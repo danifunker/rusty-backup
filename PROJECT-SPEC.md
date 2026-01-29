@@ -872,7 +872,7 @@ Cross-platform GUI tool for backing up and restoring vintage computer disk image
 - [ ] Progress bar and logging in GUI
 - [ ] Bad sector detection and reporting
 - [ ] Split file support (configurable, default 4000 MiB)
-- [ ] Works on Linux
+- [ ] Works on Mac
 
 ### Version 1.0
 - [ ] All listed filesystems supported (FAT, NTFS, ext2/3/4)
