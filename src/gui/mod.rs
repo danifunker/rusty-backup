@@ -8,6 +8,7 @@ use inspect_tab::InspectTab;
 use progress::{LogPanel, ProgressState};
 use restore_tab::RestoreTab;
 
+use rusty_backup::backup::compress::detect_chdman;
 use rusty_backup::device::{self, DiskDevice};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -40,9 +41,20 @@ impl Default for RustyBackupApp {
             log.info(format!("Found {} device(s)", devices.len()));
         }
 
+        // Detect chdman availability
+        let chdman_available = detect_chdman();
+        if chdman_available {
+            log.info("chdman detected: CHD compression available");
+        } else {
+            log.info("chdman not found: CHD compression disabled");
+        }
+
+        let mut backup_tab = BackupTab::default();
+        backup_tab.set_chdman_available(chdman_available);
+
         Self {
             active_tab: Tab::Inspect,
-            backup_tab: BackupTab::default(),
+            backup_tab,
             restore_tab: RestoreTab::default(),
             inspect_tab: InspectTab::default(),
             log_panel: log,
@@ -54,6 +66,11 @@ impl Default for RustyBackupApp {
 
 impl eframe::App for RustyBackupApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Request repaint while backup is running so progress updates are shown
+        if self.progress.active {
+            ctx.request_repaint();
+        }
+
         // Top panel: tab bar
         egui::TopBottomPanel::top("tab_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -88,8 +105,12 @@ impl eframe::App for RustyBackupApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             match self.active_tab {
                 Tab::Backup => {
-                    self.backup_tab
-                        .show(ui, &self.devices, &mut self.log_panel);
+                    self.backup_tab.show(
+                        ui,
+                        &self.devices,
+                        &mut self.log_panel,
+                        &mut self.progress,
+                    );
                 }
                 Tab::Restore => {
                     self.restore_tab
