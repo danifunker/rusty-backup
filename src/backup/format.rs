@@ -106,17 +106,38 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn test_generate_backup_name() {
-        let name = generate_backup_name(Path::new("/dev/disk2"));
+    fn test_generate_backup_name_fallback() {
+        let name = generate_backup_name(Path::new("/dev/disk2"), None, None);
         assert!(name.starts_with("disk2-"));
-        // Should contain a date pattern like 2026-01-29
         assert!(name.len() > 10);
     }
 
     #[test]
     fn test_generate_backup_name_from_image() {
-        let name = generate_backup_name(Path::new("/home/user/my-disk.img"));
+        let name = generate_backup_name(Path::new("/home/user/my-disk.img"), None, None);
         assert!(name.starts_with("my-disk-"));
+    }
+
+    #[test]
+    fn test_generate_backup_name_with_size_and_label() {
+        let name = generate_backup_name(
+            Path::new("/dev/disk2"),
+            Some(8_000_000_000),
+            Some("LLAMADOS"),
+        );
+        assert!(name.starts_with("8GB-LLAMADOS-"));
+    }
+
+    #[test]
+    fn test_generate_backup_name_size_only() {
+        let name = generate_backup_name(Path::new("/dev/disk2"), Some(512_000_000), None);
+        assert!(name.starts_with("512MB-"));
+    }
+
+    #[test]
+    fn test_generate_backup_name_label_only() {
+        let name = generate_backup_name(Path::new("/dev/disk2"), None, Some("MYDISK"));
+        assert!(name.starts_with("MYDISK-"));
     }
 
     #[test]
