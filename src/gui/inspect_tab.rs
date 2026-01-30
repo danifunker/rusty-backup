@@ -240,6 +240,11 @@ impl InspectTab {
                                         ));
                                         self.alignment = Some(alignment);
                                         self.partition_table = Some(table);
+
+                                        // mbr.bin is only 512 bytes, so EBR chain
+                                        // parsing will have silently failed. Merge
+                                        // logical partitions from metadata.
+                                        self.merge_logical_partitions_from_metadata(log);
                                     }
                                     Err(e) => {
                                         log.warn(format!("Could not parse mbr.bin: {e}"));
@@ -290,6 +295,48 @@ impl InspectTab {
                     is_extended_container: false,
                 })
                 .collect();
+        }
+    }
+
+    /// After parsing mbr.bin (which is only 512 bytes and cannot contain the
+    /// EBR chain), supplement the partition list with any logical partitions
+    /// found in backup metadata.
+    fn merge_logical_partitions_from_metadata(&mut self, log: &mut LogPanel) {
+        let meta = match &self.backup_metadata {
+            Some(m) => m,
+            None => return,
+        };
+
+        // Check if there's an extended container but no logical partitions
+        // were parsed (expected since mbr.bin has no EBR data).
+        let has_container = self.partitions.iter().any(|p| p.is_extended_container);
+        let has_logicals = self.partitions.iter().any(|p| p.is_logical);
+        if !has_container || has_logicals {
+            return;
+        }
+
+        // Add logical partitions from metadata (index >= 4 by convention)
+        let mut added = 0;
+        for pm in &meta.partitions {
+            if pm.index >= 4 {
+                self.partitions.push(PartitionInfo {
+                    index: pm.index,
+                    type_name: pm.type_name.clone(),
+                    partition_type_byte: pm.partition_type_byte,
+                    start_lba: pm.start_lba,
+                    size_bytes: pm.original_size_bytes,
+                    bootable: false,
+                    is_logical: true,
+                    is_extended_container: false,
+                });
+                added += 1;
+            }
+        }
+
+        if added > 0 {
+            log.info(format!(
+                "Added {added} logical partition(s) from backup metadata"
+            ));
         }
     }
 
@@ -453,12 +500,20 @@ impl InspectTab {
                         ui.label(format!("{}", part.start_lba));
                         ui.label(partition::format_size(part.size_bytes));
                         ui.label(if part.bootable { "Yes" } else { "" });
-                        if is_fat_type(part.partition_type_byte) {
+                        if is_fat_type(part.partition_type_byte) || is_fat_name(&part.type_name) {
                             if ui.small_button("Browse").clicked() {
+                                // Use the stored type byte, or infer one
+                                // from the name for old backups that didn't
+                                // store partition_type_byte.
+                                let ptype = if part.partition_type_byte != 0 {
+                                    part.partition_type_byte
+                                } else {
+                                    infer_fat_type_byte(&part.type_name)
+                                };
                                 browse_request = Some((
                                     part.index,
                                     part.start_lba * 512,
-                                    part.partition_type_byte,
+                                    ptype,
                                 ));
                             }
                         } else {
@@ -584,4 +639,28 @@ fn is_fat_type(ptype: u8) -> bool {
         0x01 | 0x04 | 0x06 | 0x0B | 0x0C | 0x0E
             | 0x11 | 0x14 | 0x16 | 0x1B | 0x1C | 0x1E
     )
+}
+
+/// Fallback check: detect FAT from the human-readable type name string.
+/// Used for older backups where `partition_type_byte` was not stored.
+fn is_fat_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("fat")
+}
+
+/// Infer an MBR partition type byte from the human-readable type name.
+/// Used for older backups that didn't store `partition_type_byte`.
+fn infer_fat_type_byte(name: &str) -> u8 {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("fat32") {
+        0x0C // FAT32 LBA
+    } else if lower.contains("fat16") {
+        0x06 // FAT16
+    } else if lower.contains("fat12") {
+        0x01 // FAT12
+    } else if lower.contains("fat") {
+        0x0C // Default to FAT32 LBA
+    } else {
+        0
+    }
 }

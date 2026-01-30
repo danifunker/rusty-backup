@@ -473,6 +473,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         partition_metadata.push(PartitionMetadata {
             index: part.index,
             type_name: part.type_name.clone(),
+            partition_type_byte: part.partition_type_byte,
             start_lba: part.start_lba,
             original_size_bytes: part.size_bytes,
             imaged_size_bytes: image_size,

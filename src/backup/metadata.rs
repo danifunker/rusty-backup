@@ -26,6 +26,9 @@ pub struct BackupMetadata {
 pub struct PartitionMetadata {
     pub index: usize,
     pub type_name: String,
+    /// Raw MBR partition type byte (e.g. 0x0C for FAT32 LBA). 0 for GPT.
+    #[serde(default)]
+    pub partition_type_byte: u8,
     pub start_lba: u64,
     pub original_size_bytes: u64,
     /// Actual bytes captured from the partition. Equals `original_size_bytes`
@@ -86,6 +89,7 @@ mod tests {
                 PartitionMetadata {
                     index: 0,
                     type_name: "FAT32 (LBA)".to_string(),
+                    partition_type_byte: 0x0C,
                     start_lba: 63,
                     original_size_bytes: 2_000_000_000,
                     imaged_size_bytes: 500_000_000,
