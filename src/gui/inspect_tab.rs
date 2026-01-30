@@ -1,7 +1,9 @@
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
+use rusty_backup::backup::compress;
 use rusty_backup::backup::metadata::BackupMetadata;
 use rusty_backup::device::DiskDevice;
 use rusty_backup::partition::{self, detect_alignment, PartitionAlignment, PartitionInfo, PartitionTable};
@@ -33,6 +35,53 @@ pub struct InspectTab {
     prev_backup_path: Option<PathBuf>,
     /// Filesystem browser
     browse_view: BrowseView,
+    /// VHD export: true if the export popup is open
+    export_vhd_popup: bool,
+    /// VHD export mode: true = whole disk, false = per partition
+    export_whole_disk: bool,
+    /// Per-partition sizing configuration for VHD export
+    export_partition_configs: Vec<PartitionExportConfig>,
+    /// VHD export background thread status
+    export_status: Option<Arc<Mutex<ExportStatus>>>,
+}
+
+/// Status of a background VHD export operation.
+struct ExportStatus {
+    finished: bool,
+    error: Option<String>,
+    log_messages: Vec<String>,
+    current_bytes: u64,
+    total_bytes: u64,
+    cancel_requested: bool,
+}
+
+/// Per-partition size choice for VHD export.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ExportSizeChoice {
+    Original,
+    Minimum,
+    Custom,
+}
+
+/// Per-partition export configuration.
+#[derive(Debug, Clone)]
+struct PartitionExportConfig {
+    index: usize,
+    type_name: String,
+    original_size: u64,
+    minimum_size: u64,
+    choice: ExportSizeChoice,
+    custom_size_mib: u32,
+}
+
+impl PartitionExportConfig {
+    fn effective_size(&self) -> u64 {
+        match self.choice {
+            ExportSizeChoice::Original => self.original_size,
+            ExportSizeChoice::Minimum => self.minimum_size,
+            ExportSizeChoice::Custom => self.custom_size_mib as u64 * 1024 * 1024,
+        }
+    }
 }
 
 impl Default for InspectTab {
@@ -50,6 +99,10 @@ impl Default for InspectTab {
             prev_image_path: None,
             prev_backup_path: None,
             browse_view: BrowseView::default(),
+            export_vhd_popup: false,
+            export_whole_disk: true,
+            export_partition_configs: Vec::new(),
+            export_status: None,
         }
     }
 }
@@ -70,6 +123,8 @@ impl InspectTab {
 
             let current_label = if let Some(path) = &self.backup_folder_path {
                 format!("Backup: {}", path.display())
+            } else if let Some(path) = &self.image_file_path {
+                format!("VHD: {}", path.display())
             } else if let Some(idx) = self.selected_device_idx {
                 devices
                     .get(idx)
@@ -95,6 +150,20 @@ impl InspectTab {
                         }
                     }
                     ui.separator();
+                    if ui
+                        .selectable_label(self.image_file_path.is_some(), "Open VHD File...")
+                        .clicked()
+                    {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("VHD Files", &["vhd"])
+                            .pick_file()
+                        {
+                            self.selected_device_idx = None;
+                            self.backup_folder_path = None;
+                            self.image_file_path = Some(path);
+                            self.clear_results();
+                        }
+                    }
                     if ui
                         .selectable_label(self.backup_folder_path.is_some(), "Open Backup Folder...")
                         .clicked()
@@ -122,7 +191,10 @@ impl InspectTab {
             }
         }
 
-        // Re-inspect button
+        // Poll export status
+        self.poll_export_status(log);
+
+        // Re-inspect + Export VHD buttons
         ui.horizontal(|ui| {
             let has_source = self.selected_device_idx.is_some()
                 || self.image_file_path.is_some()
@@ -137,7 +209,62 @@ impl InspectTab {
                     self.run_inspect(devices, log);
                 }
             }
+
+            // Export VHD button — available when we have partition data and no export running
+            let has_partitions = !self.partitions.is_empty();
+            let export_running = self.export_status.is_some();
+            if ui
+                .add_enabled(
+                    has_partitions && !export_running,
+                    egui::Button::new("Export VHD..."),
+                )
+                .clicked()
+            {
+                self.init_export_configs();
+                self.export_vhd_popup = true;
+            }
+
+            if export_running {
+                if ui.button("Cancel Export").clicked() {
+                    if let Some(ref status_arc) = self.export_status {
+                        if let Ok(mut s) = status_arc.lock() {
+                            s.cancel_requested = true;
+                        }
+                    }
+                    log.warn("Export cancellation requested...");
+                }
+            }
         });
+
+        // Export progress bar
+        if let Some(ref status_arc) = self.export_status {
+            if let Ok(s) = status_arc.lock() {
+                if !s.finished && s.total_bytes > 0 {
+                    let fraction = s.current_bytes as f32 / s.total_bytes as f32;
+                    let text = format!(
+                        "Exporting VHD: {} / {} ({:.0}%)",
+                        partition::format_size(s.current_bytes),
+                        partition::format_size(s.total_bytes),
+                        fraction * 100.0,
+                    );
+                    ui.add(
+                        egui::ProgressBar::new(fraction)
+                            .text(text)
+                            .animate(true),
+                    );
+                } else if !s.finished {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Exporting VHD...");
+                    });
+                }
+            }
+        }
+
+        // Export VHD popup
+        if self.export_vhd_popup {
+            self.show_export_vhd_popup(ui, devices, log);
+        }
 
         ui.add_space(12.0);
 
@@ -165,6 +292,416 @@ impl InspectTab {
         if self.browse_view.is_active() {
             //ui.add_space(4.0);
             self.browse_view.show(ui);
+        }
+    }
+
+    fn init_export_configs(&mut self) {
+        self.export_partition_configs.clear();
+        for part in &self.partitions {
+            if part.is_extended_container {
+                continue;
+            }
+            let min_size = self
+                .backup_metadata
+                .as_ref()
+                .and_then(|m| {
+                    m.partitions
+                        .iter()
+                        .find(|pm| pm.index == part.index)
+                        .map(|pm| pm.imaged_size_bytes)
+                })
+                .filter(|&sz| sz > 0)
+                .unwrap_or(part.size_bytes);
+
+            self.export_partition_configs.push(PartitionExportConfig {
+                index: part.index,
+                type_name: part.type_name.clone(),
+                original_size: part.size_bytes,
+                minimum_size: min_size,
+                choice: ExportSizeChoice::Original,
+                custom_size_mib: (part.size_bytes / (1024 * 1024)) as u32,
+            });
+        }
+    }
+
+    fn show_export_vhd_popup(&mut self, ui: &mut egui::Ui, devices: &[DiskDevice], log: &mut LogPanel) {
+        egui::Window::new("Export VHD")
+            .collapsible(false)
+            .resizable(true)
+            .default_width(500.0)
+            .show(ui.ctx(), |ui| {
+                ui.label("Export partitions as Fixed VHD files.");
+                ui.add_space(4.0);
+
+                ui.radio_value(&mut self.export_whole_disk, true, "Whole Disk (single .vhd file)");
+                ui.radio_value(&mut self.export_whole_disk, false, "Per Partition (one .vhd per partition)");
+
+                ui.add_space(8.0);
+
+                // Per-partition sizing
+                if !self.export_partition_configs.is_empty() {
+                    ui.label(egui::RichText::new("Partition Sizes:").strong());
+                    egui::Grid::new("export_partition_sizes")
+                        .striped(true)
+                        .min_col_width(50.0)
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new("#").strong());
+                            ui.label(egui::RichText::new("Type").strong());
+                            ui.label(egui::RichText::new("Size Mode").strong());
+                            ui.label(egui::RichText::new("Size (MiB)").strong());
+                            ui.end_row();
+
+                            for cfg in &mut self.export_partition_configs {
+                                ui.label(format!("{}", cfg.index));
+                                ui.label(&cfg.type_name);
+
+                                let prev_choice = cfg.choice;
+                                ui.horizontal(|ui| {
+                                    ui.radio_value(
+                                        &mut cfg.choice,
+                                        ExportSizeChoice::Original,
+                                        "Original",
+                                    );
+                                    // Only show Minimum if it differs from original
+                                    if cfg.minimum_size < cfg.original_size {
+                                        ui.radio_value(
+                                            &mut cfg.choice,
+                                            ExportSizeChoice::Minimum,
+                                            "Minimum",
+                                        );
+                                    }
+                                    ui.radio_value(
+                                        &mut cfg.choice,
+                                        ExportSizeChoice::Custom,
+                                        "Custom",
+                                    );
+                                });
+
+                                // When switching to Custom, initialize to minimum size
+                                if cfg.choice == ExportSizeChoice::Custom
+                                    && prev_choice != ExportSizeChoice::Custom
+                                {
+                                    cfg.custom_size_mib =
+                                        (cfg.minimum_size / (1024 * 1024)).max(1) as u32;
+                                }
+
+                                if cfg.choice == ExportSizeChoice::Custom {
+                                    let min_mib =
+                                        (cfg.minimum_size / (1024 * 1024)).max(1) as u32;
+                                    let max_mib =
+                                        (cfg.original_size / (1024 * 1024)).max(min_mib as u64) as u32;
+                                    ui.add(
+                                        egui::DragValue::new(&mut cfg.custom_size_mib)
+                                            .range(min_mib..=max_mib),
+                                    );
+                                } else {
+                                    ui.label(format!(
+                                        "{}",
+                                        cfg.effective_size() / (1024 * 1024)
+                                    ));
+                                }
+                                ui.end_row();
+                            }
+                        });
+                    ui.add_space(4.0);
+                }
+
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    if ui.button("Export...").clicked() {
+                        self.export_vhd_popup = false;
+                        self.start_export_vhd(devices, log);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.export_vhd_popup = false;
+                    }
+                });
+            });
+    }
+
+    fn start_export_vhd(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {
+        // Collect partition sizing info
+        let size_map: std::collections::HashMap<usize, u64> = self
+            .export_partition_configs
+            .iter()
+            .map(|cfg| (cfg.index, cfg.effective_size()))
+            .collect();
+
+        // Build partition size overrides for whole-disk export
+        let partition_overrides: Vec<compress::PartitionSizeOverride> = self
+            .export_partition_configs
+            .iter()
+            .map(|cfg| {
+                let start_lba = self
+                    .partitions
+                    .iter()
+                    .find(|p| p.index == cfg.index)
+                    .map(|p| p.start_lba)
+                    .unwrap_or(0);
+                compress::PartitionSizeOverride {
+                    index: cfg.index,
+                    start_lba,
+                    original_size: cfg.original_size,
+                    export_size: cfg.effective_size(),
+                }
+            })
+            .collect();
+
+        // Compute total bytes for progress tracking
+        let total_bytes: u64 = size_map.values().sum();
+
+        let new_status = || {
+            Arc::new(Mutex::new(ExportStatus {
+                finished: false,
+                error: None,
+                log_messages: Vec::new(),
+                current_bytes: 0,
+                total_bytes,
+                cancel_requested: false,
+            }))
+        };
+
+        if self.export_whole_disk {
+            // Pick a single file destination
+            let dialog = rfd::FileDialog::new()
+                .set_file_name("disk.vhd")
+                .add_filter("VHD Files", &["vhd"]);
+            let dest = match dialog.save_file() {
+                Some(p) => p,
+                None => return,
+            };
+
+            let source_path = self.backup_folder_path.clone()
+                .or_else(|| self.image_file_path.clone())
+                .or_else(|| {
+                    self.selected_device_idx
+                        .and_then(|idx| devices.get(idx))
+                        .map(|d| d.path.clone())
+                });
+            let source = match source_path {
+                Some(p) => p,
+                None => {
+                    log.error("No source available for export");
+                    return;
+                }
+            };
+
+            let meta = self.backup_metadata.clone();
+            let overrides = partition_overrides;
+            let status = new_status();
+            self.export_status = Some(Arc::clone(&status));
+
+            log.info(format!("Exporting whole-disk VHD to {}...", dest.display()));
+
+            std::thread::spawn(move || {
+                let status2 = Arc::clone(&status);
+                let status3 = Arc::clone(&status);
+                let result = compress::export_whole_disk_vhd(
+                    &source,
+                    meta.as_ref(),
+                    None,
+                    &overrides,
+                    &dest,
+                    move |bytes| {
+                        if let Ok(mut s) = status2.lock() {
+                            s.current_bytes = bytes;
+                        }
+                    },
+                    move || {
+                        status3
+                            .lock()
+                            .map(|s| s.cancel_requested)
+                            .unwrap_or(false)
+                    },
+                    |msg| {
+                        if let Ok(mut s) = status.lock() {
+                            s.log_messages.push(msg.to_string());
+                        }
+                    },
+                );
+                if let Ok(mut s) = status.lock() {
+                    s.finished = true;
+                    if let Err(e) = result {
+                        s.error = Some(format!("{e:#}"));
+                    }
+                }
+            });
+        } else {
+            // Per-partition: pick a folder
+            let dest_folder = match rfd::FileDialog::new().pick_folder() {
+                Some(p) => p,
+                None => return,
+            };
+
+            let source_folder = self.backup_folder_path.clone();
+            let source_image = self.image_file_path.clone().or_else(|| {
+                self.selected_device_idx
+                    .and_then(|idx| devices.get(idx))
+                    .map(|d| d.path.clone())
+            });
+            let meta = self.backup_metadata.clone();
+            let partitions = self.partitions.clone();
+
+            let status = new_status();
+            self.export_status = Some(Arc::clone(&status));
+
+            log.info(format!("Exporting per-partition VHDs to {}...", dest_folder.display()));
+
+            std::thread::spawn(move || {
+                let result = (|| -> anyhow::Result<()> {
+                    let mut overall_written: u64 = 0;
+
+                    if let (Some(folder), Some(meta)) = (&source_folder, &meta) {
+                        // Backup folder: export each partition file
+                        for pm in &meta.partitions {
+                            if status.lock().map(|s| s.cancel_requested).unwrap_or(false) {
+                                anyhow::bail!("export cancelled");
+                            }
+                            if pm.compressed_files.is_empty() {
+                                continue;
+                            }
+
+                            let export_size = size_map.get(&pm.index).copied()
+                                .unwrap_or(pm.original_size_bytes);
+                            let data_file = &pm.compressed_files[0];
+                            let data_path = folder.join(data_file);
+                            let dest_path = dest_folder.join(format!("partition-{}.vhd", pm.index));
+
+                            if let Ok(mut s) = status.lock() {
+                                s.log_messages.push(format!(
+                                    "Exporting partition-{} ({}) to {}",
+                                    pm.index,
+                                    partition::format_size(export_size),
+                                    dest_path.display()
+                                ));
+                            }
+
+                            let base_written = overall_written;
+                            let status_progress = Arc::clone(&status);
+                            let status_cancel = Arc::clone(&status);
+                            compress::export_partition_vhd(
+                                &data_path,
+                                &meta.compression_type,
+                                &dest_path,
+                                Some(export_size),
+                                move |bytes| {
+                                    if let Ok(mut s) = status_progress.lock() {
+                                        s.current_bytes = base_written + bytes;
+                                    }
+                                },
+                                move || {
+                                    status_cancel
+                                        .lock()
+                                        .map(|s| s.cancel_requested)
+                                        .unwrap_or(false)
+                                },
+                                |msg| {
+                                    if let Ok(mut s) = status.lock() {
+                                        s.log_messages.push(msg.to_string());
+                                    }
+                                },
+                            )?;
+                            overall_written += export_size;
+                        }
+                    } else if let Some(image_path) = &source_image {
+                        // Raw image/device: extract each partition by offset
+                        for part in &partitions {
+                            if status.lock().map(|s| s.cancel_requested).unwrap_or(false) {
+                                anyhow::bail!("export cancelled");
+                            }
+                            if part.is_extended_container {
+                                continue;
+                            }
+
+                            let export_size = size_map.get(&part.index).copied()
+                                .unwrap_or(part.size_bytes);
+                            let dest_path = dest_folder.join(format!("partition-{}.vhd", part.index));
+                            let offset = part.start_lba * 512;
+
+                            if let Ok(mut s) = status.lock() {
+                                s.log_messages.push(format!(
+                                    "Exporting partition-{} ({}) to {}",
+                                    part.index,
+                                    partition::format_size(export_size),
+                                    dest_path.display()
+                                ));
+                            }
+
+                            // Extract partition data to VHD
+                            let file = std::fs::File::open(image_path)?;
+                            let mut reader = std::io::BufReader::new(file);
+                            reader.seek(std::io::SeekFrom::Start(offset))?;
+                            let mut limited = reader.take(export_size);
+
+                            let mut writer = std::io::BufWriter::new(
+                                std::fs::File::create(&dest_path)?,
+                            );
+                            let mut buf = vec![0u8; 256 * 1024];
+                            let mut total: u64 = 0;
+                            let base_written = overall_written;
+                            loop {
+                                if status.lock().map(|s| s.cancel_requested).unwrap_or(false) {
+                                    anyhow::bail!("export cancelled");
+                                }
+                                let n = limited.read(&mut buf)?;
+                                if n == 0 {
+                                    break;
+                                }
+                                writer.write_all(&buf[..n])?;
+                                total += n as u64;
+                                if let Ok(mut s) = status.lock() {
+                                    s.current_bytes = base_written + total;
+                                }
+                            }
+                            writer.flush()?;
+
+                            // Append VHD footer
+                            let footer = compress::build_vhd_footer(total);
+                            writer.write_all(&footer)?;
+                            writer.flush()?;
+
+                            overall_written += export_size;
+                        }
+                    } else {
+                        anyhow::bail!("no source available for export");
+                    }
+                    Ok(())
+                })();
+
+                if let Ok(mut s) = status.lock() {
+                    s.finished = true;
+                    if let Err(e) = result {
+                        s.error = Some(format!("{e:#}"));
+                    }
+                }
+            });
+        }
+    }
+
+    fn poll_export_status(&mut self, log: &mut LogPanel) {
+        let status_arc = match &self.export_status {
+            Some(s) => Arc::clone(s),
+            None => return,
+        };
+
+        let Ok(mut status) = status_arc.lock() else {
+            return;
+        };
+
+        // Drain log messages
+        for msg in status.log_messages.drain(..) {
+            log.info(msg);
+        }
+
+        if status.finished {
+            if let Some(err) = &status.error {
+                log.error(format!("VHD export failed: {err}"));
+            } else {
+                log.info("VHD export completed successfully.");
+            }
+            drop(status);
+            self.export_status = None;
         }
     }
 
@@ -360,8 +897,47 @@ impl InspectTab {
 
         match File::open(&path) {
             Ok(file) => {
+                let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
                 let mut reader = BufReader::new(file);
-                match PartitionTable::detect(&mut reader) {
+
+                // Detect VHD: check if the last 512 bytes contain the "conectix" cookie
+                let data_size = if file_size >= 512 {
+                    if let Ok(mut f) = File::open(&path) {
+                        if f.seek(SeekFrom::End(-512)).is_ok() {
+                            let mut cookie = [0u8; 8];
+                            if f.read_exact(&mut cookie).is_ok()
+                                && &cookie == compress::VHD_COOKIE
+                            {
+                                let ds = file_size - 512;
+                                log.info(format!(
+                                    "Detected Fixed VHD (data: {} bytes)",
+                                    ds,
+                                ));
+                                Some(ds)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                // Use a limited reader if VHD was detected
+                let detect_result = if let Some(ds) = data_size {
+                    // Reset reader to start and limit to data portion
+                    let _ = reader.seek(SeekFrom::Start(0));
+                    let mut limited = reader.take(ds);
+                    PartitionTable::detect(&mut limited)
+                } else {
+                    PartitionTable::detect(&mut reader)
+                };
+
+                match detect_result {
                     Ok(table) => {
                         let alignment = detect_alignment(&table);
                         self.partitions = table.partitions();

@@ -21,6 +21,7 @@ use metadata::{AlignmentMetadata, BackupMetadata, PartitionMetadata};
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum CompressionType {
     Chd,
+    Vhd,
     Zstd,
     None,
 }
@@ -29,6 +30,7 @@ impl CompressionType {
     pub fn as_str(&self) -> &'static str {
         match self {
             CompressionType::Chd => "chd",
+            CompressionType::Vhd => "vhd",
             CompressionType::Zstd => "zstd",
             CompressionType::None => "none",
         }
@@ -37,6 +39,7 @@ impl CompressionType {
     pub fn file_extension(&self) -> &'static str {
         match self {
             CompressionType::Chd => "chd",
+            CompressionType::Vhd => "vhd",
             CompressionType::Zstd => "zst",
             CompressionType::None => "raw",
         }
