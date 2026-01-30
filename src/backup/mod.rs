@@ -402,6 +402,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 part_offset,
             ).map_err(|e| anyhow::anyhow!("compaction failed: {e}"))?;
 
+            let progress_log = Arc::clone(&progress);
             compress::compress_partition(
                 &mut compact_reader,
                 &output_base,
@@ -412,6 +413,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                     set_progress_bytes(&progress_clone, base_bytes + bytes_read, total_partition_bytes);
                 },
                 || is_cancelled(&progress_clone),
+                |msg| log(&progress_log, LogLevel::Info, msg),
             )
             .with_context(|| format!("failed to compress {part_label}"))?
         } else {
@@ -421,6 +423,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             let part_reader = (&mut source).take(image_size);
             let mut limited = LimitedReader::new(part_reader);
 
+            let progress_log = Arc::clone(&progress);
             compress::compress_partition(
                 &mut limited,
                 &output_base,
@@ -431,6 +434,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                     set_progress_bytes(&progress_clone, base_bytes + bytes_read, total_partition_bytes);
                 },
                 || is_cancelled(&progress_clone),
+                |msg| log(&progress_log, LogLevel::Info, msg),
             )
             .with_context(|| format!("failed to compress {part_label}"))?
         };

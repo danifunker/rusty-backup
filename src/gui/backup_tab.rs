@@ -338,9 +338,27 @@ impl BackupTab {
     }
 
     fn update_backup_name(&mut self, devices: &[DiskDevice]) {
-        if let Some(path) = self.source_path(devices) {
-            self.backup_name = rusty_backup::backup::format::generate_backup_name(&path);
-        }
+        let path = match self.source_path(devices) {
+            Some(p) => p,
+            None => return,
+        };
+
+        // Try to get device size and first volume label
+        let device = self
+            .selected_device_idx
+            .and_then(|idx| devices.get(idx));
+
+        let size_bytes = device.map(|d| d.size_bytes).or_else(|| {
+            std::fs::metadata(&path).ok().map(|m| m.len())
+        });
+
+        let volume_label = device
+            .and_then(|d| d.partitions.first())
+            .map(|p| p.name.as_str())
+            .filter(|n| !n.is_empty());
+
+        self.backup_name =
+            rusty_backup::backup::format::generate_backup_name(&path, size_bytes, volume_label);
     }
 
     fn start_backup(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {

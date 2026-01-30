@@ -124,8 +124,16 @@ impl<R: Read + Seek> FatFilesystem<R> {
         let data_sectors = total_sectors.saturating_sub(data_start_sector);
         let total_clusters = data_sectors / sectors_per_cluster;
 
-        // Determine FAT type per Microsoft spec
-        let fat_type = if total_clusters < 4085 {
+        // Determine FAT type.
+        //
+        // The Microsoft spec uses cluster count thresholds, but compacted
+        // images may have fewer clusters than the FAT32 minimum while still
+        // using FAT32 on-disk structures.  When the 16-bit sectors-per-FAT
+        // field is zero and the root entry count is zero the BPB is FAT32
+        // format regardless of cluster count.
+        let fat_type = if sectors_per_fat_16 == 0 && root_entry_count == 0 {
+            FatType::Fat32
+        } else if total_clusters < 4085 {
             FatType::Fat12
         } else if total_clusters < 65525 {
             FatType::Fat16
@@ -424,6 +432,11 @@ impl<R: Read + Seek> FatFilesystem<R> {
             // Long filename entry
             if attr == ATTR_LONG_NAME {
                 let seq = entry_bytes[0] & 0x3F;
+                // LFN entry layout (13 UTF-16LE characters per entry):
+                //   Bytes 1-10:  characters 1-5
+                //   Bytes 14-25: characters 6-11
+                //   Bytes 26-27: first cluster low (always 0, NOT character data)
+                //   Bytes 28-31: characters 12-13
                 let chars: Vec<u16> = vec![
                     u16::from_le_bytes([entry_bytes[1], entry_bytes[2]]),
                     u16::from_le_bytes([entry_bytes[3], entry_bytes[4]]),
@@ -436,8 +449,8 @@ impl<R: Read + Seek> FatFilesystem<R> {
                     u16::from_le_bytes([entry_bytes[20], entry_bytes[21]]),
                     u16::from_le_bytes([entry_bytes[22], entry_bytes[23]]),
                     u16::from_le_bytes([entry_bytes[24], entry_bytes[25]]),
-                    u16::from_le_bytes([entry_bytes[26], entry_bytes[27]]),
                     u16::from_le_bytes([entry_bytes[28], entry_bytes[29]]),
+                    u16::from_le_bytes([entry_bytes[30], entry_bytes[31]]),
                 ];
 
                 // Filter out padding (0x0000 and 0xFFFF)
@@ -808,7 +821,9 @@ impl<R: Read + Seek> CompactFatReader<R> {
         let data_sectors = original_total_sectors.saturating_sub(original_data_start_sector);
         let total_clusters = data_sectors / sectors_per_cluster;
 
-        let fat_type = if total_clusters < 4085 {
+        let fat_type = if sectors_per_fat_16 == 0 && root_entry_count == 0 {
+            FatType::Fat32
+        } else if total_clusters < 4085 {
             FatType::Fat12
         } else if total_clusters < 65525 {
             FatType::Fat16

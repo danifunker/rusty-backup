@@ -24,6 +24,7 @@ pub fn compress_partition(
     skip_zeros: bool,
     mut progress_cb: impl FnMut(u64),
     cancel_check: impl Fn() -> bool,
+    mut log_cb: impl FnMut(&str),
 ) -> Result<Vec<String>> {
     match compression {
         CompressionType::None => {
@@ -35,7 +36,7 @@ pub fn compress_partition(
         }
         CompressionType::Chd => {
             // CHD needs complete raw temp file; chdman handles zero compression
-            compress_chd(reader, output_base, split_size, &mut progress_cb, &cancel_check)
+            compress_chd(reader, output_base, split_size, &mut progress_cb, &cancel_check, &mut log_cb)
         }
     }
 }
@@ -225,6 +226,7 @@ fn compress_chd(
     split_size: Option<u64>,
     progress_cb: &mut impl FnMut(u64),
     cancel_check: &impl Fn() -> bool,
+    log_cb: &mut impl FnMut(&str),
 ) -> Result<Vec<String>> {
     let parent = output_base
         .parent()
@@ -292,7 +294,8 @@ fn compress_chd(
     }
 
     let chd_path = output_path(output_base, "chd", false, 0);
-    let status = Command::new("chdman")
+    log_cb(&format!("Running chdman createraw → {}", chd_path.display()));
+    let output = Command::new("chdman")
         .arg("createraw")
         .arg("-i")
         .arg(&temp_path)
@@ -302,15 +305,31 @@ fn compress_chd(
         .arg(hunk_size.to_string())
         .arg("-us")
         .arg(unit_size.to_string())
-        .status()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
         .context("failed to run chdman")?;
+
+    // Forward chdman output to log
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            log_cb(trimmed);
+        }
+    }
+    for line in String::from_utf8_lossy(&output.stderr).lines() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            log_cb(trimmed);
+        }
+    }
 
     let _ = fs::remove_file(&temp_path);
 
-    if !status.success() {
+    if !output.status.success() {
         bail!(
             "chdman exited with status {}",
-            status.code().unwrap_or(-1)
+            output.status.code().unwrap_or(-1)
         );
     }
 
@@ -484,6 +503,7 @@ mod tests {
             false,
             |_| {},
             || false,
+            |_| {},
         )
         .unwrap();
 
@@ -508,6 +528,7 @@ mod tests {
             false,
             |_| {},
             || false,
+            |_| {},
         )
         .unwrap();
 
@@ -540,6 +561,7 @@ mod tests {
             false,
             |_| {},
             || false,
+            |_| {},
         )
         .unwrap();
 
@@ -571,6 +593,7 @@ mod tests {
             true, // skip zeros
             |_| {},
             || false,
+            |_| {},
         )
         .unwrap();
 
@@ -598,6 +621,7 @@ mod tests {
             true, // skip zeros
             |_| {},
             || false,
+            |_| {},
         )
         .unwrap();
 
@@ -622,6 +646,7 @@ mod tests {
             false,
             |_| {},
             || true, // always cancel
+            |_| {},
         );
 
         assert!(result.is_err());

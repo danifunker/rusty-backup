@@ -15,15 +15,51 @@ pub fn create_backup_folder(dest: &Path, name: &str) -> Result<PathBuf> {
     Ok(folder)
 }
 
-/// Generate a backup folder name from the source path, e.g. `disk2-2026-01-29-143052`.
-pub fn generate_backup_name(source: &Path) -> String {
-    let stem = source
-        .file_stem()
-        .or_else(|| source.file_name())
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "backup".to_string());
+/// Generate a backup folder name.
+///
+/// When `size_bytes` and/or `volume_label` are provided the name uses the
+/// format `8GB-LABEL-2026-01-30-143052`.  Falls back to the source file
+/// stem when neither is available (e.g. `disk2-2026-01-30-143052`).
+pub fn generate_backup_name(
+    source: &Path,
+    size_bytes: Option<u64>,
+    volume_label: Option<&str>,
+) -> String {
     let timestamp = Local::now().format("%Y-%m-%d-%H%M%S");
-    format!("{stem}-{timestamp}")
+
+    let size_part = size_bytes.map(format_size_short);
+
+    let label_part = volume_label
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty());
+
+    match (size_part, label_part) {
+        (Some(sz), Some(label)) => format!("{sz}-{label}-{timestamp}"),
+        (Some(sz), None) => format!("{sz}-{timestamp}"),
+        (None, Some(label)) => format!("{label}-{timestamp}"),
+        (None, None) => {
+            let stem = source
+                .file_stem()
+                .or_else(|| source.file_name())
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "backup".to_string());
+            format!("{stem}-{timestamp}")
+        }
+    }
+}
+
+/// Format a byte count as a short rounded size string for folder names.
+/// Uses whole numbers: `8GB`, `512MB`, `16GB`.
+fn format_size_short(bytes: u64) -> String {
+    const GB: u64 = 1_000_000_000;
+    const MB: u64 = 1_000_000;
+    if bytes >= GB {
+        let gb = ((bytes as f64) / (GB as f64)).round() as u64;
+        format!("{gb}GB")
+    } else {
+        let mb = ((bytes as f64) / (MB as f64)).round() as u64;
+        format!("{mb}MB")
+    }
 }
 
 /// Export an MBR to `mbr.bin` (raw 512 bytes) and `mbr.json` (structured).

@@ -87,6 +87,7 @@ impl BrowseView {
             Ok(mut fs) => {
                 self.fs_type = fs.fs_type().to_string();
                 self.volume_label = fs.volume_label().unwrap_or("").to_string();
+                self.active = true;
 
                 match fs.root() {
                     Ok(root) => {
@@ -101,7 +102,6 @@ impl BrowseView {
                             }
                         }
                         self.root = Some(root);
-                        self.active = true;
                     }
                     Err(e) => {
                         self.error = Some(format!("Failed to get root: {e}"));
@@ -110,6 +110,7 @@ impl BrowseView {
             }
             Err(e) => {
                 self.error = Some(format!("Cannot open filesystem: {e}"));
+                self.active = true;
             }
         }
     }
@@ -166,14 +167,19 @@ impl BrowseView {
         // Two-panel layout: tree | content
         let available = ui.available_size();
         let tree_width = (available.x * 0.4).max(200.0).min(400.0);
+        let panel_height = available.y;
 
         ui.horizontal(|ui| {
+            ui.set_min_height(panel_height);
+
             // Left panel: file tree
             ui.vertical(|ui| {
                 ui.set_width(tree_width);
+                ui.set_min_height(panel_height);
                 egui::ScrollArea::vertical()
                     .id_salt("browse_tree")
-                    .max_height(available.y - 40.0)
+                    .max_height(panel_height)
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
                         if let Some(root) = self.root.clone() {
                             self.render_tree_entry(ui, &root);
@@ -186,7 +192,8 @@ impl BrowseView {
             // Right panel: file content / details
             ui.vertical(|ui| {
                 ui.set_min_width(available.x - tree_width - 20.0);
-                self.render_content_panel(ui);
+                ui.set_min_height(panel_height);
+                self.render_content_panel(ui, panel_height);
             });
         });
     }
@@ -274,7 +281,7 @@ impl BrowseView {
         }
     }
 
-    fn render_content_panel(&self, ui: &mut egui::Ui) {
+    fn render_content_panel(&self, ui: &mut egui::Ui, panel_height: f32) {
         match &self.selected_entry {
             None => {
                 ui.colored_label(egui::Color32::GRAY, "Select a file to view its contents.");
@@ -301,6 +308,9 @@ impl BrowseView {
                     return;
                 }
 
+                // Remaining height for the scroll area after the header
+                let content_height = ui.available_height().min(panel_height);
+
                 match &self.content {
                     None => {
                         ui.spinner();
@@ -309,6 +319,8 @@ impl BrowseView {
                     Some(FileContent::Text(text)) => {
                         egui::ScrollArea::vertical()
                             .id_salt("file_content")
+                            .max_height(content_height)
+                            .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 ui.add(
                                     egui::TextEdit::multiline(&mut text.as_str())
@@ -320,6 +332,8 @@ impl BrowseView {
                     Some(FileContent::Binary(data)) => {
                         egui::ScrollArea::vertical()
                             .id_salt("file_content")
+                            .max_height(content_height)
+                            .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 render_hex_view(ui, data);
                             });

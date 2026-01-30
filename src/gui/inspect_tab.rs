@@ -70,8 +70,6 @@ impl InspectTab {
 
             let current_label = if let Some(path) = &self.backup_folder_path {
                 format!("Backup: {}", path.display())
-            } else if let Some(path) = &self.image_file_path {
-                format!("Image: {}", path.display())
             } else if let Some(idx) = self.selected_device_idx {
                 devices
                     .get(idx)
@@ -97,15 +95,6 @@ impl InspectTab {
                         }
                     }
                     ui.separator();
-                    if ui
-                        .selectable_label(
-                            self.image_file_path.is_some() && self.backup_folder_path.is_none(),
-                            "Open Image File...",
-                        )
-                        .clicked()
-                    {
-                        self.pick_image_file();
-                    }
                     if ui
                         .selectable_label(self.backup_folder_path.is_some(), "Open Backup Folder...")
                         .clicked()
@@ -166,31 +155,16 @@ impl InspectTab {
         // Show results
         let has_table = self.partition_table.is_some();
         if has_table {
-            self.show_results(ui);
+            self.show_results(ui, devices, log);
         } else if !self.partitions.is_empty() {
             // Partitions loaded from metadata (no partition table object)
-            self.show_partition_list(ui);
+            self.show_partition_list(ui, devices, log);
         }
 
         // Show filesystem browser if active
         if self.browse_view.is_active() {
-            ui.add_space(12.0);
-            ui.separator();
+            //ui.add_space(4.0);
             self.browse_view.show(ui);
-        }
-    }
-
-    fn pick_image_file(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Disk Images", &["img", "raw", "bin", "iso", "dd"])
-            .add_filter("All Files", &["*"])
-            .pick_file()
-        {
-            self.image_file_path = Some(path);
-            self.selected_device_idx = None;
-            self.backup_folder_path = None;
-            self.backup_metadata = None;
-            self.clear_results();
         }
     }
 
@@ -243,23 +217,46 @@ impl InspectTab {
                         meta.compression_type,
                     ));
 
-                    // Convert backup metadata partitions to PartitionInfo for display
-                    self.partitions = meta
-                        .partitions
-                        .iter()
-                        .map(|p| PartitionInfo {
-                            index: p.index,
-                            type_name: p.type_name.clone(),
-                            partition_type_byte: 0,
-                            start_lba: p.start_lba,
-                            size_bytes: p.original_size_bytes,
-                            bootable: false,
-                            is_logical: p.index >= 4,
-                            is_extended_container: false,
-                        })
-                        .collect();
-
                     self.backup_metadata = Some(meta);
+
+                    // Try to parse the mbr.bin from the backup folder for the
+                    // full partition table view (disk signature, alignment,
+                    // partition type bytes for browse buttons, etc.)
+                    let mbr_bin_path = folder.join("mbr.bin");
+                    if mbr_bin_path.exists() {
+                        match File::open(&mbr_bin_path) {
+                            Ok(file) => {
+                                let mut reader = BufReader::new(file);
+                                match PartitionTable::detect(&mut reader) {
+                                    Ok(table) => {
+                                        let alignment = detect_alignment(&table);
+                                        self.partitions = table.partitions();
+                                        log.info(format!(
+                                            "Parsed {}: {} partition table, {} partition(s), alignment: {}",
+                                            mbr_bin_path.file_name().unwrap_or_default().to_string_lossy(),
+                                            table.type_name(),
+                                            self.partitions.len(),
+                                            alignment.alignment_type,
+                                        ));
+                                        self.alignment = Some(alignment);
+                                        self.partition_table = Some(table);
+                                    }
+                                    Err(e) => {
+                                        log.warn(format!("Could not parse mbr.bin: {e}"));
+                                        // Fall back to metadata-only partition list
+                                        self.load_partitions_from_metadata();
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log.warn(format!("Could not open mbr.bin: {e}"));
+                                self.load_partitions_from_metadata();
+                            }
+                        }
+                    } else {
+                        // No mbr.bin, use metadata-only partition list
+                        self.load_partitions_from_metadata();
+                    }
                 }
                 Err(e) => {
                     let msg = format!("Failed to parse metadata.json: {e}");
@@ -272,6 +269,27 @@ impl InspectTab {
                 log.add(LogLevel::Error, &msg);
                 self.last_error = Some(msg);
             }
+        }
+    }
+
+    /// Fallback: populate partition list from backup metadata when mbr.bin
+    /// is unavailable or unparseable.
+    fn load_partitions_from_metadata(&mut self) {
+        if let Some(meta) = &self.backup_metadata {
+            self.partitions = meta
+                .partitions
+                .iter()
+                .map(|p| PartitionInfo {
+                    index: p.index,
+                    type_name: p.type_name.clone(),
+                    partition_type_byte: 0,
+                    start_lba: p.start_lba,
+                    size_bytes: p.original_size_bytes,
+                    bootable: false,
+                    is_logical: p.index >= 4,
+                    is_extended_container: false,
+                })
+                .collect();
         }
     }
 
@@ -356,7 +374,7 @@ impl InspectTab {
         ui.add_space(8.0);
     }
 
-    fn show_results(&mut self, ui: &mut egui::Ui) {
+    fn show_results(&mut self, ui: &mut egui::Ui, devices: &[DiskDevice], log: &mut LogPanel) {
         // Partition table type - extract info before mutable borrow
         let (type_name, disk_sig) = if let Some(table) = &self.partition_table {
             (table.type_name().to_string(), table.disk_signature())
@@ -389,19 +407,17 @@ impl InspectTab {
         }
 
         ui.add_space(8.0);
-        self.show_partition_list(ui);
+        self.show_partition_list(ui, devices, log);
     }
 
-    fn show_partition_list(&mut self, ui: &mut egui::Ui) {
+    fn show_partition_list(&mut self, ui: &mut egui::Ui, devices: &[DiskDevice], log: &mut LogPanel) {
         if self.partitions.is_empty() {
             ui.label("No partitions found.");
             return;
         }
 
-        // Determine if we can browse (need an image file source)
-        let can_browse = self.image_file_path.is_some();
-
-        let mut browse_request: Option<(u64, u8)> = None;
+        // Browse request: (partition_index, offset, partition_type_byte)
+        let mut browse_request: Option<(usize, u64, u8)> = None;
 
         egui::Grid::new("partition_table")
             .striped(true)
@@ -413,9 +429,7 @@ impl InspectTab {
                 ui.label(egui::RichText::new("Start LBA").strong());
                 ui.label(egui::RichText::new("Size").strong());
                 ui.label(egui::RichText::new("Boot").strong());
-                if can_browse {
-                    ui.label(egui::RichText::new("").strong());
-                }
+                ui.label(egui::RichText::new("").strong());
                 ui.end_row();
 
                 for part in &self.partitions {
@@ -432,26 +446,23 @@ impl InspectTab {
                         ui.label(egui::RichText::new(format!("{}", part.start_lba)).color(egui::Color32::GRAY));
                         ui.label(egui::RichText::new(partition::format_size(part.size_bytes)).color(egui::Color32::GRAY));
                         ui.label("");
-                        if can_browse {
-                            ui.label("");
-                        }
+                        ui.label("");
                     } else {
                         ui.label(index_label);
                         ui.label(&part.type_name);
                         ui.label(format!("{}", part.start_lba));
                         ui.label(partition::format_size(part.size_bytes));
                         ui.label(if part.bootable { "Yes" } else { "" });
-                        if can_browse {
-                            if is_fat_type(part.partition_type_byte) {
-                                if ui.small_button("Browse").clicked() {
-                                    browse_request = Some((
-                                        part.start_lba * 512,
-                                        part.partition_type_byte,
-                                    ));
-                                }
-                            } else {
-                                ui.label("");
+                        if is_fat_type(part.partition_type_byte) {
+                            if ui.small_button("Browse").clicked() {
+                                browse_request = Some((
+                                    part.index,
+                                    part.start_lba * 512,
+                                    part.partition_type_byte,
+                                ));
                             }
+                        } else {
+                            ui.label("");
                         }
                     }
                     ui.end_row();
@@ -459,9 +470,107 @@ impl InspectTab {
             });
 
         // Handle browse request outside the grid (avoids borrow issues)
-        if let Some((offset, ptype)) = browse_request {
-            if let Some(path) = &self.image_file_path {
-                self.browse_view.open(path.clone(), offset, ptype);
+        if let Some((part_index, offset, ptype)) = browse_request {
+            self.open_browse(part_index, offset, ptype, devices, log);
+        }
+    }
+
+    /// Resolve the browse source and open the filesystem browser.
+    ///
+    /// For raw image files / devices, the partition data lives at `offset`
+    /// within the image. For backup folders, the partition data is stored
+    /// as a separate file (raw, zstd-compressed, or CHD-compressed).
+    fn open_browse(
+        &mut self,
+        part_index: usize,
+        offset: u64,
+        ptype: u8,
+        devices: &[DiskDevice],
+        log: &mut LogPanel,
+    ) {
+        // Case 1: device or raw image file
+        let device_path = self
+            .selected_device_idx
+            .and_then(|idx| devices.get(idx))
+            .map(|d| d.path.clone());
+        let source_path = device_path.or_else(|| self.image_file_path.clone());
+        if let Some(path) = source_path {
+            log.info(format!(
+                "Browsing partition {} from {} at offset {}",
+                part_index, path.display(), offset,
+            ));
+            self.browse_view.open(path, offset, ptype);
+            return;
+        }
+
+        // Case 2: backup folder — find the partition's data file
+        let (folder, meta) = match (&self.backup_folder_path, &self.backup_metadata) {
+            (Some(f), Some(m)) => (f.clone(), m.clone()),
+            _ => {
+                log.error(format!(
+                    "partition-{}: no source available for browsing",
+                    part_index,
+                ));
+                return;
+            }
+        };
+
+        // Look up partition metadata
+        let part_meta = match meta.partitions.iter().find(|p| p.index == part_index) {
+            Some(pm) => pm,
+            None => {
+                log.error(format!(
+                    "partition-{}: not found in backup metadata",
+                    part_index,
+                ));
+                return;
+            }
+        };
+
+        if part_meta.compressed_files.is_empty() {
+            log.error(format!(
+                "partition-{}: no data files listed in backup metadata",
+                part_index,
+            ));
+            return;
+        }
+
+        // Split files not supported for browsing
+        if part_meta.compressed_files.len() > 1 {
+            log.warn(format!(
+                "partition-{}: browsing split backup files is not supported (files: {})",
+                part_index,
+                part_meta.compressed_files.join(", "),
+            ));
+            return;
+        }
+
+        let data_file = &part_meta.compressed_files[0];
+        let data_path = folder.join(data_file);
+
+        if !data_path.exists() {
+            log.error(format!(
+                "partition-{}: data file not found: {}",
+                part_index,
+                data_path.display(),
+            ));
+            return;
+        }
+
+        match meta.compression_type.as_str() {
+            "none" => {
+                // Raw file — partition data starts at offset 0
+                log.info(format!(
+                    "Browsing partition {} from {}",
+                    part_index, data_file,
+                ));
+                self.browse_view.open(data_path, 0, ptype);
+            }
+            other => {
+                log.warn(format!(
+                    "partition-{}: browsing {} compressed backups is not yet supported (file: {})",
+                    part_index, other, data_file,
+                ));
             }
         }
     }
