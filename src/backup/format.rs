@@ -79,6 +79,30 @@ pub fn export_mbr(mbr: &Mbr, raw_bytes: &[u8; 512], folder: &Path) -> Result<()>
     Ok(())
 }
 
+/// Export a modified MBR to `mbr-min.bin` with partition `total_sectors`
+/// reduced to the effective (imaged) sizes.
+///
+/// `min_sectors` is a list of `(mbr_entry_index, new_total_sectors)` where
+/// each entry index refers to a primary MBR entry (0–3).  The function copies
+/// the original 512-byte MBR verbatim (preserving boot code, CHS, disk
+/// signature, etc.) and overwrites only the 4-byte `total_sectors` field
+/// (bytes 12–15 of each 16-byte entry at offset 446) for the specified entries.
+pub fn export_mbr_min(
+    original_bytes: &[u8; 512],
+    min_sectors: &[(usize, u32)],
+    folder: &Path,
+) -> Result<()> {
+    let mut patched = *original_bytes;
+    for &(entry_index, new_total) in min_sectors {
+        let offset = 446 + entry_index * 16 + 12;
+        patched[offset..offset + 4].copy_from_slice(&new_total.to_le_bytes());
+    }
+    let bin_path = folder.join("mbr-min.bin");
+    fs::write(&bin_path, &patched)
+        .with_context(|| format!("failed to write {}", bin_path.display()))?;
+    Ok(())
+}
+
 /// Export a GPT to `gpt.json` and its protective MBR to `mbr.bin`.
 pub fn export_gpt(
     gpt: &Gpt,
@@ -180,5 +204,50 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(folder.join("mbr.json")).unwrap()).unwrap();
         assert_eq!(json["disk_signature"], 0xDEADBEEFu32);
+    }
+
+    #[test]
+    fn test_export_mbr_min() {
+        let tmp = TempDir::new().unwrap();
+        let folder = tmp.path().join("backup");
+        fs::create_dir(&folder).unwrap();
+
+        // Build a minimal valid MBR with two partitions
+        let mut data = [0u8; 512];
+        data[440..444].copy_from_slice(&0xCAFEBABEu32.to_le_bytes());
+
+        // Partition 0: 1048576 sectors
+        let e0 = 446;
+        data[e0 + 4] = 0x0C; // FAT32 LBA
+        data[e0 + 8..e0 + 12].copy_from_slice(&63u32.to_le_bytes());
+        data[e0 + 12..e0 + 16].copy_from_slice(&1048576u32.to_le_bytes());
+
+        // Partition 1: 2097152 sectors
+        let e1 = 446 + 16;
+        data[e1 + 4] = 0x06; // FAT16
+        data[e1 + 8..e1 + 12].copy_from_slice(&1048639u32.to_le_bytes());
+        data[e1 + 12..e1 + 16].copy_from_slice(&2097152u32.to_le_bytes());
+
+        data[510] = 0x55;
+        data[511] = 0xAA;
+
+        // Patch partition 0 to 500000, partition 1 to 100000
+        let min_sectors = vec![(0, 500_000u32), (1, 100_000u32)];
+        export_mbr_min(&data, &min_sectors, &folder).unwrap();
+
+        let patched = fs::read(folder.join("mbr-min.bin")).unwrap();
+        assert_eq!(patched.len(), 512);
+        // Boot code / signature preserved
+        assert_eq!(&patched[440..444], &0xCAFEBABEu32.to_le_bytes());
+        assert_eq!(&patched[510..512], &[0x55, 0xAA]);
+        // Type bytes preserved
+        assert_eq!(patched[e0 + 4], 0x0C);
+        assert_eq!(patched[e1 + 4], 0x06);
+        // Start LBAs preserved
+        assert_eq!(&patched[e0 + 8..e0 + 12], &63u32.to_le_bytes());
+        assert_eq!(&patched[e1 + 8..e1 + 12], &1048639u32.to_le_bytes());
+        // Total sectors patched
+        assert_eq!(&patched[e0 + 12..e0 + 16], &500_000u32.to_le_bytes());
+        assert_eq!(&patched[e1 + 12..e1 + 16], &100_000u32.to_le_bytes());
     }
 }

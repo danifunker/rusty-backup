@@ -326,21 +326,21 @@ fn gcd(a: u64, b: u64) -> u64 {
     }
 }
 
-/// Format a byte count as a human-readable size string.
+/// Format a byte count as a human-readable size string using binary (base-1024) units.
 pub fn format_size(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    const GB: u64 = 1024 * MB;
-    const TB: u64 = 1024 * GB;
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    const TIB: u64 = 1024 * GIB;
 
-    if bytes >= TB {
-        format!("{:.1} TB", bytes as f64 / TB as f64)
-    } else if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.1} KB", bytes as f64 / KB as f64)
+    if bytes >= TIB {
+        format!("{:.1} TiB", bytes as f64 / TIB as f64)
+    } else if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
     } else {
         format!("{bytes} B")
     }
@@ -453,10 +453,10 @@ mod tests {
     fn test_format_size() {
         assert_eq!(format_size(0), "0 B");
         assert_eq!(format_size(512), "512 B");
-        assert_eq!(format_size(1024), "1.0 KB");
-        assert_eq!(format_size(1048576), "1.0 MB");
-        assert_eq!(format_size(1073741824), "1.0 GB");
-        assert_eq!(format_size(1099511627776), "1.0 TB");
-        assert_eq!(format_size(536870912), "512.0 MB");
+        assert_eq!(format_size(1024), "1.0 KiB");
+        assert_eq!(format_size(1048576), "1.0 MiB");
+        assert_eq!(format_size(1073741824), "1.0 GiB");
+        assert_eq!(format_size(1099511627776), "1.0 TiB");
+        assert_eq!(format_size(536870912), "512.0 MiB");
     }
 }

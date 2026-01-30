@@ -286,6 +286,36 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         }
     }
 
+    // Export mbr-min.bin for MBR tables: a copy of the MBR with each
+    // partition's total_sectors reduced to the effective (imaged) size.
+    if let PartitionTable::Mbr(_) = &table {
+        let mut min_sectors: Vec<(usize, u32)> = Vec::new();
+        for (i, part) in partitions.iter().enumerate() {
+            if part.is_logical {
+                continue; // logical partitions live in EBRs, not the MBR
+            }
+            if part.is_extended_container {
+                // Sum effective sizes of all logical partitions inside this container
+                let logical_sum: u64 = partitions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| p.is_logical)
+                    .map(|(j, _)| effective_sizes[j])
+                    .sum();
+                let new_sectors = (logical_sum / 512) as u32;
+                min_sectors.push((part.index, new_sectors));
+            } else {
+                let new_sectors = (effective_sizes[i] / 512) as u32;
+                min_sectors.push((part.index, new_sectors));
+            }
+        }
+        if let Err(e) = format::export_mbr_min(&mbr_bytes, &min_sectors, &backup_folder) {
+            log(&progress, LogLevel::Warning, format!("Failed to export mbr-min.bin: {e}"));
+        } else {
+            log(&progress, LogLevel::Info, "Exported minimum-size MBR (mbr-min.bin)");
+        }
+    }
+
     let total_partition_bytes: u64 = partitions
         .iter()
         .zip(&effective_sizes)

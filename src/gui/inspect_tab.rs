@@ -412,12 +412,32 @@ impl InspectTab {
                 ui.label("(sector-by-sector)");
             }
         });
+        // Minimum restore size: sum of all partitions' imaged sizes, plus
+        // the offset of the first partition (to account for the MBR/GPT area).
+        let min_data_bytes: u64 = meta
+            .partitions
+            .iter()
+            .map(|pm| pm.imaged_size_bytes)
+            .sum();
+        let pre_partition_bytes = meta.alignment.first_partition_lba * 512;
+        let min_restore_bytes = min_data_bytes + pre_partition_bytes;
+
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Source Size:").strong());
-            ui.label(partition::format_size(meta.source_size_bytes));
+            if min_restore_bytes > 0 {
+                ui.label(egui::RichText::new("Minimum Size:").strong());
+                ui.label(format!(
+                    "{} ({} bytes)",
+                    format_size_decimal(min_restore_bytes),
+                    format_bytes_grouped(min_restore_bytes),
+                ));
+            } else if meta.source_size_bytes > 0 {
+                ui.label(egui::RichText::new("Source Size:").strong());
+                ui.label(partition::format_size(meta.source_size_bytes));
+            }
             ui.label(egui::RichText::new("Alignment:").strong());
             ui.label(&meta.alignment.detected_type);
         });
+
         ui.add_space(8.0);
     }
 
@@ -475,6 +495,9 @@ impl InspectTab {
                 ui.label(egui::RichText::new("Type").strong());
                 ui.label(egui::RichText::new("Start LBA").strong());
                 ui.label(egui::RichText::new("Size").strong());
+                if self.backup_metadata.is_some() {
+                    ui.label(egui::RichText::new("Min Size").strong());
+                }
                 ui.label(egui::RichText::new("Boot").strong());
                 ui.label(egui::RichText::new("").strong());
                 ui.end_row();
@@ -492,6 +515,23 @@ impl InspectTab {
                         ui.label(egui::RichText::new(&part.type_name).color(egui::Color32::GRAY));
                         ui.label(egui::RichText::new(format!("{}", part.start_lba)).color(egui::Color32::GRAY));
                         ui.label(egui::RichText::new(partition::format_size(part.size_bytes)).color(egui::Color32::GRAY));
+                        if let Some(meta) = &self.backup_metadata {
+                            // Sum imaged_size_bytes of all logical partitions
+                            let logical_sum: u64 = meta
+                                .partitions
+                                .iter()
+                                .filter(|pm| pm.index >= 4)
+                                .map(|pm| pm.imaged_size_bytes)
+                                .sum();
+                            if logical_sum > 0 {
+                                ui.label(
+                                    egui::RichText::new(partition::format_size(logical_sum))
+                                        .color(egui::Color32::GRAY),
+                                );
+                            } else {
+                                ui.label("");
+                            }
+                        }
                         ui.label("");
                         ui.label("");
                     } else {
@@ -499,6 +539,19 @@ impl InspectTab {
                         ui.label(&part.type_name);
                         ui.label(format!("{}", part.start_lba));
                         ui.label(partition::format_size(part.size_bytes));
+                        if let Some(meta) = &self.backup_metadata {
+                            let min_size = meta
+                                .partitions
+                                .iter()
+                                .find(|pm| pm.index == part.index)
+                                .map(|pm| pm.imaged_size_bytes)
+                                .filter(|&sz| sz > 0 && sz < part.size_bytes);
+                            if let Some(sz) = min_size {
+                                ui.label(partition::format_size(sz));
+                            } else {
+                                ui.label("");
+                            }
+                        }
                         ui.label(if part.bootable { "Yes" } else { "" });
                         if is_fat_type(part.partition_type_byte) || is_fat_name(&part.type_name) {
                             if ui.small_button("Browse").clicked() {
@@ -663,4 +716,31 @@ fn infer_fat_type_byte(name: &str) -> u8 {
     } else {
         0
     }
+}
+
+/// Format a byte count using base-1000 (SI) units, matching how storage
+/// media is marketed (e.g. "8 GB" on an SD card = 8,000,000,000 bytes).
+fn format_size_decimal(bytes: u64) -> String {
+    const GB: f64 = 1_000_000_000.0;
+    const MB: f64 = 1_000_000.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.2} GB", b / GB)
+    } else {
+        format!("{:.1} MB", b / MB)
+    }
+}
+
+/// Format a byte count with digit grouping for readability
+/// (e.g. 1,048,576).
+fn format_bytes_grouped(bytes: u64) -> String {
+    let s = bytes.to_string();
+    let mut result = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(ch);
+    }
+    result.chars().rev().collect()
 }
