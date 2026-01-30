@@ -100,6 +100,9 @@ impl LogPanel {
 pub struct ProgressState {
     pub current_bytes: u64,
     pub total_bytes: u64,
+    /// Full untrimmed partition sizes (for displaying savings).
+    /// When this is larger than `total_bytes`, smart trimming is active.
+    pub full_size_bytes: u64,
     pub operation: String,
     pub active: bool,
 }
@@ -109,6 +112,7 @@ impl Default for ProgressState {
         Self {
             current_bytes: 0,
             total_bytes: 0,
+            full_size_bytes: 0,
             operation: String::new(),
             active: false,
         }
@@ -125,13 +129,25 @@ impl ProgressState {
             ui.label(&self.operation);
             if self.total_bytes > 0 {
                 let fraction = self.current_bytes as f32 / self.total_bytes as f32;
-                let bar = egui::ProgressBar::new(fraction)
-                    .text(format!(
+                let text = if self.full_size_bytes > self.total_bytes {
+                    // Smart trimming active — show savings
+                    format!(
+                        "{} / {} to image of {} total ({:.0}%)",
+                        rusty_backup::partition::format_size(self.current_bytes),
+                        rusty_backup::partition::format_size(self.total_bytes),
+                        rusty_backup::partition::format_size(self.full_size_bytes),
+                        fraction * 100.0,
+                    )
+                } else {
+                    format!(
                         "{} / {} ({:.0}%)",
                         rusty_backup::partition::format_size(self.current_bytes),
                         rusty_backup::partition::format_size(self.total_bytes),
                         fraction * 100.0,
-                    ))
+                    )
+                };
+                let bar = egui::ProgressBar::new(fraction)
+                    .text(text)
                     .animate(true);
                 ui.add(bar);
             } else {

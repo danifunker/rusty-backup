@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -21,17 +21,20 @@ pub fn compress_partition(
     output_base: &Path,
     compression: CompressionType,
     split_size: Option<u64>,
+    skip_zeros: bool,
     mut progress_cb: impl FnMut(u64),
     cancel_check: impl Fn() -> bool,
 ) -> Result<Vec<String>> {
     match compression {
         CompressionType::None => {
-            stream_with_split(reader, output_base, "raw", split_size, &mut progress_cb, &cancel_check)
+            stream_with_split(reader, output_base, "raw", split_size, skip_zeros, &mut progress_cb, &cancel_check)
         }
         CompressionType::Zstd => {
+            // zstd compresses zero blocks efficiently; no need to skip
             compress_zstd(reader, output_base, split_size, &mut progress_cb, &cancel_check)
         }
         CompressionType::Chd => {
+            // CHD needs complete raw temp file; chdman handles zero compression
             compress_chd(reader, output_base, split_size, &mut progress_cb, &cancel_check)
         }
     }
@@ -47,12 +50,13 @@ pub fn detect_chdman() -> bool {
         .is_ok()
 }
 
-/// Stream raw data with optional splitting.
+/// Stream raw data with optional splitting and zero-skipping.
 fn stream_with_split(
     reader: &mut impl Read,
     output_base: &Path,
     extension: &str,
     split_size: Option<u64>,
+    skip_zeros: bool,
     progress_cb: &mut impl FnMut(u64),
     cancel_check: &impl Fn() -> bool,
 ) -> Result<Vec<String>> {
@@ -61,6 +65,7 @@ fn stream_with_split(
     let mut part_index: u32 = 0;
     let mut current_file_bytes: u64 = 0;
     let split_bytes = split_size.unwrap_or(u64::MAX);
+    let mut skipped_zeros = false;
 
     let first_path = output_path(output_base, extension, split_size.is_some(), part_index);
     let mut writer = BufWriter::new(
@@ -80,6 +85,46 @@ fn stream_with_split(
             break;
         }
 
+        // When skip_zeros is enabled and the entire chunk is zeros, seek forward
+        // in the output instead of writing. This creates a sparse file on
+        // supported filesystems and saves I/O time on large mostly-empty partitions.
+        if skip_zeros && is_all_zeros(&buf[..n]) {
+            // We still need to account for split boundaries
+            let mut remaining = n;
+            while remaining > 0 {
+                let space_in_split = split_bytes.saturating_sub(current_file_bytes) as usize;
+                let skip_amount = remaining.min(space_in_split);
+                current_file_bytes += skip_amount as u64;
+                remaining -= skip_amount;
+
+                if current_file_bytes >= split_bytes && remaining > 0 {
+                    // Ensure correct file length before moving to next split
+                    writer.flush()?;
+                    writer.get_mut().set_len(current_file_bytes)?;
+                    drop(writer);
+                    part_index += 1;
+                    current_file_bytes = 0;
+                    let next_path = output_path(output_base, extension, true, part_index);
+                    writer = BufWriter::new(
+                        File::create(&next_path)
+                            .with_context(|| format!("failed to create {}", next_path.display()))?,
+                    );
+                    files.push(file_name(&next_path));
+                }
+            }
+            skipped_zeros = true;
+            total_read += n as u64;
+            progress_cb(total_read);
+            continue;
+        }
+
+        // If we previously skipped zeros, seek the writer to the correct position
+        if skipped_zeros {
+            writer.flush()?;
+            writer.seek(io::SeekFrom::Start(current_file_bytes))?;
+            skipped_zeros = false;
+        }
+
         let mut written = 0;
         while written < n {
             let remaining_in_split = split_bytes.saturating_sub(current_file_bytes) as usize;
@@ -95,6 +140,7 @@ fn stream_with_split(
                 drop(writer);
                 part_index += 1;
                 current_file_bytes = 0;
+                skipped_zeros = false;
                 let next_path =
                     output_path(output_base, extension, true, part_index);
                 writer = BufWriter::new(
@@ -109,8 +155,18 @@ fn stream_with_split(
         progress_cb(total_read);
     }
 
+    // Ensure correct file length if the last chunk(s) were skipped zeros
     writer.flush()?;
+    if skipped_zeros {
+        writer.get_mut().set_len(current_file_bytes)?;
+    }
+
     Ok(files)
+}
+
+/// Check if a byte slice is entirely zeros.
+fn is_all_zeros(data: &[u8]) -> bool {
+    data.iter().all(|&b| b == 0)
 }
 
 /// Compress with zstd, streaming through the encoder with optional splitting.
@@ -212,8 +268,28 @@ fn compress_chd(
         .with_context(|| format!("failed to stat temp file: {}", temp_path.display()))?
         .len();
 
-    // Hunk size must evenly divide the input size; use 4096 if possible, else 512
-    let hunk_size = if raw_size % 4096 == 0 { 4096 } else { 512 };
+    // chdman createraw parameters:
+    // -us (unit size) = sector size, always 512 bytes
+    // -hs (hunk size) = must be a multiple of unit size, and total data
+    //     must be a multiple of hunk size. Default to 4096 (8 sectors).
+    let unit_size: u64 = 512;
+    let hunk_size: u64 = 4096;
+
+    // Pad the raw data to the nearest hunk_size boundary if needed
+    let remainder = raw_size % hunk_size;
+    if remainder != 0 {
+        let pad_bytes = hunk_size - remainder;
+        let pad_file = fs::OpenOptions::new()
+            .append(true)
+            .open(&temp_path)
+            .context("failed to open temp file for padding")?;
+        let mut pad_writer = BufWriter::new(pad_file);
+        let zeros = vec![0u8; pad_bytes as usize];
+        pad_writer
+            .write_all(&zeros)
+            .context("failed to pad temp file")?;
+        pad_writer.flush()?;
+    }
 
     let chd_path = output_path(output_base, "chd", false, 0);
     let status = Command::new("chdman")
@@ -225,7 +301,7 @@ fn compress_chd(
         .arg("-hs")
         .arg(hunk_size.to_string())
         .arg("-us")
-        .arg(raw_size.to_string())
+        .arg(unit_size.to_string())
         .status()
         .context("failed to run chdman")?;
 
@@ -405,6 +481,7 @@ mod tests {
             &base,
             CompressionType::None,
             None,
+            false,
             |_| {},
             || false,
         )
@@ -428,6 +505,7 @@ mod tests {
             &base,
             CompressionType::None,
             Some(1024),
+            false,
             |_| {},
             || false,
         )
@@ -459,6 +537,7 @@ mod tests {
             &base,
             CompressionType::Zstd,
             None,
+            false,
             |_| {},
             || false,
         )
@@ -476,6 +555,59 @@ mod tests {
     }
 
     #[test]
+    fn test_skip_zeros_raw() {
+        let tmp = TempDir::new().unwrap();
+        // 256KB of zeros followed by 256KB of data
+        let mut data = vec![0u8; CHUNK_SIZE];
+        data.extend(vec![0xAAu8; CHUNK_SIZE]);
+        let mut reader = Cursor::new(&data);
+        let base = tmp.path().join("partition-0");
+
+        let files = compress_partition(
+            &mut reader,
+            &base,
+            CompressionType::None,
+            None,
+            true, // skip zeros
+            |_| {},
+            || false,
+        )
+        .unwrap();
+
+        assert_eq!(files, vec!["partition-0.raw"]);
+        let written = fs::read(tmp.path().join("partition-0.raw")).unwrap();
+        // File should still be the full size (sparse on disk, full logically)
+        assert_eq!(written.len(), CHUNK_SIZE * 2);
+        // First chunk should be zeros, second should be 0xAA
+        assert!(written[..CHUNK_SIZE].iter().all(|&b| b == 0));
+        assert!(written[CHUNK_SIZE..].iter().all(|&b| b == 0xAA));
+    }
+
+    #[test]
+    fn test_skip_zeros_all_zeros() {
+        let tmp = TempDir::new().unwrap();
+        let data = vec![0u8; CHUNK_SIZE * 4];
+        let mut reader = Cursor::new(&data);
+        let base = tmp.path().join("partition-0");
+
+        let files = compress_partition(
+            &mut reader,
+            &base,
+            CompressionType::None,
+            None,
+            true, // skip zeros
+            |_| {},
+            || false,
+        )
+        .unwrap();
+
+        assert_eq!(files, vec!["partition-0.raw"]);
+        let written = fs::read(tmp.path().join("partition-0.raw")).unwrap();
+        assert_eq!(written.len(), CHUNK_SIZE * 4);
+        assert!(written.iter().all(|&b| b == 0));
+    }
+
+    #[test]
     fn test_cancel_aborts() {
         let tmp = TempDir::new().unwrap();
         let data = vec![0u8; 65536];
@@ -487,6 +619,7 @@ mod tests {
             &base,
             CompressionType::None,
             None,
+            false,
             |_| {},
             || true, // always cancel
         );

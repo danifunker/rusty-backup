@@ -13,6 +13,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
+use crate::browse;
 use crate::partition::{self, PartitionTable};
 use metadata::{AlignmentMetadata, BackupMetadata, PartitionMetadata};
 
@@ -67,12 +68,18 @@ pub struct BackupConfig {
     pub compression: CompressionType,
     pub checksum: ChecksumType,
     pub split_size_mib: Option<u32>,
+    /// When true, copy every sector verbatim (including blank space).
+    /// When false (default), skip all-zero blocks for smaller/faster output.
+    pub sector_by_sector: bool,
 }
 
 /// Shared progress state between background backup thread and the GUI.
 pub struct BackupProgress {
     pub current_bytes: u64,
     pub total_bytes: u64,
+    /// Full untrimmed partition sizes — when larger than `total_bytes`,
+    /// indicates smart trimming is saving space.
+    pub full_size_bytes: u64,
     pub operation: String,
     pub finished: bool,
     pub error: Option<String>,
@@ -98,6 +105,7 @@ impl BackupProgress {
         Self {
             current_bytes: 0,
             total_bytes: 0,
+            full_size_bytes: 0,
             operation: String::new(),
             finished: false,
             error: None,
@@ -218,21 +226,117 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         bail!("backup cancelled");
     }
 
-    // Step 4: Process each partition
+    // Step 4: Analyze partitions for smart sizing
+    //
+    // When not in sector-by-sector mode, try filesystem-aware compaction first
+    // (FAT only — packs allocated clusters contiguously for a smaller, defragmented
+    // image). If compaction isn't possible, fall back to trim-based sizing that
+    // skips unused space beyond the last allocated cluster.
     let split_bytes = config.split_size_mib.map(|mib| mib as u64 * 1024 * 1024);
     let mut partition_metadata = Vec::new();
     let mut overall_bytes_done: u64 = 0;
-    let total_partition_bytes: u64 = partitions.iter().map(|p| p.size_bytes).sum();
+
+    // Pre-compute effective sizes for each partition.
+    // compact_sizes[i] is Some(compacted_size) if compaction is available for
+    // partition i, or None if we should fall back to trimming.
+    let mut effective_sizes: Vec<u64> = Vec::with_capacity(partitions.len());
+    let mut compact_sizes: Vec<Option<u64>> = Vec::with_capacity(partitions.len());
+
+    for part in partitions.iter() {
+        if config.sector_by_sector || part.is_extended_container {
+            effective_sizes.push(part.size_bytes);
+            compact_sizes.push(None);
+            continue;
+        }
+
+        // Try compaction first
+        let part_offset = part.start_lba * 512;
+        let compact_result = source
+            .get_ref()
+            .try_clone()
+            .ok()
+            .and_then(|clone| {
+                browse::compact_partition_reader(
+                    BufReader::new(clone),
+                    part_offset,
+                    part.partition_type_byte,
+                )
+            })
+            .map(|(_, result)| result);
+
+        if let Some(ref result) = compact_result {
+            effective_sizes.push(result.compacted_size);
+            compact_sizes.push(Some(result.compacted_size));
+        } else {
+            // Fall back to trim-based sizing
+            let effective = source
+                .get_ref()
+                .try_clone()
+                .ok()
+                .and_then(|clone| {
+                    browse::effective_partition_size(
+                        BufReader::new(clone),
+                        part_offset,
+                        part.partition_type_byte,
+                    )
+                })
+                .map(|data_end| data_end.min(part.size_bytes));
+            effective_sizes.push(effective.unwrap_or(part.size_bytes));
+            compact_sizes.push(None);
+        }
+    }
+
+    let total_partition_bytes: u64 = partitions
+        .iter()
+        .zip(&effective_sizes)
+        .filter(|(p, _)| !p.is_extended_container)
+        .map(|(_, &sz)| sz)
+        .sum();
+
+    let full_partition_bytes: u64 = partitions
+        .iter()
+        .filter(|p| !p.is_extended_container)
+        .map(|p| p.size_bytes)
+        .sum();
 
     if let Ok(mut p) = progress.lock() {
         p.total_bytes = total_partition_bytes;
+        p.full_size_bytes = full_partition_bytes;
         p.current_bytes = 0;
     }
 
-    for part in &partitions {
+    if full_partition_bytes > total_partition_bytes {
+        log(
+            &progress,
+            LogLevel::Info,
+            format!(
+                "Smart sizing: imaging {} of {} total (saving {})",
+                partition::format_size(total_partition_bytes),
+                partition::format_size(full_partition_bytes),
+                partition::format_size(full_partition_bytes - total_partition_bytes),
+            ),
+        );
+    }
+
+    for (part_idx, part) in partitions.iter().enumerate() {
         if is_cancelled(&progress) {
             bail!("backup cancelled");
         }
+
+        if part.is_extended_container {
+            log(
+                &progress,
+                LogLevel::Info,
+                format!(
+                    "Skipping extended container partition-{} (logical partitions backed up individually)",
+                    part.index
+                ),
+            );
+            continue;
+        }
+
+        let image_size = effective_sizes[part_idx];
+        let is_compacted = compact_sizes[part_idx].is_some();
 
         let part_label = format!("partition-{}", part.index);
         set_operation(
@@ -240,46 +344,98 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             format!(
                 "Backing up {} ({})...",
                 part_label,
-                partition::format_size(part.size_bytes)
-            ),
-        );
-        log(
-            &progress,
-            LogLevel::Info,
-            format!(
-                "Processing {}: {} at LBA {}, size {}",
-                part_label,
-                part.type_name,
-                part.start_lba,
-                partition::format_size(part.size_bytes)
+                partition::format_size(image_size)
             ),
         );
 
-        // Seek to partition start
-        let part_offset = part.start_lba * 512;
-        source.seek(SeekFrom::Start(part_offset))?;
-
-        // Create a limited reader for exactly the partition's size
-        let part_reader = (&mut source).take(part.size_bytes);
-        let mut limited = LimitedReader::new(part_reader);
+        if is_compacted {
+            log(
+                &progress,
+                LogLevel::Info,
+                format!(
+                    "Compacting {}: {} at LBA {}, {} → {} (defragmented)",
+                    part_label,
+                    part.type_name,
+                    part.start_lba,
+                    partition::format_size(part.size_bytes),
+                    partition::format_size(image_size),
+                ),
+            );
+        } else if image_size < part.size_bytes {
+            log(
+                &progress,
+                LogLevel::Info,
+                format!(
+                    "Processing {}: {} at LBA {}, trimmed from {} to {}",
+                    part_label,
+                    part.type_name,
+                    part.start_lba,
+                    partition::format_size(part.size_bytes),
+                    partition::format_size(image_size),
+                ),
+            );
+        } else {
+            log(
+                &progress,
+                LogLevel::Info,
+                format!(
+                    "Processing {}: {} at LBA {}, size {}",
+                    part_label,
+                    part.type_name,
+                    part.start_lba,
+                    partition::format_size(part.size_bytes)
+                ),
+            );
+        }
 
         let output_base = backup_folder.join(&part_label);
         let progress_clone = Arc::clone(&progress);
         let base_bytes = overall_bytes_done;
 
-        let compressed_files = compress::compress_partition(
-            &mut limited,
-            &output_base,
-            config.compression,
-            split_bytes,
-            |bytes_read| {
-                set_progress_bytes(&progress_clone, base_bytes + bytes_read, total_partition_bytes);
-            },
-            || is_cancelled(&progress_clone),
-        )
-        .with_context(|| format!("failed to compress {part_label}"))?;
+        let compressed_files = if is_compacted {
+            // Use compacted reader — create a fresh CompactFatReader
+            let part_offset = part.start_lba * 512;
+            let clone = source.get_ref().try_clone()
+                .context("failed to clone source for compaction")?;
+            let (mut compact_reader, _) = browse::CompactFatReader::new(
+                BufReader::new(clone),
+                part_offset,
+            ).map_err(|e| anyhow::anyhow!("compaction failed: {e}"))?;
 
-        overall_bytes_done += part.size_bytes;
+            compress::compress_partition(
+                &mut compact_reader,
+                &output_base,
+                config.compression,
+                split_bytes,
+                false, // compacted image has no wasted space, don't skip zeros
+                |bytes_read| {
+                    set_progress_bytes(&progress_clone, base_bytes + bytes_read, total_partition_bytes);
+                },
+                || is_cancelled(&progress_clone),
+            )
+            .with_context(|| format!("failed to compress {part_label}"))?
+        } else {
+            // Fall back to trim-based read
+            let part_offset = part.start_lba * 512;
+            source.seek(SeekFrom::Start(part_offset))?;
+            let part_reader = (&mut source).take(image_size);
+            let mut limited = LimitedReader::new(part_reader);
+
+            compress::compress_partition(
+                &mut limited,
+                &output_base,
+                config.compression,
+                split_bytes,
+                !config.sector_by_sector,
+                |bytes_read| {
+                    set_progress_bytes(&progress_clone, base_bytes + bytes_read, total_partition_bytes);
+                },
+                || is_cancelled(&progress_clone),
+            )
+            .with_context(|| format!("failed to compress {part_label}"))?
+        };
+
+        overall_bytes_done += image_size;
         set_progress_bytes(&progress, overall_bytes_done, total_partition_bytes);
 
         // Compute checksums for each output file
@@ -296,7 +452,6 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         let combined_checksum = if all_checksums.len() == 1 {
             all_checksums[0].clone()
         } else {
-            // For multi-file, join with commas
             all_checksums.join(",")
         };
 
@@ -316,9 +471,11 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             type_name: part.type_name.clone(),
             start_lba: part.start_lba,
             original_size_bytes: part.size_bytes,
+            imaged_size_bytes: image_size,
             compressed_files,
             checksum: combined_checksum,
             resized: false,
+            compacted: is_compacted,
         });
     }
 
@@ -337,6 +494,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         checksum_type: config.checksum.as_str().to_string(),
         compression_type: config.compression.as_str().to_string(),
         split_size_mib: config.split_size_mib,
+        sector_by_sector: config.sector_by_sector,
         alignment: AlignmentMetadata {
             detected_type: format!("{}", alignment.alignment_type),
             first_partition_lba: alignment.first_lba,

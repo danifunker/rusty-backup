@@ -1,3 +1,5 @@
+use std::fs::File;
+use std::io::BufReader;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -5,6 +7,7 @@ use rusty_backup::backup::{
     BackupConfig, BackupProgress, ChecksumType, CompressionType, LogLevel as BackupLogLevel,
 };
 use rusty_backup::device::DiskDevice;
+use rusty_backup::partition::{self, PartitionInfo, PartitionTable};
 
 use super::progress::{LogPanel, ProgressState};
 
@@ -14,6 +17,7 @@ pub struct BackupTab {
     image_file_path: Option<PathBuf>,
     destination_folder: Option<PathBuf>,
     backup_name: String,
+    sector_by_sector: bool,
     resize_partitions: bool,
     split_archives: bool,
     split_size_mib: u32,
@@ -22,6 +26,12 @@ pub struct BackupTab {
     chdman_available: bool,
     backup_running: bool,
     backup_progress: Option<Arc<Mutex<BackupProgress>>>,
+    /// Auto-loaded partition info for the selected source
+    source_partitions: Vec<PartitionInfo>,
+    partition_load_error: Option<String>,
+    /// Change detection for auto-load
+    prev_device_idx: Option<usize>,
+    prev_image_path: Option<PathBuf>,
 }
 
 impl Default for BackupTab {
@@ -31,6 +41,7 @@ impl Default for BackupTab {
             image_file_path: None,
             destination_folder: None,
             backup_name: String::new(),
+            sector_by_sector: false,
             resize_partitions: true,
             split_archives: true,
             split_size_mib: 4000,
@@ -39,6 +50,10 @@ impl Default for BackupTab {
             chdman_available: false,
             backup_running: false,
             backup_progress: None,
+            source_partitions: Vec::new(),
+            partition_load_error: None,
+            prev_device_idx: None,
+            prev_image_path: None,
         }
     }
 }
@@ -119,6 +134,40 @@ impl BackupTab {
             });
         });
 
+        // Auto-load partition info when source changes
+        if !self.backup_running {
+            let source_changed = self.selected_device_idx != self.prev_device_idx
+                || self.image_file_path != self.prev_image_path;
+            if source_changed {
+                self.prev_device_idx = self.selected_device_idx;
+                self.prev_image_path = self.image_file_path.clone();
+                self.load_partition_preview(devices, log);
+            }
+        }
+
+        // Show partition preview if loaded
+        if !self.source_partitions.is_empty() {
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Partitions:").strong());
+                for part in &self.source_partitions {
+                    if !part.is_extended_container {
+                        let label = format!(
+                            "#{}: {} ({})",
+                            part.index,
+                            part.type_name,
+                            partition::format_size(part.size_bytes),
+                        );
+                        ui.label(&label);
+                    }
+                }
+            });
+            ui.add_space(4.0);
+        }
+        if let Some(err) = &self.partition_load_error {
+            ui.colored_label(egui::Color32::from_rgb(200, 150, 100), err);
+        }
+
         // Destination folder
         ui.horizontal(|ui| {
             ui.label("Destination:");
@@ -178,6 +227,12 @@ impl BackupTab {
                 {}
             });
 
+            // Sector-by-sector option
+            ui.checkbox(
+                &mut self.sector_by_sector,
+                "Sector-by-sector copy (includes all blank space)",
+            );
+
             // Resize option
             ui.checkbox(
                 &mut self.resize_partitions,
@@ -231,6 +286,47 @@ impl BackupTab {
         });
     }
 
+    fn load_partition_preview(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {
+        self.source_partitions.clear();
+        self.partition_load_error = None;
+
+        let path = match self.source_path(devices) {
+            Some(p) => p,
+            None => return,
+        };
+
+        // Only auto-load for image files (not raw devices which need elevation)
+        let path_str = path.to_string_lossy();
+        if path_str.starts_with("/dev/") || path_str.starts_with("\\\\.\\") {
+            // Device path -- skip auto-load to avoid permission prompts
+            return;
+        }
+
+        match File::open(&path) {
+            Ok(file) => {
+                let mut reader = BufReader::new(file);
+                match PartitionTable::detect(&mut reader) {
+                    Ok(table) => {
+                        self.source_partitions = table.partitions();
+                        log.info(format!(
+                            "Source has {} partition(s) ({})",
+                            self.source_partitions.len(),
+                            table.type_name(),
+                        ));
+                    }
+                    Err(e) => {
+                        self.partition_load_error =
+                            Some(format!("Could not read partition table: {e}"));
+                    }
+                }
+            }
+            Err(e) => {
+                self.partition_load_error =
+                    Some(format!("Cannot open source: {e}"));
+            }
+        }
+    }
+
     fn source_path(&self, devices: &[DiskDevice]) -> Option<PathBuf> {
         if let Some(path) = &self.image_file_path {
             Some(path.clone())
@@ -275,6 +371,7 @@ impl BackupTab {
             } else {
                 None
             },
+            sector_by_sector: self.sector_by_sector,
         };
 
         let progress_arc = Arc::new(Mutex::new(BackupProgress::new()));
@@ -322,6 +419,7 @@ impl BackupTab {
         progress_state.operation = p.operation.clone();
         progress_state.current_bytes = p.current_bytes;
         progress_state.total_bytes = p.total_bytes;
+        progress_state.full_size_bytes = p.full_size_bytes;
 
         if p.finished {
             if let Some(err) = &p.error {

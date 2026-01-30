@@ -11,6 +11,10 @@ pub struct BackupMetadata {
     pub checksum_type: String,
     pub compression_type: String,
     pub split_size_mib: Option<u32>,
+    /// True if the backup was made in sector-by-sector mode (all sectors
+    /// including blank space). False means zero blocks were skipped.
+    #[serde(default)]
+    pub sector_by_sector: bool,
     pub alignment: AlignmentMetadata,
     pub partitions: Vec<PartitionMetadata>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -24,9 +28,16 @@ pub struct PartitionMetadata {
     pub type_name: String,
     pub start_lba: u64,
     pub original_size_bytes: u64,
+    /// Actual bytes captured from the partition. Equals `original_size_bytes`
+    /// for sector-by-sector backups; may be smaller when smart trimming is used.
+    #[serde(default)]
+    pub imaged_size_bytes: u64,
     pub compressed_files: Vec<String>,
     pub checksum: String,
     pub resized: bool,
+    /// True if the partition was compacted (FAT defragmentation) during backup.
+    #[serde(default)]
+    pub compacted: bool,
 }
 
 /// Partition alignment information for the backup.
@@ -63,6 +74,7 @@ mod tests {
             checksum_type: "sha256".to_string(),
             compression_type: "zstd".to_string(),
             split_size_mib: Some(4000),
+            sector_by_sector: false,
             alignment: AlignmentMetadata {
                 detected_type: "DOS Traditional (255x63)".to_string(),
                 first_partition_lba: 63,
@@ -76,9 +88,11 @@ mod tests {
                     type_name: "FAT32 (LBA)".to_string(),
                     start_lba: 63,
                     original_size_bytes: 2_000_000_000,
+                    imaged_size_bytes: 500_000_000,
                     compressed_files: vec!["partition-0.zst".to_string()],
                     checksum: "abcdef1234567890".to_string(),
                     resized: false,
+                    compacted: false,
                 },
             ],
             bad_sectors: vec![],
@@ -106,6 +120,7 @@ mod tests {
             checksum_type: "crc32".to_string(),
             compression_type: "none".to_string(),
             split_size_mib: None,
+            sector_by_sector: true,
             alignment: AlignmentMetadata {
                 detected_type: "None detected".to_string(),
                 first_partition_lba: 0,

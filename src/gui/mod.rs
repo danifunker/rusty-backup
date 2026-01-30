@@ -1,4 +1,5 @@
 mod backup_tab;
+mod browse_view;
 mod inspect_tab;
 mod progress;
 mod restore_tab;

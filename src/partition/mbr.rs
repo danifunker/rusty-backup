@@ -1,6 +1,7 @@
 use byteorder::{LittleEndian, ReadBytesExt};
 use serde::Serialize;
-use std::io::Cursor;
+use std::collections::HashSet;
+use std::io::{Cursor, Read, Seek, SeekFrom};
 
 use crate::error::RustyBackupError;
 
@@ -65,6 +66,11 @@ impl MbrPartitionEntry {
         self.partition_type == 0x00 && self.start_lba == 0 && self.total_sectors == 0
     }
 
+    /// Check if this entry is an extended partition container (CHS, LBA, or Linux).
+    pub fn is_extended(&self) -> bool {
+        matches!(self.partition_type, 0x05 | 0x0F | 0x85)
+    }
+
     pub fn size_bytes(&self) -> u64 {
         self.total_sectors as u64 * 512
     }
@@ -109,6 +115,11 @@ impl MbrPartitionEntry {
 pub struct Mbr {
     pub disk_signature: u32,
     pub entries: [MbrPartitionEntry; 4],
+    /// Logical partitions found by following the EBR chain of any extended
+    /// partition entry. Populated after initial parse by `parse_ebr_chain()`.
+    /// LBA values are absolute (already adjusted from EBR-relative offsets).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub logical_partitions: Vec<MbrPartitionEntry>,
 }
 
 impl Mbr {
@@ -142,6 +153,7 @@ impl Mbr {
         Ok(Self {
             disk_signature,
             entries,
+            logical_partitions: Vec::new(),
         })
     }
 
@@ -155,6 +167,87 @@ impl Mbr {
     pub fn active_entries(&self) -> Vec<&MbrPartitionEntry> {
         self.entries.iter().filter(|e| !e.is_empty()).collect()
     }
+}
+
+/// Maximum number of logical partitions to prevent infinite loops on corrupted data.
+const MAX_LOGICAL_PARTITIONS: usize = 64;
+
+/// Parse the Extended Boot Record (EBR) chain starting at `extended_start_lba`.
+///
+/// Each EBR is a 512-byte MBR-like structure at the start of an extended partition
+/// region. It uses only the first two of the four partition table entries:
+/// - Entry 0: describes the logical partition (start LBA relative to this EBR)
+/// - Entry 1: link to the next EBR (start LBA relative to the extended container)
+///
+/// The chain ends when the link entry is empty or we revisit an LBA.
+/// Returns logical partition entries with absolute LBA addresses.
+pub fn parse_ebr_chain(
+    reader: &mut (impl Read + Seek),
+    extended_start_lba: u32,
+) -> Result<Vec<MbrPartitionEntry>, RustyBackupError> {
+    let mut logical_partitions = Vec::new();
+    let mut visited = HashSet::new();
+    let mut current_ebr_lba = extended_start_lba;
+
+    loop {
+        if logical_partitions.len() >= MAX_LOGICAL_PARTITIONS {
+            break;
+        }
+
+        // Prevent infinite loops
+        if !visited.insert(current_ebr_lba) {
+            break;
+        }
+
+        // Seek to the EBR
+        let offset = current_ebr_lba as u64 * 512;
+        reader
+            .seek(SeekFrom::Start(offset))
+            .map_err(|e| RustyBackupError::Io(e))?;
+
+        let mut ebr_data = [0u8; 512];
+        if reader.read_exact(&mut ebr_data).is_err() {
+            // Can't read this EBR, end of chain
+            break;
+        }
+
+        // Check boot signature (some disks omit it on the last EBR)
+        let mut sig_cursor = Cursor::new(&ebr_data[510..512]);
+        let signature = sig_cursor.read_u16::<LittleEndian>().unwrap();
+        if signature != MBR_SIGNATURE {
+            break;
+        }
+
+        // Parse entry 0: the logical partition descriptor
+        let entry0_data: [u8; PARTITION_ENTRY_SIZE] = ebr_data
+            [PARTITION_TABLE_OFFSET..PARTITION_TABLE_OFFSET + PARTITION_ENTRY_SIZE]
+            .try_into()
+            .unwrap();
+        let entry0 = MbrPartitionEntry::parse(&entry0_data);
+
+        // Parse entry 1: the next EBR link
+        let entry1_offset = PARTITION_TABLE_OFFSET + PARTITION_ENTRY_SIZE;
+        let entry1_data: [u8; PARTITION_ENTRY_SIZE] = ebr_data
+            [entry1_offset..entry1_offset + PARTITION_ENTRY_SIZE]
+            .try_into()
+            .unwrap();
+        let entry1 = MbrPartitionEntry::parse(&entry1_data);
+
+        // Entry 0's start_lba is relative to current EBR position
+        if !entry0.is_empty() {
+            let mut logical = entry0;
+            logical.start_lba = current_ebr_lba + logical.start_lba;
+            logical_partitions.push(logical);
+        }
+
+        // Entry 1's start_lba is relative to the extended container start
+        if entry1.is_empty() {
+            break;
+        }
+        current_ebr_lba = extended_start_lba + entry1.start_lba;
+    }
+
+    Ok(logical_partitions)
 }
 
 #[cfg(test)]
@@ -251,6 +344,144 @@ mod tests {
         assert_eq!(mbr.entries[0].partition_type_name(), "FAT16 (>32MB)");
         assert_eq!(mbr.entries[1].partition_type_name(), "FAT32 (CHS)");
         assert_eq!(mbr.entries[0].start_lba, 63);
+    }
+
+    #[test]
+    fn test_is_extended() {
+        let data = make_mbr_bytes(
+            &[
+                (0x80, 0x06, 63, 1024000),   // FAT16 - not extended
+                (0x00, 0x05, 1024063, 4096000), // Extended (CHS)
+            ],
+            0xAA55,
+        );
+        let mbr = Mbr::parse(&data).unwrap();
+        assert!(!mbr.entries[0].is_extended());
+        assert!(mbr.entries[1].is_extended());
+    }
+
+    /// Build a disk image with an MBR containing an extended partition and
+    /// an EBR chain with the given logical partitions.
+    /// Returns a Vec<u8> large enough to hold all EBR sectors.
+    fn make_disk_with_ebr(
+        primary_entries: &[(u8, u8, u32, u32)],
+        extended_start_lba: u32,
+        // Each logical: (type, relative_start_from_ebr, sector_count)
+        logical_entries: &[(u8, u32, u32)],
+    ) -> Vec<u8> {
+        // Calculate needed size: enough to hold all EBR sectors
+        let max_lba = if logical_entries.is_empty() {
+            extended_start_lba + 1
+        } else {
+            // Each EBR is at extended_start_lba + some offset; we need enough space
+            let mut max = extended_start_lba + 1;
+            let mut ebr_offset = 0u32;
+            for (i, _) in logical_entries.iter().enumerate() {
+                let ebr_lba = extended_start_lba + ebr_offset;
+                max = max.max(ebr_lba + 1);
+                // Next EBR offset: just put them 2048 sectors apart
+                if i < logical_entries.len() - 1 {
+                    ebr_offset += 2048;
+                }
+            }
+            max + 2048 // extra space
+        };
+
+        let size = max_lba as usize * 512;
+        let mut disk = vec![0u8; size];
+
+        // Write MBR
+        let mbr = make_mbr_bytes(primary_entries, 0xAA55);
+        disk[..512].copy_from_slice(&mbr);
+
+        // Write EBR chain
+        let mut ebr_offset = 0u32;
+        for (i, &(ptype, rel_start, sectors)) in logical_entries.iter().enumerate() {
+            let ebr_lba = extended_start_lba + ebr_offset;
+            let ebr_byte_offset = ebr_lba as usize * 512;
+
+            // Boot signature
+            disk[ebr_byte_offset + 510] = 0x55;
+            disk[ebr_byte_offset + 511] = 0xAA;
+
+            // Entry 0: logical partition (relative to this EBR)
+            let e0_off = ebr_byte_offset + PARTITION_TABLE_OFFSET;
+            disk[e0_off + 4] = ptype;
+            disk[e0_off + 8..e0_off + 12].copy_from_slice(&rel_start.to_le_bytes());
+            disk[e0_off + 12..e0_off + 16].copy_from_slice(&sectors.to_le_bytes());
+
+            // Entry 1: link to next EBR (relative to extended container start)
+            if i + 1 < logical_entries.len() {
+                let next_ebr_offset = ebr_offset + 2048;
+                let e1_off = ebr_byte_offset + PARTITION_TABLE_OFFSET + PARTITION_ENTRY_SIZE;
+                disk[e1_off + 4] = 0x05; // extended type
+                disk[e1_off + 8..e1_off + 12].copy_from_slice(&next_ebr_offset.to_le_bytes());
+                disk[e1_off + 12..e1_off + 16].copy_from_slice(&2048u32.to_le_bytes());
+            }
+
+            ebr_offset += 2048;
+        }
+
+        disk
+    }
+
+    #[test]
+    fn test_ebr_single_logical() {
+        let disk = make_disk_with_ebr(
+            &[
+                (0x80, 0x06, 63, 1024000),       // FAT16
+                (0x00, 0x05, 1024063, 4096000),   // Extended
+            ],
+            1024063,
+            &[(0x0B, 1, 2048000)], // One FAT32 logical
+        );
+        let mut cursor = std::io::Cursor::new(disk);
+        let result = parse_ebr_chain(&mut cursor, 1024063).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].partition_type, 0x0B);
+        // Absolute LBA = EBR LBA (1024063) + relative start (1)
+        assert_eq!(result[0].start_lba, 1024064);
+        assert_eq!(result[0].total_sectors, 2048000);
+    }
+
+    #[test]
+    fn test_ebr_three_logicals() {
+        let disk = make_disk_with_ebr(
+            &[
+                (0x80, 0x06, 63, 1024000),
+                (0x00, 0x05, 1024063, 8192000),
+            ],
+            1024063,
+            &[
+                (0x06, 1, 1000000),   // FAT16
+                (0x0B, 1, 2000000),   // FAT32
+                (0x83, 1, 3000000),   // Linux
+            ],
+        );
+        let mut cursor = std::io::Cursor::new(disk);
+        let result = parse_ebr_chain(&mut cursor, 1024063).unwrap();
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].partition_type_name(), "FAT16 (>32MB)");
+        assert_eq!(result[0].start_lba, 1024063 + 1); // first EBR + 1
+        assert_eq!(result[1].partition_type_name(), "FAT32 (CHS)");
+        assert_eq!(result[1].start_lba, 1024063 + 2048 + 1); // second EBR + 1
+        assert_eq!(result[2].partition_type_name(), "Linux");
+        assert_eq!(result[2].start_lba, 1024063 + 4096 + 1); // third EBR + 1
+    }
+
+    #[test]
+    fn test_ebr_empty_extended() {
+        // Extended partition with no logical partitions (empty EBR)
+        let disk = make_disk_with_ebr(
+            &[(0x00, 0x05, 1024063, 4096000)],
+            1024063,
+            &[], // No logicals
+        );
+        let mut cursor = std::io::Cursor::new(disk);
+        let result = parse_ebr_chain(&mut cursor, 1024063).unwrap();
+        assert!(result.is_empty());
     }
 
     #[test]

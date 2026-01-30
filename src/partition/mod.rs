@@ -57,9 +57,15 @@ pub struct PartitionAlignment {
 pub struct PartitionInfo {
     pub index: usize,
     pub type_name: String,
+    /// Raw partition type byte (MBR type ID; 0 for GPT).
+    pub partition_type_byte: u8,
     pub start_lba: u64,
     pub size_bytes: u64,
     pub bootable: bool,
+    /// True for logical partitions inside an extended container.
+    pub is_logical: bool,
+    /// True for the extended container entry itself (not backed up individually).
+    pub is_extended_container: bool,
 }
 
 impl PartitionTable {
@@ -72,7 +78,7 @@ impl PartitionTable {
             .read_exact(&mut mbr_data)
             .map_err(|e| RustyBackupError::InvalidMbr(format!("cannot read first sector: {e}")))?;
 
-        let mbr = Mbr::parse(&mbr_data)?;
+        let mut mbr = Mbr::parse(&mbr_data)?;
 
         if mbr.is_protective_gpt() {
             // Try parsing GPT
@@ -87,6 +93,20 @@ impl PartitionTable {
                 }
             }
         } else {
+            // Parse EBR chain for any extended partition entries
+            for entry in &mbr.entries {
+                if entry.is_extended() && !entry.is_empty() {
+                    match mbr::parse_ebr_chain(reader, entry.start_lba) {
+                        Ok(logicals) => {
+                            mbr.logical_partitions = logicals;
+                        }
+                        Err(_) => {
+                            // EBR parsing failure is non-fatal; just skip logical partitions
+                        }
+                    }
+                    break; // Only one extended partition is valid per MBR
+                }
+            }
             Ok(PartitionTable::Mbr(mbr))
         }
     }
@@ -94,19 +114,40 @@ impl PartitionTable {
     /// Get a unified list of partition info for display.
     pub fn partitions(&self) -> Vec<PartitionInfo> {
         match self {
-            PartitionTable::Mbr(mbr) => mbr
-                .entries
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| !e.is_empty())
-                .map(|(i, e)| PartitionInfo {
-                    index: i,
-                    type_name: e.partition_type_name().to_string(),
-                    start_lba: e.start_lba as u64,
-                    size_bytes: e.size_bytes(),
-                    bootable: e.bootable,
-                })
-                .collect(),
+            PartitionTable::Mbr(mbr) => {
+                let mut result: Vec<PartitionInfo> = mbr
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| !e.is_empty())
+                    .map(|(i, e)| PartitionInfo {
+                        index: i,
+                        type_name: e.partition_type_name().to_string(),
+                        partition_type_byte: e.partition_type,
+                        start_lba: e.start_lba as u64,
+                        size_bytes: e.size_bytes(),
+                        bootable: e.bootable,
+                        is_logical: false,
+                        is_extended_container: e.is_extended(),
+                    })
+                    .collect();
+
+                // Append logical partitions from EBR chain (index 4+)
+                for (j, e) in mbr.logical_partitions.iter().enumerate() {
+                    result.push(PartitionInfo {
+                        index: 4 + j,
+                        type_name: e.partition_type_name().to_string(),
+                        partition_type_byte: e.partition_type,
+                        start_lba: e.start_lba as u64,
+                        size_bytes: e.size_bytes(),
+                        bootable: e.bootable,
+                        is_logical: true,
+                        is_extended_container: false,
+                    });
+                }
+
+                result
+            }
             PartitionTable::Gpt { gpt, .. } => gpt
                 .entries
                 .iter()
@@ -114,9 +155,12 @@ impl PartitionTable {
                 .map(|(i, e)| PartitionInfo {
                     index: i,
                     type_name: format!("{} ({})", e.type_name(), e.name),
+                    partition_type_byte: 0,
                     start_lba: e.first_lba,
                     size_bytes: e.size_bytes(),
                     bootable: false,
+                    is_logical: false,
+                    is_extended_container: false,
                 })
                 .collect(),
         }
