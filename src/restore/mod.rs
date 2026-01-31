@@ -1,14 +1,14 @@
 use std::collections::VecDeque;
 use std::fs::{self, File};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 
 use crate::partition::PartitionSizeOverride;
 use crate::rbformats::reconstruct_disk_from_backup;
-use crate::backup::metadata::{AlignmentMetadata, BackupMetadata};
+use crate::backup::metadata::BackupMetadata;
 use crate::backup::LogLevel;
 
 /// Restore configuration.

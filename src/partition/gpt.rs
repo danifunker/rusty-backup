@@ -1,4 +1,3 @@
-use byteorder::{LittleEndian, ReadBytesExt};
 use serde::Serialize;
 use std::io::{Read, Seek, SeekFrom};
 

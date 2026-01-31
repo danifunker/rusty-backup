@@ -23,6 +23,7 @@ pub struct BrowseView {
     /// Cached content of the selected file.
     content: Option<FileContent>,
     /// View mode for file content.
+    #[allow(dead_code)]
     view_mode: ViewMode,
     /// Error message to display.
     error: Option<String>,
@@ -43,6 +44,7 @@ enum FileContent {
     Text(String),
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ViewMode {
     Auto,

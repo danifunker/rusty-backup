@@ -16,6 +16,7 @@ use super::progress::{LogPanel, ProgressState};
 struct RestorePartitionConfig {
     index: usize,
     type_name: String,
+    #[allow(dead_code)]
     start_lba: u64,
     original_size: u64,
     minimum_size: u64,

@@ -7,10 +7,10 @@ mod linux;
 #[cfg(target_os = "windows")]
 mod windows;
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 
 use crate::device::DiskDevice;
 

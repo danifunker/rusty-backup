@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use byteorder::{LittleEndian, ReadBytesExt};
 
-use super::entry::{EntryType, FileEntry};
+use super::entry::FileEntry;
 use super::filesystem::{Filesystem, FilesystemError};
 
 const CHUNK_SIZE: usize = 256 * 1024; // 256 KB I/O buffer
@@ -37,6 +37,7 @@ pub struct FatFilesystem<R> {
     /// Total clusters.
     total_clusters: u64,
     /// Cluster count used (lazily computed).
+    #[allow(dead_code)]
     used_clusters: Option<u64>,
 }
 
@@ -64,6 +65,7 @@ const ATTR_HIDDEN: u8 = 0x02;
 const ATTR_SYSTEM: u8 = 0x04;
 const ATTR_VOLUME_ID: u8 = 0x08;
 const ATTR_DIRECTORY: u8 = 0x10;
+#[allow(dead_code)]
 const ATTR_ARCHIVE: u8 = 0x20;
 const ATTR_LONG_NAME: u8 = ATTR_READ_ONLY | ATTR_HIDDEN | ATTR_SYSTEM | ATTR_VOLUME_ID;
 
@@ -738,6 +740,7 @@ pub struct CompactInfo {
 ///   [ Data clusters 2, 3, 4, ... packed contiguously ]
 pub struct CompactFatReader<R> {
     source: R,
+    #[allow(dead_code)]
     partition_offset: u64,
 
     // Pre-built sections

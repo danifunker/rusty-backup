@@ -186,7 +186,6 @@ pub(crate) fn write_vhd(
     cancel_check: &impl Fn() -> bool,
 ) -> Result<Vec<String>> {
     use super::raw::stream_with_split;
-    use super::{file_name};
 
     // Write raw data (no splitting for VHD)
     let files = stream_with_split(
