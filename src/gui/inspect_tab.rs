@@ -444,12 +444,12 @@ impl InspectTab {
                     .find(|p| p.index == cfg.index)
                     .map(|p| p.start_lba)
                     .unwrap_or(0);
-                compress::PartitionSizeOverride {
-                    index: cfg.index,
+                compress::PartitionSizeOverride::size_only(
+                    cfg.index,
                     start_lba,
-                    original_size: cfg.original_size,
-                    export_size: cfg.effective_size(),
-                }
+                    cfg.original_size,
+                    cfg.effective_size(),
+                )
             })
             .collect();
 

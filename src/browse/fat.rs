@@ -1013,23 +1013,78 @@ impl<R: Read + Seek> CompactFatReader<R> {
             boot_sector[23] = spf16[1];
         }
 
+        // --- Patch FAT32 FSInfo in boot sector ---
+        // After compaction, the FSInfo sector must have the correct free cluster
+        // count (0 — all clusters in the compacted image are allocated) and
+        // next_free hint.
+        if fat_type == FatType::Fat32 {
+            let fsinfo_sector = u16::from_le_bytes([bpb[48], bpb[49]]);
+            if fsinfo_sector > 0
+                && (fsinfo_sector as u64) < reserved_sectors
+                && ((fsinfo_sector as u64 + 1) * bytes_per_sector) <= boot_sector.len() as u64
+            {
+                let fs_off = fsinfo_sector as usize * bytes_per_sector as usize;
+                let sig1 = u32::from_le_bytes(
+                    boot_sector[fs_off..fs_off + 4].try_into().unwrap_or([0; 4]),
+                );
+                let sig2 = u32::from_le_bytes(
+                    boot_sector[fs_off + 484..fs_off + 488].try_into().unwrap_or([0; 4]),
+                );
+                if sig1 == 0x41615252 && sig2 == 0x61417272 {
+                    // Free count = 0 (all clusters in compacted image are used)
+                    boot_sector[fs_off + 488..fs_off + 492]
+                        .copy_from_slice(&0u32.to_le_bytes());
+                    // Next free = first cluster past used data
+                    let next_free = (clusters_used as u32) + 2;
+                    boot_sector[fs_off + 492..fs_off + 496]
+                        .copy_from_slice(&next_free.to_le_bytes());
+                }
+            }
+        }
+
         // --- Build FAT table bytes ---
         let new_fat_byte_size = (new_sectors_per_fat * bytes_per_sector) as usize;
         let mut single_fat = vec![0u8; new_fat_byte_size];
 
-        // Copy entries 0 and 1 from original
+        // Set FAT[0] and FAT[1] with proper values.
+        // FAT[0] must contain the media byte (0xF8 for hard disk) with high bits set.
+        // FAT[1] must contain the end-of-chain marker with clean shutdown flags.
+        // (Cross-reference: partclone's fatclone.c check_fat_status())
+        let media_byte = bpb[21]; // BPB media byte (typically 0xF8 for hard disks)
         match fat_type {
             FatType::Fat12 => {
-                let copy_len = 3.min(fat_data.len()).min(single_fat.len());
-                single_fat[..copy_len].copy_from_slice(&fat_data[..copy_len]);
+                // FAT12: entries are 12 bits. Entry 0 = media | 0xF00, entry 1 = 0xFFF (EOC)
+                // FAT12 has no dirty flags in FAT[1]
+                let entry0 = 0x0F00u16 | media_byte as u16;
+                let entry1 = 0x0FFFu16;
+                // Pack two 12-bit entries into 3 bytes:
+                // entry0 occupies bits [0..11], entry1 occupies bits [12..23]
+                let packed: u32 = (entry0 as u32) | ((entry1 as u32) << 12);
+                if single_fat.len() >= 3 {
+                    single_fat[0] = packed as u8;
+                    single_fat[1] = (packed >> 8) as u8;
+                    single_fat[2] = (packed >> 16) as u8;
+                }
             }
             FatType::Fat16 => {
-                let copy_len = 4.min(fat_data.len()).min(single_fat.len());
-                single_fat[..copy_len].copy_from_slice(&fat_data[..copy_len]);
+                // FAT16: entry 0 = media | 0xFF00, entry 1 = 0xFFFF (EOC + clean flags)
+                // Bits 15 = clean shutdown, bit 14 = no I/O errors (both set = 0xC000)
+                let entry0 = 0xFF00u16 | media_byte as u16;
+                let entry1 = 0xFFFFu16; // EOC marker with all flag bits set
+                if single_fat.len() >= 4 {
+                    single_fat[0..2].copy_from_slice(&entry0.to_le_bytes());
+                    single_fat[2..4].copy_from_slice(&entry1.to_le_bytes());
+                }
             }
             FatType::Fat32 => {
-                let copy_len = 8.min(fat_data.len()).min(single_fat.len());
-                single_fat[..copy_len].copy_from_slice(&fat_data[..copy_len]);
+                // FAT32: entry 0 = media | 0x0FFFFF00, entry 1 = 0x0FFFFFFF (EOC + clean flags)
+                // Bits 27 = clean shutdown, bit 26 = no I/O errors (both set = 0x0C000000)
+                let entry0 = 0x0FFF_FF00u32 | media_byte as u32;
+                let entry1 = 0x0FFF_FFFFu32; // EOC marker with all flag bits set
+                if single_fat.len() >= 8 {
+                    single_fat[0..4].copy_from_slice(&entry0.to_le_bytes());
+                    single_fat[4..8].copy_from_slice(&entry1.to_le_bytes());
+                }
             }
         }
 

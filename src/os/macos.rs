@@ -252,6 +252,90 @@ fn build_device(
     })
 }
 
+/// Open a target device for writing, unmounting it first.
+///
+/// If normal open fails with permission denied, uses `osascript` to run
+/// with admin privileges via the native macOS authentication dialog.
+pub fn open_target_for_writing(path: &Path) -> Result<File> {
+    let path_str = path.to_string_lossy();
+
+    // Unmount all partitions on the disk first
+    // Convert /dev/rdiskN to diskN for diskutil
+    let disk_name = if path_str.starts_with("/dev/r") {
+        &path_str[6..]
+    } else if path_str.starts_with("/dev/") {
+        &path_str[5..]
+    } else {
+        &path_str
+    };
+
+    // Unmount the entire disk (force to handle busy volumes)
+    let unmount_result = Command::new("diskutil")
+        .args(["unmountDisk", "force", disk_name])
+        .output();
+
+    if let Ok(output) = unmount_result {
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Not fatal — the disk might not be mounted
+            eprintln!("diskutil unmountDisk warning: {}", stderr.trim());
+        }
+    }
+
+    // Use the raw device (/dev/rdiskN) for faster unbuffered writes
+    let raw_device = if path_str.starts_with("/dev/disk") {
+        format!("/dev/r{}", &path_str[5..])
+    } else {
+        path_str.to_string()
+    };
+
+    // Try normal open first
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&raw_device)
+    {
+        Ok(file) => return Ok(file),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            // Fall through to elevation attempt
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!(e)
+                .context(format!("cannot open {} for writing", raw_device)));
+        }
+    }
+
+    // Use osascript to open with elevated privileges.
+    // We open via a helper dd that writes nothing but holds the fd,
+    // but actually the simplest approach is just to re-try the unmount
+    // with admin privileges and then open.
+    let script = format!(
+        "do shell script \"diskutil unmountDisk force {disk_name}\" with administrator privileges"
+    );
+
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .context("failed to launch osascript for elevated unmount")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("User canceled") || stderr.contains("-128") {
+            bail!("User cancelled the administrator authentication request");
+        }
+    }
+
+    // Try opening again after elevated unmount
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&raw_device)
+        .with_context(|| format!(
+            "cannot open {} for writing (even after elevated unmount)", raw_device
+        ))
+}
+
 /// Open a source device or image file for reading, requesting elevated
 /// privileges via the native macOS authentication dialog if needed.
 ///

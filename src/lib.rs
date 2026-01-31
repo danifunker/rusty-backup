@@ -4,3 +4,4 @@ pub mod device;
 pub mod error;
 pub mod os;
 pub mod partition;
+pub mod restore;

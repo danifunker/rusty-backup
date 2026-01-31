@@ -7,10 +7,10 @@ mod linux;
 #[cfg(target_os = "windows")]
 mod windows;
 
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 
 use crate::device::DiskDevice;
 
@@ -54,6 +54,39 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
             file,
             temp_path: None,
         })
+    }
+}
+
+/// Open a target device or image file for writing (restore).
+///
+/// For regular files (`.img`): creates/truncates the file.
+/// For devices: uses platform-specific methods to open for raw write access
+/// (may unmount partitions, request elevation, etc.).
+pub fn open_target_for_writing(path: &Path) -> Result<File> {
+    let path_str = path.to_string_lossy();
+    let is_device = path_str.starts_with("/dev/") || path_str.starts_with("\\\\.\\");
+
+    if !is_device {
+        // Regular file — just create/truncate
+        return File::create(path)
+            .with_context(|| format!("failed to create {}", path.display()));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        macos::open_target_for_writing(path)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::open_target_for_writing(path)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::open_target_for_writing(path)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        bail!("device write access not supported on this platform")
     }
 }
 

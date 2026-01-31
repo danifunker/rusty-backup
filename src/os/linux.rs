@@ -1,7 +1,39 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use anyhow::{Context, Result};
 
 use crate::device::{DiskDevice, MountedPartition};
+
+/// Open a target device for writing on Linux.
+///
+/// Attempts to unmount any mounted partitions on the device first.
+pub fn open_target_for_writing(path: &Path) -> Result<File> {
+    let path_str = path.to_string_lossy();
+
+    // Try to unmount all partitions on this device
+    // e.g., for /dev/sdb, unmount /dev/sdb1, /dev/sdb2, etc.
+    if path_str.starts_with("/dev/") {
+        let device_name = path_str.trim_start_matches("/dev/");
+        let parent = parent_device_name(device_name);
+
+        // Try unmounting the device itself and numbered partitions
+        for suffix in ["", "1", "2", "3", "4", "5", "6", "7", "8"] {
+            let part_path = format!("/dev/{parent}{suffix}");
+            let _ = Command::new("umount")
+                .arg(&part_path)
+                .output();
+        }
+    }
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("cannot open {} for writing", path.display()))
+}
 
 /// Enumerate devices using sysinfo, grouping mounted volumes by parent device.
 pub fn enumerate_devices() -> Vec<DiskDevice> {

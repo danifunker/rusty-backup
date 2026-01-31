@@ -67,8 +67,8 @@ impl Default for RustyBackupApp {
 
 impl eframe::App for RustyBackupApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Request repaint while backup is running so progress updates are shown
-        if self.progress.active {
+        // Request repaint while backup/restore is running so progress updates are shown
+        if self.progress.active || self.restore_tab.is_running() {
             ctx.request_repaint();
         }
 
@@ -115,7 +115,7 @@ impl eframe::App for RustyBackupApp {
                 }
                 Tab::Restore => {
                     self.restore_tab
-                        .show(ui, &self.devices, &mut self.log_panel);
+                        .show(ui, &self.devices, &mut self.log_panel, &mut self.progress);
                 }
                 Tab::Inspect => {
                     self.inspect_tab

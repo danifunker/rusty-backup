@@ -520,12 +520,12 @@ impl BackupTab {
         let overrides: Vec<compress::PartitionSizeOverride> = self
             .vhd_partition_configs
             .iter()
-            .map(|cfg| compress::PartitionSizeOverride {
-                index: cfg.index,
-                start_lba: cfg.start_lba,
-                original_size: cfg.original_size,
-                export_size: cfg.effective_size(),
-            })
+            .map(|cfg| compress::PartitionSizeOverride::size_only(
+                cfg.index,
+                cfg.start_lba,
+                cfg.original_size,
+                cfg.effective_size(),
+            ))
             .collect();
 
         let total_bytes: u64 = overrides.iter().map(|o| o.export_size).sum();
