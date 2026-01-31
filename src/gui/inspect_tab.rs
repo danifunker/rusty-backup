@@ -608,21 +608,17 @@ impl InspectTab {
                                 },
                             )?;
 
-                            // Patch FAT BPB if the partition was resized
+                            // Resize FAT filesystem if the partition size changed
                             if export_size != pm.original_size_bytes {
-                                // Read BPB from the start of the VHD we just wrote
-                                let mut bpb_buf = [0u8; 512];
-                                let mut rf = std::fs::File::open(&dest_path)?;
-                                rf.read_exact(&mut bpb_buf)?;
-                                drop(rf);
-
                                 let new_sectors = (export_size / 512) as u32;
-                                let mut wf = std::fs::OpenOptions::new()
-                                    .write(true)
+                                let mut rw = std::fs::OpenOptions::new()
+                                    .read(true).write(true)
                                     .open(&dest_path)?;
-                                compress::patch_fat_bpb_in_place(
-                                    &mut wf, &bpb_buf, 0, new_sectors,
-                                )?;
+                                compress::resize_fat_in_place(&mut rw, 0, new_sectors, &mut |msg| {
+                                    if let Ok(mut s) = status.lock() {
+                                        s.log_messages.push(msg.to_string());
+                                    }
+                                })?;
                             }
 
                             overall_written += export_size;
@@ -664,8 +660,6 @@ impl InspectTab {
                                 std::fs::File::create(&dest_path)?,
                             );
                             let mut buf = vec![0u8; 256 * 1024];
-                            let mut bpb_captured = [0u8; 512];
-                            let mut first_chunk = true;
                             let mut total: u64 = 0;
                             let base_written = overall_written;
                             loop {
@@ -675,10 +669,6 @@ impl InspectTab {
                                 let n = limited.read(&mut buf)?;
                                 if n == 0 {
                                     break;
-                                }
-                                if first_chunk && n >= 512 {
-                                    bpb_captured.copy_from_slice(&buf[..512]);
-                                    first_chunk = false;
                                 }
                                 writer.write_all(&buf[..n])?;
                                 total += n as u64;
@@ -701,11 +691,15 @@ impl InspectTab {
                             }
                             writer.flush()?;
 
-                            // Patch FAT BPB if the partition was resized
+                            // Resize FAT filesystem if the partition size changed
                             if export_size != part.size_bytes {
                                 let new_sectors = (export_size / 512) as u32;
-                                compress::patch_fat_bpb_in_place(
-                                    &mut writer, &bpb_captured, 0, new_sectors,
+                                compress::resize_fat_in_place(
+                                    writer.get_mut(), 0, new_sectors, &mut |msg| {
+                                        if let Ok(mut s) = status.lock() {
+                                            s.log_messages.push(msg.to_string());
+                                        }
+                                    },
                                 )?;
                                 // Seek back to end for footer append
                                 writer.seek(std::io::SeekFrom::Start(total))?;

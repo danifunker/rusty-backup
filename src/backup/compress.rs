@@ -306,65 +306,331 @@ fn patch_mbr_partition_sizes(mbr: &mut [u8; 512], overrides: &[PartitionSizeOver
     }
 }
 
-/// Patch the FAT BPB total_sectors fields in-place so the filesystem metadata
-/// matches the new (resized) partition size.
+/// Resize a FAT12/16/32 filesystem in-place within an output file.
 ///
-/// `writer` must support seeking. `bpb` is the first 512 bytes of the partition.
-/// `partition_file_offset` is the byte offset of the partition start within the writer.
-/// `new_total_sectors` is the new partition size in 512-byte sectors.
+/// The partition data must already be written starting at `partition_offset`.
+/// This function:
 ///
-/// Silently returns `Ok(())` for non-FAT partitions (no jump instruction or
-/// invalid bytes_per_sector).
-pub fn patch_fat_bpb_in_place(
-    writer: &mut (impl Write + Seek),
-    bpb: &[u8; 512],
-    partition_file_offset: u64,
+/// - For shrinking: updates BPB `total_sectors` only (the oversized FAT is harmless)
+/// - For growing: extends FAT tables with free cluster entries, shifting the
+///   data region forward if the FAT needs additional sectors, then updates BPB
+/// - For FAT32: also updates the backup BPB at sector 6 and the FSInfo sector
+///
+/// Silently returns `Ok(false)` for non-FAT partitions.
+/// Returns `Ok(true)` if the resize was performed.
+pub fn resize_fat_in_place(
+    file: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
     new_total_sectors: u32,
-) -> Result<()> {
-    // Validate jump instruction: must start with 0xEB (short jump) or 0xE9 (near jump)
+    log_cb: &mut impl FnMut(&str),
+) -> Result<bool> {
+    // --- 1. Read and validate BPB ---
+    file.seek(SeekFrom::Start(partition_offset))?;
+    let mut bpb = [0u8; 512];
+    file.read_exact(&mut bpb)?;
+
     if bpb[0] != 0xEB && bpb[0] != 0xE9 {
-        return Ok(()); // Not a FAT BPB, silently skip
+        return Ok(false); // Not a FAT BPB
     }
 
-    // Validate bytes_per_sector (offset 11-12, little-endian)
     let bytes_per_sector = u16::from_le_bytes([bpb[11], bpb[12]]);
     if !matches!(bytes_per_sector, 512 | 1024 | 2048 | 4096) {
-        return Ok(()); // Invalid BPB
+        return Ok(false);
+    }
+    let bps = bytes_per_sector as u64;
+
+    let sectors_per_cluster = bpb[13];
+    if sectors_per_cluster == 0 || !sectors_per_cluster.is_power_of_two() {
+        return Ok(false);
+    }
+    let spc = sectors_per_cluster as u32;
+
+    let reserved_sectors = u16::from_le_bytes([bpb[14], bpb[15]]) as u32;
+    let num_fats = bpb[16] as u32;
+    if num_fats == 0 || num_fats > 2 {
+        return Ok(false);
     }
 
-    // Read original total_sectors fields
-    let ts16 = u16::from_le_bytes([bpb[19], bpb[20]]);
-    let _ts32 = u32::from_le_bytes([bpb[32], bpb[33], bpb[34], bpb[35]]);
-
-    // Determine FAT variant: FAT32 has sectors_per_fat_16 == 0 and root_entry_count == 0
     let root_entry_count = u16::from_le_bytes([bpb[17], bpb[18]]);
-    let sectors_per_fat_16 = u16::from_le_bytes([bpb[22], bpb[23]]);
-    let is_fat32 = sectors_per_fat_16 == 0 && root_entry_count == 0;
+    let ts16 = u16::from_le_bytes([bpb[19], bpb[20]]);
+    let spf16 = u16::from_le_bytes([bpb[22], bpb[23]]);
+    let ts32 = u32::from_le_bytes([bpb[32], bpb[33], bpb[34], bpb[35]]);
+    let spf32 = u32::from_le_bytes([bpb[36], bpb[37], bpb[38], bpb[39]]);
 
-    // Decide which field to use based on original layout and new value
-    let mut patched_bpb = *bpb;
-    if ts16 != 0 && new_total_sectors <= u16::MAX as u32 {
-        // Original used 16-bit field and new value fits: use 16-bit
-        patched_bpb[19..21].copy_from_slice(&(new_total_sectors as u16).to_le_bytes());
-        patched_bpb[32..36].copy_from_slice(&0u32.to_le_bytes());
+    let is_fat32 = spf16 == 0 && root_entry_count == 0;
+    let old_spf = if is_fat32 { spf32 } else { spf16 as u32 };
+    let old_total = if ts16 != 0 { ts16 as u32 } else { ts32 };
+
+    if old_total == new_total_sectors {
+        return Ok(false); // Nothing to do
+    }
+
+    let root_dir_sectors = if is_fat32 {
+        0u32
     } else {
-        // Use 32-bit field
-        patched_bpb[19..21].copy_from_slice(&0u16.to_le_bytes());
-        patched_bpb[32..36].copy_from_slice(&new_total_sectors.to_le_bytes());
+        ((root_entry_count as u32 * 32) + (bytes_per_sector as u32 - 1))
+            / bytes_per_sector as u32
+    };
+
+    // --- 2. Calculate old layout ---
+    let old_data_start = reserved_sectors + num_fats * old_spf + root_dir_sectors;
+    let old_data_sectors = old_total.saturating_sub(old_data_start);
+    let old_clusters = old_data_sectors / spc;
+
+    let fat_bits: u32 = if is_fat32 {
+        32
+    } else if old_clusters < 4085 {
+        12
+    } else {
+        16
+    };
+
+    // --- 3. Calculate new layout ---
+    let new_spf = compute_fat_sectors(
+        new_total_sectors, reserved_sectors, num_fats,
+        root_dir_sectors, spc, fat_bits, bytes_per_sector,
+    );
+    let new_data_start = reserved_sectors + num_fats * new_spf + root_dir_sectors;
+    let new_data_sectors = new_total_sectors.saturating_sub(new_data_start);
+    let new_clusters = new_data_sectors / spc;
+
+    // Verify FAT type doesn't change
+    let new_fat_bits = if is_fat32 {
+        32
+    } else if new_clusters < 4085 {
+        12
+    } else {
+        16
+    };
+    if new_fat_bits != fat_bits {
+        log_cb(&format!(
+            "FAT resize: type would change from FAT{} to FAT{}, updating BPB only",
+            fat_bits, new_fat_bits,
+        ));
+        patch_bpb_total_sectors(&mut bpb, new_total_sectors, ts16);
+        write_bpb(file, partition_offset, &bpb, is_fat32, bytes_per_sector)?;
+        return Ok(true);
     }
 
-    // Write patched BPB at partition start
-    writer.seek(SeekFrom::Start(partition_file_offset))?;
-    writer.write_all(&patched_bpb)?;
+    let growing = new_total_sectors > old_total;
+    let fat_needs_growth = new_spf > old_spf;
 
-    // For FAT32: also patch the backup BPB at sector 6
+    log_cb(&format!(
+        "FAT{}: clusters {} -> {}, spf {} -> {}",
+        fat_bits, old_clusters, new_clusters, old_spf, new_spf,
+    ));
+
+    // --- 4. Growing with FAT growth: shift data + extend FAT ---
+    if growing && fat_needs_growth {
+        let shift_sectors = (new_spf - old_spf) * num_fats;
+        let shift_bytes = shift_sectors as u64 * bps;
+
+        // Read old FAT data (one copy — both copies are identical)
+        let old_fat_start = partition_offset + reserved_sectors as u64 * bps;
+        file.seek(SeekFrom::Start(old_fat_start))?;
+        let old_fat_bytes = old_spf as usize * bps as usize;
+        let mut fat_data = vec![0u8; old_fat_bytes];
+        file.read_exact(&mut fat_data)?;
+
+        // Shift rootdir (FAT12/16) + data region forward to make room for larger FATs
+        let move_start_sector = reserved_sectors + num_fats * old_spf;
+        let move_start = partition_offset + move_start_sector as u64 * bps;
+        let move_end = partition_offset + old_total as u64 * bps;
+
+        if move_end > move_start {
+            shift_region_forward(file, move_start, move_end, shift_bytes)?;
+            log_cb(&format!(
+                "Shifted data region forward by {} sectors",
+                shift_sectors,
+            ));
+        }
+
+        // Extend FAT data with free entries (zero = free for all FAT types)
+        let new_fat_bytes = new_spf as usize * bps as usize;
+        fat_data.resize(new_fat_bytes, 0);
+
+        // Write extended FAT to each copy
+        for i in 0..num_fats as u64 {
+            let fat_pos = partition_offset
+                + reserved_sectors as u64 * bps
+                + i * new_fat_bytes as u64;
+            file.seek(SeekFrom::Start(fat_pos))?;
+            file.write_all(&fat_data)?;
+        }
+
+        log_cb(&format!(
+            "Extended FAT: {} -> {} sectors per copy",
+            old_spf, new_spf,
+        ));
+    } else if growing {
+        log_cb("FAT has spare capacity, no table extension needed");
+    }
+
+    // --- 5. Update BPB ---
+    patch_bpb_total_sectors(&mut bpb, new_total_sectors, ts16);
+    if new_spf != old_spf {
+        if is_fat32 {
+            bpb[36..40].copy_from_slice(&new_spf.to_le_bytes());
+        } else {
+            bpb[22..24].copy_from_slice(&(new_spf as u16).to_le_bytes());
+        }
+    }
+    write_bpb(file, partition_offset, &bpb, is_fat32, bytes_per_sector)?;
+
+    // --- 6. FAT32: update FSInfo ---
     if is_fat32 {
-        let backup_offset = partition_file_offset + 6 * bytes_per_sector as u64;
-        writer.seek(SeekFrom::Start(backup_offset))?;
-        writer.write_all(&patched_bpb)?;
+        let fsinfo_sector = u16::from_le_bytes([bpb[48], bpb[49]]);
+        if fsinfo_sector > 0 && (fsinfo_sector as u32) < reserved_sectors {
+            let fsinfo_offset = partition_offset + fsinfo_sector as u64 * bps;
+            file.seek(SeekFrom::Start(fsinfo_offset))?;
+            let mut fsinfo = [0u8; 512];
+            file.read_exact(&mut fsinfo)?;
+
+            let sig1 = u32::from_le_bytes(fsinfo[0..4].try_into().unwrap());
+            let sig2 = u32::from_le_bytes(fsinfo[484..488].try_into().unwrap());
+            if sig1 == 0x41615252 && sig2 == 0x61417272 {
+                // Set free cluster count to unknown (OS will recompute on mount)
+                fsinfo[488..492].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+                // Next free cluster hint
+                if new_clusters > old_clusters {
+                    fsinfo[492..496].copy_from_slice(&(old_clusters + 2).to_le_bytes());
+                } else {
+                    fsinfo[492..496].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+                }
+
+                file.seek(SeekFrom::Start(fsinfo_offset))?;
+                file.write_all(&fsinfo)?;
+                log_cb("Updated FAT32 FSInfo sector");
+            }
+        }
     }
 
-    writer.flush()?;
+    file.flush()?;
+    log_cb(&format!(
+        "FAT{} resize complete: {} clusters, {} total sectors",
+        fat_bits, new_clusters, new_total_sectors,
+    ));
+
+    Ok(true)
+}
+
+/// Patch BPB total_sectors fields (16-bit or 32-bit) in a BPB buffer.
+fn patch_bpb_total_sectors(bpb: &mut [u8; 512], new_total: u32, old_ts16: u16) {
+    if old_ts16 != 0 && new_total <= u16::MAX as u32 {
+        bpb[19..21].copy_from_slice(&(new_total as u16).to_le_bytes());
+        bpb[32..36].copy_from_slice(&0u32.to_le_bytes());
+    } else {
+        bpb[19..21].copy_from_slice(&0u16.to_le_bytes());
+        bpb[32..36].copy_from_slice(&new_total.to_le_bytes());
+    }
+}
+
+/// Write a BPB to the primary boot sector and (for FAT32) the backup at sector 6.
+fn write_bpb(
+    file: &mut (impl Write + Seek),
+    partition_offset: u64,
+    bpb: &[u8; 512],
+    is_fat32: bool,
+    bytes_per_sector: u16,
+) -> Result<()> {
+    file.seek(SeekFrom::Start(partition_offset))?;
+    file.write_all(bpb)?;
+    if is_fat32 {
+        let backup = partition_offset + 6 * bytes_per_sector as u64;
+        file.seek(SeekFrom::Start(backup))?;
+        file.write_all(bpb)?;
+    }
+    Ok(())
+}
+
+/// Compute the number of sectors needed for one FAT copy given the partition
+/// parameters and FAT type.
+fn compute_fat_sectors(
+    total_sectors: u32,
+    reserved: u32,
+    num_fats: u32,
+    root_dir_sectors: u32,
+    sectors_per_cluster: u32,
+    fat_bits: u32,
+    bytes_per_sector: u16,
+) -> u32 {
+    let avail = total_sectors.saturating_sub(reserved + root_dir_sectors) as u64;
+    let bps = bytes_per_sector as u64;
+    let spc = sectors_per_cluster as u64;
+    let n = num_fats as u64;
+
+    match fat_bits {
+        12 => {
+            // FAT12: 1.5 bytes per entry — use iterative approach
+            let mut spf = 1u32;
+            loop {
+                let data_sectors = avail.saturating_sub(n * spf as u64);
+                let clusters = data_sectors / spc;
+                let fat_bytes = ((clusters + 2) * 3 + 1) / 2;
+                let needed = ((fat_bytes + bps - 1) / bps) as u32;
+                if needed <= spf {
+                    return spf;
+                }
+                spf = needed;
+            }
+        }
+        16 => {
+            // FAT16: 2 bytes per entry
+            // Closed-form: ceil(2 * (avail + 2*spc) / (bps*spc + 2*n))
+            let num = 2 * (avail + 2 * spc);
+            let den = bps * spc + 2 * n;
+            ((num + den - 1) / den) as u32
+        }
+        32 => {
+            // FAT32: 4 bytes per entry
+            let num = 4 * (avail + 2 * spc);
+            let den = bps * spc + 4 * n;
+            ((num + den - 1) / den) as u32
+        }
+        _ => 1,
+    }
+}
+
+/// Shift a region of a file forward by `shift` bytes.
+/// Reads backward from the end to avoid overwriting unread data.
+fn shift_region_forward(
+    file: &mut (impl Read + Write + Seek),
+    src_start: u64,
+    src_end: u64,
+    shift: u64,
+) -> Result<()> {
+    let data_len = src_end.saturating_sub(src_start);
+    if data_len == 0 || shift == 0 {
+        return Ok(());
+    }
+
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    let mut remaining = data_len;
+
+    // Copy backward: read from the end, write to offset + shift
+    while remaining > 0 {
+        let chunk = remaining.min(CHUNK_SIZE as u64);
+        let read_pos = src_start + remaining - chunk;
+
+        file.seek(SeekFrom::Start(read_pos))?;
+        file.read_exact(&mut buf[..chunk as usize])?;
+
+        file.seek(SeekFrom::Start(read_pos + shift))?;
+        file.write_all(&buf[..chunk as usize])?;
+
+        remaining -= chunk;
+    }
+
+    // Zero-fill the gap left by the shift
+    let zeros = vec![0u8; CHUNK_SIZE];
+    let mut gap = shift;
+    file.seek(SeekFrom::Start(src_start))?;
+    while gap > 0 {
+        let n = (gap as usize).min(CHUNK_SIZE);
+        file.write_all(&zeros[..n])?;
+        gap -= n as u64;
+    }
+
     Ok(())
 }
 
@@ -482,27 +748,12 @@ pub fn export_whole_disk_vhd(
                 total_written += pad;
             }
 
-            // Patch FAT BPB if the partition was resized
+            // Resize FAT filesystem if the partition size changed
             if export_size != pm.original_size_bytes {
-                let bpb_offset = part_offset;
-                // Read the BPB we just wrote at the partition start
                 writer.flush()?;
-                writer.seek(SeekFrom::Start(bpb_offset))?;
-                let mut bpb_buf = [0u8; 512];
-                // We need to read from the file we're writing to — reopen for reading
-                let mut read_file = File::open(dest_path)?;
-                read_file.seek(SeekFrom::Start(bpb_offset))?;
-                read_file.read_exact(&mut bpb_buf)?;
-                drop(read_file);
-
                 let new_sectors = (export_size / 512) as u32;
-                patch_fat_bpb_in_place(&mut writer, &bpb_buf, bpb_offset, new_sectors)?;
-                // Seek back to end for subsequent writes
+                resize_fat_in_place(writer.get_mut(), part_offset, new_sectors, &mut log_cb)?;
                 writer.seek(SeekFrom::Start(total_written))?;
-                log_cb(&format!(
-                    "partition-{}: patched FAT BPB (new total sectors: {})",
-                    pm.index, new_sectors,
-                ));
             }
 
             log_cb(&format!(
@@ -603,13 +854,10 @@ pub fn export_whole_disk_vhd(
                 }
 
                 // Write partition data (limited to export_size)
-                // Capture BPB (first 512 bytes of partition) for potential patching
                 reader.seek(SeekFrom::Start(part_offset))?;
                 let copy_size = ps.export_size.min(ps.original_size);
                 let mut part_reader = (&mut reader).take(copy_size);
                 let mut part_remaining = copy_size;
-                let mut bpb_captured = [0u8; 512];
-                let mut first_chunk = true;
                 while part_remaining > 0 {
                     if cancel_check() {
                         bail!("export cancelled");
@@ -618,10 +866,6 @@ pub fn export_whole_disk_vhd(
                     let n = part_reader.read(&mut buf[..to_read])?;
                     if n == 0 {
                         break;
-                    }
-                    if first_chunk && n >= 512 {
-                        bpb_captured.copy_from_slice(&buf[..512]);
-                        first_chunk = false;
                     }
                     writer.write_all(&buf[..n])?;
                     total_written += n as u64;
@@ -636,16 +880,13 @@ pub fn export_whole_disk_vhd(
                     total_written += pad;
                 }
 
-                // Patch FAT BPB if the partition was resized
+                // Resize FAT filesystem if the partition size changed
                 if ps.export_size != ps.original_size {
+                    writer.flush()?;
                     let end_pos = total_written;
                     let new_sectors = (ps.export_size / 512) as u32;
-                    patch_fat_bpb_in_place(&mut writer, &bpb_captured, part_offset, new_sectors)?;
+                    resize_fat_in_place(writer.get_mut(), part_offset, new_sectors, &mut log_cb)?;
                     writer.seek(SeekFrom::Start(end_pos))?;
-                    log_cb(&format!(
-                        "partition-{}: patched FAT BPB (new total sectors: {})",
-                        ps.index, new_sectors,
-                    ));
                 }
 
                 log_cb(&format!(
