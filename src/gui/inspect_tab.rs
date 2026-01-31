@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use rusty_backup::backup::compress;
 use rusty_backup::backup::metadata::BackupMetadata;
+use rusty_backup::browse;
 use rusty_backup::device::DiskDevice;
 use rusty_backup::partition::{self, detect_alignment, PartitionAlignment, PartitionInfo, PartitionTable};
 
@@ -43,6 +44,8 @@ pub struct InspectTab {
     export_partition_configs: Vec<PartitionExportConfig>,
     /// VHD export background thread status
     export_status: Option<Arc<Mutex<ExportStatus>>>,
+    /// Filesystem-computed minimum partition sizes (partition index → bytes)
+    partition_min_sizes: std::collections::HashMap<usize, u64>,
 }
 
 /// Status of a background VHD export operation.
@@ -103,6 +106,7 @@ impl Default for InspectTab {
             export_whole_disk: true,
             export_partition_configs: Vec::new(),
             export_status: None,
+            partition_min_sizes: std::collections::HashMap::new(),
         }
     }
 }
@@ -311,6 +315,7 @@ impl InspectTab {
                         .map(|pm| pm.imaged_size_bytes)
                 })
                 .filter(|&sz| sz > 0)
+                .or_else(|| self.partition_min_sizes.get(&part.index).copied())
                 .unwrap_or(part.size_bytes);
 
             self.export_partition_configs.push(PartitionExportConfig {
@@ -388,8 +393,8 @@ impl InspectTab {
                                 if cfg.choice == ExportSizeChoice::Custom {
                                     let min_mib =
                                         (cfg.minimum_size / (1024 * 1024)).max(1) as u32;
-                                    let max_mib =
-                                        (cfg.original_size / (1024 * 1024)).max(min_mib as u64) as u32;
+                                    // Allow growing beyond original (up to 2 TiB VHD max)
+                                    let max_mib = 2_097_152u32;
                                     ui.add(
                                         egui::DragValue::new(&mut cfg.custom_size_mib)
                                             .range(min_mib..=max_mib),
@@ -602,6 +607,24 @@ impl InspectTab {
                                     }
                                 },
                             )?;
+
+                            // Patch FAT BPB if the partition was resized
+                            if export_size != pm.original_size_bytes {
+                                // Read BPB from the start of the VHD we just wrote
+                                let mut bpb_buf = [0u8; 512];
+                                let mut rf = std::fs::File::open(&dest_path)?;
+                                rf.read_exact(&mut bpb_buf)?;
+                                drop(rf);
+
+                                let new_sectors = (export_size / 512) as u32;
+                                let mut wf = std::fs::OpenOptions::new()
+                                    .write(true)
+                                    .open(&dest_path)?;
+                                compress::patch_fat_bpb_in_place(
+                                    &mut wf, &bpb_buf, 0, new_sectors,
+                                )?;
+                            }
+
                             overall_written += export_size;
                         }
                     } else if let Some(image_path) = &source_image {
@@ -629,15 +652,20 @@ impl InspectTab {
                             }
 
                             // Extract partition data to VHD
+                            // Read at most the original partition size from the source
+                            // to avoid reading into adjacent partitions or the VHD footer
+                            let read_limit = export_size.min(part.size_bytes);
                             let file = std::fs::File::open(image_path)?;
                             let mut reader = std::io::BufReader::new(file);
                             reader.seek(std::io::SeekFrom::Start(offset))?;
-                            let mut limited = reader.take(export_size);
+                            let mut limited = reader.take(read_limit);
 
                             let mut writer = std::io::BufWriter::new(
                                 std::fs::File::create(&dest_path)?,
                             );
                             let mut buf = vec![0u8; 256 * 1024];
+                            let mut bpb_captured = [0u8; 512];
+                            let mut first_chunk = true;
                             let mut total: u64 = 0;
                             let base_written = overall_written;
                             loop {
@@ -648,13 +676,40 @@ impl InspectTab {
                                 if n == 0 {
                                     break;
                                 }
+                                if first_chunk && n >= 512 {
+                                    bpb_captured.copy_from_slice(&buf[..512]);
+                                    first_chunk = false;
+                                }
                                 writer.write_all(&buf[..n])?;
                                 total += n as u64;
                                 if let Ok(mut s) = status.lock() {
                                     s.current_bytes = base_written + total;
                                 }
                             }
+
+                            // Pad with zeros if export_size > data read (growing)
+                            if total < export_size {
+                                let pad = export_size - total;
+                                let zeros = vec![0u8; 256 * 1024];
+                                let mut remaining = pad;
+                                while remaining > 0 {
+                                    let n = (remaining as usize).min(zeros.len());
+                                    writer.write_all(&zeros[..n])?;
+                                    remaining -= n as u64;
+                                }
+                                total = export_size;
+                            }
                             writer.flush()?;
+
+                            // Patch FAT BPB if the partition was resized
+                            if export_size != part.size_bytes {
+                                let new_sectors = (export_size / 512) as u32;
+                                compress::patch_fat_bpb_in_place(
+                                    &mut writer, &bpb_captured, 0, new_sectors,
+                                )?;
+                                // Seek back to end for footer append
+                                writer.seek(std::io::SeekFrom::Start(total))?;
+                            }
 
                             // Append VHD footer
                             let footer = compress::build_vhd_footer(total);
@@ -720,6 +775,7 @@ impl InspectTab {
         self.partitions.clear();
         self.backup_metadata = None;
         self.last_error = None;
+        self.partition_min_sizes.clear();
     }
 
     fn load_backup_metadata(&mut self, log: &mut LogPanel) {
@@ -952,6 +1008,29 @@ impl InspectTab {
                         ));
                         self.alignment = Some(alignment);
                         self.partition_table = Some(table);
+
+                        // Compute minimum partition sizes via filesystem analysis
+                        for part in &self.partitions {
+                            if part.is_extended_container {
+                                continue;
+                            }
+                            if let Ok(f) = File::open(&path) {
+                                if let Some(min_size) = browse::effective_partition_size(
+                                    BufReader::new(f),
+                                    part.start_lba * 512,
+                                    part.partition_type_byte,
+                                ) {
+                                    let clamped = min_size.min(part.size_bytes);
+                                    self.partition_min_sizes.insert(part.index, clamped);
+                                    log.info(format!(
+                                        "Partition {}: minimum size {} (original {})",
+                                        part.index,
+                                        partition::format_size(clamped),
+                                        partition::format_size(part.size_bytes),
+                                    ));
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
                         let msg = format!("Failed to parse partition table: {e}");
@@ -1071,7 +1150,7 @@ impl InspectTab {
                 ui.label(egui::RichText::new("Type").strong());
                 ui.label(egui::RichText::new("Start LBA").strong());
                 ui.label(egui::RichText::new("Size").strong());
-                if self.backup_metadata.is_some() {
+                if self.backup_metadata.is_some() || !self.partition_min_sizes.is_empty() {
                     ui.label(egui::RichText::new("Min Size").strong());
                 }
                 ui.label(egui::RichText::new("Boot").strong());
@@ -1091,19 +1170,23 @@ impl InspectTab {
                         ui.label(egui::RichText::new(&part.type_name).color(egui::Color32::GRAY));
                         ui.label(egui::RichText::new(format!("{}", part.start_lba)).color(egui::Color32::GRAY));
                         ui.label(egui::RichText::new(partition::format_size(part.size_bytes)).color(egui::Color32::GRAY));
-                        if let Some(meta) = &self.backup_metadata {
-                            // Sum imaged_size_bytes of all logical partitions
-                            let logical_sum: u64 = meta
-                                .partitions
-                                .iter()
-                                .filter(|pm| pm.index >= 4)
-                                .map(|pm| pm.imaged_size_bytes)
-                                .sum();
-                            if logical_sum > 0 {
-                                ui.label(
-                                    egui::RichText::new(partition::format_size(logical_sum))
-                                        .color(egui::Color32::GRAY),
-                                );
+                        if self.backup_metadata.is_some() || !self.partition_min_sizes.is_empty() {
+                            if let Some(meta) = &self.backup_metadata {
+                                // Sum imaged_size_bytes of all logical partitions
+                                let logical_sum: u64 = meta
+                                    .partitions
+                                    .iter()
+                                    .filter(|pm| pm.index >= 4)
+                                    .map(|pm| pm.imaged_size_bytes)
+                                    .sum();
+                                if logical_sum > 0 {
+                                    ui.label(
+                                        egui::RichText::new(partition::format_size(logical_sum))
+                                            .color(egui::Color32::GRAY),
+                                    );
+                                } else {
+                                    ui.label("");
+                                }
                             } else {
                                 ui.label("");
                             }
@@ -1115,13 +1198,23 @@ impl InspectTab {
                         ui.label(&part.type_name);
                         ui.label(format!("{}", part.start_lba));
                         ui.label(partition::format_size(part.size_bytes));
-                        if let Some(meta) = &self.backup_metadata {
-                            let min_size = meta
-                                .partitions
-                                .iter()
-                                .find(|pm| pm.index == part.index)
-                                .map(|pm| pm.imaged_size_bytes)
-                                .filter(|&sz| sz > 0 && sz < part.size_bytes);
+                        if self.backup_metadata.is_some() || !self.partition_min_sizes.is_empty() {
+                            let min_size = self
+                                .backup_metadata
+                                .as_ref()
+                                .and_then(|m| {
+                                    m.partitions
+                                        .iter()
+                                        .find(|pm| pm.index == part.index)
+                                        .map(|pm| pm.imaged_size_bytes)
+                                })
+                                .filter(|&sz| sz > 0 && sz < part.size_bytes)
+                                .or_else(|| {
+                                    self.partition_min_sizes
+                                        .get(&part.index)
+                                        .copied()
+                                        .filter(|&sz| sz < part.size_bytes)
+                                });
                             if let Some(sz) = min_size {
                                 ui.label(partition::format_size(sz));
                             } else {
