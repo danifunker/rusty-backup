@@ -6,9 +6,8 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 
-use crate::backup::compress::{
-    self, patch_mbr_entries, reconstruct_disk_from_backup, PartitionSizeOverride,
-};
+use crate::partition::PartitionSizeOverride;
+use crate::rbformats::reconstruct_disk_from_backup;
 use crate::backup::metadata::{AlignmentMetadata, BackupMetadata};
 use crate::backup::LogLevel;
 

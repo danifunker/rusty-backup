@@ -1,4 +1,3 @@
-pub mod compress;
 pub mod format;
 pub mod metadata;
 pub mod verify;
@@ -13,7 +12,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-use crate::browse;
+use crate::fs;
 use crate::partition::{self, PartitionTable};
 use metadata::{AlignmentMetadata, BackupMetadata, PartitionMetadata};
 
@@ -259,7 +258,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             .try_clone()
             .ok()
             .and_then(|clone| {
-                browse::compact_partition_reader(
+                fs::compact_partition_reader(
                     BufReader::new(clone),
                     part_offset,
                     part.partition_type_byte,
@@ -277,7 +276,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 .try_clone()
                 .ok()
                 .and_then(|clone| {
-                    browse::effective_partition_size(
+                    fs::effective_partition_size(
                         BufReader::new(clone),
                         part_offset,
                         part.partition_type_byte,
@@ -430,13 +429,13 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             let part_offset = part.start_lba * 512;
             let clone = source.get_ref().try_clone()
                 .context("failed to clone source for compaction")?;
-            let (mut compact_reader, _) = browse::CompactFatReader::new(
+            let (mut compact_reader, _) = fs::CompactFatReader::new(
                 BufReader::new(clone),
                 part_offset,
             ).map_err(|e| anyhow::anyhow!("compaction failed: {e}"))?;
 
             let progress_log = Arc::clone(&progress);
-            compress::compress_partition(
+            crate::rbformats::compress_partition(
                 &mut compact_reader,
                 &output_base,
                 config.compression,
@@ -457,7 +456,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             let mut limited = LimitedReader::new(part_reader);
 
             let progress_log = Arc::clone(&progress);
-            compress::compress_partition(
+            crate::rbformats::compress_partition(
                 &mut limited,
                 &output_base,
                 config.compression,

@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex};
 use rusty_backup::backup::{
     BackupConfig, BackupProgress, ChecksumType, CompressionType, LogLevel as BackupLogLevel,
 };
-use rusty_backup::backup::compress;
-use rusty_backup::browse;
+use rusty_backup::fs;
+use rusty_backup::partition::PartitionSizeOverride;
+use rusty_backup::rbformats::vhd::export_whole_disk_vhd;
 use rusty_backup::device::DiskDevice;
 use rusty_backup::partition::{self, PartitionInfo, PartitionTable};
 
@@ -517,10 +518,10 @@ impl BackupTab {
         let dest_path = dest_dir.join(format!("{}.vhd", self.backup_name));
 
         // Build partition size overrides
-        let overrides: Vec<compress::PartitionSizeOverride> = self
+        let overrides: Vec<PartitionSizeOverride> = self
             .vhd_partition_configs
             .iter()
-            .map(|cfg| compress::PartitionSizeOverride::size_only(
+            .map(|cfg| PartitionSizeOverride::size_only(
                 cfg.index,
                 cfg.start_lba,
                 cfg.original_size,
@@ -550,7 +551,7 @@ impl BackupTab {
         std::thread::spawn(move || {
             let status2 = Arc::clone(&status);
             let status3 = Arc::clone(&status);
-            let result = compress::export_whole_disk_vhd(
+            let result = export_whole_disk_vhd(
                 &source_path,
                 None,
                 None,
@@ -673,7 +674,7 @@ impl BackupTab {
                     }
                     let offset = part.start_lba * 512;
                     if let Ok(clone) = reader.get_ref().try_clone() {
-                        if let Some(min_size) = browse::effective_partition_size(
+                        if let Some(min_size) = fs::effective_partition_size(
                             BufReader::new(clone),
                             offset,
                             part.partition_type_byte,

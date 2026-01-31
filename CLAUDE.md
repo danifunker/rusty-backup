@@ -29,11 +29,11 @@ cargo clippy                   # Lint
 The codebase separates GUI from core logic with these major modules:
 
 - **`gui/`** - egui/eframe UI layer with tabs (Backup, Restore, Inspect), progress indicators, and a log panel. Long-running disk operations run on separate threads to keep the UI responsive.
-- **`partition/`** - MBR and GPT partition table parsing, export, and alignment detection. Alignment patterns matter for vintage systems (DOS traditional LBA 63/cylinder boundaries vs modern 1MB alignment).
-- **`filesystem/`** - Trait-based filesystem support (`Filesystem` trait with `detect`, `get_info`, `calculate_min_size`, `validate`). Implementations for FAT16/32, NTFS, and ext2/3/4.
-- **`resize/`** - Filesystem-specific resize logic. Determines minimum partition size by analyzing allocated clusters/blocks.
-- **`chd/`** - CHD (MAME standard) compression wrapper with file splitting support (default ~4GB chunks for FAT32 media compatibility).
-- **`backup/`** - Backup folder structure management, JSON metadata serialization, and checksum verification (user-selectable CRC32 or SHA256).
+- **`partition/`** - MBR and GPT partition table parsing, export, alignment detection, `PartitionSizeOverride` for resize/restore, and `patch_mbr_entries`/`lba_to_chs` for MBR patching.
+- **`fs/`** - Trait-based filesystem abstraction (`Filesystem` trait in `filesystem.rs`, `FileEntry` in `entry.rs`). FAT12/16/32 implementation in `fat.rs` includes browsing, `CompactFatReader` for smart compaction, and in-place resize/validation/BPB patching. Factory functions in `mod.rs` route by partition type byte. See `src/fs/README.md`.
+- **`rbformats/`** - Output format handlers (VHD, CHD, Zstd, Raw) with compress/decompress APIs, plus `reconstruct_disk_from_backup` for restore and VHD export. Each format in its own file. See `src/rbformats/README.md`.
+- **`backup/`** - Backup orchestration (`run_backup`), `CompressionType` enum, folder structure management, JSON metadata serialization, and checksum verification (CRC32 or SHA256).
+- **`restore/`** - Restore orchestration with flexible partition sizing (original, minimum, custom) and alignment preservation.
 - **`error.rs`** - Centralized error types using `thiserror`, with `anyhow::Result` for propagation.
 
 ### Backup Format

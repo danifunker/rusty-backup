@@ -3,9 +3,11 @@ use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use rusty_backup::backup::compress;
 use rusty_backup::backup::metadata::BackupMetadata;
-use rusty_backup::browse;
+use rusty_backup::fs;
+use rusty_backup::fs::fat::resize_fat_in_place;
+use rusty_backup::partition::PartitionSizeOverride;
+use rusty_backup::rbformats::vhd::{build_vhd_footer, export_whole_disk_vhd, export_partition_vhd, VHD_COOKIE};
 use rusty_backup::device::DiskDevice;
 use rusty_backup::partition::{self, detect_alignment, PartitionAlignment, PartitionInfo, PartitionTable};
 
@@ -434,7 +436,7 @@ impl InspectTab {
             .collect();
 
         // Build partition size overrides for whole-disk export
-        let partition_overrides: Vec<compress::PartitionSizeOverride> = self
+        let partition_overrides: Vec<PartitionSizeOverride> = self
             .export_partition_configs
             .iter()
             .map(|cfg| {
@@ -444,7 +446,7 @@ impl InspectTab {
                     .find(|p| p.index == cfg.index)
                     .map(|p| p.start_lba)
                     .unwrap_or(0);
-                compress::PartitionSizeOverride::size_only(
+                PartitionSizeOverride::size_only(
                     cfg.index,
                     start_lba,
                     cfg.original_size,
@@ -502,7 +504,7 @@ impl InspectTab {
             std::thread::spawn(move || {
                 let status2 = Arc::clone(&status);
                 let status3 = Arc::clone(&status);
-                let result = compress::export_whole_disk_vhd(
+                let result = export_whole_disk_vhd(
                     &source,
                     meta.as_ref(),
                     None,
@@ -585,7 +587,7 @@ impl InspectTab {
                             let base_written = overall_written;
                             let status_progress = Arc::clone(&status);
                             let status_cancel = Arc::clone(&status);
-                            compress::export_partition_vhd(
+                            export_partition_vhd(
                                 &data_path,
                                 &meta.compression_type,
                                 &dest_path,
@@ -614,7 +616,7 @@ impl InspectTab {
                                 let mut rw = std::fs::OpenOptions::new()
                                     .read(true).write(true)
                                     .open(&dest_path)?;
-                                compress::resize_fat_in_place(&mut rw, 0, new_sectors, &mut |msg| {
+                                resize_fat_in_place(&mut rw, 0, new_sectors, &mut |msg| {
                                     if let Ok(mut s) = status.lock() {
                                         s.log_messages.push(msg.to_string());
                                     }
@@ -694,7 +696,7 @@ impl InspectTab {
                             // Resize FAT filesystem if the partition size changed
                             if export_size != part.size_bytes {
                                 let new_sectors = (export_size / 512) as u32;
-                                compress::resize_fat_in_place(
+                                resize_fat_in_place(
                                     writer.get_mut(), 0, new_sectors, &mut |msg| {
                                         if let Ok(mut s) = status.lock() {
                                             s.log_messages.push(msg.to_string());
@@ -706,7 +708,7 @@ impl InspectTab {
                             }
 
                             // Append VHD footer
-                            let footer = compress::build_vhd_footer(total);
+                            let footer = build_vhd_footer(total);
                             writer.write_all(&footer)?;
                             writer.flush()?;
 
@@ -956,7 +958,7 @@ impl InspectTab {
                         if f.seek(SeekFrom::End(-512)).is_ok() {
                             let mut cookie = [0u8; 8];
                             if f.read_exact(&mut cookie).is_ok()
-                                && &cookie == compress::VHD_COOKIE
+                                && &cookie == VHD_COOKIE
                             {
                                 let ds = file_size - 512;
                                 log.info(format!(
@@ -1009,7 +1011,7 @@ impl InspectTab {
                                 continue;
                             }
                             if let Ok(f) = File::open(&path) {
-                                if let Some(min_size) = browse::effective_partition_size(
+                                if let Some(min_size) = fs::effective_partition_size(
                                     BufReader::new(f),
                                     part.start_lba * 512,
                                     part.partition_type_byte,

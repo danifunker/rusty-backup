@@ -4,7 +4,10 @@ pub mod filesystem;
 
 use std::io::{Read, Seek};
 
-pub use fat::{CompactFatReader, CompactInfo};
+pub use fat::{
+    CompactFatReader, CompactInfo,
+    patch_bpb_hidden_sectors, resize_fat_in_place, validate_fat_integrity,
+};
 use filesystem::{Filesystem, FilesystemError};
 
 /// Result of filesystem compaction.

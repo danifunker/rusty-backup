@@ -9,7 +9,7 @@ use inspect_tab::InspectTab;
 use progress::{LogPanel, ProgressState};
 use restore_tab::RestoreTab;
 
-use rusty_backup::backup::compress::detect_chdman;
+use rusty_backup::rbformats::chd::detect_chdman;
 use rusty_backup::device::{self, DiskDevice};
 
 #[derive(Debug, Clone, Copy, PartialEq)]

@@ -3,9 +3,9 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
 
-use rusty_backup::browse::entry::{FileEntry, EntryType};
-use rusty_backup::browse::filesystem::{Filesystem, FilesystemError};
-use rusty_backup::browse;
+use rusty_backup::fs::entry::{FileEntry, EntryType};
+use rusty_backup::fs::filesystem::{Filesystem, FilesystemError};
+use rusty_backup::fs;
 use rusty_backup::partition;
 
 const MAX_PREVIEW_SIZE: usize = 1024 * 1024; // 1 MB max file preview
@@ -137,7 +137,7 @@ impl BrowseView {
         })?;
         let file = File::open(path).map_err(FilesystemError::Io)?;
         let reader = BufReader::new(file);
-        browse::open_filesystem(reader, self.partition_offset, self.partition_type)
+        fs::open_filesystem(reader, self.partition_offset, self.partition_type)
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui) {

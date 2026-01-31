@@ -250,6 +250,95 @@ pub fn parse_ebr_chain(
     Ok(logical_partitions)
 }
 
+use super::PartitionSizeOverride;
+
+/// Patch MBR partition table entries with new start_lba, total_sectors, and
+/// optionally CHS values.
+///
+/// The MBR has 4 partition entries starting at byte 446, each 16 bytes.
+/// This function updates:
+///   - Bytes 8-11: start_lba (if `new_start_lba` is set)
+///   - Bytes 12-15: total_sectors (always, from `export_size`)
+///   - Bytes 1-3, 5-7: CHS start/end (if `heads > 0`)
+///
+/// Used by: VHD export (size changes only), restore (size + alignment changes).
+pub fn patch_mbr_entries(mbr: &mut [u8; 512], overrides: &[PartitionSizeOverride]) {
+    for ps in overrides {
+        // Primary partitions are entries 0-3 in the MBR
+        if ps.index > 3 {
+            continue; // Logical partitions are in EBRs, not the MBR
+        }
+
+        let entry_offset = PARTITION_TABLE_OFFSET + ps.index * PARTITION_ENTRY_SIZE;
+        if entry_offset + PARTITION_ENTRY_SIZE > 512 {
+            continue;
+        }
+
+        // Read current start_lba to verify we're patching the right entry
+        let current_start_lba = u32::from_le_bytes([
+            mbr[entry_offset + 8],
+            mbr[entry_offset + 9],
+            mbr[entry_offset + 10],
+            mbr[entry_offset + 11],
+        ]);
+
+        if current_start_lba as u64 != ps.start_lba {
+            continue; // Safety check: don't patch if start LBA doesn't match
+        }
+
+        let effective_start = ps.effective_start_lba();
+        let new_sectors = (ps.export_size / 512) as u32;
+
+        // Patch start_lba if changed
+        if ps.new_start_lba.is_some() {
+            mbr[entry_offset + 8..entry_offset + 12]
+                .copy_from_slice(&(effective_start as u32).to_le_bytes());
+        }
+
+        // Patch total_sectors
+        mbr[entry_offset + 12..entry_offset + 16]
+            .copy_from_slice(&new_sectors.to_le_bytes());
+
+        // Recompute CHS if geometry is specified
+        if ps.heads > 0 && ps.sectors_per_track > 0 {
+            let h = ps.heads as u32;
+            let s = ps.sectors_per_track as u32;
+
+            // CHS start
+            let (sc, sh, ss) = lba_to_chs(effective_start as u32, h, s);
+            mbr[entry_offset + 1] = sh as u8;
+            mbr[entry_offset + 2] = ((sc >> 2) & 0xC0) as u8 | (ss & 0x3F) as u8;
+            mbr[entry_offset + 3] = sc as u8;
+
+            // CHS end
+            let end_lba = (effective_start as u32).saturating_add(new_sectors.saturating_sub(1));
+            let (ec, eh, es) = lba_to_chs(end_lba, h, s);
+            mbr[entry_offset + 5] = eh as u8;
+            mbr[entry_offset + 6] = ((ec >> 2) & 0xC0) as u8 | (es & 0x3F) as u8;
+            mbr[entry_offset + 7] = ec as u8;
+        }
+    }
+}
+
+/// Convert an LBA address to CHS values using the given geometry.
+/// Returns (cylinder, head, sector) where sector is 1-based.
+/// For LBAs beyond CHS addressable range, returns (1023, heads-1, spt).
+pub fn lba_to_chs(lba: u32, heads: u32, sectors_per_track: u32) -> (u32, u32, u32) {
+    if heads == 0 || sectors_per_track == 0 {
+        return (0, 0, 0);
+    }
+    let cylinder = lba / (heads * sectors_per_track);
+    let temp = lba % (heads * sectors_per_track);
+    let head = temp / sectors_per_track;
+    let sector = (temp % sectors_per_track) + 1; // CHS sectors are 1-based
+
+    if cylinder > 1023 {
+        (1023, heads - 1, sectors_per_track)
+    } else {
+        (cylinder, head, sector)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

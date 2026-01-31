@@ -1,7 +1,8 @@
 pub mod backup;
-pub mod browse;
 pub mod device;
 pub mod error;
+pub mod fs;
 pub mod os;
 pub mod partition;
+pub mod rbformats;
 pub mod restore;

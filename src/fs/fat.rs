@@ -1,10 +1,13 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 
+use anyhow::{Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 
 use super::entry::{EntryType, FileEntry};
 use super::filesystem::{Filesystem, FilesystemError};
+
+const CHUNK_SIZE: usize = 256 * 1024; // 256 KB I/O buffer
 
 /// FAT12/16/32 filesystem reader.
 pub struct FatFilesystem<R> {
@@ -1587,6 +1590,727 @@ fn walk_directory_tree_fat32<R: Read + Seek>(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// FAT manipulation functions (resize, validate, BPB patching)
+// ---------------------------------------------------------------------------
+
+/// Resize a FAT12/16/32 filesystem in-place within an output file.
+///
+/// The partition data must already be written starting at `partition_offset`.
+/// This function:
+///
+/// - For shrinking: updates BPB `total_sectors` only (the oversized FAT is harmless)
+/// - For growing: extends FAT tables with free cluster entries, shifting the
+///   data region forward if the FAT needs additional sectors, then updates BPB
+/// - For FAT32: also updates the backup BPB at sector 6 and the FSInfo sector
+///
+/// Silently returns `Ok(false)` for non-FAT partitions.
+/// Returns `Ok(true)` if the resize was performed.
+pub fn resize_fat_in_place(
+    file: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    new_total_sectors: u32,
+    log_cb: &mut impl FnMut(&str),
+) -> Result<bool> {
+    // --- 1. Read and validate BPB ---
+    file.seek(SeekFrom::Start(partition_offset))?;
+    let mut bpb = [0u8; 512];
+    file.read_exact(&mut bpb)?;
+
+    if bpb[0] != 0xEB && bpb[0] != 0xE9 {
+        return Ok(false); // Not a FAT BPB
+    }
+
+    let bytes_per_sector = u16::from_le_bytes([bpb[11], bpb[12]]);
+    if !matches!(bytes_per_sector, 512 | 1024 | 2048 | 4096) {
+        return Ok(false);
+    }
+    let bps = bytes_per_sector as u64;
+
+    let sectors_per_cluster = bpb[13];
+    if sectors_per_cluster == 0 || !sectors_per_cluster.is_power_of_two() {
+        return Ok(false);
+    }
+    let spc = sectors_per_cluster as u32;
+
+    let reserved_sectors = u16::from_le_bytes([bpb[14], bpb[15]]) as u32;
+    let num_fats = bpb[16] as u32;
+    if num_fats == 0 || num_fats > 2 {
+        return Ok(false);
+    }
+
+    let root_entry_count = u16::from_le_bytes([bpb[17], bpb[18]]);
+    let ts16 = u16::from_le_bytes([bpb[19], bpb[20]]);
+    let spf16 = u16::from_le_bytes([bpb[22], bpb[23]]);
+    let ts32 = u32::from_le_bytes([bpb[32], bpb[33], bpb[34], bpb[35]]);
+    let spf32 = u32::from_le_bytes([bpb[36], bpb[37], bpb[38], bpb[39]]);
+
+    let is_fat32 = spf16 == 0 && root_entry_count == 0;
+    let old_spf = if is_fat32 { spf32 } else { spf16 as u32 };
+    let old_total = if ts16 != 0 { ts16 as u32 } else { ts32 };
+
+    if old_total == new_total_sectors {
+        return Ok(false); // Nothing to do
+    }
+
+    let root_dir_sectors = if is_fat32 {
+        0u32
+    } else {
+        ((root_entry_count as u32 * 32) + (bytes_per_sector as u32 - 1))
+            / bytes_per_sector as u32
+    };
+
+    // --- 2. Calculate old layout ---
+    let old_data_start = reserved_sectors + num_fats * old_spf + root_dir_sectors;
+    let old_data_sectors = old_total.saturating_sub(old_data_start);
+    let old_clusters = old_data_sectors / spc;
+
+    let fat_bits: u32 = if is_fat32 {
+        32
+    } else if old_clusters < 4085 {
+        12
+    } else {
+        16
+    };
+
+    // --- 3. Calculate new layout ---
+    let new_spf = compute_fat_sectors(
+        new_total_sectors, reserved_sectors, num_fats,
+        root_dir_sectors, spc, fat_bits, bytes_per_sector,
+    );
+    let new_data_start = reserved_sectors + num_fats * new_spf + root_dir_sectors;
+    let new_data_sectors = new_total_sectors.saturating_sub(new_data_start);
+    let new_clusters = new_data_sectors / spc;
+
+    // Verify FAT type doesn't change
+    let new_fat_bits = if is_fat32 {
+        32
+    } else if new_clusters < 4085 {
+        12
+    } else {
+        16
+    };
+    if new_fat_bits != fat_bits {
+        log_cb(&format!(
+            "FAT resize: type would change from FAT{} to FAT{}, updating BPB only",
+            fat_bits, new_fat_bits,
+        ));
+        patch_bpb_total_sectors(&mut bpb, new_total_sectors, ts16);
+        write_bpb(file, partition_offset, &bpb, is_fat32, bytes_per_sector)?;
+        return Ok(true);
+    }
+
+    let growing = new_total_sectors > old_total;
+    let fat_needs_growth = new_spf > old_spf;
+
+    log_cb(&format!(
+        "FAT{}: clusters {} -> {}, spf {} -> {}",
+        fat_bits, old_clusters, new_clusters, old_spf, new_spf,
+    ));
+
+    // --- 4. Growing with FAT growth: shift data + extend FAT ---
+    if growing && fat_needs_growth {
+        let shift_sectors = (new_spf - old_spf) * num_fats;
+        let shift_bytes = shift_sectors as u64 * bps;
+
+        // Read old FAT data (one copy — both copies are identical)
+        let old_fat_start = partition_offset + reserved_sectors as u64 * bps;
+        file.seek(SeekFrom::Start(old_fat_start))?;
+        let old_fat_bytes = old_spf as usize * bps as usize;
+        let mut fat_data = vec![0u8; old_fat_bytes];
+        file.read_exact(&mut fat_data)?;
+
+        // Shift rootdir (FAT12/16) + data region forward to make room for larger FATs
+        let move_start_sector = reserved_sectors + num_fats * old_spf;
+        let move_start = partition_offset + move_start_sector as u64 * bps;
+        let move_end = partition_offset + old_total as u64 * bps;
+
+        if move_end > move_start {
+            shift_region_forward(file, move_start, move_end, shift_bytes)?;
+            log_cb(&format!(
+                "Shifted data region forward by {} sectors",
+                shift_sectors,
+            ));
+        }
+
+        // Extend FAT data with free entries (zero = free for all FAT types)
+        let new_fat_bytes = new_spf as usize * bps as usize;
+        fat_data.resize(new_fat_bytes, 0);
+
+        // Write extended FAT to each copy
+        for i in 0..num_fats as u64 {
+            let fat_pos = partition_offset
+                + reserved_sectors as u64 * bps
+                + i * new_fat_bytes as u64;
+            file.seek(SeekFrom::Start(fat_pos))?;
+            file.write_all(&fat_data)?;
+        }
+
+        log_cb(&format!(
+            "Extended FAT: {} -> {} sectors per copy",
+            old_spf, new_spf,
+        ));
+    } else if growing {
+        log_cb("FAT has spare capacity, no table extension needed");
+    }
+
+    // --- 5. Update BPB ---
+    patch_bpb_total_sectors(&mut bpb, new_total_sectors, ts16);
+    if new_spf != old_spf {
+        if is_fat32 {
+            bpb[36..40].copy_from_slice(&new_spf.to_le_bytes());
+        } else {
+            bpb[22..24].copy_from_slice(&(new_spf as u16).to_le_bytes());
+        }
+    }
+    write_bpb(file, partition_offset, &bpb, is_fat32, bytes_per_sector)?;
+
+    // --- 6. Set FAT dirty/clean flags ---
+    // FAT[1] contains volume status flags. After manipulation we must set the
+    // clean shutdown + no I/O error bits, otherwise Windows 95/98 and scandisk
+    // will detect corruption.
+    // FAT12 has no dirty flags in FAT[1].
+    if fat_bits == 16 || fat_bits == 32 {
+        let fat_start = partition_offset + reserved_sectors as u64 * bps;
+        for fat_copy in 0..num_fats as u64 {
+            let fat_copy_start = fat_start + fat_copy * new_spf as u64 * bps;
+            let entry1_offset = fat_copy_start + match fat_bits {
+                16 => 2u64,  // FAT16: entry 1 at byte offset 2
+                32 => 4u64,  // FAT32: entry 1 at byte offset 4
+                _ => unreachable!(),
+            };
+            file.seek(SeekFrom::Start(entry1_offset))?;
+            match fat_bits {
+                16 => {
+                    let mut entry = [0u8; 2];
+                    file.read_exact(&mut entry)?;
+                    let mut val = u16::from_le_bytes(entry);
+                    val |= 0xC000; // bit 15 = clean shutdown, bit 14 = no I/O errors
+                    file.seek(SeekFrom::Start(entry1_offset))?;
+                    file.write_all(&val.to_le_bytes())?;
+                }
+                32 => {
+                    let mut entry = [0u8; 4];
+                    file.read_exact(&mut entry)?;
+                    let mut val = u32::from_le_bytes(entry);
+                    val |= 0x0C00_0000; // bit 27 = clean shutdown, bit 26 = no I/O errors
+                    file.seek(SeekFrom::Start(entry1_offset))?;
+                    file.write_all(&val.to_le_bytes())?;
+                }
+                _ => unreachable!(),
+            }
+        }
+        log_cb(&format!("FAT{}: set clean shutdown flags in FAT[1]", fat_bits));
+    }
+
+    // --- 7. FAT32: update FSInfo ---
+    if is_fat32 {
+        let fsinfo_sector = u16::from_le_bytes([bpb[48], bpb[49]]);
+        if fsinfo_sector > 0 && (fsinfo_sector as u32) < reserved_sectors {
+            let fsinfo_offset = partition_offset + fsinfo_sector as u64 * bps;
+            file.seek(SeekFrom::Start(fsinfo_offset))?;
+            let mut fsinfo = [0u8; 512];
+            file.read_exact(&mut fsinfo)?;
+
+            let sig1 = u32::from_le_bytes(fsinfo[0..4].try_into().unwrap());
+            let sig2 = u32::from_le_bytes(fsinfo[484..488].try_into().unwrap());
+            if sig1 == 0x41615252 && sig2 == 0x61417272 {
+                // Calculate actual free cluster count instead of setting to unknown.
+                // Windows 95's FAT32 driver may not recompute from 0xFFFFFFFF and
+                // could display 0 free space.
+                let actual_free = compute_free_clusters(
+                    file, partition_offset, reserved_sectors, new_spf,
+                    new_clusters, bps, fat_bits,
+                )?;
+                fsinfo[488..492].copy_from_slice(&actual_free.to_le_bytes());
+
+                // Next free cluster hint
+                if new_clusters > old_clusters {
+                    fsinfo[492..496].copy_from_slice(&(old_clusters + 2).to_le_bytes());
+                } else {
+                    fsinfo[492..496].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+                }
+
+                file.seek(SeekFrom::Start(fsinfo_offset))?;
+                file.write_all(&fsinfo)?;
+                log_cb(&format!(
+                    "Updated FAT32 FSInfo: {} free clusters", actual_free
+                ));
+            }
+        }
+    }
+
+    file.flush()?;
+    log_cb(&format!(
+        "FAT{} resize complete: {} clusters, {} total sectors",
+        fat_bits, new_clusters, new_total_sectors,
+    ));
+
+    Ok(true)
+}
+
+/// Validate the integrity of a FAT filesystem after resize/manipulation.
+///
+/// Checks BPB consistency, FAT[0] media byte, FAT[1] clean flags,
+/// FSInfo signatures (FAT32), and cluster chain bounds.
+/// Returns a list of warning messages (empty = all good).
+pub fn validate_fat_integrity(
+    file: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    log_cb: &mut impl FnMut(&str),
+) -> Result<Vec<String>> {
+    let mut warnings = Vec::new();
+
+    // Read BPB
+    file.seek(SeekFrom::Start(partition_offset))?;
+    let mut bpb = [0u8; 512];
+    file.read_exact(&mut bpb)?;
+
+    if bpb[0] != 0xEB && bpb[0] != 0xE9 {
+        warnings.push("BPB: invalid jump instruction".to_string());
+        return Ok(warnings);
+    }
+
+    let bytes_per_sector = u16::from_le_bytes([bpb[11], bpb[12]]);
+    if !matches!(bytes_per_sector, 512 | 1024 | 2048 | 4096) {
+        warnings.push(format!("BPB: invalid bytes_per_sector: {}", bytes_per_sector));
+        return Ok(warnings);
+    }
+    let bps = bytes_per_sector as u64;
+
+    let sectors_per_cluster = bpb[13];
+    if sectors_per_cluster == 0 || !sectors_per_cluster.is_power_of_two() {
+        warnings.push(format!("BPB: invalid sectors_per_cluster: {}", sectors_per_cluster));
+        return Ok(warnings);
+    }
+    let spc = sectors_per_cluster as u32;
+
+    let reserved_sectors = u16::from_le_bytes([bpb[14], bpb[15]]) as u32;
+    let num_fats = bpb[16] as u32;
+    let root_entry_count = u16::from_le_bytes([bpb[17], bpb[18]]);
+    let ts16 = u16::from_le_bytes([bpb[19], bpb[20]]);
+    let spf16 = u16::from_le_bytes([bpb[22], bpb[23]]);
+    let ts32 = u32::from_le_bytes([bpb[32], bpb[33], bpb[34], bpb[35]]);
+    let spf32 = u32::from_le_bytes([bpb[36], bpb[37], bpb[38], bpb[39]]);
+
+    let is_fat32 = spf16 == 0 && root_entry_count == 0;
+    let spf = if is_fat32 { spf32 } else { spf16 as u32 };
+    let total = if ts16 != 0 { ts16 as u32 } else { ts32 };
+
+    let root_dir_sectors = if is_fat32 {
+        0u32
+    } else {
+        ((root_entry_count as u32 * 32) + (bytes_per_sector as u32 - 1)) / bytes_per_sector as u32
+    };
+
+    let data_start = reserved_sectors + num_fats * spf + root_dir_sectors;
+    let data_sectors = total.saturating_sub(data_start);
+    let clusters = data_sectors / spc;
+
+    let fat_bits: u32 = if is_fat32 {
+        32
+    } else if clusters < 4085 {
+        12
+    } else {
+        16
+    };
+
+    // Check BPB self-consistency
+    if data_start > total {
+        warnings.push(format!(
+            "BPB: data_start ({}) > total_sectors ({})", data_start, total
+        ));
+    }
+
+    // Check FAT[0] media byte
+    let fat_start = partition_offset + reserved_sectors as u64 * bps;
+    file.seek(SeekFrom::Start(fat_start))?;
+    match fat_bits {
+        12 => {
+            let mut entry = [0u8; 2];
+            file.read_exact(&mut entry)?;
+            let val = u16::from_le_bytes(entry) & 0x0FFF;
+            let media = bpb[21];
+            if val != (0x0F00 | media as u16) {
+                warnings.push(format!(
+                    "FAT12: FAT[0] = 0x{:03X}, expected 0x{:03X}",
+                    val, 0x0F00 | media as u16
+                ));
+            }
+        }
+        16 => {
+            let mut entry = [0u8; 2];
+            file.read_exact(&mut entry)?;
+            let val = u16::from_le_bytes(entry);
+            if val & 0x00FF != bpb[21] as u16 {
+                warnings.push(format!(
+                    "FAT16: FAT[0] low byte = 0x{:02X}, media byte = 0x{:02X}",
+                    val & 0xFF, bpb[21]
+                ));
+            }
+        }
+        32 => {
+            let mut entry = [0u8; 4];
+            file.read_exact(&mut entry)?;
+            let val = u32::from_le_bytes(entry) & 0x0FFF_FFFF;
+            if val & 0xFF != bpb[21] as u32 {
+                warnings.push(format!(
+                    "FAT32: FAT[0] low byte = 0x{:02X}, media byte = 0x{:02X}",
+                    val & 0xFF, bpb[21]
+                ));
+            }
+        }
+        _ => {}
+    }
+
+    // Check FAT[1] clean flags
+    match fat_bits {
+        16 => {
+            file.seek(SeekFrom::Start(fat_start + 2))?;
+            let mut entry = [0u8; 2];
+            file.read_exact(&mut entry)?;
+            let val = u16::from_le_bytes(entry);
+            if val & 0x8000 == 0 {
+                warnings.push("FAT16: FAT[1] clean shutdown bit not set".to_string());
+            }
+            if val & 0x4000 == 0 {
+                warnings.push("FAT16: FAT[1] no-error bit not set".to_string());
+            }
+        }
+        32 => {
+            file.seek(SeekFrom::Start(fat_start + 4))?;
+            let mut entry = [0u8; 4];
+            file.read_exact(&mut entry)?;
+            let val = u32::from_le_bytes(entry);
+            if val & 0x0800_0000 == 0 {
+                warnings.push("FAT32: FAT[1] clean shutdown bit not set".to_string());
+            }
+            if val & 0x0400_0000 == 0 {
+                warnings.push("FAT32: FAT[1] no-error bit not set".to_string());
+            }
+        }
+        _ => {} // FAT12 has no dirty flags
+    }
+
+    // Check FSInfo (FAT32 only)
+    if is_fat32 {
+        let fsinfo_sector = u16::from_le_bytes([bpb[48], bpb[49]]);
+        if fsinfo_sector > 0 && (fsinfo_sector as u32) < reserved_sectors {
+            let fsinfo_offset = partition_offset + fsinfo_sector as u64 * bps;
+            file.seek(SeekFrom::Start(fsinfo_offset))?;
+            let mut fsinfo = [0u8; 512];
+            file.read_exact(&mut fsinfo)?;
+
+            let sig1 = u32::from_le_bytes(fsinfo[0..4].try_into().unwrap());
+            let sig2 = u32::from_le_bytes(fsinfo[484..488].try_into().unwrap());
+            if sig1 != 0x41615252 {
+                warnings.push(format!("FSInfo: bad signature1 0x{:08X}", sig1));
+            }
+            if sig2 != 0x61417272 {
+                warnings.push(format!("FSInfo: bad signature2 0x{:08X}", sig2));
+            }
+
+            let free_count = u32::from_le_bytes(fsinfo[488..492].try_into().unwrap());
+            if free_count != 0xFFFF_FFFF && free_count > clusters {
+                warnings.push(format!(
+                    "FSInfo: free_count ({}) > total clusters ({})",
+                    free_count, clusters
+                ));
+            }
+        }
+    }
+
+    // Check for cluster chains referencing beyond total
+    let fat_byte_size = spf as u64 * bps;
+    file.seek(SeekFrom::Start(fat_start))?;
+    let mut fat_data = vec![0u8; fat_byte_size as usize];
+    file.read_exact(&mut fat_data)?;
+
+    let total_entries = clusters + 2;
+    let mut out_of_bounds = 0u32;
+    for cluster in 2..total_entries {
+        let entry = match fat_bits {
+            12 => {
+                let byte_off = (cluster as usize * 3) / 2;
+                if byte_off + 1 >= fat_data.len() { continue; }
+                let val = u16::from_le_bytes([fat_data[byte_off], fat_data[byte_off + 1]]);
+                if cluster & 1 == 1 { (val >> 4) as u32 } else { (val & 0x0FFF) as u32 }
+            }
+            16 => {
+                let off = cluster as usize * 2;
+                if off + 1 >= fat_data.len() { continue; }
+                u16::from_le_bytes([fat_data[off], fat_data[off + 1]]) as u32
+            }
+            32 => {
+                let off = cluster as usize * 4;
+                if off + 3 >= fat_data.len() { continue; }
+                u32::from_le_bytes([
+                    fat_data[off], fat_data[off + 1],
+                    fat_data[off + 2], fat_data[off + 3],
+                ]) & 0x0FFF_FFFF
+            }
+            _ => continue,
+        };
+
+        // Check if entry points to a valid cluster (not free, not EOC, not bad)
+        let is_free = entry == 0;
+        let is_eoc = match fat_bits {
+            12 => entry >= 0x0FF8,
+            16 => entry >= 0xFFF8,
+            32 => entry >= 0x0FFF_FFF8,
+            _ => false,
+        };
+        let is_bad = match fat_bits {
+            12 => entry == 0x0FF7,
+            16 => entry == 0xFFF7,
+            32 => entry == 0x0FFF_FFF7,
+            _ => false,
+        };
+
+        if !is_free && !is_eoc && !is_bad {
+            if entry < 2 || entry >= total_entries {
+                out_of_bounds += 1;
+            }
+        }
+    }
+
+    if out_of_bounds > 0 {
+        warnings.push(format!(
+            "{} cluster(s) reference beyond total ({})",
+            out_of_bounds, total_entries
+        ));
+    }
+
+    for w in &warnings {
+        log_cb(&format!("FAT validation warning: {}", w));
+    }
+    if warnings.is_empty() {
+        log_cb("FAT validation: all checks passed");
+    }
+
+    Ok(warnings)
+}
+
+/// Update the BPB hidden sectors field (offset 0x1C) with the partition's
+/// actual start LBA. This field must match the partition's position on disk.
+pub fn patch_bpb_hidden_sectors(
+    file: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    start_lba: u64,
+    log_cb: &mut impl FnMut(&str),
+) -> Result<()> {
+    file.seek(SeekFrom::Start(partition_offset))?;
+    let mut bpb = [0u8; 512];
+    file.read_exact(&mut bpb)?;
+
+    if bpb[0] != 0xEB && bpb[0] != 0xE9 {
+        return Ok(()); // Not a FAT BPB
+    }
+
+    let bytes_per_sector = u16::from_le_bytes([bpb[11], bpb[12]]);
+    if !matches!(bytes_per_sector, 512 | 1024 | 2048 | 4096) {
+        return Ok(()); // Not a valid FAT BPB
+    }
+
+    let old_hidden = u32::from_le_bytes([bpb[0x1C], bpb[0x1D], bpb[0x1E], bpb[0x1F]]);
+    let new_hidden = start_lba as u32;
+
+    if old_hidden != new_hidden {
+        bpb[0x1C..0x20].copy_from_slice(&new_hidden.to_le_bytes());
+
+        let spf16 = u16::from_le_bytes([bpb[22], bpb[23]]);
+        let root_entry_count = u16::from_le_bytes([bpb[17], bpb[18]]);
+        let is_fat32 = spf16 == 0 && root_entry_count == 0;
+
+        write_bpb(file, partition_offset, &bpb, is_fat32, bytes_per_sector)?;
+        log_cb(&format!(
+            "Patched BPB hidden sectors: {} -> {}",
+            old_hidden, new_hidden
+        ));
+    }
+
+    Ok(())
+}
+
+/// Patch BPB total_sectors fields (16-bit or 32-bit) in a BPB buffer.
+fn patch_bpb_total_sectors(bpb: &mut [u8; 512], new_total: u32, old_ts16: u16) {
+    if old_ts16 != 0 && new_total <= u16::MAX as u32 {
+        bpb[19..21].copy_from_slice(&(new_total as u16).to_le_bytes());
+        bpb[32..36].copy_from_slice(&0u32.to_le_bytes());
+    } else {
+        bpb[19..21].copy_from_slice(&0u16.to_le_bytes());
+        bpb[32..36].copy_from_slice(&new_total.to_le_bytes());
+    }
+}
+
+/// Write a BPB to the primary boot sector and (for FAT32) the backup at sector 6.
+fn write_bpb(
+    file: &mut (impl Write + Seek),
+    partition_offset: u64,
+    bpb: &[u8; 512],
+    is_fat32: bool,
+    bytes_per_sector: u16,
+) -> Result<()> {
+    file.seek(SeekFrom::Start(partition_offset))?;
+    file.write_all(bpb)?;
+    if is_fat32 {
+        let backup = partition_offset + 6 * bytes_per_sector as u64;
+        file.seek(SeekFrom::Start(backup))?;
+        file.write_all(bpb)?;
+    }
+    Ok(())
+}
+
+/// Compute the number of sectors needed for one FAT copy given the partition
+/// parameters and FAT type.
+fn compute_fat_sectors(
+    total_sectors: u32,
+    reserved: u32,
+    num_fats: u32,
+    root_dir_sectors: u32,
+    sectors_per_cluster: u32,
+    fat_bits: u32,
+    bytes_per_sector: u16,
+) -> u32 {
+    let avail = total_sectors.saturating_sub(reserved + root_dir_sectors) as u64;
+    let bps = bytes_per_sector as u64;
+    let spc = sectors_per_cluster as u64;
+    let n = num_fats as u64;
+
+    match fat_bits {
+        12 => {
+            // FAT12: 1.5 bytes per entry — use iterative approach
+            let mut spf = 1u32;
+            loop {
+                let data_sectors = avail.saturating_sub(n * spf as u64);
+                let clusters = data_sectors / spc;
+                let fat_bytes = ((clusters + 2) * 3 + 1) / 2;
+                let needed = ((fat_bytes + bps - 1) / bps) as u32;
+                if needed <= spf {
+                    return spf;
+                }
+                spf = needed;
+            }
+        }
+        16 => {
+            // FAT16: 2 bytes per entry
+            // Closed-form: ceil(2 * (avail + 2*spc) / (bps*spc + 2*n))
+            let num = 2 * (avail + 2 * spc);
+            let den = bps * spc + 2 * n;
+            ((num + den - 1) / den) as u32
+        }
+        32 => {
+            // FAT32: 4 bytes per entry
+            let num = 4 * (avail + 2 * spc);
+            let den = bps * spc + 4 * n;
+            ((num + den - 1) / den) as u32
+        }
+        _ => 1,
+    }
+}
+
+/// Shift a region of a file forward by `shift` bytes.
+/// Reads backward from the end to avoid overwriting unread data.
+fn shift_region_forward(
+    file: &mut (impl Read + Write + Seek),
+    src_start: u64,
+    src_end: u64,
+    shift: u64,
+) -> Result<()> {
+    let data_len = src_end.saturating_sub(src_start);
+    if data_len == 0 || shift == 0 {
+        return Ok(());
+    }
+
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    let mut remaining = data_len;
+
+    // Copy backward: read from the end, write to offset + shift
+    while remaining > 0 {
+        let chunk = remaining.min(CHUNK_SIZE as u64);
+        let read_pos = src_start + remaining - chunk;
+
+        file.seek(SeekFrom::Start(read_pos))?;
+        file.read_exact(&mut buf[..chunk as usize])?;
+
+        file.seek(SeekFrom::Start(read_pos + shift))?;
+        file.write_all(&buf[..chunk as usize])?;
+
+        remaining -= chunk;
+    }
+
+    // Zero-fill the gap left by the shift
+    let zeros = vec![0u8; CHUNK_SIZE];
+    let mut gap = shift;
+    file.seek(SeekFrom::Start(src_start))?;
+    while gap > 0 {
+        let n = (gap as usize).min(CHUNK_SIZE);
+        file.write_all(&zeros[..n])?;
+        gap -= n as u64;
+    }
+
+    Ok(())
+}
+
+/// Count the number of free (zero-value) cluster entries in the FAT.
+fn compute_free_clusters(
+    file: &mut (impl Read + Seek),
+    partition_offset: u64,
+    reserved_sectors: u32,
+    sectors_per_fat: u32,
+    total_clusters: u32,
+    bps: u64,
+    fat_bits: u32,
+) -> Result<u32> {
+    let fat_start = partition_offset + reserved_sectors as u64 * bps;
+    let fat_size = sectors_per_fat as u64 * bps;
+    file.seek(SeekFrom::Start(fat_start))?;
+    let mut fat_data = vec![0u8; fat_size as usize];
+    file.read_exact(&mut fat_data)?;
+
+    let total_entries = total_clusters + 2;
+    let mut free_count: u32 = 0;
+
+    for cluster in 2..total_entries {
+        let entry = match fat_bits {
+            12 => {
+                let byte_off = (cluster as usize * 3) / 2;
+                if byte_off + 1 >= fat_data.len() {
+                    0
+                } else {
+                    let val = u16::from_le_bytes([fat_data[byte_off], fat_data[byte_off + 1]]);
+                    if cluster & 1 == 1 { (val >> 4) as u32 } else { (val & 0x0FFF) as u32 }
+                }
+            }
+            16 => {
+                let off = cluster as usize * 2;
+                if off + 1 >= fat_data.len() {
+                    0
+                } else {
+                    u16::from_le_bytes([fat_data[off], fat_data[off + 1]]) as u32
+                }
+            }
+            32 => {
+                let off = cluster as usize * 4;
+                if off + 3 >= fat_data.len() {
+                    0
+                } else {
+                    u32::from_le_bytes([
+                        fat_data[off], fat_data[off + 1],
+                        fat_data[off + 2], fat_data[off + 3],
+                    ]) & 0x0FFF_FFFF
+                }
+            }
+            _ => 0,
+        };
+        if entry == 0 {
+            free_count += 1;
+        }
+    }
+
+    Ok(free_count)
 }
 
 #[cfg(test)]
