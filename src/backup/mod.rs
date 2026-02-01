@@ -133,10 +133,7 @@ fn set_operation(progress: &Arc<Mutex<BackupProgress>>, op: impl Into<String>) {
 }
 
 fn is_cancelled(progress: &Arc<Mutex<BackupProgress>>) -> bool {
-    progress
-        .lock()
-        .map(|p| p.cancel_requested)
-        .unwrap_or(false)
+    progress.lock().map(|p| p.cancel_requested).unwrap_or(false)
 }
 
 fn set_progress_bytes(progress: &Arc<Mutex<BackupProgress>>, current: u64, total: u64) {
@@ -148,7 +145,11 @@ fn set_progress_bytes(progress: &Arc<Mutex<BackupProgress>>, current: u64, total
 
 /// Main backup orchestrator. Runs on a background thread.
 pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) -> Result<()> {
-    log(&progress, LogLevel::Info, format!("Starting backup of {}", config.source_path.display()));
+    log(
+        &progress,
+        LogLevel::Info,
+        format!("Starting backup of {}", config.source_path.display()),
+    );
 
     // Step 1: Open source and detect partition table
     set_operation(&progress, "Opening source device...");
@@ -175,11 +176,12 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
 
     // Read the first 512 bytes for MBR export
     let mut mbr_bytes = [0u8; 512];
-    source.read_exact(&mut mbr_bytes).context("cannot read first sector")?;
+    source
+        .read_exact(&mut mbr_bytes)
+        .context("cannot read first sector")?;
     source.seek(SeekFrom::Start(0))?;
 
-    let table = PartitionTable::detect(&mut source)
-        .context("failed to detect partition table")?;
+    let table = PartitionTable::detect(&mut source).context("failed to detect partition table")?;
     let alignment = partition::detect_alignment(&table);
     let partitions = table.partitions();
 
@@ -216,11 +218,19 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
     match &table {
         PartitionTable::Mbr(mbr) => {
             format::export_mbr(mbr, &mbr_bytes, &backup_folder)?;
-            log(&progress, LogLevel::Info, "Exported MBR (mbr.bin + mbr.json)");
+            log(
+                &progress,
+                LogLevel::Info,
+                "Exported MBR (mbr.bin + mbr.json)",
+            );
         }
         PartitionTable::Gpt { gpt, .. } => {
             format::export_gpt(gpt, &mbr_bytes, &backup_folder)?;
-            log(&progress, LogLevel::Info, "Exported GPT (gpt.json + mbr.bin)");
+            log(
+                &progress,
+                LogLevel::Info,
+                "Exported GPT (gpt.json + mbr.bin)",
+            );
         }
     }
 
@@ -312,9 +322,17 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             }
         }
         if let Err(e) = format::export_mbr_min(&mbr_bytes, &min_sectors, &backup_folder) {
-            log(&progress, LogLevel::Warning, format!("Failed to export mbr-min.bin: {e}"));
+            log(
+                &progress,
+                LogLevel::Warning,
+                format!("Failed to export mbr-min.bin: {e}"),
+            );
         } else {
-            log(&progress, LogLevel::Info, "Exported minimum-size MBR (mbr-min.bin)");
+            log(
+                &progress,
+                LogLevel::Info,
+                "Exported minimum-size MBR (mbr-min.bin)",
+            );
         }
     }
 
@@ -427,12 +445,13 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         let compressed_files = if is_compacted {
             // Use compacted reader — create a fresh CompactFatReader
             let part_offset = part.start_lba * 512;
-            let clone = source.get_ref().try_clone()
+            let clone = source
+                .get_ref()
+                .try_clone()
                 .context("failed to clone source for compaction")?;
-            let (mut compact_reader, _) = fs::CompactFatReader::new(
-                BufReader::new(clone),
-                part_offset,
-            ).map_err(|e| anyhow::anyhow!("compaction failed: {e}"))?;
+            let (mut compact_reader, _) =
+                fs::CompactFatReader::new(BufReader::new(clone), part_offset)
+                    .map_err(|e| anyhow::anyhow!("compaction failed: {e}"))?;
 
             let progress_log = Arc::clone(&progress);
             crate::rbformats::compress_partition(
@@ -442,7 +461,11 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 split_bytes,
                 false, // compacted image has no wasted space, don't skip zeros
                 |bytes_read| {
-                    set_progress_bytes(&progress_clone, base_bytes + bytes_read, total_partition_bytes);
+                    set_progress_bytes(
+                        &progress_clone,
+                        base_bytes + bytes_read,
+                        total_partition_bytes,
+                    );
                 },
                 || is_cancelled(&progress_clone),
                 |msg| log(&progress_log, LogLevel::Info, msg),
@@ -463,7 +486,11 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 split_bytes,
                 !config.sector_by_sector,
                 |bytes_read| {
-                    set_progress_bytes(&progress_clone, base_bytes + bytes_read, total_partition_bytes);
+                    set_progress_bytes(
+                        &progress_clone,
+                        base_bytes + bytes_read,
+                        total_partition_bytes,
+                    );
                 },
                 || is_cancelled(&progress_clone),
                 |msg| log(&progress_log, LogLevel::Info, msg),

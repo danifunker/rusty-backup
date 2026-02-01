@@ -86,9 +86,12 @@ impl LogPanel {
                     };
                     ui.horizontal(|ui| {
                         ui.label(
-                            RichText::new(format!("{} [{}] {}", entry.timestamp, prefix, entry.message))
-                                .color(color)
-                                .monospace(),
+                            RichText::new(format!(
+                                "{} [{}] {}",
+                                entry.timestamp, prefix, entry.message
+                            ))
+                            .color(color)
+                            .monospace(),
                         );
                     });
                 }
@@ -146,9 +149,7 @@ impl ProgressState {
                         fraction * 100.0,
                     )
                 };
-                let bar = egui::ProgressBar::new(fraction)
-                    .text(text)
-                    .animate(true);
+                let bar = egui::ProgressBar::new(fraction).text(text).animate(true);
                 ui.add(bar);
             } else {
                 ui.spinner();

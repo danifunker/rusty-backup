@@ -6,11 +6,11 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 
+use crate::backup::metadata::BackupMetadata;
+use crate::backup::LogLevel;
 use crate::os::SectorAlignedWriter;
 use crate::partition::PartitionSizeOverride;
 use crate::rbformats::reconstruct_disk_from_backup;
-use crate::backup::metadata::BackupMetadata;
-use crate::backup::LogLevel;
 
 /// Restore configuration.
 pub struct RestoreConfig {
@@ -245,13 +245,16 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
     set_operation(&progress, "Loading backup metadata...");
     let metadata_path = config.backup_folder.join("metadata.json");
     if !metadata_path.exists() {
-        bail!("metadata.json not found in {}", config.backup_folder.display());
+        bail!(
+            "metadata.json not found in {}",
+            config.backup_folder.display()
+        );
     }
 
     let metadata_file = File::open(&metadata_path)
         .with_context(|| format!("failed to open {}", metadata_path.display()))?;
-    let metadata: BackupMetadata = serde_json::from_reader(metadata_file)
-        .context("failed to parse metadata.json")?;
+    let metadata: BackupMetadata =
+        serde_json::from_reader(metadata_file).context("failed to parse metadata.json")?;
 
     log(
         &progress,
@@ -309,10 +312,7 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
             LogLevel::Info,
             format!(
                 "Partition {}: LBA {} -> {}, size {} MiB",
-                ov.index,
-                ov.start_lba,
-                start,
-                size_mib,
+                ov.index, ov.start_lba, start, size_mib,
             ),
         );
     }
@@ -336,21 +336,24 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
     // Step 6: Open target
     set_operation(&progress, "Opening target...");
     let target_file = if config.target_is_device {
-        log(&progress, LogLevel::Info, format!(
-            "Opening device {} for writing...", config.target_path.display()
-        ));
+        log(
+            &progress,
+            LogLevel::Info,
+            format!(
+                "Opening device {} for writing...",
+                config.target_path.display()
+            ),
+        );
         crate::os::open_target_for_writing(&config.target_path)
-            .with_context(|| format!(
-                "cannot open {} for writing", config.target_path.display()
-            ))?
+            .with_context(|| format!("cannot open {} for writing", config.target_path.display()))?
     } else {
-        log(&progress, LogLevel::Info, format!(
-            "Creating image file {}...", config.target_path.display()
-        ));
+        log(
+            &progress,
+            LogLevel::Info,
+            format!("Creating image file {}...", config.target_path.display()),
+        );
         File::create(&config.target_path)
-            .with_context(|| format!(
-                "failed to create {}", config.target_path.display()
-            ))?
+            .with_context(|| format!("failed to create {}", config.target_path.display()))?
     };
 
     // Wrap in SectorAlignedWriter so that raw device writes (/dev/rdiskN on

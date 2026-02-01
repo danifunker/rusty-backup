@@ -12,10 +12,7 @@ use mbr::Mbr;
 #[derive(Debug, Clone)]
 pub enum PartitionTable {
     Mbr(Mbr),
-    Gpt {
-        protective_mbr: Mbr,
-        gpt: Gpt,
-    },
+    Gpt { protective_mbr: Mbr, gpt: Gpt },
 }
 
 /// Detected partition alignment pattern.
@@ -72,7 +69,9 @@ impl PartitionTable {
     /// Detect and parse the partition table from a readable+seekable source.
     pub fn detect(reader: &mut (impl Read + Seek)) -> Result<Self, RustyBackupError> {
         // Read first 512 bytes (MBR / protective MBR)
-        reader.seek(SeekFrom::Start(0)).map_err(RustyBackupError::Io)?;
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(RustyBackupError::Io)?;
         let mut mbr_data = [0u8; 512];
         reader
             .read_exact(&mut mbr_data)
@@ -178,9 +177,7 @@ impl PartitionTable {
     pub fn disk_signature(&self) -> u32 {
         match self {
             PartitionTable::Mbr(mbr) => mbr.disk_signature,
-            PartitionTable::Gpt {
-                protective_mbr, ..
-            } => protective_mbr.disk_signature,
+            PartitionTable::Gpt { protective_mbr, .. } => protective_mbr.disk_signature,
         }
     }
 }
@@ -204,9 +201,7 @@ pub fn detect_alignment(table: &PartitionTable) -> PartitionAlignment {
     // Extract CHS geometry from MBR if available
     let (heads, sectors_per_track) = match table {
         PartitionTable::Mbr(mbr) => extract_chs_geometry(mbr),
-        PartitionTable::Gpt {
-            protective_mbr, ..
-        } => extract_chs_geometry(protective_mbr),
+        PartitionTable::Gpt { protective_mbr, .. } => extract_chs_geometry(protective_mbr),
     };
 
     // Check for DOS traditional alignment: first partition at LBA 63
@@ -238,10 +233,7 @@ pub fn detect_alignment(table: &PartitionTable) -> PartitionAlignment {
 
     // Check for modern 1MB alignment: first partition at LBA 2048
     if first_lba == 2048 || first_lba % 2048 == 0 {
-        if partitions
-            .iter()
-            .all(|p| p.start_lba % 2048 == 0)
-        {
+        if partitions.iter().all(|p| p.start_lba % 2048 == 0) {
             return PartitionAlignment {
                 first_lba,
                 alignment_sectors: 2048,
@@ -306,7 +298,10 @@ fn check_cylinder_alignment(partitions: &[PartitionInfo], sectors_per_cylinder: 
         return false;
     }
     // First partition may start at LBA 63 (one track offset), subsequent should be on boundaries
-    partitions.iter().skip(1).all(|p| p.start_lba % sectors_per_cylinder == 0)
+    partitions
+        .iter()
+        .skip(1)
+        .all(|p| p.start_lba % sectors_per_cylinder == 0)
 }
 
 /// Find the GCD of all partition start LBAs.
@@ -418,8 +413,8 @@ mod tests {
     fn test_dos_traditional_alignment() {
         // DOS layout: first partition at LBA 63, CHS geometry 255 heads x 63 sectors
         let mbr_data = make_mbr_with_chs(&[
-            (0x06, 63, 1024000, 1, 1, 0, 254, 63, 63),           // FAT16 at LBA 63
-            (0x0B, 16065, 2048000, 0, 1, 1, 254, 63, 127),       // FAT32 at next cylinder
+            (0x06, 63, 1024000, 1, 1, 0, 254, 63, 63), // FAT16 at LBA 63
+            (0x0B, 16065, 2048000, 0, 1, 1, 254, 63, 127), // FAT32 at next cylinder
         ]);
         let mbr = Mbr::parse(&mbr_data).unwrap();
         let table = PartitionTable::Mbr(mbr);
@@ -449,9 +444,7 @@ mod tests {
 
     #[test]
     fn test_single_partition_dos() {
-        let mbr_data = make_mbr_with_chs(&[
-            (0x06, 63, 1024000, 1, 1, 0, 254, 63, 63),
-        ]);
+        let mbr_data = make_mbr_with_chs(&[(0x06, 63, 1024000, 1, 1, 0, 254, 63, 63)]);
         let mbr = Mbr::parse(&mbr_data).unwrap();
         let table = PartitionTable::Mbr(mbr);
         let alignment = detect_alignment(&table);
@@ -473,9 +466,7 @@ mod tests {
 
     #[test]
     fn test_detect_mbr_from_reader() {
-        let mbr_data = make_mbr_with_chs(&[
-            (0x0C, 2048, 1048576, 0, 1, 0, 254, 63, 100),
-        ]);
+        let mbr_data = make_mbr_with_chs(&[(0x0C, 2048, 1048576, 0, 1, 0, 254, 63, 100)]);
         let mut cursor = Cursor::new(mbr_data.to_vec());
         let table = PartitionTable::detect(&mut cursor).unwrap();
 

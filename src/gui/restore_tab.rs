@@ -205,11 +205,7 @@ impl RestoreTab {
                                     partition::format_size(device.size_bytes),
                                     if device.is_system { " [SYSTEM]" } else { "" },
                                 );
-                                ui.selectable_value(
-                                    &mut self.selected_device_idx,
-                                    Some(i),
-                                    label,
-                                );
+                                ui.selectable_value(&mut self.selected_device_idx, Some(i), label);
                             }
                         });
                 });
@@ -282,8 +278,7 @@ impl RestoreTab {
                 let orig_label = if let Some(meta) = &self.backup_metadata {
                     format!(
                         "Original ({}, LBA {})",
-                        meta.alignment.detected_type,
-                        meta.alignment.first_partition_lba,
+                        meta.alignment.detected_type, meta.alignment.first_partition_lba,
                     )
                 } else {
                     "Original".to_string()
@@ -323,10 +318,7 @@ impl RestoreTab {
             ui.separator();
 
             ui.add_enabled_ui(controls_enabled, |ui| {
-                let last_index = self
-                    .partition_configs
-                    .last()
-                    .map(|c| c.index);
+                let last_index = self.partition_configs.last().map(|c| c.index);
 
                 egui::Grid::new("restore_partition_sizes")
                     .striped(true)
@@ -382,8 +374,7 @@ impl RestoreTab {
                             }
 
                             if cfg.choice == RestoreSizeUiChoice::Custom {
-                                let min_mib =
-                                    (cfg.minimum_size / (1024 * 1024)).max(1) as u32;
+                                let min_mib = (cfg.minimum_size / (1024 * 1024)).max(1) as u32;
                                 ui.add(
                                     egui::DragValue::new(&mut cfg.custom_size_mib)
                                         .range(min_mib..=u32::MAX),
@@ -391,10 +382,7 @@ impl RestoreTab {
                             } else if cfg.choice == RestoreSizeUiChoice::FillRemaining {
                                 ui.label("(auto)");
                             } else {
-                                ui.label(format!(
-                                    "{}",
-                                    cfg.effective_size() / (1024 * 1024),
-                                ));
+                                ui.label(format!("{}", cfg.effective_size() / (1024 * 1024),));
                             }
                             ui.end_row();
                         }
@@ -585,7 +573,10 @@ impl RestoreTab {
 
                 ui.colored_label(
                     egui::Color32::from_rgb(255, 100, 100),
-                    format!("All data on {} will be permanently overwritten!", target_name),
+                    format!(
+                        "All data on {} will be permanently overwritten!",
+                        target_name
+                    ),
                 );
                 ui.add_space(8.0);
 
@@ -605,9 +596,10 @@ impl RestoreTab {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui
-                        .button(egui::RichText::new("I understand, proceed").color(
-                            egui::Color32::from_rgb(255, 100, 100),
-                        ))
+                        .button(
+                            egui::RichText::new("I understand, proceed")
+                                .color(egui::Color32::from_rgb(255, 100, 100)),
+                        )
                         .clicked()
                     {
                         close = true;
@@ -634,10 +626,7 @@ impl RestoreTab {
         };
 
         let (target_path, target_is_device, target_size) = if self.target_is_device {
-            let device = match self
-                .selected_device_idx
-                .and_then(|idx| devices.get(idx))
-            {
+            let device = match self.selected_device_idx.and_then(|idx| devices.get(idx)) {
                 Some(d) => d,
                 None => {
                     log.error("No target device selected");
@@ -698,10 +687,7 @@ impl RestoreTab {
         self.restore_progress = Some(Arc::clone(&progress_arc));
         self.restore_running = true;
 
-        log.info(format!(
-            "Starting restore to {}",
-            target_path.display(),
-        ));
+        log.info(format!("Starting restore to {}", target_path.display(),));
 
         std::thread::spawn(move || {
             if let Err(e) = restore::run_restore(config, Arc::clone(&progress_arc)) {

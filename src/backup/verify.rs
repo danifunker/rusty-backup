@@ -56,20 +56,12 @@ pub fn write_checksum_file(
         ChecksumType::Sha256 => "sha256",
         ChecksumType::Crc32 => "crc32",
     };
-    let sidecar_path = file_path.with_extension(
-        format!(
-            "{}.{extension}",
-            file_path
-                .extension()
-                .unwrap_or_default()
-                .to_string_lossy()
-        ),
-    );
+    let sidecar_path = file_path.with_extension(format!(
+        "{}.{extension}",
+        file_path.extension().unwrap_or_default().to_string_lossy()
+    ));
 
-    let file_name = file_path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy();
+    let file_name = file_path.file_name().unwrap_or_default().to_string_lossy();
 
     let mut f = File::create(&sidecar_path)
         .with_context(|| format!("failed to create {}", sidecar_path.display()))?;

@@ -6,11 +6,11 @@ use std::sync::{Arc, Mutex};
 use rusty_backup::backup::{
     BackupConfig, BackupProgress, ChecksumType, CompressionType, LogLevel as BackupLogLevel,
 };
+use rusty_backup::device::DiskDevice;
 use rusty_backup::fs;
 use rusty_backup::partition::PartitionSizeOverride;
-use rusty_backup::rbformats::vhd::export_whole_disk_vhd;
-use rusty_backup::device::DiskDevice;
 use rusty_backup::partition::{self, PartitionInfo, PartitionTable};
+use rusty_backup::rbformats::vhd::export_whole_disk_vhd;
 
 use super::progress::{LogPanel, ProgressState};
 
@@ -264,7 +264,10 @@ impl BackupTab {
                 };
                 ui.add_enabled(
                     self.chdman_available,
-                    egui::RadioButton::new(self.compression_type == CompressionType::Chd, chd_label),
+                    egui::RadioButton::new(
+                        self.compression_type == CompressionType::Chd,
+                        chd_label,
+                    ),
                 )
                 .clicked()
                 .then(|| {
@@ -332,9 +335,8 @@ impl BackupTab {
             if !self.backup_running && !vhd_exporting {
                 let has_source =
                     self.selected_device_idx.is_some() || self.image_file_path.is_some();
-                let can_start = has_source
-                    && self.destination_folder.is_some()
-                    && !self.backup_name.is_empty();
+                let can_start =
+                    has_source && self.destination_folder.is_some() && !self.backup_name.is_empty();
 
                 if ui
                     .add_enabled(can_start, egui::Button::new("Start Backup"))
@@ -407,8 +409,16 @@ impl BackupTab {
                 ui.label("Configure VHD output.");
                 ui.add_space(4.0);
 
-                ui.radio_value(&mut self.vhd_whole_disk, true, "Whole Disk (single .vhd file)");
-                ui.radio_value(&mut self.vhd_whole_disk, false, "Per Partition (one .vhd per partition)");
+                ui.radio_value(
+                    &mut self.vhd_whole_disk,
+                    true,
+                    "Whole Disk (single .vhd file)",
+                );
+                ui.radio_value(
+                    &mut self.vhd_whole_disk,
+                    false,
+                    "Per Partition (one .vhd per partition)",
+                );
 
                 ui.add_space(8.0);
 
@@ -458,19 +468,16 @@ impl BackupTab {
                                 }
 
                                 if cfg.choice == VhdSizeChoice::Custom {
-                                    let min_mib =
-                                        (cfg.minimum_size / (1024 * 1024)).max(1) as u32;
-                                    let max_mib =
-                                        (cfg.original_size / (1024 * 1024)).max(min_mib as u64) as u32;
+                                    let min_mib = (cfg.minimum_size / (1024 * 1024)).max(1) as u32;
+                                    let max_mib = (cfg.original_size / (1024 * 1024))
+                                        .max(min_mib as u64)
+                                        as u32;
                                     ui.add(
                                         egui::DragValue::new(&mut cfg.custom_size_mib)
                                             .range(min_mib..=max_mib),
                                     );
                                 } else {
-                                    ui.label(format!(
-                                        "{}",
-                                        cfg.effective_size() / (1024 * 1024),
-                                    ));
+                                    ui.label(format!("{}", cfg.effective_size() / (1024 * 1024),));
                                 }
                                 ui.end_row();
                             }
@@ -521,12 +528,14 @@ impl BackupTab {
         let overrides: Vec<PartitionSizeOverride> = self
             .vhd_partition_configs
             .iter()
-            .map(|cfg| PartitionSizeOverride::size_only(
-                cfg.index,
-                cfg.start_lba,
-                cfg.original_size,
-                cfg.effective_size(),
-            ))
+            .map(|cfg| {
+                PartitionSizeOverride::size_only(
+                    cfg.index,
+                    cfg.start_lba,
+                    cfg.original_size,
+                    cfg.effective_size(),
+                )
+            })
             .collect();
 
         let total_bytes: u64 = overrides.iter().map(|o| o.export_size).sum();
@@ -562,12 +571,7 @@ impl BackupTab {
                         s.current_bytes = bytes;
                     }
                 },
-                move || {
-                    status3
-                        .lock()
-                        .map(|s| s.cancel_requested)
-                        .unwrap_or(false)
-                },
+                move || status3.lock().map(|s| s.cancel_requested).unwrap_or(false),
                 |msg| {
                     if let Ok(mut s) = status.lock() {
                         s.log_messages.push(msg.to_string());
@@ -692,8 +696,7 @@ impl BackupTab {
                 }
             }
             Err(e) => {
-                self.partition_load_error =
-                    Some(format!("Could not read partition table: {e}"));
+                self.partition_load_error = Some(format!("Could not read partition table: {e}"));
                 log.error(format!("Partition scan failed: {e}"));
             }
         }
@@ -734,8 +737,7 @@ impl BackupTab {
                 }
             }
             Err(e) => {
-                self.partition_load_error =
-                    Some(format!("Cannot open source: {e}"));
+                self.partition_load_error = Some(format!("Cannot open source: {e}"));
             }
         }
     }
@@ -757,13 +759,11 @@ impl BackupTab {
         };
 
         // Try to get device size and first volume label
-        let device = self
-            .selected_device_idx
-            .and_then(|idx| devices.get(idx));
+        let device = self.selected_device_idx.and_then(|idx| devices.get(idx));
 
-        let size_bytes = device.map(|d| d.size_bytes).or_else(|| {
-            std::fs::metadata(&path).ok().map(|m| m.len())
-        });
+        let size_bytes = device
+            .map(|d| d.size_bytes)
+            .or_else(|| std::fs::metadata(&path).ok().map(|m| m.len()));
 
         let volume_label = device
             .and_then(|d| d.partitions.first())
@@ -797,7 +797,8 @@ impl BackupTab {
             backup_name: self.backup_name.clone(),
             compression: self.compression_type,
             checksum: self.checksum_type,
-            split_size_mib: if self.split_archives && self.compression_type != CompressionType::Vhd {
+            split_size_mib: if self.split_archives && self.compression_type != CompressionType::Vhd
+            {
                 Some(self.split_size_mib)
             } else {
                 None

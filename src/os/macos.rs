@@ -1,285 +1,412 @@
-use std::collections::HashMap;
+use std::ffi::{c_void, CString};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::ptr::{self, NonNull};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{bail, Context, Result};
-use plist::Value;
 
-use crate::device::{DiskDevice, MountedPartition};
+use libc::statfs;
+use objc2_core_foundation::{
+    kCFRunLoopDefaultMode, CFBoolean, CFDictionary, CFMutableDictionary, CFNumber, CFRunLoop,
+    CFString, CFURL,
+};
+use objc2_disk_arbitration::{
+    kDADiskDescriptionDeviceInternalKey, kDADiskDescriptionDeviceModelKey,
+    kDADiskDescriptionDeviceProtocolKey, kDADiskDescriptionMediaBSDNameKey,
+    kDADiskDescriptionMediaRemovableKey, kDADiskDescriptionMediaSizeKey,
+    kDADiskDescriptionMediaWritableKey, kDADiskDescriptionVolumeKindKey,
+    kDADiskDescriptionVolumePathKey, kDADiskUnmountOptionForce, kDADiskUnmountOptionWhole, DADisk,
+    DADiskUnmountCallback, DADissenter, DASession,
+};
+use objc2_io_kit::{
+    kIOMainPortDefault, IOIteratorNext, IOObjectRelease, IORegistryEntryCreateCFProperties,
+    IOServiceGetMatchingServices, IOServiceMatching,
+};
+
 use super::ElevatedSource;
+use crate::device::{DiskDevice, MountedPartition};
 
-/// Enumerate devices using `diskutil list -plist` and `diskutil info -plist`.
+// ---------------------------------------------------------------------------
+// Helper: extract typed values from an untyped CFDictionary
+// ---------------------------------------------------------------------------
+
+/// Extract a `CFString` value from an untyped `CFDictionary` using a known key.
+unsafe fn dict_get_string(dict: &CFDictionary, key: &CFString) -> Option<String> {
+    let raw = unsafe { dict.value((key as *const CFString).cast()) };
+    if raw.is_null() {
+        return None;
+    }
+    let cf_str = unsafe { &*(raw as *const CFString) };
+    Some(cf_str.to_string())
+}
+
+/// Extract a `CFBoolean` value from an untyped `CFDictionary`.
+unsafe fn dict_get_bool(dict: &CFDictionary, key: &CFString) -> Option<bool> {
+    let raw = unsafe { dict.value((key as *const CFString).cast()) };
+    if raw.is_null() {
+        return None;
+    }
+    let cf_bool = unsafe { &*(raw as *const CFBoolean) };
+    Some(cf_bool.as_bool())
+}
+
+/// Extract a `CFNumber` value as `i64` from an untyped `CFDictionary`.
+unsafe fn dict_get_number(dict: &CFDictionary, key: &CFString) -> Option<i64> {
+    let raw = unsafe { dict.value((key as *const CFString).cast()) };
+    if raw.is_null() {
+        return None;
+    }
+    let cf_num = unsafe { &*(raw as *const CFNumber) };
+    cf_num.as_i64()
+}
+
+/// Extract a `CFURL` value and convert to a `PathBuf`.
+unsafe fn dict_get_url_path(dict: &CFDictionary, key: &CFString) -> Option<PathBuf> {
+    let raw = unsafe { dict.value((key as *const CFString).cast()) };
+    if raw.is_null() {
+        return None;
+    }
+    let cf_url = unsafe { &*(raw as *const CFURL) };
+    cf_url.to_file_path()
+}
+
+// ---------------------------------------------------------------------------
+// IOKit enumeration of IOMedia entries
+// ---------------------------------------------------------------------------
+
+/// Information gathered from a single IOMedia entry via IOKit.
+struct IOMediaEntry {
+    bsd_name: String,
+    is_whole: bool,
+    size: u64,
+}
+
+/// Enumerate all IOMedia entries via IOKit and return their basic properties.
+fn iokit_enumerate_media() -> Vec<IOMediaEntry> {
+    let mut entries = Vec::new();
+
+    unsafe {
+        let matching = IOServiceMatching(c"IOMedia".as_ptr());
+        let matching = match matching {
+            Some(m) => m,
+            None => return entries,
+        };
+
+        let mut iterator: u32 = 0;
+        let kr = IOServiceGetMatchingServices(
+            kIOMainPortDefault,
+            // IOServiceGetMatchingServices consumes the matching dict (takes CFRetained).
+            // We need to convert CFRetained<CFMutableDictionary> to Option<CFRetained<CFDictionary>>.
+            Some(objc2_core_foundation::CFRetained::cast_unchecked(matching)),
+            &mut iterator,
+        );
+        if kr != 0 {
+            return entries;
+        }
+
+        loop {
+            let entry = IOIteratorNext(iterator);
+            if entry == 0 {
+                break;
+            }
+
+            // Get all properties for this IOMedia entry
+            let mut props_ptr: *mut CFMutableDictionary = ptr::null_mut();
+            let kr = IORegistryEntryCreateCFProperties(
+                entry,
+                &mut props_ptr,
+                None, // kCFAllocatorDefault
+                0,
+            );
+
+            if kr == 0 && !props_ptr.is_null() {
+                // Wrap in CFRetained for automatic release
+                let props = objc2_core_foundation::CFRetained::<CFMutableDictionary>::from_raw(
+                    NonNull::new_unchecked(props_ptr),
+                );
+
+                // Access as untyped CFDictionary
+                let dict: &CFDictionary = &props;
+
+                let bsd_name_key = CFString::from_static_str("BSD Name");
+                let whole_key = CFString::from_static_str("Whole");
+                let size_key = CFString::from_static_str("Size");
+
+                if let Some(bsd_name) = dict_get_string(dict, &bsd_name_key) {
+                    let is_whole = dict_get_bool(dict, &whole_key).unwrap_or(false);
+                    let size = dict_get_number(dict, &size_key).unwrap_or(0) as u64;
+
+                    entries.push(IOMediaEntry {
+                        bsd_name,
+                        is_whole,
+                        size,
+                    });
+                }
+            }
+
+            IOObjectRelease(entry);
+        }
+
+        IOObjectRelease(iterator);
+    }
+
+    entries
+}
+
+// ---------------------------------------------------------------------------
+// DiskArbitration helpers
+// ---------------------------------------------------------------------------
+
+/// Query DiskArbitration for a disk's description dictionary.
+fn da_disk_description(session: &DASession, bsd_name: &str) -> Option<DiskDescription> {
+    let c_name = CString::new(bsd_name).ok()?;
+    unsafe {
+        let disk = DADisk::from_bsd_name(None, session, NonNull::new(c_name.as_ptr() as *mut _)?)?;
+        let desc = disk.description()?;
+        let dict: &CFDictionary = &desc;
+
+        let media_name = dict_get_string(dict, kDADiskDescriptionDeviceModelKey)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let bus_protocol =
+            dict_get_string(dict, kDADiskDescriptionDeviceProtocolKey).unwrap_or_default();
+        let is_removable =
+            dict_get_bool(dict, kDADiskDescriptionMediaRemovableKey).unwrap_or(false);
+        let is_writable = dict_get_bool(dict, kDADiskDescriptionMediaWritableKey).unwrap_or(true);
+        let is_internal = dict_get_bool(dict, kDADiskDescriptionDeviceInternalKey).unwrap_or(false);
+        let size = dict_get_number(dict, kDADiskDescriptionMediaSizeKey).unwrap_or(0) as u64;
+        let bsd = dict_get_string(dict, kDADiskDescriptionMediaBSDNameKey)
+            .unwrap_or_else(|| bsd_name.to_string());
+        let volume_kind = dict_get_string(dict, kDADiskDescriptionVolumeKindKey);
+        let volume_path = dict_get_url_path(dict, kDADiskDescriptionVolumePathKey);
+
+        Some(DiskDescription {
+            bsd_name: bsd,
+            media_name,
+            bus_protocol,
+            is_removable,
+            is_writable,
+            is_internal,
+            size,
+            volume_kind,
+            volume_path,
+        })
+    }
+}
+
+struct DiskDescription {
+    bsd_name: String,
+    media_name: String,
+    bus_protocol: String,
+    is_removable: bool,
+    is_writable: bool,
+    is_internal: bool,
+    size: u64,
+    volume_kind: Option<String>,
+    volume_path: Option<PathBuf>,
+}
+
+// ---------------------------------------------------------------------------
+// statfs helper for available space
+// ---------------------------------------------------------------------------
+
+fn get_available_space(mount_point: &Path) -> u64 {
+    let c_path = match CString::new(mount_point.to_string_lossy().as_bytes()) {
+        Ok(p) => p,
+        Err(_) => return 0,
+    };
+    unsafe {
+        let mut stat: statfs = std::mem::zeroed();
+        if libc::statfs(c_path.as_ptr(), &mut stat) == 0 {
+            stat.f_bavail * stat.f_bsize as u64
+        } else {
+            0
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Enumerate devices using IOKit for disk discovery and DiskArbitration for properties.
 pub fn enumerate_devices() -> Vec<DiskDevice> {
-    let whole_disks = match get_whole_disks() {
-        Some(disks) => disks,
+    let session = unsafe { DASession::new(None) };
+    let session = match session {
+        Some(s) => s,
         None => return Vec::new(),
     };
 
-    let partitions_map = get_disk_partitions_map().unwrap_or_default();
+    let io_entries = iokit_enumerate_media();
+
+    // Collect whole-disk BSD names
+    let whole_disks: Vec<&IOMediaEntry> = io_entries.iter().filter(|e| e.is_whole).collect();
 
     let mut devices = Vec::new();
-    for disk_name in &whole_disks {
-        if let Some(device) = build_device(disk_name, &partitions_map) {
-            devices.push(device);
+    for whole in &whole_disks {
+        let desc = match da_disk_description(&session, &whole.bsd_name) {
+            Some(d) => d,
+            None => continue,
+        };
+
+        // Skip virtual / disk-image devices
+        if desc.bus_protocol == "Disk Image" {
+            continue;
         }
+
+        // Collect partitions (non-whole IOMedia entries whose BSD name starts with this disk's name)
+        let mut partitions = Vec::new();
+        for part_entry in &io_entries {
+            if part_entry.is_whole {
+                continue;
+            }
+            // e.g. "disk2s1" starts with "disk2" — match partition to parent
+            if !part_entry.bsd_name.starts_with(&whole.bsd_name) {
+                continue;
+            }
+            // Ensure it's a direct child: after the prefix there should be 's' + digits
+            let suffix = &part_entry.bsd_name[whole.bsd_name.len()..];
+            if !suffix.starts_with('s') {
+                continue;
+            }
+
+            if let Some(part_desc) = da_disk_description(&session, &part_entry.bsd_name) {
+                if let Some(ref mount_point) = part_desc.volume_path {
+                    let mp_str = mount_point.to_string_lossy();
+                    if !mp_str.is_empty() {
+                        let available = get_available_space(mount_point);
+                        partitions.push(MountedPartition {
+                            name: part_desc.bsd_name,
+                            mount_point: mount_point.clone(),
+                            filesystem: part_desc.volume_kind.unwrap_or_default(),
+                            total_space: part_entry.size,
+                            available_space: available,
+                        });
+                    }
+                }
+            }
+        }
+
+        let is_system = desc.is_internal && !desc.is_removable;
+
+        devices.push(DiskDevice {
+            name: whole.bsd_name.clone(),
+            path: PathBuf::from(format!("/dev/{}", whole.bsd_name)),
+            size_bytes: desc.size.max(whole.size), // prefer DA size, fallback to IOKit
+            is_removable: desc.is_removable,
+            is_read_only: !desc.is_writable,
+            is_system,
+            bus_protocol: desc.bus_protocol,
+            media_name: desc.media_name,
+            partitions,
+        });
     }
 
     devices.sort_by(|a, b| a.name.cmp(&b.name));
     devices
 }
 
-/// Run `diskutil list -plist` and extract the WholeDisks array.
-fn get_whole_disks() -> Option<Vec<String>> {
-    let output = Command::new("diskutil")
-        .args(["list", "-plist"])
-        .output()
-        .ok()?;
+// ---------------------------------------------------------------------------
+// DiskArbitration unmount
+// ---------------------------------------------------------------------------
 
-    if !output.status.success() {
-        return None;
+/// Synchronously unmount all volumes on a disk via DiskArbitration.
+///
+/// Returns `Ok(())` on success, or an error if the unmount fails or times out.
+fn da_unmount_disk(bsd_name: &str) -> Result<()> {
+    let session =
+        unsafe { DASession::new(None) }.context("failed to create DiskArbitration session")?;
+
+    let c_name = CString::new(bsd_name).context("invalid BSD name")?;
+    let disk = unsafe {
+        DADisk::from_bsd_name(
+            None,
+            &session,
+            NonNull::new(c_name.as_ptr() as *mut _).unwrap(),
+        )
     }
+    .context(format!("failed to create DADisk for {}", bsd_name))?;
 
-    let plist = Value::from_reader(std::io::Cursor::new(&output.stdout)).ok()?;
-    let dict = plist.as_dictionary()?;
+    // Schedule the session on the current run loop so the callback fires
+    let run_loop = CFRunLoop::current().context("failed to get current CFRunLoop")?;
+    let mode = unsafe { kCFRunLoopDefaultMode.unwrap() };
+    unsafe { session.schedule_with_run_loop(&run_loop, mode) };
 
-    let whole_disks = dict.get("WholeDisks")?.as_array()?;
-    Some(
-        whole_disks
-            .iter()
-            .filter_map(|v| v.as_string().map(String::from))
-            .collect(),
-    )
-}
+    // Shared state for the callback
+    static UNMOUNT_DONE: AtomicBool = AtomicBool::new(false);
+    static UNMOUNT_OK: AtomicBool = AtomicBool::new(false);
+    UNMOUNT_DONE.store(false, Ordering::SeqCst);
+    UNMOUNT_OK.store(false, Ordering::SeqCst);
 
-/// Parse `diskutil list -plist` to build a map of whole disk -> partition/volume info.
-fn get_disk_partitions_map() -> Option<HashMap<String, Vec<DiskPartInfo>>> {
-    let output = Command::new("diskutil")
-        .args(["list", "-plist"])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let plist = Value::from_reader(std::io::Cursor::new(&output.stdout)).ok()?;
-    let dict = plist.as_dictionary()?;
-    let all_disks = dict.get("AllDisksAndPartitions")?.as_array()?;
-
-    let mut map: HashMap<String, Vec<DiskPartInfo>> = HashMap::new();
-
-    for disk_entry in all_disks {
-        let disk_dict = disk_entry.as_dictionary()?;
-        let dev_id = disk_dict
-            .get("DeviceIdentifier")?
-            .as_string()?
-            .to_string();
-
-        let mut parts = Vec::new();
-
-        // Collect from Partitions array (GPT/MBR disks)
-        if let Some(partitions) = disk_dict.get("Partitions").and_then(|v| v.as_array()) {
-            for p in partitions {
-                if let Some(info) = extract_part_info(p) {
-                    parts.push(info);
-                }
-            }
-        }
-
-        // Collect from APFSVolumes array (APFS containers)
-        if let Some(volumes) = disk_dict.get("APFSVolumes").and_then(|v| v.as_array()) {
-            for v in volumes {
-                if let Some(info) = extract_part_info(v) {
-                    parts.push(info);
-                }
-            }
-        }
-
-        // The disk itself may have a mount point (e.g., a plain ISO)
-        if let Some(mount_point) = disk_dict.get("MountPoint").and_then(|v| v.as_string()) {
-            if !mount_point.is_empty() {
-                parts.push(DiskPartInfo {
-                    device_identifier: dev_id.clone(),
-                    mount_point: Some(mount_point.to_string()),
-                    volume_name: disk_dict
-                        .get("VolumeName")
-                        .and_then(|v| v.as_string())
-                        .unwrap_or("")
-                        .to_string(),
-                    size: disk_dict
-                        .get("Size")
-                        .and_then(|v| v.as_unsigned_integer())
-                        .unwrap_or(0),
-                    content: disk_dict
-                        .get("Content")
-                        .and_then(|v| v.as_string())
-                        .unwrap_or("")
-                        .to_string(),
-                });
-            }
-        }
-
-        map.insert(dev_id, parts);
-    }
-
-    Some(map)
-}
-
-struct DiskPartInfo {
-    device_identifier: String,
-    mount_point: Option<String>,
-    #[allow(dead_code)]
-    volume_name: String,
-    size: u64,
-    content: String,
-}
-
-fn extract_part_info(value: &Value) -> Option<DiskPartInfo> {
-    let dict = value.as_dictionary()?;
-    Some(DiskPartInfo {
-        device_identifier: dict
-            .get("DeviceIdentifier")?
-            .as_string()?
-            .to_string(),
-        mount_point: dict
-            .get("MountPoint")
-            .and_then(|v| v.as_string())
-            .map(String::from),
-        volume_name: dict
-            .get("VolumeName")
-            .and_then(|v| v.as_string())
-            .unwrap_or("")
-            .to_string(),
-        size: dict
-            .get("Size")
-            .and_then(|v| v.as_unsigned_integer())
-            .unwrap_or(0),
-        content: dict
-            .get("Content")
-            .and_then(|v| v.as_string())
-            .unwrap_or("")
-            .to_string(),
-    })
-}
-
-/// Build a DiskDevice by querying `diskutil info -plist <disk>` for the whole disk,
-/// and using the partitions map for volume info.
-fn build_device(
-    disk_name: &str,
-    partitions_map: &HashMap<String, Vec<DiskPartInfo>>,
-) -> Option<DiskDevice> {
-    let output = Command::new("diskutil")
-        .args(["info", "-plist", disk_name])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let plist = Value::from_reader(std::io::Cursor::new(&output.stdout)).ok()?;
-    let dict = plist.as_dictionary()?;
-
-    let device_node = dict.get("DeviceNode")?.as_string()?.to_string();
-    let size = dict
-        .get("Size")
-        .and_then(|v| v.as_unsigned_integer())
-        .unwrap_or(0);
-    let removable = dict
-        .get("RemovableMediaOrExternalDevice")
-        .and_then(|v| v.as_boolean())
-        .unwrap_or(false);
-    let internal = dict
-        .get("Internal")
-        .and_then(|v| v.as_boolean())
-        .unwrap_or(false);
-    let writable = dict
-        .get("WritableMedia")
-        .and_then(|v| v.as_boolean())
-        .unwrap_or(true);
-    let bus_protocol = dict
-        .get("BusProtocol")
-        .and_then(|v| v.as_string())
-        .unwrap_or("")
-        .to_string();
-    let media_name = dict
-        .get("MediaName")
-        .and_then(|v| v.as_string())
-        .unwrap_or("")
-        .to_string();
-    let virtual_or_physical = dict
-        .get("VirtualOrPhysical")
-        .and_then(|v| v.as_string())
-        .unwrap_or("Physical")
-        .to_string();
-
-    // Skip virtual/disk image devices
-    if virtual_or_physical == "Virtual" || bus_protocol == "Disk Image" {
-        return None;
-    }
-
-    // Collect mounted partitions from the partitions map
-    let mut mounted = Vec::new();
-    if let Some(parts) = partitions_map.get(disk_name) {
-        for part in parts {
-            if let Some(mp) = &part.mount_point {
-                if !mp.is_empty() {
-                    mounted.push(MountedPartition {
-                        name: part.device_identifier.clone(),
-                        mount_point: PathBuf::from(mp),
-                        filesystem: part.content.clone(),
-                        total_space: part.size,
-                        available_space: 0,
-                    });
-                }
-            }
+    unsafe extern "C-unwind" fn unmount_callback(
+        _disk: NonNull<DADisk>,
+        dissenter: *const DADissenter,
+        _context: *mut c_void,
+    ) {
+        // NULL dissenter means success
+        UNMOUNT_OK.store(dissenter.is_null(), Ordering::SeqCst);
+        UNMOUNT_DONE.store(true, Ordering::SeqCst);
+        if let Some(rl) = CFRunLoop::current() {
+            rl.stop();
         }
     }
 
-    let is_system = internal && !removable;
+    let options = kDADiskUnmountOptionForce | kDADiskUnmountOptionWhole;
+    let callback: DADiskUnmountCallback = Some(unmount_callback);
 
-    Some(DiskDevice {
-        name: disk_name.to_string(),
-        path: PathBuf::from(&device_node),
-        size_bytes: size,
-        is_removable: removable,
-        is_read_only: !writable,
-        is_system,
-        bus_protocol,
-        media_name,
-        partitions: mounted,
-    })
+    unsafe {
+        disk.unmount(options, callback, ptr::null_mut());
+    }
+
+    // Run the run loop with a timeout to wait for the callback
+    let timeout_secs = 10.0;
+    CFRunLoop::run_in_mode(Some(mode), timeout_secs, false);
+
+    unsafe { session.unschedule_from_run_loop(&run_loop, mode) };
+
+    if !UNMOUNT_DONE.load(Ordering::SeqCst) {
+        bail!(
+            "unmount of {} timed out after {:.0}s",
+            bsd_name,
+            timeout_secs
+        );
+    }
+    if !UNMOUNT_OK.load(Ordering::SeqCst) {
+        bail!("DiskArbitration failed to unmount {}", bsd_name);
+    }
+
+    Ok(())
+}
+
+/// Extract the BSD disk name from a device path like `/dev/diskN` or `/dev/rdiskN`.
+fn bsd_name_from_path(path: &Path) -> &str {
+    let path_str = path.to_str().unwrap_or("");
+    if let Some(stripped) = path_str.strip_prefix("/dev/r") {
+        stripped
+    } else if let Some(stripped) = path_str.strip_prefix("/dev/") {
+        stripped
+    } else {
+        path_str
+    }
 }
 
 /// Open a target device for writing, unmounting it first.
 ///
-/// If normal open fails with permission denied, uses `osascript` to run
-/// with admin privileges via the native macOS authentication dialog.
+/// Uses DiskArbitration to unmount all volumes on the disk. If normal open
+/// fails with permission denied, falls back to `osascript` to run
+/// `diskutil unmountDisk force` with admin privileges via the native macOS
+/// authentication dialog (DA doesn't provide admin prompting).
 pub fn open_target_for_writing(path: &Path) -> Result<File> {
     let path_str = path.to_string_lossy();
+    let disk_name = bsd_name_from_path(path);
 
-    // Unmount all partitions on the disk first
-    // Convert /dev/rdiskN to diskN for diskutil
-    let disk_name = if path_str.starts_with("/dev/r") {
-        &path_str[6..]
-    } else if path_str.starts_with("/dev/") {
-        &path_str[5..]
-    } else {
-        &path_str
-    };
-
-    // Unmount the entire disk (force to handle busy volumes)
-    let unmount_result = Command::new("diskutil")
-        .args(["unmountDisk", "force", disk_name])
-        .output();
-
-    if let Ok(output) = unmount_result {
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Not fatal — the disk might not be mounted
-            eprintln!("diskutil unmountDisk warning: {}", stderr.trim());
-        }
+    // Unmount all partitions on the disk first via DiskArbitration
+    if let Err(e) = da_unmount_disk(disk_name) {
+        // Not fatal — the disk might not be mounted
+        eprintln!("DA unmount warning: {}", e);
     }
 
     // Use the raw device (/dev/rdiskN) for faster unbuffered writes
@@ -300,15 +427,15 @@ pub fn open_target_for_writing(path: &Path) -> Result<File> {
             // Fall through to elevation attempt
         }
         Err(e) => {
-            return Err(anyhow::anyhow!(e)
-                .context(format!("cannot open {} for writing", raw_device)));
+            return Err(
+                anyhow::anyhow!(e).context(format!("cannot open {} for writing", raw_device))
+            );
         }
     }
 
-    // Use osascript to open with elevated privileges.
-    // We open via a helper dd that writes nothing but holds the fd,
-    // but actually the simplest approach is just to re-try the unmount
-    // with admin privileges and then open.
+    // Use osascript to unmount with elevated privileges.
+    // This is the only remaining diskutil usage — specifically for privilege
+    // elevation via the native macOS admin auth dialog, which DA doesn't provide.
     let script = format!(
         "do shell script \"diskutil unmountDisk force {disk_name}\" with administrator privileges"
     );
@@ -331,9 +458,12 @@ pub fn open_target_for_writing(path: &Path) -> Result<File> {
         .read(true)
         .write(true)
         .open(&raw_device)
-        .with_context(|| format!(
-            "cannot open {} for writing (even after elevated unmount)", raw_device
-        ))
+        .with_context(|| {
+            format!(
+                "cannot open {} for writing (even after elevated unmount)",
+                raw_device
+            )
+        })
 }
 
 /// Open a source device or image file for reading, requesting elevated
@@ -358,8 +488,7 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
             // Fall through to elevation attempt
         }
         Err(e) => {
-            return Err(anyhow::anyhow!(e)
-                .context(format!("cannot open {}", path.display())));
+            return Err(anyhow::anyhow!(e).context(format!("cannot open {}", path.display())));
         }
     }
 
@@ -384,10 +513,7 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let device_stem = path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy();
+    let device_stem = path.file_name().unwrap_or_default().to_string_lossy();
     let temp_path = PathBuf::from(format!("/tmp/rusty-backup-{device_stem}-{timestamp}.raw"));
     let temp_str = temp_path.to_string_lossy();
 
@@ -420,8 +546,12 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
         );
     }
 
-    let file = File::open(&temp_path)
-        .with_context(|| format!("failed to open temporary device image: {}", temp_path.display()))?;
+    let file = File::open(&temp_path).with_context(|| {
+        format!(
+            "failed to open temporary device image: {}",
+            temp_path.display()
+        )
+    })?;
 
     Ok(ElevatedSource {
         file,

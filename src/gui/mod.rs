@@ -9,8 +9,8 @@ use inspect_tab::InspectTab;
 use progress::{LogPanel, ProgressState};
 use restore_tab::RestoreTab;
 
-use rusty_backup::rbformats::chd::detect_chdman;
 use rusty_backup::device::{self, DiskDevice};
+use rusty_backup::rbformats::chd::detect_chdman;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Tab {
@@ -103,24 +103,18 @@ impl eframe::App for RustyBackupApp {
             });
 
         // Central panel: active tab content
-        egui::CentralPanel::default().show(ctx, |ui| {
-            match self.active_tab {
-                Tab::Backup => {
-                    self.backup_tab.show(
-                        ui,
-                        &self.devices,
-                        &mut self.log_panel,
-                        &mut self.progress,
-                    );
-                }
-                Tab::Restore => {
-                    self.restore_tab
-                        .show(ui, &self.devices, &mut self.log_panel, &mut self.progress);
-                }
-                Tab::Inspect => {
-                    self.inspect_tab
-                        .show(ui, &self.devices, &mut self.log_panel);
-                }
+        egui::CentralPanel::default().show(ctx, |ui| match self.active_tab {
+            Tab::Backup => {
+                self.backup_tab
+                    .show(ui, &self.devices, &mut self.log_panel, &mut self.progress);
+            }
+            Tab::Restore => {
+                self.restore_tab
+                    .show(ui, &self.devices, &mut self.log_panel, &mut self.progress);
+            }
+            Tab::Inspect => {
+                self.inspect_tab
+                    .show(ui, &self.devices, &mut self.log_panel);
             }
         });
     }

@@ -9,7 +9,6 @@ resolver = "2"
 [dependencies]
 eframe = "0.33"
 egui = "0.33"
-plist = "1"
 rfd = "0.15"
 anyhow = "1"
 thiserror = "1"
@@ -22,9 +21,16 @@ sha2 = "0.10"
 crc32fast = "1"
 chrono = "0.4"
 
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.31", features = ["mount"] }
-libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-io-kit = { version = "0.3", default-features = false, features = ["libc"] }
+objc2-disk-arbitration = { version = "0.3", default-features = false, features = ["DASession", "DADisk", "DADissenter", "libc"] }
+objc2-core-foundation = { version = "0.3", features = ["CFString", "CFDictionary", "CFNumber", "CFRunLoop", "CFURL"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62", features = [

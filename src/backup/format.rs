@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use chrono::Local;
 
-use crate::partition::mbr::Mbr;
 use crate::partition::gpt::Gpt;
+use crate::partition::mbr::Mbr;
 
 /// Create the backup output folder. Returns the path to the created directory.
 pub fn create_backup_folder(dest: &Path, name: &str) -> Result<PathBuf> {
@@ -29,9 +29,7 @@ pub fn generate_backup_name(
 
     let size_part = size_bytes.map(format_size_short);
 
-    let label_part = volume_label
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty());
+    let label_part = volume_label.map(|l| l.trim()).filter(|l| !l.is_empty());
 
     match (size_part, label_part) {
         (Some(sz), Some(label)) => format!("{sz}-{label}-{timestamp}"),
@@ -71,8 +69,7 @@ pub fn export_mbr(mbr: &Mbr, raw_bytes: &[u8; 512], folder: &Path) -> Result<()>
 
     // Write structured JSON
     let json_path = folder.join("mbr.json");
-    let json = serde_json::to_string_pretty(mbr)
-        .context("failed to serialize MBR to JSON")?;
+    let json = serde_json::to_string_pretty(mbr).context("failed to serialize MBR to JSON")?;
     fs::write(&json_path, json)
         .with_context(|| format!("failed to write {}", json_path.display()))?;
 
@@ -104,11 +101,7 @@ pub fn export_mbr_min(
 }
 
 /// Export a GPT to `gpt.json` and its protective MBR to `mbr.bin`.
-pub fn export_gpt(
-    gpt: &Gpt,
-    protective_mbr_bytes: &[u8; 512],
-    folder: &Path,
-) -> Result<()> {
+pub fn export_gpt(gpt: &Gpt, protective_mbr_bytes: &[u8; 512], folder: &Path) -> Result<()> {
     // Write protective MBR binary
     let bin_path = folder.join("mbr.bin");
     fs::write(&bin_path, protective_mbr_bytes)
@@ -116,8 +109,7 @@ pub fn export_gpt(
 
     // Write GPT JSON
     let json_path = folder.join("gpt.json");
-    let json = serde_json::to_string_pretty(gpt)
-        .context("failed to serialize GPT to JSON")?;
+    let json = serde_json::to_string_pretty(gpt).context("failed to serialize GPT to JSON")?;
     fs::write(&json_path, json)
         .with_context(|| format!("failed to write {}", json_path.display()))?;
 

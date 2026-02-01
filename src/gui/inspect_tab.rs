@@ -4,15 +4,19 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use rusty_backup::backup::metadata::BackupMetadata;
+use rusty_backup::device::DiskDevice;
 use rusty_backup::fs;
 use rusty_backup::fs::fat::resize_fat_in_place;
 use rusty_backup::partition::PartitionSizeOverride;
-use rusty_backup::rbformats::vhd::{build_vhd_footer, export_whole_disk_vhd, export_partition_vhd, VHD_COOKIE};
-use rusty_backup::device::DiskDevice;
-use rusty_backup::partition::{self, detect_alignment, PartitionAlignment, PartitionInfo, PartitionTable};
+use rusty_backup::partition::{
+    self, detect_alignment, PartitionAlignment, PartitionInfo, PartitionTable,
+};
+use rusty_backup::rbformats::vhd::{
+    build_vhd_footer, export_partition_vhd, export_whole_disk_vhd, VHD_COOKIE,
+};
 
 use super::browse_view::BrowseView;
-use super::progress::{LogPanel, LogLevel};
+use super::progress::{LogLevel, LogPanel};
 
 /// State for the Inspect tab.
 pub struct InspectTab {
@@ -114,12 +118,7 @@ impl Default for InspectTab {
 }
 
 impl InspectTab {
-    pub fn show(
-        &mut self,
-        ui: &mut egui::Ui,
-        devices: &[DiskDevice],
-        log: &mut LogPanel,
-    ) {
+    pub fn show(&mut self, ui: &mut egui::Ui, devices: &[DiskDevice], log: &mut LogPanel) {
         ui.heading("Inspect Disk / Image");
         ui.add_space(8.0);
 
@@ -171,7 +170,10 @@ impl InspectTab {
                         }
                     }
                     if ui
-                        .selectable_label(self.backup_folder_path.is_some(), "Open Backup Folder...")
+                        .selectable_label(
+                            self.backup_folder_path.is_some(),
+                            "Open Backup Folder...",
+                        )
                         .clicked()
                     {
                         self.pick_backup_folder();
@@ -253,11 +255,7 @@ impl InspectTab {
                         partition::format_size(s.total_bytes),
                         fraction * 100.0,
                     );
-                    ui.add(
-                        egui::ProgressBar::new(fraction)
-                            .text(text)
-                            .animate(true),
-                    );
+                    ui.add(egui::ProgressBar::new(fraction).text(text).animate(true));
                 } else if !s.finished {
                     ui.horizontal(|ui| {
                         ui.spinner();
@@ -276,7 +274,10 @@ impl InspectTab {
 
         // Show error if any
         if let Some(err) = &self.last_error {
-            ui.colored_label(egui::Color32::from_rgb(255, 100, 100), format!("Error: {err}"));
+            ui.colored_label(
+                egui::Color32::from_rgb(255, 100, 100),
+                format!("Error: {err}"),
+            );
             ui.add_space(8.0);
         }
 
@@ -331,7 +332,12 @@ impl InspectTab {
         }
     }
 
-    fn show_export_vhd_popup(&mut self, ui: &mut egui::Ui, devices: &[DiskDevice], log: &mut LogPanel) {
+    fn show_export_vhd_popup(
+        &mut self,
+        ui: &mut egui::Ui,
+        devices: &[DiskDevice],
+        log: &mut LogPanel,
+    ) {
         egui::Window::new("Export VHD")
             .collapsible(false)
             .resizable(true)
@@ -340,8 +346,16 @@ impl InspectTab {
                 ui.label("Export partitions as Fixed VHD files.");
                 ui.add_space(4.0);
 
-                ui.radio_value(&mut self.export_whole_disk, true, "Whole Disk (single .vhd file)");
-                ui.radio_value(&mut self.export_whole_disk, false, "Per Partition (one .vhd per partition)");
+                ui.radio_value(
+                    &mut self.export_whole_disk,
+                    true,
+                    "Whole Disk (single .vhd file)",
+                );
+                ui.radio_value(
+                    &mut self.export_whole_disk,
+                    false,
+                    "Per Partition (one .vhd per partition)",
+                );
 
                 ui.add_space(8.0);
 
@@ -393,8 +407,7 @@ impl InspectTab {
                                 }
 
                                 if cfg.choice == ExportSizeChoice::Custom {
-                                    let min_mib =
-                                        (cfg.minimum_size / (1024 * 1024)).max(1) as u32;
+                                    let min_mib = (cfg.minimum_size / (1024 * 1024)).max(1) as u32;
                                     // Allow growing beyond original (up to 2 TiB VHD max)
                                     let max_mib = 2_097_152u32;
                                     ui.add(
@@ -402,10 +415,7 @@ impl InspectTab {
                                             .range(min_mib..=max_mib),
                                     );
                                 } else {
-                                    ui.label(format!(
-                                        "{}",
-                                        cfg.effective_size() / (1024 * 1024)
-                                    ));
+                                    ui.label(format!("{}", cfg.effective_size() / (1024 * 1024)));
                                 }
                                 ui.end_row();
                             }
@@ -479,7 +489,9 @@ impl InspectTab {
                 None => return,
             };
 
-            let source_path = self.backup_folder_path.clone()
+            let source_path = self
+                .backup_folder_path
+                .clone()
                 .or_else(|| self.image_file_path.clone())
                 .or_else(|| {
                     self.selected_device_idx
@@ -515,12 +527,7 @@ impl InspectTab {
                             s.current_bytes = bytes;
                         }
                     },
-                    move || {
-                        status3
-                            .lock()
-                            .map(|s| s.cancel_requested)
-                            .unwrap_or(false)
-                    },
+                    move || status3.lock().map(|s| s.cancel_requested).unwrap_or(false),
                     |msg| {
                         if let Ok(mut s) = status.lock() {
                             s.log_messages.push(msg.to_string());
@@ -553,7 +560,10 @@ impl InspectTab {
             let status = new_status();
             self.export_status = Some(Arc::clone(&status));
 
-            log.info(format!("Exporting per-partition VHDs to {}...", dest_folder.display()));
+            log.info(format!(
+                "Exporting per-partition VHDs to {}...",
+                dest_folder.display()
+            ));
 
             std::thread::spawn(move || {
                 let result = (|| -> anyhow::Result<()> {
@@ -569,7 +579,9 @@ impl InspectTab {
                                 continue;
                             }
 
-                            let export_size = size_map.get(&pm.index).copied()
+                            let export_size = size_map
+                                .get(&pm.index)
+                                .copied()
                                 .unwrap_or(pm.original_size_bytes);
                             let data_file = &pm.compressed_files[0];
                             let data_path = folder.join(data_file);
@@ -614,7 +626,8 @@ impl InspectTab {
                             if export_size != pm.original_size_bytes {
                                 let new_sectors = (export_size / 512) as u32;
                                 let mut rw = std::fs::OpenOptions::new()
-                                    .read(true).write(true)
+                                    .read(true)
+                                    .write(true)
                                     .open(&dest_path)?;
                                 resize_fat_in_place(&mut rw, 0, new_sectors, &mut |msg| {
                                     if let Ok(mut s) = status.lock() {
@@ -635,9 +648,12 @@ impl InspectTab {
                                 continue;
                             }
 
-                            let export_size = size_map.get(&part.index).copied()
+                            let export_size = size_map
+                                .get(&part.index)
+                                .copied()
                                 .unwrap_or(part.size_bytes);
-                            let dest_path = dest_folder.join(format!("partition-{}.vhd", part.index));
+                            let dest_path =
+                                dest_folder.join(format!("partition-{}.vhd", part.index));
                             let offset = part.start_lba * 512;
 
                             if let Ok(mut s) = status.lock() {
@@ -658,9 +674,8 @@ impl InspectTab {
                             reader.seek(std::io::SeekFrom::Start(offset))?;
                             let mut limited = reader.take(read_limit);
 
-                            let mut writer = std::io::BufWriter::new(
-                                std::fs::File::create(&dest_path)?,
-                            );
+                            let mut writer =
+                                std::io::BufWriter::new(std::fs::File::create(&dest_path)?);
                             let mut buf = vec![0u8; 256 * 1024];
                             let mut total: u64 = 0;
                             let base_written = overall_written;
@@ -697,7 +712,10 @@ impl InspectTab {
                             if export_size != part.size_bytes {
                                 let new_sectors = (export_size / 512) as u32;
                                 resize_fat_in_place(
-                                    writer.get_mut(), 0, new_sectors, &mut |msg| {
+                                    writer.get_mut(),
+                                    0,
+                                    new_sectors,
+                                    &mut |msg| {
                                         if let Ok(mut s) = status.lock() {
                                             s.log_messages.push(msg.to_string());
                                         }
@@ -787,14 +805,14 @@ impl InspectTab {
 
         let metadata_path = folder.join("metadata.json");
         if !metadata_path.exists() {
-            self.last_error = Some(format!(
-                "No metadata.json found in {}",
-                folder.display()
-            ));
+            self.last_error = Some(format!("No metadata.json found in {}", folder.display()));
             return;
         }
 
-        log.info(format!("Loading backup metadata from {}...", metadata_path.display()));
+        log.info(format!(
+            "Loading backup metadata from {}...",
+            metadata_path.display()
+        ));
 
         match std::fs::read_to_string(&metadata_path) {
             Ok(json_str) => match serde_json::from_str::<BackupMetadata>(&json_str) {
@@ -957,14 +975,9 @@ impl InspectTab {
                     if let Ok(mut f) = File::open(&path) {
                         if f.seek(SeekFrom::End(-512)).is_ok() {
                             let mut cookie = [0u8; 8];
-                            if f.read_exact(&mut cookie).is_ok()
-                                && &cookie == VHD_COOKIE
-                            {
+                            if f.read_exact(&mut cookie).is_ok() && &cookie == VHD_COOKIE {
                                 let ds = file_size - 512;
-                                log.info(format!(
-                                    "Detected Fixed VHD (data: {} bytes)",
-                                    ds,
-                                ));
+                                log.info(format!("Detected Fixed VHD (data: {} bytes)", ds,));
                                 Some(ds)
                             } else {
                                 None
@@ -1065,11 +1078,7 @@ impl InspectTab {
         });
         // Minimum restore size: sum of all partitions' imaged sizes, plus
         // the offset of the first partition (to account for the MBR/GPT area).
-        let min_data_bytes: u64 = meta
-            .partitions
-            .iter()
-            .map(|pm| pm.imaged_size_bytes)
-            .sum();
+        let min_data_bytes: u64 = meta.partitions.iter().map(|pm| pm.imaged_size_bytes).sum();
         let pre_partition_bytes = meta.alignment.first_partition_lba * 512;
         let min_restore_bytes = min_data_bytes + pre_partition_bytes;
 
@@ -1128,7 +1137,12 @@ impl InspectTab {
         self.show_partition_list(ui, devices, log);
     }
 
-    fn show_partition_list(&mut self, ui: &mut egui::Ui, devices: &[DiskDevice], log: &mut LogPanel) {
+    fn show_partition_list(
+        &mut self,
+        ui: &mut egui::Ui,
+        devices: &[DiskDevice],
+        log: &mut LogPanel,
+    ) {
         if self.partitions.is_empty() {
             ui.label("No partitions found.");
             return;
@@ -1164,8 +1178,14 @@ impl InspectTab {
                     if part.is_extended_container {
                         ui.label(egui::RichText::new(index_label).color(egui::Color32::GRAY));
                         ui.label(egui::RichText::new(&part.type_name).color(egui::Color32::GRAY));
-                        ui.label(egui::RichText::new(format!("{}", part.start_lba)).color(egui::Color32::GRAY));
-                        ui.label(egui::RichText::new(partition::format_size(part.size_bytes)).color(egui::Color32::GRAY));
+                        ui.label(
+                            egui::RichText::new(format!("{}", part.start_lba))
+                                .color(egui::Color32::GRAY),
+                        );
+                        ui.label(
+                            egui::RichText::new(partition::format_size(part.size_bytes))
+                                .color(egui::Color32::GRAY),
+                        );
                         if self.backup_metadata.is_some() || !self.partition_min_sizes.is_empty() {
                             if let Some(meta) = &self.backup_metadata {
                                 // Sum imaged_size_bytes of all logical partitions
@@ -1228,11 +1248,7 @@ impl InspectTab {
                                 } else {
                                     infer_fat_type_byte(&part.type_name)
                                 };
-                                browse_request = Some((
-                                    part.index,
-                                    part.start_lba * 512,
-                                    ptype,
-                                ));
+                                browse_request = Some((part.index, part.start_lba * 512, ptype));
                             }
                         } else {
                             ui.label("");
@@ -1270,7 +1286,9 @@ impl InspectTab {
         if let Some(path) = source_path {
             log.info(format!(
                 "Browsing partition {} from {} at offset {}",
-                part_index, path.display(), offset,
+                part_index,
+                path.display(),
+                offset,
             ));
             self.browse_view.open(path, offset, ptype);
             return;
@@ -1347,15 +1365,13 @@ impl InspectTab {
             }
         }
     }
-
 }
 
 /// Check if a partition type byte corresponds to a FAT filesystem.
 fn is_fat_type(ptype: u8) -> bool {
     matches!(
         ptype,
-        0x01 | 0x04 | 0x06 | 0x0B | 0x0C | 0x0E
-            | 0x11 | 0x14 | 0x16 | 0x1B | 0x1C | 0x1E
+        0x01 | 0x04 | 0x06 | 0x0B | 0x0C | 0x0E | 0x11 | 0x14 | 0x16 | 0x1B | 0x1C | 0x1E
     )
 }
 

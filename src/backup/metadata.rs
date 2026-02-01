@@ -85,20 +85,18 @@ mod tests {
                 heads: 255,
                 sectors_per_track: 63,
             },
-            partitions: vec![
-                PartitionMetadata {
-                    index: 0,
-                    type_name: "FAT32 (LBA)".to_string(),
-                    partition_type_byte: 0x0C,
-                    start_lba: 63,
-                    original_size_bytes: 2_000_000_000,
-                    imaged_size_bytes: 500_000_000,
-                    compressed_files: vec!["partition-0.zst".to_string()],
-                    checksum: "abcdef1234567890".to_string(),
-                    resized: false,
-                    compacted: false,
-                },
-            ],
+            partitions: vec![PartitionMetadata {
+                index: 0,
+                type_name: "FAT32 (LBA)".to_string(),
+                partition_type_byte: 0x0C,
+                start_lba: 63,
+                original_size_bytes: 2_000_000_000,
+                imaged_size_bytes: 500_000_000,
+                compressed_files: vec!["partition-0.zst".to_string()],
+                checksum: "abcdef1234567890".to_string(),
+                resized: false,
+                compacted: false,
+            }],
             bad_sectors: vec![],
         };
 

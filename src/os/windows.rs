@@ -150,12 +150,8 @@ fn query_device_properties(handle: HANDLE) -> (bool, String, String) {
     //  16: ProductIdOffset (u32)
     //  28: BusType (u32)
     let removable = buf[10] != 0;
-    let product_offset = u32::from_ne_bytes(
-        buf[16..20].try_into().unwrap_or([0; 4]),
-    );
-    let bus_type = u32::from_ne_bytes(
-        buf[28..32].try_into().unwrap_or([0; 4]),
-    );
+    let product_offset = u32::from_ne_bytes(buf[16..20].try_into().unwrap_or([0; 4]));
+    let bus_type = u32::from_ne_bytes(buf[28..32].try_into().unwrap_or([0; 4]));
 
     let product_name = string_from_buffer_offset(&buf, product_offset);
     let bus_string = bus_type_to_string(bus_type);
@@ -165,19 +161,7 @@ fn query_device_properties(handle: HANDLE) -> (bool, String, String) {
 
 /// Check if a disk is writable via IOCTL_DISK_IS_WRITABLE.
 fn is_disk_writable(handle: HANDLE) -> bool {
-    unsafe {
-        DeviceIoControl(
-            handle,
-            IOCTL_DISK_IS_WRITABLE,
-            None,
-            0,
-            None,
-            0,
-            None,
-            None,
-        )
-        .is_ok()
-    }
+    unsafe { DeviceIoControl(handle, IOCTL_DISK_IS_WRITABLE, None, 0, None, 0, None, None).is_ok() }
 }
 
 /// Information about a mounted volume (drive letter).
@@ -236,9 +220,7 @@ fn enumerate_volumes() -> Vec<VolumeInfo> {
                 // VOLUME_DISK_EXTENTS layout:
                 //   offset 0: NumberOfDiskExtents (u32)
                 //   offset 8: first DISK_EXTENT.DiskNumber (u32, after alignment padding)
-                let num = u32::from_ne_bytes(
-                    ext_buf[0..4].try_into().unwrap_or([0; 4]),
-                );
+                let num = u32::from_ne_bytes(ext_buf[0..4].try_into().unwrap_or([0; 4]));
                 if num == 0 {
                     continue;
                 }
@@ -365,8 +347,7 @@ pub fn enumerate_devices() -> Vec<DiskDevice> {
 /// dismounts each one, then opens the physical drive with read+write access.
 pub fn open_target_for_writing(path: &Path) -> Result<File> {
     let path_str = path.to_string_lossy();
-    let drive_num =
-        drive_number_from_path(&path_str).context("invalid physical drive path")?;
+    let drive_num = drive_number_from_path(&path_str).context("invalid physical drive path")?;
 
     // Lock and dismount all volumes on this drive
     let volumes = enumerate_volumes();
@@ -375,19 +356,28 @@ pub fn open_target_for_writing(path: &Path) -> Result<File> {
             continue;
         }
         let vol_path = format!(r"\\.\{}:", vol.drive_letter);
-        if let Some(vol_handle) =
-            open_device(&vol_path, GENERIC_READ_ACCESS | GENERIC_WRITE_ACCESS)
+        if let Some(vol_handle) = open_device(&vol_path, GENERIC_READ_ACCESS | GENERIC_WRITE_ACCESS)
         {
             unsafe {
                 let _ = DeviceIoControl(
                     vol_handle.0,
                     FSCTL_LOCK_VOLUME,
-                    None, 0, None, 0, None, None,
+                    None,
+                    0,
+                    None,
+                    0,
+                    None,
+                    None,
                 );
                 let _ = DeviceIoControl(
                     vol_handle.0,
                     FSCTL_DISMOUNT_VOLUME,
-                    None, 0, None, 0, None, None,
+                    None,
+                    0,
+                    None,
+                    0,
+                    None,
+                    None,
                 );
             }
         }
@@ -443,9 +433,7 @@ mod tests {
         let wide = to_wide("hello");
         assert_eq!(
             wide,
-            vec![
-                'h' as u16, 'e' as u16, 'l' as u16, 'l' as u16, 'o' as u16, 0
-            ]
+            vec!['h' as u16, 'e' as u16, 'l' as u16, 'l' as u16, 'o' as u16, 0]
         );
         assert_eq!(*wide.last().unwrap(), 0u16);
 

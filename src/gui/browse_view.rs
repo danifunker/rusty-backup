@@ -3,9 +3,9 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
 
-use rusty_backup::fs::entry::{FileEntry, EntryType};
-use rusty_backup::fs::filesystem::{Filesystem, FilesystemError};
 use rusty_backup::fs;
+use rusty_backup::fs::entry::{EntryType, FileEntry};
+use rusty_backup::fs::filesystem::{Filesystem, FilesystemError};
 use rusty_backup::partition;
 
 const MAX_PREVIEW_SIZE: usize = 1024 * 1024; // 1 MB max file preview
@@ -74,12 +74,7 @@ impl Default for BrowseView {
 
 impl BrowseView {
     /// Initialize the browser for a partition within a source image/device.
-    pub fn open(
-        &mut self,
-        source_path: PathBuf,
-        partition_offset: u64,
-        partition_type: u8,
-    ) {
+    pub fn open(&mut self, source_path: PathBuf, partition_offset: u64, partition_type: u8) {
         self.close();
         self.source_path = Some(source_path.clone());
         self.partition_offset = partition_offset;
@@ -134,9 +129,10 @@ impl BrowseView {
     }
 
     fn open_fs(&self) -> Result<Box<dyn Filesystem>, FilesystemError> {
-        let path = self.source_path.as_ref().ok_or_else(|| {
-            FilesystemError::Parse("no source path set".into())
-        })?;
+        let path = self
+            .source_path
+            .as_ref()
+            .ok_or_else(|| FilesystemError::Parse("no source path set".into()))?;
         let file = File::open(path).map_err(FilesystemError::Io)?;
         let reader = BufReader::new(file);
         fs::open_filesystem(reader, self.partition_offset, self.partition_type)
@@ -373,7 +369,13 @@ fn detect_content_type(data: &[u8]) -> FileContent {
         // 80% printable
         let text = data
             .iter()
-            .map(|&b| if b.is_ascii_graphic() || b.is_ascii_whitespace() { b as char } else { '.' })
+            .map(|&b| {
+                if b.is_ascii_graphic() || b.is_ascii_whitespace() {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
             .collect();
         return FileContent::Text(text);
     }

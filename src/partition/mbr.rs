@@ -13,7 +13,7 @@ const PARTITION_ENTRY_SIZE: usize = 16;
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct ChsAddress {
     pub head: u8,
-    pub sector: u8,   // bits 0-5 only (6 bits)
+    pub sector: u8,    // bits 0-5 only (6 bits)
     pub cylinder: u16, // 10 bits: 2 high bits from sector byte + 8 bits from cylinder byte
 }
 
@@ -142,8 +142,10 @@ impl Mbr {
         // Parse 4 partition entries starting at offset 446
         let mut entries: [MbrPartitionEntry; 4] = std::array::from_fn(|i| {
             let offset = PARTITION_TABLE_OFFSET + i * PARTITION_ENTRY_SIZE;
-            let entry_data: [u8; PARTITION_ENTRY_SIZE] =
-                data[offset..offset + PARTITION_ENTRY_SIZE].try_into().unwrap();
+            let entry_data: [u8; PARTITION_ENTRY_SIZE] = data
+                [offset..offset + PARTITION_ENTRY_SIZE]
+                .try_into()
+                .unwrap();
             MbrPartitionEntry::parse(&entry_data)
         });
 
@@ -296,8 +298,7 @@ pub fn patch_mbr_entries(mbr: &mut [u8; 512], overrides: &[PartitionSizeOverride
         }
 
         // Patch total_sectors
-        mbr[entry_offset + 12..entry_offset + 16]
-            .copy_from_slice(&new_sectors.to_le_bytes());
+        mbr[entry_offset + 12..entry_offset + 16].copy_from_slice(&new_sectors.to_le_bytes());
 
         // Recompute CHS if geometry is specified
         if ps.heads > 0 && ps.sectors_per_track > 0 {
@@ -353,12 +354,12 @@ mod tests {
         for (i, (status, ptype, start_lba, sectors)) in entries.iter().enumerate() {
             let offset = PARTITION_TABLE_OFFSET + i * PARTITION_ENTRY_SIZE;
             data[offset] = *status; // bootable flag
-            // CHS start (dummy: head=1, sector=1, cylinder=0)
+                                    // CHS start (dummy: head=1, sector=1, cylinder=0)
             data[offset + 1] = 1;
             data[offset + 2] = 1;
             data[offset + 3] = 0;
             data[offset + 4] = *ptype; // partition type
-            // CHS end (dummy)
+                                       // CHS end (dummy)
             data[offset + 5] = 254;
             data[offset + 6] = 63;
             data[offset + 7] = 100;
@@ -397,7 +398,10 @@ mod tests {
 
         assert!(mbr.is_protective_gpt());
         assert_eq!(mbr.active_entries().len(), 1);
-        assert_eq!(mbr.active_entries()[0].partition_type_name(), "GPT Protective");
+        assert_eq!(
+            mbr.active_entries()[0].partition_type_name(),
+            "GPT Protective"
+        );
     }
 
     #[test]
@@ -422,8 +426,8 @@ mod tests {
     fn test_multiple_partitions() {
         let data = make_mbr_bytes(
             &[
-                (0x80, 0x06, 63, 1024000),       // FAT16, DOS alignment
-                (0x00, 0x0B, 1024063, 2048000),   // FAT32
+                (0x80, 0x06, 63, 1024000),      // FAT16, DOS alignment
+                (0x00, 0x0B, 1024063, 2048000), // FAT32
             ],
             0xAA55,
         );
@@ -439,7 +443,7 @@ mod tests {
     fn test_is_extended() {
         let data = make_mbr_bytes(
             &[
-                (0x80, 0x06, 63, 1024000),   // FAT16 - not extended
+                (0x80, 0x06, 63, 1024000),      // FAT16 - not extended
                 (0x00, 0x05, 1024063, 4096000), // Extended (CHS)
             ],
             0xAA55,
@@ -518,8 +522,8 @@ mod tests {
     fn test_ebr_single_logical() {
         let disk = make_disk_with_ebr(
             &[
-                (0x80, 0x06, 63, 1024000),       // FAT16
-                (0x00, 0x05, 1024063, 4096000),   // Extended
+                (0x80, 0x06, 63, 1024000),      // FAT16
+                (0x00, 0x05, 1024063, 4096000), // Extended
             ],
             1024063,
             &[(0x0B, 1, 2048000)], // One FAT32 logical
@@ -537,15 +541,12 @@ mod tests {
     #[test]
     fn test_ebr_three_logicals() {
         let disk = make_disk_with_ebr(
-            &[
-                (0x80, 0x06, 63, 1024000),
-                (0x00, 0x05, 1024063, 8192000),
-            ],
+            &[(0x80, 0x06, 63, 1024000), (0x00, 0x05, 1024063, 8192000)],
             1024063,
             &[
-                (0x06, 1, 1000000),   // FAT16
-                (0x0B, 1, 2000000),   // FAT32
-                (0x83, 1, 3000000),   // Linux
+                (0x06, 1, 1000000), // FAT16
+                (0x0B, 1, 2000000), // FAT32
+                (0x83, 1, 3000000), // Linux
             ],
         );
         let mut cursor = std::io::Cursor::new(disk);
@@ -582,9 +583,9 @@ mod tests {
         // Entry 0: CHS start = head 1, sector 1, cylinder 0
         let offset = PARTITION_TABLE_OFFSET;
         data[offset] = 0x80;
-        data[offset + 1] = 1;   // head
-        data[offset + 2] = 1;   // sector (bits 0-5)
-        data[offset + 3] = 0;   // cylinder low byte
+        data[offset + 1] = 1; // head
+        data[offset + 2] = 1; // sector (bits 0-5)
+        data[offset + 3] = 0; // cylinder low byte
         data[offset + 4] = 0x0C;
         // CHS end = head 254, sector 63, cylinder 1023
         data[offset + 5] = 254;

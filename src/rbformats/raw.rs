@@ -61,10 +61,10 @@ pub(crate) fn stream_with_split(
                     part_index += 1;
                     current_file_bytes = 0;
                     let next_path = output_path(output_base, extension, true, part_index);
-                    writer = BufWriter::new(
-                        File::create(&next_path)
-                            .with_context(|| format!("failed to create {}", next_path.display()))?,
-                    );
+                    writer =
+                        BufWriter::new(File::create(&next_path).with_context(|| {
+                            format!("failed to create {}", next_path.display())
+                        })?);
                     files.push(file_name(&next_path));
                 }
             }
@@ -97,8 +97,7 @@ pub(crate) fn stream_with_split(
                 part_index += 1;
                 current_file_bytes = 0;
                 skipped_zeros = false;
-                let next_path =
-                    output_path(output_base, extension, true, part_index);
+                let next_path = output_path(output_base, extension, true, part_index);
                 writer = BufWriter::new(
                     File::create(&next_path)
                         .with_context(|| format!("failed to create {}", next_path.display()))?,

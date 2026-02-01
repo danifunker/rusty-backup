@@ -12,9 +12,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::backup::metadata::BackupMetadata;
 use crate::backup::CompressionType;
-use crate::fs::fat::{
-    patch_bpb_hidden_sectors, resize_fat_in_place, validate_fat_integrity,
-};
+use crate::fs::fat::{patch_bpb_hidden_sectors, resize_fat_in_place, validate_fat_integrity};
 use crate::partition::mbr::patch_mbr_entries;
 use crate::partition::PartitionSizeOverride;
 
@@ -38,20 +36,45 @@ pub fn compress_partition(
     mut log_cb: impl FnMut(&str),
 ) -> Result<Vec<String>> {
     match compression {
-        CompressionType::None => {
-            raw::stream_with_split(reader, output_base, "raw", split_size, skip_zeros, &mut progress_cb, &cancel_check)
-        }
+        CompressionType::None => raw::stream_with_split(
+            reader,
+            output_base,
+            "raw",
+            split_size,
+            skip_zeros,
+            &mut progress_cb,
+            &cancel_check,
+        ),
         CompressionType::Vhd => {
             // VHD = raw data + 512-byte footer; no splitting support
-            vhd::write_vhd(reader, output_base, skip_zeros, &mut progress_cb, &cancel_check)
+            vhd::write_vhd(
+                reader,
+                output_base,
+                skip_zeros,
+                &mut progress_cb,
+                &cancel_check,
+            )
         }
         CompressionType::Zstd => {
             // zstd compresses zero blocks efficiently; no need to skip
-            zstd::compress_zstd(reader, output_base, split_size, &mut progress_cb, &cancel_check)
+            zstd::compress_zstd(
+                reader,
+                output_base,
+                split_size,
+                &mut progress_cb,
+                &cancel_check,
+            )
         }
         CompressionType::Chd => {
             // CHD needs complete raw temp file; chdman handles zero compression
-            chd::compress_chd(reader, output_base, split_size, &mut progress_cb, &cancel_check, &mut log_cb)
+            chd::compress_chd(
+                reader,
+                output_base,
+                split_size,
+                &mut progress_cb,
+                &cancel_check,
+                &mut log_cb,
+            )
         }
     }
 }
@@ -165,11 +188,11 @@ pub fn decompress_to_writer(
                 .map(|m| m.len())
                 .unwrap_or(u64::MAX);
             let effective_size = temp_size.min(limit);
-            let mut reader = BufReader::new(
-                File::open(&temp_path)
-                    .with_context(|| format!("failed to open temp file: {}", temp_path.display()))?,
-            )
-            .take(effective_size);
+            let mut reader =
+                BufReader::new(File::open(&temp_path).with_context(|| {
+                    format!("failed to open temp file: {}", temp_path.display())
+                })?)
+                .take(effective_size);
             loop {
                 if cancel_check() {
                     let _ = fs::remove_file(&temp_path);
@@ -313,9 +336,7 @@ pub fn reconstruct_disk_from_backup(
         // Update BPB hidden sectors to match partition start LBA
         {
             writer.flush()?;
-            patch_bpb_hidden_sectors(
-                writer, part_offset, effective_lba, log_cb,
-            )?;
+            patch_bpb_hidden_sectors(writer, part_offset, effective_lba, log_cb)?;
         }
 
         // Resize FAT filesystem if the partition size changed
@@ -335,9 +356,7 @@ pub fn reconstruct_disk_from_backup(
 
         log_cb(&format!(
             "partition-{}: wrote {} bytes (export size: {})",
-            pm.index,
-            bytes_written,
-            export_size,
+            pm.index, bytes_written, export_size,
         ));
     }
 
@@ -358,7 +377,9 @@ pub(crate) fn write_zeros(writer: &mut impl Write, count: u64) -> Result<()> {
     let mut remaining = count;
     while remaining > 0 {
         let n = (remaining as usize).min(CHUNK_SIZE);
-        writer.write_all(&zeros[..n]).context("failed to write zeros")?;
+        writer
+            .write_all(&zeros[..n])
+            .context("failed to write zeros")?;
         remaining -= n as u64;
     }
     Ok(())
@@ -371,11 +392,13 @@ pub(crate) fn is_all_zeros(data: &[u8]) -> bool {
 
 /// Build the output file path with optional split numbering.
 /// `partition-0.zst` (no split) or `partition-0.001.zst` (split).
-pub(crate) fn output_path(base: &Path, extension: &str, splitting: bool, part_index: u32) -> PathBuf {
-    let stem = base
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy();
+pub(crate) fn output_path(
+    base: &Path,
+    extension: &str,
+    splitting: bool,
+    part_index: u32,
+) -> PathBuf {
+    let stem = base.file_stem().unwrap_or_default().to_string_lossy();
     let parent = base.parent().unwrap_or(Path::new("."));
     if splitting && part_index > 0 {
         parent.join(format!("{stem}.{:03}.{extension}", part_index))
@@ -408,8 +431,8 @@ impl SplitWriter {
         _part_index: &mut u32,
         _output_base: &Path,
     ) -> Result<Self> {
-        let file = File::create(path)
-            .with_context(|| format!("failed to create {}", path.display()))?;
+        let file =
+            File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
         Ok(Self {
             inner: BufWriter::new(file),
         })

@@ -5,9 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 
-use super::{
-    decompress_to_writer, reconstruct_disk_from_backup, write_zeros, CHUNK_SIZE,
-};
+use super::{decompress_to_writer, reconstruct_disk_from_backup, write_zeros, CHUNK_SIZE};
 use crate::backup::metadata::BackupMetadata;
 use crate::fs::fat::{patch_bpb_hidden_sectors, resize_fat_in_place};
 use crate::partition::mbr::patch_mbr_entries;
@@ -189,7 +187,13 @@ pub(crate) fn write_vhd(
 
     // Write raw data (no splitting for VHD)
     let files = stream_with_split(
-        reader, output_base, "vhd", None, skip_zeros, progress_cb, cancel_check,
+        reader,
+        output_base,
+        "vhd",
+        None,
+        skip_zeros,
+        progress_cb,
+        cancel_check,
     )?;
 
     // Re-open the file to determine data size and append the VHD footer
@@ -256,7 +260,8 @@ pub fn export_whole_disk_vhd(
 
         // Append VHD footer
         let footer = build_vhd_footer(total_written);
-        file.write_all(&footer).context("failed to write VHD footer")?;
+        file.write_all(&footer)
+            .context("failed to write VHD footer")?;
         file.flush()?;
 
         log_cb(&format!(
@@ -308,7 +313,9 @@ pub fn export_whole_disk_vhd(
                 if n == 0 {
                     break;
                 }
-                writer.write_all(&buf[..n]).context("failed to write VHD data")?;
+                writer
+                    .write_all(&buf[..n])
+                    .context("failed to write VHD data")?;
                 total_written += n as u64;
                 progress_cb(total_written);
             }
@@ -318,9 +325,13 @@ pub fn export_whole_disk_vhd(
 
             // Read and patch MBR (first 512 bytes)
             let mut mbr_buf = [0u8; 512];
-            reader.read_exact(&mut mbr_buf).context("failed to read MBR from source")?;
+            reader
+                .read_exact(&mut mbr_buf)
+                .context("failed to read MBR from source")?;
             patch_mbr_entries(&mut mbr_buf, partition_sizes);
-            writer.write_all(&mbr_buf).context("failed to write patched MBR")?;
+            writer
+                .write_all(&mbr_buf)
+                .context("failed to write patched MBR")?;
             total_written += 512;
             log_cb("Patched MBR partition table with export sizes");
 
@@ -389,7 +400,10 @@ pub fn export_whole_disk_vhd(
                     writer.flush()?;
                     let end_pos = total_written;
                     patch_bpb_hidden_sectors(
-                        writer.get_mut(), part_offset, ps.start_lba, &mut log_cb,
+                        writer.get_mut(),
+                        part_offset,
+                        ps.start_lba,
+                        &mut log_cb,
                     )?;
                     writer.seek(SeekFrom::Start(end_pos))?;
                 }
@@ -434,7 +448,9 @@ pub fn export_whole_disk_vhd(
 
     // Append VHD footer
     let footer = build_vhd_footer(total_written);
-    writer.write_all(&footer).context("failed to write VHD footer")?;
+    writer
+        .write_all(&footer)
+        .context("failed to write VHD footer")?;
     writer.flush()?;
 
     log_cb(&format!(
@@ -488,7 +504,9 @@ pub fn export_partition_vhd(
 
     // Append VHD footer
     let footer = build_vhd_footer(vhd_data_size);
-    writer.write_all(&footer).context("failed to write VHD footer")?;
+    writer
+        .write_all(&footer)
+        .context("failed to write VHD footer")?;
     writer.flush()?;
 
     log_cb(&format!(
@@ -502,8 +520,8 @@ pub fn export_partition_vhd(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::CompressionType;
+    use super::*;
     use std::io::Cursor;
     use tempfile::TempDir;
 

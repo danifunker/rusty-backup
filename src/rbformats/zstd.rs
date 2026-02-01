@@ -20,7 +20,13 @@ pub(crate) fn compress_zstd(
 
     let first_path = output_path(output_base, "zst", split_size.is_some(), part_index);
     let mut encoder = zstd::Encoder::new(
-        SplitWriter::new(&first_path, split_bytes, &mut files, &mut part_index, output_base)?,
+        SplitWriter::new(
+            &first_path,
+            split_bytes,
+            &mut files,
+            &mut part_index,
+            output_base,
+        )?,
         3, // compression level
     )
     .context("failed to create zstd encoder")?;

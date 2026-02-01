@@ -190,10 +190,9 @@ pub fn enumerate_devices() -> Vec<DiskDevice> {
                             )
                         } else {
                             // Not mounted - use sysfs partition size
-                            let part_sectors: u64 =
-                                read_sysfs_attr(&sub.path().join("size"))
-                                    .parse()
-                                    .unwrap_or(0);
+                            let part_sectors: u64 = read_sysfs_attr(&sub.path().join("size"))
+                                .parse()
+                                .unwrap_or(0);
                             (PathBuf::new(), String::new(), part_sectors * 512, 0)
                         };
 
@@ -294,7 +293,9 @@ pub fn parent_device_name(partition_name: &str) -> String {
     // nvme0n1p1 -> nvme0n1
     if partition_name.starts_with("nvme") {
         if let Some(p_pos) = partition_name.rfind('p') {
-            if partition_name[p_pos + 1..].chars().all(|c| c.is_ascii_digit())
+            if partition_name[p_pos + 1..]
+                .chars()
+                .all(|c| c.is_ascii_digit())
                 && !partition_name[p_pos + 1..].is_empty()
                 && partition_name[..p_pos].contains('n')
             {
@@ -307,7 +308,9 @@ pub fn parent_device_name(partition_name: &str) -> String {
     // mmcblk0p1 -> mmcblk0
     if partition_name.starts_with("mmcblk") {
         if let Some(p_pos) = partition_name.rfind('p') {
-            if partition_name[p_pos + 1..].chars().all(|c| c.is_ascii_digit())
+            if partition_name[p_pos + 1..]
+                .chars()
+                .all(|c| c.is_ascii_digit())
                 && !partition_name[p_pos + 1..].is_empty()
             {
                 return partition_name[..p_pos].to_string();
@@ -401,10 +404,7 @@ mod tests {
     fn test_unescape_mountinfo() {
         assert_eq!(unescape_mountinfo("hello"), "hello");
         assert_eq!(unescape_mountinfo("/mnt/usb\\040drive"), "/mnt/usb drive");
-        assert_eq!(
-            unescape_mountinfo("/mnt/a\\040b\\011c"),
-            "/mnt/a b\tc"
-        );
+        assert_eq!(unescape_mountinfo("/mnt/a\\040b\\011c"), "/mnt/a b\tc");
         assert_eq!(unescape_mountinfo("no\\escape"), "no\\escape");
     }
 

@@ -5,8 +5,8 @@ pub mod filesystem;
 use std::io::{Read, Seek};
 
 pub use fat::{
-    CompactFatReader, CompactInfo,
-    patch_bpb_hidden_sectors, resize_fat_in_place, validate_fat_integrity,
+    patch_bpb_hidden_sectors, resize_fat_in_place, validate_fat_integrity, CompactFatReader,
+    CompactInfo,
 };
 use filesystem::{Filesystem, FilesystemError};
 
@@ -29,17 +29,19 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
 ) -> Option<(CompactFatReader<R>, CompactResult)> {
     // Only FAT types are supported for compaction
     match partition_type {
-        0x01 | 0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E |
-        0x0B | 0x0C | 0x1B | 0x1C => {}
+        0x01 | 0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C => {}
         _ => return None,
     }
 
     let (reader, info) = CompactFatReader::new(reader, partition_offset).ok()?;
-    Some((reader, CompactResult {
-        original_size: info.original_size,
-        compacted_size: info.compacted_size,
-        clusters_used: info.clusters_used,
-    }))
+    Some((
+        reader,
+        CompactResult {
+            original_size: info.original_size,
+            compacted_size: info.compacted_size,
+            clusters_used: info.clusters_used,
+        },
+    ))
 }
 
 /// Calculate the effective data size for a partition — the number of bytes
@@ -67,15 +69,20 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
 ) -> Result<Box<dyn Filesystem>, FilesystemError> {
     match partition_type {
         // FAT12
-        0x01 => Ok(Box::new(fat::FatFilesystem::open(reader, partition_offset)?)),
+        0x01 => Ok(Box::new(fat::FatFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
         // FAT16
-        0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E => {
-            Ok(Box::new(fat::FatFilesystem::open(reader, partition_offset)?))
-        }
+        0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E => Ok(Box::new(fat::FatFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
         // FAT32
-        0x0B | 0x0C | 0x1B | 0x1C => {
-            Ok(Box::new(fat::FatFilesystem::open(reader, partition_offset)?))
-        }
+        0x0B | 0x0C | 0x1B | 0x1C => Ok(Box::new(fat::FatFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
         // NTFS/exFAT - try FAT first (exFAT uses same type byte)
         0x07 => Err(FilesystemError::Unsupported(
             "NTFS/exFAT browsing not yet supported".into(),

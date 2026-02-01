@@ -57,7 +57,8 @@ impl SectorAlignedWriter {
         }
         let remainder = self.buf.len() % SECTOR_SIZE;
         if remainder != 0 {
-            self.buf.resize(self.buf.len() + (SECTOR_SIZE - remainder), 0);
+            self.buf
+                .resize(self.buf.len() + (SECTOR_SIZE - remainder), 0);
         }
         self.inner.write_all(&self.buf)?;
         self.buf.clear();
@@ -143,15 +144,14 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
 /// For devices: uses platform-specific methods to open for raw write access.
 /// On Linux, unmounts partitions via `umount2(MNT_DETACH)`.
 /// On Windows, locks and dismounts volumes via `DeviceIoControl`.
-/// On macOS, uses `diskutil` to unmount.
+/// On macOS, uses DiskArbitration to unmount.
 pub fn open_target_for_writing(path: &Path) -> Result<File> {
     let path_str = path.to_string_lossy();
     let is_device = path_str.starts_with("/dev/") || path_str.starts_with("\\\\.\\");
 
     if !is_device {
         // Regular file — just create/truncate
-        return File::create(path)
-            .with_context(|| format!("failed to create {}", path.display()));
+        return File::create(path).with_context(|| format!("failed to create {}", path.display()));
     }
 
     #[cfg(target_os = "macos")]

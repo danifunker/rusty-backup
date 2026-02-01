@@ -11,7 +11,11 @@ pub trait Filesystem: Send {
     fn list_directory(&mut self, entry: &FileEntry) -> Result<Vec<FileEntry>, FilesystemError>;
 
     /// Read file contents (up to `max_bytes`).
-    fn read_file(&mut self, entry: &FileEntry, max_bytes: usize) -> Result<Vec<u8>, FilesystemError>;
+    fn read_file(
+        &mut self,
+        entry: &FileEntry,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, FilesystemError>;
 
     /// Volume label, if available.
     fn volume_label(&self) -> Option<&str>;

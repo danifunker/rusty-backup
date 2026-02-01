@@ -288,40 +288,30 @@ mod tests {
 
         // GPT header at LBA 1 (offset 512)
         let hdr_offset = 512usize;
-        image[hdr_offset..hdr_offset + 8]
-            .copy_from_slice(&GPT_SIGNATURE.to_le_bytes()); // signature
-        image[hdr_offset + 8..hdr_offset + 12]
-            .copy_from_slice(&0x00010000u32.to_le_bytes()); // revision 1.0
-        image[hdr_offset + 12..hdr_offset + 16]
-            .copy_from_slice(&92u32.to_le_bytes()); // header size
-        // header CRC32 = 0 (skip validation for test)
-        image[hdr_offset + 24..hdr_offset + 32]
-            .copy_from_slice(&1u64.to_le_bytes()); // my_lba
+        image[hdr_offset..hdr_offset + 8].copy_from_slice(&GPT_SIGNATURE.to_le_bytes()); // signature
+        image[hdr_offset + 8..hdr_offset + 12].copy_from_slice(&0x00010000u32.to_le_bytes()); // revision 1.0
+        image[hdr_offset + 12..hdr_offset + 16].copy_from_slice(&92u32.to_le_bytes()); // header size
+                                                                                       // header CRC32 = 0 (skip validation for test)
+        image[hdr_offset + 24..hdr_offset + 32].copy_from_slice(&1u64.to_le_bytes()); // my_lba
         image[hdr_offset + 32..hdr_offset + 40]
             .copy_from_slice(&((total_sectors - 1) as u64).to_le_bytes()); // alternate_lba
-        image[hdr_offset + 40..hdr_offset + 48]
-            .copy_from_slice(&34u64.to_le_bytes()); // first_usable_lba
+        image[hdr_offset + 40..hdr_offset + 48].copy_from_slice(&34u64.to_le_bytes()); // first_usable_lba
         image[hdr_offset + 48..hdr_offset + 56]
             .copy_from_slice(&((total_sectors - 34) as u64).to_le_bytes()); // last_usable_lba
-        // disk GUID
+                                                                            // disk GUID
         let disk_guid = [0xAA; 16];
         image[hdr_offset + 56..hdr_offset + 72].copy_from_slice(&disk_guid);
-        image[hdr_offset + 72..hdr_offset + 80]
-            .copy_from_slice(&2u64.to_le_bytes()); // partition_entry_lba
-        image[hdr_offset + 80..hdr_offset + 84]
-            .copy_from_slice(&num_entries.to_le_bytes());
-        image[hdr_offset + 84..hdr_offset + 88]
-            .copy_from_slice(&entry_size.to_le_bytes());
+        image[hdr_offset + 72..hdr_offset + 80].copy_from_slice(&2u64.to_le_bytes()); // partition_entry_lba
+        image[hdr_offset + 80..hdr_offset + 84].copy_from_slice(&num_entries.to_le_bytes());
+        image[hdr_offset + 84..hdr_offset + 88].copy_from_slice(&entry_size.to_le_bytes());
 
         // Partition entries at LBA 2 (offset 1024)
         for (i, (type_guid, unique_guid, first_lba, last_lba, name)) in entries.iter().enumerate() {
             let entry_offset = 1024 + i * entry_size as usize;
             image[entry_offset..entry_offset + 16].copy_from_slice(&type_guid.0);
             image[entry_offset + 16..entry_offset + 32].copy_from_slice(&unique_guid.0);
-            image[entry_offset + 32..entry_offset + 40]
-                .copy_from_slice(&first_lba.to_le_bytes());
-            image[entry_offset + 40..entry_offset + 48]
-                .copy_from_slice(&last_lba.to_le_bytes());
+            image[entry_offset + 32..entry_offset + 40].copy_from_slice(&first_lba.to_le_bytes());
+            image[entry_offset + 40..entry_offset + 48].copy_from_slice(&last_lba.to_le_bytes());
             // attributes = 0
             // name as UTF-16LE
             let name_offset = entry_offset + 56;
@@ -376,7 +366,13 @@ mod tests {
     #[test]
     fn test_parse_gpt_multiple_partitions() {
         let image = make_gpt_image(&[
-            (ms_basic_data_guid(), random_guid(), 2048, 1050623, "Windows"),
+            (
+                ms_basic_data_guid(),
+                random_guid(),
+                2048,
+                1050623,
+                "Windows",
+            ),
             (linux_fs_guid(), random_guid(), 1050624, 2099199, "Linux"),
         ]);
 
