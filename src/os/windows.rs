@@ -86,12 +86,12 @@ fn open_device(device_path: &str, access: u32) -> Option<SafeHandle> {
     unsafe {
         CreateFileW(
             PCWSTR(wide.as_ptr()),
-            FILE_ACCESS_RIGHTS(access),
+            access,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
             OPEN_EXISTING,
             FILE_FLAGS_AND_ATTRIBUTES(0),
-            HANDLE::default(),
+            None,
         )
         .ok()
         .map(SafeHandle)
@@ -388,12 +388,12 @@ pub fn open_target_for_writing(path: &Path) -> Result<File> {
     let handle = unsafe {
         CreateFileW(
             PCWSTR(wide.as_ptr()),
-            FILE_ACCESS_RIGHTS(GENERIC_READ_ACCESS | GENERIC_WRITE_ACCESS),
+            GENERIC_READ_ACCESS | GENERIC_WRITE_ACCESS,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
             OPEN_EXISTING,
             FILE_FLAGS_AND_ATTRIBUTES(0),
-            HANDLE::default(),
+            None,
         )
     }
     .with_context(|| format!("cannot open {} for writing", path.display()))?;
