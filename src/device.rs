@@ -51,8 +51,8 @@ pub struct MountedPartition {
 /// Enumerate disk devices using platform-specific methods.
 ///
 /// On macOS, uses `diskutil` for proper BSD device identifiers.
-/// On Linux, uses `sysinfo` with device name grouping.
-/// On Windows, not yet implemented.
+/// On Linux, reads sysfs (`/sys/block/`) and `/proc/self/mountinfo`.
+/// On Windows, probes `\\.\PhysicalDriveN` via `CreateFileW`/`DeviceIoControl`.
 pub fn enumerate_devices() -> Vec<DiskDevice> {
     crate::os::enumerate_devices()
 }

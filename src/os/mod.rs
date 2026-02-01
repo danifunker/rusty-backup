@@ -140,8 +140,10 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
 /// Open a target device or image file for writing (restore).
 ///
 /// For regular files (`.img`): creates/truncates the file.
-/// For devices: uses platform-specific methods to open for raw write access
-/// (may unmount partitions, request elevation, etc.).
+/// For devices: uses platform-specific methods to open for raw write access.
+/// On Linux, unmounts partitions via `umount2(MNT_DETACH)`.
+/// On Windows, locks and dismounts volumes via `DeviceIoControl`.
+/// On macOS, uses `diskutil` to unmount.
 pub fn open_target_for_writing(path: &Path) -> Result<File> {
     let path_str = path.to_string_lossy();
     let is_device = path_str.starts_with("/dev/") || path_str.starts_with("\\\\.\\");

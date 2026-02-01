@@ -1,30 +1,279 @@
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context, Result};
+use nix::mount::{umount2, MntFlags};
 
 use crate::device::{DiskDevice, MountedPartition};
 
+/// A parsed entry from `/proc/self/mountinfo`.
+struct MountInfoEntry {
+    mount_point: String,
+    fs_type: String,
+    source: String,
+}
+
+/// Read a sysfs attribute file, returning the trimmed contents or an empty
+/// string on any failure.
+fn read_sysfs_attr(path: &Path) -> String {
+    fs::read_to_string(path)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Returns `true` for block device names that represent real physical devices
+/// (as opposed to loop, ram, device-mapper, etc.).
+fn is_physical_block_device(name: &str) -> bool {
+    !name.starts_with("loop")
+        && !name.starts_with("ram")
+        && !name.starts_with("dm-")
+        && !name.starts_with("zram")
+        && !name.starts_with("sr")
+        && !name.starts_with("fd")
+        && !name.starts_with("nbd")
+}
+
+/// Unescape octal sequences in mountinfo fields (e.g. `\040` -> space).
+fn unescape_mountinfo(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            // Try to read 3 octal digits
+            let mut octal = String::with_capacity(3);
+            for _ in 0..3 {
+                if let Some(&next) = chars.as_str().chars().collect::<Vec<_>>().first() {
+                    if next.is_ascii_digit() && next < '8' {
+                        octal.push(next);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if octal.len() == 3 {
+                if let Ok(byte) = u8::from_str_radix(&octal, 8) {
+                    result.push(byte as char);
+                } else {
+                    result.push('\\');
+                    result.push_str(&octal);
+                }
+            } else {
+                result.push('\\');
+                result.push_str(&octal);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Parse the contents of `/proc/self/mountinfo` into a map from device path
+/// (e.g. `/dev/sda1`) to mount information.
+///
+/// Format (space-separated):
+///   id parent major:minor root mount_point options ... - fs_type source super_opts
+fn parse_mountinfo_from_str(content: &str) -> HashMap<String, MountInfoEntry> {
+    let mut map = HashMap::new();
+
+    for line in content.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+
+        // Find the `-` separator
+        let dash_pos = match fields.iter().position(|f| *f == "-") {
+            Some(p) => p,
+            None => continue,
+        };
+
+        // Need at least: mount_point at index 4, and fs_type + source after dash
+        if fields.len() < 5 || dash_pos + 2 >= fields.len() {
+            continue;
+        }
+
+        let mount_point = unescape_mountinfo(fields[4]);
+        let fs_type = fields[dash_pos + 1].to_string();
+        let source = fields[dash_pos + 2].to_string();
+
+        // Only track entries with real block device sources
+        if source.starts_with("/dev/") {
+            map.insert(
+                source.clone(),
+                MountInfoEntry {
+                    mount_point,
+                    fs_type,
+                    source,
+                },
+            );
+        }
+    }
+
+    map
+}
+
+/// Detect bus protocol by resolving the sysfs device symlink and checking
+/// path components for known bus keywords.
+fn detect_bus_protocol(sysfs_dev: &Path) -> String {
+    let device_path = sysfs_dev.join("device");
+    let resolved = match fs::canonicalize(&device_path) {
+        Ok(p) => p.to_string_lossy().to_string(),
+        Err(_) => return String::new(),
+    };
+
+    if resolved.contains("/usb") {
+        "USB".to_string()
+    } else if resolved.contains("/nvme") {
+        "NVMe".to_string()
+    } else if resolved.contains("/mmc") {
+        "MMC/SD".to_string()
+    } else if resolved.contains("/ata") || resolved.contains("/sata") {
+        "SATA".to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// Enumerate devices using sysfs and /proc/self/mountinfo.
+pub fn enumerate_devices() -> Vec<DiskDevice> {
+    let mountinfo_content = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    let mounts = parse_mountinfo_from_str(&mountinfo_content);
+
+    let block_dir = Path::new("/sys/block");
+    let entries = match fs::read_dir(block_dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut devices = Vec::new();
+
+    for entry in entries.flatten() {
+        let dev_name = entry.file_name().to_string_lossy().to_string();
+
+        if !is_physical_block_device(&dev_name) {
+            continue;
+        }
+
+        let sysfs_dev = block_dir.join(&dev_name);
+
+        // Read device attributes
+        let size_sectors: u64 = read_sysfs_attr(&sysfs_dev.join("size"))
+            .parse()
+            .unwrap_or(0);
+        let size_bytes = size_sectors * 512;
+
+        let is_removable = read_sysfs_attr(&sysfs_dev.join("removable")) == "1";
+        let is_read_only = read_sysfs_attr(&sysfs_dev.join("ro")) == "1";
+        let media_name = read_sysfs_attr(&sysfs_dev.join("device/model"));
+        let bus_protocol = detect_bus_protocol(&sysfs_dev);
+
+        // Discover partitions
+        let mut partitions = Vec::new();
+        let mut is_system = false;
+
+        if let Ok(sub_entries) = fs::read_dir(&sysfs_dev) {
+            for sub in sub_entries.flatten() {
+                let part_name = sub.file_name().to_string_lossy().to_string();
+                // A subdirectory is a partition if it contains a `partition` file
+                if sub.path().join("partition").exists() {
+                    let dev_path = format!("/dev/{part_name}");
+
+                    let (mount_point, filesystem, total_space, available_space) =
+                        if let Some(mi) = mounts.get(&dev_path) {
+                            // Mounted - get space via statvfs
+                            let (total, avail) = statvfs_space(&mi.mount_point);
+                            (
+                                PathBuf::from(&mi.mount_point),
+                                mi.fs_type.clone(),
+                                total,
+                                avail,
+                            )
+                        } else {
+                            // Not mounted - use sysfs partition size
+                            let part_sectors: u64 =
+                                read_sysfs_attr(&sub.path().join("size"))
+                                    .parse()
+                                    .unwrap_or(0);
+                            (PathBuf::new(), String::new(), part_sectors * 512, 0)
+                        };
+
+                    if mount_point == Path::new("/") {
+                        is_system = true;
+                    }
+
+                    partitions.push(MountedPartition {
+                        name: part_name,
+                        mount_point,
+                        filesystem,
+                        total_space,
+                        available_space,
+                    });
+                }
+            }
+        }
+
+        partitions.sort_by(|a, b| a.name.cmp(&b.name));
+
+        devices.push(DiskDevice {
+            name: dev_name.clone(),
+            path: PathBuf::from(format!("/dev/{dev_name}")),
+            size_bytes,
+            is_removable,
+            is_read_only,
+            is_system,
+            bus_protocol,
+            media_name,
+            partitions,
+        });
+    }
+
+    devices.sort_by(|a, b| a.name.cmp(&b.name));
+    devices
+}
+
+/// Get total and available space for a mount point using `statvfs64`.
+fn statvfs_space(mount_point: &str) -> (u64, u64) {
+    use std::ffi::CString;
+
+    let c_path = match CString::new(mount_point) {
+        Ok(p) => p,
+        Err(_) => return (0, 0),
+    };
+
+    unsafe {
+        let mut stat: libc::statvfs64 = std::mem::zeroed();
+        if libc::statvfs64(c_path.as_ptr(), &mut stat) == 0 {
+            let total = stat.f_blocks as u64 * stat.f_frsize as u64;
+            let avail = stat.f_bavail as u64 * stat.f_frsize as u64;
+            (total, avail)
+        } else {
+            (0, 0)
+        }
+    }
+}
+
 /// Open a target device for writing on Linux.
 ///
-/// Attempts to unmount any mounted partitions on the device first.
+/// Reads `/proc/self/mountinfo` to find mounted partitions on this device,
+/// unmounts them with `umount2(MNT_DETACH)`, then opens the device for
+/// read+write access.
 pub fn open_target_for_writing(path: &Path) -> Result<File> {
     let path_str = path.to_string_lossy();
 
-    // Try to unmount all partitions on this device
-    // e.g., for /dev/sdb, unmount /dev/sdb1, /dev/sdb2, etc.
     if path_str.starts_with("/dev/") {
         let device_name = path_str.trim_start_matches("/dev/");
         let parent = parent_device_name(device_name);
 
-        // Try unmounting the device itself and numbered partitions
-        for suffix in ["", "1", "2", "3", "4", "5", "6", "7", "8"] {
-            let part_path = format!("/dev/{parent}{suffix}");
-            let _ = Command::new("umount")
-                .arg(&part_path)
-                .output();
+        // Read mountinfo to find actually-mounted partitions
+        let mountinfo_content = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+        let mounts = parse_mountinfo_from_str(&mountinfo_content);
+
+        // Unmount any mounted partitions belonging to this device
+        for (dev_path, mi) in &mounts {
+            let dev_part_name = dev_path.trim_start_matches("/dev/");
+            if parent_device_name(dev_part_name) == parent {
+                let _ = umount2(mi.mount_point.as_str(), MntFlags::MNT_DETACH);
+            }
         }
     }
 
@@ -33,57 +282,6 @@ pub fn open_target_for_writing(path: &Path) -> Result<File> {
         .write(true)
         .open(path)
         .with_context(|| format!("cannot open {} for writing", path.display()))
-}
-
-/// Enumerate devices using sysinfo, grouping mounted volumes by parent device.
-pub fn enumerate_devices() -> Vec<DiskDevice> {
-    let disks = sysinfo::Disks::new_with_refreshed_list();
-
-    let mut device_map: HashMap<String, DiskDevice> = HashMap::new();
-
-    for disk in disks.list() {
-        let disk_name = disk.name().to_string_lossy().to_string();
-        let parent_name = parent_device_name(&disk_name);
-
-        let partition = MountedPartition {
-            name: disk_name.clone(),
-            mount_point: disk.mount_point().to_path_buf(),
-            filesystem: disk.file_system().to_string_lossy().to_string(),
-            total_space: disk.total_space(),
-            available_space: disk.available_space(),
-        };
-
-        let entry = device_map.entry(parent_name.clone()).or_insert_with(|| {
-            DiskDevice {
-                name: parent_name.clone(),
-                path: PathBuf::from(format!("/dev/{parent_name}")),
-                size_bytes: 0,
-                is_removable: disk.is_removable(),
-                is_read_only: disk.is_read_only(),
-                is_system: false,
-                bus_protocol: String::new(),
-                media_name: String::new(),
-                partitions: Vec::new(),
-            }
-        });
-
-        entry.size_bytes = entry.size_bytes.max(
-            entry
-                .partitions
-                .iter()
-                .map(|p| p.total_space)
-                .sum::<u64>()
-                + partition.total_space,
-        );
-        if disk.is_removable() {
-            entry.is_removable = true;
-        }
-        entry.partitions.push(partition);
-    }
-
-    let mut devices: Vec<DiskDevice> = device_map.into_values().collect();
-    devices.sort_by(|a, b| a.name.cmp(&b.name));
-    devices
 }
 
 /// Derive the parent device name from a partition name.
@@ -174,5 +372,55 @@ mod tests {
     #[test]
     fn test_unknown_device() {
         assert_eq!(parent_device_name("something"), "something");
+    }
+
+    #[test]
+    fn test_parse_mountinfo() {
+        let content = "\
+22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
+23 22 8:2 / /home rw,relatime shared:2 - ext4 /dev/sda2 rw
+30 22 0:30 / /run/user/1000 rw,nosuid,nodev - tmpfs tmpfs rw
+35 22 8:17 / /mnt/usb\\040drive rw,relatime shared:5 - vfat /dev/sdb1 rw
+";
+        let map = parse_mountinfo_from_str(content);
+        assert_eq!(map.len(), 3); // tmpfs excluded (source not /dev/)
+
+        let sda1 = map.get("/dev/sda1").unwrap();
+        assert_eq!(sda1.mount_point, "/");
+        assert_eq!(sda1.fs_type, "ext4");
+
+        let sda2 = map.get("/dev/sda2").unwrap();
+        assert_eq!(sda2.mount_point, "/home");
+
+        let sdb1 = map.get("/dev/sdb1").unwrap();
+        assert_eq!(sdb1.mount_point, "/mnt/usb drive");
+        assert_eq!(sdb1.fs_type, "vfat");
+    }
+
+    #[test]
+    fn test_unescape_mountinfo() {
+        assert_eq!(unescape_mountinfo("hello"), "hello");
+        assert_eq!(unescape_mountinfo("/mnt/usb\\040drive"), "/mnt/usb drive");
+        assert_eq!(
+            unescape_mountinfo("/mnt/a\\040b\\011c"),
+            "/mnt/a b\tc"
+        );
+        assert_eq!(unescape_mountinfo("no\\escape"), "no\\escape");
+    }
+
+    #[test]
+    fn test_is_physical_block_device() {
+        assert!(is_physical_block_device("sda"));
+        assert!(is_physical_block_device("nvme0n1"));
+        assert!(is_physical_block_device("mmcblk0"));
+        assert!(is_physical_block_device("vda"));
+        assert!(!is_physical_block_device("loop0"));
+        assert!(!is_physical_block_device("loop1"));
+        assert!(!is_physical_block_device("ram0"));
+        assert!(!is_physical_block_device("dm-0"));
+        assert!(!is_physical_block_device("zram0"));
+        assert!(!is_physical_block_device("sr0"));
+        assert!(!is_physical_block_device("fd0"));
+        assert!(!is_physical_block_device("nbd0"));
     }
 }
