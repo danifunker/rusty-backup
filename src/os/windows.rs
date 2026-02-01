@@ -5,7 +5,7 @@ use std::fs::File;
 use std::os::windows::io::FromRawHandle;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
 use windows::Win32::Security::{
@@ -17,7 +17,7 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::UI::Shell::{ShellExecuteW, SHELLEXECUTEINFOW, SEE_MASK_NOCLOSEPROCESS};
-use windows::Win32::UI::WindowsAndMessaging::SW_SHOW;
+use windows::Win32::UI::WindowsAndMessaging::{SHOW_WINDOW_CMD, SW_SHOW};
 
 use crate::device::{DiskDevice, MountedPartition};
 
@@ -110,12 +110,12 @@ pub fn request_elevation() -> Result<()> {
 /// This wrapper provides the correct signature.
 unsafe fn ShellExecuteExW(info: *mut SHELLEXECUTEINFOW) -> windows::core::Result<()> {
     let result = ShellExecuteW(
-        (*info).hwnd,
+        Some((*info).hwnd),
         PCWSTR((*info).lpVerb.0),
         PCWSTR((*info).lpFile.0),
         PCWSTR((*info).lpParameters.0),
         PCWSTR((*info).lpDirectory.0),
-        (*info).nShow,
+        SHOW_WINDOW_CMD((*info).nShow),
     );
     // ShellExecuteW returns > 32 on success
     if result.0 as usize > 32 {
