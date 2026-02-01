@@ -8,11 +8,91 @@ mod linux;
 mod windows;
 
 use std::fs::{self, File};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
 use crate::device::DiskDevice;
+
+const SECTOR_SIZE: usize = 512;
+const WRITE_BUF_CAPACITY: usize = 256 * 1024; // 256 KB, must be a multiple of SECTOR_SIZE
+
+/// Buffered writer that ensures all writes to the underlying file are
+/// multiples of the sector size (512 bytes).
+///
+/// On macOS, raw character devices (`/dev/rdiskN`) reject writes that are not
+/// sector-aligned with `EINVAL`. The decompression and zero-fill paths can
+/// produce writes of arbitrary size, so this wrapper accumulates them and only
+/// flushes complete sectors to the device.
+///
+/// `Read` and `Seek` flush the write buffer before delegating to the inner file.
+pub struct SectorAlignedWriter {
+    inner: File,
+    buf: Vec<u8>,
+}
+
+impl SectorAlignedWriter {
+    pub fn new(file: File) -> Self {
+        Self {
+            inner: file,
+            buf: Vec::with_capacity(WRITE_BUF_CAPACITY),
+        }
+    }
+
+    /// Write all complete sectors from the buffer to the device.
+    fn flush_sectors(&mut self) -> io::Result<()> {
+        let aligned_len = (self.buf.len() / SECTOR_SIZE) * SECTOR_SIZE;
+        if aligned_len > 0 {
+            self.inner.write_all(&self.buf[..aligned_len])?;
+            self.buf.drain(..aligned_len);
+        }
+        Ok(())
+    }
+
+    /// Flush everything, padding the final partial sector with zeros.
+    fn flush_padded(&mut self) -> io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let remainder = self.buf.len() % SECTOR_SIZE;
+        if remainder != 0 {
+            self.buf.resize(self.buf.len() + (SECTOR_SIZE - remainder), 0);
+        }
+        self.inner.write_all(&self.buf)?;
+        self.buf.clear();
+        Ok(())
+    }
+}
+
+impl Write for SectorAlignedWriter {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        if self.buf.len() >= WRITE_BUF_CAPACITY {
+            self.flush_sectors()?;
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flush_padded()?;
+        self.inner.flush()
+    }
+}
+
+impl Read for SectorAlignedWriter {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.flush_padded()?;
+        self.inner.read(buf)
+    }
+}
+
+impl Seek for SectorAlignedWriter {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.flush_padded()?;
+        self.inner.seek(pos)
+    }
+}
 
 /// Enumerate physical disk devices using platform-specific methods.
 pub fn enumerate_devices() -> Vec<DiskDevice> {

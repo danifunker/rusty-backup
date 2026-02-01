@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 
+use crate::os::SectorAlignedWriter;
 use crate::partition::PartitionSizeOverride;
 use crate::rbformats::reconstruct_disk_from_backup;
 use crate::backup::metadata::BackupMetadata;
@@ -334,7 +335,7 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
 
     // Step 6: Open target
     set_operation(&progress, "Opening target...");
-    let mut target = if config.target_is_device {
+    let target_file = if config.target_is_device {
         log(&progress, LogLevel::Info, format!(
             "Opening device {} for writing...", config.target_path.display()
         ));
@@ -351,6 +352,11 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
                 "failed to create {}", config.target_path.display()
             ))?
     };
+
+    // Wrap in SectorAlignedWriter so that raw device writes (/dev/rdiskN on
+    // macOS) are always multiples of 512 bytes.  For regular image files the
+    // buffering is harmless and adds negligible overhead.
+    let mut target = SectorAlignedWriter::new(target_file);
 
     if is_cancelled(&progress) {
         bail!("restore cancelled");
