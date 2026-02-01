@@ -1,18 +1,23 @@
 use std::collections::HashMap;
+use std::env;
 use std::ffi::c_void;
 use std::fs::File;
 use std::os::windows::io::FromRawHandle;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
+use windows::Win32::Security::{
+    CheckTokenMembership, CreateWellKnownSid, WinBuiltinAdministratorsSid, PSID,
+};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, GetDiskFreeSpaceExW, GetLogicalDriveStringsW, GetVolumeInformationW,
-    FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    OPEN_EXISTING,
+    FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows::Win32::System::IO::DeviceIoControl;
+use windows::Win32::UI::Shell::{ShellExecuteW, SHELLEXECUTEINFOW, SEE_MASK_NOCLOSEPROCESS};
+use windows::Win32::UI::WindowsAndMessaging::SW_SHOW;
 
 use crate::device::{DiskDevice, MountedPartition};
 
@@ -44,6 +49,80 @@ impl Drop for SafeHandle {
 /// Convert a string to null-terminated UTF-16.
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Check if the current process is running with administrator privileges.
+pub fn is_elevated() -> bool {
+    unsafe {
+        let mut admin_sid_buffer = [0u8; 256];
+        let mut admin_sid_size = admin_sid_buffer.len() as u32;
+        let admin_sid = PSID(admin_sid_buffer.as_mut_ptr() as *mut c_void);
+
+        if CreateWellKnownSid(
+            WinBuiltinAdministratorsSid,
+            None,
+            Some(admin_sid),
+            &mut admin_sid_size,
+        )
+        .is_err()
+        {
+            return false;
+        }
+
+        let mut is_member = Default::default();
+        CheckTokenMembership(None, admin_sid, &mut is_member).is_ok() && is_member.as_bool()
+    }
+}
+
+/// Request elevation by relaunching the application with UAC prompt.
+///
+/// This uses `ShellExecuteW` with the "runas" verb to trigger the UAC dialog.
+/// The current process will exit after launching the elevated instance.
+pub fn request_elevation() -> Result<()> {
+    let exe_path = env::current_exe().context("failed to get executable path")?;
+    let exe_path_wide = to_wide(&exe_path.to_string_lossy());
+    let verb = to_wide("runas");
+
+    let mut exec_info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS,
+        hwnd: HWND::default(),
+        lpVerb: PCWSTR(verb.as_ptr()),
+        lpFile: PCWSTR(exe_path_wide.as_ptr()),
+        lpParameters: PCWSTR::null(),
+        lpDirectory: PCWSTR::null(),
+        nShow: SW_SHOW.0,
+        hInstApp: Default::default(),
+        ..Default::default()
+    };
+
+    unsafe {
+        if ShellExecuteExW(&mut exec_info).is_ok() {
+            // Successfully launched elevated instance; exit this one
+            std::process::exit(0);
+        } else {
+            bail!("failed to request elevation - user may have cancelled UAC prompt");
+        }
+    }
+}
+
+/// ShellExecuteExW is actually ShellExecuteW in the windows crate.
+/// This wrapper provides the correct signature.
+unsafe fn ShellExecuteExW(info: *mut SHELLEXECUTEINFOW) -> windows::core::Result<()> {
+    let result = ShellExecuteW(
+        (*info).hwnd,
+        PCWSTR((*info).lpVerb.0),
+        PCWSTR((*info).lpFile.0),
+        PCWSTR((*info).lpParameters.0),
+        PCWSTR((*info).lpDirectory.0),
+        (*info).nShow,
+    );
+    // ShellExecuteW returns > 32 on success
+    if result.0 as usize > 32 {
+        Ok(())
+    } else {
+        Err(windows::core::Error::from(std::io::Error::last_os_error()))
+    }
 }
 
 /// Map STORAGE_BUS_TYPE value to a readable string.
@@ -282,7 +361,24 @@ fn enumerate_volumes() -> Vec<VolumeInfo> {
 /// Probes `\\.\PhysicalDrive0` through `\\.\PhysicalDrive15` using
 /// `CreateFileW` and `DeviceIoControl`, then maps mounted volumes
 /// (drive letters) to their parent physical drives.
+///
+/// In debug builds, if not elevated, automatically requests elevation via UAC.
 pub fn enumerate_devices() -> Vec<DiskDevice> {
+    // In debug builds, check elevation and request if needed
+    #[cfg(debug_assertions)]
+    {
+        if !is_elevated() {
+            log::warn!("Not running with administrator privileges; requesting elevation...");
+            if let Err(e) = request_elevation() {
+                log::error!("Failed to request elevation: {}", e);
+                // Return empty list if elevation failed
+                return Vec::new();
+            }
+            // If we get here, elevation was cancelled or failed
+            return Vec::new();
+        }
+    }
+
     let volumes = enumerate_volumes();
 
     // Group volumes by physical drive number
@@ -345,9 +441,26 @@ pub fn enumerate_devices() -> Vec<DiskDevice> {
 ///
 /// Finds all volumes residing on the target physical drive, locks and
 /// dismounts each one, then opens the physical drive with read+write access.
+///
+/// If access is denied and running in debug mode without elevation,
+/// automatically requests elevation via UAC.
 pub fn open_target_for_writing(path: &Path) -> Result<File> {
     let path_str = path.to_string_lossy();
     let drive_num = drive_number_from_path(&path_str).context("invalid physical drive path")?;
+
+    // In debug builds, check elevation before attempting to open
+    #[cfg(debug_assertions)]
+    {
+        if !is_elevated() {
+            log::warn!(
+                "Attempting to open {} for writing without admin privileges; requesting elevation...",
+                path.display()
+            );
+            request_elevation()?;
+            // If we get here, elevation was cancelled
+            bail!("Administrator privileges required to write to disk devices");
+        }
+    }
 
     // Lock and dismount all volumes on this drive
     let volumes = enumerate_volumes();

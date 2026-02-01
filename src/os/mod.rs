@@ -211,3 +211,39 @@ impl Drop for TempFileGuard {
         }
     }
 }
+
+/// Check if the current process is running with elevated (administrator) privileges.
+///
+/// On Windows, checks for membership in the Administrators group.
+/// On macOS and Linux, checks if running as root (UID 0).
+/// On other platforms, returns false.
+#[allow(unreachable_code)]
+pub fn is_elevated() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        return windows::is_elevated();
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        return unsafe { libc::geteuid() == 0 };
+    }
+    false
+}
+
+/// Request elevation by relaunching the application with administrator privileges.
+///
+/// On Windows, uses `ShellExecuteW` with the "runas" verb to trigger the UAC dialog.
+/// On macOS, could use Authorization Services (not yet implemented).
+/// On Linux, could use pkexec or sudo (not yet implemented).
+///
+/// This function will exit the current process if elevation is successful.
+pub fn request_elevation() -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        windows::request_elevation()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        anyhow::bail!("elevation request not implemented on this platform")
+    }
+}
