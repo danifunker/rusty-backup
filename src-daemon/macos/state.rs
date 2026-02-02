@@ -36,48 +36,16 @@ impl DaemonState {
     
     /// Handle an XPC message (dictionary).
     ///
-    /// The message is expected to contain a JSON-encoded request in the "request" key.
-    /// Returns an XPC dictionary with a JSON-encoded response in the "response" key.
-    pub unsafe fn handle_xpc_message(&mut self, message: xpc_sys::objects::xpc_object_t) -> xpc_sys::objects::xpc_object_t {
-        use xpc_sys::rs_syscalls::*;
-        
-        // Extract JSON request string from XPC dictionary
-        let request_key = b"request\0";
-        let request_str_obj = xpc_dictionary_get_value(message, request_key.as_ptr() as *const i8);
-        
-        if request_str_obj.is_null() || xpc_get_type(request_str_obj) != XPC_TYPE_STRING {
-            return create_error_response("Missing or invalid 'request' field");
-        }
-        
-        let request_cstr = xpc_string_get_string_ptr(request_str_obj);
-        let request_str = std::ffi::CStr::from_ptr(request_cstr).to_str().unwrap_or("");
-        
-        // Deserialize request
-        let request: DaemonRequest = match serde_json::from_str(request_str) {
-            Ok(req) => req,
-            Err(e) => return create_error_response(&format!("Invalid request JSON: {}", e)),
-        };
-        
-        // Handle request
-        let response = self.handle_request(request);
-        
-        // Serialize response
-        let response_json = match serde_json::to_string(&response) {
-            Ok(json) => json,
-            Err(e) => return create_error_response(&format!("Failed to serialize response: {}", e)),
-        };
-        
-        // Create XPC response dictionary
-        let reply = xpc_dictionary_create(std::ptr::null(), std::ptr::null_mut(), 0);
-        let response_key = b"response\0";
-        let response_str = xpc_string_create(response_json.as_ptr() as *const i8);
-        xpc_dictionary_set_value(reply, response_key.as_ptr() as *const i8, response_str);
-        
-        reply
+    /// Handle an incoming XPC message and return a response.
+    /// TODO: Complete XPC integration - this is a stub for now.
+    #[allow(dead_code)]
+    pub unsafe fn handle_xpc_message(&mut self, _message: xpc_sys::xpc_object_t) -> xpc_sys::xpc_object_t {
+        unimplemented!("XPC message handling - see main.rs TODO")
     }
     
-    /// Handle a daemon request.
-    fn handle_request(&mut self, request: DaemonRequest) -> DaemonResponse {
+    /// Handle a daemon request (deserialized from XPC message).
+    /// This is the core business logic that will be called once XPC integration is complete.
+    pub fn handle_request(&mut self, request: DaemonRequest) -> DaemonResponse {
         match request {
             DaemonRequest::GetVersion => self.get_version(),
             DaemonRequest::OpenDiskRead { path } => self.open_disk_read(&path),
@@ -265,22 +233,4 @@ fn write_progress_to_file(progress: &HashMap<u64, ProgressInfo>) -> Result<(), s
     Ok(())
 }
 
-/// Helper to create an error response XPC dictionary.
-unsafe fn create_error_response(message: &str) -> xpc_sys::objects::xpc_object_t {
-    use xpc_sys::rs_syscalls::*;
-    
-    let response = DaemonResponse::Error {
-        message: message.to_string(),
-    };
-    let response_json = serde_json::to_string(&response).unwrap();
-    
-    let reply = xpc_dictionary_create(std::ptr::null(), std::ptr::null_mut(), 0);
-    let response_key = b"response\0";
-    let response_str = xpc_string_create(response_json.as_ptr() as *const i8);
-    xpc_dictionary_set_value(reply, response_key.as_ptr() as *const i8, response_str);
-    
-    reply
-}
-
-// XPC type constants
-const XPC_TYPE_STRING: *const std::ffi::c_void = 3 as *const std::ffi::c_void;
+// Note: XPC helper functions removed - will be re-added when XPC integration is complete
