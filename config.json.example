@@ -1,0 +1,6 @@
+{
+  "update_check": {
+    "enabled": true,
+    "repository_url": "https://github.com/dani/rusty-backup"
+  }
+}

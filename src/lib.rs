@@ -6,3 +6,4 @@ pub mod os;
 pub mod partition;
 pub mod rbformats;
 pub mod restore;
+pub mod update;

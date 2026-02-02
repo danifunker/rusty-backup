@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Rusty Backup
+Comment=Backup and restore vintage computer hard disk images
+Exec=rusty-backup
+Icon=rusty-backup
+Categories=Utility;System;Archiving;
+Terminal=false
+StartupNotify=true
+Keywords=backup;restore;disk;image;vintage;retro;
