@@ -5,6 +5,7 @@ mod progress;
 mod restore_tab;
 mod settings_dialog;
 
+use std::path::PathBuf;
 use backup_tab::BackupTab;
 use inspect_tab::InspectTab;
 use progress::{LogPanel, ProgressState};
@@ -37,6 +38,8 @@ pub struct RustyBackupApp {
     update_info: Arc<Mutex<Option<UpdateInfo>>>,
     update_dismissed: bool,
     settings_dialog: SettingsDialog,
+    /// Shared backup folder path between restore and inspect tabs
+    loaded_backup_folder: Option<PathBuf>,
 }
 
 impl Default for RustyBackupApp {
@@ -86,6 +89,7 @@ impl Default for RustyBackupApp {
             update_info,
             update_dismissed: false,
             settings_dialog: SettingsDialog::default(),
+            loaded_backup_folder: None,
         }
     }
 }
@@ -108,6 +112,17 @@ impl eframe::App for RustyBackupApp {
                     // Version display
                     ui.label(format!("v{}", env!("APP_VERSION")));
                     ui.separator();
+                    
+                    // Close Backup button (if backup loaded)
+                    if self.loaded_backup_folder.is_some() {
+                        if ui.button("Close Backup").clicked() {
+                            self.loaded_backup_folder = None;
+                            self.restore_tab.clear_backup();
+                            self.inspect_tab.clear_backup();
+                            self.log_panel.info("Backup closed");
+                        }
+                        ui.separator();
+                    }
                     
                     if ui.button("Settings").clicked() {
                         self.settings_dialog.open_dialog();
@@ -168,10 +183,30 @@ impl eframe::App for RustyBackupApp {
                     .show(ui, &self.devices, &mut self.log_panel, &mut self.progress);
             }
             Tab::Restore => {
+                // Share backup folder between tabs
+                if let Some(new_backup) = self.restore_tab.get_loaded_backup() {
+                    if self.loaded_backup_folder.as_ref() != Some(&new_backup) {
+                        self.loaded_backup_folder = Some(new_backup.clone());
+                        self.inspect_tab.load_backup(&new_backup);
+                    }
+                } else if self.loaded_backup_folder.is_some() && !self.restore_tab.has_backup() {
+                    self.restore_tab.load_backup(self.loaded_backup_folder.as_ref().unwrap());
+                }
+                
                 self.restore_tab
                     .show(ui, &self.devices, &mut self.log_panel, &mut self.progress);
             }
             Tab::Inspect => {
+                // Share backup folder between tabs
+                if let Some(new_backup) = self.inspect_tab.get_loaded_backup() {
+                    if self.loaded_backup_folder.as_ref() != Some(&new_backup) {
+                        self.loaded_backup_folder = Some(new_backup.clone());
+                        self.restore_tab.load_backup(&new_backup);
+                    }
+                } else if self.loaded_backup_folder.is_some() && !self.inspect_tab.has_backup() {
+                    self.inspect_tab.load_backup(self.loaded_backup_folder.as_ref().unwrap());
+                }
+                
                 self.inspect_tab
                     .show(ui, &self.devices, &mut self.log_panel);
             }

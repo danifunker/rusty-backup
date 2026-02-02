@@ -105,6 +105,31 @@ impl RestoreTab {
         self.restore_running
     }
 
+    pub fn get_loaded_backup(&self) -> Option<PathBuf> {
+        self.backup_folder.clone()
+    }
+
+    pub fn has_backup(&self) -> bool {
+        self.backup_folder.is_some()
+    }
+
+    pub fn load_backup(&mut self, path: &PathBuf) {
+        if self.backup_folder.as_ref() != Some(path) {
+            self.backup_folder = Some(path.clone());
+            // Force reload on next show
+            self.prev_backup_folder = None;
+        }
+    }
+
+    pub fn clear_backup(&mut self) {
+        self.backup_folder = None;
+        self.backup_metadata = None;
+        self.mbr_bytes = None;
+        self.metadata_error = None;
+        self.prev_backup_folder = None;
+        self.partition_configs.clear();
+    }
+
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,

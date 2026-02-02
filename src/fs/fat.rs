@@ -373,8 +373,20 @@ impl<R: Read + Seek> FatFilesystem<R> {
             let offset = self.cluster_offset(cluster);
             self.reader.seek(SeekFrom::Start(offset))?;
             let mut buf = vec![0u8; cluster_size];
-            self.reader.read_exact(&mut buf)?;
-            data.extend_from_slice(&buf);
+            
+            // Use read() instead of read_exact() to handle partial reads at EOF
+            match self.reader.read(&mut buf) {
+                Ok(n) if n > 0 => {
+                    data.extend_from_slice(&buf[..n]);
+                    // If we got a short read, we're probably at EOF
+                    if n < cluster_size {
+                        break;
+                    }
+                }
+                Ok(0) => break, // EOF
+                Ok(_) => break, // Shouldn't happen, but handle partial reads
+                Err(e) => return Err(e.into()),
+            }
             count += 1;
 
             match self.next_cluster(cluster)? {

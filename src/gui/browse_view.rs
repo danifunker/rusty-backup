@@ -206,7 +206,6 @@ impl BrowseView {
                 let header = egui::CollapsingHeader::new(&entry.name)
                     .id_salt(&path)
                     .default_open(path == "/")
-                    .open(if is_expanded { Some(true) } else { None })
                     .show(ui, |ui| {
                         if let Some(children) = self.directory_cache.get(&path).cloned() {
                             for child in &children {
@@ -217,14 +216,17 @@ impl BrowseView {
                         }
                     });
 
+                // Track expansion state after the header is shown
+                let is_now_open = header.body_returned.is_some();
+                
                 // Load directory contents on first expansion
-                if header.fully_open() && !has_children {
-                    self.load_directory(entry);
-                    self.expanded_paths.insert(path);
-                }
-
-                if !header.fully_open() {
-                    self.expanded_paths.remove(&entry.path);
+                if is_now_open {
+                    if !has_children {
+                        self.load_directory(entry);
+                    }
+                    self.expanded_paths.insert(path.clone());
+                } else {
+                    self.expanded_paths.remove(&path);
                 }
             }
             EntryType::File => {

@@ -1,3 +1,4 @@
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -118,6 +119,33 @@ impl Default for InspectTab {
 }
 
 impl InspectTab {
+    pub fn get_loaded_backup(&self) -> Option<PathBuf> {
+        self.backup_folder_path.clone()
+    }
+
+    pub fn has_backup(&self) -> bool {
+        self.backup_folder_path.is_some()
+    }
+
+    pub fn load_backup(&mut self, path: &PathBuf) {
+        if self.backup_folder_path.as_ref() != Some(path) {
+            self.backup_folder_path = Some(path.clone());
+            // Force reload on next show
+            self.prev_backup_path = None;
+        }
+    }
+
+    pub fn clear_backup(&mut self) {
+        self.backup_folder_path = None;
+        self.backup_metadata = None;
+        self.prev_backup_path = None;
+        self.partitions.clear();
+        self.partition_table = None;
+        self.alignment = None;
+        self.browse_view.close();
+        self.partition_min_sizes.clear();
+    }
+
     pub fn show(&mut self, ui: &mut egui::Ui, devices: &[DiskDevice], log: &mut LogPanel) {
         ui.heading("Inspect Disk / Image");
         ui.add_space(8.0);
