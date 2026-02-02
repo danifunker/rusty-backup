@@ -45,7 +45,7 @@ impl Default for UpdateConfig {
         Self {
             update_check: UpdateCheckConfig {
                 enabled: true,
-                repository_url: "https://github.com/dani/rusty-backup".to_string(),
+                repository_url: "https://github.com/danifunker/rusty-backup".to_string(),
             },
         }
     }
