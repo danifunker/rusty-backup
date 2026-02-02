@@ -45,6 +45,53 @@ impl SettingsDialog {
                     ui.separator();
                     ui.add_space(10.0);
 
+                    // macOS daemon management
+                    #[cfg(target_os = "macos")]
+                    {
+                        ui.heading("Privileged Helper Daemon");
+                        ui.add_space(10.0);
+                        
+                        // Check daemon status
+                        if let Ok(access) = rusty_backup::privileged::create_disk_access() {
+                            if let Ok(status) = access.check_status() {
+                                match status {
+                                    rusty_backup::privileged::AccessStatus::Ready => {
+                                        ui.label(egui::RichText::new("✓ Daemon is installed and running").color(egui::Color32::GREEN));
+                                    }
+                                    rusty_backup::privileged::AccessStatus::DaemonNotInstalled => {
+                                        ui.label(egui::RichText::new("✗ Daemon is not installed").color(egui::Color32::RED));
+                                    }
+                                    rusty_backup::privileged::AccessStatus::DaemonNeedsApproval => {
+                                        ui.label(egui::RichText::new("⚠ Daemon needs approval in System Settings").color(egui::Color32::YELLOW));
+                                    }
+                                    rusty_backup::privileged::AccessStatus::DaemonOutdated { ref current } => {
+                                        ui.label(egui::RichText::new(format!("⚠ Daemon is outdated (version: {})", current)).color(egui::Color32::YELLOW));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        
+                        ui.add_space(10.0);
+                        
+                        if ui.button("Uninstall Daemon").clicked() {
+                            match rusty_backup::os::macos::uninstall_daemon() {
+                                Ok(()) => {
+                                    self.status_message = Some("Daemon uninstalled successfully".to_string());
+                                }
+                                Err(e) => {
+                                    self.status_message = Some(format!("Error uninstalling daemon: {}", e));
+                                }
+                            }
+                        }
+                        
+                        ui.label("Note: Uninstalling will require your administrator password.");
+                        ui.add_space(20.0);
+                        
+                        ui.separator();
+                        ui.add_space(10.0);
+                    }
+
                     ui.heading("Update Check");
                     ui.add_space(10.0);
 
