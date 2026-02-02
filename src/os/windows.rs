@@ -13,7 +13,8 @@ use windows::Win32::Security::{
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, GetDiskFreeSpaceExW, GetLogicalDriveStringsW, GetVolumeInformationW,
-    FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_NO_BUFFERING, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_EXISTING,
 };
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::UI::Shell::{ShellExecuteW, SHELLEXECUTEINFOW, SEE_MASK_NOCLOSEPROCESS};
@@ -161,6 +162,15 @@ fn drive_number_from_path(path: &str) -> Option<u32> {
 /// Open a device handle with the given access rights. Returns None if the
 /// device does not exist or access is denied.
 fn open_device(device_path: &str, access: u32) -> Option<SafeHandle> {
+    open_device_with_flags(device_path, access, FILE_FLAGS_AND_ATTRIBUTES(0))
+}
+
+/// Open a device handle with custom flags (for raw disk I/O).
+fn open_device_with_flags(
+    device_path: &str,
+    access: u32,
+    flags: FILE_FLAGS_AND_ATTRIBUTES,
+) -> Option<SafeHandle> {
     let wide = to_wide(device_path);
     unsafe {
         CreateFileW(
@@ -169,7 +179,7 @@ fn open_device(device_path: &str, access: u32) -> Option<SafeHandle> {
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
             OPEN_EXISTING,
-            FILE_FLAGS_AND_ATTRIBUTES(0),
+            flags,
             None,
         )
         .ok()
@@ -513,6 +523,61 @@ pub fn open_target_for_writing(path: &Path) -> Result<File> {
 
     // Convert HANDLE to File (takes ownership — do NOT also wrap in SafeHandle)
     Ok(unsafe { File::from_raw_handle(handle.0 as *mut c_void) })
+}
+
+/// Open a source device for reading (backup operation).
+///
+/// For physical drives, uses FILE_FLAG_NO_BUFFERING which is required for
+/// reliable raw disk I/O on Windows. Without this flag, reads from physical
+/// drives can fail with "Incorrect function" (error 1).
+///
+/// For regular files (image files), opens normally without buffering flags.
+pub fn open_source_for_reading(path: &Path) -> Result<crate::os::ElevatedSource> {
+    let path_str = path.to_string_lossy();
+    let is_physical_drive = path_str.starts_with(r"\\.\PhysicalDrive");
+
+    if !is_physical_drive {
+        // Regular file - just open normally
+        let file = File::open(path)
+            .with_context(|| format!("cannot open {}", path.display()))?;
+        return Ok(crate::os::ElevatedSource {
+            file,
+            temp_path: None,
+        });
+    }
+
+    // Physical drive - use FILE_FLAG_NO_BUFFERING for raw disk access
+    #[cfg(debug_assertions)]
+    {
+        if !is_elevated() {
+            log::warn!(
+                "Attempting to open {} without admin privileges; requesting elevation...",
+                path.display()
+            );
+            request_elevation()?;
+            bail!("Administrator privileges required to read disk devices");
+        }
+    }
+
+    let wide = to_wide(&path_str);
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            GENERIC_READ_ACCESS,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_NO_BUFFERING,
+            None,
+        )
+    }
+    .with_context(|| format!("cannot open {} for reading", path.display()))?;
+
+    let file = unsafe { File::from_raw_handle(handle.0 as *mut c_void) };
+    Ok(crate::os::ElevatedSource {
+        file,
+        temp_path: None,
+    })
 }
 
 #[cfg(test)]

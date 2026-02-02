@@ -121,6 +121,9 @@ pub fn enumerate_devices() -> Vec<DiskDevice> {
 /// the user for administrator credentials via the native macOS authentication
 /// dialog and create a temporary raw device image using `dd`.
 ///
+/// On Windows, physical drives are opened with FILE_FLAG_NO_BUFFERING for
+/// proper raw disk I/O support.
+///
 /// Returns an `ElevatedSource` containing the opened file. Any temporary files
 /// are automatically cleaned up when the `ElevatedSource` is dropped.
 pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
@@ -128,7 +131,11 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
     {
         macos::open_source_for_reading(path)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::open_source_for_reading(path)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let file = File::open(path)?;
         Ok(ElevatedSource {
