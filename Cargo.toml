@@ -3,7 +3,10 @@ name = "rusty-backup"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0"
+authors = ["Dani <dani@example.com>"]
 description = "Cross-platform GUI for backing up and restoring vintage computer hard disk images"
+homepage = "https://github.com/dani/rusty-backup"
+repository = "https://github.com/dani/rusty-backup"
 resolver = "2"
 
 [dependencies]
@@ -94,4 +97,8 @@ assets = [
 [package.metadata.generate-rpm.requires]
 gtk3 = "*"
 openssl = "*"
+
+# Arch package metadata
+[package.metadata.aur]
+depends = ["gtk3", "openssl"]
 
