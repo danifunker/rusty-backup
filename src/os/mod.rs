@@ -1,11 +1,11 @@
 #[cfg(target_os = "macos")]
-mod macos;
+pub mod macos;
 
 #[cfg(target_os = "linux")]
-mod linux;
+pub mod linux;
 
 #[cfg(target_os = "windows")]
-mod windows;
+pub mod windows;
 
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};

@@ -558,3 +558,51 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
         temp_path: Some(temp_path),
     })
 }
+
+// ---------------------------------------------------------------------------
+// Privileged disk access implementation (macOS)
+// ---------------------------------------------------------------------------
+
+use crate::privileged::{AccessStatus, DiskHandle, PrivilegedDiskAccess};
+
+/// macOS implementation of privileged disk access.
+///
+/// Uses SMAppService daemon with XPC communication for privileged operations.
+/// The daemon runs as root and handles all disk I/O at the sector level.
+pub struct MacOSDiskAccess {
+    // TODO: XPC connection handle
+}
+
+impl MacOSDiskAccess {
+    pub fn new() -> Result<Self> {
+        Ok(Self {})
+    }
+}
+
+impl PrivilegedDiskAccess for MacOSDiskAccess {
+    fn check_status(&self) -> Result<AccessStatus> {
+        // TODO: Check daemon installation and version
+        // For now, return not installed
+        Ok(AccessStatus::DaemonNotInstalled)
+    }
+
+    fn open_disk_read(&mut self, _path: &Path) -> Result<DiskHandle> {
+        anyhow::bail!("macOS privileged disk access not yet implemented")
+    }
+
+    fn open_disk_write(&mut self, _path: &Path) -> Result<DiskHandle> {
+        anyhow::bail!("macOS privileged disk access not yet implemented")
+    }
+
+    fn read_sectors(&mut self, _handle: DiskHandle, _lba: u64, _count: u32) -> Result<Vec<u8>> {
+        anyhow::bail!("macOS privileged disk access not yet implemented")
+    }
+
+    fn write_sectors(&mut self, _handle: DiskHandle, _lba: u64, _data: &[u8]) -> Result<()> {
+        anyhow::bail!("macOS privileged disk access not yet implemented")
+    }
+
+    fn close_disk(&mut self, _handle: DiskHandle) -> Result<()> {
+        anyhow::bail!("macOS privileged disk access not yet implemented")
+    }
+}

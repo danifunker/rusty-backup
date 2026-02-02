@@ -4,6 +4,7 @@ pub mod error;
 pub mod fs;
 pub mod os;
 pub mod partition;
+pub mod privileged;
 pub mod rbformats;
 pub mod restore;
 pub mod update;

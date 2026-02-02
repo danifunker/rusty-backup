@@ -637,3 +637,56 @@ mod tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Privileged disk access implementation (Windows)
+// ---------------------------------------------------------------------------
+
+use crate::privileged::{AccessStatus, DiskHandle, PrivilegedDiskAccess};
+
+/// Windows implementation of privileged disk access.
+///
+/// Uses direct file I/O. The app should be launched with UAC elevation
+/// (which it already requests via manifest).
+pub struct WindowsDiskAccess {
+    // TODO: Track open handles
+}
+
+impl WindowsDiskAccess {
+    pub fn new() -> Result<Self> {
+        Ok(Self {})
+    }
+}
+
+impl PrivilegedDiskAccess for WindowsDiskAccess {
+    fn check_status(&self) -> Result<AccessStatus> {
+        // Check if we're running as administrator
+        if is_admin() {
+            Ok(AccessStatus::Ready)
+        } else {
+            // Windows already prompts for UAC at startup
+            // If we're here and not admin, something went wrong
+            anyhow::bail!("Application must be run as administrator")
+        }
+    }
+
+    fn open_disk_read(&mut self, _path: &Path) -> Result<DiskHandle> {
+        anyhow::bail!("Windows privileged disk access not yet implemented")
+    }
+
+    fn open_disk_write(&mut self, _path: &Path) -> Result<DiskHandle> {
+        anyhow::bail!("Windows privileged disk access not yet implemented")
+    }
+
+    fn read_sectors(&mut self, _handle: DiskHandle, _lba: u64, _count: u32) -> Result<Vec<u8>> {
+        anyhow::bail!("Windows privileged disk access not yet implemented")
+    }
+
+    fn write_sectors(&mut self, _handle: DiskHandle, _lba: u64, _data: &[u8]) -> Result<()> {
+        anyhow::bail!("Windows privileged disk access not yet implemented")
+    }
+
+    fn close_disk(&mut self, _handle: DiskHandle) -> Result<()> {
+        anyhow::bail!("Windows privileged disk access not yet implemented")
+    }
+}
