@@ -2,5 +2,7 @@
   "update_check": {
     "enabled": true,
     "repository_url": "https://github.com/danifunker/rusty-backup"
-  }
+  },
+  "chdman_path": null
 }
+

@@ -3,11 +3,13 @@ mod browse_view;
 mod inspect_tab;
 mod progress;
 mod restore_tab;
+mod settings_dialog;
 
 use backup_tab::BackupTab;
 use inspect_tab::InspectTab;
 use progress::{LogPanel, ProgressState};
 use restore_tab::RestoreTab;
+use settings_dialog::SettingsDialog;
 
 use rusty_backup::device::{self, DiskDevice};
 use rusty_backup::rbformats::chd::detect_chdman;
@@ -34,6 +36,7 @@ pub struct RustyBackupApp {
     devices: Vec<DiskDevice>,
     update_info: Arc<Mutex<Option<UpdateInfo>>>,
     update_dismissed: bool,
+    settings_dialog: SettingsDialog,
 }
 
 impl Default for RustyBackupApp {
@@ -82,6 +85,7 @@ impl Default for RustyBackupApp {
             devices,
             update_info,
             update_dismissed: false,
+            settings_dialog: SettingsDialog::default(),
         }
     }
 }
@@ -103,6 +107,11 @@ impl eframe::App for RustyBackupApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Version display
                     ui.label(format!("v{}", env!("APP_VERSION")));
+                    ui.separator();
+                    
+                    if ui.button("Settings").clicked() {
+                        self.settings_dialog.open_dialog();
+                    }
                     ui.separator();
                     
                     if ui.button("Refresh Devices").clicked() {
@@ -167,5 +176,8 @@ impl eframe::App for RustyBackupApp {
                     .show(ui, &self.devices, &mut self.log_panel);
             }
         });
+
+        // Show settings dialog if open
+        self.settings_dialog.show(ctx);
     }
 }

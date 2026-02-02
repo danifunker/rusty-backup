@@ -7,6 +7,8 @@ use std::path::PathBuf;
 #[derive(Debug, Deserialize, Serialize)]
 pub struct UpdateConfig {
     pub update_check: UpdateCheckConfig,
+    #[serde(default)]
+    pub chdman_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -47,14 +49,37 @@ impl Default for UpdateConfig {
                 enabled: true,
                 repository_url: "https://github.com/danifunker/rusty-backup".to_string(),
             },
+            chdman_path: None,
         }
     }
 }
 
 impl UpdateConfig {
+    /// Get the user config directory path
+    pub fn user_config_dir() -> Option<PathBuf> {
+        if let Some(config_dir) = dirs::config_dir() {
+            let app_config = config_dir.join("rusty-backup");
+            Some(app_config)
+        } else {
+            None
+        }
+    }
+
+    /// Get the user config file path
+    pub fn user_config_path() -> Option<PathBuf> {
+        Self::user_config_dir().map(|dir| dir.join("config.json"))
+    }
+
     /// Load configuration from config.json
     pub fn load() -> Self {
-        // Try to load from current directory first
+        // Try to load from user config directory first (highest priority)
+        if let Some(user_config) = Self::user_config_path() {
+            if let Ok(config) = Self::load_from_path(&user_config) {
+                return config;
+            }
+        }
+
+        // Try to load from current directory
         if let Ok(config) = Self::load_from_path("config.json") {
             return config;
         }
@@ -71,6 +96,21 @@ impl UpdateConfig {
 
         // Return default if no config found
         Self::default()
+    }
+
+    /// Save configuration to user config directory
+    pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(config_dir) = Self::user_config_dir() {
+            // Create directory if it doesn't exist
+            fs::create_dir_all(&config_dir)?;
+            
+            let config_path = config_dir.join("config.json");
+            let json = serde_json::to_string_pretty(self)?;
+            fs::write(config_path, json)?;
+            Ok(())
+        } else {
+            Err("Could not determine user config directory".into())
+        }
     }
 
     fn load_from_path(path: impl Into<PathBuf>) -> Result<Self, Box<dyn std::error::Error>> {

@@ -165,7 +165,10 @@ pub fn decompress_to_writer(
             ));
 
             log_cb(&format!("Extracting CHD: {}", data_path.display()));
-            let output = Command::new("chdman")
+            let chdman_cmd = crate::update::UpdateConfig::load()
+                .chdman_path
+                .unwrap_or_else(|| "chdman".to_string());
+            let output = Command::new(&chdman_cmd)
                 .arg("extractraw")
                 .arg("-i")
                 .arg(data_path)

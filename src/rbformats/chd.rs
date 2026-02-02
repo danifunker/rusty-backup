@@ -5,11 +5,20 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
+use crate::update::UpdateConfig;
 use super::{file_name, output_path, CHUNK_SIZE};
 
-/// Detect whether `chdman` is available on PATH.
+/// Get the chdman command name or path to use (from config or default to PATH)
+fn get_chdman_command() -> String {
+    UpdateConfig::load()
+        .chdman_path
+        .unwrap_or_else(|| "chdman".to_string())
+}
+
+/// Detect whether `chdman` is available on PATH or at configured path.
 pub fn detect_chdman() -> bool {
-    Command::new("chdman")
+    let cmd = get_chdman_command();
+    Command::new(&cmd)
         .arg("help")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -102,7 +111,8 @@ pub(crate) fn compress_chd(
         "Running chdman createraw → {}",
         chd_path.display()
     ));
-    let output = Command::new("chdman")
+    let chdman_cmd = get_chdman_command();
+    let output = Command::new(&chdman_cmd)
         .arg("createraw")
         .arg("-i")
         .arg(&temp_path)
