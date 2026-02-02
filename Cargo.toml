@@ -54,3 +54,44 @@ winres = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Debian package metadata
+[package.metadata.deb]
+maintainer = "Dani <dani@example.com>"
+copyright = "2024-2026, Dani <dani@example.com>"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+Rusty Backup is a cross-platform GUI application for backing up and restoring \
+vintage computer hard disk images with partition resizing and CHD compression. \
+Target users are retro computing enthusiasts backing up CF/SD cards from DOS, \
+Windows 9x, and early Linux systems."""
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/rusty-backup", "usr/bin/", "755"],
+    ["rusty-backup.desktop", "usr/share/applications/", "644"],
+    ["assets/icons/icon-256.png", "usr/share/icons/hicolor/256x256/apps/rusty-backup.png", "644"],
+    ["assets/icons/icon-128.png", "usr/share/icons/hicolor/128x128/apps/rusty-backup.png", "644"],
+    ["assets/icons/icon-64.png", "usr/share/icons/hicolor/64x64/apps/rusty-backup.png", "644"],
+    ["assets/icons/icon-48.png", "usr/share/icons/hicolor/48x48/apps/rusty-backup.png", "644"],
+    ["assets/icons/icon-32.png", "usr/share/icons/hicolor/32x32/apps/rusty-backup.png", "644"],
+    ["assets/icons/icon-16.png", "usr/share/icons/hicolor/16x16/apps/rusty-backup.png", "644"],
+]
+depends = "$auto, libgtk-3-0, libssl3"
+
+# RPM package metadata
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/rusty-backup", dest = "/usr/bin/rusty-backup", mode = "755" },
+    { source = "rusty-backup.desktop", dest = "/usr/share/applications/rusty-backup.desktop", mode = "644" },
+    { source = "assets/icons/icon-256.png", dest = "/usr/share/icons/hicolor/256x256/apps/rusty-backup.png", mode = "644" },
+    { source = "assets/icons/icon-128.png", dest = "/usr/share/icons/hicolor/128x128/apps/rusty-backup.png", mode = "644" },
+    { source = "assets/icons/icon-64.png", dest = "/usr/share/icons/hicolor/64x64/apps/rusty-backup.png", mode = "644" },
+    { source = "assets/icons/icon-48.png", dest = "/usr/share/icons/hicolor/48x48/apps/rusty-backup.png", mode = "644" },
+    { source = "assets/icons/icon-32.png", dest = "/usr/share/icons/hicolor/32x32/apps/rusty-backup.png", mode = "644" },
+    { source = "assets/icons/icon-16.png", dest = "/usr/share/icons/hicolor/16x16/apps/rusty-backup.png", mode = "644" },
+]
+[package.metadata.generate-rpm.requires]
+gtk3 = "*"
+openssl = "*"
+

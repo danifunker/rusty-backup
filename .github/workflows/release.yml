@@ -194,12 +194,16 @@ jobs:
   build-linux-appimage:
     name: Build Linux AppImage
     needs: generate-version
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runs-on }}
     strategy:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
             arch: x64
+            runs-on: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+            runs-on: [self-hosted, linux, ARM64]
     steps:
       - uses: actions/checkout@v4
 
@@ -208,7 +212,8 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install dependencies
+      - name: Install dependencies (GitHub-hosted only)
+        if: ${{ !contains(matrix.runs-on, 'self-hosted') }}
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libssl-dev pkg-config
@@ -238,12 +243,20 @@ jobs:
       
       - name: Download AppImage tools
         run: |
-          wget https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
-          chmod +x appimagetool-x86_64.AppImage
-          # Extract appimagetool to avoid FUSE requirement
-          ./appimagetool-x86_64.AppImage --appimage-extract
-          mv squashfs-root/AppRun squashfs-root/appimagetool
-          chmod +x squashfs-root/appimagetool
+          if [ "${{ matrix.arch }}" = "x64" ]; then
+            wget https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+            chmod +x appimagetool-x86_64.AppImage
+            # Extract appimagetool to avoid FUSE requirement
+            ./appimagetool-x86_64.AppImage --appimage-extract
+            mv squashfs-root/AppRun squashfs-root/appimagetool
+            chmod +x squashfs-root/appimagetool
+          elif [ "${{ matrix.arch }}" = "arm64" ]; then
+            wget https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-aarch64.AppImage
+            chmod +x appimagetool-aarch64.AppImage
+            ./appimagetool-aarch64.AppImage --appimage-extract
+            mv squashfs-root/AppRun squashfs-root/appimagetool
+            chmod +x squashfs-root/appimagetool
+          fi
       
       - name: Create AppImage
         run: |
@@ -288,9 +301,122 @@ jobs:
           name: RustyBackup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-appimage
           path: RustyBackup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.AppImage
 
+  build-linux-packages:
+    name: Build Linux Packages
+    needs: generate-version
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: x64
+            runs-on: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+            runs-on: [self-hosted, linux, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install dependencies (GitHub-hosted only)
+        if: ${{ !contains(matrix.runs-on, 'self-hosted') }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libssl-dev pkg-config dpkg-dev liblzma-dev rpm libarchive-tools zstd
+
+      - name: Install cargo packaging tools
+        run: |
+          cargo install cargo-deb || true
+          cargo install cargo-generate-rpm || true
+          cargo install cargo-aur || true
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        env:
+          RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build Debian package
+        run: |
+          cargo deb --target ${{ matrix.target }} --no-build
+          mv target/${{ matrix.target }}/debian/*.deb RustyBackup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.deb
+
+      - name: Build RPM package
+        run: |
+          cargo generate-rpm --target ${{ matrix.target }}
+          mv target/${{ matrix.target }}/generate-rpm/*.rpm RustyBackup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.rpm
+
+      - name: Build Arch package
+        run: |
+          cargo aur
+          # cargo-aur generates PKGBUILD, build with makepkg equivalent
+          mkdir -p arch-build
+          cp target/release/rusty-backup arch-build/
+          cp rusty-backup.desktop arch-build/
+          cp -r assets arch-build/
+          cd arch-build
+          
+          # Create a simple package structure
+          mkdir -p pkg/usr/bin
+          mkdir -p pkg/usr/share/applications
+          mkdir -p pkg/usr/share/icons/hicolor/{16x16,32x32,48x48,64x64,128x128,256x256}/apps
+          
+          cp rusty-backup pkg/usr/bin/
+          chmod 755 pkg/usr/bin/rusty-backup
+          cp rusty-backup.desktop pkg/usr/share/applications/
+          cp assets/icons/icon-16.png pkg/usr/share/icons/hicolor/16x16/apps/rusty-backup.png
+          cp assets/icons/icon-32.png pkg/usr/share/icons/hicolor/32x32/apps/rusty-backup.png
+          cp assets/icons/icon-48.png pkg/usr/share/icons/hicolor/48x48/apps/rusty-backup.png
+          cp assets/icons/icon-64.png pkg/usr/share/icons/hicolor/64x64/apps/rusty-backup.png
+          cp assets/icons/icon-128.png pkg/usr/share/icons/hicolor/128x128/apps/rusty-backup.png
+          cp assets/icons/icon-256.png pkg/usr/share/icons/hicolor/256x256/apps/rusty-backup.png
+          
+          # Create package with tar and zstd
+          cd pkg
+          tar -czf ../../RustyBackup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.pkg.tar.zst *
+
+      - name: Upload Debian package
+        uses: actions/upload-artifact@v4
+        with:
+          name: RustyBackup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-deb
+          path: RustyBackup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.deb
+
+      - name: Upload RPM package
+        uses: actions/upload-artifact@v4
+        with:
+          name: RustyBackup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-rpm
+          path: RustyBackup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.rpm
+
+      - name: Upload Arch package
+        uses: actions/upload-artifact@v4
+        with:
+          name: RustyBackup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-arch
+          path: RustyBackup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.pkg.tar.zst
+
   release:
     name: Create Release
-    needs: [generate-version, build-windows, build-macos, build-linux-appimage]
+    needs: [generate-version, build-windows, build-macos, build-linux-appimage, build-linux-packages]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
