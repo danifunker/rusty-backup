@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Service identifier -->
+    <key>Label</key>
+    <string>com.rustybackup.helper</string>
+    
+    <!-- Program to run -->
+    <key>Program</key>
+    <string>/Library/PrivilegedHelperTools/rusty-backup-helper</string>
+    
+    <!-- Run as root -->
+    <key>UserName</key>
+    <string>root</string>
+    
+    <!-- Keep daemon alive (restart if crashed) -->
+    <key>KeepAlive</key>
+    <true/>
+    
+    <!-- Run on demand when socket is accessed -->
+    <key>RunAtLoad</key>
+    <true/>
+    
+    <!-- Standard output/error logging -->
+    <key>StandardOutPath</key>
+    <string>/var/log/rustybackup-helper.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/rustybackup-helper.log</string>
+    
+    <!-- Socket configuration (launchd will create socket and pass to daemon) -->
+    <key>Sockets</key>
+    <dict>
+        <key>Listener</key>
+        <dict>
+            <key>SockPathName</key>
+            <string>/var/run/rustybackup.sock</string>
+            <key>SockPathMode</key>
+            <integer>384</integer> <!-- 0600 in octal -->
+        </dict>
+    </dict>
+</dict>
+</plist>

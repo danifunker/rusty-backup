@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusty_backup::privileged::protocol::{DaemonRequest, DaemonResponse, ProgressInfo, PROGRESS_FILE};
 
-/// Daemon state for a single XPC connection.
+/// Daemon state for all connections.
 pub struct DaemonState {
     /// Open disk file handles
     open_handles: HashMap<u64, File>,
@@ -34,17 +34,7 @@ impl DaemonState {
         }
     }
     
-    /// Handle an XPC message (dictionary).
-    ///
-    /// Handle an incoming XPC message and return a response.
-    /// TODO: Complete XPC integration - this is a stub for now.
-    #[allow(dead_code)]
-    pub unsafe fn handle_xpc_message(&mut self, _message: xpc_sys::xpc_object_t) -> xpc_sys::xpc_object_t {
-        unimplemented!("XPC message handling - see main.rs TODO")
-    }
-    
-    /// Handle a daemon request (deserialized from XPC message).
-    /// This is the core business logic that will be called once XPC integration is complete.
+    /// Handle a daemon request from the client.
     pub fn handle_request(&mut self, request: DaemonRequest) -> DaemonResponse {
         match request {
             DaemonRequest::GetVersion => self.get_version(),
