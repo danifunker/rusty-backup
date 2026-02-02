@@ -26,7 +26,7 @@ cargo build --release --target "$TARGET" --bin rusty-backup-helper --features ma
 
 # Create app bundle
 APP_NAME="Rusty Backup"
-BUNDLE_NAME="Rusty-Backup.app"
+BUNDLE_NAME="Rusty Backup.app"
 VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
 
 echo "Creating app bundle: $BUNDLE_NAME"

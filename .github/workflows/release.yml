@@ -137,7 +137,7 @@ jobs:
       - name: Create macOS app bundle
         run: |
           APP_NAME="Rusty Backup"
-          BUNDLE_NAME="Rusty-Backup.app"
+          BUNDLE_NAME="Rusty Backup.app"
           VERSION="${{ needs.generate-version.outputs.version }}"
           
           # Create app bundle structure
@@ -195,13 +195,13 @@ jobs:
           codesign --force --deep --sign - "${BUNDLE_NAME}"
           
           # Create DMG
-          hdiutil create -volname "${APP_NAME}" -srcfolder "${BUNDLE_NAME}" -ov -format UDZO "RustyBackup-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg"
+          hdiutil create -volname "${APP_NAME}" -srcfolder "${BUNDLE_NAME}" -ov -format UDZO "Rusty-Backup-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg"
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: RustyBackup-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
-          path: RustyBackup-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg
+          name: Rusty-Backup-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: Rusty-Backup-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg
 
   build-linux-appimage:
     name: Build Linux AppImage
