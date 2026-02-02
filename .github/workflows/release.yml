@@ -128,7 +128,11 @@ jobs:
       - name: Build
         env:
           RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
-        run: cargo build --release --target ${{ matrix.target }}
+        run: |
+          # Build main app
+          cargo build --release --target ${{ matrix.target }}
+          # Build daemon
+          cargo build --release --target ${{ matrix.target }} --bin rusty-backup-helper --features macos-daemon
       
       - name: Create macOS app bundle
         run: |
@@ -139,10 +143,18 @@ jobs:
           # Create app bundle structure
           mkdir -p "${BUNDLE_NAME}/Contents/MacOS"
           mkdir -p "${BUNDLE_NAME}/Contents/Resources"
+          mkdir -p "${BUNDLE_NAME}/Contents/Library/LaunchDaemons"
           
-          # Copy binary
+          # Copy main binary
           cp "target/${{ matrix.target }}/release/rusty-backup" "${BUNDLE_NAME}/Contents/MacOS/"
           chmod +x "${BUNDLE_NAME}/Contents/MacOS/rusty-backup"
+          
+          # Copy daemon binary
+          cp "target/${{ matrix.target }}/release/rusty-backup-helper" "${BUNDLE_NAME}/Contents/Library/LaunchDaemons/"
+          chmod +x "${BUNDLE_NAME}/Contents/Library/LaunchDaemons/rusty-backup-helper"
+          
+          # Copy daemon plist
+          cp "assets/com.rustybackup.helper.plist" "${BUNDLE_NAME}/Contents/Resources/"
           
           # Copy icon if available
           if [ -f "assets/icons/icon.icns" ]; then
