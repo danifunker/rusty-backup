@@ -1,5 +1,6 @@
 mod backup_tab;
 mod browse_view;
+mod elevation_dialog;
 mod inspect_tab;
 mod progress;
 mod restore_tab;
@@ -15,6 +16,9 @@ use settings_dialog::SettingsDialog;
 use rusty_backup::device::{self, DiskDevice};
 use rusty_backup::rbformats::chd::detect_chdman;
 use rusty_backup::update::{check_for_updates, UpdateConfig, UpdateInfo};
+
+#[cfg(target_os = "linux")]
+use elevation_dialog::{ElevationDialog, ElevationAction};
 
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -38,6 +42,8 @@ pub struct RustyBackupApp {
     update_info: Arc<Mutex<Option<UpdateInfo>>>,
     update_dismissed: bool,
     settings_dialog: SettingsDialog,
+    #[cfg(target_os = "linux")]
+    elevation_dialog: ElevationDialog,
     /// Shared backup folder path between restore and inspect tabs
     loaded_backup_folder: Option<PathBuf>,
 }
@@ -53,6 +59,31 @@ impl Default for RustyBackupApp {
         } else {
             log.info(format!("Found {} device(s)", devices.len()));
         }
+
+        // Check privilege status
+        #[cfg(target_os = "linux")]
+        let elevation_dialog = {
+            let mut dialog = ElevationDialog::default();
+            if !devices.is_empty() {
+                // Check if we need elevation
+                if let Ok(access) = rusty_backup::privileged::create_disk_access() {
+                    if let Ok(status) = access.check_status() {
+                        match status {
+                            rusty_backup::privileged::AccessStatus::NeedsElevation => {
+                                log.warn(
+                                    "Running without elevated privileges. Click 'Request Elevation' to access devices.",
+                                );
+                            }
+                            rusty_backup::privileged::AccessStatus::Ready => {
+                                log.info("Running with elevated privileges");
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            dialog
+        };
 
         // Detect chdman availability
         let chdman_available = detect_chdman();
@@ -89,6 +120,8 @@ impl Default for RustyBackupApp {
             update_info,
             update_dismissed: false,
             settings_dialog: SettingsDialog::default(),
+            #[cfg(target_os = "linux")]
+            elevation_dialog,
             loaded_backup_folder: None,
         }
     }
@@ -129,6 +162,25 @@ impl eframe::App for RustyBackupApp {
                     }
                     ui.separator();
                     
+                    // Elevation button (Linux only, when not root)
+                    #[cfg(target_os = "linux")]
+                    {
+                        if let Ok(access) = rusty_backup::privileged::create_disk_access() {
+                            if let Ok(status) = access.check_status() {
+                                if status == rusty_backup::privileged::AccessStatus::NeedsElevation {
+                                    if ui
+                                        .button(egui::RichText::new("⚠ Request Elevation").color(egui::Color32::YELLOW))
+                                        .on_hover_text("Restart with administrator privileges to access disk devices")
+                                        .clicked()
+                                    {
+                                        self.elevation_dialog.open();
+                                    }
+                                    ui.separator();
+                                }
+                            }
+                        }
+                    }
+                    
                     if ui.button("Refresh Devices").clicked() {
                         self.devices = device::enumerate_devices();
                         self.log_panel
@@ -160,6 +212,25 @@ impl eframe::App for RustyBackupApp {
                         });
                     });
                 }
+            }
+        }
+
+        // Elevation dialog (Linux)
+        #[cfg(target_os = "linux")]
+        {
+            let action = self.elevation_dialog.show(ctx);
+            match action {
+                ElevationAction::Elevate => {
+                    self.log_panel.info("Relaunching with elevated privileges...");
+                    if let Err(e) = rusty_backup::os::linux::relaunch_with_elevation() {
+                        self.log_panel.error(format!("Failed to elevate: {}", e));
+                    }
+                    // If relaunch_with_elevation returns, something went wrong
+                }
+                ElevationAction::Cancel => {
+                    self.log_panel.warn("Elevation cancelled. Device operations will fail.");
+                }
+                ElevationAction::None => {}
             }
         }
 
