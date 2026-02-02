@@ -661,7 +661,7 @@ impl WindowsDiskAccess {
 impl PrivilegedDiskAccess for WindowsDiskAccess {
     fn check_status(&self) -> Result<AccessStatus> {
         // Check if we're running as administrator
-        if is_admin() {
+        if is_elevated() {
             Ok(AccessStatus::Ready)
         } else {
             // Windows already prompts for UAC at startup
