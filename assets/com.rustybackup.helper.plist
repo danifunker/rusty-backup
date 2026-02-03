@@ -8,7 +8,7 @@
     
     <!-- Program to run -->
     <key>Program</key>
-    <string>/Library/PrivilegedHelperTools/rusty-backup-helper</string>
+    <string>/Library/PrivilegedHelperTools/com.rustybackup.helper</string>
     
     <!-- Run as root -->
     <key>UserName</key>

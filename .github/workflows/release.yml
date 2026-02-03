@@ -150,8 +150,8 @@ jobs:
           chmod +x "${BUNDLE_NAME}/Contents/MacOS/rusty-backup"
           
           # Copy daemon binary
-          cp "target/${{ matrix.target }}/release/rusty-backup-helper" "${BUNDLE_NAME}/Contents/Library/LaunchDaemons/"
-          chmod +x "${BUNDLE_NAME}/Contents/Library/LaunchDaemons/rusty-backup-helper"
+          cp "target/${{ matrix.target }}/release/rusty-backup-helper" "${BUNDLE_NAME}/Contents/Library/LaunchDaemons/com.rustybackup.helper"
+          chmod +x "${BUNDLE_NAME}/Contents/Library/LaunchDaemons/com.rustybackup.helper"
           
           # Copy daemon plist
           cp "assets/com.rustybackup.helper.plist" "${BUNDLE_NAME}/Contents/Resources/"

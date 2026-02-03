@@ -46,8 +46,8 @@ chmod +x "${BUNDLE_NAME}/Contents/MacOS/rusty-backup"
 
 # Copy daemon binary
 echo "Copying daemon binary..."
-cp "target/$TARGET/release/rusty-backup-helper" "${BUNDLE_NAME}/Contents/Library/LaunchDaemons/"
-chmod +x "${BUNDLE_NAME}/Contents/Library/LaunchDaemons/rusty-backup-helper"
+cp "target/$TARGET/release/rusty-backup-helper" "${BUNDLE_NAME}/Contents/Library/LaunchDaemons/com.rustybackup.helper"
+chmod +x "${BUNDLE_NAME}/Contents/Library/LaunchDaemons/com.rustybackup.helper"
 
 # Copy daemon plist
 echo "Copying daemon plist..."

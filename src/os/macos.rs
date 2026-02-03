@@ -569,7 +569,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 
 const SOCKET_PATH: &str = "/var/run/rustybackup.sock";
-const DAEMON_BINARY: &str = "/Library/PrivilegedHelperTools/rusty-backup-helper";
+const DAEMON_BINARY: &str = "/Library/PrivilegedHelperTools/com.rustybackup.helper";
 const DAEMON_PLIST: &str = "/Library/LaunchDaemons/com.rustybackup.helper.plist";
 const DAEMON_LABEL: &str = "com.rustybackup.helper";
 
@@ -607,17 +607,6 @@ impl MacOSDiskAccess {
         Ok(response)
     }
     
-    /// Check if daemon is installed.
-    fn is_daemon_installed() -> bool {
-        std::path::Path::new(DAEMON_BINARY).exists() &&
-        std::path::Path::new(DAEMON_PLIST).exists()
-    }
-    
-    /// Check if daemon is running.
-    fn is_daemon_running() -> bool {
-        UnixStream::connect(SOCKET_PATH).is_ok()
-    }
-    
     /// Get daemon version (if running).
     fn get_daemon_version(&self) -> Result<String> {
         let response = self.send_request(&DaemonRequest::GetVersion)?;
@@ -633,12 +622,12 @@ impl MacOSDiskAccess {
 impl PrivilegedDiskAccess for MacOSDiskAccess {
     fn check_status(&self) -> Result<AccessStatus> {
         // Check if daemon is installed
-        if !Self::is_daemon_installed() {
+        if !is_daemon_installed() {
             return Ok(AccessStatus::DaemonNotInstalled);
         }
         
         // Check if daemon is running
-        if !Self::is_daemon_running() {
+        if !is_daemon_running() {
             return Ok(AccessStatus::DaemonNeedsApproval);
         }
         
@@ -745,8 +734,10 @@ pub fn install_daemon() -> Result<()> {
     }
     
     // Build installation script (runs with admin privileges)
+    // Unload existing daemon first (if any), then install new one
     let script = format!(
         r#"do shell script "
+        launchctl unload '{}' 2>/dev/null || true && \
         mkdir -p /Library/PrivilegedHelperTools && \
         cp '{}' '{}' && \
         chmod 755 '{}' && \
@@ -755,8 +746,9 @@ pub fn install_daemon() -> Result<()> {
         cp '{}' '{}' && \
         chmod 644 '{}' && \
         chown root:wheel '{}' && \
-        launchctl load '{}'
+        launchctl load -w '{}'
         " with administrator privileges"#,
+        DAEMON_PLIST,
         bundle_daemon.display(),
         DAEMON_BINARY,
         DAEMON_BINARY,
@@ -776,14 +768,33 @@ pub fn install_daemon() -> Result<()> {
     
     if !output.status.success() {
         let error = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Failed to install daemon: {}", error);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        anyhow::bail!("Failed to install daemon.\nError: {}\nOutput: {}", error, stdout);
     }
     
     // Wait a moment for daemon to start
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    
+    // Check if daemon actually started
+    if !is_daemon_running() {
+        // Check log file for errors
+        if let Ok(log) = std::fs::read_to_string("/var/log/rustybackup-helper.log") {
+            let last_lines: Vec<&str> = log.lines().rev().take(10).collect();
+            anyhow::bail!(
+                "Daemon installed but not running. Check System Settings > General > Login Items to approve it.\n\nLast log lines:\n{}",
+                last_lines.into_iter().rev().collect::<Vec<_>>().join("\n")
+            );
+        } else {
+            anyhow::bail!(
+                "Daemon installed but not running. Check System Settings > General > Login Items to approve it."
+            );
+        }
+    }
     
     Ok(())
 }
+
+/// Check if daemon is running.
 
 /// Uninstall the privileged helper daemon.
 ///
@@ -791,10 +802,11 @@ pub fn install_daemon() -> Result<()> {
 pub fn uninstall_daemon() -> Result<()> {
     let script = format!(
         r#"do shell script "
-        launchctl unload '{}' 2>/dev/null || true && \
+        launchctl unload -w '{}' 2>/dev/null || true && \
         rm -f '{}' && \
         rm -f '{}' && \
-        rm -f '/var/run/rustybackup.sock'
+        rm -f '/var/run/rustybackup.sock' && \
+        rm -f '/var/log/rustybackup-helper.log'
         " with administrator privileges"#,
         DAEMON_PLIST,
         DAEMON_BINARY,
@@ -822,7 +834,7 @@ fn get_bundle_daemon_path() -> Result<PathBuf> {
     let bundle_path_str = bundle_path.to_string();
     
     let mut daemon_path = PathBuf::from(bundle_path_str.as_str());
-    daemon_path.push("Contents/Library/LaunchDaemons/rusty-backup-helper");
+    daemon_path.push("Contents/Library/LaunchDaemons/com.rustybackup.helper");
     
     // Fallback: check next to executable (for development)
     if !daemon_path.exists() {
@@ -859,4 +871,15 @@ fn get_bundle_plist_path() -> Result<PathBuf> {
     }
     
     Ok(plist_path)
+}
+
+/// Check if daemon is installed.
+fn is_daemon_installed() -> bool {
+    std::path::Path::new(DAEMON_BINARY).exists() &&
+    std::path::Path::new(DAEMON_PLIST).exists()
+}
+
+/// Check if daemon is running.
+fn is_daemon_running() -> bool {
+    UnixStream::connect(SOCKET_PATH).is_ok()
 }
