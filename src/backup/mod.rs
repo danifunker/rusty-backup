@@ -169,19 +169,22 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
     }
     // Split into file + cleanup guard. The guard auto-deletes the temp file
     // (if any) when it goes out of scope at the end of this function.
-    let (source_file, _temp_guard) = elevated.into_parts();
+    let (mut source_reader, _temp_guard) = elevated.into_parts();
 
     set_operation(&progress, "Reading partition table...");
-    let mut source = BufReader::new(source_file);
 
     // Read the first 512 bytes for MBR export
     let mut mbr_bytes = [0u8; 512];
-    source
+    source_reader
         .read_exact(&mut mbr_bytes)
         .context("cannot read first sector")?;
-    source.seek(SeekFrom::Start(0))?;
+    source_reader.seek(SeekFrom::Start(0))?;
 
-    let table = PartitionTable::detect(&mut source).context("failed to detect partition table")?;
+    // For partition analysis, we need to re-open the source since we can't clone the reader
+    // If we have a temp path, use that; otherwise re-open the original
+    let analysis_path = _temp_guard.path().unwrap_or(&config.source_path);
+    
+    let table = PartitionTable::detect(&mut source_reader).context("failed to detect partition table")?;
     let alignment = partition::detect_alignment(&table);
     let partitions = table.partitions();
 
@@ -201,8 +204,8 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
     }
 
     // Get source size
-    let source_size = source.seek(SeekFrom::End(0))?;
-    source.seek(SeekFrom::Start(0))?;
+    let source_size = source_reader.seek(SeekFrom::End(0))?;
+    source_reader.seek(SeekFrom::Start(0))?;
 
     // Step 2: Create backup folder
     set_operation(&progress, "Creating backup folder...");
@@ -263,13 +266,11 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
 
         // Try compaction first
         let part_offset = part.start_lba * 512;
-        let compact_result = source
-            .get_ref()
-            .try_clone()
+        let compact_result = File::open(analysis_path)
             .ok()
-            .and_then(|clone| {
+            .and_then(|file| {
                 fs::compact_partition_reader(
-                    BufReader::new(clone),
+                    BufReader::new(file),
                     part_offset,
                     part.partition_type_byte,
                 )
@@ -281,13 +282,11 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             compact_sizes.push(Some(result.compacted_size));
         } else {
             // Fall back to trim-based sizing
-            let effective = source
-                .get_ref()
-                .try_clone()
+            let effective = File::open(analysis_path)
                 .ok()
-                .and_then(|clone| {
+                .and_then(|file| {
                     fs::effective_partition_size(
-                        BufReader::new(clone),
+                        BufReader::new(file),
                         part_offset,
                         part.partition_type_byte,
                     )
@@ -445,12 +444,10 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         let compressed_files = if is_compacted {
             // Use compacted reader — create a fresh CompactFatReader
             let part_offset = part.start_lba * 512;
-            let clone = source
-                .get_ref()
-                .try_clone()
-                .context("failed to clone source for compaction")?;
+            let file = File::open(analysis_path)
+                .context("failed to open source for compaction")?;
             let (mut compact_reader, _) =
-                fs::CompactFatReader::new(BufReader::new(clone), part_offset)
+                fs::CompactFatReader::new(BufReader::new(file), part_offset)
                     .map_err(|e| anyhow::anyhow!("compaction failed: {e}"))?;
 
             let progress_log = Arc::clone(&progress);
@@ -474,8 +471,8 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         } else {
             // Fall back to trim-based read
             let part_offset = part.start_lba * 512;
-            source.seek(SeekFrom::Start(part_offset))?;
-            let part_reader = (&mut source).take(image_size);
+            source_reader.seek(SeekFrom::Start(part_offset))?;
+            let part_reader = (&mut source_reader).take(image_size);
             let mut limited = LimitedReader::new(part_reader);
 
             let progress_log = Arc::clone(&progress);

@@ -993,23 +993,32 @@ impl InspectTab {
 
         log.info(format!("Inspecting {}...", path.display()));
 
-        match File::open(&path) {
-            Ok(file) => {
-                let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
-                let mut reader = BufReader::new(file);
+        // Use the OS-specific open function which handles device access via daemon on macOS
+        match rusty_backup::os::open_source_for_reading(&path) {
+            Ok(elevated) => {
+                if let Some(tmp) = elevated.temp_path() {
+                    log.info(format!("Using temporary device image: {}", tmp.display()));
+                }
+                
+                let (mut source, _temp_guard) = elevated.into_parts();
+                let file_size = match source.seek(SeekFrom::End(0)) {
+                    Ok(size) => size,
+                    Err(e) => {
+                        self.last_error = Some(format!("Failed to get file size: {}", e));
+                        return;
+                    }
+                };
+                
+                let mut reader = BufReader::new(source);
 
                 // Detect VHD: check if the last 512 bytes contain the "conectix" cookie
                 let data_size = if file_size >= 512 {
-                    if let Ok(mut f) = File::open(&path) {
-                        if f.seek(SeekFrom::End(-512)).is_ok() {
-                            let mut cookie = [0u8; 8];
-                            if f.read_exact(&mut cookie).is_ok() && &cookie == VHD_COOKIE {
-                                let ds = file_size - 512;
-                                log.info(format!("Detected Fixed VHD (data: {} bytes)", ds,));
-                                Some(ds)
-                            } else {
-                                None
-                            }
+                    if reader.seek(SeekFrom::End(-512)).is_ok() {
+                        let mut cookie = [0u8; 8];
+                        if reader.read_exact(&mut cookie).is_ok() && &cookie == VHD_COOKIE {
+                            let ds = file_size - 512;
+                            log.info(format!("Detected Fixed VHD (data: {} bytes)", ds));
+                            Some(ds)
                         } else {
                             None
                         }
