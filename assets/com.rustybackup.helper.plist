@@ -36,7 +36,7 @@
             <key>SockPathName</key>
             <string>/var/run/rustybackup.sock</string>
             <key>SockPathMode</key>
-            <integer>384</integer> <!-- 0600 in octal -->
+            <integer>438</integer> <!-- 0666 in octal - world read/write -->
         </dict>
     </dict>
 </dict>

@@ -36,8 +36,8 @@ fn main() {
         }
     };
     
-    // Set socket permissions (only owner can connect)
-    if let Err(e) = std::fs::set_permissions(SOCKET_PATH, std::os::unix::fs::PermissionsExt::from_mode(0o600)) {
+    // Set socket permissions (allow all users to connect)
+    if let Err(e) = std::fs::set_permissions(SOCKET_PATH, std::os::unix::fs::PermissionsExt::from_mode(0o666)) {
         eprintln!("Failed to set socket permissions: {}", e);
         std::process::exit(1);
     }
