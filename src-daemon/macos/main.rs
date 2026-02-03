@@ -3,9 +3,10 @@
 //! This daemon runs as root via launchd and handles all privileged disk
 //! operations. It communicates with the main app via Unix domain sockets.
 //!
-//! Socket: /var/run/rustybackup.sock
+//! Socket: /var/run/rustybackup.sock (managed by launchd)
 //! Protocol: JSON messages over socket (one request/response per connection)
-//! Security: Socket file permissions + peer credential validation
+//! Lifecycle: On-demand socket activation - launchd starts daemon when socket
+//!            is accessed, daemon exits after idle timeout
 
 #![cfg(target_os = "macos")]
 #![crate_name = "rusty_backup_helper"]
@@ -17,47 +18,95 @@ use rusty_backup::privileged::protocol::{DaemonRequest, DaemonResponse};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const SOCKET_PATH: &str = "/var/run/rustybackup.sock";
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30); // Exit after 30s idle
 
 fn main() {
     eprintln!("Rusty Backup Helper v{}", env!("CARGO_PKG_VERSION"));
-    eprintln!("Starting daemon on socket: {}", SOCKET_PATH);
+    eprintln!("Socket activation mode - will exit after {}s idle", IDLE_TIMEOUT.as_secs());
+    eprintln!("Checking for launchd socket on FD 3...");
     
-    // Remove old socket if it exists
-    let _ = std::fs::remove_file(SOCKET_PATH);
-    
-    // Create Unix domain socket listener
-    let listener = match UnixListener::bind(SOCKET_PATH) {
-        Ok(l) => l,
+    // Get socket from launchd (file descriptor 3 for "Listener")
+    let listener = match try_get_launchd_socket() {
+        Ok(l) => {
+            eprintln!("SUCCESS: Using socket from launchd: {}", SOCKET_PATH);
+            l
+        }
         Err(e) => {
-            eprintln!("Failed to bind socket {}: {}", SOCKET_PATH, e);
-            std::process::exit(1);
+            eprintln!("No valid launchd socket ({}), creating our own (development mode)", e);
+            // Fallback for development: create socket ourselves
+            let _ = std::fs::remove_file(SOCKET_PATH);
+            match UnixListener::bind(SOCKET_PATH) {
+                Ok(l) => {
+                    // Set socket permissions (allow all users to connect)
+                    if let Err(e) = std::fs::set_permissions(SOCKET_PATH, std::os::unix::fs::PermissionsExt::from_mode(0o666)) {
+                        eprintln!("Failed to set socket permissions: {}", e);
+                        std::process::exit(1);
+                    }
+                    l
+                }
+                Err(e) => {
+                    eprintln!("Failed to bind socket {}: {}", SOCKET_PATH, e);
+                    std::process::exit(1);
+                }
+            }
         }
     };
     
-    // Set socket permissions (allow all users to connect)
-    if let Err(e) = std::fs::set_permissions(SOCKET_PATH, std::os::unix::fs::PermissionsExt::from_mode(0o666)) {
-        eprintln!("Failed to set socket permissions: {}", e);
-        std::process::exit(1);
-    }
-    
     eprintln!("Daemon listening on {}", SOCKET_PATH);
+    
+    // Set non-blocking mode for idle timeout
+    listener.set_nonblocking(true).expect("Failed to set non-blocking");
     
     // Create shared state
     let state = Arc::new(Mutex::new(state::DaemonState::new()));
+    let mut last_activity = Instant::now();
     
-    // Accept connections
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
+    // Accept connections with idle timeout
+    loop {
+        match listener.accept() {
+            Ok((stream, _addr)) => {
+                last_activity = Instant::now();
                 let state = Arc::clone(&state);
                 std::thread::spawn(move || {
                     handle_client(stream, state);
                 });
             }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // No connection available, check idle timeout
+                if last_activity.elapsed() > IDLE_TIMEOUT {
+                    eprintln!("Idle timeout reached, exiting daemon");
+                    std::process::exit(0);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
             Err(e) => {
                 eprintln!("Connection error: {}", e);
+            }
+        }
+    }
+}
+
+/// Get the socket from launchd via file descriptor 3.
+/// Launchd passes sockets as file descriptors, first socket is at FD 3.
+/// Returns Ok if we successfully got a socket from launchd, Err otherwise.
+fn try_get_launchd_socket() -> Result<UnixListener, Box<dyn std::error::Error>> {
+    use std::os::unix::io::FromRawFd;
+    
+    // Try to use file descriptor 3 (first launchd socket)
+    unsafe {
+        let listener = UnixListener::from_raw_fd(3);
+        
+        // Test if it's valid by trying to get local address
+        match listener.local_addr() {
+            Ok(_) => {
+                eprintln!("Successfully acquired socket from launchd (FD 3)");
+                Ok(listener)
+            }
+            Err(e) => {
+                Err(format!("FD 3 is not a valid socket: {}", e).into())
             }
         }
     }

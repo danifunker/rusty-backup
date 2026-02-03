@@ -14,21 +14,13 @@
     <key>UserName</key>
     <string>root</string>
     
-    <!-- Keep daemon alive (restart if crashed) -->
-    <key>KeepAlive</key>
-    <true/>
-    
-    <!-- Run on demand when socket is accessed -->
-    <key>RunAtLoad</key>
-    <true/>
-    
     <!-- Standard output/error logging -->
     <key>StandardOutPath</key>
     <string>/var/log/rustybackup-helper.log</string>
     <key>StandardErrorPath</key>
     <string>/var/log/rustybackup-helper.log</string>
     
-    <!-- Socket configuration (launchd will create socket and pass to daemon) -->
+    <!-- Socket activation (on-demand launch) -->
     <key>Sockets</key>
     <dict>
         <key>Listener</key>
