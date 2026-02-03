@@ -439,12 +439,18 @@ jobs:
       - name: Display structure of downloaded files
         run: ls -R artifacts
       
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release-files
+          find artifacts -type f \( -name "*.zip" -o -name "*.dmg" -o -name "*.AppImage" -o -name "*.deb" -o -name "*.rpm" -o -name "*.pkg.tar.zst" \) -exec cp {} release-files/ \;
+          ls -lh release-files/
+      
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: v${{ needs.generate-version.outputs.version }}
           name: Release ${{ needs.generate-version.outputs.version }}
-          files: artifacts/**/*
+          files: release-files/*
           draft: false
           prerelease: false
           generate_release_notes: true
