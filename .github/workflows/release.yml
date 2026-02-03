@@ -77,16 +77,16 @@ jobs:
         run: |
           cd target/${{ matrix.target }}/release
           if [ -f "../../../assets/icons/icon.ico" ]; then
-            7z a ../../../RustyBackup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip rusty-backup.exe ../../../assets/icons/icon.ico
+            7z a ../../../Rusty-Backup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip rusty-backup.exe ../../../assets/icons/icon.ico
           else
-            7z a ../../../RustyBackup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip rusty-backup.exe
+            7z a ../../../Rusty-Backup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip rusty-backup.exe
           fi
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: RustyBackup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
-          path: RustyBackup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip
+          name: Rusty-Backup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: Rusty-Backup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip
 
   build-macos:
     name: Build macOS
@@ -305,13 +305,13 @@ jobs:
           ln -s usr/bin/rusty-backup AppDir/AppRun
           
           # Use extracted appimagetool with --no-appstream to avoid FUSE requirement
-          ARCH=${{ matrix.arch }} ./squashfs-root/appimagetool --no-appstream AppDir RustyBackup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.AppImage
+          ARCH=${{ matrix.arch }} ./squashfs-root/appimagetool --no-appstream AppDir Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.AppImage
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: RustyBackup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-appimage
-          path: RustyBackup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.AppImage
+          name: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-appimage
+          path: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.AppImage
 
   build-linux-packages:
     name: Build Linux Packages
@@ -372,12 +372,12 @@ jobs:
       - name: Build Debian package
         run: |
           cargo deb --target ${{ matrix.target }} --no-build
-          mv target/${{ matrix.target }}/debian/*.deb RustyBackup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.deb
+          mv target/${{ matrix.target }}/debian/*.deb Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.deb
 
       - name: Build RPM package
         run: |
           cargo generate-rpm --target ${{ matrix.target }}
-          mv target/${{ matrix.target }}/generate-rpm/*.rpm RustyBackup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.rpm
+          mv target/${{ matrix.target }}/generate-rpm/*.rpm Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.rpm
 
       - name: Build Arch package
         run: |
@@ -406,25 +406,25 @@ jobs:
           
           # Create package with tar and zstd
           cd pkg
-          tar -czf ../../RustyBackup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.pkg.tar.zst *
+          tar -czf ../../Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.pkg.tar.zst *
 
       - name: Upload Debian package
         uses: actions/upload-artifact@v4
         with:
-          name: RustyBackup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-deb
-          path: RustyBackup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.deb
+          name: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-deb
+          path: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.deb
 
       - name: Upload RPM package
         uses: actions/upload-artifact@v4
         with:
-          name: RustyBackup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-rpm
-          path: RustyBackup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.rpm
+          name: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-rpm
+          path: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.rpm
 
       - name: Upload Arch package
         uses: actions/upload-artifact@v4
         with:
-          name: RustyBackup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-arch
-          path: RustyBackup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.pkg.tar.zst
+          name: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-arch
+          path: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.pkg.tar.zst
 
   release:
     name: Create Release
