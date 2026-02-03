@@ -52,8 +52,6 @@ pub struct RustyBackupApp {
     elevation_dialog: ElevationDialog,
     #[cfg(target_os = "macos")]
     daemon_dialog: DaemonDialog,
-    #[cfg(target_os = "macos")]
-    daemon_status_checked: bool,
     /// Shared backup folder path between restore and inspect tabs
     loaded_backup_folder: Option<PathBuf>,
 }
@@ -96,8 +94,8 @@ impl Default for RustyBackupApp {
         };
 
         #[cfg(target_os = "macos")]
-        let (daemon_dialog, daemon_status_checked) = {
-            let mut dialog = DaemonDialog::default();
+        let daemon_dialog = {
+            let dialog = DaemonDialog::default();
             if !devices.is_empty() {
                 // Check daemon status
                 if let Ok(access) = rusty_backup::privileged::create_disk_access() {
@@ -120,7 +118,7 @@ impl Default for RustyBackupApp {
                     }
                 }
             }
-            (dialog, true)
+            dialog
         };
 
         // Detect chdman availability
@@ -162,8 +160,6 @@ impl Default for RustyBackupApp {
             elevation_dialog,
             #[cfg(target_os = "macos")]
             daemon_dialog,
-            #[cfg(target_os = "macos")]
-            daemon_status_checked,
             loaded_backup_folder: None,
         }
     }

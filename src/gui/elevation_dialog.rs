@@ -1,5 +1,7 @@
 //! Privilege elevation dialog for Linux.
 
+#![cfg(target_os = "linux")]
+
 /// State for the privilege elevation dialog.
 #[derive(Default)]
 pub struct ElevationDialog {

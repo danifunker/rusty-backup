@@ -200,7 +200,6 @@ impl BrowseView {
         match entry.entry_type {
             EntryType::Directory => {
                 let path = entry.path.clone();
-                let is_expanded = self.expanded_paths.contains(&path);
                 let has_children = self.directory_cache.contains_key(&path);
 
                 let header = egui::CollapsingHeader::new(&entry.name)

@@ -564,14 +564,13 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
 // ---------------------------------------------------------------------------
 
 use crate::privileged::{AccessStatus, DiskHandle, PrivilegedDiskAccess};
-use crate::privileged::protocol::{DaemonRequest, DaemonResponse, DAEMON_VERSION, MIN_DAEMON_VERSION};
+use crate::privileged::protocol::{DaemonRequest, DaemonResponse, MIN_DAEMON_VERSION};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 
 const SOCKET_PATH: &str = "/var/run/rustybackup.sock";
 const DAEMON_BINARY: &str = "/Library/PrivilegedHelperTools/com.rustybackup.helper";
 const DAEMON_PLIST: &str = "/Library/LaunchDaemons/com.rustybackup.helper.plist";
-const DAEMON_LABEL: &str = "com.rustybackup.helper";
 
 /// macOS implementation of privileged disk access.
 ///

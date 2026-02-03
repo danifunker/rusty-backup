@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -52,7 +52,7 @@ pub struct InspectTab {
     /// VHD export background thread status
     export_status: Option<Arc<Mutex<ExportStatus>>>,
     /// Filesystem-computed minimum partition sizes (partition index → bytes)
-    partition_min_sizes: std::collections::HashMap<usize, u64>,
+    partition_min_sizes: HashMap<usize, u64>,
 }
 
 /// Status of a background VHD export operation.
@@ -113,7 +113,7 @@ impl Default for InspectTab {
             export_whole_disk: true,
             export_partition_configs: Vec::new(),
             export_status: None,
-            partition_min_sizes: std::collections::HashMap::new(),
+            partition_min_sizes: HashMap::new(),
         }
     }
 }
@@ -467,7 +467,7 @@ impl InspectTab {
 
     fn start_export_vhd(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {
         // Collect partition sizing info
-        let size_map: std::collections::HashMap<usize, u64> = self
+        let size_map: HashMap<usize, u64> = self
             .export_partition_configs
             .iter()
             .map(|cfg| (cfg.index, cfg.effective_size()))

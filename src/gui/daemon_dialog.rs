@@ -32,10 +32,6 @@ impl DaemonDialog {
         self.show = false;
     }
 
-    pub fn is_visible(&self) -> bool {
-        self.show
-    }
-
     pub fn action(&self) -> DaemonAction {
         self.action
     }
