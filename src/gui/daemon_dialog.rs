@@ -36,6 +36,10 @@ impl DaemonDialog {
         self.action
     }
 
+    pub fn reset_action(&mut self) {
+        self.action = DaemonAction::None;
+    }
+
     pub fn render(&mut self, ctx: &egui::Context) {
         if !self.show {
             return;

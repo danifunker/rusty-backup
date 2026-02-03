@@ -322,8 +322,7 @@ impl eframe::App for RustyBackupApp {
         {
             self.daemon_dialog.render(ctx);
             
-            let action = self.daemon_dialog.action();
-            match action {
+            match self.daemon_dialog.action() {
                 DaemonAction::Install => {
                     self.log_panel.info("Installing privileged helper daemon...");
                     match rusty_backup::os::macos::install_daemon() {
@@ -348,9 +347,11 @@ impl eframe::App for RustyBackupApp {
                             self.log_panel.error(format!("Failed to install daemon: {}", e));
                         }
                     }
+                    self.daemon_dialog.reset_action();
                 }
                 DaemonAction::Cancel => {
                     self.log_panel.info("Daemon installation cancelled");
+                    self.daemon_dialog.reset_action();
                 }
                 DaemonAction::None => {}
             }

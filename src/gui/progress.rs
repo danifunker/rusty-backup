@@ -158,15 +158,7 @@ impl ProgressState {
     }
 }
 
-/// Simple timestamp without pulling in chrono crate.
+/// Get current timestamp in local time.
 fn chrono_now() -> String {
-    use std::time::SystemTime;
-    let duration = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = duration.as_secs();
-    let hours = (secs / 3600) % 24;
-    let minutes = (secs / 60) % 60;
-    let seconds = secs % 60;
-    format!("{hours:02}:{minutes:02}:{seconds:02}")
+    chrono::Local::now().format("%H:%M:%S").to_string()
 }
