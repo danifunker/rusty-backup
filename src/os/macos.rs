@@ -1033,6 +1033,7 @@ fn is_daemon_running() -> bool {
             // Send a GetVersion request
             let request = DaemonRequest::GetVersion;
             if let Ok(req_str) = serde_json::to_string(&request) {
+                eprintln!("[DEBUG] Sending daemon check request: {}", req_str);
                 if writeln!(stream, "{}", req_str).is_ok() {
                     // Try to read response with timeout
                     let mut reader = BufReader::new(stream);

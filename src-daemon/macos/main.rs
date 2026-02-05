@@ -89,30 +89,41 @@ fn main() {
     }
 }
 
-/// Get the socket from launchd via file descriptor 3.
-/// Launchd passes sockets as file descriptors, first socket is at FD 3.
-/// Returns Ok if we successfully got a socket from launchd, Err otherwise.
+/// Get the socket from launchd using launch_activate_socket() API.
+/// This is the proper way to get sockets from launchd on macOS.
 fn try_get_launchd_socket() -> Result<UnixListener, Box<dyn std::error::Error>> {
-    use std::os::unix::io::{FromRawFd, IntoRawFd};
+    use std::os::unix::io::FromRawFd;
+    use std::ffi::CString;
     
-    // Try to use file descriptor 3 (first launchd socket)
     unsafe {
-        // First, check if FD 3 is valid before taking ownership
-        use std::os::unix::io::RawFd;
-        let fd: RawFd = 3;
+        // Call launch_activate_socket() to get the socket FDs
+        let name = CString::new("Listener")?;
+        let mut fds: *mut libc::c_int = std::ptr::null_mut();
+        let mut cnt: libc::size_t = 0;
         
-        // Try to get socket name without taking ownership
-        let mut addr: libc::sockaddr_un = std::mem::zeroed();
-        let mut addr_len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        // Declare the external C function
+        extern "C" {
+            fn launch_activate_socket(name: *const libc::c_char, fds: *mut *mut libc::c_int, cnt: *mut libc::size_t) -> libc::c_int;
+        }
         
-        if libc::getsockname(fd, &mut addr as *mut _ as *mut libc::sockaddr, &mut addr_len) == 0 {
-            // FD 3 is a valid socket, take ownership
+        let result = launch_activate_socket(name.as_ptr(), &mut fds, &mut cnt);
+        
+        if result == 0 && cnt > 0 && !fds.is_null() {
+            // Successfully got socket FD(s) from launchd
+            let fd = *fds; // Get first socket FD
+            eprintln!("Successfully acquired socket from launchd via launch_activate_socket() (FD {})", fd);
+            
+            // Free the FDs array allocated by launch_activate_socket
+            libc::free(fds as *mut libc::c_void);
+            
+            // Take ownership of the socket FD
             let listener = UnixListener::from_raw_fd(fd);
-            eprintln!("Successfully acquired socket from launchd (FD 3)");
             Ok(listener)
         } else {
-            // FD 3 is not a valid socket - don't take ownership
-            Err("FD 3 is not a valid socket (launchd socket activation not active)".into())
+            if !fds.is_null() {
+                libc::free(fds as *mut libc::c_void);
+            }
+            Err("launch_activate_socket() failed (not launched by launchd)".into())
         }
     }
 }
