@@ -6,9 +6,6 @@ mod progress;
 mod restore_tab;
 mod settings_dialog;
 
-#[cfg(target_os = "macos")]
-mod daemon_dialog;
-
 use std::path::PathBuf;
 use backup_tab::BackupTab;
 use inspect_tab::InspectTab;
@@ -22,9 +19,6 @@ use rusty_backup::update::{check_for_updates, UpdateConfig, UpdateInfo};
 
 #[cfg(target_os = "linux")]
 use elevation_dialog::{ElevationDialog, ElevationAction};
-
-#[cfg(target_os = "macos")]
-use daemon_dialog::{DaemonDialog, DaemonAction};
 
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -50,16 +44,8 @@ pub struct RustyBackupApp {
     settings_dialog: SettingsDialog,
     #[cfg(target_os = "linux")]
     elevation_dialog: ElevationDialog,
-    #[cfg(target_os = "macos")]
-    daemon_dialog: DaemonDialog,
     /// Shared backup folder path between restore and inspect tabs
     loaded_backup_folder: Option<PathBuf>,
-    /// Cached privileged access status (to avoid checking every frame)
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    cached_access_status: Option<rusty_backup::privileged::AccessStatus>,
-    /// Last time we checked access status
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    last_status_check: std::time::Instant,
 }
 
 impl Default for RustyBackupApp {
@@ -90,34 +76,6 @@ impl Default for RustyBackupApp {
                             }
                             rusty_backup::privileged::AccessStatus::Ready => {
                                 log.info("Running with elevated privileges");
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            dialog
-        };
-
-        #[cfg(target_os = "macos")]
-        let daemon_dialog = {
-            let dialog = DaemonDialog::default();
-            if !devices.is_empty() {
-                // Check daemon status
-                if let Ok(access) = rusty_backup::privileged::create_disk_access() {
-                    if let Ok(status) = access.check_status() {
-                        match status {
-                            rusty_backup::privileged::AccessStatus::DaemonNotInstalled => {
-                                log.warn("Privileged helper daemon not installed. Click 'Install Helper' to enable disk access.");
-                            }
-                            rusty_backup::privileged::AccessStatus::DaemonNeedsApproval => {
-                                log.warn("Privileged helper daemon is not running. It may need approval in System Settings > Login Items.");
-                            }
-                            rusty_backup::privileged::AccessStatus::DaemonOutdated { current } => {
-                                log.warn(format!("Privileged helper daemon is outdated (version {}). Please reinstall from Settings.", current));
-                            }
-                            rusty_backup::privileged::AccessStatus::Ready => {
-                                log.info("Privileged helper daemon is ready");
                             }
                             _ => {}
                         }
@@ -164,46 +122,8 @@ impl Default for RustyBackupApp {
             settings_dialog: SettingsDialog::default(),
             #[cfg(target_os = "linux")]
             elevation_dialog,
-            #[cfg(target_os = "macos")]
-            daemon_dialog,
             loaded_backup_folder: None,
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            cached_access_status: None,
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            last_status_check: std::time::Instant::now() - std::time::Duration::from_secs(10),
         }
-    }
-}
-
-impl RustyBackupApp {
-    /// Get the cached privileged access status, refreshing if stale.
-    /// This avoids calling expensive check_status() on every frame.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn get_access_status(&mut self) -> Option<rusty_backup::privileged::AccessStatus> {
-        const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-        
-        // Check if cache is stale
-        if self.last_status_check.elapsed() > CHECK_INTERVAL || self.cached_access_status.is_none() {
-            // Refresh cache
-            if let Ok(access) = rusty_backup::privileged::create_disk_access() {
-                if let Ok(status) = access.check_status() {
-                    self.cached_access_status = Some(status.clone());
-                    self.last_status_check = std::time::Instant::now();
-                    return Some(status);
-                }
-            }
-            None
-        } else {
-            // Return cached value
-            self.cached_access_status.clone()
-        }
-    }
-    
-    /// Invalidate the access status cache (call after install/uninstall).
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn invalidate_access_cache(&mut self) {
-        self.cached_access_status = None;
-        self.last_status_check = std::time::Instant::now() - std::time::Duration::from_secs(10);
     }
 }
 
@@ -245,62 +165,21 @@ impl eframe::App for RustyBackupApp {
                     // Elevation button (Linux only, when not root)
                     #[cfg(target_os = "linux")]
                     {
-                        if let Some(status) = self.get_access_status() {
-                            if status == rusty_backup::privileged::AccessStatus::NeedsElevation {
-                                if ui
-                                    .button(egui::RichText::new("⚠ Request Elevation").color(egui::Color32::YELLOW))
-                                    .on_hover_text("Restart with administrator privileges to access disk devices")
-                                    .clicked()
-                                {
-                                    self.elevation_dialog.open();
+                        if let Ok(access) = rusty_backup::privileged::create_disk_access() {
+                            if let Ok(status) = access.check_status() {
+                                if status == rusty_backup::privileged::AccessStatus::NeedsElevation {
+                                    if ui
+                                        .button(egui::RichText::new("⚠ Request Elevation").color(egui::Color32::YELLOW))
+                                        .on_hover_text("Restart with administrator privileges to access disk devices")
+                                        .clicked()
+                                    {
+                                        self.elevation_dialog.open();
+                                    }
+                                    ui.separator();
                                 }
-                                ui.separator();
                             }
                         }
                     }
-                    
-                    // Daemon install button (macOS only, when daemon not ready)
-                    #[cfg(target_os = "macos")]
-                    {
-                        if let Some(status) = self.get_access_status() {
-                            match status {
-                                rusty_backup::privileged::AccessStatus::DaemonNotInstalled => {
-                                    if ui
-                                        .button(egui::RichText::new("⚠ Install Helper").color(egui::Color32::YELLOW))
-                                            .on_hover_text("Install privileged helper daemon to access disk devices")
-                                            .clicked()
-                                        {
-                                            self.daemon_dialog.show();
-                                        }
-                                        ui.separator();
-                                    }
-                                    rusty_backup::privileged::AccessStatus::DaemonNeedsApproval => {
-                                        if ui
-                                            .button(egui::RichText::new("⚠ Helper Needs Approval").color(egui::Color32::YELLOW))
-                                            .on_hover_text("Open System Settings to approve the helper daemon")
-                                            .clicked()
-                                        {
-                                            // Open System Settings
-                                            let _ = std::process::Command::new("open")
-                                                .arg("x-apple.systempreferences:com.apple.LoginItems-Settings.extension")
-                                                .spawn();
-                                        }
-                                        ui.separator();
-                                    }
-                                    rusty_backup::privileged::AccessStatus::DaemonOutdated { .. } => {
-                                        if ui
-                                            .button(egui::RichText::new("⚠ Update Helper").color(egui::Color32::YELLOW))
-                                            .on_hover_text("Reinstall helper daemon to update it")
-                                            .clicked()
-                                        {
-                                            self.daemon_dialog.show();
-                                        }
-                                        ui.separator();
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
                     
                     if ui.button("Refresh Devices").clicked() {
                         self.devices = device::enumerate_devices();
@@ -352,34 +231,6 @@ impl eframe::App for RustyBackupApp {
                     self.log_panel.warn("Elevation cancelled. Device operations will fail.");
                 }
                 ElevationAction::None => {}
-            }
-        }
-
-        // Daemon installation dialog (macOS)
-        #[cfg(target_os = "macos")]
-        {
-            self.daemon_dialog.render(ctx);
-            
-            match self.daemon_dialog.action() {
-                DaemonAction::Install => {
-                    self.log_panel.info("Installing privileged helper daemon...");
-                    match rusty_backup::os::macos::install_daemon() {
-                        Ok(()) => {
-                            self.log_panel.info("Helper daemon installed successfully!");
-                            // Invalidate cache to force status recheck
-                            self.invalidate_access_cache();
-                        }
-                        Err(e) => {
-                            self.log_panel.error(format!("Failed to install daemon: {}", e));
-                        }
-                    }
-                    self.daemon_dialog.reset_action();
-                }
-                DaemonAction::Cancel => {
-                    self.log_panel.info("Daemon installation cancelled");
-                    self.daemon_dialog.reset_action();
-                }
-                DaemonAction::None => {}
             }
         }
 

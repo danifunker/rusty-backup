@@ -138,7 +138,10 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let file = File::open(path)?;
-        Ok(ElevatedSource::from_file(file))
+        Ok(ElevatedSource {
+            file,
+            temp_path: None,
+        })
     }
 }
 
@@ -176,55 +179,26 @@ pub fn open_target_for_writing(path: &Path) -> Result<File> {
     }
 }
 
-/// An opened source file that may be backed by a temporary device image or daemon reader.
+/// An opened source file that may be backed by a temporary device image.
 ///
-/// Call `into_parts()` to get a reader and a cleanup guard that auto-deletes
-/// temp files when dropped.
+/// Call `into_parts()` to get the file and a cleanup guard that auto-deletes
+/// the temp file when dropped.
 pub struct ElevatedSource {
-    reader: Box<dyn ReadSeek>,
+    file: File,
     temp_path: Option<PathBuf>,
 }
 
-/// Trait alias for Read + Seek to simplify type constraints.
-pub trait ReadSeek: Read + Seek + Send {}
-impl<T: Read + Seek + Send> ReadSeek for T {}
-
 impl ElevatedSource {
-    /// Create from a regular file.
-    pub fn from_file(file: File) -> Self {
-        Self {
-            reader: Box::new(file),
-            temp_path: None,
-        }
-    }
-    
-    /// Create from a daemon reader (macOS only).
-    #[cfg(target_os = "macos")]
-    pub fn from_daemon_reader(reader: macos::DaemonDiskReader) -> Self {
-        Self {
-            reader: Box::new(reader),
-            temp_path: None,
-        }
-    }
-    
-    /// Create from a file with associated temp path.
-    pub fn from_file_with_temp(file: File, temp_path: PathBuf) -> Self {
-        Self {
-            reader: Box::new(file),
-            temp_path: Some(temp_path),
-        }
-    }
-    
     /// Returns the path to the temp file, if one was created.
     pub fn temp_path(&self) -> Option<&Path> {
         self.temp_path.as_deref()
     }
 
-    /// Consume self and return the reader plus a cleanup guard.
-    /// Keep the guard alive until you're done with the reader — dropping it
+    /// Consume self and return the file plus a cleanup guard.
+    /// Keep the guard alive until you're done with the file — dropping it
     /// deletes the temp file (if any).
-    pub fn into_parts(self) -> (Box<dyn ReadSeek>, TempFileGuard) {
-        (self.reader, TempFileGuard(self.temp_path))
+    pub fn into_parts(self) -> (File, TempFileGuard) {
+        (self.file, TempFileGuard(self.temp_path))
     }
 }
 

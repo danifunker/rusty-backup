@@ -635,21 +635,28 @@ impl BackupTab {
 
         log.info(format!("Scanning partitions on {}...", path.display()));
 
-        // For partition scanning, we just need to open once and read
-        // No need for elevation since this is just analysis - backup will handle elevation
-        let file = match File::open(&path) {
-            Ok(f) => f,
-            Err(e) => {
-                // If it's a device and we get permission denied, that's expected
-                // The actual backup will handle elevation
-                let path_str = path.to_string_lossy();
-                if path_str.starts_with("/dev/") || path_str.starts_with("\\\\.\\") {
-                    log.warn(format!("Cannot scan device partitions (permission denied). Backup will request elevation when needed."));
-                    self.partition_load_error = Some("Device requires elevation - partitions will be detected during backup".to_string());
-                } else {
-                    log.error(format!("Cannot open source: {e}"));
-                    self.partition_load_error = Some(format!("Cannot open source: {e}"));
+        let path_str = path.to_string_lossy();
+        let is_device = path_str.starts_with("/dev/") || path_str.starts_with("\\\\.\\");
+
+        // Open file (with elevation for devices)
+        let open_result: Result<File, String> = if is_device {
+            match rusty_backup::os::open_source_for_reading(&path) {
+                Ok(elevated) => {
+                    let (file, _guard) = elevated.into_parts();
+                    // Note: _guard is dropped here but the file handle remains valid
+                    Ok(file)
                 }
+                Err(e) => Err(format!("Cannot access device: {e}")),
+            }
+        } else {
+            File::open(&path).map_err(|e| format!("Cannot open source: {e}"))
+        };
+
+        let file = match open_result {
+            Ok(f) => f,
+            Err(msg) => {
+                self.partition_load_error = Some(msg.clone());
+                log.error(msg);
                 return;
             }
         };

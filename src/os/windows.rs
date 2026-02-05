@@ -540,7 +540,10 @@ pub fn open_source_for_reading(path: &Path) -> Result<crate::os::ElevatedSource>
         // Regular file - just open normally
         let file = File::open(path)
             .with_context(|| format!("cannot open {}", path.display()))?;
-        return Ok(crate::os::ElevatedSource::from_file(file));
+        return Ok(crate::os::ElevatedSource {
+            file,
+            temp_path: None,
+        });
     }
 
     // Physical drive - use FILE_FLAG_NO_BUFFERING for raw disk access
@@ -571,7 +574,10 @@ pub fn open_source_for_reading(path: &Path) -> Result<crate::os::ElevatedSource>
     .with_context(|| format!("cannot open {} for reading", path.display()))?;
 
     let file = unsafe { File::from_raw_handle(handle.0 as *mut c_void) };
-    Ok(crate::os::ElevatedSource::from_file(file))
+    Ok(crate::os::ElevatedSource {
+        file,
+        temp_path: None,
+    })
 }
 
 #[cfg(test)]
