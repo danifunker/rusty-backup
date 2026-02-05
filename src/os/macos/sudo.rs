@@ -23,7 +23,7 @@ ObjC.import('stdlib')
 const app = Application.currentApplication()
 app.includeStandardAdditions = true
 
-const result = app.displayDialog('Rusty Backup needs administrator access to read and write disk devices.\n\nType your password to allow this.', {
+const result = app.displayDialog('Rusty Backup needs administrator access to for low-level disk reads and writes.\n\nType your password to allow this.', {
   defaultAnswer: '',
   withIcon: 'caution',
   buttons: ['Cancel', 'OK'],
