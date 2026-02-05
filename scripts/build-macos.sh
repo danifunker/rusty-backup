@@ -1,5 +1,5 @@
 #!/bin/bash
-# Script to build and package Rusty Backup for macOS with daemon included
+# Script to build and package Rusty Backup for macOS (no daemon - uses sudo elevation)
 
 set -e
 
@@ -20,10 +20,6 @@ echo "Building for macOS ($ARCH)..."
 echo "Building main application..."
 cargo build --release --target "$TARGET"
 
-# Build daemon
-echo "Building privileged helper daemon..."
-cargo build --release --target "$TARGET" --bin rusty-backup-helper --features macos-daemon
-
 # Create app bundle
 APP_NAME="Rusty Backup"
 BUNDLE_NAME="Rusty Backup.app"
@@ -37,21 +33,11 @@ rm -rf "$BUNDLE_NAME"
 # Create structure
 mkdir -p "${BUNDLE_NAME}/Contents/MacOS"
 mkdir -p "${BUNDLE_NAME}/Contents/Resources"
-mkdir -p "${BUNDLE_NAME}/Contents/Library/LaunchDaemons"
 
 # Copy main binary
 echo "Copying main binary..."
 cp "target/$TARGET/release/rusty-backup" "${BUNDLE_NAME}/Contents/MacOS/"
 chmod +x "${BUNDLE_NAME}/Contents/MacOS/rusty-backup"
-
-# Copy daemon binary
-echo "Copying daemon binary..."
-cp "target/$TARGET/release/rusty-backup-helper" "${BUNDLE_NAME}/Contents/Library/LaunchDaemons/com.rustybackup.helper"
-chmod +x "${BUNDLE_NAME}/Contents/Library/LaunchDaemons/com.rustybackup.helper"
-
-# Copy daemon plist
-echo "Copying daemon plist..."
-cp "assets/com.rustybackup.helper.plist" "${BUNDLE_NAME}/Contents/Resources/"
 
 # Copy icon if available
 if [ -f "assets/icons/icon.icns" ]; then
@@ -86,19 +72,28 @@ cat > "${BUNDLE_NAME}/Contents/Info.plist" << EOF
     <true/>
     <key>LSMinimumSystemVersion</key>
     <string>10.13</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Rusty Backup needs to request administrator privileges for disk access.</string>
 </dict>
 </plist>
 EOF
 
-# Ad-hoc code sign
+# Code sign with entitlements
 echo "Code signing..."
-codesign --force --deep --sign - "${BUNDLE_NAME}"
+if [ -f "macos.entitlements" ]; then
+    codesign --force --deep --sign - --entitlements macos.entitlements "${BUNDLE_NAME}"
+else
+    echo "Warning: macos.entitlements not found, signing without entitlements"
+    codesign --force --deep --sign - "${BUNDLE_NAME}"
+fi
 
 echo ""
 echo "✅ Build complete!"
 echo ""
 echo "App bundle: $BUNDLE_NAME"
-echo "You can now run: open $BUNDLE_NAME"
+echo "You can now run: open '$BUNDLE_NAME'"
+echo ""
+echo "Note: The app uses sudo for disk access. You'll be prompted for your password when accessing disks."
 echo ""
 echo "Bundle contents:"
 tree "$BUNDLE_NAME" || find "$BUNDLE_NAME" -type f

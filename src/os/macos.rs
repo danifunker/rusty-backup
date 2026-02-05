@@ -1,3 +1,5 @@
+mod sudo;
+
 use std::ffi::{c_void, CString};
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -6,6 +8,8 @@ use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{bail, Context, Result};
+
+pub use sudo::{sudo_execute, request_app_elevation};
 
 use libc::statfs;
 use objc2_core_foundation::{
@@ -466,419 +470,44 @@ pub fn open_target_for_writing(path: &Path) -> Result<File> {
         })
 }
 
-/// Open a source device or image file for reading, requesting elevated
-/// privileges via the native macOS authentication dialog if needed.
+/// Open a source device or image file for reading.
 ///
-/// When the path is a `/dev/disk*` device and normal open fails with
-/// permission denied, this function:
-/// 1. Presents the macOS admin credentials dialog
-/// 2. Runs `dd` with elevated privileges to create a temporary raw image
-///    (using `/dev/rdiskN` for faster unbuffered reads)
-/// 3. Returns a handle to the temp image that auto-deletes on drop
+/// For device paths (`/dev/disk*`), the application should already be running
+/// with elevated privileges (via sudo at startup). If not elevated, this will
+/// return a permission denied error with a helpful message.
 pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
-    // Try normal open first
-    match File::open(path) {
-        Ok(file) => {
-            return Ok(ElevatedSource {
-                file,
-                temp_path: None,
-            });
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            // Fall through to elevation attempt
-        }
-        Err(e) => {
-            return Err(anyhow::anyhow!(e).context(format!("cannot open {}", path.display())));
-        }
-    }
-
-    // Only attempt elevation for device paths
     let path_str = path.to_string_lossy();
-    if !path_str.starts_with("/dev/") {
-        bail!(
-            "Permission denied: {}. Run the application with elevated privileges to access this file.",
-            path.display()
-        );
-    }
-
+    
     // Use /dev/rdiskN (raw character device) for faster unbuffered reads
-    let source_device = if path_str.starts_with("/dev/disk") {
-        format!("/dev/r{}", &path_str[5..])
+    let actual_path = if path_str.starts_with("/dev/disk") {
+        PathBuf::from(format!("/dev/r{}", &path_str[5..]))
     } else {
-        path_str.to_string()
+        path.to_path_buf()
     };
 
-    // Generate temp file path
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let device_stem = path.file_name().unwrap_or_default().to_string_lossy();
-    let temp_path = PathBuf::from(format!("/tmp/rusty-backup-{device_stem}-{timestamp}.raw"));
-    let temp_str = temp_path.to_string_lossy();
-
-    // Use osascript to run dd with administrator privileges.
-    // This presents the native macOS authentication dialog.
-    let script = format!(
-        "do shell script \"dd if={source_device} of={temp_str} bs=1m\" with administrator privileges"
-    );
-
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
-        .output()
-        .context("failed to launch osascript for elevated device access")?;
-
-    if !output.status.success() {
-        // Clean up partial temp file if it exists
-        let _ = std::fs::remove_file(&temp_path);
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("User canceled")
-            || stderr.contains("user canceled")
-            || stderr.contains("-128")
-        {
-            bail!("User cancelled the administrator authentication request");
+    // Try to open the file
+    match File::open(&actual_path) {
+        Ok(file) => {
+            Ok(ElevatedSource {
+                file,
+                temp_path: None,
+            })
         }
-        bail!(
-            "Failed to read device with elevated privileges: {}",
-            stderr.trim()
-        );
-    }
-
-    let file = File::open(&temp_path).with_context(|| {
-        format!(
-            "failed to open temporary device image: {}",
-            temp_path.display()
-        )
-    })?;
-
-    Ok(ElevatedSource {
-        file,
-        temp_path: Some(temp_path),
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Privileged disk access implementation (macOS)
-// ---------------------------------------------------------------------------
-
-use crate::privileged::{AccessStatus, DiskHandle, PrivilegedDiskAccess};
-use crate::privileged::protocol::{DaemonRequest, DaemonResponse, MIN_DAEMON_VERSION};
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
-
-const SOCKET_PATH: &str = "/var/run/rustybackup.sock";
-const DAEMON_BINARY: &str = "/Library/PrivilegedHelperTools/com.rustybackup.helper";
-const DAEMON_PLIST: &str = "/Library/LaunchDaemons/com.rustybackup.helper.plist";
-
-/// macOS implementation of privileged disk access.
-///
-/// Uses a privileged helper daemon with Unix socket communication.
-/// The daemon runs as root via launchd and handles all disk I/O at the sector level.
-pub struct MacOSDiskAccess {
-    // No persistent state - each operation connects to daemon
-}
-
-impl MacOSDiskAccess {
-    pub fn new() -> Result<Self> {
-        Ok(Self {})
-    }
-    
-    /// Send a request to the daemon and get response.
-    fn send_request(&self, request: &DaemonRequest) -> Result<DaemonResponse> {
-        // Connect to daemon socket
-        let mut stream = UnixStream::connect(SOCKET_PATH)
-            .map_err(|e| anyhow::anyhow!("Failed to connect to daemon: {}. Is it running?", e))?;
-        
-        // Serialize and send request (as single line)
-        let request_json = serde_json::to_string(request)?;
-        writeln!(stream, "{}", request_json)?;
-        
-        // Read response (single line)
-        let mut reader = BufReader::new(stream);
-        let mut response_json = String::new();
-        reader.read_line(&mut response_json)?;
-        
-        // Deserialize response
-        let response: DaemonResponse = serde_json::from_str(&response_json)?;
-        
-        Ok(response)
-    }
-    
-    /// Get daemon version (if running).
-    fn get_daemon_version(&self) -> Result<String> {
-        let response = self.send_request(&DaemonRequest::GetVersion)?;
-        
-        match response {
-            DaemonResponse::Version { version } => Ok(version),
-            DaemonResponse::Error { message } => anyhow::bail!("Daemon error: {}", message),
-            _ => anyhow::bail!("Unexpected response to GetVersion"),
-        }
-    }
-}
-
-impl PrivilegedDiskAccess for MacOSDiskAccess {
-    fn check_status(&self) -> Result<AccessStatus> {
-        // Check if daemon is installed
-        if !is_daemon_installed() {
-            return Ok(AccessStatus::DaemonNotInstalled);
-        }
-        
-        // Check if daemon is running
-        if !is_daemon_running() {
-            return Ok(AccessStatus::DaemonNeedsApproval);
-        }
-        
-        // Check daemon version
-        match self.get_daemon_version() {
-            Ok(daemon_ver) => {
-                // Check if daemon is too old for this app
-                // Note: Simple string comparison works for semantic versions
-                if daemon_ver.as_str() < MIN_DAEMON_VERSION {
-                    return Ok(AccessStatus::DaemonOutdated { current: daemon_ver });
-                }
-                
-                // All good
-                Ok(AccessStatus::Ready)
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            if path_str.starts_with("/dev/") {
+                bail!(
+                    "Permission denied: {}.\n\n\
+                     Rusty Backup requires administrator privileges to access disk devices.\n\
+                     Please restart the application - you will be prompted for your password.",
+                    path.display()
+                );
+            } else {
+                Err(anyhow::anyhow!(e).context(format!("cannot open {}", path.display())))
             }
-            Err(e) => anyhow::bail!("Failed to get daemon version: {}", e),
         }
-    }
-
-    fn open_disk_read(&mut self, path: &Path) -> Result<DiskHandle> {
-        let response = self.send_request(&DaemonRequest::OpenDiskRead {
-            path: path.to_string_lossy().to_string(),
-        })?;
-        
-        match response {
-            DaemonResponse::DiskOpened { handle, .. } => Ok(DiskHandle(handle)),
-            DaemonResponse::Error { message } => anyhow::bail!("Failed to open disk: {}", message),
-            _ => anyhow::bail!("Unexpected response to OpenDiskRead"),
-        }
-    }
-
-    fn open_disk_write(&mut self, path: &Path) -> Result<DiskHandle> {
-        let response = self.send_request(&DaemonRequest::OpenDiskWrite {
-            path: path.to_string_lossy().to_string(),
-        })?;
-        
-        match response {
-            DaemonResponse::DiskOpened { handle, .. } => Ok(DiskHandle(handle)),
-            DaemonResponse::Error { message } => anyhow::bail!("Failed to open disk: {}", message),
-            _ => anyhow::bail!("Unexpected response to OpenDiskWrite"),
-        }
-    }
-
-    fn read_sectors(&mut self, handle: DiskHandle, lba: u64, count: u32) -> Result<Vec<u8>> {
-        let response = self.send_request(&DaemonRequest::ReadSectors {
-            handle: handle.0,
-            lba,
-            count,
-        })?;
-        
-        match response {
-            DaemonResponse::SectorsRead { data } => Ok(data),
-            DaemonResponse::Error { message } => anyhow::bail!("Failed to read sectors: {}", message),
-            _ => anyhow::bail!("Unexpected response to ReadSectors"),
-        }
-    }
-
-    fn write_sectors(&mut self, handle: DiskHandle, lba: u64, data: &[u8]) -> Result<()> {
-        let response = self.send_request(&DaemonRequest::WriteSectors {
-            handle: handle.0,
-            lba,
-            data: data.to_vec(),
-        })?;
-        
-        match response {
-            DaemonResponse::Success => Ok(()),
-            DaemonResponse::Error { message } => anyhow::bail!("Failed to write sectors: {}", message),
-            _ => anyhow::bail!("Unexpected response to WriteSectors"),
-        }
-    }
-
-    fn close_disk(&mut self, handle: DiskHandle) -> Result<()> {
-        let response = self.send_request(&DaemonRequest::CloseDisk { handle: handle.0 })?;
-        
-        match response {
-            DaemonResponse::Success => Ok(()),
-            DaemonResponse::Error { message } => anyhow::bail!("Failed to close disk: {}", message),
-            _ => anyhow::bail!("Unexpected response to CloseDisk"),
+        Err(e) => {
+            Err(anyhow::anyhow!(e).context(format!("cannot open {}", path.display())))
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Daemon installation/management functions
-// ---------------------------------------------------------------------------
-
-/// Install the privileged helper daemon.
-///
-/// Copies the daemon binary and plist to system locations and loads it via launchctl.
-/// Requires admin password via osascript.
-pub fn install_daemon() -> Result<()> {
-    // Get the daemon binary from the app bundle
-    let bundle_daemon = get_bundle_daemon_path()?;
-    
-    if !bundle_daemon.exists() {
-        anyhow::bail!("Daemon binary not found in app bundle: {}", bundle_daemon.display());
-    }
-    
-    // Get the plist from the app bundle
-    let bundle_plist = get_bundle_plist_path()?;
-    
-    if !bundle_plist.exists() {
-        anyhow::bail!("Daemon plist not found in app bundle: {}", bundle_plist.display());
-    }
-    
-    // Build installation script (runs with admin privileges)
-    // Unload existing daemon first (if any), then install new one
-    let script = format!(
-        r#"do shell script "
-        launchctl unload '{}' 2>/dev/null || true && \
-        mkdir -p /Library/PrivilegedHelperTools && \
-        cp '{}' '{}' && \
-        chmod 755 '{}' && \
-        chown root:wheel '{}' && \
-        mkdir -p /Library/LaunchDaemons && \
-        cp '{}' '{}' && \
-        chmod 644 '{}' && \
-        chown root:wheel '{}' && \
-        launchctl load -w '{}'
-        " with administrator privileges"#,
-        DAEMON_PLIST,
-        bundle_daemon.display(),
-        DAEMON_BINARY,
-        DAEMON_BINARY,
-        DAEMON_BINARY,
-        bundle_plist.display(),
-        DAEMON_PLIST,
-        DAEMON_PLIST,
-        DAEMON_PLIST,
-        DAEMON_PLIST,
-    );
-    
-    // Execute with osascript (prompts for admin password)
-    let output = std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
-        .output()?;
-    
-    if !output.status.success() {
-        let error = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        anyhow::bail!("Failed to install daemon.\nError: {}\nOutput: {}", error, stdout);
-    }
-    
-    // Wait a moment for daemon to start
-    std::thread::sleep(std::time::Duration::from_secs(2));
-    
-    // Check if daemon actually started
-    if !is_daemon_running() {
-        // Check log file for errors
-        if let Ok(log) = std::fs::read_to_string("/var/log/rustybackup-helper.log") {
-            let last_lines: Vec<&str> = log.lines().rev().take(10).collect();
-            anyhow::bail!(
-                "Daemon installed but not running. Check System Settings > General > Login Items to approve it.\n\nLast log lines:\n{}",
-                last_lines.into_iter().rev().collect::<Vec<_>>().join("\n")
-            );
-        } else {
-            anyhow::bail!(
-                "Daemon installed but not running. Check System Settings > General > Login Items to approve it."
-            );
-        }
-    }
-    
-    Ok(())
-}
-
-/// Check if daemon is running.
-
-/// Uninstall the privileged helper daemon.
-///
-/// Unloads the daemon and removes files. Requires admin password.
-pub fn uninstall_daemon() -> Result<()> {
-    let script = format!(
-        r#"do shell script "
-        launchctl unload -w '{}' 2>/dev/null || true && \
-        rm -f '{}' && \
-        rm -f '{}' && \
-        rm -f '/var/run/rustybackup.sock' && \
-        rm -f '/var/log/rustybackup-helper.log'
-        " with administrator privileges"#,
-        DAEMON_PLIST,
-        DAEMON_BINARY,
-        DAEMON_PLIST,
-    );
-    
-    let output = std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
-        .output()?;
-    
-    if !output.status.success() {
-        let error = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Failed to uninstall daemon: {}", error);
-    }
-    
-    Ok(())
-}
-
-/// Get the path to the daemon binary in the app bundle.
-fn get_bundle_daemon_path() -> Result<PathBuf> {
-    // Try to get the main bundle (when running as .app)
-    let bundle = objc2_foundation::NSBundle::mainBundle();
-    let bundle_path = unsafe { bundle.bundlePath() };
-    let bundle_path_str = bundle_path.to_string();
-    
-    let mut daemon_path = PathBuf::from(bundle_path_str.as_str());
-    daemon_path.push("Contents/Library/LaunchDaemons/com.rustybackup.helper");
-    
-    // Fallback: check next to executable (for development)
-    if !daemon_path.exists() {
-        let exe = std::env::current_exe()?;
-        let mut dev_path = exe.parent().ok_or_else(|| anyhow::anyhow!("No parent dir"))?.to_path_buf();
-        dev_path.push("rusty-backup-helper");
-        if dev_path.exists() {
-            return Ok(dev_path);
-        }
-    }
-    
-    Ok(daemon_path)
-}
-
-/// Get the path to the daemon plist in the app bundle.
-fn get_bundle_plist_path() -> Result<PathBuf> {
-    let bundle = objc2_foundation::NSBundle::mainBundle();
-    let bundle_path = unsafe { bundle.bundlePath() };
-    let bundle_path_str = bundle_path.to_string();
-    
-    let mut plist_path = PathBuf::from(bundle_path_str.as_str());
-    plist_path.push("Contents/Resources/com.rustybackup.helper.plist");
-    
-    // Fallback: check in assets/ (for development)
-    if !plist_path.exists() {
-        let exe = std::env::current_exe()?;
-        let mut dev_path = exe.parent().ok_or_else(|| anyhow::anyhow!("No parent dir"))?.to_path_buf();
-        dev_path.pop(); // Remove target/debug or target/release
-        dev_path.pop(); // Remove target
-        dev_path.push("assets/com.rustybackup.helper.plist");
-        if dev_path.exists() {
-            return Ok(dev_path);
-        }
-    }
-    
-    Ok(plist_path)
-}
-
-/// Check if daemon is installed.
-fn is_daemon_installed() -> bool {
-    std::path::Path::new(DAEMON_BINARY).exists() &&
-    std::path::Path::new(DAEMON_PLIST).exists()
-}
-
-/// Check if daemon is running.
-fn is_daemon_running() -> bool {
-    UnixStream::connect(SOCKET_PATH).is_ok()
-}

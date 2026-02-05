@@ -6,9 +6,6 @@ mod progress;
 mod restore_tab;
 mod settings_dialog;
 
-#[cfg(target_os = "macos")]
-mod daemon_dialog;
-
 use std::path::PathBuf;
 use backup_tab::BackupTab;
 use inspect_tab::InspectTab;
@@ -22,9 +19,6 @@ use rusty_backup::update::{check_for_updates, UpdateConfig, UpdateInfo};
 
 #[cfg(target_os = "linux")]
 use elevation_dialog::{ElevationDialog, ElevationAction};
-
-#[cfg(target_os = "macos")]
-use daemon_dialog::{DaemonDialog, DaemonAction};
 
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -50,8 +44,6 @@ pub struct RustyBackupApp {
     settings_dialog: SettingsDialog,
     #[cfg(target_os = "linux")]
     elevation_dialog: ElevationDialog,
-    #[cfg(target_os = "macos")]
-    daemon_dialog: DaemonDialog,
     /// Shared backup folder path between restore and inspect tabs
     loaded_backup_folder: Option<PathBuf>,
 }
@@ -84,34 +76,6 @@ impl Default for RustyBackupApp {
                             }
                             rusty_backup::privileged::AccessStatus::Ready => {
                                 log.info("Running with elevated privileges");
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            dialog
-        };
-
-        #[cfg(target_os = "macos")]
-        let daemon_dialog = {
-            let dialog = DaemonDialog::default();
-            if !devices.is_empty() {
-                // Check daemon status
-                if let Ok(access) = rusty_backup::privileged::create_disk_access() {
-                    if let Ok(status) = access.check_status() {
-                        match status {
-                            rusty_backup::privileged::AccessStatus::DaemonNotInstalled => {
-                                log.warn("Privileged helper daemon not installed. Click 'Install Helper' to enable disk access.");
-                            }
-                            rusty_backup::privileged::AccessStatus::DaemonNeedsApproval => {
-                                log.warn("Privileged helper daemon is not running. It may need approval in System Settings > Login Items.");
-                            }
-                            rusty_backup::privileged::AccessStatus::DaemonOutdated { current } => {
-                                log.warn(format!("Privileged helper daemon is outdated (version {}). Please reinstall from Settings.", current));
-                            }
-                            rusty_backup::privileged::AccessStatus::Ready => {
-                                log.info("Privileged helper daemon is ready");
                             }
                             _ => {}
                         }
@@ -158,8 +122,6 @@ impl Default for RustyBackupApp {
             settings_dialog: SettingsDialog::default(),
             #[cfg(target_os = "linux")]
             elevation_dialog,
-            #[cfg(target_os = "macos")]
-            daemon_dialog,
             loaded_backup_folder: None,
         }
     }
@@ -219,51 +181,6 @@ impl eframe::App for RustyBackupApp {
                         }
                     }
                     
-                    // Daemon install button (macOS only, when daemon not ready)
-                    #[cfg(target_os = "macos")]
-                    {
-                        if let Ok(access) = rusty_backup::privileged::create_disk_access() {
-                            if let Ok(status) = access.check_status() {
-                                match status {
-                                    rusty_backup::privileged::AccessStatus::DaemonNotInstalled => {
-                                        if ui
-                                            .button(egui::RichText::new("⚠ Install Helper").color(egui::Color32::YELLOW))
-                                            .on_hover_text("Install privileged helper daemon to access disk devices")
-                                            .clicked()
-                                        {
-                                            self.daemon_dialog.show();
-                                        }
-                                        ui.separator();
-                                    }
-                                    rusty_backup::privileged::AccessStatus::DaemonNeedsApproval => {
-                                        if ui
-                                            .button(egui::RichText::new("⚠ Helper Needs Approval").color(egui::Color32::YELLOW))
-                                            .on_hover_text("Open System Settings to approve the helper daemon")
-                                            .clicked()
-                                        {
-                                            // Open System Settings
-                                            let _ = std::process::Command::new("open")
-                                                .arg("x-apple.systempreferences:com.apple.LoginItems-Settings.extension")
-                                                .spawn();
-                                        }
-                                        ui.separator();
-                                    }
-                                    rusty_backup::privileged::AccessStatus::DaemonOutdated { .. } => {
-                                        if ui
-                                            .button(egui::RichText::new("⚠ Update Helper").color(egui::Color32::YELLOW))
-                                            .on_hover_text("Reinstall helper daemon to update it")
-                                            .clicked()
-                                        {
-                                            self.daemon_dialog.show();
-                                        }
-                                        ui.separator();
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                    
                     if ui.button("Refresh Devices").clicked() {
                         self.devices = device::enumerate_devices();
                         self.log_panel
@@ -314,46 +231,6 @@ impl eframe::App for RustyBackupApp {
                     self.log_panel.warn("Elevation cancelled. Device operations will fail.");
                 }
                 ElevationAction::None => {}
-            }
-        }
-
-        // Daemon installation dialog (macOS)
-        #[cfg(target_os = "macos")]
-        {
-            self.daemon_dialog.render(ctx);
-            
-            match self.daemon_dialog.action() {
-                DaemonAction::Install => {
-                    self.log_panel.info("Installing privileged helper daemon...");
-                    match rusty_backup::os::macos::install_daemon() {
-                        Ok(()) => {
-                            self.log_panel.info("Helper daemon installed successfully!");
-                            // Recheck status
-                            if let Ok(access) = rusty_backup::privileged::create_disk_access() {
-                                if let Ok(status) = access.check_status() {
-                                    match status {
-                                        rusty_backup::privileged::AccessStatus::Ready => {
-                                            self.log_panel.info("Daemon is ready to use");
-                                        }
-                                        rusty_backup::privileged::AccessStatus::DaemonNeedsApproval => {
-                                            self.log_panel.warn("Please approve the daemon in System Settings > Login Items, then restart Rusty Backup");
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            self.log_panel.error(format!("Failed to install daemon: {}", e));
-                        }
-                    }
-                    self.daemon_dialog.reset_action();
-                }
-                DaemonAction::Cancel => {
-                    self.log_panel.info("Daemon installation cancelled");
-                    self.daemon_dialog.reset_action();
-                }
-                DaemonAction::None => {}
             }
         }
 

@@ -1,9 +1,8 @@
 //! Privileged disk access abstraction layer.
 //!
-//! Provides a unified interface for accessing disk devices across platforms:
-//! - macOS: Uses SMAppService daemon with XPC communication
-//! - Linux: Uses pkexec for privilege elevation
-//! - Windows: Uses existing UAC elevation
+//! **Note:** This module is deprecated on macOS. The application now uses
+//! sudo-based elevation at startup for simpler and more reliable disk access.
+//! This module remains for potential future cross-platform unification.
 
 use std::path::Path;
 
@@ -19,11 +18,11 @@ pub enum AccessStatus {
     Ready,
     /// Linux: Needs pkexec relaunch
     NeedsElevation,
-    /// macOS: Daemon not installed in app bundle
+    /// macOS: Daemon not installed in app bundle (deprecated - not used)
     DaemonNotInstalled,
-    /// macOS: Daemon installed but user hasn't approved in System Settings
+    /// macOS: Daemon installed but user hasn't approved in System Settings (deprecated - not used)
     DaemonNeedsApproval,
-    /// macOS: Daemon version is outdated
+    /// macOS: Daemon version is outdated (deprecated - not used)
     DaemonOutdated { current: String },
 }
 
@@ -35,6 +34,9 @@ pub struct DiskHandle(pub u64);
 ///
 /// All disk operations are performed at the sector level (512 bytes).
 /// Implementations handle platform-specific privilege elevation and IPC.
+///
+/// **Note:** This trait is not actively used on macOS anymore. The application
+/// uses standard file operations with sudo elevation at startup instead.
 pub trait PrivilegedDiskAccess: Send {
     /// Check if privileged access is available and ready.
     fn check_status(&self) -> Result<AccessStatus>;
@@ -73,10 +75,16 @@ pub trait PrivilegedDiskAccess: Send {
 }
 
 /// Create a platform-appropriate disk access implementation.
+///
+/// **Note:** On macOS, this is deprecated. The application uses sudo elevation
+/// at startup and standard file operations instead of a privileged daemon.
 pub fn create_disk_access() -> Result<Box<dyn PrivilegedDiskAccess>> {
     #[cfg(target_os = "macos")]
     {
-        Ok(Box::new(crate::os::macos::MacOSDiskAccess::new()?))
+        anyhow::bail!(
+            "Privileged disk access via daemon is deprecated on macOS. \
+             The application uses sudo elevation at startup instead."
+        )
     }
     #[cfg(target_os = "linux")]
     {
