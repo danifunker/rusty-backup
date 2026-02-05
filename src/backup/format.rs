@@ -17,33 +17,63 @@ pub fn create_backup_folder(dest: &Path, name: &str) -> Result<PathBuf> {
 
 /// Generate a backup folder name.
 ///
-/// When `size_bytes` and/or `volume_label` are provided the name uses the
-/// format `8GB-LABEL-2026-01-30-143052`.  Falls back to the source file
-/// stem when neither is available (e.g. `disk2-2026-01-30-143052`).
+/// Format: `SIZE-PartName-YYYY-MM-DD-HHMM` (local time, no seconds).
+/// `PartName` is the volume label from the first partition. Falls back to the
+/// source file stem when no volume label is available.
 pub fn generate_backup_name(
     source: &Path,
     size_bytes: Option<u64>,
     volume_label: Option<&str>,
 ) -> String {
-    let timestamp = Local::now().format("%Y-%m-%d-%H%M%S");
+    let timestamp = Local::now().format("%Y-%m-%d-%H%M");
 
     let size_part = size_bytes.map(format_size_short);
 
-    let label_part = volume_label.map(|l| l.trim()).filter(|l| !l.is_empty());
+    let label_part = volume_label
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .map(sanitize_filename);
 
     match (size_part, label_part) {
         (Some(sz), Some(label)) => format!("{sz}-{label}-{timestamp}"),
-        (Some(sz), None) => format!("{sz}-{timestamp}"),
+        (Some(sz), None) => {
+            let stem = get_source_stem(source);
+            format!("{sz}-{stem}-{timestamp}")
+        }
         (None, Some(label)) => format!("{label}-{timestamp}"),
         (None, None) => {
-            let stem = source
-                .file_stem()
-                .or_else(|| source.file_name())
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "backup".to_string());
+            let stem = get_source_stem(source);
             format!("{stem}-{timestamp}")
         }
     }
+}
+
+fn get_source_stem(source: &Path) -> String {
+    let stem = source
+        .file_stem()
+        .or_else(|| source.file_name())
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "backup".to_string());
+    sanitize_filename(&stem)
+}
+
+fn sanitize_filename(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|c| match c {
+            // Replace invalid/special characters with hyphen
+            ' ' | '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '-',
+            c if c.is_ascii_alphanumeric() || c == '-' || c == '_' => c,
+            _ => '-',
+        })
+        .collect();
+
+    // Collapse consecutive hyphens and trim
+    sanitized
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 /// Format a byte count as a short rounded size string for folder names.
@@ -125,7 +155,8 @@ mod tests {
     fn test_generate_backup_name_fallback() {
         let name = generate_backup_name(Path::new("/dev/disk2"), None, None);
         assert!(name.starts_with("disk2-"));
-        assert!(name.len() > 10);
+        // Format: disk2-YYYY-MM-DD-HHMM (21 chars: disk2-2026-01-01-0000)
+        assert!(name.len() >= 21);
     }
 
     #[test]
@@ -146,14 +177,38 @@ mod tests {
 
     #[test]
     fn test_generate_backup_name_size_only() {
+        // When size is provided but no label, fallback to disk name
         let name = generate_backup_name(Path::new("/dev/disk2"), Some(512_000_000), None);
-        assert!(name.starts_with("512MB-"));
+        assert!(name.starts_with("512MB-disk2-"));
     }
 
     #[test]
     fn test_generate_backup_name_label_only() {
         let name = generate_backup_name(Path::new("/dev/disk2"), None, Some("MYDISK"));
         assert!(name.starts_with("MYDISK-"));
+    }
+
+    #[test]
+    fn test_sanitize_filename() {
+        let name = generate_backup_name(
+            Path::new("/dev/disk2"),
+            Some(8_000_000_000),
+            Some("MY DISK: Label*"),
+        );
+        // Spaces and special chars should be replaced with hyphens
+        assert!(name.starts_with("8GB-MY-DISK-Label-"));
+    }
+
+    #[test]
+    fn test_sanitize_filename_no_trailing_hyphens() {
+        let name = generate_backup_name(
+            Path::new("/dev/disk2"),
+            Some(8_000_000_000),
+            Some("  Label  "),
+        );
+        // Leading/trailing hyphens from spaces should be trimmed
+        assert!(name.starts_with("8GB-Label-"));
+        assert!(!name.starts_with("8GB--"));
     }
 
     #[test]

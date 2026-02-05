@@ -185,6 +185,7 @@ impl eframe::App for RustyBackupApp {
                         self.devices = device::enumerate_devices();
                         self.log_panel
                             .info(format!("Refreshed: {} device(s) found", self.devices.len()));
+                        ctx.request_repaint();
                     }
                 });
             });
