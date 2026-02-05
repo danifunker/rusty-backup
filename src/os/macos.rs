@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{bail, Context, Result};
 
-pub use sudo::{sudo_execute, request_app_elevation};
+pub use sudo::{request_app_elevation, sudo_execute};
 
 use libc::statfs;
 use objc2_core_foundation::{
@@ -477,7 +477,7 @@ pub fn open_target_for_writing(path: &Path) -> Result<File> {
 /// return a permission denied error with a helpful message.
 pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
     let path_str = path.to_string_lossy();
-    
+
     // Use /dev/rdiskN (raw character device) for faster unbuffered reads
     let actual_path = if path_str.starts_with("/dev/disk") {
         PathBuf::from(format!("/dev/r{}", &path_str[5..]))
@@ -487,12 +487,10 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
 
     // Try to open the file
     match File::open(&actual_path) {
-        Ok(file) => {
-            Ok(ElevatedSource {
-                file,
-                temp_path: None,
-            })
-        }
+        Ok(file) => Ok(ElevatedSource {
+            file,
+            temp_path: None,
+        }),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             if path_str.starts_with("/dev/") {
                 bail!(
@@ -505,9 +503,6 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
                 Err(anyhow::anyhow!(e).context(format!("cannot open {}", path.display())))
             }
         }
-        Err(e) => {
-            Err(anyhow::anyhow!(e).context(format!("cannot open {}", path.display())))
-        }
+        Err(e) => Err(anyhow::anyhow!(e).context(format!("cannot open {}", path.display()))),
     }
 }
-

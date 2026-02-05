@@ -22,7 +22,10 @@ impl UpdateCheckConfig {
     pub fn api_url(&self) -> String {
         // Convert https://github.com/owner/repo to https://api.github.com/repos/owner/repo/releases/latest
         if let Some(path) = self.repository_url.strip_prefix("https://github.com/") {
-            format!("https://api.github.com/repos/{}/releases/latest", path.trim_end_matches('/'))
+            format!(
+                "https://api.github.com/repos/{}/releases/latest",
+                path.trim_end_matches('/')
+            )
         } else {
             // Fallback if URL doesn't match expected format
             self.repository_url.clone()
@@ -103,7 +106,7 @@ impl UpdateConfig {
         if let Some(config_dir) = Self::user_config_dir() {
             // Create directory if it doesn't exist
             fs::create_dir_all(&config_dir)?;
-            
+
             let config_path = config_dir.join("config.json");
             let json = serde_json::to_string_pretty(self)?;
             fs::write(config_path, json)?;
@@ -129,21 +132,24 @@ pub struct UpdateInfo {
 }
 
 /// Check for updates from GitHub releases
-pub fn check_for_updates(config: &UpdateCheckConfig, current_version: &str) -> Result<UpdateInfo, Box<dyn std::error::Error>> {
+pub fn check_for_updates(
+    config: &UpdateCheckConfig,
+    current_version: &str,
+) -> Result<UpdateInfo, Box<dyn std::error::Error>> {
     let client = reqwest::blocking::Client::builder()
         .user_agent("Rusty-Backup")
         .build()?;
-    
+
     let api_url = config.api_url();
     let response = client.get(&api_url).send()?;
     let release: GithubRelease = response.json()?;
-    
+
     // Remove 'v' prefix if present
     let latest_version = release.tag_name.trim_start_matches('v').to_string();
     let current = current_version.trim_start_matches('v');
-    
+
     let is_outdated = latest_version != current;
-    
+
     Ok(UpdateInfo {
         current_version: current.to_string(),
         latest_version,

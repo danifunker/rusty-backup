@@ -21,11 +21,7 @@ pub enum DaemonRequest {
     /// Open a disk device for writing (unmounts volumes first).
     OpenDiskWrite { path: String },
     /// Read sectors from an open disk.
-    ReadSectors {
-        handle: u64,
-        lba: u64,
-        count: u32,
-    },
+    ReadSectors { handle: u64, lba: u64, count: u32 },
     /// Write sectors to an open disk.
     WriteSectors {
         handle: u64,

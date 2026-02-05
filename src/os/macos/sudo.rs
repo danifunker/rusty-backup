@@ -58,13 +58,13 @@ pub fn sudo_execute(command: &[String], preserve_env: bool) -> Result<bool> {
             .args(&command[1..])
             .status()
             .context("Failed to execute command")?;
-        
+
         return Ok(status.success());
     }
 
     // Create temporary askpass script
     let askpass_path = create_askpass_script()?;
-    
+
     // Build the shell command that prints a marker on success
     let shell_cmd = format!(
         "echo {} && {}",
@@ -78,11 +78,11 @@ pub fn sudo_execute(command: &[String], preserve_env: bool) -> Result<bool> {
 
     // Build sudo command
     let mut sudo_cmd = Command::new("sudo");
-    
+
     if preserve_env {
         sudo_cmd.arg("-E");
     }
-    
+
     sudo_cmd
         .arg("--askpass")
         .arg("sh")
@@ -126,10 +126,7 @@ pub fn sudo_execute(command: &[String], preserve_env: bool) -> Result<bool> {
             // Exit code 255 means user cancelled in osascript
             Ok(false)
         } else {
-            bail!(
-                "Failed to authenticate: {}",
-                stderr.trim()
-            );
+            bail!("Failed to authenticate: {}", stderr.trim());
         }
     }
 }
@@ -138,13 +135,12 @@ pub fn sudo_execute(command: &[String], preserve_env: bool) -> Result<bool> {
 fn create_askpass_script() -> Result<PathBuf> {
     let pid = std::process::id();
     let path = PathBuf::from(format!("/tmp/rusty-backup-askpass-{}.js", pid));
-    
-    let mut file = fs::File::create(&path)
-        .context("Failed to create temporary askpass script")?;
-    
+
+    let mut file = fs::File::create(&path).context("Failed to create temporary askpass script")?;
+
     file.write_all(ASKPASS_SCRIPT.as_bytes())
         .context("Failed to write askpass script")?;
-    
+
     // Make executable
     #[cfg(unix)]
     {
@@ -153,7 +149,7 @@ fn create_askpass_script() -> Result<PathBuf> {
         perms.set_mode(0o755);
         fs::set_permissions(&path, perms)?;
     }
-    
+
     Ok(path)
 }
 
@@ -162,14 +158,15 @@ fn shell_escape(arg: &str) -> String {
     if arg.is_empty() {
         return "''".to_string();
     }
-    
+
     // If the argument contains no special characters, return as-is
-    if arg.chars().all(|c| {
-        c.is_alphanumeric() || c == '-' || c == '_' || c == '/' || c == '.' || c == ':'
-    }) {
+    if arg
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '/' || c == '.' || c == ':')
+    {
         return arg.to_string();
     }
-    
+
     // Otherwise, wrap in single quotes and escape any single quotes
     format!("'{}'", arg.replace('\'', "'\\''"))
 }
@@ -181,18 +178,17 @@ fn shell_escape(arg: &str) -> String {
 /// (the current process will be replaced by the elevated one).
 pub fn request_app_elevation() -> Result<()> {
     // Get the current executable path
-    let exe_path = env::current_exe()
-        .context("Failed to get current executable path")?;
-    
+    let exe_path = env::current_exe().context("Failed to get current executable path")?;
+
     // Get current arguments
     let args: Vec<String> = env::args().skip(1).collect();
-    
+
     // Build command: [exe_path, arg1, arg2, ...]
     let mut command = vec![exe_path.to_string_lossy().to_string()];
     command.extend(args);
-    
+
     eprintln!("Requesting administrator privileges...");
-    
+
     // Request elevation
     match sudo_execute(&command, true) {
         Ok(true) => {

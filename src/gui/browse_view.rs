@@ -217,7 +217,7 @@ impl BrowseView {
 
                 // Track expansion state after the header is shown
                 let is_now_open = header.body_returned.is_some();
-                
+
                 // Load directory contents on first expansion
                 if is_now_open {
                     if !has_children {

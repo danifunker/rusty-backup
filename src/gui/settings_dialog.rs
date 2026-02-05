@@ -118,7 +118,7 @@ impl SettingsDialog {
 
     fn save_settings(&mut self) {
         let mut config = UpdateConfig::load();
-        
+
         // Update chdman path
         config.chdman_path = if self.chdman_path.trim().is_empty() {
             None
@@ -132,7 +132,10 @@ impl SettingsDialog {
 
         match config.save() {
             Ok(_) => {
-                self.status_message = Some("Settings saved successfully! Restart to apply update check changes.".to_string());
+                self.status_message = Some(
+                    "Settings saved successfully! Restart to apply update check changes."
+                        .to_string(),
+                );
                 // Note: chdman detection will use new path on next backup
                 // Note: update check settings take effect on next app start
             }

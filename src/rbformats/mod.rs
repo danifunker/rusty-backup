@@ -363,7 +363,9 @@ pub fn reconstruct_disk_from_backup(
                 match writer.seek(SeekFrom::Current(pad as i64)) {
                     Ok(_) => total_written += pad,
                     Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
-                        log_cb("Warning: device doesn't support seek in data region, writing zeros");
+                        log_cb(
+                            "Warning: device doesn't support seek in data region, writing zeros",
+                        );
                         write_zeros(writer, pad)?;
                         total_written += pad;
                     }

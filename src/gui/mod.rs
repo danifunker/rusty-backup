@@ -6,19 +6,19 @@ mod progress;
 mod restore_tab;
 mod settings_dialog;
 
-use std::path::PathBuf;
 use backup_tab::BackupTab;
 use inspect_tab::InspectTab;
 use progress::{LogPanel, ProgressState};
 use restore_tab::RestoreTab;
 use settings_dialog::SettingsDialog;
+use std::path::PathBuf;
 
 use rusty_backup::device::{self, DiskDevice};
 use rusty_backup::rbformats::chd::detect_chdman;
 use rusty_backup::update::{check_for_updates, UpdateConfig, UpdateInfo};
 
 #[cfg(target_os = "linux")]
-use elevation_dialog::{ElevationDialog, ElevationAction};
+use elevation_dialog::{ElevationAction, ElevationDialog};
 
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -197,7 +197,11 @@ impl eframe::App for RustyBackupApp {
                 if info.is_outdated {
                     egui::TopBottomPanel::top("update_banner").show(ctx, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("⚠").color(egui::Color32::YELLOW).size(20.0));
+                            ui.label(
+                                egui::RichText::new("⚠")
+                                    .color(egui::Color32::YELLOW)
+                                    .size(20.0),
+                            );
                             ui.label(format!(
                                 "Update available: v{} → v{}",
                                 info.current_version, info.latest_version
@@ -205,11 +209,14 @@ impl eframe::App for RustyBackupApp {
                             if ui.button("View Release").clicked() {
                                 let _ = webbrowser::open(&info.releases_url);
                             }
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("✖").clicked() {
-                                    self.update_dismissed = true;
-                                }
-                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("✖").clicked() {
+                                        self.update_dismissed = true;
+                                    }
+                                },
+                            );
                         });
                     });
                 }
@@ -222,14 +229,16 @@ impl eframe::App for RustyBackupApp {
             let action = self.elevation_dialog.show(ctx);
             match action {
                 ElevationAction::Elevate => {
-                    self.log_panel.info("Relaunching with elevated privileges...");
+                    self.log_panel
+                        .info("Relaunching with elevated privileges...");
                     if let Err(e) = rusty_backup::os::linux::relaunch_with_elevation() {
                         self.log_panel.error(format!("Failed to elevate: {}", e));
                     }
                     // If relaunch_with_elevation returns, something went wrong
                 }
                 ElevationAction::Cancel => {
-                    self.log_panel.warn("Elevation cancelled. Device operations will fail.");
+                    self.log_panel
+                        .warn("Elevation cancelled. Device operations will fail.");
                 }
                 ElevationAction::None => {}
             }
@@ -262,9 +271,10 @@ impl eframe::App for RustyBackupApp {
                         self.inspect_tab.load_backup(&new_backup);
                     }
                 } else if self.loaded_backup_folder.is_some() && !self.restore_tab.has_backup() {
-                    self.restore_tab.load_backup(self.loaded_backup_folder.as_ref().unwrap());
+                    self.restore_tab
+                        .load_backup(self.loaded_backup_folder.as_ref().unwrap());
                 }
-                
+
                 self.restore_tab
                     .show(ui, &self.devices, &mut self.log_panel, &mut self.progress);
             }
@@ -276,9 +286,10 @@ impl eframe::App for RustyBackupApp {
                         self.restore_tab.load_backup(&new_backup);
                     }
                 } else if self.loaded_backup_folder.is_some() && !self.inspect_tab.has_backup() {
-                    self.inspect_tab.load_backup(self.loaded_backup_folder.as_ref().unwrap());
+                    self.inspect_tab
+                        .load_backup(self.loaded_backup_folder.as_ref().unwrap());
                 }
-                
+
                 self.inspect_tab
                     .show(ui, &self.devices, &mut self.log_panel);
             }

@@ -50,10 +50,12 @@ impl LogPanel {
     pub fn error(&mut self, message: impl Into<String>) {
         self.add(LogLevel::Error, message);
     }
-    
+
     /// Copy all log entries to clipboard
     fn copy_to_clipboard(&self, ctx: &egui::Context) {
-        let log_text: String = self.entries.iter()
+        let log_text: String = self
+            .entries
+            .iter()
             .map(|entry| {
                 let prefix = match entry.level {
                     LogLevel::Info => "INFO",
@@ -100,16 +102,12 @@ impl LogPanel {
                         LogLevel::Warning => "WARN",
                         LogLevel::Error => "ERR ",
                     };
-                    
+
                     let text = format!("{} [{}] {}", entry.timestamp, prefix, entry.message);
-                    
+
                     // Use horizontal layout with word wrap to handle long lines
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(
-                            RichText::new(text)
-                                .color(color)
-                                .monospace(),
-                        );
+                        ui.label(RichText::new(text).color(color).monospace());
                     });
                 }
             });

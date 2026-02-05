@@ -373,7 +373,7 @@ impl<R: Read + Seek> FatFilesystem<R> {
             let offset = self.cluster_offset(cluster);
             self.reader.seek(SeekFrom::Start(offset))?;
             let mut buf = vec![0u8; cluster_size];
-            
+
             // Use read() instead of read_exact() to handle partial reads at EOF
             match self.reader.read(&mut buf) {
                 Ok(n) if n > 0 => {
@@ -1771,16 +1771,21 @@ pub fn resize_fat_in_place(
         fat_data.resize(new_fat_bytes, 0);
 
         // Write extended FAT to each copy
-        log_cb(&format!("Writing {} FAT copies of {} bytes each...", num_fats, new_fat_bytes));
+        log_cb(&format!(
+            "Writing {} FAT copies of {} bytes each...",
+            num_fats, new_fat_bytes
+        ));
         for i in 0..num_fats as u64 {
             let fat_pos =
                 partition_offset + reserved_sectors as u64 * bps + i * new_fat_bytes as u64;
             log_cb(&format!("FAT copy {}: seeking to offset {}", i, fat_pos));
-            file.seek(SeekFrom::Start(fat_pos))
-                .with_context(|| format!("failed to seek to FAT copy {} at offset {}", i, fat_pos))?;
+            file.seek(SeekFrom::Start(fat_pos)).with_context(|| {
+                format!("failed to seek to FAT copy {} at offset {}", i, fat_pos)
+            })?;
             log_cb(&format!("FAT copy {}: writing {} bytes", i, fat_data.len()));
-            file.write_all(&fat_data)
-                .with_context(|| format!("failed to write FAT copy {} ({} bytes)", i, fat_data.len()))?;
+            file.write_all(&fat_data).with_context(|| {
+                format!("failed to write FAT copy {} ({} bytes)", i, fat_data.len())
+            })?;
         }
 
         log_cb(&format!(
@@ -1809,7 +1814,8 @@ pub fn resize_fat_in_place(
     log_cb("BPB updated successfully");
 
     // Flush writes before reading (required for raw devices on macOS)
-    file.flush().context("failed to flush before reading FAT flags")?;
+    file.flush()
+        .context("failed to flush before reading FAT flags")?;
 
     // --- 6. Set FAT dirty/clean flags ---
     // FAT[1] contains volume status flags. After manipulation we must set the
@@ -1819,7 +1825,7 @@ pub fn resize_fat_in_place(
     //
     // NOTE: On macOS raw devices (/dev/rdisk), read-after-write may fail with EINVAL.
     // The caller should close this file handle and reopen before calling set_fat_clean_flags().
-    
+
     log_cb("FAT resize complete (clean flags must be set separately after reopening file)");
     Ok(true)
 }
@@ -1846,7 +1852,7 @@ pub fn set_fat_clean_flags(
     let spf16 = u16::from_le_bytes([bpb[22], bpb[23]]);
     let root_entry_count = u16::from_le_bytes([bpb[17], bpb[18]]);
     let is_fat32 = spf16 == 0 && root_entry_count == 0;
-    
+
     let sectors_per_fat = if is_fat32 {
         u32::from_le_bytes([bpb[36], bpb[37], bpb[38], bpb[39]])
     } else {
@@ -1890,10 +1896,10 @@ pub fn set_fat_clean_flags(
     }
 
     log_cb(&format!("Setting FAT{} clean shutdown flags...", fat_bits));
-    
+
     let bps = bytes_per_sector as u64;
     let fat_start = partition_offset + reserved_sectors as u64 * bps;
-    
+
     for fat_copy in 0..num_fats as u64 {
         let fat_copy_start = fat_start + fat_copy * sectors_per_fat as u64 * bps;
         let entry1_offset = fat_copy_start
@@ -1902,10 +1908,11 @@ pub fn set_fat_clean_flags(
                 32 => 4u64, // FAT32: entry 1 at byte offset 4
                 _ => unreachable!(),
             };
-        
-        file.seek(SeekFrom::Start(entry1_offset))
-            .with_context(|| format!("failed to seek to FAT[1] entry at offset {}", entry1_offset))?;
-        
+
+        file.seek(SeekFrom::Start(entry1_offset)).with_context(|| {
+            format!("failed to seek to FAT[1] entry at offset {}", entry1_offset)
+        })?;
+
         match fat_bits {
             16 => {
                 let mut entry = [0u8; 2];
@@ -1930,12 +1937,12 @@ pub fn set_fat_clean_flags(
             _ => unreachable!(),
         }
     }
-    
+
     log_cb(&format!(
         "FAT{}: set clean shutdown flags in FAT[1]",
         fat_bits
     ));
-    
+
     Ok(())
 }
 

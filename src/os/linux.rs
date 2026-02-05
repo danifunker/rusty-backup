@@ -429,8 +429,8 @@ mod tests {
 // Privileged disk access implementation
 // ---------------------------------------------------------------------------
 
-use std::io::{ErrorKind, Read, Seek, Write};
 use std::fs::OpenOptions;
+use std::io::{ErrorKind, Read, Seek, Write};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
@@ -584,10 +584,7 @@ pub fn relaunch_with_elevation() -> Result<()> {
     }
 
     // Exec replaces current process - never returns on success
-    let err = Command::new("pkexec")
-        .arg(&current_exe)
-        .args(&args)
-        .exec();
+    let err = Command::new("pkexec").arg(&current_exe).args(&args).exec();
 
     Err(anyhow::anyhow!(err).context("Failed to relaunch with pkexec"))
 }

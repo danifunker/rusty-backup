@@ -5,8 +5,8 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
-use crate::update::UpdateConfig;
 use super::{file_name, output_path, CHUNK_SIZE};
+use crate::update::UpdateConfig;
 
 /// Get the chdman command name or path to use (from config or default to PATH)
 fn get_chdman_command() -> String {

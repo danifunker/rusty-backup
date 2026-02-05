@@ -17,7 +17,7 @@ use windows::Win32::Storage::FileSystem::{
     OPEN_EXISTING,
 };
 use windows::Win32::System::IO::DeviceIoControl;
-use windows::Win32::UI::Shell::{ShellExecuteW, SHELLEXECUTEINFOW, SEE_MASK_NOCLOSEPROCESS};
+use windows::Win32::UI::Shell::{ShellExecuteW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 use windows::Win32::UI::WindowsAndMessaging::{SHOW_WINDOW_CMD, SW_SHOW};
 
 use crate::device::{DiskDevice, MountedPartition};
@@ -538,8 +538,7 @@ pub fn open_source_for_reading(path: &Path) -> Result<crate::os::ElevatedSource>
 
     if !is_physical_drive {
         // Regular file - just open normally
-        let file = File::open(path)
-            .with_context(|| format!("cannot open {}", path.display()))?;
+        let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
         return Ok(crate::os::ElevatedSource {
             file,
             temp_path: None,
