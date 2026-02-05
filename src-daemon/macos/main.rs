@@ -93,21 +93,26 @@ fn main() {
 /// Launchd passes sockets as file descriptors, first socket is at FD 3.
 /// Returns Ok if we successfully got a socket from launchd, Err otherwise.
 fn try_get_launchd_socket() -> Result<UnixListener, Box<dyn std::error::Error>> {
-    use std::os::unix::io::FromRawFd;
+    use std::os::unix::io::{FromRawFd, IntoRawFd};
     
     // Try to use file descriptor 3 (first launchd socket)
     unsafe {
-        let listener = UnixListener::from_raw_fd(3);
+        // First, check if FD 3 is valid before taking ownership
+        use std::os::unix::io::RawFd;
+        let fd: RawFd = 3;
         
-        // Test if it's valid by trying to get local address
-        match listener.local_addr() {
-            Ok(_) => {
-                eprintln!("Successfully acquired socket from launchd (FD 3)");
-                Ok(listener)
-            }
-            Err(e) => {
-                Err(format!("FD 3 is not a valid socket: {}", e).into())
-            }
+        // Try to get socket name without taking ownership
+        let mut addr: libc::sockaddr_un = std::mem::zeroed();
+        let mut addr_len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        
+        if libc::getsockname(fd, &mut addr as *mut _ as *mut libc::sockaddr, &mut addr_len) == 0 {
+            // FD 3 is a valid socket, take ownership
+            let listener = UnixListener::from_raw_fd(fd);
+            eprintln!("Successfully acquired socket from launchd (FD 3)");
+            Ok(listener)
+        } else {
+            // FD 3 is not a valid socket - don't take ownership
+            Err("FD 3 is not a valid socket (launchd socket activation not active)".into())
         }
     }
 }

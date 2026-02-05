@@ -609,13 +609,17 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
         // Use daemon to read device on-demand (no temp file!)
         match DaemonDiskReader::new(path) {
             Ok(reader) => {
+                eprintln!("[DEBUG] Using daemon for device access: {}", path.display());
                 return Ok(ElevatedSource::from_daemon_reader(reader));
             }
             Err(e) => {
                 // Daemon failed, fall back to legacy
-                eprintln!("Daemon read failed: {}, falling back to dd", e);
+                eprintln!("[WARNING] Daemon read failed: {}, falling back to dd", e);
             }
         }
+    } else {
+        eprintln!("[DEBUG] Daemon not available (installed: {}, running: {}), using dd", 
+                 is_daemon_installed(), is_daemon_running());
     }
     
     // Fallback to old osascript + dd approach
@@ -1009,7 +1013,38 @@ fn is_daemon_installed() -> bool {
     std::path::Path::new(DAEMON_PLIST).exists()
 }
 
-/// Check if daemon is running.
+/// Check if daemon is running by sending a GetVersion request.
+/// This properly tests daemon communication rather than just connecting.
 fn is_daemon_running() -> bool {
-    UnixStream::connect(SOCKET_PATH).is_ok()
+    use std::io::{BufRead, BufReader, Write};
+    use crate::privileged::protocol::DaemonRequest;
+    use std::time::Duration;
+    
+    match UnixStream::connect(SOCKET_PATH) {
+        Ok(mut stream) => {
+            // Set a timeout to avoid hanging if daemon crashes
+            if stream.set_read_timeout(Some(Duration::from_secs(2))).is_err() {
+                return false;
+            }
+            if stream.set_write_timeout(Some(Duration::from_secs(2))).is_err() {
+                return false;
+            }
+            
+            // Send a GetVersion request
+            let request = DaemonRequest::GetVersion;
+            if let Ok(req_str) = serde_json::to_string(&request) {
+                if writeln!(stream, "{}", req_str).is_ok() {
+                    // Try to read response with timeout
+                    let mut reader = BufReader::new(stream);
+                    let mut response = String::new();
+                    if reader.read_line(&mut response).is_ok() && !response.is_empty() {
+                        // Successfully communicated with daemon
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        Err(_) => false,
+    }
 }

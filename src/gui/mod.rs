@@ -54,6 +54,12 @@ pub struct RustyBackupApp {
     daemon_dialog: DaemonDialog,
     /// Shared backup folder path between restore and inspect tabs
     loaded_backup_folder: Option<PathBuf>,
+    /// Cached privileged access status (to avoid checking every frame)
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    cached_access_status: Option<rusty_backup::privileged::AccessStatus>,
+    /// Last time we checked access status
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    last_status_check: std::time::Instant,
 }
 
 impl Default for RustyBackupApp {
@@ -161,7 +167,43 @@ impl Default for RustyBackupApp {
             #[cfg(target_os = "macos")]
             daemon_dialog,
             loaded_backup_folder: None,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            cached_access_status: None,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            last_status_check: std::time::Instant::now() - std::time::Duration::from_secs(10),
         }
+    }
+}
+
+impl RustyBackupApp {
+    /// Get the cached privileged access status, refreshing if stale.
+    /// This avoids calling expensive check_status() on every frame.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn get_access_status(&mut self) -> Option<rusty_backup::privileged::AccessStatus> {
+        const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+        
+        // Check if cache is stale
+        if self.last_status_check.elapsed() > CHECK_INTERVAL || self.cached_access_status.is_none() {
+            // Refresh cache
+            if let Ok(access) = rusty_backup::privileged::create_disk_access() {
+                if let Ok(status) = access.check_status() {
+                    self.cached_access_status = Some(status.clone());
+                    self.last_status_check = std::time::Instant::now();
+                    return Some(status);
+                }
+            }
+            None
+        } else {
+            // Return cached value
+            self.cached_access_status.clone()
+        }
+    }
+    
+    /// Invalidate the access status cache (call after install/uninstall).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn invalidate_access_cache(&mut self) {
+        self.cached_access_status = None;
+        self.last_status_check = std::time::Instant::now() - std::time::Duration::from_secs(10);
     }
 }
 
@@ -203,18 +245,16 @@ impl eframe::App for RustyBackupApp {
                     // Elevation button (Linux only, when not root)
                     #[cfg(target_os = "linux")]
                     {
-                        if let Ok(access) = rusty_backup::privileged::create_disk_access() {
-                            if let Ok(status) = access.check_status() {
-                                if status == rusty_backup::privileged::AccessStatus::NeedsElevation {
-                                    if ui
-                                        .button(egui::RichText::new("⚠ Request Elevation").color(egui::Color32::YELLOW))
-                                        .on_hover_text("Restart with administrator privileges to access disk devices")
-                                        .clicked()
-                                    {
-                                        self.elevation_dialog.open();
-                                    }
-                                    ui.separator();
+                        if let Some(status) = self.get_access_status() {
+                            if status == rusty_backup::privileged::AccessStatus::NeedsElevation {
+                                if ui
+                                    .button(egui::RichText::new("⚠ Request Elevation").color(egui::Color32::YELLOW))
+                                    .on_hover_text("Restart with administrator privileges to access disk devices")
+                                    .clicked()
+                                {
+                                    self.elevation_dialog.open();
                                 }
+                                ui.separator();
                             }
                         }
                     }
@@ -222,12 +262,11 @@ impl eframe::App for RustyBackupApp {
                     // Daemon install button (macOS only, when daemon not ready)
                     #[cfg(target_os = "macos")]
                     {
-                        if let Ok(access) = rusty_backup::privileged::create_disk_access() {
-                            if let Ok(status) = access.check_status() {
-                                match status {
-                                    rusty_backup::privileged::AccessStatus::DaemonNotInstalled => {
-                                        if ui
-                                            .button(egui::RichText::new("⚠ Install Helper").color(egui::Color32::YELLOW))
+                        if let Some(status) = self.get_access_status() {
+                            match status {
+                                rusty_backup::privileged::AccessStatus::DaemonNotInstalled => {
+                                    if ui
+                                        .button(egui::RichText::new("⚠ Install Helper").color(egui::Color32::YELLOW))
                                             .on_hover_text("Install privileged helper daemon to access disk devices")
                                             .clicked()
                                         {
@@ -262,7 +301,6 @@ impl eframe::App for RustyBackupApp {
                                 }
                             }
                         }
-                    }
                     
                     if ui.button("Refresh Devices").clicked() {
                         self.devices = device::enumerate_devices();
@@ -328,20 +366,8 @@ impl eframe::App for RustyBackupApp {
                     match rusty_backup::os::macos::install_daemon() {
                         Ok(()) => {
                             self.log_panel.info("Helper daemon installed successfully!");
-                            // Recheck status
-                            if let Ok(access) = rusty_backup::privileged::create_disk_access() {
-                                if let Ok(status) = access.check_status() {
-                                    match status {
-                                        rusty_backup::privileged::AccessStatus::Ready => {
-                                            self.log_panel.info("Daemon is ready to use");
-                                        }
-                                        rusty_backup::privileged::AccessStatus::DaemonNeedsApproval => {
-                                            self.log_panel.warn("Please approve the daemon in System Settings > Login Items, then restart Rusty Backup");
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
+                            // Invalidate cache to force status recheck
+                            self.invalidate_access_cache();
                         }
                         Err(e) => {
                             self.log_panel.error(format!("Failed to install daemon: {}", e));
