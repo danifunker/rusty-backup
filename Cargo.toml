@@ -14,15 +14,8 @@ resolver = "2"
 name = "rusty-backup"
 path = "src/main.rs"
 
-# macOS privileged helper daemon
-[[bin]]
-name = "rusty-backup-helper"
-path = "src-daemon/macos/main.rs"
-required-features = ["macos-daemon"]
-
 [features]
 default = []
-macos-daemon = []
 
 [dependencies]
 eframe = "0.33"
