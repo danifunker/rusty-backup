@@ -145,7 +145,7 @@ impl eframe::App for RustyBackupApp {
                     // Version display
                     ui.label(format!("v{}", env!("APP_VERSION")));
                     ui.separator();
-                    
+
                     // Close Backup button (if backup loaded)
                     if self.loaded_backup_folder.is_some() {
                         if ui.button("Close Backup").clicked() {
@@ -156,12 +156,12 @@ impl eframe::App for RustyBackupApp {
                         }
                         ui.separator();
                     }
-                    
+
                     if ui.button("Settings").clicked() {
                         self.settings_dialog.open_dialog();
                     }
                     ui.separator();
-                    
+
                     // Elevation button (Linux only, when not root)
                     #[cfg(target_os = "linux")]
                     {
@@ -180,7 +180,7 @@ impl eframe::App for RustyBackupApp {
                             }
                         }
                     }
-                    
+
                     if ui.button("Refresh Devices").clicked() {
                         self.devices = device::enumerate_devices();
                         self.log_panel

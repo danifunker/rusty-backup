@@ -50,7 +50,7 @@ impl SettingsDialog {
                     {
                         ui.heading("macOS Permissions");
                         ui.add_space(10.0);
-                        
+
                         ui.horizontal(|ui| {
                             ui.label(
                                 egui::RichText::new("ℹ")
@@ -62,9 +62,9 @@ impl SettingsDialog {
                                 ui.label("You'll be prompted for your password when accessing disk devices.");
                             });
                         });
-                        
+
                         ui.add_space(20.0);
-                        
+
                         ui.separator();
                         ui.add_space(10.0);
                     }
