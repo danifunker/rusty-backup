@@ -5,8 +5,8 @@ pub mod filesystem;
 use std::io::{Read, Seek};
 
 pub use fat::{
-    patch_bpb_hidden_sectors, resize_fat_in_place, validate_fat_integrity, CompactFatReader,
-    CompactInfo,
+    patch_bpb_hidden_sectors, resize_fat_in_place, set_fat_clean_flags, validate_fat_integrity,
+    CompactFatReader, CompactInfo,
 };
 use filesystem::{Filesystem, FilesystemError};
 

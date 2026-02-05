@@ -8,6 +8,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::backup::metadata::BackupMetadata;
 use crate::backup::LogLevel;
+use crate::fs::{resize_fat_in_place, set_fat_clean_flags, validate_fat_integrity};
 use crate::os::SectorAlignedWriter;
 use crate::partition::PartitionSizeOverride;
 use crate::rbformats::reconstruct_disk_from_backup;
@@ -20,6 +21,9 @@ pub struct RestoreConfig {
     pub target_size: u64,
     pub alignment: RestoreAlignment,
     pub partition_sizes: Vec<RestorePartitionSize>,
+    /// Write zeros to unused filesystem space. Generally not needed for FAT.
+    /// Set to true only if you encounter issues with specific filesystem types.
+    pub write_zeros_to_unused: bool,
 }
 
 /// Alignment choice for the restore.
@@ -365,7 +369,7 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
         bail!("restore cancelled");
     }
 
-    // Step 7: Reconstruct disk
+    // Step 7: Reconstruct disk (write all data)
     set_operation(&progress, "Writing disk image...");
     let progress_clone = Arc::clone(&progress);
     let progress_cancel = Arc::clone(&progress);
@@ -377,6 +381,8 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
         &overrides,
         config.target_size,
         &mut target,
+        config.target_is_device,
+        config.write_zeros_to_unused,
         &mut |bytes| {
             set_progress_bytes(&progress_clone, bytes, config.target_size);
         },
@@ -386,9 +392,72 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
         },
     )?;
 
-    target.flush()?;
+    // Step 8: FAT resize operations (using inner File to avoid buffer flush on every seek)
+    set_operation(&progress, "Finalizing filesystems...");
+    
+    for (pm, ov) in metadata.partitions.iter().zip(&overrides) {
+        let part_offset = ov.effective_start_lba() * 512;
+        let export_size = ov.export_size;
+        
+        // Get direct access to the File for FAT operations (avoids SectorAlignedWriter overhead)
+        let inner_file = target.inner_mut()
+            .context("failed to access device for filesystem operations")?;
+        
+        // Resize FAT filesystem if the partition size changed
+        if export_size != pm.original_size_bytes {
+            let new_sectors = (export_size / 512) as u32;
+            resize_fat_in_place(
+                inner_file,
+                part_offset,
+                new_sectors,
+                &mut |msg| log(&progress, LogLevel::Info, msg),
+            )?;
+        }
 
-    // Step 8: Post-restore summary
+        // Validate FAT integrity after resize
+        if export_size != pm.original_size_bytes || pm.compacted {
+            let _ = validate_fat_integrity(
+                inner_file,
+                part_offset,
+                &mut |msg| log(&progress, LogLevel::Info, msg),
+            );
+        }
+    }
+
+    target.flush()?;
+    
+    // Close the file to ensure all writes are committed
+    drop(target);
+    
+    // Step 9: Reopen device and set FAT clean flags (requires fresh file handle on macOS)
+    if config.target_is_device {
+        log(&progress, LogLevel::Info, "Setting FAT clean shutdown flags...");
+        
+        // Reopen device for read-write
+        let mut device_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&config.target_path)
+            .with_context(|| format!("failed to reopen {} for setting flags", config.target_path.display()))?;
+        
+        for (pm, ov) in metadata.partitions.iter().zip(&overrides) {
+            let part_offset = ov.effective_start_lba() * 512;
+            let export_size = ov.export_size;
+            
+            // Set clean flags if this was a FAT filesystem that got resized
+            if export_size != pm.original_size_bytes || pm.compacted {
+                let _ = set_fat_clean_flags(
+                    &mut device_file,
+                    part_offset,
+                    &mut |msg| log(&progress, LogLevel::Info, msg),
+                );
+            }
+        }
+        
+        device_file.flush()?;
+    }
+
+    // Step 10: Post-restore summary
     log(
         &progress,
         LogLevel::Info,

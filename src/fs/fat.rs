@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 
 use super::entry::FileEntry;
@@ -1771,17 +1771,25 @@ pub fn resize_fat_in_place(
         fat_data.resize(new_fat_bytes, 0);
 
         // Write extended FAT to each copy
+        log_cb(&format!("Writing {} FAT copies of {} bytes each...", num_fats, new_fat_bytes));
         for i in 0..num_fats as u64 {
             let fat_pos =
                 partition_offset + reserved_sectors as u64 * bps + i * new_fat_bytes as u64;
-            file.seek(SeekFrom::Start(fat_pos))?;
-            file.write_all(&fat_data)?;
+            log_cb(&format!("FAT copy {}: seeking to offset {}", i, fat_pos));
+            file.seek(SeekFrom::Start(fat_pos))
+                .with_context(|| format!("failed to seek to FAT copy {} at offset {}", i, fat_pos))?;
+            log_cb(&format!("FAT copy {}: writing {} bytes", i, fat_data.len()));
+            file.write_all(&fat_data)
+                .with_context(|| format!("failed to write FAT copy {} ({} bytes)", i, fat_data.len()))?;
         }
 
         log_cb(&format!(
             "Extended FAT: {} -> {} sectors per copy",
             old_spf, new_spf,
         ));
+
+        // Flush FAT writes before updating BPB
+        file.flush().context("failed to flush FAT writes")?;
     } else if growing {
         log_cb("FAT has spare capacity, no table extension needed");
     }
@@ -1795,100 +1803,140 @@ pub fn resize_fat_in_place(
             bpb[22..24].copy_from_slice(&(new_spf as u16).to_le_bytes());
         }
     }
-    write_bpb(file, partition_offset, &bpb, is_fat32, bytes_per_sector)?;
+    log_cb("Updating BPB with new parameters...");
+    write_bpb(file, partition_offset, &bpb, is_fat32, bytes_per_sector)
+        .context("failed to write updated BPB")?;
+    log_cb("BPB updated successfully");
+
+    // Flush writes before reading (required for raw devices on macOS)
+    file.flush().context("failed to flush before reading FAT flags")?;
 
     // --- 6. Set FAT dirty/clean flags ---
     // FAT[1] contains volume status flags. After manipulation we must set the
     // clean shutdown + no I/O error bits, otherwise Windows 95/98 and scandisk
     // will detect corruption.
     // FAT12 has no dirty flags in FAT[1].
-    if fat_bits == 16 || fat_bits == 32 {
-        let fat_start = partition_offset + reserved_sectors as u64 * bps;
-        for fat_copy in 0..num_fats as u64 {
-            let fat_copy_start = fat_start + fat_copy * new_spf as u64 * bps;
-            let entry1_offset = fat_copy_start
-                + match fat_bits {
-                    16 => 2u64, // FAT16: entry 1 at byte offset 2
-                    32 => 4u64, // FAT32: entry 1 at byte offset 4
-                    _ => unreachable!(),
-                };
-            file.seek(SeekFrom::Start(entry1_offset))?;
-            match fat_bits {
-                16 => {
-                    let mut entry = [0u8; 2];
-                    file.read_exact(&mut entry)?;
-                    let mut val = u16::from_le_bytes(entry);
-                    val |= 0xC000; // bit 15 = clean shutdown, bit 14 = no I/O errors
-                    file.seek(SeekFrom::Start(entry1_offset))?;
-                    file.write_all(&val.to_le_bytes())?;
-                }
-                32 => {
-                    let mut entry = [0u8; 4];
-                    file.read_exact(&mut entry)?;
-                    let mut val = u32::from_le_bytes(entry);
-                    val |= 0x0C00_0000; // bit 27 = clean shutdown, bit 26 = no I/O errors
-                    file.seek(SeekFrom::Start(entry1_offset))?;
-                    file.write_all(&val.to_le_bytes())?;
-                }
-                _ => unreachable!(),
-            }
-        }
-        log_cb(&format!(
-            "FAT{}: set clean shutdown flags in FAT[1]",
-            fat_bits
-        ));
-    }
-
-    // --- 7. FAT32: update FSInfo ---
-    if is_fat32 {
-        let fsinfo_sector = u16::from_le_bytes([bpb[48], bpb[49]]);
-        if fsinfo_sector > 0 && (fsinfo_sector as u32) < reserved_sectors {
-            let fsinfo_offset = partition_offset + fsinfo_sector as u64 * bps;
-            file.seek(SeekFrom::Start(fsinfo_offset))?;
-            let mut fsinfo = [0u8; 512];
-            file.read_exact(&mut fsinfo)?;
-
-            let sig1 = u32::from_le_bytes(fsinfo[0..4].try_into().unwrap());
-            let sig2 = u32::from_le_bytes(fsinfo[484..488].try_into().unwrap());
-            if sig1 == 0x41615252 && sig2 == 0x61417272 {
-                // Calculate actual free cluster count instead of setting to unknown.
-                // Windows 95's FAT32 driver may not recompute from 0xFFFFFFFF and
-                // could display 0 free space.
-                let actual_free = compute_free_clusters(
-                    file,
-                    partition_offset,
-                    reserved_sectors,
-                    new_spf,
-                    new_clusters,
-                    bps,
-                    fat_bits,
-                )?;
-                fsinfo[488..492].copy_from_slice(&actual_free.to_le_bytes());
-
-                // Next free cluster hint
-                if new_clusters > old_clusters {
-                    fsinfo[492..496].copy_from_slice(&(old_clusters + 2).to_le_bytes());
-                } else {
-                    fsinfo[492..496].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-                }
-
-                file.seek(SeekFrom::Start(fsinfo_offset))?;
-                file.write_all(&fsinfo)?;
-                log_cb(&format!(
-                    "Updated FAT32 FSInfo: {} free clusters",
-                    actual_free
-                ));
-            }
-        }
-    }
-
-    file.flush()?;
-    log_cb(&format!(
-        "FAT{} resize complete: {} clusters, {} total sectors",
-        fat_bits, new_clusters, new_total_sectors,
-    ));
-
+    //
+    // NOTE: On macOS raw devices (/dev/rdisk), read-after-write may fail with EINVAL.
+    // The caller should close this file handle and reopen before calling set_fat_clean_flags().
+    
+    log_cb("FAT resize complete (clean flags must be set separately after reopening file)");
     Ok(true)
+}
+
+/// Set FAT clean shutdown flags in FAT[1] for FAT16/32 filesystems.
+/// Should be called AFTER resize_fat_in_place() with a fresh file handle (reopened).
+pub fn set_fat_clean_flags(
+    file: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    log_cb: &mut impl FnMut(&str),
+) -> Result<()> {
+    // Read BPB to get filesystem parameters
+    file.seek(SeekFrom::Start(partition_offset))?;
+    let mut bpb = [0u8; 512];
+    file.read_exact(&mut bpb)?;
+
+    if bpb[0] != 0xEB && bpb[0] != 0xE9 {
+        return Ok(()); // Not a FAT BPB
+    }
+
+    let bytes_per_sector = u16::from_le_bytes([bpb[11], bpb[12]]);
+    let reserved_sectors = u16::from_le_bytes([bpb[14], bpb[15]]) as u32;
+    let num_fats = bpb[16] as u32;
+    let spf16 = u16::from_le_bytes([bpb[22], bpb[23]]);
+    let root_entry_count = u16::from_le_bytes([bpb[17], bpb[18]]);
+    let is_fat32 = spf16 == 0 && root_entry_count == 0;
+    
+    let sectors_per_fat = if is_fat32 {
+        u32::from_le_bytes([bpb[36], bpb[37], bpb[38], bpb[39]])
+    } else {
+        spf16 as u32
+    };
+
+    let fat_bits = if is_fat32 {
+        32
+    } else if spf16 > 0 {
+        // Determine FAT12 vs FAT16 based on cluster count
+        let total_sectors16 = u16::from_le_bytes([bpb[19], bpb[20]]);
+        let total_sectors32 = u32::from_le_bytes([bpb[32], bpb[33], bpb[34], bpb[35]]);
+        let total_sectors = if total_sectors16 != 0 {
+            total_sectors16 as u32
+        } else {
+            total_sectors32
+        };
+        let root_dir_sectors = ((root_entry_count as u32 * 32) + bytes_per_sector as u32 - 1)
+            / bytes_per_sector as u32;
+        let data_sectors = total_sectors
+            .saturating_sub(reserved_sectors)
+            .saturating_sub(num_fats * spf16 as u32)
+            .saturating_sub(root_dir_sectors);
+        let sectors_per_cluster = bpb[13] as u32;
+        let cluster_count = if sectors_per_cluster > 0 {
+            data_sectors / sectors_per_cluster
+        } else {
+            0
+        };
+        if cluster_count < 4085 {
+            12
+        } else {
+            16
+        }
+    } else {
+        return Ok(()); // Invalid
+    };
+
+    if fat_bits == 12 {
+        return Ok(()); // FAT12 has no clean flags
+    }
+
+    log_cb(&format!("Setting FAT{} clean shutdown flags...", fat_bits));
+    
+    let bps = bytes_per_sector as u64;
+    let fat_start = partition_offset + reserved_sectors as u64 * bps;
+    
+    for fat_copy in 0..num_fats as u64 {
+        let fat_copy_start = fat_start + fat_copy * sectors_per_fat as u64 * bps;
+        let entry1_offset = fat_copy_start
+            + match fat_bits {
+                16 => 2u64, // FAT16: entry 1 at byte offset 2
+                32 => 4u64, // FAT32: entry 1 at byte offset 4
+                _ => unreachable!(),
+            };
+        
+        file.seek(SeekFrom::Start(entry1_offset))
+            .with_context(|| format!("failed to seek to FAT[1] entry at offset {}", entry1_offset))?;
+        
+        match fat_bits {
+            16 => {
+                let mut entry = [0u8; 2];
+                file.read_exact(&mut entry)
+                    .context("failed to read FAT16 entry[1]")?;
+                let mut val = u16::from_le_bytes(entry);
+                val |= 0xC000; // bit 15 = clean shutdown, bit 14 = no I/O errors
+                file.seek(SeekFrom::Start(entry1_offset))?;
+                file.write_all(&val.to_le_bytes())
+                    .context("failed to write FAT16 entry[1]")?;
+            }
+            32 => {
+                let mut entry = [0u8; 4];
+                file.read_exact(&mut entry)
+                    .context("failed to read FAT32 entry[1]")?;
+                let mut val = u32::from_le_bytes(entry);
+                val |= 0x0C00_0000; // bit 27 = clean shutdown, bit 26 = no I/O errors
+                file.seek(SeekFrom::Start(entry1_offset))?;
+                file.write_all(&val.to_le_bytes())
+                    .context("failed to write FAT32 entry[1]")?;
+            }
+            _ => unreachable!(),
+        }
+    }
+    
+    log_cb(&format!(
+        "FAT{}: set clean shutdown flags in FAT[1]",
+        fat_bits
+    ));
+    
+    Ok(())
 }
 
 /// Validate the integrity of a FAT filesystem after resize/manipulation.

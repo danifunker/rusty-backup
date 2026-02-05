@@ -50,11 +50,30 @@ impl LogPanel {
     pub fn error(&mut self, message: impl Into<String>) {
         self.add(LogLevel::Error, message);
     }
+    
+    /// Copy all log entries to clipboard
+    fn copy_to_clipboard(&self, ctx: &egui::Context) {
+        let log_text: String = self.entries.iter()
+            .map(|entry| {
+                let prefix = match entry.level {
+                    LogLevel::Info => "INFO",
+                    LogLevel::Warning => "WARN",
+                    LogLevel::Error => "ERR ",
+                };
+                format!("{} [{}] {}", entry.timestamp, prefix, entry.message)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        ctx.copy_text(log_text);
+    }
 
     pub fn show(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Log").strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Copy Log").clicked() {
+                    self.copy_to_clipboard(ui.ctx());
+                }
                 if ui.button("Clear").clicked() {
                     self.entries.clear();
                 }
@@ -64,16 +83,13 @@ impl LogPanel {
 
         ui.separator();
 
-        let text_style = egui::TextStyle::Monospace;
-        let row_height = ui.text_style_height(&text_style) + 2.0;
-        let num_rows = self.entries.len();
-
+        // Use a simple ScrollArea without show_rows to avoid bouncing
         egui::ScrollArea::vertical()
             .auto_shrink([false; 2])
             .stick_to_bottom(self.auto_scroll)
-            .show_rows(ui, row_height, num_rows, |ui, row_range| {
-                for i in row_range {
-                    let entry = &self.entries[i];
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                for entry in &self.entries {
                     let color = match entry.level {
                         LogLevel::Info => Color32::GRAY,
                         LogLevel::Warning => Color32::YELLOW,
@@ -84,14 +100,15 @@ impl LogPanel {
                         LogLevel::Warning => "WARN",
                         LogLevel::Error => "ERR ",
                     };
-                    ui.horizontal(|ui| {
+                    
+                    let text = format!("{} [{}] {}", entry.timestamp, prefix, entry.message);
+                    
+                    // Use horizontal layout with word wrap to handle long lines
+                    ui.horizontal_wrapped(|ui| {
                         ui.label(
-                            RichText::new(format!(
-                                "{} [{}] {}",
-                                entry.timestamp, prefix, entry.message
-                            ))
-                            .color(color)
-                            .monospace(),
+                            RichText::new(text)
+                                .color(color)
+                                .monospace(),
                         );
                     });
                 }

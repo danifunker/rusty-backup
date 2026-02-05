@@ -12,7 +12,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::backup::metadata::BackupMetadata;
 use crate::backup::CompressionType;
-use crate::fs::fat::{patch_bpb_hidden_sectors, resize_fat_in_place, validate_fat_integrity};
+use crate::fs::fat::patch_bpb_hidden_sectors;
 use crate::partition::mbr::patch_mbr_entries;
 use crate::partition::PartitionSizeOverride;
 
@@ -224,8 +224,8 @@ pub fn decompress_to_writer(
 /// Shared by: VHD export (file writer), restore (device or file writer).
 ///
 /// Writes the MBR (patched with partition overrides), then each partition's
-/// compressed data at its correct offset, with FAT resize and BPB fixups
-/// as needed. Fills gaps and the remainder with zeros up to `_target_size`.
+/// compressed data at its correct offset, with FAT resize and BPB fixups.
+/// Gaps and unused space handling depends on `is_device` and `write_zeros`.
 ///
 /// Returns the total number of bytes written.
 pub fn reconstruct_disk_from_backup(
@@ -235,6 +235,8 @@ pub fn reconstruct_disk_from_backup(
     partition_sizes: &[PartitionSizeOverride],
     _target_size: u64,
     writer: &mut (impl Read + Write + Seek),
+    is_device: bool,
+    fill_unused_with_zeros: bool,
     progress_cb: &mut impl FnMut(u64),
     cancel_check: &impl Fn() -> bool,
     log_cb: &mut impl FnMut(&str),
@@ -291,11 +293,31 @@ pub fn reconstruct_disk_from_backup(
         let part_offset = effective_lba * 512;
         let export_size = get_export_size(pm.index, pm.original_size_bytes);
 
-        // Fill gap between current position and partition start
+        // Fill or seek over gap between current position and partition start
         if total_written < part_offset {
             let gap = part_offset - total_written;
-            write_zeros(writer, gap)?;
-            total_written += gap;
+            if is_device && fill_unused_with_zeros {
+                // Write zeros to gap (needed for some devices/filesystems)
+                write_zeros(writer, gap)?;
+                total_written += gap;
+            } else if is_device {
+                // Device without zero-fill: seek forward
+                // This may fail on some raw devices, but worth trying
+                match writer.seek(SeekFrom::Current(gap as i64)) {
+                    Ok(_) => total_written += gap,
+                    Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+                        // Seek not supported, write zeros as fallback
+                        log_cb("Warning: device doesn't support seek, writing zeros to gap");
+                        write_zeros(writer, gap)?;
+                        total_written += gap;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            } else {
+                // File: use sparse seeks
+                writer.seek(SeekFrom::Current(gap as i64))?;
+                total_written += gap;
+            }
         }
 
         // Write partition data
@@ -329,32 +351,35 @@ pub fn reconstruct_disk_from_backup(
         )?;
         total_written += bytes_written;
 
-        // Pad to export_size if we wrote less
+        // Handle unused space at end of partition
         if bytes_written < export_size {
             let pad = export_size - bytes_written;
-            write_zeros(writer, pad)?;
-            total_written += pad;
+            if fill_unused_with_zeros {
+                // User requested zero-fill (may be needed for some filesystems)
+                write_zeros(writer, pad)?;
+                total_written += pad;
+            } else if is_device {
+                // Device without zero-fill: try seek, fallback to zeros if needed
+                match writer.seek(SeekFrom::Current(pad as i64)) {
+                    Ok(_) => total_written += pad,
+                    Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+                        log_cb("Warning: device doesn't support seek in data region, writing zeros");
+                        write_zeros(writer, pad)?;
+                        total_written += pad;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            } else {
+                // File: sparse seek - filesystem resize will handle the space
+                writer.seek(SeekFrom::Current(pad as i64))?;
+                total_written += pad;
+            }
         }
 
         // Update BPB hidden sectors to match partition start LBA
         {
             writer.flush()?;
             patch_bpb_hidden_sectors(writer, part_offset, effective_lba, log_cb)?;
-        }
-
-        // Resize FAT filesystem if the partition size changed
-        if export_size != pm.original_size_bytes {
-            writer.flush()?;
-            let new_sectors = (export_size / 512) as u32;
-            resize_fat_in_place(writer, part_offset, new_sectors, log_cb)?;
-            writer.seek(SeekFrom::Start(total_written))?;
-        }
-
-        // Validate FAT integrity after resize
-        if export_size != pm.original_size_bytes || pm.compacted {
-            writer.flush()?;
-            let _ = validate_fat_integrity(writer, part_offset, log_cb);
-            writer.seek(SeekFrom::Start(total_written))?;
         }
 
         log_cb(&format!(

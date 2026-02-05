@@ -222,6 +222,7 @@ impl RestoreTab {
                     egui::ComboBox::from_id_salt("restore_target_device")
                         .selected_text(&current_label)
                         .width(400.0)
+                        .height(400.0) // Allow more items to be visible without scrolling
                         .show_ui(ui, |ui| {
                             for (i, device) in devices.iter().enumerate() {
                                 let label = format!(
@@ -706,6 +707,7 @@ impl RestoreTab {
             target_size,
             alignment,
             partition_sizes,
+            write_zeros_to_unused: false, // Default: no zero-fill (FAT handles it)
         };
 
         let progress_arc = Arc::new(Mutex::new(RestoreProgress::new()));

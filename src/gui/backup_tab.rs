@@ -156,6 +156,7 @@ impl BackupTab {
                 egui::ComboBox::from_id_salt("backup_source")
                     .selected_text(&current_label)
                     .width(400.0)
+                    .height(400.0) // Allow more items to be visible without scrolling
                     .show_ui(ui, |ui| {
                         for (i, device) in devices.iter().enumerate() {
                             if ui

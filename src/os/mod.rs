@@ -64,6 +64,15 @@ impl SectorAlignedWriter {
         self.buf.clear();
         Ok(())
     }
+    
+    /// Get mutable access to the inner File for operations requiring random access.
+    /// 
+    /// This flushes the buffer first. Use this for filesystem operations like FAT
+    /// resize that need to seek freely without triggering buffer flushes.
+    pub fn inner_mut(&mut self) -> io::Result<&mut File> {
+        self.flush_padded()?;
+        Ok(&mut self.inner)
+    }
 }
 
 impl Write for SectorAlignedWriter {

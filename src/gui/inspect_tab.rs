@@ -170,6 +170,7 @@ impl InspectTab {
             egui::ComboBox::from_id_salt("inspect_source")
                 .selected_text(&current_label)
                 .width(400.0)
+                .height(400.0) // Allow more items to be visible without scrolling
                 .show_ui(ui, |ui| {
                     for (i, device) in devices.iter().enumerate() {
                         let label = device.display_name();
