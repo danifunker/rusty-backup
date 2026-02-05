@@ -225,7 +225,7 @@ pub fn decompress_to_writer(
 ///
 /// Writes the MBR (patched with partition overrides), then each partition's
 /// compressed data at its correct offset, with FAT resize and BPB fixups
-/// as needed. Fills gaps and the remainder with zeros up to `target_size`.
+/// as needed. Fills gaps and the remainder with zeros up to `_target_size`.
 ///
 /// Returns the total number of bytes written.
 pub fn reconstruct_disk_from_backup(
@@ -233,7 +233,7 @@ pub fn reconstruct_disk_from_backup(
     metadata: &BackupMetadata,
     mbr_bytes: Option<&[u8; 512]>,
     partition_sizes: &[PartitionSizeOverride],
-    target_size: u64,
+    _target_size: u64,
     writer: &mut (impl Read + Write + Seek),
     progress_cb: &mut impl FnMut(u64),
     cancel_check: &impl Fn() -> bool,
@@ -361,13 +361,6 @@ pub fn reconstruct_disk_from_backup(
             "partition-{}: wrote {} bytes (export size: {})",
             pm.index, bytes_written, export_size,
         ));
-    }
-
-    // Fill remainder up to target_size
-    if total_written < target_size {
-        let remaining = target_size - total_written;
-        write_zeros(writer, remaining)?;
-        total_written += remaining;
     }
 
     writer.flush()?;
