@@ -794,7 +794,12 @@ impl RestoreTab {
                 index: cfg.index,
                 size_choice: match cfg.choice {
                     RestoreSizeUiChoice::Original => RestoreSizeChoice::Original,
-                    RestoreSizeUiChoice::Minimum => RestoreSizeChoice::Minimum,
+                    RestoreSizeUiChoice::Minimum => {
+                        // Pass the concrete minimum size so layout calculation
+                        // doesn't need to re-derive it (especially for Clonezilla
+                        // where the partclone header has the real used size).
+                        RestoreSizeChoice::Custom(cfg.minimum_size)
+                    }
                     RestoreSizeUiChoice::Custom => {
                         RestoreSizeChoice::Custom(cfg.custom_size_mib as u64 * 1024 * 1024)
                     }

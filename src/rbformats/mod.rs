@@ -245,6 +245,8 @@ pub fn reconstruct_disk_from_backup(
     cancel_check: &impl Fn() -> bool,
     log_cb: &mut impl FnMut(&str),
 ) -> Result<u64> {
+    // Build EBR chain if this backup has logical partitions
+    let ebr_chain = crate::restore::build_restore_ebr_chain(metadata, partition_sizes);
     let mut total_written: u64 = 0;
 
     // Helper to look up export size for a partition index
@@ -287,6 +289,22 @@ pub fn reconstruct_disk_from_backup(
     log_cb("Writing MBR to disk...");
     writer.write_all(&mbr_buf).context("failed to write MBR")?;
     total_written += 512;
+
+    // Write EBR chain if present (for logical partitions in extended container)
+    if let Some((_ext_start, ref chain)) = ebr_chain {
+        log_cb(&format!(
+            "Writing {} EBR sector(s) for logical partitions...",
+            chain.len()
+        ));
+        for (ebr_offset, ebr_sector) in chain {
+            writer.seek(SeekFrom::Start(*ebr_offset))?;
+            writer
+                .write_all(ebr_sector)
+                .context("failed to write EBR sector")?;
+        }
+        // Seek back to after MBR so gap filling works correctly
+        writer.seek(SeekFrom::Start(512))?;
+    }
 
     // Write each partition at its correct offset, filling gaps with zeros
     for pm in &metadata.partitions {

@@ -340,6 +340,79 @@ pub fn lba_to_chs(lba: u32, heads: u32, sectors_per_track: u32) -> (u32, u32, u3
     }
 }
 
+/// Info for a single logical partition, used to build an EBR chain.
+pub struct LogicalPartitionInfo {
+    /// Absolute start LBA of the logical partition data.
+    pub start_lba: u32,
+    /// Size of the logical partition in sectors.
+    pub total_sectors: u32,
+    /// MBR partition type byte (e.g. 0x06, 0x0B, 0x07).
+    pub partition_type: u8,
+}
+
+/// Build an EBR (Extended Boot Record) chain for logical partitions inside
+/// an extended container.
+///
+/// `extended_start_lba`: absolute LBA of the extended container.
+/// `logical_partitions`: logical partitions sorted by start_lba.
+///
+/// Returns a list of `(byte_offset, ebr_sector)` pairs to write to disk.
+///
+/// EBR layout follows the standard convention:
+/// - The first EBR sits at the extended container start.
+/// - Each subsequent EBR sits one sector before its logical partition data.
+/// - Entry 0 at offset 446: logical partition (start relative to this EBR)
+/// - Entry 1 at offset 462: link to next EBR (start relative to extended container)
+/// - Entries 2-3: unused (zeros)
+/// - Bytes 510-511: 0x55AA signature
+pub fn build_ebr_chain(
+    extended_start_lba: u32,
+    logical_partitions: &[LogicalPartitionInfo],
+) -> Vec<(u64, [u8; 512])> {
+    let mut result = Vec::with_capacity(logical_partitions.len());
+
+    for (i, lp) in logical_partitions.iter().enumerate() {
+        let mut ebr = [0u8; 512];
+
+        // First EBR is at the extended container start; subsequent EBRs are
+        // one sector before their logical partition data.
+        let ebr_lba = if i == 0 {
+            extended_start_lba
+        } else {
+            lp.start_lba - 1
+        };
+
+        // Entry 0: the logical partition (start relative to this EBR)
+        let e0_off = PARTITION_TABLE_OFFSET;
+        ebr[e0_off + 4] = lp.partition_type;
+        let rel_start: u32 = lp.start_lba - ebr_lba;
+        ebr[e0_off + 8..e0_off + 12].copy_from_slice(&rel_start.to_le_bytes());
+        ebr[e0_off + 12..e0_off + 16].copy_from_slice(&lp.total_sectors.to_le_bytes());
+
+        // Entry 1: link to next EBR (relative to extended container start)
+        if i + 1 < logical_partitions.len() {
+            let next_lp = &logical_partitions[i + 1];
+            let next_ebr_lba = next_lp.start_lba - 1;
+            let e1_off = PARTITION_TABLE_OFFSET + PARTITION_ENTRY_SIZE;
+            ebr[e1_off + 4] = 0x05; // extended type for the link
+            let next_rel = next_ebr_lba - extended_start_lba;
+            ebr[e1_off + 8..e1_off + 12].copy_from_slice(&next_rel.to_le_bytes());
+            // Size of next EBR region = 1 (EBR sector) + next partition sectors
+            let next_region_size = 1 + next_lp.total_sectors;
+            ebr[e1_off + 12..e1_off + 16].copy_from_slice(&next_region_size.to_le_bytes());
+        }
+        // Entry 1 is all zeros for the last partition (already zero-initialized)
+
+        // Boot signature
+        ebr[510] = 0x55;
+        ebr[511] = 0xAA;
+
+        result.push((ebr_lba as u64 * 512, ebr));
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -601,5 +674,127 @@ mod tests {
         assert_eq!(mbr.entries[0].chs_end.head, 254);
         assert_eq!(mbr.entries[0].chs_end.sector, 63);
         assert_eq!(mbr.entries[0].chs_end.cylinder, 1023);
+    }
+
+    #[test]
+    fn test_build_ebr_chain_single() {
+        // Extended container at LBA 1000, one logical partition at LBA 1002
+        // First EBR sits at the extended container start (LBA 1000)
+        let chain = build_ebr_chain(
+            1000,
+            &[LogicalPartitionInfo {
+                start_lba: 1002,
+                total_sectors: 2000,
+                partition_type: 0x06,
+            }],
+        );
+
+        assert_eq!(chain.len(), 1);
+        let (offset, ebr) = &chain[0];
+        assert_eq!(*offset, 1000 * 512); // First EBR at extended container start
+
+        // Signature
+        assert_eq!(ebr[510], 0x55);
+        assert_eq!(ebr[511], 0xAA);
+
+        // Entry 0: partition type, relative start=2 (1002-1000), sectors=2000
+        assert_eq!(ebr[PARTITION_TABLE_OFFSET + 4], 0x06);
+        let rel_start = u32::from_le_bytes(
+            ebr[PARTITION_TABLE_OFFSET + 8..PARTITION_TABLE_OFFSET + 12]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(rel_start, 2); // 1002 - 1000
+        let sectors = u32::from_le_bytes(
+            ebr[PARTITION_TABLE_OFFSET + 12..PARTITION_TABLE_OFFSET + 16]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(sectors, 2000);
+
+        // Entry 1: should be empty (last partition)
+        let e1_off = PARTITION_TABLE_OFFSET + PARTITION_ENTRY_SIZE;
+        assert_eq!(ebr[e1_off + 4], 0x00);
+    }
+
+    #[test]
+    fn test_build_ebr_chain_three() {
+        let extended_start = 1000u32;
+        let logicals = vec![
+            LogicalPartitionInfo {
+                start_lba: 1002,
+                total_sectors: 2000,
+                partition_type: 0x06,
+            },
+            LogicalPartitionInfo {
+                start_lba: 4002,
+                total_sectors: 3000,
+                partition_type: 0x0B,
+            },
+            LogicalPartitionInfo {
+                start_lba: 8002,
+                total_sectors: 1000,
+                partition_type: 0x83,
+            },
+        ];
+
+        let chain = build_ebr_chain(extended_start, &logicals);
+        assert_eq!(chain.len(), 3);
+
+        // First EBR at extended container start (LBA 1000)
+        assert_eq!(chain[0].0, 1000 * 512);
+        // Entry 1 links to next EBR at LBA 4001 (relative to extended: 4001 - 1000 = 3001)
+        let e1_off = PARTITION_TABLE_OFFSET + PARTITION_ENTRY_SIZE;
+        let next_rel = u32::from_le_bytes(chain[0].1[e1_off + 8..e1_off + 12].try_into().unwrap());
+        assert_eq!(next_rel, 4001 - 1000);
+        assert_eq!(chain[0].1[e1_off + 4], 0x05);
+
+        // Second EBR at LBA 4001
+        assert_eq!(chain[1].0, 4001 * 512);
+        let next_rel2 = u32::from_le_bytes(chain[1].1[e1_off + 8..e1_off + 12].try_into().unwrap());
+        assert_eq!(next_rel2, 8001 - 1000);
+
+        // Third EBR at LBA 8001 - no next link
+        assert_eq!(chain[2].0, 8001 * 512);
+        assert_eq!(chain[2].1[e1_off + 4], 0x00);
+    }
+
+    #[test]
+    fn test_build_ebr_chain_roundtrip() {
+        // Build EBR chain, write to a buffer, parse it back
+        let extended_start = 2048u32;
+        let logicals = vec![
+            LogicalPartitionInfo {
+                start_lba: 2050,
+                total_sectors: 4096,
+                partition_type: 0x0C,
+            },
+            LogicalPartitionInfo {
+                start_lba: 8194,
+                total_sectors: 2048,
+                partition_type: 0x83,
+            },
+        ];
+
+        let chain = build_ebr_chain(extended_start, &logicals);
+
+        // Write to disk buffer
+        let disk_size = (8194 + 2048 + 1) as usize * 512;
+        let mut disk = vec![0u8; disk_size];
+        for (offset, ebr) in &chain {
+            let off = *offset as usize;
+            disk[off..off + 512].copy_from_slice(ebr);
+        }
+
+        // Parse back
+        let mut cursor = Cursor::new(disk);
+        let parsed = parse_ebr_chain(&mut cursor, extended_start).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].partition_type, 0x0C);
+        assert_eq!(parsed[0].start_lba, 2050);
+        assert_eq!(parsed[0].total_sectors, 4096);
+        assert_eq!(parsed[1].partition_type, 0x83);
+        assert_eq!(parsed[1].start_lba, 8194);
+        assert_eq!(parsed[1].total_sectors, 2048);
     }
 }

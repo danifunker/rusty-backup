@@ -19,7 +19,7 @@ use crate::fs::{
     validate_exfat_integrity, validate_fat_integrity, validate_ntfs_integrity,
 };
 use crate::os::SectorAlignedWriter;
-use crate::partition::mbr::patch_mbr_entries;
+use crate::partition::mbr::{build_ebr_chain, patch_mbr_entries, LogicalPartitionInfo};
 use crate::partition::PartitionSizeOverride;
 use crate::rbformats::reconstruct_disk_from_backup;
 
@@ -126,6 +126,11 @@ fn set_progress_bytes(progress: &Arc<Mutex<RestoreProgress>>, current: u64, tota
 
 /// Calculate the final partition layout given alignment, sizing choices, and
 /// target disk size. Returns the computed `PartitionSizeOverride` list.
+///
+/// When the backup contains logical partitions inside an extended container,
+/// this function accounts for EBR overhead (1 sector before each logical
+/// partition) and generates a synthetic override for the extended container
+/// entry so that `patch_mbr_entries` can resize it in the MBR.
 pub fn calculate_restore_layout(
     metadata: &BackupMetadata,
     alignment: &RestoreAlignment,
@@ -144,11 +149,21 @@ pub fn calculate_restore_layout(
         RestoreAlignment::Custom(n) => (*n, *n, 0, 0),
     };
 
+    // Separate primary and logical partitions
+    let has_logical = metadata
+        .partitions
+        .iter()
+        .any(|pm| pm.is_logical || pm.index >= 4);
+
     let mut overrides = Vec::new();
     let mut current_lba = first_partition_lba;
 
+    // First pass: lay out primary (non-logical) partitions, skip logical ones
     for pm in &metadata.partitions {
-        // Find the user's size choice for this partition
+        if pm.is_logical || pm.index >= 4 {
+            continue; // handled in second pass
+        }
+
         let size_choice = partition_sizes
             .iter()
             .find(|s| s.index == pm.index)
@@ -163,32 +178,7 @@ pub fn calculate_restore_layout(
             }
         }
 
-        // Calculate partition size
-        let partition_size = match size_choice {
-            RestoreSizeChoice::Original => pm.original_size_bytes,
-            RestoreSizeChoice::Minimum => {
-                // Use imaged size, but ensure it's at least as large as data
-                let min = if pm.imaged_size_bytes > 0 {
-                    pm.imaged_size_bytes
-                } else {
-                    pm.original_size_bytes
-                };
-                // Round up to sector boundary
-                (min + 511) & !511
-            }
-            RestoreSizeChoice::Custom(bytes) => {
-                // Round up to sector boundary
-                (bytes + 511) & !511
-            }
-            RestoreSizeChoice::FillRemaining => {
-                let used_bytes = current_lba * 512;
-                if target_size > used_bytes {
-                    target_size - used_bytes
-                } else {
-                    pm.original_size_bytes
-                }
-            }
-        };
+        let partition_size = compute_partition_size(size_choice, pm, current_lba, target_size);
 
         let new_start_lba = if current_lba != pm.start_lba {
             Some(current_lba)
@@ -206,8 +196,93 @@ pub fn calculate_restore_layout(
             sectors_per_track: spt,
         });
 
-        // Advance to next partition
         current_lba += partition_size / 512;
+    }
+
+    // Second pass: lay out logical partitions inside the extended container
+    if has_logical {
+        // Determine extended container start LBA
+        let ext_info = metadata.extended_container.as_ref();
+
+        // Align the extended container start
+        if alignment_sectors > 0 {
+            let rem = current_lba % alignment_sectors;
+            if rem != 0 {
+                current_lba += alignment_sectors - rem;
+            }
+        }
+
+        let extended_start_lba = current_lba;
+
+        // Collect logical partitions sorted by original start_lba
+        let mut logical_pms: Vec<&crate::backup::metadata::PartitionMetadata> = metadata
+            .partitions
+            .iter()
+            .filter(|pm| pm.is_logical || pm.index >= 4)
+            .collect();
+        logical_pms.sort_by_key(|pm| pm.start_lba);
+
+        for pm in &logical_pms {
+            let size_choice = partition_sizes
+                .iter()
+                .find(|s| s.index == pm.index)
+                .map(|s| &s.size_choice)
+                .unwrap_or(&RestoreSizeChoice::Original);
+
+            // Reserve 1 sector for the EBR before each logical partition
+            current_lba += 1;
+
+            // Align the partition data (not the EBR) if needed
+            if alignment_sectors > 0 {
+                let rem = current_lba % alignment_sectors;
+                if rem != 0 {
+                    current_lba += alignment_sectors - rem;
+                }
+            }
+
+            let partition_size = compute_partition_size(size_choice, pm, current_lba, target_size);
+
+            let new_start_lba = if current_lba != pm.start_lba {
+                Some(current_lba)
+            } else {
+                None
+            };
+
+            overrides.push(PartitionSizeOverride {
+                index: pm.index,
+                start_lba: pm.start_lba,
+                original_size: pm.original_size_bytes,
+                export_size: partition_size,
+                new_start_lba,
+                heads,
+                sectors_per_track: spt,
+            });
+
+            current_lba += partition_size / 512;
+        }
+
+        // Compute the extended container bounds: from extended_start_lba to
+        // the end of the last logical partition.
+        let extended_end_lba = current_lba;
+        let extended_size = (extended_end_lba - extended_start_lba) * 512;
+
+        // Add a synthetic override for the extended container entry in the MBR
+        if let Some(ext) = ext_info {
+            let new_start = if extended_start_lba != ext.start_lba {
+                Some(extended_start_lba)
+            } else {
+                None
+            };
+            overrides.push(PartitionSizeOverride {
+                index: ext.mbr_index,
+                start_lba: ext.start_lba,
+                original_size: ext.size_bytes,
+                export_size: extended_size,
+                new_start_lba: new_start,
+                heads,
+                sectors_per_track: spt,
+            });
+        }
     }
 
     // Validate: no partition extends past target
@@ -224,8 +299,12 @@ pub fn calculate_restore_layout(
         }
     }
 
-    // Validate: all sizes >= minimum
+    // Validate: all sizes >= minimum (skip the extended container override)
+    let ext_index = metadata.extended_container.as_ref().map(|e| e.mbr_index);
     for ov in &overrides {
+        if Some(ov.index) == ext_index {
+            continue; // extended container size is computed, not user-specified
+        }
         let pm = metadata.partitions.iter().find(|p| p.index == ov.index);
         if let Some(pm) = pm {
             let min = if pm.imaged_size_bytes > 0 {
@@ -245,6 +324,83 @@ pub fn calculate_restore_layout(
     }
 
     Ok(overrides)
+}
+
+/// Compute a partition's size in bytes given the user's size choice.
+fn compute_partition_size(
+    size_choice: &RestoreSizeChoice,
+    pm: &crate::backup::metadata::PartitionMetadata,
+    current_lba: u64,
+    target_size: u64,
+) -> u64 {
+    match size_choice {
+        RestoreSizeChoice::Original => pm.original_size_bytes,
+        RestoreSizeChoice::Minimum => {
+            let min = if pm.imaged_size_bytes > 0 {
+                pm.imaged_size_bytes
+            } else {
+                pm.original_size_bytes
+            };
+            (min + 511) & !511
+        }
+        RestoreSizeChoice::Custom(bytes) => (bytes + 511) & !511,
+        RestoreSizeChoice::FillRemaining => {
+            let used_bytes = current_lba * 512;
+            if target_size > used_bytes {
+                target_size - used_bytes
+            } else {
+                pm.original_size_bytes
+            }
+        }
+    }
+}
+
+/// Build the EBR chain for a restore with logical partitions.
+///
+/// Returns `None` if there are no logical partitions. Otherwise returns the
+/// extended container start LBA and a list of (byte_offset, ebr_sector) pairs.
+pub fn build_restore_ebr_chain(
+    metadata: &BackupMetadata,
+    overrides: &[PartitionSizeOverride],
+) -> Option<(u32, Vec<(u64, [u8; 512])>)> {
+    let ext = metadata.extended_container.as_ref()?;
+
+    // Find the override for the extended container to get its new start LBA
+    let ext_override = overrides.iter().find(|o| o.index == ext.mbr_index)?;
+    let extended_start_lba = ext_override.effective_start_lba() as u32;
+
+    // Collect logical partition overrides, sorted by effective start LBA
+    let mut logical_overrides: Vec<(
+        &PartitionSizeOverride,
+        &crate::backup::metadata::PartitionMetadata,
+    )> = metadata
+        .partitions
+        .iter()
+        .filter(|pm| pm.is_logical || pm.index >= 4)
+        .filter_map(|pm| {
+            overrides
+                .iter()
+                .find(|o| o.index == pm.index)
+                .map(|o| (o, pm))
+        })
+        .collect();
+    logical_overrides.sort_by_key(|(o, _)| o.effective_start_lba());
+
+    if logical_overrides.is_empty() {
+        return None;
+    }
+
+    let logical_infos: Vec<LogicalPartitionInfo> = logical_overrides
+        .iter()
+        .map(|(o, pm)| LogicalPartitionInfo {
+            start_lba: o.effective_start_lba() as u32,
+            total_sectors: (o.export_size / 512) as u32,
+            partition_type: pm.partition_type_byte,
+        })
+        .collect();
+
+    let chain = build_ebr_chain(extended_start_lba, &logical_infos);
+    Some((extended_start_lba, chain))
 }
 
 /// Main restore orchestrator. Runs on a background thread.
@@ -345,7 +501,13 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
         );
     }
 
-    set_progress_bytes(&progress, 0, config.target_size);
+    // Progress total = end of last partition (includes gaps between partitions)
+    let data_extent: u64 = overrides
+        .iter()
+        .map(|o| (o.effective_start_lba() + o.export_size / 512) * 512)
+        .max()
+        .unwrap_or(0);
+    set_progress_bytes(&progress, 0, data_extent);
 
     if is_cancelled(&progress) {
         bail!("restore cancelled");
@@ -408,7 +570,7 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
         config.target_is_device,
         config.write_zeros_to_unused,
         &mut |bytes| {
-            set_progress_bytes(&progress_clone, bytes, config.target_size);
+            set_progress_bytes(&progress_clone, bytes, data_extent);
         },
         &|| is_cancelled(&progress_cancel),
         &mut |msg| {
@@ -747,7 +909,13 @@ fn run_clonezilla_restore(
         );
     }
 
-    set_progress_bytes(&progress, 0, config.target_size);
+    // Progress total = end of last partition (includes gaps between partitions)
+    let data_extent: u64 = overrides
+        .iter()
+        .map(|o| (o.effective_start_lba() + o.export_size / 512) * 512)
+        .max()
+        .unwrap_or(0);
+    set_progress_bytes(&progress, 0, data_extent);
 
     if is_cancelled(&progress) {
         bail!("restore cancelled");

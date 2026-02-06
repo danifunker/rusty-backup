@@ -19,6 +19,11 @@ pub struct BackupMetadata {
     pub partitions: Vec<PartitionMetadata>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bad_sectors: Vec<BadSectorEntry>,
+    /// Extended partition container info (MBR only). Stored so restore can
+    /// reconstruct the container entry and EBR chain when logical partitions
+    /// are resized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extended_container: Option<ExtendedContainerMetadata>,
 }
 
 /// Per-partition metadata.
@@ -41,6 +46,9 @@ pub struct PartitionMetadata {
     /// True if the partition was compacted (FAT defragmentation) during backup.
     #[serde(default)]
     pub compacted: bool,
+    /// True for logical partitions inside an extended container (MBR only).
+    #[serde(default)]
+    pub is_logical: bool,
 }
 
 /// Partition alignment information for the backup.
@@ -51,6 +59,20 @@ pub struct AlignmentMetadata {
     pub alignment_sectors: u64,
     pub heads: u16,
     pub sectors_per_track: u16,
+}
+
+/// Metadata for the extended partition container (MBR type 0x05/0x0F/0x85).
+/// Stored so that restore can regenerate the container MBR entry and EBR chain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtendedContainerMetadata {
+    /// MBR primary entry index (0-3) where the extended container lives.
+    pub mbr_index: usize,
+    /// Original partition type byte (0x05, 0x0F, or 0x85).
+    pub partition_type_byte: u8,
+    /// Original start LBA of the extended container.
+    pub start_lba: u64,
+    /// Original size of the extended container in bytes.
+    pub size_bytes: u64,
 }
 
 /// A bad sector encountered during backup.
@@ -96,8 +118,10 @@ mod tests {
                 checksum: "abcdef1234567890".to_string(),
                 resized: false,
                 compacted: false,
+                is_logical: false,
             }],
             bad_sectors: vec![],
+            extended_container: None,
         };
 
         let json = serde_json::to_string_pretty(&metadata).unwrap();
@@ -131,6 +155,7 @@ mod tests {
                 sectors_per_track: 0,
             },
             partitions: vec![],
+            extended_container: None,
             bad_sectors: vec![BadSectorEntry {
                 partition: 0,
                 sector: 100,

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::fs;
 use crate::partition::{self, PartitionTable};
-use metadata::{AlignmentMetadata, BackupMetadata, PartitionMetadata};
+use metadata::{AlignmentMetadata, BackupMetadata, ExtendedContainerMetadata, PartitionMetadata};
 
 /// Compression type for backup output.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -627,12 +627,24 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             checksum: combined_checksum,
             resized: false,
             compacted: is_compacted,
+            is_logical: part.is_logical,
         });
     }
 
     if is_cancelled(&progress) {
         bail!("backup cancelled");
     }
+
+    // Capture extended container info for MBR tables
+    let extended_container = partitions
+        .iter()
+        .find(|p| p.is_extended_container)
+        .map(|p| ExtendedContainerMetadata {
+            mbr_index: p.index,
+            partition_type_byte: p.partition_type_byte,
+            start_lba: p.start_lba,
+            size_bytes: p.size_bytes,
+        });
 
     // Step 5: Write metadata.json
     set_operation(&progress, "Writing metadata...");
@@ -655,6 +667,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         },
         partitions: partition_metadata,
         bad_sectors: vec![],
+        extended_container,
     };
 
     let metadata_path = backup_folder.join("metadata.json");
