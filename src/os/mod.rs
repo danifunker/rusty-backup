@@ -571,7 +571,7 @@ impl DeviceWriteHandle {
 ///
 /// For regular files, uses standard seek to get size.
 /// For Windows physical drives, uses IOCTL because seeking doesn't work.
-pub fn get_file_size(file: &File, path: &Path) -> Result<u64> {
+pub fn get_file_size(file: &File, _path: &Path) -> Result<u64> {
     #[cfg(target_os = "windows")]
     {
         let path_str = path.to_string_lossy();

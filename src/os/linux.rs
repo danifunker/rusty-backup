@@ -11,7 +11,7 @@ use crate::device::{DiskDevice, MountedPartition};
 struct MountInfoEntry {
     mount_point: String,
     fs_type: String,
-    source: String,
+    _source: String,
 }
 
 /// Read a sysfs attribute file, returning the trimmed contents or an empty
@@ -103,7 +103,7 @@ fn parse_mountinfo_from_str(content: &str) -> HashMap<String, MountInfoEntry> {
                 MountInfoEntry {
                     mount_point,
                     fs_type,
-                    source,
+                    _source: source,
                 },
             );
         }
@@ -583,8 +583,30 @@ pub fn relaunch_with_elevation() -> Result<()> {
         );
     }
 
+    // Preserve display environment variables so the elevated process can
+    // connect to the user's X11/Wayland display server.
+    let display_vars = [
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "WAYLAND_SOCKET",
+        "XAUTHORITY",
+        "XDG_RUNTIME_DIR",
+    ];
+    let mut env_args: Vec<String> = Vec::new();
+    for var in &display_vars {
+        if let Ok(val) = std::env::var(var) {
+            env_args.push(format!("{}={}", var, val));
+        }
+    }
+
+    // Use "env" to inject display variables, since pkexec strips the environment.
     // Exec replaces current process - never returns on success
-    let err = Command::new("pkexec").arg(&current_exe).args(&args).exec();
+    let err = Command::new("pkexec")
+        .arg("env")
+        .args(&env_args)
+        .arg(&current_exe)
+        .args(&args)
+        .exec();
 
     Err(anyhow::anyhow!(err).context("Failed to relaunch with pkexec"))
 }

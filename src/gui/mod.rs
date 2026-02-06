@@ -63,7 +63,7 @@ impl Default for RustyBackupApp {
         // Check privilege status
         #[cfg(target_os = "linux")]
         let elevation_dialog = {
-            let mut dialog = ElevationDialog::default();
+            let dialog = ElevationDialog::default();
             if !devices.is_empty() {
                 // Check if we need elevation
                 if let Ok(access) = rusty_backup::privileged::create_disk_access() {

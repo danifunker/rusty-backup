@@ -68,6 +68,7 @@ impl ElevationDialog {
         self.open = true;
     }
 
+    #[allow(dead_code)]
     pub fn is_open(&self) -> bool {
         self.open
     }
