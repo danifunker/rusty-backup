@@ -23,6 +23,20 @@ use elevation_dialog::{ElevationAction, ElevationDialog};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+/// Create an `rfd::FileDialog` pre-configured to start in the real user's home
+/// directory. This ensures file dialogs open in the right place even when the
+/// app is running elevated via pkexec.
+fn file_dialog() -> rfd::FileDialog {
+    let dialog = rfd::FileDialog::new();
+    #[cfg(target_os = "linux")]
+    let dialog = if let Some(home) = rusty_backup::os::linux::real_user_home() {
+        dialog.set_directory(home)
+    } else {
+        dialog
+    };
+    dialog
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Tab {
     Backup,

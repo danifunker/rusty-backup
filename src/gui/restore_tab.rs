@@ -156,7 +156,7 @@ impl RestoreTab {
                     .unwrap_or_else(|| "No folder selected".into());
                 ui.label(&label);
                 if ui.button("Browse...").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                    if let Some(path) = super::file_dialog().pick_folder() {
                         self.backup_folder = Some(path);
                     }
                 }
@@ -257,7 +257,7 @@ impl RestoreTab {
                         .unwrap_or_else(|| "No file selected".into());
                     ui.label(&label);
                     if ui.button("Save As...").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
+                        if let Some(path) = super::file_dialog()
                             .add_filter("Disk Images", &["img", "raw", "bin"])
                             .save_file()
                         {

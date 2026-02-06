@@ -188,7 +188,7 @@ impl InspectTab {
                         .selectable_label(self.image_file_path.is_some(), "Open VHD File...")
                         .clicked()
                     {
-                        if let Some(path) = rfd::FileDialog::new()
+                        if let Some(path) = super::file_dialog()
                             .add_filter("VHD Files", &["vhd"])
                             .pick_file()
                         {
@@ -510,7 +510,7 @@ impl InspectTab {
 
         if self.export_whole_disk {
             // Pick a single file destination
-            let dialog = rfd::FileDialog::new()
+            let dialog = super::file_dialog()
                 .set_file_name("disk.vhd")
                 .add_filter("VHD Files", &["vhd"]);
             let dest = match dialog.save_file() {
@@ -572,7 +572,7 @@ impl InspectTab {
             });
         } else {
             // Per-partition: pick a folder
-            let dest_folder = match rfd::FileDialog::new().pick_folder() {
+            let dest_folder = match super::file_dialog().pick_folder() {
                 Some(p) => p,
                 None => return,
             };
@@ -804,7 +804,7 @@ impl InspectTab {
     }
 
     fn pick_backup_folder(&mut self) {
-        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+        if let Some(path) = super::file_dialog().pick_folder() {
             self.backup_folder_path = Some(path);
             self.selected_device_idx = None;
             self.image_file_path = None;

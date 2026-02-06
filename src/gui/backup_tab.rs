@@ -176,7 +176,7 @@ impl BackupTab {
                             .selectable_label(self.image_file_path.is_some(), "Open Image File...")
                             .clicked()
                         {
-                            if let Some(path) = rfd::FileDialog::new()
+                            if let Some(path) = super::file_dialog()
                                 .add_filter("Disk Images", &["img", "raw", "bin", "iso", "dd"])
                                 .add_filter("All Files", &["*"])
                                 .pick_file()
@@ -235,7 +235,7 @@ impl BackupTab {
                     .unwrap_or_else(|| "No folder selected".into());
                 ui.label(&label);
                 if ui.button("Browse...").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                    if let Some(path) = super::file_dialog().pick_folder() {
                         self.destination_folder = Some(path);
                     }
                 }

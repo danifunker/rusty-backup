@@ -583,23 +583,32 @@ pub fn relaunch_with_elevation() -> Result<()> {
         );
     }
 
-    // Preserve display environment variables so the elevated process can
-    // connect to the user's X11/Wayland display server.
-    let display_vars = [
+    // Preserve environment variables since pkexec strips the environment.
+    // Display vars allow the elevated process to connect to X11/Wayland.
+    // User identity vars allow resolving the real user's home/config paths.
+    let passthrough_vars = [
         "DISPLAY",
         "WAYLAND_DISPLAY",
         "WAYLAND_SOCKET",
         "XAUTHORITY",
         "XDG_RUNTIME_DIR",
+        "HOME",
     ];
     let mut env_args: Vec<String> = Vec::new();
-    for var in &display_vars {
+    for var in &passthrough_vars {
         if let Ok(val) = std::env::var(var) {
             env_args.push(format!("{}={}", var, val));
         }
     }
 
-    // Use "env" to inject display variables, since pkexec strips the environment.
+    // Capture real user identity before elevation replaces the process
+    if let Ok(user) = std::env::var("USER") {
+        env_args.push(format!("SUDO_USER={}", user));
+    }
+    env_args.push(format!("SUDO_UID={}", nix::unistd::getuid()));
+    env_args.push(format!("SUDO_GID={}", nix::unistd::getgid()));
+
+    // Use "env" to inject variables, --keep-cwd to preserve working directory.
     // Exec replaces current process - never returns on success
     let err = Command::new("pkexec")
         .arg("env")
@@ -609,4 +618,41 @@ pub fn relaunch_with_elevation() -> Result<()> {
         .exec();
 
     Err(anyhow::anyhow!(err).context("Failed to relaunch with pkexec"))
+}
+
+/// Returns the real (non-root) user's home directory when running elevated.
+///
+/// When the app is relaunched via pkexec, `HOME` and `SUDO_USER` are passed
+/// through so we can resolve the original user's home. Falls back to
+/// `dirs::home_dir()` if not elevated or if env vars aren't set.
+pub fn real_user_home() -> Option<PathBuf> {
+    if !nix::unistd::geteuid().is_root() {
+        return dirs::home_dir();
+    }
+    // HOME was passed through pkexec env wrapper
+    if let Ok(home) = std::env::var("HOME") {
+        let p = PathBuf::from(&home);
+        if p != PathBuf::from("/root") && p.exists() {
+            return Some(p);
+        }
+    }
+    // Fallback: resolve SUDO_USER via /home/<user>
+    if let Ok(user) = std::env::var("SUDO_USER") {
+        let home = PathBuf::from(format!("/home/{}", user));
+        if home.exists() {
+            return Some(home);
+        }
+    }
+    dirs::home_dir()
+}
+
+/// Set permissive umask when running elevated so created files are accessible
+/// to the real user. No-op if not root.
+///
+/// Sets umask to 000 so files are created with mode 666 and directories with
+/// mode 777. The real security boundary is the pkexec prompt itself.
+pub fn set_permissive_umask_if_elevated() {
+    if nix::unistd::geteuid().is_root() {
+        nix::sys::stat::umask(nix::sys::stat::Mode::empty());
+    }
 }

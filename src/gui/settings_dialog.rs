@@ -30,7 +30,7 @@ impl SettingsDialog {
                     ui.horizontal(|ui| {
                         ui.text_edit_singleline(&mut self.chdman_path);
                         if ui.button("Browse...").clicked() {
-                            if let Some(path) = rfd::FileDialog::new()
+                            if let Some(path) = super::file_dialog()
                                 .set_title("Select chdman executable")
                                 .pick_file()
                             {

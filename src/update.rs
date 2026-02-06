@@ -58,14 +58,18 @@ impl Default for UpdateConfig {
 }
 
 impl UpdateConfig {
-    /// Get the user config directory path
+    /// Get the user config directory path.
+    ///
+    /// On Linux, uses `real_user_home()` to resolve the correct config directory
+    /// even when running elevated via pkexec (where `dirs::config_dir()` would
+    /// return `/root/.config`).
     pub fn user_config_dir() -> Option<PathBuf> {
-        if let Some(config_dir) = dirs::config_dir() {
-            let app_config = config_dir.join("rusty-backup");
-            Some(app_config)
-        } else {
-            None
-        }
+        #[cfg(target_os = "linux")]
+        let config_dir = crate::os::linux::real_user_home().map(|h| h.join(".config"));
+        #[cfg(not(target_os = "linux"))]
+        let config_dir = dirs::config_dir();
+
+        config_dir.map(|d| d.join("rusty-backup"))
     }
 
     /// Get the user config file path
