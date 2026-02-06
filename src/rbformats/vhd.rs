@@ -520,6 +520,244 @@ pub fn export_partition_vhd(
     Ok(())
 }
 
+/// Export a whole disk from a Clonezilla image as a Fixed VHD file.
+///
+/// Reconstructs the disk by writing the MBR, hidden data gap, EBR for extended
+/// partitions, and each partition's data from partclone, then appends a VHD footer.
+pub fn export_clonezilla_disk_vhd(
+    cz_image: &crate::clonezilla::metadata::ClonezillaImage,
+    _backup_folder: &Path,
+    output_path: &Path,
+    partition_sizes: &[PartitionSizeOverride],
+    mut progress_cb: impl FnMut(u64),
+    cancel_check: impl Fn() -> bool,
+    mut log_cb: impl FnMut(&str),
+) -> Result<()> {
+    use crate::clonezilla::partclone::open_partclone_reader;
+    use crate::fs::exfat::patch_exfat_hidden_sectors;
+    use crate::fs::ntfs::patch_ntfs_hidden_sectors;
+
+    let mut file = File::create(output_path)
+        .with_context(|| format!("failed to create {}", output_path.display()))?;
+
+    let mut total_written: u64 = 0;
+
+    // Helper to look up export size
+    let get_export_size = |index: usize, default: u64| -> u64 {
+        partition_sizes
+            .iter()
+            .find(|ps| ps.index == index)
+            .map(|ps| ps.export_size)
+            .unwrap_or(default)
+    };
+
+    // Write MBR
+    let mut mbr_buf = cz_image.mbr_bytes;
+    if !partition_sizes.is_empty() {
+        patch_mbr_entries(&mut mbr_buf, partition_sizes);
+        log_cb("Patched MBR partition table with export sizes");
+    }
+    file.write_all(&mbr_buf).context("failed to write MBR")?;
+    total_written += 512;
+
+    // Write hidden data after MBR
+    if !cz_image.hidden_data_after_mbr.is_empty() {
+        file.write_all(&cz_image.hidden_data_after_mbr)
+            .context("failed to write hidden data after MBR")?;
+        total_written += cz_image.hidden_data_after_mbr.len() as u64;
+        log_cb(&format!(
+            "Wrote {} bytes of hidden data after MBR",
+            cz_image.hidden_data_after_mbr.len()
+        ));
+    }
+
+    // Sort partitions by start LBA
+    let mut sorted_parts: Vec<&crate::clonezilla::metadata::ClonezillaPartition> =
+        cz_image.partitions.iter().collect();
+    sorted_parts.sort_by_key(|p| p.start_lba);
+
+    for cz_part in &sorted_parts {
+        if cancel_check() {
+            bail!("export cancelled");
+        }
+
+        let part_offset = cz_part.start_lba * 512;
+        let export_size = get_export_size(cz_part.index, cz_part.size_bytes());
+
+        // Fill gap to partition start
+        if total_written < part_offset {
+            let gap = part_offset - total_written;
+
+            // Write EBR if this is an extended partition and we have EBR data
+            if let Some(ebr_data) = cz_image.ebr_data.get(&cz_part.device_name) {
+                // EBR sits at the partition's start LBA
+                let ebr_gap = part_offset - total_written - ebr_data.len().min(512) as u64;
+                if ebr_gap > 0 {
+                    super::write_zeros(&mut file, ebr_gap)?;
+                    total_written += ebr_gap;
+                }
+                let write_len = ebr_data.len().min(512);
+                file.write_all(&ebr_data[..write_len])?;
+                total_written += write_len as u64;
+            } else {
+                super::write_zeros(&mut file, gap)?;
+                total_written += gap;
+            }
+        }
+
+        // Handle extended container partitions (no data to write)
+        if cz_part.is_extended {
+            continue;
+        }
+
+        // Write partition data from partclone
+        if cz_part.partclone_files.is_empty() {
+            log_cb(&format!(
+                "partition-{}: no data files, filling with zeros",
+                cz_part.index
+            ));
+            super::write_zeros(&mut file, export_size)?;
+            total_written += export_size;
+            continue;
+        }
+
+        log_cb(&format!(
+            "partition-{}: decompressing partclone data...",
+            cz_part.index
+        ));
+
+        let (_header, mut reader) = open_partclone_reader(&cz_part.partclone_files)?;
+
+        let mut buf = vec![0u8; super::CHUNK_SIZE];
+        let mut part_written: u64 = 0;
+        let copy_limit = export_size.min(cz_part.size_bytes());
+        let mut limited = (&mut reader).take(copy_limit);
+
+        loop {
+            if cancel_check() {
+                bail!("export cancelled");
+            }
+            let n = limited.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buf[..n])?;
+            part_written += n as u64;
+            total_written += n as u64;
+            progress_cb(total_written);
+        }
+
+        // Pad if export_size > data written
+        if part_written < export_size {
+            let pad = export_size - part_written;
+            super::write_zeros(&mut file, pad)?;
+            total_written += pad;
+        }
+
+        // Patch hidden sectors and resize filesystem
+        {
+            let effective_lba = partition_sizes
+                .iter()
+                .find(|ps| ps.index == cz_part.index)
+                .map(|ps| ps.effective_start_lba())
+                .unwrap_or(cz_part.start_lba);
+
+            patch_bpb_hidden_sectors(&mut file, part_offset, effective_lba, &mut log_cb)?;
+            patch_ntfs_hidden_sectors(&mut file, part_offset, effective_lba, &mut log_cb)?;
+            patch_exfat_hidden_sectors(&mut file, part_offset, effective_lba, &mut log_cb)?;
+
+            if export_size != cz_part.size_bytes() {
+                let new_sectors = (export_size / 512) as u32;
+                resize_fat_in_place(&mut file, part_offset, new_sectors, &mut log_cb)?;
+            }
+
+            // Seek back to end for next partition
+            file.seek(SeekFrom::Start(total_written))?;
+        }
+
+        log_cb(&format!(
+            "partition-{}: wrote {} bytes",
+            cz_part.index, export_size,
+        ));
+    }
+
+    // Append VHD footer
+    let footer = build_vhd_footer(total_written);
+    file.write_all(&footer)
+        .context("failed to write VHD footer")?;
+    file.flush()?;
+
+    log_cb(&format!(
+        "VHD export complete: {} ({} data bytes + 512 byte footer)",
+        output_path.display(),
+        total_written,
+    ));
+
+    Ok(())
+}
+
+/// Export a single partition from a Clonezilla image as a Fixed VHD file.
+pub fn export_clonezilla_partition_vhd(
+    partclone_files: &[std::path::PathBuf],
+    dest_path: &Path,
+    export_size: Option<u64>,
+    mut progress_cb: impl FnMut(u64),
+    cancel_check: impl Fn() -> bool,
+    mut log_cb: impl FnMut(&str),
+) -> Result<()> {
+    use crate::clonezilla::partclone::open_partclone_reader;
+
+    let (header, mut reader) = open_partclone_reader(partclone_files)?;
+    let partition_size = header.partition_size();
+    let max_bytes = export_size.unwrap_or(partition_size);
+
+    let mut writer = BufWriter::new(
+        File::create(dest_path)
+            .with_context(|| format!("failed to create {}", dest_path.display()))?,
+    );
+
+    let mut buf = vec![0u8; super::CHUNK_SIZE];
+    let mut total_written: u64 = 0;
+    let mut limited = (&mut reader).take(max_bytes);
+
+    loop {
+        if cancel_check() {
+            bail!("export cancelled");
+        }
+        let n = limited.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        writer.write_all(&buf[..n])?;
+        total_written += n as u64;
+        progress_cb(total_written);
+    }
+
+    // Pad if needed
+    if total_written < max_bytes {
+        let pad = max_bytes - total_written;
+        super::write_zeros(&mut writer, pad)?;
+        total_written = max_bytes;
+    }
+
+    writer.flush()?;
+
+    // Append VHD footer
+    let footer = build_vhd_footer(total_written);
+    writer
+        .write_all(&footer)
+        .context("failed to write VHD footer")?;
+    writer.flush()?;
+
+    log_cb(&format!(
+        "VHD partition export complete: {} ({} data bytes)",
+        dest_path.display(),
+        total_written,
+    ));
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::CompressionType;

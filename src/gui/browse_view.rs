@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
+use rusty_backup::clonezilla::block_cache::{PartcloneBlockCache, PartcloneBlockReader};
 use rusty_backup::fs;
 use rusty_backup::fs::entry::{EntryType, FileEntry};
 use rusty_backup::fs::filesystem::{Filesystem, FilesystemError};
@@ -36,6 +38,8 @@ pub struct BrowseView {
     partition_type: u8,
     /// Whether the browser is active (filesystem loaded).
     active: bool,
+    /// Shared block cache for Clonezilla partclone browsing.
+    partclone_cache: Option<Arc<Mutex<PartcloneBlockCache>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +72,7 @@ impl Default for BrowseView {
             partition_offset: 0,
             partition_type: 0,
             active: false,
+            partclone_cache: None,
         }
     }
 }
@@ -112,6 +117,45 @@ impl BrowseView {
         }
     }
 
+    /// Open the browser using a partclone block cache (for Clonezilla images).
+    pub fn open_partclone(&mut self, cache: Arc<Mutex<PartcloneBlockCache>>, partition_type: u8) {
+        self.close();
+        self.partclone_cache = Some(cache.clone());
+        self.partition_type = partition_type;
+        self.partition_offset = 0;
+
+        let reader = PartcloneBlockReader::new(cache);
+        match fs::open_filesystem(reader, 0, partition_type) {
+            Ok(mut fs) => {
+                self.fs_type = fs.fs_type().to_string();
+                self.volume_label = fs.volume_label().unwrap_or("").to_string();
+                self.active = true;
+
+                match fs.root() {
+                    Ok(root) => {
+                        match fs.list_directory(&root) {
+                            Ok(entries) => {
+                                self.directory_cache.insert("/".into(), entries);
+                                self.expanded_paths.insert("/".into());
+                            }
+                            Err(e) => {
+                                self.error = Some(format!("Failed to read root directory: {e}"));
+                            }
+                        }
+                        self.root = Some(root);
+                    }
+                    Err(e) => {
+                        self.error = Some(format!("Failed to get root: {e}"));
+                    }
+                }
+            }
+            Err(e) => {
+                self.error = Some(format!("Cannot open filesystem: {e}"));
+                self.active = true;
+            }
+        }
+    }
+
     pub fn close(&mut self) {
         self.root = None;
         self.directory_cache.clear();
@@ -122,6 +166,7 @@ impl BrowseView {
         self.active = false;
         self.fs_type.clear();
         self.volume_label.clear();
+        self.partclone_cache = None;
     }
 
     pub fn is_active(&self) -> bool {
@@ -129,13 +174,43 @@ impl BrowseView {
     }
 
     fn open_fs(&self) -> Result<Box<dyn Filesystem>, FilesystemError> {
+        // If we have a partclone block cache, use it
+        if let Some(cache) = &self.partclone_cache {
+            let reader = PartcloneBlockReader::new(Arc::clone(cache));
+            return fs::open_filesystem(reader, 0, self.partition_type);
+        }
+
         let path = self
             .source_path
             .as_ref()
             .ok_or_else(|| FilesystemError::Parse("no source path set".into()))?;
-        let file = File::open(path).map_err(FilesystemError::Io)?;
-        let reader = BufReader::new(file);
-        fs::open_filesystem(reader, self.partition_offset, self.partition_type)
+
+        // Detect seekable zstd files by extension
+        let is_seekable_zst = path.extension().map(|e| e == "zst").unwrap_or(false)
+            && path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.ends_with(".seekable"))
+                .unwrap_or(false);
+
+        if is_seekable_zst {
+            let file = File::open(path).map_err(FilesystemError::Io)?;
+            let decoder = match zeekstd::Decoder::new(file) {
+                Ok(d) => d,
+                Err(e) => {
+                    // Stale or corrupt cache file — delete it so it gets recreated
+                    let _ = std::fs::remove_file(path);
+                    return Err(FilesystemError::Parse(format!(
+                        "stale seekable zstd cache removed ({e}). Click Browse again to rebuild."
+                    )));
+                }
+            };
+            fs::open_filesystem(decoder, self.partition_offset, self.partition_type)
+        } else {
+            let file = File::open(path).map_err(FilesystemError::Io)?;
+            let reader = BufReader::new(file);
+            fs::open_filesystem(reader, self.partition_offset, self.partition_type)
+        }
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui) {

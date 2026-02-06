@@ -3589,6 +3589,7 @@ dependencies = [
  "webbrowser",
  "windows 0.62.2",
  "winres",
+ "zeekstd",
  "zstd",
 ]
 
@@ -5733,6 +5734,13 @@ dependencies = [
  "serde",
  "zbus_names",
  "zvariant",
+]
+
+[[package]]
+name = "zeekstd"
+version = "0.6.2"
+dependencies = [
+ "zstd-safe",
 ]
 
 [[package]]

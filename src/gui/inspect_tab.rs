@@ -4,7 +4,11 @@ use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use anyhow::Context;
+
 use rusty_backup::backup::metadata::BackupMetadata;
+use rusty_backup::clonezilla;
+use rusty_backup::clonezilla::metadata::ClonezillaImage;
 use rusty_backup::device::DiskDevice;
 use rusty_backup::fs;
 use rusty_backup::fs::fat::resize_fat_in_place;
@@ -53,6 +57,16 @@ pub struct InspectTab {
     export_status: Option<Arc<Mutex<ExportStatus>>>,
     /// Filesystem-computed minimum partition sizes (partition index → bytes)
     partition_min_sizes: HashMap<usize, u64>,
+    /// Clonezilla image metadata (when backup is a Clonezilla image)
+    clonezilla_image: Option<ClonezillaImage>,
+    /// Block caches per Clonezilla partition (for browse support)
+    block_caches: HashMap<usize, Arc<Mutex<clonezilla::block_cache::PartcloneBlockCache>>>,
+    /// Background block cache scan status
+    block_cache_scan: Option<Arc<Mutex<BlockCacheScan>>>,
+    /// Seekable zstd cache files for native zstd backups
+    seekable_cache_files: HashMap<usize, PathBuf>,
+    /// Background seekable cache creation status (native zstd only)
+    cache_status: Option<Arc<Mutex<CacheStatus>>>,
 }
 
 /// Status of a background VHD export operation.
@@ -94,6 +108,25 @@ impl PartitionExportConfig {
     }
 }
 
+/// Status of a background seekable cache creation (native zstd backups).
+struct CacheStatus {
+    finished: bool,
+    error: Option<String>,
+    partition_index: usize,
+    cache_path: Option<PathBuf>,
+    current_bytes: u64,
+    total_bytes: u64,
+}
+
+/// Status of a background block cache metadata scan (Clonezilla images).
+struct BlockCacheScan {
+    finished: bool,
+    error: Option<String>,
+    partition_index: usize,
+    partition_type: u8,
+    cache: Arc<Mutex<clonezilla::block_cache::PartcloneBlockCache>>,
+}
+
 impl Default for InspectTab {
     fn default() -> Self {
         Self {
@@ -114,6 +147,11 @@ impl Default for InspectTab {
             export_partition_configs: Vec::new(),
             export_status: None,
             partition_min_sizes: HashMap::new(),
+            clonezilla_image: None,
+            block_caches: HashMap::new(),
+            block_cache_scan: None,
+            seekable_cache_files: HashMap::new(),
+            cache_status: None,
         }
     }
 }
@@ -144,6 +182,11 @@ impl InspectTab {
         self.alignment = None;
         self.browse_view.close();
         self.partition_min_sizes.clear();
+        self.clonezilla_image = None;
+        self.block_caches.clear();
+        self.block_cache_scan = None;
+        self.seekable_cache_files.clear();
+        self.cache_status = None;
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, devices: &[DiskDevice], log: &mut LogPanel) {
@@ -310,9 +353,75 @@ impl InspectTab {
             ui.add_space(8.0);
         }
 
+        // Poll block cache scan status (Clonezilla)
+        self.poll_block_cache_scan(log);
+
+        // Show block cache scan progress
+        if let Some(ref scan_arc) = self.block_cache_scan {
+            if let Ok(s) = scan_arc.lock() {
+                if !s.finished {
+                    if let Ok(c) = s.cache.lock() {
+                        if c.total_used_blocks > 0 {
+                            let fraction =
+                                c.scanned_used_blocks as f32 / c.total_used_blocks as f32;
+                            let text = format!(
+                                "Scanning partition {} metadata: {} / {} blocks ({:.0}%)",
+                                s.partition_index,
+                                c.scanned_used_blocks,
+                                c.total_used_blocks,
+                                fraction * 100.0,
+                            );
+                            ui.add(egui::ProgressBar::new(fraction).text(text).animate(true));
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(format!(
+                                    "Scanning partition {} metadata...",
+                                    s.partition_index,
+                                ));
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Poll seekable cache creation status (native zstd)
+        self.poll_cache_status(log);
+
+        // Show seekable cache creation progress
+        if let Some(ref status_arc) = self.cache_status {
+            if let Ok(s) = status_arc.lock() {
+                if !s.finished && s.total_bytes > 0 {
+                    let fraction = s.current_bytes as f32 / s.total_bytes as f32;
+                    let text = format!(
+                        "Building seekable zstd index for partition {}: {} / {} ({:.0}%)",
+                        s.partition_index,
+                        partition::format_size(s.current_bytes),
+                        partition::format_size(s.total_bytes),
+                        fraction * 100.0,
+                    );
+                    ui.add(egui::ProgressBar::new(fraction).text(text).animate(true));
+                } else if !s.finished {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(format!(
+                            "Building seekable zstd index for partition {}...",
+                            s.partition_index
+                        ));
+                    });
+                }
+            }
+        }
+
         // Show backup metadata if loaded from folder
         if let Some(meta) = &self.backup_metadata {
             self.show_backup_metadata(ui, meta);
+        }
+
+        // Show Clonezilla metadata if loaded
+        if let Some(cz) = &self.clonezilla_image.clone() {
+            self.show_clonezilla_metadata(ui, cz);
         }
 
         // Show results
@@ -518,58 +627,106 @@ impl InspectTab {
                 None => return,
             };
 
-            let source_path = self
-                .backup_folder_path
-                .clone()
-                .or_else(|| self.image_file_path.clone())
-                .or_else(|| {
-                    self.selected_device_idx
-                        .and_then(|idx| devices.get(idx))
-                        .map(|d| d.path.clone())
-                });
-            let source = match source_path {
-                Some(p) => p,
-                None => {
-                    log.error("No source available for export");
-                    return;
-                }
-            };
-
-            let meta = self.backup_metadata.clone();
-            let overrides = partition_overrides;
-            let status = new_status();
-            self.export_status = Some(Arc::clone(&status));
-
-            log.info(format!("Exporting whole-disk VHD to {}...", dest.display()));
-
-            std::thread::spawn(move || {
-                let status2 = Arc::clone(&status);
-                let status3 = Arc::clone(&status);
-                let result = export_whole_disk_vhd(
-                    &source,
-                    meta.as_ref(),
-                    None,
-                    &overrides,
-                    &dest,
-                    move |bytes| {
-                        if let Ok(mut s) = status2.lock() {
-                            s.current_bytes = bytes;
-                        }
-                    },
-                    move || status3.lock().map(|s| s.cancel_requested).unwrap_or(false),
-                    |msg| {
-                        if let Ok(mut s) = status.lock() {
-                            s.log_messages.push(msg.to_string());
-                        }
-                    },
-                );
-                if let Ok(mut s) = status.lock() {
-                    s.finished = true;
-                    if let Err(e) = result {
-                        s.error = Some(format!("{e:#}"));
+            // Clonezilla whole-disk export
+            if let Some(cz_image) = self.clonezilla_image.clone() {
+                let source = match &self.backup_folder_path {
+                    Some(f) => f.clone(),
+                    None => {
+                        log.error("No backup folder for Clonezilla export");
+                        return;
                     }
-                }
-            });
+                };
+                let overrides = partition_overrides;
+                let status = new_status();
+                self.export_status = Some(Arc::clone(&status));
+
+                log.info(format!(
+                    "Exporting Clonezilla image as whole-disk VHD to {}...",
+                    dest.display()
+                ));
+
+                std::thread::spawn(move || {
+                    let status2 = Arc::clone(&status);
+                    let status3 = Arc::clone(&status);
+                    let result = rusty_backup::rbformats::vhd::export_clonezilla_disk_vhd(
+                        &cz_image,
+                        &source,
+                        &dest,
+                        &overrides,
+                        move |bytes| {
+                            if let Ok(mut s) = status2.lock() {
+                                s.current_bytes = bytes;
+                            }
+                        },
+                        move || status3.lock().map(|s| s.cancel_requested).unwrap_or(false),
+                        |msg| {
+                            if let Ok(mut s) = status.lock() {
+                                s.log_messages.push(msg.to_string());
+                            }
+                        },
+                    );
+                    if let Ok(mut s) = status.lock() {
+                        s.finished = true;
+                        if let Err(e) = result {
+                            s.error = Some(format!("{e:#}"));
+                        }
+                    }
+                });
+            } else {
+                // Native backup or raw image export
+                let source_path = self
+                    .backup_folder_path
+                    .clone()
+                    .or_else(|| self.image_file_path.clone())
+                    .or_else(|| {
+                        self.selected_device_idx
+                            .and_then(|idx| devices.get(idx))
+                            .map(|d| d.path.clone())
+                    });
+                let source = match source_path {
+                    Some(p) => p,
+                    None => {
+                        log.error("No source available for export");
+                        return;
+                    }
+                };
+
+                let meta = self.backup_metadata.clone();
+                let overrides = partition_overrides;
+                let status = new_status();
+                self.export_status = Some(Arc::clone(&status));
+
+                log.info(format!("Exporting whole-disk VHD to {}...", dest.display()));
+
+                std::thread::spawn(move || {
+                    let status2 = Arc::clone(&status);
+                    let status3 = Arc::clone(&status);
+                    let result = export_whole_disk_vhd(
+                        &source,
+                        meta.as_ref(),
+                        None,
+                        &overrides,
+                        &dest,
+                        move |bytes| {
+                            if let Ok(mut s) = status2.lock() {
+                                s.current_bytes = bytes;
+                            }
+                        },
+                        move || status3.lock().map(|s| s.cancel_requested).unwrap_or(false),
+                        |msg| {
+                            if let Ok(mut s) = status.lock() {
+                                s.log_messages.push(msg.to_string());
+                            }
+                        },
+                    );
+                    if let Ok(mut s) = status.lock() {
+                        s.finished = true;
+                        if let Err(e) = result {
+                            s.error = Some(format!("{e:#}"));
+                        }
+                    }
+                });
+            }
         } else {
             // Per-partition: pick a folder
             let dest_folder = match super::file_dialog().pick_folder() {
@@ -585,6 +742,7 @@ impl InspectTab {
             });
             let meta = self.backup_metadata.clone();
             let partitions = self.partitions.clone();
+            let cz_image = self.clonezilla_image.clone();
 
             let status = new_status();
             self.export_status = Some(Arc::clone(&status));
@@ -598,7 +756,60 @@ impl InspectTab {
                 let result = (|| -> anyhow::Result<()> {
                     let mut overall_written: u64 = 0;
 
-                    if let (Some(folder), Some(meta)) = (&source_folder, &meta) {
+                    if let (Some(cz), Some(_folder)) = (&cz_image, &source_folder) {
+                        // Clonezilla per-partition export
+                        for cz_part in &cz.partitions {
+                            if status.lock().map(|s| s.cancel_requested).unwrap_or(false) {
+                                anyhow::bail!("export cancelled");
+                            }
+                            if cz_part.is_extended || cz_part.partclone_files.is_empty() {
+                                continue;
+                            }
+
+                            let export_size = size_map
+                                .get(&cz_part.index)
+                                .copied()
+                                .unwrap_or(cz_part.size_bytes());
+                            let dest_path =
+                                dest_folder.join(format!("partition-{}.vhd", cz_part.index));
+
+                            if let Ok(mut s) = status.lock() {
+                                s.log_messages.push(format!(
+                                    "Exporting partition-{} ({}) to {}",
+                                    cz_part.index,
+                                    partition::format_size(export_size),
+                                    dest_path.display()
+                                ));
+                            }
+
+                            let base_written = overall_written;
+                            let status_progress = Arc::clone(&status);
+                            let status_cancel = Arc::clone(&status);
+                            rusty_backup::rbformats::vhd::export_clonezilla_partition_vhd(
+                                &cz_part.partclone_files,
+                                &dest_path,
+                                Some(export_size),
+                                move |bytes| {
+                                    if let Ok(mut s) = status_progress.lock() {
+                                        s.current_bytes = base_written + bytes;
+                                    }
+                                },
+                                move || {
+                                    status_cancel
+                                        .lock()
+                                        .map(|s| s.cancel_requested)
+                                        .unwrap_or(false)
+                                },
+                                |msg| {
+                                    if let Ok(mut s) = status.lock() {
+                                        s.log_messages.push(msg.to_string());
+                                    }
+                                },
+                            )?;
+
+                            overall_written += export_size;
+                        }
+                    } else if let (Some(folder), Some(meta)) = (&source_folder, &meta) {
                         // Backup folder: export each partition file
                         for pm in &meta.partitions {
                             if status.lock().map(|s| s.cancel_requested).unwrap_or(false) {
@@ -819,6 +1030,11 @@ impl InspectTab {
         self.backup_metadata = None;
         self.last_error = None;
         self.partition_min_sizes.clear();
+        self.clonezilla_image = None;
+        self.block_caches.clear();
+        self.block_cache_scan = None;
+        self.seekable_cache_files.clear();
+        self.cache_status = None;
     }
 
     fn load_backup_metadata(&mut self, log: &mut LogPanel) {
@@ -834,6 +1050,11 @@ impl InspectTab {
 
         let metadata_path = folder.join("metadata.json");
         if !metadata_path.exists() {
+            // Try Clonezilla image detection
+            if clonezilla::metadata::is_clonezilla_image(&folder) {
+                self.load_clonezilla_image(&folder, log);
+                return;
+            }
             self.last_error = Some(format!("No metadata.json found in {}", folder.display()));
             return;
         }
@@ -1085,6 +1306,137 @@ impl InspectTab {
         }
     }
 
+    fn load_clonezilla_image(&mut self, folder: &PathBuf, log: &mut LogPanel) {
+        log.info(format!("Detected Clonezilla image in {}", folder.display()));
+
+        match clonezilla::metadata::load(folder) {
+            Ok(cz_image) => {
+                log.info(format!(
+                    "Clonezilla image: {} partition(s), disk: {}, source size: {}",
+                    cz_image.partitions.len(),
+                    cz_image.disk_name,
+                    partition::format_size(cz_image.source_size_bytes),
+                ));
+
+                // Parse MBR from the loaded image
+                let mut mbr_reader = std::io::Cursor::new(&cz_image.mbr_bytes[..]);
+                match PartitionTable::detect(&mut mbr_reader) {
+                    Ok(table) => {
+                        let alignment = detect_alignment(&table);
+                        log.info(format!(
+                            "MBR: {} partition table, alignment: {}",
+                            table.type_name(),
+                            alignment.alignment_type,
+                        ));
+                        self.alignment = Some(alignment);
+                        self.partition_table = Some(table);
+                    }
+                    Err(e) => {
+                        log.warn(format!("Could not parse Clonezilla MBR: {e}"));
+                    }
+                }
+
+                // Convert Clonezilla partitions to PartitionInfo for the grid
+                self.partitions = cz_image
+                    .partitions
+                    .iter()
+                    .map(|p| PartitionInfo {
+                        index: p.index,
+                        type_name: p.type_name(),
+                        partition_type_byte: p.partition_type_byte,
+                        start_lba: p.start_lba,
+                        size_bytes: p.size_bytes(),
+                        bootable: p.bootable,
+                        is_logical: p.is_logical,
+                        is_extended_container: p.is_extended,
+                    })
+                    .collect();
+
+                // Compute minimum sizes by reading partclone headers
+                for cz_part in &cz_image.partitions {
+                    if cz_part.is_extended || cz_part.partclone_files.is_empty() {
+                        continue;
+                    }
+                    match clonezilla::partclone::read_partclone_header(&cz_part.partclone_files) {
+                        Ok(header) => {
+                            let used = header.used_size();
+                            if used > 0 && used < cz_part.size_bytes() {
+                                self.partition_min_sizes.insert(cz_part.index, used);
+                                log.info(format!(
+                                    "Partition {} ({}): min {} (used {} of {} blocks, block size {})",
+                                    cz_part.index,
+                                    cz_part.device_name,
+                                    partition::format_size(used),
+                                    header.used_blocks,
+                                    header.total_blocks,
+                                    header.block_size,
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            log.warn(format!(
+                                "Could not read partclone header for {}: {e}",
+                                cz_part.device_name,
+                            ));
+                        }
+                    }
+                }
+
+                // Check for existing metadata cache files
+                let mut cached_count = 0;
+                for cz_part in &cz_image.partitions {
+                    let cache_path =
+                        folder.join(format!("_{}.metadata.cache", cz_part.device_name));
+                    if cache_path.exists() {
+                        cached_count += 1;
+                    }
+                }
+                if cached_count > 0 {
+                    log.info(format!(
+                        "Found {} cached metadata file(s) for browsing",
+                        cached_count,
+                    ));
+                }
+
+                self.clonezilla_image = Some(cz_image);
+            }
+            Err(e) => {
+                let msg = format!("Failed to parse Clonezilla image: {e:#}");
+                log.error(&msg);
+                self.last_error = Some(msg);
+            }
+        }
+    }
+
+    fn show_clonezilla_metadata(&self, ui: &mut egui::Ui, cz: &ClonezillaImage) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Clonezilla Image:").strong());
+            ui.label(format!("Disk: {}", cz.disk_name));
+        });
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Source Size:").strong());
+            ui.label(format!(
+                "{} ({} bytes)",
+                format_size_decimal(cz.source_size_bytes),
+                format_bytes_grouped(cz.source_size_bytes),
+            ));
+            if cz.heads > 0 {
+                ui.label(format!(
+                    "  CHS: {} / {} / {}",
+                    cz.cylinders, cz.heads, cz.sectors_per_track
+                ));
+            }
+        });
+        // Show creation date from image info (first line)
+        if let Some(first_line) = cz.image_info.lines().next() {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Created:").strong());
+                ui.label(first_line);
+            });
+        }
+        ui.add_space(8.0);
+    }
+
     fn show_backup_metadata(&self, ui: &mut egui::Ui, meta: &BackupMetadata) {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Backup Info:").strong());
@@ -1300,6 +1652,8 @@ impl InspectTab {
     /// For raw image files / devices, the partition data lives at `offset`
     /// within the image. For backup folders, the partition data is stored
     /// as a separate file (raw, zstd-compressed, or CHD-compressed).
+    /// For Clonezilla images, data is in partclone format and needs a
+    /// seekable zstd cache for browsing.
     fn open_browse(
         &mut self,
         part_index: usize,
@@ -1325,7 +1679,13 @@ impl InspectTab {
             return;
         }
 
-        // Case 2: backup folder — find the partition's data file
+        // Case 3: Clonezilla image — use seekable zstd cache
+        if self.clonezilla_image.is_some() {
+            self.open_browse_clonezilla(part_index, ptype, log);
+            return;
+        }
+
+        // Case 2: native backup folder — find the partition's data file
         let (folder, meta) = match (&self.backup_folder_path, &self.backup_metadata) {
             (Some(f), Some(m)) => (f.clone(), m.clone()),
             _ => {
@@ -1388,6 +1748,17 @@ impl InspectTab {
                 ));
                 self.browse_view.open(data_path, 0, ptype);
             }
+            "zstd" => {
+                // Zstd-compressed backup — create seekable cache for browsing
+                self.open_browse_via_seekable_cache(
+                    part_index,
+                    ptype,
+                    &data_path,
+                    &folder,
+                    &format!("partition-{}", part_index),
+                    log,
+                );
+            }
             other => {
                 log.warn(format!(
                     "partition-{}: browsing {} compressed backups is not yet supported (file: {})",
@@ -1396,6 +1767,292 @@ impl InspectTab {
             }
         }
     }
+
+    /// Open browse for a Clonezilla partition using seekable zstd cache.
+    fn open_browse_clonezilla(&mut self, part_index: usize, ptype: u8, log: &mut LogPanel) {
+        let cz_image = match &self.clonezilla_image {
+            Some(cz) => cz.clone(),
+            None => return,
+        };
+        let folder = match &self.backup_folder_path {
+            Some(f) => f.clone(),
+            None => return,
+        };
+
+        let cz_part = match cz_image.partitions.iter().find(|p| p.index == part_index) {
+            Some(p) => p.clone(),
+            None => {
+                log.error(format!(
+                    "partition-{}: not found in Clonezilla image",
+                    part_index,
+                ));
+                return;
+            }
+        };
+
+        if cz_part.partclone_files.is_empty() {
+            log.error(format!("partition-{}: no partclone data files", part_index,));
+            return;
+        }
+
+        // Check if block cache already exists in memory
+        if let Some(cache) = self.block_caches.get(&part_index) {
+            if let Ok(c) = cache.lock() {
+                if c.state == clonezilla::block_cache::CacheState::Ready {
+                    drop(c);
+                    log.info(format!(
+                        "Browsing partition {} from block cache",
+                        part_index
+                    ));
+                    self.browse_view.open_partclone(Arc::clone(cache), ptype);
+                    return;
+                }
+            }
+        }
+
+        // Check if a scan is already running
+        if self.block_cache_scan.is_some() {
+            log.warn("A metadata scan is already in progress. Please wait.");
+            return;
+        }
+
+        // Try to load persisted cache from disk
+        let cache_path = folder.join(format!("_{}.metadata.cache", cz_part.device_name));
+        if cache_path.exists() {
+            match clonezilla::block_cache::PartcloneBlockCache::load_from_file(
+                &cache_path,
+                cz_part.partclone_files.clone(),
+            ) {
+                Ok(loaded) => {
+                    log.info(format!(
+                        "Loaded cached metadata for partition {} ({} blocks)",
+                        part_index,
+                        loaded.cached_block_count(),
+                    ));
+                    let cache = Arc::new(Mutex::new(loaded));
+                    self.block_caches.insert(part_index, Arc::clone(&cache));
+                    self.browse_view.open_partclone(cache, ptype);
+                    return;
+                }
+                Err(e) => {
+                    log::warn!("Failed to load metadata cache: {e}, will re-scan");
+                    let _ = std::fs::remove_file(&cache_path);
+                }
+            }
+        }
+
+        // Start background metadata scan
+        log.info(format!(
+            "Scanning metadata for partition {} ({})...",
+            part_index,
+            partition::format_size(cz_part.size_bytes()),
+        ));
+
+        let cache = Arc::new(Mutex::new(
+            clonezilla::block_cache::PartcloneBlockCache::new(cz_part.partclone_files.clone()),
+        ));
+
+        let scan = Arc::new(Mutex::new(BlockCacheScan {
+            finished: false,
+            error: None,
+            partition_index: part_index,
+            partition_type: ptype,
+            cache: Arc::clone(&cache),
+        }));
+        self.block_cache_scan = Some(Arc::clone(&scan));
+
+        let cache_for_thread = Arc::clone(&cache);
+        std::thread::spawn(move || {
+            let result =
+                clonezilla::block_cache::scan_metadata(&cache_for_thread, ptype, Some(&cache_path));
+            if let Ok(mut s) = scan.lock() {
+                s.finished = true;
+                if let Err(e) = result {
+                    s.error = Some(format!("{e:#}"));
+                }
+            }
+        });
+    }
+
+    /// Open browse for a native zstd-compressed backup via seekable cache.
+    fn open_browse_via_seekable_cache(
+        &mut self,
+        part_index: usize,
+        ptype: u8,
+        data_path: &PathBuf,
+        folder: &PathBuf,
+        cache_name: &str,
+        log: &mut LogPanel,
+    ) {
+        // Check if seekable cache already exists
+        if let Some(cache_path) = self.seekable_cache_files.get(&part_index).cloned() {
+            if cache_path.exists() {
+                log.info(format!(
+                    "Browsing partition {} from cached seekable file",
+                    part_index,
+                ));
+                self.browse_view.open(cache_path, 0, ptype);
+                return;
+            }
+            // Cache file was deleted (stale) — remove from map and recreate
+            self.seekable_cache_files.remove(&part_index);
+        }
+
+        if self.cache_status.is_some() {
+            log.warn("A seekable cache is already being created. Please wait.");
+            return;
+        }
+
+        let cache_path = folder.join(format!("_{cache_name}.seekable.zst"));
+
+        // Get file size for progress
+        let total_bytes = std::fs::metadata(data_path).map(|m| m.len()).unwrap_or(0);
+
+        log.info(format!(
+            "Creating seekable cache for partition {}...",
+            part_index,
+        ));
+
+        let status = Arc::new(Mutex::new(CacheStatus {
+            finished: false,
+            error: None,
+            partition_index: part_index,
+            cache_path: Some(cache_path.clone()),
+            current_bytes: 0,
+            total_bytes,
+        }));
+        self.cache_status = Some(Arc::clone(&status));
+
+        let data_path = data_path.clone();
+        std::thread::spawn(move || {
+            let result = create_seekable_cache_from_zstd(&data_path, &cache_path, &status);
+            if let Ok(mut s) = status.lock() {
+                s.finished = true;
+                if let Err(e) = result {
+                    s.error = Some(format!("{e:#}"));
+                }
+            }
+        });
+    }
+
+    fn poll_block_cache_scan(&mut self, log: &mut LogPanel) {
+        let scan_arc = match &self.block_cache_scan {
+            Some(s) => Arc::clone(s),
+            None => return,
+        };
+
+        let Ok(scan) = scan_arc.lock() else {
+            return;
+        };
+
+        if scan.finished {
+            let part_index = scan.partition_index;
+            let ptype = scan.partition_type;
+
+            if let Some(err) = &scan.error {
+                log.error(format!(
+                    "Metadata scan failed for partition {}: {err}",
+                    part_index,
+                ));
+            } else {
+                log.info(format!(
+                    "Metadata scan complete for partition {}.",
+                    part_index,
+                ));
+                let cache = Arc::clone(&scan.cache);
+                drop(scan);
+                self.block_caches.insert(part_index, Arc::clone(&cache));
+                self.block_cache_scan = None;
+
+                // Auto-open the browser
+                self.browse_view.open_partclone(cache, ptype);
+                return;
+            }
+
+            drop(scan);
+            self.block_cache_scan = None;
+        }
+    }
+
+    fn poll_cache_status(&mut self, log: &mut LogPanel) {
+        let status_arc = match &self.cache_status {
+            Some(s) => Arc::clone(s),
+            None => return,
+        };
+
+        let Ok(status) = status_arc.lock() else {
+            return;
+        };
+
+        if status.finished {
+            let part_index = status.partition_index;
+            if let Some(err) = &status.error {
+                log.error(format!(
+                    "Failed to create seekable cache for partition {}: {err}",
+                    part_index,
+                ));
+            } else if let Some(cache_path) = &status.cache_path {
+                log.info(format!(
+                    "Seekable cache ready for partition {}. Click Browse again.",
+                    part_index,
+                ));
+                self.seekable_cache_files
+                    .insert(part_index, cache_path.clone());
+            }
+            drop(status);
+            self.cache_status = None;
+        }
+    }
+}
+
+/// Create a seekable zstd cache from a native zstd-compressed backup file.
+///
+/// Streams: zstd file → zstd decompress → zeekstd encode → cache file.
+fn create_seekable_cache_from_zstd(
+    data_path: &PathBuf,
+    cache_path: &PathBuf,
+    status: &Arc<Mutex<CacheStatus>>,
+) -> anyhow::Result<()> {
+    use std::io::BufWriter;
+
+    let input_file =
+        File::open(data_path).with_context(|| format!("failed to open {}", data_path.display()))?;
+    let mut decoder =
+        zstd::Decoder::new(BufReader::new(input_file)).context("failed to create zstd decoder")?;
+
+    let output_file = File::create(cache_path)
+        .with_context(|| format!("failed to create cache file: {}", cache_path.display()))?;
+    let buf_writer = BufWriter::new(output_file);
+
+    let opts = zeekstd::EncodeOptions::new()
+        .frame_size_policy(zeekstd::FrameSizePolicy::Uncompressed(2 * 1024 * 1024));
+    let mut encoder = opts
+        .into_encoder(buf_writer)
+        .map_err(|e| anyhow::anyhow!("failed to create zeekstd encoder: {e}"))?;
+
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut total_read: u64 = 0;
+
+    loop {
+        let n = decoder.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        encoder
+            .compress(&buf[..n])
+            .map_err(|e| anyhow::anyhow!("zeekstd compress error: {e}"))?;
+        total_read += n as u64;
+
+        if let Ok(mut s) = status.lock() {
+            s.current_bytes = total_read;
+        }
+    }
+
+    encoder
+        .finish()
+        .map_err(|e| anyhow::anyhow!("zeekstd finish error: {e}"))?;
+
+    Ok(())
 }
 
 /// Check if a partition type byte corresponds to a browsable filesystem.

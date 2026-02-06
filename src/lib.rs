@@ -1,4 +1,5 @@
 pub mod backup;
+pub mod clonezilla;
 pub mod device;
 pub mod error;
 pub mod fs;

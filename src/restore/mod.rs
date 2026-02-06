@@ -8,11 +8,18 @@ use anyhow::{bail, Context, Result};
 
 use crate::backup::metadata::BackupMetadata;
 use crate::backup::LogLevel;
+use crate::clonezilla;
+use crate::clonezilla::metadata::ClonezillaImage;
+use crate::clonezilla::partclone::open_partclone_reader;
+use crate::fs::exfat::patch_exfat_hidden_sectors;
+use crate::fs::fat::patch_bpb_hidden_sectors;
+use crate::fs::ntfs::patch_ntfs_hidden_sectors;
 use crate::fs::{
     resize_exfat_in_place, resize_fat_in_place, resize_ntfs_in_place, set_fat_clean_flags,
     validate_exfat_integrity, validate_fat_integrity, validate_ntfs_integrity,
 };
 use crate::os::SectorAlignedWriter;
+use crate::partition::mbr::patch_mbr_entries;
 use crate::partition::PartitionSizeOverride;
 use crate::rbformats::reconstruct_disk_from_backup;
 
@@ -252,6 +259,10 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
     set_operation(&progress, "Loading backup metadata...");
     let metadata_path = config.backup_folder.join("metadata.json");
     if !metadata_path.exists() {
+        // Check if this is a Clonezilla image
+        if clonezilla::metadata::is_clonezilla_image(&config.backup_folder) {
+            return run_clonezilla_restore(config, progress);
+        }
         bail!(
             "metadata.json not found in {}",
             config.backup_folder.display()
@@ -523,6 +534,620 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
         p.operation = "Restore complete".to_string();
     }
 
+    Ok(())
+}
+
+/// Calculate the final partition layout for a Clonezilla image restore.
+pub fn calculate_clonezilla_restore_layout(
+    cz_image: &ClonezillaImage,
+    alignment: &RestoreAlignment,
+    partition_sizes: &[RestorePartitionSize],
+    target_size: u64,
+) -> Result<Vec<PartitionSizeOverride>> {
+    // Determine alignment parameters
+    let (first_partition_lba, alignment_sectors, heads, spt) = match alignment {
+        RestoreAlignment::Original => {
+            // Use the original alignment from the Clonezilla image
+            let first_lba = cz_image
+                .partitions
+                .iter()
+                .filter(|p| !p.is_extended)
+                .map(|p| p.start_lba)
+                .min()
+                .unwrap_or(63);
+            // Detect alignment from partition starts
+            let alignment_sectors = detect_clonezilla_alignment(cz_image);
+            (
+                first_lba,
+                alignment_sectors,
+                cz_image.heads as u16,
+                cz_image.sectors_per_track as u16,
+            )
+        }
+        RestoreAlignment::Modern1MB => (2048, 2048, 0, 0),
+        RestoreAlignment::Custom(n) => (*n, *n, 0, 0),
+    };
+
+    let mut overrides = Vec::new();
+    let mut current_lba = first_partition_lba;
+
+    // Sort partitions by start LBA for layout calculation
+    let mut sorted_parts: Vec<&clonezilla::metadata::ClonezillaPartition> = cz_image
+        .partitions
+        .iter()
+        .filter(|p| !p.is_extended)
+        .collect();
+    sorted_parts.sort_by_key(|p| p.start_lba);
+
+    for cz_part in &sorted_parts {
+        let size_choice = partition_sizes
+            .iter()
+            .find(|s| s.index == cz_part.index)
+            .map(|s| &s.size_choice)
+            .unwrap_or(&RestoreSizeChoice::Original);
+
+        // Align current_lba to boundary
+        if alignment_sectors > 0 {
+            let rem = current_lba % alignment_sectors;
+            if rem != 0 {
+                current_lba += alignment_sectors - rem;
+            }
+        }
+
+        let partition_size = match size_choice {
+            RestoreSizeChoice::Original => cz_part.size_bytes(),
+            RestoreSizeChoice::Minimum => {
+                let min = cz_part.size_bytes(); // partclone doesn't have a smaller "imaged" size
+                (min + 511) & !511
+            }
+            RestoreSizeChoice::Custom(bytes) => (bytes + 511) & !511,
+            RestoreSizeChoice::FillRemaining => {
+                let used_bytes = current_lba * 512;
+                if target_size > used_bytes {
+                    target_size - used_bytes
+                } else {
+                    cz_part.size_bytes()
+                }
+            }
+        };
+
+        let new_start_lba = if current_lba != cz_part.start_lba {
+            Some(current_lba)
+        } else {
+            None
+        };
+
+        overrides.push(PartitionSizeOverride {
+            index: cz_part.index,
+            start_lba: cz_part.start_lba,
+            original_size: cz_part.size_bytes(),
+            export_size: partition_size,
+            new_start_lba,
+            heads,
+            sectors_per_track: spt,
+        });
+
+        current_lba += partition_size / 512;
+    }
+
+    // Validate: no partition extends past target
+    let target_sectors = target_size / 512;
+    for ov in &overrides {
+        let end_lba = ov.effective_start_lba() + ov.export_size / 512;
+        if end_lba > target_sectors {
+            bail!(
+                "Partition {} would end at LBA {} which exceeds target size ({} sectors)",
+                ov.index,
+                end_lba,
+                target_sectors,
+            );
+        }
+    }
+
+    Ok(overrides)
+}
+
+/// Detect the alignment pattern from a Clonezilla image's partition table.
+fn detect_clonezilla_alignment(cz_image: &ClonezillaImage) -> u64 {
+    let starts: Vec<u64> = cz_image
+        .partitions
+        .iter()
+        .filter(|p| !p.is_extended && p.start_lba > 0)
+        .map(|p| p.start_lba)
+        .collect();
+
+    if starts.is_empty() {
+        return 1;
+    }
+
+    // Check if all partitions are aligned to a common boundary
+    for alignment in [2048u64, 63] {
+        if starts.iter().all(|&s| s % alignment == 0 || s == starts[0]) {
+            return alignment;
+        }
+    }
+
+    1 // No alignment detected
+}
+
+/// Restore a Clonezilla image to a target device or file.
+fn run_clonezilla_restore(
+    config: RestoreConfig,
+    progress: Arc<Mutex<RestoreProgress>>,
+) -> Result<()> {
+    log(
+        &progress,
+        LogLevel::Info,
+        format!(
+            "Detected Clonezilla image in {}",
+            config.backup_folder.display()
+        ),
+    );
+
+    // Load Clonezilla image metadata
+    set_operation(&progress, "Loading Clonezilla image...");
+    let cz_image = clonezilla::metadata::load(&config.backup_folder)
+        .context("failed to load Clonezilla image metadata")?;
+
+    log(
+        &progress,
+        LogLevel::Info,
+        format!(
+            "Clonezilla image: {} partition(s), source disk: {}",
+            cz_image.partitions.len(),
+            cz_image.disk_name,
+        ),
+    );
+
+    // Verify partclone files exist
+    for cz_part in &cz_image.partitions {
+        if cz_part.is_extended {
+            continue;
+        }
+        for f in &cz_part.partclone_files {
+            if !f.exists() {
+                bail!("Missing partclone data file: {}", f.display());
+            }
+        }
+    }
+
+    if is_cancelled(&progress) {
+        bail!("restore cancelled");
+    }
+
+    // Calculate partition layout
+    set_operation(&progress, "Calculating partition layout...");
+    let overrides = calculate_clonezilla_restore_layout(
+        &cz_image,
+        &config.alignment,
+        &config.partition_sizes,
+        config.target_size,
+    )?;
+
+    for ov in &overrides {
+        let start = ov.effective_start_lba();
+        let size_mib = ov.export_size / (1024 * 1024);
+        log(
+            &progress,
+            LogLevel::Info,
+            format!(
+                "Partition {}: LBA {} -> {}, size {} MiB",
+                ov.index, ov.start_lba, start, size_mib,
+            ),
+        );
+    }
+
+    // Pre-flight check
+    let total_bytes: u64 = overrides.iter().map(|o| o.export_size).sum();
+    if total_bytes > config.target_size {
+        bail!(
+            "Total partition size ({} bytes) exceeds target ({} bytes)",
+            total_bytes,
+            config.target_size,
+        );
+    }
+
+    set_progress_bytes(&progress, 0, config.target_size);
+
+    if is_cancelled(&progress) {
+        bail!("restore cancelled");
+    }
+
+    // Open target
+    set_operation(&progress, "Opening target...");
+    let device_handle = if config.target_is_device {
+        log(
+            &progress,
+            LogLevel::Info,
+            format!(
+                "Opening device {} for writing...",
+                config.target_path.display()
+            ),
+        );
+        crate::os::open_target_for_writing(&config.target_path)
+            .with_context(|| format!("cannot open {} for writing", config.target_path.display()))?
+    } else {
+        log(
+            &progress,
+            LogLevel::Info,
+            format!("Creating image file {}...", config.target_path.display()),
+        );
+        let file = File::create(&config.target_path)
+            .with_context(|| format!("failed to create {}", config.target_path.display()))?;
+        crate::os::DeviceWriteHandle::from_file(file)
+    };
+
+    let target_file = device_handle.file;
+    let mut target = SectorAlignedWriter::new(target_file);
+
+    if is_cancelled(&progress) {
+        bail!("restore cancelled");
+    }
+
+    // Write disk image
+    set_operation(&progress, "Writing disk image...");
+    let total_written = write_clonezilla_disk(
+        &cz_image,
+        &overrides,
+        &mut target,
+        config.target_is_device,
+        config.write_zeros_to_unused,
+        &progress,
+    )?;
+
+    // Filesystem resize operations
+    set_operation(&progress, "Finalizing filesystems...");
+
+    // Sort overrides the same way as partitions
+    let mut sorted_parts: Vec<&clonezilla::metadata::ClonezillaPartition> = cz_image
+        .partitions
+        .iter()
+        .filter(|p| !p.is_extended)
+        .collect();
+    sorted_parts.sort_by_key(|p| p.start_lba);
+
+    for cz_part in &sorted_parts {
+        let ov = match overrides.iter().find(|o| o.index == cz_part.index) {
+            Some(o) => o,
+            None => continue,
+        };
+
+        let part_offset = ov.effective_start_lba() * 512;
+        let export_size = ov.export_size;
+
+        let inner_file = target
+            .inner_mut()
+            .context("failed to access device for filesystem operations")?;
+
+        // Resize if partition size changed
+        if export_size != cz_part.size_bytes() {
+            let fs_type = detect_partition_fs_type(inner_file, part_offset);
+            match fs_type {
+                PartitionFsType::Ntfs => {
+                    let new_sectors = export_size / 512;
+                    resize_ntfs_in_place(inner_file, part_offset, new_sectors, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    })?;
+                }
+                PartitionFsType::Exfat => {
+                    let new_sectors = export_size / 512;
+                    resize_exfat_in_place(inner_file, part_offset, new_sectors, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    })?;
+                }
+                PartitionFsType::Fat | PartitionFsType::Unknown => {
+                    let new_sectors = (export_size / 512) as u32;
+                    resize_fat_in_place(inner_file, part_offset, new_sectors, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    })?;
+                }
+            }
+        }
+
+        // Validate filesystem integrity
+        if export_size != cz_part.size_bytes() || !cz_part.partclone_files.is_empty() {
+            let fs_type = detect_partition_fs_type(inner_file, part_offset);
+            match fs_type {
+                PartitionFsType::Ntfs => {
+                    let _ = validate_ntfs_integrity(inner_file, part_offset, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    });
+                }
+                PartitionFsType::Exfat => {
+                    let _ = validate_exfat_integrity(inner_file, part_offset, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    });
+                }
+                PartitionFsType::Fat | PartitionFsType::Unknown => {
+                    let _ = validate_fat_integrity(inner_file, part_offset, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    });
+                }
+            }
+        }
+    }
+
+    target.flush()?;
+    drop(target);
+
+    // Reopen device to set FAT clean flags
+    if config.target_is_device {
+        log(
+            &progress,
+            LogLevel::Info,
+            "Setting FAT clean shutdown flags...",
+        );
+
+        let mut device_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&config.target_path)
+            .with_context(|| {
+                format!(
+                    "failed to reopen {} for setting flags",
+                    config.target_path.display()
+                )
+            })?;
+
+        for cz_part in &sorted_parts {
+            let ov = match overrides.iter().find(|o| o.index == cz_part.index) {
+                Some(o) => o,
+                None => continue,
+            };
+
+            let part_offset = ov.effective_start_lba() * 512;
+            let export_size = ov.export_size;
+
+            if export_size != cz_part.size_bytes() || !cz_part.partclone_files.is_empty() {
+                let _ = set_fat_clean_flags(&mut device_file, part_offset, &mut |msg| {
+                    log(&progress, LogLevel::Info, msg)
+                });
+            }
+        }
+
+        device_file.flush()?;
+    }
+
+    log(
+        &progress,
+        LogLevel::Info,
+        format!(
+            "Restore complete: {} bytes written to {}",
+            total_written,
+            config.target_path.display(),
+        ),
+    );
+
+    if let Ok(mut p) = progress.lock() {
+        p.finished = true;
+        p.operation = "Restore complete".to_string();
+    }
+
+    Ok(())
+}
+
+/// Write a Clonezilla disk image: MBR, hidden data, EBR, and partition data.
+fn write_clonezilla_disk(
+    cz_image: &ClonezillaImage,
+    overrides: &[PartitionSizeOverride],
+    writer: &mut (impl Read + Write + Seek),
+    is_device: bool,
+    fill_unused_with_zeros: bool,
+    progress: &Arc<Mutex<RestoreProgress>>,
+) -> Result<u64> {
+    use std::io;
+
+    let mut total_written: u64 = 0;
+    let target_size = progress.lock().map(|p| p.total_bytes).unwrap_or(0);
+
+    let get_export_size = |index: usize, default: u64| -> u64 {
+        overrides
+            .iter()
+            .find(|ps| ps.index == index)
+            .map(|ps| ps.export_size)
+            .unwrap_or(default)
+    };
+
+    // Write MBR
+    let mut mbr_buf = cz_image.mbr_bytes;
+    if !overrides.is_empty() {
+        patch_mbr_entries(&mut mbr_buf, overrides);
+        log(progress, LogLevel::Info, "Patched MBR partition table");
+    }
+    writer.write_all(&mbr_buf).context("failed to write MBR")?;
+    total_written += 512;
+
+    // Write hidden data after MBR
+    if !cz_image.hidden_data_after_mbr.is_empty() {
+        writer
+            .write_all(&cz_image.hidden_data_after_mbr)
+            .context("failed to write hidden data after MBR")?;
+        total_written += cz_image.hidden_data_after_mbr.len() as u64;
+        log(
+            progress,
+            LogLevel::Info,
+            format!(
+                "Wrote {} bytes of hidden data after MBR",
+                cz_image.hidden_data_after_mbr.len()
+            ),
+        );
+    }
+
+    // Sort partitions by start LBA
+    let mut sorted_parts: Vec<&clonezilla::metadata::ClonezillaPartition> =
+        cz_image.partitions.iter().collect();
+    sorted_parts.sort_by_key(|p| p.start_lba);
+
+    for cz_part in &sorted_parts {
+        if is_cancelled(progress) {
+            bail!("restore cancelled");
+        }
+
+        let effective_lba = overrides
+            .iter()
+            .find(|ps| ps.index == cz_part.index)
+            .map(|ps| ps.effective_start_lba())
+            .unwrap_or(cz_part.start_lba);
+
+        let part_offset = effective_lba * 512;
+        let export_size = get_export_size(cz_part.index, cz_part.size_bytes());
+
+        // Fill gap to partition start
+        if total_written < part_offset {
+            let gap = part_offset - total_written;
+
+            // Write EBR if applicable
+            if let Some(ebr_data) = cz_image.ebr_data.get(&cz_part.device_name) {
+                let ebr_gap = part_offset - total_written - ebr_data.len().min(512) as u64;
+                if ebr_gap > 0 {
+                    fill_gap(writer, ebr_gap, is_device, fill_unused_with_zeros)?;
+                    total_written += ebr_gap;
+                }
+                let write_len = ebr_data.len().min(512);
+                writer.write_all(&ebr_data[..write_len])?;
+                total_written += write_len as u64;
+            } else {
+                fill_gap(writer, gap, is_device, fill_unused_with_zeros)?;
+                total_written += gap;
+            }
+        }
+
+        // Extended container partitions have no data
+        if cz_part.is_extended {
+            continue;
+        }
+
+        // Write partition data from partclone
+        if cz_part.partclone_files.is_empty() {
+            log(
+                progress,
+                LogLevel::Info,
+                format!(
+                    "partition-{}: no data files, filling with zeros",
+                    cz_part.index
+                ),
+            );
+            crate::rbformats::write_zeros(writer, export_size)?;
+            total_written += export_size;
+            continue;
+        }
+
+        log(
+            progress,
+            LogLevel::Info,
+            format!(
+                "partition-{}: decompressing partclone data ({})...",
+                cz_part.index, cz_part.device_name
+            ),
+        );
+
+        let (_header, mut reader) = open_partclone_reader(&cz_part.partclone_files)?;
+
+        let mut buf = vec![0u8; crate::rbformats::CHUNK_SIZE];
+        let mut part_written: u64 = 0;
+        let copy_limit = export_size.min(cz_part.size_bytes());
+        let mut limited = (&mut reader).take(copy_limit);
+
+        loop {
+            if is_cancelled(progress) {
+                bail!("restore cancelled");
+            }
+            let n = limited.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            writer.write_all(&buf[..n])?;
+            part_written += n as u64;
+            total_written += n as u64;
+            set_progress_bytes(progress, total_written, target_size);
+        }
+
+        // Pad if export_size > data written
+        if part_written < export_size {
+            let pad = export_size - part_written;
+            if fill_unused_with_zeros || is_device {
+                #[cfg(target_os = "windows")]
+                {
+                    crate::rbformats::write_zeros(writer, pad)?;
+                    total_written += pad;
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    if fill_unused_with_zeros {
+                        crate::rbformats::write_zeros(writer, pad)?;
+                        total_written += pad;
+                    } else {
+                        match writer.seek(SeekFrom::Current(pad as i64)) {
+                            Ok(_) => total_written += pad,
+                            Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+                                crate::rbformats::write_zeros(writer, pad)?;
+                                total_written += pad;
+                            }
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                }
+            } else {
+                writer.seek(SeekFrom::Current(pad as i64))?;
+                total_written += pad;
+            }
+        }
+
+        // Patch hidden sectors
+        {
+            writer.flush()?;
+            patch_bpb_hidden_sectors(writer, part_offset, effective_lba, &mut |msg| {
+                log(progress, LogLevel::Info, msg)
+            })?;
+            patch_ntfs_hidden_sectors(writer, part_offset, effective_lba, &mut |msg| {
+                log(progress, LogLevel::Info, msg)
+            })?;
+            patch_exfat_hidden_sectors(writer, part_offset, effective_lba, &mut |msg| {
+                log(progress, LogLevel::Info, msg)
+            })?;
+        }
+
+        log(
+            progress,
+            LogLevel::Info,
+            format!(
+                "partition-{}: wrote {} bytes (export size: {})",
+                cz_part.index, part_written, export_size,
+            ),
+        );
+    }
+
+    writer.flush()?;
+    Ok(total_written)
+}
+
+/// Fill a gap between partitions: write zeros or seek depending on context.
+fn fill_gap(
+    writer: &mut (impl Write + Seek),
+    gap: u64,
+    is_device: bool,
+    fill_unused_with_zeros: bool,
+) -> Result<()> {
+    use std::io;
+
+    #[cfg(target_os = "windows")]
+    let force_write_zeros = is_device;
+    #[cfg(not(target_os = "windows"))]
+    let force_write_zeros = false;
+
+    if force_write_zeros || (is_device && fill_unused_with_zeros) {
+        crate::rbformats::write_zeros(writer, gap)?;
+    } else if is_device {
+        match writer.seek(SeekFrom::Current(gap as i64)) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+                crate::rbformats::write_zeros(writer, gap)?;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    } else {
+        writer.seek(SeekFrom::Current(gap as i64))?;
+    }
     Ok(())
 }
 

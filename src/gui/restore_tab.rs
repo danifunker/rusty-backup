@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use rusty_backup::backup::metadata::BackupMetadata;
+use rusty_backup::clonezilla;
+use rusty_backup::clonezilla::metadata::ClonezillaImage;
 use rusty_backup::device::DiskDevice;
 use rusty_backup::partition;
 use rusty_backup::restore::{
@@ -55,6 +57,7 @@ pub struct RestoreTab {
     // Source
     backup_folder: Option<PathBuf>,
     backup_metadata: Option<BackupMetadata>,
+    clonezilla_image: Option<ClonezillaImage>,
     mbr_bytes: Option<[u8; 512]>,
     metadata_error: Option<String>,
     prev_backup_folder: Option<PathBuf>,
@@ -84,6 +87,7 @@ impl Default for RestoreTab {
         Self {
             backup_folder: None,
             backup_metadata: None,
+            clonezilla_image: None,
             mbr_bytes: None,
             metadata_error: None,
             prev_backup_folder: None,
@@ -110,7 +114,7 @@ impl RestoreTab {
     }
 
     pub fn has_backup(&self) -> bool {
-        self.backup_folder.is_some()
+        self.backup_metadata.is_some() || self.clonezilla_image.is_some()
     }
 
     pub fn load_backup(&mut self, path: &PathBuf) {
@@ -124,6 +128,7 @@ impl RestoreTab {
     pub fn clear_backup(&mut self) {
         self.backup_folder = None;
         self.backup_metadata = None;
+        self.clonezilla_image = None;
         self.mbr_bytes = None;
         self.metadata_error = None;
         self.prev_backup_folder = None;
@@ -191,6 +196,23 @@ impl RestoreTab {
                     "{} ({})",
                     meta.source_device,
                     partition::format_size(meta.source_size_bytes),
+                ));
+            });
+        } else if let Some(cz) = &self.clonezilla_image {
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Backup Info:").strong());
+                ui.label(format!(
+                    "Clonezilla image, {} partition(s), MBR",
+                    cz.partitions.len(),
+                ));
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Source:").strong());
+                ui.label(format!(
+                    "/dev/{} ({})",
+                    cz.disk_name,
+                    partition::format_size(cz.source_size_bytes),
                 ));
             });
         }
@@ -268,10 +290,14 @@ impl RestoreTab {
             }
 
             // Show target size comparison
-            if let Some(meta) = &self.backup_metadata {
+            let source_size_opt = self
+                .backup_metadata
+                .as_ref()
+                .map(|m| m.source_size_bytes)
+                .or_else(|| self.clonezilla_image.as_ref().map(|c| c.source_size_bytes));
+            if let Some(source_size) = source_size_opt {
                 let target_size = self.get_target_size(devices);
                 if target_size > 0 {
-                    let source_size = meta.source_size_bytes;
                     let color = if target_size >= source_size {
                         egui::Color32::GRAY
                     } else {
@@ -295,7 +321,7 @@ impl RestoreTab {
         });
 
         // --- Section 3: Alignment (only when metadata loaded) ---
-        if self.backup_metadata.is_some() {
+        if self.backup_metadata.is_some() || self.clonezilla_image.is_some() {
             ui.add_space(8.0);
             ui.label(egui::RichText::new("Alignment").strong());
             ui.separator();
@@ -306,6 +332,15 @@ impl RestoreTab {
                         "Original ({}, LBA {})",
                         meta.alignment.detected_type, meta.alignment.first_partition_lba,
                     )
+                } else if let Some(cz) = &self.clonezilla_image {
+                    let first_lba = cz
+                        .partitions
+                        .iter()
+                        .filter(|p| !p.is_extended)
+                        .map(|p| p.start_lba)
+                        .min()
+                        .unwrap_or(63);
+                    format!("Original (LBA {})", first_lba)
                 } else {
                     "Original".to_string()
                 };
@@ -450,7 +485,8 @@ impl RestoreTab {
         // --- Section 5: Action Buttons ---
         ui.horizontal(|ui| {
             if !self.restore_running {
-                let can_start = self.backup_metadata.is_some() && self.has_target(devices);
+                let can_start = (self.backup_metadata.is_some() || self.clonezilla_image.is_some())
+                    && self.has_target(devices);
                 if ui
                     .add_enabled(can_start, egui::Button::new("Restore"))
                     .clicked()
@@ -477,6 +513,7 @@ impl RestoreTab {
 
     fn load_backup_metadata(&mut self, log: &mut LogPanel) {
         self.backup_metadata = None;
+        self.clonezilla_image = None;
         self.mbr_bytes = None;
         self.metadata_error = None;
         self.partition_configs.clear();
@@ -487,12 +524,23 @@ impl RestoreTab {
         };
 
         let metadata_path = folder.join("metadata.json");
-        if !metadata_path.exists() {
-            self.metadata_error = Some("metadata.json not found in folder".to_string());
-            return;
+        if metadata_path.exists() {
+            self.load_native_backup_metadata(&folder, &metadata_path, log);
+        } else if clonezilla::metadata::is_clonezilla_image(&folder) {
+            self.load_clonezilla_backup_metadata(&folder, log);
+        } else {
+            self.metadata_error =
+                Some("No backup found (metadata.json or Clonezilla image)".to_string());
         }
+    }
 
-        let file = match File::open(&metadata_path) {
+    fn load_native_backup_metadata(
+        &mut self,
+        folder: &std::path::Path,
+        metadata_path: &std::path::Path,
+        log: &mut LogPanel,
+    ) {
+        let file = match File::open(metadata_path) {
             Ok(f) => f,
             Err(e) => {
                 self.metadata_error = Some(format!("Cannot open metadata.json: {e}"));
@@ -547,6 +595,57 @@ impl RestoreTab {
         self.backup_metadata = Some(metadata);
     }
 
+    fn load_clonezilla_backup_metadata(&mut self, folder: &std::path::Path, log: &mut LogPanel) {
+        let cz_image = match clonezilla::metadata::load(folder) {
+            Ok(img) => img,
+            Err(e) => {
+                self.metadata_error = Some(format!("Failed to load Clonezilla image: {e}"));
+                return;
+            }
+        };
+
+        self.mbr_bytes = Some(cz_image.mbr_bytes);
+
+        // Build partition configs from Clonezilla partitions (skip extended containers)
+        for cz_part in &cz_image.partitions {
+            if cz_part.is_extended {
+                continue;
+            }
+
+            // Try to get minimum size from partclone header
+            let minimum_size = if !cz_part.partclone_files.is_empty() {
+                match clonezilla::partclone::read_partclone_header(&cz_part.partclone_files) {
+                    Ok(header) => header.used_size(),
+                    Err(_) => cz_part.size_bytes(),
+                }
+            } else {
+                cz_part.size_bytes()
+            };
+
+            self.partition_configs.push(RestorePartitionConfig {
+                index: cz_part.index,
+                type_name: cz_part.type_name(),
+                start_lba: cz_part.start_lba,
+                original_size: cz_part.size_bytes(),
+                minimum_size,
+                choice: RestoreSizeUiChoice::Original,
+                custom_size_mib: (cz_part.size_bytes() / (1024 * 1024)) as u32,
+            });
+        }
+
+        log.info(format!(
+            "Loaded Clonezilla image: {} partition(s) from /dev/{}",
+            cz_image
+                .partitions
+                .iter()
+                .filter(|p| !p.is_extended)
+                .count(),
+            cz_image.disk_name,
+        ));
+
+        self.clonezilla_image = Some(cz_image);
+    }
+
     fn get_target_size(&self, devices: &[DiskDevice]) -> u64 {
         if self.target_is_device {
             self.selected_device_idx
@@ -555,10 +654,13 @@ impl RestoreTab {
                 .unwrap_or(0)
         } else {
             // For image files, use the source disk size as default target
-            self.backup_metadata
-                .as_ref()
-                .map(|m| m.source_size_bytes)
-                .unwrap_or(0)
+            if let Some(meta) = &self.backup_metadata {
+                meta.source_size_bytes
+            } else if let Some(cz) = &self.clonezilla_image {
+                cz.source_size_bytes
+            } else {
+                0
+            }
         }
     }
 
@@ -672,6 +774,7 @@ impl RestoreTab {
                 .backup_metadata
                 .as_ref()
                 .map(|m| m.source_size_bytes)
+                .or_else(|| self.clonezilla_image.as_ref().map(|c| c.source_size_bytes))
                 .unwrap_or(0);
             (path, false, size)
         };
