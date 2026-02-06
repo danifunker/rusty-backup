@@ -1267,7 +1267,7 @@ impl InspectTab {
                             }
                         }
                         ui.label(if part.bootable { "Yes" } else { "" });
-                        if is_fat_type(part.partition_type_byte) || is_fat_name(&part.type_name) {
+                        if is_browsable_type(part.partition_type_byte) || is_fat_name(&part.type_name) {
                             if ui.small_button("Browse").clicked() {
                                 // Use the stored type byte, or infer one
                                 // from the name for old backups that didn't
@@ -1396,11 +1396,11 @@ impl InspectTab {
     }
 }
 
-/// Check if a partition type byte corresponds to a FAT filesystem.
-fn is_fat_type(ptype: u8) -> bool {
+/// Check if a partition type byte corresponds to a browsable filesystem.
+fn is_browsable_type(ptype: u8) -> bool {
     matches!(
         ptype,
-        0x01 | 0x04 | 0x06 | 0x0B | 0x0C | 0x0E | 0x11 | 0x14 | 0x16 | 0x1B | 0x1C | 0x1E
+        0x01 | 0x04 | 0x06 | 0x07 | 0x0B | 0x0C | 0x0E | 0x11 | 0x14 | 0x16 | 0x1B | 0x1C | 0x1E
     )
 }
 

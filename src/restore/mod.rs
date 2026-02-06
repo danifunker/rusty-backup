@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -8,7 +8,10 @@ use anyhow::{bail, Context, Result};
 
 use crate::backup::metadata::BackupMetadata;
 use crate::backup::LogLevel;
-use crate::fs::{resize_fat_in_place, set_fat_clean_flags, validate_fat_integrity};
+use crate::fs::{
+    resize_exfat_in_place, resize_fat_in_place, resize_ntfs_in_place, set_fat_clean_flags,
+    validate_exfat_integrity, validate_fat_integrity, validate_ntfs_integrity,
+};
 use crate::os::SectorAlignedWriter;
 use crate::partition::PartitionSizeOverride;
 use crate::rbformats::reconstruct_disk_from_backup;
@@ -369,7 +372,11 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
     // macOS) are always multiples of 512 bytes.  For regular image files the
     // buffering is harmless and adds negligible overhead.
     let mut target = SectorAlignedWriter::new(target_file);
-    log(&progress, LogLevel::Info, "SectorAlignedWriter created successfully");
+    log(
+        &progress,
+        LogLevel::Info,
+        "SectorAlignedWriter created successfully",
+    );
 
     if is_cancelled(&progress) {
         bail!("restore cancelled");
@@ -398,31 +405,65 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
         },
     )?;
 
-    // Step 8: FAT resize operations (using inner File to avoid buffer flush on every seek)
+    // Step 8: Filesystem resize operations (using inner File to avoid buffer flush on every seek)
     set_operation(&progress, "Finalizing filesystems...");
 
     for (pm, ov) in metadata.partitions.iter().zip(&overrides) {
         let part_offset = ov.effective_start_lba() * 512;
         let export_size = ov.export_size;
 
-        // Get direct access to the File for FAT operations (avoids SectorAlignedWriter overhead)
+        // Get direct access to the File for filesystem operations (avoids SectorAlignedWriter overhead)
         let inner_file = target
             .inner_mut()
             .context("failed to access device for filesystem operations")?;
 
-        // Resize FAT filesystem if the partition size changed
+        // Resize filesystem if the partition size changed
         if export_size != pm.original_size_bytes {
-            let new_sectors = (export_size / 512) as u32;
-            resize_fat_in_place(inner_file, part_offset, new_sectors, &mut |msg| {
-                log(&progress, LogLevel::Info, msg)
-            })?;
+            // Detect filesystem type from the written partition data
+            let fs_type = detect_partition_fs_type(inner_file, part_offset);
+
+            match fs_type {
+                PartitionFsType::Ntfs => {
+                    let new_sectors = export_size / 512;
+                    resize_ntfs_in_place(inner_file, part_offset, new_sectors, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    })?;
+                }
+                PartitionFsType::Exfat => {
+                    let new_sectors = export_size / 512;
+                    resize_exfat_in_place(inner_file, part_offset, new_sectors, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    })?;
+                }
+                PartitionFsType::Fat | PartitionFsType::Unknown => {
+                    let new_sectors = (export_size / 512) as u32;
+                    resize_fat_in_place(inner_file, part_offset, new_sectors, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    })?;
+                }
+            }
         }
 
-        // Validate FAT integrity after resize
+        // Validate filesystem integrity after resize
         if export_size != pm.original_size_bytes || pm.compacted {
-            let _ = validate_fat_integrity(inner_file, part_offset, &mut |msg| {
-                log(&progress, LogLevel::Info, msg)
-            });
+            let fs_type = detect_partition_fs_type(inner_file, part_offset);
+            match fs_type {
+                PartitionFsType::Ntfs => {
+                    let _ = validate_ntfs_integrity(inner_file, part_offset, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    });
+                }
+                PartitionFsType::Exfat => {
+                    let _ = validate_exfat_integrity(inner_file, part_offset, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    });
+                }
+                PartitionFsType::Fat | PartitionFsType::Unknown => {
+                    let _ = validate_fat_integrity(inner_file, part_offset, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    });
+                }
+            }
         }
     }
 
@@ -483,4 +524,32 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
     }
 
     Ok(())
+}
+
+/// Detected filesystem type for a partition.
+enum PartitionFsType {
+    Fat,
+    Ntfs,
+    Exfat,
+    Unknown,
+}
+
+/// Detect the filesystem type of a partition by reading its boot sector magic bytes.
+fn detect_partition_fs_type(file: &mut (impl Read + Seek), partition_offset: u64) -> PartitionFsType {
+    if file.seek(SeekFrom::Start(partition_offset)).is_err() {
+        return PartitionFsType::Unknown;
+    }
+    let mut buf = [0u8; 12];
+    if file.read_exact(&mut buf).is_err() {
+        return PartitionFsType::Unknown;
+    }
+    if &buf[3..11] == b"NTFS    " {
+        PartitionFsType::Ntfs
+    } else if &buf[3..11] == b"EXFAT   " {
+        PartitionFsType::Exfat
+    } else if buf[0] == 0xEB || buf[0] == 0xE9 {
+        PartitionFsType::Fat
+    } else {
+        PartitionFsType::Unknown
+    }
 }

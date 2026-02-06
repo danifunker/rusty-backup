@@ -255,10 +255,7 @@ pub struct SectorAlignedWriter {
 impl SectorAlignedWriter {
     pub fn new(file: File) -> Self {
         // For devices, metadata() typically fails so position defaults to 0.
-        let position = file
-            .metadata()
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let position = file.metadata().map(|m| m.len()).unwrap_or(0);
 
         Self {
             inner: file,
@@ -580,10 +577,11 @@ pub fn get_file_size(file: &File, path: &Path) -> Result<u64> {
             return windows::get_physical_drive_size(file);
         }
     }
-    
+
     // For regular files or non-Windows, use seek
     let mut file = file;
-    let size = file.seek(SeekFrom::End(0))
+    let size = file
+        .seek(SeekFrom::End(0))
         .context("failed to seek to end of file")?;
     file.seek(SeekFrom::Start(0))
         .context("failed to seek back to start")?;

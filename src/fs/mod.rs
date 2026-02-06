@@ -1,12 +1,21 @@
 pub mod entry;
+pub mod exfat;
 pub mod fat;
 pub mod filesystem;
+pub mod ntfs;
 
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, SeekFrom};
 
+pub use exfat::{
+    patch_exfat_hidden_sectors, resize_exfat_in_place, validate_exfat_integrity,
+    CompactExfatReader,
+};
 pub use fat::{
     patch_bpb_hidden_sectors, resize_fat_in_place, set_fat_clean_flags, validate_fat_integrity,
     CompactFatReader, CompactInfo,
+};
+pub use ntfs::{
+    patch_ntfs_hidden_sectors, resize_ntfs_in_place, validate_ntfs_integrity, CompactNtfsReader,
 };
 use filesystem::{Filesystem, FilesystemError};
 
@@ -17,31 +26,80 @@ pub struct CompactResult {
     pub clusters_used: u32,
 }
 
-/// Try to create a compacted reader for a FAT partition.
+/// Detect whether a type-0x07 partition is NTFS or exFAT by reading the OEM ID.
+/// Returns `"ntfs"`, `"exfat"`, or `"unknown"`.
+fn detect_0x07_type<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> &'static str {
+    if reader.seek(SeekFrom::Start(partition_offset)).is_err() {
+        return "unknown";
+    }
+    let mut oem = [0u8; 11];
+    if reader.read_exact(&mut oem).is_err() {
+        return "unknown";
+    }
+    if &oem[3..11] == b"NTFS    " {
+        "ntfs"
+    } else if &oem[3..11] == b"EXFAT   " {
+        "exfat"
+    } else {
+        "unknown"
+    }
+}
+
+/// Try to create a compacted reader for a partition.
 ///
-/// Returns `None` for unsupported filesystem types. On success, returns the
-/// `CompactFatReader` (which implements `Read`) and a `CompactResult` with
-/// sizing information.
+/// Returns `None` for unsupported filesystem types. On success, returns a
+/// boxed `Read` implementation and a `CompactResult` with sizing information.
 pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
-    reader: R,
+    mut reader: R,
     partition_offset: u64,
     partition_type: u8,
-) -> Option<(CompactFatReader<R>, CompactResult)> {
-    // Only FAT types are supported for compaction
+) -> Option<(Box<dyn Read + Send>, CompactResult)> {
     match partition_type {
-        0x01 | 0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C => {}
-        _ => return None,
+        // FAT types
+        0x01 | 0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C => {
+            let (reader, info) = CompactFatReader::new(reader, partition_offset).ok()?;
+            Some((
+                Box::new(reader),
+                CompactResult {
+                    original_size: info.original_size,
+                    compacted_size: info.compacted_size,
+                    clusters_used: info.clusters_used,
+                },
+            ))
+        }
+        // NTFS / exFAT
+        0x07 => {
+            let fs_type = detect_0x07_type(&mut reader, partition_offset);
+            match fs_type {
+                "ntfs" => {
+                    let (reader, info) =
+                        CompactNtfsReader::new(reader, partition_offset).ok()?;
+                    Some((
+                        Box::new(reader),
+                        CompactResult {
+                            original_size: info.original_size,
+                            compacted_size: info.compacted_size,
+                            clusters_used: info.clusters_used,
+                        },
+                    ))
+                }
+                "exfat" => {
+                    let (reader, info) =
+                        CompactExfatReader::new(reader, partition_offset).ok()?;
+                    Some((
+                        Box::new(reader),
+                        CompactResult {
+                            original_size: info.original_size,
+                            compacted_size: info.compacted_size,
+                            clusters_used: info.clusters_used,
+                        },
+                    ))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
     }
-
-    let (reader, info) = CompactFatReader::new(reader, partition_offset).ok()?;
-    Some((
-        reader,
-        CompactResult {
-            original_size: info.original_size,
-            compacted_size: info.compacted_size,
-            clusters_used: info.clusters_used,
-        },
-    ))
 }
 
 /// Calculate the effective data size for a partition — the number of bytes
@@ -63,7 +121,7 @@ pub fn effective_partition_size<R: Read + Seek + Send + 'static>(
 /// `reader` must be seekable and positioned at the partition start.
 /// `partition_type` is the MBR partition type byte.
 pub fn open_filesystem<R: Read + Seek + Send + 'static>(
-    reader: R,
+    mut reader: R,
     partition_offset: u64,
     partition_type: u8,
 ) -> Result<Box<dyn Filesystem>, FilesystemError> {
@@ -83,10 +141,23 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
             reader,
             partition_offset,
         )?)),
-        // NTFS/exFAT - try FAT first (exFAT uses same type byte)
-        0x07 => Err(FilesystemError::Unsupported(
-            "NTFS/exFAT browsing not yet supported".into(),
-        )),
+        // NTFS/exFAT — distinguish by superblock magic
+        0x07 => {
+            let fs_type = detect_0x07_type(&mut reader, partition_offset);
+            match fs_type {
+                "ntfs" => Ok(Box::new(ntfs::NtfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "exfat" => Ok(Box::new(exfat::ExfatFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                _ => Err(FilesystemError::Unsupported(
+                    "type 0x07 partition is neither NTFS nor exFAT".into(),
+                )),
+            }
+        }
         // Linux
         0x83 => Err(FilesystemError::Unsupported(
             "ext2/3/4 browsing not yet supported".into(),

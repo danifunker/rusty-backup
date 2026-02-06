@@ -7,7 +7,9 @@ Trait-based filesystem abstraction for browsing, compaction, resize, and validat
 - **`filesystem.rs`** — `Filesystem` trait and `FilesystemError` enum. The trait defines `root`, `list_directory`, `read_file`, `volume_label`, `fs_type`, `total_size`, `used_size`, and `last_data_byte`.
 - **`entry.rs`** — `FileEntry` and `EntryType` structs representing files and directories within a partition.
 - **`fat.rs`** — Complete FAT12/16/32 implementation: BPB parsing, directory browsing (with LFN and CP437 support), cluster chain traversal, `CompactFatReader` for smart backup compaction, and in-place resize/validation/BPB patching for restore.
-- **`mod.rs`** — Factory functions (`open_filesystem`, `compact_partition_reader`, `effective_partition_size`) that route by MBR partition type byte, plus re-exports.
+- **`ntfs.rs`** — NTFS implementation: VBR parsing, MFT record parsing with fixup array handling, data run decoding, version detection (1.0–3.1), directory browsing via B+ tree index entries, `CompactNtfsReader` for bitmap-based compaction, and VBR patching resize.
+- **`exfat.rs`** — exFAT implementation: VBR parsing, directory entry set parsing (File + Stream Extension + File Name entries), allocation bitmap reading, `CompactExfatReader` for compaction, and full resize with bitmap/FAT/VBR/checksum updates.
+- **`mod.rs`** — Factory functions (`open_filesystem`, `compact_partition_reader`, `effective_partition_size`) that route by MBR partition type byte, plus re-exports. Type byte `0x07` is disambiguated by reading the OEM ID magic (`"NTFS    "` vs `"EXFAT   "`).
 
 ## Supported Partition Types
 
@@ -16,7 +18,8 @@ Trait-based filesystem abstraction for browsing, compaction, resize, and validat
 | `0x01`                               | FAT12     | Yes      | Yes        | Yes    |
 | `0x04`, `0x06`, `0x0E`, `0x14`, `0x16`, `0x1E` | FAT16 | Yes | Yes | Yes |
 | `0x0B`, `0x0C`, `0x1B`, `0x1C`      | FAT32     | Yes      | Yes        | Yes    |
-| `0x07`                               | NTFS/exFAT | No (planned) | No | No |
+| `0x07`                               | NTFS      | Yes      | Yes        | Yes (VBR patch) |
+| `0x07`                               | exFAT     | Yes      | Yes        | Yes (full bitmap resize) |
 | `0x83`                               | ext2/3/4  | No (planned) | No | No |
 
 ## How to Add a New Filesystem

@@ -201,11 +201,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
     }
 
     // Get source size
-    log(
-        &progress,
-        LogLevel::Info,
-        "Getting source device size...",
-    );
+    log(&progress, LogLevel::Info, "Getting source device size...");
     let source_size = crate::os::get_file_size(source.get_ref(), &config.source_path)
         .context("failed to get source size")?;
     log(
@@ -257,7 +253,10 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
     log(
         &progress,
         LogLevel::Info,
-        format!("Analyzing {} partitions for smart sizing...", partitions.len()),
+        format!(
+            "Analyzing {} partitions for smart sizing...",
+            partitions.len()
+        ),
     );
     let split_bytes = config.split_size_mib.map(|mib| mib as u64 * 1024 * 1024);
     let mut partition_metadata = Vec::new();
@@ -273,7 +272,10 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         log(
             &progress,
             LogLevel::Info,
-            format!("Analyzing partition-{}: {} at LBA {}", part.index, part.type_name, part.start_lba),
+            format!(
+                "Analyzing partition-{}: {} at LBA {}",
+                part.index, part.type_name, part.start_lba
+            ),
         );
         if config.sector_by_sector || part.is_extended_container {
             effective_sizes.push(part.size_bytes);
@@ -293,7 +295,10 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             log(
                 &progress,
                 LogLevel::Warning,
-                format!("Failed to clone file handle for partition-{}: {}", part.index, e),
+                format!(
+                    "Failed to clone file handle for partition-{}: {}",
+                    part.index, e
+                ),
             );
         }
         let compact_result = clone_result
@@ -407,7 +412,10 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         log(
             &progress,
             LogLevel::Info,
-            format!("Processing partition index {} (partition-{})", part_idx, part.index),
+            format!(
+                "Processing partition index {} (partition-{})",
+                part_idx, part.index
+            ),
         );
 
         if part.is_extended_container {
@@ -482,15 +490,18 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         log(
             &progress,
             LogLevel::Info,
-            format!("Starting compression for {}, is_compacted={}", part_label, is_compacted),
+            format!(
+                "Starting compression for {}, is_compacted={}",
+                part_label, is_compacted
+            ),
         );
 
         let compressed_files = if is_compacted {
-            // Use compacted reader — create a fresh CompactFatReader
+            // Use compacted reader — create a fresh compact reader for this filesystem
             log(
                 &progress,
                 LogLevel::Info,
-                format!("Creating CompactFatReader for {}", part_label),
+                format!("Creating compact reader for {}", part_label),
             );
             let part_offset = part.start_lba * 512;
             let clone = source
@@ -498,8 +509,8 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 .try_clone()
                 .context("failed to clone source for compaction")?;
             let (mut compact_reader, _) =
-                fs::CompactFatReader::new(BufReader::new(clone), part_offset)
-                    .map_err(|e| anyhow::anyhow!("compaction failed: {e}"))?;
+                fs::compact_partition_reader(BufReader::new(clone), part_offset, part.partition_type_byte)
+                    .ok_or_else(|| anyhow::anyhow!("compaction failed for {part_label}"))?;
 
             log(
                 &progress,

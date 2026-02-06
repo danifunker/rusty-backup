@@ -13,8 +13,7 @@ use windows::Win32::Security::{
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, GetDiskFreeSpaceExW, GetLogicalDriveStringsW, GetVolumeInformationW,
-    FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, OPEN_EXISTING,
+    FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::UI::Shell::{ShellExecuteW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
@@ -74,7 +73,10 @@ impl VolumeLockSet {
 /// while we write to the physical drive.
 fn lock_and_dismount_volumes(drive_num: u32) -> Result<VolumeLockSet> {
     let volumes = enumerate_volumes();
-    let target_volumes: Vec<_> = volumes.iter().filter(|v| v.disk_number == drive_num).collect();
+    let target_volumes: Vec<_> = volumes
+        .iter()
+        .filter(|v| v.disk_number == drive_num)
+        .collect();
 
     if target_volumes.is_empty() {
         log::info!("No mounted volumes found on PhysicalDrive{}", drive_num);
@@ -96,9 +98,8 @@ fn lock_and_dismount_volumes(drive_num: u32) -> Result<VolumeLockSet> {
         };
 
         // Lock the volume for exclusive access
-        let lock_result = unsafe {
-            DeviceIoControl(handle.0, FSCTL_LOCK_VOLUME, None, 0, None, 0, None, None)
-        };
+        let lock_result =
+            unsafe { DeviceIoControl(handle.0, FSCTL_LOCK_VOLUME, None, 0, None, 0, None, None) };
         match lock_result {
             Ok(_) => log::info!("Volume {} locked successfully", volume_path),
             Err(e) => log::warn!(
@@ -309,7 +310,7 @@ fn query_disk_size(handle: HANDLE) -> Option<u64> {
 /// For physical drives on Windows, seeking doesn't work, so we use DeviceIoControl instead.
 pub fn get_physical_drive_size(file: &File) -> Result<u64> {
     use std::os::windows::io::AsRawHandle;
-    
+
     let handle = HANDLE(file.as_raw_handle() as *mut std::ffi::c_void);
     query_disk_size(handle)
         .context("failed to query disk size via IOCTL_DISK_GET_DRIVE_GEOMETRY_EX")

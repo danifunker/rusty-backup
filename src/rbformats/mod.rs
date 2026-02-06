@@ -13,6 +13,8 @@ use anyhow::{bail, Context, Result};
 use crate::backup::metadata::BackupMetadata;
 use crate::backup::CompressionType;
 use crate::fs::fat::patch_bpb_hidden_sectors;
+use crate::fs::ntfs::patch_ntfs_hidden_sectors;
+use crate::fs::exfat::patch_exfat_hidden_sectors;
 use crate::partition::mbr::patch_mbr_entries;
 use crate::partition::PartitionSizeOverride;
 
@@ -151,7 +153,8 @@ pub fn decompress_to_writer(
                 if n == 0 {
                     break;
                 }
-                writer.write_all(&buf[..n])
+                writer
+                    .write_all(&buf[..n])
                     .with_context(|| format!("write_all failed at offset {}", total_written))?;
                 total_written += n as u64;
                 progress_cb(total_written);
@@ -295,8 +298,10 @@ pub fn reconstruct_disk_from_backup(
         let part_offset = effective_lba * 512;
         let export_size = get_export_size(pm.index, pm.original_size_bytes);
 
-        log_cb(&format!("Partition {}: LBA {}, offset {}, size {} bytes",
-            pm.index, effective_lba, part_offset, export_size));
+        log_cb(&format!(
+            "Partition {}: LBA {}, offset {}, size {} bytes",
+            pm.index, effective_lba, part_offset, export_size
+        ));
 
         // Fill or seek over gap between current position and partition start
         if total_written < part_offset {
@@ -353,8 +358,12 @@ pub fn reconstruct_disk_from_backup(
             continue;
         }
 
-        log_cb(&format!("partition-{}: decompressing {} to writer (target size: {} bytes)...",
-            pm.index, data_path.display(), export_size));
+        log_cb(&format!(
+            "partition-{}: decompressing {} to writer (target size: {} bytes)...",
+            pm.index,
+            data_path.display(),
+            export_size
+        ));
 
         let bytes_written = decompress_to_writer(
             &data_path,
@@ -366,8 +375,11 @@ pub fn reconstruct_disk_from_backup(
             log_cb,
         )
         .with_context(|| format!("failed to decompress partition {}", pm.index))?;
-        
-        log_cb(&format!("partition-{}: decompressed {} bytes", pm.index, bytes_written));
+
+        log_cb(&format!(
+            "partition-{}: decompressed {} bytes",
+            pm.index, bytes_written
+        ));
         total_written += bytes_written;
 
         // Handle unused space at end of partition
@@ -397,10 +409,13 @@ pub fn reconstruct_disk_from_backup(
             }
         }
 
-        // Update BPB hidden sectors to match partition start LBA
+        // Update hidden sectors / partition offset to match the new start LBA
         {
             writer.flush()?;
+            // Try FAT first (most common), then NTFS, then exFAT
             patch_bpb_hidden_sectors(writer, part_offset, effective_lba, log_cb)?;
+            patch_ntfs_hidden_sectors(writer, part_offset, effective_lba, log_cb)?;
+            patch_exfat_hidden_sectors(writer, part_offset, effective_lba, log_cb)?;
         }
 
         log_cb(&format!(
