@@ -5739,6 +5739,8 @@ dependencies = [
 [[package]]
 name = "zeekstd"
 version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5f1379c45a7b52ed4aa3442da2cf5cc39abf1d8d178a5c02797be29c072ede2"
 dependencies = [
  "zstd-safe",
 ]
