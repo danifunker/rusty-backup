@@ -151,7 +151,8 @@ pub fn decompress_to_writer(
                 if n == 0 {
                     break;
                 }
-                writer.write_all(&buf[..n])?;
+                writer.write_all(&buf[..n])
+                    .with_context(|| format!("write_all failed at offset {}", total_written))?;
                 total_written += n as u64;
                 progress_cb(total_written);
             }
@@ -280,6 +281,7 @@ pub fn reconstruct_disk_from_backup(
         patch_mbr_entries(&mut mbr_buf, partition_sizes);
         log_cb("Patched MBR partition table with export sizes");
     }
+    log_cb("Writing MBR to disk...");
     writer.write_all(&mbr_buf).context("failed to write MBR")?;
     total_written += 512;
 
@@ -293,20 +295,31 @@ pub fn reconstruct_disk_from_backup(
         let part_offset = effective_lba * 512;
         let export_size = get_export_size(pm.index, pm.original_size_bytes);
 
+        log_cb(&format!("Partition {}: LBA {}, offset {}, size {} bytes",
+            pm.index, effective_lba, part_offset, export_size));
+
         // Fill or seek over gap between current position and partition start
         if total_written < part_offset {
             let gap = part_offset - total_written;
-            if is_device && fill_unused_with_zeros {
-                // Write zeros to gap (needed for some devices/filesystems)
+            // On Windows physical drives, we must write zeros to gaps (seeking
+            // alone doesn't advance the physical write position reliably).
+            #[cfg(target_os = "windows")]
+            let force_write_zeros = is_device;
+            #[cfg(not(target_os = "windows"))]
+            let force_write_zeros = false;
+
+            if force_write_zeros || (is_device && fill_unused_with_zeros) {
+                log_cb(&format!("Writing {} bytes of zeros to gap...", gap));
                 write_zeros(writer, gap)?;
+                writer.flush().context("failed to flush after zeros")?;
                 total_written += gap;
             } else if is_device {
-                // Device without zero-fill: seek forward
-                // This may fail on some raw devices, but worth trying
+                // Unix device without zero-fill: try to seek
                 match writer.seek(SeekFrom::Current(gap as i64)) {
-                    Ok(_) => total_written += gap,
+                    Ok(_) => {
+                        total_written += gap;
+                    }
                     Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
-                        // Seek not supported, write zeros as fallback
                         log_cb("Warning: device doesn't support seek, writing zeros to gap");
                         write_zeros(writer, gap)?;
                         total_written += gap;
@@ -340,6 +353,9 @@ pub fn reconstruct_disk_from_backup(
             continue;
         }
 
+        log_cb(&format!("partition-{}: decompressing {} to writer (target size: {} bytes)...",
+            pm.index, data_path.display(), export_size));
+
         let bytes_written = decompress_to_writer(
             &data_path,
             &metadata.compression_type,
@@ -348,7 +364,10 @@ pub fn reconstruct_disk_from_backup(
             progress_cb,
             cancel_check,
             log_cb,
-        )?;
+        )
+        .with_context(|| format!("failed to decompress partition {}", pm.index))?;
+        
+        log_cb(&format!("partition-{}: decompressed {} bytes", pm.index, bytes_written));
         total_written += bytes_written;
 
         // Handle unused space at end of partition

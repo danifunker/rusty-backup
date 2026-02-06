@@ -339,7 +339,7 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
 
     // Step 6: Open target
     set_operation(&progress, "Opening target...");
-    let target_file = if config.target_is_device {
+    let device_handle = if config.target_is_device {
         log(
             &progress,
             LogLevel::Info,
@@ -356,14 +356,20 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
             LogLevel::Info,
             format!("Creating image file {}...", config.target_path.display()),
         );
-        File::create(&config.target_path)
-            .with_context(|| format!("failed to create {}", config.target_path.display()))?
+        let file = File::create(&config.target_path)
+            .with_context(|| format!("failed to create {}", config.target_path.display()))?;
+        crate::os::DeviceWriteHandle::from_file(file)
     };
+
+    // Extract the file for I/O. On Windows, device_handle's remaining fields
+    // hold volume locks that keep volumes dismounted until this function returns.
+    let target_file = device_handle.file;
 
     // Wrap in SectorAlignedWriter so that raw device writes (/dev/rdiskN on
     // macOS) are always multiples of 512 bytes.  For regular image files the
     // buffering is harmless and adds negligible overhead.
     let mut target = SectorAlignedWriter::new(target_file);
+    log(&progress, LogLevel::Info, "SectorAlignedWriter created successfully");
 
     if is_cancelled(&progress) {
         bail!("restore cancelled");

@@ -81,16 +81,19 @@ mod aligned_buffer {
         }
 
         /// Get a mutable slice of the valid data.
+        #[allow(dead_code)]
         pub fn as_mut_slice(&mut self) -> &mut [u8] {
             unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
         }
 
         /// Get a slice of the entire buffer capacity.
+        #[allow(dead_code)]
         pub fn as_full_slice(&self) -> &[u8] {
             unsafe { std::slice::from_raw_parts(self.ptr, self.capacity()) }
         }
 
         /// Get a mutable slice of the entire buffer capacity.
+        #[allow(dead_code)]
         pub fn as_full_mut_slice(&mut self) -> &mut [u8] {
             unsafe { std::slice::from_raw_parts_mut(self.ptr, self.capacity()) }
         }
@@ -251,8 +254,11 @@ pub struct SectorAlignedWriter {
 #[cfg(target_os = "windows")]
 impl SectorAlignedWriter {
     pub fn new(file: File) -> Self {
-        // Get current file position
-        let position = file.metadata().and_then(|m| Ok(m.len())).unwrap_or(0);
+        // For devices, metadata() typically fails so position defaults to 0.
+        let position = file
+            .metadata()
+            .map(|m| m.len())
+            .unwrap_or(0);
 
         Self {
             inner: file,
@@ -294,15 +300,19 @@ impl SectorAlignedWriter {
         }
 
         // Ensure we're at a sector-aligned position
-        let current_pos = self.inner.stream_position()?;
-        if current_pos % SECTOR_SIZE as u64 != 0 {
+        // Use our tracked position instead of stream_position() which fails with FILE_FLAG_NO_BUFFERING
+        if self.position % SECTOR_SIZE as u64 != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("file position {} is not sector-aligned", current_pos),
+                format!("file position {} is not sector-aligned", self.position),
             ));
         }
 
+        // Seek to exact position before every write to keep file pointer in sync
+        use std::io::Seek;
+        self.inner.seek(std::io::SeekFrom::Start(self.position))?;
         self.inner.write_all(self.buf.as_slice())?;
+
         self.position += self.buf.len() as u64;
         self.buf.clear();
         Ok(())
@@ -321,13 +331,42 @@ impl SectorAlignedWriter {
 #[cfg(target_os = "windows")]
 impl Write for SectorAlignedWriter {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        self.buf
-            .extend_from_slice(data)
-            .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "buffer full"))?;
-
-        if self.buf.len() >= WRITE_BUF_CAPACITY {
+        // If data won't fit, flush sectors first
+        if self.buf.len() + data.len() > WRITE_BUF_CAPACITY {
             self.flush_sectors()?;
         }
+
+        // If data is still too large for the buffer, write it directly
+        if data.len() > WRITE_BUF_CAPACITY {
+            self.flush_padded()?;
+
+            // Write large data directly, padding to sector boundary if needed
+            let aligned_len = (data.len() / SECTOR_SIZE) * SECTOR_SIZE;
+            if aligned_len > 0 {
+                use std::io::Seek;
+                self.inner.seek(std::io::SeekFrom::Start(self.position))?;
+                self.inner.write_all(&data[..aligned_len])?;
+                self.position += aligned_len as u64;
+            }
+
+            // Buffer any remaining partial sector
+            let remainder = &data[aligned_len..];
+            if !remainder.is_empty() {
+                self.buf
+                    .extend_from_slice(remainder)
+                    .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "buffer full"))?;
+            }
+        } else {
+            // Normal path: buffer the data
+            self.buf
+                .extend_from_slice(data)
+                .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "buffer full"))?;
+
+            if self.buf.len() >= WRITE_BUF_CAPACITY {
+                self.flush_sectors()?;
+            }
+        }
+
         Ok(data.len())
     }
 
@@ -362,20 +401,11 @@ impl Seek for SectorAlignedWriter {
             SeekFrom::Current(offset) => (self.position as i64 + offset) as u64,
         };
 
-        // Align down to sector boundary for FILE_FLAG_NO_BUFFERING
+        // Align down to sector boundary
         let aligned_target = (target / SECTOR_SIZE as u64) * SECTOR_SIZE as u64;
 
-        // Perform the aligned seek
         let new_pos = self.inner.seek(SeekFrom::Start(aligned_target))?;
         self.position = new_pos;
-
-        // If the requested position wasn't aligned, we need to handle the offset
-        // by reading and discarding bytes, or by tracking the offset for the next write
-        if target != aligned_target {
-            // For now, we just track that we're at the aligned position
-            // The caller may need to handle partial sector operations
-            // This is a limitation of FILE_FLAG_NO_BUFFERING
-        }
 
         Ok(new_pos)
     }
@@ -438,26 +468,32 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
 /// On Linux, unmounts partitions via `umount2(MNT_DETACH)`.
 /// On Windows, locks and dismounts volumes via `DeviceIoControl`.
 /// On macOS, uses DiskArbitration to unmount.
-pub fn open_target_for_writing(path: &Path) -> Result<File> {
+pub fn open_target_for_writing(path: &Path) -> Result<DeviceWriteHandle> {
     let path_str = path.to_string_lossy();
     let is_device = path_str.starts_with("/dev/") || path_str.starts_with("\\\\.\\");
 
     if !is_device {
         // Regular file — just create/truncate
-        return File::create(path).with_context(|| format!("failed to create {}", path.display()));
+        let file =
+            File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+        return Ok(DeviceWriteHandle::from_file(file));
     }
 
     #[cfg(target_os = "macos")]
     {
-        macos::open_target_for_writing(path)
+        macos::open_target_for_writing(path).map(DeviceWriteHandle::from_file)
     }
     #[cfg(target_os = "linux")]
     {
-        linux::open_target_for_writing(path)
+        linux::open_target_for_writing(path).map(DeviceWriteHandle::from_file)
     }
     #[cfg(target_os = "windows")]
     {
-        windows::open_target_for_writing(path)
+        let (file, locks) = windows::open_target_for_writing(path)?;
+        Ok(DeviceWriteHandle {
+            file,
+            _volume_locks: locks,
+        })
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
@@ -503,6 +539,54 @@ impl Drop for TempFileGuard {
             let _ = fs::remove_file(path);
         }
     }
+}
+
+/// Handle to a device opened for writing with platform-specific locks.
+///
+/// On Windows, this holds volume lock handles that keep volumes on the target
+/// drive locked and dismounted for the duration of the write. On other
+/// platforms, this is a thin wrapper around `File`.
+///
+/// When this struct is dropped, all locks are released.
+pub struct DeviceWriteHandle {
+    /// The file handle for writing to the device.
+    pub file: File,
+    /// On Windows: locked volume handles kept alive to prevent re-mounting.
+    #[cfg(target_os = "windows")]
+    _volume_locks: windows::VolumeLockSet,
+}
+
+impl DeviceWriteHandle {
+    /// Create a handle from a plain file (no platform locks).
+    pub fn from_file(file: File) -> Self {
+        Self {
+            file,
+            #[cfg(target_os = "windows")]
+            _volume_locks: windows::VolumeLockSet::empty(),
+        }
+    }
+}
+
+/// Get the size of a file or device.
+///
+/// For regular files, uses standard seek to get size.
+/// For Windows physical drives, uses IOCTL because seeking doesn't work.
+pub fn get_file_size(file: &File, path: &Path) -> Result<u64> {
+    #[cfg(target_os = "windows")]
+    {
+        let path_str = path.to_string_lossy();
+        if path_str.starts_with(r"\\.\PhysicalDrive") {
+            return windows::get_physical_drive_size(file);
+        }
+    }
+    
+    // For regular files or non-Windows, use seek
+    let mut file = file;
+    let size = file.seek(SeekFrom::End(0))
+        .context("failed to seek to end of file")?;
+    file.seek(SeekFrom::Start(0))
+        .context("failed to seek back to start")?;
+    Ok(size)
 }
 
 /// Check if the current process is running with elevated (administrator) privileges.

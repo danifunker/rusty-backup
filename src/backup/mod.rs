@@ -201,8 +201,18 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
     }
 
     // Get source size
-    let source_size = source.seek(SeekFrom::End(0))?;
-    source.seek(SeekFrom::Start(0))?;
+    log(
+        &progress,
+        LogLevel::Info,
+        "Getting source device size...",
+    );
+    let source_size = crate::os::get_file_size(source.get_ref(), &config.source_path)
+        .context("failed to get source size")?;
+    log(
+        &progress,
+        LogLevel::Info,
+        format!("Source size: {} bytes", source_size),
+    );
 
     // Step 2: Create backup folder
     set_operation(&progress, "Creating backup folder...");
@@ -244,6 +254,11 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
     // (FAT only — packs allocated clusters contiguously for a smaller, defragmented
     // image). If compaction isn't possible, fall back to trim-based sizing that
     // skips unused space beyond the last allocated cluster.
+    log(
+        &progress,
+        LogLevel::Info,
+        format!("Analyzing {} partitions for smart sizing...", partitions.len()),
+    );
     let split_bytes = config.split_size_mib.map(|mib| mib as u64 * 1024 * 1024);
     let mut partition_metadata = Vec::new();
     let mut overall_bytes_done: u64 = 0;
@@ -255,6 +270,11 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
     let mut compact_sizes: Vec<Option<u64>> = Vec::with_capacity(partitions.len());
 
     for part in partitions.iter() {
+        log(
+            &progress,
+            LogLevel::Info,
+            format!("Analyzing partition-{}: {} at LBA {}", part.index, part.type_name, part.start_lba),
+        );
         if config.sector_by_sector || part.is_extended_container {
             effective_sizes.push(part.size_bytes);
             compact_sizes.push(None);
@@ -262,10 +282,21 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         }
 
         // Try compaction first
+        log(
+            &progress,
+            LogLevel::Info,
+            format!("Attempting compaction for partition-{}...", part.index),
+        );
         let part_offset = part.start_lba * 512;
-        let compact_result = source
-            .get_ref()
-            .try_clone()
+        let clone_result = source.get_ref().try_clone();
+        if let Err(ref e) = clone_result {
+            log(
+                &progress,
+                LogLevel::Warning,
+                format!("Failed to clone file handle for partition-{}: {}", part.index, e),
+            );
+        }
+        let compact_result = clone_result
             .ok()
             .and_then(|clone| {
                 fs::compact_partition_reader(
@@ -373,6 +404,12 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             bail!("backup cancelled");
         }
 
+        log(
+            &progress,
+            LogLevel::Info,
+            format!("Processing partition index {} (partition-{})", part_idx, part.index),
+        );
+
         if part.is_extended_container {
             log(
                 &progress,
@@ -442,8 +479,19 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         let progress_clone = Arc::clone(&progress);
         let base_bytes = overall_bytes_done;
 
+        log(
+            &progress,
+            LogLevel::Info,
+            format!("Starting compression for {}, is_compacted={}", part_label, is_compacted),
+        );
+
         let compressed_files = if is_compacted {
             // Use compacted reader — create a fresh CompactFatReader
+            log(
+                &progress,
+                LogLevel::Info,
+                format!("Creating CompactFatReader for {}", part_label),
+            );
             let part_offset = part.start_lba * 512;
             let clone = source
                 .get_ref()
@@ -453,6 +501,11 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 fs::CompactFatReader::new(BufReader::new(clone), part_offset)
                     .map_err(|e| anyhow::anyhow!("compaction failed: {e}"))?;
 
+            log(
+                &progress,
+                LogLevel::Info,
+                format!("Calling compress_partition for compacted {}", part_label),
+            );
             let progress_log = Arc::clone(&progress);
             crate::rbformats::compress_partition(
                 &mut compact_reader,
@@ -473,11 +526,31 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             .with_context(|| format!("failed to compress {part_label}"))?
         } else {
             // Fall back to trim-based read
+            log(
+                &progress,
+                LogLevel::Info,
+                format!("Using trim-based read for {}", part_label),
+            );
             let part_offset = part.start_lba * 512;
+            log(
+                &progress,
+                LogLevel::Info,
+                format!("Seeking to offset {} for {}", part_offset, part_label),
+            );
             source.seek(SeekFrom::Start(part_offset))?;
+            log(
+                &progress,
+                LogLevel::Info,
+                format!("Creating limited reader, image_size={}", image_size),
+            );
             let part_reader = (&mut source).take(image_size);
             let mut limited = LimitedReader::new(part_reader);
 
+            log(
+                &progress,
+                LogLevel::Info,
+                format!("Calling compress_partition for trim-based {}", part_label),
+            );
             let progress_log = Arc::clone(&progress);
             crate::rbformats::compress_partition(
                 &mut limited,

@@ -812,10 +812,9 @@ impl BackupTab {
         self.backup_running = true;
 
         log.info(format!(
-            "Starting backup: {} -> {}/{}",
+            "Starting backup: {} -> {}",
             config.source_path.display(),
-            config.destination_dir.display(),
-            config.backup_name
+            config.destination_dir.join(&config.backup_name).display()
         ));
 
         std::thread::spawn(move || {

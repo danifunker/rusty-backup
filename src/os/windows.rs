@@ -13,8 +13,8 @@ use windows::Win32::Security::{
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, GetDiskFreeSpaceExW, GetLogicalDriveStringsW, GetVolumeInformationW,
-    FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_NO_BUFFERING, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    OPEN_EXISTING,
+    FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::UI::Shell::{ShellExecuteW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
@@ -45,6 +45,100 @@ impl Drop for SafeHandle {
             }
         }
     }
+}
+
+/// RAII guard holding locked and dismounted volume handles.
+///
+/// Volumes remain locked and dismounted until this is dropped. When dropped,
+/// the volume handles are closed via `CloseHandle`, releasing the locks and
+/// allowing Windows to re-mount the volumes.
+pub(crate) struct VolumeLockSet {
+    _handles: Vec<SafeHandle>,
+}
+
+// Safety: HANDLE is an OS-level integer handle, safe to send between threads.
+unsafe impl Send for VolumeLockSet {}
+
+impl VolumeLockSet {
+    pub fn empty() -> Self {
+        Self {
+            _handles: Vec::new(),
+        }
+    }
+}
+
+/// Lock and dismount all volumes residing on the given physical drive.
+///
+/// Opens each volume with `FSCTL_LOCK_VOLUME` + `FSCTL_DISMOUNT_VOLUME`,
+/// keeping the handles open so Windows cannot re-mount the filesystems
+/// while we write to the physical drive.
+fn lock_and_dismount_volumes(drive_num: u32) -> Result<VolumeLockSet> {
+    let volumes = enumerate_volumes();
+    let target_volumes: Vec<_> = volumes.iter().filter(|v| v.disk_number == drive_num).collect();
+
+    if target_volumes.is_empty() {
+        log::info!("No mounted volumes found on PhysicalDrive{}", drive_num);
+        return Ok(VolumeLockSet::empty());
+    }
+
+    let mut locked = Vec::new();
+
+    for vol in &target_volumes {
+        let volume_path = format!(r"\\.\{}:", vol.drive_letter);
+        log::info!("Locking and dismounting volume {}...", volume_path);
+
+        let handle = match open_device(&volume_path, GENERIC_READ_ACCESS | GENERIC_WRITE_ACCESS) {
+            Some(h) => h,
+            None => {
+                log::warn!("Could not open volume {}, skipping", volume_path);
+                continue;
+            }
+        };
+
+        // Lock the volume for exclusive access
+        let lock_result = unsafe {
+            DeviceIoControl(handle.0, FSCTL_LOCK_VOLUME, None, 0, None, 0, None, None)
+        };
+        match lock_result {
+            Ok(_) => log::info!("Volume {} locked successfully", volume_path),
+            Err(e) => log::warn!(
+                "FSCTL_LOCK_VOLUME failed for {}: {} (continuing anyway)",
+                volume_path,
+                e
+            ),
+        }
+
+        // Dismount the volume's filesystem
+        let dismount_result = unsafe {
+            DeviceIoControl(
+                handle.0,
+                FSCTL_DISMOUNT_VOLUME,
+                None,
+                0,
+                None,
+                0,
+                None,
+                None,
+            )
+        };
+        match dismount_result {
+            Ok(_) => log::info!("Volume {} dismounted successfully", volume_path),
+            Err(e) => log::warn!(
+                "FSCTL_DISMOUNT_VOLUME failed for {}: {} (continuing anyway)",
+                volume_path,
+                e
+            ),
+        }
+
+        locked.push(handle);
+    }
+
+    log::info!(
+        "Locked and dismounted {} volume(s) on PhysicalDrive{}",
+        locked.len(),
+        drive_num
+    );
+    Ok(VolumeLockSet { _handles: locked })
 }
 
 /// Convert a string to null-terminated UTF-16.
@@ -98,7 +192,7 @@ pub fn request_elevation() -> Result<()> {
     };
 
     unsafe {
-        if ShellExecuteExW(&mut exec_info).is_ok() {
+        if shell_execute_ex_w(&mut exec_info).is_ok() {
             // Successfully launched elevated instance; exit this one
             std::process::exit(0);
         } else {
@@ -109,7 +203,7 @@ pub fn request_elevation() -> Result<()> {
 
 /// ShellExecuteExW is actually ShellExecuteW in the windows crate.
 /// This wrapper provides the correct signature.
-unsafe fn ShellExecuteExW(info: *mut SHELLEXECUTEINFOW) -> windows::core::Result<()> {
+unsafe fn shell_execute_ex_w(info: *mut SHELLEXECUTEINFOW) -> windows::core::Result<()> {
     let result = ShellExecuteW(
         Some((*info).hwnd),
         PCWSTR((*info).lpVerb.0),
@@ -209,6 +303,16 @@ fn query_disk_size(handle: HANDLE) -> Option<u64> {
     // DiskSize is at offset 24 in DISK_GEOMETRY_EX (after the 24-byte DISK_GEOMETRY)
     let disk_size = i64::from_ne_bytes(buf[24..32].try_into().ok()?);
     Some(disk_size as u64)
+}
+
+/// Get the size of a physical drive using Windows IOCTL.
+/// For physical drives on Windows, seeking doesn't work, so we use DeviceIoControl instead.
+pub fn get_physical_drive_size(file: &File) -> Result<u64> {
+    use std::os::windows::io::AsRawHandle;
+    
+    let handle = HANDLE(file.as_raw_handle() as *mut std::ffi::c_void);
+    query_disk_size(handle)
+        .context("failed to query disk size via IOCTL_DISK_GET_DRIVE_GEOMETRY_EX")
 }
 
 /// Query storage device properties via IOCTL_STORAGE_QUERY_PROPERTY.
@@ -454,7 +558,7 @@ pub fn enumerate_devices() -> Vec<DiskDevice> {
 ///
 /// If access is denied and running in debug mode without elevation,
 /// automatically requests elevation via UAC.
-pub fn open_target_for_writing(path: &Path) -> Result<File> {
+pub(crate) fn open_target_for_writing(path: &Path) -> Result<(File, VolumeLockSet)> {
     let path_str = path.to_string_lossy();
     let drive_num = drive_number_from_path(&path_str).context("invalid physical drive path")?;
 
@@ -472,41 +576,12 @@ pub fn open_target_for_writing(path: &Path) -> Result<File> {
         }
     }
 
-    // Lock and dismount all volumes on this drive
-    let volumes = enumerate_volumes();
-    for vol in &volumes {
-        if vol.disk_number != drive_num {
-            continue;
-        }
-        let vol_path = format!(r"\\.\{}:", vol.drive_letter);
-        if let Some(vol_handle) = open_device(&vol_path, GENERIC_READ_ACCESS | GENERIC_WRITE_ACCESS)
-        {
-            unsafe {
-                let _ = DeviceIoControl(
-                    vol_handle.0,
-                    FSCTL_LOCK_VOLUME,
-                    None,
-                    0,
-                    None,
-                    0,
-                    None,
-                    None,
-                );
-                let _ = DeviceIoControl(
-                    vol_handle.0,
-                    FSCTL_DISMOUNT_VOLUME,
-                    None,
-                    0,
-                    None,
-                    0,
-                    None,
-                    None,
-                );
-            }
-        }
-    }
+    // Lock and dismount all volumes on the target drive BEFORE opening.
+    // This is required on Windows: the OS denies write access to sectors
+    // belonging to a mounted volume. Without this, MBR/gap writes succeed
+    // but partition data writes fail with "Access is denied" (OS error 5).
+    let volume_locks = lock_and_dismount_volumes(drive_num)?;
 
-    // Open the physical drive for read+write
     let wide = to_wide(&path_str);
     let handle = unsafe {
         CreateFileW(
@@ -522,16 +597,17 @@ pub fn open_target_for_writing(path: &Path) -> Result<File> {
     .with_context(|| format!("cannot open {} for writing", path.display()))?;
 
     // Convert HANDLE to File (takes ownership — do NOT also wrap in SafeHandle)
-    Ok(unsafe { File::from_raw_handle(handle.0 as *mut c_void) })
+    let file = unsafe { File::from_raw_handle(handle.0 as *mut c_void) };
+    Ok((file, volume_locks))
 }
 
 /// Open a source device for reading (backup operation).
 ///
-/// For physical drives, uses FILE_FLAG_NO_BUFFERING which is required for
-/// reliable raw disk I/O on Windows. Without this flag, reads from physical
-/// drives can fail with "Incorrect function" (error 1).
+/// For physical drives, opens with standard flags (no FILE_FLAG_NO_BUFFERING).
+/// Unbuffered I/O requires aligned buffers which complicates read operations.
+/// For backup (read-only), standard buffered I/O provides adequate performance.
 ///
-/// For regular files (image files), opens normally without buffering flags.
+/// For regular files (image files), opens normally.
 pub fn open_source_for_reading(path: &Path) -> Result<crate::os::ElevatedSource> {
     let path_str = path.to_string_lossy();
     let is_physical_drive = path_str.starts_with(r"\\.\PhysicalDrive");
@@ -545,7 +621,7 @@ pub fn open_source_for_reading(path: &Path) -> Result<crate::os::ElevatedSource>
         });
     }
 
-    // Physical drive - use FILE_FLAG_NO_BUFFERING for raw disk access
+    // Physical drive - open with standard flags (no NO_BUFFERING to avoid alignment issues on reads)
     #[cfg(debug_assertions)]
     {
         if !is_elevated() {
@@ -566,7 +642,7 @@ pub fn open_source_for_reading(path: &Path) -> Result<crate::os::ElevatedSource>
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
             OPEN_EXISTING,
-            FILE_FLAG_NO_BUFFERING,
+            FILE_FLAGS_AND_ATTRIBUTES(0), // Standard flags - no NO_BUFFERING
             None,
         )
     }

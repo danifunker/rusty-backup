@@ -2372,6 +2372,7 @@ fn shift_region_forward(
 }
 
 /// Count the number of free (zero-value) cluster entries in the FAT.
+#[allow(dead_code)]
 fn compute_free_clusters(
     file: &mut (impl Read + Seek),
     partition_offset: u64,
