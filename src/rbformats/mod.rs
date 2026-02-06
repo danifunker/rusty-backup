@@ -12,9 +12,9 @@ use anyhow::{bail, Context, Result};
 
 use crate::backup::metadata::BackupMetadata;
 use crate::backup::CompressionType;
+use crate::fs::exfat::patch_exfat_hidden_sectors;
 use crate::fs::fat::patch_bpb_hidden_sectors;
 use crate::fs::ntfs::patch_ntfs_hidden_sectors;
-use crate::fs::exfat::patch_exfat_hidden_sectors;
 use crate::partition::mbr::patch_mbr_entries;
 use crate::partition::PartitionSizeOverride;
 

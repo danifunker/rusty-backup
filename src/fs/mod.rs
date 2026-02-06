@@ -7,17 +7,16 @@ pub mod ntfs;
 use std::io::{Read, Seek, SeekFrom};
 
 pub use exfat::{
-    patch_exfat_hidden_sectors, resize_exfat_in_place, validate_exfat_integrity,
-    CompactExfatReader,
+    patch_exfat_hidden_sectors, resize_exfat_in_place, validate_exfat_integrity, CompactExfatReader,
 };
 pub use fat::{
     patch_bpb_hidden_sectors, resize_fat_in_place, set_fat_clean_flags, validate_fat_integrity,
     CompactFatReader, CompactInfo,
 };
+use filesystem::{Filesystem, FilesystemError};
 pub use ntfs::{
     patch_ntfs_hidden_sectors, resize_ntfs_in_place, validate_ntfs_integrity, CompactNtfsReader,
 };
-use filesystem::{Filesystem, FilesystemError};
 
 /// Result of filesystem compaction.
 pub struct CompactResult {
@@ -72,8 +71,7 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
             let fs_type = detect_0x07_type(&mut reader, partition_offset);
             match fs_type {
                 "ntfs" => {
-                    let (reader, info) =
-                        CompactNtfsReader::new(reader, partition_offset).ok()?;
+                    let (reader, info) = CompactNtfsReader::new(reader, partition_offset).ok()?;
                     Some((
                         Box::new(reader),
                         CompactResult {
@@ -84,8 +82,7 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
                     ))
                 }
                 "exfat" => {
-                    let (reader, info) =
-                        CompactExfatReader::new(reader, partition_offset).ok()?;
+                    let (reader, info) = CompactExfatReader::new(reader, partition_offset).ok()?;
                     Some((
                         Box::new(reader),
                         CompactResult {

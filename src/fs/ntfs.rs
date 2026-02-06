@@ -35,7 +35,9 @@ struct NtfsVbr {
 fn parse_vbr(vbr: &[u8; 512]) -> Result<NtfsVbr, FilesystemError> {
     // Check OEM ID: "NTFS    " at offset 3
     if &vbr[3..11] != b"NTFS    " {
-        return Err(FilesystemError::Parse("not an NTFS volume (OEM ID mismatch)".into()));
+        return Err(FilesystemError::Parse(
+            "not an NTFS volume (OEM ID mismatch)".into(),
+        ));
     }
 
     let bytes_per_sector = u16::from_le_bytes([vbr[0x0B], vbr[0x0C]]) as u64;
@@ -47,22 +49,21 @@ fn parse_vbr(vbr: &[u8; 512]) -> Result<NtfsVbr, FilesystemError> {
 
     let sectors_per_cluster = vbr[0x0D] as u64;
     if sectors_per_cluster == 0 {
-        return Err(FilesystemError::Parse("invalid NTFS sectors per cluster: 0".into()));
+        return Err(FilesystemError::Parse(
+            "invalid NTFS sectors per cluster: 0".into(),
+        ));
     }
 
     let total_sectors = u64::from_le_bytes([
-        vbr[0x28], vbr[0x29], vbr[0x2A], vbr[0x2B],
-        vbr[0x2C], vbr[0x2D], vbr[0x2E], vbr[0x2F],
+        vbr[0x28], vbr[0x29], vbr[0x2A], vbr[0x2B], vbr[0x2C], vbr[0x2D], vbr[0x2E], vbr[0x2F],
     ]);
 
     let mft_cluster = u64::from_le_bytes([
-        vbr[0x30], vbr[0x31], vbr[0x32], vbr[0x33],
-        vbr[0x34], vbr[0x35], vbr[0x36], vbr[0x37],
+        vbr[0x30], vbr[0x31], vbr[0x32], vbr[0x33], vbr[0x34], vbr[0x35], vbr[0x36], vbr[0x37],
     ]);
 
     let mft_mirror_cluster = u64::from_le_bytes([
-        vbr[0x38], vbr[0x39], vbr[0x3A], vbr[0x3B],
-        vbr[0x3C], vbr[0x3D], vbr[0x3E], vbr[0x3F],
+        vbr[0x38], vbr[0x39], vbr[0x3A], vbr[0x3B], vbr[0x3C], vbr[0x3D], vbr[0x3E], vbr[0x3F],
     ]);
 
     // Clusters per MFT record: if negative, record size = 2^|value| bytes
@@ -185,7 +186,10 @@ fn parse_mft_attributes(record: &[u8], record_size: u32) -> Vec<MftAttribute> {
 
     while pos + 16 <= record.len() && pos < record_size as usize {
         let attr_type = u32::from_le_bytes([
-            record[pos], record[pos + 1], record[pos + 2], record[pos + 3],
+            record[pos],
+            record[pos + 1],
+            record[pos + 2],
+            record[pos + 3],
         ]);
 
         if attr_type == ATTR_END || attr_type == 0 {
@@ -193,7 +197,10 @@ fn parse_mft_attributes(record: &[u8], record_size: u32) -> Vec<MftAttribute> {
         }
 
         let attr_len = u32::from_le_bytes([
-            record[pos + 4], record[pos + 5], record[pos + 6], record[pos + 7],
+            record[pos + 4],
+            record[pos + 5],
+            record[pos + 6],
+            record[pos + 7],
         ]) as usize;
 
         if attr_len < 16 || pos + attr_len > record.len() {
@@ -205,9 +212,13 @@ fn parse_mft_attributes(record: &[u8], record_size: u32) -> Vec<MftAttribute> {
         if non_resident == 0 {
             // Resident attribute
             let value_length = u32::from_le_bytes([
-                record[pos + 0x10], record[pos + 0x11], record[pos + 0x12], record[pos + 0x13],
+                record[pos + 0x10],
+                record[pos + 0x11],
+                record[pos + 0x12],
+                record[pos + 0x13],
             ]) as usize;
-            let value_offset = u16::from_le_bytes([record[pos + 0x14], record[pos + 0x15]]) as usize;
+            let value_offset =
+                u16::from_le_bytes([record[pos + 0x14], record[pos + 0x15]]) as usize;
 
             let value = if value_offset + value_length <= attr_len {
                 record[pos + value_offset..pos + value_offset + value_length].to_vec()
@@ -228,8 +239,14 @@ fn parse_mft_attributes(record: &[u8], record_size: u32) -> Vec<MftAttribute> {
             // Non-resident attribute
             let starting_vcn = if pos + 0x18 <= record.len() {
                 u64::from_le_bytes([
-                    record[pos + 0x10], record[pos + 0x11], record[pos + 0x12], record[pos + 0x13],
-                    record[pos + 0x14], record[pos + 0x15], record[pos + 0x16], record[pos + 0x17],
+                    record[pos + 0x10],
+                    record[pos + 0x11],
+                    record[pos + 0x12],
+                    record[pos + 0x13],
+                    record[pos + 0x14],
+                    record[pos + 0x15],
+                    record[pos + 0x16],
+                    record[pos + 0x17],
                 ])
             } else {
                 0
@@ -237,8 +254,14 @@ fn parse_mft_attributes(record: &[u8], record_size: u32) -> Vec<MftAttribute> {
 
             let real_size = if pos + 0x38 <= record.len() {
                 u64::from_le_bytes([
-                    record[pos + 0x30], record[pos + 0x31], record[pos + 0x32], record[pos + 0x33],
-                    record[pos + 0x34], record[pos + 0x35], record[pos + 0x36], record[pos + 0x37],
+                    record[pos + 0x30],
+                    record[pos + 0x31],
+                    record[pos + 0x32],
+                    record[pos + 0x33],
+                    record[pos + 0x34],
+                    record[pos + 0x35],
+                    record[pos + 0x36],
+                    record[pos + 0x37],
                 ])
             } else {
                 0
@@ -246,8 +269,14 @@ fn parse_mft_attributes(record: &[u8], record_size: u32) -> Vec<MftAttribute> {
 
             let allocated_size = if pos + 0x30 <= record.len() {
                 u64::from_le_bytes([
-                    record[pos + 0x28], record[pos + 0x29], record[pos + 0x2A], record[pos + 0x2B],
-                    record[pos + 0x2C], record[pos + 0x2D], record[pos + 0x2E], record[pos + 0x2F],
+                    record[pos + 0x28],
+                    record[pos + 0x29],
+                    record[pos + 0x2A],
+                    record[pos + 0x2B],
+                    record[pos + 0x2C],
+                    record[pos + 0x2D],
+                    record[pos + 0x2E],
+                    record[pos + 0x2F],
                 ])
             } else {
                 0
@@ -289,7 +318,9 @@ fn parse_mft_attributes(record: &[u8], record_size: u32) -> Vec<MftAttribute> {
 /// Apply fixup array to an MFT record buffer.
 fn apply_fixup(record: &mut [u8], bytes_per_sector: u64) -> Result<(), FilesystemError> {
     if record.len() < 48 {
-        return Err(FilesystemError::Parse("MFT record too small for fixup".into()));
+        return Err(FilesystemError::Parse(
+            "MFT record too small for fixup".into(),
+        ));
     }
 
     let fixup_offset = u16::from_le_bytes([record[0x04], record[0x05]]) as usize;
@@ -346,7 +377,8 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
     pub fn open(mut reader: R, partition_offset: u64) -> Result<Self, FilesystemError> {
         reader.seek(SeekFrom::Start(partition_offset))?;
         let mut vbr_buf = [0u8; 512];
-        reader.read_exact(&mut vbr_buf)
+        reader
+            .read_exact(&mut vbr_buf)
             .map_err(|e| FilesystemError::Parse(format!("cannot read NTFS VBR: {e}")))?;
 
         let vbr = parse_vbr(&vbr_buf)?;
@@ -419,7 +451,8 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
         let attrs = parse_mft_attributes(&record, self.mft_record_size);
 
         for attr in &attrs {
-            if attr.attr_type == ATTR_VOLUME_INFORMATION && attr.resident && attr.value.len() >= 10 {
+            if attr.attr_type == ATTR_VOLUME_INFORMATION && attr.resident && attr.value.len() >= 10
+            {
                 let major = attr.value[8];
                 let minor = attr.value[9];
                 return Ok((major, minor));
@@ -453,7 +486,11 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
     }
 
     /// Read attribute data (handles both resident and non-resident).
-    fn read_attribute_data(&mut self, attr: &MftAttribute, max_bytes: Option<u64>) -> Result<Vec<u8>, FilesystemError> {
+    fn read_attribute_data(
+        &mut self,
+        attr: &MftAttribute,
+        max_bytes: Option<u64>,
+    ) -> Result<Vec<u8>, FilesystemError> {
         if attr.resident {
             let limit = max_bytes.map(|m| m as usize).unwrap_or(attr.value.len());
             Ok(attr.value[..limit.min(attr.value.len())].to_vec())
@@ -538,7 +575,9 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
             }
         }
 
-        Err(FilesystemError::Parse("$Bitmap $DATA attribute not found".into()))
+        Err(FilesystemError::Parse(
+            "$Bitmap $DATA attribute not found".into(),
+        ))
     }
 
     /// Parse index entries from $INDEX_ROOT and $INDEX_ALLOCATION to list directory contents.
@@ -597,17 +636,25 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
         }
 
         let entries_offset = u32::from_le_bytes([
-            data[node_offset], data[node_offset + 1],
-            data[node_offset + 2], data[node_offset + 3],
+            data[node_offset],
+            data[node_offset + 1],
+            data[node_offset + 2],
+            data[node_offset + 3],
         ]) as usize;
 
         let entries_size = u32::from_le_bytes([
-            data[node_offset + 4], data[node_offset + 5],
-            data[node_offset + 6], data[node_offset + 7],
+            data[node_offset + 4],
+            data[node_offset + 5],
+            data[node_offset + 6],
+            data[node_offset + 7],
         ]) as usize;
 
         let start = node_offset + entries_offset;
-        self.parse_index_entry_list(&data[start..data.len().min(node_offset + entries_size)], parent_path, entries)
+        self.parse_index_entry_list(
+            &data[start..data.len().min(node_offset + entries_size)],
+            parent_path,
+            entries,
+        )
     }
 
     /// Parse index entries from $INDEX_ALLOCATION (non-resident B+ tree nodes).
@@ -645,13 +692,17 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
             }
 
             let entries_offset = u32::from_le_bytes([
-                record_copy[node_offset], record_copy[node_offset + 1],
-                record_copy[node_offset + 2], record_copy[node_offset + 3],
+                record_copy[node_offset],
+                record_copy[node_offset + 1],
+                record_copy[node_offset + 2],
+                record_copy[node_offset + 3],
             ]) as usize;
 
             let entries_size = u32::from_le_bytes([
-                record_copy[node_offset + 4], record_copy[node_offset + 5],
-                record_copy[node_offset + 6], record_copy[node_offset + 7],
+                record_copy[node_offset + 4],
+                record_copy[node_offset + 5],
+                record_copy[node_offset + 6],
+                record_copy[node_offset + 7],
             ]) as usize;
 
             let start = node_offset + entries_offset;
@@ -678,7 +729,12 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
         while pos + 16 <= data.len() {
             let entry_length = u16::from_le_bytes([data[pos + 8], data[pos + 9]]) as usize;
             let content_length = u16::from_le_bytes([data[pos + 10], data[pos + 11]]) as usize;
-            let flags = u32::from_le_bytes([data[pos + 12], data[pos + 13], data[pos + 14], data[pos + 15]]);
+            let flags = u32::from_le_bytes([
+                data[pos + 12],
+                data[pos + 13],
+                data[pos + 14],
+                data[pos + 15],
+            ]);
 
             if entry_length < 16 || pos + entry_length > data.len() {
                 break;
@@ -695,8 +751,14 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
                 if let Some(entry) = self.parse_file_name_entry(content, parent_path) {
                     // Skip . and .. entries and system metafiles
                     let mft_ref = u64::from_le_bytes([
-                        data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-                        data[pos + 4], data[pos + 5], 0, 0,
+                        data[pos],
+                        data[pos + 1],
+                        data[pos + 2],
+                        data[pos + 3],
+                        data[pos + 4],
+                        data[pos + 5],
+                        0,
+                        0,
                     ]) & 0x0000_FFFF_FFFF_FFFF;
 
                     if mft_ref >= 24 || (mft_ref >= 11 && mft_ref < 24) {
@@ -719,8 +781,7 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
 
         let file_flags = u32::from_le_bytes([data[56], data[57], data[58], data[59]]);
         let real_size = u64::from_le_bytes([
-            data[48], data[49], data[50], data[51],
-            data[52], data[53], data[54], data[55],
+            data[48], data[49], data[50], data[51], data[52], data[53], data[54], data[55],
         ]);
         let name_length = data[64] as usize;
         let name_type = data[65]; // 0=POSIX, 1=Win32, 2=DOS, 3=Win32+DOS
@@ -753,9 +814,9 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
         };
 
         // Use parent MFT reference as location (for directory listing)
-        let parent_ref = u64::from_le_bytes([
-            data[0], data[1], data[2], data[3], data[4], data[5], 0, 0,
-        ]) & 0x0000_FFFF_FFFF_FFFF;
+        let parent_ref =
+            u64::from_le_bytes([data[0], data[1], data[2], data[3], data[4], data[5], 0, 0])
+                & 0x0000_FFFF_FFFF_FFFF;
 
         if is_dir {
             Some(FileEntry::new_directory(name, path, parent_ref))
@@ -899,7 +960,8 @@ impl<R: Read + Seek> CompactNtfsReader<R> {
         // Read VBR
         source.seek(SeekFrom::Start(partition_offset))?;
         let mut vbr_buf = [0u8; 512];
-        source.read_exact(&mut vbr_buf)
+        source
+            .read_exact(&mut vbr_buf)
             .map_err(|e| FilesystemError::Parse(format!("cannot read NTFS VBR: {e}")))?;
 
         let vbr = parse_vbr(&vbr_buf)?;
@@ -935,10 +997,14 @@ impl<R: Read + Seek> CompactNtfsReader<R> {
                     // Read bitmap from data runs
                     for run in &attr.data_runs {
                         if run.cluster_offset <= 0 {
-                            bitmap_data.resize(bitmap_data.len() + (run.length * cluster_size) as usize, 0);
+                            bitmap_data.resize(
+                                bitmap_data.len() + (run.length * cluster_size) as usize,
+                                0,
+                            );
                             continue;
                         }
-                        let run_offset = partition_offset + run.cluster_offset as u64 * cluster_size;
+                        let run_offset =
+                            partition_offset + run.cluster_offset as u64 * cluster_size;
                         source.seek(SeekFrom::Start(run_offset))?;
                         let run_size = (run.length * cluster_size) as usize;
                         let old_len = bitmap_data.len();
@@ -1021,10 +1087,12 @@ impl<R: Read + Seek> Read for CompactNtfsReader<R> {
                 if self.cluster_buf.is_empty() || within_cluster == 0 {
                     let src_cluster = self.used_cluster_list[cluster_idx];
                     let src_offset = self.partition_offset + src_cluster * self.cluster_size;
-                    self.source.seek(SeekFrom::Start(src_offset))
+                    self.source
+                        .seek(SeekFrom::Start(src_offset))
                         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
                     self.cluster_buf.resize(self.cluster_size as usize, 0);
-                    self.source.read_exact(&mut self.cluster_buf)
+                    self.source
+                        .read_exact(&mut self.cluster_buf)
                         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
                 }
 
@@ -1076,8 +1144,7 @@ pub fn resize_ntfs_in_place(
     }
 
     let old_total = u64::from_le_bytes([
-        vbr[0x28], vbr[0x29], vbr[0x2A], vbr[0x2B],
-        vbr[0x2C], vbr[0x2D], vbr[0x2E], vbr[0x2F],
+        vbr[0x28], vbr[0x29], vbr[0x2A], vbr[0x2B], vbr[0x2C], vbr[0x2D], vbr[0x2E], vbr[0x2F],
     ]);
 
     if old_total == new_total_sectors {
@@ -1089,8 +1156,7 @@ pub fn resize_ntfs_in_place(
     // Check that data doesn't extend beyond new size by reading $Bitmap
     // We need to find the last used cluster
     let mft_cluster = u64::from_le_bytes([
-        vbr[0x30], vbr[0x31], vbr[0x32], vbr[0x33],
-        vbr[0x34], vbr[0x35], vbr[0x36], vbr[0x37],
+        vbr[0x30], vbr[0x31], vbr[0x32], vbr[0x33], vbr[0x34], vbr[0x35], vbr[0x36], vbr[0x37],
     ]);
 
     let clusters_per_mft_raw = vbr[0x40] as i8;
@@ -1164,8 +1230,7 @@ fn read_last_used_cluster_from_bitmap(
     if &record[0..4] != b"FILE" {
         bail!("$Bitmap MFT record invalid");
     }
-    apply_fixup(&mut record, bytes_per_sector)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    apply_fixup(&mut record, bytes_per_sector).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let attrs = parse_mft_attributes(&record, mft_record_size);
     for attr in &attrs {
@@ -1232,8 +1297,7 @@ pub fn validate_ntfs_integrity(
     let cluster_size = bytes_per_sector * sectors_per_cluster;
 
     let mft_cluster = u64::from_le_bytes([
-        vbr[0x30], vbr[0x31], vbr[0x32], vbr[0x33],
-        vbr[0x34], vbr[0x35], vbr[0x36], vbr[0x37],
+        vbr[0x30], vbr[0x31], vbr[0x32], vbr[0x33], vbr[0x34], vbr[0x35], vbr[0x36], vbr[0x37],
     ]);
 
     let clusters_per_mft_raw = vbr[0x40] as i8;
@@ -1296,8 +1360,7 @@ pub fn patch_ntfs_hidden_sectors(
 
         // Write backup boot sector at last sector
         let total_sectors = u64::from_le_bytes([
-            vbr[0x28], vbr[0x29], vbr[0x2A], vbr[0x2B],
-            vbr[0x2C], vbr[0x2D], vbr[0x2E], vbr[0x2F],
+            vbr[0x28], vbr[0x29], vbr[0x2A], vbr[0x2B], vbr[0x2C], vbr[0x2D], vbr[0x2E], vbr[0x2F],
         ]);
         let bytes_per_sector = u16::from_le_bytes([vbr[0x0B], vbr[0x0C]]) as u64;
         if total_sectors > 0 && bytes_per_sector > 0 {
@@ -1404,7 +1467,7 @@ mod tests {
         let data = [
             0x11, 0x04, 0x0A, // run 1: len=4, offset=+10
             0x11, 0x08, 0x14, // run 2: len=8, offset=+20 (abs=30)
-            0x00,              // end
+            0x00, // end
         ];
         let runs = decode_data_runs(&data);
         assert_eq!(runs.len(), 2);
@@ -1418,8 +1481,8 @@ mod tests {
     fn test_decode_data_runs_negative_offset() {
         // Two runs where second has negative relative offset
         let data = [
-            0x11, 0x04, 0x20,       // run 1: len=4, offset=+32
-            0x11, 0x04, 0xF0,       // run 2: len=4, offset=-16 (abs=32-16=16)
+            0x11, 0x04, 0x20, // run 1: len=4, offset=+32
+            0x11, 0x04, 0xF0, // run 2: len=4, offset=-16 (abs=32-16=16)
             0x00,
         ];
         let runs = decode_data_runs(&data);

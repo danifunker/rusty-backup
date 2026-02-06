@@ -535,7 +535,10 @@ enum PartitionFsType {
 }
 
 /// Detect the filesystem type of a partition by reading its boot sector magic bytes.
-fn detect_partition_fs_type(file: &mut (impl Read + Seek), partition_offset: u64) -> PartitionFsType {
+fn detect_partition_fs_type(
+    file: &mut (impl Read + Seek),
+    partition_offset: u64,
+) -> PartitionFsType {
     if file.seek(SeekFrom::Start(partition_offset)).is_err() {
         return PartitionFsType::Unknown;
     }

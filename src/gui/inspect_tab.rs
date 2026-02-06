@@ -1267,7 +1267,9 @@ impl InspectTab {
                             }
                         }
                         ui.label(if part.bootable { "Yes" } else { "" });
-                        if is_browsable_type(part.partition_type_byte) || is_fat_name(&part.type_name) {
+                        if is_browsable_type(part.partition_type_byte)
+                            || is_fat_name(&part.type_name)
+                        {
                             if ui.small_button("Browse").clicked() {
                                 // Use the stored type byte, or infer one
                                 // from the name for old backups that didn't

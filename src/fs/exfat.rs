@@ -32,19 +32,22 @@ struct ExfatVbr {
 fn parse_exfat_vbr(vbr: &[u8; 512]) -> Result<ExfatVbr, FilesystemError> {
     // Check OEM: "EXFAT   " at offset 3
     if &vbr[3..11] != b"EXFAT   " {
-        return Err(FilesystemError::Parse("not an exFAT volume (OEM ID mismatch)".into()));
+        return Err(FilesystemError::Parse(
+            "not an exFAT volume (OEM ID mismatch)".into(),
+        ));
     }
 
     // Check that the must-be-zero region (0x0B..0x40) is indeed zero
     // (this is a key exFAT identifier)
     let must_be_zero = &vbr[0x0B..0x40];
     if must_be_zero.iter().any(|&b| b != 0) {
-        return Err(FilesystemError::Parse("exFAT must-be-zero region is not zero".into()));
+        return Err(FilesystemError::Parse(
+            "exFAT must-be-zero region is not zero".into(),
+        ));
     }
 
     let volume_length = u64::from_le_bytes([
-        vbr[0x48], vbr[0x49], vbr[0x4A], vbr[0x4B],
-        vbr[0x4C], vbr[0x4D], vbr[0x4E], vbr[0x4F],
+        vbr[0x48], vbr[0x49], vbr[0x4A], vbr[0x4B], vbr[0x4C], vbr[0x4D], vbr[0x4E], vbr[0x4F],
     ]);
 
     let fat_offset = u32::from_le_bytes([vbr[0x50], vbr[0x51], vbr[0x52], vbr[0x53]]);
@@ -110,7 +113,8 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
     pub fn open(mut reader: R, partition_offset: u64) -> Result<Self, FilesystemError> {
         reader.seek(SeekFrom::Start(partition_offset))?;
         let mut vbr_buf = [0u8; 512];
-        reader.read_exact(&mut vbr_buf)
+        reader
+            .read_exact(&mut vbr_buf)
             .map_err(|e| FilesystemError::Parse(format!("cannot read exFAT VBR: {e}")))?;
 
         let vbr = parse_exfat_vbr(&vbr_buf)?;
@@ -180,7 +184,11 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
     }
 
     /// Read cluster chain data.
-    fn read_cluster_chain(&mut self, start_cluster: u32, max_bytes: Option<u64>) -> Result<Vec<u8>, FilesystemError> {
+    fn read_cluster_chain(
+        &mut self,
+        start_cluster: u32,
+        max_bytes: Option<u64>,
+    ) -> Result<Vec<u8>, FilesystemError> {
         let limit = max_bytes.unwrap_or(u64::MAX);
         let mut data = Vec::new();
         let mut cluster = start_cluster;
@@ -250,14 +258,20 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
                     // Bitmap entry: start cluster at offset 20 (u32), data length at offset 24 (u64)
                     if pos + 32 <= root_data.len() {
                         self.bitmap_start_cluster = u32::from_le_bytes([
-                            root_data[pos + 20], root_data[pos + 21],
-                            root_data[pos + 22], root_data[pos + 23],
+                            root_data[pos + 20],
+                            root_data[pos + 21],
+                            root_data[pos + 22],
+                            root_data[pos + 23],
                         ]);
                         self.bitmap_size = u64::from_le_bytes([
-                            root_data[pos + 24], root_data[pos + 25],
-                            root_data[pos + 26], root_data[pos + 27],
-                            root_data[pos + 28], root_data[pos + 29],
-                            root_data[pos + 30], root_data[pos + 31],
+                            root_data[pos + 24],
+                            root_data[pos + 25],
+                            root_data[pos + 26],
+                            root_data[pos + 27],
+                            root_data[pos + 28],
+                            root_data[pos + 29],
+                            root_data[pos + 30],
+                            root_data[pos + 31],
                         ]);
                     }
                 }
@@ -354,7 +368,8 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
 
                 // Next entry should be stream extension (0xC0)
                 let stream_pos = pos + 32;
-                if stream_pos + 32 > dir_data.len() || dir_data[stream_pos] != ENTRY_TYPE_STREAM_EXT {
+                if stream_pos + 32 > dir_data.len() || dir_data[stream_pos] != ENTRY_TYPE_STREAM_EXT
+                {
                     pos += 32;
                     continue;
                 }
@@ -362,14 +377,20 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
                 let _no_fat_chain = (dir_data[stream_pos + 1] & 0x02) != 0;
                 let name_length = dir_data[stream_pos + 3] as usize;
                 let first_cluster = u32::from_le_bytes([
-                    dir_data[stream_pos + 20], dir_data[stream_pos + 21],
-                    dir_data[stream_pos + 22], dir_data[stream_pos + 23],
+                    dir_data[stream_pos + 20],
+                    dir_data[stream_pos + 21],
+                    dir_data[stream_pos + 22],
+                    dir_data[stream_pos + 23],
                 ]);
                 let data_length = u64::from_le_bytes([
-                    dir_data[stream_pos + 24], dir_data[stream_pos + 25],
-                    dir_data[stream_pos + 26], dir_data[stream_pos + 27],
-                    dir_data[stream_pos + 28], dir_data[stream_pos + 29],
-                    dir_data[stream_pos + 30], dir_data[stream_pos + 31],
+                    dir_data[stream_pos + 24],
+                    dir_data[stream_pos + 25],
+                    dir_data[stream_pos + 26],
+                    dir_data[stream_pos + 27],
+                    dir_data[stream_pos + 28],
+                    dir_data[stream_pos + 29],
+                    dir_data[stream_pos + 30],
+                    dir_data[stream_pos + 31],
                 ]);
 
                 // Collect filename from 0xC1 entries
@@ -577,7 +598,8 @@ impl<R: Read + Seek> CompactExfatReader<R> {
         // Read VBR
         source.seek(SeekFrom::Start(partition_offset))?;
         let mut vbr_buf = [0u8; 512];
-        source.read_exact(&mut vbr_buf)
+        source
+            .read_exact(&mut vbr_buf)
             .map_err(|e| FilesystemError::Parse(format!("cannot read exFAT VBR: {e}")))?;
 
         let vbr = parse_exfat_vbr(&vbr_buf)?;
@@ -602,8 +624,8 @@ impl<R: Read + Seek> CompactExfatReader<R> {
 
         // Find allocation bitmap in root directory
         let cluster_heap_offset = vbr.cluster_heap_offset as u64 * bytes_per_sector;
-        let root_offset = partition_offset + cluster_heap_offset
-            + (vbr.root_cluster as u64 - 2) * cluster_size;
+        let root_offset =
+            partition_offset + cluster_heap_offset + (vbr.root_cluster as u64 - 2) * cluster_size;
 
         source.seek(SeekFrom::Start(root_offset))?;
         let mut root_buf = vec![0u8; cluster_size as usize];
@@ -619,14 +641,20 @@ impl<R: Read + Seek> CompactExfatReader<R> {
             }
             if root_buf[pos] == ENTRY_TYPE_ALLOCATION_BITMAP {
                 bitmap_cluster = u32::from_le_bytes([
-                    root_buf[pos + 20], root_buf[pos + 21],
-                    root_buf[pos + 22], root_buf[pos + 23],
+                    root_buf[pos + 20],
+                    root_buf[pos + 21],
+                    root_buf[pos + 22],
+                    root_buf[pos + 23],
                 ]);
                 bitmap_size = u64::from_le_bytes([
-                    root_buf[pos + 24], root_buf[pos + 25],
-                    root_buf[pos + 26], root_buf[pos + 27],
-                    root_buf[pos + 28], root_buf[pos + 29],
-                    root_buf[pos + 30], root_buf[pos + 31],
+                    root_buf[pos + 24],
+                    root_buf[pos + 25],
+                    root_buf[pos + 26],
+                    root_buf[pos + 27],
+                    root_buf[pos + 28],
+                    root_buf[pos + 29],
+                    root_buf[pos + 30],
+                    root_buf[pos + 31],
                 ]);
                 break;
             }
@@ -636,8 +664,8 @@ impl<R: Read + Seek> CompactExfatReader<R> {
         // Read bitmap
         let mut used_cluster_list = Vec::new();
         if bitmap_cluster >= 2 {
-            let bmp_offset = partition_offset + cluster_heap_offset
-                + (bitmap_cluster as u64 - 2) * cluster_size;
+            let bmp_offset =
+                partition_offset + cluster_heap_offset + (bitmap_cluster as u64 - 2) * cluster_size;
             source.seek(SeekFrom::Start(bmp_offset))?;
             let mut bitmap_data = vec![0u8; bitmap_size as usize];
             source.read_exact(&mut bitmap_data)?;
@@ -720,17 +748,23 @@ impl<R: Read + Seek> Read for CompactExfatReader<R> {
                 if self.cluster_buf.is_empty() || within_cluster == 0 {
                     let cluster_num = self.used_cluster_list[cluster_idx];
                     let cluster_heap_offset = u32::from_le_bytes([
-                        self.boot_region[0x58], self.boot_region[0x59],
-                        self.boot_region[0x5A], self.boot_region[0x5B],
-                    ]) as u64 * self.bytes_per_sector;
+                        self.boot_region[0x58],
+                        self.boot_region[0x59],
+                        self.boot_region[0x5A],
+                        self.boot_region[0x5B],
+                    ]) as u64
+                        * self.bytes_per_sector;
 
-                    let src_offset = self.partition_offset + cluster_heap_offset
+                    let src_offset = self.partition_offset
+                        + cluster_heap_offset
                         + (cluster_num as u64 - 2) * self.cluster_size;
 
-                    self.source.seek(SeekFrom::Start(src_offset))
+                    self.source
+                        .seek(SeekFrom::Start(src_offset))
                         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
                     self.cluster_buf.resize(self.cluster_size as usize, 0);
-                    self.source.read_exact(&mut self.cluster_buf)
+                    self.source
+                        .read_exact(&mut self.cluster_buf)
                         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
                 }
 
@@ -776,8 +810,7 @@ pub fn resize_exfat_in_place(
     let cluster_size = bytes_per_sector * sectors_per_cluster;
 
     let old_volume_length = u64::from_le_bytes([
-        vbr[0x48], vbr[0x49], vbr[0x4A], vbr[0x4B],
-        vbr[0x4C], vbr[0x4D], vbr[0x4E], vbr[0x4F],
+        vbr[0x48], vbr[0x49], vbr[0x4A], vbr[0x4B], vbr[0x4C], vbr[0x4D], vbr[0x4E], vbr[0x4F],
     ]);
 
     if old_volume_length == new_volume_length_sectors {
@@ -797,7 +830,8 @@ pub fn resize_exfat_in_place(
     }
 
     // Find allocation bitmap in root directory
-    let root_offset = partition_offset + cluster_heap_offset as u64 * bytes_per_sector
+    let root_offset = partition_offset
+        + cluster_heap_offset as u64 * bytes_per_sector
         + (root_cluster as u64 - 2) * cluster_size;
     file.seek(SeekFrom::Start(root_offset))?;
     let mut root_buf = vec![0u8; cluster_size as usize];
@@ -814,14 +848,20 @@ pub fn resize_exfat_in_place(
         }
         if root_buf[pos] == ENTRY_TYPE_ALLOCATION_BITMAP {
             bitmap_cluster = u32::from_le_bytes([
-                root_buf[pos + 20], root_buf[pos + 21],
-                root_buf[pos + 22], root_buf[pos + 23],
+                root_buf[pos + 20],
+                root_buf[pos + 21],
+                root_buf[pos + 22],
+                root_buf[pos + 23],
             ]);
             bitmap_size = u64::from_le_bytes([
-                root_buf[pos + 24], root_buf[pos + 25],
-                root_buf[pos + 26], root_buf[pos + 27],
-                root_buf[pos + 28], root_buf[pos + 29],
-                root_buf[pos + 30], root_buf[pos + 31],
+                root_buf[pos + 24],
+                root_buf[pos + 25],
+                root_buf[pos + 26],
+                root_buf[pos + 27],
+                root_buf[pos + 28],
+                root_buf[pos + 29],
+                root_buf[pos + 30],
+                root_buf[pos + 31],
             ]);
             bitmap_entry_offset = pos;
             break;
@@ -834,7 +874,8 @@ pub fn resize_exfat_in_place(
     }
 
     // Check last used cluster fits within new size
-    let bmp_offset = partition_offset + cluster_heap_offset as u64 * bytes_per_sector
+    let bmp_offset = partition_offset
+        + cluster_heap_offset as u64 * bytes_per_sector
         + (bitmap_cluster as u64 - 2) * cluster_size;
     file.seek(SeekFrom::Start(bmp_offset))?;
     let mut bitmap_data = vec![0u8; bitmap_size as usize];
@@ -860,8 +901,7 @@ pub fn resize_exfat_in_place(
 
     log_cb(&format!(
         "exFAT resize: {} -> {} clusters ({} -> {} sectors)",
-        old_cluster_count, new_cluster_count,
-        old_volume_length, new_volume_length_sectors,
+        old_cluster_count, new_cluster_count, old_volume_length, new_volume_length_sectors,
     ));
 
     // Resize bitmap
@@ -893,7 +933,9 @@ pub fn resize_exfat_in_place(
 
     // Verify FAT has no entries beyond new cluster count (for shrinking)
     if new_cluster_count < old_cluster_count {
-        let fat_offset = partition_offset + u32::from_le_bytes([vbr[0x50], vbr[0x51], vbr[0x52], vbr[0x53]]) as u64 * bytes_per_sector;
+        let fat_offset = partition_offset
+            + u32::from_le_bytes([vbr[0x50], vbr[0x51], vbr[0x52], vbr[0x53]]) as u64
+                * bytes_per_sector;
         for cluster in new_cluster_count + 2..old_cluster_count + 2 {
             let entry_offset = fat_offset + cluster as u64 * 4;
             file.seek(SeekFrom::Start(entry_offset))?;
@@ -1016,8 +1058,10 @@ pub fn validate_exfat_integrity(
     let cs_offset = 11 * bytes_per_sector as usize;
     if cs_offset + 4 <= boot_region.len() {
         let stored = u32::from_le_bytes([
-            boot_region[cs_offset], boot_region[cs_offset + 1],
-            boot_region[cs_offset + 2], boot_region[cs_offset + 3],
+            boot_region[cs_offset],
+            boot_region[cs_offset + 1],
+            boot_region[cs_offset + 2],
+            boot_region[cs_offset + 3],
         ]);
         if computed != stored {
             log_cb(&format!(
@@ -1058,8 +1102,7 @@ pub fn patch_exfat_hidden_sectors(
     let bytes_per_sector = 1u64 << bytes_per_sector_shift;
 
     let old_partition_offset = u64::from_le_bytes([
-        vbr[0x40], vbr[0x41], vbr[0x42], vbr[0x43],
-        vbr[0x44], vbr[0x45], vbr[0x46], vbr[0x47],
+        vbr[0x40], vbr[0x41], vbr[0x42], vbr[0x43], vbr[0x44], vbr[0x45], vbr[0x46], vbr[0x47],
     ]);
 
     if old_partition_offset == start_lba {
@@ -1148,7 +1191,7 @@ mod tests {
         // Revision: 1.0
         vbr[0x68] = 0; // minor
         vbr[0x69] = 1; // major
-        // Bytes per sector shift = 9 (512 bytes)
+                       // Bytes per sector shift = 9 (512 bytes)
         vbr[0x6C] = 9;
         // Sectors per cluster shift = 3 (8 sectors = 4096 bytes)
         vbr[0x6D] = 3;

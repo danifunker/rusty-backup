@@ -508,9 +508,12 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 .get_ref()
                 .try_clone()
                 .context("failed to clone source for compaction")?;
-            let (mut compact_reader, _) =
-                fs::compact_partition_reader(BufReader::new(clone), part_offset, part.partition_type_byte)
-                    .ok_or_else(|| anyhow::anyhow!("compaction failed for {part_label}"))?;
+            let (mut compact_reader, _) = fs::compact_partition_reader(
+                BufReader::new(clone),
+                part_offset,
+                part.partition_type_byte,
+            )
+            .ok_or_else(|| anyhow::anyhow!("compaction failed for {part_label}"))?;
 
             log(
                 &progress,
