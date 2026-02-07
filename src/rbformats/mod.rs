@@ -15,6 +15,7 @@ use crate::backup::CompressionType;
 use crate::fs::exfat::patch_exfat_hidden_sectors;
 use crate::fs::fat::patch_bpb_hidden_sectors;
 use crate::fs::ntfs::patch_ntfs_hidden_sectors;
+use crate::partition::gpt::Gpt;
 use crate::partition::mbr::patch_mbr_entries;
 use crate::partition::PartitionSizeOverride;
 
@@ -237,10 +238,11 @@ pub fn reconstruct_disk_from_backup(
     metadata: &BackupMetadata,
     mbr_bytes: Option<&[u8; 512]>,
     partition_sizes: &[PartitionSizeOverride],
-    _target_size: u64,
+    target_size: u64,
     writer: &mut (impl Read + Write + Seek),
     is_device: bool,
     fill_unused_with_zeros: bool,
+    gpt: Option<&Gpt>,
     progress_cb: &mut impl FnMut(u64),
     cancel_check: &impl Fn() -> bool,
     log_cb: &mut impl FnMut(&str),
@@ -267,28 +269,53 @@ pub fn reconstruct_disk_from_backup(
             .unwrap_or(default)
     };
 
-    // Write MBR (first 512 bytes), patching partition sizes if needed
-    let mut mbr_buf = if let Some(mbr) = mbr_bytes {
-        *mbr
+    let target_sectors = target_size / 512;
+
+    if let Some(gpt_data) = gpt {
+        // GPT restore: write protective MBR + primary GPT (LBAs 0-33)
+        let patched_gpt = gpt_data.patch_for_restore(partition_sizes, target_sectors);
+
+        let protective_mbr = Gpt::build_protective_mbr(target_sectors);
+        writer
+            .write_all(&protective_mbr)
+            .context("failed to write protective MBR")?;
+        total_written += 512;
+        log_cb("Wrote protective MBR for GPT disk");
+
+        let primary_gpt = patched_gpt.build_primary_gpt(target_sectors);
+        writer
+            .write_all(&primary_gpt)
+            .context("failed to write primary GPT")?;
+        total_written += primary_gpt.len() as u64;
+        log_cb(&format!(
+            "Wrote primary GPT ({} bytes, {} entries)",
+            primary_gpt.len(),
+            patched_gpt.entries.len()
+        ));
     } else {
-        let mbr_path = backup_folder.join("mbr.bin");
-        if mbr_path.exists() {
-            let data = fs::read(&mbr_path).context("failed to read mbr.bin")?;
-            let mut buf = [0u8; 512];
-            let copy_len = data.len().min(512);
-            buf[..copy_len].copy_from_slice(&data[..copy_len]);
-            buf
+        // MBR restore: write patched MBR
+        let mut mbr_buf = if let Some(mbr) = mbr_bytes {
+            *mbr
         } else {
-            bail!("no MBR data available for disk reconstruction");
+            let mbr_path = backup_folder.join("mbr.bin");
+            if mbr_path.exists() {
+                let data = fs::read(&mbr_path).context("failed to read mbr.bin")?;
+                let mut buf = [0u8; 512];
+                let copy_len = data.len().min(512);
+                buf[..copy_len].copy_from_slice(&data[..copy_len]);
+                buf
+            } else {
+                bail!("no MBR data available for disk reconstruction");
+            }
+        };
+        if !partition_sizes.is_empty() {
+            patch_mbr_entries(&mut mbr_buf, partition_sizes);
+            log_cb("Patched MBR partition table with export sizes");
         }
-    };
-    if !partition_sizes.is_empty() {
-        patch_mbr_entries(&mut mbr_buf, partition_sizes);
-        log_cb("Patched MBR partition table with export sizes");
+        log_cb("Writing MBR to disk...");
+        writer.write_all(&mbr_buf).context("failed to write MBR")?;
+        total_written += 512;
     }
-    log_cb("Writing MBR to disk...");
-    writer.write_all(&mbr_buf).context("failed to write MBR")?;
-    total_written += 512;
 
     // Write EBR chain if present (for logical partitions in extended container)
     if let Some((_ext_start, ref chain)) = ebr_chain {
@@ -439,6 +466,22 @@ pub fn reconstruct_disk_from_backup(
         log_cb(&format!(
             "partition-{}: wrote {} bytes (export size: {})",
             pm.index, bytes_written, export_size,
+        ));
+    }
+
+    // Write backup GPT at end of disk for GPT restores
+    if let Some(gpt_data) = gpt {
+        let patched_gpt = gpt_data.patch_for_restore(partition_sizes, target_sectors);
+        let backup_gpt = patched_gpt.build_backup_gpt(target_sectors);
+        let backup_offset = (target_sectors - 33) * 512;
+        writer.seek(SeekFrom::Start(backup_offset))?;
+        writer
+            .write_all(&backup_gpt)
+            .context("failed to write backup GPT")?;
+        log_cb(&format!(
+            "Wrote backup GPT at LBA {} ({} bytes)",
+            target_sectors - 33,
+            backup_gpt.len()
         ));
     }
 

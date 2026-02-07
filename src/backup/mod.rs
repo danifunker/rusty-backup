@@ -237,6 +237,19 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 LogLevel::Info,
                 "Exported GPT (gpt.json + mbr.bin)",
             );
+            if let Err(e) = format::export_gpt_bin(&mut source, &backup_folder) {
+                log(
+                    &progress,
+                    LogLevel::Warning,
+                    format!("Failed to export gpt.bin: {e}"),
+                );
+            } else {
+                log(
+                    &progress,
+                    LogLevel::Info,
+                    "Exported raw GPT sectors (gpt.bin)",
+                );
+            }
         }
     }
 

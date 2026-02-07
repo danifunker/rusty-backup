@@ -146,6 +146,31 @@ pub fn export_gpt(gpt: &Gpt, protective_mbr_bytes: &[u8; 512], folder: &Path) ->
     Ok(())
 }
 
+/// Export raw GPT sectors (LBAs 0-33) to `gpt.bin`.
+/// This preserves the exact on-disk GPT structures for byte-accurate restore.
+pub fn export_gpt_bin(
+    reader: &mut (impl std::io::Read + std::io::Seek),
+    folder: &Path,
+) -> Result<()> {
+    use std::io::SeekFrom;
+
+    reader
+        .seek(SeekFrom::Start(0))
+        .context("failed to seek to start for GPT export")?;
+
+    // Read LBAs 0-33 (protective MBR + GPT header + partition entries)
+    let mut buf = vec![0u8; 34 * 512];
+    reader
+        .read_exact(&mut buf)
+        .context("failed to read GPT sectors")?;
+
+    let bin_path = folder.join("gpt.bin");
+    fs::write(&bin_path, &buf)
+        .with_context(|| format!("failed to write {}", bin_path.display()))?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

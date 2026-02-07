@@ -24,6 +24,18 @@ pub struct ClonezillaImage {
     pub source_size_bytes: u64,
     /// Clonezilla image info text (from clonezilla-img file)
     pub image_info: String,
+    /// Whether this is a GPT disk
+    pub is_gpt: bool,
+    /// Raw bytes from `<disk>-gpt-1st` (primary GPT sectors)
+    pub gpt_primary_raw: Option<Vec<u8>>,
+    /// Raw bytes from `<disk>-gpt-2nd` (backup GPT sectors)
+    pub gpt_backup_raw: Option<Vec<u8>>,
+    /// Disk GUID from sfdisk label-id (for GPT)
+    pub gpt_disk_guid: Option<String>,
+    /// First usable LBA from sfdisk (for GPT)
+    pub gpt_first_lba: Option<u64>,
+    /// Last usable LBA from sfdisk (for GPT)
+    pub gpt_last_lba: Option<u64>,
 }
 
 /// A single partition within a Clonezilla image.
@@ -49,6 +61,12 @@ pub struct ClonezillaPartition {
     pub bootable: bool,
     /// Sorted list of partclone image split files
     pub partclone_files: Vec<PathBuf>,
+    /// GPT partition type GUID string (for GPT partitions)
+    pub type_guid: Option<String>,
+    /// GPT partition unique GUID string (for GPT partitions)
+    pub unique_guid: Option<String>,
+    /// GPT partition name (for GPT partitions)
+    pub partition_name: Option<String>,
 }
 
 impl ClonezillaPartition {
@@ -90,7 +108,8 @@ pub fn load(folder: &Path) -> Result<ClonezillaImage> {
     let part_names = parse_parts(folder)?;
 
     // Parse sfdisk data
-    let sfdisk_entries = parse_sfdisk(folder, &disk_name)?;
+    let sfdisk_result = parse_sfdisk(folder, &disk_name)?;
+    let is_gpt = sfdisk_result.label == PartitionTableLabel::Gpt;
 
     // Parse dev-fs.list
     let fs_map = parse_dev_fs_list(folder)?;
@@ -118,6 +137,20 @@ pub fn load(folder: &Path) -> Result<ClonezillaImage> {
         Vec::new()
     };
 
+    // Read GPT sector files if they exist
+    let gpt_1st_path = folder.join(format!("{disk_name}-gpt-1st"));
+    let gpt_primary_raw = if gpt_1st_path.exists() {
+        Some(std::fs::read(&gpt_1st_path).context("failed to read GPT primary sectors")?)
+    } else {
+        None
+    };
+    let gpt_2nd_path = folder.join(format!("{disk_name}-gpt-2nd"));
+    let gpt_backup_raw = if gpt_2nd_path.exists() {
+        Some(std::fs::read(&gpt_2nd_path).context("failed to read GPT backup sectors")?)
+    } else {
+        None
+    };
+
     // Read EBR files
     let mut ebr_data = HashMap::new();
     for entry in std::fs::read_dir(folder).context("failed to read backup folder")? {
@@ -135,14 +168,14 @@ pub fn load(folder: &Path) -> Result<ClonezillaImage> {
     let mut partitions = Vec::new();
     let mut source_size_bytes: u64 = 0;
 
-    for sf_entry in &sfdisk_entries {
+    for sf_entry in &sfdisk_result.entries {
         let end_bytes = (sf_entry.start + sf_entry.size) * 512;
         if end_bytes > source_size_bytes {
             source_size_bytes = end_bytes;
         }
 
-        let is_extended = matches!(sf_entry.ptype, 0x05 | 0x0F | 0x85);
-        let is_logical = sf_entry.index >= 4;
+        let is_extended = !is_gpt && matches!(sf_entry.ptype, 0x05 | 0x0F | 0x85);
+        let is_logical = !is_gpt && sf_entry.index >= 4;
         let has_data = part_names.contains(&sf_entry.device_name);
 
         // Map device name to filesystem type
@@ -169,6 +202,9 @@ pub fn load(folder: &Path) -> Result<ClonezillaImage> {
             is_logical,
             bootable: sf_entry.bootable,
             partclone_files,
+            type_guid: sf_entry.type_guid.clone(),
+            unique_guid: sf_entry.unique_guid.clone(),
+            partition_name: sf_entry.partition_name.clone(),
         });
     }
 
@@ -183,6 +219,12 @@ pub fn load(folder: &Path) -> Result<ClonezillaImage> {
         partitions,
         source_size_bytes,
         image_info,
+        is_gpt,
+        gpt_primary_raw,
+        gpt_backup_raw,
+        gpt_disk_guid: sfdisk_result.disk_guid,
+        gpt_first_lba: sfdisk_result.first_lba,
+        gpt_last_lba: sfdisk_result.last_lba,
     })
 }
 
@@ -212,19 +254,70 @@ struct SfdiskEntry {
     size: u64,
     ptype: u8,
     bootable: bool,
+    /// GPT partition type GUID string
+    type_guid: Option<String>,
+    /// GPT partition unique GUID string
+    unique_guid: Option<String>,
+    /// GPT partition name
+    partition_name: Option<String>,
+}
+
+/// Partition table label detected from sfdisk.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PartitionTableLabel {
+    Mbr,
+    Gpt,
+}
+
+/// Result of parsing an sfdisk file.
+struct SfdiskResult {
+    label: PartitionTableLabel,
+    /// For GPT: disk GUID from label-id
+    disk_guid: Option<String>,
+    /// For GPT: first usable LBA
+    first_lba: Option<u64>,
+    /// For GPT: last usable LBA
+    last_lba: Option<u64>,
+    entries: Vec<SfdiskEntry>,
 }
 
 /// Parse the `<disk>-pt.sf` sfdisk file.
-fn parse_sfdisk(folder: &Path, disk_name: &str) -> Result<Vec<SfdiskEntry>> {
+fn parse_sfdisk(folder: &Path, disk_name: &str) -> Result<SfdiskResult> {
     let sf_path = folder.join(format!("{disk_name}-pt.sf"));
     let content = std::fs::read_to_string(&sf_path)
         .with_context(|| format!("failed to read {}", sf_path.display()))?;
 
     let mut entries = Vec::new();
+    let mut label = PartitionTableLabel::Mbr;
+    let mut disk_guid: Option<String> = None;
+    let mut first_lba: Option<u64> = None;
+    let mut last_lba: Option<u64> = None;
 
     for line in content.lines() {
         let line = line.trim();
-        // Lines look like: /dev/sda1 : start=          63, size=     4096512, type=6, bootable
+
+        // Parse header lines
+        if let Some(val) = line.strip_prefix("label:") {
+            let val = val.trim();
+            if val == "gpt" {
+                label = PartitionTableLabel::Gpt;
+            }
+            continue;
+        }
+        if let Some(val) = line.strip_prefix("label-id:") {
+            disk_guid = Some(val.trim().to_string());
+            continue;
+        }
+        if let Some(val) = line.strip_prefix("first-lba:") {
+            first_lba = val.trim().parse().ok();
+            continue;
+        }
+        if let Some(val) = line.strip_prefix("last-lba:") {
+            last_lba = val.trim().parse().ok();
+            continue;
+        }
+
+        // Partition entry lines
         if !line.starts_with("/dev/") || !line.contains("start=") {
             continue;
         }
@@ -247,7 +340,20 @@ fn parse_sfdisk(folder: &Path, disk_name: &str) -> Result<Vec<SfdiskEntry>> {
         let attrs = parts[1];
         let start = parse_sfdisk_value(attrs, "start")?;
         let size = parse_sfdisk_value(attrs, "size")?;
-        let ptype = parse_sfdisk_hex_value(attrs, "type")?;
+
+        let (ptype, type_guid_str, unique_guid_str, name_str) = if label == PartitionTableLabel::Gpt
+        {
+            // GPT: type= is a GUID string, uuid= is unique GUID, name= is partition name
+            let tg = parse_sfdisk_string_value(attrs, "type");
+            let ug = parse_sfdisk_string_value(attrs, "uuid");
+            let nm = parse_sfdisk_quoted_value(attrs, "name");
+            (0u8, tg, ug, nm)
+        } else {
+            // MBR: type= is a hex byte
+            let pt = parse_sfdisk_hex_value(attrs, "type")?;
+            (pt, None, None, None)
+        };
+
         let bootable = attrs.contains("bootable");
 
         entries.push(SfdiskEntry {
@@ -257,6 +363,9 @@ fn parse_sfdisk(folder: &Path, disk_name: &str) -> Result<Vec<SfdiskEntry>> {
             size,
             ptype,
             bootable,
+            type_guid: type_guid_str,
+            unique_guid: unique_guid_str,
+            partition_name: name_str,
         });
     }
 
@@ -264,7 +373,36 @@ fn parse_sfdisk(folder: &Path, disk_name: &str) -> Result<Vec<SfdiskEntry>> {
         bail!("no partition entries found in {}", sf_path.display());
     }
 
-    Ok(entries)
+    Ok(SfdiskResult {
+        label,
+        disk_guid,
+        first_lba,
+        last_lba,
+        entries,
+    })
+}
+
+/// Extract a string value from sfdisk attributes (e.g. "type=EBD0A0A2-...").
+fn parse_sfdisk_string_value(attrs: &str, key: &str) -> Option<String> {
+    for part in attrs.split(',') {
+        let part = part.trim();
+        if let Some(val_str) = part.strip_prefix(&format!("{key}=")) {
+            return Some(val_str.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Extract a quoted string value from sfdisk attributes (e.g. `name="EFI System Partition"`).
+fn parse_sfdisk_quoted_value(attrs: &str, key: &str) -> Option<String> {
+    let pattern = format!("{key}=\"");
+    if let Some(start) = attrs.find(&pattern) {
+        let rest = &attrs[start + pattern.len()..];
+        if let Some(end) = rest.find('"') {
+            return Some(rest[..end].to_string());
+        }
+    }
+    None
 }
 
 /// Extract a numeric value from sfdisk output (e.g. "start=63" from "start=          63, size=...").
@@ -452,5 +590,79 @@ mod tests {
     fn test_is_clonezilla_image() {
         // Non-existent folder
         assert!(!is_clonezilla_image(Path::new("/nonexistent")));
+    }
+
+    #[test]
+    fn test_parse_sfdisk_gpt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sf_content = r#"label: gpt
+label-id: 12345678-1234-1234-1234-123456789ABC
+device: /dev/sda
+unit: sectors
+first-lba: 34
+last-lba: 976773134
+
+/dev/sda1 : start=     2048, size=   532480, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, uuid=AAAA1111-2222-3333-4444-555566667777, name="EFI System Partition"
+/dev/sda2 : start=   534528, size=976236544, type=EBD0A0A2-B9E5-4433-87C0-68B6B72699C7, uuid=BBBB1111-2222-3333-4444-555566667777, name="Basic data partition"
+"#;
+        std::fs::write(tmp.path().join("sda-pt.sf"), sf_content).unwrap();
+        let result = parse_sfdisk(tmp.path(), "sda").unwrap();
+
+        assert_eq!(result.label, PartitionTableLabel::Gpt);
+        assert_eq!(
+            result.disk_guid.as_deref(),
+            Some("12345678-1234-1234-1234-123456789ABC")
+        );
+        assert_eq!(result.first_lba, Some(34));
+        assert_eq!(result.last_lba, Some(976773134));
+        assert_eq!(result.entries.len(), 2);
+
+        let e0 = &result.entries[0];
+        assert_eq!(e0.device_name, "sda1");
+        assert_eq!(e0.start, 2048);
+        assert_eq!(e0.size, 532480);
+        assert_eq!(e0.ptype, 0); // GPT entries have no MBR type byte
+        assert_eq!(
+            e0.type_guid.as_deref(),
+            Some("C12A7328-F81F-11D2-BA4B-00A0C93EC93B")
+        );
+        assert_eq!(
+            e0.unique_guid.as_deref(),
+            Some("AAAA1111-2222-3333-4444-555566667777")
+        );
+        assert_eq!(e0.partition_name.as_deref(), Some("EFI System Partition"));
+
+        let e1 = &result.entries[1];
+        assert_eq!(e1.device_name, "sda2");
+        assert_eq!(e1.start, 534528);
+        assert_eq!(
+            e1.type_guid.as_deref(),
+            Some("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7")
+        );
+        assert_eq!(e1.partition_name.as_deref(), Some("Basic data partition"));
+    }
+
+    #[test]
+    fn test_parse_sfdisk_string_value() {
+        let attrs = "start=2048, size=532480, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, uuid=AAAA";
+        assert_eq!(
+            parse_sfdisk_string_value(attrs, "type"),
+            Some("C12A7328-F81F-11D2-BA4B-00A0C93EC93B".to_string())
+        );
+        assert_eq!(
+            parse_sfdisk_string_value(attrs, "uuid"),
+            Some("AAAA".to_string())
+        );
+        assert_eq!(parse_sfdisk_string_value(attrs, "missing"), None);
+    }
+
+    #[test]
+    fn test_parse_sfdisk_quoted_value() {
+        let attrs = r#"start=2048, size=532480, name="EFI System Partition""#;
+        assert_eq!(
+            parse_sfdisk_quoted_value(attrs, "name"),
+            Some("EFI System Partition".to_string())
+        );
+        assert_eq!(parse_sfdisk_quoted_value(attrs, "missing"), None);
     }
 }

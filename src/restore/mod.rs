@@ -19,6 +19,7 @@ use crate::fs::{
     validate_exfat_integrity, validate_fat_integrity, validate_ntfs_integrity,
 };
 use crate::os::SectorAlignedWriter;
+use crate::partition::gpt::Gpt;
 use crate::partition::mbr::{build_ebr_chain, patch_mbr_entries, LogicalPartitionInfo};
 use crate::partition::PartitionSizeOverride;
 use crate::rbformats::reconstruct_disk_from_backup;
@@ -155,8 +156,22 @@ pub fn calculate_restore_layout(
         .iter()
         .any(|pm| pm.is_logical || pm.index >= 4);
 
+    let is_gpt = metadata.partition_table_type == "GPT";
+
     let mut overrides = Vec::new();
     let mut current_lba = first_partition_lba;
+
+    // GPT: partitions must start at or after LBA 34 (GPT header + entries)
+    if is_gpt && current_lba < 34 {
+        current_lba = 34;
+    }
+
+    // For GPT, reserve 33 sectors at end for backup GPT
+    let usable_target_size = if is_gpt {
+        target_size.saturating_sub(33 * 512)
+    } else {
+        target_size
+    };
 
     // First pass: lay out primary (non-logical) partitions, skip logical ones
     for pm in &metadata.partitions {
@@ -178,7 +193,8 @@ pub fn calculate_restore_layout(
             }
         }
 
-        let partition_size = compute_partition_size(size_choice, pm, current_lba, target_size);
+        let partition_size =
+            compute_partition_size(size_choice, pm, current_lba, usable_target_size);
 
         let new_start_lba = if current_lba != pm.start_lba {
             Some(current_lba)
@@ -240,7 +256,8 @@ pub fn calculate_restore_layout(
                 }
             }
 
-            let partition_size = compute_partition_size(size_choice, pm, current_lba, target_size);
+            let partition_size =
+                compute_partition_size(size_choice, pm, current_lba, usable_target_size);
 
             let new_start_lba = if current_lba != pm.start_lba {
                 Some(current_lba)
@@ -285,16 +302,16 @@ pub fn calculate_restore_layout(
         }
     }
 
-    // Validate: no partition extends past target
-    let target_sectors = target_size / 512;
+    // Validate: no partition extends past usable area
+    let usable_sectors = usable_target_size / 512;
     for ov in &overrides {
         let end_lba = ov.effective_start_lba() + ov.export_size / 512;
-        if end_lba > target_sectors {
+        if end_lba > usable_sectors {
             bail!(
-                "Partition {} would end at LBA {} which exceeds target size ({} sectors)",
+                "Partition {} would end at LBA {} which exceeds usable area ({} sectors)",
                 ov.index,
                 end_lba,
-                target_sectors,
+                usable_sectors,
             );
         }
     }
@@ -455,8 +472,10 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
         bail!("restore cancelled");
     }
 
-    // Step 3: Read MBR from backup
-    set_operation(&progress, "Reading MBR...");
+    // Step 3: Read MBR and GPT from backup
+    set_operation(&progress, "Reading partition table...");
+    let is_gpt = metadata.partition_table_type == "GPT";
+
     let mbr_path = config.backup_folder.join("mbr.bin");
     let mbr_bytes = if mbr_path.exists() {
         let data = fs::read(&mbr_path).context("failed to read mbr.bin")?;
@@ -464,6 +483,31 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
         let copy_len = data.len().min(512);
         buf[..copy_len].copy_from_slice(&data[..copy_len]);
         Some(buf)
+    } else {
+        None
+    };
+
+    // Load GPT data if this is a GPT backup
+    let gpt_data: Option<Gpt> = if is_gpt {
+        let gpt_json_path = config.backup_folder.join("gpt.json");
+        if gpt_json_path.exists() {
+            let gpt_file = File::open(&gpt_json_path)
+                .with_context(|| format!("failed to open {}", gpt_json_path.display()))?;
+            let gpt: Gpt = serde_json::from_reader(gpt_file).context("failed to parse gpt.json")?;
+            log(
+                &progress,
+                LogLevel::Info,
+                format!("Loaded GPT: {} partition entries", gpt.entries.len()),
+            );
+            Some(gpt)
+        } else {
+            log(
+                &progress,
+                LogLevel::Warning,
+                "GPT backup has no gpt.json — GPT structures will not be written",
+            );
+            None
+        }
     } else {
         None
     };
@@ -556,11 +600,12 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
     }
 
     // Step 6b: Clear any residual GPT structures from the target disk.
-    // If the disk was previously GPT-partitioned, the old GPT headers would
-    // otherwise survive and confuse firmware/OSes into ignoring our new MBR.
-    clear_gpt_structures(&mut target, config.target_size, &mut |msg| {
-        log(&progress, LogLevel::Info, msg);
-    })?;
+    // Only needed for MBR restores — GPT restores will overwrite these areas.
+    if !is_gpt {
+        clear_gpt_structures(&mut target, config.target_size, &mut |msg| {
+            log(&progress, LogLevel::Info, msg);
+        })?;
+    }
 
     // Step 7: Reconstruct disk (write all data)
     set_operation(&progress, "Writing disk image...");
@@ -576,6 +621,7 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
         &mut target,
         config.target_is_device,
         config.write_zeros_to_unused,
+        gpt_data.as_ref(),
         &mut |bytes| {
             set_progress_bytes(&progress_clone, bytes, data_extent);
         },
@@ -740,6 +786,18 @@ pub fn calculate_clonezilla_restore_layout(
     let mut overrides = Vec::new();
     let mut current_lba = first_partition_lba;
 
+    // GPT: partitions must start at or after LBA 34
+    if cz_image.is_gpt && current_lba < 34 {
+        current_lba = 34;
+    }
+
+    // For GPT, reserve 33 sectors at end for backup GPT
+    let usable_target_size = if cz_image.is_gpt {
+        target_size.saturating_sub(33 * 512)
+    } else {
+        target_size
+    };
+
     // Sort partitions by start LBA for layout calculation
     let mut sorted_parts: Vec<&clonezilla::metadata::ClonezillaPartition> = cz_image
         .partitions
@@ -772,8 +830,8 @@ pub fn calculate_clonezilla_restore_layout(
             RestoreSizeChoice::Custom(bytes) => (bytes + 511) & !511,
             RestoreSizeChoice::FillRemaining => {
                 let used_bytes = current_lba * 512;
-                if target_size > used_bytes {
-                    target_size - used_bytes
+                if usable_target_size > used_bytes {
+                    usable_target_size - used_bytes
                 } else {
                     cz_part.size_bytes()
                 }
@@ -799,16 +857,16 @@ pub fn calculate_clonezilla_restore_layout(
         current_lba += partition_size / 512;
     }
 
-    // Validate: no partition extends past target
-    let target_sectors = target_size / 512;
+    // Validate: no partition extends past usable area
+    let usable_sectors = usable_target_size / 512;
     for ov in &overrides {
         let end_lba = ov.effective_start_lba() + ov.export_size / 512;
-        if end_lba > target_sectors {
+        if end_lba > usable_sectors {
             bail!(
-                "Partition {} would end at LBA {} which exceeds target size ({} sectors)",
+                "Partition {} would end at LBA {} which exceeds usable area ({} sectors)",
                 ov.index,
                 end_lba,
-                target_sectors,
+                usable_sectors,
             );
         }
     }
@@ -959,10 +1017,47 @@ fn run_clonezilla_restore(
         bail!("restore cancelled");
     }
 
-    // Clear any residual GPT structures from the target disk
-    clear_gpt_structures(&mut target, config.target_size, &mut |msg| {
-        log(&progress, LogLevel::Info, msg);
-    })?;
+    // Parse GPT from raw sectors if this is a GPT image
+    let gpt_data: Option<Gpt> = if cz_image.is_gpt {
+        if let Some(ref raw) = cz_image.gpt_primary_raw {
+            // gpt_primary_raw contains LBAs 0-33 (or just 1-33); parse GPT from it
+            let mut cursor = std::io::Cursor::new(raw);
+            match Gpt::parse(&mut cursor) {
+                Ok(gpt) => {
+                    log(
+                        &progress,
+                        LogLevel::Info,
+                        format!("Parsed GPT from raw sectors: {} entries", gpt.entries.len()),
+                    );
+                    Some(gpt)
+                }
+                Err(e) => {
+                    log(
+                        &progress,
+                        LogLevel::Warning,
+                        format!("Failed to parse GPT from raw sectors: {e}"),
+                    );
+                    None
+                }
+            }
+        } else {
+            log(
+                &progress,
+                LogLevel::Warning,
+                "GPT image has no raw GPT sectors — GPT structures will not be written",
+            );
+            None
+        }
+    } else {
+        None
+    };
+
+    // Clear any residual GPT structures from the target disk (MBR restores only)
+    if !cz_image.is_gpt {
+        clear_gpt_structures(&mut target, config.target_size, &mut |msg| {
+            log(&progress, LogLevel::Info, msg);
+        })?;
+    }
 
     // Write disk image
     set_operation(&progress, "Writing disk image...");
@@ -972,6 +1067,8 @@ fn run_clonezilla_restore(
         &mut target,
         config.target_is_device,
         config.write_zeros_to_unused,
+        gpt_data.as_ref(),
+        config.target_size,
         &progress,
     )?;
 
@@ -1106,19 +1203,22 @@ fn run_clonezilla_restore(
     Ok(())
 }
 
-/// Write a Clonezilla disk image: MBR, hidden data, EBR, and partition data.
+/// Write a Clonezilla disk image: MBR/GPT, hidden data, EBR, and partition data.
 fn write_clonezilla_disk(
     cz_image: &ClonezillaImage,
     overrides: &[PartitionSizeOverride],
     writer: &mut (impl Read + Write + Seek),
     is_device: bool,
     fill_unused_with_zeros: bool,
+    gpt: Option<&Gpt>,
+    disk_target_size: u64,
     progress: &Arc<Mutex<RestoreProgress>>,
 ) -> Result<u64> {
     use std::io;
 
     let mut total_written: u64 = 0;
     let target_size = progress.lock().map(|p| p.total_bytes).unwrap_or(0);
+    let target_sectors = disk_target_size / 512;
 
     let get_export_size = |index: usize, default: u64| -> u64 {
         overrides
@@ -1128,17 +1228,48 @@ fn write_clonezilla_disk(
             .unwrap_or(default)
     };
 
-    // Write MBR
-    let mut mbr_buf = cz_image.mbr_bytes;
-    if !overrides.is_empty() {
-        patch_mbr_entries(&mut mbr_buf, overrides);
-        log(progress, LogLevel::Info, "Patched MBR partition table");
-    }
-    writer.write_all(&mbr_buf).context("failed to write MBR")?;
-    total_written += 512;
+    if let Some(gpt_data) = gpt {
+        // GPT restore: write protective MBR + primary GPT (LBAs 0-33)
+        let patched_gpt = gpt_data.patch_for_restore(overrides, target_sectors);
 
-    // Write hidden data after MBR
-    if !cz_image.hidden_data_after_mbr.is_empty() {
+        let protective_mbr = Gpt::build_protective_mbr(target_sectors);
+        writer
+            .write_all(&protective_mbr)
+            .context("failed to write protective MBR")?;
+        total_written += 512;
+        log(
+            progress,
+            LogLevel::Info,
+            "Wrote protective MBR for GPT disk",
+        );
+
+        let primary_gpt = patched_gpt.build_primary_gpt(target_sectors);
+        writer
+            .write_all(&primary_gpt)
+            .context("failed to write primary GPT")?;
+        total_written += primary_gpt.len() as u64;
+        log(
+            progress,
+            LogLevel::Info,
+            format!(
+                "Wrote primary GPT ({} bytes, {} entries)",
+                primary_gpt.len(),
+                patched_gpt.entries.len()
+            ),
+        );
+    } else {
+        // MBR restore
+        let mut mbr_buf = cz_image.mbr_bytes;
+        if !overrides.is_empty() {
+            patch_mbr_entries(&mut mbr_buf, overrides);
+            log(progress, LogLevel::Info, "Patched MBR partition table");
+        }
+        writer.write_all(&mbr_buf).context("failed to write MBR")?;
+        total_written += 512;
+    }
+
+    // Write hidden data after MBR (MBR restores only — GPT primary occupies LBAs 1-33)
+    if gpt.is_none() && !cz_image.hidden_data_after_mbr.is_empty() {
         writer
             .write_all(&cz_image.hidden_data_after_mbr)
             .context("failed to write hidden data after MBR")?;
@@ -1293,6 +1424,26 @@ fn write_clonezilla_disk(
             format!(
                 "partition-{}: wrote {} bytes (export size: {})",
                 cz_part.index, part_written, export_size,
+            ),
+        );
+    }
+
+    // Write backup GPT at end of disk for GPT restores
+    if let Some(gpt_data) = gpt {
+        let patched_gpt = gpt_data.patch_for_restore(overrides, target_sectors);
+        let backup_gpt = patched_gpt.build_backup_gpt(target_sectors);
+        let backup_offset = (target_sectors - 33) * 512;
+        writer.seek(SeekFrom::Start(backup_offset))?;
+        writer
+            .write_all(&backup_gpt)
+            .context("failed to write backup GPT")?;
+        log(
+            progress,
+            LogLevel::Info,
+            format!(
+                "Wrote backup GPT at LBA {} ({} bytes)",
+                target_sectors - 33,
+                backup_gpt.len()
             ),
         );
     }
