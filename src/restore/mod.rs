@@ -555,6 +555,13 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
         bail!("restore cancelled");
     }
 
+    // Step 6b: Clear any residual GPT structures from the target disk.
+    // If the disk was previously GPT-partitioned, the old GPT headers would
+    // otherwise survive and confuse firmware/OSes into ignoring our new MBR.
+    clear_gpt_structures(&mut target, config.target_size, &mut |msg| {
+        log(&progress, LogLevel::Info, msg);
+    })?;
+
     // Step 7: Reconstruct disk (write all data)
     set_operation(&progress, "Writing disk image...");
     let progress_clone = Arc::clone(&progress);
@@ -952,6 +959,11 @@ fn run_clonezilla_restore(
         bail!("restore cancelled");
     }
 
+    // Clear any residual GPT structures from the target disk
+    clear_gpt_structures(&mut target, config.target_size, &mut |msg| {
+        log(&progress, LogLevel::Info, msg);
+    })?;
+
     // Write disk image
     set_operation(&progress, "Writing disk image...");
     let total_written = write_clonezilla_disk(
@@ -1316,6 +1328,60 @@ fn fill_gap(
     } else {
         writer.seek(SeekFrom::Current(gap as i64))?;
     }
+    Ok(())
+}
+
+/// Clear any residual GPT structures from a disk so that an MBR restore is
+/// not confused by leftover GPT headers.
+///
+/// GPT stores a primary header at LBA 1 and a backup header at the last LBA.
+/// Both contain the signature "EFI PART" which firmware and OSes use to detect
+/// GPT.  If a disk was previously partitioned with GPT and we are now writing
+/// an MBR-based image, we must destroy both headers to prevent the old GPT
+/// from taking precedence over the new MBR.
+fn clear_gpt_structures(
+    writer: &mut (impl Write + Seek),
+    target_size: u64,
+    log_cb: &mut impl FnMut(&str),
+) -> Result<()> {
+    // Unconditionally zero GPT areas. We are about to write an MBR-based image
+    // so any pre-existing GPT must be destroyed. The cost is negligible: 34
+    // sectors at the start plus 33 at the end.
+    //
+    // Note: we do NOT try to detect GPT first via read because macOS raw
+    // devices (/dev/rdiskN) require sector-aligned I/O, and reading here would
+    // add complexity for no real benefit.
+    log_cb("Clearing any existing GPT structures on target...");
+
+    let zeros = [0u8; 512];
+
+    // Zero LBAs 1-33: primary GPT header (LBA 1) + partition entries (LBAs 2-33)
+    for lba in 1..34u64 {
+        writer.seek(SeekFrom::Start(lba * 512))?;
+        writer
+            .write_all(&zeros)
+            .context("failed to clear primary GPT area")?;
+    }
+
+    // Zero backup GPT at the end of the disk: partition entries (32 sectors)
+    // followed by the backup header (last sector)
+    if target_size >= 34 * 512 {
+        let last_lba = target_size / 512 - 1;
+        // Backup partition entries occupy 32 sectors before the backup header
+        let backup_entries_start_lba = last_lba - 32;
+        for lba in backup_entries_start_lba..=last_lba {
+            writer.seek(SeekFrom::Start(lba * 512))?;
+            writer
+                .write_all(&zeros)
+                .context("failed to clear backup GPT area")?;
+        }
+    }
+
+    writer.flush()?;
+    log_cb("Cleared GPT structures");
+
+    // Seek back to start for subsequent operations
+    writer.seek(SeekFrom::Start(0))?;
     Ok(())
 }
 
