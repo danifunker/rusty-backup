@@ -251,6 +251,14 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 );
             }
         }
+        PartitionTable::Apm(apm) => {
+            format::export_apm(apm, &backup_folder)?;
+            log(
+                &progress,
+                LogLevel::Info,
+                "Exported APM (apm.json + apm.bin)",
+            );
+        }
     }
 
     if is_cancelled(&progress) {
@@ -641,6 +649,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             resized: false,
             compacted: is_compacted,
             is_logical: part.is_logical,
+            partition_type_string: part.partition_type_string.clone(),
         });
     }
 

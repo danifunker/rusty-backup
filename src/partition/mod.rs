@@ -1,3 +1,4 @@
+pub mod apm;
 pub mod gpt;
 pub mod mbr;
 
@@ -5,6 +6,7 @@ use serde::Serialize;
 use std::io::{Read, Seek, SeekFrom};
 
 use crate::error::RustyBackupError;
+use apm::Apm;
 use gpt::Gpt;
 use mbr::Mbr;
 
@@ -13,6 +15,7 @@ use mbr::Mbr;
 pub enum PartitionTable {
     Mbr(Mbr),
     Gpt { protective_mbr: Mbr, gpt: Gpt },
+    Apm(Apm),
 }
 
 /// Detected partition alignment pattern.
@@ -63,12 +66,14 @@ pub struct PartitionInfo {
     pub is_logical: bool,
     /// True for the extended container entry itself (not backed up individually).
     pub is_extended_container: bool,
+    /// APM partition type string (e.g. "Apple_HFS"). None for MBR/GPT.
+    pub partition_type_string: Option<String>,
 }
 
 impl PartitionTable {
     /// Detect and parse the partition table from a readable+seekable source.
     pub fn detect(reader: &mut (impl Read + Seek)) -> Result<Self, RustyBackupError> {
-        // Read first 512 bytes (MBR / protective MBR)
+        // Read first 512 bytes (MBR / protective MBR / DDR)
         reader
             .seek(SeekFrom::Start(0))
             .map_err(RustyBackupError::Io)?;
@@ -76,6 +81,17 @@ impl PartitionTable {
         reader
             .read_exact(&mut mbr_data)
             .map_err(|e| RustyBackupError::InvalidMbr(format!("cannot read first sector: {e}")))?;
+
+        // Check for APM (Driver Descriptor Record signature 0x4552 at offset 0)
+        let ddr_sig = u16::from_be_bytes([mbr_data[0], mbr_data[1]]);
+        if ddr_sig == 0x4552 {
+            reader.seek(SeekFrom::Start(0)).map_err(RustyBackupError::Io)?;
+            if let Ok(apm) = Apm::parse(reader) {
+                return Ok(PartitionTable::Apm(apm));
+            }
+            // Fall through to MBR/GPT parsing on failure
+            reader.seek(SeekFrom::Start(0)).map_err(RustyBackupError::Io)?;
+        }
 
         let mut mbr = Mbr::parse(&mbr_data)?;
 
@@ -128,6 +144,7 @@ impl PartitionTable {
                         bootable: e.bootable,
                         is_logical: false,
                         is_extended_container: e.is_extended(),
+                        partition_type_string: None,
                     })
                     .collect();
 
@@ -142,6 +159,7 @@ impl PartitionTable {
                         bootable: e.bootable,
                         is_logical: true,
                         is_extended_container: false,
+                        partition_type_string: None,
                     });
                 }
 
@@ -160,8 +178,28 @@ impl PartitionTable {
                     bootable: false,
                     is_logical: false,
                     is_extended_container: false,
+                    partition_type_string: None,
                 })
                 .collect(),
+            PartitionTable::Apm(apm) => {
+                let block_size = apm.ddr.block_size;
+                apm.entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| e.is_data_partition())
+                    .map(|(i, e)| PartitionInfo {
+                        index: i,
+                        type_name: format!("{} ({})", e.partition_type, e.name),
+                        partition_type_byte: 0,
+                        start_lba: e.start_block as u64 * block_size as u64 / 512,
+                        size_bytes: e.size_bytes(block_size),
+                        bootable: e.is_bootable(),
+                        is_logical: false,
+                        is_extended_container: false,
+                        partition_type_string: Some(e.partition_type.clone()),
+                    })
+                    .collect()
+            }
         }
     }
 
@@ -170,14 +208,17 @@ impl PartitionTable {
         match self {
             PartitionTable::Mbr(_) => "MBR",
             PartitionTable::Gpt { .. } => "GPT",
+            PartitionTable::Apm(_) => "APM",
         }
     }
 
     /// Get the MBR disk signature (available for both MBR and GPT via protective MBR).
+    /// APM has no disk signature, returns 0.
     pub fn disk_signature(&self) -> u32 {
         match self {
             PartitionTable::Mbr(mbr) => mbr.disk_signature,
             PartitionTable::Gpt { protective_mbr, .. } => protective_mbr.disk_signature,
+            PartitionTable::Apm(_) => 0,
         }
     }
 }
@@ -198,10 +239,11 @@ pub fn detect_alignment(table: &PartitionTable) -> PartitionAlignment {
 
     let first_lba = partitions[0].start_lba;
 
-    // Extract CHS geometry from MBR if available
+    // Extract CHS geometry from MBR if available (APM has no CHS)
     let (heads, sectors_per_track) = match table {
         PartitionTable::Mbr(mbr) => extract_chs_geometry(mbr),
         PartitionTable::Gpt { protective_mbr, .. } => extract_chs_geometry(protective_mbr),
+        PartitionTable::Apm(_) => (0, 0),
     };
 
     // Check for DOS traditional alignment: first partition at LBA 63

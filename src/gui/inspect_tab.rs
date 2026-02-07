@@ -1150,6 +1150,7 @@ impl InspectTab {
                     bootable: false,
                     is_logical: p.index >= 4,
                     is_extended_container: false,
+                    partition_type_string: p.partition_type_string.clone(),
                 })
                 .collect();
         }
@@ -1185,6 +1186,7 @@ impl InspectTab {
                     bootable: false,
                     is_logical: true,
                     is_extended_container: false,
+                    partition_type_string: pm.partition_type_string.clone(),
                 });
                 added += 1;
             }
@@ -1349,6 +1351,7 @@ impl InspectTab {
                         bootable: p.bootable,
                         is_logical: p.is_logical,
                         is_extended_container: p.is_extended,
+                        partition_type_string: None,
                     })
                     .collect();
 

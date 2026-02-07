@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use chrono::Local;
 
+use crate::partition::apm::Apm;
 use crate::partition::gpt::Gpt;
 use crate::partition::mbr::Mbr;
 
@@ -166,6 +167,23 @@ pub fn export_gpt_bin(
 
     let bin_path = folder.join("gpt.bin");
     fs::write(&bin_path, &buf)
+        .with_context(|| format!("failed to write {}", bin_path.display()))?;
+
+    Ok(())
+}
+
+/// Export an APM to `apm.json` (structured) and `apm.bin` (raw DDR + map entries).
+pub fn export_apm(apm: &Apm, folder: &Path) -> Result<()> {
+    // Write structured JSON
+    let json_path = folder.join("apm.json");
+    let json = serde_json::to_string_pretty(apm).context("failed to serialize APM to JSON")?;
+    fs::write(&json_path, json)
+        .with_context(|| format!("failed to write {}", json_path.display()))?;
+
+    // Write raw APM blocks (DDR + partition map entries)
+    let bin_path = folder.join("apm.bin");
+    let raw = apm.build_apm_blocks(None);
+    fs::write(&bin_path, raw)
         .with_context(|| format!("failed to write {}", bin_path.display()))?;
 
     Ok(())

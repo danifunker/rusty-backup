@@ -2,6 +2,8 @@ pub mod entry;
 pub mod exfat;
 pub mod fat;
 pub mod filesystem;
+pub mod hfs;
+pub mod hfsplus;
 pub mod ntfs;
 
 use std::io::{Read, Seek, SeekFrom};
@@ -12,6 +14,13 @@ pub use exfat::{
 pub use fat::{
     patch_bpb_hidden_sectors, resize_fat_in_place, set_fat_clean_flags, validate_fat_integrity,
     CompactFatReader, CompactInfo,
+};
+pub use hfs::{
+    patch_hfs_hidden_sectors, resize_hfs_in_place, validate_hfs_integrity, CompactHfsReader,
+};
+pub use hfsplus::{
+    patch_hfsplus_hidden_sectors, resize_hfsplus_in_place, validate_hfsplus_integrity,
+    CompactHfsPlusReader,
 };
 use filesystem::{Filesystem, FilesystemError};
 pub use ntfs::{

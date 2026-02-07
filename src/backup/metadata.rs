@@ -49,6 +49,9 @@ pub struct PartitionMetadata {
     /// True for logical partitions inside an extended container (MBR only).
     #[serde(default)]
     pub is_logical: bool,
+    /// APM partition type string (e.g. "Apple_HFS"). None for MBR/GPT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_type_string: Option<String>,
 }
 
 /// Partition alignment information for the backup.
@@ -119,6 +122,7 @@ mod tests {
                 resized: false,
                 compacted: false,
                 is_logical: false,
+                partition_type_string: None,
             }],
             bad_sectors: vec![],
             extended_container: None,

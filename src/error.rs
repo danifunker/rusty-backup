@@ -11,6 +11,9 @@ pub enum RustyBackupError {
     #[error("Invalid GPT: {0}")]
     InvalidGpt(String),
 
+    #[error("Invalid APM: {0}")]
+    InvalidApm(String),
+
     #[error("Device is currently mounted: {0}")]
     DeviceMounted(String),
 
