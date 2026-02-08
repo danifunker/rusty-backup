@@ -97,20 +97,20 @@ impl HfsMasterDirectoryBlock {
         let name_bytes = &data[37..37 + name_len.min(27)];
         let volume_name = mac_roman_to_utf8(name_bytes);
 
-        let mut catalog_extents = [HfsExtDescriptor {
-            start_block: 0,
-            block_count: 0,
-        }; 3];
-        for i in 0..3 {
-            catalog_extents[i] = HfsExtDescriptor::parse(&data[70 + i * 4..74 + i * 4]);
-        }
-
         let mut extents_extents = [HfsExtDescriptor {
             start_block: 0,
             block_count: 0,
         }; 3];
         for i in 0..3 {
-            extents_extents[i] = HfsExtDescriptor::parse(&data[82 + i * 4..86 + i * 4]);
+            extents_extents[i] = HfsExtDescriptor::parse(&data[134 + i * 4..138 + i * 4]);
+        }
+
+        let mut catalog_extents = [HfsExtDescriptor {
+            start_block: 0,
+            block_count: 0,
+        }; 3];
+        for i in 0..3 {
+            catalog_extents[i] = HfsExtDescriptor::parse(&data[150 + i * 4..154 + i * 4]);
         }
 
         // Embedded HFS+ info at offsets 124-130
@@ -128,10 +128,10 @@ impl HfsMasterDirectoryBlock {
             volume_name,
             volume_bitmap_block: BigEndian::read_u16(&data[14..16]),
             first_alloc_block: BigEndian::read_u16(&data[28..30]),
-            catalog_file_size: BigEndian::read_u32(&data[66..70]),
-            catalog_file_extents: catalog_extents,
-            extents_file_size: BigEndian::read_u32(&data[78..82]),
+            extents_file_size: BigEndian::read_u32(&data[130..134]),
             extents_file_extents: extents_extents,
+            catalog_file_size: BigEndian::read_u32(&data[146..150]),
+            catalog_file_extents: catalog_extents,
             embedded_signature: embedded_sig,
             embedded_start_block: embedded_start,
             embedded_block_count: embedded_count,
@@ -208,15 +208,19 @@ impl<R: Read + Seek> HfsFilesystem<R> {
 
     /// List all catalog records with a given parent_id.
     fn list_children(&self, parent_id: u32) -> Result<Vec<CatalogRecord>, FilesystemError> {
-        let node_size = 512u32; // Classic HFS always uses 512-byte catalog nodes
-        if self.catalog_data.len() < node_size as usize {
+        if self.catalog_data.len() < 512 {
             return Ok(vec![]);
         }
 
         // Read B-tree header from node 0
+        // Node descriptor: 14 bytes, then BTHeaderRec starts
+        // BTHeaderRec: treeDepth(2) + rootNode(4) + leafRecords(4) + firstLeafNode(4) + ...
+        let node_size = BigEndian::read_u16(&self.catalog_data[32..34]) as u32;
+        if node_size == 0 || self.catalog_data.len() < node_size as usize {
+            return Ok(vec![]);
+        }
         let header_node = &self.catalog_data[0..node_size as usize];
-        // Node descriptor: 14 bytes, then header record starts
-        let first_leaf = BigEndian::read_u32(&header_node[14 + 6..14 + 10]);
+        let first_leaf = BigEndian::read_u32(&header_node[24..28]);
 
         let mut results = Vec::new();
         let mut node_idx = first_leaf;
