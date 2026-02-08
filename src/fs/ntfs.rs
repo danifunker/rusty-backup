@@ -835,6 +835,8 @@ impl<R: Read + Seek + Send> Filesystem for NtfsFilesystem<R> {
             size: 0,
             location: MFT_RECORD_ROOT,
             modified: None,
+            type_code: None,
+            creator_code: None,
         })
     }
 

@@ -9,6 +9,10 @@ pub struct FileEntry {
     pub location: u64,
     /// Human-readable modification date string.
     pub modified: Option<String>,
+    /// HFS/HFS+ file type code (e.g. "TEXT", "PICT"). Four ASCII characters.
+    pub type_code: Option<String>,
+    /// HFS/HFS+ creator code (e.g. "MSWD", "ttxt"). Four ASCII characters.
+    pub creator_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -26,6 +30,8 @@ impl FileEntry {
             size: 0,
             location: 0,
             modified: None,
+            type_code: None,
+            creator_code: None,
         }
     }
 
@@ -37,6 +43,8 @@ impl FileEntry {
             size: 0,
             location,
             modified: None,
+            type_code: None,
+            creator_code: None,
         }
     }
 
@@ -48,6 +56,8 @@ impl FileEntry {
             size,
             location,
             modified: None,
+            type_code: None,
+            creator_code: None,
         }
     }
 

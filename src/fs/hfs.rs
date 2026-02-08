@@ -148,6 +148,20 @@ impl HfsMasterDirectoryBlock {
 const CATALOG_DIR: i8 = 1;
 const CATALOG_FILE: i8 = 2;
 
+/// Decode a 4-byte Mac OS type/creator code to a string.
+/// Non-printable bytes are replaced with '.'.
+fn decode_fourcc(data: &[u8]) -> String {
+    data.iter()
+        .map(|&b| {
+            if b.is_ascii_graphic() || b == b' ' {
+                b as char
+            } else {
+                '.'
+            }
+        })
+        .collect()
+}
+
 /// A parsed HFS catalog record.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -163,6 +177,8 @@ enum CatalogRecord {
         parent_id: u32,
         data_size: u32,
         data_extents: [HfsExtDescriptor; 3],
+        type_code: String,
+        creator_code: String,
     },
 }
 
@@ -296,15 +312,19 @@ impl<R: Read + Seek> HfsFilesystem<R> {
                             continue;
                         }
                         let rec = &node[rec_data_offset..];
-                        let file_id = BigEndian::read_u32(&rec[6..10]);
-                        // Data fork: logical size at offset 54, first 3 extents at 58
-                        let data_size = BigEndian::read_u32(&rec[54..58]);
+                        // Finder Info (FInfo) at offset 4: fdType(4) + fdCreator(4)
+                        let type_code = decode_fourcc(&rec[4..8]);
+                        let creator_code = decode_fourcc(&rec[8..12]);
+                        // File ID (filFlNum) at offset 20
+                        let file_id = BigEndian::read_u32(&rec[20..24]);
+                        // Data fork: logical size at offset 26, first 3 extents at 74
+                        let data_size = BigEndian::read_u32(&rec[26..30]);
                         let mut data_extents = [HfsExtDescriptor {
                             start_block: 0,
                             block_count: 0,
                         }; 3];
                         for j in 0..3 {
-                            data_extents[j] = HfsExtDescriptor::parse(&rec[58 + j * 4..62 + j * 4]);
+                            data_extents[j] = HfsExtDescriptor::parse(&rec[74 + j * 4..78 + j * 4]);
                         }
                         results.push(CatalogRecord::File {
                             file_id,
@@ -312,6 +332,8 @@ impl<R: Read + Seek> HfsFilesystem<R> {
                             parent_id: rec_parent_id,
                             data_size,
                             data_extents,
+                            type_code,
+                            creator_code,
                         });
                     }
                     _ => {}
@@ -322,6 +344,77 @@ impl<R: Read + Seek> HfsFilesystem<R> {
         }
 
         Ok(results)
+    }
+
+    /// Find a file record by its file_id (CNID) in the catalog B-tree.
+    fn find_file_by_id(&self, file_id: u32) -> Option<(u32, [HfsExtDescriptor; 3])> {
+        if self.catalog_data.len() < 512 {
+            return None;
+        }
+        let node_size = BigEndian::read_u16(&self.catalog_data[32..34]) as u32;
+        if node_size == 0 || self.catalog_data.len() < node_size as usize {
+            return None;
+        }
+        let header_node = &self.catalog_data[0..node_size as usize];
+        let first_leaf = BigEndian::read_u32(&header_node[24..28]);
+
+        let mut node_idx = first_leaf;
+        while node_idx != 0 {
+            let offset = node_idx as usize * node_size as usize;
+            if offset + node_size as usize > self.catalog_data.len() {
+                break;
+            }
+            let node = &self.catalog_data[offset..offset + node_size as usize];
+            let next_node = BigEndian::read_u32(&node[0..4]);
+            let num_records = BigEndian::read_u16(&node[10..12]);
+
+            for i in 0..num_records as usize {
+                let offset_pos = node_size as usize - 2 * (i + 1);
+                if offset_pos + 2 > node.len() {
+                    break;
+                }
+                let rec_offset = BigEndian::read_u16(&node[offset_pos..offset_pos + 2]) as usize;
+                if rec_offset + 6 > node.len() {
+                    continue;
+                }
+                let key_len = node[rec_offset] as usize;
+                if key_len < 6 || rec_offset + 1 + key_len > node.len() {
+                    continue;
+                }
+                let mut rec_data_offset = rec_offset + 1 + key_len;
+                if rec_data_offset % 2 != 0 {
+                    rec_data_offset += 1;
+                }
+                if rec_data_offset + 2 > node.len() {
+                    continue;
+                }
+                let record_type = node[rec_data_offset] as i8;
+                if record_type != CATALOG_FILE {
+                    continue;
+                }
+                if rec_data_offset + 102 > node.len() {
+                    continue;
+                }
+                let rec = &node[rec_data_offset..];
+                // File ID (filFlNum) at offset 20
+                let rec_file_id = BigEndian::read_u32(&rec[20..24]);
+                if rec_file_id != file_id {
+                    continue;
+                }
+                // Data fork: logical size at offset 26, extents at 74
+                let data_size = BigEndian::read_u32(&rec[26..30]);
+                let mut data_extents = [HfsExtDescriptor {
+                    start_block: 0,
+                    block_count: 0,
+                }; 3];
+                for j in 0..3 {
+                    data_extents[j] = HfsExtDescriptor::parse(&rec[74 + j * 4..78 + j * 4]);
+                }
+                return Some((data_size, data_extents));
+            }
+            node_idx = next_node;
+        }
+        None
     }
 
     /// Read the volume bitmap and return it.
@@ -349,6 +442,8 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
             size: 0,
             location: 2, // HFS root directory CNID
             modified: None,
+            type_code: None,
+            creator_code: None,
         })
     }
 
@@ -368,14 +463,22 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
                     entries.push(FileEntry::new_directory(name, path, dir_id as u64));
                 }
                 CatalogRecord::File {
-                    name, data_size, ..
+                    file_id,
+                    name,
+                    data_size,
+                    type_code,
+                    creator_code,
+                    ..
                 } => {
                     let path = if entry.path == "/" {
                         format!("/{name}")
                     } else {
                         format!("{}/{name}", entry.path)
                     };
-                    entries.push(FileEntry::new_file(name, path, data_size as u64, 0));
+                    let mut fe = FileEntry::new_file(name, path, data_size as u64, file_id as u64);
+                    fe.type_code = Some(type_code);
+                    fe.creator_code = Some(creator_code);
+                    entries.push(fe);
                 }
             }
         }
@@ -386,12 +489,23 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
 
     fn read_file(
         &mut self,
-        _entry: &FileEntry,
-        _max_bytes: usize,
+        entry: &FileEntry,
+        max_bytes: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
-        Err(FilesystemError::Unsupported(
-            "HFS file reading not yet implemented".into(),
-        ))
+        let file_id = entry.location as u32;
+        let (data_size, extents) = self
+            .find_file_by_id(file_id)
+            .ok_or_else(|| FilesystemError::NotFound(format!("file id {file_id} not found in catalog")))?;
+
+        let mut data = read_fork_data(
+            &mut self.reader,
+            self.partition_offset,
+            &self.mdb,
+            &extents,
+            data_size as u64,
+        )?;
+        data.truncate(max_bytes);
+        Ok(data)
     }
 
     fn volume_label(&self) -> Option<&str> {

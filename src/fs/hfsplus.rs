@@ -163,6 +163,19 @@ impl BTreeHeaderRecord {
 /// Catalog record types.
 const CATALOG_FOLDER: i16 = 1;
 const CATALOG_FILE: i16 = 2;
+
+/// Decode a 4-byte Mac OS type/creator code to a string.
+fn decode_fourcc(data: &[u8]) -> String {
+    data.iter()
+        .map(|&b| {
+            if b.is_ascii_graphic() || b == b' ' {
+                b as char
+            } else {
+                '.'
+            }
+        })
+        .collect()
+}
 #[allow(dead_code)]
 const CATALOG_FOLDER_THREAD: i16 = 3;
 #[allow(dead_code)]
@@ -176,11 +189,13 @@ enum CatalogEntry {
         name: String,
     },
     File {
-        #[allow(dead_code)]
         file_id: u32,
         name: String,
         data_size: u64,
+        #[allow(dead_code)]
         data_fork: ForkData,
+        type_code: String,
+        creator_code: String,
     },
 }
 
@@ -321,6 +336,9 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
                             continue;
                         }
                         let file_id = BigEndian::read_u32(&rec[8..12]);
+                        // FileInfo (Finder Info) at offset 48: fdType(4) + fdCreator(4)
+                        let type_code = decode_fourcc(&rec[48..52]);
+                        let creator_code = decode_fourcc(&rec[52..56]);
                         // Data fork at offset 88 (80 bytes)
                         let data_fork = ForkData::parse(&rec[88..168]);
                         results.push(CatalogEntry::File {
@@ -328,6 +346,8 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
                             name,
                             data_size: data_fork.logical_size,
                             data_fork,
+                            type_code,
+                            creator_code,
                         });
                     }
                     _ => {}
@@ -338,6 +358,65 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         }
 
         Ok(results)
+    }
+
+    /// Find a file record by its file_id (CNID) in the catalog B-tree.
+    fn find_file_by_id(&self, file_id: u32) -> Option<ForkData> {
+        let node_size = self.catalog_header.node_size as usize;
+        if node_size == 0 {
+            return None;
+        }
+
+        let mut node_idx = self.catalog_header.first_leaf_node;
+        while node_idx != 0 {
+            let offset = node_idx as usize * node_size;
+            if offset + node_size > self.catalog_data.len() {
+                break;
+            }
+            let node = &self.catalog_data[offset..offset + node_size];
+            let desc = BTreeNodeDescriptor::parse(node);
+            if desc.kind != -1 {
+                node_idx = desc.next;
+                continue;
+            }
+
+            for i in 0..desc.num_records as usize {
+                let offset_pos = node_size - 2 * (i + 1);
+                if offset_pos + 2 > node.len() {
+                    break;
+                }
+                let rec_offset = BigEndian::read_u16(&node[offset_pos..offset_pos + 2]) as usize;
+                if rec_offset + 6 > node.len() {
+                    continue;
+                }
+                let key_len = BigEndian::read_u16(&node[rec_offset..rec_offset + 2]) as usize;
+                if key_len < 6 || rec_offset + 2 + key_len > node.len() {
+                    continue;
+                }
+                let mut rec_data_start = rec_offset + 2 + key_len;
+                if rec_data_start % 2 != 0 {
+                    rec_data_start += 1;
+                }
+                if rec_data_start + 2 > node.len() {
+                    continue;
+                }
+                let record_type = BigEndian::read_i16(&node[rec_data_start..rec_data_start + 2]);
+                if record_type != CATALOG_FILE {
+                    continue;
+                }
+                let rec = &node[rec_data_start..];
+                if rec.len() < 248 {
+                    continue;
+                }
+                let rec_file_id = BigEndian::read_u32(&rec[8..12]);
+                if rec_file_id != file_id {
+                    continue;
+                }
+                return Some(ForkData::parse(&rec[88..168]));
+            }
+            node_idx = desc.next;
+        }
+        None
     }
 
     /// Read the allocation bitmap and return it.
@@ -361,6 +440,8 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
             size: 0,
             location: 2, // HFS+ root directory CNID
             modified: None,
+            type_code: None,
+            creator_code: None,
         })
     }
 
@@ -380,14 +461,22 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
                     entries.push(FileEntry::new_directory(name, path, folder_id as u64));
                 }
                 CatalogEntry::File {
-                    name, data_size, ..
+                    file_id,
+                    name,
+                    data_size,
+                    type_code,
+                    creator_code,
+                    ..
                 } => {
                     let path = if entry.path == "/" {
                         format!("/{name}")
                     } else {
                         format!("{}/{name}", entry.path)
                     };
-                    entries.push(FileEntry::new_file(name, path, data_size, 0));
+                    let mut fe = FileEntry::new_file(name, path, data_size, file_id as u64);
+                    fe.type_code = Some(type_code);
+                    fe.creator_code = Some(creator_code);
+                    entries.push(fe);
                 }
             }
         }
@@ -398,12 +487,22 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
 
     fn read_file(
         &mut self,
-        _entry: &FileEntry,
-        _max_bytes: usize,
+        entry: &FileEntry,
+        max_bytes: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
-        Err(FilesystemError::Unsupported(
-            "HFS+ file reading not yet implemented".into(),
-        ))
+        let file_id = entry.location as u32;
+        let fork = self
+            .find_file_by_id(file_id)
+            .ok_or_else(|| FilesystemError::NotFound(format!("file id {file_id} not found in catalog")))?;
+
+        let mut data = read_fork(
+            &mut self.reader,
+            self.partition_offset,
+            self.vh.block_size,
+            &fork,
+        )?;
+        data.truncate(max_bytes);
+        Ok(data)
     }
 
     fn volume_label(&self) -> Option<&str> {

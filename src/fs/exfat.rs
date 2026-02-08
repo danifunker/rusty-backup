@@ -439,6 +439,8 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
                         size: 0,
                         location: first_cluster as u64,
                         modified: None,
+                        type_code: None,
+                        creator_code: None,
                     }
                 } else {
                     FileEntry {
@@ -448,6 +450,8 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
                         size: data_length,
                         location: first_cluster as u64,
                         modified: None,
+                        type_code: None,
+                        creator_code: None,
                     }
                 };
 
@@ -474,6 +478,8 @@ impl<R: Read + Seek + Send> Filesystem for ExfatFilesystem<R> {
             size: 0,
             location: self.root_cluster as u64,
             modified: None,
+            type_code: None,
+            creator_code: None,
         })
     }
 

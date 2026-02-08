@@ -367,7 +367,7 @@ impl BrowseView {
         if let Ok(mut fs) = self.open_fs() {
             match fs.read_file(entry, MAX_PREVIEW_SIZE) {
                 Ok(data) => {
-                    self.content = Some(detect_content_type(&data));
+                    self.content = Some(detect_content_type(entry, &data));
                 }
                 Err(e) => {
                     self.error = Some(format!("Failed to read file: {e}"));
@@ -390,6 +390,12 @@ impl BrowseView {
                         if !modified.is_empty() {
                             ui.label(format!("Modified: {modified}"));
                         }
+                    }
+                    if let Some(ref tc) = entry.type_code {
+                        ui.label(format!("Type: {tc}"));
+                    }
+                    if let Some(ref cc) = entry.creator_code {
+                        ui.label(format!("Creator: {cc}"));
                     }
                     ui.label(format!("Path: {}", entry.path));
                 });
@@ -440,12 +446,74 @@ impl BrowseView {
 }
 
 /// Detect whether data is text or binary and return appropriate content.
-fn detect_content_type(data: &[u8]) -> FileContent {
-    // Check if data looks like text (mostly printable ASCII/UTF-8)
+/// HFS/HFS+ file type classification from assets/hfs_file_types.json, embedded at compile time.
+mod hfs_file_types {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+
+    #[derive(serde::Deserialize)]
+    struct TypeInfo {
+        category: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct HfsFileTypes {
+        types: HashMap<String, TypeInfo>,
+    }
+
+    static HFS_TYPES: OnceLock<HashMap<String, bool>> = OnceLock::new();
+    const HFS_FILE_TYPES_JSON: &str = include_str!("../../assets/hfs_file_types.json");
+
+    fn get() -> &'static HashMap<String, bool> {
+        HFS_TYPES.get_or_init(|| {
+            let ft: HfsFileTypes =
+                serde_json::from_str(HFS_FILE_TYPES_JSON).unwrap_or(HfsFileTypes {
+                    types: HashMap::new(),
+                });
+            ft.types
+                .into_iter()
+                .map(|(k, v)| (k, v.category == "text"))
+                .collect()
+        })
+    }
+
+    /// Returns Some(true) for known text type, Some(false) for known binary, None for unknown.
+    pub fn classify(type_code: &str) -> Option<bool> {
+        get().get(type_code).copied()
+    }
+}
+
+fn detect_content_type(entry: &FileEntry, data: &[u8]) -> FileContent {
     if data.is_empty() {
         return FileContent::Text(String::new());
     }
 
+    // Check HFS type code first (if present)
+    if let Some(ref type_code) = entry.type_code {
+        if let Some(is_text) = hfs_file_types::classify(type_code) {
+            if !is_text {
+                return FileContent::Binary(data.to_vec());
+            }
+            // Known text type — decode as text (Mac files may not be UTF-8)
+            if let Ok(text) = std::str::from_utf8(data) {
+                return FileContent::Text(text.to_string());
+            }
+            // Not valid UTF-8 but known text type — show as lossy text
+            let text = data
+                .iter()
+                .map(|&b| {
+                    if b.is_ascii_graphic() || b.is_ascii_whitespace() {
+                        b as char
+                    } else {
+                        '.'
+                    }
+                })
+                .collect();
+            return FileContent::Text(text);
+        }
+    }
+
+    // Fall back to content heuristics
     // Try UTF-8 first
     if let Ok(text) = std::str::from_utf8(data) {
         let non_printable = text
