@@ -124,7 +124,13 @@ pub fn effective_partition_size<R: Read + Seek + Send + 'static>(
     partition_type: u8,
     partition_type_string: Option<&str>,
 ) -> Option<u64> {
-    let mut fs = open_filesystem(reader, partition_offset, partition_type, partition_type_string).ok()?;
+    let mut fs = open_filesystem(
+        reader,
+        partition_offset,
+        partition_type,
+        partition_type_string,
+    )
+    .ok()?;
     fs.last_data_byte().ok()
 }
 
@@ -228,8 +234,7 @@ fn compact_partition_reader_by_string<R: Read + Seek + Send + 'static>(
     match type_str {
         "Apple_HFS" => {
             if detect_embedded_hfs_plus(&mut reader, partition_offset) {
-                let (compact, info) =
-                    CompactHfsPlusReader::new(reader, partition_offset).ok()?;
+                let (compact, info) = CompactHfsPlusReader::new(reader, partition_offset).ok()?;
                 Some((Box::new(compact), info))
             } else {
                 let (compact, info) = CompactHfsReader::new(reader, partition_offset).ok()?;
@@ -237,8 +242,7 @@ fn compact_partition_reader_by_string<R: Read + Seek + Send + 'static>(
             }
         }
         "Apple_HFSX" | "Apple_HFS+" => {
-            let (compact, info) =
-                CompactHfsPlusReader::new(reader, partition_offset).ok()?;
+            let (compact, info) = CompactHfsPlusReader::new(reader, partition_offset).ok()?;
             Some((Box::new(compact), info))
         }
         _ => None,
@@ -249,7 +253,10 @@ fn compact_partition_reader_by_string<R: Read + Seek + Send + 'static>(
 /// Reads the MDB signature at offset+1024 and checks offset 124 for the
 /// HFS+ embedded signature (0x482B).
 fn detect_embedded_hfs_plus<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> bool {
-    if reader.seek(SeekFrom::Start(partition_offset + 1024)).is_err() {
+    if reader
+        .seek(SeekFrom::Start(partition_offset + 1024))
+        .is_err()
+    {
         return false;
     }
     let mut buf = [0u8; 130];

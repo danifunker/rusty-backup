@@ -232,7 +232,7 @@ impl InspectTab {
                         .clicked()
                     {
                         if let Some(path) = super::file_dialog()
-                            .add_filter("VHD Files", &["vhd"])
+                            .add_filter("VHD Files", &["vhd", "hda"])
                             .pick_file()
                         {
                             self.selected_device_idx = None;
@@ -621,7 +621,7 @@ impl InspectTab {
             // Pick a single file destination
             let dialog = super::file_dialog()
                 .set_file_name("disk.vhd")
-                .add_filter("VHD Files", &["vhd"]);
+                .add_filter("VHD Files", &["vhd", "hda"]);
             let dest = match dialog.save_file() {
                 Some(p) => p,
                 None => return,
@@ -1636,7 +1636,12 @@ impl InspectTab {
                                 } else {
                                     infer_fat_type_byte(&part.type_name)
                                 };
-                                browse_request = Some((part.index, part.start_lba * 512, ptype, part.partition_type_string.clone()));
+                                browse_request = Some((
+                                    part.index,
+                                    part.start_lba * 512,
+                                    ptype,
+                                    part.partition_type_string.clone(),
+                                ));
                             }
                         } else {
                             ui.label("");

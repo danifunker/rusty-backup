@@ -521,8 +521,7 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
         if apm_json_path.exists() {
             let apm_file = File::open(&apm_json_path)
                 .with_context(|| format!("failed to open {}", apm_json_path.display()))?;
-            let apm: Apm =
-                serde_json::from_reader(apm_file).context("failed to parse apm.json")?;
+            let apm: Apm = serde_json::from_reader(apm_file).context("failed to parse apm.json")?;
             log(
                 &progress,
                 LogLevel::Info,
@@ -1639,10 +1638,7 @@ fn detect_partition_fs_type(
     }
 
     // Check for HFS/HFS+ at partition_offset + 1024
-    if file
-        .seek(SeekFrom::Start(partition_offset + 1024))
-        .is_ok()
-    {
+    if file.seek(SeekFrom::Start(partition_offset + 1024)).is_ok() {
         let mut hfs_buf = [0u8; 2];
         if file.read_exact(&mut hfs_buf).is_ok() {
             let sig = u16::from_be_bytes(hfs_buf);

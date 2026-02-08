@@ -216,11 +216,21 @@ impl BrowseView {
                     )));
                 }
             };
-            fs::open_filesystem(decoder, self.partition_offset, self.partition_type, self.partition_type_string.as_deref())
+            fs::open_filesystem(
+                decoder,
+                self.partition_offset,
+                self.partition_type,
+                self.partition_type_string.as_deref(),
+            )
         } else {
             let file = File::open(path).map_err(FilesystemError::Io)?;
             let reader = BufReader::new(file);
-            fs::open_filesystem(reader, self.partition_offset, self.partition_type, self.partition_type_string.as_deref())
+            fs::open_filesystem(
+                reader,
+                self.partition_offset,
+                self.partition_type,
+                self.partition_type_string.as_deref(),
+            )
         }
     }
 
