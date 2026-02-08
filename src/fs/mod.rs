@@ -15,6 +15,7 @@ pub use fat::{
     patch_bpb_hidden_sectors, resize_fat_in_place, set_fat_clean_flags, validate_fat_integrity,
     CompactFatReader, CompactInfo,
 };
+use filesystem::{Filesystem, FilesystemError};
 pub use hfs::{
     patch_hfs_hidden_sectors, resize_hfs_in_place, validate_hfs_integrity, CompactHfsReader,
 };
@@ -22,7 +23,6 @@ pub use hfsplus::{
     patch_hfsplus_hidden_sectors, resize_hfsplus_in_place, validate_hfsplus_integrity,
     CompactHfsPlusReader,
 };
-use filesystem::{Filesystem, FilesystemError};
 pub use ntfs::{
     patch_ntfs_hidden_sectors, resize_ntfs_in_place, validate_ntfs_integrity, CompactNtfsReader,
 };
@@ -61,7 +61,12 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
     mut reader: R,
     partition_offset: u64,
     partition_type: u8,
+    partition_type_string: Option<&str>,
 ) -> Option<(Box<dyn Read + Send>, CompactResult)> {
+    // Check string-based type first (APM partitions)
+    if let Some(type_str) = partition_type_string {
+        return compact_partition_reader_by_string(reader, partition_offset, type_str);
+    }
     match partition_type {
         // FAT types
         0x01 | 0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C => {
@@ -117,8 +122,9 @@ pub fn effective_partition_size<R: Read + Seek + Send + 'static>(
     reader: R,
     partition_offset: u64,
     partition_type: u8,
+    partition_type_string: Option<&str>,
 ) -> Option<u64> {
-    let mut fs = open_filesystem(reader, partition_offset, partition_type).ok()?;
+    let mut fs = open_filesystem(reader, partition_offset, partition_type, partition_type_string).ok()?;
     fs.last_data_byte().ok()
 }
 
@@ -126,11 +132,17 @@ pub fn effective_partition_size<R: Read + Seek + Send + 'static>(
 ///
 /// `reader` must be seekable and positioned at the partition start.
 /// `partition_type` is the MBR partition type byte.
+/// `partition_type_string` is the APM partition type string (e.g. "Apple_HFS").
 pub fn open_filesystem<R: Read + Seek + Send + 'static>(
     mut reader: R,
     partition_offset: u64,
     partition_type: u8,
+    partition_type_string: Option<&str>,
 ) -> Result<Box<dyn Filesystem>, FilesystemError> {
+    // Check string-based type first (APM partitions)
+    if let Some(type_str) = partition_type_string {
+        return open_filesystem_by_string(reader, partition_offset, type_str);
+    }
     match partition_type {
         // FAT12
         0x01 => Ok(Box::new(fat::FatFilesystem::open(
@@ -173,4 +185,81 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
             partition_type
         ))),
     }
+}
+
+/// Open a filesystem by APM partition type string.
+fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
+    mut reader: R,
+    partition_offset: u64,
+    type_str: &str,
+) -> Result<Box<dyn Filesystem>, FilesystemError> {
+    match type_str {
+        "Apple_HFS" => {
+            // Check if this is an HFS wrapper around an embedded HFS+ volume
+            if detect_embedded_hfs_plus(&mut reader, partition_offset) {
+                Ok(Box::new(hfsplus::HfsPlusFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?))
+            } else {
+                Ok(Box::new(hfs::HfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?))
+            }
+        }
+        "Apple_HFSX" | "Apple_HFS+" => Ok(Box::new(hfsplus::HfsPlusFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
+        _ => Err(FilesystemError::Unsupported(format!(
+            "APM partition type '{}' not supported for browsing",
+            type_str
+        ))),
+    }
+}
+
+/// Try to create a compacted reader by APM partition type string.
+fn compact_partition_reader_by_string<R: Read + Seek + Send + 'static>(
+    mut reader: R,
+    partition_offset: u64,
+    type_str: &str,
+) -> Option<(Box<dyn Read + Send>, CompactResult)> {
+    match type_str {
+        "Apple_HFS" => {
+            if detect_embedded_hfs_plus(&mut reader, partition_offset) {
+                let (compact, info) =
+                    CompactHfsPlusReader::new(reader, partition_offset).ok()?;
+                Some((Box::new(compact), info))
+            } else {
+                let (compact, info) = CompactHfsReader::new(reader, partition_offset).ok()?;
+                Some((Box::new(compact), info))
+            }
+        }
+        "Apple_HFSX" | "Apple_HFS+" => {
+            let (compact, info) =
+                CompactHfsPlusReader::new(reader, partition_offset).ok()?;
+            Some((Box::new(compact), info))
+        }
+        _ => None,
+    }
+}
+
+/// Detect whether an Apple_HFS partition contains an embedded HFS+ volume.
+/// Reads the MDB signature at offset+1024 and checks offset 124 for the
+/// HFS+ embedded signature (0x482B).
+fn detect_embedded_hfs_plus<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> bool {
+    if reader.seek(SeekFrom::Start(partition_offset + 1024)).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 130];
+    if reader.read_exact(&mut buf).is_err() {
+        return false;
+    }
+    let sig = u16::from_be_bytes([buf[0], buf[1]]);
+    if sig != 0x4244 {
+        return false; // Not HFS
+    }
+    let embedded_sig = u16::from_be_bytes([buf[124], buf[125]]);
+    embedded_sig == 0x482B
 }

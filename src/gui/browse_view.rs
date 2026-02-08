@@ -36,6 +36,8 @@ pub struct BrowseView {
     source_path: Option<PathBuf>,
     partition_offset: u64,
     partition_type: u8,
+    /// APM partition type string (e.g. "Apple_HFS"). None for MBR/GPT.
+    partition_type_string: Option<String>,
     /// Whether the browser is active (filesystem loaded).
     active: bool,
     /// Shared block cache for Clonezilla partclone browsing.
@@ -71,6 +73,7 @@ impl Default for BrowseView {
             source_path: None,
             partition_offset: 0,
             partition_type: 0,
+            partition_type_string: None,
             active: false,
             partclone_cache: None,
         }
@@ -79,11 +82,18 @@ impl Default for BrowseView {
 
 impl BrowseView {
     /// Initialize the browser for a partition within a source image/device.
-    pub fn open(&mut self, source_path: PathBuf, partition_offset: u64, partition_type: u8) {
+    pub fn open(
+        &mut self,
+        source_path: PathBuf,
+        partition_offset: u64,
+        partition_type: u8,
+        partition_type_string: Option<String>,
+    ) {
         self.close();
         self.source_path = Some(source_path.clone());
         self.partition_offset = partition_offset;
         self.partition_type = partition_type;
+        self.partition_type_string = partition_type_string;
 
         match self.open_fs() {
             Ok(mut fs) => {
@@ -125,7 +135,7 @@ impl BrowseView {
         self.partition_offset = 0;
 
         let reader = PartcloneBlockReader::new(cache);
-        match fs::open_filesystem(reader, 0, partition_type) {
+        match fs::open_filesystem(reader, 0, partition_type, None) {
             Ok(mut fs) => {
                 self.fs_type = fs.fs_type().to_string();
                 self.volume_label = fs.volume_label().unwrap_or("").to_string();
@@ -167,6 +177,7 @@ impl BrowseView {
         self.fs_type.clear();
         self.volume_label.clear();
         self.partclone_cache = None;
+        self.partition_type_string = None;
     }
 
     pub fn is_active(&self) -> bool {
@@ -177,7 +188,7 @@ impl BrowseView {
         // If we have a partclone block cache, use it
         if let Some(cache) = &self.partclone_cache {
             let reader = PartcloneBlockReader::new(Arc::clone(cache));
-            return fs::open_filesystem(reader, 0, self.partition_type);
+            return fs::open_filesystem(reader, 0, self.partition_type, None);
         }
 
         let path = self
@@ -205,11 +216,11 @@ impl BrowseView {
                     )));
                 }
             };
-            fs::open_filesystem(decoder, self.partition_offset, self.partition_type)
+            fs::open_filesystem(decoder, self.partition_offset, self.partition_type, self.partition_type_string.as_deref())
         } else {
             let file = File::open(path).map_err(FilesystemError::Io)?;
             let reader = BufReader::new(file);
-            fs::open_filesystem(reader, self.partition_offset, self.partition_type)
+            fs::open_filesystem(reader, self.partition_offset, self.partition_type, self.partition_type_string.as_deref())
         }
     }
 

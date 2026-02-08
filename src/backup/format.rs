@@ -183,8 +183,7 @@ pub fn export_apm(apm: &Apm, folder: &Path) -> Result<()> {
     // Write raw APM blocks (DDR + partition map entries)
     let bin_path = folder.join("apm.bin");
     let raw = apm.build_apm_blocks(None);
-    fs::write(&bin_path, raw)
-        .with_context(|| format!("failed to write {}", bin_path.display()))?;
+    fs::write(&bin_path, raw).with_context(|| format!("failed to write {}", bin_path.display()))?;
 
     Ok(())
 }

@@ -97,12 +97,18 @@ impl HfsMasterDirectoryBlock {
         let name_bytes = &data[37..37 + name_len.min(27)];
         let volume_name = mac_roman_to_utf8(name_bytes);
 
-        let mut catalog_extents = [HfsExtDescriptor { start_block: 0, block_count: 0 }; 3];
+        let mut catalog_extents = [HfsExtDescriptor {
+            start_block: 0,
+            block_count: 0,
+        }; 3];
         for i in 0..3 {
             catalog_extents[i] = HfsExtDescriptor::parse(&data[70 + i * 4..74 + i * 4]);
         }
 
-        let mut extents_extents = [HfsExtDescriptor { start_block: 0, block_count: 0 }; 3];
+        let mut extents_extents = [HfsExtDescriptor {
+            start_block: 0,
+            block_count: 0,
+        }; 3];
         for i in 0..3 {
             extents_extents[i] = HfsExtDescriptor::parse(&data[82 + i * 4..86 + i * 4]);
         }
@@ -273,7 +279,8 @@ impl<R: Read + Seek> HfsFilesystem<R> {
                         if rec_data_offset + 70 > node.len() {
                             continue;
                         }
-                        let dir_id = BigEndian::read_u32(&node[rec_data_offset + 6..rec_data_offset + 10]);
+                        let dir_id =
+                            BigEndian::read_u32(&node[rec_data_offset + 6..rec_data_offset + 10]);
                         results.push(CatalogRecord::Directory {
                             dir_id,
                             name,
@@ -288,7 +295,10 @@ impl<R: Read + Seek> HfsFilesystem<R> {
                         let file_id = BigEndian::read_u32(&rec[6..10]);
                         // Data fork: logical size at offset 54, first 3 extents at 58
                         let data_size = BigEndian::read_u32(&rec[54..58]);
-                        let mut data_extents = [HfsExtDescriptor { start_block: 0, block_count: 0 }; 3];
+                        let mut data_extents = [HfsExtDescriptor {
+                            start_block: 0,
+                            block_count: 0,
+                        }; 3];
                         for j in 0..3 {
                             data_extents[j] = HfsExtDescriptor::parse(&rec[58 + j * 4..62 + j * 4]);
                         }
@@ -312,8 +322,7 @@ impl<R: Read + Seek> HfsFilesystem<R> {
 
     /// Read the volume bitmap and return it.
     fn read_volume_bitmap(&mut self) -> Result<Vec<u8>, FilesystemError> {
-        let bitmap_offset = self.partition_offset
-            + self.mdb.volume_bitmap_block as u64 * 512;
+        let bitmap_offset = self.partition_offset + self.mdb.volume_bitmap_block as u64 * 512;
         let bitmap_size = (self.mdb.total_blocks as u32).div_ceil(8) as usize;
         self.reader.seek(SeekFrom::Start(bitmap_offset))?;
         let mut bitmap = vec![0u8; bitmap_size];
@@ -323,8 +332,7 @@ impl<R: Read + Seek> HfsFilesystem<R> {
 
     /// Return the byte offset of allocation block `n` from partition start.
     fn alloc_block_offset(&self, block: u32) -> u64 {
-        self.mdb.first_alloc_block as u64 * 512
-            + block as u64 * self.mdb.block_size as u64
+        self.mdb.first_alloc_block as u64 * 512 + block as u64 * self.mdb.block_size as u64
     }
 }
 
@@ -355,7 +363,9 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
                     };
                     entries.push(FileEntry::new_directory(name, path, dir_id as u64));
                 }
-                CatalogRecord::File { name, data_size, .. } => {
+                CatalogRecord::File {
+                    name, data_size, ..
+                } => {
                     let path = if entry.path == "/" {
                         format!("/{name}")
                     } else {
@@ -518,8 +528,8 @@ impl<R: Read + Seek> CompactHfsReader<R> {
 
         // Boot region: first 3 sectors (boot blocks at 0-1, MDB at sector 2)
         let boot_region_size = 3 * 512;
-        let original_size = mdb.total_blocks as u64 * mdb.block_size as u64
-            + mdb.first_alloc_block as u64 * 512;
+        let original_size =
+            mdb.total_blocks as u64 * mdb.block_size as u64 + mdb.first_alloc_block as u64 * 512;
         let compacted_size = boot_region_size + allocated as u64 * mdb.block_size as u64;
 
         let result = CompactResult {

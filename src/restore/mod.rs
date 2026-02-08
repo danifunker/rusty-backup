@@ -15,10 +15,12 @@ use crate::fs::exfat::patch_exfat_hidden_sectors;
 use crate::fs::fat::patch_bpb_hidden_sectors;
 use crate::fs::ntfs::patch_ntfs_hidden_sectors;
 use crate::fs::{
-    resize_exfat_in_place, resize_fat_in_place, resize_ntfs_in_place, set_fat_clean_flags,
-    validate_exfat_integrity, validate_fat_integrity, validate_ntfs_integrity,
+    resize_exfat_in_place, resize_fat_in_place, resize_hfs_in_place, resize_hfsplus_in_place,
+    resize_ntfs_in_place, set_fat_clean_flags, validate_exfat_integrity, validate_fat_integrity,
+    validate_hfs_integrity, validate_hfsplus_integrity, validate_ntfs_integrity,
 };
 use crate::os::SectorAlignedWriter;
+use crate::partition::apm::Apm;
 use crate::partition::gpt::Gpt;
 use crate::partition::mbr::{build_ebr_chain, patch_mbr_entries, LogicalPartitionInfo};
 use crate::partition::PartitionSizeOverride;
@@ -512,6 +514,33 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
         None
     };
 
+    // Load APM data if this is an APM backup
+    let is_apm = metadata.partition_table_type == "APM";
+    let apm_data: Option<Apm> = if is_apm {
+        let apm_json_path = config.backup_folder.join("apm.json");
+        if apm_json_path.exists() {
+            let apm_file = File::open(&apm_json_path)
+                .with_context(|| format!("failed to open {}", apm_json_path.display()))?;
+            let apm: Apm =
+                serde_json::from_reader(apm_file).context("failed to parse apm.json")?;
+            log(
+                &progress,
+                LogLevel::Info,
+                format!("Loaded APM: {} partition entries", apm.entries.len()),
+            );
+            Some(apm)
+        } else {
+            log(
+                &progress,
+                LogLevel::Warning,
+                "APM backup has no apm.json — APM structures will not be written",
+            );
+            None
+        }
+    } else {
+        None
+    };
+
     // Step 4: Calculate partition layout
     set_operation(&progress, "Calculating partition layout...");
     let overrides = calculate_restore_layout(
@@ -622,6 +651,7 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
         config.target_is_device,
         config.write_zeros_to_unused,
         gpt_data.as_ref(),
+        apm_data.as_ref(),
         &mut |bytes| {
             set_progress_bytes(&progress_clone, bytes, data_extent);
         },
@@ -661,6 +691,16 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
                         log(&progress, LogLevel::Info, msg)
                     })?;
                 }
+                PartitionFsType::Hfs => {
+                    resize_hfs_in_place(inner_file, part_offset, export_size, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    })?;
+                }
+                PartitionFsType::HfsPlus => {
+                    resize_hfsplus_in_place(inner_file, part_offset, export_size, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    })?;
+                }
                 PartitionFsType::Fat | PartitionFsType::Unknown => {
                     let new_sectors = (export_size / 512) as u32;
                     resize_fat_in_place(inner_file, part_offset, new_sectors, &mut |msg| {
@@ -681,6 +721,16 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
                 }
                 PartitionFsType::Exfat => {
                     let _ = validate_exfat_integrity(inner_file, part_offset, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    });
+                }
+                PartitionFsType::Hfs => {
+                    let _ = validate_hfs_integrity(inner_file, part_offset, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    });
+                }
+                PartitionFsType::HfsPlus => {
+                    let _ = validate_hfsplus_integrity(inner_file, part_offset, &mut |msg| {
                         log(&progress, LogLevel::Info, msg)
                     });
                 }
@@ -1112,6 +1162,16 @@ fn run_clonezilla_restore(
                         log(&progress, LogLevel::Info, msg)
                     })?;
                 }
+                PartitionFsType::Hfs => {
+                    resize_hfs_in_place(inner_file, part_offset, export_size, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    })?;
+                }
+                PartitionFsType::HfsPlus => {
+                    resize_hfsplus_in_place(inner_file, part_offset, export_size, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    })?;
+                }
                 PartitionFsType::Fat | PartitionFsType::Unknown => {
                     let new_sectors = (export_size / 512) as u32;
                     resize_fat_in_place(inner_file, part_offset, new_sectors, &mut |msg| {
@@ -1132,6 +1192,16 @@ fn run_clonezilla_restore(
                 }
                 PartitionFsType::Exfat => {
                     let _ = validate_exfat_integrity(inner_file, part_offset, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    });
+                }
+                PartitionFsType::Hfs => {
+                    let _ = validate_hfs_integrity(inner_file, part_offset, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    });
+                }
+                PartitionFsType::HfsPlus => {
+                    let _ = validate_hfsplus_integrity(inner_file, part_offset, &mut |msg| {
                         log(&progress, LogLevel::Info, msg)
                     });
                 }
@@ -1541,6 +1611,8 @@ enum PartitionFsType {
     Fat,
     Ntfs,
     Exfat,
+    Hfs,
+    HfsPlus,
     Unknown,
 }
 
@@ -1557,12 +1629,44 @@ fn detect_partition_fs_type(
         return PartitionFsType::Unknown;
     }
     if &buf[3..11] == b"NTFS    " {
-        PartitionFsType::Ntfs
-    } else if &buf[3..11] == b"EXFAT   " {
-        PartitionFsType::Exfat
-    } else if buf[0] == 0xEB || buf[0] == 0xE9 {
-        PartitionFsType::Fat
-    } else {
-        PartitionFsType::Unknown
+        return PartitionFsType::Ntfs;
     }
+    if &buf[3..11] == b"EXFAT   " {
+        return PartitionFsType::Exfat;
+    }
+    if buf[0] == 0xEB || buf[0] == 0xE9 {
+        return PartitionFsType::Fat;
+    }
+
+    // Check for HFS/HFS+ at partition_offset + 1024
+    if file
+        .seek(SeekFrom::Start(partition_offset + 1024))
+        .is_ok()
+    {
+        let mut hfs_buf = [0u8; 2];
+        if file.read_exact(&mut hfs_buf).is_ok() {
+            let sig = u16::from_be_bytes(hfs_buf);
+            match sig {
+                0x4244 => {
+                    // HFS — check for embedded HFS+ at offset 124-125 from MDB start
+                    let mut embed = [0u8; 2];
+                    if file
+                        .seek(SeekFrom::Start(partition_offset + 1024 + 124))
+                        .is_ok()
+                        && file.read_exact(&mut embed).is_ok()
+                    {
+                        let embed_sig = u16::from_be_bytes(embed);
+                        if embed_sig == 0x482B {
+                            return PartitionFsType::HfsPlus;
+                        }
+                    }
+                    return PartitionFsType::Hfs;
+                }
+                0x482B | 0x4858 => return PartitionFsType::HfsPlus,
+                _ => {}
+            }
+        }
+    }
+
+    PartitionFsType::Unknown
 }

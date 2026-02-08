@@ -127,7 +127,9 @@ pub struct Apm {
 impl Apm {
     /// Parse an APM from a readable+seekable source.
     /// The reader should be positioned at the start of the disk.
-    pub fn parse(reader: &mut (impl std::io::Read + std::io::Seek)) -> Result<Self, RustyBackupError> {
+    pub fn parse(
+        reader: &mut (impl std::io::Read + std::io::Seek),
+    ) -> Result<Self, RustyBackupError> {
         use std::io::SeekFrom;
 
         // Read DDR (block 0)
@@ -155,9 +157,9 @@ impl Apm {
 
         // Read first partition entry to get map_entries count
         let mut entry_buf = [0u8; 512];
-        reader
-            .read_exact(&mut entry_buf)
-            .map_err(|e| RustyBackupError::InvalidApm(format!("cannot read first APM entry: {e}")))?;
+        reader.read_exact(&mut entry_buf).map_err(|e| {
+            RustyBackupError::InvalidApm(format!("cannot read first APM entry: {e}"))
+        })?;
         let first_entry = ApmPartitionEntry::parse(&entry_buf)?;
         let map_entry_count = first_entry.map_entries;
 
@@ -322,7 +324,11 @@ mod tests {
         let mut cursor = Cursor::new(data);
         let apm = Apm::parse(&mut cursor).unwrap();
 
-        let data_parts: Vec<_> = apm.entries.iter().filter(|e| e.is_data_partition()).collect();
+        let data_parts: Vec<_> = apm
+            .entries
+            .iter()
+            .filter(|e| e.is_data_partition())
+            .collect();
         assert_eq!(data_parts.len(), 1);
         assert_eq!(data_parts[0].name, "Macintosh HD");
     }
@@ -376,7 +382,7 @@ mod tests {
 
         let overrides = vec![PartitionSizeOverride::size_only(
             0,
-            64,     // start_lba (same as start_block since block_size=512)
+            64, // start_lba (same as start_block since block_size=512)
             50000 * 512,
             60000 * 512,
         )];

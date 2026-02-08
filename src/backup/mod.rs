@@ -329,6 +329,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                     BufReader::new(clone),
                     part_offset,
                     part.partition_type_byte,
+                    part.partition_type_string.as_deref(),
                 )
             })
             .map(|(_, result)| result);
@@ -347,6 +348,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                         BufReader::new(clone),
                         part_offset,
                         part.partition_type_byte,
+                        part.partition_type_string.as_deref(),
                     )
                 })
                 .map(|data_end| data_end.min(part.size_bytes));
@@ -533,6 +535,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 BufReader::new(clone),
                 part_offset,
                 part.partition_type_byte,
+                part.partition_type_string.as_deref(),
             )
             .ok_or_else(|| anyhow::anyhow!("compaction failed for {part_label}"))?;
 

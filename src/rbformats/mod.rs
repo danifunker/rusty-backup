@@ -14,7 +14,10 @@ use crate::backup::metadata::BackupMetadata;
 use crate::backup::CompressionType;
 use crate::fs::exfat::patch_exfat_hidden_sectors;
 use crate::fs::fat::patch_bpb_hidden_sectors;
+use crate::fs::hfs::patch_hfs_hidden_sectors;
+use crate::fs::hfsplus::patch_hfsplus_hidden_sectors;
 use crate::fs::ntfs::patch_ntfs_hidden_sectors;
+use crate::partition::apm::Apm;
 use crate::partition::gpt::Gpt;
 use crate::partition::mbr::patch_mbr_entries;
 use crate::partition::PartitionSizeOverride;
@@ -243,6 +246,7 @@ pub fn reconstruct_disk_from_backup(
     is_device: bool,
     fill_unused_with_zeros: bool,
     gpt: Option<&Gpt>,
+    apm: Option<&Apm>,
     progress_cb: &mut impl FnMut(u64),
     cancel_check: &impl Fn() -> bool,
     log_cb: &mut impl FnMut(&str),
@@ -291,6 +295,21 @@ pub fn reconstruct_disk_from_backup(
             "Wrote primary GPT ({} bytes, {} entries)",
             primary_gpt.len(),
             patched_gpt.entries.len()
+        ));
+    } else if let Some(apm_data) = apm {
+        // APM restore: write patched DDR + partition map entries
+        let target_blocks = (target_size / apm_data.ddr.block_size as u64) as u32;
+        let patched_apm = apm_data.patch_for_restore(partition_sizes, target_blocks);
+        let apm_blocks = patched_apm.build_apm_blocks(Some(target_blocks));
+
+        writer
+            .write_all(&apm_blocks)
+            .context("failed to write APM blocks")?;
+        total_written += apm_blocks.len() as u64;
+        log_cb(&format!(
+            "Wrote APM: DDR + {} partition entries ({} bytes)",
+            patched_apm.entries.len(),
+            apm_blocks.len()
         ));
     } else {
         // MBR restore: write patched MBR
@@ -457,10 +476,12 @@ pub fn reconstruct_disk_from_backup(
         // Update hidden sectors / partition offset to match the new start LBA
         {
             writer.flush()?;
-            // Try FAT first (most common), then NTFS, then exFAT
+            // Try FAT first (most common), then NTFS, then exFAT, then HFS/HFS+ (no-ops)
             patch_bpb_hidden_sectors(writer, part_offset, effective_lba, log_cb)?;
             patch_ntfs_hidden_sectors(writer, part_offset, effective_lba, log_cb)?;
             patch_exfat_hidden_sectors(writer, part_offset, effective_lba, log_cb)?;
+            patch_hfs_hidden_sectors(writer, part_offset, effective_lba, log_cb)?;
+            patch_hfsplus_hidden_sectors(writer, part_offset, effective_lba, log_cb)?;
         }
 
         log_cb(&format!(

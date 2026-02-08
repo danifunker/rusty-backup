@@ -1280,6 +1280,7 @@ impl InspectTab {
                                     BufReader::new(f),
                                     part.start_lba * 512,
                                     part.partition_type_byte,
+                                    part.partition_type_string.as_deref(),
                                 ) {
                                     let clamped = min_size.min(part.size_bytes);
                                     self.partition_min_sizes.insert(part.index, clamped);
@@ -1533,7 +1534,7 @@ impl InspectTab {
         }
 
         // Browse request: (partition_index, offset, partition_type_byte)
-        let mut browse_request: Option<(usize, u64, u8)> = None;
+        let mut browse_request: Option<(usize, u64, u8, Option<String>)> = None;
 
         egui::Grid::new("partition_table")
             .striped(true)
@@ -1624,6 +1625,7 @@ impl InspectTab {
                         ui.label(if part.bootable { "Yes" } else { "" });
                         if is_browsable_type(part.partition_type_byte)
                             || is_fat_name(&part.type_name)
+                            || is_browsable_type_string(part.partition_type_string.as_deref())
                         {
                             if ui.small_button("Browse").clicked() {
                                 // Use the stored type byte, or infer one
@@ -1634,7 +1636,7 @@ impl InspectTab {
                                 } else {
                                     infer_fat_type_byte(&part.type_name)
                                 };
-                                browse_request = Some((part.index, part.start_lba * 512, ptype));
+                                browse_request = Some((part.index, part.start_lba * 512, ptype, part.partition_type_string.clone()));
                             }
                         } else {
                             ui.label("");
@@ -1645,8 +1647,8 @@ impl InspectTab {
             });
 
         // Handle browse request outside the grid (avoids borrow issues)
-        if let Some((part_index, offset, ptype)) = browse_request {
-            self.open_browse(part_index, offset, ptype, devices, log);
+        if let Some((part_index, offset, ptype, type_string)) = browse_request {
+            self.open_browse(part_index, offset, ptype, type_string, devices, log);
         }
     }
 
@@ -1662,6 +1664,7 @@ impl InspectTab {
         part_index: usize,
         offset: u64,
         ptype: u8,
+        partition_type_string: Option<String>,
         devices: &[DiskDevice],
         log: &mut LogPanel,
     ) {
@@ -1678,7 +1681,8 @@ impl InspectTab {
                 path.display(),
                 offset,
             ));
-            self.browse_view.open(path, offset, ptype);
+            self.browse_view
+                .open(path, offset, ptype, partition_type_string);
             return;
         }
 
@@ -1749,13 +1753,15 @@ impl InspectTab {
                     "Browsing partition {} from {}",
                     part_index, data_file,
                 ));
-                self.browse_view.open(data_path, 0, ptype);
+                self.browse_view
+                    .open(data_path, 0, ptype, partition_type_string.clone());
             }
             "zstd" => {
                 // Zstd-compressed backup — create seekable cache for browsing
                 self.open_browse_via_seekable_cache(
                     part_index,
                     ptype,
+                    partition_type_string,
                     &data_path,
                     &folder,
                     &format!("partition-{}", part_index),
@@ -1882,6 +1888,7 @@ impl InspectTab {
         &mut self,
         part_index: usize,
         ptype: u8,
+        partition_type_string: Option<String>,
         data_path: &PathBuf,
         folder: &PathBuf,
         cache_name: &str,
@@ -1894,7 +1901,8 @@ impl InspectTab {
                     "Browsing partition {} from cached seekable file",
                     part_index,
                 ));
-                self.browse_view.open(cache_path, 0, ptype);
+                self.browse_view
+                    .open(cache_path, 0, ptype, partition_type_string.clone());
                 return;
             }
             // Cache file was deleted (stale) — remove from map and recreate
@@ -2064,6 +2072,11 @@ fn is_browsable_type(ptype: u8) -> bool {
         ptype,
         0x01 | 0x04 | 0x06 | 0x07 | 0x0B | 0x0C | 0x0E | 0x11 | 0x14 | 0x16 | 0x1B | 0x1C | 0x1E
     )
+}
+
+/// Check if an APM partition type string corresponds to a browsable filesystem.
+fn is_browsable_type_string(type_str: Option<&str>) -> bool {
+    matches!(type_str, Some("Apple_HFS" | "Apple_HFSX" | "Apple_HFS+"))
 }
 
 /// Fallback check: detect FAT from the human-readable type name string.

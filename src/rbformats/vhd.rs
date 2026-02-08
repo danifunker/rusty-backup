@@ -256,6 +256,7 @@ pub fn export_whole_disk_vhd(
             false, // VHD export is to a file
             false, // No need to write zeros for VHD files
             None,  // VHD export doesn't write GPT structures
+            None,  // VHD export doesn't write APM structures
             &mut progress_cb,
             &cancel_check,
             &mut log_cb,

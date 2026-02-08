@@ -683,6 +683,7 @@ impl BackupTab {
                             BufReader::new(clone),
                             offset,
                             part.partition_type_byte,
+                            part.partition_type_string.as_deref(),
                         ) {
                             let clamped = min_size.min(part.size_bytes);
                             self.partition_min_sizes.insert(part.index, clamped);

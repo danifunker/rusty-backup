@@ -85,12 +85,16 @@ impl PartitionTable {
         // Check for APM (Driver Descriptor Record signature 0x4552 at offset 0)
         let ddr_sig = u16::from_be_bytes([mbr_data[0], mbr_data[1]]);
         if ddr_sig == 0x4552 {
-            reader.seek(SeekFrom::Start(0)).map_err(RustyBackupError::Io)?;
+            reader
+                .seek(SeekFrom::Start(0))
+                .map_err(RustyBackupError::Io)?;
             if let Ok(apm) = Apm::parse(reader) {
                 return Ok(PartitionTable::Apm(apm));
             }
             // Fall through to MBR/GPT parsing on failure
-            reader.seek(SeekFrom::Start(0)).map_err(RustyBackupError::Io)?;
+            reader
+                .seek(SeekFrom::Start(0))
+                .map_err(RustyBackupError::Io)?;
         }
 
         let mut mbr = Mbr::parse(&mbr_data)?;

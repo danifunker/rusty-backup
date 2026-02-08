@@ -40,7 +40,10 @@ struct ForkData {
 
 impl ForkData {
     fn parse(data: &[u8]) -> Self {
-        let mut extents = [ExtentDescriptor { start_block: 0, block_count: 0 }; 8];
+        let mut extents = [ExtentDescriptor {
+            start_block: 0,
+            block_count: 0,
+        }; 8];
         for i in 0..8 {
             extents[i] = ExtentDescriptor::parse(&data[16 + i * 8..24 + i * 8]);
         }
@@ -620,7 +623,12 @@ impl<R: Read + Seek> CompactHfsPlusReader<R> {
         let vh = HfsPlusVolumeHeader::parse(&vh_buf)?;
 
         // Read allocation file
-        let alloc_data = read_fork(&mut reader, partition_offset, vh.block_size, &vh.allocation_file)?;
+        let alloc_data = read_fork(
+            &mut reader,
+            partition_offset,
+            vh.block_size,
+            &vh.allocation_file,
+        )?;
 
         // Count allocated blocks
         let mut allocated = 0u32;
@@ -702,8 +710,7 @@ impl<R: Read + Seek> Read for CompactHfsPlusReader<R> {
             return Ok(0);
         }
 
-        let block_offset =
-            self.partition_offset + self.current_block as u64 * block_size;
+        let block_offset = self.partition_offset + self.current_block as u64 * block_size;
         let offset_in_block = self.phase_pos % block_size;
         let remaining_in_block = block_size - offset_in_block;
         let to_read = (remaining_in_block as usize).min(buf.len());
