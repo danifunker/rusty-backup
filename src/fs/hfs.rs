@@ -493,9 +493,9 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
         max_bytes: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
         let file_id = entry.location as u32;
-        let (data_size, extents) = self
-            .find_file_by_id(file_id)
-            .ok_or_else(|| FilesystemError::NotFound(format!("file id {file_id} not found in catalog")))?;
+        let (data_size, extents) = self.find_file_by_id(file_id).ok_or_else(|| {
+            FilesystemError::NotFound(format!("file id {file_id} not found in catalog"))
+        })?;
 
         let mut data = read_fork_data(
             &mut self.reader,
