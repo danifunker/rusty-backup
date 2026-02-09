@@ -1,0 +1,42 @@
+Running with administrator privileges ✓
+DEBUG: Tree handle - event: Event::Focus, clicks: false
+DEBUG: Tree handle - event: Event::Unfocus, clicks: false
+DEBUG: Tree handle - event: Event::Focus, clicks: false
+DEBUG: Tree handle - event: Event::Show, clicks: false
+DEBUG: Tree handle - event: Event::Focus, clicks: false
+DEBUG: Tree handle - event: Event::Leave, clicks: false
+DEBUG: Tree handle - event: Event::Enter, clicks: false
+DEBUG: Tree handle - event: Event::Move, clicks: false
+  [repeated 140 more times]
+DEBUG: Tree handle - event: Event::Leave, clicks: false
+DEBUG: Tree handle - event: Event::Enter, clicks: false
+DEBUG: Tree handle - event: Event::Move, clicks: false
+  [repeated 66 more times]
+DEBUG: Tree handle - event: Event::MouseWheel, clicks: false
+  [repeated 51 more times]
+DEBUG: Tree handle - event: Event::Move, clicks: false
+  [repeated 273 more times]
+DEBUG: Tree selection callback - path: 📄 CONFIG.SYS
+DEBUG: Cache has 102 entries
+DEBUG: Entry NOT in cache, available keys:
+  - 📁 FAT16 (>32MB)//📁 System Volume Information
+  - 📁 FAT16 (>32MB)//📁 BOOTUS.422
+  - 📁 FAT16 (>32MB)//📁 QEMM
+  - 📁 FAT16 (>32MB)//📁 WIN98SW
+  - 📁 FAT16 (>32MB)//📄 REPORT.ASM
+DEBUG: Tree handle - event: Event::Push, clicks: false
+DEBUG: Tree handle - event: Event::Released, clicks: false
+DEBUG: Tree handle - event: Event::Move, clicks: false
+  [repeated 152 more times]
+DEBUG: Tree handle - event: Event::Push, clicks: false
+DEBUG: Tree handle - event: Event::Released, clicks: false
+DEBUG: Tree handle - event: Event::Move, clicks: false
+DEBUG: Tree handle - event: Event::Push, clicks: true
+DEBUG: Double-click detected!
+DEBUG: Double-clicked path: 📄 CONFIG.SYS
+DEBUG: Tree handle - event: Event::Released, clicks: true
+DEBUG: Tree handle - event: Event::Move, clicks: true
+  [repeated 20 more times]
+DEBUG: Tree handle - event: Event::Leave, clicks: true
+  [repeated 1 more time]
+DEBUG: Tree handle - event: Event::Unfocus, clicks: true

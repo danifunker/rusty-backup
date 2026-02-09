@@ -18,8 +18,7 @@ path = "src/main.rs"
 default = []
 
 [dependencies]
-eframe = "0.33"
-egui = "0.33"
+fltk = { version = "1.5", features = ["fltk-bundled"] }
 rfd = "0.15"
 anyhow = "1"
 thiserror = "1"
