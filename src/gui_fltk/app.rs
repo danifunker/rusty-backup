@@ -14,6 +14,13 @@ pub struct LoadedBackupState {
     pub backup_path: Option<String>,
 }
 
+// Shared state for currently loaded disk image file
+#[derive(Clone, Default)]
+pub struct LoadedFileState {
+    pub file_path: Option<std::path::PathBuf>,
+    pub partition_table: Option<rusty_backup::partition::PartitionTable>,
+}
+
 pub struct RustyBackupApp {
     wind: window::Window,
     _top_bar: group::Group,
@@ -22,6 +29,7 @@ pub struct RustyBackupApp {
     progress_state: ProgressState,
     devices: Vec<DiskDevice>,
     loaded_backup: Arc<Mutex<LoadedBackupState>>,
+    loaded_file: Arc<Mutex<LoadedFileState>>,
 }
 
 impl RustyBackupApp {
@@ -47,6 +55,9 @@ impl RustyBackupApp {
 
         // Create shared loaded backup state
         let loaded_backup = Arc::new(Mutex::new(LoadedBackupState::default()));
+
+        // Create shared loaded file state
+        let loaded_file = Arc::new(Mutex::new(LoadedFileState::default()));
 
         // Create top bar (horizontal group for buttons and version)
         let top_bar = group::Group::new(5, 5, 890, 35, None);
@@ -206,6 +217,7 @@ impl RustyBackupApp {
             &devices,
             log_panel.clone(),
             loaded_backup.clone(),
+            loaded_file.clone(),
             close_backup_btn.clone(),
         );
         let inspect_source_choice = inspect_tab.get_source_choice();
@@ -378,6 +390,7 @@ impl RustyBackupApp {
             progress_state,
             devices,
             loaded_backup,
+            loaded_file,
         }
     }
 

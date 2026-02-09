@@ -289,51 +289,32 @@ impl RestoreTab {
 
         // View partitions button - need to pass backup path so it can load metadata
         self.view_partitions_btn.set_callback({
-            let backup_input = self.backup_input.clone();
+            let loaded = self.loaded_backup.clone();
             let log = self.log_panel.clone();
 
             move |_| {
-                let backup_path = PathBuf::from(backup_input.value());
-                let metadata_path = backup_path.join("metadata.json");
-
-                if let Ok(json) = std::fs::read_to_string(&metadata_path) {
-                    if let Ok(metadata) = serde_json::from_str::<
-                        rusty_backup::backup::metadata::BackupMetadata,
-                    >(&json)
-                    {
-                        // Convert to PartitionInfo for viewer
-                        let partitions: Vec<rusty_backup::partition::PartitionInfo> = metadata
-                            .partitions
-                            .iter()
-                            .map(|p| {
-                                rusty_backup::partition::PartitionInfo {
-                                    index: p.index,
-                                    partition_type_byte: p.partition_type_byte,
-                                    type_name: p.type_name.clone(),
-                                    start_lba: p.start_lba,
-                                    size_bytes: p.original_size_bytes,
-                                    bootable: false, // Not stored in metadata
-                                    is_logical: p.is_logical,
-                                    is_extended_container: false,
-                                    partition_type_string: None,
-                                }
-                            })
-                            .collect();
-
-                        // Open partition viewer window
-                        let mut viewer = super::partition_viewer::PartitionViewerWindow::new(
-                            &partitions,
-                            &backup_path
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy(),
-                        );
-                        viewer.show();
-                    } else {
-                        log.error("Failed to parse backup metadata");
-                    }
+                // Get metadata from loaded backup
+                let metadata_opt = if let Ok(state) = loaded.lock() {
+                    state.metadata.clone()
                 } else {
-                    log.error("Could not read backup metadata");
+                    None
+                };
+
+                match metadata_opt {
+                    Some(metadata) => {
+                        // Open partition viewer window with full metadata
+                        let mut viewer =
+                            super::partition_viewer::PartitionViewerWindow::new_from_metadata(
+                                &metadata,
+                            );
+                        viewer.show();
+                    }
+                    None => {
+                        dialog::message_default(
+                            "No backup loaded. Please select a backup folder first.",
+                        );
+                        log.warn("Attempted to view partitions without loaded backup");
+                    }
                 }
             }
         });

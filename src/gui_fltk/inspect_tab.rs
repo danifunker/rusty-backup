@@ -1,5 +1,5 @@
 use super::log_panel::LogPanel;
-use crate::gui_fltk::app::LoadedBackupState;
+use crate::gui_fltk::app::{LoadedBackupState, LoadedFileState};
 use fltk::{prelude::*, *};
 use rusty_backup::device::DiskDevice;
 use std::path::PathBuf;
@@ -26,6 +26,7 @@ pub struct InspectTab {
 
     // Shared state
     loaded_backup: Arc<Mutex<LoadedBackupState>>,
+    loaded_file: Arc<Mutex<LoadedFileState>>,
     close_backup_btn: button::Button,
     log_panel: LogPanel,
     devices: Vec<DiskDevice>,
@@ -40,6 +41,7 @@ impl InspectTab {
         devices: &[DiskDevice],
         log_panel: LogPanel,
         loaded_backup: Arc<Mutex<LoadedBackupState>>,
+        loaded_file: Arc<Mutex<LoadedFileState>>,
         close_backup_btn: button::Button,
     ) -> Self {
         let mut y_pos = y + 10;
@@ -109,6 +111,7 @@ impl InspectTab {
             selected_device_idx: None,
             image_file_path: None,
             loaded_backup,
+            loaded_file,
             close_backup_btn,
             log_panel,
             devices: devices_clone,
