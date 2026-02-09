@@ -132,18 +132,128 @@ impl InspectTab {
         });
 
         // Open file button
-        self.open_file_btn.set_callback(|_| {
-            if let Some(path) = rfd::FileDialog::new()
-                .set_title("Select Disk Image to Inspect")
-                .add_filter(
-                    "Disk Images",
-                    &["img", "raw", "bin", "iso", "vhd", "vhdx", "vmdk", "qcow2"],
-                )
-                .add_filter("All Files", &["*"])
-                .pick_file()
-            {
-                // TODO: Load image info and enable buttons
-                dialog::message_default(&format!("Inspecting: {}", path.display()));
+        self.open_file_btn.set_callback({
+            let mut info_buffer = self.info_buffer.clone();
+            let mut view_btn = self.view_partitions_btn.clone();
+            let mut browse_btn = self.browse_filesystem_btn.clone();
+            let mut export_btn = self.export_vhd_btn.clone();
+            let log = self.log_panel.clone();
+            let loaded_file = self.loaded_file.clone();
+
+            move |_| {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Select Disk Image to Inspect")
+                    .add_filter(
+                        "Disk Images",
+                        &["img", "raw", "bin", "iso", "vhd", "vhdx", "vmdk", "qcow2"],
+                    )
+                    .add_filter("All Files", &["*"])
+                    .pick_file()
+                {
+                    log.info(format!("Opening image file: {}", path.display()));
+
+                    match std::fs::File::open(&path) {
+                        Ok(file) => {
+                            use std::io::{BufReader, Read, Seek, SeekFrom};
+                            
+                            let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+                            let mut reader = BufReader::new(file);
+
+                            // Detect VHD: check if last 512 bytes contain "conectix" cookie
+                            let data_size = if file_size >= 512 {
+                                if let Ok(mut f) = std::fs::File::open(&path) {
+                                    if f.seek(SeekFrom::End(-512)).is_ok() {
+                                        let mut cookie = [0u8; 8];
+                                        if f.read_exact(&mut cookie).is_ok() && &cookie == b"conectix" {
+                                            let ds = file_size - 512;
+                                            log.info(format!("Detected Fixed VHD (data: {} bytes)", ds));
+                                            Some(ds)
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+
+                            // Use a limited reader if VHD was detected
+                            let detect_result = if let Some(ds) = data_size {
+                                reader.seek(SeekFrom::Start(0)).ok();
+                                let mut limited = reader.take(ds);
+                                rusty_backup::partition::PartitionTable::detect(&mut limited)
+                            } else {
+                                rusty_backup::partition::PartitionTable::detect(&mut reader)
+                            };
+
+                            match detect_result {
+                                Ok(table) => {
+                                    let partitions = table.partitions();
+                                    let table_type = match &table {
+                                        rusty_backup::partition::PartitionTable::Mbr(_) => "MBR",
+                                        rusty_backup::partition::PartitionTable::Gpt { .. } => "GPT",
+                                        rusty_backup::partition::PartitionTable::Apm(_) => "APM",
+                                        rusty_backup::partition::PartitionTable::None { .. } => "None (Superfloppy)",
+                                    };
+                                    
+                                    let mut info = String::new();
+                                    info.push_str(&format!("File: {}\n", path.file_name().unwrap_or_default().to_string_lossy()));
+                                    info.push_str(&format!("Size: {} bytes\n", data_size.unwrap_or(file_size)));
+                                    info.push_str(&format!("Partition Table: {}\n", table_type));
+                                    info.push_str(&format!("Partitions: {}\n\n", partitions.len()));
+                                    
+                                    for part in &partitions {
+                                        info.push_str(&format!(
+                                            "  [{}] {} - Type: 0x{:02X}, Start: LBA {}, Size: {}\n",
+                                            part.index,
+                                            part.type_name,
+                                            part.partition_type_byte,
+                                            part.start_lba,
+                                            rusty_backup::partition::format_size(part.size_bytes)
+                                        ));
+                                    }
+                                    
+                                    info_buffer.set_text(&info);
+                                    
+                                    // Store loaded file state
+                                    if let Ok(mut state) = loaded_file.lock() {
+                                        state.file_path = Some(path.clone());
+                                        state.partition_table = Some(table);
+                                    }
+                                    
+                                    // Enable buttons
+                                    if !partitions.is_empty() {
+                                        view_btn.activate();
+                                        browse_btn.activate();
+                                        export_btn.activate();
+                                    }
+                                    
+                                    log.info(format!("Loaded {} partition(s) from {}", partitions.len(), path.file_name().unwrap_or_default().to_string_lossy()));
+                                }
+                                Err(e) => {
+                                    let info = format!(
+                                        "File: {}\nSize: {} bytes\n\nCould not parse partition table: {}",
+                                        path.file_name().unwrap_or_default().to_string_lossy(),
+                                        file_size,
+                                        e
+                                    );
+                                    info_buffer.set_text(&info);
+                                    view_btn.deactivate();
+                                    browse_btn.deactivate();
+                                    log.warn(format!("Failed to parse partition table: {}", e));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            dialog::message_default(&format!("Failed to open file: {}", e));
+                            log.error(format!("Failed to open {}: {}", path.display(), e));
+                        }
+                    }
+                }
             }
         });
 
