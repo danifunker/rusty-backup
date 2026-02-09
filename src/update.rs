@@ -1,4 +1,4 @@
-//! Update checking functionality
+//! Update checking functionality and configuration
 
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -6,17 +6,20 @@ use std::path::PathBuf;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct UpdateConfig {
+    #[cfg(feature = "update-checker")]
     pub update_check: UpdateCheckConfig,
     #[serde(default)]
     pub chdman_path: Option<String>,
 }
 
+#[cfg(feature = "update-checker")]
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct UpdateCheckConfig {
     pub enabled: bool,
     pub repository_url: String,
 }
 
+#[cfg(feature = "update-checker")]
 impl UpdateCheckConfig {
     /// Get the API URL for checking releases
     pub fn api_url(&self) -> String {
@@ -38,6 +41,7 @@ impl UpdateCheckConfig {
     }
 }
 
+#[cfg(feature = "update-checker")]
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct GithubRelease {
@@ -48,6 +52,7 @@ struct GithubRelease {
 impl Default for UpdateConfig {
     fn default() -> Self {
         Self {
+            #[cfg(feature = "update-checker")]
             update_check: UpdateCheckConfig {
                 enabled: true,
                 repository_url: "https://github.com/danifunker/rusty-backup".to_string(),
@@ -127,6 +132,7 @@ impl UpdateConfig {
     }
 }
 
+#[cfg(feature = "update-checker")]
 #[derive(Debug, Clone)]
 pub struct UpdateInfo {
     pub current_version: String,
@@ -135,6 +141,7 @@ pub struct UpdateInfo {
     pub is_outdated: bool,
 }
 
+#[cfg(feature = "update-checker")]
 /// Check for updates from GitHub releases
 pub fn check_for_updates(
     config: &UpdateCheckConfig,

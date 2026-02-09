@@ -1,16 +1,9 @@
 use super::log_panel::LogPanel;
+use crate::gui_fltk::app::LoadedBackupState;
 use fltk::{prelude::*, *};
 use rusty_backup::device::DiskDevice;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-
-// Shared state for the inspect tab
-#[derive(Clone, Default)]
-struct InspectState {
-    backup_folder: Option<PathBuf>,
-    metadata: Option<rusty_backup::backup::metadata::BackupMetadata>,
-    partition_labels: Vec<(usize, String, String, u64)>, // (index, type_name, volume_label, size_bytes)
-}
 
 pub struct InspectTab {
     // Source selection
@@ -30,9 +23,10 @@ pub struct InspectTab {
     // State
     selected_device_idx: Option<usize>,
     image_file_path: Option<PathBuf>,
-    state: Arc<Mutex<InspectState>>,
 
-    // Shared
+    // Shared state
+    loaded_backup: Arc<Mutex<LoadedBackupState>>,
+    close_backup_btn: button::Button,
     log_panel: LogPanel,
     devices: Vec<DiskDevice>,
 }
@@ -45,6 +39,8 @@ impl InspectTab {
         _h: i32,
         devices: &[DiskDevice],
         log_panel: LogPanel,
+        loaded_backup: Arc<Mutex<LoadedBackupState>>,
+        close_backup_btn: button::Button,
     ) -> Self {
         let mut y_pos = y + 10;
         let label_w = 100;
@@ -101,8 +97,6 @@ impl InspectTab {
         export_vhd_btn.deactivate();
 
         let devices_clone = devices.to_vec();
-        let state = Arc::new(Mutex::new(InspectState::default()));
-
         let mut tab = Self {
             source_choice,
             open_file_btn,
@@ -114,7 +108,8 @@ impl InspectTab {
             export_vhd_btn,
             selected_device_idx: None,
             image_file_path: None,
-            state,
+            loaded_backup,
+            close_backup_btn,
             log_panel,
             devices: devices_clone,
         };
@@ -156,7 +151,8 @@ impl InspectTab {
             let mut browse_btn = self.browse_filesystem_btn.clone();
             let mut export_btn = self.export_vhd_btn.clone();
             let log = self.log_panel.clone();
-            let state = self.state.clone();
+            let loaded = self.loaded_backup.clone();
+            let mut close_btn = self.close_backup_btn.clone();
 
             move |_| {
                 if let Some(path) = rfd::FileDialog::new()
@@ -169,75 +165,59 @@ impl InspectTab {
                     if metadata_path.exists() {
                         // Load and display backup metadata
                         if let Ok(json) = std::fs::read_to_string(&metadata_path) {
-                            if let Ok(metadata) = serde_json::from_str::<rusty_backup::backup::metadata::BackupMetadata>(&json) {
+                            if let Ok(metadata) = serde_json::from_str::<
+                                rusty_backup::backup::metadata::BackupMetadata,
+                            >(&json)
+                            {
                                 let mut info_text = String::new();
-                                info_text.push_str(&format!("Backup: {}\n", path.file_name().unwrap_or_default().to_string_lossy()));
+                                info_text.push_str(&format!(
+                                    "Backup: {}\n",
+                                    path.file_name().unwrap_or_default().to_string_lossy()
+                                ));
                                 info_text.push_str(&format!("Version: {}\n", metadata.version));
-                                info_text.push_str(&format!("Alignment: {} ({} sectors)\n\n",
+                                info_text.push_str(&format!(
+                                    "Alignment: {} ({} sectors)\n\n",
                                     metadata.alignment.detected_type,
-                                    metadata.alignment.alignment_sectors));
-                                info_text.push_str(&format!("Partitions: {}\n", metadata.partitions.len()));
+                                    metadata.alignment.alignment_sectors
+                                ));
+                                info_text.push_str(&format!(
+                                    "Partitions: {}\n",
+                                    metadata.partitions.len()
+                                ));
 
                                 for part in &metadata.partitions {
-                                    info_text.push_str(&format!("  [{}] {} - {} bytes\n",
-                                        part.index, part.type_name, part.original_size_bytes));
+                                    info_text.push_str(&format!(
+                                        "  [{}] {} - {} bytes\n",
+                                        part.index, part.type_name, part.original_size_bytes
+                                    ));
                                 }
 
                                 info_buffer.set_text(&info_text);
 
-                                // Pre-load volume labels for all partitions
-                                log.info("Loading partition labels...");
-                                let mut partition_labels = Vec::new();
-                                let compression_type = metadata.compression_type.clone();
-
-                                for part in &metadata.partitions {
-                                    let volume_label = match crate::gui_fltk::fs_loader::load_filesystem_from_backup(
-                                        &path,
-                                        part.index,
-                                        part.partition_type_byte,
-                                        &compression_type,
-                                    ) {
-                                        Ok(fs) => {
-                                            let label = fs.volume_label().unwrap_or("").to_string();
-                                            log.info(format!("Partition {} ({}) label: '{}'", part.index, part.type_name,
-                                                if label.is_empty() { "NONE" } else { &label }));
-                                            label
-                                        }
-                                        Err(e) => {
-                                            log.warn(format!("Failed to load partition {}: {}", part.index, e));
-                                            String::new()
-                                        }
-                                    };
-
-                                    partition_labels.push((
-                                        part.index,
-                                        part.type_name.clone(),
-                                        volume_label,
-                                        part.original_size_bytes,
-                                    ));
+                                // Update shared state
+                                if let Ok(mut state) = loaded.lock() {
+                                    state.metadata = Some(metadata.clone());
+                                    state.backup_path = Some(path.to_string_lossy().to_string());
                                 }
 
-                                // Store state for other buttons
-                                if let Ok(mut st) = state.lock() {
-                                    st.backup_folder = Some(path.clone());
-                                    st.metadata = Some(metadata.clone());
-                                    st.partition_labels = partition_labels;
-                                }
+                                // Show close backup button
+                                close_btn.show();
+                                close_btn.parent().unwrap().redraw();
 
-                                // Enable buttons
+                                // Enable action buttons
                                 view_btn.activate();
                                 browse_btn.activate();
                                 export_btn.activate();
 
-                                log.info(format!("Loaded backup info: {} partitions", metadata.partitions.len()));
+                                log.info("Loaded backup info");
+                            } else {
+                                log.error("Failed to parse metadata.json");
                             }
+                        } else {
+                            log.error("Failed to read metadata.json");
                         }
-                    } else if rusty_backup::clonezilla::metadata::is_clonezilla_image(&path) {
-                        info_buffer.set_text(&format!("Clonezilla backup detected at:\n{}", path.display()));
-                        view_btn.activate();
-                        log.info("Loaded Clonezilla backup");
                     } else {
-                        dialog::message_default("Selected folder does not contain a valid backup.");
+                        log.error("Not a valid backup folder (metadata.json not found)");
                     }
                 }
             }
@@ -252,24 +232,17 @@ impl InspectTab {
         // Browse filesystem button
         self.browse_filesystem_btn.set_callback({
             let log = self.log_panel.clone();
-            let state = self.state.clone();
+            let loaded = self.loaded_backup.clone();
 
             move |_| {
-                // Get partition info with pre-loaded labels
-                let partition_choices: Vec<(usize, String, String, u64)>;
-                let backup_folder: PathBuf;
-                let compression_type_str: String;
+                // Get backup info from shared state
+                let backup_path: PathBuf;
+                let metadata: rusty_backup::backup::metadata::BackupMetadata;
 
-                if let Ok(st) = state.lock() {
-                    if let Some(ref metadata) = st.metadata {
-                        if let Some(ref folder) = st.backup_folder {
-                            partition_choices = st.partition_labels.clone();
-                            backup_folder = folder.clone();
-                            compression_type_str = metadata.compression_type.clone();
-                        } else {
-                            dialog::message_default("No backup folder loaded");
-                            return;
-                        }
+                if let Ok(state) = loaded.lock() {
+                    if let (Some(ref meta), Some(ref path)) = (&state.metadata, &state.backup_path) {
+                        backup_path = PathBuf::from(path);
+                        metadata = meta.clone();
                     } else {
                         dialog::message_default("No backup loaded");
                         return;
@@ -278,10 +251,24 @@ impl InspectTab {
                     return;
                 }
 
-                if partition_choices.is_empty() {
+                if metadata.partitions.is_empty() {
                     dialog::message_default("No partitions found in backup");
                     return;
                 }
+
+                // Build partition choices for selector
+                let partition_choices: Vec<(usize, String, String, u64)> = metadata
+                    .partitions
+                    .iter()
+                    .map(|p| {
+                        (
+                            p.index,
+                            p.type_name.clone(),
+                            String::new(), // Volume label - we'll load it when opening
+                            p.original_size_bytes,
+                        )
+                    })
+                    .collect();
 
                 // Show partition selector dialog
                 let selection = match super::partition_selector::show_partition_selector(&partition_choices) {
@@ -290,49 +277,29 @@ impl InspectTab {
                 };
 
                 // Get selected partition info
-                let (part_idx, type_name, volume_label, _size_bytes) = match partition_choices.get(selection) {
-                    Some(info) => info.clone(),
-                    None => {
-                        dialog::message_default("Invalid partition selection");
-                        return;
-                    }
-                };
+                let part_info = &metadata.partitions[selection];
 
-                let type_byte = if let Ok(st) = state.lock() {
-                    if let Some(ref metadata) = st.metadata {
-                        metadata.partitions.iter()
-                            .find(|p| p.index == part_idx)
-                            .map(|p| p.partition_type_byte)
-                            .unwrap_or(0)
-                    } else {
-                        return;
-                    }
-                } else {
-                    return;
-                };
+                log.info(format!("Opening filesystem browser for partition {}", part_info.index));
 
-                log.info(format!("Opening filesystem browser for partition {}", part_idx));
-
-                // Load filesystem in background thread, then send to main thread via fltk channel
-                let log_clone = log.clone();
+                // Load filesystem from backup
+                log.info(format!("Loading partition {} from backup...", part_info.index));
 
                 // Create fltk channel for thread-safe communication
                 let (sender, receiver) = app::channel::<(String, String, std::sync::Arc<std::sync::Mutex<Option<Box<dyn rusty_backup::fs::filesystem::Filesystem>>>>)>();
 
-                let title_volume = if volume_label.is_empty() {
-                    type_name.clone()
-                } else {
-                    volume_label.clone()
-                };
+                let log_clone = log.clone();
+                let backup_path_clone = backup_path.clone();
+                let part_idx = part_info.index;
+                let type_byte = part_info.partition_type_byte;
+                let compression_type = metadata.compression_type.clone();
+                let type_name = part_info.type_name.clone();
 
                 std::thread::spawn(move || {
-                    log_clone.info(format!("Loading partition {} from backup...", part_idx));
-
                     match crate::gui_fltk::fs_loader::load_filesystem_from_backup(
-                        &backup_folder,
+                        &backup_path_clone,
                         part_idx,
                         type_byte,
-                        &compression_type_str,
+                        &compression_type,
                     ) {
                         Ok(filesystem) => {
                             let fs_type = filesystem.fs_type().to_string();
@@ -340,10 +307,10 @@ impl InspectTab {
 
                             // Wrap filesystem in Arc<Mutex<Option<>>> for FilesystemBrowserWindow
                             let fs_wrapped = std::sync::Arc::new(std::sync::Mutex::new(Some(filesystem)));
-                            let title = format!("Browse: {}", title_volume);
+                            let title = format!("Browse: {}", type_name);
 
-                            // Send to main thread via fltk channel (title, volume_label, filesystem)
-                            sender.send((title, title_volume.clone(), fs_wrapped));
+                            // Send to main thread via fltk channel
+                            sender.send((title, type_name.clone(), fs_wrapped));
                         }
                         Err(e) => {
                             log_clone.error(format!("Failed to load filesystem: {}", e));
@@ -389,5 +356,13 @@ impl InspectTab {
 
     pub fn update_info(&mut self, info: &str) {
         self.info_buffer.set_text(info);
+    }
+
+    pub fn clear_info(&mut self) {
+        self.info_buffer.set_text("");
+    }
+
+    pub fn get_info_buffer(&self) -> text::TextBuffer {
+        self.info_buffer.clone()
     }
 }

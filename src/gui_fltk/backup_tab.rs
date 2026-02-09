@@ -149,10 +149,10 @@ impl BackupTab {
         checksum_choice.add_choice("SHA-256 (recommended)");
         checksum_choice.add_choice("CRC-32 (faster)");
         checksum_choice.set_value(0);
-        y_pos += row_h + spacing * 3;
+        y_pos += row_h + spacing; // Minimal spacing before Start button
 
         // Start button
-        let mut start_btn = button::Button::new(x + 10, y_pos, 150, 40, "Start Backup");
+        let mut start_btn = button::Button::new(x + 10, y_pos, 150, 30, "Start Backup");
         start_btn.set_color(enums::Color::from_rgb(0, 120, 0));
         start_btn.set_label_color(enums::Color::White);
 

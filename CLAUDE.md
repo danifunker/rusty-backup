@@ -13,6 +13,7 @@ Licensed under AGPL-3.0. The full specification lives in `PROJECT-SPEC.md`.
 ```bash
 cargo build                    # Debug build (version: x.y.z-dev)
 cargo build --release          # Release build (version from Cargo.toml or RELEASE_VERSION env)
+cargo build --release --no-default-features  # Build without update checker (for old systems)
 cargo run                      # Run (debug)
 cargo run --release            # Run (release)
 cargo test                     # All tests
@@ -23,6 +24,15 @@ cargo fmt --check              # Check formatting
 cargo fmt                      # Auto-format
 cargo clippy                   # Lint
 ```
+
+## Build Features
+
+### Update Checker (optional)
+- Feature flag: `update-checker` (enabled by default)
+- Dependencies: `reqwest`, `webbrowser`
+- Disable with: `cargo build --no-default-features`
+- Use case: Building for very old systems without TLS/modern networking support
+- When disabled: Banner and update checking code are not compiled, reducing binary size and removing network dependencies
 
 ## Build Infrastructure
 

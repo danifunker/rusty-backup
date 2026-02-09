@@ -3,14 +3,25 @@ use super::{
     restore_tab::RestoreTab,
 };
 use fltk::{prelude::*, *};
+use rusty_backup::backup::metadata::BackupMetadata;
 use rusty_backup::device::{self, DiskDevice};
+use std::sync::{Arc, Mutex};
+
+// Shared state for currently loaded backup
+#[derive(Clone, Default)]
+pub struct LoadedBackupState {
+    pub metadata: Option<BackupMetadata>,
+    pub backup_path: Option<String>,
+}
 
 pub struct RustyBackupApp {
     wind: window::Window,
+    _top_bar: group::Group,
     tabs: group::Tabs,
     log_panel: LogPanel,
     progress_state: ProgressState,
     devices: Vec<DiskDevice>,
+    loaded_backup: Arc<Mutex<LoadedBackupState>>,
 }
 
 impl RustyBackupApp {
@@ -34,23 +45,72 @@ impl RustyBackupApp {
         // Enumerate devices
         let devices = device::enumerate_devices();
 
-        // Create tabs (top section)
-        let mut tabs = group::Tabs::new(5, 5, 890, 480, None);
+        // Create shared loaded backup state
+        let loaded_backup = Arc::new(Mutex::new(LoadedBackupState::default()));
+
+        // Create top bar (horizontal group for buttons and version)
+        let top_bar = group::Group::new(5, 5, 890, 35, None);
+
+        // Refresh Devices button
+        let mut refresh_btn = button::Button::new(5, 5, 120, 30, "Refresh Devices");
+
+        // Settings button
+        let mut settings_btn = button::Button::new(130, 5, 80, 30, "Settings");
+
+        // Close Backup button (initially hidden)
+        let mut close_backup_btn = button::Button::new(215, 5, 100, 30, "Close Backup");
+        close_backup_btn.hide();
+
+        // Linux: Request Elevation button (conditional)
+        #[cfg(target_os = "linux")]
+        let mut elevate_btn = {
+            let mut btn = button::Button::new(320, 5, 130, 30, "Request Elevation");
+            if nix::unistd::geteuid().is_root() {
+                btn.hide(); // Hide if already elevated
+            }
+            btn
+        };
+
+        // Version label (right-aligned)
+        let mut version_label = frame::Frame::new(700, 5, 90, 30, None);
+        version_label.set_label(&format!("v{}", env!("APP_VERSION")));
+
+        #[cfg(feature = "update-checker")]
+        // Update notification (initially hidden) - icon and button on top bar
+        let mut update_icon = frame::Frame::new(795, 5, 30, 30, "🎉");
+        #[cfg(feature = "update-checker")]
+        update_icon.set_label_size(18);
+        #[cfg(feature = "update-checker")]
+        update_icon.hide();
+
+        #[cfg(feature = "update-checker")]
+        let mut view_update_btn = button::Button::new(825, 5, 65, 30, "Update");
+        #[cfg(feature = "update-checker")]
+        view_update_btn.set_color(enums::Color::from_rgb(0, 120, 200));
+        #[cfg(feature = "update-checker")]
+        view_update_btn.set_label_color(enums::Color::White);
+        #[cfg(feature = "update-checker")]
+        view_update_btn.hide();
+
+        top_bar.end();
+
+        // Create tabs (below top bar, no banner)
+        let mut tabs = group::Tabs::new(5, 45, 890, 440, None);
 
         // Create shared state
         let progress_state = ProgressState::default();
 
         // Backup tab
-        let backup_group = group::Group::new(5, 30, 890, 455, "Backup\t");
+        let backup_group = group::Group::new(5, 70, 890, 415, "Backup\t");
         // Note: log_panel will be created after tabs.end(), so pass None for now
         backup_group.end();
 
         // Restore tab
-        let restore_group = group::Group::new(5, 30, 890, 455, "Restore\t");
+        let restore_group = group::Group::new(5, 70, 890, 415, "Restore\t");
         restore_group.end();
 
         // Inspect tab
-        let inspect_group = group::Group::new(5, 30, 890, 455, "Inspect\t");
+        let inspect_group = group::Group::new(5, 70, 890, 415, "Inspect\t");
         inspect_group.end();
 
         tabs.end();
@@ -80,13 +140,52 @@ impl RustyBackupApp {
             }
         });
 
+        // Wire up top bar button callbacks
+        refresh_btn.set_callback({
+            let mut log = log_panel.clone();
+            move |_| {
+                log.info("Refreshing device list...");
+                let new_devices = device::enumerate_devices();
+                log.info(format!("Found {} device(s)", new_devices.len()));
+                // TODO: Update device lists in tabs
+            }
+        });
+
+        settings_btn.set_callback({
+            let mut log = log_panel.clone();
+            move |_| {
+                log.info("Settings window not yet implemented");
+                // TODO: Open settings window
+            }
+        });
+
+        #[cfg(feature = "update-checker")]
+        // Wire up update button
+        let releases_url = Arc::new(Mutex::new(String::new()));
+
+        #[cfg(feature = "update-checker")]
+        view_update_btn.set_callback({
+            let url = releases_url.clone();
+            let mut log = log_panel.clone();
+            move |_| {
+                if let Ok(url_str) = url.lock() {
+                    if !url_str.is_empty() {
+                        match webbrowser::open(url_str.as_str()) {
+                            Ok(_) => log.info("Opened release page in browser"),
+                            Err(e) => log.warn(format!("Failed to open browser: {}", e)),
+                        }
+                    }
+                }
+            }
+        });
+
         // Now create tab contents with log_panel available
         backup_group.begin();
         let _backup_tab = BackupTab::new(
             5,
-            30,
+            70,
             890,
-            455,
+            415,
             &devices,
             log_panel.clone(),
             progress_state.clone(),
@@ -94,20 +193,58 @@ impl RustyBackupApp {
         backup_group.end();
 
         restore_group.begin();
-        let _restore_tab = RestoreTab::new(
+        let restore_tab = RestoreTab::new(
             5,
-            30,
+            70,
             890,
-            455,
+            415,
             &devices,
             log_panel.clone(),
             progress_state.clone(),
+            loaded_backup.clone(),
+            close_backup_btn.clone(),
         );
         restore_group.end();
 
         inspect_group.begin();
-        let _inspect_tab = InspectTab::new(5, 30, 890, 455, &devices, log_panel.clone());
+        let inspect_tab = InspectTab::new(
+            5,
+            70,
+            890,
+            415,
+            &devices,
+            log_panel.clone(),
+            loaded_backup.clone(),
+            close_backup_btn.clone(),
+        );
         inspect_group.end();
+
+        // Wire up close backup button to clear info displays
+        {
+            let mut restore_buf = restore_tab.get_info_buffer();
+            let mut inspect_buf = inspect_tab.get_info_buffer();
+            let mut restore_input = restore_tab.get_backup_input();
+
+            close_backup_btn.set_callback({
+                let mut log = log_panel.clone();
+                let loaded = loaded_backup.clone();
+                let mut btn = close_backup_btn.clone();
+                move |_| {
+                    if let Ok(mut state) = loaded.lock() {
+                        state.metadata = None;
+                        state.backup_path = None;
+                        log.info("Backup closed");
+                        btn.hide();
+                        btn.parent().unwrap().redraw();
+
+                        // Clear info displays
+                        restore_buf.set_text("");
+                        inspect_buf.set_text("");
+                        restore_input.set_value("");
+                    }
+                }
+            });
+        }
 
         // Add initial log messages
         {
@@ -131,15 +268,71 @@ impl RustyBackupApp {
             log.refresh();
         }
 
+        #[cfg(feature = "update-checker")]
+        // Check for updates in background
+        {
+            let mut log = log_panel.clone();
+            let mut icon = update_icon.clone();
+            let mut button = view_update_btn.clone();
+            let url_storage = releases_url.clone();
+
+            std::thread::spawn(move || {
+                let config = rusty_backup::update::UpdateConfig::load();
+                if config.update_check.enabled {
+                    match rusty_backup::update::check_for_updates(
+                        &config.update_check,
+                        env!("APP_VERSION"),
+                    ) {
+                        Ok(info) => {
+                            if info.is_outdated {
+                                // Store the URL for the View Update button
+                                if let Ok(mut url) = url_storage.lock() {
+                                    *url = info.releases_url.clone();
+                                }
+
+                                // Clone values for closures
+                                let latest_ver = info.latest_version.clone();
+                                let log_msg = format!(
+                                    "Update available: v{} → v{}",
+                                    info.current_version, latest_ver
+                                );
+
+                                // Update UI on main thread - show icon and button
+                                app::awake_callback(move || {
+                                    icon.set_tooltip(&format!("Update available: v{}", latest_ver));
+                                    icon.show();
+                                    button.show();
+                                    if let Some(mut parent) = icon.parent() {
+                                        parent.redraw();
+                                    }
+                                });
+
+                                log.info(log_msg);
+                            } else {
+                                log.info("Software is up to date");
+                            }
+                        }
+                        Err(e) => {
+                            log.warn(format!("Update check failed: {}", e));
+                        }
+                    }
+                } else {
+                    log.info("Update checking is disabled");
+                }
+            });
+        }
+
         wind.end();
         wind.show();
 
         Self {
             wind,
+            _top_bar: top_bar,
             tabs,
             log_panel,
             progress_state,
             devices,
+            loaded_backup,
         }
     }
 

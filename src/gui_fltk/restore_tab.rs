@@ -1,7 +1,9 @@
 use super::log_panel::LogPanel;
 use super::progress::ProgressState;
+use crate::gui_fltk::app::LoadedBackupState;
 use fltk::{prelude::*, *};
 use rusty_backup::device::DiskDevice;
+use std::sync::{Arc, Mutex};
 
 use rusty_backup::restore::RestoreAlignment;
 use std::path::PathBuf;
@@ -32,13 +34,12 @@ pub struct RestoreTab {
     start_btn: button::Button,
 
     // State
-    backup_folder: Option<PathBuf>,
     selected_device_idx: Option<usize>,
     target_file_path: Option<PathBuf>,
-    loaded_metadata: Option<rusty_backup::backup::metadata::BackupMetadata>,
-    detected_alignment: Option<rusty_backup::partition::AlignmentType>,
 
-    // Shared
+    // Shared state
+    loaded_backup: Arc<Mutex<LoadedBackupState>>,
+    close_backup_btn: button::Button,
     log_panel: LogPanel,
     progress_state: ProgressState,
     devices: Vec<DiskDevice>,
@@ -53,6 +54,8 @@ impl RestoreTab {
         devices: &[DiskDevice],
         log_panel: LogPanel,
         progress_state: ProgressState,
+        loaded_backup: Arc<Mutex<LoadedBackupState>>,
+        close_backup_btn: button::Button,
     ) -> Self {
         let mut y_pos = y + 10;
         let label_w = 120;
@@ -152,7 +155,7 @@ impl RestoreTab {
         y_pos += 40 + spacing * 2;
 
         // Start button
-        let mut start_btn = button::Button::new(x + 10, y_pos, 150, 40, "Start Restore");
+        let mut start_btn = button::Button::new(x + 10, y_pos, 150, 30, "Start Restore");
         start_btn.set_color(enums::Color::from_rgb(0, 100, 180));
         start_btn.set_label_color(enums::Color::White);
         start_btn.deactivate(); // Enable when ready
@@ -174,11 +177,10 @@ impl RestoreTab {
             view_partitions_btn,
             configure_sizes_btn,
             start_btn,
-            backup_folder: None,
             selected_device_idx: None,
             target_file_path: None,
-            loaded_metadata: None,
-            detected_alignment: None,
+            loaded_backup,
+            close_backup_btn,
             log_panel,
             progress_state,
             devices: devices_clone,
@@ -405,5 +407,13 @@ impl RestoreTab {
             let sectors = self.custom_alignment_input.value().parse().unwrap_or(2048);
             RestoreAlignment::Custom(sectors)
         }
+    }
+
+    pub fn get_info_buffer(&self) -> text::TextBuffer {
+        self.info_buffer.clone()
+    }
+
+    pub fn get_backup_input(&self) -> input::Input {
+        self.backup_input.clone()
     }
 }
