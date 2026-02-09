@@ -274,8 +274,12 @@ pub fn reconstruct_disk_from_backup(
     };
 
     let target_sectors = target_size / 512;
+    let is_superfloppy = metadata.partition_table_type == "None";
 
-    if let Some(gpt_data) = gpt {
+    if is_superfloppy {
+        // Superfloppy: no partition table to write — data starts at offset 0
+        log_cb("Superfloppy: no partition table to write");
+    } else if let Some(gpt_data) = gpt {
         // GPT restore: write protective MBR + primary GPT (LBAs 0-33)
         let patched_gpt = gpt_data.patch_for_restore(partition_sizes, target_sectors);
 

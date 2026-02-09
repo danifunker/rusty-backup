@@ -140,6 +140,21 @@ pub fn calculate_restore_layout(
     partition_sizes: &[RestorePartitionSize],
     target_size: u64,
 ) -> Result<Vec<PartitionSizeOverride>> {
+    // Superfloppy: single partition at offset 0, no alignment
+    if metadata.partition_table_type == "None" {
+        if let Some(pm) = metadata.partitions.first() {
+            return Ok(vec![PartitionSizeOverride {
+                index: 0,
+                start_lba: 0,
+                original_size: pm.original_size_bytes,
+                export_size: pm.original_size_bytes,
+                new_start_lba: None,
+                heads: 0,
+                sectors_per_track: 0,
+            }]);
+        }
+    }
+
     // Determine alignment parameters
     let (first_partition_lba, alignment_sectors, heads, spt) = match alignment {
         RestoreAlignment::Original => (
@@ -477,16 +492,21 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
     // Step 3: Read MBR and GPT from backup
     set_operation(&progress, "Reading partition table...");
     let is_gpt = metadata.partition_table_type == "GPT";
+    let is_superfloppy = metadata.partition_table_type == "None";
 
-    let mbr_path = config.backup_folder.join("mbr.bin");
-    let mbr_bytes = if mbr_path.exists() {
-        let data = fs::read(&mbr_path).context("failed to read mbr.bin")?;
-        let mut buf = [0u8; 512];
-        let copy_len = data.len().min(512);
-        buf[..copy_len].copy_from_slice(&data[..copy_len]);
-        Some(buf)
-    } else {
+    let mbr_bytes = if is_superfloppy {
         None
+    } else {
+        let mbr_path = config.backup_folder.join("mbr.bin");
+        if mbr_path.exists() {
+            let data = fs::read(&mbr_path).context("failed to read mbr.bin")?;
+            let mut buf = [0u8; 512];
+            let copy_len = data.len().min(512);
+            buf[..copy_len].copy_from_slice(&data[..copy_len]);
+            Some(buf)
+        } else {
+            None
+        }
     };
 
     // Load GPT data if this is a GPT backup
@@ -628,8 +648,8 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
     }
 
     // Step 6b: Clear any residual GPT structures from the target disk.
-    // Only needed for MBR restores — GPT restores will overwrite these areas.
-    if !is_gpt {
+    // Only needed for MBR restores — GPT restores and superfloppies write these areas directly.
+    if !is_gpt && !is_superfloppy {
         clear_gpt_structures(&mut target, config.target_size, &mut |msg| {
             log(&progress, LogLevel::Info, msg);
         })?;

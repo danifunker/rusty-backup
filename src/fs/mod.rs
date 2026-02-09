@@ -34,6 +34,60 @@ pub struct CompactResult {
     pub clusters_used: u32,
 }
 
+/// Auto-detect the filesystem type at a given offset by probing magic bytes.
+/// Returns a string hint: "fat", "ntfs", "exfat", "hfs", "hfsplus", or "unknown".
+fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> &'static str {
+    // Read first 12 bytes for FAT/NTFS/exFAT detection
+    if reader.seek(SeekFrom::Start(partition_offset)).is_err() {
+        return "unknown";
+    }
+    let mut buf = [0u8; 12];
+    if reader.read_exact(&mut buf).is_err() {
+        return "unknown";
+    }
+    if &buf[3..11] == b"NTFS    " {
+        return "ntfs";
+    }
+    if &buf[3..11] == b"EXFAT   " {
+        return "exfat";
+    }
+    if buf[0] == 0xEB || buf[0] == 0xE9 {
+        return "fat";
+    }
+
+    // Check for HFS/HFS+ at partition_offset + 1024
+    if reader
+        .seek(SeekFrom::Start(partition_offset + 1024))
+        .is_ok()
+    {
+        let mut hfs_buf = [0u8; 2];
+        if reader.read_exact(&mut hfs_buf).is_ok() {
+            let sig = u16::from_be_bytes(hfs_buf);
+            match sig {
+                0x4244 => {
+                    // Check for embedded HFS+ at offset 124-125 from MDB start
+                    let mut embed = [0u8; 2];
+                    if reader
+                        .seek(SeekFrom::Start(partition_offset + 1024 + 124))
+                        .is_ok()
+                        && reader.read_exact(&mut embed).is_ok()
+                    {
+                        let embed_sig = u16::from_be_bytes(embed);
+                        if embed_sig == 0x482B {
+                            return "hfsplus";
+                        }
+                    }
+                    return "hfs";
+                }
+                0x482B | 0x4858 => return "hfsplus",
+                _ => {}
+            }
+        }
+    }
+
+    "unknown"
+}
+
 /// Detect whether a type-0x07 partition is NTFS or exFAT by reading the OEM ID.
 /// Returns `"ntfs"`, `"exfat"`, or `"unknown"`.
 fn detect_0x07_type<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> &'static str {
@@ -68,6 +122,46 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
         return compact_partition_reader_by_string(reader, partition_offset, type_str);
     }
     match partition_type {
+        // Auto-detect (superfloppy / type byte 0)
+        0x00 => {
+            let fs_type = detect_filesystem_type(&mut reader, partition_offset);
+            match fs_type {
+                "fat" => {
+                    let (reader, info) = CompactFatReader::new(reader, partition_offset).ok()?;
+                    Some((
+                        Box::new(reader),
+                        CompactResult {
+                            original_size: info.original_size,
+                            compacted_size: info.compacted_size,
+                            clusters_used: info.clusters_used,
+                        },
+                    ))
+                }
+                "ntfs" => {
+                    let (reader, info) = CompactNtfsReader::new(reader, partition_offset).ok()?;
+                    Some((
+                        Box::new(reader),
+                        CompactResult {
+                            original_size: info.original_size,
+                            compacted_size: info.compacted_size,
+                            clusters_used: info.clusters_used,
+                        },
+                    ))
+                }
+                "exfat" => {
+                    let (reader, info) = CompactExfatReader::new(reader, partition_offset).ok()?;
+                    Some((
+                        Box::new(reader),
+                        CompactResult {
+                            original_size: info.original_size,
+                            compacted_size: info.compacted_size,
+                            clusters_used: info.clusters_used,
+                        },
+                    ))
+                }
+                _ => None,
+            }
+        }
         // FAT types
         0x01 | 0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C => {
             let (reader, info) = CompactFatReader::new(reader, partition_offset).ok()?;
@@ -150,6 +244,35 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
         return open_filesystem_by_string(reader, partition_offset, type_str);
     }
     match partition_type {
+        // Auto-detect (superfloppy / type byte 0)
+        0x00 => {
+            let fs_type = detect_filesystem_type(&mut reader, partition_offset);
+            match fs_type {
+                "fat" => Ok(Box::new(fat::FatFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "ntfs" => Ok(Box::new(ntfs::NtfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "exfat" => Ok(Box::new(exfat::ExfatFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "hfs" => Ok(Box::new(hfs::HfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "hfsplus" => Ok(Box::new(hfsplus::HfsPlusFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                _ => Err(FilesystemError::Unsupported(
+                    "could not detect filesystem type on superfloppy".into(),
+                )),
+            }
+        }
         // FAT12
         0x01 => Ok(Box::new(fat::FatFilesystem::open(
             reader,

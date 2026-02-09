@@ -184,17 +184,29 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
     let table = PartitionTable::detect(&mut source).context("failed to detect partition table")?;
     let alignment = partition::detect_alignment(&table);
     let partitions = table.partitions();
+    let is_superfloppy = matches!(table, PartitionTable::None { .. });
 
-    log(
-        &progress,
-        LogLevel::Info,
-        format!(
-            "Detected {} partition table with {} partition(s), alignment: {}",
-            table.type_name(),
-            partitions.len(),
-            alignment.alignment_type
-        ),
-    );
+    if is_superfloppy {
+        log(
+            &progress,
+            LogLevel::Info,
+            format!(
+                "Detected superfloppy (no partition table) with {} partition(s)",
+                partitions.len(),
+            ),
+        );
+    } else {
+        log(
+            &progress,
+            LogLevel::Info,
+            format!(
+                "Detected {} partition table with {} partition(s), alignment: {}",
+                table.type_name(),
+                partitions.len(),
+                alignment.alignment_type
+            ),
+        );
+    }
 
     if is_cancelled(&progress) {
         bail!("backup cancelled");
@@ -259,6 +271,13 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 "Exported APM (apm.json + apm.bin)",
             );
         }
+        PartitionTable::None { fs_hint, .. } => {
+            log(
+                &progress,
+                LogLevel::Info,
+                format!("No partition table (superfloppy, filesystem: {fs_hint})"),
+            );
+        }
     }
 
     if is_cancelled(&progress) {
@@ -298,7 +317,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 part.index, part.type_name, part.start_lba
             ),
         );
-        if config.sector_by_sector || part.is_extended_container {
+        if config.sector_by_sector || part.is_extended_container || is_superfloppy {
             effective_sizes.push(part.size_bytes);
             compact_sizes.push(None);
             continue;
@@ -510,6 +529,13 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         let progress_clone = Arc::clone(&progress);
         let base_bytes = overall_bytes_done;
 
+        // Superfloppy: force raw compression to produce a universally compatible .img file
+        let effective_compression = if is_superfloppy {
+            CompressionType::None
+        } else {
+            config.compression
+        };
+
         log(
             &progress,
             LogLevel::Info,
@@ -548,7 +574,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             crate::rbformats::compress_partition(
                 &mut compact_reader,
                 &output_base,
-                config.compression,
+                effective_compression,
                 split_bytes,
                 false, // compacted image has no wasted space, don't skip zeros
                 |bytes_read| {
@@ -593,7 +619,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             crate::rbformats::compress_partition(
                 &mut limited,
                 &output_base,
-                config.compression,
+                effective_compression,
                 split_bytes,
                 !config.sector_by_sector,
                 |bytes_read| {
@@ -611,6 +637,24 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
 
         overall_bytes_done += image_size;
         set_progress_bytes(&progress, overall_bytes_done, total_partition_bytes);
+
+        // Superfloppy: rename .raw to .img for universally compatible raw image
+        let compressed_files = if is_superfloppy {
+            let mut renamed = Vec::new();
+            for file_name in &compressed_files {
+                let new_name = file_name.replace(".raw", ".img");
+                let old_path = backup_folder.join(file_name);
+                let new_path = backup_folder.join(&new_name);
+                if old_path != new_path {
+                    std::fs::rename(&old_path, &new_path)
+                        .with_context(|| format!("failed to rename {file_name} to {new_name}"))?;
+                }
+                renamed.push(new_name);
+            }
+            renamed
+        } else {
+            compressed_files
+        };
 
         // Compute checksums for each output file
         let mut all_checksums = Vec::new();
@@ -680,7 +724,11 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         source_size_bytes: source_size,
         partition_table_type: table.type_name().to_string(),
         checksum_type: config.checksum.as_str().to_string(),
-        compression_type: config.compression.as_str().to_string(),
+        compression_type: if is_superfloppy {
+            CompressionType::None.as_str().to_string()
+        } else {
+            config.compression.as_str().to_string()
+        },
         split_size_mib: config.split_size_mib,
         sector_by_sector: config.sector_by_sector,
         alignment: AlignmentMetadata {

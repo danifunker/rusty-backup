@@ -666,10 +666,15 @@ impl BackupTab {
         match PartitionTable::detect(&mut reader) {
             Ok(table) => {
                 self.source_partitions = table.partitions();
+                let table_desc = if matches!(table, PartitionTable::None { .. }) {
+                    "No partition table (superfloppy)".to_string()
+                } else {
+                    table.type_name().to_string()
+                };
                 log.info(format!(
                     "Found {} partition(s) ({})",
                     self.source_partitions.len(),
-                    table.type_name(),
+                    table_desc,
                 ));
 
                 // Compute minimum partition sizes using filesystem analysis
@@ -726,10 +731,15 @@ impl BackupTab {
                 match PartitionTable::detect(&mut reader) {
                     Ok(table) => {
                         self.source_partitions = table.partitions();
+                        let table_desc = if matches!(table, PartitionTable::None { .. }) {
+                            "No partition table (superfloppy)".to_string()
+                        } else {
+                            table.type_name().to_string()
+                        };
                         log.info(format!(
                             "Source has {} partition(s) ({})",
                             self.source_partitions.len(),
-                            table.type_name(),
+                            table_desc,
                         ));
                     }
                     Err(e) => {

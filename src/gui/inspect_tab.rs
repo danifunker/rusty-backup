@@ -1258,11 +1258,18 @@ impl InspectTab {
                     Ok(table) => {
                         let alignment = detect_alignment(&table);
                         self.partitions = table.partitions();
-                        log.info(format!(
-                            "Detected {} partition table with {} partition(s)",
-                            table.type_name(),
-                            self.partitions.len()
-                        ));
+                        if matches!(table, PartitionTable::None { .. }) {
+                            log.info(format!(
+                                "Detected superfloppy (no partition table) with {} partition(s)",
+                                self.partitions.len()
+                            ));
+                        } else {
+                            log.info(format!(
+                                "Detected {} partition table with {} partition(s)",
+                                table.type_name(),
+                                self.partitions.len()
+                            ));
+                        }
                         log.info(format!(
                             "Alignment: {} (first LBA: {})",
                             alignment.alignment_type, alignment.first_lba
@@ -1488,16 +1495,24 @@ impl InspectTab {
 
     fn show_results(&mut self, ui: &mut egui::Ui, devices: &[DiskDevice], log: &mut LogPanel) {
         // Partition table type - extract info before mutable borrow
-        let (type_name, disk_sig) = if let Some(table) = &self.partition_table {
-            (table.type_name().to_string(), table.disk_signature())
+        let (type_name, disk_sig, is_superfloppy) = if let Some(table) = &self.partition_table {
+            (
+                table.type_name().to_string(),
+                table.disk_signature(),
+                matches!(table, PartitionTable::None { .. }),
+            )
         } else {
             return;
         };
 
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Partition Table:").strong());
-            ui.label(&type_name);
-            ui.label(format!("(disk signature: 0x{disk_sig:08X})"));
+            if is_superfloppy {
+                ui.label("None (superfloppy)");
+            } else {
+                ui.label(&type_name);
+                ui.label(format!("(disk signature: 0x{disk_sig:08X})"));
+            }
         });
 
         // Alignment info
@@ -1626,6 +1641,7 @@ impl InspectTab {
                         if is_browsable_type(part.partition_type_byte)
                             || is_fat_name(&part.type_name)
                             || is_browsable_type_string(part.partition_type_string.as_deref())
+                            || is_browsable_superfloppy(part.partition_type_byte, &part.type_name)
                         {
                             if ui.small_button("Browse").clicked() {
                                 // Use the stored type byte, or infer one
@@ -2082,6 +2098,17 @@ fn is_browsable_type(ptype: u8) -> bool {
 /// Check if an APM partition type string corresponds to a browsable filesystem.
 fn is_browsable_type_string(type_str: Option<&str>) -> bool {
     matches!(type_str, Some("Apple_HFS" | "Apple_HFSX" | "Apple_HFS+"))
+}
+
+/// Check if a superfloppy (type byte 0) has a browsable filesystem hint.
+fn is_browsable_superfloppy(ptype: u8, type_name: &str) -> bool {
+    if ptype != 0 {
+        return false;
+    }
+    matches!(
+        type_name,
+        "FAT" | "HFS" | "HFS+" | "NTFS" | "exFAT" | "Unknown"
+    )
 }
 
 /// Fallback check: detect FAT from the human-readable type name string.

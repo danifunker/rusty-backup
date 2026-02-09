@@ -14,8 +14,18 @@ use mbr::Mbr;
 #[derive(Debug, Clone)]
 pub enum PartitionTable {
     Mbr(Mbr),
-    Gpt { protective_mbr: Mbr, gpt: Gpt },
+    Gpt {
+        protective_mbr: Mbr,
+        gpt: Gpt,
+    },
     Apm(Apm),
+    /// Superfloppy / floppy: no partition table, filesystem at sector 0.
+    None {
+        /// Total disk size in bytes (needed to synthesize partition info).
+        size_bytes: u64,
+        /// Detected filesystem hint: "FAT", "HFS", "HFS+", or "Unknown".
+        fs_hint: String,
+    },
 }
 
 /// Detected partition alignment pattern.
@@ -70,6 +80,57 @@ pub struct PartitionInfo {
     pub partition_type_string: Option<String>,
 }
 
+/// Detect whether a disk image is a superfloppy (no partition table, filesystem at sector 0).
+///
+/// Checks the first sector for a valid FAT BPB, and offset 1024 for HFS/HFS+.
+/// Returns `Some(fs_hint)` where `fs_hint` is `"FAT"`, `"HFS"`, `"HFS+"`,
+/// or `None` if not a superfloppy.
+fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek)) -> Option<String> {
+    // Check for FAT VBR: JMP instruction + valid BPB fields.
+    // We validate multiple BPB fields to reliably distinguish a FAT boot sector
+    // from an MBR. The partition table area (offsets 446-509) of a FAT VBR
+    // contains bootstrap code which often has non-zero bytes that would look
+    // like partition entries, so we do NOT check that area.
+    if first_sector[0] == 0xEB || first_sector[0] == 0xE9 {
+        let bytes_per_sector = u16::from_le_bytes([first_sector[11], first_sector[12]]);
+        let sectors_per_cluster = first_sector[13];
+        let reserved_sectors = u16::from_le_bytes([first_sector[14], first_sector[15]]);
+        let num_fats = first_sector[16];
+        let media_descriptor = first_sector[21];
+
+        let valid_bps = matches!(bytes_per_sector, 512 | 1024 | 2048 | 4096);
+        let valid_spc = sectors_per_cluster.is_power_of_two() && sectors_per_cluster > 0;
+        let valid_reserved = reserved_sectors >= 1;
+        let valid_fats = num_fats == 1 || num_fats == 2;
+        let valid_media = media_descriptor == 0xF0 || media_descriptor >= 0xF8;
+
+        if valid_bps && valid_spc && valid_reserved && valid_fats && valid_media {
+            // The combined probability of a non-FAT sector having all five
+            // valid BPB fields by coincidence is ~10^-9, so this is a very
+            // strong detection signal. We intentionally do NOT check the
+            // partition table area (bytes 446-509) because on FAT VBRs that
+            // area contains bootstrap code which often has bytes that look
+            // like valid MBR partition entries.
+            return Some("FAT".to_string());
+        }
+    }
+
+    // Check for HFS / HFS+ at offset 1024
+    if reader.seek(SeekFrom::Start(1024)).is_ok() {
+        let mut hfs_buf = [0u8; 2];
+        if reader.read_exact(&mut hfs_buf).is_ok() {
+            let sig = u16::from_be_bytes(hfs_buf);
+            match sig {
+                0x4244 => return Some("HFS".to_string()),
+                0x482B | 0x4858 => return Some("HFS+".to_string()),
+                _ => {}
+            }
+        }
+    }
+
+    None
+}
+
 impl PartitionTable {
     /// Detect and parse the partition table from a readable+seekable source.
     pub fn detect(reader: &mut (impl Read + Seek)) -> Result<Self, RustyBackupError> {
@@ -96,6 +157,22 @@ impl PartitionTable {
                 .seek(SeekFrom::Start(0))
                 .map_err(RustyBackupError::Io)?;
         }
+
+        // Check for superfloppy (no partition table) before MBR parsing
+        if let Some(fs_hint) = detect_superfloppy(&mbr_data, reader) {
+            // Get disk size via seek to end
+            let size_bytes = reader
+                .seek(SeekFrom::End(0))
+                .map_err(RustyBackupError::Io)?;
+            return Ok(PartitionTable::None {
+                size_bytes,
+                fs_hint,
+            });
+        }
+
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(RustyBackupError::Io)?;
 
         let mut mbr = Mbr::parse(&mbr_data)?;
 
@@ -204,6 +281,22 @@ impl PartitionTable {
                     })
                     .collect()
             }
+            PartitionTable::None {
+                size_bytes,
+                fs_hint,
+            } => {
+                vec![PartitionInfo {
+                    index: 0,
+                    type_name: fs_hint.clone(),
+                    partition_type_byte: 0,
+                    start_lba: 0,
+                    size_bytes: *size_bytes,
+                    bootable: false,
+                    is_logical: false,
+                    is_extended_container: false,
+                    partition_type_string: None,
+                }]
+            }
         }
     }
 
@@ -213,16 +306,17 @@ impl PartitionTable {
             PartitionTable::Mbr(_) => "MBR",
             PartitionTable::Gpt { .. } => "GPT",
             PartitionTable::Apm(_) => "APM",
+            PartitionTable::None { .. } => "None",
         }
     }
 
     /// Get the MBR disk signature (available for both MBR and GPT via protective MBR).
-    /// APM has no disk signature, returns 0.
+    /// APM and superfloppy have no disk signature, returns 0.
     pub fn disk_signature(&self) -> u32 {
         match self {
             PartitionTable::Mbr(mbr) => mbr.disk_signature,
             PartitionTable::Gpt { protective_mbr, .. } => protective_mbr.disk_signature,
-            PartitionTable::Apm(_) => 0,
+            PartitionTable::Apm(_) | PartitionTable::None { .. } => 0,
         }
     }
 }
@@ -243,11 +337,11 @@ pub fn detect_alignment(table: &PartitionTable) -> PartitionAlignment {
 
     let first_lba = partitions[0].start_lba;
 
-    // Extract CHS geometry from MBR if available (APM has no CHS)
+    // Extract CHS geometry from MBR if available (APM / superfloppy have no CHS)
     let (heads, sectors_per_track) = match table {
         PartitionTable::Mbr(mbr) => extract_chs_geometry(mbr),
         PartitionTable::Gpt { protective_mbr, .. } => extract_chs_geometry(protective_mbr),
-        PartitionTable::Apm(_) => (0, 0),
+        PartitionTable::Apm(_) | PartitionTable::None { .. } => (0, 0),
     };
 
     // Check for DOS traditional alignment: first partition at LBA 63
@@ -530,5 +624,70 @@ mod tests {
         assert_eq!(format_size(1073741824), "1.0 GiB");
         assert_eq!(format_size(1099511627776), "1.0 TiB");
         assert_eq!(format_size(536870912), "512.0 MiB");
+    }
+
+    #[test]
+    fn test_detect_superfloppy_fat12() {
+        // Build a realistic FAT12 VBR with non-zero boot code in partition table area
+        let mut data = vec![0u8; 1474560]; // 1.44 MB floppy
+        data[0] = 0xEB; // JMP short
+        data[1] = 0x3C;
+        data[2] = 0x90; // NOP
+                        // OEM ID
+        data[3..11].copy_from_slice(b"MSDOS5.0");
+        // bytes_per_sector = 512
+        data[11] = 0x00;
+        data[12] = 0x02;
+        // sectors_per_cluster = 1
+        data[13] = 0x01;
+        // reserved_sectors = 1
+        data[14] = 0x01;
+        data[15] = 0x00;
+        // num_fats = 2
+        data[16] = 0x02;
+        // media descriptor = 0xF0 (floppy)
+        data[21] = 0xF0;
+        // Boot signature
+        data[510] = 0x55;
+        data[511] = 0xAA;
+        // Simulate non-zero bootstrap code in the partition table area (bytes 446-509)
+        // This is common in real floppy VBRs and should NOT prevent superfloppy detection
+        for i in 446..510 {
+            data[i] = 0xCD + (i as u8 % 17); // arbitrary non-zero boot code
+        }
+
+        let mut cursor = Cursor::new(data);
+        let table = PartitionTable::detect(&mut cursor).unwrap();
+        assert_eq!(table.type_name(), "None");
+        let parts = table.partitions();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].start_lba, 0);
+        assert_eq!(parts[0].size_bytes, 1474560);
+        assert_eq!(parts[0].type_name, "FAT");
+    }
+
+    #[test]
+    fn test_detect_superfloppy_hfs() {
+        // Build a minimal HFS floppy: signature 0x4244 at offset 1024
+        let mut data = vec![0u8; 819200]; // 800K floppy
+                                          // No JMP instruction at byte 0, no MBR signature
+        data[1024] = 0x42;
+        data[1025] = 0x44;
+
+        let mut cursor = Cursor::new(data);
+        let table = PartitionTable::detect(&mut cursor).unwrap();
+        assert_eq!(table.type_name(), "None");
+        let parts = table.partitions();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].type_name, "HFS");
+    }
+
+    #[test]
+    fn test_real_mbr_not_superfloppy() {
+        // A real MBR with valid partition entries should NOT be detected as superfloppy
+        let mbr_data = make_mbr_with_chs(&[(0x0C, 2048, 1048576, 0, 1, 0, 254, 63, 100)]);
+        let mut cursor = Cursor::new(mbr_data.to_vec());
+        let table = PartitionTable::detect(&mut cursor).unwrap();
+        assert_eq!(table.type_name(), "MBR");
     }
 }
