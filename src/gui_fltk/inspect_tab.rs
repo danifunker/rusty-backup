@@ -155,7 +155,7 @@ impl InspectTab {
                     match std::fs::File::open(&path) {
                         Ok(file) => {
                             use std::io::{BufReader, Read, Seek, SeekFrom};
-                            
+
                             let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
                             let mut reader = BufReader::new(file);
 
@@ -199,13 +199,13 @@ impl InspectTab {
                                         rusty_backup::partition::PartitionTable::Apm(_) => "APM",
                                         rusty_backup::partition::PartitionTable::None { .. } => "None (Superfloppy)",
                                     };
-                                    
+
                                     let mut info = String::new();
                                     info.push_str(&format!("File: {}\n", path.file_name().unwrap_or_default().to_string_lossy()));
                                     info.push_str(&format!("Size: {} bytes\n", data_size.unwrap_or(file_size)));
                                     info.push_str(&format!("Partition Table: {}\n", table_type));
                                     info.push_str(&format!("Partitions: {}\n\n", partitions.len()));
-                                    
+
                                     for part in &partitions {
                                         info.push_str(&format!(
                                             "  [{}] {} - Type: 0x{:02X}, Start: LBA {}, Size: {}\n",
@@ -216,22 +216,22 @@ impl InspectTab {
                                             rusty_backup::partition::format_size(part.size_bytes)
                                         ));
                                     }
-                                    
+
                                     info_buffer.set_text(&info);
-                                    
+
                                     // Store loaded file state
                                     if let Ok(mut state) = loaded_file.lock() {
                                         state.file_path = Some(path.clone());
                                         state.partition_table = Some(table);
                                     }
-                                    
+
                                     // Enable buttons
                                     if !partitions.is_empty() {
                                         view_btn.activate();
                                         browse_btn.activate();
                                         export_btn.activate();
                                     }
-                                    
+
                                     log.info(format!("Loaded {} partition(s) from {}", partitions.len(), path.file_name().unwrap_or_default().to_string_lossy()));
                                 }
                                 Err(e) => {
