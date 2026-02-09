@@ -1255,7 +1255,19 @@ impl InspectTab {
                 };
 
                 match detect_result {
-                    Ok(table) => {
+                    Ok(mut table) => {
+                        // Fix up superfloppy size: seek(End(0)) returns 0 for macOS devices
+                        if let PartitionTable::None { size_bytes, .. } = &mut table {
+                            if *size_bytes == 0 {
+                                if let Ok(f) = File::open(&path) {
+                                    if let Ok(real_size) =
+                                        rusty_backup::os::get_file_size(&f, &path)
+                                    {
+                                        *size_bytes = real_size;
+                                    }
+                                }
+                            }
+                        }
                         let alignment = detect_alignment(&table);
                         self.partitions = table.partitions();
                         if matches!(table, PartitionTable::None { .. }) {

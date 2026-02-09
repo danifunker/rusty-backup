@@ -568,6 +568,8 @@ impl DeviceWriteHandle {
 ///
 /// For regular files, uses standard seek to get size.
 /// For Windows physical drives, uses IOCTL because seeking doesn't work.
+/// For macOS devices, uses DKIOCGETBLOCKCOUNT/DKIOCGETBLOCKSIZE ioctl because
+/// `seek(End(0))` returns 0 for device files.
 #[allow(unused_variables)]
 pub fn get_file_size(file: &File, path: &Path) -> Result<u64> {
     #[cfg(target_os = "windows")]
@@ -578,7 +580,17 @@ pub fn get_file_size(file: &File, path: &Path) -> Result<u64> {
         }
     }
 
-    // For regular files or non-Windows, use seek
+    #[cfg(target_os = "macos")]
+    {
+        let path_str = path.to_string_lossy();
+        if path_str.starts_with("/dev/") {
+            if let Some(size) = macos::get_device_size(file) {
+                return Ok(size);
+            }
+        }
+    }
+
+    // For regular files or non-device paths, use seek
     let mut file = file;
     let size = file
         .seek(SeekFrom::End(0))

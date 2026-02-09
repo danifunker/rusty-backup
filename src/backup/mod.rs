@@ -181,7 +181,41 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         .context("cannot read first sector")?;
     source.seek(SeekFrom::Start(0))?;
 
-    let table = PartitionTable::detect(&mut source).context("failed to detect partition table")?;
+    // Log first bytes for diagnostics
+    log(
+        &progress,
+        LogLevel::Info,
+        format!(
+            "First 16 bytes: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}, bytes 510-511: {:02X} {:02X}",
+            mbr_bytes[0], mbr_bytes[1], mbr_bytes[2], mbr_bytes[3],
+            mbr_bytes[4], mbr_bytes[5], mbr_bytes[6], mbr_bytes[7],
+            mbr_bytes[8], mbr_bytes[9], mbr_bytes[10], mbr_bytes[11],
+            mbr_bytes[12], mbr_bytes[13], mbr_bytes[14], mbr_bytes[15],
+            mbr_bytes[510], mbr_bytes[511],
+        ),
+    );
+
+    let mut table =
+        PartitionTable::detect(&mut source).context("failed to detect partition table")?;
+
+    // Fix up superfloppy size: seek(End(0)) returns 0 for macOS device files,
+    // so we need to use platform-specific ioctl to get the real device size.
+    if let PartitionTable::None { size_bytes, .. } = &mut table {
+        if *size_bytes == 0 {
+            if let Ok(real_size) = crate::os::get_file_size(source.get_ref(), &config.source_path) {
+                log(
+                    &progress,
+                    LogLevel::Info,
+                    format!(
+                        "Device size via seek was 0, using ioctl size: {} bytes",
+                        real_size
+                    ),
+                );
+                *size_bytes = real_size;
+            }
+        }
+    }
+
     let alignment = partition::detect_alignment(&table);
     let partitions = table.partitions();
     let is_superfloppy = matches!(table, PartitionTable::None { .. });
@@ -195,6 +229,16 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 partitions.len(),
             ),
         );
+        for p in &partitions {
+            log(
+                &progress,
+                LogLevel::Info,
+                format!(
+                    "  Partition {}: type_byte=0x{:02X} type_name={} start_lba={} size={}",
+                    p.index, p.partition_type_byte, p.type_name, p.start_lba, p.size_bytes,
+                ),
+            );
+        }
     } else {
         log(
             &progress,
@@ -206,6 +250,16 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 alignment.alignment_type
             ),
         );
+        for p in &partitions {
+            log(
+                &progress,
+                LogLevel::Info,
+                format!(
+                    "  Partition {}: type_byte=0x{:02X} type_name={} start_lba={} size={}",
+                    p.index, p.partition_type_byte, p.type_name, p.start_lba, p.size_bytes,
+                ),
+            );
+        }
     }
 
     if is_cancelled(&progress) {
@@ -634,6 +688,23 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             )
             .with_context(|| format!("failed to compress {part_label}"))?
         };
+
+        // Log output file sizes for diagnostics
+        for file_name in &compressed_files {
+            let file_path = backup_folder.join(file_name);
+            match std::fs::metadata(&file_path) {
+                Ok(meta) => log(
+                    &progress,
+                    LogLevel::Info,
+                    format!("Output file {} size: {} bytes", file_name, meta.len()),
+                ),
+                Err(e) => log(
+                    &progress,
+                    LogLevel::Warning,
+                    format!("Cannot stat output file {}: {}", file_name, e),
+                ),
+            }
+        }
 
         overall_bytes_done += image_size;
         set_progress_bytes(&progress, overall_bytes_done, total_partition_bytes);

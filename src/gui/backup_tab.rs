@@ -664,7 +664,17 @@ impl BackupTab {
 
         let mut reader = BufReader::new(file);
         match PartitionTable::detect(&mut reader) {
-            Ok(table) => {
+            Ok(mut table) => {
+                // Fix up superfloppy size: seek(End(0)) returns 0 for macOS devices
+                if let PartitionTable::None { size_bytes, .. } = &mut table {
+                    if *size_bytes == 0 {
+                        if let Ok(real_size) =
+                            rusty_backup::os::get_file_size(reader.get_ref(), &path)
+                        {
+                            *size_bytes = real_size;
+                        }
+                    }
+                }
                 self.source_partitions = table.partitions();
                 let table_desc = if matches!(table, PartitionTable::None { .. }) {
                     "No partition table (superfloppy)".to_string()

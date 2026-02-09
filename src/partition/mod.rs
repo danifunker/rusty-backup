@@ -683,6 +683,79 @@ mod tests {
     }
 
     #[test]
+    fn test_hfs_superfloppy_backup_flow() {
+        use std::io::BufReader;
+
+        // Simulate the EXACT backup flow for an HFS floppy using a real
+        // temp file (not Cursor) to catch File+BufReader interaction bugs.
+        let mut data = vec![0xAAu8; 819200]; // 800K floppy, filled with 0xAA
+                                             // HFS MDB signature at offset 1024
+        data[1024] = 0x42;
+        data[1025] = 0x44;
+
+        // Write to a real temp file
+        let tmp_dir = std::env::temp_dir();
+        let tmp_path = tmp_dir.join("rusty_backup_test_hfs_floppy.img");
+        std::fs::write(&tmp_path, &data).unwrap();
+
+        let file = std::fs::File::open(&tmp_path).unwrap();
+        let mut source = BufReader::new(file);
+
+        // Step 1: Read first 512 bytes for MBR export (same as backup)
+        let mut mbr_bytes = [0u8; 512];
+        source.read_exact(&mut mbr_bytes).unwrap();
+        source.seek(SeekFrom::Start(0)).unwrap();
+
+        // Step 2: Detect partition table
+        let table = PartitionTable::detect(&mut source).unwrap();
+        assert_eq!(table.type_name(), "None");
+        let partitions = table.partitions();
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0].start_lba, 0);
+        let image_size = partitions[0].size_bytes;
+        assert_eq!(image_size, 819200);
+
+        // Step 3: Simulate get_file_size bypassing BufReader
+        // (In real code: get_file_size(source.get_ref(), ...) seeks the
+        // underlying File directly via &File impl Seek)
+        use std::io::Write;
+        {
+            let inner: &std::fs::File = source.get_ref();
+            let mut file_ref = inner;
+            let _sz = std::io::Seek::seek(&mut file_ref, SeekFrom::End(0)).unwrap();
+            std::io::Seek::seek(&mut file_ref, SeekFrom::Start(0)).unwrap();
+        }
+
+        // Step 4: Seek back and read data (trim-based path)
+        let part_offset = partitions[0].start_lba * 512; // 0
+        source.seek(SeekFrom::Start(part_offset)).unwrap();
+        let part_reader = (&mut source).take(image_size);
+
+        let mut output = Vec::new();
+        let mut buf = [0u8; 65536]; // 64K chunks
+        let mut limited = part_reader;
+        loop {
+            let n = limited.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            output.extend_from_slice(&buf[..n]);
+        }
+
+        // Cleanup
+        let _ = std::fs::remove_file(&tmp_path);
+
+        // Verify we read the full floppy
+        assert_eq!(
+            output.len(),
+            819200,
+            "Expected 819200 bytes but got {}",
+            output.len()
+        );
+        assert_eq!(&output, &data);
+    }
+
+    #[test]
     fn test_real_mbr_not_superfloppy() {
         // A real MBR with valid partition entries should NOT be detected as superfloppy
         let mbr_data = make_mbr_with_chs(&[(0x0C, 2048, 1048576, 0, 1, 0, 254, 63, 100)]);

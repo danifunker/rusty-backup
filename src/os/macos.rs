@@ -32,6 +32,39 @@ use objc2_io_kit::{
 use super::ElevatedSource;
 use crate::device::{DiskDevice, MountedPartition};
 
+// macOS ioctl constants for getting device size
+// DKIOCGETBLOCKSIZE = _IOR('d', 24, u32) = 0x40046418
+// DKIOCGETBLOCKCOUNT = _IOR('d', 25, u64) = 0x40086419
+const DKIOCGETBLOCKSIZE: libc::c_ulong = 0x40046418;
+const DKIOCGETBLOCKCOUNT: libc::c_ulong = 0x40086419;
+
+/// Get the size of a macOS block device using ioctl.
+///
+/// `seek(SeekFrom::End(0))` returns 0 for macOS device files, so we must
+/// use DKIOCGETBLOCKCOUNT × DKIOCGETBLOCKSIZE to get the actual size.
+pub fn get_device_size(file: &std::fs::File) -> Option<u64> {
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+
+    let mut block_size: u32 = 0;
+    let mut block_count: u64 = 0;
+
+    unsafe {
+        if libc::ioctl(fd, DKIOCGETBLOCKSIZE, &mut block_size) != 0 {
+            return None;
+        }
+        if libc::ioctl(fd, DKIOCGETBLOCKCOUNT, &mut block_count) != 0 {
+            return None;
+        }
+    }
+
+    if block_size == 0 {
+        return None;
+    }
+
+    Some(block_count * block_size as u64)
+}
+
 // ---------------------------------------------------------------------------
 // Helper: extract typed values from an untyped CFDictionary
 // ---------------------------------------------------------------------------
