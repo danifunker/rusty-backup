@@ -1,5 +1,5 @@
 use super::log_panel::LogPanel;
-use super::progress::ProgressState;
+use super::progress::{ProgressState, ProgressWidget};
 use fltk::{prelude::*, *};
 use rusty_backup::backup::{BackupConfig, BackupProgress, ChecksumType, CompressionType};
 use rusty_backup::device::DiskDevice;
@@ -29,6 +29,9 @@ pub struct BackupTab {
 
     // Checksum
     checksum_choice: menu::Choice,
+
+    // Progress
+    progress_widget: ProgressWidget,
 
     // Actions
     start_btn: button::Button,
@@ -149,7 +152,12 @@ impl BackupTab {
         checksum_choice.add_choice("SHA-256 (recommended)");
         checksum_choice.add_choice("CRC-32 (faster)");
         checksum_choice.set_value(0);
-        y_pos += row_h + spacing; // Minimal spacing before Start button
+        y_pos += row_h + spacing;
+
+        // Progress widget
+        let progress_widget =
+            ProgressWidget::new(x + 10, y_pos, w - 20, 60, progress_state.clone());
+        y_pos += 65;
 
         // Start button
         let mut start_btn = button::Button::new(x + 10, y_pos, 150, 30, "Start Backup");
@@ -158,6 +166,8 @@ impl BackupTab {
 
         // Set up callbacks
         let devices_clone = devices.to_vec();
+        let progress_widget_clone = progress_widget.clone();
+
         let mut tab = Self {
             source_choice,
             open_file_btn,
@@ -170,6 +180,7 @@ impl BackupTab {
             split_size_input,
             compression_choice,
             checksum_choice,
+            progress_widget,
             start_btn,
             selected_device_idx: None,
             image_file_path: None,
@@ -181,6 +192,14 @@ impl BackupTab {
         };
 
         tab.setup_callbacks();
+
+        // Set up progress refresh timer
+        app::add_timeout3(0.2, move |handle| {
+            let mut widget = progress_widget_clone.clone();
+            widget.refresh();
+            app::repeat_timeout3(0.2, handle);
+        });
+
         tab
     }
 
@@ -317,6 +336,65 @@ impl BackupTab {
                     let progress = Arc::new(Mutex::new(BackupProgress::new()));
                     let progress_clone = progress.clone();
 
+                    // Set up progress polling on main thread with UI updates
+                    let progress_poll = progress.clone();
+                    let progress_state_poll = progress_state_thread.clone();
+                    let log_poll = log_panel_thread.clone();
+
+                    // Start polling timer
+                    let poll_handle = {
+                        let progress = progress_poll.clone();
+                        let progress_state = progress_state_poll.clone();
+                        let mut log = log_poll.clone();
+
+                        app::add_timeout3(0.2, move |handle| {
+                            if let Ok(p) = progress.lock() {
+                                // Update progress state
+                                progress_state.update(p.current_bytes, p.total_bytes);
+                                progress_state.set_operation(&p.operation);
+
+                                // Update full_size_bytes
+                                if let Ok(mut full) = progress_state.full_size_bytes.lock() {
+                                    *full = p.full_size_bytes;
+                                }
+
+                                // Process log messages
+                                let messages: Vec<_> = p
+                                    .log_messages
+                                    .iter()
+                                    .map(|m| (m.level, m.message.clone()))
+                                    .collect();
+                                let finished = p.finished;
+                                drop(p);
+
+                                for (level, msg) in messages {
+                                    match level {
+                                        rusty_backup::backup::LogLevel::Info => log.info(&msg),
+                                        rusty_backup::backup::LogLevel::Warning => log.warn(&msg),
+                                        rusty_backup::backup::LogLevel::Error => log.error(&msg),
+                                    }
+                                }
+
+                                // Clear processed messages
+                                if let Ok(mut p) = progress.lock() {
+                                    p.log_messages.clear();
+                                }
+
+                                // Check if finished
+                                if finished {
+                                    app::remove_timeout3(handle);
+                                    return;
+                                }
+                            }
+
+                            // Wake UI to redraw
+                            app::awake();
+
+                            // Re-schedule
+                            app::repeat_timeout3(0.2, handle);
+                        })
+                    };
+
                     // Run backup
                     let result = rusty_backup::backup::run_backup(config, progress_clone);
 
@@ -330,8 +408,15 @@ impl BackupTab {
                         }
                     }
 
+                    // Mark finished and clean up
+                    if let Ok(mut p) = progress.lock() {
+                        p.finished = true;
+                    }
+
                     // Re-enable button and reset progress
                     progress_state_thread.set_active(false);
+                    app::remove_timeout3(poll_handle);
+
                     fltk::app::awake(); // Wake UI thread to refresh
 
                     // Re-enable button on main thread
@@ -350,6 +435,10 @@ impl BackupTab {
             // Note: fltk doesn't have easy way to disable specific menu items
             // For now, just track the state
         }
+    }
+
+    pub fn refresh_progress(&mut self) {
+        self.progress_widget.refresh();
     }
 
     pub fn get_selected_compression(&self) -> CompressionType {

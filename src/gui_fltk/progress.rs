@@ -50,6 +50,7 @@ impl ProgressState {
     }
 }
 
+#[derive(Clone)]
 pub struct ProgressWidget {
     frame: frame::Frame,
     bar: misc::Progress,
