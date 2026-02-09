@@ -2,7 +2,7 @@ use super::log_panel::LogPanel;
 use super::progress::ProgressState;
 use fltk::{prelude::*, *};
 use rusty_backup::device::DiskDevice;
-use rusty_backup::partition::AlignmentType;
+
 use rusty_backup::restore::RestoreAlignment;
 use std::path::PathBuf;
 
@@ -49,7 +49,7 @@ impl RestoreTab {
         x: i32,
         y: i32,
         w: i32,
-        h: i32,
+        _h: i32,
         devices: &[DiskDevice],
         log_panel: LogPanel,
         progress_state: ProgressState,
@@ -63,7 +63,7 @@ impl RestoreTab {
         // Backup folder selection
         frame::Frame::new(x + 10, y_pos, label_w, row_h, "Backup Folder:");
         let backup_input = input::Input::new(x + label_w + 10, y_pos, field_w, row_h, None);
-        let mut backup_browse_btn =
+        let backup_browse_btn =
             button::Button::new(x + label_w + field_w + 20, y_pos, 90, row_h, "Browse...");
         y_pos += row_h + spacing;
 
@@ -84,7 +84,7 @@ impl RestoreTab {
         }
         target_choice.set_value(0);
 
-        let mut open_file_btn =
+        let open_file_btn =
             button::Button::new(x + label_w + field_w + 20, y_pos, 90, row_h, "To File...");
         y_pos += row_h + spacing * 2;
 
@@ -198,7 +198,7 @@ impl RestoreTab {
             let mut start_btn = self.start_btn.clone();
             let mut details_frame = self.alignment_details_frame.clone();
             let log = self.log_panel.clone();
-            
+
             move |_| {
                 if let Some(dirname) = rfd::FileDialog::new()
                     .set_title("Select Backup Folder (containing metadata.json or Clonezilla image)")
@@ -206,7 +206,7 @@ impl RestoreTab {
                 {
                     // Check if this looks like a backup folder
                     let metadata_path = dirname.join("metadata.json");
-                    
+
                     if metadata_path.exists() {
                         // Try to load metadata
                         match std::fs::read_to_string(&metadata_path) {
@@ -214,13 +214,13 @@ impl RestoreTab {
                                 match serde_json::from_str::<rusty_backup::backup::metadata::BackupMetadata>(&json) {
                                     Ok(metadata) => {
                                         input.set_value(&dirname.to_string_lossy());
-                                        
+
                                         // Update alignment details frame with detected value
-                                        let alignment_text = format!("({} - {} sectors)", 
-                                            metadata.alignment.detected_type, 
+                                        let alignment_text = format!("({} - {} sectors)",
+                                            metadata.alignment.detected_type,
                                             metadata.alignment.alignment_sectors);
                                         details_frame.set_label(&alignment_text);
-                                        
+
                                         // Display backup info in text area
                                         let mut info_text = String::new();
                                         info_text.push_str(&format!("Backup: {}\n", dirname.file_name().unwrap_or_default().to_string_lossy()));
@@ -228,18 +228,18 @@ impl RestoreTab {
                                             metadata.partitions.len(),
                                             metadata.alignment.detected_type,
                                             metadata.alignment.alignment_sectors));
-                                        info_text.push_str(&format!("Compression: {}  |  Checksum: {}", 
+                                        info_text.push_str(&format!("Compression: {}  |  Checksum: {}",
                                             metadata.compression_type,
                                             metadata.checksum_type));
                                         info_buffer.set_text(&info_text);
-                                        
+
                                         // Enable partition buttons
                                         view_btn.activate();
                                         config_btn.activate();
                                         start_btn.activate();
-                                        
+
                                         log.info(format!("Loaded backup: {} partitions", metadata.partitions.len()));
-                                        
+
                                         // TODO: Store metadata for later use
                                     }
                                     Err(e) => {

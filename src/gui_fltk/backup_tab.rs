@@ -50,7 +50,7 @@ impl BackupTab {
         x: i32,
         y: i32,
         w: i32,
-        h: i32,
+        _h: i32,
         devices: &[DiskDevice],
         log_panel: LogPanel,
         progress_state: ProgressState,
@@ -70,14 +70,14 @@ impl BackupTab {
         }
         source_choice.set_value(0);
 
-        let mut open_file_btn =
+        let open_file_btn =
             button::Button::new(x + label_w + field_w + 20, y_pos, 90, row_h, "Open File...");
         y_pos += row_h + spacing;
 
         // Destination folder
         frame::Frame::new(x + 10, y_pos, label_w, row_h, "Destination:");
         let dest_input = input::Input::new(x + label_w + 10, y_pos, field_w, row_h, None);
-        let mut dest_browse_btn =
+        let dest_browse_btn =
             button::Button::new(x + label_w + field_w + 20, y_pos, 90, row_h, "Browse...");
         y_pos += row_h + spacing;
 
@@ -100,7 +100,7 @@ impl BackupTab {
         );
         y_pos += row_h + 5;
 
-        let mut resize_partitions_check = button::CheckButton::new(
+        let resize_partitions_check = button::CheckButton::new(
             x + 20,
             y_pos,
             w - 40,
@@ -118,7 +118,7 @@ impl BackupTab {
         let mut split_size_input = input::IntInput::new(x + 315, y_pos, 80, row_h, None);
         split_size_input.set_value("4000");
 
-        let split_size_label = frame::Frame::new(x + 400, y_pos, 50, row_h, "MiB");
+        let _split_size_label = frame::Frame::new(x + 400, y_pos, 50, row_h, "MiB");
         y_pos += row_h + spacing * 2;
 
         // Wire up split archives checkbox to enable/disable split size input
@@ -231,7 +231,7 @@ impl BackupTab {
             let dest_input = self.dest_input.clone();
             let name_input = self.name_input.clone();
             let sector_check = self.sector_by_sector_check.clone();
-            let resize_check = self.resize_partitions_check.clone();
+            let _resize_check = self.resize_partitions_check.clone();
             let split_check = self.split_archives_check.clone();
             let split_size_input = self.split_size_input.clone();
             let compression_choice = self.compression_choice.clone();

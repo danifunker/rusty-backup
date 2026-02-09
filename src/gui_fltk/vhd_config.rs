@@ -28,14 +28,14 @@ impl VhdConfigWindow {
         header.set_align(enums::Align::Left | enums::Align::Inside);
 
         // Whole disk option
-        let whole_disk_radio = button::RadioButton::new(10, 50, 580, 30, "Whole disk backup");
+        let _whole_disk_radio = button::RadioButton::new(10, 50, 580, 30, "Whole disk backup");
 
         // Per-partition option
         let per_partition_radio =
             button::RadioButton::new(10, 85, 580, 30, "Per-partition configuration");
 
         // Partition list (scrollable area)
-        let mut scroll = group::Scroll::new(10, 120, 580, 300, None);
+        let scroll = group::Scroll::new(10, 120, 580, 300, None);
         let mut y_pos = 125;
 
         for (idx, part) in partitions.iter().enumerate() {

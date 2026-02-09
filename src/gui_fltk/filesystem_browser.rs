@@ -60,7 +60,7 @@ impl FilesystemBrowserWindow {
         let mut export_btn = button::Button::new(10, 640, 100, 30, "Export...");
         export_btn.deactivate(); // Enable when file selected
 
-        let refresh_btn = button::Button::new(120, 640, 100, 30, "Refresh");
+        let _refresh_btn = button::Button::new(120, 640, 100, 30, "Refresh");
 
         let mut close_btn = button::Button::new(790, 640, 100, 30, "Close");
 
