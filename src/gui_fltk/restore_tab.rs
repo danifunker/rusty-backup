@@ -416,4 +416,23 @@ impl RestoreTab {
     pub fn get_backup_input(&self) -> input::Input {
         self.backup_input.clone()
     }
+
+    pub fn get_target_choice(&self) -> menu::Choice {
+        self.target_choice.clone()
+    }
+
+    pub fn update_device_list(&mut self, devices: &[DiskDevice]) {
+        self.devices = devices.to_vec();
+        let current_value = self.target_choice.value();
+        self.target_choice.clear();
+        self.target_choice.add_choice("Select a device...");
+        for device in devices.iter() {
+            self.target_choice.add_choice(&device.display_name());
+        }
+        if current_value < (devices.len() + 1) as i32 {
+            self.target_choice.set_value(current_value);
+        } else {
+            self.target_choice.set_value(0);
+        }
+    }
 }

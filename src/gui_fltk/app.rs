@@ -140,17 +140,6 @@ impl RustyBackupApp {
             }
         });
 
-        // Wire up top bar button callbacks
-        refresh_btn.set_callback({
-            let mut log = log_panel.clone();
-            move |_| {
-                log.info("Refreshing device list...");
-                let new_devices = device::enumerate_devices();
-                log.info(format!("Found {} device(s)", new_devices.len()));
-                // TODO: Update device lists in tabs
-            }
-        });
-
         settings_btn.set_callback({
             let mut log = log_panel.clone();
             move |_| {
@@ -181,7 +170,7 @@ impl RustyBackupApp {
 
         // Now create tab contents with log_panel available
         backup_group.begin();
-        let _backup_tab = BackupTab::new(
+        let backup_tab = BackupTab::new(
             5,
             70,
             890,
@@ -190,6 +179,7 @@ impl RustyBackupApp {
             log_panel.clone(),
             progress_state.clone(),
         );
+        let backup_source_choice = backup_tab.get_source_choice();
         backup_group.end();
 
         restore_group.begin();
@@ -204,6 +194,7 @@ impl RustyBackupApp {
             loaded_backup.clone(),
             close_backup_btn.clone(),
         );
+        let restore_target_choice = restore_tab.get_target_choice();
         restore_group.end();
 
         inspect_group.begin();
@@ -217,7 +208,61 @@ impl RustyBackupApp {
             loaded_backup.clone(),
             close_backup_btn.clone(),
         );
+        let inspect_source_choice = inspect_tab.get_source_choice();
         inspect_group.end();
+
+        // Wire up refresh button callback (now that we have the choice widgets)
+        refresh_btn.set_callback({
+            let mut log = log_panel.clone();
+            let mut backup_choice = backup_source_choice.clone();
+            let mut restore_choice = restore_target_choice.clone();
+            let mut inspect_choice = inspect_source_choice.clone();
+
+            move |_| {
+                log.info("Refreshing device list...");
+                let new_devices = device::enumerate_devices();
+                log.info(format!("Found {} device(s)", new_devices.len()));
+
+                // Update all three dropdowns
+                let backup_val = backup_choice.value();
+                backup_choice.clear();
+                backup_choice.add_choice("Select a device...");
+                for device in new_devices.iter() {
+                    backup_choice.add_choice(&device.display_name());
+                }
+                if backup_val < (new_devices.len() + 1) as i32 {
+                    backup_choice.set_value(backup_val);
+                } else {
+                    backup_choice.set_value(0);
+                }
+
+                let restore_val = restore_choice.value();
+                restore_choice.clear();
+                restore_choice.add_choice("Select a device...");
+                for device in new_devices.iter() {
+                    restore_choice.add_choice(&device.display_name());
+                }
+                if restore_val < (new_devices.len() + 1) as i32 {
+                    restore_choice.set_value(restore_val);
+                } else {
+                    restore_choice.set_value(0);
+                }
+
+                let inspect_val = inspect_choice.value();
+                inspect_choice.clear();
+                inspect_choice.add_choice("Select a source...");
+                for device in new_devices.iter() {
+                    inspect_choice.add_choice(&device.display_name());
+                }
+                if inspect_val < (new_devices.len() + 1) as i32 {
+                    inspect_choice.set_value(inspect_val);
+                } else {
+                    inspect_choice.set_value(0);
+                }
+
+                log.info("Device list updated in all tabs");
+            }
+        });
 
         // Wire up close backup button to clear info displays
         {

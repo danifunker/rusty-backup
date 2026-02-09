@@ -203,6 +203,26 @@ impl BackupTab {
         tab
     }
 
+    pub fn get_source_choice(&self) -> menu::Choice {
+        self.source_choice.clone()
+    }
+
+    pub fn update_device_list(&mut self, devices: &[DiskDevice]) {
+        self.devices = devices.to_vec();
+        let current_value = self.source_choice.value();
+        self.source_choice.clear();
+        self.source_choice.add_choice("Select a device...");
+        for device in devices.iter() {
+            self.source_choice.add_choice(&device.display_name());
+        }
+        // Restore selection if still valid
+        if current_value < (devices.len() + 1) as i32 {
+            self.source_choice.set_value(current_value);
+        } else {
+            self.source_choice.set_value(0);
+        }
+    }
+
     fn setup_callbacks(&mut self) {
         // Source device selection
         self.source_choice.set_callback(|choice| {
