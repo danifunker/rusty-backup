@@ -388,12 +388,208 @@ impl RestoreTab {
         });
 
         // Start restore button
-        self.start_btn.set_callback(|_| {
-            // TODO: Validate inputs and start restore operation
-            let result = dialog::choice2_default("⚠ Warning: This will overwrite the target device!\n\nAre you sure you want to continue?", "Yes, Restore", "Cancel", "");
-            if result == Some(0) {
-                // TODO: Start restore operation
-                dialog::message_default("Restore would start here");
+        self.start_btn.set_callback({
+            let mut btn = self.start_btn.clone();
+            let backup_input = self.backup_input.clone();
+            let target_choice = self.target_choice.clone();
+            let devices = self.devices.clone();
+            let loaded_backup = self.loaded_backup.clone();
+            let log_panel = self.log_panel.clone();
+            let progress_state = self.progress_state.clone();
+            let alignment_original = self.alignment_original_radio.clone();
+            let alignment_modern = self.alignment_modern_radio.clone();
+            let custom_alignment_input = self.custom_alignment_input.clone();
+
+            move |_| {
+                // Validate backup folder is loaded
+                let backup_path = PathBuf::from(backup_input.value());
+                if backup_path.as_os_str().is_empty() {
+                    dialog::message_default("Please select a backup folder");
+                    return;
+                }
+
+                // Validate target is selected
+                if target_choice.value() == 0 {
+                    dialog::message_default("Please select a target device");
+                    return;
+                }
+
+                let target_idx = (target_choice.value() - 1) as usize;
+                if target_idx >= devices.len() {
+                    dialog::message_default("Invalid target device selected");
+                    return;
+                }
+                let target_device = &devices[target_idx];
+                let target_path = PathBuf::from(&target_device.path);
+
+                // Get alignment choice
+                let alignment = if alignment_original.value() {
+                    rusty_backup::restore::RestoreAlignment::Original
+                } else if alignment_modern.value() {
+                    rusty_backup::restore::RestoreAlignment::Modern1MB
+                } else {
+                    let sectors = custom_alignment_input
+                        .value()
+                        .parse()
+                        .unwrap_or(2048);
+                    rusty_backup::restore::RestoreAlignment::Custom(sectors)
+                };
+
+                // Get backup metadata from loaded state
+                let metadata_opt = if let Ok(state) = loaded_backup.lock() {
+                    state.metadata.clone()
+                } else {
+                    None
+                };
+
+                let metadata = match metadata_opt {
+                    Some(m) => m,
+                    None => {
+                        dialog::message_default("Backup metadata not loaded. Please browse to a backup folder first.");
+                        return;
+                    }
+                };
+
+                // Calculate required size from partitions
+                let required_bytes: u64 = metadata
+                    .partitions
+                    .iter()
+                    .map(|p| p.imaged_size_bytes)
+                    .sum();
+                let target_bytes = target_device.size_bytes;
+
+                if target_bytes < required_bytes {
+                    dialog::message_default(&format!(
+                        "Target device is too small!\n\nRequired: {} bytes\nTarget: {} bytes",
+                        required_bytes, target_bytes
+                    ));
+                    return;
+                }
+
+                // Confirmation dialog
+                let msg = format!(
+                    "⚠ WARNING: This will OVERWRITE ALL DATA on:\n\n{}\n\nSize: {} bytes\n\nAre you ABSOLUTELY SURE?",
+                    target_device.display_name(),
+                    target_bytes
+                );
+                let result = dialog::choice2_default(&msg, "Yes, RESTORE", "Cancel", "");
+                if result != Some(0) {
+                    return; // User cancelled
+                }
+
+                // Build partition sizes (for now, use Original for all)
+                let partition_sizes: Vec<rusty_backup::restore::RestorePartitionSize> = metadata
+                    .partitions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _p)| rusty_backup::restore::RestorePartitionSize {
+                        index: i,
+                        size_choice: rusty_backup::restore::RestoreSizeChoice::Original,
+                    })
+                    .collect();
+
+                let config = rusty_backup::restore::RestoreConfig {
+                    backup_folder: backup_path.clone(),
+                    target_path: target_path.clone(),
+                    target_is_device: true,
+                    target_size: target_bytes,
+                    alignment,
+                    partition_sizes,
+                    write_zeros_to_unused: false,
+                };
+
+                // Disable button during operation
+                btn.deactivate();
+                progress_state.set_active(true);
+                log_panel.info(format!("Starting restore to: {}", target_device.display_name()));
+
+                // Spawn restore thread
+                let log_panel_thread = log_panel.clone();
+                let progress_state_thread = progress_state.clone();
+                let mut btn_clone = btn.clone();
+
+                std::thread::spawn(move || {
+                    let progress = Arc::new(Mutex::new(rusty_backup::restore::RestoreProgress::new()));
+                    let progress_clone = progress.clone();
+
+                    // Set up progress polling
+                    let progress_poll = progress.clone();
+                    let progress_state_poll = progress_state_thread.clone();
+                    let log_poll = log_panel_thread.clone();
+
+                    let poll_handle = {
+                        let progress = progress_poll.clone();
+                        let progress_state = progress_state_poll.clone();
+                        let mut log = log_poll.clone();
+
+                        app::add_timeout3(0.2, move |handle| {
+                            if let Ok(p) = progress.lock() {
+                                // Update progress state
+                                progress_state.update(p.current_bytes, p.total_bytes);
+                                progress_state.set_operation(&p.operation);
+
+                                // Process log messages
+                                let messages: Vec<_> = p
+                                    .log_messages
+                                    .iter()
+                                    .map(|m| (m.level, m.message.clone()))
+                                    .collect();
+                                let finished = p.finished;
+                                drop(p);
+
+                                for (level, msg) in messages {
+                                    match level {
+                                        rusty_backup::backup::LogLevel::Info => log.info(&msg),
+                                        rusty_backup::backup::LogLevel::Warning => log.warn(&msg),
+                                        rusty_backup::backup::LogLevel::Error => log.error(&msg),
+                                    }
+                                }
+
+                                // Clear processed messages
+                                if let Ok(mut p) = progress.lock() {
+                                    p.log_messages.clear();
+                                }
+
+                                // Check if finished
+                                if finished {
+                                    app::remove_timeout3(handle);
+                                    return;
+                                }
+                            }
+
+                            // Wake UI
+                            app::awake();
+                            app::repeat_timeout3(0.2, handle);
+                        })
+                    };
+
+                    // Run restore
+                    let result = rusty_backup::restore::run_restore(config, progress_clone);
+
+                    // Handle result
+                    match result {
+                        Ok(_) => {
+                            log_panel_thread.info("Restore completed successfully!");
+                        }
+                        Err(e) => {
+                            log_panel_thread.error(format!("Restore failed: {}", e));
+                        }
+                    }
+
+                    // Mark finished and clean up
+                    if let Ok(mut p) = progress.lock() {
+                        p.finished = true;
+                    }
+
+                    progress_state_thread.set_active(false);
+                    app::remove_timeout3(poll_handle);
+                    fltk::app::awake();
+
+                    // Re-enable button
+                    app::awake_callback(move || {
+                        btn_clone.activate();
+                    });
+                });
             }
         });
     }
