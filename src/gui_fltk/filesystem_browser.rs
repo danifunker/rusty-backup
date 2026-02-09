@@ -137,6 +137,34 @@ impl FilesystemBrowserWindow {
         }
 
         self.tree.redraw();
+
+        // Close all items first
+        if let Some(mut item) = self.tree.first() {
+            loop {
+                item.close();
+                if let Some(next) = item.next() {
+                    item = next;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Then expand ROOT and the volume level to show root directory contents
+        let root_label = if self.volume_label.is_empty() {
+            "ROOT"
+        } else {
+            &self.volume_label
+        };
+
+        // Open ROOT first
+        if self.tree.open("ROOT", false).is_ok() {
+            // Then open the volume level inside ROOT
+            let volume_path = format!("ROOT/{}", root_label);
+            let _ = self.tree.open(&volume_path, false);
+        }
+
+        self.tree.redraw();
     }
 
     fn load_directory_recursive(
