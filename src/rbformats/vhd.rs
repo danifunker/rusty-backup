@@ -7,8 +7,12 @@ use anyhow::{bail, Context, Result};
 
 use super::{decompress_to_writer, reconstruct_disk_from_backup, write_zeros, CHUNK_SIZE};
 use crate::backup::metadata::BackupMetadata;
+use crate::fs::exfat::{patch_exfat_hidden_sectors, resize_exfat_in_place};
 use crate::fs::ext::resize_ext_in_place;
 use crate::fs::fat::{patch_bpb_hidden_sectors, resize_fat_in_place};
+use crate::fs::hfs::{patch_hfs_hidden_sectors, resize_hfs_in_place};
+use crate::fs::hfsplus::{patch_hfsplus_hidden_sectors, resize_hfsplus_in_place};
+use crate::fs::ntfs::{patch_ntfs_hidden_sectors, resize_ntfs_in_place};
 use crate::partition::mbr::patch_mbr_entries;
 use crate::partition::PartitionSizeOverride;
 
@@ -400,11 +404,35 @@ pub fn export_whole_disk_vhd(
                     total_written += pad;
                 }
 
-                // Update BPB hidden sectors
+                // Update hidden sectors for all filesystem types
                 {
                     writer.flush()?;
                     let end_pos = total_written;
                     patch_bpb_hidden_sectors(
+                        writer.get_mut(),
+                        part_offset,
+                        ps.start_lba,
+                        &mut log_cb,
+                    )?;
+                    patch_ntfs_hidden_sectors(
+                        writer.get_mut(),
+                        part_offset,
+                        ps.start_lba,
+                        &mut log_cb,
+                    )?;
+                    patch_exfat_hidden_sectors(
+                        writer.get_mut(),
+                        part_offset,
+                        ps.start_lba,
+                        &mut log_cb,
+                    )?;
+                    patch_hfs_hidden_sectors(
+                        writer.get_mut(),
+                        part_offset,
+                        ps.start_lba,
+                        &mut log_cb,
+                    )?;
+                    patch_hfsplus_hidden_sectors(
                         writer.get_mut(),
                         part_offset,
                         ps.start_lba,
@@ -418,7 +446,32 @@ pub fn export_whole_disk_vhd(
                     writer.flush()?;
                     let end_pos = total_written;
                     let new_sectors = (ps.export_size / 512) as u32;
+                    let new_sectors_u64 = ps.export_size / 512;
                     resize_fat_in_place(writer.get_mut(), part_offset, new_sectors, &mut log_cb)?;
+                    resize_ntfs_in_place(
+                        writer.get_mut(),
+                        part_offset,
+                        new_sectors_u64,
+                        &mut log_cb,
+                    )?;
+                    resize_exfat_in_place(
+                        writer.get_mut(),
+                        part_offset,
+                        new_sectors_u64,
+                        &mut log_cb,
+                    )?;
+                    resize_hfs_in_place(
+                        writer.get_mut(),
+                        part_offset,
+                        ps.export_size,
+                        &mut log_cb,
+                    )?;
+                    resize_hfsplus_in_place(
+                        writer.get_mut(),
+                        part_offset,
+                        ps.export_size,
+                        &mut log_cb,
+                    )?;
                     resize_ext_in_place(
                         writer.get_mut(),
                         part_offset,
@@ -543,8 +596,6 @@ pub fn export_clonezilla_disk_vhd(
     mut log_cb: impl FnMut(&str),
 ) -> Result<()> {
     use crate::clonezilla::partclone::open_partclone_reader;
-    use crate::fs::exfat::patch_exfat_hidden_sectors;
-    use crate::fs::ntfs::patch_ntfs_hidden_sectors;
 
     let mut file = File::create(output_path)
         .with_context(|| format!("failed to create {}", output_path.display()))?;
@@ -674,10 +725,17 @@ pub fn export_clonezilla_disk_vhd(
             patch_bpb_hidden_sectors(&mut file, part_offset, effective_lba, &mut log_cb)?;
             patch_ntfs_hidden_sectors(&mut file, part_offset, effective_lba, &mut log_cb)?;
             patch_exfat_hidden_sectors(&mut file, part_offset, effective_lba, &mut log_cb)?;
+            patch_hfs_hidden_sectors(&mut file, part_offset, effective_lba, &mut log_cb)?;
+            patch_hfsplus_hidden_sectors(&mut file, part_offset, effective_lba, &mut log_cb)?;
 
             if export_size != cz_part.size_bytes() {
                 let new_sectors = (export_size / 512) as u32;
+                let new_sectors_u64 = export_size / 512;
                 resize_fat_in_place(&mut file, part_offset, new_sectors, &mut log_cb)?;
+                resize_ntfs_in_place(&mut file, part_offset, new_sectors_u64, &mut log_cb)?;
+                resize_exfat_in_place(&mut file, part_offset, new_sectors_u64, &mut log_cb)?;
+                resize_hfs_in_place(&mut file, part_offset, export_size, &mut log_cb)?;
+                resize_hfsplus_in_place(&mut file, part_offset, export_size, &mut log_cb)?;
                 resize_ext_in_place(&mut file, part_offset, export_size, &mut log_cb)?;
             }
 

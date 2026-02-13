@@ -13,6 +13,8 @@ use crate::clonezilla::metadata::ClonezillaImage;
 use crate::clonezilla::partclone::open_partclone_reader;
 use crate::fs::exfat::patch_exfat_hidden_sectors;
 use crate::fs::fat::patch_bpb_hidden_sectors;
+use crate::fs::hfs::patch_hfs_hidden_sectors;
+use crate::fs::hfsplus::patch_hfsplus_hidden_sectors;
 use crate::fs::ntfs::patch_ntfs_hidden_sectors;
 use crate::fs::{
     resize_exfat_in_place, resize_ext_in_place, resize_fat_in_place, resize_hfs_in_place,
@@ -1524,6 +1526,12 @@ fn write_clonezilla_disk(
                 log(progress, LogLevel::Info, msg)
             })?;
             patch_exfat_hidden_sectors(writer, part_offset, effective_lba, &mut |msg| {
+                log(progress, LogLevel::Info, msg)
+            })?;
+            patch_hfs_hidden_sectors(writer, part_offset, effective_lba, &mut |msg| {
+                log(progress, LogLevel::Info, msg)
+            })?;
+            patch_hfsplus_hidden_sectors(writer, part_offset, effective_lba, &mut |msg| {
                 log(progress, LogLevel::Info, msg)
             })?;
         }
