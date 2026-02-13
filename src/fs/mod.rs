@@ -1,5 +1,6 @@
 pub mod entry;
 pub mod exfat;
+pub mod ext;
 pub mod fat;
 pub mod filesystem;
 pub mod hfs;

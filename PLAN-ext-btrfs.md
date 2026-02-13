@@ -16,7 +16,7 @@ When starting a new session, read this file first, find the first uncompleted ta
 - [x] Task 4: Unix common — compact reader framework (unix_common/compact.rs)
 - [x] Task 5: Unix common — validation helpers (unix_common/validate.rs)
 - [x] Task 6: GUI updates for symlinks, specials, permissions (browse_view.rs)
-- [ ] Task 7: ext2/3/4 browsing — superblock + inode + directory parsing (ext.rs)
+- [x] Task 7: ext2/3/4 browsing — superblock + inode + directory parsing (ext.rs)
 - [ ] Task 8: Wire ext into mod.rs routing + detection
 - [ ] Task 9: ext2/3/4 compaction — CompactExtReader
 - [ ] Task 10: ext2/3/4 resize + validate + restore wiring
@@ -492,7 +492,7 @@ Look at how HFS `type_code` and `creator_code` are conditionally displayed in th
 
 ## Task 7: ext2/3/4 Filesystem Browsing
 
-**Status:** NOT STARTED
+**Status:** DONE
 **Depends on:** Tasks 1-3 (entry types, unix_common/inode, unix_common/bitmap)
 **Files to read first:** `src/fs/fat.rs` (the `FatFilesystem` struct and `Filesystem` trait impl — as structural reference), `src/fs/filesystem.rs` (trait definition)
 **Partclone reference:** `../partclone/src/extfsclone.c` (bitmap reading algorithm), `../partclone/src/btrfs/ctree.h` or Linux kernel `fs/ext4/ext4.h` for on-disk struct layouts
