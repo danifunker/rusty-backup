@@ -15,7 +15,7 @@ When starting a new session, read this file first, find the first uncompleted ta
 - [x] Task 3: Unix common — bitmap utilities (unix_common/bitmap.rs)
 - [x] Task 4: Unix common — compact reader framework (unix_common/compact.rs)
 - [x] Task 5: Unix common — validation helpers (unix_common/validate.rs)
-- [ ] Task 6: GUI updates for symlinks, specials, permissions (browse_view.rs)
+- [x] Task 6: GUI updates for symlinks, specials, permissions (browse_view.rs)
 - [ ] Task 7: ext2/3/4 browsing — superblock + inode + directory parsing (ext.rs)
 - [ ] Task 8: Wire ext into mod.rs routing + detection
 - [ ] Task 9: ext2/3/4 compaction — CompactExtReader
@@ -449,7 +449,7 @@ impl ValidationResult {
 
 ## Task 6: GUI Updates for Symlinks, Specials, Permissions
 
-**Status:** NOT STARTED
+**Status:** DONE
 **Depends on:** Task 1, Task 2
 **Files to read first:** `src/gui/browse_view.rs` — understand how the tree and metadata panel are rendered. Look for how `FileEntry` fields are displayed, how `FileContent` is used, and how HFS type/creator codes are shown in the metadata panel.
 **Files to modify:** `src/gui/browse_view.rs`

@@ -388,6 +388,26 @@ impl BrowseView {
         self.content = None;
         self.error = None;
 
+        // Symlinks: show the target path as text content
+        if entry.is_symlink() {
+            let target = entry
+                .symlink_target
+                .as_deref()
+                .unwrap_or("(unknown target)");
+            self.content = Some(FileContent::Text(format!("Symlink target: {target}")));
+            return;
+        }
+
+        // Special files: no content to preview
+        if entry.is_special() {
+            let stype = entry.special_type.as_deref().unwrap_or("special file");
+            self.content = Some(FileContent::Text(format!(
+                "{} -- no preview available",
+                stype
+            )));
+            return;
+        }
+
         if entry.size > MAX_PREVIEW_SIZE as u64 {
             // Don't auto-load large files
             return;
@@ -425,6 +445,18 @@ impl BrowseView {
                     }
                     if let Some(ref cc) = entry.creator_code {
                         ui.label(format!("Creator: {cc}"));
+                    }
+                    if let Some(mode_str) = entry.mode_string() {
+                        ui.label(format!("Permissions: {mode_str}"));
+                    }
+                    if let (Some(uid), Some(gid)) = (entry.uid, entry.gid) {
+                        ui.label(format!("Owner: {uid}:{gid}"));
+                    }
+                    if let Some(ref target) = entry.symlink_target {
+                        ui.label(format!("Target: {target}"));
+                    }
+                    if let Some(ref stype) = entry.special_type {
+                        ui.label(format!("Type: {stype}"));
                     }
                     ui.label(format!("Path: {}", entry.path));
                 });
