@@ -441,6 +441,11 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
                         modified: None,
                         type_code: None,
                         creator_code: None,
+                        symlink_target: None,
+                        special_type: None,
+                        mode: None,
+                        uid: None,
+                        gid: None,
                     }
                 } else {
                     FileEntry {
@@ -452,6 +457,11 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
                         modified: None,
                         type_code: None,
                         creator_code: None,
+                        symlink_target: None,
+                        special_type: None,
+                        mode: None,
+                        uid: None,
+                        gid: None,
                     }
                 };
 
@@ -480,6 +490,11 @@ impl<R: Read + Seek + Send> Filesystem for ExfatFilesystem<R> {
             modified: None,
             type_code: None,
             creator_code: None,
+            symlink_target: None,
+            special_type: None,
+            mode: None,
+            uid: None,
+            gid: None,
         })
     }
 

@@ -442,6 +442,11 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
             modified: None,
             type_code: None,
             creator_code: None,
+            symlink_target: None,
+            special_type: None,
+            mode: None,
+            uid: None,
+            gid: None,
         })
     }
 

@@ -338,6 +338,35 @@ impl BrowseView {
                     self.select_file(entry);
                 }
             }
+            EntryType::Symlink => {
+                let is_selected = self
+                    .selected_entry
+                    .as_ref()
+                    .map(|s| s.path == entry.path)
+                    .unwrap_or(false);
+
+                let target = entry.symlink_target.as_deref().unwrap_or("?");
+                let label = format!("{} -> {}", entry.name, target);
+
+                if ui.selectable_label(is_selected, &label).clicked() {
+                    self.select_file(entry);
+                }
+            }
+            EntryType::Special => {
+                let is_selected = self
+                    .selected_entry
+                    .as_ref()
+                    .map(|s| s.path == entry.path)
+                    .unwrap_or(false);
+
+                let stype = entry.special_type.as_deref().unwrap_or("special");
+                let label = format!("{}  ({})", entry.name, stype);
+
+                if ui.selectable_label(is_selected, &label).clicked() {
+                    self.selected_entry = Some(entry.clone());
+                    self.content = None;
+                }
+            }
         }
     }
 

@@ -5,6 +5,7 @@ pub mod filesystem;
 pub mod hfs;
 pub mod hfsplus;
 pub mod ntfs;
+pub mod unix_common;
 
 use std::io::{Read, Seek, SeekFrom};
 
