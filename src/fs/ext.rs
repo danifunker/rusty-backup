@@ -1,15 +1,21 @@
-//! ext2/3/4 filesystem browsing.
+//! ext2/3/4 filesystem browsing and compaction.
 //!
 //! Implements the `Filesystem` trait for ext2, ext3, and ext4 partitions,
 //! supporting superblock parsing, block group descriptors, inode reading,
 //! directory parsing (linear and htree), extent trees, indirect block chains,
 //! and fast/slow symlinks.
+//!
+//! Also provides `CompactExtReader` for producing compacted partition images
+//! where unallocated blocks are zeroed out (ideal for compression).
 
 use std::io::{Read, Seek, SeekFrom};
 
 use super::entry::{EntryType, FileEntry};
 use super::filesystem::{Filesystem, FilesystemError};
+use super::unix_common::bitmap::BitmapReader;
+use super::unix_common::compact::{CompactLayout, CompactSection, CompactStreamReader};
 use super::unix_common::inode::{unix_entry_from_inode, unix_file_type, UnixFileType};
+use crate::fs::CompactResult;
 
 // ---- Constants ----
 
@@ -27,6 +33,9 @@ const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
 
 // Extent magic
 const EXT4_EXT_MAGIC: u16 = 0xF30A;
+
+// Block group flags
+const BG_BLOCK_UNINIT: u16 = 0x0002;
 
 // Special inodes
 const EXT_ROOT_INO: u32 = 2;
@@ -103,6 +112,7 @@ pub struct ExtFilesystem<R> {
     label: Option<String>,
     ext_version: ExtVersion,
     has_extents: bool,
+    #[allow(dead_code)] // Used in later tasks (64-bit block number handling)
     is_64bit: bool,
     #[allow(dead_code)] // Used in later tasks (64-bit GDT re-reading)
     desc_size: u16,
@@ -700,8 +710,6 @@ impl<R: Read + Seek + Send> Filesystem for ExtFilesystem<R> {
     }
 
     fn last_data_byte(&mut self) -> Result<u64, FilesystemError> {
-        use super::unix_common::bitmap::BitmapReader;
-
         let mut highest_block: u64 = 0;
         let blocks_per_group =
             (self.total_blocks + self.group_count as u64 - 1) / self.group_count as u64;
@@ -832,6 +840,193 @@ fn le32(data: &[u8], offset: usize) -> u32 {
         data[offset + 2],
         data[offset + 3],
     ])
+}
+
+// ---------------------------------------------------------------------------
+// CompactExtReader — streaming compacted ext image
+// ---------------------------------------------------------------------------
+
+/// A streaming `Read` that produces a compacted ext2/3/4 partition image.
+///
+/// Allocated blocks are preserved; unallocated blocks are replaced with zeros.
+/// The output image has the same block layout as the original — block pointers
+/// in inodes and extent trees remain valid. This approach is simpler and more
+/// reliable than defragmentation, and produces excellent compression ratios
+/// since free space compresses to nothing.
+pub struct CompactExtReader<R: Read + Seek> {
+    inner: CompactStreamReader<R>,
+}
+
+impl<R: Read + Seek + Send> CompactExtReader<R> {
+    /// Create a new compacted ext reader.
+    ///
+    /// Parses the superblock and block group descriptors, scans block bitmaps
+    /// to identify allocated blocks, and builds a virtual layout that maps
+    /// allocated blocks from the source while zeroing unallocated ones.
+    pub fn new(
+        mut reader: R,
+        partition_offset: u64,
+    ) -> Result<(Self, CompactResult), FilesystemError> {
+        // Parse superblock
+        reader.seek(SeekFrom::Start(partition_offset + SUPERBLOCK_OFFSET))?;
+        let mut sb = [0u8; SUPERBLOCK_SIZE];
+        reader.read_exact(&mut sb)?;
+
+        let magic = u16::from_le_bytes([sb[0x38], sb[0x39]]);
+        if magic != EXT_MAGIC {
+            return Err(FilesystemError::Parse(format!(
+                "ext compact: invalid superblock magic 0x{magic:04X}"
+            )));
+        }
+
+        let blocks_count_lo = le32(&sb, 0x04);
+        let first_data_block = le32(&sb, 0x18);
+        let log_block_size = le32(&sb, 0x1C);
+        let blocks_per_group = le32(&sb, 0x24);
+        let feature_incompat = le32(&sb, 0x60);
+
+        let block_size = 1024u64 << log_block_size;
+        let is_64bit = feature_incompat & INCOMPAT_64BIT != 0;
+
+        let desc_size: u16 = if is_64bit {
+            let ds = u16::from_le_bytes([sb[0xFE], sb[0xFF]]);
+            if ds >= 64 {
+                ds
+            } else {
+                64
+            }
+        } else {
+            32
+        };
+
+        let total_blocks = if is_64bit {
+            let hi = le32(&sb, 0x150) as u64;
+            (hi << 32) | blocks_count_lo as u64
+        } else {
+            blocks_count_lo as u64
+        };
+
+        if blocks_per_group == 0 {
+            return Err(FilesystemError::Parse(
+                "ext compact: blocks_per_group is 0".into(),
+            ));
+        }
+
+        let group_count = ((total_blocks - first_data_block as u64 + blocks_per_group as u64 - 1)
+            / blocks_per_group as u64) as u32;
+
+        // Read group descriptors
+        let sb_block = if block_size == 1024 { 1 } else { 0 };
+        let gdt_block = sb_block + 1;
+        let gdt_offset = partition_offset + gdt_block * block_size;
+        let gdt_bytes_needed = group_count as usize * desc_size as usize;
+        let mut gdt_buf = vec![0u8; gdt_bytes_needed];
+        reader.seek(SeekFrom::Start(gdt_offset))?;
+        reader.read_exact(&mut gdt_buf)?;
+
+        // Parse GDTs to get block bitmap locations and flags
+        let mut gd_infos: Vec<(u64, u16)> = Vec::with_capacity(group_count as usize);
+        for i in 0..group_count as usize {
+            let off = i * desc_size as usize;
+            let d = &gdt_buf[off..];
+            let block_bitmap_lo = le32(d, 0x00) as u64;
+            let flags = u16::from_le_bytes([d[0x12], d[0x13]]);
+            let block_bitmap = if is_64bit && desc_size >= 64 {
+                let bb_hi = le32(d, 0x20) as u64;
+                (bb_hi << 32) | block_bitmap_lo
+            } else {
+                block_bitmap_lo
+            };
+            gd_infos.push((block_bitmap, flags));
+        }
+
+        // Scan block bitmaps and build the layout
+        // Strategy: for each block group, read its bitmap and emit either
+        // MappedBlocks (for runs of allocated blocks) or Zeros (for runs of free blocks).
+        let mut sections: Vec<CompactSection> = Vec::new();
+        let mut total_allocated: u64 = 0;
+
+        for group in 0..group_count as usize {
+            let group_start_block =
+                first_data_block as u64 + group as u64 * blocks_per_group as u64;
+            let group_block_count = if group as u32 == group_count - 1 {
+                total_blocks - group_start_block
+            } else {
+                blocks_per_group as u64
+            };
+
+            let (bitmap_block, flags) = gd_infos[group];
+
+            if flags & BG_BLOCK_UNINIT != 0 {
+                // All blocks in this group are free
+                sections.push(CompactSection::Zeros(group_block_count * block_size));
+                continue;
+            }
+
+            // Read the block bitmap
+            reader.seek(SeekFrom::Start(
+                partition_offset + bitmap_block * block_size,
+            ))?;
+            let mut bitmap_data = vec![0u8; block_size as usize];
+            reader.read_exact(&mut bitmap_data)?;
+
+            let bm = BitmapReader::new(&bitmap_data, group_block_count);
+
+            // Build runs of allocated/free blocks
+            let mut block_idx: u64 = 0;
+            while block_idx < group_block_count {
+                let is_set = bm.is_bit_set(block_idx);
+
+                // Find the end of this run
+                let mut run_end = block_idx + 1;
+                while run_end < group_block_count && bm.is_bit_set(run_end) == is_set {
+                    run_end += 1;
+                }
+                let run_len = run_end - block_idx;
+
+                if is_set {
+                    // Allocated blocks — map from source
+                    let old_blocks: Vec<u64> = (block_idx..run_end)
+                        .map(|bi| group_start_block + bi)
+                        .collect();
+                    total_allocated += run_len;
+                    sections.push(CompactSection::MappedBlocks { old_blocks });
+                } else {
+                    // Free blocks — emit zeros
+                    sections.push(CompactSection::Zeros(run_len * block_size));
+                }
+
+                block_idx = run_end;
+            }
+        }
+
+        let original_size = total_blocks * block_size;
+        let compacted_size = original_size; // Same logical size, but zeros compress well
+
+        let layout = CompactLayout {
+            sections,
+            block_size: block_size as usize,
+            source_data_start: 0, // ext block numbers are partition-relative
+            source_partition_offset: partition_offset,
+        };
+
+        let inner = CompactStreamReader::new(reader, layout);
+
+        Ok((
+            Self { inner },
+            CompactResult {
+                original_size,
+                compacted_size,
+                clusters_used: total_allocated as u32,
+            },
+        ))
+    }
+}
+
+impl<R: Read + Seek> Read for CompactExtReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
 }
 
 // ---- Tests ----
@@ -1226,5 +1421,66 @@ mod tests {
 
         let entries = fs.list_directory(&root).unwrap();
         assert_eq!(entries.len(), 3);
+    }
+
+    #[test]
+    fn test_compact_ext_reader() {
+        let image = make_test_image();
+        let total_size = image.len();
+        let cursor = Cursor::new(image);
+
+        let (mut reader, info) = CompactExtReader::new(cursor, 0).unwrap();
+
+        // Original size should match the image
+        assert_eq!(info.original_size, total_size as u64);
+        // Blocks 0-6 are allocated (7 blocks)
+        assert_eq!(info.clusters_used, 7);
+
+        // Read the entire compacted image
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).unwrap();
+        assert_eq!(output.len(), total_size);
+
+        // The first 7 blocks should be non-zero (they contain data)
+        // Block 0 has the superblock at offset 1024
+        assert_eq!(
+            u16::from_le_bytes([output[1024 + 0x38], output[1024 + 0x39]]),
+            EXT_MAGIC
+        );
+
+        // Blocks beyond block 6 should be all zeros
+        let block_size = 4096;
+        let zero_start = 7 * block_size;
+        if zero_start < output.len() {
+            assert!(
+                output[zero_start..zero_start + block_size]
+                    .iter()
+                    .all(|&b| b == 0),
+                "blocks after the last allocated block should be zeroed"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compact_ext_reader_preserves_allocated_data() {
+        let image = make_test_image();
+        let cursor = Cursor::new(image.clone());
+
+        let (mut reader, _info) = CompactExtReader::new(cursor, 0).unwrap();
+
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).unwrap();
+
+        // Allocated blocks (0-6) should match the original image exactly
+        let block_size = 4096;
+        for block in 0..7 {
+            let start = block * block_size;
+            let end = start + block_size;
+            assert_eq!(
+                &output[start..end],
+                &image[start..end],
+                "allocated block {block} should match source"
+            );
+        }
     }
 }

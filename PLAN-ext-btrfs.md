@@ -17,8 +17,8 @@ When starting a new session, read this file first, find the first uncompleted ta
 - [x] Task 5: Unix common — validation helpers (unix_common/validate.rs)
 - [x] Task 6: GUI updates for symlinks, specials, permissions (browse_view.rs)
 - [x] Task 7: ext2/3/4 browsing — superblock + inode + directory parsing (ext.rs)
-- [ ] Task 8: Wire ext into mod.rs routing + detection
-- [ ] Task 9: ext2/3/4 compaction — CompactExtReader
+- [x] Task 8: Wire ext into mod.rs routing + detection
+- [x] Task 9: ext2/3/4 compaction — CompactExtReader
 - [ ] Task 10: ext2/3/4 resize + validate + restore wiring
 - [ ] Task 11: btrfs browsing — superblock + chunk tree + FS tree (btrfs.rs)
 - [ ] Task 12: Wire btrfs into mod.rs routing + detection
@@ -658,7 +658,7 @@ For ext3/4 htree-indexed directories: ignore the hash index structure entirely. 
 
 ## Task 8: Wire ext into mod.rs Routing
 
-**Status:** NOT STARTED
+**Status:** DONE
 **Depends on:** Task 7
 **Files to read first:** `src/fs/mod.rs` (current routing logic)
 **Files to modify:** `src/fs/mod.rs`
@@ -702,7 +702,7 @@ For ext3/4 htree-indexed directories: ignore the hash index structure entirely. 
 
 ## Task 9: ext2/3/4 Compaction — CompactExtReader
 
-**Status:** NOT STARTED
+**Status:** DONE
 **Depends on:** Tasks 3, 4, 7 (bitmap utils, compact framework, ext browsing)
 **Files to read first:** `src/fs/ext.rs` (the ExtFilesystem you built in Task 7), `src/fs/unix_common/compact.rs` (the framework from Task 4), `src/fs/unix_common/bitmap.rs`
 **Partclone reference:** `../partclone/src/extfsclone.c` lines 100-257 (how it identifies used blocks, handles `BLOCK_UNINIT`)

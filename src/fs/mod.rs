@@ -13,6 +13,7 @@ use std::io::{Read, Seek, SeekFrom};
 pub use exfat::{
     patch_exfat_hidden_sectors, resize_exfat_in_place, validate_exfat_integrity, CompactExfatReader,
 };
+pub use ext::{CompactExtReader, ExtFilesystem};
 pub use fat::{
     patch_bpb_hidden_sectors, resize_fat_in_place, set_fat_clean_flags, validate_fat_integrity,
     CompactFatReader, CompactInfo,
@@ -37,7 +38,7 @@ pub struct CompactResult {
 }
 
 /// Auto-detect the filesystem type at a given offset by probing magic bytes.
-/// Returns a string hint: "fat", "ntfs", "exfat", "hfs", "hfsplus", or "unknown".
+/// Returns a string hint: "fat", "ntfs", "exfat", "hfs", "hfsplus", "ext", or "unknown".
 fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> &'static str {
     // Read first 12 bytes for FAT/NTFS/exFAT detection
     if reader.seek(SeekFrom::Start(partition_offset)).is_err() {
@@ -84,6 +85,17 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
                 0x482B | 0x4858 => return "hfsplus",
                 _ => {}
             }
+        }
+    }
+
+    // Check for ext2/3/4 magic (0xEF53 LE) at partition_offset + 1024 + 0x38
+    if reader
+        .seek(SeekFrom::Start(partition_offset + 1024 + 0x38))
+        .is_ok()
+    {
+        let mut magic = [0u8; 2];
+        if reader.read_exact(&mut magic).is_ok() && magic == [0x53, 0xEF] {
+            return "ext";
         }
     }
 
@@ -161,6 +173,10 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
                         },
                     ))
                 }
+                "ext" => {
+                    let (reader, info) = CompactExtReader::new(reader, partition_offset).ok()?;
+                    Some((Box::new(reader), info))
+                }
                 _ => None,
             }
         }
@@ -202,6 +218,18 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
                         },
                     ))
                 }
+                _ => None,
+            }
+        }
+        // Linux (ext2/3/4, btrfs in future)
+        0x83 => {
+            let fs_type = detect_filesystem_type(&mut reader, partition_offset);
+            match fs_type {
+                "ext" => {
+                    let (reader, info) = CompactExtReader::new(reader, partition_offset).ok()?;
+                    Some((Box::new(reader), info))
+                }
+                // "btrfs" => added in Task 13
                 _ => None,
             }
         }
@@ -270,6 +298,10 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "ext" => Ok(Box::new(ext::ExtFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 _ => Err(FilesystemError::Unsupported(
                     "could not detect filesystem type on superfloppy".into(),
                 )),
@@ -307,10 +339,20 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                 )),
             }
         }
-        // Linux
-        0x83 => Err(FilesystemError::Unsupported(
-            "ext2/3/4 browsing not yet supported".into(),
-        )),
+        // Linux — detect ext vs btrfs by magic bytes
+        0x83 => {
+            let fs_type = detect_filesystem_type(&mut reader, partition_offset);
+            match fs_type {
+                "ext" => Ok(Box::new(ext::ExtFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                // "btrfs" => added in Task 12
+                _ => Err(FilesystemError::Unsupported(
+                    "type 0x83 partition: unrecognized Linux filesystem".into(),
+                )),
+            }
+        }
         _ => Err(FilesystemError::Unsupported(format!(
             "filesystem type 0x{:02X} not supported for browsing",
             partition_type
