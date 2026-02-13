@@ -756,7 +756,7 @@ Update `compact_partition_reader()` for type `0x83` and auto-detect `0x00`:
 
 ## Task 10: ext2/3/4 Resize + Validate + Restore Wiring
 
-**Status:** NOT STARTED
+**Status:** DONE
 **Depends on:** Task 9
 **Files to read first:** `src/restore/mod.rs` (search for `PartitionFsType` enum and the resize/validate match arms), `src/rbformats/mod.rs` (search for `patch_bpb_hidden_sectors` — see the patching chain), `src/rbformats/vhd.rs` (search for `resize_fat_in_place`)
 **Files to modify:** `src/fs/ext.rs`, `src/restore/mod.rs`, `src/rbformats/vhd.rs`

@@ -13,7 +13,7 @@ use std::io::{Read, Seek, SeekFrom};
 pub use exfat::{
     patch_exfat_hidden_sectors, resize_exfat_in_place, validate_exfat_integrity, CompactExfatReader,
 };
-pub use ext::{CompactExtReader, ExtFilesystem};
+pub use ext::{resize_ext_in_place, validate_ext_integrity, CompactExtReader, ExtFilesystem};
 pub use fat::{
     patch_bpb_hidden_sectors, resize_fat_in_place, set_fat_clean_flags, validate_fat_integrity,
     CompactFatReader, CompactInfo,

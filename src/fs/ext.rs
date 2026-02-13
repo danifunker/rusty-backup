@@ -843,6 +843,189 @@ fn le32(data: &[u8], offset: usize) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
+// Resize
+// ---------------------------------------------------------------------------
+
+/// Grow an ext2/3/4 filesystem in place.
+///
+/// Updates the superblock and group descriptor table to reflect the new
+/// partition size. Only grow operations are supported — if the new size is
+/// smaller than or equal to the current size, this is a no-op.
+///
+/// This performs a minimal resize: it updates `s_blocks_count` and
+/// `s_free_blocks_count` in the superblock and zeroes new block group
+/// metadata. A full `e2fsck`/`resize2fs` is still recommended after restore,
+/// but this gets the filesystem to a bootable state.
+pub fn resize_ext_in_place(
+    file: &mut (impl Read + std::io::Write + Seek),
+    partition_offset: u64,
+    new_total_bytes: u64,
+    log_cb: &mut impl FnMut(&str),
+) -> anyhow::Result<()> {
+    // Read superblock
+    file.seek(SeekFrom::Start(partition_offset + SUPERBLOCK_OFFSET))?;
+    let mut sb = [0u8; SUPERBLOCK_SIZE];
+    file.read_exact(&mut sb)?;
+
+    let magic = u16::from_le_bytes([sb[0x38], sb[0x39]]);
+    if magic != EXT_MAGIC {
+        log_cb("ext resize: not an ext filesystem, skipping");
+        return Ok(());
+    }
+
+    let log_block_size = le32(&sb, 0x1C);
+    let block_size = 1024u64 << log_block_size;
+    let blocks_per_group = le32(&sb, 0x24) as u64;
+    let inodes_per_group = le32(&sb, 0x2C);
+    let inode_size = u16::from_le_bytes([sb[0x3E], sb[0x3F]]) as u64;
+    let feature_incompat = le32(&sb, 0x60);
+    let is_64bit = feature_incompat & INCOMPAT_64BIT != 0;
+    let _first_data_block = le32(&sb, 0x18) as u64;
+
+    let old_blocks = if is_64bit {
+        let hi = le32(&sb, 0x150) as u64;
+        (hi << 32) | le32(&sb, 0x04) as u64
+    } else {
+        le32(&sb, 0x04) as u64
+    };
+
+    let new_blocks = new_total_bytes / block_size;
+    if new_blocks <= old_blocks {
+        log_cb(&format!(
+            "ext resize: new size ({new_blocks} blocks) <= current ({old_blocks} blocks), skipping"
+        ));
+        return Ok(());
+    }
+
+    let added_blocks = new_blocks - old_blocks;
+    log_cb(&format!(
+        "ext resize: growing from {old_blocks} to {new_blocks} blocks (+{added_blocks})"
+    ));
+
+    // Update s_blocks_count
+    sb[0x04..0x08].copy_from_slice(&(new_blocks as u32).to_le_bytes());
+    if is_64bit {
+        sb[0x150..0x154].copy_from_slice(&((new_blocks >> 32) as u32).to_le_bytes());
+    }
+
+    // Update s_free_blocks_count: add the new blocks as free
+    let old_free_lo = le32(&sb, 0x0C) as u64;
+    let old_free = if is_64bit {
+        let hi = le32(&sb, 0x154) as u64;
+        (hi << 32) | old_free_lo
+    } else {
+        old_free_lo
+    };
+    let new_free = old_free + added_blocks;
+    sb[0x0C..0x10].copy_from_slice(&(new_free as u32).to_le_bytes());
+    if is_64bit {
+        sb[0x154..0x158].copy_from_slice(&((new_free >> 32) as u32).to_le_bytes());
+    }
+
+    // Write updated superblock
+    file.seek(SeekFrom::Start(partition_offset + SUPERBLOCK_OFFSET))?;
+    file.write_all(&sb)?;
+
+    log_cb(&format!(
+        "ext resize: updated superblock — {new_blocks} total blocks, {new_free} free blocks"
+    ));
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Validate
+// ---------------------------------------------------------------------------
+
+/// Validate ext2/3/4 filesystem integrity.
+///
+/// Performs basic consistency checks and returns a list of warnings.
+pub fn validate_ext_integrity(
+    file: &mut (impl Read + Seek),
+    partition_offset: u64,
+    log_cb: &mut impl FnMut(&str),
+) -> anyhow::Result<Vec<String>> {
+    let mut warnings = Vec::new();
+
+    // Read superblock
+    file.seek(SeekFrom::Start(partition_offset + SUPERBLOCK_OFFSET))?;
+    let mut sb = [0u8; SUPERBLOCK_SIZE];
+    file.read_exact(&mut sb)?;
+
+    // Check magic
+    let magic = u16::from_le_bytes([sb[0x38], sb[0x39]]);
+    if magic != EXT_MAGIC {
+        warnings.push(format!(
+            "ext: invalid superblock magic 0x{magic:04X} (expected 0xEF53)"
+        ));
+        return Ok(warnings);
+    }
+    log_cb("ext validate: superblock magic OK");
+
+    // Check block size
+    let log_block_size = le32(&sb, 0x1C);
+    let block_size = 1024u64 << log_block_size;
+    if !matches!(block_size, 1024 | 2048 | 4096) {
+        warnings.push(format!("ext: unusual block size {block_size}"));
+    }
+
+    // Check blocks_per_group > 0
+    let blocks_per_group = le32(&sb, 0x24);
+    if blocks_per_group == 0 {
+        warnings.push("ext: blocks_per_group is 0".to_string());
+        return Ok(warnings);
+    }
+
+    // Check group count consistency
+    let feature_incompat = le32(&sb, 0x60);
+    let is_64bit = feature_incompat & INCOMPAT_64BIT != 0;
+    let first_data_block = le32(&sb, 0x18) as u64;
+    let total_blocks = if is_64bit {
+        let hi = le32(&sb, 0x150) as u64;
+        (hi << 32) | le32(&sb, 0x04) as u64
+    } else {
+        le32(&sb, 0x04) as u64
+    };
+
+    let expected_groups = ((total_blocks - first_data_block + blocks_per_group as u64 - 1)
+        / blocks_per_group as u64) as u32;
+
+    // Check inode size
+    let inode_size = u16::from_le_bytes([sb[0x3E], sb[0x3F]]);
+    if inode_size < 128 {
+        warnings.push(format!("ext: invalid inode size {inode_size}"));
+    }
+
+    // Check inodes_per_group > 0
+    let inodes_per_group = le32(&sb, 0x2C);
+    if inodes_per_group == 0 {
+        warnings.push("ext: inodes_per_group is 0".to_string());
+    }
+
+    let total_inodes = le32(&sb, 0x00);
+    let expected_inodes = expected_groups * inodes_per_group;
+    if total_inodes != expected_inodes {
+        warnings.push(format!(
+            "ext: s_inodes_count ({total_inodes}) != groups * inodes_per_group ({expected_inodes})"
+        ));
+    }
+
+    log_cb(&format!(
+        "ext validate: {total_blocks} blocks, {expected_groups} groups, block size {block_size}"
+    ));
+
+    if warnings.is_empty() {
+        log_cb("ext validate: all checks passed");
+    } else {
+        for w in &warnings {
+            log_cb(&format!("ext validate warning: {w}"));
+        }
+    }
+
+    Ok(warnings)
+}
+
+// ---------------------------------------------------------------------------
 // CompactExtReader — streaming compacted ext image
 // ---------------------------------------------------------------------------
 

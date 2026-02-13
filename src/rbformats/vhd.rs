@@ -7,6 +7,7 @@ use anyhow::{bail, Context, Result};
 
 use super::{decompress_to_writer, reconstruct_disk_from_backup, write_zeros, CHUNK_SIZE};
 use crate::backup::metadata::BackupMetadata;
+use crate::fs::ext::resize_ext_in_place;
 use crate::fs::fat::{patch_bpb_hidden_sectors, resize_fat_in_place};
 use crate::partition::mbr::patch_mbr_entries;
 use crate::partition::PartitionSizeOverride;
@@ -412,12 +413,18 @@ pub fn export_whole_disk_vhd(
                     writer.seek(SeekFrom::Start(end_pos))?;
                 }
 
-                // Resize FAT filesystem if the partition size changed
+                // Resize filesystem if the partition size changed
                 if ps.export_size != ps.original_size {
                     writer.flush()?;
                     let end_pos = total_written;
                     let new_sectors = (ps.export_size / 512) as u32;
                     resize_fat_in_place(writer.get_mut(), part_offset, new_sectors, &mut log_cb)?;
+                    resize_ext_in_place(
+                        writer.get_mut(),
+                        part_offset,
+                        ps.export_size,
+                        &mut log_cb,
+                    )?;
                     writer.seek(SeekFrom::Start(end_pos))?;
                 }
 
@@ -671,6 +678,7 @@ pub fn export_clonezilla_disk_vhd(
             if export_size != cz_part.size_bytes() {
                 let new_sectors = (export_size / 512) as u32;
                 resize_fat_in_place(&mut file, part_offset, new_sectors, &mut log_cb)?;
+                resize_ext_in_place(&mut file, part_offset, export_size, &mut log_cb)?;
             }
 
             // Seek back to end for next partition
