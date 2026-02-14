@@ -19,12 +19,12 @@ When starting a new session, read this file first, find the first uncompleted ta
 - [x] Task 7: ext2/3/4 browsing — superblock + inode + directory parsing (ext.rs)
 - [x] Task 8: Wire ext into mod.rs routing + detection
 - [x] Task 9: ext2/3/4 compaction — CompactExtReader
-- [ ] Task 10: ext2/3/4 resize + validate + restore wiring
-- [ ] Task 11: btrfs browsing — superblock + chunk tree + FS tree (btrfs.rs)
-- [ ] Task 12: Wire btrfs into mod.rs routing + detection
-- [ ] Task 13: btrfs compaction — CompactBtrfsReader
-- [ ] Task 14: btrfs resize + validate + restore wiring
-- [ ] Task 15: Clonezilla block_cache ext/btrfs metadata scanning
+- [x] Task 10: ext2/3/4 resize + validate + restore wiring
+- [x] Task 11: btrfs browsing — superblock + chunk tree + FS tree (btrfs.rs)
+- [x] Task 12: Wire btrfs into mod.rs routing + detection
+- [x] Task 13: btrfs compaction — CompactBtrfsReader
+- [x] Task 14: btrfs resize + validate + restore wiring
+- [x] Task 15: Clonezilla block_cache ext/btrfs metadata scanning
 - [ ] Task 16: End-to-end testing
 
 ---
@@ -1143,7 +1143,7 @@ Same pattern as Task 10 Part C:
 
 ## Task 15: Clonezilla block_cache Extensions
 
-**Status:** NOT STARTED
+**Status:** DONE
 **Depends on:** Tasks 7, 11 (need to understand ext and btrfs on-disk formats)
 **Files to read first:** `src/clonezilla/block_cache.rs` — search for `identify_fat_metadata_blocks` and `scan_metadata` to understand the pattern
 **Files to modify:** `src/clonezilla/block_cache.rs`

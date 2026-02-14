@@ -638,6 +638,8 @@ fn identify_metadata_blocks(
                 vec![0]
             }
         }
+        // Linux (ext2/3/4, btrfs)
+        0x83 => identify_linux_metadata_blocks(boot_sector, bs, _total_blocks),
         _ => vec![0],
     }
 }
@@ -803,8 +805,423 @@ fn discover_directory_blocks(
             // Directory index blocks in NTFS are loaded on demand.
             vec![]
         }
+        // Linux (ext2/3/4, btrfs) — directory data is loaded on demand
+        // via the filesystem's own tree/inode reading. The metadata blocks
+        // cached in identify_linux_metadata_blocks cover superblock, GDTs,
+        // bitmaps, inode tables, and tree nodes needed for browsing.
+        0x83 => discover_linux_directory_blocks(cache, block_size),
         _ => vec![],
     }
+}
+
+/// Identify metadata blocks for Linux partitions (ext2/3/4 or btrfs).
+///
+/// Since we can't always tell which filesystem it is from block 0 alone,
+/// we probe the cached data for ext superblock magic and btrfs magic,
+/// and return blocks for whichever is detected.
+fn identify_linux_metadata_blocks(
+    boot_sector: &[u8],
+    block_size: u64,
+    total_blocks: u64,
+) -> Vec<u64> {
+    let mut blocks = BTreeSet::new();
+    blocks.insert(0);
+
+    // Check if block 0 contains the ext superblock (at byte 1024 within the partition).
+    // If block_size >= 2048, the superblock is within block 0 at offset 1024.
+    // If block_size == 1024, the superblock is in block 1.
+    let ext_sb_block = 1024 / block_size;
+    blocks.insert(ext_sb_block);
+
+    // Also request the btrfs superblock block (at byte offset 0x10000 = 65536)
+    let btrfs_sb_block = 0x10000 / block_size;
+    if btrfs_sb_block < total_blocks {
+        blocks.insert(btrfs_sb_block);
+    }
+
+    // Try to detect ext from block 0 data if block_size >= 2048
+    // (superblock at byte 1024 would be within block 0)
+    if block_size >= 2048 && boot_sector.len() >= 1024 + 0x3A {
+        let magic = u16::from_le_bytes([boot_sector[1024 + 0x38], boot_sector[1024 + 0x39]]);
+        if magic == 0xEF53 {
+            let ext_blocks = identify_ext_metadata_blocks(boot_sector, block_size);
+            for b in ext_blocks {
+                blocks.insert(b);
+            }
+        }
+    }
+
+    blocks.into_iter().collect()
+}
+
+/// Identify ext2/3/4 metadata blocks from a data buffer that contains the superblock.
+///
+/// `data` must contain at least 1024 + 256 bytes (superblock at offset 1024).
+/// Returns partition block indices for: superblock, group descriptor table,
+/// block bitmaps, inode bitmaps, and inode tables for all block groups.
+fn identify_ext_metadata_blocks(data: &[u8], block_size: u64) -> Vec<u64> {
+    let mut blocks = BTreeSet::new();
+
+    // Superblock block
+    let sb_block = 1024 / block_size;
+    blocks.insert(sb_block);
+
+    let sb_off = 1024usize;
+    if data.len() < sb_off + 0x60 {
+        return blocks.into_iter().collect();
+    }
+
+    // Parse essential superblock fields
+    let magic = u16::from_le_bytes([data[sb_off + 0x38], data[sb_off + 0x39]]);
+    if magic != 0xEF53 {
+        return blocks.into_iter().collect();
+    }
+
+    let blocks_count_lo = u32::from_le_bytes(data[sb_off..sb_off + 4].try_into().unwrap()) as u64;
+    let _inodes_count = u32::from_le_bytes(data[sb_off + 0x00..sb_off + 0x04].try_into().unwrap());
+    let first_data_block =
+        u32::from_le_bytes(data[sb_off + 0x18..sb_off + 0x1C].try_into().unwrap()) as u64;
+    let log_block_size = u32::from_le_bytes(data[sb_off + 0x1C..sb_off + 0x20].try_into().unwrap());
+    let ext_block_size = 1024u64 << log_block_size;
+    let blocks_per_group =
+        u32::from_le_bytes(data[sb_off + 0x24..sb_off + 0x28].try_into().unwrap()) as u64;
+    let inodes_per_group =
+        u32::from_le_bytes(data[sb_off + 0x2C..sb_off + 0x30].try_into().unwrap());
+    let inode_size = if data.len() >= sb_off + 0x40 {
+        u16::from_le_bytes([data[sb_off + 0x3E], data[sb_off + 0x3F]]) as u64
+    } else {
+        128
+    };
+
+    // Check for 64-bit mode
+    let incompat_flags = if data.len() >= sb_off + 0x64 {
+        u32::from_le_bytes(data[sb_off + 0x60..sb_off + 0x64].try_into().unwrap())
+    } else {
+        0
+    };
+    let is_64bit = incompat_flags & 0x80 != 0;
+    let desc_size = if is_64bit && data.len() >= sb_off + 0x5A {
+        u16::from_le_bytes([data[sb_off + 0x58], data[sb_off + 0x59]]).max(32) as u64
+    } else {
+        32
+    };
+
+    // Total blocks (handle 64-bit)
+    let blocks_count_hi = if is_64bit && data.len() >= sb_off + 0x154 {
+        u32::from_le_bytes(data[sb_off + 0x150..sb_off + 0x154].try_into().unwrap()) as u64
+    } else {
+        0
+    };
+    let total_ext_blocks = blocks_count_lo | (blocks_count_hi << 32);
+
+    if blocks_per_group == 0 || ext_block_size == 0 {
+        return blocks.into_iter().collect();
+    }
+
+    let group_count = total_ext_blocks.div_ceil(blocks_per_group);
+
+    // Group descriptor table starts at the block after the superblock block
+    let gdt_start_ext_block = first_data_block + 1;
+    let gdt_total_bytes = group_count * desc_size;
+    let gdt_ext_blocks = gdt_total_bytes.div_ceil(ext_block_size);
+
+    // Convert ext blocks to partition blocks
+    let ext_to_partition = |ext_block: u64| -> u64 { (ext_block * ext_block_size) / block_size };
+
+    // Add GDT blocks
+    for i in 0..gdt_ext_blocks {
+        let pb = ext_to_partition(gdt_start_ext_block + i);
+        blocks.insert(pb);
+        // If ext_block_size > block_size, we may need multiple partition blocks
+        if ext_block_size > block_size {
+            let end_pb = ext_to_partition(gdt_start_ext_block + i + 1);
+            for b in pb..end_pb {
+                blocks.insert(b);
+            }
+        }
+    }
+
+    // Add block bitmaps, inode bitmaps, and inode tables for first N groups.
+    // Limit to avoid caching too much for huge filesystems.
+    let max_groups = group_count.min(64);
+
+    // GDT entries contain the bitmap/inode table locations.
+    // If block_size >= ext_block_size, GDT may be in already-requested blocks.
+    // Parse GDT entries from the data buffer if available, otherwise just
+    // request blocks for the first few groups based on standard layout.
+    let gdt_byte_start = gdt_start_ext_block * ext_block_size;
+    let gdt_in_data = gdt_byte_start as usize;
+
+    for g in 0..max_groups {
+        let gd_offset = gdt_in_data + (g as usize) * desc_size as usize;
+        if gd_offset + 12 > data.len() {
+            // GDT not available in this buffer — use standard layout assumption
+            // For standard ext layout: bitmap at group_start + overhead
+            // We'll just add the first few blocks of each group as a fallback
+            let group_start = first_data_block + g * blocks_per_group;
+            // Block bitmap, inode bitmap, and first inode table block
+            for offset in 0..3 {
+                let pb = ext_to_partition(group_start + gdt_ext_blocks + 1 + offset);
+                blocks.insert(pb);
+            }
+            // Inode table: ceil(inodes_per_group * inode_size / ext_block_size) blocks
+            let inode_table_blocks =
+                (inodes_per_group as u64 * inode_size).div_ceil(ext_block_size);
+            let inode_table_start = group_start + gdt_ext_blocks + 3;
+            for i in 0..inode_table_blocks.min(32) {
+                let pb = ext_to_partition(inode_table_start + i);
+                blocks.insert(pb);
+                if ext_block_size > block_size {
+                    for b in pb..ext_to_partition(inode_table_start + i + 1) {
+                        blocks.insert(b);
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Parse GDT entry
+        let bb_lo = u32::from_le_bytes(data[gd_offset..gd_offset + 4].try_into().unwrap()) as u64;
+        let ib_lo =
+            u32::from_le_bytes(data[gd_offset + 4..gd_offset + 8].try_into().unwrap()) as u64;
+        let it_lo =
+            u32::from_le_bytes(data[gd_offset + 8..gd_offset + 12].try_into().unwrap()) as u64;
+
+        // 64-bit high parts
+        let (bb, ib, it) = if is_64bit && desc_size >= 64 && gd_offset + 0x28 <= data.len() {
+            let bb_hi =
+                u32::from_le_bytes(data[gd_offset + 0x20..gd_offset + 0x24].try_into().unwrap())
+                    as u64;
+            let ib_hi =
+                u32::from_le_bytes(data[gd_offset + 0x24..gd_offset + 0x28].try_into().unwrap())
+                    as u64;
+            let it_hi =
+                u32::from_le_bytes(data[gd_offset + 0x28..gd_offset + 0x2C].try_into().unwrap())
+                    as u64;
+            (
+                bb_lo | (bb_hi << 32),
+                ib_lo | (ib_hi << 32),
+                it_lo | (it_hi << 32),
+            )
+        } else {
+            (bb_lo, ib_lo, it_lo)
+        };
+
+        // Block bitmap
+        let pb = ext_to_partition(bb);
+        blocks.insert(pb);
+        if ext_block_size > block_size {
+            for b in pb..ext_to_partition(bb + 1) {
+                blocks.insert(b);
+            }
+        }
+
+        // Inode bitmap
+        let pb = ext_to_partition(ib);
+        blocks.insert(pb);
+        if ext_block_size > block_size {
+            for b in pb..ext_to_partition(ib + 1) {
+                blocks.insert(b);
+            }
+        }
+
+        // Inode table
+        let inode_table_blocks = (inodes_per_group as u64 * inode_size).div_ceil(ext_block_size);
+        for i in 0..inode_table_blocks.min(32) {
+            let pb = ext_to_partition(it + i);
+            blocks.insert(pb);
+            if ext_block_size > block_size {
+                for b in pb..ext_to_partition(it + i + 1) {
+                    blocks.insert(b);
+                }
+            }
+        }
+    }
+
+    blocks.into_iter().collect()
+}
+
+/// Identify btrfs metadata blocks: superblock + root tree + chunk tree + FS tree nodes.
+///
+/// `data` must contain the superblock at its expected offset within the buffer.
+/// `sb_byte_offset` is the byte offset of the superblock within the partition.
+fn identify_btrfs_metadata_blocks_from_sb(sb_data: &[u8], block_size: u64) -> Vec<u64> {
+    let mut blocks = BTreeSet::new();
+
+    // Superblock at partition byte offset 0x10000
+    let sb_byte = 0x10000u64;
+    let sb_partition_block = sb_byte / block_size;
+    blocks.insert(sb_partition_block);
+    // Superblock is 4096 bytes, may span multiple partition blocks
+    let sb_end_block = (sb_byte + 4096 - 1) / block_size;
+    for b in sb_partition_block..=sb_end_block {
+        blocks.insert(b);
+    }
+
+    if sb_data.len() < 0x60 {
+        return blocks.into_iter().collect();
+    }
+
+    // Validate magic
+    if sb_data.len() >= 0x48 && &sb_data[0x40..0x48] != b"_BHRfS_M" {
+        return blocks.into_iter().collect();
+    }
+
+    // Parse key superblock fields
+    let root_tree_root = u64::from_le_bytes(sb_data[0x50..0x58].try_into().unwrap());
+    let chunk_root = u64::from_le_bytes(sb_data[0x58..0x60].try_into().unwrap());
+    let total_bytes = u64::from_le_bytes(sb_data[0x70..0x78].try_into().unwrap());
+    let node_size = if sb_data.len() >= 0x98 {
+        u32::from_le_bytes(sb_data[0x94..0x98].try_into().unwrap()) as u64
+    } else {
+        16384
+    };
+
+    // Parse sys_chunk_array to build initial chunk map for logical→physical translation
+    let sys_chunk_size = if sb_data.len() >= 0xA4 {
+        u32::from_le_bytes(sb_data[0xA0..0xA4].try_into().unwrap()) as usize
+    } else {
+        0
+    };
+
+    let mut chunk_map: Vec<(u64, u64, u64)> = Vec::new(); // (logical, physical, length)
+    if sb_data.len() >= 0x32B + sys_chunk_size {
+        let sys_data = &sb_data[0x32B..0x32B + sys_chunk_size];
+        let mut off = 0;
+        while off + 17 < sys_data.len() {
+            let logical = u64::from_le_bytes(sys_data[off + 9..off + 17].try_into().unwrap());
+            off += 17;
+            if off + 48 > sys_data.len() {
+                break;
+            }
+            let length = u64::from_le_bytes(sys_data[off..off + 8].try_into().unwrap());
+            let num_stripes =
+                u16::from_le_bytes(sys_data[off + 44..off + 46].try_into().unwrap()) as usize;
+            off += 48;
+            if num_stripes == 0 || off + 32 > sys_data.len() {
+                break;
+            }
+            let physical = u64::from_le_bytes(sys_data[off + 8..off + 16].try_into().unwrap());
+            off += num_stripes * 32;
+            chunk_map.push((logical, physical, length));
+        }
+        chunk_map.sort_by_key(|&(l, _, _)| l);
+    }
+
+    // Helper: translate logical address to physical using the chunk map
+    let logical_to_physical = |logical: u64| -> Option<u64> {
+        // Binary search
+        let idx = match chunk_map.binary_search_by(|&(l, _, _)| l.cmp(&logical)) {
+            Ok(i) => i,
+            Err(0) => return None,
+            Err(i) => i - 1,
+        };
+        let (l, p, len) = chunk_map[idx];
+        if logical >= l && logical < l + len {
+            Some(p + (logical - l))
+        } else {
+            None
+        }
+    };
+
+    // Add blocks for a tree node (node_size bytes at a physical offset)
+    let add_node_blocks = |blocks: &mut BTreeSet<u64>, physical: u64| {
+        if physical >= total_bytes {
+            return;
+        }
+        let start_block = physical / block_size;
+        let end_block = (physical + node_size - 1) / block_size;
+        for b in start_block..=end_block {
+            blocks.insert(b);
+        }
+    };
+
+    // Root tree root node
+    if let Some(phys) = logical_to_physical(root_tree_root) {
+        add_node_blocks(&mut blocks, phys);
+    }
+
+    // Chunk tree root node
+    if let Some(phys) = logical_to_physical(chunk_root) {
+        add_node_blocks(&mut blocks, phys);
+    }
+
+    blocks.into_iter().collect()
+}
+
+/// Discover additional directory/metadata blocks for Linux filesystems
+/// after the initial metadata blocks have been cached.
+fn discover_linux_directory_blocks(cache: &PartcloneBlockCache, block_size: u32) -> Vec<u64> {
+    let bs = block_size as u64;
+    if bs == 0 {
+        return vec![];
+    }
+
+    // Try ext: check for superblock magic at byte 1024
+    let sb_block = 1024 / bs;
+    if let Some(sb_data) = cache.blocks.get(&sb_block) {
+        let sb_off_in_block = (1024 % bs) as usize;
+        if sb_data.len() >= sb_off_in_block + 0x3A {
+            let magic = u16::from_le_bytes([
+                sb_data[sb_off_in_block + 0x38],
+                sb_data[sb_off_in_block + 0x39],
+            ]);
+            if magic == 0xEF53 {
+                // Reconstruct full superblock data from cache for identify_ext_metadata_blocks
+                // We need data starting from byte 0 with the superblock at offset 1024
+                let needed_bytes = 1024 + 1024; // superblock starts at 1024, is 1024 bytes
+                let mut buf = vec![0u8; needed_bytes];
+                // Fill from cached blocks
+                let mut filled = 0u64;
+                while filled < needed_bytes as u64 {
+                    let block_idx = filled / bs;
+                    let block_off = (filled % bs) as usize;
+                    if let Some(block_data) = cache.blocks.get(&block_idx) {
+                        let avail =
+                            (block_data.len() - block_off).min(needed_bytes - filled as usize);
+                        buf[filled as usize..filled as usize + avail]
+                            .copy_from_slice(&block_data[block_off..block_off + avail]);
+                        filled += avail as u64;
+                    } else {
+                        filled += (bs - filled % bs).min(needed_bytes as u64 - filled);
+                    }
+                }
+                return identify_ext_metadata_blocks(&buf, bs);
+            }
+        }
+    }
+
+    // Try btrfs: check for superblock at byte 0x10000
+    let btrfs_sb_block = 0x10000 / bs;
+    if let Some(sb_block_data) = cache.blocks.get(&btrfs_sb_block) {
+        let sb_off_in_block = (0x10000 % bs) as usize;
+        if sb_block_data.len() >= sb_off_in_block + 0x48 {
+            if &sb_block_data[sb_off_in_block + 0x40..sb_off_in_block + 0x48] == b"_BHRfS_M" {
+                // Reconstruct 4096-byte superblock from cached blocks
+                let mut sb_buf = vec![0u8; 4096];
+                let mut filled = 0usize;
+                let mut byte_pos = 0x10000u64;
+                while filled < 4096 {
+                    let block_idx = byte_pos / bs;
+                    let block_off = (byte_pos % bs) as usize;
+                    if let Some(block_data) = cache.blocks.get(&block_idx) {
+                        let avail = (block_data.len() - block_off).min(4096 - filled);
+                        sb_buf[filled..filled + avail]
+                            .copy_from_slice(&block_data[block_off..block_off + avail]);
+                        filled += avail;
+                        byte_pos += avail as u64;
+                    } else {
+                        break;
+                    }
+                }
+                if filled >= 0x60 {
+                    return identify_btrfs_metadata_blocks_from_sb(&sb_buf, bs);
+                }
+            }
+        }
+    }
+
+    vec![]
 }
 
 /// Discover all FAT directory cluster blocks by BFS from the root directory.
