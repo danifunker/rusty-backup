@@ -826,7 +826,7 @@ In `src/rbformats/vhd.rs`:
 
 ## Task 11: btrfs Filesystem Browsing
 
-**Status:** NOT STARTED
+**Status:** DONE
 **Depends on:** Tasks 1-2 (entry types, unix_common/inode)
 **Files to read first:** `src/fs/ext.rs` (your ext implementation as structural reference)
 **Partclone reference:** `../partclone/src/btrfsclone.c` (tree walking), `../partclone/src/btrfs/ctree.h` (on-disk structs)
@@ -1030,7 +1030,7 @@ When listing a directory and encountering a DIR_INDEX with `child_type == BTRFS_
 
 ## Task 12: Wire btrfs into mod.rs Routing
 
-**Status:** NOT STARTED
+**Status:** DONE
 **Depends on:** Task 11
 **Files to read first:** `src/fs/mod.rs`
 **Files to modify:** `src/fs/mod.rs`
@@ -1072,7 +1072,7 @@ When listing a directory and encountering a DIR_INDEX with `child_type == BTRFS_
 
 ## Task 13: btrfs Compaction — CompactBtrfsReader
 
-**Status:** NOT STARTED
+**Status:** DONE
 **Depends on:** Tasks 4, 11 (compact framework, btrfs browsing)
 **Files to modify:** `src/fs/btrfs.rs`, `src/fs/mod.rs`
 **Partclone reference:** `../partclone/src/btrfsclone.c` lines 249-480 (extent tree walking for used blocks)
@@ -1108,7 +1108,7 @@ Same pattern as ext — add to `compact_partition_reader()` for types `0x83` and
 
 ## Task 14: btrfs Resize + Validate + Restore Wiring
 
-**Status:** NOT STARTED
+**Status:** DONE
 **Depends on:** Task 13
 **Files to modify:** `src/fs/btrfs.rs`, `src/restore/mod.rs`, `src/rbformats/vhd.rs`
 
@@ -1179,25 +1179,34 @@ Add filesystem type detection (ext magic / btrfs magic) and call the appropriate
 
 **Status:** NOT STARTED
 **Depends on:** All previous tasks (1-15)
-**Platform:** Must be run on Linux (requires `mkfs.ext2/3/4`, `mkfs.btrfs`, `mount`)
-**Verify:** `cargo test --test '*'` passes all integration tests
+**Platform:** Linux (requires `mkfs.ext2/3/4`, `mkfs.btrfs` — NO sudo/mount needed)
+**Verify:** `cargo test --test filesystem_e2e -- --ignored` passes all integration tests
 
 ### Overview
 
-This task creates real filesystem images using Linux tools and writes integration tests that exercise the full stack: browsing, compaction, resize, validation, and backup/restore round-trips. These tests complement the existing 224+ unit tests that use hand-crafted synthetic images.
+This task creates real filesystem images using Linux tools and writes integration tests that exercise the full stack: browsing, compaction, resize, validation, and filesystem detection routing. These tests complement the existing unit tests that use hand-crafted synthetic images.
+
+### Key discovery: No sudo needed
+
+Both `mkfs.ext*` and `mkfs.btrfs` support populating the filesystem from a source directory without needing mount:
+- `mkfs.ext2/ext4 -d <rootdir>` — copies directory contents into the image
+- `mkfs.btrfs --rootdir <rootdir>` — copies directory contents into the image
+
+This means the script works in unprivileged environments (WSL2, containers, CI).
+
+**Caveat:** Files will have the current user's uid/gid (not configurable without root). Tests should check `uid.is_some()` / `gid.is_some()` rather than specific values, or read the actual uid at test time.
 
 ### Prerequisites
 
-Install required tools on the Linux machine:
+Install required tools on the Linux machine (already present on this system):
 ```bash
 sudo apt install e2fsprogs btrfs-progs  # Debian/Ubuntu
-# or
-sudo dnf install e2fsprogs btrfs-progs  # Fedora/RHEL
+# Verified: e2fsprogs 1.47.0, btrfs-progs 6.6.3
 ```
 
 ### Step 1: Create test image generation script
 
-Create `scripts/generate-test-images.sh` that builds deterministic test images:
+Create `scripts/generate-test-images.sh` (no sudo required):
 
 ```bash
 #!/bin/bash
@@ -1206,71 +1215,79 @@ set -euo pipefail
 OUTDIR="tests/fixtures"
 mkdir -p "$OUTDIR"
 
-# --- ext2 image (4 MiB) ---
-echo "Creating ext2 test image..."
-dd if=/dev/zero of="$OUTDIR/test_ext2.img" bs=1M count=4 2>/dev/null
-mkfs.ext2 -L "test_ext2" -F "$OUTDIR/test_ext2.img"
-MNT=$(mktemp -d)
-sudo mount "$OUTDIR/test_ext2.img" "$MNT"
-echo -n "Hello, ext2!" | sudo tee "$MNT/hello.txt" >/dev/null
-sudo mkdir "$MNT/subdir"
-echo -n "nested file" | sudo tee "$MNT/subdir/nested.txt" >/dev/null
-sudo ln -s hello.txt "$MNT/link.txt"
-sudo chown 1000:1000 "$MNT/hello.txt"
-sudo chmod 644 "$MNT/hello.txt"
-sudo chmod 755 "$MNT/subdir"
-sudo umount "$MNT"
-rmdir "$MNT"
+# Prepare a common source directory structure
+SRCDIR=$(mktemp -d)
+trap 'rm -rf "$SRCDIR"' EXIT
 
-# --- ext4 image (4 MiB) ---
+echo -n "Hello, ext2!" > "$SRCDIR/hello_ext2.txt"
+echo -n "Hello, ext4!" > "$SRCDIR/hello_ext4.txt"
+echo -n "Hello, btrfs!" > "$SRCDIR/hello_btrfs.txt"
+echo -n "nested file" > "$SRCDIR/nested.txt"
+
+# --- Helper to build a rootdir for a given fs ---
+build_rootdir() {
+    local ROOTDIR="$1"
+    local HELLO_CONTENT="$2"
+    mkdir -p "$ROOTDIR/subdir"
+    cp "$SRCDIR/$HELLO_CONTENT" "$ROOTDIR/hello.txt"
+    cp "$SRCDIR/nested.txt" "$ROOTDIR/subdir/nested.txt"
+    ln -s hello.txt "$ROOTDIR/link.txt"
+    chmod 644 "$ROOTDIR/hello.txt"
+    chmod 755 "$ROOTDIR/subdir"
+}
+
+# --- ext2 image (4 MiB, no journal) ---
+echo "Creating ext2 test image..."
+EXT2_ROOT=$(mktemp -d)
+build_rootdir "$EXT2_ROOT" "hello_ext2.txt"
+dd if=/dev/zero of="$OUTDIR/test_ext2.img" bs=1M count=4 2>/dev/null
+mkfs.ext2 -L "test_ext2" -F -d "$EXT2_ROOT" "$OUTDIR/test_ext2.img" 2>&1 | tail -1
+rm -rf "$EXT2_ROOT"
+
+# --- ext4 image (16 MiB — needs >=5 MiB for journal) ---
 echo "Creating ext4 test image..."
-dd if=/dev/zero of="$OUTDIR/test_ext4.img" bs=1M count=4 2>/dev/null
-mkfs.ext4 -L "test_ext4" -F "$OUTDIR/test_ext4.img"
-MNT=$(mktemp -d)
-sudo mount "$OUTDIR/test_ext4.img" "$MNT"
-echo -n "Hello, ext4!" | sudo tee "$MNT/hello.txt" >/dev/null
-sudo mkdir "$MNT/subdir"
-echo -n "nested file" | sudo tee "$MNT/subdir/nested.txt" >/dev/null
-sudo ln -s hello.txt "$MNT/link.txt"
-sudo chown 1000:1000 "$MNT/hello.txt"
-sudo chmod 644 "$MNT/hello.txt"
-sudo chmod 755 "$MNT/subdir"
-sudo umount "$MNT"
-rmdir "$MNT"
+EXT4_ROOT=$(mktemp -d)
+build_rootdir "$EXT4_ROOT" "hello_ext4.txt"
+dd if=/dev/zero of="$OUTDIR/test_ext4.img" bs=1M count=16 2>/dev/null
+mkfs.ext4 -L "test_ext4" -F -d "$EXT4_ROOT" "$OUTDIR/test_ext4.img" 2>&1 | tail -1
+rm -rf "$EXT4_ROOT"
 
 # --- btrfs image (256 MiB — btrfs minimum is ~109 MiB) ---
 echo "Creating btrfs test image..."
+BTRFS_ROOT=$(mktemp -d)
+build_rootdir "$BTRFS_ROOT" "hello_btrfs.txt"
 dd if=/dev/zero of="$OUTDIR/test_btrfs.img" bs=1M count=256 2>/dev/null
-mkfs.btrfs -L "test_btrfs" -f "$OUTDIR/test_btrfs.img"
-MNT=$(mktemp -d)
-sudo mount "$OUTDIR/test_btrfs.img" "$MNT"
-echo -n "Hello, btrfs!" | sudo tee "$MNT/hello.txt" >/dev/null
-sudo mkdir "$MNT/subdir"
-echo -n "nested file" | sudo tee "$MNT/subdir/nested.txt" >/dev/null
-sudo ln -s hello.txt "$MNT/link.txt"
-sudo chown 1000:1000 "$MNT/hello.txt"
-sudo chmod 644 "$MNT/hello.txt"
-sudo chmod 755 "$MNT/subdir"
-sudo umount "$MNT"
-rmdir "$MNT"
+mkfs.btrfs -L "test_btrfs" -f --rootdir "$BTRFS_ROOT" "$OUTDIR/test_btrfs.img" 2>&1 | tail -1
+rm -rf "$BTRFS_ROOT"
 
+echo ""
 echo "Test images created in $OUTDIR/"
 ls -lh "$OUTDIR"/*.img
 ```
 
 Make executable: `chmod +x scripts/generate-test-images.sh`
 
-Add `tests/fixtures/*.img` to `.gitignore` (images are large and generated, not checked in).
+Add `tests/fixtures/` to `.gitignore` (images are large and generated, not checked in).
 
 ### Step 2: Create integration test file
 
-Create `tests/filesystem_e2e.rs` with the following test groups. Each test should be gated with `#[ignore]` so they only run when explicitly requested (since they need the fixture images):
+Create `tests/filesystem_e2e.rs`. Each test is gated with `#[ignore]` so they only run when explicitly requested (since they need the fixture images).
+
+**Important API notes** (verified against actual codebase):
+- `Filesystem` trait is at `rusty_backup::fs::filesystem::Filesystem`
+- `volume_label()` returns `Option<&str>`
+- `open_filesystem(reader, offset, type_byte, type_string)` takes 4 params — 4th is `Option<&str>`
+- `CompactExtReader::new(reader, offset)` returns `Result<(Self, CompactResult), FilesystemError>`
+- `CompactResult` has fields: `original_size: u64`, `compacted_size: u64`, `clusters_used: u32`
+- `resize_ext_in_place(file, offset, new_total_bytes, log_cb)` — takes `new_total_bytes: u64`
+- `resize_btrfs_in_place(file, offset, new_total_bytes, log_cb)` — same pattern
+- ext2 at 4 MiB has no journal → detected as "ext2". ext4 at 16 MiB has journal → detected as "ext4"
 
 ```rust
 //! End-to-end tests using real filesystem images.
 //!
 //! These tests require pre-generated fixture images in tests/fixtures/.
-//! Run `scripts/generate-test-images.sh` first (Linux only, requires root).
+//! Run `scripts/generate-test-images.sh` first (Linux only, no root needed).
 //!
 //! Run with: cargo test --test filesystem_e2e -- --ignored
 
@@ -1282,9 +1299,10 @@ use rusty_backup::fs::filesystem::Filesystem;
 
 ```rust
 #[test]
-#[ignore] // requires test fixtures
+#[ignore]
 fn test_ext2_browse_root() {
-    let img = std::fs::read("tests/fixtures/test_ext2.img").expect("run generate-test-images.sh first");
+    let img = std::fs::read("tests/fixtures/test_ext2.img")
+        .expect("run scripts/generate-test-images.sh first");
     let cursor = Cursor::new(img);
     let mut fs = rusty_backup::fs::ext::ExtFilesystem::open(cursor, 0).unwrap();
 
@@ -1342,8 +1360,9 @@ fn test_ext2_permissions() {
     let entries = fs.list_directory(&root).unwrap();
     let hello = entries.iter().find(|e| e.name == "hello.txt").unwrap();
 
-    assert_eq!(hello.uid, Some(1000));
-    assert_eq!(hello.gid, Some(1000));
+    // uid/gid will be whatever the user who ran mkfs was (no sudo chown available)
+    assert!(hello.uid.is_some(), "uid should be set");
+    assert!(hello.gid.is_some(), "gid should be set");
     // Mode should be 0o100644 (regular file, rw-r--r--)
     assert_eq!(hello.mode.map(|m| m & 0o777), Some(0o644));
 }
@@ -1367,9 +1386,15 @@ fn test_ext2_nested_directory() {
 }
 ```
 
-#### Test Group B: ext4 browsing (same structure, different image/label)
+#### Test Group B: ext4 browsing
 
-Same tests as Group A but using `test_ext4.img`, checking `fs_type() == "ext4"`, label `"test_ext4"`, file content `"Hello, ext4!"`.
+Same structure as Group A but using `test_ext4.img`:
+- `fs_type() == "ext4"` (has journal, so detected as ext4)
+- `volume_label() == Some("test_ext4")`
+- File content: `b"Hello, ext4!"`
+
+Tests: `test_ext4_browse_root`, `test_ext4_read_file`, `test_ext4_symlink`,
+`test_ext4_permissions`, `test_ext4_nested_directory`.
 
 #### Test Group C: btrfs browsing
 
@@ -1410,13 +1435,34 @@ fn test_btrfs_read_file() {
 #[test]
 #[ignore]
 fn test_btrfs_symlink() {
-    // same pattern — check link.txt target == "hello.txt"
+    let img = std::fs::read("tests/fixtures/test_btrfs.img").unwrap();
+    let cursor = Cursor::new(img);
+    let mut fs = rusty_backup::fs::btrfs::BtrfsFilesystem::open(cursor, 0).unwrap();
+
+    let root = fs.root().unwrap();
+    let entries = fs.list_directory(&root).unwrap();
+    let link = entries.iter().find(|e| e.name == "link.txt").unwrap();
+
+    assert!(link.is_symlink());
+    assert_eq!(link.symlink_target.as_deref(), Some("hello.txt"));
 }
 
 #[test]
 #[ignore]
 fn test_btrfs_nested_directory() {
-    // same pattern — navigate into subdir, read nested.txt
+    let img = std::fs::read("tests/fixtures/test_btrfs.img").unwrap();
+    let cursor = Cursor::new(img);
+    let mut fs = rusty_backup::fs::btrfs::BtrfsFilesystem::open(cursor, 0).unwrap();
+
+    let root = fs.root().unwrap();
+    let entries = fs.list_directory(&root).unwrap();
+    let subdir = entries.iter().find(|e| e.name == "subdir").unwrap();
+    assert!(subdir.is_directory());
+
+    let sub_entries = fs.list_directory(subdir).unwrap();
+    let nested = sub_entries.iter().find(|e| e.name == "nested.txt").unwrap();
+    let data = fs.read_file(nested, 1024).unwrap();
+    assert_eq!(&data, b"nested file");
 }
 ```
 
@@ -1428,7 +1474,7 @@ fn test_btrfs_nested_directory() {
 fn test_ext4_compaction_round_trip() {
     let img = std::fs::read("tests/fixtures/test_ext4.img").unwrap();
     let original_size = img.len();
-    let cursor = Cursor::new(img.clone());
+    let cursor = Cursor::new(img);
 
     // Compact
     let (mut compact, info) = rusty_backup::fs::CompactExtReader::new(cursor, 0).unwrap();
@@ -1451,7 +1497,32 @@ fn test_ext4_compaction_round_trip() {
 
 #### Test Group E: btrfs compaction round-trip
 
-Same pattern as Group D using `test_btrfs.img` and `CompactBtrfsReader`.
+```rust
+#[test]
+#[ignore]
+fn test_btrfs_compaction_round_trip() {
+    let img = std::fs::read("tests/fixtures/test_btrfs.img").unwrap();
+    let original_size = img.len();
+    let cursor = Cursor::new(img);
+
+    // Compact
+    let (mut compact, info) = rusty_backup::fs::CompactBtrfsReader::new(cursor, 0).unwrap();
+    assert!(info.compacted_size <= original_size as u64);
+
+    // Read compacted output
+    let mut output = Vec::new();
+    std::io::Read::read_to_end(&mut compact, &mut output).unwrap();
+
+    // Verify the compacted image is still browsable
+    let cursor = Cursor::new(output);
+    let mut fs = rusty_backup::fs::btrfs::BtrfsFilesystem::open(cursor, 0).unwrap();
+    let root = fs.root().unwrap();
+    let entries = fs.list_directory(&root).unwrap();
+    let hello = entries.iter().find(|e| e.name == "hello.txt").unwrap();
+    let data = fs.read_file(hello, 1024).unwrap();
+    assert_eq!(&data, b"Hello, btrfs!");
+}
+```
 
 #### Test Group F: ext resize
 
@@ -1523,21 +1594,21 @@ fn test_btrfs_resize_grows() {
 ```rust
 #[test]
 #[ignore]
-fn test_detect_ext4_from_image() {
+fn test_detect_ext4_via_0x83() {
     let img = std::fs::read("tests/fixtures/test_ext4.img").unwrap();
     let cursor = Cursor::new(img);
     // open_filesystem with type 0x83 should detect ext4
-    let mut fs = rusty_backup::fs::open_filesystem(cursor, 0, 0x83, None).unwrap();
+    let fs = rusty_backup::fs::open_filesystem(cursor, 0, 0x83, None).unwrap();
     assert_eq!(fs.fs_type(), "ext4");
 }
 
 #[test]
 #[ignore]
-fn test_detect_btrfs_from_image() {
+fn test_detect_btrfs_via_0x83() {
     let img = std::fs::read("tests/fixtures/test_btrfs.img").unwrap();
     let cursor = Cursor::new(img);
     // open_filesystem with type 0x83 should detect btrfs
-    let mut fs = rusty_backup::fs::open_filesystem(cursor, 0, 0x83, None).unwrap();
+    let fs = rusty_backup::fs::open_filesystem(cursor, 0, 0x83, None).unwrap();
     assert_eq!(fs.fs_type(), "btrfs");
 }
 
@@ -1547,7 +1618,7 @@ fn test_detect_ext4_auto() {
     let img = std::fs::read("tests/fixtures/test_ext4.img").unwrap();
     let cursor = Cursor::new(img);
     // open_filesystem with type 0x00 (auto-detect) should find ext4
-    let mut fs = rusty_backup::fs::open_filesystem(cursor, 0, 0x00, None).unwrap();
+    let fs = rusty_backup::fs::open_filesystem(cursor, 0, 0x00, None).unwrap();
     assert_eq!(fs.fs_type(), "ext4");
 }
 
@@ -1556,16 +1627,25 @@ fn test_detect_ext4_auto() {
 fn test_detect_btrfs_auto() {
     let img = std::fs::read("tests/fixtures/test_btrfs.img").unwrap();
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::open_filesystem(cursor, 0, 0x00, None).unwrap();
+    let fs = rusty_backup::fs::open_filesystem(cursor, 0, 0x00, None).unwrap();
     assert_eq!(fs.fs_type(), "btrfs");
+}
+
+#[test]
+#[ignore]
+fn test_detect_ext2_via_0x83() {
+    let img = std::fs::read("tests/fixtures/test_ext2.img").unwrap();
+    let cursor = Cursor::new(img);
+    let fs = rusty_backup::fs::open_filesystem(cursor, 0, 0x83, None).unwrap();
+    assert_eq!(fs.fs_type(), "ext2");
 }
 ```
 
 ### Step 3: Running the tests
 
 ```bash
-# 1. Generate test images (requires root on Linux)
-sudo scripts/generate-test-images.sh
+# 1. Generate test images (NO sudo needed)
+scripts/generate-test-images.sh
 
 # 2. Run the end-to-end tests
 cargo test --test filesystem_e2e -- --ignored
@@ -1576,7 +1656,7 @@ cargo test --lib && cargo test --test filesystem_e2e -- --ignored
 
 ### Verification checklist
 
-- [ ] `scripts/generate-test-images.sh` runs successfully and creates 3 images
+- [ ] `scripts/generate-test-images.sh` runs successfully without sudo, creates 3 images
 - [ ] All ext2 browsing tests pass (root listing, file read, symlink, permissions, nested dir)
 - [ ] All ext4 browsing tests pass (same checks)
 - [ ] All btrfs browsing tests pass (same checks)
@@ -1584,8 +1664,8 @@ cargo test --lib && cargo test --test filesystem_e2e -- --ignored
 - [ ] btrfs compaction round-trip: compacted image still browsable with correct file data
 - [ ] ext4 resize: grown image passes validation and is browsable
 - [ ] btrfs resize: grown image passes validation, total_size reflects new size
-- [ ] Filesystem detection: type 0x83 and 0x00 correctly identify ext4 and btrfs
-- [ ] `cargo test --lib` still passes all 224+ existing unit tests
+- [ ] Filesystem detection: types 0x83 and 0x00 correctly identify ext2, ext4, and btrfs
+- [ ] `cargo test --lib` still passes all existing unit tests
 - [ ] `cargo clippy` has no new warnings
 
 ---

@@ -880,15 +880,15 @@ fn identify_ext_metadata_blocks(data: &[u8], block_size: u64) -> Vec<u64> {
     let blocks_count_lo = u32::from_le_bytes(data[sb_off..sb_off + 4].try_into().unwrap()) as u64;
     let _inodes_count = u32::from_le_bytes(data[sb_off + 0x00..sb_off + 0x04].try_into().unwrap());
     let first_data_block =
-        u32::from_le_bytes(data[sb_off + 0x18..sb_off + 0x1C].try_into().unwrap()) as u64;
-    let log_block_size = u32::from_le_bytes(data[sb_off + 0x1C..sb_off + 0x20].try_into().unwrap());
+        u32::from_le_bytes(data[sb_off + 0x14..sb_off + 0x18].try_into().unwrap()) as u64;
+    let log_block_size = u32::from_le_bytes(data[sb_off + 0x18..sb_off + 0x1C].try_into().unwrap());
     let ext_block_size = 1024u64 << log_block_size;
     let blocks_per_group =
-        u32::from_le_bytes(data[sb_off + 0x24..sb_off + 0x28].try_into().unwrap()) as u64;
+        u32::from_le_bytes(data[sb_off + 0x20..sb_off + 0x24].try_into().unwrap()) as u64;
     let inodes_per_group =
-        u32::from_le_bytes(data[sb_off + 0x2C..sb_off + 0x30].try_into().unwrap());
-    let inode_size = if data.len() >= sb_off + 0x40 {
-        u16::from_le_bytes([data[sb_off + 0x3E], data[sb_off + 0x3F]]) as u64
+        u32::from_le_bytes(data[sb_off + 0x28..sb_off + 0x2C].try_into().unwrap());
+    let inode_size = if data.len() >= sb_off + 0x5A {
+        u16::from_le_bytes([data[sb_off + 0x58], data[sb_off + 0x59]]) as u64
     } else {
         128
     };
@@ -900,8 +900,8 @@ fn identify_ext_metadata_blocks(data: &[u8], block_size: u64) -> Vec<u64> {
         0
     };
     let is_64bit = incompat_flags & 0x80 != 0;
-    let desc_size = if is_64bit && data.len() >= sb_off + 0x5A {
-        u16::from_le_bytes([data[sb_off + 0x58], data[sb_off + 0x59]]).max(32) as u64
+    let desc_size = if is_64bit && data.len() >= sb_off + 0x100 {
+        u16::from_le_bytes([data[sb_off + 0xFE], data[sb_off + 0xFF]]).max(32) as u64
     } else {
         32
     };

@@ -139,11 +139,11 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
         // Parse superblock fields
         let inodes_count = le32(&sb, 0x00);
         let blocks_count_lo = le32(&sb, 0x04);
-        let first_data_block = le32(&sb, 0x18);
-        let log_block_size = le32(&sb, 0x1C);
-        let blocks_per_group = le32(&sb, 0x24);
-        let inodes_per_group = le32(&sb, 0x2C);
-        let inode_size = u16::from_le_bytes([sb[0x3E], sb[0x3F]]);
+        let first_data_block = le32(&sb, 0x14);
+        let log_block_size = le32(&sb, 0x18);
+        let blocks_per_group = le32(&sb, 0x20);
+        let inodes_per_group = le32(&sb, 0x28);
+        let inode_size = u16::from_le_bytes([sb[0x58], sb[0x59]]);
         let feature_compat = le32(&sb, 0x5C);
         let feature_incompat = le32(&sb, 0x60);
 
@@ -873,14 +873,14 @@ pub fn resize_ext_in_place(
         return Ok(());
     }
 
-    let log_block_size = le32(&sb, 0x1C);
+    let log_block_size = le32(&sb, 0x18);
     let block_size = 1024u64 << log_block_size;
-    let blocks_per_group = le32(&sb, 0x24) as u64;
-    let inodes_per_group = le32(&sb, 0x2C);
-    let inode_size = u16::from_le_bytes([sb[0x3E], sb[0x3F]]) as u64;
+    let blocks_per_group = le32(&sb, 0x20) as u64;
+    let inodes_per_group = le32(&sb, 0x28);
+    let inode_size = u16::from_le_bytes([sb[0x58], sb[0x59]]) as u64;
     let feature_incompat = le32(&sb, 0x60);
     let is_64bit = feature_incompat & INCOMPAT_64BIT != 0;
-    let _first_data_block = le32(&sb, 0x18) as u64;
+    let _first_data_block = le32(&sb, 0x14) as u64;
 
     let old_blocks = if is_64bit {
         let hi = le32(&sb, 0x150) as u64;
@@ -911,7 +911,7 @@ pub fn resize_ext_in_place(
     // Update s_free_blocks_count: add the new blocks as free
     let old_free_lo = le32(&sb, 0x0C) as u64;
     let old_free = if is_64bit {
-        let hi = le32(&sb, 0x154) as u64;
+        let hi = le32(&sb, 0x158) as u64;
         (hi << 32) | old_free_lo
     } else {
         old_free_lo
@@ -919,7 +919,7 @@ pub fn resize_ext_in_place(
     let new_free = old_free + added_blocks;
     sb[0x0C..0x10].copy_from_slice(&(new_free as u32).to_le_bytes());
     if is_64bit {
-        sb[0x154..0x158].copy_from_slice(&((new_free >> 32) as u32).to_le_bytes());
+        sb[0x158..0x15C].copy_from_slice(&((new_free >> 32) as u32).to_le_bytes());
     }
 
     // Write updated superblock
@@ -963,14 +963,14 @@ pub fn validate_ext_integrity(
     log_cb("ext validate: superblock magic OK");
 
     // Check block size
-    let log_block_size = le32(&sb, 0x1C);
+    let log_block_size = le32(&sb, 0x18);
     let block_size = 1024u64 << log_block_size;
     if !matches!(block_size, 1024 | 2048 | 4096) {
         warnings.push(format!("ext: unusual block size {block_size}"));
     }
 
     // Check blocks_per_group > 0
-    let blocks_per_group = le32(&sb, 0x24);
+    let blocks_per_group = le32(&sb, 0x20);
     if blocks_per_group == 0 {
         warnings.push("ext: blocks_per_group is 0".to_string());
         return Ok(warnings);
@@ -979,7 +979,7 @@ pub fn validate_ext_integrity(
     // Check group count consistency
     let feature_incompat = le32(&sb, 0x60);
     let is_64bit = feature_incompat & INCOMPAT_64BIT != 0;
-    let first_data_block = le32(&sb, 0x18) as u64;
+    let first_data_block = le32(&sb, 0x14) as u64;
     let total_blocks = if is_64bit {
         let hi = le32(&sb, 0x150) as u64;
         (hi << 32) | le32(&sb, 0x04) as u64
@@ -991,13 +991,13 @@ pub fn validate_ext_integrity(
         / blocks_per_group as u64) as u32;
 
     // Check inode size
-    let inode_size = u16::from_le_bytes([sb[0x3E], sb[0x3F]]);
+    let inode_size = u16::from_le_bytes([sb[0x58], sb[0x59]]);
     if inode_size < 128 {
         warnings.push(format!("ext: invalid inode size {inode_size}"));
     }
 
     // Check inodes_per_group > 0
-    let inodes_per_group = le32(&sb, 0x2C);
+    let inodes_per_group = le32(&sb, 0x28);
     if inodes_per_group == 0 {
         warnings.push("ext: inodes_per_group is 0".to_string());
     }
@@ -1063,9 +1063,9 @@ impl<R: Read + Seek + Send> CompactExtReader<R> {
         }
 
         let blocks_count_lo = le32(&sb, 0x04);
-        let first_data_block = le32(&sb, 0x18);
-        let log_block_size = le32(&sb, 0x1C);
-        let blocks_per_group = le32(&sb, 0x24);
+        let first_data_block = le32(&sb, 0x14);
+        let log_block_size = le32(&sb, 0x18);
+        let blocks_per_group = le32(&sb, 0x20);
         let feature_incompat = le32(&sb, 0x60);
 
         let block_size = 1024u64 << log_block_size;
@@ -1235,17 +1235,17 @@ mod tests {
         // s_blocks_count_lo
         sb[0x04..0x08].copy_from_slice(&total_blocks.to_le_bytes());
         // s_first_data_block = 0 (4K blocks)
-        sb[0x18..0x1C].copy_from_slice(&0u32.to_le_bytes());
+        sb[0x14..0x18].copy_from_slice(&0u32.to_le_bytes());
         // s_log_block_size
-        sb[0x1C..0x20].copy_from_slice(&block_size_log.to_le_bytes());
+        sb[0x18..0x1C].copy_from_slice(&block_size_log.to_le_bytes());
         // s_blocks_per_group
-        sb[0x24..0x28].copy_from_slice(&blocks_per_group.to_le_bytes());
+        sb[0x20..0x24].copy_from_slice(&blocks_per_group.to_le_bytes());
         // s_inodes_per_group
-        sb[0x2C..0x30].copy_from_slice(&inodes_per_group.to_le_bytes());
+        sb[0x28..0x2C].copy_from_slice(&inodes_per_group.to_le_bytes());
         // s_magic
         sb[0x38..0x3A].copy_from_slice(&EXT_MAGIC.to_le_bytes());
         // s_inode_size
-        sb[0x3E..0x40].copy_from_slice(&inode_size.to_le_bytes());
+        sb[0x58..0x5A].copy_from_slice(&inode_size.to_le_bytes());
         // s_volume_name
         sb[0x78..0x83].copy_from_slice(b"TestVolume\0");
 
