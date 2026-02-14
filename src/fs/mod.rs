@@ -1,3 +1,4 @@
+pub mod btrfs;
 pub mod entry;
 pub mod exfat;
 pub mod ext;
@@ -10,6 +11,7 @@ pub mod unix_common;
 
 use std::io::{Read, Seek, SeekFrom};
 
+pub use btrfs::CompactBtrfsReader;
 pub use exfat::{
     patch_exfat_hidden_sectors, resize_exfat_in_place, validate_exfat_integrity, CompactExfatReader,
 };
@@ -99,6 +101,17 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
         }
     }
 
+    // Check for btrfs magic "_BHRfS_M" at partition_offset + 0x10000 + 0x40
+    if reader
+        .seek(SeekFrom::Start(partition_offset + 0x10000 + 0x40))
+        .is_ok()
+    {
+        let mut magic = [0u8; 8];
+        if reader.read_exact(&mut magic).is_ok() && &magic == b"_BHRfS_M" {
+            return "btrfs";
+        }
+    }
+
     "unknown"
 }
 
@@ -177,6 +190,10 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
                     let (reader, info) = CompactExtReader::new(reader, partition_offset).ok()?;
                     Some((Box::new(reader), info))
                 }
+                "btrfs" => {
+                    let (reader, info) = CompactBtrfsReader::new(reader, partition_offset).ok()?;
+                    Some((Box::new(reader), info))
+                }
                 _ => None,
             }
         }
@@ -221,7 +238,7 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
                 _ => None,
             }
         }
-        // Linux (ext2/3/4, btrfs in future)
+        // Linux (ext2/3/4, btrfs)
         0x83 => {
             let fs_type = detect_filesystem_type(&mut reader, partition_offset);
             match fs_type {
@@ -229,7 +246,10 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
                     let (reader, info) = CompactExtReader::new(reader, partition_offset).ok()?;
                     Some((Box::new(reader), info))
                 }
-                // "btrfs" => added in Task 13
+                "btrfs" => {
+                    let (reader, info) = CompactBtrfsReader::new(reader, partition_offset).ok()?;
+                    Some((Box::new(reader), info))
+                }
                 _ => None,
             }
         }
@@ -302,6 +322,10 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "btrfs" => Ok(Box::new(btrfs::BtrfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 _ => Err(FilesystemError::Unsupported(
                     "could not detect filesystem type on superfloppy".into(),
                 )),
@@ -347,7 +371,10 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
-                // "btrfs" => added in Task 12
+                "btrfs" => Ok(Box::new(btrfs::BtrfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 _ => Err(FilesystemError::Unsupported(
                     "type 0x83 partition: unrecognized Linux filesystem".into(),
                 )),
