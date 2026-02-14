@@ -7,7 +7,7 @@
 //!
 //! Only single-device images are supported (always uses stripe[0]).
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use super::entry::FileEntry;
 use super::filesystem::{Filesystem, FilesystemError};
@@ -995,6 +995,120 @@ impl<R: Read + Seek> Read for CompactBtrfsReader<R> {
     }
 }
 
+// ---- Resize / Validate ----
+
+/// Resize a btrfs filesystem in place by updating the superblock's total_bytes
+/// and dev_item.total_bytes fields. Only grows (never shrinks). Recomputes the
+/// superblock CRC32C checksum after patching.
+pub fn resize_btrfs_in_place(
+    file: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    new_total_bytes: u64,
+    log_cb: &mut impl FnMut(&str),
+) -> anyhow::Result<()> {
+    let sb_pos = partition_offset + SUPERBLOCK_OFFSET;
+    file.seek(SeekFrom::Start(sb_pos))?;
+    let mut sb = [0u8; 4096];
+    file.read_exact(&mut sb)?;
+
+    // Validate magic — skip silently if not btrfs (matches ext/fat pattern)
+    if &sb[0x40..0x48] != BTRFS_MAGIC {
+        log_cb("btrfs resize: not a btrfs superblock, skipping");
+        return Ok(());
+    }
+
+    let current_total = le64(&sb, 0x70);
+    if new_total_bytes <= current_total {
+        log_cb(&format!(
+            "btrfs resize: new size ({new_total_bytes}) <= current ({current_total}), skipping"
+        ));
+        return Ok(());
+    }
+
+    log_cb(&format!(
+        "btrfs resize: {current_total} -> {new_total_bytes} bytes"
+    ));
+
+    // Patch total_bytes at 0x70
+    sb[0x70..0x78].copy_from_slice(&new_total_bytes.to_le_bytes());
+
+    // Patch dev_item.total_bytes at 0xD1 (dev_item starts at 0xC9, devid is 8 bytes)
+    sb[0xD1..0xD9].copy_from_slice(&new_total_bytes.to_le_bytes());
+
+    // Recompute CRC32C over bytes 0x20..4096, store as LE32 at 0x00..0x04
+    let crc = crc32c::crc32c(&sb[0x20..]);
+    sb[0x00..0x04].copy_from_slice(&crc.to_le_bytes());
+
+    // Write patched superblock back
+    file.seek(SeekFrom::Start(sb_pos))?;
+    file.write_all(&sb)?;
+
+    log_cb("btrfs resize: superblock updated successfully");
+    Ok(())
+}
+
+/// Validate btrfs superblock integrity. Returns a list of warnings (empty = OK).
+pub fn validate_btrfs_integrity(
+    file: &mut (impl Read + Seek),
+    partition_offset: u64,
+    log_cb: &mut impl FnMut(&str),
+) -> anyhow::Result<Vec<String>> {
+    let mut warnings = Vec::new();
+
+    let sb_pos = partition_offset + SUPERBLOCK_OFFSET;
+    file.seek(SeekFrom::Start(sb_pos))?;
+    let mut sb = [0u8; 4096];
+    file.read_exact(&mut sb)?;
+
+    // Check magic
+    if &sb[0x40..0x48] != BTRFS_MAGIC {
+        warnings.push("btrfs: invalid superblock magic".to_string());
+        log_cb("btrfs validate: invalid superblock magic");
+        return Ok(warnings);
+    }
+
+    // Verify CRC32C
+    let stored_crc = le32(&sb, 0x00);
+    let computed_crc = crc32c::crc32c(&sb[0x20..]);
+    if stored_crc != computed_crc {
+        let msg = format!(
+            "btrfs: superblock CRC32C mismatch (stored {stored_crc:#010X}, computed {computed_crc:#010X})"
+        );
+        log_cb(&msg);
+        warnings.push(msg);
+    }
+
+    // Check total_bytes > 0
+    let total_bytes = le64(&sb, 0x70);
+    if total_bytes == 0 {
+        let msg = "btrfs: total_bytes is zero".to_string();
+        log_cb(&msg);
+        warnings.push(msg);
+    }
+
+    // Check node_size in valid range
+    let node_size = le32(&sb, 0x94);
+    if !(4096..=65536).contains(&node_size) {
+        let msg = format!("btrfs: invalid node_size {node_size}");
+        log_cb(&msg);
+        warnings.push(msg);
+    }
+
+    // Check num_devices >= 1
+    let num_devices = le64(&sb, 0x88);
+    if num_devices < 1 {
+        let msg = format!("btrfs: num_devices is {num_devices}, expected >= 1");
+        log_cb(&msg);
+        warnings.push(msg);
+    }
+
+    if warnings.is_empty() {
+        log_cb("btrfs validate: superblock integrity OK");
+    }
+
+    Ok(warnings)
+}
+
 // ---- Parsing helpers ----
 
 /// Parse an INODE_ITEM (160 bytes).
@@ -1152,6 +1266,8 @@ mod tests {
         write_le64(&mut img, sb_off + 0x70, image_size as u64);
         // bytes_used at 0x78
         write_le64(&mut img, sb_off + 0x78, 32768);
+        // num_devices at 0x88
+        write_le64(&mut img, sb_off + 0x88, 1);
         // sectorsize at 0x90
         write_le32(&mut img, sb_off + 0x90, 4096);
         // nodesize at 0x94
@@ -1609,6 +1725,137 @@ mod tests {
             &output[sb_start..sb_end],
             &img[sb_start..sb_end],
             "superblock must be byte-identical to original"
+        );
+    }
+
+    /// Helper: write a valid CRC32C into a test image's superblock so resize/validate can work.
+    fn stamp_superblock_crc(img: &mut [u8]) {
+        let sb_off = SUPERBLOCK_OFFSET as usize;
+        let crc = crc32c::crc32c(&img[sb_off + 0x20..sb_off + 4096]);
+        img[sb_off..sb_off + 4].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    #[test]
+    fn test_resize_btrfs_in_place() {
+        let mut img = build_test_image();
+        // Stamp a valid CRC so resize can work with it
+        stamp_superblock_crc(&mut img);
+
+        let new_size = 4 * 1024 * 1024u64; // 4 MiB
+                                           // Extend the image buffer to accommodate the new size metadata
+                                           // (resize only patches superblock, doesn't need the actual space)
+        let mut cursor = Cursor::new(img);
+        let mut logs = Vec::new();
+        resize_btrfs_in_place(&mut cursor, 0, new_size, &mut |msg| {
+            logs.push(msg.to_string());
+        })
+        .unwrap();
+
+        // Read back superblock and verify
+        let img = cursor.into_inner();
+        let sb_off = SUPERBLOCK_OFFSET as usize;
+
+        // total_bytes at 0x70 should be updated
+        let total_bytes = le64(&img, sb_off + 0x70);
+        assert_eq!(total_bytes, new_size);
+
+        // dev_item.total_bytes at 0xD1 should be updated
+        let dev_total = le64(&img, sb_off + 0xD1);
+        assert_eq!(dev_total, new_size);
+
+        // CRC32C should be valid
+        let stored_crc = le32(&img, sb_off);
+        let computed_crc = crc32c::crc32c(&img[sb_off + 0x20..sb_off + 4096]);
+        assert_eq!(
+            stored_crc, computed_crc,
+            "CRC32C must be valid after resize"
+        );
+
+        // Should still be openable as a valid btrfs filesystem
+        // (need to extend the buffer so total_bytes doesn't exceed image)
+        let mut extended = vec![0u8; new_size as usize];
+        extended[..img.len()].copy_from_slice(&img);
+        // Update total_bytes back to original for opening (our test image nodes are at fixed offsets)
+        // Actually, let's just verify the superblock parses — the FS_TREE lookup will still work
+        // because the chunk map hasn't changed.
+        let cursor = Cursor::new(extended);
+        let fs = BtrfsFilesystem::open(cursor, 0).unwrap();
+        assert_eq!(fs.total_size(), new_size);
+
+        // Verify logs mention resize
+        assert!(logs.iter().any(|l| l.contains("resize")));
+    }
+
+    #[test]
+    fn test_resize_btrfs_no_shrink() {
+        let mut img = build_test_image();
+        stamp_superblock_crc(&mut img);
+
+        let original_size = img.len() as u64;
+        let smaller_size = original_size / 2;
+
+        let mut cursor = Cursor::new(img.clone());
+        let mut logs = Vec::new();
+        resize_btrfs_in_place(&mut cursor, 0, smaller_size, &mut |msg| {
+            logs.push(msg.to_string());
+        })
+        .unwrap();
+
+        // Superblock should be unchanged
+        let result = cursor.into_inner();
+        let sb_off = SUPERBLOCK_OFFSET as usize;
+        let total_bytes = le64(&result, sb_off + 0x70);
+        assert_eq!(total_bytes, original_size, "should not shrink");
+        assert!(logs.iter().any(|l| l.contains("skipping")));
+
+        // Also test equal size
+        let mut cursor = Cursor::new(img);
+        let mut logs = Vec::new();
+        resize_btrfs_in_place(&mut cursor, 0, original_size, &mut |msg| {
+            logs.push(msg.to_string());
+        })
+        .unwrap();
+        let result = cursor.into_inner();
+        let total_bytes = le64(&result, sb_off + 0x70);
+        assert_eq!(total_bytes, original_size, "equal size should skip");
+    }
+
+    #[test]
+    fn test_validate_btrfs_integrity() {
+        // Good image should pass
+        let mut img = build_test_image();
+        stamp_superblock_crc(&mut img);
+
+        let mut cursor = Cursor::new(img.clone());
+        let mut logs = Vec::new();
+        let warnings =
+            validate_btrfs_integrity(&mut cursor, 0, &mut |msg| logs.push(msg.to_string()))
+                .unwrap();
+        assert!(warnings.is_empty(), "good image should have no warnings");
+        assert!(logs.iter().any(|l| l.contains("OK")));
+
+        // Corrupt magic should produce a warning
+        let mut bad_img = img.clone();
+        bad_img[SUPERBLOCK_OFFSET as usize + 0x40] = 0xFF;
+        let mut cursor = Cursor::new(bad_img);
+        let mut logs = Vec::new();
+        let warnings =
+            validate_btrfs_integrity(&mut cursor, 0, &mut |msg| logs.push(msg.to_string()))
+                .unwrap();
+        assert!(!warnings.is_empty(), "corrupted magic should warn");
+        assert!(warnings[0].contains("magic"));
+
+        // Corrupt CRC should produce a warning
+        let mut bad_crc = img;
+        bad_crc[SUPERBLOCK_OFFSET as usize] ^= 0xFF; // flip CRC byte
+        let mut cursor = Cursor::new(bad_crc);
+        let mut logs = Vec::new();
+        let warnings =
+            validate_btrfs_integrity(&mut cursor, 0, &mut |msg| logs.push(msg.to_string()))
+                .unwrap();
+        assert!(
+            warnings.iter().any(|w| w.contains("CRC32C")),
+            "corrupted CRC should warn"
         );
     }
 }

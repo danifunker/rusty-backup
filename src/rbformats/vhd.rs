@@ -7,6 +7,7 @@ use anyhow::{bail, Context, Result};
 
 use super::{decompress_to_writer, reconstruct_disk_from_backup, write_zeros, CHUNK_SIZE};
 use crate::backup::metadata::BackupMetadata;
+use crate::fs::btrfs::resize_btrfs_in_place;
 use crate::fs::exfat::{patch_exfat_hidden_sectors, resize_exfat_in_place};
 use crate::fs::ext::resize_ext_in_place;
 use crate::fs::fat::{patch_bpb_hidden_sectors, resize_fat_in_place};
@@ -478,6 +479,12 @@ pub fn export_whole_disk_vhd(
                         ps.export_size,
                         &mut log_cb,
                     )?;
+                    resize_btrfs_in_place(
+                        writer.get_mut(),
+                        part_offset,
+                        ps.export_size,
+                        &mut log_cb,
+                    )?;
                     writer.seek(SeekFrom::Start(end_pos))?;
                 }
 
@@ -737,6 +744,7 @@ pub fn export_clonezilla_disk_vhd(
                 resize_hfs_in_place(&mut file, part_offset, export_size, &mut log_cb)?;
                 resize_hfsplus_in_place(&mut file, part_offset, export_size, &mut log_cb)?;
                 resize_ext_in_place(&mut file, part_offset, export_size, &mut log_cb)?;
+                resize_btrfs_in_place(&mut file, part_offset, export_size, &mut log_cb)?;
             }
 
             // Seek back to end for next partition

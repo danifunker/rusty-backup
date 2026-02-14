@@ -17,10 +17,11 @@ use crate::fs::hfs::patch_hfs_hidden_sectors;
 use crate::fs::hfsplus::patch_hfsplus_hidden_sectors;
 use crate::fs::ntfs::patch_ntfs_hidden_sectors;
 use crate::fs::{
-    resize_exfat_in_place, resize_ext_in_place, resize_fat_in_place, resize_hfs_in_place,
-    resize_hfsplus_in_place, resize_ntfs_in_place, set_fat_clean_flags, validate_exfat_integrity,
-    validate_ext_integrity, validate_fat_integrity, validate_hfs_integrity,
-    validate_hfsplus_integrity, validate_ntfs_integrity,
+    resize_btrfs_in_place, resize_exfat_in_place, resize_ext_in_place, resize_fat_in_place,
+    resize_hfs_in_place, resize_hfsplus_in_place, resize_ntfs_in_place, set_fat_clean_flags,
+    validate_btrfs_integrity, validate_exfat_integrity, validate_ext_integrity,
+    validate_fat_integrity, validate_hfs_integrity, validate_hfsplus_integrity,
+    validate_ntfs_integrity,
 };
 use crate::os::SectorAlignedWriter;
 use crate::partition::apm::Apm;
@@ -728,6 +729,11 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
                         log(&progress, LogLevel::Info, msg)
                     })?;
                 }
+                PartitionFsType::Btrfs => {
+                    resize_btrfs_in_place(inner_file, part_offset, export_size, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    })?;
+                }
                 PartitionFsType::Fat | PartitionFsType::Unknown => {
                     let new_sectors = (export_size / 512) as u32;
                     resize_fat_in_place(inner_file, part_offset, new_sectors, &mut |msg| {
@@ -763,6 +769,11 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
                 }
                 PartitionFsType::Ext => {
                     let _ = validate_ext_integrity(inner_file, part_offset, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    });
+                }
+                PartitionFsType::Btrfs => {
+                    let _ = validate_btrfs_integrity(inner_file, part_offset, &mut |msg| {
                         log(&progress, LogLevel::Info, msg)
                     });
                 }
@@ -1209,6 +1220,11 @@ fn run_clonezilla_restore(
                         log(&progress, LogLevel::Info, msg)
                     })?;
                 }
+                PartitionFsType::Btrfs => {
+                    resize_btrfs_in_place(inner_file, part_offset, export_size, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    })?;
+                }
                 PartitionFsType::Fat | PartitionFsType::Unknown => {
                     let new_sectors = (export_size / 512) as u32;
                     resize_fat_in_place(inner_file, part_offset, new_sectors, &mut |msg| {
@@ -1244,6 +1260,11 @@ fn run_clonezilla_restore(
                 }
                 PartitionFsType::Ext => {
                     let _ = validate_ext_integrity(inner_file, part_offset, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    });
+                }
+                PartitionFsType::Btrfs => {
+                    let _ = validate_btrfs_integrity(inner_file, part_offset, &mut |msg| {
                         log(&progress, LogLevel::Info, msg)
                     });
                 }
@@ -1662,6 +1683,7 @@ enum PartitionFsType {
     Hfs,
     HfsPlus,
     Ext,
+    Btrfs,
     Unknown,
 }
 
@@ -1722,6 +1744,17 @@ fn detect_partition_fs_type(
         let mut ext_magic = [0u8; 2];
         if file.read_exact(&mut ext_magic).is_ok() && ext_magic == [0x53, 0xEF] {
             return PartitionFsType::Ext;
+        }
+    }
+
+    // Check for btrfs magic "_BHRfS_M" at partition_offset + 0x10000 + 0x40
+    if file
+        .seek(SeekFrom::Start(partition_offset + 0x10040))
+        .is_ok()
+    {
+        let mut btrfs_magic = [0u8; 8];
+        if file.read_exact(&mut btrfs_magic).is_ok() && &btrfs_magic == b"_BHRfS_M" {
+            return PartitionFsType::Btrfs;
         }
     }
 

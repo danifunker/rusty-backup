@@ -11,7 +11,7 @@ pub mod unix_common;
 
 use std::io::{Read, Seek, SeekFrom};
 
-pub use btrfs::CompactBtrfsReader;
+pub use btrfs::{resize_btrfs_in_place, validate_btrfs_integrity, CompactBtrfsReader};
 pub use exfat::{
     patch_exfat_hidden_sectors, resize_exfat_in_place, validate_exfat_integrity, CompactExfatReader,
 };
