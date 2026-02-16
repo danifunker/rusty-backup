@@ -748,19 +748,20 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
             // Parse $FILE_NAME content if present
             if content_length >= 66 {
                 let content = &data[pos + 16..pos + 16 + content_length];
-                if let Some(entry) = self.parse_file_name_entry(content, parent_path) {
-                    // Skip . and .. entries and system metafiles
-                    let mft_ref = u64::from_le_bytes([
-                        data[pos],
-                        data[pos + 1],
-                        data[pos + 2],
-                        data[pos + 3],
-                        data[pos + 4],
-                        data[pos + 5],
-                        0,
-                        0,
-                    ]) & 0x0000_FFFF_FFFF_FFFF;
+                // The file's own MFT reference is at the start of the index entry
+                let mft_ref = u64::from_le_bytes([
+                    data[pos],
+                    data[pos + 1],
+                    data[pos + 2],
+                    data[pos + 3],
+                    data[pos + 4],
+                    data[pos + 5],
+                    0,
+                    0,
+                ]) & 0x0000_FFFF_FFFF_FFFF;
 
+                if let Some(entry) = self.parse_file_name_entry(content, parent_path, mft_ref) {
+                    // Skip system metafiles (MFT records 0-23)
                     if mft_ref >= 24 || (mft_ref >= 11 && mft_ref < 24) {
                         entries.push(entry);
                     }
@@ -774,7 +775,13 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
     }
 
     /// Parse a $FILE_NAME attribute into a FileEntry.
-    fn parse_file_name_entry(&self, data: &[u8], parent_path: &str) -> Option<FileEntry> {
+    /// `file_mft_ref` is the file's own MFT record number (from the index entry).
+    fn parse_file_name_entry(
+        &self,
+        data: &[u8],
+        parent_path: &str,
+        file_mft_ref: u64,
+    ) -> Option<FileEntry> {
         if data.len() < 66 {
             return None;
         }
@@ -813,15 +820,10 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
             format!("{parent_path}/{name}")
         };
 
-        // Use parent MFT reference as location (for directory listing)
-        let parent_ref =
-            u64::from_le_bytes([data[0], data[1], data[2], data[3], data[4], data[5], 0, 0])
-                & 0x0000_FFFF_FFFF_FFFF;
-
         if is_dir {
-            Some(FileEntry::new_directory(name, path, parent_ref))
+            Some(FileEntry::new_directory(name, path, file_mft_ref))
         } else {
-            Some(FileEntry::new_file(name, path, real_size, parent_ref))
+            Some(FileEntry::new_file(name, path, real_size, file_mft_ref))
         }
     }
 }
