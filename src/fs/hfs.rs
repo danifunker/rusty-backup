@@ -177,6 +177,8 @@ enum CatalogRecord {
         parent_id: u32,
         data_size: u32,
         data_extents: [HfsExtDescriptor; 3],
+        rsrc_size: u32,
+        rsrc_extents: [HfsExtDescriptor; 3],
         type_code: String,
         creator_code: String,
     },
@@ -326,12 +328,23 @@ impl<R: Read + Seek> HfsFilesystem<R> {
                         for j in 0..3 {
                             data_extents[j] = HfsExtDescriptor::parse(&rec[74 + j * 4..78 + j * 4]);
                         }
+                        // Resource fork: logical size at offset 36, extents at 86
+                        let rsrc_size = BigEndian::read_u32(&rec[36..40]);
+                        let mut rsrc_extents = [HfsExtDescriptor {
+                            start_block: 0,
+                            block_count: 0,
+                        }; 3];
+                        for j in 0..3 {
+                            rsrc_extents[j] = HfsExtDescriptor::parse(&rec[86 + j * 4..90 + j * 4]);
+                        }
                         results.push(CatalogRecord::File {
                             file_id,
                             name,
                             parent_id: rec_parent_id,
                             data_size,
                             data_extents,
+                            rsrc_size,
+                            rsrc_extents,
                             type_code,
                             creator_code,
                         });
@@ -347,7 +360,11 @@ impl<R: Read + Seek> HfsFilesystem<R> {
     }
 
     /// Find a file record by its file_id (CNID) in the catalog B-tree.
-    fn find_file_by_id(&self, file_id: u32) -> Option<(u32, [HfsExtDescriptor; 3])> {
+    /// Returns (data_size, data_extents, rsrc_size, rsrc_extents).
+    fn find_file_by_id(
+        &self,
+        file_id: u32,
+    ) -> Option<(u32, [HfsExtDescriptor; 3], u32, [HfsExtDescriptor; 3])> {
         if self.catalog_data.len() < 512 {
             return None;
         }
@@ -410,7 +427,16 @@ impl<R: Read + Seek> HfsFilesystem<R> {
                 for j in 0..3 {
                     data_extents[j] = HfsExtDescriptor::parse(&rec[74 + j * 4..78 + j * 4]);
                 }
-                return Some((data_size, data_extents));
+                // Resource fork: logical size at offset 36, extents at 86
+                let rsrc_size = BigEndian::read_u32(&rec[36..40]);
+                let mut rsrc_extents = [HfsExtDescriptor {
+                    start_block: 0,
+                    block_count: 0,
+                }; 3];
+                for j in 0..3 {
+                    rsrc_extents[j] = HfsExtDescriptor::parse(&rec[86 + j * 4..90 + j * 4]);
+                }
+                return Some((data_size, data_extents, rsrc_size, rsrc_extents));
             }
             node_idx = next_node;
         }
@@ -449,6 +475,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
             mode: None,
             uid: None,
             gid: None,
+            resource_fork_size: None,
         })
     }
 
@@ -471,6 +498,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
                     file_id,
                     name,
                     data_size,
+                    rsrc_size,
                     type_code,
                     creator_code,
                     ..
@@ -483,6 +511,9 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
                     let mut fe = FileEntry::new_file(name, path, data_size as u64, file_id as u64);
                     fe.type_code = Some(type_code);
                     fe.creator_code = Some(creator_code);
+                    if rsrc_size > 0 {
+                        fe.resource_fork_size = Some(rsrc_size as u64);
+                    }
                     entries.push(fe);
                 }
             }
@@ -498,9 +529,10 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
         max_bytes: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
         let file_id = entry.location as u32;
-        let (data_size, extents) = self.find_file_by_id(file_id).ok_or_else(|| {
-            FilesystemError::NotFound(format!("file id {file_id} not found in catalog"))
-        })?;
+        let (data_size, extents, _rsrc_size, _rsrc_extents) =
+            self.find_file_by_id(file_id).ok_or_else(|| {
+                FilesystemError::NotFound(format!("file id {file_id} not found in catalog"))
+            })?;
 
         let mut data = read_fork_data(
             &mut self.reader,
@@ -543,6 +575,37 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
             }
             None => Ok(self.total_size()),
         }
+    }
+
+    fn write_resource_fork_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn std::io::Write,
+    ) -> Result<u64, FilesystemError> {
+        let file_id = entry.location as u32;
+        let (_data_size, _data_ext, rsrc_size, rsrc_extents) =
+            self.find_file_by_id(file_id).ok_or_else(|| {
+                FilesystemError::NotFound(format!("file id {file_id} not found in catalog"))
+            })?;
+        if rsrc_size == 0 {
+            return Ok(0);
+        }
+        let data = read_fork_data(
+            &mut self.reader,
+            self.partition_offset,
+            &self.mdb,
+            &rsrc_extents,
+            rsrc_size as u64,
+        )?;
+        writer.write_all(&data)?;
+        Ok(data.len() as u64)
+    }
+
+    fn resource_fork_size(&mut self, entry: &FileEntry) -> u64 {
+        let file_id = entry.location as u32;
+        self.find_file_by_id(file_id)
+            .map(|(_ds, _de, rs, _re)| rs as u64)
+            .unwrap_or(0)
     }
 }
 

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -8,9 +8,22 @@ use rusty_backup::clonezilla::block_cache::{PartcloneBlockCache, PartcloneBlockR
 use rusty_backup::fs;
 use rusty_backup::fs::entry::{EntryType, FileEntry};
 use rusty_backup::fs::filesystem::{Filesystem, FilesystemError};
+use rusty_backup::fs::resource_fork::{self, ResourceForkMode};
 use rusty_backup::partition;
 
 const MAX_PREVIEW_SIZE: usize = 1024 * 1024; // 1 MB max file preview
+
+/// Shared extraction progress state between UI and background thread.
+struct ExtractionProgress {
+    current_bytes: u64,
+    total_bytes: u64,
+    current_file: String,
+    files_extracted: u32,
+    total_files: u32,
+    finished: bool,
+    error: Option<String>,
+    cancel_requested: bool,
+}
 
 /// Filesystem browser view for inspecting partition contents.
 pub struct BrowseView {
@@ -42,6 +55,12 @@ pub struct BrowseView {
     active: bool,
     /// Shared block cache for Clonezilla partclone browsing.
     partclone_cache: Option<Arc<Mutex<PartcloneBlockCache>>>,
+    /// Resource fork handling mode (HFS/HFS+ only).
+    resource_fork_mode: ResourceForkMode,
+    /// Active extraction progress (shared with background thread).
+    extraction_progress: Option<Arc<Mutex<ExtractionProgress>>>,
+    /// Message to show after extraction completes.
+    extraction_result: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +95,9 @@ impl Default for BrowseView {
             partition_type_string: None,
             active: false,
             partclone_cache: None,
+            resource_fork_mode: ResourceForkMode::AppleDouble,
+            extraction_progress: None,
+            extraction_result: None,
         }
     }
 }
@@ -178,6 +200,8 @@ impl BrowseView {
         self.volume_label.clear();
         self.partclone_cache = None;
         self.partition_type_string = None;
+        self.extraction_progress = None;
+        self.extraction_result = None;
     }
 
     pub fn is_active(&self) -> bool {
@@ -185,59 +209,28 @@ impl BrowseView {
     }
 
     fn open_fs(&self) -> Result<Box<dyn Filesystem>, FilesystemError> {
-        // If we have a partclone block cache, use it
-        if let Some(cache) = &self.partclone_cache {
-            let reader = PartcloneBlockReader::new(Arc::clone(cache));
-            return fs::open_filesystem(reader, 0, self.partition_type, None);
-        }
+        create_filesystem(
+            self.source_path.as_ref(),
+            self.partition_offset,
+            self.partition_type,
+            self.partition_type_string.as_deref(),
+            self.partclone_cache.as_ref(),
+        )
+    }
 
-        let path = self
-            .source_path
-            .as_ref()
-            .ok_or_else(|| FilesystemError::Parse("no source path set".into()))?;
-
-        // Detect seekable zstd files by extension
-        let is_seekable_zst = path.extension().map(|e| e == "zst").unwrap_or(false)
-            && path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(|s| s.ends_with(".seekable"))
-                .unwrap_or(false);
-
-        if is_seekable_zst {
-            let file = File::open(path).map_err(FilesystemError::Io)?;
-            let decoder = match zeekstd::Decoder::new(file) {
-                Ok(d) => d,
-                Err(e) => {
-                    // Stale or corrupt cache file — delete it so it gets recreated
-                    let _ = std::fs::remove_file(path);
-                    return Err(FilesystemError::Parse(format!(
-                        "stale seekable zstd cache removed ({e}). Click Browse again to rebuild."
-                    )));
-                }
-            };
-            fs::open_filesystem(
-                decoder,
-                self.partition_offset,
-                self.partition_type,
-                self.partition_type_string.as_deref(),
-            )
-        } else {
-            let file = File::open(path).map_err(FilesystemError::Io)?;
-            let reader = BufReader::new(file);
-            fs::open_filesystem(
-                reader,
-                self.partition_offset,
-                self.partition_type,
-                self.partition_type_string.as_deref(),
-            )
-        }
+    /// Returns true if the current filesystem is HFS or HFS+.
+    fn is_hfs_type(&self) -> bool {
+        let ft = self.fs_type.as_str();
+        ft == "HFS" || ft == "HFS+" || ft == "HFSX"
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui) {
         if !self.active {
             return;
         }
+
+        // Poll extraction progress
+        self.poll_extraction(ui);
 
         // Header
         ui.horizontal(|ui| {
@@ -254,6 +247,16 @@ impl BrowseView {
 
         if let Some(err) = &self.error {
             ui.colored_label(egui::Color32::from_rgb(255, 100, 100), err);
+        }
+
+        // Extraction result message
+        if let Some(result) = &self.extraction_result.clone() {
+            ui.horizontal(|ui| {
+                ui.label(result);
+                if ui.button("OK").clicked() {
+                    self.extraction_result = None;
+                }
+            });
         }
 
         ui.separator();
@@ -425,12 +428,42 @@ impl BrowseView {
         }
     }
 
-    fn render_content_panel(&self, ui: &mut egui::Ui, panel_height: f32) {
+    fn render_content_panel(&mut self, ui: &mut egui::Ui, panel_height: f32) {
+        // Extraction progress bar
+        if let Some(progress) = &self.extraction_progress {
+            if let Ok(p) = progress.lock() {
+                let fraction = if p.total_bytes > 0 {
+                    p.current_bytes as f32 / p.total_bytes as f32
+                } else if p.total_files > 0 {
+                    p.files_extracted as f32 / p.total_files as f32
+                } else {
+                    0.0
+                };
+                let text = format!(
+                    "Extracting {}/{} files: {}",
+                    p.files_extracted, p.total_files, p.current_file
+                );
+                ui.add(egui::ProgressBar::new(fraction).text(text));
+                if !p.finished {
+                    // Clone progress Arc to allow the mutable borrow for the button
+                    let progress_clone = Arc::clone(progress);
+                    drop(p);
+                    if ui.button("Cancel").clicked() {
+                        if let Ok(mut p) = progress_clone.lock() {
+                            p.cancel_requested = true;
+                        }
+                    }
+                    ui.separator();
+                }
+            }
+        }
+
         match &self.selected_entry {
             None => {
                 ui.colored_label(egui::Color32::GRAY, "Select a file to view its contents.");
             }
             Some(entry) => {
+                let entry = entry.clone();
                 // File info header
                 ui.label(egui::RichText::new(&entry.name).strong());
                 ui.horizontal(|ui| {
@@ -446,6 +479,11 @@ impl BrowseView {
                     if let Some(ref cc) = entry.creator_code {
                         ui.label(format!("Creator: {cc}"));
                     }
+                    if let Some(ref rsrc) = entry.resource_fork_size {
+                        if *rsrc > 0 {
+                            ui.label(format!("Rsrc: {}", partition::format_size(*rsrc)));
+                        }
+                    }
                     if let Some(mode_str) = entry.mode_string() {
                         ui.label(format!("Permissions: {mode_str}"));
                     }
@@ -460,13 +498,53 @@ impl BrowseView {
                     }
                     ui.label(format!("Path: {}", entry.path));
                 });
+
+                // Extract controls row
+                let extraction_running = self.extraction_progress.is_some();
+                let is_extractable = entry.is_file() || entry.is_directory() || entry.is_symlink();
+
+                if is_extractable && !extraction_running {
+                    ui.horizontal(|ui| {
+                        // Resource fork mode dropdown (HFS/HFS+ only)
+                        if self.is_hfs_type() {
+                            ui.label("Resource forks:");
+                            let current_label = self.resource_fork_mode.label();
+                            egui::ComboBox::from_id_salt("rsrc_mode")
+                                .selected_text(current_label)
+                                .show_ui(ui, |ui| {
+                                    for mode in &ResourceForkMode::ALL {
+                                        ui.selectable_value(
+                                            &mut self.resource_fork_mode,
+                                            *mode,
+                                            mode.label(),
+                                        );
+                                    }
+                                });
+                            ui.add_space(8.0);
+                        }
+
+                        let btn_label = if entry.is_directory() {
+                            "Extract Folder..."
+                        } else {
+                            "Extract File..."
+                        };
+                        if ui.button(btn_label).clicked() {
+                            self.start_extraction(&entry);
+                        }
+                    });
+                }
+
                 ui.separator();
 
-                if entry.size > MAX_PREVIEW_SIZE as u64 {
+                if entry.size > MAX_PREVIEW_SIZE as u64 && entry.is_file() {
                     ui.label(format!(
                         "File too large to preview ({}).",
                         partition::format_size(entry.size)
                     ));
+                    return;
+                }
+
+                if entry.is_directory() {
                     return;
                 }
 
@@ -475,8 +553,10 @@ impl BrowseView {
 
                 match &self.content {
                     None => {
-                        ui.spinner();
-                        ui.label("Loading...");
+                        if entry.is_file() {
+                            ui.spinner();
+                            ui.label("Loading...");
+                        }
                     }
                     Some(FileContent::Text(text)) => {
                         egui::ScrollArea::vertical()
@@ -504,6 +584,373 @@ impl BrowseView {
             }
         }
     }
+
+    /// Start extracting the selected entry to a user-chosen folder.
+    fn start_extraction(&mut self, entry: &FileEntry) {
+        // Pick destination folder
+        let dest = match rfd::FileDialog::new()
+            .set_title("Extract to folder")
+            .pick_folder()
+        {
+            Some(d) => d,
+            None => return,
+        };
+
+        let entry = entry.clone();
+        let source_path = self.source_path.clone();
+        let partition_offset = self.partition_offset;
+        let partition_type = self.partition_type;
+        let partition_type_string = self.partition_type_string.clone();
+        let partclone_cache = self.partclone_cache.clone();
+        let resource_fork_mode = self.resource_fork_mode;
+        let is_hfs = self.is_hfs_type();
+
+        let progress = Arc::new(Mutex::new(ExtractionProgress {
+            current_bytes: 0,
+            total_bytes: 0,
+            current_file: String::new(),
+            files_extracted: 0,
+            total_files: 0,
+            finished: false,
+            error: None,
+            cancel_requested: false,
+        }));
+
+        self.extraction_progress = Some(Arc::clone(&progress));
+        self.extraction_result = None;
+
+        std::thread::spawn(move || {
+            let result = run_extraction(
+                source_path.as_ref(),
+                partition_offset,
+                partition_type,
+                partition_type_string.as_deref(),
+                partclone_cache.as_ref(),
+                &entry,
+                &dest,
+                resource_fork_mode,
+                is_hfs,
+                &progress,
+            );
+
+            if let Ok(mut p) = progress.lock() {
+                p.finished = true;
+                if let Err(e) = result {
+                    p.error = Some(format!("{e}"));
+                }
+            }
+        });
+    }
+
+    /// Poll extraction progress and update UI state.
+    fn poll_extraction(&mut self, ui: &egui::Ui) {
+        let finished_msg = if let Some(progress) = &self.extraction_progress {
+            if let Ok(p) = progress.lock() {
+                if p.finished {
+                    Some(if let Some(ref err) = p.error {
+                        format!("Extraction failed: {err}")
+                    } else {
+                        format!(
+                            "Extraction complete: {} files extracted.",
+                            p.files_extracted
+                        )
+                    })
+                } else {
+                    ui.ctx().request_repaint();
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(msg) = finished_msg {
+            self.extraction_result = Some(msg);
+            self.extraction_progress = None;
+        }
+    }
+}
+
+/// Create a filesystem instance from the browse view's configuration.
+/// This is a standalone function so it can be called from background threads.
+fn create_filesystem(
+    source_path: Option<&PathBuf>,
+    partition_offset: u64,
+    partition_type: u8,
+    partition_type_string: Option<&str>,
+    partclone_cache: Option<&Arc<Mutex<PartcloneBlockCache>>>,
+) -> Result<Box<dyn Filesystem>, FilesystemError> {
+    // If we have a partclone block cache, use it
+    if let Some(cache) = partclone_cache {
+        let reader = PartcloneBlockReader::new(Arc::clone(cache));
+        return fs::open_filesystem(reader, 0, partition_type, None);
+    }
+
+    let path = source_path.ok_or_else(|| FilesystemError::Parse("no source path set".into()))?;
+
+    // Detect seekable zstd files by extension
+    let is_seekable_zst = path.extension().map(|e| e == "zst").unwrap_or(false)
+        && path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.ends_with(".seekable"))
+            .unwrap_or(false);
+
+    if is_seekable_zst {
+        let file = File::open(path).map_err(FilesystemError::Io)?;
+        let decoder = match zeekstd::Decoder::new(file) {
+            Ok(d) => d,
+            Err(e) => {
+                // Stale or corrupt cache file — delete it so it gets recreated
+                let _ = std::fs::remove_file(path);
+                return Err(FilesystemError::Parse(format!(
+                    "stale seekable zstd cache removed ({e}). Click Browse again to rebuild."
+                )));
+            }
+        };
+        fs::open_filesystem(
+            decoder,
+            partition_offset,
+            partition_type,
+            partition_type_string,
+        )
+    } else {
+        let file = File::open(path).map_err(FilesystemError::Io)?;
+        let reader = BufReader::new(file);
+        fs::open_filesystem(
+            reader,
+            partition_offset,
+            partition_type,
+            partition_type_string,
+        )
+    }
+}
+
+/// Run the extraction in a background thread.
+fn run_extraction(
+    source_path: Option<&PathBuf>,
+    partition_offset: u64,
+    partition_type: u8,
+    partition_type_string: Option<&str>,
+    partclone_cache: Option<&Arc<Mutex<PartcloneBlockCache>>>,
+    entry: &FileEntry,
+    dest: &std::path::Path,
+    resource_fork_mode: ResourceForkMode,
+    is_hfs: bool,
+    progress: &Arc<Mutex<ExtractionProgress>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut counting_fs = create_filesystem(
+        source_path,
+        partition_offset,
+        partition_type,
+        partition_type_string,
+        partclone_cache,
+    )?;
+
+    // Pre-count files and bytes for progress tracking
+    let (total_files, total_bytes) = count_entry(&mut *counting_fs, entry)?;
+    if let Ok(mut p) = progress.lock() {
+        p.total_files = total_files;
+        p.total_bytes = total_bytes;
+    }
+    drop(counting_fs);
+
+    // Open a fresh filesystem for extraction
+    let mut fs = create_filesystem(
+        source_path,
+        partition_offset,
+        partition_type,
+        partition_type_string,
+        partclone_cache,
+    )?;
+
+    extract_entry(&mut *fs, entry, dest, resource_fork_mode, is_hfs, progress)?;
+
+    Ok(())
+}
+
+/// Recursively count files and total bytes for progress tracking.
+fn count_entry(
+    fs: &mut dyn Filesystem,
+    entry: &FileEntry,
+) -> Result<(u32, u64), Box<dyn std::error::Error + Send + Sync>> {
+    match entry.entry_type {
+        EntryType::File => {
+            let rsrc = entry.resource_fork_size.unwrap_or(0);
+            Ok((1, entry.size + rsrc))
+        }
+        EntryType::Symlink => Ok((1, 0)),
+        EntryType::Directory => {
+            let children = fs.list_directory(entry)?;
+            let mut total_files = 0u32;
+            let mut total_bytes = 0u64;
+            for child in &children {
+                let (f, b) = count_entry(fs, child)?;
+                total_files += f;
+                total_bytes += b;
+            }
+            Ok((total_files, total_bytes))
+        }
+        EntryType::Special => Ok((0, 0)),
+    }
+}
+
+/// Recursively extract an entry to the destination path.
+fn extract_entry(
+    fs: &mut dyn Filesystem,
+    entry: &FileEntry,
+    dest: &std::path::Path,
+    resource_fork_mode: ResourceForkMode,
+    is_hfs: bool,
+    progress: &Arc<Mutex<ExtractionProgress>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Check for cancellation
+    if let Ok(p) = progress.lock() {
+        if p.cancel_requested {
+            return Err("Extraction cancelled".into());
+        }
+    }
+
+    let safe_name = resource_fork::sanitize_filename(&entry.name);
+
+    match entry.entry_type {
+        EntryType::File => {
+            // Update progress with current file name
+            if let Ok(mut p) = progress.lock() {
+                p.current_file = entry.path.clone();
+            }
+
+            let has_rsrc = is_hfs && entry.resource_fork_size.map(|s| s > 0).unwrap_or(false);
+
+            if has_rsrc && resource_fork_mode == ResourceForkMode::MacBinary {
+                // MacBinary: single .bin file containing both forks
+                let data = fs.read_file(entry, usize::MAX)?;
+                let mut rsrc_buf = Vec::new();
+                fs.write_resource_fork_to(entry, &mut rsrc_buf)?;
+
+                let type_code = entry
+                    .type_code
+                    .as_ref()
+                    .map(|s| fourcc_bytes(s))
+                    .unwrap_or([0; 4]);
+                let creator_code = entry
+                    .creator_code
+                    .as_ref()
+                    .map(|s| fourcc_bytes(s))
+                    .unwrap_or([0; 4]);
+
+                let mb = resource_fork::build_macbinary(
+                    &safe_name,
+                    &type_code,
+                    &creator_code,
+                    &data,
+                    &rsrc_buf,
+                );
+                let out_path = dest.join(format!("{safe_name}.bin"));
+                let mut f = BufWriter::new(File::create(&out_path)?);
+                f.write_all(&mb)?;
+                f.flush()?;
+
+                if let Ok(mut p) = progress.lock() {
+                    p.current_bytes += data.len() as u64 + rsrc_buf.len() as u64;
+                    p.files_extracted += 1;
+                }
+            } else {
+                // Write data fork
+                let out_path = dest.join(&safe_name);
+                let mut f = BufWriter::new(File::create(&out_path)?);
+                let written = fs.write_file_to(entry, &mut f)?;
+                f.flush()?;
+
+                if let Ok(mut p) = progress.lock() {
+                    p.current_bytes += written;
+                }
+
+                // Handle resource fork
+                if has_rsrc && resource_fork_mode != ResourceForkMode::DataForkOnly {
+                    let type_code = entry
+                        .type_code
+                        .as_ref()
+                        .map(|s| fourcc_bytes(s))
+                        .unwrap_or([0; 4]);
+                    let creator_code = entry
+                        .creator_code
+                        .as_ref()
+                        .map(|s| fourcc_bytes(s))
+                        .unwrap_or([0; 4]);
+
+                    let mut rsrc_buf = Vec::new();
+                    fs.write_resource_fork_to(entry, &mut rsrc_buf)?;
+
+                    match resource_fork_mode {
+                        ResourceForkMode::AppleDouble => {
+                            let ad = resource_fork::build_appledouble(
+                                &type_code,
+                                &creator_code,
+                                &rsrc_buf,
+                            );
+                            let ad_path = dest.join(format!("._{safe_name}"));
+                            let mut af = BufWriter::new(File::create(&ad_path)?);
+                            af.write_all(&ad)?;
+                            af.flush()?;
+                        }
+                        ResourceForkMode::SeparateRsrc => {
+                            let rsrc_path = dest.join(format!("{safe_name}.rsrc"));
+                            let mut rf = BufWriter::new(File::create(&rsrc_path)?);
+                            rf.write_all(&rsrc_buf)?;
+                            rf.flush()?;
+                        }
+                        _ => {}
+                    }
+
+                    if let Ok(mut p) = progress.lock() {
+                        p.current_bytes += rsrc_buf.len() as u64;
+                    }
+                }
+
+                if let Ok(mut p) = progress.lock() {
+                    p.files_extracted += 1;
+                }
+            }
+        }
+        EntryType::Directory => {
+            let dir_path = dest.join(&safe_name);
+            std::fs::create_dir_all(&dir_path)?;
+
+            let children = fs.list_directory(entry)?;
+            for child in &children {
+                extract_entry(fs, child, &dir_path, resource_fork_mode, is_hfs, progress)?;
+            }
+        }
+        EntryType::Symlink => {
+            #[cfg(unix)]
+            {
+                let target = entry.symlink_target.as_deref().unwrap_or("");
+                let link_path = dest.join(&safe_name);
+                // Ignore errors for symlinks (target may not exist on host)
+                let _ = std::os::unix::fs::symlink(target, &link_path);
+            }
+            if let Ok(mut p) = progress.lock() {
+                p.files_extracted += 1;
+            }
+        }
+        EntryType::Special => {
+            // Skip special files (block devices, etc.)
+        }
+    }
+
+    Ok(())
+}
+
+/// Convert a 4-character type/creator string to a byte array.
+fn fourcc_bytes(s: &str) -> [u8; 4] {
+    let bytes = s.as_bytes();
+    let mut result = [b' '; 4];
+    for (i, &b) in bytes.iter().take(4).enumerate() {
+        result[i] = b;
+    }
+    result
 }
 
 /// Detect whether data is text or binary and return appropriate content.

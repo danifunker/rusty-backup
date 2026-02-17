@@ -24,6 +24,8 @@ pub struct FileEntry {
     pub uid: Option<u32>,
     /// Unix group ID. Present on ext/btrfs/xfs/UFS filesystems.
     pub gid: Option<u32>,
+    /// Resource fork size (HFS/HFS+ only). None or Some(0) means no resource fork.
+    pub resource_fork_size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -53,6 +55,7 @@ impl FileEntry {
             mode: None,
             uid: None,
             gid: None,
+            resource_fork_size: None,
         }
     }
 
@@ -71,6 +74,7 @@ impl FileEntry {
             mode: None,
             uid: None,
             gid: None,
+            resource_fork_size: None,
         }
     }
 
@@ -89,6 +93,7 @@ impl FileEntry {
             mode: None,
             uid: None,
             gid: None,
+            resource_fork_size: None,
         }
     }
 
@@ -113,6 +118,7 @@ impl FileEntry {
             mode: None,
             uid: None,
             gid: None,
+            resource_fork_size: None,
         }
     }
 
@@ -136,6 +142,7 @@ impl FileEntry {
             mode: None,
             uid: None,
             gid: None,
+            resource_fork_size: None,
         }
     }
 

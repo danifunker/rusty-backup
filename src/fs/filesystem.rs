@@ -1,4 +1,5 @@
 use std::fmt;
+use std::io::Write;
 
 use super::entry::FileEntry;
 
@@ -35,6 +36,33 @@ pub trait Filesystem: Send {
     /// Default implementation returns `total_size()` (no trimming).
     fn last_data_byte(&mut self) -> Result<u64, FilesystemError> {
         Ok(self.total_size())
+    }
+
+    /// Stream file data to a writer. Returns the number of bytes written.
+    /// Default delegates to `read_file(entry, usize::MAX)`.
+    fn write_file_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn Write,
+    ) -> Result<u64, FilesystemError> {
+        let data = self.read_file(entry, usize::MAX)?;
+        writer.write_all(&data)?;
+        Ok(data.len() as u64)
+    }
+
+    /// Write resource fork data to a writer. Returns the number of bytes written.
+    /// Default returns `Ok(0)` (no resource fork).
+    fn write_resource_fork_to(
+        &mut self,
+        _entry: &FileEntry,
+        _writer: &mut dyn Write,
+    ) -> Result<u64, FilesystemError> {
+        Ok(0)
+    }
+
+    /// Returns the resource fork size for a file entry. Default returns `0`.
+    fn resource_fork_size(&mut self, _entry: &FileEntry) -> u64 {
+        0
     }
 }
 

@@ -844,6 +844,7 @@ impl<R: Read + Seek + Send> Filesystem for NtfsFilesystem<R> {
             mode: None,
             uid: None,
             gid: None,
+            resource_fork_size: None,
         })
     }
 

@@ -7,6 +7,7 @@ pub mod filesystem;
 pub mod hfs;
 pub mod hfsplus;
 pub mod ntfs;
+pub mod resource_fork;
 pub mod unix_common;
 
 use std::io::{Read, Seek, SeekFrom};

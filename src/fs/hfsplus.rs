@@ -194,6 +194,7 @@ enum CatalogEntry {
         data_size: u64,
         #[allow(dead_code)]
         data_fork: ForkData,
+        rsrc_size: u64,
         type_code: String,
         creator_code: String,
     },
@@ -341,11 +342,14 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
                         let creator_code = decode_fourcc(&rec[52..56]);
                         // Data fork at offset 88 (80 bytes)
                         let data_fork = ForkData::parse(&rec[88..168]);
+                        // Resource fork at offset 168 (80 bytes)
+                        let rsrc_fork = ForkData::parse(&rec[168..248]);
                         results.push(CatalogEntry::File {
                             file_id,
                             name,
                             data_size: data_fork.logical_size,
                             data_fork,
+                            rsrc_size: rsrc_fork.logical_size,
                             type_code,
                             creator_code,
                         });
@@ -361,7 +365,8 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
     }
 
     /// Find a file record by its file_id (CNID) in the catalog B-tree.
-    fn find_file_by_id(&self, file_id: u32) -> Option<ForkData> {
+    /// Returns (data_fork, resource_fork).
+    fn find_file_by_id(&self, file_id: u32) -> Option<(ForkData, ForkData)> {
         let node_size = self.catalog_header.node_size as usize;
         if node_size == 0 {
             return None;
@@ -412,7 +417,10 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
                 if rec_file_id != file_id {
                     continue;
                 }
-                return Some(ForkData::parse(&rec[88..168]));
+                return Some((
+                    ForkData::parse(&rec[88..168]),
+                    ForkData::parse(&rec[168..248]),
+                ));
             }
             node_idx = desc.next;
         }
@@ -447,6 +455,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
             mode: None,
             uid: None,
             gid: None,
+            resource_fork_size: None,
         })
     }
 
@@ -469,6 +478,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
                     file_id,
                     name,
                     data_size,
+                    rsrc_size,
                     type_code,
                     creator_code,
                     ..
@@ -481,6 +491,9 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
                     let mut fe = FileEntry::new_file(name, path, data_size, file_id as u64);
                     fe.type_code = Some(type_code);
                     fe.creator_code = Some(creator_code);
+                    if rsrc_size > 0 {
+                        fe.resource_fork_size = Some(rsrc_size);
+                    }
                     entries.push(fe);
                 }
             }
@@ -496,7 +509,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
         max_bytes: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
         let file_id = entry.location as u32;
-        let fork = self.find_file_by_id(file_id).ok_or_else(|| {
+        let (data_fork, _rsrc_fork) = self.find_file_by_id(file_id).ok_or_else(|| {
             FilesystemError::NotFound(format!("file id {file_id} not found in catalog"))
         })?;
 
@@ -504,7 +517,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
             &mut self.reader,
             self.partition_offset,
             self.vh.block_size,
-            &fork,
+            &data_fork,
         )?;
         data.truncate(max_bytes);
         Ok(data)
@@ -544,6 +557,35 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
             }
             None => Ok(self.total_size()),
         }
+    }
+
+    fn write_resource_fork_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn std::io::Write,
+    ) -> Result<u64, FilesystemError> {
+        let file_id = entry.location as u32;
+        let (_data_fork, rsrc_fork) = self.find_file_by_id(file_id).ok_or_else(|| {
+            FilesystemError::NotFound(format!("file id {file_id} not found in catalog"))
+        })?;
+        if rsrc_fork.logical_size == 0 {
+            return Ok(0);
+        }
+        let data = read_fork(
+            &mut self.reader,
+            self.partition_offset,
+            self.vh.block_size,
+            &rsrc_fork,
+        )?;
+        writer.write_all(&data)?;
+        Ok(data.len() as u64)
+    }
+
+    fn resource_fork_size(&mut self, entry: &FileEntry) -> u64 {
+        let file_id = entry.location as u32;
+        self.find_file_by_id(file_id)
+            .map(|(_d, r)| r.logical_size)
+            .unwrap_or(0)
     }
 }
 
