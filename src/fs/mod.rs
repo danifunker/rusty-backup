@@ -254,6 +254,20 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
                 _ => None,
             }
         }
+        // Apple HFS/HFS+ on MBR disks
+        0xAF => {
+            let (fs_type, hfsplus_offset) = resolve_apple_hfs(&mut reader, partition_offset);
+            match fs_type {
+                "hfsplus" => {
+                    let (compact, info) = CompactHfsPlusReader::new(reader, hfsplus_offset).ok()?;
+                    Some((Box::new(compact), info))
+                }
+                _ => {
+                    let (compact, info) = CompactHfsReader::new(reader, partition_offset).ok()?;
+                    Some((Box::new(compact), info))
+                }
+            }
+        }
         _ => None,
     }
 }
@@ -379,6 +393,20 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                 _ => Err(FilesystemError::Unsupported(
                     "type 0x83 partition: unrecognized Linux filesystem".into(),
                 )),
+            }
+        }
+        // Apple HFS/HFS+ on MBR disks
+        0xAF => {
+            let (fs_type, hfsplus_offset) = resolve_apple_hfs(&mut reader, partition_offset);
+            match fs_type {
+                "hfsplus" => Ok(Box::new(hfsplus::HfsPlusFilesystem::open(
+                    reader,
+                    hfsplus_offset,
+                )?)),
+                _ => Ok(Box::new(hfs::HfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
             }
         }
         _ => Err(FilesystemError::Unsupported(format!(
