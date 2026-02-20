@@ -412,7 +412,9 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
             reader,
             partition_offset,
         )?)),
-        "Apple_UNIX_SRVR2" => {
+        // "Apple_UNIX_SVR2" is the standard APM type for Unix partitions (System V R2).
+        // Some tools also write "Apple_UNIX_SRVR2"; handle both.
+        "Apple_UNIX_SVR2" | "Apple_UNIX_SRVR2" => {
             let fs_type = detect_filesystem_type(&mut reader, partition_offset);
             match fs_type {
                 "ext" => Ok(Box::new(ext::ExtFilesystem::open(
@@ -424,7 +426,7 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
                     partition_offset,
                 )?)),
                 _ => Err(FilesystemError::Unsupported(format!(
-                    "Apple_UNIX_SRVR2 partition: unrecognized filesystem (detected: {fs_type})"
+                    "{type_str} partition: unrecognized filesystem (detected: {fs_type})"
                 ))),
             }
         }
@@ -459,7 +461,7 @@ fn compact_partition_reader_by_string<R: Read + Seek + Send + 'static>(
             let (compact, info) = CompactHfsPlusReader::new(reader, partition_offset).ok()?;
             Some((Box::new(compact), info))
         }
-        "Apple_UNIX_SRVR2" => {
+        "Apple_UNIX_SVR2" | "Apple_UNIX_SRVR2" => {
             let fs_type = detect_filesystem_type(&mut reader, partition_offset);
             match fs_type {
                 "ext" => {

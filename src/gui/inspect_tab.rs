@@ -2163,7 +2163,7 @@ fn is_browsable_type(ptype: u8) -> bool {
 fn is_browsable_type_string(type_str: Option<&str>) -> bool {
     matches!(
         type_str,
-        Some("Apple_HFS" | "Apple_HFSX" | "Apple_HFS+" | "Apple_UNIX_SRVR2")
+        Some("Apple_HFS" | "Apple_HFSX" | "Apple_HFS+" | "Apple_UNIX_SVR2" | "Apple_UNIX_SRVR2")
     )
 }
 
