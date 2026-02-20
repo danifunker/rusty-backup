@@ -217,8 +217,27 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
     }
 
     let alignment = partition::detect_alignment(&table);
-    let partitions = table.partitions();
+    let mut partitions = table.partitions();
     let is_superfloppy = matches!(table, PartitionTable::None { .. });
+
+    // For APM disks, probe "Apple_HFS" partitions to detect the actual HFS variant
+    // (native HFS vs native HFS+ vs embedded HFS+) and update the type_name accordingly.
+    if matches!(table, PartitionTable::Apm(_)) {
+        for part in &mut partitions {
+            if part.partition_type_string.as_deref() == Some("Apple_HFS") {
+                let part_offset = part.start_lba * 512;
+                if let Ok(clone) = source.get_ref().try_clone() {
+                    let mut br = std::io::BufReader::new(clone);
+                    let detected = fs::probe_apple_hfs_type(&mut br, part_offset);
+                    if detected == "HFS+" || detected == "HFSX" {
+                        part.type_name = part
+                            .type_name
+                            .replace("Apple_HFS", &format!("Apple_HFS ({detected})"));
+                    }
+                }
+            }
+        }
+    }
 
     if is_superfloppy {
         log(

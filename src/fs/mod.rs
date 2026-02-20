@@ -396,23 +396,38 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
 ) -> Result<Box<dyn Filesystem>, FilesystemError> {
     match type_str {
         "Apple_HFS" => {
-            // Check if this is an HFS wrapper around an embedded HFS+ volume
-            if detect_embedded_hfs_plus(&mut reader, partition_offset) {
-                Ok(Box::new(hfsplus::HfsPlusFilesystem::open(
+            let (fs_type, hfsplus_offset) = resolve_apple_hfs(&mut reader, partition_offset);
+            match fs_type {
+                "hfsplus" => Ok(Box::new(hfsplus::HfsPlusFilesystem::open(
+                    reader,
+                    hfsplus_offset,
+                )?)),
+                _ => Ok(Box::new(hfs::HfsFilesystem::open(
                     reader,
                     partition_offset,
-                )?))
-            } else {
-                Ok(Box::new(hfs::HfsFilesystem::open(
-                    reader,
-                    partition_offset,
-                )?))
+                )?)),
             }
         }
         "Apple_HFSX" | "Apple_HFS+" => Ok(Box::new(hfsplus::HfsPlusFilesystem::open(
             reader,
             partition_offset,
         )?)),
+        "Apple_UNIX_SRVR2" => {
+            let fs_type = detect_filesystem_type(&mut reader, partition_offset);
+            match fs_type {
+                "ext" => Ok(Box::new(ext::ExtFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "btrfs" => Ok(Box::new(btrfs::BtrfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                _ => Err(FilesystemError::Unsupported(format!(
+                    "Apple_UNIX_SRVR2 partition: unrecognized filesystem (detected: {fs_type})"
+                ))),
+            }
+        }
         _ => Err(FilesystemError::Unsupported(format!(
             "APM partition type '{}' not supported for browsing",
             type_str
@@ -428,40 +443,108 @@ fn compact_partition_reader_by_string<R: Read + Seek + Send + 'static>(
 ) -> Option<(Box<dyn Read + Send>, CompactResult)> {
     match type_str {
         "Apple_HFS" => {
-            if detect_embedded_hfs_plus(&mut reader, partition_offset) {
-                let (compact, info) = CompactHfsPlusReader::new(reader, partition_offset).ok()?;
-                Some((Box::new(compact), info))
-            } else {
-                let (compact, info) = CompactHfsReader::new(reader, partition_offset).ok()?;
-                Some((Box::new(compact), info))
+            let (fs_type, hfsplus_offset) = resolve_apple_hfs(&mut reader, partition_offset);
+            match fs_type {
+                "hfsplus" => {
+                    let (compact, info) = CompactHfsPlusReader::new(reader, hfsplus_offset).ok()?;
+                    Some((Box::new(compact), info))
+                }
+                _ => {
+                    let (compact, info) = CompactHfsReader::new(reader, partition_offset).ok()?;
+                    Some((Box::new(compact), info))
+                }
             }
         }
         "Apple_HFSX" | "Apple_HFS+" => {
             let (compact, info) = CompactHfsPlusReader::new(reader, partition_offset).ok()?;
             Some((Box::new(compact), info))
         }
+        "Apple_UNIX_SRVR2" => {
+            let fs_type = detect_filesystem_type(&mut reader, partition_offset);
+            match fs_type {
+                "ext" => {
+                    let (compact, info) = CompactExtReader::new(reader, partition_offset).ok()?;
+                    Some((Box::new(compact), info))
+                }
+                "btrfs" => {
+                    let (compact, info) = CompactBtrfsReader::new(reader, partition_offset).ok()?;
+                    Some((Box::new(compact), info))
+                }
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
 
-/// Detect whether an Apple_HFS partition contains an embedded HFS+ volume.
-/// Reads the MDB signature at offset+1024 and checks offset 124 for the
-/// HFS+ embedded signature (0x482B).
-fn detect_embedded_hfs_plus<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> bool {
+/// Resolve the actual HFS filesystem variant for an "Apple_HFS" APM partition.
+///
+/// Returns `(fs_type, hfsplus_offset)` where `fs_type` is `"hfs"`, `"hfsplus"`,
+/// or `"unknown"`, and `hfsplus_offset` is the partition_offset to pass to
+/// `HfsPlusFilesystem::open` (accounts for the embedded volume's position).
+///
+/// Three cases are handled:
+/// - Native HFS+ (0x482B/0x4858 at partition_offset+1024): `hfsplus_offset == partition_offset`.
+/// - Embedded HFS+ (HFS wrapper with 0x4244 MDB, drEmbedSigWord == 0x482B): `hfsplus_offset`
+///   is calculated from the MDB's drAlBlSt/drAlBlkSiz/drEmbedExtent fields.
+/// - Pure HFS (0x4244, no embedded HFS+): returns `"hfs"`.
+fn resolve_apple_hfs<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> (&'static str, u64) {
     if reader
         .seek(SeekFrom::Start(partition_offset + 1024))
         .is_err()
     {
-        return false;
+        return ("unknown", partition_offset);
     }
-    let mut buf = [0u8; 130];
+    let mut buf = [0u8; 162];
     if reader.read_exact(&mut buf).is_err() {
-        return false;
+        return ("unknown", partition_offset);
     }
     let sig = u16::from_be_bytes([buf[0], buf[1]]);
-    if sig != 0x4244 {
-        return false; // Not HFS
+    match sig {
+        0x4244 => {
+            // HFS MDB — check for embedded HFS+ (drEmbedSigWord at MDB offset 124)
+            let embedded_sig = u16::from_be_bytes([buf[124], buf[125]]);
+            if embedded_sig == 0x482B {
+                // Embedded HFS+: calculate the embedded volume's starting offset.
+                // drAlBlkSiz (allocation block size, bytes) at MDB offset 20 (u32 BE).
+                // drAlBlSt (first alloc block in 512-byte sectors) at MDB offset 28 (u16 BE).
+                // drEmbedExtent.startBlock at MDB offset 126 (u16 BE).
+                let block_size = u32::from_be_bytes([buf[20], buf[21], buf[22], buf[23]]) as u64;
+                let first_alloc_block = u16::from_be_bytes([buf[28], buf[29]]) as u64;
+                let embedded_start = u16::from_be_bytes([buf[126], buf[127]]) as u64;
+                // HFS+ volume starts at: partition_offset + drAlBlSt*512 + startBlock*drAlBlkSiz
+                let hfsplus_offset =
+                    partition_offset + first_alloc_block * 512 + embedded_start * block_size;
+                ("hfsplus", hfsplus_offset)
+            } else {
+                ("hfs", partition_offset)
+            }
+        }
+        // Native HFS+ or HFSX — volume header is directly at partition_offset+1024
+        0x482B | 0x4858 => ("hfsplus", partition_offset),
+        _ => ("unknown", partition_offset),
     }
-    let embedded_sig = u16::from_be_bytes([buf[124], buf[125]]);
-    embedded_sig == 0x482B
+}
+
+/// Probe an "Apple_HFS" APM partition to detect the actual filesystem type.
+///
+/// Returns `"HFS+"`, `"HFSX"`, `"HFS"`, or `"unknown"`. Useful for updating
+/// display names after partition table detection.
+pub fn probe_apple_hfs_type<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> &'static str {
+    let (fs_type, hfsplus_offset) = resolve_apple_hfs(reader, partition_offset);
+    match fs_type {
+        "hfsplus" => {
+            // Distinguish HFS+ from HFSX by reading the volume header signature
+            if reader.seek(SeekFrom::Start(hfsplus_offset + 1024)).is_ok() {
+                let mut sig_buf = [0u8; 2];
+                if reader.read_exact(&mut sig_buf).is_ok() && u16::from_be_bytes(sig_buf) == 0x4858
+                {
+                    return "HFSX";
+                }
+            }
+            "HFS+"
+        }
+        "hfs" => "HFS",
+        _ => "unknown",
+    }
 }

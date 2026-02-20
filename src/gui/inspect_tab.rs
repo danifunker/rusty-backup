@@ -1270,6 +1270,27 @@ impl InspectTab {
                         }
                         let alignment = detect_alignment(&table);
                         self.partitions = table.partitions();
+
+                        // For APM disks, probe "Apple_HFS" partitions to show the actual
+                        // HFS variant (HFS vs HFS+ vs HFSX) in the type name.
+                        if matches!(table, PartitionTable::Apm(_)) {
+                            for part in &mut self.partitions {
+                                if part.partition_type_string.as_deref() == Some("Apple_HFS") {
+                                    if let Ok(f) = File::open(&path) {
+                                        let mut br = BufReader::new(f);
+                                        let detected =
+                                            fs::probe_apple_hfs_type(&mut br, part.start_lba * 512);
+                                        if detected == "HFS+" || detected == "HFSX" {
+                                            part.type_name = part.type_name.replace(
+                                                "Apple_HFS",
+                                                &format!("Apple_HFS ({detected})"),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         if matches!(table, PartitionTable::None { .. }) {
                             log.info(format!(
                                 "Detected superfloppy (no partition table) with {} partition(s)",
@@ -2049,9 +2070,32 @@ impl InspectTab {
     }
 }
 
+/// A `Read` wrapper that counts bytes consumed from the inner reader.
+///
+/// Used to track how many compressed bytes have been read from the input zstd
+/// file, so that progress can be reported as a fraction of the compressed size
+/// rather than the (much larger) decompressed size.
+struct CountingRead<R> {
+    inner: R,
+    count: Arc<Mutex<u64>>,
+}
+
+impl<R: Read> Read for CountingRead<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if let Ok(mut c) = self.count.lock() {
+            *c += n as u64;
+        }
+        Ok(n)
+    }
+}
+
 /// Create a seekable zstd cache from a native zstd-compressed backup file.
 ///
 /// Streams: zstd file → zstd decompress → zeekstd encode → cache file.
+///
+/// Progress (`status.current_bytes`) tracks compressed input bytes consumed so
+/// that the fraction `current_bytes / total_bytes` stays in [0, 1].
 fn create_seekable_cache_from_zstd(
     data_path: &PathBuf,
     cache_path: &PathBuf,
@@ -2061,8 +2105,15 @@ fn create_seekable_cache_from_zstd(
 
     let input_file =
         File::open(data_path).with_context(|| format!("failed to open {}", data_path.display()))?;
-    let mut decoder =
-        zstd::Decoder::new(BufReader::new(input_file)).context("failed to create zstd decoder")?;
+
+    // Wrap the compressed input in a counting reader so we can track how many
+    // compressed bytes have been consumed for accurate progress reporting.
+    let compressed_count = Arc::new(Mutex::new(0u64));
+    let counting = CountingRead {
+        inner: BufReader::new(input_file),
+        count: Arc::clone(&compressed_count),
+    };
+    let mut decoder = zstd::Decoder::new(counting).context("failed to create zstd decoder")?;
 
     let output_file = File::create(cache_path)
         .with_context(|| format!("failed to create cache file: {}", cache_path.display()))?;
@@ -2075,7 +2126,6 @@ fn create_seekable_cache_from_zstd(
         .map_err(|e| anyhow::anyhow!("failed to create zeekstd encoder: {e}"))?;
 
     let mut buf = vec![0u8; 256 * 1024];
-    let mut total_read: u64 = 0;
 
     loop {
         let n = decoder.read(&mut buf)?;
@@ -2085,10 +2135,12 @@ fn create_seekable_cache_from_zstd(
         encoder
             .compress(&buf[..n])
             .map_err(|e| anyhow::anyhow!("zeekstd compress error: {e}"))?;
-        total_read += n as u64;
 
-        if let Ok(mut s) = status.lock() {
-            s.current_bytes = total_read;
+        // Update progress with compressed bytes consumed (stays within [0, total_bytes])
+        if let Ok(compressed) = compressed_count.lock() {
+            if let Ok(mut s) = status.lock() {
+                s.current_bytes = *compressed;
+            }
         }
     }
 
@@ -2109,7 +2161,10 @@ fn is_browsable_type(ptype: u8) -> bool {
 
 /// Check if an APM partition type string corresponds to a browsable filesystem.
 fn is_browsable_type_string(type_str: Option<&str>) -> bool {
-    matches!(type_str, Some("Apple_HFS" | "Apple_HFSX" | "Apple_HFS+"))
+    matches!(
+        type_str,
+        Some("Apple_HFS" | "Apple_HFSX" | "Apple_HFS+" | "Apple_UNIX_SRVR2")
+    )
 }
 
 /// Check if a superfloppy (type byte 0) has a browsable filesystem hint.
