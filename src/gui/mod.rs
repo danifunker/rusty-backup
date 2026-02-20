@@ -62,6 +62,24 @@ pub struct RustyBackupApp {
     loaded_backup_folder: Option<PathBuf>,
 }
 
+impl RustyBackupApp {
+    pub fn new(cc: &eframe::CreationContext) -> Self {
+        let mut app = Self::default();
+
+        #[cfg(feature = "glow")]
+        if cc.gl.is_some() {
+            app.log_panel.info("Graphics backend: OpenGL (glow)");
+        }
+
+        #[cfg(feature = "wgpu")]
+        if cc.wgpu_render_state.is_some() {
+            app.log_panel.info("Graphics backend: WGPU");
+        }
+
+        app
+    }
+}
+
 impl Default for RustyBackupApp {
     fn default() -> Self {
         let mut log = LogPanel::default();

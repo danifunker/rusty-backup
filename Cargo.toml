@@ -15,10 +15,12 @@ name = "rusty-backup"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["glow"]
+glow = ["eframe/glow"]
+wgpu = ["eframe/wgpu"]
 
 [dependencies]
-eframe = "0.33"
+eframe = { version = "0.33", default-features = false, features = ["accesskit", "default_fonts", "wayland", "web_screen_reader", "x11"] }
 egui = "0.33"
 rfd = "0.15"
 anyhow = "1"

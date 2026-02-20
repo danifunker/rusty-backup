@@ -68,12 +68,16 @@ fn main() -> eframe::Result {
             .with_inner_size([900.0, 700.0])
             .with_min_inner_size([600.0, 400.0])
             .with_icon(icon_data),
+        #[cfg(all(feature = "wgpu", not(feature = "glow")))]
+        renderer: eframe::Renderer::Wgpu,
+        #[cfg(all(feature = "glow", not(feature = "wgpu")))]
+        renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
 
     eframe::run_native(
         "Rusty Backup",
         options,
-        Box::new(|_cc| Ok(Box::new(gui::RustyBackupApp::default()))),
+        Box::new(|cc| Ok(Box::new(gui::RustyBackupApp::new(cc)))),
     )
 }
