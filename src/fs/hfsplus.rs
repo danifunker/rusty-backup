@@ -766,10 +766,21 @@ impl<R: Read + Seek> CompactHfsPlusReader<R> {
         partition_offset: u64,
     ) -> Result<(Self, CompactResult), FilesystemError> {
         // Read volume header
+        eprintln!(
+            "[HFS+ compact] seeking to VH at offset {}",
+            partition_offset + 1024
+        );
         reader.seek(SeekFrom::Start(partition_offset + 1024))?;
         let mut vh_buf = [0u8; 512];
         reader.read_exact(&mut vh_buf)?;
         let vh = HfsPlusVolumeHeader::parse(&vh_buf)?;
+        eprintln!(
+            "[HFS+ compact] VH ok: block_size={}, total_blocks={}, alloc_file extents[0]=(start={}, count={})",
+            vh.block_size,
+            vh.total_blocks,
+            vh.allocation_file.extents[0].start_block,
+            vh.allocation_file.extents[0].block_count,
+        );
 
         // Read allocation file
         let alloc_data = read_fork(
@@ -777,7 +788,15 @@ impl<R: Read + Seek> CompactHfsPlusReader<R> {
             partition_offset,
             vh.block_size,
             &vh.allocation_file,
-        )?;
+        )
+        .map_err(|e| {
+            eprintln!("[HFS+ compact] read_fork(alloc_file) failed: {e}");
+            e
+        })?;
+        eprintln!(
+            "[HFS+ compact] allocation bitmap read: {} bytes",
+            alloc_data.len()
+        );
 
         // Count allocated blocks
         let mut allocated = 0u32;
@@ -788,11 +807,21 @@ impl<R: Read + Seek> CompactHfsPlusReader<R> {
                 allocated += 1;
             }
         }
+        eprintln!(
+            "[HFS+ compact] allocated={} / {} total blocks ({} free)",
+            allocated,
+            vh.total_blocks,
+            vh.total_blocks - allocated,
+        );
 
         let original_size = vh.total_blocks as u64 * vh.block_size as u64;
         // Layout-preserving: output size equals the original partition size.
         // Unallocated blocks are zeroed, so they compress extremely well.
         let compacted_size = original_size;
+        eprintln!(
+            "[HFS+ compact] compacted_size={} original_size={} (layout-preserving; free blocks → zeros)",
+            compacted_size, original_size
+        );
 
         let result = CompactResult {
             original_size,

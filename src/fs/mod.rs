@@ -135,6 +135,37 @@ fn detect_0x07_type<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> &'
     }
 }
 
+/// Like `compact_partition_reader` but returns a `Result` with a diagnostic
+/// error string so callers can log why compaction was unavailable.
+///
+/// Distinguishes between:
+/// - `Ok((reader, result))` — compaction succeeded
+/// - `Err(msg)` — the type is supported but the reader constructor failed (e.g.
+///   bad superblock); the message explains the failure
+/// - `Err("unsupported: ...")` — the filesystem type has no compact reader
+pub fn try_compact_partition_reader<R: Read + Seek + Send + 'static>(
+    mut reader: R,
+    partition_offset: u64,
+    partition_type: u8,
+    partition_type_string: Option<&str>,
+) -> Result<(Box<dyn Read + Send>, CompactResult), String> {
+    if let Some(type_str) = partition_type_string {
+        return compact_partition_reader_by_string(reader, partition_offset, type_str).and_then(
+            |opt| {
+                opt.ok_or_else(|| {
+                    format!("unsupported: APM type '{type_str}' has no compact reader")
+                })
+            },
+        );
+    }
+    compact_partition_reader(reader, partition_offset, partition_type, None).ok_or_else(|| {
+        format!(
+            "unsupported: no compact reader for MBR type 0x{partition_type:02X} \
+             at offset {partition_offset}"
+        )
+    })
+}
+
 /// Try to create a compacted reader for a partition.
 ///
 /// Returns `None` for unsupported filesystem types. On success, returns a
@@ -147,7 +178,8 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
 ) -> Option<(Box<dyn Read + Send>, CompactResult)> {
     // Check string-based type first (APM partitions)
     if let Some(type_str) = partition_type_string {
-        return compact_partition_reader_by_string(reader, partition_offset, type_str);
+        return compact_partition_reader_by_string(reader, partition_offset, type_str)
+            .unwrap_or(None);
     }
     match partition_type {
         // Auto-detect (superfloppy / type byte 0)
@@ -466,44 +498,69 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
 }
 
 /// Try to create a compacted reader by APM partition type string.
+/// Returns `Ok(None)` when the type is unsupported, `Ok(Some(...))` on success,
+/// and `Err(msg)` when the type is recognised but the reader constructor fails.
 fn compact_partition_reader_by_string<R: Read + Seek + Send + 'static>(
     mut reader: R,
     partition_offset: u64,
     type_str: &str,
-) -> Option<(Box<dyn Read + Send>, CompactResult)> {
+) -> Result<Option<(Box<dyn Read + Send>, CompactResult)>, String> {
     match type_str {
         "Apple_HFS" => {
             let (fs_type, hfsplus_offset) = resolve_apple_hfs(&mut reader, partition_offset);
             match fs_type {
                 "hfsplus" => {
-                    let (compact, info) = CompactHfsPlusReader::new(reader, hfsplus_offset).ok()?;
-                    Some((Box::new(compact), info))
+                    let (compact, info) = CompactHfsPlusReader::new(reader, hfsplus_offset)
+                        .map_err(|e| {
+                            format!(
+                                "CompactHfsPlusReader::new failed at offset {hfsplus_offset}: {e}"
+                            )
+                        })?;
+                    Ok(Some((Box::new(compact), info)))
                 }
                 _ => {
-                    let (compact, info) = CompactHfsReader::new(reader, partition_offset).ok()?;
-                    Some((Box::new(compact), info))
+                    let (compact, info) =
+                        CompactHfsReader::new(reader, partition_offset).map_err(|e| {
+                            format!(
+                                "CompactHfsReader::new failed at offset {partition_offset}: {e}"
+                            )
+                        })?;
+                    Ok(Some((Box::new(compact), info)))
                 }
             }
         }
         "Apple_HFSX" | "Apple_HFS+" => {
-            let (compact, info) = CompactHfsPlusReader::new(reader, partition_offset).ok()?;
-            Some((Box::new(compact), info))
+            let (compact, info) =
+                CompactHfsPlusReader::new(reader, partition_offset).map_err(|e| {
+                    format!("CompactHfsPlusReader::new failed at offset {partition_offset}: {e}")
+                })?;
+            Ok(Some((Box::new(compact), info)))
         }
         "Apple_UNIX_SVR2" | "Apple_UNIX_SRVR2" => {
             let fs_type = detect_filesystem_type(&mut reader, partition_offset);
             match fs_type {
                 "ext" => {
-                    let (compact, info) = CompactExtReader::new(reader, partition_offset).ok()?;
-                    Some((Box::new(compact), info))
+                    let (compact, info) =
+                        CompactExtReader::new(reader, partition_offset).map_err(|e| {
+                            format!(
+                                "CompactExtReader::new failed at offset {partition_offset}: {e}"
+                            )
+                        })?;
+                    Ok(Some((Box::new(compact), info)))
                 }
                 "btrfs" => {
-                    let (compact, info) = CompactBtrfsReader::new(reader, partition_offset).ok()?;
-                    Some((Box::new(compact), info))
+                    let (compact, info) = CompactBtrfsReader::new(reader, partition_offset)
+                        .map_err(|e| {
+                            format!(
+                                "CompactBtrfsReader::new failed at offset {partition_offset}: {e}"
+                            )
+                        })?;
+                    Ok(Some((Box::new(compact), info)))
                 }
-                _ => None,
+                _ => Ok(None),
             }
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 

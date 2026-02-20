@@ -418,17 +418,60 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 ),
             );
         }
-        let compact_result = clone_result
-            .ok()
-            .and_then(|clone| {
-                fs::compact_partition_reader(
+        let compact_result = match clone_result {
+            Err(_) => None, // already warned above
+            Ok(clone) => {
+                match fs::try_compact_partition_reader(
                     BufReader::new(clone),
                     part_offset,
                     part.partition_type_byte,
                     part.partition_type_string.as_deref(),
-                )
-            })
-            .map(|(_, result)| result);
+                ) {
+                    Ok((_, result)) => {
+                        log(
+                            &progress,
+                            LogLevel::Info,
+                            format!(
+                                "Compact analysis (partition-{}): {} allocated clusters, \
+                                 compacted={} original={} mode={}",
+                                part.index,
+                                result.clusters_used,
+                                partition::format_size(result.compacted_size),
+                                partition::format_size(result.original_size),
+                                if result.compacted_size == result.original_size {
+                                    "layout-preserving (free blocks → zeros)"
+                                } else {
+                                    "packed"
+                                },
+                            ),
+                        );
+                        Some(result)
+                    }
+                    Err(ref msg) if msg.starts_with("unsupported:") => {
+                        log(
+                            &progress,
+                            LogLevel::Info,
+                            format!(
+                                "Compact reader not available for partition-{} ({}): {msg}",
+                                part.index, part.type_name,
+                            ),
+                        );
+                        None
+                    }
+                    Err(ref msg) => {
+                        log(
+                            &progress,
+                            LogLevel::Warning,
+                            format!(
+                                "Compact reader failed for partition-{} ({}): {msg}",
+                                part.index, part.type_name,
+                            ),
+                        );
+                        None
+                    }
+                }
+            }
+        };
 
         if let Some(ref result) = compact_result {
             effective_sizes.push(result.compacted_size);
