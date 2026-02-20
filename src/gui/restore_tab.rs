@@ -569,11 +569,17 @@ impl RestoreTab {
 
         // Build partition configs
         for pm in &metadata.partitions {
-            let minimum = if pm.imaged_size_bytes > 0 {
-                pm.imaged_size_bytes
-            } else {
-                pm.original_size_bytes
-            };
+            // Prefer explicit minimum_size_bytes (computed at backup time via
+            // last_data_byte). Fall back to imaged_size_bytes for older backups
+            // that used packed compaction (where imaged < original), and finally
+            // original_size_bytes when no sizing hint is available.
+            let minimum = pm.minimum_size_bytes.filter(|&s| s > 0).unwrap_or_else(|| {
+                if pm.imaged_size_bytes > 0 {
+                    pm.imaged_size_bytes
+                } else {
+                    pm.original_size_bytes
+                }
+            });
 
             self.partition_configs.push(RestorePartitionConfig {
                 index: pm.index,

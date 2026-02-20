@@ -1655,7 +1655,20 @@ impl InspectTab {
                                     m.partitions
                                         .iter()
                                         .find(|pm| pm.index == part.index)
-                                        .map(|pm| pm.imaged_size_bytes)
+                                        .and_then(|pm| {
+                                            // Prefer explicit minimum_size_bytes (computed at
+                                            // backup time); fall back to imaged_size_bytes for
+                                            // older backups that lack the field.
+                                            pm.minimum_size_bytes.or_else(|| {
+                                                if pm.imaged_size_bytes > 0
+                                                    && pm.imaged_size_bytes < pm.original_size_bytes
+                                                {
+                                                    Some(pm.imaged_size_bytes)
+                                                } else {
+                                                    None
+                                                }
+                                            })
+                                        })
                                 })
                                 .filter(|&sz| sz > 0 && sz < part.size_bytes)
                                 .or_else(|| {

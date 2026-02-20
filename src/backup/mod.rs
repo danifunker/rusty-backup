@@ -378,8 +378,11 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
     // Pre-compute effective sizes for each partition.
     // compact_sizes[i] is Some(compacted_size) if compaction is available for
     // partition i, or None if we should fall back to trimming.
+    // minimum_sizes[i] is the true filesystem minimum (last_data_byte result),
+    // stored in metadata so the UI can offer shrink-to-minimum restore.
     let mut effective_sizes: Vec<u64> = Vec::with_capacity(partitions.len());
     let mut compact_sizes: Vec<Option<u64>> = Vec::with_capacity(partitions.len());
+    let mut minimum_sizes: Vec<Option<u64>> = Vec::with_capacity(partitions.len());
 
     for part in partitions.iter() {
         log(
@@ -393,6 +396,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         if config.sector_by_sector || part.is_extended_container || is_superfloppy {
             effective_sizes.push(part.size_bytes);
             compact_sizes.push(None);
+            minimum_sizes.push(None);
             continue;
         }
 
@@ -429,6 +433,27 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         if let Some(ref result) = compact_result {
             effective_sizes.push(result.compacted_size);
             compact_sizes.push(Some(result.compacted_size));
+            // For packed compaction (FAT/NTFS/exFAT), compacted_size is already
+            // the minimum. For layout-preserving compaction (HFS/HFS+/ext/btrfs),
+            // compacted_size == original_size, so we need a separate minimum.
+            let minimum = if result.compacted_size < part.size_bytes {
+                Some(result.compacted_size)
+            } else {
+                source
+                    .get_ref()
+                    .try_clone()
+                    .ok()
+                    .and_then(|clone| {
+                        fs::effective_partition_size(
+                            BufReader::new(clone),
+                            part_offset,
+                            part.partition_type_byte,
+                            part.partition_type_string.as_deref(),
+                        )
+                    })
+                    .map(|min| min.min(part.size_bytes))
+            };
+            minimum_sizes.push(minimum);
         } else {
             // Fall back to trim-based sizing
             let effective = source
@@ -446,6 +471,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 .map(|data_end| data_end.min(part.size_bytes));
             effective_sizes.push(effective.unwrap_or(part.size_bytes));
             compact_sizes.push(None);
+            minimum_sizes.push(effective);
         }
     }
 
@@ -774,6 +800,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             ),
         );
 
+        let minimum_size = minimum_sizes[part_idx].filter(|&s| s < part.size_bytes);
         partition_metadata.push(PartitionMetadata {
             index: part.index,
             type_name: part.type_name.clone(),
@@ -787,6 +814,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             compacted: is_compacted,
             is_logical: part.is_logical,
             partition_type_string: part.partition_type_string.clone(),
+            minimum_size_bytes: minimum_size,
         });
     }
 

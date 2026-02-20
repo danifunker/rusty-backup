@@ -52,6 +52,12 @@ pub struct PartitionMetadata {
     /// APM partition type string (e.g. "Apple_HFS"). None for MBR/GPT.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partition_type_string: Option<String>,
+    /// Minimum bytes needed to hold the filesystem data (from `last_data_byte`).
+    /// Populated during backup for all supported filesystem types.
+    /// Used to offer shrink-to-minimum restore when `imaged_size_bytes` equals
+    /// `original_size_bytes` (layout-preserving or sector-by-sector backups).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_size_bytes: Option<u64>,
 }
 
 /// Partition alignment information for the backup.
@@ -123,6 +129,7 @@ mod tests {
                 compacted: false,
                 is_logical: false,
                 partition_type_string: None,
+                minimum_size_bytes: Some(480_000_000),
             }],
             bad_sectors: vec![],
             extended_container: None,

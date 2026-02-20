@@ -653,29 +653,30 @@ fn find_last_set_bit(bitmap: &[u8], max_bits: u32) -> Option<u32> {
     last
 }
 
-/// Compact reader for classic HFS: streams boot sectors + MDB + allocated blocks.
+/// Compact reader for classic HFS: layout-preserving image with zeros for free blocks.
+///
+/// Outputs the full pre-allocation region (boot blocks + MDB + volume bitmap,
+/// `first_alloc_block * 512` bytes) followed by all allocation blocks in order,
+/// with free blocks replaced by zeros. This preserves the original block layout:
+/// allocation block N is always at byte offset `first_alloc_block*512 + N*block_size`,
+/// enabling correct filesystem browsing and reliable restore.
 pub struct CompactHfsReader<R: Read + Seek> {
     reader: R,
     partition_offset: u64,
     mdb: HfsMasterDirectoryBlock,
     bitmap: Vec<u8>,
-    /// Current phase: 0=boot region, 1=allocated blocks, 2=done
+    /// Current phase: 0=pre-alloc region, 1=allocation blocks, 2=done.
     phase: u8,
-    /// Position within current phase
-    phase_pos: u64,
-    /// Current allocation block index
+    /// Byte position within the pre-alloc region (phase 0).
+    pre_alloc_pos: u64,
+    /// Current allocation block index (phase 1).
     current_block: u32,
-    /// Total compacted size (precomputed)
-    #[allow(dead_code)]
-    compacted_size: u64,
-    /// Original partition size
+    /// Byte position within the current allocation block (phase 1).
+    block_pos: u64,
     #[allow(dead_code)]
     original_size: u64,
-    /// Number of allocated blocks
     #[allow(dead_code)]
     allocated_blocks: u32,
-    /// Size of boot region in bytes (sectors 0-2 + MDB)
-    boot_region_size: u64,
 }
 
 impl<R: Read + Seek> CompactHfsReader<R> {
@@ -712,11 +713,12 @@ impl<R: Read + Seek> CompactHfsReader<R> {
             }
         }
 
-        // Boot region: first 3 sectors (boot blocks at 0-1, MDB at sector 2)
-        let boot_region_size = 3 * 512;
-        let original_size =
-            mdb.total_blocks as u64 * mdb.block_size as u64 + mdb.first_alloc_block as u64 * 512;
-        let compacted_size = boot_region_size + allocated as u64 * mdb.block_size as u64;
+        // Full partition data: pre-alloc region + all allocation blocks.
+        let pre_alloc_size = mdb.first_alloc_block as u64 * 512;
+        let original_size = pre_alloc_size + mdb.total_blocks as u64 * mdb.block_size as u64;
+        // Layout-preserving: compacted_size == original_size.
+        // Free allocation blocks are zeroed, so they compress extremely well.
+        let compacted_size = original_size;
 
         let result = CompactResult {
             original_size,
@@ -731,12 +733,11 @@ impl<R: Read + Seek> CompactHfsReader<R> {
                 mdb,
                 bitmap,
                 phase: 0,
-                phase_pos: 0,
+                pre_alloc_pos: 0,
                 current_block: 0,
-                compacted_size,
+                block_pos: 0,
                 original_size,
                 allocated_blocks: allocated,
-                boot_region_size,
             },
             result,
         ))
@@ -756,52 +757,54 @@ impl<R: Read + Seek> Read for CompactHfsReader<R> {
         }
 
         if self.phase == 0 {
-            // Boot region: sectors 0-2
-            let remaining = self.boot_region_size - self.phase_pos;
+            // Phase 0: pre-alloc region (boot blocks, MDB, volume bitmap).
+            // Covers sectors 0..first_alloc_block — always preserved verbatim.
+            let pre_alloc_size = self.mdb.first_alloc_block as u64 * 512;
+            let remaining = pre_alloc_size - self.pre_alloc_pos;
             if remaining == 0 {
                 self.phase = 1;
-                self.phase_pos = 0;
-                self.current_block = 0;
                 return self.read(buf);
             }
             let to_read = (remaining as usize).min(buf.len());
-            let offset = self.partition_offset + self.phase_pos;
+            let offset = self.partition_offset + self.pre_alloc_pos;
             self.reader
                 .seek(SeekFrom::Start(offset))
                 .map_err(std::io::Error::other)?;
             let n = self.reader.read(&mut buf[..to_read])?;
-            self.phase_pos += n as u64;
+            self.pre_alloc_pos += n as u64;
             return Ok(n);
         }
 
-        // Phase 1: allocated blocks
-        let block_size = self.mdb.block_size as u64;
+        // Phase 1: allocation blocks 0..total_blocks.
+        // Allocated blocks → real data; free blocks → zeros.
         let total_blocks = self.mdb.total_blocks as u32;
-
-        // Find next allocated block
-        while self.current_block < total_blocks && !self.is_block_allocated(self.current_block) {
-            self.current_block += 1;
-        }
         if self.current_block >= total_blocks {
             self.phase = 2;
             return Ok(0);
         }
 
-        // Read from current allocated block
-        let block_offset = self.partition_offset
-            + self.mdb.first_alloc_block as u64 * 512
-            + self.current_block as u64 * block_size;
-        let offset_in_block = self.phase_pos % block_size;
-        let remaining_in_block = block_size - offset_in_block;
+        let block_size = self.mdb.block_size as u64;
+        let remaining_in_block = block_size - self.block_pos;
         let to_read = (remaining_in_block as usize).min(buf.len());
 
-        self.reader
-            .seek(SeekFrom::Start(block_offset + offset_in_block))?;
-        let n = self.reader.read(&mut buf[..to_read])?;
-        self.phase_pos += n as u64;
+        let n = if self.is_block_allocated(self.current_block) {
+            let offset = self.partition_offset
+                + self.mdb.first_alloc_block as u64 * 512
+                + self.current_block as u64 * block_size
+                + self.block_pos;
+            self.reader
+                .seek(SeekFrom::Start(offset))
+                .map_err(std::io::Error::other)?;
+            self.reader.read(&mut buf[..to_read])?
+        } else {
+            // Free block — emit zeros so free space compresses to nothing.
+            buf[..to_read].fill(0);
+            to_read
+        };
 
-        // Move to next block if we finished this one
-        if self.phase_pos % block_size == 0 {
+        self.block_pos += n as u64;
+        if self.block_pos >= block_size {
+            self.block_pos = 0;
             self.current_block += 1;
         }
 
