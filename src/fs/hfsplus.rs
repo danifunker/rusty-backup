@@ -549,7 +549,16 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
 
     fn last_data_byte(&mut self) -> Result<u64, FilesystemError> {
         let bitmap = self.read_allocation_bitmap()?;
-        let last = find_last_set_bit(&bitmap, self.vh.total_blocks);
+        // The HFS+ alternate volume header occupies the second-to-last 512-byte sector
+        // of the partition.  For volumes whose allocation block size is ≤ 1024 bytes this
+        // overlaps with the last TWO allocation blocks; for larger block sizes (4 KiB, etc.)
+        // it falls within only the last block.  Either way the last 1–2 blocks are reserved
+        // for VH/alternate-VH and are always marked allocated — if we include them in the
+        // search, find_last_set_bit returns the very end of the partition, making trimming
+        // impossible.  Exclude the final two blocks so that the trim point reflects the
+        // last genuine user-data block instead.
+        let search_up_to = self.vh.total_blocks.saturating_sub(2);
+        let last = find_last_set_bit(&bitmap, search_up_to);
         match last {
             Some(block) => {
                 let byte = (block as u64 + 1) * self.vh.block_size as u64;
