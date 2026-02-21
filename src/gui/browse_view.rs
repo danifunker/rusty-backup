@@ -9,6 +9,7 @@ use rusty_backup::fs;
 use rusty_backup::fs::entry::{EntryType, FileEntry};
 use rusty_backup::fs::filesystem::{Filesystem, FilesystemError};
 use rusty_backup::fs::resource_fork::{self, ResourceForkMode};
+use rusty_backup::fs::zstd_stream::{ZstdStreamCache, ZstdStreamReader};
 use rusty_backup::partition;
 
 const MAX_PREVIEW_SIZE: usize = 1024 * 1024; // 1 MB max file preview
@@ -55,6 +56,8 @@ pub struct BrowseView {
     active: bool,
     /// Shared block cache for Clonezilla partclone browsing.
     partclone_cache: Option<Arc<Mutex<PartcloneBlockCache>>>,
+    /// Streaming zstd cache for native zstd backups (before seekable cache is ready).
+    zstd_cache: Option<Arc<Mutex<ZstdStreamCache>>>,
     /// Resource fork handling mode (HFS/HFS+ only).
     resource_fork_mode: ResourceForkMode,
     /// Active extraction progress (shared with background thread).
@@ -95,6 +98,7 @@ impl Default for BrowseView {
             partition_type_string: None,
             active: false,
             partclone_cache: None,
+            zstd_cache: None,
             resource_fork_mode: ResourceForkMode::AppleDouble,
             extraction_progress: None,
             extraction_result: None,
@@ -188,6 +192,71 @@ impl BrowseView {
         }
     }
 
+    /// Open the browser by streaming a native zstd-compressed partition image.
+    ///
+    /// The filesystem opens immediately via a `ZstdStreamReader` backed by a
+    /// 256 MB in-memory buffer.  Call `upgrade_to_seekable_cache` once the
+    /// background seekable cache is ready to enable full random access.
+    pub fn open_streaming(&mut self, path: PathBuf, ptype: u8, ptype_str: Option<String>) {
+        self.close();
+        self.partition_type = ptype;
+        self.partition_type_string = ptype_str;
+        self.partition_offset = 0;
+
+        let cache = match ZstdStreamCache::new(&path) {
+            Ok(c) => Arc::new(Mutex::new(c)),
+            Err(e) => {
+                self.error = Some(format!("Cannot open zstd stream: {e}"));
+                self.active = true;
+                return;
+            }
+        };
+        self.zstd_cache = Some(cache);
+
+        match self.open_fs() {
+            Ok(mut fs) => {
+                self.fs_type = fs.fs_type().to_string();
+                self.volume_label = fs.volume_label().unwrap_or("").to_string();
+                self.active = true;
+
+                match fs.root() {
+                    Ok(root) => {
+                        match fs.list_directory(&root) {
+                            Ok(entries) => {
+                                self.directory_cache.insert("/".into(), entries);
+                                self.expanded_paths.insert("/".into());
+                            }
+                            Err(e) => {
+                                self.error = Some(format!("Failed to read root directory: {e}"));
+                            }
+                        }
+                        self.root = Some(root);
+                    }
+                    Err(e) => {
+                        self.error = Some(format!("Failed to get root: {e}"));
+                    }
+                }
+            }
+            Err(e) => {
+                self.error = Some(format!("Cannot open filesystem: {e}"));
+                self.active = true;
+            }
+        }
+    }
+
+    /// Switch the active streaming view to use a completed seekable cache file.
+    ///
+    /// Only acts if the browser is currently in active streaming mode
+    /// (`zstd_cache` is `Some`).  The directory cache is preserved so the
+    /// user stays in the same place in the tree.
+    pub fn upgrade_to_seekable_cache(&mut self, cache_path: PathBuf) {
+        if !self.active || self.zstd_cache.is_none() {
+            return;
+        }
+        self.source_path = Some(cache_path);
+        self.zstd_cache = None;
+    }
+
     pub fn close(&mut self) {
         self.root = None;
         self.directory_cache.clear();
@@ -199,6 +268,7 @@ impl BrowseView {
         self.fs_type.clear();
         self.volume_label.clear();
         self.partclone_cache = None;
+        self.zstd_cache = None;
         self.partition_type_string = None;
         self.extraction_progress = None;
         self.extraction_result = None;
@@ -215,6 +285,7 @@ impl BrowseView {
             self.partition_type,
             self.partition_type_string.as_deref(),
             self.partclone_cache.as_ref(),
+            self.zstd_cache.as_ref(),
         )
     }
 
@@ -602,6 +673,7 @@ impl BrowseView {
         let partition_type = self.partition_type;
         let partition_type_string = self.partition_type_string.clone();
         let partclone_cache = self.partclone_cache.clone();
+        let zstd_cache = self.zstd_cache.clone();
         let resource_fork_mode = self.resource_fork_mode;
         let is_hfs = self.is_hfs_type();
 
@@ -626,6 +698,7 @@ impl BrowseView {
                 partition_type,
                 partition_type_string.as_deref(),
                 partclone_cache.as_ref(),
+                zstd_cache.as_ref(),
                 &entry,
                 &dest,
                 resource_fork_mode,
@@ -680,11 +753,23 @@ fn create_filesystem(
     partition_type: u8,
     partition_type_string: Option<&str>,
     partclone_cache: Option<&Arc<Mutex<PartcloneBlockCache>>>,
+    zstd_cache: Option<&Arc<Mutex<ZstdStreamCache>>>,
 ) -> Result<Box<dyn Filesystem>, FilesystemError> {
     // If we have a partclone block cache, use it
     if let Some(cache) = partclone_cache {
         let reader = PartcloneBlockReader::new(Arc::clone(cache));
         return fs::open_filesystem(reader, 0, partition_type, None);
+    }
+
+    // If we have a streaming zstd cache, use it
+    if let Some(cache) = zstd_cache {
+        let reader = ZstdStreamReader::new(Arc::clone(cache));
+        return fs::open_filesystem(
+            reader,
+            partition_offset,
+            partition_type,
+            partition_type_string,
+        );
     }
 
     let path = source_path.ok_or_else(|| FilesystemError::Parse("no source path set".into()))?;
@@ -734,6 +819,7 @@ fn run_extraction(
     partition_type: u8,
     partition_type_string: Option<&str>,
     partclone_cache: Option<&Arc<Mutex<PartcloneBlockCache>>>,
+    zstd_cache: Option<&Arc<Mutex<ZstdStreamCache>>>,
     entry: &FileEntry,
     dest: &std::path::Path,
     resource_fork_mode: ResourceForkMode,
@@ -746,6 +832,7 @@ fn run_extraction(
         partition_type,
         partition_type_string,
         partclone_cache,
+        zstd_cache,
     )?;
 
     // Pre-count files and bytes for progress tracking
@@ -763,6 +850,7 @@ fn run_extraction(
         partition_type,
         partition_type_string,
         partclone_cache,
+        zstd_cache,
     )?;
 
     extract_entry(&mut *fs, entry, dest, resource_fork_mode, is_hfs, progress)?;

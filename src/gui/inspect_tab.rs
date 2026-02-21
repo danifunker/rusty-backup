@@ -1824,8 +1824,9 @@ impl InspectTab {
                     .open(data_path, 0, ptype, partition_type_string.clone());
             }
             "zstd" => {
-                // Zstd-compressed backup — create seekable cache for browsing
-                self.open_browse_via_seekable_cache(
+                // Zstd-compressed backup — open streaming immediately while
+                // seekable cache builds in the background
+                self.open_browse_zstd(
                     part_index,
                     ptype,
                     partition_type_string,
@@ -1950,8 +1951,14 @@ impl InspectTab {
         });
     }
 
-    /// Open browse for a native zstd-compressed backup via seekable cache.
-    fn open_browse_via_seekable_cache(
+    /// Open browse for a native zstd-compressed backup.
+    ///
+    /// If a seekable cache already exists, opens it directly.  Otherwise,
+    /// opens the browser immediately via a streaming reader and starts a
+    /// background thread to build the seekable cache.  When the background
+    /// build completes, `poll_cache_status` will upgrade the browser
+    /// automatically.
+    fn open_browse_zstd(
         &mut self,
         part_index: usize,
         ptype: u8,
@@ -1961,7 +1968,7 @@ impl InspectTab {
         cache_name: &str,
         log: &mut LogPanel,
     ) {
-        // Check if seekable cache already exists
+        // 1. If seekable cache already exists, use it directly
         if let Some(cache_path) = self.seekable_cache_files.get(&part_index).cloned() {
             if cache_path.exists() {
                 log.info(format!(
@@ -1976,18 +1983,26 @@ impl InspectTab {
             self.seekable_cache_files.remove(&part_index);
         }
 
+        // 2. If a cache build is already running, warn and return
         if self.cache_status.is_some() {
             log.warn("A seekable cache is already being created. Please wait.");
             return;
         }
 
-        let cache_path = folder.join(format!("_{cache_name}.seekable.zst"));
+        // 3. Open the browser immediately via streaming reader
+        log.info(format!(
+            "Opening partition {} via streaming reader (seekable cache building in background)...",
+            part_index,
+        ));
+        self.browse_view
+            .open_streaming(data_path.clone(), ptype, partition_type_string.clone());
 
-        // Get file size for progress
+        // 4. Start background thread to build seekable cache
+        let cache_path = folder.join(format!("_{cache_name}.seekable.zst"));
         let total_bytes = std::fs::metadata(data_path).map(|m| m.len()).unwrap_or(0);
 
         log.info(format!(
-            "Creating seekable cache for partition {}...",
+            "Creating seekable cache for partition {} in the background...",
             part_index,
         ));
 
@@ -2069,16 +2084,22 @@ impl InspectTab {
                     "Failed to create seekable cache for partition {}: {err}",
                     part_index,
                 ));
+                drop(status);
+                self.cache_status = None;
             } else if let Some(cache_path) = &status.cache_path {
-                log.info(format!(
-                    "Seekable cache ready for partition {}. Click Browse again.",
-                    part_index,
-                ));
+                log.info(
+                    "Seekable cache ready — browser upgraded to full seek support.".to_string(),
+                );
+                let cache_path = cache_path.clone();
                 self.seekable_cache_files
                     .insert(part_index, cache_path.clone());
+                drop(status);
+                self.cache_status = None;
+                self.browse_view.upgrade_to_seekable_cache(cache_path);
+            } else {
+                drop(status);
+                self.cache_status = None;
             }
-            drop(status);
-            self.cache_status = None;
         }
     }
 }
