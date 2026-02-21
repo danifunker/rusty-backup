@@ -132,25 +132,52 @@ jobs:
           # Build main app
           cargo build --release --target ${{ matrix.target }}
       
+      - name: Import signing certificate
+        if: ${{ secrets.MACOS_CERTIFICATE != '' }}
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+        run: |
+          # Create a temporary keychain
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PWD=$(openssl rand -base64 32)
+
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+
+          # Import certificate
+          CERT_PATH=$RUNNER_TEMP/certificate.p12
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$CERT_PATH"
+          security import "$CERT_PATH" -P "$MACOS_CERTIFICATE_PWD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          rm "$CERT_PATH"
+
+          # Allow codesign to access the keychain
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+
       - name: Create macOS app bundle
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
         run: |
           APP_NAME="Rusty Backup"
           BUNDLE_NAME="Rusty Backup.app"
           VERSION="${{ needs.generate-version.outputs.version }}"
-          
+
           # Create app bundle structure
           mkdir -p "${BUNDLE_NAME}/Contents/MacOS"
           mkdir -p "${BUNDLE_NAME}/Contents/Resources"
-          
+
           # Copy main binary
           cp "target/${{ matrix.target }}/release/rusty-backup" "${BUNDLE_NAME}/Contents/MacOS/"
           chmod +x "${BUNDLE_NAME}/Contents/MacOS/rusty-backup"
-          
+
           # Copy icon if available
           if [ -f "assets/icons/icon.icns" ]; then
             cp "assets/icons/icon.icns" "${BUNDLE_NAME}/Contents/Resources/AppIcon.icns"
           fi
-          
+
           # Create Info.plist
           cat > "${BUNDLE_NAME}/Contents/Info.plist" << EOF
           <?xml version="1.0" encoding="UTF-8"?>
@@ -180,12 +207,51 @@ jobs:
           </dict>
           </plist>
           EOF
-          
-          # Ad-hoc code sign to prevent "damaged" error
-          codesign --force --deep --sign - "${BUNDLE_NAME}"
-          
+
+          # Code sign: use Developer ID if available, otherwise ad-hoc
+          if [ -n "$MACOS_CERTIFICATE" ] && [ -n "$MACOS_TEAM_ID" ]; then
+            echo "Signing with Developer ID certificate..."
+            codesign --force --options runtime --sign "Developer ID Application: ($MACOS_TEAM_ID)" "${BUNDLE_NAME}"
+          else
+            echo "No signing certificate found, using ad-hoc signature..."
+            codesign --force --deep --sign - "${BUNDLE_NAME}"
+          fi
+
           # Create DMG
           hdiutil create -volname "${APP_NAME}" -srcfolder "${BUNDLE_NAME}" -ov -format UDZO "Rusty-Backup-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg"
+
+          # Sign the DMG as well if certificate is available
+          if [ -n "$MACOS_CERTIFICATE" ] && [ -n "$MACOS_TEAM_ID" ]; then
+            codesign --force --sign "Developer ID Application: ($MACOS_TEAM_ID)" "Rusty-Backup-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg"
+          fi
+
+      - name: Notarize DMG
+        if: ${{ secrets.MACOS_CERTIFICATE != '' }}
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_NOTARIZE_APPLE_ID: ${{ secrets.MACOS_NOTARIZE_APPLE_ID }}
+          MACOS_NOTARIZE_PASSWORD: ${{ secrets.MACOS_NOTARIZE_PASSWORD }}
+          MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+        run: |
+          DMG_FILE="Rusty-Backup-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg"
+
+          echo "Submitting for notarization..."
+          xcrun notarytool submit "$DMG_FILE" \
+            --apple-id "$MACOS_NOTARIZE_APPLE_ID" \
+            --password "$MACOS_NOTARIZE_PASSWORD" \
+            --team-id "$MACOS_TEAM_ID" \
+            --wait
+
+          echo "Stapling notarization ticket..."
+          xcrun stapler staple "$DMG_FILE"
+
+      - name: Cleanup keychain
+        if: always()
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          if [ -f "$KEYCHAIN_PATH" ]; then
+            security delete-keychain "$KEYCHAIN_PATH"
+          fi
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
