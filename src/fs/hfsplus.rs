@@ -818,14 +818,17 @@ impl<R: Read + Seek> CompactHfsPlusReader<R> {
         // Layout-preserving: output size equals the original partition size.
         // Unallocated blocks are zeroed, so they compress extremely well.
         let compacted_size = original_size;
+        // data_size: only allocated blocks require disk reads.
+        let data_size = allocated as u64 * vh.block_size as u64;
         eprintln!(
-            "[HFS+ compact] compacted_size={} original_size={} (layout-preserving; free blocks → zeros)",
-            compacted_size, original_size
+            "[HFS+ compact] compacted_size={} data_size={} original_size={} (layout-preserving; free blocks → zeros)",
+            compacted_size, data_size, original_size
         );
 
         let result = CompactResult {
             original_size,
             compacted_size,
+            data_size,
             clusters_used: allocated,
         };
 

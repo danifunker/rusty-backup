@@ -1185,6 +1185,8 @@ impl<R: Read + Seek + Send> CompactExtReader<R> {
 
         let original_size = total_blocks * block_size;
         let compacted_size = original_size; // Same logical size, but zeros compress well
+                                            // data_size: only allocated blocks require disk reads.
+        let data_size = total_allocated * block_size;
 
         let layout = CompactLayout {
             sections,
@@ -1200,6 +1202,7 @@ impl<R: Read + Seek + Send> CompactExtReader<R> {
             CompactResult {
                 original_size,
                 compacted_size,
+                data_size,
                 clusters_used: total_allocated as u32,
             },
         ))

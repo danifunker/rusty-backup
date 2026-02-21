@@ -453,7 +453,21 @@ pub fn reconstruct_disk_from_backup(
         // Handle unused space at end of partition
         if bytes_written < export_size {
             let pad = export_size - bytes_written;
-            if fill_unused_with_zeros {
+            // Compacted (layout-preserving) partitions: the backup stream was trimmed to
+            // the last used block, leaving the tail unwritten.  We MUST zero-fill so that:
+            //   (a) no stale data from a previous install remains in the free region,
+            //   (b) the alternate volume header slot (HFS/HFS+) is zeroed before step 8
+            //       of restore writes the correct header there.
+            // Progress is reported chunk-by-chunk since the tail can be substantial.
+            if pm.compacted {
+                log_cb(&format!(
+                    "partition-{}: trimmed backup — zero-filling {} bytes to complete partition \
+                     (filesystem headers finalized in post-processing)",
+                    pm.index, pad
+                ));
+                write_zeros_with_progress(writer, pad, total_written, progress_cb)?;
+                total_written += pad;
+            } else if fill_unused_with_zeros {
                 // User requested zero-fill (may be needed for some filesystems)
                 write_zeros(writer, pad)?;
                 total_written += pad;
@@ -524,6 +538,31 @@ pub(crate) fn write_zeros(writer: &mut impl Write, count: u64) -> Result<()> {
             .write_all(&zeros[..n])
             .context("failed to write zeros")?;
         remaining -= n as u64;
+    }
+    Ok(())
+}
+
+/// Write `count` zero bytes to a writer, calling `progress_cb` after each chunk.
+/// `base_offset` is the total bytes already written before this call; the callback
+/// receives `base_offset + bytes_written_so_far` so the caller's progress counter
+/// stays in sync with the zero-fill.
+fn write_zeros_with_progress(
+    writer: &mut impl Write,
+    count: u64,
+    base_offset: u64,
+    progress_cb: &mut impl FnMut(u64),
+) -> Result<()> {
+    let zeros = vec![0u8; CHUNK_SIZE];
+    let mut remaining = count;
+    let mut done: u64 = 0;
+    while remaining > 0 {
+        let n = (remaining as usize).min(CHUNK_SIZE);
+        writer
+            .write_all(&zeros[..n])
+            .context("failed to write zeros")?;
+        remaining -= n as u64;
+        done += n as u64;
+        progress_cb(base_offset + done);
     }
     Ok(())
 }

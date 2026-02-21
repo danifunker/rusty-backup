@@ -978,11 +978,14 @@ impl<R: Read + Seek + Send> CompactBtrfsReader<R> {
 
         let inner = CompactStreamReader::new(reader, layout);
 
+        // data_size: only allocated sectors require disk reads.
+        let data_size = total_allocated_sectors as u64 * sector_size as u64;
         Ok((
             Self { inner },
             CompactResult {
                 original_size: total_bytes,
                 compacted_size: total_bytes,
+                data_size,
                 clusters_used: total_allocated_sectors as u32,
             },
         ))

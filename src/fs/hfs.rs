@@ -739,14 +739,17 @@ impl<R: Read + Seek> CompactHfsReader<R> {
         // Layout-preserving: compacted_size == original_size.
         // Free allocation blocks are zeroed, so they compress extremely well.
         let compacted_size = original_size;
+        // data_size: pre-alloc is always read from disk; only allocated alloc blocks are read.
+        let data_size = pre_alloc_size + allocated as u64 * mdb.block_size as u64;
         eprintln!(
-            "[HFS compact] pre_alloc_size={}, compacted_size={} original_size={} (layout-preserving; free blocks → zeros)",
-            pre_alloc_size, compacted_size, original_size
+            "[HFS compact] pre_alloc_size={}, data_size={}, compacted_size={} original_size={} (layout-preserving; free blocks → zeros)",
+            pre_alloc_size, data_size, compacted_size, original_size
         );
 
         let result = CompactResult {
             original_size,
             compacted_size,
+            data_size,
             clusters_used: allocated,
         };
 

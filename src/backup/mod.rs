@@ -380,9 +380,24 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
     // partition i, or None if we should fall back to trimming.
     // minimum_sizes[i] is the true filesystem minimum (last_data_byte result),
     // stored in metadata so the UI can offer shrink-to-minimum restore.
+    // effective_sizes[i] = actual bytes we will write to the backup stream.
+    //   For packed readers (FAT/NTFS/exFAT): = compacted_size (already optimal).
+    //   For layout-preserving readers (HFS/HFS+/ext/btrfs): = minimum_size (trimmed
+    //   to last-used-block; free tail is skipped).
+    //   For non-compact partitions: = effective_partition_size (trim-based).
+    //
+    // stream_sizes[i] = same as effective_sizes[i]; kept as a separate name to
+    //   match the progress-tracking variable naming used in the backup loop.
+    //
+    // is_layout_preserving_flags[i] = true if the compact reader for partition i
+    //   emits free blocks as zeros (HFS/HFS+/ext/btrfs).  Tracked separately because
+    //   after stream trimming both effective_size and stream_size equal minimum, so
+    //   we can no longer infer LP status from stream_size > image_size.
     let mut effective_sizes: Vec<u64> = Vec::with_capacity(partitions.len());
+    let mut stream_sizes: Vec<u64> = Vec::with_capacity(partitions.len());
     let mut compact_sizes: Vec<Option<u64>> = Vec::with_capacity(partitions.len());
     let mut minimum_sizes: Vec<Option<u64>> = Vec::with_capacity(partitions.len());
+    let mut is_layout_preserving_flags: Vec<bool> = Vec::with_capacity(partitions.len());
 
     for part in partitions.iter() {
         log(
@@ -395,8 +410,10 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         );
         if config.sector_by_sector || part.is_extended_container || is_superfloppy {
             effective_sizes.push(part.size_bytes);
+            stream_sizes.push(part.size_bytes);
             compact_sizes.push(None);
             minimum_sizes.push(None);
+            is_layout_preserving_flags.push(false);
             continue;
         }
 
@@ -433,9 +450,10 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                             LogLevel::Info,
                             format!(
                                 "Compact analysis (partition-{}): {} allocated clusters, \
-                                 compacted={} original={} mode={}",
+                                 data={} stream={} original={} mode={}",
                                 part.index,
                                 result.clusters_used,
+                                partition::format_size(result.data_size),
                                 partition::format_size(result.compacted_size),
                                 partition::format_size(result.original_size),
                                 if result.compacted_size == result.original_size {
@@ -474,13 +492,18 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         };
 
         if let Some(ref result) = compact_result {
-            effective_sizes.push(result.compacted_size);
+            // LP = layout-preserving: free blocks emitted as zeros, compacted_size == original_size.
+            // Packed: allocated clusters packed contiguously, compacted_size < original_size.
+            let is_lp = result.compacted_size == result.original_size;
             compact_sizes.push(Some(result.compacted_size));
-            // For packed compaction (FAT/NTFS/exFAT), compacted_size is already
-            // the minimum. For layout-preserving compaction (HFS/HFS+/ext/btrfs),
-            // compacted_size == original_size, so we need a separate minimum.
-            let minimum = if result.compacted_size < part.size_bytes {
-                Some(result.compacted_size)
+            is_layout_preserving_flags.push(is_lp);
+
+            // Minimum partition size:
+            // - Packed (FAT/NTFS/exFAT): data_size is the tightest possible image.
+            // - LP (HFS/HFS+/ext/btrfs): must ask the filesystem for the last-used-block
+            //   position via effective_partition_size / last_data_byte.
+            let minimum = if !is_lp && result.data_size < part.size_bytes {
+                Some(result.data_size)
             } else {
                 source
                     .get_ref()
@@ -497,6 +520,17 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                     .map(|min| min.min(part.size_bytes))
             };
             minimum_sizes.push(minimum);
+
+            // For LP readers: trim the stream to minimum so the free tail is not
+            // processed through the compressor.  For packed readers: stream_size ==
+            // compacted_size (already optimal, no trimming needed).
+            let stream = if is_lp {
+                minimum.unwrap_or(result.compacted_size)
+            } else {
+                result.compacted_size
+            };
+            effective_sizes.push(stream);
+            stream_sizes.push(stream);
         } else {
             // Fall back to trim-based sizing
             let effective = source
@@ -512,9 +546,12 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                     )
                 })
                 .map(|data_end| data_end.min(part.size_bytes));
-            effective_sizes.push(effective.unwrap_or(part.size_bytes));
+            let sz = effective.unwrap_or(part.size_bytes);
+            effective_sizes.push(sz);
+            stream_sizes.push(sz);
             compact_sizes.push(None);
             minimum_sizes.push(effective);
+            is_layout_preserving_flags.push(false);
         }
     }
 
@@ -556,9 +593,22 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         }
     }
 
-    let total_partition_bytes: u64 = partitions
+    // total_display_bytes: logical data bytes to image (excludes zero-filled free blocks
+    //   in layout-preserving readers). Used for the smart-sizing log message and
+    //   imaged_size_bytes metadata.
+    let total_display_bytes: u64 = partitions
         .iter()
         .zip(&effective_sizes)
+        .filter(|(p, _)| !p.is_extended_container)
+        .map(|(_, &sz)| sz)
+        .sum();
+
+    // total_stream_bytes: actual bytes that will flow through the compressor
+    //   (includes zero-fill for free blocks in layout-preserving readers).
+    //   Used for accurate progress-bar tracking.
+    let total_stream_bytes: u64 = partitions
+        .iter()
+        .zip(&stream_sizes)
         .filter(|(p, _)| !p.is_extended_container)
         .map(|(_, &sz)| sz)
         .sum();
@@ -570,20 +620,20 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         .sum();
 
     if let Ok(mut p) = progress.lock() {
-        p.total_bytes = total_partition_bytes;
+        p.total_bytes = total_stream_bytes;
         p.full_size_bytes = full_partition_bytes;
         p.current_bytes = 0;
     }
 
-    if full_partition_bytes > total_partition_bytes {
+    if full_partition_bytes > total_display_bytes {
         log(
             &progress,
             LogLevel::Info,
             format!(
                 "Smart sizing: imaging {} of {} total (saving {})",
-                partition::format_size(total_partition_bytes),
+                partition::format_size(total_display_bytes),
                 partition::format_size(full_partition_bytes),
-                partition::format_size(full_partition_bytes - total_partition_bytes),
+                partition::format_size(full_partition_bytes - total_display_bytes),
             ),
         );
     }
@@ -614,8 +664,16 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             continue;
         }
 
+        // image_size: logical data bytes (allocated blocks × block_size) for this partition.
+        //   Stored in imaged_size_bytes and used for non-compacted source.take() limit.
         let image_size = effective_sizes[part_idx];
+        // stream_size: actual bytes that will flow through the compressor.
+        //   For LP readers this is the minimum (trimmed); equals image_size.
+        let stream_size = stream_sizes[part_idx];
         let is_compacted = compact_sizes[part_idx].is_some();
+        // is_layout_preserving: the compact reader emits free blocks as zeros.
+        //   Tracked separately since after trimming stream_size == image_size for all modes.
+        let is_layout_preserving = is_layout_preserving_flags[part_idx];
 
         let part_label = format!("partition-{}", part.index);
         set_operation(
@@ -628,18 +686,33 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         );
 
         if is_compacted {
-            log(
-                &progress,
-                LogLevel::Info,
-                format!(
-                    "Compacting {}: {} at LBA {}, {} → {} (defragmented)",
-                    part_label,
-                    part.type_name,
-                    part.start_lba,
-                    partition::format_size(part.size_bytes),
-                    partition::format_size(image_size),
-                ),
-            );
+            if is_layout_preserving {
+                log(
+                    &progress,
+                    LogLevel::Info,
+                    format!(
+                        "Compacting {}: {} at LBA {}, trimmed {} → {} (free blocks → zeros)",
+                        part_label,
+                        part.type_name,
+                        part.start_lba,
+                        partition::format_size(part.size_bytes),
+                        partition::format_size(stream_size),
+                    ),
+                );
+            } else {
+                log(
+                    &progress,
+                    LogLevel::Info,
+                    format!(
+                        "Compacting {}: {} at LBA {}, {} → {} (defragmented)",
+                        part_label,
+                        part.type_name,
+                        part.start_lba,
+                        partition::format_size(part.size_bytes),
+                        partition::format_size(stream_size),
+                    ),
+                );
+            }
         } else if image_size < part.size_bytes {
             log(
                 &progress,
@@ -699,13 +772,18 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 .get_ref()
                 .try_clone()
                 .context("failed to clone source for compaction")?;
-            let (mut compact_reader, _) = fs::compact_partition_reader(
+            let (compact_reader, _) = fs::compact_partition_reader(
                 BufReader::new(clone),
                 part_offset,
                 part.partition_type_byte,
                 part.partition_type_string.as_deref(),
             )
             .ok_or_else(|| anyhow::anyhow!("compaction failed for {part_label}"))?;
+
+            // Trim the stream to stream_size.  For layout-preserving readers this
+            // drops the zero-filled free tail; for packed readers stream_size equals
+            // the natural end of the stream so take() is a no-op.
+            let mut limited = compact_reader.take(stream_size);
 
             log(
                 &progress,
@@ -714,7 +792,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             );
             let progress_log = Arc::clone(&progress);
             crate::rbformats::compress_partition(
-                &mut compact_reader,
+                &mut limited,
                 &output_base,
                 effective_compression,
                 split_bytes,
@@ -723,7 +801,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                     set_progress_bytes(
                         &progress_clone,
                         base_bytes + bytes_read,
-                        total_partition_bytes,
+                        total_stream_bytes,
                     );
                 },
                 || is_cancelled(&progress_clone),
@@ -768,7 +846,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                     set_progress_bytes(
                         &progress_clone,
                         base_bytes + bytes_read,
-                        total_partition_bytes,
+                        total_stream_bytes,
                     );
                 },
                 || is_cancelled(&progress_clone),
@@ -794,8 +872,8 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             }
         }
 
-        overall_bytes_done += image_size;
-        set_progress_bytes(&progress, overall_bytes_done, total_partition_bytes);
+        overall_bytes_done += stream_size;
+        set_progress_bytes(&progress, overall_bytes_done, total_stream_bytes);
 
         // Superfloppy: rename .raw to .img for universally compatible raw image
         let compressed_files = if is_superfloppy {

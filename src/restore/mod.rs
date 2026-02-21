@@ -696,24 +696,46 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
             .inner_mut()
             .context("failed to access device for filesystem operations")?;
 
-        // Resize filesystem if the partition size changed
-        if export_size != pm.original_size_bytes {
-            // Detect filesystem type from the written partition data
+        // Resize filesystem if the partition size changed.
+        let needs_resize = export_size != pm.original_size_bytes;
+        // For compacted HFS/HFS+ restored to original size: the backup stream was
+        // trimmed to the last used block, so the partition tail was zero-filled above.
+        // We must still call resize (with the same export_size) to write the correct
+        // alternate volume header into that zero-filled tail.  For other filesystem
+        // types, no end-of-partition structure needs fixing.
+        let compacted_hfs_fixup = pm.compacted && !needs_resize;
+        if needs_resize || compacted_hfs_fixup {
             let fs_type = detect_partition_fs_type(inner_file, part_offset);
 
+            if compacted_hfs_fixup
+                && matches!(fs_type, PartitionFsType::Hfs | PartitionFsType::HfsPlus)
+            {
+                log(
+                    &progress,
+                    LogLevel::Info,
+                    format!(
+                        "Partition {}: trimmed HFS/HFS+ backup restored to original size — \
+                         writing alternate volume header into zero-filled tail",
+                        pm.index
+                    ),
+                );
+            }
+
             match fs_type {
-                PartitionFsType::Ntfs => {
+                PartitionFsType::Ntfs if needs_resize => {
                     let new_sectors = export_size / 512;
                     resize_ntfs_in_place(inner_file, part_offset, new_sectors, &mut |msg| {
                         log(&progress, LogLevel::Info, msg)
                     })?;
                 }
-                PartitionFsType::Exfat => {
+                PartitionFsType::Exfat if needs_resize => {
                     let new_sectors = export_size / 512;
                     resize_exfat_in_place(inner_file, part_offset, new_sectors, &mut |msg| {
                         log(&progress, LogLevel::Info, msg)
                     })?;
                 }
+                // HFS and HFS+ are matched without a needs_resize guard: resize handles
+                // both shrink/grow and the same-size case, always writing the alternate VH.
                 PartitionFsType::Hfs => {
                     resize_hfs_in_place(inner_file, part_offset, export_size, &mut |msg| {
                         log(&progress, LogLevel::Info, msg)
@@ -724,22 +746,23 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
                         log(&progress, LogLevel::Info, msg)
                     })?;
                 }
-                PartitionFsType::Ext => {
+                PartitionFsType::Ext if needs_resize => {
                     resize_ext_in_place(inner_file, part_offset, export_size, &mut |msg| {
                         log(&progress, LogLevel::Info, msg)
                     })?;
                 }
-                PartitionFsType::Btrfs => {
+                PartitionFsType::Btrfs if needs_resize => {
                     resize_btrfs_in_place(inner_file, part_offset, export_size, &mut |msg| {
                         log(&progress, LogLevel::Info, msg)
                     })?;
                 }
-                PartitionFsType::Fat | PartitionFsType::Unknown => {
+                PartitionFsType::Fat | PartitionFsType::Unknown if needs_resize => {
                     let new_sectors = (export_size / 512) as u32;
                     resize_fat_in_place(inner_file, part_offset, new_sectors, &mut |msg| {
                         log(&progress, LogLevel::Info, msg)
                     })?;
                 }
+                _ => {}
             }
         }
 

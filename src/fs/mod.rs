@@ -36,7 +36,14 @@ pub use ntfs::{
 /// Result of filesystem compaction.
 pub struct CompactResult {
     pub original_size: u64,
+    /// Actual bytes that the compact reader will emit (= `original_size` for
+    /// layout-preserving readers; < `original_size` for packed readers).
     pub compacted_size: u64,
+    /// Logical data bytes: allocated clusters × block_size (+ pre-alloc for HFS).
+    /// For packed readers this equals `compacted_size`.
+    /// For layout-preserving readers this is less than `compacted_size` because
+    /// free clusters are zero-filled in-memory rather than read from disk.
+    pub data_size: u64,
     pub clusters_used: u32,
 }
 
@@ -193,6 +200,7 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
                         CompactResult {
                             original_size: info.original_size,
                             compacted_size: info.compacted_size,
+                            data_size: info.compacted_size,
                             clusters_used: info.clusters_used,
                         },
                     ))
@@ -204,6 +212,7 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
                         CompactResult {
                             original_size: info.original_size,
                             compacted_size: info.compacted_size,
+                            data_size: info.compacted_size,
                             clusters_used: info.clusters_used,
                         },
                     ))
@@ -215,6 +224,7 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
                         CompactResult {
                             original_size: info.original_size,
                             compacted_size: info.compacted_size,
+                            data_size: info.compacted_size,
                             clusters_used: info.clusters_used,
                         },
                     ))
@@ -238,6 +248,7 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
                 CompactResult {
                     original_size: info.original_size,
                     compacted_size: info.compacted_size,
+                    data_size: info.compacted_size,
                     clusters_used: info.clusters_used,
                 },
             ))
@@ -253,6 +264,7 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
                         CompactResult {
                             original_size: info.original_size,
                             compacted_size: info.compacted_size,
+                            data_size: info.compacted_size,
                             clusters_used: info.clusters_used,
                         },
                     ))
@@ -264,6 +276,7 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
                         CompactResult {
                             original_size: info.original_size,
                             compacted_size: info.compacted_size,
+                            data_size: info.compacted_size,
                             clusters_used: info.clusters_used,
                         },
                     ))
