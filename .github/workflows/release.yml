@@ -212,8 +212,10 @@ jobs:
 
           # Code sign: use Developer ID if available, otherwise ad-hoc
           if [ -n "$MACOS_CERTIFICATE" ] && [ -n "$MACOS_TEAM_ID" ]; then
-            echo "Signing with Developer ID certificate..."
-            codesign --force --options runtime --sign "Developer ID Application: ($MACOS_TEAM_ID)" "${BUNDLE_NAME}"
+            # Find the exact identity name from the imported certificate
+            IDENTITY=$(security find-identity -v -p codesigning "$RUNNER_TEMP/app-signing.keychain-db" | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+            echo "Signing with identity: $IDENTITY"
+            codesign --force --options runtime --sign "$IDENTITY" "${BUNDLE_NAME}"
           else
             echo "No signing certificate found, using ad-hoc signature..."
             codesign --force --deep --sign - "${BUNDLE_NAME}"
@@ -224,7 +226,7 @@ jobs:
 
           # Sign the DMG as well if certificate is available
           if [ -n "$MACOS_CERTIFICATE" ] && [ -n "$MACOS_TEAM_ID" ]; then
-            codesign --force --sign "Developer ID Application: ($MACOS_TEAM_ID)" "Rusty-Backup-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg"
+            codesign --force --sign "$IDENTITY" "Rusty-Backup-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg"
           fi
 
       - name: Notarize DMG
