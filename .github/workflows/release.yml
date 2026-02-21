@@ -92,6 +92,8 @@ jobs:
     name: Build macOS
     needs: generate-version
     runs-on: macos-latest
+    env:
+      HAS_SIGNING_CERT: ${{ secrets.MACOS_CERTIFICATE != '' }}
     strategy:
       matrix:
         include:
@@ -133,7 +135,7 @@ jobs:
           cargo build --release --target ${{ matrix.target }}
       
       - name: Import signing certificate
-        if: ${{ secrets.MACOS_CERTIFICATE != '' }}
+        if: ${{ env.HAS_SIGNING_CERT == 'true' }}
         env:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
@@ -226,7 +228,7 @@ jobs:
           fi
 
       - name: Notarize DMG
-        if: ${{ secrets.MACOS_CERTIFICATE != '' }}
+        if: ${{ env.HAS_SIGNING_CERT == 'true' }}
         env:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_NOTARIZE_APPLE_ID: ${{ secrets.MACOS_NOTARIZE_APPLE_ID }}
