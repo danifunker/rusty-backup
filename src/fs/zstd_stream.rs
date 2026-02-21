@@ -1,21 +1,19 @@
 //! Streaming zstd reader with a growable in-memory buffer.
 //!
 //! `ZstdStreamCache` decompresses a zstd file forward-only into a growable
-//! in-memory buffer (capped at 256 MB).  Multiple `ZstdStreamReader` handles
-//! share a single cache via `Arc<Mutex<...>>` and present a `Read + Seek`
-//! interface suitable for passing to `fs::open_filesystem`.
+//! in-memory buffer.  Multiple `ZstdStreamReader` handles share a single cache
+//! via `Arc<Mutex<...>>` and present a `Read + Seek` interface suitable for
+//! passing to `fs::open_filesystem`.
 //!
-//! Reads within the buffered region are served directly from memory; reads
-//! past the cap return an `io::Error` (the caller should switch to the
-//! seekable cache once it is ready).
+//! The buffer grows on demand as the filesystem reads metadata structures.
+//! No arbitrary cap is applied — reads are always served if the decompressor
+//! can produce the data.  When the seekable cache is ready, `zstd_cache` is
+//! dropped and the buffer is freed.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-
-/// Default buffer cap: 256 MB.
-const DEFAULT_CAP: usize = 256 * 1024 * 1024;
 
 /// Shared state for the streaming zstd reader.
 ///
@@ -24,13 +22,11 @@ const DEFAULT_CAP: usize = 256 * 1024 * 1024;
 pub struct ZstdStreamCache {
     /// Accumulated decompressed bytes.
     data: Vec<u8>,
-    /// Maximum bytes to buffer.
-    cap: usize,
     /// Streaming decoder.  Dropped once `exhausted` is `true`.
     /// `zstd::Decoder::new(file)` wraps `File` in a `BufReader` internally,
     /// yielding `Decoder<'static, BufReader<File>>`.
     decoder: Option<zstd::Decoder<'static, std::io::BufReader<File>>>,
-    /// `true` when EOF or the cap has been reached.
+    /// `true` when the decoder has reached EOF of the compressed stream.
     exhausted: bool,
 }
 
@@ -48,7 +44,6 @@ impl ZstdStreamCache {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("zstd decoder: {e}")))?;
         Ok(Self {
             data: Vec::new(),
-            cap: DEFAULT_CAP,
             decoder: Some(decoder),
             exhausted: false,
         })
@@ -56,14 +51,16 @@ impl ZstdStreamCache {
 
     /// Ensure `data.len() >= end`, decompressing forward as needed.
     ///
-    /// Stops at `cap` or EOF and sets `exhausted = true`.  Returns an error
-    /// only if the decoder itself fails.
+    /// Always fills to `end` on demand regardless of partition size.
+    /// Sets `exhausted = true` only when the decompressor reaches EOF.
+    /// Returns an error only if the decoder itself fails.
     fn fill_to(&mut self, end: u64) -> io::Result<()> {
         if self.exhausted {
             return Ok(());
         }
 
-        let target = end.min(self.cap as u64) as usize;
+        // Clamp to usize max to avoid overflow on 32-bit platforms
+        let target = end.min(usize::MAX as u64) as usize;
         if self.data.len() >= target {
             return Ok(());
         }
@@ -100,11 +97,6 @@ impl ZstdStreamCache {
             }
         }
 
-        // If we have reached the cap, seal the decoder
-        if self.data.len() >= self.cap {
-            self.decoder = None;
-            self.exhausted = true;
-        }
         Ok(())
     }
 }
@@ -139,19 +131,8 @@ impl Read for ZstdStreamReader {
 
         let buffered = cache.data.len() as u64;
         if self.position >= buffered {
-            if cache.exhausted && self.position >= buffered {
-                // Position is past the buffer cap
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    format!(
-                        "ZstdStreamCache: offset {} is past buffer limit ({} bytes buffered). \
-                         Seekable cache is still building — try again shortly.",
-                        self.position, buffered
-                    ),
-                ));
-            }
-            // Within an empty but non-exhausted stream — shouldn't happen, but
-            // return 0 to signal EOF rather than panic.
+            // Either genuine EOF (exhausted) or fill_to failed to reach end —
+            // signal EOF either way; the filesystem will handle it gracefully.
             return Ok(0);
         }
 
