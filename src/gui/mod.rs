@@ -2,12 +2,14 @@ mod backup_tab;
 mod browse_view;
 mod elevation_dialog;
 mod inspect_tab;
+mod optical_tab;
 mod progress;
 mod restore_tab;
 mod settings_dialog;
 
 use backup_tab::BackupTab;
 use inspect_tab::InspectTab;
+use optical_tab::OpticalTab;
 use progress::{LogPanel, ProgressState};
 use restore_tab::RestoreTab;
 use settings_dialog::SettingsDialog;
@@ -42,6 +44,7 @@ enum Tab {
     Backup,
     Restore,
     Inspect,
+    Optical,
 }
 
 /// Main application state.
@@ -50,6 +53,7 @@ pub struct RustyBackupApp {
     backup_tab: BackupTab,
     restore_tab: RestoreTab,
     inspect_tab: InspectTab,
+    optical_tab: OpticalTab,
     log_panel: LogPanel,
     progress: ProgressState,
     devices: Vec<DiskDevice>,
@@ -110,6 +114,16 @@ impl Default for RustyBackupApp {
         let mut backup_tab = BackupTab::default();
         backup_tab.set_chdman_available(chdman_available);
 
+        let mut optical_tab = OpticalTab::default();
+        optical_tab.set_chdman_available(chdman_available);
+        optical_tab.refresh_drives();
+        if optical_tab.drive_count() > 0 {
+            log.info(format!(
+                "Found {} optical drive(s)",
+                optical_tab.drive_count()
+            ));
+        }
+
         // Start update check in background
         let update_info = Arc::new(Mutex::new(None));
         let update_info_clone = Arc::clone(&update_info);
@@ -128,6 +142,7 @@ impl Default for RustyBackupApp {
             backup_tab,
             restore_tab: RestoreTab::default(),
             inspect_tab: InspectTab::default(),
+            optical_tab,
             log_panel: log,
             progress: ProgressState::default(),
             devices,
@@ -144,7 +159,7 @@ impl Default for RustyBackupApp {
 impl eframe::App for RustyBackupApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Request repaint while backup/restore is running so progress updates are shown
-        if self.progress.active || self.restore_tab.is_running() {
+        if self.progress.active || self.restore_tab.is_running() || self.optical_tab.is_running() {
             ctx.request_repaint();
         }
 
@@ -154,6 +169,7 @@ impl eframe::App for RustyBackupApp {
                 ui.selectable_value(&mut self.active_tab, Tab::Backup, "Backup");
                 ui.selectable_value(&mut self.active_tab, Tab::Restore, "Restore");
                 ui.selectable_value(&mut self.active_tab, Tab::Inspect, "Inspect");
+                ui.selectable_value(&mut self.active_tab, Tab::Optical, "Optical");
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Version display
@@ -306,6 +322,10 @@ impl eframe::App for RustyBackupApp {
 
                 self.inspect_tab
                     .show(ui, &self.devices, &mut self.log_panel);
+            }
+            Tab::Optical => {
+                self.optical_tab
+                    .show(ui, &mut self.log_panel, &mut self.progress);
             }
         });
 

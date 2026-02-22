@@ -3,6 +3,7 @@ pub mod clonezilla;
 pub mod device;
 pub mod error;
 pub mod fs;
+pub mod optical;
 pub mod os;
 pub mod partition;
 pub mod privileged;
