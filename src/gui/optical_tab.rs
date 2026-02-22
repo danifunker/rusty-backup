@@ -262,6 +262,7 @@ impl OpticalTab {
                     Action::Rip => vec![
                         (OutputFormat::Iso, "ISO", true),
                         (OutputFormat::BinCue, "BIN/CUE", true),
+                        (OutputFormat::Chd, "CHD", self.chdman_available),
                     ],
                     Action::Convert => {
                         let source_format = self.disc_info.as_ref().map(|i| &i.format);
@@ -462,13 +463,16 @@ impl OpticalTab {
             }
         };
 
+        // CHD rip: rip to temp BIN/CUE, then convert to CHD
+        if self.output_format == OutputFormat::Chd {
+            self.start_rip_to_chd(drive.device_path.clone(), output_path, log);
+            return;
+        }
+
         let format = match self.output_format {
             OutputFormat::Iso => RipFormat::Iso,
             OutputFormat::BinCue => RipFormat::BinCue,
-            OutputFormat::Chd => {
-                log.error("Cannot rip directly to CHD. Rip to BIN/CUE first, then convert.");
-                return;
-            }
+            OutputFormat::Chd => unreachable!(),
         };
 
         let config = RipConfig {
@@ -493,6 +497,33 @@ impl OpticalTab {
                 if let Ok(mut p) = progress_arc.lock() {
                     p.error = Some(format!("{e:#}"));
                     p.finished = true;
+                }
+            }
+        });
+    }
+
+    /// Rip to CHD: rip to temporary BIN/CUE, convert to CHD, clean up temps.
+    fn start_rip_to_chd(&mut self, device_path: PathBuf, chd_path: PathBuf, log: &mut LogPanel) {
+        let eject_after = self.eject_after;
+
+        log.info(format!(
+            "Starting rip to CHD: {} -> {}",
+            device_path.display(),
+            chd_path.display()
+        ));
+
+        let progress_arc = Arc::new(Mutex::new(ConvertProgress::new()));
+        self.convert_progress = Some(Arc::clone(&progress_arc));
+        self.convert_running = true;
+
+        std::thread::spawn(move || {
+            let result = rip_to_chd_worker(&device_path, &chd_path, eject_after, &progress_arc);
+            if let Err(e) = result {
+                if let Ok(mut p) = progress_arc.lock() {
+                    if !p.finished {
+                        p.error = Some(format!("{e:#}"));
+                        p.finished = true;
+                    }
                 }
             }
         });
@@ -672,4 +703,78 @@ fn run_conversion(
             );
         }
     }
+}
+
+/// Background worker: rip disc to temp BIN/CUE, convert to CHD, clean up.
+fn rip_to_chd_worker(
+    device_path: &std::path::Path,
+    chd_path: &std::path::Path,
+    eject_after: bool,
+    progress: &Arc<Mutex<ConvertProgress>>,
+) -> anyhow::Result<()> {
+    use rusty_backup::backup::LogLevel;
+    use rusty_backup::optical::{convert, rip};
+
+    // Step 1: Rip to temporary BIN/CUE next to the output CHD
+    let parent = chd_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let temp_cue = parent.join(".rusty-backup-rip-temp.cue");
+    let temp_bin = parent.join(".rusty-backup-rip-temp.bin");
+
+    let rip_config = RipConfig {
+        device_path: device_path.to_path_buf(),
+        output_path: temp_cue.clone(),
+        format: RipFormat::BinCue,
+        eject_after,
+    };
+
+    if let Ok(mut p) = progress.lock() {
+        p.operation = "Ripping to temporary BIN/CUE...".into();
+    }
+
+    // Use a separate RipProgress and drain its messages into our ConvertProgress
+    let rip_progress = Arc::new(Mutex::new(rip::RipProgress::new()));
+    rip::run_rip(rip_config, Arc::clone(&rip_progress))?;
+
+    // Drain rip log messages
+    if let Ok(mut rp) = rip_progress.lock() {
+        while let Some(msg) = rp.log_messages.pop_front() {
+            if let Ok(mut p) = progress.lock() {
+                p.log_messages.push_back(msg);
+            }
+        }
+    }
+
+    // Step 2: Convert temp BIN/CUE to CHD
+    if let Ok(mut p) = progress.lock() {
+        p.log_messages.push_back(rusty_backup::backup::LogMessage {
+            level: LogLevel::Info,
+            message: "Rip complete, converting to CHD...".into(),
+        });
+    }
+
+    let convert_progress = Arc::new(Mutex::new(ConvertProgress::new()));
+    let convert_result = convert::to_chd(&temp_cue, chd_path, Arc::clone(&convert_progress));
+
+    // Drain convert log messages
+    if let Ok(mut cp) = convert_progress.lock() {
+        while let Some(msg) = cp.log_messages.pop_front() {
+            if let Ok(mut p) = progress.lock() {
+                p.log_messages.push_back(msg);
+            }
+        }
+    }
+
+    // Clean up temp files regardless of result
+    let _ = std::fs::remove_file(&temp_cue);
+    let _ = std::fs::remove_file(&temp_bin);
+
+    convert_result?;
+
+    if let Ok(mut p) = progress.lock() {
+        p.finished = true;
+    }
+
+    Ok(())
 }
