@@ -2,9 +2,6 @@ name: Release
 
 on:
   push:
-    branches:
-      - main
-      - master
     paths-ignore:
       - "*.md"
       - "docs/**"
@@ -488,6 +485,7 @@ jobs:
 
   release:
     name: Create Release
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
     needs: [generate-version, build-windows, build-macos, build-linux-appimage, build-linux-packages]
     runs-on: ubuntu-latest
     steps:
