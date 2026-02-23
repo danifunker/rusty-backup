@@ -828,7 +828,11 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
     // Step 8: Filesystem resize operations (using inner File to avoid buffer flush on every seek)
     set_operation(&progress, "Finalizing filesystems...");
 
-    for (pm, ov) in metadata.partitions.iter().zip(&overrides) {
+    for pm in &metadata.partitions {
+        let ov = match overrides.iter().find(|o| o.index == pm.index) {
+            Some(o) => o,
+            None => continue,
+        };
         let part_offset = ov.effective_start_lba() * 512;
         let export_size = ov.export_size;
 

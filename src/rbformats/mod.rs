@@ -441,12 +441,13 @@ pub fn reconstruct_disk_from_backup(
             export_size
         ));
 
+        let base_offset = total_written;
         let bytes_written = decompress_to_writer(
             &data_path,
             &metadata.compression_type,
             writer,
             Some(export_size),
-            progress_cb,
+            &mut |bytes| progress_cb(base_offset + bytes),
             cancel_check,
             log_cb,
         )
