@@ -17,12 +17,13 @@ use objc2_core_foundation::{
     CFString, CFURL,
 };
 use objc2_disk_arbitration::{
-    kDADiskDescriptionDeviceInternalKey, kDADiskDescriptionDeviceModelKey,
-    kDADiskDescriptionDeviceProtocolKey, kDADiskDescriptionMediaBSDNameKey,
-    kDADiskDescriptionMediaRemovableKey, kDADiskDescriptionMediaSizeKey,
-    kDADiskDescriptionMediaWritableKey, kDADiskDescriptionVolumeKindKey,
-    kDADiskDescriptionVolumePathKey, kDADiskUnmountOptionForce, kDADiskUnmountOptionWhole, DADisk,
-    DADiskUnmountCallback, DADissenter, DASession,
+    kDADiskClaimOptionDefault, kDADiskDescriptionDeviceInternalKey,
+    kDADiskDescriptionDeviceModelKey, kDADiskDescriptionDeviceProtocolKey,
+    kDADiskDescriptionMediaBSDNameKey, kDADiskDescriptionMediaRemovableKey,
+    kDADiskDescriptionMediaSizeKey, kDADiskDescriptionMediaWritableKey,
+    kDADiskDescriptionVolumeKindKey, kDADiskDescriptionVolumePathKey, kDADiskUnmountOptionForce,
+    kDADiskUnmountOptionWhole, DADisk, DADiskClaimCallback, DADiskUnmountCallback, DADissenter,
+    DASession,
 };
 use objc2_io_kit::{
     kIOMainPortDefault, IOIteratorNext, IOObjectRelease, IORegistryEntryCreateCFProperties,
@@ -418,6 +419,116 @@ fn da_unmount_disk(bsd_name: &str) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// DiskArbitration exclusive claim
+// ---------------------------------------------------------------------------
+
+/// RAII guard that holds an exclusive claim on a disk via DiskArbitration.
+///
+/// While held, the system and other applications (e.g. VMware) cannot mount
+/// or claim the disk. The claim is released when this guard is dropped.
+pub(crate) struct DiskClaim {
+    _session: objc2_core_foundation::CFRetained<DASession>,
+    disk: objc2_core_foundation::CFRetained<DADisk>,
+    run_loop: objc2_core_foundation::CFRetained<CFRunLoop>,
+}
+
+// Safety: DiskClaim only holds CF objects that are thread-safe (CFRetained
+// pointers to immutable Core Foundation types). DADiskUnclaim and
+// CFRunLoop unschedule are safe to call from any thread.
+unsafe impl Send for DiskClaim {}
+
+impl Drop for DiskClaim {
+    fn drop(&mut self) {
+        unsafe {
+            self.disk.unclaim();
+            let mode = kCFRunLoopDefaultMode.unwrap();
+            self._session.unschedule_from_run_loop(&self.run_loop, mode);
+        }
+    }
+}
+
+/// Synchronously claim a disk for exclusive use via DiskArbitration.
+///
+/// Returns `Ok(Some(guard))` on success, `Ok(None)` if the claim fails
+/// (non-fatal — the operation can proceed without exclusive access), or
+/// `Err` only for setup failures.
+fn da_claim_disk(bsd_name: &str) -> Result<Option<DiskClaim>> {
+    let session =
+        unsafe { DASession::new(None) }.context("failed to create DiskArbitration session")?;
+
+    let c_name = CString::new(bsd_name).context("invalid BSD name")?;
+    let disk = unsafe {
+        DADisk::from_bsd_name(
+            None,
+            &session,
+            NonNull::new(c_name.as_ptr() as *mut _).unwrap(),
+        )
+    }
+    .context(format!("failed to create DADisk for {}", bsd_name))?;
+
+    let run_loop = CFRunLoop::current().context("failed to get current CFRunLoop")?;
+    let mode = unsafe { kCFRunLoopDefaultMode.unwrap() };
+    unsafe { session.schedule_with_run_loop(&run_loop, mode) };
+
+    // Shared state for the callback
+    static CLAIM_DONE: AtomicBool = AtomicBool::new(false);
+    static CLAIM_OK: AtomicBool = AtomicBool::new(false);
+    CLAIM_DONE.store(false, Ordering::SeqCst);
+    CLAIM_OK.store(false, Ordering::SeqCst);
+
+    unsafe extern "C-unwind" fn claim_callback(
+        _disk: NonNull<DADisk>,
+        dissenter: *const DADissenter,
+        _context: *mut c_void,
+    ) {
+        CLAIM_OK.store(dissenter.is_null(), Ordering::SeqCst);
+        CLAIM_DONE.store(true, Ordering::SeqCst);
+        if let Some(rl) = CFRunLoop::current() {
+            rl.stop();
+        }
+    }
+
+    let callback: DADiskClaimCallback = Some(claim_callback);
+
+    unsafe {
+        disk.claim(
+            kDADiskClaimOptionDefault,
+            None,            // no release callback — claim can never be stolen
+            ptr::null_mut(), // release context
+            callback,
+            ptr::null_mut(), // callback context
+        );
+    }
+
+    let timeout_secs = 10.0;
+    CFRunLoop::run_in_mode(Some(mode), timeout_secs, false);
+
+    if !CLAIM_DONE.load(Ordering::SeqCst) {
+        unsafe { session.unschedule_from_run_loop(&run_loop, mode) };
+        eprintln!(
+            "DA claim of {} timed out — proceeding without exclusive access",
+            bsd_name
+        );
+        return Ok(None);
+    }
+    if !CLAIM_OK.load(Ordering::SeqCst) {
+        unsafe { session.unschedule_from_run_loop(&run_loop, mode) };
+        eprintln!(
+            "DA claim of {} failed — proceeding without exclusive access",
+            bsd_name
+        );
+        return Ok(None);
+    }
+
+    // Keep session scheduled so the claim stays alive — DiskClaim::drop will unschedule
+    Ok(Some(DiskClaim {
+        _session: session,
+        disk,
+        run_loop,
+    }))
+}
+
 /// Extract the BSD disk name from a device path like `/dev/diskN` or `/dev/rdiskN`.
 fn bsd_name_from_path(path: &Path) -> &str {
     let path_str = path.to_str().unwrap_or("");
@@ -430,15 +541,28 @@ fn bsd_name_from_path(path: &Path) -> &str {
     }
 }
 
-/// Open a target device for writing, unmounting it first.
+/// Open a target device for writing, claiming and unmounting it first.
 ///
-/// Uses DiskArbitration to unmount all volumes on the disk. If normal open
-/// fails with permission denied, falls back to `osascript` to run
+/// Claims the disk for exclusive access via DiskArbitration (prevents other
+/// apps like VMware from interfering), then unmounts all volumes. If normal
+/// open fails with permission denied, falls back to `osascript` to run
 /// `diskutil unmountDisk force` with admin privileges via the native macOS
 /// authentication dialog (DA doesn't provide admin prompting).
-pub fn open_target_for_writing(path: &Path) -> Result<File> {
+///
+/// Returns the file handle and an optional `DiskClaim` guard that must be
+/// kept alive for the duration of the operation.
+pub(crate) fn open_target_for_writing(path: &Path) -> Result<(File, Option<DiskClaim>)> {
     let path_str = path.to_string_lossy();
     let disk_name = bsd_name_from_path(path);
+
+    // Claim the disk for exclusive access before unmounting
+    let claim = match da_claim_disk(disk_name) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("DA claim warning: {}", e);
+            None
+        }
+    };
 
     // Unmount all partitions on the disk first via DiskArbitration
     if let Err(e) = da_unmount_disk(disk_name) {
@@ -459,7 +583,7 @@ pub fn open_target_for_writing(path: &Path) -> Result<File> {
         .write(true)
         .open(&raw_device)
     {
-        Ok(file) => return Ok(file),
+        Ok(file) => return Ok((file, claim)),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             // Fall through to elevation attempt
         }
@@ -491,7 +615,7 @@ pub fn open_target_for_writing(path: &Path) -> Result<File> {
     }
 
     // Try opening again after elevated unmount
-    std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(&raw_device)
@@ -500,16 +624,40 @@ pub fn open_target_for_writing(path: &Path) -> Result<File> {
                 "cannot open {} for writing (even after elevated unmount)",
                 raw_device
             )
-        })
+        })?;
+    Ok((file, claim))
 }
 
 /// Open a source device or image file for reading.
 ///
-/// For device paths (`/dev/disk*`), the application should already be running
-/// with elevated privileges (via sudo at startup). If not elevated, this will
-/// return a permission denied error with a helpful message.
+/// For device paths (`/dev/disk*`), claims the disk for exclusive access and
+/// unmounts all volumes before opening. The application should already be
+/// running with elevated privileges (via sudo at startup). If not elevated,
+/// this will return a permission denied error with a helpful message.
 pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
     let path_str = path.to_string_lossy();
+    let is_device = path_str.starts_with("/dev/disk") || path_str.starts_with("/dev/rdisk");
+
+    // For devices: claim + unmount before opening
+    let disk_claim = if is_device {
+        let disk_name = bsd_name_from_path(path);
+
+        let claim = match da_claim_disk(disk_name) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("DA claim warning: {}", e);
+                None
+            }
+        };
+
+        if let Err(e) = da_unmount_disk(disk_name) {
+            eprintln!("DA unmount warning: {}", e);
+        }
+
+        claim
+    } else {
+        None
+    };
 
     // Use /dev/rdiskN (raw character device) for faster unbuffered reads
     let actual_path = if path_str.starts_with("/dev/disk") {
@@ -523,6 +671,7 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
         Ok(file) => Ok(ElevatedSource {
             file,
             temp_path: None,
+            disk_claim,
         }),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             if path_str.starts_with("/dev/") {
