@@ -356,8 +356,16 @@ pub fn reconstruct_disk_from_backup(
         writer.seek(SeekFrom::Start(512))?;
     }
 
+    // Sort partitions by effective start LBA so we always write forward.
+    // APM and other schemes can store partitions in arbitrary index order
+    // (e.g. index 1 at LBA 300M, index 2 at LBA 100M). Writing in index
+    // order would skip the backward seek and corrupt the disk.
+    let mut sorted_partitions: Vec<&crate::backup::metadata::PartitionMetadata> =
+        metadata.partitions.iter().collect();
+    sorted_partitions.sort_by_key(|pm| get_effective_start_lba(pm.index, pm.start_lba));
+
     // Write each partition at its correct offset, filling gaps with zeros
-    for pm in &metadata.partitions {
+    for pm in &sorted_partitions {
         if cancel_check() {
             bail!("operation cancelled");
         }
