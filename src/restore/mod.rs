@@ -144,6 +144,11 @@ pub fn calculate_restore_layout(
     partition_sizes: &[RestorePartitionSize],
     target_size: u64,
 ) -> Result<Vec<PartitionSizeOverride>> {
+    // APM: use dedicated layout logic that preserves absolute positions
+    if metadata.partition_table_type == "APM" {
+        return calculate_apm_restore_layout(metadata, alignment, partition_sizes, target_size);
+    }
+
     // Superfloppy: single partition at offset 0, no alignment
     if metadata.partition_table_type == "None" {
         if let Some(pm) = metadata.partitions.first() {
@@ -172,10 +177,7 @@ pub fn calculate_restore_layout(
     };
 
     // Separate primary and logical partitions
-    let has_logical = metadata
-        .partitions
-        .iter()
-        .any(|pm| pm.is_logical || pm.index >= 4);
+    let has_logical = metadata.partitions.iter().any(|pm| pm.is_logical);
 
     let is_gpt = metadata.partition_table_type == "GPT";
 
@@ -196,7 +198,7 @@ pub fn calculate_restore_layout(
 
     // First pass: lay out primary (non-logical) partitions, skip logical ones
     for pm in &metadata.partitions {
-        if pm.is_logical || pm.index >= 4 {
+        if pm.is_logical {
             continue; // handled in second pass
         }
 
@@ -255,7 +257,7 @@ pub fn calculate_restore_layout(
         let mut logical_pms: Vec<&crate::backup::metadata::PartitionMetadata> = metadata
             .partitions
             .iter()
-            .filter(|pm| pm.is_logical || pm.index >= 4)
+            .filter(|pm| pm.is_logical)
             .collect();
         logical_pms.sort_by_key(|pm| pm.start_lba);
 
@@ -364,6 +366,145 @@ pub fn calculate_restore_layout(
     Ok(overrides)
 }
 
+/// Calculate partition layout for APM (Apple Partition Map) restores.
+///
+/// APM partitions have fixed absolute positions (not sequential like MBR).
+/// With Original alignment, each partition keeps its original `start_lba`.
+/// With non-Original alignment, partitions are sorted by `start_lba` and
+/// laid out sequentially from the minimum start LBA.
+fn calculate_apm_restore_layout(
+    metadata: &BackupMetadata,
+    alignment: &RestoreAlignment,
+    partition_sizes: &[RestorePartitionSize],
+    target_size: u64,
+) -> Result<Vec<PartitionSizeOverride>> {
+    let usable_target_size = target_size;
+
+    // Sort partitions by start_lba for consistent layout
+    let mut sorted_parts: Vec<&crate::backup::metadata::PartitionMetadata> =
+        metadata.partitions.iter().collect();
+    sorted_parts.sort_by_key(|pm| pm.start_lba);
+
+    let mut overrides = Vec::new();
+
+    match alignment {
+        RestoreAlignment::Original => {
+            // Each partition keeps its original absolute position
+            for pm in &sorted_parts {
+                let size_choice = partition_sizes
+                    .iter()
+                    .find(|s| s.index == pm.index)
+                    .map(|s| &s.size_choice)
+                    .unwrap_or(&RestoreSizeChoice::Original);
+
+                let partition_size =
+                    compute_partition_size(size_choice, pm, pm.start_lba, usable_target_size);
+
+                overrides.push(PartitionSizeOverride {
+                    index: pm.index,
+                    start_lba: pm.start_lba,
+                    original_size: pm.original_size_bytes,
+                    export_size: partition_size,
+                    new_start_lba: None,
+                    heads: 0,
+                    sectors_per_track: 0,
+                });
+            }
+        }
+        RestoreAlignment::Modern1MB | RestoreAlignment::Custom(_) => {
+            // Sequential layout from the earliest partition position
+            let alignment_sectors = match alignment {
+                RestoreAlignment::Modern1MB => 2048,
+                RestoreAlignment::Custom(n) => *n,
+                _ => unreachable!(),
+            };
+
+            let mut current_lba = sorted_parts.first().map(|pm| pm.start_lba).unwrap_or(0);
+
+            // Align the starting LBA
+            if alignment_sectors > 0 {
+                let rem = current_lba % alignment_sectors;
+                if rem != 0 {
+                    current_lba += alignment_sectors - rem;
+                }
+            }
+
+            for pm in &sorted_parts {
+                let size_choice = partition_sizes
+                    .iter()
+                    .find(|s| s.index == pm.index)
+                    .map(|s| &s.size_choice)
+                    .unwrap_or(&RestoreSizeChoice::Original);
+
+                // Align current_lba
+                if alignment_sectors > 0 {
+                    let rem = current_lba % alignment_sectors;
+                    if rem != 0 {
+                        current_lba += alignment_sectors - rem;
+                    }
+                }
+
+                let partition_size =
+                    compute_partition_size(size_choice, pm, current_lba, usable_target_size);
+
+                let new_start_lba = if current_lba != pm.start_lba {
+                    Some(current_lba)
+                } else {
+                    None
+                };
+
+                overrides.push(PartitionSizeOverride {
+                    index: pm.index,
+                    start_lba: pm.start_lba,
+                    original_size: pm.original_size_bytes,
+                    export_size: partition_size,
+                    new_start_lba,
+                    heads: 0,
+                    sectors_per_track: 0,
+                });
+
+                current_lba += partition_size / 512;
+            }
+        }
+    }
+
+    // Validate: no partition extends past usable area
+    let usable_sectors = usable_target_size / 512;
+    for ov in &overrides {
+        let end_lba = ov.effective_start_lba() + ov.export_size / 512;
+        if end_lba > usable_sectors {
+            bail!(
+                "Partition {} would end at LBA {} which exceeds usable area ({} sectors)",
+                ov.index,
+                end_lba,
+                usable_sectors,
+            );
+        }
+    }
+
+    // Validate: all sizes >= minimum
+    for ov in &overrides {
+        let pm = metadata.partitions.iter().find(|p| p.index == ov.index);
+        if let Some(pm) = pm {
+            let min = if pm.imaged_size_bytes > 0 {
+                pm.imaged_size_bytes
+            } else {
+                pm.original_size_bytes
+            };
+            if ov.export_size < min {
+                bail!(
+                    "Partition {} size ({}) is smaller than minimum ({})",
+                    ov.index,
+                    ov.export_size,
+                    min,
+                );
+            }
+        }
+    }
+
+    Ok(overrides)
+}
+
 /// Compute a partition's size in bytes given the user's size choice.
 fn compute_partition_size(
     size_choice: &RestoreSizeChoice,
@@ -414,7 +555,7 @@ pub fn build_restore_ebr_chain(
     )> = metadata
         .partitions
         .iter()
-        .filter(|pm| pm.is_logical || pm.index >= 4)
+        .filter(|pm| pm.is_logical)
         .filter_map(|pm| {
             overrides
                 .iter()
