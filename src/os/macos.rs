@@ -448,6 +448,9 @@ static DENY_MOUNT_PREFIX: Mutex<Option<String>> = Mutex::new(None);
 
 /// Mount approval callback: denies mounts on any disk whose BSD name starts
 /// with the prefix stored in `DENY_MOUNT_PREFIX`.
+///
+/// Uses `try_lock()` to never block — if the lock is contended, we approve
+/// the mount rather than risk deadlocking the DiskArbitration system thread.
 unsafe extern "C-unwind" fn deny_mount_callback(
     disk: NonNull<DADisk>,
     _context: *mut c_void,
@@ -457,15 +460,18 @@ unsafe extern "C-unwind" fn deny_mount_callback(
     if !name_ptr.is_null() {
         let name = unsafe { std::ffi::CStr::from_ptr(name_ptr) };
         if let Ok(name_str) = name.to_str() {
-            let guard = DENY_MOUNT_PREFIX.lock().unwrap();
-            if let Some(ref prefix) = *guard {
-                if name_str.starts_with(prefix.as_str()) {
-                    // Return a dissenter to deny this mount
-                    let reason = CFString::from_str("Rusty Backup has exclusive access");
-                    let dissenter =
-                        unsafe { DADissenter::new(None, kDAReturnExclusiveAccess, Some(&reason)) };
-                    // Leak one ref to the caller (caller owns the returned reference)
-                    return objc2_core_foundation::CFRetained::into_raw(dissenter).as_ptr();
+            // try_lock: never block the DA system thread
+            if let Ok(guard) = DENY_MOUNT_PREFIX.try_lock() {
+                if let Some(ref prefix) = *guard {
+                    if name_str.starts_with(prefix.as_str()) {
+                        // Return a dissenter to deny this mount
+                        let reason = CFString::from_str("Rusty Backup has exclusive access");
+                        let dissenter = unsafe {
+                            DADissenter::new(None, kDAReturnExclusiveAccess, Some(&reason))
+                        };
+                        // Leak one ref to the caller (caller owns the returned reference)
+                        return objc2_core_foundation::CFRetained::into_raw(dissenter).as_ptr();
+                    }
                 }
             }
         }
@@ -478,14 +484,21 @@ unsafe extern "C-unwind" fn deny_mount_callback(
 ///
 /// While held, the system and other applications (e.g. VMware) cannot mount
 /// or claim the disk. Released when dropped.
+///
+/// The approval session is scheduled on the **main run loop** (the GUI event
+/// loop), not the calling thread's run loop. This is critical: the calling
+/// thread does blocking disk I/O and never pumps its run loop. If the
+/// approval callback were scheduled there, DA would wait forever for a
+/// response, deadlocking all system mount operations.
 pub(crate) struct DiskClaim {
     // Claim session + disk (prevents other apps from claiming)
     _claim_session: objc2_core_foundation::CFRetained<DASession>,
     claim_disk: objc2_core_foundation::CFRetained<DADisk>,
     claim_run_loop: objc2_core_foundation::CFRetained<CFRunLoop>,
     // Approval session (denies mount attempts on all partitions)
+    // Scheduled on the MAIN run loop so callbacks fire while worker threads do I/O
     approval_session: objc2_core_foundation::CFRetained<DAApprovalSession>,
-    approval_run_loop: objc2_core_foundation::CFRetained<CFRunLoop>,
+    main_run_loop: objc2_core_foundation::CFRetained<CFRunLoop>,
 }
 
 // Safety: DiskClaim only holds CF objects that are thread-safe (CFRetained
@@ -504,10 +517,12 @@ impl Drop for DiskClaim {
             );
             let mode = kCFRunLoopDefaultMode.unwrap();
             self.approval_session
-                .unschedule_from_run_loop(&self.approval_run_loop, mode);
+                .unschedule_from_run_loop(&self.main_run_loop, mode);
 
             // Clear the deny prefix
-            *DENY_MOUNT_PREFIX.lock().unwrap() = None;
+            if let Ok(mut guard) = DENY_MOUNT_PREFIX.lock() {
+                *guard = None;
+            }
 
             // Release the whole-disk claim
             self.claim_disk.unclaim();
@@ -590,11 +605,16 @@ fn da_claim_disk(bsd_name: &str) -> Result<Option<DiskClaim>> {
     }
 
     // --- 2. Register mount-denial callback for all partitions ---
+    //
+    // CRITICAL: schedule on the MAIN run loop, not the current thread's.
+    // The calling thread will block on disk I/O and never pump its run loop.
+    // If we scheduled there, DA would wait forever for the approval callback
+    // to return, deadlocking all system mount operations.
     let approval_session =
         unsafe { DAApprovalSession::new(None) }.context("failed to create DAApprovalSession")?;
 
-    let approval_run_loop = CFRunLoop::current().context("failed to get current CFRunLoop")?;
-    unsafe { approval_session.schedule_with_run_loop(&approval_run_loop, mode) };
+    let main_run_loop = CFRunLoop::main().context("failed to get main CFRunLoop")?;
+    unsafe { approval_session.schedule_with_run_loop(&main_run_loop, mode) };
 
     // Set the prefix that the callback will match against
     *DENY_MOUNT_PREFIX.lock().unwrap() = Some(bsd_name.to_string());
@@ -619,7 +639,7 @@ fn da_claim_disk(bsd_name: &str) -> Result<Option<DiskClaim>> {
         claim_disk,
         claim_run_loop,
         approval_session,
-        approval_run_loop,
+        main_run_loop,
     }))
 }
 
