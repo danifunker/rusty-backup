@@ -16,13 +16,16 @@ use objc2_core_foundation::{
     kCFRunLoopDefaultMode, CFBoolean, CFDictionary, CFMutableDictionary, CFNumber, CFRunLoop,
     CFString, CFURL,
 };
+use std::sync::Mutex;
+
 use objc2_disk_arbitration::{
     kDADiskClaimOptionDefault, kDADiskDescriptionDeviceInternalKey,
     kDADiskDescriptionDeviceModelKey, kDADiskDescriptionDeviceProtocolKey,
     kDADiskDescriptionMediaBSDNameKey, kDADiskDescriptionMediaRemovableKey,
     kDADiskDescriptionMediaSizeKey, kDADiskDescriptionMediaWritableKey,
     kDADiskDescriptionVolumeKindKey, kDADiskDescriptionVolumePathKey, kDADiskUnmountOptionForce,
-    kDADiskUnmountOptionWhole, DADisk, DADiskClaimCallback, DADiskUnmountCallback, DADissenter,
+    kDADiskUnmountOptionWhole, kDAReturnExclusiveAccess, DAApprovalSession, DADisk,
+    DADiskClaimCallback, DADiskMountApprovalCallback, DADiskUnmountCallback, DADissenter,
     DASession,
 };
 use objc2_io_kit::{
@@ -420,17 +423,69 @@ fn da_unmount_disk(bsd_name: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// DiskArbitration exclusive claim
+// DiskArbitration exclusive claim + mount denial
 // ---------------------------------------------------------------------------
 
-/// RAII guard that holds an exclusive claim on a disk via DiskArbitration.
+// The crate's binding for DARegisterDiskMountApprovalCallback has the wrong
+// session type (DASession instead of DAApprovalSession). Declare corrected externs.
+extern "C-unwind" {
+    fn DARegisterDiskMountApprovalCallback(
+        session: &DAApprovalSession,
+        r#match: Option<&CFDictionary>,
+        callback: DADiskMountApprovalCallback,
+        context: *mut c_void,
+    );
+    fn DAUnregisterApprovalCallback(
+        session: &DAApprovalSession,
+        callback: NonNull<c_void>,
+        context: *mut c_void,
+    );
+}
+
+/// Global state for the mount-denial callback: the BSD name prefix to deny
+/// (e.g. "disk2" denies mounts on disk2, disk2s1, disk2s2, …).
+static DENY_MOUNT_PREFIX: Mutex<Option<String>> = Mutex::new(None);
+
+/// Mount approval callback: denies mounts on any disk whose BSD name starts
+/// with the prefix stored in `DENY_MOUNT_PREFIX`.
+unsafe extern "C-unwind" fn deny_mount_callback(
+    disk: NonNull<DADisk>,
+    _context: *mut c_void,
+) -> *const DADissenter {
+    let disk_ref = unsafe { disk.as_ref() };
+    let name_ptr = unsafe { disk_ref.bsd_name() };
+    if !name_ptr.is_null() {
+        let name = unsafe { std::ffi::CStr::from_ptr(name_ptr) };
+        if let Ok(name_str) = name.to_str() {
+            let guard = DENY_MOUNT_PREFIX.lock().unwrap();
+            if let Some(ref prefix) = *guard {
+                if name_str.starts_with(prefix.as_str()) {
+                    // Return a dissenter to deny this mount
+                    let reason = CFString::from_str("Rusty Backup has exclusive access");
+                    let dissenter =
+                        unsafe { DADissenter::new(None, kDAReturnExclusiveAccess, Some(&reason)) };
+                    // Leak one ref to the caller (caller owns the returned reference)
+                    return objc2_core_foundation::CFRetained::into_raw(dissenter).as_ptr();
+                }
+            }
+        }
+    }
+    ptr::null() // NULL = approve mount (not our disk)
+}
+
+/// RAII guard that holds an exclusive claim on a disk via DiskArbitration
+/// and blocks all mount attempts on the disk and its partitions.
 ///
 /// While held, the system and other applications (e.g. VMware) cannot mount
-/// or claim the disk. The claim is released when this guard is dropped.
+/// or claim the disk. Released when dropped.
 pub(crate) struct DiskClaim {
-    _session: objc2_core_foundation::CFRetained<DASession>,
-    disk: objc2_core_foundation::CFRetained<DADisk>,
-    run_loop: objc2_core_foundation::CFRetained<CFRunLoop>,
+    // Claim session + disk (prevents other apps from claiming)
+    _claim_session: objc2_core_foundation::CFRetained<DASession>,
+    claim_disk: objc2_core_foundation::CFRetained<DADisk>,
+    claim_run_loop: objc2_core_foundation::CFRetained<CFRunLoop>,
+    // Approval session (denies mount attempts on all partitions)
+    approval_session: objc2_core_foundation::CFRetained<DAApprovalSession>,
+    approval_run_loop: objc2_core_foundation::CFRetained<CFRunLoop>,
 }
 
 // Safety: DiskClaim only holds CF objects that are thread-safe (CFRetained
@@ -441,37 +496,51 @@ unsafe impl Send for DiskClaim {}
 impl Drop for DiskClaim {
     fn drop(&mut self) {
         unsafe {
-            self.disk.unclaim();
+            // Unregister mount denial callback
+            DAUnregisterApprovalCallback(
+                &self.approval_session,
+                NonNull::new_unchecked(deny_mount_callback as *mut c_void),
+                ptr::null_mut(),
+            );
             let mode = kCFRunLoopDefaultMode.unwrap();
-            self._session.unschedule_from_run_loop(&self.run_loop, mode);
+            self.approval_session
+                .unschedule_from_run_loop(&self.approval_run_loop, mode);
+
+            // Clear the deny prefix
+            *DENY_MOUNT_PREFIX.lock().unwrap() = None;
+
+            // Release the whole-disk claim
+            self.claim_disk.unclaim();
+            self._claim_session
+                .unschedule_from_run_loop(&self.claim_run_loop, mode);
         }
     }
 }
 
-/// Synchronously claim a disk for exclusive use via DiskArbitration.
+/// Synchronously claim a disk for exclusive use and register a mount-denial
+/// callback for all its partitions.
 ///
-/// Returns `Ok(Some(guard))` on success, `Ok(None)` if the claim fails
-/// (non-fatal — the operation can proceed without exclusive access), or
-/// `Err` only for setup failures.
+/// Returns `Ok(Some(guard))` on success, `Ok(None)` if setup fails
+/// (non-fatal — the operation can proceed without exclusive access).
 fn da_claim_disk(bsd_name: &str) -> Result<Option<DiskClaim>> {
-    let session =
+    // --- 1. Claim the whole disk ---
+    let claim_session =
         unsafe { DASession::new(None) }.context("failed to create DiskArbitration session")?;
 
     let c_name = CString::new(bsd_name).context("invalid BSD name")?;
-    let disk = unsafe {
+    let claim_disk = unsafe {
         DADisk::from_bsd_name(
             None,
-            &session,
+            &claim_session,
             NonNull::new(c_name.as_ptr() as *mut _).unwrap(),
         )
     }
     .context(format!("failed to create DADisk for {}", bsd_name))?;
 
-    let run_loop = CFRunLoop::current().context("failed to get current CFRunLoop")?;
+    let claim_run_loop = CFRunLoop::current().context("failed to get current CFRunLoop")?;
     let mode = unsafe { kCFRunLoopDefaultMode.unwrap() };
-    unsafe { session.schedule_with_run_loop(&run_loop, mode) };
+    unsafe { claim_session.schedule_with_run_loop(&claim_run_loop, mode) };
 
-    // Shared state for the callback
     static CLAIM_DONE: AtomicBool = AtomicBool::new(false);
     static CLAIM_OK: AtomicBool = AtomicBool::new(false);
     CLAIM_DONE.store(false, Ordering::SeqCst);
@@ -490,9 +559,8 @@ fn da_claim_disk(bsd_name: &str) -> Result<Option<DiskClaim>> {
     }
 
     let callback: DADiskClaimCallback = Some(claim_callback);
-
     unsafe {
-        disk.claim(
+        claim_disk.claim(
             kDADiskClaimOptionDefault,
             None,            // no release callback — claim can never be stolen
             ptr::null_mut(), // release context
@@ -505,7 +573,7 @@ fn da_claim_disk(bsd_name: &str) -> Result<Option<DiskClaim>> {
     CFRunLoop::run_in_mode(Some(mode), timeout_secs, false);
 
     if !CLAIM_DONE.load(Ordering::SeqCst) {
-        unsafe { session.unschedule_from_run_loop(&run_loop, mode) };
+        unsafe { claim_session.unschedule_from_run_loop(&claim_run_loop, mode) };
         eprintln!(
             "DA claim of {} timed out — proceeding without exclusive access",
             bsd_name
@@ -513,7 +581,7 @@ fn da_claim_disk(bsd_name: &str) -> Result<Option<DiskClaim>> {
         return Ok(None);
     }
     if !CLAIM_OK.load(Ordering::SeqCst) {
-        unsafe { session.unschedule_from_run_loop(&run_loop, mode) };
+        unsafe { claim_session.unschedule_from_run_loop(&claim_run_loop, mode) };
         eprintln!(
             "DA claim of {} failed — proceeding without exclusive access",
             bsd_name
@@ -521,11 +589,37 @@ fn da_claim_disk(bsd_name: &str) -> Result<Option<DiskClaim>> {
         return Ok(None);
     }
 
-    // Keep session scheduled so the claim stays alive — DiskClaim::drop will unschedule
+    // --- 2. Register mount-denial callback for all partitions ---
+    let approval_session =
+        unsafe { DAApprovalSession::new(None) }.context("failed to create DAApprovalSession")?;
+
+    let approval_run_loop = CFRunLoop::current().context("failed to get current CFRunLoop")?;
+    unsafe { approval_session.schedule_with_run_loop(&approval_run_loop, mode) };
+
+    // Set the prefix that the callback will match against
+    *DENY_MOUNT_PREFIX.lock().unwrap() = Some(bsd_name.to_string());
+
+    let approval_callback: DADiskMountApprovalCallback = Some(deny_mount_callback);
+    unsafe {
+        DARegisterDiskMountApprovalCallback(
+            &approval_session,
+            None, // match all disks — callback filters by prefix
+            approval_callback,
+            ptr::null_mut(),
+        );
+    }
+
+    eprintln!(
+        "DA: claimed {} and registered mount denial for {}*",
+        bsd_name, bsd_name
+    );
+
     Ok(Some(DiskClaim {
-        _session: session,
-        disk,
-        run_loop,
+        _claim_session: claim_session,
+        claim_disk,
+        claim_run_loop,
+        approval_session,
+        approval_run_loop,
     }))
 }
 
