@@ -19,12 +19,13 @@ use objc2_core_foundation::{
 };
 
 use objc2_disk_arbitration::{
-    kDADiskDescriptionDeviceInternalKey, kDADiskDescriptionDeviceModelKey,
-    kDADiskDescriptionDeviceProtocolKey, kDADiskDescriptionMediaBSDNameKey,
-    kDADiskDescriptionMediaRemovableKey, kDADiskDescriptionMediaSizeKey,
-    kDADiskDescriptionMediaWritableKey, kDADiskDescriptionVolumeKindKey,
-    kDADiskDescriptionVolumePathKey, kDADiskUnmountOptionForce, kDADiskUnmountOptionWhole, DADisk,
-    DADiskUnmountCallback, DADissenter, DASession,
+    kDADiskClaimOptionDefault, kDADiskDescriptionDeviceInternalKey,
+    kDADiskDescriptionDeviceModelKey, kDADiskDescriptionDeviceProtocolKey,
+    kDADiskDescriptionMediaBSDNameKey, kDADiskDescriptionMediaRemovableKey,
+    kDADiskDescriptionMediaSizeKey, kDADiskDescriptionMediaWritableKey,
+    kDADiskDescriptionVolumeKindKey, kDADiskDescriptionVolumePathKey, kDADiskUnmountOptionForce,
+    kDADiskUnmountOptionWhole, DADisk, DADiskClaimCallback, DADiskUnmountCallback, DADissenter,
+    DASession,
 };
 use objc2_io_kit::{
     kIOMainPortDefault, IOIteratorNext, IOObjectRelease, IORegistryEntryCreateCFProperties,
@@ -421,6 +422,119 @@ fn da_unmount_disk(bsd_name: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// DiskArbitration exclusive claim
+// ---------------------------------------------------------------------------
+
+/// RAII guard that holds an exclusive claim on a disk via DiskArbitration.
+///
+/// While held, other DiskArbitration clients (e.g. VMware Fusion) cannot
+/// claim or interact with the disk. Released when dropped.
+///
+/// Note: this does NOT prevent the kernel from mounting partitions — that's
+/// handled by `O_EXLOCK` on the file descriptor. The claim only prevents
+/// other DA clients from claiming the disk.
+pub(crate) struct DiskClaim {
+    _session: objc2_core_foundation::CFRetained<DASession>,
+    disk: objc2_core_foundation::CFRetained<DADisk>,
+    run_loop: objc2_core_foundation::CFRetained<CFRunLoop>,
+}
+
+// Safety: DiskClaim only holds CF objects that are thread-safe (CFRetained
+// pointers to immutable Core Foundation types). DADiskUnclaim and
+// CFRunLoop unschedule are safe to call from any thread.
+unsafe impl Send for DiskClaim {}
+
+impl Drop for DiskClaim {
+    fn drop(&mut self) {
+        unsafe {
+            let mode = kCFRunLoopDefaultMode.unwrap();
+            self.disk.unclaim();
+            self._session.unschedule_from_run_loop(&self.run_loop, mode);
+        }
+    }
+}
+
+/// Synchronously claim a disk for exclusive use via DiskArbitration.
+///
+/// This prevents other DA clients (e.g. VMware Fusion) from claiming or
+/// interacting with the disk. Non-fatal: returns `Ok(None)` if the claim
+/// fails (the operation can proceed without it).
+fn da_claim_disk(bsd_name: &str) -> Result<Option<DiskClaim>> {
+    let session =
+        unsafe { DASession::new(None) }.context("failed to create DiskArbitration session")?;
+
+    let c_name = CString::new(bsd_name).context("invalid BSD name")?;
+    let disk = unsafe {
+        DADisk::from_bsd_name(
+            None,
+            &session,
+            NonNull::new(c_name.as_ptr() as *mut _).unwrap(),
+        )
+    }
+    .context(format!("failed to create DADisk for {}", bsd_name))?;
+
+    let run_loop = CFRunLoop::current().context("failed to get current CFRunLoop")?;
+    let mode = unsafe { kCFRunLoopDefaultMode.unwrap() };
+    unsafe { session.schedule_with_run_loop(&run_loop, mode) };
+
+    static CLAIM_DONE: AtomicBool = AtomicBool::new(false);
+    static CLAIM_OK: AtomicBool = AtomicBool::new(false);
+    CLAIM_DONE.store(false, Ordering::SeqCst);
+    CLAIM_OK.store(false, Ordering::SeqCst);
+
+    unsafe extern "C-unwind" fn claim_callback(
+        _disk: NonNull<DADisk>,
+        dissenter: *const DADissenter,
+        _context: *mut c_void,
+    ) {
+        CLAIM_OK.store(dissenter.is_null(), Ordering::SeqCst);
+        CLAIM_DONE.store(true, Ordering::SeqCst);
+        if let Some(rl) = CFRunLoop::current() {
+            rl.stop();
+        }
+    }
+
+    let callback: DADiskClaimCallback = Some(claim_callback);
+    unsafe {
+        disk.claim(
+            kDADiskClaimOptionDefault,
+            None,            // no release callback — claim can never be stolen
+            ptr::null_mut(), // release context
+            callback,
+            ptr::null_mut(), // callback context
+        );
+    }
+
+    let timeout_secs = 10.0;
+    CFRunLoop::run_in_mode(Some(mode), timeout_secs, false);
+
+    if !CLAIM_DONE.load(Ordering::SeqCst) {
+        unsafe { session.unschedule_from_run_loop(&run_loop, mode) };
+        eprintln!(
+            "DA claim of {} timed out — proceeding without exclusive access",
+            bsd_name
+        );
+        return Ok(None);
+    }
+    if !CLAIM_OK.load(Ordering::SeqCst) {
+        unsafe { session.unschedule_from_run_loop(&run_loop, mode) };
+        eprintln!(
+            "DA claim of {} failed — proceeding without exclusive access",
+            bsd_name
+        );
+        return Ok(None);
+    }
+
+    eprintln!("DA: claimed {} for exclusive access", bsd_name);
+
+    Ok(Some(DiskClaim {
+        _session: session,
+        disk,
+        run_loop,
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // O_EXLOCK exclusive device access
 // ---------------------------------------------------------------------------
 
@@ -490,22 +604,32 @@ fn bsd_name_from_path(path: &Path) -> &str {
 
 /// Open a target device for writing with exclusive access.
 ///
-/// Unmounts all volumes via DiskArbitration, then opens the raw character
-/// device (`/dev/rdiskN`) with `O_EXLOCK` for kernel-level exclusive access.
-/// This prevents macOS from mounting any partition on the disk while the fd
-/// is held — no DiskArbitration claim or mount-approval callbacks needed.
+/// Uses a two-layer locking strategy:
+/// 1. `DADiskClaim` — prevents other DiskArbitration clients (e.g. VMware
+///    Fusion) from claiming or interacting with the disk.
+/// 2. `O_EXLOCK` — kernel-level exclusive lock that prevents macOS from
+///    mounting any partition on the disk while the fd is held.
 ///
 /// If the initial open fails with permission denied, falls back to `osascript`
 /// to run `diskutil unmountDisk force` with admin privileges, then retries.
-pub(crate) fn open_target_for_writing(path: &Path) -> Result<File> {
+pub(crate) fn open_target_for_writing(path: &Path) -> Result<(File, Option<DiskClaim>)> {
     let path_str = path.to_string_lossy();
     let disk_name = bsd_name_from_path(path);
 
-    // Unmount all volumes before opening with exclusive lock
+    // Unmount all volumes before claiming/opening
     if let Err(e) = da_unmount_disk(disk_name) {
         // Not fatal — the disk might not be mounted
         eprintln!("DA unmount warning: {}", e);
     }
+
+    // Claim the disk to keep other DA clients (e.g. VMware) away
+    let claim = match da_claim_disk(disk_name) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("DA claim warning: {}", e);
+            None
+        }
+    };
 
     // Use the raw device (/dev/rdiskN) for faster unbuffered writes
     let raw_device = if path_str.starts_with("/dev/disk") {
@@ -516,24 +640,18 @@ pub(crate) fn open_target_for_writing(path: &Path) -> Result<File> {
 
     // Try to open with O_EXLOCK
     match open_with_exlock(&raw_device, libc::O_RDWR) {
-        Ok(file) => return Ok(file),
+        Ok(file) => return Ok((file, claim)),
         Err(e) => {
             // Check if this is a permission error — if so, try elevation
-            let is_permission = e.downcast_ref::<std::io::Error>().map_or(false, |io_err| {
-                io_err.kind() == std::io::ErrorKind::PermissionDenied
+            let is_permission_chain = e.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .map_or(false, |io_err| {
+                        io_err.kind() == std::io::ErrorKind::PermissionDenied
+                    })
             });
-            if !is_permission {
-                // Check the chain (anyhow wraps the io::Error as source)
-                let is_permission_chain = e.chain().any(|cause| {
-                    cause
-                        .downcast_ref::<std::io::Error>()
-                        .map_or(false, |io_err| {
-                            io_err.kind() == std::io::ErrorKind::PermissionDenied
-                        })
-                });
-                if !is_permission_chain {
-                    return Err(e);
-                }
+            if !is_permission_chain {
+                return Err(e);
             }
         }
     }
@@ -559,12 +677,13 @@ pub(crate) fn open_target_for_writing(path: &Path) -> Result<File> {
     }
 
     // Retry with O_EXLOCK after elevated unmount
-    open_with_exlock(&raw_device, libc::O_RDWR).with_context(|| {
+    let file = open_with_exlock(&raw_device, libc::O_RDWR).with_context(|| {
         format!(
             "cannot open {} for writing (even after elevated unmount)",
             raw_device
         )
-    })
+    })?;
+    Ok((file, claim))
 }
 
 /// Open a source device or image file for reading with exclusive access.
@@ -580,10 +699,19 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
     if is_device {
         let disk_name = bsd_name_from_path(path);
 
-        // Unmount all volumes before opening with exclusive lock
+        // Unmount all volumes before claiming/opening
         if let Err(e) = da_unmount_disk(disk_name) {
             eprintln!("DA unmount warning: {}", e);
         }
+
+        // Claim the disk to keep other DA clients (e.g. VMware) away
+        let disk_claim = match da_claim_disk(disk_name) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("DA claim warning: {}", e);
+                None
+            }
+        };
 
         // Use /dev/rdiskN (raw character device) for faster unbuffered reads
         let raw_device = if path_str.starts_with("/dev/disk") {
@@ -596,6 +724,7 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
             Ok(file) => Ok(ElevatedSource {
                 file,
                 temp_path: None,
+                disk_claim,
             }),
             Err(e) => {
                 // Check if permission denied anywhere in the error chain
@@ -623,6 +752,7 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
         Ok(ElevatedSource {
             file,
             temp_path: None,
+            disk_claim: None,
         })
     }
 }
