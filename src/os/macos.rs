@@ -669,7 +669,14 @@ pub(crate) fn open_target_for_writing(path: &Path) -> Result<(File, Option<DiskC
     let path_str = path.to_string_lossy();
     let disk_name = bsd_name_from_path(path);
 
-    // Claim the disk for exclusive access before unmounting
+    // Unmount FIRST, then claim. If we claim before unmounting, the mount
+    // denial callback could interfere with the unmount itself.
+    if let Err(e) = da_unmount_disk(disk_name) {
+        // Not fatal — the disk might not be mounted
+        eprintln!("DA unmount warning: {}", e);
+    }
+
+    // Claim the disk for exclusive access and register mount denial
     let claim = match da_claim_disk(disk_name) {
         Ok(c) => c,
         Err(e) => {
@@ -678,12 +685,6 @@ pub(crate) fn open_target_for_writing(path: &Path) -> Result<(File, Option<DiskC
         }
     };
 
-    // Unmount all partitions on the disk first via DiskArbitration
-    if let Err(e) = da_unmount_disk(disk_name) {
-        // Not fatal — the disk might not be mounted
-        eprintln!("DA unmount warning: {}", e);
-    }
-
     // Use the raw device (/dev/rdiskN) for faster unbuffered writes
     let raw_device = if path_str.starts_with("/dev/disk") {
         format!("/dev/r{}", &path_str[5..])
@@ -691,21 +692,45 @@ pub(crate) fn open_target_for_writing(path: &Path) -> Result<(File, Option<DiskC
         path_str.to_string()
     };
 
-    // Try normal open first
-    match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&raw_device)
-    {
-        Ok(file) => return Ok((file, claim)),
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            // Fall through to elevation attempt
-        }
-        Err(e) => {
-            return Err(
-                anyhow::anyhow!(e).context(format!("cannot open {} for writing", raw_device))
+    // Try to open, retrying on EBUSY (the unmount may not have fully
+    // propagated in the kernel yet)
+    let mut last_err = None;
+    for attempt in 0..5 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            eprintln!(
+                "Retrying open of {} (attempt {}/5)...",
+                raw_device,
+                attempt + 1
             );
         }
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&raw_device)
+        {
+            Ok(file) => return Ok((file, claim)),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                // Don't retry — fall through to elevation attempt
+                last_err = Some(e);
+                break;
+            }
+            Err(e) => {
+                let is_busy = e.raw_os_error() == Some(libc::EBUSY);
+                last_err = Some(e);
+                if !is_busy {
+                    // Non-transient error — don't retry
+                    break;
+                }
+            }
+        }
+    }
+
+    let last_err = last_err.unwrap();
+    if last_err.kind() != std::io::ErrorKind::PermissionDenied {
+        return Err(
+            anyhow::anyhow!(last_err).context(format!("cannot open {} for writing", raw_device))
+        );
     }
 
     // Use osascript to unmount with elevated privileges.
@@ -752,9 +777,14 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
     let path_str = path.to_string_lossy();
     let is_device = path_str.starts_with("/dev/disk") || path_str.starts_with("/dev/rdisk");
 
-    // For devices: claim + unmount before opening
+    // For devices: unmount first, then claim (so mount denial doesn't
+    // interfere with the unmount itself)
     let disk_claim = if is_device {
         let disk_name = bsd_name_from_path(path);
+
+        if let Err(e) = da_unmount_disk(disk_name) {
+            eprintln!("DA unmount warning: {}", e);
+        }
 
         let claim = match da_claim_disk(disk_name) {
             Ok(c) => c,
@@ -763,10 +793,6 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
                 None
             }
         };
-
-        if let Err(e) = da_unmount_disk(disk_name) {
-            eprintln!("DA unmount warning: {}", e);
-        }
 
         claim
     } else {
