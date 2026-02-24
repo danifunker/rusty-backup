@@ -901,9 +901,12 @@ pub fn resize_exfat_in_place(
     let bmp_offset = partition_offset
         + cluster_heap_offset as u64 * bytes_per_sector
         + (bitmap_cluster as u64 - 2) * cluster_size;
+    // Read bitmap with sector-aligned size for raw device compatibility
+    let bitmap_aligned_size = ((bitmap_size as usize + 511) / 512) * 512;
     file.seek(SeekFrom::Start(bmp_offset))?;
-    let mut bitmap_data = vec![0u8; bitmap_size as usize];
+    let mut bitmap_data = vec![0u8; bitmap_aligned_size];
     file.read_exact(&mut bitmap_data)?;
+    bitmap_data.truncate(bitmap_size as usize);
 
     // Verify no data beyond new cluster count
     if new_cluster_count < old_cluster_count {
@@ -944,7 +947,9 @@ pub fn resize_exfat_in_place(
         }
     }
 
-    // Write resized bitmap
+    // Write resized bitmap (sector-aligned for raw device compatibility)
+    let write_aligned_size = ((new_bitmap_size + 511) / 512) * 512;
+    bitmap_data.resize(write_aligned_size, 0);
     file.seek(SeekFrom::Start(bmp_offset))?;
     file.write_all(&bitmap_data)?;
 
@@ -956,21 +961,51 @@ pub fn resize_exfat_in_place(
     file.write_all(&root_buf)?;
 
     // Verify FAT has no entries beyond new cluster count (for shrinking)
+    // Uses sector-aligned I/O: read/write whole 512-byte sectors at a time
     if new_cluster_count < old_cluster_count {
         let fat_offset = partition_offset
             + u32::from_le_bytes([vbr[0x50], vbr[0x51], vbr[0x52], vbr[0x53]]) as u64
                 * bytes_per_sector;
-        for cluster in new_cluster_count + 2..old_cluster_count + 2 {
-            let entry_offset = fat_offset + cluster as u64 * 4;
-            file.seek(SeekFrom::Start(entry_offset))?;
-            let mut entry_buf = [0u8; 4];
-            file.read_exact(&mut entry_buf)?;
-            let entry = u32::from_le_bytes(entry_buf);
-            if entry != 0 {
-                // Clear the FAT entry
-                file.seek(SeekFrom::Start(entry_offset))?;
-                file.write_all(&0u32.to_le_bytes())?;
+        let first_cluster = new_cluster_count + 2;
+        let last_cluster = old_cluster_count + 2; // exclusive
+
+        // Process one 512-byte sector at a time (128 FAT entries per sector)
+        let first_byte = first_cluster as u64 * 4;
+        let last_byte = last_cluster as u64 * 4;
+        let first_sector_off = (first_byte / 512) * 512;
+        let last_sector_off = ((last_byte + 511) / 512) * 512;
+
+        let mut sector = [0u8; 512];
+        let mut sector_off = first_sector_off;
+        while sector_off < last_sector_off {
+            file.seek(SeekFrom::Start(fat_offset + sector_off))?;
+            file.read_exact(&mut sector)?;
+
+            let mut modified = false;
+            // Check each 4-byte entry within this sector
+            for byte_pos in (0..512).step_by(4) {
+                let abs_byte = sector_off + byte_pos as u64;
+                let cluster = abs_byte / 4;
+                if cluster >= first_cluster as u64 && cluster < last_cluster as u64 {
+                    let entry = u32::from_le_bytes([
+                        sector[byte_pos],
+                        sector[byte_pos + 1],
+                        sector[byte_pos + 2],
+                        sector[byte_pos + 3],
+                    ]);
+                    if entry != 0 {
+                        sector[byte_pos..byte_pos + 4].copy_from_slice(&0u32.to_le_bytes());
+                        modified = true;
+                    }
+                }
             }
+
+            if modified {
+                file.seek(SeekFrom::Start(fat_offset + sector_off))?;
+                file.write_all(&sector)?;
+            }
+
+            sector_off += 512;
         }
     }
 

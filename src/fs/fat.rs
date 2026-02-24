@@ -1902,40 +1902,40 @@ pub fn set_fat_clean_flags(
 
     for fat_copy in 0..num_fats as u64 {
         let fat_copy_start = fat_start + fat_copy * sectors_per_fat as u64 * bps;
-        let entry1_offset = fat_copy_start
-            + match fat_bits {
-                16 => 2u64, // FAT16: entry 1 at byte offset 2
-                32 => 4u64, // FAT32: entry 1 at byte offset 4
-                _ => unreachable!(),
-            };
 
-        file.seek(SeekFrom::Start(entry1_offset)).with_context(|| {
-            format!("failed to seek to FAT[1] entry at offset {}", entry1_offset)
-        })?;
+        // Read the entire first sector of this FAT copy (sector-aligned I/O
+        // required on raw devices like macOS /dev/rdiskN)
+        file.seek(SeekFrom::Start(fat_copy_start))
+            .with_context(|| {
+                format!(
+                    "failed to seek to FAT copy start at offset {}",
+                    fat_copy_start
+                )
+            })?;
+        let mut sector = [0u8; 512];
+        file.read_exact(&mut sector)
+            .context("failed to read FAT sector for clean flags")?;
 
         match fat_bits {
             16 => {
-                let mut entry = [0u8; 2];
-                file.read_exact(&mut entry)
-                    .context("failed to read FAT16 entry[1]")?;
-                let mut val = u16::from_le_bytes(entry);
+                // FAT16: entry 1 at byte offset 2
+                let mut val = u16::from_le_bytes([sector[2], sector[3]]);
                 val |= 0xC000; // bit 15 = clean shutdown, bit 14 = no I/O errors
-                file.seek(SeekFrom::Start(entry1_offset))?;
-                file.write_all(&val.to_le_bytes())
-                    .context("failed to write FAT16 entry[1]")?;
+                sector[2..4].copy_from_slice(&val.to_le_bytes());
             }
             32 => {
-                let mut entry = [0u8; 4];
-                file.read_exact(&mut entry)
-                    .context("failed to read FAT32 entry[1]")?;
-                let mut val = u32::from_le_bytes(entry);
+                // FAT32: entry 1 at byte offset 4
+                let mut val = u32::from_le_bytes([sector[4], sector[5], sector[6], sector[7]]);
                 val |= 0x0C00_0000; // bit 27 = clean shutdown, bit 26 = no I/O errors
-                file.seek(SeekFrom::Start(entry1_offset))?;
-                file.write_all(&val.to_le_bytes())
-                    .context("failed to write FAT32 entry[1]")?;
+                sector[4..8].copy_from_slice(&val.to_le_bytes());
             }
             _ => unreachable!(),
         }
+
+        // Write the modified sector back
+        file.seek(SeekFrom::Start(fat_copy_start))?;
+        file.write_all(&sector)
+            .context("failed to write FAT sector with clean flags")?;
     }
 
     log_cb(&format!(
@@ -2026,14 +2026,16 @@ pub fn validate_fat_integrity(
         ));
     }
 
-    // Check FAT[0] media byte
+    // Check FAT[0] media byte and FAT[1] clean flags
+    // Read the first sector of the FAT (sector-aligned I/O for raw device compat)
     let fat_start = partition_offset + reserved_sectors as u64 * bps;
     file.seek(SeekFrom::Start(fat_start))?;
+    let mut fat_sector = [0u8; 512];
+    file.read_exact(&mut fat_sector)?;
+
     match fat_bits {
         12 => {
-            let mut entry = [0u8; 2];
-            file.read_exact(&mut entry)?;
-            let val = u16::from_le_bytes(entry) & 0x0FFF;
+            let val = u16::from_le_bytes([fat_sector[0], fat_sector[1]]) & 0x0FFF;
             let media = bpb[21];
             if val != (0x0F00 | media as u16) {
                 warnings.push(format!(
@@ -2044,59 +2046,45 @@ pub fn validate_fat_integrity(
             }
         }
         16 => {
-            let mut entry = [0u8; 2];
-            file.read_exact(&mut entry)?;
-            let val = u16::from_le_bytes(entry);
-            if val & 0x00FF != bpb[21] as u16 {
+            // FAT[0] at bytes 0-1, FAT[1] at bytes 2-3
+            let val0 = u16::from_le_bytes([fat_sector[0], fat_sector[1]]);
+            if val0 & 0x00FF != bpb[21] as u16 {
                 warnings.push(format!(
                     "FAT16: FAT[0] low byte = 0x{:02X}, media byte = 0x{:02X}",
-                    val & 0xFF,
+                    val0 & 0xFF,
                     bpb[21]
                 ));
             }
-        }
-        32 => {
-            let mut entry = [0u8; 4];
-            file.read_exact(&mut entry)?;
-            let val = u32::from_le_bytes(entry) & 0x0FFF_FFFF;
-            if val & 0xFF != bpb[21] as u32 {
-                warnings.push(format!(
-                    "FAT32: FAT[0] low byte = 0x{:02X}, media byte = 0x{:02X}",
-                    val & 0xFF,
-                    bpb[21]
-                ));
-            }
-        }
-        _ => {}
-    }
-
-    // Check FAT[1] clean flags
-    match fat_bits {
-        16 => {
-            file.seek(SeekFrom::Start(fat_start + 2))?;
-            let mut entry = [0u8; 2];
-            file.read_exact(&mut entry)?;
-            let val = u16::from_le_bytes(entry);
-            if val & 0x8000 == 0 {
+            let val1 = u16::from_le_bytes([fat_sector[2], fat_sector[3]]);
+            if val1 & 0x8000 == 0 {
                 warnings.push("FAT16: FAT[1] clean shutdown bit not set".to_string());
             }
-            if val & 0x4000 == 0 {
+            if val1 & 0x4000 == 0 {
                 warnings.push("FAT16: FAT[1] no-error bit not set".to_string());
             }
         }
         32 => {
-            file.seek(SeekFrom::Start(fat_start + 4))?;
-            let mut entry = [0u8; 4];
-            file.read_exact(&mut entry)?;
-            let val = u32::from_le_bytes(entry);
-            if val & 0x0800_0000 == 0 {
+            // FAT[0] at bytes 0-3, FAT[1] at bytes 4-7
+            let val0 =
+                u32::from_le_bytes([fat_sector[0], fat_sector[1], fat_sector[2], fat_sector[3]])
+                    & 0x0FFF_FFFF;
+            if val0 & 0xFF != bpb[21] as u32 {
+                warnings.push(format!(
+                    "FAT32: FAT[0] low byte = 0x{:02X}, media byte = 0x{:02X}",
+                    val0 & 0xFF,
+                    bpb[21]
+                ));
+            }
+            let val1 =
+                u32::from_le_bytes([fat_sector[4], fat_sector[5], fat_sector[6], fat_sector[7]]);
+            if val1 & 0x0800_0000 == 0 {
                 warnings.push("FAT32: FAT[1] clean shutdown bit not set".to_string());
             }
-            if val & 0x0400_0000 == 0 {
+            if val1 & 0x0400_0000 == 0 {
                 warnings.push("FAT32: FAT[1] no-error bit not set".to_string());
             }
         }
-        _ => {} // FAT12 has no dirty flags
+        _ => {}
     }
 
     // Check FSInfo (FAT32 only)

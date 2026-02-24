@@ -979,7 +979,11 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
                 )
             })?;
 
-        for (pm, ov) in metadata.partitions.iter().zip(&overrides) {
+        for pm in &metadata.partitions {
+            let ov = match overrides.iter().find(|o| o.index == pm.index) {
+                Some(o) => o,
+                None => continue,
+            };
             let part_offset = ov.effective_start_lba() * 512;
             let export_size = ov.export_size;
 
@@ -1856,72 +1860,66 @@ enum PartitionFsType {
 }
 
 /// Detect the filesystem type of a partition by reading its boot sector magic bytes.
+/// All reads are done in sector-aligned 512-byte blocks to work on raw devices
+/// (e.g. macOS /dev/rdiskN) which require sector-aligned I/O.
 fn detect_partition_fs_type(
     file: &mut (impl Read + Seek),
     partition_offset: u64,
 ) -> PartitionFsType {
+    let mut sector = [0u8; 512];
+
+    // Read first sector (boot sector): FAT/NTFS/exFAT signatures
     if file.seek(SeekFrom::Start(partition_offset)).is_err() {
         return PartitionFsType::Unknown;
     }
-    let mut buf = [0u8; 12];
-    if file.read_exact(&mut buf).is_err() {
+    if file.read_exact(&mut sector).is_err() {
         return PartitionFsType::Unknown;
     }
-    if &buf[3..11] == b"NTFS    " {
+    if &sector[3..11] == b"NTFS    " {
         return PartitionFsType::Ntfs;
     }
-    if &buf[3..11] == b"EXFAT   " {
+    if &sector[3..11] == b"EXFAT   " {
         return PartitionFsType::Exfat;
     }
-    if buf[0] == 0xEB || buf[0] == 0xE9 {
+    if sector[0] == 0xEB || sector[0] == 0xE9 {
         return PartitionFsType::Fat;
     }
 
-    // Check for HFS/HFS+ at partition_offset + 1024
-    if file.seek(SeekFrom::Start(partition_offset + 1024)).is_ok() {
-        let mut hfs_buf = [0u8; 2];
-        if file.read_exact(&mut hfs_buf).is_ok() {
-            let sig = u16::from_be_bytes(hfs_buf);
-            match sig {
-                0x4244 => {
-                    // HFS — check for embedded HFS+ at offset 124-125 from MDB start
-                    let mut embed = [0u8; 2];
-                    if file
-                        .seek(SeekFrom::Start(partition_offset + 1024 + 124))
-                        .is_ok()
-                        && file.read_exact(&mut embed).is_ok()
-                    {
-                        let embed_sig = u16::from_be_bytes(embed);
-                        if embed_sig == 0x482B {
-                            return PartitionFsType::HfsPlus;
-                        }
-                    }
-                    return PartitionFsType::Hfs;
-                }
-                0x482B | 0x4858 => return PartitionFsType::HfsPlus,
-                _ => {}
-            }
-        }
-    }
-
-    // Check for ext2/3/4 magic (0xEF53 LE) at partition_offset + 1024 + 0x38
-    if file
-        .seek(SeekFrom::Start(partition_offset + 1024 + 0x38))
-        .is_ok()
+    // Read sector at partition_offset + 1024 (sector 2): HFS/HFS+ and ext2/3/4 signatures
+    // HFS/HFS+ volume header is at partition_offset + 1024
+    // ext superblock magic (0xEF53) is at partition_offset + 1024 + 0x38
+    // Both fall within the same 512-byte sector
+    if file.seek(SeekFrom::Start(partition_offset + 1024)).is_ok()
+        && file.read_exact(&mut sector).is_ok()
     {
-        let mut ext_magic = [0u8; 2];
-        if file.read_exact(&mut ext_magic).is_ok() && ext_magic == [0x53, 0xEF] {
+        let sig = u16::from_be_bytes([sector[0], sector[1]]);
+        match sig {
+            0x4244 => {
+                // HFS — check for embedded HFS+ at offset 124-125 from MDB start
+                let embed_sig = u16::from_be_bytes([sector[124], sector[125]]);
+                if embed_sig == 0x482B {
+                    return PartitionFsType::HfsPlus;
+                }
+                return PartitionFsType::Hfs;
+            }
+            0x482B | 0x4858 => return PartitionFsType::HfsPlus,
+            _ => {}
+        }
+
+        // ext2/3/4 magic at offset 0x38 within this sector
+        if sector[0x38] == 0x53 && sector[0x39] == 0xEF {
             return PartitionFsType::Ext;
         }
     }
 
-    // Check for btrfs magic "_BHRfS_M" at partition_offset + 0x10000 + 0x40
+    // Read sector at partition_offset + 0x10000 (sector 128): btrfs superblock
+    // btrfs magic "_BHRfS_M" at offset 0x40 within the superblock
     if file
-        .seek(SeekFrom::Start(partition_offset + 0x10040))
+        .seek(SeekFrom::Start(partition_offset + 0x10000))
         .is_ok()
+        && file.read_exact(&mut sector).is_ok()
     {
-        let mut btrfs_magic = [0u8; 8];
-        if file.read_exact(&mut btrfs_magic).is_ok() && &btrfs_magic == b"_BHRfS_M" {
+        if &sector[0x40..0x48] == b"_BHRfS_M" {
             return PartitionFsType::Btrfs;
         }
     }

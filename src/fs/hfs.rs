@@ -848,21 +848,23 @@ pub fn resize_hfs_in_place(
     new_size_bytes: u64,
     log: &mut impl FnMut(&str),
 ) -> anyhow::Result<()> {
-    // Read MDB
+    // Read MDB sector (512-byte aligned I/O for raw device compatibility)
+    // The MDB is at partition_offset + 1024 and is 162 bytes, but we read/write
+    // a full 512-byte sector to satisfy raw device alignment requirements.
     device.seek(SeekFrom::Start(partition_offset + 1024))?;
-    let mut mdb_buf = [0u8; 162];
-    device.read_exact(&mut mdb_buf)?;
+    let mut sector = [0u8; 512];
+    device.read_exact(&mut sector)?;
 
-    let sig = BigEndian::read_u16(&mdb_buf[0..2]);
+    let sig = BigEndian::read_u16(&sector[0..2]);
     if sig != HFS_SIGNATURE {
         log("HFS resize: not an HFS volume, skipping");
         return Ok(());
     }
 
-    let block_size = BigEndian::read_u32(&mdb_buf[20..24]);
-    let old_total = BigEndian::read_u16(&mdb_buf[18..20]);
-    let free_blocks = BigEndian::read_u16(&mdb_buf[34..36]);
-    let first_alloc = BigEndian::read_u16(&mdb_buf[28..30]);
+    let block_size = BigEndian::read_u32(&sector[20..24]);
+    let old_total = BigEndian::read_u16(&sector[18..20]);
+    let free_blocks = BigEndian::read_u16(&sector[34..36]);
+    let first_alloc = BigEndian::read_u16(&sector[28..30]);
     let used_blocks = old_total - free_blocks;
 
     let overhead = first_alloc as u64 * 512;
@@ -883,18 +885,18 @@ pub fn resize_hfs_in_place(
         old_total, new_total, new_free
     ));
 
-    // Update MDB fields
-    BigEndian::write_u16(&mut mdb_buf[18..20], new_total);
-    BigEndian::write_u16(&mut mdb_buf[34..36], new_free);
+    // Update MDB fields in the sector buffer
+    BigEndian::write_u16(&mut sector[18..20], new_total);
+    BigEndian::write_u16(&mut sector[34..36], new_free);
 
-    // Write primary MDB at offset + 1024
+    // Write primary MDB sector at offset + 1024
     device.seek(SeekFrom::Start(partition_offset + 1024))?;
-    device.write_all(&mdb_buf)?;
+    device.write_all(&sector)?;
 
-    // Write backup MDB at offset + new_size - 1024
+    // Write backup MDB sector at offset + new_size - 1024
     if new_size_bytes > 1024 {
         device.seek(SeekFrom::Start(partition_offset + new_size_bytes - 1024))?;
-        device.write_all(&mdb_buf)?;
+        device.write_all(&sector)?;
     }
 
     device.flush()?;
@@ -907,18 +909,19 @@ pub fn validate_hfs_integrity(
     partition_offset: u64,
     log: &mut impl FnMut(&str),
 ) -> anyhow::Result<()> {
+    // Read MDB sector (512-byte aligned I/O for raw device compatibility)
     device.seek(SeekFrom::Start(partition_offset + 1024))?;
-    let mut mdb_buf = [0u8; 162];
-    device.read_exact(&mut mdb_buf)?;
+    let mut sector = [0u8; 512];
+    device.read_exact(&mut sector)?;
 
-    let sig = BigEndian::read_u16(&mdb_buf[0..2]);
+    let sig = BigEndian::read_u16(&sector[0..2]);
     if sig != HFS_SIGNATURE {
         log("HFS validate: not an HFS volume, skipping");
         return Ok(());
     }
 
-    let block_size = BigEndian::read_u32(&mdb_buf[20..24]);
-    let total_blocks = BigEndian::read_u16(&mdb_buf[18..20]);
+    let block_size = BigEndian::read_u32(&sector[20..24]);
+    let total_blocks = BigEndian::read_u16(&sector[18..20]);
 
     // Basic sanity checks
     if !block_size.is_power_of_two() || block_size < 512 {
