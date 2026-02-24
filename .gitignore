@@ -35,3 +35,4 @@ flatpak/bin/
 
 # Generated test images (keep .zst compressed fixtures in repo)
 tests/fixtures/*.img
+outputs/
