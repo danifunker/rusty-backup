@@ -2,6 +2,7 @@ mod sudo;
 
 use std::ffi::{c_void, CString};
 use std::fs::File;
+use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::ptr::{self, NonNull};
@@ -16,17 +17,14 @@ use objc2_core_foundation::{
     kCFRunLoopDefaultMode, CFBoolean, CFDictionary, CFMutableDictionary, CFNumber, CFRunLoop,
     CFString, CFURL,
 };
-use std::sync::Mutex;
 
 use objc2_disk_arbitration::{
-    kDADiskClaimOptionDefault, kDADiskDescriptionDeviceInternalKey,
-    kDADiskDescriptionDeviceModelKey, kDADiskDescriptionDeviceProtocolKey,
-    kDADiskDescriptionMediaBSDNameKey, kDADiskDescriptionMediaRemovableKey,
-    kDADiskDescriptionMediaSizeKey, kDADiskDescriptionMediaWritableKey,
-    kDADiskDescriptionVolumeKindKey, kDADiskDescriptionVolumePathKey, kDADiskUnmountOptionForce,
-    kDADiskUnmountOptionWhole, kDAReturnExclusiveAccess, DAApprovalSession, DADisk,
-    DADiskClaimCallback, DADiskMountApprovalCallback, DADiskUnmountCallback, DADissenter,
-    DASession,
+    kDADiskDescriptionDeviceInternalKey, kDADiskDescriptionDeviceModelKey,
+    kDADiskDescriptionDeviceProtocolKey, kDADiskDescriptionMediaBSDNameKey,
+    kDADiskDescriptionMediaRemovableKey, kDADiskDescriptionMediaSizeKey,
+    kDADiskDescriptionMediaWritableKey, kDADiskDescriptionVolumeKindKey,
+    kDADiskDescriptionVolumePathKey, kDADiskUnmountOptionForce, kDADiskUnmountOptionWhole, DADisk,
+    DADiskUnmountCallback, DADissenter, DASession,
 };
 use objc2_io_kit::{
     kIOMainPortDefault, IOIteratorNext, IOObjectRelease, IORegistryEntryCreateCFProperties,
@@ -423,224 +421,59 @@ fn da_unmount_disk(bsd_name: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// DiskArbitration exclusive claim + mount denial
+// O_EXLOCK exclusive device access
 // ---------------------------------------------------------------------------
 
-// The crate's binding for DARegisterDiskMountApprovalCallback has the wrong
-// session type (DASession instead of DAApprovalSession). Declare corrected externs.
-extern "C-unwind" {
-    fn DARegisterDiskMountApprovalCallback(
-        session: &DAApprovalSession,
-        r#match: Option<&CFDictionary>,
-        callback: DADiskMountApprovalCallback,
-        context: *mut c_void,
-    );
-    fn DAUnregisterApprovalCallback(
-        session: &DAApprovalSession,
-        callback: NonNull<c_void>,
-        context: *mut c_void,
-    );
-}
+/// BSD exclusive lock flag — prevents any other open (including kernel mounts)
+/// while the fd is held. This is how Balena Etcher prevents macOS from
+/// mounting partitions mid-write.
+const O_EXLOCK: libc::c_int = 0x0020;
 
-/// Global state for the mount-denial callback: the BSD name prefix to deny
-/// (e.g. "disk2" denies mounts on disk2, disk2s1, disk2s2, …).
-static DENY_MOUNT_PREFIX: Mutex<Option<String>> = Mutex::new(None);
+/// macOS fcntl command to bypass the buffer cache (equivalent to O_DIRECT on Linux).
+const F_NOCACHE: libc::c_int = 48;
 
-/// Mount approval callback: denies mounts on any disk whose BSD name starts
-/// with the prefix stored in `DENY_MOUNT_PREFIX`.
+/// Open a device path with `O_EXLOCK` for exclusive access.
 ///
-/// Uses `try_lock()` to never block — if the lock is contended, we approve
-/// the mount rather than risk deadlocking the DiskArbitration system thread.
-unsafe extern "C-unwind" fn deny_mount_callback(
-    disk: NonNull<DADisk>,
-    _context: *mut c_void,
-) -> *const DADissenter {
-    let disk_ref = unsafe { disk.as_ref() };
-    let name_ptr = unsafe { disk_ref.bsd_name() };
-    if !name_ptr.is_null() {
-        let name = unsafe { std::ffi::CStr::from_ptr(name_ptr) };
-        if let Ok(name_str) = name.to_str() {
-            // try_lock: never block the DA system thread
-            if let Ok(guard) = DENY_MOUNT_PREFIX.try_lock() {
-                if let Some(ref prefix) = *guard {
-                    if name_str.starts_with(prefix.as_str()) {
-                        // Return a dissenter to deny this mount
-                        let reason = CFString::from_str("Rusty Backup has exclusive access");
-                        let dissenter = unsafe {
-                            DADissenter::new(None, kDAReturnExclusiveAccess, Some(&reason))
-                        };
-                        // Leak one ref to the caller (caller owns the returned reference)
-                        return objc2_core_foundation::CFRetained::into_raw(dissenter).as_ptr();
-                    }
-                }
-            }
+/// Uses `libc::open()` directly because Rust's `OpenOptions` doesn't expose
+/// BSD-specific flags. Sets `F_NOCACHE` for direct I/O. Retries up to 5 times
+/// on EBUSY (unmount may not have fully propagated in the kernel).
+fn open_with_exlock(path: &str, flags: libc::c_int) -> Result<File> {
+    let c_path = CString::new(path).context("invalid device path")?;
+    let mut last_err = None;
+
+    for attempt in 0..5 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            eprintln!("Retrying open of {} (attempt {}/5)...", path, attempt + 1);
         }
-    }
-    ptr::null() // NULL = approve mount (not our disk)
-}
 
-/// RAII guard that holds an exclusive claim on a disk via DiskArbitration
-/// and blocks all mount attempts on the disk and its partitions.
-///
-/// While held, the system and other applications (e.g. VMware) cannot mount
-/// or claim the disk. Released when dropped.
-///
-/// The approval session is scheduled on the **main run loop** (the GUI event
-/// loop), not the calling thread's run loop. This is critical: the calling
-/// thread does blocking disk I/O and never pumps its run loop. If the
-/// approval callback were scheduled there, DA would wait forever for a
-/// response, deadlocking all system mount operations.
-pub(crate) struct DiskClaim {
-    // Claim session + disk (prevents other apps from claiming)
-    _claim_session: objc2_core_foundation::CFRetained<DASession>,
-    claim_disk: objc2_core_foundation::CFRetained<DADisk>,
-    claim_run_loop: objc2_core_foundation::CFRetained<CFRunLoop>,
-    // Approval session (denies mount attempts on all partitions)
-    // Scheduled on the MAIN run loop so callbacks fire while worker threads do I/O
-    approval_session: objc2_core_foundation::CFRetained<DAApprovalSession>,
-    main_run_loop: objc2_core_foundation::CFRetained<CFRunLoop>,
-}
-
-// Safety: DiskClaim only holds CF objects that are thread-safe (CFRetained
-// pointers to immutable Core Foundation types). DADiskUnclaim and
-// CFRunLoop unschedule are safe to call from any thread.
-unsafe impl Send for DiskClaim {}
-
-impl Drop for DiskClaim {
-    fn drop(&mut self) {
-        unsafe {
-            // Unregister mount denial callback
-            DAUnregisterApprovalCallback(
-                &self.approval_session,
-                NonNull::new_unchecked(deny_mount_callback as *mut c_void),
-                ptr::null_mut(),
-            );
-            let mode = kCFRunLoopDefaultMode.unwrap();
-            self.approval_session
-                .unschedule_from_run_loop(&self.main_run_loop, mode);
-
-            // Clear the deny prefix
-            if let Ok(mut guard) = DENY_MOUNT_PREFIX.lock() {
-                *guard = None;
-            }
-
-            // Release the whole-disk claim
-            self.claim_disk.unclaim();
-            self._claim_session
-                .unschedule_from_run_loop(&self.claim_run_loop, mode);
+        let fd = unsafe { libc::open(c_path.as_ptr(), flags | O_EXLOCK) };
+        if fd >= 0 {
+            // Set F_NOCACHE for direct I/O (bypass buffer cache)
+            unsafe { libc::fcntl(fd, F_NOCACHE, 1) };
+            let file = unsafe { File::from_raw_fd(fd) };
+            eprintln!("Opened {} with O_EXLOCK (attempt {})", path, attempt + 1);
+            return Ok(file);
         }
-    }
-}
 
-/// Synchronously claim a disk for exclusive use and register a mount-denial
-/// callback for all its partitions.
-///
-/// Returns `Ok(Some(guard))` on success, `Ok(None)` if setup fails
-/// (non-fatal — the operation can proceed without exclusive access).
-fn da_claim_disk(bsd_name: &str) -> Result<Option<DiskClaim>> {
-    // --- 1. Claim the whole disk ---
-    let claim_session =
-        unsafe { DASession::new(None) }.context("failed to create DiskArbitration session")?;
+        let err = std::io::Error::last_os_error();
+        let raw = err.raw_os_error().unwrap_or(0);
 
-    let c_name = CString::new(bsd_name).context("invalid BSD name")?;
-    let claim_disk = unsafe {
-        DADisk::from_bsd_name(
-            None,
-            &claim_session,
-            NonNull::new(c_name.as_ptr() as *mut _).unwrap(),
-        )
-    }
-    .context(format!("failed to create DADisk for {}", bsd_name))?;
-
-    let claim_run_loop = CFRunLoop::current().context("failed to get current CFRunLoop")?;
-    let mode = unsafe { kCFRunLoopDefaultMode.unwrap() };
-    unsafe { claim_session.schedule_with_run_loop(&claim_run_loop, mode) };
-
-    static CLAIM_DONE: AtomicBool = AtomicBool::new(false);
-    static CLAIM_OK: AtomicBool = AtomicBool::new(false);
-    CLAIM_DONE.store(false, Ordering::SeqCst);
-    CLAIM_OK.store(false, Ordering::SeqCst);
-
-    unsafe extern "C-unwind" fn claim_callback(
-        _disk: NonNull<DADisk>,
-        dissenter: *const DADissenter,
-        _context: *mut c_void,
-    ) {
-        CLAIM_OK.store(dissenter.is_null(), Ordering::SeqCst);
-        CLAIM_DONE.store(true, Ordering::SeqCst);
-        if let Some(rl) = CFRunLoop::current() {
-            rl.stop();
+        if err.kind() == std::io::ErrorKind::PermissionDenied {
+            // Don't retry — caller will handle elevation
+            return Err(anyhow::anyhow!(err).context(format!("permission denied opening {}", path)));
         }
+
+        if raw != libc::EBUSY {
+            // Non-transient error — don't retry
+            return Err(anyhow::anyhow!(err).context(format!("cannot open {}", path)));
+        }
+
+        last_err = Some(err);
     }
 
-    let callback: DADiskClaimCallback = Some(claim_callback);
-    unsafe {
-        claim_disk.claim(
-            kDADiskClaimOptionDefault,
-            None,            // no release callback — claim can never be stolen
-            ptr::null_mut(), // release context
-            callback,
-            ptr::null_mut(), // callback context
-        );
-    }
-
-    let timeout_secs = 10.0;
-    CFRunLoop::run_in_mode(Some(mode), timeout_secs, false);
-
-    if !CLAIM_DONE.load(Ordering::SeqCst) {
-        unsafe { claim_session.unschedule_from_run_loop(&claim_run_loop, mode) };
-        eprintln!(
-            "DA claim of {} timed out — proceeding without exclusive access",
-            bsd_name
-        );
-        return Ok(None);
-    }
-    if !CLAIM_OK.load(Ordering::SeqCst) {
-        unsafe { claim_session.unschedule_from_run_loop(&claim_run_loop, mode) };
-        eprintln!(
-            "DA claim of {} failed — proceeding without exclusive access",
-            bsd_name
-        );
-        return Ok(None);
-    }
-
-    // --- 2. Register mount-denial callback for all partitions ---
-    //
-    // CRITICAL: schedule on the MAIN run loop, not the current thread's.
-    // The calling thread will block on disk I/O and never pump its run loop.
-    // If we scheduled there, DA would wait forever for the approval callback
-    // to return, deadlocking all system mount operations.
-    let approval_session =
-        unsafe { DAApprovalSession::new(None) }.context("failed to create DAApprovalSession")?;
-
-    let main_run_loop = CFRunLoop::main().context("failed to get main CFRunLoop")?;
-    unsafe { approval_session.schedule_with_run_loop(&main_run_loop, mode) };
-
-    // Set the prefix that the callback will match against
-    *DENY_MOUNT_PREFIX.lock().unwrap() = Some(bsd_name.to_string());
-
-    let approval_callback: DADiskMountApprovalCallback = Some(deny_mount_callback);
-    unsafe {
-        DARegisterDiskMountApprovalCallback(
-            &approval_session,
-            None, // match all disks — callback filters by prefix
-            approval_callback,
-            ptr::null_mut(),
-        );
-    }
-
-    eprintln!(
-        "DA: claimed {} and registered mount denial for {}*",
-        bsd_name, bsd_name
-    );
-
-    Ok(Some(DiskClaim {
-        _claim_session: claim_session,
-        claim_disk,
-        claim_run_loop,
-        approval_session,
-        main_run_loop,
-    }))
+    Err(anyhow::anyhow!(last_err.unwrap())
+        .context(format!("cannot open {} (EBUSY after 5 attempts)", path)))
 }
 
 /// Extract the BSD disk name from a device path like `/dev/diskN` or `/dev/rdiskN`.
@@ -655,35 +488,24 @@ fn bsd_name_from_path(path: &Path) -> &str {
     }
 }
 
-/// Open a target device for writing, claiming and unmounting it first.
+/// Open a target device for writing with exclusive access.
 ///
-/// Claims the disk for exclusive access via DiskArbitration (prevents other
-/// apps like VMware from interfering), then unmounts all volumes. If normal
-/// open fails with permission denied, falls back to `osascript` to run
-/// `diskutil unmountDisk force` with admin privileges via the native macOS
-/// authentication dialog (DA doesn't provide admin prompting).
+/// Unmounts all volumes via DiskArbitration, then opens the raw character
+/// device (`/dev/rdiskN`) with `O_EXLOCK` for kernel-level exclusive access.
+/// This prevents macOS from mounting any partition on the disk while the fd
+/// is held — no DiskArbitration claim or mount-approval callbacks needed.
 ///
-/// Returns the file handle and an optional `DiskClaim` guard that must be
-/// kept alive for the duration of the operation.
-pub(crate) fn open_target_for_writing(path: &Path) -> Result<(File, Option<DiskClaim>)> {
+/// If the initial open fails with permission denied, falls back to `osascript`
+/// to run `diskutil unmountDisk force` with admin privileges, then retries.
+pub(crate) fn open_target_for_writing(path: &Path) -> Result<File> {
     let path_str = path.to_string_lossy();
     let disk_name = bsd_name_from_path(path);
 
-    // Unmount FIRST, then claim. If we claim before unmounting, the mount
-    // denial callback could interfere with the unmount itself.
+    // Unmount all volumes before opening with exclusive lock
     if let Err(e) = da_unmount_disk(disk_name) {
         // Not fatal — the disk might not be mounted
         eprintln!("DA unmount warning: {}", e);
     }
-
-    // Claim the disk for exclusive access and register mount denial
-    let claim = match da_claim_disk(disk_name) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("DA claim warning: {}", e);
-            None
-        }
-    };
 
     // Use the raw device (/dev/rdiskN) for faster unbuffered writes
     let raw_device = if path_str.starts_with("/dev/disk") {
@@ -692,50 +514,33 @@ pub(crate) fn open_target_for_writing(path: &Path) -> Result<(File, Option<DiskC
         path_str.to_string()
     };
 
-    // Try to open, retrying on EBUSY (the unmount may not have fully
-    // propagated in the kernel yet)
-    let mut last_err = None;
-    for attempt in 0..5 {
-        if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            eprintln!(
-                "Retrying open of {} (attempt {}/5)...",
-                raw_device,
-                attempt + 1
-            );
-        }
-        match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&raw_device)
-        {
-            Ok(file) => return Ok((file, claim)),
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                // Don't retry — fall through to elevation attempt
-                last_err = Some(e);
-                break;
-            }
-            Err(e) => {
-                let is_busy = e.raw_os_error() == Some(libc::EBUSY);
-                last_err = Some(e);
-                if !is_busy {
-                    // Non-transient error — don't retry
-                    break;
+    // Try to open with O_EXLOCK
+    match open_with_exlock(&raw_device, libc::O_RDWR) {
+        Ok(file) => return Ok(file),
+        Err(e) => {
+            // Check if this is a permission error — if so, try elevation
+            let is_permission = e.downcast_ref::<std::io::Error>().map_or(false, |io_err| {
+                io_err.kind() == std::io::ErrorKind::PermissionDenied
+            });
+            if !is_permission {
+                // Check the chain (anyhow wraps the io::Error as source)
+                let is_permission_chain = e.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .map_or(false, |io_err| {
+                            io_err.kind() == std::io::ErrorKind::PermissionDenied
+                        })
+                });
+                if !is_permission_chain {
+                    return Err(e);
                 }
             }
         }
     }
 
-    let last_err = last_err.unwrap();
-    if last_err.kind() != std::io::ErrorKind::PermissionDenied {
-        return Err(
-            anyhow::anyhow!(last_err).context(format!("cannot open {} for writing", raw_device))
-        );
-    }
-
-    // Use osascript to unmount with elevated privileges.
-    // This is the only remaining diskutil usage — specifically for privilege
-    // elevation via the native macOS admin auth dialog, which DA doesn't provide.
+    // Permission denied — use osascript to unmount with elevated privileges,
+    // then retry. This is the only remaining diskutil usage — specifically
+    // for privilege elevation via the native macOS admin auth dialog.
     let script = format!(
         "do shell script \"diskutil unmountDisk force {disk_name}\" with administrator privileges"
     );
@@ -753,78 +558,71 @@ pub(crate) fn open_target_for_writing(path: &Path) -> Result<(File, Option<DiskC
         }
     }
 
-    // Try opening again after elevated unmount
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&raw_device)
-        .with_context(|| {
-            format!(
-                "cannot open {} for writing (even after elevated unmount)",
-                raw_device
-            )
-        })?;
-    Ok((file, claim))
+    // Retry with O_EXLOCK after elevated unmount
+    open_with_exlock(&raw_device, libc::O_RDWR).with_context(|| {
+        format!(
+            "cannot open {} for writing (even after elevated unmount)",
+            raw_device
+        )
+    })
 }
 
-/// Open a source device or image file for reading.
+/// Open a source device or image file for reading with exclusive access.
 ///
-/// For device paths (`/dev/disk*`), claims the disk for exclusive access and
-/// unmounts all volumes before opening. The application should already be
-/// running with elevated privileges (via sudo at startup). If not elevated,
-/// this will return a permission denied error with a helpful message.
+/// For device paths (`/dev/disk*`), unmounts all volumes and opens with
+/// `O_EXLOCK` for kernel-level exclusive access. For regular files, opens
+/// normally. The application should already be running with elevated
+/// privileges (via sudo at startup).
 pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
     let path_str = path.to_string_lossy();
     let is_device = path_str.starts_with("/dev/disk") || path_str.starts_with("/dev/rdisk");
 
-    // For devices: unmount first, then claim (so mount denial doesn't
-    // interfere with the unmount itself)
-    let disk_claim = if is_device {
+    if is_device {
         let disk_name = bsd_name_from_path(path);
 
+        // Unmount all volumes before opening with exclusive lock
         if let Err(e) = da_unmount_disk(disk_name) {
             eprintln!("DA unmount warning: {}", e);
         }
 
-        let claim = match da_claim_disk(disk_name) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("DA claim warning: {}", e);
-                None
-            }
+        // Use /dev/rdiskN (raw character device) for faster unbuffered reads
+        let raw_device = if path_str.starts_with("/dev/disk") {
+            format!("/dev/r{}", &path_str[5..])
+        } else {
+            path_str.to_string()
         };
 
-        claim
-    } else {
-        None
-    };
-
-    // Use /dev/rdiskN (raw character device) for faster unbuffered reads
-    let actual_path = if path_str.starts_with("/dev/disk") {
-        PathBuf::from(format!("/dev/r{}", &path_str[5..]))
-    } else {
-        path.to_path_buf()
-    };
-
-    // Try to open the file
-    match File::open(&actual_path) {
-        Ok(file) => Ok(ElevatedSource {
-            file,
-            temp_path: None,
-            disk_claim,
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            if path_str.starts_with("/dev/") {
-                bail!(
-                    "Permission denied: {}.\n\n\
-                     Rusty Backup requires administrator privileges to access disk devices.\n\
-                     Please restart the application - you will be prompted for your password.",
-                    path.display()
-                );
-            } else {
-                Err(anyhow::anyhow!(e).context(format!("cannot open {}", path.display())))
+        match open_with_exlock(&raw_device, libc::O_RDONLY) {
+            Ok(file) => Ok(ElevatedSource {
+                file,
+                temp_path: None,
+            }),
+            Err(e) => {
+                // Check if permission denied anywhere in the error chain
+                let is_permission = e.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .map_or(false, |io_err| {
+                            io_err.kind() == std::io::ErrorKind::PermissionDenied
+                        })
+                });
+                if is_permission {
+                    bail!(
+                        "Permission denied: {}.\n\n\
+                         Rusty Backup requires administrator privileges to access disk devices.\n\
+                         Please restart the application - you will be prompted for your password.",
+                        path.display()
+                    );
+                }
+                Err(e)
             }
         }
-        Err(e) => Err(anyhow::anyhow!(e).context(format!("cannot open {}", path.display()))),
+    } else {
+        // Regular file — open normally
+        let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+        Ok(ElevatedSource {
+            file,
+            temp_path: None,
+        })
     }
 }
