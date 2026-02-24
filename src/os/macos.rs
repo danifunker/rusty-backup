@@ -24,8 +24,8 @@ use objc2_disk_arbitration::{
     kDADiskDescriptionMediaBSDNameKey, kDADiskDescriptionMediaRemovableKey,
     kDADiskDescriptionMediaSizeKey, kDADiskDescriptionMediaWritableKey,
     kDADiskDescriptionVolumeKindKey, kDADiskDescriptionVolumePathKey, kDADiskUnmountOptionForce,
-    kDADiskUnmountOptionWhole, DADisk, DADiskClaimCallback, DADiskUnmountCallback, DADissenter,
-    DASession,
+    kDADiskUnmountOptionWhole, kDAReturnExclusiveAccess, DADisk, DADiskClaimCallback,
+    DADiskClaimReleaseCallback, DADiskUnmountCallback, DADissenter, DASession,
 };
 use objc2_io_kit::{
     kIOMainPortDefault, IOIteratorNext, IOObjectRelease, IORegistryEntryCreateCFProperties,
@@ -428,15 +428,17 @@ fn da_unmount_disk(bsd_name: &str) -> Result<()> {
 /// RAII guard that holds an exclusive claim on a disk via DiskArbitration.
 ///
 /// While held, other DiskArbitration clients (e.g. VMware Fusion) cannot
-/// claim or interact with the disk. Released when dropped.
+/// claim or interact with the disk. The claim session is scheduled on the
+/// **main run loop** (GUI event loop) so the release-denial callback fires
+/// even while the worker thread does blocking I/O.
 ///
 /// Note: this does NOT prevent the kernel from mounting partitions — that's
-/// handled by `O_EXLOCK` on the file descriptor. The claim only prevents
-/// other DA clients from claiming the disk.
+/// handled by `O_EXLOCK` on the file descriptor. The claim prevents other
+/// DA clients from claiming the disk.
 pub(crate) struct DiskClaim {
     _session: objc2_core_foundation::CFRetained<DASession>,
     disk: objc2_core_foundation::CFRetained<DADisk>,
-    run_loop: objc2_core_foundation::CFRetained<CFRunLoop>,
+    main_run_loop: objc2_core_foundation::CFRetained<CFRunLoop>,
 }
 
 // Safety: DiskClaim only holds CF objects that are thread-safe (CFRetained
@@ -449,16 +451,35 @@ impl Drop for DiskClaim {
         unsafe {
             let mode = kCFRunLoopDefaultMode.unwrap();
             self.disk.unclaim();
-            self._session.unschedule_from_run_loop(&self.run_loop, mode);
+            self._session
+                .unschedule_from_run_loop(&self.main_run_loop, mode);
         }
     }
 }
 
+/// Release-denial callback: DA calls this when another client (e.g. VMware)
+/// tries to steal our claim. We return a dissenter to refuse.
+unsafe extern "C-unwind" fn claim_release_deny(
+    _disk: NonNull<DADisk>,
+    _context: *mut c_void,
+) -> *const DADissenter {
+    eprintln!("DA: another client tried to steal our disk claim — denied");
+    let reason = CFString::from_str("Rusty Backup has exclusive access");
+    let dissenter = unsafe { DADissenter::new(None, kDAReturnExclusiveAccess, Some(&reason)) };
+    objc2_core_foundation::CFRetained::into_raw(dissenter).as_ptr()
+}
+
 /// Synchronously claim a disk for exclusive use via DiskArbitration.
 ///
-/// This prevents other DA clients (e.g. VMware Fusion) from claiming or
-/// interacting with the disk. Non-fatal: returns `Ok(None)` if the claim
-/// fails (the operation can proceed without it).
+/// The claim session is scheduled on the **main run loop** so that:
+/// 1. The release-denial callback fires when other DA clients try to steal
+///    the claim (the worker thread's run loop is never pumped during I/O).
+/// 2. The claim completion callback fires reliably.
+///
+/// We spin-wait for the completion callback since we can't pump the main
+/// run loop from a worker thread (the GUI thread pumps it).
+///
+/// Non-fatal: returns `Ok(None)` if the claim fails.
 fn da_claim_disk(bsd_name: &str) -> Result<Option<DiskClaim>> {
     let session =
         unsafe { DASession::new(None) }.context("failed to create DiskArbitration session")?;
@@ -473,9 +494,11 @@ fn da_claim_disk(bsd_name: &str) -> Result<Option<DiskClaim>> {
     }
     .context(format!("failed to create DADisk for {}", bsd_name))?;
 
-    let run_loop = CFRunLoop::current().context("failed to get current CFRunLoop")?;
+    // Schedule on the MAIN run loop so the release-denial callback fires
+    // even while the worker thread does blocking disk I/O.
+    let main_run_loop = CFRunLoop::main().context("failed to get main CFRunLoop")?;
     let mode = unsafe { kCFRunLoopDefaultMode.unwrap() };
-    unsafe { session.schedule_with_run_loop(&run_loop, mode) };
+    unsafe { session.schedule_with_run_loop(&main_run_loop, mode) };
 
     static CLAIM_DONE: AtomicBool = AtomicBool::new(false);
     static CLAIM_OK: AtomicBool = AtomicBool::new(false);
@@ -489,35 +512,37 @@ fn da_claim_disk(bsd_name: &str) -> Result<Option<DiskClaim>> {
     ) {
         CLAIM_OK.store(dissenter.is_null(), Ordering::SeqCst);
         CLAIM_DONE.store(true, Ordering::SeqCst);
-        if let Some(rl) = CFRunLoop::current() {
-            rl.stop();
-        }
     }
 
+    let release_cb: DADiskClaimReleaseCallback = Some(claim_release_deny);
     let callback: DADiskClaimCallback = Some(claim_callback);
     unsafe {
         disk.claim(
             kDADiskClaimOptionDefault,
-            None,            // no release callback — claim can never be stolen
+            release_cb,      // deny steal attempts from other DA clients
             ptr::null_mut(), // release context
             callback,
             ptr::null_mut(), // callback context
         );
     }
 
-    let timeout_secs = 10.0;
-    CFRunLoop::run_in_mode(Some(mode), timeout_secs, false);
-
-    if !CLAIM_DONE.load(Ordering::SeqCst) {
-        unsafe { session.unschedule_from_run_loop(&run_loop, mode) };
-        eprintln!(
-            "DA claim of {} timed out — proceeding without exclusive access",
-            bsd_name
-        );
-        return Ok(None);
+    // Spin-wait for the claim completion callback (fires on main run loop,
+    // which is pumped by the GUI thread).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !CLAIM_DONE.load(Ordering::SeqCst) {
+        if std::time::Instant::now() >= deadline {
+            unsafe { session.unschedule_from_run_loop(&main_run_loop, mode) };
+            eprintln!(
+                "DA claim of {} timed out — proceeding without exclusive access",
+                bsd_name
+            );
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
+
     if !CLAIM_OK.load(Ordering::SeqCst) {
-        unsafe { session.unschedule_from_run_loop(&run_loop, mode) };
+        unsafe { session.unschedule_from_run_loop(&main_run_loop, mode) };
         eprintln!(
             "DA claim of {} failed — proceeding without exclusive access",
             bsd_name
@@ -530,7 +555,7 @@ fn da_claim_disk(bsd_name: &str) -> Result<Option<DiskClaim>> {
     Ok(Some(DiskClaim {
         _session: session,
         disk,
-        run_loop,
+        main_run_loop,
     }))
 }
 
