@@ -26,27 +26,9 @@ fn main() -> eframe::Result {
         }
     }
 
-    // macOS: Request elevation at startup if not already running as root
-    #[cfg(target_os = "macos")]
-    {
-        if unsafe { libc::geteuid() } != 0 {
-            eprintln!("Rusty Backup requires administrator privileges for disk access.");
-            eprintln!("Requesting elevation...");
-
-            if let Err(e) = rusty_backup::os::macos::request_app_elevation() {
-                eprintln!("Failed to elevate: {}", e);
-                eprintln!("\nPlease run the application with sudo:");
-                eprintln!("  sudo '/Applications/Rusty Backup.app/Contents/MacOS/rusty-backup'");
-                std::process::exit(1);
-            }
-
-            // If we reach here, elevation was requested but the elevated process
-            // completed (shouldn't happen in normal flow)
-            std::process::exit(0);
-        }
-
-        eprintln!("Running with administrator privileges ✓");
-    }
+    // macOS: no startup elevation needed — authopen handles per-operation
+    // privilege escalation via the native macOS auth dialog when the user
+    // initiates a backup or restore.
 
     // Load icon from bytes with transparency preserved
     let icon_bytes = include_bytes!("../assets/icons/icon-256.png");
