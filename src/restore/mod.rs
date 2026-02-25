@@ -805,7 +805,7 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
     let progress_clone = Arc::clone(&progress);
     let progress_cancel = Arc::clone(&progress);
 
-    let total_written = reconstruct_disk_from_backup(
+    let write_result = reconstruct_disk_from_backup(
         &config.backup_folder,
         &metadata,
         mbr_bytes.as_ref(),
@@ -823,7 +823,38 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
         &mut |msg| {
             log(&progress, LogLevel::Info, msg);
         },
-    )?;
+    );
+
+    // A stalled write to a raw device (e.g. EIO from macOS I/O arbitration
+    // while another process such as VMware probes the disk concurrently) can
+    // block in the kernel for several minutes before returning an error.
+    // Once the blocked syscall finally returns, treat any I/O error as a
+    // clean cancellation if the user already requested it — otherwise surface
+    // the original error with a hint.
+    let total_written = match write_result {
+        Ok(n) => n,
+        Err(e) => {
+            if is_cancelled(&progress) {
+                bail!("restore cancelled");
+            }
+            // Check whether the error looks like a macOS I/O stall (EIO = os error 5).
+            let is_io_stall = e.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .map_or(false, |io_err| {
+                        io_err.raw_os_error() == Some(5) // EIO
+                            || io_err.kind() == std::io::ErrorKind::BrokenPipe
+                    })
+            });
+            if is_io_stall {
+                return Err(e.context(
+                    "disk write stalled — if another application (e.g. VMware) is \
+                     accessing the target drive, suspend it and retry",
+                ));
+            }
+            return Err(e);
+        }
+    };
 
     // Step 8: Filesystem resize operations (using inner File to avoid buffer flush on every seek)
     set_operation(&progress, "Finalizing filesystems...");
