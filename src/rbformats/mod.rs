@@ -379,7 +379,10 @@ pub fn reconstruct_disk_from_backup(
             pm.index, effective_lba, part_offset, export_size
         ));
 
-        // Fill or seek over gap between current position and partition start
+        // Fill or seek over gap between current position and partition start.
+        // We always use absolute seeks (SeekFrom::Start) rather than relative
+        // seeks because the patch_*_hidden_sectors calls at the end of each
+        // iteration may have moved the file cursor away from total_written.
         if total_written < part_offset {
             let gap = part_offset - total_written;
             // On Windows physical drives, we must write zeros to gaps (seeking
@@ -390,18 +393,22 @@ pub fn reconstruct_disk_from_backup(
             let force_write_zeros = false;
 
             if force_write_zeros || (is_device && fill_unused_with_zeros) {
+                writer.seek(SeekFrom::Start(total_written))?;
                 log_cb(&format!("Writing {} bytes of zeros to gap...", gap));
                 write_zeros(writer, gap)?;
                 writer.flush().context("failed to flush after zeros")?;
                 total_written += gap;
             } else if is_device {
-                // Unix device without zero-fill: try to seek
-                match writer.seek(SeekFrom::Current(gap as i64)) {
+                // Unix device without zero-fill: seek directly to partition start
+                match writer.seek(SeekFrom::Start(part_offset)) {
                     Ok(_) => {
-                        total_written += gap;
+                        total_written = part_offset;
                     }
                     Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
-                        log_cb("Warning: device doesn't support seek, writing zeros to gap");
+                        writer.seek(SeekFrom::Start(total_written))?;
+                        log_cb(
+                            "Warning: device doesn't support absolute seek, writing zeros to gap",
+                        );
                         write_zeros(writer, gap)?;
                         total_written += gap;
                     }
@@ -409,9 +416,12 @@ pub fn reconstruct_disk_from_backup(
                 }
             } else {
                 // File: use sparse seeks
-                writer.seek(SeekFrom::Current(gap as i64))?;
-                total_written += gap;
+                writer.seek(SeekFrom::Start(part_offset))?;
+                total_written = part_offset;
             }
+        } else if total_written == part_offset {
+            // No gap, but ensure file position is correct (patch calls may have moved it)
+            writer.seek(SeekFrom::Start(part_offset))?;
         }
 
         // Write partition data
