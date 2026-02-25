@@ -4,7 +4,6 @@ use std::ffi::{c_void, CString};
 use std::fs::File;
 use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -35,11 +34,70 @@ use objc2_io_kit::{
 use super::ElevatedSource;
 use crate::device::{DiskDevice, MountedPartition};
 
+// ---------------------------------------------------------------------------
+// Security.framework FFI — used by authopen_device for privilege escalation
+// ---------------------------------------------------------------------------
+
+mod security {
+    use libc::{c_char, c_void, size_t};
+
+    pub type AuthorizationRef = *mut c_void;
+    pub type OSStatus = i32;
+    pub type AuthorizationFlags = u32;
+
+    pub const ERR_AUTHORIZATION_SUCCESS: OSStatus = 0;
+    pub const ERR_AUTHORIZATION_CANCELED: OSStatus = -60006;
+    pub const FLAG_INTERACTION_ALLOWED: AuthorizationFlags = 1 << 0;
+    pub const FLAG_EXTEND_RIGHTS: AuthorizationFlags = 1 << 1;
+    pub const FLAG_PRE_AUTHORIZE: AuthorizationFlags = 1 << 2;
+    /// kAuthorizationExternalFormLength
+    pub const EXTERNAL_FORM_LENGTH: usize = 32;
+
+    #[repr(C)]
+    pub struct AuthorizationItem {
+        pub name: *const c_char,
+        pub value_length: size_t,
+        pub value: *mut c_void,
+        pub flags: u32,
+    }
+
+    #[repr(C)]
+    pub struct AuthorizationRights {
+        pub count: u32,
+        pub items: *const AuthorizationItem,
+    }
+
+    #[repr(C)]
+    pub struct AuthorizationExternalForm {
+        pub bytes: [c_char; 32],
+    }
+
+    #[link(name = "Security", kind = "framework")]
+    extern "C" {
+        pub fn AuthorizationCreate(
+            rights: *const AuthorizationRights,
+            environment: *const c_void,
+            flags: AuthorizationFlags,
+            authorization: *mut AuthorizationRef,
+        ) -> OSStatus;
+
+        pub fn AuthorizationMakeExternalForm(
+            authorization: AuthorizationRef,
+            ext_form: *mut AuthorizationExternalForm,
+        ) -> OSStatus;
+
+        pub fn AuthorizationFree(authorization: AuthorizationRef, flags: u32) -> OSStatus;
+    }
+}
+
 // macOS ioctl constants for getting device size
 // DKIOCGETBLOCKSIZE = _IOR('d', 24, u32) = 0x40046418
 // DKIOCGETBLOCKCOUNT = _IOR('d', 25, u64) = 0x40086419
 const DKIOCGETBLOCKSIZE: libc::c_ulong = 0x40046418;
 const DKIOCGETBLOCKCOUNT: libc::c_ulong = 0x40086419;
+
+/// macOS fcntl command to bypass the buffer cache (equivalent to O_DIRECT on Linux).
+const F_NOCACHE: libc::c_int = 48;
 
 /// Get the size of a macOS block device using ioctl.
 ///
@@ -350,13 +408,31 @@ pub fn enumerate_devices() -> Vec<DiskDevice> {
 }
 
 // ---------------------------------------------------------------------------
-// DiskArbitration unmount
+// Per-call DiskArbitration callback state
+// ---------------------------------------------------------------------------
+
+/// Heap-allocated state passed via the DA callback context pointer.
+///
+/// Replaces module-level static `AtomicBool`s to prevent a race condition
+/// when two operations start concurrently or a previous one is aborted mid-flight.
+struct CallbackState {
+    done: AtomicBool,
+    ok: AtomicBool,
+}
+
+// ---------------------------------------------------------------------------
+// DiskArbitration unmount (with per-tick retry)
 // ---------------------------------------------------------------------------
 
 /// Synchronously unmount all volumes on a disk via DiskArbitration.
 ///
-/// Returns `Ok(())` on success, or an error if the unmount fails or times out.
+/// Returns `Ok(())` on success, or an error if the unmount fails or times out
+/// after 5 retry attempts (25 seconds total).
 fn da_unmount_disk(bsd_name: &str) -> Result<()> {
+    da_unmount_disk_attempt(bsd_name, 0)
+}
+
+fn da_unmount_disk_attempt(bsd_name: &str, attempt: u32) -> Result<()> {
     let session =
         unsafe { DASession::new(None) }.context("failed to create DiskArbitration session")?;
 
@@ -375,20 +451,20 @@ fn da_unmount_disk(bsd_name: &str) -> Result<()> {
     let mode = unsafe { kCFRunLoopDefaultMode.unwrap() };
     unsafe { session.schedule_with_run_loop(&run_loop, mode) };
 
-    // Shared state for the callback
-    static UNMOUNT_DONE: AtomicBool = AtomicBool::new(false);
-    static UNMOUNT_OK: AtomicBool = AtomicBool::new(false);
-    UNMOUNT_DONE.store(false, Ordering::SeqCst);
-    UNMOUNT_OK.store(false, Ordering::SeqCst);
+    // Per-call state passed via context pointer — no static globals
+    let state = Box::into_raw(Box::new(CallbackState {
+        done: AtomicBool::new(false),
+        ok: AtomicBool::new(false),
+    }));
 
     unsafe extern "C-unwind" fn unmount_callback(
         _disk: NonNull<DADisk>,
         dissenter: *const DADissenter,
-        _context: *mut c_void,
+        context: *mut c_void,
     ) {
-        // NULL dissenter means success
-        UNMOUNT_OK.store(dissenter.is_null(), Ordering::SeqCst);
-        UNMOUNT_DONE.store(true, Ordering::SeqCst);
+        let state = unsafe { &*(context as *const CallbackState) };
+        state.ok.store(dissenter.is_null(), Ordering::SeqCst);
+        state.done.store(true, Ordering::SeqCst);
         if let Some(rl) = CFRunLoop::current() {
             rl.stop();
         }
@@ -398,23 +474,39 @@ fn da_unmount_disk(bsd_name: &str) -> Result<()> {
     let callback: DADiskUnmountCallback = Some(unmount_callback);
 
     unsafe {
-        disk.unmount(options, callback, ptr::null_mut());
+        disk.unmount(options, callback, state as *mut c_void);
     }
 
-    // Run the run loop with a timeout to wait for the callback
-    let timeout_secs = 10.0;
-    CFRunLoop::run_in_mode(Some(mode), timeout_secs, false);
+    // Run the run loop in 0.5s ticks (max 10 = 5s) waiting for the callback.
+    // The callback calls rl.stop(), so run_in_mode returns early when it fires.
+    let mut callback_fired = false;
+    for _ in 0..10 {
+        CFRunLoop::run_in_mode(Some(mode), 0.5, false);
+        if unsafe { &*state }.done.load(Ordering::SeqCst) {
+            callback_fired = true;
+            break;
+        }
+    }
 
     unsafe { session.unschedule_from_run_loop(&run_loop, mode) };
+    let state = unsafe { Box::from_raw(state) };
 
-    if !UNMOUNT_DONE.load(Ordering::SeqCst) {
+    if !callback_fired {
+        if attempt < 5 {
+            eprintln!(
+                "DA unmount of {} timed out (attempt {}), retrying...",
+                bsd_name,
+                attempt + 1
+            );
+            return da_unmount_disk_attempt(bsd_name, attempt + 1);
+        }
         bail!(
-            "unmount of {} timed out after {:.0}s",
-            bsd_name,
-            timeout_secs
+            "unmount of {} timed out after 5 attempts (25s total)",
+            bsd_name
         );
     }
-    if !UNMOUNT_OK.load(Ordering::SeqCst) {
+
+    if !state.ok.load(Ordering::SeqCst) {
         bail!("DiskArbitration failed to unmount {}", bsd_name);
     }
 
@@ -431,10 +523,6 @@ fn da_unmount_disk(bsd_name: &str) -> Result<()> {
 /// claim or interact with the disk. The claim session is scheduled on the
 /// **main run loop** (GUI event loop) so the release-denial callback fires
 /// even while the worker thread does blocking I/O.
-///
-/// Note: this does NOT prevent the kernel from mounting partitions — that's
-/// handled by `O_EXLOCK` on the file descriptor. The claim prevents other
-/// DA clients from claiming the disk.
 pub(crate) struct DiskClaim {
     _session: objc2_core_foundation::CFRetained<DASession>,
     disk: objc2_core_foundation::CFRetained<DADisk>,
@@ -500,18 +588,20 @@ fn da_claim_disk(bsd_name: &str) -> Result<Option<DiskClaim>> {
     let mode = unsafe { kCFRunLoopDefaultMode.unwrap() };
     unsafe { session.schedule_with_run_loop(&main_run_loop, mode) };
 
-    static CLAIM_DONE: AtomicBool = AtomicBool::new(false);
-    static CLAIM_OK: AtomicBool = AtomicBool::new(false);
-    CLAIM_DONE.store(false, Ordering::SeqCst);
-    CLAIM_OK.store(false, Ordering::SeqCst);
+    // Per-call state — no static globals, eliminates the concurrent-operation race
+    let state = Box::into_raw(Box::new(CallbackState {
+        done: AtomicBool::new(false),
+        ok: AtomicBool::new(false),
+    }));
 
     unsafe extern "C-unwind" fn claim_callback(
         _disk: NonNull<DADisk>,
         dissenter: *const DADissenter,
-        _context: *mut c_void,
+        context: *mut c_void,
     ) {
-        CLAIM_OK.store(dissenter.is_null(), Ordering::SeqCst);
-        CLAIM_DONE.store(true, Ordering::SeqCst);
+        let state = unsafe { &*(context as *const CallbackState) };
+        state.ok.store(dissenter.is_null(), Ordering::SeqCst);
+        state.done.store(true, Ordering::SeqCst);
     }
 
     let release_cb: DADiskClaimReleaseCallback = Some(claim_release_deny);
@@ -519,19 +609,22 @@ fn da_claim_disk(bsd_name: &str) -> Result<Option<DiskClaim>> {
     unsafe {
         disk.claim(
             kDADiskClaimOptionDefault,
-            release_cb,      // deny steal attempts from other DA clients
+            release_cb,
             ptr::null_mut(), // release context
             callback,
-            ptr::null_mut(), // callback context
+            state as *mut c_void, // claim callback context
         );
     }
 
     // Spin-wait for the claim completion callback (fires on main run loop,
     // which is pumped by the GUI thread).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !CLAIM_DONE.load(Ordering::SeqCst) {
+    while !unsafe { &*state }.done.load(Ordering::SeqCst) {
         if std::time::Instant::now() >= deadline {
-            unsafe { session.unschedule_from_run_loop(&main_run_loop, mode) };
+            unsafe {
+                session.unschedule_from_run_loop(&main_run_loop, mode);
+                let _ = Box::from_raw(state);
+            }
             eprintln!(
                 "DA claim of {} timed out — proceeding without exclusive access",
                 bsd_name
@@ -541,7 +634,9 @@ fn da_claim_disk(bsd_name: &str) -> Result<Option<DiskClaim>> {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
-    if !CLAIM_OK.load(Ordering::SeqCst) {
+    let state = unsafe { Box::from_raw(state) };
+
+    if !state.ok.load(Ordering::SeqCst) {
         unsafe { session.unschedule_from_run_loop(&main_run_loop, mode) };
         eprintln!(
             "DA claim of {} failed — proceeding without exclusive access",
@@ -560,23 +655,280 @@ fn da_claim_disk(bsd_name: &str) -> Result<Option<DiskClaim>> {
 }
 
 // ---------------------------------------------------------------------------
-// O_EXLOCK exclusive device access
+// authopen-based privileged device access
 // ---------------------------------------------------------------------------
 
-/// BSD exclusive lock flag — prevents any other open (including kernel mounts)
-/// while the fd is held. This is how Balena Etcher prevents macOS from
-/// mounting partitions mid-write.
-const O_EXLOCK: libc::c_int = 0x0020;
+/// Receive a file descriptor sent via `SCM_RIGHTS` ancillary data on a Unix socket.
+fn receive_fd_from_socket(sock: libc::c_int) -> Result<libc::c_int> {
+    use std::mem;
 
-/// macOS fcntl command to bypass the buffer cache (equivalent to O_DIRECT on Linux).
-const F_NOCACHE: libc::c_int = 48;
+    let mut data = 0u8;
+    let mut iov = libc::iovec {
+        iov_base: &mut data as *mut u8 as *mut c_void,
+        iov_len: 1,
+    };
 
-/// Open a device path with `O_EXLOCK` for exclusive access.
+    // Allocate a buffer large enough for one cmsghdr + one int (the fd)
+    let cmsg_space =
+        unsafe { libc::CMSG_SPACE(mem::size_of::<libc::c_int>() as libc::c_uint) as usize };
+    let mut cmsg_buf = vec![0u8; cmsg_space];
+
+    let mut msg: libc::msghdr = unsafe { mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut c_void;
+    msg.msg_controllen = cmsg_space as libc::socklen_t;
+
+    let ret = loop {
+        let r = unsafe { libc::recvmsg(sock, &mut msg, 0) };
+        if r == -1 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            bail!("recvmsg failed: {}", err);
+        }
+        break r;
+    };
+
+    if ret <= 0 {
+        bail!("recvmsg: authopen did not send a file descriptor");
+    }
+
+    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+    if cmsg.is_null() {
+        bail!("recvmsg: no ancillary control message (authopen may have failed)");
+    }
+
+    let (cmsg_level, cmsg_type) = unsafe { ((*cmsg).cmsg_level, (*cmsg).cmsg_type) };
+    if cmsg_level != libc::SOL_SOCKET || cmsg_type != libc::SCM_RIGHTS {
+        bail!(
+            "recvmsg: unexpected control message (level={}, type={})",
+            cmsg_level,
+            cmsg_type
+        );
+    }
+
+    let fd = unsafe {
+        let data_ptr = libc::CMSG_DATA(cmsg) as *const libc::c_int;
+        std::ptr::read_unaligned(data_ptr)
+    };
+
+    Ok(fd)
+}
+
+/// Open a device using `/usr/libexec/authopen`.
 ///
-/// Uses `libc::open()` directly because Rust's `OpenOptions` doesn't expose
-/// BSD-specific flags. Sets `F_NOCACHE` for direct I/O. Retries up to 5 times
-/// on EBUSY (unmount may not have fully propagated in the kernel).
-fn open_with_exlock(path: &str, flags: libc::c_int) -> Result<File> {
+/// `authopen` is a macOS system binary that opens a device with root privileges
+/// and passes the file descriptor back via a Unix domain socket (`SCM_RIGHTS`).
+/// This mirrors what RPI Imager does and avoids the unreliable `O_EXLOCK` flag
+/// on raw character devices.
+///
+/// If the app is already running as root, `authopen` returns the fd immediately
+/// without showing the system auth dialog.
+fn authopen_device(path: &str, flags: libc::c_int) -> Result<File> {
+    // 1. Build the right name: "sys.openfile.readwrite.<path>"
+    let right_name_str = format!("sys.openfile.readwrite.{}", path);
+    let right_name = CString::new(right_name_str).context("path contains NUL byte")?;
+
+    // 2. Request the authorization right (shows native auth dialog if not root)
+    let mut auth_ref: security::AuthorizationRef = ptr::null_mut();
+    let item = security::AuthorizationItem {
+        name: right_name.as_ptr(),
+        value_length: 0,
+        value: ptr::null_mut(),
+        flags: 0,
+    };
+    let rights = security::AuthorizationRights {
+        count: 1,
+        items: &item,
+    };
+
+    let status = unsafe {
+        security::AuthorizationCreate(
+            &rights,
+            ptr::null(),
+            security::FLAG_INTERACTION_ALLOWED
+                | security::FLAG_EXTEND_RIGHTS
+                | security::FLAG_PRE_AUTHORIZE,
+            &mut auth_ref,
+        )
+    };
+
+    if status == security::ERR_AUTHORIZATION_CANCELED {
+        bail!("User cancelled authentication");
+    }
+    if status != security::ERR_AUTHORIZATION_SUCCESS {
+        bail!("AuthorizationCreate failed with status {}", status);
+    }
+
+    // 3. Serialize the auth token to 32 bytes so we can hand it to authopen
+    let mut ext_form = security::AuthorizationExternalForm { bytes: [0i8; 32] };
+    let status = unsafe { security::AuthorizationMakeExternalForm(auth_ref, &mut ext_form) };
+
+    // 4. Release the auth ref — we have the serialized external form now
+    unsafe { security::AuthorizationFree(auth_ref, 0) };
+
+    if status != security::ERR_AUTHORIZATION_SUCCESS {
+        bail!(
+            "AuthorizationMakeExternalForm failed with status {}",
+            status
+        );
+    }
+
+    // 5. Create IPC channels:
+    //    sv[0]       — parent receives the fd via SCM_RIGHTS
+    //    sv[1]       — child (authopen) sends the fd
+    //    stdin_pipe[0] — child reads the 32-byte auth token from stdin
+    //    stdin_pipe[1] — parent writes the auth token
+    let mut sv = [-1i32; 2];
+    let mut stdin_pipe = [-1i32; 2];
+
+    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) } != 0 {
+        bail!("socketpair failed: {}", std::io::Error::last_os_error());
+    }
+    if unsafe { libc::pipe(stdin_pipe.as_mut_ptr()) } != 0 {
+        unsafe {
+            libc::close(sv[0]);
+            libc::close(sv[1]);
+        }
+        bail!("pipe failed: {}", std::io::Error::last_os_error());
+    }
+
+    // Prepare all execv arguments BEFORE fork (CStrings must stay alive until after exec)
+    let authopen_path = CString::new("/usr/libexec/authopen").unwrap();
+    let arg0 = CString::new("authopen").unwrap();
+    let arg_stdoutpipe = CString::new("-stdoutpipe").unwrap();
+    let arg_extauth = CString::new("-extauth").unwrap();
+    let arg_o = CString::new("-o").unwrap();
+    let flags_str = CString::new(format!("{}", flags)).unwrap();
+    let path_cstr = CString::new(path).context("path contains NUL byte")?;
+
+    // null-terminated argv array for execv
+    let argv: [*const libc::c_char; 8] = [
+        arg0.as_ptr(),
+        arg_stdoutpipe.as_ptr(),
+        arg_extauth.as_ptr(),
+        arg_o.as_ptr(),
+        flags_str.as_ptr(),
+        path_cstr.as_ptr(),
+        ptr::null(),
+        ptr::null(),
+    ];
+
+    // 6. Fork — child execs authopen; parent receives the fd
+    let pid = unsafe { libc::fork() };
+
+    match pid {
+        -1 => {
+            unsafe {
+                libc::close(sv[0]);
+                libc::close(sv[1]);
+                libc::close(stdin_pipe[0]);
+                libc::close(stdin_pipe[1]);
+            }
+            bail!("fork failed: {}", std::io::Error::last_os_error());
+        }
+        0 => {
+            // Child process — only async-signal-safe calls between fork and exec
+            unsafe {
+                // Close parent-side ends
+                libc::close(sv[0]);
+                libc::close(stdin_pipe[1]);
+
+                // Wire auth-token pipe to stdin
+                libc::dup2(stdin_pipe[0], libc::STDIN_FILENO);
+                libc::close(stdin_pipe[0]);
+
+                // Wire socket to stdout (authopen sends fd via -stdoutpipe on stdout)
+                libc::dup2(sv[1], libc::STDOUT_FILENO);
+                libc::close(sv[1]);
+
+                libc::execv(authopen_path.as_ptr(), argv.as_ptr());
+                libc::exit(-1); // exec failed
+            }
+        }
+        child_pid => {
+            // Parent process
+            unsafe {
+                // Close child-side ends
+                libc::close(sv[1]);
+                libc::close(stdin_pipe[0]);
+
+                // 7. Write the 32-byte auth external form to authopen's stdin
+                libc::write(
+                    stdin_pipe[1],
+                    ext_form.bytes.as_ptr() as *const c_void,
+                    security::EXTERNAL_FORM_LENGTH,
+                );
+                libc::close(stdin_pipe[1]);
+            }
+
+            // 8. Receive the file descriptor via SCM_RIGHTS (retry on EINTR)
+            let received_fd = match receive_fd_from_socket(sv[0]) {
+                Ok(fd) => {
+                    unsafe { libc::close(sv[0]) };
+                    fd
+                }
+                Err(e) => {
+                    unsafe {
+                        libc::close(sv[0]);
+                        // Reap child to avoid zombie
+                        let mut wstatus = 0i32;
+                        libc::waitpid(child_pid, &mut wstatus, 0);
+                    }
+                    return Err(e);
+                }
+            };
+
+            // 9. Wait for authopen to exit (retry on EINTR)
+            let mut wstatus = 0i32;
+            loop {
+                let r = unsafe { libc::waitpid(child_pid, &mut wstatus, 0) };
+                if r == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break;
+            }
+
+            if libc::WIFEXITED(wstatus) && libc::WEXITSTATUS(wstatus) != 0 {
+                unsafe { libc::close(received_fd) };
+                bail!(
+                    "authopen exited with error code {}",
+                    libc::WEXITSTATUS(wstatus)
+                );
+            }
+
+            // 10. Bypass the buffer cache (equivalent to O_DIRECT on Linux)
+            unsafe { libc::fcntl(received_fd, F_NOCACHE, 1) };
+
+            Ok(unsafe { File::from_raw_fd(received_fd) })
+        }
+    }
+}
+
+/// Open a device path with privilege escalation via authopen when needed.
+///
+/// Tries `authopen` first (shows the native macOS auth dialog if not root).
+/// If authopen fails for a reason other than user cancellation, falls back
+/// to a direct `open(2)` — which works when the app is already root via sudo.
+///
+/// Never uses `O_EXLOCK`, which is unreliable on raw character devices and
+/// causes intermittent `EBUSY` errors even after a successful unmount.
+fn open_device(path: &str, flags: libc::c_int) -> Result<File> {
+    // Try authopen first
+    match authopen_device(path, flags) {
+        Ok(file) => return Ok(file),
+        Err(e) => {
+            let msg = e.to_string().to_lowercase();
+            if msg.contains("cancelled") || msg.contains("canceled") {
+                return Err(e);
+            }
+            eprintln!("authopen warning: {} — falling back to direct open", e);
+        }
+    }
+
+    // Direct open fallback (used when the app is already running as root via sudo)
     let c_path = CString::new(path).context("invalid device path")?;
     let mut last_err = None;
 
@@ -586,25 +938,23 @@ fn open_with_exlock(path: &str, flags: libc::c_int) -> Result<File> {
             eprintln!("Retrying open of {} (attempt {}/5)...", path, attempt + 1);
         }
 
-        let fd = unsafe { libc::open(c_path.as_ptr(), flags | O_EXLOCK) };
+        let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
         if fd >= 0 {
-            // Set F_NOCACHE for direct I/O (bypass buffer cache)
             unsafe { libc::fcntl(fd, F_NOCACHE, 1) };
-            let file = unsafe { File::from_raw_fd(fd) };
-            eprintln!("Opened {} with O_EXLOCK (attempt {})", path, attempt + 1);
-            return Ok(file);
+            eprintln!("Opened {} directly (attempt {})", path, attempt + 1);
+            return Ok(unsafe { File::from_raw_fd(fd) });
         }
 
         let err = std::io::Error::last_os_error();
         let raw = err.raw_os_error().unwrap_or(0);
 
-        if err.kind() == std::io::ErrorKind::PermissionDenied {
-            // Don't retry — caller will handle elevation
-            return Err(anyhow::anyhow!(err).context(format!("permission denied opening {}", path)));
+        if raw == libc::EPERM {
+            return Err(anyhow::anyhow!(err).context(format!(
+                "permission denied opening {} — run without sudo or check disk permissions",
+                path
+            )));
         }
-
         if raw != libc::EBUSY {
-            // Non-transient error — don't retry
             return Err(anyhow::anyhow!(err).context(format!("cannot open {}", path)));
         }
 
@@ -629,14 +979,11 @@ fn bsd_name_from_path(path: &Path) -> &str {
 
 /// Open a target device for writing with exclusive access.
 ///
-/// Uses a two-layer locking strategy:
-/// 1. `DADiskClaim` — prevents other DiskArbitration clients (e.g. VMware
-///    Fusion) from claiming or interacting with the disk.
-/// 2. `O_EXLOCK` — kernel-level exclusive lock that prevents macOS from
-///    mounting any partition on the disk while the fd is held.
-///
-/// If the initial open fails with permission denied, falls back to `osascript`
-/// to run `diskutil unmountDisk force` with admin privileges, then retries.
+/// Strategy:
+/// 1. `DADiskUnmount` — unmount all volumes (with retry).
+/// 2. `DADiskClaim` — prevent other DiskArbitration clients from interacting.
+/// 3. `authopen` — request root privileges via the native macOS auth dialog
+///    and open the raw device. Falls back to a direct open if already root.
 pub(crate) fn open_target_for_writing(path: &Path) -> Result<(File, Option<DiskClaim>)> {
     let path_str = path.to_string_lossy();
     let disk_name = bsd_name_from_path(path);
@@ -663,60 +1010,18 @@ pub(crate) fn open_target_for_writing(path: &Path) -> Result<(File, Option<DiskC
         path_str.to_string()
     };
 
-    // Try to open with O_EXLOCK
-    match open_with_exlock(&raw_device, libc::O_RDWR) {
-        Ok(file) => return Ok((file, claim)),
-        Err(e) => {
-            // Check if this is a permission error — if so, try elevation
-            let is_permission_chain = e.chain().any(|cause| {
-                cause
-                    .downcast_ref::<std::io::Error>()
-                    .map_or(false, |io_err| {
-                        io_err.kind() == std::io::ErrorKind::PermissionDenied
-                    })
-            });
-            if !is_permission_chain {
-                return Err(e);
-            }
-        }
-    }
-
-    // Permission denied — use osascript to unmount with elevated privileges,
-    // then retry. This is the only remaining diskutil usage — specifically
-    // for privilege elevation via the native macOS admin auth dialog.
-    let script = format!(
-        "do shell script \"diskutil unmountDisk force {disk_name}\" with administrator privileges"
-    );
-
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
-        .output()
-        .context("failed to launch osascript for elevated unmount")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("User canceled") || stderr.contains("-128") {
-            bail!("User cancelled the administrator authentication request");
-        }
-    }
-
-    // Retry with O_EXLOCK after elevated unmount
-    let file = open_with_exlock(&raw_device, libc::O_RDWR).with_context(|| {
-        format!(
-            "cannot open {} for writing (even after elevated unmount)",
-            raw_device
-        )
-    })?;
+    let file = open_device(&raw_device, libc::O_RDWR)?;
     Ok((file, claim))
 }
 
-/// Open a source device or image file for reading with exclusive access.
+/// Open a source device or image file for reading.
 ///
 /// For device paths (`/dev/disk*`), unmounts all volumes and opens with
-/// `O_EXLOCK` for kernel-level exclusive access. For regular files, opens
-/// normally. The application should already be running with elevated
-/// privileges (via sudo at startup).
+/// `authopen` for privileged access. For regular files, opens normally.
+///
+/// Read path: tries a direct `O_RDONLY` open first (works on removable media
+/// accessible without root), falling back to `authopen` (always `O_RDWR`)
+/// only on `EPERM`.
 pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
     let path_str = path.to_string_lossy();
     let is_device = path_str.starts_with("/dev/disk") || path_str.starts_with("/dev/rdisk");
@@ -745,32 +1050,38 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
             path_str.to_string()
         };
 
-        match open_with_exlock(&raw_device, libc::O_RDONLY) {
-            Ok(file) => Ok(ElevatedSource {
+        let c_path = CString::new(raw_device.as_str()).context("invalid device path")?;
+
+        // 1. Try a direct O_RDONLY open first — succeeds if we're already root
+        //    or if the media is accessible without privileges.
+        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY) };
+        if fd >= 0 {
+            unsafe { libc::fcntl(fd, F_NOCACHE, 1) };
+            return Ok(ElevatedSource {
+                file: unsafe { File::from_raw_fd(fd) },
+                temp_path: None,
+                disk_claim,
+            });
+        }
+
+        let err = std::io::Error::last_os_error();
+        let raw = err.raw_os_error().unwrap_or(0);
+
+        // 2. On EPERM, escalate via authopen (authopen always opens O_RDWR,
+        //    which is fine for reading).
+        if raw == libc::EPERM {
+            let file = authopen_device(&raw_device, libc::O_RDWR).with_context(|| {
+                format!("cannot open {} for reading (authopen failed)", raw_device)
+            })?;
+            return Ok(ElevatedSource {
                 file,
                 temp_path: None,
                 disk_claim,
-            }),
-            Err(e) => {
-                // Check if permission denied anywhere in the error chain
-                let is_permission = e.chain().any(|cause| {
-                    cause
-                        .downcast_ref::<std::io::Error>()
-                        .map_or(false, |io_err| {
-                            io_err.kind() == std::io::ErrorKind::PermissionDenied
-                        })
-                });
-                if is_permission {
-                    bail!(
-                        "Permission denied: {}.\n\n\
-                         Rusty Backup requires administrator privileges to access disk devices.\n\
-                         Please restart the application - you will be prompted for your password.",
-                        path.display()
-                    );
-                }
-                Err(e)
-            }
+            });
         }
+
+        // 3. Any other error is non-recoverable
+        Err(anyhow::anyhow!(err).context(format!("cannot open {} for reading", raw_device)))
     } else {
         // Regular file — open normally
         let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
