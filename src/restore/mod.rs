@@ -991,7 +991,19 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
     drop(target);
 
     // Step 9: Reopen device and set FAT clean flags (requires fresh file handle on macOS)
-    if config.target_is_device {
+    // Only do this if at least one FAT partition was resized or compacted.
+    let any_fat_needs_flags = config.target_is_device
+        && metadata.partitions.iter().any(|pm| {
+            if !pm.type_name.to_ascii_lowercase().contains("fat") {
+                return false;
+            }
+            let Some(ov) = overrides.iter().find(|o| o.index == pm.index) else {
+                return false;
+            };
+            ov.export_size != pm.original_size_bytes || pm.compacted
+        });
+
+    if any_fat_needs_flags {
         log(
             &progress,
             LogLevel::Info,
@@ -1011,6 +1023,9 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
             })?;
 
         for pm in &metadata.partitions {
+            if !pm.type_name.to_ascii_lowercase().contains("fat") {
+                continue;
+            }
             let ov = match overrides.iter().find(|o| o.index == pm.index) {
                 Some(o) => o,
                 None => continue,
@@ -1018,7 +1033,7 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
             let part_offset = ov.effective_start_lba() * 512;
             let export_size = ov.export_size;
 
-            // Set clean flags if this was a FAT filesystem that got resized
+            // Set clean flags if this FAT partition was resized or compacted
             if export_size != pm.original_size_bytes || pm.compacted {
                 let _ = set_fat_clean_flags(&mut device_file, part_offset, &mut |msg| {
                     log(&progress, LogLevel::Info, msg)
@@ -1483,8 +1498,20 @@ fn run_clonezilla_restore(
     target.flush()?;
     drop(target);
 
-    // Reopen device to set FAT clean flags
-    if config.target_is_device {
+    // Reopen device to set FAT clean flags (only if any FAT partition was resized/used partclone)
+    let any_fat_needs_flags = config.target_is_device
+        && sorted_parts.iter().any(|cz_part| {
+            let fs = cz_part.filesystem_type.to_ascii_lowercase();
+            if !fs.contains("fat") && !fs.contains("vfat") {
+                return false;
+            }
+            let Some(ov) = overrides.iter().find(|o| o.index == cz_part.index) else {
+                return false;
+            };
+            ov.export_size != cz_part.size_bytes() || !cz_part.partclone_files.is_empty()
+        });
+
+    if any_fat_needs_flags {
         log(
             &progress,
             LogLevel::Info,
@@ -1503,6 +1530,10 @@ fn run_clonezilla_restore(
             })?;
 
         for cz_part in &sorted_parts {
+            let fs = cz_part.filesystem_type.to_ascii_lowercase();
+            if !fs.contains("fat") && !fs.contains("vfat") {
+                continue;
+            }
             let ov = match overrides.iter().find(|o| o.index == cz_part.index) {
                 Some(o) => o,
                 None => continue,
