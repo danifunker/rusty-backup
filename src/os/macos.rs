@@ -977,6 +977,46 @@ fn bsd_name_from_path(path: &Path) -> &str {
     }
 }
 
+/// Open a device for read-only inspection without unmounting or claiming.
+///
+/// Used by the Inspect tab, which runs on the GUI thread and cannot afford
+/// the DA unmount/claim latency. Since inspect is non-destructive, exclusive
+/// access is not required.
+///
+/// Tries a direct `O_RDONLY` open first; on `EPERM` or `EACCES`, escalates
+/// via `authopen` so the user is prompted for administrator credentials once.
+pub(crate) fn open_device_for_inspect(path: &Path) -> Result<File> {
+    let path_str = path.to_string_lossy();
+    let is_device = path_str.starts_with("/dev/disk") || path_str.starts_with("/dev/rdisk");
+
+    if is_device {
+        let raw_device = if path_str.starts_with("/dev/disk") {
+            format!("/dev/r{}", &path_str[5..])
+        } else {
+            path_str.to_string()
+        };
+
+        let c_path = CString::new(raw_device.as_str()).context("invalid device path")?;
+        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY) };
+        if fd >= 0 {
+            unsafe { libc::fcntl(fd, F_NOCACHE, 1) };
+            return Ok(unsafe { File::from_raw_fd(fd) });
+        }
+
+        let err = std::io::Error::last_os_error();
+        let raw = err.raw_os_error().unwrap_or(0);
+
+        if raw == libc::EPERM || raw == libc::EACCES {
+            return authopen_device(&raw_device, libc::O_RDWR)
+                .with_context(|| format!("cannot open {} for inspection", raw_device));
+        }
+
+        Err(anyhow::anyhow!(err).context(format!("cannot open {} for reading", raw_device)))
+    } else {
+        File::open(path).with_context(|| format!("cannot open {}", path.display()))
+    }
+}
+
 /// Open a target device for writing with exclusive access.
 ///
 /// Strategy:
@@ -1067,9 +1107,9 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
         let err = std::io::Error::last_os_error();
         let raw = err.raw_os_error().unwrap_or(0);
 
-        // 2. On EPERM, escalate via authopen (authopen always opens O_RDWR,
-        //    which is fine for reading).
-        if raw == libc::EPERM {
+        // 2. On EPERM or EACCES, escalate via authopen (authopen always opens
+        //    O_RDWR, which is fine for reading).
+        if raw == libc::EPERM || raw == libc::EACCES {
             let file = authopen_device(&raw_device, libc::O_RDWR).with_context(|| {
                 format!("cannot open {} for reading (authopen failed)", raw_device)
             })?;

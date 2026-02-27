@@ -458,6 +458,25 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
     }
 }
 
+/// Open a file or device for read-only inspection.
+///
+/// On macOS, if a `/dev/disk*` path returns permission denied, this will
+/// prompt the user for administrator credentials via the native macOS
+/// authentication dialog. Unlike [`open_source_for_reading`], this does NOT
+/// unmount or claim the device, making it safe to call from the GUI thread.
+///
+/// On other platforms, opens the file normally.
+pub fn open_for_inspect(path: &Path) -> Result<File> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::open_device_for_inspect(path)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        File::open(path).with_context(|| format!("cannot open {}", path.display()))
+    }
+}
+
 /// Open a target device or image file for writing (restore).
 ///
 /// For regular files (`.img`): creates/truncates the file.
