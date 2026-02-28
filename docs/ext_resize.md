@@ -52,24 +52,19 @@ Currently ext uses a layout-preserving compact reader (`compacted_size == origin
 
 ---
 
-## Session 3: Rebuild Bitmaps and Group Descriptors
+## Session 3: Rebuild Bitmaps and Group Descriptors ✅
 
 **Goal:** Produce updated block bitmaps and group descriptors reflecting the new block layout after relocation.
 
 ### Tasks
-- [ ] Add function: `rebuild_bitmaps(original_bitmaps, relocation_map, min_groups) -> Vec<Vec<u8>>`
-  - For each group within new boundary:
-    - Start with original bitmap
-    - Clear bits for blocks relocated OUT
-    - Set bits for blocks relocated IN
-- [ ] Update group descriptors:
-  - Recalculate `bg_free_blocks_count` per group from rebuilt bitmaps
-  - Zero/remove descriptors for truncated trailing groups
-- [ ] Update superblock fields for new image:
-  - `s_blocks_count` (total blocks)
-  - `s_free_blocks_count` (total free)
-  - `s_block_group_nr` if needed
-- [ ] Unit test: verify bitmap consistency — set bits == allocated blocks count
+- [x] `ShrinkMetadata` struct: `superblock: Vec<u8>`, `gdt: Vec<u8>`, `block_bitmaps: Vec<Vec<u8>>`
+- [x] `rebuild_metadata_for_shrink(reader, partition_offset, plan) -> ShrinkMetadata`
+  - Reads original bitmaps, applies relocation (clear OUT bits, set IN bits)
+  - Recalculates `bg_free_blocks_count` per group from rebuilt bitmaps
+  - Truncates GDT to `min_groups`
+  - Patches superblock: `s_blocks_count`, `s_free_blocks_count`, `s_r_blocks_count` (proportional)
+  - Handles 64-bit high words for all fields
+- [x] Tests: `test_rebuild_metadata_superblock`, `test_rebuild_metadata_gdt_truncated`, `test_rebuild_metadata_bitmap`, `test_rebuild_metadata_no_shrink`
 
 ### Files to modify
 - `src/fs/ext.rs`

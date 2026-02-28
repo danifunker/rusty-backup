@@ -1723,6 +1723,213 @@ fn patch_indirect_block_recursive<R: Read + Seek>(
     Ok(())
 }
 
+// ---- Metadata rebuild for shrink ----
+
+/// Rebuilt metadata ready to be assembled into the packed stream.
+#[derive(Debug)]
+pub struct ShrinkMetadata {
+    /// Patched superblock (1024 bytes), with updated block/free counts.
+    pub superblock: Vec<u8>,
+    /// Patched GDT bytes for the new (smaller) number of groups.
+    pub gdt: Vec<u8>,
+    /// Rebuilt block bitmaps, one per group in the new layout.
+    pub block_bitmaps: Vec<Vec<u8>>,
+}
+
+/// Rebuild superblock, GDT, and block bitmaps for a shrunken filesystem.
+///
+/// Reads the original metadata, applies the relocation plan (clearing bits for
+/// blocks moved out, setting bits for blocks moved in), truncates the GDT to
+/// `min_groups`, and updates the superblock totals.
+pub fn rebuild_metadata_for_shrink<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    plan: &RelocationPlan,
+) -> Result<ShrinkMetadata, FilesystemError> {
+    // ---- Read superblock ----
+    reader.seek(SeekFrom::Start(partition_offset + SUPERBLOCK_OFFSET))?;
+    let mut sb = [0u8; SUPERBLOCK_SIZE];
+    reader.read_exact(&mut sb)?;
+
+    let magic = u16::from_le_bytes([sb[0x38], sb[0x39]]);
+    if magic != EXT_MAGIC {
+        return Err(FilesystemError::Parse(format!(
+            "ext rebuild: invalid magic 0x{magic:04X}"
+        )));
+    }
+
+    let first_data_block = le32(&sb, 0x14);
+    let log_block_size = le32(&sb, 0x18);
+    let blocks_per_group = le32(&sb, 0x20);
+    let feature_incompat = le32(&sb, 0x60);
+
+    let block_size = 1024u64 << log_block_size;
+    let is_64bit = feature_incompat & INCOMPAT_64BIT != 0;
+
+    let desc_size: u16 = if is_64bit {
+        let ds = u16::from_le_bytes([sb[0xFE], sb[0xFF]]);
+        if ds >= 64 {
+            ds
+        } else {
+            64
+        }
+    } else {
+        32
+    };
+
+    let blocks_count_lo = le32(&sb, 0x04);
+    let total_blocks = if is_64bit {
+        let hi = le32(&sb, 0x150) as u64;
+        (hi << 32) | blocks_count_lo as u64
+    } else {
+        blocks_count_lo as u64
+    };
+
+    let group_count = ((total_blocks - first_data_block as u64 + blocks_per_group as u64 - 1)
+        / blocks_per_group as u64) as u32;
+
+    let min_groups = plan.min_groups;
+
+    // ---- Read original GDT ----
+    let sb_block = if block_size == 1024 { 1 } else { 0 };
+    let gdt_block = sb_block + 1;
+    let gdt_offset = partition_offset + gdt_block * block_size;
+    let gdt_bytes_needed = group_count as usize * desc_size as usize;
+    let mut gdt_buf = vec![0u8; gdt_bytes_needed];
+    reader.seek(SeekFrom::Start(gdt_offset))?;
+    reader.read_exact(&mut gdt_buf)?;
+
+    // Parse block bitmap locations
+    let mut bitmap_blocks: Vec<u64> = Vec::with_capacity(group_count as usize);
+    for i in 0..group_count as usize {
+        let off = i * desc_size as usize;
+        let d = &gdt_buf[off..];
+        let bb_lo = le32(d, 0x00) as u64;
+        let bb = if is_64bit && desc_size >= 64 {
+            let bb_hi = le32(d, 0x20) as u64;
+            (bb_hi << 32) | bb_lo
+        } else {
+            bb_lo
+        };
+        bitmap_blocks.push(bb);
+    }
+
+    // ---- Rebuild block bitmaps for groups 0..min_groups ----
+    // Build a reverse map: new_block → old_block (to know what was moved IN)
+    let reverse: std::collections::HashMap<u64, u64> = plan
+        .relocations
+        .iter()
+        .map(|(&old, &new)| (new, old))
+        .collect();
+
+    let mut block_bitmaps: Vec<Vec<u8>> = Vec::with_capacity(min_groups as usize);
+    let mut total_free: u64 = 0;
+
+    for group in 0..min_groups as usize {
+        let group_start = first_data_block as u64 + group as u64 * blocks_per_group as u64;
+        let group_block_count = if group as u32 == min_groups - 1 {
+            plan.new_total_blocks - group_start
+        } else {
+            blocks_per_group as u64
+        };
+
+        // Read original bitmap (if group existed)
+        let mut bitmap = if (group as u32) < group_count {
+            reader.seek(SeekFrom::Start(
+                partition_offset + bitmap_blocks[group] * block_size,
+            ))?;
+            let mut bm = vec![0u8; block_size as usize];
+            reader.read_exact(&mut bm)?;
+            bm
+        } else {
+            vec![0u8; block_size as usize]
+        };
+
+        // Apply relocations: clear bits for blocks moved OUT, set bits for blocks moved IN
+        for bit in 0..group_block_count {
+            let abs_block = group_start + bit;
+
+            // If this block was relocated OUT (it's in the relocation map as a key
+            // and its target is in a different group), clear it
+            if plan.relocations.contains_key(&abs_block) {
+                // Block was moved away — clear the bit
+                let byte_idx = (bit / 8) as usize;
+                let bit_idx = (bit % 8) as u32;
+                bitmap[byte_idx] &= !(1u8 << bit_idx);
+            }
+
+            // If this block is a relocation TARGET (something was moved here), set it
+            if reverse.contains_key(&abs_block) {
+                let byte_idx = (bit / 8) as usize;
+                let bit_idx = (bit % 8) as u32;
+                bitmap[byte_idx] |= 1u8 << bit_idx;
+            }
+        }
+
+        // Count free blocks in this group
+        let bm_reader = BitmapReader::new(&bitmap, group_block_count);
+        let used = bm_reader.count_set_bits();
+        let free = group_block_count - used;
+        total_free += free;
+
+        // Update bg_free_blocks_count in GDT for this group
+        let gdt_off = group * desc_size as usize;
+        if gdt_off + desc_size as usize <= gdt_buf.len() {
+            gdt_buf[gdt_off + 0x0C..gdt_off + 0x0E].copy_from_slice(&(free as u16).to_le_bytes());
+            if is_64bit && desc_size >= 64 {
+                gdt_buf[gdt_off + 0x2C..gdt_off + 0x2E]
+                    .copy_from_slice(&((free >> 16) as u16).to_le_bytes());
+            }
+        }
+
+        block_bitmaps.push(bitmap);
+    }
+
+    // Truncate GDT to min_groups
+    let new_gdt_len = min_groups as usize * desc_size as usize;
+    gdt_buf.truncate(new_gdt_len);
+
+    // ---- Patch superblock ----
+    let new_total = plan.new_total_blocks;
+
+    // s_blocks_count
+    sb[0x04..0x08].copy_from_slice(&(new_total as u32).to_le_bytes());
+    if is_64bit {
+        sb[0x150..0x154].copy_from_slice(&((new_total >> 32) as u32).to_le_bytes());
+    }
+
+    // s_free_blocks_count
+    sb[0x0C..0x10].copy_from_slice(&(total_free as u32).to_le_bytes());
+    if is_64bit {
+        sb[0x158..0x15C].copy_from_slice(&((total_free >> 32) as u32).to_le_bytes());
+    }
+
+    // s_r_blocks_count (reserved) — scale proportionally
+    let old_reserved_lo = le32(&sb, 0x08) as u64;
+    let old_reserved = if is_64bit {
+        let hi = le32(&sb, 0x154) as u64;
+        (hi << 32) | old_reserved_lo
+    } else {
+        old_reserved_lo
+    };
+    let old_total = total_blocks;
+    let new_reserved = if old_total > 0 {
+        old_reserved * new_total / old_total
+    } else {
+        0
+    };
+    sb[0x08..0x0C].copy_from_slice(&(new_reserved as u32).to_le_bytes());
+    if is_64bit {
+        sb[0x154..0x158].copy_from_slice(&((new_reserved >> 32) as u32).to_le_bytes());
+    }
+
+    Ok(ShrinkMetadata {
+        superblock: sb.to_vec(),
+        gdt: gdt_buf,
+        block_bitmaps,
+    })
+}
+
 // ---- Byte reading helpers ----
 
 fn le32(data: &[u8], offset: usize) -> u32 {
@@ -2836,5 +3043,96 @@ mod tests {
         // Should still produce tables (1 group)
         assert_eq!(result.tables.len(), 1);
         assert!(result.indirect_block_patches.is_empty());
+    }
+
+    // ---- Metadata rebuild tests ----
+
+    #[test]
+    fn test_rebuild_metadata_superblock() {
+        let image = make_two_group_image();
+        let mut cursor = Cursor::new(image);
+
+        let plan = build_relocation_map(&mut cursor, 0).unwrap();
+        assert!(plan.needs_relocation);
+        assert_eq!(plan.new_total_blocks, 64);
+
+        let meta = rebuild_metadata_for_shrink(&mut cursor, 0, &plan).unwrap();
+
+        // Superblock should reflect new size
+        let sb = &meta.superblock;
+        let new_blocks = le32(sb, 0x04) as u64;
+        assert_eq!(new_blocks, 64, "s_blocks_count should be 64");
+
+        // Free blocks should be consistent
+        let free_blocks = le32(sb, 0x0C) as u64;
+        // Group 0 has 64 blocks, 5 metadata + 3 original data + 2 relocated in = 10 used, 54 free
+        assert_eq!(free_blocks, 64 - 10, "s_free_blocks_count should be 54");
+    }
+
+    #[test]
+    fn test_rebuild_metadata_gdt_truncated() {
+        let image = make_two_group_image();
+        let mut cursor = Cursor::new(image);
+
+        let plan = build_relocation_map(&mut cursor, 0).unwrap();
+        let meta = rebuild_metadata_for_shrink(&mut cursor, 0, &plan).unwrap();
+
+        // GDT should only have 1 group (32 bytes for non-64bit)
+        assert_eq!(meta.gdt.len(), 32, "GDT should be truncated to 1 group");
+    }
+
+    #[test]
+    fn test_rebuild_metadata_bitmap() {
+        let image = make_two_group_image();
+        let mut cursor = Cursor::new(image);
+
+        let plan = build_relocation_map(&mut cursor, 0).unwrap();
+        let meta = rebuild_metadata_for_shrink(&mut cursor, 0, &plan).unwrap();
+
+        // Should have 1 bitmap (for the 1 remaining group)
+        assert_eq!(meta.block_bitmaps.len(), 1);
+
+        let bm = BitmapReader::new(&meta.block_bitmaps[0], 64);
+
+        // Metadata blocks 0-4 should still be set
+        for b in 0..5 {
+            assert!(bm.is_bit_set(b), "metadata block {b} should be set");
+        }
+
+        // Original data blocks 8-10 should still be set
+        for b in 8..=10 {
+            assert!(bm.is_bit_set(b), "original data block {b} should be set");
+        }
+
+        // Relocated blocks should be set at their new locations
+        for &new_block in plan.relocations.values() {
+            assert!(
+                bm.is_bit_set(new_block),
+                "relocated target block {new_block} should be set"
+            );
+        }
+
+        // Total set bits = 5 metadata + 3 original + 2 relocated = 10
+        assert_eq!(bm.count_set_bits(), 10);
+    }
+
+    #[test]
+    fn test_rebuild_metadata_no_shrink() {
+        // Single-group image — no shrink needed
+        let image = make_test_image();
+        let mut cursor = Cursor::new(image);
+
+        let plan = build_relocation_map(&mut cursor, 0).unwrap();
+        assert!(!plan.needs_relocation);
+
+        let meta = rebuild_metadata_for_shrink(&mut cursor, 0, &plan).unwrap();
+
+        // Superblock should keep original block count
+        let sb = &meta.superblock;
+        let blocks = le32(sb, 0x04) as u64;
+        assert_eq!(blocks, 32768);
+
+        // Should have 1 bitmap
+        assert_eq!(meta.block_bitmaps.len(), 1);
     }
 }
