@@ -307,8 +307,14 @@ pub fn export_whole_disk_vhd(
     if let Some(meta) = backup_metadata {
         // Backup folder reconstruction — use File directly (not BufWriter)
         // because reconstruct_disk_from_backup needs Read + Write + Seek.
-        // Writes are already in large chunks so BufWriter isn't needed.
-        let mut file = File::create(dest_path)
+        // Must open with read+write (not O_WRONLY) because patch_bpb_hidden_sectors
+        // and similar functions read back from the writer to detect filesystem type.
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dest_path)
             .with_context(|| format!("failed to create {}", dest_path.display()))?;
 
         total_written = reconstruct_disk_from_backup(
