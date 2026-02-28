@@ -1317,18 +1317,18 @@ impl InspectTab {
                 }
             };
 
-            // Open the device/file with full elevation: unmounts volumes and
-            // claims exclusive DA access for the duration of the inspect.
-            let elevated = match rusty_backup::os::open_source_for_reading(&path) {
-                Ok(e) => e,
+            // Open the device/file for read-only inspection.
+            // Inspect is non-destructive, so we do NOT unmount or claim the
+            // disk — that would pop a DA authorization dialog unnecessarily.
+            // open_for_inspect tries a direct O_RDONLY first; on EPERM it
+            // escalates via authopen (one dialog, cached for ~5 min).
+            let device_file = match rusty_backup::os::open_for_inspect(&path) {
+                Ok(f) => f,
                 Err(e) => {
                     finish_err(format!("Cannot open {}: {e}", path.display()));
                     return;
                 }
             };
-            // _guard keeps the DiskClaim (and any temp file) alive until the
-            // thread exits, then releases exclusive access automatically.
-            let (device_file, _guard) = elevated.into_parts();
 
             set_step("Reading partition table...");
 

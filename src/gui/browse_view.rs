@@ -801,7 +801,14 @@ fn create_filesystem(
             partition_type_string,
         )
     } else {
-        let file = File::open(path).map_err(FilesystemError::Io)?;
+        // Use the OS-aware opener so macOS devices get authopen elevation
+        // instead of a bare File::open that returns EPERM on /dev/diskN.
+        let file = rusty_backup::os::open_for_inspect(path).map_err(|e| {
+            FilesystemError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            ))
+        })?;
         let reader = BufReader::new(file);
         fs::open_filesystem(
             reader,
