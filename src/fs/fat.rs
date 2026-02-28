@@ -4,8 +4,12 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use anyhow::{Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 
+use byteorder::WriteBytesExt;
+
 use super::entry::FileEntry;
-use super::filesystem::{Filesystem, FilesystemError};
+use super::filesystem::{
+    CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
+};
 
 const CHUNK_SIZE: usize = 256 * 1024; // 256 KB I/O buffer
 
@@ -650,6 +654,999 @@ impl<R: Read + Seek + Send> Filesystem for FatFilesystem<R> {
                 Ok(self.data_region_offset())
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Editable filesystem support — FAT write operations
+// ---------------------------------------------------------------------------
+
+/// FAT forbidden characters for long filenames.
+const FAT_LFN_FORBIDDEN: &[char] = &['"', '*', '/', ':', '<', '>', '?', '\\', '|'];
+
+/// FAT forbidden characters for short filenames (additional beyond LFN).
+const FAT_SFN_FORBIDDEN: &[char] = &[
+    '"', '*', '+', ',', '/', ':', ';', '<', '=', '>', '?', '[', '\\', ']', '|',
+];
+
+/// Compute LFN checksum for a short name (11-byte SFN).
+fn lfn_checksum(sfn: &[u8; 11]) -> u8 {
+    let mut sum: u8 = 0;
+    for &b in sfn.iter() {
+        sum = sum
+            .wrapping_shr(1)
+            .wrapping_add(sum.wrapping_shl(7))
+            .wrapping_add(b);
+    }
+    sum
+}
+
+/// Encode a string as UCS-2 for LFN entries (pad with 0xFFFF after null terminator).
+fn encode_ucs2_lfn(name: &str) -> Vec<u16> {
+    let mut chars: Vec<u16> = name.encode_utf16().collect();
+    chars.push(0x0000); // null terminator
+    chars
+}
+
+/// Get current FAT date/time as (date_word, time_word).
+fn current_fat_datetime() -> (u16, u16) {
+    // Use a simple approach — get seconds since Unix epoch and convert
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // Convert to FAT date/time
+    // Days from 1970-01-01 to 1980-01-01 = 3652
+    let secs_since_1980 = now.saturating_sub(315532800); // 3652 days * 86400
+    let days = secs_since_1980 / 86400;
+    let time_of_day = secs_since_1980 % 86400;
+
+    // Approximate date calculation (not perfectly accurate but sufficient)
+    let mut year = 0u16;
+    let mut remaining_days = days as u32;
+    loop {
+        let days_in_year =
+            if (year + 1980) % 4 == 0 && ((year + 1980) % 100 != 0 || (year + 1980) % 400 == 0) {
+                366
+            } else {
+                365
+            };
+        if remaining_days < days_in_year {
+            break;
+        }
+        remaining_days -= days_in_year;
+        year += 1;
+        if year > 127 {
+            year = 127;
+            break;
+        }
+    }
+    let is_leap = (year + 1980) % 4 == 0 && ((year + 1980) % 100 != 0 || (year + 1980) % 400 == 0);
+    let days_in_months: [u32; 12] = [
+        31,
+        if is_leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut month = 0u16;
+    for (i, &dim) in days_in_months.iter().enumerate() {
+        if remaining_days < dim {
+            month = i as u16 + 1;
+            break;
+        }
+        remaining_days -= dim;
+    }
+    if month == 0 {
+        month = 12;
+    }
+    let day = remaining_days as u16 + 1;
+
+    let hour = (time_of_day / 3600) as u16;
+    let minute = ((time_of_day % 3600) / 60) as u16;
+    let second = ((time_of_day % 60) / 2) as u16; // FAT uses 2-second resolution
+
+    let date_word = (year << 9) | (month << 5) | day;
+    let time_word = (hour << 11) | (minute << 5) | second;
+    (date_word, time_word)
+}
+
+impl<R: Read + Write + Seek> FatFilesystem<R> {
+    /// Read the entire FAT table into memory.
+    fn read_fat_table(&mut self) -> Result<Vec<u8>, FilesystemError> {
+        let fat_offset = self.sector_offset(self.reserved_sectors);
+        let fat_size = (self.sectors_per_fat * self.bytes_per_sector) as usize;
+        self.reader.seek(SeekFrom::Start(fat_offset))?;
+        let mut fat_data = vec![0u8; fat_size];
+        self.reader.read_exact(&mut fat_data)?;
+        Ok(fat_data)
+    }
+
+    /// Write a FAT entry for a given cluster on disk (updates all FAT copies).
+    fn write_fat_entry_disk(&mut self, cluster: u32, value: u32) -> Result<(), FilesystemError> {
+        let fat_start = self.sector_offset(self.reserved_sectors);
+        let fat_size = self.sectors_per_fat * self.bytes_per_sector;
+
+        for fat_idx in 0..self.num_fats as u64 {
+            let fat_base = fat_start + fat_idx * fat_size;
+            match self.fat_type {
+                FatType::Fat12 => {
+                    let byte_off = (cluster as u64 * 3) / 2;
+                    self.reader.seek(SeekFrom::Start(fat_base + byte_off))?;
+                    let existing = self.reader.read_u16::<LittleEndian>()?;
+                    let new_val = if cluster & 1 == 1 {
+                        (existing & 0x000F) | ((value as u16) << 4)
+                    } else {
+                        (existing & 0xF000) | (value as u16 & 0x0FFF)
+                    };
+                    self.reader.seek(SeekFrom::Start(fat_base + byte_off))?;
+                    self.reader.write_u16::<LittleEndian>(new_val)?;
+                }
+                FatType::Fat16 => {
+                    let byte_off = cluster as u64 * 2;
+                    self.reader.seek(SeekFrom::Start(fat_base + byte_off))?;
+                    self.reader.write_u16::<LittleEndian>(value as u16)?;
+                }
+                FatType::Fat32 => {
+                    let byte_off = cluster as u64 * 4;
+                    self.reader.seek(SeekFrom::Start(fat_base + byte_off))?;
+                    let existing = self.reader.read_u32::<LittleEndian>()?;
+                    let new_val = (existing & 0xF000_0000) | (value & 0x0FFF_FFFF);
+                    self.reader.seek(SeekFrom::Start(fat_base + byte_off))?;
+                    self.reader.write_u32::<LittleEndian>(new_val)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Find `count` free clusters by scanning the FAT. Returns cluster numbers.
+    fn find_free_clusters(&mut self, count: u32) -> Result<Vec<u32>, FilesystemError> {
+        let fat_data = self.read_fat_table()?;
+        let total_entries = self.total_clusters as u32 + 2;
+        let mut free = Vec::with_capacity(count as usize);
+
+        for cluster in 2..total_entries {
+            let entry = read_fat_entry(&fat_data, cluster, self.fat_type);
+            if entry == 0 {
+                free.push(cluster);
+                if free.len() == count as usize {
+                    return Ok(free);
+                }
+            }
+        }
+
+        Err(FilesystemError::DiskFull(format!(
+            "need {} free clusters, found {}",
+            count,
+            free.len()
+        )))
+    }
+
+    /// Allocate a chain of clusters. Returns the first cluster number.
+    fn allocate_cluster_chain(&mut self, count: u32) -> Result<u32, FilesystemError> {
+        if count == 0 {
+            return Ok(0);
+        }
+        let clusters = self.find_free_clusters(count)?;
+        let eoc = end_of_chain_marker(self.fat_type);
+
+        // Chain them together
+        for i in 0..clusters.len() {
+            let next = if i + 1 < clusters.len() {
+                clusters[i + 1]
+            } else {
+                eoc
+            };
+            self.write_fat_entry_disk(clusters[i], next)?;
+        }
+
+        Ok(clusters[0])
+    }
+
+    /// Free a cluster chain starting at `start`.
+    fn free_cluster_chain(&mut self, start: u32) -> Result<(), FilesystemError> {
+        let mut cluster = start;
+        let mut count = 0u32;
+        loop {
+            if cluster < 2 || count > self.total_clusters as u32 {
+                break;
+            }
+            let next = self.next_cluster(cluster)?;
+            self.write_fat_entry_disk(cluster, 0)?;
+            count += 1;
+            match next {
+                Some(n) => cluster = n,
+                None => break,
+            }
+        }
+        Ok(())
+    }
+
+    /// Write data to a cluster.
+    fn write_cluster_data(&mut self, cluster: u32, data: &[u8]) -> Result<(), FilesystemError> {
+        let offset = self.cluster_offset(cluster);
+        self.reader.seek(SeekFrom::Start(offset))?;
+        self.reader.write_all(data)?;
+        Ok(())
+    }
+
+    /// Count free clusters by scanning FAT.
+    fn count_free_clusters(&mut self) -> Result<u32, FilesystemError> {
+        let fat_data = self.read_fat_table()?;
+        let total_entries = self.total_clusters as u32 + 2;
+        let mut free = 0u32;
+        for cluster in 2..total_entries {
+            if read_fat_entry(&fat_data, cluster, self.fat_type) == 0 {
+                free += 1;
+            }
+        }
+        Ok(free)
+    }
+
+    /// Generate an 8.3 short name from a long name, handling collisions.
+    /// `existing_sfns` contains the 11-byte short names already present in the directory.
+    fn generate_short_name(long_name: &str, existing_sfns: &HashSet<[u8; 11]>) -> [u8; 11] {
+        let upper = long_name.to_uppercase();
+        // Split name and extension
+        let (base, ext) = if let Some(dot_pos) = upper.rfind('.') {
+            (&upper[..dot_pos], &upper[dot_pos + 1..])
+        } else {
+            (upper.as_str(), "")
+        };
+
+        // Strip forbidden characters and leading/trailing spaces/dots
+        let clean_base: String = base
+            .chars()
+            .filter(|c| !FAT_SFN_FORBIDDEN.contains(c) && *c != ' ' && *c != '.')
+            .collect();
+        let clean_ext: String = ext
+            .chars()
+            .filter(|c| !FAT_SFN_FORBIDDEN.contains(c) && *c != ' ' && *c != '.')
+            .take(3)
+            .collect();
+
+        // Build candidate without numeric tail first
+        let base_part: String = clean_base.chars().take(8).collect();
+        let mut sfn = [b' '; 11];
+
+        let fill_sfn = |sfn: &mut [u8; 11], name: &str, ext: &str| {
+            for (i, b) in name.bytes().take(8).enumerate() {
+                sfn[i] = b;
+            }
+            for (i, b) in ext.bytes().take(3).enumerate() {
+                sfn[8 + i] = b;
+            }
+        };
+
+        // Try without numeric tail
+        fill_sfn(&mut sfn, &base_part, &clean_ext);
+        if !existing_sfns.contains(&sfn) {
+            return sfn;
+        }
+
+        // Try with ~1 through ~999999
+        for n in 1..1000000u32 {
+            let tail = format!("~{n}");
+            let max_base = 8 - tail.len();
+            let truncated: String = clean_base.chars().take(max_base).collect();
+            let candidate = format!("{truncated}{tail}");
+            sfn = [b' '; 11];
+            fill_sfn(&mut sfn, &candidate, &clean_ext);
+            if !existing_sfns.contains(&sfn) {
+                return sfn;
+            }
+        }
+
+        // Fallback (should never happen in practice)
+        sfn
+    }
+
+    /// Collect existing short names in a directory.
+    fn collect_existing_sfns(&self, dir_data: &[u8]) -> HashSet<[u8; 11]> {
+        let mut sfns = HashSet::new();
+        let num_entries = dir_data.len() / DIR_ENTRY_SIZE;
+        for i in 0..num_entries {
+            let off = i * DIR_ENTRY_SIZE;
+            if dir_data[off] == 0x00 || dir_data[off] == 0xE5 {
+                continue;
+            }
+            let attr = dir_data[off + 11];
+            if attr == ATTR_LONG_NAME || (attr & ATTR_VOLUME_ID) != 0 {
+                continue;
+            }
+            let mut sfn = [0u8; 11];
+            sfn.copy_from_slice(&dir_data[off..off + 11]);
+            sfns.insert(sfn);
+        }
+        sfns
+    }
+
+    /// Check if a name already exists in a directory (case-insensitive).
+    fn name_exists_in_dir(&self, dir_data: &[u8], name: &str) -> bool {
+        let entries = self.parse_directory(dir_data, "/");
+        entries.iter().any(|e| e.name.eq_ignore_ascii_case(name))
+    }
+
+    /// Find contiguous free slots in directory data.
+    /// Returns the byte offset of the first free slot, or None if not enough space.
+    fn find_free_dir_slots(dir_data: &[u8], slots_needed: usize) -> Option<usize> {
+        let num_entries = dir_data.len() / DIR_ENTRY_SIZE;
+        let mut consecutive = 0usize;
+        let mut start = 0usize;
+
+        for i in 0..num_entries {
+            let off = i * DIR_ENTRY_SIZE;
+            if dir_data[off] == 0x00 || dir_data[off] == 0xE5 {
+                if consecutive == 0 {
+                    start = off;
+                }
+                consecutive += 1;
+                if consecutive >= slots_needed {
+                    return Some(start);
+                }
+                // If we hit end-of-dir marker (0x00), all subsequent slots are free too
+                if dir_data[off] == 0x00 {
+                    let remaining = num_entries - i;
+                    if consecutive + remaining - 1 >= slots_needed {
+                        return Some(start);
+                    }
+                }
+            } else {
+                consecutive = 0;
+            }
+        }
+        None
+    }
+
+    /// Build LFN + SFN directory entries for a new file/directory.
+    /// Returns the raw bytes (multiple of 32) to write into the directory.
+    fn build_dir_entries(
+        name: &str,
+        sfn: &[u8; 11],
+        attr: u8,
+        first_cluster: u32,
+        file_size: u32,
+    ) -> Vec<u8> {
+        let (date, time) = current_fat_datetime();
+        let checksum = lfn_checksum(sfn);
+
+        // Determine if LFN is needed
+        let needs_lfn = name.len() > 11
+            || name.contains(|c: char| c.is_lowercase() || FAT_LFN_FORBIDDEN.contains(&c))
+            || {
+                // Check if the name differs from the SFN
+                let sfn_name = build_short_name(&sfn[0..8], &sfn[8..11]);
+                !name.eq_ignore_ascii_case(&sfn_name)
+            };
+
+        let mut entries = Vec::new();
+
+        if needs_lfn {
+            let ucs2 = encode_ucs2_lfn(name);
+            // LFN entries hold 13 chars each
+            let lfn_count = (ucs2.len() + 12) / 13;
+            // Pad to full 13-char slots
+            let mut padded = ucs2;
+            while padded.len() < lfn_count * 13 {
+                padded.push(0xFFFF);
+            }
+
+            // Write LFN entries in reverse order
+            for seq in (0..lfn_count).rev() {
+                let mut entry = [0u8; 32];
+                let seq_num = (seq + 1) as u8;
+                entry[0] = if seq == lfn_count - 1 {
+                    seq_num | 0x40
+                } else {
+                    seq_num
+                };
+                entry[11] = ATTR_LONG_NAME;
+                entry[13] = checksum;
+                // Bytes 26-27 must be 0 for LFN
+
+                let base = seq * 13;
+                // Chars 1-5 → bytes 1-10
+                for j in 0..5 {
+                    let c = padded[base + j];
+                    entry[1 + j * 2] = c as u8;
+                    entry[2 + j * 2] = (c >> 8) as u8;
+                }
+                // Chars 6-11 → bytes 14-25
+                for j in 0..6 {
+                    let c = padded[base + 5 + j];
+                    entry[14 + j * 2] = c as u8;
+                    entry[15 + j * 2] = (c >> 8) as u8;
+                }
+                // Chars 12-13 → bytes 28-31
+                for j in 0..2 {
+                    let c = padded[base + 11 + j];
+                    entry[28 + j * 2] = c as u8;
+                    entry[29 + j * 2] = (c >> 8) as u8;
+                }
+
+                entries.extend_from_slice(&entry);
+            }
+        }
+
+        // SFN entry
+        let mut sfn_entry = [0u8; 32];
+        sfn_entry[0..11].copy_from_slice(sfn);
+        sfn_entry[11] = attr;
+        // Creation time/date (bytes 14-17)
+        sfn_entry[14] = time as u8;
+        sfn_entry[15] = (time >> 8) as u8;
+        sfn_entry[16] = date as u8;
+        sfn_entry[17] = (date >> 8) as u8;
+        // Last access date (bytes 18-19)
+        sfn_entry[18] = date as u8;
+        sfn_entry[19] = (date >> 8) as u8;
+        // First cluster high (bytes 20-21)
+        sfn_entry[20] = ((first_cluster >> 16) & 0xFF) as u8;
+        sfn_entry[21] = ((first_cluster >> 24) & 0xFF) as u8;
+        // Modification time/date (bytes 22-25)
+        sfn_entry[22] = time as u8;
+        sfn_entry[23] = (time >> 8) as u8;
+        sfn_entry[24] = date as u8;
+        sfn_entry[25] = (date >> 8) as u8;
+        // First cluster low (bytes 26-27)
+        sfn_entry[26] = (first_cluster & 0xFF) as u8;
+        sfn_entry[27] = ((first_cluster >> 8) & 0xFF) as u8;
+        // File size (bytes 28-31)
+        sfn_entry[28..32].copy_from_slice(&file_size.to_le_bytes());
+
+        entries.extend_from_slice(&sfn_entry);
+        entries
+    }
+
+    /// Add directory entries to a parent directory.
+    /// For FAT12/16 root: writes to the fixed root directory area.
+    /// For FAT32 or subdirectories: writes to cluster chain, allocating new clusters if needed.
+    fn add_to_directory(
+        &mut self,
+        parent: &FileEntry,
+        entry_bytes: &[u8],
+    ) -> Result<(), FilesystemError> {
+        let slots_needed = entry_bytes.len() / DIR_ENTRY_SIZE;
+
+        if parent.path == "/" && self.fat_type != FatType::Fat32 {
+            // FAT12/16 fixed root directory
+            let mut dir_data = self.read_root_directory()?;
+            match Self::find_free_dir_slots(&dir_data, slots_needed) {
+                Some(offset) => {
+                    dir_data[offset..offset + entry_bytes.len()].copy_from_slice(entry_bytes);
+                    // Write back
+                    let root_start =
+                        self.reserved_sectors + (self.num_fats as u64 * self.sectors_per_fat);
+                    let abs_offset = self.sector_offset(root_start);
+                    self.reader.seek(SeekFrom::Start(abs_offset))?;
+                    self.reader.write_all(&dir_data)?;
+                    Ok(())
+                }
+                None => Err(FilesystemError::DiskFull("root directory is full".into())),
+            }
+        } else {
+            // Cluster-based directory
+            let start_cluster = parent.location as u32;
+            if start_cluster < 2 {
+                return Err(FilesystemError::InvalidData(
+                    "invalid parent directory cluster".into(),
+                ));
+            }
+
+            let mut dir_data = self.read_cluster_chain(start_cluster)?;
+            match Self::find_free_dir_slots(&dir_data, slots_needed) {
+                Some(offset) => {
+                    dir_data[offset..offset + entry_bytes.len()].copy_from_slice(entry_bytes);
+                    // Write back the modified clusters
+                    self.write_cluster_chain(start_cluster, &dir_data)?;
+                    Ok(())
+                }
+                None => {
+                    // Need to allocate a new cluster for the directory
+                    let new_cluster = self.allocate_cluster_chain(1)?;
+                    // Zero out the new cluster
+                    let cluster_size = self.cluster_size() as usize;
+                    let zeros = vec![0u8; cluster_size];
+                    self.write_cluster_data(new_cluster, &zeros)?;
+
+                    // Append to the chain
+                    let mut last = start_cluster;
+                    loop {
+                        match self.next_cluster(last)? {
+                            Some(next) => last = next,
+                            None => break,
+                        }
+                    }
+                    self.write_fat_entry_disk(last, new_cluster)?;
+
+                    // Re-read and try again
+                    let mut dir_data = self.read_cluster_chain(start_cluster)?;
+                    match Self::find_free_dir_slots(&dir_data, slots_needed) {
+                        Some(offset) => {
+                            dir_data[offset..offset + entry_bytes.len()]
+                                .copy_from_slice(entry_bytes);
+                            self.write_cluster_chain(start_cluster, &dir_data)?;
+                            Ok(())
+                        }
+                        None => Err(FilesystemError::DiskFull(
+                            "could not add directory entry".into(),
+                        )),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Write data back to a cluster chain (assumes chain is already allocated and long enough).
+    fn write_cluster_chain(
+        &mut self,
+        start_cluster: u32,
+        data: &[u8],
+    ) -> Result<(), FilesystemError> {
+        let cluster_size = self.cluster_size() as usize;
+        let mut cluster = start_cluster;
+        let mut offset = 0usize;
+        let mut count = 0u32;
+
+        while offset < data.len() {
+            if cluster < 2 || count > self.total_clusters as u32 {
+                break;
+            }
+            let end = (offset + cluster_size).min(data.len());
+            let abs_offset = self.cluster_offset(cluster);
+            self.reader.seek(SeekFrom::Start(abs_offset))?;
+            self.reader.write_all(&data[offset..end])?;
+            // Pad with zeros if partial cluster
+            if end - offset < cluster_size {
+                let padding = vec![0u8; cluster_size - (end - offset)];
+                self.reader.write_all(&padding)?;
+            }
+            offset = end;
+            count += 1;
+            match self.next_cluster(cluster)? {
+                Some(next) => cluster = next,
+                None => break,
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove directory entries (SFN + any preceding LFN entries) for the given entry.
+    fn remove_dir_entries(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+    ) -> Result<(), FilesystemError> {
+        let is_root_fat16 = parent.path == "/" && self.fat_type != FatType::Fat32;
+
+        let (mut dir_data, write_back) = if is_root_fat16 {
+            let data = self.read_root_directory()?;
+            (data, None) // None means root directory
+        } else {
+            let cluster = parent.location as u32;
+            let data = self.read_cluster_chain(cluster)?;
+            (data, Some(cluster))
+        };
+
+        // Find the SFN entry matching this FileEntry
+        let num_entries = dir_data.len() / DIR_ENTRY_SIZE;
+        let mut found_off = None;
+        let mut lfn_parts: Vec<(u8, String)> = Vec::new();
+
+        for i in 0..num_entries {
+            let off = i * DIR_ENTRY_SIZE;
+            if dir_data[off] == 0x00 {
+                break;
+            }
+            if dir_data[off] == 0xE5 {
+                lfn_parts.clear();
+                continue;
+            }
+
+            let attr = dir_data[off + 11];
+            if attr == ATTR_LONG_NAME {
+                let seq = dir_data[off] & 0x3F;
+                if dir_data[off] & 0x40 != 0 {
+                    lfn_parts.clear();
+                }
+                // Decode LFN chars
+                let chars: Vec<u16> = vec![
+                    u16::from_le_bytes([dir_data[off + 1], dir_data[off + 2]]),
+                    u16::from_le_bytes([dir_data[off + 3], dir_data[off + 4]]),
+                    u16::from_le_bytes([dir_data[off + 5], dir_data[off + 6]]),
+                    u16::from_le_bytes([dir_data[off + 7], dir_data[off + 8]]),
+                    u16::from_le_bytes([dir_data[off + 9], dir_data[off + 10]]),
+                    u16::from_le_bytes([dir_data[off + 14], dir_data[off + 15]]),
+                    u16::from_le_bytes([dir_data[off + 16], dir_data[off + 17]]),
+                    u16::from_le_bytes([dir_data[off + 18], dir_data[off + 19]]),
+                    u16::from_le_bytes([dir_data[off + 20], dir_data[off + 21]]),
+                    u16::from_le_bytes([dir_data[off + 22], dir_data[off + 23]]),
+                    u16::from_le_bytes([dir_data[off + 24], dir_data[off + 25]]),
+                    u16::from_le_bytes([dir_data[off + 28], dir_data[off + 29]]),
+                    u16::from_le_bytes([dir_data[off + 30], dir_data[off + 31]]),
+                ];
+                let part: String = chars
+                    .into_iter()
+                    .take_while(|&c| c != 0x0000 && c != 0xFFFF)
+                    .flat_map(|c| std::char::from_u32(c as u32))
+                    .collect();
+                lfn_parts.push((seq, part));
+                continue;
+            }
+            if (attr & ATTR_VOLUME_ID) != 0 {
+                lfn_parts.clear();
+                continue;
+            }
+
+            // SFN entry — check if it matches
+            let name_bytes = &dir_data[off..off + 8];
+            let ext_bytes = &dir_data[off + 8..off + 11];
+            let short_name = build_short_name(name_bytes, ext_bytes);
+
+            let long_name = if !lfn_parts.is_empty() {
+                lfn_parts.sort_by_key(|&(seq, _)| seq);
+                let name: String = lfn_parts.iter().map(|(_, s)| s.as_str()).collect();
+                lfn_parts.clear();
+                name
+            } else {
+                lfn_parts.clear();
+                String::new()
+            };
+
+            let display_name = if !long_name.is_empty() {
+                &long_name
+            } else {
+                &short_name
+            };
+
+            let cluster_hi = u16::from_le_bytes([dir_data[off + 20], dir_data[off + 21]]) as u32;
+            let cluster_lo = u16::from_le_bytes([dir_data[off + 26], dir_data[off + 27]]) as u32;
+            let cluster = (cluster_hi << 16) | cluster_lo;
+
+            if display_name == &entry.name && cluster == entry.location as u32 {
+                found_off = Some(off);
+                break;
+            }
+        }
+
+        let sfn_off = found_off.ok_or_else(|| {
+            FilesystemError::NotFound(format!("entry '{}' not found in parent", entry.name))
+        })?;
+
+        // Mark SFN entry as deleted
+        dir_data[sfn_off] = 0xE5;
+
+        // Mark preceding LFN entries as deleted (walk backwards)
+        let mut j = (sfn_off / DIR_ENTRY_SIZE).wrapping_sub(1);
+        loop {
+            if j >= num_entries {
+                break;
+            }
+            let off = j * DIR_ENTRY_SIZE;
+            if dir_data[off] == 0xE5 || dir_data[off] == 0x00 {
+                break;
+            }
+            let attr = dir_data[off + 11];
+            if attr != ATTR_LONG_NAME {
+                break;
+            }
+            dir_data[off] = 0xE5;
+            j = j.wrapping_sub(1);
+        }
+
+        // Write directory data back
+        match write_back {
+            None => {
+                let root_start =
+                    self.reserved_sectors + (self.num_fats as u64 * self.sectors_per_fat);
+                let abs_offset = self.sector_offset(root_start);
+                self.reader.seek(SeekFrom::Start(abs_offset))?;
+                self.reader.write_all(&dir_data)?;
+            }
+            Some(cluster) => {
+                self.write_cluster_chain(cluster, &dir_data)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Update FAT32 FSInfo sector (free count and next free hint).
+    fn update_fsinfo(&mut self) -> Result<(), FilesystemError> {
+        if self.fat_type != FatType::Fat32 {
+            return Ok(());
+        }
+
+        // Read boot sector to get FSInfo sector number
+        self.reader.seek(SeekFrom::Start(self.partition_offset))?;
+        let mut bpb = [0u8; 512];
+        self.reader.read_exact(&mut bpb)?;
+
+        let fsinfo_sector = u16::from_le_bytes([bpb[48], bpb[49]]);
+        if fsinfo_sector == 0 || fsinfo_sector as u64 >= self.reserved_sectors {
+            return Ok(());
+        }
+
+        let fsinfo_offset = self.sector_offset(fsinfo_sector as u64);
+        self.reader.seek(SeekFrom::Start(fsinfo_offset))?;
+        let mut fsinfo = [0u8; 512];
+        self.reader.read_exact(&mut fsinfo)?;
+
+        // Validate signatures
+        let sig1 = u32::from_le_bytes(fsinfo[0..4].try_into().unwrap());
+        let sig2 = u32::from_le_bytes(fsinfo[484..488].try_into().unwrap());
+        if sig1 != 0x41615252 || sig2 != 0x61417272 {
+            return Ok(()); // Not a valid FSInfo sector
+        }
+
+        // Count free clusters
+        let free_count = self.count_free_clusters()?;
+        fsinfo[488..492].copy_from_slice(&free_count.to_le_bytes());
+
+        // Find next free cluster hint
+        let fat_data = self.read_fat_table()?;
+        let total_entries = self.total_clusters as u32 + 2;
+        let mut next_free = 0xFFFF_FFFFu32;
+        for cluster in 2..total_entries {
+            if read_fat_entry(&fat_data, cluster, self.fat_type) == 0 {
+                next_free = cluster;
+                break;
+            }
+        }
+        fsinfo[492..496].copy_from_slice(&next_free.to_le_bytes());
+
+        // Write back
+        self.reader.seek(SeekFrom::Start(fsinfo_offset))?;
+        self.reader.write_all(&fsinfo)?;
+
+        Ok(())
+    }
+
+    /// Validate a filename for FAT LFN rules.
+    fn validate_fat_name(name: &str) -> Result<(), FilesystemError> {
+        if name.is_empty() {
+            return Err(FilesystemError::InvalidData(
+                "filename cannot be empty".into(),
+            ));
+        }
+        if name.len() > 255 {
+            return Err(FilesystemError::InvalidData(
+                "filename exceeds 255 characters".into(),
+            ));
+        }
+        for c in name.chars() {
+            if FAT_LFN_FORBIDDEN.contains(&c) {
+                return Err(FilesystemError::InvalidData(format!(
+                    "filename contains forbidden character '{c}'"
+                )));
+            }
+        }
+        if name.ends_with(' ') || name.ends_with('.') {
+            return Err(FilesystemError::InvalidData(
+                "filename cannot end with space or dot".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
+    fn create_file(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        data: &mut dyn std::io::Read,
+        data_len: u64,
+        _options: &CreateFileOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        Self::validate_fat_name(name)?;
+
+        // Read parent directory to check for duplicates and collect SFNs
+        let dir_data = if parent.path == "/" && self.fat_type != FatType::Fat32 {
+            self.read_root_directory()?
+        } else {
+            self.read_cluster_chain(parent.location as u32)?
+        };
+
+        if self.name_exists_in_dir(&dir_data, name) {
+            return Err(FilesystemError::AlreadyExists(name.to_string()));
+        }
+
+        // Allocate clusters for file data
+        let cluster_size = self.cluster_size() as usize;
+        let clusters_needed = if data_len == 0 {
+            0
+        } else {
+            ((data_len as usize + cluster_size - 1) / cluster_size) as u32
+        };
+
+        let first_cluster = if clusters_needed > 0 {
+            self.allocate_cluster_chain(clusters_needed)?
+        } else {
+            0
+        };
+
+        // Write file data to clusters
+        if clusters_needed > 0 {
+            let mut cluster = first_cluster;
+            let mut remaining = data_len as usize;
+            let mut buf = vec![0u8; cluster_size];
+            loop {
+                if cluster < 2 || remaining == 0 {
+                    break;
+                }
+                let to_read = remaining.min(cluster_size);
+                buf.fill(0);
+                let mut total_read = 0;
+                while total_read < to_read {
+                    match data.read(&mut buf[total_read..to_read]) {
+                        Ok(0) => break,
+                        Ok(n) => total_read += n,
+                        Err(e) => return Err(FilesystemError::Io(e)),
+                    }
+                }
+                self.write_cluster_data(cluster, &buf)?;
+                remaining -= to_read;
+                match self.next_cluster(cluster)? {
+                    Some(next) => cluster = next,
+                    None => break,
+                }
+            }
+        }
+
+        // Generate SFN and build directory entries
+        let existing_sfns = self.collect_existing_sfns(&dir_data);
+        let sfn = Self::generate_short_name(name, &existing_sfns);
+        let entry_bytes =
+            Self::build_dir_entries(name, &sfn, ATTR_ARCHIVE, first_cluster, data_len as u32);
+
+        self.add_to_directory(parent, &entry_bytes)?;
+        self.update_fsinfo()?;
+
+        let path = if parent.path == "/" {
+            format!("/{name}")
+        } else {
+            format!("{}/{name}", parent.path)
+        };
+
+        let mut file_entry =
+            FileEntry::new_file(name.to_string(), path, data_len, first_cluster as u64);
+        let (date, time) = current_fat_datetime();
+        file_entry.modified = Some(format_fat_datetime(date, time));
+
+        Ok(file_entry)
+    }
+
+    fn create_directory(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        _options: &CreateDirectoryOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        Self::validate_fat_name(name)?;
+
+        let dir_data = if parent.path == "/" && self.fat_type != FatType::Fat32 {
+            self.read_root_directory()?
+        } else {
+            self.read_cluster_chain(parent.location as u32)?
+        };
+
+        if self.name_exists_in_dir(&dir_data, name) {
+            return Err(FilesystemError::AlreadyExists(name.to_string()));
+        }
+
+        // Allocate 1 cluster for the new directory
+        let new_cluster = self.allocate_cluster_chain(1)?;
+
+        // Initialize directory with . and .. entries
+        let cluster_size = self.cluster_size() as usize;
+        let mut new_dir = vec![0u8; cluster_size];
+        let (date, time) = current_fat_datetime();
+
+        // . entry
+        new_dir[0..11].copy_from_slice(b".          ");
+        new_dir[11] = ATTR_DIRECTORY;
+        new_dir[14] = time as u8;
+        new_dir[15] = (time >> 8) as u8;
+        new_dir[16] = date as u8;
+        new_dir[17] = (date >> 8) as u8;
+        new_dir[22] = time as u8;
+        new_dir[23] = (time >> 8) as u8;
+        new_dir[24] = date as u8;
+        new_dir[25] = (date >> 8) as u8;
+        new_dir[20] = ((new_cluster >> 16) & 0xFF) as u8;
+        new_dir[21] = ((new_cluster >> 24) & 0xFF) as u8;
+        new_dir[26] = (new_cluster & 0xFF) as u8;
+        new_dir[27] = ((new_cluster >> 8) & 0xFF) as u8;
+
+        // .. entry
+        let parent_cluster = if parent.path == "/" {
+            0u32
+        } else {
+            parent.location as u32
+        };
+        new_dir[32..43].copy_from_slice(b"..         ");
+        new_dir[43] = ATTR_DIRECTORY;
+        new_dir[46] = time as u8;
+        new_dir[47] = (time >> 8) as u8;
+        new_dir[48] = date as u8;
+        new_dir[49] = (date >> 8) as u8;
+        new_dir[54] = time as u8;
+        new_dir[55] = (time >> 8) as u8;
+        new_dir[56] = date as u8;
+        new_dir[57] = (date >> 8) as u8;
+        new_dir[52] = ((parent_cluster >> 16) & 0xFF) as u8;
+        new_dir[53] = ((parent_cluster >> 24) & 0xFF) as u8;
+        new_dir[58] = (parent_cluster & 0xFF) as u8;
+        new_dir[59] = ((parent_cluster >> 8) & 0xFF) as u8;
+
+        self.write_cluster_data(new_cluster, &new_dir)?;
+
+        // Add entry in parent directory
+        let existing_sfns = self.collect_existing_sfns(&dir_data);
+        let sfn = Self::generate_short_name(name, &existing_sfns);
+        let entry_bytes = Self::build_dir_entries(name, &sfn, ATTR_DIRECTORY, new_cluster, 0);
+
+        self.add_to_directory(parent, &entry_bytes)?;
+        self.update_fsinfo()?;
+
+        let path = if parent.path == "/" {
+            format!("/{name}")
+        } else {
+            format!("{}/{name}", parent.path)
+        };
+
+        let mut dir_entry = FileEntry::new_directory(name.to_string(), path, new_cluster as u64);
+        dir_entry.modified = Some(format_fat_datetime(date, time));
+
+        Ok(dir_entry)
+    }
+
+    fn delete_entry(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+    ) -> Result<(), FilesystemError> {
+        // If it's a directory, check that it's empty
+        if entry.is_directory() {
+            let children = self.list_directory(entry)?;
+            if !children.is_empty() {
+                return Err(FilesystemError::InvalidData(format!(
+                    "directory '{}' is not empty",
+                    entry.name
+                )));
+            }
+        }
+
+        // Remove directory entries (SFN + LFN)
+        self.remove_dir_entries(parent, entry)?;
+
+        // Free cluster chain
+        if entry.location >= 2 {
+            self.free_cluster_chain(entry.location as u32)?;
+        }
+
+        self.update_fsinfo()?;
+        Ok(())
+    }
+
+    fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
+        self.update_fsinfo()?;
+        self.reader.flush()?;
+        Ok(())
+    }
+
+    fn free_space(&mut self) -> Result<u64, FilesystemError> {
+        let free_clusters = self.count_free_clusters()?;
+        Ok(free_clusters as u64 * self.cluster_size())
     }
 }
 
@@ -2460,5 +3457,316 @@ mod tests {
     #[test]
     fn test_format_fat_datetime_zero() {
         assert_eq!(format_fat_datetime(0, 0), "");
+    }
+
+    /// Create a minimal FAT16 image in memory for editing tests.
+    /// 512 bytes/sector, 1 sector/cluster, 4 reserved, 2 FATs, 16 root entries,
+    /// 128 total sectors. This gives us ~120 data clusters.
+    fn create_test_fat16_image() -> std::io::Cursor<Vec<u8>> {
+        let bytes_per_sector: u16 = 512;
+        let sectors_per_cluster: u8 = 1;
+        let reserved_sectors: u16 = 4;
+        let num_fats: u8 = 2;
+        let root_entry_count: u16 = 16;
+        let total_sectors: u16 = 128;
+        // FAT16 with 120 data clusters (needs sectors_per_fat to cover them)
+        let root_dir_sectors = ((root_entry_count as u64 * 32) + (bytes_per_sector as u64 - 1))
+            / bytes_per_sector as u64;
+        let _data_start = reserved_sectors as u64 + root_dir_sectors;
+        // We need FAT to cover at least total_sectors entries × 2 bytes
+        let sectors_per_fat: u16 = 1;
+
+        let image_size = total_sectors as usize * bytes_per_sector as usize;
+        let mut img = vec![0u8; image_size];
+
+        // Boot sector
+        img[0] = 0xEB; // jump
+        img[1] = 0x3C;
+        img[2] = 0x90;
+        // OEM
+        img[3..11].copy_from_slice(b"MSDOS5.0");
+        // BPB
+        img[11..13].copy_from_slice(&bytes_per_sector.to_le_bytes());
+        img[13] = sectors_per_cluster;
+        img[14..16].copy_from_slice(&reserved_sectors.to_le_bytes());
+        img[16] = num_fats;
+        img[17..19].copy_from_slice(&root_entry_count.to_le_bytes());
+        img[19..21].copy_from_slice(&total_sectors.to_le_bytes());
+        img[21] = 0xF8; // media byte
+        img[22..24].copy_from_slice(&sectors_per_fat.to_le_bytes());
+        // Boot signature
+        img[510] = 0x55;
+        img[511] = 0xAA;
+
+        // Initialize FAT entries 0 and 1
+        let fat_offset = reserved_sectors as usize * bytes_per_sector as usize;
+        // FAT16 entry 0 = 0xFFF8, entry 1 = 0xFFFF
+        img[fat_offset..fat_offset + 2].copy_from_slice(&0xFFF8u16.to_le_bytes());
+        img[fat_offset + 2..fat_offset + 4].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        // Copy to second FAT
+        let fat2_offset = fat_offset + sectors_per_fat as usize * bytes_per_sector as usize;
+        img[fat2_offset..fat2_offset + 2].copy_from_slice(&0xFFF8u16.to_le_bytes());
+        img[fat2_offset + 2..fat2_offset + 4].copy_from_slice(&0xFFFFu16.to_le_bytes());
+
+        std::io::Cursor::new(img)
+    }
+
+    #[test]
+    fn test_fat_create_file_and_read_back() {
+        let mut img = create_test_fat16_image();
+        let mut fs = FatFilesystem::open(&mut img, 0).unwrap();
+        let root = fs.root().unwrap();
+
+        // Verify empty directory
+        let entries = fs.list_directory(&root).unwrap();
+        assert!(entries.is_empty());
+
+        // Need Read+Write+Seek for editing
+        drop(fs);
+
+        let mut fs = FatFilesystem::open(&mut img, 0).unwrap();
+        let root = fs.root().unwrap();
+
+        // Create a file
+        let test_data = b"Hello, FAT world!";
+        let mut reader = std::io::Cursor::new(test_data.to_vec());
+        let file = fs
+            .create_file(
+                &root,
+                "hello.txt",
+                &mut reader,
+                test_data.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+
+        assert_eq!(file.name, "hello.txt");
+        assert_eq!(file.size, test_data.len() as u64);
+
+        // List directory - should have 1 entry
+        let entries = fs.list_directory(&root).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "hello.txt");
+
+        // Read file back
+        let data = fs.read_file(&entries[0], usize::MAX).unwrap();
+        assert_eq!(&data, test_data);
+    }
+
+    #[test]
+    fn test_fat_create_directory() {
+        let mut img = create_test_fat16_image();
+        let mut fs = FatFilesystem::open(&mut img, 0).unwrap();
+        let root = fs.root().unwrap();
+
+        let dir = fs
+            .create_directory(&root, "SUBDIR", &CreateDirectoryOptions::default())
+            .unwrap();
+
+        assert_eq!(dir.name, "SUBDIR");
+        assert!(dir.is_directory());
+
+        // List root — should have the directory
+        let entries = fs.list_directory(&root).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].is_directory());
+
+        // List the new directory — should be empty
+        let sub_entries = fs.list_directory(&entries[0]).unwrap();
+        assert!(sub_entries.is_empty());
+    }
+
+    #[test]
+    fn test_fat_delete_file() {
+        let mut img = create_test_fat16_image();
+        let mut fs = FatFilesystem::open(&mut img, 0).unwrap();
+        let root = fs.root().unwrap();
+
+        // Create a file
+        let test_data = b"delete me";
+        let mut reader = std::io::Cursor::new(test_data.to_vec());
+        fs.create_file(
+            &root,
+            "temp.txt",
+            &mut reader,
+            test_data.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+
+        let entries = fs.list_directory(&root).unwrap();
+        assert_eq!(entries.len(), 1);
+
+        // Get free space before delete
+        let free_before = fs.free_space().unwrap();
+
+        // Delete it
+        fs.delete_entry(&root, &entries[0]).unwrap();
+
+        let entries = fs.list_directory(&root).unwrap();
+        assert!(entries.is_empty());
+
+        // Free space should have increased
+        let free_after = fs.free_space().unwrap();
+        assert!(free_after > free_before);
+    }
+
+    #[test]
+    fn test_fat_delete_recursive() {
+        let mut img = create_test_fat16_image();
+        let mut fs = FatFilesystem::open(&mut img, 0).unwrap();
+        let root = fs.root().unwrap();
+
+        // Create a directory with a file inside
+        let dir = fs
+            .create_directory(&root, "mydir", &CreateDirectoryOptions::default())
+            .unwrap();
+
+        let test_data = b"nested file";
+        let mut reader = std::io::Cursor::new(test_data.to_vec());
+        fs.create_file(
+            &dir,
+            "inner.txt",
+            &mut reader,
+            test_data.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+
+        // Verify structure
+        let root_entries = fs.list_directory(&root).unwrap();
+        assert_eq!(root_entries.len(), 1);
+        let dir_entries = fs.list_directory(&root_entries[0]).unwrap();
+        assert_eq!(dir_entries.len(), 1);
+
+        // Delete recursively
+        fs.delete_recursive(&root, &root_entries[0]).unwrap();
+
+        let root_entries = fs.list_directory(&root).unwrap();
+        assert!(root_entries.is_empty());
+    }
+
+    #[test]
+    fn test_fat_duplicate_name_rejected() {
+        let mut img = create_test_fat16_image();
+        let mut fs = FatFilesystem::open(&mut img, 0).unwrap();
+        let root = fs.root().unwrap();
+
+        let mut reader = std::io::Cursor::new(b"data".to_vec());
+        fs.create_file(
+            &root,
+            "test.txt",
+            &mut reader,
+            4,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+
+        let mut reader = std::io::Cursor::new(b"data2".to_vec());
+        let result = fs.create_file(
+            &root,
+            "test.txt",
+            &mut reader,
+            5,
+            &CreateFileOptions::default(),
+        );
+        assert!(matches!(result, Err(FilesystemError::AlreadyExists(_))));
+    }
+
+    #[test]
+    fn test_fat_forbidden_chars_rejected() {
+        let mut img = create_test_fat16_image();
+        let mut fs = FatFilesystem::open(&mut img, 0).unwrap();
+        let root = fs.root().unwrap();
+
+        let mut reader = std::io::Cursor::new(b"data".to_vec());
+        let result = fs.create_file(
+            &root,
+            "test:file.txt",
+            &mut reader,
+            4,
+            &CreateFileOptions::default(),
+        );
+        assert!(matches!(result, Err(FilesystemError::InvalidData(_))));
+    }
+
+    #[test]
+    fn test_fat_free_space() {
+        let mut img = create_test_fat16_image();
+        let mut fs = FatFilesystem::open(&mut img, 0).unwrap();
+
+        let initial_free = fs.free_space().unwrap();
+        assert!(initial_free > 0);
+
+        let root = fs.root().unwrap();
+        let test_data = vec![0xABu8; 512];
+        let mut reader = std::io::Cursor::new(test_data);
+        fs.create_file(
+            &root,
+            "big.bin",
+            &mut reader,
+            512,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+
+        let after_free = fs.free_space().unwrap();
+        assert!(after_free < initial_free);
+    }
+
+    #[test]
+    fn test_fat_zero_length_file() {
+        let mut img = create_test_fat16_image();
+        let mut fs = FatFilesystem::open(&mut img, 0).unwrap();
+        let root = fs.root().unwrap();
+
+        let mut reader = std::io::Cursor::new(Vec::new());
+        let file = fs
+            .create_file(
+                &root,
+                "empty.txt",
+                &mut reader,
+                0,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+
+        assert_eq!(file.size, 0);
+
+        let entries = fs.list_directory(&root).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].size, 0);
+
+        let data = fs.read_file(&entries[0], usize::MAX).unwrap();
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn test_fat_lfn_checksum() {
+        // Known test vector: "KERNEL  SYS" → specific checksum
+        let sfn = *b"KERNEL  SYS";
+        let cs = lfn_checksum(&sfn);
+        // Just verify it's deterministic and non-zero
+        assert_ne!(cs, 0);
+        assert_eq!(cs, lfn_checksum(&sfn)); // idempotent
+    }
+
+    #[test]
+    fn test_fat_short_name_generation() {
+        let mut existing = HashSet::new();
+
+        let sfn1 = FatFilesystem::<std::io::Cursor<Vec<u8>>>::generate_short_name(
+            "longfilename.txt",
+            &existing,
+        );
+        assert_ne!(sfn1, [b' '; 11]);
+
+        existing.insert(sfn1);
+        let sfn2 = FatFilesystem::<std::io::Cursor<Vec<u8>>>::generate_short_name(
+            "longfilename.txt",
+            &existing,
+        );
+        // Should generate a different SFN (with ~N tail)
+        assert_ne!(sfn1, sfn2);
     }
 }

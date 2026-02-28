@@ -26,7 +26,7 @@ use crate::fs::{
 use crate::os::SectorAlignedWriter;
 use crate::partition::apm::Apm;
 use crate::partition::gpt::Gpt;
-use crate::partition::mbr::{build_ebr_chain, patch_mbr_entries, LogicalPartitionInfo};
+use crate::partition::mbr::{build_ebr_chain, patch_mbr_entries, LogicalPartitionInfo, Mbr};
 use crate::partition::PartitionSizeOverride;
 use crate::rbformats::reconstruct_disk_from_backup;
 
@@ -534,52 +534,140 @@ fn compute_partition_size(
     }
 }
 
-/// Build the EBR chain for a restore with logical partitions.
+/// Result of building an EBR chain for restore or VHD export.
+pub struct EbrChainResult {
+    pub extended_start_lba: u32,
+    /// (byte_offset, 512-byte EBR sector) pairs to write to the disk image.
+    pub ebr_sectors: Vec<(u64, [u8; 512])>,
+    /// New start LBA (in sectors) for each logical partition, keyed by
+    /// partition metadata index.  Used by the data-write loop to place each
+    /// partition at the correct offset after layout recalculation.
+    pub logical_starts: Vec<(usize, u64)>,
+}
+
+/// Build the EBR chain for a restore or VHD export with logical partitions.
 ///
-/// Returns `None` if there are no logical partitions. Otherwise returns the
-/// extended container start LBA and a list of (byte_offset, ebr_sector) pairs.
+/// Returns `None` if there are no logical partitions.
+///
+/// `mbr_bytes` is used as a fallback for old backups that pre-date the
+/// `extended_container` metadata field: the MBR is parsed to locate the
+/// extended container's original start LBA.
+///
+/// When any logical partition is resized, subsequent partitions are packed
+/// contiguously (1-sector EBR gap) to avoid large holes in the disk image.
 pub fn build_restore_ebr_chain(
     metadata: &BackupMetadata,
     overrides: &[PartitionSizeOverride],
-) -> Option<(u32, Vec<(u64, [u8; 512])>)> {
-    let ext = metadata.extended_container.as_ref()?;
+    mbr_bytes: Option<&[u8; 512]>,
+) -> Option<EbrChainResult> {
+    // Determine the extended container start LBA.
+    // Priority: metadata field → MBR parse → give up.
+    let extended_start_lba: u32 = if let Some(ext) = &metadata.extended_container {
+        overrides
+            .iter()
+            .find(|o| o.index == ext.mbr_index)
+            .map(|o| o.effective_start_lba())
+            .unwrap_or(ext.start_lba) as u32
+    } else if let Some(mbr) = mbr_bytes {
+        // Old backup format without extended_container: parse the MBR to find
+        // the extended partition entry's start LBA.
+        let mbr_parsed = Mbr::parse(mbr).ok()?;
+        let ext_entry = mbr_parsed
+            .entries
+            .iter()
+            .find(|e| e.is_extended() && !e.is_empty())?;
+        ext_entry.start_lba
+    } else {
+        return None;
+    };
 
-    // Find the override for the extended container to get its new start LBA
-    let ext_override = overrides.iter().find(|o| o.index == ext.mbr_index)?;
-    let extended_start_lba = ext_override.effective_start_lba() as u32;
-
-    // Collect logical partition overrides, sorted by effective start LBA
-    let mut logical_overrides: Vec<(
-        &PartitionSizeOverride,
-        &crate::backup::metadata::PartitionMetadata,
-    )> = metadata
+    // Collect logical partitions sorted by original start_lba.
+    // Old metadata may lack is_logical; treat index >= 4 as logical (MBR convention).
+    let mut logical_pms: Vec<&crate::backup::metadata::PartitionMetadata> = metadata
         .partitions
         .iter()
-        .filter(|pm| pm.is_logical)
-        .filter_map(|pm| {
-            overrides
-                .iter()
-                .find(|o| o.index == pm.index)
-                .map(|o| (o, pm))
-        })
+        .filter(|pm| pm.is_logical || pm.index >= 4)
         .collect();
-    logical_overrides.sort_by_key(|(o, _)| o.effective_start_lba());
 
-    if logical_overrides.is_empty() {
+    if logical_pms.is_empty() {
         return None;
     }
 
-    let logical_infos: Vec<LogicalPartitionInfo> = logical_overrides
-        .iter()
-        .map(|(o, pm)| LogicalPartitionInfo {
-            start_lba: o.effective_start_lba() as u32,
-            total_sectors: (o.export_size / 512) as u32,
-            partition_type: pm.partition_type_byte,
-        })
-        .collect();
+    logical_pms.sort_by_key(|pm| pm.start_lba);
 
-    let chain = build_ebr_chain(extended_start_lba, &logical_infos);
-    Some((extended_start_lba, chain))
+    // Detect whether any logical partition will change size.  If so, pack
+    // subsequent partitions contiguously rather than using stale original LBAs,
+    // which would leave large gaps and inflate the output image.
+    let any_resized = logical_pms.iter().any(|pm| {
+        overrides
+            .iter()
+            .find(|o| o.index == pm.index)
+            .map(|ov| ov.export_size != pm.original_size_bytes)
+            .unwrap_or(false)
+    });
+
+    let mut logical_infos: Vec<LogicalPartitionInfo> = Vec::with_capacity(logical_pms.len());
+    let mut logical_starts: Vec<(usize, u64)> = Vec::with_capacity(logical_pms.len());
+    let mut next_lba: u32 = 0;
+
+    for (i, pm) in logical_pms.iter().enumerate() {
+        let ov = overrides.iter().find(|o| o.index == pm.index);
+        let new_size_sectors = ov
+            .map(|o| o.export_size / 512)
+            .unwrap_or(pm.original_size_bytes / 512) as u32;
+
+        let start_lba = if i == 0 {
+            // First logical partition: always keep its original absolute LBA so
+            // the extended container entry in the MBR still points correctly.
+            ov.map(|o| o.effective_start_lba()).unwrap_or(pm.start_lba) as u32
+        } else if any_resized {
+            // Pack right after the previous partition, leaving 1 sector for the EBR.
+            next_lba + 1
+        } else {
+            ov.map(|o| o.effective_start_lba()).unwrap_or(pm.start_lba) as u32
+        };
+
+        next_lba = start_lba + new_size_sectors;
+        logical_starts.push((pm.index, start_lba as u64));
+        let ptype = if pm.partition_type_byte != 0 {
+            pm.partition_type_byte
+        } else {
+            infer_partition_type_byte(&pm.type_name)
+        };
+        logical_infos.push(LogicalPartitionInfo {
+            start_lba,
+            total_sectors: new_size_sectors,
+            partition_type: ptype,
+        });
+    }
+
+    let ebr_sectors = build_ebr_chain(extended_start_lba, &logical_infos);
+    Some(EbrChainResult {
+        extended_start_lba,
+        ebr_sectors,
+        logical_starts,
+    })
+}
+
+/// Infer MBR partition type byte from a human-readable type name.
+/// Used as a fallback for old backup metadata that lacks `partition_type_byte`.
+fn infer_partition_type_byte(name: &str) -> u8 {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("fat32") {
+        0x0C
+    } else if lower.contains("fat16") {
+        0x06
+    } else if lower.contains("fat12") {
+        0x01
+    } else if lower.contains("fat") {
+        0x0C
+    } else if lower.contains("ntfs") || lower.contains("exfat") {
+        0x07
+    } else if lower.contains("linux") || lower.contains("ext") {
+        0x83
+    } else {
+        0x06 // safe default
+    }
 }
 
 /// Main restore orchestrator. Runs on a background thread.
