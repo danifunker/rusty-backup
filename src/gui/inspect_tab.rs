@@ -1240,7 +1240,7 @@ impl InspectTab {
                     start_lba: p.start_lba,
                     size_bytes: p.original_size_bytes,
                     bootable: false,
-                    is_logical: p.index >= 4,
+                    is_logical: p.is_logical,
                     is_extended_container: false,
                     partition_type_string: p.partition_type_string.clone(),
                 })
@@ -1265,10 +1265,10 @@ impl InspectTab {
             return;
         }
 
-        // Add logical partitions from metadata (index >= 4 by convention)
+        // Add logical partitions from metadata (tagged is_logical in backup metadata)
         let mut added = 0;
         for pm in &meta.partitions {
-            if pm.index >= 4 {
+            if pm.is_logical {
                 self.partitions.push(PartitionInfo {
                     index: pm.index,
                     type_name: pm.type_name.clone(),

@@ -50,73 +50,69 @@ pub struct CompactResult {
 
 /// Auto-detect the filesystem type at a given offset by probing magic bytes.
 /// Returns a string hint: "fat", "ntfs", "exfat", "hfs", "hfsplus", "ext", or "unknown".
+///
+/// All reads are done at 512-byte-aligned offsets with 512-byte buffers so this
+/// function works on both regular files and raw character devices (e.g. /dev/rdiskN
+/// on macOS, which requires sector-aligned I/O).
 fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> &'static str {
-    // Read first 12 bytes for FAT/NTFS/exFAT detection
+    // Sector 0: FAT/NTFS/exFAT detection (boot sector, OEM ID at bytes 3-10).
+    // Read a full 512-byte sector so the underlying raw-device read is aligned.
     if reader.seek(SeekFrom::Start(partition_offset)).is_err() {
         return "unknown";
     }
-    let mut buf = [0u8; 12];
-    if reader.read_exact(&mut buf).is_err() {
+    let mut sector0 = [0u8; 512];
+    if reader.read_exact(&mut sector0).is_err() {
         return "unknown";
     }
-    if &buf[3..11] == b"NTFS    " {
+    if &sector0[3..11] == b"NTFS    " {
         return "ntfs";
     }
-    if &buf[3..11] == b"EXFAT   " {
+    if &sector0[3..11] == b"EXFAT   " {
         return "exfat";
     }
-    if buf[0] == 0xEB || buf[0] == 0xE9 {
+    if sector0[0] == 0xEB || sector0[0] == 0xE9 {
         return "fat";
     }
 
-    // Check for HFS/HFS+ at partition_offset + 1024
+    // Sectors 2-3 (offset 1024): HFS/HFS+ volume header / MDB and ext superblock.
+    //   HFS/HFS+ signature is at byte 0 of this block.
+    //   ext superblock magic (0xEF53 LE) is at byte 0x38 = 56 of this block.
+    //   All in one sector-aligned, sector-sized read.
     if reader
         .seek(SeekFrom::Start(partition_offset + 1024))
         .is_ok()
     {
-        let mut hfs_buf = [0u8; 2];
-        if reader.read_exact(&mut hfs_buf).is_ok() {
-            let sig = u16::from_be_bytes(hfs_buf);
+        let mut sb_buf = [0u8; 512];
+        if reader.read_exact(&mut sb_buf).is_ok() {
+            let sig = u16::from_be_bytes([sb_buf[0], sb_buf[1]]);
             match sig {
                 0x4244 => {
-                    // Check for embedded HFS+ at offset 124-125 from MDB start
-                    let mut embed = [0u8; 2];
-                    if reader
-                        .seek(SeekFrom::Start(partition_offset + 1024 + 124))
-                        .is_ok()
-                        && reader.read_exact(&mut embed).is_ok()
-                    {
-                        let embed_sig = u16::from_be_bytes(embed);
-                        if embed_sig == 0x482B {
-                            return "hfsplus";
-                        }
+                    // HFS MDB — check for embedded HFS+ (drEmbedSigWord at MDB offset 124)
+                    let embed_sig = u16::from_be_bytes([sb_buf[124], sb_buf[125]]);
+                    if embed_sig == 0x482B {
+                        return "hfsplus";
                     }
                     return "hfs";
                 }
                 0x482B | 0x4858 => return "hfsplus",
                 _ => {}
             }
+            // ext superblock magic at offset 0x38 (56) within this sector
+            if sb_buf[0x38] == 0x53 && sb_buf[0x39] == 0xEF {
+                return "ext";
+            }
         }
     }
 
-    // Check for ext2/3/4 magic (0xEF53 LE) at partition_offset + 1024 + 0x38
+    // Sector 128 (offset 65536 = 0x10000): btrfs superblock.
+    // btrfs magic "_BHRfS_M" is at offset 0x40 (64) within the superblock,
+    // i.e. byte 64 of a sector-aligned read from offset 65536.
     if reader
-        .seek(SeekFrom::Start(partition_offset + 1024 + 0x38))
+        .seek(SeekFrom::Start(partition_offset + 0x10000))
         .is_ok()
     {
-        let mut magic = [0u8; 2];
-        if reader.read_exact(&mut magic).is_ok() && magic == [0x53, 0xEF] {
-            return "ext";
-        }
-    }
-
-    // Check for btrfs magic "_BHRfS_M" at partition_offset + 0x10000 + 0x40
-    if reader
-        .seek(SeekFrom::Start(partition_offset + 0x10000 + 0x40))
-        .is_ok()
-    {
-        let mut magic = [0u8; 8];
-        if reader.read_exact(&mut magic).is_ok() && &magic == b"_BHRfS_M" {
+        let mut btrfs_buf = [0u8; 512];
+        if reader.read_exact(&mut btrfs_buf).is_ok() && &btrfs_buf[0x40..0x48] == b"_BHRfS_M" {
             return "btrfs";
         }
     }
@@ -126,17 +122,19 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
 
 /// Detect whether a type-0x07 partition is NTFS or exFAT by reading the OEM ID.
 /// Returns `"ntfs"`, `"exfat"`, or `"unknown"`.
+///
+/// Reads a full 512-byte sector for compatibility with raw character devices.
 fn detect_0x07_type<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> &'static str {
     if reader.seek(SeekFrom::Start(partition_offset)).is_err() {
         return "unknown";
     }
-    let mut oem = [0u8; 11];
-    if reader.read_exact(&mut oem).is_err() {
+    let mut sector0 = [0u8; 512];
+    if reader.read_exact(&mut sector0).is_err() {
         return "unknown";
     }
-    if &oem[3..11] == b"NTFS    " {
+    if &sector0[3..11] == b"NTFS    " {
         "ntfs"
-    } else if &oem[3..11] == b"EXFAT   " {
+    } else if &sector0[3..11] == b"EXFAT   " {
         "exfat"
     } else {
         "unknown"
@@ -590,13 +588,17 @@ fn compact_partition_reader_by_string<R: Read + Seek + Send + 'static>(
 ///   is calculated from the MDB's drAlBlSt/drAlBlkSiz/drEmbedExtent fields.
 /// - Pure HFS (0x4244, no embedded HFS+): returns `"hfs"`.
 fn resolve_apple_hfs<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> (&'static str, u64) {
+    // The HFS MDB / HFS+ volume header sits at partition_offset + 1024 (sector-aligned).
+    // Read 512 bytes (one sector) — all required fields are within the first 512 bytes
+    // of the MDB (largest field needed is drEmbedExtent.startBlock at MDB offset 127).
+    // This keeps the read sector-aligned for raw character device compatibility.
     if reader
         .seek(SeekFrom::Start(partition_offset + 1024))
         .is_err()
     {
         return ("unknown", partition_offset);
     }
-    let mut buf = [0u8; 162];
+    let mut buf = [0u8; 512];
     if reader.read_exact(&mut buf).is_err() {
         return ("unknown", partition_offset);
     }
@@ -636,9 +638,11 @@ pub fn probe_apple_hfs_type<R: Read + Seek>(reader: &mut R, partition_offset: u6
     match fs_type {
         "hfsplus" => {
             // Distinguish HFS+ from HFSX by reading the volume header signature
+            // (signature at bytes 0-1 of a sector-aligned read at hfsplus_offset + 1024).
             if reader.seek(SeekFrom::Start(hfsplus_offset + 1024)).is_ok() {
-                let mut sig_buf = [0u8; 2];
-                if reader.read_exact(&mut sig_buf).is_ok() && u16::from_be_bytes(sig_buf) == 0x4858
+                let mut sig_buf = [0u8; 512];
+                if reader.read_exact(&mut sig_buf).is_ok()
+                    && u16::from_be_bytes([sig_buf[0], sig_buf[1]]) == 0x4858
                 {
                     return "HFSX";
                 }
