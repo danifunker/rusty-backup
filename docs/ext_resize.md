@@ -8,21 +8,17 @@ Currently ext uses a layout-preserving compact reader (`compacted_size == origin
 
 ---
 
-## Session 1: Compute Minimum Size and Build Relocation Map
+## Session 1: Compute Minimum Size and Build Relocation Map ✅
 
 **Goal:** Given an ext partition, calculate the minimum number of block groups needed and build a mapping of which blocks need to move where.
 
 ### Tasks
-- [ ] Add helper: `metadata_blocks_for_group(group, block_size, blocks_per_group, desc_size, group_count, has_super)` — returns which block numbers in a group are reserved for metadata (superblock backup, GDT, bitmaps, inode table)
-- [ ] Add helper: `needs_superblock_backup(group)` — true for groups 0, 1, and powers of 3, 5, 7 (sparse_super feature)
-- [ ] Add function: `build_relocation_map(reader, partition_offset) -> RelocationPlan` containing:
-  - `min_groups`: minimum block groups needed for all used blocks + metadata
-  - `new_total_blocks`: `min_groups * blocks_per_group`
-  - `relocations: HashMap<u64, u64>` — old_block → new_block for every block beyond boundary
-  - `free_pool: Vec<u64>` — free data blocks within boundary (excluding metadata blocks)
-- [ ] Scan all block bitmaps to identify allocated blocks beyond new boundary
-- [ ] Pair out-of-bounds blocks with free blocks within boundary
-- [ ] Unit test: create a scenario with known block allocation, verify relocation map is correct
+- [x] Add helper: `metadata_blocks_in_group()` — returns count of metadata blocks per group (SB backup, GDT, bitmaps, inode table)
+- [x] Add helper: `has_superblock_backup(group, sparse_super)` — true for groups 0, 1, and powers of 3, 5, 7
+- [x] Add `RelocationPlan` struct with `min_groups`, `new_total_blocks`, `relocations: HashMap<u64,u64>`, `needs_relocation`
+- [x] Add `build_relocation_map(reader, partition_offset)` — scans bitmaps, identifies metadata vs data blocks, computes minimum groups, pairs out-of-bounds data blocks with free slots
+- [x] Unit tests: `test_has_superblock_backup`, `test_metadata_blocks_in_group`, `test_relocation_map_no_trailing_data`, `test_relocation_map_with_trailing_data`
+- [x] Multi-group test image helper: `make_two_group_image()` (2 groups, 64 blocks each, data in both groups)
 
 ### Key code to reuse
 - `CompactExtReader::new()` (ext.rs:1049-1210) — superblock + GDT parsing, bitmap scanning
