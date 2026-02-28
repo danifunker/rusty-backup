@@ -14,7 +14,9 @@ use crate::fs::fat::{patch_bpb_hidden_sectors, resize_fat_in_place};
 use crate::fs::hfs::{patch_hfs_hidden_sectors, resize_hfs_in_place};
 use crate::fs::hfsplus::{patch_hfsplus_hidden_sectors, resize_hfsplus_in_place};
 use crate::fs::ntfs::{patch_ntfs_hidden_sectors, resize_ntfs_in_place};
-use crate::partition::mbr::patch_mbr_entries;
+use crate::partition::mbr::{
+    build_ebr_chain, parse_ebr_chain, patch_mbr_entries, LogicalPartitionInfo, Mbr,
+};
 use crate::partition::PartitionSizeOverride;
 
 /// VHD cookie identifying a valid VHD footer.
@@ -223,6 +225,63 @@ pub(crate) fn write_vhd(
     file.flush()?;
 
     Ok(files)
+}
+
+/// Parse the source MBR and EBR chain, then build an updated EBR chain where
+/// logical partition sizes are replaced by the new sizes from `partition_sizes`.
+///
+/// Returns `None` if the source has no extended partition or its EBR cannot be
+/// parsed (non-fatal: the export continues without updated EBR in that case).
+fn rebuild_vhd_ebr_chain(
+    source_mbr: &[u8; 512],
+    source: &mut (impl Read + Seek),
+    partition_sizes: &[PartitionSizeOverride],
+    log_cb: &mut impl FnMut(&str),
+) -> Option<Vec<(u64, [u8; 512])>> {
+    // Find the extended container entry in the source MBR.
+    let mbr = Mbr::parse(source_mbr).ok()?;
+    let extended_entry = mbr
+        .entries
+        .iter()
+        .find(|e| e.is_extended() && !e.is_empty())?;
+    let extended_start_lba = extended_entry.start_lba;
+
+    // Parse the source EBR chain to get current logical partition info
+    // (positions and partition types).
+    let source_logicals = match parse_ebr_chain(source, extended_start_lba) {
+        Ok(v) if !v.is_empty() => v,
+        Ok(_) => return None, // empty chain — nothing to update
+        Err(e) => {
+            log_cb(&format!("Warning: could not parse source EBR chain: {e}"));
+            return None;
+        }
+    };
+
+    // Build updated LogicalPartitionInfo entries: keep source positions and
+    // types, but apply new sector counts from partition_sizes where available.
+    let logical_infos: Vec<LogicalPartitionInfo> = source_logicals
+        .iter()
+        .map(|src| {
+            let new_sectors = partition_sizes
+                .iter()
+                .find(|ps| ps.start_lba == src.start_lba as u64)
+                .map(|ps| (ps.export_size / 512) as u32)
+                .unwrap_or(src.total_sectors);
+            LogicalPartitionInfo {
+                start_lba: src.start_lba,
+                total_sectors: new_sectors,
+                partition_type: src.partition_type,
+            }
+        })
+        .collect();
+
+    let chain = build_ebr_chain(extended_start_lba, &logical_infos);
+    log_cb(&format!(
+        "Rebuilt {} EBR sector(s) for logical partitions (extended container at LBA {})",
+        chain.len(),
+        extended_start_lba,
+    ));
+    Some(chain)
 }
 
 /// Export a whole disk image as a Fixed VHD file.
@@ -511,6 +570,24 @@ pub fn export_whole_disk_vhd(
                     total_written += n as u64;
                     progress_cb(total_written);
                 }
+            }
+
+            // Rebuild the EBR chain with updated logical partition sizes.
+            // The gap copy above brought the original EBR sectors from the
+            // source into the output; overwrite them with corrected entries
+            // so that any resized logical partitions are reflected in the EBR.
+            if let Some(ebr_chain) =
+                rebuild_vhd_ebr_chain(&mbr_buf, &mut reader, partition_sizes, &mut log_cb)
+            {
+                for (ebr_offset, ebr_sector) in &ebr_chain {
+                    // BufWriter::seek flushes its buffer before seeking, so
+                    // this is safe to call directly on the BufWriter.
+                    writer.seek(SeekFrom::Start(*ebr_offset))?;
+                    writer.write_all(ebr_sector)?;
+                }
+                // Restore the write position to the end of the data region
+                // so the footer is appended at the correct offset.
+                writer.seek(SeekFrom::Start(total_written))?;
             }
         }
     }

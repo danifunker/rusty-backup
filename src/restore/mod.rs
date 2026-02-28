@@ -544,39 +544,39 @@ pub fn build_restore_ebr_chain(
 ) -> Option<(u32, Vec<(u64, [u8; 512])>)> {
     let ext = metadata.extended_container.as_ref()?;
 
-    // Find the override for the extended container to get its new start LBA
-    let ext_override = overrides.iter().find(|o| o.index == ext.mbr_index)?;
-    let extended_start_lba = ext_override.effective_start_lba() as u32;
+    // Use the override's effective start LBA if one exists (restore with
+    // layout changes), otherwise fall back to the original from metadata
+    // (VHD export where the extended container is not in the overrides list
+    // because init_export_configs intentionally skips it).
+    let extended_start_lba = overrides
+        .iter()
+        .find(|o| o.index == ext.mbr_index)
+        .map(|o| o.effective_start_lba())
+        .unwrap_or(ext.start_lba) as u32;
 
-    // Collect logical partition overrides, sorted by effective start LBA
-    let mut logical_overrides: Vec<(
-        &PartitionSizeOverride,
-        &crate::backup::metadata::PartitionMetadata,
-    )> = metadata
+    // Collect logical partitions from metadata, applying overrides where
+    // available and falling back to the original metadata values otherwise.
+    let mut logical_infos: Vec<LogicalPartitionInfo> = metadata
         .partitions
         .iter()
         .filter(|pm| pm.is_logical)
-        .filter_map(|pm| {
-            overrides
-                .iter()
-                .find(|o| o.index == pm.index)
-                .map(|o| (o, pm))
+        .map(|pm| {
+            let ov = overrides.iter().find(|o| o.index == pm.index);
+            LogicalPartitionInfo {
+                start_lba: ov.map(|o| o.effective_start_lba()).unwrap_or(pm.start_lba) as u32,
+                total_sectors: ov
+                    .map(|o| o.export_size / 512)
+                    .unwrap_or(pm.original_size_bytes / 512) as u32,
+                partition_type: pm.partition_type_byte,
+            }
         })
         .collect();
-    logical_overrides.sort_by_key(|(o, _)| o.effective_start_lba());
 
-    if logical_overrides.is_empty() {
+    if logical_infos.is_empty() {
         return None;
     }
 
-    let logical_infos: Vec<LogicalPartitionInfo> = logical_overrides
-        .iter()
-        .map(|(o, pm)| LogicalPartitionInfo {
-            start_lba: o.effective_start_lba() as u32,
-            total_sectors: (o.export_size / 512) as u32,
-            partition_type: pm.partition_type_byte,
-        })
-        .collect();
+    logical_infos.sort_by_key(|info| info.start_lba);
 
     let chain = build_ebr_chain(extended_start_lba, &logical_infos);
     Some((extended_start_lba, chain))
