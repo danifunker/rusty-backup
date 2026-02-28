@@ -7,6 +7,7 @@ pub mod filesystem;
 pub mod hfs;
 pub mod hfsplus;
 pub mod ntfs;
+pub mod prodos;
 pub mod resource_fork;
 pub mod unix_common;
 pub mod zstd_stream;
@@ -33,6 +34,7 @@ pub use hfsplus::{
 pub use ntfs::{
     patch_ntfs_hidden_sectors, resize_ntfs_in_place, validate_ntfs_integrity, CompactNtfsReader,
 };
+pub use prodos::{resize_prodos_in_place, validate_prodos_integrity, CompactProDosReader};
 
 /// Result of filesystem compaction.
 pub struct CompactResult {
@@ -100,6 +102,17 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
             // ext superblock magic at offset 0x38 (56) within this sector
             if sb_buf[0x38] == 0x53 && sb_buf[0x39] == 0xEF {
                 return "ext";
+            }
+            // ProDOS volume directory key block: prev_block==0, storage_type nibble==0xF,
+            // entry_length==39, entries_per_block==13
+            if sb_buf[0] == 0
+                && sb_buf[1] == 0
+                && (sb_buf[4] >> 4) == 0xF
+                && (sb_buf[4] & 0xF) >= 1
+                && sb_buf[27] == 39
+                && sb_buf[28] == 13
+            {
+                return "prodos";
             }
         }
     }
@@ -236,6 +249,10 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
                     let (reader, info) = CompactBtrfsReader::new(reader, partition_offset).ok()?;
                     Some((Box::new(reader), info))
                 }
+                "prodos" => {
+                    let (reader, info) = CompactProDosReader::new(reader, partition_offset).ok()?;
+                    Some((Box::new(reader), info))
+                }
                 _ => None,
             }
         }
@@ -312,6 +329,11 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
                 }
             }
         }
+        // ProDOS on MBR disks
+        0xA8 => {
+            let (compact, info) = CompactProDosReader::new(reader, partition_offset).ok()?;
+            Some((Box::new(compact), info))
+        }
         _ => None,
     }
 }
@@ -385,6 +407,10 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "prodos" => Ok(Box::new(prodos::ProDosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 _ => Err(FilesystemError::Unsupported(
                     "could not detect filesystem type on superfloppy".into(),
                 )),
@@ -453,6 +479,11 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                 )?)),
             }
         }
+        // ProDOS on MBR disks (type byte 0xA8)
+        0xA8 => Ok(Box::new(prodos::ProDosFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
         _ => Err(FilesystemError::Unsupported(format!(
             "filesystem type 0x{:02X} not supported for browsing",
             partition_type
@@ -502,6 +533,10 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
                 ))),
             }
         }
+        "Apple_PRODOS" | "Apple_ProDOS" => Ok(Box::new(prodos::ProDosFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
         _ => Err(FilesystemError::Unsupported(format!(
             "APM partition type '{}' not supported for browsing",
             type_str
@@ -571,6 +606,13 @@ fn compact_partition_reader_by_string<R: Read + Seek + Send + 'static>(
                 }
                 _ => Ok(None),
             }
+        }
+        "Apple_PRODOS" | "Apple_ProDOS" => {
+            let (compact, info) =
+                CompactProDosReader::new(reader, partition_offset).map_err(|e| {
+                    format!("CompactProDosReader::new failed at offset {partition_offset}: {e}")
+                })?;
+            Ok(Some((Box::new(compact), info)))
         }
         _ => Ok(None),
     }

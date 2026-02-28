@@ -18,10 +18,10 @@ use crate::fs::hfsplus::patch_hfsplus_hidden_sectors;
 use crate::fs::ntfs::patch_ntfs_hidden_sectors;
 use crate::fs::{
     resize_btrfs_in_place, resize_exfat_in_place, resize_ext_in_place, resize_fat_in_place,
-    resize_hfs_in_place, resize_hfsplus_in_place, resize_ntfs_in_place, set_fat_clean_flags,
-    validate_btrfs_integrity, validate_exfat_integrity, validate_ext_integrity,
-    validate_fat_integrity, validate_hfs_integrity, validate_hfsplus_integrity,
-    validate_ntfs_integrity,
+    resize_hfs_in_place, resize_hfsplus_in_place, resize_ntfs_in_place, resize_prodos_in_place,
+    set_fat_clean_flags, validate_btrfs_integrity, validate_exfat_integrity,
+    validate_ext_integrity, validate_fat_integrity, validate_hfs_integrity,
+    validate_hfsplus_integrity, validate_ntfs_integrity, validate_prodos_integrity,
 };
 use crate::os::SectorAlignedWriter;
 use crate::partition::apm::Apm;
@@ -932,6 +932,11 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
                         log(&progress, LogLevel::Info, msg)
                     })?;
                 }
+                PartitionFsType::ProDos if needs_resize => {
+                    resize_prodos_in_place(inner_file, part_offset, export_size, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    })?;
+                }
                 PartitionFsType::Fat | PartitionFsType::Unknown if needs_resize => {
                     let new_sectors = (export_size / 512) as u32;
                     resize_fat_in_place(inner_file, part_offset, new_sectors, &mut |msg| {
@@ -973,6 +978,11 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
                 }
                 PartitionFsType::Btrfs => {
                     let _ = validate_btrfs_integrity(inner_file, part_offset, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    });
+                }
+                PartitionFsType::ProDos => {
+                    let _ = validate_prodos_integrity(inner_file, part_offset, &mut |msg| {
                         log(&progress, LogLevel::Info, msg)
                     });
                 }
@@ -1443,6 +1453,11 @@ fn run_clonezilla_restore(
                         log(&progress, LogLevel::Info, msg)
                     })?;
                 }
+                PartitionFsType::ProDos => {
+                    resize_prodos_in_place(inner_file, part_offset, export_size, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    })?;
+                }
                 PartitionFsType::Fat | PartitionFsType::Unknown => {
                     let new_sectors = (export_size / 512) as u32;
                     resize_fat_in_place(inner_file, part_offset, new_sectors, &mut |msg| {
@@ -1483,6 +1498,11 @@ fn run_clonezilla_restore(
                 }
                 PartitionFsType::Btrfs => {
                     let _ = validate_btrfs_integrity(inner_file, part_offset, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    });
+                }
+                PartitionFsType::ProDos => {
+                    let _ = validate_prodos_integrity(inner_file, part_offset, &mut |msg| {
                         log(&progress, LogLevel::Info, msg)
                     });
                 }
@@ -1918,6 +1938,7 @@ enum PartitionFsType {
     HfsPlus,
     Ext,
     Btrfs,
+    ProDos,
     Unknown,
 }
 
@@ -1971,6 +1992,16 @@ fn detect_partition_fs_type(
         // ext2/3/4 magic at offset 0x38 within this sector
         if sector[0x38] == 0x53 && sector[0x39] == 0xEF {
             return PartitionFsType::Ext;
+        }
+        // ProDOS volume directory key block
+        if sector[0] == 0
+            && sector[1] == 0
+            && (sector[4] >> 4) == 0xF
+            && (sector[4] & 0xF) >= 1
+            && sector[27] == 39
+            && sector[28] == 13
+        {
+            return PartitionFsType::ProDos;
         }
     }
 
