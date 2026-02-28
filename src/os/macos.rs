@@ -35,60 +35,6 @@ use super::ElevatedSource;
 use crate::device::{DiskDevice, MountedPartition};
 
 // ---------------------------------------------------------------------------
-// Security.framework FFI — used by authopen_device for privilege escalation
-// ---------------------------------------------------------------------------
-
-mod security {
-    use libc::{c_char, c_void, size_t};
-
-    pub type AuthorizationRef = *mut c_void;
-    pub type OSStatus = i32;
-    pub type AuthorizationFlags = u32;
-
-    pub const ERR_AUTHORIZATION_SUCCESS: OSStatus = 0;
-    pub const ERR_AUTHORIZATION_CANCELED: OSStatus = -60006;
-    pub const FLAG_INTERACTION_ALLOWED: AuthorizationFlags = 1 << 0;
-    pub const FLAG_EXTEND_RIGHTS: AuthorizationFlags = 1 << 1;
-    pub const FLAG_PRE_AUTHORIZE: AuthorizationFlags = 1 << 2;
-    /// kAuthorizationExternalFormLength
-    pub const EXTERNAL_FORM_LENGTH: usize = 32;
-
-    #[repr(C)]
-    pub struct AuthorizationItem {
-        pub name: *const c_char,
-        pub value_length: size_t,
-        pub value: *mut c_void,
-        pub flags: u32,
-    }
-
-    #[repr(C)]
-    pub struct AuthorizationRights {
-        pub count: u32,
-        pub items: *const AuthorizationItem,
-    }
-
-    #[repr(C)]
-    pub struct AuthorizationExternalForm {
-        pub bytes: [c_char; 32],
-    }
-
-    #[link(name = "Security", kind = "framework")]
-    extern "C" {
-        pub fn AuthorizationCreate(
-            rights: *const AuthorizationRights,
-            environment: *const c_void,
-            flags: AuthorizationFlags,
-            authorization: *mut AuthorizationRef,
-        ) -> OSStatus;
-
-        pub fn AuthorizationMakeExternalForm(
-            authorization: AuthorizationRef,
-            ext_form: *mut AuthorizationExternalForm,
-        ) -> OSStatus;
-
-        pub fn AuthorizationFree(authorization: AuthorizationRef, flags: u32) -> OSStatus;
-    }
-}
 
 // macOS ioctl constants for getting device size
 // DKIOCGETBLOCKSIZE = _IOR('d', 24, u32) = 0x40046418
@@ -721,94 +667,33 @@ fn receive_fd_from_socket(sock: libc::c_int) -> Result<libc::c_int> {
 ///
 /// `authopen` is a macOS system binary that opens a device with root privileges
 /// and passes the file descriptor back via a Unix domain socket (`SCM_RIGHTS`).
-/// This mirrors what RPI Imager does and avoids the unreliable `O_EXLOCK` flag
-/// on raw character devices.
+/// This avoids the unreliable `O_EXLOCK` flag on raw character devices.
 ///
-/// If the app is already running as root, `authopen` returns the fd immediately
-/// without showing the system auth dialog.
+/// authopen handles its own authorization and shows a single native macOS
+/// auth dialog when needed. If already running as root it returns the fd
+/// immediately without any dialog.
 fn authopen_device(path: &str, flags: libc::c_int) -> Result<File> {
-    // 1. Build the right name: "sys.openfile.readwrite.<path>"
-    let right_name_str = format!("sys.openfile.readwrite.{}", path);
-    let right_name = CString::new(right_name_str).context("path contains NUL byte")?;
-
-    // 2. Request the authorization right (shows native auth dialog if not root)
-    let mut auth_ref: security::AuthorizationRef = ptr::null_mut();
-    let item = security::AuthorizationItem {
-        name: right_name.as_ptr(),
-        value_length: 0,
-        value: ptr::null_mut(),
-        flags: 0,
-    };
-    let rights = security::AuthorizationRights {
-        count: 1,
-        items: &item,
-    };
-
-    let status = unsafe {
-        security::AuthorizationCreate(
-            &rights,
-            ptr::null(),
-            security::FLAG_INTERACTION_ALLOWED
-                | security::FLAG_EXTEND_RIGHTS
-                | security::FLAG_PRE_AUTHORIZE,
-            &mut auth_ref,
-        )
-    };
-
-    if status == security::ERR_AUTHORIZATION_CANCELED {
-        bail!("User cancelled authentication");
-    }
-    if status != security::ERR_AUTHORIZATION_SUCCESS {
-        bail!("AuthorizationCreate failed with status {}", status);
-    }
-
-    // 3. Serialize the auth token to 32 bytes so we can hand it to authopen
-    let mut ext_form = security::AuthorizationExternalForm { bytes: [0i8; 32] };
-    let status = unsafe { security::AuthorizationMakeExternalForm(auth_ref, &mut ext_form) };
-
-    // 4. Release the auth ref — we have the serialized external form now
-    unsafe { security::AuthorizationFree(auth_ref, 0) };
-
-    if status != security::ERR_AUTHORIZATION_SUCCESS {
-        bail!(
-            "AuthorizationMakeExternalForm failed with status {}",
-            status
-        );
-    }
-
-    // 5. Create IPC channels:
-    //    sv[0]       — parent receives the fd via SCM_RIGHTS
-    //    sv[1]       — child (authopen) sends the fd
-    //    stdin_pipe[0] — child reads the 32-byte auth token from stdin
-    //    stdin_pipe[1] — parent writes the auth token
+    // 1. Create IPC socket pair:
+    //    sv[0] — parent receives the fd via SCM_RIGHTS
+    //    sv[1] — child (authopen) sends the fd via stdout
     let mut sv = [-1i32; 2];
-    let mut stdin_pipe = [-1i32; 2];
 
     if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) } != 0 {
         bail!("socketpair failed: {}", std::io::Error::last_os_error());
-    }
-    if unsafe { libc::pipe(stdin_pipe.as_mut_ptr()) } != 0 {
-        unsafe {
-            libc::close(sv[0]);
-            libc::close(sv[1]);
-        }
-        bail!("pipe failed: {}", std::io::Error::last_os_error());
     }
 
     // Prepare all execv arguments BEFORE fork (CStrings must stay alive until after exec)
     let authopen_path = CString::new("/usr/libexec/authopen").unwrap();
     let arg0 = CString::new("authopen").unwrap();
     let arg_stdoutpipe = CString::new("-stdoutpipe").unwrap();
-    let arg_extauth = CString::new("-extauth").unwrap();
     let arg_o = CString::new("-o").unwrap();
     let flags_str = CString::new(format!("{}", flags)).unwrap();
     let path_cstr = CString::new(path).context("path contains NUL byte")?;
 
-    // null-terminated argv array for execv
-    let argv: [*const libc::c_char; 8] = [
+    // null-terminated argv: authopen -stdoutpipe -o <flags> <path>
+    let argv: [*const libc::c_char; 7] = [
         arg0.as_ptr(),
         arg_stdoutpipe.as_ptr(),
-        arg_extauth.as_ptr(),
         arg_o.as_ptr(),
         flags_str.as_ptr(),
         path_cstr.as_ptr(),
@@ -816,7 +701,7 @@ fn authopen_device(path: &str, flags: libc::c_int) -> Result<File> {
         ptr::null(),
     ];
 
-    // 6. Fork — child execs authopen; parent receives the fd
+    // 2. Fork — child execs authopen; parent receives the fd
     let pid = unsafe { libc::fork() };
 
     match pid {
@@ -824,21 +709,14 @@ fn authopen_device(path: &str, flags: libc::c_int) -> Result<File> {
             unsafe {
                 libc::close(sv[0]);
                 libc::close(sv[1]);
-                libc::close(stdin_pipe[0]);
-                libc::close(stdin_pipe[1]);
             }
             bail!("fork failed: {}", std::io::Error::last_os_error());
         }
         0 => {
             // Child process — only async-signal-safe calls between fork and exec
             unsafe {
-                // Close parent-side ends
+                // Close parent-side end
                 libc::close(sv[0]);
-                libc::close(stdin_pipe[1]);
-
-                // Wire auth-token pipe to stdin
-                libc::dup2(stdin_pipe[0], libc::STDIN_FILENO);
-                libc::close(stdin_pipe[0]);
 
                 // Wire socket to stdout (authopen sends fd via -stdoutpipe on stdout)
                 libc::dup2(sv[1], libc::STDOUT_FILENO);
@@ -851,20 +729,11 @@ fn authopen_device(path: &str, flags: libc::c_int) -> Result<File> {
         child_pid => {
             // Parent process
             unsafe {
-                // Close child-side ends
+                // Close child-side end
                 libc::close(sv[1]);
-                libc::close(stdin_pipe[0]);
-
-                // 7. Write the 32-byte auth external form to authopen's stdin
-                libc::write(
-                    stdin_pipe[1],
-                    ext_form.bytes.as_ptr() as *const c_void,
-                    security::EXTERNAL_FORM_LENGTH,
-                );
-                libc::close(stdin_pipe[1]);
             }
 
-            // 8. Receive the file descriptor via SCM_RIGHTS (retry on EINTR)
+            // 3. Receive the file descriptor via SCM_RIGHTS (retry on EINTR)
             let received_fd = match receive_fd_from_socket(sv[0]) {
                 Ok(fd) => {
                     unsafe { libc::close(sv[0]) };
@@ -881,7 +750,7 @@ fn authopen_device(path: &str, flags: libc::c_int) -> Result<File> {
                 }
             };
 
-            // 9. Wait for authopen to exit (retry on EINTR)
+            // 4. Wait for authopen to exit (retry on EINTR)
             let mut wstatus = 0i32;
             loop {
                 let r = unsafe { libc::waitpid(child_pid, &mut wstatus, 0) };
@@ -899,7 +768,7 @@ fn authopen_device(path: &str, flags: libc::c_int) -> Result<File> {
                 );
             }
 
-            // 10. Bypass the buffer cache (equivalent to O_DIRECT on Linux)
+            // 5. Bypass the buffer cache (equivalent to O_DIRECT on Linux)
             unsafe { libc::fcntl(received_fd, F_NOCACHE, 1) };
 
             Ok(unsafe { File::from_raw_fd(received_fd) })
