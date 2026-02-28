@@ -1945,16 +1945,15 @@ fn le32(data: &[u8], offset: usize) -> u32 {
 // Resize
 // ---------------------------------------------------------------------------
 
-/// Grow an ext2/3/4 filesystem in place.
+/// Resize an ext2/3/4 filesystem in place (grow or shrink).
 ///
-/// Updates the superblock and group descriptor table to reflect the new
-/// partition size. Only grow operations are supported — if the new size is
-/// smaller than or equal to the current size, this is a no-op.
+/// Updates the superblock to reflect the new partition size. For growing,
+/// newly available blocks are added to the free count. For shrinking (after
+/// a packed backup with block relocation), the block count and free count
+/// are adjusted downward.
 ///
-/// This performs a minimal resize: it updates `s_blocks_count` and
-/// `s_free_blocks_count` in the superblock and zeroes new block group
-/// metadata. A full `e2fsck`/`resize2fs` is still recommended after restore,
-/// but this gets the filesystem to a bootable state.
+/// This performs a minimal metadata-only resize. A full `e2fsck`/`resize2fs`
+/// is still recommended after restore for production use.
 pub fn resize_ext_in_place(
     file: &mut (impl Read + std::io::Write + Seek),
     partition_offset: u64,
@@ -1974,12 +1973,8 @@ pub fn resize_ext_in_place(
 
     let log_block_size = le32(&sb, 0x18);
     let block_size = 1024u64 << log_block_size;
-    let blocks_per_group = le32(&sb, 0x20) as u64;
-    let inodes_per_group = le32(&sb, 0x28);
-    let inode_size = u16::from_le_bytes([sb[0x58], sb[0x59]]) as u64;
     let feature_incompat = le32(&sb, 0x60);
     let is_64bit = feature_incompat & INCOMPAT_64BIT != 0;
-    let _first_data_block = le32(&sb, 0x14) as u64;
 
     let old_blocks = if is_64bit {
         let hi = le32(&sb, 0x150) as u64;
@@ -1989,25 +1984,11 @@ pub fn resize_ext_in_place(
     };
 
     let new_blocks = new_total_bytes / block_size;
-    if new_blocks <= old_blocks {
-        log_cb(&format!(
-            "ext resize: new size ({new_blocks} blocks) <= current ({old_blocks} blocks), skipping"
-        ));
+    if new_blocks == old_blocks {
+        log_cb("ext resize: size unchanged, skipping");
         return Ok(());
     }
 
-    let added_blocks = new_blocks - old_blocks;
-    log_cb(&format!(
-        "ext resize: growing from {old_blocks} to {new_blocks} blocks (+{added_blocks})"
-    ));
-
-    // Update s_blocks_count
-    sb[0x04..0x08].copy_from_slice(&(new_blocks as u32).to_le_bytes());
-    if is_64bit {
-        sb[0x150..0x154].copy_from_slice(&((new_blocks >> 32) as u32).to_le_bytes());
-    }
-
-    // Update s_free_blocks_count: add the new blocks as free
     let old_free_lo = le32(&sb, 0x0C) as u64;
     let old_free = if is_64bit {
         let hi = le32(&sb, 0x158) as u64;
@@ -2015,10 +1996,55 @@ pub fn resize_ext_in_place(
     } else {
         old_free_lo
     };
-    let new_free = old_free + added_blocks;
+
+    let old_reserved_lo = le32(&sb, 0x08) as u64;
+    let old_reserved = if is_64bit {
+        let hi = le32(&sb, 0x154) as u64;
+        (hi << 32) | old_reserved_lo
+    } else {
+        old_reserved_lo
+    };
+
+    let (new_free, new_reserved);
+
+    if new_blocks > old_blocks {
+        // Growing: add new blocks as free
+        let added = new_blocks - old_blocks;
+        new_free = old_free + added;
+        new_reserved = old_reserved; // keep reserved count unchanged
+        log_cb(&format!(
+            "ext resize: growing from {old_blocks} to {new_blocks} blocks (+{added})"
+        ));
+    } else {
+        // Shrinking: reduce free and reserved proportionally
+        let removed = old_blocks - new_blocks;
+        new_free = old_free.saturating_sub(removed);
+        new_reserved = if old_blocks > 0 {
+            old_reserved * new_blocks / old_blocks
+        } else {
+            0
+        };
+        log_cb(&format!(
+            "ext resize: shrinking from {old_blocks} to {new_blocks} blocks (-{removed})"
+        ));
+    }
+
+    // Update s_blocks_count
+    sb[0x04..0x08].copy_from_slice(&(new_blocks as u32).to_le_bytes());
+    if is_64bit {
+        sb[0x150..0x154].copy_from_slice(&((new_blocks >> 32) as u32).to_le_bytes());
+    }
+
+    // Update s_free_blocks_count
     sb[0x0C..0x10].copy_from_slice(&(new_free as u32).to_le_bytes());
     if is_64bit {
         sb[0x158..0x15C].copy_from_slice(&((new_free >> 32) as u32).to_le_bytes());
+    }
+
+    // Update s_r_blocks_count (reserved)
+    sb[0x08..0x0C].copy_from_slice(&(new_reserved as u32).to_le_bytes());
+    if is_64bit {
+        sb[0x154..0x158].copy_from_slice(&((new_reserved >> 32) as u32).to_le_bytes());
     }
 
     // Write updated superblock
@@ -2131,10 +2157,10 @@ pub fn validate_ext_integrity(
 /// A streaming `Read` that produces a compacted ext2/3/4 partition image.
 ///
 /// Allocated blocks are preserved; unallocated blocks are replaced with zeros.
-/// The output image has the same block layout as the original — block pointers
-/// in inodes and extent trees remain valid. This approach is simpler and more
-/// reliable than defragmentation, and produces excellent compression ratios
-/// since free space compresses to nothing.
+/// The output image is normally layout-preserving (block pointers remain valid,
+/// free space is zeroed for compression). When the filesystem can be shrunk,
+/// it instead produces a **packed** image with block relocation — like
+/// `resize2fs` but applied during backup.
 pub struct CompactExtReader<R: Read + Seek> {
     inner: CompactStreamReader<R>,
 }
@@ -2142,10 +2168,341 @@ pub struct CompactExtReader<R: Read + Seek> {
 impl<R: Read + Seek + Send> CompactExtReader<R> {
     /// Create a new compacted ext reader.
     ///
-    /// Parses the superblock and block group descriptors, scans block bitmaps
-    /// to identify allocated blocks, and builds a virtual layout that maps
-    /// allocated blocks from the source while zeroing unallocated ones.
+    /// First attempts to build a packed (shrunken) image by relocating blocks.
+    /// Falls back to layout-preserving compaction if shrinking isn't possible.
     pub fn new(
+        mut reader: R,
+        partition_offset: u64,
+    ) -> Result<(Self, CompactResult), FilesystemError> {
+        // Try to build a packed image
+        let plan = build_relocation_map(&mut reader, partition_offset)?;
+
+        if plan.new_total_blocks < Self::parse_total_blocks(&mut reader, partition_offset)? {
+            Self::new_packed(reader, partition_offset, &plan)
+        } else {
+            Self::new_layout_preserving(reader, partition_offset)
+        }
+    }
+
+    /// Read total_blocks from the superblock.
+    fn parse_total_blocks(reader: &mut R, partition_offset: u64) -> Result<u64, FilesystemError> {
+        reader.seek(SeekFrom::Start(partition_offset + SUPERBLOCK_OFFSET))?;
+        let mut sb = [0u8; SUPERBLOCK_SIZE];
+        reader.read_exact(&mut sb)?;
+        let feature_incompat = le32(&sb, 0x60);
+        let is_64bit = feature_incompat & INCOMPAT_64BIT != 0;
+        let lo = le32(&sb, 0x04) as u64;
+        Ok(if is_64bit {
+            let hi = le32(&sb, 0x150) as u64;
+            (hi << 32) | lo
+        } else {
+            lo
+        })
+    }
+
+    /// Build a packed (shrunken) image with block relocation.
+    fn new_packed(
+        mut reader: R,
+        partition_offset: u64,
+        plan: &RelocationPlan,
+    ) -> Result<(Self, CompactResult), FilesystemError> {
+        // Get patched inode tables and indirect block patches
+        let patched_inodes = scan_and_patch_inodes(&mut reader, partition_offset, plan)?;
+
+        // Get patched superblock, GDT, and block bitmaps
+        let shrink_meta = rebuild_metadata_for_shrink(&mut reader, partition_offset, plan)?;
+
+        // Parse key fields from the PATCHED superblock
+        let sb = &shrink_meta.superblock;
+        let first_data_block = le32(sb, 0x14);
+        let log_block_size = le32(sb, 0x18);
+        let blocks_per_group = le32(sb, 0x20);
+        let inodes_per_group = le32(sb, 0x28);
+        let inode_size = u16::from_le_bytes([sb[0x58], sb[0x59]]);
+        let feature_incompat = le32(sb, 0x60);
+        let feature_ro_compat = le32(sb, 0x64);
+        let is_64bit = feature_incompat & INCOMPAT_64BIT != 0;
+        let sparse_super = feature_ro_compat & 0x0001 != 0;
+
+        let block_size = 1024u64 << log_block_size;
+        let desc_size: u16 = if is_64bit {
+            let ds = u16::from_le_bytes([sb[0xFE], sb[0xFF]]);
+            if ds >= 64 {
+                ds
+            } else {
+                64
+            }
+        } else {
+            32
+        };
+
+        let min_groups = plan.min_groups;
+        let new_total_blocks = plan.new_total_blocks;
+        let inode_table_blocks =
+            ((inodes_per_group as u64 * inode_size as u64) + block_size - 1) / block_size;
+
+        // Parse GDT to find bitmap/inode-table block numbers per group
+        struct GroupMeta {
+            block_bitmap: u64,
+            inode_bitmap: u64,
+            inode_table: u64,
+        }
+        let mut group_meta: Vec<GroupMeta> = Vec::with_capacity(min_groups as usize);
+        for i in 0..min_groups as usize {
+            let off = i * desc_size as usize;
+            let d = &shrink_meta.gdt[off..];
+            let bb_lo = le32(d, 0x00) as u64;
+            let ib_lo = le32(d, 0x04) as u64;
+            let it_lo = le32(d, 0x08) as u64;
+            let (bb, ib, it) = if is_64bit && desc_size >= 64 {
+                (
+                    (le32(d, 0x20) as u64) << 32 | bb_lo,
+                    (le32(d, 0x24) as u64) << 32 | ib_lo,
+                    (le32(d, 0x28) as u64) << 32 | it_lo,
+                )
+            } else {
+                (bb_lo, ib_lo, it_lo)
+            };
+            group_meta.push(GroupMeta {
+                block_bitmap: bb,
+                inode_bitmap: ib,
+                inode_table: it,
+            });
+        }
+
+        // Build a set of blocks that have indirect/extent-index patches
+        let indirect_patches = &patched_inodes.indirect_block_patches;
+
+        // Also read original inode bitmaps (not modified by shrink)
+        let mut inode_bitmaps: Vec<Vec<u8>> = Vec::with_capacity(min_groups as usize);
+        for gm in &group_meta {
+            reader.seek(SeekFrom::Start(
+                partition_offset + gm.inode_bitmap * block_size,
+            ))?;
+            let mut ibm = vec![0u8; block_size as usize];
+            reader.read_exact(&mut ibm)?;
+            inode_bitmaps.push(ibm);
+        }
+
+        // Read the original total_blocks for CompactResult
+        let original_total = Self::parse_total_blocks(&mut reader, partition_offset)?;
+        let original_size = original_total * block_size;
+
+        // ---- Build sections ----
+        // Walk blocks 0..new_total_blocks and emit the right content for each.
+        let mut sections: Vec<CompactSection> = Vec::new();
+        let mut total_data_reads: u64 = 0;
+
+        // Block 0 for 1K blocks contains the boot sector (bytes 0-1023) + superblock (1024-2047)
+        // For 4K blocks, block 0 contains boot(0-1023) + superblock(1024-2047) + padding
+        // We always emit block 0 as PreBuilt with patched superblock
+        if first_data_block == 1 {
+            // 1K block size: block 0 is boot sector, block 1 is superblock
+            // Read boot block from source
+            reader.seek(SeekFrom::Start(partition_offset))?;
+            let mut boot = vec![0u8; block_size as usize];
+            reader.read_exact(&mut boot)?;
+            sections.push(CompactSection::PreBuilt(boot));
+
+            // Block 1: patched superblock
+            sections.push(CompactSection::PreBuilt(shrink_meta.superblock.clone()));
+        } else {
+            // 2K/4K blocks: block 0 has boot(0-1023) + superblock(1024-2047) + padding
+            reader.seek(SeekFrom::Start(partition_offset))?;
+            let mut block0 = vec![0u8; block_size as usize];
+            reader.read_exact(&mut block0)?;
+            // Overlay patched superblock at offset 1024
+            let sb_len = shrink_meta.superblock.len().min(block0.len() - 1024);
+            block0[1024..1024 + sb_len].copy_from_slice(&shrink_meta.superblock[..sb_len]);
+            sections.push(CompactSection::PreBuilt(block0));
+        }
+
+        // GDT blocks (immediately after superblock block)
+        let gdt_bytes = &shrink_meta.gdt;
+        let gdt_total_blocks = (gdt_bytes.len() as u64 + block_size - 1) / block_size;
+        // Pad GDT to full blocks
+        let mut gdt_padded = gdt_bytes.clone();
+        let gdt_padded_len = gdt_total_blocks as usize * block_size as usize;
+        gdt_padded.resize(gdt_padded_len, 0);
+        sections.push(CompactSection::PreBuilt(gdt_padded));
+
+        // Now emit per-group metadata + data blocks
+        // We've already emitted blocks for SB + GDT (which are in group 0's range).
+        // The remaining blocks in each group are: block_bitmap, inode_bitmap,
+        // inode_table, then data blocks.
+        //
+        // Rather than trying to track exactly which block number we're at,
+        // iterate through each group's blocks using the rebuilt bitmap.
+
+        let sb_gdt_blocks = if first_data_block == 1 { 2 } else { 1 } + gdt_total_blocks;
+
+        for group in 0..min_groups as usize {
+            let group_start = first_data_block as u64 + group as u64 * blocks_per_group as u64;
+            let group_block_count = if group as u32 == min_groups - 1 {
+                new_total_blocks - group_start
+            } else {
+                blocks_per_group as u64
+            };
+
+            let gm = &group_meta[group];
+            let rebuilt_bitmap = &shrink_meta.block_bitmaps[group];
+            let bm = BitmapReader::new(rebuilt_bitmap, group_block_count);
+
+            // Skip blocks we've already emitted (SB + GDT in group 0)
+            let start_block_in_group = if group == 0 { sb_gdt_blocks } else { 0 };
+
+            // For groups with SB backup (not group 0), emit backup SB + GDT
+            if group > 0 && has_superblock_backup(group as u32, sparse_super) {
+                // SB backup block
+                sections.push(CompactSection::PreBuilt(shrink_meta.superblock.clone()));
+                // GDT backup
+                let mut gdt_backup = shrink_meta.gdt.clone();
+                gdt_backup.resize(gdt_total_blocks as usize * block_size as usize, 0);
+                sections.push(CompactSection::PreBuilt(gdt_backup));
+            }
+
+            // Determine where group-local metadata starts (after any SB/GDT backup)
+            let meta_start = if group == 0 {
+                sb_gdt_blocks
+            } else if has_superblock_backup(group as u32, sparse_super) {
+                1 + gdt_total_blocks // SB + GDT blocks
+            } else {
+                0
+            };
+
+            // Emit remaining blocks using the rebuilt bitmap
+            let emit_start = if group == 0 {
+                start_block_in_group
+            } else if has_superblock_backup(group as u32, sparse_super) {
+                1 + gdt_total_blocks // Already emitted SB+GDT backup above
+            } else {
+                0
+            };
+
+            let mut block_idx = emit_start;
+            while block_idx < group_block_count {
+                let abs_block = group_start + block_idx;
+
+                // Check if this is a metadata block we need to serve patched
+                if abs_block == gm.block_bitmap {
+                    sections.push(CompactSection::PreBuilt(rebuilt_bitmap.clone()));
+                    block_idx += 1;
+                    continue;
+                }
+                if abs_block == gm.inode_bitmap {
+                    sections.push(CompactSection::PreBuilt(inode_bitmaps[group].clone()));
+                    block_idx += 1;
+                    continue;
+                }
+                if abs_block >= gm.inode_table && abs_block < gm.inode_table + inode_table_blocks {
+                    // Emit from patched inode table
+                    let table_block_idx = (abs_block - gm.inode_table) as usize;
+                    let byte_start = table_block_idx * block_size as usize;
+                    let byte_end =
+                        (byte_start + block_size as usize).min(patched_inodes.tables[group].len());
+                    if byte_start < patched_inodes.tables[group].len() {
+                        let mut chunk = patched_inodes.tables[group][byte_start..byte_end].to_vec();
+                        chunk.resize(block_size as usize, 0);
+                        sections.push(CompactSection::PreBuilt(chunk));
+                    } else {
+                        sections.push(CompactSection::Zeros(block_size));
+                    }
+                    block_idx += 1;
+                    continue;
+                }
+
+                // Check if this block has an indirect/extent-index patch
+                if let Some(patched_data) = indirect_patches.get(&abs_block) {
+                    sections.push(CompactSection::PreBuilt(patched_data.clone()));
+                    total_data_reads += 1;
+                    block_idx += 1;
+                    continue;
+                }
+
+                // Regular data block — use bitmap to determine allocated vs free
+                let is_alloc = bm.is_bit_set(block_idx);
+                if is_alloc {
+                    // Find run of allocated non-special blocks
+                    let mut run_end = block_idx + 1;
+                    while run_end < group_block_count {
+                        let next_abs = group_start + run_end;
+                        if next_abs == gm.block_bitmap
+                            || next_abs == gm.inode_bitmap
+                            || (next_abs >= gm.inode_table
+                                && next_abs < gm.inode_table + inode_table_blocks)
+                            || indirect_patches.contains_key(&next_abs)
+                            || !bm.is_bit_set(run_end)
+                        {
+                            break;
+                        }
+                        run_end += 1;
+                    }
+
+                    // For relocated blocks, read from ORIGINAL source location
+                    let reverse: std::collections::HashMap<u64, u64> = plan
+                        .relocations
+                        .iter()
+                        .map(|(&old, &new)| (new, old))
+                        .collect();
+
+                    let old_blocks: Vec<u64> = (block_idx..run_end)
+                        .map(|bi| {
+                            let abs = group_start + bi;
+                            // If this block is a relocation target, read from original position
+                            reverse.get(&abs).copied().unwrap_or(abs)
+                        })
+                        .collect();
+                    total_data_reads += old_blocks.len() as u64;
+                    sections.push(CompactSection::MappedBlocks { old_blocks });
+                    block_idx = run_end;
+                } else {
+                    // Find run of free blocks
+                    let mut run_end = block_idx + 1;
+                    while run_end < group_block_count {
+                        let next_abs = group_start + run_end;
+                        if next_abs == gm.block_bitmap
+                            || next_abs == gm.inode_bitmap
+                            || (next_abs >= gm.inode_table
+                                && next_abs < gm.inode_table + inode_table_blocks)
+                            || indirect_patches.contains_key(&next_abs)
+                            || bm.is_bit_set(run_end)
+                        {
+                            break;
+                        }
+                        run_end += 1;
+                    }
+                    let run_len = run_end - block_idx;
+                    sections.push(CompactSection::Zeros(run_len * block_size));
+                    block_idx = run_end;
+                }
+            }
+        }
+
+        let compacted_size = new_total_blocks * block_size;
+        let data_size = total_data_reads * block_size;
+
+        let layout = CompactLayout {
+            sections,
+            block_size: block_size as usize,
+            source_data_start: 0,
+            source_partition_offset: partition_offset,
+        };
+
+        let inner = CompactStreamReader::new(reader, layout);
+
+        Ok((
+            Self { inner },
+            CompactResult {
+                original_size,
+                compacted_size,
+                data_size,
+                clusters_used: total_data_reads as u32,
+            },
+        ))
+    }
+
+    /// Build a layout-preserving compacted image (original behavior).
+    fn new_layout_preserving(
         mut reader: R,
         partition_offset: u64,
     ) -> Result<(Self, CompactResult), FilesystemError> {
@@ -2206,7 +2563,6 @@ impl<R: Read + Seek + Send> CompactExtReader<R> {
         reader.seek(SeekFrom::Start(gdt_offset))?;
         reader.read_exact(&mut gdt_buf)?;
 
-        // Parse GDTs to get block bitmap locations and flags
         let mut gd_infos: Vec<(u64, u16)> = Vec::with_capacity(group_count as usize);
         for i in 0..group_count as usize {
             let off = i * desc_size as usize;
@@ -2222,9 +2578,6 @@ impl<R: Read + Seek + Send> CompactExtReader<R> {
             gd_infos.push((block_bitmap, flags));
         }
 
-        // Scan block bitmaps and build the layout
-        // Strategy: for each block group, read its bitmap and emit either
-        // MappedBlocks (for runs of allocated blocks) or Zeros (for runs of free blocks).
         let mut sections: Vec<CompactSection> = Vec::new();
         let mut total_allocated: u64 = 0;
 
@@ -2240,12 +2593,10 @@ impl<R: Read + Seek + Send> CompactExtReader<R> {
             let (bitmap_block, flags) = gd_infos[group];
 
             if flags & BG_BLOCK_UNINIT != 0 {
-                // All blocks in this group are free
                 sections.push(CompactSection::Zeros(group_block_count * block_size));
                 continue;
             }
 
-            // Read the block bitmap
             reader.seek(SeekFrom::Start(
                 partition_offset + bitmap_block * block_size,
             ))?;
@@ -2254,12 +2605,10 @@ impl<R: Read + Seek + Send> CompactExtReader<R> {
 
             let bm = BitmapReader::new(&bitmap_data, group_block_count);
 
-            // Build runs of allocated/free blocks
             let mut block_idx: u64 = 0;
             while block_idx < group_block_count {
                 let is_set = bm.is_bit_set(block_idx);
 
-                // Find the end of this run
                 let mut run_end = block_idx + 1;
                 while run_end < group_block_count && bm.is_bit_set(run_end) == is_set {
                     run_end += 1;
@@ -2267,14 +2616,12 @@ impl<R: Read + Seek + Send> CompactExtReader<R> {
                 let run_len = run_end - block_idx;
 
                 if is_set {
-                    // Allocated blocks — map from source
                     let old_blocks: Vec<u64> = (block_idx..run_end)
                         .map(|bi| group_start_block + bi)
                         .collect();
                     total_allocated += run_len;
                     sections.push(CompactSection::MappedBlocks { old_blocks });
                 } else {
-                    // Free blocks — emit zeros
                     sections.push(CompactSection::Zeros(run_len * block_size));
                 }
 
@@ -2283,14 +2630,13 @@ impl<R: Read + Seek + Send> CompactExtReader<R> {
         }
 
         let original_size = total_blocks * block_size;
-        let compacted_size = original_size; // Same logical size, but zeros compress well
-                                            // data_size: only allocated blocks require disk reads.
+        let compacted_size = original_size;
         let data_size = total_allocated * block_size;
 
         let layout = CompactLayout {
             sections,
             block_size: block_size as usize,
-            source_data_start: 0, // ext block numbers are partition-relative
+            source_data_start: 0,
             source_partition_offset: partition_offset,
         };
 
@@ -3134,5 +3480,275 @@ mod tests {
 
         // Should have 1 bitmap
         assert_eq!(meta.block_bitmaps.len(), 1);
+    }
+
+    // ---- Packed compact reader tests ----
+
+    #[test]
+    fn test_packed_reader_produces_smaller_output() {
+        let image = make_two_group_image_with_inodes();
+        let original_len = image.len();
+        let cursor = Cursor::new(image);
+
+        let (mut reader, info) = CompactExtReader::new(cursor, 0).unwrap();
+
+        // Original size should be the full 2-group image
+        assert_eq!(info.original_size, original_len as u64);
+
+        // Compacted size should be 1 group (64 blocks * 4096 = 262144)
+        assert_eq!(
+            info.compacted_size,
+            64 * 4096,
+            "packed image should be 1 group"
+        );
+        assert!(
+            info.compacted_size < info.original_size,
+            "packed image should be smaller than original"
+        );
+
+        // Read the full packed output
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).unwrap();
+        assert_eq!(output.len(), info.compacted_size as usize);
+    }
+
+    #[test]
+    fn test_packed_reader_has_valid_superblock() {
+        let image = make_two_group_image_with_inodes();
+        let cursor = Cursor::new(image);
+
+        let (mut reader, _info) = CompactExtReader::new(cursor, 0).unwrap();
+
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).unwrap();
+
+        // Superblock at offset 1024 should have valid magic
+        let magic = u16::from_le_bytes([output[1024 + 0x38], output[1024 + 0x39]]);
+        assert_eq!(magic, EXT_MAGIC, "superblock should have valid magic");
+
+        // s_blocks_count should reflect shrunken size (64 blocks)
+        let blocks = le32(&output, 1024 + 0x04) as u64;
+        assert_eq!(blocks, 64, "superblock should show 64 blocks");
+    }
+
+    #[test]
+    fn test_packed_reader_preserves_inode_data() {
+        let image = make_two_group_image_with_inodes();
+        let block_size = 4096;
+        let inode_size = 256;
+
+        // Remember what block 72 contained (this is what inode 12 points to)
+        let original_data_at_72 = image[72 * block_size..(72 + 1) * block_size].to_vec();
+
+        let cursor = Cursor::new(image);
+        let (mut reader, _info) = CompactExtReader::new(cursor, 0).unwrap();
+
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).unwrap();
+
+        // Find where inode 12's data was relocated to
+        // Inode 12 is at index 11 in the inode table (block 4)
+        let inode_table_off = 4 * block_size;
+        let file_inode_off = inode_table_off + 11 * inode_size;
+        let new_block = le32(&output, file_inode_off + 0x28) as u64;
+
+        // The block pointer should be within group 0 (< 64)
+        assert!(
+            new_block < 64 && new_block >= 5,
+            "inode 12's block should be relocated to group 0, got {new_block}"
+        );
+
+        // The data at the new block location should match the original data at block 72
+        let new_data_start = new_block as usize * block_size;
+        let new_data_end = new_data_start + block_size;
+        assert_eq!(
+            &output[new_data_start..new_data_end],
+            &original_data_at_72,
+            "relocated data should match original"
+        );
+    }
+
+    #[test]
+    fn test_single_group_uses_layout_preserving() {
+        // Single-group image should use layout-preserving (no shrink possible)
+        let image = make_test_image();
+        let total_size = image.len();
+        let cursor = Cursor::new(image);
+
+        let (_reader, info) = CompactExtReader::new(cursor, 0).unwrap();
+
+        // compacted_size should equal original_size (layout-preserving)
+        assert_eq!(info.compacted_size, total_size as u64);
+        assert_eq!(info.original_size, total_size as u64);
+    }
+
+    // ---- Resize tests ----
+
+    #[test]
+    fn test_resize_grow() {
+        let image = make_test_image();
+        let block_size = 4096u64;
+        let mut data = image;
+
+        // Grow from 32768 blocks to 40000 blocks
+        let new_size = 40000 * block_size;
+        data.resize(new_size as usize, 0);
+
+        let mut cursor = Cursor::new(data);
+        let mut logs = Vec::new();
+        resize_ext_in_place(&mut cursor, 0, new_size, &mut |msg| {
+            logs.push(msg.to_string())
+        })
+        .unwrap();
+
+        // Verify superblock was updated
+        let data = cursor.into_inner();
+        let new_blocks = le32(&data, 1024 + 0x04) as u64;
+        assert_eq!(new_blocks, 40000);
+
+        let new_free = le32(&data, 1024 + 0x0C) as u64;
+        // SB s_free_blocks_count was 0 (not set in test image), added 7232
+        assert_eq!(new_free, 7232);
+
+        assert!(logs.iter().any(|l| l.contains("growing")));
+    }
+
+    #[test]
+    fn test_resize_shrink() {
+        let image = make_test_image();
+        let block_size = 4096u64;
+        let mut data = image;
+
+        // Shrink from 32768 blocks to 16384 blocks
+        let new_size = 16384 * block_size;
+
+        let mut cursor = Cursor::new(data);
+        let mut logs = Vec::new();
+        resize_ext_in_place(&mut cursor, 0, new_size, &mut |msg| {
+            logs.push(msg.to_string())
+        })
+        .unwrap();
+
+        let data = cursor.into_inner();
+        let new_blocks = le32(&data, 1024 + 0x04) as u64;
+        assert_eq!(new_blocks, 16384);
+
+        // Free blocks should decrease: 100 - (32768 - 16384) = 0 (saturating)
+        let new_free = le32(&data, 1024 + 0x0C) as u64;
+        assert_eq!(new_free, 0); // saturating_sub
+
+        assert!(logs.iter().any(|l| l.contains("shrinking")));
+    }
+
+    #[test]
+    fn test_resize_no_change() {
+        let image = make_test_image();
+        let block_size = 4096u64;
+        let current_size = 32768 * block_size;
+
+        let mut cursor = Cursor::new(image);
+        let mut logs = Vec::new();
+        resize_ext_in_place(&mut cursor, 0, current_size, &mut |msg| {
+            logs.push(msg.to_string())
+        })
+        .unwrap();
+
+        assert!(logs.iter().any(|l| l.contains("unchanged")));
+    }
+
+    // ---- End-to-end: packed backup → restore to exact size ----
+
+    #[test]
+    fn test_packed_backup_restore_round_trip() {
+        let image = make_two_group_image_with_inodes();
+        let block_size = 4096usize;
+        let inode_size = 256;
+
+        // Remember original data at block 72 (will be relocated)
+        let original_data_72 = image[72 * block_size..(73) * block_size].to_vec();
+
+        // Step 1: Create packed backup
+        let cursor = Cursor::new(image);
+        let (mut reader, info) = CompactExtReader::new(cursor, 0).unwrap();
+        assert!(info.compacted_size < info.original_size, "should be packed");
+
+        let mut packed = Vec::new();
+        reader.read_to_end(&mut packed).unwrap();
+        assert_eq!(packed.len(), info.compacted_size as usize);
+
+        // Step 2: "Restore" — write packed image to a target partition
+        // Target is exactly the packed size
+        let mut target = packed.clone();
+
+        // Step 3: Resize (should be no-op since SB already matches)
+        let mut cursor = Cursor::new(&mut target[..]);
+        let mut logs = Vec::new();
+        resize_ext_in_place(&mut cursor, 0, info.compacted_size, &mut |msg| {
+            logs.push(msg.to_string())
+        })
+        .unwrap();
+        assert!(
+            logs.iter().any(|l| l.contains("unchanged")),
+            "resize should be no-op for exact-fit"
+        );
+
+        // Step 4: Verify the restored image
+        // Superblock is valid
+        let magic = u16::from_le_bytes([target[1024 + 0x38], target[1024 + 0x39]]);
+        assert_eq!(magic, EXT_MAGIC);
+
+        // Block count matches packed size
+        let blocks = le32(&target, 1024 + 0x04) as u64;
+        assert_eq!(blocks * block_size as u64, info.compacted_size);
+
+        // Inode 12's data is accessible at its relocated block
+        let file_inode_off = 4 * block_size + 11 * inode_size;
+        let data_block = le32(&target, file_inode_off + 0x28) as u64;
+        assert!(data_block < 64, "block should be in group 0");
+
+        let data_start = data_block as usize * block_size;
+        assert_eq!(
+            &target[data_start..data_start + block_size],
+            &original_data_72,
+            "file data should match original"
+        );
+    }
+
+    #[test]
+    fn test_packed_backup_restore_to_larger_partition() {
+        let image = make_two_group_image_with_inodes();
+        let block_size = 4096usize;
+
+        // Step 1: Create packed backup
+        let cursor = Cursor::new(image);
+        let (mut reader, info) = CompactExtReader::new(cursor, 0).unwrap();
+
+        let mut packed = Vec::new();
+        reader.read_to_end(&mut packed).unwrap();
+
+        // Step 2: "Restore" to a larger partition (2x size)
+        let target_size = info.compacted_size as usize * 2;
+        let mut target = packed.clone();
+        target.resize(target_size, 0); // zero-fill the rest
+
+        // Step 3: Resize to match larger partition
+        let mut cursor = Cursor::new(&mut target[..]);
+        let mut logs = Vec::new();
+        resize_ext_in_place(&mut cursor, 0, target_size as u64, &mut |msg| {
+            logs.push(msg.to_string())
+        })
+        .unwrap();
+        assert!(
+            logs.iter().any(|l| l.contains("growing")),
+            "should grow to fill larger partition"
+        );
+
+        // Verify superblock reflects the larger size
+        let new_blocks = le32(&target, 1024 + 0x04) as u64;
+        assert_eq!(new_blocks, target_size as u64 / block_size as u64);
+
+        // Free blocks should include the additional space
+        let free = le32(&target, 1024 + 0x0C) as u64;
+        assert!(free > 0, "should have free blocks from the extra space");
     }
 }
