@@ -345,6 +345,62 @@ pub fn reconstruct_disk_from_backup(
         // fallback for old backups that lack the `extended_container` field.
         ebr_result =
             crate::restore::build_restore_ebr_chain(metadata, partition_sizes, Some(&mbr_buf));
+
+        // Patch the MBR extended container entry's total_sectors to match the
+        // repacked EBR chain layout, then rewrite the MBR.
+        if let Some(ref result) = ebr_result {
+            let extended_start = result.extended_start_lba as u64;
+            // Find the last logical partition end to compute new container size
+            let last_end_lba = result
+                .logical_starts
+                .iter()
+                .filter_map(|(idx, start_lba)| {
+                    let size = partition_sizes
+                        .iter()
+                        .find(|ps| ps.index == *idx)
+                        .map(|ps| ps.export_size / 512)
+                        .or_else(|| {
+                            metadata
+                                .partitions
+                                .iter()
+                                .find(|pm| pm.index == *idx)
+                                .map(|pm| pm.original_size_bytes / 512)
+                        })?;
+                    Some(start_lba + size)
+                })
+                .max();
+
+            if let Some(end_lba) = last_end_lba {
+                let new_total_sectors = (end_lba - extended_start) as u32;
+                // Find and patch the extended container entry in the MBR
+                for i in 0..4 {
+                    let off = 446 + i * 16;
+                    let type_byte = mbr_buf[off + 4];
+                    if type_byte == 0x05 || type_byte == 0x0F || type_byte == 0x85 {
+                        let entry_start = u32::from_le_bytes([
+                            mbr_buf[off + 8],
+                            mbr_buf[off + 9],
+                            mbr_buf[off + 10],
+                            mbr_buf[off + 11],
+                        ]);
+                        if entry_start == extended_start as u32 {
+                            mbr_buf[off + 12..off + 16]
+                                .copy_from_slice(&new_total_sectors.to_le_bytes());
+                            log_cb(&format!(
+                                "Patched MBR extended container: total_sectors = {}",
+                                new_total_sectors,
+                            ));
+                            // Rewrite the MBR with the updated extended container
+                            writer.seek(SeekFrom::Start(0))?;
+                            writer
+                                .write_all(&mbr_buf)
+                                .context("failed to rewrite MBR with extended container patch")?;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Write EBR chain if present (for logical partitions in extended container)
@@ -366,7 +422,7 @@ pub fn reconstruct_disk_from_backup(
     // Helper: resolve effective start LBA for a partition, using EBR-recalculated
     // positions for logical partitions when the layout was compacted after a resize.
     let get_partition_lba = |pm: &crate::backup::metadata::PartitionMetadata| -> u64 {
-        if pm.is_logical {
+        if pm.is_logical || pm.index >= 4 {
             ebr_result
                 .as_ref()
                 .and_then(|r| {

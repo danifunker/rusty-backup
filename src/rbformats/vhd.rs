@@ -227,8 +227,21 @@ pub(crate) fn write_vhd(
     Ok(files)
 }
 
+/// Result of rebuilding the VHD EBR chain with repacked logical partitions.
+struct VhdEbrResult {
+    /// (byte_offset, 512-byte EBR sector) pairs.
+    ebr_sectors: Vec<(u64, [u8; 512])>,
+    /// Map from original start_lba to new start_lba for repacked logicals.
+    logical_remap: Vec<(u64, u64)>,
+    /// New total_sectors for the MBR extended container entry.
+    new_extended_total_sectors: u32,
+    /// The extended container start LBA.
+    extended_start_lba: u32,
+}
+
 /// Parse the source MBR and EBR chain, then build an updated EBR chain where
 /// logical partition sizes are replaced by the new sizes from `partition_sizes`.
+/// When any logical partition is resized, repacks them contiguously.
 ///
 /// Returns `None` if the source has no extended partition or its EBR cannot be
 /// parsed (non-fatal: the export continues without updated EBR in that case).
@@ -237,7 +250,7 @@ fn rebuild_vhd_ebr_chain(
     source: &mut (impl Read + Seek),
     partition_sizes: &[PartitionSizeOverride],
     log_cb: &mut impl FnMut(&str),
-) -> Option<Vec<(u64, [u8; 512])>> {
+) -> Option<VhdEbrResult> {
     // Find the extended container entry in the source MBR.
     let mbr = Mbr::parse(source_mbr).ok()?;
     let extended_entry = mbr
@@ -257,31 +270,68 @@ fn rebuild_vhd_ebr_chain(
         }
     };
 
-    // Build updated LogicalPartitionInfo entries: keep source positions and
-    // types, but apply new sector counts from partition_sizes where available.
-    let logical_infos: Vec<LogicalPartitionInfo> = source_logicals
-        .iter()
-        .map(|src| {
-            let new_sectors = partition_sizes
-                .iter()
-                .find(|ps| ps.start_lba == src.start_lba as u64)
-                .map(|ps| (ps.export_size / 512) as u32)
-                .unwrap_or(src.total_sectors);
-            LogicalPartitionInfo {
-                start_lba: src.start_lba,
-                total_sectors: new_sectors,
-                partition_type: src.partition_type,
-            }
-        })
-        .collect();
+    // Check if any logical partition is resized
+    let any_resized = source_logicals.iter().any(|src| {
+        partition_sizes
+            .iter()
+            .find(|ps| ps.start_lba == src.start_lba as u64)
+            .map(|ps| ps.export_size != src.total_sectors as u64 * 512)
+            .unwrap_or(false)
+    });
 
-    let chain = build_ebr_chain(extended_start_lba, &logical_infos);
+    // Build updated LogicalPartitionInfo entries.  When any logical is resized,
+    // repack them contiguously (first keeps position, rest packed with 1-sector
+    // EBR gap) — same algorithm as build_restore_ebr_chain in restore/mod.rs.
+    let mut logical_infos: Vec<LogicalPartitionInfo> = Vec::with_capacity(source_logicals.len());
+    let mut logical_remap: Vec<(u64, u64)> = Vec::with_capacity(source_logicals.len());
+    let mut next_lba: u32 = 0;
+
+    for (i, src) in source_logicals.iter().enumerate() {
+        let new_sectors = partition_sizes
+            .iter()
+            .find(|ps| ps.start_lba == src.start_lba as u64)
+            .map(|ps| (ps.export_size / 512) as u32)
+            .unwrap_or(src.total_sectors);
+
+        let start_lba = if i == 0 {
+            // First logical: keep original position
+            src.start_lba
+        } else if any_resized {
+            // Pack right after previous partition, leaving 1 sector for EBR
+            next_lba + 1
+        } else {
+            src.start_lba
+        };
+
+        next_lba = start_lba + new_sectors;
+
+        if start_lba != src.start_lba {
+            logical_remap.push((src.start_lba as u64, start_lba as u64));
+        }
+
+        logical_infos.push(LogicalPartitionInfo {
+            start_lba,
+            total_sectors: new_sectors,
+            partition_type: src.partition_type,
+        });
+    }
+
+    let last_end_lba = next_lba;
+    let new_extended_total_sectors = last_end_lba - extended_start_lba;
+
+    let ebr_sectors = build_ebr_chain(extended_start_lba, &logical_infos);
     log_cb(&format!(
-        "Rebuilt {} EBR sector(s) for logical partitions (extended container at LBA {})",
-        chain.len(),
+        "Rebuilt {} EBR sector(s) for logical partitions (extended container at LBA {}, new total_sectors {})",
+        ebr_sectors.len(),
         extended_start_lba,
+        new_extended_total_sectors,
     ));
-    Some(chain)
+    Some(VhdEbrResult {
+        ebr_sectors,
+        logical_remap,
+        new_extended_total_sectors,
+        extended_start_lba,
+    })
 }
 
 /// Export a whole disk image as a Fixed VHD file.
@@ -404,48 +454,114 @@ pub fn export_whole_disk_vhd(
                 .read_exact(&mut mbr_buf)
                 .context("failed to read MBR from source")?;
             patch_mbr_entries(&mut mbr_buf, partition_sizes);
+
+            // Build repacked EBR chain before writing so we know new positions.
+            let ebr_result =
+                rebuild_vhd_ebr_chain(&mbr_buf, &mut reader, partition_sizes, &mut log_cb);
+
+            // Build a remap from original start_lba to new start_lba for logicals.
+            let logical_remap: std::collections::HashMap<u64, u64> = ebr_result
+                .as_ref()
+                .map(|r| r.logical_remap.iter().copied().collect())
+                .unwrap_or_default();
+
+            // Patch extended container entry in MBR if logicals were repacked.
+            if let Some(ref ebr) = ebr_result {
+                let ext_start = ebr.extended_start_lba;
+                let new_total = ebr.new_extended_total_sectors;
+                for i in 0..4 {
+                    let off = 446 + i * 16;
+                    let type_byte = mbr_buf[off + 4];
+                    if type_byte == 0x05 || type_byte == 0x0F || type_byte == 0x85 {
+                        let entry_start = u32::from_le_bytes([
+                            mbr_buf[off + 8],
+                            mbr_buf[off + 9],
+                            mbr_buf[off + 10],
+                            mbr_buf[off + 11],
+                        ]);
+                        if entry_start == ext_start {
+                            mbr_buf[off + 12..off + 16].copy_from_slice(&new_total.to_le_bytes());
+                            log_cb(&format!(
+                                "Patched MBR extended container: total_sectors = {}",
+                                new_total,
+                            ));
+                            break;
+                        }
+                    }
+                }
+            }
+
             writer
                 .write_all(&mbr_buf)
                 .context("failed to write patched MBR")?;
             total_written += 512;
             log_cb("Patched MBR partition table with export sizes");
 
-            // Sort partitions by start offset
-            let mut sorted_parts: Vec<&PartitionSizeOverride> = partition_sizes.iter().collect();
-            sorted_parts.sort_by_key(|p| p.start_lba);
+            // Build sorted partition list with remapped positions for logicals.
+            struct PartWrite {
+                source_lba: u64,
+                dest_lba: u64,
+                export_size: u64,
+                original_size: u64,
+                index: usize,
+            }
+            let mut sorted_parts: Vec<PartWrite> = partition_sizes
+                .iter()
+                .map(|ps| {
+                    let dest_lba = logical_remap
+                        .get(&ps.start_lba)
+                        .copied()
+                        .unwrap_or(ps.start_lba);
+                    PartWrite {
+                        source_lba: ps.start_lba,
+                        dest_lba,
+                        export_size: ps.export_size,
+                        original_size: ps.original_size,
+                        index: ps.index,
+                    }
+                })
+                .collect();
+            sorted_parts.sort_by_key(|p| p.dest_lba);
 
-            for ps in &sorted_parts {
+            for pw in &sorted_parts {
                 if cancel_check() {
                     bail!("export cancelled");
                 }
 
-                let part_offset = ps.start_lba * 512;
+                let dest_offset = pw.dest_lba * 512;
+                let source_offset = pw.source_lba * 512;
 
-                // Copy everything from current position to this partition's start
-                if total_written < part_offset {
-                    let gap = part_offset - total_written;
-                    reader.seek(SeekFrom::Start(total_written))?;
-                    let mut gap_reader = (&mut reader).take(gap);
-                    let mut gap_remaining = gap;
-                    while gap_remaining > 0 {
-                        let to_read = (gap_remaining as usize).min(CHUNK_SIZE);
-                        let n = gap_reader.read(&mut buf[..to_read])?;
-                        if n == 0 {
-                            // Source ended early, fill remainder with zeros
-                            write_zeros(&mut writer, gap_remaining)?;
-                            total_written += gap_remaining;
-                            break;
+                // Fill gap between current position and this partition's dest
+                if total_written < dest_offset {
+                    let gap = dest_offset - total_written;
+                    if pw.source_lba == pw.dest_lba {
+                        // Not remapped: copy source data for the gap
+                        reader.seek(SeekFrom::Start(total_written))?;
+                        let mut gap_reader = (&mut reader).take(gap);
+                        let mut gap_remaining = gap;
+                        while gap_remaining > 0 {
+                            let to_read = (gap_remaining as usize).min(CHUNK_SIZE);
+                            let n = gap_reader.read(&mut buf[..to_read])?;
+                            if n == 0 {
+                                write_zeros(&mut writer, gap_remaining)?;
+                                total_written += gap_remaining;
+                                break;
+                            }
+                            writer.write_all(&buf[..n])?;
+                            total_written += n as u64;
+                            gap_remaining -= n as u64;
+                            progress_cb(total_written);
                         }
-                        writer.write_all(&buf[..n])?;
-                        total_written += n as u64;
-                        gap_remaining -= n as u64;
-                        progress_cb(total_written);
+                    } else {
+                        // Remapped: zero-fill the gap (no meaningful source data)
+                        write_zeros(&mut writer, gap)?;
+                        total_written += gap;
                     }
                 }
 
-                // Write partition data (limited to export_size)
-                reader.seek(SeekFrom::Start(part_offset))?;
-                let copy_size = ps.export_size.min(ps.original_size);
+                // Write partition data (read from source position, write at dest)
+                reader.seek(SeekFrom::Start(source_offset))?;
+                let copy_size = pw.export_size.min(pw.original_size);
                 let mut part_reader = (&mut reader).take(copy_size);
                 let mut part_remaining = copy_size;
                 while part_remaining > 0 {
@@ -464,8 +580,8 @@ pub fn export_whole_disk_vhd(
                 }
 
                 // If export_size > data copied (e.g. original), pad
-                if ps.export_size > copy_size {
-                    let pad = ps.export_size - copy_size;
+                if pw.export_size > copy_size {
+                    let pad = pw.export_size - copy_size;
                     write_zeros(&mut writer, pad)?;
                     total_written += pad;
                 }
@@ -476,93 +592,102 @@ pub fn export_whole_disk_vhd(
                     let end_pos = total_written;
                     patch_bpb_hidden_sectors(
                         writer.get_mut(),
-                        part_offset,
-                        ps.start_lba,
+                        dest_offset,
+                        pw.dest_lba,
                         &mut log_cb,
                     )?;
                     patch_ntfs_hidden_sectors(
                         writer.get_mut(),
-                        part_offset,
-                        ps.start_lba,
+                        dest_offset,
+                        pw.dest_lba,
                         &mut log_cb,
                     )?;
                     patch_exfat_hidden_sectors(
                         writer.get_mut(),
-                        part_offset,
-                        ps.start_lba,
+                        dest_offset,
+                        pw.dest_lba,
                         &mut log_cb,
                     )?;
                     patch_hfs_hidden_sectors(
                         writer.get_mut(),
-                        part_offset,
-                        ps.start_lba,
+                        dest_offset,
+                        pw.dest_lba,
                         &mut log_cb,
                     )?;
                     patch_hfsplus_hidden_sectors(
                         writer.get_mut(),
-                        part_offset,
-                        ps.start_lba,
+                        dest_offset,
+                        pw.dest_lba,
                         &mut log_cb,
                     )?;
                     writer.seek(SeekFrom::Start(end_pos))?;
                 }
 
                 // Resize filesystem if the partition size changed
-                if ps.export_size != ps.original_size {
+                if pw.export_size != pw.original_size {
                     writer.flush()?;
                     let end_pos = total_written;
-                    let new_sectors = (ps.export_size / 512) as u32;
-                    let new_sectors_u64 = ps.export_size / 512;
-                    resize_fat_in_place(writer.get_mut(), part_offset, new_sectors, &mut log_cb)?;
+                    let new_sectors = (pw.export_size / 512) as u32;
+                    let new_sectors_u64 = pw.export_size / 512;
+                    resize_fat_in_place(writer.get_mut(), dest_offset, new_sectors, &mut log_cb)?;
                     resize_ntfs_in_place(
                         writer.get_mut(),
-                        part_offset,
+                        dest_offset,
                         new_sectors_u64,
                         &mut log_cb,
                     )?;
                     resize_exfat_in_place(
                         writer.get_mut(),
-                        part_offset,
+                        dest_offset,
                         new_sectors_u64,
                         &mut log_cb,
                     )?;
                     resize_hfs_in_place(
                         writer.get_mut(),
-                        part_offset,
-                        ps.export_size,
+                        dest_offset,
+                        pw.export_size,
                         &mut log_cb,
                     )?;
                     resize_hfsplus_in_place(
                         writer.get_mut(),
-                        part_offset,
-                        ps.export_size,
+                        dest_offset,
+                        pw.export_size,
                         &mut log_cb,
                     )?;
                     resize_ext_in_place(
                         writer.get_mut(),
-                        part_offset,
-                        ps.export_size,
+                        dest_offset,
+                        pw.export_size,
                         &mut log_cb,
                     )?;
                     resize_btrfs_in_place(
                         writer.get_mut(),
-                        part_offset,
-                        ps.export_size,
+                        dest_offset,
+                        pw.export_size,
                         &mut log_cb,
                     )?;
                     writer.seek(SeekFrom::Start(end_pos))?;
                 }
 
                 log_cb(&format!(
-                    "partition-{}: exported {} bytes",
-                    ps.index, ps.export_size,
+                    "partition-{}: exported {} bytes at LBA {}",
+                    pw.index, pw.export_size, pw.dest_lba,
                 ));
             }
 
-            // Copy any remaining data after the last partition up to source end
-            if total_written < source_data_size {
+            // Compute the actual data end: max of all partition ends.
+            let new_data_end = sorted_parts
+                .iter()
+                .map(|pw| pw.dest_lba * 512 + pw.export_size)
+                .max()
+                .unwrap_or(total_written);
+            let effective_source_end = source_data_size.min(new_data_end);
+
+            // Copy any remaining data after the last partition up to the
+            // effective end (truncated when logicals were repacked).
+            if total_written < effective_source_end {
                 reader.seek(SeekFrom::Start(total_written))?;
-                let remaining = source_data_size - total_written;
+                let remaining = effective_source_end - total_written;
                 let mut tail_reader = (&mut reader).take(remaining);
                 loop {
                     if cancel_check() {
@@ -578,21 +703,13 @@ pub fn export_whole_disk_vhd(
                 }
             }
 
-            // Rebuild the EBR chain with updated logical partition sizes.
-            // The gap copy above brought the original EBR sectors from the
-            // source into the output; overwrite them with corrected entries
-            // so that any resized logical partitions are reflected in the EBR.
-            if let Some(ebr_chain) =
-                rebuild_vhd_ebr_chain(&mbr_buf, &mut reader, partition_sizes, &mut log_cb)
-            {
-                for (ebr_offset, ebr_sector) in &ebr_chain {
-                    // BufWriter::seek flushes its buffer before seeking, so
-                    // this is safe to call directly on the BufWriter.
+            // Write the rebuilt EBR chain sectors into the output.
+            if let Some(ref ebr) = ebr_result {
+                for (ebr_offset, ebr_sector) in &ebr.ebr_sectors {
                     writer.seek(SeekFrom::Start(*ebr_offset))?;
                     writer.write_all(ebr_sector)?;
                 }
-                // Restore the write position to the end of the data region
-                // so the footer is appended at the correct offset.
+                // Restore write position to data end for the footer.
                 writer.seek(SeekFrom::Start(total_written))?;
             }
         }

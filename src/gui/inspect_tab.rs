@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -1233,16 +1233,24 @@ impl InspectTab {
             self.partitions = meta
                 .partitions
                 .iter()
-                .map(|p| PartitionInfo {
-                    index: p.index,
-                    type_name: p.type_name.clone(),
-                    partition_type_byte: 0,
-                    start_lba: p.start_lba,
-                    size_bytes: p.original_size_bytes,
-                    bootable: false,
-                    is_logical: p.is_logical,
-                    is_extended_container: false,
-                    partition_type_string: p.partition_type_string.clone(),
+                .map(|p| {
+                    // Use stored type byte, or infer from type_name for old backups
+                    let ptype = if p.partition_type_byte != 0 {
+                        p.partition_type_byte
+                    } else {
+                        infer_fat_type_byte(&p.type_name)
+                    };
+                    PartitionInfo {
+                        index: p.index,
+                        type_name: p.type_name.clone(),
+                        partition_type_byte: ptype,
+                        start_lba: p.start_lba,
+                        size_bytes: p.original_size_bytes,
+                        bootable: false,
+                        is_logical: p.is_logical,
+                        is_extended_container: false,
+                        partition_type_string: p.partition_type_string.clone(),
+                    }
                 })
                 .collect();
         }
@@ -1257,22 +1265,40 @@ impl InspectTab {
             None => return,
         };
 
-        // Check if there's an extended container but no logical partitions
-        // were parsed (expected since mbr.bin has no EBR data).
-        let has_container = self.partitions.iter().any(|p| p.is_extended_container);
+        // Only merge if we don't already have logical partitions from MBR
+        // parsing. (mbr.bin is 512 bytes and can't contain the EBR chain,
+        // so logicals need to come from metadata.)
         let has_logicals = self.partitions.iter().any(|p| p.is_logical);
-        if !has_container || has_logicals {
+        if has_logicals {
             return;
         }
 
-        // Add logical partitions from metadata (tagged is_logical in backup metadata)
+        // Also check that metadata actually has partitions we're missing
+        let existing_indices: HashSet<usize> = self.partitions.iter().map(|p| p.index).collect();
+        let meta_has_extra = meta
+            .partitions
+            .iter()
+            .any(|pm| !existing_indices.contains(&pm.index));
+        if !meta_has_extra {
+            return;
+        }
+
+        // Add logical partitions from metadata.
+        // Tagged as is_logical in newer backups; for older backups that lack
+        // the field, detect by index >= 4 (MBR primary entries are 0-3).
         let mut added = 0;
         for pm in &meta.partitions {
-            if pm.is_logical {
+            let is_logical = pm.is_logical || pm.index >= 4;
+            if is_logical && !existing_indices.contains(&pm.index) {
+                let ptype = if pm.partition_type_byte != 0 {
+                    pm.partition_type_byte
+                } else {
+                    infer_fat_type_byte(&pm.type_name)
+                };
                 self.partitions.push(PartitionInfo {
                     index: pm.index,
                     type_name: pm.type_name.clone(),
-                    partition_type_byte: pm.partition_type_byte,
+                    partition_type_byte: ptype,
                     start_lba: pm.start_lba,
                     size_bytes: pm.original_size_bytes,
                     bootable: false,
@@ -2413,6 +2439,14 @@ fn infer_fat_type_byte(name: &str) -> u8 {
         0x01 // FAT12
     } else if lower.contains("fat") {
         0x0C // Default to FAT32 LBA
+    } else if lower.contains("ntfs") {
+        0x07
+    } else if lower.contains("exfat") {
+        0x07
+    } else if lower.contains("linux") || lower.contains("ext") {
+        0x83
+    } else if lower.contains("hfs") {
+        0xAF
     } else {
         0
     }

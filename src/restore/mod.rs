@@ -582,10 +582,11 @@ pub fn build_restore_ebr_chain(
     };
 
     // Collect logical partitions sorted by original start_lba.
+    // Old metadata may lack is_logical; treat index >= 4 as logical (MBR convention).
     let mut logical_pms: Vec<&crate::backup::metadata::PartitionMetadata> = metadata
         .partitions
         .iter()
-        .filter(|pm| pm.is_logical)
+        .filter(|pm| pm.is_logical || pm.index >= 4)
         .collect();
 
     if logical_pms.is_empty() {
@@ -628,10 +629,15 @@ pub fn build_restore_ebr_chain(
 
         next_lba = start_lba + new_size_sectors;
         logical_starts.push((pm.index, start_lba as u64));
+        let ptype = if pm.partition_type_byte != 0 {
+            pm.partition_type_byte
+        } else {
+            infer_partition_type_byte(&pm.type_name)
+        };
         logical_infos.push(LogicalPartitionInfo {
             start_lba,
             total_sectors: new_size_sectors,
-            partition_type: pm.partition_type_byte,
+            partition_type: ptype,
         });
     }
 
@@ -641,6 +647,27 @@ pub fn build_restore_ebr_chain(
         ebr_sectors,
         logical_starts,
     })
+}
+
+/// Infer MBR partition type byte from a human-readable type name.
+/// Used as a fallback for old backup metadata that lacks `partition_type_byte`.
+fn infer_partition_type_byte(name: &str) -> u8 {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("fat32") {
+        0x0C
+    } else if lower.contains("fat16") {
+        0x06
+    } else if lower.contains("fat12") {
+        0x01
+    } else if lower.contains("fat") {
+        0x0C
+    } else if lower.contains("ntfs") || lower.contains("exfat") {
+        0x07
+    } else if lower.contains("linux") || lower.contains("ext") {
+        0x83
+    } else {
+        0x06 // safe default
+    }
 }
 
 /// Main restore orchestrator. Runs on a background thread.
