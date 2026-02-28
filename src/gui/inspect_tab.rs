@@ -68,6 +68,11 @@ pub struct InspectTab {
     cache_status: Option<Arc<Mutex<CacheStatus>>>,
     /// Background disk inspect status (physical device paths)
     inspect_status: Option<Arc<Mutex<InspectStatus>>>,
+    /// Open device file reused by BrowseView (avoids re-open / re-prompt).
+    /// Wrapping in Arc lets BrowseView call try_clone() for each open_fs() call.
+    open_device_file: Option<Arc<File>>,
+    /// Guard that keeps the DiskClaim (and any temp file) alive while browsing.
+    open_device_guard: Option<rusty_backup::os::TempFileGuard>,
 }
 
 /// Status of a background VHD export operation.
@@ -121,6 +126,12 @@ struct InspectStatus {
     alignment: Option<PartitionAlignment>,
     partitions: Vec<PartitionInfo>,
     partition_min_sizes: HashMap<usize, u64>,
+    /// The open device file handle, passed back to the main thread so
+    /// that BrowseView can reuse it without re-opening (and re-prompting).
+    device_file: Option<File>,
+    /// The TempFileGuard that holds the DiskClaim / temp file alive.
+    /// Kept here so the main thread can decide when to release it.
+    device_guard: Option<rusty_backup::os::TempFileGuard>,
 }
 
 /// Status of a background seekable cache creation (native zstd backups).
@@ -168,6 +179,8 @@ impl Default for InspectTab {
             seekable_cache_files: HashMap::new(),
             cache_status: None,
             inspect_status: None,
+            open_device_file: None,
+            open_device_guard: None,
         }
     }
 }
@@ -1048,6 +1061,12 @@ impl InspectTab {
                 self.alignment = status.alignment.take();
                 self.partitions = std::mem::take(&mut status.partitions);
                 self.partition_min_sizes = std::mem::take(&mut status.partition_min_sizes);
+                // Capture the open device fd + guard so BrowseView can reuse
+                // it without re-opening (and without another auth dialog).
+                if let Some(f) = status.device_file.take() {
+                    self.open_device_file = Some(Arc::new(f));
+                }
+                self.open_device_guard = status.device_guard.take();
             }
             drop(status);
             self.inspect_status = None;
@@ -1102,6 +1121,9 @@ impl InspectTab {
         self.seekable_cache_files.clear();
         self.cache_status = None;
         self.inspect_status = None;
+        // Release the open device fd and disk claim (remounts the disk).
+        self.open_device_file = None;
+        self.open_device_guard = None;
     }
 
     fn load_backup_metadata(&mut self, log: &mut LogPanel) {
@@ -1295,6 +1317,8 @@ impl InspectTab {
             alignment: None,
             partitions: Vec::new(),
             partition_min_sizes: HashMap::new(),
+            device_file: None,
+            device_guard: None,
         }));
         self.inspect_status = Some(Arc::clone(&status));
 
@@ -1317,18 +1341,18 @@ impl InspectTab {
                 }
             };
 
-            // Open the device/file for read-only inspection.
-            // Inspect is non-destructive, so we do NOT unmount or claim the
-            // disk — that would pop a DA authorization dialog unnecessarily.
-            // open_for_inspect tries a direct O_RDONLY first; on EPERM it
-            // escalates via authopen (one dialog, cached for ~5 min).
-            let device_file = match rusty_backup::os::open_for_inspect(&path) {
-                Ok(f) => f,
+            // Open the device/file with full elevation: unmounts volumes and
+            // claims exclusive DA access for the duration of the inspect.
+            let elevated = match rusty_backup::os::open_source_for_reading(&path) {
+                Ok(e) => e,
                 Err(e) => {
                     finish_err(format!("Cannot open {}: {e}", path.display()));
                     return;
                 }
             };
+            // Decompose into file + guard (keeps DiskClaim alive until we
+            // explicitly drop it by storing/releasing from the main thread).
+            let (device_file, guard) = elevated.into_parts();
 
             set_step("Reading partition table...");
 
@@ -1455,12 +1479,16 @@ impl InspectTab {
                         }
                     }
 
-                    // Write results and signal completion
+                    // Write results and signal completion.
+                    // Move device_file and guard into status so the main thread
+                    // can reuse the open fd for BrowseView without re-prompting.
                     if let Ok(mut s) = status.lock() {
                         s.partition_table = Some(table);
                         s.alignment = Some(alignment);
                         s.partitions = partitions;
                         s.partition_min_sizes = partition_min_sizes;
+                        s.device_file = Some(device_file);
+                        s.device_guard = Some(guard);
                         s.finished = true;
                     }
                 }
@@ -1870,8 +1898,17 @@ impl InspectTab {
                 path.display(),
                 offset,
             ));
+            // For device paths, reuse the fd that was opened during inspect
+            // (already elevated) so we never need to re-open or re-prompt.
+            let preopen = if path.to_string_lossy().starts_with("/dev/") {
+                self.open_device_file
+                    .as_ref()
+                    .and_then(|arc| arc.try_clone().ok())
+            } else {
+                None
+            };
             self.browse_view
-                .open(path, offset, ptype, partition_type_string);
+                .open(path, offset, ptype, partition_type_string, preopen);
             return;
         }
 
@@ -1943,7 +1980,7 @@ impl InspectTab {
                     part_index, data_file,
                 ));
                 self.browse_view
-                    .open(data_path, 0, ptype, partition_type_string.clone());
+                    .open(data_path, 0, ptype, partition_type_string.clone(), None);
             }
             "zstd" => {
                 // Zstd-compressed backup — open streaming immediately while
@@ -2098,7 +2135,7 @@ impl InspectTab {
                     part_index,
                 ));
                 self.browse_view
-                    .open(cache_path, 0, ptype, partition_type_string.clone());
+                    .open(cache_path, 0, ptype, partition_type_string.clone(), None);
                 return;
             }
             // Cache file was deleted (stale) — remove from map and recreate
