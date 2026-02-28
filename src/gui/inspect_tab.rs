@@ -1061,12 +1061,15 @@ impl InspectTab {
                 self.alignment = status.alignment.take();
                 self.partitions = std::mem::take(&mut status.partitions);
                 self.partition_min_sizes = std::mem::take(&mut status.partition_min_sizes);
-                // Capture the open device fd + guard so BrowseView can reuse
-                // it without re-opening (and without another auth dialog).
-                if let Some(f) = status.device_file.take() {
-                    self.open_device_file = Some(Arc::new(f));
+                // macOS only: capture the open device fd + guard so BrowseView
+                // can reuse it without re-opening (and without another auth dialog).
+                #[cfg(target_os = "macos")]
+                {
+                    if let Some(f) = status.device_file.take() {
+                        self.open_device_file = Some(Arc::new(f));
+                    }
+                    self.open_device_guard = status.device_guard.take();
                 }
-                self.open_device_guard = status.device_guard.take();
             }
             drop(status);
             self.inspect_status = None;
@@ -1480,15 +1483,18 @@ impl InspectTab {
                     }
 
                     // Write results and signal completion.
-                    // Move device_file and guard into status so the main thread
-                    // can reuse the open fd for BrowseView without re-prompting.
                     if let Ok(mut s) = status.lock() {
                         s.partition_table = Some(table);
                         s.alignment = Some(alignment);
                         s.partitions = partitions;
                         s.partition_min_sizes = partition_min_sizes;
-                        s.device_file = Some(device_file);
-                        s.device_guard = Some(guard);
+                        // On macOS, pass the open fd + claim to the main thread
+                        // so BrowseView can reuse it without re-opening/re-prompting.
+                        #[cfg(target_os = "macos")]
+                        {
+                            s.device_file = Some(device_file);
+                            s.device_guard = Some(guard);
+                        }
                         s.finished = true;
                     }
                 }
@@ -1898,8 +1904,10 @@ impl InspectTab {
                 path.display(),
                 offset,
             ));
-            // For device paths, reuse the fd that was opened during inspect
-            // (already elevated) so we never need to re-open or re-prompt.
+            // macOS only: reuse the fd opened during inspect so BrowseView
+            // never needs to re-open the raw device (which would re-prompt).
+            // On Linux/Windows the app runs as root, so File::open works fine.
+            #[cfg(target_os = "macos")]
             let preopen = if path.to_string_lossy().starts_with("/dev/") {
                 self.open_device_file
                     .as_ref()
@@ -1907,6 +1915,8 @@ impl InspectTab {
             } else {
                 None
             };
+            #[cfg(not(target_os = "macos"))]
+            let preopen = None;
             self.browse_view
                 .open(path, offset, ptype, partition_type_string, preopen);
             return;
