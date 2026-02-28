@@ -12,7 +12,7 @@ pub mod resource_fork;
 pub mod unix_common;
 pub mod zstd_stream;
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 pub use btrfs::{resize_btrfs_in_place, validate_btrfs_integrity, CompactBtrfsReader};
 pub use exfat::{
@@ -22,6 +22,9 @@ pub use ext::{resize_ext_in_place, validate_ext_integrity, CompactExtReader, Ext
 pub use fat::{
     patch_bpb_hidden_sectors, resize_fat_in_place, set_fat_clean_flags, validate_fat_integrity,
     CompactFatReader, CompactInfo,
+};
+pub use filesystem::{
+    CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, ResourceForkSource,
 };
 use filesystem::{Filesystem, FilesystemError};
 pub use hfs::{
@@ -487,6 +490,62 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
         _ => Err(FilesystemError::Unsupported(format!(
             "filesystem type 0x{:02X} not supported for browsing",
             partition_type
+        ))),
+    }
+}
+
+/// Open a filesystem for editing (read + write access).
+///
+/// Same dispatch logic as `open_filesystem` but requires a writable reader and
+/// returns a `Box<dyn EditableFilesystem>`. Currently only FAT is supported;
+/// other filesystems will be added in subsequent phases.
+pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
+    mut reader: R,
+    partition_offset: u64,
+    partition_type: u8,
+    partition_type_string: Option<&str>,
+) -> Result<Box<dyn EditableFilesystem>, FilesystemError> {
+    // Check string-based type first (APM partitions)
+    if let Some(type_str) = partition_type_string {
+        return Err(FilesystemError::Unsupported(format!(
+            "editing not yet supported for APM type '{type_str}'"
+        )));
+    }
+    match partition_type {
+        // Auto-detect (superfloppy / type byte 0)
+        0x00 => {
+            let fs_type = detect_filesystem_type(&mut reader, partition_offset);
+            match fs_type {
+                "fat" => Ok(Box::new(fat::FatFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                _ => Err(FilesystemError::Unsupported(format!(
+                    "editing not yet supported for filesystem type '{fs_type}'"
+                ))),
+            }
+        }
+        // FAT12
+        0x01 => Ok(Box::new(fat::FatFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
+        // FAT16
+        0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E => Ok(Box::new(fat::FatFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
+        // FAT32
+        0x0B | 0x0C | 0x1B | 0x1C => Ok(Box::new(fat::FatFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
+        // ProDOS — editing not supported
+        0xA8 => Err(FilesystemError::Unsupported(
+            "editing not supported for ProDOS".into(),
+        )),
+        _ => Err(FilesystemError::Unsupported(format!(
+            "editing not yet supported for filesystem type 0x{partition_type:02X}"
         ))),
     }
 }

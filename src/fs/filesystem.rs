@@ -1,5 +1,6 @@
 use std::fmt;
 use std::io::Write;
+use std::path::PathBuf;
 
 use super::entry::FileEntry;
 
@@ -75,6 +76,8 @@ pub enum FilesystemError {
     Parse(String),
     Unsupported(String),
     InvalidData(String),
+    AlreadyExists(String),
+    DiskFull(String),
 }
 
 impl fmt::Display for FilesystemError {
@@ -86,6 +89,8 @@ impl fmt::Display for FilesystemError {
             FilesystemError::Parse(msg) => write!(f, "parse error: {msg}"),
             FilesystemError::Unsupported(msg) => write!(f, "unsupported: {msg}"),
             FilesystemError::InvalidData(msg) => write!(f, "invalid data: {msg}"),
+            FilesystemError::AlreadyExists(p) => write!(f, "already exists: {p}"),
+            FilesystemError::DiskFull(msg) => write!(f, "disk full: {msg}"),
         }
     }
 }
@@ -96,4 +101,129 @@ impl From<std::io::Error> for FilesystemError {
     fn from(e: std::io::Error) -> Self {
         FilesystemError::Io(e)
     }
+}
+
+/// Options for creating a file on an editable filesystem.
+#[derive(Debug, Clone, Default)]
+pub struct CreateFileOptions {
+    /// Unix mode bits (default 0o100666). Ignored on FAT/exFAT.
+    pub mode: Option<u32>,
+    /// Unix user ID (default 0). Ignored on FAT/exFAT/NTFS.
+    pub uid: Option<u32>,
+    /// Unix group ID (default 0). Ignored on FAT/exFAT/NTFS.
+    pub gid: Option<u32>,
+    /// HFS/HFS+ type code (e.g. "TEXT"). Auto-detected from extension if not set.
+    pub type_code: Option<String>,
+    /// HFS/HFS+ creator code (e.g. "MSWD"). Auto-detected from extension if not set.
+    pub creator_code: Option<String>,
+    /// Optional resource fork data source (HFS/HFS+ only).
+    pub resource_fork: Option<ResourceForkSource>,
+}
+
+/// Options for creating a directory on an editable filesystem.
+#[derive(Debug, Clone, Default)]
+pub struct CreateDirectoryOptions {
+    /// Unix mode bits (default 0o40777). Ignored on FAT/exFAT.
+    pub mode: Option<u32>,
+    /// Unix user ID (default 0). Ignored on FAT/exFAT/NTFS.
+    pub uid: Option<u32>,
+    /// Unix group ID (default 0). Ignored on FAT/exFAT/NTFS.
+    pub gid: Option<u32>,
+}
+
+/// Source for resource fork data (HFS/HFS+ only).
+#[derive(Debug, Clone)]
+pub enum ResourceForkSource {
+    /// Read resource fork from a file on the host.
+    File(PathBuf),
+    /// Resource fork data provided directly.
+    Data(Vec<u8>),
+}
+
+/// Trait for filesystems that support write operations (add/delete files and folders).
+///
+/// Each method that modifies the filesystem should call `sync_metadata()` internally
+/// before returning to ensure on-disk consistency.
+pub trait EditableFilesystem: Filesystem {
+    /// Create a file in the given parent directory.
+    ///
+    /// `data` is a reader providing the file contents; `data_len` is the total size.
+    /// Returns the new file's entry.
+    fn create_file(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        data: &mut dyn std::io::Read,
+        data_len: u64,
+        options: &CreateFileOptions,
+    ) -> Result<FileEntry, FilesystemError>;
+
+    /// Create a subdirectory in the given parent directory.
+    fn create_directory(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        options: &CreateDirectoryOptions,
+    ) -> Result<FileEntry, FilesystemError>;
+
+    /// Delete a file, empty directory, or symlink.
+    ///
+    /// Returns an error if the entry is a non-empty directory.
+    fn delete_entry(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+    ) -> Result<(), FilesystemError>;
+
+    /// Recursively delete a directory and all its contents.
+    ///
+    /// Default implementation lists children, recurses, then calls `delete_entry`.
+    fn delete_recursive(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+    ) -> Result<(), FilesystemError> {
+        if entry.is_directory() {
+            let children = self.list_directory(entry)?;
+            for child in &children {
+                if child.is_directory() {
+                    self.delete_recursive(entry, child)?;
+                } else {
+                    self.delete_entry(entry, child)?;
+                }
+            }
+        }
+        self.delete_entry(parent, entry)
+    }
+
+    /// Set Unix permission bits on an entry. No-op for FAT/exFAT.
+    fn set_permissions(&mut self, _entry: &FileEntry, _mode: u32) -> Result<(), FilesystemError> {
+        Ok(())
+    }
+
+    /// Set HFS/HFS+ type and creator codes. No-op for non-HFS filesystems.
+    fn set_type_creator(
+        &mut self,
+        _entry: &FileEntry,
+        _type_code: &str,
+        _creator_code: &str,
+    ) -> Result<(), FilesystemError> {
+        Ok(())
+    }
+
+    /// Write resource fork data. No-op for non-HFS filesystems.
+    fn write_resource_fork(
+        &mut self,
+        _entry: &FileEntry,
+        _data: &mut dyn std::io::Read,
+        _len: u64,
+    ) -> Result<(), FilesystemError> {
+        Ok(())
+    }
+
+    /// Flush metadata (superblock, bitmaps, FAT tables, etc.) to disk.
+    fn sync_metadata(&mut self) -> Result<(), FilesystemError>;
+
+    /// Returns the number of free bytes available on the filesystem.
+    fn free_space(&mut self) -> Result<u64, FilesystemError>;
 }
