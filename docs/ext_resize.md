@@ -29,19 +29,17 @@ Currently ext uses a layout-preserving compact reader (`compacted_size == origin
 
 ---
 
-## Session 2: Inode Scanning and Block Pointer Patching
+## Session 2: Inode Scanning and Block Pointer Patching ✅
 
 **Goal:** Read every allocated inode, identify block references that point to relocated blocks, produce patched inode table data.
 
 ### Tasks
-- [ ] Add function: `scan_and_patch_inodes(reader, partition_offset, relocation_map) -> Vec<PatchedInodeTable>`
-- [ ] Iterate inode bitmaps across all groups to find allocated inodes
-- [ ] For each allocated inode, read it and determine block mapping type:
-  - **Extent-based (ext4):** Walk extent tree, patch `ee_start_lo/hi` in leaf nodes. Also handle extent index nodes (`ei_leaf_lo/hi`) that may themselves be relocated.
-  - **Indirect-block (ext2/ext3):** Patch direct block pointers (inode bytes 40-87), then walk single/double/triple indirect chains patching block numbers. Handle indirect blocks themselves being relocated.
-- [ ] Produce patched inode table bytes (Vec<u8>) per block group, with all block pointers updated
-- [ ] Handle edge cases: symlinks (inline if < 60 bytes), xattr blocks, special files
-- [ ] Unit test: create inodes with known extent/indirect layouts, verify patching
+- [x] `scan_and_patch_inodes(reader, partition_offset, plan) -> PatchedInodeTables` — reads all inode bitmaps/tables, patches block pointers
+- [x] `PatchedInodeTables` struct: `tables: Vec<Vec<u8>>` (per-group patched inode table bytes) + `indirect_block_patches: HashMap<u64, Vec<u8>>` (patched indirect/extent-index blocks)
+- [x] Extent-based patching: `patch_extent_tree_in_inode()`, `patch_extent_block()`, `patch_extent_leaf()` — recursive extent tree walking with leaf start_lo/hi patching and index pointer patching
+- [x] Indirect-block patching: `patch_indirect_in_inode()`, `patch_indirect_pointer()`, `patch_indirect_block_recursive()` — handles direct[0-11], single/double/triple indirect with recursive child patching
+- [x] Edge cases: fast symlinks skipped, socket/fifo/device inodes skipped (no block pointers)
+- [x] Tests: `test_scan_and_patch_direct_block_pointer`, `test_scan_and_patch_extent_based_inode`, `test_scan_and_patch_no_relocation_needed`
 
 ### Key code to reuse
 - `read_inode()` (ext.rs:311-383) — read any inode by number

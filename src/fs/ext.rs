@@ -1178,6 +1178,551 @@ pub fn build_relocation_map<R: Read + Seek>(
     })
 }
 
+// ---- Inode block-pointer patching ----
+
+/// Result of scanning and patching inode tables for a set of block groups.
+#[derive(Debug)]
+pub struct PatchedInodeTables {
+    /// Patched inode table bytes for each group (index = group number).
+    pub tables: Vec<Vec<u8>>,
+    /// Set of block numbers that are indirect or extent-index blocks and whose
+    /// contents also need patching when streamed. Maps block_number → patched bytes.
+    pub indirect_block_patches: std::collections::HashMap<u64, Vec<u8>>,
+}
+
+/// Scan all inode tables and patch block pointers according to the relocation map.
+///
+/// Reads inode bitmaps to find allocated inodes, reads the inode tables,
+/// and rewrites any block pointers that appear in `relocations`. Also reads
+/// and patches indirect blocks and extent index blocks whose contents
+/// reference relocated blocks.
+pub fn scan_and_patch_inodes<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    plan: &RelocationPlan,
+) -> Result<PatchedInodeTables, FilesystemError> {
+    use std::collections::HashMap;
+
+    if plan.relocations.is_empty() {
+        // Nothing to patch — but we still need to read inode tables for the stream
+    }
+
+    // ---- Parse superblock (again, since this is a standalone function) ----
+    reader.seek(SeekFrom::Start(partition_offset + SUPERBLOCK_OFFSET))?;
+    let mut sb = [0u8; SUPERBLOCK_SIZE];
+    reader.read_exact(&mut sb)?;
+
+    let magic = u16::from_le_bytes([sb[0x38], sb[0x39]]);
+    if magic != EXT_MAGIC {
+        return Err(FilesystemError::Parse(format!(
+            "ext patch: invalid magic 0x{magic:04X}"
+        )));
+    }
+
+    let first_data_block = le32(&sb, 0x14);
+    let log_block_size = le32(&sb, 0x18);
+    let blocks_per_group = le32(&sb, 0x20);
+    let inodes_per_group = le32(&sb, 0x28);
+    let inode_size = u16::from_le_bytes([sb[0x58], sb[0x59]]);
+    let feature_incompat = le32(&sb, 0x60);
+
+    let block_size = 1024u64 << log_block_size;
+    let is_64bit = feature_incompat & INCOMPAT_64BIT != 0;
+    let has_extents = feature_incompat & INCOMPAT_EXTENTS != 0;
+
+    let desc_size: u16 = if is_64bit {
+        let ds = u16::from_le_bytes([sb[0xFE], sb[0xFF]]);
+        if ds >= 64 {
+            ds
+        } else {
+            64
+        }
+    } else {
+        32
+    };
+
+    let blocks_count_lo = le32(&sb, 0x04);
+    let total_blocks = if is_64bit {
+        let hi = le32(&sb, 0x150) as u64;
+        (hi << 32) | blocks_count_lo as u64
+    } else {
+        blocks_count_lo as u64
+    };
+
+    let group_count = ((total_blocks - first_data_block as u64 + blocks_per_group as u64 - 1)
+        / blocks_per_group as u64) as u32;
+
+    // ---- Read GDT ----
+    let sb_block = if block_size == 1024 { 1 } else { 0 };
+    let gdt_block = sb_block + 1;
+    let gdt_offset = partition_offset + gdt_block * block_size;
+    let gdt_bytes_needed = group_count as usize * desc_size as usize;
+    let mut gdt_buf = vec![0u8; gdt_bytes_needed];
+    reader.seek(SeekFrom::Start(gdt_offset))?;
+    reader.read_exact(&mut gdt_buf)?;
+
+    // Parse group descriptors for inode bitmap and inode table locations
+    struct GdInfo {
+        inode_bitmap: u64,
+        inode_table: u64,
+    }
+    let mut gd_infos: Vec<GdInfo> = Vec::with_capacity(group_count as usize);
+    for i in 0..group_count as usize {
+        let off = i * desc_size as usize;
+        let d = &gdt_buf[off..];
+        let ib_lo = le32(d, 0x04) as u64;
+        let it_lo = le32(d, 0x08) as u64;
+        let (inode_bitmap, inode_table) = if is_64bit && desc_size >= 64 {
+            let ib_hi = le32(d, 0x24) as u64;
+            let it_hi = le32(d, 0x28) as u64;
+            ((ib_hi << 32) | ib_lo, (it_hi << 32) | it_lo)
+        } else {
+            (ib_lo, it_lo)
+        };
+        gd_infos.push(GdInfo {
+            inode_bitmap,
+            inode_table,
+        });
+    }
+
+    let inode_table_size = inodes_per_group as u64 * inode_size as u64;
+    let ptrs_per_block = block_size as usize / 4;
+
+    let mut tables: Vec<Vec<u8>> = Vec::with_capacity(group_count as usize);
+    let mut indirect_patches: HashMap<u64, Vec<u8>> = HashMap::new();
+
+    for group in 0..group_count as usize {
+        // Read inode bitmap
+        reader.seek(SeekFrom::Start(
+            partition_offset + gd_infos[group].inode_bitmap * block_size,
+        ))?;
+        let mut ibm_data = vec![0u8; block_size as usize];
+        reader.read_exact(&mut ibm_data)?;
+        let ibm = BitmapReader::new(&ibm_data, inodes_per_group as u64);
+
+        // Read inode table
+        reader.seek(SeekFrom::Start(
+            partition_offset + gd_infos[group].inode_table * block_size,
+        ))?;
+        let mut table = vec![0u8; inode_table_size as usize];
+        reader.read_exact(&mut table)?;
+
+        // Patch each allocated inode
+        for local_idx in ibm.iter_set_bits() {
+            let ioff = local_idx as usize * inode_size as usize;
+            if ioff + inode_size as usize > table.len() {
+                break;
+            }
+
+            let mode = u16::from_le_bytes([table[ioff], table[ioff + 1]]) as u32;
+            let flags = le32(&table, ioff + 0x20);
+
+            // Skip inodes that don't have block pointers:
+            // - Socket/FIFO/char/block devices store dev number in i_block, not block ptrs
+            let ft = unix_file_type(mode);
+            match ft {
+                UnixFileType::Socket
+                | UnixFileType::Fifo
+                | UnixFileType::CharDevice
+                | UnixFileType::BlockDevice => continue,
+                _ => {}
+            }
+
+            // Fast symlinks store the target in i_block — no block pointers
+            if ft == UnixFileType::Symlink {
+                let size_lo = le32(&table, ioff + 0x04) as u64;
+                if size_lo < 60 && flags & EXT4_EXTENTS_FL == 0 {
+                    continue;
+                }
+            }
+
+            let i_block_off = ioff + 0x28;
+            let i_block = &table[i_block_off..i_block_off + 60];
+
+            if flags & EXT4_EXTENTS_FL != 0
+                || (has_extents && i_block.len() >= 2 && is_extent_header(i_block))
+            {
+                // ---- Extent-based inode ----
+                patch_extent_tree_in_inode(
+                    reader,
+                    partition_offset,
+                    block_size,
+                    &mut table[i_block_off..i_block_off + 60],
+                    &plan.relocations,
+                    &mut indirect_patches,
+                )?;
+            } else {
+                // ---- Indirect-block inode ----
+                patch_indirect_in_inode(
+                    reader,
+                    partition_offset,
+                    block_size,
+                    ptrs_per_block,
+                    &mut table[i_block_off..i_block_off + 60],
+                    &plan.relocations,
+                    &mut indirect_patches,
+                )?;
+            }
+        }
+
+        tables.push(table);
+    }
+
+    Ok(PatchedInodeTables {
+        tables,
+        indirect_block_patches: indirect_patches,
+    })
+}
+
+/// Patch extent tree root stored in i_block (60 bytes inline in the inode).
+/// Also recursively patches extent index blocks (which are separate data blocks).
+fn patch_extent_tree_in_inode<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    block_size: u64,
+    i_block: &mut [u8],
+    relocations: &std::collections::HashMap<u64, u64>,
+    indirect_patches: &mut std::collections::HashMap<u64, Vec<u8>>,
+) -> Result<(), FilesystemError> {
+    if i_block.len() < 12 {
+        return Ok(());
+    }
+    let header = match parse_extent_header(i_block) {
+        Ok(h) => h,
+        Err(_) => return Ok(()),
+    };
+
+    if header.depth == 0 {
+        // Leaf extents — patch ee_start_lo/hi
+        for i in 0..header.entries as usize {
+            let off = 12 + i * 12;
+            if off + 12 > i_block.len() {
+                break;
+            }
+            patch_extent_leaf(i_block, off, relocations);
+        }
+    } else {
+        // Index nodes — patch ei_leaf_lo/hi and recurse into child blocks
+        for i in 0..header.entries as usize {
+            let off = 12 + i * 12;
+            if off + 12 > i_block.len() {
+                break;
+            }
+            let child_lo = le32(i_block, off + 4) as u64;
+            let child_hi = u16::from_le_bytes([i_block[off + 8], i_block[off + 9]]) as u64;
+            let child_block = (child_hi << 32) | child_lo;
+
+            // Patch the index pointer if the child block itself was relocated
+            if let Some(&new_block) = relocations.get(&child_block) {
+                i_block[off + 4..off + 8].copy_from_slice(&(new_block as u32).to_le_bytes());
+                i_block[off + 8..off + 10]
+                    .copy_from_slice(&((new_block >> 32) as u16).to_le_bytes());
+            }
+
+            // Read the child block and patch its contents
+            let read_from = relocations
+                .get(&child_block)
+                .copied()
+                .unwrap_or(child_block);
+            // Actually we read from the ORIGINAL location (the source disk hasn't moved data)
+            reader.seek(SeekFrom::Start(partition_offset + child_block * block_size))?;
+            let mut child_data = vec![0u8; block_size as usize];
+            reader.read_exact(&mut child_data)?;
+
+            patch_extent_block(
+                reader,
+                partition_offset,
+                block_size,
+                &mut child_data,
+                relocations,
+                indirect_patches,
+            )?;
+
+            // Store patched child block for later streaming
+            let store_at = relocations
+                .get(&child_block)
+                .copied()
+                .unwrap_or(child_block);
+            indirect_patches.insert(store_at, child_data);
+        }
+    }
+    Ok(())
+}
+
+/// Recursively patch an extent tree block (non-inline, separate data block).
+fn patch_extent_block<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    block_size: u64,
+    block_data: &mut [u8],
+    relocations: &std::collections::HashMap<u64, u64>,
+    indirect_patches: &mut std::collections::HashMap<u64, Vec<u8>>,
+) -> Result<(), FilesystemError> {
+    let header = match parse_extent_header(block_data) {
+        Ok(h) => h,
+        Err(_) => return Ok(()),
+    };
+
+    if header.depth == 0 {
+        for i in 0..header.entries as usize {
+            let off = 12 + i * 12;
+            if off + 12 > block_data.len() {
+                break;
+            }
+            patch_extent_leaf(block_data, off, relocations);
+        }
+    } else {
+        for i in 0..header.entries as usize {
+            let off = 12 + i * 12;
+            if off + 12 > block_data.len() {
+                break;
+            }
+            let child_lo = le32(block_data, off + 4) as u64;
+            let child_hi = u16::from_le_bytes([block_data[off + 8], block_data[off + 9]]) as u64;
+            let child_block = (child_hi << 32) | child_lo;
+
+            if let Some(&new_block) = relocations.get(&child_block) {
+                block_data[off + 4..off + 8].copy_from_slice(&(new_block as u32).to_le_bytes());
+                block_data[off + 8..off + 10]
+                    .copy_from_slice(&((new_block >> 32) as u16).to_le_bytes());
+            }
+
+            reader.seek(SeekFrom::Start(partition_offset + child_block * block_size))?;
+            let mut child_data = vec![0u8; block_size as usize];
+            reader.read_exact(&mut child_data)?;
+
+            patch_extent_block(
+                reader,
+                partition_offset,
+                block_size,
+                &mut child_data,
+                relocations,
+                indirect_patches,
+            )?;
+
+            let store_at = relocations
+                .get(&child_block)
+                .copied()
+                .unwrap_or(child_block);
+            indirect_patches.insert(store_at, child_data);
+        }
+    }
+    Ok(())
+}
+
+/// Patch a single extent leaf entry's physical block start.
+/// An extent may span multiple blocks. If ANY block in the extent's range was
+/// relocated, we need to split/handle it. For simplicity, we patch the start
+/// block only if it appears in the relocation map — this works when the
+/// relocation map relocates contiguous runs together.
+fn patch_extent_leaf(
+    data: &mut [u8],
+    off: usize,
+    relocations: &std::collections::HashMap<u64, u64>,
+) {
+    let start_lo = le32(data, off + 8) as u64;
+    let start_hi = u16::from_le_bytes([data[off + 6], data[off + 7]]) as u64;
+    let phys_block = (start_hi << 32) | start_lo;
+
+    if let Some(&new_block) = relocations.get(&phys_block) {
+        data[off + 8..off + 12].copy_from_slice(&(new_block as u32).to_le_bytes());
+        data[off + 6..off + 8].copy_from_slice(&((new_block >> 32) as u16).to_le_bytes());
+    }
+}
+
+/// Patch indirect block pointers in an ext2/ext3-style inode's i_block area.
+fn patch_indirect_in_inode<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    block_size: u64,
+    ptrs_per_block: usize,
+    i_block: &mut [u8],
+    relocations: &std::collections::HashMap<u64, u64>,
+    indirect_patches: &mut std::collections::HashMap<u64, Vec<u8>>,
+) -> Result<(), FilesystemError> {
+    // Patch 12 direct block pointers
+    for i in 0..12 {
+        let off = i * 4;
+        let blk = le32(i_block, off) as u64;
+        if blk != 0 {
+            if let Some(&new_blk) = relocations.get(&blk) {
+                i_block[off..off + 4].copy_from_slice(&(new_blk as u32).to_le_bytes());
+            }
+        }
+    }
+
+    // Patch single indirect pointer (i_block[12])
+    patch_indirect_pointer(
+        reader,
+        partition_offset,
+        block_size,
+        ptrs_per_block,
+        i_block,
+        48,
+        1,
+        relocations,
+        indirect_patches,
+    )?;
+
+    // Patch double indirect pointer (i_block[13])
+    patch_indirect_pointer(
+        reader,
+        partition_offset,
+        block_size,
+        ptrs_per_block,
+        i_block,
+        52,
+        2,
+        relocations,
+        indirect_patches,
+    )?;
+
+    // Patch triple indirect pointer (i_block[14])
+    patch_indirect_pointer(
+        reader,
+        partition_offset,
+        block_size,
+        ptrs_per_block,
+        i_block,
+        56,
+        3,
+        relocations,
+        indirect_patches,
+    )?;
+
+    Ok(())
+}
+
+/// Patch an indirect block pointer at `ptr_offset` within `i_block`, and
+/// recursively patch the indirect block's contents.
+fn patch_indirect_pointer<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    block_size: u64,
+    ptrs_per_block: usize,
+    i_block: &mut [u8],
+    ptr_offset: usize,
+    depth: u32,
+    relocations: &std::collections::HashMap<u64, u64>,
+    indirect_patches: &mut std::collections::HashMap<u64, Vec<u8>>,
+) -> Result<(), FilesystemError> {
+    let blk = le32(i_block, ptr_offset) as u64;
+    if blk == 0 {
+        return Ok(());
+    }
+
+    // Patch the pointer itself if the indirect block was relocated
+    if let Some(&new_blk) = relocations.get(&blk) {
+        i_block[ptr_offset..ptr_offset + 4].copy_from_slice(&(new_blk as u32).to_le_bytes());
+    }
+
+    // Read the indirect block from its ORIGINAL location
+    reader.seek(SeekFrom::Start(partition_offset + blk * block_size))?;
+    let mut ind_data = vec![0u8; block_size as usize];
+    reader.read_exact(&mut ind_data)?;
+
+    if depth == 1 {
+        // Leaf indirect block: entries are data block pointers
+        for i in 0..ptrs_per_block {
+            let off = i * 4;
+            let data_blk = le32(&ind_data, off) as u64;
+            if data_blk != 0 {
+                if let Some(&new_blk) = relocations.get(&data_blk) {
+                    ind_data[off..off + 4].copy_from_slice(&(new_blk as u32).to_le_bytes());
+                }
+            }
+        }
+    } else {
+        // Non-leaf: entries are pointers to deeper indirect blocks
+        for i in 0..ptrs_per_block {
+            let off = i * 4;
+            let child_blk = le32(&ind_data, off) as u64;
+            if child_blk != 0 {
+                // Patch pointer to child if child was relocated
+                if let Some(&new_blk) = relocations.get(&child_blk) {
+                    ind_data[off..off + 4].copy_from_slice(&(new_blk as u32).to_le_bytes());
+                }
+
+                // Read and recursively patch child
+                reader.seek(SeekFrom::Start(partition_offset + child_blk * block_size))?;
+                let mut child_data = vec![0u8; block_size as usize];
+                reader.read_exact(&mut child_data)?;
+
+                patch_indirect_block_recursive(
+                    reader,
+                    partition_offset,
+                    block_size,
+                    ptrs_per_block,
+                    &mut child_data,
+                    depth - 1,
+                    relocations,
+                    indirect_patches,
+                )?;
+
+                let store_at = relocations.get(&child_blk).copied().unwrap_or(child_blk);
+                indirect_patches.insert(store_at, child_data);
+            }
+        }
+    }
+
+    let store_at = relocations.get(&blk).copied().unwrap_or(blk);
+    indirect_patches.insert(store_at, ind_data);
+    Ok(())
+}
+
+/// Recursively patch an indirect block's contents.
+fn patch_indirect_block_recursive<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    block_size: u64,
+    ptrs_per_block: usize,
+    block_data: &mut [u8],
+    depth: u32,
+    relocations: &std::collections::HashMap<u64, u64>,
+    indirect_patches: &mut std::collections::HashMap<u64, Vec<u8>>,
+) -> Result<(), FilesystemError> {
+    if depth == 1 {
+        for i in 0..ptrs_per_block {
+            let off = i * 4;
+            let blk = le32(block_data, off) as u64;
+            if blk != 0 {
+                if let Some(&new_blk) = relocations.get(&blk) {
+                    block_data[off..off + 4].copy_from_slice(&(new_blk as u32).to_le_bytes());
+                }
+            }
+        }
+    } else {
+        for i in 0..ptrs_per_block {
+            let off = i * 4;
+            let child_blk = le32(block_data, off) as u64;
+            if child_blk != 0 {
+                if let Some(&new_blk) = relocations.get(&child_blk) {
+                    block_data[off..off + 4].copy_from_slice(&(new_blk as u32).to_le_bytes());
+                }
+
+                reader.seek(SeekFrom::Start(partition_offset + child_blk * block_size))?;
+                let mut child_data = vec![0u8; block_size as usize];
+                reader.read_exact(&mut child_data)?;
+
+                patch_indirect_block_recursive(
+                    reader,
+                    partition_offset,
+                    block_size,
+                    ptrs_per_block,
+                    &mut child_data,
+                    depth - 1,
+                    relocations,
+                    indirect_patches,
+                )?;
+
+                let store_at = relocations.get(&child_blk).copied().unwrap_or(child_blk);
+                indirect_patches.insert(store_at, child_data);
+            }
+        }
+    }
+    Ok(())
+}
+
 // ---- Byte reading helpers ----
 
 fn le32(data: &[u8], offset: usize) -> u32 {
@@ -2160,5 +2705,136 @@ mod tests {
                 "target should not conflict with existing data"
             );
         }
+    }
+
+    /// Build a two-group image with inodes that have block pointers to group 1.
+    /// Adds:
+    /// - inode 12 (regular file) with direct block pointer to block 72 (in group 1)
+    /// - inode bitmap marks inodes 1 (root) and 11 (inode 12, 0-indexed) as allocated
+    fn make_two_group_image_with_inodes() -> Vec<u8> {
+        let mut image = make_two_group_image();
+        let block_size = 4096;
+        let inode_size = 256;
+
+        // Write inode bitmap at block 3 — mark inodes 0,1 (root=inode 2) and 11 (inode 12)
+        let ibm_off = 3 * block_size;
+        image[ibm_off] = 0x03; // inodes 1,2 (bits 0,1)
+        image[ibm_off + 1] = 0x08; // inode 12 (bit 11 = byte 1 bit 3)
+
+        // Write inode for root (inode 2, index 1) at inode table block 4
+        let root_off = 4 * block_size + 1 * inode_size;
+        let dir_mode: u16 = 0o040755;
+        image[root_off..root_off + 2].copy_from_slice(&dir_mode.to_le_bytes());
+        image[root_off + 0x04..root_off + 0x08].copy_from_slice(&4096u32.to_le_bytes());
+        // root dir data at block 8
+        image[root_off + 0x28..root_off + 0x2C].copy_from_slice(&8u32.to_le_bytes());
+
+        // Write inode for file (inode 12, index 11) with direct block pointer to block 72
+        let file_off = 4 * block_size + 11 * inode_size;
+        let file_mode: u16 = 0o100644;
+        image[file_off..file_off + 2].copy_from_slice(&file_mode.to_le_bytes());
+        image[file_off + 0x04..file_off + 0x08].copy_from_slice(&4096u32.to_le_bytes());
+        // i_block[0] = block 72 (in group 1, needs relocation)
+        image[file_off + 0x28..file_off + 0x2C].copy_from_slice(&72u32.to_le_bytes());
+
+        // Also write inode bitmap for group 1 (at block 67) — empty, no inodes
+        // (already zeros from make_two_group_image)
+
+        image
+    }
+
+    #[test]
+    fn test_scan_and_patch_direct_block_pointer() {
+        let image = make_two_group_image_with_inodes();
+        let mut cursor = Cursor::new(image);
+
+        // First get the relocation plan
+        let plan = build_relocation_map(&mut cursor, 0).unwrap();
+        assert!(plan.needs_relocation);
+        assert!(plan.relocations.contains_key(&72));
+
+        let new_block_for_72 = plan.relocations[&72];
+
+        // Now patch inodes
+        let result = scan_and_patch_inodes(&mut cursor, 0, &plan).unwrap();
+
+        // Group 0 inode table should be patched
+        assert_eq!(result.tables.len(), 2);
+        let table0 = &result.tables[0];
+
+        // Inode 12 (index 11) should have its direct block pointer patched
+        let inode_size = 256;
+        let file_inode_off = 11 * inode_size;
+        let patched_block = le32(table0, file_inode_off + 0x28) as u64;
+        assert_eq!(
+            patched_block, new_block_for_72,
+            "direct block pointer should be relocated from 72 to {new_block_for_72}"
+        );
+    }
+
+    #[test]
+    fn test_scan_and_patch_extent_based_inode() {
+        let mut image = make_two_group_image_with_inodes();
+        let block_size = 4096;
+        let inode_size = 256;
+
+        // Convert inode 12 to extent-based (ext4 style)
+        // Set INCOMPAT_EXTENTS flag in superblock
+        let feat_off = 1024 + 0x60;
+        let feat = le32(&image, feat_off) | INCOMPAT_EXTENTS;
+        image[feat_off..feat_off + 4].copy_from_slice(&feat.to_le_bytes());
+
+        // Rewrite inode 12's i_block as an extent tree
+        let file_off = 4 * block_size + 11 * inode_size + 0x28;
+        // Zero out i_block first
+        image[file_off..file_off + 60].fill(0);
+
+        // Extent header: magic=0xF30A, entries=1, max=4, depth=0
+        image[file_off..file_off + 2].copy_from_slice(&EXT4_EXT_MAGIC.to_le_bytes());
+        image[file_off + 2..file_off + 4].copy_from_slice(&1u16.to_le_bytes()); // entries
+        image[file_off + 4..file_off + 6].copy_from_slice(&4u16.to_le_bytes()); // max
+        image[file_off + 6..file_off + 8].copy_from_slice(&0u16.to_le_bytes()); // depth
+
+        // Extent leaf at offset 12: logical=0, len=1, start_hi=0, start_lo=72
+        let leaf_off = file_off + 12;
+        image[leaf_off..leaf_off + 4].copy_from_slice(&0u32.to_le_bytes()); // logical
+        image[leaf_off + 4..leaf_off + 6].copy_from_slice(&1u16.to_le_bytes()); // len
+        image[leaf_off + 6..leaf_off + 8].copy_from_slice(&0u16.to_le_bytes()); // start_hi
+        image[leaf_off + 8..leaf_off + 12].copy_from_slice(&72u32.to_le_bytes()); // start_lo
+
+        // Also set EXT4_EXTENTS_FL on the inode
+        let flags_off = 4 * block_size + 11 * inode_size + 0x20;
+        let flags = EXT4_EXTENTS_FL;
+        image[flags_off..flags_off + 4].copy_from_slice(&flags.to_le_bytes());
+
+        let mut cursor = Cursor::new(image);
+        let plan = build_relocation_map(&mut cursor, 0).unwrap();
+        assert!(plan.needs_relocation);
+
+        let new_block = plan.relocations[&72];
+        let result = scan_and_patch_inodes(&mut cursor, 0, &plan).unwrap();
+
+        // Check that the extent leaf's start_lo was patched
+        let table0 = &result.tables[0];
+        let i_block_off = 11 * inode_size + 0x28;
+        let patched_start_lo = le32(table0, i_block_off + 12 + 8) as u64;
+        assert_eq!(
+            patched_start_lo, new_block,
+            "extent leaf start_lo should be relocated to {new_block}"
+        );
+    }
+
+    #[test]
+    fn test_scan_and_patch_no_relocation_needed() {
+        // Single-group image — no relocation needed
+        let image = make_test_image();
+        let mut cursor = Cursor::new(image);
+        let plan = build_relocation_map(&mut cursor, 0).unwrap();
+        assert!(!plan.needs_relocation);
+
+        let result = scan_and_patch_inodes(&mut cursor, 0, &plan).unwrap();
+        // Should still produce tables (1 group)
+        assert_eq!(result.tables.len(), 1);
+        assert!(result.indirect_block_patches.is_empty());
     }
 }
