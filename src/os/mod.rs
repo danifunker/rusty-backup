@@ -458,6 +458,25 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
     }
 }
 
+/// Open a file or device for read-only inspection.
+///
+/// On macOS, if a `/dev/disk*` path returns permission denied, this will
+/// prompt the user for administrator credentials via the native macOS
+/// authentication dialog. Unlike [`open_source_for_reading`], this does NOT
+/// unmount or claim the device, making it safe to call from the GUI thread.
+///
+/// On other platforms, opens the file normally.
+pub fn open_for_inspect(path: &Path) -> Result<File> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::open_device_for_inspect(path)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        File::open(path).with_context(|| format!("cannot open {}", path.display()))
+    }
+}
+
 /// Open a target device or image file for writing (restore).
 ///
 /// For regular files (`.img`): creates/truncates the file.
@@ -478,7 +497,11 @@ pub fn open_target_for_writing(path: &Path) -> Result<DeviceWriteHandle> {
 
     #[cfg(target_os = "macos")]
     {
-        macos::open_target_for_writing(path).map(DeviceWriteHandle::from_file)
+        let (file, claim) = macos::open_target_for_writing(path)?;
+        Ok(DeviceWriteHandle {
+            file,
+            _disk_claim: claim,
+        })
     }
     #[cfg(target_os = "linux")]
     {
@@ -505,6 +528,9 @@ pub fn open_target_for_writing(path: &Path) -> Result<DeviceWriteHandle> {
 pub struct ElevatedSource {
     file: File,
     temp_path: Option<PathBuf>,
+    /// On macOS: exclusive disk claim kept alive for the duration of the backup.
+    #[cfg(target_os = "macos")]
+    disk_claim: Option<macos::DiskClaim>,
 }
 
 impl ElevatedSource {
@@ -515,24 +541,37 @@ impl ElevatedSource {
 
     /// Consume self and return the file plus a cleanup guard.
     /// Keep the guard alive until you're done with the file — dropping it
-    /// deletes the temp file (if any).
+    /// deletes the temp file (if any) and releases the disk claim.
     pub fn into_parts(self) -> (File, TempFileGuard) {
-        (self.file, TempFileGuard(self.temp_path))
+        (
+            self.file,
+            TempFileGuard {
+                temp_path: self.temp_path,
+                #[cfg(target_os = "macos")]
+                _disk_claim: self.disk_claim,
+            },
+        )
     }
 }
 
-/// RAII guard that deletes a temporary file when dropped.
-pub struct TempFileGuard(Option<PathBuf>);
+/// RAII guard that deletes a temporary file when dropped and holds the
+/// macOS disk claim alive for the duration of the operation.
+pub struct TempFileGuard {
+    temp_path: Option<PathBuf>,
+    /// On macOS: exclusive disk claim released when guard is dropped.
+    #[cfg(target_os = "macos")]
+    _disk_claim: Option<macos::DiskClaim>,
+}
 
 impl TempFileGuard {
     pub fn path(&self) -> Option<&Path> {
-        self.0.as_deref()
+        self.temp_path.as_deref()
     }
 }
 
 impl Drop for TempFileGuard {
     fn drop(&mut self) {
-        if let Some(ref path) = self.0 {
+        if let Some(ref path) = self.temp_path {
             let _ = fs::remove_file(path);
         }
     }
@@ -551,15 +590,20 @@ pub struct DeviceWriteHandle {
     /// On Windows: locked volume handles kept alive to prevent re-mounting.
     #[cfg(target_os = "windows")]
     _volume_locks: windows::VolumeLockSet,
+    /// On macOS: exclusive disk claim released when handle is dropped.
+    #[cfg(target_os = "macos")]
+    _disk_claim: Option<macos::DiskClaim>,
 }
 
 impl DeviceWriteHandle {
-    /// Create a handle from a plain file (no platform locks).
+    /// Create a handle from a plain file (no platform locks or claims).
     pub fn from_file(file: File) -> Self {
         Self {
             file,
             #[cfg(target_os = "windows")]
             _volume_locks: windows::VolumeLockSet::empty(),
+            #[cfg(target_os = "macos")]
+            _disk_claim: None,
         }
     }
 }

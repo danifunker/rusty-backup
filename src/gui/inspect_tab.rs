@@ -10,7 +10,6 @@ use rusty_backup::backup::metadata::BackupMetadata;
 use rusty_backup::clonezilla;
 use rusty_backup::clonezilla::metadata::ClonezillaImage;
 use rusty_backup::device::DiskDevice;
-use rusty_backup::fs;
 use rusty_backup::fs::fat::resize_fat_in_place;
 use rusty_backup::partition::PartitionSizeOverride;
 use rusty_backup::partition::{
@@ -67,6 +66,13 @@ pub struct InspectTab {
     seekable_cache_files: HashMap<usize, PathBuf>,
     /// Background seekable cache creation status (native zstd only)
     cache_status: Option<Arc<Mutex<CacheStatus>>>,
+    /// Background disk inspect status (physical device paths)
+    inspect_status: Option<Arc<Mutex<InspectStatus>>>,
+    /// Open device file reused by BrowseView (avoids re-open / re-prompt).
+    /// Wrapping in Arc lets BrowseView call try_clone() for each open_fs() call.
+    open_device_file: Option<Arc<File>>,
+    /// Guard that keeps the DiskClaim (and any temp file) alive while browsing.
+    open_device_guard: Option<rusty_backup::os::TempFileGuard>,
 }
 
 /// Status of a background VHD export operation.
@@ -106,6 +112,26 @@ impl PartitionExportConfig {
             ExportSizeChoice::Custom => self.custom_size_mib as u64 * 1024 * 1024,
         }
     }
+}
+
+/// Status of a background disk inspect operation.
+struct InspectStatus {
+    finished: bool,
+    error: Option<String>,
+    log_messages: Vec<String>,
+    /// Human-readable description of the current step shown in the UI.
+    current_step: String,
+    // Results, populated on success:
+    partition_table: Option<PartitionTable>,
+    alignment: Option<PartitionAlignment>,
+    partitions: Vec<PartitionInfo>,
+    partition_min_sizes: HashMap<usize, u64>,
+    /// The open device file handle, passed back to the main thread so
+    /// that BrowseView can reuse it without re-opening (and re-prompting).
+    device_file: Option<File>,
+    /// The TempFileGuard that holds the DiskClaim / temp file alive.
+    /// Kept here so the main thread can decide when to release it.
+    device_guard: Option<rusty_backup::os::TempFileGuard>,
 }
 
 /// Status of a background seekable cache creation (native zstd backups).
@@ -152,6 +178,9 @@ impl Default for InspectTab {
             block_cache_scan: None,
             seekable_cache_files: HashMap::new(),
             cache_status: None,
+            inspect_status: None,
+            open_device_file: None,
+            open_device_guard: None,
         }
     }
 }
@@ -271,6 +300,9 @@ impl InspectTab {
             }
         }
 
+        // Poll background inspect (physical device)
+        self.poll_inspect_status(log);
+
         // Poll export status
         self.poll_export_status(log);
 
@@ -279,8 +311,12 @@ impl InspectTab {
             let has_source = self.selected_device_idx.is_some()
                 || self.image_file_path.is_some()
                 || self.backup_folder_path.is_some();
+            let inspect_running = self.inspect_status.is_some();
             if ui
-                .add_enabled(has_source, egui::Button::new("Re-inspect"))
+                .add_enabled(
+                    has_source && !inspect_running,
+                    egui::Button::new("Re-inspect"),
+                )
                 .clicked()
             {
                 if self.backup_folder_path.is_some() {
@@ -332,6 +368,18 @@ impl InspectTab {
                     ui.horizontal(|ui| {
                         ui.spinner();
                         ui.label("Exporting VHD...");
+                    });
+                }
+            }
+        }
+
+        // Inspect-in-progress spinner
+        if let Some(ref status_arc) = self.inspect_status {
+            if let Ok(s) = status_arc.lock() {
+                if !s.finished {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(&s.current_step);
                     });
                 }
             }
@@ -988,6 +1036,46 @@ impl InspectTab {
         }
     }
 
+    fn poll_inspect_status(&mut self, log: &mut LogPanel) {
+        let status_arc = match &self.inspect_status {
+            Some(s) => Arc::clone(s),
+            None => return,
+        };
+
+        let Ok(mut status) = status_arc.lock() else {
+            return;
+        };
+
+        // Drain log messages into the panel
+        for msg in status.log_messages.drain(..) {
+            log.info(msg);
+        }
+
+        if status.finished {
+            if let Some(err) = &status.error {
+                let msg = format!("Inspect failed: {err}");
+                log.error(&msg);
+                self.last_error = Some(msg);
+            } else {
+                self.partition_table = status.partition_table.take();
+                self.alignment = status.alignment.take();
+                self.partitions = std::mem::take(&mut status.partitions);
+                self.partition_min_sizes = std::mem::take(&mut status.partition_min_sizes);
+                // macOS only: capture the open device fd + guard so BrowseView
+                // can reuse it without re-opening (and without another auth dialog).
+                #[cfg(target_os = "macos")]
+                {
+                    if let Some(f) = status.device_file.take() {
+                        self.open_device_file = Some(Arc::new(f));
+                    }
+                    self.open_device_guard = status.device_guard.take();
+                }
+            }
+            drop(status);
+            self.inspect_status = None;
+        }
+    }
+
     fn poll_export_status(&mut self, log: &mut LogPanel) {
         let status_arc = match &self.export_status {
             Some(s) => Arc::clone(s),
@@ -1035,6 +1123,10 @@ impl InspectTab {
         self.block_cache_scan = None;
         self.seekable_cache_files.clear();
         self.cache_status = None;
+        self.inspect_status = None;
+        // Release the open device fd and disk claim (remounts the disk).
+        self.open_device_file = None;
+        self.open_device_guard = None;
     }
 
     fn load_backup_metadata(&mut self, log: &mut LogPanel) {
@@ -1148,7 +1240,7 @@ impl InspectTab {
                     start_lba: p.start_lba,
                     size_bytes: p.original_size_bytes,
                     bootable: false,
-                    is_logical: p.index >= 4,
+                    is_logical: p.is_logical,
                     is_extended_container: false,
                     partition_type_string: p.partition_type_string.clone(),
                 })
@@ -1173,10 +1265,10 @@ impl InspectTab {
             return;
         }
 
-        // Add logical partitions from metadata (index >= 4 by convention)
+        // Add logical partitions from metadata (tagged is_logical in backup metadata)
         let mut added = 0;
         for pm in &meta.partitions {
-            if pm.index >= 4 {
+            if pm.is_logical {
                 self.partitions.push(PartitionInfo {
                     index: pm.index,
                     type_name: pm.type_name.clone(),
@@ -1217,23 +1309,76 @@ impl InspectTab {
 
         log.info(format!("Inspecting {}...", path.display()));
 
-        match File::open(&path) {
-            Ok(file) => {
-                let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
-                let mut reader = BufReader::new(file);
+        // All device I/O runs on a background thread so DA unmount/claim
+        // (which can block up to ~5 s) never freezes the GUI.
+        let status = Arc::new(Mutex::new(InspectStatus {
+            finished: false,
+            error: None,
+            log_messages: Vec::new(),
+            current_step: "Requesting exclusive disk access...".into(),
+            partition_table: None,
+            alignment: None,
+            partitions: Vec::new(),
+            partition_min_sizes: HashMap::new(),
+            device_file: None,
+            device_guard: None,
+        }));
+        self.inspect_status = Some(Arc::clone(&status));
 
-                // Detect VHD: check if the last 512 bytes contain the "conectix" cookie
-                let data_size = if file_size >= 512 {
-                    if let Ok(mut f) = File::open(&path) {
-                        if f.seek(SeekFrom::End(-512)).is_ok() {
-                            let mut cookie = [0u8; 8];
-                            if f.read_exact(&mut cookie).is_ok() && &cookie == VHD_COOKIE {
-                                let ds = file_size - 512;
-                                log.info(format!("Detected Fixed VHD (data: {} bytes)", ds,));
-                                Some(ds)
-                            } else {
-                                None
-                            }
+        std::thread::spawn(move || {
+            // Helpers that post into the shared status without blocking the GUI.
+            let push_log = |msg: String| {
+                if let Ok(mut s) = status.lock() {
+                    s.log_messages.push(msg);
+                }
+            };
+            let set_step = |step: &'static str| {
+                if let Ok(mut s) = status.lock() {
+                    s.current_step = step.into();
+                }
+            };
+            let finish_err = |err: String| {
+                if let Ok(mut s) = status.lock() {
+                    s.error = Some(err);
+                    s.finished = true;
+                }
+            };
+
+            // Open the device/file with full elevation: unmounts volumes and
+            // claims exclusive DA access for the duration of the inspect.
+            let elevated = match rusty_backup::os::open_source_for_reading(&path) {
+                Ok(e) => e,
+                Err(e) => {
+                    finish_err(format!("Cannot open {}: {e}", path.display()));
+                    return;
+                }
+            };
+            // Decompose into file + guard (keeps DiskClaim alive until we
+            // explicitly drop it by storing/releasing from the main thread).
+            let (device_file, guard) = elevated.into_parts();
+
+            set_step("Reading partition table...");
+
+            let file_size = device_file.metadata().map(|m| m.len()).unwrap_or(0);
+
+            // Clone for the BufReader; keep `device_file` for additional clones.
+            let mut reader = match device_file.try_clone() {
+                Ok(f) => BufReader::new(f),
+                Err(e) => {
+                    finish_err(format!("Cannot clone file handle: {e}"));
+                    return;
+                }
+            };
+
+            // Detect VHD: check if the last 512 bytes contain the "conectix" cookie
+            let data_size = if file_size >= 512 {
+                if let Ok(mut f) = device_file.try_clone() {
+                    if f.seek(SeekFrom::End(-512)).is_ok() {
+                        let mut cookie = [0u8; 8];
+                        if f.read_exact(&mut cookie).is_ok() && &cookie == VHD_COOKIE {
+                            let ds = file_size - 512;
+                            push_log(format!("Detected Fixed VHD (data: {} bytes)", ds));
+                            Some(ds)
                         } else {
                             None
                         }
@@ -1242,111 +1387,122 @@ impl InspectTab {
                     }
                 } else {
                     None
-                };
+                }
+            } else {
+                None
+            };
 
-                // Use a limited reader if VHD was detected
-                let detect_result = if let Some(ds) = data_size {
-                    // Reset reader to start and limit to data portion
-                    let _ = reader.seek(SeekFrom::Start(0));
-                    let mut limited = reader.take(ds);
-                    PartitionTable::detect(&mut limited)
-                } else {
-                    PartitionTable::detect(&mut reader)
-                };
+            // Use a limited reader if VHD was detected
+            let detect_result = if let Some(ds) = data_size {
+                let _ = reader.seek(SeekFrom::Start(0));
+                let mut limited = reader.take(ds);
+                PartitionTable::detect(&mut limited)
+            } else {
+                PartitionTable::detect(&mut reader)
+            };
 
-                match detect_result {
-                    Ok(mut table) => {
-                        // Fix up superfloppy size: seek(End(0)) returns 0 for macOS devices
-                        if let PartitionTable::None { size_bytes, .. } = &mut table {
-                            if *size_bytes == 0 {
-                                if let Ok(f) = File::open(&path) {
-                                    if let Ok(real_size) =
-                                        rusty_backup::os::get_file_size(&f, &path)
-                                    {
-                                        *size_bytes = real_size;
-                                    }
-                                }
-                            }
-                        }
-                        let alignment = detect_alignment(&table);
-                        self.partitions = table.partitions();
-
-                        // For APM disks, probe "Apple_HFS" partitions to show the actual
-                        // HFS variant (HFS vs HFS+ vs HFSX) in the type name.
-                        if matches!(table, PartitionTable::Apm(_)) {
-                            for part in &mut self.partitions {
-                                if part.partition_type_string.as_deref() == Some("Apple_HFS") {
-                                    if let Ok(f) = File::open(&path) {
-                                        let mut br = BufReader::new(f);
-                                        let detected =
-                                            fs::probe_apple_hfs_type(&mut br, part.start_lba * 512);
-                                        if detected == "HFS+" || detected == "HFSX" {
-                                            part.type_name = part.type_name.replace(
-                                                "Apple_HFS",
-                                                &format!("Apple_HFS ({detected})"),
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        if matches!(table, PartitionTable::None { .. }) {
-                            log.info(format!(
-                                "Detected superfloppy (no partition table) with {} partition(s)",
-                                self.partitions.len()
-                            ));
-                        } else {
-                            log.info(format!(
-                                "Detected {} partition table with {} partition(s)",
-                                table.type_name(),
-                                self.partitions.len()
-                            ));
-                        }
-                        log.info(format!(
-                            "Alignment: {} (first LBA: {})",
-                            alignment.alignment_type, alignment.first_lba
-                        ));
-                        self.alignment = Some(alignment);
-                        self.partition_table = Some(table);
-
-                        // Compute minimum partition sizes via filesystem analysis
-                        for part in &self.partitions {
-                            if part.is_extended_container {
-                                continue;
-                            }
-                            if let Ok(f) = File::open(&path) {
-                                if let Some(min_size) = fs::effective_partition_size(
-                                    BufReader::new(f),
-                                    part.start_lba * 512,
-                                    part.partition_type_byte,
-                                    part.partition_type_string.as_deref(),
-                                ) {
-                                    let clamped = min_size.min(part.size_bytes);
-                                    self.partition_min_sizes.insert(part.index, clamped);
-                                    log.info(format!(
-                                        "Partition {}: minimum size {} (original {})",
-                                        part.index,
-                                        partition::format_size(clamped),
-                                        partition::format_size(part.size_bytes),
-                                    ));
+            match detect_result {
+                Ok(mut table) => {
+                    // Fix up superfloppy size: seek(End(0)) returns 0 for macOS devices
+                    if let PartitionTable::None { size_bytes, .. } = &mut table {
+                        if *size_bytes == 0 {
+                            if let Ok(f) = device_file.try_clone() {
+                                if let Ok(real_size) = rusty_backup::os::get_file_size(&f, &path) {
+                                    *size_bytes = real_size;
                                 }
                             }
                         }
                     }
-                    Err(e) => {
-                        let msg = format!("Failed to parse partition table: {e}");
-                        log.error(&msg);
-                        self.last_error = Some(msg);
+
+                    let alignment = detect_alignment(&table);
+                    let mut partitions = table.partitions();
+
+                    // For APM disks, probe "Apple_HFS" partitions to show the
+                    // actual HFS variant (HFS vs HFS+ vs HFSX) in the type name.
+                    if matches!(table, PartitionTable::Apm(_)) {
+                        for part in &mut partitions {
+                            if part.partition_type_string.as_deref() == Some("Apple_HFS") {
+                                if let Ok(f) = device_file.try_clone() {
+                                    let mut br = BufReader::new(f);
+                                    let detected = rusty_backup::fs::probe_apple_hfs_type(
+                                        &mut br,
+                                        part.start_lba * 512,
+                                    );
+                                    if detected == "HFS+" || detected == "HFSX" {
+                                        part.type_name = part.type_name.replace(
+                                            "Apple_HFS",
+                                            &format!("Apple_HFS ({detected})"),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if matches!(table, PartitionTable::None { .. }) {
+                        push_log(format!(
+                            "Detected superfloppy (no partition table) with {} partition(s)",
+                            partitions.len()
+                        ));
+                    } else {
+                        push_log(format!(
+                            "Detected {} partition table with {} partition(s)",
+                            table.type_name(),
+                            partitions.len()
+                        ));
+                    }
+                    push_log(format!(
+                        "Alignment: {} (first LBA: {})",
+                        alignment.alignment_type, alignment.first_lba
+                    ));
+
+                    // Compute minimum partition sizes via filesystem analysis
+                    set_step("Analyzing filesystem sizes...");
+                    let mut partition_min_sizes = HashMap::new();
+                    for part in &partitions {
+                        if part.is_extended_container {
+                            continue;
+                        }
+                        if let Ok(f) = device_file.try_clone() {
+                            if let Some(min_size) = rusty_backup::fs::effective_partition_size(
+                                BufReader::new(f),
+                                part.start_lba * 512,
+                                part.partition_type_byte,
+                                part.partition_type_string.as_deref(),
+                            ) {
+                                let clamped = min_size.min(part.size_bytes);
+                                partition_min_sizes.insert(part.index, clamped);
+                                push_log(format!(
+                                    "Partition {}: minimum size {} (original {})",
+                                    part.index,
+                                    rusty_backup::partition::format_size(clamped),
+                                    rusty_backup::partition::format_size(part.size_bytes),
+                                ));
+                            }
+                        }
+                    }
+
+                    // Write results and signal completion.
+                    if let Ok(mut s) = status.lock() {
+                        s.partition_table = Some(table);
+                        s.alignment = Some(alignment);
+                        s.partitions = partitions;
+                        s.partition_min_sizes = partition_min_sizes;
+                        // On macOS, pass the open fd + claim to the main thread
+                        // so BrowseView can reuse it without re-opening/re-prompting.
+                        #[cfg(target_os = "macos")]
+                        {
+                            s.device_file = Some(device_file);
+                            s.device_guard = Some(guard);
+                        }
+                        s.finished = true;
                     }
                 }
+                Err(e) => {
+                    finish_err(format!("Failed to parse partition table: {e}"));
+                }
             }
-            Err(e) => {
-                let msg = format!("Cannot open {}: {e}", path.display());
-                log.add(LogLevel::Error, &msg);
-                self.last_error = Some(msg);
-            }
-        }
+        });
     }
 
     fn load_clonezilla_image(&mut self, folder: &PathBuf, log: &mut LogPanel) {
@@ -1748,8 +1904,21 @@ impl InspectTab {
                 path.display(),
                 offset,
             ));
+            // macOS only: reuse the fd opened during inspect so BrowseView
+            // never needs to re-open the raw device (which would re-prompt).
+            // On Linux/Windows the app runs as root, so File::open works fine.
+            #[cfg(target_os = "macos")]
+            let preopen = if path.to_string_lossy().starts_with("/dev/") {
+                self.open_device_file
+                    .as_ref()
+                    .and_then(|arc| arc.try_clone().ok())
+            } else {
+                None
+            };
+            #[cfg(not(target_os = "macos"))]
+            let preopen = None;
             self.browse_view
-                .open(path, offset, ptype, partition_type_string);
+                .open(path, offset, ptype, partition_type_string, preopen);
             return;
         }
 
@@ -1821,7 +1990,7 @@ impl InspectTab {
                     part_index, data_file,
                 ));
                 self.browse_view
-                    .open(data_path, 0, ptype, partition_type_string.clone());
+                    .open(data_path, 0, ptype, partition_type_string.clone(), None);
             }
             "zstd" => {
                 // Zstd-compressed backup — open streaming immediately while
@@ -1976,7 +2145,7 @@ impl InspectTab {
                     part_index,
                 ));
                 self.browse_view
-                    .open(cache_path, 0, ptype, partition_type_string.clone());
+                    .open(cache_path, 0, ptype, partition_type_string.clone(), None);
                 return;
             }
             // Cache file was deleted (stale) — remove from map and recreate

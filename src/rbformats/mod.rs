@@ -356,8 +356,16 @@ pub fn reconstruct_disk_from_backup(
         writer.seek(SeekFrom::Start(512))?;
     }
 
+    // Sort partitions by effective start LBA so we always write forward.
+    // APM and other schemes can store partitions in arbitrary index order
+    // (e.g. index 1 at LBA 300M, index 2 at LBA 100M). Writing in index
+    // order would skip the backward seek and corrupt the disk.
+    let mut sorted_partitions: Vec<&crate::backup::metadata::PartitionMetadata> =
+        metadata.partitions.iter().collect();
+    sorted_partitions.sort_by_key(|pm| get_effective_start_lba(pm.index, pm.start_lba));
+
     // Write each partition at its correct offset, filling gaps with zeros
-    for pm in &metadata.partitions {
+    for pm in &sorted_partitions {
         if cancel_check() {
             bail!("operation cancelled");
         }
@@ -371,7 +379,10 @@ pub fn reconstruct_disk_from_backup(
             pm.index, effective_lba, part_offset, export_size
         ));
 
-        // Fill or seek over gap between current position and partition start
+        // Fill or seek over gap between current position and partition start.
+        // We always use absolute seeks (SeekFrom::Start) rather than relative
+        // seeks because the patch_*_hidden_sectors calls at the end of each
+        // iteration may have moved the file cursor away from total_written.
         if total_written < part_offset {
             let gap = part_offset - total_written;
             // On Windows physical drives, we must write zeros to gaps (seeking
@@ -382,18 +393,22 @@ pub fn reconstruct_disk_from_backup(
             let force_write_zeros = false;
 
             if force_write_zeros || (is_device && fill_unused_with_zeros) {
+                writer.seek(SeekFrom::Start(total_written))?;
                 log_cb(&format!("Writing {} bytes of zeros to gap...", gap));
                 write_zeros(writer, gap)?;
                 writer.flush().context("failed to flush after zeros")?;
                 total_written += gap;
             } else if is_device {
-                // Unix device without zero-fill: try to seek
-                match writer.seek(SeekFrom::Current(gap as i64)) {
+                // Unix device without zero-fill: seek directly to partition start
+                match writer.seek(SeekFrom::Start(part_offset)) {
                     Ok(_) => {
-                        total_written += gap;
+                        total_written = part_offset;
                     }
                     Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
-                        log_cb("Warning: device doesn't support seek, writing zeros to gap");
+                        writer.seek(SeekFrom::Start(total_written))?;
+                        log_cb(
+                            "Warning: device doesn't support absolute seek, writing zeros to gap",
+                        );
                         write_zeros(writer, gap)?;
                         total_written += gap;
                     }
@@ -401,9 +416,12 @@ pub fn reconstruct_disk_from_backup(
                 }
             } else {
                 // File: use sparse seeks
-                writer.seek(SeekFrom::Current(gap as i64))?;
-                total_written += gap;
+                writer.seek(SeekFrom::Start(part_offset))?;
+                total_written = part_offset;
             }
+        } else if total_written == part_offset {
+            // No gap, but ensure file position is correct (patch calls may have moved it)
+            writer.seek(SeekFrom::Start(part_offset))?;
         }
 
         // Write partition data
@@ -433,12 +451,13 @@ pub fn reconstruct_disk_from_backup(
             export_size
         ));
 
+        let base_offset = total_written;
         let bytes_written = decompress_to_writer(
             &data_path,
             &metadata.compression_type,
             writer,
             Some(export_size),
-            progress_cb,
+            &mut |bytes| progress_cb(base_offset + bytes),
             cancel_check,
             log_cb,
         )

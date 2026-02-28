@@ -52,6 +52,9 @@ pub struct BrowseView {
     partition_type: u8,
     /// APM partition type string (e.g. "Apple_HFS"). None for MBR/GPT.
     partition_type_string: Option<String>,
+    /// Pre-opened device file (macOS raw disk, already elevated).
+    /// Wrapped in Arc so each open_fs() call can try_clone() an independent fd.
+    preopen_file: Option<std::sync::Arc<File>>,
     /// Whether the browser is active (filesystem loaded).
     active: bool,
     /// Shared block cache for Clonezilla partclone browsing.
@@ -96,6 +99,7 @@ impl Default for BrowseView {
             partition_offset: 0,
             partition_type: 0,
             partition_type_string: None,
+            preopen_file: None,
             active: false,
             partclone_cache: None,
             zstd_cache: None,
@@ -108,18 +112,25 @@ impl Default for BrowseView {
 
 impl BrowseView {
     /// Initialize the browser for a partition within a source image/device.
+    ///
+    /// `preopen_file` — if provided, this already-elevated file handle is used
+    /// for all filesystem reads instead of re-opening `source_path`.  Pass
+    /// `Some(file)` when browsing a raw device on macOS to avoid a second auth
+    /// prompt; pass `None` for backup files / image files.
     pub fn open(
         &mut self,
         source_path: PathBuf,
         partition_offset: u64,
         partition_type: u8,
         partition_type_string: Option<String>,
+        preopen_file: Option<File>,
     ) {
         self.close();
         self.source_path = Some(source_path.clone());
         self.partition_offset = partition_offset;
         self.partition_type = partition_type;
         self.partition_type_string = partition_type_string;
+        self.preopen_file = preopen_file.map(std::sync::Arc::new);
 
         match self.open_fs() {
             Ok(mut fs) => {
@@ -270,6 +281,7 @@ impl BrowseView {
         self.partclone_cache = None;
         self.zstd_cache = None;
         self.partition_type_string = None;
+        self.preopen_file = None;
         self.extraction_progress = None;
         self.extraction_result = None;
     }
@@ -286,6 +298,7 @@ impl BrowseView {
             self.partition_type_string.as_deref(),
             self.partclone_cache.as_ref(),
             self.zstd_cache.as_ref(),
+            self.preopen_file.as_ref(),
         )
     }
 
@@ -674,6 +687,7 @@ impl BrowseView {
         let partition_type_string = self.partition_type_string.clone();
         let partclone_cache = self.partclone_cache.clone();
         let zstd_cache = self.zstd_cache.clone();
+        let preopen_file = self.preopen_file.clone();
         let resource_fork_mode = self.resource_fork_mode;
         let is_hfs = self.is_hfs_type();
 
@@ -699,6 +713,7 @@ impl BrowseView {
                 partition_type_string.as_deref(),
                 partclone_cache.as_ref(),
                 zstd_cache.as_ref(),
+                preopen_file.as_ref(),
                 &entry,
                 &dest,
                 resource_fork_mode,
@@ -754,6 +769,7 @@ fn create_filesystem(
     partition_type_string: Option<&str>,
     partclone_cache: Option<&Arc<Mutex<PartcloneBlockCache>>>,
     zstd_cache: Option<&Arc<Mutex<ZstdStreamCache>>>,
+    preopen_file: Option<&std::sync::Arc<File>>,
 ) -> Result<Box<dyn Filesystem>, FilesystemError> {
     // If we have a partclone block cache, use it
     if let Some(cache) = partclone_cache {
@@ -764,6 +780,19 @@ fn create_filesystem(
     // If we have a streaming zstd cache, use it
     if let Some(cache) = zstd_cache {
         let reader = ZstdStreamReader::new(Arc::clone(cache));
+        return fs::open_filesystem(
+            reader,
+            partition_offset,
+            partition_type,
+            partition_type_string,
+        );
+    }
+
+    // Pre-opened device file (already elevated, e.g. macOS raw disk).
+    // try_clone() gives an independent fd so each open_fs() call can seek freely.
+    if let Some(arc) = preopen_file {
+        let file = arc.try_clone().map_err(FilesystemError::Io)?;
+        let reader = BufReader::new(file);
         return fs::open_filesystem(
             reader,
             partition_offset,
@@ -820,6 +849,7 @@ fn run_extraction(
     partition_type_string: Option<&str>,
     partclone_cache: Option<&Arc<Mutex<PartcloneBlockCache>>>,
     zstd_cache: Option<&Arc<Mutex<ZstdStreamCache>>>,
+    preopen_file: Option<&std::sync::Arc<File>>,
     entry: &FileEntry,
     dest: &std::path::Path,
     resource_fork_mode: ResourceForkMode,
@@ -833,6 +863,7 @@ fn run_extraction(
         partition_type_string,
         partclone_cache,
         zstd_cache,
+        preopen_file,
     )?;
 
     // Pre-count files and bytes for progress tracking
@@ -851,6 +882,7 @@ fn run_extraction(
         partition_type_string,
         partclone_cache,
         zstd_cache,
+        preopen_file,
     )?;
 
     extract_entry(&mut *fs, entry, dest, resource_fork_mode, is_hfs, progress)?;

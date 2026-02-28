@@ -144,6 +144,11 @@ pub fn calculate_restore_layout(
     partition_sizes: &[RestorePartitionSize],
     target_size: u64,
 ) -> Result<Vec<PartitionSizeOverride>> {
+    // APM: use dedicated layout logic that preserves absolute positions
+    if metadata.partition_table_type == "APM" {
+        return calculate_apm_restore_layout(metadata, alignment, partition_sizes, target_size);
+    }
+
     // Superfloppy: single partition at offset 0, no alignment
     if metadata.partition_table_type == "None" {
         if let Some(pm) = metadata.partitions.first() {
@@ -172,10 +177,7 @@ pub fn calculate_restore_layout(
     };
 
     // Separate primary and logical partitions
-    let has_logical = metadata
-        .partitions
-        .iter()
-        .any(|pm| pm.is_logical || pm.index >= 4);
+    let has_logical = metadata.partitions.iter().any(|pm| pm.is_logical);
 
     let is_gpt = metadata.partition_table_type == "GPT";
 
@@ -196,7 +198,7 @@ pub fn calculate_restore_layout(
 
     // First pass: lay out primary (non-logical) partitions, skip logical ones
     for pm in &metadata.partitions {
-        if pm.is_logical || pm.index >= 4 {
+        if pm.is_logical {
             continue; // handled in second pass
         }
 
@@ -255,7 +257,7 @@ pub fn calculate_restore_layout(
         let mut logical_pms: Vec<&crate::backup::metadata::PartitionMetadata> = metadata
             .partitions
             .iter()
-            .filter(|pm| pm.is_logical || pm.index >= 4)
+            .filter(|pm| pm.is_logical)
             .collect();
         logical_pms.sort_by_key(|pm| pm.start_lba);
 
@@ -364,6 +366,145 @@ pub fn calculate_restore_layout(
     Ok(overrides)
 }
 
+/// Calculate partition layout for APM (Apple Partition Map) restores.
+///
+/// APM partitions have fixed absolute positions (not sequential like MBR).
+/// With Original alignment, each partition keeps its original `start_lba`.
+/// With non-Original alignment, partitions are sorted by `start_lba` and
+/// laid out sequentially from the minimum start LBA.
+fn calculate_apm_restore_layout(
+    metadata: &BackupMetadata,
+    alignment: &RestoreAlignment,
+    partition_sizes: &[RestorePartitionSize],
+    target_size: u64,
+) -> Result<Vec<PartitionSizeOverride>> {
+    let usable_target_size = target_size;
+
+    // Sort partitions by start_lba for consistent layout
+    let mut sorted_parts: Vec<&crate::backup::metadata::PartitionMetadata> =
+        metadata.partitions.iter().collect();
+    sorted_parts.sort_by_key(|pm| pm.start_lba);
+
+    let mut overrides = Vec::new();
+
+    match alignment {
+        RestoreAlignment::Original => {
+            // Each partition keeps its original absolute position
+            for pm in &sorted_parts {
+                let size_choice = partition_sizes
+                    .iter()
+                    .find(|s| s.index == pm.index)
+                    .map(|s| &s.size_choice)
+                    .unwrap_or(&RestoreSizeChoice::Original);
+
+                let partition_size =
+                    compute_partition_size(size_choice, pm, pm.start_lba, usable_target_size);
+
+                overrides.push(PartitionSizeOverride {
+                    index: pm.index,
+                    start_lba: pm.start_lba,
+                    original_size: pm.original_size_bytes,
+                    export_size: partition_size,
+                    new_start_lba: None,
+                    heads: 0,
+                    sectors_per_track: 0,
+                });
+            }
+        }
+        RestoreAlignment::Modern1MB | RestoreAlignment::Custom(_) => {
+            // Sequential layout from the earliest partition position
+            let alignment_sectors = match alignment {
+                RestoreAlignment::Modern1MB => 2048,
+                RestoreAlignment::Custom(n) => *n,
+                _ => unreachable!(),
+            };
+
+            let mut current_lba = sorted_parts.first().map(|pm| pm.start_lba).unwrap_or(0);
+
+            // Align the starting LBA
+            if alignment_sectors > 0 {
+                let rem = current_lba % alignment_sectors;
+                if rem != 0 {
+                    current_lba += alignment_sectors - rem;
+                }
+            }
+
+            for pm in &sorted_parts {
+                let size_choice = partition_sizes
+                    .iter()
+                    .find(|s| s.index == pm.index)
+                    .map(|s| &s.size_choice)
+                    .unwrap_or(&RestoreSizeChoice::Original);
+
+                // Align current_lba
+                if alignment_sectors > 0 {
+                    let rem = current_lba % alignment_sectors;
+                    if rem != 0 {
+                        current_lba += alignment_sectors - rem;
+                    }
+                }
+
+                let partition_size =
+                    compute_partition_size(size_choice, pm, current_lba, usable_target_size);
+
+                let new_start_lba = if current_lba != pm.start_lba {
+                    Some(current_lba)
+                } else {
+                    None
+                };
+
+                overrides.push(PartitionSizeOverride {
+                    index: pm.index,
+                    start_lba: pm.start_lba,
+                    original_size: pm.original_size_bytes,
+                    export_size: partition_size,
+                    new_start_lba,
+                    heads: 0,
+                    sectors_per_track: 0,
+                });
+
+                current_lba += partition_size / 512;
+            }
+        }
+    }
+
+    // Validate: no partition extends past usable area
+    let usable_sectors = usable_target_size / 512;
+    for ov in &overrides {
+        let end_lba = ov.effective_start_lba() + ov.export_size / 512;
+        if end_lba > usable_sectors {
+            bail!(
+                "Partition {} would end at LBA {} which exceeds usable area ({} sectors)",
+                ov.index,
+                end_lba,
+                usable_sectors,
+            );
+        }
+    }
+
+    // Validate: all sizes >= minimum
+    for ov in &overrides {
+        let pm = metadata.partitions.iter().find(|p| p.index == ov.index);
+        if let Some(pm) = pm {
+            let min = if pm.imaged_size_bytes > 0 {
+                pm.imaged_size_bytes
+            } else {
+                pm.original_size_bytes
+            };
+            if ov.export_size < min {
+                bail!(
+                    "Partition {} size ({}) is smaller than minimum ({})",
+                    ov.index,
+                    ov.export_size,
+                    min,
+                );
+            }
+        }
+    }
+
+    Ok(overrides)
+}
+
 /// Compute a partition's size in bytes given the user's size choice.
 fn compute_partition_size(
     size_choice: &RestoreSizeChoice,
@@ -414,7 +555,7 @@ pub fn build_restore_ebr_chain(
     )> = metadata
         .partitions
         .iter()
-        .filter(|pm| pm.is_logical || pm.index >= 4)
+        .filter(|pm| pm.is_logical)
         .filter_map(|pm| {
             overrides
                 .iter()
@@ -664,7 +805,7 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
     let progress_clone = Arc::clone(&progress);
     let progress_cancel = Arc::clone(&progress);
 
-    let total_written = reconstruct_disk_from_backup(
+    let write_result = reconstruct_disk_from_backup(
         &config.backup_folder,
         &metadata,
         mbr_bytes.as_ref(),
@@ -682,12 +823,47 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
         &mut |msg| {
             log(&progress, LogLevel::Info, msg);
         },
-    )?;
+    );
+
+    // A stalled write to a raw device (e.g. EIO from macOS I/O arbitration
+    // while another process such as VMware probes the disk concurrently) can
+    // block in the kernel for several minutes before returning an error.
+    // Once the blocked syscall finally returns, treat any I/O error as a
+    // clean cancellation if the user already requested it — otherwise surface
+    // the original error with a hint.
+    let total_written = match write_result {
+        Ok(n) => n,
+        Err(e) => {
+            if is_cancelled(&progress) {
+                bail!("restore cancelled");
+            }
+            // Check whether the error looks like a macOS I/O stall (EIO = os error 5).
+            let is_io_stall = e.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .map_or(false, |io_err| {
+                        io_err.raw_os_error() == Some(5) // EIO
+                            || io_err.kind() == std::io::ErrorKind::BrokenPipe
+                    })
+            });
+            if is_io_stall {
+                return Err(e.context(
+                    "disk write stalled — if another application (e.g. VMware) is \
+                     accessing the target drive, suspend it and retry",
+                ));
+            }
+            return Err(e);
+        }
+    };
 
     // Step 8: Filesystem resize operations (using inner File to avoid buffer flush on every seek)
     set_operation(&progress, "Finalizing filesystems...");
 
-    for (pm, ov) in metadata.partitions.iter().zip(&overrides) {
+    for pm in &metadata.partitions {
+        let ov = match overrides.iter().find(|o| o.index == pm.index) {
+            Some(o) => o,
+            None => continue,
+        };
         let part_offset = ov.effective_start_lba() * 512;
         let export_size = ov.export_size;
 
@@ -815,7 +991,19 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
     drop(target);
 
     // Step 9: Reopen device and set FAT clean flags (requires fresh file handle on macOS)
-    if config.target_is_device {
+    // Only do this if at least one FAT partition was resized or compacted.
+    let any_fat_needs_flags = config.target_is_device
+        && metadata.partitions.iter().any(|pm| {
+            if !pm.type_name.to_ascii_lowercase().contains("fat") {
+                return false;
+            }
+            let Some(ov) = overrides.iter().find(|o| o.index == pm.index) else {
+                return false;
+            };
+            ov.export_size != pm.original_size_bytes || pm.compacted
+        });
+
+    if any_fat_needs_flags {
         log(
             &progress,
             LogLevel::Info,
@@ -834,11 +1022,18 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
                 )
             })?;
 
-        for (pm, ov) in metadata.partitions.iter().zip(&overrides) {
+        for pm in &metadata.partitions {
+            if !pm.type_name.to_ascii_lowercase().contains("fat") {
+                continue;
+            }
+            let ov = match overrides.iter().find(|o| o.index == pm.index) {
+                Some(o) => o,
+                None => continue,
+            };
             let part_offset = ov.effective_start_lba() * 512;
             let export_size = ov.export_size;
 
-            // Set clean flags if this was a FAT filesystem that got resized
+            // Set clean flags if this FAT partition was resized or compacted
             if export_size != pm.original_size_bytes || pm.compacted {
                 let _ = set_fat_clean_flags(&mut device_file, part_offset, &mut |msg| {
                     log(&progress, LogLevel::Info, msg)
@@ -1303,8 +1498,20 @@ fn run_clonezilla_restore(
     target.flush()?;
     drop(target);
 
-    // Reopen device to set FAT clean flags
-    if config.target_is_device {
+    // Reopen device to set FAT clean flags (only if any FAT partition was resized/used partclone)
+    let any_fat_needs_flags = config.target_is_device
+        && sorted_parts.iter().any(|cz_part| {
+            let fs = cz_part.filesystem_type.to_ascii_lowercase();
+            if !fs.contains("fat") && !fs.contains("vfat") {
+                return false;
+            }
+            let Some(ov) = overrides.iter().find(|o| o.index == cz_part.index) else {
+                return false;
+            };
+            ov.export_size != cz_part.size_bytes() || !cz_part.partclone_files.is_empty()
+        });
+
+    if any_fat_needs_flags {
         log(
             &progress,
             LogLevel::Info,
@@ -1323,6 +1530,10 @@ fn run_clonezilla_restore(
             })?;
 
         for cz_part in &sorted_parts {
+            let fs = cz_part.filesystem_type.to_ascii_lowercase();
+            if !fs.contains("fat") && !fs.contains("vfat") {
+                continue;
+            }
             let ov = match overrides.iter().find(|o| o.index == cz_part.index) {
                 Some(o) => o,
                 None => continue,
@@ -1711,72 +1922,66 @@ enum PartitionFsType {
 }
 
 /// Detect the filesystem type of a partition by reading its boot sector magic bytes.
+/// All reads are done in sector-aligned 512-byte blocks to work on raw devices
+/// (e.g. macOS /dev/rdiskN) which require sector-aligned I/O.
 fn detect_partition_fs_type(
     file: &mut (impl Read + Seek),
     partition_offset: u64,
 ) -> PartitionFsType {
+    let mut sector = [0u8; 512];
+
+    // Read first sector (boot sector): FAT/NTFS/exFAT signatures
     if file.seek(SeekFrom::Start(partition_offset)).is_err() {
         return PartitionFsType::Unknown;
     }
-    let mut buf = [0u8; 12];
-    if file.read_exact(&mut buf).is_err() {
+    if file.read_exact(&mut sector).is_err() {
         return PartitionFsType::Unknown;
     }
-    if &buf[3..11] == b"NTFS    " {
+    if &sector[3..11] == b"NTFS    " {
         return PartitionFsType::Ntfs;
     }
-    if &buf[3..11] == b"EXFAT   " {
+    if &sector[3..11] == b"EXFAT   " {
         return PartitionFsType::Exfat;
     }
-    if buf[0] == 0xEB || buf[0] == 0xE9 {
+    if sector[0] == 0xEB || sector[0] == 0xE9 {
         return PartitionFsType::Fat;
     }
 
-    // Check for HFS/HFS+ at partition_offset + 1024
-    if file.seek(SeekFrom::Start(partition_offset + 1024)).is_ok() {
-        let mut hfs_buf = [0u8; 2];
-        if file.read_exact(&mut hfs_buf).is_ok() {
-            let sig = u16::from_be_bytes(hfs_buf);
-            match sig {
-                0x4244 => {
-                    // HFS — check for embedded HFS+ at offset 124-125 from MDB start
-                    let mut embed = [0u8; 2];
-                    if file
-                        .seek(SeekFrom::Start(partition_offset + 1024 + 124))
-                        .is_ok()
-                        && file.read_exact(&mut embed).is_ok()
-                    {
-                        let embed_sig = u16::from_be_bytes(embed);
-                        if embed_sig == 0x482B {
-                            return PartitionFsType::HfsPlus;
-                        }
-                    }
-                    return PartitionFsType::Hfs;
-                }
-                0x482B | 0x4858 => return PartitionFsType::HfsPlus,
-                _ => {}
-            }
-        }
-    }
-
-    // Check for ext2/3/4 magic (0xEF53 LE) at partition_offset + 1024 + 0x38
-    if file
-        .seek(SeekFrom::Start(partition_offset + 1024 + 0x38))
-        .is_ok()
+    // Read sector at partition_offset + 1024 (sector 2): HFS/HFS+ and ext2/3/4 signatures
+    // HFS/HFS+ volume header is at partition_offset + 1024
+    // ext superblock magic (0xEF53) is at partition_offset + 1024 + 0x38
+    // Both fall within the same 512-byte sector
+    if file.seek(SeekFrom::Start(partition_offset + 1024)).is_ok()
+        && file.read_exact(&mut sector).is_ok()
     {
-        let mut ext_magic = [0u8; 2];
-        if file.read_exact(&mut ext_magic).is_ok() && ext_magic == [0x53, 0xEF] {
+        let sig = u16::from_be_bytes([sector[0], sector[1]]);
+        match sig {
+            0x4244 => {
+                // HFS — check for embedded HFS+ at offset 124-125 from MDB start
+                let embed_sig = u16::from_be_bytes([sector[124], sector[125]]);
+                if embed_sig == 0x482B {
+                    return PartitionFsType::HfsPlus;
+                }
+                return PartitionFsType::Hfs;
+            }
+            0x482B | 0x4858 => return PartitionFsType::HfsPlus,
+            _ => {}
+        }
+
+        // ext2/3/4 magic at offset 0x38 within this sector
+        if sector[0x38] == 0x53 && sector[0x39] == 0xEF {
             return PartitionFsType::Ext;
         }
     }
 
-    // Check for btrfs magic "_BHRfS_M" at partition_offset + 0x10000 + 0x40
+    // Read sector at partition_offset + 0x10000 (sector 128): btrfs superblock
+    // btrfs magic "_BHRfS_M" at offset 0x40 within the superblock
     if file
-        .seek(SeekFrom::Start(partition_offset + 0x10040))
+        .seek(SeekFrom::Start(partition_offset + 0x10000))
         .is_ok()
+        && file.read_exact(&mut sector).is_ok()
     {
-        let mut btrfs_magic = [0u8; 8];
-        if file.read_exact(&mut btrfs_magic).is_ok() && &btrfs_magic == b"_BHRfS_M" {
+        if &sector[0x40..0x48] == b"_BHRfS_M" {
             return PartitionFsType::Btrfs;
         }
     }

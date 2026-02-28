@@ -498,9 +498,17 @@ impl RestoreTab {
                     if let Some(ref progress_arc) = self.restore_progress {
                         if let Ok(mut p) = progress_arc.lock() {
                             p.cancel_requested = true;
+                            // Update the operation label immediately so the
+                            // user sees feedback while the current disk write
+                            // drains (macOS I/O can block for tens of seconds
+                            // before a stalled write returns).
+                            p.operation =
+                                "Cancelling — waiting for current write to complete…".to_string();
                         }
                     }
-                    log.warn("Cancellation requested...");
+                    log.warn(
+                        "Cancellation requested — waiting for current disk write to complete...",
+                    );
                 }
             }
         });

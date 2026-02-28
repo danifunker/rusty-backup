@@ -335,7 +335,7 @@ pub fn detect_alignment(table: &PartitionTable) -> PartitionAlignment {
         };
     }
 
-    let first_lba = partitions[0].start_lba;
+    let first_lba = partitions.iter().map(|p| p.start_lba).min().unwrap_or(0);
 
     // Extract CHS geometry from MBR if available (APM / superfloppy have no CHS)
     let (heads, sectors_per_track) = match table {
