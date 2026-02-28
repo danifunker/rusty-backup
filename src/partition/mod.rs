@@ -115,15 +115,28 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
         }
     }
 
-    // Check for HFS / HFS+ at offset 1024
+    // Check for HFS / HFS+ / ProDOS at offset 1024.
+    // Read a full 512-byte sector for raw device compatibility (macOS /dev/rdiskN
+    // requires sector-aligned reads).
     if reader.seek(SeekFrom::Start(1024)).is_ok() {
-        let mut hfs_buf = [0u8; 2];
-        if reader.read_exact(&mut hfs_buf).is_ok() {
-            let sig = u16::from_be_bytes(hfs_buf);
+        let mut buf = [0u8; 512];
+        if reader.read_exact(&mut buf).is_ok() {
+            let sig = u16::from_be_bytes([buf[0], buf[1]]);
             match sig {
                 0x4244 => return Some("HFS".to_string()),
                 0x482B | 0x4858 => return Some("HFS+".to_string()),
                 _ => {}
+            }
+            // ProDOS volume directory key block: prev_block==0, storage_type nibble==0xF,
+            // entry_length==39, entries_per_block==13
+            if buf[0] == 0
+                && buf[1] == 0
+                && (buf[4] >> 4) == 0xF
+                && (buf[4] & 0xF) >= 1
+                && buf[27] == 39
+                && buf[28] == 13
+            {
+                return Some("ProDOS".to_string());
             }
         }
     }
