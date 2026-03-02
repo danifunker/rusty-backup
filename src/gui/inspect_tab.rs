@@ -2008,6 +2008,10 @@ impl InspectTab {
             return;
         }
 
+        let metadata_path = folder.join("metadata.json");
+        let compression_type_str = meta.compression_type.clone();
+        let checksum_type = meta.checksum_type.clone();
+
         match meta.compression_type.as_str() {
             "none" => {
                 // Raw file — partition data starts at offset 0
@@ -2015,8 +2019,14 @@ impl InspectTab {
                     "Browsing partition {} from {}",
                     part_index, data_file,
                 ));
-                self.browse_view
-                    .open(data_path, 0, ptype, partition_type_string.clone(), None);
+                self.browse_view.open(
+                    data_path.clone(),
+                    0,
+                    ptype,
+                    partition_type_string.clone(),
+                    None,
+                );
+                // Raw backups support direct editing (no decompress needed)
             }
             "zstd" => {
                 // Zstd-compressed backup — open streaming immediately while
@@ -2029,6 +2039,40 @@ impl InspectTab {
                     &folder,
                     &format!("partition-{}", part_index),
                     log,
+                );
+                // Set archive edit context for decompress→edit→recompress flow
+                self.browse_view.set_archive_edit_context(
+                    data_path,
+                    compression_type_str,
+                    part_meta.original_size_bytes,
+                    part_meta.compacted,
+                    metadata_path,
+                    part_index,
+                    checksum_type,
+                );
+            }
+            "chd" => {
+                // CHD-compressed backup — open directly via ChdReader (on-demand decompression)
+                log.info(format!(
+                    "Browsing partition {} from CHD: {}",
+                    part_index, data_file,
+                ));
+                self.browse_view.open(
+                    data_path.clone(),
+                    0,
+                    ptype,
+                    partition_type_string.clone(),
+                    None,
+                );
+                // Set archive edit context for decompress→edit→recompress flow
+                self.browse_view.set_archive_edit_context(
+                    data_path,
+                    compression_type_str,
+                    part_meta.original_size_bytes,
+                    part_meta.compacted,
+                    metadata_path,
+                    part_index,
+                    checksum_type,
                 );
             }
             other => {

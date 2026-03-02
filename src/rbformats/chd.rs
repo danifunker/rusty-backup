@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::Command;
 
@@ -7,6 +7,108 @@ use anyhow::{bail, Context, Result};
 
 use super::{file_name, output_path, CHUNK_SIZE};
 use crate::update::UpdateConfig;
+
+/// Read+Seek adapter over a CHD file using the `chd` crate for on-demand
+/// hunk decompression. Enables filesystem browsing without extracting to a
+/// temp file.
+pub struct ChdReader {
+    chd: chd::Chd<BufReader<File>>,
+    hunk_size: u32,
+    logical_size: u64,
+    position: u64,
+    cached_hunk_index: Option<u32>,
+    hunk_buf: Vec<u8>,
+    cmp_buf: Vec<u8>,
+}
+
+impl ChdReader {
+    /// Open a CHD file for reading.
+    pub fn open(path: &Path) -> Result<Self> {
+        let file =
+            File::open(path).with_context(|| format!("failed to open CHD: {}", path.display()))?;
+        let reader = BufReader::new(file);
+        let chd = chd::Chd::open(reader, None)
+            .map_err(|e| anyhow::anyhow!("failed to open CHD: {:?}", e))?;
+        let hunk_size = chd.header().hunk_size();
+        let logical_size = chd.header().logical_bytes();
+        let hunk_buf = vec![0u8; hunk_size as usize];
+        let cmp_buf = Vec::new();
+        Ok(Self {
+            chd,
+            hunk_size,
+            logical_size,
+            position: 0,
+            cached_hunk_index: None,
+            hunk_buf,
+            cmp_buf,
+        })
+    }
+
+    /// Decompress a hunk into the internal buffer if not already cached.
+    fn ensure_hunk(&mut self, hunk_index: u32) -> io::Result<()> {
+        if self.cached_hunk_index == Some(hunk_index) {
+            return Ok(());
+        }
+        let mut hunk = self.chd.hunk(hunk_index).map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("CHD hunk error: {:?}", e))
+        })?;
+        hunk.read_hunk_in(&mut self.cmp_buf, &mut self.hunk_buf)
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("CHD decompress error: {:?}", e),
+                )
+            })?;
+        self.cached_hunk_index = Some(hunk_index);
+        Ok(())
+    }
+}
+
+impl Read for ChdReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.position >= self.logical_size {
+            return Ok(0);
+        }
+        let remaining = self.logical_size - self.position;
+        let to_read = buf.len().min(remaining as usize);
+        if to_read == 0 {
+            return Ok(0);
+        }
+
+        let mut total = 0;
+        while total < to_read {
+            let hunk_index = (self.position / self.hunk_size as u64) as u32;
+            let offset_in_hunk = (self.position % self.hunk_size as u64) as usize;
+            let avail = (self.hunk_size as usize - offset_in_hunk).min(to_read - total);
+
+            self.ensure_hunk(hunk_index)?;
+            buf[total..total + avail]
+                .copy_from_slice(&self.hunk_buf[offset_in_hunk..offset_in_hunk + avail]);
+
+            total += avail;
+            self.position += avail as u64;
+        }
+        Ok(total)
+    }
+}
+
+impl Seek for ChdReader {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new_pos = match pos {
+            SeekFrom::Start(n) => n as i64,
+            SeekFrom::Current(n) => self.position as i64 + n,
+            SeekFrom::End(n) => self.logical_size as i64 + n,
+        };
+        if new_pos < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before start",
+            ));
+        }
+        self.position = (new_pos as u64).min(self.logical_size);
+        Ok(self.position)
+    }
+}
 
 /// Get the chdman command name or path to use (from config or default to PATH)
 fn get_chdman_command() -> String {

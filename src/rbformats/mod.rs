@@ -628,6 +628,89 @@ pub fn reconstruct_disk_from_backup(
     Ok(total_written)
 }
 
+/// Decompress a partition archive to a raw file.
+///
+/// If `compacted` is true, the decompressed data is smaller than `original_size`;
+/// the output file is zero-padded to `original_size` so the filesystem is
+/// at its original geometry.
+pub fn decompress_partition_to_file(
+    data_path: &Path,
+    compression_type: &str,
+    output_path: &Path,
+    original_size: u64,
+    compacted: bool,
+    progress_cb: &mut impl FnMut(u64),
+    cancel_check: &impl Fn() -> bool,
+) -> Result<()> {
+    let mut output = BufWriter::new(
+        File::create(output_path)
+            .with_context(|| format!("failed to create temp file: {}", output_path.display()))?,
+    );
+    let mut log_cb = |_: &str| {};
+
+    let written = decompress_to_writer(
+        data_path,
+        compression_type,
+        &mut output,
+        Some(original_size),
+        progress_cb,
+        cancel_check,
+        &mut log_cb,
+    )?;
+
+    // Zero-pad to original_size if compacted
+    if compacted && written < original_size {
+        let pad = original_size - written;
+        write_zeros(&mut output, pad)?;
+    }
+
+    output.flush()?;
+    Ok(())
+}
+
+/// Compress a raw file to an archive using the given compression type.
+pub fn compress_file_to_archive(
+    input_path: &Path,
+    output_path_base: &Path,
+    compression_type: &str,
+    progress_cb: &mut impl FnMut(u64),
+    cancel_check: &impl Fn() -> bool,
+    log_cb: &mut impl FnMut(&str),
+) -> Result<Vec<String>> {
+    let mut reader = BufReader::new(
+        File::open(input_path)
+            .with_context(|| format!("failed to open {}", input_path.display()))?,
+    );
+
+    match compression_type {
+        "zstd" => zstd::compress_zstd(
+            &mut reader,
+            output_path_base,
+            None,
+            progress_cb,
+            cancel_check,
+        ),
+        "chd" => chd::compress_chd(
+            &mut reader,
+            output_path_base,
+            None,
+            progress_cb,
+            cancel_check,
+            log_cb,
+        ),
+        "none" | "raw" => raw::stream_with_split(
+            &mut reader,
+            output_path_base,
+            "raw",
+            None,
+            false,
+            progress_cb,
+            cancel_check,
+        ),
+        other => bail!("unsupported compression type for recompression: {}", other),
+    }
+}
+
 /// Write `count` zero bytes to a writer, in chunks.
 pub(crate) fn write_zeros(writer: &mut impl Write, count: u64) -> Result<()> {
     let zeros = vec![0u8; CHUNK_SIZE];

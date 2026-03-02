@@ -93,6 +93,34 @@ pub struct BadSectorEntry {
     pub timestamp: String,
 }
 
+/// Update the checksum for a specific partition in a metadata.json file.
+pub fn update_partition_checksum(
+    metadata_path: &std::path::Path,
+    partition_index: usize,
+    new_checksum: &str,
+    new_compressed_files: Option<&[String]>,
+) -> anyhow::Result<()> {
+    let data = std::fs::read_to_string(metadata_path)
+        .map_err(|e| anyhow::anyhow!("failed to read metadata: {e}"))?;
+    let mut metadata: BackupMetadata = serde_json::from_str(&data)
+        .map_err(|e| anyhow::anyhow!("failed to parse metadata: {e}"))?;
+
+    let part = metadata
+        .partitions
+        .iter_mut()
+        .find(|p| p.index == partition_index)
+        .ok_or_else(|| anyhow::anyhow!("partition {} not found in metadata", partition_index))?;
+
+    part.checksum = new_checksum.to_string();
+    if let Some(files) = new_compressed_files {
+        part.compressed_files = files.to_vec();
+    }
+
+    let json = serde_json::to_string_pretty(&metadata)?;
+    std::fs::write(metadata_path, json)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

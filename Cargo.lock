@@ -3766,6 +3766,7 @@ dependencies = [
  "byteorder",
  "cargo-husky",
  "cd-da-reader",
+ "chd",
  "chrono",
  "crc32c",
  "crc32fast",
