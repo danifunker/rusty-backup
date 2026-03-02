@@ -524,6 +524,10 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "ntfs" => Ok(Box::new(ntfs::NtfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 _ => Err(FilesystemError::Unsupported(format!(
                     "editing not yet supported for filesystem type '{fs_type}'"
                 ))),
@@ -552,8 +556,12 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "ntfs" => Ok(Box::new(ntfs::NtfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 _ => Err(FilesystemError::Unsupported(
-                    "editing not yet supported for NTFS".into(),
+                    "type 0x07 partition is neither NTFS nor exFAT".into(),
                 )),
             }
         }
