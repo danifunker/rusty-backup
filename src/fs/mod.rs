@@ -520,6 +520,10 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "exfat" => Ok(Box::new(exfat::ExfatFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 _ => Err(FilesystemError::Unsupported(format!(
                     "editing not yet supported for filesystem type '{fs_type}'"
                 ))),
@@ -540,6 +544,19 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
             reader,
             partition_offset,
         )?)),
+        // NTFS/exFAT — distinguish by superblock magic
+        0x07 => {
+            let fs_type = detect_0x07_type(&mut reader, partition_offset);
+            match fs_type {
+                "exfat" => Ok(Box::new(exfat::ExfatFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                _ => Err(FilesystemError::Unsupported(
+                    "editing not yet supported for NTFS".into(),
+                )),
+            }
+        }
         // ProDOS — editing not supported
         0xA8 => Err(FilesystemError::Unsupported(
             "editing not supported for ProDOS".into(),

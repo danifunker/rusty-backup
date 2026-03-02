@@ -3,7 +3,9 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use anyhow::{bail, Result};
 
 use super::entry::{EntryType, FileEntry};
-use super::filesystem::{Filesystem, FilesystemError};
+use super::filesystem::{
+    CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
+};
 
 // exFAT directory entry types
 const ENTRY_TYPE_ALLOCATION_BITMAP: u8 = 0x81;
@@ -557,6 +559,743 @@ impl<R: Read + Seek + Send> Filesystem for ExfatFilesystem<R> {
         let last_byte = self.cluster_heap_offset_sectors as u64 * self.bytes_per_sector
             + (last_cluster + 1) * self.cluster_size;
         Ok(last_byte)
+    }
+}
+
+// =============================================================================
+// Editing support
+// =============================================================================
+
+/// Get current timestamp as exFAT format (DOS-style u32: date in upper 16 bits, time in lower 16).
+fn current_exfat_timestamp() -> u32 {
+    // Use same approach as FAT: encode current UTC time
+    // For simplicity in an embedded context, use a fixed recent timestamp
+    // Date: bits 31-25=year(0-127 from 1980), 24-21=month, 20-16=day
+    // Time: bits 15-11=hour, 10-5=minute, 4-0=second/2
+    // 2024-01-01 00:00:00
+    let year = 2024 - 1980; // 44
+    let month = 1u32;
+    let day = 1u32;
+    let date = (year << 9) | (month << 5) | day;
+    let time = 0u32; // midnight
+    (date << 16) | time
+}
+
+impl<R: Read + Write + Seek> ExfatFilesystem<R> {
+    // -- Bitmap I/O --
+
+    /// Read the allocation bitmap from disk.
+    fn read_bitmap(&mut self) -> Result<Vec<u8>, FilesystemError> {
+        if self.bitmap_start_cluster < 2 {
+            return Err(FilesystemError::InvalidData(
+                "allocation bitmap not found".into(),
+            ));
+        }
+        let offset = self.cluster_offset(self.bitmap_start_cluster);
+        self.reader.seek(SeekFrom::Start(offset))?;
+        let mut data = vec![0u8; self.bitmap_size as usize];
+        self.reader.read_exact(&mut data)?;
+        Ok(data)
+    }
+
+    /// Write the allocation bitmap back to disk (sector-aligned).
+    fn write_bitmap(&mut self, bitmap: &[u8]) -> Result<(), FilesystemError> {
+        let offset = self.cluster_offset(self.bitmap_start_cluster);
+        self.reader.seek(SeekFrom::Start(offset))?;
+        // Pad to sector alignment for raw device compatibility
+        let aligned_size = ((bitmap.len() + 511) / 512) * 512;
+        let mut aligned = vec![0u8; aligned_size];
+        aligned[..bitmap.len()].copy_from_slice(bitmap);
+        self.reader.write_all(&aligned)?;
+        Ok(())
+    }
+
+    // -- Cluster Management --
+
+    /// Allocate `count` clusters, chain them in FAT, set bitmap bits.
+    fn allocate_clusters(&mut self, count: u32) -> Result<u32, FilesystemError> {
+        if count == 0 {
+            return Ok(0);
+        }
+        let mut bitmap = self.read_bitmap()?;
+        let mut allocated = Vec::new();
+
+        // Scan bitmap for free clusters
+        for cluster_idx in 0..self.cluster_count {
+            if allocated.len() as u32 >= count {
+                break;
+            }
+            let byte = cluster_idx / 8;
+            let bit = cluster_idx % 8;
+            if byte < bitmap.len() as u32 && bitmap[byte as usize] & (1 << bit) == 0 {
+                // Mark as used
+                bitmap[byte as usize] |= 1 << bit;
+                allocated.push(cluster_idx + 2); // clusters are 2-based
+            }
+        }
+
+        if (allocated.len() as u32) < count {
+            return Err(FilesystemError::DiskFull(format!(
+                "need {} clusters, only {} free",
+                count,
+                allocated.len()
+            )));
+        }
+
+        // Write FAT chain
+        for i in 0..allocated.len() {
+            let next = if i + 1 < allocated.len() {
+                allocated[i + 1]
+            } else {
+                0xFFFFFFFFu32 // end of chain
+            };
+            self.write_fat_entry(allocated[i], next)?;
+        }
+
+        // Write bitmap
+        self.write_bitmap(&bitmap)?;
+
+        Ok(allocated[0])
+    }
+
+    /// Free a cluster chain: clear FAT entries, clear bitmap bits.
+    fn free_cluster_chain_rw(&mut self, start: u32) -> Result<(), FilesystemError> {
+        if start < 2 {
+            return Ok(());
+        }
+        let mut bitmap = self.read_bitmap()?;
+        let mut cluster = start;
+        let mut count = 0u32;
+
+        loop {
+            if cluster < 2 || count > self.cluster_count {
+                break;
+            }
+            // Read next before zeroing
+            let next = self.next_cluster(cluster)?;
+            // Zero FAT entry
+            self.write_fat_entry(cluster, 0)?;
+            // Clear bitmap bit
+            let idx = cluster - 2;
+            let byte = idx / 8;
+            let bit = idx % 8;
+            if (byte as usize) < bitmap.len() {
+                bitmap[byte as usize] &= !(1 << bit);
+            }
+            count += 1;
+            match next {
+                Some(n) => cluster = n,
+                None => break,
+            }
+        }
+
+        self.write_bitmap(&bitmap)?;
+        Ok(())
+    }
+
+    /// Write a FAT entry (4 bytes per entry).
+    fn write_fat_entry(&mut self, cluster: u32, value: u32) -> Result<(), FilesystemError> {
+        let offset = self.fat_offset() + cluster as u64 * 4;
+        self.reader.seek(SeekFrom::Start(offset))?;
+        self.reader.write_all(&value.to_le_bytes())?;
+        Ok(())
+    }
+
+    /// Write data to a cluster's location on disk.
+    fn write_cluster_data(&mut self, cluster: u32, data: &[u8]) -> Result<(), FilesystemError> {
+        let offset = self.cluster_offset(cluster);
+        self.reader.seek(SeekFrom::Start(offset))?;
+        self.reader.write_all(data)?;
+        Ok(())
+    }
+
+    /// Count free clusters by scanning the bitmap.
+    fn count_free_clusters(&mut self) -> Result<u32, FilesystemError> {
+        let bitmap = self.read_bitmap()?;
+        let used = count_set_bits(&bitmap, self.cluster_count);
+        Ok(self.cluster_count - used as u32)
+    }
+
+    // -- Name & Checksum --
+
+    /// Uppercase a UTF-16 character (ASCII range only for MVP).
+    fn upcase_char(c: u16) -> u16 {
+        if (0x0061..=0x007A).contains(&c) {
+            c - 0x0020
+        } else {
+            c
+        }
+    }
+
+    /// Compute the exFAT name hash for a filename.
+    fn name_hash(name: &str) -> u16 {
+        let mut hash: u16 = 0;
+        for c in name.encode_utf16() {
+            let uc = Self::upcase_char(c);
+            let lo = (uc & 0xFF) as u8;
+            let hi = (uc >> 8) as u8;
+            hash = hash.rotate_right(1).wrapping_add(lo as u16);
+            hash = hash.rotate_right(1).wrapping_add(hi as u16);
+        }
+        hash
+    }
+
+    /// Compute the entry set checksum over raw entry bytes.
+    /// Skips bytes 2-3 of the first entry (the SetChecksum field itself).
+    fn entry_set_checksum(entries: &[u8]) -> u16 {
+        let mut cs: u16 = 0;
+        for (i, &byte) in entries.iter().enumerate() {
+            // Skip bytes 2 and 3 (SetChecksum field in the File entry)
+            if i == 2 || i == 3 {
+                continue;
+            }
+            cs = if cs & 1 != 0 {
+                0x8000 | (cs >> 1)
+            } else {
+                cs >> 1
+            };
+            cs = cs.wrapping_add(byte as u16);
+        }
+        cs
+    }
+
+    /// Validate an exFAT filename.
+    fn validate_exfat_name(name: &str) -> Result<(), FilesystemError> {
+        if name.is_empty() || name.len() > 255 {
+            return Err(FilesystemError::InvalidData(
+                "exFAT name must be 1-255 characters".into(),
+            ));
+        }
+        const FORBIDDEN: &[char] = &['"', '*', '/', ':', '<', '>', '?', '\\', '|'];
+        for c in name.chars() {
+            if FORBIDDEN.contains(&c) || (c as u32) < 0x20 {
+                return Err(FilesystemError::InvalidData(format!(
+                    "invalid character '{}' in exFAT filename",
+                    c
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    // -- Directory Entry Sets --
+
+    /// Build a complete entry set (File + Stream + FileName entries).
+    fn build_entry_set(name: &str, attrs: u16, first_cluster: u32, data_len: u64) -> Vec<u8> {
+        let name_utf16: Vec<u16> = name.encode_utf16().collect();
+        let name_entry_count = (name_utf16.len() + 14) / 15; // ceil(len/15)
+        let secondary_count = 1 + name_entry_count; // stream + name entries
+        let total_entries = 1 + secondary_count; // file + secondaries
+        let mut entries = vec![0u8; total_entries * 32];
+
+        let ts = current_exfat_timestamp();
+
+        // File Entry (0x85)
+        entries[0] = ENTRY_TYPE_FILE;
+        entries[1] = secondary_count as u8;
+        // [2-3] = SetChecksum (filled later)
+        entries[4] = (attrs & 0xFF) as u8;
+        entries[5] = (attrs >> 8) as u8;
+        // CreateTimestamp [8-11]
+        entries[8..12].copy_from_slice(&ts.to_le_bytes());
+        // ModifyTimestamp [12-15]
+        entries[12..16].copy_from_slice(&ts.to_le_bytes());
+        // AccessTimestamp [16-19]
+        entries[16..20].copy_from_slice(&ts.to_le_bytes());
+
+        // Stream Extension (0xC0) at offset 32
+        let s = 32;
+        entries[s] = ENTRY_TYPE_STREAM_EXT;
+        entries[s + 1] = 0x01; // AllocationPossible, NoFatChain=0 (use FAT chain)
+        entries[s + 3] = name_utf16.len() as u8; // NameLength
+        let nh = Self::name_hash(name);
+        entries[s + 4] = (nh & 0xFF) as u8;
+        entries[s + 5] = (nh >> 8) as u8;
+        // ValidDataLength [8-15]
+        entries[s + 8..s + 16].copy_from_slice(&data_len.to_le_bytes());
+        // FirstCluster [20-23]
+        entries[s + 20..s + 24].copy_from_slice(&first_cluster.to_le_bytes());
+        // DataLength [24-31]
+        entries[s + 24..s + 32].copy_from_slice(&data_len.to_le_bytes());
+
+        // File Name entries (0xC1) starting at offset 64
+        for i in 0..name_entry_count {
+            let off = 64 + i * 32;
+            entries[off] = ENTRY_TYPE_FILE_NAME;
+            entries[off + 1] = 0x00;
+            for j in 0..15 {
+                let char_idx = i * 15 + j;
+                if char_idx < name_utf16.len() {
+                    let c = name_utf16[char_idx];
+                    entries[off + 2 + j * 2] = (c & 0xFF) as u8;
+                    entries[off + 2 + j * 2 + 1] = (c >> 8) as u8;
+                }
+            }
+        }
+
+        // Compute and set the entry set checksum
+        let checksum = Self::entry_set_checksum(&entries);
+        entries[2] = (checksum & 0xFF) as u8;
+        entries[3] = (checksum >> 8) as u8;
+
+        entries
+    }
+
+    /// Check if a name already exists in a directory's raw data.
+    fn name_exists_in_dir(dir_data: &[u8], name: &str) -> bool {
+        let mut pos = 0;
+        while pos + 32 <= dir_data.len() {
+            let entry_type = dir_data[pos];
+            if entry_type == 0x00 {
+                break;
+            }
+            if entry_type == ENTRY_TYPE_FILE {
+                let secondary_count = dir_data[pos + 1] as usize;
+                let stream_pos = pos + 32;
+                if stream_pos + 32 <= dir_data.len()
+                    && dir_data[stream_pos] == ENTRY_TYPE_STREAM_EXT
+                {
+                    let name_length = dir_data[stream_pos + 3] as usize;
+                    // Collect name from 0xC1 entries
+                    let mut name_chars = Vec::new();
+                    for i in 0..secondary_count.saturating_sub(1) {
+                        let fn_pos = pos + 64 + i * 32;
+                        if fn_pos + 32 > dir_data.len() || dir_data[fn_pos] != ENTRY_TYPE_FILE_NAME
+                        {
+                            break;
+                        }
+                        for j in 0..15 {
+                            if name_chars.len() >= name_length {
+                                break;
+                            }
+                            let co = fn_pos + 2 + j * 2;
+                            if co + 1 < dir_data.len() {
+                                name_chars
+                                    .push(u16::from_le_bytes([dir_data[co], dir_data[co + 1]]));
+                            }
+                        }
+                    }
+                    name_chars.truncate(name_length);
+                    let existing = String::from_utf16_lossy(&name_chars);
+                    if existing.eq_ignore_ascii_case(name) {
+                        return true;
+                    }
+                }
+                pos += 32 * (1 + secondary_count);
+                continue;
+            }
+            pos += 32;
+        }
+        false
+    }
+
+    // -- Directory Operations --
+
+    /// Add an entry set to a parent directory. Finds free slots or extends the chain.
+    fn add_entry_to_directory(
+        &mut self,
+        parent: &FileEntry,
+        entry_bytes: &[u8],
+    ) -> Result<(), FilesystemError> {
+        let parent_cluster = if parent.path == "/" {
+            self.root_cluster
+        } else {
+            parent.location as u32
+        };
+
+        let dir_data = self.read_cluster_chain(parent_cluster, None)?;
+        let entries_needed = entry_bytes.len() / 32;
+
+        // Find a run of free slots (type 0x00 or deleted entries with InUse bit clear)
+        let mut pos = 0;
+        let mut run_start = None;
+        let mut run_count = 0;
+
+        while pos + 32 <= dir_data.len() {
+            let t = dir_data[pos];
+            if t == 0x00 || (t & 0x80 == 0 && t != 0x00) {
+                // Free or deleted entry
+                if run_start.is_none() {
+                    run_start = Some(pos);
+                    run_count = 1;
+                } else {
+                    run_count += 1;
+                }
+                // If this is end-of-directory (0x00), all remaining slots are free too
+                if t == 0x00 {
+                    let remaining_slots = (dir_data.len() - pos) / 32;
+                    run_count = run_count + remaining_slots - 1; // -1 since we already counted this one
+                    break;
+                }
+                if run_count >= entries_needed {
+                    break;
+                }
+            } else {
+                run_start = None;
+                run_count = 0;
+            }
+            pos += 32;
+        }
+
+        if run_count >= entries_needed {
+            // Write entry set at run_start position
+            let start = run_start.unwrap();
+            let cluster_offset_in_chain = start / self.cluster_size as usize;
+            let offset_in_cluster = start % self.cluster_size as usize;
+
+            // Walk to the right cluster
+            let mut cluster = parent_cluster;
+            for _ in 0..cluster_offset_in_chain {
+                match self.next_cluster(cluster)? {
+                    Some(next) => cluster = next,
+                    None => {
+                        return Err(FilesystemError::InvalidData(
+                            "directory chain shorter than expected".into(),
+                        ))
+                    }
+                }
+            }
+
+            // Write the entry bytes, potentially spanning clusters
+            let mut written = 0;
+            let mut cur_cluster = cluster;
+            let mut cur_offset = offset_in_cluster;
+            while written < entry_bytes.len() {
+                let avail = self.cluster_size as usize - cur_offset;
+                let to_write = avail.min(entry_bytes.len() - written);
+                let disk_offset = self.cluster_offset(cur_cluster) + cur_offset as u64;
+                self.reader.seek(SeekFrom::Start(disk_offset))?;
+                self.reader
+                    .write_all(&entry_bytes[written..written + to_write])?;
+                written += to_write;
+                cur_offset = 0;
+                if written < entry_bytes.len() {
+                    match self.next_cluster(cur_cluster)? {
+                        Some(next) => cur_cluster = next,
+                        None => {
+                            return Err(FilesystemError::InvalidData(
+                                "directory chain too short for entry".into(),
+                            ))
+                        }
+                    }
+                }
+            }
+
+            // If we overwrote end-of-directory markers, ensure there's a 0x00 terminator after
+            let end_pos = start + entry_bytes.len();
+            if end_pos < dir_data.len() && dir_data[end_pos] != 0x00 {
+                // The next slot should already be 0x00 or another entry; only set if needed
+            }
+        } else {
+            // Need to extend directory: allocate a new cluster
+            let new_cluster = self.allocate_clusters(1)?;
+            // Zero the new cluster
+            let zeroed = vec![0u8; self.cluster_size as usize];
+            self.write_cluster_data(new_cluster, &zeroed)?;
+
+            // Append to chain: walk to last cluster
+            let mut last = parent_cluster;
+            loop {
+                match self.next_cluster(last)? {
+                    Some(next) => last = next,
+                    None => break,
+                }
+            }
+            // Link last -> new_cluster
+            self.write_fat_entry(last, new_cluster)?;
+            self.write_fat_entry(new_cluster, 0xFFFFFFFF)?;
+
+            // Write entry set at the start of the new cluster
+            let disk_offset = self.cluster_offset(new_cluster);
+            self.reader.seek(SeekFrom::Start(disk_offset))?;
+            self.reader.write_all(entry_bytes)?;
+        }
+
+        Ok(())
+    }
+
+    /// Remove an entry set from a directory by clearing InUse bits.
+    fn remove_entry_from_directory(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+    ) -> Result<(), FilesystemError> {
+        let parent_cluster = if parent.path == "/" {
+            self.root_cluster
+        } else {
+            parent.location as u32
+        };
+
+        let dir_data = self.read_cluster_chain(parent_cluster, None)?;
+
+        // Find the entry set by matching name
+        let mut pos = 0;
+        while pos + 32 <= dir_data.len() {
+            let t = dir_data[pos];
+            if t == 0x00 {
+                break;
+            }
+            if t == ENTRY_TYPE_FILE {
+                let secondary_count = dir_data[pos + 1] as usize;
+                let stream_pos = pos + 32;
+                if stream_pos + 32 <= dir_data.len()
+                    && dir_data[stream_pos] == ENTRY_TYPE_STREAM_EXT
+                {
+                    let name_length = dir_data[stream_pos + 3] as usize;
+                    let mut name_chars = Vec::new();
+                    for i in 0..secondary_count.saturating_sub(1) {
+                        let fn_pos = pos + 64 + i * 32;
+                        if fn_pos + 32 > dir_data.len() || dir_data[fn_pos] != ENTRY_TYPE_FILE_NAME
+                        {
+                            break;
+                        }
+                        for j in 0..15 {
+                            if name_chars.len() >= name_length {
+                                break;
+                            }
+                            let co = fn_pos + 2 + j * 2;
+                            if co + 1 < dir_data.len() {
+                                name_chars
+                                    .push(u16::from_le_bytes([dir_data[co], dir_data[co + 1]]));
+                            }
+                        }
+                    }
+                    name_chars.truncate(name_length);
+                    let existing = String::from_utf16_lossy(&name_chars);
+
+                    if existing.eq_ignore_ascii_case(&entry.name) {
+                        // Found it — clear InUse bit on all entries in the set
+                        let total = 1 + secondary_count;
+                        for i in 0..total {
+                            let entry_pos = pos + i * 32;
+                            // Calculate which cluster and offset
+                            let cluster_idx = entry_pos / self.cluster_size as usize;
+                            let offset_in_cluster = entry_pos % self.cluster_size as usize;
+
+                            let mut cluster = parent_cluster;
+                            for _ in 0..cluster_idx {
+                                match self.next_cluster(cluster)? {
+                                    Some(next) => cluster = next,
+                                    None => break,
+                                }
+                            }
+
+                            let disk_offset =
+                                self.cluster_offset(cluster) + offset_in_cluster as u64;
+                            self.reader.seek(SeekFrom::Start(disk_offset))?;
+                            let mut type_byte = [0u8; 1];
+                            self.reader.read_exact(&mut type_byte)?;
+                            // Clear bit 7 (InUse)
+                            type_byte[0] &= 0x7F;
+                            self.reader.seek(SeekFrom::Start(disk_offset))?;
+                            self.reader.write_all(&type_byte)?;
+                        }
+                        return Ok(());
+                    }
+                }
+                pos += 32 * (1 + secondary_count);
+                continue;
+            }
+            pos += 32;
+        }
+
+        Err(FilesystemError::NotFound(entry.name.clone()))
+    }
+
+    // -- Boot Checksum --
+
+    /// Recalculate and write the boot region checksum (main + backup).
+    fn recalculate_boot_checksum(&mut self) -> Result<(), FilesystemError> {
+        // Read main boot region (sectors 0-11)
+        let boot_region_size = 12 * self.bytes_per_sector;
+        self.reader.seek(SeekFrom::Start(self.partition_offset))?;
+        let mut boot_region = vec![0u8; boot_region_size as usize];
+        self.reader.read_exact(&mut boot_region)?;
+
+        let checksum = compute_exfat_boot_checksum(&boot_region, self.bytes_per_sector);
+        let checksum_data = build_checksum_sector(checksum, self.bytes_per_sector);
+
+        // Write checksum to sector 11 of main boot region
+        let cs_offset = self.partition_offset + 11 * self.bytes_per_sector;
+        self.reader.seek(SeekFrom::Start(cs_offset))?;
+        self.reader.write_all(&checksum_data)?;
+
+        // Copy main boot region (sectors 0-11) to backup (sectors 12-23)
+        // Re-read to include the checksum we just wrote
+        self.reader.seek(SeekFrom::Start(self.partition_offset))?;
+        let mut full_boot = vec![0u8; 12 * self.bytes_per_sector as usize];
+        self.reader.read_exact(&mut full_boot)?;
+
+        let backup_offset = self.partition_offset + 12 * self.bytes_per_sector;
+        self.reader.seek(SeekFrom::Start(backup_offset))?;
+        self.reader.write_all(&full_boot)?;
+
+        Ok(())
+    }
+}
+
+// =============================================================================
+// EditableFilesystem implementation
+// =============================================================================
+
+impl<R: Read + Write + Seek + Send> EditableFilesystem for ExfatFilesystem<R> {
+    fn create_file(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        data: &mut dyn std::io::Read,
+        data_len: u64,
+        _options: &CreateFileOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        Self::validate_exfat_name(name)?;
+
+        // Check for duplicate
+        let parent_cluster = if parent.path == "/" {
+            self.root_cluster
+        } else {
+            parent.location as u32
+        };
+        let dir_data = self.read_cluster_chain(parent_cluster, None)?;
+        if Self::name_exists_in_dir(&dir_data, name) {
+            return Err(FilesystemError::AlreadyExists(name.to_string()));
+        }
+
+        // Allocate clusters for file data
+        let cluster_size = self.cluster_size as usize;
+        let clusters_needed = if data_len == 0 {
+            0
+        } else {
+            ((data_len as usize + cluster_size - 1) / cluster_size) as u32
+        };
+
+        let first_cluster = if clusters_needed > 0 {
+            self.allocate_clusters(clusters_needed)?
+        } else {
+            0
+        };
+
+        // Write file data to clusters
+        if clusters_needed > 0 {
+            let mut cluster = first_cluster;
+            let mut remaining = data_len as usize;
+            let mut buf = vec![0u8; cluster_size];
+            loop {
+                if cluster < 2 || remaining == 0 {
+                    break;
+                }
+                let to_read = remaining.min(cluster_size);
+                buf.fill(0);
+                let mut total_read = 0;
+                while total_read < to_read {
+                    match data.read(&mut buf[total_read..to_read]) {
+                        Ok(0) => break,
+                        Ok(n) => total_read += n,
+                        Err(e) => return Err(FilesystemError::Io(e)),
+                    }
+                }
+                self.write_cluster_data(cluster, &buf)?;
+                remaining -= to_read;
+                match self.next_cluster(cluster)? {
+                    Some(next) => cluster = next,
+                    None => break,
+                }
+            }
+        }
+
+        // Build entry set and add to directory
+        let entry_bytes = Self::build_entry_set(name, 0x20, first_cluster, data_len); // 0x20 = Archive
+        self.add_entry_to_directory(parent, &entry_bytes)?;
+        self.sync_metadata()?;
+
+        let path = if parent.path == "/" {
+            format!("/{name}")
+        } else {
+            format!("{}/{name}", parent.path)
+        };
+
+        Ok(FileEntry::new_file(
+            name.to_string(),
+            path,
+            data_len,
+            first_cluster as u64,
+        ))
+    }
+
+    fn create_directory(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        _options: &CreateDirectoryOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        Self::validate_exfat_name(name)?;
+
+        let parent_cluster = if parent.path == "/" {
+            self.root_cluster
+        } else {
+            parent.location as u32
+        };
+        let dir_data = self.read_cluster_chain(parent_cluster, None)?;
+        if Self::name_exists_in_dir(&dir_data, name) {
+            return Err(FilesystemError::AlreadyExists(name.to_string()));
+        }
+
+        // Allocate 1 cluster for new directory (exFAT dirs don't have . and ..)
+        let new_cluster = self.allocate_clusters(1)?;
+        let zeroed = vec![0u8; self.cluster_size as usize];
+        self.write_cluster_data(new_cluster, &zeroed)?;
+
+        // Build entry set with directory attribute
+        let entry_bytes = Self::build_entry_set(name, ATTR_DIRECTORY as u16, new_cluster, 0);
+        self.add_entry_to_directory(parent, &entry_bytes)?;
+        self.sync_metadata()?;
+
+        let path = if parent.path == "/" {
+            format!("/{name}")
+        } else {
+            format!("{}/{name}", parent.path)
+        };
+
+        Ok(FileEntry::new_directory(
+            name.to_string(),
+            path,
+            new_cluster as u64,
+        ))
+    }
+
+    fn delete_entry(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+    ) -> Result<(), FilesystemError> {
+        if entry.is_directory() {
+            let children = self.list_directory(entry)?;
+            if !children.is_empty() {
+                return Err(FilesystemError::InvalidData(format!(
+                    "directory '{}' is not empty",
+                    entry.name
+                )));
+            }
+        }
+
+        self.remove_entry_from_directory(parent, entry)?;
+
+        if entry.location >= 2 {
+            self.free_cluster_chain_rw(entry.location as u32)?;
+        }
+
+        self.sync_metadata()?;
+        Ok(())
+    }
+
+    fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
+        self.recalculate_boot_checksum()?;
+        self.reader.flush()?;
+        Ok(())
+    }
+
+    fn free_space(&mut self) -> Result<u64, FilesystemError> {
+        let free = self.count_free_clusters()?;
+        Ok(free as u64 * self.cluster_size)
     }
 }
 
@@ -1334,5 +2073,322 @@ mod tests {
                 0xDEADBEEF
             );
         }
+    }
+
+    // =========================================================================
+    // Editing tests
+    // =========================================================================
+
+    use crate::fs::filesystem::{CreateDirectoryOptions, CreateFileOptions, EditableFilesystem};
+    use std::io::Cursor;
+
+    /// Create a minimal in-memory exFAT image suitable for editing tests.
+    ///
+    /// Layout (512 bytes/sector, 8 sectors/cluster = 4096 bytes/cluster):
+    /// - Sectors 0-10: Main boot region (VBR + extended boot + OEM params)
+    /// - Sector 11: Boot checksum
+    /// - Sectors 12-23: Backup boot region
+    /// - Sectors 24-151: FAT (128 sectors)
+    /// - Sector 256+: Cluster heap
+    ///   - Cluster 2: Allocation bitmap
+    ///   - Cluster 3: (reserved for upcase table placeholder)
+    ///   - Cluster 4: Root directory
+    ///   - Clusters 5+: Free
+    fn make_test_exfat_image() -> Vec<u8> {
+        let bytes_per_sector: u64 = 512;
+        let sectors_per_cluster: u64 = 8;
+        let cluster_size = bytes_per_sector * sectors_per_cluster; // 4096
+        let cluster_heap_offset: u64 = 256; // sectors
+        let cluster_count: u32 = 100; // 100 clusters
+        let volume_length: u64 = cluster_heap_offset + cluster_count as u64 * sectors_per_cluster;
+        let total_bytes = volume_length * bytes_per_sector;
+        let mut image = vec![0u8; total_bytes as usize];
+
+        // -- VBR (sector 0) --
+        let vbr = make_exfat_vbr_custom(volume_length, cluster_count);
+        image[..512].copy_from_slice(&vbr);
+
+        // -- FAT (starts at sector 24) --
+        let fat_start = 24 * bytes_per_sector as usize;
+        // Cluster 0,1: reserved (media type)
+        image[fat_start..fat_start + 4].copy_from_slice(&0xFFFFFFF8u32.to_le_bytes());
+        image[fat_start + 4..fat_start + 8].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+        // Cluster 2 (bitmap): end of chain
+        image[fat_start + 8..fat_start + 12].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+        // Cluster 3 (upcase placeholder): end of chain
+        image[fat_start + 12..fat_start + 16].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+        // Cluster 4 (root dir): end of chain
+        image[fat_start + 16..fat_start + 20].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+
+        // -- Allocation bitmap (cluster 2) --
+        let bitmap_offset = cluster_heap_offset as usize * 512 + 0 * cluster_size as usize;
+        // Clusters 2,3,4 are used (bitmap indices 0,1,2)
+        image[bitmap_offset] = 0x07; // bits 0,1,2 set
+
+        // -- Root directory (cluster 4) --
+        let root_offset = cluster_heap_offset as usize * 512 + 2 * cluster_size as usize;
+
+        // Allocation Bitmap entry (0x81)
+        image[root_offset] = ENTRY_TYPE_ALLOCATION_BITMAP;
+        // BitmapFlags = 0 (first bitmap)
+        // FirstCluster = 2
+        image[root_offset + 20..root_offset + 24].copy_from_slice(&2u32.to_le_bytes());
+        // DataLength = ceil(cluster_count/8)
+        let bitmap_size = ((cluster_count + 7) / 8) as u64;
+        image[root_offset + 24..root_offset + 32].copy_from_slice(&bitmap_size.to_le_bytes());
+
+        // Volume Label entry (0x83) at offset 32
+        let label_offset = root_offset + 32;
+        image[label_offset] = ENTRY_TYPE_VOLUME_LABEL;
+        image[label_offset + 1] = 4; // 4 chars
+        let label = "TEST";
+        for (i, c) in label.encode_utf16().enumerate() {
+            image[label_offset + 2 + i * 2] = (c & 0xFF) as u8;
+            image[label_offset + 2 + i * 2 + 1] = (c >> 8) as u8;
+        }
+
+        // Compute and write boot checksum for sectors 0-10
+        let boot_region = &image[..12 * 512];
+        let checksum = compute_exfat_boot_checksum(boot_region, bytes_per_sector);
+        let cs_sector = build_checksum_sector(checksum, bytes_per_sector);
+        let cs_offset = 11 * 512;
+        image[cs_offset..cs_offset + 512].copy_from_slice(&cs_sector);
+
+        // Copy main boot region to backup (sectors 12-23)
+        let main_boot: Vec<u8> = image[..12 * 512].to_vec();
+        image[12 * 512..24 * 512].copy_from_slice(&main_boot);
+
+        image
+    }
+
+    fn make_exfat_vbr_custom(volume_length: u64, cluster_count: u32) -> [u8; 512] {
+        let mut vbr = [0u8; 512];
+        vbr[0] = 0xEB;
+        vbr[1] = 0x76;
+        vbr[2] = 0x90;
+        vbr[3..11].copy_from_slice(b"EXFAT   ");
+        // Partition offset
+        vbr[0x40..0x48].copy_from_slice(&0u64.to_le_bytes());
+        // Volume length
+        vbr[0x48..0x50].copy_from_slice(&volume_length.to_le_bytes());
+        // FAT offset = 24 sectors
+        vbr[0x50..0x54].copy_from_slice(&24u32.to_le_bytes());
+        // FAT length = 128 sectors
+        vbr[0x54..0x58].copy_from_slice(&128u32.to_le_bytes());
+        // Cluster heap offset = 256 sectors
+        vbr[0x58..0x5C].copy_from_slice(&256u32.to_le_bytes());
+        // Cluster count
+        vbr[0x5C..0x60].copy_from_slice(&cluster_count.to_le_bytes());
+        // Root cluster = 4
+        vbr[0x60..0x64].copy_from_slice(&4u32.to_le_bytes());
+        // Volume serial
+        vbr[0x64..0x68].copy_from_slice(&0x12345678u32.to_le_bytes());
+        // Revision 1.0
+        vbr[0x68] = 0;
+        vbr[0x69] = 1;
+        // Bytes per sector shift = 9 (512)
+        vbr[0x6C] = 9;
+        // Sectors per cluster shift = 3 (8 sectors = 4096 bytes)
+        vbr[0x6D] = 3;
+        // Number of FATs = 1
+        vbr[0x6E] = 1;
+        // Boot signature
+        vbr[510] = 0x55;
+        vbr[511] = 0xAA;
+        vbr
+    }
+
+    fn open_test_exfat(image: &mut Vec<u8>) -> ExfatFilesystem<Cursor<&mut Vec<u8>>> {
+        let cursor = Cursor::new(image);
+        ExfatFilesystem::open(cursor, 0).expect("failed to open test exFAT image")
+    }
+
+    #[test]
+    fn test_exfat_name_hash() {
+        // The hash should be deterministic
+        let h1 = ExfatFilesystem::<Cursor<Vec<u8>>>::name_hash("test.txt");
+        let h2 = ExfatFilesystem::<Cursor<Vec<u8>>>::name_hash("test.txt");
+        assert_eq!(h1, h2);
+
+        // Case-insensitive: "TEST.TXT" should hash the same (ASCII uppercase)
+        let h3 = ExfatFilesystem::<Cursor<Vec<u8>>>::name_hash("TEST.TXT");
+        assert_eq!(h1, h3);
+    }
+
+    #[test]
+    fn test_exfat_entry_set_checksum() {
+        // Build an entry set and verify the checksum is non-zero and consistent
+        let entries =
+            ExfatFilesystem::<Cursor<Vec<u8>>>::build_entry_set("hello.txt", 0x20, 5, 100);
+        assert!(entries.len() >= 96); // At least 3 entries (file + stream + 1 name)
+        let stored_cs = u16::from_le_bytes([entries[2], entries[3]]);
+        assert_ne!(stored_cs, 0);
+
+        // Verify: recompute with checksum field zeroed out
+        let mut copy = entries.clone();
+        copy[2] = 0;
+        copy[3] = 0;
+        let recomputed = ExfatFilesystem::<Cursor<Vec<u8>>>::entry_set_checksum(&copy);
+        assert_eq!(recomputed, stored_cs);
+    }
+
+    #[test]
+    fn test_exfat_create_file() {
+        let mut image = make_test_exfat_image();
+        let mut fs = open_test_exfat(&mut image);
+
+        let root = fs.root().unwrap();
+        let initial_free = fs.free_space().unwrap();
+
+        let data = b"Hello exFAT world!";
+        let mut cursor = std::io::Cursor::new(data.as_slice());
+        let file = fs
+            .create_file(
+                &root,
+                "hello.txt",
+                &mut cursor,
+                data.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+
+        assert_eq!(file.name, "hello.txt");
+        assert_eq!(file.size, data.len() as u64);
+
+        // Should appear in directory listing
+        let entries = fs.list_directory(&root).unwrap();
+        assert!(entries.iter().any(|e| e.name == "hello.txt"));
+
+        // Free space should decrease by at least one cluster
+        let new_free = fs.free_space().unwrap();
+        assert!(new_free < initial_free);
+    }
+
+    #[test]
+    fn test_exfat_create_directory() {
+        let mut image = make_test_exfat_image();
+        let mut fs = open_test_exfat(&mut image);
+
+        let root = fs.root().unwrap();
+        let dir = fs
+            .create_directory(&root, "subdir", &CreateDirectoryOptions::default())
+            .unwrap();
+
+        assert_eq!(dir.name, "subdir");
+        assert!(dir.is_directory());
+
+        let entries = fs.list_directory(&root).unwrap();
+        assert!(entries
+            .iter()
+            .any(|e| e.name == "subdir" && e.is_directory()));
+    }
+
+    #[test]
+    fn test_exfat_delete_file() {
+        let mut image = make_test_exfat_image();
+        let mut fs = open_test_exfat(&mut image);
+
+        let root = fs.root().unwrap();
+        let initial_free = fs.free_space().unwrap();
+
+        // Create a file
+        let data = b"delete me";
+        let mut cursor = std::io::Cursor::new(data.as_slice());
+        let file = fs
+            .create_file(
+                &root,
+                "todelete.txt",
+                &mut cursor,
+                data.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+
+        // Delete it
+        let root = fs.root().unwrap();
+        fs.delete_entry(&root, &file).unwrap();
+
+        // Should not appear in listing
+        let entries = fs.list_directory(&root).unwrap();
+        assert!(!entries.iter().any(|e| e.name == "todelete.txt"));
+
+        // Free space should be recovered
+        let final_free = fs.free_space().unwrap();
+        assert_eq!(final_free, initial_free);
+    }
+
+    #[test]
+    fn test_exfat_duplicate_name() {
+        let mut image = make_test_exfat_image();
+        let mut fs = open_test_exfat(&mut image);
+
+        let root = fs.root().unwrap();
+        let data = b"first";
+        let mut cursor = std::io::Cursor::new(data.as_slice());
+        fs.create_file(
+            &root,
+            "dup.txt",
+            &mut cursor,
+            data.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+
+        // Try to create again — should fail
+        let mut cursor2 = std::io::Cursor::new(data.as_slice());
+        let root = fs.root().unwrap();
+        let result = fs.create_file(
+            &root,
+            "dup.txt",
+            &mut cursor2,
+            data.len() as u64,
+            &CreateFileOptions::default(),
+        );
+        assert!(matches!(result, Err(FilesystemError::AlreadyExists(_))));
+    }
+
+    #[test]
+    fn test_exfat_boot_checksum_updated() {
+        let mut image = make_test_exfat_image();
+
+        // Read initial checksum
+        let initial_cs = u32::from_le_bytes([
+            image[11 * 512],
+            image[11 * 512 + 1],
+            image[11 * 512 + 2],
+            image[11 * 512 + 3],
+        ]);
+
+        {
+            let mut fs = open_test_exfat(&mut image);
+            let root = fs.root().unwrap();
+            let data = b"trigger checksum update";
+            let mut cursor = std::io::Cursor::new(data.as_slice());
+            fs.create_file(
+                &root,
+                "checksumtest.txt",
+                &mut cursor,
+                data.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        }
+
+        // The boot checksum should still be valid (not necessarily changed since we
+        // didn't modify the VBR itself, but sync_metadata recalculated it)
+        let final_cs = u32::from_le_bytes([
+            image[11 * 512],
+            image[11 * 512 + 1],
+            image[11 * 512 + 2],
+            image[11 * 512 + 3],
+        ]);
+
+        // The checksum should be the same since VBR didn't change, but it was recalculated
+        assert_eq!(initial_cs, final_cs);
+
+        // Verify backup matches main
+        let main_boot: Vec<u8> = image[..12 * 512].to_vec();
+        let backup_boot = &image[12 * 512..24 * 512];
+        assert_eq!(main_boot, backup_boot);
     }
 }
