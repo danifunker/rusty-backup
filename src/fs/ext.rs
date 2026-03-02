@@ -8,11 +8,15 @@
 //! Also provides `CompactExtReader` for producing compacted partition images
 //! where unallocated blocks are zeroed out (ideal for compression).
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use super::entry::{EntryType, FileEntry};
-use super::filesystem::{Filesystem, FilesystemError};
-use super::unix_common::bitmap::BitmapReader;
+use super::filesystem::{
+    CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
+};
+use super::unix_common::bitmap::{
+    bitmap_clear_bit, bitmap_find_clear_bit, bitmap_set_bit, BitmapReader,
+};
 use super::unix_common::compact::{CompactLayout, CompactSection, CompactStreamReader};
 use super::unix_common::inode::{unix_entry_from_inode, unix_file_type, UnixFileType};
 use crate::fs::CompactResult;
@@ -737,6 +741,1091 @@ impl<R: Read + Seek + Send> Filesystem for ExtFilesystem<R> {
 
         // Return byte offset of the end of the highest used block
         Ok((highest_block + 1) * self.block_size)
+    }
+}
+
+// ---- ext Editing Support ----
+
+/// Validate a filename for ext2/3/4.
+fn validate_ext_name(name: &str) -> Result<(), FilesystemError> {
+    if name.is_empty() {
+        return Err(FilesystemError::InvalidData(
+            "ext: filename cannot be empty".into(),
+        ));
+    }
+    if name == "." || name == ".." {
+        return Err(FilesystemError::InvalidData(
+            "ext: filename cannot be '.' or '..'".into(),
+        ));
+    }
+    if name.len() > 255 {
+        return Err(FilesystemError::InvalidData(
+            "ext: filename exceeds 255 bytes".into(),
+        ));
+    }
+    if name.contains('/') {
+        return Err(FilesystemError::InvalidData(
+            "ext: filename cannot contain '/'".into(),
+        ));
+    }
+    if name.contains('\0') {
+        return Err(FilesystemError::InvalidData(
+            "ext: filename cannot contain NUL".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Compute the actual size of a directory entry (header + name, rounded to 4 bytes).
+fn dir_entry_actual_len(name_len: usize) -> usize {
+    // Header is 8 bytes: inode(4) + rec_len(2) + name_len(1) + file_type(1)
+    let raw = 8 + name_len;
+    (raw + 3) & !3 // round up to 4-byte boundary
+}
+
+impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
+    // ---- Low-level write helpers ----
+
+    /// Write a full block to disk.
+    fn write_block(&mut self, block_num: u64, data: &[u8]) -> Result<(), FilesystemError> {
+        let offset = self.partition_offset + block_num * self.block_size;
+        self.reader.seek(SeekFrom::Start(offset))?;
+        self.reader.write_all(data)?;
+        Ok(())
+    }
+
+    /// Write raw inode bytes to the inode table.
+    fn write_inode_raw(
+        &mut self,
+        inode_num: u32,
+        inode_bytes: &[u8],
+    ) -> Result<(), FilesystemError> {
+        let group = (inode_num - 1) / self.inodes_per_group;
+        let index = (inode_num - 1) % self.inodes_per_group;
+        let gd = &self.group_descriptors[group as usize];
+        let offset = self.partition_offset
+            + gd.inode_table * self.block_size
+            + index as u64 * self.inode_size as u64;
+        self.reader.seek(SeekFrom::Start(offset))?;
+        self.reader.write_all(inode_bytes)?;
+        Ok(())
+    }
+
+    /// Write the superblock with current free counts.
+    fn write_superblock(&mut self) -> Result<(), FilesystemError> {
+        // Read current superblock
+        self.reader
+            .seek(SeekFrom::Start(self.partition_offset + SUPERBLOCK_OFFSET))?;
+        let mut sb = [0u8; SUPERBLOCK_SIZE];
+        self.reader.read_exact(&mut sb)?;
+
+        // Compute total free inodes from group descriptors
+        let total_free_inodes: u64 = self
+            .group_descriptors
+            .iter()
+            .map(|gd| gd.free_inodes as u64)
+            .sum();
+
+        // Patch s_free_blocks_count (offset 0x0C)
+        sb[0x0C..0x10].copy_from_slice(&(self.free_blocks as u32).to_le_bytes());
+        if self.is_64bit {
+            sb[0x158..0x15C].copy_from_slice(&((self.free_blocks >> 32) as u32).to_le_bytes());
+        }
+
+        // Patch s_free_inodes_count (offset 0x10)
+        sb[0x10..0x14].copy_from_slice(&(total_free_inodes as u32).to_le_bytes());
+
+        // Write back
+        self.reader
+            .seek(SeekFrom::Start(self.partition_offset + SUPERBLOCK_OFFSET))?;
+        self.reader.write_all(&sb)?;
+        Ok(())
+    }
+
+    /// Write a single group descriptor back to the GDT.
+    fn write_group_descriptor(
+        &mut self,
+        group: usize,
+        gd: &GroupDescriptor,
+    ) -> Result<(), FilesystemError> {
+        let sb_block: u64 = if self.block_size == 1024 { 1 } else { 0 };
+        let gdt_offset = self.partition_offset
+            + (sb_block + 1) * self.block_size
+            + group as u64 * self.desc_size as u64;
+
+        let mut buf = vec![0u8; self.desc_size as usize];
+        // Read existing to preserve fields we don't modify
+        self.reader.seek(SeekFrom::Start(gdt_offset))?;
+        self.reader.read_exact(&mut buf)?;
+
+        // Write low fields
+        buf[0x00..0x04].copy_from_slice(&(gd.block_bitmap as u32).to_le_bytes());
+        buf[0x04..0x08].copy_from_slice(&(gd.inode_bitmap as u32).to_le_bytes());
+        buf[0x08..0x0C].copy_from_slice(&(gd.inode_table as u32).to_le_bytes());
+        buf[0x0C..0x0E].copy_from_slice(&(gd.free_blocks as u16).to_le_bytes());
+        buf[0x0E..0x10].copy_from_slice(&(gd.free_inodes as u16).to_le_bytes());
+        buf[0x12..0x14].copy_from_slice(&gd.flags.to_le_bytes());
+
+        // High fields for 64-bit
+        if self.is_64bit && self.desc_size >= 64 {
+            buf[0x20..0x24].copy_from_slice(&((gd.block_bitmap >> 32) as u32).to_le_bytes());
+            buf[0x24..0x28].copy_from_slice(&((gd.inode_bitmap >> 32) as u32).to_le_bytes());
+            buf[0x28..0x2C].copy_from_slice(&((gd.inode_table >> 32) as u32).to_le_bytes());
+            buf[0x2C..0x2E].copy_from_slice(&((gd.free_blocks >> 16) as u16).to_le_bytes());
+            buf[0x2E..0x30].copy_from_slice(&((gd.free_inodes >> 16) as u16).to_le_bytes());
+        }
+
+        self.reader.seek(SeekFrom::Start(gdt_offset))?;
+        self.reader.write_all(&buf)?;
+        Ok(())
+    }
+
+    // ---- Block allocation/deallocation ----
+
+    /// Allocate `count` blocks, preferring `preferred_group`. Returns block numbers.
+    fn allocate_blocks(
+        &mut self,
+        count: usize,
+        preferred_group: u32,
+    ) -> Result<Vec<u64>, FilesystemError> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        if (self.free_blocks as usize) < count {
+            return Err(FilesystemError::DiskFull("not enough free blocks".into()));
+        }
+
+        let blocks_per_group =
+            ((self.total_blocks - self.first_data_block as u64) + self.group_count as u64 - 1)
+                / self.group_count as u64;
+
+        let mut allocated = Vec::with_capacity(count);
+        let mut remaining = count;
+
+        // Try preferred group first, then scan all groups
+        let mut group_order: Vec<u32> = Vec::with_capacity(self.group_count as usize);
+        group_order.push(preferred_group.min(self.group_count - 1));
+        for g in 0..self.group_count {
+            if g != preferred_group.min(self.group_count - 1) {
+                group_order.push(g);
+            }
+        }
+
+        for &group in &group_order {
+            if remaining == 0 {
+                break;
+            }
+            if self.group_descriptors[group as usize].free_blocks == 0 {
+                continue;
+            }
+
+            let group_start = self.first_data_block as u64 + group as u64 * blocks_per_group;
+            let group_blocks = if group == self.group_count - 1 {
+                (self.total_blocks - group_start).min(blocks_per_group)
+            } else {
+                blocks_per_group
+            };
+
+            let mut bitmap = self.read_block_bitmap(group as usize)?;
+
+            while remaining > 0 {
+                if let Some(bit) = bitmap_find_clear_bit(&bitmap, group_blocks) {
+                    bitmap_set_bit(&mut bitmap, bit);
+                    let abs_block = group_start + bit;
+                    allocated.push(abs_block);
+                    self.group_descriptors[group as usize].free_blocks -= 1;
+                    self.free_blocks -= 1;
+                    remaining -= 1;
+                } else {
+                    break;
+                }
+            }
+
+            // Write modified bitmap back
+            self.write_block(self.group_descriptors[group as usize].block_bitmap, &bitmap)?;
+            self.write_group_descriptor(
+                group as usize,
+                &self.group_descriptors[group as usize].clone(),
+            )?;
+        }
+
+        if remaining > 0 {
+            // Shouldn't happen since we checked free_blocks, but be safe
+            return Err(FilesystemError::DiskFull(
+                "could not allocate enough blocks".into(),
+            ));
+        }
+
+        Ok(allocated)
+    }
+
+    /// Free a list of blocks back to the filesystem.
+    fn free_blocks_list(&mut self, blocks: &[u64]) -> Result<(), FilesystemError> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+
+        let blocks_per_group =
+            ((self.total_blocks - self.first_data_block as u64) + self.group_count as u64 - 1)
+                / self.group_count as u64;
+
+        // Group blocks by their group for efficient bitmap updates
+        let mut by_group: std::collections::HashMap<u32, Vec<u64>> =
+            std::collections::HashMap::new();
+        for &blk in blocks {
+            if blk == 0 {
+                continue; // sparse blocks
+            }
+            let group = ((blk - self.first_data_block as u64) / blocks_per_group) as u32;
+            by_group.entry(group).or_default().push(blk);
+        }
+
+        for (group, blk_list) in &by_group {
+            let group_start = self.first_data_block as u64 + *group as u64 * blocks_per_group;
+            let mut bitmap = self.read_block_bitmap(*group as usize)?;
+
+            for &blk in blk_list {
+                let bit = blk - group_start;
+                bitmap_clear_bit(&mut bitmap, bit);
+                self.group_descriptors[*group as usize].free_blocks += 1;
+                self.free_blocks += 1;
+            }
+
+            self.write_block(
+                self.group_descriptors[*group as usize].block_bitmap,
+                &bitmap,
+            )?;
+            self.write_group_descriptor(
+                *group as usize,
+                &self.group_descriptors[*group as usize].clone(),
+            )?;
+        }
+
+        Ok(())
+    }
+
+    // ---- Inode allocation/deallocation ----
+
+    /// Allocate a new inode, preferring `preferred_group`. Returns 1-based inode number.
+    fn allocate_inode(&mut self, preferred_group: u32) -> Result<u32, FilesystemError> {
+        let mut group_order: Vec<u32> = Vec::with_capacity(self.group_count as usize);
+        group_order.push(preferred_group.min(self.group_count - 1));
+        for g in 0..self.group_count {
+            if g != preferred_group.min(self.group_count - 1) {
+                group_order.push(g);
+            }
+        }
+
+        for &group in &group_order {
+            if self.group_descriptors[group as usize].free_inodes == 0 {
+                continue;
+            }
+
+            let gd = &self.group_descriptors[group as usize];
+            let bitmap_block = gd.inode_bitmap;
+            let mut bitmap = self.read_block(bitmap_block)?;
+
+            if let Some(bit) = bitmap_find_clear_bit(&bitmap, self.inodes_per_group as u64) {
+                bitmap_set_bit(&mut bitmap, bit);
+                self.write_block(bitmap_block, &bitmap)?;
+
+                self.group_descriptors[group as usize].free_inodes -= 1;
+                self.write_group_descriptor(
+                    group as usize,
+                    &self.group_descriptors[group as usize].clone(),
+                )?;
+
+                let inode_num = group * self.inodes_per_group + bit as u32 + 1;
+                return Ok(inode_num);
+            }
+        }
+
+        Err(FilesystemError::DiskFull("no free inodes".into()))
+    }
+
+    /// Free an inode by clearing its bitmap bit and zeroing its inode table entry.
+    fn free_inode(&mut self, inode_num: u32) -> Result<(), FilesystemError> {
+        let group = (inode_num - 1) / self.inodes_per_group;
+        let index = (inode_num - 1) % self.inodes_per_group;
+
+        // Clear inode bitmap
+        let gd = &self.group_descriptors[group as usize];
+        let bitmap_block = gd.inode_bitmap;
+        let mut bitmap = self.read_block(bitmap_block)?;
+        bitmap_clear_bit(&mut bitmap, index as u64);
+        self.write_block(bitmap_block, &bitmap)?;
+
+        self.group_descriptors[group as usize].free_inodes += 1;
+        self.write_group_descriptor(
+            group as usize,
+            &self.group_descriptors[group as usize].clone(),
+        )?;
+
+        // Zero out the inode in the inode table
+        let zero_inode = vec![0u8; self.inode_size as usize];
+        self.write_inode_raw(inode_num, &zero_inode)?;
+
+        Ok(())
+    }
+
+    /// Build an inode byte buffer with the given parameters.
+    fn build_inode_bytes(
+        &self,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        size: u64,
+        links: u16,
+        flags: u32,
+        block_data: &[u8; 60],
+    ) -> Vec<u8> {
+        let mut buf = vec![0u8; self.inode_size as usize];
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as u32;
+
+        // i_mode (0x00)
+        buf[0x00..0x02].copy_from_slice(&(mode as u16).to_le_bytes());
+        // i_uid_lo (0x02)
+        buf[0x02..0x04].copy_from_slice(&(uid as u16).to_le_bytes());
+        // i_size_lo (0x04)
+        buf[0x04..0x08].copy_from_slice(&(size as u32).to_le_bytes());
+        // i_atime (0x08)
+        buf[0x08..0x0C].copy_from_slice(&now.to_le_bytes());
+        // i_ctime (0x0C)
+        buf[0x0C..0x10].copy_from_slice(&now.to_le_bytes());
+        // i_mtime (0x10)
+        buf[0x10..0x14].copy_from_slice(&now.to_le_bytes());
+        // i_links_count (0x1A)
+        buf[0x1A..0x1C].copy_from_slice(&links.to_le_bytes());
+        // i_blocks_lo (0x1C) — number of 512-byte sectors (we compute from size)
+        let sectors = ((size + 511) / 512) as u32;
+        buf[0x1C..0x20].copy_from_slice(&sectors.to_le_bytes());
+        // i_flags (0x20)
+        buf[0x20..0x24].copy_from_slice(&flags.to_le_bytes());
+        // i_gid_lo (0x18)
+        buf[0x18..0x1A].copy_from_slice(&(gid as u16).to_le_bytes());
+        // i_block (0x28..0x64) — 60 bytes
+        buf[0x28..0x64].copy_from_slice(block_data);
+        // i_size_hi (0x6C) for large files
+        buf[0x6C..0x70].copy_from_slice(&((size >> 32) as u32).to_le_bytes());
+        // i_uid_hi (0x78)
+        if buf.len() >= 0x7A {
+            buf[0x78..0x7A].copy_from_slice(&((uid >> 16) as u16).to_le_bytes());
+        }
+        // i_gid_hi (0x7A)
+        if buf.len() >= 0x7C {
+            buf[0x7A..0x7C].copy_from_slice(&((gid >> 16) as u16).to_le_bytes());
+        }
+
+        buf
+    }
+
+    // ---- Directory entry manipulation ----
+
+    /// Check if a name exists in a directory's data.
+    fn name_exists_in_dir(
+        &mut self,
+        parent_inode: u32,
+        name: &str,
+    ) -> Result<bool, FilesystemError> {
+        let inode = self.read_inode(parent_inode)?;
+        let data = self.read_inode_data(&inode, inode.size as usize)?;
+        let entries = self.parse_directory(&data);
+        Ok(entries.iter().any(|e| e.name == name))
+    }
+
+    /// Add a directory entry to a parent directory.
+    ///
+    /// Finds space in the last entry's rec_len slack, or allocates a new block.
+    fn add_dir_entry(
+        &mut self,
+        parent_inode: u32,
+        name: &str,
+        child_inode: u32,
+        file_type: u8,
+    ) -> Result<(), FilesystemError> {
+        let parent = self.read_inode(parent_inode)?;
+        let data_blocks = self.inode_data_blocks(&parent)?;
+        let new_entry_len = dir_entry_actual_len(name.len());
+
+        // Try to find space in existing directory blocks
+        for &block_num in &data_blocks {
+            if block_num == 0 {
+                continue;
+            }
+            let mut block_data = self.read_block(block_num)?;
+            if self.try_insert_dir_entry(
+                &mut block_data,
+                child_inode,
+                name,
+                file_type,
+                new_entry_len,
+            ) {
+                self.write_block(block_num, &block_data)?;
+                return Ok(());
+            }
+        }
+
+        // No space found — allocate a new block for the directory
+        let parent_group = (parent_inode - 1) / self.inodes_per_group;
+        let new_blocks = self.allocate_blocks(1, parent_group)?;
+        let new_block = new_blocks[0];
+
+        // Initialize new directory block with single entry spanning entire block
+        let mut new_block_data = vec![0u8; self.block_size as usize];
+        // Write the new entry
+        new_block_data[0..4].copy_from_slice(&child_inode.to_le_bytes());
+        new_block_data[4..6].copy_from_slice(&(self.block_size as u16).to_le_bytes()); // rec_len = entire block
+        new_block_data[6] = name.len() as u8;
+        new_block_data[7] = file_type;
+        new_block_data[8..8 + name.len()].copy_from_slice(name.as_bytes());
+        self.write_block(new_block, &new_block_data)?;
+
+        // Update parent inode to include the new block
+        self.add_block_to_inode(parent_inode, new_block, &parent)?;
+
+        // Update parent inode size
+        let new_size = parent.size + self.block_size;
+        self.update_inode_size(parent_inode, new_size)?;
+
+        Ok(())
+    }
+
+    /// Try to insert a directory entry into a block by splitting the last entry's slack.
+    /// Returns true if insertion succeeded.
+    fn try_insert_dir_entry(
+        &self,
+        block_data: &mut [u8],
+        child_inode: u32,
+        name: &str,
+        file_type: u8,
+        new_entry_len: usize,
+    ) -> bool {
+        let block_len = block_data.len();
+        let mut offset = 0;
+        let mut prev_offset = 0;
+
+        // Walk to find an entry with enough slack space
+        while offset + 8 <= block_len {
+            let inode = le32(block_data, offset);
+            let rec_len =
+                u16::from_le_bytes([block_data[offset + 4], block_data[offset + 5]]) as usize;
+            let name_len = block_data[offset + 6] as usize;
+
+            if rec_len == 0 || offset + rec_len > block_len {
+                break;
+            }
+
+            let actual_len = if inode == 0 {
+                // Deleted entry — can reuse entire rec_len
+                0
+            } else {
+                dir_entry_actual_len(name_len)
+            };
+
+            let slack = rec_len - actual_len;
+            if slack >= new_entry_len {
+                if inode == 0 {
+                    // Reuse this deleted entry slot
+                    block_data[offset..offset + 4].copy_from_slice(&child_inode.to_le_bytes());
+                    // rec_len stays the same
+                    block_data[offset + 6] = name.len() as u8;
+                    block_data[offset + 7] = file_type;
+                    block_data[offset + 8..offset + 8 + name.len()]
+                        .copy_from_slice(name.as_bytes());
+                    // Zero out rest of name area
+                    let end = offset + 8 + name.len();
+                    let entry_end = offset + rec_len;
+                    if end < entry_end {
+                        block_data[end..entry_end.min(offset + new_entry_len)].fill(0);
+                    }
+                } else {
+                    // Split: shrink current entry's rec_len, add new entry after it
+                    let new_rec_len = rec_len - actual_len;
+                    block_data[offset + 4..offset + 6]
+                        .copy_from_slice(&(actual_len as u16).to_le_bytes());
+
+                    let new_offset = offset + actual_len;
+                    block_data[new_offset..new_offset + 4]
+                        .copy_from_slice(&child_inode.to_le_bytes());
+                    block_data[new_offset + 4..new_offset + 6]
+                        .copy_from_slice(&(new_rec_len as u16).to_le_bytes());
+                    block_data[new_offset + 6] = name.len() as u8;
+                    block_data[new_offset + 7] = file_type;
+                    block_data[new_offset + 8..new_offset + 8 + name.len()]
+                        .copy_from_slice(name.as_bytes());
+                }
+                return true;
+            }
+
+            prev_offset = offset;
+            offset += rec_len;
+        }
+
+        let _ = prev_offset; // suppress unused warning
+        false
+    }
+
+    /// Remove a directory entry by name from the parent directory.
+    fn remove_dir_entry(&mut self, parent_inode: u32, name: &str) -> Result<(), FilesystemError> {
+        let parent = self.read_inode(parent_inode)?;
+        let data_blocks = self.inode_data_blocks(&parent)?;
+
+        for &block_num in &data_blocks {
+            if block_num == 0 {
+                continue;
+            }
+            let mut block_data = self.read_block(block_num)?;
+
+            if self.try_remove_dir_entry(&mut block_data, name) {
+                self.write_block(block_num, &block_data)?;
+                return Ok(());
+            }
+        }
+
+        Err(FilesystemError::InvalidData(format!(
+            "ext: directory entry '{name}' not found"
+        )))
+    }
+
+    /// Try to remove a directory entry from a block. Returns true if found and removed.
+    fn try_remove_dir_entry(&self, block_data: &mut [u8], name: &str) -> bool {
+        let block_len = block_data.len();
+        let mut offset = 0;
+        let mut prev_offset: Option<usize> = None;
+
+        while offset + 8 <= block_len {
+            let inode = le32(block_data, offset);
+            let rec_len =
+                u16::from_le_bytes([block_data[offset + 4], block_data[offset + 5]]) as usize;
+            let name_len = block_data[offset + 6] as usize;
+
+            if rec_len == 0 || offset + rec_len > block_len {
+                break;
+            }
+
+            if inode != 0 && name_len > 0 && offset + 8 + name_len <= block_len {
+                let entry_name =
+                    String::from_utf8_lossy(&block_data[offset + 8..offset + 8 + name_len]);
+                if entry_name == name {
+                    if let Some(prev) = prev_offset {
+                        // Merge with previous entry: extend prev's rec_len
+                        let prev_rec_len =
+                            u16::from_le_bytes([block_data[prev + 4], block_data[prev + 5]])
+                                as usize;
+                        let merged = prev_rec_len + rec_len;
+                        block_data[prev + 4..prev + 6]
+                            .copy_from_slice(&(merged as u16).to_le_bytes());
+                    } else {
+                        // First entry in block — just zero the inode
+                        block_data[offset..offset + 4].copy_from_slice(&0u32.to_le_bytes());
+                    }
+                    return true;
+                }
+            }
+
+            prev_offset = Some(offset);
+            offset += rec_len;
+        }
+
+        false
+    }
+
+    // ---- Block pointer management for inodes ----
+
+    /// Add a data block to an inode (extends the inode's data allocation).
+    /// For ext2/3 uses direct/indirect block pointers. For ext4 uses extents.
+    fn add_block_to_inode(
+        &mut self,
+        inode_num: u32,
+        new_block: u64,
+        inode: &InodeData,
+    ) -> Result<(), FilesystemError> {
+        if self.has_extents
+            && (inode.flags & EXT4_EXTENTS_FL != 0 || is_extent_header(&inode.block))
+        {
+            self.add_block_to_extent_inode(inode_num, new_block, inode)
+        } else {
+            self.add_block_to_indirect_inode(inode_num, new_block, inode)
+        }
+    }
+
+    /// Add a block to an inode using indirect block pointers (ext2/3).
+    fn add_block_to_indirect_inode(
+        &mut self,
+        inode_num: u32,
+        new_block: u64,
+        inode: &InodeData,
+    ) -> Result<(), FilesystemError> {
+        // Count how many blocks currently used
+        let blocks_used = (inode.size + self.block_size - 1) / self.block_size;
+
+        if blocks_used < 12 {
+            // Direct block — just update i_block[blocks_used]
+            let mut new_iblock = inode.block;
+            let slot = blocks_used as usize * 4;
+            new_iblock[slot..slot + 4].copy_from_slice(&(new_block as u32).to_le_bytes());
+
+            // Read inode, patch i_block, write back
+            self.patch_inode_block_field(inode_num, &new_iblock)?;
+        } else {
+            // Single/double/triple indirect — for now just support single indirect
+            let ptrs_per_block = self.block_size as usize / 4;
+            if blocks_used < 12 + ptrs_per_block as u64 {
+                let index_in_indirect = (blocks_used - 12) as usize;
+                let mut single_ind_block = le32(&inode.block, 48) as u64;
+
+                if single_ind_block == 0 {
+                    // Allocate the indirect block itself
+                    let parent_group = (inode_num - 1) / self.inodes_per_group;
+                    let ind_blocks = self.allocate_blocks(1, parent_group)?;
+                    single_ind_block = ind_blocks[0];
+                    // Zero it out
+                    let zeros = vec![0u8; self.block_size as usize];
+                    self.write_block(single_ind_block, &zeros)?;
+                    // Update inode's i_block[12]
+                    let mut new_iblock = inode.block;
+                    new_iblock[48..52].copy_from_slice(&(single_ind_block as u32).to_le_bytes());
+                    self.patch_inode_block_field(inode_num, &new_iblock)?;
+                }
+
+                let mut ind_data = self.read_block(single_ind_block)?;
+                let off = index_in_indirect * 4;
+                ind_data[off..off + 4].copy_from_slice(&(new_block as u32).to_le_bytes());
+                self.write_block(single_ind_block, &ind_data)?;
+            } else {
+                return Err(FilesystemError::Unsupported(
+                    "ext: directory too large (double/triple indirect not yet supported for editing)".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Add a block to an inode using extent trees (ext4).
+    fn add_block_to_extent_inode(
+        &mut self,
+        inode_num: u32,
+        new_block: u64,
+        inode: &InodeData,
+    ) -> Result<(), FilesystemError> {
+        let header = parse_extent_header(&inode.block)?;
+        let logical_block = (inode.size / self.block_size) as u32;
+
+        if header.depth == 0 {
+            // Leaf level — try to extend existing extent or add new one
+            let max_entries = u16::from_le_bytes([inode.block[4], inode.block[5]]);
+
+            // Check if we can extend the last extent
+            if header.entries > 0 {
+                let last_idx = (header.entries - 1) as usize;
+                let off = 12 + last_idx * 12;
+                let ext_logical = le32(&inode.block, off);
+                let ext_len = u16::from_le_bytes([inode.block[off + 4], inode.block[off + 5]]);
+                let ext_phys = {
+                    let lo = le32(&inode.block, off + 8) as u64;
+                    let hi =
+                        u16::from_le_bytes([inode.block[off + 6], inode.block[off + 7]]) as u64;
+                    (hi << 32) | lo
+                };
+
+                // If new block is contiguous with last extent
+                if ext_logical + ext_len as u32 == logical_block
+                    && ext_phys + ext_len as u64 == new_block
+                    && ext_len < 32768
+                {
+                    let mut new_iblock = inode.block;
+                    let new_len = ext_len + 1;
+                    new_iblock[off + 4..off + 6].copy_from_slice(&new_len.to_le_bytes());
+                    self.patch_inode_block_field(inode_num, &new_iblock)?;
+                    return Ok(());
+                }
+            }
+
+            // Add a new extent entry
+            if header.entries < max_entries {
+                let mut new_iblock = inode.block;
+                let new_idx = header.entries as usize;
+                let off = 12 + new_idx * 12;
+
+                // logical block
+                new_iblock[off..off + 4].copy_from_slice(&logical_block.to_le_bytes());
+                // length = 1
+                new_iblock[off + 4..off + 6].copy_from_slice(&1u16.to_le_bytes());
+                // physical block high 16 bits
+                new_iblock[off + 6..off + 8]
+                    .copy_from_slice(&((new_block >> 32) as u16).to_le_bytes());
+                // physical block low 32 bits
+                new_iblock[off + 8..off + 12].copy_from_slice(&(new_block as u32).to_le_bytes());
+
+                // Update entry count in header
+                let new_count = header.entries + 1;
+                new_iblock[2..4].copy_from_slice(&new_count.to_le_bytes());
+
+                self.patch_inode_block_field(inode_num, &new_iblock)?;
+                return Ok(());
+            }
+
+            return Err(FilesystemError::Unsupported(
+                "ext4: extent tree splitting not yet supported for editing".into(),
+            ));
+        }
+
+        Err(FilesystemError::Unsupported(
+            "ext4: deep extent tree editing not yet supported".into(),
+        ))
+    }
+
+    /// Patch just the i_block field (60 bytes at offset 0x28) in an on-disk inode.
+    fn patch_inode_block_field(
+        &mut self,
+        inode_num: u32,
+        new_iblock: &[u8; 60],
+    ) -> Result<(), FilesystemError> {
+        let group = (inode_num - 1) / self.inodes_per_group;
+        let index = (inode_num - 1) % self.inodes_per_group;
+        let gd = &self.group_descriptors[group as usize];
+        let offset = self.partition_offset
+            + gd.inode_table * self.block_size
+            + index as u64 * self.inode_size as u64
+            + 0x28;
+        self.reader.seek(SeekFrom::Start(offset))?;
+        self.reader.write_all(new_iblock)?;
+        Ok(())
+    }
+
+    /// Update the i_size field of an inode on disk.
+    fn update_inode_size(&mut self, inode_num: u32, new_size: u64) -> Result<(), FilesystemError> {
+        let group = (inode_num - 1) / self.inodes_per_group;
+        let index = (inode_num - 1) % self.inodes_per_group;
+        let gd = &self.group_descriptors[group as usize];
+        let base = self.partition_offset
+            + gd.inode_table * self.block_size
+            + index as u64 * self.inode_size as u64;
+
+        // i_size_lo at 0x04
+        self.reader.seek(SeekFrom::Start(base + 0x04))?;
+        self.reader.write_all(&(new_size as u32).to_le_bytes())?;
+        // i_size_hi at 0x6C
+        self.reader.seek(SeekFrom::Start(base + 0x6C))?;
+        self.reader
+            .write_all(&((new_size >> 32) as u32).to_le_bytes())?;
+        Ok(())
+    }
+
+    /// Update the i_links_count field of an inode on disk.
+    fn update_inode_links(&mut self, inode_num: u32, delta: i32) -> Result<(), FilesystemError> {
+        let inode = self.read_inode(inode_num)?;
+        let new_links = (inode.links_count as i32 + delta).max(0) as u16;
+
+        let group = (inode_num - 1) / self.inodes_per_group;
+        let index = (inode_num - 1) % self.inodes_per_group;
+        let gd = &self.group_descriptors[group as usize];
+        let base = self.partition_offset
+            + gd.inode_table * self.block_size
+            + index as u64 * self.inode_size as u64;
+
+        self.reader.seek(SeekFrom::Start(base + 0x1A))?;
+        self.reader.write_all(&new_links.to_le_bytes())?;
+        Ok(())
+    }
+
+    /// Set up block pointers for a new file's inode.
+    fn set_inode_blocks_for_new_file(
+        &mut self,
+        _inode_num: u32,
+        blocks: &[u64],
+    ) -> Result<[u8; 60], FilesystemError> {
+        let mut iblock = [0u8; 60];
+
+        if self.has_extents {
+            // Build extent header + leaf entries
+            // Header: magic(2) + entries(2) + max(2) + depth(2) + generation(4) = 12 bytes
+            iblock[0..2].copy_from_slice(&EXT4_EXT_MAGIC.to_le_bytes());
+            let entries = blocks.len().min(4) as u16; // max 4 extents in inline i_block
+            iblock[2..4].copy_from_slice(&entries.to_le_bytes());
+            iblock[4..6].copy_from_slice(&4u16.to_le_bytes()); // max_entries = 4
+
+            // Build extents — merge contiguous blocks into single extents
+            let mut ext_idx = 0;
+            let mut i = 0;
+            while i < blocks.len() && ext_idx < 4 {
+                let start = blocks[i];
+                let logical_start = i as u32;
+                let mut len = 1u16;
+                while i + (len as usize) < blocks.len()
+                    && blocks[i + (len as usize)] == start + len as u64
+                    && len < 32768
+                {
+                    len += 1;
+                }
+
+                let off = 12 + ext_idx * 12;
+                iblock[off..off + 4].copy_from_slice(&logical_start.to_le_bytes());
+                iblock[off + 4..off + 6].copy_from_slice(&len.to_le_bytes());
+                iblock[off + 6..off + 8].copy_from_slice(&((start >> 32) as u16).to_le_bytes());
+                iblock[off + 8..off + 12].copy_from_slice(&(start as u32).to_le_bytes());
+
+                i += len as usize;
+                ext_idx += 1;
+            }
+
+            if i < blocks.len() {
+                return Err(FilesystemError::Unsupported(
+                    "ext4: file requires more than 4 extents (too fragmented for inline)".into(),
+                ));
+            }
+        } else {
+            // ext2/3: direct block pointers
+            for (idx, &blk) in blocks.iter().enumerate() {
+                if idx < 12 {
+                    let off = idx * 4;
+                    iblock[off..off + 4].copy_from_slice(&(blk as u32).to_le_bytes());
+                } else {
+                    return Err(FilesystemError::Unsupported(
+                        "ext2/3: indirect blocks for new files not yet supported (file too large)"
+                            .into(),
+                    ));
+                }
+            }
+        }
+
+        Ok(iblock)
+    }
+
+    /// Get all data block numbers for an inode (for freeing on delete).
+    fn get_inode_data_blocks(&mut self, inode_num: u32) -> Result<Vec<u64>, FilesystemError> {
+        let inode = self.read_inode(inode_num)?;
+        self.inode_data_blocks(&inode)
+    }
+}
+
+// ---- EditableFilesystem implementation ----
+
+impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
+    fn create_file(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        data: &mut dyn std::io::Read,
+        data_len: u64,
+        options: &CreateFileOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        validate_ext_name(name)?;
+
+        let parent_inode = parent.location as u32;
+        if self.name_exists_in_dir(parent_inode, name)? {
+            return Err(FilesystemError::AlreadyExists(name.to_string()));
+        }
+
+        // Check free space (data + 1 block overhead for directory entry growth)
+        let needed = data_len + self.block_size;
+        if self.free_blocks * self.block_size < needed {
+            return Err(FilesystemError::DiskFull("not enough free space".into()));
+        }
+
+        let parent_group = (parent_inode - 1) / self.inodes_per_group;
+
+        // Allocate inode
+        let new_inode = self.allocate_inode(parent_group)?;
+
+        // Allocate data blocks and write data
+        let block_size = self.block_size as usize;
+        let blocks_needed = if data_len == 0 {
+            0
+        } else {
+            ((data_len as usize + block_size - 1) / block_size) as usize
+        };
+
+        let data_blocks = self.allocate_blocks(blocks_needed, parent_group)?;
+
+        // Write data to blocks
+        let mut buf = vec![0u8; block_size];
+        for &blk in &data_blocks {
+            buf.fill(0);
+            let mut total_read = 0;
+            while total_read < block_size {
+                match data.read(&mut buf[total_read..]) {
+                    Ok(0) => break,
+                    Ok(n) => total_read += n,
+                    Err(e) => return Err(FilesystemError::Io(e)),
+                }
+            }
+            self.write_block(blk, &buf)?;
+        }
+
+        // Build and write inode
+        let mode = options.mode.unwrap_or(0o100644);
+        let uid = options.uid.unwrap_or(0);
+        let gid = options.gid.unwrap_or(0);
+        let flags = if self.has_extents { EXT4_EXTENTS_FL } else { 0 };
+        let iblock = self.set_inode_blocks_for_new_file(new_inode, &data_blocks)?;
+        let inode_bytes = self.build_inode_bytes(mode, uid, gid, data_len, 1, flags, &iblock);
+        self.write_inode_raw(new_inode, &inode_bytes)?;
+
+        // Add directory entry
+        self.add_dir_entry(parent_inode, name, new_inode, FT_REG_FILE)?;
+
+        self.sync_metadata()?;
+
+        let path = if parent.path == "/" {
+            format!("/{name}")
+        } else {
+            format!("{}/{name}", parent.path)
+        };
+
+        Ok(FileEntry::new_file(
+            name.to_string(),
+            path,
+            data_len,
+            new_inode as u64,
+        ))
+    }
+
+    fn create_directory(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        options: &CreateDirectoryOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        validate_ext_name(name)?;
+
+        let parent_inode = parent.location as u32;
+        if self.name_exists_in_dir(parent_inode, name)? {
+            return Err(FilesystemError::AlreadyExists(name.to_string()));
+        }
+
+        let parent_group = (parent_inode - 1) / self.inodes_per_group;
+
+        // Allocate inode and 1 data block
+        let new_inode = self.allocate_inode(parent_group)?;
+        let dir_blocks = self.allocate_blocks(1, parent_group)?;
+        let dir_block = dir_blocks[0];
+
+        // Initialize directory block with . and .. entries
+        let block_size = self.block_size as usize;
+        let mut dir_data = vec![0u8; block_size];
+
+        // . entry: inode = new_inode, rec_len = 12, name_len = 1, file_type = FT_DIR
+        dir_data[0..4].copy_from_slice(&new_inode.to_le_bytes());
+        dir_data[4..6].copy_from_slice(&12u16.to_le_bytes());
+        dir_data[6] = 1;
+        dir_data[7] = FT_DIR;
+        dir_data[8] = b'.';
+
+        // .. entry: inode = parent_inode, rec_len = rest of block, name_len = 2
+        let dotdot_rec_len = (block_size - 12) as u16;
+        dir_data[12..16].copy_from_slice(&parent_inode.to_le_bytes());
+        dir_data[16..18].copy_from_slice(&dotdot_rec_len.to_le_bytes());
+        dir_data[18] = 2;
+        dir_data[19] = FT_DIR;
+        dir_data[20] = b'.';
+        dir_data[21] = b'.';
+
+        self.write_block(dir_block, &dir_data)?;
+
+        // Build inode
+        let mode = options.mode.unwrap_or(0o40755);
+        let uid = options.uid.unwrap_or(0);
+        let gid = options.gid.unwrap_or(0);
+        let flags = if self.has_extents { EXT4_EXTENTS_FL } else { 0 };
+        let iblock = self.set_inode_blocks_for_new_file(new_inode, &dir_blocks)?;
+        let inode_bytes =
+            self.build_inode_bytes(mode, uid, gid, self.block_size, 2, flags, &iblock);
+        self.write_inode_raw(new_inode, &inode_bytes)?;
+
+        // Add entry in parent directory
+        self.add_dir_entry(parent_inode, name, new_inode, FT_DIR)?;
+
+        // Increment parent's link count (for the .. reference)
+        self.update_inode_links(parent_inode, 1)?;
+
+        self.sync_metadata()?;
+
+        let path = if parent.path == "/" {
+            format!("/{name}")
+        } else {
+            format!("{}/{name}", parent.path)
+        };
+
+        Ok(FileEntry::new_directory(
+            name.to_string(),
+            path,
+            new_inode as u64,
+        ))
+    }
+
+    fn delete_entry(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+    ) -> Result<(), FilesystemError> {
+        if entry.is_directory() {
+            let children = self.list_directory(entry)?;
+            if !children.is_empty() {
+                return Err(FilesystemError::InvalidData(format!(
+                    "directory '{}' is not empty",
+                    entry.name
+                )));
+            }
+        }
+
+        let parent_inode = parent.location as u32;
+        let entry_inode = entry.location as u32;
+
+        // Remove directory entry from parent
+        self.remove_dir_entry(parent_inode, &entry.name)?;
+
+        // Free data blocks
+        let data_blocks = self.get_inode_data_blocks(entry_inode)?;
+        let non_zero: Vec<u64> = data_blocks.into_iter().filter(|&b| b != 0).collect();
+        self.free_blocks_list(&non_zero)?;
+
+        // If directory, decrement parent's link count
+        if entry.is_directory() {
+            self.update_inode_links(parent_inode, -1)?;
+        }
+
+        // Free the inode
+        self.free_inode(entry_inode)?;
+
+        self.sync_metadata()?;
+        Ok(())
+    }
+
+    fn set_permissions(&mut self, entry: &FileEntry, mode: u32) -> Result<(), FilesystemError> {
+        let inode_num = entry.location as u32;
+        let inode = self.read_inode(inode_num)?;
+
+        // Preserve file type bits (S_IFMT = 0o170000), change only permission bits
+        let new_mode = (inode.mode & 0o170000) | (mode & 0o7777);
+
+        let group = (inode_num - 1) / self.inodes_per_group;
+        let index = (inode_num - 1) % self.inodes_per_group;
+        let gd = &self.group_descriptors[group as usize];
+        let base = self.partition_offset
+            + gd.inode_table * self.block_size
+            + index as u64 * self.inode_size as u64;
+
+        self.reader.seek(SeekFrom::Start(base))?;
+        self.reader.write_all(&(new_mode as u16).to_le_bytes())?;
+
+        self.reader.flush()?;
+        Ok(())
+    }
+
+    fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
+        self.write_superblock()?;
+        // Group descriptors are written immediately when modified,
+        // so we just need to flush here.
+        self.reader.flush()?;
+        Ok(())
+    }
+
+    fn free_space(&mut self) -> Result<u64, FilesystemError> {
+        Ok(self.free_blocks * self.block_size)
     }
 }
 
@@ -3750,5 +4839,465 @@ mod tests {
         // Free blocks should include the additional space
         let free = le32(&target, 1024 + 0x0C) as u64;
         assert!(free > 0, "should have free blocks from the extra space");
+    }
+
+    // ---- Editing tests ----
+
+    /// Create a minimal ext2 image suitable for editing tests.
+    /// Layout (4096-byte blocks):
+    ///   Block 0: boot sector + superblock (at offset 1024)
+    ///   Block 1: GDT
+    ///   Block 2: block bitmap
+    ///   Block 3: inode bitmap
+    ///   Block 4-19: inode table (16 blocks for inodes_per_group=256, inode_size=256)
+    ///   Block 20: root directory data
+    ///   Blocks 21+: free for allocation
+    fn make_editable_ext2_image() -> Cursor<Vec<u8>> {
+        let block_size = 4096usize;
+        let total_blocks = 256u32; // small image
+        let blocks_per_group = 256u32;
+        let inodes_per_group = 256u32;
+        let inode_size = 256u16;
+        let total_inodes = 256u32;
+        // Metadata blocks: 0(boot+sb), 1(gdt), 2(block_bm), 3(inode_bm),
+        //                   4-19(inode table = 256*256/4096 = 16 blocks), 20(root dir) = 21 blocks
+        let inode_table_blocks = (inodes_per_group as usize * inode_size as usize) / block_size;
+        let metadata_blocks = 4 + inode_table_blocks + 1; // +1 for root dir block
+        let free_blocks = total_blocks as u32 - metadata_blocks as u32;
+
+        let mut image = vec![0u8; total_blocks as usize * block_size];
+
+        // ---- Superblock at offset 1024 ----
+        let sb_off = 1024;
+        // s_inodes_count
+        image[sb_off + 0x00..sb_off + 0x04].copy_from_slice(&total_inodes.to_le_bytes());
+        // s_blocks_count_lo
+        image[sb_off + 0x04..sb_off + 0x08].copy_from_slice(&total_blocks.to_le_bytes());
+        // s_free_blocks_count
+        image[sb_off + 0x0C..sb_off + 0x10].copy_from_slice(&free_blocks.to_le_bytes());
+        // s_free_inodes_count (all except inode 1=bad blocks and 2=root = 254 free)
+        let free_inodes = total_inodes - 2; // inodes 1,2 used (11 reserved but we only mark 2)
+        image[sb_off + 0x10..sb_off + 0x14].copy_from_slice(&free_inodes.to_le_bytes());
+        // s_first_data_block = 0 (4K blocks)
+        image[sb_off + 0x14..sb_off + 0x18].copy_from_slice(&0u32.to_le_bytes());
+        // s_log_block_size = 2 (4096)
+        image[sb_off + 0x18..sb_off + 0x1C].copy_from_slice(&2u32.to_le_bytes());
+        // s_blocks_per_group
+        image[sb_off + 0x20..sb_off + 0x24].copy_from_slice(&blocks_per_group.to_le_bytes());
+        // s_inodes_per_group
+        image[sb_off + 0x28..sb_off + 0x2C].copy_from_slice(&inodes_per_group.to_le_bytes());
+        // s_magic
+        image[sb_off + 0x38..sb_off + 0x3A].copy_from_slice(&EXT_MAGIC.to_le_bytes());
+        // s_inode_size
+        image[sb_off + 0x58..sb_off + 0x5A].copy_from_slice(&inode_size.to_le_bytes());
+        // s_volume_name
+        image[sb_off + 0x78..sb_off + 0x82].copy_from_slice(b"EditTest\0\0");
+
+        // ---- GDT at block 1 ----
+        let gdt_off = block_size;
+        image[gdt_off + 0x00..gdt_off + 0x04].copy_from_slice(&2u32.to_le_bytes()); // block_bitmap = 2
+        image[gdt_off + 0x04..gdt_off + 0x08].copy_from_slice(&3u32.to_le_bytes()); // inode_bitmap = 3
+        image[gdt_off + 0x08..gdt_off + 0x0C].copy_from_slice(&4u32.to_le_bytes()); // inode_table = 4
+        image[gdt_off + 0x0C..gdt_off + 0x0E].copy_from_slice(&(free_blocks as u16).to_le_bytes()); // bg_free_blocks_count
+        image[gdt_off + 0x0E..gdt_off + 0x10].copy_from_slice(&(free_inodes as u16).to_le_bytes()); // bg_free_inodes_count
+
+        // ---- Block bitmap at block 2 ----
+        // Mark blocks 0-20 as used (21 blocks: metadata + root dir)
+        let bm_off = 2 * block_size;
+        // 21 bits = 2 full bytes (0xFF, 0xFF) + 5 bits in byte 2
+        image[bm_off] = 0xFF; // blocks 0-7
+        image[bm_off + 1] = 0xFF; // blocks 8-15
+        image[bm_off + 2] = 0x1F; // blocks 16-20 (bits 0-4)
+
+        // ---- Inode bitmap at block 3 ----
+        // Mark inodes 1 and 2 as used (1-based, so bits 0 and 1)
+        let ibm_off = 3 * block_size;
+        image[ibm_off] = 0x03; // bits 0,1 set
+
+        // ---- Root inode (inode 2, index 1) at block 4 + 1*256 ----
+        let root_off = 4 * block_size + 256;
+        // i_mode = 0o040755 (directory)
+        image[root_off + 0x00..root_off + 0x02].copy_from_slice(&(0o040755u16).to_le_bytes());
+        // i_size = 4096 (one block)
+        image[root_off + 0x04..root_off + 0x08].copy_from_slice(&(block_size as u32).to_le_bytes());
+        // i_mtime
+        image[root_off + 0x10..root_off + 0x14].copy_from_slice(&1700000000u32.to_le_bytes());
+        // i_links_count = 2 (self + parent)
+        image[root_off + 0x1A..root_off + 0x1C].copy_from_slice(&2u16.to_le_bytes());
+        // i_block[0] = block 20 (root dir data)
+        image[root_off + 0x28..root_off + 0x2C].copy_from_slice(&20u32.to_le_bytes());
+
+        // ---- Root directory data at block 20 ----
+        let dir_off = 20 * block_size;
+        // . entry: inode=2, rec_len=12, name_len=1, file_type=FT_DIR
+        image[dir_off..dir_off + 4].copy_from_slice(&2u32.to_le_bytes());
+        image[dir_off + 4..dir_off + 6].copy_from_slice(&12u16.to_le_bytes());
+        image[dir_off + 6] = 1;
+        image[dir_off + 7] = FT_DIR;
+        image[dir_off + 8] = b'.';
+
+        // .. entry: inode=2, rec_len=rest_of_block, name_len=2, file_type=FT_DIR
+        let dotdot_off = dir_off + 12;
+        let dotdot_rec_len = (block_size - 12) as u16;
+        image[dotdot_off..dotdot_off + 4].copy_from_slice(&2u32.to_le_bytes());
+        image[dotdot_off + 4..dotdot_off + 6].copy_from_slice(&dotdot_rec_len.to_le_bytes());
+        image[dotdot_off + 6] = 2;
+        image[dotdot_off + 7] = FT_DIR;
+        image[dotdot_off + 8] = b'.';
+        image[dotdot_off + 9] = b'.';
+
+        Cursor::new(image)
+    }
+
+    #[test]
+    fn test_ext_editable_open() {
+        let mut img = make_editable_ext2_image();
+        let mut fs = ExtFilesystem::open(&mut img, 0).unwrap();
+        let root = fs.root().unwrap();
+        assert!(root.is_directory());
+
+        // Root should be empty (only . and ..)
+        let entries = fs.list_directory(&root).unwrap();
+        assert!(entries.is_empty(), "root should have no user entries");
+    }
+
+    #[test]
+    fn test_ext_create_file_and_read_back() {
+        let mut img = make_editable_ext2_image();
+        let mut fs = ExtFilesystem::open(&mut img, 0).unwrap();
+        let root = fs.root().unwrap();
+
+        let test_data = b"Hello, ext2 world!";
+        let mut reader = Cursor::new(test_data.to_vec());
+        let file = fs
+            .create_file(
+                &root,
+                "hello.txt",
+                &mut reader,
+                test_data.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+
+        assert_eq!(file.name, "hello.txt");
+        assert_eq!(file.size, test_data.len() as u64);
+
+        // List directory — should have 1 entry
+        let entries = fs.list_directory(&root).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "hello.txt");
+
+        // Read file back
+        let data = fs.read_file(&entries[0], usize::MAX).unwrap();
+        assert_eq!(&data[..test_data.len()], test_data);
+    }
+
+    #[test]
+    fn test_ext_create_empty_file() {
+        let mut img = make_editable_ext2_image();
+        let mut fs = ExtFilesystem::open(&mut img, 0).unwrap();
+        let root = fs.root().unwrap();
+
+        let mut reader = Cursor::new(Vec::new());
+        let file = fs
+            .create_file(
+                &root,
+                "empty.txt",
+                &mut reader,
+                0,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+
+        assert_eq!(file.size, 0);
+
+        let entries = fs.list_directory(&root).unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn test_ext_create_directory() {
+        let mut img = make_editable_ext2_image();
+        let mut fs = ExtFilesystem::open(&mut img, 0).unwrap();
+        let root = fs.root().unwrap();
+
+        let dir = fs
+            .create_directory(&root, "subdir", &CreateDirectoryOptions::default())
+            .unwrap();
+
+        assert_eq!(dir.name, "subdir");
+        assert!(dir.is_directory());
+
+        // List root — should have the directory
+        let entries = fs.list_directory(&root).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].is_directory());
+
+        // List the new directory — should be empty
+        let sub_entries = fs.list_directory(&entries[0]).unwrap();
+        assert!(sub_entries.is_empty());
+    }
+
+    #[test]
+    fn test_ext_delete_file() {
+        let mut img = make_editable_ext2_image();
+        let mut fs = ExtFilesystem::open(&mut img, 0).unwrap();
+        let root = fs.root().unwrap();
+
+        let free_before = fs.free_space().unwrap();
+
+        // Create a file
+        let test_data = b"delete me";
+        let mut reader = Cursor::new(test_data.to_vec());
+        fs.create_file(
+            &root,
+            "temp.txt",
+            &mut reader,
+            test_data.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+
+        let entries = fs.list_directory(&root).unwrap();
+        assert_eq!(entries.len(), 1);
+
+        let free_after_create = fs.free_space().unwrap();
+        assert!(free_after_create < free_before);
+
+        // Delete it
+        fs.delete_entry(&root, &entries[0]).unwrap();
+
+        let entries = fs.list_directory(&root).unwrap();
+        assert!(entries.is_empty());
+
+        let free_after_delete = fs.free_space().unwrap();
+        assert!(free_after_delete > free_after_create);
+    }
+
+    #[test]
+    fn test_ext_delete_empty_directory() {
+        let mut img = make_editable_ext2_image();
+        let mut fs = ExtFilesystem::open(&mut img, 0).unwrap();
+        let root = fs.root().unwrap();
+
+        fs.create_directory(&root, "emptydir", &CreateDirectoryOptions::default())
+            .unwrap();
+
+        let entries = fs.list_directory(&root).unwrap();
+        assert_eq!(entries.len(), 1);
+
+        fs.delete_entry(&root, &entries[0]).unwrap();
+
+        let entries = fs.list_directory(&root).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_ext_delete_nonempty_dir_fails() {
+        let mut img = make_editable_ext2_image();
+        let mut fs = ExtFilesystem::open(&mut img, 0).unwrap();
+        let root = fs.root().unwrap();
+
+        let dir = fs
+            .create_directory(&root, "mydir", &CreateDirectoryOptions::default())
+            .unwrap();
+
+        // Create a file inside the directory
+        let test_data = b"inside";
+        let mut reader = Cursor::new(test_data.to_vec());
+        fs.create_file(
+            &dir,
+            "inner.txt",
+            &mut reader,
+            test_data.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+
+        // Trying to delete non-empty dir should fail
+        let entries = fs.list_directory(&root).unwrap();
+        let result = fs.delete_entry(&root, &entries[0]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_ext_delete_recursive() {
+        let mut img = make_editable_ext2_image();
+        let mut fs = ExtFilesystem::open(&mut img, 0).unwrap();
+        let root = fs.root().unwrap();
+
+        let dir = fs
+            .create_directory(&root, "mydir", &CreateDirectoryOptions::default())
+            .unwrap();
+
+        let test_data = b"inside";
+        let mut reader = Cursor::new(test_data.to_vec());
+        fs.create_file(
+            &dir,
+            "inner.txt",
+            &mut reader,
+            test_data.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+
+        // Recursive delete should work
+        let entries = fs.list_directory(&root).unwrap();
+        fs.delete_recursive(&root, &entries[0]).unwrap();
+
+        let entries = fs.list_directory(&root).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_ext_duplicate_name_fails() {
+        let mut img = make_editable_ext2_image();
+        let mut fs = ExtFilesystem::open(&mut img, 0).unwrap();
+        let root = fs.root().unwrap();
+
+        let test_data = b"first";
+        let mut reader = Cursor::new(test_data.to_vec());
+        fs.create_file(
+            &root,
+            "dup.txt",
+            &mut reader,
+            test_data.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+
+        // Second file with same name should fail
+        let mut reader2 = Cursor::new(b"second".to_vec());
+        let result = fs.create_file(
+            &root,
+            "dup.txt",
+            &mut reader2,
+            6,
+            &CreateFileOptions::default(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_ext_name_validation() {
+        let mut img = make_editable_ext2_image();
+        let mut fs = ExtFilesystem::open(&mut img, 0).unwrap();
+        let root = fs.root().unwrap();
+
+        // Empty name
+        let result = fs.create_directory(&root, "", &CreateDirectoryOptions::default());
+        assert!(result.is_err());
+
+        // Name with /
+        let result = fs.create_directory(&root, "a/b", &CreateDirectoryOptions::default());
+        assert!(result.is_err());
+
+        // Name with NUL
+        let result = fs.create_directory(&root, "a\0b", &CreateDirectoryOptions::default());
+        assert!(result.is_err());
+
+        // "." and ".."
+        let result = fs.create_directory(&root, ".", &CreateDirectoryOptions::default());
+        assert!(result.is_err());
+        let result = fs.create_directory(&root, "..", &CreateDirectoryOptions::default());
+        assert!(result.is_err());
+
+        // Too long (> 255 bytes)
+        let long_name = "x".repeat(256);
+        let result = fs.create_directory(&root, &long_name, &CreateDirectoryOptions::default());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_ext_free_space() {
+        let mut img = make_editable_ext2_image();
+        let mut fs = ExtFilesystem::open(&mut img, 0).unwrap();
+
+        let free1 = fs.free_space().unwrap();
+        assert!(free1 > 0);
+
+        let root = fs.root().unwrap();
+        let test_data = b"some data";
+        let mut reader = Cursor::new(test_data.to_vec());
+        fs.create_file(
+            &root,
+            "test.txt",
+            &mut reader,
+            test_data.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+
+        let free2 = fs.free_space().unwrap();
+        // Should have used at least 1 block (4096) for data + 1 for inode overhead
+        assert!(free2 < free1);
+        assert!(free1 - free2 >= 4096);
+    }
+
+    #[test]
+    fn test_ext_set_permissions() {
+        let mut img = make_editable_ext2_image();
+        let mut fs = ExtFilesystem::open(&mut img, 0).unwrap();
+        let root = fs.root().unwrap();
+
+        let test_data = b"perm test";
+        let mut reader = Cursor::new(test_data.to_vec());
+        fs.create_file(
+            &root,
+            "perm.txt",
+            &mut reader,
+            test_data.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+
+        let entries = fs.list_directory(&root).unwrap();
+        let file = &entries[0];
+
+        // Set permissions to 0o755
+        fs.set_permissions(file, 0o755).unwrap();
+
+        // Re-read the inode to verify
+        let inode = fs.read_inode(file.location as u32).unwrap();
+        assert_eq!(inode.mode & 0o7777, 0o755);
+        // File type bits should be preserved
+        assert_eq!(inode.mode & 0o170000, 0o100000); // S_IFREG
+    }
+
+    #[test]
+    fn test_ext_multiple_files() {
+        let mut img = make_editable_ext2_image();
+        let mut fs = ExtFilesystem::open(&mut img, 0).unwrap();
+        let root = fs.root().unwrap();
+
+        // Create multiple files
+        for i in 0..5 {
+            let name = format!("file{i}.txt");
+            let data = format!("content {i}");
+            let mut reader = Cursor::new(data.as_bytes().to_vec());
+            fs.create_file(
+                &root,
+                &name,
+                &mut reader,
+                data.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        }
+
+        let entries = fs.list_directory(&root).unwrap();
+        assert_eq!(entries.len(), 5);
+
+        // Delete the middle file
+        let to_delete = entries
+            .iter()
+            .find(|e| e.name == "file2.txt")
+            .unwrap()
+            .clone();
+        fs.delete_entry(&root, &to_delete).unwrap();
+
+        let entries = fs.list_directory(&root).unwrap();
+        assert_eq!(entries.len(), 4);
+        assert!(!entries.iter().any(|e| e.name == "file2.txt"));
     }
 }

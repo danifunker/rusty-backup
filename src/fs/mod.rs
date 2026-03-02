@@ -528,6 +528,10 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "ext" => Ok(Box::new(ext::ExtFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 _ => Err(FilesystemError::Unsupported(format!(
                     "editing not yet supported for filesystem type '{fs_type}'"
                 ))),
@@ -563,6 +567,19 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                 _ => Err(FilesystemError::Unsupported(
                     "type 0x07 partition is neither NTFS nor exFAT".into(),
                 )),
+            }
+        }
+        // Linux — detect ext2/3/4
+        0x83 => {
+            let fs_type = detect_filesystem_type(&mut reader, partition_offset);
+            match fs_type {
+                "ext" => Ok(Box::new(ext::ExtFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                _ => Err(FilesystemError::Unsupported(format!(
+                    "editing not yet supported for Linux filesystem type '{fs_type}'"
+                ))),
             }
         }
         // ProDOS — editing not supported
