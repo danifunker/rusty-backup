@@ -5,6 +5,7 @@ pub mod ext;
 pub mod fat;
 pub mod filesystem;
 pub mod hfs;
+pub(crate) mod hfs_common;
 pub mod hfsplus;
 pub mod ntfs;
 pub mod prodos;
@@ -507,9 +508,53 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
 ) -> Result<Box<dyn EditableFilesystem>, FilesystemError> {
     // Check string-based type first (APM partitions)
     if let Some(type_str) = partition_type_string {
-        return Err(FilesystemError::Unsupported(format!(
-            "editing not yet supported for APM type '{type_str}'"
-        )));
+        match type_str {
+            "Apple_HFS" => {
+                let (fs_type, hfsplus_offset) = resolve_apple_hfs(&mut reader, partition_offset);
+                return match fs_type {
+                    "hfsplus" => Ok(Box::new(hfsplus::HfsPlusFilesystem::open(
+                        reader,
+                        hfsplus_offset,
+                    )?)),
+                    "hfs" => Ok(Box::new(hfs::HfsFilesystem::open(
+                        reader,
+                        partition_offset,
+                    )?)),
+                    _ => Err(FilesystemError::Unsupported(
+                        "unrecognized Apple_HFS variant".into(),
+                    )),
+                };
+            }
+            "Apple_HFSX" => {
+                return Ok(Box::new(hfsplus::HfsPlusFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?));
+            }
+            "Apple_UNIX_SVR2" | "Apple_UNIX_SRVR2" => {
+                let fs_type = detect_filesystem_type(&mut reader, partition_offset);
+                return match fs_type {
+                    "ext" => Ok(Box::new(ext::ExtFilesystem::open(
+                        reader,
+                        partition_offset,
+                    )?)),
+                    _ => Err(FilesystemError::Unsupported(format!(
+                        "editing not yet supported for APM Unix filesystem type '{fs_type}'"
+                    ))),
+                };
+            }
+            "Apple_PRODOS" | "Apple_ProDOS" => {
+                return Ok(Box::new(prodos::ProDosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?));
+            }
+            _ => {
+                return Err(FilesystemError::Unsupported(format!(
+                    "editing not yet supported for APM type '{type_str}'"
+                )));
+            }
+        }
     }
     match partition_type {
         // Auto-detect (superfloppy / type byte 0)
@@ -517,6 +562,18 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
             let fs_type = detect_filesystem_type(&mut reader, partition_offset);
             match fs_type {
                 "fat" => Ok(Box::new(fat::FatFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "exfat" => Ok(Box::new(exfat::ExfatFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "ntfs" => Ok(Box::new(ntfs::NtfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "ext" => Ok(Box::new(ext::ExtFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),
@@ -540,10 +597,58 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
             reader,
             partition_offset,
         )?)),
-        // ProDOS — editing not supported
-        0xA8 => Err(FilesystemError::Unsupported(
-            "editing not supported for ProDOS".into(),
-        )),
+        // NTFS/exFAT — distinguish by superblock magic
+        0x07 => {
+            let fs_type = detect_0x07_type(&mut reader, partition_offset);
+            match fs_type {
+                "exfat" => Ok(Box::new(exfat::ExfatFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "ntfs" => Ok(Box::new(ntfs::NtfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                _ => Err(FilesystemError::Unsupported(
+                    "type 0x07 partition is neither NTFS nor exFAT".into(),
+                )),
+            }
+        }
+        // Linux — detect ext2/3/4
+        0x83 => {
+            let fs_type = detect_filesystem_type(&mut reader, partition_offset);
+            match fs_type {
+                "ext" => Ok(Box::new(ext::ExtFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                _ => Err(FilesystemError::Unsupported(format!(
+                    "editing not yet supported for Linux filesystem type '{fs_type}'"
+                ))),
+            }
+        }
+        // ProDOS
+        0xA8 => Ok(Box::new(prodos::ProDosFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
+        // HFS+ (MBR type 0xAF)
+        0xAF => {
+            let (fs_type, hfsplus_offset) = resolve_apple_hfs(&mut reader, partition_offset);
+            match fs_type {
+                "hfsplus" => Ok(Box::new(hfsplus::HfsPlusFilesystem::open(
+                    reader,
+                    hfsplus_offset,
+                )?)),
+                "hfs" => Ok(Box::new(hfs::HfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                _ => Err(FilesystemError::Unsupported(
+                    "unrecognized HFS variant at type 0xAF".into(),
+                )),
+            }
+        }
         _ => Err(FilesystemError::Unsupported(format!(
             "editing not yet supported for filesystem type 0x{partition_type:02X}"
         ))),

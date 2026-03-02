@@ -200,6 +200,56 @@ impl Iterator for ClearBitsIter<'_> {
     }
 }
 
+// --- Bitmap mutation helpers (for filesystem editing) ---
+
+/// Set the bit at `index` in a mutable bitmap (little-endian bit order).
+///
+/// Panics if `index` is out of range for the data slice.
+#[inline]
+pub fn bitmap_set_bit(data: &mut [u8], index: u64) {
+    let byte_idx = (index / 8) as usize;
+    let bit_idx = (index % 8) as u32;
+    data[byte_idx] |= 1u8 << bit_idx;
+}
+
+/// Clear the bit at `index` in a mutable bitmap (little-endian bit order).
+///
+/// Panics if `index` is out of range for the data slice.
+#[inline]
+pub fn bitmap_clear_bit(data: &mut [u8], index: u64) {
+    let byte_idx = (index / 8) as usize;
+    let bit_idx = (index % 8) as u32;
+    data[byte_idx] &= !(1u8 << bit_idx);
+}
+
+/// Find the first clear (0) bit in the bitmap within `bit_count` valid bits.
+///
+/// Returns `None` if all valid bits are set.
+pub fn bitmap_find_clear_bit(data: &[u8], bit_count: u64) -> Option<u64> {
+    let full_bytes = (bit_count / 8) as usize;
+    let remaining_bits = (bit_count % 8) as u32;
+
+    for i in 0..full_bytes {
+        if data[i] != 0xFF {
+            let bit = data[i].trailing_ones();
+            return Some(i as u64 * 8 + bit as u64);
+        }
+    }
+
+    if remaining_bits > 0 && full_bytes < data.len() {
+        let mask = (1u8 << remaining_bits) - 1;
+        let masked = data[full_bytes] & mask;
+        if masked != mask {
+            let bit = masked.trailing_ones();
+            if bit < remaining_bits {
+                return Some(full_bytes as u64 * 8 + bit as u64);
+            }
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,5 +448,74 @@ mod tests {
         let bm = BitmapReader::new(&data, 8);
         let bits: Vec<u64> = bm.iter_set_bits().collect();
         assert!(bits.is_empty());
+    }
+
+    // --- Mutation helper tests ---
+
+    #[test]
+    fn test_bitmap_set_bit() {
+        let mut data = [0u8; 2];
+        bitmap_set_bit(&mut data, 0);
+        assert_eq!(data[0], 0b00000001);
+        bitmap_set_bit(&mut data, 7);
+        assert_eq!(data[0], 0b10000001);
+        bitmap_set_bit(&mut data, 8);
+        assert_eq!(data[1], 0b00000001);
+        bitmap_set_bit(&mut data, 15);
+        assert_eq!(data[1], 0b10000001);
+    }
+
+    #[test]
+    fn test_bitmap_clear_bit() {
+        let mut data = [0xFF, 0xFF];
+        bitmap_clear_bit(&mut data, 0);
+        assert_eq!(data[0], 0b11111110);
+        bitmap_clear_bit(&mut data, 7);
+        assert_eq!(data[0], 0b01111110);
+        bitmap_clear_bit(&mut data, 8);
+        assert_eq!(data[1], 0b11111110);
+    }
+
+    #[test]
+    fn test_bitmap_set_clear_roundtrip() {
+        let mut data = [0u8; 4];
+        for i in 0..32u64 {
+            bitmap_set_bit(&mut data, i);
+        }
+        assert_eq!(data, [0xFF; 4]);
+        for i in 0..32u64 {
+            bitmap_clear_bit(&mut data, i);
+        }
+        assert_eq!(data, [0x00; 4]);
+    }
+
+    #[test]
+    fn test_bitmap_find_clear_bit_basic() {
+        let data = [0xFF, 0b11111110]; // first clear bit is 8
+        assert_eq!(bitmap_find_clear_bit(&data, 16), Some(8));
+    }
+
+    #[test]
+    fn test_bitmap_find_clear_bit_first() {
+        let data = [0b11111110]; // bit 0 clear
+        assert_eq!(bitmap_find_clear_bit(&data, 8), Some(0));
+    }
+
+    #[test]
+    fn test_bitmap_find_clear_bit_none() {
+        let data = [0xFF, 0xFF];
+        assert_eq!(bitmap_find_clear_bit(&data, 16), None);
+    }
+
+    #[test]
+    fn test_bitmap_find_clear_bit_partial() {
+        let data = [0xFF, 0b00001111]; // bits 12-15 are clear, but only 12 valid
+        assert_eq!(bitmap_find_clear_bit(&data, 12), None); // all 12 valid bits are set
+    }
+
+    #[test]
+    fn test_bitmap_find_clear_bit_in_partial() {
+        let data = [0xFF, 0b11111011]; // bit 10 clear
+        assert_eq!(bitmap_find_clear_bit(&data, 12), Some(10));
     }
 }
