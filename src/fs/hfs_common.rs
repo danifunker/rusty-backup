@@ -41,6 +41,18 @@ pub fn bitmap_clear_bit_be(data: &mut [u8], index: u32) {
 }
 
 #[allow(dead_code)]
+/// Find the first set (1) bit in a big-endian bitmap within `max_bits`.
+/// ProDOS uses bit=1 for FREE blocks, so this finds the first free block.
+pub fn bitmap_find_set_bit_be(data: &[u8], max_bits: u32) -> Option<u32> {
+    for bit in 0..max_bits {
+        if bitmap_test_bit_be(data, bit) {
+            return Some(bit);
+        }
+    }
+    None
+}
+
+#[allow(dead_code)]
 /// Find the first clear (0) bit in a big-endian bitmap within `max_bits`.
 pub fn bitmap_find_clear_bit_be(data: &[u8], max_bits: u32) -> Option<u32> {
     for bit in 0..max_bits {

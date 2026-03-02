@@ -543,6 +543,12 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     ))),
                 };
             }
+            "Apple_PRODOS" | "Apple_ProDOS" => {
+                return Ok(Box::new(prodos::ProDosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?));
+            }
             _ => {
                 return Err(FilesystemError::Unsupported(format!(
                     "editing not yet supported for APM type '{type_str}'"
@@ -621,10 +627,11 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                 ))),
             }
         }
-        // ProDOS — editing not supported
-        0xA8 => Err(FilesystemError::Unsupported(
-            "editing not supported for ProDOS".into(),
-        )),
+        // ProDOS
+        0xA8 => Ok(Box::new(prodos::ProDosFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
         // HFS+ (MBR type 0xAF)
         0xAF => {
             let (fs_type, hfsplus_offset) = resolve_apple_hfs(&mut reader, partition_offset);
