@@ -65,6 +65,12 @@ pub trait Filesystem: Send {
     fn resource_fork_size(&mut self, _entry: &FileEntry) -> u64 {
         0
     }
+
+    /// Returns the CNID and name of the blessed (bootable) system folder, if set.
+    /// Only meaningful for HFS/HFS+.
+    fn blessed_system_folder(&mut self) -> Option<(u64, String)> {
+        None
+    }
 }
 
 /// Errors from filesystem operations.
@@ -226,4 +232,10 @@ pub trait EditableFilesystem: Filesystem {
 
     /// Returns the number of free bytes available on the filesystem.
     fn free_space(&mut self) -> Result<u64, FilesystemError>;
+
+    /// Mark a folder as the blessed (bootable) system folder.
+    /// Only meaningful for HFS/HFS+. Default no-op.
+    fn set_blessed_folder(&mut self, _entry: &FileEntry) -> Result<(), FilesystemError> {
+        Ok(())
+    }
 }

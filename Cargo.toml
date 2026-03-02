@@ -38,6 +38,7 @@ image = "0.25"
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 webbrowser = "1.0"
 dirs = "5"
+unicode-normalization = "0.1"
 opticaldiscs = { git = "https://github.com/danifunker/opticaldiscs-rs", features = ["drives"] }
 cd-da-reader = { git = "https://github.com/danifunker/rust-cd-da-reader", branch = "add-data-support" }
 

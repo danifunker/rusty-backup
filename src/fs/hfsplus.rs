@@ -1,8 +1,17 @@
 use byteorder::{BigEndian, ByteOrder};
+use std::cmp::Ordering;
 use std::io::{Read, Seek, SeekFrom, Write};
+use unicode_normalization::UnicodeNormalization;
 
 use super::entry::{EntryType, FileEntry};
-use super::filesystem::{Filesystem, FilesystemError};
+use super::filesystem::{
+    CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
+};
+use super::hfs_common::{
+    self, bitmap_clear_bit_be, bitmap_find_clear_run_be, bitmap_set_bit_be, btree_free_node,
+    btree_grow_root, btree_insert_into_index, btree_insert_record, btree_record_range,
+    btree_remove_record, btree_split_leaf, BTreeHeader,
+};
 use super::CompactResult;
 
 const HFS_PLUS_SIGNATURE: u16 = 0x482B;
@@ -25,6 +34,11 @@ impl ExtentDescriptor {
 
     fn is_empty(&self) -> bool {
         self.block_count == 0
+    }
+
+    fn serialize(&self, out: &mut [u8]) {
+        BigEndian::write_u32(&mut out[0..4], self.start_block);
+        BigEndian::write_u32(&mut out[4..8], self.block_count);
     }
 }
 
@@ -54,6 +68,27 @@ impl ForkData {
             extents,
         }
     }
+
+    fn serialize(&self, out: &mut [u8]) {
+        BigEndian::write_u64(&mut out[0..8], self.logical_size);
+        BigEndian::write_u32(&mut out[8..12], self.clump_size);
+        BigEndian::write_u32(&mut out[12..16], self.total_blocks);
+        for i in 0..8 {
+            self.extents[i].serialize(&mut out[16 + i * 8..24 + i * 8]);
+        }
+    }
+
+    fn empty() -> Self {
+        ForkData {
+            logical_size: 0,
+            clump_size: 0,
+            total_blocks: 0,
+            extents: [ExtentDescriptor {
+                start_block: 0,
+                block_count: 0,
+            }; 8],
+        }
+    }
 }
 
 /// HFS+ Volume Header (512 bytes at partition_offset + 1024).
@@ -63,9 +98,24 @@ struct HfsPlusVolumeHeader {
     signature: u16,
     version: u16,
     attributes: u32,
+    last_mounted_version: u32,
+    journal_info_block: u32,
+    create_date: u32,
+    modify_date: u32,
+    backup_date: u32,
+    checked_date: u32,
+    file_count: u32,
+    folder_count: u32,
     block_size: u32,
     total_blocks: u32,
     free_blocks: u32,
+    next_allocation: u32,
+    rsrc_clump_size: u32,
+    data_clump_size: u32,
+    next_catalog_id: u32,
+    write_count: u32,
+    encodings_bitmap: u64,
+    finder_info: [u32; 8],
     allocation_file: ForkData,
     extents_file: ForkData,
     catalog_file: ForkData,
@@ -85,19 +135,72 @@ impl HfsPlusVolumeHeader {
             )));
         }
 
+        let mut finder_info = [0u32; 8];
+        for i in 0..8 {
+            finder_info[i] = BigEndian::read_u32(&data[80 + i * 4..84 + i * 4]);
+        }
+
         Ok(HfsPlusVolumeHeader {
             signature: sig,
             version: BigEndian::read_u16(&data[2..4]),
             attributes: BigEndian::read_u32(&data[4..8]),
+            last_mounted_version: BigEndian::read_u32(&data[8..12]),
+            journal_info_block: BigEndian::read_u32(&data[12..16]),
+            create_date: BigEndian::read_u32(&data[16..20]),
+            modify_date: BigEndian::read_u32(&data[20..24]),
+            backup_date: BigEndian::read_u32(&data[24..28]),
+            checked_date: BigEndian::read_u32(&data[28..32]),
+            file_count: BigEndian::read_u32(&data[32..36]),
+            folder_count: BigEndian::read_u32(&data[36..40]),
             block_size: BigEndian::read_u32(&data[40..44]),
             total_blocks: BigEndian::read_u32(&data[44..48]),
             free_blocks: BigEndian::read_u32(&data[48..52]),
+            next_allocation: BigEndian::read_u32(&data[52..56]),
+            rsrc_clump_size: BigEndian::read_u32(&data[56..60]),
+            data_clump_size: BigEndian::read_u32(&data[60..64]),
+            next_catalog_id: BigEndian::read_u32(&data[64..68]),
+            write_count: BigEndian::read_u32(&data[68..72]),
+            encodings_bitmap: BigEndian::read_u64(&data[72..80]),
+            finder_info,
             allocation_file: ForkData::parse(&data[112..192]),
             extents_file: ForkData::parse(&data[192..272]),
             catalog_file: ForkData::parse(&data[272..352]),
             attributes_file: ForkData::parse(&data[352..432]),
             startup_file: ForkData::parse(&data[432..512]),
         })
+    }
+
+    fn serialize(&self) -> [u8; 512] {
+        let mut out = [0u8; 512];
+        BigEndian::write_u16(&mut out[0..2], self.signature);
+        BigEndian::write_u16(&mut out[2..4], self.version);
+        BigEndian::write_u32(&mut out[4..8], self.attributes);
+        BigEndian::write_u32(&mut out[8..12], self.last_mounted_version);
+        BigEndian::write_u32(&mut out[12..16], self.journal_info_block);
+        BigEndian::write_u32(&mut out[16..20], self.create_date);
+        BigEndian::write_u32(&mut out[20..24], self.modify_date);
+        BigEndian::write_u32(&mut out[24..28], self.backup_date);
+        BigEndian::write_u32(&mut out[28..32], self.checked_date);
+        BigEndian::write_u32(&mut out[32..36], self.file_count);
+        BigEndian::write_u32(&mut out[36..40], self.folder_count);
+        BigEndian::write_u32(&mut out[40..44], self.block_size);
+        BigEndian::write_u32(&mut out[44..48], self.total_blocks);
+        BigEndian::write_u32(&mut out[48..52], self.free_blocks);
+        BigEndian::write_u32(&mut out[52..56], self.next_allocation);
+        BigEndian::write_u32(&mut out[56..60], self.rsrc_clump_size);
+        BigEndian::write_u32(&mut out[60..64], self.data_clump_size);
+        BigEndian::write_u32(&mut out[64..68], self.next_catalog_id);
+        BigEndian::write_u32(&mut out[68..72], self.write_count);
+        BigEndian::write_u64(&mut out[72..80], self.encodings_bitmap);
+        for i in 0..8 {
+            BigEndian::write_u32(&mut out[80 + i * 4..84 + i * 4], self.finder_info[i]);
+        }
+        self.allocation_file.serialize(&mut out[112..192]);
+        self.extents_file.serialize(&mut out[192..272]);
+        self.catalog_file.serialize(&mut out[272..352]);
+        self.attributes_file.serialize(&mut out[352..432]);
+        self.startup_file.serialize(&mut out[432..512]);
+        out
     }
 
     fn is_hfsx(&self) -> bool {
@@ -211,6 +314,8 @@ pub struct HfsPlusFilesystem<R: Read + Seek> {
     catalog_header: BTreeHeaderRecord,
     /// Volume label (from catalog root folder thread).
     label: String,
+    /// Cached allocation bitmap (loaded on first write operation).
+    bitmap: Option<Vec<u8>>,
 }
 
 impl<R: Read + Seek> HfsPlusFilesystem<R> {
@@ -254,6 +359,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
             catalog_data,
             catalog_header,
             label,
+            bitmap: None,
         })
     }
 
@@ -437,6 +543,538 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         )?;
         Ok(alloc_data)
     }
+
+    /// Ensure the allocation bitmap is cached in memory.
+    fn ensure_bitmap(&mut self) -> Result<(), FilesystemError> {
+        if self.bitmap.is_none() {
+            self.bitmap = Some(self.read_allocation_bitmap()?);
+        }
+        Ok(())
+    }
+
+    /// Build HFS+ catalog key bytes: key_len(2) + parent_id(4) + name_length(2) + name(UTF-16BE NFD).
+    fn build_catalog_key(parent_cnid: u32, name: &str) -> Vec<u8> {
+        let nfd: String = name.nfd().collect();
+        let utf16: Vec<u16> = nfd.encode_utf16().collect();
+        let key_len = 4 + 2 + utf16.len() * 2;
+        let mut key = Vec::with_capacity(2 + key_len);
+        let mut buf = [0u8; 2];
+        BigEndian::write_u16(&mut buf, key_len as u16);
+        key.extend_from_slice(&buf);
+        let mut buf4 = [0u8; 4];
+        BigEndian::write_u32(&mut buf4, parent_cnid);
+        key.extend_from_slice(&buf4);
+        BigEndian::write_u16(&mut buf, utf16.len() as u16);
+        key.extend_from_slice(&buf);
+        for &ch in &utf16 {
+            BigEndian::write_u16(&mut buf, ch);
+            key.extend_from_slice(&buf);
+        }
+        key
+    }
+
+    /// Compare function for catalog B-tree records (compares key portion only).
+    fn catalog_compare(a: &[u8], b: &[u8]) -> Ordering {
+        // Both records start with: key_len(2) + parent_id(4) + name_len(2) + name(UTF-16BE)
+        if a.len() < 8 || b.len() < 8 {
+            return a.len().cmp(&b.len());
+        }
+        let parent_a = BigEndian::read_u32(&a[2..6]);
+        let parent_b = BigEndian::read_u32(&b[2..6]);
+        let name_len_a = BigEndian::read_u16(&a[6..8]) as usize;
+        let name_len_b = BigEndian::read_u16(&b[6..8]) as usize;
+        let name_a: Vec<u16> = a[8..8 + name_len_a.min((a.len() - 8) / 2) * 2]
+            .chunks_exact(2)
+            .map(|c| BigEndian::read_u16(c))
+            .collect();
+        let name_b: Vec<u16> = b[8..8 + name_len_b.min((b.len() - 8) / 2) * 2]
+            .chunks_exact(2)
+            .map(|c| BigEndian::read_u16(c))
+            .collect();
+        hfs_common::compare_hfsplus_keys(parent_a, &name_a, parent_b, &name_b, false)
+    }
+
+    /// Find a catalog record by (parent_cnid, name).
+    /// Returns Some((node_idx, rec_idx, absolute_offset_in_catalog_data)) if found.
+    /// Scans leaf nodes linearly (correct for all catalog sizes we encounter).
+    fn find_catalog_record(&self, parent_cnid: u32, name: &str) -> Option<(u32, usize, usize)> {
+        let search_key = Self::build_catalog_key(parent_cnid, name);
+        let node_size = self.catalog_header.node_size as usize;
+        if node_size == 0 {
+            return None;
+        }
+
+        let mut node_idx = self.catalog_header.first_leaf_node;
+        while node_idx != 0 {
+            let offset = node_idx as usize * node_size;
+            if offset + node_size > self.catalog_data.len() {
+                break;
+            }
+            let node = &self.catalog_data[offset..offset + node_size];
+            let kind = node[8] as i8;
+            if kind != -1 {
+                node_idx = BigEndian::read_u32(&node[0..4]);
+                continue;
+            }
+            let num_records = BigEndian::read_u16(&node[10..12]) as usize;
+            for i in 0..num_records {
+                let (rec_start, rec_end) = btree_record_range(node, node_size, i);
+                if rec_start >= rec_end || rec_end > node_size {
+                    continue;
+                }
+                let rec = &node[rec_start..rec_end];
+                if rec.len() < 8 {
+                    continue;
+                }
+                // Compare key portion
+                let key_len = BigEndian::read_u16(&rec[0..2]) as usize;
+                let key_portion = &rec[..2 + key_len.min(rec.len() - 2)];
+                if Self::catalog_compare(key_portion, &search_key) == Ordering::Equal {
+                    return Some((node_idx, i, offset + rec_start));
+                }
+            }
+            node_idx = BigEndian::read_u32(&node[0..4]);
+        }
+        None
+    }
+
+    /// Find a thread record by CNID (thread key: parent_id=cnid, name="").
+    fn find_catalog_record_by_cnid(&self, cnid: u32) -> Option<(u32, usize, usize)> {
+        self.find_catalog_record(cnid, "")
+    }
+
+    /// Update parent folder valence (child count) by delta.
+    fn update_parent_valence(
+        &mut self,
+        parent_cnid: u32,
+        delta: i32,
+    ) -> Result<(), FilesystemError> {
+        // Find parent's thread record to get its actual parent + name
+        let (node_idx, _rec_idx, _offset) = self
+            .find_catalog_record_by_cnid(parent_cnid)
+            .ok_or_else(|| {
+                FilesystemError::NotFound(format!("thread record for CNID {parent_cnid} not found"))
+            })?;
+
+        // Now scan for the actual folder record (not thread) with this CNID
+        let node_size = self.catalog_header.node_size as usize;
+        let mut scan_node = self.catalog_header.first_leaf_node;
+        while scan_node != 0 {
+            let offset = scan_node as usize * node_size;
+            if offset + node_size > self.catalog_data.len() {
+                break;
+            }
+            let num_records =
+                BigEndian::read_u16(&self.catalog_data[offset + 10..offset + 12]) as usize;
+            for i in 0..num_records {
+                let (rec_start, rec_end) = btree_record_range(
+                    &self.catalog_data[offset..offset + node_size],
+                    node_size,
+                    i,
+                );
+                let abs_start = offset + rec_start;
+                let abs_end = offset + rec_end;
+                if abs_end > self.catalog_data.len() || rec_end - rec_start < 8 {
+                    continue;
+                }
+                let key_len =
+                    BigEndian::read_u16(&self.catalog_data[abs_start..abs_start + 2]) as usize;
+                let mut rec_data_start = abs_start + 2 + key_len;
+                if rec_data_start % 2 != 0 {
+                    rec_data_start += 1;
+                }
+                if rec_data_start + 12 > abs_end {
+                    continue;
+                }
+                let record_type =
+                    BigEndian::read_i16(&self.catalog_data[rec_data_start..rec_data_start + 2]);
+                if record_type != CATALOG_FOLDER {
+                    continue;
+                }
+                let folder_id = BigEndian::read_u32(
+                    &self.catalog_data[rec_data_start + 8..rec_data_start + 12],
+                );
+                if folder_id == parent_cnid {
+                    // Valence is at offset 4 in the folder record
+                    let val_offset = rec_data_start + 4;
+                    let old_val =
+                        BigEndian::read_u32(&self.catalog_data[val_offset..val_offset + 4]);
+                    let new_val = (old_val as i64 + delta as i64).max(0) as u32;
+                    BigEndian::write_u32(
+                        &mut self.catalog_data[val_offset..val_offset + 4],
+                        new_val,
+                    );
+                    return Ok(());
+                }
+            }
+            let next = BigEndian::read_u32(&self.catalog_data[offset..offset + 4]);
+            scan_node = next;
+        }
+        // If we can't find it, that's not fatal (could be root with no visible record)
+        let _ = node_idx; // suppress warning
+        Ok(())
+    }
+
+    /// Insert a catalog record into the B-tree, handling splits and growth.
+    fn insert_catalog_record(&mut self, key_record: &[u8]) -> Result<(), FilesystemError> {
+        let header = BTreeHeader::read(&self.catalog_data);
+        let node_size = header.node_size as usize;
+
+        // Find the correct leaf node
+        let (leaf_idx, parent_chain) = hfs_common::btree_find_insert_leaf(
+            &self.catalog_data,
+            &header,
+            key_record,
+            &Self::catalog_compare,
+        );
+
+        // Try to insert into the leaf
+        let offset = leaf_idx as usize * node_size;
+        let node = &mut self.catalog_data[offset..offset + node_size];
+        match btree_insert_record(node, node_size, key_record, &Self::catalog_compare) {
+            Ok(_) => {
+                // Update header leaf_records
+                let mut h = BTreeHeader::read(&self.catalog_data);
+                h.leaf_records += 1;
+                h.write(&mut self.catalog_data);
+                self.catalog_header.leaf_records = h.leaf_records;
+                Ok(())
+            }
+            Err(_) => {
+                // Leaf is full — split
+                let mut h = BTreeHeader::read(&self.catalog_data);
+                let (new_idx, split_key) =
+                    btree_split_leaf(&mut self.catalog_data, node_size, leaf_idx, &mut h)?;
+
+                // Insert into the correct half
+                let target = if Self::catalog_compare(key_record, &split_key) == Ordering::Less {
+                    leaf_idx
+                } else {
+                    new_idx
+                };
+                let t_offset = target as usize * node_size;
+                let t_node = &mut self.catalog_data[t_offset..t_offset + node_size];
+                btree_insert_record(t_node, node_size, key_record, &Self::catalog_compare)?;
+
+                h.leaf_records += 1;
+
+                // Insert separator into parent
+                if h.depth == 1 {
+                    // Root was a leaf — grow root
+                    btree_grow_root(
+                        &mut self.catalog_data,
+                        node_size,
+                        &mut h,
+                        leaf_idx,
+                        new_idx,
+                        &split_key,
+                    )?;
+                } else {
+                    // Find the parent index node for the leaf
+                    if let Some(&(_, parent_idx)) =
+                        parent_chain.iter().find(|&&(nidx, _)| nidx == leaf_idx)
+                    {
+                        btree_insert_into_index(
+                            &mut self.catalog_data,
+                            node_size,
+                            parent_idx,
+                            new_idx,
+                            &split_key,
+                            &mut h,
+                            &Self::catalog_compare,
+                            &parent_chain,
+                        )?;
+                    } else {
+                        btree_grow_root(
+                            &mut self.catalog_data,
+                            node_size,
+                            &mut h,
+                            leaf_idx,
+                            new_idx,
+                            &split_key,
+                        )?;
+                    }
+                }
+
+                h.write(&mut self.catalog_data);
+                self.catalog_header = BTreeHeaderRecord::parse(&self.catalog_data[14..14 + 106]);
+                Ok(())
+            }
+        }
+    }
+
+    /// Remove a catalog record by (node_idx, rec_idx).
+    fn remove_catalog_record(&mut self, node_idx: u32, rec_idx: usize) {
+        let node_size = self.catalog_header.node_size as usize;
+        let offset = node_idx as usize * node_size;
+        btree_remove_record(
+            &mut self.catalog_data[offset..offset + node_size],
+            node_size,
+            rec_idx,
+        );
+
+        // Check if leaf is now empty
+        let num = BigEndian::read_u16(&self.catalog_data[offset + 10..offset + 12]);
+        if num == 0 {
+            // Free the node and update prev/next links
+            let prev = BigEndian::read_u32(&self.catalog_data[offset + 4..offset + 8]);
+            let next = BigEndian::read_u32(&self.catalog_data[offset..offset + 4]);
+            if prev != 0 {
+                let prev_off = prev as usize * node_size;
+                BigEndian::write_u32(&mut self.catalog_data[prev_off..prev_off + 4], next);
+            }
+            if next != 0 {
+                let next_off = next as usize * node_size;
+                BigEndian::write_u32(&mut self.catalog_data[next_off + 4..next_off + 8], prev);
+            }
+            btree_free_node(&mut self.catalog_data, node_size, node_idx);
+
+            let mut h = BTreeHeader::read(&self.catalog_data);
+            h.free_nodes += 1;
+            if h.first_leaf_node == node_idx {
+                h.first_leaf_node = next;
+            }
+            if h.last_leaf_node == node_idx {
+                h.last_leaf_node = prev;
+            }
+            h.write(&mut self.catalog_data);
+        }
+
+        // Update header leaf_records
+        let mut h = BTreeHeader::read(&self.catalog_data);
+        h.leaf_records = h.leaf_records.saturating_sub(1);
+        h.write(&mut self.catalog_data);
+        self.catalog_header = BTreeHeaderRecord::parse(&self.catalog_data[14..14 + 106]);
+    }
+}
+
+// --- Write helpers (require R: Read + Write + Seek) ---
+
+impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
+    /// Write data to an allocation block.
+    fn write_block(&mut self, block: u32, data: &[u8]) -> Result<(), FilesystemError> {
+        let offset = self.partition_offset + block as u64 * self.vh.block_size as u64;
+        self.reader.seek(SeekFrom::Start(offset))?;
+        self.reader.write_all(data)?;
+        Ok(())
+    }
+
+    /// Write the volume header to both primary (offset+1024) and backup (offset+total_size-1024).
+    fn write_volume_header(&mut self) -> Result<(), FilesystemError> {
+        let vh_bytes = self.vh.serialize();
+        // Primary
+        self.reader
+            .seek(SeekFrom::Start(self.partition_offset + 1024))?;
+        self.reader.write_all(&vh_bytes)?;
+        // Backup (last 1024 bytes of volume)
+        let total_size = self.vh.total_blocks as u64 * self.vh.block_size as u64;
+        if total_size > 1024 {
+            self.reader
+                .seek(SeekFrom::Start(self.partition_offset + total_size - 1024))?;
+            self.reader.write_all(&vh_bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Write the catalog B-tree data back to disk through the catalog_file fork extents.
+    fn write_catalog(&mut self) -> Result<(), FilesystemError> {
+        write_fork_data(
+            &mut self.reader,
+            self.partition_offset,
+            self.vh.block_size,
+            &self.vh.catalog_file,
+            &self.catalog_data,
+        )
+    }
+
+    /// Write the allocation bitmap back to disk.
+    fn write_allocation_bitmap(&mut self) -> Result<(), FilesystemError> {
+        if let Some(ref bm) = self.bitmap {
+            write_fork_data(
+                &mut self.reader,
+                self.partition_offset,
+                self.vh.block_size,
+                &self.vh.allocation_file,
+                bm,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Reload the catalog from disk.
+    fn reload_catalog(&mut self) -> Result<(), FilesystemError> {
+        self.catalog_data = read_fork(
+            &mut self.reader,
+            self.partition_offset,
+            self.vh.block_size,
+            &self.vh.catalog_file,
+        )?;
+        self.catalog_header = BTreeHeaderRecord::parse(&self.catalog_data[14..14 + 106]);
+        self.label = find_volume_label(&self.catalog_data, &self.catalog_header);
+        Ok(())
+    }
+
+    /// Allocate `count` contiguous blocks from the allocation bitmap.
+    /// Returns the start block index.
+    fn allocate_blocks(&mut self, count: u32) -> Result<u32, FilesystemError> {
+        self.ensure_bitmap()?;
+        let bitmap = self.bitmap.as_mut().unwrap();
+        let start =
+            bitmap_find_clear_run_be(bitmap, self.vh.total_blocks, count).ok_or_else(|| {
+                FilesystemError::DiskFull(format!("cannot find {} contiguous free blocks", count))
+            })?;
+        for i in 0..count {
+            bitmap_set_bit_be(bitmap, start + i);
+        }
+        self.vh.free_blocks -= count;
+        Ok(start)
+    }
+
+    /// Free `count` blocks starting at `start`.
+    fn free_blocks(&mut self, start: u32, count: u32) {
+        self.ensure_bitmap().ok();
+        if let Some(ref mut bitmap) = self.bitmap {
+            for i in 0..count {
+                bitmap_clear_bit_be(bitmap, start + i);
+            }
+        }
+        self.vh.free_blocks += count;
+    }
+
+    /// Free all blocks referenced by a fork (inline extents only).
+    fn free_fork_blocks(&mut self, fork: &ForkData) {
+        for ext in &fork.extents {
+            if ext.is_empty() {
+                break;
+            }
+            self.free_blocks(ext.start_block, ext.block_count);
+        }
+    }
+
+    /// Write file data to allocated blocks. Returns the ForkData describing the allocation.
+    fn write_data_to_blocks(
+        &mut self,
+        data: &mut dyn std::io::Read,
+        data_len: u64,
+    ) -> Result<ForkData, FilesystemError> {
+        if data_len == 0 {
+            return Ok(ForkData::empty());
+        }
+        let block_size = self.vh.block_size as u64;
+        let blocks_needed = ((data_len + block_size - 1) / block_size) as u32;
+        let start_block = self.allocate_blocks(blocks_needed)?;
+
+        // Write data block by block
+        let mut buf = vec![0u8; block_size as usize];
+        let mut remaining = data_len;
+        for i in 0..blocks_needed {
+            let to_read = remaining.min(block_size) as usize;
+            buf[..to_read].fill(0);
+            data.read_exact(&mut buf[..to_read]).map_err(|e| {
+                FilesystemError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("reading file data: {e}"),
+                ))
+            })?;
+            // Zero-pad the rest of the block
+            if to_read < block_size as usize {
+                buf[to_read..].fill(0);
+            }
+            self.write_block(start_block + i, &buf)?;
+            remaining -= to_read as u64;
+        }
+
+        let mut fork = ForkData::empty();
+        fork.logical_size = data_len;
+        fork.total_blocks = blocks_needed;
+        fork.extents[0] = ExtentDescriptor {
+            start_block,
+            block_count: blocks_needed,
+        };
+        Ok(fork)
+    }
+
+    /// Build a complete HFS+ file catalog record (248 bytes).
+    fn build_file_record(
+        file_id: u32,
+        data_fork: &ForkData,
+        rsrc_fork: &ForkData,
+        type_code: &[u8; 4],
+        creator_code: &[u8; 4],
+    ) -> [u8; 248] {
+        let mut rec = [0u8; 248];
+        let now = hfs_common::hfs_now();
+        BigEndian::write_i16(&mut rec[0..2], CATALOG_FILE);
+        BigEndian::write_u32(&mut rec[8..12], file_id);
+        BigEndian::write_u32(&mut rec[12..16], now); // createDate
+        BigEndian::write_u32(&mut rec[16..20], now); // contentModDate
+        BigEndian::write_u32(&mut rec[20..24], now); // attributeModDate
+        BigEndian::write_u32(&mut rec[24..28], now); // accessDate
+                                                     // FileInfo (userInfo): fdType at offset 48, fdCreator at offset 52
+        rec[48..52].copy_from_slice(type_code);
+        rec[52..56].copy_from_slice(creator_code);
+        // dataFork at offset 88
+        data_fork.serialize(&mut rec[88..168]);
+        // resourceFork at offset 168
+        rsrc_fork.serialize(&mut rec[168..248]);
+        rec
+    }
+
+    /// Build a complete HFS+ folder catalog record (88 bytes).
+    fn build_folder_record(folder_id: u32) -> [u8; 88] {
+        let mut rec = [0u8; 88];
+        let now = hfs_common::hfs_now();
+        BigEndian::write_i16(&mut rec[0..2], CATALOG_FOLDER);
+        // valence = 0 (offset 4)
+        BigEndian::write_u32(&mut rec[8..12], folder_id);
+        BigEndian::write_u32(&mut rec[12..16], now);
+        BigEndian::write_u32(&mut rec[16..20], now);
+        BigEndian::write_u32(&mut rec[20..24], now);
+        BigEndian::write_u32(&mut rec[24..28], now);
+        rec
+    }
+
+    /// Build a thread record. Thread key: (cnid, ""). Thread data: type(2) + reserved(2) + parentID(4) + name.
+    fn build_thread_record(record_type: i16, parent_cnid: u32, name: &str) -> (Vec<u8>, Vec<u8>) {
+        // Thread key: parent_id = cnid, name = empty
+        // Actually, thread records are keyed by (cnid, "")
+        // We need to build key + record separately
+
+        // Key
+        let key = Self::build_catalog_key(parent_cnid, "");
+        // But wait — for thread records, the key uses the CNID as parent_id and empty name.
+        // The parent_cnid here is actually the target CNID, not the actual parent.
+        // Let me re-read: Thread key: key_len(2) + parent_id(4, =CNID) + name_len(2, =0)
+
+        // Record data: type(2) + reserved(2) + parentID(4) + name_len(2) + name(UTF-16BE)
+        let nfd: String = name.nfd().collect();
+        let utf16: Vec<u16> = nfd.encode_utf16().collect();
+        let mut rec = Vec::with_capacity(10 + utf16.len() * 2);
+        let mut buf2 = [0u8; 2];
+        let mut buf4 = [0u8; 4];
+        BigEndian::write_i16(&mut buf2, record_type);
+        rec.extend_from_slice(&buf2); // type
+        rec.extend_from_slice(&[0, 0]); // reserved
+        BigEndian::write_u32(&mut buf4, parent_cnid);
+        rec.extend_from_slice(&buf4); // parentID (the actual parent of the entry)
+        BigEndian::write_u16(&mut buf2, utf16.len() as u16);
+        rec.extend_from_slice(&buf2); // name_len
+        for &ch in &utf16 {
+            BigEndian::write_u16(&mut buf2, ch);
+            rec.extend_from_slice(&buf2);
+        }
+        (key, rec)
+    }
+
+    /// Sync metadata: write catalog + allocation bitmap + volume header + flush.
+    fn do_sync_metadata(&mut self) -> Result<(), FilesystemError> {
+        self.vh.modify_date = hfs_common::hfs_now();
+        self.write_catalog()?;
+        self.write_allocation_bitmap()?;
+        self.write_volume_header()?;
+        self.reader.flush()?;
+        Ok(())
+    }
 }
 
 impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
@@ -596,6 +1234,48 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
             .map(|(_d, r)| r.logical_size)
             .unwrap_or(0)
     }
+
+    fn blessed_system_folder(&mut self) -> Option<(u64, String)> {
+        // finderInfo[0] = Classic Mac OS System Folder CNID
+        let cnid = self.vh.finder_info[0];
+        if cnid == 0 {
+            // Try finderInfo[5] = Mac OS X boot directory
+            let cnid_x = self.vh.finder_info[5];
+            if cnid_x == 0 {
+                return None;
+            }
+            return self.lookup_folder_name(cnid_x);
+        }
+        self.lookup_folder_name(cnid)
+    }
+}
+
+impl<R: Read + Seek + Send> HfsPlusFilesystem<R> {
+    fn lookup_folder_name(&self, cnid: u32) -> Option<(u64, String)> {
+        // Find the thread record for this CNID to get its name
+        if let Some((_node, _rec, offset)) = self.find_catalog_record_by_cnid(cnid) {
+            let node_size = self.catalog_header.node_size as usize;
+            let key_len = BigEndian::read_u16(&self.catalog_data[offset..offset + 2]) as usize;
+            let mut rec_data_start = offset + 2 + key_len;
+            if rec_data_start % 2 != 0 {
+                rec_data_start += 1;
+            }
+            // Thread record: type(2) + reserved(2) + parentID(4) + name_len(2) + name(UTF-16BE)
+            if rec_data_start + 10 <= self.catalog_data.len() {
+                let name_len = BigEndian::read_u16(
+                    &self.catalog_data[rec_data_start + 8..rec_data_start + 10],
+                ) as usize;
+                let name_end = rec_data_start + 10 + name_len * 2;
+                if name_end <= self.catalog_data.len() {
+                    let name = decode_utf16be(&self.catalog_data[rec_data_start + 10..name_end]);
+                    return Some((cnid as u64, name));
+                }
+            }
+            let _ = node_size;
+        }
+        // CNID set but can't resolve name
+        Some((cnid as u64, format!("CNID {}", cnid)))
+    }
 }
 
 /// Read a fork's data through its extent descriptors.
@@ -626,6 +1306,29 @@ fn read_fork<R: Read + Seek>(
 
     data.truncate(size);
     Ok(data)
+}
+
+/// Write data through a fork's extent descriptors.
+fn write_fork_data<R: Write + Seek>(
+    writer: &mut R,
+    partition_offset: u64,
+    block_size: u32,
+    fork: &ForkData,
+    data: &[u8],
+) -> Result<(), FilesystemError> {
+    let mut written = 0usize;
+    for ext in &fork.extents {
+        if ext.is_empty() || written >= data.len() {
+            break;
+        }
+        let offset = partition_offset + ext.start_block as u64 * block_size as u64;
+        let extent_len = ext.block_count as u64 * block_size as u64;
+        let to_write = extent_len.min((data.len() - written) as u64) as usize;
+        writer.seek(SeekFrom::Start(offset))?;
+        writer.write_all(&data[written..written + to_write])?;
+        written += to_write;
+    }
+    Ok(())
 }
 
 /// Decode a UTF-16BE byte slice to a String.
@@ -745,6 +1448,394 @@ fn find_last_set_bit(bitmap: &[u8], max_bits: u32) -> Option<u32> {
         }
     }
     None
+}
+
+// --- EditableFilesystem implementation ---
+
+impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsPlusFilesystem<R> {
+    fn create_file(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        data: &mut dyn std::io::Read,
+        data_len: u64,
+        options: &CreateFileOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        let parent_cnid = parent.location as u32;
+
+        // Validate name
+        let nfd: String = name.nfd().collect();
+        let utf16_len = nfd.encode_utf16().count();
+        if utf16_len == 0 || utf16_len > 255 {
+            return Err(FilesystemError::InvalidData(
+                "name must be 1-255 UTF-16 units".into(),
+            ));
+        }
+        if name.contains(':') {
+            return Err(FilesystemError::InvalidData(
+                "name cannot contain ':'".into(),
+            ));
+        }
+
+        // Check for duplicates
+        if self.find_catalog_record(parent_cnid, name).is_some() {
+            return Err(FilesystemError::AlreadyExists(name.into()));
+        }
+
+        // Assign CNID
+        let file_id = self.vh.next_catalog_id;
+        self.vh.next_catalog_id += 1;
+
+        // Determine type/creator
+        let ext = name.rsplit('.').next().unwrap_or("");
+        let (type_code, creator_code) = if let (Some(tc), Some(cc)) =
+            (options.type_code.as_ref(), options.creator_code.as_ref())
+        {
+            (hfs_common::encode_fourcc(tc), hfs_common::encode_fourcc(cc))
+        } else {
+            hfs_common::type_creator_for_extension(ext).unwrap_or(([0; 4], [0; 4]))
+        };
+
+        // Allocate blocks and write data
+        let data_fork = self.write_data_to_blocks(data, data_len)?;
+
+        // Handle resource fork
+        let rsrc_fork = if let Some(ref rsrc_src) = options.resource_fork {
+            match rsrc_src {
+                super::filesystem::ResourceForkSource::Data(rsrc_data) => {
+                    let mut cursor = std::io::Cursor::new(rsrc_data);
+                    self.write_data_to_blocks(&mut cursor, rsrc_data.len() as u64)?
+                }
+                super::filesystem::ResourceForkSource::File(path) => {
+                    let mut f = std::fs::File::open(path)?;
+                    let len = f.metadata()?.len();
+                    self.write_data_to_blocks(&mut f, len)?
+                }
+            }
+        } else {
+            ForkData::empty()
+        };
+
+        // Build file record
+        let file_rec =
+            Self::build_file_record(file_id, &data_fork, &rsrc_fork, &type_code, &creator_code);
+
+        // Build key + record for catalog insertion
+        let key = Self::build_catalog_key(parent_cnid, name);
+        let mut key_record = key.clone();
+        // Pad to even boundary if needed
+        if key_record.len() % 2 != 0 {
+            key_record.push(0);
+        }
+        key_record.extend_from_slice(&file_rec);
+
+        // Insert file record
+        self.insert_catalog_record(&key_record)?;
+
+        // Build and insert thread record
+        let (thread_key, thread_data) =
+            Self::build_thread_record(CATALOG_FILE_THREAD, parent_cnid, name);
+        let mut thread_record = thread_key;
+        if thread_record.len() % 2 != 0 {
+            thread_record.push(0);
+        }
+        thread_record.extend_from_slice(&thread_data);
+        // Thread key is (file_id, ""), but build_thread_record used parent_cnid...
+        // Actually, thread records are keyed by (file_id, "")
+        let actual_thread_key = Self::build_catalog_key(file_id, "");
+        let mut actual_thread_record = actual_thread_key;
+        if actual_thread_record.len() % 2 != 0 {
+            actual_thread_record.push(0);
+        }
+        actual_thread_record.extend_from_slice(&thread_data);
+        self.insert_catalog_record(&actual_thread_record)?;
+
+        // Update parent valence
+        self.update_parent_valence(parent_cnid, 1)?;
+
+        // Update VH counts
+        self.vh.file_count += 1;
+
+        // Sync
+        self.do_sync_metadata()?;
+
+        let path = if parent.path == "/" {
+            format!("/{name}")
+        } else {
+            format!("{}/{name}", parent.path)
+        };
+        let mut fe = FileEntry::new_file(name.to_string(), path, data_len, file_id as u64);
+        let tc_str = String::from_utf8_lossy(&type_code).to_string();
+        let cc_str = String::from_utf8_lossy(&creator_code).to_string();
+        if type_code != [0; 4] {
+            fe.type_code = Some(tc_str);
+            fe.creator_code = Some(cc_str);
+        }
+        if rsrc_fork.logical_size > 0 {
+            fe.resource_fork_size = Some(rsrc_fork.logical_size);
+        }
+        Ok(fe)
+    }
+
+    fn create_directory(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        _options: &CreateDirectoryOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        let parent_cnid = parent.location as u32;
+
+        // Validate
+        let nfd: String = name.nfd().collect();
+        let utf16_len = nfd.encode_utf16().count();
+        if utf16_len == 0 || utf16_len > 255 {
+            return Err(FilesystemError::InvalidData(
+                "name must be 1-255 UTF-16 units".into(),
+            ));
+        }
+        if name.contains(':') {
+            return Err(FilesystemError::InvalidData(
+                "name cannot contain ':'".into(),
+            ));
+        }
+
+        // Check duplicates
+        if self.find_catalog_record(parent_cnid, name).is_some() {
+            return Err(FilesystemError::AlreadyExists(name.into()));
+        }
+
+        // Assign CNID
+        let folder_id = self.vh.next_catalog_id;
+        self.vh.next_catalog_id += 1;
+
+        // Build folder record
+        let folder_rec = Self::build_folder_record(folder_id);
+
+        // Build key + record
+        let key = Self::build_catalog_key(parent_cnid, name);
+        let mut key_record = key.clone();
+        if key_record.len() % 2 != 0 {
+            key_record.push(0);
+        }
+        key_record.extend_from_slice(&folder_rec);
+
+        self.insert_catalog_record(&key_record)?;
+
+        // Thread record (type 3 = folder thread)
+        let (_thread_key, thread_data) =
+            Self::build_thread_record(CATALOG_FOLDER_THREAD, parent_cnid, name);
+        let actual_thread_key = Self::build_catalog_key(folder_id, "");
+        let mut actual_thread_record = actual_thread_key;
+        if actual_thread_record.len() % 2 != 0 {
+            actual_thread_record.push(0);
+        }
+        actual_thread_record.extend_from_slice(&thread_data);
+        self.insert_catalog_record(&actual_thread_record)?;
+
+        // Update parent valence
+        self.update_parent_valence(parent_cnid, 1)?;
+
+        // Update VH
+        self.vh.folder_count += 1;
+
+        self.do_sync_metadata()?;
+
+        let path = if parent.path == "/" {
+            format!("/{name}")
+        } else {
+            format!("{}/{name}", parent.path)
+        };
+        Ok(FileEntry::new_directory(
+            name.to_string(),
+            path,
+            folder_id as u64,
+        ))
+    }
+
+    fn delete_entry(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+    ) -> Result<(), FilesystemError> {
+        let parent_cnid = parent.location as u32;
+        let cnid = entry.location as u32;
+
+        // Check directory is empty
+        if entry.is_directory() {
+            let children = self.list_children(cnid)?;
+            if !children.is_empty() {
+                return Err(FilesystemError::InvalidData(
+                    "cannot delete non-empty directory".into(),
+                ));
+            }
+        }
+
+        // Find and remove the entry record
+        let (node_idx, rec_idx, _offset) = self
+            .find_catalog_record(parent_cnid, &entry.name)
+            .ok_or_else(|| {
+                FilesystemError::NotFound(format!("entry '{}' not found in catalog", entry.name))
+            })?;
+
+        // If it's a file, free its data and resource fork blocks
+        if !entry.is_directory() {
+            if let Some((data_fork, rsrc_fork)) = self.find_file_by_id(cnid) {
+                self.free_fork_blocks(&data_fork);
+                self.free_fork_blocks(&rsrc_fork);
+            }
+        }
+
+        self.remove_catalog_record(node_idx, rec_idx);
+
+        // Find and remove the thread record
+        if let Some((t_node, t_rec, _)) = self.find_catalog_record_by_cnid(cnid) {
+            self.remove_catalog_record(t_node, t_rec);
+        }
+
+        // Update parent valence
+        self.update_parent_valence(parent_cnid, -1)?;
+
+        // Update VH counts
+        if entry.is_directory() {
+            self.vh.folder_count = self.vh.folder_count.saturating_sub(1);
+        } else {
+            self.vh.file_count = self.vh.file_count.saturating_sub(1);
+        }
+
+        self.do_sync_metadata()?;
+        Ok(())
+    }
+
+    fn set_type_creator(
+        &mut self,
+        entry: &FileEntry,
+        type_code: &str,
+        creator_code: &str,
+    ) -> Result<(), FilesystemError> {
+        let cnid = entry.location as u32;
+
+        // Find the thread to get parent + name
+        let (_t_node, _t_rec, t_offset) =
+            self.find_catalog_record_by_cnid(cnid).ok_or_else(|| {
+                FilesystemError::NotFound(format!("thread for CNID {cnid} not found"))
+            })?;
+
+        // Read parent_cnid and name from thread data
+        let node_size = self.catalog_header.node_size as usize;
+        let key_len = BigEndian::read_u16(&self.catalog_data[t_offset..t_offset + 2]) as usize;
+        let mut rec_data_start = t_offset + 2 + key_len;
+        if rec_data_start % 2 != 0 {
+            rec_data_start += 1;
+        }
+        let thread_parent =
+            BigEndian::read_u32(&self.catalog_data[rec_data_start + 4..rec_data_start + 8]);
+        let thread_name_len =
+            BigEndian::read_u16(&self.catalog_data[rec_data_start + 8..rec_data_start + 10])
+                as usize;
+        let thread_name = decode_utf16be(
+            &self.catalog_data[rec_data_start + 10..rec_data_start + 10 + thread_name_len * 2],
+        );
+
+        // Find the actual file record
+        let (f_node, f_rec, f_offset) = self
+            .find_catalog_record(thread_parent, &thread_name)
+            .ok_or_else(|| {
+                FilesystemError::NotFound(format!("file record for '{}' not found", thread_name))
+            })?;
+
+        // Compute the record data offset
+        let fkey_len = BigEndian::read_u16(&self.catalog_data[f_offset..f_offset + 2]) as usize;
+        let mut frec_start = f_offset + 2 + fkey_len;
+        if frec_start % 2 != 0 {
+            frec_start += 1;
+        }
+
+        // Write type and creator at offsets 48-52 and 52-56
+        let tc = hfs_common::encode_fourcc(type_code);
+        let cc = hfs_common::encode_fourcc(creator_code);
+        self.catalog_data[frec_start + 48..frec_start + 52].copy_from_slice(&tc);
+        self.catalog_data[frec_start + 52..frec_start + 56].copy_from_slice(&cc);
+
+        self.do_sync_metadata()?;
+        let _ = (f_node, f_rec, node_size); // suppress warnings
+        Ok(())
+    }
+
+    fn write_resource_fork(
+        &mut self,
+        entry: &FileEntry,
+        data: &mut dyn std::io::Read,
+        len: u64,
+    ) -> Result<(), FilesystemError> {
+        let cnid = entry.location as u32;
+
+        // Free existing resource fork blocks
+        if let Some((_data_fork, rsrc_fork)) = self.find_file_by_id(cnid) {
+            self.free_fork_blocks(&rsrc_fork);
+        }
+
+        // Allocate and write new resource fork data
+        let new_rsrc = self.write_data_to_blocks(data, len)?;
+
+        // Find the file record and update the resource fork
+        let (t_node, _t_rec, t_offset) =
+            self.find_catalog_record_by_cnid(cnid).ok_or_else(|| {
+                FilesystemError::NotFound(format!("thread for CNID {cnid} not found"))
+            })?;
+
+        let key_len = BigEndian::read_u16(&self.catalog_data[t_offset..t_offset + 2]) as usize;
+        let mut rec_data_start = t_offset + 2 + key_len;
+        if rec_data_start % 2 != 0 {
+            rec_data_start += 1;
+        }
+        let thread_parent =
+            BigEndian::read_u32(&self.catalog_data[rec_data_start + 4..rec_data_start + 8]);
+        let thread_name_len =
+            BigEndian::read_u16(&self.catalog_data[rec_data_start + 8..rec_data_start + 10])
+                as usize;
+        let thread_name = decode_utf16be(
+            &self.catalog_data[rec_data_start + 10..rec_data_start + 10 + thread_name_len * 2],
+        );
+
+        let (_f_node, _f_rec, f_offset) = self
+            .find_catalog_record(thread_parent, &thread_name)
+            .ok_or_else(|| {
+                FilesystemError::NotFound(format!("file record for '{}' not found", thread_name))
+            })?;
+
+        let fkey_len = BigEndian::read_u16(&self.catalog_data[f_offset..f_offset + 2]) as usize;
+        let mut frec_start = f_offset + 2 + fkey_len;
+        if frec_start % 2 != 0 {
+            frec_start += 1;
+        }
+
+        // Write resource fork data (at offset 168 in file record)
+        let mut rsrc_bytes = [0u8; 80];
+        new_rsrc.serialize(&mut rsrc_bytes);
+        self.catalog_data[frec_start + 168..frec_start + 248].copy_from_slice(&rsrc_bytes);
+
+        self.do_sync_metadata()?;
+        let _ = t_node;
+        Ok(())
+    }
+
+    fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
+        self.do_sync_metadata()
+    }
+
+    fn free_space(&mut self) -> Result<u64, FilesystemError> {
+        Ok(self.vh.free_blocks as u64 * self.vh.block_size as u64)
+    }
+
+    fn set_blessed_folder(&mut self, entry: &FileEntry) -> Result<(), FilesystemError> {
+        if !entry.is_directory() {
+            return Err(FilesystemError::InvalidData(
+                "can only bless a directory".into(),
+            ));
+        }
+        self.vh.finder_info[0] = entry.location as u32;
+        self.do_sync_metadata()
+    }
 }
 
 // --- Compact reader ---
@@ -1061,5 +2152,420 @@ mod tests {
 
         let empty = [0u8; 2];
         assert_eq!(find_last_set_bit(&empty, 16), None);
+    }
+
+    #[test]
+    fn test_volume_header_serialize_roundtrip() {
+        let mut data = [0u8; 512];
+        BigEndian::write_u16(&mut data[0..2], HFS_PLUS_SIGNATURE);
+        BigEndian::write_u16(&mut data[2..4], 4);
+        BigEndian::write_u32(&mut data[40..44], 4096);
+        BigEndian::write_u32(&mut data[44..48], 100);
+        BigEndian::write_u32(&mut data[48..52], 50);
+        BigEndian::write_u32(&mut data[64..68], 10); // next_catalog_id
+        BigEndian::write_u32(&mut data[80..84], 42); // finder_info[0]
+
+        let vh = HfsPlusVolumeHeader::parse(&data).unwrap();
+        assert_eq!(vh.next_catalog_id, 10);
+        assert_eq!(vh.finder_info[0], 42);
+
+        let serialized = vh.serialize();
+        let vh2 = HfsPlusVolumeHeader::parse(&serialized).unwrap();
+        assert_eq!(vh2.block_size, 4096);
+        assert_eq!(vh2.total_blocks, 100);
+        assert_eq!(vh2.free_blocks, 50);
+        assert_eq!(vh2.next_catalog_id, 10);
+        assert_eq!(vh2.finder_info[0], 42);
+    }
+
+    #[test]
+    fn test_fork_data_serialize_roundtrip() {
+        let fork = ForkData {
+            logical_size: 12345,
+            clump_size: 0,
+            total_blocks: 3,
+            extents: [
+                ExtentDescriptor {
+                    start_block: 10,
+                    block_count: 3,
+                },
+                ExtentDescriptor {
+                    start_block: 0,
+                    block_count: 0,
+                },
+                ExtentDescriptor {
+                    start_block: 0,
+                    block_count: 0,
+                },
+                ExtentDescriptor {
+                    start_block: 0,
+                    block_count: 0,
+                },
+                ExtentDescriptor {
+                    start_block: 0,
+                    block_count: 0,
+                },
+                ExtentDescriptor {
+                    start_block: 0,
+                    block_count: 0,
+                },
+                ExtentDescriptor {
+                    start_block: 0,
+                    block_count: 0,
+                },
+                ExtentDescriptor {
+                    start_block: 0,
+                    block_count: 0,
+                },
+            ],
+        };
+        let mut buf = [0u8; 80];
+        fork.serialize(&mut buf);
+        let fork2 = ForkData::parse(&buf);
+        assert_eq!(fork2.logical_size, 12345);
+        assert_eq!(fork2.total_blocks, 3);
+        assert_eq!(fork2.extents[0].start_block, 10);
+        assert_eq!(fork2.extents[0].block_count, 3);
+    }
+
+    /// Create a minimal valid in-memory HFS+ image for testing.
+    /// Layout: 256 blocks × 4096 bytes = 1 MB
+    /// - Block 0: unused (VH at byte 1024 within this block)
+    /// - Block 1: allocation bitmap
+    /// - Block 2-5: catalog B-tree (4 blocks = 16 KB = 4 nodes of 4096 bytes)
+    ///   - Node 0: header node
+    ///   - Node 1: leaf node with root folder record + thread
+    ///   - Nodes 2-3: free
+    /// - Blocks 6+: free for user data
+    fn make_editable_hfsplus_image() -> Vec<u8> {
+        let block_size = 4096u32;
+        let total_blocks = 256u32;
+        let image_size = total_blocks as usize * block_size as usize; // 1 MB
+        let mut img = vec![0u8; image_size];
+
+        // Allocation bitmap: blocks 0-5 allocated (VH area + bitmap + catalog)
+        let bitmap_block = 1u32;
+        let catalog_start_block = 2u32;
+        let catalog_blocks = 4u32;
+        let alloc_blocks = 1 + 1 + catalog_blocks as u32; // VH + bitmap + catalog = 6 blocks
+        let bitmap_data = &mut img[bitmap_block as usize * block_size as usize
+            ..(bitmap_block + 1) as usize * block_size as usize];
+        // Set bits 0-5 (MSB-first): byte 0 = 0b11111100
+        bitmap_data[0] = 0b11111100;
+
+        // Build catalog B-tree in blocks 2-5 (4 nodes × 4096)
+        let node_size = 4096usize;
+        let catalog_offset = catalog_start_block as usize * block_size as usize;
+        let catalog_size = catalog_blocks as usize * block_size as usize;
+
+        // Node 0: Header node
+        let hdr_off = catalog_offset;
+        // Node descriptor: next=0, prev=0, kind=1(header), height=0, numRecords=3
+        img[hdr_off + 8] = 1; // kind = header
+        BigEndian::write_u16(&mut img[hdr_off + 10..hdr_off + 12], 3); // 3 records
+
+        // B-tree header record (record 0, at offset 14)
+        let hr = hdr_off + 14;
+        BigEndian::write_u16(&mut img[hr..hr + 2], 1); // depth = 1
+        BigEndian::write_u32(&mut img[hr + 2..hr + 6], 1); // root_node = 1
+        BigEndian::write_u32(&mut img[hr + 6..hr + 10], 2); // leaf_records = 2 (folder + thread)
+        BigEndian::write_u32(&mut img[hr + 10..hr + 14], 1); // first_leaf_node = 1
+        BigEndian::write_u32(&mut img[hr + 14..hr + 18], 1); // last_leaf_node = 1
+        BigEndian::write_u16(&mut img[hr + 18..hr + 20], node_size as u16); // node_size
+        BigEndian::write_u16(&mut img[hr + 20..hr + 22], 516); // max_key_len
+        BigEndian::write_u32(&mut img[hr + 22..hr + 26], 4); // total_nodes = 4
+        BigEndian::write_u32(&mut img[hr + 26..hr + 30], 2); // free_nodes = 2
+
+        // Record offsets for header node (3 records + free space offset)
+        // Record 0: header record at offset 14
+        // Record 1: user data record (128 bytes at offset 14+128=142)
+        // Record 2: bitmap record (256 bytes at offset 142+128=270)
+        // Free space offset at end
+        let ot = hdr_off + node_size; // offset table at end of node
+        BigEndian::write_u16(&mut img[ot - 2..ot], 14); // record 0 offset
+        BigEndian::write_u16(&mut img[ot - 4..ot - 2], 142); // record 1 offset
+        BigEndian::write_u16(&mut img[ot - 6..ot - 4], 270); // record 2 (bitmap)
+        BigEndian::write_u16(&mut img[ot - 8..ot - 6], 526); // free space offset
+
+        // Node bitmap (record 2): mark nodes 0 and 1 as allocated
+        img[hdr_off + 270] = 0b11000000;
+
+        // Node 1: Leaf node with root folder record + thread record
+        let leaf_off = catalog_offset + node_size;
+        // Node descriptor: next=0, prev=0, kind=-1(leaf), height=1, numRecords=2
+        img[leaf_off + 8] = 0xFF; // kind = -1 (leaf)
+        img[leaf_off + 9] = 1; // height = 1
+        BigEndian::write_u16(&mut img[leaf_off + 10..leaf_off + 12], 2); // 2 records
+
+        // Record 0: Root folder record (CNID 2)
+        // Key: key_len(2) + parent_id(4, =1) + name_len(2, =0)  — root folder's parent is CNID 1
+        let r0_off = leaf_off + 14;
+        BigEndian::write_u16(&mut img[r0_off..r0_off + 2], 6); // key_len = 6
+        BigEndian::write_u32(&mut img[r0_off + 2..r0_off + 6], 1); // parent_id = 1 (root parent)
+        BigEndian::write_u16(&mut img[r0_off + 6..r0_off + 8], 0); // name_len = 0
+                                                                   // Record data starts after key (at offset 8, even-aligned)
+        let r0_data = r0_off + 8;
+        BigEndian::write_i16(&mut img[r0_data..r0_data + 2], CATALOG_FOLDER); // type = folder
+        BigEndian::write_u32(&mut img[r0_data + 8..r0_data + 12], 2); // folderID = 2
+                                                                      // Folder record is 88 bytes total
+
+        // Record 1: Thread record for root folder (CNID 2)
+        // Thread key: parent_id = CNID = 2, name = empty
+        let r1_off = r0_data + 88; // after folder record
+        BigEndian::write_u16(&mut img[r1_off..r1_off + 2], 6); // key_len = 6
+        BigEndian::write_u32(&mut img[r1_off + 2..r1_off + 6], 2); // parent_id = 2 (CNID)
+        BigEndian::write_u16(&mut img[r1_off + 6..r1_off + 8], 0); // name_len = 0
+                                                                   // Thread record data
+        let r1_data = r1_off + 8;
+        BigEndian::write_i16(&mut img[r1_data..r1_data + 2], 3); // type = folder thread
+        BigEndian::write_u32(&mut img[r1_data + 4..r1_data + 8], 1); // parentID = 1
+        BigEndian::write_u16(&mut img[r1_data + 8..r1_data + 10], 0); // name_len = 0
+                                                                      // Thread record is variable length, but at minimum 10 bytes
+
+        // Record offset table for leaf node (2 records + free space)
+        let lot = leaf_off + node_size;
+        BigEndian::write_u16(&mut img[lot - 2..lot], 14); // record 0 offset
+        let r1_rel = (r1_off - leaf_off) as u16;
+        BigEndian::write_u16(&mut img[lot - 4..lot - 2], r1_rel); // record 1 offset
+        let free_rel = (r1_data + 10 - leaf_off) as u16;
+        BigEndian::write_u16(&mut img[lot - 6..lot - 4], free_rel); // free space offset
+
+        // Volume Header at byte 1024
+        let mut vh = HfsPlusVolumeHeader {
+            signature: HFS_PLUS_SIGNATURE,
+            version: 4,
+            attributes: 0,
+            last_mounted_version: 0,
+            journal_info_block: 0,
+            create_date: hfs_common::hfs_now(),
+            modify_date: hfs_common::hfs_now(),
+            backup_date: 0,
+            checked_date: 0,
+            file_count: 0,
+            folder_count: 1, // root folder
+            block_size,
+            total_blocks,
+            free_blocks: total_blocks - alloc_blocks,
+            next_allocation: alloc_blocks,
+            rsrc_clump_size: 0,
+            data_clump_size: 0,
+            next_catalog_id: 16, // next available CNID
+            write_count: 0,
+            encodings_bitmap: 0,
+            finder_info: [0u32; 8],
+            allocation_file: ForkData {
+                logical_size: block_size as u64,
+                clump_size: 0,
+                total_blocks: 1,
+                extents: {
+                    let mut e = [ExtentDescriptor {
+                        start_block: 0,
+                        block_count: 0,
+                    }; 8];
+                    e[0] = ExtentDescriptor {
+                        start_block: bitmap_block,
+                        block_count: 1,
+                    };
+                    e
+                },
+            },
+            extents_file: ForkData::empty(),
+            catalog_file: ForkData {
+                logical_size: catalog_size as u64,
+                clump_size: 0,
+                total_blocks: catalog_blocks,
+                extents: {
+                    let mut e = [ExtentDescriptor {
+                        start_block: 0,
+                        block_count: 0,
+                    }; 8];
+                    e[0] = ExtentDescriptor {
+                        start_block: catalog_start_block,
+                        block_count: catalog_blocks,
+                    };
+                    e
+                },
+            },
+            attributes_file: ForkData::empty(),
+            startup_file: ForkData::empty(),
+        };
+
+        let vh_bytes = vh.serialize();
+        img[1024..1024 + 512].copy_from_slice(&vh_bytes);
+
+        // Backup VH at last 1024 bytes
+        let backup_pos = image_size - 1024;
+        img[backup_pos..backup_pos + 512].copy_from_slice(&vh_bytes);
+
+        img
+    }
+
+    #[test]
+    fn test_hfsplus_editable_open_and_free_space() {
+        let img = make_editable_hfsplus_image();
+        let cursor = std::io::Cursor::new(img);
+        let mut fs = HfsPlusFilesystem::open(cursor, 0).unwrap();
+        assert_eq!(fs.fs_type(), "HFS+");
+        let free = fs.free_space().unwrap();
+        assert!(free > 0);
+        // 250 free blocks × 4096 = 1,024,000
+        assert_eq!(free, 250 * 4096);
+    }
+
+    #[test]
+    fn test_hfsplus_editable_create_file_and_read() {
+        let img = make_editable_hfsplus_image();
+        let cursor = std::io::Cursor::new(img);
+        let mut fs = HfsPlusFilesystem::open(cursor, 0).unwrap();
+
+        let root = fs.root().unwrap();
+        let test_data = b"Hello, HFS+ World!";
+        let mut data_reader = std::io::Cursor::new(test_data.as_slice());
+
+        let options = CreateFileOptions::default();
+        let fe = fs
+            .create_file(
+                &root,
+                "test.txt",
+                &mut data_reader,
+                test_data.len() as u64,
+                &options,
+            )
+            .unwrap();
+
+        assert_eq!(fe.name, "test.txt");
+        assert_eq!(fe.size, test_data.len() as u64);
+
+        // Verify we can list and find it
+        let entries = fs.list_directory(&root).unwrap();
+        assert!(entries.iter().any(|e| e.name == "test.txt"));
+
+        // Verify we can read it back
+        let read_back = fs.read_file(&fe, 1024).unwrap();
+        assert_eq!(&read_back, test_data);
+    }
+
+    #[test]
+    fn test_hfsplus_editable_create_directory() {
+        let img = make_editable_hfsplus_image();
+        let cursor = std::io::Cursor::new(img);
+        let mut fs = HfsPlusFilesystem::open(cursor, 0).unwrap();
+
+        let root = fs.root().unwrap();
+        let options = CreateDirectoryOptions::default();
+        let dir = fs.create_directory(&root, "TestDir", &options).unwrap();
+
+        assert_eq!(dir.name, "TestDir");
+        assert!(dir.is_directory());
+
+        let entries = fs.list_directory(&root).unwrap();
+        assert!(entries
+            .iter()
+            .any(|e| e.name == "TestDir" && e.is_directory()));
+    }
+
+    #[test]
+    fn test_hfsplus_editable_delete_file() {
+        let img = make_editable_hfsplus_image();
+        let cursor = std::io::Cursor::new(img);
+        let mut fs = HfsPlusFilesystem::open(cursor, 0).unwrap();
+
+        let root = fs.root().unwrap();
+        let test_data = b"delete me";
+        let mut data_reader = std::io::Cursor::new(test_data.as_slice());
+        let options = CreateFileOptions::default();
+        let fe = fs
+            .create_file(
+                &root,
+                "gone.txt",
+                &mut data_reader,
+                test_data.len() as u64,
+                &options,
+            )
+            .unwrap();
+
+        let free_before = fs.free_space().unwrap();
+
+        // Delete it
+        fs.delete_entry(&root, &fe).unwrap();
+
+        // Verify it's gone
+        let entries = fs.list_directory(&root).unwrap();
+        assert!(!entries.iter().any(|e| e.name == "gone.txt"));
+
+        // Verify free space recovered
+        let free_after = fs.free_space().unwrap();
+        assert!(free_after > free_before);
+    }
+
+    #[test]
+    fn test_hfsplus_editable_duplicate_name_rejected() {
+        let img = make_editable_hfsplus_image();
+        let cursor = std::io::Cursor::new(img);
+        let mut fs = HfsPlusFilesystem::open(cursor, 0).unwrap();
+
+        let root = fs.root().unwrap();
+        let test_data = b"first";
+        let mut r1 = std::io::Cursor::new(test_data.as_slice());
+        let options = CreateFileOptions::default();
+        fs.create_file(&root, "dup.txt", &mut r1, 5, &options)
+            .unwrap();
+
+        // Second creation should fail
+        let mut r2 = std::io::Cursor::new(test_data.as_slice());
+        let result = fs.create_file(&root, "dup.txt", &mut r2, 5, &options);
+        assert!(matches!(result, Err(FilesystemError::AlreadyExists(_))));
+    }
+
+    #[test]
+    fn test_hfsplus_editable_blessed_folder() {
+        let img = make_editable_hfsplus_image();
+        let cursor = std::io::Cursor::new(img);
+        let mut fs = HfsPlusFilesystem::open(cursor, 0).unwrap();
+
+        // Initially no blessed folder
+        assert!(fs.blessed_system_folder().is_none());
+
+        // Create a system folder
+        let root = fs.root().unwrap();
+        let options = CreateDirectoryOptions::default();
+        let sys_dir = fs
+            .create_directory(&root, "System Folder", &options)
+            .unwrap();
+
+        // Bless it
+        fs.set_blessed_folder(&sys_dir).unwrap();
+
+        // Verify it's blessed
+        let blessed = fs.blessed_system_folder();
+        assert!(blessed.is_some());
+        let (cnid, name) = blessed.unwrap();
+        assert_eq!(cnid, sys_dir.location);
+        assert_eq!(name, "System Folder");
+    }
+
+    #[test]
+    fn test_hfsplus_editable_type_creator_auto_detect() {
+        let img = make_editable_hfsplus_image();
+        let cursor = std::io::Cursor::new(img);
+        let mut fs = HfsPlusFilesystem::open(cursor, 0).unwrap();
+
+        let root = fs.root().unwrap();
+        let test_data = b"text content";
+        let mut data_reader = std::io::Cursor::new(test_data.as_slice());
+        let options = CreateFileOptions::default();
+        let fe = fs
+            .create_file(
+                &root,
+                "hello.txt",
+                &mut data_reader,
+                test_data.len() as u64,
+                &options,
+            )
+            .unwrap();
+
+        // "txt" extension should auto-detect to TEXT/ttxt
+        assert!(fe.type_code.is_some());
+        assert_eq!(fe.type_code.as_deref(), Some("TEXT"));
     }
 }

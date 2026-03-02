@@ -118,6 +118,8 @@ pub struct BrowseView {
     archive_edit_progress: Option<Arc<Mutex<ArchiveEditProgress>>>,
     /// Temp file path while editing an archive (cleaned up on close/save).
     archive_temp_path: Option<PathBuf>,
+    /// Blessed (bootable) system folder info (HFS/HFS+ only).
+    blessed_folder: Option<(u64, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +168,7 @@ impl Default for BrowseView {
             archive_edit_ctx: None,
             archive_edit_progress: None,
             archive_temp_path: None,
+            blessed_folder: None,
         }
     }
 }
@@ -198,6 +201,7 @@ impl BrowseView {
             Ok(mut fs) => {
                 self.fs_type = fs.fs_type().to_string();
                 self.volume_label = fs.volume_label().unwrap_or("").to_string();
+                self.blessed_folder = fs.blessed_system_folder();
                 self.active = true;
 
                 match fs.root() {
@@ -238,6 +242,7 @@ impl BrowseView {
             Ok(mut fs) => {
                 self.fs_type = fs.fs_type().to_string();
                 self.volume_label = fs.volume_label().unwrap_or("").to_string();
+                self.blessed_folder = fs.blessed_system_folder();
                 self.active = true;
 
                 match fs.root() {
@@ -290,6 +295,7 @@ impl BrowseView {
             Ok(mut fs) => {
                 self.fs_type = fs.fs_type().to_string();
                 self.volume_label = fs.volume_label().unwrap_or("").to_string();
+                self.blessed_folder = fs.blessed_system_folder();
                 self.active = true;
 
                 match fs.root() {
@@ -381,6 +387,7 @@ impl BrowseView {
         self.new_folder_name.clear();
         self.show_new_folder_dialog = false;
         self.pending_delete = None;
+        self.blessed_folder = None;
         // Clean up archive temp file if present
         if let Some(temp) = self.archive_temp_path.take() {
             let _ = std::fs::remove_file(&temp);
@@ -428,6 +435,9 @@ impl BrowseView {
             ui.label(format!("[{}]", self.fs_type));
             if !self.volume_label.is_empty() {
                 ui.label(format!("Label: {}", self.volume_label));
+            }
+            if let Some((_, ref name)) = self.blessed_folder {
+                ui.label(format!("Blessed: {}", name));
             }
 
             // Edit mode toggle
@@ -588,7 +598,18 @@ impl BrowseView {
                 let path = entry.path.clone();
                 let has_children = self.directory_cache.contains_key(&path);
 
-                let header = egui::CollapsingHeader::new(&entry.name)
+                let dir_label = if self
+                    .blessed_folder
+                    .as_ref()
+                    .map(|(cnid, _)| *cnid == entry.location)
+                    .unwrap_or(false)
+                {
+                    format!("{} [System]", entry.name)
+                } else {
+                    entry.name.clone()
+                };
+
+                let header = egui::CollapsingHeader::new(dir_label)
                     .id_salt(&path)
                     .default_open(path == "/")
                     .show(ui, |ui| {
@@ -1216,6 +1237,7 @@ impl BrowseView {
                     Ok(mut fs) => {
                         self.fs_type = fs.fs_type().to_string();
                         self.volume_label = fs.volume_label().unwrap_or("").to_string();
+                        self.blessed_folder = fs.blessed_system_folder();
                         if let Ok(root) = fs.root() {
                             self.root = Some(root);
                         }
@@ -1240,6 +1262,7 @@ impl BrowseView {
                     Ok(mut fs) => {
                         self.fs_type = fs.fs_type().to_string();
                         self.volume_label = fs.volume_label().unwrap_or("").to_string();
+                        self.blessed_folder = fs.blessed_system_folder();
                         if let Ok(root) = fs.root() {
                             self.root = Some(root);
                         }
@@ -1330,6 +1353,38 @@ impl BrowseView {
                             .map(|c| !c.is_empty())
                             .unwrap_or(true); // assume non-empty if not cached
                     self.pending_delete = Some((parent, sel.clone(), is_non_empty_dir));
+                }
+            }
+
+            // Bless Folder button (HFS/HFS+ only)
+            if self.is_hfs_type() {
+                let can_bless = has_selection
+                    && self
+                        .selected_entry
+                        .as_ref()
+                        .map(|e| e.is_directory())
+                        .unwrap_or(false);
+                if ui
+                    .add_enabled(can_bless, egui::Button::new("Bless Folder"))
+                    .clicked()
+                {
+                    if let Some(ref sel) = self.selected_entry.clone() {
+                        match self.open_editable_fs() {
+                            Ok(mut efs) => match efs.set_blessed_folder(sel) {
+                                Ok(()) => {
+                                    self.blessed_folder = Some((sel.location, sel.name.clone()));
+                                    self.edit_result =
+                                        Some(format!("Blessed folder set to '{}'", sel.name));
+                                }
+                                Err(e) => {
+                                    self.edit_result = Some(format!("Error blessing folder: {e}"));
+                                }
+                            },
+                            Err(e) => {
+                                self.edit_result = Some(format!("Error opening filesystem: {e}"));
+                            }
+                        }
+                    }
                 }
             }
 
