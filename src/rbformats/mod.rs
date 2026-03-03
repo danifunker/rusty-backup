@@ -1,5 +1,6 @@
 pub mod chd;
 pub mod dmg;
+pub mod export;
 pub mod raw;
 pub mod twomg;
 pub mod vhd;

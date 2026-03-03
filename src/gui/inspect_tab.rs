@@ -15,7 +15,8 @@ use rusty_backup::partition::PartitionSizeOverride;
 use rusty_backup::partition::{
     self, detect_alignment, PartitionAlignment, PartitionInfo, PartitionTable,
 };
-use rusty_backup::rbformats::vhd::{build_vhd_footer, export_partition_vhd, export_whole_disk_vhd};
+use rusty_backup::rbformats::export::ExportFormat;
+use rusty_backup::rbformats::vhd::build_vhd_footer;
 
 use super::browse_view::BrowseView;
 use super::progress::{LogLevel, LogPanel};
@@ -44,10 +45,12 @@ pub struct InspectTab {
     prev_backup_path: Option<PathBuf>,
     /// Filesystem browser
     browse_view: BrowseView,
-    /// VHD export: true if the export popup is open
-    export_vhd_popup: bool,
-    /// VHD export mode: true = whole disk, false = per partition
+    /// Export: true if the export popup is open
+    export_popup: bool,
+    /// Export mode: true = whole disk, false = per partition
     export_whole_disk: bool,
+    /// Export format selection
+    export_format: ExportFormat,
     /// Per-partition sizing configuration for VHD export
     export_partition_configs: Vec<PartitionExportConfig>,
     /// VHD export background thread status
@@ -166,8 +169,9 @@ impl Default for InspectTab {
             prev_image_path: None,
             prev_backup_path: None,
             browse_view: BrowseView::default(),
-            export_vhd_popup: false,
+            export_popup: false,
             export_whole_disk: true,
+            export_format: ExportFormat::Vhd,
             export_partition_configs: Vec::new(),
             export_status: None,
             partition_min_sizes: HashMap::new(),
@@ -255,7 +259,7 @@ impl InspectTab {
                     }
                     ui.separator();
                     if ui
-                        .selectable_label(self.image_file_path.is_some(), "Open Disk Image...")
+                        .selectable_label(self.image_file_path.is_some(), "Open VHD/Disk Image...")
                         .clicked()
                     {
                         if let Some(path) = super::file_dialog()
@@ -331,18 +335,18 @@ impl InspectTab {
                 }
             }
 
-            // Export VHD button — available when we have partition data and no export running
+            // Export button — available when we have partition data and no export running
             let has_partitions = !self.partitions.is_empty();
             let export_running = self.export_status.is_some();
             if ui
                 .add_enabled(
                     has_partitions && !export_running,
-                    egui::Button::new("Export VHD..."),
+                    egui::Button::new("Export Disk Image..."),
                 )
                 .clicked()
             {
                 self.init_export_configs();
-                self.export_vhd_popup = true;
+                self.export_popup = true;
             }
 
             if export_running {
@@ -363,7 +367,7 @@ impl InspectTab {
                 if !s.finished && s.total_bytes > 0 {
                     let fraction = s.current_bytes as f32 / s.total_bytes as f32;
                     let text = format!(
-                        "Exporting VHD: {} / {} ({:.0}%)",
+                        "Exporting: {} / {} ({:.0}%)",
                         partition::format_size(s.current_bytes),
                         partition::format_size(s.total_bytes),
                         fraction * 100.0,
@@ -372,7 +376,7 @@ impl InspectTab {
                 } else if !s.finished {
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label("Exporting VHD...");
+                        ui.label("Exporting...");
                     });
                 }
             }
@@ -390,9 +394,9 @@ impl InspectTab {
             }
         }
 
-        // Export VHD popup
-        if self.export_vhd_popup {
-            self.show_export_vhd_popup(ui, devices, log);
+        // Export popup
+        if self.export_popup {
+            self.show_export_popup(ui, devices, log);
         }
 
         ui.add_space(12.0);
@@ -523,30 +527,36 @@ impl InspectTab {
         }
     }
 
-    fn show_export_vhd_popup(
-        &mut self,
-        ui: &mut egui::Ui,
-        devices: &[DiskDevice],
-        log: &mut LogPanel,
-    ) {
-        egui::Window::new("Export VHD")
+    fn show_export_popup(&mut self, ui: &mut egui::Ui, devices: &[DiskDevice], log: &mut LogPanel) {
+        egui::Window::new("Export Disk Image")
             .collapsible(false)
             .resizable(true)
             .default_width(500.0)
             .show(ui.ctx(), |ui| {
-                ui.label("Export partitions as Fixed VHD files.");
+                ui.label("Export partitions as disk image files.");
                 ui.add_space(4.0);
 
+                // Export mode
                 ui.radio_value(
                     &mut self.export_whole_disk,
                     true,
-                    "Whole Disk (single .vhd file)",
+                    "Whole Disk (single file)",
                 );
                 ui.radio_value(
                     &mut self.export_whole_disk,
                     false,
-                    "Per Partition (one .vhd per partition)",
+                    "Per Partition (one file per partition)",
                 );
+
+                ui.add_space(4.0);
+
+                // Export format
+                ui.label(egui::RichText::new("Format:").strong());
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut self.export_format, ExportFormat::Vhd, "VHD");
+                    ui.radio_value(&mut self.export_format, ExportFormat::Raw, "Raw (.img)");
+                    ui.radio_value(&mut self.export_format, ExportFormat::TwoMg, "2MG (.2mg)");
+                });
 
                 ui.add_space(8.0);
 
@@ -618,17 +628,21 @@ impl InspectTab {
 
                 ui.horizontal(|ui| {
                     if ui.button("Export...").clicked() {
-                        self.export_vhd_popup = false;
-                        self.start_export_vhd(devices, log);
+                        self.export_popup = false;
+                        self.start_export(devices, log);
                     }
                     if ui.button("Cancel").clicked() {
-                        self.export_vhd_popup = false;
+                        self.export_popup = false;
                     }
                 });
             });
     }
 
-    fn start_export_vhd(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {
+    fn start_export(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {
+        let format = self.export_format;
+        let ext = format.extension();
+        let format_desc = format.description();
+
         // Collect partition sizing info
         let size_map: HashMap<usize, u64> = self
             .export_partition_configs
@@ -672,9 +686,10 @@ impl InspectTab {
 
         if self.export_whole_disk {
             // Pick a single file destination
+            let (filter_label, filter_exts) = format.dialog_filter();
             let dialog = super::file_dialog()
-                .set_file_name("disk.vhd")
-                .add_filter("VHD Files", &["vhd", "hda"]);
+                .set_file_name(format.default_filename("disk"))
+                .add_filter(filter_label, filter_exts);
             let dest = match dialog.save_file() {
                 Some(p) => p,
                 None => return,
@@ -694,14 +709,16 @@ impl InspectTab {
                 self.export_status = Some(Arc::clone(&status));
 
                 log.info(format!(
-                    "Exporting Clonezilla image as whole-disk VHD to {}...",
+                    "Exporting Clonezilla image as whole-disk {} to {}...",
+                    format_desc,
                     dest.display()
                 ));
 
                 std::thread::spawn(move || {
                     let status2 = Arc::clone(&status);
                     let status3 = Arc::clone(&status);
-                    let result = rusty_backup::rbformats::vhd::export_clonezilla_disk_vhd(
+                    let result = rusty_backup::rbformats::export::export_clonezilla_disk(
+                        format,
                         &cz_image,
                         &source,
                         &dest,
@@ -749,12 +766,17 @@ impl InspectTab {
                 let status = new_status();
                 self.export_status = Some(Arc::clone(&status));
 
-                log.info(format!("Exporting whole-disk VHD to {}...", dest.display()));
+                log.info(format!(
+                    "Exporting whole-disk {} to {}...",
+                    format_desc,
+                    dest.display()
+                ));
 
                 std::thread::spawn(move || {
                     let status2 = Arc::clone(&status);
                     let status3 = Arc::clone(&status);
-                    let result = export_whole_disk_vhd(
+                    let result = rusty_backup::rbformats::export::export_whole_disk(
+                        format,
                         &source,
                         meta.as_ref(),
                         None,
@@ -801,7 +823,8 @@ impl InspectTab {
             self.export_status = Some(Arc::clone(&status));
 
             log.info(format!(
-                "Exporting per-partition VHDs to {}...",
+                "Exporting per-partition {} files to {}...",
+                format_desc,
                 dest_folder.display()
             ));
 
@@ -824,7 +847,7 @@ impl InspectTab {
                                 .copied()
                                 .unwrap_or(cz_part.size_bytes());
                             let dest_path =
-                                dest_folder.join(format!("partition-{}.vhd", cz_part.index));
+                                dest_folder.join(format!("partition-{}.{}", cz_part.index, ext));
 
                             if let Ok(mut s) = status.lock() {
                                 s.log_messages.push(format!(
@@ -838,7 +861,8 @@ impl InspectTab {
                             let base_written = overall_written;
                             let status_progress = Arc::clone(&status);
                             let status_cancel = Arc::clone(&status);
-                            rusty_backup::rbformats::vhd::export_clonezilla_partition_vhd(
+                            rusty_backup::rbformats::export::export_clonezilla_partition(
+                                format,
                                 &cz_part.partclone_files,
                                 &dest_path,
                                 Some(export_size),
@@ -878,7 +902,8 @@ impl InspectTab {
                                 .unwrap_or(pm.original_size_bytes);
                             let data_file = &pm.compressed_files[0];
                             let data_path = folder.join(data_file);
-                            let dest_path = dest_folder.join(format!("partition-{}.vhd", pm.index));
+                            let dest_path =
+                                dest_folder.join(format!("partition-{}.{}", pm.index, ext));
 
                             if let Ok(mut s) = status.lock() {
                                 s.log_messages.push(format!(
@@ -892,7 +917,8 @@ impl InspectTab {
                             let base_written = overall_written;
                             let status_progress = Arc::clone(&status);
                             let status_cancel = Arc::clone(&status);
-                            export_partition_vhd(
+                            rusty_backup::rbformats::export::export_partition(
+                                format,
                                 &data_path,
                                 &meta.compression_type,
                                 &dest_path,
@@ -946,7 +972,7 @@ impl InspectTab {
                                 .copied()
                                 .unwrap_or(part.size_bytes);
                             let dest_path =
-                                dest_folder.join(format!("partition-{}.vhd", part.index));
+                                dest_folder.join(format!("partition-{}.{}", part.index, ext));
                             let offset = part.start_lba * 512;
 
                             if let Ok(mut s) = status.lock() {
@@ -958,9 +984,7 @@ impl InspectTab {
                                 ));
                             }
 
-                            // Extract partition data to VHD
-                            // Read at most the original partition size from the source
-                            // to avoid reading into adjacent partitions or the VHD footer
+                            // Extract partition data
                             let read_limit = export_size.min(part.size_bytes);
                             let file = std::fs::File::open(image_path)?;
                             let mut reader = std::io::BufReader::new(file);
@@ -969,6 +993,14 @@ impl InspectTab {
 
                             let mut writer =
                                 std::io::BufWriter::new(std::fs::File::create(&dest_path)?);
+
+                            // Write format header (2MG only)
+                            if format == ExportFormat::TwoMg {
+                                let hdr =
+                                    rusty_backup::rbformats::twomg::build_twomg_header(export_size);
+                                writer.write_all(&hdr)?;
+                            }
+
                             let mut buf = vec![0u8; 256 * 1024];
                             let mut total: u64 = 0;
                             let base_written = overall_written;
@@ -1004,9 +1036,11 @@ impl InspectTab {
                             // Resize FAT filesystem if the partition size changed
                             if export_size != part.size_bytes {
                                 let new_sectors = (export_size / 512) as u32;
+                                // For 2MG, data starts at offset 64
+                                let fs_offset = if format == ExportFormat::TwoMg { 64 } else { 0 };
                                 resize_fat_in_place(
                                     writer.get_mut(),
-                                    0,
+                                    fs_offset,
                                     new_sectors,
                                     &mut |msg| {
                                         if let Ok(mut s) = status.lock() {
@@ -1014,13 +1048,20 @@ impl InspectTab {
                                         }
                                     },
                                 )?;
-                                // Seek back to end for footer append
-                                writer.seek(std::io::SeekFrom::Start(total))?;
+                                // Seek back to end
+                                let end = if format == ExportFormat::TwoMg {
+                                    64 + total
+                                } else {
+                                    total
+                                };
+                                writer.seek(std::io::SeekFrom::Start(end))?;
                             }
 
-                            // Append VHD footer
-                            let footer = build_vhd_footer(total);
-                            writer.write_all(&footer)?;
+                            // Append format footer (VHD only)
+                            if format == ExportFormat::Vhd {
+                                let footer = build_vhd_footer(total);
+                                writer.write_all(&footer)?;
+                            }
                             writer.flush()?;
 
                             overall_written += export_size;
@@ -1098,9 +1139,9 @@ impl InspectTab {
 
         if status.finished {
             if let Some(err) = &status.error {
-                log.error(format!("VHD export failed: {err}"));
+                log.error(format!("Export failed: {err}"));
             } else {
-                log.info("VHD export completed successfully.");
+                log.info("Export completed successfully.");
             }
             drop(status);
             self.export_status = None;

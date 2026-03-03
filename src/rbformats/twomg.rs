@@ -57,6 +57,40 @@ pub fn parse_twomg_header(reader: &mut impl Read) -> Option<TwoMgHeader> {
     })
 }
 
+/// Build a 64-byte 2MG header for the given raw disk data length.
+///
+/// The header uses:
+/// - Magic: `"2IMG"`
+/// - Creator: `"rsbk"` (Rusty Backup)
+/// - Header size: 64
+/// - Version: 1
+/// - Image format: ProDOS order (1)
+/// - Data offset: 64
+/// - Data length: `data_length`
+/// - ProDOS blocks: `data_length / 512`
+pub fn build_twomg_header(data_length: u64) -> [u8; 64] {
+    let mut buf = [0u8; 64];
+    // Magic (offset 0, 4 bytes)
+    buf[0..4].copy_from_slice(b"2IMG");
+    // Creator (offset 4, 4 bytes)
+    buf[4..8].copy_from_slice(b"rsbk");
+    // Header size (offset 0x08, u16 LE)
+    buf[0x08..0x0A].copy_from_slice(&64u16.to_le_bytes());
+    // Version (offset 0x0A, u16 LE)
+    buf[0x0A..0x0C].copy_from_slice(&1u16.to_le_bytes());
+    // Image format (offset 0x0C, u32 LE) — ProDOS order
+    buf[0x0C..0x10].copy_from_slice(&FORMAT_PRODOS.to_le_bytes());
+    // Flags (offset 0x10, u32 LE) — 0
+    // ProDOS blocks (offset 0x14, u32 LE)
+    let blocks = (data_length / 512) as u32;
+    buf[0x14..0x18].copy_from_slice(&blocks.to_le_bytes());
+    // Data offset (offset 0x18, u32 LE)
+    buf[0x18..0x1C].copy_from_slice(&64u32.to_le_bytes());
+    // Data length (offset 0x1C, u32 LE)
+    buf[0x1C..0x20].copy_from_slice(&(data_length as u32).to_le_bytes());
+    buf
+}
+
 impl TwoMgHeader {
     /// Human-readable description of the image format.
     pub fn format_name(&self) -> &'static str {
@@ -128,6 +162,49 @@ mod tests {
         let data = [0u8; 10];
         let mut cursor = Cursor::new(&data[..]);
         assert!(parse_twomg_header(&mut cursor).is_none());
+    }
+
+    #[test]
+    fn test_build_twomg_header() {
+        let data_len: u64 = 65536;
+        let hdr = build_twomg_header(data_len);
+
+        // Verify magic
+        assert_eq!(&hdr[0..4], b"2IMG");
+        // Creator
+        assert_eq!(&hdr[4..8], b"rsbk");
+        // Header size
+        assert_eq!(u16::from_le_bytes([hdr[0x08], hdr[0x09]]), 64);
+        // Version
+        assert_eq!(u16::from_le_bytes([hdr[0x0A], hdr[0x0B]]), 1);
+        // Format = ProDOS
+        assert_eq!(
+            u32::from_le_bytes([hdr[0x0C], hdr[0x0D], hdr[0x0E], hdr[0x0F]]),
+            FORMAT_PRODOS,
+        );
+        // ProDOS blocks
+        assert_eq!(
+            u32::from_le_bytes([hdr[0x14], hdr[0x15], hdr[0x16], hdr[0x17]]),
+            128,
+        );
+        // Data offset
+        assert_eq!(
+            u32::from_le_bytes([hdr[0x18], hdr[0x19], hdr[0x1A], hdr[0x1B]]),
+            64,
+        );
+        // Data length
+        assert_eq!(
+            u32::from_le_bytes([hdr[0x1C], hdr[0x1D], hdr[0x1E], hdr[0x1F]]),
+            65536,
+        );
+
+        // Verify it round-trips through the parser
+        let mut cursor = Cursor::new(&hdr[..]);
+        let parsed = parse_twomg_header(&mut cursor).unwrap();
+        assert_eq!(parsed.data_offset, 64);
+        assert_eq!(parsed.data_length, data_len);
+        assert_eq!(parsed.image_format, FORMAT_PRODOS);
+        assert_eq!(parsed.prodos_blocks, 128);
     }
 
     #[test]
