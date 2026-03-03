@@ -1,5 +1,7 @@
 pub mod chd;
+pub mod dmg;
 pub mod raw;
+pub mod twomg;
 pub mod vhd;
 pub mod zstd;
 
@@ -811,6 +813,198 @@ impl Write for SplitWriter {
 
     fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unified image format detection
+// ---------------------------------------------------------------------------
+
+/// Detected disk image format.
+pub enum ImageFormat {
+    /// No wrapper — treat the file as a raw disk image.
+    Raw,
+    /// VHD Fixed — strip the 512-byte footer; `data_size` is the raw data length.
+    Vhd { data_size: u64 },
+    /// 2MG (Apple II) — skip header, use data_offset/data_length.
+    TwoMg(twomg::TwoMgHeader),
+    /// UDIF DMG — virtual decompressed reader.
+    Dmg(dmg::DmgReader),
+}
+
+impl ImageFormat {
+    /// Human-readable name of the detected format.
+    pub fn description(&self) -> String {
+        match self {
+            ImageFormat::Raw => "Raw disk image".to_string(),
+            ImageFormat::Vhd { data_size } => {
+                format!("Fixed VHD (data: {} bytes)", data_size)
+            }
+            ImageFormat::TwoMg(hdr) => {
+                format!("2MG ({}, {} bytes)", hdr.format_name(), hdr.data_length)
+            }
+            ImageFormat::Dmg(reader) => {
+                format!(
+                    "Compressed DMG/UDIF ({}, {} bytes)",
+                    dmg::describe_dmg_methods(reader),
+                    reader.total_size()
+                )
+            }
+        }
+    }
+}
+
+/// Detect the image format of an opened file.
+///
+/// Checks for 2MG header, VHD footer, DMG koly footer, and falls back to raw.
+pub fn detect_image_format(file: File) -> Result<ImageFormat> {
+    let file_size = file.metadata()?.len();
+    let mut file = file;
+
+    // 1. Check first 4 bytes for 2IMG magic
+    if file_size >= 64 {
+        file.seek(SeekFrom::Start(0))?;
+        let mut magic = [0u8; 4];
+        if file.read_exact(&mut magic).is_ok() && &magic == twomg::TWOMG_MAGIC {
+            file.seek(SeekFrom::Start(0))?;
+            if let Some(hdr) = twomg::parse_twomg_header(&mut file) {
+                return Ok(ImageFormat::TwoMg(hdr));
+            }
+        }
+    }
+
+    // 2. Check last 512 bytes for VHD "conectix" cookie
+    if file_size >= 512 {
+        file.seek(SeekFrom::End(-512))?;
+        let mut cookie = [0u8; 8];
+        if file.read_exact(&mut cookie).is_ok() && &cookie == vhd::VHD_COOKIE {
+            return Ok(ImageFormat::Vhd {
+                data_size: file_size - 512,
+            });
+        }
+    }
+
+    // 3. Check last 512 bytes for DMG koly footer
+    if file_size >= 512 {
+        match dmg::detect_dmg(file) {
+            Ok(Some(reader)) => return Ok(ImageFormat::Dmg(reader)),
+            Ok(None) => {
+                // Not a UDIF DMG — fall through to raw.
+                // We consumed the file; return Raw (the caller will re-open).
+                return Ok(ImageFormat::Raw);
+            }
+            Err(_) => {
+                // Parse error — treat as raw
+                return Ok(ImageFormat::Raw);
+            }
+        }
+    }
+
+    // 4. Fallback — raw image
+    Ok(ImageFormat::Raw)
+}
+
+/// A boxed reader that implements both `Read` and `Seek`.
+pub type BoxReadSeek = Box<dyn ReadSeek>;
+
+/// Trait alias for `Read + Seek`.
+pub trait ReadSeek: Read + Seek {}
+impl<T: Read + Seek> ReadSeek for T {}
+
+/// Wraps a file according to its detected image format, returning a reader
+/// positioned at the start of the disk data and the data length.
+///
+/// The caller must pass the *same* file used for `detect_image_format` (or a
+/// freshly opened copy).  For `Dmg`, the `DmgReader` is moved out of the
+/// `ImageFormat` enum.
+pub fn wrap_image_reader(file: File, format: ImageFormat) -> Result<(BoxReadSeek, u64)> {
+    match format {
+        ImageFormat::Raw => {
+            let size = file.metadata()?.len();
+            let mut reader = BufReader::new(file);
+            reader.seek(SeekFrom::Start(0))?;
+            Ok((Box::new(reader), size))
+        }
+        ImageFormat::Vhd { data_size } => {
+            let mut reader = BufReader::new(file);
+            reader.seek(SeekFrom::Start(0))?;
+            // We return a Take-limited reader so the caller never sees the footer.
+            // But Take doesn't implement Seek, so we use a SectionReader.
+            Ok((
+                Box::new(SectionReader::new(reader, 0, data_size)?),
+                data_size,
+            ))
+        }
+        ImageFormat::TwoMg(hdr) => {
+            let mut reader = BufReader::new(file);
+            reader.seek(SeekFrom::Start(hdr.data_offset))?;
+            Ok((
+                Box::new(SectionReader::new(
+                    reader,
+                    hdr.data_offset,
+                    hdr.data_length,
+                )?),
+                hdr.data_length,
+            ))
+        }
+        ImageFormat::Dmg(reader) => {
+            let size = reader.total_size();
+            Ok((Box::new(reader), size))
+        }
+    }
+}
+
+/// A reader that exposes a section (offset..offset+length) of an inner reader
+/// as if it were a standalone file.
+struct SectionReader<R: Read + Seek> {
+    inner: R,
+    base: u64,
+    length: u64,
+    position: u64,
+}
+
+impl<R: Read + Seek> SectionReader<R> {
+    fn new(mut inner: R, base: u64, length: u64) -> Result<Self> {
+        inner.seek(SeekFrom::Start(base))?;
+        Ok(Self {
+            inner,
+            base,
+            length,
+            position: 0,
+        })
+    }
+}
+
+impl<R: Read + Seek> Read for SectionReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let remaining = self.length.saturating_sub(self.position);
+        if remaining == 0 {
+            return Ok(0);
+        }
+        let to_read = (buf.len() as u64).min(remaining) as usize;
+        let n = self.inner.read(&mut buf[..to_read])?;
+        self.position += n as u64;
+        Ok(n)
+    }
+}
+
+impl<R: Read + Seek> Seek for SectionReader<R> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new_pos = match pos {
+            SeekFrom::Start(p) => p as i64,
+            SeekFrom::Current(delta) => self.position as i64 + delta,
+            SeekFrom::End(delta) => self.length as i64 + delta,
+        };
+        if new_pos < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek to negative position",
+            ));
+        }
+        let new_pos = new_pos as u64;
+        self.inner.seek(SeekFrom::Start(self.base + new_pos))?;
+        self.position = new_pos;
+        Ok(self.position)
     }
 }
 

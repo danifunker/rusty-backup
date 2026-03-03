@@ -177,7 +177,13 @@ impl BackupTab {
                             .clicked()
                         {
                             if let Some(path) = super::file_dialog()
-                                .add_filter("Disk Images", &["img", "raw", "bin", "iso", "dd"])
+                                .add_filter(
+                                    "Disk Images",
+                                    &[
+                                        "img", "raw", "bin", "iso", "dd", "vhd", "hda", "hdv",
+                                        "2mg", "dmg",
+                                    ],
+                                )
                                 .add_filter("All Files", &["*"])
                                 .pick_file()
                             {
@@ -737,8 +743,44 @@ impl BackupTab {
 
         match File::open(&path) {
             Ok(file) => {
-                let mut reader = BufReader::new(file);
-                match PartitionTable::detect(&mut reader) {
+                // Detect image format (VHD, 2MG, DMG, or raw)
+                let detect_result = match rusty_backup::rbformats::detect_image_format(file) {
+                    Ok(format) => {
+                        let desc = format.description();
+                        log.info(format!("Detected format: {}", desc));
+                        match File::open(&path) {
+                            Ok(f2) => {
+                                match rusty_backup::rbformats::wrap_image_reader(f2, format) {
+                                    Ok((mut reader, _size)) => PartitionTable::detect(&mut reader),
+                                    Err(e) => {
+                                        // Fallback to raw
+                                        log.warn(format!("Format wrap failed: {e}"));
+                                        match File::open(&path) {
+                                            Ok(f3) => {
+                                                let mut r = BufReader::new(f3);
+                                                PartitionTable::detect(&mut r)
+                                            }
+                                            Err(e) => Err(e.into()),
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => Err(e.into()),
+                        }
+                    }
+                    Err(_) => {
+                        // Fallback to raw read
+                        match File::open(&path) {
+                            Ok(f2) => {
+                                let mut r = BufReader::new(f2);
+                                PartitionTable::detect(&mut r)
+                            }
+                            Err(e) => Err(e.into()),
+                        }
+                    }
+                };
+
+                match detect_result {
                     Ok(table) => {
                         self.source_partitions = table.partitions();
                         let table_desc = if matches!(table, PartitionTable::None { .. }) {

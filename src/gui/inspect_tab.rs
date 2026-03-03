@@ -15,9 +15,7 @@ use rusty_backup::partition::PartitionSizeOverride;
 use rusty_backup::partition::{
     self, detect_alignment, PartitionAlignment, PartitionInfo, PartitionTable,
 };
-use rusty_backup::rbformats::vhd::{
-    build_vhd_footer, export_partition_vhd, export_whole_disk_vhd, VHD_COOKIE,
-};
+use rusty_backup::rbformats::vhd::{build_vhd_footer, export_partition_vhd, export_whole_disk_vhd};
 
 use super::browse_view::BrowseView;
 use super::progress::{LogLevel, LogPanel};
@@ -257,11 +255,18 @@ impl InspectTab {
                     }
                     ui.separator();
                     if ui
-                        .selectable_label(self.image_file_path.is_some(), "Open VHD File...")
+                        .selectable_label(self.image_file_path.is_some(), "Open Disk Image...")
                         .clicked()
                     {
                         if let Some(path) = super::file_dialog()
-                            .add_filter("VHD Files", &["vhd", "hda"])
+                            .add_filter(
+                                "Disk Images",
+                                &[
+                                    "vhd", "img", "raw", "bin", "iso", "dd", "hda", "hdv", "2mg",
+                                    "dmg",
+                                ],
+                            )
+                            .add_filter("All Files", &["*"])
                             .pick_file()
                         {
                             self.selected_device_idx = None;
@@ -1385,8 +1390,6 @@ impl InspectTab {
 
             set_step("Reading partition table...");
 
-            let file_size = device_file.metadata().map(|m| m.len()).unwrap_or(0);
-
             // Clone for the BufReader; keep `device_file` for additional clones.
             let mut reader = match device_file.try_clone() {
                 Ok(f) => BufReader::new(f),
@@ -1396,34 +1399,42 @@ impl InspectTab {
                 }
             };
 
-            // Detect VHD: check if the last 512 bytes contain the "conectix" cookie
-            let data_size = if file_size >= 512 {
-                if let Ok(mut f) = device_file.try_clone() {
-                    if f.seek(SeekFrom::End(-512)).is_ok() {
-                        let mut cookie = [0u8; 8];
-                        if f.read_exact(&mut cookie).is_ok() && &cookie == VHD_COOKIE {
-                            let ds = file_size - 512;
-                            push_log(format!("Detected Fixed VHD (data: {} bytes)", ds));
-                            Some(ds)
-                        } else {
-                            None
+            // Detect image format (VHD, 2MG, DMG, or raw)
+            let is_device = path.to_string_lossy().starts_with("/dev/")
+                || path.to_string_lossy().starts_with("\\\\.\\");
+
+            let detect_result = if !is_device {
+                // For image files, use unified format detection
+                match device_file.try_clone() {
+                    Ok(clone) => match rusty_backup::rbformats::detect_image_format(clone) {
+                        Ok(format) => {
+                            let desc = format.description();
+                            push_log(format!("Detected format: {}", desc));
+                            match rusty_backup::rbformats::wrap_image_reader(
+                                device_file.try_clone().unwrap_or_else(|_| {
+                                    std::fs::File::open(&path).expect("reopen failed")
+                                }),
+                                format,
+                            ) {
+                                Ok((mut wrapped_reader, _data_size)) => {
+                                    PartitionTable::detect(&mut wrapped_reader)
+                                }
+                                Err(e) => {
+                                    push_log(format!("Format wrap failed, trying raw: {e}"));
+                                    let _ = reader.seek(SeekFrom::Start(0));
+                                    PartitionTable::detect(&mut reader)
+                                }
+                            }
                         }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
+                        Err(e) => {
+                            push_log(format!("Format detection failed, trying raw: {e}"));
+                            PartitionTable::detect(&mut reader)
+                        }
+                    },
+                    Err(_) => PartitionTable::detect(&mut reader),
                 }
             } else {
-                None
-            };
-
-            // Use a limited reader if VHD was detected
-            let detect_result = if let Some(ds) = data_size {
-                let _ = reader.seek(SeekFrom::Start(0));
-                let mut limited = reader.take(ds);
-                PartitionTable::detect(&mut limited)
-            } else {
+                // Device path — always treat as raw
                 PartitionTable::detect(&mut reader)
             };
 
