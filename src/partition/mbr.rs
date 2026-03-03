@@ -413,6 +413,60 @@ pub fn build_ebr_chain(
     result
 }
 
+/// Build a minimal MBR from scratch with the given partition entries.
+///
+/// Each entry is `(type_byte, start_lba, total_sectors, bootable)`.
+/// Returns a valid 512-byte MBR with 0xAA55 signature and CHS values
+/// computed from the given geometry.
+pub fn build_minimal_mbr(
+    disk_signature: u32,
+    entries: &[(u8, u32, u32, bool)],
+    heads: u16,
+    sectors_per_track: u16,
+) -> [u8; 512] {
+    let mut mbr = [0u8; 512];
+
+    // Disk signature at offset 440
+    mbr[440..444].copy_from_slice(&disk_signature.to_le_bytes());
+
+    // Partition entries (up to 4)
+    for (i, &(type_byte, start_lba, total_sectors, bootable)) in entries.iter().take(4).enumerate()
+    {
+        let offset = PARTITION_TABLE_OFFSET + i * PARTITION_ENTRY_SIZE;
+
+        // Bootable flag
+        mbr[offset] = if bootable { 0x80 } else { 0x00 };
+
+        // CHS start
+        let (cyl_s, head_s, sec_s) = lba_to_chs(start_lba, heads as u32, sectors_per_track as u32);
+        mbr[offset + 1] = head_s as u8;
+        mbr[offset + 2] = (sec_s as u8 & 0x3F) | ((cyl_s >> 2) as u8 & 0xC0);
+        mbr[offset + 3] = cyl_s as u8;
+
+        // Partition type
+        mbr[offset + 4] = type_byte;
+
+        // CHS end
+        let end_lba = start_lba.saturating_add(total_sectors).saturating_sub(1);
+        let (cyl_e, head_e, sec_e) = lba_to_chs(end_lba, heads as u32, sectors_per_track as u32);
+        mbr[offset + 5] = head_e as u8;
+        mbr[offset + 6] = (sec_e as u8 & 0x3F) | ((cyl_e >> 2) as u8 & 0xC0);
+        mbr[offset + 7] = cyl_e as u8;
+
+        // Start LBA
+        mbr[offset + 8..offset + 12].copy_from_slice(&start_lba.to_le_bytes());
+
+        // Total sectors
+        mbr[offset + 12..offset + 16].copy_from_slice(&total_sectors.to_le_bytes());
+    }
+
+    // MBR signature
+    mbr[510] = 0x55;
+    mbr[511] = 0xAA;
+
+    mbr
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,5 +850,31 @@ mod tests {
         assert_eq!(parsed[1].partition_type, 0x83);
         assert_eq!(parsed[1].start_lba, 8194);
         assert_eq!(parsed[1].total_sectors, 2048);
+    }
+
+    #[test]
+    fn test_build_minimal_mbr_roundtrip() {
+        let mbr_bytes = build_minimal_mbr(
+            0xCAFEBABE,
+            &[(0x0C, 2048, 1048576, true), (0x83, 1050624, 2097152, false)],
+            255,
+            63,
+        );
+
+        let mbr = Mbr::parse(&mbr_bytes).unwrap();
+        assert_eq!(mbr.disk_signature, 0xCAFEBABE);
+
+        let non_empty: Vec<_> = mbr.entries.iter().filter(|e| !e.is_empty()).collect();
+        assert_eq!(non_empty.len(), 2);
+
+        assert_eq!(non_empty[0].partition_type, 0x0C);
+        assert_eq!(non_empty[0].start_lba, 2048);
+        assert_eq!(non_empty[0].total_sectors, 1048576);
+        assert!(non_empty[0].bootable);
+
+        assert_eq!(non_empty[1].partition_type, 0x83);
+        assert_eq!(non_empty[1].start_lba, 1050624);
+        assert_eq!(non_empty[1].total_sectors, 2097152);
+        assert!(!non_empty[1].bootable);
     }
 }

@@ -259,6 +259,71 @@ fn write_c_string(buf: &mut [u8], s: &str) {
     // Rest is already zero from initialization
 }
 
+/// Build a minimal APM from scratch with the given partition entries.
+///
+/// Each entry is `(type_string, start_block, block_count)`.
+/// Returns an `Apm` with DDR + self-referencing partition map entry + user entries.
+pub fn build_minimal_apm(
+    entries: &[(String, u32, u32)],
+    block_size: u32,
+    total_blocks: u32,
+) -> Apm {
+    // Total map entries = 1 (self-referencing) + user entries
+    let map_count = 1 + entries.len() as u32;
+
+    // Self-referencing partition map entry (covers blocks 1..map_count)
+    let map_entry = ApmPartitionEntry {
+        signature: APM_ENTRY_SIGNATURE,
+        map_entries: map_count,
+        start_block: 1,
+        block_count: map_count,
+        name: "Apple".to_string(),
+        partition_type: "Apple_partition_map".to_string(),
+        data_start: 0,
+        data_count: map_count,
+        status: 0x03, // valid + allocated
+        boot_start: 0,
+        boot_size: 0,
+        boot_load: 0,
+        boot_entry: 0,
+        boot_checksum: 0,
+        processor: String::new(),
+    };
+
+    let mut apm_entries = vec![map_entry];
+
+    for (i, (type_string, start_block, block_count)) in entries.iter().enumerate() {
+        apm_entries.push(ApmPartitionEntry {
+            signature: APM_ENTRY_SIGNATURE,
+            map_entries: map_count,
+            start_block: *start_block,
+            block_count: *block_count,
+            name: format!("Partition {}", i + 1),
+            partition_type: type_string.clone(),
+            data_start: 0,
+            data_count: *block_count,
+            status: 0x33, // valid + allocated + readable + writable
+            boot_start: 0,
+            boot_size: 0,
+            boot_load: 0,
+            boot_entry: 0,
+            boot_checksum: 0,
+            processor: String::new(),
+        });
+    }
+
+    Apm {
+        ddr: DriverDescriptorRecord {
+            signature: DDR_SIGNATURE,
+            block_size: block_size as u16,
+            block_count: total_blocks,
+            driver_count: 0,
+        },
+        entries: apm_entries,
+        map_entry_count: map_count,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,5 +456,26 @@ mod tests {
         assert_eq!(patched.ddr.block_count, 120000);
         assert_eq!(patched.entries[1].block_count, 60000);
         assert_eq!(patched.entries[1].data_count, 60000);
+    }
+
+    #[test]
+    fn test_build_minimal_apm_roundtrip() {
+        let apm = build_minimal_apm(&[("Apple_HFS".to_string(), 64, 100000)], 512, 200000);
+
+        // Serialize to bytes
+        let bytes = apm.build_apm_blocks(Some(200000));
+
+        // Parse back
+        let mut cursor = std::io::Cursor::new(bytes);
+        let parsed = Apm::parse(&mut cursor).unwrap();
+
+        assert_eq!(parsed.ddr.block_size, 512);
+        assert_eq!(parsed.ddr.block_count, 200000);
+        // Should have 2 entries: partition map + user partition
+        assert_eq!(parsed.entries.len(), 2);
+        assert_eq!(parsed.entries[0].partition_type, "Apple_partition_map");
+        assert_eq!(parsed.entries[1].partition_type, "Apple_HFS");
+        assert_eq!(parsed.entries[1].start_block, 64);
+        assert_eq!(parsed.entries[1].block_count, 100000);
     }
 }

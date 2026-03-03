@@ -73,6 +73,9 @@ pub struct BackupConfig {
     /// When true, copy every sector verbatim (including blank space).
     /// When false (default), skip all-zero blocks for smaller/faster output.
     pub sector_by_sector: bool,
+    /// When set, only back up partitions whose index is in the list.
+    /// The partition table is always exported in full regardless.
+    pub partition_filter: Option<Vec<usize>>,
 }
 
 /// Shared progress state between background backup thread and the GUI.
@@ -593,13 +596,24 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         }
     }
 
+    // Helper closure: returns true if a partition should be included in the backup.
+    let should_include = |p: &partition::PartitionInfo| -> bool {
+        if p.is_extended_container {
+            return false;
+        }
+        if let Some(ref filter) = config.partition_filter {
+            return filter.contains(&p.index);
+        }
+        true
+    };
+
     // total_display_bytes: logical data bytes to image (excludes zero-filled free blocks
     //   in layout-preserving readers). Used for the smart-sizing log message and
     //   imaged_size_bytes metadata.
     let total_display_bytes: u64 = partitions
         .iter()
         .zip(&effective_sizes)
-        .filter(|(p, _)| !p.is_extended_container)
+        .filter(|(p, _)| should_include(p))
         .map(|(_, &sz)| sz)
         .sum();
 
@@ -609,13 +623,13 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
     let total_stream_bytes: u64 = partitions
         .iter()
         .zip(&stream_sizes)
-        .filter(|(p, _)| !p.is_extended_container)
+        .filter(|(p, _)| should_include(p))
         .map(|(_, &sz)| sz)
         .sum();
 
     let full_partition_bytes: u64 = partitions
         .iter()
-        .filter(|p| !p.is_extended_container)
+        .filter(|p| should_include(p))
         .map(|p| p.size_bytes)
         .sum();
 
@@ -641,6 +655,21 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
     for (part_idx, part) in partitions.iter().enumerate() {
         if is_cancelled(&progress) {
             bail!("backup cancelled");
+        }
+
+        // Skip partitions not in the filter (if a filter is set)
+        if let Some(ref filter) = config.partition_filter {
+            if !filter.contains(&part.index) {
+                log(
+                    &progress,
+                    LogLevel::Info,
+                    format!(
+                        "Skipping partition-{} (not selected for backup)",
+                        part.index
+                    ),
+                );
+                continue;
+            }
         }
 
         log(

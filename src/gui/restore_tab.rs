@@ -1,4 +1,5 @@
 use std::fs::File;
+use std::io::BufReader;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -6,12 +7,26 @@ use rusty_backup::backup::metadata::BackupMetadata;
 use rusty_backup::clonezilla;
 use rusty_backup::clonezilla::metadata::ClonezillaImage;
 use rusty_backup::device::DiskDevice;
-use rusty_backup::partition;
+use rusty_backup::partition::{self, PartitionInfo, PartitionTable};
+use rusty_backup::restore::single::{
+    NewDiskConfig, NewTableType, SinglePartitionRestoreConfig, SinglePartitionSource,
+};
 use rusty_backup::restore::{
     self, RestoreAlignment, RestoreConfig, RestorePartitionSize, RestoreProgress, RestoreSizeChoice,
 };
 
 use super::progress::{LogPanel, ProgressState};
+
+/// Which restore mode is active.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RestoreMode {
+    /// Existing behavior: restore entire disk from backup.
+    FullDisk,
+    /// Restore a single partition to an existing disk.
+    SinglePartition,
+    /// Restore a single partition to a new/empty disk with a fresh partition table.
+    NewDisk,
+}
 
 /// Per-partition restore configuration in the GUI.
 #[derive(Debug, Clone)]
@@ -54,7 +69,10 @@ enum AlignmentChoice {
 
 /// State for the Restore tab.
 pub struct RestoreTab {
-    // Source
+    // Mode
+    restore_mode: RestoreMode,
+
+    // Source (Full Disk + Single Partition)
     backup_folder: Option<PathBuf>,
     backup_metadata: Option<BackupMetadata>,
     clonezilla_image: Option<ClonezillaImage>,
@@ -62,16 +80,16 @@ pub struct RestoreTab {
     metadata_error: Option<String>,
     prev_backup_folder: Option<PathBuf>,
 
-    // Target
+    // Target (Full Disk)
     selected_device_idx: Option<usize>,
     image_file_path: Option<PathBuf>,
     target_is_device: bool,
 
-    // Alignment
+    // Alignment (Full Disk)
     alignment_choice: AlignmentChoice,
     custom_alignment_sectors: u32,
 
-    // Per-partition sizing
+    // Per-partition sizing (Full Disk)
     partition_configs: Vec<RestorePartitionConfig>,
 
     // Confirmation
@@ -80,11 +98,39 @@ pub struct RestoreTab {
     // Operation state
     restore_running: bool,
     restore_progress: Option<Arc<Mutex<RestoreProgress>>>,
+
+    // --- Single Partition mode state ---
+    /// Source image file for single-partition restore (alternative to backup folder)
+    sp_image_file: Option<PathBuf>,
+    /// Which partition index to restore (from backup)
+    sp_source_partition_idx: Option<usize>,
+    /// Target device for single-partition restore
+    sp_target_device_idx: Option<usize>,
+    /// Scanned target partition table
+    sp_target_partitions: Vec<PartitionInfo>,
+    /// Which target partition to overwrite
+    sp_target_partition_idx: Option<usize>,
+    /// Error from scanning target
+    sp_scan_error: Option<String>,
+
+    // --- New Disk mode state ---
+    /// Table type for new disk
+    nd_table_type: NewTableType,
+    /// Alignment choice for new disk
+    nd_alignment_choice: AlignmentChoice,
+    nd_custom_alignment: u32,
+    /// Bootable flag (MBR only)
+    nd_bootable: bool,
+    /// Target device or image file
+    nd_target_device_idx: Option<usize>,
+    nd_image_file_path: Option<PathBuf>,
+    nd_target_is_device: bool,
 }
 
 impl Default for RestoreTab {
     fn default() -> Self {
         Self {
+            restore_mode: RestoreMode::FullDisk,
             backup_folder: None,
             backup_metadata: None,
             clonezilla_image: None,
@@ -100,6 +146,19 @@ impl Default for RestoreTab {
             confirm_popup_open: false,
             restore_running: false,
             restore_progress: None,
+            sp_image_file: None,
+            sp_source_partition_idx: None,
+            sp_target_device_idx: None,
+            sp_target_partitions: Vec::new(),
+            sp_target_partition_idx: None,
+            sp_scan_error: None,
+            nd_table_type: NewTableType::Mbr,
+            nd_alignment_choice: AlignmentChoice::Modern1MB,
+            nd_custom_alignment: 2048,
+            nd_bootable: false,
+            nd_target_device_idx: None,
+            nd_image_file_path: None,
+            nd_target_is_device: true,
         }
     }
 }
@@ -150,6 +209,50 @@ impl RestoreTab {
 
         let controls_enabled = !self.restore_running;
 
+        // --- Restore Mode Selector ---
+        ui.add_enabled_ui(controls_enabled, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Mode:").strong());
+                ui.radio_value(
+                    &mut self.restore_mode,
+                    RestoreMode::FullDisk,
+                    "Full Disk Restore",
+                );
+                ui.radio_value(
+                    &mut self.restore_mode,
+                    RestoreMode::SinglePartition,
+                    "Restore Single Partition",
+                );
+                ui.radio_value(
+                    &mut self.restore_mode,
+                    RestoreMode::NewDisk,
+                    "Restore to New Disk",
+                );
+            });
+        });
+        ui.add_space(4.0);
+
+        match self.restore_mode {
+            RestoreMode::FullDisk => self.show_full_disk_mode(ui, devices, log, controls_enabled),
+            RestoreMode::SinglePartition => {
+                self.show_single_partition_mode(ui, devices, log, controls_enabled)
+            }
+            RestoreMode::NewDisk => self.show_new_disk_mode(ui, devices, log, controls_enabled),
+        }
+
+        // --- Confirmation popup ---
+        if self.confirm_popup_open {
+            self.show_confirmation_popup(ui, devices, log);
+        }
+    }
+
+    fn show_full_disk_mode(
+        &mut self,
+        ui: &mut egui::Ui,
+        devices: &[DiskDevice],
+        log: &mut LogPanel,
+        controls_enabled: bool,
+    ) {
         // --- Section 1: Backup Source ---
         ui.horizontal(|ui| {
             ui.label("Backup Folder:");
@@ -483,10 +586,43 @@ impl RestoreTab {
         ui.add_space(16.0);
 
         // --- Section 5: Action Buttons ---
+        self.show_action_buttons(ui, devices, log);
+    }
+
+    fn show_action_buttons(
+        &mut self,
+        ui: &mut egui::Ui,
+        devices: &[DiskDevice],
+        log: &mut LogPanel,
+    ) {
+        ui.add_space(16.0);
         ui.horizontal(|ui| {
             if !self.restore_running {
-                let can_start = (self.backup_metadata.is_some() || self.clonezilla_image.is_some())
-                    && self.has_target(devices);
+                let can_start = match self.restore_mode {
+                    RestoreMode::FullDisk => {
+                        (self.backup_metadata.is_some() || self.clonezilla_image.is_some())
+                            && self.has_target(devices)
+                    }
+                    RestoreMode::SinglePartition => {
+                        let has_source = (self.backup_metadata.is_some()
+                            && self.sp_source_partition_idx.is_some())
+                            || self.sp_image_file.is_some();
+                        let has_target = self.sp_target_device_idx.is_some()
+                            && self.sp_target_partition_idx.is_some();
+                        has_source && has_target
+                    }
+                    RestoreMode::NewDisk => {
+                        let has_source = (self.backup_metadata.is_some()
+                            && self.sp_source_partition_idx.is_some())
+                            || self.sp_image_file.is_some();
+                        let has_target = if self.nd_target_is_device {
+                            self.nd_target_device_idx.is_some()
+                        } else {
+                            self.nd_image_file_path.is_some()
+                        };
+                        has_source && has_target
+                    }
+                };
                 if ui
                     .add_enabled(can_start, egui::Button::new("Restore"))
                     .clicked()
@@ -498,10 +634,6 @@ impl RestoreTab {
                     if let Some(ref progress_arc) = self.restore_progress {
                         if let Ok(mut p) = progress_arc.lock() {
                             p.cancel_requested = true;
-                            // Update the operation label immediately so the
-                            // user sees feedback while the current disk write
-                            // drains (macOS I/O can block for tens of seconds
-                            // before a stalled write returns).
                             p.operation =
                                 "Cancelling — waiting for current write to complete…".to_string();
                         }
@@ -512,10 +644,294 @@ impl RestoreTab {
                 }
             }
         });
+    }
 
-        // --- Confirmation popup ---
-        if self.confirm_popup_open {
-            self.show_confirmation_popup(ui, devices, log);
+    fn show_single_partition_mode(
+        &mut self,
+        ui: &mut egui::Ui,
+        devices: &[DiskDevice],
+        log: &mut LogPanel,
+        controls_enabled: bool,
+    ) {
+        // --- Source Section ---
+        ui.label(egui::RichText::new("Source").strong());
+        ui.separator();
+
+        ui.add_enabled_ui(controls_enabled, |ui| {
+            // Backup folder source
+            ui.horizontal(|ui| {
+                ui.label("Backup Folder:");
+                let label = self
+                    .backup_folder
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "No folder selected".into());
+                ui.label(&label);
+                if ui.button("Browse...").clicked() {
+                    if let Some(path) = super::file_dialog().pick_folder() {
+                        self.backup_folder = Some(path);
+                        self.sp_image_file = None;
+                    }
+                }
+            });
+
+            // Or image file source
+            ui.horizontal(|ui| {
+                ui.label("Or Image File:");
+                let label = self
+                    .sp_image_file
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "No file selected".into());
+                ui.label(&label);
+                if ui.button("Browse...").clicked() {
+                    if let Some(path) = super::file_dialog()
+                        .add_filter(
+                            "Disk Images",
+                            &["img", "raw", "bin", "vhd", "2mg", "iso", "dd"],
+                        )
+                        .add_filter("All Files", &["*"])
+                        .pick_file()
+                    {
+                        self.sp_image_file = Some(path);
+                        self.backup_folder = None;
+                        self.backup_metadata = None;
+                        self.sp_source_partition_idx = None;
+                        self.prev_backup_folder = None;
+                    }
+                }
+            });
+        });
+
+        // Auto-load metadata when folder changes
+        if !self.restore_running {
+            let folder_changed = self.backup_folder != self.prev_backup_folder;
+            if folder_changed {
+                self.prev_backup_folder = self.backup_folder.clone();
+                self.load_backup_metadata(log);
+            }
+        }
+
+        // Show source partition selector for backup sources
+        if let Some(meta) = &self.backup_metadata {
+            ui.add_space(4.0);
+            ui.add_enabled_ui(controls_enabled, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Source Partition:");
+                    let partitions = &meta.partitions;
+                    let current_label = self
+                        .sp_source_partition_idx
+                        .and_then(|idx| partitions.iter().find(|p| p.index == idx))
+                        .map(|p| {
+                            format!(
+                                "#{}: {} ({})",
+                                p.index,
+                                p.type_name,
+                                partition::format_size(p.original_size_bytes),
+                            )
+                        })
+                        .unwrap_or_else(|| "Select a partition...".into());
+
+                    egui::ComboBox::from_id_salt("sp_source_partition")
+                        .selected_text(&current_label)
+                        .width(350.0)
+                        .show_ui(ui, |ui| {
+                            for pm in partitions {
+                                let label = format!(
+                                    "#{}: {} ({})",
+                                    pm.index,
+                                    pm.type_name,
+                                    partition::format_size(pm.original_size_bytes),
+                                );
+                                ui.selectable_value(
+                                    &mut self.sp_source_partition_idx,
+                                    Some(pm.index),
+                                    label,
+                                );
+                            }
+                        });
+                });
+            });
+        } else if self.sp_image_file.is_some() {
+            ui.add_space(4.0);
+            ui.label("Source: entire image file");
+        }
+
+        if let Some(err) = &self.metadata_error {
+            ui.colored_label(egui::Color32::from_rgb(200, 150, 100), err);
+        }
+
+        ui.add_space(8.0);
+
+        // --- Target Section ---
+        ui.label(egui::RichText::new("Target").strong());
+        ui.separator();
+
+        ui.add_enabled_ui(controls_enabled, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Target Device:");
+                let current_label = self
+                    .sp_target_device_idx
+                    .and_then(|idx| devices.get(idx))
+                    .map(|d| d.display_name())
+                    .unwrap_or_else(|| "Select a target device...".into());
+
+                egui::ComboBox::from_id_salt("sp_target_device")
+                    .selected_text(&current_label)
+                    .width(400.0)
+                    .height(400.0)
+                    .show_ui(ui, |ui| {
+                        for (i, device) in devices.iter().enumerate() {
+                            let label = format!(
+                                "{} ({}){}",
+                                device.display_name(),
+                                partition::format_size(device.size_bytes),
+                                if device.is_system { " [SYSTEM]" } else { "" },
+                            );
+                            if ui
+                                .selectable_value(&mut self.sp_target_device_idx, Some(i), label)
+                                .clicked()
+                            {
+                                self.sp_target_partitions.clear();
+                                self.sp_target_partition_idx = None;
+                                self.sp_scan_error = None;
+                            }
+                        }
+                    });
+
+                if self.sp_target_device_idx.is_some() {
+                    if ui.button("Scan Target").clicked() {
+                        self.scan_target_partitions(devices, log);
+                    }
+                }
+            });
+
+            // System disk warning
+            if let Some(idx) = self.sp_target_device_idx {
+                if let Some(device) = devices.get(idx) {
+                    if device.is_system {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 100, 100),
+                            "WARNING: This is a system disk!",
+                        );
+                    }
+                }
+            }
+
+            // Show scanned target partitions
+            if !self.sp_target_partitions.is_empty() {
+                ui.add_space(4.0);
+                ui.label("Target Partition:");
+
+                // Get source size for comparison
+                let source_size = self.get_sp_source_size();
+
+                egui::Grid::new("sp_target_partitions")
+                    .striped(true)
+                    .min_col_width(30.0)
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("").strong()); // radio
+                        ui.label(egui::RichText::new("#").strong());
+                        ui.label(egui::RichText::new("Type").strong());
+                        ui.label(egui::RichText::new("Size").strong());
+                        ui.label(egui::RichText::new("").strong()); // compat
+                        ui.end_row();
+
+                        for part in &self.sp_target_partitions {
+                            if part.is_extended_container {
+                                continue;
+                            }
+                            let selected = self.sp_target_partition_idx == Some(part.index);
+                            if ui.radio(selected, "").clicked() {
+                                self.sp_target_partition_idx = Some(part.index);
+                            }
+                            ui.label(format!("{}", part.index));
+                            ui.label(&part.type_name);
+                            ui.label(partition::format_size(part.size_bytes));
+
+                            // Size compatibility indicator
+                            if let Some(src_sz) = source_size {
+                                if part.size_bytes < src_sz {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(255, 100, 100),
+                                        "too small",
+                                    );
+                                } else {
+                                    ui.label("OK");
+                                }
+                            } else {
+                                ui.label("");
+                            }
+                            ui.end_row();
+                        }
+                    });
+            }
+
+            if let Some(err) = &self.sp_scan_error {
+                ui.colored_label(egui::Color32::from_rgb(200, 150, 100), err);
+            }
+        });
+
+        // Action buttons
+        self.show_action_buttons(ui, devices, log);
+    }
+
+    /// Get the source data size for the single-partition mode.
+    fn get_sp_source_size(&self) -> Option<u64> {
+        if let Some(meta) = &self.backup_metadata {
+            if let Some(idx) = self.sp_source_partition_idx {
+                return meta
+                    .partitions
+                    .iter()
+                    .find(|p| p.index == idx)
+                    .map(|p| p.imaged_size_bytes);
+            }
+        }
+        if let Some(path) = &self.sp_image_file {
+            return std::fs::metadata(path).ok().map(|m| m.len());
+        }
+        None
+    }
+
+    /// Scan the target device's partition table (requires elevation for devices).
+    fn scan_target_partitions(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {
+        self.sp_target_partitions.clear();
+        self.sp_target_partition_idx = None;
+        self.sp_scan_error = None;
+
+        let device = match self.sp_target_device_idx.and_then(|idx| devices.get(idx)) {
+            Some(d) => d,
+            None => return,
+        };
+
+        log.info(format!(
+            "Scanning target partitions on {}...",
+            device.path.display()
+        ));
+
+        match rusty_backup::os::open_source_for_reading(&device.path) {
+            Ok(elevated) => {
+                let (file, _guard) = elevated.into_parts();
+                let mut reader = BufReader::new(file);
+                match PartitionTable::detect(&mut reader) {
+                    Ok(table) => {
+                        self.sp_target_partitions = table.partitions();
+                        log.info(format!(
+                            "Found {} partition(s) on target ({})",
+                            self.sp_target_partitions.len(),
+                            table.type_name(),
+                        ));
+                    }
+                    Err(e) => {
+                        self.sp_scan_error = Some(format!("Could not read partition table: {e}"));
+                        log.error(format!("Target scan failed: {e}"));
+                    }
+                }
+            }
+            Err(e) => {
+                self.sp_scan_error = Some(format!("Cannot access device: {e}"));
+                log.error(format!("Cannot access target device: {e}"));
+            }
         }
     }
 
@@ -701,38 +1117,93 @@ impl RestoreTab {
             .resizable(false)
             .default_width(400.0)
             .show(ui.ctx(), |ui| {
-                let target_name = if self.target_is_device {
-                    self.selected_device_idx
-                        .and_then(|idx| devices.get(idx))
-                        .map(|d| d.display_name())
-                        .unwrap_or_else(|| "Unknown".into())
-                } else {
-                    self.image_file_path
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "Unknown".into())
-                };
+                match self.restore_mode {
+                    RestoreMode::FullDisk => {
+                        let target_name = if self.target_is_device {
+                            self.selected_device_idx
+                                .and_then(|idx| devices.get(idx))
+                                .map(|d| d.display_name())
+                                .unwrap_or_else(|| "Unknown".into())
+                        } else {
+                            self.image_file_path
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "Unknown".into())
+                        };
 
-                ui.colored_label(
-                    egui::Color32::from_rgb(255, 100, 100),
-                    format!(
-                        "All data on {} will be permanently overwritten!",
-                        target_name
-                    ),
-                );
-                ui.add_space(8.0);
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 100, 100),
+                            format!(
+                                "All data on {} will be permanently overwritten!",
+                                target_name
+                            ),
+                        );
+                        ui.add_space(8.0);
 
-                // Show partition summary
-                for cfg in &self.partition_configs {
-                    let size_str = if cfg.choice == RestoreSizeUiChoice::FillRemaining {
-                        "Fill remaining".to_string()
-                    } else {
-                        partition::format_size(cfg.effective_size())
-                    };
-                    ui.label(format!(
-                        "  Partition {}: {} -> {}",
-                        cfg.index, cfg.type_name, size_str,
-                    ));
+                        for cfg in &self.partition_configs {
+                            let size_str = if cfg.choice == RestoreSizeUiChoice::FillRemaining {
+                                "Fill remaining".to_string()
+                            } else {
+                                partition::format_size(cfg.effective_size())
+                            };
+                            ui.label(format!(
+                                "  Partition {}: {} -> {}",
+                                cfg.index, cfg.type_name, size_str,
+                            ));
+                        }
+                    }
+                    RestoreMode::SinglePartition => {
+                        let target_name = self
+                            .sp_target_device_idx
+                            .and_then(|idx| devices.get(idx))
+                            .map(|d| d.display_name())
+                            .unwrap_or_else(|| "Unknown".into());
+                        let target_part = self.sp_target_partition_idx.and_then(|idx| {
+                            self.sp_target_partitions.iter().find(|p| p.index == idx)
+                        });
+                        let part_desc = target_part
+                            .map(|p| {
+                                format!(
+                                    "Partition {} ({}, {})",
+                                    p.index,
+                                    p.type_name,
+                                    partition::format_size(p.size_bytes),
+                                )
+                            })
+                            .unwrap_or_else(|| "Unknown".into());
+
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 180, 100),
+                            format!("{} on {} will be overwritten.", part_desc, target_name,),
+                        );
+                        ui.label("The partition table will NOT be modified.");
+                    }
+                    RestoreMode::NewDisk => {
+                        let target_name = if self.nd_target_is_device {
+                            self.nd_target_device_idx
+                                .and_then(|idx| devices.get(idx))
+                                .map(|d| d.display_name())
+                                .unwrap_or_else(|| "Unknown".into())
+                        } else {
+                            self.nd_image_file_path
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "Unknown".into())
+                        };
+                        let table_type = match self.nd_table_type {
+                            NewTableType::Mbr => "MBR",
+                            NewTableType::Gpt => "GPT",
+                            NewTableType::Apm => "APM",
+                        };
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 100, 100),
+                            format!(
+                                "A new {} partition table will be written to {}!",
+                                table_type, target_name,
+                            ),
+                        );
+                        ui.label("All existing data will be destroyed.");
+                    }
                 }
 
                 ui.add_space(8.0);
@@ -745,7 +1216,13 @@ impl RestoreTab {
                         .clicked()
                     {
                         close = true;
-                        self.start_restore(devices, log);
+                        match self.restore_mode {
+                            RestoreMode::FullDisk => self.start_restore(devices, log),
+                            RestoreMode::SinglePartition => {
+                                self.start_single_partition_restore(devices, log)
+                            }
+                            RestoreMode::NewDisk => self.start_new_disk_restore(devices, log),
+                        }
                     }
                     if ui.button("Cancel").clicked() {
                         close = true;
@@ -840,6 +1317,476 @@ impl RestoreTab {
 
         std::thread::spawn(move || {
             if let Err(e) = restore::run_restore(config, Arc::clone(&progress_arc)) {
+                if let Ok(mut p) = progress_arc.lock() {
+                    p.error = Some(format!("{e:#}"));
+                    p.finished = true;
+                }
+            }
+        });
+    }
+
+    fn start_single_partition_restore(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {
+        // Determine source
+        let source = if let Some(path) = &self.sp_image_file {
+            SinglePartitionSource::ImageFile { path: path.clone() }
+        } else if let Some(folder) = &self.backup_folder {
+            let idx = match self.sp_source_partition_idx {
+                Some(i) => i,
+                None => {
+                    log.error("No source partition selected");
+                    return;
+                }
+            };
+            SinglePartitionSource::Backup {
+                folder: folder.clone(),
+                partition_index: idx,
+            }
+        } else {
+            log.error("No source selected");
+            return;
+        };
+
+        // Determine target
+        let device = match self.sp_target_device_idx.and_then(|idx| devices.get(idx)) {
+            Some(d) => d,
+            None => {
+                log.error("No target device selected");
+                return;
+            }
+        };
+        let target_part = match self
+            .sp_target_partition_idx
+            .and_then(|idx| self.sp_target_partitions.iter().find(|p| p.index == idx))
+        {
+            Some(p) => p.clone(),
+            None => {
+                log.error("No target partition selected");
+                return;
+            }
+        };
+
+        let source_start_lba = match &source {
+            SinglePartitionSource::Backup {
+                partition_index, ..
+            } => self
+                .backup_metadata
+                .as_ref()
+                .and_then(|m| m.partitions.iter().find(|p| p.index == *partition_index))
+                .map(|p| p.start_lba)
+                .unwrap_or(0),
+            SinglePartitionSource::ImageFile { .. } => 0,
+        };
+
+        let config = SinglePartitionRestoreConfig {
+            source,
+            target_path: device.path.clone(),
+            target_is_device: true,
+            target_offset_bytes: target_part.start_lba * 512,
+            target_size_bytes: Some(target_part.size_bytes),
+            target_start_lba: target_part.start_lba,
+            source_start_lba,
+            new_disk: None,
+        };
+
+        let progress_arc = Arc::new(Mutex::new(RestoreProgress::new()));
+        self.restore_progress = Some(Arc::clone(&progress_arc));
+        self.restore_running = true;
+
+        log.info(format!(
+            "Starting single-partition restore to partition {} on {}",
+            target_part.index,
+            device.path.display(),
+        ));
+
+        std::thread::spawn(move || {
+            if let Err(e) = rusty_backup::restore::single::run_single_partition_restore(
+                config,
+                Arc::clone(&progress_arc),
+            ) {
+                if let Ok(mut p) = progress_arc.lock() {
+                    p.error = Some(format!("{e:#}"));
+                    p.finished = true;
+                }
+            }
+        });
+    }
+
+    fn show_new_disk_mode(
+        &mut self,
+        ui: &mut egui::Ui,
+        devices: &[DiskDevice],
+        log: &mut LogPanel,
+        controls_enabled: bool,
+    ) {
+        // --- Source Section (same as single partition) ---
+        ui.label(egui::RichText::new("Source").strong());
+        ui.separator();
+
+        ui.add_enabled_ui(controls_enabled, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Backup Folder:");
+                let label = self
+                    .backup_folder
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "No folder selected".into());
+                ui.label(&label);
+                if ui.button("Browse...").clicked() {
+                    if let Some(path) = super::file_dialog().pick_folder() {
+                        self.backup_folder = Some(path);
+                        self.sp_image_file = None;
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Or Image File:");
+                let label = self
+                    .sp_image_file
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "No file selected".into());
+                ui.label(&label);
+                if ui.button("Browse...").clicked() {
+                    if let Some(path) = super::file_dialog()
+                        .add_filter(
+                            "Disk Images",
+                            &["img", "raw", "bin", "vhd", "2mg", "iso", "dd"],
+                        )
+                        .add_filter("All Files", &["*"])
+                        .pick_file()
+                    {
+                        self.sp_image_file = Some(path);
+                        self.backup_folder = None;
+                        self.backup_metadata = None;
+                        self.sp_source_partition_idx = None;
+                        self.prev_backup_folder = None;
+                    }
+                }
+            });
+        });
+
+        // Auto-load metadata when folder changes
+        if !self.restore_running {
+            let folder_changed = self.backup_folder != self.prev_backup_folder;
+            if folder_changed {
+                self.prev_backup_folder = self.backup_folder.clone();
+                self.load_backup_metadata(log);
+            }
+        }
+
+        // Source partition selector
+        if let Some(meta) = &self.backup_metadata {
+            ui.add_space(4.0);
+            ui.add_enabled_ui(controls_enabled, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Source Partition:");
+                    let partitions = &meta.partitions;
+                    let current_label = self
+                        .sp_source_partition_idx
+                        .and_then(|idx| partitions.iter().find(|p| p.index == idx))
+                        .map(|p| {
+                            format!(
+                                "#{}: {} ({})",
+                                p.index,
+                                p.type_name,
+                                partition::format_size(p.original_size_bytes),
+                            )
+                        })
+                        .unwrap_or_else(|| "Select a partition...".into());
+
+                    egui::ComboBox::from_id_salt("nd_source_partition")
+                        .selected_text(&current_label)
+                        .width(350.0)
+                        .show_ui(ui, |ui| {
+                            for pm in partitions {
+                                let label = format!(
+                                    "#{}: {} ({})",
+                                    pm.index,
+                                    pm.type_name,
+                                    partition::format_size(pm.original_size_bytes),
+                                );
+                                ui.selectable_value(
+                                    &mut self.sp_source_partition_idx,
+                                    Some(pm.index),
+                                    label,
+                                );
+                            }
+                        });
+                });
+            });
+        }
+
+        if let Some(err) = &self.metadata_error {
+            ui.colored_label(egui::Color32::from_rgb(200, 150, 100), err);
+        }
+
+        ui.add_space(8.0);
+
+        // --- Target Section ---
+        ui.label(egui::RichText::new("Target").strong());
+        ui.separator();
+
+        ui.add_enabled_ui(controls_enabled, |ui| {
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut self.nd_target_is_device, true, "Write to device");
+                ui.radio_value(&mut self.nd_target_is_device, false, "Save as image file");
+            });
+
+            if self.nd_target_is_device {
+                ui.horizontal(|ui| {
+                    ui.label("Device:");
+                    let current_label = self
+                        .nd_target_device_idx
+                        .and_then(|idx| devices.get(idx))
+                        .map(|d| d.display_name())
+                        .unwrap_or_else(|| "Select a target device...".into());
+
+                    egui::ComboBox::from_id_salt("nd_target_device")
+                        .selected_text(&current_label)
+                        .width(400.0)
+                        .height(400.0)
+                        .show_ui(ui, |ui| {
+                            for (i, device) in devices.iter().enumerate() {
+                                let label = format!(
+                                    "{} ({}){}",
+                                    device.display_name(),
+                                    partition::format_size(device.size_bytes),
+                                    if device.is_system { " [SYSTEM]" } else { "" },
+                                );
+                                ui.selectable_value(&mut self.nd_target_device_idx, Some(i), label);
+                            }
+                        });
+                });
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label("Image File:");
+                    let label = self
+                        .nd_image_file_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "No file selected".into());
+                    ui.label(&label);
+                    if ui.button("Save As...").clicked() {
+                        if let Some(path) = super::file_dialog()
+                            .add_filter("Disk Images", &["img", "raw", "bin"])
+                            .save_file()
+                        {
+                            self.nd_image_file_path = Some(path);
+                        }
+                    }
+                });
+            }
+        });
+
+        ui.add_space(8.0);
+
+        // --- Partition Table Options ---
+        ui.label(egui::RichText::new("New Partition Table").strong());
+        ui.separator();
+
+        ui.add_enabled_ui(controls_enabled, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Table Type:");
+                ui.radio_value(&mut self.nd_table_type, NewTableType::Mbr, "MBR");
+                ui.radio_value(&mut self.nd_table_type, NewTableType::Gpt, "GPT");
+                ui.radio_value(&mut self.nd_table_type, NewTableType::Apm, "APM");
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("Alignment:");
+                ui.radio_value(
+                    &mut self.nd_alignment_choice,
+                    AlignmentChoice::Modern1MB,
+                    "1 MB (LBA 2048)",
+                );
+                ui.radio_value(
+                    &mut self.nd_alignment_choice,
+                    AlignmentChoice::Original,
+                    "DOS (LBA 63)",
+                );
+                ui.radio_value(
+                    &mut self.nd_alignment_choice,
+                    AlignmentChoice::Custom,
+                    "Custom",
+                );
+                if self.nd_alignment_choice == AlignmentChoice::Custom {
+                    ui.add(egui::DragValue::new(&mut self.nd_custom_alignment).range(1..=65535));
+                    ui.label("sectors");
+                }
+            });
+
+            if self.nd_table_type == NewTableType::Mbr {
+                ui.checkbox(&mut self.nd_bootable, "Mark partition as bootable");
+            }
+
+            // Preview layout
+            let alignment_sectors = match self.nd_alignment_choice {
+                AlignmentChoice::Original => 63,
+                AlignmentChoice::Modern1MB => 2048,
+                AlignmentChoice::Custom => self.nd_custom_alignment as u64,
+            };
+            let start_lba = match self.nd_table_type {
+                NewTableType::Gpt => {
+                    // GPT needs LBAs 0-33 for protective MBR + header + entries
+                    let min_lba = 34u64;
+                    if alignment_sectors > 0 {
+                        let rem = min_lba % alignment_sectors;
+                        if rem != 0 {
+                            min_lba + alignment_sectors - rem
+                        } else {
+                            min_lba
+                        }
+                    } else {
+                        min_lba
+                    }
+                }
+                _ => alignment_sectors,
+            };
+            ui.colored_label(
+                egui::Color32::GRAY,
+                format!("Partition will start at LBA {}", start_lba),
+            );
+        });
+
+        self.show_action_buttons(ui, devices, log);
+    }
+
+    fn start_new_disk_restore(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {
+        // Determine source
+        let source = if let Some(path) = &self.sp_image_file {
+            SinglePartitionSource::ImageFile { path: path.clone() }
+        } else if let Some(folder) = &self.backup_folder {
+            let idx = match self.sp_source_partition_idx {
+                Some(i) => i,
+                None => {
+                    log.error("No source partition selected");
+                    return;
+                }
+            };
+            SinglePartitionSource::Backup {
+                folder: folder.clone(),
+                partition_index: idx,
+            }
+        } else {
+            log.error("No source selected");
+            return;
+        };
+
+        // Determine target
+        let (target_path, target_is_device, disk_size_bytes) = if self.nd_target_is_device {
+            let device = match self.nd_target_device_idx.and_then(|idx| devices.get(idx)) {
+                Some(d) => d,
+                None => {
+                    log.error("No target device selected");
+                    return;
+                }
+            };
+            (device.path.clone(), true, device.size_bytes)
+        } else {
+            let path = match &self.nd_image_file_path {
+                Some(p) => p.clone(),
+                None => {
+                    log.error("No target file selected");
+                    return;
+                }
+            };
+            // For image files, estimate disk size from source partition size
+            let source_size = self.get_sp_source_size().unwrap_or(0);
+            let estimated = source_size + 2048 * 512; // add alignment overhead
+            (path, false, estimated)
+        };
+
+        // Calculate partition start LBA
+        let alignment_sectors = match self.nd_alignment_choice {
+            AlignmentChoice::Original => 63u64,
+            AlignmentChoice::Modern1MB => 2048,
+            AlignmentChoice::Custom => self.nd_custom_alignment as u64,
+        };
+        let start_lba = match self.nd_table_type {
+            NewTableType::Gpt => {
+                let min_lba = 34u64;
+                if alignment_sectors > 0 {
+                    let rem = min_lba % alignment_sectors;
+                    if rem != 0 {
+                        min_lba + alignment_sectors - rem
+                    } else {
+                        min_lba
+                    }
+                } else {
+                    min_lba
+                }
+            }
+            _ => alignment_sectors,
+        };
+
+        let source_start_lba = match &source {
+            SinglePartitionSource::Backup {
+                partition_index, ..
+            } => self
+                .backup_metadata
+                .as_ref()
+                .and_then(|m| m.partitions.iter().find(|p| p.index == *partition_index))
+                .map(|p| p.start_lba)
+                .unwrap_or(0),
+            SinglePartitionSource::ImageFile { .. } => 0,
+        };
+
+        // Determine partition type from backup metadata
+        let partition_type_byte = self
+            .backup_metadata
+            .as_ref()
+            .and_then(|m| {
+                self.sp_source_partition_idx.and_then(|idx| {
+                    m.partitions
+                        .iter()
+                        .find(|p| p.index == idx)
+                        .map(|p| p.partition_type_byte)
+                })
+            })
+            .unwrap_or(0x0C); // default to FAT32 LBA
+
+        let partition_type_string = self.backup_metadata.as_ref().and_then(|m| {
+            self.sp_source_partition_idx.and_then(|idx| {
+                m.partitions
+                    .iter()
+                    .find(|p| p.index == idx)
+                    .and_then(|p| p.partition_type_string.clone())
+            })
+        });
+
+        let config = SinglePartitionRestoreConfig {
+            source,
+            target_path: target_path.clone(),
+            target_is_device,
+            target_offset_bytes: start_lba * 512,
+            target_size_bytes: None, // use source size
+            target_start_lba: start_lba,
+            source_start_lba,
+            new_disk: Some(NewDiskConfig {
+                table_type: self.nd_table_type,
+                alignment_sectors,
+                partition_type_byte,
+                partition_type_guid: None, // use default
+                partition_type_string,
+                bootable: self.nd_bootable,
+                disk_size_bytes,
+            }),
+        };
+
+        let progress_arc = Arc::new(Mutex::new(RestoreProgress::new()));
+        self.restore_progress = Some(Arc::clone(&progress_arc));
+        self.restore_running = true;
+
+        log.info(format!(
+            "Starting new-disk restore to {}",
+            target_path.display(),
+        ));
+
+        std::thread::spawn(move || {
+            if let Err(e) = rusty_backup::restore::single::run_single_partition_restore(
+                config,
+                Arc::clone(&progress_arc),
+            ) {
                 if let Ok(mut p) = progress_arc.lock() {
                     p.error = Some(format!("{e:#}"));
                     p.finished = true;

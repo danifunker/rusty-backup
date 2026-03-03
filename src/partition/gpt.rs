@@ -505,6 +505,64 @@ fn parse_utf16le_name(bytes: &[u8]) -> String {
     String::from_utf16_lossy(&u16s)
 }
 
+/// Build a minimal GPT from scratch with the given partition entries.
+///
+/// Each entry is `(type_guid, start_lba, end_lba, name)`.
+/// Returns a `Gpt` that can be used with `build_primary_gpt`, `build_backup_gpt`,
+/// and `build_protective_mbr`.
+pub fn build_minimal_gpt(entries: &[(Guid, u64, u64, String)], disk_size_bytes: u64) -> Gpt {
+    let disk_sectors = disk_size_bytes / SECTOR_SIZE;
+
+    // Generate a random-ish disk GUID from a hash of the entries
+    let mut disk_guid_bytes = [0u8; 16];
+    let mut hash: u64 = 0x5A5A_5A5A_5A5A_5A5A;
+    for (i, (_, start, end, name)) in entries.iter().enumerate() {
+        hash ^= start.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        hash ^= end.wrapping_mul(0x517C_C1B7_2722_0A95);
+        hash ^= (i as u64).wrapping_mul(0x6C62_272E_07BB_0142);
+        hash ^= name.len() as u64;
+    }
+    disk_guid_bytes[0..8].copy_from_slice(&hash.to_le_bytes());
+    disk_guid_bytes[8..16].copy_from_slice(&hash.wrapping_mul(0xBF58_476D_1CE4_E5B9).to_le_bytes());
+
+    let gpt_entries: Vec<GptPartitionEntry> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, (type_guid, start_lba, end_lba, name))| {
+            // Generate a unique GUID for each partition
+            let mut unique_bytes = disk_guid_bytes;
+            unique_bytes[0] ^= (i as u8).wrapping_add(1);
+
+            GptPartitionEntry {
+                type_guid: *type_guid,
+                unique_guid: Guid::from_bytes(unique_bytes),
+                first_lba: *start_lba,
+                last_lba: *end_lba,
+                attributes: 0,
+                name: name.clone(),
+            }
+        })
+        .collect();
+
+    Gpt {
+        header: GptHeader {
+            revision: 0x0001_0000, // GPT revision 1.0
+            header_size: 92,
+            header_crc32: 0, // computed by build_primary_gpt
+            my_lba: 1,
+            alternate_lba: disk_sectors - 1,
+            first_usable_lba: 34,
+            last_usable_lba: disk_sectors - 34,
+            disk_guid: Guid::from_bytes(disk_guid_bytes),
+            partition_entry_lba: 2,
+            num_partition_entries: 128,
+            partition_entry_size: 128,
+            partition_array_crc32: 0, // computed by build_primary_gpt
+        },
+        entries: gpt_entries,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -848,5 +906,35 @@ mod tests {
             bytes[i * 2 + 1] = (ch >> 8) as u8;
         }
         assert_eq!(parse_utf16le_name(&bytes), "Test Partition");
+    }
+
+    #[test]
+    fn test_build_minimal_gpt_roundtrip() {
+        let type_guid = Guid::from_string("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7").unwrap();
+        let disk_size = 1024 * 1024 * 100; // 100 MB
+        let disk_sectors = disk_size / 512;
+
+        let gpt = build_minimal_gpt(
+            &[(type_guid, 2048, disk_sectors - 34, "Test".to_string())],
+            disk_size,
+        );
+
+        // Build a disk image from the constructed GPT
+        let pmbr = Gpt::build_protective_mbr(disk_sectors);
+        let primary = gpt.build_primary_gpt(disk_sectors);
+
+        let mut image = vec![0u8; disk_size as usize];
+        image[..512].copy_from_slice(&pmbr);
+        image[512..512 + primary.len()].copy_from_slice(&primary);
+
+        // Parse it back
+        let mut cursor = StdCursor::new(image);
+        let parsed = Gpt::parse(&mut cursor).unwrap();
+
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.entries[0].first_lba, 2048);
+        assert_eq!(parsed.entries[0].last_lba, disk_sectors - 34);
+        assert_eq!(parsed.entries[0].name, "Test");
+        assert_eq!(parsed.entries[0].type_guid, type_guid);
     }
 }

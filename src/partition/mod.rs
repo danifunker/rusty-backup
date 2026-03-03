@@ -1,6 +1,8 @@
 pub mod apm;
+pub mod editor;
 pub mod gpt;
 pub mod mbr;
+pub mod resize;
 
 use serde::Serialize;
 use std::io::{Read, Seek, SeekFrom};

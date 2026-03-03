@@ -1,3 +1,5 @@
+pub mod single;
+
 use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -2018,7 +2020,8 @@ fn clear_gpt_structures(
 }
 
 /// Detected filesystem type for a partition.
-enum PartitionFsType {
+#[derive(Debug)]
+pub(crate) enum PartitionFsType {
     Fat,
     Ntfs,
     Exfat,
@@ -2033,7 +2036,7 @@ enum PartitionFsType {
 /// Detect the filesystem type of a partition by reading its boot sector magic bytes.
 /// All reads are done in sector-aligned 512-byte blocks to work on raw devices
 /// (e.g. macOS /dev/rdiskN) which require sector-aligned I/O.
-fn detect_partition_fs_type(
+pub(crate) fn detect_partition_fs_type(
     file: &mut (impl Read + Seek),
     partition_offset: u64,
 ) -> PartitionFsType {

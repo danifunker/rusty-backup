@@ -11,13 +11,13 @@ use rusty_backup::clonezilla;
 use rusty_backup::clonezilla::metadata::ClonezillaImage;
 use rusty_backup::device::DiskDevice;
 use rusty_backup::fs::fat::resize_fat_in_place;
+use rusty_backup::partition::editor::{self as pt_editor, PartitionTableEdit};
 use rusty_backup::partition::PartitionSizeOverride;
 use rusty_backup::partition::{
     self, detect_alignment, PartitionAlignment, PartitionInfo, PartitionTable,
 };
-use rusty_backup::rbformats::vhd::{
-    build_vhd_footer, export_partition_vhd, export_whole_disk_vhd, VHD_COOKIE,
-};
+use rusty_backup::rbformats::export::ExportFormat;
+use rusty_backup::rbformats::vhd::build_vhd_footer;
 
 use super::browse_view::BrowseView;
 use super::progress::{LogLevel, LogPanel};
@@ -46,10 +46,12 @@ pub struct InspectTab {
     prev_backup_path: Option<PathBuf>,
     /// Filesystem browser
     browse_view: BrowseView,
-    /// VHD export: true if the export popup is open
-    export_vhd_popup: bool,
-    /// VHD export mode: true = whole disk, false = per partition
+    /// Export: true if the export popup is open
+    export_popup: bool,
+    /// Export mode: true = whole disk, false = per partition
     export_whole_disk: bool,
+    /// Export format selection
+    export_format: ExportFormat,
     /// Per-partition sizing configuration for VHD export
     export_partition_configs: Vec<PartitionExportConfig>,
     /// VHD export background thread status
@@ -73,6 +75,70 @@ pub struct InspectTab {
     open_device_file: Option<Arc<File>>,
     /// Guard that keeps the DiskClaim (and any temp file) alive while browsing.
     open_device_guard: Option<rusty_backup::os::TempFileGuard>,
+    /// Partition table editor popup
+    editor_popup: bool,
+    /// Editor: working copy of partition entries (editable)
+    editor_entries: Vec<EditorEntry>,
+    /// Editor: pending edits to apply
+    editor_edits: Vec<PartitionTableEdit>,
+    /// Editor: validation errors/warnings
+    editor_errors: Vec<String>,
+    /// Editor: disk size in bytes for validation
+    editor_disk_size: u64,
+    /// Editor: status message after apply
+    editor_status: Option<String>,
+    /// Editor: add-partition fields
+    editor_add_start_lba: String,
+    editor_add_size_mb: String,
+    editor_add_type: String,
+    editor_add_bootable: bool,
+    /// Resize popup (in-place partition resizing)
+    resize_popup: Option<Box<super::resize_popup::ResizePopup>>,
+}
+
+/// Working copy of a partition entry in the editor.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct EditorEntry {
+    index: usize,
+    type_name: String,
+    partition_type_byte: u8,
+    partition_type_string: Option<String>,
+    start_lba: u64,
+    size_bytes: u64,
+    bootable: bool,
+    is_logical: bool,
+    is_extended_container: bool,
+    /// User-edited size text (in MiB)
+    size_text: String,
+    /// User-edited type text (hex for MBR, string for APM, GUID for GPT)
+    type_text: String,
+    /// Marked for deletion
+    deleted: bool,
+}
+
+impl EditorEntry {
+    fn from_partition(p: &PartitionInfo) -> Self {
+        let size_mib = p.size_bytes as f64 / (1024.0 * 1024.0);
+        Self {
+            index: p.index,
+            type_name: p.type_name.clone(),
+            partition_type_byte: p.partition_type_byte,
+            partition_type_string: p.partition_type_string.clone(),
+            start_lba: p.start_lba,
+            size_bytes: p.size_bytes,
+            bootable: p.bootable,
+            is_logical: p.is_logical,
+            is_extended_container: p.is_extended_container,
+            size_text: format!("{:.2}", size_mib),
+            type_text: if let Some(ref ts) = p.partition_type_string {
+                ts.clone()
+            } else {
+                format!("{:02X}", p.partition_type_byte)
+            },
+            deleted: false,
+        }
+    }
 }
 
 /// Status of a background VHD export operation.
@@ -168,8 +234,9 @@ impl Default for InspectTab {
             prev_image_path: None,
             prev_backup_path: None,
             browse_view: BrowseView::default(),
-            export_vhd_popup: false,
+            export_popup: false,
             export_whole_disk: true,
+            export_format: ExportFormat::Vhd,
             export_partition_configs: Vec::new(),
             export_status: None,
             partition_min_sizes: HashMap::new(),
@@ -181,6 +248,17 @@ impl Default for InspectTab {
             inspect_status: None,
             open_device_file: None,
             open_device_guard: None,
+            editor_popup: false,
+            editor_entries: Vec::new(),
+            editor_edits: Vec::new(),
+            editor_errors: Vec::new(),
+            editor_disk_size: 0,
+            editor_status: None,
+            editor_add_start_lba: String::new(),
+            editor_add_size_mb: String::new(),
+            editor_add_type: String::new(),
+            editor_add_bootable: false,
+            resize_popup: None,
         }
     }
 }
@@ -257,11 +335,18 @@ impl InspectTab {
                     }
                     ui.separator();
                     if ui
-                        .selectable_label(self.image_file_path.is_some(), "Open VHD File...")
+                        .selectable_label(self.image_file_path.is_some(), "Open VHD/Disk Image...")
                         .clicked()
                     {
                         if let Some(path) = super::file_dialog()
-                            .add_filter("VHD Files", &["vhd", "hda"])
+                            .add_filter(
+                                "Disk Images",
+                                &[
+                                    "vhd", "img", "raw", "bin", "iso", "dd", "hda", "hdv", "2mg",
+                                    "dmg",
+                                ],
+                            )
+                            .add_filter("All Files", &["*"])
                             .pick_file()
                         {
                             self.selected_device_idx = None;
@@ -326,18 +411,48 @@ impl InspectTab {
                 }
             }
 
-            // Export VHD button — available when we have partition data and no export running
+            // Export button — available when we have partition data and no export running
             let has_partitions = !self.partitions.is_empty();
             let export_running = self.export_status.is_some();
             if ui
                 .add_enabled(
                     has_partitions && !export_running,
-                    egui::Button::new("Export VHD..."),
+                    egui::Button::new("Export Disk Image..."),
                 )
                 .clicked()
             {
                 self.init_export_configs();
-                self.export_vhd_popup = true;
+                self.export_popup = true;
+            }
+
+            // Edit Partition Table button — only for devices and image files (not backups)
+            let is_editable_source = self.partition_table.is_some()
+                && self.backup_folder_path.is_none()
+                && self.clonezilla_image.is_none()
+                && !matches!(
+                    self.partition_table.as_ref(),
+                    Some(PartitionTable::None { .. })
+                );
+            if ui
+                .add_enabled(
+                    is_editable_source && !export_running,
+                    egui::Button::new("Edit Partition Table..."),
+                )
+                .clicked()
+            {
+                self.init_editor();
+            }
+
+            // Resize Partitions button — same conditions as Edit Partition Table
+            let resize_running = self.resize_popup.as_ref().is_some_and(|p| p.is_running());
+            if ui
+                .add_enabled(
+                    is_editable_source && !export_running && !resize_running,
+                    egui::Button::new("Resize Partitions..."),
+                )
+                .clicked()
+            {
+                self.init_resize_popup(devices);
             }
 
             if export_running {
@@ -358,7 +473,7 @@ impl InspectTab {
                 if !s.finished && s.total_bytes > 0 {
                     let fraction = s.current_bytes as f32 / s.total_bytes as f32;
                     let text = format!(
-                        "Exporting VHD: {} / {} ({:.0}%)",
+                        "Exporting: {} / {} ({:.0}%)",
                         partition::format_size(s.current_bytes),
                         partition::format_size(s.total_bytes),
                         fraction * 100.0,
@@ -367,7 +482,7 @@ impl InspectTab {
                 } else if !s.finished {
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label("Exporting VHD...");
+                        ui.label("Exporting...");
                     });
                 }
             }
@@ -385,9 +500,22 @@ impl InspectTab {
             }
         }
 
-        // Export VHD popup
-        if self.export_vhd_popup {
-            self.show_export_vhd_popup(ui, devices, log);
+        // Export popup
+        if self.export_popup {
+            self.show_export_popup(ui, devices, log);
+        }
+
+        // Editor popup
+        if self.editor_popup {
+            self.show_editor_popup(ui, devices, log);
+        }
+
+        // Resize popup
+        if let Some(ref mut popup) = self.resize_popup {
+            popup.poll_status(log);
+            if !popup.show(ui, devices, log) {
+                self.resize_popup = None;
+            }
         }
 
         ui.add_space(12.0);
@@ -488,6 +616,557 @@ impl InspectTab {
         }
     }
 
+    fn init_editor(&mut self) {
+        self.editor_entries = self
+            .partitions
+            .iter()
+            .map(EditorEntry::from_partition)
+            .collect();
+        self.editor_edits.clear();
+        self.editor_errors.clear();
+        self.editor_status = None;
+        self.editor_add_start_lba = String::new();
+        self.editor_add_size_mb = String::new();
+        self.editor_add_type = String::new();
+        self.editor_add_bootable = false;
+
+        // Determine disk size
+        self.editor_disk_size = self
+            .partitions
+            .iter()
+            .map(|p| (p.start_lba * 512) + p.size_bytes)
+            .max()
+            .unwrap_or(0);
+
+        self.editor_popup = true;
+    }
+
+    fn init_resize_popup(&mut self, devices: &[DiskDevice]) {
+        let table = match &self.partition_table {
+            Some(t) => t.clone(),
+            None => return,
+        };
+
+        let source_path = self.image_file_path.clone().or_else(|| {
+            self.selected_device_idx
+                .and_then(|idx| devices.get(idx))
+                .map(|d| d.path.clone())
+        });
+        let path = match source_path {
+            Some(p) => p,
+            None => return,
+        };
+
+        let is_device = self.selected_device_idx.is_some();
+
+        // Determine disk size
+        let disk_size = self
+            .partitions
+            .iter()
+            .map(|p| (p.start_lba * 512) + p.size_bytes)
+            .max()
+            .unwrap_or(0);
+
+        let alignment_sectors = self
+            .alignment
+            .as_ref()
+            .map(|a| a.alignment_sectors)
+            .unwrap_or(0);
+
+        self.resize_popup = Some(Box::new(super::resize_popup::ResizePopup::new(
+            &self.partitions,
+            table,
+            &self.partition_min_sizes,
+            alignment_sectors,
+            disk_size,
+            is_device,
+            path,
+        )));
+    }
+
+    fn show_editor_popup(&mut self, ui: &mut egui::Ui, devices: &[DiskDevice], log: &mut LogPanel) {
+        let mut open = true;
+        let mut apply_requested = false;
+
+        let table_type = match &self.partition_table {
+            Some(PartitionTable::Mbr(_)) => "MBR",
+            Some(PartitionTable::Gpt { .. }) => "GPT",
+            Some(PartitionTable::Apm(_)) => "APM",
+            _ => "Unknown",
+        };
+
+        egui::Window::new("Edit Partition Table")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(700.0)
+            .show(ui.ctx(), |ui| {
+                ui.label(format!("Table type: {}", table_type));
+                ui.add_space(4.0);
+
+                // Partition entry grid
+                egui::Grid::new("editor_grid")
+                    .striped(true)
+                    .min_col_width(50.0)
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("#").strong());
+                        ui.label(egui::RichText::new("Type").strong());
+                        ui.label(egui::RichText::new("Start LBA").strong());
+                        ui.label(egui::RichText::new("Size (MiB)").strong());
+                        ui.label(egui::RichText::new("Boot").strong());
+                        ui.label(egui::RichText::new("").strong());
+                        ui.end_row();
+
+                        for i in 0..self.editor_entries.len() {
+                            // Copy values we need for display to avoid holding
+                            // an immutable borrow across mutable TextEdit borrows.
+                            let idx = self.editor_entries[i].index;
+                            let deleted = self.editor_entries[i].deleted;
+                            let is_ext = self.editor_entries[i].is_extended_container;
+                            let is_logical = self.editor_entries[i].is_logical;
+                            let start_lba = self.editor_entries[i].start_lba;
+                            let size_bytes = self.editor_entries[i].size_bytes;
+                            let bootable = self.editor_entries[i].bootable;
+                            let type_name = self.editor_entries[i].type_name.clone();
+
+                            if deleted {
+                                ui.label(
+                                    egui::RichText::new(format!("{}", idx))
+                                        .color(egui::Color32::GRAY)
+                                        .strikethrough(),
+                                );
+                                ui.label(
+                                    egui::RichText::new(&type_name)
+                                        .color(egui::Color32::GRAY)
+                                        .strikethrough(),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!("{}", start_lba))
+                                        .color(egui::Color32::GRAY),
+                                );
+                                ui.label(egui::RichText::new("deleted").color(egui::Color32::GRAY));
+                                ui.label("");
+                                if ui.small_button("Undo").clicked() {
+                                    self.editor_entries[i].deleted = false;
+                                }
+                                ui.end_row();
+                                continue;
+                            }
+
+                            if is_ext {
+                                ui.label(
+                                    egui::RichText::new(format!("{} (ext)", idx))
+                                        .color(egui::Color32::GRAY),
+                                );
+                                ui.label(
+                                    egui::RichText::new(&type_name).color(egui::Color32::GRAY),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!("{}", start_lba))
+                                        .color(egui::Color32::GRAY),
+                                );
+                                let size_mib = size_bytes as f64 / (1024.0 * 1024.0);
+                                ui.label(
+                                    egui::RichText::new(format!("{:.2}", size_mib))
+                                        .color(egui::Color32::GRAY),
+                                );
+                                ui.label("");
+                                ui.label("");
+                                ui.end_row();
+                                continue;
+                            }
+
+                            let label = if is_logical {
+                                format!("  {}", idx)
+                            } else {
+                                format!("{}", idx)
+                            };
+                            ui.label(label);
+
+                            // Type field (editable)
+                            let type_id = format!("ed_type_{}", i);
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.editor_entries[i].type_text)
+                                    .desired_width(100.0)
+                                    .id(egui::Id::new(&type_id)),
+                            );
+
+                            // Start LBA (read-only)
+                            ui.label(format!("{}", start_lba));
+
+                            // Size (MiB) - editable
+                            let size_id = format!("ed_size_{}", i);
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.editor_entries[i].size_text)
+                                    .desired_width(80.0)
+                                    .id(egui::Id::new(&size_id)),
+                            );
+
+                            // Bootable checkbox (MBR only)
+                            if table_type == "MBR" {
+                                ui.checkbox(&mut self.editor_entries[i].bootable, "");
+                            } else {
+                                ui.label(if bootable { "Yes" } else { "" });
+                            }
+
+                            // Delete button
+                            if !is_logical {
+                                if ui
+                                    .small_button("Delete")
+                                    .on_hover_text("Mark partition for deletion")
+                                    .clicked()
+                                {
+                                    self.editor_entries[i].deleted = true;
+                                }
+                            } else {
+                                ui.label("");
+                            }
+
+                            ui.end_row();
+                        }
+                    });
+
+                ui.add_space(8.0);
+
+                // Add partition section
+                ui.collapsing("Add Partition", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Start LBA:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.editor_add_start_lba)
+                                .desired_width(80.0),
+                        );
+                        ui.label("Size (MiB):");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.editor_add_size_mb)
+                                .desired_width(80.0),
+                        );
+                        ui.label("Type:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.editor_add_type)
+                                .desired_width(80.0),
+                        );
+                        if table_type == "MBR" {
+                            ui.checkbox(&mut self.editor_add_bootable, "Bootable");
+                        }
+                        if ui.button("Add").clicked() {
+                            // Parse and add
+                            if let (Ok(start), Ok(size_mib)) = (
+                                self.editor_add_start_lba.trim().parse::<u64>(),
+                                self.editor_add_size_mb.trim().parse::<f64>(),
+                            ) {
+                                let size_bytes = (size_mib * 1024.0 * 1024.0) as u64;
+                                let type_byte = u8::from_str_radix(
+                                    self.editor_add_type.trim().trim_start_matches("0x"),
+                                    16,
+                                )
+                                .unwrap_or(0x83);
+                                let next_idx = self
+                                    .editor_entries
+                                    .iter()
+                                    .map(|e| e.index)
+                                    .max()
+                                    .unwrap_or(0)
+                                    + 1;
+                                let type_string = if table_type != "MBR" {
+                                    Some(self.editor_add_type.trim().to_string())
+                                } else {
+                                    None
+                                };
+                                self.editor_entries.push(EditorEntry {
+                                    index: next_idx,
+                                    type_name: format!("0x{:02X}", type_byte),
+                                    partition_type_byte: type_byte,
+                                    partition_type_string: type_string,
+                                    start_lba: start,
+                                    size_bytes,
+                                    bootable: self.editor_add_bootable,
+                                    is_logical: false,
+                                    is_extended_container: false,
+                                    size_text: format!("{:.2}", size_mib),
+                                    type_text: self.editor_add_type.trim().to_string(),
+                                    deleted: false,
+                                });
+                                self.editor_add_start_lba.clear();
+                                self.editor_add_size_mb.clear();
+                                self.editor_add_type.clear();
+                                self.editor_add_bootable = false;
+                            }
+                        }
+                    });
+                });
+
+                ui.add_space(8.0);
+
+                // Show validation errors
+                for err in &self.editor_errors {
+                    ui.colored_label(egui::Color32::from_rgb(255, 100, 100), err);
+                }
+
+                // Show status
+                if let Some(status) = &self.editor_status {
+                    ui.colored_label(egui::Color32::from_rgb(100, 255, 100), status);
+                }
+
+                ui.add_space(4.0);
+
+                // Action buttons
+                ui.horizontal(|ui| {
+                    if ui.button("Validate").clicked() {
+                        self.build_and_validate_edits();
+                    }
+
+                    let can_apply = self.editor_errors.is_empty()
+                        && self.partition_table.is_some()
+                        && self.backup_folder_path.is_none();
+                    if ui
+                        .add_enabled(can_apply, egui::Button::new("Apply Changes"))
+                        .clicked()
+                    {
+                        // Build edits first
+                        self.build_and_validate_edits();
+                        if self.editor_errors.is_empty() && !self.editor_edits.is_empty() {
+                            apply_requested = true;
+                        }
+                    }
+
+                    if ui.button("Cancel").clicked() {
+                        self.editor_popup = false;
+                    }
+                });
+            });
+
+        if !open {
+            self.editor_popup = false;
+        }
+
+        if apply_requested {
+            self.apply_editor_changes(devices, log);
+        }
+    }
+
+    /// Build the list of edits from the editor state and validate them.
+    fn build_and_validate_edits(&mut self) {
+        self.editor_edits.clear();
+        self.editor_errors.clear();
+        self.editor_status = None;
+
+        let table = match &self.partition_table {
+            Some(t) => t,
+            None => return,
+        };
+        let orig_partitions = table.partitions();
+
+        // Process existing entries: detect changes
+        for entry in &self.editor_entries {
+            // Find original
+            let orig = orig_partitions.iter().find(|p| p.index == entry.index);
+
+            if entry.deleted {
+                if orig.is_some() {
+                    self.editor_edits
+                        .push(PartitionTableEdit::DeleteEntry { index: entry.index });
+                }
+                continue;
+            }
+
+            if let Some(orig) = orig {
+                // Check size change
+                let new_size_mib: f64 = entry.size_text.trim().parse().unwrap_or(-1.0);
+                if new_size_mib > 0.0 {
+                    let new_size_bytes = (new_size_mib * 1024.0 * 1024.0) as u64;
+                    // Round to sector boundary
+                    let new_size_bytes = (new_size_bytes / 512) * 512;
+                    if new_size_bytes != orig.size_bytes {
+                        self.editor_edits.push(PartitionTableEdit::ResizeEntry {
+                            index: entry.index,
+                            new_size_bytes,
+                        });
+                    }
+                } else {
+                    self.editor_errors.push(format!(
+                        "Invalid size for partition {}: '{}'",
+                        entry.index, entry.size_text
+                    ));
+                }
+
+                // Check type change
+                let type_changed = match table {
+                    PartitionTable::Mbr(_) => {
+                        let new_byte =
+                            u8::from_str_radix(entry.type_text.trim().trim_start_matches("0x"), 16);
+                        match new_byte {
+                            Ok(b) if b != orig.partition_type_byte => {
+                                self.editor_edits.push(PartitionTableEdit::ChangeType {
+                                    index: entry.index,
+                                    new_type_byte: b,
+                                    new_type_string: None,
+                                });
+                                true
+                            }
+                            Err(_) => {
+                                self.editor_errors.push(format!(
+                                    "Invalid hex type for partition {}: '{}'",
+                                    entry.index, entry.type_text
+                                ));
+                                false
+                            }
+                            _ => false,
+                        }
+                    }
+                    PartitionTable::Gpt { .. } => {
+                        // GPT type is a GUID string
+                        if entry.type_text.trim()
+                            != orig.partition_type_string.as_deref().unwrap_or("")
+                        {
+                            self.editor_edits.push(PartitionTableEdit::ChangeType {
+                                index: entry.index,
+                                new_type_byte: 0,
+                                new_type_string: Some(entry.type_text.trim().to_string()),
+                            });
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    PartitionTable::Apm(_) => {
+                        if entry.type_text.trim()
+                            != orig.partition_type_string.as_deref().unwrap_or("")
+                        {
+                            self.editor_edits.push(PartitionTableEdit::ChangeType {
+                                index: entry.index,
+                                new_type_byte: 0,
+                                new_type_string: Some(entry.type_text.trim().to_string()),
+                            });
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                };
+                let _ = type_changed; // suppress unused warning
+            } else {
+                // New entry added via the editor
+                let type_byte =
+                    u8::from_str_radix(entry.type_text.trim().trim_start_matches("0x"), 16)
+                        .unwrap_or(0x83);
+                let type_string = if entry.partition_type_string.is_some() {
+                    Some(entry.type_text.trim().to_string())
+                } else {
+                    None
+                };
+                self.editor_edits.push(PartitionTableEdit::AddEntry {
+                    start_lba: entry.start_lba,
+                    size_bytes: entry.size_bytes,
+                    partition_type: type_byte,
+                    type_string,
+                    bootable: entry.bootable,
+                });
+            }
+        }
+
+        // Validate
+        if self.editor_errors.is_empty() {
+            match pt_editor::validate_edits(table, &self.editor_edits, self.editor_disk_size) {
+                Ok(warnings) => {
+                    for w in warnings {
+                        self.editor_errors.push(format!("Warning: {}", w));
+                    }
+                    if self.editor_edits.is_empty() {
+                        self.editor_status = Some("No changes detected.".to_string());
+                    } else {
+                        self.editor_status = Some(format!(
+                            "Validation OK — {} edit(s) ready to apply.",
+                            self.editor_edits.len()
+                        ));
+                    }
+                }
+                Err(e) => {
+                    self.editor_errors.push(format!("Validation error: {}", e));
+                }
+            }
+        }
+    }
+
+    fn apply_editor_changes(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {
+        let table = match &self.partition_table {
+            Some(t) => t.clone(),
+            None => {
+                log.error("No partition table loaded");
+                return;
+            }
+        };
+
+        let source_path = self.image_file_path.clone().or_else(|| {
+            self.selected_device_idx
+                .and_then(|idx| devices.get(idx))
+                .map(|d| d.path.clone())
+        });
+
+        let path = match source_path {
+            Some(p) => p,
+            None => {
+                log.error("No source path for editing");
+                return;
+            }
+        };
+
+        let edits = self.editor_edits.clone();
+        let disk_size = self.editor_disk_size;
+
+        // For devices, we need write access
+        let is_device = self.selected_device_idx.is_some();
+
+        log.info(format!(
+            "Applying {} partition table edit(s) to {}...",
+            edits.len(),
+            path.display()
+        ));
+
+        let result = if is_device {
+            use rusty_backup::os::open_target_for_writing;
+            match open_target_for_writing(&path) {
+                Ok(mut handle) => pt_editor::apply_edits(
+                    &mut handle.file,
+                    &table,
+                    &edits,
+                    disk_size,
+                    &mut |msg| log.info(msg),
+                ),
+                Err(e) => Err(e),
+            }
+        } else {
+            // Image file — open for read+write
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    pt_editor::apply_edits(&mut file, &table, &edits, disk_size, &mut |msg| {
+                        log.info(msg)
+                    })
+                }
+                Err(e) => Err(e.into()),
+            }
+        };
+
+        match result {
+            Ok(()) => {
+                log.info("Partition table updated successfully.");
+                self.editor_status = Some(
+                    "Changes applied successfully! Close and re-inspect to see updates."
+                        .to_string(),
+                );
+                self.editor_edits.clear();
+            }
+            Err(e) => {
+                log.error(format!("Failed to apply edits: {:#}", e));
+                self.editor_status = Some(format!("Error: {:#}", e));
+            }
+        }
+    }
+
     fn init_export_configs(&mut self) {
         self.export_partition_configs.clear();
         for part in &self.partitions {
@@ -518,30 +1197,36 @@ impl InspectTab {
         }
     }
 
-    fn show_export_vhd_popup(
-        &mut self,
-        ui: &mut egui::Ui,
-        devices: &[DiskDevice],
-        log: &mut LogPanel,
-    ) {
-        egui::Window::new("Export VHD")
+    fn show_export_popup(&mut self, ui: &mut egui::Ui, devices: &[DiskDevice], log: &mut LogPanel) {
+        egui::Window::new("Export Disk Image")
             .collapsible(false)
             .resizable(true)
             .default_width(500.0)
             .show(ui.ctx(), |ui| {
-                ui.label("Export partitions as Fixed VHD files.");
+                ui.label("Export partitions as disk image files.");
                 ui.add_space(4.0);
 
+                // Export mode
                 ui.radio_value(
                     &mut self.export_whole_disk,
                     true,
-                    "Whole Disk (single .vhd file)",
+                    "Whole Disk (single file)",
                 );
                 ui.radio_value(
                     &mut self.export_whole_disk,
                     false,
-                    "Per Partition (one .vhd per partition)",
+                    "Per Partition (one file per partition)",
                 );
+
+                ui.add_space(4.0);
+
+                // Export format
+                ui.label(egui::RichText::new("Format:").strong());
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut self.export_format, ExportFormat::Vhd, "VHD");
+                    ui.radio_value(&mut self.export_format, ExportFormat::Raw, "Raw (.img)");
+                    ui.radio_value(&mut self.export_format, ExportFormat::TwoMg, "2MG (.2mg)");
+                });
 
                 ui.add_space(8.0);
 
@@ -613,17 +1298,21 @@ impl InspectTab {
 
                 ui.horizontal(|ui| {
                     if ui.button("Export...").clicked() {
-                        self.export_vhd_popup = false;
-                        self.start_export_vhd(devices, log);
+                        self.export_popup = false;
+                        self.start_export(devices, log);
                     }
                     if ui.button("Cancel").clicked() {
-                        self.export_vhd_popup = false;
+                        self.export_popup = false;
                     }
                 });
             });
     }
 
-    fn start_export_vhd(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {
+    fn start_export(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {
+        let format = self.export_format;
+        let ext = format.extension();
+        let format_desc = format.description();
+
         // Collect partition sizing info
         let size_map: HashMap<usize, u64> = self
             .export_partition_configs
@@ -667,9 +1356,10 @@ impl InspectTab {
 
         if self.export_whole_disk {
             // Pick a single file destination
+            let (filter_label, filter_exts) = format.dialog_filter();
             let dialog = super::file_dialog()
-                .set_file_name("disk.vhd")
-                .add_filter("VHD Files", &["vhd", "hda"]);
+                .set_file_name(format.default_filename("disk"))
+                .add_filter(filter_label, filter_exts);
             let dest = match dialog.save_file() {
                 Some(p) => p,
                 None => return,
@@ -689,14 +1379,16 @@ impl InspectTab {
                 self.export_status = Some(Arc::clone(&status));
 
                 log.info(format!(
-                    "Exporting Clonezilla image as whole-disk VHD to {}...",
+                    "Exporting Clonezilla image as whole-disk {} to {}...",
+                    format_desc,
                     dest.display()
                 ));
 
                 std::thread::spawn(move || {
                     let status2 = Arc::clone(&status);
                     let status3 = Arc::clone(&status);
-                    let result = rusty_backup::rbformats::vhd::export_clonezilla_disk_vhd(
+                    let result = rusty_backup::rbformats::export::export_clonezilla_disk(
+                        format,
                         &cz_image,
                         &source,
                         &dest,
@@ -744,12 +1436,17 @@ impl InspectTab {
                 let status = new_status();
                 self.export_status = Some(Arc::clone(&status));
 
-                log.info(format!("Exporting whole-disk VHD to {}...", dest.display()));
+                log.info(format!(
+                    "Exporting whole-disk {} to {}...",
+                    format_desc,
+                    dest.display()
+                ));
 
                 std::thread::spawn(move || {
                     let status2 = Arc::clone(&status);
                     let status3 = Arc::clone(&status);
-                    let result = export_whole_disk_vhd(
+                    let result = rusty_backup::rbformats::export::export_whole_disk(
+                        format,
                         &source,
                         meta.as_ref(),
                         None,
@@ -796,7 +1493,8 @@ impl InspectTab {
             self.export_status = Some(Arc::clone(&status));
 
             log.info(format!(
-                "Exporting per-partition VHDs to {}...",
+                "Exporting per-partition {} files to {}...",
+                format_desc,
                 dest_folder.display()
             ));
 
@@ -819,7 +1517,7 @@ impl InspectTab {
                                 .copied()
                                 .unwrap_or(cz_part.size_bytes());
                             let dest_path =
-                                dest_folder.join(format!("partition-{}.vhd", cz_part.index));
+                                dest_folder.join(format!("partition-{}.{}", cz_part.index, ext));
 
                             if let Ok(mut s) = status.lock() {
                                 s.log_messages.push(format!(
@@ -833,7 +1531,8 @@ impl InspectTab {
                             let base_written = overall_written;
                             let status_progress = Arc::clone(&status);
                             let status_cancel = Arc::clone(&status);
-                            rusty_backup::rbformats::vhd::export_clonezilla_partition_vhd(
+                            rusty_backup::rbformats::export::export_clonezilla_partition(
+                                format,
                                 &cz_part.partclone_files,
                                 &dest_path,
                                 Some(export_size),
@@ -873,7 +1572,8 @@ impl InspectTab {
                                 .unwrap_or(pm.original_size_bytes);
                             let data_file = &pm.compressed_files[0];
                             let data_path = folder.join(data_file);
-                            let dest_path = dest_folder.join(format!("partition-{}.vhd", pm.index));
+                            let dest_path =
+                                dest_folder.join(format!("partition-{}.{}", pm.index, ext));
 
                             if let Ok(mut s) = status.lock() {
                                 s.log_messages.push(format!(
@@ -887,7 +1587,8 @@ impl InspectTab {
                             let base_written = overall_written;
                             let status_progress = Arc::clone(&status);
                             let status_cancel = Arc::clone(&status);
-                            export_partition_vhd(
+                            rusty_backup::rbformats::export::export_partition(
+                                format,
                                 &data_path,
                                 &meta.compression_type,
                                 &dest_path,
@@ -941,7 +1642,7 @@ impl InspectTab {
                                 .copied()
                                 .unwrap_or(part.size_bytes);
                             let dest_path =
-                                dest_folder.join(format!("partition-{}.vhd", part.index));
+                                dest_folder.join(format!("partition-{}.{}", part.index, ext));
                             let offset = part.start_lba * 512;
 
                             if let Ok(mut s) = status.lock() {
@@ -953,9 +1654,7 @@ impl InspectTab {
                                 ));
                             }
 
-                            // Extract partition data to VHD
-                            // Read at most the original partition size from the source
-                            // to avoid reading into adjacent partitions or the VHD footer
+                            // Extract partition data
                             let read_limit = export_size.min(part.size_bytes);
                             let file = std::fs::File::open(image_path)?;
                             let mut reader = std::io::BufReader::new(file);
@@ -964,6 +1663,14 @@ impl InspectTab {
 
                             let mut writer =
                                 std::io::BufWriter::new(std::fs::File::create(&dest_path)?);
+
+                            // Write format header (2MG only)
+                            if format == ExportFormat::TwoMg {
+                                let hdr =
+                                    rusty_backup::rbformats::twomg::build_twomg_header(export_size);
+                                writer.write_all(&hdr)?;
+                            }
+
                             let mut buf = vec![0u8; 256 * 1024];
                             let mut total: u64 = 0;
                             let base_written = overall_written;
@@ -999,9 +1706,11 @@ impl InspectTab {
                             // Resize FAT filesystem if the partition size changed
                             if export_size != part.size_bytes {
                                 let new_sectors = (export_size / 512) as u32;
+                                // For 2MG, data starts at offset 64
+                                let fs_offset = if format == ExportFormat::TwoMg { 64 } else { 0 };
                                 resize_fat_in_place(
                                     writer.get_mut(),
-                                    0,
+                                    fs_offset,
                                     new_sectors,
                                     &mut |msg| {
                                         if let Ok(mut s) = status.lock() {
@@ -1009,13 +1718,20 @@ impl InspectTab {
                                         }
                                     },
                                 )?;
-                                // Seek back to end for footer append
-                                writer.seek(std::io::SeekFrom::Start(total))?;
+                                // Seek back to end
+                                let end = if format == ExportFormat::TwoMg {
+                                    64 + total
+                                } else {
+                                    total
+                                };
+                                writer.seek(std::io::SeekFrom::Start(end))?;
                             }
 
-                            // Append VHD footer
-                            let footer = build_vhd_footer(total);
-                            writer.write_all(&footer)?;
+                            // Append format footer (VHD only)
+                            if format == ExportFormat::Vhd {
+                                let footer = build_vhd_footer(total);
+                                writer.write_all(&footer)?;
+                            }
                             writer.flush()?;
 
                             overall_written += export_size;
@@ -1093,9 +1809,9 @@ impl InspectTab {
 
         if status.finished {
             if let Some(err) = &status.error {
-                log.error(format!("VHD export failed: {err}"));
+                log.error(format!("Export failed: {err}"));
             } else {
-                log.info("VHD export completed successfully.");
+                log.info("Export completed successfully.");
             }
             drop(status);
             self.export_status = None;
@@ -1385,8 +2101,6 @@ impl InspectTab {
 
             set_step("Reading partition table...");
 
-            let file_size = device_file.metadata().map(|m| m.len()).unwrap_or(0);
-
             // Clone for the BufReader; keep `device_file` for additional clones.
             let mut reader = match device_file.try_clone() {
                 Ok(f) => BufReader::new(f),
@@ -1396,34 +2110,42 @@ impl InspectTab {
                 }
             };
 
-            // Detect VHD: check if the last 512 bytes contain the "conectix" cookie
-            let data_size = if file_size >= 512 {
-                if let Ok(mut f) = device_file.try_clone() {
-                    if f.seek(SeekFrom::End(-512)).is_ok() {
-                        let mut cookie = [0u8; 8];
-                        if f.read_exact(&mut cookie).is_ok() && &cookie == VHD_COOKIE {
-                            let ds = file_size - 512;
-                            push_log(format!("Detected Fixed VHD (data: {} bytes)", ds));
-                            Some(ds)
-                        } else {
-                            None
+            // Detect image format (VHD, 2MG, DMG, or raw)
+            let is_device = path.to_string_lossy().starts_with("/dev/")
+                || path.to_string_lossy().starts_with("\\\\.\\");
+
+            let detect_result = if !is_device {
+                // For image files, use unified format detection
+                match device_file.try_clone() {
+                    Ok(clone) => match rusty_backup::rbformats::detect_image_format(clone) {
+                        Ok(format) => {
+                            let desc = format.description();
+                            push_log(format!("Detected format: {}", desc));
+                            match rusty_backup::rbformats::wrap_image_reader(
+                                device_file.try_clone().unwrap_or_else(|_| {
+                                    std::fs::File::open(&path).expect("reopen failed")
+                                }),
+                                format,
+                            ) {
+                                Ok((mut wrapped_reader, _data_size)) => {
+                                    PartitionTable::detect(&mut wrapped_reader)
+                                }
+                                Err(e) => {
+                                    push_log(format!("Format wrap failed, trying raw: {e}"));
+                                    let _ = reader.seek(SeekFrom::Start(0));
+                                    PartitionTable::detect(&mut reader)
+                                }
+                            }
                         }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
+                        Err(e) => {
+                            push_log(format!("Format detection failed, trying raw: {e}"));
+                            PartitionTable::detect(&mut reader)
+                        }
+                    },
+                    Err(_) => PartitionTable::detect(&mut reader),
                 }
             } else {
-                None
-            };
-
-            // Use a limited reader if VHD was detected
-            let detect_result = if let Some(ds) = data_size {
-                let _ = reader.seek(SeekFrom::Start(0));
-                let mut limited = reader.take(ds);
-                PartitionTable::detect(&mut limited)
-            } else {
+                // Device path — always treat as raw
                 PartitionTable::detect(&mut reader)
             };
 
