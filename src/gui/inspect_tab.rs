@@ -92,6 +92,8 @@ pub struct InspectTab {
     editor_add_size_mb: String,
     editor_add_type: String,
     editor_add_bootable: bool,
+    /// Resize popup (in-place partition resizing)
+    resize_popup: Option<Box<super::resize_popup::ResizePopup>>,
 }
 
 /// Working copy of a partition entry in the editor.
@@ -256,6 +258,7 @@ impl Default for InspectTab {
             editor_add_size_mb: String::new(),
             editor_add_type: String::new(),
             editor_add_bootable: false,
+            resize_popup: None,
         }
     }
 }
@@ -440,6 +443,18 @@ impl InspectTab {
                 self.init_editor();
             }
 
+            // Resize Partitions button — same conditions as Edit Partition Table
+            let resize_running = self.resize_popup.as_ref().is_some_and(|p| p.is_running());
+            if ui
+                .add_enabled(
+                    is_editable_source && !export_running && !resize_running,
+                    egui::Button::new("Resize Partitions..."),
+                )
+                .clicked()
+            {
+                self.init_resize_popup(devices);
+            }
+
             if export_running {
                 if ui.button("Cancel Export").clicked() {
                     if let Some(ref status_arc) = self.export_status {
@@ -493,6 +508,14 @@ impl InspectTab {
         // Editor popup
         if self.editor_popup {
             self.show_editor_popup(ui, devices, log);
+        }
+
+        // Resize popup
+        if let Some(ref mut popup) = self.resize_popup {
+            popup.poll_status(log);
+            if !popup.show(ui, devices, log) {
+                self.resize_popup = None;
+            }
         }
 
         ui.add_space(12.0);
@@ -616,6 +639,49 @@ impl InspectTab {
             .unwrap_or(0);
 
         self.editor_popup = true;
+    }
+
+    fn init_resize_popup(&mut self, devices: &[DiskDevice]) {
+        let table = match &self.partition_table {
+            Some(t) => t.clone(),
+            None => return,
+        };
+
+        let source_path = self.image_file_path.clone().or_else(|| {
+            self.selected_device_idx
+                .and_then(|idx| devices.get(idx))
+                .map(|d| d.path.clone())
+        });
+        let path = match source_path {
+            Some(p) => p,
+            None => return,
+        };
+
+        let is_device = self.selected_device_idx.is_some();
+
+        // Determine disk size
+        let disk_size = self
+            .partitions
+            .iter()
+            .map(|p| (p.start_lba * 512) + p.size_bytes)
+            .max()
+            .unwrap_or(0);
+
+        let alignment_sectors = self
+            .alignment
+            .as_ref()
+            .map(|a| a.alignment_sectors)
+            .unwrap_or(0);
+
+        self.resize_popup = Some(Box::new(super::resize_popup::ResizePopup::new(
+            &self.partitions,
+            table,
+            &self.partition_min_sizes,
+            alignment_sectors,
+            disk_size,
+            is_device,
+            path,
+        )));
     }
 
     fn show_editor_popup(&mut self, ui: &mut egui::Ui, devices: &[DiskDevice], log: &mut LogPanel) {

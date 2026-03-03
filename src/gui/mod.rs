@@ -4,6 +4,7 @@ mod elevation_dialog;
 mod inspect_tab;
 mod optical_tab;
 mod progress;
+mod resize_popup;
 mod restore_tab;
 mod settings_dialog;
 
