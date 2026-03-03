@@ -11,6 +11,7 @@ use rusty_backup::clonezilla;
 use rusty_backup::clonezilla::metadata::ClonezillaImage;
 use rusty_backup::device::DiskDevice;
 use rusty_backup::fs::fat::resize_fat_in_place;
+use rusty_backup::partition::editor::{self as pt_editor, PartitionTableEdit};
 use rusty_backup::partition::PartitionSizeOverride;
 use rusty_backup::partition::{
     self, detect_alignment, PartitionAlignment, PartitionInfo, PartitionTable,
@@ -74,6 +75,68 @@ pub struct InspectTab {
     open_device_file: Option<Arc<File>>,
     /// Guard that keeps the DiskClaim (and any temp file) alive while browsing.
     open_device_guard: Option<rusty_backup::os::TempFileGuard>,
+    /// Partition table editor popup
+    editor_popup: bool,
+    /// Editor: working copy of partition entries (editable)
+    editor_entries: Vec<EditorEntry>,
+    /// Editor: pending edits to apply
+    editor_edits: Vec<PartitionTableEdit>,
+    /// Editor: validation errors/warnings
+    editor_errors: Vec<String>,
+    /// Editor: disk size in bytes for validation
+    editor_disk_size: u64,
+    /// Editor: status message after apply
+    editor_status: Option<String>,
+    /// Editor: add-partition fields
+    editor_add_start_lba: String,
+    editor_add_size_mb: String,
+    editor_add_type: String,
+    editor_add_bootable: bool,
+}
+
+/// Working copy of a partition entry in the editor.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct EditorEntry {
+    index: usize,
+    type_name: String,
+    partition_type_byte: u8,
+    partition_type_string: Option<String>,
+    start_lba: u64,
+    size_bytes: u64,
+    bootable: bool,
+    is_logical: bool,
+    is_extended_container: bool,
+    /// User-edited size text (in MiB)
+    size_text: String,
+    /// User-edited type text (hex for MBR, string for APM, GUID for GPT)
+    type_text: String,
+    /// Marked for deletion
+    deleted: bool,
+}
+
+impl EditorEntry {
+    fn from_partition(p: &PartitionInfo) -> Self {
+        let size_mib = p.size_bytes as f64 / (1024.0 * 1024.0);
+        Self {
+            index: p.index,
+            type_name: p.type_name.clone(),
+            partition_type_byte: p.partition_type_byte,
+            partition_type_string: p.partition_type_string.clone(),
+            start_lba: p.start_lba,
+            size_bytes: p.size_bytes,
+            bootable: p.bootable,
+            is_logical: p.is_logical,
+            is_extended_container: p.is_extended_container,
+            size_text: format!("{:.2}", size_mib),
+            type_text: if let Some(ref ts) = p.partition_type_string {
+                ts.clone()
+            } else {
+                format!("{:02X}", p.partition_type_byte)
+            },
+            deleted: false,
+        }
+    }
 }
 
 /// Status of a background VHD export operation.
@@ -183,6 +246,16 @@ impl Default for InspectTab {
             inspect_status: None,
             open_device_file: None,
             open_device_guard: None,
+            editor_popup: false,
+            editor_entries: Vec::new(),
+            editor_edits: Vec::new(),
+            editor_errors: Vec::new(),
+            editor_disk_size: 0,
+            editor_status: None,
+            editor_add_start_lba: String::new(),
+            editor_add_size_mb: String::new(),
+            editor_add_type: String::new(),
+            editor_add_bootable: false,
         }
     }
 }
@@ -349,6 +422,24 @@ impl InspectTab {
                 self.export_popup = true;
             }
 
+            // Edit Partition Table button — only for devices and image files (not backups)
+            let is_editable_source = self.partition_table.is_some()
+                && self.backup_folder_path.is_none()
+                && self.clonezilla_image.is_none()
+                && !matches!(
+                    self.partition_table.as_ref(),
+                    Some(PartitionTable::None { .. })
+                );
+            if ui
+                .add_enabled(
+                    is_editable_source && !export_running,
+                    egui::Button::new("Edit Partition Table..."),
+                )
+                .clicked()
+            {
+                self.init_editor();
+            }
+
             if export_running {
                 if ui.button("Cancel Export").clicked() {
                     if let Some(ref status_arc) = self.export_status {
@@ -397,6 +488,11 @@ impl InspectTab {
         // Export popup
         if self.export_popup {
             self.show_export_popup(ui, devices, log);
+        }
+
+        // Editor popup
+        if self.editor_popup {
+            self.show_editor_popup(ui, devices, log);
         }
 
         ui.add_space(12.0);
@@ -494,6 +590,514 @@ impl InspectTab {
         if self.browse_view.is_active() {
             //ui.add_space(4.0);
             self.browse_view.show(ui);
+        }
+    }
+
+    fn init_editor(&mut self) {
+        self.editor_entries = self
+            .partitions
+            .iter()
+            .map(EditorEntry::from_partition)
+            .collect();
+        self.editor_edits.clear();
+        self.editor_errors.clear();
+        self.editor_status = None;
+        self.editor_add_start_lba = String::new();
+        self.editor_add_size_mb = String::new();
+        self.editor_add_type = String::new();
+        self.editor_add_bootable = false;
+
+        // Determine disk size
+        self.editor_disk_size = self
+            .partitions
+            .iter()
+            .map(|p| (p.start_lba * 512) + p.size_bytes)
+            .max()
+            .unwrap_or(0);
+
+        self.editor_popup = true;
+    }
+
+    fn show_editor_popup(&mut self, ui: &mut egui::Ui, devices: &[DiskDevice], log: &mut LogPanel) {
+        let mut open = true;
+        let mut apply_requested = false;
+
+        let table_type = match &self.partition_table {
+            Some(PartitionTable::Mbr(_)) => "MBR",
+            Some(PartitionTable::Gpt { .. }) => "GPT",
+            Some(PartitionTable::Apm(_)) => "APM",
+            _ => "Unknown",
+        };
+
+        egui::Window::new("Edit Partition Table")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(700.0)
+            .show(ui.ctx(), |ui| {
+                ui.label(format!("Table type: {}", table_type));
+                ui.add_space(4.0);
+
+                // Partition entry grid
+                egui::Grid::new("editor_grid")
+                    .striped(true)
+                    .min_col_width(50.0)
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("#").strong());
+                        ui.label(egui::RichText::new("Type").strong());
+                        ui.label(egui::RichText::new("Start LBA").strong());
+                        ui.label(egui::RichText::new("Size (MiB)").strong());
+                        ui.label(egui::RichText::new("Boot").strong());
+                        ui.label(egui::RichText::new("").strong());
+                        ui.end_row();
+
+                        for i in 0..self.editor_entries.len() {
+                            // Copy values we need for display to avoid holding
+                            // an immutable borrow across mutable TextEdit borrows.
+                            let idx = self.editor_entries[i].index;
+                            let deleted = self.editor_entries[i].deleted;
+                            let is_ext = self.editor_entries[i].is_extended_container;
+                            let is_logical = self.editor_entries[i].is_logical;
+                            let start_lba = self.editor_entries[i].start_lba;
+                            let size_bytes = self.editor_entries[i].size_bytes;
+                            let bootable = self.editor_entries[i].bootable;
+                            let type_name = self.editor_entries[i].type_name.clone();
+
+                            if deleted {
+                                ui.label(
+                                    egui::RichText::new(format!("{}", idx))
+                                        .color(egui::Color32::GRAY)
+                                        .strikethrough(),
+                                );
+                                ui.label(
+                                    egui::RichText::new(&type_name)
+                                        .color(egui::Color32::GRAY)
+                                        .strikethrough(),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!("{}", start_lba))
+                                        .color(egui::Color32::GRAY),
+                                );
+                                ui.label(egui::RichText::new("deleted").color(egui::Color32::GRAY));
+                                ui.label("");
+                                if ui.small_button("Undo").clicked() {
+                                    self.editor_entries[i].deleted = false;
+                                }
+                                ui.end_row();
+                                continue;
+                            }
+
+                            if is_ext {
+                                ui.label(
+                                    egui::RichText::new(format!("{} (ext)", idx))
+                                        .color(egui::Color32::GRAY),
+                                );
+                                ui.label(
+                                    egui::RichText::new(&type_name).color(egui::Color32::GRAY),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!("{}", start_lba))
+                                        .color(egui::Color32::GRAY),
+                                );
+                                let size_mib = size_bytes as f64 / (1024.0 * 1024.0);
+                                ui.label(
+                                    egui::RichText::new(format!("{:.2}", size_mib))
+                                        .color(egui::Color32::GRAY),
+                                );
+                                ui.label("");
+                                ui.label("");
+                                ui.end_row();
+                                continue;
+                            }
+
+                            let label = if is_logical {
+                                format!("  {}", idx)
+                            } else {
+                                format!("{}", idx)
+                            };
+                            ui.label(label);
+
+                            // Type field (editable)
+                            let type_id = format!("ed_type_{}", i);
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.editor_entries[i].type_text)
+                                    .desired_width(100.0)
+                                    .id(egui::Id::new(&type_id)),
+                            );
+
+                            // Start LBA (read-only)
+                            ui.label(format!("{}", start_lba));
+
+                            // Size (MiB) - editable
+                            let size_id = format!("ed_size_{}", i);
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.editor_entries[i].size_text)
+                                    .desired_width(80.0)
+                                    .id(egui::Id::new(&size_id)),
+                            );
+
+                            // Bootable checkbox (MBR only)
+                            if table_type == "MBR" {
+                                ui.checkbox(&mut self.editor_entries[i].bootable, "");
+                            } else {
+                                ui.label(if bootable { "Yes" } else { "" });
+                            }
+
+                            // Delete button
+                            if !is_logical {
+                                if ui
+                                    .small_button("Delete")
+                                    .on_hover_text("Mark partition for deletion")
+                                    .clicked()
+                                {
+                                    self.editor_entries[i].deleted = true;
+                                }
+                            } else {
+                                ui.label("");
+                            }
+
+                            ui.end_row();
+                        }
+                    });
+
+                ui.add_space(8.0);
+
+                // Add partition section
+                ui.collapsing("Add Partition", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Start LBA:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.editor_add_start_lba)
+                                .desired_width(80.0),
+                        );
+                        ui.label("Size (MiB):");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.editor_add_size_mb)
+                                .desired_width(80.0),
+                        );
+                        ui.label("Type:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.editor_add_type)
+                                .desired_width(80.0),
+                        );
+                        if table_type == "MBR" {
+                            ui.checkbox(&mut self.editor_add_bootable, "Bootable");
+                        }
+                        if ui.button("Add").clicked() {
+                            // Parse and add
+                            if let (Ok(start), Ok(size_mib)) = (
+                                self.editor_add_start_lba.trim().parse::<u64>(),
+                                self.editor_add_size_mb.trim().parse::<f64>(),
+                            ) {
+                                let size_bytes = (size_mib * 1024.0 * 1024.0) as u64;
+                                let type_byte = u8::from_str_radix(
+                                    self.editor_add_type.trim().trim_start_matches("0x"),
+                                    16,
+                                )
+                                .unwrap_or(0x83);
+                                let next_idx = self
+                                    .editor_entries
+                                    .iter()
+                                    .map(|e| e.index)
+                                    .max()
+                                    .unwrap_or(0)
+                                    + 1;
+                                let type_string = if table_type != "MBR" {
+                                    Some(self.editor_add_type.trim().to_string())
+                                } else {
+                                    None
+                                };
+                                self.editor_entries.push(EditorEntry {
+                                    index: next_idx,
+                                    type_name: format!("0x{:02X}", type_byte),
+                                    partition_type_byte: type_byte,
+                                    partition_type_string: type_string,
+                                    start_lba: start,
+                                    size_bytes,
+                                    bootable: self.editor_add_bootable,
+                                    is_logical: false,
+                                    is_extended_container: false,
+                                    size_text: format!("{:.2}", size_mib),
+                                    type_text: self.editor_add_type.trim().to_string(),
+                                    deleted: false,
+                                });
+                                self.editor_add_start_lba.clear();
+                                self.editor_add_size_mb.clear();
+                                self.editor_add_type.clear();
+                                self.editor_add_bootable = false;
+                            }
+                        }
+                    });
+                });
+
+                ui.add_space(8.0);
+
+                // Show validation errors
+                for err in &self.editor_errors {
+                    ui.colored_label(egui::Color32::from_rgb(255, 100, 100), err);
+                }
+
+                // Show status
+                if let Some(status) = &self.editor_status {
+                    ui.colored_label(egui::Color32::from_rgb(100, 255, 100), status);
+                }
+
+                ui.add_space(4.0);
+
+                // Action buttons
+                ui.horizontal(|ui| {
+                    if ui.button("Validate").clicked() {
+                        self.build_and_validate_edits();
+                    }
+
+                    let can_apply = self.editor_errors.is_empty()
+                        && self.partition_table.is_some()
+                        && self.backup_folder_path.is_none();
+                    if ui
+                        .add_enabled(can_apply, egui::Button::new("Apply Changes"))
+                        .clicked()
+                    {
+                        // Build edits first
+                        self.build_and_validate_edits();
+                        if self.editor_errors.is_empty() && !self.editor_edits.is_empty() {
+                            apply_requested = true;
+                        }
+                    }
+
+                    if ui.button("Cancel").clicked() {
+                        self.editor_popup = false;
+                    }
+                });
+            });
+
+        if !open {
+            self.editor_popup = false;
+        }
+
+        if apply_requested {
+            self.apply_editor_changes(devices, log);
+        }
+    }
+
+    /// Build the list of edits from the editor state and validate them.
+    fn build_and_validate_edits(&mut self) {
+        self.editor_edits.clear();
+        self.editor_errors.clear();
+        self.editor_status = None;
+
+        let table = match &self.partition_table {
+            Some(t) => t,
+            None => return,
+        };
+        let orig_partitions = table.partitions();
+
+        // Process existing entries: detect changes
+        for entry in &self.editor_entries {
+            // Find original
+            let orig = orig_partitions.iter().find(|p| p.index == entry.index);
+
+            if entry.deleted {
+                if orig.is_some() {
+                    self.editor_edits
+                        .push(PartitionTableEdit::DeleteEntry { index: entry.index });
+                }
+                continue;
+            }
+
+            if let Some(orig) = orig {
+                // Check size change
+                let new_size_mib: f64 = entry.size_text.trim().parse().unwrap_or(-1.0);
+                if new_size_mib > 0.0 {
+                    let new_size_bytes = (new_size_mib * 1024.0 * 1024.0) as u64;
+                    // Round to sector boundary
+                    let new_size_bytes = (new_size_bytes / 512) * 512;
+                    if new_size_bytes != orig.size_bytes {
+                        self.editor_edits.push(PartitionTableEdit::ResizeEntry {
+                            index: entry.index,
+                            new_size_bytes,
+                        });
+                    }
+                } else {
+                    self.editor_errors.push(format!(
+                        "Invalid size for partition {}: '{}'",
+                        entry.index, entry.size_text
+                    ));
+                }
+
+                // Check type change
+                let type_changed = match table {
+                    PartitionTable::Mbr(_) => {
+                        let new_byte =
+                            u8::from_str_radix(entry.type_text.trim().trim_start_matches("0x"), 16);
+                        match new_byte {
+                            Ok(b) if b != orig.partition_type_byte => {
+                                self.editor_edits.push(PartitionTableEdit::ChangeType {
+                                    index: entry.index,
+                                    new_type_byte: b,
+                                    new_type_string: None,
+                                });
+                                true
+                            }
+                            Err(_) => {
+                                self.editor_errors.push(format!(
+                                    "Invalid hex type for partition {}: '{}'",
+                                    entry.index, entry.type_text
+                                ));
+                                false
+                            }
+                            _ => false,
+                        }
+                    }
+                    PartitionTable::Gpt { .. } => {
+                        // GPT type is a GUID string
+                        if entry.type_text.trim()
+                            != orig.partition_type_string.as_deref().unwrap_or("")
+                        {
+                            self.editor_edits.push(PartitionTableEdit::ChangeType {
+                                index: entry.index,
+                                new_type_byte: 0,
+                                new_type_string: Some(entry.type_text.trim().to_string()),
+                            });
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    PartitionTable::Apm(_) => {
+                        if entry.type_text.trim()
+                            != orig.partition_type_string.as_deref().unwrap_or("")
+                        {
+                            self.editor_edits.push(PartitionTableEdit::ChangeType {
+                                index: entry.index,
+                                new_type_byte: 0,
+                                new_type_string: Some(entry.type_text.trim().to_string()),
+                            });
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                };
+                let _ = type_changed; // suppress unused warning
+            } else {
+                // New entry added via the editor
+                let type_byte =
+                    u8::from_str_radix(entry.type_text.trim().trim_start_matches("0x"), 16)
+                        .unwrap_or(0x83);
+                let type_string = if entry.partition_type_string.is_some() {
+                    Some(entry.type_text.trim().to_string())
+                } else {
+                    None
+                };
+                self.editor_edits.push(PartitionTableEdit::AddEntry {
+                    start_lba: entry.start_lba,
+                    size_bytes: entry.size_bytes,
+                    partition_type: type_byte,
+                    type_string,
+                    bootable: entry.bootable,
+                });
+            }
+        }
+
+        // Validate
+        if self.editor_errors.is_empty() {
+            match pt_editor::validate_edits(table, &self.editor_edits, self.editor_disk_size) {
+                Ok(warnings) => {
+                    for w in warnings {
+                        self.editor_errors.push(format!("Warning: {}", w));
+                    }
+                    if self.editor_edits.is_empty() {
+                        self.editor_status = Some("No changes detected.".to_string());
+                    } else {
+                        self.editor_status = Some(format!(
+                            "Validation OK — {} edit(s) ready to apply.",
+                            self.editor_edits.len()
+                        ));
+                    }
+                }
+                Err(e) => {
+                    self.editor_errors.push(format!("Validation error: {}", e));
+                }
+            }
+        }
+    }
+
+    fn apply_editor_changes(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {
+        let table = match &self.partition_table {
+            Some(t) => t.clone(),
+            None => {
+                log.error("No partition table loaded");
+                return;
+            }
+        };
+
+        let source_path = self.image_file_path.clone().or_else(|| {
+            self.selected_device_idx
+                .and_then(|idx| devices.get(idx))
+                .map(|d| d.path.clone())
+        });
+
+        let path = match source_path {
+            Some(p) => p,
+            None => {
+                log.error("No source path for editing");
+                return;
+            }
+        };
+
+        let edits = self.editor_edits.clone();
+        let disk_size = self.editor_disk_size;
+
+        // For devices, we need write access
+        let is_device = self.selected_device_idx.is_some();
+
+        log.info(format!(
+            "Applying {} partition table edit(s) to {}...",
+            edits.len(),
+            path.display()
+        ));
+
+        let result = if is_device {
+            use rusty_backup::os::open_target_for_writing;
+            match open_target_for_writing(&path) {
+                Ok(mut handle) => pt_editor::apply_edits(
+                    &mut handle.file,
+                    &table,
+                    &edits,
+                    disk_size,
+                    &mut |msg| log.info(msg),
+                ),
+                Err(e) => Err(e),
+            }
+        } else {
+            // Image file — open for read+write
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    pt_editor::apply_edits(&mut file, &table, &edits, disk_size, &mut |msg| {
+                        log.info(msg)
+                    })
+                }
+                Err(e) => Err(e.into()),
+            }
+        };
+
+        match result {
+            Ok(()) => {
+                log.info("Partition table updated successfully.");
+                self.editor_status = Some(
+                    "Changes applied successfully! Close and re-inspect to see updates."
+                        .to_string(),
+                );
+                self.editor_edits.clear();
+            }
+            Err(e) => {
+                log.error(format!("Failed to apply edits: {:#}", e));
+                self.editor_status = Some(format!("Error: {:#}", e));
+            }
         }
     }
 

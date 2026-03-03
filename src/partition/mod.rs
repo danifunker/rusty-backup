@@ -1,4 +1,5 @@
 pub mod apm;
+pub mod editor;
 pub mod gpt;
 pub mod mbr;
 

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
@@ -31,6 +32,8 @@ pub struct BackupTab {
     backup_progress: Option<Arc<Mutex<BackupProgress>>>,
     /// Auto-loaded partition info for the selected source
     source_partitions: Vec<PartitionInfo>,
+    /// Which partitions are selected for backup (by partition index)
+    selected_partitions: HashSet<usize>,
     /// Minimum sizes per partition (indexed by partition index), from filesystem analysis
     partition_min_sizes: std::collections::HashMap<usize, u64>,
     partition_load_error: Option<String>,
@@ -101,6 +104,7 @@ impl Default for BackupTab {
             backup_running: false,
             backup_progress: None,
             source_partitions: Vec::new(),
+            selected_partitions: HashSet::new(),
             partition_min_sizes: std::collections::HashMap::new(),
             partition_load_error: None,
             prev_device_idx: None,
@@ -207,20 +211,42 @@ impl BackupTab {
             }
         }
 
-        // Show partition preview if loaded
+        // Show partition selection checkboxes
         if !self.source_partitions.is_empty() {
             ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
+            ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Partitions:").strong());
+                ui.add_enabled_ui(controls_enabled, |ui| {
+                    if ui.small_button("All").clicked() {
+                        for part in &self.source_partitions {
+                            if !part.is_extended_container {
+                                self.selected_partitions.insert(part.index);
+                            }
+                        }
+                    }
+                    if ui.small_button("None").clicked() {
+                        self.selected_partitions.clear();
+                    }
+                });
+            });
+            ui.add_enabled_ui(controls_enabled, |ui| {
                 for part in &self.source_partitions {
-                    if !part.is_extended_container {
-                        let label = format!(
-                            "#{}: {} ({})",
-                            part.index,
-                            part.type_name,
-                            partition::format_size(part.size_bytes),
-                        );
-                        ui.label(&label);
+                    if part.is_extended_container {
+                        continue;
+                    }
+                    let mut selected = self.selected_partitions.contains(&part.index);
+                    let label = format!(
+                        "#{}: {} ({})",
+                        part.index,
+                        part.type_name,
+                        partition::format_size(part.size_bytes),
+                    );
+                    if ui.checkbox(&mut selected, label).changed() {
+                        if selected {
+                            self.selected_partitions.insert(part.index);
+                        } else {
+                            self.selected_partitions.remove(&part.index);
+                        }
                     }
                 }
             });
@@ -342,8 +368,12 @@ impl BackupTab {
             if !self.backup_running && !vhd_exporting {
                 let has_source =
                     self.selected_device_idx.is_some() || self.image_file_path.is_some();
-                let can_start =
-                    has_source && self.destination_folder.is_some() && !self.backup_name.is_empty();
+                let has_partitions =
+                    self.source_partitions.is_empty() || !self.selected_partitions.is_empty();
+                let can_start = has_source
+                    && self.destination_folder.is_some()
+                    && !self.backup_name.is_empty()
+                    && has_partitions;
 
                 if ui
                     .add_enabled(can_start, egui::Button::new("Start Backup"))
@@ -632,6 +662,7 @@ impl BackupTab {
     /// For devices, this uses OS-level elevation (may prompt for credentials).
     fn scan_source_partitions(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {
         self.source_partitions.clear();
+        self.selected_partitions.clear();
         self.partition_min_sizes.clear();
         self.partition_load_error = None;
 
@@ -682,6 +713,7 @@ impl BackupTab {
                     }
                 }
                 self.source_partitions = table.partitions();
+                self.select_all_partitions();
                 let table_desc = if matches!(table, PartitionTable::None { .. }) {
                     "No partition table (superfloppy)".to_string()
                 } else {
@@ -727,6 +759,7 @@ impl BackupTab {
 
     fn load_partition_preview(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {
         self.source_partitions.clear();
+        self.selected_partitions.clear();
         self.partition_load_error = None;
 
         let path = match self.source_path(devices) {
@@ -783,6 +816,7 @@ impl BackupTab {
                 match detect_result {
                     Ok(table) => {
                         self.source_partitions = table.partitions();
+                        self.select_all_partitions();
                         let table_desc = if matches!(table, PartitionTable::None { .. }) {
                             "No partition table (superfloppy)".to_string()
                         } else {
@@ -802,6 +836,16 @@ impl BackupTab {
             }
             Err(e) => {
                 self.partition_load_error = Some(format!("Cannot open source: {e}"));
+            }
+        }
+    }
+
+    /// Select all non-extended partitions for backup (called after partition list loads).
+    fn select_all_partitions(&mut self) {
+        self.selected_partitions.clear();
+        for part in &self.source_partitions {
+            if !part.is_extended_container {
+                self.selected_partitions.insert(part.index);
             }
         }
     }
@@ -855,6 +899,18 @@ impl BackupTab {
             }
         };
 
+        let partition_filter = if self.selected_partitions.len()
+            < self
+                .source_partitions
+                .iter()
+                .filter(|p| !p.is_extended_container)
+                .count()
+        {
+            Some(self.selected_partitions.iter().copied().collect())
+        } else {
+            None // All selected — no filter needed
+        };
+
         let config = BackupConfig {
             source_path,
             destination_dir,
@@ -868,6 +924,7 @@ impl BackupTab {
                 None
             },
             sector_by_sector: self.sector_by_sector,
+            partition_filter,
         };
 
         let progress_arc = Arc::new(Mutex::new(BackupProgress::new()));
