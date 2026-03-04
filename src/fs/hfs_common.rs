@@ -351,61 +351,49 @@ where
         return Err(FilesystemError::InvalidData("B-tree node full".into()));
     }
 
-    // Find insertion position by comparing keys
-    let mut insert_pos = num_records; // default: append at end
+    // Collect all existing records
+    let mut records: Vec<Vec<u8>> = Vec::with_capacity(num_records + 1);
     for i in 0..num_records {
         let (rec_start, rec_end) = btree_record_range(node, node_size, i);
-        if rec_start >= rec_end || rec_end > node_size {
-            continue;
+        if rec_start < rec_end && rec_end <= node_size {
+            records.push(node[rec_start..rec_end].to_vec());
         }
-        let existing_key = &node[rec_start..rec_end];
-        if compare_fn(existing_key, key_record_bytes) == Ordering::Greater {
+    }
+
+    // Find insertion position by comparing keys
+    let mut insert_pos = records.len();
+    for (i, rec) in records.iter().enumerate() {
+        if compare_fn(rec, key_record_bytes) == Ordering::Greater {
             insert_pos = i;
             break;
         }
     }
 
-    // Get the offset where data will be written (= current free space offset)
-    let free_offset_pos = node_size - 2 * (num_records + 1);
-    let data_offset = BigEndian::read_u16(&node[free_offset_pos..free_offset_pos + 2]) as usize;
+    // Insert the new record at the sorted position
+    records.insert(insert_pos, key_record_bytes.to_vec());
 
-    // If inserting in the middle, we need to shift subsequent records' data forward.
-    // Actually, HFS B-tree records are stored in order of insertion offset, not sorted.
-    // The offset table determines the logical order.
-    // Simplest approach: append data at the free offset, then fix up the offset table.
-
-    // Write the record data at data_offset
-    node[data_offset..data_offset + key_record_bytes.len()].copy_from_slice(key_record_bytes);
-
-    let new_free_offset = data_offset + key_record_bytes.len();
-
-    // Shift offset table entries for records after insert_pos to make room
-    // The offset table grows backward from end of node.
-    // After insertion, we have num_records+1 records, so offset table needs (num_records+2) entries.
-    // Entries are at: node_size - 2*(i+1) for record i, plus one free-space offset.
-
-    // Read all current offsets
-    let mut offsets: Vec<u16> = Vec::with_capacity(num_records + 1);
-    for i in 0..=num_records {
-        let pos = node_size - 2 * (i + 1);
-        offsets.push(BigEndian::read_u16(&node[pos..pos + 2]));
+    // Rebuild the node: write all records sequentially starting at offset 14
+    // This ensures physical data order matches offset table order (monotonically increasing)
+    let mut write_pos = 14usize;
+    for (i, rec) in records.iter().enumerate() {
+        node[write_pos..write_pos + rec.len()].copy_from_slice(rec);
+        let opos = node_size - 2 * (i + 1);
+        BigEndian::write_u16(&mut node[opos..opos + 2], write_pos as u16);
+        write_pos += rec.len();
     }
 
-    // Insert the new record's offset at insert_pos
-    // offsets[0..num_records] are record offsets, offsets[num_records] is free-space offset
-    offsets.insert(insert_pos, data_offset as u16);
-    // Update free-space offset (now at end)
-    let last_idx = offsets.len() - 1;
-    offsets[last_idx] = new_free_offset as u16;
+    // Write free-space offset
+    let fpos = node_size - 2 * (records.len() + 1);
+    BigEndian::write_u16(&mut node[fpos..fpos + 2], write_pos as u16);
 
-    // Write offsets back
-    for (i, &off) in offsets.iter().enumerate() {
-        let pos = node_size - 2 * (i + 1);
-        BigEndian::write_u16(&mut node[pos..pos + 2], off);
+    // Clear any leftover data between write_pos and the offset table
+    let offset_table_start = node_size - 2 * (records.len() + 1);
+    if write_pos < offset_table_start {
+        node[write_pos..offset_table_start].fill(0);
     }
 
     // Update num_records in node descriptor
-    BigEndian::write_u16(&mut node[10..12], (num_records + 1) as u16);
+    BigEndian::write_u16(&mut node[10..12], records.len() as u16);
 
     Ok(insert_pos)
 }
@@ -606,8 +594,15 @@ pub fn btree_split_leaf(
         header.last_leaf_node = new_idx;
     }
 
-    // The separator key is the first record (key portion) of the new node
-    let split_key = records[split_point].clone();
+    // The separator key is just the key portion of the first record of the new node.
+    // Key length is in byte 0; key data is bytes 0..1+key_len, padded to even.
+    let full_rec = &records[split_point];
+    let key_len = full_rec[0] as usize;
+    let mut key_end = 1 + key_len;
+    if key_end % 2 != 0 {
+        key_end += 1; // pad to even boundary
+    }
+    let split_key = full_rec[..key_end.min(full_rec.len())].to_vec();
 
     Ok((new_idx, split_key))
 }
@@ -774,8 +769,14 @@ fn split_index_node(
         BigEndian::write_u16(&mut node[10..12], count as u16);
     }
 
-    // The separator key is the first key of the new (right) node
-    let split_key = records[split_point].clone();
+    // The separator key is just the key portion of the first record of the new node.
+    // For index records, each record is key + 4-byte child pointer, so key = record[..len-4].
+    let full_rec = &records[split_point];
+    let split_key = if full_rec.len() > 4 {
+        full_rec[..full_rec.len() - 4].to_vec()
+    } else {
+        full_rec.clone()
+    };
 
     Ok((new_idx, split_key))
 }
