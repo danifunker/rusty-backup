@@ -283,9 +283,9 @@ pub struct HfsFilesystem<R: Read + Seek> {
 
 impl<R: Read + Seek> HfsFilesystem<R> {
     pub fn open(mut reader: R, partition_offset: u64) -> Result<Self, FilesystemError> {
-        // Read MDB at offset + 1024 (sector 2)
+        // Read MDB at offset + 1024 (sector 2) — full 512-byte sector
         reader.seek(SeekFrom::Start(partition_offset + 1024))?;
-        let mut mdb_buf = [0u8; 162];
+        let mut mdb_buf = [0u8; 512];
         reader.read_exact(&mut mdb_buf)?;
         let mdb = HfsMasterDirectoryBlock::parse(&mdb_buf)?;
 
@@ -855,20 +855,16 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
         Ok(())
     }
 
-    /// Write MDB to both primary (offset+1024) and backup (offset+total_size-1024).
+    /// Write MDB to the primary location (offset+1024).
+    /// The backup (alternate) MDB is intentionally not updated — its location
+    /// depends on the exact partition size which may not be known. The primary
+    /// MDB is authoritative; Mac OS only falls back to the alternate if the
+    /// primary is corrupt, and the stale alternate remains structurally valid.
     fn write_mdb(&mut self) -> Result<(), FilesystemError> {
         let mdb_bytes = self.mdb.serialize_to_sector();
         self.reader
             .seek(SeekFrom::Start(self.partition_offset + 1024))?;
         self.reader.write_all(&mdb_bytes)?;
-        // Backup MDB
-        let total_size = self.mdb.first_alloc_block as u64 * 512
-            + self.mdb.total_blocks as u64 * self.mdb.block_size as u64;
-        if total_size > 1024 {
-            self.reader
-                .seek(SeekFrom::Start(self.partition_offset + total_size - 1024))?;
-            self.reader.write_all(&mdb_bytes)?;
-        }
         Ok(())
     }
 
@@ -978,6 +974,7 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
         rsrc_blocks: u16,
         type_code: &[u8; 4],
         creator_code: &[u8; 4],
+        block_size: u32,
     ) -> [u8; 102] {
         let mut rec = [0u8; 102];
         let now = hfs_common::hfs_now();
@@ -992,16 +989,18 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
         BigEndian::write_u16(&mut rec[24..26], data_start);
         // filLgLen at offset 26 (data fork logical size)
         BigEndian::write_u32(&mut rec[26..30], data_size);
-        // filPyLen at offset 30 (data fork physical size) — set by caller if needed
-        // (physical size is not critical for classic HFS browsing)
+        // filPyLen at offset 30 (data fork physical size)
+        BigEndian::write_u32(&mut rec[30..34], data_blocks as u32 * block_size);
         // filRStBlk at offset 34
         BigEndian::write_u16(&mut rec[34..36], rsrc_start);
         // filRLgLen at offset 36 (rsrc fork logical size)
         BigEndian::write_u32(&mut rec[36..40], rsrc_size);
-        // filCrDat at offset 42
-        BigEndian::write_u32(&mut rec[42..46], now);
-        // filMdDat at offset 46
-        BigEndian::write_u32(&mut rec[46..50], now);
+        // filRPyLen at offset 40 (rsrc fork physical size)
+        BigEndian::write_u32(&mut rec[40..44], rsrc_blocks as u32 * block_size);
+        // filCrDat at offset 44
+        BigEndian::write_u32(&mut rec[44..48], now);
+        // filMdDat at offset 48
+        BigEndian::write_u32(&mut rec[48..52], now);
         // Data fork extents at offset 74 (3 × 4 bytes)
         if data_blocks > 0 {
             BigEndian::write_u16(&mut rec[74..76], data_start);
@@ -1325,6 +1324,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
             rsrc_blocks,
             &type_code,
             &creator_code,
+            self.mdb.block_size,
         );
 
         // Build key + record for catalog insertion
