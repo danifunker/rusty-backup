@@ -589,8 +589,14 @@ fn rebuild_index_nodes(catalog_data: &mut [u8], node_size: usize, report: &mut R
         next_level.push((idx_node, first_key_of_node));
 
         for (child_idx, child_key) in &current_level {
-            // Build index record: key_bytes + child_node_ptr (4 bytes BE)
+            // Build index record: key_bytes + [pad] + child_node_ptr (4 bytes BE)
+            // HFS requires record data to start at an even offset from the record
+            // start. If (1 + key_length) is odd, insert a pad byte so the node
+            // pointer is correctly aligned for Mac OS's B-tree traversal.
             let mut index_rec = child_key.clone();
+            if index_rec.len() % 2 != 0 {
+                index_rec.push(0);
+            }
             let mut ptr_bytes = [0u8; 4];
             BigEndian::write_u32(&mut ptr_bytes, *child_idx);
             index_rec.extend_from_slice(&ptr_bytes);

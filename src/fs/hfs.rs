@@ -2602,4 +2602,86 @@ mod tests {
 
         assert_fsck_clean(&mut fs);
     }
+
+    /// Verify that rebuilt index records have proper even-alignment padding
+    /// between the key and the node pointer, as required by Mac OS's B-tree
+    /// traversal code. Without padding, Mac OS reads misaligned node pointers
+    /// and crashes during volume mount.
+    #[test]
+    fn test_repair_index_records_are_even_aligned() {
+        use super::hfs_common::{btree_record_range, BTreeHeader};
+
+        let img = make_editable_hfs_image();
+        let cursor = Cursor::new(img);
+        let mut fs = HfsFilesystem::open(cursor, 0).unwrap();
+        let root = fs.root().unwrap();
+        let options = CreateFileOptions::default();
+
+        // Create files with varying name lengths (even and odd) to exercise
+        // both padded and unpadded key paths in index records
+        for i in 0..40 {
+            let name = if i % 2 == 0 {
+                format!("f{:03}.txt", i) // 8 chars → key_len=14 (even) → needs pad
+            } else {
+                format!("fi{:03}.txt", i) // 9 chars → key_len=15 (odd) → no pad
+            };
+            let data = format!("data{}", i);
+            let mut reader = Cursor::new(data.as_bytes().to_vec());
+            fs.create_file(&root, &name, &mut reader, data.len() as u64, &options)
+                .unwrap();
+        }
+
+        // Run repair (which rebuilds index nodes)
+        let report = fs.repair().unwrap();
+        assert!(
+            report.fixes_failed.is_empty(),
+            "repair failures: {:?}",
+            report.fixes_failed
+        );
+
+        // Verify every index record has correct alignment
+        let cat = &fs.catalog_data;
+        let header = BTreeHeader::read(cat);
+        let node_size = header.node_size as usize;
+        let max_nodes = cat.len() / node_size;
+
+        let mut index_recs_checked = 0u32;
+        for n in 1..max_nodes {
+            let off = n * node_size;
+            if off + node_size > cat.len() {
+                break;
+            }
+            let kind = cat[off + 8] as i8;
+            if kind != 0 {
+                continue;
+            }
+            let num_recs = BigEndian::read_u16(&cat[off + 10..off + 12]) as usize;
+            for r in 0..num_recs {
+                let (rec_start, rec_end) =
+                    btree_record_range(&cat[off..off + node_size], node_size, r);
+                if rec_start >= rec_end || rec_end > node_size {
+                    continue;
+                }
+                let key_len = cat[off + rec_start] as usize;
+                let key_total = 1 + key_len;
+                let rec_len = rec_end - rec_start;
+
+                // Mac OS reads the node pointer at even-aligned offset after key
+                let mac_ptr_offset = key_total + if key_total % 2 != 0 { 1 } else { 0 };
+                let actual_ptr_offset = rec_len - 4;
+
+                assert_eq!(
+                    mac_ptr_offset, actual_ptr_offset,
+                    "Index node {} rec {}: key_len={}, rec_len={}, \
+                     Mac reads ptr at +{} but actual at +{}",
+                    n, r, key_len, rec_len, mac_ptr_offset, actual_ptr_offset
+                );
+                index_recs_checked += 1;
+            }
+        }
+        assert!(
+            index_recs_checked > 0,
+            "no index records found — test needs more files"
+        );
+    }
 }
