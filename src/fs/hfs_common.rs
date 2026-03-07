@@ -482,7 +482,13 @@ pub fn btree_free_node(catalog_data: &mut [u8], node_size: usize, node_idx: u32)
 
 /// Initialize a new empty node in catalog_data at the given node_idx.
 /// Sets the node kind and height. Returns a mutable slice to the node.
-fn init_node(catalog_data: &mut [u8], node_size: usize, node_idx: u32, kind: i8, height: u8) {
+pub(crate) fn init_node(
+    catalog_data: &mut [u8],
+    node_size: usize,
+    node_idx: u32,
+    kind: i8,
+    height: u8,
+) {
     let offset = node_idx as usize * node_size;
     let node = &mut catalog_data[offset..offset + node_size];
     // Zero the node

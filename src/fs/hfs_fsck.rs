@@ -14,8 +14,8 @@ use super::hfs::{
     mac_roman_to_utf8, HfsExtDescriptor, HfsMasterDirectoryBlock, CATALOG_DIR, CATALOG_FILE,
 };
 use super::hfs_common::{
-    bitmap_set_bit_be, bitmap_test_bit_be, btree_node_bitmap_range, btree_record_range,
-    BTreeHeader, BTREE_HEADER_NODE, BTREE_INDEX_NODE, BTREE_LEAF_NODE,
+    bitmap_set_bit_be, bitmap_test_bit_be, btree_insert_record, btree_node_bitmap_range,
+    btree_record_range, BTreeHeader, BTREE_HEADER_NODE, BTREE_INDEX_NODE, BTREE_LEAF_NODE,
 };
 
 const CATALOG_DIR_THREAD: i8 = 3;
@@ -293,8 +293,12 @@ fn repair_btree_structure(catalog_data: &mut [u8], node_size: usize, report: &mu
         }
     }
 
-    // Rebuild leaf chain: scan all allocated nodes, collect leaf nodes, sort by first key, relink
+    // Rebuild leaf chain: union fLink-reachable + bitmap-allocated leaf nodes,
+    // sort by first key, relink, and fix node bitmap.
     rebuild_leaf_chain(catalog_data, node_size, report);
+
+    // Rebuild index nodes to match the new leaf chain
+    rebuild_index_nodes(catalog_data, node_size, report);
 
     // Fix leaf record count
     let header = BTreeHeader::read(catalog_data);
@@ -311,42 +315,90 @@ fn repair_btree_structure(catalog_data: &mut [u8], node_size: usize, report: &mu
     }
 }
 
-/// Scan all allocated leaf nodes via B-tree node bitmap, sort by first key, relink chain.
+/// Validate that a node looks like a real leaf node with parseable catalog keys.
+fn is_valid_leaf_node(catalog_data: &[u8], node_size: usize, node_idx: u32) -> bool {
+    let off = node_idx as usize * node_size;
+    if off + node_size > catalog_data.len() {
+        return false;
+    }
+    let kind = catalog_data[off + 8] as i8;
+    if kind != BTREE_LEAF_NODE {
+        return false;
+    }
+    let num_records = BigEndian::read_u16(&catalog_data[off + 10..off + 12]) as usize;
+    if num_records == 0 {
+        return false;
+    }
+    // Verify first record has a parseable HFS catalog key (min 6 bytes: 1 reserved + 4 parentID + 1 nameLen)
+    let (rec_start, rec_end) =
+        btree_record_range(&catalog_data[off..off + node_size], node_size, 0);
+    if rec_start >= rec_end || rec_end > node_size {
+        return false;
+    }
+    let key_len = catalog_data[off + rec_start] as usize;
+    if key_len < 6 {
+        return false;
+    }
+    let key_end = rec_start + 1 + key_len;
+    key_end <= rec_end
+}
+
+/// Extract the first key from a validated leaf node.
+fn extract_first_key(catalog_data: &[u8], node_size: usize, node_idx: u32) -> Vec<u8> {
+    let off = node_idx as usize * node_size;
+    let (rec_start, _rec_end) =
+        btree_record_range(&catalog_data[off..off + node_size], node_size, 0);
+    let key_len = catalog_data[off + rec_start] as usize;
+    let key_end = rec_start + 1 + key_len;
+    catalog_data[off + rec_start..off + key_end].to_vec()
+}
+
+/// Discover all valid leaf nodes by unioning the fLink chain and the node bitmap,
+/// sort by first key, relink the chain, and fix the node bitmap.
 fn rebuild_leaf_chain(catalog_data: &mut [u8], node_size: usize, report: &mut RepairReport) {
-    let (bmp_off, bmp_size) = btree_node_bitmap_range(catalog_data, node_size);
+    let header = BTreeHeader::read(catalog_data);
     let max_nodes = catalog_data.len() / node_size;
 
-    // Collect all leaf nodes with their first key for sorting
-    let mut leaf_nodes: Vec<(u32, Vec<u8>)> = Vec::new(); // (node_idx, first_key)
+    // Step 1: Walk existing fLink chain to find reachable leaf nodes
+    let mut chain_nodes: HashSet<u32> = HashSet::new();
+    {
+        let mut node_idx = header.first_leaf_node;
+        let mut visited = HashSet::new();
+        while node_idx != 0 {
+            if !visited.insert(node_idx) {
+                break;
+            }
+            if is_valid_leaf_node(catalog_data, node_size, node_idx) {
+                chain_nodes.insert(node_idx);
+            }
+            let off = node_idx as usize * node_size;
+            if off + node_size > catalog_data.len() {
+                break;
+            }
+            node_idx = BigEndian::read_u32(&catalog_data[off..off + 4]); // fLink
+        }
+    }
 
+    // Step 2: Scan bitmap for allocated leaf nodes
+    let (bmp_off, bmp_size) = btree_node_bitmap_range(catalog_data, node_size);
+    let mut bitmap_nodes: HashSet<u32> = HashSet::new();
     for node_idx in 1..max_nodes as u32 {
         if !bitmap_test_bit_be(&catalog_data[bmp_off..bmp_off + bmp_size], node_idx) {
             continue;
         }
-        let off = node_idx as usize * node_size;
-        if off + node_size > catalog_data.len() {
-            break;
+        if is_valid_leaf_node(catalog_data, node_size, node_idx) {
+            bitmap_nodes.insert(node_idx);
         }
-        let kind = catalog_data[off + 8] as i8;
-        if kind != BTREE_LEAF_NODE {
-            continue;
-        }
-        let num_records = BigEndian::read_u16(&catalog_data[off + 10..off + 12]) as usize;
-        if num_records == 0 {
-            continue;
-        }
+    }
 
-        // Extract first key for sorting
-        let (rec_start, rec_end) =
-            btree_record_range(&catalog_data[off..off + node_size], node_size, 0);
-        if rec_start < rec_end && rec_end <= node_size {
-            let key_len = catalog_data[off + rec_start] as usize;
-            let key_end = rec_start + 1 + key_len;
-            if key_end <= rec_end {
-                let first_key = catalog_data[off + rec_start..off + key_end].to_vec();
-                leaf_nodes.push((node_idx, first_key));
-            }
-        }
+    // Step 3: Union both sets
+    let all_candidates: HashSet<u32> = chain_nodes.union(&bitmap_nodes).copied().collect();
+
+    // Step 4: Collect with first keys
+    let mut leaf_nodes: Vec<(u32, Vec<u8>)> = Vec::new();
+    for &node_idx in &all_candidates {
+        let first_key = extract_first_key(catalog_data, node_size, node_idx);
+        leaf_nodes.push((node_idx, first_key));
     }
 
     if leaf_nodes.is_empty() {
@@ -358,11 +410,9 @@ fn rebuild_leaf_chain(catalog_data: &mut [u8], node_size: usize, report: &mut Re
         super::hfs::HfsFilesystem::<std::io::Cursor<Vec<u8>>>::catalog_compare(&a.1, &b.1)
     });
 
-    // Check if chain is already correct
-    let header = BTreeHeader::read(catalog_data);
+    // Check if chain is already correct (same nodes in same order)
     let mut chain_ok = header.first_leaf_node == leaf_nodes[0].0
         && header.last_leaf_node == leaf_nodes.last().unwrap().0;
-
     if chain_ok {
         let mut node_idx = header.first_leaf_node;
         let mut visited = HashSet::new();
@@ -389,7 +439,7 @@ fn rebuild_leaf_chain(catalog_data: &mut [u8], node_size: usize, report: &mut Re
         return; // Chain is already correct
     }
 
-    // Rewrite fLink/bLink for all leaf nodes
+    // Rewrite fLink/bLink for all leaf nodes, set height=1
     for (i, (node_idx, _)) in leaf_nodes.iter().enumerate() {
         let off = *node_idx as usize * node_size;
         let prev = if i > 0 { leaf_nodes[i - 1].0 } else { 0 };
@@ -400,6 +450,7 @@ fn rebuild_leaf_chain(catalog_data: &mut [u8], node_size: usize, report: &mut Re
         };
         BigEndian::write_u32(&mut catalog_data[off..off + 4], next); // fLink
         BigEndian::write_u32(&mut catalog_data[off + 4..off + 8], prev); // bLink
+        catalog_data[off + 9] = 1; // height = 1 for leaf nodes
     }
 
     // Update header
@@ -408,9 +459,188 @@ fn rebuild_leaf_chain(catalog_data: &mut [u8], node_size: usize, report: &mut Re
     h.last_leaf_node = leaf_nodes.last().unwrap().0;
     h.write(catalog_data);
 
+    // Step 5: Fix node bitmap — mark all included leaf nodes as allocated
+    let recovered_from_chain = chain_nodes.difference(&bitmap_nodes).count() as u32;
+    let (bmp_off, bmp_size) = btree_node_bitmap_range(catalog_data, node_size);
+    let bmp_max_bit = (bmp_size as u32) * 8;
+    for &(node_idx, _) in &leaf_nodes {
+        if node_idx < bmp_max_bit
+            && !bitmap_test_bit_be(&catalog_data[bmp_off..bmp_off + bmp_size], node_idx)
+        {
+            bitmap_set_bit_be(&mut catalog_data[bmp_off..bmp_off + bmp_size], node_idx);
+        }
+    }
+    if recovered_from_chain > 0 {
+        let mut h = BTreeHeader::read(catalog_data);
+        h.free_nodes = h.free_nodes.saturating_sub(recovered_from_chain);
+        h.write(catalog_data);
+        report.fixes_applied.push(format!(
+            "Recovered {} leaf nodes reachable via fLink chain but missing from B-tree bitmap",
+            recovered_from_chain
+        ));
+    }
+
     report.fixes_applied.push(format!(
         "Rebuilt leaf chain: {} leaf nodes relinked",
         leaf_nodes.len()
+    ));
+}
+
+/// Rebuild index nodes bottom-up from the sorted leaf chain.
+///
+/// After `rebuild_leaf_chain()` the leaves are correctly linked and sorted.
+/// This function frees all old index nodes and builds new ones so that
+/// root → index → leaf traversal is consistent with the leaf chain.
+fn rebuild_index_nodes(catalog_data: &mut [u8], node_size: usize, report: &mut RepairReport) {
+    use super::hfs_common::{btree_alloc_node, btree_free_node, init_node};
+
+    let header = BTreeHeader::read(catalog_data);
+    let (bmp_off, bmp_size) = btree_node_bitmap_range(catalog_data, node_size);
+    let max_nodes = catalog_data.len() / node_size;
+
+    // Free all existing index nodes
+    let mut freed = 0u32;
+    let bmp_max_bit = (bmp_size as u32) * 8;
+    for node_idx in 1..(max_nodes as u32).min(bmp_max_bit) {
+        if !bitmap_test_bit_be(&catalog_data[bmp_off..bmp_off + bmp_size], node_idx) {
+            continue;
+        }
+        let off = node_idx as usize * node_size;
+        if off + node_size > catalog_data.len() {
+            break;
+        }
+        if catalog_data[off + 8] as i8 == BTREE_INDEX_NODE {
+            btree_free_node(catalog_data, node_size, node_idx);
+            freed += 1;
+        }
+    }
+
+    // Collect the sorted leaf chain as the initial level
+    // Each entry: (node_idx, first_key_bytes)
+    let mut current_level: Vec<(u32, Vec<u8>)> = Vec::new();
+    {
+        let mut node_idx = header.first_leaf_node;
+        let mut visited = HashSet::new();
+        while node_idx != 0 {
+            if !visited.insert(node_idx) {
+                break;
+            }
+            let off = node_idx as usize * node_size;
+            if off + node_size > catalog_data.len() {
+                break;
+            }
+            let first_key = extract_first_key(catalog_data, node_size, node_idx);
+            current_level.push((node_idx, first_key));
+            node_idx = BigEndian::read_u32(&catalog_data[off..off + 4]); // fLink
+        }
+    }
+
+    if current_level.is_empty() {
+        return;
+    }
+
+    // If only one leaf node, it is the root
+    if current_level.len() == 1 {
+        let mut h = BTreeHeader::read(catalog_data);
+        h.root_node = current_level[0].0;
+        h.depth = 1;
+        h.free_nodes += freed;
+        h.write(catalog_data);
+        if freed > 0 {
+            report
+                .fixes_applied
+                .push(format!("Rebuilt index: freed {} old index nodes", freed));
+        }
+        return;
+    }
+
+    let mut h = BTreeHeader::read(catalog_data);
+    h.free_nodes += freed;
+    h.write(catalog_data);
+
+    let compare = super::hfs::HfsFilesystem::<std::io::Cursor<Vec<u8>>>::catalog_compare;
+
+    // Build index levels bottom-up
+    let mut height: u8 = 1; // leaves are height 1
+    let mut index_nodes_created = 0u32;
+
+    while current_level.len() > 1 {
+        height += 1;
+        let mut next_level: Vec<(u32, Vec<u8>)> = Vec::new();
+
+        // Allocate first index node for this level
+        let mut h = BTreeHeader::read(catalog_data);
+        let idx_node = match btree_alloc_node(catalog_data, node_size, h.total_nodes) {
+            Ok(n) => n,
+            Err(_) => {
+                report
+                    .fixes_failed
+                    .push("Index rebuild: out of free nodes".into());
+                return;
+            }
+        };
+        h.free_nodes = h.free_nodes.saturating_sub(1);
+        h.write(catalog_data);
+
+        init_node(catalog_data, node_size, idx_node, BTREE_INDEX_NODE, height);
+        index_nodes_created += 1;
+
+        let first_key_of_node = current_level[0].1.clone();
+        next_level.push((idx_node, first_key_of_node));
+
+        for (child_idx, child_key) in &current_level {
+            // Build index record: key_bytes + child_node_ptr (4 bytes BE)
+            let mut index_rec = child_key.clone();
+            let mut ptr_bytes = [0u8; 4];
+            BigEndian::write_u32(&mut ptr_bytes, *child_idx);
+            index_rec.extend_from_slice(&ptr_bytes);
+
+            let off = next_level.last().unwrap().0 as usize * node_size;
+            let node = &mut catalog_data[off..off + node_size];
+
+            if btree_insert_record(node, node_size, &index_rec, &compare).is_err() {
+                // Current node is full — allocate a new one
+                let mut h = BTreeHeader::read(catalog_data);
+                let new_idx = match btree_alloc_node(catalog_data, node_size, h.total_nodes) {
+                    Ok(n) => n,
+                    Err(_) => {
+                        report
+                            .fixes_failed
+                            .push("Index rebuild: out of free nodes".into());
+                        return;
+                    }
+                };
+                h.free_nodes = h.free_nodes.saturating_sub(1);
+                h.write(catalog_data);
+
+                init_node(catalog_data, node_size, new_idx, BTREE_INDEX_NODE, height);
+                index_nodes_created += 1;
+
+                next_level.push((new_idx, child_key.clone()));
+
+                let off2 = new_idx as usize * node_size;
+                let node2 = &mut catalog_data[off2..off2 + node_size];
+                if btree_insert_record(node2, node_size, &index_rec, &compare).is_err() {
+                    report
+                        .fixes_failed
+                        .push("Index rebuild: record too large for empty node".into());
+                    return;
+                }
+            }
+        }
+
+        current_level = next_level;
+    }
+
+    // The single remaining node is the root
+    let mut h = BTreeHeader::read(catalog_data);
+    h.root_node = current_level[0].0;
+    h.depth = height as u16;
+    h.write(catalog_data);
+
+    report.fixes_applied.push(format!(
+        "Rebuilt index: {} index nodes created, depth = {}",
+        index_nodes_created, height
     ));
 }
 
