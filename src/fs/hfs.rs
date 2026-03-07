@@ -557,7 +557,7 @@ impl<R: Read + Seek> HfsFilesystem<R> {
     }
 
     /// Run filesystem integrity check. Loads bitmap if not already cached.
-    pub fn fsck(&mut self) -> Result<super::hfs_fsck::FsckResult, FilesystemError> {
+    pub fn fsck(&mut self) -> Result<super::fsck::FsckResult, FilesystemError> {
         self.ensure_bitmap()?;
         // Load extents overflow B-tree if it exists (for files with >3 extents)
         let extents_data = if self.mdb.extents_file_size > 0 {
@@ -1266,7 +1266,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
         Some((cnid as u64, format!("CNID {}", cnid)))
     }
 
-    fn fsck(&mut self) -> Option<Result<super::hfs_fsck::FsckResult, FilesystemError>> {
+    fn fsck(&mut self) -> Option<Result<super::fsck::FsckResult, FilesystemError>> {
         Some(self.fsck())
     }
 }
@@ -1650,7 +1650,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
         Ok(())
     }
 
-    fn repair(&mut self) -> Result<super::hfs_fsck::RepairReport, FilesystemError> {
+    fn repair(&mut self) -> Result<super::fsck::RepairReport, FilesystemError> {
         self.ensure_bitmap()?;
         let extents_data = if self.mdb.extents_file_size > 0 {
             read_fork_data(
@@ -2500,8 +2500,6 @@ mod tests {
         assert!(result.is_clean(), "fresh image should be clean");
         assert_eq!(result.stats.directories_checked, 1); // root only
         assert_eq!(result.stats.files_checked, 0);
-        assert_eq!(result.stats.leaf_nodes_visited, 1);
-        assert_eq!(result.stats.orphaned_threads, 0);
     }
 
     #[test]

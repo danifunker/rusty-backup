@@ -2752,18 +2752,14 @@ impl InspectTab {
                     ui.separator();
 
                     // Stats
-                    ui.label(format!(
-                        "Files: {}  Directories: {}  Leaf nodes: {}",
-                        result.stats.files_checked,
-                        result.stats.directories_checked,
-                        result.stats.leaf_nodes_visited,
-                    ));
-                    if result.stats.orphaned_threads > 0 {
-                        ui.label(format!(
-                            "Orphaned threads: {}",
-                            result.stats.orphaned_threads
-                        ));
+                    let mut stats_line = format!(
+                        "Files: {}  Directories: {}",
+                        result.stats.files_checked, result.stats.directories_checked,
+                    );
+                    for (label, value) in &result.stats.extra {
+                        stats_line.push_str(&format!("  {}: {}", label, value));
                     }
+                    ui.label(stats_line);
 
                     // Errors
                     if !result.errors.is_empty() {
@@ -2854,15 +2850,7 @@ impl InspectTab {
         let repairable_count = self
             .fsck_result
             .as_ref()
-            .map(|r| {
-                r.errors
-                    .iter()
-                    .filter(|e| {
-                        rusty_backup::fs::hfs_fsck::classify_repair(&e.code)
-                            != rusty_backup::fs::hfs_fsck::RepairAction::NotRepairable
-                    })
-                    .count()
-            })
+            .map(|r| r.errors.iter().filter(|e| e.repairable).count())
             .unwrap_or(0);
 
         let mut confirmed = false;

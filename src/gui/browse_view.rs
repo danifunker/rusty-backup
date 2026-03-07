@@ -650,21 +650,39 @@ impl BrowseView {
                     entry.name.clone()
                 };
 
-                let header = egui::CollapsingHeader::new(dir_label)
-                    .id_salt(&path)
-                    .default_open(path == "/")
-                    .show(ui, |ui| {
-                        if let Some(children) = self.directory_cache.get(&path).cloned() {
-                            for child in &children {
-                                self.render_tree_entry(ui, child);
-                            }
-                        } else {
-                            ui.label("Loading...");
-                        }
-                    });
+                let id = ui.make_persistent_id(&path);
+                let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                    ui.ctx(),
+                    id,
+                    path == "/",
+                );
 
-                // Track expansion state after the header is shown
-                let is_now_open = header.body_returned.is_some();
+                let is_selected = self
+                    .selected_entry
+                    .as_ref()
+                    .map(|s| s.path == entry.path)
+                    .unwrap_or(false);
+
+                let header_res = ui.horizontal(|ui| {
+                    state.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
+                    if ui.selectable_label(is_selected, &dir_label).clicked() {
+                        self.selected_entry = Some(entry.clone());
+                        self.content = None;
+                        self.error = None;
+                    }
+                });
+
+                state.show_body_indented(&header_res.response, ui, |ui| {
+                    if let Some(children) = self.directory_cache.get(&path).cloned() {
+                        for child in &children {
+                            self.render_tree_entry(ui, child);
+                        }
+                    } else {
+                        ui.label("Loading...");
+                    }
+                });
+
+                let is_now_open = state.is_open();
 
                 // Load directory contents on first expansion
                 if is_now_open {
@@ -1651,18 +1669,15 @@ impl BrowseView {
                     ui.separator();
 
                     // Stats
-                    ui.label(format!(
-                        "Files: {}  Directories: {}  Leaf nodes: {}",
+                    let mut stats_line = format!(
+                        "Files: {}  Directories: {}",
                         result.stats.files_checked,
                         result.stats.directories_checked,
-                        result.stats.leaf_nodes_visited,
-                    ));
-                    if result.stats.orphaned_threads > 0 {
-                        ui.label(format!(
-                            "Orphaned threads: {}",
-                            result.stats.orphaned_threads
-                        ));
+                    );
+                    for (label, value) in &result.stats.extra {
+                        stats_line.push_str(&format!("  {}: {}", label, value));
                     }
+                    ui.label(stats_line);
 
                     // Errors
                     if !result.errors.is_empty() {
@@ -1677,6 +1692,49 @@ impl BrowseView {
                                         egui::Color32::from_rgb(255, 100, 100),
                                         format!("[{}] {}", issue.code, issue.message),
                                     );
+                                }
+                            });
+                    }
+
+                    // Orphaned entries (files/dirs with missing parents)
+                    if !result.orphaned_entries.is_empty() {
+                        ui.separator();
+                        // Group by missing parent CNID
+                        let mut by_parent: std::collections::BTreeMap<u64, Vec<&rusty_backup::fs::OrphanedEntry>> =
+                            std::collections::BTreeMap::new();
+                        for entry in &result.orphaned_entries {
+                            by_parent
+                                .entry(entry.missing_parent_id)
+                                .or_default()
+                                .push(entry);
+                        }
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 100, 100),
+                            format!(
+                                "{} file(s)/folder(s) reference {} missing parent director{} — not repairable.",
+                                result.orphaned_entries.len(),
+                                by_parent.len(),
+                                if by_parent.len() == 1 { "y" } else { "ies" },
+                            ),
+                        );
+                        ui.label("These entries exist in the catalog but their parent directory is gone. \
+                                  This typically indicates severe directory corruption.");
+                        egui::ScrollArea::vertical()
+                            .id_salt("fsck_orphans")
+                            .max_height(200.0)
+                            .show(ui, |ui| {
+                                for (parent_cnid, entries) in &by_parent {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(255, 200, 100),
+                                        format!("Missing parent ID {}:", parent_cnid),
+                                    );
+                                    for entry in entries {
+                                        let kind = if entry.is_directory { "dir" } else { "file" };
+                                        ui.label(format!(
+                                            "    {} \"{}\" (ID {})",
+                                            kind, entry.name, entry.id
+                                        ));
+                                    }
                                 }
                             });
                     }
@@ -1726,6 +1784,15 @@ impl BrowseView {
                                 );
                             }
                         }
+                        if report.unrepairable_count > 0 {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(255, 200, 100),
+                                format!(
+                                    "{} error(s) could not be repaired (missing parent directories).",
+                                    report.unrepairable_count
+                                ),
+                            );
+                        }
                     }
                 }
             });
@@ -1748,15 +1815,7 @@ impl BrowseView {
         let repairable_count = self
             .fsck_result
             .as_ref()
-            .map(|r| {
-                r.errors
-                    .iter()
-                    .filter(|e| {
-                        rusty_backup::fs::hfs_fsck::classify_repair(&e.code)
-                            != rusty_backup::fs::hfs_fsck::RepairAction::NotRepairable
-                    })
-                    .count()
-            })
+            .map(|r| r.errors.iter().filter(|e| e.repairable).count())
             .unwrap_or(0);
 
         let mut confirmed = false;

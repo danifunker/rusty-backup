@@ -10,7 +10,9 @@ use std::collections::{HashMap, HashSet};
 
 use byteorder::{BigEndian, ByteOrder};
 
-use super::hfs::{HfsExtDescriptor, HfsMasterDirectoryBlock, CATALOG_DIR, CATALOG_FILE};
+use super::hfs::{
+    mac_roman_to_utf8, HfsExtDescriptor, HfsMasterDirectoryBlock, CATALOG_DIR, CATALOG_FILE,
+};
 use super::hfs_common::{
     bitmap_set_bit_be, bitmap_test_bit_be, btree_node_bitmap_range, btree_record_range,
     BTreeHeader, BTREE_HEADER_NODE, BTREE_INDEX_NODE, BTREE_LEAF_NODE,
@@ -22,66 +24,15 @@ const CATALOG_FILE_THREAD: i8 = 4;
 /// Maximum number of bitmap mismatch issues to report before capping.
 const MAX_BITMAP_MISMATCHES: usize = 20;
 
-/// Result of a filesystem check.
-pub struct FsckResult {
-    pub errors: Vec<FsckIssue>,
-    pub warnings: Vec<FsckIssue>,
-    pub stats: FsckStats,
-    /// True when at least one error has a repair action that isn't `NotRepairable`.
-    pub repairable: bool,
-}
+use super::fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry, RepairReport};
 
-/// Report from a repair operation.
-pub struct RepairReport {
-    pub fixes_applied: Vec<String>,
-    pub fixes_failed: Vec<String>,
-}
+// ---------------------------------------------------------------------------
+// HFS-specific issue codes and repair classification
+// ---------------------------------------------------------------------------
 
-/// Classification of what repair action an error maps to.
+/// HFS-specific issue codes used internally for repair classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RepairAction {
-    FixMdbSignature,
-    FixMdbCounts,
-    FixNodeKind,
-    RebuildLeafChain,
-    FixLeafLink,
-    FixBtreeHeader,
-    FixThreadRecord,
-    InsertDirThread,
-    RemoveOrphanedThread,
-    FixValence,
-    RebuildBitmap,
-    TruncateExtent,
-    ResolveOverlap,
-    NotRepairable,
-}
-
-impl FsckResult {
-    /// Returns true if no errors were found (warnings are tolerated).
-    pub fn is_clean(&self) -> bool {
-        self.errors.is_empty()
-    }
-}
-
-/// A single issue found during the check.
-pub struct FsckIssue {
-    pub code: FsckCode,
-    pub message: String,
-    /// B-tree node index where the issue was found, if applicable.
-    pub node: Option<u32>,
-}
-
-/// Aggregate statistics from the check.
-pub struct FsckStats {
-    pub files_checked: u32,
-    pub directories_checked: u32,
-    pub leaf_nodes_visited: u32,
-    pub orphaned_threads: u32,
-}
-
-/// Classification of check issues.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FsckCode {
+enum HfsFsckCode {
     // MDB issues
     BadSignature,
     BadBlockSize,
@@ -102,7 +53,8 @@ pub enum FsckCode {
     ThreadParentNameMismatch,
     FileCountMismatch,
     FolderCountMismatch,
-    OrphanedRecord,
+    OrphanedThread,
+    MissingParent,
     ValenceMismatch,
     // Extent/allocation
     ExtentOutOfRange,
@@ -111,38 +63,24 @@ pub enum FsckCode {
     FreeBlockCountMismatch,
 }
 
-impl std::fmt::Display for FsckCode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
-    }
+/// Whether an HFS issue code is automatically repairable.
+fn is_repairable(code: HfsFsckCode) -> bool {
+    !matches!(
+        code,
+        HfsFsckCode::BadBlockSize
+            | HfsFsckCode::OffsetTableNotMonotonic
+            | HfsFsckCode::OffsetTableOutOfBounds
+            | HfsFsckCode::MissingFileThread
+            | HfsFsckCode::MissingParent
+    )
 }
 
-/// Map each FsckCode to its corresponding repair action.
-pub fn classify_repair(code: &FsckCode) -> RepairAction {
-    match code {
-        FsckCode::BadSignature => RepairAction::FixMdbSignature,
-        FsckCode::BadBlockSize => RepairAction::NotRepairable,
-        FsckCode::NextCatalogIdTooLow => RepairAction::FixMdbCounts,
-        FsckCode::HeaderNodeBadKind => RepairAction::FixNodeKind,
-        FsckCode::RootNodeBadKind => RepairAction::FixNodeKind,
-        FsckCode::OffsetTableNotMonotonic => RepairAction::NotRepairable,
-        FsckCode::OffsetTableOutOfBounds => RepairAction::NotRepairable,
-        FsckCode::LeafChainBroken => RepairAction::RebuildLeafChain,
-        FsckCode::LeafBacklinkMismatch => RepairAction::FixLeafLink,
-        FsckCode::LeafRecordCountMismatch => RepairAction::FixBtreeHeader,
-        FsckCode::MissingFileThread => RepairAction::NotRepairable, // optional in classic HFS
-        FsckCode::MissingDirThread => RepairAction::InsertDirThread,
-        FsckCode::MissingFileRecord => RepairAction::RemoveOrphanedThread,
-        FsckCode::MissingDirRecord => RepairAction::RemoveOrphanedThread,
-        FsckCode::ThreadParentNameMismatch => RepairAction::FixThreadRecord,
-        FsckCode::FileCountMismatch => RepairAction::FixMdbCounts,
-        FsckCode::FolderCountMismatch => RepairAction::FixMdbCounts,
-        FsckCode::OrphanedRecord => RepairAction::RemoveOrphanedThread,
-        FsckCode::ValenceMismatch => RepairAction::FixValence,
-        FsckCode::ExtentOutOfRange => RepairAction::TruncateExtent,
-        FsckCode::OverlappingExtents => RepairAction::ResolveOverlap,
-        FsckCode::BitmapMismatch => RepairAction::RebuildBitmap,
-        FsckCode::FreeBlockCountMismatch => RepairAction::FixMdbCounts,
+/// Build a shared `FsckIssue` from an HFS-specific code and message.
+fn hfs_issue(code: HfsFsckCode, message: impl Into<String>) -> FsckIssue {
+    FsckIssue {
+        code: format!("{:?}", code),
+        message: message.into(),
+        repairable: is_repairable(code),
     }
 }
 
@@ -160,26 +98,28 @@ pub(crate) fn check_hfs_integrity(
 ) -> FsckResult {
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
-    let mut stats = FsckStats {
-        files_checked: 0,
-        directories_checked: 0,
-        leaf_nodes_visited: 0,
-        orphaned_threads: 0,
-    };
+    let mut leaf_nodes_visited = 0u32;
+    let mut orphaned_threads = 0u32;
+    let mut files_checked = 0u32;
+    let mut directories_checked = 0u32;
 
     // Phase 1: MDB sanity
     check_mdb(mdb, &mut errors);
 
     // If signature is bad, the rest of the check is meaningless
-    if errors.iter().any(|e| e.code == FsckCode::BadSignature) {
-        let repairable = errors
-            .iter()
-            .any(|e| classify_repair(&e.code) != RepairAction::NotRepairable);
+    if errors.iter().any(|e| e.code == "BadSignature") {
+        let repairable = errors.iter().any(|e| e.repairable);
         return FsckResult {
             errors,
             warnings,
-            stats,
+            stats: build_stats(
+                files_checked,
+                directories_checked,
+                leaf_nodes_visited,
+                orphaned_threads,
+            ),
             repairable,
+            orphaned_entries: Vec::new(),
         };
     }
 
@@ -187,31 +127,38 @@ pub(crate) fn check_hfs_integrity(
     let header = BTreeHeader::read(catalog_data);
     let node_size = header.node_size as usize;
     if node_size == 0 || catalog_data.len() < node_size {
-        errors.push(FsckIssue {
-            code: FsckCode::HeaderNodeBadKind,
-            message: "catalog B-tree node size is zero or catalog data too small".into(),
-            node: None,
-        });
-        let repairable = errors
-            .iter()
-            .any(|e| classify_repair(&e.code) != RepairAction::NotRepairable);
+        errors.push(hfs_issue(
+            HfsFsckCode::HeaderNodeBadKind,
+            "catalog B-tree node size is zero or catalog data too small",
+        ));
+        let repairable = errors.iter().any(|e| e.repairable);
         return FsckResult {
             errors,
             warnings,
-            stats,
+            stats: build_stats(
+                files_checked,
+                directories_checked,
+                leaf_nodes_visited,
+                orphaned_threads,
+            ),
             repairable,
+            orphaned_entries: Vec::new(),
         };
     }
-    check_btree_structure(catalog_data, &header, &mut errors, &mut stats);
+    check_btree_structure(catalog_data, &header, &mut errors, &mut leaf_nodes_visited);
 
     // Phase 3: Catalog consistency
+    let mut orphaned_entries = Vec::new();
     check_catalog_consistency(
         mdb,
         catalog_data,
         &header,
         &mut errors,
         &mut warnings,
-        &mut stats,
+        &mut files_checked,
+        &mut directories_checked,
+        &mut orphaned_threads,
+        &mut orphaned_entries,
     );
 
     // Phase 4: Extent/allocation bitmap
@@ -225,14 +172,30 @@ pub(crate) fn check_hfs_integrity(
         &mut warnings,
     );
 
-    let repairable = errors
-        .iter()
-        .any(|e| classify_repair(&e.code) != RepairAction::NotRepairable);
+    let repairable = errors.iter().any(|e| e.repairable);
     FsckResult {
         errors,
         warnings,
-        stats,
+        stats: build_stats(
+            files_checked,
+            directories_checked,
+            leaf_nodes_visited,
+            orphaned_threads,
+        ),
         repairable,
+        orphaned_entries,
+    }
+}
+
+fn build_stats(files: u32, dirs: u32, leaf_nodes: u32, orphaned_threads: u32) -> FsckStats {
+    let mut extra = vec![("Leaf nodes visited".into(), leaf_nodes.to_string())];
+    if orphaned_threads > 0 {
+        extra.push(("Orphaned threads".into(), orphaned_threads.to_string()));
+    }
+    FsckStats {
+        files_checked: files,
+        directories_checked: dirs,
+        extra,
     }
 }
 
@@ -250,9 +213,14 @@ pub(crate) fn repair_hfs(
     bitmap: &mut Vec<u8>,
     extents_data: Option<&[u8]>,
 ) -> RepairReport {
+    // Count unrepairable issues by running a quick check first
+    let check_result = check_hfs_integrity(mdb, catalog_data, bitmap, extents_data);
+    let unrepairable_count = check_result.errors.iter().filter(|e| !e.repairable).count();
+
     let mut report = RepairReport {
         fixes_applied: Vec::new(),
         fixes_failed: Vec::new(),
+        unrepairable_count,
     };
 
     // --- Phase 0: MDB signature ---
@@ -1113,27 +1081,25 @@ fn repair_mdb_counts_and_bitmap(
 
 fn check_mdb(mdb: &HfsMasterDirectoryBlock, errors: &mut Vec<FsckIssue>) {
     if mdb.signature != 0x4244 {
-        errors.push(FsckIssue {
-            code: FsckCode::BadSignature,
-            message: format!(
+        errors.push(hfs_issue(
+            HfsFsckCode::BadSignature,
+            format!(
                 "bad MDB signature: 0x{:04X} (expected 0x4244)",
                 mdb.signature
             ),
-            node: None,
-        });
+        ));
     }
 
     // HFS block size must be a positive multiple of 512
     #[allow(clippy::manual_is_multiple_of)]
     if mdb.block_size == 0 || mdb.block_size % 512 != 0 {
-        errors.push(FsckIssue {
-            code: FsckCode::BadBlockSize,
-            message: format!(
+        errors.push(hfs_issue(
+            HfsFsckCode::BadBlockSize,
+            format!(
                 "bad allocation block size: {} (must be a positive multiple of 512)",
                 mdb.block_size
             ),
-            node: None,
-        });
+        ));
     }
 }
 
@@ -1145,7 +1111,7 @@ fn check_btree_structure(
     catalog_data: &[u8],
     header: &BTreeHeader,
     errors: &mut Vec<FsckIssue>,
-    stats: &mut FsckStats,
+    leaf_nodes_visited: &mut u32,
 ) {
     let node_size = header.node_size as usize;
 
@@ -1153,14 +1119,13 @@ fn check_btree_structure(
     if catalog_data.len() >= 9 {
         let kind = catalog_data[8] as i8;
         if kind != BTREE_HEADER_NODE {
-            errors.push(FsckIssue {
-                code: FsckCode::HeaderNodeBadKind,
-                message: format!(
+            errors.push(hfs_issue(
+                HfsFsckCode::HeaderNodeBadKind,
+                format!(
                     "node 0 kind = {} (expected {} = header)",
                     kind, BTREE_HEADER_NODE
                 ),
-                node: Some(0),
-            });
+            ));
         }
     }
 
@@ -1175,14 +1140,13 @@ fn check_btree_structure(
                 BTREE_INDEX_NODE
             };
             if root_kind != expected_kind {
-                errors.push(FsckIssue {
-                    code: FsckCode::RootNodeBadKind,
-                    message: format!(
+                errors.push(hfs_issue(
+                    HfsFsckCode::RootNodeBadKind,
+                    format!(
                         "root node {} kind = {} (expected {} for depth {})",
                         header.root_node, root_kind, expected_kind, header.depth
                     ),
-                    node: Some(header.root_node),
-                });
+                ));
             }
         }
     }
@@ -1208,18 +1172,17 @@ fn check_btree_structure(
     }
 
     // Walk leaf chain and verify forward/backward links
-    let leaf_count = walk_leaf_chain(catalog_data, header, errors, stats);
+    let leaf_count = walk_leaf_chain(catalog_data, header, errors, leaf_nodes_visited);
 
     // Verify leaf record count
     if leaf_count != header.leaf_records {
-        errors.push(FsckIssue {
-            code: FsckCode::LeafRecordCountMismatch,
-            message: format!(
+        errors.push(hfs_issue(
+            HfsFsckCode::LeafRecordCountMismatch,
+            format!(
                 "leaf record count: walked {} but header says {}",
                 leaf_count, header.leaf_records
             ),
-            node: None,
-        });
+        ));
     }
 }
 
@@ -1239,21 +1202,20 @@ fn check_offset_table(
         let offset = BigEndian::read_u16(&node[pos..pos + 2]);
 
         if offset as usize >= node_size {
-            errors.push(FsckIssue {
-                code: FsckCode::OffsetTableOutOfBounds,
-                message: format!(
+            errors.push(hfs_issue(
+                HfsFsckCode::OffsetTableOutOfBounds,
+                format!(
                     "node {}: offset[{}] = {} >= node_size {}",
                     node_idx, i, offset, node_size
                 ),
-                node: Some(node_idx),
-            });
+            ));
             return; // no point checking further
         }
 
         if i > 0 && offset < prev_offset {
-            errors.push(FsckIssue {
-                code: FsckCode::OffsetTableNotMonotonic,
-                message: format!(
+            errors.push(hfs_issue(
+                HfsFsckCode::OffsetTableNotMonotonic,
+                format!(
                     "node {}: offset[{}] = {} < offset[{}] = {} (not monotonic)",
                     node_idx,
                     i,
@@ -1261,8 +1223,7 @@ fn check_offset_table(
                     i - 1,
                     prev_offset
                 ),
-                node: Some(node_idx),
-            });
+            ));
             return;
         }
         prev_offset = offset;
@@ -1275,7 +1236,7 @@ fn walk_leaf_chain(
     catalog_data: &[u8],
     header: &BTreeHeader,
     errors: &mut Vec<FsckIssue>,
-    stats: &mut FsckStats,
+    leaf_nodes_visited: &mut u32,
 ) -> u32 {
     let node_size = header.node_size as usize;
     let mut total_records = 0u32;
@@ -1285,21 +1246,19 @@ fn walk_leaf_chain(
 
     while node_idx != 0 {
         if !visited.insert(node_idx) {
-            errors.push(FsckIssue {
-                code: FsckCode::LeafChainBroken,
-                message: format!("leaf chain loop detected at node {}", node_idx),
-                node: Some(node_idx),
-            });
+            errors.push(hfs_issue(
+                HfsFsckCode::LeafChainBroken,
+                format!("leaf chain loop detected at node {}", node_idx),
+            ));
             break;
         }
 
         let off = node_idx as usize * node_size;
         if off + node_size > catalog_data.len() {
-            errors.push(FsckIssue {
-                code: FsckCode::LeafChainBroken,
-                message: format!("leaf node {} offset out of range", node_idx),
-                node: Some(node_idx),
-            });
+            errors.push(hfs_issue(
+                HfsFsckCode::LeafChainBroken,
+                format!("leaf node {} offset out of range", node_idx),
+            ));
             break;
         }
 
@@ -1310,31 +1269,29 @@ fn walk_leaf_chain(
         let num_records = BigEndian::read_u16(&node[10..12]) as u32;
 
         if kind != BTREE_LEAF_NODE {
-            errors.push(FsckIssue {
-                code: FsckCode::LeafChainBroken,
-                message: format!(
+            errors.push(hfs_issue(
+                HfsFsckCode::LeafChainBroken,
+                format!(
                     "node {} in leaf chain has kind {} (expected leaf = {})",
                     node_idx, kind, BTREE_LEAF_NODE
                 ),
-                node: Some(node_idx),
-            });
+            ));
             break;
         }
 
         // Verify backlink
-        if stats.leaf_nodes_visited > 0 && blink != prev_idx {
-            errors.push(FsckIssue {
-                code: FsckCode::LeafBacklinkMismatch,
-                message: format!(
+        if *leaf_nodes_visited > 0 && blink != prev_idx {
+            errors.push(hfs_issue(
+                HfsFsckCode::LeafBacklinkMismatch,
+                format!(
                     "node {}: bLink = {} but previous node was {}",
                     node_idx, blink, prev_idx
                 ),
-                node: Some(node_idx),
-            });
+            ));
         }
 
         total_records += num_records;
-        stats.leaf_nodes_visited += 1;
+        *leaf_nodes_visited += 1;
         prev_idx = node_idx;
         node_idx = flink;
     }
@@ -1385,7 +1342,10 @@ fn check_catalog_consistency(
     header: &BTreeHeader,
     errors: &mut Vec<FsckIssue>,
     warnings: &mut Vec<FsckIssue>,
-    stats: &mut FsckStats,
+    files_checked: &mut u32,
+    directories_checked: &mut u32,
+    orphaned_threads: &mut u32,
+    orphaned_entries: &mut Vec<OrphanedEntry>,
 ) {
     // Scan all leaf records
     let entries = collect_catalog_entries(catalog_data, header);
@@ -1416,7 +1376,7 @@ fn check_catalog_consistency(
                 if *dir_id > max_cnid {
                     max_cnid = *dir_id;
                 }
-                stats.directories_checked += 1;
+                *directories_checked += 1;
             }
             CatalogEntry::File { key, file_id, .. } => {
                 file_records.insert(*file_id, (key.parent_id, key.name.clone()));
@@ -1424,7 +1384,7 @@ fn check_catalog_consistency(
                 if *file_id > max_cnid {
                     max_cnid = *file_id;
                 }
-                stats.files_checked += 1;
+                *files_checked += 1;
             }
             CatalogEntry::DirThread {
                 key_cnid,
@@ -1445,14 +1405,13 @@ fn check_catalog_consistency(
 
     // Check next_catalog_id > max CNID
     if mdb.next_catalog_id <= max_cnid {
-        errors.push(FsckIssue {
-            code: FsckCode::NextCatalogIdTooLow,
-            message: format!(
+        errors.push(hfs_issue(
+            HfsFsckCode::NextCatalogIdTooLow,
+            format!(
                 "next_catalog_id {} <= max CNID {} found in catalog",
                 mdb.next_catalog_id, max_cnid
             ),
-            node: None,
-        });
+        ));
     }
 
     // Verify thread ↔ record consistency for directories
@@ -1460,44 +1419,44 @@ fn check_catalog_consistency(
         if dir_id == 2 {
             // Root folder — thread should exist but parent/name rules are special
             if !dir_threads.contains_key(&dir_id) {
-                errors.push(FsckIssue {
-                    code: FsckCode::MissingDirThread,
-                    message: format!("directory CNID {} has no thread record", dir_id),
-                    node: None,
-                });
+                errors.push(hfs_issue(
+                    HfsFsckCode::MissingDirThread,
+                    format!("directory CNID {} has no thread record", dir_id),
+                ));
             }
             continue;
         }
         match dir_threads.get(&dir_id) {
             None => {
-                errors.push(FsckIssue {
-                    code: FsckCode::MissingDirThread,
-                    message: format!("directory CNID {} has no thread record", dir_id),
-                    node: None,
-                });
+                errors.push(hfs_issue(
+                    HfsFsckCode::MissingDirThread,
+                    format!("directory CNID {} has no thread record", dir_id),
+                ));
             }
             Some((thr_parent, thr_name)) => {
                 if *thr_parent != parent_id || *thr_name != *name {
-                    errors.push(FsckIssue {
-                        code: FsckCode::ThreadParentNameMismatch,
-                        message: format!(
+                    errors.push(hfs_issue(HfsFsckCode::ThreadParentNameMismatch, format!(
                             "directory CNID {} thread points to parent {} but record key has parent {}",
                             dir_id, thr_parent, parent_id
-                        ),
-                        node: None,
-                    });
+                        )));
                 }
             }
         }
         // Verify parent exists
         if parent_id != 1 && !dir_records.contains_key(&parent_id) {
-            errors.push(FsckIssue {
-                code: FsckCode::OrphanedRecord,
-                message: format!(
-                    "directory CNID {} references parent {} which doesn't exist",
-                    dir_id, parent_id
+            let decoded_name = mac_roman_to_utf8(name);
+            errors.push(hfs_issue(
+                HfsFsckCode::MissingParent,
+                format!(
+                    "directory \"{}\" (CNID {}) references parent {} which doesn't exist",
+                    decoded_name, dir_id, parent_id
                 ),
-                node: None,
+            ));
+            orphaned_entries.push(OrphanedEntry {
+                id: dir_id as u64,
+                name: decoded_name,
+                is_directory: true,
+                missing_parent_id: parent_id as u64,
             });
         }
     }
@@ -1509,27 +1468,32 @@ fn check_catalog_consistency(
         if let Some((thr_parent, thr_name)) = file_threads.get(&file_id) {
             // Thread exists — verify it matches the record
             if *thr_parent != parent_id || *thr_name != *name {
-                errors.push(FsckIssue {
-                    code: FsckCode::ThreadParentNameMismatch,
-                    message: format!(
+                errors.push(hfs_issue(
+                    HfsFsckCode::ThreadParentNameMismatch,
+                    format!(
                         "file CNID {} thread points to parent {} but record key has parent {}",
                         file_id, thr_parent, parent_id
                     ),
-                    node: None,
-                });
+                ));
             }
         }
         // Not having a file thread is normal in classic HFS — no warning needed.
 
         // Verify parent exists
         if parent_id != 1 && !dir_records.contains_key(&parent_id) {
-            errors.push(FsckIssue {
-                code: FsckCode::OrphanedRecord,
-                message: format!(
-                    "file CNID {} references parent {} which doesn't exist",
-                    file_id, parent_id
+            let decoded_name = mac_roman_to_utf8(name);
+            errors.push(hfs_issue(
+                HfsFsckCode::MissingParent,
+                format!(
+                    "file \"{}\" (CNID {}) references parent {} which doesn't exist",
+                    decoded_name, file_id, parent_id
                 ),
-                node: None,
+            ));
+            orphaned_entries.push(OrphanedEntry {
+                id: file_id as u64,
+                name: decoded_name,
+                is_directory: false,
+                missing_parent_id: parent_id as u64,
             });
         }
     }
@@ -1537,62 +1501,57 @@ fn check_catalog_consistency(
     // Check for orphaned threads (threads with no matching record)
     for &cnid in dir_threads.keys() {
         if !dir_records.contains_key(&cnid) {
-            stats.orphaned_threads += 1;
-            warnings.push(FsckIssue {
-                code: FsckCode::OrphanedRecord,
-                message: format!("orphaned directory thread for CNID {}", cnid),
-                node: None,
-            });
+            *orphaned_threads += 1;
+            warnings.push(hfs_issue(
+                HfsFsckCode::OrphanedThread,
+                format!("orphaned directory thread for CNID {}", cnid),
+            ));
         }
     }
     for &cnid in file_threads.keys() {
         if !file_records.contains_key(&cnid) {
-            stats.orphaned_threads += 1;
-            warnings.push(FsckIssue {
-                code: FsckCode::OrphanedRecord,
-                message: format!("orphaned file thread for CNID {}", cnid),
-                node: None,
-            });
+            *orphaned_threads += 1;
+            warnings.push(hfs_issue(
+                HfsFsckCode::OrphanedThread,
+                format!("orphaned file thread for CNID {}", cnid),
+            ));
         }
     }
 
     // Verify file_count and folder_count match MDB
     // HFS folder_count includes the root directory (CNID 2)
-    let actual_file_count = stats.files_checked;
-    let actual_folder_count = stats.directories_checked;
+    let actual_file_count = *files_checked;
+    let actual_folder_count = *directories_checked;
     if actual_file_count != mdb.file_count {
-        errors.push(FsckIssue {
-            code: FsckCode::FileCountMismatch,
-            message: format!(
+        errors.push(hfs_issue(
+            HfsFsckCode::FileCountMismatch,
+            format!(
                 "MDB file_count = {} but catalog has {} file records",
                 mdb.file_count, actual_file_count
             ),
-            node: None,
-        });
+        ));
     }
     if actual_folder_count != mdb.folder_count {
-        errors.push(FsckIssue {
-            code: FsckCode::FolderCountMismatch,
-            message: format!(
+        errors.push(hfs_issue(
+            HfsFsckCode::FolderCountMismatch,
+            format!(
                 "MDB folder_count = {} but catalog has {} directory records",
                 mdb.folder_count, actual_folder_count
             ),
-            node: None,
-        });
+        ));
     }
 
     // Verify valence matches actual children count
     for (&dir_id, &(_parent_id, ref _name, valence)) in &dir_records {
         let actual = children_count.get(&dir_id).copied().unwrap_or(0);
         if actual != valence as u32 {
-            errors.push(FsckIssue {
-                code: FsckCode::ValenceMismatch,
-                message: format!(
+            errors.push(hfs_issue(
+                HfsFsckCode::ValenceMismatch,
+                format!(
                     "directory CNID {} valence = {} but has {} children",
                     dir_id, valence, actual
                 ),
-                node: None,
-            });
+            ));
         }
     }
 }
@@ -1933,23 +1892,21 @@ fn check_extents_and_bitmap(
     // Check extents are in range and mark them
     for (start, count, ref label) in &extent_blocks {
         if *start + *count > total_blocks {
-            errors.push(FsckIssue {
-                code: FsckCode::ExtentOutOfRange,
-                message: format!(
+            errors.push(hfs_issue(
+                HfsFsckCode::ExtentOutOfRange,
+                format!(
                     "{}: extent [{}, +{}) exceeds total_blocks {}",
                     label, start, count, total_blocks
                 ),
-                node: None,
-            });
+            ));
             continue;
         }
         for b in *start..*start + *count {
             if bitmap_test_bit_be(&computed_bitmap, b) {
-                errors.push(FsckIssue {
-                    code: FsckCode::OverlappingExtents,
-                    message: format!("{}: block {} already allocated by another extent", label, b),
-                    node: None,
-                });
+                errors.push(hfs_issue(
+                    HfsFsckCode::OverlappingExtents,
+                    format!("{}: block {} already allocated by another extent", label, b),
+                ));
                 break; // one report per extent is enough
             }
             super::hfs_common::bitmap_set_bit_be(&mut computed_bitmap, b);
@@ -1969,24 +1926,22 @@ fn check_extents_and_bitmap(
                 } else {
                     "free in catalog but allocated in bitmap"
                 };
-                warnings.push(FsckIssue {
-                    code: FsckCode::BitmapMismatch,
-                    message: format!("block {}: {}", block, direction),
-                    node: None,
-                });
+                warnings.push(hfs_issue(
+                    HfsFsckCode::BitmapMismatch,
+                    format!("block {}: {}", block, direction),
+                ));
             }
         }
     }
     if mismatch_count > MAX_BITMAP_MISMATCHES {
-        warnings.push(FsckIssue {
-            code: FsckCode::BitmapMismatch,
-            message: format!(
+        warnings.push(hfs_issue(
+            HfsFsckCode::BitmapMismatch,
+            format!(
                 "... and {} more bitmap mismatches (total {})",
                 mismatch_count - MAX_BITMAP_MISMATCHES,
                 mismatch_count
             ),
-            node: None,
-        });
+        ));
     }
 
     // Verify free block count
@@ -1997,14 +1952,13 @@ fn check_extents_and_bitmap(
         }
     }
     if actual_free != mdb.free_blocks as u32 {
-        errors.push(FsckIssue {
-            code: FsckCode::FreeBlockCountMismatch,
-            message: format!(
+        errors.push(hfs_issue(
+            HfsFsckCode::FreeBlockCountMismatch,
+            format!(
                 "MDB free_blocks = {} but bitmap has {} free blocks",
                 mdb.free_blocks, actual_free
             ),
-            node: None,
-        });
+        ));
     }
 }
 
@@ -2022,14 +1976,13 @@ fn mark_extents(
         let start = ext.start_block as u32;
         let count = ext.block_count as u32;
         if start + count > total_blocks {
-            errors.push(FsckIssue {
-                code: FsckCode::ExtentOutOfRange,
-                message: format!(
+            errors.push(hfs_issue(
+                HfsFsckCode::ExtentOutOfRange,
+                format!(
                     "{}: extent [{}, +{}) exceeds total_blocks {}",
                     label, start, count, total_blocks
                 ),
-                node: None,
-            });
+            ));
             continue;
         }
         for b in start..start + count {
@@ -2043,44 +1996,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_fsck_code_display() {
-        assert_eq!(format!("{}", FsckCode::BadSignature), "BadSignature");
-        assert_eq!(format!("{}", FsckCode::LeafChainBroken), "LeafChainBroken");
+    fn test_fsck_code_to_string() {
+        let issue = hfs_issue(HfsFsckCode::BadSignature, "test");
+        assert_eq!(issue.code, "BadSignature");
+        let issue = hfs_issue(HfsFsckCode::LeafChainBroken, "test");
+        assert_eq!(issue.code, "LeafChainBroken");
     }
 
     #[test]
     fn test_fsck_result_is_clean() {
         let result = FsckResult {
             errors: vec![],
-            warnings: vec![FsckIssue {
-                code: FsckCode::BitmapMismatch,
-                message: "minor".into(),
-                node: None,
-            }],
-            stats: FsckStats {
-                files_checked: 0,
-                directories_checked: 0,
-                leaf_nodes_visited: 0,
-                orphaned_threads: 0,
-            },
+            warnings: vec![hfs_issue(HfsFsckCode::BitmapMismatch, "minor")],
+            stats: build_stats(0, 0, 0, 0),
             repairable: false,
+            orphaned_entries: vec![],
         };
         assert!(result.is_clean()); // warnings don't count
 
         let result_err = FsckResult {
-            errors: vec![FsckIssue {
-                code: FsckCode::BadSignature,
-                message: "bad".into(),
-                node: None,
-            }],
+            errors: vec![hfs_issue(HfsFsckCode::BadSignature, "bad")],
             warnings: vec![],
-            stats: FsckStats {
-                files_checked: 0,
-                directories_checked: 0,
-                leaf_nodes_visited: 0,
-                orphaned_threads: 0,
-            },
+            stats: build_stats(0, 0, 0, 0),
             repairable: true,
+            orphaned_entries: vec![],
         };
         assert!(!result_err.is_clean());
     }
@@ -2103,14 +2042,14 @@ mod tests {
         errors.clear();
         check_mdb(&mdb, &mut errors);
         assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].code, FsckCode::BadBlockSize);
+        assert_eq!(errors[0].code, "BadBlockSize");
 
         // Zero is invalid
         mdb.block_size = 0;
         errors.clear();
         check_mdb(&mdb, &mut errors);
         assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].code, FsckCode::BadBlockSize);
+        assert_eq!(errors[0].code, "BadBlockSize");
     }
 
     fn make_test_mdb() -> HfsMasterDirectoryBlock {

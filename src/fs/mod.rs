@@ -4,6 +4,7 @@ pub mod exfat;
 pub mod ext;
 pub mod fat;
 pub mod filesystem;
+pub mod fsck;
 pub mod hfs;
 pub(crate) mod hfs_common;
 pub mod hfs_fsck;
@@ -29,10 +30,10 @@ pub use filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, ResourceForkSource,
 };
 use filesystem::{Filesystem, FilesystemError};
+pub use fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry, RepairReport};
 pub use hfs::{
     patch_hfs_hidden_sectors, resize_hfs_in_place, validate_hfs_integrity, CompactHfsReader,
 };
-pub use hfs_fsck::{FsckResult, RepairReport};
 pub use hfsplus::{
     patch_hfsplus_hidden_sectors, resize_hfsplus_in_place, validate_hfsplus_integrity,
     CompactHfsPlusReader,

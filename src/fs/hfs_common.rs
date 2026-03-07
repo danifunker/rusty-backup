@@ -881,8 +881,13 @@ where
     let mut parent_chain: Vec<(u32, u32)> = Vec::new();
     let mut current_node = header.root_node;
     let mut parent_node = 0u32;
+    let mut visited = std::collections::HashSet::new();
 
     loop {
+        // Cycle detection: bail if we revisit a node
+        if !visited.insert(current_node) {
+            return (None, parent_chain);
+        }
         let offset = current_node as usize * node_size;
         if offset + node_size > catalog_data.len() {
             return (None, parent_chain);
@@ -963,8 +968,13 @@ where
     let mut parent_chain: Vec<(u32, u32)> = Vec::new();
     let mut current_node = header.root_node;
     let mut parent_node = 0u32;
+    let mut visited = std::collections::HashSet::new();
 
     loop {
+        // Cycle detection: bail to first leaf if we revisit a node
+        if !visited.insert(current_node) {
+            return (header.first_leaf_node, parent_chain);
+        }
         let offset = current_node as usize * node_size;
         if offset + node_size > catalog_data.len() {
             return (current_node, parent_chain);

@@ -74,7 +74,7 @@ pub trait Filesystem: Send {
 
     /// Run filesystem integrity check. Returns `None` if not supported for
     /// this filesystem type. Override in implementations that support fsck.
-    fn fsck(&mut self) -> Option<Result<super::hfs_fsck::FsckResult, FilesystemError>> {
+    fn fsck(&mut self) -> Option<Result<super::fsck::FsckResult, FilesystemError>> {
         None
     }
 }
@@ -235,7 +235,7 @@ pub trait EditableFilesystem: Filesystem {
 
     /// Attempt to repair filesystem issues found by fsck.
     /// Default returns an error indicating repair is not supported.
-    fn repair(&mut self) -> Result<super::hfs_fsck::RepairReport, FilesystemError> {
+    fn repair(&mut self) -> Result<super::fsck::RepairReport, FilesystemError> {
         Err(FilesystemError::Unsupported(
             "repair not supported for this filesystem".into(),
         ))
