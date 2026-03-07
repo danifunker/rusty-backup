@@ -128,6 +128,12 @@ pub struct BrowseView {
     show_repair_confirm: bool,
     /// Result of a repair operation.
     repair_report: Option<rusty_backup::fs::RepairReport>,
+    /// Cached tree-view text output.
+    tree_text: Option<String>,
+    /// Whether to show the tree-view popup.
+    show_tree_popup: bool,
+    /// Whether the tree popup shows filesystem IDs.
+    tree_show_ids: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -181,6 +187,9 @@ impl Default for BrowseView {
             show_fsck_popup: false,
             show_repair_confirm: false,
             repair_report: None,
+            tree_text: None,
+            show_tree_popup: false,
+            tree_show_ids: false,
         }
     }
 }
@@ -404,6 +413,9 @@ impl BrowseView {
         self.show_fsck_popup = false;
         self.show_repair_confirm = false;
         self.repair_report = None;
+        self.tree_text = None;
+        self.show_tree_popup = false;
+        self.tree_show_ids = false;
         // Clean up archive temp file if present
         if let Some(temp) = self.archive_temp_path.take() {
             let _ = std::fs::remove_file(&temp);
@@ -510,6 +522,10 @@ impl BrowseView {
                         self.error = Some(format!("Failed to open filesystem: {}", e));
                     }
                 }
+            }
+
+            if ui.button("Tree").clicked() {
+                self.generate_tree_text();
             }
 
             if ui.button("Close").clicked() {
@@ -631,6 +647,7 @@ impl BrowseView {
 
         // Fsck results popup window
         self.render_fsck_popup(ui);
+        self.render_tree_popup(ui);
     }
 
     fn render_tree_entry(&mut self, ui: &mut egui::Ui, entry: &FileEntry) {
@@ -1876,6 +1893,93 @@ impl BrowseView {
             },
             Err(e) => {
                 self.error = Some(format!("Failed to open filesystem for repair: {}", e));
+            }
+        }
+    }
+
+    fn generate_tree_text(&mut self) {
+        match self.open_fs() {
+            Ok(mut fs) => {
+                let result = if self.tree_show_ids {
+                    rusty_backup::fs::tree::format_tree_with_ids(&mut *fs)
+                } else {
+                    rusty_backup::fs::tree::format_tree(&mut *fs)
+                };
+                match result {
+                    Ok(text) => {
+                        self.tree_text = Some(text);
+                        self.show_tree_popup = true;
+                    }
+                    Err(e) => {
+                        self.error = Some(format!("Failed to generate tree: {}", e));
+                    }
+                }
+            }
+            Err(e) => {
+                self.error = Some(format!("Failed to open filesystem: {}", e));
+            }
+        }
+    }
+
+    fn render_tree_popup(&mut self, ui: &mut egui::Ui) {
+        if !self.show_tree_popup {
+            return;
+        }
+        let mut open = true;
+        let mut save_requested = false;
+        let mut regenerate = false;
+        egui::Window::new("Tree View")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(600.0)
+            .default_height(500.0)
+            .show(ui.ctx(), |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Copy to Clipboard").clicked() {
+                        if let Some(text) = &self.tree_text {
+                            ui.ctx().copy_text(text.clone());
+                        }
+                    }
+                    if ui.button("Save to File...").clicked() {
+                        save_requested = true;
+                    }
+                    ui.add_space(16.0);
+                    if ui.checkbox(&mut self.tree_show_ids, "Show IDs").changed() {
+                        regenerate = true;
+                    }
+                });
+                ui.separator();
+                if let Some(text) = &self.tree_text {
+                    egui::ScrollArea::both()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut text.as_str())
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(f32::INFINITY),
+                            );
+                        });
+                }
+            });
+        if !open {
+            self.show_tree_popup = false;
+        }
+        if regenerate {
+            self.generate_tree_text();
+        }
+        if save_requested {
+            if let Some(text) = &self.tree_text {
+                let text = text.clone();
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Save tree view")
+                    .set_file_name("tree.txt")
+                    .add_filter("Text files", &["txt"])
+                    .save_file()
+                {
+                    if let Err(e) = std::fs::write(&path, &text) {
+                        self.error = Some(format!("Failed to save tree: {}", e));
+                    }
+                }
             }
         }
     }

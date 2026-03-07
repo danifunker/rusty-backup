@@ -12,6 +12,7 @@ pub mod hfsplus;
 pub mod ntfs;
 pub mod prodos;
 pub mod resource_fork;
+pub mod tree;
 pub mod unix_common;
 pub mod zstd_stream;
 
