@@ -94,6 +94,16 @@ pub struct InspectTab {
     editor_add_bootable: bool,
     /// Resize popup (in-place partition resizing)
     resize_popup: Option<Box<super::resize_popup::ResizePopup>>,
+    /// Last filesystem check result (for popup display).
+    fsck_result: Option<rusty_backup::fs::FsckResult>,
+    /// Whether to show the fsck results popup.
+    show_fsck_popup: bool,
+    /// Whether to show the repair confirmation dialog.
+    show_repair_confirm: bool,
+    /// Result of a repair operation.
+    repair_report: Option<rusty_backup::fs::RepairReport>,
+    /// Context for pending repair: (offset, ptype, type_string).
+    repair_context: Option<(u64, u8, Option<String>)>,
 }
 
 /// Working copy of a partition entry in the editor.
@@ -259,6 +269,11 @@ impl Default for InspectTab {
             editor_add_type: String::new(),
             editor_add_bootable: false,
             resize_popup: None,
+            fsck_result: None,
+            show_fsck_popup: false,
+            show_repair_confirm: false,
+            repair_report: None,
+            repair_context: None,
         }
     }
 }
@@ -2487,6 +2502,8 @@ impl InspectTab {
 
         // Browse request: (partition_index, offset, partition_type_byte)
         let mut browse_request: Option<(usize, u64, u8, Option<String>)> = None;
+        // Check (fsck) request: same tuple format
+        let mut check_request: Option<(u64, u8, Option<String>)> = None;
 
         egui::Grid::new("partition_table")
             .striped(true)
@@ -2593,21 +2610,27 @@ impl InspectTab {
                             || is_browsable_type_string(part.partition_type_string.as_deref())
                             || is_browsable_superfloppy(part.partition_type_byte, &part.type_name)
                         {
+                            let ptype = if part.partition_type_byte != 0 {
+                                part.partition_type_byte
+                            } else {
+                                infer_fat_type_byte(&part.type_name)
+                            };
                             if ui.small_button("Browse").clicked() {
-                                // Use the stored type byte, or infer one
-                                // from the name for old backups that didn't
-                                // store partition_type_byte.
-                                let ptype = if part.partition_type_byte != 0 {
-                                    part.partition_type_byte
-                                } else {
-                                    infer_fat_type_byte(&part.type_name)
-                                };
                                 browse_request = Some((
                                     part.index,
                                     part.start_lba * 512,
                                     ptype,
                                     part.partition_type_string.clone(),
                                 ));
+                            }
+                            if is_checkable_type(ptype, part.partition_type_string.as_deref()) {
+                                if ui.small_button("Check").clicked() {
+                                    check_request = Some((
+                                        part.start_lba * 512,
+                                        ptype,
+                                        part.partition_type_string.clone(),
+                                    ));
+                                }
                             }
                         } else {
                             ui.label("");
@@ -2620,6 +2643,319 @@ impl InspectTab {
         // Handle browse request outside the grid (avoids borrow issues)
         if let Some((part_index, offset, ptype, type_string)) = browse_request {
             self.open_browse(part_index, offset, ptype, type_string, devices, log);
+        }
+
+        // Handle check (fsck) request
+        if let Some((offset, ptype, type_string)) = check_request {
+            self.run_fsck(offset, ptype, type_string.clone(), devices, log);
+            self.repair_context = Some((offset, ptype, type_string));
+            self.repair_report = None;
+        }
+
+        // Fsck results popup
+        self.render_fsck_popup(ui, devices, log);
+    }
+
+    /// Run filesystem check on a partition and display results.
+    fn run_fsck(
+        &mut self,
+        offset: u64,
+        ptype: u8,
+        type_string: Option<String>,
+        devices: &[DiskDevice],
+        log: &mut LogPanel,
+    ) {
+        // Resolve source path from device or image file
+        let source_path = self
+            .selected_device_idx
+            .and_then(|idx| devices.get(idx))
+            .map(|d| d.path.clone())
+            .or_else(|| self.image_file_path.clone());
+
+        let path = match source_path {
+            Some(p) => p,
+            None => {
+                log.error("No source available for filesystem check");
+                return;
+            }
+        };
+
+        match std::fs::File::open(&path) {
+            Ok(file) => {
+                let reader = BufReader::new(file);
+                match rusty_backup::fs::open_filesystem(
+                    reader,
+                    offset,
+                    ptype,
+                    type_string.as_deref(),
+                ) {
+                    Ok(mut fs) => match fs.fsck() {
+                        Some(Ok(result)) => {
+                            if result.is_clean() {
+                                log.info(format!(
+                                    "Filesystem check: clean ({} files, {} dirs)",
+                                    result.stats.files_checked, result.stats.directories_checked,
+                                ));
+                            } else {
+                                log.warn(format!(
+                                    "Filesystem check: {} error(s), {} warning(s)",
+                                    result.errors.len(),
+                                    result.warnings.len(),
+                                ));
+                            }
+                            self.fsck_result = Some(result);
+                            self.show_fsck_popup = true;
+                        }
+                        Some(Err(e)) => {
+                            log.error(format!("Filesystem check failed: {}", e));
+                        }
+                        None => {
+                            log.info("Filesystem check not supported for this filesystem type");
+                        }
+                    },
+                    Err(e) => {
+                        log.error(format!("Failed to open filesystem: {}", e));
+                    }
+                }
+            }
+            Err(e) => {
+                log.error(format!("Failed to open file: {}", e));
+            }
+        }
+    }
+
+    /// Render the filesystem check results popup.
+    fn render_fsck_popup(&mut self, ui: &mut egui::Ui, devices: &[DiskDevice], log: &mut LogPanel) {
+        if !self.show_fsck_popup {
+            return;
+        }
+        let mut open = true;
+        let mut do_repair = false;
+        egui::Window::new("Filesystem Check Results")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(500.0)
+            .show(ui.ctx(), |ui| {
+                if let Some(result) = &self.fsck_result {
+                    if result.is_clean() {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(100, 200, 100),
+                            "Filesystem is clean.",
+                        );
+                    } else {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 100, 100),
+                            format!("{} error(s) found.", result.errors.len()),
+                        );
+                    }
+
+                    ui.separator();
+
+                    // Stats
+                    ui.label(format!(
+                        "Files: {}  Directories: {}  Leaf nodes: {}",
+                        result.stats.files_checked,
+                        result.stats.directories_checked,
+                        result.stats.leaf_nodes_visited,
+                    ));
+                    if result.stats.orphaned_threads > 0 {
+                        ui.label(format!(
+                            "Orphaned threads: {}",
+                            result.stats.orphaned_threads
+                        ));
+                    }
+
+                    // Errors
+                    if !result.errors.is_empty() {
+                        ui.separator();
+                        ui.label(egui::RichText::new("Errors:").strong());
+                        egui::ScrollArea::vertical()
+                            .id_salt("fsck_errors_inspect")
+                            .max_height(200.0)
+                            .show(ui, |ui| {
+                                for issue in &result.errors {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(255, 100, 100),
+                                        format!("[{}] {}", issue.code, issue.message),
+                                    );
+                                }
+                            });
+                    }
+
+                    // Warnings
+                    if !result.warnings.is_empty() {
+                        ui.separator();
+                        ui.label(egui::RichText::new("Warnings:").strong());
+                        egui::ScrollArea::vertical()
+                            .id_salt("fsck_warnings_inspect")
+                            .max_height(200.0)
+                            .show(ui, |ui| {
+                                for issue in &result.warnings {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(255, 200, 100),
+                                        format!("[{}] {}", issue.code, issue.message),
+                                    );
+                                }
+                            });
+                    }
+
+                    // Repair button
+                    if result.repairable {
+                        ui.separator();
+                        if ui.button("Repair").clicked() {
+                            do_repair = true;
+                        }
+                    }
+
+                    // Repair report
+                    if let Some(ref report) = self.repair_report {
+                        ui.separator();
+                        ui.label(egui::RichText::new("Repair Report:").strong());
+                        if !report.fixes_applied.is_empty() {
+                            for fix in &report.fixes_applied {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(100, 200, 100),
+                                    format!("  {}", fix),
+                                );
+                            }
+                        }
+                        if !report.fixes_failed.is_empty() {
+                            for fail in &report.fixes_failed {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(255, 100, 100),
+                                    format!("  {}", fail),
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+        if !open {
+            self.show_fsck_popup = false;
+        }
+        if do_repair {
+            self.show_repair_confirm = true;
+        }
+
+        // Repair confirmation dialog
+        self.render_repair_confirm_inspect(ui, devices, log);
+    }
+
+    /// Render the repair confirmation dialog for the inspect tab.
+    fn render_repair_confirm_inspect(
+        &mut self,
+        ui: &mut egui::Ui,
+        devices: &[DiskDevice],
+        log: &mut LogPanel,
+    ) {
+        if !self.show_repair_confirm {
+            return;
+        }
+        let repairable_count = self
+            .fsck_result
+            .as_ref()
+            .map(|r| {
+                r.errors
+                    .iter()
+                    .filter(|e| {
+                        rusty_backup::fs::hfs_fsck::classify_repair(&e.code)
+                            != rusty_backup::fs::hfs_fsck::RepairAction::NotRepairable
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+
+        let mut confirmed = false;
+        let mut cancelled = false;
+        egui::Window::new("Repair Filesystem?")
+            .collapsible(false)
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                ui.label(format!(
+                    "This will attempt to fix {} repairable error(s). \
+                     Unrepairable issues (B-tree structural damage) will be skipped.\n\n\
+                     Continue?",
+                    repairable_count
+                ));
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() {
+                        confirmed = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancelled = true;
+                    }
+                });
+            });
+
+        if cancelled {
+            self.show_repair_confirm = false;
+        }
+        if confirmed {
+            self.show_repair_confirm = false;
+            self.run_repair_inspect(devices, log);
+        }
+    }
+
+    /// Execute repair on the filesystem via inspect tab context.
+    fn run_repair_inspect(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {
+        let (offset, ptype, type_string) = match &self.repair_context {
+            Some(ctx) => ctx.clone(),
+            None => {
+                log.error("No repair context available");
+                return;
+            }
+        };
+
+        let source_path = self
+            .selected_device_idx
+            .and_then(|idx| devices.get(idx))
+            .map(|d| d.path.clone())
+            .or_else(|| self.image_file_path.clone());
+
+        let path = match source_path {
+            Some(p) => p,
+            None => {
+                log.error("No source available for repair");
+                return;
+            }
+        };
+
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(file) => {
+                match rusty_backup::fs::open_editable_filesystem(
+                    file,
+                    offset,
+                    ptype,
+                    type_string.as_deref(),
+                ) {
+                    Ok(mut efs) => match efs.repair() {
+                        Ok(report) => {
+                            log.info(format!(
+                                "Repair complete: {} fix(es) applied, {} failed",
+                                report.fixes_applied.len(),
+                                report.fixes_failed.len(),
+                            ));
+                            self.repair_report = Some(report);
+                            // Re-run fsck to show updated state
+                            drop(efs);
+                            self.run_fsck(offset, ptype, type_string, devices, log);
+                        }
+                        Err(e) => {
+                            log.error(format!("Repair failed: {}", e));
+                        }
+                    },
+                    Err(e) => {
+                        log.error(format!("Failed to open filesystem for repair: {}", e));
+                    }
+                }
+            }
+            Err(e) => {
+                log.error(format!("Failed to open file for repair: {}", e));
+            }
         }
     }
 
@@ -3229,6 +3565,12 @@ fn format_size_decimal(bytes: u64) -> String {
     } else {
         format!("{:.1} MB", b / MB)
     }
+}
+
+/// Check if a partition type supports filesystem checking (fsck).
+/// Currently only classic HFS (0xAF or APM "Apple_HFS").
+fn is_checkable_type(ptype: u8, type_str: Option<&str>) -> bool {
+    ptype == 0xAF || matches!(type_str, Some("Apple_HFS"))
 }
 
 /// Format a byte count with digit grouping for readability

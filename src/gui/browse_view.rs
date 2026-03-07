@@ -120,6 +120,14 @@ pub struct BrowseView {
     archive_temp_path: Option<PathBuf>,
     /// Blessed (bootable) system folder info (HFS/HFS+ only).
     blessed_folder: Option<(u64, String)>,
+    /// Last filesystem check result (for popup display).
+    fsck_result: Option<rusty_backup::fs::FsckResult>,
+    /// Whether to show the fsck results popup.
+    show_fsck_popup: bool,
+    /// Whether to show the repair confirmation dialog.
+    show_repair_confirm: bool,
+    /// Result of a repair operation.
+    repair_report: Option<rusty_backup::fs::RepairReport>,
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +177,10 @@ impl Default for BrowseView {
             archive_edit_progress: None,
             archive_temp_path: None,
             blessed_folder: None,
+            fsck_result: None,
+            show_fsck_popup: false,
+            show_repair_confirm: false,
+            repair_report: None,
         }
     }
 }
@@ -388,6 +400,10 @@ impl BrowseView {
         self.show_new_folder_dialog = false;
         self.pending_delete = None;
         self.blessed_folder = None;
+        self.fsck_result = None;
+        self.show_fsck_popup = false;
+        self.show_repair_confirm = false;
+        self.repair_report = None;
         // Clean up archive temp file if present
         if let Some(temp) = self.archive_temp_path.take() {
             let _ = std::fs::remove_file(&temp);
@@ -471,6 +487,28 @@ impl BrowseView {
                 }
                 if !self.edit_mode && btn.hovered() {
                     btn.on_hover_text("Enable editing to add or delete files on this image");
+                }
+            }
+
+            // Check filesystem button (HFS only for now)
+            if self.fs_type == "HFS" && ui.button("Check").clicked() {
+                match self.open_fs() {
+                    Ok(mut fs) => match fs.fsck() {
+                        Some(Ok(result)) => {
+                            self.fsck_result = Some(result);
+                            self.show_fsck_popup = true;
+                        }
+                        Some(Err(e)) => {
+                            self.error = Some(format!("Filesystem check failed: {}", e));
+                        }
+                        None => {
+                            self.error =
+                                Some("Filesystem check not supported for this type".into());
+                        }
+                    },
+                    Err(e) => {
+                        self.error = Some(format!("Failed to open filesystem: {}", e));
+                    }
                 }
             }
 
@@ -590,6 +628,9 @@ impl BrowseView {
                 self.render_content_panel(ui, panel_height);
             });
         });
+
+        // Fsck results popup window
+        self.render_fsck_popup(ui);
     }
 
     fn render_tree_entry(&mut self, ui: &mut egui::Ui, entry: &FileEntry) {
@@ -1580,6 +1621,204 @@ impl BrowseView {
                 self.show_new_folder_dialog = false;
             }
         });
+    }
+
+    /// Render the filesystem check results popup.
+    fn render_fsck_popup(&mut self, ui: &mut egui::Ui) {
+        if !self.show_fsck_popup {
+            return;
+        }
+        let mut open = true;
+        let mut do_repair = false;
+        egui::Window::new("Filesystem Check Results")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(500.0)
+            .show(ui.ctx(), |ui| {
+                if let Some(result) = &self.fsck_result {
+                    if result.is_clean() {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(100, 200, 100),
+                            "Filesystem is clean.",
+                        );
+                    } else {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 100, 100),
+                            format!("{} error(s) found.", result.errors.len()),
+                        );
+                    }
+
+                    ui.separator();
+
+                    // Stats
+                    ui.label(format!(
+                        "Files: {}  Directories: {}  Leaf nodes: {}",
+                        result.stats.files_checked,
+                        result.stats.directories_checked,
+                        result.stats.leaf_nodes_visited,
+                    ));
+                    if result.stats.orphaned_threads > 0 {
+                        ui.label(format!(
+                            "Orphaned threads: {}",
+                            result.stats.orphaned_threads
+                        ));
+                    }
+
+                    // Errors
+                    if !result.errors.is_empty() {
+                        ui.separator();
+                        ui.label(egui::RichText::new("Errors:").strong());
+                        egui::ScrollArea::vertical()
+                            .id_salt("fsck_errors")
+                            .max_height(200.0)
+                            .show(ui, |ui| {
+                                for issue in &result.errors {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(255, 100, 100),
+                                        format!("[{}] {}", issue.code, issue.message),
+                                    );
+                                }
+                            });
+                    }
+
+                    // Warnings
+                    if !result.warnings.is_empty() {
+                        ui.separator();
+                        ui.label(egui::RichText::new("Warnings:").strong());
+                        egui::ScrollArea::vertical()
+                            .id_salt("fsck_warnings")
+                            .max_height(200.0)
+                            .show(ui, |ui| {
+                                for issue in &result.warnings {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(255, 200, 100),
+                                        format!("[{}] {}", issue.code, issue.message),
+                                    );
+                                }
+                            });
+                    }
+
+                    // Repair button — only for repairable errors on non-archive sources
+                    if result.repairable && self.archive_edit_ctx.is_none() {
+                        ui.separator();
+                        if ui.button("Repair").clicked() {
+                            do_repair = true;
+                        }
+                    }
+
+                    // Repair report
+                    if let Some(ref report) = self.repair_report {
+                        ui.separator();
+                        ui.label(egui::RichText::new("Repair Report:").strong());
+                        if !report.fixes_applied.is_empty() {
+                            for fix in &report.fixes_applied {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(100, 200, 100),
+                                    format!("  {}", fix),
+                                );
+                            }
+                        }
+                        if !report.fixes_failed.is_empty() {
+                            for fail in &report.fixes_failed {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(255, 100, 100),
+                                    format!("  {}", fail),
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+        if !open {
+            self.show_fsck_popup = false;
+        }
+        if do_repair {
+            self.show_repair_confirm = true;
+        }
+
+        // Repair confirmation dialog
+        self.render_repair_confirm(ui);
+    }
+
+    /// Render the repair confirmation dialog and execute repair if confirmed.
+    fn render_repair_confirm(&mut self, ui: &mut egui::Ui) {
+        if !self.show_repair_confirm {
+            return;
+        }
+        let repairable_count = self
+            .fsck_result
+            .as_ref()
+            .map(|r| {
+                r.errors
+                    .iter()
+                    .filter(|e| {
+                        rusty_backup::fs::hfs_fsck::classify_repair(&e.code)
+                            != rusty_backup::fs::hfs_fsck::RepairAction::NotRepairable
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+
+        let mut confirmed = false;
+        let mut cancelled = false;
+        egui::Window::new("Repair Filesystem?")
+            .collapsible(false)
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                ui.label(format!(
+                    "This will attempt to fix {} repairable error(s). \
+                     Unrepairable issues (B-tree structural damage) will be skipped.\n\n\
+                     Continue?",
+                    repairable_count
+                ));
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() {
+                        confirmed = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancelled = true;
+                    }
+                });
+            });
+
+        if cancelled {
+            self.show_repair_confirm = false;
+        }
+        if confirmed {
+            self.show_repair_confirm = false;
+            self.run_repair();
+        }
+    }
+
+    /// Execute repair on the filesystem and re-run check.
+    fn run_repair(&mut self) {
+        match self.open_editable_fs() {
+            Ok(mut efs) => match efs.repair() {
+                Ok(report) => {
+                    self.repair_report = Some(report);
+                    // Re-run fsck to show updated state
+                    drop(efs);
+                    match self.open_fs() {
+                        Ok(mut fs) => {
+                            if let Some(Ok(result)) = fs.fsck() {
+                                self.fsck_result = Some(result);
+                            }
+                        }
+                        Err(e) => {
+                            self.error = Some(format!("Failed to re-check after repair: {}", e));
+                        }
+                    }
+                    // Invalidate directory cache
+                    self.directory_cache.clear();
+                }
+                Err(e) => {
+                    self.error = Some(format!("Repair failed: {}", e));
+                }
+            },
+            Err(e) => {
+                self.error = Some(format!("Failed to open filesystem for repair: {}", e));
+            }
+        }
     }
 
     /// Create a new folder with the name from the dialog.

@@ -71,6 +71,12 @@ pub trait Filesystem: Send {
     fn blessed_system_folder(&mut self) -> Option<(u64, String)> {
         None
     }
+
+    /// Run filesystem integrity check. Returns `None` if not supported for
+    /// this filesystem type. Override in implementations that support fsck.
+    fn fsck(&mut self) -> Option<Result<super::hfs_fsck::FsckResult, FilesystemError>> {
+        None
+    }
 }
 
 /// Errors from filesystem operations.
@@ -225,6 +231,14 @@ pub trait EditableFilesystem: Filesystem {
         _len: u64,
     ) -> Result<(), FilesystemError> {
         Ok(())
+    }
+
+    /// Attempt to repair filesystem issues found by fsck.
+    /// Default returns an error indicating repair is not supported.
+    fn repair(&mut self) -> Result<super::hfs_fsck::RepairReport, FilesystemError> {
+        Err(FilesystemError::Unsupported(
+            "repair not supported for this filesystem".into(),
+        ))
     }
 
     /// Flush metadata (superblock, bitmaps, FAT tables, etc.) to disk.

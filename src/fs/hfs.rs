@@ -79,13 +79,13 @@ pub fn mac_roman_to_utf8(data: &[u8]) -> String {
 
 /// HFS extent descriptor: start_block (u16) + block_count (u16).
 #[derive(Debug, Clone, Copy)]
-struct HfsExtDescriptor {
-    start_block: u16,
-    block_count: u16,
+pub(crate) struct HfsExtDescriptor {
+    pub(crate) start_block: u16,
+    pub(crate) block_count: u16,
 }
 
 impl HfsExtDescriptor {
-    fn parse(data: &[u8]) -> Self {
+    pub(crate) fn parse(data: &[u8]) -> Self {
         HfsExtDescriptor {
             start_block: BigEndian::read_u16(&data[0..2]),
             block_count: BigEndian::read_u16(&data[2..4]),
@@ -101,31 +101,31 @@ impl HfsExtDescriptor {
 /// HFS Master Directory Block (MDB) — at partition_offset + 1024.
 #[derive(Debug)]
 #[allow(dead_code)]
-struct HfsMasterDirectoryBlock {
-    signature: u16,
-    create_date: u32,
-    modify_date: u32,
-    total_blocks: u16,
-    block_size: u32,
-    free_blocks: u16,
-    volume_name: String,
-    volume_name_raw: Vec<u8>,
-    volume_bitmap_block: u16,
+pub(crate) struct HfsMasterDirectoryBlock {
+    pub(crate) signature: u16,
+    pub(crate) create_date: u32,
+    pub(crate) modify_date: u32,
+    pub(crate) total_blocks: u16,
+    pub(crate) block_size: u32,
+    pub(crate) free_blocks: u16,
+    pub(crate) volume_name: String,
+    pub(crate) volume_name_raw: Vec<u8>,
+    pub(crate) volume_bitmap_block: u16,
     /// First allocation block's offset in 512-byte sectors from partition start.
-    first_alloc_block: u16,
-    next_catalog_id: u32,
-    file_count: u32,
-    folder_count: u32,
-    finder_info: [u32; 8],
-    catalog_file_size: u32,
-    catalog_file_extents: [HfsExtDescriptor; 3],
-    extents_file_size: u32,
-    extents_file_extents: [HfsExtDescriptor; 3],
-    embedded_signature: u16,
-    embedded_start_block: u16,
-    embedded_block_count: u16,
+    pub(crate) first_alloc_block: u16,
+    pub(crate) next_catalog_id: u32,
+    pub(crate) file_count: u32,
+    pub(crate) folder_count: u32,
+    pub(crate) finder_info: [u32; 8],
+    pub(crate) catalog_file_size: u32,
+    pub(crate) catalog_file_extents: [HfsExtDescriptor; 3],
+    pub(crate) extents_file_size: u32,
+    pub(crate) extents_file_extents: [HfsExtDescriptor; 3],
+    pub(crate) embedded_signature: u16,
+    pub(crate) embedded_start_block: u16,
+    pub(crate) embedded_block_count: u16,
     /// Raw 512-byte sector for serialization (preserve fields we don't explicitly parse).
-    raw_sector: [u8; 512],
+    pub(crate) raw_sector: [u8; 512],
 }
 
 impl HfsMasterDirectoryBlock {
@@ -231,8 +231,8 @@ impl HfsMasterDirectoryBlock {
 }
 
 /// Catalog record types.
-const CATALOG_DIR: i8 = 1;
-const CATALOG_FILE: i8 = 2;
+pub(crate) const CATALOG_DIR: i8 = 1;
+pub(crate) const CATALOG_FILE: i8 = 2;
 
 /// Decode a 4-byte Mac OS type/creator code to a string.
 /// Non-printable bytes are replaced with '.'.
@@ -556,8 +556,32 @@ impl<R: Read + Seek> HfsFilesystem<R> {
         Ok(())
     }
 
+    /// Run filesystem integrity check. Loads bitmap if not already cached.
+    pub fn fsck(&mut self) -> Result<super::hfs_fsck::FsckResult, FilesystemError> {
+        self.ensure_bitmap()?;
+        // Load extents overflow B-tree if it exists (for files with >3 extents)
+        let extents_data = if self.mdb.extents_file_size > 0 {
+            read_fork_data(
+                &mut self.reader,
+                self.partition_offset,
+                &self.mdb,
+                &self.mdb.extents_file_extents,
+                self.mdb.extents_file_size as u64,
+            )
+            .ok()
+        } else {
+            None
+        };
+        Ok(super::hfs_fsck::check_hfs_integrity(
+            &self.mdb,
+            &self.catalog_data,
+            self.bitmap.as_ref().unwrap(),
+            extents_data.as_deref(),
+        ))
+    }
+
     /// Build classic HFS catalog key: key_len(1) + reserved(1) + parent_id(4) + name_len(1) + name(Mac Roman).
-    fn build_catalog_key(parent_id: u32, name: &[u8]) -> Vec<u8> {
+    pub(crate) fn build_catalog_key(parent_id: u32, name: &[u8]) -> Vec<u8> {
         let key_len = 1 + 4 + 1 + name.len(); // reserved + parent_id + name_len + name
         let mut key = Vec::with_capacity(1 + key_len);
         key.push(key_len as u8); // key_len
@@ -575,7 +599,7 @@ impl<R: Read + Seek> HfsFilesystem<R> {
     }
 
     /// Compare function for HFS catalog keys (key portion only).
-    fn catalog_compare(a: &[u8], b: &[u8]) -> Ordering {
+    pub(crate) fn catalog_compare(a: &[u8], b: &[u8]) -> Ordering {
         // Format: key_len(1) + reserved(1) + parent_id(4) + name_len(1) + name(Mac Roman)
         if a.len() < 7 || b.len() < 7 {
             return a.len().cmp(&b.len());
@@ -1032,7 +1056,11 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
 
     /// Build a thread record for classic HFS.
     /// Thread key: (cnid, ""). Thread data: type(1) + reserved(1) + reserved(8) + parentID(4) + name(Pascal string).
-    fn build_thread_record(thread_type: i8, parent_id: u32, name: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    pub(crate) fn build_thread_record(
+        thread_type: i8,
+        parent_id: u32,
+        name: &[u8],
+    ) -> (Vec<u8>, Vec<u8>) {
         // Key: (entry_cnid, "")  — built by caller with build_catalog_key(cnid, &[])
         // Record data: cdrType(1) + reserved(1) + reserved(8) + thdParID(4) + thdCName(Pascal, 1+N)
         let mut rec = Vec::with_capacity(14 + 1 + name.len());
@@ -1236,6 +1264,10 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
             }
         }
         Some((cnid as u64, format!("CNID {}", cnid)))
+    }
+
+    fn fsck(&mut self) -> Option<Result<super::hfs_fsck::FsckResult, FilesystemError>> {
+        Some(self.fsck())
     }
 }
 
@@ -1616,6 +1648,32 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
 
         self.do_sync_metadata()?;
         Ok(())
+    }
+
+    fn repair(&mut self) -> Result<super::hfs_fsck::RepairReport, FilesystemError> {
+        self.ensure_bitmap()?;
+        let extents_data = if self.mdb.extents_file_size > 0 {
+            read_fork_data(
+                &mut self.reader,
+                self.partition_offset,
+                &self.mdb,
+                &self.mdb.extents_file_extents,
+                self.mdb.extents_file_size as u64,
+            )
+            .ok()
+        } else {
+            None
+        };
+
+        let report = super::hfs_fsck::repair_hfs(
+            &mut self.mdb,
+            &mut self.catalog_data,
+            self.bitmap.as_mut().unwrap(),
+            extents_data.as_deref(),
+        );
+
+        self.do_sync_metadata()?;
+        Ok(report)
     }
 
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
@@ -2417,5 +2475,133 @@ mod tests {
 
         assert!(fe.type_code.is_some());
         assert_eq!(fe.type_code.as_deref(), Some("TEXT"));
+    }
+
+    /// Helper: run fsck on an HfsFilesystem and panic if any errors are found.
+    fn assert_fsck_clean<R: Read + Seek>(fs: &mut HfsFilesystem<R>) {
+        let result = fs.fsck().unwrap();
+        if !result.is_clean() {
+            let msgs: Vec<_> = result
+                .errors
+                .iter()
+                .map(|e| format!("[{}] {}", e.code, e.message))
+                .collect();
+            panic!("fsck found {} error(s):\n{}", msgs.len(), msgs.join("\n"));
+        }
+    }
+
+    #[test]
+    fn test_fsck_clean_fresh_image() {
+        let img = make_editable_hfs_image();
+        let cursor = Cursor::new(img);
+        let mut fs = HfsFilesystem::open(cursor, 0).unwrap();
+
+        let result = fs.fsck().unwrap();
+        assert!(result.is_clean(), "fresh image should be clean");
+        assert_eq!(result.stats.directories_checked, 1); // root only
+        assert_eq!(result.stats.files_checked, 0);
+        assert_eq!(result.stats.leaf_nodes_visited, 1);
+        assert_eq!(result.stats.orphaned_threads, 0);
+    }
+
+    #[test]
+    fn test_fsck_clean_after_create_file() {
+        let img = make_editable_hfs_image();
+        let cursor = Cursor::new(img);
+        let mut fs = HfsFilesystem::open(cursor, 0).unwrap();
+
+        let root = fs.root().unwrap();
+        let test_data = b"Hello, HFS World!";
+        let mut data_reader = Cursor::new(test_data.as_slice());
+        let options = CreateFileOptions::default();
+        fs.create_file(
+            &root,
+            "test.txt",
+            &mut data_reader,
+            test_data.len() as u64,
+            &options,
+        )
+        .unwrap();
+
+        assert_fsck_clean(&mut fs);
+    }
+
+    #[test]
+    fn test_fsck_clean_after_create_directory() {
+        let img = make_editable_hfs_image();
+        let cursor = Cursor::new(img);
+        let mut fs = HfsFilesystem::open(cursor, 0).unwrap();
+
+        let root = fs.root().unwrap();
+        let options = CreateDirectoryOptions::default();
+        fs.create_directory(&root, "NewDir", &options).unwrap();
+
+        assert_fsck_clean(&mut fs);
+    }
+
+    #[test]
+    fn test_fsck_clean_after_delete_file() {
+        let img = make_editable_hfs_image();
+        let cursor = Cursor::new(img);
+        let mut fs = HfsFilesystem::open(cursor, 0).unwrap();
+
+        let root = fs.root().unwrap();
+        let test_data = b"delete me";
+        let mut data_reader = Cursor::new(test_data.as_slice());
+        let options = CreateFileOptions::default();
+        let fe = fs
+            .create_file(
+                &root,
+                "gone.txt",
+                &mut data_reader,
+                test_data.len() as u64,
+                &options,
+            )
+            .unwrap();
+
+        assert_fsck_clean(&mut fs);
+        fs.delete_entry(&root, &fe).unwrap();
+        assert_fsck_clean(&mut fs);
+    }
+
+    #[test]
+    fn test_fsck_stress_many_files() {
+        let img = make_editable_hfs_image();
+        let cursor = Cursor::new(img);
+        let mut fs = HfsFilesystem::open(cursor, 0).unwrap();
+
+        let root = fs.root().unwrap();
+        let options = CreateFileOptions::default();
+
+        // Create 30+ files to trigger B-tree splits
+        for i in 0..35 {
+            let name = format!("file_{:03}.txt", i);
+            let data = format!("content of file {}", i);
+            let mut reader = Cursor::new(data.as_bytes().to_vec());
+            fs.create_file(&root, &name, &mut reader, data.len() as u64, &options)
+                .unwrap();
+
+            // Verify fsck passes after each creation
+            assert_fsck_clean(&mut fs);
+        }
+
+        let result = fs.fsck().unwrap();
+        assert!(result.is_clean());
+        assert_eq!(result.stats.files_checked, 35);
+        assert_eq!(result.stats.directories_checked, 1); // just root
+    }
+
+    #[test]
+    fn test_fsck_clean_after_blessed_folder() {
+        let img = make_editable_hfs_image();
+        let cursor = Cursor::new(img);
+        let mut fs = HfsFilesystem::open(cursor, 0).unwrap();
+
+        let root = fs.root().unwrap();
+        let options = CreateDirectoryOptions::default();
+        let sys_dir = fs.create_directory(&root, "System", &options).unwrap();
+        fs.set_blessed_folder(&sys_dir).unwrap();
+
+        assert_fsck_clean(&mut fs);
     }
 }

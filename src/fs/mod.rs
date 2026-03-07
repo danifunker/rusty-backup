@@ -6,6 +6,7 @@ pub mod fat;
 pub mod filesystem;
 pub mod hfs;
 pub(crate) mod hfs_common;
+pub mod hfs_fsck;
 pub mod hfsplus;
 pub mod ntfs;
 pub mod prodos;
@@ -31,6 +32,7 @@ use filesystem::{Filesystem, FilesystemError};
 pub use hfs::{
     patch_hfs_hidden_sectors, resize_hfs_in_place, validate_hfs_integrity, CompactHfsReader,
 };
+pub use hfs_fsck::{FsckResult, RepairReport};
 pub use hfsplus::{
     patch_hfsplus_hidden_sectors, resize_hfsplus_in_place, validate_hfsplus_integrity,
     CompactHfsPlusReader,
