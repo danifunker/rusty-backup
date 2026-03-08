@@ -635,6 +635,19 @@ fn rebuild_index_nodes(catalog_data: &mut [u8], node_size: usize, report: &mut R
             }
         }
 
+        // Link index nodes at this level with fLink/bLink
+        for (i, (idx_node, _)) in next_level.iter().enumerate() {
+            let off = *idx_node as usize * node_size;
+            let next = if i + 1 < next_level.len() {
+                next_level[i + 1].0
+            } else {
+                0
+            };
+            let prev = if i > 0 { next_level[i - 1].0 } else { 0 };
+            BigEndian::write_u32(&mut catalog_data[off..off + 4], next); // fLink
+            BigEndian::write_u32(&mut catalog_data[off + 4..off + 8], prev); // bLink
+        }
+
         current_level = next_level;
     }
 
