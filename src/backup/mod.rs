@@ -411,6 +411,15 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 part.index, part.type_name, part.start_lba
             ),
         );
+        // Skip GPT protective partitions (0xEE) — not a real partition.
+        if part.partition_type_byte == 0xEE {
+            effective_sizes.push(0);
+            stream_sizes.push(0);
+            compact_sizes.push(None);
+            minimum_sizes.push(None);
+            is_layout_preserving_flags.push(false);
+            continue;
+        }
         if config.sector_by_sector || part.is_extended_container || is_superfloppy {
             effective_sizes.push(part.size_bytes);
             stream_sizes.push(part.size_bytes);
@@ -655,6 +664,11 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
     for (part_idx, part) in partitions.iter().enumerate() {
         if is_cancelled(&progress) {
             bail!("backup cancelled");
+        }
+
+        // Skip GPT protective partitions (0xEE) — not a real partition.
+        if part.partition_type_byte == 0xEE {
+            continue;
         }
 
         // Skip partitions not in the filter (if a filter is set)

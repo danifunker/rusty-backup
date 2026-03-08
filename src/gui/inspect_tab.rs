@@ -2226,6 +2226,11 @@ impl InspectTab {
                         if part.is_extended_container {
                             continue;
                         }
+                        // Skip GPT protective partitions (0xEE) — they span the
+                        // entire disk and have no filesystem to analyze.
+                        if part.partition_type_byte == 0xEE {
+                            continue;
+                        }
                         if let Ok(f) = device_file.try_clone() {
                             if let Some(min_size) = rusty_backup::fs::effective_partition_size(
                                 BufReader::new(f),
