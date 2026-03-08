@@ -1613,7 +1613,36 @@ fn walk_leaf_chain(
     total_records
 }
 
+/// Extract all child node pointers from an index node.
+fn extract_child_pointers(node: &[u8], node_size: usize) -> Vec<u32> {
+    let num_records = BigEndian::read_u16(&node[10..12]) as usize;
+    let mut children = Vec::new();
+    for i in 0..num_records {
+        let (rec_start, rec_end) = btree_record_range(node, node_size, i);
+        if rec_start >= rec_end || rec_end > node_size {
+            continue;
+        }
+        let rec = &node[rec_start..rec_end];
+        if rec.len() < 5 {
+            continue;
+        }
+        let key_len = rec[0] as usize;
+        let mut ptr_off = 1 + key_len;
+        if ptr_off % 2 != 0 {
+            ptr_off += 1;
+        }
+        if ptr_off + 4 <= rec.len() {
+            children.push(BigEndian::read_u32(&rec[ptr_off..ptr_off + 4]));
+        }
+    }
+    children
+}
+
 /// Walk index nodes from the root down, verifying fLink/bLink consistency at each level.
+///
+/// Instead of following the (potentially broken) sibling chain, we discover
+/// the expected set of nodes at each level from the parent's child pointers,
+/// then verify those nodes are properly chained via fLink/bLink.
 fn check_index_sibling_links(
     catalog_data: &[u8],
     header: &BTreeHeader,
@@ -1624,97 +1653,72 @@ fn check_index_sibling_links(
         return; // no index nodes
     }
 
-    // Start from the root and walk down through index levels
-    let mut level_start = header.root_node;
+    // Start with the root as the sole node at the top level
+    let mut level_nodes: Vec<u32> = vec![header.root_node];
 
+    // Walk down from the root level (depth) to level 2 (one above leaves)
     for _level in (2..=header.depth).rev() {
-        // Walk the sibling chain at this level
-        let mut node_idx = level_start;
-        let mut prev_idx: u32 = 0;
-        let mut first_child: Option<u32> = None;
-        let mut visited = HashSet::new();
+        if level_nodes.is_empty() {
+            break;
+        }
 
-        while node_idx != 0 {
-            if !visited.insert(node_idx) {
-                errors.push(hfs_issue(
-                    HfsFsckCode::IndexSiblingLinkBroken,
-                    format!("index sibling chain loop at node {}", node_idx),
-                ));
-                break;
-            }
-
+        // Verify sibling links among nodes at this level
+        for (i, &node_idx) in level_nodes.iter().enumerate() {
             let off = node_idx as usize * node_size;
             if off + node_size > catalog_data.len() {
                 errors.push(hfs_issue(
                     HfsFsckCode::IndexSiblingLinkBroken,
                     format!("index node {} offset out of range", node_idx),
                 ));
-                break;
+                continue;
             }
 
             let node = &catalog_data[off..off + node_size];
             let flink = BigEndian::read_u32(&node[0..4]);
             let blink = BigEndian::read_u32(&node[4..8]);
-            let kind = node[8] as i8;
 
-            if kind != BTREE_INDEX_NODE {
+            let expected_flink = if i + 1 < level_nodes.len() {
+                level_nodes[i + 1]
+            } else {
+                0
+            };
+            let expected_blink = if i > 0 { level_nodes[i - 1] } else { 0 };
+
+            if flink != expected_flink {
                 errors.push(hfs_issue(
                     HfsFsckCode::IndexSiblingLinkBroken,
                     format!(
-                        "node {} in index chain has kind {} (expected index = {})",
-                        node_idx, kind, BTREE_INDEX_NODE
+                        "index node {}: fLink = {} but expected {}",
+                        node_idx, flink, expected_flink
                     ),
                 ));
-                break;
             }
-
-            // Verify backlink
-            if prev_idx != 0 && blink != prev_idx {
+            if blink != expected_blink {
                 errors.push(hfs_issue(
                     HfsFsckCode::IndexSiblingLinkBroken,
                     format!(
-                        "index node {}: bLink = {} but previous node was {}",
-                        node_idx, blink, prev_idx
-                    ),
-                ));
-            } else if prev_idx == 0 && blink != 0 {
-                errors.push(hfs_issue(
-                    HfsFsckCode::IndexSiblingLinkBroken,
-                    format!(
-                        "first index node {} at level has bLink = {} (expected 0)",
-                        node_idx, blink
+                        "index node {}: bLink = {} but expected {}",
+                        node_idx, blink, expected_blink
                     ),
                 ));
             }
-
-            // Capture the first child pointer for the next level down
-            if first_child.is_none() {
-                let num_records = BigEndian::read_u16(&node[10..12]) as usize;
-                if num_records > 0 {
-                    let (rec_start, rec_end) = btree_record_range(node, node_size, 0);
-                    if rec_start < rec_end && rec_end <= node_size && rec_end - rec_start >= 5 {
-                        let rec = &node[rec_start..rec_end];
-                        let key_len = rec[0] as usize;
-                        let mut ptr_off = 1 + key_len;
-                        if ptr_off % 2 != 0 {
-                            ptr_off += 1;
-                        }
-                        if ptr_off + 4 <= rec.len() {
-                            first_child = Some(BigEndian::read_u32(&rec[ptr_off..ptr_off + 4]));
-                        }
-                    }
-                }
-            }
-
-            prev_idx = node_idx;
-            node_idx = flink;
         }
 
-        // Move to the next level down using the first child pointer
-        match first_child {
-            Some(child) => level_start = child,
-            None => break,
+        // Collect all child pointers from this level to get the next level's nodes
+        let mut next_level = Vec::new();
+        for &node_idx in &level_nodes {
+            let off = node_idx as usize * node_size;
+            if off + node_size > catalog_data.len() {
+                continue;
+            }
+            let node = &catalog_data[off..off + node_size];
+            if node[8] as i8 != BTREE_INDEX_NODE {
+                continue;
+            }
+            next_level.extend(extract_child_pointers(node, node_size));
         }
+
+        level_nodes = next_level;
     }
 }
 
