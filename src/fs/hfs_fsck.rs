@@ -6,6 +6,7 @@
 //! 3. Catalog consistency (threads ↔ records, counts)
 //! 4. Extent/allocation bitmap cross-check (including extents overflow)
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use byteorder::{BigEndian, ByteOrder};
@@ -14,9 +15,9 @@ use super::hfs::{
     mac_roman_to_utf8, HfsExtDescriptor, HfsMasterDirectoryBlock, CATALOG_DIR, CATALOG_FILE,
 };
 use super::hfs_common::{
-    bitmap_set_bit_be, bitmap_test_bit_be, btree_insert_record, btree_node_bitmap_range,
-    btree_record_range, normalize_catalog_index_key, BTreeHeader, BTREE_HEADER_NODE,
-    BTREE_INDEX_NODE, BTREE_LEAF_NODE,
+    bitmap_clear_bit_be, bitmap_set_bit_be, bitmap_test_bit_be, btree_insert_record,
+    btree_node_bitmap_range, btree_record_range, init_node, normalize_catalog_index_key,
+    BTreeHeader, BTREE_HEADER_NODE, BTREE_INDEX_NODE, BTREE_LEAF_NODE, BTREE_MAP_NODE,
 };
 
 const CATALOG_DIR_THREAD: i8 = 3;
@@ -37,10 +38,14 @@ enum HfsFsckCode {
     // MDB issues
     BadSignature,
     BadBlockSize,
+    VbmDataAreaCollision,
     NextCatalogIdTooLow,
     // B-tree structure
     HeaderNodeBadKind,
     RootNodeBadKind,
+    MapNodeBadStructure,
+    NodeBitmapMissing,
+    KeysOutOfOrder,
     OffsetTableNotMonotonic,
     OffsetTableOutOfBounds,
     LeafChainBroken,
@@ -59,6 +64,8 @@ enum HfsFsckCode {
     OrphanedThread,
     MissingParent,
     ValenceMismatch,
+    // Extents overflow B-tree structure
+    ExtentsBtreeStructure,
     // Extent/allocation
     ExtentOutOfRange,
     OverlappingExtents,
@@ -71,6 +78,7 @@ fn is_repairable(code: HfsFsckCode) -> bool {
     !matches!(
         code,
         HfsFsckCode::BadBlockSize
+            | HfsFsckCode::VbmDataAreaCollision
             | HfsFsckCode::OffsetTableNotMonotonic
             | HfsFsckCode::OffsetTableOutOfBounds
             | HfsFsckCode::MissingFileThread
@@ -164,6 +172,11 @@ pub(crate) fn check_hfs_integrity(
         &mut orphaned_entries,
     );
 
+    // Phase 3.5: Extents overflow B-tree structure
+    if let Some(ext_data) = extents_data {
+        check_extents_btree_structure(ext_data, &mut errors);
+    }
+
     // Phase 4: Extent/allocation bitmap
     check_extents_and_bitmap(
         mdb,
@@ -214,10 +227,15 @@ pub(crate) fn repair_hfs(
     mdb: &mut HfsMasterDirectoryBlock,
     catalog_data: &mut [u8],
     bitmap: &mut Vec<u8>,
-    extents_data: Option<&[u8]>,
+    mut extents_data: Option<&mut Vec<u8>>,
 ) -> RepairReport {
     // Count unrepairable issues by running a quick check first
-    let check_result = check_hfs_integrity(mdb, catalog_data, bitmap, extents_data);
+    let check_result = check_hfs_integrity(
+        mdb,
+        catalog_data,
+        bitmap,
+        extents_data.as_deref().map(|v| v.as_slice()),
+    );
     let unrepairable_count = check_result.errors.iter().filter(|e| !e.repairable).count();
 
     let mut report = RepairReport {
@@ -262,11 +280,31 @@ pub(crate) fn repair_hfs(
     rebuild_index_nodes(catalog_data, node_size, &mut report);
     fix_leaf_record_count(catalog_data, &mut report);
 
+    // Fix node bitmap after all structural changes are finalized
+    repair_node_bitmap(catalog_data, node_size, &mut report);
+
+    // --- Phase 3.5: Extents overflow B-tree structure repair ---
+    if let Some(ext) = extents_data.as_mut() {
+        repair_extents_btree_structure(ext, &mut report);
+    }
+
     // --- Phase 4: Extent fixes ---
-    repair_extents(mdb, catalog_data, node_size, extents_data, &mut report);
+    repair_extents(
+        mdb,
+        catalog_data,
+        node_size,
+        extents_data.as_deref().map(|v| v.as_slice()),
+        &mut report,
+    );
 
     // --- Phase 5: MDB counts + bitmap rebuild ---
-    repair_mdb_counts_and_bitmap(mdb, catalog_data, bitmap, extents_data, &mut report);
+    repair_mdb_counts_and_bitmap(
+        mdb,
+        catalog_data,
+        bitmap,
+        extents_data.as_deref().map(|v| v.as_slice()),
+        &mut report,
+    );
 
     report
 }
@@ -311,9 +349,192 @@ fn repair_btree_structure_leaves_only(
         }
     }
 
+    // Fix map (continuation) nodes if present
+    repair_map_nodes(catalog_data, node_size, report);
+
+    // Sort records within nodes before rebuilding the leaf chain.
+    // This fixes intra-node key order; rebuild_leaf_chain fixes inter-node order.
+    repair_key_ordering(catalog_data, node_size, report);
+
     // Rebuild leaf chain: union fLink-reachable + bitmap-allocated leaf nodes,
     // sort by first key, relink, and fix node bitmap.
     rebuild_leaf_chain(catalog_data, node_size, report);
+}
+
+/// Fix map (continuation) nodes: ensure correct kind, record count, and offsets.
+fn repair_map_nodes(catalog_data: &mut [u8], node_size: usize, report: &mut RepairReport) {
+    if catalog_data.len() < node_size {
+        return;
+    }
+    let mut node_idx = BigEndian::read_u32(&catalog_data[0..4]);
+    let max_nodes = catalog_data.len() / node_size;
+    let mut visited = HashSet::new();
+
+    while node_idx != 0 {
+        if !visited.insert(node_idx) {
+            break;
+        }
+        if node_idx as usize >= max_nodes {
+            break;
+        }
+        let off = node_idx as usize * node_size;
+        let mut fixed = false;
+
+        let kind = catalog_data[off + 8] as i8;
+        if kind != BTREE_MAP_NODE {
+            catalog_data[off + 8] = BTREE_MAP_NODE as u8;
+            fixed = true;
+        }
+
+        let num_records = BigEndian::read_u16(&catalog_data[off + 10..off + 12]) as usize;
+        if num_records != 1 {
+            BigEndian::write_u16(&mut catalog_data[off + 10..off + 12], 1);
+            fixed = true;
+        }
+
+        // Set correct offset table: record 0 at 14, free space at node_size - 2
+        // The map record spans from offset 14 to (node_size - 4): the last 4 bytes
+        // are the offset table itself (2 entries × 2 bytes).
+        let rec0_pos = off + node_size - 2;
+        let rec0_off = BigEndian::read_u16(&catalog_data[rec0_pos..rec0_pos + 2]) as usize;
+        if rec0_off != 14 {
+            BigEndian::write_u16(&mut catalog_data[rec0_pos..rec0_pos + 2], 14);
+            fixed = true;
+        }
+        // Free space offset: end of map data = node_size - 4
+        let free_pos = off + node_size - 4;
+        let free_off = BigEndian::read_u16(&catalog_data[free_pos..free_pos + 2]) as usize;
+        let expected_free = node_size - 4;
+        if free_off != expected_free {
+            BigEndian::write_u16(
+                &mut catalog_data[free_pos..free_pos + 2],
+                expected_free as u16,
+            );
+            fixed = true;
+        }
+
+        if fixed {
+            report.fixes_applied.push(format!(
+                "Fixed map node {} structure (kind/records/offsets)",
+                node_idx
+            ));
+        }
+
+        node_idx = BigEndian::read_u32(&catalog_data[off..off + 4]);
+    }
+}
+
+/// Fix node bitmap: ensure every referenced node is marked as allocated.
+fn repair_node_bitmap(catalog_data: &mut [u8], node_size: usize, report: &mut RepairReport) {
+    let header = BTreeHeader::read(catalog_data);
+    let (bmp_off, bmp_size) = btree_node_bitmap_range(catalog_data, node_size);
+    if bmp_size == 0 {
+        return;
+    }
+
+    let referenced = collect_referenced_nodes(catalog_data, &header);
+    let mut fixed_count = 0u32;
+
+    for &node_idx in &referenced {
+        if !bitmap_test_bit_be(&catalog_data[bmp_off..bmp_off + bmp_size], node_idx) {
+            bitmap_set_bit_be(&mut catalog_data[bmp_off..bmp_off + bmp_size], node_idx);
+            fixed_count += 1;
+        }
+    }
+
+    if fixed_count > 0 {
+        // Update free_nodes in header
+        let mut h = BTreeHeader::read(catalog_data);
+        h.free_nodes = h.free_nodes.saturating_sub(fixed_count);
+        h.write(catalog_data);
+        report.fixes_applied.push(format!(
+            "Marked {} referenced node(s) as allocated in node bitmap",
+            fixed_count
+        ));
+    }
+}
+
+/// Sort records within each leaf/index node by catalog key order.
+/// This fixes intra-node key ordering; inter-node ordering is handled by
+/// `rebuild_leaf_chain` (which sorts nodes by first key).
+fn repair_key_ordering(catalog_data: &mut [u8], node_size: usize, report: &mut RepairReport) {
+    let (bmp_off, bmp_size) = btree_node_bitmap_range(catalog_data, node_size);
+    let max_nodes = catalog_data.len() / node_size;
+    let mut fixed_count = 0u32;
+
+    for node_idx in 0..max_nodes as u32 {
+        if !bitmap_test_bit_be(&catalog_data[bmp_off..bmp_off + bmp_size], node_idx) {
+            continue;
+        }
+        let off = node_idx as usize * node_size;
+        let kind = catalog_data[off + 8] as i8;
+        if kind != BTREE_LEAF_NODE && kind != BTREE_INDEX_NODE {
+            continue;
+        }
+        let num_records = BigEndian::read_u16(&catalog_data[off + 10..off + 12]) as usize;
+        if num_records < 2 {
+            continue;
+        }
+
+        // Check if this node needs sorting
+        let node = &catalog_data[off..off + node_size];
+        let mut needs_sort = false;
+        for i in 0..num_records - 1 {
+            let (s1, e1) = btree_record_range(node, node_size, i);
+            let (s2, e2) = btree_record_range(node, node_size, i + 1);
+            let key_a = record_key(node, s1, e1);
+            let key_b = record_key(node, s2, e2);
+            if key_a.is_empty() || key_b.is_empty() {
+                continue;
+            }
+            if compare_catalog_keys(key_a, key_b) != Ordering::Less {
+                needs_sort = true;
+                break;
+            }
+        }
+        if !needs_sort {
+            continue;
+        }
+
+        // Collect all records from this node
+        let mut records: Vec<Vec<u8>> = Vec::with_capacity(num_records);
+        for i in 0..num_records {
+            let (rec_start, rec_end) = btree_record_range(node, node_size, i);
+            if rec_start < rec_end && rec_end <= node_size {
+                records.push(node[rec_start..rec_end].to_vec());
+            }
+        }
+
+        // Sort by key
+        records.sort_by(|a, b| compare_catalog_keys(a, b));
+
+        // Rewrite node data sequentially from offset 14
+        let node_mut = &mut catalog_data[off..off + node_size];
+        let mut write_pos = 14usize;
+        for (i, rec) in records.iter().enumerate() {
+            node_mut[write_pos..write_pos + rec.len()].copy_from_slice(rec);
+            let opos = node_size - 2 * (i + 1);
+            BigEndian::write_u16(&mut node_mut[opos..opos + 2], write_pos as u16);
+            write_pos += rec.len();
+        }
+        // Free-space offset
+        let fpos = node_size - 2 * (records.len() + 1);
+        BigEndian::write_u16(&mut node_mut[fpos..fpos + 2], write_pos as u16);
+        // Clear leftover
+        let ot_start = node_size - 2 * (records.len() + 1);
+        if write_pos < ot_start {
+            node_mut[write_pos..ot_start].fill(0);
+        }
+
+        fixed_count += 1;
+    }
+
+    if fixed_count > 0 {
+        report.fixes_applied.push(format!(
+            "Sorted records in {} node(s) to restore key ordering",
+            fixed_count
+        ));
+    }
 }
 
 /// Fix the header leaf record count to match actual records in the leaf chain.
@@ -832,6 +1053,9 @@ fn repair_catalog_consistency(
         }
     }
 
+    // Fix thread records with incorrect data lengths (should be exactly 46 bytes)
+    repair_thread_record_lengths(catalog_data, node_size, report);
+
     // Remove orphaned threads (threads with no matching record)
     for &cnid in dir_threads.keys() {
         if !dir_records.contains_key(&cnid) && remove_thread_record(catalog_data, node_size, cnid) {
@@ -946,6 +1170,94 @@ fn fix_thread_record(
         correct_parent_id,
         correct_name,
     )
+}
+
+/// Scan all leaf nodes for thread records with incorrect data lengths and
+/// rebuild them with the proper 46-byte format (fixed 32-byte Str31 field).
+fn repair_thread_record_lengths(
+    catalog_data: &mut [u8],
+    node_size: usize,
+    report: &mut RepairReport,
+) {
+    // Collect thread records that need fixing: (cnid, thread_type, parent_id, name)
+    let mut bad_threads: Vec<(u32, i8, u32, Vec<u8>)> = Vec::new();
+
+    let header = BTreeHeader::read(catalog_data);
+    let mut node_idx = header.first_leaf_node;
+    let mut visited = HashSet::new();
+
+    while node_idx != 0 {
+        if !visited.insert(node_idx) {
+            break;
+        }
+        let off = node_idx as usize * node_size;
+        if off + node_size > catalog_data.len() {
+            break;
+        }
+        let node = &catalog_data[off..off + node_size];
+        let kind = node[8] as i8;
+        if kind != -1 {
+            // Skip non-leaf nodes
+            let flink = BigEndian::read_u32(&node[0..4]);
+            node_idx = flink;
+            continue;
+        }
+        let num_records = BigEndian::read_u16(&node[10..12]) as usize;
+        for i in 0..num_records {
+            let (rec_start, rec_end) = btree_record_range(node, node_size, i);
+            if rec_start >= rec_end || rec_end > node_size {
+                continue;
+            }
+            let key_len = node[rec_start] as usize;
+            let key_total = 1 + key_len;
+            let rec_len = rec_end - rec_start;
+            if key_total >= rec_len {
+                continue;
+            }
+            let mut data_start = key_total;
+            if data_start % 2 != 0 {
+                data_start += 1;
+            }
+            if data_start >= rec_len {
+                continue;
+            }
+            let rec_type = node[rec_start + data_start] as i8;
+            let data_len = rec_len - data_start;
+
+            // Only fix thread records (type 3 = dir thread, type 4 = file thread)
+            if (rec_type == 3 || rec_type == 4) && data_len != 46 {
+                // Extract CNID from the key (parent_id field = CNID for thread keys)
+                if key_len >= 5 {
+                    let cnid = BigEndian::read_u32(&node[rec_start + 2..rec_start + 6]);
+                    // Extract parent_id and name from the existing thread data
+                    let data_off = rec_start + data_start;
+                    if data_len >= 15 {
+                        let parent_id = BigEndian::read_u32(&node[data_off + 10..data_off + 14]);
+                        let name_len = (node[data_off + 14] as usize).min(31);
+                        let name_end = (data_off + 15 + name_len).min(rec_end);
+                        let name = node[data_off + 15..name_end].to_vec();
+                        bad_threads.push((cnid, rec_type, parent_id, name));
+                    }
+                }
+            }
+        }
+        node_idx = BigEndian::read_u32(&catalog_data[off..off + 4]);
+    }
+
+    // Now fix each bad thread by removing and re-inserting with correct format
+    for (cnid, thread_type, parent_id, name) in bad_threads {
+        if fix_thread_record(catalog_data, node_size, cnid, thread_type, parent_id, &name) {
+            report.fixes_applied.push(format!(
+                "Fixed thread record length for CNID {} (type {})",
+                cnid, thread_type
+            ));
+        } else {
+            report.fixes_failed.push(format!(
+                "Failed to fix thread record length for CNID {} (type {})",
+                cnid, thread_type
+            ));
+        }
+    }
 }
 
 /// Remove a thread record (key = (cnid, "")) from the catalog B-tree.
@@ -1425,6 +1737,24 @@ fn check_mdb(mdb: &HfsMasterDirectoryBlock, errors: &mut Vec<FsckIssue>) {
             ),
         ));
     }
+
+    // Volume bitmap must not collide with the allocation data area.
+    // VBM starts at sector drVBMSt and occupies ceil(total_blocks / (512*8)) sectors.
+    // The data area starts at sector drAlBlSt.
+    if mdb.block_size > 0 && mdb.total_blocks > 0 {
+        let bits_per_sector: u32 = 512 * 8; // 4096 bits per 512-byte sector
+        let vbm_sectors = (mdb.total_blocks as u32 + bits_per_sector - 1) / bits_per_sector;
+        let vbm_end = mdb.volume_bitmap_block as u32 + vbm_sectors;
+        if vbm_end > mdb.first_alloc_block as u32 {
+            errors.push(hfs_issue(
+                HfsFsckCode::VbmDataAreaCollision,
+                format!(
+                    "volume bitmap (sectors {}..{}) overlaps data area (starts at sector {})",
+                    mdb.volume_bitmap_block, vbm_end, mdb.first_alloc_block
+                ),
+            ));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1557,6 +1887,9 @@ fn check_btree_structure(
         }
     }
 
+    // Check map node structure (continuation nodes for large B-trees)
+    check_map_nodes(catalog_data, node_size, errors);
+
     // Walk leaf chain and verify forward/backward links
     let leaf_count = walk_leaf_chain(catalog_data, header, errors, leaf_nodes_visited);
 
@@ -1572,6 +1905,230 @@ fn check_btree_structure(
                 leaf_count, header.leaf_records
             ),
         ));
+    }
+
+    // Verify node bitmap consistency: every referenced node must be allocated,
+    // and every allocated non-special node should be referenced.
+    check_node_bitmap_consistency(catalog_data, header, errors);
+
+    // Verify keys within each node are in ascending order
+    check_key_ordering(catalog_data, header, errors);
+}
+
+/// Validate map (continuation) nodes in the B-tree.
+///
+/// Node 0 is the header node. Its fLink may point to a continuation map node
+/// that holds additional node-allocation bitmap data. Each continuation map
+/// node must have kind = BTREE_MAP_NODE (2), exactly 1 record, and the first
+/// record must start at offset 14 (immediately after the node descriptor).
+fn check_map_nodes(catalog_data: &[u8], node_size: usize, errors: &mut Vec<FsckIssue>) {
+    if catalog_data.len() < node_size {
+        return;
+    }
+    // Follow fLink chain from the header node (node 0)
+    let mut node_idx = BigEndian::read_u32(&catalog_data[0..4]);
+    let max_nodes = catalog_data.len() / node_size;
+    let mut visited = HashSet::new();
+
+    while node_idx != 0 {
+        if !visited.insert(node_idx) {
+            break; // loop detected — leaf chain check will catch this
+        }
+        if node_idx as usize >= max_nodes {
+            break;
+        }
+        let off = node_idx as usize * node_size;
+        let node = &catalog_data[off..off + node_size];
+
+        let kind = node[8] as i8;
+        if kind != BTREE_MAP_NODE {
+            errors.push(hfs_issue(
+                HfsFsckCode::MapNodeBadStructure,
+                format!(
+                    "map node {} has kind {} (expected {} = map)",
+                    node_idx, kind, BTREE_MAP_NODE
+                ),
+            ));
+        }
+
+        let num_records = BigEndian::read_u16(&node[10..12]) as usize;
+        if num_records != 1 {
+            errors.push(hfs_issue(
+                HfsFsckCode::MapNodeBadStructure,
+                format!(
+                    "map node {} has {} records (expected 1)",
+                    node_idx, num_records
+                ),
+            ));
+        }
+
+        // First record should start at offset 14 (right after node descriptor)
+        if num_records >= 1 {
+            let rec0_pos = node_size - 2;
+            let rec0_off = BigEndian::read_u16(&node[rec0_pos..rec0_pos + 2]) as usize;
+            if rec0_off != 14 {
+                errors.push(hfs_issue(
+                    HfsFsckCode::MapNodeBadStructure,
+                    format!(
+                        "map node {} record 0 offset = {} (expected 14)",
+                        node_idx, rec0_off
+                    ),
+                ));
+            }
+        }
+
+        node_idx = BigEndian::read_u32(&node[0..4]);
+    }
+}
+
+/// Collect all node indices reachable from the B-tree root via child pointers
+/// and leaf chain. Returns a set of node indices that should be bitmap-allocated.
+fn collect_referenced_nodes(catalog_data: &[u8], header: &BTreeHeader) -> HashSet<u32> {
+    let node_size = header.node_size as usize;
+    let max_nodes = catalog_data.len() / node_size;
+    let mut referenced = HashSet::new();
+
+    // Node 0 (header) is always referenced
+    referenced.insert(0u32);
+
+    // Map nodes (fLink chain from node 0)
+    let mut map_idx = BigEndian::read_u32(&catalog_data[0..4]);
+    let mut visited = HashSet::new();
+    while map_idx != 0 && visited.insert(map_idx) && (map_idx as usize) < max_nodes {
+        referenced.insert(map_idx);
+        let off = map_idx as usize * node_size;
+        map_idx = BigEndian::read_u32(&catalog_data[off..off + 4]);
+    }
+
+    if header.root_node == 0 || header.depth == 0 {
+        return referenced;
+    }
+
+    // Walk the index tree top-down, collecting all referenced nodes
+    let mut level_nodes: Vec<u32> = vec![header.root_node];
+    referenced.insert(header.root_node);
+
+    for _level in (2..=header.depth).rev() {
+        let mut next_level = Vec::new();
+        for &node_idx in &level_nodes {
+            let off = node_idx as usize * node_size;
+            if off + node_size > catalog_data.len() {
+                continue;
+            }
+            let node = &catalog_data[off..off + node_size];
+            if node[8] as i8 != BTREE_INDEX_NODE {
+                continue;
+            }
+            for child in extract_child_pointers(node, node_size) {
+                if (child as usize) < max_nodes {
+                    referenced.insert(child);
+                }
+                next_level.push(child);
+            }
+        }
+        level_nodes = next_level;
+    }
+
+    // Walk the leaf chain
+    let mut leaf_idx = header.first_leaf_node;
+    let mut leaf_visited = HashSet::new();
+    while leaf_idx != 0 && leaf_visited.insert(leaf_idx) && (leaf_idx as usize) < max_nodes {
+        referenced.insert(leaf_idx);
+        let off = leaf_idx as usize * node_size;
+        leaf_idx = BigEndian::read_u32(&catalog_data[off..off + 4]);
+    }
+
+    referenced
+}
+
+/// Verify that every node referenced by the B-tree structure is marked as
+/// allocated in the node bitmap. Missing bitmap bits mean the node could be
+/// overwritten by a future allocation — a serious structural issue.
+fn check_node_bitmap_consistency(
+    catalog_data: &[u8],
+    header: &BTreeHeader,
+    errors: &mut Vec<FsckIssue>,
+) {
+    let node_size = header.node_size as usize;
+    let (bmp_off, bmp_size) = btree_node_bitmap_range(catalog_data, node_size);
+    if bmp_size == 0 {
+        return;
+    }
+    let bitmap = &catalog_data[bmp_off..bmp_off + bmp_size];
+
+    let referenced = collect_referenced_nodes(catalog_data, header);
+
+    for &node_idx in &referenced {
+        if !bitmap_test_bit_be(bitmap, node_idx) {
+            errors.push(hfs_issue(
+                HfsFsckCode::NodeBitmapMissing,
+                format!(
+                    "node {} is referenced but not marked allocated in node bitmap",
+                    node_idx
+                ),
+            ));
+        }
+    }
+}
+
+/// Compare two catalog key byte slices for ordering.
+/// Each slice starts with key_len(1) + reserved(1) + parent_id(4) + name_len(1) + name.
+fn compare_catalog_keys(a: &[u8], b: &[u8]) -> Ordering {
+    super::hfs::HfsFilesystem::<std::io::Cursor<Vec<u8>>>::catalog_compare(a, b)
+}
+
+/// Extract the key portion of a record (key_len byte + key_len bytes of data).
+fn record_key(node: &[u8], rec_start: usize, rec_end: usize) -> &[u8] {
+    if rec_start >= rec_end || rec_start >= node.len() {
+        return &[];
+    }
+    let key_len = node[rec_start] as usize;
+    let key_end = (rec_start + 1 + key_len).min(rec_end).min(node.len());
+    &node[rec_start..key_end]
+}
+
+/// Verify that records within each allocated node are sorted in ascending key order.
+fn check_key_ordering(catalog_data: &[u8], header: &BTreeHeader, errors: &mut Vec<FsckIssue>) {
+    let node_size = header.node_size as usize;
+    let (bmp_off, bmp_size) = btree_node_bitmap_range(catalog_data, node_size);
+    let max_nodes = catalog_data.len() / node_size;
+
+    for node_idx in 0..max_nodes as u32 {
+        if !bitmap_test_bit_be(&catalog_data[bmp_off..bmp_off + bmp_size], node_idx) {
+            continue;
+        }
+        let off = node_idx as usize * node_size;
+        let node = &catalog_data[off..off + node_size];
+        let kind = node[8] as i8;
+        if kind != BTREE_LEAF_NODE && kind != BTREE_INDEX_NODE {
+            continue;
+        }
+        let num_records = BigEndian::read_u16(&node[10..12]) as usize;
+        if num_records < 2 {
+            continue;
+        }
+
+        for i in 0..num_records - 1 {
+            let (s1, e1) = btree_record_range(node, node_size, i);
+            let (s2, e2) = btree_record_range(node, node_size, i + 1);
+            let key_a = record_key(node, s1, e1);
+            let key_b = record_key(node, s2, e2);
+            if key_a.is_empty() || key_b.is_empty() {
+                continue;
+            }
+            if compare_catalog_keys(key_a, key_b) != Ordering::Less {
+                errors.push(hfs_issue(
+                    HfsFsckCode::KeysOutOfOrder,
+                    format!(
+                        "node {} records {} and {}: keys not in ascending order",
+                        node_idx,
+                        i,
+                        i + 1
+                    ),
+                ));
+                break; // one error per node is enough
+            }
+        }
     }
 }
 
@@ -1703,18 +2260,21 @@ fn check_leaf_record_lengths(
         let data_len = rec_len - data_start;
         // Minimum data sizes: dir record = 70, file record = 102,
         // thread records = at least 46 (type + reserved + parentID + name)
-        let min_data = match rec_type {
-            1 => 70,       // CATALOG_DIR
-            2 => 102,      // CATALOG_FILE
-            3 | 4 => 15,   // dir/file thread: type(1)+rsv(1)+rsv(8)+parentID(4)+nameLen(1)
-            _ => continue, // unknown type, skip
+        // Expected data sizes per hfsutils:
+        // dir record = 70, file record = 102,
+        // thread records = exactly 46 (type(1)+rsv(1)+rsv(8)+parentID(4)+Str31(32))
+        let (expected, exact) = match rec_type {
+            1 => (70, true),     // CATALOG_DIR - fixed size
+            2 => (102, true),    // CATALOG_FILE - fixed size
+            3 | 4 => (46, true), // dir/file thread - fixed Str31 field
+            _ => continue,       // unknown type, skip
         };
-        if data_len < min_data {
+        if (exact && data_len != expected) || (!exact && data_len < expected) {
             errors.push(hfs_issue(
                 HfsFsckCode::InvalidRecordLength,
                 format!(
-                    "node {} record {}: type {} data length {} < minimum {}",
-                    node_idx, i, rec_type, data_len, min_data
+                    "node {} record {}: type {} data length {} (expected {})",
+                    node_idx, i, rec_type, data_len, expected
                 ),
             ));
         }
@@ -2591,6 +3151,1139 @@ fn mark_extents(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Extents Overflow B-tree Structure
+// ---------------------------------------------------------------------------
+
+/// Compare two extents overflow B-tree keys.
+/// Key format: key_len(1) + fork_type(1) + file_id(4) + start_block(2)
+/// Ordering: file_id first, then fork_type, then start_block.
+fn compare_extents_keys(a: &[u8], b: &[u8]) -> Ordering {
+    if a.len() < 8 || b.len() < 8 {
+        return a.len().cmp(&b.len());
+    }
+    let file_a = BigEndian::read_u32(&a[2..6]);
+    let file_b = BigEndian::read_u32(&b[2..6]);
+    match file_a.cmp(&file_b) {
+        Ordering::Equal => {}
+        other => return other,
+    }
+    match a[1].cmp(&b[1]) {
+        Ordering::Equal => {}
+        other => return other,
+    }
+    let start_a = BigEndian::read_u16(&a[6..8]);
+    let start_b = BigEndian::read_u16(&b[6..8]);
+    start_a.cmp(&start_b)
+}
+
+/// Check extents overflow B-tree structure (same structural checks as catalog).
+fn check_extents_btree_structure(extents_data: &[u8], errors: &mut Vec<FsckIssue>) {
+    if extents_data.len() < 512 {
+        return;
+    }
+
+    let header = BTreeHeader::read(extents_data);
+    let node_size = header.node_size as usize;
+
+    // Node size validation
+    if node_size < 512 || node_size % 512 != 0 || extents_data.len() < node_size {
+        errors.push(hfs_issue(
+            HfsFsckCode::ExtentsBtreeStructure,
+            format!(
+                "extents B-tree node size {} invalid or data too small",
+                node_size
+            ),
+        ));
+        return;
+    }
+
+    // Header node kind
+    let kind = extents_data[8] as i8;
+    if kind != BTREE_HEADER_NODE {
+        errors.push(hfs_issue(
+            HfsFsckCode::ExtentsBtreeStructure,
+            format!(
+                "extents B-tree node 0 kind = {} (expected {} = header)",
+                kind, BTREE_HEADER_NODE
+            ),
+        ));
+    }
+
+    // Header node must have 3 records
+    let hdr_num_recs = BigEndian::read_u16(&extents_data[10..12]) as usize;
+    if hdr_num_recs != 3 {
+        errors.push(hfs_issue(
+            HfsFsckCode::ExtentsBtreeStructure,
+            format!(
+                "extents B-tree header node has {} records (expected 3)",
+                hdr_num_recs
+            ),
+        ));
+    } else {
+        let rec0_off = BigEndian::read_u16(&extents_data[node_size - 2..node_size]);
+        if rec0_off != 0x00e {
+            errors.push(hfs_issue(
+                HfsFsckCode::ExtentsBtreeStructure,
+                format!(
+                    "extents B-tree header offset[0] = 0x{:03x} (expected 0x00e)",
+                    rec0_off
+                ),
+            ));
+        }
+    }
+
+    // Root node kind
+    if header.root_node != 0 && header.depth > 0 {
+        let root_off = header.root_node as usize * node_size;
+        if root_off + node_size <= extents_data.len() {
+            let root_kind = extents_data[root_off + 8] as i8;
+            let expected = if header.depth == 1 {
+                BTREE_LEAF_NODE
+            } else {
+                BTREE_INDEX_NODE
+            };
+            if root_kind != expected {
+                errors.push(hfs_issue(
+                    HfsFsckCode::ExtentsBtreeStructure,
+                    format!(
+                        "extents B-tree root node {} kind = {} (expected {})",
+                        header.root_node, root_kind, expected
+                    ),
+                ));
+            }
+        }
+    }
+
+    // Map nodes
+    check_extents_map_nodes(extents_data, node_size, errors);
+
+    // If tree is empty, nothing more to check
+    if header.root_node == 0 || header.depth == 0 {
+        return;
+    }
+
+    // Check allocated nodes: offset tables, record counts, record lengths
+    let (bmp_off, bmp_size) = btree_node_bitmap_range(extents_data, node_size);
+    let max_nodes = extents_data.len() / node_size;
+    let max_nrecs = HFS_MAX_NRECS * (node_size / 512);
+
+    for node_idx in 1..max_nodes as u32 {
+        if !bitmap_test_bit_be(&extents_data[bmp_off..bmp_off + bmp_size], node_idx) {
+            continue;
+        }
+        let off = node_idx as usize * node_size;
+        if off + node_size > extents_data.len() {
+            break;
+        }
+        let node = &extents_data[off..off + node_size];
+        let num_records = BigEndian::read_u16(&node[10..12]) as usize;
+        let nk = node[8] as i8;
+
+        if num_records > max_nrecs {
+            errors.push(hfs_issue(
+                HfsFsckCode::ExtentsBtreeStructure,
+                format!(
+                    "extents node {}: {} records exceeds maximum {}",
+                    node_idx, num_records, max_nrecs
+                ),
+            ));
+            continue;
+        }
+
+        if num_records == 0 {
+            continue;
+        }
+
+        // Offset table monotonicity
+        check_extents_offset_table(node, node_size, node_idx, num_records, errors);
+
+        // Record length checks
+        if nk == BTREE_INDEX_NODE {
+            check_extents_index_record_lengths(node, node_size, node_idx, num_records, errors);
+        } else if nk == BTREE_LEAF_NODE {
+            check_extents_leaf_record_lengths(node, node_size, node_idx, num_records, errors);
+        }
+    }
+
+    // Leaf chain verification
+    check_extents_leaf_chain(extents_data, &header, errors);
+
+    // Index sibling links
+    if header.depth > 1 {
+        check_extents_index_sibling_links(extents_data, &header, errors);
+    }
+
+    // Leaf record count
+    let leaf_count = count_extents_leaf_records(extents_data, &header);
+    if leaf_count != header.leaf_records {
+        errors.push(hfs_issue(
+            HfsFsckCode::ExtentsBtreeStructure,
+            format!(
+                "extents B-tree leaf record count: walked {} but header says {}",
+                leaf_count, header.leaf_records
+            ),
+        ));
+    }
+
+    // Node bitmap consistency
+    check_extents_node_bitmap(extents_data, &header, errors);
+
+    // Key ordering
+    check_extents_key_ordering(extents_data, &header, errors);
+}
+
+fn check_extents_map_nodes(extents_data: &[u8], node_size: usize, errors: &mut Vec<FsckIssue>) {
+    let mut node_idx = BigEndian::read_u32(&extents_data[0..4]);
+    let max_nodes = extents_data.len() / node_size;
+    let mut visited = HashSet::new();
+
+    while node_idx != 0 {
+        if !visited.insert(node_idx) || node_idx as usize >= max_nodes {
+            break;
+        }
+        let off = node_idx as usize * node_size;
+        let node = &extents_data[off..off + node_size];
+        if node[8] as i8 != BTREE_MAP_NODE {
+            errors.push(hfs_issue(
+                HfsFsckCode::ExtentsBtreeStructure,
+                format!(
+                    "extents map node {} has wrong kind {}",
+                    node_idx, node[8] as i8
+                ),
+            ));
+        }
+        if BigEndian::read_u16(&node[10..12]) != 1 {
+            errors.push(hfs_issue(
+                HfsFsckCode::ExtentsBtreeStructure,
+                format!(
+                    "extents map node {} has {} records (expected 1)",
+                    node_idx,
+                    BigEndian::read_u16(&node[10..12])
+                ),
+            ));
+        }
+        node_idx = BigEndian::read_u32(&node[0..4]);
+    }
+}
+
+fn check_extents_offset_table(
+    node: &[u8],
+    node_size: usize,
+    node_idx: u32,
+    num_records: usize,
+    errors: &mut Vec<FsckIssue>,
+) {
+    let mut prev = 0u16;
+    for i in 0..=num_records {
+        let pos = node_size - 2 * (i + 1);
+        let off = BigEndian::read_u16(&node[pos..pos + 2]);
+        if off as usize >= node_size {
+            errors.push(hfs_issue(
+                HfsFsckCode::ExtentsBtreeStructure,
+                format!(
+                    "extents node {} offset[{}] = {} out of bounds",
+                    node_idx, i, off
+                ),
+            ));
+            return;
+        }
+        if i > 0 && off <= prev {
+            errors.push(hfs_issue(
+                HfsFsckCode::ExtentsBtreeStructure,
+                format!(
+                    "extents node {} offset table not monotonic at index {}",
+                    node_idx, i
+                ),
+            ));
+            return;
+        }
+        prev = off;
+    }
+}
+
+fn check_extents_index_record_lengths(
+    node: &[u8],
+    node_size: usize,
+    node_idx: u32,
+    num_records: usize,
+    errors: &mut Vec<FsckIssue>,
+) {
+    // Extents index records: key_len=7, key(8 bytes even-aligned) + child_ptr(4) = 12 bytes
+    for i in 0..num_records {
+        let (rec_start, rec_end) = btree_record_range(node, node_size, i);
+        if rec_start >= rec_end {
+            continue;
+        }
+        let rec_len = rec_end - rec_start;
+        if rec_len < 5 {
+            continue;
+        }
+        let key_len = node[rec_start] as usize;
+        if key_len != 7 {
+            errors.push(hfs_issue(
+                HfsFsckCode::ExtentsBtreeStructure,
+                format!(
+                    "extents index node {} record {}: key_len {} (expected 7)",
+                    node_idx, i, key_len
+                ),
+            ));
+        }
+        // Total: 1 (key_len) + 7 (key) + 4 (child ptr) = 12
+        if rec_len != 12 {
+            errors.push(hfs_issue(
+                HfsFsckCode::ExtentsBtreeStructure,
+                format!(
+                    "extents index node {} record {}: length {} (expected 12)",
+                    node_idx, i, rec_len
+                ),
+            ));
+        }
+    }
+}
+
+fn check_extents_leaf_record_lengths(
+    node: &[u8],
+    node_size: usize,
+    node_idx: u32,
+    num_records: usize,
+    errors: &mut Vec<FsckIssue>,
+) {
+    // Extents leaf records: key(8 bytes) + 3 extent descriptors(12 bytes) = 20 bytes
+    for i in 0..num_records {
+        let (rec_start, rec_end) = btree_record_range(node, node_size, i);
+        if rec_start >= rec_end {
+            continue;
+        }
+        let rec_len = rec_end - rec_start;
+        let key_len = node[rec_start] as usize;
+        if key_len != 7 {
+            errors.push(hfs_issue(
+                HfsFsckCode::ExtentsBtreeStructure,
+                format!(
+                    "extents leaf node {} record {}: key_len {} (expected 7)",
+                    node_idx, i, key_len
+                ),
+            ));
+            continue;
+        }
+        // Total: 1 (key_len) + 7 (key data) + 12 (3 × 4-byte extent descriptors) = 20
+        if rec_len != 20 {
+            errors.push(hfs_issue(
+                HfsFsckCode::ExtentsBtreeStructure,
+                format!(
+                    "extents leaf node {} record {}: length {} (expected 20)",
+                    node_idx, i, rec_len
+                ),
+            ));
+        }
+    }
+}
+
+fn check_extents_leaf_chain(
+    extents_data: &[u8],
+    header: &BTreeHeader,
+    errors: &mut Vec<FsckIssue>,
+) {
+    let node_size = header.node_size as usize;
+    let mut node_idx = header.first_leaf_node;
+    let mut prev_idx: u32 = 0;
+    let mut visited = HashSet::new();
+    let mut count = 0u32;
+
+    while node_idx != 0 {
+        if !visited.insert(node_idx) {
+            errors.push(hfs_issue(
+                HfsFsckCode::ExtentsBtreeStructure,
+                format!("extents leaf chain loop at node {}", node_idx),
+            ));
+            break;
+        }
+        let off = node_idx as usize * node_size;
+        if off + node_size > extents_data.len() {
+            errors.push(hfs_issue(
+                HfsFsckCode::ExtentsBtreeStructure,
+                format!("extents leaf node {} out of range", node_idx),
+            ));
+            break;
+        }
+        let node = &extents_data[off..off + node_size];
+        let kind = node[8] as i8;
+        if kind != BTREE_LEAF_NODE {
+            errors.push(hfs_issue(
+                HfsFsckCode::ExtentsBtreeStructure,
+                format!(
+                    "extents node {} in leaf chain has kind {} (expected leaf)",
+                    node_idx, kind
+                ),
+            ));
+            break;
+        }
+        let blink = BigEndian::read_u32(&node[4..8]);
+        if count > 0 && blink != prev_idx {
+            errors.push(hfs_issue(
+                HfsFsckCode::ExtentsBtreeStructure,
+                format!(
+                    "extents node {}: bLink {} != previous {}",
+                    node_idx, blink, prev_idx
+                ),
+            ));
+        }
+        prev_idx = node_idx;
+        count += 1;
+        node_idx = BigEndian::read_u32(&node[0..4]);
+    }
+}
+
+fn check_extents_index_sibling_links(
+    extents_data: &[u8],
+    header: &BTreeHeader,
+    errors: &mut Vec<FsckIssue>,
+) {
+    let node_size = header.node_size as usize;
+    let mut level_nodes: Vec<u32> = vec![header.root_node];
+
+    for _level in (2..=header.depth).rev() {
+        if level_nodes.is_empty() {
+            break;
+        }
+        for (i, &nidx) in level_nodes.iter().enumerate() {
+            let off = nidx as usize * node_size;
+            if off + node_size > extents_data.len() {
+                continue;
+            }
+            let node = &extents_data[off..off + node_size];
+            let flink = BigEndian::read_u32(&node[0..4]);
+            let blink = BigEndian::read_u32(&node[4..8]);
+            let exp_f = if i + 1 < level_nodes.len() {
+                level_nodes[i + 1]
+            } else {
+                0
+            };
+            let exp_b = if i > 0 { level_nodes[i - 1] } else { 0 };
+            if flink != exp_f {
+                errors.push(hfs_issue(
+                    HfsFsckCode::ExtentsBtreeStructure,
+                    format!(
+                        "extents index node {}: fLink {} expected {}",
+                        nidx, flink, exp_f
+                    ),
+                ));
+            }
+            if blink != exp_b {
+                errors.push(hfs_issue(
+                    HfsFsckCode::ExtentsBtreeStructure,
+                    format!(
+                        "extents index node {}: bLink {} expected {}",
+                        nidx, blink, exp_b
+                    ),
+                ));
+            }
+        }
+        let mut next = Vec::new();
+        for &nidx in &level_nodes {
+            let off = nidx as usize * node_size;
+            if off + node_size > extents_data.len() {
+                continue;
+            }
+            let node = &extents_data[off..off + node_size];
+            if node[8] as i8 != BTREE_INDEX_NODE {
+                continue;
+            }
+            next.extend(extract_child_pointers(node, node_size));
+        }
+        level_nodes = next;
+    }
+}
+
+fn count_extents_leaf_records(extents_data: &[u8], header: &BTreeHeader) -> u32 {
+    let node_size = header.node_size as usize;
+    let mut node_idx = header.first_leaf_node;
+    let mut visited = HashSet::new();
+    let mut total = 0u32;
+    while node_idx != 0 {
+        if !visited.insert(node_idx) {
+            break;
+        }
+        let off = node_idx as usize * node_size;
+        if off + node_size > extents_data.len() {
+            break;
+        }
+        let node = &extents_data[off..off + node_size];
+        if node[8] as i8 != BTREE_LEAF_NODE {
+            break;
+        }
+        total += BigEndian::read_u16(&node[10..12]) as u32;
+        node_idx = BigEndian::read_u32(&node[0..4]);
+    }
+    total
+}
+
+fn check_extents_node_bitmap(
+    extents_data: &[u8],
+    header: &BTreeHeader,
+    errors: &mut Vec<FsckIssue>,
+) {
+    let node_size = header.node_size as usize;
+    let (bmp_off, bmp_size) = btree_node_bitmap_range(extents_data, node_size);
+    if bmp_size == 0 {
+        return;
+    }
+    let bitmap = &extents_data[bmp_off..bmp_off + bmp_size];
+
+    // Collect referenced nodes (same pattern as catalog)
+    let max_nodes = extents_data.len() / node_size;
+    let mut referenced = HashSet::new();
+    referenced.insert(0u32);
+
+    // Map nodes
+    let mut map_idx = BigEndian::read_u32(&extents_data[0..4]);
+    let mut visited = HashSet::new();
+    while map_idx != 0 && visited.insert(map_idx) && (map_idx as usize) < max_nodes {
+        referenced.insert(map_idx);
+        let off = map_idx as usize * node_size;
+        map_idx = BigEndian::read_u32(&extents_data[off..off + 4]);
+    }
+
+    if header.root_node != 0 && header.depth > 0 {
+        referenced.insert(header.root_node);
+        let mut level: Vec<u32> = vec![header.root_node];
+        for _l in (2..=header.depth).rev() {
+            let mut next = Vec::new();
+            for &nidx in &level {
+                let off = nidx as usize * node_size;
+                if off + node_size > extents_data.len() {
+                    continue;
+                }
+                let node = &extents_data[off..off + node_size];
+                if node[8] as i8 != BTREE_INDEX_NODE {
+                    continue;
+                }
+                for child in extract_child_pointers(node, node_size) {
+                    if (child as usize) < max_nodes {
+                        referenced.insert(child);
+                    }
+                    next.push(child);
+                }
+            }
+            level = next;
+        }
+
+        let mut leaf_idx = header.first_leaf_node;
+        let mut lv = HashSet::new();
+        while leaf_idx != 0 && lv.insert(leaf_idx) && (leaf_idx as usize) < max_nodes {
+            referenced.insert(leaf_idx);
+            let off = leaf_idx as usize * node_size;
+            leaf_idx = BigEndian::read_u32(&extents_data[off..off + 4]);
+        }
+    }
+
+    for &nidx in &referenced {
+        if !bitmap_test_bit_be(bitmap, nidx) {
+            errors.push(hfs_issue(
+                HfsFsckCode::ExtentsBtreeStructure,
+                format!(
+                    "extents node {} referenced but not allocated in node bitmap",
+                    nidx
+                ),
+            ));
+        }
+    }
+}
+
+fn check_extents_key_ordering(
+    extents_data: &[u8],
+    header: &BTreeHeader,
+    errors: &mut Vec<FsckIssue>,
+) {
+    let node_size = header.node_size as usize;
+    let (bmp_off, bmp_size) = btree_node_bitmap_range(extents_data, node_size);
+    let max_nodes = extents_data.len() / node_size;
+
+    for node_idx in 0..max_nodes as u32 {
+        if !bitmap_test_bit_be(&extents_data[bmp_off..bmp_off + bmp_size], node_idx) {
+            continue;
+        }
+        let off = node_idx as usize * node_size;
+        let node = &extents_data[off..off + node_size];
+        let kind = node[8] as i8;
+        if kind != BTREE_LEAF_NODE && kind != BTREE_INDEX_NODE {
+            continue;
+        }
+        let num_records = BigEndian::read_u16(&node[10..12]) as usize;
+        if num_records < 2 {
+            continue;
+        }
+
+        for i in 0..num_records - 1 {
+            let (s1, e1) = btree_record_range(node, node_size, i);
+            let (s2, e2) = btree_record_range(node, node_size, i + 1);
+            let key_a = record_key(node, s1, e1);
+            let key_b = record_key(node, s2, e2);
+            if key_a.is_empty() || key_b.is_empty() {
+                continue;
+            }
+            if compare_extents_keys(key_a, key_b) != Ordering::Less {
+                errors.push(hfs_issue(
+                    HfsFsckCode::ExtentsBtreeStructure,
+                    format!(
+                        "extents node {} records {} and {}: keys not in ascending order",
+                        node_idx,
+                        i,
+                        i + 1
+                    ),
+                ));
+                break;
+            }
+        }
+    }
+}
+
+/// Repair extents overflow B-tree structure.
+/// Applies the same structural fixes as the catalog B-tree repair:
+/// header/root node kinds, map nodes, key ordering, leaf chain, index rebuild,
+/// node bitmap.
+fn repair_extents_btree_structure(extents_data: &mut Vec<u8>, report: &mut RepairReport) {
+    if extents_data.len() < 512 {
+        return;
+    }
+
+    let header = BTreeHeader::read(extents_data);
+    let node_size = header.node_size as usize;
+    if node_size < 512 || node_size % 512 != 0 || extents_data.len() < node_size {
+        report
+            .fixes_failed
+            .push("Cannot repair extents B-tree: invalid node size".into());
+        return;
+    }
+
+    // Fix header node kind
+    if extents_data[8] as i8 != BTREE_HEADER_NODE {
+        extents_data[8] = BTREE_HEADER_NODE as u8;
+        report
+            .fixes_applied
+            .push("Fixed extents B-tree header node kind".into());
+    }
+
+    // Fix header node record count and offset table
+    let hdr_recs = BigEndian::read_u16(&extents_data[10..12]);
+    if hdr_recs != 3 {
+        BigEndian::write_u16(&mut extents_data[10..12], 3);
+        report.fixes_applied.push(format!(
+            "Fixed extents header record count: {} -> 3",
+            hdr_recs
+        ));
+    }
+
+    // Fix root node kind
+    let header = BTreeHeader::read(extents_data);
+    if header.root_node != 0 && header.depth > 0 {
+        let root_off = header.root_node as usize * node_size;
+        if root_off + node_size <= extents_data.len() {
+            let root_kind = extents_data[root_off + 8] as i8;
+            let expected = if header.depth == 1 {
+                BTREE_LEAF_NODE
+            } else {
+                BTREE_INDEX_NODE
+            };
+            if root_kind != expected {
+                extents_data[root_off + 8] = expected as u8;
+                report.fixes_applied.push(format!(
+                    "Fixed extents root node {} kind: {} -> {}",
+                    header.root_node, root_kind, expected
+                ));
+            }
+        }
+    }
+
+    // Fix map nodes
+    repair_extents_map_nodes(extents_data, node_size, report);
+
+    // Sort records within nodes
+    repair_extents_key_ordering(extents_data, node_size, report);
+
+    // Rebuild leaf chain
+    rebuild_extents_leaf_chain(extents_data, node_size, report);
+
+    // Rebuild index nodes
+    if header.depth > 1 || (header.root_node != 0 && header.depth > 0) {
+        rebuild_extents_index_nodes(extents_data, node_size, report);
+    }
+
+    // Fix leaf record count
+    fix_extents_leaf_record_count(extents_data, report);
+
+    // Fix node bitmap
+    repair_extents_node_bitmap(extents_data, node_size, report);
+}
+
+fn repair_extents_map_nodes(extents_data: &mut [u8], node_size: usize, report: &mut RepairReport) {
+    let mut node_idx = BigEndian::read_u32(&extents_data[0..4]);
+    let max_nodes = extents_data.len() / node_size;
+    let mut visited = HashSet::new();
+
+    while node_idx != 0 {
+        if !visited.insert(node_idx) || node_idx as usize >= max_nodes {
+            break;
+        }
+        let off = node_idx as usize * node_size;
+        let mut fixed = false;
+
+        if extents_data[off + 8] as i8 != BTREE_MAP_NODE {
+            extents_data[off + 8] = BTREE_MAP_NODE as u8;
+            fixed = true;
+        }
+        if BigEndian::read_u16(&extents_data[off + 10..off + 12]) != 1 {
+            BigEndian::write_u16(&mut extents_data[off + 10..off + 12], 1);
+            fixed = true;
+        }
+        let rec0_pos = off + node_size - 2;
+        if BigEndian::read_u16(&extents_data[rec0_pos..rec0_pos + 2]) != 14 {
+            BigEndian::write_u16(&mut extents_data[rec0_pos..rec0_pos + 2], 14);
+            fixed = true;
+        }
+        let free_pos = off + node_size - 4;
+        let expected_free = (node_size - 4) as u16;
+        if BigEndian::read_u16(&extents_data[free_pos..free_pos + 2]) != expected_free {
+            BigEndian::write_u16(&mut extents_data[free_pos..free_pos + 2], expected_free);
+            fixed = true;
+        }
+
+        if fixed {
+            report
+                .fixes_applied
+                .push(format!("Fixed extents map node {} structure", node_idx));
+        }
+        node_idx = BigEndian::read_u32(&extents_data[off..off + 4]);
+    }
+}
+
+fn repair_extents_key_ordering(
+    extents_data: &mut [u8],
+    node_size: usize,
+    report: &mut RepairReport,
+) {
+    let (bmp_off, bmp_size) = btree_node_bitmap_range(extents_data, node_size);
+    let max_nodes = extents_data.len() / node_size;
+    let mut fixed_count = 0u32;
+
+    for node_idx in 0..max_nodes as u32 {
+        if !bitmap_test_bit_be(&extents_data[bmp_off..bmp_off + bmp_size], node_idx) {
+            continue;
+        }
+        let off = node_idx as usize * node_size;
+        let kind = extents_data[off + 8] as i8;
+        if kind != BTREE_LEAF_NODE && kind != BTREE_INDEX_NODE {
+            continue;
+        }
+        let num_records = BigEndian::read_u16(&extents_data[off + 10..off + 12]) as usize;
+        if num_records < 2 {
+            continue;
+        }
+
+        let node = &extents_data[off..off + node_size];
+        let mut needs_sort = false;
+        for i in 0..num_records - 1 {
+            let (s1, e1) = btree_record_range(node, node_size, i);
+            let (s2, e2) = btree_record_range(node, node_size, i + 1);
+            let ka = record_key(node, s1, e1);
+            let kb = record_key(node, s2, e2);
+            if !ka.is_empty() && !kb.is_empty() && compare_extents_keys(ka, kb) != Ordering::Less {
+                needs_sort = true;
+                break;
+            }
+        }
+        if !needs_sort {
+            continue;
+        }
+
+        let mut records: Vec<Vec<u8>> = Vec::with_capacity(num_records);
+        for i in 0..num_records {
+            let (s, e) = btree_record_range(node, node_size, i);
+            if s < e && e <= node_size {
+                records.push(node[s..e].to_vec());
+            }
+        }
+        records.sort_by(|a, b| compare_extents_keys(a, b));
+
+        let node_mut = &mut extents_data[off..off + node_size];
+        let mut wp = 14usize;
+        for (i, rec) in records.iter().enumerate() {
+            node_mut[wp..wp + rec.len()].copy_from_slice(rec);
+            let opos = node_size - 2 * (i + 1);
+            BigEndian::write_u16(&mut node_mut[opos..opos + 2], wp as u16);
+            wp += rec.len();
+        }
+        let fpos = node_size - 2 * (records.len() + 1);
+        BigEndian::write_u16(&mut node_mut[fpos..fpos + 2], wp as u16);
+        if wp < fpos {
+            node_mut[wp..fpos].fill(0);
+        }
+        fixed_count += 1;
+    }
+
+    if fixed_count > 0 {
+        report
+            .fixes_applied
+            .push(format!("Sorted records in {} extents node(s)", fixed_count));
+    }
+}
+
+fn rebuild_extents_leaf_chain(
+    extents_data: &mut [u8],
+    node_size: usize,
+    report: &mut RepairReport,
+) {
+    let (bmp_off, bmp_size) = btree_node_bitmap_range(extents_data, node_size);
+    let max_nodes = extents_data.len() / node_size;
+
+    // Collect all leaf nodes (bitmap-allocated with kind=leaf)
+    let mut leaf_nodes: Vec<u32> = Vec::new();
+    for idx in 1..max_nodes as u32 {
+        if !bitmap_test_bit_be(&extents_data[bmp_off..bmp_off + bmp_size], idx) {
+            continue;
+        }
+        let off = idx as usize * node_size;
+        if off + node_size > extents_data.len() {
+            break;
+        }
+        if extents_data[off + 8] as i8 == BTREE_LEAF_NODE {
+            leaf_nodes.push(idx);
+        }
+    }
+
+    if leaf_nodes.is_empty() {
+        return;
+    }
+
+    // Sort by first key
+    leaf_nodes.sort_by(|&a, &b| {
+        let off_a = a as usize * node_size;
+        let off_b = b as usize * node_size;
+        let na = &extents_data[off_a..off_a + node_size];
+        let nb = &extents_data[off_b..off_b + node_size];
+        let (sa, ea) = btree_record_range(na, node_size, 0);
+        let (sb, eb) = btree_record_range(nb, node_size, 0);
+        let ka = record_key(na, sa, ea);
+        let kb = record_key(nb, sb, eb);
+        compare_extents_keys(ka, kb)
+    });
+
+    // Relink
+    let mut changed = false;
+    for (i, &nidx) in leaf_nodes.iter().enumerate() {
+        let off = nidx as usize * node_size;
+        let flink = if i + 1 < leaf_nodes.len() {
+            leaf_nodes[i + 1]
+        } else {
+            0
+        };
+        let blink = if i > 0 { leaf_nodes[i - 1] } else { 0 };
+
+        let cur_f = BigEndian::read_u32(&extents_data[off..off + 4]);
+        let cur_b = BigEndian::read_u32(&extents_data[off + 4..off + 8]);
+        if cur_f != flink || cur_b != blink {
+            BigEndian::write_u32(&mut extents_data[off..off + 4], flink);
+            BigEndian::write_u32(&mut extents_data[off + 4..off + 8], blink);
+            changed = true;
+        }
+        // Ensure height = 1
+        extents_data[off + 9] = 1;
+    }
+
+    // Update header
+    let mut h = BTreeHeader::read(extents_data);
+    let first = leaf_nodes[0];
+    let last = *leaf_nodes.last().unwrap();
+    if h.first_leaf_node != first || h.last_leaf_node != last {
+        h.first_leaf_node = first;
+        h.last_leaf_node = last;
+        h.write(extents_data);
+        changed = true;
+    }
+
+    if changed {
+        report.fixes_applied.push(format!(
+            "Rebuilt extents leaf chain ({} nodes)",
+            leaf_nodes.len()
+        ));
+    }
+}
+
+fn rebuild_extents_index_nodes(
+    extents_data: &mut [u8],
+    node_size: usize,
+    report: &mut RepairReport,
+) {
+    // Free all existing index nodes
+    let (bmp_off, bmp_size) = btree_node_bitmap_range(extents_data, node_size);
+    let max_nodes = extents_data.len() / node_size;
+    for idx in 1..max_nodes as u32 {
+        if bitmap_test_bit_be(&extents_data[bmp_off..bmp_off + bmp_size], idx) {
+            let off = idx as usize * node_size;
+            if off + node_size <= extents_data.len()
+                && extents_data[off + 8] as i8 == BTREE_INDEX_NODE
+            {
+                bitmap_clear_bit_be(&mut extents_data[bmp_off..bmp_off + bmp_size], idx);
+            }
+        }
+    }
+
+    // Collect leaf nodes from chain
+    let header = BTreeHeader::read(extents_data);
+    let mut leaves: Vec<u32> = Vec::new();
+    let mut node_idx = header.first_leaf_node;
+    let mut visited = HashSet::new();
+    while node_idx != 0 && visited.insert(node_idx) {
+        let off = node_idx as usize * node_size;
+        if off + node_size > extents_data.len() {
+            break;
+        }
+        if extents_data[off + 8] as i8 != BTREE_LEAF_NODE {
+            break;
+        }
+        leaves.push(node_idx);
+        node_idx = BigEndian::read_u32(&extents_data[off..off + 4]);
+    }
+
+    if leaves.len() <= 1 {
+        // Single leaf = root, depth = 1
+        if !leaves.is_empty() {
+            let mut h = BTreeHeader::read(extents_data);
+            h.root_node = leaves[0];
+            h.depth = 1;
+            h.write(extents_data);
+        }
+        return;
+    }
+
+    // Build index levels bottom-up
+    let mut children = leaves;
+    let mut height = 2u16;
+
+    loop {
+        let total_nodes_in_btree = extents_data.len() / node_size;
+        let mut idx_nodes: Vec<u32> = Vec::new();
+        let mut cur_idx_node = match super::hfs_common::btree_alloc_node(
+            extents_data,
+            node_size,
+            total_nodes_in_btree as u32,
+        ) {
+            Ok(n) => n,
+            Err(_) => {
+                report
+                    .fixes_failed
+                    .push("Cannot allocate extents index node".into());
+                return;
+            }
+        };
+        init_node(
+            extents_data,
+            node_size,
+            cur_idx_node,
+            BTREE_INDEX_NODE,
+            height as u8,
+        );
+        idx_nodes.push(cur_idx_node);
+
+        let mut write_pos = 14usize;
+        let mut rec_count = 0usize;
+
+        for &child in &children {
+            let child_off = child as usize * node_size;
+            if child_off + node_size > extents_data.len() {
+                continue;
+            }
+            let child_node = &extents_data[child_off..child_off + node_size];
+            let (s, e) = btree_record_range(child_node, node_size, 0);
+            if s >= e {
+                continue;
+            }
+            let key = record_key(child_node, s, e).to_vec();
+            if key.is_empty() || key.len() < 8 {
+                continue;
+            }
+
+            // Extents index record: key(8 bytes) + child_ptr(4) = 12 bytes
+            let rec_size = 8 + 4;
+            let off = cur_idx_node as usize * node_size;
+            let ot_size = 2 * (rec_count + 2); // current records + new + free space
+            if write_pos + rec_size + ot_size > node_size {
+                // Finalize current index node
+                let node_mut = &mut extents_data[off..off + node_size];
+                BigEndian::write_u16(&mut node_mut[10..12], rec_count as u16);
+                let fpos = node_size - 2 * (rec_count + 1);
+                BigEndian::write_u16(&mut node_mut[fpos..fpos + 2], write_pos as u16);
+
+                // Allocate a new index node
+                cur_idx_node = match super::hfs_common::btree_alloc_node(
+                    extents_data,
+                    node_size,
+                    total_nodes_in_btree as u32,
+                ) {
+                    Ok(n) => n,
+                    Err(_) => {
+                        report
+                            .fixes_failed
+                            .push("Cannot allocate extents index node".into());
+                        return;
+                    }
+                };
+                init_node(
+                    extents_data,
+                    node_size,
+                    cur_idx_node,
+                    BTREE_INDEX_NODE,
+                    height as u8,
+                );
+                idx_nodes.push(cur_idx_node);
+                write_pos = 14;
+                rec_count = 0;
+            }
+
+            // Write index record
+            let off = cur_idx_node as usize * node_size;
+            // Key: key_len(1)=7 + fork_type(1) + file_id(4) + start_block(2) = 8 bytes
+            extents_data[off + write_pos..off + write_pos + 8]
+                .copy_from_slice(&key[..8.min(key.len())]);
+            // Ensure key_len = 7
+            extents_data[off + write_pos] = 7;
+            BigEndian::write_u32(
+                &mut extents_data[off + write_pos + 8..off + write_pos + 12],
+                child,
+            );
+            let opos = off + node_size - 2 * (rec_count + 1);
+            BigEndian::write_u16(&mut extents_data[opos..opos + 2], write_pos as u16);
+            write_pos += rec_size;
+            rec_count += 1;
+        }
+
+        // Finalize last index node
+        let off = cur_idx_node as usize * node_size;
+        BigEndian::write_u16(&mut extents_data[off + 10..off + 12], rec_count as u16);
+        let fpos = off + node_size - 2 * (rec_count + 1);
+        BigEndian::write_u16(&mut extents_data[fpos..fpos + 2], write_pos as u16);
+
+        // Link index nodes
+        for (i, &nidx) in idx_nodes.iter().enumerate() {
+            let noff = nidx as usize * node_size;
+            let flink = if i + 1 < idx_nodes.len() {
+                idx_nodes[i + 1]
+            } else {
+                0
+            };
+            let blink = if i > 0 { idx_nodes[i - 1] } else { 0 };
+            BigEndian::write_u32(&mut extents_data[noff..noff + 4], flink);
+            BigEndian::write_u32(&mut extents_data[noff + 4..noff + 8], blink);
+        }
+
+        if idx_nodes.len() == 1 {
+            // This is the root
+            let mut h = BTreeHeader::read(extents_data);
+            h.root_node = idx_nodes[0];
+            h.depth = height;
+            h.write(extents_data);
+            report
+                .fixes_applied
+                .push(format!("Rebuilt extents index tree (depth {})", height));
+            break;
+        }
+
+        children = idx_nodes;
+        height += 1;
+    }
+}
+
+fn fix_extents_leaf_record_count(extents_data: &mut [u8], report: &mut RepairReport) {
+    let header = BTreeHeader::read(extents_data);
+    let actual = count_extents_leaf_records(extents_data, &header);
+    if actual != header.leaf_records {
+        let old = header.leaf_records;
+        let mut h = header;
+        h.leaf_records = actual;
+        h.write(extents_data);
+        report.fixes_applied.push(format!(
+            "Fixed extents leaf record count: {} -> {}",
+            old, actual
+        ));
+    }
+}
+
+fn repair_extents_node_bitmap(
+    extents_data: &mut [u8],
+    node_size: usize,
+    report: &mut RepairReport,
+) {
+    let header = BTreeHeader::read(extents_data);
+    let (bmp_off, bmp_size) = btree_node_bitmap_range(extents_data, node_size);
+    if bmp_size == 0 {
+        return;
+    }
+
+    let max_nodes = extents_data.len() / node_size;
+    let mut referenced = HashSet::new();
+    referenced.insert(0u32);
+
+    // Map nodes
+    let mut map_idx = BigEndian::read_u32(&extents_data[0..4]);
+    let mut visited = HashSet::new();
+    while map_idx != 0 && visited.insert(map_idx) && (map_idx as usize) < max_nodes {
+        referenced.insert(map_idx);
+        let off = map_idx as usize * node_size;
+        map_idx = BigEndian::read_u32(&extents_data[off..off + 4]);
+    }
+
+    if header.root_node != 0 && header.depth > 0 {
+        referenced.insert(header.root_node);
+        let mut level: Vec<u32> = vec![header.root_node];
+        for _l in (2..=header.depth).rev() {
+            let mut next = Vec::new();
+            for &nidx in &level {
+                let off = nidx as usize * node_size;
+                if off + node_size > extents_data.len() {
+                    continue;
+                }
+                if extents_data[off + 8] as i8 != BTREE_INDEX_NODE {
+                    continue;
+                }
+                let node = &extents_data[off..off + node_size];
+                for child in extract_child_pointers(node, node_size) {
+                    if (child as usize) < max_nodes {
+                        referenced.insert(child);
+                    }
+                    next.push(child);
+                }
+            }
+            level = next;
+        }
+        let mut leaf_idx = header.first_leaf_node;
+        let mut lv = HashSet::new();
+        while leaf_idx != 0 && lv.insert(leaf_idx) && (leaf_idx as usize) < max_nodes {
+            referenced.insert(leaf_idx);
+            let off = leaf_idx as usize * node_size;
+            leaf_idx = BigEndian::read_u32(&extents_data[off..off + 4]);
+        }
+    }
+
+    let mut fixed = 0u32;
+    for &nidx in &referenced {
+        if !bitmap_test_bit_be(&extents_data[bmp_off..bmp_off + bmp_size], nidx) {
+            bitmap_set_bit_be(&mut extents_data[bmp_off..bmp_off + bmp_size], nidx);
+            fixed += 1;
+        }
+    }
+
+    if fixed > 0 {
+        let mut h = BTreeHeader::read(extents_data);
+        h.free_nodes = h.free_nodes.saturating_sub(fixed);
+        h.write(extents_data);
+        report.fixes_applied.push(format!(
+            "Marked {} extents node(s) as allocated in node bitmap",
+            fixed
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2634,7 +4327,10 @@ mod tests {
         assert!(
             errors.is_empty(),
             "8704 should be valid: {:?}",
-            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+            errors
+                .iter()
+                .map(|e| e.message.as_str())
+                .collect::<Vec<_>>()
         );
 
         // Not a multiple of 512
@@ -2683,5 +4379,607 @@ mod tests {
             embedded_block_count: 0,
             raw_sector: [0; 512],
         }
+    }
+
+    #[test]
+    fn test_vbm_no_collision() {
+        // Default test MDB: bitmap at sector 3, total_blocks=100.
+        // VBM needs ceil(100 / 4096) = 1 sector. VBM occupies sector 3..4.
+        // Data area starts at sector 5. No collision.
+        let mdb = make_test_mdb();
+        let mut errors = Vec::new();
+        check_mdb(&mdb, &mut errors);
+        assert!(
+            errors.is_empty(),
+            "no VBM collision expected: {:?}",
+            errors
+                .iter()
+                .map(|e| e.message.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_vbm_collision_detected() {
+        let mut mdb = make_test_mdb();
+        // Bitmap at sector 3, total_blocks=50000 → needs ceil(50000/4096) = 13 sectors
+        // VBM occupies sectors 3..16, but data area starts at sector 5 → collision
+        mdb.total_blocks = 50000;
+        let mut errors = Vec::new();
+        check_mdb(&mdb, &mut errors);
+        assert!(
+            errors.iter().any(|e| e.code == "VbmDataAreaCollision"),
+            "should detect VBM collision: {:?}",
+            errors
+                .iter()
+                .map(|e| e.message.as_str())
+                .collect::<Vec<_>>()
+        );
+        // VBM collision is non-repairable
+        assert!(
+            !errors
+                .iter()
+                .find(|e| e.code == "VbmDataAreaCollision")
+                .unwrap()
+                .repairable
+        );
+    }
+
+    #[test]
+    fn test_map_node_valid_no_continuation() {
+        // Most B-trees have no continuation map nodes (node 0 fLink = 0).
+        // This is the common case — should produce no errors.
+        let node_size = 512;
+        let mut data = vec![0u8; node_size * 4];
+        // Node 0: header node, fLink = 0 (no continuation)
+        data[8] = BTREE_HEADER_NODE as u8;
+        BigEndian::write_u16(&mut data[10..12], 3);
+        // Minimal offset table for header node
+        let ot = node_size;
+        BigEndian::write_u16(&mut data[ot - 2..ot], 14);
+        BigEndian::write_u16(&mut data[ot - 4..ot - 2], 0x78);
+        BigEndian::write_u16(&mut data[ot - 6..ot - 4], 0xf8);
+        BigEndian::write_u16(&mut data[ot - 8..ot - 6], 0x1f8);
+
+        let mut errors = Vec::new();
+        check_map_nodes(&data, node_size, &mut errors);
+        assert!(errors.is_empty(), "no map node errors expected");
+    }
+
+    #[test]
+    fn test_map_node_bad_kind_detected() {
+        let node_size = 512;
+        let mut data = vec![0u8; node_size * 4];
+        // Node 0: header node, fLink = 2 (points to map node at index 2)
+        BigEndian::write_u32(&mut data[0..4], 2);
+        data[8] = BTREE_HEADER_NODE as u8;
+        BigEndian::write_u16(&mut data[10..12], 3);
+
+        // Node 2: should be map node but has wrong kind (leaf)
+        let n2 = 2 * node_size;
+        data[n2 + 8] = BTREE_LEAF_NODE as u8; // wrong!
+        BigEndian::write_u16(&mut data[n2 + 10..n2 + 12], 1);
+        // Correct offset table
+        BigEndian::write_u16(&mut data[n2 + node_size - 2..n2 + node_size], 14);
+        BigEndian::write_u16(
+            &mut data[n2 + node_size - 4..n2 + node_size - 2],
+            (node_size - 4) as u16,
+        );
+
+        let mut errors = Vec::new();
+        check_map_nodes(&data, node_size, &mut errors);
+        assert_eq!(errors.len(), 1, "should detect bad map node kind");
+        assert_eq!(errors[0].code, "MapNodeBadStructure");
+        assert!(errors[0].repairable);
+    }
+
+    #[test]
+    fn test_map_node_repair() {
+        let node_size = 512;
+        let mut data = vec![0u8; node_size * 4];
+        // Node 0: header, fLink → node 2
+        BigEndian::write_u32(&mut data[0..4], 2);
+        data[8] = BTREE_HEADER_NODE as u8;
+        BigEndian::write_u16(&mut data[10..12], 3);
+
+        // Node 2: broken map node (wrong kind, wrong record count, wrong offsets)
+        let n2 = 2 * node_size;
+        data[n2 + 8] = BTREE_INDEX_NODE as u8; // wrong kind
+        BigEndian::write_u16(&mut data[n2 + 10..n2 + 12], 5); // wrong record count
+        BigEndian::write_u16(&mut data[n2 + node_size - 2..n2 + node_size], 99); // wrong offset
+
+        let mut report = RepairReport {
+            fixes_applied: Vec::new(),
+            fixes_failed: Vec::new(),
+            unrepairable_count: 0,
+        };
+        repair_map_nodes(&mut data, node_size, &mut report);
+
+        // Verify repairs
+        assert_eq!(data[n2 + 8] as i8, BTREE_MAP_NODE);
+        assert_eq!(BigEndian::read_u16(&data[n2 + 10..n2 + 12]), 1);
+        assert_eq!(
+            BigEndian::read_u16(&data[n2 + node_size - 2..n2 + node_size]),
+            14
+        );
+        assert_eq!(
+            BigEndian::read_u16(&data[n2 + node_size - 4..n2 + node_size - 2]),
+            (node_size - 4) as u16
+        );
+        assert_eq!(report.fixes_applied.len(), 1);
+
+        // Check passes after repair
+        let mut errors = Vec::new();
+        check_map_nodes(&data, node_size, &mut errors);
+        assert!(
+            errors.is_empty(),
+            "should be clean after repair: {:?}",
+            errors
+                .iter()
+                .map(|e| e.message.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Helper: build a minimal B-tree with a header node and one leaf node.
+    /// Returns (data, node_size). Node 0 = header, node 1 = leaf (root).
+    /// The leaf has one dummy catalog record.
+    fn make_minimal_btree(node_size: usize) -> Vec<u8> {
+        let num_nodes = 4usize;
+        let mut data = vec![0u8; node_size * num_nodes];
+
+        // Node 0: Header node
+        data[8] = BTREE_HEADER_NODE as u8; // kind
+        BigEndian::write_u16(&mut data[10..12], 3); // 3 records
+
+        // B-tree header record at offset 14
+        let hr = 14;
+        BigEndian::write_u16(&mut data[hr..hr + 2], 1); // depth = 1
+        BigEndian::write_u32(&mut data[hr + 2..hr + 6], 1); // root_node = 1
+        BigEndian::write_u32(&mut data[hr + 6..hr + 10], 1); // leaf_records = 1
+        BigEndian::write_u32(&mut data[hr + 10..hr + 14], 1); // first_leaf = 1
+        BigEndian::write_u32(&mut data[hr + 14..hr + 18], 1); // last_leaf = 1
+        BigEndian::write_u16(&mut data[hr + 18..hr + 20], node_size as u16); // node_size
+        BigEndian::write_u16(&mut data[hr + 20..hr + 22], 37); // max_key_len
+        BigEndian::write_u32(&mut data[hr + 22..hr + 26], num_nodes as u32); // total_nodes
+        BigEndian::write_u32(&mut data[hr + 26..hr + 30], (num_nodes - 2) as u32); // free_nodes
+
+        // Offset table for header node
+        let ot = node_size;
+        BigEndian::write_u16(&mut data[ot - 2..ot], 14); // record 0
+        BigEndian::write_u16(&mut data[ot - 4..ot - 2], 0x78); // record 1
+        BigEndian::write_u16(&mut data[ot - 6..ot - 4], 0xf8); // record 2
+        BigEndian::write_u16(&mut data[ot - 8..ot - 6], node_size as u16 - 8); // free space
+
+        // Node bitmap (record 2 at offset 0xf8): mark nodes 0 and 1 as allocated
+        data[0xf8] = 0b11000000;
+
+        // Node 1: Leaf node with 1 dummy record
+        let n1 = node_size;
+        data[n1 + 8] = BTREE_LEAF_NODE as u8; // kind = leaf
+        data[n1 + 9] = 1; // height = 1
+        BigEndian::write_u16(&mut data[n1 + 10..n1 + 12], 1); // 1 record
+
+        // Dummy catalog dir record: key(8 bytes) + dir data(70 bytes) = 78 bytes
+        let r0 = n1 + 14;
+        data[r0] = 6; // key_len = 6
+        BigEndian::write_u32(&mut data[r0 + 2..r0 + 6], 1); // parent_id = 1
+        data[r0 + 8] = CATALOG_DIR as u8; // type = directory
+        BigEndian::write_u32(&mut data[r0 + 14..r0 + 18], 2); // dirID = 2
+
+        // Offset table for leaf
+        let lot = n1 + node_size;
+        BigEndian::write_u16(&mut data[lot - 2..lot], 14); // record 0
+        BigEndian::write_u16(&mut data[lot - 4..lot - 2], (14 + 78) as u16); // free space
+
+        data
+    }
+
+    #[test]
+    fn test_node_bitmap_consistent() {
+        let node_size = 512;
+        let data = make_minimal_btree(node_size);
+        let header = BTreeHeader::read(&data);
+        let mut errors = Vec::new();
+        check_node_bitmap_consistency(&data, &header, &mut errors);
+        assert!(
+            errors.is_empty(),
+            "consistent bitmap should have no errors: {:?}",
+            errors
+                .iter()
+                .map(|e| e.message.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_node_bitmap_missing_detected() {
+        let node_size = 512;
+        let mut data = make_minimal_btree(node_size);
+
+        // Clear the bitmap bit for node 1 (leaf/root) — it's still referenced
+        // The bitmap is at offset 0xf8 in node 0. Bit 0 = node 0, bit 1 = node 1.
+        data[0xf8] = 0b10000000; // only node 0 allocated, node 1 missing
+
+        let header = BTreeHeader::read(&data);
+        let mut errors = Vec::new();
+        check_node_bitmap_consistency(&data, &header, &mut errors);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].code, "NodeBitmapMissing");
+        assert!(errors[0].repairable);
+        assert!(errors[0].message.contains("node 1"));
+    }
+
+    #[test]
+    fn test_node_bitmap_missing_repaired() {
+        let node_size = 512;
+        let mut data = make_minimal_btree(node_size);
+
+        // Clear bitmap bit for node 1
+        data[0xf8] = 0b10000000;
+
+        let mut report = RepairReport {
+            fixes_applied: Vec::new(),
+            fixes_failed: Vec::new(),
+            unrepairable_count: 0,
+        };
+        repair_node_bitmap(&mut data, node_size, &mut report);
+
+        // Verify node 1 is now allocated
+        assert_eq!(
+            data[0xf8] & 0b01000000,
+            0b01000000,
+            "node 1 bit should be set"
+        );
+        assert_eq!(report.fixes_applied.len(), 1);
+
+        // Verify header free_nodes was decremented
+        let header = BTreeHeader::read(&data);
+        // Original: 2 free nodes (nodes 2,3). After fixing node 1: still 2 free
+        // because node 1 was already counted as used. Actually free_nodes was set
+        // to num_nodes - 2 = 2. After repair, it saturating_sub(1) = 1.
+        assert_eq!(header.free_nodes, 1);
+
+        // Check should now pass
+        let mut errors = Vec::new();
+        check_node_bitmap_consistency(&data, &header, &mut errors);
+        assert!(errors.is_empty());
+    }
+
+    /// Build a leaf node with two catalog dir records at given parent_ids.
+    /// Returns the modified btree data. Uses make_minimal_btree as base
+    /// but replaces the leaf with two records.
+    fn make_btree_with_two_leaf_records(
+        node_size: usize,
+        parent_id_0: u32,
+        name_0: &[u8],
+        parent_id_1: u32,
+        name_1: &[u8],
+    ) -> Vec<u8> {
+        let mut data = make_minimal_btree(node_size);
+
+        // Build two dir records in the leaf node (node 1)
+        let n1 = node_size;
+        BigEndian::write_u16(&mut data[n1 + 10..n1 + 12], 2); // 2 records
+
+        // Record 0: key + dir data
+        let r0 = n1 + 14;
+        let key_len_0 = 1 + 4 + 1 + name_0.len(); // reserved + parent_id + name_len + name
+        data[r0] = key_len_0 as u8;
+        data[r0 + 1] = 0; // reserved
+        BigEndian::write_u32(&mut data[r0 + 2..r0 + 6], parent_id_0);
+        data[r0 + 6] = name_0.len() as u8;
+        data[r0 + 7..r0 + 7 + name_0.len()].copy_from_slice(name_0);
+        let mut key_total_0 = 1 + key_len_0;
+        if key_total_0 % 2 != 0 {
+            key_total_0 += 1; // even alignment
+        }
+        let data_off_0 = r0 + key_total_0;
+        data[data_off_0] = CATALOG_DIR as u8;
+        BigEndian::write_u32(&mut data[data_off_0 + 6..data_off_0 + 10], 2); // dirID
+        let rec0_len = key_total_0 + 70;
+
+        // Record 1: key + dir data
+        let r1 = r0 + rec0_len;
+        let key_len_1 = 1 + 4 + 1 + name_1.len();
+        data[r1] = key_len_1 as u8;
+        data[r1 + 1] = 0;
+        BigEndian::write_u32(&mut data[r1 + 2..r1 + 6], parent_id_1);
+        data[r1 + 6] = name_1.len() as u8;
+        data[r1 + 7..r1 + 7 + name_1.len()].copy_from_slice(name_1);
+        let mut key_total_1 = 1 + key_len_1;
+        if key_total_1 % 2 != 0 {
+            key_total_1 += 1;
+        }
+        let data_off_1 = r1 + key_total_1;
+        data[data_off_1] = CATALOG_DIR as u8;
+        BigEndian::write_u32(&mut data[data_off_1 + 6..data_off_1 + 10], 3);
+        let rec1_len = key_total_1 + 70;
+
+        // Offset table
+        let lot = n1 + node_size;
+        BigEndian::write_u16(&mut data[lot - 2..lot], 14); // record 0
+        BigEndian::write_u16(&mut data[lot - 4..lot - 2], (14 + rec0_len) as u16); // record 1
+        BigEndian::write_u16(
+            &mut data[lot - 6..lot - 4],
+            (14 + rec0_len + rec1_len) as u16,
+        ); // free space
+
+        // Update header leaf_records
+        let hr = 14;
+        BigEndian::write_u32(&mut data[hr + 6..hr + 10], 2); // leaf_records = 2
+
+        data
+    }
+
+    #[test]
+    fn test_keys_in_order() {
+        let node_size = 512;
+        // parent_id 1 < parent_id 5 → already sorted
+        let data = make_btree_with_two_leaf_records(node_size, 1, b"", 5, b"");
+        let header = BTreeHeader::read(&data);
+        let mut errors = Vec::new();
+        check_key_ordering(&data, &header, &mut errors);
+        assert!(
+            errors.is_empty(),
+            "sorted keys should have no errors: {:?}",
+            errors
+                .iter()
+                .map(|e| e.message.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_keys_out_of_order_detected() {
+        let node_size = 512;
+        // parent_id 10 > parent_id 1 → out of order (record 0 has higher key)
+        let data = make_btree_with_two_leaf_records(node_size, 10, b"", 1, b"");
+        let header = BTreeHeader::read(&data);
+        let mut errors = Vec::new();
+        check_key_ordering(&data, &header, &mut errors);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].code, "KeysOutOfOrder");
+        assert!(errors[0].repairable);
+    }
+
+    #[test]
+    fn test_keys_out_of_order_by_name() {
+        let node_size = 512;
+        // Same parent_id but name "Zebra" > "Apple" → out of order
+        let data = make_btree_with_two_leaf_records(node_size, 2, b"Zebra", 2, b"Apple");
+        let header = BTreeHeader::read(&data);
+        let mut errors = Vec::new();
+        check_key_ordering(&data, &header, &mut errors);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].code, "KeysOutOfOrder");
+    }
+
+    #[test]
+    fn test_keys_out_of_order_repaired() {
+        let node_size = 512;
+        let mut data = make_btree_with_two_leaf_records(node_size, 10, b"", 1, b"");
+
+        let mut report = RepairReport {
+            fixes_applied: Vec::new(),
+            fixes_failed: Vec::new(),
+            unrepairable_count: 0,
+        };
+        repair_key_ordering(&mut data, node_size, &mut report);
+        assert_eq!(report.fixes_applied.len(), 1);
+
+        // Verify check passes after repair
+        let header = BTreeHeader::read(&data);
+        let mut errors = Vec::new();
+        check_key_ordering(&data, &header, &mut errors);
+        assert!(
+            errors.is_empty(),
+            "should be clean after repair: {:?}",
+            errors
+                .iter()
+                .map(|e| e.message.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        // Verify the records are now in correct order: parent_id 1 first, then 10
+        let n1 = node_size;
+        let node = &data[n1..n1 + node_size];
+        let (s0, _) = btree_record_range(node, node_size, 0);
+        let (s1, _) = btree_record_range(node, node_size, 1);
+        let pid0 = BigEndian::read_u32(&node[s0 + 2..s0 + 6]);
+        let pid1 = BigEndian::read_u32(&node[s1 + 2..s1 + 6]);
+        assert_eq!(pid0, 1, "first record should have parent_id 1");
+        assert_eq!(pid1, 10, "second record should have parent_id 10");
+    }
+
+    // ---- Extents overflow B-tree tests ----
+
+    /// Build a minimal extents overflow B-tree with a header node and one leaf.
+    /// The leaf has one extent record for file_id=10, data fork, start_block=0.
+    fn make_minimal_extents_btree(node_size: usize) -> Vec<u8> {
+        let num_nodes = 4usize;
+        let mut data = vec![0u8; node_size * num_nodes];
+
+        // Node 0: Header
+        data[8] = BTREE_HEADER_NODE as u8;
+        BigEndian::write_u16(&mut data[10..12], 3);
+
+        let hr = 14;
+        BigEndian::write_u16(&mut data[hr..hr + 2], 1); // depth = 1
+        BigEndian::write_u32(&mut data[hr + 2..hr + 6], 1); // root = 1
+        BigEndian::write_u32(&mut data[hr + 6..hr + 10], 1); // leaf_records = 1
+        BigEndian::write_u32(&mut data[hr + 10..hr + 14], 1); // first_leaf = 1
+        BigEndian::write_u32(&mut data[hr + 14..hr + 18], 1); // last_leaf = 1
+        BigEndian::write_u16(&mut data[hr + 18..hr + 20], node_size as u16);
+        BigEndian::write_u16(&mut data[hr + 20..hr + 22], 7); // max_key_len = 7
+        BigEndian::write_u32(&mut data[hr + 22..hr + 26], num_nodes as u32);
+        BigEndian::write_u32(&mut data[hr + 26..hr + 30], (num_nodes - 2) as u32); // free
+
+        // Offset table for header
+        let ot = node_size;
+        BigEndian::write_u16(&mut data[ot - 2..ot], 14);
+        BigEndian::write_u16(&mut data[ot - 4..ot - 2], 0x78);
+        BigEndian::write_u16(&mut data[ot - 6..ot - 4], 0xf8);
+        BigEndian::write_u16(&mut data[ot - 8..ot - 6], node_size as u16 - 8);
+
+        // Node bitmap: nodes 0 and 1 allocated
+        data[0xf8] = 0b11000000;
+
+        // Node 1: Leaf with 1 extent record
+        let n1 = node_size;
+        data[n1 + 8] = BTREE_LEAF_NODE as u8;
+        data[n1 + 9] = 1; // height
+
+        BigEndian::write_u16(&mut data[n1 + 10..n1 + 12], 1); // 1 record
+
+        // Extent record: key(8) + data(12) = 20 bytes
+        let r0 = n1 + 14;
+        data[r0] = 7; // key_len = 7
+        data[r0 + 1] = 0x00; // fork_type = data
+        BigEndian::write_u32(&mut data[r0 + 2..r0 + 6], 10); // file_id = 10
+        BigEndian::write_u16(&mut data[r0 + 6..r0 + 8], 0); // start_block = 0
+                                                            // 3 extent descriptors (each 4 bytes): start_block(2) + block_count(2)
+        BigEndian::write_u16(&mut data[r0 + 8..r0 + 10], 100); // ext[0].start = 100
+        BigEndian::write_u16(&mut data[r0 + 10..r0 + 12], 5); // ext[0].count = 5
+                                                              // ext[1] and ext[2] = 0 (already zeroed)
+
+        // Offset table for leaf
+        let lot = n1 + node_size;
+        BigEndian::write_u16(&mut data[lot - 2..lot], 14);
+        BigEndian::write_u16(&mut data[lot - 4..lot - 2], (14 + 20) as u16); // free
+
+        data
+    }
+
+    #[test]
+    fn test_extents_btree_valid() {
+        let node_size = 512;
+        let data = make_minimal_extents_btree(node_size);
+        let mut errors = Vec::new();
+        check_extents_btree_structure(&data, &mut errors);
+        assert!(
+            errors.is_empty(),
+            "valid extents B-tree: {:?}",
+            errors
+                .iter()
+                .map(|e| e.message.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_extents_btree_empty() {
+        // No extents data at all — should produce no errors
+        let mut errors = Vec::new();
+        check_extents_btree_structure(&[], &mut errors);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn test_extents_btree_bad_header() {
+        let node_size = 512;
+        let mut data = make_minimal_extents_btree(node_size);
+        // Corrupt header node kind
+        data[8] = BTREE_LEAF_NODE as u8;
+        let mut errors = Vec::new();
+        check_extents_btree_structure(&data, &mut errors);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.code == "ExtentsBtreeStructure" && e.message.contains("kind")),
+            "should detect bad header kind: {:?}",
+            errors
+                .iter()
+                .map(|e| e.message.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_extents_btree_bad_leaf_record_length() {
+        let node_size = 512;
+        let mut data = make_minimal_extents_btree(node_size);
+        // Change free space offset to make record appear longer than 20
+        let lot = node_size + node_size;
+        BigEndian::write_u16(&mut data[lot - 4..lot - 2], (14 + 30) as u16);
+        let mut errors = Vec::new();
+        check_extents_btree_structure(&data, &mut errors);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.code == "ExtentsBtreeStructure" && e.message.contains("length")),
+            "should detect bad record length: {:?}",
+            errors
+                .iter()
+                .map(|e| e.message.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_extents_btree_key_ordering() {
+        let node_size = 512;
+        let mut data = make_minimal_extents_btree(node_size);
+        // Add a second record with a LOWER file_id (out of order)
+        let n1 = node_size;
+        BigEndian::write_u16(&mut data[n1 + 10..n1 + 12], 2); // 2 records
+
+        // Second record at offset 14 + 20 = 34
+        let r1 = n1 + 34;
+        data[r1] = 7;
+        data[r1 + 1] = 0x00; // data fork
+        BigEndian::write_u32(&mut data[r1 + 2..r1 + 6], 5); // file_id = 5 (< 10, out of order!)
+        BigEndian::write_u16(&mut data[r1 + 6..r1 + 8], 0);
+
+        let lot = n1 + node_size;
+        BigEndian::write_u16(&mut data[lot - 4..lot - 2], 34); // record 1
+        BigEndian::write_u16(&mut data[lot - 6..lot - 4], (34 + 20) as u16); // free
+
+        // Update header leaf_records
+        BigEndian::write_u32(&mut data[14 + 6..14 + 10], 2);
+
+        let mut errors = Vec::new();
+        check_extents_btree_structure(&data, &mut errors);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.code == "ExtentsBtreeStructure" && e.message.contains("ascending")),
+            "should detect out-of-order keys: {:?}",
+            errors
+                .iter()
+                .map(|e| e.message.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_extents_btree_repair() {
+        let node_size = 512;
+        let mut data = make_minimal_extents_btree(node_size);
+        // Corrupt header node kind
+        data[8] = BTREE_INDEX_NODE as u8;
+
+        let mut report = RepairReport {
+            fixes_applied: Vec::new(),
+            fixes_failed: Vec::new(),
+            unrepairable_count: 0,
+        };
+        repair_extents_btree_structure(&mut data, &mut report);
+        assert!(
+            !report.fixes_applied.is_empty(),
+            "should have applied fixes"
+        );
+
+        // Verify clean after repair
+        let mut errors = Vec::new();
+        check_extents_btree_structure(&data, &mut errors);
+        assert!(
+            errors.is_empty(),
+            "should be clean after repair: {:?}",
+            errors
+                .iter()
+                .map(|e| e.message.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 }

@@ -1062,20 +1062,21 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
         name: &[u8],
     ) -> (Vec<u8>, Vec<u8>) {
         // Key: (entry_cnid, "")  — built by caller with build_catalog_key(cnid, &[])
-        // Record data: cdrType(1) + reserved(1) + reserved(8) + thdParID(4) + thdCName(Pascal, 1+N)
-        let mut rec = Vec::with_capacity(14 + 1 + name.len());
+        // Record data: cdrType(1) + reserved(1) + reserved(8) + thdParID(4) + thdCName(Str31=32)
+        // Total data = 46 bytes (per hfsutils: fixed Str31 field, not variable-length)
+        let mut rec = Vec::with_capacity(46);
         rec.push(thread_type as u8); // cdrType
         rec.push(0); // reserved
-        rec.extend_from_slice(&[0u8; 8]); // reserved
+        rec.extend_from_slice(&[0u8; 8]); // reserved (2 x LongInt)
         let mut buf4 = [0u8; 4];
         BigEndian::write_u32(&mut buf4, parent_id);
-        rec.extend_from_slice(&buf4);
-        rec.push(name.len() as u8);
-        rec.extend_from_slice(name);
-        // Pad to even
-        if rec.len() % 2 != 0 {
-            rec.push(0);
-        }
+        rec.extend_from_slice(&buf4); // thdParID
+                                      // Str31: 1 byte length + up to 31 bytes name + zero padding = 32 bytes total
+        let name_len = name.len().min(31);
+        let mut str31 = [0u8; 32];
+        str31[0] = name_len as u8;
+        str31[1..1 + name_len].copy_from_slice(&name[..name_len]);
+        rec.extend_from_slice(&str31);
         // Key for the thread (not built here — caller uses build_catalog_key)
         (vec![], rec) // key is unused; caller builds key separately
     }
@@ -1652,7 +1653,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
 
     fn repair(&mut self) -> Result<super::fsck::RepairReport, FilesystemError> {
         self.ensure_bitmap()?;
-        let extents_data = if self.mdb.extents_file_size > 0 {
+        let mut extents_data = if self.mdb.extents_file_size > 0 {
             read_fork_data(
                 &mut self.reader,
                 self.partition_offset,
@@ -1669,8 +1670,37 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
             &mut self.mdb,
             &mut self.catalog_data,
             self.bitmap.as_mut().unwrap(),
-            extents_data.as_deref(),
+            extents_data.as_mut(),
         );
+
+        // Write back repaired extents overflow B-tree if modified
+        if let Some(ref ext_data) = extents_data {
+            if self.mdb.extents_file_size > 0 {
+                let alloc_start = self.mdb.first_alloc_block as u64 * 512;
+                for (i, extent) in self.mdb.extents_file_extents.iter().enumerate() {
+                    if extent.block_count == 0 {
+                        break;
+                    }
+                    let block_off = self.partition_offset
+                        + alloc_start
+                        + extent.start_block as u64 * self.mdb.block_size as u64;
+                    let byte_len = extent.block_count as u64 * self.mdb.block_size as u64;
+                    let data_start = if i == 0 {
+                        0
+                    } else {
+                        self.mdb.extents_file_extents[..i]
+                            .iter()
+                            .map(|e| e.block_count as u64 * self.mdb.block_size as u64)
+                            .sum::<u64>() as usize
+                    };
+                    let data_end = (data_start + byte_len as usize).min(ext_data.len());
+                    if data_start < data_end {
+                        self.reader.seek(std::io::SeekFrom::Start(block_off))?;
+                        self.reader.write_all(&ext_data[data_start..data_end])?;
+                    }
+                }
+            }
+        }
 
         self.do_sync_metadata()?;
         Ok(report)
@@ -2263,15 +2293,16 @@ mod tests {
         img[r1_data + 1] = 0; // reserved
                               // reserved(8) at offset 2-9
         BigEndian::write_u32(&mut img[r1_data + 10..r1_data + 14], 1); // parentID = 1
-        img[r1_data + 14] = 0; // name_len = 0
-                               // Thread data = ~16 bytes
+                                                                       // Str31 name field: 32 bytes (1 length byte + 31 bytes name/padding)
+        img[r1_data + 14] = 0; // name_len = 0 (rest of 32 bytes already zero)
+                               // Thread data total = 2 (type+rsv) + 8 (rsv) + 4 (parentID) + 32 (Str31) = 46 bytes
 
         // Record offset table for leaf node
         let lot = leaf_off + node_size;
         BigEndian::write_u16(&mut img[lot - 2..lot], 14); // record 0
         let r1_rel = (r1_off - leaf_off) as u16;
         BigEndian::write_u16(&mut img[lot - 4..lot - 2], r1_rel); // record 1
-        let free_rel = (r1_data + 16 - leaf_off) as u16;
+        let free_rel = (r1_data + 46 - leaf_off) as u16;
         BigEndian::write_u16(&mut img[lot - 6..lot - 4], free_rel); // free space
 
         // MDB at byte 1024
@@ -2497,7 +2528,12 @@ mod tests {
         let mut fs = HfsFilesystem::open(cursor, 0).unwrap();
 
         let result = fs.fsck().unwrap();
-        assert!(result.is_clean(), "fresh image should be clean");
+        let err_msgs: Vec<&str> = result.errors.iter().map(|e| e.message.as_str()).collect();
+        assert!(
+            result.is_clean(),
+            "fresh image should be clean: {:?}",
+            err_msgs
+        );
         assert_eq!(result.stats.directories_checked, 1); // root only
         assert_eq!(result.stats.files_checked, 0);
     }

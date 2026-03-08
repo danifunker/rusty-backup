@@ -421,31 +421,47 @@ where
     Ok(insert_pos)
 }
 
-/// Remove record at `rec_idx` from a B-tree node and compact the offset table.
+/// Remove record at `rec_idx` from a B-tree node and compact data.
+///
+/// Rebuilds the node data area sequentially (like `btree_insert_record`) so
+/// that record boundaries in the offset table are contiguous. Without
+/// compaction, `btree_record_range` would report inflated record lengths
+/// because it uses consecutive offset table entries to determine boundaries.
 pub fn btree_remove_record(node: &mut [u8], node_size: usize, rec_idx: usize) {
     let num_records = BigEndian::read_u16(&node[10..12]) as usize;
     if rec_idx >= num_records {
         return;
     }
 
-    // Read all offsets (records + free-space)
-    let mut offsets: Vec<u16> = Vec::with_capacity(num_records + 1);
-    for i in 0..=num_records {
-        let pos = node_size - 2 * (i + 1);
-        offsets.push(BigEndian::read_u16(&node[pos..pos + 2]));
+    // Collect all records except the one being removed
+    let mut records: Vec<Vec<u8>> = Vec::with_capacity(num_records - 1);
+    for i in 0..num_records {
+        if i == rec_idx {
+            continue;
+        }
+        let (rec_start, rec_end) = btree_record_range(node, node_size, i);
+        if rec_start < rec_end && rec_end <= node_size {
+            records.push(node[rec_start..rec_end].to_vec());
+        }
     }
 
-    // Remove the offset for rec_idx
-    offsets.remove(rec_idx);
+    // Rebuild node: write all remaining records sequentially from offset 14
+    let mut write_pos = 14usize;
+    for (i, rec) in records.iter().enumerate() {
+        node[write_pos..write_pos + rec.len()].copy_from_slice(rec);
+        let opos = node_size - 2 * (i + 1);
+        BigEndian::write_u16(&mut node[opos..opos + 2], write_pos as u16);
+        write_pos += rec.len();
+    }
 
-    // Note: we don't compact the record data area — the space simply becomes
-    // internal fragmentation. HFS implementations tolerate this; the free-space
-    // offset still correctly tracks the end of all record data.
+    // Write free-space offset
+    let fpos = node_size - 2 * (records.len() + 1);
+    BigEndian::write_u16(&mut node[fpos..fpos + 2], write_pos as u16);
 
-    // Write offsets back (now one fewer)
-    for (i, &off) in offsets.iter().enumerate() {
-        let pos = node_size - 2 * (i + 1);
-        BigEndian::write_u16(&mut node[pos..pos + 2], off);
+    // Clear leftover data between write_pos and the offset table
+    let offset_table_start = node_size - 2 * (records.len() + 1);
+    if write_pos < offset_table_start {
+        node[write_pos..offset_table_start].fill(0);
     }
 
     // Clear the now-unused last offset slot
@@ -453,7 +469,7 @@ pub fn btree_remove_record(node: &mut [u8], node_size: usize, rec_idx: usize) {
     BigEndian::write_u16(&mut node[clear_pos..clear_pos + 2], 0);
 
     // Update num_records
-    BigEndian::write_u16(&mut node[10..12], (num_records - 1) as u16);
+    BigEndian::write_u16(&mut node[10..12], records.len() as u16);
 }
 
 // ---------------------------------------------------------------------------
