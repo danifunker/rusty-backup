@@ -15,7 +15,8 @@ use super::hfs::{
 };
 use super::hfs_common::{
     bitmap_set_bit_be, bitmap_test_bit_be, btree_insert_record, btree_node_bitmap_range,
-    btree_record_range, BTreeHeader, BTREE_HEADER_NODE, BTREE_INDEX_NODE, BTREE_LEAF_NODE,
+    btree_record_range, normalize_catalog_index_key, BTreeHeader, BTREE_HEADER_NODE,
+    BTREE_INDEX_NODE, BTREE_LEAF_NODE,
 };
 
 const CATALOG_DIR_THREAD: i8 = 3;
@@ -591,14 +592,11 @@ fn rebuild_index_nodes(catalog_data: &mut [u8], node_size: usize, report: &mut R
         next_level.push((idx_node, first_key_of_node));
 
         for (child_idx, child_key) in &current_level {
-            // Build index record: key_bytes + [pad] + child_node_ptr (4 bytes BE)
-            // HFS requires record data to start at an even offset from the record
-            // start. If (1 + key_length) is odd, insert a pad byte so the node
-            // pointer is correctly aligned for Mac OS's B-tree traversal.
-            let mut index_rec = child_key.clone();
-            if index_rec.len() % 2 != 0 {
-                index_rec.push(0);
-            }
+            // Build index record: normalized_key + child_node_ptr (4 bytes BE)
+            // Mac OS forces all catalog index keys to length 0x25 (37),
+            // zero-padded. With key_len=0x25, the record is always 42 bytes:
+            // 1 (key_len) + 37 (key data) + 4 (child pointer) = 42.
+            let mut index_rec = normalize_catalog_index_key(child_key);
             let mut ptr_bytes = [0u8; 4];
             BigEndian::write_u32(&mut ptr_bytes, *child_idx);
             index_rec.extend_from_slice(&ptr_bytes);
@@ -1552,7 +1550,9 @@ fn check_offset_table(
     }
 }
 
-/// Validate index record lengths: each must be key_len + [pad] + 4 (child pointer).
+/// Validate catalog index record lengths.
+/// Mac OS forces all catalog index keys to length 0x25 (37), making every
+/// index record exactly 42 bytes: 1 (key_len) + 37 (key data) + 4 (child ptr).
 fn check_index_record_lengths(
     node: &[u8],
     node_size: usize,
@@ -1560,6 +1560,11 @@ fn check_index_record_lengths(
     num_records: usize,
     errors: &mut Vec<FsckIssue>,
 ) {
+    use super::hfs_common::HFS_CAT_MAX_KEY_LEN;
+
+    // Expected: key_len(1) + key_data(0x25=37) + child_ptr(4) = 42
+    let expected_len: usize = 1 + HFS_CAT_MAX_KEY_LEN as usize + 4; // 42
+
     for i in 0..num_records {
         let (rec_start, rec_end) = btree_record_range(node, node_size, i);
         if rec_start >= rec_end || rec_end > node_size {
@@ -1577,18 +1582,12 @@ fn check_index_record_lengths(
             continue;
         }
         let key_len = node[rec_start] as usize;
-        if key_len < 6 {
-            continue; // not a valid catalog key, skip
-        }
-        let key_total = 1 + key_len;
-        // Expected: key_total + pad (if odd) + 4
-        let expected = key_total + (key_total % 2) + 4;
-        if rec_len != expected {
+        if rec_len != expected_len || key_len != HFS_CAT_MAX_KEY_LEN as usize {
             errors.push(hfs_issue(
                 HfsFsckCode::InvalidRecordLength,
                 format!(
-                    "node {} record {}: index record length {} but expected {} (key_len={})",
-                    node_idx, i, rec_len, expected, key_len
+                    "node {} record {}: index record length {} key_len {} (expected {} key_len {})",
+                    node_idx, i, rec_len, key_len, expected_len, HFS_CAT_MAX_KEY_LEN
                 ),
             ));
         }

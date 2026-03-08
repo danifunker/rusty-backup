@@ -2663,18 +2663,19 @@ mod tests {
                     continue;
                 }
                 let key_len = cat[off + rec_start] as usize;
-                let key_total = 1 + key_len;
                 let rec_len = rec_end - rec_start;
 
-                // Mac OS reads the node pointer at even-aligned offset after key
-                let mac_ptr_offset = key_total + if key_total % 2 != 0 { 1 } else { 0 };
-                let actual_ptr_offset = rec_len - 4;
-
+                // Mac OS forces all catalog index keys to length 0x25 (37),
+                // making every record exactly 42 bytes.
                 assert_eq!(
-                    mac_ptr_offset, actual_ptr_offset,
-                    "Index node {} rec {}: key_len={}, rec_len={}, \
-                     Mac reads ptr at +{} but actual at +{}",
-                    n, r, key_len, rec_len, mac_ptr_offset, actual_ptr_offset
+                    key_len, 0x25,
+                    "Index node {} rec {}: key_len={} but expected 0x25",
+                    n, r, key_len
+                );
+                assert_eq!(
+                    rec_len, 42,
+                    "Index node {} rec {}: rec_len={} but expected 42",
+                    n, r, rec_len
                 );
                 index_recs_checked += 1;
             }

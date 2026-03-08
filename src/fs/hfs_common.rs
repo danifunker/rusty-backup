@@ -248,6 +248,29 @@ pub const BTREE_HEADER_NODE: i8 = 1;
 #[allow(dead_code)]
 pub const BTREE_MAP_NODE: i8 = 2;
 
+/// Mac OS forces all catalog B-tree index keys to this length (0x25 = 37 decimal).
+/// Key structure: reserved(1) + parentID(4) + nameLen(1) + name(up to 31) = 37 max.
+pub const HFS_CAT_MAX_KEY_LEN: u8 = 0x25;
+
+/// Normalize a catalog key for use in an index record.
+///
+/// Mac OS expects all catalog index record keys to have key_len = 0x25,
+/// zero-padded beyond the actual key data. This matches the `n_index`
+/// function in hfsutils which forces `ckrKeyLen = 0x25`.
+///
+/// Returns: `[0x25][key_data zero-padded to 37 bytes]` = 38 bytes total.
+pub fn normalize_catalog_index_key(key: &[u8]) -> Vec<u8> {
+    let max = HFS_CAT_MAX_KEY_LEN as usize; // 37
+    let mut result = vec![0u8; 1 + max]; // 38 bytes: key_len + 37 bytes of key data
+    result[0] = HFS_CAT_MAX_KEY_LEN;
+    // Copy actual key data (skip the key_len byte from source)
+    if key.len() > 1 {
+        let copy_len = (key.len() - 1).min(max);
+        result[1..1 + copy_len].copy_from_slice(&key[1..1 + copy_len]);
+    }
+    result
+}
+
 /// Read the B-tree header record from catalog_data (node 0, record 0 at offset 14).
 /// Returns (depth, root_node, leaf_records, first_leaf, last_leaf, node_size,
 ///          max_key_len, total_nodes, free_nodes).
@@ -630,13 +653,11 @@ pub fn btree_insert_into_index<F>(
 where
     F: Fn(&[u8], &[u8]) -> Ordering,
 {
-    // Build index record: split_key + [pad] + child_pointer
-    // HFS requires record data (the node pointer) to start at an even offset
-    // from the record start. If (1 + key_length) is odd, insert a pad byte.
-    let mut index_record = split_key.to_vec();
-    if index_record.len() % 2 != 0 {
-        index_record.push(0);
-    }
+    // Build index record: normalized_key + child_pointer
+    // Mac OS forces all catalog index keys to length 0x25, zero-padded.
+    // With key_len=0x25, HFS_RECKEYSKIP = (1+37+1)&~1 = 38, so data starts
+    // at offset 38 (even), and the full record is always 42 bytes.
+    let mut index_record = normalize_catalog_index_key(split_key);
     let mut ptr = [0u8; 4];
     BigEndian::write_u32(&mut ptr, child_node);
     index_record.extend_from_slice(&ptr);
@@ -831,20 +852,15 @@ pub fn btree_grow_root(
     let first_key =
         catalog_data[old_root_offset + first_rec_start..old_root_offset + key_end].to_vec();
 
-    // Record 1: first_key + [pad] + old_root pointer
-    let mut rec1 = first_key;
-    if rec1.len() % 2 != 0 {
-        rec1.push(0);
-    }
+    // Record 1: normalized first_key + old_root pointer
+    // Mac OS forces all catalog index keys to 0x25 length.
+    let mut rec1 = normalize_catalog_index_key(&first_key);
     let mut ptr1 = [0u8; 4];
     BigEndian::write_u32(&mut ptr1, old_root);
     rec1.extend_from_slice(&ptr1);
 
-    // Record 2: split_key + [pad] + new_sibling pointer
-    let mut rec2 = split_key.to_vec();
-    if rec2.len() % 2 != 0 {
-        rec2.push(0);
-    }
+    // Record 2: normalized split_key + new_sibling pointer
+    let mut rec2 = normalize_catalog_index_key(split_key);
     let mut ptr2 = [0u8; 4];
     BigEndian::write_u32(&mut ptr2, new_sibling);
     rec2.extend_from_slice(&ptr2);
