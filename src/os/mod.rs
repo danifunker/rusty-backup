@@ -18,6 +18,115 @@ use crate::device::DiskDevice;
 const SECTOR_SIZE: usize = 512;
 const WRITE_BUF_CAPACITY: usize = 256 * 1024; // 256 KB, must be a multiple of SECTOR_SIZE
 
+/// A read adapter that ensures all I/O to the underlying reader is performed
+/// at sector-aligned offsets with sector-multiple sizes.
+///
+/// macOS raw character devices (`/dev/rdiskN`) require both seek positions and
+/// read sizes to be multiples of 512 bytes, returning `EINVAL` otherwise.
+/// Standard `BufReader` does not enforce this — it passes through arbitrary
+/// seeks from filesystem code (e.g. FAT's `next_cluster` seeking to
+/// `fat_offset + cluster*4`, or ext's `read_inode` seeking to an inode table
+/// entry at an arbitrary byte offset).
+///
+/// This wrapper maintains a one-sector read-ahead buffer. On seek, it records
+/// the logical position. On read, it aligns the underlying seek down to the
+/// sector boundary, reads full sectors, and returns only the requested slice.
+pub struct SectorAlignedReader<R> {
+    inner: R,
+    /// Logical byte position (what the caller thinks the position is).
+    pos: u64,
+    /// Cached sector data.
+    buf: [u8; SECTOR_SIZE],
+    /// The absolute byte offset of the cached sector (sector-aligned).
+    buf_sector_start: u64,
+    /// Number of valid bytes in `buf` (may be < SECTOR_SIZE at EOF).
+    buf_valid: usize,
+}
+
+impl<R: Read + Seek> SectorAlignedReader<R> {
+    pub fn new(inner: R) -> Self {
+        Self {
+            inner,
+            pos: 0,
+            buf: [0u8; SECTOR_SIZE],
+            buf_sector_start: u64::MAX, // invalid — forces first read to fill
+            buf_valid: 0,
+        }
+    }
+
+    /// Ensure `self.buf` contains the sector that covers `self.pos`.
+    fn fill_buf(&mut self) -> io::Result<()> {
+        let sector_start = (self.pos / SECTOR_SIZE as u64) * SECTOR_SIZE as u64;
+        if sector_start == self.buf_sector_start {
+            return Ok(()); // already cached
+        }
+        self.inner.seek(SeekFrom::Start(sector_start))?;
+        // Read a full sector; short reads are fine at EOF.
+        let mut total = 0;
+        while total < SECTOR_SIZE {
+            match self.inner.read(&mut self.buf[total..]) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        self.buf_sector_start = sector_start;
+        self.buf_valid = total;
+        Ok(())
+    }
+}
+
+impl<R: Read + Seek> Read for SectorAlignedReader<R> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        let mut written = 0;
+        while written < out.len() {
+            self.fill_buf()?;
+            let offset_in_sector = (self.pos % SECTOR_SIZE as u64) as usize;
+            if offset_in_sector >= self.buf_valid {
+                break; // EOF
+            }
+            let available = self.buf_valid - offset_in_sector;
+            let to_copy = available.min(out.len() - written);
+            out[written..written + to_copy]
+                .copy_from_slice(&self.buf[offset_in_sector..offset_in_sector + to_copy]);
+            written += to_copy;
+            self.pos += to_copy as u64;
+        }
+        Ok(written)
+    }
+}
+
+impl<R: Read + Seek> Seek for SectorAlignedReader<R> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new_pos = match pos {
+            SeekFrom::Start(n) => n,
+            SeekFrom::End(_) => {
+                // Delegate to inner to resolve End-relative seeks, then
+                // realign our logical position.
+                let resolved = self.inner.seek(pos)?;
+                self.pos = resolved;
+                return Ok(resolved);
+            }
+            SeekFrom::Current(offset) => if offset >= 0 {
+                self.pos.checked_add(offset as u64)
+            } else {
+                self.pos.checked_sub((-offset) as u64)
+            }
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek out of range"))?,
+        };
+        self.pos = new_pos;
+        Ok(new_pos)
+    }
+}
+
+// SAFETY: SectorAlignedReader<R> only contains R and stack-local buffers.
+// If R is Send, the whole wrapper is Send.
+unsafe impl<R: Send> Send for SectorAlignedReader<R> {}
+
 // Windows-specific aligned buffer implementation
 #[cfg(target_os = "windows")]
 mod aligned_buffer {

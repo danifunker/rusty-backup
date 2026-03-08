@@ -2232,12 +2232,24 @@ impl InspectTab {
                             continue;
                         }
                         if let Ok(f) = device_file.try_clone() {
-                            if let Some(min_size) = rusty_backup::fs::effective_partition_size(
-                                BufReader::new(f),
-                                part.start_lba * 512,
-                                part.partition_type_byte,
-                                part.partition_type_string.as_deref(),
-                            ) {
+                            // Use SectorAlignedReader for raw devices (/dev/rdiskN)
+                            // which require sector-aligned seeks and reads.
+                            let min_size = if is_device {
+                                rusty_backup::fs::effective_partition_size(
+                                    rusty_backup::os::SectorAlignedReader::new(f),
+                                    part.start_lba * 512,
+                                    part.partition_type_byte,
+                                    part.partition_type_string.as_deref(),
+                                )
+                            } else {
+                                rusty_backup::fs::effective_partition_size(
+                                    BufReader::new(f),
+                                    part.start_lba * 512,
+                                    part.partition_type_byte,
+                                    part.partition_type_string.as_deref(),
+                                )
+                            };
+                            if let Some(min_size) = min_size {
                                 let clamped = min_size.min(part.size_bytes);
                                 partition_min_sizes.insert(part.index, clamped);
                                 push_log(format!(
