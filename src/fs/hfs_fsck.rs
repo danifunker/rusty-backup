@@ -46,6 +46,7 @@ enum HfsFsckCode {
     LeafBacklinkMismatch,
     LeafRecordCountMismatch,
     IndexSiblingLinkBroken,
+    InvalidRecordLength,
     // Catalog consistency
     MissingFileThread,
     MissingDirThread,
@@ -1480,6 +1481,13 @@ fn check_btree_structure(
         }
 
         check_offset_table(node, node_size, node_idx, num_records, errors);
+
+        let kind = node[8] as i8;
+        if kind == BTREE_INDEX_NODE {
+            check_index_record_lengths(node, node_size, node_idx, num_records, errors);
+        } else if kind == BTREE_LEAF_NODE {
+            check_leaf_record_lengths(node, node_size, node_idx, num_records, errors);
+        }
     }
 
     // Walk leaf chain and verify forward/backward links
@@ -1541,6 +1549,107 @@ fn check_offset_table(
             return;
         }
         prev_offset = offset;
+    }
+}
+
+/// Validate index record lengths: each must be key_len + [pad] + 4 (child pointer).
+fn check_index_record_lengths(
+    node: &[u8],
+    node_size: usize,
+    node_idx: u32,
+    num_records: usize,
+    errors: &mut Vec<FsckIssue>,
+) {
+    for i in 0..num_records {
+        let (rec_start, rec_end) = btree_record_range(node, node_size, i);
+        if rec_start >= rec_end || rec_end > node_size {
+            continue;
+        }
+        let rec_len = rec_end - rec_start;
+        if rec_len < 5 {
+            errors.push(hfs_issue(
+                HfsFsckCode::InvalidRecordLength,
+                format!(
+                    "node {} record {}: index record too short ({})",
+                    node_idx, i, rec_len
+                ),
+            ));
+            continue;
+        }
+        let key_len = node[rec_start] as usize;
+        if key_len < 6 {
+            continue; // not a valid catalog key, skip
+        }
+        let key_total = 1 + key_len;
+        // Expected: key_total + pad (if odd) + 4
+        let expected = key_total + (key_total % 2) + 4;
+        if rec_len != expected {
+            errors.push(hfs_issue(
+                HfsFsckCode::InvalidRecordLength,
+                format!(
+                    "node {} record {}: index record length {} but expected {} (key_len={})",
+                    node_idx, i, rec_len, expected, key_len
+                ),
+            ));
+        }
+    }
+}
+
+/// Validate leaf catalog record lengths against expected sizes for each record type.
+fn check_leaf_record_lengths(
+    node: &[u8],
+    node_size: usize,
+    node_idx: u32,
+    num_records: usize,
+    errors: &mut Vec<FsckIssue>,
+) {
+    for i in 0..num_records {
+        let (rec_start, rec_end) = btree_record_range(node, node_size, i);
+        if rec_start >= rec_end || rec_end > node_size {
+            continue;
+        }
+        let rec_len = rec_end - rec_start;
+        if rec_len < 7 {
+            errors.push(hfs_issue(
+                HfsFsckCode::InvalidRecordLength,
+                format!(
+                    "node {} record {}: leaf record too short ({})",
+                    node_idx, i, rec_len
+                ),
+            ));
+            continue;
+        }
+        let key_len = node[rec_start] as usize;
+        let key_total = 1 + key_len;
+        if key_total >= rec_len {
+            continue;
+        }
+        let mut data_start = key_total;
+        if data_start % 2 != 0 {
+            data_start += 1;
+        }
+        if data_start >= rec_len {
+            continue;
+        }
+        let rec_type = node[rec_start + data_start] as i8;
+        let data_len = rec_len - data_start;
+        // Minimum data sizes: dir record = 70, file record = 102,
+        // thread records = at least 46 (type + reserved + parentID + name)
+        let min_data = match rec_type {
+            1 => 70,       // CATALOG_DIR
+            2 => 102,      // CATALOG_FILE
+            3 | 4 => 15,   // dir/file thread: type(1)+rsv(1)+rsv(8)+parentID(4)+nameLen(1)
+            _ => continue, // unknown type, skip
+        };
+        if data_len < min_data {
+            errors.push(hfs_issue(
+                HfsFsckCode::InvalidRecordLength,
+                format!(
+                    "node {} record {}: type {} data length {} < minimum {}",
+                    node_idx, i, rec_type, data_len, min_data
+                ),
+            ));
+        }
     }
 }
 

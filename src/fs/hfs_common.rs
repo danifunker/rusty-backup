@@ -600,14 +600,11 @@ pub fn btree_split_leaf(
         header.last_leaf_node = new_idx;
     }
 
-    // The separator key is just the key portion of the first record of the new node.
-    // Key length is in byte 0; key data is bytes 0..1+key_len, padded to even.
+    // The separator key is just the key portion of the first record of the new node
+    // (key_len byte + key data), without pad or record data.
     let full_rec = &records[split_point];
     let key_len = full_rec[0] as usize;
-    let mut key_end = 1 + key_len;
-    if key_end % 2 != 0 {
-        key_end += 1; // pad to even boundary
-    }
+    let key_end = 1 + key_len;
     let split_key = full_rec[..key_end.min(full_rec.len())].to_vec();
 
     Ok((new_idx, split_key))
@@ -633,8 +630,13 @@ pub fn btree_insert_into_index<F>(
 where
     F: Fn(&[u8], &[u8]) -> Ordering,
 {
-    // Build index record: split_key + child_pointer
+    // Build index record: split_key + [pad] + child_pointer
+    // HFS requires record data (the node pointer) to start at an even offset
+    // from the record start. If (1 + key_length) is odd, insert a pad byte.
     let mut index_record = split_key.to_vec();
+    if index_record.len() % 2 != 0 {
+        index_record.push(0);
+    }
     let mut ptr = [0u8; 4];
     BigEndian::write_u32(&mut ptr, child_node);
     index_record.extend_from_slice(&ptr);
@@ -775,11 +777,13 @@ fn split_index_node(
         BigEndian::write_u16(&mut node[10..12], count as u16);
     }
 
-    // The separator key is just the key portion of the first record of the new node.
-    // For index records, each record is key + 4-byte child pointer, so key = record[..len-4].
+    // The separator key is just the key portion (key_len byte + key data) of the
+    // first record of the new node, without pad or child pointer.
     let full_rec = &records[split_point];
-    let split_key = if full_rec.len() > 4 {
-        full_rec[..full_rec.len() - 4].to_vec()
+    let split_key = if !full_rec.is_empty() {
+        let kl = full_rec[0] as usize;
+        let key_end = (1 + kl).min(full_rec.len());
+        full_rec[..key_end].to_vec()
     } else {
         full_rec.clone()
     };
@@ -816,23 +820,31 @@ pub fn btree_grow_root(
     // 1. First child (old_root): use the first key of old_root + pointer to old_root
     // 2. Second child (new_sibling): split_key + pointer to new_sibling
 
-    // Get first key of old_root (must read before borrowing new root mutably)
-    let (first_rec_start, first_rec_end) = btree_record_range(
+    // Get first key of old_root (just the key portion, not the full record)
+    let (first_rec_start, _first_rec_end) = btree_record_range(
         &catalog_data[old_root_offset..old_root_offset + node_size],
         node_size,
         0,
     );
+    let key_len = catalog_data[old_root_offset + first_rec_start] as usize;
+    let key_end = first_rec_start + 1 + key_len;
     let first_key =
-        catalog_data[old_root_offset + first_rec_start..old_root_offset + first_rec_end].to_vec();
+        catalog_data[old_root_offset + first_rec_start..old_root_offset + key_end].to_vec();
 
-    // Record 1: first_key + old_root pointer
+    // Record 1: first_key + [pad] + old_root pointer
     let mut rec1 = first_key;
+    if rec1.len() % 2 != 0 {
+        rec1.push(0);
+    }
     let mut ptr1 = [0u8; 4];
     BigEndian::write_u32(&mut ptr1, old_root);
     rec1.extend_from_slice(&ptr1);
 
-    // Record 2: split_key + new_sibling pointer
+    // Record 2: split_key + [pad] + new_sibling pointer
     let mut rec2 = split_key.to_vec();
+    if rec2.len() % 2 != 0 {
+        rec2.push(0);
+    }
     let mut ptr2 = [0u8; 4];
     BigEndian::write_u32(&mut ptr2, new_sibling);
     rec2.extend_from_slice(&ptr2);
