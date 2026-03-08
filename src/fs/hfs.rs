@@ -2683,5 +2683,14 @@ mod tests {
             index_recs_checked > 0,
             "no index records found — test needs more files"
         );
+
+        // Verify that a post-repair integrity check finds no issues
+        let result = fs.fsck().unwrap();
+        let error_msgs: Vec<&str> = result.errors.iter().map(|e| e.message.as_str()).collect();
+        assert!(
+            result.errors.is_empty(),
+            "post-repair check found errors: {:?}",
+            error_msgs
+        );
     }
 }

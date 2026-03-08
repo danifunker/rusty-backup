@@ -45,6 +45,7 @@ enum HfsFsckCode {
     LeafChainBroken,
     LeafBacklinkMismatch,
     LeafRecordCountMismatch,
+    IndexSiblingLinkBroken,
     // Catalog consistency
     MissingFileThread,
     MissingDirThread,
@@ -1484,6 +1485,9 @@ fn check_btree_structure(
     // Walk leaf chain and verify forward/backward links
     let leaf_count = walk_leaf_chain(catalog_data, header, errors, leaf_nodes_visited);
 
+    // Walk index nodes and verify sibling links at each level
+    check_index_sibling_links(catalog_data, header, errors);
+
     // Verify leaf record count
     if leaf_count != header.leaf_records {
         errors.push(hfs_issue(
@@ -1607,6 +1611,111 @@ fn walk_leaf_chain(
     }
 
     total_records
+}
+
+/// Walk index nodes from the root down, verifying fLink/bLink consistency at each level.
+fn check_index_sibling_links(
+    catalog_data: &[u8],
+    header: &BTreeHeader,
+    errors: &mut Vec<FsckIssue>,
+) {
+    let node_size = header.node_size as usize;
+    if header.depth <= 1 || header.root_node == 0 {
+        return; // no index nodes
+    }
+
+    // Start from the root and walk down through index levels
+    let mut level_start = header.root_node;
+
+    for _level in (2..=header.depth).rev() {
+        // Walk the sibling chain at this level
+        let mut node_idx = level_start;
+        let mut prev_idx: u32 = 0;
+        let mut first_child: Option<u32> = None;
+        let mut visited = HashSet::new();
+
+        while node_idx != 0 {
+            if !visited.insert(node_idx) {
+                errors.push(hfs_issue(
+                    HfsFsckCode::IndexSiblingLinkBroken,
+                    format!("index sibling chain loop at node {}", node_idx),
+                ));
+                break;
+            }
+
+            let off = node_idx as usize * node_size;
+            if off + node_size > catalog_data.len() {
+                errors.push(hfs_issue(
+                    HfsFsckCode::IndexSiblingLinkBroken,
+                    format!("index node {} offset out of range", node_idx),
+                ));
+                break;
+            }
+
+            let node = &catalog_data[off..off + node_size];
+            let flink = BigEndian::read_u32(&node[0..4]);
+            let blink = BigEndian::read_u32(&node[4..8]);
+            let kind = node[8] as i8;
+
+            if kind != BTREE_INDEX_NODE {
+                errors.push(hfs_issue(
+                    HfsFsckCode::IndexSiblingLinkBroken,
+                    format!(
+                        "node {} in index chain has kind {} (expected index = {})",
+                        node_idx, kind, BTREE_INDEX_NODE
+                    ),
+                ));
+                break;
+            }
+
+            // Verify backlink
+            if prev_idx != 0 && blink != prev_idx {
+                errors.push(hfs_issue(
+                    HfsFsckCode::IndexSiblingLinkBroken,
+                    format!(
+                        "index node {}: bLink = {} but previous node was {}",
+                        node_idx, blink, prev_idx
+                    ),
+                ));
+            } else if prev_idx == 0 && blink != 0 {
+                errors.push(hfs_issue(
+                    HfsFsckCode::IndexSiblingLinkBroken,
+                    format!(
+                        "first index node {} at level has bLink = {} (expected 0)",
+                        node_idx, blink
+                    ),
+                ));
+            }
+
+            // Capture the first child pointer for the next level down
+            if first_child.is_none() {
+                let num_records = BigEndian::read_u16(&node[10..12]) as usize;
+                if num_records > 0 {
+                    let (rec_start, rec_end) = btree_record_range(node, node_size, 0);
+                    if rec_start < rec_end && rec_end <= node_size && rec_end - rec_start >= 5 {
+                        let rec = &node[rec_start..rec_end];
+                        let key_len = rec[0] as usize;
+                        let mut ptr_off = 1 + key_len;
+                        if ptr_off % 2 != 0 {
+                            ptr_off += 1;
+                        }
+                        if ptr_off + 4 <= rec.len() {
+                            first_child = Some(BigEndian::read_u32(&rec[ptr_off..ptr_off + 4]));
+                        }
+                    }
+                }
+            }
+
+            prev_idx = node_idx;
+            node_idx = flink;
+        }
+
+        // Move to the next level down using the first child pointer
+        match first_child {
+            Some(child) => level_start = child,
+            None => break,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
