@@ -723,7 +723,7 @@ fn repair_catalog_consistency(
     for (&dir_id, &(parent_id, ref name, _)) in &dir_records {
         match dir_threads.get(&dir_id) {
             None => {
-                // Insert missing directory thread
+                // Try to insert the missing directory thread
                 if insert_thread_record(
                     catalog_data,
                     node_size,
@@ -737,10 +737,21 @@ fn repair_catalog_consistency(
                         dir_id
                     ));
                 } else {
-                    report.fixes_failed.push(format!(
-                        "Failed to insert directory thread for CNID {}",
-                        dir_id
-                    ));
+                    // Thread insertion failed (node full). Remove the orphaned
+                    // directory record instead — without a thread, Mac OS
+                    // cannot resolve this CNID and some operations will fail.
+                    let decoded = mac_roman_to_utf8(name);
+                    if remove_record_by_key(catalog_data, node_size, parent_id, name) {
+                        report.fixes_applied.push(format!(
+                            "Removed directory CNID {} '{}' (could not create missing thread)",
+                            dir_id, decoded
+                        ));
+                    } else {
+                        report.fixes_failed.push(format!(
+                            "Failed to insert or remove directory thread for CNID {} '{}'",
+                            dir_id, decoded
+                        ));
+                    }
                 }
             }
             Some((thr_parent, thr_name)) => {
@@ -915,6 +926,56 @@ fn remove_thread_record(catalog_data: &mut [u8], node_size: usize, cnid: u32) ->
     let compare = super::hfs::HfsFilesystem::<std::io::Cursor<Vec<u8>>>::catalog_compare;
     let search_key =
         super::hfs::HfsFilesystem::<std::io::Cursor<Vec<u8>>>::build_catalog_key(cnid, &[]);
+
+    let header = BTreeHeader::read(catalog_data);
+    let mut node_idx = header.first_leaf_node;
+    let mut visited = HashSet::new();
+
+    while node_idx != 0 {
+        if !visited.insert(node_idx) {
+            break;
+        }
+        let off = node_idx as usize * node_size;
+        if off + node_size > catalog_data.len() {
+            break;
+        }
+        let num_records = BigEndian::read_u16(&catalog_data[off + 10..off + 12]) as usize;
+        for i in 0..num_records {
+            let (rec_start, rec_end) =
+                btree_record_range(&catalog_data[off..off + node_size], node_size, i);
+            if rec_start >= rec_end || rec_end > node_size {
+                continue;
+            }
+            let key_len = catalog_data[off + rec_start] as usize;
+            let key_end = rec_start + 1 + key_len;
+            if key_end > rec_end {
+                continue;
+            }
+            let key_portion = &catalog_data[off + rec_start..off + key_end];
+            if compare(key_portion, &search_key) == std::cmp::Ordering::Equal {
+                let node = &mut catalog_data[off..off + node_size];
+                super::hfs_common::btree_remove_record(node, node_size, i);
+                let mut h = BTreeHeader::read(catalog_data);
+                h.leaf_records = h.leaf_records.saturating_sub(1);
+                h.write(catalog_data);
+                return true;
+            }
+        }
+        node_idx = BigEndian::read_u32(&catalog_data[off..off + 4]);
+    }
+    false
+}
+
+/// Remove a catalog record by (parent_id, name) key from the catalog B-tree.
+fn remove_record_by_key(
+    catalog_data: &mut [u8],
+    node_size: usize,
+    parent_id: u32,
+    name: &[u8],
+) -> bool {
+    let compare = super::hfs::HfsFilesystem::<std::io::Cursor<Vec<u8>>>::catalog_compare;
+    let search_key =
+        super::hfs::HfsFilesystem::<std::io::Cursor<Vec<u8>>>::build_catalog_key(parent_id, name);
 
     let header = BTreeHeader::read(catalog_data);
     let mut node_idx = header.first_leaf_node;
