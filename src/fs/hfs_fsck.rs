@@ -246,23 +246,38 @@ pub(crate) fn repair_hfs(
         return report;
     }
 
-    // --- Phase 1: B-tree structure fixes ---
-    repair_btree_structure(catalog_data, node_size, &mut report);
+    // --- Phase 1: Initial B-tree structure fixes (leaf chain only) ---
+    // Fix header/root node kinds and rebuild the leaf chain so catalog
+    // consistency repairs can find all records. Index nodes are NOT rebuilt
+    // yet — that must happen AFTER catalog modifications.
+    repair_btree_structure_leaves_only(catalog_data, node_size, &mut report);
 
     // --- Phase 2: Catalog consistency fixes ---
+    // This may insert/remove leaf records (threads, orphans, valence).
     repair_catalog_consistency(mdb, catalog_data, node_size, &mut report);
 
-    // --- Phase 3: Extent fixes ---
+    // --- Phase 3: Rebuild B-tree index nodes and fix header counts ---
+    // Now that all catalog modifications are done, rebuild the full B-tree
+    // structure: index nodes, sibling links, and header record counts.
+    rebuild_index_nodes(catalog_data, node_size, &mut report);
+    fix_leaf_record_count(catalog_data, &mut report);
+
+    // --- Phase 4: Extent fixes ---
     repair_extents(mdb, catalog_data, node_size, extents_data, &mut report);
 
-    // --- Phase 4: MDB counts + bitmap rebuild ---
+    // --- Phase 5: MDB counts + bitmap rebuild ---
     repair_mdb_counts_and_bitmap(mdb, catalog_data, bitmap, extents_data, &mut report);
 
     report
 }
 
-/// Phase 1: Fix B-tree structural issues.
-fn repair_btree_structure(catalog_data: &mut [u8], node_size: usize, report: &mut RepairReport) {
+/// Phase 1 (partial): Fix header/root node kinds and rebuild the leaf chain.
+/// Index nodes are NOT rebuilt here — that happens after catalog modifications.
+fn repair_btree_structure_leaves_only(
+    catalog_data: &mut [u8],
+    node_size: usize,
+    report: &mut RepairReport,
+) {
     // Fix header node kind
     if catalog_data.len() >= 9 {
         let kind = catalog_data[8] as i8;
@@ -299,11 +314,10 @@ fn repair_btree_structure(catalog_data: &mut [u8], node_size: usize, report: &mu
     // Rebuild leaf chain: union fLink-reachable + bitmap-allocated leaf nodes,
     // sort by first key, relink, and fix node bitmap.
     rebuild_leaf_chain(catalog_data, node_size, report);
+}
 
-    // Rebuild index nodes to match the new leaf chain
-    rebuild_index_nodes(catalog_data, node_size, report);
-
-    // Fix leaf record count
+/// Fix the header leaf record count to match actual records in the leaf chain.
+fn fix_leaf_record_count(catalog_data: &mut [u8], report: &mut RepairReport) {
     let header = BTreeHeader::read(catalog_data);
     let actual_leaf_count = count_leaf_records(catalog_data, &header);
     if actual_leaf_count != header.leaf_records {
@@ -1417,6 +1431,9 @@ fn check_mdb(mdb: &HfsMasterDirectoryBlock, errors: &mut Vec<FsckIssue>) {
 // Phase 2: B-tree Structure
 // ---------------------------------------------------------------------------
 
+/// Maximum records per node (based on minimum record size of ~10 bytes in 512-byte node).
+const HFS_MAX_NRECS: usize = 35;
+
 fn check_btree_structure(
     catalog_data: &[u8],
     header: &BTreeHeader,
@@ -1424,6 +1441,17 @@ fn check_btree_structure(
     leaf_nodes_visited: &mut u32,
 ) {
     let node_size = header.node_size as usize;
+
+    // Check node size is a power of 2 multiple of 512
+    if node_size < 512 || node_size % 512 != 0 {
+        errors.push(hfs_issue(
+            HfsFsckCode::HeaderNodeBadKind,
+            format!(
+                "B-tree node size {} (must be a positive multiple of 512)",
+                node_size
+            ),
+        ));
+    }
 
     // Check header node kind
     if catalog_data.len() >= 9 {
@@ -1436,6 +1464,32 @@ fn check_btree_structure(
                     kind, BTREE_HEADER_NODE
                 ),
             ));
+        }
+    }
+
+    // Check header node structure: must have exactly 3 records
+    // Record 0 = B-tree header (0x6a bytes), Record 1 = reserved (0x80 bytes),
+    // Record 2 = node bitmap (0x100 bytes for 512-byte nodes, larger for bigger nodes)
+    if catalog_data.len() >= node_size {
+        let hdr_num_recs = BigEndian::read_u16(&catalog_data[10..12]) as usize;
+        if hdr_num_recs != 3 {
+            errors.push(hfs_issue(
+                HfsFsckCode::HeaderNodeBadKind,
+                format!("header node has {} records (expected 3)", hdr_num_recs),
+            ));
+        } else {
+            // Validate first record starts at offset 0x00e (14 = after node descriptor)
+            let pos = node_size - 2;
+            let rec0_off = BigEndian::read_u16(&catalog_data[pos..pos + 2]);
+            if rec0_off != 0x00e {
+                errors.push(hfs_issue(
+                    HfsFsckCode::HeaderNodeBadKind,
+                    format!(
+                        "header node offset[0] = 0x{:03x} (expected 0x00e)",
+                        rec0_off
+                    ),
+                ));
+            }
         }
     }
 
@@ -1461,7 +1515,7 @@ fn check_btree_structure(
         }
     }
 
-    // Check offset tables on all allocated nodes
+    // Check all allocated nodes
     let (bmp_off, bmp_size) = btree_node_bitmap_range(catalog_data, node_size);
     let max_nodes = catalog_data.len() / node_size;
     for node_idx in 0..max_nodes as u32 {
@@ -1474,6 +1528,21 @@ fn check_btree_structure(
         }
         let node = &catalog_data[off..off + node_size];
         let num_records = BigEndian::read_u16(&node[10..12]) as usize;
+
+        // Check record count doesn't exceed maximum for this node size.
+        // hfsutils defines HFS_MAX_NRECS=35 for 512-byte nodes. Scale proportionally.
+        let max_nrecs = HFS_MAX_NRECS * (node_size / 512);
+        if num_records > max_nrecs {
+            errors.push(hfs_issue(
+                HfsFsckCode::InvalidRecordLength,
+                format!(
+                    "node {}: {} records exceeds maximum {}",
+                    node_idx, num_records, max_nrecs
+                ),
+            ));
+            continue;
+        }
+
         if num_records == 0 {
             continue;
         }
