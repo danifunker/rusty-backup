@@ -3011,24 +3011,9 @@ fn check_catalog_consistency(
                         ),
                     ));
                 }
-                if *data_start_block != 0 {
-                    warnings.push(hfs_issue(
-                        HfsFsckCode::ReservedFieldNonZero,
-                        format!(
-                            "file CNID {}: dataStartBlock is {} (expected 0)",
-                            file_id, data_start_block
-                        ),
-                    ));
-                }
-                if *rsrc_start_block != 0 {
-                    warnings.push(hfs_issue(
-                        HfsFsckCode::ReservedFieldNonZero,
-                        format!(
-                            "file CNID {}: rsrcStartBlock is {} (expected 0)",
-                            file_id, rsrc_start_block
-                        ),
-                    ));
-                }
+                // filStBlk / filRStBlk are NOT reserved — they hold the first
+                // allocation block of the data and resource forks respectively.
+                // Non-zero values are normal for any file that has data.
                 *files_checked += 1;
             }
             CatalogEntry::DirThread {
@@ -5507,11 +5492,14 @@ mod tests {
             "should warn about non-zero reserved byte: {:?}",
             warnings.iter().map(|e| &e.message).collect::<Vec<_>>()
         );
+        // filStBlk (dataStartBlock) and filRStBlk (rsrcStartBlock) are real
+        // fields — non-zero values are normal and should NOT produce warnings.
         assert!(
-            warnings
+            !warnings
                 .iter()
-                .any(|e| e.code == "ReservedFieldNonZero" && e.message.contains("dataStartBlock")),
-            "should warn about non-zero dataStartBlock: {:?}",
+                .any(|e| e.message.contains("dataStartBlock")
+                    || e.message.contains("rsrcStartBlock")),
+            "start block fields should not warn: {:?}",
             warnings.iter().map(|e| &e.message).collect::<Vec<_>>()
         );
     }
