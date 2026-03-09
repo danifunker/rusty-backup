@@ -1639,12 +1639,14 @@ fn repair_mdb_counts_and_bitmap(
             .fixes_applied
             .push(format!("Fixed MDB file_count: {} -> {}", old, file_count));
     }
-    if mdb.folder_count != folder_count {
+    // HFS drDirCnt does NOT include the root directory (CNID 2)
+    let non_root_folder_count = folder_count.saturating_sub(1);
+    if mdb.folder_count != non_root_folder_count {
         let old = mdb.folder_count;
-        mdb.folder_count = folder_count;
+        mdb.folder_count = non_root_folder_count;
         report.fixes_applied.push(format!(
             "Fixed MDB folder_count: {} -> {}",
-            old, folder_count
+            old, non_root_folder_count
         ));
     }
 
@@ -1978,8 +1980,8 @@ fn check_mdb(mdb: &HfsMasterDirectoryBlock, errors: &mut Vec<FsckIssue>) {
         let volume_size = mdb.total_blocks as u64 * mdb.block_size as u64;
         let clump_checks: [(&str, usize); 3] = [
             ("default clump size (drClpSiz)", 24),
-            ("extents file clump size (drXTClpSiz)", 72),
-            ("catalog file clump size (drCTClpSiz)", 76),
+            ("extents file clump size (drXTClpSiz)", 74),
+            ("catalog file clump size (drCTClpSiz)", 78),
         ];
         for (label, offset) in &clump_checks {
             let clump = BigEndian::read_u32(&mdb.raw_sector[*offset..*offset + 4]);
@@ -3144,9 +3146,10 @@ fn check_catalog_consistency(
     check_directory_structure(&dir_records, errors, warnings);
 
     // Verify file_count and folder_count match MDB
-    // HFS folder_count includes the root directory (CNID 2)
+    // HFS drDirCnt does NOT include the root directory (CNID 2),
+    // so subtract 1 from catalog count (which includes root).
     let actual_file_count = *files_checked;
-    let actual_folder_count = *directories_checked;
+    let actual_folder_count = (*directories_checked).saturating_sub(1);
     if actual_file_count != mdb.file_count {
         errors.push(hfs_issue(
             HfsFsckCode::FileCountMismatch,
@@ -3160,7 +3163,7 @@ fn check_catalog_consistency(
         errors.push(hfs_issue(
             HfsFsckCode::FolderCountMismatch,
             format!(
-                "MDB folder_count = {} but catalog has {} directory records",
+                "MDB folder_count = {} but catalog has {} directory records (excluding root)",
                 mdb.folder_count, actual_folder_count
             ),
         ));
@@ -4929,7 +4932,7 @@ mod tests {
             first_alloc_block: 5,
             next_catalog_id: 16,
             file_count: 0,
-            folder_count: 1,
+            folder_count: 0, // HFS drDirCnt excludes root directory
             finder_info: [0; 8],
             catalog_file_size: 0,
             catalog_file_extents: [HfsExtDescriptor {
@@ -5103,7 +5106,7 @@ mod tests {
         let mut mdb = make_test_mdb();
         // total_blocks=100, block_size=4096 → volume_size=409600
         // Set drXTClpSiz to something larger
-        BigEndian::write_u32(&mut mdb.raw_sector[72..76], 4096 * 200);
+        BigEndian::write_u32(&mut mdb.raw_sector[74..78], 4096 * 200);
         let mut errors = Vec::new();
         check_mdb(&mdb, &mut errors);
         assert!(
@@ -5120,8 +5123,8 @@ mod tests {
         let mut mdb = make_test_mdb();
         // Set all three clump sizes to valid multiples of block_size (4096)
         BigEndian::write_u32(&mut mdb.raw_sector[24..28], 4096 * 2); // drClpSiz
-        BigEndian::write_u32(&mut mdb.raw_sector[72..76], 4096); // drXTClpSiz
-        BigEndian::write_u32(&mut mdb.raw_sector[76..80], 4096 * 4); // drCTClpSiz
+        BigEndian::write_u32(&mut mdb.raw_sector[74..78], 4096); // drXTClpSiz
+        BigEndian::write_u32(&mut mdb.raw_sector[78..82], 4096 * 4); // drCTClpSiz
         let mut errors = Vec::new();
         check_mdb(&mdb, &mut errors);
         assert!(

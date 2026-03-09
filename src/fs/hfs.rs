@@ -2343,7 +2343,7 @@ mod tests {
         mdb[36] = 7;
         mdb[37..44].copy_from_slice(b"TestVol");
         BigEndian::write_u32(&mut mdb[84..88], 0); // file_count
-        BigEndian::write_u32(&mut mdb[88..92], 1); // folder_count (root)
+        BigEndian::write_u32(&mut mdb[88..92], 0); // folder_count (drDirCnt excludes root)
                                                    // Catalog file size
         BigEndian::write_u32(&mut mdb[146..150], catalog_size);
         // Catalog extents
@@ -2541,6 +2541,41 @@ mod tests {
                 .collect();
             panic!("fsck found {} error(s):\n{}", msgs.len(), msgs.join("\n"));
         }
+    }
+
+    #[test]
+    #[ignore] // manual test — requires real HFS image
+    fn test_fsck_real_hfs_image() {
+        let path = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join("Documents/HD20_512 20MB Mac II Data-FullyWorking.hda");
+        if !path.exists() {
+            eprintln!("Skipping: {:?} not found", path);
+            return;
+        }
+        let file = std::fs::File::open(&path).unwrap();
+        // APM disk: partition 3 (Apple_HFS) starts at sector 0x60 = 96
+        let partition_offset = 96 * 512;
+        let mut fs = HfsFilesystem::open(file, partition_offset).unwrap();
+        let result = fs.fsck().unwrap();
+
+        eprintln!("=== ERRORS ({}) ===", result.errors.len());
+        for e in &result.errors {
+            eprintln!("  [{}] {}", e.code, e.message);
+        }
+        eprintln!("=== WARNINGS ({}) ===", result.warnings.len());
+        for w in &result.warnings {
+            eprintln!("  [{}] {}", w.code, w.message);
+        }
+        eprintln!(
+            "=== STATS: {} files, {} dirs ===",
+            result.stats.files_checked, result.stats.directories_checked
+        );
+        assert!(
+            result.is_clean(),
+            "known-good image should be clean ({} errors, {} warnings)",
+            result.errors.len(),
+            result.warnings.len()
+        );
     }
 
     #[test]
