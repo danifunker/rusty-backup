@@ -37,7 +37,6 @@ use super::fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry, RepairReport}
 enum HfsFsckCode {
     // MDB issues
     BadSignature,
-    AlternateMdbMissing,
     AlternateMdbMismatch,
     EmbeddedHfsPlusInvalid,
     BadBlockSize,
@@ -1834,19 +1833,12 @@ fn check_alternate_mdb(
 ) {
     let alt_sig = BigEndian::read_u16(&alt_sector[0..2]);
     if alt_sig != 0x4244 {
-        // The alternate MDB is a backup copy located right after the allocation
-        // area.  When the partition is larger than the filesystem's allocation
-        // blocks, the alternate MDB may be at the partition's penultimate sector
-        // instead — a location we cannot determine without knowing the partition
-        // size.  Treat a missing alternate MDB as a warning, not an error,
-        // because the primary MDB (validated in Phase 1) is what matters.
-        warnings.push(hfs_issue(
-            HfsFsckCode::AlternateMdbMissing,
-            format!(
-                "alternate MDB not found at expected offset (signature 0x{:04X})",
-                alt_sig
-            ),
-        ));
+        // The alternate MDB is a backup copy whose location we calculate as
+        // right after the allocation area.  When the partition is larger than
+        // the filesystem's allocation blocks the real alternate MDB sits at
+        // the partition's penultimate sector — a location we can't determine
+        // without the partition size.  Since we can't tell "missing" from
+        // "looked in the wrong place", silently skip the cross-check.
         return;
     }
 
@@ -5750,14 +5742,12 @@ mod tests {
         let mut warnings = Vec::new();
         check_alternate_mdb(&mdb, &alt, &mut errors, &mut warnings);
         assert!(
-            !errors
-                .iter()
-                .any(|e| e.code == "AlternateMdbMismatch" || e.code == "AlternateMdbMissing"),
+            errors.is_empty(),
             "matching alt MDB should not error: {:?}",
             errors.iter().map(|e| &e.message).collect::<Vec<_>>()
         );
         assert!(
-            !warnings.iter().any(|e| e.code == "AlternateMdbMissing"),
+            warnings.is_empty(),
             "matching alt MDB should not warn: {:?}",
             warnings.iter().map(|e| &e.message).collect::<Vec<_>>()
         );
@@ -5781,23 +5771,23 @@ mod tests {
     }
 
     #[test]
-    fn test_alternate_mdb_missing_signature() {
+    fn test_alternate_mdb_missing_signature_silently_skipped() {
         let mdb = make_test_mdb();
-        let alt = [0u8; 512]; // all zeros — bad signature
+        let alt = [0u8; 512]; // all zeros — no valid MDB signature
         let mut errors = Vec::new();
         let mut warnings = Vec::new();
         check_alternate_mdb(&mdb, &alt, &mut errors, &mut warnings);
-        // Missing alternate MDB is a warning, not an error — the primary MDB
-        // is what matters and the alternate may be at a different offset when
-        // the partition is larger than the allocation area.
+        // Can't distinguish "missing" from "looked in the wrong place"
+        // (partition larger than allocation area), so produce nothing.
         assert!(
-            warnings.iter().any(|e| e.code == "AlternateMdbMissing"),
-            "should warn about missing alt MDB: {:?}",
-            warnings.iter().map(|e| &e.message).collect::<Vec<_>>()
+            errors.is_empty(),
+            "unexpected errors: {:?}",
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
         );
         assert!(
-            !errors.iter().any(|e| e.code == "AlternateMdbMissing"),
-            "missing alt MDB should not be an error"
+            warnings.is_empty(),
+            "unexpected warnings: {:?}",
+            warnings.iter().map(|e| &e.message).collect::<Vec<_>>()
         );
     }
 
