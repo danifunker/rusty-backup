@@ -37,8 +37,16 @@ use super::fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry, RepairReport}
 enum HfsFsckCode {
     // MDB issues
     BadSignature,
+    AlternateMdbMissing,
+    AlternateMdbMismatch,
+    EmbeddedHfsPlusInvalid,
     BadBlockSize,
+    BlockSizeUpperBound,
     VbmDataAreaCollision,
+    MdbVBMStTooLow,
+    MdbAlBlStTooLow,
+    MdbTotalBlocksInvalid,
+    InvalidClumpSize,
     NextCatalogIdTooLow,
     // B-tree structure
     HeaderNodeBadKind,
@@ -64,9 +72,19 @@ enum HfsFsckCode {
     OrphanedThread,
     MissingParent,
     ValenceMismatch,
+    // Directory structure
+    DirectoryLoop,
+    NestingDepthWarning,
+    // Catalog record field validation
+    LeoFExceedsPeoF,
+    InvalidCnidRange,
+    ReservedFieldNonZero,
+    InvalidCatalogName,
+    ThreadNameNotEmpty,
     // Extents overflow B-tree structure
     ExtentsBtreeStructure,
     // Extent/allocation
+    BadBlockExtentNotInBitmap,
     ExtentOutOfRange,
     OverlappingExtents,
     BitmapMismatch,
@@ -78,7 +96,18 @@ fn is_repairable(code: HfsFsckCode) -> bool {
     !matches!(
         code,
         HfsFsckCode::BadBlockSize
+            | HfsFsckCode::BlockSizeUpperBound
             | HfsFsckCode::VbmDataAreaCollision
+            | HfsFsckCode::MdbVBMStTooLow
+            | HfsFsckCode::MdbAlBlStTooLow
+            | HfsFsckCode::MdbTotalBlocksInvalid
+            | HfsFsckCode::InvalidClumpSize
+            | HfsFsckCode::EmbeddedHfsPlusInvalid
+            | HfsFsckCode::DirectoryLoop
+            | HfsFsckCode::NestingDepthWarning
+            | HfsFsckCode::LeoFExceedsPeoF
+            | HfsFsckCode::InvalidCnidRange
+            | HfsFsckCode::InvalidCatalogName
             | HfsFsckCode::OffsetTableNotMonotonic
             | HfsFsckCode::OffsetTableOutOfBounds
             | HfsFsckCode::MissingFileThread
@@ -101,11 +130,13 @@ fn hfs_issue(code: HfsFsckCode, message: impl Into<String>) -> FsckIssue {
 /// `catalog_data` — full catalog B-tree file content.
 /// `bitmap` — volume allocation bitmap bytes.
 /// `extents_data` — optional extents overflow B-tree file content (for files with >3 extents).
+/// `alt_mdb_sector` — optional raw 512-byte alternate MDB sector (last sector of volume).
 pub(crate) fn check_hfs_integrity(
     mdb: &HfsMasterDirectoryBlock,
     catalog_data: &[u8],
     bitmap: &[u8],
     extents_data: Option<&[u8]>,
+    alt_mdb_sector: Option<&[u8; 512]>,
 ) -> FsckResult {
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
@@ -133,6 +164,14 @@ pub(crate) fn check_hfs_integrity(
             orphaned_entries: Vec::new(),
         };
     }
+
+    // Phase 1b: Alternate MDB cross-check
+    if let Some(alt_sector) = alt_mdb_sector {
+        check_alternate_mdb(mdb, alt_sector, &mut errors, &mut warnings);
+    }
+
+    // Phase 1c: Embedded HFS+ wrapper check
+    check_embedded_hfs_plus(mdb, &mut errors, &mut warnings);
 
     // Phase 2: B-tree structure
     let header = BTreeHeader::read(catalog_data);
@@ -235,6 +274,7 @@ pub(crate) fn repair_hfs(
         catalog_data,
         bitmap,
         extents_data.as_deref().map(|v| v.as_slice()),
+        None, // alt MDB not available during repair
     );
     let unrepairable_count = check_result.errors.iter().filter(|e| !e.repairable).count();
 
@@ -954,6 +994,7 @@ fn repair_catalog_consistency(
                 key_cnid,
                 parent_id,
                 name,
+                ..
             } => {
                 dir_threads.insert(*key_cnid, (*parent_id, name.clone()));
             }
@@ -961,6 +1002,7 @@ fn repair_catalog_consistency(
                 key_cnid,
                 parent_id,
                 name,
+                ..
             } => {
                 file_threads.insert(*key_cnid, (*parent_id, name.clone()));
             }
@@ -1715,6 +1757,125 @@ fn repair_mdb_counts_and_bitmap(
 // Phase 1: MDB Sanity
 // ---------------------------------------------------------------------------
 
+/// Validate an HFS catalog name (Mac Roman bytes).
+/// Returns `Some(problem)` if invalid, `None` if ok.
+fn validate_hfs_name(name: &[u8]) -> Option<String> {
+    if name.is_empty() {
+        return Some("name is empty".into());
+    }
+    if name.len() > 31 {
+        return Some(format!(
+            "name length {} exceeds HFS maximum of 31",
+            name.len()
+        ));
+    }
+    if name.contains(&0x00) {
+        return Some("name contains null byte".into());
+    }
+    if name.contains(&0x3A) {
+        return Some("name contains colon (HFS path separator)".into());
+    }
+    None
+}
+
+/// Validate the alternate MDB against the primary MDB.
+fn check_alternate_mdb(
+    mdb: &HfsMasterDirectoryBlock,
+    alt_sector: &[u8; 512],
+    errors: &mut Vec<FsckIssue>,
+    _warnings: &mut Vec<FsckIssue>,
+) {
+    let alt_sig = BigEndian::read_u16(&alt_sector[0..2]);
+    if alt_sig != 0x4244 {
+        errors.push(hfs_issue(
+            HfsFsckCode::AlternateMdbMissing,
+            format!(
+                "alternate MDB signature 0x{:04X} (expected 0x4244)",
+                alt_sig
+            ),
+        ));
+        return;
+    }
+
+    // Cross-check critical fields
+    let checks: &[(&str, fn(&[u8; 512]) -> u32, u32)] = &[
+        (
+            "block size",
+            |s| BigEndian::read_u32(&s[20..24]),
+            mdb.block_size,
+        ),
+        (
+            "total blocks",
+            |s| BigEndian::read_u16(&s[18..20]) as u32,
+            mdb.total_blocks as u32,
+        ),
+        (
+            "volume bitmap start",
+            |s| BigEndian::read_u16(&s[14..16]) as u32,
+            mdb.volume_bitmap_block as u32,
+        ),
+        (
+            "first alloc block start",
+            |s| BigEndian::read_u16(&s[28..30]) as u32,
+            mdb.first_alloc_block as u32,
+        ),
+    ];
+    for (field, read_fn, primary_val) in checks {
+        let alt_val = read_fn(alt_sector);
+        if alt_val != *primary_val {
+            errors.push(hfs_issue(
+                HfsFsckCode::AlternateMdbMismatch,
+                format!(
+                    "alternate MDB {} ({}) differs from primary ({})",
+                    field, alt_val, primary_val
+                ),
+            ));
+        }
+    }
+}
+
+/// Check for embedded HFS+ volume inside an HFS wrapper.
+fn check_embedded_hfs_plus(
+    mdb: &HfsMasterDirectoryBlock,
+    errors: &mut Vec<FsckIssue>,
+    warnings: &mut Vec<FsckIssue>,
+) {
+    if mdb.embedded_signature == 0 {
+        return; // No embedded volume
+    }
+    if mdb.embedded_signature == 0x482B {
+        // Valid HFS+ embedded signature — check extents are within bounds
+        let start = mdb.embedded_start_block as u32;
+        let count = mdb.embedded_block_count as u32;
+        if start + count > mdb.total_blocks as u32 {
+            errors.push(hfs_issue(
+                HfsFsckCode::EmbeddedHfsPlusInvalid,
+                format!(
+                    "embedded HFS+ region [{}, +{}) exceeds total blocks {}",
+                    start, count, mdb.total_blocks
+                ),
+            ));
+        } else {
+            warnings.push(hfs_issue(
+                HfsFsckCode::EmbeddedHfsPlusInvalid,
+                format!(
+                    "HFS wrapper contains embedded HFS+ volume (blocks {}..{})",
+                    start,
+                    start + count
+                ),
+            ));
+        }
+    } else {
+        errors.push(hfs_issue(
+            HfsFsckCode::EmbeddedHfsPlusInvalid,
+            format!(
+                "unknown embedded volume signature 0x{:04X}",
+                mdb.embedded_signature
+            ),
+        ));
+    }
+}
+
 fn check_mdb(mdb: &HfsMasterDirectoryBlock, errors: &mut Vec<FsckIssue>) {
     if mdb.signature != 0x4244 {
         errors.push(hfs_issue(
@@ -1738,6 +1899,37 @@ fn check_mdb(mdb: &HfsMasterDirectoryBlock, errors: &mut Vec<FsckIssue>) {
         ));
     }
 
+    // Gap 8: Block size upper bound (Apple Max_ABSiz = 0x7FFFFE00, ~2GB)
+    if mdb.block_size > 0x7FFF_FE00 {
+        errors.push(hfs_issue(
+            HfsFsckCode::BlockSizeUpperBound,
+            format!(
+                "allocation block size 0x{:08X} exceeds HFS maximum (0x7FFFFE00)",
+                mdb.block_size
+            ),
+        ));
+    }
+
+    // Gap 5: Total allocation blocks sanity
+    if mdb.total_blocks == 0 && mdb.block_size > 0 {
+        errors.push(hfs_issue(
+            HfsFsckCode::MdbTotalBlocksInvalid,
+            "total allocation blocks is 0".to_string(),
+        ));
+    }
+
+    // Gap 7: Volume bitmap must start at sector 3 or later
+    // (sectors 0-1 are boot blocks, sector 2 is the MDB)
+    if mdb.volume_bitmap_block < 3 {
+        errors.push(hfs_issue(
+            HfsFsckCode::MdbVBMStTooLow,
+            format!(
+                "volume bitmap start sector {} is too low (must be >= 3)",
+                mdb.volume_bitmap_block
+            ),
+        ));
+    }
+
     // Volume bitmap must not collide with the allocation data area.
     // VBM starts at sector drVBMSt and occupies ceil(total_blocks / (512*8)) sectors.
     // The data area starts at sector drAlBlSt.
@@ -1753,6 +1945,63 @@ fn check_mdb(mdb: &HfsMasterDirectoryBlock, errors: &mut Vec<FsckIssue>) {
                     mdb.volume_bitmap_block, vbm_end, mdb.first_alloc_block
                 ),
             ));
+        }
+
+        // Gap 6: First alloc block start must be past the VBM
+        if (mdb.first_alloc_block as u32) < vbm_end {
+            // Only report if not already covered by VbmDataAreaCollision
+            // (VbmDataAreaCollision checks overlap; this is the same condition)
+            // Already reported above — skip to avoid duplicate.
+        } else if mdb.first_alloc_block < 3 {
+            errors.push(hfs_issue(
+                HfsFsckCode::MdbAlBlStTooLow,
+                format!(
+                    "first allocation block start sector {} is too low (must be >= 3)",
+                    mdb.first_alloc_block
+                ),
+            ));
+        }
+    } else if mdb.first_alloc_block < 3 {
+        // Gap 6: Even without valid block_size/total_blocks, catch obviously bad values
+        errors.push(hfs_issue(
+            HfsFsckCode::MdbAlBlStTooLow,
+            format!(
+                "first allocation block start sector {} is too low (must be >= 3)",
+                mdb.first_alloc_block
+            ),
+        ));
+    }
+
+    // Gap 9: Clump size validation
+    // Read from raw_sector since these aren't in the parsed struct fields.
+    if mdb.block_size > 0 && mdb.total_blocks > 0 {
+        let volume_size = mdb.total_blocks as u64 * mdb.block_size as u64;
+        let clump_checks: [(&str, usize); 3] = [
+            ("default clump size (drClpSiz)", 24),
+            ("extents file clump size (drXTClpSiz)", 72),
+            ("catalog file clump size (drCTClpSiz)", 76),
+        ];
+        for (label, offset) in &clump_checks {
+            let clump = BigEndian::read_u32(&mdb.raw_sector[*offset..*offset + 4]);
+            if clump == 0 {
+                continue; // zero is acceptable (means use default)
+            }
+            #[allow(clippy::manual_is_multiple_of)]
+            if clump % mdb.block_size != 0 {
+                errors.push(hfs_issue(
+                    HfsFsckCode::InvalidClumpSize,
+                    format!(
+                        "{}: {} is not a multiple of block size {}",
+                        label, clump, mdb.block_size
+                    ),
+                ));
+            }
+            if clump as u64 > volume_size {
+                errors.push(hfs_issue(
+                    HfsFsckCode::InvalidClumpSize,
+                    format!("{}: {} exceeds volume size {}", label, clump, volume_size),
+                ));
+            }
         }
     }
 }
@@ -2481,19 +2730,114 @@ enum CatalogEntry {
         file_id: u32,
         data_extents: [HfsExtDescriptor; 3],
         data_size: u32,
+        data_physical_size: u32,
         rsrc_extents: [HfsExtDescriptor; 3],
         rsrc_size: u32,
+        rsrc_physical_size: u32,
+        data_start_block: u16,
+        rsrc_start_block: u16,
+        reserved_byte: u8,
     },
     DirThread {
         key_cnid: u32,
         parent_id: u32,
         name: Vec<u8>,
+        key_name_len: usize,
     },
     FileThread {
         key_cnid: u32,
         parent_id: u32,
         name: Vec<u8>,
+        key_name_len: usize,
     },
+}
+
+/// Walk parent chains to detect directory loops and excessive nesting depth.
+/// `dir_records` maps dir_id → (parent_id, name, valence).
+fn check_directory_structure(
+    dir_records: &HashMap<u32, (u32, Vec<u8>, u16)>,
+    errors: &mut Vec<FsckIssue>,
+    warnings: &mut Vec<FsckIssue>,
+) {
+    const MAX_NESTING: usize = 100;
+    const MAX_HOPS: usize = 200;
+
+    // Cache: dir_id → known depth (None if involved in a loop)
+    let mut depth_cache: HashMap<u32, Option<usize>> = HashMap::new();
+    // Root dir (CNID 2) has depth 0 if it exists; parent_id=1 is the virtual root parent.
+    depth_cache.insert(2, Some(0));
+
+    for &dir_id in dir_records.keys() {
+        if depth_cache.contains_key(&dir_id) {
+            continue;
+        }
+
+        // Walk toward root, collecting the path
+        let mut path: Vec<u32> = Vec::new();
+        let mut current = dir_id;
+        let mut depth = None;
+
+        for _ in 0..MAX_HOPS {
+            if let Some(cached) = depth_cache.get(&current) {
+                // We've reached a node with a known depth
+                depth = cached.map(|d| d + path.len());
+                break;
+            }
+            if current == 2 || current == 1 {
+                // Reached root
+                depth = Some(path.len());
+                break;
+            }
+            if path.contains(&current) {
+                // Loop detected
+                errors.push(hfs_issue(
+                    HfsFsckCode::DirectoryLoop,
+                    format!("directory loop detected involving CNID {}", current),
+                ));
+                // Mark all nodes in the loop
+                for &node in &path {
+                    depth_cache.insert(node, None);
+                }
+                depth_cache.insert(current, None);
+                break;
+            }
+            path.push(current);
+            if let Some(&(parent_id, _, _)) = dir_records.get(&current) {
+                current = parent_id;
+            } else {
+                // Parent not found — stop (MissingParent handles this separately)
+                depth = Some(path.len());
+                break;
+            }
+        }
+
+        // Cache depths for all nodes in the path
+        if let Some(base_depth) = depth {
+            for (i, &node) in path.iter().enumerate() {
+                let node_depth = base_depth - i;
+                depth_cache.insert(node, Some(node_depth));
+            }
+        }
+    }
+
+    // Check for excessive nesting
+    for (&dir_id, &cached_depth) in &depth_cache {
+        if let Some(d) = cached_depth {
+            if d > MAX_NESTING {
+                let name = dir_records
+                    .get(&dir_id)
+                    .map(|(_, n, _)| mac_roman_to_utf8(n))
+                    .unwrap_or_default();
+                warnings.push(hfs_issue(
+                    HfsFsckCode::NestingDepthWarning,
+                    format!(
+                        "directory \"{}\" (CNID {}) nesting depth {} exceeds recommended maximum of {}",
+                        name, dir_id, d, MAX_NESTING
+                    ),
+                ));
+            }
+        }
+    }
 }
 
 fn check_catalog_consistency(
@@ -2536,13 +2880,109 @@ fn check_catalog_consistency(
                 if *dir_id > max_cnid {
                     max_cnid = *dir_id;
                 }
+                // Gap 2: CNID range — must be >= 16 or == 2 (root)
+                if *dir_id != 2 && *dir_id < 16 {
+                    errors.push(hfs_issue(
+                        HfsFsckCode::InvalidCnidRange,
+                        format!(
+                            "directory CNID {} is in the reserved range (must be >= 16 or == 2)",
+                            dir_id
+                        ),
+                    ));
+                }
+                // Gap 10: Catalog name validation
+                // Skip for root directory (CNID 2) — its key name is the volume name
+                // which may legitimately be empty in some implementations.
+                if *dir_id != 2 {
+                    if let Some(problem) = validate_hfs_name(&key.name) {
+                        errors.push(hfs_issue(
+                            HfsFsckCode::InvalidCatalogName,
+                            format!("directory CNID {}: {}", dir_id, problem),
+                        ));
+                    }
+                }
                 *directories_checked += 1;
             }
-            CatalogEntry::File { key, file_id, .. } => {
+            CatalogEntry::File {
+                key,
+                file_id,
+                data_size,
+                data_physical_size,
+                rsrc_size,
+                rsrc_physical_size,
+                data_start_block,
+                rsrc_start_block,
+                reserved_byte,
+                ..
+            } => {
                 file_records.insert(*file_id, (key.parent_id, key.name.clone()));
                 *children_count.entry(key.parent_id).or_insert(0) += 1;
                 if *file_id > max_cnid {
                     max_cnid = *file_id;
+                }
+                // Gap 2: CNID range — must be >= 16
+                if *file_id < 16 {
+                    errors.push(hfs_issue(
+                        HfsFsckCode::InvalidCnidRange,
+                        format!(
+                            "file CNID {} is in the reserved range (must be >= 16)",
+                            file_id
+                        ),
+                    ));
+                }
+                // Gap 10: Catalog name validation
+                if let Some(problem) = validate_hfs_name(&key.name) {
+                    errors.push(hfs_issue(
+                        HfsFsckCode::InvalidCatalogName,
+                        format!("file CNID {}: {}", file_id, problem),
+                    ));
+                }
+                // Gap 1: LEOF > PEOF — logical size must not exceed physical size
+                if *data_size > *data_physical_size {
+                    errors.push(hfs_issue(
+                        HfsFsckCode::LeoFExceedsPeoF,
+                        format!(
+                            "file CNID {}: data fork logical size {} > physical size {}",
+                            file_id, data_size, data_physical_size
+                        ),
+                    ));
+                }
+                if *rsrc_size > *rsrc_physical_size {
+                    errors.push(hfs_issue(
+                        HfsFsckCode::LeoFExceedsPeoF,
+                        format!(
+                            "file CNID {}: resource fork logical size {} > physical size {}",
+                            file_id, rsrc_size, rsrc_physical_size
+                        ),
+                    ));
+                }
+                // Gap 3: Reserved fields must be zero
+                if *reserved_byte != 0 {
+                    warnings.push(hfs_issue(
+                        HfsFsckCode::ReservedFieldNonZero,
+                        format!(
+                            "file CNID {}: reserved byte is 0x{:02X} (expected 0)",
+                            file_id, reserved_byte
+                        ),
+                    ));
+                }
+                if *data_start_block != 0 {
+                    warnings.push(hfs_issue(
+                        HfsFsckCode::ReservedFieldNonZero,
+                        format!(
+                            "file CNID {}: dataStartBlock is {} (expected 0)",
+                            file_id, data_start_block
+                        ),
+                    ));
+                }
+                if *rsrc_start_block != 0 {
+                    warnings.push(hfs_issue(
+                        HfsFsckCode::ReservedFieldNonZero,
+                        format!(
+                            "file CNID {}: rsrcStartBlock is {} (expected 0)",
+                            file_id, rsrc_start_block
+                        ),
+                    ));
                 }
                 *files_checked += 1;
             }
@@ -2550,15 +2990,37 @@ fn check_catalog_consistency(
                 key_cnid,
                 parent_id,
                 name,
+                key_name_len,
             } => {
                 dir_threads.insert(*key_cnid, (*parent_id, name.clone()));
+                // Gap 11: Thread key name must be zero-length
+                if *key_name_len != 0 {
+                    errors.push(hfs_issue(
+                        HfsFsckCode::ThreadNameNotEmpty,
+                        format!(
+                            "directory thread CNID {}: key name length is {} (must be 0)",
+                            key_cnid, key_name_len
+                        ),
+                    ));
+                }
             }
             CatalogEntry::FileThread {
                 key_cnid,
                 parent_id,
                 name,
+                key_name_len,
             } => {
                 file_threads.insert(*key_cnid, (*parent_id, name.clone()));
+                // Gap 11: Thread key name must be zero-length
+                if *key_name_len != 0 {
+                    errors.push(hfs_issue(
+                        HfsFsckCode::ThreadNameNotEmpty,
+                        format!(
+                            "file thread CNID {}: key name length is {} (must be 0)",
+                            key_cnid, key_name_len
+                        ),
+                    ));
+                }
             }
         }
     }
@@ -2677,6 +3139,9 @@ fn check_catalog_consistency(
             ));
         }
     }
+
+    // Gap 12/13: Directory loop detection and nesting depth
+    check_directory_structure(&dir_records, errors, warnings);
 
     // Verify file_count and folder_count match MDB
     // HFS folder_count includes the root directory (CNID 2)
@@ -2803,8 +3268,14 @@ fn parse_catalog_record(node: &[u8], node_size: usize, rec_idx: usize) -> Option
                 return None;
             }
             let rec = &node[rec_data_offset..];
+            let reserved_byte = rec[1];
             let file_id = BigEndian::read_u32(&rec[20..24]);
+            let data_start_block = BigEndian::read_u16(&rec[24..26]);
             let data_size = BigEndian::read_u32(&rec[26..30]);
+            let data_physical_size = BigEndian::read_u32(&rec[30..34]);
+            let rsrc_start_block = BigEndian::read_u16(&rec[34..36]);
+            let rsrc_size = BigEndian::read_u32(&rec[36..40]);
+            let rsrc_physical_size = BigEndian::read_u32(&rec[40..44]);
             let mut data_extents = [HfsExtDescriptor {
                 start_block: 0,
                 block_count: 0,
@@ -2812,7 +3283,6 @@ fn parse_catalog_record(node: &[u8], node_size: usize, rec_idx: usize) -> Option
             for j in 0..3 {
                 data_extents[j] = HfsExtDescriptor::parse(&rec[74 + j * 4..78 + j * 4]);
             }
-            let rsrc_size = BigEndian::read_u32(&rec[36..40]);
             let mut rsrc_extents = [HfsExtDescriptor {
                 start_block: 0,
                 block_count: 0,
@@ -2828,8 +3298,13 @@ fn parse_catalog_record(node: &[u8], node_size: usize, rec_idx: usize) -> Option
                 file_id,
                 data_extents,
                 data_size,
+                data_physical_size,
                 rsrc_extents,
                 rsrc_size,
+                rsrc_physical_size,
+                data_start_block,
+                rsrc_start_block,
+                reserved_byte,
             })
         }
         CATALOG_DIR_THREAD => {
@@ -2852,6 +3327,7 @@ fn parse_catalog_record(node: &[u8], node_size: usize, rec_idx: usize) -> Option
                 key_cnid: parent_id, // thread key uses CNID as "parent_id" field
                 parent_id: thr_parent_id,
                 name: thr_name,
+                key_name_len: name_len,
             })
         }
         CATALOG_FILE_THREAD => {
@@ -2874,6 +3350,7 @@ fn parse_catalog_record(node: &[u8], node_size: usize, rec_idx: usize) -> Option
                 key_cnid: parent_id,
                 parent_id: thr_parent_id,
                 name: thr_name,
+                key_name_len: name_len,
             })
         }
         _ => None,
@@ -2962,6 +3439,77 @@ fn collect_overflow_extents(extents_data: &[u8]) -> Vec<(u32, u32, String)> {
                         ext.block_count as u32,
                         format!("file {} {} (overflow)", file_id, fork_label),
                     ));
+                }
+            }
+        }
+
+        node_idx = flink;
+    }
+
+    result
+}
+
+/// Collect extents belonging to the bad block file (CNID 5) from the extents overflow B-tree.
+fn collect_bad_block_extents(extents_data: &[u8]) -> Vec<(u32, u32)> {
+    const BAD_BLOCK_FILE_ID: u32 = 5;
+    let mut result = Vec::new();
+
+    if extents_data.len() < 512 {
+        return result;
+    }
+
+    let header = BTreeHeader::read(extents_data);
+    let node_size = header.node_size as usize;
+    if node_size == 0 || extents_data.len() < node_size {
+        return result;
+    }
+
+    let mut node_idx = header.first_leaf_node;
+    let mut visited = HashSet::new();
+
+    while node_idx != 0 {
+        if !visited.insert(node_idx) {
+            break;
+        }
+        let off = node_idx as usize * node_size;
+        if off + node_size > extents_data.len() {
+            break;
+        }
+        let node = &extents_data[off..off + node_size];
+        let flink = BigEndian::read_u32(&node[0..4]);
+        let kind = node[8] as i8;
+        if kind != BTREE_LEAF_NODE {
+            break;
+        }
+        let num_records = BigEndian::read_u16(&node[10..12]) as usize;
+
+        for i in 0..num_records {
+            let (rec_start, _rec_end) = btree_record_range(node, node_size, i);
+            if rec_start + 8 > node_size {
+                continue;
+            }
+            let key_len = node[rec_start] as usize;
+            if key_len < 7 || rec_start + 1 + key_len > node_size {
+                continue;
+            }
+            let file_id = BigEndian::read_u32(&node[rec_start + 2..rec_start + 6]);
+            if file_id != BAD_BLOCK_FILE_ID {
+                continue;
+            }
+
+            let mut data_off = rec_start + 1 + key_len;
+            #[allow(clippy::manual_is_multiple_of)]
+            if data_off % 2 != 0 {
+                data_off += 1;
+            }
+            if data_off + 12 > node_size {
+                continue;
+            }
+
+            for j in 0..3 {
+                let ext = HfsExtDescriptor::parse(&node[data_off + j * 4..data_off + j * 4 + 4]);
+                if ext.block_count > 0 {
+                    result.push((ext.start_block as u32, ext.block_count as u32));
                 }
             }
         }
@@ -3102,6 +3650,25 @@ fn check_extents_and_bitmap(
                 mismatch_count
             ),
         ));
+    }
+
+    // Gap 15: Bad block file (CNID 5) extents must be marked allocated in the on-disk bitmap
+    if let Some(ext_data) = extents_data {
+        let bad_block_extents = collect_bad_block_extents(ext_data);
+        for (start, count) in &bad_block_extents {
+            for b in *start..(*start + *count).min(total_blocks) {
+                if !bitmap_test_bit_be(bitmap, b) {
+                    warnings.push(hfs_issue(
+                        HfsFsckCode::BadBlockExtentNotInBitmap,
+                        format!(
+                            "bad block file: block {} is marked free in bitmap (should be allocated)",
+                            b
+                        ),
+                    ));
+                    break; // one warning per extent range is enough
+                }
+            }
+        }
     }
 
     // Verify free block count
@@ -4422,6 +4989,960 @@ mod tests {
                 .find(|e| e.code == "VbmDataAreaCollision")
                 .unwrap()
                 .repairable
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage 1: Extended MDB Validation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mdb_vbm_start_too_low() {
+        let mut mdb = make_test_mdb();
+        mdb.volume_bitmap_block = 1; // must be >= 3
+        let mut errors = Vec::new();
+        check_mdb(&mdb, &mut errors);
+        assert!(
+            errors.iter().any(|e| e.code == "MdbVBMStTooLow"),
+            "should detect VBM start too low: {:?}",
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_mdb_vbm_start_at_3_ok() {
+        let mdb = make_test_mdb(); // volume_bitmap_block = 3
+        let mut errors = Vec::new();
+        check_mdb(&mdb, &mut errors);
+        assert!(
+            !errors.iter().any(|e| e.code == "MdbVBMStTooLow"),
+            "VBM start at 3 should be ok"
+        );
+    }
+
+    #[test]
+    fn test_mdb_alblst_too_low() {
+        let mut mdb = make_test_mdb();
+        mdb.first_alloc_block = 2; // must be >= 3 at minimum
+        mdb.volume_bitmap_block = 3;
+        mdb.total_blocks = 1; // tiny volume so VBM is 1 sector (3..4)
+        let mut errors = Vec::new();
+        check_mdb(&mdb, &mut errors);
+        // first_alloc_block=2 < vbm_end=4, triggers VbmDataAreaCollision
+        // and first_alloc_block=2 < 3 triggers MdbAlBlStTooLow
+        // Due to the overlap check being reported first, AlBlSt<3 is also caught
+        // in the else-if fallback when total_blocks is 0. But with total_blocks=1,
+        // the VBM collision covers it. Let's test with total_blocks=0 path.
+        let mut mdb2 = make_test_mdb();
+        mdb2.first_alloc_block = 2;
+        mdb2.total_blocks = 0;
+        mdb2.block_size = 0; // skip VBM collision path
+        let mut errors2 = Vec::new();
+        check_mdb(&mdb2, &mut errors2);
+        assert!(
+            errors2.iter().any(|e| e.code == "MdbAlBlStTooLow"),
+            "should detect first alloc block too low: {:?}",
+            errors2.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_mdb_block_size_upper_bound() {
+        let mut mdb = make_test_mdb();
+        mdb.block_size = 0x8000_0000;
+        let mut errors = Vec::new();
+        check_mdb(&mdb, &mut errors);
+        assert!(
+            errors.iter().any(|e| e.code == "BlockSizeUpperBound"),
+            "should detect block size exceeding max: {:?}",
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_mdb_block_size_at_max_valid() {
+        let mut mdb = make_test_mdb();
+        mdb.block_size = 0x7FFF_FE00;
+        let mut errors = Vec::new();
+        check_mdb(&mdb, &mut errors);
+        assert!(
+            !errors.iter().any(|e| e.code == "BlockSizeUpperBound"),
+            "block size at max should not trigger upper bound error"
+        );
+    }
+
+    #[test]
+    fn test_mdb_total_blocks_zero() {
+        let mut mdb = make_test_mdb();
+        mdb.total_blocks = 0;
+        let mut errors = Vec::new();
+        check_mdb(&mdb, &mut errors);
+        assert!(
+            errors.iter().any(|e| e.code == "MdbTotalBlocksInvalid"),
+            "should detect total_blocks=0: {:?}",
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_mdb_clump_size_not_multiple() {
+        let mut mdb = make_test_mdb();
+        // block_size=4096, set drClpSiz to 5000 (not a multiple of 4096)
+        BigEndian::write_u32(&mut mdb.raw_sector[24..28], 5000);
+        let mut errors = Vec::new();
+        check_mdb(&mdb, &mut errors);
+        assert!(
+            errors.iter().any(|e| e.code == "InvalidClumpSize"),
+            "should detect clump size not a multiple of block size: {:?}",
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_mdb_clump_size_exceeds_volume() {
+        let mut mdb = make_test_mdb();
+        // total_blocks=100, block_size=4096 → volume_size=409600
+        // Set drXTClpSiz to something larger
+        BigEndian::write_u32(&mut mdb.raw_sector[72..76], 4096 * 200);
+        let mut errors = Vec::new();
+        check_mdb(&mdb, &mut errors);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.code == "InvalidClumpSize" && e.message.contains("exceeds volume size")),
+            "should detect clump size exceeding volume: {:?}",
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_mdb_clump_size_valid() {
+        let mut mdb = make_test_mdb();
+        // Set all three clump sizes to valid multiples of block_size (4096)
+        BigEndian::write_u32(&mut mdb.raw_sector[24..28], 4096 * 2); // drClpSiz
+        BigEndian::write_u32(&mut mdb.raw_sector[72..76], 4096); // drXTClpSiz
+        BigEndian::write_u32(&mut mdb.raw_sector[76..80], 4096 * 4); // drCTClpSiz
+        let mut errors = Vec::new();
+        check_mdb(&mdb, &mut errors);
+        assert!(
+            !errors.iter().any(|e| e.code == "InvalidClumpSize"),
+            "valid clump sizes should not trigger errors"
+        );
+    }
+
+    #[test]
+    fn test_mdb_clump_size_zero_ok() {
+        let mdb = make_test_mdb(); // raw_sector all zeros → clump sizes are 0
+        let mut errors = Vec::new();
+        check_mdb(&mdb, &mut errors);
+        assert!(
+            !errors.iter().any(|e| e.code == "InvalidClumpSize"),
+            "zero clump sizes should be accepted"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage 2: Catalog Record Field Validation tests
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal catalog B-tree containing a root dir (CNID 2) with
+    /// its thread, plus one file record with configurable fields.
+    /// Returns (catalog_data, file_cnid).
+    fn make_btree_with_file(
+        file_cnid: u32,
+        data_logical: u32,
+        data_physical: u32,
+        rsrc_logical: u32,
+        rsrc_physical: u32,
+        reserved_byte: u8,
+        data_start_block: u16,
+        rsrc_start_block: u16,
+    ) -> Vec<u8> {
+        let node_size = 512usize;
+        let num_nodes = 4usize;
+        let mut data = vec![0u8; node_size * num_nodes];
+
+        // Node 0: Header node
+        data[8] = BTREE_HEADER_NODE as u8;
+        BigEndian::write_u16(&mut data[10..12], 3); // 3 records
+
+        let hr = 14;
+        BigEndian::write_u16(&mut data[hr..hr + 2], 1); // depth = 1
+        BigEndian::write_u32(&mut data[hr + 2..hr + 6], 1); // root_node = 1
+        BigEndian::write_u32(&mut data[hr + 6..hr + 10], 4); // leaf_records = 4
+        BigEndian::write_u32(&mut data[hr + 10..hr + 14], 1); // first_leaf = 1
+        BigEndian::write_u32(&mut data[hr + 14..hr + 18], 1); // last_leaf = 1
+        BigEndian::write_u16(&mut data[hr + 18..hr + 20], node_size as u16);
+        BigEndian::write_u16(&mut data[hr + 20..hr + 22], 37); // max_key_len
+        BigEndian::write_u32(&mut data[hr + 22..hr + 26], num_nodes as u32);
+        BigEndian::write_u32(&mut data[hr + 26..hr + 30], (num_nodes - 2) as u32);
+
+        // Offset table for header node
+        let ot = node_size;
+        BigEndian::write_u16(&mut data[ot - 2..ot], 14);
+        BigEndian::write_u16(&mut data[ot - 4..ot - 2], 0x78);
+        BigEndian::write_u16(&mut data[ot - 6..ot - 4], 0xf8);
+        BigEndian::write_u16(&mut data[ot - 8..ot - 6], node_size as u16 - 8);
+
+        // Node bitmap: mark nodes 0 and 1 as allocated
+        data[0xf8] = 0b11000000;
+
+        // Node 1: Leaf node with 4 records:
+        //   rec 0: root dir thread (CNID 2 → parent 1, name "Test")
+        //   rec 1: root dir (parent_id=1, name="", CNID=2, valence=1)
+        //   rec 2: file record (parent_id=2, name="File", CNID=file_cnid)
+        //   rec 3: file thread (CNID=file_cnid → parent 2, name "File")
+        // Keys must be sorted: (1,"") < (2,"") < (2,"File") < (file_cnid,"")
+        let n1 = node_size;
+        data[n1 + 8] = BTREE_LEAF_NODE as u8;
+        data[n1 + 9] = 1; // height
+
+        let mut write_pos = n1 + 14;
+        let mut num_recs = 0u16;
+
+        // Record 0: Dir thread for root dir — key: parent_id=2, name=""
+        let r0_start = write_pos;
+        data[write_pos] = 6; // key_len = 6 (1 reserved + 4 parentID + 1 nameLen)
+                             // reserved byte at +1 already 0
+        BigEndian::write_u32(&mut data[write_pos + 2..write_pos + 6], 2); // key parent_id = CNID 2
+        data[write_pos + 6] = 0; // name_len = 0
+                                 // Even-align record data
+        let rec_off = write_pos + 8; // 1+6 = 7 → pad to 8
+        data[rec_off] = CATALOG_DIR_THREAD as u8; // type = 3
+                                                  // reserved 8 bytes (already 0)
+        BigEndian::write_u32(&mut data[rec_off + 10..rec_off + 14], 1); // parent_id = 1
+        data[rec_off + 14] = 4; // name_len = 4
+        data[rec_off + 15..rec_off + 19].copy_from_slice(b"Test");
+        write_pos = rec_off + 46; // dir thread = 46 bytes
+        num_recs += 1;
+
+        // Record 1: Root dir — key: parent_id=1, name="" (but actually the root dir
+        // record uses parent_id=1 and typically the volume name... for simplicity use
+        // a zero-length name which sorts before "File")
+        // Actually we need keys in order. Thread key (2,"") should come AFTER dir key
+        // (1,"name"). Let me reorder: put root dir first.
+        // Rewrite: clear and redo in proper key order.
+        // Key order: (1,"Test") < (2,"") < (2,"File") < (file_cnid,"")
+        // So: rec0=root dir, rec1=root dir thread, rec2=file, rec3=file thread
+
+        // Start over at offset 14
+        write_pos = n1 + 14;
+        num_recs = 0;
+
+        // Record 0: Root directory — key (parent_id=1, name="Test")
+        {
+            let kl_off = write_pos;
+            data[kl_off] = 10; // key_len = 10 (1+4+1+4)
+            data[kl_off + 2..kl_off + 6].copy_from_slice(&1u32.to_be_bytes()); // parent_id=1
+            data[kl_off + 6] = 4; // name_len=4
+            data[kl_off + 7..kl_off + 11].copy_from_slice(b"Test");
+            let rec_off = kl_off + 12; // 1+10=11 → pad to 12
+            data[rec_off] = CATALOG_DIR as u8; // type = 1
+            BigEndian::write_u16(&mut data[rec_off + 4..rec_off + 6], 1); // valence=1
+            BigEndian::write_u32(&mut data[rec_off + 6..rec_off + 10], 2); // dirID=2
+            write_pos = rec_off + 70;
+            num_recs += 1;
+        }
+
+        // Record 1: Root dir thread — key (parent_id=2, name="")
+        {
+            let kl_off = write_pos;
+            data[kl_off] = 6; // key_len=6
+            data[kl_off + 2..kl_off + 6].copy_from_slice(&2u32.to_be_bytes());
+            data[kl_off + 6] = 0; // name_len=0
+            let rec_off = kl_off + 8; // 1+6=7 → pad to 8
+            data[rec_off] = CATALOG_DIR_THREAD as u8;
+            BigEndian::write_u32(&mut data[rec_off + 10..rec_off + 14], 1); // parent=1
+            data[rec_off + 14] = 4;
+            data[rec_off + 15..rec_off + 19].copy_from_slice(b"Test");
+            write_pos = rec_off + 46;
+            num_recs += 1;
+        }
+
+        // Record 2: File record — key (parent_id=2, name="File")
+        {
+            let kl_off = write_pos;
+            data[kl_off] = 10; // key_len=10 (1+4+1+4)
+            data[kl_off + 2..kl_off + 6].copy_from_slice(&2u32.to_be_bytes());
+            data[kl_off + 6] = 4; // name_len=4
+            data[kl_off + 7..kl_off + 11].copy_from_slice(b"File");
+            let rec_off = kl_off + 12; // 1+10=11 → pad to 12
+            data[rec_off] = CATALOG_FILE as u8; // type = 2
+            data[rec_off + 1] = reserved_byte; // cdrResrv
+            BigEndian::write_u32(&mut data[rec_off + 20..rec_off + 24], file_cnid); // filFlNum
+            BigEndian::write_u16(&mut data[rec_off + 24..rec_off + 26], data_start_block);
+            BigEndian::write_u32(&mut data[rec_off + 26..rec_off + 30], data_logical);
+            BigEndian::write_u32(&mut data[rec_off + 30..rec_off + 34], data_physical);
+            BigEndian::write_u16(&mut data[rec_off + 34..rec_off + 36], rsrc_start_block);
+            BigEndian::write_u32(&mut data[rec_off + 36..rec_off + 40], rsrc_logical);
+            BigEndian::write_u32(&mut data[rec_off + 40..rec_off + 44], rsrc_physical);
+            write_pos = rec_off + 102;
+            num_recs += 1;
+        }
+
+        // Record 3: File thread — key (parent_id=file_cnid, name="")
+        {
+            let kl_off = write_pos;
+            data[kl_off] = 6;
+            data[kl_off + 2..kl_off + 6].copy_from_slice(&file_cnid.to_be_bytes());
+            data[kl_off + 6] = 0;
+            let rec_off = kl_off + 8;
+            data[rec_off] = CATALOG_FILE_THREAD as u8;
+            BigEndian::write_u32(&mut data[rec_off + 10..rec_off + 14], 2); // parent=2
+            data[rec_off + 14] = 4;
+            data[rec_off + 15..rec_off + 19].copy_from_slice(b"File");
+            write_pos = rec_off + 46;
+            num_recs += 1;
+        }
+
+        // Set record count
+        BigEndian::write_u16(&mut data[n1 + 10..n1 + 12], num_recs);
+
+        // Write offset table for leaf node
+        let mut rec_offsets = Vec::new();
+        let mut cur = 14usize;
+        // rec 0: root dir = key(12) + data(70) = 82
+        rec_offsets.push(cur);
+        cur += 82;
+        // rec 1: dir thread = key(8) + data(46) = 54
+        rec_offsets.push(cur);
+        cur += 54;
+        // rec 2: file = key(12) + data(102) = 114
+        rec_offsets.push(cur);
+        cur += 114;
+        // rec 3: file thread = key(8) + data(46) = 54
+        rec_offsets.push(cur);
+        cur += 54;
+        // free space
+        let lot = n1 + node_size;
+        for (i, &off) in rec_offsets.iter().enumerate() {
+            BigEndian::write_u16(&mut data[lot - 2 * (i + 1)..lot - 2 * i], off as u16);
+        }
+        BigEndian::write_u16(
+            &mut data[lot - 2 * (rec_offsets.len() + 1)..lot - 2 * rec_offsets.len()],
+            cur as u16,
+        );
+
+        data
+    }
+
+    fn run_catalog_check_on_btree(
+        mdb: &HfsMasterDirectoryBlock,
+        catalog_data: &[u8],
+    ) -> (Vec<FsckIssue>, Vec<FsckIssue>) {
+        let header = BTreeHeader::read(catalog_data);
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+        let mut files_checked = 0;
+        let mut dirs_checked = 0;
+        let mut orphaned_threads = 0;
+        let mut orphaned_entries = Vec::new();
+        check_catalog_consistency(
+            mdb,
+            catalog_data,
+            &header,
+            &mut errors,
+            &mut warnings,
+            &mut files_checked,
+            &mut dirs_checked,
+            &mut orphaned_threads,
+            &mut orphaned_entries,
+        );
+        (errors, warnings)
+    }
+
+    #[test]
+    fn test_leof_exceeds_peof_data_fork() {
+        let catalog = make_btree_with_file(16, 5000, 4096, 0, 0, 0, 0, 0);
+        let mut mdb = make_test_mdb();
+        mdb.file_count = 1;
+        mdb.next_catalog_id = 17;
+        let (errors, _) = run_catalog_check_on_btree(&mdb, &catalog);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.code == "LeoFExceedsPeoF" && e.message.contains("data fork")),
+            "should detect data LEOF > PEOF: {:?}",
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_leof_exceeds_peof_rsrc_fork() {
+        let catalog = make_btree_with_file(16, 0, 0, 3000, 2048, 0, 0, 0);
+        let mut mdb = make_test_mdb();
+        mdb.file_count = 1;
+        mdb.next_catalog_id = 17;
+        let (errors, _) = run_catalog_check_on_btree(&mdb, &catalog);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.code == "LeoFExceedsPeoF" && e.message.contains("resource fork")),
+            "should detect rsrc LEOF > PEOF: {:?}",
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_leof_within_peof_ok() {
+        let catalog = make_btree_with_file(16, 4000, 4096, 1000, 2048, 0, 0, 0);
+        let mut mdb = make_test_mdb();
+        mdb.file_count = 1;
+        mdb.next_catalog_id = 17;
+        let (errors, _) = run_catalog_check_on_btree(&mdb, &catalog);
+        assert!(
+            !errors.iter().any(|e| e.code == "LeoFExceedsPeoF"),
+            "LEOF <= PEOF should not error: {:?}",
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_cnid_below_16_file() {
+        let catalog = make_btree_with_file(5, 0, 0, 0, 0, 0, 0, 0); // CNID 5 = reserved
+        let mut mdb = make_test_mdb();
+        mdb.file_count = 1;
+        mdb.next_catalog_id = 17;
+        let (errors, _) = run_catalog_check_on_btree(&mdb, &catalog);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.code == "InvalidCnidRange" && e.message.contains("file CNID 5")),
+            "should detect reserved file CNID: {:?}",
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_cnid_16_file_ok() {
+        let catalog = make_btree_with_file(16, 0, 0, 0, 0, 0, 0, 0);
+        let mut mdb = make_test_mdb();
+        mdb.file_count = 1;
+        mdb.next_catalog_id = 17;
+        let (errors, _) = run_catalog_check_on_btree(&mdb, &catalog);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.code == "InvalidCnidRange" && e.message.contains("file")),
+            "file CNID 16 should be ok: {:?}",
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_cnid_2_root_ok() {
+        // Root dir has CNID 2 — should NOT trigger InvalidCnidRange
+        let catalog = make_btree_with_file(16, 0, 0, 0, 0, 0, 0, 0);
+        let mut mdb = make_test_mdb();
+        mdb.file_count = 1;
+        mdb.next_catalog_id = 17;
+        let (errors, _) = run_catalog_check_on_btree(&mdb, &catalog);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.code == "InvalidCnidRange" && e.message.contains("directory CNID 2")),
+            "root dir CNID 2 should not trigger error: {:?}",
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_reserved_fields_nonzero() {
+        // reserved_byte=1, data_start_block=1, rsrc_start_block=0
+        let catalog = make_btree_with_file(16, 0, 0, 0, 0, 1, 1, 0);
+        let mut mdb = make_test_mdb();
+        mdb.file_count = 1;
+        mdb.next_catalog_id = 17;
+        let (_, warnings) = run_catalog_check_on_btree(&mdb, &catalog);
+        assert!(
+            warnings
+                .iter()
+                .any(|e| e.code == "ReservedFieldNonZero" && e.message.contains("reserved byte")),
+            "should warn about non-zero reserved byte: {:?}",
+            warnings.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|e| e.code == "ReservedFieldNonZero" && e.message.contains("dataStartBlock")),
+            "should warn about non-zero dataStartBlock: {:?}",
+            warnings.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_reserved_fields_zero_ok() {
+        let catalog = make_btree_with_file(16, 0, 0, 0, 0, 0, 0, 0);
+        let mut mdb = make_test_mdb();
+        mdb.file_count = 1;
+        mdb.next_catalog_id = 17;
+        let (_, warnings) = run_catalog_check_on_btree(&mdb, &catalog);
+        assert!(
+            !warnings.iter().any(|e| e.code == "ReservedFieldNonZero"),
+            "all-zero reserved fields should not warn: {:?}",
+            warnings.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage 3: Catalog Name & Thread Key Validation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_catalog_name_valid() {
+        // "File" is a valid 4-byte name — should pass
+        let catalog = make_btree_with_file(16, 0, 0, 0, 0, 0, 0, 0);
+        let mut mdb = make_test_mdb();
+        mdb.file_count = 1;
+        mdb.next_catalog_id = 17;
+        let (errors, _) = run_catalog_check_on_btree(&mdb, &catalog);
+        assert!(
+            !errors.iter().any(|e| e.code == "InvalidCatalogName"),
+            "valid name should not error: {:?}",
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_catalog_name_contains_colon() {
+        let mut catalog = make_btree_with_file(16, 0, 0, 0, 0, 0, 0, 0);
+        // Patch the file name in the catalog — the file record key is at
+        // node 1, record 2. The name starts at key offset+7.
+        // rec 2 starts at: 14 + 82 (rec0) + 54 (rec1) = 150 within node 1
+        // node 1 offset = 512
+        // key name at: 512 + 150 + 7 = 669
+        // Name is "File" (4 bytes). Replace 'F' with ':'
+        catalog[512 + 150 + 7] = 0x3A; // ':' = colon
+        let mut mdb = make_test_mdb();
+        mdb.file_count = 1;
+        mdb.next_catalog_id = 17;
+        let (errors, _) = run_catalog_check_on_btree(&mdb, &catalog);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.code == "InvalidCatalogName" && e.message.contains("colon")),
+            "should detect colon in name: {:?}",
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_catalog_name_empty() {
+        let mut catalog = make_btree_with_file(16, 0, 0, 0, 0, 0, 0, 0);
+        // Patch the file name length to 0 but keep key_len unchanged so
+        // the record data offset stays correct. The name bytes become padding.
+        // rec 2 key: at 512 + 150. name_len at offset +6
+        catalog[512 + 150 + 6] = 0; // name_len = 0
+        let mut mdb = make_test_mdb();
+        mdb.file_count = 1;
+        mdb.next_catalog_id = 17;
+        let (errors, _) = run_catalog_check_on_btree(&mdb, &catalog);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.code == "InvalidCatalogName" && e.message.contains("empty")),
+            "should detect empty name: {:?}",
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_thread_key_name_zero_ok() {
+        // Default btree has thread records with name_len=0 in keys — should be fine
+        let catalog = make_btree_with_file(16, 0, 0, 0, 0, 0, 0, 0);
+        let mut mdb = make_test_mdb();
+        mdb.file_count = 1;
+        mdb.next_catalog_id = 17;
+        let (errors, _) = run_catalog_check_on_btree(&mdb, &catalog);
+        assert!(
+            !errors.iter().any(|e| e.code == "ThreadNameNotEmpty"),
+            "zero-length thread key name should not error: {:?}",
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_thread_key_name_nonzero() {
+        let mut catalog = make_btree_with_file(16, 0, 0, 0, 0, 0, 0, 0);
+        // Patch the file thread key (record 3) to have name_len=1
+        // rec 3 starts at: 14 + 82 + 54 + 114 = 264 within node 1
+        // node 1 offset = 512
+        // key_len at 512+264, name_len at 512+264+6
+        let r3 = 512 + 264;
+        catalog[r3] = 7; // key_len = 7 (was 6)
+        catalog[r3 + 6] = 1; // name_len = 1
+        catalog[r3 + 7] = b'X'; // name byte
+        let mut mdb = make_test_mdb();
+        mdb.file_count = 1;
+        mdb.next_catalog_id = 17;
+        let (errors, _) = run_catalog_check_on_btree(&mdb, &catalog);
+        assert!(
+            errors.iter().any(|e| e.code == "ThreadNameNotEmpty"),
+            "non-zero thread key name should error: {:?}",
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_validate_hfs_name_too_long() {
+        let name = vec![b'A'; 32];
+        assert!(validate_hfs_name(&name).is_some());
+        assert!(validate_hfs_name(&name).unwrap().contains("exceeds"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage 4: Directory Structure tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_directory_reaches_root() {
+        // CNID 2 (root) → parent 1 (virtual root)
+        // CNID 16 → parent 2
+        let mut dirs: HashMap<u32, (u32, Vec<u8>, u16)> = HashMap::new();
+        dirs.insert(2, (1, b"Root".to_vec(), 1));
+        dirs.insert(16, (2, b"Sub".to_vec(), 0));
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+        check_directory_structure(&dirs, &mut errors, &mut warnings);
+        assert!(
+            !errors.iter().any(|e| e.code == "DirectoryLoop"),
+            "normal hierarchy should not have loops"
+        );
+        assert!(
+            !warnings.iter().any(|e| e.code == "NestingDepthWarning"),
+            "shallow hierarchy should not warn"
+        );
+    }
+
+    #[test]
+    fn test_directory_loop_detected() {
+        // CNID 2 (root) → parent 1
+        // CNID 16 → parent 17
+        // CNID 17 → parent 16  (loop!)
+        let mut dirs: HashMap<u32, (u32, Vec<u8>, u16)> = HashMap::new();
+        dirs.insert(2, (1, b"Root".to_vec(), 0));
+        dirs.insert(16, (17, b"A".to_vec(), 0));
+        dirs.insert(17, (16, b"B".to_vec(), 0));
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+        check_directory_structure(&dirs, &mut errors, &mut warnings);
+        assert!(
+            errors.iter().any(|e| e.code == "DirectoryLoop"),
+            "should detect directory loop: {:?}",
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_deep_nesting_warning() {
+        // Build a 101-level chain: 2 → 16 → 17 → ... → 116
+        let mut dirs: HashMap<u32, (u32, Vec<u8>, u16)> = HashMap::new();
+        dirs.insert(2, (1, b"Root".to_vec(), 1));
+        for i in 0..101u32 {
+            let cnid = 16 + i;
+            let parent = if i == 0 { 2 } else { 16 + i - 1 };
+            dirs.insert(cnid, (parent, b"D".to_vec(), if i < 100 { 1 } else { 0 }));
+        }
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+        check_directory_structure(&dirs, &mut errors, &mut warnings);
+        assert!(
+            warnings.iter().any(|e| e.code == "NestingDepthWarning"),
+            "should warn about deep nesting: {:?}",
+            warnings.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_normal_nesting_ok() {
+        // 5-level chain: should not warn
+        let mut dirs: HashMap<u32, (u32, Vec<u8>, u16)> = HashMap::new();
+        dirs.insert(2, (1, b"Root".to_vec(), 1));
+        for i in 0..5u32 {
+            let cnid = 16 + i;
+            let parent = if i == 0 { 2 } else { 16 + i - 1 };
+            dirs.insert(cnid, (parent, b"D".to_vec(), if i < 4 { 1 } else { 0 }));
+        }
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+        check_directory_structure(&dirs, &mut errors, &mut warnings);
+        assert!(
+            !warnings.iter().any(|e| e.code == "NestingDepthWarning"),
+            "shallow nesting should not warn"
+        );
+        assert!(!errors.iter().any(|e| e.code == "DirectoryLoop"), "no loop");
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage 5: Alternate MDB & Embedded HFS+ Wrapper tests
+    // -----------------------------------------------------------------------
+
+    fn make_alt_mdb_sector(mdb: &HfsMasterDirectoryBlock) -> [u8; 512] {
+        // Build an alt MDB sector matching the primary
+        let mut alt = [0u8; 512];
+        BigEndian::write_u16(&mut alt[0..2], 0x4244); // signature
+        BigEndian::write_u16(&mut alt[14..16], mdb.volume_bitmap_block);
+        BigEndian::write_u16(&mut alt[18..20], mdb.total_blocks);
+        BigEndian::write_u32(&mut alt[20..24], mdb.block_size);
+        BigEndian::write_u16(&mut alt[28..30], mdb.first_alloc_block);
+        alt
+    }
+
+    #[test]
+    fn test_alternate_mdb_matches() {
+        let mdb = make_test_mdb();
+        let alt = make_alt_mdb_sector(&mdb);
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+        check_alternate_mdb(&mdb, &alt, &mut errors, &mut warnings);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.code == "AlternateMdbMismatch" || e.code == "AlternateMdbMissing"),
+            "matching alt MDB should not error: {:?}",
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_alternate_mdb_block_size_mismatch() {
+        let mdb = make_test_mdb();
+        let mut alt = make_alt_mdb_sector(&mdb);
+        BigEndian::write_u32(&mut alt[20..24], 8192); // different block size
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+        check_alternate_mdb(&mdb, &alt, &mut errors, &mut warnings);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.code == "AlternateMdbMismatch" && e.message.contains("block size")),
+            "should detect block size mismatch: {:?}",
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_alternate_mdb_missing_signature() {
+        let mdb = make_test_mdb();
+        let alt = [0u8; 512]; // all zeros — bad signature
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+        check_alternate_mdb(&mdb, &alt, &mut errors, &mut warnings);
+        assert!(
+            errors.iter().any(|e| e.code == "AlternateMdbMissing"),
+            "should detect missing alt MDB: {:?}",
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_embedded_hfs_plus_valid_wrapper() {
+        let mut mdb = make_test_mdb();
+        mdb.embedded_signature = 0x482B;
+        mdb.embedded_start_block = 10;
+        mdb.embedded_block_count = 50;
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+        check_embedded_hfs_plus(&mdb, &mut errors, &mut warnings);
+        assert!(
+            !errors.iter().any(|e| e.code == "EmbeddedHfsPlusInvalid"),
+            "valid embedded region should not error: {:?}",
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+        // Should have an informational warning
+        assert!(
+            warnings
+                .iter()
+                .any(|e| e.code == "EmbeddedHfsPlusInvalid" && e.message.contains("wrapper")),
+            "should warn about HFS wrapper: {:?}",
+            warnings.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_embedded_hfs_plus_out_of_range() {
+        let mut mdb = make_test_mdb();
+        mdb.embedded_signature = 0x482B;
+        mdb.embedded_start_block = 80;
+        mdb.embedded_block_count = 30; // 80+30=110 > total_blocks=100
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+        check_embedded_hfs_plus(&mdb, &mut errors, &mut warnings);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.code == "EmbeddedHfsPlusInvalid" && e.message.contains("exceeds")),
+            "should detect out-of-range embedded region: {:?}",
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_embedded_unknown_signature() {
+        let mut mdb = make_test_mdb();
+        mdb.embedded_signature = 0x1234;
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+        check_embedded_hfs_plus(&mdb, &mut errors, &mut warnings);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.code == "EmbeddedHfsPlusInvalid" && e.message.contains("unknown")),
+            "should detect unknown embedded signature: {:?}",
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage 6: Bad Block File Bitmap Cross-Check tests
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal extents overflow B-tree with one extent record for the given file_id.
+    fn make_extents_btree_with_bad_blocks(
+        file_id: u32,
+        start_block: u16,
+        block_count: u16,
+    ) -> Vec<u8> {
+        let node_size = 512usize;
+        let num_nodes = 4usize;
+        let mut data = vec![0u8; node_size * num_nodes];
+
+        // Node 0: Header node
+        data[8] = BTREE_HEADER_NODE as u8;
+        BigEndian::write_u16(&mut data[10..12], 3); // 3 records
+
+        let hr = 14;
+        BigEndian::write_u16(&mut data[hr..hr + 2], 1); // depth = 1
+        BigEndian::write_u32(&mut data[hr + 2..hr + 6], 1); // root_node = 1
+        BigEndian::write_u32(&mut data[hr + 6..hr + 10], 1); // leaf_records = 1
+        BigEndian::write_u32(&mut data[hr + 10..hr + 14], 1); // first_leaf = 1
+        BigEndian::write_u32(&mut data[hr + 14..hr + 18], 1); // last_leaf = 1
+        BigEndian::write_u16(&mut data[hr + 18..hr + 20], node_size as u16);
+        BigEndian::write_u16(&mut data[hr + 20..hr + 22], 7); // max_key_len
+        BigEndian::write_u32(&mut data[hr + 22..hr + 26], num_nodes as u32);
+        BigEndian::write_u32(&mut data[hr + 26..hr + 30], (num_nodes - 2) as u32);
+
+        let ot = node_size;
+        BigEndian::write_u16(&mut data[ot - 2..ot], 14);
+        BigEndian::write_u16(&mut data[ot - 4..ot - 2], 0x78);
+        BigEndian::write_u16(&mut data[ot - 6..ot - 4], 0xf8);
+        BigEndian::write_u16(&mut data[ot - 8..ot - 6], node_size as u16 - 8);
+
+        // Node bitmap: mark nodes 0 and 1
+        data[0xf8] = 0b11000000;
+
+        // Node 1: Leaf node with 1 extent record
+        let n1 = node_size;
+        data[n1 + 8] = BTREE_LEAF_NODE as u8;
+        data[n1 + 9] = 1;
+        BigEndian::write_u16(&mut data[n1 + 10..n1 + 12], 1);
+
+        // Record 0: key(8 bytes) + 3 extent descriptors(12 bytes) = 20 bytes
+        let r0 = n1 + 14;
+        data[r0] = 7; // key_len = 7
+        data[r0 + 1] = 0x00; // fork_type = data
+        BigEndian::write_u32(&mut data[r0 + 2..r0 + 6], file_id);
+        BigEndian::write_u16(&mut data[r0 + 6..r0 + 8], 0); // startBlock
+
+        // Record data at even offset: r0 + 1 + 7 = r0+8 (even)
+        let rd = r0 + 8;
+        // First extent descriptor
+        BigEndian::write_u16(&mut data[rd..rd + 2], start_block);
+        BigEndian::write_u16(&mut data[rd + 2..rd + 4], block_count);
+        // Remaining 2 extents are zero
+
+        // Offset table for leaf
+        let lot = n1 + node_size;
+        BigEndian::write_u16(&mut data[lot - 2..lot], 14);
+        BigEndian::write_u16(&mut data[lot - 4..lot - 2], (14 + 20) as u16);
+
+        data
+    }
+
+    #[test]
+    fn test_no_bad_block_file_ok() {
+        // No extents overflow → no bad block issues
+        let mdb = make_test_mdb();
+        let catalog = make_minimal_btree(512);
+        let bitmap = vec![0u8; 13]; // 100 bits
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+        let header = BTreeHeader::read(&catalog);
+        check_extents_and_bitmap(
+            &mdb,
+            &catalog,
+            &header,
+            &bitmap,
+            None,
+            &mut errors,
+            &mut warnings,
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|e| e.code == "BadBlockExtentNotInBitmap"),
+            "no bad block file should produce no warnings"
+        );
+    }
+
+    #[test]
+    fn test_bad_block_extents_in_bitmap_ok() {
+        let mdb = make_test_mdb();
+        let catalog = make_minimal_btree(512);
+        // Bad block file (CNID 5) claims blocks 50-52
+        let ext_data = make_extents_btree_with_bad_blocks(5, 50, 3);
+        // Bitmap: mark blocks 50-52 as allocated
+        let mut bitmap = vec![0u8; 13]; // 100 bits
+        for b in 50..53u32 {
+            bitmap_set_bit_be(&mut bitmap, b);
+        }
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+        let header = BTreeHeader::read(&catalog);
+        check_extents_and_bitmap(
+            &mdb,
+            &catalog,
+            &header,
+            &bitmap,
+            Some(&ext_data),
+            &mut errors,
+            &mut warnings,
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|e| e.code == "BadBlockExtentNotInBitmap"),
+            "allocated bad blocks should not warn: {:?}",
+            warnings.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_bad_block_extent_not_in_bitmap() {
+        let mdb = make_test_mdb();
+        let catalog = make_minimal_btree(512);
+        // Bad block file (CNID 5) claims blocks 50-52
+        let ext_data = make_extents_btree_with_bad_blocks(5, 50, 3);
+        // Bitmap: block 50 is free (not allocated)
+        let bitmap = vec![0u8; 13]; // all free
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+        let header = BTreeHeader::read(&catalog);
+        check_extents_and_bitmap(
+            &mdb,
+            &catalog,
+            &header,
+            &bitmap,
+            Some(&ext_data),
+            &mut errors,
+            &mut warnings,
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|e| e.code == "BadBlockExtentNotInBitmap"),
+            "free bad block should warn: {:?}",
+            warnings.iter().map(|e| &e.message).collect::<Vec<_>>()
         );
     }
 

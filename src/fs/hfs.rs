@@ -572,11 +572,33 @@ impl<R: Read + Seek> HfsFilesystem<R> {
         } else {
             None
         };
+        // Read the alternate MDB — located at the sector immediately after
+        // the last allocation block on the volume.
+        let alt_mdb_sector = if self.mdb.block_size > 0 && self.mdb.total_blocks > 0 {
+            let sectors_per_block = self.mdb.block_size as u64 / 512;
+            let last_alloc_sector = self.mdb.first_alloc_block as u64
+                + self.mdb.total_blocks as u64 * sectors_per_block;
+            let alt_offset = self.partition_offset + last_alloc_sector * 512;
+            let mut alt_buf = [0u8; 512];
+            if self
+                .reader
+                .seek(SeekFrom::Start(alt_offset))
+                .and_then(|_| self.reader.read_exact(&mut alt_buf))
+                .is_ok()
+            {
+                Some(alt_buf)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         Ok(super::hfs_fsck::check_hfs_integrity(
             &self.mdb,
             &self.catalog_data,
             self.bitmap.as_ref().unwrap(),
             extents_data.as_deref(),
+            alt_mdb_sector.as_ref(),
         ))
     }
 
