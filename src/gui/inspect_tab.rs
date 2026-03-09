@@ -470,6 +470,17 @@ impl InspectTab {
                 self.init_resize_popup(devices);
             }
 
+            // Close button — releases the device (remounts it) and clears results
+            if self.selected_device_idx.is_some() && !inspect_running && !export_running {
+                if ui.button("Close Device").clicked() {
+                    self.browse_view.close();
+                    self.clear_results();
+                    self.selected_device_idx = None;
+                    self.prev_device_idx = None;
+                    log.info("Device closed and remounted.");
+                }
+            }
+
             if export_running {
                 if ui.button("Cancel Export").clicked() {
                     if let Some(ref status_arc) = self.export_status {
