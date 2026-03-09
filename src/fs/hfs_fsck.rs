@@ -174,13 +174,46 @@ pub(crate) fn check_hfs_integrity(
     check_embedded_hfs_plus(mdb, &mut errors, &mut warnings);
 
     // Phase 2: B-tree structure
+    //
+    // A blank HFS volume (no files) may have an empty or minimal catalog B-tree.
+    // If the volume reports zero files and zero folders and the catalog data is
+    // too small to contain a valid B-tree header, treat this as a valid empty
+    // volume rather than an error.
+    let is_empty_volume = mdb.file_count == 0 && mdb.folder_count == 0;
+
+    if catalog_data.len() < 44 {
+        // Need at least 44 bytes to read the B-tree header (14-byte node descriptor
+        // + 30 bytes of header record fields).
+        if !is_empty_volume {
+            errors.push(hfs_issue(
+                HfsFsckCode::HeaderNodeBadKind,
+                "catalog B-tree data too small to contain a header",
+            ));
+        }
+        let repairable = errors.iter().any(|e| e.repairable);
+        return FsckResult {
+            errors,
+            warnings,
+            stats: build_stats(
+                files_checked,
+                directories_checked,
+                leaf_nodes_visited,
+                orphaned_threads,
+            ),
+            repairable,
+            orphaned_entries: Vec::new(),
+        };
+    }
+
     let header = BTreeHeader::read(catalog_data);
     let node_size = header.node_size as usize;
     if node_size == 0 || catalog_data.len() < node_size {
-        errors.push(hfs_issue(
-            HfsFsckCode::HeaderNodeBadKind,
-            "catalog B-tree node size is zero or catalog data too small",
-        ));
+        if !is_empty_volume {
+            errors.push(hfs_issue(
+                HfsFsckCode::HeaderNodeBadKind,
+                "catalog B-tree node size is zero or catalog data too small",
+            ));
+        }
         let repairable = errors.iter().any(|e| e.repairable);
         return FsckResult {
             errors,
@@ -294,13 +327,25 @@ pub(crate) fn repair_hfs(
             .push("Fixed MDB signature to 0x4244".into());
     }
 
-    // Need a valid node_size to proceed
+    // Need a valid node_size to proceed.  On a blank volume (no files, no
+    // folders) the catalog may be empty/zeroed — nothing to repair.
+    let is_empty_volume = mdb.file_count == 0 && mdb.folder_count == 0;
+    if catalog_data.len() < 44 {
+        if !is_empty_volume {
+            report
+                .fixes_failed
+                .push("Cannot repair: catalog B-tree data too small to contain a header".into());
+        }
+        return report;
+    }
     let header = BTreeHeader::read(catalog_data);
     let node_size = header.node_size as usize;
     if node_size == 0 || catalog_data.len() < node_size {
-        report
-            .fixes_failed
-            .push("Cannot repair: B-tree node size is zero or catalog data too small".into());
+        if !is_empty_volume {
+            report
+                .fixes_failed
+                .push("Cannot repair: B-tree node size is zero or catalog data too small".into());
+        }
         return report;
     }
 
@@ -6504,6 +6549,50 @@ mod tests {
                 .iter()
                 .map(|e| e.message.as_str())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_fsck_blank_volume_empty_catalog() {
+        // A blank HFS volume with no files may have an empty catalog B-tree.
+        // This should NOT be reported as an error.
+        let mdb = make_test_mdb(); // file_count=0, folder_count=0
+        let bitmap = vec![0u8; 16];
+        let catalog_data: &[u8] = &[];
+        let result = check_hfs_integrity(&mdb, catalog_data, &bitmap, None, None);
+        assert!(
+            result.is_clean(),
+            "blank volume with empty catalog should be clean, got errors: {:?}",
+            result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_fsck_blank_volume_zeroed_catalog() {
+        // A blank HFS volume whose catalog is allocated but zeroed out.
+        // node_size reads as 0 — should not be flagged on an empty volume.
+        let mdb = make_test_mdb();
+        let bitmap = vec![0u8; 16];
+        let catalog_data = vec![0u8; 512];
+        let result = check_hfs_integrity(&mdb, &catalog_data, &bitmap, None, None);
+        assert!(
+            result.is_clean(),
+            "blank volume with zeroed catalog should be clean, got errors: {:?}",
+            result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_fsck_nonempty_volume_zeroed_catalog_is_error() {
+        // A volume that claims to have files but has a zeroed catalog IS an error.
+        let mut mdb = make_test_mdb();
+        mdb.file_count = 5;
+        let bitmap = vec![0u8; 16];
+        let catalog_data = vec![0u8; 512];
+        let result = check_hfs_integrity(&mdb, &catalog_data, &bitmap, None, None);
+        assert!(
+            !result.is_clean(),
+            "non-empty volume with zeroed catalog should have errors"
         );
     }
 }
