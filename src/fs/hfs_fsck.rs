@@ -1830,14 +1830,20 @@ fn check_alternate_mdb(
     mdb: &HfsMasterDirectoryBlock,
     alt_sector: &[u8; 512],
     errors: &mut Vec<FsckIssue>,
-    _warnings: &mut Vec<FsckIssue>,
+    warnings: &mut Vec<FsckIssue>,
 ) {
     let alt_sig = BigEndian::read_u16(&alt_sector[0..2]);
     if alt_sig != 0x4244 {
-        errors.push(hfs_issue(
+        // The alternate MDB is a backup copy located right after the allocation
+        // area.  When the partition is larger than the filesystem's allocation
+        // blocks, the alternate MDB may be at the partition's penultimate sector
+        // instead — a location we cannot determine without knowing the partition
+        // size.  Treat a missing alternate MDB as a warning, not an error,
+        // because the primary MDB (validated in Phase 1) is what matters.
+        warnings.push(hfs_issue(
             HfsFsckCode::AlternateMdbMissing,
             format!(
-                "alternate MDB signature 0x{:04X} (expected 0x4244)",
+                "alternate MDB not found at expected offset (signature 0x{:04X})",
                 alt_sig
             ),
         ));
@@ -5750,6 +5756,11 @@ mod tests {
             "matching alt MDB should not error: {:?}",
             errors.iter().map(|e| &e.message).collect::<Vec<_>>()
         );
+        assert!(
+            !warnings.iter().any(|e| e.code == "AlternateMdbMissing"),
+            "matching alt MDB should not warn: {:?}",
+            warnings.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -5776,10 +5787,17 @@ mod tests {
         let mut errors = Vec::new();
         let mut warnings = Vec::new();
         check_alternate_mdb(&mdb, &alt, &mut errors, &mut warnings);
+        // Missing alternate MDB is a warning, not an error — the primary MDB
+        // is what matters and the alternate may be at a different offset when
+        // the partition is larger than the allocation area.
         assert!(
-            errors.iter().any(|e| e.code == "AlternateMdbMissing"),
-            "should detect missing alt MDB: {:?}",
-            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+            warnings.iter().any(|e| e.code == "AlternateMdbMissing"),
+            "should warn about missing alt MDB: {:?}",
+            warnings.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+        assert!(
+            !errors.iter().any(|e| e.code == "AlternateMdbMissing"),
+            "missing alt MDB should not be an error"
         );
     }
 
