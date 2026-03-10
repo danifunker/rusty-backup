@@ -248,29 +248,6 @@ pub const BTREE_HEADER_NODE: i8 = 1;
 #[allow(dead_code)]
 pub const BTREE_MAP_NODE: i8 = 2;
 
-/// Mac OS forces all catalog B-tree index keys to this length (0x25 = 37 decimal).
-/// Key structure: reserved(1) + parentID(4) + nameLen(1) + name(up to 31) = 37 max.
-pub const HFS_CAT_MAX_KEY_LEN: u8 = 0x25;
-
-/// Normalize a catalog key for use in an index record.
-///
-/// Mac OS expects all catalog index record keys to have key_len = 0x25,
-/// zero-padded beyond the actual key data. This matches the `n_index`
-/// function in hfsutils which forces `ckrKeyLen = 0x25`.
-///
-/// Returns: `[0x25][key_data zero-padded to 37 bytes]` = 38 bytes total.
-pub fn normalize_catalog_index_key(key: &[u8]) -> Vec<u8> {
-    let max = HFS_CAT_MAX_KEY_LEN as usize; // 37
-    let mut result = vec![0u8; 1 + max]; // 38 bytes: key_len + 37 bytes of key data
-    result[0] = HFS_CAT_MAX_KEY_LEN;
-    // Copy actual key data (skip the key_len byte from source)
-    if key.len() > 1 {
-        let copy_len = (key.len() - 1).min(max);
-        result[1..1 + copy_len].copy_from_slice(&key[1..1 + copy_len]);
-    }
-    result
-}
-
 /// Read the B-tree header record from catalog_data (node 0, record 0 at offset 14).
 /// Returns (depth, root_node, leaf_records, first_leaf, last_leaf, node_size,
 ///          max_key_len, total_nodes, free_nodes).
@@ -421,47 +398,31 @@ where
     Ok(insert_pos)
 }
 
-/// Remove record at `rec_idx` from a B-tree node and compact data.
-///
-/// Rebuilds the node data area sequentially (like `btree_insert_record`) so
-/// that record boundaries in the offset table are contiguous. Without
-/// compaction, `btree_record_range` would report inflated record lengths
-/// because it uses consecutive offset table entries to determine boundaries.
+/// Remove record at `rec_idx` from a B-tree node and compact the offset table.
 pub fn btree_remove_record(node: &mut [u8], node_size: usize, rec_idx: usize) {
     let num_records = BigEndian::read_u16(&node[10..12]) as usize;
     if rec_idx >= num_records {
         return;
     }
 
-    // Collect all records except the one being removed
-    let mut records: Vec<Vec<u8>> = Vec::with_capacity(num_records - 1);
-    for i in 0..num_records {
-        if i == rec_idx {
-            continue;
-        }
-        let (rec_start, rec_end) = btree_record_range(node, node_size, i);
-        if rec_start < rec_end && rec_end <= node_size {
-            records.push(node[rec_start..rec_end].to_vec());
-        }
+    // Read all offsets (records + free-space)
+    let mut offsets: Vec<u16> = Vec::with_capacity(num_records + 1);
+    for i in 0..=num_records {
+        let pos = node_size - 2 * (i + 1);
+        offsets.push(BigEndian::read_u16(&node[pos..pos + 2]));
     }
 
-    // Rebuild node: write all remaining records sequentially from offset 14
-    let mut write_pos = 14usize;
-    for (i, rec) in records.iter().enumerate() {
-        node[write_pos..write_pos + rec.len()].copy_from_slice(rec);
-        let opos = node_size - 2 * (i + 1);
-        BigEndian::write_u16(&mut node[opos..opos + 2], write_pos as u16);
-        write_pos += rec.len();
-    }
+    // Remove the offset for rec_idx
+    offsets.remove(rec_idx);
 
-    // Write free-space offset
-    let fpos = node_size - 2 * (records.len() + 1);
-    BigEndian::write_u16(&mut node[fpos..fpos + 2], write_pos as u16);
+    // Note: we don't compact the record data area — the space simply becomes
+    // internal fragmentation. HFS implementations tolerate this; the free-space
+    // offset still correctly tracks the end of all record data.
 
-    // Clear leftover data between write_pos and the offset table
-    let offset_table_start = node_size - 2 * (records.len() + 1);
-    if write_pos < offset_table_start {
-        node[write_pos..offset_table_start].fill(0);
+    // Write offsets back (now one fewer)
+    for (i, &off) in offsets.iter().enumerate() {
+        let pos = node_size - 2 * (i + 1);
+        BigEndian::write_u16(&mut node[pos..pos + 2], off);
     }
 
     // Clear the now-unused last offset slot
@@ -469,7 +430,7 @@ pub fn btree_remove_record(node: &mut [u8], node_size: usize, rec_idx: usize) {
     BigEndian::write_u16(&mut node[clear_pos..clear_pos + 2], 0);
 
     // Update num_records
-    BigEndian::write_u16(&mut node[10..12], records.len() as u16);
+    BigEndian::write_u16(&mut node[10..12], (num_records - 1) as u16);
 }
 
 // ---------------------------------------------------------------------------
@@ -521,13 +482,7 @@ pub fn btree_free_node(catalog_data: &mut [u8], node_size: usize, node_idx: u32)
 
 /// Initialize a new empty node in catalog_data at the given node_idx.
 /// Sets the node kind and height. Returns a mutable slice to the node.
-pub(crate) fn init_node(
-    catalog_data: &mut [u8],
-    node_size: usize,
-    node_idx: u32,
-    kind: i8,
-    height: u8,
-) {
+fn init_node(catalog_data: &mut [u8], node_size: usize, node_idx: u32, kind: i8, height: u8) {
     let offset = node_idx as usize * node_size;
     let node = &mut catalog_data[offset..offset + node_size];
     // Zero the node
@@ -639,11 +594,14 @@ pub fn btree_split_leaf(
         header.last_leaf_node = new_idx;
     }
 
-    // The separator key is just the key portion of the first record of the new node
-    // (key_len byte + key data), without pad or record data.
+    // The separator key is just the key portion of the first record of the new node.
+    // Key length is in byte 0; key data is bytes 0..1+key_len, padded to even.
     let full_rec = &records[split_point];
     let key_len = full_rec[0] as usize;
-    let key_end = 1 + key_len;
+    let mut key_end = 1 + key_len;
+    if key_end % 2 != 0 {
+        key_end += 1; // pad to even boundary
+    }
     let split_key = full_rec[..key_end.min(full_rec.len())].to_vec();
 
     Ok((new_idx, split_key))
@@ -669,11 +627,8 @@ pub fn btree_insert_into_index<F>(
 where
     F: Fn(&[u8], &[u8]) -> Ordering,
 {
-    // Build index record: normalized_key + child_pointer
-    // Mac OS forces all catalog index keys to length 0x25, zero-padded.
-    // With key_len=0x25, HFS_RECKEYSKIP = (1+37+1)&~1 = 38, so data starts
-    // at offset 38 (even), and the full record is always 42 bytes.
-    let mut index_record = normalize_catalog_index_key(split_key);
+    // Build index record: split_key + child_pointer
+    let mut index_record = split_key.to_vec();
     let mut ptr = [0u8; 4];
     BigEndian::write_u32(&mut ptr, child_node);
     index_record.extend_from_slice(&ptr);
@@ -814,13 +769,11 @@ fn split_index_node(
         BigEndian::write_u16(&mut node[10..12], count as u16);
     }
 
-    // The separator key is just the key portion (key_len byte + key data) of the
-    // first record of the new node, without pad or child pointer.
+    // The separator key is just the key portion of the first record of the new node.
+    // For index records, each record is key + 4-byte child pointer, so key = record[..len-4].
     let full_rec = &records[split_point];
-    let split_key = if !full_rec.is_empty() {
-        let kl = full_rec[0] as usize;
-        let key_end = (1 + kl).min(full_rec.len());
-        full_rec[..key_end].to_vec()
+    let split_key = if full_rec.len() > 4 {
+        full_rec[..full_rec.len() - 4].to_vec()
     } else {
         full_rec.clone()
     };
@@ -857,26 +810,23 @@ pub fn btree_grow_root(
     // 1. First child (old_root): use the first key of old_root + pointer to old_root
     // 2. Second child (new_sibling): split_key + pointer to new_sibling
 
-    // Get first key of old_root (just the key portion, not the full record)
-    let (first_rec_start, _first_rec_end) = btree_record_range(
+    // Get first key of old_root (must read before borrowing new root mutably)
+    let (first_rec_start, first_rec_end) = btree_record_range(
         &catalog_data[old_root_offset..old_root_offset + node_size],
         node_size,
         0,
     );
-    let key_len = catalog_data[old_root_offset + first_rec_start] as usize;
-    let key_end = first_rec_start + 1 + key_len;
     let first_key =
-        catalog_data[old_root_offset + first_rec_start..old_root_offset + key_end].to_vec();
+        catalog_data[old_root_offset + first_rec_start..old_root_offset + first_rec_end].to_vec();
 
-    // Record 1: normalized first_key + old_root pointer
-    // Mac OS forces all catalog index keys to 0x25 length.
-    let mut rec1 = normalize_catalog_index_key(&first_key);
+    // Record 1: first_key + old_root pointer
+    let mut rec1 = first_key;
     let mut ptr1 = [0u8; 4];
     BigEndian::write_u32(&mut ptr1, old_root);
     rec1.extend_from_slice(&ptr1);
 
-    // Record 2: normalized split_key + new_sibling pointer
-    let mut rec2 = normalize_catalog_index_key(split_key);
+    // Record 2: split_key + new_sibling pointer
+    let mut rec2 = split_key.to_vec();
     let mut ptr2 = [0u8; 4];
     BigEndian::write_u32(&mut ptr2, new_sibling);
     rec2.extend_from_slice(&ptr2);
