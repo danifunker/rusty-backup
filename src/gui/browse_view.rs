@@ -124,6 +124,8 @@ pub struct BrowseView {
     fsck_result: Option<rusty_backup::fs::FsckResult>,
     /// Whether to show the fsck results popup.
     show_fsck_popup: bool,
+    /// Whether to show debug-level fsck messages.
+    show_fsck_debug: bool,
     /// Whether to show the repair confirmation dialog.
     show_repair_confirm: bool,
     /// Result of a repair operation.
@@ -185,6 +187,7 @@ impl Default for BrowseView {
             blessed_folder: None,
             fsck_result: None,
             show_fsck_popup: false,
+            show_fsck_debug: false,
             show_repair_confirm: false,
             repair_report: None,
             tree_text: None,
@@ -1756,21 +1759,40 @@ impl BrowseView {
                             });
                     }
 
-                    // Warnings
-                    if !result.warnings.is_empty() {
+                    // Warnings (filter out debug-level unless toggled)
+                    let visible_warnings: Vec<_> = result
+                        .warnings
+                        .iter()
+                        .filter(|w| !w.debug || self.show_fsck_debug)
+                        .collect();
+                    let has_debug = result.warnings.iter().any(|w| w.debug);
+                    if !visible_warnings.is_empty() {
                         ui.separator();
                         ui.label(egui::RichText::new("Warnings:").strong());
                         egui::ScrollArea::vertical()
                             .id_salt("fsck_warnings")
                             .max_height(200.0)
                             .show(ui, |ui| {
-                                for issue in &result.warnings {
-                                    ui.colored_label(
-                                        egui::Color32::from_rgb(255, 200, 100),
-                                        format!("[{}] {}", issue.code, issue.message),
-                                    );
+                                for issue in &visible_warnings {
+                                    if issue.debug {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(150, 150, 150),
+                                            format!("[DEBUG] {}", issue.message),
+                                        );
+                                    } else {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(255, 200, 100),
+                                            format!("[{}] {}", issue.code, issue.message),
+                                        );
+                                    }
                                 }
                             });
+                    }
+                    if has_debug {
+                        ui.checkbox(
+                            &mut self.show_fsck_debug,
+                            "Show debug messages",
+                        );
                     }
 
                     // Repair button — only for repairable errors on non-archive sources
