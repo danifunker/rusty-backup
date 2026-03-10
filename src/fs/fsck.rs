@@ -34,6 +34,9 @@ pub struct FsckIssue {
     pub message: String,
     /// Whether this issue can be automatically repaired.
     pub repairable: bool,
+    /// Debug-level issue: only shown when debug output is enabled.
+    /// These are cosmetic/harmless findings (e.g. tiny wasted space).
+    pub debug: bool,
 }
 
 /// Aggregate statistics from a filesystem check.

@@ -120,6 +120,16 @@ fn hfs_issue(code: HfsFsckCode, message: impl Into<String>) -> FsckIssue {
         code: format!("{:?}", code),
         message: message.into(),
         repairable: is_repairable(code),
+        debug: false,
+    }
+}
+
+fn hfs_debug_issue(code: HfsFsckCode, message: impl Into<String>) -> FsckIssue {
+    FsckIssue {
+        code: format!("{:?}", code),
+        message: message.into(),
+        repairable: false,
+        debug: true,
     }
 }
 
@@ -3652,33 +3662,52 @@ fn check_extents_and_bitmap(
         }
     }
 
-    // Compare computed bitmap vs actual volume bitmap
-    let mut mismatch_count = 0;
+    // Compare computed bitmap vs actual volume bitmap.
+    //
+    // "allocated in catalog but free in bitmap" is a real warning — a file's
+    // data block isn't protected, so it could be overwritten.
+    //
+    // "free in catalog but allocated in bitmap" is harmless — just a small
+    // amount of wasted space.  DiskWarrior also leaves these behind after
+    // directory rebuilds.  We report them as debug-level only.
+    let mut real_mismatch_count = 0usize;
+    let mut wasted_block_count = 0usize;
     for block in 0..total_blocks {
         let computed = bitmap_test_bit_be(&computed_bitmap, block);
         let actual = bitmap_test_bit_be(bitmap, block);
         if computed != actual {
-            mismatch_count += 1;
-            if mismatch_count <= MAX_BITMAP_MISMATCHES {
-                let direction = if computed {
-                    "allocated in catalog but free in bitmap"
-                } else {
-                    "free in catalog but allocated in bitmap"
-                };
-                warnings.push(hfs_issue(
-                    HfsFsckCode::BitmapMismatch,
-                    format!("block {}: {}", block, direction),
-                ));
+            if computed {
+                // File references this block but bitmap says free — real problem
+                real_mismatch_count += 1;
+                if real_mismatch_count <= MAX_BITMAP_MISMATCHES {
+                    warnings.push(hfs_issue(
+                        HfsFsckCode::BitmapMismatch,
+                        format!("block {}: allocated in catalog but free in bitmap", block),
+                    ));
+                }
+            } else {
+                // Bitmap says allocated but no file uses it — just wasted space
+                wasted_block_count += 1;
             }
         }
     }
-    if mismatch_count > MAX_BITMAP_MISMATCHES {
+    if real_mismatch_count > MAX_BITMAP_MISMATCHES {
         warnings.push(hfs_issue(
             HfsFsckCode::BitmapMismatch,
             format!(
                 "... and {} more bitmap mismatches (total {})",
-                mismatch_count - MAX_BITMAP_MISMATCHES,
-                mismatch_count
+                real_mismatch_count - MAX_BITMAP_MISMATCHES,
+                real_mismatch_count
+            ),
+        ));
+    }
+    if wasted_block_count > 0 {
+        warnings.push(hfs_debug_issue(
+            HfsFsckCode::BitmapMismatch,
+            format!(
+                "{} block(s) marked allocated in bitmap but not referenced by any file \
+                 (probably just small wasted space)",
+                wasted_block_count
             ),
         ));
     }

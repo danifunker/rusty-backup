@@ -2579,6 +2579,83 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // manual test — requires real HFS image
+    fn test_fsck_pm6100_compare() {
+        let paths = [
+            (
+                "/Volumes/Software/VintageSystemBackups/HD40_imagedPowerMac6100.hda",
+                "ORIGINAL",
+            ),
+            (
+                "/Volumes/Software/VintageSystemBackups/DiskWarriorFixed/HD50_pm6100 hdd.hda",
+                "DISKWARRIOR FIXED",
+            ),
+        ];
+
+        for (path, label) in &paths {
+            let p = std::path::Path::new(path);
+            if !p.exists() {
+                eprintln!("Skipping {}: not found", path);
+                continue;
+            }
+            eprintln!("\n========== {} ==========", label);
+            eprintln!("File: {}", path);
+
+            let file = std::fs::File::open(p).unwrap();
+            let mut reader = std::io::BufReader::new(file);
+
+            // Find Apple_HFS partition in APM
+            let mut hfs_offset = 0u64;
+            for i in 1..64u64 {
+                use std::io::{Read, Seek};
+                reader.seek(SeekFrom::Start(i * 512)).unwrap();
+                let mut buf = [0u8; 512];
+                if reader.read_exact(&mut buf).is_err() {
+                    break;
+                }
+                if buf[0] != 0x50 || buf[1] != 0x4D {
+                    break;
+                }
+                let start = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+                let count = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
+                let tstr: String = buf[48..80]
+                    .iter()
+                    .take_while(|&&b| b != 0)
+                    .map(|&b| b as char)
+                    .collect();
+                eprintln!(
+                    "  Part {}: {:32} start={:>8} blocks={:>8}",
+                    i, tstr, start, count
+                );
+                if tstr == "Apple_HFS" && hfs_offset == 0 {
+                    hfs_offset = start as u64 * 512;
+                }
+            }
+            eprintln!("  -> HFS partition at offset {}", hfs_offset);
+
+            let file2 = std::fs::File::open(p).unwrap();
+            let mut fs = HfsFilesystem::open(file2, hfs_offset).unwrap();
+            let result = fs.fsck().unwrap();
+
+            eprintln!("=== ERRORS ({}) ===", result.errors.len());
+            for e in &result.errors {
+                eprintln!("  [{}] {}", e.code, e.message);
+            }
+            eprintln!("=== WARNINGS ({}) ===", result.warnings.len());
+            for w in &result.warnings {
+                eprintln!("  [{}] {}", w.code, w.message);
+            }
+            eprintln!(
+                "=== STATS: {} files, {} dirs ===",
+                result.stats.files_checked, result.stats.directories_checked
+            );
+            for (k, v) in &result.stats.extra {
+                eprintln!("  {} = {}", k, v);
+            }
+        }
+    }
+
+    #[test]
     fn test_fsck_clean_fresh_image() {
         let img = make_editable_hfs_image();
         let cursor = Cursor::new(img);
