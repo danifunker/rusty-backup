@@ -470,6 +470,17 @@ impl InspectTab {
                 self.init_resize_popup(devices);
             }
 
+            // Close button — releases the device (remounts it) and clears results
+            if self.selected_device_idx.is_some() && !inspect_running && !export_running {
+                if ui.button("Close Device").clicked() {
+                    self.browse_view.close();
+                    self.clear_results();
+                    self.selected_device_idx = None;
+                    self.prev_device_idx = None;
+                    log.info("Device closed and remounted.");
+                }
+            }
+
             if export_running {
                 if ui.button("Cancel Export").clicked() {
                     if let Some(ref status_arc) = self.export_status {
@@ -2226,13 +2237,30 @@ impl InspectTab {
                         if part.is_extended_container {
                             continue;
                         }
+                        // Skip GPT protective partitions (0xEE) — they span the
+                        // entire disk and have no filesystem to analyze.
+                        if part.partition_type_byte == 0xEE {
+                            continue;
+                        }
                         if let Ok(f) = device_file.try_clone() {
-                            if let Some(min_size) = rusty_backup::fs::effective_partition_size(
-                                BufReader::new(f),
-                                part.start_lba * 512,
-                                part.partition_type_byte,
-                                part.partition_type_string.as_deref(),
-                            ) {
+                            // Use SectorAlignedReader for raw devices (/dev/rdiskN)
+                            // which require sector-aligned seeks and reads.
+                            let min_size = if is_device {
+                                rusty_backup::fs::effective_partition_size(
+                                    rusty_backup::os::SectorAlignedReader::new(f),
+                                    part.start_lba * 512,
+                                    part.partition_type_byte,
+                                    part.partition_type_string.as_deref(),
+                                )
+                            } else {
+                                rusty_backup::fs::effective_partition_size(
+                                    BufReader::new(f),
+                                    part.start_lba * 512,
+                                    part.partition_type_byte,
+                                    part.partition_type_string.as_deref(),
+                                )
+                            };
+                            if let Some(min_size) = min_size {
                                 let clamped = min_size.min(part.size_bytes);
                                 partition_min_sizes.insert(part.index, clamped);
                                 push_log(format!(

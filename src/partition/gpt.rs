@@ -357,6 +357,9 @@ impl Gpt {
 
     /// Parse a GPT from a readable+seekable source.
     /// Assumes sector size is 512 bytes.
+    ///
+    /// **Note:** On macOS raw devices (`/dev/rdiskN`), reads must be
+    /// sector-aligned. Wrap the reader in a `BufReader` before calling.
     pub fn parse(reader: &mut (impl Read + Seek)) -> Result<Self, RustyBackupError> {
         // Seek to LBA 1 (byte offset 512)
         reader

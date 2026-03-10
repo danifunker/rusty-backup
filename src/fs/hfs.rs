@@ -572,11 +572,33 @@ impl<R: Read + Seek> HfsFilesystem<R> {
         } else {
             None
         };
+        // Read the alternate MDB — located at the sector immediately after
+        // the last allocation block on the volume.
+        let alt_mdb_sector = if self.mdb.block_size > 0 && self.mdb.total_blocks > 0 {
+            let sectors_per_block = self.mdb.block_size as u64 / 512;
+            let last_alloc_sector = self.mdb.first_alloc_block as u64
+                + self.mdb.total_blocks as u64 * sectors_per_block;
+            let alt_offset = self.partition_offset + last_alloc_sector * 512;
+            let mut alt_buf = [0u8; 512];
+            if self
+                .reader
+                .seek(SeekFrom::Start(alt_offset))
+                .and_then(|_| self.reader.read_exact(&mut alt_buf))
+                .is_ok()
+            {
+                Some(alt_buf)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         Ok(super::hfs_fsck::check_hfs_integrity(
             &self.mdb,
             &self.catalog_data,
             self.bitmap.as_ref().unwrap(),
             extents_data.as_deref(),
+            alt_mdb_sector.as_ref(),
         ))
     }
 
@@ -1062,20 +1084,21 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
         name: &[u8],
     ) -> (Vec<u8>, Vec<u8>) {
         // Key: (entry_cnid, "")  — built by caller with build_catalog_key(cnid, &[])
-        // Record data: cdrType(1) + reserved(1) + reserved(8) + thdParID(4) + thdCName(Pascal, 1+N)
-        let mut rec = Vec::with_capacity(14 + 1 + name.len());
+        // Record data: cdrType(1) + reserved(1) + reserved(8) + thdParID(4) + thdCName(Str31=32)
+        // Total data = 46 bytes (per hfsutils: fixed Str31 field, not variable-length)
+        let mut rec = Vec::with_capacity(46);
         rec.push(thread_type as u8); // cdrType
         rec.push(0); // reserved
-        rec.extend_from_slice(&[0u8; 8]); // reserved
+        rec.extend_from_slice(&[0u8; 8]); // reserved (2 x LongInt)
         let mut buf4 = [0u8; 4];
         BigEndian::write_u32(&mut buf4, parent_id);
-        rec.extend_from_slice(&buf4);
-        rec.push(name.len() as u8);
-        rec.extend_from_slice(name);
-        // Pad to even
-        if rec.len() % 2 != 0 {
-            rec.push(0);
-        }
+        rec.extend_from_slice(&buf4); // thdParID
+                                      // Str31: 1 byte length + up to 31 bytes name + zero padding = 32 bytes total
+        let name_len = name.len().min(31);
+        let mut str31 = [0u8; 32];
+        str31[0] = name_len as u8;
+        str31[1..1 + name_len].copy_from_slice(&name[..name_len]);
+        rec.extend_from_slice(&str31);
         // Key for the thread (not built here — caller uses build_catalog_key)
         (vec![], rec) // key is unused; caller builds key separately
     }
@@ -1652,7 +1675,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
 
     fn repair(&mut self) -> Result<super::fsck::RepairReport, FilesystemError> {
         self.ensure_bitmap()?;
-        let extents_data = if self.mdb.extents_file_size > 0 {
+        let mut extents_data = if self.mdb.extents_file_size > 0 {
             read_fork_data(
                 &mut self.reader,
                 self.partition_offset,
@@ -1669,8 +1692,37 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
             &mut self.mdb,
             &mut self.catalog_data,
             self.bitmap.as_mut().unwrap(),
-            extents_data.as_deref(),
+            extents_data.as_mut(),
         );
+
+        // Write back repaired extents overflow B-tree if modified
+        if let Some(ref ext_data) = extents_data {
+            if self.mdb.extents_file_size > 0 {
+                let alloc_start = self.mdb.first_alloc_block as u64 * 512;
+                for (i, extent) in self.mdb.extents_file_extents.iter().enumerate() {
+                    if extent.block_count == 0 {
+                        break;
+                    }
+                    let block_off = self.partition_offset
+                        + alloc_start
+                        + extent.start_block as u64 * self.mdb.block_size as u64;
+                    let byte_len = extent.block_count as u64 * self.mdb.block_size as u64;
+                    let data_start = if i == 0 {
+                        0
+                    } else {
+                        self.mdb.extents_file_extents[..i]
+                            .iter()
+                            .map(|e| e.block_count as u64 * self.mdb.block_size as u64)
+                            .sum::<u64>() as usize
+                    };
+                    let data_end = (data_start + byte_len as usize).min(ext_data.len());
+                    if data_start < data_end {
+                        self.reader.seek(std::io::SeekFrom::Start(block_off))?;
+                        self.reader.write_all(&ext_data[data_start..data_end])?;
+                    }
+                }
+            }
+        }
 
         self.do_sync_metadata()?;
         Ok(report)
@@ -2263,15 +2315,16 @@ mod tests {
         img[r1_data + 1] = 0; // reserved
                               // reserved(8) at offset 2-9
         BigEndian::write_u32(&mut img[r1_data + 10..r1_data + 14], 1); // parentID = 1
-        img[r1_data + 14] = 0; // name_len = 0
-                               // Thread data = ~16 bytes
+                                                                       // Str31 name field: 32 bytes (1 length byte + 31 bytes name/padding)
+        img[r1_data + 14] = 0; // name_len = 0 (rest of 32 bytes already zero)
+                               // Thread data total = 2 (type+rsv) + 8 (rsv) + 4 (parentID) + 32 (Str31) = 46 bytes
 
         // Record offset table for leaf node
         let lot = leaf_off + node_size;
         BigEndian::write_u16(&mut img[lot - 2..lot], 14); // record 0
         let r1_rel = (r1_off - leaf_off) as u16;
         BigEndian::write_u16(&mut img[lot - 4..lot - 2], r1_rel); // record 1
-        let free_rel = (r1_data + 16 - leaf_off) as u16;
+        let free_rel = (r1_data + 46 - leaf_off) as u16;
         BigEndian::write_u16(&mut img[lot - 6..lot - 4], free_rel); // free space
 
         // MDB at byte 1024
@@ -2290,7 +2343,7 @@ mod tests {
         mdb[36] = 7;
         mdb[37..44].copy_from_slice(b"TestVol");
         BigEndian::write_u32(&mut mdb[84..88], 0); // file_count
-        BigEndian::write_u32(&mut mdb[88..92], 1); // folder_count (root)
+        BigEndian::write_u32(&mut mdb[88..92], 0); // folder_count (drDirCnt excludes root)
                                                    // Catalog file size
         BigEndian::write_u32(&mut mdb[146..150], catalog_size);
         // Catalog extents
@@ -2491,13 +2544,53 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // manual test — requires real HFS image
+    fn test_fsck_real_hfs_image() {
+        let path = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join("Documents/HD20_512 20MB Mac II Data-FullyWorking.hda");
+        if !path.exists() {
+            eprintln!("Skipping: {:?} not found", path);
+            return;
+        }
+        let file = std::fs::File::open(&path).unwrap();
+        // APM disk: partition 3 (Apple_HFS) starts at sector 0x60 = 96
+        let partition_offset = 96 * 512;
+        let mut fs = HfsFilesystem::open(file, partition_offset).unwrap();
+        let result = fs.fsck().unwrap();
+
+        eprintln!("=== ERRORS ({}) ===", result.errors.len());
+        for e in &result.errors {
+            eprintln!("  [{}] {}", e.code, e.message);
+        }
+        eprintln!("=== WARNINGS ({}) ===", result.warnings.len());
+        for w in &result.warnings {
+            eprintln!("  [{}] {}", w.code, w.message);
+        }
+        eprintln!(
+            "=== STATS: {} files, {} dirs ===",
+            result.stats.files_checked, result.stats.directories_checked
+        );
+        assert!(
+            result.is_clean(),
+            "known-good image should be clean ({} errors, {} warnings)",
+            result.errors.len(),
+            result.warnings.len()
+        );
+    }
+
+    #[test]
     fn test_fsck_clean_fresh_image() {
         let img = make_editable_hfs_image();
         let cursor = Cursor::new(img);
         let mut fs = HfsFilesystem::open(cursor, 0).unwrap();
 
         let result = fs.fsck().unwrap();
-        assert!(result.is_clean(), "fresh image should be clean");
+        let err_msgs: Vec<&str> = result.errors.iter().map(|e| e.message.as_str()).collect();
+        assert!(
+            result.is_clean(),
+            "fresh image should be clean: {:?}",
+            err_msgs
+        );
         assert_eq!(result.stats.directories_checked, 1); // root only
         assert_eq!(result.stats.files_checked, 0);
     }
@@ -2601,5 +2694,97 @@ mod tests {
         fs.set_blessed_folder(&sys_dir).unwrap();
 
         assert_fsck_clean(&mut fs);
+    }
+
+    /// Verify that rebuilt index records have proper even-alignment padding
+    /// between the key and the node pointer, as required by Mac OS's B-tree
+    /// traversal code. Without padding, Mac OS reads misaligned node pointers
+    /// and crashes during volume mount.
+    #[test]
+    fn test_repair_index_records_are_even_aligned() {
+        use super::hfs_common::{btree_record_range, BTreeHeader};
+
+        let img = make_editable_hfs_image();
+        let cursor = Cursor::new(img);
+        let mut fs = HfsFilesystem::open(cursor, 0).unwrap();
+        let root = fs.root().unwrap();
+        let options = CreateFileOptions::default();
+
+        // Create files with varying name lengths (even and odd) to exercise
+        // both padded and unpadded key paths in index records
+        for i in 0..40 {
+            let name = if i % 2 == 0 {
+                format!("f{:03}.txt", i) // 8 chars → key_len=14 (even) → needs pad
+            } else {
+                format!("fi{:03}.txt", i) // 9 chars → key_len=15 (odd) → no pad
+            };
+            let data = format!("data{}", i);
+            let mut reader = Cursor::new(data.as_bytes().to_vec());
+            fs.create_file(&root, &name, &mut reader, data.len() as u64, &options)
+                .unwrap();
+        }
+
+        // Run repair (which rebuilds index nodes)
+        let report = fs.repair().unwrap();
+        assert!(
+            report.fixes_failed.is_empty(),
+            "repair failures: {:?}",
+            report.fixes_failed
+        );
+
+        // Verify every index record has correct alignment
+        let cat = &fs.catalog_data;
+        let header = BTreeHeader::read(cat);
+        let node_size = header.node_size as usize;
+        let max_nodes = cat.len() / node_size;
+
+        let mut index_recs_checked = 0u32;
+        for n in 1..max_nodes {
+            let off = n * node_size;
+            if off + node_size > cat.len() {
+                break;
+            }
+            let kind = cat[off + 8] as i8;
+            if kind != 0 {
+                continue;
+            }
+            let num_recs = BigEndian::read_u16(&cat[off + 10..off + 12]) as usize;
+            for r in 0..num_recs {
+                let (rec_start, rec_end) =
+                    btree_record_range(&cat[off..off + node_size], node_size, r);
+                if rec_start >= rec_end || rec_end > node_size {
+                    continue;
+                }
+                let key_len = cat[off + rec_start] as usize;
+                let rec_len = rec_end - rec_start;
+
+                // Mac OS forces all catalog index keys to length 0x25 (37),
+                // making every record exactly 42 bytes.
+                assert_eq!(
+                    key_len, 0x25,
+                    "Index node {} rec {}: key_len={} but expected 0x25",
+                    n, r, key_len
+                );
+                assert_eq!(
+                    rec_len, 42,
+                    "Index node {} rec {}: rec_len={} but expected 42",
+                    n, r, rec_len
+                );
+                index_recs_checked += 1;
+            }
+        }
+        assert!(
+            index_recs_checked > 0,
+            "no index records found — test needs more files"
+        );
+
+        // Verify that a post-repair integrity check finds no issues
+        let result = fs.fsck().unwrap();
+        let error_msgs: Vec<&str> = result.errors.iter().map(|e| e.message.as_str()).collect();
+        assert!(
+            result.errors.is_empty(),
+            "post-repair check found errors: {:?}",
+            error_msgs
+        );
     }
 }

@@ -198,9 +198,12 @@ impl PartitionTable {
                     protective_mbr: mbr,
                     gpt,
                 }),
-                Err(_) => {
-                    // Fall back to treating as plain MBR if GPT parsing fails
-                    Ok(PartitionTable::Mbr(mbr))
+                Err(e) => {
+                    // A protective 0xEE MBR means this IS a GPT disk.
+                    // If GPT parsing fails, surface the error instead of
+                    // falling back to MBR (which would expose a fake 0xEE
+                    // partition spanning the entire disk).
+                    Err(e)
                 }
             }
         } else {
@@ -274,7 +277,7 @@ impl PartitionTable {
                     bootable: false,
                     is_logical: false,
                     is_extended_container: false,
-                    partition_type_string: None,
+                    partition_type_string: Some(e.type_guid.to_string_formatted()),
                 })
                 .collect(),
             PartitionTable::Apm(apm) => {
@@ -777,5 +780,111 @@ mod tests {
         let mut cursor = Cursor::new(mbr_data.to_vec());
         let table = PartitionTable::detect(&mut cursor).unwrap();
         assert_eq!(table.type_name(), "MBR");
+    }
+
+    /// Build a minimal GPT disk image with a protective MBR + GPT header + entries.
+    fn make_gpt_disk_image(entries: &[(gpt::Guid, u64, u64, &str)]) -> Vec<u8> {
+        let num_entries = 128u32;
+        let entry_size = 128u32;
+        let total_sectors: u64 = 34 + 1024;
+        let mut image = vec![0u8; total_sectors as usize * 512];
+
+        // Protective MBR at LBA 0
+        image[446] = 0x00;
+        image[450] = 0xEE; // GPT protective type
+        image[454..458].copy_from_slice(&1u32.to_le_bytes());
+        image[458..462].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+        image[510] = 0x55;
+        image[511] = 0xAA;
+
+        // GPT header at LBA 1
+        let hdr = 512usize;
+        image[hdr..hdr + 8].copy_from_slice(&0x5452415020494645u64.to_le_bytes());
+        image[hdr + 8..hdr + 12].copy_from_slice(&0x00010000u32.to_le_bytes());
+        image[hdr + 12..hdr + 16].copy_from_slice(&92u32.to_le_bytes());
+        image[hdr + 24..hdr + 32].copy_from_slice(&1u64.to_le_bytes());
+        image[hdr + 32..hdr + 40].copy_from_slice(&(total_sectors - 1).to_le_bytes());
+        image[hdr + 40..hdr + 48].copy_from_slice(&34u64.to_le_bytes());
+        image[hdr + 48..hdr + 56].copy_from_slice(&(total_sectors - 34).to_le_bytes());
+        image[hdr + 56..hdr + 72].copy_from_slice(&[0xAAu8; 16]);
+        image[hdr + 72..hdr + 80].copy_from_slice(&2u64.to_le_bytes());
+        image[hdr + 80..hdr + 84].copy_from_slice(&num_entries.to_le_bytes());
+        image[hdr + 84..hdr + 88].copy_from_slice(&entry_size.to_le_bytes());
+
+        // Partition entries at LBA 2
+        for (i, (type_guid, first_lba, last_lba, name)) in entries.iter().enumerate() {
+            let off = 1024 + i * entry_size as usize;
+            image[off..off + 16].copy_from_slice(type_guid.as_bytes());
+            // unique GUID
+            image[off + 16..off + 32].copy_from_slice(&[
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15,
+                (i as u8) + 1,
+            ]);
+            image[off + 32..off + 40].copy_from_slice(&first_lba.to_le_bytes());
+            image[off + 40..off + 48].copy_from_slice(&last_lba.to_le_bytes());
+            let name_off = off + 56;
+            for (j, ch) in name.encode_utf16().enumerate() {
+                let o = name_off + j * 2;
+                if o + 2 <= off + entry_size as usize {
+                    image[o..o + 2].copy_from_slice(&ch.to_le_bytes());
+                }
+            }
+        }
+
+        image
+    }
+
+    #[test]
+    fn test_detect_valid_gpt_disk() {
+        let ms_basic = gpt::Guid::from_string("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7").unwrap();
+        let image = make_gpt_disk_image(&[(ms_basic, 2048, 1050623, "DATA")]);
+        let mut cursor = Cursor::new(image);
+        let table = PartitionTable::detect(&mut cursor).unwrap();
+
+        assert_eq!(table.type_name(), "GPT");
+        let parts = table.partitions();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].start_lba, 2048);
+        assert_eq!(parts[0].size_bytes, (1050623 - 2048 + 1) * 512);
+        // GPT entries should have partition_type_string set
+        assert!(parts[0].partition_type_string.is_some());
+        assert_eq!(
+            parts[0].partition_type_string.as_deref().unwrap(),
+            "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7"
+        );
+    }
+
+    #[test]
+    fn test_protective_mbr_with_corrupt_gpt_returns_error() {
+        // Build a disk with protective 0xEE MBR but no valid GPT header
+        let mut image = vec![0u8; 34 * 512];
+        // Protective MBR
+        image[450] = 0xEE;
+        image[454..458].copy_from_slice(&1u32.to_le_bytes());
+        image[458..462].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+        image[510] = 0x55;
+        image[511] = 0xAA;
+        // LBA 1 is all zeros — invalid GPT signature
+
+        let mut cursor = Cursor::new(image);
+        let result = PartitionTable::detect(&mut cursor);
+        assert!(
+            result.is_err(),
+            "Expected error when GPT header is corrupt, not a fallback to MBR"
+        );
     }
 }

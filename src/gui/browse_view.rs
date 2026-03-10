@@ -2133,9 +2133,13 @@ fn create_filesystem(
 
     // Pre-opened device file (already elevated, e.g. macOS raw disk).
     // try_clone() gives an independent fd so each open_fs() call can seek freely.
+    // Wrap in SectorAlignedReader because macOS raw character devices (/dev/rdiskN)
+    // require all seeks and reads to be sector-aligned (512-byte multiples).
+    // Filesystem code (FAT's next_cluster, ext's read_inode, etc.) performs
+    // sub-sector seeks, so a plain BufReader would cause EINVAL errors.
     if let Some(arc) = preopen_file {
         let file = arc.try_clone().map_err(FilesystemError::Io)?;
-        let reader = BufReader::new(file);
+        let reader = rusty_backup::os::SectorAlignedReader::new(file);
         return fs::open_filesystem(
             reader,
             partition_offset,
