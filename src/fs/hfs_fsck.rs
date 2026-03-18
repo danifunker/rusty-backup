@@ -823,7 +823,11 @@ fn rebuild_leaf_chain(catalog_data: &mut [u8], node_size: usize, report: &mut Re
 /// After `rebuild_leaf_chain()` the leaves are correctly linked and sorted.
 /// This function frees all old index nodes and builds new ones so that
 /// root → index → leaf traversal is consistent with the leaf chain.
-fn rebuild_index_nodes(catalog_data: &mut [u8], node_size: usize, report: &mut RepairReport) {
+pub(crate) fn rebuild_index_nodes(
+    catalog_data: &mut [u8],
+    node_size: usize,
+    report: &mut RepairReport,
+) {
     use super::hfs_common::{btree_alloc_node, btree_free_node, init_node};
 
     let header = BTreeHeader::read(catalog_data);

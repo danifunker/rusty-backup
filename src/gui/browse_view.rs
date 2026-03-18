@@ -17,6 +17,37 @@ use rusty_backup::rbformats::chd::ChdReader;
 
 const MAX_PREVIEW_SIZE: usize = 1024 * 1024; // 1 MB max file preview
 
+/// A staged edit operation that will be applied when the user clicks "Apply Edits".
+#[derive(Debug, Clone)]
+enum StagedEdit {
+    AddFile {
+        parent: FileEntry,
+        name: String,
+        host_path: PathBuf,
+        size: u64,
+    },
+    CreateDirectory {
+        parent: FileEntry,
+        name: String,
+    },
+    DeleteEntry {
+        parent: FileEntry,
+        entry: FileEntry,
+    },
+    DeleteRecursive {
+        parent: FileEntry,
+        entry: FileEntry,
+    },
+    SetTypeCreator {
+        entry: FileEntry,
+        type_code: String,
+        creator_code: String,
+    },
+    BlessFolder {
+        entry: FileEntry,
+    },
+}
+
 /// Context for editing a backup archive partition (decompress → edit → recompress).
 struct ArchiveEditContext {
     /// Path to the compressed archive file (e.g. partition-0.zst or partition-0.chd).
@@ -136,6 +167,10 @@ pub struct BrowseView {
     show_tree_popup: bool,
     /// Whether the tree popup shows filesystem IDs.
     tree_show_ids: bool,
+    /// Queued edit operations awaiting "Apply Edits".
+    staged_edits: Vec<StagedEdit>,
+    /// Whether to show the "unsaved changes" confirmation dialog.
+    show_unsaved_dialog: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -193,6 +228,8 @@ impl Default for BrowseView {
             tree_text: None,
             show_tree_popup: false,
             tree_show_ids: false,
+            staged_edits: Vec::new(),
+            show_unsaved_dialog: false,
         }
     }
 }
@@ -419,6 +456,8 @@ impl BrowseView {
         self.tree_text = None;
         self.show_tree_popup = false;
         self.tree_show_ids = false;
+        self.staged_edits.clear();
+        self.show_unsaved_dialog = false;
         // Clean up archive temp file if present
         if let Some(temp) = self.archive_temp_path.take() {
             let _ = std::fs::remove_file(&temp);
@@ -487,16 +526,23 @@ impl BrowseView {
                         // Archive editing: toggle triggers decompress/recompress
                         if !self.edit_mode {
                             self.start_archive_extract();
+                        } else if !self.staged_edits.is_empty() {
+                            self.show_unsaved_dialog = true;
                         } else {
                             self.start_archive_compress();
                         }
                     } else {
                         // Direct editing (raw image / device)
-                        self.edit_mode = !self.edit_mode;
-                        if !self.edit_mode {
-                            self.edit_result = None;
-                            self.show_new_folder_dialog = false;
-                            self.pending_delete = None;
+                        if self.edit_mode && !self.staged_edits.is_empty() {
+                            self.show_unsaved_dialog = true;
+                        } else {
+                            self.edit_mode = !self.edit_mode;
+                            if !self.edit_mode {
+                                self.edit_result = None;
+                                self.show_new_folder_dialog = false;
+                                self.pending_delete = None;
+                                self.staged_edits.clear();
+                            }
                         }
                     }
                 }
@@ -532,8 +578,12 @@ impl BrowseView {
             }
 
             if ui.button("Close").clicked() {
-                self.close();
-                return;
+                if self.edit_mode && !self.staged_edits.is_empty() {
+                    self.show_unsaved_dialog = true;
+                } else {
+                    self.close();
+                    return;
+                }
             }
         });
 
@@ -586,7 +636,7 @@ impl BrowseView {
         if self.edit_mode && self.archive_edit_ctx.is_some() {
             ui.colored_label(
                 egui::Color32::from_rgb(100, 160, 255),
-                "Editing temporary copy. Changes saved when you exit edit mode.",
+                "Editing temporary copy. Click 'Apply Edits' to write changes.",
             );
         }
 
@@ -611,6 +661,9 @@ impl BrowseView {
 
         // Delete confirmation dialog
         self.render_delete_dialog(ui);
+
+        // Unsaved changes dialog
+        self.render_unsaved_dialog(ui);
 
         // New folder dialog
         self.render_new_folder_dialog(ui);
@@ -654,6 +707,9 @@ impl BrowseView {
     }
 
     fn render_tree_entry(&mut self, ui: &mut egui::Ui, entry: &FileEntry) {
+        let pending_del = self.edit_mode && self.is_pending_delete(entry);
+        let dimmed = egui::Color32::from_rgb(120, 120, 120);
+
         match entry.entry_type {
             EntryType::Directory => {
                 let path = entry.path.clone();
@@ -685,7 +741,12 @@ impl BrowseView {
 
                 let header_res = ui.horizontal(|ui| {
                     state.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
-                    if ui.selectable_label(is_selected, &dir_label).clicked() {
+                    if pending_del {
+                        let text = egui::RichText::new(&dir_label)
+                            .color(dimmed)
+                            .strikethrough();
+                        ui.label(text);
+                    } else if ui.selectable_label(is_selected, &dir_label).clicked() {
                         self.selected_entry = Some(entry.clone());
                         self.content = None;
                         self.error = None;
@@ -699,6 +760,14 @@ impl BrowseView {
                         }
                     } else {
                         ui.label("Loading...");
+                    }
+
+                    // Append pending-add entries for this directory
+                    if self.edit_mode {
+                        let pending = self.pending_adds_for(&path);
+                        for pentry in &pending {
+                            self.render_pending_add_entry(ui, pentry);
+                        }
                     }
                 });
 
@@ -722,10 +791,16 @@ impl BrowseView {
                     .unwrap_or(false);
 
                 let size_str = entry.size_string();
-                let label = format!("{}  ({})", entry.name, size_str);
 
-                if ui.selectable_label(is_selected, &label).clicked() {
-                    self.select_file(entry);
+                if pending_del {
+                    let label = format!("{}  ({})", entry.name, size_str);
+                    let text = egui::RichText::new(&label).color(dimmed).strikethrough();
+                    ui.label(text);
+                } else {
+                    let label = format!("{}  ({})", entry.name, size_str);
+                    if ui.selectable_label(is_selected, &label).clicked() {
+                        self.select_file(entry);
+                    }
                 }
             }
             EntryType::Symlink => {
@@ -738,7 +813,10 @@ impl BrowseView {
                 let target = entry.symlink_target.as_deref().unwrap_or("?");
                 let label = format!("{} -> {}", entry.name, target);
 
-                if ui.selectable_label(is_selected, &label).clicked() {
+                if pending_del {
+                    let text = egui::RichText::new(&label).color(dimmed).strikethrough();
+                    ui.label(text);
+                } else if ui.selectable_label(is_selected, &label).clicked() {
                     self.select_file(entry);
                 }
             }
@@ -752,11 +830,37 @@ impl BrowseView {
                 let stype = entry.special_type.as_deref().unwrap_or("special");
                 let label = format!("{}  ({})", entry.name, stype);
 
-                if ui.selectable_label(is_selected, &label).clicked() {
+                if pending_del {
+                    let text = egui::RichText::new(&label).color(dimmed).strikethrough();
+                    ui.label(text);
+                } else if ui.selectable_label(is_selected, &label).clicked() {
                     self.selected_entry = Some(entry.clone());
                     self.content = None;
                 }
             }
+        }
+    }
+
+    /// Render a pending-add entry with green "+" prefix (not selectable for content).
+    fn render_pending_add_entry(&mut self, ui: &mut egui::Ui, entry: &FileEntry) {
+        let green = egui::Color32::from_rgb(100, 200, 100);
+        let is_selected = self
+            .selected_entry
+            .as_ref()
+            .map(|s| s.path == entry.path)
+            .unwrap_or(false);
+
+        let label = if entry.is_directory() {
+            format!("+ {}", entry.name)
+        } else {
+            format!("+ {}  ({})", entry.name, entry.size_string())
+        };
+
+        let text = egui::RichText::new(&label).color(green);
+        if ui.selectable_label(is_selected, text).clicked() {
+            // Allow selecting pending-add entries (for unstaging via delete)
+            self.selected_entry = Some(entry.clone());
+            self.content = None;
         }
     }
 
@@ -1387,6 +1491,84 @@ impl BrowseView {
         }
     }
 
+    /// Check if an entry is pending deletion in the staged edits.
+    fn is_pending_delete(&self, entry: &FileEntry) -> bool {
+        self.staged_edits.iter().any(|edit| match edit {
+            StagedEdit::DeleteEntry { entry: e, .. }
+            | StagedEdit::DeleteRecursive { entry: e, .. } => e.path == entry.path,
+            _ => false,
+        })
+    }
+
+    /// Check if an entry is a pending add (not yet on disk).
+    fn is_pending_add(&self, entry_path: &str) -> bool {
+        self.staged_edits.iter().any(|edit| match edit {
+            StagedEdit::AddFile { parent, name, .. } => {
+                let path = if parent.path == "/" {
+                    format!("/{name}")
+                } else {
+                    format!("{}/{name}", parent.path)
+                };
+                path == entry_path
+            }
+            StagedEdit::CreateDirectory { parent, name, .. } => {
+                let path = if parent.path == "/" {
+                    format!("/{name}")
+                } else {
+                    format!("{}/{name}", parent.path)
+                };
+                path == entry_path
+            }
+            _ => false,
+        })
+    }
+
+    /// Collect pending add entries for a given parent path.
+    fn pending_adds_for(&self, parent_path: &str) -> Vec<FileEntry> {
+        self.staged_edits
+            .iter()
+            .filter_map(|edit| match edit {
+                StagedEdit::AddFile {
+                    parent, name, size, ..
+                } if parent.path == parent_path => {
+                    let path = if parent.path == "/" {
+                        format!("/{name}")
+                    } else {
+                        format!("{}/{name}", parent.path)
+                    };
+                    Some(FileEntry::new_file(name.clone(), path, *size, 0))
+                }
+                StagedEdit::CreateDirectory { parent, name, .. } if parent.path == parent_path => {
+                    let path = if parent.path == "/" {
+                        format!("/{name}")
+                    } else {
+                        format!("{}/{name}", parent.path)
+                    };
+                    Some(FileEntry::new_directory(name.clone(), path, 0))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Remove a pending-add entry from staged_edits by path. Returns true if found.
+    fn remove_pending_add(&mut self, entry_path: &str) -> bool {
+        let before = self.staged_edits.len();
+        self.staged_edits.retain(|edit| match edit {
+            StagedEdit::AddFile { parent, name, .. }
+            | StagedEdit::CreateDirectory { parent, name, .. } => {
+                let path = if parent.path == "/" {
+                    format!("/{name}")
+                } else {
+                    format!("{}/{name}", parent.path)
+                };
+                path != entry_path
+            }
+            _ => true,
+        });
+        self.staged_edits.len() < before
+    }
+
     /// Render the edit mode toolbar with action buttons and free space.
     fn render_edit_toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
@@ -1424,14 +1606,22 @@ impl BrowseView {
                 .clicked()
             {
                 if let Some(ref sel) = self.selected_entry.clone() {
-                    let parent = self.current_parent_entry();
-                    let is_non_empty_dir = sel.is_directory()
-                        && self
-                            .directory_cache
-                            .get(&sel.path)
-                            .map(|c| !c.is_empty())
-                            .unwrap_or(true); // assume non-empty if not cached
-                    self.pending_delete = Some((parent, sel.clone(), is_non_empty_dir));
+                    // If it's a pending-add, just remove it from staged_edits
+                    if self.is_pending_add(&sel.path) {
+                        self.remove_pending_add(&sel.path);
+                        self.edit_result = Some(format!("Unstaged '{}'", sel.name));
+                        self.selected_entry = None;
+                        self.content = None;
+                    } else {
+                        let parent = self.current_parent_entry();
+                        let is_non_empty_dir = sel.is_directory()
+                            && self
+                                .directory_cache
+                                .get(&sel.path)
+                                .map(|c| !c.is_empty())
+                                .unwrap_or(true); // assume non-empty if not cached
+                        self.pending_delete = Some((parent, sel.clone(), is_non_empty_dir));
+                    }
                 }
             }
 
@@ -1448,31 +1638,61 @@ impl BrowseView {
                     .clicked()
                 {
                     if let Some(ref sel) = self.selected_entry.clone() {
-                        match self.open_editable_fs() {
-                            Ok(mut efs) => match efs.set_blessed_folder(sel) {
-                                Ok(()) => {
-                                    self.blessed_folder = Some((sel.location, sel.name.clone()));
-                                    self.edit_result =
-                                        Some(format!("Blessed folder set to '{}'", sel.name));
-                                }
-                                Err(e) => {
-                                    self.edit_result = Some(format!("Error blessing folder: {e}"));
-                                }
-                            },
-                            Err(e) => {
-                                self.edit_result = Some(format!("Error opening filesystem: {e}"));
-                            }
-                        }
+                        self.staged_edits
+                            .push(StagedEdit::BlessFolder { entry: sel.clone() });
+                        self.edit_result = Some(format!("Staged bless folder '{}'", sel.name));
                     }
                 }
             }
 
-            ui.add_space(16.0);
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(8.0);
 
-            // Free space indicator
+            // Apply button — only shown when edits are staged
+            if !self.staged_edits.is_empty() {
+                let label = format!("Apply Edits ({})", self.staged_edits.len());
+                if ui.button(label).clicked() {
+                    self.apply_staged_edits();
+                }
+            }
+
+            ui.add_space(8.0);
+
+            // Free space indicator with projected space after staged edits
             if let Ok(mut efs) = self.open_editable_fs() {
                 if let Ok(free) = efs.free_space() {
                     ui.label(format!("Free: {}", partition::format_size(free)));
+
+                    if !self.staged_edits.is_empty() {
+                        let mut bytes_added: u64 = 0;
+                        let mut bytes_freed: u64 = 0;
+                        for edit in &self.staged_edits {
+                            match edit {
+                                StagedEdit::AddFile { size, .. } => bytes_added += size,
+                                StagedEdit::DeleteEntry { entry, .. }
+                                | StagedEdit::DeleteRecursive { entry, .. } => {
+                                    if !entry.is_directory() {
+                                        bytes_freed += entry.size;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        let projected =
+                            free.saturating_add(bytes_freed).saturating_sub(bytes_added);
+                        let color = if bytes_added > free + bytes_freed {
+                            egui::Color32::from_rgb(255, 100, 100) // red — won't fit
+                        } else if projected < free / 10 {
+                            egui::Color32::from_rgb(255, 200, 100) // yellow — tight
+                        } else {
+                            egui::Color32::from_rgb(100, 200, 100) // green — ok
+                        };
+                        ui.colored_label(
+                            color,
+                            format!("After: {}", partition::format_size(projected)),
+                        );
+                    }
                 }
             }
         });
@@ -1489,33 +1709,30 @@ impl BrowseView {
         }
     }
 
-    /// Add files/folders from host paths to the current directory.
+    /// Stage files/folders from host paths for adding to the current directory.
     fn add_host_paths(&mut self, paths: &[PathBuf]) {
         let parent = self.current_parent_entry();
-        let parent_path = parent.path.clone();
         let mut last_error: Option<String> = None;
-        let mut added_count = 0usize;
+        let mut staged_count = 0usize;
 
         for path in paths {
             if path.is_dir() {
                 match self.add_host_directory(path, &parent) {
-                    Ok(n) => added_count += n,
-                    Err(e) => last_error = Some(format!("Error adding '{}': {e}", path.display())),
+                    Ok(n) => staged_count += n,
+                    Err(e) => last_error = Some(format!("Error staging '{}': {e}", path.display())),
                 }
             } else if path.is_file() {
                 match self.add_host_file(path, &parent) {
-                    Ok(()) => added_count += 1,
-                    Err(e) => last_error = Some(format!("Error adding '{}': {e}", path.display())),
+                    Ok(()) => staged_count += 1,
+                    Err(e) => last_error = Some(format!("Error staging '{}': {e}", path.display())),
                 }
             }
         }
 
-        self.invalidate_cache_for(&parent_path);
-
         if let Some(err) = last_error {
             self.edit_result = Some(err);
-        } else if added_count > 0 {
-            self.edit_result = Some(format!("Added {added_count} item(s)"));
+        } else if staged_count > 0 {
+            self.edit_result = Some(format!("Staged {staged_count} item(s)"));
         }
     }
 
@@ -1531,26 +1748,26 @@ impl BrowseView {
             .ok_or("invalid filename")?
             .to_string();
 
-        let metadata = std::fs::metadata(host_path).map_err(|e| e.to_string())?;
-        let data_len = metadata.len();
+        // Check for duplicate name in pending adds for this parent
+        let pending = self.pending_adds_for(&parent.path);
+        if pending.iter().any(|e| e.name == name) {
+            return Err(format!("'{name}' is already staged in this directory"));
+        }
 
-        let mut file = File::open(host_path).map_err(|e| e.to_string())?;
-        let mut efs = self.open_editable_fs().map_err(|e| e.to_string())?;
+        let size = std::fs::metadata(host_path)
+            .map_err(|e| e.to_string())?
+            .len();
 
-        efs.create_file(
-            parent,
-            &name,
-            &mut file,
-            data_len,
-            &CreateFileOptions::default(),
-        )
-        .map_err(|e| e.to_string())?;
-
-        efs.sync_metadata().map_err(|e| e.to_string())?;
+        self.staged_edits.push(StagedEdit::AddFile {
+            parent: parent.clone(),
+            name,
+            host_path: host_path.to_path_buf(),
+            size,
+        });
         Ok(())
     }
 
-    /// Recursively add a host directory and its contents to the image.
+    /// Recursively stage a host directory and its contents for adding.
     fn add_host_directory(
         &mut self,
         host_path: &std::path::Path,
@@ -1562,12 +1779,19 @@ impl BrowseView {
             .ok_or("invalid directory name")?
             .to_string();
 
-        let mut efs = self.open_editable_fs().map_err(|e| e.to_string())?;
-        let new_dir = efs
-            .create_directory(parent, &name, &CreateDirectoryOptions::default())
-            .map_err(|e| e.to_string())?;
-        efs.sync_metadata().map_err(|e| e.to_string())?;
-        drop(efs);
+        // Stage the directory creation
+        self.staged_edits.push(StagedEdit::CreateDirectory {
+            parent: parent.clone(),
+            name: name.clone(),
+        });
+
+        // Build a synthetic FileEntry for children to reference as parent
+        let dir_path = if parent.path == "/" {
+            format!("/{name}")
+        } else {
+            format!("{}/{name}", parent.path)
+        };
+        let new_dir = FileEntry::new_directory(name, dir_path, 0);
 
         let mut count = 1usize; // count the directory itself
 
@@ -1586,35 +1810,106 @@ impl BrowseView {
         Ok(count)
     }
 
-    /// Perform a delete operation.
+    /// Stage a delete operation.
     fn perform_delete(&mut self, parent: &FileEntry, entry: &FileEntry, recursive: bool) {
-        let parent_path = parent.path.clone();
         let entry_name = entry.name.clone();
 
-        let result = (|| -> Result<(), String> {
-            let mut efs = self.open_editable_fs().map_err(|e| e.to_string())?;
-            if recursive {
-                efs.delete_recursive(parent, entry)
-                    .map_err(|e| e.to_string())?;
-            } else {
-                efs.delete_entry(parent, entry).map_err(|e| e.to_string())?;
-            }
-            efs.sync_metadata().map_err(|e| e.to_string())?;
-            Ok(())
-        })();
+        if recursive {
+            self.staged_edits.push(StagedEdit::DeleteRecursive {
+                parent: parent.clone(),
+                entry: entry.clone(),
+            });
+        } else {
+            self.staged_edits.push(StagedEdit::DeleteEntry {
+                parent: parent.clone(),
+                entry: entry.clone(),
+            });
+        }
 
-        match result {
-            Ok(()) => {
-                self.edit_result = Some(format!("Deleted '{entry_name}'"));
-                self.selected_entry = None;
-                self.content = None;
-            }
+        self.edit_result = Some(format!("Staged delete of '{entry_name}'"));
+    }
+
+    /// Apply all staged edits to the filesystem in a single batch.
+    fn apply_staged_edits(&mut self) {
+        let mut efs = match self.open_editable_fs() {
+            Ok(fs) => fs,
             Err(e) => {
-                self.edit_result = Some(format!("Error deleting '{entry_name}': {e}"));
+                self.edit_result = Some(format!("Error opening filesystem: {e}"));
+                return;
+            }
+        };
+
+        let edits: Vec<StagedEdit> = self.staged_edits.drain(..).collect();
+        let total = edits.len();
+
+        for (i, edit) in edits.iter().enumerate() {
+            let result = match edit {
+                StagedEdit::AddFile {
+                    parent,
+                    name,
+                    host_path,
+                    size,
+                } => match File::open(host_path) {
+                    Ok(mut file) => efs
+                        .create_file(
+                            parent,
+                            name,
+                            &mut file,
+                            *size,
+                            &CreateFileOptions::default(),
+                        )
+                        .map(|_| ()),
+                    Err(e) => Err(FilesystemError::Io(e)),
+                },
+                StagedEdit::CreateDirectory { parent, name } => efs
+                    .create_directory(parent, name, &CreateDirectoryOptions::default())
+                    .map(|_| ()),
+                StagedEdit::DeleteEntry { parent, entry } => efs.delete_entry(parent, entry),
+                StagedEdit::DeleteRecursive { parent, entry } => {
+                    efs.delete_recursive(parent, entry)
+                }
+                StagedEdit::SetTypeCreator {
+                    entry,
+                    type_code,
+                    creator_code,
+                } => efs.set_type_creator(entry, type_code, creator_code),
+                StagedEdit::BlessFolder { entry } => efs.set_blessed_folder(entry),
+            };
+
+            if let Err(e) = result {
+                self.edit_result = Some(format!("Error on edit {}/{total}: {e}", i + 1));
+                return;
             }
         }
 
-        self.invalidate_cache_for(&parent_path);
+        if let Err(e) = efs.sync_metadata() {
+            self.edit_result = Some(format!("Error saving to disk: {e}"));
+            return;
+        }
+
+        self.edit_result = Some(format!("Applied {total} edit(s) successfully"));
+        self.invalidate_all_caches();
+
+        // Update blessed folder info after apply
+        if let Ok(mut fs) = self.open_fs() {
+            self.blessed_folder = fs.blessed_system_folder();
+        }
+    }
+
+    /// Invalidate all cached directory listings and reload root.
+    fn invalidate_all_caches(&mut self) {
+        self.directory_cache.clear();
+        self.selected_entry = None;
+        self.content = None;
+        // Reload root from filesystem
+        if let Ok(mut fs) = self.open_fs() {
+            if let Ok(root) = fs.root() {
+                if let Ok(children) = fs.list_directory(&root) {
+                    self.directory_cache.insert(root.path.clone(), children);
+                }
+                self.root = Some(root);
+            }
+        }
     }
 
     /// Render the delete confirmation dialog.
@@ -1635,6 +1930,99 @@ impl BrowseView {
                     self.pending_delete = None;
                 }
             });
+        }
+    }
+
+    /// Render the unsaved changes confirmation dialog.
+    fn render_unsaved_dialog(&mut self, ui: &mut egui::Ui) {
+        if !self.show_unsaved_dialog {
+            return;
+        }
+
+        let count = self.staged_edits.len();
+
+        egui::Window::new("Unsaved Changes")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ui.ctx(), |ui| {
+                ui.label(format!("You have {count} unsaved edit(s)."));
+                ui.add_space(4.0);
+
+                // Summary
+                let mut files_added = 0usize;
+                let mut dirs_added = 0usize;
+                let mut entries_deleted = 0usize;
+                let mut bytes_added: u64 = 0;
+                for edit in &self.staged_edits {
+                    match edit {
+                        StagedEdit::AddFile { size, .. } => {
+                            files_added += 1;
+                            bytes_added += size;
+                        }
+                        StagedEdit::CreateDirectory { .. } => dirs_added += 1,
+                        StagedEdit::DeleteEntry { .. } | StagedEdit::DeleteRecursive { .. } => {
+                            entries_deleted += 1
+                        }
+                        _ => {}
+                    }
+                }
+                let mut parts = Vec::new();
+                if files_added > 0 {
+                    parts.push(format!("{files_added} file(s) added"));
+                }
+                if dirs_added > 0 {
+                    parts.push(format!("{dirs_added} folder(s) added"));
+                }
+                if entries_deleted > 0 {
+                    parts.push(format!("{entries_deleted} item(s) deleted"));
+                }
+                if !parts.is_empty() {
+                    ui.label(parts.join(", "));
+                }
+                if bytes_added > 0 {
+                    ui.label(format!(
+                        "Net data: +{}",
+                        partition::format_size(bytes_added)
+                    ));
+                }
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Discard Edits").clicked() {
+                        self.staged_edits.clear();
+                        self.show_unsaved_dialog = false;
+                        self.exit_edit_mode();
+                    }
+                    if ui.button("Apply Edits").clicked() {
+                        self.show_unsaved_dialog = false;
+                        self.apply_staged_edits();
+                        if self
+                            .edit_result
+                            .as_ref()
+                            .map(|r| !r.starts_with("Error"))
+                            .unwrap_or(true)
+                        {
+                            self.exit_edit_mode();
+                        }
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.show_unsaved_dialog = false;
+                    }
+                });
+            });
+    }
+
+    /// Exit edit mode, clearing all staged state.
+    fn exit_edit_mode(&mut self) {
+        self.edit_mode = false;
+        self.edit_result = None;
+        self.show_new_folder_dialog = false;
+        self.pending_delete = None;
+        self.staged_edits.clear();
+
+        if self.archive_edit_ctx.is_some() {
+            self.start_archive_compress();
         }
     }
 
@@ -2017,26 +2405,22 @@ impl BrowseView {
         }
 
         let parent = self.current_parent_entry();
-        let parent_path = parent.path.clone();
 
-        let result = (|| -> Result<(), String> {
-            let mut efs = self.open_editable_fs().map_err(|e| e.to_string())?;
-            efs.create_directory(&parent, &name, &CreateDirectoryOptions::default())
-                .map_err(|e| e.to_string())?;
-            efs.sync_metadata().map_err(|e| e.to_string())?;
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                self.edit_result = Some(format!("Created folder '{name}'"));
-            }
-            Err(e) => {
-                self.edit_result = Some(format!("Error: {e}"));
-            }
+        // Check for duplicate name in pending adds
+        let pending = self.pending_adds_for(&parent.path);
+        if pending.iter().any(|e| e.name == name) {
+            self.edit_result = Some(format!(
+                "Error: '{name}' is already staged in this directory"
+            ));
+            return;
         }
 
-        self.invalidate_cache_for(&parent_path);
+        self.staged_edits.push(StagedEdit::CreateDirectory {
+            parent,
+            name: name.clone(),
+        });
+
+        self.edit_result = Some(format!("Staged folder '{name}'"));
     }
 
     /// Handle files dropped from the host OS onto the window.

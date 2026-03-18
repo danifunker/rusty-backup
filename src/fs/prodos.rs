@@ -788,7 +788,6 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ProDosFilesystem<R> {
         let (block_num, slot) = self.find_free_dir_slot(dir_key_block)?;
         self.write_dir_entry(block_num, slot, &entry_bytes)?;
         self.update_dir_file_count(dir_key_block, 1)?;
-        self.do_sync_metadata()?;
 
         let path = if parent.path == "/" {
             format!("/{validated_name}")
@@ -837,7 +836,6 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ProDosFilesystem<R> {
         let subdir_entry = build_subdir_entry_bytes(&validated_name, new_key_block);
         self.write_dir_entry(entry_block, entry_slot, &subdir_entry)?;
         self.update_dir_file_count(parent_key_block, 1)?;
-        self.do_sync_metadata()?;
 
         let path = if parent.path == "/" {
             format!("/{validated_name}")
@@ -886,7 +884,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ProDosFilesystem<R> {
             self.update_dir_file_count(dir_key_block, -1)?;
         }
 
-        self.do_sync_metadata()
+        Ok(())
     }
 
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {

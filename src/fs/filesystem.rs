@@ -154,8 +154,10 @@ pub enum ResourceForkSource {
 
 /// Trait for filesystems that support write operations (add/delete files and folders).
 ///
-/// Each method that modifies the filesystem should call `sync_metadata()` internally
-/// before returning to ensure on-disk consistency.
+/// Individual mutation methods (`create_file`, `delete_entry`, etc.) modify in-memory
+/// state only. The caller MUST call `sync_metadata()` after all mutations are complete
+/// to flush changes to disk. This enables batching multiple edits into a single atomic
+/// write.
 pub trait EditableFilesystem: Filesystem {
     /// Create a file in the given parent directory.
     ///

@@ -1205,7 +1205,6 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExfatFilesystem<R> {
         // Build entry set and add to directory
         let entry_bytes = Self::build_entry_set(name, 0x20, first_cluster, data_len); // 0x20 = Archive
         self.add_entry_to_directory(parent, &entry_bytes)?;
-        self.sync_metadata()?;
 
         let path = if parent.path == "/" {
             format!("/{name}")
@@ -1247,7 +1246,6 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExfatFilesystem<R> {
         // Build entry set with directory attribute
         let entry_bytes = Self::build_entry_set(name, ATTR_DIRECTORY as u16, new_cluster, 0);
         self.add_entry_to_directory(parent, &entry_bytes)?;
-        self.sync_metadata()?;
 
         let path = if parent.path == "/" {
             format!("/{name}")
@@ -1283,7 +1281,6 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExfatFilesystem<R> {
             self.free_cluster_chain_rw(entry.location as u32)?;
         }
 
-        self.sync_metadata()?;
         Ok(())
     }
 

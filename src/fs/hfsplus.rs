@@ -1556,9 +1556,6 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsPlusFilesystem<R> 
         // Update VH counts
         self.vh.file_count += 1;
 
-        // Sync
-        self.do_sync_metadata()?;
-
         let path = if parent.path == "/" {
             format!("/{name}")
         } else {
@@ -1638,8 +1635,6 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsPlusFilesystem<R> 
         // Update VH
         self.vh.folder_count += 1;
 
-        self.do_sync_metadata()?;
-
         let path = if parent.path == "/" {
             format!("/{name}")
         } else {
@@ -1702,7 +1697,6 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsPlusFilesystem<R> 
             self.vh.file_count = self.vh.file_count.saturating_sub(1);
         }
 
-        self.do_sync_metadata()?;
         Ok(())
     }
 
@@ -1756,7 +1750,6 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsPlusFilesystem<R> 
         self.catalog_data[frec_start + 48..frec_start + 52].copy_from_slice(&tc);
         self.catalog_data[frec_start + 52..frec_start + 56].copy_from_slice(&cc);
 
-        self.do_sync_metadata()?;
         let _ = (f_node, f_rec, node_size); // suppress warnings
         Ok(())
     }
@@ -1814,7 +1807,6 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsPlusFilesystem<R> 
         new_rsrc.serialize(&mut rsrc_bytes);
         self.catalog_data[frec_start + 168..frec_start + 248].copy_from_slice(&rsrc_bytes);
 
-        self.do_sync_metadata()?;
         let _ = t_node;
         Ok(())
     }
@@ -1834,7 +1826,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsPlusFilesystem<R> 
             ));
         }
         self.vh.finder_info[0] = entry.location as u32;
-        self.do_sync_metadata()
+        Ok(())
     }
 }
 

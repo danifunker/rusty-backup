@@ -8,8 +8,7 @@ use super::filesystem::{
 };
 use super::hfs_common::{
     self, bitmap_clear_bit_be, bitmap_find_clear_run_be, bitmap_set_bit_be, btree_free_node,
-    btree_grow_root, btree_insert_into_index, btree_insert_record, btree_record_range,
-    btree_remove_record, btree_split_leaf, BTreeHeader,
+    btree_insert_record, btree_record_range, btree_remove_record, btree_split_leaf, BTreeHeader,
 };
 use super::CompactResult;
 
@@ -99,7 +98,7 @@ impl HfsExtDescriptor {
 }
 
 /// HFS Master Directory Block (MDB) — at partition_offset + 1024.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub(crate) struct HfsMasterDirectoryBlock {
     pub(crate) signature: u16,
@@ -747,7 +746,10 @@ impl<R: Read + Seek> HfsFilesystem<R> {
             let next = BigEndian::read_u32(&self.catalog_data[offset..offset + 4]);
             node_idx = next;
         }
-        Ok(())
+        Err(FilesystemError::NotFound(format!(
+            "parent directory CNID {} not found in catalog",
+            parent_id
+        )))
     }
 
     /// Insert a catalog record into the B-tree, handling splits and growth.
@@ -774,12 +776,11 @@ impl<R: Read + Seek> HfsFilesystem<R> {
                 Ok(())
             }
             Err(_) => {
-                // Leaf full — split
+                // Leaf full — split, insert into correct half, rebuild index
                 let mut h = BTreeHeader::read(&self.catalog_data);
                 let (new_idx, split_key) =
                     btree_split_leaf(&mut self.catalog_data, node_size, leaf_idx, &mut h)?;
 
-                // Insert into the correct half
                 let target = if Self::catalog_compare(key_record, &split_key) == Ordering::Less {
                     leaf_idx
                 } else {
@@ -790,42 +791,20 @@ impl<R: Read + Seek> HfsFilesystem<R> {
                 btree_insert_record(t_node, node_size, key_record, &Self::catalog_compare)?;
 
                 h.leaf_records += 1;
-
-                // Insert separator into parent
-                if h.depth == 1 {
-                    btree_grow_root(
-                        &mut self.catalog_data,
-                        node_size,
-                        &mut h,
-                        leaf_idx,
-                        new_idx,
-                        &split_key,
-                    )?;
-                } else if let Some(&(_, parent_idx)) =
-                    _parent_chain.iter().find(|&&(nidx, _)| nidx == leaf_idx)
-                {
-                    btree_insert_into_index(
-                        &mut self.catalog_data,
-                        node_size,
-                        parent_idx,
-                        new_idx,
-                        &split_key,
-                        &mut h,
-                        &Self::catalog_compare,
-                        &_parent_chain,
-                    )?;
-                } else {
-                    btree_grow_root(
-                        &mut self.catalog_data,
-                        node_size,
-                        &mut h,
-                        leaf_idx,
-                        new_idx,
-                        &split_key,
-                    )?;
-                }
-
                 h.write(&mut self.catalog_data);
+
+                // Full index rebuild replaces incremental parent chain insertion
+                let mut dummy_report = super::fsck::RepairReport {
+                    fixes_applied: Vec::new(),
+                    fixes_failed: Vec::new(),
+                    unrepairable_count: 0,
+                };
+                super::hfs_fsck::rebuild_index_nodes(
+                    &mut self.catalog_data,
+                    node_size,
+                    &mut dummy_report,
+                );
+
                 Ok(())
             }
         }
@@ -882,12 +861,43 @@ impl<R: Read + Seek> HfsFilesystem<R> {
             btree_free_node(&mut self.catalog_data, node_size, node_idx);
             h.free_nodes += 1;
             h.write(&mut self.catalog_data);
+
+            // Rebuild index nodes to clean up stale separator keys
+            let header = BTreeHeader::read(&self.catalog_data);
+            if header.depth > 1 {
+                let mut dummy_report = super::fsck::RepairReport {
+                    fixes_applied: Vec::new(),
+                    fixes_failed: Vec::new(),
+                    unrepairable_count: 0,
+                };
+                super::hfs_fsck::rebuild_index_nodes(
+                    &mut self.catalog_data,
+                    node_size,
+                    &mut dummy_report,
+                );
+            }
         }
 
         // Update leaf_records count
         let mut h = BTreeHeader::read(&self.catalog_data);
         h.leaf_records = h.leaf_records.saturating_sub(1);
         h.write(&mut self.catalog_data);
+    }
+
+    /// Capture a snapshot of all mutable in-memory state for rollback.
+    fn snapshot(&self) -> (Vec<u8>, Option<Vec<u8>>, HfsMasterDirectoryBlock) {
+        (
+            self.catalog_data.clone(),
+            self.bitmap.clone(),
+            self.mdb.clone(),
+        )
+    }
+
+    /// Restore in-memory state from a previously captured snapshot.
+    fn restore_snapshot(&mut self, snap: (Vec<u8>, Option<Vec<u8>>, HfsMasterDirectoryBlock)) {
+        self.catalog_data = snap.0;
+        self.bitmap = snap.1;
+        self.mdb = snap.2;
     }
 }
 
@@ -1307,120 +1317,125 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
         data_len: u64,
         options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
-        let parent_id = parent.location as u32;
+        let snap = self.snapshot();
+        let result = (|| {
+            let parent_id = parent.location as u32;
 
-        // Validate name: must be encodable in Mac Roman, 1-31 bytes, no ':'
-        if name.contains(':') {
-            return Err(FilesystemError::InvalidData(
-                "name cannot contain ':'".into(),
-            ));
-        }
-        let name_bytes = utf8_to_mac_roman(name)?;
-        if name_bytes.is_empty() || name_bytes.len() > 31 {
-            return Err(FilesystemError::InvalidData(
-                "name must be 1-31 Mac Roman bytes".into(),
-            ));
-        }
-
-        // Check for duplicates
-        if self
-            .find_catalog_record_by_name(parent_id, &name_bytes)
-            .is_some()
-        {
-            return Err(FilesystemError::AlreadyExists(name.into()));
-        }
-
-        // Assign CNID
-        let file_id = self.mdb.next_catalog_id;
-        self.mdb.next_catalog_id += 1;
-
-        // Determine type/creator
-        let ext = name.rsplit('.').next().unwrap_or("");
-        let (type_code, creator_code) = if let (Some(tc), Some(cc)) =
-            (options.type_code.as_ref(), options.creator_code.as_ref())
-        {
-            (hfs_common::encode_fourcc(tc), hfs_common::encode_fourcc(cc))
-        } else {
-            hfs_common::type_creator_for_extension(ext).unwrap_or(([0; 4], [0; 4]))
-        };
-
-        // Allocate blocks and write data
-        let (data_start, data_blocks) = self.write_data_to_blocks(data, data_len)?;
-
-        // Handle resource fork
-        let (rsrc_start, rsrc_blocks, rsrc_size) = if let Some(ref rsrc_src) = options.resource_fork
-        {
-            match rsrc_src {
-                super::filesystem::ResourceForkSource::Data(rsrc_data) => {
-                    let mut cursor = std::io::Cursor::new(rsrc_data);
-                    let (rs, rb) =
-                        self.write_data_to_blocks(&mut cursor, rsrc_data.len() as u64)?;
-                    (rs, rb, rsrc_data.len() as u32)
-                }
-                super::filesystem::ResourceForkSource::File(path) => {
-                    let mut f = std::fs::File::open(path)?;
-                    let len = f.metadata()?.len();
-                    let (rs, rb) = self.write_data_to_blocks(&mut f, len)?;
-                    (rs, rb, len as u32)
-                }
+            // Validate name: must be encodable in Mac Roman, 1-31 bytes, no ':'
+            if name.contains(':') {
+                return Err(FilesystemError::InvalidData(
+                    "name cannot contain ':'".into(),
+                ));
             }
-        } else {
-            (0, 0, 0)
-        };
+            let name_bytes = utf8_to_mac_roman(name)?;
+            if name_bytes.is_empty() || name_bytes.len() > 31 {
+                return Err(FilesystemError::InvalidData(
+                    "name must be 1-31 Mac Roman bytes".into(),
+                ));
+            }
 
-        // Build file record
-        let file_rec = Self::build_file_record(
-            file_id,
-            data_len as u32,
-            data_start,
-            data_blocks,
-            rsrc_size,
-            rsrc_start,
-            rsrc_blocks,
-            &type_code,
-            &creator_code,
-            self.mdb.block_size,
-        );
+            // Check for duplicates
+            if self
+                .find_catalog_record_by_name(parent_id, &name_bytes)
+                .is_some()
+            {
+                return Err(FilesystemError::AlreadyExists(name.into()));
+            }
 
-        // Build key + record for catalog insertion
-        let key = Self::build_catalog_key(parent_id, &name_bytes);
-        let mut key_record = key;
-        key_record.extend_from_slice(&file_rec);
+            // Assign CNID
+            let file_id = self.mdb.next_catalog_id;
+            self.mdb.next_catalog_id += 1;
 
-        self.insert_catalog_record(&key_record)?;
+            // Determine type/creator
+            let ext = name.rsplit('.').next().unwrap_or("");
+            let (type_code, creator_code) = if let (Some(tc), Some(cc)) =
+                (options.type_code.as_ref(), options.creator_code.as_ref())
+            {
+                (hfs_common::encode_fourcc(tc), hfs_common::encode_fourcc(cc))
+            } else {
+                hfs_common::type_creator_for_extension(ext).unwrap_or(([0; 4], [0; 4]))
+            };
 
-        // Build and insert thread record
-        let (_, thread_data) =
-            Self::build_thread_record(CATALOG_FILE_THREAD, parent_id, &name_bytes);
-        let thread_key = Self::build_catalog_key(file_id, &[]);
-        let mut thread_record = thread_key;
-        thread_record.extend_from_slice(&thread_data);
-        self.insert_catalog_record(&thread_record)?;
+            // Allocate blocks and write data
+            let (data_start, data_blocks) = self.write_data_to_blocks(data, data_len)?;
 
-        // Update parent valence
-        self.update_parent_valence(parent_id, 1)?;
+            // Handle resource fork
+            let (rsrc_start, rsrc_blocks, rsrc_size) =
+                if let Some(ref rsrc_src) = options.resource_fork {
+                    match rsrc_src {
+                        super::filesystem::ResourceForkSource::Data(rsrc_data) => {
+                            let mut cursor = std::io::Cursor::new(rsrc_data);
+                            let (rs, rb) =
+                                self.write_data_to_blocks(&mut cursor, rsrc_data.len() as u64)?;
+                            (rs, rb, rsrc_data.len() as u32)
+                        }
+                        super::filesystem::ResourceForkSource::File(path) => {
+                            let mut f = std::fs::File::open(path)?;
+                            let len = f.metadata()?.len();
+                            let (rs, rb) = self.write_data_to_blocks(&mut f, len)?;
+                            (rs, rb, len as u32)
+                        }
+                    }
+                } else {
+                    (0, 0, 0)
+                };
 
-        // Update MDB counts
-        self.mdb.file_count += 1;
+            // Build file record
+            let file_rec = Self::build_file_record(
+                file_id,
+                data_len as u32,
+                data_start,
+                data_blocks,
+                rsrc_size,
+                rsrc_start,
+                rsrc_blocks,
+                &type_code,
+                &creator_code,
+                self.mdb.block_size,
+            );
 
-        self.do_sync_metadata()?;
+            // Build key + record for catalog insertion
+            let key = Self::build_catalog_key(parent_id, &name_bytes);
+            let mut key_record = key;
+            key_record.extend_from_slice(&file_rec);
 
-        let path = if parent.path == "/" {
-            format!("/{name}")
-        } else {
-            format!("{}/{name}", parent.path)
-        };
-        let mut fe = FileEntry::new_file(name.to_string(), path, data_len, file_id as u64);
-        let tc_str = String::from_utf8_lossy(&type_code).to_string();
-        let cc_str = String::from_utf8_lossy(&creator_code).to_string();
-        if type_code != [0; 4] {
-            fe.type_code = Some(tc_str);
-            fe.creator_code = Some(cc_str);
+            self.insert_catalog_record(&key_record)?;
+
+            // Build and insert thread record
+            let (_, thread_data) =
+                Self::build_thread_record(CATALOG_FILE_THREAD, parent_id, &name_bytes);
+            let thread_key = Self::build_catalog_key(file_id, &[]);
+            let mut thread_record = thread_key;
+            thread_record.extend_from_slice(&thread_data);
+            self.insert_catalog_record(&thread_record)?;
+
+            // Update parent valence
+            self.update_parent_valence(parent_id, 1)?;
+
+            // Update MDB counts
+            self.mdb.file_count += 1;
+
+            let path = if parent.path == "/" {
+                format!("/{name}")
+            } else {
+                format!("{}/{name}", parent.path)
+            };
+            let mut fe = FileEntry::new_file(name.to_string(), path, data_len, file_id as u64);
+            let tc_str = String::from_utf8_lossy(&type_code).to_string();
+            let cc_str = String::from_utf8_lossy(&creator_code).to_string();
+            if type_code != [0; 4] {
+                fe.type_code = Some(tc_str);
+                fe.creator_code = Some(cc_str);
+            }
+            if rsrc_size > 0 {
+                fe.resource_fork_size = Some(rsrc_size as u64);
+            }
+            Ok(fe)
+        })();
+        if result.is_err() {
+            self.restore_snapshot(snap);
         }
-        if rsrc_size > 0 {
-            fe.resource_fork_size = Some(rsrc_size as u64);
-        }
-        Ok(fe)
+        result
     }
 
     fn create_directory(
@@ -1429,69 +1444,74 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
         name: &str,
         _options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
-        let parent_id = parent.location as u32;
+        let snap = self.snapshot();
+        let result = (|| {
+            let parent_id = parent.location as u32;
 
-        // Validate
-        if name.contains(':') {
-            return Err(FilesystemError::InvalidData(
-                "name cannot contain ':'".into(),
-            ));
+            // Validate
+            if name.contains(':') {
+                return Err(FilesystemError::InvalidData(
+                    "name cannot contain ':'".into(),
+                ));
+            }
+            let name_bytes = utf8_to_mac_roman(name)?;
+            if name_bytes.is_empty() || name_bytes.len() > 31 {
+                return Err(FilesystemError::InvalidData(
+                    "name must be 1-31 Mac Roman bytes".into(),
+                ));
+            }
+
+            // Check duplicates
+            if self
+                .find_catalog_record_by_name(parent_id, &name_bytes)
+                .is_some()
+            {
+                return Err(FilesystemError::AlreadyExists(name.into()));
+            }
+
+            // Assign CNID
+            let folder_id = self.mdb.next_catalog_id;
+            self.mdb.next_catalog_id += 1;
+
+            // Build folder record
+            let folder_rec = Self::build_dir_record(folder_id);
+
+            // Build key + record
+            let key = Self::build_catalog_key(parent_id, &name_bytes);
+            let mut key_record = key;
+            key_record.extend_from_slice(&folder_rec);
+
+            self.insert_catalog_record(&key_record)?;
+
+            // Thread record
+            let (_, thread_data) =
+                Self::build_thread_record(CATALOG_DIR_THREAD, parent_id, &name_bytes);
+            let thread_key = Self::build_catalog_key(folder_id, &[]);
+            let mut thread_record = thread_key;
+            thread_record.extend_from_slice(&thread_data);
+            self.insert_catalog_record(&thread_record)?;
+
+            // Update parent valence
+            self.update_parent_valence(parent_id, 1)?;
+
+            // Update MDB
+            self.mdb.folder_count += 1;
+
+            let path = if parent.path == "/" {
+                format!("/{name}")
+            } else {
+                format!("{}/{name}", parent.path)
+            };
+            Ok(FileEntry::new_directory(
+                name.to_string(),
+                path,
+                folder_id as u64,
+            ))
+        })();
+        if result.is_err() {
+            self.restore_snapshot(snap);
         }
-        let name_bytes = utf8_to_mac_roman(name)?;
-        if name_bytes.is_empty() || name_bytes.len() > 31 {
-            return Err(FilesystemError::InvalidData(
-                "name must be 1-31 Mac Roman bytes".into(),
-            ));
-        }
-
-        // Check duplicates
-        if self
-            .find_catalog_record_by_name(parent_id, &name_bytes)
-            .is_some()
-        {
-            return Err(FilesystemError::AlreadyExists(name.into()));
-        }
-
-        // Assign CNID
-        let folder_id = self.mdb.next_catalog_id;
-        self.mdb.next_catalog_id += 1;
-
-        // Build folder record
-        let folder_rec = Self::build_dir_record(folder_id);
-
-        // Build key + record
-        let key = Self::build_catalog_key(parent_id, &name_bytes);
-        let mut key_record = key;
-        key_record.extend_from_slice(&folder_rec);
-
-        self.insert_catalog_record(&key_record)?;
-
-        // Thread record
-        let (_, thread_data) =
-            Self::build_thread_record(CATALOG_DIR_THREAD, parent_id, &name_bytes);
-        let thread_key = Self::build_catalog_key(folder_id, &[]);
-        let mut thread_record = thread_key;
-        thread_record.extend_from_slice(&thread_data);
-        self.insert_catalog_record(&thread_record)?;
-
-        // Update parent valence
-        self.update_parent_valence(parent_id, 1)?;
-
-        // Update MDB
-        self.mdb.folder_count += 1;
-
-        self.do_sync_metadata()?;
-
-        let path = if parent.path == "/" {
-            format!("/{name}")
-        } else {
-            format!("{}/{name}", parent.path)
-        };
-        Ok(FileEntry::new_directory(
-            name.to_string(),
-            path,
-            folder_id as u64,
-        ))
+        result
     }
 
     fn delete_entry(
@@ -1499,54 +1519,63 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
         parent: &FileEntry,
         entry: &FileEntry,
     ) -> Result<(), FilesystemError> {
-        let parent_id = parent.location as u32;
-        let cnid = entry.location as u32;
+        let snap = self.snapshot();
+        let result = (|| {
+            let parent_id = parent.location as u32;
+            let cnid = entry.location as u32;
 
-        // Check directory is empty
-        if entry.is_directory() {
-            let children = self.list_children(cnid)?;
-            if !children.is_empty() {
-                return Err(FilesystemError::InvalidData(
-                    "cannot delete non-empty directory".into(),
-                ));
+            // Check directory is empty
+            if entry.is_directory() {
+                let children = self.list_children(cnid)?;
+                if !children.is_empty() {
+                    return Err(FilesystemError::InvalidData(
+                        "cannot delete non-empty directory".into(),
+                    ));
+                }
             }
-        }
 
-        // Find the entry record
-        let name_bytes = utf8_to_mac_roman(&entry.name)?;
-        let (node_idx, rec_idx, _offset) = self
-            .find_catalog_record_by_name(parent_id, &name_bytes)
-            .ok_or_else(|| {
-                FilesystemError::NotFound(format!("entry '{}' not found in catalog", entry.name))
-            })?;
+            // Find the entry record
+            let name_bytes = utf8_to_mac_roman(&entry.name)?;
+            let (node_idx, rec_idx, _offset) = self
+                .find_catalog_record_by_name(parent_id, &name_bytes)
+                .ok_or_else(|| {
+                    FilesystemError::NotFound(format!(
+                        "entry '{}' not found in catalog",
+                        entry.name
+                    ))
+                })?;
 
-        // If it's a file, free its fork blocks
-        if !entry.is_directory() {
-            if let Some((_, data_extents, _, rsrc_extents)) = self.find_file_by_id(cnid) {
-                self.free_extent_blocks(&data_extents);
-                self.free_extent_blocks(&rsrc_extents);
+            // If it's a file, free its fork blocks
+            if !entry.is_directory() {
+                if let Some((_, data_extents, _, rsrc_extents)) = self.find_file_by_id(cnid) {
+                    self.free_extent_blocks(&data_extents);
+                    self.free_extent_blocks(&rsrc_extents);
+                }
             }
+
+            self.remove_catalog_record(node_idx, rec_idx);
+
+            // Find and remove the thread record
+            if let Some((t_node, t_rec, _)) = self.find_catalog_record_by_cnid(cnid) {
+                self.remove_catalog_record(t_node, t_rec);
+            }
+
+            // Update parent valence
+            self.update_parent_valence(parent_id, -1)?;
+
+            // Update MDB counts
+            if entry.is_directory() {
+                self.mdb.folder_count = self.mdb.folder_count.saturating_sub(1);
+            } else {
+                self.mdb.file_count = self.mdb.file_count.saturating_sub(1);
+            }
+
+            Ok(())
+        })();
+        if result.is_err() {
+            self.restore_snapshot(snap);
         }
-
-        self.remove_catalog_record(node_idx, rec_idx);
-
-        // Find and remove the thread record
-        if let Some((t_node, t_rec, _)) = self.find_catalog_record_by_cnid(cnid) {
-            self.remove_catalog_record(t_node, t_rec);
-        }
-
-        // Update parent valence
-        self.update_parent_valence(parent_id, -1)?;
-
-        // Update MDB counts
-        if entry.is_directory() {
-            self.mdb.folder_count = self.mdb.folder_count.saturating_sub(1);
-        } else {
-            self.mdb.file_count = self.mdb.file_count.saturating_sub(1);
-        }
-
-        self.do_sync_metadata()?;
-        Ok(())
+        result
     }
 
     fn set_type_creator(
@@ -1555,47 +1584,54 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
         type_code: &str,
         creator_code: &str,
     ) -> Result<(), FilesystemError> {
-        let cnid = entry.location as u32;
+        let snap = self.snapshot();
+        let result = (|| {
+            let cnid = entry.location as u32;
 
-        // Find the thread to get parent + name
-        let (_t_node, _t_rec, t_offset) =
-            self.find_catalog_record_by_cnid(cnid).ok_or_else(|| {
-                FilesystemError::NotFound(format!("thread for CNID {cnid} not found"))
-            })?;
+            // Find the thread to get parent + name
+            let (_t_node, _t_rec, t_offset) =
+                self.find_catalog_record_by_cnid(cnid).ok_or_else(|| {
+                    FilesystemError::NotFound(format!("thread for CNID {cnid} not found"))
+                })?;
 
-        // Read parent_id and name from thread record data
-        let key_len = self.catalog_data[t_offset] as usize;
-        let mut rec_data_start = t_offset + 1 + key_len;
-        if rec_data_start % 2 != 0 {
-            rec_data_start += 1;
+            // Read parent_id and name from thread record data
+            let key_len = self.catalog_data[t_offset] as usize;
+            let mut rec_data_start = t_offset + 1 + key_len;
+            if rec_data_start % 2 != 0 {
+                rec_data_start += 1;
+            }
+            // Thread record: type(1) + reserved(1) + reserved(8) + parentID(4) + name(Pascal)
+            let thread_parent =
+                BigEndian::read_u32(&self.catalog_data[rec_data_start + 10..rec_data_start + 14]);
+            let thread_name_len = self.catalog_data[rec_data_start + 14] as usize;
+            let thread_name = self.catalog_data
+                [rec_data_start + 15..rec_data_start + 15 + thread_name_len]
+                .to_vec();
+
+            // Find the actual file record
+            let (_f_node, _f_rec, f_offset) = self
+                .find_catalog_record_by_name(thread_parent, &thread_name)
+                .ok_or_else(|| FilesystemError::NotFound("file record not found".into()))?;
+
+            // Compute record data offset
+            let fkey_len = self.catalog_data[f_offset] as usize;
+            let mut frec_start = f_offset + 1 + fkey_len;
+            if frec_start % 2 != 0 {
+                frec_start += 1;
+            }
+
+            // Write type at offset 4, creator at offset 8 in the file record
+            let tc = hfs_common::encode_fourcc(type_code);
+            let cc = hfs_common::encode_fourcc(creator_code);
+            self.catalog_data[frec_start + 4..frec_start + 8].copy_from_slice(&tc);
+            self.catalog_data[frec_start + 8..frec_start + 12].copy_from_slice(&cc);
+
+            Ok(())
+        })();
+        if result.is_err() {
+            self.restore_snapshot(snap);
         }
-        // Thread record: type(1) + reserved(1) + reserved(8) + parentID(4) + name(Pascal)
-        let thread_parent =
-            BigEndian::read_u32(&self.catalog_data[rec_data_start + 10..rec_data_start + 14]);
-        let thread_name_len = self.catalog_data[rec_data_start + 14] as usize;
-        let thread_name =
-            self.catalog_data[rec_data_start + 15..rec_data_start + 15 + thread_name_len].to_vec();
-
-        // Find the actual file record
-        let (_f_node, _f_rec, f_offset) = self
-            .find_catalog_record_by_name(thread_parent, &thread_name)
-            .ok_or_else(|| FilesystemError::NotFound("file record not found".into()))?;
-
-        // Compute record data offset
-        let fkey_len = self.catalog_data[f_offset] as usize;
-        let mut frec_start = f_offset + 1 + fkey_len;
-        if frec_start % 2 != 0 {
-            frec_start += 1;
-        }
-
-        // Write type at offset 4, creator at offset 8 in the file record
-        let tc = hfs_common::encode_fourcc(type_code);
-        let cc = hfs_common::encode_fourcc(creator_code);
-        self.catalog_data[frec_start + 4..frec_start + 8].copy_from_slice(&tc);
-        self.catalog_data[frec_start + 8..frec_start + 12].copy_from_slice(&cc);
-
-        self.do_sync_metadata()?;
-        Ok(())
+        result
     }
 
     fn write_resource_fork(
@@ -1604,73 +1640,80 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
         data: &mut dyn std::io::Read,
         len: u64,
     ) -> Result<(), FilesystemError> {
-        let cnid = entry.location as u32;
+        let snap = self.snapshot();
+        let result = (|| {
+            let cnid = entry.location as u32;
 
-        // Free existing resource fork blocks
-        if let Some((_, _, _, rsrc_extents)) = self.find_file_by_id(cnid) {
-            self.free_extent_blocks(&rsrc_extents);
+            // Free existing resource fork blocks
+            if let Some((_, _, _, rsrc_extents)) = self.find_file_by_id(cnid) {
+                self.free_extent_blocks(&rsrc_extents);
+            }
+
+            // Allocate and write new resource fork
+            let (rsrc_start, rsrc_blocks) = self.write_data_to_blocks(data, len)?;
+
+            // Find the file record via thread
+            let (_t_node, _t_rec, t_offset) =
+                self.find_catalog_record_by_cnid(cnid).ok_or_else(|| {
+                    FilesystemError::NotFound(format!("thread for CNID {cnid} not found"))
+                })?;
+
+            let key_len = self.catalog_data[t_offset] as usize;
+            let mut rec_data_start = t_offset + 1 + key_len;
+            if rec_data_start % 2 != 0 {
+                rec_data_start += 1;
+            }
+            let thread_parent =
+                BigEndian::read_u32(&self.catalog_data[rec_data_start + 10..rec_data_start + 14]);
+            let thread_name_len = self.catalog_data[rec_data_start + 14] as usize;
+            let thread_name = self.catalog_data
+                [rec_data_start + 15..rec_data_start + 15 + thread_name_len]
+                .to_vec();
+
+            let (_f_node, _f_rec, f_offset) = self
+                .find_catalog_record_by_name(thread_parent, &thread_name)
+                .ok_or_else(|| FilesystemError::NotFound("file record not found".into()))?;
+
+            let fkey_len = self.catalog_data[f_offset] as usize;
+            let mut frec_start = f_offset + 1 + fkey_len;
+            if frec_start % 2 != 0 {
+                frec_start += 1;
+            }
+
+            // Update rsrc fork fields in file record:
+            // filRStBlk at offset 34
+            BigEndian::write_u16(
+                &mut self.catalog_data[frec_start + 34..frec_start + 36],
+                rsrc_start,
+            );
+            // filRLgLen at offset 36
+            BigEndian::write_u32(
+                &mut self.catalog_data[frec_start + 36..frec_start + 40],
+                len as u32,
+            );
+            // filRPyLen at offset 40
+            BigEndian::write_u32(
+                &mut self.catalog_data[frec_start + 40..frec_start + 44],
+                rsrc_blocks as u32 * self.mdb.block_size,
+            );
+            // Rsrc extents at offset 86
+            BigEndian::write_u16(
+                &mut self.catalog_data[frec_start + 86..frec_start + 88],
+                rsrc_start,
+            );
+            BigEndian::write_u16(
+                &mut self.catalog_data[frec_start + 88..frec_start + 90],
+                rsrc_blocks,
+            );
+            // Clear remaining rsrc extent slots
+            self.catalog_data[frec_start + 90..frec_start + 98].fill(0);
+
+            Ok(())
+        })();
+        if result.is_err() {
+            self.restore_snapshot(snap);
         }
-
-        // Allocate and write new resource fork
-        let (rsrc_start, rsrc_blocks) = self.write_data_to_blocks(data, len)?;
-
-        // Find the file record via thread
-        let (_t_node, _t_rec, t_offset) =
-            self.find_catalog_record_by_cnid(cnid).ok_or_else(|| {
-                FilesystemError::NotFound(format!("thread for CNID {cnid} not found"))
-            })?;
-
-        let key_len = self.catalog_data[t_offset] as usize;
-        let mut rec_data_start = t_offset + 1 + key_len;
-        if rec_data_start % 2 != 0 {
-            rec_data_start += 1;
-        }
-        let thread_parent =
-            BigEndian::read_u32(&self.catalog_data[rec_data_start + 10..rec_data_start + 14]);
-        let thread_name_len = self.catalog_data[rec_data_start + 14] as usize;
-        let thread_name =
-            self.catalog_data[rec_data_start + 15..rec_data_start + 15 + thread_name_len].to_vec();
-
-        let (_f_node, _f_rec, f_offset) = self
-            .find_catalog_record_by_name(thread_parent, &thread_name)
-            .ok_or_else(|| FilesystemError::NotFound("file record not found".into()))?;
-
-        let fkey_len = self.catalog_data[f_offset] as usize;
-        let mut frec_start = f_offset + 1 + fkey_len;
-        if frec_start % 2 != 0 {
-            frec_start += 1;
-        }
-
-        // Update rsrc fork fields in file record:
-        // filRStBlk at offset 34
-        BigEndian::write_u16(
-            &mut self.catalog_data[frec_start + 34..frec_start + 36],
-            rsrc_start,
-        );
-        // filRLgLen at offset 36
-        BigEndian::write_u32(
-            &mut self.catalog_data[frec_start + 36..frec_start + 40],
-            len as u32,
-        );
-        // filRPyLen at offset 40
-        BigEndian::write_u32(
-            &mut self.catalog_data[frec_start + 40..frec_start + 44],
-            rsrc_blocks as u32 * self.mdb.block_size,
-        );
-        // Rsrc extents at offset 86
-        BigEndian::write_u16(
-            &mut self.catalog_data[frec_start + 86..frec_start + 88],
-            rsrc_start,
-        );
-        BigEndian::write_u16(
-            &mut self.catalog_data[frec_start + 88..frec_start + 90],
-            rsrc_blocks,
-        );
-        // Clear remaining rsrc extent slots
-        self.catalog_data[frec_start + 90..frec_start + 98].fill(0);
-
-        self.do_sync_metadata()?;
-        Ok(())
+        result
     }
 
     fn repair(&mut self) -> Result<super::fsck::RepairReport, FilesystemError> {
@@ -1737,13 +1780,20 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
     }
 
     fn set_blessed_folder(&mut self, entry: &FileEntry) -> Result<(), FilesystemError> {
-        if !entry.is_directory() {
-            return Err(FilesystemError::InvalidData(
-                "can only bless a directory".into(),
-            ));
+        let snap = self.snapshot();
+        let result = (|| {
+            if !entry.is_directory() {
+                return Err(FilesystemError::InvalidData(
+                    "can only bless a directory".into(),
+                ));
+            }
+            self.mdb.finder_info[0] = entry.location as u32;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.restore_snapshot(snap);
         }
-        self.mdb.finder_info[0] = entry.location as u32;
-        self.do_sync_metadata()
+        result
     }
 }
 

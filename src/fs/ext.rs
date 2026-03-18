@@ -1668,8 +1668,6 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
         // Add directory entry
         self.add_dir_entry(parent_inode, name, new_inode, FT_REG_FILE)?;
 
-        self.sync_metadata()?;
-
         let path = if parent.path == "/" {
             format!("/{name}")
         } else {
@@ -1742,8 +1740,6 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
         // Increment parent's link count (for the .. reference)
         self.update_inode_links(parent_inode, 1)?;
 
-        self.sync_metadata()?;
-
         let path = if parent.path == "/" {
             format!("/{name}")
         } else {
@@ -1791,7 +1787,6 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
         // Free the inode
         self.free_inode(entry_inode)?;
 
-        self.sync_metadata()?;
         Ok(())
     }
 
@@ -1812,7 +1807,6 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
         self.reader.seek(SeekFrom::Start(base))?;
         self.reader.write_all(&(new_mode as u16).to_le_bytes())?;
 
-        self.reader.flush()?;
         Ok(())
     }
 
