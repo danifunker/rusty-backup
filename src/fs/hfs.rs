@@ -76,6 +76,18 @@ pub fn mac_roman_to_utf8(data: &[u8]) -> String {
         .collect()
 }
 
+/// Returns `true` if the catalog B-tree header is all zeros (uninitialized).
+/// Some formatters (notably Disk Jockey's "Empty HFS" image) allocate the
+/// catalog extents but leave the bytes zeroed, which would otherwise cause a
+/// panic on the first insert because `node_size` parses as 0.
+fn is_catalog_uninitialized(catalog_data: &[u8]) -> bool {
+    if catalog_data.len() < 34 {
+        return true;
+    }
+    // node_size field in the BTHeaderRec sits at catalog byte 32..34.
+    BigEndian::read_u16(&catalog_data[32..34]) == 0
+}
+
 /// HFS extent descriptor: start_block (u16) + block_count (u16).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HfsExtDescriptor {
@@ -1122,6 +1134,251 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
         self.reader.flush()?;
         Ok(())
     }
+
+    /// If the catalog and/or extents-overflow B-trees are blank (e.g. Disk
+    /// Jockey "Empty HFS" output where the MDB reserves extents for both
+    /// B-trees but leaves the bytes zeroed), build fresh B-trees and commit
+    /// them to disk. Subsequent edits can then use the normal insert paths
+    /// instead of panicking on an empty B-tree header.
+    fn ensure_catalog_initialized(&mut self) -> Result<(), FilesystemError> {
+        let catalog_blank = is_catalog_uninitialized(&self.catalog_data);
+        // Read the extents B-tree bytes so we can detect a blank one.
+        let extents_data = if self.mdb.extents_file_size > 0 {
+            read_fork_data(
+                &mut self.reader,
+                self.partition_offset,
+                &self.mdb,
+                &self.mdb.extents_file_extents,
+                self.mdb.extents_file_size as u64,
+            )
+            .ok()
+        } else {
+            None
+        };
+        let extents_blank = extents_data
+            .as_deref()
+            .map(is_catalog_uninitialized)
+            .unwrap_or(false);
+        if !catalog_blank && !extents_blank {
+            return Ok(());
+        }
+        self.initialize_empty_btrees(catalog_blank, extents_blank)
+    }
+
+    fn initialize_empty_btrees(
+        &mut self,
+        init_catalog: bool,
+        init_extents: bool,
+    ) -> Result<(), FilesystemError> {
+        if init_catalog {
+            let catalog_size = self.catalog_data.len();
+            if catalog_size < 1024 {
+                return Err(FilesystemError::InvalidData(format!(
+                    "cannot initialize empty HFS catalog: region is only {catalog_size} bytes"
+                )));
+            }
+            let buf = build_empty_hfs_catalog(catalog_size)?;
+            self.catalog_data = buf;
+            self.write_catalog()?;
+        }
+
+        if init_extents {
+            let extents_size = self.mdb.extents_file_size as usize;
+            if extents_size >= 512 {
+                let buf = build_empty_hfs_extents_btree(extents_size)?;
+                write_hfs_fork_data(
+                    &mut self.reader,
+                    self.partition_offset,
+                    &self.mdb,
+                    &self.mdb.extents_file_extents,
+                    &buf,
+                )?;
+            }
+        }
+
+        // Rebuild the volume bitmap from scratch: only the blocks occupied by
+        // the two B-trees should be marked allocated. This avoids trusting any
+        // pre-existing garbage in the on-disk bitmap.
+        let bitmap_size = (self.mdb.total_blocks as u32).div_ceil(8) as usize;
+        let mut bitmap = vec![0u8; bitmap_size];
+        let mut used_blocks = 0u32;
+        for ext in self.mdb.catalog_file_extents.iter() {
+            if ext.block_count == 0 {
+                break;
+            }
+            for i in 0..ext.block_count {
+                let bit = ext.start_block as u32 + i as u32;
+                if bit < self.mdb.total_blocks as u32 {
+                    hfs_common::bitmap_set_bit_be(&mut bitmap, bit);
+                    used_blocks += 1;
+                }
+            }
+        }
+        for ext in self.mdb.extents_file_extents.iter() {
+            if ext.block_count == 0 {
+                break;
+            }
+            for i in 0..ext.block_count {
+                let bit = ext.start_block as u32 + i as u32;
+                if bit < self.mdb.total_blocks as u32 {
+                    hfs_common::bitmap_set_bit_be(&mut bitmap, bit);
+                    used_blocks += 1;
+                }
+            }
+        }
+        self.bitmap = Some(bitmap);
+        self.mdb.free_blocks = (self.mdb.total_blocks as u32).saturating_sub(used_blocks) as u16;
+
+        // Reset volume counters to reflect a truly-empty volume.
+        self.mdb.file_count = 0;
+        self.mdb.folder_count = 0;
+        if self.mdb.next_catalog_id < 16 {
+            self.mdb.next_catalog_id = 16;
+        }
+        self.mdb.modify_date = hfs_common::hfs_now();
+
+        self.write_volume_bitmap()?;
+        self.write_mdb()?;
+        self.reader.flush()?;
+        Ok(())
+    }
+}
+
+/// Build a fresh classic HFS catalog B-tree with a header node plus a single
+/// leaf node containing the root directory record and its thread record.
+fn build_empty_hfs_catalog(catalog_size: usize) -> Result<Vec<u8>, FilesystemError> {
+    let node_size = 512usize;
+    let total_nodes = (catalog_size / node_size) as u32;
+    if total_nodes < 2 {
+        return Err(FilesystemError::InvalidData(format!(
+            "cannot initialize empty HFS catalog: only {total_nodes} node(s) fit"
+        )));
+    }
+    let mut buf = vec![0u8; catalog_size];
+
+    // ---- Node 0: B-tree header node (kind=1, 3 records) ----
+    buf[8] = hfs_common::BTREE_HEADER_NODE as u8;
+    buf[9] = 0;
+    BigEndian::write_u16(&mut buf[10..12], 3);
+
+    // BTHeaderRec at offset 14
+    BigEndian::write_u16(&mut buf[14..16], 1); // depth
+    BigEndian::write_u32(&mut buf[16..20], 1); // rootNode = 1
+    BigEndian::write_u32(&mut buf[20..24], 2); // leafRecords
+    BigEndian::write_u32(&mut buf[24..28], 1); // firstLeafNode
+    BigEndian::write_u32(&mut buf[28..32], 1); // lastLeafNode
+    BigEndian::write_u16(&mut buf[32..34], node_size as u16); // nodeSize
+    BigEndian::write_u16(&mut buf[34..36], 37); // maxKeyLen
+    BigEndian::write_u32(&mut buf[36..40], total_nodes);
+    BigEndian::write_u32(&mut buf[40..44], total_nodes - 2); // freeNodes
+
+    // Record 1: user data at offset 120 (128 bytes zero)
+    // Record 2: node-allocation bitmap at offset 248; mark nodes 0 and 1 used.
+    let bitmap_rec_offset = 248usize;
+    buf[bitmap_rec_offset] = 0b11000000;
+
+    // Offset table for header node (stored bottom-up)
+    let free_offset = (node_size - 8) as u16;
+    BigEndian::write_u16(&mut buf[node_size - 2..node_size], 14);
+    BigEndian::write_u16(&mut buf[node_size - 4..node_size - 2], 120);
+    BigEndian::write_u16(
+        &mut buf[node_size - 6..node_size - 4],
+        bitmap_rec_offset as u16,
+    );
+    BigEndian::write_u16(&mut buf[node_size - 8..node_size - 6], free_offset);
+
+    // ---- Node 1: Leaf node with root dir record + thread ----
+    let leaf = node_size;
+    buf[leaf + 8] = hfs_common::BTREE_LEAF_NODE as u8; // -1
+    buf[leaf + 9] = 1; // height
+    BigEndian::write_u16(&mut buf[leaf + 10..leaf + 12], 2); // 2 records
+
+    // Record 0: Root directory (key: parent CNID 1, empty name)
+    let r0_key = leaf + 14;
+    buf[r0_key] = 6; // key_len = resv+parID+nameLen = 6
+    buf[r0_key + 1] = 0;
+    BigEndian::write_u32(&mut buf[r0_key + 2..r0_key + 6], 1);
+    buf[r0_key + 6] = 0; // name_len
+    buf[r0_key + 7] = 0; // pad to even
+    let r0_data = r0_key + 8; // 22
+    buf[r0_data] = CATALOG_DIR as u8;
+    BigEndian::write_u32(&mut buf[r0_data + 6..r0_data + 10], 2); // dirDirID = root CNID 2
+    let now = hfs_common::hfs_now();
+    BigEndian::write_u32(&mut buf[r0_data + 10..r0_data + 14], now); // crDate
+    BigEndian::write_u32(&mut buf[r0_data + 14..r0_data + 18], now); // mdDate
+                                                                     // Remainder of the 70-byte CdrDirRec stays zero.
+
+    // Record 1: Root directory thread (key: parent CNID 2, empty name)
+    let r1_key = r0_data + 70; // 92
+    buf[r1_key] = 6;
+    buf[r1_key + 1] = 0;
+    BigEndian::write_u32(&mut buf[r1_key + 2..r1_key + 6], 2);
+    buf[r1_key + 6] = 0;
+    buf[r1_key + 7] = 0;
+    let r1_data = r1_key + 8; // 100
+    buf[r1_data] = CATALOG_DIR_THREAD as u8;
+    BigEndian::write_u32(&mut buf[r1_data + 10..r1_data + 14], 1); // thdParID = 1
+                                                                   // Remaining bytes (Str31 name, 32 bytes) stay zero. Thread record = 46 bytes.
+
+    let free_rel = (r1_data + 46 - leaf) as u16; // 146
+
+    // Leaf offset table (2 records + free space)
+    BigEndian::write_u16(&mut buf[leaf + node_size - 2..leaf + node_size], 14);
+    BigEndian::write_u16(
+        &mut buf[leaf + node_size - 4..leaf + node_size - 2],
+        (r1_key - leaf) as u16,
+    );
+    BigEndian::write_u16(
+        &mut buf[leaf + node_size - 6..leaf + node_size - 4],
+        free_rel,
+    );
+
+    Ok(buf)
+}
+
+/// Build a fresh classic HFS extents-overflow B-tree containing only the
+/// header node (no leaf records). This is the minimal valid shape for a
+/// volume with no files that spill beyond three extents per fork.
+fn build_empty_hfs_extents_btree(size: usize) -> Result<Vec<u8>, FilesystemError> {
+    let node_size = 512usize;
+    let total_nodes = (size / node_size) as u32;
+    if total_nodes < 1 {
+        return Err(FilesystemError::InvalidData(format!(
+            "cannot initialize empty HFS extents B-tree: region is only {size} bytes"
+        )));
+    }
+    let mut buf = vec![0u8; size];
+
+    buf[8] = hfs_common::BTREE_HEADER_NODE as u8;
+    buf[9] = 0;
+    BigEndian::write_u16(&mut buf[10..12], 3);
+
+    // BTHeaderRec: depth=0, root=0, no leaves.
+    BigEndian::write_u16(&mut buf[14..16], 0); // depth
+    BigEndian::write_u32(&mut buf[16..20], 0); // rootNode
+    BigEndian::write_u32(&mut buf[20..24], 0); // leafRecords
+    BigEndian::write_u32(&mut buf[24..28], 0); // firstLeafNode
+    BigEndian::write_u32(&mut buf[28..32], 0); // lastLeafNode
+    BigEndian::write_u16(&mut buf[32..34], node_size as u16); // nodeSize
+    BigEndian::write_u16(&mut buf[34..36], 7); // maxKeyLen for extents key (keyLen+forkType+fileID+startBlock)
+    BigEndian::write_u32(&mut buf[36..40], total_nodes);
+    BigEndian::write_u32(&mut buf[40..44], total_nodes - 1); // only header node used
+
+    // Record 1: user data (128 bytes, zero) at offset 120
+    // Record 2: node bitmap at offset 248; mark only node 0 (header).
+    let bitmap_rec_offset = 248usize;
+    buf[bitmap_rec_offset] = 0b10000000;
+
+    let free_offset = (node_size - 8) as u16;
+    BigEndian::write_u16(&mut buf[node_size - 2..node_size], 14);
+    BigEndian::write_u16(&mut buf[node_size - 4..node_size - 2], 120);
+    BigEndian::write_u16(
+        &mut buf[node_size - 6..node_size - 4],
+        bitmap_rec_offset as u16,
+    );
+    BigEndian::write_u16(&mut buf[node_size - 8..node_size - 6], free_offset);
+
+    Ok(buf)
 }
 
 impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
@@ -1317,6 +1574,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
         data_len: u64,
         options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
+        self.ensure_catalog_initialized()?;
         let snap = self.snapshot();
         let result = (|| {
             let parent_id = parent.location as u32;
@@ -1444,6 +1702,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
         name: &str,
         _options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
+        self.ensure_catalog_initialized()?;
         let snap = self.snapshot();
         let result = (|| {
             let parent_id = parent.location as u32;
@@ -2403,6 +2662,107 @@ mod tests {
         img[mdb_off..mdb_off + 512].copy_from_slice(&mdb);
 
         img
+    }
+
+    /// Create an "uninitialized" HFS image mimicking Disk Jockey's Empty HFS
+    /// output: MDB present with catalog/extents extents reserved, but the
+    /// catalog and extents-overflow regions are all zeros and the volume
+    /// bitmap is blank.
+    fn make_uninitialized_hfs_image() -> Vec<u8> {
+        let block_size = 512u32;
+        let total_blocks = 256u16;
+        let first_alloc_block = 6u16;
+        let alloc_start = first_alloc_block as usize * 512;
+        let image_size = alloc_start + total_blocks as usize * block_size as usize;
+        let mut img = vec![0u8; image_size];
+
+        // Extents B-tree: blocks 0..3 (4 × 512 = 2048 bytes)
+        let extents_start = 0u16;
+        let extents_blocks = 4u16;
+        // Catalog B-tree: blocks 4..7 (4 × 512 = 2048 bytes)
+        let catalog_start = 4u16;
+        let catalog_blocks = 4u16;
+
+        // MDB at byte 1024, bitmap at sector 3 (byte 1536), both left blank
+        // for the catalog and extents regions.
+        let mdb_off = 1024usize;
+        let mut mdb = [0u8; 512];
+        BigEndian::write_u16(&mut mdb[0..2], HFS_SIGNATURE);
+        BigEndian::write_u32(&mut mdb[2..6], hfs_common::hfs_now());
+        BigEndian::write_u32(&mut mdb[6..10], hfs_common::hfs_now());
+        BigEndian::write_u16(&mut mdb[14..16], 3); // vbm_block sector
+        BigEndian::write_u16(&mut mdb[18..20], total_blocks);
+        BigEndian::write_u32(&mut mdb[20..24], block_size);
+        BigEndian::write_u16(&mut mdb[28..30], first_alloc_block);
+        BigEndian::write_u32(&mut mdb[30..34], 16);
+        BigEndian::write_u16(
+            &mut mdb[34..36],
+            total_blocks - extents_blocks - catalog_blocks,
+        );
+        // Volume name "Blank"
+        mdb[36] = 5;
+        mdb[37..42].copy_from_slice(b"Blank");
+        // Extents file
+        BigEndian::write_u32(&mut mdb[130..134], extents_blocks as u32 * block_size);
+        BigEndian::write_u16(&mut mdb[134..136], extents_start);
+        BigEndian::write_u16(&mut mdb[136..138], extents_blocks);
+        // Catalog file
+        BigEndian::write_u32(&mut mdb[146..150], catalog_blocks as u32 * block_size);
+        BigEndian::write_u16(&mut mdb[150..152], catalog_start);
+        BigEndian::write_u16(&mut mdb[152..154], catalog_blocks);
+
+        img[mdb_off..mdb_off + 512].copy_from_slice(&mdb);
+        img
+    }
+
+    #[test]
+    fn test_hfs_empty_volume_auto_initialize_and_create_file() {
+        // Blank catalog + extents regions should be auto-initialized on the
+        // first mutating call instead of panicking in btree_find_insert_leaf.
+        let img = make_uninitialized_hfs_image();
+        let cursor = Cursor::new(img);
+        let mut fs = HfsFilesystem::open(cursor, 0).unwrap();
+        assert_eq!(fs.fs_type(), "HFS");
+
+        // list_directory on a blank catalog returns an empty list (no panic).
+        let root = fs.root().unwrap();
+        let entries = fs.list_directory(&root).unwrap();
+        assert!(entries.is_empty());
+
+        // create_file triggers the auto-init path.
+        let data = b"auto-init test";
+        let mut cursor = Cursor::new(data.as_slice());
+        let fe = fs
+            .create_file(
+                &root,
+                "hello.txt",
+                &mut cursor,
+                data.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(fe.name, "hello.txt");
+        fs.sync_metadata().unwrap();
+
+        // The new file should be listed and readable.
+        let entries = fs.list_directory(&root).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "hello.txt");
+        let read_back = fs.read_file(&fe, 1024).unwrap();
+        assert_eq!(&read_back, data);
+
+        // fsck should report no errors or warnings on the initialized volume.
+        let result = fs.fsck().unwrap();
+        let err_msgs: Vec<_> = result.errors.iter().map(|e| e.message.clone()).collect();
+        let warn_msgs: Vec<_> = result.warnings.iter().map(|w| w.message.clone()).collect();
+        assert!(
+            result.errors.is_empty(),
+            "unexpected fsck errors: {err_msgs:?}"
+        );
+        assert!(
+            result.warnings.is_empty(),
+            "unexpected fsck warnings: {warn_msgs:?}"
+        );
     }
 
     #[test]

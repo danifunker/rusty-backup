@@ -130,13 +130,17 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
                 _ => {}
             }
             // ProDOS volume directory key block: prev_block==0, storage_type nibble==0xF,
-            // entry_length==39, entries_per_block==13
+            // entry_length==39, entries_per_block==13.
+            // The directory header entry starts at offset 4 (after the 4-byte
+            // prev/next block pointers), so entry_length (offset 31) and
+            // entries_per_block (offset 32) within the entry land at block
+            // bytes 35 and 36.
             if buf[0] == 0
                 && buf[1] == 0
                 && (buf[4] >> 4) == 0xF
                 && (buf[4] & 0xF) >= 1
-                && buf[27] == 39
-                && buf[28] == 13
+                && buf[35] == 39
+                && buf[36] == 13
             {
                 return Some("ProDOS".to_string());
             }

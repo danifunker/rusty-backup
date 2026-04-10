@@ -112,13 +112,17 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
                 return "ext";
             }
             // ProDOS volume directory key block: prev_block==0, storage_type nibble==0xF,
-            // entry_length==39, entries_per_block==13
+            // entry_length==39, entries_per_block==13.
+            // The directory header entry starts at offset 4 (after the 4-byte
+            // prev/next block pointers), so entry_length and entries_per_block
+            // (offsets 31 and 32 within the 39-byte header entry) land at
+            // block bytes 35 and 36.
             if sb_buf[0] == 0
                 && sb_buf[1] == 0
                 && (sb_buf[4] >> 4) == 0xF
                 && (sb_buf[4] & 0xF) >= 1
-                && sb_buf[27] == 39
-                && sb_buf[28] == 13
+                && sb_buf[35] == 39
+                && sb_buf[36] == 13
             {
                 return "prodos";
             }
@@ -578,6 +582,18 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     partition_offset,
                 )?)),
                 "ext" => Ok(Box::new(ext::ExtFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "hfs" => Ok(Box::new(hfs::HfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "hfsplus" => Ok(Box::new(hfsplus::HfsPlusFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "prodos" => Ok(Box::new(prodos::ProDosFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),

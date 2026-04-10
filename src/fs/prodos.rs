@@ -1001,8 +1001,8 @@ pub fn resize_prodos_in_place(
         return Ok(());
     }
 
-    let old_total = u16::from_le_bytes([sector[33], sector[34]]);
-    let bitmap_pointer = u16::from_le_bytes([sector[31], sector[32]]);
+    let old_total = u16::from_le_bytes([sector[41], sector[42]]);
+    let bitmap_pointer = u16::from_le_bytes([sector[39], sector[40]]);
 
     // Count used blocks to guard against shrinking into data.
     let bitmap_blocks_needed = ((old_total as u32 + 4095) / 4096) as usize;
@@ -1042,8 +1042,8 @@ pub fn resize_prodos_in_place(
 
     // Patch total_blocks in the key block and write it back.
     let tb = new_total.to_le_bytes();
-    sector[33] = tb[0];
-    sector[34] = tb[1];
+    sector[41] = tb[0];
+    sector[42] = tb[1];
     device.seek(SeekFrom::Start(partition_offset + 1024))?;
     device.write_all(&sector)?;
 
@@ -1097,9 +1097,9 @@ pub fn validate_prodos_integrity(
         return Ok(warnings);
     }
 
-    let entry_length = sector[27];
-    let entries_per_block = sector[28];
-    let total_blocks = u16::from_le_bytes([sector[33], sector[34]]);
+    let entry_length = sector[35];
+    let entries_per_block = sector[36];
+    let total_blocks = u16::from_le_bytes([sector[41], sector[42]]);
 
     if entry_length != 39 {
         warnings.push(format!(
@@ -1146,8 +1146,11 @@ fn read_volume_header<R: Read + Seek>(
         .map(|&b| b as char)
         .collect();
 
-    let bitmap_pointer = u16::from_le_bytes([buf[31], buf[32]]);
-    let total_blocks = u16::from_le_bytes([buf[33], buf[34]]);
+    // Volume header entry fields live at block offset 4 + N. bit_map_pointer
+    // is at entry offset 35 (block 39) and total_blocks at entry offset 37
+    // (block 41), both little-endian u16.
+    let bitmap_pointer = u16::from_le_bytes([buf[39], buf[40]]);
+    let total_blocks = u16::from_le_bytes([buf[41], buf[42]]);
 
     // Build a temporary header so read_bitmap can iterate correctly.
     let tmp = ProDosVolumeHeader {
@@ -1219,13 +1222,17 @@ fn infer_storage_type(eof: usize) -> u32 {
 }
 
 fn validate_volume_key_block(buf: &[u8]) -> bool {
-    buf.len() >= 29
+    // The volume directory header entry starts at block offset 4 (after the
+    // 4-byte prev_block/next_block pointers). entry_length (offset 31 within
+    // the entry) and entries_per_block (offset 32 within the entry) therefore
+    // land at block offsets 35 and 36.
+    buf.len() >= 43
         && buf[0] == 0
         && buf[1] == 0 // prev_block == 0
-        && (buf[4] >> 4) == 0xF // storage_type nibble = volume dir
+        && (buf[4] >> 4) == 0xF // storage_type nibble = volume dir header
         && (buf[4] & 0xF) >= 1 // name_length valid
-        && buf[27] == 39 // entry_length
-        && buf[28] == 13 // entries_per_block
+        && buf[35] == 39 // entry_length
+        && buf[36] == 13 // entries_per_block
 }
 
 fn list_prodos_directory<R: Read + Seek>(
@@ -1257,8 +1264,8 @@ fn list_prodos_directory<R: Read + Seek>(
             let type_nibble = e[0] >> 4;
             let name_len = (e[0] & 0xF) as usize;
 
-            // Skip deleted (0), volume directory header (0xF), subdir header (0xD).
-            if type_nibble == 0 || type_nibble == 0xF || type_nibble == 0xD {
+            // Skip deleted (0), volume directory header (0xF), subdir header (0xE).
+            if type_nibble == 0 || type_nibble == 0xF || type_nibble == 0xE {
                 continue;
             }
             if name_len == 0 || name_len > 15 {
@@ -1283,7 +1290,7 @@ fn list_prodos_directory<R: Read + Seek>(
             let modified = parse_prodos_datetime(modified_date, modified_time)
                 .or_else(|| parse_prodos_datetime(creation_date, creation_time));
 
-            if type_nibble == 0xE {
+            if type_nibble == 0xD {
                 // Subdirectory entry: key_pointer is the subdirectory key block.
                 let mut fe = FileEntry::new_directory(name, path, key_pointer as u64);
                 fe.modified = modified;
@@ -1530,13 +1537,15 @@ mod tests {
         block[7] = b'A';
         block[8] = b'N';
         block[9] = b'K';
-        block[27] = 39; // entry_length
-        block[28] = 13; // entries_per_block
-        block[31] = 6;
-        block[32] = 0; // bitmap_pointer = 6
+        // Volume header entry fields live at block offset 4 + N (entry starts
+        // after the 4-byte prev/next block pointers).
+        block[35] = 39; // entry_length (entry offset 31)
+        block[36] = 13; // entries_per_block (entry offset 32)
+        block[39] = 6;
+        block[40] = 0; // bitmap_pointer (entry offset 35) = 6
         let tb: u16 = 280;
-        block[33] = tb as u8;
-        block[34] = (tb >> 8) as u8; // total_blocks = 280
+        block[41] = tb as u8;
+        block[42] = (tb >> 8) as u8; // total_blocks (entry offset 37) = 280
         block
     }
 
@@ -1576,7 +1585,7 @@ mod tests {
         assert!(validate_volume_key_block(&vk));
 
         let mut bad = vk;
-        bad[27] = 40; // wrong entry_length
+        bad[35] = 40; // wrong entry_length
         assert!(!validate_volume_key_block(&bad));
 
         let mut bad2 = vk;
@@ -1693,7 +1702,7 @@ mod tests {
         cursor.seek(SeekFrom::Start(1024)).unwrap();
         let mut sector = [0u8; 512];
         cursor.read_exact(&mut sector).unwrap();
-        let new_total = u16::from_le_bytes([sector[33], sector[34]]);
+        let new_total = u16::from_le_bytes([sector[41], sector[42]]);
         assert_eq!(new_total, 400);
     }
 
@@ -1707,7 +1716,7 @@ mod tests {
         cursor.seek(SeekFrom::Start(1024)).unwrap();
         let mut sector = [0u8; 512];
         cursor.read_exact(&mut sector).unwrap();
-        let total = u16::from_le_bytes([sector[33], sector[34]]);
+        let total = u16::from_le_bytes([sector[41], sector[42]]);
         assert_eq!(total, 280); // unchanged
     }
 
