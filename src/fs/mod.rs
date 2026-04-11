@@ -176,7 +176,7 @@ fn detect_0x07_type<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> &'
 ///   bad superblock); the message explains the failure
 /// - `Err("unsupported: ...")` — the filesystem type has no compact reader
 pub fn try_compact_partition_reader<R: Read + Seek + Send + 'static>(
-    mut reader: R,
+    reader: R,
     partition_offset: u64,
     partition_type: u8,
     partition_type_string: Option<&str>,

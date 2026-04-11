@@ -2025,7 +2025,6 @@ pub fn build_relocation_map<R: Read + Seek>(
     let blocks_per_group = le32(&sb, 0x20);
     let inodes_per_group = le32(&sb, 0x28);
     let inode_size = u16::from_le_bytes([sb[0x58], sb[0x59]]);
-    let feature_compat = le32(&sb, 0x5C);
     let feature_incompat = le32(&sb, 0x60);
     let feature_ro_compat = le32(&sb, 0x64);
 
@@ -2502,12 +2501,8 @@ fn patch_extent_tree_in_inode<R: Read + Seek>(
                     .copy_from_slice(&((new_block >> 32) as u16).to_le_bytes());
             }
 
-            // Read the child block and patch its contents
-            let read_from = relocations
-                .get(&child_block)
-                .copied()
-                .unwrap_or(child_block);
-            // Actually we read from the ORIGINAL location (the source disk hasn't moved data)
+            // Read the child block from its ORIGINAL location — the source disk
+            // hasn't moved data; relocations only affect the emitted stream.
             reader.seek(SeekFrom::Start(partition_offset + child_block * block_size))?;
             let mut child_data = vec![0u8; block_size as usize];
             reader.read_exact(&mut child_data)?;
@@ -3443,15 +3438,6 @@ impl<R: Read + Seek + Send> CompactExtReader<R> {
                 gdt_backup.resize(gdt_total_blocks as usize * block_size as usize, 0);
                 sections.push(CompactSection::PreBuilt(gdt_backup));
             }
-
-            // Determine where group-local metadata starts (after any SB/GDT backup)
-            let meta_start = if group == 0 {
-                sb_gdt_blocks
-            } else if has_superblock_backup(group as u32, sparse_super) {
-                1 + gdt_total_blocks // SB + GDT blocks
-            } else {
-                0
-            };
 
             // Emit remaining blocks using the rebuilt bitmap
             let emit_start = if group == 0 {

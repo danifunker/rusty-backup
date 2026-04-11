@@ -61,10 +61,7 @@ enum HfsFsckCode {
     IndexSiblingLinkBroken,
     InvalidRecordLength,
     // Catalog consistency
-    MissingFileThread,
     MissingDirThread,
-    MissingFileRecord,
-    MissingDirRecord,
     ThreadParentNameMismatch,
     FileCountMismatch,
     FolderCountMismatch,
@@ -109,7 +106,6 @@ fn is_repairable(code: HfsFsckCode) -> bool {
             | HfsFsckCode::InvalidCatalogName
             | HfsFsckCode::OffsetTableNotMonotonic
             | HfsFsckCode::OffsetTableOutOfBounds
-            | HfsFsckCode::MissingFileThread
             | HfsFsckCode::MissingParent
     )
 }
@@ -176,7 +172,7 @@ pub(crate) fn check_hfs_integrity(
 
     // Phase 1b: Alternate MDB cross-check
     if let Some(alt_sector) = alt_mdb_sector {
-        check_alternate_mdb(mdb, alt_sector, &mut errors, &mut warnings);
+        check_alternate_mdb(mdb, alt_sector, &mut errors);
     }
 
     // Phase 1c: Embedded HFS+ wrapper check
@@ -1843,7 +1839,6 @@ fn check_alternate_mdb(
     mdb: &HfsMasterDirectoryBlock,
     alt_sector: &[u8; 512],
     errors: &mut Vec<FsckIssue>,
-    warnings: &mut Vec<FsckIssue>,
 ) {
     let alt_sig = BigEndian::read_u16(&alt_sector[0..2]);
     if alt_sig != 0x4244 {
@@ -2793,8 +2788,6 @@ enum CatalogEntry {
         rsrc_extents: [HfsExtDescriptor; 3],
         rsrc_size: u32,
         rsrc_physical_size: u32,
-        data_start_block: u16,
-        rsrc_start_block: u16,
         reserved_byte: u8,
     },
     DirThread {
@@ -2969,8 +2962,6 @@ fn check_catalog_consistency(
                 data_physical_size,
                 rsrc_size,
                 rsrc_physical_size,
-                data_start_block,
-                rsrc_start_block,
                 reserved_byte,
                 ..
             } => {
@@ -3315,10 +3306,8 @@ fn parse_catalog_record(node: &[u8], node_size: usize, rec_idx: usize) -> Option
             let rec = &node[rec_data_offset..];
             let reserved_byte = rec[1];
             let file_id = BigEndian::read_u32(&rec[20..24]);
-            let data_start_block = BigEndian::read_u16(&rec[24..26]);
             let data_size = BigEndian::read_u32(&rec[26..30]);
             let data_physical_size = BigEndian::read_u32(&rec[30..34]);
-            let rsrc_start_block = BigEndian::read_u16(&rec[34..36]);
             let rsrc_size = BigEndian::read_u32(&rec[36..40]);
             let rsrc_physical_size = BigEndian::read_u32(&rec[40..44]);
             let mut data_extents = [HfsExtDescriptor {
@@ -3347,8 +3336,6 @@ fn parse_catalog_record(node: &[u8], node_size: usize, rec_idx: usize) -> Option
                 rsrc_extents,
                 rsrc_size,
                 rsrc_physical_size,
-                data_start_block,
-                rsrc_start_block,
                 reserved_byte,
             })
         }
@@ -5760,17 +5747,11 @@ mod tests {
         let mdb = make_test_mdb();
         let alt = make_alt_mdb_sector(&mdb);
         let mut errors = Vec::new();
-        let mut warnings = Vec::new();
-        check_alternate_mdb(&mdb, &alt, &mut errors, &mut warnings);
+        check_alternate_mdb(&mdb, &alt, &mut errors);
         assert!(
             errors.is_empty(),
             "matching alt MDB should not error: {:?}",
             errors.iter().map(|e| &e.message).collect::<Vec<_>>()
-        );
-        assert!(
-            warnings.is_empty(),
-            "matching alt MDB should not warn: {:?}",
-            warnings.iter().map(|e| &e.message).collect::<Vec<_>>()
         );
     }
 
@@ -5780,8 +5761,7 @@ mod tests {
         let mut alt = make_alt_mdb_sector(&mdb);
         BigEndian::write_u32(&mut alt[20..24], 8192); // different block size
         let mut errors = Vec::new();
-        let mut warnings = Vec::new();
-        check_alternate_mdb(&mdb, &alt, &mut errors, &mut warnings);
+        check_alternate_mdb(&mdb, &alt, &mut errors);
         assert!(
             errors
                 .iter()
@@ -5796,19 +5776,13 @@ mod tests {
         let mdb = make_test_mdb();
         let alt = [0u8; 512]; // all zeros — no valid MDB signature
         let mut errors = Vec::new();
-        let mut warnings = Vec::new();
-        check_alternate_mdb(&mdb, &alt, &mut errors, &mut warnings);
+        check_alternate_mdb(&mdb, &alt, &mut errors);
         // Can't distinguish "missing" from "looked in the wrong place"
         // (partition larger than allocation area), so produce nothing.
         assert!(
             errors.is_empty(),
             "unexpected errors: {:?}",
             errors.iter().map(|e| &e.message).collect::<Vec<_>>()
-        );
-        assert!(
-            warnings.is_empty(),
-            "unexpected warnings: {:?}",
-            warnings.iter().map(|e| &e.message).collect::<Vec<_>>()
         );
     }
 

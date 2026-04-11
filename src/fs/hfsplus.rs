@@ -901,19 +901,6 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
         Ok(())
     }
 
-    /// Reload the catalog from disk.
-    fn reload_catalog(&mut self) -> Result<(), FilesystemError> {
-        self.catalog_data = read_fork(
-            &mut self.reader,
-            self.partition_offset,
-            self.vh.block_size,
-            &self.vh.catalog_file,
-        )?;
-        self.catalog_header = BTreeHeaderRecord::parse(&self.catalog_data[14..14 + 106]);
-        self.label = find_volume_label(&self.catalog_data, &self.catalog_header);
-        Ok(())
-    }
-
     /// Allocate `count` contiguous blocks from the allocation bitmap.
     /// Returns the start block index.
     fn allocate_blocks(&mut self, count: u32) -> Result<u32, FilesystemError> {

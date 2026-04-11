@@ -42,11 +42,6 @@ enum StagedEdit {
         parent: FileEntry,
         entry: FileEntry,
     },
-    SetTypeCreator {
-        entry: FileEntry,
-        type_code: String,
-        creator_code: String,
-    },
     SetProdosType {
         entry: FileEntry,
         type_byte: u8,
@@ -440,14 +435,6 @@ impl BrowseView {
                 self.active = true;
             }
         }
-    }
-
-    /// Switch the active streaming view to use a completed seekable cache file.
-    ///
-    /// Only acts if the browser is currently in active streaming mode
-    /// Override whether editing is supported for the current source.
-    pub fn set_edit_supported(&mut self, supported: bool) {
-        self.edit_supported = supported;
     }
 
     /// Set up archive edit context so that toggling edit mode triggers
@@ -1588,33 +1575,6 @@ impl BrowseView {
         }
     }
 
-    /// Invalidate directory cache for a path and its ancestors.
-    fn invalidate_cache_for(&mut self, dir_path: &str) {
-        self.directory_cache.remove(dir_path);
-        // Also reload from filesystem
-        let entry = if dir_path == "/" {
-            self.root.clone()
-        } else {
-            // Find the entry in the cache
-            let mut found = None;
-            for entries in self.directory_cache.values() {
-                for e in entries {
-                    if e.path == dir_path && e.is_directory() {
-                        found = Some(e.clone());
-                        break;
-                    }
-                }
-                if found.is_some() {
-                    break;
-                }
-            }
-            found
-        };
-        if let Some(entry) = entry {
-            self.load_directory(&entry);
-        }
-    }
-
     /// Check if an entry is pending deletion in the staged edits.
     fn is_pending_delete(&self, entry: &FileEntry) -> bool {
         self.staged_edits.iter().any(|edit| match edit {
@@ -2026,11 +1986,6 @@ impl BrowseView {
                 StagedEdit::DeleteRecursive { parent, entry } => {
                     efs.delete_recursive(parent, entry)
                 }
-                StagedEdit::SetTypeCreator {
-                    entry,
-                    type_code,
-                    creator_code,
-                } => efs.set_type_creator(entry, type_code, creator_code),
                 StagedEdit::SetProdosType {
                     entry,
                     type_byte,
