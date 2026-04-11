@@ -172,6 +172,17 @@ fn table() -> &'static ProdosTypeTable {
     TABLE.get_or_init(build_table)
 }
 
+/// Return all known ProDOS file types sorted ascending by type byte.
+///
+/// Each tuple is `(byte, info)`. Useful for populating GUI dropdowns.
+pub fn all_types() -> Vec<(u8, &'static ProdosTypeInfo)> {
+    let t = table();
+    let mut v: Vec<(u8, &'static ProdosTypeInfo)> =
+        t.by_byte.iter().map(|(k, v)| (*k, v)).collect();
+    v.sort_by_key(|(k, _)| *k);
+    v
+}
+
 /// Look up the 3-letter abbreviation for a ProDOS file type byte.
 /// Returns "???" for unknown types.
 pub fn type_abbr(file_type: u8) -> &'static str {

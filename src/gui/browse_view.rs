@@ -25,6 +25,10 @@ enum StagedEdit {
         name: String,
         host_path: PathBuf,
         size: u64,
+        /// ProDOS-specific overrides. None means "auto-detect from the host
+        /// filename extension at apply time".
+        prodos_type: Option<u8>,
+        prodos_aux: Option<u16>,
     },
     CreateDirectory {
         parent: FileEntry,
@@ -42,6 +46,11 @@ enum StagedEdit {
         entry: FileEntry,
         type_code: String,
         creator_code: String,
+    },
+    SetProdosType {
+        entry: FileEntry,
+        type_byte: u8,
+        aux_type: u16,
     },
     BlessFolder {
         entry: FileEntry,
@@ -127,6 +136,8 @@ pub struct BrowseView {
     zstd_cache: Option<Arc<Mutex<ZstdStreamCache>>>,
     /// Resource fork handling mode (HFS/HFS+ only).
     resource_fork_mode: ResourceForkMode,
+    /// How to encode ProDOS type/aux on extract (ProDOS only).
+    prodos_export_mode: ProdosExportMode,
     /// Active extraction progress (shared with background thread).
     extraction_progress: Option<Arc<Mutex<ExtractionProgress>>>,
     /// Message to show after extraction completes.
@@ -171,12 +182,57 @@ pub struct BrowseView {
     staged_edits: Vec<StagedEdit>,
     /// Whether to show the "unsaved changes" confirmation dialog.
     show_unsaved_dialog: bool,
+    /// State for the "Set ProDOS Type…" dialog (None == closed).
+    prodos_type_dialog: Option<ProdosTypeDialogState>,
+}
+
+/// Transient state for the "Set ProDOS Type…" dialog.
+#[derive(Debug, Clone)]
+struct ProdosTypeDialogState {
+    /// Target entry (existing file) — cloned at dialog-open time.
+    entry: FileEntry,
+    /// If `Some(i)`, the entry is a pending `StagedEdit::AddFile` at index `i`
+    /// in `staged_edits` and applying the dialog should mutate it in place.
+    staged_index: Option<usize>,
+    /// Current type byte.
+    type_byte: u8,
+    /// Current aux type.
+    aux_type: u16,
+    /// Freeform hex input for the type byte (kept in sync with the dropdown,
+    /// also used for types not in the embedded table).
+    type_hex: String,
+    /// Freeform hex input for the aux type.
+    aux_hex: String,
+    /// Transient validation error for display below the inputs.
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 enum FileContent {
     Binary(Vec<u8>),
     Text(String),
+}
+
+/// How to encode ProDOS file type/aux when extracting files to a host
+/// directory. Only meaningful for ProDOS filesystems.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ProdosExportMode {
+    /// Append a CiderPress `#TTAAAA` suffix to each extracted filename so
+    /// type and aux survive a round-trip back into ProDOS.
+    WithTypeSuffix,
+    /// Write the bare ProDOS name (lossy — type/aux are dropped).
+    Plain,
+}
+
+impl ProdosExportMode {
+    const ALL: [ProdosExportMode; 2] = [ProdosExportMode::WithTypeSuffix, ProdosExportMode::Plain];
+
+    fn label(&self) -> &'static str {
+        match self {
+            ProdosExportMode::WithTypeSuffix => "Name + #TTAAAA suffix",
+            ProdosExportMode::Plain => "Bare name (lossy)",
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -208,6 +264,7 @@ impl Default for BrowseView {
             partclone_cache: None,
             zstd_cache: None,
             resource_fork_mode: ResourceForkMode::AppleDouble,
+            prodos_export_mode: ProdosExportMode::WithTypeSuffix,
             extraction_progress: None,
             extraction_result: None,
             edit_mode: false,
@@ -230,6 +287,7 @@ impl Default for BrowseView {
             tree_show_ids: false,
             staged_edits: Vec::new(),
             show_unsaved_dialog: false,
+            prodos_type_dialog: None,
         }
     }
 }
@@ -488,6 +546,11 @@ impl BrowseView {
         ft == "HFS" || ft == "HFS+" || ft == "HFSX"
     }
 
+    /// Returns true if the current filesystem is ProDOS.
+    fn is_prodos_type(&self) -> bool {
+        self.fs_type == "ProDOS"
+    }
+
     pub fn show(&mut self, ui: &mut egui::Ui) {
         if !self.active {
             return;
@@ -668,6 +731,9 @@ impl BrowseView {
         // New folder dialog
         self.render_new_folder_dialog(ui);
 
+        // ProDOS "Set Type…" dialog
+        self.render_prodos_type_dialog(ui);
+
         // Two-panel layout: tree | content
         let available = ui.available_size();
         let tree_width = (available.x * 0.4).max(200.0).min(400.0);
@@ -791,14 +857,50 @@ impl BrowseView {
                     .unwrap_or(false);
 
                 let size_str = entry.size_string();
+                // ProDOS entries get an inline "$XX ABC" type badge so the user
+                // can see the file's type/aux without clicking into it.
+                let prodos_badge = if self.is_prodos_type() {
+                    entry.type_code.as_deref().map(|tc| tc.to_string())
+                } else {
+                    None
+                };
+                let hover_text = prodos_badge.as_ref().map(|_| {
+                    let tc = entry.type_code.as_deref().unwrap_or("");
+                    let tt = tc
+                        .split_whitespace()
+                        .next()
+                        .and_then(|s| u8::from_str_radix(s.trim_start_matches('$'), 16).ok())
+                        .unwrap_or(0);
+                    let desc = rusty_backup::fs::prodos_types::type_description(tt);
+                    let aux = entry.aux_type.unwrap_or(0);
+                    if desc.is_empty() {
+                        format!("{tc} • ${:04X}", aux)
+                    } else {
+                        format!("{desc} • ${:04X}", aux)
+                    }
+                });
 
                 if pending_del {
-                    let label = format!("{}  ({})", entry.name, size_str);
+                    let label = if let Some(ref b) = prodos_badge {
+                        format!("{}  [{}]  ({})", entry.name, b, size_str)
+                    } else {
+                        format!("{}  ({})", entry.name, size_str)
+                    };
                     let text = egui::RichText::new(&label).color(dimmed).strikethrough();
                     ui.label(text);
                 } else {
-                    let label = format!("{}  ({})", entry.name, size_str);
-                    if ui.selectable_label(is_selected, &label).clicked() {
+                    let label = if let Some(ref b) = prodos_badge {
+                        format!("{}  [{}]  ({})", entry.name, b, size_str)
+                    } else {
+                        format!("{}  ({})", entry.name, size_str)
+                    };
+                    let resp = ui.selectable_label(is_selected, &label);
+                    let resp = if let Some(h) = hover_text {
+                        resp.on_hover_text(h)
+                    } else {
+                        resp
+                    };
+                    if resp.clicked() {
                         self.select_file(entry);
                     }
                 }
@@ -1014,6 +1116,24 @@ impl BrowseView {
                             ui.add_space(8.0);
                         }
 
+                        // ProDOS export mode dropdown (ProDOS only)
+                        if self.is_prodos_type() {
+                            ui.label("Export name:");
+                            let current_label = self.prodos_export_mode.label();
+                            egui::ComboBox::from_id_salt("prodos_export_mode")
+                                .selected_text(current_label)
+                                .show_ui(ui, |ui| {
+                                    for mode in &ProdosExportMode::ALL {
+                                        ui.selectable_value(
+                                            &mut self.prodos_export_mode,
+                                            *mode,
+                                            mode.label(),
+                                        );
+                                    }
+                                });
+                            ui.add_space(8.0);
+                        }
+
                         let btn_label = if entry.is_directory() {
                             "Extract Folder..."
                         } else {
@@ -1097,6 +1217,8 @@ impl BrowseView {
         let preopen_file = self.preopen_file.clone();
         let resource_fork_mode = self.resource_fork_mode;
         let is_hfs = self.is_hfs_type();
+        let is_prodos = self.is_prodos_type();
+        let prodos_export_mode = self.prodos_export_mode;
 
         let progress = Arc::new(Mutex::new(ExtractionProgress {
             current_bytes: 0,
@@ -1125,6 +1247,8 @@ impl BrowseView {
                 &dest,
                 resource_fork_mode,
                 is_hfs,
+                is_prodos,
+                prodos_export_mode,
                 &progress,
             );
 
@@ -1625,6 +1749,24 @@ impl BrowseView {
                 }
             }
 
+            // Set ProDOS Type… button (ProDOS only, file selected)
+            if self.is_prodos_type() {
+                let can_set_type = has_selection
+                    && self
+                        .selected_entry
+                        .as_ref()
+                        .map(|e| e.is_file())
+                        .unwrap_or(false);
+                if ui
+                    .add_enabled(can_set_type, egui::Button::new("Set Type…"))
+                    .clicked()
+                {
+                    if let Some(ref sel) = self.selected_entry.clone() {
+                        self.open_prodos_type_dialog(sel.clone());
+                    }
+                }
+            }
+
             // Bless Folder button (HFS/HFS+ only)
             if self.is_hfs_type() {
                 let can_bless = has_selection
@@ -1742,11 +1884,23 @@ impl BrowseView {
         host_path: &std::path::Path,
         parent: &FileEntry,
     ) -> Result<(), String> {
-        let name = host_path
+        let raw_name = host_path
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or("invalid filename")?
             .to_string();
+
+        // ProDOS targets: strip any trailing CiderPress `#TTAAAA` suffix from
+        // the host filename and use the decoded (type, aux) as staged
+        // overrides so the round-trip `drag-out → drag-back-in` is lossless.
+        let (name, prodos_type, prodos_aux) = if self.is_prodos_type() {
+            match rusty_backup::fs::prodos_types::decode_cp_suffix(&raw_name) {
+                Some((stem, tt, aa)) => (stem.to_string(), Some(tt), Some(aa)),
+                None => (raw_name, None, None),
+            }
+        } else {
+            (raw_name, None, None)
+        };
 
         // Check for duplicate name in pending adds for this parent
         let pending = self.pending_adds_for(&parent.path);
@@ -1763,6 +1917,8 @@ impl BrowseView {
             name,
             host_path: host_path.to_path_buf(),
             size,
+            prodos_type,
+            prodos_aux,
         });
         Ok(())
     }
@@ -1849,16 +2005,18 @@ impl BrowseView {
                     name,
                     host_path,
                     size,
+                    prodos_type,
+                    prodos_aux,
                 } => match File::open(host_path) {
-                    Ok(mut file) => efs
-                        .create_file(
-                            parent,
-                            name,
-                            &mut file,
-                            *size,
-                            &CreateFileOptions::default(),
-                        )
-                        .map(|_| ()),
+                    Ok(mut file) => {
+                        let opts = CreateFileOptions {
+                            type_code: prodos_type.map(|t| format!("${:02X}", t)),
+                            aux_type: *prodos_aux,
+                            ..Default::default()
+                        };
+                        efs.create_file(parent, name, &mut file, *size, &opts)
+                            .map(|_| ())
+                    }
                     Err(e) => Err(FilesystemError::Io(e)),
                 },
                 StagedEdit::CreateDirectory { parent, name } => efs
@@ -1873,6 +2031,11 @@ impl BrowseView {
                     type_code,
                     creator_code,
                 } => efs.set_type_creator(entry, type_code, creator_code),
+                StagedEdit::SetProdosType {
+                    entry,
+                    type_byte,
+                    aux_type,
+                } => efs.set_prodos_type(entry, *type_byte, *aux_type),
                 StagedEdit::BlessFolder { entry } => efs.set_blessed_folder(entry),
             };
 
@@ -1910,6 +2073,210 @@ impl BrowseView {
                 self.root = Some(root);
             }
         }
+    }
+
+    /// Open the "Set ProDOS Type…" dialog for a given file entry. If the
+    /// entry is a pending `AddFile` staged edit, the dialog will mutate it
+    /// in place on Apply instead of pushing a new `SetProdosType` edit.
+    fn open_prodos_type_dialog(&mut self, entry: FileEntry) {
+        // Seed the dialog from whatever we currently know about this entry.
+        // For an existing on-disk file, `entry.aux_type` is populated by
+        // `list_prodos_directory` and `type_code` looks like "$XX ABC".
+        // For a pending add we read the staged override if set.
+        let (mut type_byte, mut aux_type) = {
+            let parsed_tc = entry
+                .type_code
+                .as_ref()
+                .and_then(|tc| {
+                    tc.split_whitespace()
+                        .next()
+                        .and_then(|s| u8::from_str_radix(s.trim_start_matches('$'), 16).ok())
+                })
+                .unwrap_or(0x06);
+            (parsed_tc, entry.aux_type.unwrap_or(0))
+        };
+
+        let mut staged_index: Option<usize> = None;
+        let entry_full_path = entry.path.clone();
+        for (i, edit) in self.staged_edits.iter().enumerate() {
+            if let StagedEdit::AddFile {
+                parent,
+                name,
+                prodos_type,
+                prodos_aux,
+                ..
+            } = edit
+            {
+                let p = if parent.path == "/" {
+                    format!("/{name}")
+                } else {
+                    format!("{}/{name}", parent.path)
+                };
+                if p == entry_full_path {
+                    staged_index = Some(i);
+                    if let Some(t) = prodos_type {
+                        type_byte = *t;
+                    }
+                    if let Some(a) = prodos_aux {
+                        aux_type = *a;
+                    }
+                    break;
+                }
+            }
+        }
+
+        self.prodos_type_dialog = Some(ProdosTypeDialogState {
+            entry,
+            staged_index,
+            type_byte,
+            aux_type,
+            type_hex: format!("{:02X}", type_byte),
+            aux_hex: format!("{:04X}", aux_type),
+            error: None,
+        });
+    }
+
+    /// Render the "Set ProDOS Type…" dialog. No-op when closed.
+    fn render_prodos_type_dialog(&mut self, ui: &mut egui::Ui) {
+        let Some(mut state) = self.prodos_type_dialog.take() else {
+            return;
+        };
+        let mut keep_open = true;
+        let mut apply_clicked = false;
+
+        egui::Window::new("Set ProDOS Type")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ui.ctx(), |ui| {
+                ui.label(format!("File: {}", state.entry.path));
+                ui.add_space(6.0);
+
+                // Type dropdown — all entries in the embedded prodos_types table.
+                let types = rusty_backup::fs::prodos_types::all_types();
+                let current_label = format!(
+                    "${:02X} {} — {}",
+                    state.type_byte,
+                    rusty_backup::fs::prodos_types::type_abbr(state.type_byte),
+                    rusty_backup::fs::prodos_types::type_description(state.type_byte),
+                );
+                ui.horizontal(|ui| {
+                    ui.label("Type:");
+                    egui::ComboBox::from_id_salt("prodos_type_combo")
+                        .selected_text(current_label)
+                        .width(320.0)
+                        .show_ui(ui, |ui| {
+                            for (byte, info) in &types {
+                                let label =
+                                    format!("${:02X} {} — {}", byte, info.abbr, info.description);
+                                if ui
+                                    .selectable_label(*byte == state.type_byte, label)
+                                    .clicked()
+                                {
+                                    state.type_byte = *byte;
+                                    state.type_hex = format!("{:02X}", byte);
+                                }
+                            }
+                        });
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Custom type (hex):  $");
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut state.type_hex)
+                            .desired_width(40.0)
+                            .char_limit(2),
+                    );
+                    if r.changed() {
+                        if let Ok(v) = u8::from_str_radix(state.type_hex.trim(), 16) {
+                            state.type_byte = v;
+                            state.error = None;
+                        }
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Aux type (hex):      $");
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut state.aux_hex)
+                            .desired_width(60.0)
+                            .char_limit(4),
+                    );
+                    if r.changed() {
+                        if let Ok(v) = u16::from_str_radix(state.aux_hex.trim(), 16) {
+                            state.aux_type = v;
+                            state.error = None;
+                        }
+                    }
+                });
+
+                if let Some(err) = &state.error {
+                    ui.colored_label(egui::Color32::from_rgb(255, 120, 120), err);
+                }
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Apply").clicked() {
+                        // Re-validate hex inputs on apply in case the user typed
+                        // something invalid and never blurred the field.
+                        let tb = u8::from_str_radix(state.type_hex.trim(), 16);
+                        let aux = u16::from_str_radix(state.aux_hex.trim(), 16);
+                        match (tb, aux) {
+                            (Ok(t), Ok(a)) => {
+                                state.type_byte = t;
+                                state.aux_type = a;
+                                apply_clicked = true;
+                                keep_open = false;
+                            }
+                            _ => {
+                                state.error =
+                                    Some("Type and aux must be valid hex (2 and 4 digits)".into());
+                            }
+                        }
+                    }
+                    if ui.button("Cancel").clicked() {
+                        keep_open = false;
+                    }
+                });
+            });
+
+        if apply_clicked {
+            self.apply_prodos_type_dialog(&state);
+        }
+        if keep_open {
+            self.prodos_type_dialog = Some(state);
+        }
+    }
+
+    /// Commit the dialog's result to `staged_edits`.
+    fn apply_prodos_type_dialog(&mut self, state: &ProdosTypeDialogState) {
+        if let Some(i) = state.staged_index {
+            // Mutate the pending AddFile in place.
+            if let Some(StagedEdit::AddFile {
+                prodos_type,
+                prodos_aux,
+                ..
+            }) = self.staged_edits.get_mut(i)
+            {
+                *prodos_type = Some(state.type_byte);
+                *prodos_aux = Some(state.aux_type);
+                self.edit_result = Some(format!(
+                    "Staged type ${:02X} / ${:04X} on '{}'",
+                    state.type_byte, state.aux_type, state.entry.name
+                ));
+                return;
+            }
+        }
+        // Existing on-disk file → push a SetProdosType edit.
+        self.staged_edits.push(StagedEdit::SetProdosType {
+            entry: state.entry.clone(),
+            type_byte: state.type_byte,
+            aux_type: state.aux_type,
+        });
+        self.edit_result = Some(format!(
+            "Staged type ${:02X} / ${:04X} on '{}'",
+            state.type_byte, state.aux_type, state.entry.name
+        ));
     }
 
     /// Render the delete confirmation dialog.
@@ -2603,6 +2970,7 @@ fn create_filesystem(
 }
 
 /// Run the extraction in a background thread.
+#[allow(clippy::too_many_arguments)]
 fn run_extraction(
     source_path: Option<&PathBuf>,
     partition_offset: u64,
@@ -2615,6 +2983,8 @@ fn run_extraction(
     dest: &std::path::Path,
     resource_fork_mode: ResourceForkMode,
     is_hfs: bool,
+    is_prodos: bool,
+    prodos_export_mode: ProdosExportMode,
     progress: &Arc<Mutex<ExtractionProgress>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut counting_fs = create_filesystem(
@@ -2646,7 +3016,16 @@ fn run_extraction(
         preopen_file,
     )?;
 
-    extract_entry(&mut *fs, entry, dest, resource_fork_mode, is_hfs, progress)?;
+    extract_entry(
+        &mut *fs,
+        entry,
+        dest,
+        resource_fork_mode,
+        is_hfs,
+        is_prodos,
+        prodos_export_mode,
+        progress,
+    )?;
 
     Ok(())
 }
@@ -2678,12 +3057,15 @@ fn count_entry(
 }
 
 /// Recursively extract an entry to the destination path.
+#[allow(clippy::too_many_arguments)]
 fn extract_entry(
     fs: &mut dyn Filesystem,
     entry: &FileEntry,
     dest: &std::path::Path,
     resource_fork_mode: ResourceForkMode,
     is_hfs: bool,
+    is_prodos: bool,
+    prodos_export_mode: ProdosExportMode,
     progress: &Arc<Mutex<ExtractionProgress>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Check for cancellation
@@ -2693,7 +3075,29 @@ fn extract_entry(
         }
     }
 
-    let safe_name = resource_fork::sanitize_filename(&entry.name);
+    let base_name = resource_fork::sanitize_filename(&entry.name);
+    // For ProDOS files (not directories) in WithTypeSuffix mode, append the
+    // CiderPress `#TTAAAA` suffix so type and aux round-trip through host.
+    let safe_name =
+        if is_prodos && entry.is_file() && prodos_export_mode == ProdosExportMode::WithTypeSuffix {
+            let tt = entry
+                .type_code
+                .as_deref()
+                .and_then(|tc| {
+                    tc.split_whitespace()
+                        .next()
+                        .and_then(|s| u8::from_str_radix(s.trim_start_matches('$'), 16).ok())
+                })
+                .unwrap_or(0x06);
+            let aux = entry.aux_type.unwrap_or(0);
+            format!(
+                "{}{}",
+                base_name,
+                rusty_backup::fs::prodos_types::encode_cp_suffix(tt, aux)
+            )
+        } else {
+            base_name
+        };
 
     match entry.entry_type {
         EntryType::File => {
@@ -2801,7 +3205,16 @@ fn extract_entry(
 
             let children = fs.list_directory(entry)?;
             for child in &children {
-                extract_entry(fs, child, &dir_path, resource_fork_mode, is_hfs, progress)?;
+                extract_entry(
+                    fs,
+                    child,
+                    &dir_path,
+                    resource_fork_mode,
+                    is_hfs,
+                    is_prodos,
+                    prodos_export_mode,
+                    progress,
+                )?;
             }
         }
         EntryType::Symlink => {
