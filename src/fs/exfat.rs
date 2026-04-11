@@ -111,6 +111,38 @@ pub struct ExfatFilesystem<R> {
     used_bytes: u64,
 }
 
+/// Validate an exFAT filename.
+fn validate_exfat_name(name: &str) -> Result<(), FilesystemError> {
+    if name.is_empty() {
+        return Err(FilesystemError::InvalidData(
+            "filename is empty — pick a non-blank name".into(),
+        ));
+    }
+    let char_count = name.chars().count();
+    if char_count > 255 {
+        return Err(FilesystemError::InvalidData(format!(
+            "filename is too long ({char_count} chars); exFAT allows up to 255 — shorten the name"
+        )));
+    }
+    const FORBIDDEN: &[char] = &['"', '*', '/', ':', '<', '>', '?', '\\', '|'];
+    for c in name.chars() {
+        if FORBIDDEN.contains(&c) {
+            return Err(FilesystemError::InvalidData(format!(
+                "filename contains '{c}', which exFAT does not allow \
+                 (forbidden: \" * / : < > ? \\ |) — rename the file"
+            )));
+        }
+        if (c as u32) < 0x20 {
+            return Err(FilesystemError::InvalidData(format!(
+                "filename contains a control character (U+{:04X}); \
+                 exFAT disallows control codes — rename the file",
+                c as u32
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl<R: Read + Seek> ExfatFilesystem<R> {
     pub fn open(mut reader: R, partition_offset: u64) -> Result<Self, FilesystemError> {
         reader.seek(SeekFrom::Start(partition_offset))?;
@@ -545,6 +577,10 @@ impl<R: Read + Seek + Send> Filesystem for ExfatFilesystem<R> {
         "exFAT"
     }
 
+    fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
+        validate_exfat_name(name)
+    }
+
     fn total_size(&self) -> u64 {
         self.volume_length * self.bytes_per_sector
     }
@@ -760,25 +796,6 @@ impl<R: Read + Write + Seek> ExfatFilesystem<R> {
             cs = cs.wrapping_add(byte as u16);
         }
         cs
-    }
-
-    /// Validate an exFAT filename.
-    fn validate_exfat_name(name: &str) -> Result<(), FilesystemError> {
-        if name.is_empty() || name.len() > 255 {
-            return Err(FilesystemError::InvalidData(
-                "exFAT name must be 1-255 characters".into(),
-            ));
-        }
-        const FORBIDDEN: &[char] = &['"', '*', '/', ':', '<', '>', '?', '\\', '|'];
-        for c in name.chars() {
-            if FORBIDDEN.contains(&c) || (c as u32) < 0x20 {
-                return Err(FilesystemError::InvalidData(format!(
-                    "invalid character '{}' in exFAT filename",
-                    c
-                )));
-            }
-        }
-        Ok(())
     }
 
     // -- Directory Entry Sets --
@@ -1150,7 +1167,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExfatFilesystem<R> {
         data_len: u64,
         _options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
-        Self::validate_exfat_name(name)?;
+        validate_exfat_name(name)?;
 
         // Check for duplicate
         let parent_cluster = if parent.path == "/" {
@@ -1229,7 +1246,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExfatFilesystem<R> {
         name: &str,
         _options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
-        Self::validate_exfat_name(name)?;
+        validate_exfat_name(name)?;
 
         let parent_cluster = if parent.path == "/" {
             self.root_cluster

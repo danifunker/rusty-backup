@@ -103,6 +103,10 @@ impl<R: Read + Seek + Send> Filesystem for ProDosFilesystem<R> {
         "ProDOS"
     }
 
+    fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
+        validate_prodos_name(name).map(|_| ())
+    }
+
     fn total_size(&self) -> u64 {
         self.header.total_blocks as u64 * BLOCK_SIZE
     }
@@ -728,22 +732,32 @@ fn days_to_ymd(days: i64) -> (i32, u32, u32) {
 /// Validate a ProDOS filename: 1-15 chars, A-Z/0-9/period, first char must be a letter.
 /// Returns the uppercase name.
 fn validate_prodos_name(name: &str) -> Result<String, FilesystemError> {
+    if name.is_empty() {
+        return Err(FilesystemError::InvalidData(
+            "filename is empty — pick a non-blank name".into(),
+        ));
+    }
     let upper = name.to_ascii_uppercase();
     let bytes = upper.as_bytes();
-    if bytes.is_empty() || bytes.len() > 15 {
+    if bytes.len() > 15 {
         return Err(FilesystemError::InvalidData(format!(
-            "ProDOS name must be 1-15 characters, got '{name}'"
+            "filename is too long ({} chars); ProDOS allows up to 15 — shorten the name",
+            bytes.len()
         )));
     }
     if !bytes[0].is_ascii_alphabetic() {
         return Err(FilesystemError::InvalidData(format!(
-            "ProDOS name must start with a letter, got '{name}'"
+            "filename starts with '{}' — ProDOS requires the first character to be a letter \
+             (A-Z); rename so it begins with a letter",
+            upper.chars().next().unwrap_or('?')
         )));
     }
-    for &b in bytes {
+    for (i, &b) in bytes.iter().enumerate() {
         if !b.is_ascii_alphanumeric() && b != b'.' {
+            let c = upper.chars().nth(i).unwrap_or('?');
             return Err(FilesystemError::InvalidData(format!(
-                "ProDOS name contains invalid character in '{name}'"
+                "filename contains '{c}' — ProDOS allows only letters (A-Z), digits (0-9), \
+                 and '.'; rename the file (spaces and most punctuation are not allowed)"
             )));
         }
     }

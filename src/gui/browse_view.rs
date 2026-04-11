@@ -52,6 +52,39 @@ enum StagedEdit {
     },
 }
 
+/// Walk an editable filesystem from the root to the directory at `path`,
+/// returning its live `FileEntry`.
+///
+/// Staged edits capture a `parent` `FileEntry` at staging time, but for a
+/// pending-add directory the `location` (CNID/cluster) field is a placeholder
+/// because the directory does not yet exist on disk. Re-resolving by path at
+/// apply time picks up the real identifier assigned when the earlier
+/// `CreateDirectory` edit ran.
+fn resolve_dir_by_path(
+    efs: &mut dyn EditableFilesystem,
+    path: &str,
+) -> Result<FileEntry, FilesystemError> {
+    let mut current = efs.root()?;
+    if path == "/" || path.is_empty() {
+        return Ok(current);
+    }
+    for component in path.trim_start_matches('/').split('/') {
+        if component.is_empty() {
+            continue;
+        }
+        let children = efs.list_directory(&current)?;
+        current = children
+            .into_iter()
+            .find(|e| e.is_directory() && e.name == component)
+            .ok_or_else(|| {
+                FilesystemError::NotFound(format!(
+                    "directory '{component}' not found while resolving '{path}'"
+                ))
+            })?;
+    }
+    Ok(current)
+}
+
 /// Context for editing a backup archive partition (decompress → edit → recompress).
 struct ArchiveEditContext {
     /// Path to the compressed archive file (e.g. partition-0.zst or partition-0.chd).
@@ -179,6 +212,11 @@ pub struct BrowseView {
     show_unsaved_dialog: bool,
     /// State for the "Set ProDOS Type…" dialog (None == closed).
     prodos_type_dialog: Option<ProdosTypeDialogState>,
+    /// Files that failed to stage (bad name, IO error, etc.). When non-empty,
+    /// `show_staging_errors` drives a modal dialog listing each failure.
+    staging_errors: Vec<(PathBuf, String)>,
+    /// Whether the staging-errors modal dialog is open.
+    show_staging_errors: bool,
 }
 
 /// Transient state for the "Set ProDOS Type…" dialog.
@@ -283,6 +321,8 @@ impl Default for BrowseView {
             staged_edits: Vec::new(),
             show_unsaved_dialog: false,
             prodos_type_dialog: None,
+            staging_errors: Vec::new(),
+            show_staging_errors: false,
         }
     }
 }
@@ -538,6 +578,13 @@ impl BrowseView {
         self.fs_type == "ProDOS"
     }
 
+    /// Validate a filename against the current filesystem's rules at
+    /// staging time, so invalid names are rejected before apply.
+    fn validate_staged_name(&self, name: &str) -> Result<(), String> {
+        let fs = self.open_fs().map_err(|e| e.to_string())?;
+        fs.validate_name(name).map_err(|e| e.to_string())
+    }
+
     pub fn show(&mut self, ui: &mut egui::Ui) {
         if !self.active {
             return;
@@ -720,6 +767,9 @@ impl BrowseView {
 
         // ProDOS "Set Type…" dialog
         self.render_prodos_type_dialog(ui);
+
+        // Staging errors dialog
+        self.render_staging_errors_dialog(ui);
 
         // Two-panel layout: tree | content
         let available = ui.available_size();
@@ -1812,30 +1862,130 @@ impl BrowseView {
     }
 
     /// Stage files/folders from host paths for adding to the current directory.
+    ///
+    /// Individual failures (invalid filename, IO error, …) are collected into
+    /// `staging_errors` and surfaced via the staging-errors modal dialog. The
+    /// rest of the batch is still staged so the user does not lose successful
+    /// items just because one file had a bad name.
     fn add_host_paths(&mut self, paths: &[PathBuf]) {
         let parent = self.current_parent_entry();
-        let mut last_error: Option<String> = None;
+        let mut errors: Vec<(PathBuf, String)> = Vec::new();
         let mut staged_count = 0usize;
 
         for path in paths {
             if path.is_dir() {
-                match self.add_host_directory(path, &parent) {
-                    Ok(n) => staged_count += n,
-                    Err(e) => last_error = Some(format!("Error staging '{}': {e}", path.display())),
-                }
+                staged_count += self.stage_host_directory(path, &parent, &mut errors);
             } else if path.is_file() {
-                match self.add_host_file(path, &parent) {
-                    Ok(()) => staged_count += 1,
-                    Err(e) => last_error = Some(format!("Error staging '{}': {e}", path.display())),
-                }
+                staged_count += self.stage_host_file(path, &parent, &mut errors);
             }
         }
 
-        if let Some(err) = last_error {
-            self.edit_result = Some(err);
+        if !errors.is_empty() {
+            self.staging_errors = errors;
+            self.show_staging_errors = true;
+            self.edit_result = Some(format!(
+                "Staged {staged_count} item(s); {} failed — see dialog",
+                self.staging_errors.len()
+            ));
         } else if staged_count > 0 {
             self.edit_result = Some(format!("Staged {staged_count} item(s)"));
         }
+    }
+
+    /// Try to stage a single host file, pushing any error into `errors`.
+    /// Returns 1 on success, 0 on failure.
+    fn stage_host_file(
+        &mut self,
+        host_path: &std::path::Path,
+        parent: &FileEntry,
+        errors: &mut Vec<(PathBuf, String)>,
+    ) -> usize {
+        match self.add_host_file(host_path, parent) {
+            Ok(()) => 1,
+            Err(e) => {
+                errors.push((host_path.to_path_buf(), e));
+                0
+            }
+        }
+    }
+
+    /// Try to stage a host directory (and its contents), continuing past
+    /// individual child failures so one bad file does not abort the whole
+    /// tree. Returns the number of items that were successfully staged.
+    fn stage_host_directory(
+        &mut self,
+        host_path: &std::path::Path,
+        parent: &FileEntry,
+        errors: &mut Vec<(PathBuf, String)>,
+    ) -> usize {
+        let name = match host_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string())
+        {
+            Some(n) => n,
+            None => {
+                errors.push((host_path.to_path_buf(), "invalid directory name".into()));
+                return 0;
+            }
+        };
+
+        // Validate the directory name against the target filesystem's rules
+        // before staging the CreateDirectory edit.
+        if let Err(e) = self.validate_staged_name(&name) {
+            errors.push((host_path.to_path_buf(), e));
+            return 0;
+        }
+
+        // Duplicate-name check against pending adds in this parent.
+        let pending = self.pending_adds_for(&parent.path);
+        if pending.iter().any(|e| e.name == name) {
+            errors.push((
+                host_path.to_path_buf(),
+                format!("'{name}' is already staged in this directory"),
+            ));
+            return 0;
+        }
+
+        self.staged_edits.push(StagedEdit::CreateDirectory {
+            parent: parent.clone(),
+            name: name.clone(),
+        });
+
+        // Build a synthetic FileEntry for children to reference as parent.
+        let dir_path = if parent.path == "/" {
+            format!("/{name}")
+        } else {
+            format!("{}/{name}", parent.path)
+        };
+        let new_dir = FileEntry::new_directory(name, dir_path, 0);
+
+        let mut count = 1usize; // count the directory itself
+
+        let entries = match std::fs::read_dir(host_path) {
+            Ok(e) => e,
+            Err(e) => {
+                errors.push((host_path.to_path_buf(), e.to_string()));
+                return count;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    errors.push((host_path.to_path_buf(), e.to_string()));
+                    continue;
+                }
+            };
+            let child_path = entry.path();
+            if child_path.is_dir() {
+                count += self.stage_host_directory(&child_path, &new_dir, errors);
+            } else if child_path.is_file() {
+                count += self.stage_host_file(&child_path, &new_dir, errors);
+            }
+        }
+
+        count
     }
 
     /// Add a single host file to a parent directory on the image.
@@ -1862,6 +2012,11 @@ impl BrowseView {
             (raw_name, None, None)
         };
 
+        // Validate the name against the target filesystem's rules before
+        // staging so that clearly-bad names are rejected up-front.
+        self.validate_staged_name(&name)
+            .map_err(|e| format!("'{name}': {e}"))?;
+
         // Check for duplicate name in pending adds for this parent
         let pending = self.pending_adds_for(&parent.path);
         if pending.iter().any(|e| e.name == name) {
@@ -1881,49 +2036,6 @@ impl BrowseView {
             prodos_aux,
         });
         Ok(())
-    }
-
-    /// Recursively stage a host directory and its contents for adding.
-    fn add_host_directory(
-        &mut self,
-        host_path: &std::path::Path,
-        parent: &FileEntry,
-    ) -> Result<usize, String> {
-        let name = host_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or("invalid directory name")?
-            .to_string();
-
-        // Stage the directory creation
-        self.staged_edits.push(StagedEdit::CreateDirectory {
-            parent: parent.clone(),
-            name: name.clone(),
-        });
-
-        // Build a synthetic FileEntry for children to reference as parent
-        let dir_path = if parent.path == "/" {
-            format!("/{name}")
-        } else {
-            format!("{}/{name}", parent.path)
-        };
-        let new_dir = FileEntry::new_directory(name, dir_path, 0);
-
-        let mut count = 1usize; // count the directory itself
-
-        let entries = std::fs::read_dir(host_path).map_err(|e| e.to_string())?;
-        for entry in entries {
-            let entry = entry.map_err(|e| e.to_string())?;
-            let child_path = entry.path();
-            if child_path.is_dir() {
-                count += self.add_host_directory(&child_path, &new_dir)?;
-            } else if child_path.is_file() {
-                self.add_host_file(&child_path, &new_dir)?;
-                count += 1;
-            }
-        }
-
-        Ok(count)
     }
 
     /// Stage a delete operation.
@@ -1974,14 +2086,26 @@ impl BrowseView {
                             aux_type: *prodos_aux,
                             ..Default::default()
                         };
-                        efs.create_file(parent, name, &mut file, *size, &opts)
-                            .map(|_| ())
+                        // Re-resolve parent by path so nested edits under a
+                        // pending-add directory pick up the real CNID assigned
+                        // when that directory was created earlier in this batch.
+                        resolve_dir_by_path(&mut *efs, &parent.path).and_then(|resolved_parent| {
+                            efs.create_file(&resolved_parent, name, &mut file, *size, &opts)
+                                .map(|_| ())
+                        })
                     }
                     Err(e) => Err(FilesystemError::Io(e)),
                 },
-                StagedEdit::CreateDirectory { parent, name } => efs
-                    .create_directory(parent, name, &CreateDirectoryOptions::default())
-                    .map(|_| ()),
+                StagedEdit::CreateDirectory { parent, name } => {
+                    resolve_dir_by_path(&mut *efs, &parent.path).and_then(|resolved_parent| {
+                        efs.create_directory(
+                            &resolved_parent,
+                            name,
+                            &CreateDirectoryOptions::default(),
+                        )
+                        .map(|_| ())
+                    })
+                }
                 StagedEdit::DeleteEntry { parent, entry } => efs.delete_entry(parent, entry),
                 StagedEdit::DeleteRecursive { parent, entry } => {
                     efs.delete_recursive(parent, entry)
@@ -2371,6 +2495,67 @@ impl BrowseView {
         });
     }
 
+    /// Render a modal listing files that failed to stage, with the reason
+    /// for each failure. The list is built by `add_host_paths` and persists
+    /// until the user dismisses the dialog.
+    fn render_staging_errors_dialog(&mut self, ui: &mut egui::Ui) {
+        if !self.show_staging_errors {
+            return;
+        }
+        let mut open = true;
+        let mut dismiss = false;
+        egui::Window::new("Could not add some files")
+            .open(&mut open)
+            .resizable(true)
+            .collapsible(false)
+            .default_width(520.0)
+            .default_height(320.0)
+            .show(ui.ctx(), |ui| {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 150, 100),
+                    format!(
+                        "{} item(s) could not be staged for the [{}] filesystem:",
+                        self.staging_errors.len(),
+                        self.fs_type
+                    ),
+                );
+                ui.add_space(4.0);
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .max_height(220.0)
+                    .show(ui, |ui| {
+                        for (path, reason) in &self.staging_errors {
+                            let label = path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or_else(|| path.to_str().unwrap_or("?"));
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(egui::RichText::new(label).strong());
+                                ui.label("—");
+                                ui.colored_label(egui::Color32::from_rgb(255, 120, 120), reason);
+                            });
+                            ui.label(
+                                egui::RichText::new(path.display().to_string())
+                                    .small()
+                                    .color(egui::Color32::from_gray(150)),
+                            );
+                            ui.add_space(4.0);
+                        }
+                    });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() {
+                        dismiss = true;
+                    }
+                });
+            });
+        if !open || dismiss {
+            self.show_staging_errors = false;
+            self.staging_errors.clear();
+        }
+    }
+
     /// Render the filesystem check results popup.
     fn render_fsck_popup(&mut self, ui: &mut egui::Ui) {
         if !self.show_fsck_popup {
@@ -2723,6 +2908,11 @@ impl BrowseView {
 
         if name.is_empty() {
             self.edit_result = Some("Error: folder name cannot be empty".into());
+            return;
+        }
+
+        if let Err(e) = self.validate_staged_name(&name) {
+            self.edit_result = Some(format!("Error: {e}"));
             return;
         }
 

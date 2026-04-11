@@ -920,6 +920,10 @@ impl<R: Read + Seek + Send> Filesystem for NtfsFilesystem<R> {
         &self.fs_type_string
     }
 
+    fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
+        validate_ntfs_name(name)
+    }
+
     fn total_size(&self) -> u64 {
         self.total_sectors * self.bytes_per_sector
     }
@@ -1019,17 +1023,30 @@ const FIXED_NTFS_TIMESTAMP: u64 = 133_480_416_000_000_000;
 
 /// Validate an NTFS filename.
 fn validate_ntfs_name(name: &str) -> Result<(), FilesystemError> {
-    if name.is_empty() || name.len() > 255 {
+    if name.is_empty() {
         return Err(FilesystemError::InvalidData(
-            "NTFS name must be 1-255 characters".into(),
+            "filename is empty — pick a non-blank name".into(),
         ));
+    }
+    let char_count = name.chars().count();
+    if char_count > 255 {
+        return Err(FilesystemError::InvalidData(format!(
+            "filename is too long ({char_count} chars); NTFS allows up to 255 — shorten the name"
+        )));
     }
     const FORBIDDEN: &[char] = &['"', '*', '/', ':', '<', '>', '?', '\\', '|'];
     for c in name.chars() {
-        if FORBIDDEN.contains(&c) || (c as u32) < 0x20 {
+        if FORBIDDEN.contains(&c) {
             return Err(FilesystemError::InvalidData(format!(
-                "invalid character '{}' in NTFS filename",
-                c
+                "filename contains '{c}', which NTFS does not allow \
+                 (forbidden: \" * / : < > ? \\ |) — rename the file"
+            )));
+        }
+        if (c as u32) < 0x20 {
+            return Err(FilesystemError::InvalidData(format!(
+                "filename contains a control character (U+{:04X}); \
+                 NTFS disallows control codes — rename the file",
+                c as u32
             )));
         }
     }

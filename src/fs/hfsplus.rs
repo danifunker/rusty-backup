@@ -267,6 +267,31 @@ impl BTreeHeaderRecord {
 const CATALOG_FOLDER: i16 = 1;
 const CATALOG_FILE: i16 = 2;
 
+/// Validate a name for a new file or directory on an HFS+/HFSX volume.
+fn validate_hfsplus_create_name(name: &str) -> Result<(), FilesystemError> {
+    if name.is_empty() {
+        return Err(FilesystemError::InvalidData(
+            "filename is empty — pick a non-blank name".into(),
+        ));
+    }
+    if name.contains(':') {
+        return Err(FilesystemError::InvalidData(
+            "filename contains ':', which classic Mac OS uses as a path separator — \
+             rename the file (try '-' or '_' instead)"
+                .into(),
+        ));
+    }
+    let nfd: String = name.nfd().collect();
+    let utf16_len = nfd.encode_utf16().count();
+    if utf16_len > 255 {
+        return Err(FilesystemError::InvalidData(format!(
+            "filename is too long ({utf16_len} UTF-16 units); HFS+ allows up to 255 — \
+             shorten the name (note: some emoji and rare characters count as 2 units)"
+        )));
+    }
+    Ok(())
+}
+
 /// Decode a 4-byte Mac OS type/creator code to a string.
 fn decode_fourcc(data: &[u8]) -> String {
     data.iter()
@@ -1165,6 +1190,10 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
         }
     }
 
+    fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
+        validate_hfsplus_create_name(name)
+    }
+
     fn total_size(&self) -> u64 {
         self.vh.total_blocks as u64 * self.vh.block_size as u64
     }
@@ -1451,19 +1480,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsPlusFilesystem<R> 
     ) -> Result<FileEntry, FilesystemError> {
         let parent_cnid = parent.location as u32;
 
-        // Validate name
-        let nfd: String = name.nfd().collect();
-        let utf16_len = nfd.encode_utf16().count();
-        if utf16_len == 0 || utf16_len > 255 {
-            return Err(FilesystemError::InvalidData(
-                "name must be 1-255 UTF-16 units".into(),
-            ));
-        }
-        if name.contains(':') {
-            return Err(FilesystemError::InvalidData(
-                "name cannot contain ':'".into(),
-            ));
-        }
+        validate_hfsplus_create_name(name)?;
 
         // Check for duplicates
         if self.find_catalog_record(parent_cnid, name).is_some() {
@@ -1570,19 +1587,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsPlusFilesystem<R> 
     ) -> Result<FileEntry, FilesystemError> {
         let parent_cnid = parent.location as u32;
 
-        // Validate
-        let nfd: String = name.nfd().collect();
-        let utf16_len = nfd.encode_utf16().count();
-        if utf16_len == 0 || utf16_len > 255 {
-            return Err(FilesystemError::InvalidData(
-                "name must be 1-255 UTF-16 units".into(),
-            ));
-        }
-        if name.contains(':') {
-            return Err(FilesystemError::InvalidData(
-                "name cannot contain ':'".into(),
-            ));
-        }
+        validate_hfsplus_create_name(name)?;
 
         // Check duplicates
         if self.find_catalog_record(parent_cnid, name).is_some() {

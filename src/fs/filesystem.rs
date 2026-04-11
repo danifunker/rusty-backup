@@ -77,6 +77,20 @@ pub trait Filesystem: Send {
     fn fsck(&mut self) -> Option<Result<super::fsck::FsckResult, FilesystemError>> {
         None
     }
+
+    /// Validate that `name` is legal for a new file or directory on this
+    /// filesystem. Returns `Err(InvalidData)` with a human-readable reason
+    /// when the name violates length, character, or encoding rules.
+    ///
+    /// Default implementation accepts any non-empty name; filesystems that
+    /// support editing should override this with their actual rules so that
+    /// GUI callers can validate at staging time rather than at apply time.
+    fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
+        if name.is_empty() {
+            return Err(FilesystemError::InvalidData("name cannot be empty".into()));
+        }
+        Ok(())
+    }
 }
 
 /// Errors from filesystem operations.

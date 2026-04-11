@@ -626,6 +626,10 @@ impl<R: Read + Seek + Send> Filesystem for FatFilesystem<R> {
         self.fat_type.name()
     }
 
+    fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
+        validate_fat_name(name)
+    }
+
     fn total_size(&self) -> u64 {
         self.total_sectors * self.bytes_per_sector
     }
@@ -1409,33 +1413,37 @@ impl<R: Read + Write + Seek> FatFilesystem<R> {
 
         Ok(())
     }
+}
 
-    /// Validate a filename for FAT LFN rules.
-    fn validate_fat_name(name: &str) -> Result<(), FilesystemError> {
-        if name.is_empty() {
-            return Err(FilesystemError::InvalidData(
-                "filename cannot be empty".into(),
-            ));
-        }
-        if name.len() > 255 {
-            return Err(FilesystemError::InvalidData(
-                "filename exceeds 255 characters".into(),
-            ));
-        }
-        for c in name.chars() {
-            if FAT_LFN_FORBIDDEN.contains(&c) {
-                return Err(FilesystemError::InvalidData(format!(
-                    "filename contains forbidden character '{c}'"
-                )));
-            }
-        }
-        if name.ends_with(' ') || name.ends_with('.') {
-            return Err(FilesystemError::InvalidData(
-                "filename cannot end with space or dot".into(),
-            ));
-        }
-        Ok(())
+/// Validate a filename for FAT LFN rules.
+fn validate_fat_name(name: &str) -> Result<(), FilesystemError> {
+    if name.is_empty() {
+        return Err(FilesystemError::InvalidData(
+            "filename is empty — pick a non-blank name".into(),
+        ));
     }
+    let char_count = name.chars().count();
+    if char_count > 255 {
+        return Err(FilesystemError::InvalidData(format!(
+            "filename is too long ({char_count} chars); FAT allows up to 255 — shorten the name"
+        )));
+    }
+    for c in name.chars() {
+        if FAT_LFN_FORBIDDEN.contains(&c) {
+            return Err(FilesystemError::InvalidData(format!(
+                "filename contains '{c}', which FAT does not allow \
+                 (forbidden: \" * / : < > ? \\ |) — rename the file"
+            )));
+        }
+    }
+    if name.ends_with(' ') || name.ends_with('.') {
+        return Err(FilesystemError::InvalidData(
+            "filename ends with a space or '.' — FAT strips trailing spaces/dots; \
+             remove the trailing character and try again"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
@@ -1447,7 +1455,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
         data_len: u64,
         _options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
-        Self::validate_fat_name(name)?;
+        validate_fat_name(name)?;
 
         // Read parent directory to check for duplicates and collect SFNs
         let dir_data = if parent.path == "/" && self.fat_type != FatType::Fat32 {
@@ -1531,7 +1539,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
         name: &str,
         _options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
-        Self::validate_fat_name(name)?;
+        validate_fat_name(name)?;
 
         let dir_data = if parent.path == "/" && self.fat_type != FatType::Fat32 {
             self.read_root_directory()?

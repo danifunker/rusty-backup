@@ -77,6 +77,42 @@ pub fn mac_roman_to_utf8(data: &[u8]) -> String {
 }
 
 /// Returns `true` if the catalog B-tree header is all zeros (uninitialized).
+/// Validate a name for a new file or directory on a classic HFS volume.
+/// Returns the encoded Mac Roman bytes on success.
+fn validate_hfs_create_name(name: &str) -> Result<Vec<u8>, FilesystemError> {
+    if name.is_empty() {
+        return Err(FilesystemError::InvalidData(
+            "filename is empty — pick a non-blank name".into(),
+        ));
+    }
+    if name.contains(':') {
+        return Err(FilesystemError::InvalidData(
+            "filename contains ':', which classic Mac OS uses as a path separator — \
+             rename the file (try '-' or '_' instead)"
+                .into(),
+        ));
+    }
+    let name_bytes = utf8_to_mac_roman(name).map_err(|_| {
+        FilesystemError::InvalidData(
+            "filename contains characters that can't be encoded in Mac Roman \
+             (HFS predates Unicode) — rename using plain ASCII or common accented letters"
+                .into(),
+        )
+    })?;
+    if name_bytes.is_empty() {
+        return Err(FilesystemError::InvalidData(
+            "filename is empty — pick a non-blank name".into(),
+        ));
+    }
+    if name_bytes.len() > 31 {
+        return Err(FilesystemError::InvalidData(format!(
+            "filename is too long ({} chars); classic HFS allows up to 31 — shorten the name",
+            name_bytes.len()
+        )));
+    }
+    Ok(name_bytes)
+}
+
 /// Some formatters (notably Disk Jockey's "Empty HFS" image) allocate the
 /// catalog extents but leave the bytes zeroed, which would otherwise cause a
 /// panic on the first insert because `node_size` parses as 0.
@@ -1480,6 +1516,10 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
         "HFS"
     }
 
+    fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
+        validate_hfs_create_name(name).map(|_| ())
+    }
+
     fn total_size(&self) -> u64 {
         self.mdb.total_blocks as u64 * self.mdb.block_size as u64
     }
@@ -1580,18 +1620,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
         let result = (|| {
             let parent_id = parent.location as u32;
 
-            // Validate name: must be encodable in Mac Roman, 1-31 bytes, no ':'
-            if name.contains(':') {
-                return Err(FilesystemError::InvalidData(
-                    "name cannot contain ':'".into(),
-                ));
-            }
-            let name_bytes = utf8_to_mac_roman(name)?;
-            if name_bytes.is_empty() || name_bytes.len() > 31 {
-                return Err(FilesystemError::InvalidData(
-                    "name must be 1-31 Mac Roman bytes".into(),
-                ));
-            }
+            let name_bytes = validate_hfs_create_name(name)?;
 
             // Check for duplicates
             if self
@@ -1708,18 +1737,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
         let result = (|| {
             let parent_id = parent.location as u32;
 
-            // Validate
-            if name.contains(':') {
-                return Err(FilesystemError::InvalidData(
-                    "name cannot contain ':'".into(),
-                ));
-            }
-            let name_bytes = utf8_to_mac_roman(name)?;
-            if name_bytes.is_empty() || name_bytes.len() > 31 {
-                return Err(FilesystemError::InvalidData(
-                    "name must be 1-31 Mac Roman bytes".into(),
-                ));
-            }
+            let name_bytes = validate_hfs_create_name(name)?;
 
             // Check duplicates
             if self

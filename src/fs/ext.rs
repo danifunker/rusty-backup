@@ -705,6 +705,10 @@ impl<R: Read + Seek + Send> Filesystem for ExtFilesystem<R> {
         self.ext_version.name()
     }
 
+    fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
+        validate_ext_name(name)
+    }
+
     fn total_size(&self) -> u64 {
         self.total_blocks * self.block_size
     }
@@ -750,27 +754,29 @@ impl<R: Read + Seek + Send> Filesystem for ExtFilesystem<R> {
 fn validate_ext_name(name: &str) -> Result<(), FilesystemError> {
     if name.is_empty() {
         return Err(FilesystemError::InvalidData(
-            "ext: filename cannot be empty".into(),
+            "filename is empty — pick a non-blank name".into(),
         ));
     }
     if name == "." || name == ".." {
         return Err(FilesystemError::InvalidData(
-            "ext: filename cannot be '.' or '..'".into(),
+            "'.' and '..' are reserved on ext — rename the file".into(),
         ));
     }
-    if name.len() > 255 {
-        return Err(FilesystemError::InvalidData(
-            "ext: filename exceeds 255 bytes".into(),
-        ));
+    let byte_len = name.len();
+    if byte_len > 255 {
+        return Err(FilesystemError::InvalidData(format!(
+            "filename is too long ({byte_len} bytes); ext allows up to 255 bytes — \
+             shorten the name (note: accented and non-ASCII characters take multiple bytes)"
+        )));
     }
     if name.contains('/') {
         return Err(FilesystemError::InvalidData(
-            "ext: filename cannot contain '/'".into(),
+            "filename contains '/', which ext uses as a path separator — rename the file".into(),
         ));
     }
     if name.contains('\0') {
         return Err(FilesystemError::InvalidData(
-            "ext: filename cannot contain NUL".into(),
+            "filename contains a NUL byte — rename the file".into(),
         ));
     }
     Ok(())
