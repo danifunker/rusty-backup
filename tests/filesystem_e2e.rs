@@ -1281,3 +1281,301 @@ fn test_detect_hfsplus_auto() {
     let fs = rusty_backup::fs::open_filesystem(cursor, 0, 0x00, None).unwrap();
     assert_eq!(fs.fs_type(), "HFS+");
 }
+
+#[test]
+fn test_detect_prodos_auto() {
+    // Fixture: 800 KB Apple IIgs ProDOS volume "PRODOS3TST" with two
+    // subdirectories (TSTFLDR, ANTETRIS) and a top-level FINDER.DATA file.
+    // ANTETRIS holds a shareware game as sapling files.
+    let img = load_fixture("test_prodos.hdv.zst");
+    let cursor = Cursor::new(img);
+    let fs = rusty_backup::fs::open_filesystem(cursor, 0, 0x00, None).unwrap();
+    assert_eq!(fs.fs_type(), "ProDOS");
+    assert_eq!(fs.volume_label(), Some("PRODOS3TST"));
+}
+
+#[test]
+fn test_prodos_superfloppy_detection() {
+    let img = load_fixture("test_prodos.hdv.zst");
+    let mut cursor = Cursor::new(img);
+    let table = rusty_backup::partition::PartitionTable::detect(&mut cursor).unwrap();
+    match table {
+        rusty_backup::partition::PartitionTable::None { fs_hint, .. } => {
+            assert_eq!(fs_hint, "ProDOS");
+        }
+        other => panic!("expected superfloppy, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_prodos_list_and_recurse() {
+    use rusty_backup::fs::filesystem::Filesystem;
+
+    let img = load_fixture("test_prodos.hdv.zst");
+    let cursor = Cursor::new(img);
+    let mut fs = rusty_backup::fs::prodos::ProDosFilesystem::open(cursor, 0).unwrap();
+
+    let root = fs.root().unwrap();
+    let entries = fs.list_directory(&root).unwrap();
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(names.contains(&"TSTFLDR"), "expected TSTFLDR in {names:?}");
+    assert!(
+        names.contains(&"ANTETRIS"),
+        "expected ANTETRIS in {names:?}"
+    );
+    assert!(
+        names.contains(&"FINDER.DATA"),
+        "expected FINDER.DATA in {names:?}"
+    );
+
+    // Directory storage_type ($D nibble) must map to directory entries, not
+    // be skipped as a header.
+    let tstfldr = entries.iter().find(|e| e.name == "TSTFLDR").unwrap();
+    assert!(tstfldr.is_directory());
+
+    // Recurse into TSTFLDR and verify the test text file is visible.
+    let kids = fs.list_directory(tstfldr).unwrap();
+    let kid_names: Vec<&str> = kids.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        kid_names.contains(&"TEST.TXT"),
+        "expected TEST.TXT in {kid_names:?}"
+    );
+
+    // Recurse into ANTETRIS (shareware game folder) and confirm sapling files.
+    let antetris = entries.iter().find(|e| e.name == "ANTETRIS").unwrap();
+    let game_files = fs.list_directory(antetris).unwrap();
+    let game_names: Vec<&str> = game_files.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        game_names.contains(&"ANTETRIS"),
+        "expected ANTETRIS binary in {game_names:?}"
+    );
+    assert!(
+        game_names.contains(&"ANTETRIS.DATA"),
+        "expected ANTETRIS.DATA in {game_names:?}"
+    );
+}
+
+#[test]
+fn test_prodos_type_codes_populated() {
+    // Verify list_directory populates FileEntry::type_code from the new
+    // prodos_types table rather than returning raw hex codes.
+    use rusty_backup::fs::filesystem::Filesystem;
+
+    let img = load_fixture("test_prodos.hdv.zst");
+    let cursor = Cursor::new(img);
+    let mut fs = rusty_backup::fs::prodos::ProDosFilesystem::open(cursor, 0).unwrap();
+
+    let root = fs.root().unwrap();
+    let entries = fs.list_directory(&root).unwrap();
+    let finder = entries
+        .iter()
+        .find(|e| e.name == "FINDER.DATA")
+        .expect("FINDER.DATA present");
+    let tc = finder
+        .type_code
+        .as_ref()
+        .expect("type_code should be set for ProDOS files");
+    // FINDER.DATA is stored with ProDOS type $C9 (FND) on IIgs volumes.
+    assert_eq!(tc, "$C9 FND", "type_code for FINDER.DATA was {tc}");
+
+    // Sanity-check a second entry: ANTETRIS/ANTETRIS is an S16 application
+    // ($B3) on this fixture.
+    let antetris_dir = entries.iter().find(|e| e.name == "ANTETRIS").unwrap();
+    let game_files = fs.list_directory(antetris_dir).unwrap();
+    let antetris_bin = game_files.iter().find(|e| e.name == "ANTETRIS").unwrap();
+    let tc = antetris_bin.type_code.as_ref().unwrap();
+    assert!(
+        tc.starts_with('$') && tc.contains(' '),
+        "type_code should be formatted as '$XX ABC', got {tc}"
+    );
+}
+
+#[test]
+fn test_prodos_create_file_auto_types_from_extension() {
+    // With no explicit type_code in CreateFileOptions, the ProDOS writer
+    // should fall back to the prodos_types extension table so that
+    // "HELLO.TXT" → $04 TXT and "GAME.BAS" → $FC BAS with aux $0801.
+    use rusty_backup::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+
+    let mut img = load_fixture("test_prodos.hdv.zst");
+
+    {
+        let cursor = Cursor::new(&mut img);
+        let mut fs = rusty_backup::fs::prodos::ProDosFilesystem::open(cursor, 0).unwrap();
+
+        let root = fs.root().unwrap();
+        let txt = b"hello world";
+        let txt_entry = fs
+            .create_file(
+                &root,
+                "NOTE.TXT",
+                &mut &txt[..],
+                txt.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            txt_entry.type_code.as_deref(),
+            Some("$04 TXT"),
+            "auto-detected type for .txt should be $04 TXT"
+        );
+
+        // Applesoft BASIC: name drives both type AND aux_type ($0801).
+        let bas = b"10 PRINT \"HI\"";
+        let bas_entry = fs
+            .create_file(
+                &root,
+                "HELLO.BAS",
+                &mut &bas[..],
+                bas.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(bas_entry.type_code.as_deref(), Some("$FC BAS"));
+
+        fs.sync_metadata().unwrap();
+    }
+
+    // Reopen and verify the aux_type bytes actually landed on disk for HELLO.BAS.
+    // Directory entry layout: entry offset 31-32 = aux_type (LE u16).
+    let cursor = Cursor::new(img.clone());
+    let mut fs = rusty_backup::fs::prodos::ProDosFilesystem::open(cursor, 0).unwrap();
+    let root = fs.root().unwrap();
+    let entries = fs.list_directory(&root).unwrap();
+    assert!(entries.iter().any(|e| e.name == "NOTE.TXT"));
+    assert!(entries.iter().any(|e| e.name == "HELLO.BAS"));
+
+    // Find HELLO.BAS slot by scanning the volume directory key block (block 2)
+    // for the name, then check its aux_type bytes at slot-offset 31..33.
+    let block2 = &img[2 * 512..3 * 512];
+    let mut aux = None;
+    for slot in 0..13 {
+        let eo = 4 + slot * 39;
+        let name_len = (block2[eo] & 0xF) as usize;
+        if name_len == 0 || name_len > 15 {
+            continue;
+        }
+        let name: String = block2[eo + 1..eo + 1 + name_len]
+            .iter()
+            .map(|&b| b as char)
+            .collect();
+        if name == "HELLO.BAS" {
+            aux = Some(u16::from_le_bytes([block2[eo + 31], block2[eo + 32]]));
+            break;
+        }
+    }
+    assert_eq!(
+        aux,
+        Some(0x0801),
+        "HELLO.BAS should have aux_type $0801 from extension table, got {aux:?}"
+    );
+}
+
+#[test]
+fn test_prodos_edit_round_trip() {
+    // End-to-end write test: open the fixture, create a file and a folder at
+    // the root, sync metadata, drop the filesystem, re-open from the same
+    // buffer, and verify everything is still visible and readable. This is
+    // the test that would have caught the inverted $D/$E nibbles on real
+    // directories — it exercises find_free_dir_slot, write_dir_entry,
+    // update_dir_file_count, and the bitmap flush path.
+    use rusty_backup::fs::filesystem::{
+        CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem,
+    };
+
+    let mut img = load_fixture("test_prodos.hdv.zst");
+    let payload = b"Hello from rusty-backup";
+
+    {
+        let cursor = Cursor::new(&mut img);
+        let mut fs = rusty_backup::fs::prodos::ProDosFilesystem::open(cursor, 0).unwrap();
+
+        let root = fs.root().unwrap();
+        let create_opts = CreateFileOptions {
+            type_code: Some("$04".into()), // TXT
+            ..Default::default()
+        };
+        let created = fs
+            .create_file(
+                &root,
+                "RBTEST",
+                &mut &payload[..],
+                payload.len() as u64,
+                &create_opts,
+            )
+            .unwrap();
+        assert_eq!(created.name, "RBTEST");
+
+        let root = fs.root().unwrap();
+        let _newdir = fs
+            .create_directory(&root, "RBDIR", &CreateDirectoryOptions::default())
+            .unwrap();
+
+        fs.sync_metadata().unwrap();
+    }
+
+    // Reopen from the mutated bytes and verify state persisted.
+    let cursor = Cursor::new(img);
+    let mut fs = rusty_backup::fs::prodos::ProDosFilesystem::open(cursor, 0).unwrap();
+    let root = fs.root().unwrap();
+    let entries = fs.list_directory(&root).unwrap();
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        names.contains(&"RBTEST"),
+        "RBTEST missing after reopen; got {names:?}"
+    );
+    assert!(
+        names.contains(&"RBDIR"),
+        "RBDIR missing after reopen; got {names:?}"
+    );
+    assert!(
+        names.contains(&"TSTFLDR"),
+        "pre-existing TSTFLDR disappeared; got {names:?}"
+    );
+
+    // New file reads back correctly.
+    let rbtest = entries.iter().find(|e| e.name == "RBTEST").unwrap();
+    assert!(rbtest.is_file());
+    let read_back = fs.read_file(rbtest, usize::MAX).unwrap();
+    assert_eq!(read_back, payload, "RBTEST round-trip mismatch");
+
+    // New directory is empty and listable.
+    let rbdir = entries.iter().find(|e| e.name == "RBDIR").unwrap();
+    assert!(rbdir.is_directory());
+    let kids = fs.list_directory(rbdir).unwrap();
+    assert!(kids.is_empty(), "new dir should be empty, got {kids:?}");
+}
+
+#[test]
+fn test_prodos_read_file_contents() {
+    use rusty_backup::fs::filesystem::Filesystem;
+
+    let img = load_fixture("test_prodos.hdv.zst");
+    let cursor = Cursor::new(img);
+    let mut fs = rusty_backup::fs::prodos::ProDosFilesystem::open(cursor, 0).unwrap();
+
+    let root = fs.root().unwrap();
+    let root_entries = fs.list_directory(&root).unwrap();
+    let tstfldr = root_entries.iter().find(|e| e.name == "TSTFLDR").unwrap();
+    let tst_kids = fs.list_directory(tstfldr).unwrap();
+    let test_txt = tst_kids.iter().find(|e| e.name == "TEST.TXT").unwrap();
+    assert!(test_txt.is_file());
+
+    let data = fs.read_file(test_txt, usize::MAX).unwrap();
+    assert_eq!(data.len(), test_txt.size as usize);
+    // Sanity-check: not all zeros (which would indicate we followed the wrong
+    // block pointer and read into uninitialized disk area).
+    assert!(
+        data.iter().any(|&b| b != 0),
+        "TEST.TXT content was all zeros"
+    );
+
+    // Also read a sapling file from ANTETRIS to exercise the sapling codepath.
+    let antetris = root_entries.iter().find(|e| e.name == "ANTETRIS").unwrap();
+    let game_files = fs.list_directory(antetris).unwrap();
+    let antetris_bin = game_files.iter().find(|e| e.name == "ANTETRIS").unwrap();
+    assert_eq!(antetris_bin.mode, Some(2), "ANTETRIS should be a sapling");
+    let bin_data = fs.read_file(antetris_bin, usize::MAX).unwrap();
+    assert_eq!(bin_data.len(), antetris_bin.size as usize);
+    assert!(bin_data.iter().any(|&b| b != 0));
+}

@@ -11,6 +11,7 @@ pub mod hfs_fsck;
 pub mod hfsplus;
 pub mod ntfs;
 pub mod prodos;
+pub mod prodos_types;
 pub mod resource_fork;
 pub mod tree;
 pub mod unix_common;

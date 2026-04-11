@@ -124,10 +124,16 @@ pub struct CreateFileOptions {
     pub uid: Option<u32>,
     /// Unix group ID (default 0). Ignored on FAT/exFAT/NTFS.
     pub gid: Option<u32>,
-    /// HFS/HFS+ type code (e.g. "TEXT"). Auto-detected from extension if not set.
+    /// HFS/HFS+ type code (e.g. "TEXT") or ProDOS type as "$XX" (e.g. "$04").
+    /// Auto-detected from extension if not set.
     pub type_code: Option<String>,
     /// HFS/HFS+ creator code (e.g. "MSWD"). Auto-detected from extension if not set.
     pub creator_code: Option<String>,
+    /// ProDOS auxiliary type (16-bit). Semantics depend on the file type:
+    /// $0801 for Applesoft BASIC load address, $2000 for typical BIN,
+    /// record length for random-access TXT, etc. Auto-detected from
+    /// extension if not set. Ignored on non-ProDOS filesystems.
+    pub aux_type: Option<u16>,
     /// Optional resource fork data source (HFS/HFS+ only).
     pub resource_fork: Option<ResourceForkSource>,
 }

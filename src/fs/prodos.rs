@@ -244,7 +244,7 @@ impl<R: Read + Write + Seek + Send> ProDosFilesystem<R> {
                 let type_nibble = block[eo] >> 4;
                 let name_len = (block[eo] & 0xF) as usize;
                 // Skip deleted, volume dir header, subdir header
-                if type_nibble == 0 || type_nibble == 0xF || type_nibble == 0xD {
+                if type_nibble == 0 || type_nibble == 0xF || type_nibble == 0xE {
                     continue;
                 }
                 if name_len == 0 || name_len > 15 {
@@ -331,22 +331,22 @@ impl<R: Read + Write + Seek + Send> ProDosFilesystem<R> {
         self.write_dir_entry(block_num, slot, &zero)
     }
 
-    /// Update the file_count field in the directory header (key block, slot 0, bytes 29-30).
+    /// Update the file_count field in the directory header.
+    ///
+    /// Slot 0 of the key block holds the header entry (39 bytes, starting at
+    /// block offset 4). Within that entry, `file_count` lives at entry offset
+    /// 33-34, i.e. absolute block offsets 37-38.
     fn update_dir_file_count(
         &mut self,
         dir_key_block: u16,
         delta: i16,
     ) -> Result<(), FilesystemError> {
         let mut block = self.read_block(dir_key_block)?;
-        // file_count is at entry offset 4 (start of slot 0) + 29 = byte 33 in the block... wait.
-        // Actually: slot 0 starts at offset 4 in the block. The header entry has
-        // file_count at bytes 25-26 within the 39-byte entry.
-        // So absolute position = 4 + 25 = 29, 4 + 26 = 30.
-        let fc = u16::from_le_bytes([block[4 + 25], block[4 + 26]]);
+        let fc = u16::from_le_bytes([block[4 + 33], block[4 + 34]]);
         let new_fc = (fc as i16 + delta).max(0) as u16;
         let bytes = new_fc.to_le_bytes();
-        block[4 + 25] = bytes[0];
-        block[4 + 26] = bytes[1];
+        block[4 + 33] = bytes[0];
+        block[4 + 34] = bytes[1];
         self.write_block(dir_key_block, &block)
     }
 
@@ -517,7 +517,7 @@ impl<R: Read + Write + Seek + Send> ProDosFilesystem<R> {
                     continue;
                 }
                 let type_nibble = block[eo] >> 4;
-                if type_nibble != 0 && type_nibble != 0xD {
+                if type_nibble != 0 && type_nibble != 0xE {
                     return Ok(false);
                 }
             }
@@ -576,12 +576,12 @@ fn build_file_entry_bytes(
     e
 }
 
-/// Build a 39-byte subdirectory entry (type nibble 0xE) for the parent directory.
+/// Build a 39-byte subdirectory entry (type nibble 0xD) for the parent directory.
 fn build_subdir_entry_bytes(name: &str, key_ptr: u16) -> [u8; 39] {
     let mut e = [0u8; 39];
     let name_bytes = name.as_bytes();
     let name_len = name_bytes.len().min(15) as u8;
-    e[0] = (0xE << 4) | name_len;
+    e[0] = (0xD << 4) | name_len;
     e[1..1 + name_len as usize].copy_from_slice(&name_bytes[..name_len as usize]);
     e[16] = 0x0F; // file_type = DIR
     let kp = key_ptr.to_le_bytes();
@@ -605,15 +605,17 @@ fn build_subdir_entry_bytes(name: &str, key_ptr: u16) -> [u8; 39] {
     e
 }
 
-/// Build a 39-byte subdirectory header entry (type nibble 0xD) for slot 0 of a new dir block.
+/// Build a 39-byte subdirectory header entry (type nibble 0xE) for slot 0 of a new dir block.
 fn build_subdir_header_bytes(name: &str, parent_key_block: u16, parent_entry_num: u8) -> [u8; 39] {
     let mut e = [0u8; 39];
     let name_bytes = name.as_bytes();
     let name_len = name_bytes.len().min(15) as u8;
-    e[0] = (0xD << 4) | name_len;
+    e[0] = (0xE << 4) | name_len;
     e[1..1 + name_len as usize].copy_from_slice(&name_bytes[..name_len as usize]);
-    // Bytes 16-19: reserved (0x76 is sometimes used as magic, but 0 is fine)
-    e[20] = 0x75; // ProDOS 8 subdir marker
+    // Byte 16: reserved subdir marker ($75 per ProDOS 8 TRM)
+    e[16] = 0x75;
+    // Bytes 17-23: reserved
+    // Bytes 24-25: creation date, 26-27: creation time
     let (date, time) = make_prodos_datetime_now();
     let cd = date.to_le_bytes();
     e[24] = cd[0];
@@ -621,17 +623,19 @@ fn build_subdir_header_bytes(name: &str, parent_key_block: u16, parent_entry_num
     let ct = time.to_le_bytes();
     e[26] = ct[0];
     e[27] = ct[1];
-    e[27] = 39; // entry_length
-    e[28] = 13; // entries_per_block
-                // file_count = 0 at bytes 29-30 (LE u16)
-                // parent_pointer at bytes 31-32
+    // Byte 28: version, 29: min_version, 30: access
+    e[30] = 0xC3;
+    // Byte 31: entry_length, 32: entries_per_block, 33-34: file_count,
+    // 35-36: parent_pointer, 37: parent_entry_number, 38: parent_entry_length.
+    // These mirror the same offsets used for the volume directory header.
+    e[31] = 39; // entry_length
+    e[32] = 13; // entries_per_block
+                // file_count stays 0 at bytes 33-34
     let pp = parent_key_block.to_le_bytes();
-    e[31] = pp[0];
-    e[32] = pp[1];
-    // parent_entry_number at byte 33
-    e[33] = parent_entry_num;
-    // parent_entry_length at byte 34
-    e[34] = 39;
+    e[35] = pp[0];
+    e[36] = pp[1];
+    e[37] = parent_entry_num;
+    e[38] = 39; // parent_entry_length
     e
 }
 
@@ -713,15 +717,31 @@ fn validate_prodos_name(name: &str) -> Result<String, FilesystemError> {
     Ok(upper)
 }
 
-/// Parse a file type from CreateFileOptions.type_code (e.g. "$06" → 0x06).
-/// Defaults to 0x06 (BIN) if not set or unparseable.
-fn parse_file_type(opts: &CreateFileOptions) -> u8 {
-    if let Some(ref tc) = opts.type_code {
+/// Parse a file type + aux type for a new ProDOS file.
+///
+/// Resolution order:
+/// 1. Explicit `opts.type_code` / `opts.aux_type` (caller knows what they want)
+/// 2. Extension-based lookup via `prodos_types::type_for_filename`
+/// 3. Fallback: BIN ($06) with aux_type 0
+fn parse_file_type(opts: &CreateFileOptions, name: &str) -> (u8, u16) {
+    // Explicit type code, if provided.
+    let explicit_type = opts.type_code.as_ref().and_then(|tc| {
         let s = tc.trim().trim_start_matches('$');
-        u8::from_str_radix(s, 16).unwrap_or(0x06)
-    } else {
-        0x06 // BIN
-    }
+        u8::from_str_radix(s, 16).ok()
+    });
+
+    // Extension lookup is used either when the type is unknown or when the
+    // aux type is unknown (so e.g. `{type_code: Some("$FC"), aux_type: None}`
+    // can still pick up the $0801 BAS convention via the name).
+    let by_ext = super::prodos_types::type_for_filename(name);
+
+    let file_type = explicit_type
+        .or(by_ext.map(|i| i.type_byte))
+        .unwrap_or(0x06); // BIN
+
+    let aux_type = opts.aux_type.or(by_ext.map(|i| i.aux_type)).unwrap_or(0);
+
+    (file_type, aux_type)
 }
 
 // ─────────────────────────────── EditableFilesystem ──────────────────────────
@@ -759,7 +779,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ProDosFilesystem<R> {
             .map_err(FilesystemError::Io)?;
 
         let eof = file_data.len() as u32;
-        let file_type = parse_file_type(options);
+        let (file_type, aux_type) = parse_file_type(options, &validated_name);
 
         // Choose storage type and write blocks
         let (key_ptr, blocks_used, storage_type) = if file_data.len() <= 512 {
@@ -777,7 +797,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ProDosFilesystem<R> {
         let entry_bytes = build_file_entry_bytes(
             &validated_name,
             file_type,
-            0,
+            aux_type,
             storage_type,
             key_ptr,
             blocks_used,
@@ -796,7 +816,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ProDosFilesystem<R> {
         };
 
         let mut fe = FileEntry::new_file(validated_name, path, eof as u64, key_ptr as u64);
-        fe.type_code = Some(format!("${file_type:02X} {}", prodos_type_name(file_type)));
+        fe.type_code = Some(super::prodos_types::format_type_code(file_type));
         fe.mode = Some(storage_type as u32);
         Ok(fe)
     }
@@ -832,7 +852,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ProDosFilesystem<R> {
         new_block_data[4..4 + 39].copy_from_slice(&header);
         self.write_block(new_key_block, &new_block_data)?;
 
-        // Build parent directory entry (type 0xE)
+        // Build parent directory entry (type 0xD)
         let subdir_entry = build_subdir_entry_bytes(&validated_name, new_key_block);
         self.write_dir_entry(entry_block, entry_slot, &subdir_entry)?;
         self.update_dir_file_count(parent_key_block, 1)?;
@@ -1297,10 +1317,9 @@ fn list_prodos_directory<R: Read + Seek>(
                 result.push(fe);
             } else {
                 // Regular file: seedling (1), sapling (2), or tree (3).
-                let type_name = prodos_type_name(file_type);
                 let mut fe = FileEntry::new_file(name, path, eof as u64, key_pointer as u64);
                 fe.modified = modified;
-                fe.type_code = Some(format!("${file_type:02X} {type_name}"));
+                fe.type_code = Some(super::prodos_types::format_type_code(file_type));
                 // Store storage type in `mode` so read_file can dispatch correctly.
                 fe.mode = Some(type_nibble as u32);
                 result.push(fe);
@@ -1436,55 +1455,6 @@ fn read_tree<R: Read + Seek>(
     }
 
     Ok(data)
-}
-
-// ─────────────────────────────── ProDOS type codes ───────────────────────────
-
-fn prodos_type_name(file_type: u8) -> &'static str {
-    match file_type {
-        0x00 => "NON",
-        0x01 => "BAD",
-        0x04 => "TXT",
-        0x06 => "BIN",
-        0x0F => "DIR",
-        0x19 => "ADB",
-        0x1A => "AWP",
-        0x1B => "ASP",
-        0xB0 => "SRC",
-        0xB3 => "S16",
-        0xB4 => "RTL",
-        0xB5 => "EXE",
-        0xB6 => "PIF",
-        0xB7 => "TIF",
-        0xB8 => "NDA",
-        0xB9 => "CDA",
-        0xBA => "TOL",
-        0xBB => "DVR",
-        0xBC => "LDF",
-        0xBD => "FST",
-        0xBF => "DOC",
-        0xC0 => "PNT",
-        0xC1 => "PIC",
-        0xC2 => "ANI",
-        0xC3 => "PAL",
-        0xC8 => "FON",
-        0xC9 => "FND",
-        0xCA => "ICN",
-        0xD5 => "MUS",
-        0xD6 => "INS",
-        0xD7 => "MDI",
-        0xD8 => "SND",
-        0xDB => "DBM",
-        0xE0 => "LBR",
-        0xEF => "PAS",
-        0xF0 => "CMD",
-        0xF1 => "OVL",
-        0xFC => "BAS",
-        0xFD => "VAR",
-        0xFE => "REL",
-        0xFF => "SYS",
-        _ => "???",
-    }
 }
 
 /// Parse a ProDOS date+time pair into a human-readable string.
@@ -1747,10 +1717,10 @@ mod tests {
             disk[eo + 22] = 0;
             disk[eo + 23] = 0;
         }
-        // Entry 2: subdirectory (storage_type=0xE), name="SUBDIR"
+        // Entry 2: subdirectory (storage_type=0xD), name="SUBDIR"
         {
             let eo = 1024 + 82; // slot 2
-            disk[eo] = (0xE << 4) | 6; // type=0xE (subdir), name_len=6
+            disk[eo] = (0xD << 4) | 6; // type=0xD (subdir), name_len=6
             disk[eo + 1..eo + 7].copy_from_slice(b"SUBDIR");
             disk[eo + 17] = 20; // key_pointer = block 20
             disk[eo + 18] = 0;

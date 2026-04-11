@@ -41,13 +41,25 @@ fn probe(path: &str) {
             let root = fs.root().unwrap();
             let entries = fs.list_directory(&root).unwrap();
             println!("  {} entries in root", entries.len());
-            for e in entries.iter().take(10) {
+            for e in entries.iter() {
                 println!(
                     "    {} ({}, {} bytes)",
                     e.name,
                     if e.is_directory() { "dir" } else { "file" },
                     e.size
                 );
+                if e.is_directory() {
+                    if let Ok(kids) = fs.list_directory(e) {
+                        for k in kids.iter() {
+                            println!(
+                                "      {} ({}, {} bytes)",
+                                k.name,
+                                if k.is_directory() { "dir" } else { "file" },
+                                k.size
+                            );
+                        }
+                    }
+                }
             }
         }
         Err(e) => println!("  ProDosFilesystem::open error: {e}"),
