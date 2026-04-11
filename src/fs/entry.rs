@@ -26,6 +26,10 @@ pub struct FileEntry {
     pub gid: Option<u32>,
     /// Resource fork size (HFS/HFS+ only). None or Some(0) means no resource fork.
     pub resource_fork_size: Option<u64>,
+    /// ProDOS auxiliary type (16-bit). Semantics depend on the file type
+    /// (e.g. `$0801` = Applesoft BASIC load address, load addr for BIN,
+    /// record length for random-access TXT). Only set for ProDOS entries.
+    pub aux_type: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -56,6 +60,7 @@ impl FileEntry {
             uid: None,
             gid: None,
             resource_fork_size: None,
+            aux_type: None,
         }
     }
 
@@ -75,6 +80,7 @@ impl FileEntry {
             uid: None,
             gid: None,
             resource_fork_size: None,
+            aux_type: None,
         }
     }
 
@@ -94,6 +100,7 @@ impl FileEntry {
             uid: None,
             gid: None,
             resource_fork_size: None,
+            aux_type: None,
         }
     }
 
@@ -119,6 +126,7 @@ impl FileEntry {
             uid: None,
             gid: None,
             resource_fork_size: None,
+            aux_type: None,
         }
     }
 
@@ -143,6 +151,7 @@ impl FileEntry {
             uid: None,
             gid: None,
             resource_fork_size: None,
+            aux_type: None,
         }
     }
 

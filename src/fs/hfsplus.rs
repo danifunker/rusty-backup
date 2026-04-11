@@ -1094,6 +1094,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
             uid: None,
             gid: None,
             resource_fork_size: None,
+            aux_type: None,
         })
     }
 

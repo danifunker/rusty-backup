@@ -1547,6 +1547,79 @@ fn test_prodos_edit_round_trip() {
 }
 
 #[test]
+fn test_prodos_aux_type_populated_from_catalog() {
+    // `list_prodos_directory` must surface the aux_type from the 39-byte
+    // catalog entry. ANTETRIS is an S16 ($B3) binary whose aux type should be
+    // non-zero on the fixture.
+    use rusty_backup::fs::filesystem::Filesystem;
+
+    let img = load_fixture("test_prodos.hdv.zst");
+    let cursor = Cursor::new(img);
+    let mut fs = rusty_backup::fs::prodos::ProDosFilesystem::open(cursor, 0).unwrap();
+    let root = fs.root().unwrap();
+    let root_entries = fs.list_directory(&root).unwrap();
+    let antetris_dir = root_entries.iter().find(|e| e.name == "ANTETRIS").unwrap();
+    let game_files = fs.list_directory(antetris_dir).unwrap();
+    let antetris_bin = game_files.iter().find(|e| e.name == "ANTETRIS").unwrap();
+    assert!(
+        antetris_bin.aux_type.is_some(),
+        "aux_type should be populated for ProDOS files"
+    );
+}
+
+#[test]
+fn test_prodos_set_prodos_type_round_trip() {
+    // Create a stub file as BIN, then change it to TXT with a specific aux
+    // via set_prodos_type, sync, reopen, and verify both fields landed.
+    use rusty_backup::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+
+    let mut img = load_fixture("test_prodos.hdv.zst");
+    let payload = b"not-really-text";
+
+    {
+        let cursor = Cursor::new(&mut img);
+        let mut fs = rusty_backup::fs::prodos::ProDosFilesystem::open(cursor, 0).unwrap();
+        let root = fs.root().unwrap();
+        let opts = CreateFileOptions {
+            type_code: Some("$06".into()),
+            aux_type: Some(0x0000),
+            ..Default::default()
+        };
+        let created = fs
+            .create_file(
+                &root,
+                "RBTYPE",
+                &mut &payload[..],
+                payload.len() as u64,
+                &opts,
+            )
+            .unwrap();
+        assert_eq!(created.type_code.as_deref(), Some("$06 BIN"));
+        assert_eq!(created.aux_type, Some(0x0000));
+
+        // Change to $04 TXT with aux $1234.
+        fs.set_prodos_type(&created, 0x04, 0x1234).unwrap();
+        fs.sync_metadata().unwrap();
+    }
+
+    let cursor = Cursor::new(img);
+    let mut fs = rusty_backup::fs::prodos::ProDosFilesystem::open(cursor, 0).unwrap();
+    let root = fs.root().unwrap();
+    let entries = fs.list_directory(&root).unwrap();
+    let rbtype = entries.iter().find(|e| e.name == "RBTYPE").unwrap();
+    assert_eq!(
+        rbtype.type_code.as_deref(),
+        Some("$04 TXT"),
+        "set_prodos_type should have flipped type byte"
+    );
+    assert_eq!(
+        rbtype.aux_type,
+        Some(0x1234),
+        "set_prodos_type should have written aux"
+    );
+}
+
+#[test]
 fn test_prodos_read_file_contents() {
     use rusty_backup::fs::filesystem::Filesystem;
 

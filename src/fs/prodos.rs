@@ -59,6 +59,7 @@ impl<R: Read + Seek + Send> Filesystem for ProDosFilesystem<R> {
             uid: None,
             gid: None,
             resource_fork_size: None,
+            aux_type: None,
         })
     }
 
@@ -221,6 +222,38 @@ impl<R: Read + Write + Seek + Send> ProDosFilesystem<R> {
     }
 
     // ── Directory helpers ────────────────────────────────────────────────
+
+    /// Walk an absolute ProDOS path (e.g. `/SUB/FILE.TXT`) and return the
+    /// directory block + slot of the referenced entry. The path must not
+    /// refer to the volume root itself.
+    fn locate_dir_entry_by_path(&mut self, path: &str) -> Result<(u16, usize), FilesystemError> {
+        let trimmed = path.trim_start_matches('/');
+        if trimmed.is_empty() {
+            return Err(FilesystemError::NotFound(path.into()));
+        }
+        let segments: Vec<&str> = trimmed.split('/').collect();
+        // Start at the volume directory key block.
+        let mut dir_key_block: u16 = 2;
+        // Walk parent segments: each must be a subdirectory.
+        for seg in &segments[..segments.len() - 1] {
+            match self.find_dir_entry(dir_key_block, seg)? {
+                Some((block_num, slot)) => {
+                    let block = self.read_block(block_num)?;
+                    let eo = 4 + slot * 39;
+                    let type_nibble = block[eo] >> 4;
+                    if type_nibble != 0xD {
+                        return Err(FilesystemError::NotADirectory(seg.to_string()));
+                    }
+                    // Subdir entry: bytes 17-18 hold the key block.
+                    dir_key_block = u16::from_le_bytes([block[eo + 17], block[eo + 18]]);
+                }
+                None => return Err(FilesystemError::NotFound(seg.to_string())),
+            }
+        }
+        let leaf = segments.last().unwrap();
+        self.find_dir_entry(dir_key_block, leaf)?
+            .ok_or_else(|| FilesystemError::NotFound(leaf.to_string()))
+    }
 
     /// Find a directory entry by name (case-insensitive) in a directory chain.
     /// Returns `(block_num, slot_index)` if found.
@@ -817,6 +850,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ProDosFilesystem<R> {
 
         let mut fe = FileEntry::new_file(validated_name, path, eof as u64, key_ptr as u64);
         fe.type_code = Some(super::prodos_types::format_type_code(file_type));
+        fe.aux_type = Some(aux_type);
         fe.mode = Some(storage_type as u32);
         Ok(fe)
     }
@@ -904,6 +938,33 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ProDosFilesystem<R> {
             self.update_dir_file_count(dir_key_block, -1)?;
         }
 
+        Ok(())
+    }
+
+    fn set_prodos_type(
+        &mut self,
+        entry: &FileEntry,
+        type_byte: u8,
+        aux_type: u16,
+    ) -> Result<(), FilesystemError> {
+        if !entry.is_file() {
+            return Err(FilesystemError::Unsupported(
+                "set_prodos_type only applies to files".into(),
+            ));
+        }
+        let (block_num, slot) = self.locate_dir_entry_by_path(&entry.path)?;
+
+        // Read the entry bytes, patch file_type (byte 16) and aux_type (bytes 31-32),
+        // write it back.
+        let block = self.read_block(block_num)?;
+        let eo = 4 + slot * 39;
+        let mut entry_bytes = [0u8; 39];
+        entry_bytes.copy_from_slice(&block[eo..eo + 39]);
+        entry_bytes[16] = type_byte;
+        let at = aux_type.to_le_bytes();
+        entry_bytes[31] = at[0];
+        entry_bytes[32] = at[1];
+        self.write_dir_entry(block_num, slot, &entry_bytes)?;
         Ok(())
     }
 
@@ -1302,6 +1363,7 @@ fn list_prodos_directory<R: Read + Seek>(
             let key_pointer = u16::from_le_bytes([e[17], e[18]]);
             let eof = (e[21] as u32) | ((e[22] as u32) << 8) | ((e[23] as u32) << 16);
             let file_type = e[16];
+            let aux_type = u16::from_le_bytes([e[31], e[32]]);
             let creation_date = u16::from_le_bytes([e[24], e[25]]);
             let creation_time = u16::from_le_bytes([e[26], e[27]]);
             let modified_date = u16::from_le_bytes([e[33], e[34]]);
@@ -1320,6 +1382,7 @@ fn list_prodos_directory<R: Read + Seek>(
                 let mut fe = FileEntry::new_file(name, path, eof as u64, key_pointer as u64);
                 fe.modified = modified;
                 fe.type_code = Some(super::prodos_types::format_type_code(file_type));
+                fe.aux_type = Some(aux_type);
                 // Store storage type in `mode` so read_file can dispatch correctly.
                 fe.mode = Some(type_nibble as u32);
                 result.push(fe);

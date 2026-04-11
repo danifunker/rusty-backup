@@ -221,6 +221,41 @@ pub fn type_for_filename(name: &str) -> Option<ProdosExtensionInfo> {
     type_for_extension(&name[dot + 1..])
 }
 
+/// Encode a ProDOS `(type_byte, aux_type)` pair as a CiderPress-style
+/// filename suffix, including the leading `#`. Uppercase hex, big-endian
+/// aux (as written on the host filename).
+///
+/// Example: `encode_cp_suffix(0xFC, 0x0801) == "#FC0801"`.
+pub fn encode_cp_suffix(type_byte: u8, aux_type: u16) -> String {
+    format!("#{:02X}{:04X}", type_byte, aux_type)
+}
+
+/// Look for a trailing CiderPress `#TTAAAA` suffix on a host filename.
+///
+/// Returns `(stem, type_byte, aux_type)` if the filename ends with a valid
+/// 6-digit hex suffix preceded by `#`. The `stem` is the filename with the
+/// suffix removed.
+///
+/// - Hex digits are case-insensitive (`#fc0801` and `#FC0801` both parse).
+/// - The suffix must be the literal tail of the filename. A trailing
+///   dot-extension after the suffix (e.g. `FOO#FC0801.bak`) is not matched;
+///   callers should fall back to extension-based detection.
+pub fn decode_cp_suffix(filename: &str) -> Option<(&str, u8, u16)> {
+    // Find the last '#' in the filename.
+    let hash_idx = filename.rfind('#')?;
+    let tail = &filename[hash_idx + 1..];
+    if tail.len() != 6 {
+        return None;
+    }
+    if !tail.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let type_byte = u8::from_str_radix(&tail[0..2], 16).ok()?;
+    let aux_type = u16::from_str_radix(&tail[2..6], 16).ok()?;
+    let stem = &filename[..hash_idx];
+    Some((stem, type_byte, aux_type))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,5 +312,73 @@ mod tests {
         let info2 = type_for_filename("GAME.SRC.BAS").unwrap();
         assert_eq!(info2.type_byte, 0xFC);
         assert!(type_for_filename("NOEXT").is_none());
+    }
+
+    #[test]
+    fn encode_cp_suffix_formats_uppercase_hex() {
+        assert_eq!(encode_cp_suffix(0x04, 0x0000), "#040000");
+        assert_eq!(encode_cp_suffix(0xFC, 0x0801), "#FC0801");
+        assert_eq!(encode_cp_suffix(0xB3, 0xDB7F), "#B3DB7F");
+        assert_eq!(encode_cp_suffix(0xFF, 0xFFFF), "#FFFFFF");
+    }
+
+    #[test]
+    fn decode_cp_suffix_parses_valid_suffixes() {
+        assert_eq!(
+            decode_cp_suffix("README.TXT#040000"),
+            Some(("README.TXT", 0x04, 0x0000))
+        );
+        assert_eq!(
+            decode_cp_suffix("HELLO.BAS#FC0801"),
+            Some(("HELLO.BAS", 0xFC, 0x0801))
+        );
+        assert_eq!(
+            decode_cp_suffix("ANTETRIS#B3DB7F"),
+            Some(("ANTETRIS", 0xB3, 0xDB7F))
+        );
+    }
+
+    #[test]
+    fn decode_cp_suffix_is_case_insensitive() {
+        assert_eq!(
+            decode_cp_suffix("hello.bas#fc0801"),
+            Some(("hello.bas", 0xFC, 0x0801))
+        );
+        assert_eq!(
+            decode_cp_suffix("HELLO.BAS#Fc0801"),
+            Some(("HELLO.BAS", 0xFC, 0x0801))
+        );
+    }
+
+    #[test]
+    fn decode_cp_suffix_rejects_bad_input() {
+        // No '#'.
+        assert!(decode_cp_suffix("README.TXT").is_none());
+        // 5 hex digits.
+        assert!(decode_cp_suffix("README.TXT#FC080").is_none());
+        // 7 hex digits.
+        assert!(decode_cp_suffix("README.TXT#FC08011").is_none());
+        // Trailing extension after the suffix.
+        assert!(decode_cp_suffix("FOO#FC0801.bak").is_none());
+        // Non-hex character.
+        assert!(decode_cp_suffix("README.TXT#FCZ801").is_none());
+    }
+
+    #[test]
+    fn encode_decode_round_trip() {
+        for &(tt, aa) in &[
+            (0x04u8, 0x0000u16),
+            (0xFC, 0x0801),
+            (0xB3, 0xDB7F),
+            (0xFF, 0xFFFF),
+            (0x00, 0x1234),
+        ] {
+            let suffix = encode_cp_suffix(tt, aa);
+            let name = format!("NAME{}", suffix);
+            let (stem, tt2, aa2) = decode_cp_suffix(&name).unwrap();
+            assert_eq!(stem, "NAME");
+            assert_eq!(tt, tt2);
+            assert_eq!(aa, aa2);
+        }
     }
 }

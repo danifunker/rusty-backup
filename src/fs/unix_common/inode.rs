@@ -159,6 +159,7 @@ pub fn unix_entry_from_inode(
         uid: Some(uid),
         gid: Some(gid),
         resource_fork_size: None,
+        aux_type: None,
     }
 }
 

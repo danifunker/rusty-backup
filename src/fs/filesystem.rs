@@ -231,6 +231,19 @@ pub trait EditableFilesystem: Filesystem {
         Ok(())
     }
 
+    /// Set ProDOS file type byte and aux type on an existing file.
+    /// Default returns `Unsupported` — override on ProDOS.
+    fn set_prodos_type(
+        &mut self,
+        _entry: &FileEntry,
+        _type_byte: u8,
+        _aux_type: u16,
+    ) -> Result<(), FilesystemError> {
+        Err(FilesystemError::Unsupported(
+            "set_prodos_type not supported for this filesystem".into(),
+        ))
+    }
+
     /// Write resource fork data. No-op for non-HFS filesystems.
     fn write_resource_fork(
         &mut self,
