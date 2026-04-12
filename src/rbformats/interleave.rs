@@ -32,21 +32,20 @@ const SECTORS_PER_TRACK: usize = 16;
 /// Bytes per physical sector.
 const SECTOR_SIZE: usize = 256;
 
-/// Maps a physical sector index (in DOS 3.3 order) to the corresponding
-/// ProDOS physical sector index.  When reading a `.do` file, the bytes at
-/// `track * 16 * 256 + dos_sector * 256` correspond to physical sector
-/// `dos_sector`.  To produce ProDOS-order output, we need to rearrange
-/// sectors within each track.
+/// Maps DOS logical sector number → ProDOS-order position within a track.
 ///
-/// ProDOS block N is composed of two physical sectors from the same track:
-///   - Low half (bytes 0..256):   sector `PRODOS_BLOCK_INTERLEAVE[N*2 % 16]`
-///   - High half (bytes 256..512): sector `PRODOS_BLOCK_INTERLEAVE[N*2+1 % 16]`
+/// In a `.do` file, byte offset `track * 16 * 256 + dos_sector * 256` holds
+/// the data for DOS logical sector `dos_sector`.  In a `.po` file, position
+/// `prodos_pos * 256` holds ProDOS-order sector `prodos_pos`.
 ///
-/// But it's simpler to express as: for each of the 16 sectors in a track,
-/// DOS 3.3 sector S maps to ProDOS sector INTERLEAVE[S].
+/// The physical sector layout on disk:
+///   - DOS 3.3 maps logical sector N to physical sector via its own skew table
+///   - ProDOS maps block N to physical sectors (N*2, N*2+1) mod 16
+///   - A `.po` file stores sectors as: phys 0,2,4,6,8,10,12,14,1,3,5,7,9,11,13,15
 ///
-/// The interleave table maps DOS 3.3 sector number → ProDOS sector number.
-const DOS_TO_PRODOS_SECTOR: [usize; 16] = [0, 13, 11, 9, 7, 5, 3, 1, 14, 12, 10, 8, 6, 4, 2, 15];
+/// This table is a self-inverse permutation (applying it twice gives the identity),
+/// derived from the standard DOS 3.3 and ProDOS sector skew tables.
+const DOS_TO_PRODOS_SECTOR: [usize; 16] = [0, 11, 7, 3, 14, 10, 6, 2, 13, 9, 5, 1, 12, 8, 4, 15];
 
 /// Check if a 512-byte buffer looks like a ProDOS volume directory key block.
 ///
@@ -189,7 +188,7 @@ pub fn is_dos_order(raw: &[u8]) -> bool {
         prodos_to_dos[prodos_sec] = dos_sec;
     }
 
-    // ProDOS block 2 = physical sectors 4 and 5 (in ProDOS numbering)
+    // ProDOS block 2 = positions 4 and 5 in ProDOS-order layout
     let dos_sec_lo = prodos_to_dos[4];
     let dos_sec_hi = prodos_to_dos[5];
 

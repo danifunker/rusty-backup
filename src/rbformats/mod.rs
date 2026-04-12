@@ -6,6 +6,7 @@ pub mod interleave;
 pub mod raw;
 pub mod twomg;
 pub mod vhd;
+pub mod woz;
 pub mod zstd;
 
 use std::fs::{self, File};
@@ -837,6 +838,8 @@ pub enum ImageFormat {
     DosOrder,
     /// DiskCopy 4.2 — classic Mac/Apple IIgs floppy image with 84-byte header.
     DiskCopy42(dc42::Dc42Header),
+    /// WOZ 1.0/2.0 — nibble/bitstream floppy image, decoded to logical sectors.
+    Woz(woz::WozReader),
 }
 
 impl ImageFormat {
@@ -871,6 +874,13 @@ impl ImageFormat {
                     hdr.data_size
                 )
             }
+            ImageFormat::Woz(ref reader) => {
+                format!(
+                    "WOZ {} ({} bytes decoded)",
+                    reader.disk_type_name(),
+                    reader.len()
+                )
+            }
         }
     }
 }
@@ -892,7 +902,26 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
     let file_size = file.metadata()?.len();
     let mut file = file;
 
-    // 1. Check first 4 bytes for 2IMG magic
+    // 1. Check first 8 bytes for WOZ magic (WOZ1/WOZ2 + high-bit check).
+    //    WOZ has a very strong 8-byte signature, so check it first.
+    if file_size >= 12 {
+        file.seek(SeekFrom::Start(0))?;
+        let mut magic = [0u8; 8];
+        if file.read_exact(&mut magic).is_ok() && woz::is_woz(&magic) {
+            // Read entire file and decode — floppy images are small (< 1MB)
+            file.seek(SeekFrom::Start(0))?;
+            let mut raw = Vec::new();
+            file.read_to_end(&mut raw)?;
+            match woz::WozReader::from_bytes(raw) {
+                Ok(reader) => return Ok(ImageFormat::Woz(reader)),
+                Err(_) => {
+                    // WOZ magic matched but decoding failed — fall through
+                }
+            }
+        }
+    }
+
+    // 2. Check first 4 bytes for 2MG magic
     if file_size >= 64 {
         file.seek(SeekFrom::Start(0))?;
         let mut magic = [0u8; 4];
@@ -904,7 +933,7 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
         }
     }
 
-    // 2. Check last 512 bytes for VHD "conectix" cookie
+    // 3. Check last 512 bytes for VHD "conectix" cookie
     if file_size >= 512 {
         file.seek(SeekFrom::End(-512))?;
         let mut cookie = [0u8; 8];
@@ -915,7 +944,7 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
         }
     }
 
-    // 3. Check last 512 bytes for DMG koly footer
+    // 4. Check last 512 bytes for DMG koly footer
     if file_size >= 512 {
         match dmg::detect_dmg(file) {
             Ok(Some(reader)) => return Ok(ImageFormat::Dmg(reader)),
@@ -929,7 +958,7 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
         }
     }
 
-    // 4. DiskCopy 4.2 detection: 84-byte header with private field = 0x0100,
+    // 5. DiskCopy 4.2 detection: 84-byte header with private field = 0x0100,
     //    file size must equal 84 + data_size + tag_size.
     if file_size >= dc42::DC42_HEADER_SIZE {
         // Re-open since DMG detection may have consumed the file handle.
@@ -942,7 +971,7 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
         }
     }
 
-    // 5. DOS-order floppy detection for 140K images with .do/.dsk extension.
+    // 6. DOS-order floppy detection for 140K images with .do/.dsk extension.
     //    A .dsk file could be either DOS or ProDOS order, so we probe the
     //    sector data to disambiguate.
     if file_size == interleave::FLOPPY_140K {
@@ -968,7 +997,7 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
         }
     }
 
-    // 6. Fallback — raw image
+    // 7. Fallback — raw image
     Ok(ImageFormat::Raw)
 }
 
@@ -1039,6 +1068,13 @@ pub fn wrap_image_reader(file: File, format: ImageFormat) -> Result<(BoxReadSeek
                 )?),
                 hdr.data_size,
             ))
+        }
+        ImageFormat::Woz(reader) => {
+            // WOZ data was already decoded during format detection.
+            // The file parameter is unused — the WozReader holds the decoded data.
+            drop(file);
+            let size = reader.len();
+            Ok((Box::new(reader), size))
         }
     }
 }
