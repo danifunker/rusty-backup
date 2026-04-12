@@ -663,48 +663,11 @@ fn decode_35_track(
 }
 
 /// Decode a complete 3.5" WOZ image into flat sector data.
-/// Returns 80 tracks × variable sectors × 512 bytes = 819,200 bytes (800KB).
+/// Returns up to 80 tracks × 2 sides × variable sectors × 512 bytes.
+/// Single-sided (400K) = 800 sectors, double-sided (800K) = 1600 sectors.
 fn decode_35_woz(woz: &WozFile) -> Result<Vec<u8>> {
-    let mut output = vec![0u8; TOTAL_SECTORS_35 * 512];
-    let mut sector_offset = 0usize;
-
-    for track_num in 0..80usize {
-        let num_sectors = sectors_for_track(track_num);
-
-        // TMAP for 3.5": entry = (track << 1) + side
-        // For single-sided: side = 0; for double-sided both sides have tracks
-        // Most 800K disks are double-sided with 80 tracks per side
-        // TMAP index for side 0: track * 2; side 1: track * 2 + 1
-        //
-        // But for a standard 800K disk image, we interleave sides:
-        // tracks 0-79 on side 0, then tracks 0-79 on side 1
-        // Actually, the standard layout is: TMAP[track*2] = side 0, TMAP[track*2+1] = side 1
-        // We treat side 0 tracks 0-79 first, giving 800 sectors = 400K,
-        // then side 1 tracks 0-79 for the other 400K.
-        //
-        // For now, handle side 0 only in the first pass, side 1 in second pass
-        let tmap_idx = woz.tmap[track_num * 2]; // side 0
-
-        if let Some((track_data, bit_count)) = get_track_bits(woz, tmap_idx) {
-            let sectors = decode_35_track(track_data, bit_count, num_sectors);
-            for (sec_idx, sector) in sectors.iter().enumerate() {
-                if let Some(ref data) = sector {
-                    let out_offset = (sector_offset + sec_idx) * 512;
-                    if out_offset + 512 <= output.len() {
-                        output[out_offset..out_offset + 512].copy_from_slice(data);
-                    }
-                }
-            }
-        }
-
-        sector_offset += num_sectors;
-    }
-
-    // Side 1 (for double-sided disks)
-    // Decode side 0 tracks, then side 1 tracks, sequentially.
-    // For a flat image (ProDOS/HFS), sectors are numbered sequentially:
-    // all of side 0 first, then all of side 1.
-    output.fill(0);
+    // Allocate for both sides; we'll truncate if single-sided.
+    let mut output = vec![0u8; TOTAL_SECTORS_35 * 2 * 512]; // 1600 sectors max
     let mut out_pos = 0usize;
 
     // Side 0
