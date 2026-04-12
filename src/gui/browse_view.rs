@@ -1129,6 +1129,35 @@ impl BrowseView {
                     ui.label(format!("Path: {}", entry.path));
                 });
 
+                // ProDOS/GS-OS leaves $CB..$EE unassigned in the official
+                // type registry; vintage apps often picked bytes out of
+                // that range for their own data files. Surface a note so
+                // the user knows the file isn't corrupt — the type and
+                // aux round-trip via the CiderPress #TTAAAA suffix.
+                if self.is_prodos_type() {
+                    let tt = entry.type_code.as_deref().and_then(|tc| {
+                        tc.split_whitespace()
+                            .next()
+                            .and_then(|s| u8::from_str_radix(s.trim_start_matches('$'), 16).ok())
+                    });
+                    if let Some(tt) = tt {
+                        if !rusty_backup::fs::prodos_types::is_known_type(tt) {
+                            let aux = entry.aux_type.unwrap_or(0);
+                            ui.colored_label(
+                                egui::Color32::from_rgb(220, 200, 120),
+                                format!(
+                                    "Note: ${:02X} is not in the ProDOS type registry — {}. The type and aux (${:04X}) will be preserved on export via the CiderPress #{:02X}{:04X} filename suffix.",
+                                    tt,
+                                    rusty_backup::fs::prodos_types::UNKNOWN_TYPE_NOTE,
+                                    aux,
+                                    tt,
+                                    aux,
+                                ),
+                            );
+                        }
+                    }
+                }
+
                 // Extract controls row
                 let extraction_running = self.extraction_progress.is_some();
                 let is_extractable = entry.is_file() || entry.is_directory() || entry.is_symlink();
