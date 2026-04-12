@@ -559,59 +559,80 @@ fn find_address_field_35(stream: &mut BitStream) -> Option<AddressField35> {
 }
 
 /// Decode a 3.5" data field (524 bytes: 12 tag + 512 data).
-/// The encoding uses 6-and-2 but with a different buffer layout:
-/// 175 auxiliary nibbles + 524 primary nibbles + 1 checksum = 700 nibbles total.
 ///
-/// Actually, 3.5" uses: 3 groups of (175 + 175 + 174) = 524 six-bit values
-/// for the auxiliary, plus 524 primary values. But the common format is:
-/// 699 nibbles of 6-and-2 encoded data + 1 checksum.
+/// Sony GCR 3.5" encoding stores 524 bytes as 700 GCR nibbles read in
+/// 175 groups of 4.  Each group contains one auxiliary nibble (high 2 bits
+/// for 3 bytes) followed by three primary nibbles (low 6 bits each).
+/// A three-register rotating checksum (c1, c2, c3) is applied during
+/// decoding — there is no simple XOR chain like 5.25" disks.
 ///
-/// Returns the 512 data bytes (tag bytes are discarded).
+/// Returns the 512 data bytes (12-byte tag prefix is discarded).
 fn decode_data_field_35(stream: &mut BitStream) -> Option<[u8; 512]> {
-    // The 3.5" data field stores 524 bytes (12 tag + 512 data) encoded as:
-    //   - Sector byte at offset 0 (for sector interleave verification)
-    //   - 174 auxiliary nibbles (low 2 bits, packed 3 per nibble for 524 bytes)
-    //   - 524 primary nibbles (high 6 bits)
-    //   - 1 checksum nibble
-    //   Total: 175 + 524 + 1 = 700 nibbles
-    //
-    // But the actual count is ceil(524/3) = 175 aux + 524 primary = 699 + 1 checksum
-    let aux_count = 175; // ceil(524 / 3)
-    let primary_count = 524; // 12 tag + 512 data
-    let total_nibbles = aux_count + primary_count + 1; // +1 checksum
+    // After D5 AA AD prologue, the first nibble is the sector number — skip it.
+    let _sector_nib = stream.next_nibble()?;
+    let _sector = DECODE_62[_sector_nib as usize];
+    if _sector == 0xFF {
+        return None;
+    }
 
-    let mut raw = vec![0u8; total_nibbles];
-    for byte in raw.iter_mut() {
-        let nib = stream.next_nibble()?;
-        let decoded = DECODE_62[nib as usize];
-        if decoded == 0xFF {
+    // Read 700 nibbles as 175 groups of 4 (aux, primary0, primary1, primary2).
+    let mut nibble_groups = Vec::with_capacity(175);
+    for _ in 0..175 {
+        let n0 = DECODE_62[stream.next_nibble()? as usize];
+        let n1 = DECODE_62[stream.next_nibble()? as usize];
+        let n2 = DECODE_62[stream.next_nibble()? as usize];
+        let n3 = DECODE_62[stream.next_nibble()? as usize];
+        if n0 == 0xFF || n1 == 0xFF || n2 == 0xFF || n3 == 0xFF {
             return None;
         }
-        *byte = decoded;
+        nibble_groups.push((n0, n1, n2, n3));
     }
 
-    // De-XOR
-    let mut prev = 0u8;
-    for byte in raw.iter_mut() {
-        *byte ^= prev;
-        prev = *byte;
+    // Reconstruct bytes: each group of 4 nibbles → 3 data bytes.
+    // aux bits [5:4] → high 2 of byte 0, [3:2] → byte 1, [1:0] → byte 2.
+    // Three-register rotating checksum decodes each byte.
+    let mut c1: u32 = 0;
+    let mut c2: u32 = 0;
+    let mut c3: u32 = 0;
+    let mut sector_data = Vec::with_capacity(525);
+
+    for &(aux, p0, p1, p2) in &nibble_groups {
+        let d0 = (p0 & 0x3F) | ((aux << 2) & 0xC0);
+        let d1 = (p1 & 0x3F) | ((aux << 4) & 0xC0);
+        let d2 = (p2 & 0x3F) | ((aux << 6) & 0xC0);
+
+        // Byte 0: XOR with c1
+        c1 = (c1 & 0xFF) << 1;
+        if c1 > 0xFF {
+            c1 -= 0xFF;
+            c3 += 1;
+        }
+        let b0 = (d0 as u32) ^ c1;
+        c3 += b0;
+        sector_data.push(b0 as u8);
+
+        // Byte 1: XOR with c3
+        if c3 > 0xFF {
+            c3 &= 0xFF;
+            c2 += 1;
+        }
+        let b1 = (d1 as u32) ^ c3;
+        c2 += b1;
+        sector_data.push(b1 as u8);
+
+        // Byte 2: XOR with c2
+        if c2 > 0xFF {
+            c2 &= 0xFF;
+            c1 += 1;
+        }
+        let b2 = (d2 as u32) ^ c2;
+        c1 += b2;
+        sector_data.push(b2 as u8);
     }
 
-    // Reconstruct 524 bytes from aux + primary
-    let aux = &raw[..aux_count];
-    let primary = &raw[aux_count..aux_count + primary_count];
-
-    let mut sector_data = [0u8; 524];
-    for i in 0..524 {
-        let hi6 = primary[i];
-        let aux_idx = i % aux_count;
-        let aux_shift = (i / aux_count) * 2;
-        let lo2 = if aux_shift < 6 {
-            (aux[aux_idx] >> aux_shift) & 0x03
-        } else {
-            0
-        };
-        sector_data[i] = (hi6 << 2) | lo2;
+    // 175 groups × 3 bytes = 525; we need 524 (12 tag + 512 data).
+    if sector_data.len() < 524 {
+        return None;
     }
 
     // Return just the 512 data bytes (skip 12-byte tag prefix)
@@ -887,5 +908,36 @@ mod tests {
             disk_type: DISK_TYPE_525,
         };
         assert_eq!(reader.len(), 1000);
+    }
+}
+
+/// Tests that require real disk images from ~/Downloads (skipped if absent).
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+
+    #[test]
+    fn test_35_woz_decodes_filesystem() {
+        let path = std::path::Path::new(env!("HOME")).join("Downloads/4th & Inches IIgs.woz");
+        if !path.exists() {
+            return;
+        }
+
+        let reader = WozReader::open(&path).expect("failed to open WOZ file");
+        assert_eq!(
+            reader.len(),
+            819200,
+            "expected 800K double-sided 3.5\" image"
+        );
+
+        let data = &reader.data;
+        let non_zero = data.iter().filter(|&&b| b != 0).count();
+        assert!(non_zero > 1000, "decoded data is mostly zeros");
+
+        // ProDOS volume directory key block is at block 2 (offset 1024)
+        assert!(
+            crate::rbformats::interleave::has_prodos_volume_header(&data[1024..]),
+            "expected ProDOS volume header at offset 1024"
+        );
     }
 }
