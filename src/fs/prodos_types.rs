@@ -139,7 +139,7 @@ fn build_table() -> ProdosTypeTable {
             continue;
         };
         let info = ProdosTypeInfo {
-            abbr: v.abbr.unwrap_or_else(|| "???".to_string()),
+            abbr: v.abbr.unwrap_or_else(|| "CUS".to_string()),
             description: v.description.unwrap_or_default(),
             category: v.category.unwrap_or_else(|| "binary".to_string()),
         };
@@ -183,24 +183,43 @@ pub fn all_types() -> Vec<(u8, &'static ProdosTypeInfo)> {
     v
 }
 
+/// Human-readable note shown for ProDOS type bytes that are not present in
+/// the registry. These are almost always app-specific data written by
+/// vintage software that picked a byte out of the reserved `$CB`..`$EE`
+/// range; Rusty Backup still preserves the type and aux on round-trip via
+/// the CiderPress `#TTAAAA` filename suffix.
+pub const UNKNOWN_TYPE_NOTE: &str = "Custom or unassigned ProDOS type (likely app-specific data)";
+
+/// Abbreviation shown for ProDOS type bytes that are not present in the
+/// registry.
+pub const UNKNOWN_TYPE_ABBR: &str = "CUS";
+
 /// Look up the 3-letter abbreviation for a ProDOS file type byte.
-/// Returns "???" for unknown types.
+/// Returns `UNKNOWN_TYPE_ABBR` for unknown types.
 pub fn type_abbr(file_type: u8) -> &'static str {
     table()
         .by_byte
         .get(&file_type)
         .map(|info| info.abbr.as_str())
-        .unwrap_or("???")
+        .unwrap_or(UNKNOWN_TYPE_ABBR)
 }
 
-/// Look up the description for a ProDOS file type byte. Returns empty
-/// string for unknown types.
+/// Look up the description for a ProDOS file type byte. Returns a generic
+/// "custom/unassigned" note for bytes that are not in the registry, and an
+/// empty string only when the registry explicitly has no description for a
+/// known byte.
 pub fn type_description(file_type: u8) -> &'static str {
     table()
         .by_byte
         .get(&file_type)
         .map(|info| info.description.as_str())
-        .unwrap_or("")
+        .unwrap_or(UNKNOWN_TYPE_NOTE)
+}
+
+/// Returns true if the given ProDOS file type byte has a registered entry
+/// in the type table (either the embedded defaults or a user override).
+pub fn is_known_type(file_type: u8) -> bool {
+    table().by_byte.contains_key(&file_type)
 }
 
 /// Look up the category ("text", "binary", "code", ...) for a ProDOS file
@@ -283,9 +302,16 @@ mod tests {
     #[test]
     fn unknown_types_return_placeholder() {
         // 0x99 isn't used in the standard table.
-        assert_eq!(type_abbr(0x99), "???");
-        assert_eq!(type_description(0x99), "");
+        assert_eq!(type_abbr(0x99), "CUS");
+        assert_eq!(type_description(0x99), UNKNOWN_TYPE_NOTE);
         assert_eq!(type_category(0x99), "binary");
+        assert!(!is_known_type(0x99));
+    }
+
+    #[test]
+    fn known_types_are_reported_as_known() {
+        assert!(is_known_type(0x04));
+        assert!(is_known_type(0xFC));
     }
 
     #[test]

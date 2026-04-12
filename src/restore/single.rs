@@ -171,7 +171,7 @@ pub fn run_single_partition_restore(
         SinglePartitionSource::ImageFile { path } => {
             let file =
                 File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-            let format = rbformats::detect_image_format(file)
+            let format = rbformats::detect_image_format_with_path(file, Some(path))
                 .with_context(|| format!("failed to detect format of {}", path.display()))?;
             let desc = format.description();
             log(
@@ -393,7 +393,7 @@ pub fn run_single_partition_restore(
         }
         SinglePartitionSource::ImageFile { path } => {
             let file = File::open(path)?;
-            let format = rbformats::detect_image_format(file)?;
+            let format = rbformats::detect_image_format_with_path(file, Some(path))?;
             let file2 = File::open(path)?;
             let (mut reader, _) = rbformats::wrap_image_reader(file2, format)?;
 

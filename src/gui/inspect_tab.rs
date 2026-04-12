@@ -28,6 +28,8 @@ pub struct InspectTab {
     selected_device_idx: Option<usize>,
     /// Path to an image file (when using file picker instead of device)
     image_file_path: Option<PathBuf>,
+    /// Detected image format label (e.g. "WOZ 3.5\"", "Fixed VHD", "2MG")
+    image_format_label: Option<String>,
     /// Path to a backup folder (loaded via metadata.json)
     backup_folder_path: Option<PathBuf>,
     /// Parsed partition table result
@@ -204,6 +206,8 @@ struct InspectStatus {
     alignment: Option<PartitionAlignment>,
     partitions: Vec<PartitionInfo>,
     partition_min_sizes: HashMap<usize, u64>,
+    /// Detected image format label (e.g. "WOZ 3.5\"", "Fixed VHD").
+    format_label: Option<String>,
     /// The open device file handle, passed back to the main thread so
     /// that BrowseView can reuse it without re-opening (and re-prompting).
     device_file: Option<File>,
@@ -236,6 +240,7 @@ impl Default for InspectTab {
         Self {
             selected_device_idx: None,
             image_file_path: None,
+            image_format_label: None,
             backup_folder_path: None,
             partition_table: None,
             alignment: None,
@@ -325,7 +330,18 @@ impl InspectTab {
             let current_label = if let Some(path) = &self.backup_folder_path {
                 format!("Backup: {}", path.display())
             } else if let Some(path) = &self.image_file_path {
-                format!("VHD: {}", path.display())
+                if let Some(label) = &self.image_format_label {
+                    format!(
+                        "{}: {}",
+                        label,
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    )
+                } else {
+                    format!(
+                        "Image: {}",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    )
+                }
             } else if let Some(idx) = self.selected_device_idx {
                 devices
                     .get(idx)
@@ -361,7 +377,7 @@ impl InspectTab {
                                 "Disk Images",
                                 &[
                                     "vhd", "img", "raw", "bin", "iso", "dd", "hda", "hdv", "2mg",
-                                    "dmg",
+                                    "dmg", "po", "do", "dsk", "dc42", "woz",
                                 ],
                             )
                             .add_filter("All Files", &["*"])
@@ -1806,6 +1822,7 @@ impl InspectTab {
                 self.alignment = status.alignment.take();
                 self.partitions = std::mem::take(&mut status.partitions);
                 self.partition_min_sizes = std::mem::take(&mut status.partition_min_sizes);
+                self.image_format_label = status.format_label.take();
                 // macOS only: capture the open device fd + guard so BrowseView
                 // can reuse it without re-opening (and without another auth dialog).
                 #[cfg(target_os = "macos")]
@@ -1862,6 +1879,7 @@ impl InspectTab {
         self.partitions.clear();
         self.backup_metadata = None;
         self.last_error = None;
+        self.image_format_label = None;
         self.partition_min_sizes.clear();
         self.clonezilla_image = None;
         self.block_caches.clear();
@@ -2091,6 +2109,7 @@ impl InspectTab {
             alignment: None,
             partitions: Vec::new(),
             partition_min_sizes: HashMap::new(),
+            format_label: None,
             device_file: None,
             device_guard: None,
         }));
@@ -2146,10 +2165,16 @@ impl InspectTab {
             let detect_result = if !is_device {
                 // For image files, use unified format detection
                 match device_file.try_clone() {
-                    Ok(clone) => match rusty_backup::rbformats::detect_image_format(clone) {
+                    Ok(clone) => match rusty_backup::rbformats::detect_image_format_with_path(
+                        clone,
+                        Some(&path),
+                    ) {
                         Ok(format) => {
                             let desc = format.description();
                             push_log(format!("Detected format: {}", desc));
+                            if let Ok(mut s) = status.lock() {
+                                s.format_label = Some(desc.clone());
+                            }
                             match rusty_backup::rbformats::wrap_image_reader(
                                 device_file.try_clone().unwrap_or_else(|_| {
                                     std::fs::File::open(&path).expect("reopen failed")

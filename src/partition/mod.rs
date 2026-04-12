@@ -82,6 +82,22 @@ pub struct PartitionInfo {
     pub partition_type_string: Option<String>,
 }
 
+/// Standard floppy disk image sizes (bytes).
+///
+/// Images matching one of these sizes that lack both a recognized filesystem
+/// and a valid MBR/GPT signature are treated as superfloppies with an unknown
+/// filesystem rather than producing a confusing partition-table error.
+fn is_floppy_size(size: u64) -> bool {
+    matches!(
+        size,
+        143_360     // 5.25" 140K (35 tracks × 16 sectors × 256 bytes)
+        | 409_600   // 3.5" 400K single-sided GCR
+        | 819_200   // 3.5" 800K double-sided GCR
+        | 737_280   // 3.5" 720K MFM (PC double-density)
+        | 1_474_560 // 3.5" 1.44MB MFM (PC/Mac high-density)
+    )
+}
+
 /// Detect whether a disk image is a superfloppy (no partition table, filesystem at sector 0).
 ///
 /// Checks the first sector for a valid FAT BPB, and offset 1024 for HFS/HFS+.
@@ -193,7 +209,24 @@ impl PartitionTable {
             .seek(SeekFrom::Start(0))
             .map_err(RustyBackupError::Io)?;
 
-        let mut mbr = Mbr::parse(&mbr_data)?;
+        // Try MBR parsing.  If it fails and the image is a standard floppy
+        // size, treat it as a superfloppy with an unrecognized filesystem
+        // (e.g. Apple DOS 3.3) rather than surfacing a confusing MBR error.
+        let mut mbr = match Mbr::parse(&mbr_data) {
+            Ok(m) => m,
+            Err(e) => {
+                let size_bytes = reader
+                    .seek(SeekFrom::End(0))
+                    .map_err(RustyBackupError::Io)?;
+                if is_floppy_size(size_bytes) {
+                    return Ok(PartitionTable::None {
+                        size_bytes,
+                        fs_hint: "Unknown".to_string(),
+                    });
+                }
+                return Err(e);
+            }
+        };
 
         if mbr.is_protective_gpt() {
             // Try parsing GPT

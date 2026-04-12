@@ -688,7 +688,10 @@ impl RestoreTab {
                     if let Some(path) = super::file_dialog()
                         .add_filter(
                             "Disk Images",
-                            &["img", "raw", "bin", "vhd", "2mg", "iso", "dd"],
+                            &[
+                                "img", "raw", "bin", "vhd", "2mg", "iso", "dd", "po", "do", "dsk",
+                                "dc42", "woz",
+                            ],
                         )
                         .add_filter("All Files", &["*"])
                         .pick_file()
@@ -1450,7 +1453,10 @@ impl RestoreTab {
                     if let Some(path) = super::file_dialog()
                         .add_filter(
                             "Disk Images",
-                            &["img", "raw", "bin", "vhd", "2mg", "iso", "dd"],
+                            &[
+                                "img", "raw", "bin", "vhd", "2mg", "iso", "dd", "po", "do", "dsk",
+                                "dc42", "woz",
+                            ],
                         )
                         .add_filter("All Files", &["*"])
                         .pick_file()

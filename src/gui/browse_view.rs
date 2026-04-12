@@ -1129,6 +1129,35 @@ impl BrowseView {
                     ui.label(format!("Path: {}", entry.path));
                 });
 
+                // ProDOS/GS-OS leaves $CB..$EE unassigned in the official
+                // type registry; vintage apps often picked bytes out of
+                // that range for their own data files. Surface a note so
+                // the user knows the file isn't corrupt — the type and
+                // aux round-trip via the CiderPress #TTAAAA suffix.
+                if self.is_prodos_type() {
+                    let tt = entry.type_code.as_deref().and_then(|tc| {
+                        tc.split_whitespace()
+                            .next()
+                            .and_then(|s| u8::from_str_radix(s.trim_start_matches('$'), 16).ok())
+                    });
+                    if let Some(tt) = tt {
+                        if !rusty_backup::fs::prodos_types::is_known_type(tt) {
+                            let aux = entry.aux_type.unwrap_or(0);
+                            ui.colored_label(
+                                egui::Color32::from_rgb(220, 200, 120),
+                                format!(
+                                    "Note: ${:02X} is not in the ProDOS type registry — {}. The type and aux (${:04X}) will be preserved on export via the CiderPress #{:02X}{:04X} filename suffix.",
+                                    tt,
+                                    rusty_backup::fs::prodos_types::UNKNOWN_TYPE_NOTE,
+                                    aux,
+                                    tt,
+                                    aux,
+                                ),
+                            );
+                        }
+                    }
+                }
+
                 // Extract controls row
                 let extraction_running = self.extraction_progress.is_some();
                 let is_extractable = entry.is_file() || entry.is_directory() || entry.is_symlink();
@@ -3084,6 +3113,17 @@ fn create_filesystem(
         return fs::open_filesystem(chd_reader, 0, partition_type, partition_type_string);
     }
 
+    // Detect WOZ files by extension — decode GCR bitstream to sector data
+    let is_woz = path
+        .extension()
+        .map(|e| e.eq_ignore_ascii_case("woz"))
+        .unwrap_or(false);
+    if is_woz {
+        let woz_reader = rusty_backup::rbformats::woz::WozReader::open(path)
+            .map_err(|e| FilesystemError::Parse(format!("failed to open WOZ: {e}")))?;
+        return fs::open_filesystem(woz_reader, 0, partition_type, partition_type_string);
+    }
+
     if is_seekable_zst {
         let file = File::open(path).map_err(FilesystemError::Io)?;
         let decoder = match zeekstd::Decoder::new(file) {
@@ -3103,14 +3143,39 @@ fn create_filesystem(
             partition_type_string,
         )
     } else {
+        // For all other formats (raw images, VHD, 2MG, DiskCopy 4.2, DOS-order, etc.),
+        // use the unified format detection pipeline so container wrappers are peeled off.
         let file = File::open(path).map_err(FilesystemError::Io)?;
-        let reader = BufReader::new(file);
-        fs::open_filesystem(
-            reader,
-            partition_offset,
-            partition_type,
-            partition_type_string,
-        )
+        match rusty_backup::rbformats::detect_image_format_with_path(file, Some(path)) {
+            Ok(format) if !matches!(format, rusty_backup::rbformats::ImageFormat::Raw) => {
+                let file2 = File::open(path).map_err(FilesystemError::Io)?;
+                let (reader, _size) = rusty_backup::rbformats::wrap_image_reader(file2, format)
+                    .map_err(|e| FilesystemError::Parse(format!("failed to unwrap image: {e}")))?;
+                // Container formats present unwrapped data starting at offset 0;
+                // use partition_offset=0 for superfloppies.
+                let effective_offset = if partition_type == 0 {
+                    0
+                } else {
+                    partition_offset
+                };
+                fs::open_filesystem(
+                    reader,
+                    effective_offset,
+                    partition_type,
+                    partition_type_string,
+                )
+            }
+            _ => {
+                let file = File::open(path).map_err(FilesystemError::Io)?;
+                let reader = BufReader::new(file);
+                fs::open_filesystem(
+                    reader,
+                    partition_offset,
+                    partition_type,
+                    partition_type_string,
+                )
+            }
+        }
     }
 }
 

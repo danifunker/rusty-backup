@@ -1,9 +1,12 @@
 pub mod chd;
+pub mod dc42;
 pub mod dmg;
 pub mod export;
+pub mod interleave;
 pub mod raw;
 pub mod twomg;
 pub mod vhd;
+pub mod woz;
 pub mod zstd;
 
 use std::fs::{self, File};
@@ -831,6 +834,12 @@ pub enum ImageFormat {
     TwoMg(twomg::TwoMgHeader),
     /// UDIF DMG — virtual decompressed reader.
     Dmg(dmg::DmgReader),
+    /// Apple II DOS sector order — 5.25" floppy (140 KB), needs interleave to ProDOS order.
+    DosOrder,
+    /// DiskCopy 4.2 — classic Mac/Apple IIgs floppy image with 84-byte header.
+    DiskCopy42(dc42::Dc42Header),
+    /// WOZ 1.0/2.0 — nibble/bitstream floppy image, decoded to logical sectors.
+    Woz(woz::WozReader),
 }
 
 impl ImageFormat {
@@ -851,18 +860,68 @@ impl ImageFormat {
                     reader.total_size()
                 )
             }
+            ImageFormat::DosOrder => {
+                format!(
+                    "DOS sector order ({} bytes, will convert to ProDOS order)",
+                    interleave::FLOPPY_140K
+                )
+            }
+            ImageFormat::DiskCopy42(ref hdr) => {
+                format!(
+                    "DiskCopy 4.2 \"{}\" ({}, {} bytes)",
+                    hdr.disk_name,
+                    hdr.format_name(),
+                    hdr.data_size
+                )
+            }
+            ImageFormat::Woz(ref reader) => {
+                format!(
+                    "WOZ {} ({} bytes decoded)",
+                    reader.disk_type_name(),
+                    reader.len()
+                )
+            }
         }
     }
 }
 
 /// Detect the image format of an opened file.
 ///
-/// Checks for 2MG header, VHD footer, DMG koly footer, and falls back to raw.
+/// Checks for 2MG header, VHD footer, DMG koly footer, DOS 3.3-order floppy,
+/// and falls back to raw.
+///
+/// The optional `path` enables extension-based heuristics for formats that lack
+/// a magic signature (e.g. `.do`/`.dsk` files).
 pub fn detect_image_format(file: File) -> Result<ImageFormat> {
+    detect_image_format_with_path(file, None)
+}
+
+/// Like [`detect_image_format`] but with an optional filesystem path for
+/// extension-based detection of headerless formats.
+pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<ImageFormat> {
     let file_size = file.metadata()?.len();
     let mut file = file;
 
-    // 1. Check first 4 bytes for 2IMG magic
+    // 1. Check first 8 bytes for WOZ magic (WOZ1/WOZ2 + high-bit check).
+    //    WOZ has a very strong 8-byte signature, so check it first.
+    if file_size >= 12 {
+        file.seek(SeekFrom::Start(0))?;
+        let mut magic = [0u8; 8];
+        if file.read_exact(&mut magic).is_ok() && woz::is_woz(&magic) {
+            // Read entire file and decode — floppy images are small (< 1MB)
+            file.seek(SeekFrom::Start(0))?;
+            let mut raw = Vec::new();
+            file.read_to_end(&mut raw)?;
+            match woz::WozReader::from_bytes(raw) {
+                Ok(reader) => return Ok(ImageFormat::Woz(reader)),
+                Err(_) => {
+                    // WOZ magic matched but decoding failed — fall through
+                }
+            }
+        }
+    }
+
+    // 2. Check first 4 bytes for 2MG magic
     if file_size >= 64 {
         file.seek(SeekFrom::Start(0))?;
         let mut magic = [0u8; 4];
@@ -874,7 +933,7 @@ pub fn detect_image_format(file: File) -> Result<ImageFormat> {
         }
     }
 
-    // 2. Check last 512 bytes for VHD "conectix" cookie
+    // 3. Check last 512 bytes for VHD "conectix" cookie
     if file_size >= 512 {
         file.seek(SeekFrom::End(-512))?;
         let mut cookie = [0u8; 8];
@@ -885,32 +944,69 @@ pub fn detect_image_format(file: File) -> Result<ImageFormat> {
         }
     }
 
-    // 3. Check last 512 bytes for DMG koly footer
+    // 4. Check last 512 bytes for DMG koly footer
     if file_size >= 512 {
         match dmg::detect_dmg(file) {
             Ok(Some(reader)) => return Ok(ImageFormat::Dmg(reader)),
             Ok(None) => {
-                // Not a UDIF DMG — fall through to raw.
-                // We consumed the file; return Raw (the caller will re-open).
-                return Ok(ImageFormat::Raw);
+                // Not a UDIF DMG — fall through.
+                // We consumed the file; re-check remaining heuristics below.
             }
             Err(_) => {
-                // Parse error — treat as raw
-                return Ok(ImageFormat::Raw);
+                // Parse error — fall through to remaining checks.
             }
         }
     }
 
-    // 4. Fallback — raw image
+    // 5. DiskCopy 4.2 detection: 84-byte header with private field = 0x0100,
+    //    file size must equal 84 + data_size + tag_size.
+    if file_size >= dc42::DC42_HEADER_SIZE {
+        // Re-open since DMG detection may have consumed the file handle.
+        if let Some(p) = path {
+            if let Ok(mut f) = File::open(p) {
+                if let Some(hdr) = dc42::detect_dc42(&mut f, file_size) {
+                    return Ok(ImageFormat::DiskCopy42(hdr));
+                }
+            }
+        }
+    }
+
+    // 6. DOS-order floppy detection for 140K images with .do/.dsk extension.
+    //    A .dsk file could be either DOS or ProDOS order, so we probe the
+    //    sector data to disambiguate.
+    if file_size == interleave::FLOPPY_140K {
+        if let Some(ext) = path.and_then(|p| p.extension()).and_then(|e| e.to_str()) {
+            let ext_lower = ext.to_ascii_lowercase();
+            match ext_lower.as_str() {
+                "do" => return Ok(ImageFormat::DosOrder),
+                "dsk" => {
+                    // Ambiguous — probe content to decide ordering.
+                    // Re-open since DMG detection may have consumed the file handle.
+                    if let Some(p) = path {
+                        if let Ok(mut f) = File::open(p) {
+                            let mut raw = vec![0u8; interleave::FLOPPY_140K as usize];
+                            if f.read_exact(&mut raw).is_ok() && interleave::is_dos_order(&raw) {
+                                return Ok(ImageFormat::DosOrder);
+                            }
+                        }
+                    }
+                    // If probe failed or it's ProDOS order, fall through to Raw
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // 7. Fallback — raw image
     Ok(ImageFormat::Raw)
 }
 
 /// A boxed reader that implements both `Read` and `Seek`.
 pub type BoxReadSeek = Box<dyn ReadSeek>;
 
-/// Trait alias for `Read + Seek`.
-pub trait ReadSeek: Read + Seek {}
-impl<T: Read + Seek> ReadSeek for T {}
+/// Trait alias for `Read + Seek + Send`.
+pub trait ReadSeek: Read + Seek + Send {}
+impl<T: Read + Seek + Send> ReadSeek for T {}
 
 /// Wraps a file according to its detected image format, returning a reader
 /// positioned at the start of the disk data and the data length.
@@ -950,6 +1046,34 @@ pub fn wrap_image_reader(file: File, format: ImageFormat) -> Result<(BoxReadSeek
         }
         ImageFormat::Dmg(reader) => {
             let size = reader.total_size();
+            Ok((Box::new(reader), size))
+        }
+        ImageFormat::DosOrder => {
+            let mut raw = Vec::new();
+            let mut reader = BufReader::new(file);
+            reader.seek(SeekFrom::Start(0))?;
+            reader.read_to_end(&mut raw)?;
+            let dos_reader = interleave::DosOrderReader::new(raw)
+                .map_err(|e| anyhow::anyhow!("failed to read DOS-order image: {e}"))?;
+            let size = dos_reader.len();
+            Ok((Box::new(dos_reader), size))
+        }
+        ImageFormat::DiskCopy42(hdr) => {
+            let reader = BufReader::new(file);
+            Ok((
+                Box::new(SectionReader::new(
+                    reader,
+                    dc42::DC42_HEADER_SIZE,
+                    hdr.data_size,
+                )?),
+                hdr.data_size,
+            ))
+        }
+        ImageFormat::Woz(reader) => {
+            // WOZ data was already decoded during format detection.
+            // The file parameter is unused — the WozReader holds the decoded data.
+            drop(file);
+            let size = reader.len();
             Ok((Box::new(reader), size))
         }
     }
