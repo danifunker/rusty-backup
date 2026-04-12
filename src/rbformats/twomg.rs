@@ -49,9 +49,19 @@ pub fn parse_twomg_header(reader: &mut impl Read) -> Option<TwoMgHeader> {
     let data_offset = u32::from_le_bytes([buf[0x18], buf[0x19], buf[0x1A], buf[0x1B]]);
     let data_length = u32::from_le_bytes([buf[0x1C], buf[0x1D], buf[0x1E], buf[0x1F]]);
 
+    // Some 2MG files have data_length=0 but a valid prodos_blocks count.
+    // Fall back to prodos_blocks * 512 when data_length is missing.
+    let effective_length = if data_length > 0 {
+        data_length as u64
+    } else if prodos_blocks > 0 {
+        prodos_blocks as u64 * 512
+    } else {
+        0
+    };
+
     Some(TwoMgHeader {
         data_offset: data_offset as u64,
-        data_length: data_length as u64,
+        data_length: effective_length,
         image_format,
         prodos_blocks,
     })
