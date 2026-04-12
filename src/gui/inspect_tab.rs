@@ -361,7 +361,7 @@ impl InspectTab {
                                 "Disk Images",
                                 &[
                                     "vhd", "img", "raw", "bin", "iso", "dd", "hda", "hdv", "2mg",
-                                    "dmg",
+                                    "dmg", "po", "do", "dsk", "dc42", "woz",
                                 ],
                             )
                             .add_filter("All Files", &["*"])
@@ -2146,7 +2146,10 @@ impl InspectTab {
             let detect_result = if !is_device {
                 // For image files, use unified format detection
                 match device_file.try_clone() {
-                    Ok(clone) => match rusty_backup::rbformats::detect_image_format(clone) {
+                    Ok(clone) => match rusty_backup::rbformats::detect_image_format_with_path(
+                        clone,
+                        Some(&path),
+                    ) {
                         Ok(format) => {
                             let desc = format.description();
                             push_log(format!("Detected format: {}", desc));
