@@ -687,53 +687,90 @@ fn decode_35_track(
 /// Returns up to 80 tracks × 2 sides × variable sectors × 512 bytes.
 /// Single-sided (400K) = 800 sectors, double-sided (800K) = 1600 sectors.
 fn decode_35_woz(woz: &WozFile) -> Result<Vec<u8>> {
-    // Allocate for both sides; we'll truncate if single-sided.
+    // On 3.5" disks, blocks are interleaved by side within each track:
+    //   Track 0 Side 0 sectors, Track 0 Side 1 sectors,
+    //   Track 1 Side 0 sectors, Track 1 Side 1 sectors, ...
+    // This matches the ProDOS / HFS block numbering on double-sided 3.5" disks.
     let mut output = vec![0u8; TOTAL_SECTORS_35 * 2 * 512]; // 1600 sectors max
     let mut out_pos = 0usize;
+    let mut total_decoded = 0usize;
+    let mut total_expected = 0usize;
+    let mut missing_sectors = Vec::new();
 
-    // Side 0
+    let has_side1 = (0..80usize).any(|t| woz.tmap[t * 2 + 1] != 0xFF);
+
     for track_num in 0..80usize {
         let num_sectors = sectors_for_track(track_num);
-        let tmap_idx = woz.tmap[track_num * 2];
 
-        if let Some((track_data, bit_count)) = get_track_bits(woz, tmap_idx) {
+        // Side 0
+        total_expected += num_sectors;
+        let tmap_idx_s0 = woz.tmap[track_num * 2];
+        if let Some((track_data, bit_count)) = get_track_bits(woz, tmap_idx_s0) {
             let sectors = decode_35_track(track_data, bit_count, num_sectors);
-            for sector in &sectors {
+            for (sec_idx, sector) in sectors.iter().enumerate() {
                 if let Some(ref data) = sector {
                     if out_pos + 512 <= output.len() {
                         output[out_pos..out_pos + 512].copy_from_slice(data);
                     }
+                    total_decoded += 1;
+                } else {
+                    missing_sectors.push(format!("S0 T{} S{}", track_num, sec_idx));
                 }
                 out_pos += 512;
             }
         } else {
+            for s in 0..num_sectors {
+                missing_sectors.push(format!("S0 T{} S{} (no track)", track_num, s));
+            }
             out_pos += num_sectors * 512;
+        }
+
+        // Side 1 (immediately after side 0 for the same track)
+        if has_side1 {
+            total_expected += num_sectors;
+            let tmap_idx_s1 = woz.tmap[track_num * 2 + 1];
+            if tmap_idx_s1 != 0xFF {
+                if let Some((track_data, bit_count)) = get_track_bits(woz, tmap_idx_s1) {
+                    let sectors = decode_35_track(track_data, bit_count, num_sectors);
+                    for (sec_idx, sector) in sectors.iter().enumerate() {
+                        if let Some(ref data) = sector {
+                            if out_pos + 512 <= output.len() {
+                                output[out_pos..out_pos + 512].copy_from_slice(data);
+                            }
+                            total_decoded += 1;
+                        } else {
+                            missing_sectors.push(format!("S1 T{} S{}", track_num, sec_idx));
+                        }
+                        out_pos += 512;
+                    }
+                } else {
+                    for s in 0..num_sectors {
+                        missing_sectors.push(format!("S1 T{} S{} (no track)", track_num, s));
+                    }
+                    out_pos += num_sectors * 512;
+                }
+            } else {
+                out_pos += num_sectors * 512;
+            }
         }
     }
 
-    // Side 1
-    for track_num in 0..80usize {
-        let num_sectors = sectors_for_track(track_num);
-        let tmap_idx = woz.tmap[track_num * 2 + 1];
-
-        if tmap_idx == 0xFF {
-            out_pos += num_sectors * 512;
-            continue;
-        }
-
-        if let Some((track_data, bit_count)) = get_track_bits(woz, tmap_idx) {
-            let sectors = decode_35_track(track_data, bit_count, num_sectors);
-            for sector in &sectors {
-                if let Some(ref data) = sector {
-                    if out_pos + 512 <= output.len() {
-                        output[out_pos..out_pos + 512].copy_from_slice(data);
-                    }
-                }
-                out_pos += 512;
+    if !missing_sectors.is_empty() {
+        eprintln!(
+            "WOZ 3.5\": decoded {}/{} sectors, {} missing: {}",
+            total_decoded,
+            total_expected,
+            missing_sectors.len(),
+            if missing_sectors.len() <= 20 {
+                missing_sectors.join(", ")
+            } else {
+                format!(
+                    "{}... (and {} more)",
+                    missing_sectors[..20].join(", "),
+                    missing_sectors.len() - 20
+                )
             }
-        } else {
-            out_pos += num_sectors * 512;
-        }
+        );
     }
 
     // Trim to actual output size
@@ -939,5 +976,39 @@ mod integration_tests {
             crate::rbformats::interleave::has_prodos_volume_header(&data[1024..]),
             "expected ProDOS volume header at offset 1024"
         );
+
+        // Verify all files are readable (catches block ordering bugs)
+        let woz = WozReader::open(&path).unwrap();
+        let mut fs = crate::fs::open_filesystem(woz, 0, 0, None).unwrap();
+        let root_entry = fs.root().unwrap();
+        let root = fs.list_directory(&root_entry).unwrap();
+        assert!(!root.is_empty(), "root directory should not be empty");
+
+        fn collect_files(
+            fs: &mut dyn crate::fs::filesystem::Filesystem,
+            dir: &[crate::fs::entry::FileEntry],
+            all: &mut Vec<crate::fs::entry::FileEntry>,
+        ) {
+            for e in dir {
+                all.push(e.clone());
+                if e.entry_type == crate::fs::entry::EntryType::Directory {
+                    if let Ok(children) = fs.list_directory(e) {
+                        collect_files(fs, &children, all);
+                    }
+                }
+            }
+        }
+        let mut all_entries = Vec::new();
+        collect_files(&mut *fs, &root, &mut all_entries);
+
+        let mut failures = Vec::new();
+        for e in &all_entries {
+            if e.entry_type == crate::fs::entry::EntryType::File && e.size > 0 {
+                if let Err(err) = fs.read_file(e, e.size as usize) {
+                    failures.push(format!("{}: {}", e.name, err));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "Failed to read files: {:?}", failures);
     }
 }

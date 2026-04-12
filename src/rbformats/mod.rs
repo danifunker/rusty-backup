@@ -1004,9 +1004,9 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
 /// A boxed reader that implements both `Read` and `Seek`.
 pub type BoxReadSeek = Box<dyn ReadSeek>;
 
-/// Trait alias for `Read + Seek`.
-pub trait ReadSeek: Read + Seek {}
-impl<T: Read + Seek> ReadSeek for T {}
+/// Trait alias for `Read + Seek + Send`.
+pub trait ReadSeek: Read + Seek + Send {}
+impl<T: Read + Seek + Send> ReadSeek for T {}
 
 /// Wraps a file according to its detected image format, returning a reader
 /// positioned at the start of the disk data and the data length.
