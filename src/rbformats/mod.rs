@@ -7,6 +7,7 @@ pub mod raw;
 pub mod twomg;
 pub mod vhd;
 pub mod woz;
+pub mod woz_write;
 pub mod zstd;
 
 use std::fs::{self, File};
@@ -142,6 +143,31 @@ pub fn decompress_to_writer(
                 }
                 writer.write_all(&buf[..n])?;
                 total_written += n as u64;
+                progress_cb(total_written);
+            }
+        }
+        "woz" => {
+            // WOZ files contain GCR-encoded bitstreams.  We decode the whole
+            // image into memory (floppies are small) and then stream the
+            // resulting flat sector buffer to the writer, respecting `limit`.
+            let raw = fs::read(data_path)
+                .with_context(|| format!("failed to read WOZ file: {}", data_path.display()))?;
+            let mut reader = woz::WozReader::from_bytes(raw)
+                .with_context(|| format!("failed to decode WOZ: {}", data_path.display()))?;
+            let total = reader.len().min(limit);
+            let mut remaining = total;
+            while remaining > 0 {
+                if cancel_check() {
+                    bail!("export cancelled");
+                }
+                let to_read = (remaining as usize).min(CHUNK_SIZE);
+                let n = reader.read(&mut buf[..to_read])?;
+                if n == 0 {
+                    break;
+                }
+                writer.write_all(&buf[..n])?;
+                total_written += n as u64;
+                remaining -= n as u64;
                 progress_cb(total_written);
             }
         }
@@ -713,6 +739,25 @@ pub fn compress_file_to_archive(
             progress_cb,
             cancel_check,
         ),
+        "woz" => {
+            // Read the whole raw sector buffer (floppies are small), encode
+            // as WOZ2, write it back to the original archive path.  The base
+            // path already points to the `.woz` file (no splitting).
+            let mut sectors = Vec::new();
+            reader
+                .read_to_end(&mut sectors)
+                .context("failed to read raw sectors for WOZ re-encode")?;
+            if cancel_check() {
+                bail!("export cancelled");
+            }
+            progress_cb(sectors.len() as u64);
+            let woz_bytes =
+                woz_write::sectors_to_woz(&sectors).context("failed to encode WOZ image")?;
+            let out_path = output_path_base.with_extension("woz");
+            fs::write(&out_path, &woz_bytes)
+                .with_context(|| format!("failed to write {}", out_path.display()))?;
+            Ok(vec![file_name(&out_path)])
+        }
         other => bail!("unsupported compression type for recompression: {}", other),
     }
 }
@@ -1273,6 +1318,58 @@ mod tests {
         let written = fs::read(tmp.path().join("partition-0.raw")).unwrap();
         assert_eq!(written.len(), CHUNK_SIZE * 4);
         assert!(written.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_woz_decompress_and_recompress_round_trip() {
+        // End-to-end test of the "woz" compression type: build a WOZ file
+        // from pattern sectors, decompress through mod.rs into a temp file,
+        // then re-compress back to WOZ, and verify the final decoded data
+        // matches the original input bytes.
+        let tmp = TempDir::new().unwrap();
+        let woz_path = tmp.path().join("disk.woz");
+
+        // Build a WOZ2 file from a distinct-pattern 140K floppy image.
+        let mut input = vec![0u8; woz_write::RAW_SIZE_525];
+        for (i, b) in input.iter_mut().enumerate() {
+            *b = ((i * 13) ^ (i >> 5)) as u8;
+        }
+        woz_write::write_woz(&woz_path, &input).unwrap();
+
+        // Decompress WOZ → raw file (no compaction).
+        let raw_path = tmp.path().join("sectors.bin");
+        decompress_partition_to_file(
+            &woz_path,
+            "woz",
+            &raw_path,
+            woz_write::RAW_SIZE_525 as u64,
+            false,
+            &mut |_| {},
+            &|| false,
+        )
+        .unwrap();
+        let round_in = fs::read(&raw_path).unwrap();
+        assert_eq!(round_in, input, "WOZ → raw round-trip failed");
+
+        // Re-compress raw file → WOZ, replacing the original.
+        let out_base = tmp.path().join("disk");
+        let files = compress_file_to_archive(
+            &raw_path,
+            &out_base,
+            "woz",
+            &mut |_| {},
+            &|| false,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(files, vec!["disk.woz"]);
+
+        // Decode the re-encoded WOZ and verify the byte-for-byte match.
+        let reader = woz::WozReader::open(&out_base.with_extension("woz")).unwrap();
+        let mut decoded = Vec::new();
+        let mut reader = reader;
+        Read::read_to_end(&mut reader, &mut decoded).unwrap();
+        assert_eq!(decoded, input, "WOZ re-encode round-trip failed");
     }
 
     #[test]

@@ -11,6 +11,7 @@ use anyhow::{bail, Context, Result};
 
 use super::twomg::build_twomg_header;
 use super::vhd::build_vhd_footer;
+use super::woz_write;
 use super::{decompress_to_writer, reconstruct_disk_from_backup, write_zeros, CHUNK_SIZE};
 use crate::backup::metadata::BackupMetadata;
 use crate::partition::PartitionSizeOverride;
@@ -24,6 +25,8 @@ pub enum ExportFormat {
     Raw,
     /// 2MG (Apple II) — 64-byte header + raw data.
     TwoMg,
+    /// WOZ 2.0 (Apple II GCR bitstream) — floppy-only: 140K, 400K, or 800K sources.
+    Woz,
 }
 
 impl ExportFormat {
@@ -33,6 +36,7 @@ impl ExportFormat {
             Self::Vhd => "vhd",
             Self::Raw => "img",
             Self::TwoMg => "2mg",
+            Self::Woz => "woz",
         }
     }
 
@@ -42,6 +46,7 @@ impl ExportFormat {
             Self::Vhd => "Fixed VHD",
             Self::Raw => "Raw Image",
             Self::TwoMg => "2MG (Apple II)",
+            Self::Woz => "WOZ (Apple II)",
         }
     }
 
@@ -56,7 +61,14 @@ impl ExportFormat {
             Self::Vhd => ("VHD Files", &["vhd", "hda"]),
             Self::Raw => ("Raw Images", &["img", "raw", "bin", "dd"]),
             Self::TwoMg => ("2MG Files", &["2mg"]),
+            Self::Woz => ("WOZ Files", &["woz"]),
         }
+    }
+
+    /// True if this format can only wrap an Apple II floppy image
+    /// (140K, 400K, or 800K of raw sector data).
+    pub fn is_floppy_only(&self) -> bool {
+        matches!(self, Self::Woz)
     }
 
     /// Write the format header (if any) to `writer`. Returns bytes written.
@@ -109,6 +121,51 @@ impl ExportFormat {
     }
 }
 
+/// Encode raw sector bytes as a WOZ 2.0 file and write to `dest_path`.
+///
+/// `sectors.len()` must be 143,360 (140K 5.25"), 409,600 (400K 3.5"), or
+/// 819,200 (800K 3.5") — `sectors_to_woz` auto-detects and rejects others.
+fn write_woz_from_sectors(
+    sectors: &[u8],
+    dest_path: &Path,
+    log_cb: &mut impl FnMut(&str),
+) -> Result<()> {
+    let bytes = woz_write::sectors_to_woz(sectors)
+        .context("WOZ export failed: source is not a recognised floppy size")?;
+    std::fs::write(dest_path, &bytes)
+        .with_context(|| format!("failed to write {}", dest_path.display()))?;
+    log_cb(&format!(
+        "WOZ export complete: {} ({} input bytes → {} WOZ bytes)",
+        dest_path.display(),
+        sectors.len(),
+        bytes.len(),
+    ));
+    Ok(())
+}
+
+/// Slurp a source path (via decompress_to_writer) into an in-memory buffer.
+/// Intended for floppy-sized content only — bounded by `max_bytes`.
+fn read_source_to_memory(
+    source_path: &Path,
+    compression_type: &str,
+    max_bytes: Option<u64>,
+    progress_cb: &mut impl FnMut(u64),
+    cancel_check: &impl Fn() -> bool,
+    log_cb: &mut impl FnMut(&str),
+) -> Result<Vec<u8>> {
+    let mut buf: Vec<u8> = Vec::new();
+    decompress_to_writer(
+        source_path,
+        compression_type,
+        &mut buf,
+        max_bytes,
+        progress_cb,
+        cancel_check,
+        log_cb,
+    )?;
+    Ok(buf)
+}
+
 /// Export a whole disk image in the specified format.
 ///
 /// For backup folders: reconstructs the disk from MBR + partition data files.
@@ -137,6 +194,59 @@ pub fn export_whole_disk(
             cancel_check,
             log_cb,
         );
+    }
+
+    // WOZ: floppy-only.  Reconstruct (or slurp) the source into memory, then
+    // encode as WOZ2.  Raw-image path covers superfloppies (2MG, .dsk, etc.);
+    // backup-folder path reconstructs the whole disk first via the common
+    // reconstruction helper (superfloppy layout preserves the sector stream).
+    if format == ExportFormat::Woz {
+        if let Some(meta) = backup_metadata {
+            let mut buf: Vec<u8> = Vec::new();
+            reconstruct_disk_from_backup(
+                source_path,
+                meta,
+                mbr_bytes,
+                partition_sizes,
+                meta.source_size_bytes,
+                &mut std::io::Cursor::new(&mut buf),
+                false,
+                false,
+                None,
+                None,
+                &mut progress_cb,
+                &cancel_check,
+                &mut log_cb,
+            )?;
+            return write_woz_from_sectors(&buf, dest_path, &mut log_cb);
+        } else {
+            let file_size = std::fs::metadata(source_path)
+                .with_context(|| format!("failed to stat {}", source_path.display()))?
+                .len();
+            // Strip a VHD footer if present so the 512-byte trailer doesn't
+            // inflate the source size past the recognised floppy sizes.
+            let data_size = {
+                let mut f = File::open(source_path)?;
+                if file_size >= 512 {
+                    f.seek(SeekFrom::End(-512))?;
+                    let mut cookie = [0u8; 8];
+                    f.read_exact(&mut cookie)?;
+                    if &cookie == super::vhd::VHD_COOKIE {
+                        file_size - 512
+                    } else {
+                        file_size
+                    }
+                } else {
+                    file_size
+                }
+            };
+            let mut f = File::open(source_path)
+                .with_context(|| format!("failed to open {}", source_path.display()))?;
+            let mut buf = vec![0u8; data_size as usize];
+            f.read_exact(&mut buf).context("failed to read source")?;
+            progress_cb(data_size);
+            return write_woz_from_sectors(&buf, dest_path, &mut log_cb);
+        }
     }
 
     // Raw and 2MG formats: reconstruct disk, then wrap with header/footer.
@@ -287,6 +397,20 @@ pub fn export_partition(
         );
     }
 
+    // WOZ: slurp into memory, encode as WOZ2, write.  Requires the decompressed
+    // partition size to be a recognised Apple II floppy size.
+    if format == ExportFormat::Woz {
+        let buf = read_source_to_memory(
+            source_path,
+            compression_type,
+            max_bytes,
+            &mut progress_cb,
+            &cancel_check,
+            &mut log_cb,
+        )?;
+        return write_woz_from_sectors(&buf, dest_path, &mut log_cb);
+    }
+
     let mut writer = BufWriter::new(
         File::create(dest_path)
             .with_context(|| format!("failed to create {}", dest_path.display()))?,
@@ -359,7 +483,7 @@ pub fn export_clonezilla_disk(
         );
     }
 
-    // For Raw/2MG: wrap the VHD export logic but skip footer / add header.
+    // For Raw/2MG/WOZ: wrap the VHD export logic but skip footer / add header.
     // Since the Clonezilla disk export is complex (EBR, gap filling, etc.),
     // we call the VHD version to a temp file and then strip/convert.
     // However, that's wasteful. Instead, replicate the core logic.
@@ -380,7 +504,7 @@ pub fn export_clonezilla_disk(
         &mut log_cb,
     )?;
 
-    // Convert: strip VHD footer, optionally add 2MG header
+    // Convert: strip VHD footer, optionally add 2MG header or encode as WOZ.
     convert_from_vhd_temp(&temp_vhd, output_path, format, &mut log_cb)?;
 
     // Clean up temp
@@ -440,6 +564,15 @@ fn convert_from_vhd_temp(
         .len();
     let data_size = vhd_size.saturating_sub(512); // strip VHD footer
 
+    // WOZ path: read the stripped data into memory, encode, write.
+    if format == ExportFormat::Woz {
+        let mut f = File::open(vhd_path)
+            .with_context(|| format!("failed to open {}", vhd_path.display()))?;
+        let mut buf = vec![0u8; data_size as usize];
+        f.read_exact(&mut buf).context("failed to read VHD temp")?;
+        return write_woz_from_sectors(&buf, dest_path, log_cb);
+    }
+
     let mut reader = std::io::BufReader::new(
         File::open(vhd_path).with_context(|| format!("failed to open {}", vhd_path.display()))?,
     );
@@ -485,6 +618,15 @@ mod tests {
         assert_eq!(ExportFormat::Vhd.extension(), "vhd");
         assert_eq!(ExportFormat::Raw.extension(), "img");
         assert_eq!(ExportFormat::TwoMg.extension(), "2mg");
+        assert_eq!(ExportFormat::Woz.extension(), "woz");
+    }
+
+    #[test]
+    fn test_export_format_is_floppy_only() {
+        assert!(!ExportFormat::Vhd.is_floppy_only());
+        assert!(!ExportFormat::Raw.is_floppy_only());
+        assert!(!ExportFormat::TwoMg.is_floppy_only());
+        assert!(ExportFormat::Woz.is_floppy_only());
     }
 
     #[test]

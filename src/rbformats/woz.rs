@@ -391,8 +391,11 @@ fn decode_data_field(stream: &mut BitStream) -> Option<[u8; 256]> {
         let hi6 = primary[i]; // high 6 bits
                               // Auxiliary byte index: each aux byte holds 2 bits for 3 data bytes
         let aux_idx = i % 86;
-        let aux_shift = (i / 86) * 2; // 0, 2, or 4 (but only 0 and 2 are used for 256 bytes)
-        let lo2 = (aux[aux_idx] >> aux_shift) & 0x03;
+        let aux_shift = (i / 86) * 2; // 0, 2, or 4
+                                      // Standard 6-and-2: encoder writes the low 2 bits in swapped order
+                                      // (bit 0 ↔ bit 1), so decode must swap back.
+        let raw = (aux[aux_idx] >> aux_shift) & 0x03;
+        let lo2 = ((raw & 0x01) << 1) | ((raw & 0x02) >> 1);
         result[i] = (hi6 << 2) | lo2;
     }
 
@@ -401,7 +404,7 @@ fn decode_data_field(stream: &mut BitStream) -> Option<[u8; 256]> {
 
 /// Decode all sectors from a 5.25" track bitstream.
 /// Returns an array of 16 sectors, each 256 bytes. Missing sectors are zeroed.
-fn decode_525_track(track_data: &[u8], bit_count: u32) -> [Option<[u8; 256]>; 16] {
+pub(crate) fn decode_525_track(track_data: &[u8], bit_count: u32) -> [Option<[u8; 256]>; 16] {
     let mut sectors: [Option<[u8; 256]>; 16] = [None; 16];
     let mut stream = BitStream::new(track_data, bit_count);
     let mut found = 0u8;
@@ -642,7 +645,7 @@ fn decode_data_field_35(stream: &mut BitStream) -> Option<[u8; 512]> {
 }
 
 /// Decode all sectors from a 3.5" track bitstream.
-fn decode_35_track(
+pub(crate) fn decode_35_track(
     track_data: &[u8],
     bit_count: u32,
     expected_sectors: usize,

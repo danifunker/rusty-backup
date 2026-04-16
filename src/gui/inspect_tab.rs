@@ -1271,6 +1271,10 @@ impl InspectTab {
                     ui.radio_value(&mut self.export_format, ExportFormat::Vhd, "VHD");
                     ui.radio_value(&mut self.export_format, ExportFormat::Raw, "Raw (.img)");
                     ui.radio_value(&mut self.export_format, ExportFormat::TwoMg, "2MG (.2mg)");
+                    ui.radio_value(&mut self.export_format, ExportFormat::Woz, "WOZ (.woz)")
+                        .on_hover_text(
+                            "Apple II WOZ 2.0 (floppy only: 140K / 400K / 800K sources)",
+                        );
                 });
 
                 ui.add_space(8.0);
