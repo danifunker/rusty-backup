@@ -220,30 +220,20 @@ pub fn export_whole_disk(
             )?;
             return write_woz_from_sectors(&buf, dest_path, &mut log_cb);
         } else {
-            let file_size = std::fs::metadata(source_path)
-                .with_context(|| format!("failed to stat {}", source_path.display()))?
-                .len();
-            // Strip a VHD footer if present so the 512-byte trailer doesn't
-            // inflate the source size past the recognised floppy sizes.
-            let data_size = {
-                let mut f = File::open(source_path)?;
-                if file_size >= 512 {
-                    f.seek(SeekFrom::End(-512))?;
-                    let mut cookie = [0u8; 8];
-                    f.read_exact(&mut cookie)?;
-                    if &cookie == super::vhd::VHD_COOKIE {
-                        file_size - 512
-                    } else {
-                        file_size
-                    }
-                } else {
-                    file_size
-                }
-            };
-            let mut f = File::open(source_path)
+            // Unwrap any container (WOZ, 2MG, DMG, VHD, DiskCopy 4.2, DOS-order
+            // .do/.dsk) so we feed `sectors_to_woz` flat sector data, not the
+            // raw container bytes.
+            let file = File::open(source_path)
                 .with_context(|| format!("failed to open {}", source_path.display()))?;
+            let (mut reader, data_size) = {
+                let file2 = File::open(source_path)?;
+                let fmt = super::detect_image_format_with_path(file, Some(source_path))?;
+                super::wrap_image_reader(file2, fmt)?
+            };
             let mut buf = vec![0u8; data_size as usize];
-            f.read_exact(&mut buf).context("failed to read source")?;
+            reader
+                .read_exact(&mut buf)
+                .context("failed to read source")?;
             progress_cb(data_size);
             return write_woz_from_sectors(&buf, dest_path, &mut log_cb);
         }
