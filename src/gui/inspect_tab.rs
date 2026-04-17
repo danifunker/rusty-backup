@@ -489,7 +489,7 @@ impl InspectTab {
                 self.init_resize_popup(devices);
             }
 
-            // Close button — releases the device (remounts it) and clears results
+            // Close button — releases the device/image and clears results
             if self.selected_device_idx.is_some() && !inspect_running && !export_running {
                 if ui.button("Close Device").clicked() {
                     self.browse_view.close();
@@ -497,6 +497,24 @@ impl InspectTab {
                     self.selected_device_idx = None;
                     self.prev_device_idx = None;
                     log.info("Device closed and remounted.");
+                }
+            }
+            if self.image_file_path.is_some() && !inspect_running && !export_running {
+                if ui.button("Close Image").clicked() {
+                    self.browse_view.close();
+                    self.clear_results();
+                    self.image_file_path = None;
+                    self.prev_image_path = None;
+                    log.info("Image file closed.");
+                }
+            }
+            if self.backup_folder_path.is_some() && !inspect_running && !export_running {
+                if ui.button("Close Backup").clicked() {
+                    self.browse_view.close();
+                    self.clear_results();
+                    self.backup_folder_path = None;
+                    self.prev_backup_path = None;
+                    log.info("Backup folder closed.");
                 }
             }
 
@@ -3189,6 +3207,28 @@ impl InspectTab {
                     None,
                 );
                 // Set archive edit context for decompress→edit→recompress flow
+                self.browse_view.set_archive_edit_context(
+                    data_path,
+                    compression_type_str,
+                    part_meta.original_size_bytes,
+                    part_meta.compacted,
+                    metadata_path,
+                    part_index,
+                    checksum_type,
+                );
+            }
+            "woz" => {
+                log.info(format!(
+                    "Browsing partition {} from WOZ: {}",
+                    part_index, data_file,
+                ));
+                self.browse_view.open(
+                    data_path.clone(),
+                    0,
+                    ptype,
+                    partition_type_string.clone(),
+                    None,
+                );
                 self.browse_view.set_archive_edit_context(
                     data_path,
                     compression_type_str,

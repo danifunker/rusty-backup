@@ -351,6 +351,39 @@ impl BrowseView {
         // Editing is supported for regular files (not Clonezilla/streaming)
         self.edit_supported = true;
 
+        // Container formats (WOZ, CHD) can't be edited in-place — route
+        // through the decompress→edit→recompress flow automatically.
+        let ext = source_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ext == "woz" || ext == "chd" {
+            let original_size = match ext.as_str() {
+                "woz" => rusty_backup::rbformats::woz::WozReader::open(&source_path)
+                    .map(|r| r.len())
+                    .unwrap_or(0),
+                "chd" => std::fs::metadata(&source_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0),
+                _ => 0,
+            };
+            log::info!(
+                "Container edit context set for {} ({} decoded bytes)",
+                source_path.display(),
+                original_size
+            );
+            self.archive_edit_ctx = Some(ArchiveEditContext {
+                archive_path: source_path.clone(),
+                compression_type: ext.clone(),
+                original_size,
+                compacted: false,
+                metadata_path: PathBuf::new(),
+                partition_index: 0,
+                checksum_type: String::new(),
+            });
+        }
+
         match self.open_fs() {
             Ok(mut fs) => {
                 self.fs_type = fs.fs_type().to_string();
@@ -619,9 +652,15 @@ impl BrowseView {
                 };
                 let btn = ui.add_enabled(!busy, edit_btn);
                 if btn.clicked() {
+                    log::info!(
+                        "Edit Mode clicked: archive_edit_ctx={}, edit_mode={}",
+                        self.archive_edit_ctx.is_some(),
+                        self.edit_mode
+                    );
                     if self.archive_edit_ctx.is_some() {
                         // Archive editing: toggle triggers decompress/recompress
                         if !self.edit_mode {
+                            log::info!("Starting archive extract for editing");
                             self.start_archive_extract();
                         } else if !self.staged_edits.is_empty() {
                             self.show_unsaved_dialog = true;
@@ -1407,7 +1446,7 @@ impl BrowseView {
         // Create temp file next to the archive
         let parent = archive_path.parent().unwrap_or(std::path::Path::new("."));
         let temp_path = parent.join(format!(
-            ".edit-{}.tmp",
+            "{}-edit.img",
             archive_path
                 .file_stem()
                 .unwrap_or_default()
@@ -1511,6 +1550,12 @@ impl BrowseView {
 
             // Remove old archive, compress temp → new archive
             let archive_base = archive_path.with_extension("");
+            log::info!(
+                "Compressing {} → {} (type={})",
+                temp_path.display(),
+                archive_base.display(),
+                compression_type
+            );
             let result = rusty_backup::rbformats::compress_file_to_archive(
                 &temp_path,
                 &archive_base,
@@ -1521,13 +1566,14 @@ impl BrowseView {
                     }
                 },
                 &cancel,
-                &mut |_| {},
+                &mut |msg| log::info!("{}", msg),
             );
 
             if let Ok(mut p) = progress_thread.lock() {
                 p.finished = true;
                 match result {
                     Ok(new_files) => {
+                        log::info!("Compress succeeded: {:?}", new_files);
                         // Remove old archive file (in case extension changed)
                         if archive_path.exists() {
                             // The new file may have the same path; only remove if different
@@ -1540,19 +1586,22 @@ impl BrowseView {
                             }
                         }
 
-                        // Update metadata checksum
-                        if let Ok(checksum) = checksum_result {
-                            if let Err(e) =
-                                rusty_backup::backup::metadata::update_partition_checksum(
-                                    &metadata_path,
-                                    partition_index,
-                                    &checksum,
-                                    Some(&new_files),
-                                )
-                            {
-                                p.error = Some(format!(
-                                    "Saved archive but failed to update metadata: {e}"
-                                ));
+                        // Update metadata checksum (skip for standalone
+                        // container files where metadata_path is empty)
+                        if !metadata_path.as_os_str().is_empty() {
+                            if let Ok(checksum) = checksum_result {
+                                if let Err(e) =
+                                    rusty_backup::backup::metadata::update_partition_checksum(
+                                        &metadata_path,
+                                        partition_index,
+                                        &checksum,
+                                        Some(&new_files),
+                                    )
+                                {
+                                    p.error = Some(format!(
+                                        "Saved archive but failed to update metadata: {e}"
+                                    ));
+                                }
                             }
                         }
 
@@ -1835,6 +1884,9 @@ impl BrowseView {
                 let label = format!("Apply Edits ({})", self.staged_edits.len());
                 if ui.button(label).clicked() {
                     self.apply_staged_edits();
+                    if self.archive_edit_ctx.is_some() && !self.has_edit_error() {
+                        self.start_archive_compress();
+                    }
                 }
             }
 
@@ -2088,9 +2140,18 @@ impl BrowseView {
 
     /// Apply all staged edits to the filesystem in a single batch.
     fn apply_staged_edits(&mut self) {
+        log::info!(
+            "Applying {} staged edit(s) to {}",
+            self.staged_edits.len(),
+            self.source_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        );
         let mut efs = match self.open_editable_fs() {
             Ok(fs) => fs,
             Err(e) => {
+                log::error!("Failed to open editable filesystem: {e}");
                 self.edit_result = Some(format!("Error opening filesystem: {e}"));
                 return;
             }
@@ -2165,6 +2226,13 @@ impl BrowseView {
         if let Ok(mut fs) = self.open_fs() {
             self.blessed_folder = fs.blessed_system_folder();
         }
+    }
+
+    fn has_edit_error(&self) -> bool {
+        self.edit_result
+            .as_ref()
+            .map(|r| r.starts_with("Error"))
+            .unwrap_or(false)
     }
 
     /// Invalidate all cached directory listings and reload root.

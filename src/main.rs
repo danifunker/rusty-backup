@@ -4,6 +4,9 @@
 mod gui;
 
 fn main() -> eframe::Result {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_millis()
+        .init();
     // Linux: Request elevation at startup if not already running as root
     #[cfg(target_os = "linux")]
     {
