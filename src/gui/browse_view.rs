@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use rusty_backup::clonezilla::block_cache::{PartcloneBlockCache, PartcloneBlockReader};
 use rusty_backup::fs;
 use rusty_backup::fs::entry::{EntryType, FileEntry};
+use rusty_backup::fs::filesystem::ResourceForkSource;
 use rusty_backup::fs::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
 };
@@ -29,6 +30,8 @@ enum StagedEdit {
         /// filename extension at apply time".
         prodos_type: Option<u8>,
         prodos_aux: Option<u16>,
+        /// Resource fork data detected from the host (HFS/HFS+ only).
+        resource_fork: Option<resource_fork::ImportedResourceFork>,
     },
     CreateDirectory {
         parent: FileEntry,
@@ -1974,13 +1977,18 @@ impl BrowseView {
     }
 
     /// Try to stage a single host file, pushing any error into `errors`.
-    /// Returns 1 on success, 0 on failure.
+    /// Returns 1 on success, 0 on failure/skip.
     fn stage_host_file(
         &mut self,
         host_path: &std::path::Path,
         parent: &FileEntry,
         errors: &mut Vec<(PathBuf, String)>,
     ) -> usize {
+        // Silently skip resource fork sidecars — they'll be consumed
+        // with their primary file.
+        if resource_fork::is_resource_fork_sidecar(host_path) {
+            return 0;
+        }
         match self.add_host_file(host_path, parent) {
             Ok(()) => 1,
             Err(e) => {
@@ -2093,6 +2101,32 @@ impl BrowseView {
             (raw_name, None, None)
         };
 
+        // Detect resource fork from host (native, AppleDouble, MacBinary, .rsrc)
+        let rsrc_import = if self.is_hfs_type() {
+            resource_fork::detect_resource_fork(host_path)
+        } else {
+            None
+        };
+
+        // For MacBinary imports the "file" is a container — use the data fork
+        // size from inside the container, not the container's file size.
+        let (effective_path, size) = if let Some(ref imp) = rsrc_import {
+            if let Some(ref data_fork) = imp.data_fork {
+                // MacBinary: we'll write the extracted data fork, not the .bin file
+                (host_path.to_path_buf(), data_fork.len() as u64)
+            } else {
+                let sz = std::fs::metadata(host_path)
+                    .map_err(|e| e.to_string())?
+                    .len();
+                (host_path.to_path_buf(), sz)
+            }
+        } else {
+            let sz = std::fs::metadata(host_path)
+                .map_err(|e| e.to_string())?
+                .len();
+            (host_path.to_path_buf(), sz)
+        };
+
         // Validate the name against the target filesystem's rules before
         // staging so that clearly-bad names are rejected up-front.
         self.validate_staged_name(&name)
@@ -2104,17 +2138,14 @@ impl BrowseView {
             return Err(format!("'{name}' is already staged in this directory"));
         }
 
-        let size = std::fs::metadata(host_path)
-            .map_err(|e| e.to_string())?
-            .len();
-
         self.staged_edits.push(StagedEdit::AddFile {
             parent: parent.clone(),
             name,
-            host_path: host_path.to_path_buf(),
+            host_path: effective_path,
             size,
             prodos_type,
             prodos_aux,
+            resource_fork: rsrc_import,
         });
         Ok(())
     }
@@ -2169,23 +2200,78 @@ impl BrowseView {
                     size,
                     prodos_type,
                     prodos_aux,
-                } => match File::open(host_path) {
-                    Ok(mut file) => {
-                        let opts = CreateFileOptions {
-                            type_code: prodos_type.map(|t| format!("${:02X}", t)),
-                            aux_type: *prodos_aux,
-                            ..Default::default()
-                        };
-                        // Re-resolve parent by path so nested edits under a
-                        // pending-add directory pick up the real CNID assigned
-                        // when that directory was created earlier in this batch.
-                        resolve_dir_by_path(&mut *efs, &parent.path).and_then(|resolved_parent| {
-                            efs.create_file(&resolved_parent, name, &mut file, *size, &opts)
-                                .map(|_| ())
-                        })
+                    resource_fork: rsrc_import,
+                } => {
+                    // Build CreateFileOptions with resource fork and type/creator
+                    // from the detected import, if any.
+                    let mut opts = CreateFileOptions {
+                        type_code: prodos_type.map(|t| format!("${:02X}", t)),
+                        aux_type: *prodos_aux,
+                        ..Default::default()
+                    };
+
+                    if let Some(ref imp) = rsrc_import {
+                        opts.resource_fork = Some(ResourceForkSource::Data(imp.data.clone()));
+                        // Type/creator from container overrides auto-detect,
+                        // but not explicit ProDOS overrides.
+                        if opts.type_code.is_none() {
+                            if let Some(tc) = imp.type_code {
+                                opts.type_code = Some(String::from_utf8_lossy(&tc).to_string());
+                            }
+                        }
+                        if opts.creator_code.is_none() {
+                            if let Some(cc) = imp.creator_code {
+                                opts.creator_code = Some(String::from_utf8_lossy(&cc).to_string());
+                            }
+                        }
                     }
-                    Err(e) => Err(FilesystemError::Io(e)),
-                },
+
+                    // For MacBinary imports, use the extracted data fork
+                    // instead of the raw .bin file.
+                    if let Some(ref imp) = rsrc_import {
+                        if let Some(ref data_fork) = imp.data_fork {
+                            let mut cursor = std::io::Cursor::new(data_fork);
+                            let df_size = data_fork.len() as u64;
+                            resolve_dir_by_path(&mut *efs, &parent.path).and_then(
+                                |resolved_parent| {
+                                    efs.create_file(
+                                        &resolved_parent,
+                                        name,
+                                        &mut cursor,
+                                        df_size,
+                                        &opts,
+                                    )
+                                    .map(|_| ())
+                                },
+                            )
+                        } else {
+                            match File::open(host_path) {
+                                Ok(mut file) => resolve_dir_by_path(&mut *efs, &parent.path)
+                                    .and_then(|resolved_parent| {
+                                        efs.create_file(
+                                            &resolved_parent,
+                                            name,
+                                            &mut file,
+                                            *size,
+                                            &opts,
+                                        )
+                                        .map(|_| ())
+                                    }),
+                                Err(e) => Err(FilesystemError::Io(e)),
+                            }
+                        }
+                    } else {
+                        match File::open(host_path) {
+                            Ok(mut file) => resolve_dir_by_path(&mut *efs, &parent.path).and_then(
+                                |resolved_parent| {
+                                    efs.create_file(&resolved_parent, name, &mut file, *size, &opts)
+                                        .map(|_| ())
+                                },
+                            ),
+                            Err(e) => Err(FilesystemError::Io(e)),
+                        }
+                    }
+                }
                 StagedEdit::CreateDirectory { parent, name } => {
                     resolve_dir_by_path(&mut *efs, &parent.path).and_then(|resolved_parent| {
                         efs.create_directory(
@@ -3447,6 +3533,12 @@ fn extract_entry(
                     fs.write_resource_fork_to(entry, &mut rsrc_buf)?;
 
                     match resource_fork_mode {
+                        ResourceForkMode::Native => {
+                            let rsrc_path = out_path.join("..namedfork/rsrc");
+                            let mut rf = BufWriter::new(File::create(&rsrc_path)?);
+                            rf.write_all(&rsrc_buf)?;
+                            rf.flush()?;
+                        }
                         ResourceForkMode::AppleDouble => {
                             let ad = resource_fork::build_appledouble(
                                 &type_code,

@@ -806,6 +806,12 @@ fn extract_entry(
                     let rsrc_data = fs.read_resource_fork(entry)?.unwrap_or_default();
 
                     match resource_fork_mode {
+                        ResourceForkMode::Native => {
+                            let rsrc_path = out_path.join("..namedfork/rsrc");
+                            let mut rf = BufWriter::new(std::fs::File::create(&rsrc_path)?);
+                            rf.write_all(&rsrc_data)?;
+                            rf.flush()?;
+                        }
                         ResourceForkMode::AppleDouble => {
                             let ad = resource_fork::build_appledouble(
                                 &type_code,
