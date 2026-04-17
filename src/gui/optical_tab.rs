@@ -216,14 +216,19 @@ impl OpticalTab {
             }
         });
 
-        // Browse Contents button
-        if self.disc_info.is_some() && !self.browse_view.is_active() {
+        // Browse Contents / Close buttons
+        if self.disc_info.is_some() {
             ui.horizontal(|ui| {
                 ui.add_space(60.0);
-                if ui.button("Browse Contents").clicked() {
-                    if let Some(path) = self.get_browsable_path() {
-                        self.browse_view.open(&path);
+                if !self.browse_view.is_active() {
+                    if ui.button("Browse Contents").clicked() {
+                        if let Some(path) = self.get_browsable_path() {
+                            self.browse_view.open(&path);
+                        }
                     }
+                }
+                if ui.button("Close Disc").clicked() {
+                    self.close_disc();
                 }
             });
         }
@@ -395,6 +400,16 @@ impl OpticalTab {
                 .and_then(|idx| self.drives.get(idx))
                 .map(|d| d.device_path.clone()),
         }
+    }
+
+    fn close_disc(&mut self) {
+        self.browse_view.close();
+        self.disc_info = None;
+        self.disc_info_error = None;
+        self.image_file_path = None;
+        self.selected_drive_idx = None;
+        self.prev_drive_idx = None;
+        self.prev_image_path = None;
     }
 
     fn detect_disc_info(&mut self, log: &mut LogPanel) {
