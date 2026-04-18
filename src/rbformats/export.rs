@@ -9,6 +9,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
+use super::dc42;
 use super::twomg::build_twomg_header;
 use super::vhd::build_vhd_footer;
 use super::woz_write;
@@ -27,6 +28,8 @@ pub enum ExportFormat {
     TwoMg,
     /// WOZ 2.0 (Apple II GCR bitstream) — floppy-only: 140K, 400K, or 800K sources.
     Woz,
+    /// DiskCopy 4.2 (Mac / Apple IIgs) — floppy-only: 400K / 720K / 800K / 1440K sources.
+    Dc42,
 }
 
 impl ExportFormat {
@@ -37,6 +40,7 @@ impl ExportFormat {
             Self::Raw => "img",
             Self::TwoMg => "2mg",
             Self::Woz => "woz",
+            Self::Dc42 => "dsk",
         }
     }
 
@@ -47,6 +51,7 @@ impl ExportFormat {
             Self::Raw => "Raw Image",
             Self::TwoMg => "2MG (Apple II)",
             Self::Woz => "WOZ (Apple II)",
+            Self::Dc42 => "DiskCopy 4.2",
         }
     }
 
@@ -62,13 +67,14 @@ impl ExportFormat {
             Self::Raw => ("Raw Images", &["img", "raw", "bin", "dd"]),
             Self::TwoMg => ("2MG Files", &["2mg"]),
             Self::Woz => ("WOZ Files", &["woz"]),
+            Self::Dc42 => ("DiskCopy 4.2", &["dsk", "image", "dc42", "img"]),
         }
     }
 
-    /// True if this format can only wrap an Apple II floppy image
-    /// (140K, 400K, or 800K of raw sector data).
+    /// True if this format can only wrap a floppy-sized image.
+    /// WOZ: 140K / 400K / 800K. DiskCopy 4.2: 400K / 720K / 800K / 1440K.
     pub fn is_floppy_only(&self) -> bool {
-        matches!(self, Self::Woz)
+        matches!(self, Self::Woz | Self::Dc42)
     }
 
     /// Write the format header (if any) to `writer`. Returns bytes written.
@@ -119,6 +125,31 @@ impl ExportFormat {
             _ => Ok(()),
         }
     }
+}
+
+/// Encode raw sector bytes as a DiskCopy 4.2 file and write to `dest_path`.
+///
+/// `sectors.len()` must be 400K / 720K / 800K / 1440K — the encoder rejects anything else.
+fn write_dc42_from_sectors(
+    sectors: &[u8],
+    dest_path: &Path,
+    log_cb: &mut impl FnMut(&str),
+) -> Result<()> {
+    let name = dest_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Untitled");
+    let bytes = dc42::encode_dc42(name, sectors)
+        .map_err(|e| anyhow::anyhow!("DiskCopy 4.2 export failed: {e}"))?;
+    std::fs::write(dest_path, &bytes)
+        .with_context(|| format!("failed to write {}", dest_path.display()))?;
+    log_cb(&format!(
+        "DiskCopy 4.2 export complete: {} ({} input bytes → {} DC42 bytes)",
+        dest_path.display(),
+        sectors.len(),
+        bytes.len(),
+    ));
+    Ok(())
 }
 
 /// Encode raw sector bytes as a WOZ 2.0 file and write to `dest_path`.
@@ -196,12 +227,11 @@ pub fn export_whole_disk(
         );
     }
 
-    // WOZ: floppy-only.  Reconstruct (or slurp) the source into memory, then
-    // encode as WOZ2.  Raw-image path covers superfloppies (2MG, .dsk, etc.);
-    // backup-folder path reconstructs the whole disk first via the common
-    // reconstruction helper (superfloppy layout preserves the sector stream).
-    if format == ExportFormat::Woz {
-        if let Some(meta) = backup_metadata {
+    // WOZ and DiskCopy 4.2: floppy-only.  Reconstruct (or slurp) the source
+    // into memory, then encode.  Raw-image path covers superfloppies (2MG,
+    // .dsk, DC42, etc.); backup-folder path reconstructs the whole disk first.
+    if format == ExportFormat::Woz || format == ExportFormat::Dc42 {
+        let buf = if let Some(meta) = backup_metadata {
             let mut buf: Vec<u8> = Vec::new();
             reconstruct_disk_from_backup(
                 source_path,
@@ -218,11 +248,10 @@ pub fn export_whole_disk(
                 &cancel_check,
                 &mut log_cb,
             )?;
-            return write_woz_from_sectors(&buf, dest_path, &mut log_cb);
+            buf
         } else {
             // Unwrap any container (WOZ, 2MG, DMG, VHD, DiskCopy 4.2, DOS-order
-            // .do/.dsk) so we feed `sectors_to_woz` flat sector data, not the
-            // raw container bytes.
+            // .do/.dsk) so we feed the encoder flat sector data.
             let file = File::open(source_path)
                 .with_context(|| format!("failed to open {}", source_path.display()))?;
             let (mut reader, data_size) = {
@@ -235,8 +264,13 @@ pub fn export_whole_disk(
                 .read_exact(&mut buf)
                 .context("failed to read source")?;
             progress_cb(data_size);
-            return write_woz_from_sectors(&buf, dest_path, &mut log_cb);
-        }
+            buf
+        };
+        return if format == ExportFormat::Woz {
+            write_woz_from_sectors(&buf, dest_path, &mut log_cb)
+        } else {
+            write_dc42_from_sectors(&buf, dest_path, &mut log_cb)
+        };
     }
 
     // Raw and 2MG formats: reconstruct disk, then wrap with header/footer.
@@ -302,34 +336,26 @@ pub fn export_whole_disk(
         // Write header (2MG only — writes placeholder, patched later)
         let header_size = format.write_header(&mut writer, 0)?;
 
-        // Stream source data
-        let file = File::open(source_path)
-            .with_context(|| format!("failed to open {}", source_path.display()))?;
-        let file_size = file.metadata()?.len();
-        let mut reader = std::io::BufReader::new(file);
-
-        // Check for VHD footer on source
-        let source_data_size = if file_size >= 512 {
-            let mut f = File::open(source_path)?;
-            f.seek(SeekFrom::End(-512))?;
-            let mut cookie = [0u8; 8];
-            f.read_exact(&mut cookie)?;
-            if &cookie == super::vhd::VHD_COOKIE {
-                file_size - 512
-            } else {
-                file_size
-            }
-        } else {
-            file_size
+        // Unwrap any container (VHD, 2MG, DMG, DiskCopy 4.2, DOS-order .dsk, WOZ)
+        // so Raw/2MG exports always emit flat sector data — not the source's header/footer bytes.
+        let (mut reader, source_data_size) = {
+            let file = File::open(source_path)
+                .with_context(|| format!("failed to open {}", source_path.display()))?;
+            let file2 = File::open(source_path)?;
+            let fmt = super::detect_image_format_with_path(file, Some(source_path))?;
+            super::wrap_image_reader(file2, fmt)?
         };
 
         let mut buf = vec![0u8; CHUNK_SIZE];
-        let mut limited = (&mut reader).take(source_data_size);
-        loop {
+        let mut remaining = source_data_size;
+        while remaining > 0 {
             if cancel_check() {
                 bail!("export cancelled");
             }
-            let n = limited.read(&mut buf).context("failed to read source")?;
+            let to_read = (remaining as usize).min(CHUNK_SIZE);
+            let n = reader
+                .read(&mut buf[..to_read])
+                .context("failed to read source")?;
             if n == 0 {
                 break;
             }
@@ -337,6 +363,7 @@ pub fn export_whole_disk(
                 .write_all(&buf[..n])
                 .context("failed to write data")?;
             total_written += n as u64;
+            remaining -= n as u64;
             progress_cb(total_written);
         }
 
@@ -387,9 +414,9 @@ pub fn export_partition(
         );
     }
 
-    // WOZ: slurp into memory, encode as WOZ2, write.  Requires the decompressed
-    // partition size to be a recognised Apple II floppy size.
-    if format == ExportFormat::Woz {
+    // WOZ / DiskCopy 4.2: slurp into memory, encode, write.  Requires the
+    // decompressed partition size to be a recognised floppy size.
+    if format == ExportFormat::Woz || format == ExportFormat::Dc42 {
         let buf = read_source_to_memory(
             source_path,
             compression_type,
@@ -398,7 +425,11 @@ pub fn export_partition(
             &cancel_check,
             &mut log_cb,
         )?;
-        return write_woz_from_sectors(&buf, dest_path, &mut log_cb);
+        return if format == ExportFormat::Woz {
+            write_woz_from_sectors(&buf, dest_path, &mut log_cb)
+        } else {
+            write_dc42_from_sectors(&buf, dest_path, &mut log_cb)
+        };
     }
 
     let mut writer = BufWriter::new(
@@ -554,13 +585,17 @@ fn convert_from_vhd_temp(
         .len();
     let data_size = vhd_size.saturating_sub(512); // strip VHD footer
 
-    // WOZ path: read the stripped data into memory, encode, write.
-    if format == ExportFormat::Woz {
+    // WOZ / DC42 path: read the stripped data into memory, encode, write.
+    if format == ExportFormat::Woz || format == ExportFormat::Dc42 {
         let mut f = File::open(vhd_path)
             .with_context(|| format!("failed to open {}", vhd_path.display()))?;
         let mut buf = vec![0u8; data_size as usize];
         f.read_exact(&mut buf).context("failed to read VHD temp")?;
-        return write_woz_from_sectors(&buf, dest_path, log_cb);
+        return if format == ExportFormat::Woz {
+            write_woz_from_sectors(&buf, dest_path, log_cb)
+        } else {
+            write_dc42_from_sectors(&buf, dest_path, log_cb)
+        };
     }
 
     let mut reader = std::io::BufReader::new(
@@ -609,6 +644,7 @@ mod tests {
         assert_eq!(ExportFormat::Raw.extension(), "img");
         assert_eq!(ExportFormat::TwoMg.extension(), "2mg");
         assert_eq!(ExportFormat::Woz.extension(), "woz");
+        assert_eq!(ExportFormat::Dc42.extension(), "dsk");
     }
 
     #[test]
@@ -617,6 +653,7 @@ mod tests {
         assert!(!ExportFormat::Raw.is_floppy_only());
         assert!(!ExportFormat::TwoMg.is_floppy_only());
         assert!(ExportFormat::Woz.is_floppy_only());
+        assert!(ExportFormat::Dc42.is_floppy_only());
     }
 
     #[test]

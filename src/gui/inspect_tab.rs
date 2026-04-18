@@ -1293,6 +1293,14 @@ impl InspectTab {
                         .on_hover_text(
                             "Apple II WOZ 2.0 (floppy only: 140K / 400K / 800K sources)",
                         );
+                    ui.radio_value(
+                        &mut self.export_format,
+                        ExportFormat::Dc42,
+                        "DiskCopy 4.2 (.dsk)",
+                    )
+                    .on_hover_text(
+                        "Mac / Apple IIgs DiskCopy 4.2 (floppy only: 400K / 720K / 800K / 1440K)",
+                    );
                 });
 
                 ui.add_space(8.0);
@@ -1695,6 +1703,12 @@ impl InspectTab {
                             overall_written += export_size;
                         }
                     } else if let Some(image_path) = &source_image {
+                        if format.is_floppy_only() {
+                            anyhow::bail!(
+                                "{} per-partition export from a raw disk image is not supported — use Whole Disk export for floppy-only formats",
+                                format.description()
+                            );
+                        }
                         // Raw image/device: extract each partition by offset
                         for part in &partitions {
                             if status.lock().map(|s| s.cancel_requested).unwrap_or(false) {

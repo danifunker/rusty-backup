@@ -220,6 +220,17 @@ pub struct BrowseView {
     staging_errors: Vec<(PathBuf, String)>,
     /// Whether the staging-errors modal dialog is open.
     show_staging_errors: bool,
+    /// Extraction parameters awaiting overwrite confirmation.
+    pending_extraction: Option<PendingExtraction>,
+}
+
+/// Captured state from `start_extraction` so the extraction can resume after
+/// the user answers the overwrite confirmation dialog.
+struct PendingExtraction {
+    entry: FileEntry,
+    dest: PathBuf,
+    /// Path(s) at `dest` that already exist and would be replaced.
+    conflicts: Vec<PathBuf>,
 }
 
 /// Transient state for the "Set ProDOS Type…" dialog.
@@ -326,6 +337,7 @@ impl Default for BrowseView {
             prodos_type_dialog: None,
             staging_errors: Vec::new(),
             show_staging_errors: false,
+            pending_extraction: None,
         }
     }
 }
@@ -813,6 +825,9 @@ impl BrowseView {
         // Staging errors dialog
         self.render_staging_errors_dialog(ui);
 
+        // Extraction overwrite-confirm dialog
+        self.render_extract_overwrite_dialog(ui);
+
         // Two-panel layout: tree | content
         let available = ui.available_size();
         let tree_width = (available.x * 0.4).max(200.0).min(400.0);
@@ -1031,8 +1046,47 @@ impl BrowseView {
             .map(|s| s.path == entry.path)
             .unwrap_or(false);
 
+        // Look up the staged AddFile for this entry to surface rsrc/type info.
+        let rsrc_badge: Option<String> = self.staged_edits.iter().find_map(|e| match e {
+            StagedEdit::AddFile {
+                parent,
+                name,
+                resource_fork: Some(imp),
+                ..
+            } => {
+                let path = if parent.path == "/" {
+                    format!("/{name}")
+                } else {
+                    format!("{}/{name}", parent.path)
+                };
+                if path != entry.path {
+                    return None;
+                }
+                let tc = imp
+                    .type_code
+                    .map(|c| String::from_utf8_lossy(&c).to_string());
+                let cc = imp
+                    .creator_code
+                    .map(|c| String::from_utf8_lossy(&c).to_string());
+                let codes = match (tc, cc) {
+                    (Some(t), Some(c)) => format!("{t}/{c} "),
+                    (Some(t), None) => format!("{t} "),
+                    (None, Some(c)) => format!("?/{c} "),
+                    (None, None) => String::new(),
+                };
+                Some(format!(
+                    "[{}+rsrc {}]",
+                    codes,
+                    partition::format_size(imp.data.len() as u64)
+                ))
+            }
+            _ => None,
+        });
+
         let label = if entry.is_directory() {
             format!("+ {}", entry.name)
+        } else if let Some(ref badge) = rsrc_badge {
+            format!("+ {}  {}  ({})", entry.name, badge, entry.size_string())
         } else {
             format!("+ {}  ({})", entry.name, entry.size_string())
         };
@@ -1315,7 +1369,75 @@ impl BrowseView {
             None => return,
         };
 
-        let entry = entry.clone();
+        let conflicts = self.detect_extract_conflicts(entry, &dest);
+        if !conflicts.is_empty() {
+            self.pending_extraction = Some(PendingExtraction {
+                entry: entry.clone(),
+                dest,
+                conflicts,
+            });
+            return;
+        }
+
+        self.launch_extraction(entry.clone(), dest);
+    }
+
+    /// Collect existing paths under `dest` that the extraction would overwrite.
+    /// Only top-level collisions are considered (the primary output plus any
+    /// sidecar file for HFS resource-fork modes).
+    fn detect_extract_conflicts(&self, entry: &FileEntry, dest: &std::path::Path) -> Vec<PathBuf> {
+        let base = resource_fork::sanitize_filename(&entry.name);
+        let safe_name = if self.is_prodos_type()
+            && entry.is_file()
+            && self.prodos_export_mode == ProdosExportMode::WithTypeSuffix
+        {
+            let tt = entry
+                .type_code
+                .as_deref()
+                .and_then(|tc| {
+                    tc.split_whitespace()
+                        .next()
+                        .and_then(|s| u8::from_str_radix(s.trim_start_matches('$'), 16).ok())
+                })
+                .unwrap_or(0x06);
+            let aux = entry.aux_type.unwrap_or(0);
+            format!(
+                "{}{}",
+                base,
+                rusty_backup::fs::prodos_types::encode_cp_suffix(tt, aux)
+            )
+        } else {
+            base
+        };
+
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        let has_rsrc = self.is_hfs_type()
+            && entry.is_file()
+            && entry.resource_fork_size.map(|s| s > 0).unwrap_or(false);
+
+        if has_rsrc && self.resource_fork_mode == ResourceForkMode::MacBinary {
+            candidates.push(dest.join(format!("{safe_name}.bin")));
+        } else {
+            candidates.push(dest.join(&safe_name));
+            if has_rsrc {
+                match self.resource_fork_mode {
+                    ResourceForkMode::AppleDouble => {
+                        candidates.push(dest.join(format!("._{safe_name}")));
+                    }
+                    ResourceForkMode::SeparateRsrc => {
+                        candidates.push(dest.join(format!("{safe_name}.rsrc")));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        candidates.into_iter().filter(|p| p.exists()).collect()
+    }
+
+    /// Spawn the extraction thread. Separated from `start_extraction` so the
+    /// overwrite confirmation dialog can resume it after the user confirms.
+    fn launch_extraction(&mut self, entry: FileEntry, dest: PathBuf) {
         let source_path = self.source_path.clone();
         let partition_offset = self.partition_offset;
         let partition_type = self.partition_type;
@@ -2640,6 +2762,80 @@ impl BrowseView {
                     }
                 });
             });
+    }
+
+    /// Render the overwrite confirmation dialog for extraction.
+    fn render_extract_overwrite_dialog(&mut self, ui: &mut egui::Ui) {
+        if self.pending_extraction.is_none() {
+            return;
+        }
+        let (conflict_list, count) = {
+            let pe = self.pending_extraction.as_ref().unwrap();
+            let list: Vec<String> = pe
+                .conflicts
+                .iter()
+                .map(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("?")
+                        .to_string()
+                })
+                .collect();
+            (list, pe.conflicts.len())
+        };
+
+        let mut action: Option<bool> = None; // Some(true)=overwrite, Some(false)=cancel
+        egui::Window::new("Overwrite existing file?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ui.ctx(), |ui| {
+                if count == 1 {
+                    ui.label(format!(
+                        "'{}' already exists at the destination.",
+                        conflict_list[0]
+                    ));
+                } else {
+                    ui.label(format!("{count} items already exist at the destination:"));
+                    for name in &conflict_list {
+                        ui.label(format!("  • {name}"));
+                    }
+                }
+                ui.add_space(4.0);
+                ui.label("Overwriting will replace the existing items.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Overwrite").clicked() {
+                        action = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        action = Some(false);
+                    }
+                });
+            });
+
+        match action {
+            Some(true) => {
+                let pe = self.pending_extraction.take().unwrap();
+                for path in &pe.conflicts {
+                    let res = if path.is_dir() {
+                        std::fs::remove_dir_all(path)
+                    } else {
+                        std::fs::remove_file(path)
+                    };
+                    if let Err(e) = res {
+                        self.extraction_result =
+                            Some(format!("Could not remove '{}': {e}", path.display()));
+                        return;
+                    }
+                }
+                self.launch_extraction(pe.entry, pe.dest);
+            }
+            Some(false) => {
+                self.pending_extraction = None;
+            }
+            None => {}
+        }
     }
 
     /// Exit edit mode, clearing all staged state.

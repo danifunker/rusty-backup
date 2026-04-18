@@ -17,6 +17,16 @@ pub const DC42_HEADER_SIZE: u64 = 84;
 /// Located at offset 82-83, big-endian.  Must be 0x0100.
 const DC42_PRIVATE_MAGIC: u16 = 0x0100;
 
+// disk_format byte values (offset 80).
+const DC42_DISK_400K: u8 = 0;
+const DC42_DISK_800K: u8 = 1;
+const DC42_DISK_720K: u8 = 2;
+const DC42_DISK_1440K: u8 = 3;
+
+// format_byte values (offset 81).
+const DC42_FMT_SINGLE_SIDED: u8 = 0x02; // 400K Mac single-sided
+const DC42_FMT_DOUBLE_SIDED: u8 = 0x22; // 800K Mac / HD MFM
+
 /// Parsed DiskCopy 4.2 header.
 #[derive(Debug, Clone)]
 pub struct Dc42Header {
@@ -107,6 +117,62 @@ pub fn detect_dc42(reader: &mut impl Read, file_size: u64) -> Option<Dc42Header>
     } else {
         None
     }
+}
+
+/// Compute the DiskCopy 4.2 checksum of a data buffer.
+///
+/// For every 16-bit big-endian word: `sum = (sum + word).rotate_right(1)` in 32-bit arithmetic.
+/// An odd trailing byte is ignored (all standard floppy sizes are even).
+pub fn dc42_checksum(data: &[u8]) -> u32 {
+    let mut sum: u32 = 0;
+    let mut i = 0;
+    while i + 1 < data.len() {
+        let word = u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+        sum = sum.wrapping_add(word);
+        sum = sum.rotate_right(1);
+        i += 2;
+    }
+    sum
+}
+
+/// Encode a flat sector buffer as a complete DiskCopy 4.2 file.
+///
+/// `data.len()` must be one of the standard Mac floppy sizes: 400K, 720K, 800K, or 1440K.
+/// No tag bytes are emitted (tag_size = 0), which matches the modern convention
+/// for MFM disks and is the common case for GCR images in practice.
+pub fn encode_dc42(name: &str, data: &[u8]) -> Result<Vec<u8>, &'static str> {
+    let (disk_format, format_byte) = match data.len() {
+        409_600 => (DC42_DISK_400K, DC42_FMT_SINGLE_SIDED),
+        737_280 => (DC42_DISK_720K, DC42_FMT_DOUBLE_SIDED),
+        819_200 => (DC42_DISK_800K, DC42_FMT_DOUBLE_SIDED),
+        1_474_560 => (DC42_DISK_1440K, DC42_FMT_DOUBLE_SIDED),
+        _ => return Err("DiskCopy 4.2 supports only 400K / 720K / 800K / 1440K images"),
+    };
+
+    let name_bytes = name.as_bytes();
+    let name_len = name_bytes.len().min(63).max(1);
+    let effective_name: &[u8] = if name_bytes.is_empty() {
+        b"Untitled"
+    } else {
+        &name_bytes[..name_len]
+    };
+    let effective_len = effective_name.len();
+
+    let mut header = [0u8; 84];
+    header[0] = effective_len as u8;
+    header[1..1 + effective_len].copy_from_slice(effective_name);
+    header[64..68].copy_from_slice(&(data.len() as u32).to_be_bytes());
+    // tag_size stays 0
+    header[72..76].copy_from_slice(&dc42_checksum(data).to_be_bytes());
+    // tag_checksum stays 0 (no tags)
+    header[80] = disk_format;
+    header[81] = format_byte;
+    header[82..84].copy_from_slice(&DC42_PRIVATE_MAGIC.to_be_bytes());
+
+    let mut out = Vec::with_capacity(84 + data.len());
+    out.extend_from_slice(&header);
+    out.extend_from_slice(data);
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -201,5 +267,51 @@ mod tests {
         let wrong_size = 900000u64; // doesn't match 84 + 819200 + 19200
         let mut cursor = Cursor::new(&header_bytes);
         assert!(detect_dc42(&mut cursor, wrong_size).is_none());
+    }
+
+    #[test]
+    fn test_encode_dc42_roundtrip_1440k() {
+        let data = vec![0xA5u8; 1_474_560];
+        let encoded = encode_dc42("InstallMe", &data).expect("encode");
+        assert_eq!(encoded.len(), 84 + 1_474_560);
+
+        let mut cursor = Cursor::new(&encoded);
+        let hdr = detect_dc42(&mut cursor, encoded.len() as u64).expect("detect");
+        assert_eq!(hdr.disk_name, "InstallMe");
+        assert_eq!(hdr.data_size, 1_474_560);
+        assert_eq!(hdr.tag_size, 0);
+        assert_eq!(hdr.disk_format, DC42_DISK_1440K);
+        assert_eq!(hdr.format_byte, DC42_FMT_DOUBLE_SIDED);
+        assert_eq!(hdr.data_checksum, dc42_checksum(&data));
+    }
+
+    #[test]
+    fn test_encode_dc42_400k_single_sided() {
+        let data = vec![0u8; 409_600];
+        let encoded = encode_dc42("Mac400", &data).expect("encode");
+        assert_eq!(encoded[80], DC42_DISK_400K);
+        assert_eq!(encoded[81], DC42_FMT_SINGLE_SIDED);
+    }
+
+    #[test]
+    fn test_encode_dc42_rejects_odd_size() {
+        let data = vec![0u8; 1_000_000];
+        assert!(encode_dc42("Bad", &data).is_err());
+    }
+
+    #[test]
+    fn test_encode_dc42_empty_name_defaults() {
+        let data = vec![0u8; 819_200];
+        let encoded = encode_dc42("", &data).expect("encode");
+        assert_eq!(encoded[0], 8); // "Untitled" = 8 bytes
+        assert_eq!(&encoded[1..9], b"Untitled");
+    }
+
+    #[test]
+    fn test_dc42_checksum_known_vector() {
+        // Simple vector: two words 0x0001 0x0002 → sum=1 ror1 = 0x80000000
+        //   then sum=0x80000000+2=0x80000002 ror1 = 0x40000001
+        let data = [0x00, 0x01, 0x00, 0x02];
+        assert_eq!(dc42_checksum(&data), 0x40000001);
     }
 }

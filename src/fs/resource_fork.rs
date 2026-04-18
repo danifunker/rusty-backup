@@ -199,11 +199,12 @@ pub fn detect_resource_fork(host_path: &std::path::Path) -> Option<ImportedResou
         let rsrc_path = host_path.join("..namedfork/rsrc");
         if let Ok(data) = std::fs::read(&rsrc_path) {
             if !data.is_empty() {
+                let (type_code, creator_code) = read_finder_info_xattr(host_path);
                 return Some(ImportedResourceFork {
                     data,
                     data_fork: None,
-                    type_code: None,
-                    creator_code: None,
+                    type_code,
+                    creator_code,
                 });
             }
         }
@@ -420,6 +421,49 @@ pub fn parse_macbinary(data: &[u8]) -> Option<ImportedResourceFork> {
             None
         },
     })
+}
+
+/// Read the macOS `com.apple.FinderInfo` extended attribute and extract
+/// the 4-byte type and creator codes. Returns `(None, None)` if the xattr
+/// is missing, too short, or both codes are zero.
+#[cfg(target_os = "macos")]
+fn read_finder_info_xattr(path: &std::path::Path) -> (Option<[u8; 4]>, Option<[u8; 4]>) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = match CString::new(path.as_os_str().as_bytes()) {
+        Ok(p) => p,
+        Err(_) => return (None, None),
+    };
+    let c_name = match CString::new("com.apple.FinderInfo") {
+        Ok(n) => n,
+        Err(_) => return (None, None),
+    };
+
+    let mut buf = [0u8; 32];
+    // getxattr(path, name, value, size, position, options)
+    let n = unsafe {
+        libc::getxattr(
+            c_path.as_ptr(),
+            c_name.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+            0,
+            0,
+        )
+    };
+    if n < 8 {
+        return (None, None);
+    }
+
+    let mut tc = [0u8; 4];
+    let mut cc = [0u8; 4];
+    tc.copy_from_slice(&buf[0..4]);
+    cc.copy_from_slice(&buf[4..8]);
+
+    let tc = if tc != [0; 4] { Some(tc) } else { None };
+    let cc = if cc != [0; 4] { Some(cc) } else { None };
+    (tc, cc)
 }
 
 #[cfg(test)]
