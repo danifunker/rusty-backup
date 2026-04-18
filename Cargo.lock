@@ -3240,7 +3240,7 @@ dependencies = [
 [[package]]
 name = "opticaldiscs"
 version = "0.1.0"
-source = "git+https://github.com/danifunker/opticaldiscs-rs#5a8c45ef2b3d0ced5e3f1cd77763ac04538e5bdd"
+source = "git+https://github.com/danifunker/opticaldiscs-rs#4d6f54e1e5c65f0a2d833cff67371b3cf2e858ac"
 dependencies = [
  "chd",
  "cue_sheet",

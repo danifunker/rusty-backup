@@ -3447,32 +3447,29 @@ fn create_filesystem(
 
     let path = source_path.ok_or_else(|| FilesystemError::Parse("no source path set".into()))?;
 
-    // Detect seekable zstd files by extension
+    // Sniff first 8 bytes to detect content-addressable formats regardless of
+    // file extension (users often have mislabeled files).
+    let mut magic = [0u8; 8];
+    if let Ok(mut f) = File::open(path) {
+        use std::io::Read as _;
+        let _ = f.read(&mut magic);
+    }
+
+    // CHD — 8-byte magic "MComprHD" at offset 0.
+    if &magic == b"MComprHD" {
+        let chd_reader = ChdReader::open(path)
+            .map_err(|e| FilesystemError::Parse(format!("failed to open CHD: {e}")))?;
+        return fs::open_filesystem(chd_reader, 0, partition_type, partition_type_string);
+    }
+
+    // Seekable zstd cache files — keep extension-based detection since there
+    // is no reliable content-level signal distinguishing them from other zstd.
     let is_seekable_zst = path.extension().map(|e| e == "zst").unwrap_or(false)
         && path
             .file_stem()
             .and_then(|s| s.to_str())
             .map(|s| s.ends_with(".seekable"))
             .unwrap_or(false);
-
-    // Detect CHD files by extension — use ChdReader for on-demand decompression
-    let is_chd = path.extension().map(|e| e == "chd").unwrap_or(false);
-    if is_chd {
-        let chd_reader = ChdReader::open(path)
-            .map_err(|e| FilesystemError::Parse(format!("failed to open CHD: {e}")))?;
-        return fs::open_filesystem(chd_reader, 0, partition_type, partition_type_string);
-    }
-
-    // Detect WOZ files by extension — decode GCR bitstream to sector data
-    let is_woz = path
-        .extension()
-        .map(|e| e.eq_ignore_ascii_case("woz"))
-        .unwrap_or(false);
-    if is_woz {
-        let woz_reader = rusty_backup::rbformats::woz::WozReader::open(path)
-            .map_err(|e| FilesystemError::Parse(format!("failed to open WOZ: {e}")))?;
-        return fs::open_filesystem(woz_reader, 0, partition_type, partition_type_string);
-    }
 
     if is_seekable_zst {
         let file = File::open(path).map_err(FilesystemError::Io)?;

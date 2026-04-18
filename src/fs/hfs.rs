@@ -314,6 +314,8 @@ enum CatalogRecord {
         rsrc_extents: [HfsExtDescriptor; 3],
         type_code: String,
         creator_code: String,
+        /// Finder flags (FInfo.fdFlags) — bit 0x8000 is `kIsAlias`.
+        finder_flags: u16,
     },
 }
 
@@ -450,9 +452,10 @@ impl<R: Read + Seek> HfsFilesystem<R> {
                             continue;
                         }
                         let rec = &node[rec_data_offset..];
-                        // Finder Info (FInfo) at offset 4: fdType(4) + fdCreator(4)
+                        // Finder Info (FInfo) at offset 4: fdType(4) + fdCreator(4) + fdFlags(2)
                         let type_code = decode_fourcc(&rec[4..8]);
                         let creator_code = decode_fourcc(&rec[8..12]);
+                        let finder_flags = BigEndian::read_u16(&rec[12..14]);
                         // File ID (filFlNum) at offset 20
                         let file_id = BigEndian::read_u32(&rec[20..24]);
                         // Data fork: logical size at offset 26, first 3 extents at 74
@@ -483,6 +486,7 @@ impl<R: Read + Seek> HfsFilesystem<R> {
                             rsrc_extents,
                             type_code,
                             creator_code,
+                            finder_flags,
                         });
                     }
                     _ => {}
@@ -1458,8 +1462,10 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
                     name,
                     data_size,
                     rsrc_size,
+                    rsrc_extents,
                     type_code,
                     creator_code,
+                    finder_flags,
                     ..
                 } => {
                     let path = if entry.path == "/" {
@@ -1472,6 +1478,22 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
                     fe.creator_code = Some(creator_code);
                     if rsrc_size > 0 {
                         fe.resource_fork_size = Some(rsrc_size as u64);
+                    }
+                    // Classic-Mac alias: fdFlags bit 0x8000 set. Read the
+                    // resource fork (small for aliases, typically <4KB) and
+                    // parse the `alis` resource to surface the target.
+                    if finder_flags & super::mac_alias::IS_ALIAS_FLAG != 0 && rsrc_size > 0 {
+                        if let Ok(rsrc) = read_fork_data(
+                            &mut self.reader,
+                            self.partition_offset,
+                            &self.mdb,
+                            &rsrc_extents,
+                            rsrc_size as u64,
+                        ) {
+                            if let Some(target) = super::mac_alias::resolve_alias_target(&rsrc) {
+                                fe.symlink_target = Some(target);
+                            }
+                        }
                     }
                     entries.push(fe);
                 }

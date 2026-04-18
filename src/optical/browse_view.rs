@@ -278,7 +278,10 @@ impl OpticalDiscBrowseView {
                     .unwrap_or(false);
 
                 let size_str = entry.size_string();
-                let label = format!("{}  ({})", entry.name, size_str);
+                let label = match &entry.symlink_target {
+                    Some(target) => format!("{} → {}  ({})", entry.name, target, size_str),
+                    None => format!("{}  ({})", entry.name, size_str),
+                };
 
                 if ui.selectable_label(is_selected, &label).clicked() {
                     self.select_file(entry);
@@ -371,6 +374,9 @@ impl OpticalDiscBrowseView {
                         if rsrc > 0 {
                             ui.label(format!("Rsrc: {}", format_size(rsrc)));
                         }
+                    }
+                    if let Some(ref target) = entry.symlink_target {
+                        ui.label(format!("→ {target}"));
                     }
                     ui.label(format!("Path: {}", entry.path));
                 });
@@ -661,6 +667,10 @@ fn walk_optical_tree(
         out.push_str(prefix);
         out.push_str(connector);
         out.push_str(&child.name);
+
+        if let Some(ref target) = child.symlink_target {
+            out.push_str(&format!(" -> {target}"));
+        }
 
         if child.is_file() {
             let total = child.total_size();

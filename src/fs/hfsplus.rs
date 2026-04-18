@@ -320,11 +320,13 @@ enum CatalogEntry {
         file_id: u32,
         name: String,
         data_size: u64,
-        #[allow(dead_code)]
         data_fork: ForkData,
         rsrc_size: u64,
+        rsrc_fork: ForkData,
         type_code: String,
         creator_code: String,
+        /// Finder flags (userInfo.fdFlags) — bit 0x8000 is `kIsAlias`.
+        finder_flags: u16,
     },
 }
 
@@ -468,9 +470,10 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
                             continue;
                         }
                         let file_id = BigEndian::read_u32(&rec[8..12]);
-                        // FileInfo (Finder Info) at offset 48: fdType(4) + fdCreator(4)
+                        // FileInfo at offset 48: fdType(4) + fdCreator(4) + fdFlags(2)
                         let type_code = decode_fourcc(&rec[48..52]);
                         let creator_code = decode_fourcc(&rec[52..56]);
+                        let finder_flags = BigEndian::read_u16(&rec[56..58]);
                         // Data fork at offset 88 (80 bytes)
                         let data_fork = ForkData::parse(&rec[88..168]);
                         // Resource fork at offset 168 (80 bytes)
@@ -481,8 +484,10 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
                             data_size: data_fork.logical_size,
                             data_fork,
                             rsrc_size: rsrc_fork.logical_size,
+                            rsrc_fork,
                             type_code,
                             creator_code,
+                            finder_flags,
                         });
                     }
                     _ => {}
@@ -1129,10 +1134,12 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
                     file_id,
                     name,
                     data_size,
+                    data_fork,
                     rsrc_size,
+                    rsrc_fork,
                     type_code,
                     creator_code,
-                    ..
+                    finder_flags,
                 } => {
                     let path = if entry.path == "/" {
                         format!("/{name}")
@@ -1140,10 +1147,47 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
                         format!("{}/{name}", entry.path)
                     };
                     let mut fe = FileEntry::new_file(name, path, data_size, file_id as u64);
+                    // HFS+ UNIX symlink: type "slnk" / creator "rhap", data
+                    // fork is the target path as UTF-8 (typically <256 bytes).
+                    if type_code == super::mac_alias::SLNK_TYPE
+                        && creator_code == super::mac_alias::RHAP_CREATOR
+                        && data_size > 0
+                        && data_size <= 4096
+                    {
+                        if let Ok(data) = read_fork(
+                            &mut self.reader,
+                            self.partition_offset,
+                            self.vh.block_size,
+                            &data_fork,
+                        ) {
+                            if let Ok(target) = std::str::from_utf8(&data) {
+                                let trimmed = target.trim_end_matches('\0').trim();
+                                if !trimmed.is_empty() {
+                                    fe.symlink_target = Some(trimmed.to_string());
+                                }
+                            }
+                        }
+                    }
                     fe.type_code = Some(type_code);
                     fe.creator_code = Some(creator_code);
                     if rsrc_size > 0 {
                         fe.resource_fork_size = Some(rsrc_size);
+                    }
+                    // Classic-Mac alias: fdFlags bit 0x8000 set.
+                    if finder_flags & super::mac_alias::IS_ALIAS_FLAG != 0
+                        && rsrc_size > 0
+                        && fe.symlink_target.is_none()
+                    {
+                        if let Ok(rsrc) = read_fork(
+                            &mut self.reader,
+                            self.partition_offset,
+                            self.vh.block_size,
+                            &rsrc_fork,
+                        ) {
+                            if let Some(target) = super::mac_alias::resolve_alias_target(&rsrc) {
+                                fe.symlink_target = Some(target);
+                            }
+                        }
                     }
                     entries.push(fe);
                 }
