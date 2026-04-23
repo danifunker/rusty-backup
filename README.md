@@ -67,7 +67,7 @@ VHD export is available from the Inspect tab: produce either a whole-disk
 | Apple 2MG      | `.2mg`          | Yes            | No              | Apple II / IIgs disk images |
 | Disk Copy 4.2  | `.dc42`, `.image` | Yes          | No              | Classic Mac floppy images |
 | Apple DMG      | `.dmg`          | Yes (raw/UDRW) | No              | Uncompressed DMGs only |
-| WOZ            | `.woz`          | Yes            | No              | Apple II 5.25" and 3.5" flux images |
+| WOZ            | `.woz`          | Yes            | Yes (export)    | Apple II 5.25" and 3.5"; WOZ2 writer regenerates a clean image |
 | Raw physical disk | —            | Yes            | Yes (restore target) | CF/SD/USB/HDD/SSD — see below |
 
 ### Filesystems
@@ -104,9 +104,15 @@ restore or VHD export.
   physical disk works.
 - **Raw → raw** restore always works regardless of filesystem; only the
   shrink/expand paths depend on filesystem-specific code.
-- **Write-back to source formats** (2MG, DC42, DMG, WOZ) is not supported;
-  read those to back up, and restore to raw / VHD / CHD / Zstd or a physical
-  disk.
+- **Write-back to source formats**: WOZ2 export is supported (the writer
+  regenerates a clean WOZ from the decoded sector buffer). 2MG, DC42, and
+  DMG are still read-only as sources — to round-trip those, restore to raw /
+  VHD / CHD / Zstd or a physical disk.
+- **Browsing compressed backups**: native `.zst` backups stream-decompress
+  lazily on open, so browsing a multi-gigabyte zstd backup is fast. `.chd`
+  backups currently require building a full seekable cache on open, which
+  can be slow for large partitions — plan to work around this in a future
+  release.
 
 ### Physical drive compatibility
 
