@@ -62,6 +62,21 @@ pub fn format_tree_with_ids(fs: &mut dyn Filesystem) -> Result<String, Filesyste
     Ok(out)
 }
 
+/// Replace ASCII control characters with Unicode Control Pictures (U+2400–U+241F)
+/// so they render as visible glyphs instead of disrupting the tree layout.
+fn display_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_control() {
+                // Unicode Control Pictures block: U+2400 + codepoint
+                char::from_u32(0x2400 + c as u32).unwrap_or('\u{FFFD}')
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 fn walk_tree(
     fs: &mut dyn Filesystem,
     dir: &FileEntry,
@@ -80,7 +95,7 @@ fn walk_tree(
 
         out.push_str(prefix);
         out.push_str(connector);
-        out.push_str(&child.name);
+        out.push_str(&display_name(&child.name));
 
         if child.is_file() || child.is_symlink() {
             let total_size = child.size + child.resource_fork_size.unwrap_or(0);
