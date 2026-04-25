@@ -359,7 +359,21 @@ output is a usable .hda / .img file, not a bare partition blob.
 - Manual: round-trip a real .hda through the pipeline; resulting file
   mounts in BasiliskII / Mini vMac.
 
-**Status:** ⬜ Pending
+**Status:** ✅ DONE — `pub fn emit_apm_disk_with_hfs(source_disk, source_data_size,
+hfs_image, output) -> Result<EmitReport>` in `src/fs/hfs_clone.rs`. Parses the
+source APM, copies every `Apple_Driver*` partition byte-for-byte at its original
+start block, and places the new `Apple_HFS` partition at the source's HFS start
+block (or at `max(driver_end, 64)` if larger). Builds a fresh APM with a
+self-referencing `Apple_partition_map` entry + driver entries + a single
+`Apple_HFS` entry sized to `hfs_image`, writes DDR + map + payloads with
+zero-fill between regions, and returns drivers_copied / hfs_start_block /
+hfs_block_count / total_bytes. Tests cover synthetic-APM round trip
+(driver bytes preserved verbatim, emitted APM re-parses, wrapped HFS
+partition is fsck-clean) and the non-512-aligned-image rejection path.
+
+Note: `emit_apm_disk_with_hfs` is an APM-only path. Sources without an APM
+(e.g. raw HFS partition images, SCSI2SD blobs without DDR) need a different
+entry point; deferred until the GUI step decides whether to support them.
 
 ---
 
