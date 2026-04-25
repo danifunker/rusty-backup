@@ -131,6 +131,21 @@ pub struct HfsExtDescriptor {
     pub block_count: u16,
 }
 
+/// Lightweight, public snapshot of an HFS volume's headline numbers.
+/// Returned by [`HfsFilesystem::volume_summary`] so GUI code outside the
+/// library crate can populate display fields without touching pub(crate)
+/// internals.
+#[derive(Debug, Clone)]
+pub struct HfsVolumeSummary {
+    pub volume_name: String,
+    pub block_size: u32,
+    pub total_blocks: u16,
+    pub free_blocks: u16,
+    pub used_bytes: u64,
+    pub file_count: u32,
+    pub folder_count: u32,
+}
+
 impl HfsExtDescriptor {
     pub fn parse(data: &[u8]) -> Self {
         HfsExtDescriptor {
@@ -961,6 +976,22 @@ impl<R: Read + Seek> HfsFilesystem<R> {
 
     pub(crate) fn mdb(&self) -> &HfsMasterDirectoryBlock {
         &self.mdb
+    }
+
+    /// Lightweight read-only summary of the volume. Public so GUI callers
+    /// outside the library crate can populate display fields without going
+    /// through the full `Filesystem` browse API.
+    pub fn volume_summary(&self) -> HfsVolumeSummary {
+        let used_blocks = self.mdb.total_blocks.saturating_sub(self.mdb.free_blocks) as u64;
+        HfsVolumeSummary {
+            volume_name: self.mdb.volume_name.clone(),
+            block_size: self.mdb.block_size,
+            total_blocks: self.mdb.total_blocks,
+            free_blocks: self.mdb.free_blocks,
+            used_bytes: used_blocks * self.mdb.block_size as u64,
+            file_count: self.mdb.file_count,
+            folder_count: self.mdb.folder_count,
+        }
     }
 
     pub(crate) fn catalog_data(&self) -> &[u8] {

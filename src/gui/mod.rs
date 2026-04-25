@@ -1,6 +1,7 @@
 mod backup_tab;
 mod browse_view;
 mod elevation_dialog;
+mod expand_hfs_dialog;
 mod inspect_tab;
 mod optical_tab;
 mod progress;

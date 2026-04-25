@@ -21,6 +21,7 @@ use rusty_backup::rbformats::export::ExportFormat;
 use rusty_backup::rbformats::vhd::build_vhd_footer;
 
 use super::browse_view::BrowseView;
+use super::expand_hfs_dialog::{summarize_source as summarize_hfs_source, ExpandHfsDialog};
 use super::progress::{LogLevel, LogPanel};
 
 /// State for the Inspect tab.
@@ -109,6 +110,8 @@ pub struct InspectTab {
     repair_report: Option<rusty_backup::fs::RepairReport>,
     /// Context for pending repair: (offset, ptype, type_string).
     repair_context: Option<(u64, u8, Option<String>)>,
+    /// "Expand HFS Volume…" dialog (classic HFS only).
+    expand_hfs_dialog: Option<ExpandHfsDialog>,
 }
 
 /// Working copy of a partition entry in the editor.
@@ -288,6 +291,7 @@ impl Default for InspectTab {
             show_repair_confirm: false,
             repair_report: None,
             repair_context: None,
+            expand_hfs_dialog: None,
         }
     }
 }
@@ -2677,6 +2681,8 @@ impl InspectTab {
         let mut browse_request: Option<(usize, u64, u8, Option<String>)> = None;
         // Check (fsck) request: same tuple format
         let mut check_request: Option<(u64, u8, Option<String>)> = None;
+        // Expand-HFS request: (offset, partition_size_bytes)
+        let mut expand_request: Option<(u64, u64)> = None;
 
         egui::Grid::new("partition_table")
             .striped(true)
@@ -2812,6 +2818,14 @@ impl InspectTab {
                                     ));
                                 }
                             }
+                            if is_classic_hfs(
+                                part.partition_type_byte,
+                                part.partition_type_string.as_deref(),
+                                &part.type_name,
+                            ) && ui.small_button("Expand…").clicked()
+                            {
+                                expand_request = Some((part.start_lba * 512, part.size_bytes));
+                            }
                         } else {
                             ui.label("");
                         }
@@ -2832,8 +2846,51 @@ impl InspectTab {
             self.repair_report = None;
         }
 
+        // Handle expand-HFS request: probe the source, then open the dialog.
+        if let Some((offset, partition_size)) = expand_request {
+            self.open_expand_hfs(offset, partition_size, devices, log);
+        }
+
         // Fsck results popup
         self.render_fsck_popup(ui, devices, log);
+
+        // Expand-HFS dialog
+        if let Some(dlg) = &mut self.expand_hfs_dialog {
+            let still_open = dlg.show(ui.ctx(), log);
+            if !still_open {
+                self.expand_hfs_dialog = None;
+            }
+        }
+    }
+
+    /// Resolve the source path and open the Expand-HFS dialog.
+    fn open_expand_hfs(
+        &mut self,
+        offset: u64,
+        partition_size: u64,
+        devices: &[DiskDevice],
+        log: &mut LogPanel,
+    ) {
+        let source_path = self
+            .selected_device_idx
+            .and_then(|idx| devices.get(idx))
+            .map(|d| d.path.clone())
+            .or_else(|| self.image_file_path.clone());
+        let path = match source_path {
+            Some(p) => p,
+            None => {
+                log.error("No source available for HFS expand");
+                return;
+            }
+        };
+        match summarize_hfs_source(&path, offset, partition_size) {
+            Ok(source) => {
+                self.expand_hfs_dialog = Some(ExpandHfsDialog::new(source));
+            }
+            Err(e) => {
+                log.error(format!("Cannot read source HFS volume: {e}"));
+            }
+        }
     }
 
     /// Run filesystem check on a partition and display results.
@@ -3710,6 +3767,21 @@ fn is_browsable_type(ptype: u8) -> bool {
             | 0xA8
             | 0xAF
     )
+}
+
+/// Heuristic: is this partition classic HFS (not HFS+/HFSX)?
+/// Used to gate the "Expand HFS Volume…" action, which only handles classic
+/// HFS. APM rows where `probe_apple_hfs_type` flagged HFS+/HFSX get a tag in
+/// `type_name` like `Apple_HFS (HFS+)`; those are excluded here.
+fn is_classic_hfs(ptype: u8, type_string: Option<&str>, type_name: &str) -> bool {
+    let apm_hfs = type_string
+        .map(|s| s.eq_ignore_ascii_case("Apple_HFS"))
+        .unwrap_or(false);
+    let mbr_hfs = ptype == 0xAF;
+    if !(apm_hfs || mbr_hfs) {
+        return false;
+    }
+    !(type_name.contains("HFS+") || type_name.contains("HFSX"))
 }
 
 /// Check if an APM partition type string corresponds to a browsable filesystem.

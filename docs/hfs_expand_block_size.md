@@ -410,7 +410,24 @@ selectors and a "Save As…" file picker for the output.
 choose a larger size + larger block size, pick output path, watch progress,
 verify resulting file mounts and contains every original file.
 
-**Status:** ⬜ Pending
+**Status:** ✅ DONE — `src/gui/expand_hfs_dialog.rs` holds `ExpandHfsDialog`,
+`ExpandSource`, and `summarize_source(path, partition_offset, partition_size)`.
+Wired into `src/gui/inspect_tab.rs`: per-partition "Expand…" small button
+appears alongside Browse/Check for rows where `is_classic_hfs(...)` returns
+true (gates out Apple_HFS rows that `probe_apple_hfs_type` flagged as
+HFS+/HFSX). Clicking opens the dialog with a source summary (volume name,
+size, block size, used/file/dir counts), block-size combobox (4/8/16/32/64
+KiB, each labelled with its 65535-block ceiling), a target-size slider
+clamped to `[ceil(used)..max_for_block_size]`, and a "Save As…" picker.
+
+The "Expand" button spawns a worker thread that runs `create_blank_hfs` →
+`clone_hfs_volume` → `fsck` verify → `emit_apm_disk_with_hfs` and reports
+progress via a shared `Arc<Mutex<ExpandStatus>>`; the dialog displays the
+current step, log messages, and a final success/failure line. Source-summary
+helper added to the library: `pub fn HfsFilesystem::volume_summary() ->
+HfsVolumeSummary` exposes name/block_size/total/free/used/file/folder
+counts so GUI code outside the lib crate can populate display fields
+without touching `pub(crate)` internals.
 
 ---
 
