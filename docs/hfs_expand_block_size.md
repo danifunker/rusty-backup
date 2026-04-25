@@ -314,7 +314,20 @@ catalog and replicates every directory and file with all metadata.
 - Test: source contains a file with a 4-extent data fork (forces
   extents-overflow walk); cloned target reads back identical bytes.
 
-**Status:** ⬜ Pending
+**Status:** ✅ DONE — `clone_hfs_volume(source, target) -> Result<CloneReport>`
+in `src/fs/hfs_clone.rs`. BFS over `SourceCatalogSnapshot` with parent-indexed
+maps so dirs are created before children regardless of catalog ordering. Each
+file goes through `read_file` + `write_resource_fork_to` on the source, then
+`create_file` / `write_resource_fork` / `set_finder_info` / `set_dates` /
+`set_file_locked` on the target. Volume `drFndrInfo` is copied with a CNID
+remap applied to any int that matches a known source CNID (catches the
+blessed System Folder + OS-folder slots without disturbing flag fields).
+
+Multi-extent test deferred: HFS `create_file` always allocates contiguously,
+so producing a >3-extent file via the editable API isn't possible. Forcing it
+would require crafting an extents-overflow B-tree by hand. Read-side support
+for >3 extents is also not yet implemented in `read_fork_data`, so this is a
+broader future task and not a Step 5 blocker.
 
 ---
 
