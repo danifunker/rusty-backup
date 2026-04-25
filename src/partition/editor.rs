@@ -96,6 +96,7 @@ pub fn validate_edits(
                     is_logical: false,
                     is_extended_container: false,
                     partition_type_string: None,
+                    hfs_block_size: None,
                 });
             }
         }

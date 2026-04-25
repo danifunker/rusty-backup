@@ -126,13 +126,13 @@ fn is_catalog_uninitialized(catalog_data: &[u8]) -> bool {
 
 /// HFS extent descriptor: start_block (u16) + block_count (u16).
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct HfsExtDescriptor {
-    pub(crate) start_block: u16,
-    pub(crate) block_count: u16,
+pub struct HfsExtDescriptor {
+    pub start_block: u16,
+    pub block_count: u16,
 }
 
 impl HfsExtDescriptor {
-    pub(crate) fn parse(data: &[u8]) -> Self {
+    pub fn parse(data: &[u8]) -> Self {
         HfsExtDescriptor {
             start_block: BigEndian::read_u16(&data[0..2]),
             block_count: BigEndian::read_u16(&data[2..4]),
@@ -328,6 +328,11 @@ pub struct HfsFilesystem<R: Read + Seek> {
     catalog_data: Vec<u8>,
     /// Cached volume bitmap (lazy-loaded on first edit operation).
     bitmap: Option<Vec<u8>>,
+    /// Boot block payload staged by `set_boot_blocks`; flushed on `sync_metadata`.
+    pending_boot_blocks: Option<Box<[u8; 1024]>>,
+    /// Volume (create, modify, backup) dates staged by `set_volume_dates`.
+    /// When Some, overrides the automatic `hfs_now()` stamp in `sync_metadata`.
+    pending_volume_dates: Option<(u32, u32, u32)>,
 }
 
 impl<R: Read + Seek> HfsFilesystem<R> {
@@ -359,6 +364,8 @@ impl<R: Read + Seek> HfsFilesystem<R> {
             mdb,
             catalog_data,
             bitmap: None,
+            pending_boot_blocks: None,
+            pending_volume_dates: None,
         })
     }
 
@@ -951,6 +958,234 @@ impl<R: Read + Seek> HfsFilesystem<R> {
         self.bitmap = snap.1;
         self.mdb = snap.2;
     }
+
+    pub(crate) fn mdb(&self) -> &HfsMasterDirectoryBlock {
+        &self.mdb
+    }
+
+    pub(crate) fn catalog_data(&self) -> &[u8] {
+        &self.catalog_data
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn partition_offset(&self) -> u64 {
+        self.partition_offset
+    }
+
+    /// Read the 1024-byte boot block region (sectors 0..1 of the partition).
+    pub(crate) fn read_boot_blocks(&mut self) -> Result<[u8; 1024], FilesystemError> {
+        self.reader.seek(SeekFrom::Start(self.partition_offset))?;
+        let mut buf = [0u8; 1024];
+        self.reader.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Read a fork's content via the given 3-extent descriptor, up to `size` bytes.
+    /// This does not consult the extents-overflow B-tree.
+    #[allow(dead_code)]
+    pub(crate) fn read_fork(
+        &mut self,
+        extents: &[HfsExtDescriptor; 3],
+        size: u64,
+    ) -> Result<Vec<u8>, FilesystemError> {
+        read_fork_data(
+            &mut self.reader,
+            self.partition_offset,
+            &self.mdb,
+            extents,
+            size,
+        )
+    }
+
+    /// Locate the catalog record-data offset for a file or directory CNID by
+    /// going through the thread record (which always exists for both record
+    /// types in classic HFS editable volumes). The returned offset points at
+    /// the record type byte (offset 0 of the record data).
+    fn locate_record_data(&self, cnid: u32) -> Result<usize, FilesystemError> {
+        let (_, _, t_offset) = self.find_catalog_record_by_cnid(cnid).ok_or_else(|| {
+            FilesystemError::NotFound(format!("thread for CNID {cnid} not found"))
+        })?;
+        let key_len = self.catalog_data[t_offset] as usize;
+        let mut rec_data_start = t_offset + 1 + key_len;
+        if rec_data_start % 2 != 0 {
+            rec_data_start += 1;
+        }
+        let thread_parent =
+            BigEndian::read_u32(&self.catalog_data[rec_data_start + 10..rec_data_start + 14]);
+        let thread_name_len = self.catalog_data[rec_data_start + 14] as usize;
+        let thread_name =
+            self.catalog_data[rec_data_start + 15..rec_data_start + 15 + thread_name_len].to_vec();
+
+        let (_, _, f_offset) = self
+            .find_catalog_record_by_name(thread_parent, &thread_name)
+            .ok_or_else(|| {
+                FilesystemError::NotFound(format!("catalog record for CNID {cnid} not found"))
+            })?;
+        let fkey_len = self.catalog_data[f_offset] as usize;
+        let mut frec_start = f_offset + 1 + fkey_len;
+        if frec_start % 2 != 0 {
+            frec_start += 1;
+        }
+        Ok(frec_start)
+    }
+
+    /// Write the full 16-byte `FInfo` + 16-byte `FXInfo` Finder metadata
+    /// blocks on a file catalog record. `entry` must be a file.
+    pub fn set_finder_info(
+        &mut self,
+        entry: &FileEntry,
+        finfo: [u8; 16],
+        fxinfo: [u8; 16],
+    ) -> Result<(), FilesystemError> {
+        if entry.is_directory() {
+            return Err(FilesystemError::InvalidData(
+                "set_finder_info: entry is a directory".into(),
+            ));
+        }
+        let snap = self.snapshot();
+        let result = (|| {
+            let rec = self.locate_record_data(entry.location as u32)?;
+            if self.catalog_data[rec] as i8 != CATALOG_FILE {
+                return Err(FilesystemError::InvalidData("not a file record".into()));
+            }
+            self.catalog_data[rec + 4..rec + 20].copy_from_slice(&finfo);
+            self.catalog_data[rec + 56..rec + 72].copy_from_slice(&fxinfo);
+            Ok(())
+        })();
+        if result.is_err() {
+            self.restore_snapshot(snap);
+        }
+        result
+    }
+
+    /// Write the full 16-byte `DInfo` + 16-byte `DXInfo` Finder metadata
+    /// blocks on a directory catalog record. `entry` must be a directory.
+    pub fn set_directory_finder_info(
+        &mut self,
+        entry: &FileEntry,
+        dinfo: [u8; 16],
+        dxinfo: [u8; 16],
+    ) -> Result<(), FilesystemError> {
+        if !entry.is_directory() {
+            return Err(FilesystemError::InvalidData(
+                "set_directory_finder_info: entry is not a directory".into(),
+            ));
+        }
+        let snap = self.snapshot();
+        let result = (|| {
+            let rec = self.locate_record_data(entry.location as u32)?;
+            if self.catalog_data[rec] as i8 != CATALOG_DIR {
+                return Err(FilesystemError::InvalidData(
+                    "not a directory record".into(),
+                ));
+            }
+            self.catalog_data[rec + 22..rec + 38].copy_from_slice(&dinfo);
+            self.catalog_data[rec + 38..rec + 54].copy_from_slice(&dxinfo);
+            Ok(())
+        })();
+        if result.is_err() {
+            self.restore_snapshot(snap);
+        }
+        result
+    }
+
+    /// Set create/modify/backup dates (HFS epoch seconds) on a file or
+    /// directory catalog record. File record offsets: crDate@44, mdDate@48,
+    /// bkDate@52. Dir record offsets: crDate@10, mdDate@14, bkDate@18.
+    pub fn set_dates(
+        &mut self,
+        entry: &FileEntry,
+        create: u32,
+        modify: u32,
+        backup: u32,
+    ) -> Result<(), FilesystemError> {
+        let snap = self.snapshot();
+        let result = (|| {
+            let rec = self.locate_record_data(entry.location as u32)?;
+            let record_type = self.catalog_data[rec] as i8;
+            let (cr_off, md_off, bk_off) = match record_type {
+                CATALOG_FILE => (44, 48, 52),
+                CATALOG_DIR => (10, 14, 18),
+                other => {
+                    return Err(FilesystemError::InvalidData(format!(
+                        "unexpected catalog record type: {other}"
+                    )))
+                }
+            };
+            BigEndian::write_u32(
+                &mut self.catalog_data[rec + cr_off..rec + cr_off + 4],
+                create,
+            );
+            BigEndian::write_u32(
+                &mut self.catalog_data[rec + md_off..rec + md_off + 4],
+                modify,
+            );
+            BigEndian::write_u32(
+                &mut self.catalog_data[rec + bk_off..rec + bk_off + 4],
+                backup,
+            );
+            Ok(())
+        })();
+        if result.is_err() {
+            self.restore_snapshot(snap);
+        }
+        result
+    }
+
+    /// Set or clear the "locked" bit (0x01) in the catalog file record's
+    /// flags byte at offset 2. Only meaningful for files.
+    pub fn set_file_locked(
+        &mut self,
+        entry: &FileEntry,
+        locked: bool,
+    ) -> Result<(), FilesystemError> {
+        if entry.is_directory() {
+            return Err(FilesystemError::InvalidData(
+                "set_file_locked: entry is a directory".into(),
+            ));
+        }
+        let snap = self.snapshot();
+        let result = (|| {
+            let rec = self.locate_record_data(entry.location as u32)?;
+            if self.catalog_data[rec] as i8 != CATALOG_FILE {
+                return Err(FilesystemError::InvalidData("not a file record".into()));
+            }
+            let flags = self.catalog_data[rec + 2];
+            self.catalog_data[rec + 2] = if locked { flags | 0x01 } else { flags & !0x01 };
+            Ok(())
+        })();
+        if result.is_err() {
+            self.restore_snapshot(snap);
+        }
+        result
+    }
+
+    /// Set volume-level create / modify / backup dates. The modify date
+    /// overrides the automatic `hfs_now()` stamp that `sync_metadata`
+    /// normally applies.
+    pub fn set_volume_dates(&mut self, create: u32, modify: u32, backup: u32) {
+        self.pending_volume_dates = Some((create, modify, backup));
+        self.mdb.create_date = create;
+        self.mdb.modify_date = modify;
+        BigEndian::write_u32(&mut self.mdb.raw_sector[2..6], create);
+        BigEndian::write_u32(&mut self.mdb.raw_sector[6..10], modify);
+        BigEndian::write_u32(&mut self.mdb.raw_sector[64..68], backup);
+    }
+
+    /// Stage a 1024-byte boot-block region (sectors 0–1) for the volume.
+    /// The bytes are written verbatim at `sync_metadata` time.
+    pub fn set_boot_blocks(&mut self, blocks: &[u8; 1024]) {
+        self.pending_boot_blocks = Some(Box::new(*blocks));
+    }
+
+    /// Write the full 32-byte `drFndrInfo` (8 × u32) on the MDB. Useful when
+    /// blessed-folder fingerprinting extends beyond `drFndrInfo[0]` (e.g.
+    /// `drFndrInfo[3]` for the OS folder).
+    pub fn set_volume_finder_info(&mut self, finder_info: &[u8; 32]) {
+        for i in 0..8 {
+            self.mdb.finder_info[i] = BigEndian::read_u32(&finder_info[i * 4..(i + 1) * 4]);
+        }
+    }
 }
 
 /// Write helpers — require Read + Write + Seek.
@@ -1167,7 +1402,19 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
 
     /// Sync metadata: write catalog + bitmap + MDB + flush.
     fn do_sync_metadata(&mut self) -> Result<(), FilesystemError> {
-        self.mdb.modify_date = hfs_common::hfs_now();
+        if let Some((create, modify, backup)) = self.pending_volume_dates.take() {
+            self.mdb.create_date = create;
+            self.mdb.modify_date = modify;
+            BigEndian::write_u32(&mut self.mdb.raw_sector[2..6], create);
+            BigEndian::write_u32(&mut self.mdb.raw_sector[6..10], modify);
+            BigEndian::write_u32(&mut self.mdb.raw_sector[64..68], backup);
+        } else {
+            self.mdb.modify_date = hfs_common::hfs_now();
+        }
+        if let Some(blocks) = self.pending_boot_blocks.take() {
+            self.reader.seek(SeekFrom::Start(self.partition_offset))?;
+            self.reader.write_all(&blocks[..])?;
+        }
         self.write_catalog()?;
         self.write_volume_bitmap()?;
         self.write_mdb()?;
@@ -1419,6 +1666,184 @@ fn build_empty_hfs_extents_btree(size: usize) -> Result<Vec<u8>, FilesystemError
     BigEndian::write_u16(&mut buf[node_size - 8..node_size - 6], free_offset);
 
     Ok(buf)
+}
+
+/// Build a brand-new, empty classic-HFS partition image with the given total
+/// size and allocation block size. The returned `Vec<u8>` is a standalone
+/// partition blob (no APM wrapper) containing:
+///
+/// - sectors 0..1: zeroed boot blocks
+/// - sector 2: primary MDB (Master Directory Block)
+/// - starting at sector 3: volume bitmap
+/// - aligned up to `drAlBlSt`: allocation blocks
+/// - blocks 0..4: extents-overflow B-tree (header-only)
+/// - blocks 4..8: catalog B-tree (header + leaf with root dir + root thread)
+/// - blocks 8..: free
+/// - last sector: alternate MDB (mirror of primary)
+///
+/// The volume's `drFndrInfo`, dates and boot blocks are left at defaults;
+/// callers (e.g. Step 6 of the expand-block-size plan) overwrite those
+/// afterward. `drNxtCNID` starts at 16, matching real-world HFS volumes.
+///
+/// `block_size` must be a non-zero multiple of 512 and small enough that
+/// `total_blocks` fits in a `u16` (<= 65535).
+pub fn create_blank_hfs(
+    target_size_bytes: u64,
+    block_size: u32,
+    volume_name: &str,
+) -> Result<Vec<u8>, FilesystemError> {
+    if block_size == 0 || block_size % 512 != 0 {
+        return Err(FilesystemError::InvalidData(format!(
+            "HFS block_size must be a non-zero multiple of 512 (got {block_size})"
+        )));
+    }
+
+    let name_raw = utf8_to_mac_roman(volume_name)?;
+    if name_raw.len() > 27 {
+        return Err(FilesystemError::InvalidData(format!(
+            "HFS volume name '{volume_name}' exceeds 27 Mac Roman bytes"
+        )));
+    }
+
+    // Iteratively determine first_alloc_block. Bitmap starts at sector 3; its
+    // size depends on total_blocks, which depends on first_alloc_block, so
+    // grow the reserved region until it stops changing.
+    let mut first_alloc_block: u16 = 3;
+    let total_blocks: u32;
+    loop {
+        let pre_alloc = first_alloc_block as u64 * 512;
+        if target_size_bytes <= pre_alloc + 512 {
+            return Err(FilesystemError::InvalidData(format!(
+                "HFS volume too small ({target_size_bytes} bytes) for block_size {block_size}"
+            )));
+        }
+        let usable = target_size_bytes - pre_alloc - 512; // minus alt MDB
+        let tb = usable / block_size as u64;
+        if tb == 0 {
+            return Err(FilesystemError::InvalidData(format!(
+                "HFS volume too small for block_size {block_size}"
+            )));
+        }
+        if tb > 65535 {
+            return Err(FilesystemError::InvalidData(format!(
+                "HFS would have {tb} allocation blocks at block_size {block_size}, exceeding u16 ceiling 65535"
+            )));
+        }
+        let tb = tb as u32;
+        let bitmap_bytes = (tb as u64).div_ceil(8);
+        let bitmap_sectors = bitmap_bytes.div_ceil(512) as u16;
+        let needed = 3u16 + bitmap_sectors;
+        if needed <= first_alloc_block {
+            total_blocks = tb;
+            break;
+        }
+        first_alloc_block = needed;
+    }
+
+    // B-trees consume the first 8 allocation blocks (4 extents + 4 catalog).
+    const EXTENTS_START: u16 = 0;
+    const EXTENTS_BLOCKS: u16 = 4;
+    const CATALOG_START: u16 = EXTENTS_BLOCKS;
+    const CATALOG_BLOCKS: u16 = 4;
+    const BTREE_BLOCKS: u16 = EXTENTS_BLOCKS + CATALOG_BLOCKS;
+
+    if total_blocks < BTREE_BLOCKS as u32 {
+        return Err(FilesystemError::InvalidData(format!(
+            "HFS volume too small: {total_blocks} allocation blocks is below the minimum of {BTREE_BLOCKS} needed for B-trees"
+        )));
+    }
+
+    let extents_size = EXTENTS_BLOCKS as u32 * block_size;
+    let catalog_size = CATALOG_BLOCKS as u32 * block_size;
+
+    let image_size = first_alloc_block as u64 * 512 + total_blocks as u64 * block_size as u64 + 512;
+    let mut img = vec![0u8; image_size as usize];
+
+    // Volume bitmap at sector 3: mark the first BTREE_BLOCKS allocation
+    // blocks as used (the rest remain free).
+    let bitmap_off = 3 * 512;
+    for b in 0..BTREE_BLOCKS as u32 {
+        let byte_idx = (b / 8) as usize;
+        let bit_idx = 7 - (b % 8) as u8;
+        img[bitmap_off + byte_idx] |= 1 << bit_idx;
+    }
+
+    // Extents B-tree (header-only; no leaf records)
+    let extents_bytes = build_empty_hfs_extents_btree(extents_size as usize)?;
+    let extents_off = first_alloc_block as u64 * 512 + EXTENTS_START as u64 * block_size as u64;
+    img[extents_off as usize..extents_off as usize + extents_bytes.len()]
+        .copy_from_slice(&extents_bytes);
+
+    // Catalog B-tree with root directory (CNID 2) + its thread record
+    let catalog_bytes = build_empty_hfs_catalog(catalog_size as usize)?;
+    let catalog_off = first_alloc_block as u64 * 512 + CATALOG_START as u64 * block_size as u64;
+    img[catalog_off as usize..catalog_off as usize + catalog_bytes.len()]
+        .copy_from_slice(&catalog_bytes);
+
+    // Primary MDB at sector 2
+    let mdb = build_blank_mdb(
+        &name_raw,
+        total_blocks as u16,
+        block_size,
+        first_alloc_block,
+        CATALOG_START,
+        CATALOG_BLOCKS,
+        catalog_size,
+        EXTENTS_START,
+        EXTENTS_BLOCKS,
+        extents_size,
+        BTREE_BLOCKS,
+    );
+    img[1024..1024 + 512].copy_from_slice(&mdb);
+
+    // Alternate MDB at the sector immediately after the last allocation
+    // block (= last 512 bytes of the image).
+    let alt_off = image_size as usize - 512;
+    img[alt_off..alt_off + 512].copy_from_slice(&mdb);
+
+    Ok(img)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_blank_mdb(
+    name_raw: &[u8],
+    total_blocks: u16,
+    block_size: u32,
+    first_alloc_block: u16,
+    catalog_start: u16,
+    catalog_blocks: u16,
+    catalog_size: u32,
+    extents_start: u16,
+    extents_blocks: u16,
+    extents_size: u32,
+    allocated_blocks: u16,
+) -> [u8; 512] {
+    let mut mdb = [0u8; 512];
+    let now = hfs_common::hfs_now();
+    BigEndian::write_u16(&mut mdb[0..2], HFS_SIGNATURE);
+    BigEndian::write_u32(&mut mdb[2..6], now); // drCrDate
+    BigEndian::write_u32(&mut mdb[6..10], now); // drLsMod
+    BigEndian::write_u16(&mut mdb[14..16], 3); // drVBMSt = bitmap sector
+    BigEndian::write_u16(&mut mdb[18..20], total_blocks); // drNmAlBlks
+    BigEndian::write_u32(&mut mdb[20..24], block_size); // drAlBlkSiz
+    BigEndian::write_u32(&mut mdb[24..28], 4 * block_size); // drClpSiz
+    BigEndian::write_u16(&mut mdb[28..30], first_alloc_block); // drAlBlSt
+    BigEndian::write_u32(&mut mdb[30..34], 16); // drNxtCNID
+    BigEndian::write_u16(&mut mdb[34..36], total_blocks - allocated_blocks); // drFreeBks
+    mdb[36] = name_raw.len() as u8;
+    mdb[37..37 + name_raw.len()].copy_from_slice(name_raw);
+    BigEndian::write_u32(&mut mdb[74..78], extents_size); // drXTClpSiz
+    BigEndian::write_u32(&mut mdb[78..82], catalog_size); // drCTClpSiz
+                                                          // drFilCnt (84..88) and drDirCnt (88..92) both 0: no files and no
+                                                          // non-root directories on a fresh volume. (HFS drDirCnt excludes the
+                                                          // root directory — see hfs_fsck.rs.)
+    BigEndian::write_u32(&mut mdb[130..134], extents_size); // drXTFlSize
+    BigEndian::write_u16(&mut mdb[134..136], extents_start);
+    BigEndian::write_u16(&mut mdb[136..138], extents_blocks);
+    BigEndian::write_u32(&mut mdb[146..150], catalog_size); // drCTFlSize
+    BigEndian::write_u16(&mut mdb[150..152], catalog_start);
+    BigEndian::write_u16(&mut mdb[152..154], catalog_blocks);
+    mdb
 }
 
 impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
@@ -2354,6 +2779,41 @@ impl<R: Read + Seek> Read for CompactHfsReader<R> {
 // --- Resize and validation functions ---
 
 /// Resize an HFS filesystem in place.
+/// Probe a classic HFS volume and return the maximum size (bytes) it can be
+/// grown to in-place, given its allocation block size and Volume Bitmap
+/// capacity. Returns `None` if the partition doesn't start with a valid HFS
+/// MDB (e.g. it's HFS+, HFSX, or something else).
+///
+/// The ceiling is `min(65535 blocks, VBM bit capacity) * block_size + overhead`.
+/// Growing beyond this requires reformatting with a larger block size.
+pub fn hfs_max_growable_size(
+    device: &mut (impl Read + Seek),
+    partition_offset: u64,
+) -> Option<u64> {
+    device.seek(SeekFrom::Start(partition_offset + 1024)).ok()?;
+    let mut sector = [0u8; 512];
+    device.read_exact(&mut sector).ok()?;
+
+    let sig = BigEndian::read_u16(&sector[0..2]);
+    if sig != HFS_SIGNATURE {
+        return None;
+    }
+
+    let block_size = BigEndian::read_u32(&sector[20..24]) as u64;
+    let vbm_start = BigEndian::read_u16(&sector[14..16]) as u64;
+    let first_alloc = BigEndian::read_u16(&sector[28..30]) as u64;
+
+    if block_size == 0 || first_alloc <= vbm_start {
+        return None;
+    }
+
+    let vbm_capacity = (first_alloc - vbm_start) * 512 * 8;
+    let max_blocks = vbm_capacity.min(u16::MAX as u64);
+    let overhead = first_alloc * 512;
+
+    Some(max_blocks * block_size + overhead)
+}
+
 pub fn resize_hfs_in_place(
     device: &mut (impl Read + Write + Seek),
     partition_offset: u64,
@@ -2376,11 +2836,55 @@ pub fn resize_hfs_in_place(
     let block_size = BigEndian::read_u32(&sector[20..24]);
     let old_total = BigEndian::read_u16(&sector[18..20]);
     let free_blocks = BigEndian::read_u16(&sector[34..36]);
+    let vbm_start = BigEndian::read_u16(&sector[14..16]);
     let first_alloc = BigEndian::read_u16(&sector[28..30]);
     let used_blocks = old_total - free_blocks;
 
+    // Volume Bitmap lives in sectors [vbm_start, first_alloc) and holds 1 bit
+    // per allocation block. If new_total exceeds that bit capacity, the OS
+    // would walk allocation blocks not represented in the VBM.
+    let vbm_capacity_blocks = if first_alloc > vbm_start {
+        (first_alloc - vbm_start) as u64 * 512 * 8
+    } else {
+        0
+    };
+
     let overhead = first_alloc as u64 * 512;
-    let new_total = ((new_size_bytes - overhead) / block_size as u64) as u16;
+    if new_size_bytes <= overhead {
+        anyhow::bail!(
+            "HFS resize: new size {} bytes <= overhead {} bytes",
+            new_size_bytes,
+            overhead
+        );
+    }
+    let new_total_u64 = (new_size_bytes - overhead) / block_size as u64;
+
+    // drNmAlBlks is a u16 — 65535 allocation blocks is the hard HFS ceiling.
+    // Silently truncating here would write a bogus block count to the MDB.
+    if new_total_u64 > u16::MAX as u64 {
+        let max_bytes = u16::MAX as u64 * block_size as u64 + overhead;
+        anyhow::bail!(
+            "HFS resize: requested size {} MB needs {} allocation blocks at {}-byte blocks, \
+             but HFS caps at 65535 blocks (max {} MB for this volume). \
+             Growing further would require reformatting with a larger allocation block size.",
+            new_size_bytes / 1024 / 1024,
+            new_total_u64,
+            block_size,
+            max_bytes / 1024 / 1024,
+        );
+    }
+    if new_total_u64 > vbm_capacity_blocks {
+        anyhow::bail!(
+            "HFS resize: requested {} allocation blocks exceeds the Volume Bitmap capacity \
+             ({} blocks) for this volume. The VBM lives in fixed sectors [{}..{}) and cannot \
+             be grown without reformatting.",
+            new_total_u64,
+            vbm_capacity_blocks,
+            vbm_start,
+            first_alloc,
+        );
+    }
+    let new_total = new_total_u64 as u16;
 
     if new_total < used_blocks {
         anyhow::bail!(
@@ -2549,6 +3053,39 @@ mod tests {
     fn test_utf8_to_mac_roman_unencodable() {
         let text = "\u{4E2D}"; // Chinese character — not in Mac Roman
         assert!(utf8_to_mac_roman(text).is_err());
+    }
+
+    #[test]
+    fn test_resize_hfs_rejects_u16_overflow() {
+        // Build a minimal 500 MB HFS-like image with 8192-byte blocks. The u16
+        // ceiling at this block size is 65535 * 8192 = ~512 MB, so a 2047 MB
+        // resize request must bail (not silently truncate via `as u16`).
+        let mut sector = [0u8; 512];
+        BigEndian::write_u16(&mut sector[0..2], HFS_SIGNATURE);
+        BigEndian::write_u16(&mut sector[14..16], 3); // vbm_st
+        BigEndian::write_u16(&mut sector[18..20], 64110); // drNmAlBlks
+        BigEndian::write_u32(&mut sector[20..24], 8192); // drAlBlkSiz
+        BigEndian::write_u16(&mut sector[28..30], 19); // drAlBlSt
+        BigEndian::write_u16(&mut sector[34..36], 31423); // drFreeBks
+
+        // Pad image to ~512 MB so the seek to the (would-be) backup MDB is valid
+        // for the old size; the resize should bail before writing anyway.
+        let mut img = vec![0u8; 512 * 1024 * 1024];
+        img[1024..1024 + 512].copy_from_slice(&sector);
+
+        let mut cursor = Cursor::new(img);
+        let res = resize_hfs_in_place(
+            &mut cursor,
+            0,
+            2047 * 1024 * 1024, // would need ~262016 blocks, overflows u16
+            &mut |_| {},
+        );
+        let err = res.expect_err("resize should have bailed on u16 overflow");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("65535") || msg.contains("u16") || msg.contains("Volume Bitmap"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]
@@ -3313,6 +3850,371 @@ mod tests {
             result.errors.is_empty(),
             "post-repair check found errors: {:?}",
             error_msgs
+        );
+    }
+
+    /// Blank-volume builder round-trip: open, fsck-clean, create a file,
+    /// re-open, read back. Runs across the four block sizes called out in
+    /// docs/hfs_expand_block_size.md.
+    #[test]
+    fn test_create_blank_hfs_roundtrip() {
+        // (total_size, block_size, label) — sizes chosen to stay well clear
+        // of the u16 block-count ceiling for each block size.
+        let cases: &[(u64, u32, &str)] = &[
+            (1 * 1024 * 1024, 512, "1MB @ 512"),
+            (8 * 1024 * 1024, 4096, "8MB @ 4K"),
+            (64 * 1024 * 1024, 16384, "64MB @ 16K"),
+            (256 * 1024 * 1024, 32768, "256MB @ 32K"),
+        ];
+
+        for (total_size, block_size, label) in cases {
+            let img = create_blank_hfs(*total_size, *block_size, "Fresh")
+                .unwrap_or_else(|e| panic!("{label}: create_blank_hfs failed: {e}"));
+
+            // The image MUST be exactly the requested size (rounded down by
+            // whole allocation blocks, plus MDB sectors). We don't enforce
+            // exact equality — the builder consumes remaining bytes for the
+            // alt MDB — but it must never exceed the requested size.
+            assert!(
+                (img.len() as u64) <= *total_size,
+                "{label}: image {} exceeds requested {}",
+                img.len(),
+                total_size
+            );
+
+            let mut fs = HfsFilesystem::open(Cursor::new(img.clone()), 0)
+                .unwrap_or_else(|e| panic!("{label}: open failed: {e}"));
+            assert_eq!(fs.mdb().block_size, *block_size, "{label}: block_size");
+            assert_eq!(fs.mdb().volume_name, "Fresh", "{label}: volume_name");
+
+            let root = fs.root().unwrap();
+            let entries = fs.list_directory(&root).unwrap();
+            assert!(
+                entries.is_empty(),
+                "{label}: root not empty on fresh volume"
+            );
+
+            let result = fs.fsck().unwrap();
+            assert!(
+                result.errors.is_empty(),
+                "{label}: fsck errors: {:?}",
+                result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+            );
+
+            // create_file + sync + re-open + read-back
+            let mut backing = img;
+            {
+                let mut fs = HfsFilesystem::open(Cursor::new(&mut backing), 0).unwrap();
+                let root = fs.root().unwrap();
+                let payload = b"contents".to_vec();
+                let mut src = payload.as_slice();
+                fs.create_file(
+                    &root,
+                    "hello",
+                    &mut src,
+                    payload.len() as u64,
+                    &CreateFileOptions::default(),
+                )
+                .unwrap_or_else(|e| panic!("{label}: create_file failed: {e}"));
+                fs.sync_metadata()
+                    .unwrap_or_else(|e| panic!("{label}: sync_metadata failed: {e}"));
+            }
+            let mut fs = HfsFilesystem::open(Cursor::new(&mut backing), 0).unwrap();
+            let root = fs.root().unwrap();
+            let entries = fs.list_directory(&root).unwrap();
+            assert_eq!(entries.len(), 1, "{label}: expected 1 child after create");
+            assert_eq!(entries[0].name, "hello", "{label}: child name");
+            let data = fs.read_file(&entries[0], 64).unwrap();
+            assert_eq!(data, b"contents", "{label}: file content round-trip");
+
+            let result = fs.fsck().unwrap();
+            assert!(
+                result.errors.is_empty(),
+                "{label}: post-create fsck errors: {:?}",
+                result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// A 2 GB - 1 byte volume at 32 KiB block size sits right under the
+    /// u16 block-count ceiling (65535 blocks). Verify the builder accepts
+    /// it and produces a fsck-clean image.
+    #[test]
+    fn test_create_blank_hfs_near_2gb() {
+        let total = 2u64 * 1024 * 1024 * 1024 - 1;
+        let img = create_blank_hfs(total, 32768, "Near2GB")
+            .expect("create_blank_hfs near 2GB should succeed");
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        assert_eq!(fs.mdb().block_size, 32768);
+        assert!(fs.mdb().total_blocks >= 65000);
+        let result = fs.fsck().unwrap();
+        assert!(
+            result.errors.is_empty(),
+            "fsck errors: {:?}",
+            result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// Block sizes that aren't positive multiples of 512 must be rejected.
+    #[test]
+    fn test_create_blank_hfs_rejects_bad_block_size() {
+        assert!(create_blank_hfs(1 << 20, 0, "X").is_err());
+        assert!(create_blank_hfs(1 << 20, 500, "X").is_err());
+        assert!(create_blank_hfs(1 << 20, 513, "X").is_err());
+    }
+
+    // --- Step 4: Finder-metadata setter round-trip tests ---
+
+    /// Create a file on the test image and return (fs, file_entry).
+    fn make_fs_with_file() -> (HfsFilesystem<Cursor<Vec<u8>>>, FileEntry) {
+        let img = make_editable_hfs_image();
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let data = b"hello";
+        let mut r = Cursor::new(data.as_slice());
+        let fe = fs
+            .create_file(
+                &root,
+                "thing.bin",
+                &mut r,
+                data.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        (fs, fe)
+    }
+
+    #[test]
+    fn test_hfs_set_finder_info_round_trip() {
+        let (mut fs, fe) = make_fs_with_file();
+        let mut finfo = [0u8; 16];
+        finfo[0..4].copy_from_slice(b"APPL");
+        finfo[4..8].copy_from_slice(b"MACS");
+        BigEndian::write_u16(&mut finfo[8..10], 0x4000); // fdFlags kHasBeenInited
+        BigEndian::write_i16(&mut finfo[10..12], 100); // fdLocation.v
+        BigEndian::write_i16(&mut finfo[12..14], 200); // fdLocation.h
+        BigEndian::write_u16(&mut finfo[14..16], 0x1234); // fdFldr
+        let mut fxinfo = [0u8; 16];
+        BigEndian::write_u16(&mut fxinfo[0..2], 0xABCD); // fdIconID
+        fxinfo[8] = 0x55; // fdScript
+        BigEndian::write_u32(&mut fxinfo[12..16], 0xDEADBEEF); // fdPutAway
+
+        fs.set_finder_info(&fe, finfo, fxinfo).unwrap();
+
+        let rec = fs.locate_record_data(fe.location as u32).unwrap();
+        assert_eq!(&fs.catalog_data[rec + 4..rec + 20], &finfo);
+        assert_eq!(&fs.catalog_data[rec + 56..rec + 72], &fxinfo);
+    }
+
+    #[test]
+    fn test_hfs_set_finder_info_rejects_directory() {
+        let img = make_editable_hfs_image();
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let dir = fs
+            .create_directory(&root, "Dir", &CreateDirectoryOptions::default())
+            .unwrap();
+        let err = fs.set_finder_info(&dir, [0u8; 16], [0u8; 16]).unwrap_err();
+        assert!(matches!(err, FilesystemError::InvalidData(_)));
+    }
+
+    #[test]
+    fn test_hfs_set_directory_finder_info_round_trip() {
+        let img = make_editable_hfs_image();
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let dir = fs
+            .create_directory(&root, "Apps", &CreateDirectoryOptions::default())
+            .unwrap();
+
+        let mut dinfo = [0u8; 16];
+        BigEndian::write_i16(&mut dinfo[0..2], 10); // frRect top
+        BigEndian::write_i16(&mut dinfo[2..4], 20); // frRect left
+        BigEndian::write_i16(&mut dinfo[4..6], 300); // frRect bottom
+        BigEndian::write_i16(&mut dinfo[6..8], 400); // frRect right
+        BigEndian::write_u16(&mut dinfo[8..10], 0x0100); // frFlags
+        let mut dxinfo = [0u8; 16];
+        BigEndian::write_i16(&mut dxinfo[0..2], -5); // frScroll.v
+        BigEndian::write_i16(&mut dxinfo[2..4], -7); // frScroll.h
+        BigEndian::write_u32(&mut dxinfo[4..8], 0xCAFEBABE); // frOpenChain
+
+        fs.set_directory_finder_info(&dir, dinfo, dxinfo).unwrap();
+
+        let rec = fs.locate_record_data(dir.location as u32).unwrap();
+        assert_eq!(&fs.catalog_data[rec + 22..rec + 38], &dinfo);
+        assert_eq!(&fs.catalog_data[rec + 38..rec + 54], &dxinfo);
+    }
+
+    #[test]
+    fn test_hfs_set_directory_finder_info_rejects_file() {
+        let (mut fs, fe) = make_fs_with_file();
+        let err = fs
+            .set_directory_finder_info(&fe, [0u8; 16], [0u8; 16])
+            .unwrap_err();
+        assert!(matches!(err, FilesystemError::InvalidData(_)));
+    }
+
+    #[test]
+    fn test_hfs_set_dates_file() {
+        let (mut fs, fe) = make_fs_with_file();
+        let create = 0x1000_0001u32;
+        let modify = 0x2000_0002u32;
+        let backup = 0x3000_0003u32;
+        fs.set_dates(&fe, create, modify, backup).unwrap();
+
+        let rec = fs.locate_record_data(fe.location as u32).unwrap();
+        assert_eq!(
+            BigEndian::read_u32(&fs.catalog_data[rec + 44..rec + 48]),
+            create
+        );
+        assert_eq!(
+            BigEndian::read_u32(&fs.catalog_data[rec + 48..rec + 52]),
+            modify
+        );
+        assert_eq!(
+            BigEndian::read_u32(&fs.catalog_data[rec + 52..rec + 56]),
+            backup
+        );
+    }
+
+    #[test]
+    fn test_hfs_set_dates_directory() {
+        let img = make_editable_hfs_image();
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let dir = fs
+            .create_directory(&root, "D", &CreateDirectoryOptions::default())
+            .unwrap();
+
+        let create = 0xAAAAu32;
+        let modify = 0xBBBBu32;
+        let backup = 0xCCCCu32;
+        fs.set_dates(&dir, create, modify, backup).unwrap();
+
+        let rec = fs.locate_record_data(dir.location as u32).unwrap();
+        assert_eq!(
+            BigEndian::read_u32(&fs.catalog_data[rec + 10..rec + 14]),
+            create
+        );
+        assert_eq!(
+            BigEndian::read_u32(&fs.catalog_data[rec + 14..rec + 18]),
+            modify
+        );
+        assert_eq!(
+            BigEndian::read_u32(&fs.catalog_data[rec + 18..rec + 22]),
+            backup
+        );
+    }
+
+    #[test]
+    fn test_hfs_set_file_locked_toggle() {
+        let (mut fs, fe) = make_fs_with_file();
+        let rec = fs.locate_record_data(fe.location as u32).unwrap();
+        let initial = fs.catalog_data[rec + 2];
+        assert_eq!(initial & 0x01, 0);
+
+        fs.set_file_locked(&fe, true).unwrap();
+        let rec = fs.locate_record_data(fe.location as u32).unwrap();
+        assert_eq!(fs.catalog_data[rec + 2] & 0x01, 0x01);
+
+        fs.set_file_locked(&fe, false).unwrap();
+        let rec = fs.locate_record_data(fe.location as u32).unwrap();
+        assert_eq!(fs.catalog_data[rec + 2] & 0x01, 0);
+    }
+
+    #[test]
+    fn test_hfs_set_file_locked_rejects_directory() {
+        let img = make_editable_hfs_image();
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let dir = fs
+            .create_directory(&root, "Dir", &CreateDirectoryOptions::default())
+            .unwrap();
+        let err = fs.set_file_locked(&dir, true).unwrap_err();
+        assert!(matches!(err, FilesystemError::InvalidData(_)));
+    }
+
+    #[test]
+    fn test_hfs_set_volume_dates_persists_through_sync() {
+        let img = make_editable_hfs_image();
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+
+        let create = 0x4242_4242u32;
+        let modify = 0x5151_5151u32;
+        let backup = 0x6060_6060u32;
+        fs.set_volume_dates(create, modify, backup);
+        fs.sync_metadata().unwrap();
+
+        assert_eq!(fs.mdb.create_date, create);
+        assert_eq!(fs.mdb.modify_date, modify);
+        assert_eq!(BigEndian::read_u32(&fs.mdb.raw_sector[64..68]), backup);
+
+        // Round-trip through disk: the on-disk MDB must preserve these bytes.
+        let bytes = fs.reader.get_ref().clone();
+        let mut fs2 = HfsFilesystem::open(Cursor::new(bytes), 0).unwrap();
+        assert_eq!(fs2.mdb.create_date, create);
+        assert_eq!(fs2.mdb.modify_date, modify);
+        assert_eq!(BigEndian::read_u32(&fs2.mdb.raw_sector[64..68]), backup);
+
+        // No pending dates → sync stamps modify_date to hfs_now (different from `modify`).
+        fs2.sync_metadata().unwrap();
+        assert_ne!(fs2.mdb.modify_date, modify);
+    }
+
+    #[test]
+    fn test_hfs_set_boot_blocks_written_on_sync() {
+        let img = make_editable_hfs_image();
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let mut bb = [0u8; 1024];
+        bb[0] = 0x4C; // 'LK' HFS boot signature
+        bb[1] = 0x4B;
+        for (i, slot) in bb.iter_mut().enumerate().skip(2).take(200) {
+            *slot = (i & 0xFF) as u8;
+        }
+        fs.set_boot_blocks(&bb);
+        fs.sync_metadata().unwrap();
+
+        let read_back = fs.read_boot_blocks().unwrap();
+        assert_eq!(&read_back[..], &bb[..]);
+    }
+
+    #[test]
+    fn test_hfs_set_volume_finder_info_round_trip() {
+        let img = make_editable_hfs_image();
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+
+        let mut fi = [0u8; 32];
+        BigEndian::write_u32(&mut fi[0..4], 100); // blessed folder CNID
+        BigEndian::write_u32(&mut fi[12..16], 200); // OS folder CNID (drFndrInfo[3])
+        BigEndian::write_u32(&mut fi[20..24], 300); // drFndrInfo[5]
+        fs.set_volume_finder_info(&fi);
+        assert_eq!(fs.mdb.finder_info[0], 100);
+        assert_eq!(fs.mdb.finder_info[3], 200);
+        assert_eq!(fs.mdb.finder_info[5], 300);
+
+        fs.sync_metadata().unwrap();
+        let bytes = fs.reader.get_ref().clone();
+        let fs2 = HfsFilesystem::open(Cursor::new(bytes), 0).unwrap();
+        assert_eq!(fs2.mdb.finder_info[0], 100);
+        assert_eq!(fs2.mdb.finder_info[3], 200);
+        assert_eq!(fs2.mdb.finder_info[5], 300);
+    }
+
+    #[test]
+    fn test_hfs_finder_info_setters_survive_fsck() {
+        // Ensure setters don't produce structural corruption.
+        let (mut fs, fe) = make_fs_with_file();
+        fs.set_finder_info(&fe, [0x11; 16], [0x22; 16]).unwrap();
+        fs.set_dates(&fe, 1, 2, 3).unwrap();
+        fs.set_file_locked(&fe, true).unwrap();
+        fs.set_volume_dates(10, 20, 30);
+        fs.set_volume_finder_info(&[0x33; 32]);
+        fs.sync_metadata().unwrap();
+        let result = fs.fsck().unwrap();
+        assert!(
+            result.errors.is_empty(),
+            "fsck errors: {:?}",
+            result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
         );
     }
 }

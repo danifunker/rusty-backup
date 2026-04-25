@@ -398,6 +398,67 @@ pub fn export_whole_disk_vhd(
         return Ok(());
     }
 
+    // Raw image/device path. If the source has an APM partition table and
+    // there are size overrides, reconstruct with patched APM + per-partition
+    // resize; then append the VHD footer. Otherwise fall back to the MBR /
+    // straight-stream path using BufWriter.
+    if !partition_sizes.is_empty() {
+        let mut probe_reader = BufReader::new(
+            File::open(source_path)
+                .with_context(|| format!("failed to open {}", source_path.display()))?,
+        );
+        if super::detect_raw_apm(&mut probe_reader).is_some() {
+            let file_size = std::fs::metadata(source_path)?.len();
+            // Strip trailing VHD footer if source is itself a VHD file.
+            let source_data_size = {
+                let mut f = File::open(source_path)?;
+                if file_size >= 512 {
+                    f.seek(SeekFrom::End(-512))?;
+                    let mut cookie = [0u8; 8];
+                    f.read_exact(&mut cookie)?;
+                    if &cookie == VHD_COOKIE {
+                        file_size - 512
+                    } else {
+                        file_size
+                    }
+                } else {
+                    file_size
+                }
+            };
+
+            let mut reader = BufReader::new(File::open(source_path)?);
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(dest_path)
+                .with_context(|| format!("failed to create {}", dest_path.display()))?;
+
+            total_written = super::reconstruct_raw_apm_disk(
+                &mut reader,
+                source_data_size,
+                &mut file,
+                partition_sizes,
+                &mut progress_cb,
+                &cancel_check,
+                &mut log_cb,
+            )?;
+
+            let footer = build_vhd_footer(total_written);
+            file.write_all(&footer)
+                .context("failed to write VHD footer")?;
+            file.flush()?;
+
+            log_cb(&format!(
+                "VHD export complete: {} ({} data bytes + 512 byte footer, APM reconstructed)",
+                dest_path.display(),
+                total_written,
+            ));
+            return Ok(());
+        }
+    }
+
     // Raw image/device path — use BufWriter for streaming
     let mut writer = BufWriter::new(
         File::create(dest_path)

@@ -801,6 +801,196 @@ fn write_zeros_with_progress(
     Ok(())
 }
 
+/// Detect whether a raw source starts with an Apple Partition Map.
+/// Returns the parsed APM on success, or `None` if the first sector doesn't
+/// have the DDR signature (`ER`) or the map fails to parse.
+pub fn detect_raw_apm(reader: &mut (impl Read + Seek)) -> Option<Apm> {
+    reader.seek(SeekFrom::Start(0)).ok()?;
+    let mut ddr = [0u8; 4];
+    reader.read_exact(&mut ddr).ok()?;
+    if &ddr[0..2] != b"ER" {
+        return None;
+    }
+    reader.seek(SeekFrom::Start(0)).ok()?;
+    Apm::parse(reader).ok()
+}
+
+/// Reconstruct a raw APM disk with partition size overrides applied.
+///
+/// For a raw source image (e.g. `.hda`, `.img`) whose first sector is an
+/// Apple Driver Descriptor Record, this parses the APM, patches partition
+/// entries via [`Apm::patch_for_restore`], writes the patched DDR + entries,
+/// then copies each partition's data from its original source position to
+/// its new destination position, zero-filling any gaps.
+///
+/// HFS partitions that are resized get their MDB updated in-place on the
+/// destination via `resize_hfs_in_place`. HFS+/HFSX resize would go through
+/// `resize_hfsplus_in_place` the same way — added opportunistically.
+///
+/// Returns the total number of bytes written.
+pub fn reconstruct_raw_apm_disk(
+    reader: &mut (impl Read + Seek),
+    source_data_size: u64,
+    writer: &mut (impl Read + Write + Seek),
+    partition_sizes: &[PartitionSizeOverride],
+    progress_cb: &mut impl FnMut(u64),
+    cancel_check: &impl Fn() -> bool,
+    log_cb: &mut impl FnMut(&str),
+) -> Result<u64> {
+    let apm = Apm::parse(reader).context("failed to parse APM from source")?;
+    let block_size = apm.ddr.block_size as u64;
+    if block_size == 0 {
+        bail!("APM DDR has zero block size");
+    }
+
+    // Determine target DDR block count: the farthest partition end across
+    // patched entries, or the source's original block count if larger.
+    let mut max_end: u64 = apm.ddr.block_count as u64;
+    for entry in &apm.entries {
+        let entry_lba = entry.start_block as u64 * block_size / 512;
+        if let Some(ov) = partition_sizes.iter().find(|o| o.start_lba == entry_lba) {
+            let new_start_lba = ov.effective_start_lba();
+            let new_start_block = new_start_lba * 512 / block_size;
+            let new_blocks = ov.export_size / block_size;
+            max_end = max_end.max(new_start_block + new_blocks);
+        } else {
+            max_end = max_end.max(entry.start_block as u64 + entry.block_count as u64);
+        }
+    }
+    let target_block_count: u32 = max_end
+        .try_into()
+        .context("APM target block count exceeds u32")?;
+
+    let patched = apm.patch_for_restore(partition_sizes, target_block_count);
+    let apm_blocks = patched.build_apm_blocks(Some(target_block_count));
+
+    writer.seek(SeekFrom::Start(0))?;
+    writer.write_all(&apm_blocks)?;
+    let mut total_written: u64 = apm_blocks.len() as u64;
+    progress_cb(total_written);
+    log_cb(&format!(
+        "Wrote patched APM: DDR + {} entries, target block count {} ({} MB)",
+        patched.entries.len(),
+        target_block_count,
+        target_block_count as u64 * block_size / 1024 / 1024
+    ));
+
+    // Build a write plan: for each entry, (source_lba, dest_lba, copy_size, export_size, is_hfs).
+    struct PartPlan {
+        source_lba: u64,
+        dest_lba: u64,
+        copy_size: u64,
+        export_size: u64,
+        name: String,
+        partition_type: String,
+    }
+    let mut plans: Vec<PartPlan> = Vec::new();
+    for entry in &apm.entries {
+        if entry.partition_type == "Apple_partition_map" {
+            // Already written as part of the APM blocks above.
+            continue;
+        }
+        let entry_lba = entry.start_block as u64 * block_size / 512;
+        let original_size = entry.block_count as u64 * block_size;
+        let (dest_lba, export_size) =
+            if let Some(ov) = partition_sizes.iter().find(|o| o.start_lba == entry_lba) {
+                (ov.effective_start_lba(), ov.export_size)
+            } else {
+                (entry_lba, original_size)
+            };
+        plans.push(PartPlan {
+            source_lba: entry_lba,
+            dest_lba,
+            copy_size: original_size.min(export_size),
+            export_size,
+            name: entry.name.clone(),
+            partition_type: entry.partition_type.clone(),
+        });
+    }
+    plans.sort_by_key(|p| p.dest_lba);
+
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    for plan in &plans {
+        if cancel_check() {
+            bail!("export cancelled");
+        }
+
+        let dest_offset = plan.dest_lba * 512;
+        if total_written < dest_offset {
+            let gap = dest_offset - total_written;
+            write_zeros_with_progress(writer, gap, 0, &mut |_| {})?;
+            total_written += gap;
+            progress_cb(total_written);
+        } else if total_written > dest_offset {
+            bail!(
+                "APM export: partition {} at dest {} overlaps earlier data (already wrote {})",
+                plan.name,
+                dest_offset,
+                total_written
+            );
+        }
+
+        // Copy original partition data from the source.
+        let source_offset = plan.source_lba * 512;
+        let copy_bound = plan
+            .copy_size
+            .min(source_data_size.saturating_sub(source_offset));
+        reader.seek(SeekFrom::Start(source_offset))?;
+        let mut remaining = copy_bound;
+        while remaining > 0 {
+            if cancel_check() {
+                bail!("export cancelled");
+            }
+            let to_read = (remaining as usize).min(CHUNK_SIZE);
+            let n = reader
+                .read(&mut buf[..to_read])
+                .context("failed to read partition data")?;
+            if n == 0 {
+                break;
+            }
+            writer
+                .write_all(&buf[..n])
+                .context("failed to write partition data")?;
+            total_written += n as u64;
+            remaining -= n as u64;
+            progress_cb(total_written);
+        }
+
+        // Zero-fill growth region (if the partition grew).
+        if plan.export_size > plan.copy_size {
+            let extra = plan.export_size - plan.copy_size;
+            write_zeros_with_progress(writer, extra, 0, &mut |_| {})?;
+            total_written += extra;
+            progress_cb(total_written);
+        }
+
+        // For HFS partitions that grew, update the MDB in-place on the dest.
+        if plan.partition_type == "Apple_HFS" && plan.export_size != plan.copy_size {
+            let part_offset = plan.dest_lba * 512;
+            writer.seek(SeekFrom::Start(0))?; // ensure writer is flushed/synced
+            match crate::fs::resize_hfs_in_place(writer, part_offset, plan.export_size, &mut |m| {
+                log_cb(&format!("  [hfs] {m}"))
+            }) {
+                Ok(()) => log_cb(&format!(
+                    "Resized HFS in partition '{}' to {} MB",
+                    plan.name,
+                    plan.export_size / 1024 / 1024
+                )),
+                Err(e) => {
+                    log_cb(&format!(
+                        "HFS resize failed for partition '{}': {e}. Note: HFS+ / wrapped-HFS+ \
+                         volumes can share the Apple_HFS type and aren't resized here.",
+                        plan.name
+                    ));
+                }
+            }
+            writer.seek(SeekFrom::Start(total_written))?;
+        }
+    }
+
+    Ok(total_written)
+}
+
 /// Check if a byte slice is entirely zeros.
 pub(crate) fn is_all_zeros(data: &[u8]) -> bool {
     data.iter().all(|&b| b == 0)
@@ -1183,6 +1373,130 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use tempfile::TempDir;
+
+    /// Build a minimal APM + classic HFS raw disk image for round-trip testing:
+    /// block 0 = DDR, blocks 1-2 = APM (self-map + HFS), blocks 3+ = HFS data.
+    fn build_apm_hfs_test_disk() -> Vec<u8> {
+        use crate::partition::apm::build_minimal_apm;
+        use byteorder::{BigEndian, ByteOrder};
+
+        // Classic HFS at block 3. Use a tiny volume: 128 alloc blocks × 4096
+        // bytes = 512 KB of data area, plus 3 sectors of overhead
+        // (boot blocks 0-1, MDB 2, bitmap 3, first_alloc_block = 5).
+        let ddr_block_size = 512u32;
+        let hfs_start_block = 3u32; // in DDR blocks (512)
+        let hfs_total_alloc_blocks = 128u16;
+        let hfs_alloc_block_size = 4096u32;
+        let hfs_first_alloc_sec = 5u16;
+        let hfs_size_bytes = hfs_first_alloc_sec as u64 * 512
+            + hfs_total_alloc_blocks as u64 * hfs_alloc_block_size as u64;
+        let hfs_size_blocks = (hfs_size_bytes / ddr_block_size as u64) as u32;
+
+        let total_disk_blocks = hfs_start_block + hfs_size_blocks;
+        let apm = build_minimal_apm(
+            &[("Apple_HFS".to_string(), hfs_start_block, hfs_size_blocks)],
+            ddr_block_size,
+            total_disk_blocks,
+        );
+
+        let mut disk = vec![0u8; total_disk_blocks as usize * ddr_block_size as usize];
+        let apm_bytes = apm.build_apm_blocks(Some(total_disk_blocks));
+        disk[..apm_bytes.len()].copy_from_slice(&apm_bytes);
+
+        // Write a minimal HFS MDB at hfs_start_block * 512 + 1024.
+        let part_offset = hfs_start_block as usize * 512;
+        let mdb_off = part_offset + 1024;
+        BigEndian::write_u16(&mut disk[mdb_off..mdb_off + 2], 0x4244); // HFS signature
+        BigEndian::write_u16(&mut disk[mdb_off + 14..mdb_off + 16], 3); // vbm_st
+        BigEndian::write_u16(
+            &mut disk[mdb_off + 18..mdb_off + 20],
+            hfs_total_alloc_blocks,
+        );
+        BigEndian::write_u32(&mut disk[mdb_off + 20..mdb_off + 24], hfs_alloc_block_size);
+        BigEndian::write_u16(&mut disk[mdb_off + 28..mdb_off + 30], hfs_first_alloc_sec);
+        BigEndian::write_u16(
+            &mut disk[mdb_off + 34..mdb_off + 36],
+            hfs_total_alloc_blocks,
+        ); // all free
+        disk[mdb_off + 36] = 4;
+        disk[mdb_off + 37..mdb_off + 41].copy_from_slice(b"Test");
+
+        disk
+    }
+
+    #[test]
+    fn test_reconstruct_raw_apm_disk_grows_hfs_partition() {
+        use crate::partition::apm::Apm;
+        use crate::partition::PartitionSizeOverride;
+
+        let source = build_apm_hfs_test_disk();
+        let source_size = source.len() as u64;
+
+        // Parse source APM to discover the HFS partition's layout.
+        let mut reader = Cursor::new(source.clone());
+        let apm = Apm::parse(&mut reader).unwrap();
+        let hfs_entry = apm
+            .entries
+            .iter()
+            .find(|e| e.partition_type == "Apple_HFS")
+            .expect("source must have Apple_HFS partition");
+        let block_size = apm.ddr.block_size as u64;
+        let hfs_start_lba = hfs_entry.start_block as u64 * block_size / 512;
+        let original_size = hfs_entry.block_count as u64 * block_size;
+        // Grow by one sector's worth of allocation blocks.
+        let new_size = original_size + 16 * 4096;
+
+        let override_ = PartitionSizeOverride::size_only(0, hfs_start_lba, original_size, new_size);
+
+        // Use a big enough Cursor so in-place writes past source length succeed.
+        let mut dest_buf = vec![0u8; source_size as usize + new_size as usize];
+        let mut writer = Cursor::new(&mut dest_buf);
+
+        let mut reader2 = Cursor::new(source);
+        let mut progress: u64 = 0;
+        let total = reconstruct_raw_apm_disk(
+            &mut reader2,
+            source_size,
+            &mut writer,
+            &[override_],
+            &mut |b| progress = b,
+            &|| false,
+            &mut |_| {},
+        )
+        .unwrap();
+
+        assert!(
+            total >= hfs_start_lba * 512 + new_size,
+            "total={} expected >= {}",
+            total,
+            hfs_start_lba * 512 + new_size
+        );
+
+        // Re-parse the dest APM and confirm the HFS entry grew.
+        let mut dest_reader = Cursor::new(&dest_buf[..total as usize]);
+        let dest_apm = Apm::parse(&mut dest_reader).unwrap();
+        let dest_hfs = dest_apm
+            .entries
+            .iter()
+            .find(|e| e.partition_type == "Apple_HFS")
+            .expect("dest must have Apple_HFS");
+        assert_eq!(
+            dest_hfs.block_count as u64 * block_size,
+            new_size,
+            "patched APM entry should reflect new size"
+        );
+
+        // Confirm the HFS MDB's drNmAlBlks was updated in the dest.
+        use byteorder::{BigEndian, ByteOrder};
+        let part_offset = hfs_start_lba as usize * 512;
+        let mdb_off = part_offset + 1024;
+        let new_total_blocks = BigEndian::read_u16(&dest_buf[mdb_off + 18..mdb_off + 20]);
+        let expected_blocks = ((new_size - 5 * 512) / 4096) as u16;
+        assert_eq!(
+            new_total_blocks, expected_blocks,
+            "HFS MDB drNmAlBlks should be updated to reflect new size"
+        );
+    }
 
     #[test]
     fn test_output_path_no_split() {

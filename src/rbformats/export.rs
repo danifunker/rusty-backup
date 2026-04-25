@@ -327,15 +327,8 @@ pub fn export_whole_disk(
             total_written,
         ));
     } else {
-        // Raw image/device path
-        let mut writer = BufWriter::new(
-            File::create(dest_path)
-                .with_context(|| format!("failed to create {}", dest_path.display()))?,
-        );
-
-        // Write header (2MG only — writes placeholder, patched later)
-        let header_size = format.write_header(&mut writer, 0)?;
-
+        // Raw image/device path.
+        //
         // Unwrap any container (VHD, 2MG, DMG, DiskCopy 4.2, DOS-order .dsk, WOZ)
         // so Raw/2MG exports always emit flat sector data — not the source's header/footer bytes.
         let (mut reader, source_data_size) = {
@@ -346,45 +339,93 @@ pub fn export_whole_disk(
             super::wrap_image_reader(file2, fmt)?
         };
 
-        let mut buf = vec![0u8; CHUNK_SIZE];
-        let mut remaining = source_data_size;
-        while remaining > 0 {
-            if cancel_check() {
-                bail!("export cancelled");
+        // If the source has an APM partition table and the caller supplied
+        // size overrides, reconstruct the disk with patched APM entries and
+        // per-partition resize (currently covers classic HFS). Only Raw
+        // format gets this path — 2MG wrapping APM isn't a realistic case.
+        let apm = if format == ExportFormat::Raw && !partition_sizes.is_empty() {
+            super::detect_raw_apm(&mut reader)
+        } else {
+            None
+        };
+
+        if apm.is_some() {
+            // Open destination with Read+Write+Seek for the APM reconstruction.
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(dest_path)
+                .with_context(|| format!("failed to create {}", dest_path.display()))?;
+
+            total_written = super::reconstruct_raw_apm_disk(
+                &mut reader,
+                source_data_size,
+                &mut file,
+                partition_sizes,
+                &mut progress_cb,
+                &cancel_check,
+                &mut log_cb,
+            )?;
+            file.flush()?;
+
+            log_cb(&format!(
+                "{} export complete: {} ({} data bytes, APM reconstructed)",
+                format.description(),
+                dest_path.display(),
+                total_written,
+            ));
+        } else {
+            // No APM override or non-APM source: stream bytes.
+            let mut writer = BufWriter::new(
+                File::create(dest_path)
+                    .with_context(|| format!("failed to create {}", dest_path.display()))?,
+            );
+
+            // Write header (2MG only — writes placeholder, patched later)
+            let header_size = format.write_header(&mut writer, 0)?;
+
+            let mut buf = vec![0u8; CHUNK_SIZE];
+            let mut remaining = source_data_size;
+            while remaining > 0 {
+                if cancel_check() {
+                    bail!("export cancelled");
+                }
+                let to_read = (remaining as usize).min(CHUNK_SIZE);
+                let n = reader
+                    .read(&mut buf[..to_read])
+                    .context("failed to read source")?;
+                if n == 0 {
+                    break;
+                }
+                writer
+                    .write_all(&buf[..n])
+                    .context("failed to write data")?;
+                total_written += n as u64;
+                remaining -= n as u64;
+                progress_cb(total_written);
             }
-            let to_read = (remaining as usize).min(CHUNK_SIZE);
-            let n = reader
-                .read(&mut buf[..to_read])
-                .context("failed to read source")?;
-            if n == 0 {
-                break;
+
+            writer.flush()?;
+
+            // Patch 2MG header with actual data length
+            if format == ExportFormat::TwoMg {
+                format.patch_header_length(writer.get_mut(), total_written)?;
+                writer.seek(SeekFrom::Start(header_size + total_written))?;
             }
-            writer
-                .write_all(&buf[..n])
-                .context("failed to write data")?;
-            total_written += n as u64;
-            remaining -= n as u64;
-            progress_cb(total_written);
+
+            // Write footer (VHD only — but we already returned for VHD above)
+            format.write_footer(&mut writer, total_written)?;
+            writer.flush()?;
+
+            log_cb(&format!(
+                "{} export complete: {} ({} data bytes)",
+                format.description(),
+                dest_path.display(),
+                total_written,
+            ));
         }
-
-        writer.flush()?;
-
-        // Patch 2MG header with actual data length
-        if format == ExportFormat::TwoMg {
-            format.patch_header_length(writer.get_mut(), total_written)?;
-            writer.seek(SeekFrom::Start(header_size + total_written))?;
-        }
-
-        // Write footer (VHD only — but we already returned for VHD above)
-        format.write_footer(&mut writer, total_written)?;
-        writer.flush()?;
-
-        log_cb(&format!(
-            "{} export complete: {} ({} data bytes)",
-            format.description(),
-            dest_path.display(),
-            total_written,
-        ));
     }
 
     Ok(())

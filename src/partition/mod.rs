@@ -80,6 +80,9 @@ pub struct PartitionInfo {
     pub is_extended_container: bool,
     /// APM partition type string (e.g. "Apple_HFS"). None for MBR/GPT.
     pub partition_type_string: Option<String>,
+    /// Allocation block size in bytes for HFS / HFS+ partitions. `None` for
+    /// non-HFS partitions or when the volume header could not be probed.
+    pub hfs_block_size: Option<u32>,
 }
 
 /// Standard floppy disk image sizes (bytes).
@@ -281,6 +284,7 @@ impl PartitionTable {
                         is_logical: false,
                         is_extended_container: e.is_extended(),
                         partition_type_string: None,
+                        hfs_block_size: None,
                     })
                     .collect();
 
@@ -296,6 +300,7 @@ impl PartitionTable {
                         is_logical: true,
                         is_extended_container: false,
                         partition_type_string: None,
+                        hfs_block_size: None,
                     });
                 }
 
@@ -315,6 +320,7 @@ impl PartitionTable {
                     is_logical: false,
                     is_extended_container: false,
                     partition_type_string: Some(e.type_guid.to_string_formatted()),
+                    hfs_block_size: None,
                 })
                 .collect(),
             PartitionTable::Apm(apm) => {
@@ -333,6 +339,7 @@ impl PartitionTable {
                         is_logical: false,
                         is_extended_container: false,
                         partition_type_string: Some(e.partition_type.clone()),
+                        hfs_block_size: None,
                     })
                     .collect()
             }
@@ -350,6 +357,7 @@ impl PartitionTable {
                     is_logical: false,
                     is_extended_container: false,
                     partition_type_string: None,
+                    hfs_block_size: None,
                 }]
             }
         }

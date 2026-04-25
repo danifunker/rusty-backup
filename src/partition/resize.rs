@@ -576,6 +576,7 @@ mod tests {
                     is_logical,
                     is_extended_container: false,
                     partition_type_string: None,
+                    hfs_block_size: None,
                 },
             )
             .collect()

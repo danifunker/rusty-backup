@@ -11,6 +11,7 @@ use rusty_backup::clonezilla;
 use rusty_backup::clonezilla::metadata::ClonezillaImage;
 use rusty_backup::device::DiskDevice;
 use rusty_backup::fs::fat::resize_fat_in_place;
+use rusty_backup::fs::hfs_max_growable_size;
 use rusty_backup::partition::editor::{self as pt_editor, PartitionTableEdit};
 use rusty_backup::partition::PartitionSizeOverride;
 use rusty_backup::partition::{
@@ -180,6 +181,11 @@ struct PartitionExportConfig {
     type_name: String,
     original_size: u64,
     minimum_size: u64,
+    /// Upper bound (bytes) on this partition's export size. For classic HFS
+    /// this reflects the 65535-block / Volume Bitmap ceiling, so the user
+    /// can't request a resize that would corrupt the MDB. `None` means no
+    /// filesystem-specific cap.
+    max_size: Option<u64>,
     choice: ExportSizeChoice,
     custom_size_mib: u32,
 }
@@ -1232,6 +1238,15 @@ impl InspectTab {
 
     fn init_export_configs(&mut self) {
         self.export_partition_configs.clear();
+
+        // Open the source once so we can probe HFS partitions for their
+        // block-size-dependent max growable size.
+        let mut source_reader: Option<BufReader<File>> = self
+            .image_file_path
+            .as_ref()
+            .and_then(|p| File::open(p).ok())
+            .map(BufReader::new);
+
         for part in &self.partitions {
             if part.is_extended_container {
                 continue;
@@ -1249,11 +1264,31 @@ impl InspectTab {
                 .or_else(|| self.partition_min_sizes.get(&part.index).copied())
                 .unwrap_or(part.size_bytes);
 
+            // Probe classic HFS to find the u16/VBM ceiling. Only relevant for
+            // "Apple_HFS" APM partitions (which may actually be HFS, HFS+, or
+            // wrapped HFS+ — hfs_max_growable_size returns None for the
+            // non-classic cases). For other filesystem types, no cap.
+            let max_size = if let Some(reader) = source_reader.as_mut() {
+                let is_hfs_candidate = part
+                    .partition_type_string
+                    .as_deref()
+                    .map(|s| s.eq_ignore_ascii_case("Apple_HFS"))
+                    .unwrap_or(false);
+                if is_hfs_candidate {
+                    hfs_max_growable_size(reader, part.start_lba * 512)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             self.export_partition_configs.push(PartitionExportConfig {
                 index: part.index,
                 type_name: part.type_name.clone(),
                 original_size: part.size_bytes,
                 minimum_size: min_size,
+                max_size,
                 choice: ExportSizeChoice::Original,
                 custom_size_mib: (part.size_bytes / (1024 * 1024)) as u32,
             });
@@ -1354,12 +1389,25 @@ impl InspectTab {
 
                                 if cfg.choice == ExportSizeChoice::Custom {
                                     let min_mib = (cfg.minimum_size / (1024 * 1024)).max(1) as u32;
-                                    // Allow growing beyond original (up to 2 TiB VHD max)
-                                    let max_mib = 2_097_152u32;
-                                    ui.add(
+                                    // Default ceiling: 2 TiB (VHD max). Classic HFS volumes
+                                    // carry a per-volume cap from their allocation block size
+                                    // (u16 block count), so respect that when we've probed it.
+                                    let max_mib = cfg
+                                        .max_size
+                                        .map(|b| (b / (1024 * 1024)).max(min_mib as u64) as u32)
+                                        .unwrap_or(2_097_152u32);
+                                    let resp = ui.add(
                                         egui::DragValue::new(&mut cfg.custom_size_mib)
                                             .range(min_mib..=max_mib),
                                     );
+                                    if cfg.max_size.is_some() {
+                                        resp.on_hover_text(format!(
+                                            "HFS volumes are capped at 65535 allocation blocks. \
+                                             For this volume's block size, the maximum is {} MiB. \
+                                             Growing further requires reformatting.",
+                                            max_mib
+                                        ));
+                                    }
                                 } else {
                                     ui.label(format!("{}", cfg.effective_size() / (1024 * 1024)));
                                 }
@@ -2049,6 +2097,7 @@ impl InspectTab {
                         is_logical: p.is_logical,
                         is_extended_container: false,
                         partition_type_string: p.partition_type_string.clone(),
+                        hfs_block_size: None,
                     }
                 })
                 .collect();
@@ -2104,6 +2153,7 @@ impl InspectTab {
                     is_logical: true,
                     is_extended_container: false,
                     partition_type_string: pm.partition_type_string.clone(),
+                    hfs_block_size: None,
                 });
                 added += 1;
             }
@@ -2277,6 +2327,36 @@ impl InspectTab {
                         }
                     }
 
+                    // Probe HFS/HFS+ partitions for their allocation block size
+                    // so the inspect grid can show it. Covers APM Apple_HFS,
+                    // MBR type 0xAF, and HFS/HFS+ superfloppies.
+                    for part in &mut partitions {
+                        if part.is_extended_container {
+                            continue;
+                        }
+                        let is_hfs_apm = part
+                            .partition_type_string
+                            .as_deref()
+                            .map(|s| s.eq_ignore_ascii_case("Apple_HFS"))
+                            .unwrap_or(false);
+                        let is_hfs_mbr = part.partition_type_byte == 0xAF;
+                        let is_hfs_superfloppy = matches!(
+                            &table,
+                            PartitionTable::None { fs_hint, .. }
+                                if fs_hint == "HFS" || fs_hint == "HFS+"
+                        );
+                        if !(is_hfs_apm || is_hfs_mbr || is_hfs_superfloppy) {
+                            continue;
+                        }
+                        if let Ok(f) = device_file.try_clone() {
+                            let mut br = BufReader::new(f);
+                            part.hfs_block_size = rusty_backup::fs::hfs_block_size_at_offset(
+                                &mut br,
+                                part.start_lba * 512,
+                            );
+                        }
+                    }
+
                     if matches!(table, PartitionTable::None { .. }) {
                         push_log(format!(
                             "Detected superfloppy (no partition table) with {} partition(s)",
@@ -2404,6 +2484,7 @@ impl InspectTab {
                         is_logical: p.is_logical,
                         is_extended_container: p.is_extended,
                         partition_type_string: None,
+                        hfs_block_size: None,
                     })
                     .collect();
 
@@ -2609,6 +2690,7 @@ impl InspectTab {
                 if self.backup_metadata.is_some() || !self.partition_min_sizes.is_empty() {
                     ui.label(egui::RichText::new("Min Size").strong());
                 }
+                ui.label(egui::RichText::new("Block Size").strong());
                 ui.label(egui::RichText::new("Boot").strong());
                 ui.label(egui::RichText::new("").strong());
                 ui.end_row();
@@ -2655,6 +2737,7 @@ impl InspectTab {
                         }
                         ui.label("");
                         ui.label("");
+                        ui.label("");
                     } else {
                         ui.label(index_label);
                         ui.label(&part.type_name);
@@ -2695,6 +2778,11 @@ impl InspectTab {
                             } else {
                                 ui.label("");
                             }
+                        }
+                        if let Some(bs) = part.hfs_block_size {
+                            ui.label(format_block_size(bs));
+                        } else {
+                            ui.label("");
                         }
                         ui.label(if part.bootable { "Yes" } else { "" });
                         if is_browsable_type(part.partition_type_byte)
@@ -3700,6 +3788,16 @@ fn format_size_decimal(bytes: u64) -> String {
 /// Currently only classic HFS (0xAF or APM "Apple_HFS").
 fn is_checkable_type(ptype: u8, type_str: Option<&str>) -> bool {
     ptype == 0xAF || matches!(type_str, Some("Apple_HFS"))
+}
+
+/// Format an HFS allocation block size as "N KiB" when it's a whole
+/// number of kibibytes, else "N B".
+fn format_block_size(bytes: u32) -> String {
+    if bytes >= 1024 && bytes % 1024 == 0 {
+        format!("{} KiB", bytes / 1024)
+    } else {
+        format!("{} B", bytes)
+    }
 }
 
 /// Format a byte count with digit grouping for readability

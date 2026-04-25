@@ -6,6 +6,7 @@ pub mod fat;
 pub mod filesystem;
 pub mod fsck;
 pub mod hfs;
+pub mod hfs_clone;
 pub(crate) mod hfs_common;
 pub mod hfs_fsck;
 pub mod hfsplus;
@@ -35,7 +36,8 @@ pub use filesystem::{
 use filesystem::{Filesystem, FilesystemError};
 pub use fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry, RepairReport};
 pub use hfs::{
-    patch_hfs_hidden_sectors, resize_hfs_in_place, validate_hfs_integrity, CompactHfsReader,
+    hfs_max_growable_size, patch_hfs_hidden_sectors, resize_hfs_in_place, validate_hfs_integrity,
+    CompactHfsReader,
 };
 pub use hfsplus::{
     patch_hfsplus_hidden_sectors, resize_hfsplus_in_place, validate_hfsplus_integrity,
@@ -854,6 +856,39 @@ fn resolve_apple_hfs<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> (
         // Native HFS+ or HFSX — volume header is directly at partition_offset+1024
         0x482B | 0x4858 => ("hfsplus", partition_offset),
         _ => ("unknown", partition_offset),
+    }
+}
+
+/// Probe an HFS or HFS+ partition for its allocation block size in bytes.
+///
+/// Returns the volume's `drAlBlkSiz` (HFS) or `blockSize` (HFS+/HFSX) field —
+/// the unit used by every catalog/extents record on the volume. For an
+/// HFS-wrapped HFS+ volume, the inner HFS+ block size is returned (that's
+/// what the catalog records use).
+///
+/// Returns `None` if no recognizable HFS volume header is found at
+/// `partition_offset + 1024`.
+pub fn hfs_block_size_at_offset<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+) -> Option<u32> {
+    let (fs_type, hfsplus_offset) = resolve_apple_hfs(reader, partition_offset);
+    match fs_type {
+        "hfs" => {
+            // Classic HFS: drAlBlkSiz at MDB offset 20 (u32 BE).
+            reader.seek(SeekFrom::Start(partition_offset + 1024)).ok()?;
+            let mut buf = [0u8; 512];
+            reader.read_exact(&mut buf).ok()?;
+            Some(u32::from_be_bytes([buf[20], buf[21], buf[22], buf[23]]))
+        }
+        "hfsplus" => {
+            // HFS+/HFSX: blockSize at VH offset 40 (u32 BE).
+            reader.seek(SeekFrom::Start(hfsplus_offset + 1024)).ok()?;
+            let mut buf = [0u8; 512];
+            reader.read_exact(&mut buf).ok()?;
+            Some(u32::from_be_bytes([buf[40], buf[41], buf[42], buf[43]]))
+        }
+        _ => None,
     }
 }
 
