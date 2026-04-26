@@ -133,6 +133,116 @@ fn load_extension_map() -> &'static ExtensionMap {
     })
 }
 
+/// A known (type, creator) pair with a friendly description, used to populate
+/// the type/creator editor's pulldown.
+#[derive(Debug, Clone)]
+pub struct TypeCreatorEntry {
+    pub type_code: [u8; 4],
+    pub creator_code: [u8; 4],
+    pub description: String,
+}
+
+impl TypeCreatorEntry {
+    pub fn type_str(&self) -> String {
+        String::from_utf8_lossy(&self.type_code).to_string()
+    }
+    pub fn creator_str(&self) -> String {
+        String::from_utf8_lossy(&self.creator_code).to_string()
+    }
+}
+
+fn load_type_creator_entries() -> &'static Vec<TypeCreatorEntry> {
+    static ENTRIES: OnceLock<Vec<TypeCreatorEntry>> = OnceLock::new();
+    ENTRIES.get_or_init(|| {
+        let json_bytes = include_str!("../../assets/hfs_file_types.json");
+        let parsed: serde_json::Value = serde_json::from_str(json_bytes).unwrap_or_default();
+
+        // type code -> friendly description (from the "types" block)
+        let mut type_desc: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        if let Some(types) = parsed.get("types").and_then(|v| v.as_object()) {
+            for (tc, val) in types {
+                if let Some(desc) = val.get("description").and_then(|v| v.as_str()) {
+                    type_desc.insert(tc.clone(), desc.to_string());
+                }
+            }
+        }
+
+        // Curated (type, creator) catalog from the "entries" block — these
+        // win on description because they're hand-written.
+        let mut seen: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        let mut out: Vec<TypeCreatorEntry> = Vec::new();
+        if let Some(arr) = parsed.get("entries").and_then(|v| v.as_array()) {
+            for item in arr {
+                let (Some(tc_str), Some(cc_str), Some(desc)) = (
+                    item.get("type").and_then(|v| v.as_str()),
+                    item.get("creator").and_then(|v| v.as_str()),
+                    item.get("description").and_then(|v| v.as_str()),
+                ) else {
+                    continue;
+                };
+                if !seen.insert((tc_str.to_string(), cc_str.to_string())) {
+                    continue;
+                }
+                out.push(TypeCreatorEntry {
+                    type_code: encode_fourcc(tc_str),
+                    creator_code: encode_fourcc(cc_str),
+                    description: desc.to_string(),
+                });
+            }
+        }
+        // Fall back to extension-derived pairs for anything not already in
+        // the curated catalog (legacy entries, late additions).
+        if let Some(exts) = parsed.get("extensions").and_then(|v| v.as_object()) {
+            for (ext, val) in exts {
+                if ext.starts_with('_') {
+                    continue;
+                }
+                let (Some(tc_str), Some(cc_str)) = (
+                    val.get("type").and_then(|v| v.as_str()),
+                    val.get("creator").and_then(|v| v.as_str()),
+                ) else {
+                    continue;
+                };
+                if !seen.insert((tc_str.to_string(), cc_str.to_string())) {
+                    continue;
+                }
+                let desc = type_desc
+                    .get(tc_str)
+                    .cloned()
+                    .unwrap_or_else(|| format!(".{ext}"));
+                out.push(TypeCreatorEntry {
+                    type_code: encode_fourcc(tc_str),
+                    creator_code: encode_fourcc(cc_str),
+                    description: desc,
+                });
+            }
+        }
+        out.sort_by(|a, b| {
+            a.description
+                .to_lowercase()
+                .cmp(&b.description.to_lowercase())
+                .then_with(|| a.type_code.cmp(&b.type_code))
+                .then_with(|| a.creator_code.cmp(&b.creator_code))
+        });
+        out
+    })
+}
+
+/// All known (type, creator) entries, sorted by friendly description.
+pub fn known_type_creators() -> &'static [TypeCreatorEntry] {
+    load_type_creator_entries().as_slice()
+}
+
+/// Friendly description for a (type, creator) pair, if known.
+pub fn describe_type_creator(type_code: &[u8; 4], creator_code: &[u8; 4]) -> Option<&'static str> {
+    load_type_creator_entries()
+        .iter()
+        .find(|e| &e.type_code == type_code && &e.creator_code == creator_code)
+        .map(|e| e.description.as_str())
+}
+
 /// Look up the type and creator codes for a file extension.
 /// Returns None for unknown extensions.
 pub fn type_creator_for_extension(ext: &str) -> Option<([u8; 4], [u8; 4])> {

@@ -7,7 +7,7 @@ pub mod filesystem;
 pub mod fsck;
 pub mod hfs;
 pub mod hfs_clone;
-pub(crate) mod hfs_common;
+pub mod hfs_common;
 pub mod hfs_fsck;
 pub mod hfsplus;
 pub mod mac_alias;
