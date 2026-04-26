@@ -3,7 +3,7 @@ name = "rusty-backup"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0"
-authors = ["Dani <dani@example.com>"]
+authors = ["Dani <dani@funkervogt.com>"]
 description = "Cross-platform GUI for backing up and restoring vintage computer hard disk images"
 homepage = "https://github.com/dani/rusty-backup"
 repository = "https://github.com/dani/rusty-backup"
@@ -81,8 +81,8 @@ tempfile = "3"
 
 # Debian package metadata
 [package.metadata.deb]
-maintainer = "Dani <dani@example.com>"
-copyright = "2024-2026, Dani <dani@example.com>"
+maintainer = "Dani <dani@funkervogt.com>"
+copyright = "2025-2026, Dani <dani@funkervogt.com>"
 license-file = ["LICENSE", "0"]
 extended-description = """\
 Rusty Backup is a cross-platform GUI application for backing up and restoring \
