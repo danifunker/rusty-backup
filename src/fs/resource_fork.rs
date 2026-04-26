@@ -338,8 +338,11 @@ pub fn parse_appledouble(data: &[u8]) -> Option<ImportedResourceFork> {
         }
     }
 
-    let rsrc = rsrc_data?;
-    if rsrc.is_empty() {
+    // Accept the sidecar if it carries either a resource fork OR Finder info.
+    // Files with type/creator but no rsrc (e.g. plain text, bookmark files)
+    // still need to round-trip their FInfo.
+    let rsrc = rsrc_data.unwrap_or_default();
+    if rsrc.is_empty() && type_code.is_none() && creator_code.is_none() {
         return None;
     }
 
@@ -579,6 +582,24 @@ mod tests {
         let mut bad = vec![0; 256];
         bad[0] = 1;
         assert!(parse_macbinary(&bad).is_none());
+    }
+
+    #[test]
+    fn test_parse_appledouble_finfo_only() {
+        // Sidecar built for a file with type/creator but no resource fork
+        // (e.g. a classic Mac bookmark or .txt file). Must round-trip.
+        let ad = build_appledouble(b"MOSS", b"sigl", &[]);
+        let parsed = parse_appledouble(&ad).expect("FInfo-only sidecar should parse");
+        assert!(parsed.data.is_empty());
+        assert_eq!(parsed.type_code, Some(*b"MOSS"));
+        assert_eq!(parsed.creator_code, Some(*b"sigl"));
+    }
+
+    #[test]
+    fn test_parse_appledouble_empty_finder_info_rejected() {
+        // Sidecar with no rsrc and no FInfo carries no information.
+        let ad = build_appledouble(&[0; 4], &[0; 4], &[]);
+        assert!(parse_appledouble(&ad).is_none());
     }
 
     #[test]

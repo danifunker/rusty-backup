@@ -2333,7 +2333,9 @@ impl BrowseView {
                     };
 
                     if let Some(ref imp) = rsrc_import {
-                        opts.resource_fork = Some(ResourceForkSource::Data(imp.data.clone()));
+                        if !imp.data.is_empty() {
+                            opts.resource_fork = Some(ResourceForkSource::Data(imp.data.clone()));
+                        }
                         // Type/creator from container overrides auto-detect,
                         // but not explicit ProDOS overrides.
                         if opts.type_code.is_none() {
@@ -3709,8 +3711,7 @@ fn extract_entry(
                     p.current_bytes += written;
                 }
 
-                // Handle resource fork
-                if has_rsrc && resource_fork_mode != ResourceForkMode::DataForkOnly {
+                if is_hfs && resource_fork_mode != ResourceForkMode::DataForkOnly {
                     let type_code = entry
                         .type_code
                         .as_ref()
@@ -3721,39 +3722,48 @@ fn extract_entry(
                         .as_ref()
                         .map(|s| fourcc_bytes(s))
                         .unwrap_or([0; 4]);
+                    let has_finfo = type_code != [0; 4] || creator_code != [0; 4];
 
                     let mut rsrc_buf = Vec::new();
-                    fs.write_resource_fork_to(entry, &mut rsrc_buf)?;
-
-                    match resource_fork_mode {
-                        ResourceForkMode::Native => {
-                            let rsrc_path = out_path.join("..namedfork/rsrc");
-                            let mut rf = BufWriter::new(File::create(&rsrc_path)?);
-                            rf.write_all(&rsrc_buf)?;
-                            rf.flush()?;
-                        }
-                        ResourceForkMode::AppleDouble => {
-                            let ad = resource_fork::build_appledouble(
-                                &type_code,
-                                &creator_code,
-                                &rsrc_buf,
-                            );
-                            let ad_path = dest.join(format!("._{safe_name}"));
-                            let mut af = BufWriter::new(File::create(&ad_path)?);
-                            af.write_all(&ad)?;
-                            af.flush()?;
-                        }
-                        ResourceForkMode::SeparateRsrc => {
-                            let rsrc_path = dest.join(format!("{safe_name}.rsrc"));
-                            let mut rf = BufWriter::new(File::create(&rsrc_path)?);
-                            rf.write_all(&rsrc_buf)?;
-                            rf.flush()?;
-                        }
-                        _ => {}
+                    if has_rsrc {
+                        fs.write_resource_fork_to(entry, &mut rsrc_buf)?;
                     }
 
-                    if let Ok(mut p) = progress.lock() {
-                        p.current_bytes += rsrc_buf.len() as u64;
+                    if has_rsrc || has_finfo {
+                        match resource_fork_mode {
+                            ResourceForkMode::Native => {
+                                if has_rsrc {
+                                    let rsrc_path = out_path.join("..namedfork/rsrc");
+                                    let mut rf = BufWriter::new(File::create(&rsrc_path)?);
+                                    rf.write_all(&rsrc_buf)?;
+                                    rf.flush()?;
+                                }
+                            }
+                            ResourceForkMode::AppleDouble => {
+                                let ad = resource_fork::build_appledouble(
+                                    &type_code,
+                                    &creator_code,
+                                    &rsrc_buf,
+                                );
+                                let ad_path = dest.join(format!("._{safe_name}"));
+                                let mut af = BufWriter::new(File::create(&ad_path)?);
+                                af.write_all(&ad)?;
+                                af.flush()?;
+                            }
+                            ResourceForkMode::SeparateRsrc => {
+                                if has_rsrc {
+                                    let rsrc_path = dest.join(format!("{safe_name}.rsrc"));
+                                    let mut rf = BufWriter::new(File::create(&rsrc_path)?);
+                                    rf.write_all(&rsrc_buf)?;
+                                    rf.flush()?;
+                                }
+                            }
+                            _ => {}
+                        }
+
+                        if let Ok(mut p) = progress.lock() {
+                            p.current_bytes += rsrc_buf.len() as u64;
+                        }
                     }
                 }
 
