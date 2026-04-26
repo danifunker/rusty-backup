@@ -1121,36 +1121,113 @@ impl<R: Read + Seek> HfsFilesystem<R> {
         Ok(data)
     }
 
-    /// Locate the catalog record-data offset for a file or directory CNID by
-    /// going through the thread record (which always exists for both record
-    /// types in classic HFS editable volumes). The returned offset points at
-    /// the record type byte (offset 0 of the record data).
+    /// Locate the catalog record-data offset for a file or directory CNID.
+    ///
+    /// Directories always have a thread record (HFS spec mandates it), so we
+    /// look them up via the thread → key path. File thread records are
+    /// optional in classic HFS — Finder, CiderPress2, and Inside Macintosh:
+    /// Files all describe them as optional, and our `create_file` no longer
+    /// emits them. So if the thread lookup fails, fall back to a leaf scan
+    /// for a file record whose `filFlNum` (CNID) matches.
+    ///
+    /// The returned offset points at the record type byte (offset 0 of the
+    /// record data).
     fn locate_record_data(&self, cnid: u32) -> Result<usize, FilesystemError> {
-        let (_, _, t_offset) = self.find_catalog_record_by_cnid(cnid).ok_or_else(|| {
-            FilesystemError::NotFound(format!("thread for CNID {cnid} not found"))
-        })?;
-        let key_len = self.catalog_data[t_offset] as usize;
-        let mut rec_data_start = t_offset + 1 + key_len;
-        if rec_data_start % 2 != 0 {
-            rec_data_start += 1;
-        }
-        let thread_parent =
-            BigEndian::read_u32(&self.catalog_data[rec_data_start + 10..rec_data_start + 14]);
-        let thread_name_len = self.catalog_data[rec_data_start + 14] as usize;
-        let thread_name =
-            self.catalog_data[rec_data_start + 15..rec_data_start + 15 + thread_name_len].to_vec();
+        if let Some((_, _, t_offset)) = self.find_catalog_record_by_cnid(cnid) {
+            let key_len = self.catalog_data[t_offset] as usize;
+            let mut rec_data_start = t_offset + 1 + key_len;
+            if rec_data_start % 2 != 0 {
+                rec_data_start += 1;
+            }
+            let thread_parent =
+                BigEndian::read_u32(&self.catalog_data[rec_data_start + 10..rec_data_start + 14]);
+            let thread_name_len = self.catalog_data[rec_data_start + 14] as usize;
+            let thread_name = self.catalog_data
+                [rec_data_start + 15..rec_data_start + 15 + thread_name_len]
+                .to_vec();
 
-        let (_, _, f_offset) = self
-            .find_catalog_record_by_name(thread_parent, &thread_name)
-            .ok_or_else(|| {
-                FilesystemError::NotFound(format!("catalog record for CNID {cnid} not found"))
-            })?;
-        let fkey_len = self.catalog_data[f_offset] as usize;
-        let mut frec_start = f_offset + 1 + fkey_len;
-        if frec_start % 2 != 0 {
-            frec_start += 1;
+            if let Some((_, _, f_offset)) =
+                self.find_catalog_record_by_name(thread_parent, &thread_name)
+            {
+                let fkey_len = self.catalog_data[f_offset] as usize;
+                let mut frec_start = f_offset + 1 + fkey_len;
+                if frec_start % 2 != 0 {
+                    frec_start += 1;
+                }
+                return Ok(frec_start);
+            }
         }
-        Ok(frec_start)
+
+        if let Some((_, _, frec_start)) = self.find_file_record_offset_by_cnid(cnid) {
+            return Ok(frec_start);
+        }
+
+        Err(FilesystemError::NotFound(format!(
+            "catalog record for CNID {cnid} not found"
+        )))
+    }
+
+    /// Scan catalog leaves for a file record whose `filFlNum` equals `cnid`.
+    /// Returns `(node_idx, rec_idx, record_data_offset)` — the third element
+    /// has the same meaning as the third element of
+    /// `find_catalog_record_by_name`, except it points at the record DATA
+    /// (offset 0 = type byte) rather than the key.
+    ///
+    /// Used as a fallback for file CNID lookup since classic HFS file thread
+    /// records are optional (and our `create_file` no longer emits them).
+    fn find_file_record_offset_by_cnid(&self, cnid: u32) -> Option<(u32, usize, usize)> {
+        if self.catalog_data.len() < 512 {
+            return None;
+        }
+        let node_size = BigEndian::read_u16(&self.catalog_data[32..34]) as usize;
+        if node_size == 0 || self.catalog_data.len() < node_size {
+            return None;
+        }
+        let first_leaf = BigEndian::read_u32(&self.catalog_data[24..28]);
+
+        let mut node_idx = first_leaf;
+        while node_idx != 0 {
+            let off = node_idx as usize * node_size;
+            if off + node_size > self.catalog_data.len() {
+                break;
+            }
+            let node = &self.catalog_data[off..off + node_size];
+            let next_node = BigEndian::read_u32(&node[0..4]);
+            let num_records = BigEndian::read_u16(&node[10..12]) as usize;
+
+            for i in 0..num_records {
+                let offset_pos = node_size - 2 * (i + 1);
+                if offset_pos + 2 > node_size {
+                    break;
+                }
+                let rec_offset = BigEndian::read_u16(&node[offset_pos..offset_pos + 2]) as usize;
+                if rec_offset >= node_size {
+                    continue;
+                }
+                let key_len = node[rec_offset] as usize;
+                if key_len < 6 || rec_offset + 1 + key_len > node_size {
+                    continue;
+                }
+                let mut rec_data_offset = rec_offset + 1 + key_len;
+                if rec_data_offset % 2 != 0 {
+                    rec_data_offset += 1;
+                }
+                if rec_data_offset + 24 > node_size {
+                    continue;
+                }
+                if node[rec_data_offset] as i8 != CATALOG_FILE {
+                    continue;
+                }
+                // filFlNum at offset 20 of the file record data
+                let rec_cnid =
+                    BigEndian::read_u32(&node[rec_data_offset + 20..rec_data_offset + 24]);
+                if rec_cnid == cnid {
+                    return Some((node_idx, i, off + rec_data_offset));
+                }
+            }
+            node_idx = next_node;
+        }
+        None
     }
 
     /// Write the full 16-byte `FInfo` + 16-byte `FXInfo` Finder metadata
@@ -1722,9 +1799,27 @@ fn pick_btree_node_size(_target_bytes: u64) -> u16 {
     512
 }
 
-/// Largest B-tree file size we can produce without needing map nodes.
-/// `(node_size=512) * (2048 bits in header bitmap) = 1 MiB`.
-pub const HFS_MAX_BTREE_FILE_SIZE: u32 = 1024 * 1024;
+/// Largest B-tree file size the blank-volume builder will produce. With
+/// node_size=512, the header bitmap covers 2048 nodes (= 1 MiB) on its own;
+/// each appended map node extends this by 3952 nodes. We cap at 16 MiB —
+/// 32768 nodes — which is plenty for any real-world HFS catalog while
+/// staying well under HFS's 32-bit node-index space.
+pub const HFS_MAX_BTREE_FILE_SIZE: u32 = 16 * 1024 * 1024;
+
+/// Number of map nodes (BTNodeKind=2) needed to extend the node-allocation
+/// bitmap so it covers `total_nodes` indices, given a node size.
+fn hfs_map_nodes_required(total_nodes: u32, node_size: usize) -> u32 {
+    let header_cap = ((node_size - 256) * 8) as u32; // header-node bitmap bits
+    if total_nodes <= header_cap {
+        return 0;
+    }
+    let per_map = (hfs_common::map_node_bitmap_bytes(node_size) * 8) as u32;
+    if per_map == 0 {
+        return 0;
+    }
+    let extra = total_nodes - header_cap;
+    extra.div_ceil(per_map)
+}
 
 fn build_empty_hfs_catalog_with_node_size(
     catalog_size: usize,
@@ -1743,9 +1838,23 @@ fn build_empty_hfs_catalog_with_node_size(
             "cannot initialize empty HFS catalog: only {total_nodes} node(s) fit"
         )));
     }
+    // Layout: 0 = header, 1 = root leaf, 2..2+map_nodes = map nodes (BTNodeKind=2)
+    // extending the node bitmap beyond the header-node bitmap's capacity.
+    let map_nodes = hfs_map_nodes_required(total_nodes, node_size);
+    let used_nodes = 2 + map_nodes;
+    if total_nodes < used_nodes {
+        return Err(FilesystemError::InvalidData(format!(
+            "cannot initialize empty HFS catalog: {total_nodes} nodes < {used_nodes} required \
+             (header + leaf + {map_nodes} map nodes)"
+        )));
+    }
     let mut buf = vec![0u8; catalog_size];
 
     // ---- Node 0: B-tree header node (kind=1, 3 records) ----
+    // fLink at byte 0..4 points to the first map node (when map_nodes > 0).
+    if map_nodes > 0 {
+        BigEndian::write_u32(&mut buf[0..4], 2);
+    }
     buf[8] = hfs_common::BTREE_HEADER_NODE as u8;
     buf[9] = 0;
     BigEndian::write_u16(&mut buf[10..12], 3);
@@ -1759,12 +1868,25 @@ fn build_empty_hfs_catalog_with_node_size(
     BigEndian::write_u16(&mut buf[32..34], node_size as u16); // nodeSize
     BigEndian::write_u16(&mut buf[34..36], 37); // maxKeyLen
     BigEndian::write_u32(&mut buf[36..40], total_nodes);
-    BigEndian::write_u32(&mut buf[40..44], total_nodes - 2); // freeNodes
+    BigEndian::write_u32(&mut buf[40..44], total_nodes - used_nodes); // freeNodes
 
     // Record 1: user data at offset 120 (128 bytes zero)
-    // Record 2: node-allocation bitmap at offset 248; mark nodes 0 and 1 used.
+    // Record 2: node-allocation bitmap at offset 248. Mark nodes 0..used_nodes
+    // as allocated. The header bitmap covers the first 2048 bits (at
+    // node_size=512); the map-node initialization below claims any indices
+    // beyond that. Since used_nodes ≤ 2 + map_nodes ≪ 2048 in practice, all
+    // initial bits land in the header bitmap.
     let bitmap_rec_offset = 248usize;
-    buf[bitmap_rec_offset] = 0b11000000;
+    let header_bitmap_len = node_size - 256; // bytes
+    for bit in 0..used_nodes {
+        // Mark in header bitmap (MSB-first within each byte).
+        let local = bit;
+        let byte_idx = (local / 8) as usize;
+        let bit_in_byte = 7 - (local % 8) as u8;
+        if byte_idx < header_bitmap_len {
+            buf[bitmap_rec_offset + byte_idx] |= 1u8 << bit_in_byte;
+        }
+    }
 
     // Offset table for header node (stored bottom-up)
     let free_offset = (node_size - 8) as u16;
@@ -1835,6 +1957,14 @@ fn build_empty_hfs_catalog_with_node_size(
         free_rel,
     );
 
+    // ---- Map nodes (BTNodeKind=2) at indices 2..2+map_nodes ----
+    for i in 0..map_nodes {
+        let node_idx = 2 + i;
+        let next_link = if i + 1 < map_nodes { node_idx + 1 } else { 0 };
+        let prev_link = if i == 0 { 0 } else { node_idx - 1 };
+        hfs_common::init_map_node(&mut buf, node_size, node_idx, prev_link, next_link);
+    }
+
     Ok(buf)
 }
 
@@ -1855,8 +1985,20 @@ fn build_empty_hfs_extents_btree_with_node_size(
             "cannot initialize empty HFS extents B-tree: region is only {size} bytes"
         )));
     }
+    let map_nodes = hfs_map_nodes_required(total_nodes, node_size);
+    let used_nodes = 1 + map_nodes;
+    if total_nodes < used_nodes {
+        return Err(FilesystemError::InvalidData(format!(
+            "cannot initialize empty HFS extents B-tree: {total_nodes} nodes < {used_nodes} \
+             required (header + {map_nodes} map nodes)"
+        )));
+    }
     let mut buf = vec![0u8; size];
 
+    // Header descriptor. fLink → first map node when one exists.
+    if map_nodes > 0 {
+        BigEndian::write_u32(&mut buf[0..4], 1);
+    }
     buf[8] = hfs_common::BTREE_HEADER_NODE as u8;
     buf[9] = 0;
     BigEndian::write_u16(&mut buf[10..12], 3);
@@ -1870,12 +2012,20 @@ fn build_empty_hfs_extents_btree_with_node_size(
     BigEndian::write_u16(&mut buf[32..34], node_size as u16); // nodeSize
     BigEndian::write_u16(&mut buf[34..36], 7); // maxKeyLen for extents key (keyLen+forkType+fileID+startBlock)
     BigEndian::write_u32(&mut buf[36..40], total_nodes);
-    BigEndian::write_u32(&mut buf[40..44], total_nodes - 1); // only header node used
+    BigEndian::write_u32(&mut buf[40..44], total_nodes - used_nodes);
 
     // Record 1: user data (128 bytes, zero) at offset 120
-    // Record 2: node bitmap at offset 248; mark only node 0 (header).
+    // Record 2: node bitmap at offset 248; mark node 0 (header) and nodes
+    // 1..1+map_nodes (map nodes) as allocated.
     let bitmap_rec_offset = 248usize;
-    buf[bitmap_rec_offset] = 0b10000000;
+    let header_bitmap_len = node_size - 256;
+    for bit in 0..used_nodes {
+        let byte_idx = (bit / 8) as usize;
+        let bit_in_byte = 7 - (bit % 8) as u8;
+        if byte_idx < header_bitmap_len {
+            buf[bitmap_rec_offset + byte_idx] |= 1u8 << bit_in_byte;
+        }
+    }
 
     let free_offset = (node_size - 8) as u16;
     BigEndian::write_u16(&mut buf[node_size - 2..node_size], 14);
@@ -1885,6 +2035,14 @@ fn build_empty_hfs_extents_btree_with_node_size(
         bitmap_rec_offset as u16,
     );
     BigEndian::write_u16(&mut buf[node_size - 8..node_size - 6], free_offset);
+
+    // Map nodes at indices 1..1+map_nodes
+    for i in 0..map_nodes {
+        let node_idx = 1 + i;
+        let next_link = if i + 1 < map_nodes { node_idx + 1 } else { 0 };
+        let prev_link = if i == 0 { 0 } else { node_idx - 1 };
+        hfs_common::init_map_node(&mut buf, node_size, node_idx, prev_link, next_link);
+    }
 
     Ok(buf)
 }
@@ -2297,9 +2455,9 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
     }
 }
 
-/// Classic HFS thread record types.
+/// Classic HFS thread record type for directories. (File threads exist in
+/// the spec but are optional and we don't emit them — see `create_file`.)
 const CATALOG_DIR_THREAD: i8 = 3;
-const CATALOG_FILE_THREAD: i8 = 4;
 
 impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
     fn create_file(
@@ -2391,13 +2549,12 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
 
             self.insert_catalog_record(&key_record)?;
 
-            // Build and insert thread record
-            let (_, thread_data) =
-                Self::build_thread_record(CATALOG_FILE_THREAD, parent_id, &name_bytes);
-            let thread_key = Self::build_catalog_key(file_id, &[]);
-            let mut thread_record = thread_key;
-            thread_record.extend_from_slice(&thread_data);
-            self.insert_catalog_record(&thread_record)?;
+            // No file thread record: classic HFS file threads are optional
+            // (Inside Macintosh: Files), and Finder / CiderPress2 don't emit
+            // them. Skipping them roughly halves catalog size for file-heavy
+            // volumes and lets dense sources (~5000 entries) fit within the
+            // 2048-node header-bitmap cap. File CNID lookups fall back to a
+            // leaf scan in `locate_record_data` / `find_file_record_offset_by_cnid`.
 
             // Update parent valence
             self.update_parent_valence(parent_id, 1)?;
@@ -2566,41 +2723,14 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
     ) -> Result<(), FilesystemError> {
         let snap = self.snapshot();
         let result = (|| {
-            let cnid = entry.location as u32;
-
-            // Find the thread to get parent + name
-            let (_t_node, _t_rec, t_offset) =
-                self.find_catalog_record_by_cnid(cnid).ok_or_else(|| {
-                    FilesystemError::NotFound(format!("thread for CNID {cnid} not found"))
-                })?;
-
-            // Read parent_id and name from thread record data
-            let key_len = self.catalog_data[t_offset] as usize;
-            let mut rec_data_start = t_offset + 1 + key_len;
-            if rec_data_start % 2 != 0 {
-                rec_data_start += 1;
-            }
-            // Thread record: type(1) + reserved(1) + reserved(8) + parentID(4) + name(Pascal)
-            let thread_parent =
-                BigEndian::read_u32(&self.catalog_data[rec_data_start + 10..rec_data_start + 14]);
-            let thread_name_len = self.catalog_data[rec_data_start + 14] as usize;
-            let thread_name = self.catalog_data
-                [rec_data_start + 15..rec_data_start + 15 + thread_name_len]
-                .to_vec();
-
-            // Find the actual file record
-            let (_f_node, _f_rec, f_offset) = self
-                .find_catalog_record_by_name(thread_parent, &thread_name)
-                .ok_or_else(|| FilesystemError::NotFound("file record not found".into()))?;
-
-            // Compute record data offset
-            let fkey_len = self.catalog_data[f_offset] as usize;
-            let mut frec_start = f_offset + 1 + fkey_len;
-            if frec_start % 2 != 0 {
-                frec_start += 1;
+            let frec_start = self.locate_record_data(entry.location as u32)?;
+            if self.catalog_data[frec_start] as i8 != CATALOG_FILE {
+                return Err(FilesystemError::InvalidData(
+                    "set_type_creator: not a file record".into(),
+                ));
             }
 
-            // Write type at offset 4, creator at offset 8 in the file record
+            // Write type at FInfo+0 (rec offset 4), creator at FInfo+4 (rec offset 8)
             let tc = hfs_common::encode_fourcc(type_code);
             let cc = hfs_common::encode_fourcc(creator_code);
             self.catalog_data[frec_start + 4..frec_start + 8].copy_from_slice(&tc);
@@ -2632,32 +2762,11 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
             // Allocate and write new resource fork
             let (rsrc_start, rsrc_blocks) = self.write_data_to_blocks(data, len)?;
 
-            // Find the file record via thread
-            let (_t_node, _t_rec, t_offset) =
-                self.find_catalog_record_by_cnid(cnid).ok_or_else(|| {
-                    FilesystemError::NotFound(format!("thread for CNID {cnid} not found"))
-                })?;
-
-            let key_len = self.catalog_data[t_offset] as usize;
-            let mut rec_data_start = t_offset + 1 + key_len;
-            if rec_data_start % 2 != 0 {
-                rec_data_start += 1;
-            }
-            let thread_parent =
-                BigEndian::read_u32(&self.catalog_data[rec_data_start + 10..rec_data_start + 14]);
-            let thread_name_len = self.catalog_data[rec_data_start + 14] as usize;
-            let thread_name = self.catalog_data
-                [rec_data_start + 15..rec_data_start + 15 + thread_name_len]
-                .to_vec();
-
-            let (_f_node, _f_rec, f_offset) = self
-                .find_catalog_record_by_name(thread_parent, &thread_name)
-                .ok_or_else(|| FilesystemError::NotFound("file record not found".into()))?;
-
-            let fkey_len = self.catalog_data[f_offset] as usize;
-            let mut frec_start = f_offset + 1 + fkey_len;
-            if frec_start % 2 != 0 {
-                frec_start += 1;
+            let frec_start = self.locate_record_data(cnid)?;
+            if self.catalog_data[frec_start] as i8 != CATALOG_FILE {
+                return Err(FilesystemError::InvalidData(
+                    "write_resource_fork: not a file record".into(),
+                ));
             }
 
             // Update rsrc fork fields in file record:
@@ -4421,6 +4530,59 @@ mod tests {
             "node_size must stay at 512 for Mac OS compat"
         );
         let result = fs.fsck().expect("fsck big");
+        assert!(
+            result.errors.is_empty(),
+            "unexpected fsck errors: {:?}",
+            result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// Catalog larger than the header bitmap's 2048-node capacity must
+    /// allocate map nodes (BTNodeKind=2). Verify the chain is set up
+    /// correctly, fsck is clean, and we can allocate nodes beyond bit 2048.
+    #[test]
+    fn test_create_blank_hfs_with_map_nodes() {
+        // Request a 2 MiB catalog (4096 nodes at node_size=512). This needs
+        // ceil((4096-2048)/3952) = 1 map node.
+        let img =
+            create_blank_hfs_sized(64 * 1024 * 1024, 32 * 1024, "MapNodes", 0, 2 * 1024 * 1024)
+                .expect("create_blank_hfs_sized 2 MiB cat");
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let cat = fs.catalog_data().to_vec();
+
+        // Header.fLink must point to the first map node (node 2).
+        let header_flink = BigEndian::read_u32(&cat[0..4]);
+        assert_eq!(header_flink, 2, "header.fLink should point to map node 2");
+
+        // Node 2 must be a map node (kind=2) with one record and fLink=0
+        // (only one map node needed for 4096-node capacity).
+        let map = &cat[1024..1536];
+        assert_eq!(map[8] as i8, 2, "node 2 should be a map node");
+        assert_eq!(BigEndian::read_u16(&map[10..12]), 1);
+        assert_eq!(
+            BigEndian::read_u32(&map[0..4]),
+            0,
+            "single map node, fLink=0"
+        );
+
+        // Total nodes 4096, used 3 (header, leaf, map). free = 4093.
+        let header = hfs_common::BTreeHeader::read(&cat);
+        assert_eq!(header.total_nodes, 4096);
+        assert_eq!(header.free_nodes, 4093);
+
+        // Walk the segment iterator — should yield 2 segments covering
+        // 256 + 494 = 750 bytes = 6000 bits ≥ 4096 nodes.
+        let segs = hfs_common::btree_bitmap_segments(&cat, 512);
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].base_bit, 0);
+        assert_eq!(segs[1].base_bit, 2048);
+        assert!(
+            (segs[0].len + segs[1].len) * 8 >= 4096,
+            "bitmap chain must address all 4096 nodes"
+        );
+
+        // fsck should be clean.
+        let result = fs.fsck().expect("fsck");
         assert!(
             result.errors.is_empty(),
             "unexpected fsck errors: {:?}",

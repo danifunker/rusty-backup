@@ -15,9 +15,10 @@ use super::hfs::{
     mac_roman_to_utf8, HfsExtDescriptor, HfsMasterDirectoryBlock, CATALOG_DIR, CATALOG_FILE,
 };
 use super::hfs_common::{
-    bitmap_clear_bit_be, bitmap_set_bit_be, bitmap_test_bit_be, btree_insert_record,
-    btree_node_bitmap_range, btree_record_range, init_node, normalize_catalog_index_key,
-    BTreeHeader, BTREE_HEADER_NODE, BTREE_INDEX_NODE, BTREE_LEAF_NODE, BTREE_MAP_NODE,
+    bitmap_set_bit_be, bitmap_test_bit_be, btree_bitmap_clear, btree_bitmap_set, btree_bitmap_test,
+    btree_insert_record, btree_node_bitmap_range, btree_record_range, init_node,
+    normalize_catalog_index_key, BTreeHeader, BTREE_HEADER_NODE, BTREE_INDEX_NODE, BTREE_LEAF_NODE,
+    BTREE_MAP_NODE,
 };
 
 const CATALOG_DIR_THREAD: i8 = 3;
@@ -517,7 +518,7 @@ fn repair_map_nodes(catalog_data: &mut [u8], node_size: usize, report: &mut Repa
 /// Fix node bitmap: ensure every referenced node is marked as allocated.
 fn repair_node_bitmap(catalog_data: &mut [u8], node_size: usize, report: &mut RepairReport) {
     let header = BTreeHeader::read(catalog_data);
-    let (bmp_off, bmp_size) = btree_node_bitmap_range(catalog_data, node_size);
+    let (_bmp_off, bmp_size) = btree_node_bitmap_range(catalog_data, node_size);
     if bmp_size == 0 {
         return;
     }
@@ -526,8 +527,8 @@ fn repair_node_bitmap(catalog_data: &mut [u8], node_size: usize, report: &mut Re
     let mut fixed_count = 0u32;
 
     for &node_idx in &referenced {
-        if !bitmap_test_bit_be(&catalog_data[bmp_off..bmp_off + bmp_size], node_idx) {
-            bitmap_set_bit_be(&mut catalog_data[bmp_off..bmp_off + bmp_size], node_idx);
+        if !btree_bitmap_test(catalog_data, node_size, node_idx) {
+            btree_bitmap_set(catalog_data, node_size, node_idx);
             fixed_count += 1;
         }
     }
@@ -548,12 +549,11 @@ fn repair_node_bitmap(catalog_data: &mut [u8], node_size: usize, report: &mut Re
 /// This fixes intra-node key ordering; inter-node ordering is handled by
 /// `rebuild_leaf_chain` (which sorts nodes by first key).
 fn repair_key_ordering(catalog_data: &mut [u8], node_size: usize, report: &mut RepairReport) {
-    let (bmp_off, bmp_size) = btree_node_bitmap_range(catalog_data, node_size);
     let max_nodes = catalog_data.len() / node_size;
     let mut fixed_count = 0u32;
 
     for node_idx in 0..max_nodes as u32 {
-        if !bitmap_test_bit_be(&catalog_data[bmp_off..bmp_off + bmp_size], node_idx) {
+        if !btree_bitmap_test(catalog_data, node_size, node_idx) {
             continue;
         }
         let off = node_idx as usize * node_size;
@@ -708,10 +708,9 @@ fn rebuild_leaf_chain(catalog_data: &mut [u8], node_size: usize, report: &mut Re
     }
 
     // Step 2: Scan bitmap for allocated leaf nodes
-    let (bmp_off, bmp_size) = btree_node_bitmap_range(catalog_data, node_size);
     let mut bitmap_nodes: HashSet<u32> = HashSet::new();
     for node_idx in 1..max_nodes as u32 {
-        if !bitmap_test_bit_be(&catalog_data[bmp_off..bmp_off + bmp_size], node_idx) {
+        if !btree_bitmap_test(catalog_data, node_size, node_idx) {
             continue;
         }
         if is_valid_leaf_node(catalog_data, node_size, node_idx) {
@@ -789,13 +788,9 @@ fn rebuild_leaf_chain(catalog_data: &mut [u8], node_size: usize, report: &mut Re
 
     // Step 5: Fix node bitmap — mark all included leaf nodes as allocated
     let recovered_from_chain = chain_nodes.difference(&bitmap_nodes).count() as u32;
-    let (bmp_off, bmp_size) = btree_node_bitmap_range(catalog_data, node_size);
-    let bmp_max_bit = (bmp_size as u32) * 8;
     for &(node_idx, _) in &leaf_nodes {
-        if node_idx < bmp_max_bit
-            && !bitmap_test_bit_be(&catalog_data[bmp_off..bmp_off + bmp_size], node_idx)
-        {
-            bitmap_set_bit_be(&mut catalog_data[bmp_off..bmp_off + bmp_size], node_idx);
+        if !btree_bitmap_test(catalog_data, node_size, node_idx) {
+            btree_bitmap_set(catalog_data, node_size, node_idx);
         }
     }
     if recovered_from_chain > 0 {
@@ -827,14 +822,14 @@ pub(crate) fn rebuild_index_nodes(
     use super::hfs_common::{btree_alloc_node, btree_free_node, init_node};
 
     let header = BTreeHeader::read(catalog_data);
-    let (bmp_off, bmp_size) = btree_node_bitmap_range(catalog_data, node_size);
+    let (_bmp_off, bmp_size) = btree_node_bitmap_range(catalog_data, node_size);
     let max_nodes = catalog_data.len() / node_size;
 
     // Free all existing index nodes
     let mut freed = 0u32;
     let bmp_max_bit = (bmp_size as u32) * 8;
     for node_idx in 1..(max_nodes as u32).min(bmp_max_bit) {
-        if !bitmap_test_bit_be(&catalog_data[bmp_off..bmp_off + bmp_size], node_idx) {
+        if !btree_bitmap_test(catalog_data, node_size, node_idx) {
             continue;
         }
         let off = node_idx as usize * node_size;
@@ -2149,10 +2144,9 @@ fn check_btree_structure(
     }
 
     // Check all allocated nodes
-    let (bmp_off, bmp_size) = btree_node_bitmap_range(catalog_data, node_size);
     let max_nodes = catalog_data.len() / node_size;
     for node_idx in 0..max_nodes as u32 {
-        if !bitmap_test_bit_be(&catalog_data[bmp_off..bmp_off + bmp_size], node_idx) {
+        if !btree_bitmap_test(catalog_data, node_size, node_idx) {
             continue; // free node — skip
         }
         let off = node_idx as usize * node_size;
@@ -2353,16 +2347,15 @@ fn check_node_bitmap_consistency(
     errors: &mut Vec<FsckIssue>,
 ) {
     let node_size = header.node_size as usize;
-    let (bmp_off, bmp_size) = btree_node_bitmap_range(catalog_data, node_size);
+    let (_bmp_off, bmp_size) = btree_node_bitmap_range(catalog_data, node_size);
     if bmp_size == 0 {
         return;
     }
-    let bitmap = &catalog_data[bmp_off..bmp_off + bmp_size];
 
     let referenced = collect_referenced_nodes(catalog_data, header);
 
     for &node_idx in &referenced {
-        if !bitmap_test_bit_be(bitmap, node_idx) {
+        if !btree_bitmap_test(catalog_data, node_size, node_idx) {
             errors.push(hfs_issue(
                 HfsFsckCode::NodeBitmapMissing,
                 format!(
@@ -2393,11 +2386,10 @@ fn record_key(node: &[u8], rec_start: usize, rec_end: usize) -> &[u8] {
 /// Verify that records within each allocated node are sorted in ascending key order.
 fn check_key_ordering(catalog_data: &[u8], header: &BTreeHeader, errors: &mut Vec<FsckIssue>) {
     let node_size = header.node_size as usize;
-    let (bmp_off, bmp_size) = btree_node_bitmap_range(catalog_data, node_size);
     let max_nodes = catalog_data.len() / node_size;
 
     for node_idx in 0..max_nodes as u32 {
-        if !bitmap_test_bit_be(&catalog_data[bmp_off..bmp_off + bmp_size], node_idx) {
+        if !btree_bitmap_test(catalog_data, node_size, node_idx) {
             continue;
         }
         let off = node_idx as usize * node_size;
@@ -3882,12 +3874,11 @@ fn check_extents_btree_structure(extents_data: &[u8], errors: &mut Vec<FsckIssue
     }
 
     // Check allocated nodes: offset tables, record counts, record lengths
-    let (bmp_off, bmp_size) = btree_node_bitmap_range(extents_data, node_size);
     let max_nodes = extents_data.len() / node_size;
     let max_nrecs = HFS_MAX_NRECS * (node_size / 512);
 
     for node_idx in 1..max_nodes as u32 {
-        if !bitmap_test_bit_be(&extents_data[bmp_off..bmp_off + bmp_size], node_idx) {
+        if !btree_bitmap_test(extents_data, node_size, node_idx) {
             continue;
         }
         let off = node_idx as usize * node_size;
@@ -4315,11 +4306,10 @@ fn check_extents_key_ordering(
     errors: &mut Vec<FsckIssue>,
 ) {
     let node_size = header.node_size as usize;
-    let (bmp_off, bmp_size) = btree_node_bitmap_range(extents_data, node_size);
     let max_nodes = extents_data.len() / node_size;
 
     for node_idx in 0..max_nodes as u32 {
-        if !bitmap_test_bit_be(&extents_data[bmp_off..bmp_off + bmp_size], node_idx) {
+        if !btree_bitmap_test(extents_data, node_size, node_idx) {
             continue;
         }
         let off = node_idx as usize * node_size;
@@ -4481,12 +4471,11 @@ fn repair_extents_key_ordering(
     node_size: usize,
     report: &mut RepairReport,
 ) {
-    let (bmp_off, bmp_size) = btree_node_bitmap_range(extents_data, node_size);
     let max_nodes = extents_data.len() / node_size;
     let mut fixed_count = 0u32;
 
     for node_idx in 0..max_nodes as u32 {
-        if !bitmap_test_bit_be(&extents_data[bmp_off..bmp_off + bmp_size], node_idx) {
+        if !btree_bitmap_test(extents_data, node_size, node_idx) {
             continue;
         }
         let off = node_idx as usize * node_size;
@@ -4552,13 +4541,12 @@ fn rebuild_extents_leaf_chain(
     node_size: usize,
     report: &mut RepairReport,
 ) {
-    let (bmp_off, bmp_size) = btree_node_bitmap_range(extents_data, node_size);
     let max_nodes = extents_data.len() / node_size;
 
     // Collect all leaf nodes (bitmap-allocated with kind=leaf)
     let mut leaf_nodes: Vec<u32> = Vec::new();
     for idx in 1..max_nodes as u32 {
-        if !bitmap_test_bit_be(&extents_data[bmp_off..bmp_off + bmp_size], idx) {
+        if !btree_bitmap_test(extents_data, node_size, idx) {
             continue;
         }
         let off = idx as usize * node_size;
@@ -4634,15 +4622,14 @@ fn rebuild_extents_index_nodes(
     report: &mut RepairReport,
 ) {
     // Free all existing index nodes
-    let (bmp_off, bmp_size) = btree_node_bitmap_range(extents_data, node_size);
     let max_nodes = extents_data.len() / node_size;
     for idx in 1..max_nodes as u32 {
-        if bitmap_test_bit_be(&extents_data[bmp_off..bmp_off + bmp_size], idx) {
+        if btree_bitmap_test(extents_data, node_size, idx) {
             let off = idx as usize * node_size;
             if off + node_size <= extents_data.len()
                 && extents_data[off + 8] as i8 == BTREE_INDEX_NODE
             {
-                bitmap_clear_bit_be(&mut extents_data[bmp_off..bmp_off + bmp_size], idx);
+                btree_bitmap_clear(extents_data, node_size, idx);
             }
         }
     }
@@ -4833,7 +4820,7 @@ fn repair_extents_node_bitmap(
     report: &mut RepairReport,
 ) {
     let header = BTreeHeader::read(extents_data);
-    let (bmp_off, bmp_size) = btree_node_bitmap_range(extents_data, node_size);
+    let (_bmp_off, bmp_size) = btree_node_bitmap_range(extents_data, node_size);
     if bmp_size == 0 {
         return;
     }
@@ -4885,8 +4872,8 @@ fn repair_extents_node_bitmap(
 
     let mut fixed = 0u32;
     for &nidx in &referenced {
-        if !bitmap_test_bit_be(&extents_data[bmp_off..bmp_off + bmp_size], nidx) {
-            bitmap_set_bit_be(&mut extents_data[bmp_off..bmp_off + bmp_size], nidx);
+        if !btree_bitmap_test(extents_data, node_size, nidx) {
+            btree_bitmap_set(extents_data, node_size, nidx);
             fixed += 1;
         }
     }

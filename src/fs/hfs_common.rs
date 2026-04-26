@@ -583,11 +583,22 @@ pub fn btree_remove_record(node: &mut [u8], node_size: usize, rec_idx: usize) {
 }
 
 // ---------------------------------------------------------------------------
-// B-tree node bitmap (allocation bitmap for nodes, stored in header node)
+// B-tree node bitmap (allocation bitmap for nodes)
 // ---------------------------------------------------------------------------
+//
+// The first segment of the node bitmap lives in record 2 of node 0 (the
+// header node). At node_size=512 it covers (512−256) bytes × 8 = 2048 bits,
+// so a B-tree file larger than 2048 nodes needs MAP NODES (BTNodeKind=2)
+// to hold the rest. Map nodes are chained through node descriptors:
+//
+//   header.fLink → mapNode₁ → mapNode₂ → … → 0
+//
+// Each map node carries a single record (record 0) of bitmap bytes covering
+// (node_size − 14 − 4) × 8 = 3952 bits at node_size=512 — i.e. each map node
+// extends the addressable range by 3952 nodes.
 
-/// Find the node allocation bitmap in the header node (record 2 of node 0).
-/// Returns (byte_offset_in_catalog_data, size_in_bytes).
+/// Header-node bitmap range — first segment of the bitmap chain.
+/// Returns `(byte_offset_in_catalog_data, size_in_bytes)`.
 pub fn btree_node_bitmap_range(catalog_data: &[u8], node_size: usize) -> (usize, usize) {
     // Node 0 has 3 records: [0]=header, [1]=user data, [2]=bitmap
     // The bitmap record starts at the offset stored for record 2
@@ -598,6 +609,107 @@ pub fn btree_node_bitmap_range(catalog_data: &[u8], node_size: usize) -> (usize,
     (bitmap_start, bitmap_end.saturating_sub(bitmap_start))
 }
 
+/// Bytes of bitmap stored in a single map node at the given node_size.
+pub fn map_node_bitmap_bytes(node_size: usize) -> usize {
+    // descriptor (14) + record-0 offset u16 + free-space offset u16 = 18.
+    node_size.saturating_sub(18)
+}
+
+/// One contiguous span of the node bitmap in `catalog_data`.
+#[derive(Debug, Clone, Copy)]
+pub struct BitmapSegment {
+    /// Byte offset in `catalog_data`.
+    pub byte_off: usize,
+    /// Length in bytes.
+    pub len: usize,
+    /// Index of the first node bit in this segment (i.e. global bit
+    /// `base_bit` lives at byte `byte_off`, bit 7 within that byte).
+    pub base_bit: u32,
+}
+
+/// Walk the B-tree node bitmap from the header node through any map-node
+/// chain and return the byte ranges that make up the full bitmap.
+///
+/// Defensive: bails out if the chain self-loops or points outside the file.
+/// Always returns at least the header-node segment.
+pub fn btree_bitmap_segments(catalog_data: &[u8], node_size: usize) -> Vec<BitmapSegment> {
+    let mut segs = Vec::with_capacity(1);
+    if catalog_data.len() < node_size {
+        return segs;
+    }
+
+    let (hdr_off, hdr_len) = btree_node_bitmap_range(catalog_data, node_size);
+    segs.push(BitmapSegment {
+        byte_off: hdr_off,
+        len: hdr_len,
+        base_bit: 0,
+    });
+    let mut next_bit = (hdr_len as u32) * 8;
+
+    // The header node's fLink is at byte 0..4 of node 0 — when non-zero, it
+    // points to the first map node.
+    let mut next_node = BigEndian::read_u32(&catalog_data[0..4]);
+    let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::with_capacity(8);
+
+    while next_node != 0 {
+        if !visited.insert(next_node) {
+            // Cycle — stop.
+            break;
+        }
+        let off = next_node as usize * node_size;
+        if off + node_size > catalog_data.len() {
+            break;
+        }
+        // Validate kind == 2 (map node) and numRecords >= 1.
+        let kind = catalog_data[off + 8] as i8;
+        let num_records = BigEndian::read_u16(&catalog_data[off + 10..off + 12]);
+        if kind != 2 || num_records < 1 {
+            break;
+        }
+        // Record 0 offset is at end of node minus 2 bytes.
+        let rec0_pos = off + node_size - 2;
+        let rec0_off = BigEndian::read_u16(&catalog_data[rec0_pos..rec0_pos + 2]) as usize;
+        // Free-space offset (next 2 bytes back) gives the end of record 0.
+        let free_pos = off + node_size - 4;
+        let free_off = BigEndian::read_u16(&catalog_data[free_pos..free_pos + 2]) as usize;
+        if rec0_off < 14 || free_off <= rec0_off || free_off > node_size {
+            break;
+        }
+        let len = free_off - rec0_off;
+        segs.push(BitmapSegment {
+            byte_off: off + rec0_off,
+            len,
+            base_bit: next_bit,
+        });
+        next_bit += (len as u32) * 8;
+        // fLink at byte 0..4 of this map node.
+        next_node = BigEndian::read_u32(&catalog_data[off..off + 4]);
+    }
+
+    segs
+}
+
+fn locate_bit_in_segments(segs: &[BitmapSegment], global_bit: u32) -> Option<(usize, u32)> {
+    for (i, seg) in segs.iter().enumerate() {
+        let cap = (seg.len as u32) * 8;
+        if global_bit >= seg.base_bit && global_bit < seg.base_bit + cap {
+            return Some((i, global_bit - seg.base_bit));
+        }
+    }
+    None
+}
+
+/// Test whether the given global node bit is set in the node bitmap chain.
+pub fn btree_bitmap_test(catalog_data: &[u8], node_size: usize, bit: u32) -> bool {
+    let segs = btree_bitmap_segments(catalog_data, node_size);
+    let Some((idx, local)) = locate_bit_in_segments(&segs, bit) else {
+        return false;
+    };
+    let seg = segs[idx];
+    let slice = &catalog_data[seg.byte_off..seg.byte_off + seg.len];
+    bitmap_test_bit_be(slice, local)
+}
+
 /// Allocate a free node from the B-tree node bitmap.
 /// Sets the bit and returns the node index. Updates nothing else (caller must
 /// update header's free_nodes).
@@ -606,14 +718,20 @@ pub fn btree_alloc_node(
     node_size: usize,
     total_nodes: u32,
 ) -> Result<u32, FilesystemError> {
-    let (bm_start, bm_size) = btree_node_bitmap_range(catalog_data, node_size);
-    let bitmap = &catalog_data[bm_start..bm_start + bm_size];
-
-    // Find first clear bit using BE bitmap (node bitmap is also MSB-first)
-    for bit in 0..total_nodes {
-        if !bitmap_test_bit_be(bitmap, bit) {
-            bitmap_set_bit_be(&mut catalog_data[bm_start..bm_start + bm_size], bit);
-            return Ok(bit);
+    let segs = btree_bitmap_segments(catalog_data, node_size);
+    for seg in &segs {
+        let bitmap = &catalog_data[seg.byte_off..seg.byte_off + seg.len];
+        let cap = (seg.len as u32) * 8;
+        let upper = total_nodes.saturating_sub(seg.base_bit).min(cap);
+        for local in 0..upper {
+            if !bitmap_test_bit_be(bitmap, local) {
+                let global = seg.base_bit + local;
+                bitmap_set_bit_be(
+                    &mut catalog_data[seg.byte_off..seg.byte_off + seg.len],
+                    local,
+                );
+                return Ok(global);
+            }
         }
     }
     Err(FilesystemError::DiskFull("no free B-tree nodes".into()))
@@ -621,8 +739,69 @@ pub fn btree_alloc_node(
 
 /// Free a node in the B-tree node bitmap. Clears the bit.
 pub fn btree_free_node(catalog_data: &mut [u8], node_size: usize, node_idx: u32) {
-    let (bm_start, bm_size) = btree_node_bitmap_range(catalog_data, node_size);
-    bitmap_clear_bit_be(&mut catalog_data[bm_start..bm_start + bm_size], node_idx);
+    let segs = btree_bitmap_segments(catalog_data, node_size);
+    let Some((idx, local)) = locate_bit_in_segments(&segs, node_idx) else {
+        return;
+    };
+    let seg = segs[idx];
+    bitmap_clear_bit_be(
+        &mut catalog_data[seg.byte_off..seg.byte_off + seg.len],
+        local,
+    );
+}
+
+/// Clear a node's bit in the bitmap. Segment-aware (handles map nodes).
+pub fn btree_bitmap_clear(catalog_data: &mut [u8], node_size: usize, node_idx: u32) {
+    let segs = btree_bitmap_segments(catalog_data, node_size);
+    let Some((idx, local)) = locate_bit_in_segments(&segs, node_idx) else {
+        return;
+    };
+    let seg = segs[idx];
+    bitmap_clear_bit_be(
+        &mut catalog_data[seg.byte_off..seg.byte_off + seg.len],
+        local,
+    );
+}
+
+/// Set a node's bit in the bitmap (without doing any allocation). Used by
+/// the blank-volume builder to reserve specific node indices for map nodes.
+pub fn btree_bitmap_set(catalog_data: &mut [u8], node_size: usize, node_idx: u32) {
+    let segs = btree_bitmap_segments(catalog_data, node_size);
+    let Some((idx, local)) = locate_bit_in_segments(&segs, node_idx) else {
+        return;
+    };
+    let seg = segs[idx];
+    bitmap_set_bit_be(
+        &mut catalog_data[seg.byte_off..seg.byte_off + seg.len],
+        local,
+    );
+}
+
+/// Initialize a node as a map node (BTNodeKind=2): descriptor + one record
+/// holding `bitmap_bytes` of zeros + offset table.
+pub fn init_map_node(
+    catalog_data: &mut [u8],
+    node_size: usize,
+    node_idx: u32,
+    prev_link: u32,
+    next_link: u32,
+) {
+    let off = node_idx as usize * node_size;
+    let node = &mut catalog_data[off..off + node_size];
+    // Zero everything first.
+    node.fill(0);
+    // Descriptor: fLink, bLink, kind=2, height=0, numRecords=1, reserved.
+    BigEndian::write_u32(&mut node[0..4], next_link);
+    BigEndian::write_u32(&mut node[4..8], prev_link);
+    node[8] = 2; // BTNodeKind::MapNode
+    node[9] = 0;
+    BigEndian::write_u16(&mut node[10..12], 1);
+    // Record 0 starts at offset 14 and runs to (node_size - 4).
+    let bitmap_bytes = map_node_bitmap_bytes(node_size) as u16;
+    let free_off = 14u16 + bitmap_bytes;
+    // Offset table at the end: [free_space_offset, record0_offset] (last entry first).
+    BigEndian::write_u16(&mut node[node_size - 2..node_size], 14);
+    BigEndian::write_u16(&mut node[node_size - 4..node_size - 2], free_off);
 }
 
 // ---------------------------------------------------------------------------

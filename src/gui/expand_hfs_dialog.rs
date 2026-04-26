@@ -388,14 +388,11 @@ fn run_expand(
     step("Building blank target volume…");
     // Size the target B-trees from the source's actual on-disk file sizes,
     // with 50% headroom on the catalog (split-based insertion can leave
-    // some nodes underfull). The blank-volume builder picks a node size
-    // that lets the header-node bitmap address every node, so there's no
-    // hard cap on B-tree size beyond what the partition can hold.
-    // Cap requested B-tree file sizes at 1 MiB — that's the largest classic
-    // HFS B-tree (with node_size=512 and only the header-node bitmap) we can
-    // build without map nodes. Quadra ROMs reject larger node sizes with
-    // -127. The source's catalog typically has substantial free space, so
-    // sizing the new catalog above its used portion is plenty.
+    // some nodes underfull). The blank-volume builder appends map nodes
+    // (BTNodeKind=2) to extend the node-allocation bitmap past the
+    // header-node bitmap's 2048-bit cap, so requesting a >1 MiB catalog
+    // is fine. We still cap at HFS_MAX_BTREE_FILE_SIZE (16 MiB) because
+    // larger trees are not needed for any realistic HFS volume.
     let catalog_min = source
         .source_catalog_size
         .saturating_mul(3)

@@ -14,6 +14,18 @@ resolver = "2"
 name = "rusty-backup"
 path = "src/main.rs"
 
+[[example]]
+name = "probe_hfs_btree"
+path = "example/probe_hfs_btree.rs"
+
+[[example]]
+name = "test_clone_fix"
+path = "example/test_clone_fix.rs"
+
+[[example]]
+name = "fsck_bare"
+path = "example/fsck_bare.rs"
+
 [features]
 default = []
 
