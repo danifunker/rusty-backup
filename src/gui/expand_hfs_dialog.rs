@@ -13,7 +13,7 @@ use std::io::{BufReader, Cursor};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use rusty_backup::fs::hfs::{create_blank_hfs, HfsFilesystem};
+use rusty_backup::fs::hfs::{create_blank_hfs_sized, HfsFilesystem};
 use rusty_backup::fs::hfs_clone::{
     clone_hfs_volume, emit_apm_disk_with_hfs, CloneReport, EmitReport,
 };
@@ -61,6 +61,12 @@ pub struct ExpandSource {
     pub partition_size: u64,
     /// Source allocation block size (drAlBlkSiz), informational.
     pub source_block_size: u32,
+    /// Source catalog file size (bytes). Used to size the target catalog so
+    /// it can hold every record from the source without running out of nodes.
+    pub source_catalog_size: u32,
+    /// Source extents-overflow file size (bytes). Used the same way for the
+    /// target's extents-overflow B-tree.
+    pub source_extents_size: u32,
     /// Source allocated bytes (used = (total_blocks - free_blocks) × block_size).
     pub used_bytes: u64,
     /// Source file count, informational.
@@ -380,9 +386,39 @@ fn run_expand(
     };
 
     step("Building blank target volume…");
-    let mut target_buf =
-        create_blank_hfs(target_size_bytes, target_block_size, &source.volume_name)
-            .map_err(|e| anyhow::anyhow!("create_blank_hfs failed: {e}"))?;
+    // Size the target B-trees from the source's actual on-disk file sizes,
+    // with 50% headroom on the catalog (split-based insertion can leave
+    // some nodes underfull). The blank-volume builder picks a node size
+    // that lets the header-node bitmap address every node, so there's no
+    // hard cap on B-tree size beyond what the partition can hold.
+    // Cap requested B-tree file sizes at 1 MiB — that's the largest classic
+    // HFS B-tree (with node_size=512 and only the header-node bitmap) we can
+    // build without map nodes. Quadra ROMs reject larger node sizes with
+    // -127. The source's catalog typically has substantial free space, so
+    // sizing the new catalog above its used portion is plenty.
+    let catalog_min = source
+        .source_catalog_size
+        .saturating_mul(3)
+        .saturating_div(2)
+        .min(rusty_backup::fs::hfs::HFS_MAX_BTREE_FILE_SIZE);
+    let extents_min = source
+        .source_extents_size
+        .min(rusty_backup::fs::hfs::HFS_MAX_BTREE_FILE_SIZE);
+    let mut target_buf = create_blank_hfs_sized(
+        target_size_bytes,
+        target_block_size,
+        &source.volume_name,
+        extents_min,
+        catalog_min,
+    )
+    .map_err(|e| anyhow::anyhow!("create_blank_hfs failed: {e}"))?;
+    push(&format!(
+        "Target B-trees sized: catalog ≥ {} KiB (source {} KiB), extents-overflow ≥ {} KiB (source {} KiB)",
+        catalog_min / 1024,
+        source.source_catalog_size / 1024,
+        extents_min / 1024,
+        source.source_extents_size / 1024
+    ));
     push(&format!(
         "Allocated {} MiB target image at {} KiB blocks",
         target_buf.len() / (1024 * 1024),
@@ -404,6 +440,21 @@ fn run_expand(
 
     let mut source_fs = HfsFilesystem::open(source_buffered, source.partition_offset)
         .map_err(|e| anyhow::anyhow!("open source HFS: {e}"))?;
+
+    // Capture which fsck issue codes the source already exhibits — pre-
+    // existing quirks (e.g. system files with embedded null bytes in their
+    // catalog names) faithfully copied to the target shouldn't fail the
+    // post-clone verification.
+    let source_issue_codes: std::collections::HashSet<String> = source_fs
+        .fsck()
+        .map(|r| r.errors.iter().map(|e| e.code.clone()).collect())
+        .unwrap_or_default();
+    if !source_issue_codes.is_empty() {
+        push(&format!(
+            "Source has pre-existing fsck issue codes: {:?} (will be ignored on target)",
+            source_issue_codes
+        ));
+    }
 
     step("Cloning files…");
     let target_cursor = Cursor::new(&mut target_buf);
@@ -427,9 +478,26 @@ fn run_expand(
         let result = verify_fs
             .fsck()
             .map_err(|e| anyhow::anyhow!("fsck error: {e}"))?;
-        if !result.is_clean() {
-            let codes: Vec<String> = result.errors.iter().map(|e| e.code.clone()).collect();
-            anyhow::bail!("target fsck reported {} error(s): {:?}", codes.len(), codes);
+        let (new_issues, inherited): (Vec<_>, Vec<_>) = result
+            .errors
+            .iter()
+            .partition(|i| !source_issue_codes.contains(&i.code));
+        for issue in &inherited {
+            push(&format!(
+                "fsck (inherited from source): [{}] {}",
+                issue.code, issue.message
+            ));
+        }
+        for issue in &new_issues {
+            push(&format!("fsck: [{}] {}", issue.code, issue.message));
+        }
+        if !new_issues.is_empty() {
+            let codes: Vec<String> = new_issues.iter().map(|e| e.code.clone()).collect();
+            anyhow::bail!(
+                "target fsck reported {} new error(s) not present in source: {:?}",
+                codes.len(),
+                codes
+            );
         }
     }
 
@@ -482,6 +550,8 @@ pub fn summarize_source(
         partition_offset,
         partition_size,
         source_block_size: summary.block_size,
+        source_catalog_size: summary.catalog_file_size,
+        source_extents_size: summary.extents_file_size,
         used_bytes: summary.used_bytes,
         file_count: summary.file_count as u64,
         dir_count: summary.folder_count as u64,

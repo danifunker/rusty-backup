@@ -8,7 +8,7 @@ use super::filesystem::{
 };
 use super::hfs_common::{
     self, bitmap_clear_bit_be, bitmap_find_clear_run_be, bitmap_set_bit_be, btree_free_node,
-    btree_insert_record, btree_record_range, btree_remove_record, btree_split_leaf, BTreeHeader,
+    btree_insert_record, btree_record_range, btree_remove_record, BTreeHeader,
 };
 use super::CompactResult;
 
@@ -144,6 +144,8 @@ pub struct HfsVolumeSummary {
     pub used_bytes: u64,
     pub file_count: u32,
     pub folder_count: u32,
+    pub catalog_file_size: u32,
+    pub extents_file_size: u32,
 }
 
 impl HfsExtDescriptor {
@@ -341,6 +343,9 @@ pub struct HfsFilesystem<R: Read + Seek> {
     mdb: HfsMasterDirectoryBlock,
     /// Cached catalog file data.
     catalog_data: Vec<u8>,
+    /// Cached extents-overflow B-tree file data, lazily loaded on first
+    /// read of a file that needs more than its 3 inline extents.
+    extents_overflow_data: Option<Vec<u8>>,
     /// Cached volume bitmap (lazy-loaded on first edit operation).
     bitmap: Option<Vec<u8>>,
     /// Boot block payload staged by `set_boot_blocks`; flushed on `sync_metadata`.
@@ -378,6 +383,7 @@ impl<R: Read + Seek> HfsFilesystem<R> {
             partition_offset,
             mdb,
             catalog_data,
+            extents_overflow_data: None,
             bitmap: None,
             pending_boot_blocks: None,
             pending_volume_dates: None,
@@ -850,19 +856,20 @@ impl<R: Read + Seek> HfsFilesystem<R> {
                 Ok(())
             }
             Err(_) => {
-                // Leaf full — split, insert into correct half, rebuild index
+                // Leaf full — split-and-insert atomically. The merged
+                // partition uses a byte-based split point, which is robust
+                // to uneven catalog record sizes (split-then-insert with a
+                // count-based split could leave the target half too packed
+                // for the new record).
                 let mut h = BTreeHeader::read(&self.catalog_data);
-                let (new_idx, split_key) =
-                    btree_split_leaf(&mut self.catalog_data, node_size, leaf_idx, &mut h)?;
-
-                let target = if Self::catalog_compare(key_record, &split_key) == Ordering::Less {
-                    leaf_idx
-                } else {
-                    new_idx
-                };
-                let t_offset = target as usize * node_size;
-                let t_node = &mut self.catalog_data[t_offset..t_offset + node_size];
-                btree_insert_record(t_node, node_size, key_record, &Self::catalog_compare)?;
+                let _ = hfs_common::btree_split_leaf_with_insert(
+                    &mut self.catalog_data,
+                    node_size,
+                    leaf_idx,
+                    &mut h,
+                    key_record,
+                    &Self::catalog_compare,
+                )?;
 
                 h.leaf_records += 1;
                 h.write(&mut self.catalog_data);
@@ -991,6 +998,8 @@ impl<R: Read + Seek> HfsFilesystem<R> {
             used_bytes: used_blocks * self.mdb.block_size as u64,
             file_count: self.mdb.file_count,
             folder_count: self.mdb.folder_count,
+            catalog_file_size: self.mdb.catalog_file_size,
+            extents_file_size: self.mdb.extents_file_size,
         }
     }
 
@@ -1026,6 +1035,90 @@ impl<R: Read + Seek> HfsFilesystem<R> {
             extents,
             size,
         )
+    }
+
+    /// Lazily load the extents-overflow B-tree fork into memory. No-op if
+    /// already loaded or if the volume has no extents-overflow file.
+    fn ensure_extents_overflow(&mut self) -> Result<(), FilesystemError> {
+        if self.extents_overflow_data.is_some() {
+            return Ok(());
+        }
+        if self.mdb.extents_file_size == 0 {
+            return Ok(());
+        }
+        let data = read_fork_data(
+            &mut self.reader,
+            self.partition_offset,
+            &self.mdb,
+            &self.mdb.extents_file_extents,
+            self.mdb.extents_file_size as u64,
+        )?;
+        self.extents_overflow_data = Some(data);
+        Ok(())
+    }
+
+    /// Read a fork's content combining the 3 inline extents with any
+    /// overflow records in the extents-overflow B-tree. Used for files
+    /// fragmented past the inline limit.
+    ///
+    /// `fork_type`: `0x00` for the data fork, `0xFF` for the resource fork.
+    fn read_fork_with_overflow(
+        &mut self,
+        file_id: u32,
+        fork_type: u8,
+        inline: &[HfsExtDescriptor; 3],
+        size: u64,
+    ) -> Result<Vec<u8>, FilesystemError> {
+        let mut data = read_fork_data(
+            &mut self.reader,
+            self.partition_offset,
+            &self.mdb,
+            inline,
+            size,
+        )?;
+        if (data.len() as u64) >= size {
+            return Ok(data);
+        }
+
+        self.ensure_extents_overflow()?;
+        let Some(ext_data) = self.extents_overflow_data.as_ref() else {
+            return Err(FilesystemError::InvalidData(format!(
+                "file {file_id} fork {fork_type:#x}: {size} bytes requested but only {} bytes \
+                 in inline extents and no extents-overflow B-tree present",
+                data.len()
+            )));
+        };
+
+        let inline_blocks: u32 = inline.iter().map(|e| e.block_count as u32).sum();
+        let overflow = collect_fork_overflow_extents(ext_data, file_id, fork_type, inline_blocks);
+
+        let block_size = self.mdb.block_size as u64;
+        let first_alloc_offset = self.partition_offset + self.mdb.first_alloc_block as u64 * 512;
+
+        for ext in overflow {
+            if data.len() as u64 >= size {
+                break;
+            }
+            if ext.block_count == 0 {
+                continue;
+            }
+            let offset = first_alloc_offset + ext.start_block as u64 * block_size;
+            let extent_len = ext.block_count as u64 * block_size;
+            let to_read = extent_len.min(size - data.len() as u64) as usize;
+            self.reader.seek(SeekFrom::Start(offset))?;
+            let mut buf = vec![0u8; to_read];
+            self.reader.read_exact(&mut buf)?;
+            data.extend_from_slice(&buf);
+        }
+
+        if (data.len() as u64) < size {
+            return Err(FilesystemError::InvalidData(format!(
+                "file {file_id} fork {fork_type:#x}: extents (inline + overflow) cover \
+                 {} of {size} bytes",
+                data.len()
+            )));
+        }
+        Ok(data)
     }
 
     /// Locate the catalog record-data offset for a file or directory CNID by
@@ -1235,10 +1328,52 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
     /// MDB is authoritative; Mac OS only falls back to the alternate if the
     /// primary is corrupt, and the stale alternate remains structurally valid.
     fn write_mdb(&mut self) -> Result<(), FilesystemError> {
+        // Stamp drAtrb with the "volume successfully unmounted" bit (0x0100).
+        // Without it, classic Mac OS treats the volume as dirty and refuses
+        // to put it on the desktop until it's scavenged — for a freshly
+        // built clone that's never been mounted, that produces a disk LIDO
+        // sees over SCSI but the Finder ignores. This is sync-time because
+        // by the time we get here every catalog record + bitmap bit + alt
+        // MDB has been flushed to the writer.
+        BigEndian::write_u16(&mut self.mdb.raw_sector[10..12], 0x0100);
+
+        // Count the root directory's direct children. drNmFls (offset 12)
+        // and drNmRtDirs (offset 82) hold the number of files / directories
+        // immediately under CNID 2; the Finder uses these to decide
+        // whether the volume's root listing is consistent. Real-world
+        // disks always populate them, so missing values look suspect.
+        let (root_files, root_dirs) = match self.list_children(2) {
+            Ok(children) => {
+                let mut f = 0u16;
+                let mut d = 0u16;
+                for c in &children {
+                    match c {
+                        CatalogRecord::File { .. } => f = f.saturating_add(1),
+                        CatalogRecord::Directory { .. } => d = d.saturating_add(1),
+                    }
+                }
+                (f, d)
+            }
+            Err(_) => (0, 0),
+        };
+        BigEndian::write_u16(&mut self.mdb.raw_sector[12..14], root_files);
+        BigEndian::write_u16(&mut self.mdb.raw_sector[82..84], root_dirs);
+
         let mdb_bytes = self.mdb.serialize_to_sector();
         self.reader
             .seek(SeekFrom::Start(self.partition_offset + 1024))?;
         self.reader.write_all(&mdb_bytes)?;
+        // Mirror to the alternate MDB at the sector right after the last
+        // allocation block. Mac OS rejects volumes whose primary and alt
+        // MDBs disagree, so this must stay in sync with the primary write.
+        if self.mdb.block_size > 0 && self.mdb.total_blocks > 0 {
+            let sectors_per_block = self.mdb.block_size as u64 / 512;
+            let alt_sector = self.mdb.first_alloc_block as u64
+                + self.mdb.total_blocks as u64 * sectors_per_block;
+            let alt_offset = self.partition_offset + alt_sector * 512;
+            self.reader.seek(SeekFrom::Start(alt_offset))?;
+            self.reader.write_all(&mdb_bytes)?;
+        }
         Ok(())
     }
 
@@ -1495,7 +1630,12 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
                     "cannot initialize empty HFS catalog: region is only {catalog_size} bytes"
                 )));
             }
-            let buf = build_empty_hfs_catalog(catalog_size)?;
+            // Build the empty catalog with the current volume name so the
+            // root dir record's key carries it (Mac OS looks up the root by
+            // (parent=1, drVN) and rejects volumes with an empty key).
+            let vol_name = self.mdb.volume_name_raw.clone();
+            let node_size = pick_btree_node_size(catalog_size as u64) as usize;
+            let buf = build_empty_hfs_catalog_with_node_size(catalog_size, node_size, &vol_name)?;
             self.catalog_data = buf;
             self.write_catalog()?;
         }
@@ -1564,8 +1704,39 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
 
 /// Build a fresh classic HFS catalog B-tree with a header node plus a single
 /// leaf node containing the root directory record and its thread record.
+#[cfg(test)]
 fn build_empty_hfs_catalog(catalog_size: usize) -> Result<Vec<u8>, FilesystemError> {
-    let node_size = 512usize;
+    build_empty_hfs_catalog_with_node_size(catalog_size, 512, &[])
+}
+
+/// Classic Mac OS expects HFS B-tree node size = 512 bytes. While the on-disk
+/// format technically allows larger node sizes, Apple's reference tools and
+/// CiderPress2 both hard-code 512, and an emulated Quadra produced "error
+/// type -127" when fed a catalog with 1024-byte nodes. Always use 512.
+///
+/// The header node's bitmap covers `(512 - 256) * 8 = 2048` nodes; trees that
+/// need more nodes require additional MAP nodes (NodeType=2) chained off the
+/// header — not yet implemented here. Callers should size their B-tree files
+/// to ≤ 1 MB (2048 nodes × 512 bytes) until that's wired up.
+fn pick_btree_node_size(_target_bytes: u64) -> u16 {
+    512
+}
+
+/// Largest B-tree file size we can produce without needing map nodes.
+/// `(node_size=512) * (2048 bits in header bitmap) = 1 MiB`.
+pub const HFS_MAX_BTREE_FILE_SIZE: u32 = 1024 * 1024;
+
+fn build_empty_hfs_catalog_with_node_size(
+    catalog_size: usize,
+    node_size: usize,
+    volume_name_raw: &[u8],
+) -> Result<Vec<u8>, FilesystemError> {
+    if volume_name_raw.len() > 27 {
+        return Err(FilesystemError::InvalidData(format!(
+            "HFS volume name length {} exceeds 27 Mac Roman bytes",
+            volume_name_raw.len()
+        )));
+    }
     let total_nodes = (catalog_size / node_size) as u32;
     if total_nodes < 2 {
         return Err(FilesystemError::InvalidData(format!(
@@ -1611,14 +1782,22 @@ fn build_empty_hfs_catalog(catalog_size: usize) -> Result<Vec<u8>, FilesystemErr
     buf[leaf + 9] = 1; // height
     BigEndian::write_u16(&mut buf[leaf + 10..leaf + 12], 2); // 2 records
 
-    // Record 0: Root directory (key: parent CNID 1, empty name)
+    // Record 0: Root directory (key: parent CNID 1, name = volume name).
+    // Mac OS looks up the root dir via (parent=1, drVN); a record with
+    // name="" makes it return -127 ("File system internal error").
+    let name_len = volume_name_raw.len();
     let r0_key = leaf + 14;
-    buf[r0_key] = 6; // key_len = resv+parID+nameLen = 6
+    let key_data_len: u8 = (1 + 4 + 1 + name_len) as u8; // resv + parID + nameLen + name
+    buf[r0_key] = key_data_len;
     buf[r0_key + 1] = 0;
     BigEndian::write_u32(&mut buf[r0_key + 2..r0_key + 6], 1);
-    buf[r0_key + 6] = 0; // name_len
-    buf[r0_key + 7] = 0; // pad to even
-    let r0_data = r0_key + 8; // 22
+    buf[r0_key + 6] = name_len as u8;
+    buf[r0_key + 7..r0_key + 7 + name_len].copy_from_slice(volume_name_raw);
+    // Records start on even offsets within a node; pad an extra byte if the
+    // key total (1 + key_data_len) is odd.
+    let r0_key_total = 1 + key_data_len as usize;
+    let r0_pad = r0_key_total & 1;
+    let r0_data = r0_key + r0_key_total + r0_pad;
     buf[r0_data] = CATALOG_DIR as u8;
     BigEndian::write_u32(&mut buf[r0_data + 6..r0_data + 10], 2); // dirDirID = root CNID 2
     let now = hfs_common::hfs_now();
@@ -1626,19 +1805,24 @@ fn build_empty_hfs_catalog(catalog_size: usize) -> Result<Vec<u8>, FilesystemErr
     BigEndian::write_u32(&mut buf[r0_data + 14..r0_data + 18], now); // mdDate
                                                                      // Remainder of the 70-byte CdrDirRec stays zero.
 
-    // Record 1: Root directory thread (key: parent CNID 2, empty name)
-    let r1_key = r0_data + 70; // 92
+    // Record 1: Root directory thread (key: parent CNID 2, empty name).
+    // Per HFS spec the thread RECORD's *key* uses an empty name; the volume
+    // name lives in the thread DATA's `thdCName` field at offset 14 of the
+    // 46-byte thread record.
+    let r1_key = r0_data + 70;
     buf[r1_key] = 6;
     buf[r1_key + 1] = 0;
     BigEndian::write_u32(&mut buf[r1_key + 2..r1_key + 6], 2);
     buf[r1_key + 6] = 0;
     buf[r1_key + 7] = 0;
-    let r1_data = r1_key + 8; // 100
+    let r1_data = r1_key + 8;
     buf[r1_data] = CATALOG_DIR_THREAD as u8;
     BigEndian::write_u32(&mut buf[r1_data + 10..r1_data + 14], 1); // thdParID = 1
-                                                                   // Remaining bytes (Str31 name, 32 bytes) stay zero. Thread record = 46 bytes.
+    buf[r1_data + 14] = name_len as u8;
+    buf[r1_data + 15..r1_data + 15 + name_len].copy_from_slice(volume_name_raw);
+    // Remaining bytes of the Str31 name stay zero. Thread record = 46 bytes.
 
-    let free_rel = (r1_data + 46 - leaf) as u16; // 146
+    let free_rel = (r1_data + 46 - leaf) as u16;
 
     // Leaf offset table (2 records + free space)
     BigEndian::write_u16(&mut buf[leaf + node_size - 2..leaf + node_size], 14);
@@ -1658,7 +1842,13 @@ fn build_empty_hfs_catalog(catalog_size: usize) -> Result<Vec<u8>, FilesystemErr
 /// header node (no leaf records). This is the minimal valid shape for a
 /// volume with no files that spill beyond three extents per fork.
 fn build_empty_hfs_extents_btree(size: usize) -> Result<Vec<u8>, FilesystemError> {
-    let node_size = 512usize;
+    build_empty_hfs_extents_btree_with_node_size(size, 512)
+}
+
+fn build_empty_hfs_extents_btree_with_node_size(
+    size: usize,
+    node_size: usize,
+) -> Result<Vec<u8>, FilesystemError> {
     let total_nodes = (size / node_size) as u32;
     if total_nodes < 1 {
         return Err(FilesystemError::InvalidData(format!(
@@ -1710,7 +1900,8 @@ fn build_empty_hfs_extents_btree(size: usize) -> Result<Vec<u8>, FilesystemError
 /// - blocks 0..4: extents-overflow B-tree (header-only)
 /// - blocks 4..8: catalog B-tree (header + leaf with root dir + root thread)
 /// - blocks 8..: free
-/// - last sector: alternate MDB (mirror of primary)
+/// - next-to-last sector: alternate MDB (mirror of primary)
+/// - last sector: reserved (zero) — required by HFS spec
 ///
 /// The volume's `drFndrInfo`, dates and boot blocks are left at defaults;
 /// callers (e.g. Step 6 of the expand-block-size plan) overwrite those
@@ -1722,6 +1913,21 @@ pub fn create_blank_hfs(
     target_size_bytes: u64,
     block_size: u32,
     volume_name: &str,
+) -> Result<Vec<u8>, FilesystemError> {
+    create_blank_hfs_sized(target_size_bytes, block_size, volume_name, 0, 0)
+}
+
+/// Variant of [`create_blank_hfs`] that lets the caller request minimum
+/// extents-overflow and catalog B-tree sizes (in bytes). Each is rounded up
+/// to a whole allocation block; values smaller than the 4-block default are
+/// raised to that floor. Used by the expand-block-size pipeline so the new
+/// volume's catalog can hold every record from a fragmented source.
+pub fn create_blank_hfs_sized(
+    target_size_bytes: u64,
+    block_size: u32,
+    volume_name: &str,
+    min_extents_bytes: u32,
+    min_catalog_bytes: u32,
 ) -> Result<Vec<u8>, FilesystemError> {
     if block_size == 0 || block_size % 512 != 0 {
         return Err(FilesystemError::InvalidData(format!(
@@ -1748,7 +1954,7 @@ pub fn create_blank_hfs(
                 "HFS volume too small ({target_size_bytes} bytes) for block_size {block_size}"
             )));
         }
-        let usable = target_size_bytes - pre_alloc - 512; // minus alt MDB
+        let usable = target_size_bytes - pre_alloc - 1024; // minus alt MDB + reserved last sector
         let tb = usable / block_size as u64;
         if tb == 0 {
             return Err(FilesystemError::InvalidData(format!(
@@ -1771,43 +1977,66 @@ pub fn create_blank_hfs(
         first_alloc_block = needed;
     }
 
-    // B-trees consume the first 8 allocation blocks (4 extents + 4 catalog).
-    const EXTENTS_START: u16 = 0;
-    const EXTENTS_BLOCKS: u16 = 4;
-    const CATALOG_START: u16 = EXTENTS_BLOCKS;
-    const CATALOG_BLOCKS: u16 = 4;
-    const BTREE_BLOCKS: u16 = EXTENTS_BLOCKS + CATALOG_BLOCKS;
+    // B-trees consume contiguous allocation blocks at the start of the
+    // partition. Default 4+4; callers can request larger via
+    // min_*_bytes. Each is rounded up to a whole allocation block.
+    let blocks_for = |bytes: u32| -> u16 {
+        let n = (bytes as u64).div_ceil(block_size as u64).max(4);
+        n.min(u16::MAX as u64) as u16
+    };
+    let extents_blocks = blocks_for(min_extents_bytes);
+    let catalog_blocks = blocks_for(min_catalog_bytes);
+    let extents_start: u16 = 0;
+    let catalog_start: u16 = extents_blocks;
+    let btree_blocks: u16 = extents_blocks + catalog_blocks;
 
-    if total_blocks < BTREE_BLOCKS as u32 {
+    if total_blocks < btree_blocks as u32 {
         return Err(FilesystemError::InvalidData(format!(
-            "HFS volume too small: {total_blocks} allocation blocks is below the minimum of {BTREE_BLOCKS} needed for B-trees"
+            "HFS volume too small: {total_blocks} allocation blocks is below the minimum of {btree_blocks} needed for B-trees"
         )));
     }
 
-    let extents_size = EXTENTS_BLOCKS as u32 * block_size;
-    let catalog_size = CATALOG_BLOCKS as u32 * block_size;
+    let extents_size = extents_blocks as u32 * block_size;
+    let catalog_size = catalog_blocks as u32 * block_size;
 
-    let image_size = first_alloc_block as u64 * 512 + total_blocks as u64 * block_size as u64 + 512;
+    // Scale node_size up from 512 when the B-tree file would have more nodes
+    // than the header-node bitmap can address. This avoids needing dedicated
+    // "map nodes" while still being spec-compliant.
+    let extents_node_size = pick_btree_node_size(extents_size as u64) as usize;
+    let catalog_node_size = pick_btree_node_size(catalog_size as u64) as usize;
+
+    // Per HFS spec: alt MDB lives at the *next-to-last* sector of the volume,
+    // and the very last sector is reserved (zero). Reserve two trailing sectors.
+    let image_size =
+        first_alloc_block as u64 * 512 + total_blocks as u64 * block_size as u64 + 1024;
     let mut img = vec![0u8; image_size as usize];
 
-    // Volume bitmap at sector 3: mark the first BTREE_BLOCKS allocation
+    // Volume bitmap at sector 3: mark the first btree_blocks allocation
     // blocks as used (the rest remain free).
     let bitmap_off = 3 * 512;
-    for b in 0..BTREE_BLOCKS as u32 {
+    for b in 0..btree_blocks as u32 {
         let byte_idx = (b / 8) as usize;
         let bit_idx = 7 - (b % 8) as u8;
         img[bitmap_off + byte_idx] |= 1 << bit_idx;
     }
 
     // Extents B-tree (header-only; no leaf records)
-    let extents_bytes = build_empty_hfs_extents_btree(extents_size as usize)?;
-    let extents_off = first_alloc_block as u64 * 512 + EXTENTS_START as u64 * block_size as u64;
+    let extents_bytes =
+        build_empty_hfs_extents_btree_with_node_size(extents_size as usize, extents_node_size)?;
+    let extents_off = first_alloc_block as u64 * 512 + extents_start as u64 * block_size as u64;
     img[extents_off as usize..extents_off as usize + extents_bytes.len()]
         .copy_from_slice(&extents_bytes);
 
-    // Catalog B-tree with root directory (CNID 2) + its thread record
-    let catalog_bytes = build_empty_hfs_catalog(catalog_size as usize)?;
-    let catalog_off = first_alloc_block as u64 * 512 + CATALOG_START as u64 * block_size as u64;
+    // Catalog B-tree with root directory (CNID 2) + its thread record.
+    // The volume name lives in the root dir record's KEY (parent=1) and
+    // in the root thread record's `thdCName` data field. Mac OS looks
+    // these up by drVN at mount time.
+    let catalog_bytes = build_empty_hfs_catalog_with_node_size(
+        catalog_size as usize,
+        catalog_node_size,
+        &name_raw,
+    )?;
+    let catalog_off = first_alloc_block as u64 * 512 + catalog_start as u64 * block_size as u64;
     img[catalog_off as usize..catalog_off as usize + catalog_bytes.len()]
         .copy_from_slice(&catalog_bytes);
 
@@ -1817,19 +2046,19 @@ pub fn create_blank_hfs(
         total_blocks as u16,
         block_size,
         first_alloc_block,
-        CATALOG_START,
-        CATALOG_BLOCKS,
+        catalog_start,
+        catalog_blocks,
         catalog_size,
-        EXTENTS_START,
-        EXTENTS_BLOCKS,
+        extents_start,
+        extents_blocks,
         extents_size,
-        BTREE_BLOCKS,
+        btree_blocks,
     );
     img[1024..1024 + 512].copy_from_slice(&mdb);
 
-    // Alternate MDB at the sector immediately after the last allocation
-    // block (= last 512 bytes of the image).
-    let alt_off = image_size as usize - 512;
+    // Alternate MDB at the next-to-last sector (= immediately after the last
+    // allocation block); the final sector stays zero (reserved by Apple).
+    let alt_off = image_size as usize - 1024;
     img[alt_off..alt_off + 512].copy_from_slice(&mdb);
 
     Ok(img)
@@ -1971,13 +2200,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
                 FilesystemError::NotFound(format!("file id {file_id} not found in catalog"))
             })?;
 
-        let mut data = read_fork_data(
-            &mut self.reader,
-            self.partition_offset,
-            &self.mdb,
-            &extents,
-            data_size as u64,
-        )?;
+        let mut data = self.read_fork_with_overflow(file_id, 0x00, &extents, data_size as u64)?;
         data.truncate(max_bytes);
         Ok(data)
     }
@@ -2031,13 +2254,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
         if rsrc_size == 0 {
             return Ok(0);
         }
-        let data = read_fork_data(
-            &mut self.reader,
-            self.partition_offset,
-            &self.mdb,
-            &rsrc_extents,
-            rsrc_size as u64,
-        )?;
+        let data = self.read_fork_with_overflow(file_id, 0xFF, &rsrc_extents, rsrc_size as u64)?;
         writer.write_all(&data)?;
         Ok(data.len() as u64)
     }
@@ -2554,6 +2771,85 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
 }
 
 /// Read fork data from the 3-extent descriptor array in the MDB.
+/// Walk the extents-overflow B-tree leaf chain and collect every extent
+/// record matching `(file_id, fork_type)` whose key startBlock is at or after
+/// `min_start_block`. Returned in startBlock order (records appear in key
+/// order on disk; we sort defensively in case of corruption).
+fn collect_fork_overflow_extents(
+    extents_data: &[u8],
+    file_id: u32,
+    fork_type: u8,
+    min_start_block: u32,
+) -> Vec<HfsExtDescriptor> {
+    use super::hfs_common::{btree_record_range, BTreeHeader, BTREE_LEAF_NODE};
+    use std::collections::HashSet;
+
+    let mut out: Vec<(u16, HfsExtDescriptor)> = Vec::new();
+    if extents_data.len() < 512 {
+        return Vec::new();
+    }
+    let header = BTreeHeader::read(extents_data);
+    let node_size = header.node_size as usize;
+    if node_size == 0 || extents_data.len() < node_size {
+        return Vec::new();
+    }
+
+    let mut node_idx = header.first_leaf_node;
+    let mut visited: HashSet<u32> = HashSet::new();
+    while node_idx != 0 {
+        if !visited.insert(node_idx) {
+            break;
+        }
+        let off = node_idx as usize * node_size;
+        if off + node_size > extents_data.len() {
+            break;
+        }
+        let node = &extents_data[off..off + node_size];
+        let flink = BigEndian::read_u32(&node[0..4]);
+        let kind = node[8] as i8;
+        if kind != BTREE_LEAF_NODE {
+            break;
+        }
+        let num_records = BigEndian::read_u16(&node[10..12]) as usize;
+        for i in 0..num_records {
+            let (rec_start, _) = btree_record_range(node, node_size, i);
+            if rec_start + 8 > node_size {
+                continue;
+            }
+            let key_len = node[rec_start] as usize;
+            if key_len < 7 || rec_start + 1 + key_len > node_size {
+                continue;
+            }
+            let rec_fork_type = node[rec_start + 1];
+            let rec_file_id = BigEndian::read_u32(&node[rec_start + 2..rec_start + 6]);
+            let rec_start_block = BigEndian::read_u16(&node[rec_start + 6..rec_start + 8]);
+            if rec_fork_type != fork_type || rec_file_id != file_id {
+                continue;
+            }
+            if (rec_start_block as u32) < min_start_block {
+                continue;
+            }
+            let mut data_off = rec_start + 1 + key_len;
+            if data_off % 2 != 0 {
+                data_off += 1;
+            }
+            if data_off + 12 > node_size {
+                continue;
+            }
+            for j in 0..3 {
+                let ext = HfsExtDescriptor::parse(&node[data_off + j * 4..data_off + j * 4 + 4]);
+                if ext.block_count > 0 {
+                    out.push((rec_start_block, ext));
+                }
+            }
+        }
+        node_idx = flink;
+    }
+
+    out.sort_by_key(|(sb, _)| *sb);
+    out.into_iter().map(|(_, e)| e).collect()
+}
+
 fn read_fork_data<R: Read + Seek>(
     reader: &mut R,
     partition_offset: u64,
@@ -3157,15 +3453,15 @@ mod tests {
         let image_size = alloc_start + total_blocks as usize * block_size as usize;
         let mut img = vec![0u8; image_size];
 
-        let catalog_start = 0u16; // first 4 allocation blocks
-        let catalog_blocks = 4u16;
+        let catalog_start = 0u16; // first 8 allocation blocks
+        let catalog_blocks = 8u16;
         let catalog_size = catalog_blocks as u32 * block_size;
 
         // Volume bitmap at sector 3 (byte 1536)
         let bitmap_sector = 3u16;
         let bitmap_off = bitmap_sector as usize * 512;
-        // Mark blocks 0-3 as allocated (catalog)
-        img[bitmap_off] = 0b11110000;
+        // Mark blocks 0-7 as allocated (catalog spans 8 blocks)
+        img[bitmap_off] = 0b11111111;
 
         // Build catalog B-tree
         let node_size = 4096usize;
@@ -3185,8 +3481,8 @@ mod tests {
         BigEndian::write_u32(&mut img[hr + 14..hr + 18], 1); // last_leaf_node = 1
         BigEndian::write_u16(&mut img[hr + 18..hr + 20], node_size as u16); // node_size
         BigEndian::write_u16(&mut img[hr + 20..hr + 22], 37); // max_key_len
-        BigEndian::write_u32(&mut img[hr + 22..hr + 26], 4); // total_nodes = 4
-        BigEndian::write_u32(&mut img[hr + 26..hr + 30], 2); // free_nodes = 2
+        BigEndian::write_u32(&mut img[hr + 22..hr + 26], 8); // total_nodes = 8
+        BigEndian::write_u32(&mut img[hr + 26..hr + 30], 6); // free_nodes = 6
 
         // Record offset table for header node
         let ot = hdr_off + node_size;
@@ -3382,8 +3678,8 @@ mod tests {
         assert_eq!(fs.fs_type(), "HFS");
         assert_eq!(fs.volume_label(), Some("TestVol"));
         let free = fs.free_space().unwrap();
-        // 124 free blocks × 4096 = 507,904
-        assert_eq!(free, 124 * 4096);
+        // 128 total - 8 catalog blocks = 120 free × 4096
+        assert_eq!(free, 120 * 4096);
     }
 
     #[test]
@@ -3982,6 +4278,145 @@ mod tests {
         assert!(
             result.errors.is_empty(),
             "fsck errors: {:?}",
+            result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// Synthesize a one-leaf extents-overflow B-tree blob and verify the
+    /// collector returns the expected (start_block, block_count) sequence
+    /// for the matching (file_id, fork_type), filtering by start_block.
+    #[test]
+    fn test_collect_fork_overflow_extents() {
+        let node_size = 512usize;
+        // 3 nodes: 0=header, 1=leaf, 2=unused.
+        let total_nodes = 3u32;
+        let mut buf = vec![0u8; node_size * total_nodes as usize];
+
+        // Header node.
+        buf[8] = hfs_common::BTREE_HEADER_NODE as u8;
+        BigEndian::write_u16(&mut buf[10..12], 3); // numRecords
+        BigEndian::write_u16(&mut buf[14..16], 1); // depth
+        BigEndian::write_u32(&mut buf[16..20], 1); // rootNode
+        BigEndian::write_u32(&mut buf[20..24], 1); // leafRecords (approx)
+        BigEndian::write_u32(&mut buf[24..28], 1); // firstLeafNode
+        BigEndian::write_u32(&mut buf[28..32], 1); // lastLeafNode
+        BigEndian::write_u16(&mut buf[32..34], node_size as u16);
+        BigEndian::write_u16(&mut buf[34..36], 7);
+        BigEndian::write_u32(&mut buf[36..40], total_nodes);
+        BigEndian::write_u32(&mut buf[40..44], total_nodes - 2);
+        // Mark nodes 0 and 1 allocated in the header-node bitmap (rec at 248).
+        buf[248] = 0b11000000;
+
+        // Leaf node at index 1.
+        let leaf_off = node_size;
+        let leaf = &mut buf[leaf_off..leaf_off + node_size];
+        leaf[8] = hfs_common::BTREE_LEAF_NODE as u8;
+        BigEndian::write_u16(&mut leaf[10..12], 1); // one record
+
+        // Record: key_len(1)=7, fork_type(1)=0x00, file_id(4)=0x100, start_block(2)=3
+        let rec_off = 14usize;
+        leaf[rec_off] = 7;
+        leaf[rec_off + 1] = 0x00;
+        BigEndian::write_u32(&mut leaf[rec_off + 2..rec_off + 6], 0x100);
+        BigEndian::write_u16(&mut leaf[rec_off + 6..rec_off + 8], 3);
+        // 3 extent descriptors (4 bytes each) immediately after key (already even).
+        let data_off = rec_off + 8;
+        BigEndian::write_u16(&mut leaf[data_off..data_off + 2], 50); // start
+        BigEndian::write_u16(&mut leaf[data_off + 2..data_off + 4], 2); // count
+        BigEndian::write_u16(&mut leaf[data_off + 4..data_off + 6], 60);
+        BigEndian::write_u16(&mut leaf[data_off + 6..data_off + 8], 1);
+        BigEndian::write_u16(&mut leaf[data_off + 8..data_off + 10], 0); // unused
+        BigEndian::write_u16(&mut leaf[data_off + 10..data_off + 12], 0);
+
+        // Record offset table: rec0 starts at 14, free at 14+8+12=34.
+        let nr = 1usize;
+        BigEndian::write_u16(&mut leaf[node_size - 2..], 14);
+        BigEndian::write_u16(&mut leaf[node_size - 4..node_size - 2], 34);
+        let _ = nr;
+
+        // Match: same file, data fork, start_block >= 3.
+        let got = collect_fork_overflow_extents(&buf, 0x100, 0x00, 3);
+        assert_eq!(got.len(), 2, "expected 2 non-empty extents, got {got:?}");
+        assert_eq!((got[0].start_block, got[0].block_count), (50, 2));
+        assert_eq!((got[1].start_block, got[1].block_count), (60, 1));
+
+        // Filter by min_start_block: skip record whose key startBlock < 4.
+        let none = collect_fork_overflow_extents(&buf, 0x100, 0x00, 4);
+        assert!(
+            none.is_empty(),
+            "expected empty when filtered, got {none:?}"
+        );
+
+        // Wrong fork_type returns nothing.
+        let rsrc = collect_fork_overflow_extents(&buf, 0x100, 0xFF, 0);
+        assert!(rsrc.is_empty());
+
+        // Wrong file_id returns nothing.
+        let other = collect_fork_overflow_extents(&buf, 0x101, 0x00, 0);
+        assert!(other.is_empty());
+    }
+
+    /// `create_blank_hfs_sized` with non-default catalog/extents sizes
+    /// produces an fsck-clean image that opens with the requested B-tree
+    /// sizes (rounded up to the next allocation block).
+    #[test]
+    fn test_create_blank_hfs_sized_custom_btree_sizes() {
+        let block_size = 32 * 1024u32;
+        // Ask for 256 KiB catalog and 64 KiB extents-overflow.
+        let img =
+            create_blank_hfs_sized(64 * 1024 * 1024, block_size, "Sized", 64 * 1024, 256 * 1024)
+                .expect("create_blank_hfs_sized");
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        // 64 KiB / 32 KiB = 2 blocks → bumped to 4 (default floor).
+        assert_eq!(fs.mdb().extents_file_size, 4 * block_size);
+        // 256 KiB / 32 KiB = 8 blocks.
+        assert_eq!(fs.mdb().catalog_file_size, 8 * block_size);
+        let result = fs.fsck().expect("fsck");
+        assert!(
+            result.errors.is_empty(),
+            "unexpected fsck errors: {:?}",
+            result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// `pick_btree_node_size` always returns 512 — classic Mac OS rejects
+    /// larger node sizes (Quadra ROM produces error -127). Map nodes are
+    /// the long-term answer for >1 MiB B-tree files; until they exist we
+    /// just pin the node size and rely on callers to clamp file sizes.
+    #[test]
+    fn test_pick_btree_node_size_thresholds() {
+        assert_eq!(pick_btree_node_size(512 * 2048), 512);
+        assert_eq!(pick_btree_node_size(512 * 2049), 512);
+        assert_eq!(pick_btree_node_size(1024 * 6144), 512);
+        assert_eq!(pick_btree_node_size(u32::MAX as u64), 512);
+    }
+
+    /// Even when the caller asks for a B-tree size above the 1 MiB header-
+    /// bitmap budget, the produced volume still uses node_size=512. The
+    /// caller is responsible for clamping; the builder keeps Mac-OS-friendly
+    /// nodes and produces a fsck-clean image.
+    #[test]
+    fn test_create_blank_hfs_sized_large_catalog() {
+        let block_size = 32 * 1024u32;
+        let img = create_blank_hfs_sized(
+            128 * 1024 * 1024,
+            block_size,
+            "Big",
+            0,
+            HFS_MAX_BTREE_FILE_SIZE,
+        )
+        .expect("create_blank_hfs_sized big catalog");
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).expect("open big");
+        let cat = fs.catalog_data();
+        let node_size = BigEndian::read_u16(&cat[32..34]);
+        assert_eq!(
+            node_size, 512,
+            "node_size must stay at 512 for Mac OS compat"
+        );
+        let result = fs.fsck().expect("fsck big");
+        assert!(
+            result.errors.is_empty(),
+            "unexpected fsck errors: {:?}",
             result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
         );
     }

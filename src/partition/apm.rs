@@ -13,7 +13,32 @@ pub struct DriverDescriptorRecord {
     pub signature: u16,
     pub block_size: u16,
     pub block_count: u32,
+    /// `sbDevType` at offset 8.
+    #[serde(default)]
+    pub dev_type: u16,
+    /// `sbDevId` at offset 10.
+    #[serde(default)]
+    pub dev_id: u16,
+    /// `sbData` at offset 12.
+    #[serde(default)]
+    pub sb_data: u32,
     pub driver_count: u16,
+    /// `drDriverInfo` array starting at offset 18 — one entry per driver.
+    /// Mac ROMs use these to load SCSI drivers at boot, so they must be
+    /// preserved verbatim when rebuilding a disk.
+    #[serde(default)]
+    pub driver_info: Vec<DriverInfo>,
+}
+
+/// One entry in the DDR's `drDriverInfo` array (8 bytes).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DriverInfo {
+    /// `ddBlock` — first block of the driver code on the disk.
+    pub block: u32,
+    /// `ddSize` — driver size in 512-byte blocks.
+    pub size: u16,
+    /// `ddType` — driver type (1 = Mac OS, etc.).
+    pub kind: u16,
 }
 
 /// A single Apple Partition Map entry (one per block, starting at block 1).
@@ -34,6 +59,13 @@ pub struct ApmPartitionEntry {
     pub boot_entry: u64,
     pub boot_checksum: u32,
     pub processor: String,
+    /// Bytes 136..512 of the entry (`pmPad`). Apple's HD SC and similar
+    /// formatters stash a driver-descriptor table here for `Apple_Driver43`
+    /// entries; without it the ROM cannot load the SCSI driver and the
+    /// emulator/host doesn't even see the disk. Preserved verbatim from the
+    /// source on parse, written back unmodified by `to_bytes`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pad: Vec<u8>,
 }
 
 impl ApmPartitionEntry {
@@ -62,6 +94,7 @@ impl ApmPartitionEntry {
             boot_entry: BigEndian::read_u64(&data[108..116]),
             boot_checksum: BigEndian::read_u32(&data[116..120]),
             processor: parse_c_string(&data[120..136]),
+            pad: data[136..512].to_vec(),
         })
     }
 
@@ -84,6 +117,11 @@ impl ApmPartitionEntry {
         BigEndian::write_u64(&mut buf[108..116], self.boot_entry);
         BigEndian::write_u32(&mut buf[116..120], self.boot_checksum);
         write_c_string(&mut buf[120..136], &self.processor);
+        // Preserve `pmPad` verbatim from source. Apple_Driver43 entries
+        // carry driver-descriptor metadata here; zeroing it makes the ROM
+        // skip the disk entirely.
+        let pad_len = self.pad.len().min(512 - 136);
+        buf[136..136 + pad_len].copy_from_slice(&self.pad[..pad_len]);
         buf
     }
 
@@ -148,11 +186,28 @@ impl Apm {
             )));
         }
 
+        let driver_count = BigEndian::read_u16(&ddr_buf[16..18]);
+        let mut driver_info = Vec::with_capacity(driver_count as usize);
+        for i in 0..driver_count as usize {
+            let off = 18 + i * 8;
+            if off + 8 > ddr_buf.len() {
+                break;
+            }
+            driver_info.push(DriverInfo {
+                block: BigEndian::read_u32(&ddr_buf[off..off + 4]),
+                size: BigEndian::read_u16(&ddr_buf[off + 4..off + 6]),
+                kind: BigEndian::read_u16(&ddr_buf[off + 6..off + 8]),
+            });
+        }
         let ddr = DriverDescriptorRecord {
             signature: sig,
             block_size: BigEndian::read_u16(&ddr_buf[2..4]),
             block_count: BigEndian::read_u32(&ddr_buf[4..8]),
-            driver_count: BigEndian::read_u16(&ddr_buf[16..18]),
+            dev_type: BigEndian::read_u16(&ddr_buf[8..10]),
+            dev_id: BigEndian::read_u16(&ddr_buf[10..12]),
+            sb_data: BigEndian::read_u32(&ddr_buf[12..16]),
+            driver_count,
+            driver_info,
         };
 
         // Read first partition entry to get map_entries count
@@ -203,7 +258,19 @@ impl Apm {
             &mut buf[4..8],
             target_block_count.unwrap_or(self.ddr.block_count),
         );
+        BigEndian::write_u16(&mut buf[8..10], self.ddr.dev_type);
+        BigEndian::write_u16(&mut buf[10..12], self.ddr.dev_id);
+        BigEndian::write_u32(&mut buf[12..16], self.ddr.sb_data);
         BigEndian::write_u16(&mut buf[16..18], self.ddr.driver_count);
+        for (i, di) in self.ddr.driver_info.iter().enumerate() {
+            let off = 18 + i * 8;
+            if off + 8 > 512 {
+                break;
+            }
+            BigEndian::write_u32(&mut buf[off..off + 4], di.block);
+            BigEndian::write_u16(&mut buf[off + 4..off + 6], di.size);
+            BigEndian::write_u16(&mut buf[off + 6..off + 8], di.kind);
+        }
 
         // Write each partition entry
         for (i, entry) in self.entries.iter().enumerate() {
@@ -288,6 +355,7 @@ pub fn build_minimal_apm(
         boot_entry: 0,
         boot_checksum: 0,
         processor: String::new(),
+        pad: Vec::new(),
     };
 
     let mut apm_entries = vec![map_entry];
@@ -309,6 +377,7 @@ pub fn build_minimal_apm(
             boot_entry: 0,
             boot_checksum: 0,
             processor: String::new(),
+            pad: Vec::new(),
         });
     }
 
@@ -317,7 +386,11 @@ pub fn build_minimal_apm(
             signature: DDR_SIGNATURE,
             block_size: block_size as u16,
             block_count: total_blocks,
+            dev_type: 0,
+            dev_id: 0,
+            sb_data: 0,
             driver_count: 0,
+            driver_info: Vec::new(),
         },
         entries: apm_entries,
         map_entry_count: map_count,

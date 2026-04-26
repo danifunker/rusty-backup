@@ -574,6 +574,7 @@ fn apply_apm_edits(
                     boot_entry: 0,
                     boot_checksum: 0,
                     processor: String::new(),
+                    pad: Vec::new(),
                 });
 
                 // Update map_entries count

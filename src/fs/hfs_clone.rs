@@ -413,9 +413,20 @@ where
     // typically the OS folder, [5] the macOS X System file. We don't know
     // which slots hold CNIDs vs flags, so the "matches a known source CNID"
     // heuristic catches the right ones without disturbing flag fields.
+    //
+    // Slots 6 and 7 form the volume's "Finder ID" (`fndrInfo[6..8]` packed as
+    // a u64) — Finder uses it to recognise a previously-seen disk across
+    // mounts. Carrying the source's ID forward makes Mac OS treat the clone
+    // as "the source disk, modified outside our knowledge" and run Disk
+    // First Aid on first mount. Zeroing them lets Mac OS generate a fresh
+    // ID on first mount, so the clone presents as a new disk and skips the
+    // dirty-volume check.
     let known_source_cnids: HashSet<u32> = cnid_map.keys().copied().collect();
     let mut new_finder_info = [0u8; 32];
     for i in 0..8 {
+        if i == 6 || i == 7 {
+            continue; // leave Finder volume ID zeroed
+        }
         let src_val = snapshot.volume.finder_info[i];
         let mapped = if known_source_cnids.contains(&src_val) {
             *cnid_map.get(&src_val).unwrap()
@@ -615,44 +626,68 @@ where
     // driver verbatim, then the new HFS partition.
     let map_entries: u32 = 1 + drivers.len() as u32 + 1;
     let mut entries: Vec<ApmPartitionEntry> = Vec::with_capacity(map_entries as usize);
+    // Preserve the source's Apple_partition_map self-entry verbatim: keep its
+    // reserved block_count (typically 63 on classic Mac disks) and status
+    // flags (0x37 on bootable Quadra disks). Some Mac ROMs reject the disk
+    // if the self-entry's status is zero.
+    let source_self = source_apm
+        .entries
+        .iter()
+        .find(|e| e.partition_type == "Apple_partition_map");
+    let map_block_count = source_self.map(|e| e.block_count).unwrap_or(map_entries);
     entries.push(ApmPartitionEntry {
         signature: 0x504D,
         map_entries,
         start_block: 1,
-        block_count: map_entries,
-        name: "Apple".to_string(),
+        block_count: map_block_count,
+        name: source_self
+            .map(|e| e.name.clone())
+            .unwrap_or_else(|| "Apple".to_string()),
         partition_type: "Apple_partition_map".to_string(),
         data_start: 0,
-        data_count: map_entries,
-        status: 0x03,
-        boot_start: 0,
-        boot_size: 0,
-        boot_load: 0,
-        boot_entry: 0,
-        boot_checksum: 0,
-        processor: String::new(),
+        data_count: map_block_count,
+        status: source_self.map(|e| e.status).unwrap_or(0x37),
+        boot_start: source_self.map(|e| e.boot_start).unwrap_or(0),
+        boot_size: source_self.map(|e| e.boot_size).unwrap_or(0),
+        boot_load: source_self.map(|e| e.boot_load).unwrap_or(0),
+        boot_entry: source_self.map(|e| e.boot_entry).unwrap_or(0),
+        boot_checksum: source_self.map(|e| e.boot_checksum).unwrap_or(0),
+        processor: source_self.map(|e| e.processor.clone()).unwrap_or_default(),
+        pad: source_self.map(|e| e.pad.clone()).unwrap_or_default(),
     });
     for d in &drivers {
         let mut e = d.clone();
         e.map_entries = map_entries;
         entries.push(e);
     }
+    // Preserve the source's boot-related fields (status + pmBoot* + processor
+    // + name) on the new Apple_HFS entry. Quadra ROMs read these out of the
+    // partition map at boot, so a bootable source disk's flags must carry
+    // through to the expanded copy. Fall back to 0x33 / "MacOS" only when
+    // the source has no Apple_HFS entry.
+    let source_hfs = source_apm
+        .entries
+        .iter()
+        .find(|e| e.partition_type == "Apple_HFS");
     entries.push(ApmPartitionEntry {
         signature: 0x504D,
         map_entries,
         start_block: hfs_start_block,
         block_count: hfs_block_count,
-        name: "MacOS".to_string(),
+        name: source_hfs
+            .map(|e| e.name.clone())
+            .unwrap_or_else(|| "MacOS".to_string()),
         partition_type: "Apple_HFS".to_string(),
         data_start: 0,
         data_count: hfs_block_count,
-        status: 0x33, // valid + allocated + readable + writable
-        boot_start: 0,
-        boot_size: 0,
-        boot_load: 0,
-        boot_entry: 0,
-        boot_checksum: 0,
-        processor: String::new(),
+        status: source_hfs.map(|e| e.status).unwrap_or(0x33),
+        boot_start: source_hfs.map(|e| e.boot_start).unwrap_or(0),
+        boot_size: source_hfs.map(|e| e.boot_size).unwrap_or(0),
+        boot_load: source_hfs.map(|e| e.boot_load).unwrap_or(0),
+        boot_entry: source_hfs.map(|e| e.boot_entry).unwrap_or(0),
+        boot_checksum: source_hfs.map(|e| e.boot_checksum).unwrap_or(0),
+        processor: source_hfs.map(|e| e.processor.clone()).unwrap_or_default(),
+        pad: source_hfs.map(|e| e.pad.clone()).unwrap_or_default(),
     });
 
     let mut new_apm = source_apm.clone();

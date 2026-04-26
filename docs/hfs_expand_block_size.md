@@ -494,3 +494,181 @@ dialog.
   versions also stash CNIDs in `drFndrInfo[3]` (the OS folder) and
   `[5]` (Mac OS X System file). Copy all 8 ints verbatim with the
   CNID-remap applied, not just the first one.
+
+---
+
+## Bootability Lessons (learned during integration testing)
+
+Building an HFS volume that classic Mac OS / Quadra ROMs accept turned
+out to require getting several spec details exactly right. The ones
+that bit us, in roughly the order the symptoms appeared:
+
+### 1. APM partition entry `pmPad` (bytes 136..512) is not optional
+
+Apple's HD SC formatter writes a small driver-descriptor table into the
+unused tail of each `Apple_Driver43` partition entry. The Mac ROM reads
+this table at boot to locate the on-disk SCSI driver. Zeroing `pmPad`
+when re-emitting the partition map made the ROM skip the disk entirely
+— LIDO didn't see it on the SCSI bus and MacOS never prompted for
+anything. `ApmPartitionEntry` (src/partition/apm.rs) now stores
+`pad: Vec<u8>` (376 bytes) populated by `parse()` and re-emitted
+verbatim by `to_bytes()`. `emit_apm_disk_with_hfs` propagates `pad`
+from the source's `Apple_partition_map` and `Apple_HFS` entries.
+
+**Symptom**: disk completely invisible to the OS / emulator.
+
+### 2. Alternate MDB lives at the *next-to-last* sector, not the last
+
+The HFS spec reserves *two* trailing sectors per volume: the alternate
+MDB at `partition_size - 2` (penultimate) and the final sector empty.
+Our blank-volume builder originally allocated only one extra sector at
+the end, putting the alt MDB at the very last sector. Mac OS rejected
+the volume even though the primary MDB looked fine.
+
+Fix in `create_blank_hfs_sized` (src/fs/hfs.rs): reserve 1024 bytes
+past the allocation region instead of 512. The existing `write_mdb`
+formula `first_alloc_block + total_blocks * sectors_per_block` then
+correctly lands on the penultimate sector.
+
+**Symptom**: SCSI device detected, OS sees the partition map, but the
+volume never appears on the desktop.
+
+### 3. Root directory's catalog record key MUST carry the volume name
+
+This was the most subtle. The root dir record's catalog key is
+`(parent_id=1, name=<volume_name>)`, *not* `(parent_id=1, name="")`.
+Mac OS looks up the root at mount time via `(parent=1, drVN)` —
+an empty name produces error -127 ("File system internal error")
+even though the volume has already been recognised by name via
+the MDB.
+
+The root *thread* record at `(parent=2, name="")` keeps an empty
+key (correct per spec) but its data must include the volume name in
+the `thdCName` Str31 field at offset 14 of the 46-byte thread record.
+
+Fix in `build_empty_hfs_catalog_with_node_size` (src/fs/hfs.rs):
+takes `volume_name_raw: &[u8]`, writes it into the root dir record's
+key and into the root thread record's `thdCName`. Both
+`create_blank_hfs_sized` and `initialize_empty_btrees` pass the
+volume name through. Verify with
+`./target/release/examples/dump_root_dir_raw <path>` — node 1 rec 0
+should show `parent=1 name="<volume>"`.
+
+**Symptom**: volume "Quad Squad" briefly appears on the desktop, then
+the OS pops "The disk 'Quad Squad' cannot be used, because of an error
+type -127 occurred."
+
+### 4. Other classic-HFS bootability fields (already covered above)
+
+These are documented in the body of this file but worth grouping with
+the lessons above for completeness:
+
+- DDR `drDriverInfo` array entries (block/size/type) preserved from
+  source so the ROM can locate the driver
+- APM self-entry status `0x37` and block_count `63` preserved
+  verbatim — hardcoding `0x03` makes ROMs reject the map
+- HFS MDB `drAtrb` bit `0x0100` (`drAtrbUmounted`) **must** be set on
+  every sync; otherwise Mac OS treats the volume as dirty
+- `drNmFls` (offset 12) and `drNmRtDirs` (offset 82) recomputed at
+  sync time from `list_children(2)`
+- Alternate MDB mirrors the primary on every sync (not just at create)
+
+### Reference disks used to ground-truth layouts
+
+- `~/Documents/HD10_512 Quadra_System7OldNew.hda` — known-bootable
+  Quadra image, used as ground truth for byte-by-byte comparison
+- `~/Documents/HD10_512 2048MB.hda` — Apple HD SC 7.3.5 blank, used
+  to validate the APM/DDR side without involving any clone logic.
+  `examples/make_blank_apm_hfs.rs` exists for this purpose: it runs
+  just `create_blank_hfs` + `emit_apm_disk_with_hfs` so the wrapping
+  pipeline can be A/B-tested in isolation from the clone path.
+
+### 5. B-tree node size must be 512 bytes
+
+Classic Mac OS / Quadra ROM rejects HFS volumes whose catalog or extents-
+overflow B-tree uses anything other than 512-byte nodes, even though
+IM:F technically permits variable node sizes. Apple's reference
+implementation and CiderPress2 both hard-code 512.
+
+We had a `pick_btree_node_size` helper that scaled node size up (1024,
+2048, 4096) to fit larger trees within a single header-node bitmap.
+That made the cloned target unmountable: the volume name appeared on
+the desktop but every file access returned -127.
+
+The 512-byte node header bitmap covers `(512 - 256) * 8 = 2048 nodes`,
+which is 1 MiB of B-tree file. Larger trees need MAP nodes (NodeType=2
+chained off the header via FLink) — not yet implemented. Until then:
+
+- `pick_btree_node_size` returns 512 unconditionally
+- `HFS_MAX_BTREE_FILE_SIZE = 1 MiB` clamps the catalog and extents
+  sizes the GUI passes into `create_blank_hfs_sized`
+
+Source disks with catalogs larger than 1 MiB (e.g. real Quadra hard
+drives with 2 MB catalogs) tend to have substantial free space within
+their B-tree files. Our clone rebuilds the catalog in sorted order, so
+the actual used portion typically fits comfortably under 1 MiB. If a
+source genuinely has more than ~10 000 catalog records and won't pack
+into a 1 MiB tree, the clone will run out of space — at that point we'll
+need to add map node support, not raise the node size.
+
+**Symptom**: volume mounts on desktop, then every operation returns
+"-127". Catalog can be read by `dump_catalog_leaf` but CiderPress2
+reports "Offset for record 0 was not set" because it reads only the
+first 512 bytes of each node.
+
+### Independent validator: CiderPress2 cp2
+
+`../CiderPress2` has a mature, well-tested HFS implementation. Its
+command-line tool can catalog and validate any HFS image we produce:
+
+```bash
+DOTNET_ROOT=/opt/homebrew/Cellar/dotnet/10.0.105/libexec \
+DOTNET_ROLL_FORWARD=Major \
+/Users/dani/repos/CiderPress2/cp2/bin/Release/net8.0/cp2 catalog \
+    ~/Documents/Quad\ Squad-expanded.hda
+```
+
+If cp2 errors out, the message points at the offending field —
+much faster than diffing MDB bytes by hand. cp2's `HFS_Node.cs`
+(`RegenerateList`, `InitEmptyNode`) and `HFS.cs` (`Format`,
+`ScanVolume`) are the authoritative reference for what real Mac OS
+will accept.
+
+### 6. Leaf split must be byte-based and atomic with new-record insert
+
+`btree_split_leaf` (the old API) split records by *count* (`split_point =
+old_num / 2`), and the caller separately inserted the new record into the
+appropriate half afterwards. Catalog records are very uneven in size
+(46-byte threads, 70-byte directory records, 102-byte file records, plus
+keys ranging 7–38 bytes), so a count-based split could leave both halves
+filled to the brim while neither had room for the next record:
+
+```
+6-record leaf, sizes mostly ~64 B → split_point = 3
+left half:  3×64 + ~14 desc + ~8 offsets ≈ 214 B
+right half: same
+new file record needs 124 + 2 B = 126 B
+free in either half = 512 - ~214 = 298 B           ← looks OK
+... but real splits with mixed records gave 382 B used → 130 B free
+new 124 B file record + 2 B offset = 126 B doesn't fit ← "B-tree node full"
+```
+
+The fix is `btree_split_leaf_with_insert` (`src/fs/hfs_common.rs`):
+
+1. Read existing records.
+2. Insert `new_record` into the sorted list of records.
+3. Pick `split_point` so the *byte sum* on each side is ≤ half the
+   total bytes. Always leaves at least one record on each side.
+4. Verify both halves fit in `node_size`; error out otherwise (this
+   shouldn't happen since the maximum single record is below half a
+   512-byte node).
+5. Write left half back into the old node, right half into the new
+   node, splice into the leaf chain.
+
+`insert_catalog_record` (`src/fs/hfs.rs`) calls the new function instead
+of split-then-insert. The old `btree_split_leaf` is still used by
+`hfsplus.rs` and remains available.
+
+**Symptom**: clone failed mid-run with `clone failed: invalid data: B-tree
+node full`. After this fix, cloning Quadra HD (2206 files / 335 dirs)
+into a 2 GiB target succeeds and CiderPress2 reads the result cleanly.
