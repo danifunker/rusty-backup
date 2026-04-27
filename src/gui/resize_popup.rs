@@ -239,7 +239,7 @@ impl ResizePopup {
                             ui.label(egui::RichText::new("#").strong());
                             ui.label(egui::RichText::new("Old Start").strong());
                             ui.label(egui::RichText::new("Old Size").strong());
-                            ui.label(egui::RichText::new("→ New Start").strong());
+                            ui.label(egui::RichText::new("New Start").strong());
                             ui.label(egui::RichText::new("New Size").strong());
                             ui.label(egui::RichText::new("Action").strong());
                             ui.end_row();

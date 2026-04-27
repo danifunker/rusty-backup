@@ -469,7 +469,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                                 partition::format_size(result.compacted_size),
                                 partition::format_size(result.original_size),
                                 if result.compacted_size == result.original_size {
-                                    "layout-preserving (free blocks → zeros)"
+                                    "layout-preserving (free blocks -> zeros)"
                                 } else {
                                     "packed"
                                 },
@@ -734,7 +734,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                     &progress,
                     LogLevel::Info,
                     format!(
-                        "Compacting {}: {} at LBA {}, trimmed {} → {} (free blocks → zeros)",
+                        "Compacting {}: {} at LBA {}, trimmed {} -> {} (free blocks -> zeros)",
                         part_label,
                         part.type_name,
                         part.start_lba,
@@ -747,7 +747,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                     &progress,
                     LogLevel::Info,
                     format!(
-                        "Compacting {}: {} at LBA {}, {} → {} (defragmented)",
+                        "Compacting {}: {} at LBA {}, {} -> {} (defragmented)",
                         part_label,
                         part.type_name,
                         part.start_lba,

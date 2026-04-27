@@ -25,7 +25,7 @@ fn main() -> eframe::Result {
             // Already root (elevated relaunch landed here) — set permissive umask
             // so backup files are created with 666/777 permissions accessible to the real user.
             rusty_backup::os::linux::set_permissive_umask_if_elevated();
-            eprintln!("Running with administrator privileges ✓");
+            eprintln!("Running with administrator privileges");
         }
     }
 
