@@ -986,9 +986,9 @@ impl BrowseView {
                     let desc = rusty_backup::fs::prodos_types::type_description(tt);
                     let aux = entry.aux_type.unwrap_or(0);
                     if desc.is_empty() {
-                        format!("{tc} • ${:04X}", aux)
+                        format!("{tc} ${:04X}", aux)
                     } else {
-                        format!("{desc} • ${:04X}", aux)
+                        format!("{desc} ${:04X}", aux)
                     }
                 });
 
@@ -1733,7 +1733,7 @@ impl BrowseView {
             // Remove old archive, compress temp → new archive
             let archive_base = archive_path.with_extension("");
             log::info!(
-                "Compressing {} → {} (type={})",
+                "Compressing {} -> {} (type={})",
                 temp_path.display(),
                 archive_base.display(),
                 compression_type
@@ -3092,7 +3092,7 @@ impl BrowseView {
                 } else {
                     ui.label(format!("{count} items already exist at the destination:"));
                     for name in &conflict_list {
-                        ui.label(format!("  • {name}"));
+                        ui.label(format!("  - {name}"));
                     }
                 }
                 ui.add_space(4.0);

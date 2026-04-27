@@ -26,9 +26,9 @@ impl ElevationDialog {
                 ui.vertical_centered(|ui| {
                     ui.add_space(10.0);
                     ui.label(
-                        egui::RichText::new("⚠")
+                        egui::RichText::new("Warning")
                             .color(egui::Color32::YELLOW)
-                            .size(48.0),
+                            .size(24.0),
                     );
                     ui.add_space(10.0);
                 });

@@ -1124,7 +1124,7 @@ impl<R: Read + Seek> HfsFilesystem<R> {
     /// Locate the catalog record-data offset for a file or directory CNID.
     ///
     /// Directories always have a thread record (HFS spec mandates it), so we
-    /// look them up via the thread → key path. File thread records are
+    /// look them up via the thread -> key path. File thread records are
     /// optional in classic HFS — Finder, CiderPress2, and Inside Macintosh:
     /// Files all describe them as optional, and our `create_file` no longer
     /// emits them. So if the thread lookup fails, fall back to a leaf scan
@@ -1995,7 +1995,7 @@ fn build_empty_hfs_extents_btree_with_node_size(
     }
     let mut buf = vec![0u8; size];
 
-    // Header descriptor. fLink → first map node when one exists.
+    // Header descriptor. fLink -> first map node when one exists.
     if map_nodes > 0 {
         BigEndian::write_u32(&mut buf[0..4], 1);
     }
@@ -3122,7 +3122,7 @@ impl<R: Read + Seek> CompactHfsReader<R> {
         // data_size: pre-alloc is always read from disk; only allocated alloc blocks are read.
         let data_size = pre_alloc_size + allocated as u64 * mdb.block_size as u64;
         eprintln!(
-            "[HFS compact] pre_alloc_size={}, data_size={}, compacted_size={} original_size={} (layout-preserving; free blocks → zeros)",
+            "[HFS compact] pre_alloc_size={}, data_size={}, compacted_size={} original_size={} (layout-preserving; free blocks -> zeros)",
             pre_alloc_size, data_size, compacted_size, original_size
         );
 
@@ -3183,7 +3183,7 @@ impl<R: Read + Seek> Read for CompactHfsReader<R> {
         }
 
         // Phase 1: allocation blocks 0..total_blocks.
-        // Allocated blocks → real data; free blocks → zeros.
+        // Allocated blocks -> real data; free blocks -> zeros.
         let total_blocks = self.mdb.total_blocks as u32;
         if self.current_block >= total_blocks {
             self.phase = 2;
@@ -4222,9 +4222,9 @@ mod tests {
         // both padded and unpadded key paths in index records
         for i in 0..40 {
             let name = if i % 2 == 0 {
-                format!("f{:03}.txt", i) // 8 chars → key_len=14 (even) → needs pad
+                format!("f{:03}.txt", i) // 8 chars -> key_len=14 (even) -> needs pad
             } else {
-                format!("fi{:03}.txt", i) // 9 chars → key_len=15 (odd) → no pad
+                format!("fi{:03}.txt", i) // 9 chars -> key_len=15 (odd) -> no pad
             };
             let data = format!("data{}", i);
             let mut reader = Cursor::new(data.as_bytes().to_vec());
@@ -4483,7 +4483,7 @@ mod tests {
             create_blank_hfs_sized(64 * 1024 * 1024, block_size, "Sized", 64 * 1024, 256 * 1024)
                 .expect("create_blank_hfs_sized");
         let mut fs = HfsFilesystem::open(Cursor::new(img), 0).expect("open");
-        // 64 KiB / 32 KiB = 2 blocks → bumped to 4 (default floor).
+        // 64 KiB / 32 KiB = 2 blocks -> bumped to 4 (default floor).
         assert_eq!(fs.mdb().extents_file_size, 4 * block_size);
         // 256 KiB / 32 KiB = 8 blocks.
         assert_eq!(fs.mdb().catalog_file_size, 8 * block_size);
@@ -4791,7 +4791,7 @@ mod tests {
         assert_eq!(fs2.mdb.modify_date, modify);
         assert_eq!(BigEndian::read_u32(&fs2.mdb.raw_sector[64..68]), backup);
 
-        // No pending dates → sync stamps modify_date to hfs_now (different from `modify`).
+        // No pending dates -> sync stamps modify_date to hfs_now (different from `modify`).
         fs2.sync_metadata().unwrap();
         assert_ne!(fs2.mdb.modify_date, modify);
     }

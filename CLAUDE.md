@@ -100,3 +100,4 @@ All OS-specific code lives in `src/os/`:
 - Disk I/O must be sector-aligned (512 bytes or 4KB).
 - Disable UI controls during active operations to prevent conflicts.
 - Use `Result<T>` and `?` for error propagation throughout.
+- **No Unicode glyphs in UI text or log messages.** The default egui font does not include emoji or symbol glyphs (e.g. `✓ ✗ ⚠ ← → • ✖ ℹ`), so they render as blank boxes on the user's screen. Use plain ASCII alternatives instead — `OK`, `Skipped`, `Warning`, `Back`, `->`, `-`, `X`, `Info:` — for log lines, button labels, dialog text, and any other user-visible string. The only exception is content read directly from a filesystem (e.g. symlink target arrows in the optical browse view), which we render verbatim.

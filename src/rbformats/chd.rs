@@ -210,7 +210,7 @@ pub(crate) fn compress_chd(
 
     let chd_path = output_path(output_base, "chd", false, 0);
     log_cb(&format!(
-        "Running chdman createraw → {}",
+        "Running chdman createraw -> {}",
         chd_path.display()
     ));
     let chdman_cmd = get_chdman_command();

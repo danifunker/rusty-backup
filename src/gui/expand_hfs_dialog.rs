@@ -319,7 +319,7 @@ impl ExpandHfsDialog {
         let target_bs = self.target_block_size;
 
         log.info(format!(
-            "Expanding HFS volume '{}' to {} MiB at {} KiB blocks → {}",
+            "Expanding HFS volume '{}' to {} MiB at {} KiB blocks -> {}",
             source.volume_name,
             self.target_size_mib,
             target_bs / 1024,

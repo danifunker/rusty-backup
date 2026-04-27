@@ -53,8 +53,8 @@ impl SettingsDialog {
 
                         ui.horizontal(|ui| {
                             ui.label(
-                                egui::RichText::new("ℹ")
-                                    .size(16.0)
+                                egui::RichText::new("Info:")
+                                    .size(14.0)
                                     .color(egui::Color32::from_rgb(0, 122, 255))
                             );
                             ui.vertical(|ui| {

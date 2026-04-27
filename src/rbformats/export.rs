@@ -144,7 +144,7 @@ fn write_dc42_from_sectors(
     std::fs::write(dest_path, &bytes)
         .with_context(|| format!("failed to write {}", dest_path.display()))?;
     log_cb(&format!(
-        "DiskCopy 4.2 export complete: {} ({} input bytes → {} DC42 bytes)",
+        "DiskCopy 4.2 export complete: {} ({} input bytes -> {} DC42 bytes)",
         dest_path.display(),
         sectors.len(),
         bytes.len(),
@@ -166,7 +166,7 @@ fn write_woz_from_sectors(
     std::fs::write(dest_path, &bytes)
         .with_context(|| format!("failed to write {}", dest_path.display()))?;
     log_cb(&format!(
-        "WOZ export complete: {} ({} input bytes → {} WOZ bytes)",
+        "WOZ export complete: {} ({} input bytes -> {} WOZ bytes)",
         dest_path.display(),
         sectors.len(),
         bytes.len(),
