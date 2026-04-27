@@ -807,11 +807,13 @@ fn write_zeros_with_progress(
 pub fn detect_raw_apm(reader: &mut (impl Read + Seek)) -> Option<Apm> {
     reader.seek(SeekFrom::Start(0)).ok()?;
     let mut ddr = [0u8; 4];
-    reader.read_exact(&mut ddr).ok()?;
-    if &ddr[0..2] != b"ER" {
+    let read_ok = reader.read_exact(&mut ddr).is_ok();
+    // Always restore the cursor to 0 so callers that fall through to a
+    // sequential read of the unwrapped stream don't lose the first bytes.
+    reader.seek(SeekFrom::Start(0)).ok()?;
+    if !read_ok || &ddr[0..2] != b"ER" {
         return None;
     }
-    reader.seek(SeekFrom::Start(0)).ok()?;
     Apm::parse(reader).ok()
 }
 
