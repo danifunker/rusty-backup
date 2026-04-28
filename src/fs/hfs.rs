@@ -3065,7 +3065,7 @@ impl<R: Read + Seek> CompactHfsReader<R> {
         partition_offset: u64,
     ) -> Result<(Self, CompactResult), FilesystemError> {
         // Read MDB
-        eprintln!(
+        log::debug!(
             "[HFS compact] seeking to MDB at offset {}",
             partition_offset + 1024
         );
@@ -3073,16 +3073,16 @@ impl<R: Read + Seek> CompactHfsReader<R> {
         let mut mdb_buf = [0u8; 162];
         reader.read_exact(&mut mdb_buf)?;
         let mdb = HfsMasterDirectoryBlock::parse(&mdb_buf).map_err(|e| {
-            eprintln!("[HFS compact] MDB parse failed: {e}");
+            log::debug!("[HFS compact] MDB parse failed: {e}");
             e
         })?;
-        eprintln!(
+        log::debug!(
             "[HFS compact] MDB ok: block_size={}, total_blocks={}, first_alloc_block={}, volume_bitmap_block={}",
             mdb.block_size, mdb.total_blocks, mdb.first_alloc_block, mdb.volume_bitmap_block,
         );
 
         if mdb.has_embedded_hfs_plus() {
-            eprintln!("[HFS compact] has embedded HFS+ — refusing to compact HFS wrapper");
+            log::debug!("[HFS compact] has embedded HFS+ — refusing to compact HFS wrapper");
             return Err(FilesystemError::Unsupported(
                 "cannot compact HFS wrapper with embedded HFS+".into(),
             ));
@@ -3090,12 +3090,12 @@ impl<R: Read + Seek> CompactHfsReader<R> {
 
         // Read volume bitmap
         let bitmap_offset = partition_offset + mdb.volume_bitmap_block as u64 * 512;
-        eprintln!("[HFS compact] reading bitmap at offset {bitmap_offset}");
+        log::debug!("[HFS compact] reading bitmap at offset {bitmap_offset}");
         let bitmap_size = (mdb.total_blocks as u32).div_ceil(8) as usize;
         reader.seek(SeekFrom::Start(bitmap_offset))?;
         let mut bitmap = vec![0u8; bitmap_size];
         reader.read_exact(&mut bitmap)?;
-        eprintln!("[HFS compact] bitmap read: {bitmap_size} bytes");
+        log::debug!("[HFS compact] bitmap read: {bitmap_size} bytes");
 
         // Count allocated blocks
         let mut allocated = 0u32;
@@ -3106,7 +3106,7 @@ impl<R: Read + Seek> CompactHfsReader<R> {
                 allocated += 1;
             }
         }
-        eprintln!(
+        log::debug!(
             "[HFS compact] allocated={} / {} total blocks ({} free)",
             allocated,
             mdb.total_blocks,
@@ -3121,7 +3121,7 @@ impl<R: Read + Seek> CompactHfsReader<R> {
         let compacted_size = original_size;
         // data_size: pre-alloc is always read from disk; only allocated alloc blocks are read.
         let data_size = pre_alloc_size + allocated as u64 * mdb.block_size as u64;
-        eprintln!(
+        log::debug!(
             "[HFS compact] pre_alloc_size={}, data_size={}, compacted_size={} original_size={} (layout-preserving; free blocks -> zeros)",
             pre_alloc_size, data_size, compacted_size, original_size
         );

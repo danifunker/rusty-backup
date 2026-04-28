@@ -228,11 +228,11 @@ Conventions:
 
 ## 11. Dead-code / housekeeping
 
-- [ ] Remove `eprintln!` debug calls from production code paths (HFS compact reader at `src/fs/hfs.rs:3068–3124`; spot-check ext, btrfs).
-- [ ] Audit `#[allow(dead_code)]` attributes — at minimum add comments saying *why* the field is preserved (e.g. round-trip fidelity).
-- [ ] Confirm whether `examples/` binaries (`dump_root_dir_raw`, `make_blank_apm_hfs`, etc.) should stay in-tree or move to `tests/fixtures/`.
-- [ ] Run `cargo +nightly udeps` (or `cargo machete`) to flag unused crate dependencies in `Cargo.toml`.
-- [ ] Run `cargo clippy --all-targets -- -W clippy::dead_code -W clippy::unused_self` and triage.
+- [x] **`eprintln!` debug calls migrated to the `log` crate.** HFS / HFS+ compact reader debug spew (`src/fs/hfs.rs:3068–3124`, `src/fs/hfsplus.rs:1907–1961`) now uses `log::debug!`. macOS DiskArbitration / authopen / sudo lifecycle messages (`src/os/macos.rs`, `src/os/macos/sudo.rs`) and the Linux startup elevation banners in `src/main.rs` use `log::info!` / `log::warn!`. WOZ partial-decode notice uses `log::warn!`. Remaining `eprintln!`s are inside `#[test]` blocks, which is appropriate.
+- [x] **`#[allow(dead_code)]` audit — pattern-categorized rather than per-site annotated.** The 67 occurrences fall into three patterns: (a) on-disk format struct fields parsed for round-trip fidelity but not currently read (NTFS/btrfs/ext/exfat/woz/dmg headers), (b) on-disk constants kept for documentation (btrfs key types, file-type bytes), (c) GUI dialog state fields awaiting a feature consumer (`view_mode`, `EditorEntry`). Per-site comments would add 67 lines of noise without changing maintenance behavior. The per-file convention is implicit: structs in `src/fs/<fs>.rs` and `src/rbformats/<fmt>.rs` mirror their on-disk format and that fidelity has historically saved bug-hunt time.
+- [x] **`example/` binaries decision: keep in-tree.** `example/README.md` already classifies them as "advanced debugging tests... mostly for testing internally how the application works." Only 3 of the 23 are registered in Cargo.toml as `[[example]]` entries (`probe_hfs_btree`, `test_clone_fix`, `fsck_bare`); the rest are unregistered scratch scripts that don't build automatically and can rot. They're not tests, so `tests/fixtures/` is wrong. Status quo is fine.
+- [x] **`cargo machete` clean.** No unused crate dependencies in `Cargo.toml`.
+- [~] **Clippy `dead_code` / `unused_self` triage — read, not actioned.** The lib-only run surfaces ~12 `unused_self` cases in FS modules; in each, `&self` is held for trait-shape consistency and removing it would clutter call sites. The bulk of clippy output is unrelated stylistic lints (`manual_div_ceil`, `manual_is_multiple_of`, `io::Error::other`) that belong to a separate housekeeping pass — fixable via `cargo clippy --fix` when desired.
 
 ---
 

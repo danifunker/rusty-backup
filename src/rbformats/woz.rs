@@ -759,7 +759,7 @@ fn decode_35_woz(woz: &WozFile) -> Result<Vec<u8>> {
     }
 
     if !missing_sectors.is_empty() {
-        eprintln!(
+        log::warn!(
             "WOZ 3.5\": decoded {}/{} sectors, {} missing: {}",
             total_decoded,
             total_expected,

@@ -1904,7 +1904,7 @@ impl<R: Read + Seek> CompactHfsPlusReader<R> {
         partition_offset: u64,
     ) -> Result<(Self, CompactResult), FilesystemError> {
         // Read volume header
-        eprintln!(
+        log::debug!(
             "[HFS+ compact] seeking to VH at offset {}",
             partition_offset + 1024
         );
@@ -1912,7 +1912,7 @@ impl<R: Read + Seek> CompactHfsPlusReader<R> {
         let mut vh_buf = [0u8; 512];
         reader.read_exact(&mut vh_buf)?;
         let vh = HfsPlusVolumeHeader::parse(&vh_buf)?;
-        eprintln!(
+        log::debug!(
             "[HFS+ compact] VH ok: block_size={}, total_blocks={}, alloc_file extents[0]=(start={}, count={})",
             vh.block_size,
             vh.total_blocks,
@@ -1928,10 +1928,10 @@ impl<R: Read + Seek> CompactHfsPlusReader<R> {
             &vh.allocation_file,
         )
         .map_err(|e| {
-            eprintln!("[HFS+ compact] read_fork(alloc_file) failed: {e}");
+            log::debug!("[HFS+ compact] read_fork(alloc_file) failed: {e}");
             e
         })?;
-        eprintln!(
+        log::debug!(
             "[HFS+ compact] allocation bitmap read: {} bytes",
             alloc_data.len()
         );
@@ -1945,7 +1945,7 @@ impl<R: Read + Seek> CompactHfsPlusReader<R> {
                 allocated += 1;
             }
         }
-        eprintln!(
+        log::debug!(
             "[HFS+ compact] allocated={} / {} total blocks ({} free)",
             allocated,
             vh.total_blocks,
@@ -1958,7 +1958,7 @@ impl<R: Read + Seek> CompactHfsPlusReader<R> {
         let compacted_size = original_size;
         // data_size: only allocated blocks require disk reads.
         let data_size = allocated as u64 * vh.block_size as u64;
-        eprintln!(
+        log::debug!(
             "[HFS+ compact] compacted_size={} data_size={} original_size={} (layout-preserving; free blocks -> zeros)",
             compacted_size, data_size, original_size
         );

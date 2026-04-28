@@ -187,7 +187,7 @@ pub fn request_app_elevation() -> Result<()> {
     let mut command = vec![exe_path.to_string_lossy().to_string()];
     command.extend(args);
 
-    eprintln!("Requesting administrator privileges...");
+    log::info!("Requesting administrator privileges...");
 
     // Request elevation
     match sudo_execute(&command, true) {
