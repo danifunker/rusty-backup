@@ -6,6 +6,7 @@ use super::entry::{EntryType, FileEntry};
 use super::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
 };
+use super::CompactResult;
 
 // exFAT directory entry types
 const ENTRY_TYPE_ALLOCATION_BITMAP: u8 = 0x81;
@@ -1338,12 +1339,6 @@ fn count_set_bits(data: &[u8], max_clusters: u32) -> u64 {
 // Compaction
 // =============================================================================
 
-pub struct CompactExfatInfo {
-    pub original_size: u64,
-    pub compacted_size: u64,
-    pub clusters_used: u32,
-}
-
 /// A reader that streams only used clusters of an exFAT partition.
 ///
 /// Layout: boot region (12 sectors) + FAT + used clusters in order
@@ -1374,7 +1369,7 @@ impl<R: Read + Seek> CompactExfatReader<R> {
     pub fn new(
         mut source: R,
         partition_offset: u64,
-    ) -> Result<(Self, CompactExfatInfo), FilesystemError> {
+    ) -> Result<(Self, CompactResult), FilesystemError> {
         // Read VBR
         source.seek(SeekFrom::Start(partition_offset))?;
         let mut vbr_buf = [0u8; 512];
@@ -1478,9 +1473,10 @@ impl<R: Read + Seek> CompactExfatReader<R> {
                 boot_region_size,
                 fat_region_size: fat_size,
             },
-            CompactExfatInfo {
+            CompactResult {
                 original_size,
                 compacted_size,
+                data_size: compacted_size,
                 clusters_used,
             },
         ))

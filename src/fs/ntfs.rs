@@ -6,6 +6,7 @@ use super::entry::{EntryType, FileEntry};
 use super::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
 };
+use super::CompactResult;
 
 // Well-known MFT record numbers
 const MFT_RECORD_VOLUME: u64 = 3;
@@ -2411,13 +2412,6 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
 // Compaction
 // =============================================================================
 
-/// Information about an NTFS compaction result.
-pub struct CompactNtfsInfo {
-    pub original_size: u64,
-    pub compacted_size: u64,
-    pub clusters_used: u32,
-}
-
 /// A reader that streams only the used clusters of an NTFS partition.
 ///
 /// Layout: boot sector(s) | used clusters in order (skipping free ones)
@@ -2442,7 +2436,7 @@ impl<R: Read + Seek> CompactNtfsReader<R> {
     pub fn new(
         mut source: R,
         partition_offset: u64,
-    ) -> Result<(Self, CompactNtfsInfo), FilesystemError> {
+    ) -> Result<(Self, CompactResult), FilesystemError> {
         // Read VBR
         source.seek(SeekFrom::Start(partition_offset))?;
         let mut vbr_buf = [0u8; 512];
@@ -2532,9 +2526,10 @@ impl<R: Read + Seek> CompactNtfsReader<R> {
                 total_size: compacted_size,
                 cluster_buf: Vec::new(),
             },
-            CompactNtfsInfo {
+            CompactResult {
                 original_size,
                 compacted_size,
+                data_size: compacted_size,
                 clusters_used,
             },
         ))

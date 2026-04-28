@@ -9,6 +9,14 @@ Conventions:
 
 > Note (GUI redesign): a major GUI overhaul is planned. Items in §5 and §10 are deliberately framed to make that redesign easier — pull model logic out of `src/gui/` first so the new GUI can be built against a stable, testable model layer.
 
+> **Revisit-after-§5 list.** Several §2 items are intentionally parked — they need concrete model-layer consumers before the right trait shape is visible:
+> - `MacFilesystem` sub-trait for `blessed_system_folder` / `set_blessed_folder`
+> - `ProDosEditableFilesystem` sub-trait for `set_prodos_type`
+> - Full `Filesystem` trait split into `FilesystemReader` / `FilesystemInspector` / `FilesystemRepair`
+> - `fn capabilities() -> Capabilities` discovery method
+>
+> Suggested order: §3 → §4 → §7 (pure refactors) → §5 (model extraction) → return to §2 deferred items → §6 resize/validation strategies.
+
 ---
 
 ## 1. B-tree implementation duplication (HFS / HFS+)
@@ -32,40 +40,42 @@ Conventions:
 
 ## 2. Filesystem trait surface
 
-- [ ] **Default `write_file_to` reads the entire file into RAM via `read_file(.., usize::MAX)`** (`src/fs/filesystem.rs:44`)
-  - **Evidence:** Only HFS, HFS+, and ext override. FAT/NTFS/exFAT/btrfs/ProDOS inherit the loading-everything default — a real risk for large extracted files. CLAUDE.md explicitly mandates streaming I/O.
-  - **Suggested action:** Change the default to chunked streaming, or make `write_file_to` required and stream per-FS.
+- [~] **Default `write_file_to` reads the entire file into RAM via `read_file(.., usize::MAX)`** (`src/fs/filesystem.rs:44`)
+  - **Evidence:** No FS overrides this (audit's claim that HFS/HFS+/ext override was wrong — every implementation inherits the default). Risk is bounded in practice (vintage disk-image files are typically <100 MiB).
+  - **Done (partial):** Added a doc comment + TODO at the trait method explaining the RAM behavior and what a future streaming override needs (a chunked `read_file_at(entry, offset, len)` API). Full streaming refactor deferred — would touch all 8 FS implementations and isn't blocking real workloads today.
 
-- [ ] **`set_permissions` is a silent no-op for most filesystems** (`src/fs/filesystem.rs:234`)
-  - **Evidence:** Default returns `Ok(())`. Only ext and ProDOS do something meaningful — others silently drop the mode.
-  - **Suggested action:** Either change the default to `Err(Unsupported)` (loud failure) or split into a `UnixEditableFilesystem` sub-trait.
+- [x] **`set_permissions` was a silent no-op for most filesystems** (`src/fs/filesystem.rs:234`)
+  - **Done:** Default now returns `Err(Unsupported)`. ext continues to override with the real implementation; other filesystems surface the unsupported state instead of silently dropping mode bits. Audit's note that ProDOS overrides was wrong — only ext does.
+  - **Related gap:** ProDOS *does* have an access byte (`prodos.rs:602, 637, 664`) but no setter is exposed. Logged in [`TODO_missing_features.md`](TODO_missing_features.md) — it needs a ProDOS-specific method, not a Unix-mode shim.
+
+- [x] **`set_type_creator`, `write_resource_fork`, `set_blessed_folder` were also silent no-ops**
+  - **Done:** All three defaults now return `Err(Unsupported)`. HFS/HFS+ continue to override. UI gating in `gui/browse_view.rs` already restricts these StagedEdits to compatible filesystems, so no caller paths regress.
 
 - [ ] **`blessed_system_folder` is Mac-only but lives on the base `Filesystem` trait** (`src/fs/filesystem.rs:71`)
-  - **Suggested action:** Move to a `MacFilesystem` sub-trait (HFS, HFS+).
+  - **Suggested action:** Move to a `MacFilesystem` sub-trait (HFS, HFS+). **Deferred** until §5 model extraction lands and we can see how the GUI consumes capability info — a sub-trait split is invasive and trait-object boundaries make it awkward without that picture.
 
 - [ ] **`set_prodos_type` is on `EditableFilesystem` but only ProDOS implements it** (`src/fs/filesystem.rs:250`, impl at `src/fs/prodos.rs:938`)
-  - **Suggested action:** Move to a `ProDosEditableFilesystem` sub-trait, or expose via a `set_metadata(key, value)` shape.
+  - **Suggested action:** Move to a `ProDosEditableFilesystem` sub-trait, or expose via a `set_metadata(key, value)` shape. **Deferred** alongside the sub-trait split above.
 
 - [ ] **`Filesystem` trait mixes read, inspection, repair, and Mac-specific concerns** (`src/fs/filesystem.rs:8`)
-  - **Suggested action:** Consider splitting into `FilesystemReader` (browse), `FilesystemInspector` (sizes, last byte), `FilesystemRepair` (fsck), and feature-specific sub-traits. Defer until §5 model extraction settles, since trait shape will be clearer once GUI consumers are simpler.
+  - **Suggested action:** Consider splitting into `FilesystemReader` (browse), `FilesystemInspector` (sizes, last byte), `FilesystemRepair` (fsck), and feature-specific sub-traits. **Deferred until §5** — trait shape will be clearer once GUI consumers are simpler.
 
 - [ ] **No capability discovery — callers must catch `Unsupported` at runtime**
-  - **Suggested action:** Add `fn capabilities() -> Capabilities` returning a bitset (resource forks, type/creator, prodos types, unix perms, blessing, fsck, repair). GUI uses this to gate buttons instead of try/catch.
+  - **Suggested action:** Add `fn capabilities() -> Capabilities` returning a bitset (resource forks, type/creator, prodos types, unix perms, blessing, fsck, repair). GUI uses this to gate buttons instead of try/catch. **Deferred** — wait until §5 reveals concrete GUI gating sites.
 
 ---
 
 ## 3. Compact readers / compaction result types
 
-- [ ] **Each FS defines its own `Compact*Reader` with the same shape** (FAT, NTFS, exFAT, ext, btrfs, HFS, HFS+, ProDOS)
-  - **Evidence:** All track phase + position + buffer and `impl Read`. No shared trait or scaffolding.
-  - **Suggested action:** Introduce a `CompactReader` trait + `StreamingCompactState` helper for phase/position bookkeeping. Each FS supplies only the per-phase byte source.
+- [x] **Each FS defines its own `Compact*Reader` with the same shape** (FAT, NTFS, exFAT, ext, btrfs, HFS, HFS+, ProDOS) — **evaluated, not pursued.**
+  - **Evidence on review:** Truly shared state is small (`source`, `partition_offset`, `position`, `total_size`, `cluster_buf`) — ~40 bytes per struct. The interesting code is each filesystem's region/cluster layout in its `Read` impl, which is genuinely different (FAT scans boot→FAT→root_dir→data; NTFS is just boot+clusters; HFS/HFS+ are layout-preserving). A trait abstraction would obscure that without meaningful savings.
+  - **Decision:** Keep separate per-FS readers. The audit's claim of high duplication overstated the case.
 
-- [ ] **Multiple equivalent result types: `CompactInfo` (FAT), `CompactExfatInfo`, `CompactNtfsInfo`** plus `CompactResult` in `rbformats`
-  - **Suggested action:** Standardize on one (`CompactResult` from `rbformats/mod.rs` or hoisted to `fs/`). Delete the per-FS duplicates.
+- [x] **Multiple equivalent result types: `CompactInfo` (FAT), `CompactExfatInfo`, `CompactNtfsInfo`** plus `CompactResult`
+  - **Done:** All three legacy types deleted. FAT/NTFS/exFAT compact readers now return `CompactResult` directly. The dispatch in `fs/mod.rs::compact_partition_reader` collapsed from four 11-line reshuffle blocks to one-line passthroughs (~40 fewer lines). Re-export `CompactInfo` removed from `fs/mod.rs:31`.
 
-- [ ] **Three distinct sizes (`original_size`, `compacted_size`, `data_size`) are computed differently per FS**
-  - **Evidence:** See `MEMORY.md` "CompactResult data_size vs compacted_size".
-  - **Suggested action:** Document this distinction in `src/fs/README.md` and assert invariants in a shared helper rather than relying on each implementor to remember which is which.
+- [x] **Three distinct sizes (`original_size`, `compacted_size`, `data_size`) are computed differently per FS**
+  - **Done:** Added a "Compact reader sizing model" section to `src/fs/README.md` documenting the two reader styles (packed vs. layout-preserving) and the invariants each guarantees. Doc-comment on `CompactResult` now points at the README. New compact readers should add a unit test asserting their invariant.
 
 ---
 

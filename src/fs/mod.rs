@@ -28,7 +28,7 @@ pub use exfat::{
 pub use ext::{resize_ext_in_place, validate_ext_integrity, CompactExtReader, ExtFilesystem};
 pub use fat::{
     patch_bpb_hidden_sectors, resize_fat_in_place, set_fat_clean_flags, validate_fat_integrity,
-    CompactFatReader, CompactInfo,
+    CompactFatReader,
 };
 pub use filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, ResourceForkSource,
@@ -49,6 +49,10 @@ pub use ntfs::{
 pub use prodos::{resize_prodos_in_place, validate_prodos_integrity, CompactProDosReader};
 
 /// Result of filesystem compaction.
+///
+/// See `src/fs/README.md` ("Compact reader sizing model") for the full
+/// description of how `original_size`, `compacted_size`, and `data_size`
+/// relate for packed vs. layout-preserving readers.
 pub struct CompactResult {
     pub original_size: u64,
     /// Actual bytes that the compact reader will emit (= `original_size` for
@@ -223,39 +227,15 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
             match fs_type {
                 "fat" => {
                     let (reader, info) = CompactFatReader::new(reader, partition_offset).ok()?;
-                    Some((
-                        Box::new(reader),
-                        CompactResult {
-                            original_size: info.original_size,
-                            compacted_size: info.compacted_size,
-                            data_size: info.compacted_size,
-                            clusters_used: info.clusters_used,
-                        },
-                    ))
+                    Some((Box::new(reader), info))
                 }
                 "ntfs" => {
                     let (reader, info) = CompactNtfsReader::new(reader, partition_offset).ok()?;
-                    Some((
-                        Box::new(reader),
-                        CompactResult {
-                            original_size: info.original_size,
-                            compacted_size: info.compacted_size,
-                            data_size: info.compacted_size,
-                            clusters_used: info.clusters_used,
-                        },
-                    ))
+                    Some((Box::new(reader), info))
                 }
                 "exfat" => {
                     let (reader, info) = CompactExfatReader::new(reader, partition_offset).ok()?;
-                    Some((
-                        Box::new(reader),
-                        CompactResult {
-                            original_size: info.original_size,
-                            compacted_size: info.compacted_size,
-                            data_size: info.compacted_size,
-                            clusters_used: info.clusters_used,
-                        },
-                    ))
+                    Some((Box::new(reader), info))
                 }
                 "ext" => {
                     let (reader, info) = CompactExtReader::new(reader, partition_offset).ok()?;
@@ -275,15 +255,7 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
         // FAT types
         0x01 | 0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C => {
             let (reader, info) = CompactFatReader::new(reader, partition_offset).ok()?;
-            Some((
-                Box::new(reader),
-                CompactResult {
-                    original_size: info.original_size,
-                    compacted_size: info.compacted_size,
-                    data_size: info.compacted_size,
-                    clusters_used: info.clusters_used,
-                },
-            ))
+            Some((Box::new(reader), info))
         }
         // NTFS / exFAT
         0x07 => {
@@ -291,27 +263,11 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
             match fs_type {
                 "ntfs" => {
                     let (reader, info) = CompactNtfsReader::new(reader, partition_offset).ok()?;
-                    Some((
-                        Box::new(reader),
-                        CompactResult {
-                            original_size: info.original_size,
-                            compacted_size: info.compacted_size,
-                            data_size: info.compacted_size,
-                            clusters_used: info.clusters_used,
-                        },
-                    ))
+                    Some((Box::new(reader), info))
                 }
                 "exfat" => {
                     let (reader, info) = CompactExfatReader::new(reader, partition_offset).ok()?;
-                    Some((
-                        Box::new(reader),
-                        CompactResult {
-                            original_size: info.original_size,
-                            compacted_size: info.compacted_size,
-                            data_size: info.compacted_size,
-                            clusters_used: info.clusters_used,
-                        },
-                    ))
+                    Some((Box::new(reader), info))
                 }
                 _ => None,
             }

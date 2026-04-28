@@ -40,7 +40,13 @@ pub trait Filesystem: Send {
     }
 
     /// Stream file data to a writer. Returns the number of bytes written.
-    /// Default delegates to `read_file(entry, usize::MAX)`.
+    ///
+    /// Default loads the entire file into RAM via `read_file(entry,
+    /// usize::MAX)` and then writes it. This is acceptable for vintage
+    /// disk images (typical files <100 MiB) but is not true streaming.
+    /// TODO: when a chunked `read_file_at(entry, offset, len)` API is
+    /// added, override this per-FS to stream extent-by-extent and avoid
+    /// the full-file allocation.
     fn write_file_to(
         &mut self,
         entry: &FileEntry,
@@ -230,19 +236,27 @@ pub trait EditableFilesystem: Filesystem {
         self.delete_entry(parent, entry)
     }
 
-    /// Set Unix permission bits on an entry. No-op for FAT/exFAT.
+    /// Set Unix permission bits on an entry. Override on Unix-style
+    /// filesystems (ext); other filesystems return `Unsupported` so callers
+    /// don't silently lose mode information.
     fn set_permissions(&mut self, _entry: &FileEntry, _mode: u32) -> Result<(), FilesystemError> {
-        Ok(())
+        Err(FilesystemError::Unsupported(
+            "set_permissions not supported for this filesystem".into(),
+        ))
     }
 
-    /// Set HFS/HFS+ type and creator codes. No-op for non-HFS filesystems.
+    /// Set HFS/HFS+ type and creator codes. Override on HFS/HFS+; other
+    /// filesystems return `Unsupported` so callers can branch on capability
+    /// rather than relying on silent no-ops.
     fn set_type_creator(
         &mut self,
         _entry: &FileEntry,
         _type_code: &str,
         _creator_code: &str,
     ) -> Result<(), FilesystemError> {
-        Ok(())
+        Err(FilesystemError::Unsupported(
+            "set_type_creator not supported for this filesystem".into(),
+        ))
     }
 
     /// Set ProDOS file type byte and aux type on an existing file.
@@ -258,14 +272,17 @@ pub trait EditableFilesystem: Filesystem {
         ))
     }
 
-    /// Write resource fork data. No-op for non-HFS filesystems.
+    /// Write resource fork data. Override on HFS/HFS+; other filesystems
+    /// return `Unsupported` rather than silently dropping the fork.
     fn write_resource_fork(
         &mut self,
         _entry: &FileEntry,
         _data: &mut dyn std::io::Read,
         _len: u64,
     ) -> Result<(), FilesystemError> {
-        Ok(())
+        Err(FilesystemError::Unsupported(
+            "write_resource_fork not supported for this filesystem".into(),
+        ))
     }
 
     /// Attempt to repair filesystem issues found by fsck.
@@ -282,9 +299,12 @@ pub trait EditableFilesystem: Filesystem {
     /// Returns the number of free bytes available on the filesystem.
     fn free_space(&mut self) -> Result<u64, FilesystemError>;
 
-    /// Mark a folder as the blessed (bootable) system folder.
-    /// Only meaningful for HFS/HFS+. Default no-op.
+    /// Mark a folder as the blessed (bootable) system folder. Override on
+    /// HFS/HFS+; other filesystems return `Unsupported` so the GUI can
+    /// gate the action and surface unexpected calls.
     fn set_blessed_folder(&mut self, _entry: &FileEntry) -> Result<(), FilesystemError> {
-        Ok(())
+        Err(FilesystemError::Unsupported(
+            "set_blessed_folder not supported for this filesystem".into(),
+        ))
     }
 }

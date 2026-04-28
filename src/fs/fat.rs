@@ -10,6 +10,7 @@ use super::entry::FileEntry;
 use super::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
 };
+use super::CompactResult;
 
 const CHUNK_SIZE: usize = 256 * 1024; // 256 KB I/O buffer
 
@@ -1731,13 +1732,6 @@ fn format_fat_datetime(date: u16, time: u16) -> String {
 // CompactFatReader — streaming compacted FAT image
 // ---------------------------------------------------------------------------
 
-/// Result of filesystem compaction analysis.
-pub struct CompactInfo {
-    pub original_size: u64,
-    pub compacted_size: u64,
-    pub clusters_used: u32,
-}
-
 /// A streaming `Read` that produces a compacted FAT partition image.
 ///
 /// Allocated clusters are packed contiguously from cluster 2 onwards, producing
@@ -1792,7 +1786,7 @@ impl<R: Read + Seek> CompactFatReader<R> {
     pub fn new(
         mut source: R,
         partition_offset: u64,
-    ) -> Result<(Self, CompactInfo), FilesystemError> {
+    ) -> Result<(Self, CompactResult), FilesystemError> {
         // --- Parse BPB ---
         source.seek(SeekFrom::Start(partition_offset))?;
         let mut bpb = [0u8; 512];
@@ -2164,9 +2158,10 @@ impl<R: Read + Seek> CompactFatReader<R> {
         let data_offset_in_image = root_dir_offset_in_image + (root_dir_sectors * bytes_per_sector);
         let total_virtual_size = new_total_sectors * bytes_per_sector;
 
-        let info = CompactInfo {
+        let info = CompactResult {
             original_size,
             compacted_size: total_virtual_size,
+            data_size: total_virtual_size,
             clusters_used,
         };
 

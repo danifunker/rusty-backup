@@ -43,3 +43,28 @@ Trait-based filesystem abstraction for browsing, compaction, resize, and validat
 5. Add `pub mod myfs;` to `fs/mod.rs`.
 
 See `fat.rs` as the complete reference implementation showing all capabilities.
+
+
+## Compact reader sizing model
+
+Compact readers return a `CompactResult` (`fs/mod.rs`) carrying three byte counts that look similar but mean different things. Reading or writing one without remembering the distinction will silently corrupt progress bars or backup metadata.
+
+| Field             | Meaning                                                                  |
+|-------------------|--------------------------------------------------------------------------|
+| `original_size`   | Partition size on the source disk (unchanged by compaction).             |
+| `compacted_size`  | Bytes the reader will emit downstream (the stream's actual length).      |
+| `data_size`       | Logical data bytes: `allocated_blocks * block_size` (+ HFS pre-alloc).   |
+
+Two reader styles produce different relations:
+
+- **Packed** (FAT, NTFS, exFAT): boot region + FAT + only used clusters, contiguously. Stream is *smaller* than the original. Invariant: `data_size == compacted_size < original_size`.
+- **Layout-preserving** (HFS, HFS+, ext, btrfs, ProDOS): full original byte layout, but free clusters are zero-filled in-memory rather than read from disk. Stream is *the same length* as the original. Invariant: `data_size < compacted_size == original_size`.
+
+In `backup/mod.rs` the orchestrator uses these as:
+
+- `effective_sizes[i] = data_size` — feeds the smart-sizing log line ("X MiB of data in N MiB partition").
+- `stream_sizes[i] = compacted_size` — feeds the progress bar (matches actual bytes flowing through the compressor).
+- `total_display_bytes = sum(data_sizes)` — total logical data across all partitions.
+- `total_stream_bytes = sum(stream_sizes)` — total bytes written to the archive.
+
+When adding a new compact reader, decide which style it is, stamp the result accordingly, and **add a unit test asserting the invariant** so future changes can't drift.
