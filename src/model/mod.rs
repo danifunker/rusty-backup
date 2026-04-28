@@ -4,5 +4,6 @@
 //! this tree. See §5 / §10 of `docs/codecleanup.md`.
 
 pub mod archive_edit;
+pub mod backup_loader;
 pub mod edit_queue;
 pub mod fsck_runner;

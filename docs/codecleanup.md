@@ -112,7 +112,8 @@ Conventions:
 
 - [ ] **Partition editor state → model** (inspect_tab.rs:117–250, 692–1164)
 - [ ] **Export configuration & job orchestration → model** (inspect_tab.rs:1243–1929)
-- [ ] **Backup / Clonezilla loading and partition merging → model** (inspect_tab.rs:1983–2173)
+- [x] **Backup / Clonezilla loading + partition merging extracted**
+  - **Done:** `src/model/backup_loader.rs` (360 lines) exposes `load_backup(folder)` which dispatches on whether the folder is a rusty-backup or Clonezilla image, plus the underlying `load_backup_metadata` and `load_clonezilla` parsers. Each returns a typed outcome (metadata + partition table + alignment + partitions + min sizes + warnings/info messages). The view's three load helpers (`load_backup_metadata`, `load_partitions_from_metadata`, `merge_logical_partitions_from_metadata`, `load_clonezilla_image`) collapsed into a thin `load_backup_metadata` wrapper plus two small `apply_*_outcome` helpers. `infer_fat_type_byte` moved to the model and is `pub`-imported by the one remaining view-side caller. inspect_tab.rs: 3858 → 3611 lines.
 - [x] **Fsck/repair runner extracted**
   - **Done:** `src/model/fsck_runner.rs` (56 lines) exposes `run_fsck(path, offset, ptype, type_string) -> Result<Option<FsckResult>>` and `run_repair(...) -> Result<RepairReport>` — pure path-in / typed-result-out. inspect_tab.rs::run_fsck and run_repair_inspect collapsed from ~135 lines combined to ~75 lines (just path resolution + logging + state storage). The popup/confirm renderers stay on the view since they're pure UI.
   - **Suggested action (all four):** Establish `src/model/{partition_editor,export,backup_loader,fsck_runner}.rs`. Each owns its background thread + status struct; `inspect_tab.rs` becomes view + dispatch only. Goal: drop inspect_tab below ~2000 lines.

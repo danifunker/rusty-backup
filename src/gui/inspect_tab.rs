@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -22,7 +22,7 @@ use rusty_backup::rbformats::vhd::build_vhd_footer;
 
 use super::browse_view::BrowseView;
 use super::expand_hfs_dialog::{summarize_source as summarize_hfs_source, ExpandHfsDialog};
-use super::progress::{LogLevel, LogPanel};
+use super::progress::LogPanel;
 
 /// State for the Inspect tab.
 pub struct InspectTab {
@@ -1991,183 +1991,37 @@ impl InspectTab {
             None => return,
         };
 
-        let metadata_path = folder.join("metadata.json");
-        if !metadata_path.exists() {
-            // Try Clonezilla image detection
-            if clonezilla::metadata::is_clonezilla_image(&folder) {
-                self.load_clonezilla_image(&folder, log);
-                return;
+        log.info(format!("Loading backup folder {}...", folder.display()));
+        match rusty_backup::model::backup_loader::load_backup(&folder) {
+            Ok(rusty_backup::model::backup_loader::LoadOutcome::Backup(out)) => {
+                self.apply_backup_outcome(out, log);
             }
-            self.last_error = Some(format!("No metadata.json found in {}", folder.display()));
-            return;
-        }
-
-        log.info(format!(
-            "Loading backup metadata from {}...",
-            metadata_path.display()
-        ));
-
-        match std::fs::read_to_string(&metadata_path) {
-            Ok(json_str) => match serde_json::from_str::<BackupMetadata>(&json_str) {
-                Ok(meta) => {
-                    log.info(format!(
-                        "Backup: {} ({} partition(s), {} compression)",
-                        meta.source_device,
-                        meta.partitions.len(),
-                        meta.compression_type,
-                    ));
-
-                    self.backup_metadata = Some(meta);
-
-                    // Try to parse the mbr.bin from the backup folder for the
-                    // full partition table view (disk signature, alignment,
-                    // partition type bytes for browse buttons, etc.)
-                    let mbr_bin_path = folder.join("mbr.bin");
-                    if mbr_bin_path.exists() {
-                        match File::open(&mbr_bin_path) {
-                            Ok(file) => {
-                                let mut reader = BufReader::new(file);
-                                match PartitionTable::detect(&mut reader) {
-                                    Ok(table) => {
-                                        let alignment = detect_alignment(&table);
-                                        self.partitions = table.partitions();
-                                        log.info(format!(
-                                            "Parsed {}: {} partition table, {} partition(s), alignment: {}",
-                                            mbr_bin_path.file_name().unwrap_or_default().to_string_lossy(),
-                                            table.type_name(),
-                                            self.partitions.len(),
-                                            alignment.alignment_type,
-                                        ));
-                                        self.alignment = Some(alignment);
-                                        self.partition_table = Some(table);
-
-                                        // mbr.bin is only 512 bytes, so EBR chain
-                                        // parsing will have silently failed. Merge
-                                        // logical partitions from metadata.
-                                        self.merge_logical_partitions_from_metadata(log);
-                                    }
-                                    Err(e) => {
-                                        log.warn(format!("Could not parse mbr.bin: {e}"));
-                                        // Fall back to metadata-only partition list
-                                        self.load_partitions_from_metadata();
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                log.warn(format!("Could not open mbr.bin: {e}"));
-                                self.load_partitions_from_metadata();
-                            }
-                        }
-                    } else {
-                        // No mbr.bin, use metadata-only partition list
-                        self.load_partitions_from_metadata();
-                    }
-                }
-                Err(e) => {
-                    let msg = format!("Failed to parse metadata.json: {e}");
-                    log.error(&msg);
-                    self.last_error = Some(msg);
-                }
-            },
+            Ok(rusty_backup::model::backup_loader::LoadOutcome::Clonezilla(out)) => {
+                self.apply_clonezilla_outcome(out, log);
+            }
             Err(e) => {
-                let msg = format!("Cannot read {}: {e}", metadata_path.display());
-                log.add(LogLevel::Error, &msg);
+                let msg = format!("{e:#}");
+                log.error(&msg);
                 self.last_error = Some(msg);
             }
         }
     }
 
-    /// Fallback: populate partition list from backup metadata when mbr.bin
-    /// is unavailable or unparseable.
-    fn load_partitions_from_metadata(&mut self) {
-        if let Some(meta) = &self.backup_metadata {
-            self.partitions = meta
-                .partitions
-                .iter()
-                .map(|p| {
-                    // Use stored type byte, or infer from type_name for old backups
-                    let ptype = if p.partition_type_byte != 0 {
-                        p.partition_type_byte
-                    } else {
-                        infer_fat_type_byte(&p.type_name)
-                    };
-                    PartitionInfo {
-                        index: p.index,
-                        type_name: p.type_name.clone(),
-                        partition_type_byte: ptype,
-                        start_lba: p.start_lba,
-                        size_bytes: p.original_size_bytes,
-                        bootable: false,
-                        is_logical: p.is_logical,
-                        is_extended_container: false,
-                        partition_type_string: p.partition_type_string.clone(),
-                        hfs_block_size: None,
-                    }
-                })
-                .collect();
+    fn apply_backup_outcome(
+        &mut self,
+        out: rusty_backup::model::backup_loader::BackupLoadOutcome,
+        log: &mut LogPanel,
+    ) {
+        for msg in &out.info {
+            log.info(msg);
         }
-    }
-
-    /// After parsing mbr.bin (which is only 512 bytes and cannot contain the
-    /// EBR chain), supplement the partition list with any logical partitions
-    /// found in backup metadata.
-    fn merge_logical_partitions_from_metadata(&mut self, log: &mut LogPanel) {
-        let meta = match &self.backup_metadata {
-            Some(m) => m,
-            None => return,
-        };
-
-        // Only merge if we don't already have logical partitions from MBR
-        // parsing. (mbr.bin is 512 bytes and can't contain the EBR chain,
-        // so logicals need to come from metadata.)
-        let has_logicals = self.partitions.iter().any(|p| p.is_logical);
-        if has_logicals {
-            return;
+        for msg in &out.warnings {
+            log.warn(msg);
         }
-
-        // Also check that metadata actually has partitions we're missing
-        let existing_indices: HashSet<usize> = self.partitions.iter().map(|p| p.index).collect();
-        let meta_has_extra = meta
-            .partitions
-            .iter()
-            .any(|pm| !existing_indices.contains(&pm.index));
-        if !meta_has_extra {
-            return;
-        }
-
-        // Add logical partitions from metadata.
-        // Tagged as is_logical in newer backups; for older backups that lack
-        // the field, detect by index >= 4 (MBR primary entries are 0-3).
-        let mut added = 0;
-        for pm in &meta.partitions {
-            let is_logical = pm.is_logical || pm.index >= 4;
-            if is_logical && !existing_indices.contains(&pm.index) {
-                let ptype = if pm.partition_type_byte != 0 {
-                    pm.partition_type_byte
-                } else {
-                    infer_fat_type_byte(&pm.type_name)
-                };
-                self.partitions.push(PartitionInfo {
-                    index: pm.index,
-                    type_name: pm.type_name.clone(),
-                    partition_type_byte: ptype,
-                    start_lba: pm.start_lba,
-                    size_bytes: pm.original_size_bytes,
-                    bootable: false,
-                    is_logical: true,
-                    is_extended_container: false,
-                    partition_type_string: pm.partition_type_string.clone(),
-                    hfs_block_size: None,
-                });
-                added += 1;
-            }
-        }
-
-        if added > 0 {
-            log.info(format!(
-                "Added {added} logical partition(s) from backup metadata"
-            ));
-        }
+        self.backup_metadata = Some(out.metadata);
+        self.partition_table = out.partition_table;
+        self.alignment = out.alignment;
+        self.partitions = out.partitions;
     }
 
     fn run_inspect(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {
@@ -2444,108 +2298,28 @@ impl InspectTab {
         });
     }
 
-    fn load_clonezilla_image(&mut self, folder: &PathBuf, log: &mut LogPanel) {
-        log.info(format!("Detected Clonezilla image in {}", folder.display()));
-
-        match clonezilla::metadata::load(folder) {
-            Ok(cz_image) => {
-                log.info(format!(
-                    "Clonezilla image: {} partition(s), disk: {}, source size: {}",
-                    cz_image.partitions.len(),
-                    cz_image.disk_name,
-                    partition::format_size(cz_image.source_size_bytes),
-                ));
-
-                // Parse MBR from the loaded image
-                let mut mbr_reader = std::io::Cursor::new(&cz_image.mbr_bytes[..]);
-                match PartitionTable::detect(&mut mbr_reader) {
-                    Ok(table) => {
-                        let alignment = detect_alignment(&table);
-                        log.info(format!(
-                            "MBR: {} partition table, alignment: {}",
-                            table.type_name(),
-                            alignment.alignment_type,
-                        ));
-                        self.alignment = Some(alignment);
-                        self.partition_table = Some(table);
-                    }
-                    Err(e) => {
-                        log.warn(format!("Could not parse Clonezilla MBR: {e}"));
-                    }
-                }
-
-                // Convert Clonezilla partitions to PartitionInfo for the grid
-                self.partitions = cz_image
-                    .partitions
-                    .iter()
-                    .map(|p| PartitionInfo {
-                        index: p.index,
-                        type_name: p.type_name(),
-                        partition_type_byte: p.partition_type_byte,
-                        start_lba: p.start_lba,
-                        size_bytes: p.size_bytes(),
-                        bootable: p.bootable,
-                        is_logical: p.is_logical,
-                        is_extended_container: p.is_extended,
-                        partition_type_string: None,
-                        hfs_block_size: None,
-                    })
-                    .collect();
-
-                // Compute minimum sizes by reading partclone headers
-                for cz_part in &cz_image.partitions {
-                    if cz_part.is_extended || cz_part.partclone_files.is_empty() {
-                        continue;
-                    }
-                    match clonezilla::partclone::read_partclone_header(&cz_part.partclone_files) {
-                        Ok(header) => {
-                            let used = header.used_size();
-                            if used > 0 && used < cz_part.size_bytes() {
-                                self.partition_min_sizes.insert(cz_part.index, used);
-                                log.info(format!(
-                                    "Partition {} ({}): min {} (used {} of {} blocks, block size {})",
-                                    cz_part.index,
-                                    cz_part.device_name,
-                                    partition::format_size(used),
-                                    header.used_blocks,
-                                    header.total_blocks,
-                                    header.block_size,
-                                ));
-                            }
-                        }
-                        Err(e) => {
-                            log.warn(format!(
-                                "Could not read partclone header for {}: {e}",
-                                cz_part.device_name,
-                            ));
-                        }
-                    }
-                }
-
-                // Check for existing metadata cache files
-                let mut cached_count = 0;
-                for cz_part in &cz_image.partitions {
-                    let cache_path =
-                        folder.join(format!("_{}.metadata.cache", cz_part.device_name));
-                    if cache_path.exists() {
-                        cached_count += 1;
-                    }
-                }
-                if cached_count > 0 {
-                    log.info(format!(
-                        "Found {} cached metadata file(s) for browsing",
-                        cached_count,
-                    ));
-                }
-
-                self.clonezilla_image = Some(cz_image);
-            }
-            Err(e) => {
-                let msg = format!("Failed to parse Clonezilla image: {e:#}");
-                log.error(&msg);
-                self.last_error = Some(msg);
-            }
+    fn apply_clonezilla_outcome(
+        &mut self,
+        out: rusty_backup::model::backup_loader::ClonezillaLoadOutcome,
+        log: &mut LogPanel,
+    ) {
+        for msg in &out.info {
+            log.info(msg);
         }
+        for msg in &out.warnings {
+            log.warn(msg);
+        }
+        if out.cached_metadata_count > 0 {
+            log.info(format!(
+                "Found {} cached metadata file(s) for browsing",
+                out.cached_metadata_count,
+            ));
+        }
+        self.partition_table = out.partition_table;
+        self.alignment = out.alignment;
+        self.partitions = out.partitions;
+        self.partition_min_sizes = out.partition_min_sizes;
+        self.clonezilla_image = Some(out.image);
     }
 
     fn show_clonezilla_metadata(&self, ui: &mut egui::Ui, cz: &ClonezillaImage) {
@@ -2799,7 +2573,9 @@ impl InspectTab {
                             let ptype = if part.partition_type_byte != 0 {
                                 part.partition_type_byte
                             } else {
-                                infer_fat_type_byte(&part.type_name)
+                                rusty_backup::model::backup_loader::infer_fat_type_byte(
+                                    &part.type_name,
+                                )
                             };
                             if ui.small_button("Browse").clicked() {
                                 browse_request = Some((
@@ -3791,29 +3567,6 @@ fn is_fat_name(name: &str) -> bool {
 
 /// Infer an MBR partition type byte from the human-readable type name.
 /// Used for older backups that didn't store `partition_type_byte`.
-fn infer_fat_type_byte(name: &str) -> u8 {
-    let lower = name.to_ascii_lowercase();
-    if lower.contains("fat32") {
-        0x0C // FAT32 LBA
-    } else if lower.contains("fat16") {
-        0x06 // FAT16
-    } else if lower.contains("fat12") {
-        0x01 // FAT12
-    } else if lower.contains("fat") {
-        0x0C // Default to FAT32 LBA
-    } else if lower.contains("ntfs") {
-        0x07
-    } else if lower.contains("exfat") {
-        0x07
-    } else if lower.contains("linux") || lower.contains("ext") {
-        0x83
-    } else if lower.contains("hfs") {
-        0xAF
-    } else {
-        0
-    }
-}
-
 /// Format a byte count using base-1000 (SI) units, matching how storage
 /// media is marketed (e.g. "8 GB" on an SD card = 8,000,000,000 bytes).
 fn format_size_decimal(bytes: u64) -> String {
