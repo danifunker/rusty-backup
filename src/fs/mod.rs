@@ -62,6 +62,30 @@ pub fn patch_hidden_sectors_for(
     Ok(())
 }
 
+/// Resize whichever filesystem is present at `partition_offset` to
+/// `new_size_bytes`. Each per-FS resize is a no-op when its magic doesn't
+/// match, so this is safe to call without first probing the type. Use this
+/// for code paths (like VHD export reconstruction) that don't already track
+/// the filesystem type — code paths that *do* know the type should call
+/// the per-FS resize directly.
+pub fn resize_filesystem_for(
+    file: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    new_size_bytes: u64,
+    log_cb: &mut impl FnMut(&str),
+) -> anyhow::Result<()> {
+    let new_sectors_u32 = (new_size_bytes / 512) as u32;
+    let new_sectors_u64 = new_size_bytes / 512;
+    fat::resize_fat_in_place(file, partition_offset, new_sectors_u32, log_cb)?;
+    ntfs::resize_ntfs_in_place(file, partition_offset, new_sectors_u64, log_cb)?;
+    exfat::resize_exfat_in_place(file, partition_offset, new_sectors_u64, log_cb)?;
+    hfs::resize_hfs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
+    hfsplus::resize_hfsplus_in_place(file, partition_offset, new_size_bytes, log_cb)?;
+    ext::resize_ext_in_place(file, partition_offset, new_size_bytes, log_cb)?;
+    btrfs::resize_btrfs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
+    Ok(())
+}
+
 /// Result of filesystem compaction.
 ///
 /// See `src/fs/README.md` ("Compact reader sizing model") for the full

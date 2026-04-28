@@ -130,11 +130,13 @@ Conventions:
 
 ## 6. Resize / validation across filesystems
 
-- [ ] **Each FS implements `resize_*_in_place` with the same signature and shape** (FAT, NTFS, exFAT, ext, HFS, HFS+, btrfs, ProDOS)
-  - **Suggested action:** A `ResizeStrategy` trait + a `resize_in_place_helper` for the read/patch/write boilerplate.
+- [~] **Resize dispatcher consolidated; full strategy trait deferred**
+  - **Done:** New `fs::resize_filesystem_for(file, offset, new_size_bytes, log_cb)` in `src/fs/mod.rs` blind-dispatches across FAT/NTFS/exFAT/HFS/HFS+/ext/btrfs (each is a no-op on magic mismatch). Two ladders in `rbformats/vhd.rs` (~45 lines + ~10 lines) collapsed to single calls — mirrors the `patch_hidden_sectors_for` pattern landed in §4.
+  - **Not done:** A full `ResizeStrategy` trait with a shared read/patch/write helper. The shared boilerplate is genuinely thin (the read+magic-check is one helper away — see `fs/patch.rs`), and each FS's resize is structurally distinct: FAT walks BPB+FAT-tables; NTFS rewrites the boot-and-mirror VBR; HFS rewrites the MDB and alternate MDB; ext rewrites the superblock + group-descriptor table; btrfs the superblock; etc. A trait wrapping that wouldn't reduce code meaningfully — kept the standalone fns.
 
-- [ ] **`validate_*_integrity` per-FS — all funnel into `FsckResult`** (`src/fs/fat.rs:2959`, `ext.rs:3152`, `hfsplus.rs:2084`, …)
-  - **Suggested action:** A `ValidationContext` that records issues; per-FS code just emits findings.
+- [~] **Validate dispatcher consolidated; full ValidationContext deferred**
+  - **Done:** New `restore::validate_filesystem_for(file, offset, fs_type, log_cb)` collapses the two near-identical match ladders in `src/restore/mod.rs` (~45 lines each → 3 lines each). It harmonizes the per-FS validators' heterogeneous return types (`Vec<String>` / `bool` / `()`) to `Result<()>`, since `restore` only cares about side-effect logging.
+  - **Not done:** A full `ValidationContext` shared sink — each per-FS validator still returns its own shape, and a fully unified context would require migrating every call site (including any future diagnostic UI that *does* want the warnings list). Worth revisiting once the GUI gets a "validate filesystem" button that needs the structured results.
 
 ---
 

@@ -1036,48 +1036,9 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
         // Validate filesystem integrity after resize
         if export_size != pm.original_size_bytes || pm.compacted {
             let fs_type = detect_partition_fs_type(inner_file, part_offset);
-            match fs_type {
-                PartitionFsType::Ntfs => {
-                    let _ = validate_ntfs_integrity(inner_file, part_offset, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    });
-                }
-                PartitionFsType::Exfat => {
-                    let _ = validate_exfat_integrity(inner_file, part_offset, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    });
-                }
-                PartitionFsType::Hfs => {
-                    let _ = validate_hfs_integrity(inner_file, part_offset, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    });
-                }
-                PartitionFsType::HfsPlus => {
-                    let _ = validate_hfsplus_integrity(inner_file, part_offset, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    });
-                }
-                PartitionFsType::Ext => {
-                    let _ = validate_ext_integrity(inner_file, part_offset, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    });
-                }
-                PartitionFsType::Btrfs => {
-                    let _ = validate_btrfs_integrity(inner_file, part_offset, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    });
-                }
-                PartitionFsType::ProDos => {
-                    let _ = validate_prodos_integrity(inner_file, part_offset, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    });
-                }
-                PartitionFsType::Fat | PartitionFsType::Unknown => {
-                    let _ = validate_fat_integrity(inner_file, part_offset, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    });
-                }
-            }
+            let _ = validate_filesystem_for(inner_file, part_offset, fs_type, &mut |msg| {
+                log(&progress, LogLevel::Info, msg)
+            });
         }
     }
 
@@ -1556,48 +1517,9 @@ fn run_clonezilla_restore(
         // Validate filesystem integrity
         if export_size != cz_part.size_bytes() || !cz_part.partclone_files.is_empty() {
             let fs_type = detect_partition_fs_type(inner_file, part_offset);
-            match fs_type {
-                PartitionFsType::Ntfs => {
-                    let _ = validate_ntfs_integrity(inner_file, part_offset, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    });
-                }
-                PartitionFsType::Exfat => {
-                    let _ = validate_exfat_integrity(inner_file, part_offset, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    });
-                }
-                PartitionFsType::Hfs => {
-                    let _ = validate_hfs_integrity(inner_file, part_offset, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    });
-                }
-                PartitionFsType::HfsPlus => {
-                    let _ = validate_hfsplus_integrity(inner_file, part_offset, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    });
-                }
-                PartitionFsType::Ext => {
-                    let _ = validate_ext_integrity(inner_file, part_offset, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    });
-                }
-                PartitionFsType::Btrfs => {
-                    let _ = validate_btrfs_integrity(inner_file, part_offset, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    });
-                }
-                PartitionFsType::ProDos => {
-                    let _ = validate_prodos_integrity(inner_file, part_offset, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    });
-                }
-                PartitionFsType::Fat | PartitionFsType::Unknown => {
-                    let _ = validate_fat_integrity(inner_file, part_offset, &mut |msg| {
-                        log(&progress, LogLevel::Info, msg)
-                    });
-                }
-            }
+            let _ = validate_filesystem_for(inner_file, part_offset, fs_type, &mut |msg| {
+                log(&progress, LogLevel::Info, msg)
+            });
         }
     }
 
@@ -2015,6 +1937,47 @@ pub(crate) enum PartitionFsType {
     Btrfs,
     ProDos,
     Unknown,
+}
+
+/// Validate filesystem integrity for whichever FS lives at `partition_offset`.
+/// Per-FS validators have heterogeneous return types — some yield a `Vec`
+/// of warnings, some a `bool`, some `()`. Callers in `restore` only care
+/// about the side-effect logging, so this helper harmonizes the return
+/// type to `()` and discards detailed results. (For diagnostic use cases
+/// that need the warnings list, call the per-FS function directly.)
+fn validate_filesystem_for(
+    file: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    fs_type: PartitionFsType,
+    log_cb: &mut impl FnMut(&str),
+) -> anyhow::Result<()> {
+    match fs_type {
+        PartitionFsType::Ntfs => {
+            validate_ntfs_integrity(file, partition_offset, log_cb)?;
+        }
+        PartitionFsType::Exfat => {
+            validate_exfat_integrity(file, partition_offset, log_cb)?;
+        }
+        PartitionFsType::Hfs => {
+            validate_hfs_integrity(file, partition_offset, log_cb)?;
+        }
+        PartitionFsType::HfsPlus => {
+            validate_hfsplus_integrity(file, partition_offset, log_cb)?;
+        }
+        PartitionFsType::Ext => {
+            validate_ext_integrity(file, partition_offset, log_cb)?;
+        }
+        PartitionFsType::Btrfs => {
+            validate_btrfs_integrity(file, partition_offset, log_cb)?;
+        }
+        PartitionFsType::ProDos => {
+            validate_prodos_integrity(file, partition_offset, log_cb)?;
+        }
+        PartitionFsType::Fat | PartitionFsType::Unknown => {
+            validate_fat_integrity(file, partition_offset, log_cb)?;
+        }
+    }
+    Ok(())
 }
 
 /// Detect the filesystem type of a partition by reading its boot sector magic bytes.
