@@ -101,9 +101,8 @@ Conventions:
   - **Still on `BrowseView`:** the `staged_edits: Vec<StagedEdit>` field itself plus the many query/inspection helpers (`pending_adds_for`, `pending_delete_for`, `find_pending_add_idx`, `resolved_hfs_type_creator`, etc.) that currently read directly from the vec. Folding those into an `EditQueue` model object is a separate (larger) iteration — the enum + apply alone are the cleanly-extractable kernel, and the view's UI logic is still tangled with the queue.
   - **`ArchiveEditContext`/`ArchiveEditProgress` not yet moved** — tracked under the next bullet.
 
-- [ ] **Extract archive extract/recompress orchestration** (browse_view.rs:1419–1803)
-  - **Evidence:** `start_extraction`, `launch_extraction`, `poll_archive_edit` manage temp files, decompression streams, and progress.
-  - **Suggested action:** Move to `src/model/archive_edit.rs` exposing a simple progress handle.
+- [x] **Archive extract/recompress orchestration extracted**
+  - **Done:** New `src/model/archive_edit.rs` (243 lines) owns `ArchiveEditContext`, `ArchiveEditProgress`, `start_extract`, `start_compress`, and the shared `compute_file_checksum`. Each launcher spawns the worker thread and returns an `Arc<Mutex<ArchiveEditProgress>>` for the GUI to poll. The view's `start_archive_extract` (~60 lines) and `start_archive_compress` (~110 lines) collapsed to ~20 lines each — they now do the view-side state mutations (toggle edit mode, clear caches) and call the model. `poll_archive_edit` stays in the view since it heavily mutates view state on completion. Browse view: 4058 → 3851 lines.
 
 - [ ] **`BrowseView` re-opens the filesystem on every operation** (per `MEMORY.md`)
   - **Evidence:** This is intentional today — but it suggests the view is doing model work it shouldn't.

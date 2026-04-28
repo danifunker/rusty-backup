@@ -10,41 +10,12 @@ use rusty_backup::fs::entry::{EntryType, FileEntry};
 use rusty_backup::fs::filesystem::{EditableFilesystem, Filesystem, FilesystemError};
 use rusty_backup::fs::resource_fork::{self, ResourceForkMode};
 use rusty_backup::fs::zstd_stream::{ZstdStreamCache, ZstdStreamReader};
+use rusty_backup::model::archive_edit::{self, ArchiveEditContext, ArchiveEditProgress};
 use rusty_backup::model::edit_queue::{self, StagedEdit};
 use rusty_backup::partition;
 use rusty_backup::rbformats::chd::ChdReader;
 
 const MAX_PREVIEW_SIZE: usize = 1024 * 1024; // 1 MB max file preview
-
-/// Context for editing a backup archive partition (decompress → edit → recompress).
-struct ArchiveEditContext {
-    /// Path to the compressed archive file (e.g. partition-0.zst or partition-0.chd).
-    archive_path: PathBuf,
-    /// Compression type string ("zstd", "chd", etc.).
-    compression_type: String,
-    /// Original uncompressed partition size in bytes.
-    original_size: u64,
-    /// Whether the partition was compacted (stream < original_size).
-    compacted: bool,
-    /// Path to metadata.json for updating checksums.
-    metadata_path: PathBuf,
-    /// Partition index in metadata.
-    partition_index: usize,
-    /// Checksum type ("sha256" or "crc32").
-    checksum_type: String,
-}
-
-/// Progress state for archive edit extract/compress operations.
-struct ArchiveEditProgress {
-    phase: String, // "Extracting" or "Compressing"
-    current: u64,
-    total: u64,
-    finished: bool,
-    error: Option<String>,
-    cancel_requested: bool,
-    /// Path to the temp file (set after extraction completes).
-    temp_path: Option<PathBuf>,
-}
 
 /// Shared extraction progress state between UI and background thread.
 struct ExtractionProgress {
@@ -1532,77 +1503,33 @@ impl BrowseView {
 
     /// Start background extraction of an archive to a temp file for editing.
     fn start_archive_extract(&mut self) {
-        let ctx = match &self.archive_edit_ctx {
-            Some(c) => c,
-            None => return,
+        let Some(ctx) = self.archive_edit_ctx.clone() else {
+            return;
         };
 
-        let archive_path = ctx.archive_path.clone();
-        let compression_type = ctx.compression_type.clone();
-        let original_size = ctx.original_size;
-        let compacted = ctx.compacted;
-
         // Create temp file next to the archive
-        let parent = archive_path.parent().unwrap_or(std::path::Path::new("."));
+        let parent = ctx
+            .archive_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
         let temp_path = parent.join(format!(
             "{}-edit.img",
-            archive_path
+            ctx.archive_path
                 .file_stem()
                 .unwrap_or_default()
                 .to_string_lossy()
         ));
 
-        let progress = Arc::new(Mutex::new(ArchiveEditProgress {
-            phase: "Extracting".to_string(),
-            current: 0,
-            total: original_size,
-            finished: false,
-            error: None,
-            cancel_requested: false,
-            temp_path: Some(temp_path.clone()),
-        }));
-        self.archive_edit_progress = Some(Arc::clone(&progress));
-
-        let progress_thread = Arc::clone(&progress);
-        std::thread::spawn(move || {
-            let cancel = {
-                let p = Arc::clone(&progress_thread);
-                move || p.lock().map(|g| g.cancel_requested).unwrap_or(false)
-            };
-            let result = rusty_backup::rbformats::decompress_partition_to_file(
-                &archive_path,
-                &compression_type,
-                &temp_path,
-                original_size,
-                compacted,
-                &mut |bytes| {
-                    if let Ok(mut p) = progress_thread.lock() {
-                        p.current = bytes;
-                    }
-                },
-                &cancel,
-            );
-            if let Ok(mut p) = progress_thread.lock() {
-                p.finished = true;
-                if let Err(e) = result {
-                    p.error = Some(format!("{e:#}"));
-                    // Clean up temp file on error
-                    let _ = std::fs::remove_file(&temp_path);
-                }
-            }
-        });
+        self.archive_edit_progress = Some(archive_edit::start_extract(&ctx, temp_path));
     }
 
     /// Start background recompression of the edited temp file back to the archive.
     fn start_archive_compress(&mut self) {
-        let ctx = match &self.archive_edit_ctx {
-            Some(c) => c,
-            None => return,
+        let Some(ctx) = self.archive_edit_ctx.clone() else {
+            return;
         };
-
-        let temp_path = match &self.archive_temp_path {
-            Some(p) => p.clone(),
-            None => return,
+        let Some(temp_path) = self.archive_temp_path.clone() else {
+            return;
         };
 
         // Disable edit mode immediately
@@ -1611,109 +1538,14 @@ impl BrowseView {
         self.show_new_folder_dialog = false;
         self.pending_delete = None;
 
-        let archive_path = ctx.archive_path.clone();
-        let compression_type = ctx.compression_type.clone();
-        let metadata_path = ctx.metadata_path.clone();
-        let partition_index = ctx.partition_index;
-        let checksum_type = ctx.checksum_type.clone();
-
-        let input_size = std::fs::metadata(&temp_path).map(|m| m.len()).unwrap_or(0);
-
-        let progress = Arc::new(Mutex::new(ArchiveEditProgress {
-            phase: "Compressing".to_string(),
-            current: 0,
-            total: input_size,
-            finished: false,
-            error: None,
-            cancel_requested: false,
-            temp_path: None,
-        }));
-        self.archive_edit_progress = Some(Arc::clone(&progress));
-
         // Switch browse source back to archive (read-only) — close the browser
-        // while compressing to release the temp file
+        // while compressing to release the temp file.
         self.root = None;
         self.directory_cache.clear();
         self.selected_entry = None;
         self.content = None;
 
-        let progress_thread = Arc::clone(&progress);
-        std::thread::spawn(move || {
-            let cancel = {
-                let p = Arc::clone(&progress_thread);
-                move || p.lock().map(|g| g.cancel_requested).unwrap_or(false)
-            };
-
-            // Compute checksum of the temp file before compressing
-            let checksum_result = compute_file_checksum(&temp_path, &checksum_type);
-
-            // Remove old archive, compress temp → new archive
-            let archive_base = archive_path.with_extension("");
-            log::info!(
-                "Compressing {} -> {} (type={})",
-                temp_path.display(),
-                archive_base.display(),
-                compression_type
-            );
-            let result = rusty_backup::rbformats::compress_file_to_archive(
-                &temp_path,
-                &archive_base,
-                &compression_type,
-                &mut |bytes| {
-                    if let Ok(mut p) = progress_thread.lock() {
-                        p.current = bytes;
-                    }
-                },
-                &cancel,
-                &mut |msg| log::info!("{}", msg),
-            );
-
-            if let Ok(mut p) = progress_thread.lock() {
-                p.finished = true;
-                match result {
-                    Ok(new_files) => {
-                        log::info!("Compress succeeded: {:?}", new_files);
-                        // Remove old archive file (in case extension changed)
-                        if archive_path.exists() {
-                            // The new file may have the same path; only remove if different
-                            let new_path = archive_path
-                                .parent()
-                                .unwrap_or(std::path::Path::new("."))
-                                .join(&new_files[0]);
-                            if new_path != archive_path {
-                                let _ = std::fs::remove_file(&archive_path);
-                            }
-                        }
-
-                        // Update metadata checksum (skip for standalone
-                        // container files where metadata_path is empty)
-                        if !metadata_path.as_os_str().is_empty() {
-                            if let Ok(checksum) = checksum_result {
-                                if let Err(e) =
-                                    rusty_backup::backup::metadata::update_partition_checksum(
-                                        &metadata_path,
-                                        partition_index,
-                                        &checksum,
-                                        Some(&new_files),
-                                    )
-                                {
-                                    p.error = Some(format!(
-                                        "Saved archive but failed to update metadata: {e}"
-                                    ));
-                                }
-                            }
-                        }
-
-                        // Clean up temp file
-                        let _ = std::fs::remove_file(&temp_path);
-                    }
-                    Err(e) => {
-                        p.error = Some(format!("{e:#}"));
-                        // Keep temp file on error so user can retry
-                    }
-                }
-            }
-        });
+        self.archive_edit_progress = Some(archive_edit::start_compress(&ctx, temp_path));
     }
 
     /// Poll archive edit background operations for completion.
@@ -3451,42 +3283,6 @@ impl BrowseView {
 }
 
 /// Compute a checksum (SHA256 or CRC32) of a file.
-fn compute_file_checksum(
-    path: &std::path::Path,
-    checksum_type: &str,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    use std::io::Read;
-    let mut file = File::open(path)?;
-    let mut buf = vec![0u8; 256 * 1024];
-
-    match checksum_type {
-        "sha256" => {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            loop {
-                let n = file.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buf[..n]);
-            }
-            Ok(format!("{:x}", hasher.finalize()))
-        }
-        "crc32" => {
-            let mut hasher = crc32fast::Hasher::new();
-            loop {
-                let n = file.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buf[..n]);
-            }
-            Ok(format!("{:08x}", hasher.finalize()))
-        }
-        other => Err(format!("unsupported checksum type: {other}").into()),
-    }
-}
-
 /// Create a filesystem instance from the browse view's configuration.
 /// This is a standalone function so it can be called from background threads.
 fn create_filesystem(
