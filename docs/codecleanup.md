@@ -96,9 +96,10 @@ Conventions:
 
 ### `src/gui/browse_view.rs` — 4265 lines
 
-- [ ] **Extract the staged-edit queue into a model module** (browse_view.rs:23–67, ~2337)
-  - **Evidence:** `StagedEdit`, `ArchiveEditContext`, `ArchiveEditProgress`, `apply_staged_edits()` are pure business logic.
-  - **Suggested action:** Create `src/model/edit_queue.rs`. Browse view becomes a renderer over `&EditQueue`.
+- [~] **Staged-edit queue extracted (partial)**
+  - **Done:** New `src/model/edit_queue.rs` (195 lines) owns the `StagedEdit` enum, the `resolve_dir_by_path` walk helper, and a pure `apply_edit(efs, &StagedEdit) -> Result<(), FilesystemError>` dispatch. `browse_view.rs::apply_staged_edits` shrank from ~165 lines to a 25-line view-side wrapper that opens the editable FS, replays the queue via `apply_edit`, syncs metadata, and refreshes its caches. Lib gains a new `pub mod model;` root.
+  - **Still on `BrowseView`:** the `staged_edits: Vec<StagedEdit>` field itself plus the many query/inspection helpers (`pending_adds_for`, `pending_delete_for`, `find_pending_add_idx`, `resolved_hfs_type_creator`, etc.) that currently read directly from the vec. Folding those into an `EditQueue` model object is a separate (larger) iteration — the enum + apply alone are the cleanly-extractable kernel, and the view's UI logic is still tangled with the queue.
+  - **`ArchiveEditContext`/`ArchiveEditProgress` not yet moved** — tracked under the next bullet.
 
 - [ ] **Extract archive extract/recompress orchestration** (browse_view.rs:1419–1803)
   - **Evidence:** `start_extraction`, `launch_extraction`, `poll_archive_edit` manage temp files, decompression streams, and progress.
