@@ -12,7 +12,8 @@ use std::collections::HashSet;
 
 use byteorder::{BigEndian, ByteOrder};
 
-use super::{extract_child_pointers, hfs_issue, record_key, HfsFsckCode, HFS_MAX_NRECS};
+use super::btree::{extract_child_pointers, record_key, HFS_MAX_NRECS};
+use super::{hfs_issue, HfsFsckCode};
 use crate::fs::fsck::{FsckIssue, RepairReport};
 use crate::fs::hfs_common::{
     bitmap_test_bit_be, btree_alloc_node, btree_bitmap_clear, btree_bitmap_set, btree_bitmap_test,

@@ -20,3 +20,7 @@ Conventions:
   ```
   or a higher-level `set_locked(entry, bool)` if a single locked/unlocked toggle covers the GUI case.
 - **GUI hookup:** new `StagedEdit::SetProdosAccess` variant in `src/gui/browse_view.rs` (parallel to `SetProdosType`); button gated on `fs_type == "ProDOS"`.
+
+### HFS — extending a raw partition image
+- **Gap:** investigate how to extend `~/Documents/partition-0.img` (a raw single-partition HFS image with no APM wrapper). The current expand-HFS path runs through `emit_apm_disk_with_hfs` in `src/fs/hfs_clone.rs`, which assumes an APM source. Surfaced during the hfs_fsck Phase 4 split — not investigated yet.
+- **Suggested shape:** TBD. First step is to reproduce and confirm whether raw-image expand ever worked or has always been APM-only; then either add a non-APM emit path (just write the cloned HFS image to the output) or document the APM-only constraint and offer to wrap the source first.
