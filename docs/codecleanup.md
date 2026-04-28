@@ -138,15 +138,14 @@ Conventions:
 
 ## 7. Clonezilla
 
-- [ ] **`block_cache.rs` is 1461 lines and conflates streaming, in-memory cache, and persistence** (`src/clonezilla/block_cache.rs`)
-  - **Suggested action:** Split into `PartcloneDecompressor` (stream), `PartcloneBlockStore` (BTreeMap cache), and `PartcloneBlockCache` (state machine + persistence). Each <500 lines.
+- [x] **`block_cache.rs` (1461 lines) split into cache + scan**
+  - **Done:** `scan_metadata` and the per-FS `identify_*_metadata_blocks` / `discover_*_directory_blocks` helpers moved into a new `src/clonezilla/metadata_scan.rs` (1063 lines). `block_cache.rs` is now 415 lines and contains only `PartcloneBlockCache`, `PartcloneBlockReader`, and `CacheState` (plus persistence). The audit's three-way split (`PartcloneDecompressor` / `PartcloneBlockStore` / `PartcloneBlockCache`) was rejected on read — the decompressor state is too tightly coupled to the cache's bitmap + on-demand reads to extract usefully; the natural fault line is "block storage" vs. "filesystem-aware metadata identification." Visibility on cache fields touched by scan was bumped to `pub(super)`.
 
-- [ ] **`scan_metadata` (block_cache.rs:429) parses partition metadata in parallel with `backup/metadata.rs`**
-  - **Suggested action:** Unify under `src/backup/metadata.rs::parse_metadata_from_reader` (or a shared `PartitionMetadata` type).
+- [x] ~~**`scan_metadata` parses partition metadata in parallel with `backup/metadata.rs`**~~ — **false positive on review.**
+  - **Evidence:** `clonezilla/metadata_scan.rs::scan_metadata` walks the partclone *block stream* identifying filesystem metadata blocks (FAT table sectors, MFT records, ext GDT) for browsing. `backup/metadata.rs` defines the JSON schema for our own backup folders. They parse different inputs for different consumers — no real overlap.
 
-- [ ] **Clonezilla GPT handling vs `partition/gpt.rs`** (`src/clonezilla/metadata.rs` reads `<disk>-gpt-1st`/`-gpt-2nd`)
-  - **Evidence:** GPT parsing for restore happens via the primary raw file rather than via `partition/gpt.rs::Gpt`.
-  - **Suggested action:** Confirm both code paths agree on CRC/serde, or route Clonezilla GPT through the same parser.
+- [x] **Clonezilla GPT routes through `partition::gpt::Gpt::parse`** — **already true.**
+  - **Evidence:** `src/restore/mod.rs:1428` wraps `cz_image.gpt_primary_raw` in a `Cursor` and calls `Gpt::parse()` directly. CRC validation and serde round-trips share the same code path as native GPT restores. No additional work needed.
 
 ---
 

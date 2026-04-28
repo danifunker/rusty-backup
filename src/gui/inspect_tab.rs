@@ -3502,8 +3502,11 @@ impl InspectTab {
 
         let cache_for_thread = Arc::clone(&cache);
         std::thread::spawn(move || {
-            let result =
-                clonezilla::block_cache::scan_metadata(&cache_for_thread, ptype, Some(&cache_path));
+            let result = clonezilla::metadata_scan::scan_metadata(
+                &cache_for_thread,
+                ptype,
+                Some(&cache_path),
+            );
             if let Ok(mut s) = scan.lock() {
                 s.finished = true;
                 if let Err(e) = result {
