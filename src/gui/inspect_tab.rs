@@ -2902,7 +2902,6 @@ impl InspectTab {
         devices: &[DiskDevice],
         log: &mut LogPanel,
     ) {
-        // Resolve source path from device or image file
         let source_path = self
             .selected_device_idx
             .and_then(|idx| devices.get(idx))
@@ -2917,48 +2916,34 @@ impl InspectTab {
             }
         };
 
-        match std::fs::File::open(&path) {
-            Ok(file) => {
-                let reader = BufReader::new(file);
-                match rusty_backup::fs::open_filesystem(
-                    reader,
-                    offset,
-                    ptype,
-                    type_string.as_deref(),
-                ) {
-                    Ok(mut fs) => match fs.fsck() {
-                        Some(Ok(result)) => {
-                            if result.is_clean() {
-                                log.info(format!(
-                                    "Filesystem check: clean ({} files, {} dirs)",
-                                    result.stats.files_checked, result.stats.directories_checked,
-                                ));
-                            } else {
-                                let visible_warns =
-                                    result.warnings.iter().filter(|w| !w.debug).count();
-                                log.warn(format!(
-                                    "Filesystem check: {} error(s), {} warning(s)",
-                                    result.errors.len(),
-                                    visible_warns,
-                                ));
-                            }
-                            self.fsck_result = Some(result);
-                            self.show_fsck_popup = true;
-                        }
-                        Some(Err(e)) => {
-                            log.error(format!("Filesystem check failed: {}", e));
-                        }
-                        None => {
-                            log.info("Filesystem check not supported for this filesystem type");
-                        }
-                    },
-                    Err(e) => {
-                        log.error(format!("Failed to open filesystem: {}", e));
-                    }
+        match rusty_backup::model::fsck_runner::run_fsck(
+            &path,
+            offset,
+            ptype,
+            type_string.as_deref(),
+        ) {
+            Ok(Some(result)) => {
+                if result.is_clean() {
+                    log.info(format!(
+                        "Filesystem check: clean ({} files, {} dirs)",
+                        result.stats.files_checked, result.stats.directories_checked,
+                    ));
+                } else {
+                    let visible_warns = result.warnings.iter().filter(|w| !w.debug).count();
+                    log.warn(format!(
+                        "Filesystem check: {} error(s), {} warning(s)",
+                        result.errors.len(),
+                        visible_warns,
+                    ));
                 }
+                self.fsck_result = Some(result);
+                self.show_fsck_popup = true;
+            }
+            Ok(None) => {
+                log.info("Filesystem check not supported for this filesystem type");
             }
             Err(e) => {
-                log.error(format!("Failed to open file: {}", e));
+                log.error(format!("{e:#}"));
             }
         }
     }
@@ -3163,41 +3148,24 @@ impl InspectTab {
             }
         };
 
-        match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-        {
-            Ok(file) => {
-                match rusty_backup::fs::open_editable_filesystem(
-                    file,
-                    offset,
-                    ptype,
-                    type_string.as_deref(),
-                ) {
-                    Ok(mut efs) => match efs.repair() {
-                        Ok(report) => {
-                            log.info(format!(
-                                "Repair complete: {} fix(es) applied, {} failed",
-                                report.fixes_applied.len(),
-                                report.fixes_failed.len(),
-                            ));
-                            self.repair_report = Some(report);
-                            // Re-run fsck to show updated state
-                            drop(efs);
-                            self.run_fsck(offset, ptype, type_string, devices, log);
-                        }
-                        Err(e) => {
-                            log.error(format!("Repair failed: {}", e));
-                        }
-                    },
-                    Err(e) => {
-                        log.error(format!("Failed to open filesystem for repair: {}", e));
-                    }
-                }
+        match rusty_backup::model::fsck_runner::run_repair(
+            &path,
+            offset,
+            ptype,
+            type_string.as_deref(),
+        ) {
+            Ok(report) => {
+                log.info(format!(
+                    "Repair complete: {} fix(es) applied, {} failed",
+                    report.fixes_applied.len(),
+                    report.fixes_failed.len(),
+                ));
+                self.repair_report = Some(report);
+                // Re-run fsck to show updated state
+                self.run_fsck(offset, ptype, type_string, devices, log);
             }
             Err(e) => {
-                log.error(format!("Failed to open file for repair: {}", e));
+                log.error(format!("{e:#}"));
             }
         }
     }

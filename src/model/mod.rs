@@ -5,3 +5,4 @@
 
 pub mod archive_edit;
 pub mod edit_queue;
+pub mod fsck_runner;

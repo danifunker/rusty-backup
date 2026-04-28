@@ -113,7 +113,8 @@ Conventions:
 - [ ] **Partition editor state → model** (inspect_tab.rs:117–250, 692–1164)
 - [ ] **Export configuration & job orchestration → model** (inspect_tab.rs:1243–1929)
 - [ ] **Backup / Clonezilla loading and partition merging → model** (inspect_tab.rs:1983–2173)
-- [ ] **Fsck runner state → model** (inspect_tab.rs:2897–3212)
+- [x] **Fsck/repair runner extracted**
+  - **Done:** `src/model/fsck_runner.rs` (56 lines) exposes `run_fsck(path, offset, ptype, type_string) -> Result<Option<FsckResult>>` and `run_repair(...) -> Result<RepairReport>` — pure path-in / typed-result-out. inspect_tab.rs::run_fsck and run_repair_inspect collapsed from ~135 lines combined to ~75 lines (just path resolution + logging + state storage). The popup/confirm renderers stay on the view since they're pure UI.
   - **Suggested action (all four):** Establish `src/model/{partition_editor,export,backup_loader,fsck_runner}.rs`. Each owns its background thread + status struct; `inspect_tab.rs` becomes view + dispatch only. Goal: drop inspect_tab below ~2000 lines.
 
 ### Cross-cutting GUI
