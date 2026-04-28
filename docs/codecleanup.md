@@ -173,9 +173,11 @@ Conventions:
 - [ ] Walk for any `eprintln!` debug calls; route through `log` crate.
 
 ### HFS (`src/fs/hfs.rs`, 4855) + `hfs_fsck.rs` (6588) + `hfs_common.rs` (1849) + `hfs_clone.rs` (1338)
-- [ ] Largest area of recent change — confirm `hfs_common.rs` exposes everything `hfs_clone.rs` needs (`pub(crate)` items have crept in over time).
+- [x] ~~Largest area of recent change — confirm `hfs_common.rs` exposes everything `hfs_clone.rs` needs (`pub(crate)` items have crept in over time).~~ — verified clean.
+  - **Evidence:** `hfs_common.rs` has exactly one `pub(crate)` symbol; the rest are `pub` (intended public API) or `pub(super)`. The "items have crept in" worry hasn't materialized.
 - [ ] Catalog walking / record-range helpers shared with HFS+ (§1).
-- [ ] Audit debug `eprintln!` instances flagged in `hfs.rs:3068–3124` and replace with `log::debug!`.
+- [x] ~~Audit debug `eprintln!` instances flagged in `hfs.rs:3068–3124` and replace with `log::debug!`.~~ — false positive.
+  - **Evidence:** all 17 `eprintln!`s in `src/fs/hfs.rs` (lines 3973–4074) are inside `#[cfg(test)]` blocks — manual `#[ignore]`-tagged real-image fsck tests that intentionally print to stderr. Production code is clean. The line range cited in the audit predated subsequent edits and no longer maps to anything.
 - [x] `hfs_fsck.rs` fully split by phase.
   - `src/fs/hfs_fsck.rs` (was 6588 lines) is now `src/fs/hfs_fsck/mod.rs` (1916 lines, just orchestrators + tests + the `HfsFsckCode` enum) plus five phase submodules:
     - `mdb.rs` (260 lines) — Phase 1 MDB sanity.
