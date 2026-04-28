@@ -10,7 +10,7 @@ use super::filesystem::{
 use super::hfs_common::{
     self, bitmap_clear_bit_be, bitmap_find_clear_run_be, bitmap_set_bit_be, btree_free_node,
     btree_grow_root, btree_insert_into_index, btree_insert_record, btree_record_range,
-    btree_remove_record, btree_split_leaf, BTreeHeader,
+    btree_remove_record, btree_split_leaf_with_insert, BTreeHeader,
 };
 use super::CompactResult;
 
@@ -46,6 +46,9 @@ impl ExtentDescriptor {
 #[derive(Debug, Clone)]
 struct ForkData {
     logical_size: u64,
+    // Preserved for VH round-trip; HFS+ on-disk fork data has a clump_size
+    // slot at bytes [8..12]. We never tune it, but parsing/emitting the
+    // named field keeps the serializer symmetric with the parser.
     #[allow(dead_code)]
     clump_size: u32,
     total_blocks: u32,
@@ -771,20 +774,19 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
                 Ok(())
             }
             Err(_) => {
-                // Leaf is full — split
+                // Leaf full — atomic split+insert. Byte-based split point
+                // tolerates uneven record sizes; avoids the
+                // split-then-insert failure mode where the target half
+                // can't accept the new record.
                 let mut h = BTreeHeader::read(&self.catalog_data);
-                let (new_idx, split_key) =
-                    btree_split_leaf(&mut self.catalog_data, node_size, leaf_idx, &mut h)?;
-
-                // Insert into the correct half
-                let target = if Self::catalog_compare(key_record, &split_key) == Ordering::Less {
-                    leaf_idx
-                } else {
-                    new_idx
-                };
-                let t_offset = target as usize * node_size;
-                let t_node = &mut self.catalog_data[t_offset..t_offset + node_size];
-                btree_insert_record(t_node, node_size, key_record, &Self::catalog_compare)?;
+                let (new_idx, split_key) = btree_split_leaf_with_insert(
+                    &mut self.catalog_data,
+                    node_size,
+                    leaf_idx,
+                    &mut h,
+                    key_record,
+                    &Self::catalog_compare,
+                )?;
 
                 h.leaf_records += 1;
 

@@ -969,136 +969,6 @@ where
     Ok((new_idx, split_key))
 }
 
-/// Split a full leaf node, moving the upper half of records to a new node.
-///
-/// Returns (new_node_idx, first_key_of_new_node) — the separator key to be
-/// inserted into the parent index node.
-///
-/// `header` is mutated: free_nodes decremented. Caller writes it back.
-pub fn btree_split_leaf(
-    catalog_data: &mut [u8],
-    node_size: usize,
-    node_idx: u32,
-    header: &mut BTreeHeader,
-) -> Result<(u32, Vec<u8>), FilesystemError> {
-    let new_idx = btree_alloc_node(catalog_data, node_size, header.total_nodes)?;
-    header.free_nodes -= 1;
-
-    let old_offset = node_idx as usize * node_size;
-    let new_offset = new_idx as usize * node_size;
-
-    // Read the old node's descriptor and records
-    let old_num = BigEndian::read_u16(&catalog_data[old_offset + 10..old_offset + 12]) as usize;
-    let old_height = catalog_data[old_offset + 9];
-
-    // Initialize new node as leaf
-    init_node(
-        catalog_data,
-        node_size,
-        new_idx,
-        BTREE_LEAF_NODE,
-        old_height,
-    );
-
-    // Collect records from old node
-    let mut records: Vec<Vec<u8>> = Vec::with_capacity(old_num);
-    for i in 0..old_num {
-        let (start, end) = btree_record_range(
-            &catalog_data[old_offset..old_offset + node_size],
-            node_size,
-            i,
-        );
-        records.push(catalog_data[old_offset + start..old_offset + end].to_vec());
-    }
-
-    // Pick the split point by *bytes*, not record count. Catalog records
-    // vary widely in size (46 B threads vs 102 B file records vs 70 B dir
-    // records, plus variable-length keys). A naïve count-based 50/50 split
-    // can leave both halves with insufficient free space for the new
-    // record — observed during clone: 3+3 split of a 6-record leaf left
-    // both halves at ~382 B used (130 B free) when the next record needed
-    // 122 B + 2 B offset, just over the line. Bytewise split picks the
-    // earliest position where the left half's bytes meet half the
-    // record-bearing region, leaving the right half with enough free
-    // space for any single record (since max record < half node).
-    let total_bytes: usize = records.iter().map(|r| r.len() + 2).sum();
-    let half = total_bytes / 2;
-    let mut split_point = 1;
-    let mut acc = 0usize;
-    for (i, rec) in records.iter().enumerate() {
-        acc += rec.len() + 2;
-        if acc >= half {
-            split_point = (i + 1).min(old_num - 1).max(1);
-            break;
-        }
-    }
-
-    // Rebuild old node with first half
-    {
-        let node = &mut catalog_data[old_offset..old_offset + node_size];
-        // Keep descriptor (next/prev/kind/height), reset records
-        BigEndian::write_u16(&mut node[10..12], 0);
-        // Reset offset table
-        BigEndian::write_u16(&mut node[node_size - 2..node_size], 14);
-        let mut write_pos = 14usize;
-        for (i, rec) in records[..split_point].iter().enumerate() {
-            node[write_pos..write_pos + rec.len()].copy_from_slice(rec);
-            // Set offset for this record
-            let opos = node_size - 2 * (i + 1);
-            BigEndian::write_u16(&mut node[opos..opos + 2], write_pos as u16);
-            write_pos += rec.len();
-        }
-        // Free-space offset
-        let fpos = node_size - 2 * (split_point + 1);
-        BigEndian::write_u16(&mut node[fpos..fpos + 2], write_pos as u16);
-        BigEndian::write_u16(&mut node[10..12], split_point as u16);
-    }
-
-    // Build new node with second half
-    {
-        let node = &mut catalog_data[new_offset..new_offset + node_size];
-        let count = old_num - split_point;
-        let mut write_pos = 14usize;
-        for (i, rec) in records[split_point..].iter().enumerate() {
-            node[write_pos..write_pos + rec.len()].copy_from_slice(rec);
-            let opos = node_size - 2 * (i + 1);
-            BigEndian::write_u16(&mut node[opos..opos + 2], write_pos as u16);
-            write_pos += rec.len();
-        }
-        let fpos = node_size - 2 * (count + 1);
-        BigEndian::write_u16(&mut node[fpos..fpos + 2], write_pos as u16);
-        BigEndian::write_u16(&mut node[10..12], count as u16);
-    }
-
-    // Update prev/next links
-    let old_next = BigEndian::read_u32(&catalog_data[old_offset..old_offset + 4]);
-    // old.next = new_idx
-    BigEndian::write_u32(&mut catalog_data[old_offset..old_offset + 4], new_idx);
-    // new.prev = node_idx
-    BigEndian::write_u32(&mut catalog_data[new_offset + 4..new_offset + 8], node_idx);
-    // new.next = old's former next
-    BigEndian::write_u32(&mut catalog_data[new_offset..new_offset + 4], old_next);
-    // If old had a next sibling, update its prev to new_idx
-    if old_next != 0 {
-        let next_offset = old_next as usize * node_size;
-        BigEndian::write_u32(&mut catalog_data[next_offset + 4..next_offset + 8], new_idx);
-    }
-
-    // Update header's last_leaf if needed
-    if header.last_leaf_node == node_idx {
-        header.last_leaf_node = new_idx;
-    }
-
-    // The separator key is just the key portion of the first record of the new node
-    // (key_len byte + key data), without pad or record data.
-    let full_rec = &records[split_point];
-    let key_len = full_rec[0] as usize;
-    let key_end = 1 + key_len;
-    let split_key = full_rec[..key_end.min(full_rec.len())].to_vec();
-
-    Ok((new_idx, split_key))
-}
-
 /// Insert a separator key into a parent index node, pointing to child_node.
 ///
 /// For index nodes, each record is: key_bytes + child_node_ptr (4 bytes BE).
@@ -1814,15 +1684,15 @@ mod tests {
     }
 
     #[test]
-    fn test_btree_split_leaf() {
+    fn test_btree_split_leaf_with_insert() {
         let mut data = make_test_btree(512);
         let node_size = 512;
 
-        // Insert several records into node 1
+        // Insert 10 fixed-size records (keys 0..10, even indices) into node 1
         let compare = |a: &[u8], b: &[u8]| a.cmp(b);
         for i in 0..10u8 {
             let mut rec = vec![0u8; 30];
-            rec[0] = i;
+            rec[0] = i * 2;
             let node = &mut data[node_size..node_size * 2];
             btree_insert_record(node, node_size, &rec, &compare).unwrap();
         }
@@ -1830,20 +1700,19 @@ mod tests {
         let node = &data[node_size..node_size * 2];
         assert_eq!(BigEndian::read_u16(&node[10..12]), 10);
 
+        // Atomic split + insert a new 30-byte record with key=5 (lands in left half).
+        let mut new_rec = vec![0u8; 30];
+        new_rec[0] = 5;
         let mut header = BTreeHeader::read(&data);
-        let (new_idx, split_key) = btree_split_leaf(&mut data, node_size, 1, &mut header).unwrap();
-        assert_eq!(new_idx, 2); // allocated node 2
+        let (new_idx, _split_key) =
+            btree_split_leaf_with_insert(&mut data, node_size, 1, &mut header, &new_rec, &compare)
+                .unwrap();
+        assert_eq!(new_idx, 2);
 
-        // Check both nodes have records
         let old_node = &data[node_size..node_size * 2];
         let new_node = &data[new_idx as usize * node_size..(new_idx as usize + 1) * node_size];
         let old_count = BigEndian::read_u16(&old_node[10..12]);
         let new_count = BigEndian::read_u16(&new_node[10..12]);
-        assert_eq!(old_count + new_count, 10);
-        assert_eq!(old_count, 5);
-        assert_eq!(new_count, 5);
-
-        // Split key should be the first record of the new node
-        assert_eq!(split_key[0], 5); // records 5-9 moved to new node
+        assert_eq!(old_count + new_count, 11); // 10 existing + 1 inserted
     }
 }
