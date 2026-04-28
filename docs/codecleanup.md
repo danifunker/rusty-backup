@@ -157,20 +157,24 @@ Conventions:
 
 ### FAT (`src/fs/fat.rs`, 3780 lines)
 - [ ] Solid module organization (BPB → reader → editable → compact reader). No reorganization needed.
-- [ ] Move `write_bpb` (line ~3259) into a shared helper if NTFS/exFAT can reuse it.
+- [x] ~~Move `write_bpb` (line ~3259) into a shared helper if NTFS/exFAT can reuse it.~~ — not applicable.
+  - **Evidence:** NTFS and exFAT VBRs have completely different layouts (NTFS = $Boot at LCN 0 with backup at last sector + FILE record signatures; exFAT = 12-sector boot region with checksum). Their write paths share no structure with FAT's BPB. The audit's "if NTFS/exFAT can reuse it" was speculative; the answer is no.
 
 ### NTFS (`src/fs/ntfs.rs`, 3276)
-- [ ] Hidden-sector patcher consolidates with FAT/exFAT (§4).
+- [x] ~~Hidden-sector patcher consolidates with FAT/exFAT (§4).~~ — done as part of §4.
 - [ ] Audit MFT-record and index helpers for overlap with `unix_common/`.
 
 ### exFAT (`src/fs/exfat.rs`, 2411)
-- [ ] Drop `CompactExfatInfo` in favor of unified type (§3).
-- [ ] Hidden-sector patcher consolidates (§4).
+- [x] ~~Drop `CompactExfatInfo` in favor of unified type (§3).~~ — already gone.
+  - **Evidence:** zero references to `CompactExfatInfo` in the codebase; the type was removed during the §3 compact-reader unification work.
+- [x] ~~Hidden-sector patcher consolidates (§4).~~ — done as part of §4.
 
 ### ext (`src/fs/ext.rs`, 5289 — largest single FS file)
-- [ ] Inode handling overlaps with `unix_common/inode.rs`. Promote shared code there.
+- [x] ~~Inode handling overlaps with `unix_common/inode.rs`. Promote shared code there.~~ — already done.
+  - **Evidence:** `src/fs/ext.rs:17–21` imports from `unix_common::bitmap`, `unix_common::compact`, and `unix_common::inode` (`unix_entry_from_inode`, `unix_file_type`, `UnixFileType`). The shared inode helpers live in `unix_common/inode.rs` (412 lines) and ext is the active consumer.
 - [ ] Consider splitting per-revision code (ext2 vs ext3 vs ext4) into submodules under `src/fs/ext/`.
-- [ ] Walk for any `eprintln!` debug calls; route through `log` crate.
+- [x] ~~Walk for any `eprintln!` debug calls; route through `log` crate.~~ — already clean.
+  - **Evidence:** zero `eprintln!` instances in `src/fs/ext.rs` (also zero in `ntfs.rs` and `btrfs.rs`).
 
 ### HFS (`src/fs/hfs.rs`, 4855) + `hfs_fsck.rs` (6588) + `hfs_common.rs` (1849) + `hfs_clone.rs` (1338)
 - [x] ~~Largest area of recent change — confirm `hfs_common.rs` exposes everything `hfs_clone.rs` needs (`pub(crate)` items have crept in over time).~~ — verified clean.
@@ -188,7 +192,8 @@ Conventions:
   - Cross-module wiring: `extents.rs` and `catalog.rs` import shared btree primitives via `super::btree::...`; `bitmap.rs` imports `CatalogEntry` / `collect_catalog_entries` from `super::catalog::...`; `catalog.rs` imports `validate_hfs_name` from `super::mdb::...`. `rebuild_index_nodes` is re-exported from mod.rs as `pub(crate)` so `hfs.rs` callers (`super::hfs_fsck::rebuild_index_nodes`) keep working unchanged. `hfs_issue`, `HfsFsckCode`, `CATALOG_DIR_THREAD`, `CATALOG_FILE_THREAD` stay in mod.rs as `pub(super)` shared helpers. All 61 fsck tests still pass.
 
 ### HFS+ (`src/fs/hfsplus.rs`, 2607)
-- [ ] Migrate to `btree_split_leaf_with_insert` (§1).
+- [x] ~~Migrate to `btree_split_leaf_with_insert` (§1).~~ — done.
+  - **Evidence:** `src/fs/hfsplus.rs:13` imports `btree_split_leaf_with_insert` and line 782 calls it during catalog inserts.
 - [x] Dead-code sweep done: `clump_size` documented and kept; the other two were false positives.
 - [ ] Currently lacks the editable surface HFS gained — confirm it's intentionally read-only or queue an edit-mode track.
 
