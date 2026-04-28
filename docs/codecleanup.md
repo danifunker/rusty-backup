@@ -176,7 +176,9 @@ Conventions:
 - [ ] Largest area of recent change — confirm `hfs_common.rs` exposes everything `hfs_clone.rs` needs (`pub(crate)` items have crept in over time).
 - [ ] Catalog walking / record-range helpers shared with HFS+ (§1).
 - [ ] Audit debug `eprintln!` instances flagged in `hfs.rs:3068–3124` and replace with `log::debug!`.
-- [ ] `hfs_fsck.rs` at 6588 lines is unwieldy — consider splitting per phase (mdb / btree / catalog / bitmap / repair) into submodules under `src/fs/hfs_fsck/`.
+- [~] `hfs_fsck.rs` split started: extents-overflow code moved to its own submodule.
+  - **Done:** `src/fs/hfs_fsck.rs` is now `src/fs/hfs_fsck/mod.rs` (5279 lines, was 6588) plus `src/fs/hfs_fsck/extents.rs` (1337 lines) covering the 17 `*_extents_*` functions for the extents-overflow B-tree (`check_extents_btree_structure` + `repair_extents_btree_structure` entry points + helpers and the dedicated test block). Helpers `HfsFsckCode`, `HFS_MAX_NRECS`, `hfs_issue`, `extract_child_pointers`, `record_key` bumped to `pub(super)` so the submodule can reach them. All 7 fsck tests still pass under their new module paths.
+  - **Not yet done:** further per-phase splits (mdb / catalog / btree / bitmap). The remaining mod.rs has tighter cross-references between phases (catalog and B-tree share many helpers like `compare_catalog_keys`, `walk_leaf_chain`, `repair_btree_structure_leaves_only`); each additional split needs a careful pass over `pub(super)` visibility. Worth doing iteratively.
 
 ### HFS+ (`src/fs/hfsplus.rs`, 2607)
 - [ ] Migrate to `btree_split_leaf_with_insert` (§1).
