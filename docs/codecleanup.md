@@ -81,15 +81,14 @@ Conventions:
 
 ## 4. Hidden-sector patching
 
-- [ ] **FAT, NTFS, exFAT hidden-sector patches are nearly identical** (`src/fs/fat.rs:3208`, `src/fs/ntfs.rs:2823`, `src/fs/exfat.rs:1901`)
-  - **Evidence:** All seek to BPB/VBR offset `0x1C..0x20`, write a u32 LE.
-  - **Suggested action:** Single `patch_le_u32_at(file, sector_offset, field_offset, value)` helper in a new `fs/patch.rs`; the per-FS patcher becomes a one-line call.
+- [x] **FAT, NTFS, exFAT hidden-sector patches share their preamble** (`src/fs/fat.rs`, `src/fs/ntfs.rs`, `src/fs/exfat.rs`)
+  - **Done:** New `src/fs/patch.rs` exposes `read_boot_sector`, `patch_u32_le_in_buf` (returns `Some(old)` only when the field actually changes), and `write_sector_at`. FAT and NTFS patchers now share the read+detect+write-primary path; exFAT reuses `read_boot_sector` only (its u64@0x40 + 12-sector boot region + checksum recompute is genuinely unique). The audit's "one-line call" framing was overstated — backup-region writes (FAT32 sector-6 mirror, NTFS last-sector mirror, exFAT 12-sector backup region with checksum) differ enough that a single helper would obscure rather than simplify.
 
-- [ ] **HFS / HFS+ have no-op `patch_*_hidden_sectors` stubs** (`src/fs/hfs.rs:3401`, `src/fs/hfsplus.rs:2116`)
-  - **Suggested action:** Either delete (and let `rbformats/mod.rs` skip them) or document why they're stubs.
+- [x] **HFS / HFS+ no-op `patch_*_hidden_sectors` stubs deleted**
+  - **Done:** Removed the no-op functions and their re-exports in `src/fs/mod.rs`. HFS / HFS+ have no LBA-dependent VBR field; the dispatcher (next item) now skips them by construction.
 
-- [ ] **`rbformats/mod.rs` orchestrates per-FS patching but the call list lives outside `fs/`**
-  - **Suggested action:** Move the dispatcher into `src/fs/mod.rs` next to `compact_partition_reader()` and `effective_partition_size()`; `rbformats` should just call one `patch_hidden_sectors_for(parts, file)`.
+- [x] **Dispatcher moved into `src/fs/mod.rs`**
+  - **Done:** New `pub fn patch_hidden_sectors_for(file, partition_offset, start_lba, log_cb)` in `src/fs/mod.rs` calls FAT / NTFS / exFAT in sequence (each is a no-op on magic mismatch). All five call sites collapsed: `rbformats/mod.rs`, `rbformats/vhd.rs` (×2), `restore/mod.rs`, `restore/single.rs`, `partition/resize.rs`. Each previously inlined a 5-line ladder of per-FS calls.
 
 ---
 

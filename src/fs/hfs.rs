@@ -3397,16 +3397,6 @@ pub fn validate_hfs_integrity(
     Ok(())
 }
 
-/// Patch HFS hidden sectors (no-op: HFS doesn't have a hidden sectors field like FAT/NTFS).
-pub fn patch_hfs_hidden_sectors(
-    _device: &mut (impl Read + Seek),
-    _partition_offset: u64,
-    _new_lba: u64,
-    _log: &mut impl FnMut(&str),
-) -> anyhow::Result<()> {
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

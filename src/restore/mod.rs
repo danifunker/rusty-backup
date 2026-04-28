@@ -13,11 +13,7 @@ use crate::backup::LogLevel;
 use crate::clonezilla;
 use crate::clonezilla::metadata::ClonezillaImage;
 use crate::clonezilla::partclone::open_partclone_reader;
-use crate::fs::exfat::patch_exfat_hidden_sectors;
-use crate::fs::fat::patch_bpb_hidden_sectors;
-use crate::fs::hfs::patch_hfs_hidden_sectors;
-use crate::fs::hfsplus::patch_hfsplus_hidden_sectors;
-use crate::fs::ntfs::patch_ntfs_hidden_sectors;
+use crate::fs::patch_hidden_sectors_for;
 use crate::fs::{
     resize_btrfs_in_place, resize_exfat_in_place, resize_ext_in_place, resize_fat_in_place,
     resize_hfs_in_place, resize_hfsplus_in_place, resize_ntfs_in_place, resize_prodos_in_place,
@@ -1884,19 +1880,7 @@ fn write_clonezilla_disk(
         // Patch hidden sectors
         {
             writer.flush()?;
-            patch_bpb_hidden_sectors(writer, part_offset, effective_lba, &mut |msg| {
-                log(progress, LogLevel::Info, msg)
-            })?;
-            patch_ntfs_hidden_sectors(writer, part_offset, effective_lba, &mut |msg| {
-                log(progress, LogLevel::Info, msg)
-            })?;
-            patch_exfat_hidden_sectors(writer, part_offset, effective_lba, &mut |msg| {
-                log(progress, LogLevel::Info, msg)
-            })?;
-            patch_hfs_hidden_sectors(writer, part_offset, effective_lba, &mut |msg| {
-                log(progress, LogLevel::Info, msg)
-            })?;
-            patch_hfsplus_hidden_sectors(writer, part_offset, effective_lba, &mut |msg| {
+            patch_hidden_sectors_for(writer, part_offset, effective_lba, &mut |msg| {
                 log(progress, LogLevel::Info, msg)
             })?;
         }

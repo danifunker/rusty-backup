@@ -508,45 +508,12 @@ fn patch_filesystem_hidden_sectors(
     use crate::restore::PartitionFsType;
 
     match fs_type {
-        PartitionFsType::Fat => {
-            crate::fs::fat::patch_bpb_hidden_sectors(
-                file,
-                partition_offset,
-                new_start_lba,
-                log_cb,
-            )?;
-        }
-        PartitionFsType::Ntfs => {
-            crate::fs::ntfs::patch_ntfs_hidden_sectors(
-                file,
-                partition_offset,
-                new_start_lba,
-                log_cb,
-            )?;
-        }
-        PartitionFsType::Exfat => {
-            crate::fs::exfat::patch_exfat_hidden_sectors(
-                file,
-                partition_offset,
-                new_start_lba,
-                log_cb,
-            )?;
-        }
-        PartitionFsType::Hfs => {
-            crate::fs::hfs::patch_hfs_hidden_sectors(
-                file,
-                partition_offset,
-                new_start_lba,
-                log_cb,
-            )?;
-        }
-        PartitionFsType::HfsPlus => {
-            crate::fs::hfsplus::patch_hfsplus_hidden_sectors(
-                file,
-                partition_offset,
-                new_start_lba,
-                log_cb,
-            )?;
+        PartitionFsType::Fat
+        | PartitionFsType::Ntfs
+        | PartitionFsType::Exfat
+        | PartitionFsType::Hfs
+        | PartitionFsType::HfsPlus => {
+            crate::fs::patch_hidden_sectors_for(file, partition_offset, new_start_lba, log_cb)?;
         }
         // ext, btrfs, prodos have no hidden sectors field
         PartitionFsType::Ext

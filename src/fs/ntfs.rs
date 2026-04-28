@@ -2821,23 +2821,17 @@ pub fn patch_ntfs_hidden_sectors(
     start_lba: u64,
     log_cb: &mut impl FnMut(&str),
 ) -> Result<()> {
-    file.seek(SeekFrom::Start(partition_offset))?;
-    let mut vbr = [0u8; 512];
-    file.read_exact(&mut vbr)?;
+    let mut vbr = crate::fs::patch::read_boot_sector(file, partition_offset)?;
 
     if &vbr[3..11] != b"NTFS    " {
         return Ok(());
     }
 
-    let old_hidden = u32::from_le_bytes([vbr[0x1C], vbr[0x1D], vbr[0x1E], vbr[0x1F]]);
-    let new_hidden = start_lba as u32;
-
-    if old_hidden != new_hidden {
-        vbr[0x1C..0x20].copy_from_slice(&new_hidden.to_le_bytes());
-
+    if let Some(old_hidden) =
+        crate::fs::patch::patch_u32_le_in_buf(&mut vbr, 0x1C, start_lba as u32)
+    {
         // Write primary VBR
-        file.seek(SeekFrom::Start(partition_offset))?;
-        file.write_all(&vbr)?;
+        crate::fs::patch::write_sector_at(file, partition_offset, &vbr)?;
 
         // Write backup boot sector at last sector
         let total_sectors = u64::from_le_bytes([
@@ -2846,13 +2840,12 @@ pub fn patch_ntfs_hidden_sectors(
         let bytes_per_sector = u16::from_le_bytes([vbr[0x0B], vbr[0x0C]]) as u64;
         if total_sectors > 0 && bytes_per_sector > 0 {
             let backup_offset = partition_offset + (total_sectors - 1) * bytes_per_sector;
-            file.seek(SeekFrom::Start(backup_offset))?;
-            file.write_all(&vbr)?;
+            crate::fs::patch::write_sector_at(file, backup_offset, &vbr)?;
         }
 
         log_cb(&format!(
             "NTFS: patched hidden sectors {} -> {}",
-            old_hidden, new_hidden
+            old_hidden, start_lba as u32
         ));
     }
 

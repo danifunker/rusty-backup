@@ -7,11 +7,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::backup::metadata::BackupMetadata;
 use crate::backup::LogLevel;
-use crate::fs::exfat::patch_exfat_hidden_sectors;
-use crate::fs::fat::patch_bpb_hidden_sectors;
-use crate::fs::hfs::patch_hfs_hidden_sectors;
-use crate::fs::hfsplus::patch_hfsplus_hidden_sectors;
-use crate::fs::ntfs::patch_ntfs_hidden_sectors;
+use crate::fs::patch_hidden_sectors_for;
 use crate::fs::{
     resize_btrfs_in_place, resize_exfat_in_place, resize_ext_in_place, resize_fat_in_place,
     resize_hfs_in_place, resize_hfsplus_in_place, resize_ntfs_in_place, resize_prodos_in_place,
@@ -485,40 +481,12 @@ pub fn run_single_partition_restore(
         );
 
         match fs_type {
-            PartitionFsType::Fat => {
-                let _ = patch_bpb_hidden_sectors(
-                    inner_file,
-                    config.target_offset_bytes,
-                    config.target_start_lba,
-                    &mut |msg| log(&progress, LogLevel::Info, msg),
-                );
-            }
-            PartitionFsType::Ntfs => {
-                let _ = patch_ntfs_hidden_sectors(
-                    inner_file,
-                    config.target_offset_bytes,
-                    config.target_start_lba,
-                    &mut |msg| log(&progress, LogLevel::Info, msg),
-                );
-            }
-            PartitionFsType::Exfat => {
-                let _ = patch_exfat_hidden_sectors(
-                    inner_file,
-                    config.target_offset_bytes,
-                    config.target_start_lba,
-                    &mut |msg| log(&progress, LogLevel::Info, msg),
-                );
-            }
-            PartitionFsType::Hfs => {
-                let _ = patch_hfs_hidden_sectors(
-                    inner_file,
-                    config.target_offset_bytes,
-                    config.target_start_lba,
-                    &mut |msg| log(&progress, LogLevel::Info, msg),
-                );
-            }
-            PartitionFsType::HfsPlus => {
-                let _ = patch_hfsplus_hidden_sectors(
+            PartitionFsType::Fat
+            | PartitionFsType::Ntfs
+            | PartitionFsType::Exfat
+            | PartitionFsType::Hfs
+            | PartitionFsType::HfsPlus => {
+                let _ = patch_hidden_sectors_for(
                     inner_file,
                     config.target_offset_bytes,
                     config.target_start_lba,

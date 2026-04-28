@@ -19,11 +19,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::backup::metadata::BackupMetadata;
 use crate::backup::CompressionType;
-use crate::fs::exfat::patch_exfat_hidden_sectors;
-use crate::fs::fat::patch_bpb_hidden_sectors;
-use crate::fs::hfs::patch_hfs_hidden_sectors;
-use crate::fs::hfsplus::patch_hfsplus_hidden_sectors;
-use crate::fs::ntfs::patch_ntfs_hidden_sectors;
+use crate::fs::patch_hidden_sectors_for;
 use crate::partition::apm::Apm;
 use crate::partition::gpt::Gpt;
 use crate::partition::mbr::patch_mbr_entries;
@@ -626,12 +622,7 @@ pub fn reconstruct_disk_from_backup(
         // Update hidden sectors / partition offset to match the new start LBA
         {
             writer.flush()?;
-            // Try FAT first (most common), then NTFS, then exFAT, then HFS/HFS+ (no-ops)
-            patch_bpb_hidden_sectors(writer, part_offset, effective_lba, log_cb)?;
-            patch_ntfs_hidden_sectors(writer, part_offset, effective_lba, log_cb)?;
-            patch_exfat_hidden_sectors(writer, part_offset, effective_lba, log_cb)?;
-            patch_hfs_hidden_sectors(writer, part_offset, effective_lba, log_cb)?;
-            patch_hfsplus_hidden_sectors(writer, part_offset, effective_lba, log_cb)?;
+            patch_hidden_sectors_for(writer, part_offset, effective_lba, log_cb)?;
         }
 
         log_cb(&format!(

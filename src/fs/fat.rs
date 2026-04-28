@@ -3206,9 +3206,7 @@ pub fn patch_bpb_hidden_sectors(
     start_lba: u64,
     log_cb: &mut impl FnMut(&str),
 ) -> Result<()> {
-    file.seek(SeekFrom::Start(partition_offset))?;
-    let mut bpb = [0u8; 512];
-    file.read_exact(&mut bpb)?;
+    let mut bpb = crate::fs::patch::read_boot_sector(file, partition_offset)?;
 
     if bpb[0] != 0xEB && bpb[0] != 0xE9 {
         return Ok(()); // Not a FAT BPB
@@ -3219,12 +3217,9 @@ pub fn patch_bpb_hidden_sectors(
         return Ok(()); // Not a valid FAT BPB
     }
 
-    let old_hidden = u32::from_le_bytes([bpb[0x1C], bpb[0x1D], bpb[0x1E], bpb[0x1F]]);
-    let new_hidden = start_lba as u32;
-
-    if old_hidden != new_hidden {
-        bpb[0x1C..0x20].copy_from_slice(&new_hidden.to_le_bytes());
-
+    if let Some(old_hidden) =
+        crate::fs::patch::patch_u32_le_in_buf(&mut bpb, 0x1C, start_lba as u32)
+    {
         let spf16 = u16::from_le_bytes([bpb[22], bpb[23]]);
         let root_entry_count = u16::from_le_bytes([bpb[17], bpb[18]]);
         let is_fat32 = spf16 == 0 && root_entry_count == 0;
@@ -3232,7 +3227,7 @@ pub fn patch_bpb_hidden_sectors(
         write_bpb(file, partition_offset, &bpb, is_fat32, bytes_per_sector)?;
         log_cb(&format!(
             "Patched BPB hidden sectors: {} -> {}",
-            old_hidden, new_hidden
+            old_hidden, start_lba as u32
         ));
     }
 

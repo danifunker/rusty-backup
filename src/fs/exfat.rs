@@ -1900,10 +1900,7 @@ pub fn patch_exfat_hidden_sectors(
     start_lba: u64,
     log_cb: &mut impl FnMut(&str),
 ) -> Result<()> {
-    // Read full boot region for checksum recalculation
-    file.seek(SeekFrom::Start(partition_offset))?;
-    let mut vbr = [0u8; 512];
-    file.read_exact(&mut vbr)?;
+    let mut vbr = crate::fs::patch::read_boot_sector(file, partition_offset)?;
 
     if &vbr[3..11] != b"EXFAT   " {
         return Ok(());

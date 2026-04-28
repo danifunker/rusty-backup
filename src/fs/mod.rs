@@ -12,6 +12,7 @@ pub mod hfs_fsck;
 pub mod hfsplus;
 pub mod mac_alias;
 pub mod ntfs;
+pub mod patch;
 pub mod prodos;
 pub mod prodos_types;
 pub mod resource_fork;
@@ -36,17 +37,30 @@ pub use filesystem::{
 use filesystem::{Filesystem, FilesystemError};
 pub use fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry, RepairReport};
 pub use hfs::{
-    hfs_max_growable_size, patch_hfs_hidden_sectors, resize_hfs_in_place, validate_hfs_integrity,
-    CompactHfsReader,
+    hfs_max_growable_size, resize_hfs_in_place, validate_hfs_integrity, CompactHfsReader,
 };
-pub use hfsplus::{
-    patch_hfsplus_hidden_sectors, resize_hfsplus_in_place, validate_hfsplus_integrity,
-    CompactHfsPlusReader,
-};
+pub use hfsplus::{resize_hfsplus_in_place, validate_hfsplus_integrity, CompactHfsPlusReader};
 pub use ntfs::{
     patch_ntfs_hidden_sectors, resize_ntfs_in_place, validate_ntfs_integrity, CompactNtfsReader,
 };
 pub use prodos::{resize_prodos_in_place, validate_prodos_integrity, CompactProDosReader};
+
+/// Update the BPB/VBR hidden-sectors / partition-offset field for whichever
+/// filesystem is present at `partition_offset`. Each per-FS patcher checks
+/// its own magic and is a no-op on mismatch, so this is safe to call
+/// unconditionally during restore. HFS / HFS+ have no LBA-dependent VBR
+/// field and are intentionally absent from the dispatch list.
+pub fn patch_hidden_sectors_for(
+    file: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    start_lba: u64,
+    log_cb: &mut impl FnMut(&str),
+) -> anyhow::Result<()> {
+    fat::patch_bpb_hidden_sectors(file, partition_offset, start_lba, log_cb)?;
+    ntfs::patch_ntfs_hidden_sectors(file, partition_offset, start_lba, log_cb)?;
+    exfat::patch_exfat_hidden_sectors(file, partition_offset, start_lba, log_cb)?;
+    Ok(())
+}
 
 /// Result of filesystem compaction.
 ///
