@@ -16,7 +16,8 @@ use super::super::hfs::{HfsExtDescriptor, HfsMasterDirectoryBlock, CATALOG_FILE}
 use super::super::hfs_common::{
     bitmap_set_bit_be, bitmap_test_bit_be, btree_record_range, BTreeHeader, BTREE_LEAF_NODE,
 };
-use super::{collect_catalog_entries, hfs_issue, CatalogEntry, HfsFsckCode};
+use super::catalog::{collect_catalog_entries, CatalogEntry};
+use super::{hfs_issue, HfsFsckCode};
 
 /// Maximum number of bitmap mismatch issues to report before capping.
 const MAX_BITMAP_MISMATCHES: usize = 20;
