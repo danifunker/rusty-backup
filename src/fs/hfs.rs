@@ -8,7 +8,7 @@ use super::filesystem::{
 };
 use super::hfs_common::{
     self, bitmap_clear_bit_be, bitmap_find_clear_run_be, bitmap_set_bit_be, btree_free_node,
-    btree_insert_record, btree_record_range, btree_remove_record, BTreeHeader,
+    btree_insert_record, btree_remove_record, BTreeHeader,
 };
 use super::CompactResult;
 
@@ -723,47 +723,28 @@ impl<R: Read + Seek> HfsFilesystem<R> {
     ) -> Option<(u32, usize, usize)> {
         let search_key = Self::build_catalog_key(parent_id, name);
         let node_size = BigEndian::read_u16(&self.catalog_data[32..34]) as usize;
-        if node_size == 0 || self.catalog_data.len() < node_size {
-            return None;
-        }
         let first_leaf = BigEndian::read_u32(&self.catalog_data[24..28]);
 
-        let mut node_idx = first_leaf;
-        while node_idx != 0 {
-            let offset = node_idx as usize * node_size;
-            if offset + node_size > self.catalog_data.len() {
-                break;
-            }
-            let node = &self.catalog_data[offset..offset + node_size];
-            let kind = node[8] as i8;
-            if kind != -1 {
-                node_idx = BigEndian::read_u32(&node[0..4]);
-                continue;
-            }
-            let num_records = BigEndian::read_u16(&node[10..12]) as usize;
-            for i in 0..num_records {
-                let (rec_start, rec_end) = btree_record_range(node, node_size, i);
-                if rec_start >= rec_end || rec_end > node_size {
-                    continue;
-                }
-                let rec = &node[rec_start..rec_end];
+        hfs_common::walk_leaf_records(
+            &self.catalog_data,
+            first_leaf,
+            node_size,
+            |node_idx, rec_idx, abs_off, rec| {
                 if rec.len() < 7 {
-                    continue;
+                    return None;
                 }
-                // Extract key portion (key_len byte + key data, possibly padded)
                 let key_len = rec[0] as usize;
                 let key_end = 1 + key_len;
                 if key_end > rec.len() {
-                    continue;
+                    return None;
                 }
-                let key_portion = &rec[..key_end];
-                if Self::catalog_compare(key_portion, &search_key) == Ordering::Equal {
-                    return Some((node_idx, i, offset + rec_start));
+                if Self::catalog_compare(&rec[..key_end], &search_key) == Ordering::Equal {
+                    Some((node_idx, rec_idx, abs_off))
+                } else {
+                    None
                 }
-            }
-            node_idx = BigEndian::read_u32(&node[0..4]);
-        }
-        None
+            },
+        )
     }
 
     /// Find a thread record by CNID (thread key: parent_id=cnid, name="").
@@ -774,62 +755,49 @@ impl<R: Read + Seek> HfsFilesystem<R> {
     /// Update parent folder valence (child count) by delta.
     fn update_parent_valence(&mut self, parent_id: u32, delta: i32) -> Result<(), FilesystemError> {
         let node_size = BigEndian::read_u16(&self.catalog_data[32..34]) as usize;
-        if node_size == 0 {
-            return Ok(());
-        }
         let first_leaf = BigEndian::read_u32(&self.catalog_data[24..28]);
 
-        let mut node_idx = first_leaf;
-        while node_idx != 0 {
-            let offset = node_idx as usize * node_size;
-            if offset + node_size > self.catalog_data.len() {
-                break;
-            }
-            let num_records =
-                BigEndian::read_u16(&self.catalog_data[offset + 10..offset + 12]) as usize;
-            for i in 0..num_records {
-                let (rec_start, rec_end) = btree_record_range(
-                    &self.catalog_data[offset..offset + node_size],
-                    node_size,
-                    i,
-                );
-                let abs_start = offset + rec_start;
-                let abs_end = offset + rec_end;
-                if abs_end > self.catalog_data.len() || rec_end - rec_start < 7 {
-                    continue;
+        // Walk leaves to locate the dir record's valence offset; mutate after
+        // the borrow ends so we satisfy the &mut self mutation rule.
+        let val_off = hfs_common::walk_leaf_records(
+            &self.catalog_data,
+            first_leaf,
+            node_size,
+            |_node_idx, _rec_idx, abs_off, rec| {
+                if rec.len() < 7 {
+                    return None;
                 }
-                let key_len = self.catalog_data[abs_start] as usize;
-                let mut rec_data_offset = abs_start + 1 + key_len;
-                if rec_data_offset % 2 != 0 {
-                    rec_data_offset += 1;
+                let key_len = rec[0] as usize;
+                let mut data_off = abs_off + 1 + key_len;
+                if data_off % 2 != 0 {
+                    data_off += 1;
                 }
-                if rec_data_offset + 10 > abs_end {
-                    continue;
+                let abs_end = abs_off + rec.len();
+                if data_off + 10 > abs_end {
+                    return None;
                 }
-                let record_type = self.catalog_data[rec_data_offset] as i8;
-                if record_type != CATALOG_DIR {
-                    continue;
+                if self.catalog_data[data_off] as i8 != CATALOG_DIR {
+                    return None;
                 }
                 // Dir record: type(1) + reserved(1) + flags(2) + valence(2) + dirID(4)
-                let dir_id = BigEndian::read_u32(
-                    &self.catalog_data[rec_data_offset + 6..rec_data_offset + 10],
-                );
+                let dir_id = BigEndian::read_u32(&self.catalog_data[data_off + 6..data_off + 10]);
                 if dir_id == parent_id {
-                    // Valence at offset 4 (u16)
-                    let val_off = rec_data_offset + 4;
-                    let old_val = BigEndian::read_u16(&self.catalog_data[val_off..val_off + 2]);
-                    let new_val = (old_val as i32 + delta).max(0) as u16;
-                    BigEndian::write_u16(&mut self.catalog_data[val_off..val_off + 2], new_val);
-                    return Ok(());
+                    Some(data_off + 4)
+                } else {
+                    None
                 }
-            }
-            let next = BigEndian::read_u32(&self.catalog_data[offset..offset + 4]);
-            node_idx = next;
-        }
-        Err(FilesystemError::NotFound(format!(
-            "parent directory CNID {} not found in catalog",
-            parent_id
-        )))
+            },
+        );
+        let val_off = val_off.ok_or_else(|| {
+            FilesystemError::NotFound(format!(
+                "parent directory CNID {} not found in catalog",
+                parent_id
+            ))
+        })?;
+        let old_val = BigEndian::read_u16(&self.catalog_data[val_off..val_off + 2]);
+        let new_val = (old_val as i32 + delta).max(0) as u16;
+        BigEndian::write_u16(&mut self.catalog_data[val_off..val_off + 2], new_val);
+        Ok(())
     }
 
     /// Insert a catalog record into the B-tree, handling splits and growth.
@@ -1180,54 +1148,39 @@ impl<R: Read + Seek> HfsFilesystem<R> {
             return None;
         }
         let node_size = BigEndian::read_u16(&self.catalog_data[32..34]) as usize;
-        if node_size == 0 || self.catalog_data.len() < node_size {
-            return None;
-        }
         let first_leaf = BigEndian::read_u32(&self.catalog_data[24..28]);
 
-        let mut node_idx = first_leaf;
-        while node_idx != 0 {
-            let off = node_idx as usize * node_size;
-            if off + node_size > self.catalog_data.len() {
-                break;
-            }
-            let node = &self.catalog_data[off..off + node_size];
-            let next_node = BigEndian::read_u32(&node[0..4]);
-            let num_records = BigEndian::read_u16(&node[10..12]) as usize;
-
-            for i in 0..num_records {
-                let offset_pos = node_size - 2 * (i + 1);
-                if offset_pos + 2 > node_size {
-                    break;
+        hfs_common::walk_leaf_records(
+            &self.catalog_data,
+            first_leaf,
+            node_size,
+            |node_idx, rec_idx, abs_off, rec| {
+                if rec.len() < 7 {
+                    return None;
                 }
-                let rec_offset = BigEndian::read_u16(&node[offset_pos..offset_pos + 2]) as usize;
-                if rec_offset >= node_size {
-                    continue;
+                let key_len = rec[0] as usize;
+                if key_len < 6 || 1 + key_len > rec.len() {
+                    return None;
                 }
-                let key_len = node[rec_offset] as usize;
-                if key_len < 6 || rec_offset + 1 + key_len > node_size {
-                    continue;
+                let mut data_rel = 1 + key_len;
+                if data_rel % 2 != 0 {
+                    data_rel += 1;
                 }
-                let mut rec_data_offset = rec_offset + 1 + key_len;
-                if rec_data_offset % 2 != 0 {
-                    rec_data_offset += 1;
+                if data_rel + 24 > rec.len() {
+                    return None;
                 }
-                if rec_data_offset + 24 > node_size {
-                    continue;
-                }
-                if node[rec_data_offset] as i8 != CATALOG_FILE {
-                    continue;
+                if rec[data_rel] as i8 != CATALOG_FILE {
+                    return None;
                 }
                 // filFlNum at offset 20 of the file record data
-                let rec_cnid =
-                    BigEndian::read_u32(&node[rec_data_offset + 20..rec_data_offset + 24]);
+                let rec_cnid = BigEndian::read_u32(&rec[data_rel + 20..data_rel + 24]);
                 if rec_cnid == cnid {
-                    return Some((node_idx, i, off + rec_data_offset));
+                    Some((node_idx, rec_idx, abs_off + data_rel))
+                } else {
+                    None
                 }
-            }
-            node_idx = next_node;
-        }
-        None
+            },
+        )
     }
 
     /// Write the full 16-byte `FInfo` + 16-byte `FXInfo` Finder metadata

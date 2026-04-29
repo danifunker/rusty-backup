@@ -25,9 +25,8 @@ Conventions:
   - **Evidence:** `btree_split_leaf` splits first then inserts in a separate step, which can leave undersized leaves; `btree_split_leaf_with_insert` merges both into an atomic byte-based split. HFS migrated after the "B-tree node full" bug noted in `MEMORY.md`; HFS+ did not.
   - **Done:** HFS+ `insert_catalog_record` now calls `btree_split_leaf_with_insert`. Old `btree_split_leaf` deleted from `hfs_common.rs`; its unit test ported to the new function. (HFS+'s incremental `btree_insert_into_index` / `btree_grow_root` parent-chain handling kept; only the leaf split changed.)
 
-- [ ] **Catalog walking / key comparison patterns duplicated between HFS and HFS+** (`src/fs/hfs.rs`, `src/fs/hfsplus.rs`)
-  - **Evidence:** Both walk a B-tree leaf chain doing key comparisons against `(parent_id, name)` tuples; only the key encoding differs.
-  - **Suggested action:** Extract a generic `CatalogWalker<K: CatalogKey>` (or just shared helpers) into `hfs_common.rs`.
+- [x] **Catalog walking / key comparison patterns duplicated between HFS and HFS+** (`src/fs/hfs.rs`, `src/fs/hfsplus.rs`)
+  - **Done:** New `hfs_common::walk_leaf_records(catalog_data, first_leaf, node_size, visit) -> Option<T>` visits every record in a catalog leaf chain (skipping non-leaf nodes, with cycle detection and bounds checks), letting the visitor short-circuit by returning `Some(T)`. Replaced five hand-rolled leaf walks: HFS `find_catalog_record_by_name`, `update_parent_valence`, `find_file_record_offset_by_cnid`; HFS+ `find_catalog_record`, `update_parent_valence`, `find_file_by_id`. Each shrunk roughly 2× — the boilerplate (offset bounds, kind=-1 check, fLink chase, `btree_record_range` extraction) is now in one place. Key encoding differences (1-byte vs 2-byte `key_len`, Mac Roman vs UTF-16BE NFD) stay in the per-FS visitor closures, where they belong. Per-FS `catalog_compare` and `build_catalog_key` kept inline — they're tiny and the encoding-specific code reads more naturally there than behind a `CatalogKey` trait.
 
 - [x] **`clump_size` field in HFS+ `ForkData` is parsed and serialized but never read** (`src/fs/hfsplus.rs:50`)
   - **Done:** Kept for VH round-trip symmetry; added a comment explaining why the field is unread but preserved. Removing it would force a magic zero-write at offset `[8..12]`, which is less clear than a named field.
@@ -179,7 +178,7 @@ Conventions:
 ### HFS (`src/fs/hfs.rs`, 4855) + `hfs_fsck.rs` (6588) + `hfs_common.rs` (1849) + `hfs_clone.rs` (1338)
 - [x] ~~Largest area of recent change — confirm `hfs_common.rs` exposes everything `hfs_clone.rs` needs (`pub(crate)` items have crept in over time).~~ — verified clean.
   - **Evidence:** `hfs_common.rs` has exactly one `pub(crate)` symbol; the rest are `pub` (intended public API) or `pub(super)`. The "items have crept in" worry hasn't materialized.
-- [ ] Catalog walking / record-range helpers shared with HFS+ (§1).
+- [x] Catalog walking / record-range helpers shared with HFS+ (§1) — done via `hfs_common::walk_leaf_records`.
 - [x] ~~Audit debug `eprintln!` instances flagged in `hfs.rs:3068–3124` and replace with `log::debug!`.~~ — false positive.
   - **Evidence:** all 17 `eprintln!`s in `src/fs/hfs.rs` (lines 3973–4074) are inside `#[cfg(test)]` blocks — manual `#[ignore]`-tagged real-image fsck tests that intentionally print to stderr. Production code is clean. The line range cited in the audit predated subsequent edits and no longer maps to anything.
 - [x] `hfs_fsck.rs` fully split by phase.

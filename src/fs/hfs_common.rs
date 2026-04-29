@@ -461,6 +461,58 @@ pub fn btree_record_range(node: &[u8], node_size: usize, rec_idx: usize) -> (usi
     (start, end)
 }
 
+/// Visit every record in the catalog's leaf-node chain, skipping non-leaf
+/// nodes and stopping if a cycle is detected. The visitor receives
+/// `(node_idx, rec_idx, abs_rec_offset, rec_bytes)`; returning `Some(T)`
+/// short-circuits the walk and yields that value.
+///
+/// Used by HFS and HFS+ for catalog scans where a B-tree descent isn't
+/// appropriate (linear scans by CNID, valence updates, name lookups in
+/// small catalogs).
+pub fn walk_leaf_records<T, F>(
+    catalog_data: &[u8],
+    first_leaf: u32,
+    node_size: usize,
+    mut visit: F,
+) -> Option<T>
+where
+    F: FnMut(u32, usize, usize, &[u8]) -> Option<T>,
+{
+    if node_size == 0 || catalog_data.len() < node_size {
+        return None;
+    }
+    let mut node_idx = first_leaf;
+    let mut visited = std::collections::HashSet::new();
+    while node_idx != 0 {
+        if !visited.insert(node_idx) {
+            return None;
+        }
+        let offset = (node_idx as usize).checked_mul(node_size)?;
+        if offset + node_size > catalog_data.len() {
+            return None;
+        }
+        let node = &catalog_data[offset..offset + node_size];
+        let next = BigEndian::read_u32(&node[0..4]);
+        let kind = node[8] as i8;
+        if kind != BTREE_LEAF_NODE {
+            node_idx = next;
+            continue;
+        }
+        let num_records = BigEndian::read_u16(&node[10..12]) as usize;
+        for i in 0..num_records {
+            let (rec_start, rec_end) = btree_record_range(node, node_size, i);
+            if rec_start >= rec_end || rec_end > node_size {
+                continue;
+            }
+            if let Some(t) = visit(node_idx, i, offset + rec_start, &node[rec_start..rec_end]) {
+                return Some(t);
+            }
+        }
+        node_idx = next;
+    }
+    None
+}
+
 /// Insert a record (key_bytes ++ record_bytes) into a B-tree leaf node at the
 /// correct sorted position.
 ///

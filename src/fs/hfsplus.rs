@@ -9,8 +9,8 @@ use super::filesystem::{
 };
 use super::hfs_common::{
     self, bitmap_clear_bit_be, bitmap_find_clear_run_be, bitmap_set_bit_be, btree_free_node,
-    btree_grow_root, btree_insert_into_index, btree_insert_record, btree_record_range,
-    btree_remove_record, btree_split_leaf_with_insert, BTreeHeader,
+    btree_grow_root, btree_insert_into_index, btree_insert_record, btree_remove_record,
+    btree_split_leaf_with_insert, BTreeHeader,
 };
 use super::CompactResult;
 
@@ -507,63 +507,45 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
     /// Returns (data_fork, resource_fork).
     fn find_file_by_id(&self, file_id: u32) -> Option<(ForkData, ForkData)> {
         let node_size = self.catalog_header.node_size as usize;
-        if node_size == 0 {
-            return None;
-        }
+        let first_leaf = self.catalog_header.first_leaf_node;
 
-        let mut node_idx = self.catalog_header.first_leaf_node;
-        while node_idx != 0 {
-            let offset = node_idx as usize * node_size;
-            if offset + node_size > self.catalog_data.len() {
-                break;
-            }
-            let node = &self.catalog_data[offset..offset + node_size];
-            let desc = BTreeNodeDescriptor::parse(node);
-            if desc.kind != -1 {
-                node_idx = desc.next;
-                continue;
-            }
-
-            for i in 0..desc.num_records as usize {
-                let offset_pos = node_size - 2 * (i + 1);
-                if offset_pos + 2 > node.len() {
-                    break;
+        hfs_common::walk_leaf_records(
+            &self.catalog_data,
+            first_leaf,
+            node_size,
+            |_node_idx, _rec_idx, _abs_off, rec| {
+                if rec.len() < 8 {
+                    return None;
                 }
-                let rec_offset = BigEndian::read_u16(&node[offset_pos..offset_pos + 2]) as usize;
-                if rec_offset + 6 > node.len() {
-                    continue;
+                let key_len = BigEndian::read_u16(&rec[0..2]) as usize;
+                if key_len < 6 || 2 + key_len > rec.len() {
+                    return None;
                 }
-                let key_len = BigEndian::read_u16(&node[rec_offset..rec_offset + 2]) as usize;
-                if key_len < 6 || rec_offset + 2 + key_len > node.len() {
-                    continue;
+                let mut data_rel = 2 + key_len;
+                if data_rel % 2 != 0 {
+                    data_rel += 1;
                 }
-                let mut rec_data_start = rec_offset + 2 + key_len;
-                if rec_data_start % 2 != 0 {
-                    rec_data_start += 1;
+                if data_rel + 2 > rec.len() {
+                    return None;
                 }
-                if rec_data_start + 2 > node.len() {
-                    continue;
-                }
-                let record_type = BigEndian::read_i16(&node[rec_data_start..rec_data_start + 2]);
+                let record_type = BigEndian::read_i16(&rec[data_rel..data_rel + 2]);
                 if record_type != CATALOG_FILE {
-                    continue;
+                    return None;
                 }
-                let rec = &node[rec_data_start..];
-                if rec.len() < 248 {
-                    continue;
+                let body = &rec[data_rel..];
+                if body.len() < 248 {
+                    return None;
                 }
-                let rec_file_id = BigEndian::read_u32(&rec[8..12]);
+                let rec_file_id = BigEndian::read_u32(&body[8..12]);
                 if rec_file_id != file_id {
-                    continue;
+                    return None;
                 }
-                return Some((
-                    ForkData::parse(&rec[88..168]),
-                    ForkData::parse(&rec[168..248]),
-                ));
-            }
-            node_idx = desc.next;
-        }
-        None
+                Some((
+                    ForkData::parse(&body[88..168]),
+                    ForkData::parse(&body[168..248]),
+                ))
+            },
+        )
     }
 
     /// Read the allocation bitmap and return it.
@@ -633,42 +615,25 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
     fn find_catalog_record(&self, parent_cnid: u32, name: &str) -> Option<(u32, usize, usize)> {
         let search_key = Self::build_catalog_key(parent_cnid, name);
         let node_size = self.catalog_header.node_size as usize;
-        if node_size == 0 {
-            return None;
-        }
+        let first_leaf = self.catalog_header.first_leaf_node;
 
-        let mut node_idx = self.catalog_header.first_leaf_node;
-        while node_idx != 0 {
-            let offset = node_idx as usize * node_size;
-            if offset + node_size > self.catalog_data.len() {
-                break;
-            }
-            let node = &self.catalog_data[offset..offset + node_size];
-            let kind = node[8] as i8;
-            if kind != -1 {
-                node_idx = BigEndian::read_u32(&node[0..4]);
-                continue;
-            }
-            let num_records = BigEndian::read_u16(&node[10..12]) as usize;
-            for i in 0..num_records {
-                let (rec_start, rec_end) = btree_record_range(node, node_size, i);
-                if rec_start >= rec_end || rec_end > node_size {
-                    continue;
-                }
-                let rec = &node[rec_start..rec_end];
+        hfs_common::walk_leaf_records(
+            &self.catalog_data,
+            first_leaf,
+            node_size,
+            |node_idx, rec_idx, abs_off, rec| {
                 if rec.len() < 8 {
-                    continue;
+                    return None;
                 }
-                // Compare key portion
                 let key_len = BigEndian::read_u16(&rec[0..2]) as usize;
                 let key_portion = &rec[..2 + key_len.min(rec.len() - 2)];
                 if Self::catalog_compare(key_portion, &search_key) == Ordering::Equal {
-                    return Some((node_idx, i, offset + rec_start));
+                    Some((node_idx, rec_idx, abs_off))
+                } else {
+                    None
                 }
-            }
-            node_idx = BigEndian::read_u32(&node[0..4]);
-        }
-        None
+            },
+        )
     }
 
     /// Find a thread record by CNID (thread key: parent_id=cnid, name="").
@@ -689,59 +654,43 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
                 FilesystemError::NotFound(format!("thread record for CNID {parent_cnid} not found"))
             })?;
 
-        // Now scan for the actual folder record (not thread) with this CNID
+        // Now scan for the actual folder record (not thread) with this CNID.
         let node_size = self.catalog_header.node_size as usize;
-        let mut scan_node = self.catalog_header.first_leaf_node;
-        while scan_node != 0 {
-            let offset = scan_node as usize * node_size;
-            if offset + node_size > self.catalog_data.len() {
-                break;
-            }
-            let num_records =
-                BigEndian::read_u16(&self.catalog_data[offset + 10..offset + 12]) as usize;
-            for i in 0..num_records {
-                let (rec_start, rec_end) = btree_record_range(
-                    &self.catalog_data[offset..offset + node_size],
-                    node_size,
-                    i,
-                );
-                let abs_start = offset + rec_start;
-                let abs_end = offset + rec_end;
-                if abs_end > self.catalog_data.len() || rec_end - rec_start < 8 {
-                    continue;
+        let first_leaf = self.catalog_header.first_leaf_node;
+        let val_offset = hfs_common::walk_leaf_records(
+            &self.catalog_data,
+            first_leaf,
+            node_size,
+            |_node_idx, _rec_idx, abs_off, rec| {
+                if rec.len() < 8 {
+                    return None;
                 }
-                let key_len =
-                    BigEndian::read_u16(&self.catalog_data[abs_start..abs_start + 2]) as usize;
-                let mut rec_data_start = abs_start + 2 + key_len;
-                if rec_data_start % 2 != 0 {
-                    rec_data_start += 1;
+                let key_len = BigEndian::read_u16(&rec[0..2]) as usize;
+                let mut data_off = abs_off + 2 + key_len;
+                if data_off % 2 != 0 {
+                    data_off += 1;
                 }
-                if rec_data_start + 12 > abs_end {
-                    continue;
+                let abs_end = abs_off + rec.len();
+                if data_off + 12 > abs_end {
+                    return None;
                 }
-                let record_type =
-                    BigEndian::read_i16(&self.catalog_data[rec_data_start..rec_data_start + 2]);
+                let record_type = BigEndian::read_i16(&self.catalog_data[data_off..data_off + 2]);
                 if record_type != CATALOG_FOLDER {
-                    continue;
+                    return None;
                 }
-                let folder_id = BigEndian::read_u32(
-                    &self.catalog_data[rec_data_start + 8..rec_data_start + 12],
-                );
+                let folder_id =
+                    BigEndian::read_u32(&self.catalog_data[data_off + 8..data_off + 12]);
                 if folder_id == parent_cnid {
-                    // Valence is at offset 4 in the folder record
-                    let val_offset = rec_data_start + 4;
-                    let old_val =
-                        BigEndian::read_u32(&self.catalog_data[val_offset..val_offset + 4]);
-                    let new_val = (old_val as i64 + delta as i64).max(0) as u32;
-                    BigEndian::write_u32(
-                        &mut self.catalog_data[val_offset..val_offset + 4],
-                        new_val,
-                    );
-                    return Ok(());
+                    Some(data_off + 4)
+                } else {
+                    None
                 }
-            }
-            let next = BigEndian::read_u32(&self.catalog_data[offset..offset + 4]);
-            scan_node = next;
+            },
+        );
+        if let Some(val_offset) = val_offset {
+            let old_val = BigEndian::read_u32(&self.catalog_data[val_offset..val_offset + 4]);
+            let new_val = (old_val as i64 + delta as i64).max(0) as u32;
+            BigEndian::write_u32(&mut self.catalog_data[val_offset..val_offset + 4], new_val);
         }
         // If we can't find it, that's not fatal (could be root with no visible record)
         let _ = node_idx; // suppress warning
