@@ -129,13 +129,13 @@ Conventions:
 
 ## 6. Resize / validation across filesystems
 
-- [~] **Resize dispatcher consolidated; full strategy trait deferred**
-  - **Done:** New `fs::resize_filesystem_for(file, offset, new_size_bytes, log_cb)` in `src/fs/mod.rs` blind-dispatches across FAT/NTFS/exFAT/HFS/HFS+/ext/btrfs (each is a no-op on magic mismatch). Two ladders in `rbformats/vhd.rs` (~45 lines + ~10 lines) collapsed to single calls — mirrors the `patch_hidden_sectors_for` pattern landed in §4.
-  - **Not done:** A full `ResizeStrategy` trait with a shared read/patch/write helper. The shared boilerplate is genuinely thin (the read+magic-check is one helper away — see `fs/patch.rs`), and each FS's resize is structurally distinct: FAT walks BPB+FAT-tables; NTFS rewrites the boot-and-mirror VBR; HFS rewrites the MDB and alternate MDB; ext rewrites the superblock + group-descriptor table; btrfs the superblock; etc. A trait wrapping that wouldn't reduce code meaningfully — kept the standalone fns.
+- [x] **Resize dispatcher consolidated; full strategy trait considered and rejected**
+  - **Done:** `fs::resize_filesystem_for(file, offset, new_size_bytes, log_cb)` in `src/fs/mod.rs` blind-dispatches across FAT/NTFS/exFAT/HFS/HFS+/ext/btrfs (each is a no-op on magic mismatch). Two ladders in `rbformats/vhd.rs` (~45 lines + ~10 lines) collapsed to single calls — mirrors the `patch_hidden_sectors_for` pattern landed in §4.
+  - **Decision:** A full `ResizeStrategy` trait with a shared read/patch/write helper is **not pursued.** The shared boilerplate is genuinely thin (the read+magic-check is already one helper away — see `fs/patch.rs`), and each FS's resize is structurally distinct: FAT walks BPB+FAT-tables; NTFS rewrites the boot-and-mirror VBR; HFS rewrites the MDB and alternate MDB; ext rewrites the superblock + group-descriptor table; btrfs the superblock; etc. A trait wrapping that wouldn't reduce code meaningfully. Standalone fns retained.
 
-- [~] **Validate dispatcher consolidated; full ValidationContext deferred**
-  - **Done:** New `restore::validate_filesystem_for(file, offset, fs_type, log_cb)` collapses the two near-identical match ladders in `src/restore/mod.rs` (~45 lines each → 3 lines each). It harmonizes the per-FS validators' heterogeneous return types (`Vec<String>` / `bool` / `()`) to `Result<()>`, since `restore` only cares about side-effect logging.
-  - **Not done:** A full `ValidationContext` shared sink — each per-FS validator still returns its own shape, and a fully unified context would require migrating every call site (including any future diagnostic UI that *does* want the warnings list). Worth revisiting once the GUI gets a "validate filesystem" button that needs the structured results.
+- [x] **Validate dispatcher consolidated; full ValidationContext considered and rejected**
+  - **Done:** `restore::validate_filesystem_for(file, offset, fs_type, log_cb)` collapses the two near-identical match ladders in `src/restore/mod.rs` (~45 lines each → 3 lines each). It harmonizes the per-FS validators' heterogeneous return types (`Vec<String>` / `bool` / `()`) to `Result<()>`, since `restore` only cares about side-effect logging.
+  - **Decision:** A full `ValidationContext` shared sink is **not pursued now.** Each per-FS validator still returns its own shape, and a fully unified context would require migrating every call site. There is no consumer today that needs the structured warnings list — `restore` only logs them. Revisit if/when a GUI "validate filesystem" surface lands that wants the typed results.
 
 ---
 
