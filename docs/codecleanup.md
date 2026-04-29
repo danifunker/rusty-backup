@@ -9,13 +9,7 @@ Conventions:
 
 > Note (GUI redesign): a major GUI overhaul is planned. Items in §5 and §10 are deliberately framed to make that redesign easier — pull model logic out of `src/gui/` first so the new GUI can be built against a stable, testable model layer.
 
-> **Revisit-after-§5 list.** Several §2 items are intentionally parked — they need concrete model-layer consumers before the right trait shape is visible:
-> - `MacFilesystem` sub-trait for `blessed_system_folder` / `set_blessed_folder`
-> - `ProDosEditableFilesystem` sub-trait for `set_prodos_type`
-> - Full `Filesystem` trait split into `FilesystemReader` / `FilesystemInspector` / `FilesystemRepair`
-> - `fn capabilities() -> Capabilities` discovery method
->
-> Suggested order: §3 → §4 → §7 (pure refactors) → §5 (model extraction) → return to §2 deferred items → §6 resize/validation strategies.
+> **Post-§5 verdict.** All four §2 items that were parked pending §5 (Mac/ProDOS sub-traits, full trait split, `capabilities()` bitset) were revisited and closed as "decided not to pursue" — the model-layer extraction in §5 didn't surface consumers that wanted any of those shapes. See §2 entries for rationale.
 
 ---
 
@@ -50,17 +44,17 @@ Conventions:
 - [x] **`set_type_creator`, `write_resource_fork`, `set_blessed_folder` were also silent no-ops**
   - **Done:** All three defaults now return `Err(Unsupported)`. HFS/HFS+ continue to override. UI gating in `gui/browse_view.rs` already restricts these StagedEdits to compatible filesystems, so no caller paths regress.
 
-- [ ] **`blessed_system_folder` is Mac-only but lives on the base `Filesystem` trait** (`src/fs/filesystem.rs:71`)
-  - **Suggested action:** Move to a `MacFilesystem` sub-trait (HFS, HFS+). **Deferred** until §5 model extraction lands and we can see how the GUI consumes capability info — a sub-trait split is invasive and trait-object boundaries make it awkward without that picture.
+- [x] **`blessed_system_folder` Mac sub-trait considered and rejected**
+  - **Decision:** §5 is now done; the model layer + GUI use `fs.blessed_system_folder()` directly (6 call sites in browse_view.rs) and the default `Err(Unsupported)` from §2's earlier work handles non-Mac filesystems cleanly. A `MacFilesystem` sub-trait would force downcasting at every call site without removing any code. Status quo is fine.
 
-- [ ] **`set_prodos_type` is on `EditableFilesystem` but only ProDOS implements it** (`src/fs/filesystem.rs:250`, impl at `src/fs/prodos.rs:938`)
-  - **Suggested action:** Move to a `ProDosEditableFilesystem` sub-trait, or expose via a `set_metadata(key, value)` shape. **Deferred** alongside the sub-trait split above.
+- [x] **`set_prodos_type` ProDOS sub-trait considered and rejected**
+  - **Decision:** Same posture as the Mac sub-trait — the model layer (`edit_queue.rs:183`) calls `efs.set_prodos_type(...)` directly, with `Err(Unsupported)` from non-ProDOS filesystems. A `ProDosEditableFilesystem` sub-trait would force downcasting; a `set_metadata(key, value)` shape would be a less type-safe variant of the same call. Status quo is fine.
 
-- [ ] **`Filesystem` trait mixes read, inspection, repair, and Mac-specific concerns** (`src/fs/filesystem.rs:8`)
-  - **Suggested action:** Consider splitting into `FilesystemReader` (browse), `FilesystemInspector` (sizes, last byte), `FilesystemRepair` (fsck), and feature-specific sub-traits. **Deferred until §5** — trait shape will be clearer once GUI consumers are simpler.
+- [x] **`Filesystem` trait split (Reader / Inspector / Repair) considered and rejected**
+  - **Decision:** §5 is now done and the model layer doesn't actually want a split surface — every consumer uses the full trait object. A split would require duplicating dispatch logic in `fs::open_filesystem` and giving every model module its own preferred slice. No payoff visible; trait stays unified.
 
-- [ ] **No capability discovery — callers must catch `Unsupported` at runtime**
-  - **Suggested action:** Add `fn capabilities() -> Capabilities` returning a bitset (resource forks, type/creator, prodos types, unix perms, blessing, fsck, repair). GUI uses this to gate buttons instead of try/catch. **Deferred** — wait until §5 reveals concrete GUI gating sites.
+- [x] **`fn capabilities() -> Capabilities` discovery considered and rejected**
+  - **Decision:** GUI gates buttons by partition type byte (46 sites between `browse_view.rs` and `inspect_tab.rs` use helpers like `is_browsable_type`, `is_checkable_type`, `is_classic_hfs`). That's the existing pattern and it works without opening a filesystem first. A capability bitset would duplicate that information without simplifying any call site. Try/catch on `Err(Unsupported)` is fine for the few mutation paths where the FS is already open.
 
 ---
 
@@ -161,7 +155,8 @@ Conventions:
 
 ### NTFS (`src/fs/ntfs.rs`, 3276)
 - [x] ~~Hidden-sector patcher consolidates with FAT/exFAT (§4).~~ — done as part of §4.
-- [ ] Audit MFT-record and index helpers for overlap with `unix_common/`.
+- [x] ~~Audit MFT-record and index helpers for overlap with `unix_common/`.~~ — no overlap.
+  - **Evidence:** NTFS doesn't import `unix_common` at all. The shape is genuinely different — NTFS uses MFT records with security descriptors and `$STANDARD_INFORMATION` attributes; `unix_common` is POSIX-mode-bit + inode-shaped. There's no shared helper to extract.
 
 ### exFAT (`src/fs/exfat.rs`, 2411)
 - [x] ~~Drop `CompactExfatInfo` in favor of unified type (§3).~~ — already gone.
@@ -197,12 +192,14 @@ Conventions:
 - [ ] Currently lacks the editable surface HFS gained — confirm it's intentionally read-only or queue an edit-mode track.
 
 ### btrfs (`src/fs/btrfs.rs`, 1864)
-- [ ] Mostly skeleton; when extending, lean on `unix_common/` for inode/bitmap.
-- [ ] See `docs/TODO-BTRFS-TRIMMING.md` — fold those TODOs into this checklist or link them.
+- [x] ~~Mostly skeleton; when extending, lean on `unix_common/` for inode/bitmap.~~ — already does.
+  - **Evidence:** `src/fs/btrfs.rs:14–15` imports `unix_common::compact::{CompactLayout, CompactSection, CompactStreamReader}` and `unix_common::inode::unix_entry_from_inode`. Generic future-extension advice — no current action.
+- [ ] See [`docs/TODO-BTRFS-TRIMMING.md`](TODO-BTRFS-TRIMMING.md) for the open btrfs compact-reader trimming work; that's its own track, not part of this cleanup pass.
 
 ### ProDOS (`src/fs/prodos.rs`, 2087) + `prodos_types.rs` (421)
-- [ ] Directory walking pattern resembles FAT/ext — candidate for shared walker.
-- [ ] `set_prodos_type` trait method belongs on a sub-trait (§2).
+- [x] ~~Directory walking pattern resembles FAT/ext — candidate for shared walker.~~ — rejected on inspection.
+  - **Evidence:** FAT walks cluster chains + 32-byte MS-DOS directory entries; ext walks inode→block→linked dir entries; ProDOS walks block storage types (seedling/sapling/tree) with ProDOS-specific 4-byte entry headers. The shared abstraction is already the `Filesystem::list_directory` trait method; pushing it lower would require modeling three incompatible on-disk formats behind one walker. No payoff.
+- [x] `set_prodos_type` trait method belongs on a sub-trait (§2) — closed in §2: sub-trait rejected.
 
 ---
 
@@ -211,8 +208,8 @@ Conventions:
 - [ ] **`rbformats/mod.rs` is 1712 lines and hosts cross-format orchestration**
   - **Suggested action:** Split: keep format dispatch + `reconstruct_disk_from_backup` here, move shared compress/decompress helpers to `src/rbformats/compress.rs`.
 
-- [ ] **VHD export and `reconstruct_disk_from_backup` share scaffolding** (`src/rbformats/vhd.rs`, `src/rbformats/mod.rs`)
-  - **Suggested action:** Confirm there's no duplicated layout/zero-fill code; if there is, factor out.
+- [x] ~~VHD export and `reconstruct_disk_from_backup` share scaffolding~~ — already shared.
+  - **Evidence:** `src/rbformats/vhd.rs:8` imports `reconstruct_disk_from_backup, write_zeros, CHUNK_SIZE` from the parent module. All zero-fill and gap-handling in vhd.rs goes through `super::write_zeros`. No duplication to factor out.
 
 - [ ] **`partition/mod.rs` (935) vs `partition/mbr.rs` (880) vs `partition/gpt.rs` (943) vs `partition/apm.rs` (554)**
   - **Suggested action:** Audit `partition/mod.rs` for orchestration that should live elsewhere (alignment helpers belong in their own module; size override structs may belong in `restore`).
@@ -246,6 +243,15 @@ Conventions:
 - [x] **`example/` binaries decision: keep in-tree.** `example/README.md` already classifies them as "advanced debugging tests... mostly for testing internally how the application works." Only 3 of the 23 are registered in Cargo.toml as `[[example]]` entries (`probe_hfs_btree`, `test_clone_fix`, `fsck_bare`); the rest are unregistered scratch scripts that don't build automatically and can rot. They're not tests, so `tests/fixtures/` is wrong. Status quo is fine.
 - [x] **`cargo machete` clean.** No unused crate dependencies in `Cargo.toml`.
 - [~] **Clippy `dead_code` / `unused_self` triage — read, not actioned.** The lib-only run surfaces ~12 `unused_self` cases in FS modules; in each, `&self` is held for trait-shape consistency and removing it would clutter call sites. The bulk of clippy output is unrelated stylistic lints (`manual_div_ceil`, `manual_is_multiple_of`, `io::Error::other`) that belong to a separate housekeeping pass — fixable via `cargo clippy --fix` when desired.
+
+---
+
+## 12. Final pass — eliminate compilation warnings
+
+- [ ] **Once all other refactor work is done, drive `cargo build --all-targets` to zero warnings.**
+  - **Current state (refactor in progress):** `cargo build` (lib + bin) is already clean. `cargo build --all-targets` reports 14 warnings, mostly in `#[cfg(test)]` blocks and the `examples/` scratch binaries (unused imports, unused `mut`, unused variables, dead helpers like `build_empty_hfs_catalog`).
+  - **Suggested action:** After landing the remaining real-work items in §8/§9/§10, do a single sweep: `cargo fix --lib --tests` for the auto-fixable ones, hand-edit the rest, and consider adding `#![deny(warnings)]` to the lib root or a CI check so regressions can't slip back in.
+  - **Why last:** warnings churn during refactoring; cleaning them up before the refactor settles wastes work. Keep this as the final step before considering the cleanup pass complete.
 
 ---
 
