@@ -110,7 +110,8 @@ Conventions:
 
 - [x] **Partition editor state → model**
   - **Done:** New `src/model/partition_editor.rs` (258 lines) owns `EditorEntry` + `PartitionEditor` with `entries`, `edits`, `errors`, `disk_size`, `status`, and the four `add_*` input fields. Methods `seed_from(&[PartitionInfo])`, `add_entry_from_inputs(is_mbr)`, `build_and_validate(&PartitionTable)`. `InspectTab`'s nine `editor_*` fields collapsed to `editor: PartitionEditor`; the local `EditorEntry` (47 lines) and the 142-line `build_and_validate_edits` body were deleted; `init_editor` shrank to two lines; the inline 40-line "Add" button block became one method call. inspect_tab.rs: 3611 → 3347 lines (−264). `apply_editor_changes` stays on the view since it's threaded through `LogPanel`.
-- [ ] **Export configuration & job orchestration → model** (inspect_tab.rs:1243–1929)
+- [x] **Export configuration & job orchestration → model**
+  - **Done:** New `src/model/export_runner.rs` (~560 lines after fmt) owns `ExportStatus`, `ExportSizeChoice`, `PartitionExportConfig` (+ `effective_size`), and four entry points: `build_partition_configs`, `build_size_overrides`, `build_size_map`, plus three thread-spawning fns `start_clonezilla_whole_disk`, `start_native_whole_disk`, `start_per_partition` (the latter takes a `PerPartitionInputs` bundle to keep the call site readable). The 60-line `init_export_configs` body collapsed to a 6-line delegate; the 450-line `start_export` body collapsed to a ~95-line dialog + dispatch. inspect_tab.rs: 3347 → 2907 lines (−440). Three rusty_backup imports (`fs::fat::resize_fat_in_place`, `fs::hfs_max_growable_size`, `partition::PartitionSizeOverride`, `rbformats::vhd::build_vhd_footer`) plus `std::io::Write` are no longer needed in the view.
 - [x] **Backup / Clonezilla loading + partition merging extracted**
   - **Done:** `src/model/backup_loader.rs` (360 lines) exposes `load_backup(folder)` which dispatches on whether the folder is a rusty-backup or Clonezilla image, plus the underlying `load_backup_metadata` and `load_clonezilla` parsers. Each returns a typed outcome (metadata + partition table + alignment + partitions + min sizes + warnings/info messages). The view's three load helpers (`load_backup_metadata`, `load_partitions_from_metadata`, `merge_logical_partitions_from_metadata`, `load_clonezilla_image`) collapsed into a thin `load_backup_metadata` wrapper plus two small `apply_*_outcome` helpers. `infer_fat_type_byte` moved to the model and is `pub`-imported by the one remaining view-side caller. inspect_tab.rs: 3858 → 3611 lines.
 - [x] **Fsck/repair runner extracted**
@@ -119,11 +120,11 @@ Conventions:
 
 ### Cross-cutting GUI
 
-- [ ] **Per-tab `Status` structs (`ExportStatus`, `InspectStatus`, `CacheStatus`, `BlockCacheScan`) live inside GUI files**
-  - **Suggested action:** Move to `src/model/` so the future GUI redesign can swap views without touching threading code.
+- [x] **Per-tab `Status` structs moved to `src/model/`**
+  - **Done:** `ExportStatus` moved with the export-runner extraction above. The remaining four — `InspectStatus`, `CacheStatus`, `BlockCacheScan` (inspect_tab) and `VhdExportStatus` (backup_tab) — moved into `src/model/status.rs` (69 lines). All fields made `pub` so the views can construct them; no methods to move (these are pure shared-state structs polled from the GUI thread). inspect_tab.rs: 2907 → 2867 (−40); backup_tab.rs: 989 → 979 (−10).
 
-- [ ] **State plumbed through long argument lists** (`devices`, `log`, `&mut self`, etc.)
-  - **Suggested action:** Introduce per-tab context structs (`InspectContext`, `BrowseContext`) once model is extracted.
+- [x] **`TabContext` bundle replaces `(devices, log)` argument pairs**
+  - **Done:** New `src/gui/context.rs` (28 lines) defines `TabContext<'a> { pub devices: &'a [DiskDevice], pub log: &'a mut LogPanel }` with a `new` constructor. Migrated all three tabs that follow the pattern: `InspectTab`, `BackupTab`, `RestoreTab`. ~33 method signatures simplified — methods that took both `devices: &[DiskDevice]` and `log: &mut LogPanel` (or just one) now take `ctx: &mut TabContext` (or `&TabContext` for read-only methods like `source_path`/`get_target_size`/`has_target`). `progress: &mut ProgressState` stays a separate parameter on the few methods that need it (Backup/Restore `show`/`poll_progress`), avoiding `Option<&mut _>` ergonomic pain. App's call sites in `gui/mod.rs` construct one `TabContext` per tab dispatch. inspect_tab.rs: 2867 → 2853 (−14); backup_tab.rs: 979 → 976 (−3); restore_tab.rs ≈ unchanged (−2 imports, sigs net out). Net code is roughly the same — the win is in argument-list ergonomics and giving the App a single bundle to construct, not raw line count. `BrowseView` was deliberately not converted: it doesn't take `devices` / `log`, so the bundle wouldn't help. The doc's "BrowseContext" suggestion turned out to not apply.
 
 ---
 

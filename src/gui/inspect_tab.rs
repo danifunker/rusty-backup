@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -9,21 +9,20 @@ use anyhow::Context;
 use rusty_backup::backup::metadata::BackupMetadata;
 use rusty_backup::clonezilla;
 use rusty_backup::clonezilla::metadata::ClonezillaImage;
-use rusty_backup::device::DiskDevice;
-use rusty_backup::fs::fat::resize_fat_in_place;
-use rusty_backup::fs::hfs_max_growable_size;
+use rusty_backup::model::export_runner::{
+    self, ExportSizeChoice, ExportStatus, PartitionExportConfig, PerPartitionInputs,
+};
 use rusty_backup::model::partition_editor::PartitionEditor;
+use rusty_backup::model::status::{BlockCacheScan, CacheStatus, InspectStatus};
 use rusty_backup::partition::editor as pt_editor;
-use rusty_backup::partition::PartitionSizeOverride;
 use rusty_backup::partition::{
     self, detect_alignment, PartitionAlignment, PartitionInfo, PartitionTable,
 };
 use rusty_backup::rbformats::export::ExportFormat;
-use rusty_backup::rbformats::vhd::build_vhd_footer;
 
 use super::browse_view::BrowseView;
+use super::context::TabContext;
 use super::expand_hfs_dialog::{summarize_source as summarize_hfs_source, ExpandHfsDialog};
-use super::progress::LogPanel;
 
 /// State for the Inspect tab.
 pub struct InspectTab {
@@ -100,91 +99,6 @@ pub struct InspectTab {
     repair_context: Option<(u64, u8, Option<String>)>,
     /// "Expand HFS Volume…" dialog (classic HFS only).
     expand_hfs_dialog: Option<ExpandHfsDialog>,
-}
-
-/// Status of a background VHD export operation.
-struct ExportStatus {
-    finished: bool,
-    error: Option<String>,
-    log_messages: Vec<String>,
-    current_bytes: u64,
-    total_bytes: u64,
-    cancel_requested: bool,
-}
-
-/// Per-partition size choice for VHD export.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum ExportSizeChoice {
-    Original,
-    Minimum,
-    Custom,
-}
-
-/// Per-partition export configuration.
-#[derive(Debug, Clone)]
-struct PartitionExportConfig {
-    index: usize,
-    type_name: String,
-    original_size: u64,
-    minimum_size: u64,
-    /// Upper bound (bytes) on this partition's export size. For classic HFS
-    /// this reflects the 65535-block / Volume Bitmap ceiling, so the user
-    /// can't request a resize that would corrupt the MDB. `None` means no
-    /// filesystem-specific cap.
-    max_size: Option<u64>,
-    choice: ExportSizeChoice,
-    custom_size_mib: u32,
-}
-
-impl PartitionExportConfig {
-    fn effective_size(&self) -> u64 {
-        match self.choice {
-            ExportSizeChoice::Original => self.original_size,
-            ExportSizeChoice::Minimum => self.minimum_size,
-            ExportSizeChoice::Custom => self.custom_size_mib as u64 * 1024 * 1024,
-        }
-    }
-}
-
-/// Status of a background disk inspect operation.
-struct InspectStatus {
-    finished: bool,
-    error: Option<String>,
-    log_messages: Vec<String>,
-    /// Human-readable description of the current step shown in the UI.
-    current_step: String,
-    // Results, populated on success:
-    partition_table: Option<PartitionTable>,
-    alignment: Option<PartitionAlignment>,
-    partitions: Vec<PartitionInfo>,
-    partition_min_sizes: HashMap<usize, u64>,
-    /// Detected image format label (e.g. "WOZ 3.5\"", "Fixed VHD").
-    format_label: Option<String>,
-    /// The open device file handle, passed back to the main thread so
-    /// that BrowseView can reuse it without re-opening (and re-prompting).
-    device_file: Option<File>,
-    /// The TempFileGuard that holds the DiskClaim / temp file alive.
-    /// Kept here so the main thread can decide when to release it.
-    device_guard: Option<rusty_backup::os::TempFileGuard>,
-}
-
-/// Status of a background seekable cache creation (native zstd backups).
-struct CacheStatus {
-    finished: bool,
-    error: Option<String>,
-    partition_index: usize,
-    cache_path: Option<PathBuf>,
-    current_bytes: u64,
-    total_bytes: u64,
-}
-
-/// Status of a background block cache metadata scan (Clonezilla images).
-struct BlockCacheScan {
-    finished: bool,
-    error: Option<String>,
-    partition_index: usize,
-    partition_type: u8,
-    cache: Arc<Mutex<clonezilla::block_cache::PartcloneBlockCache>>,
 }
 
 impl Default for InspectTab {
@@ -264,7 +178,7 @@ impl InspectTab {
         self.cache_status = None;
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, devices: &[DiskDevice], log: &mut LogPanel) {
+    pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
         ui.heading("Inspect Disk / Image");
         ui.add_space(8.0);
 
@@ -288,7 +202,7 @@ impl InspectTab {
                     )
                 }
             } else if let Some(idx) = self.selected_device_idx {
-                devices
+                ctx.devices
                     .get(idx)
                     .map(|d| d.display_name())
                     .unwrap_or_else(|| "Unknown".into())
@@ -301,7 +215,7 @@ impl InspectTab {
                 .width(400.0)
                 .height(400.0) // Allow more items to be visible without scrolling
                 .show_ui(ui, |ui| {
-                    for (i, device) in devices.iter().enumerate() {
+                    for (i, device) in ctx.devices.iter().enumerate() {
                         let label = device.display_name();
                         if ui
                             .selectable_value(&mut self.selected_device_idx, Some(i), &label)
@@ -358,17 +272,17 @@ impl InspectTab {
             self.prev_image_path = self.image_file_path.clone();
             self.prev_backup_path = self.backup_folder_path.clone();
             if self.backup_folder_path.is_some() {
-                self.load_backup_metadata(log);
+                self.load_backup_metadata(ctx);
             } else if self.selected_device_idx.is_some() || self.image_file_path.is_some() {
-                self.run_inspect(devices, log);
+                self.run_inspect(ctx);
             }
         }
 
         // Poll background inspect (physical device)
-        self.poll_inspect_status(log);
+        self.poll_inspect_status(ctx);
 
         // Poll export status
-        self.poll_export_status(log);
+        self.poll_export_status(ctx);
 
         // Re-inspect + Export VHD buttons
         ui.horizontal(|ui| {
@@ -384,9 +298,9 @@ impl InspectTab {
                 .clicked()
             {
                 if self.backup_folder_path.is_some() {
-                    self.load_backup_metadata(log);
+                    self.load_backup_metadata(ctx);
                 } else {
-                    self.run_inspect(devices, log);
+                    self.run_inspect(ctx);
                 }
             }
 
@@ -431,7 +345,7 @@ impl InspectTab {
                 )
                 .clicked()
             {
-                self.init_resize_popup(devices);
+                self.init_resize_popup(ctx);
             }
 
             // Close button — releases the device/image and clears results
@@ -441,7 +355,7 @@ impl InspectTab {
                     self.clear_results();
                     self.selected_device_idx = None;
                     self.prev_device_idx = None;
-                    log.info("Device closed and remounted.");
+                    ctx.log.info("Device closed and remounted.");
                 }
             }
             if self.image_file_path.is_some() && !inspect_running && !export_running {
@@ -450,7 +364,7 @@ impl InspectTab {
                     self.clear_results();
                     self.image_file_path = None;
                     self.prev_image_path = None;
-                    log.info("Image file closed.");
+                    ctx.log.info("Image file closed.");
                 }
             }
             if self.backup_folder_path.is_some() && !inspect_running && !export_running {
@@ -459,7 +373,7 @@ impl InspectTab {
                     self.clear_results();
                     self.backup_folder_path = None;
                     self.prev_backup_path = None;
-                    log.info("Backup folder closed.");
+                    ctx.log.info("Backup folder closed.");
                 }
             }
 
@@ -470,7 +384,7 @@ impl InspectTab {
                             s.cancel_requested = true;
                         }
                     }
-                    log.warn("Export cancellation requested...");
+                    ctx.log.warn("Export cancellation requested...");
                 }
             }
         });
@@ -510,18 +424,18 @@ impl InspectTab {
 
         // Export popup
         if self.export_popup {
-            self.show_export_popup(ui, devices, log);
+            self.show_export_popup(ui, ctx);
         }
 
         // Editor popup
         if self.editor_popup {
-            self.show_editor_popup(ui, devices, log);
+            self.show_editor_popup(ui, ctx);
         }
 
         // Resize popup
         if let Some(ref mut popup) = self.resize_popup {
-            popup.poll_status(log);
-            if !popup.show(ui, devices, log) {
+            popup.poll_status(ctx.log);
+            if !popup.show(ui, ctx.devices, ctx.log) {
                 self.resize_popup = None;
             }
         }
@@ -538,7 +452,7 @@ impl InspectTab {
         }
 
         // Poll block cache scan status (Clonezilla)
-        self.poll_block_cache_scan(log);
+        self.poll_block_cache_scan(ctx);
 
         // Show block cache scan progress
         if let Some(ref scan_arc) = self.block_cache_scan {
@@ -571,7 +485,7 @@ impl InspectTab {
         }
 
         // Poll seekable cache creation status (native zstd)
-        self.poll_cache_status(log);
+        self.poll_cache_status(ctx);
 
         // Show seekable cache creation progress
         if let Some(ref status_arc) = self.cache_status {
@@ -611,10 +525,10 @@ impl InspectTab {
         // Show results
         let has_table = self.partition_table.is_some();
         if has_table {
-            self.show_results(ui, devices, log);
+            self.show_results(ui, ctx);
         } else if !self.partitions.is_empty() {
             // Partitions loaded from metadata (no partition table object)
-            self.show_partition_list(ui, devices, log);
+            self.show_partition_list(ui, ctx);
         }
 
         // Show filesystem browser if active
@@ -629,7 +543,7 @@ impl InspectTab {
         self.editor_popup = true;
     }
 
-    fn init_resize_popup(&mut self, devices: &[DiskDevice]) {
+    fn init_resize_popup(&mut self, ctx: &mut TabContext) {
         let table = match &self.partition_table {
             Some(t) => t.clone(),
             None => return,
@@ -637,7 +551,7 @@ impl InspectTab {
 
         let source_path = self.image_file_path.clone().or_else(|| {
             self.selected_device_idx
-                .and_then(|idx| devices.get(idx))
+                .and_then(|idx| ctx.devices.get(idx))
                 .map(|d| d.path.clone())
         });
         let path = match source_path {
@@ -672,7 +586,7 @@ impl InspectTab {
         )));
     }
 
-    fn show_editor_popup(&mut self, ui: &mut egui::Ui, devices: &[DiskDevice], log: &mut LogPanel) {
+    fn show_editor_popup(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
         let mut open = true;
         let mut apply_requested = false;
 
@@ -887,7 +801,7 @@ impl InspectTab {
         }
 
         if apply_requested {
-            self.apply_editor_changes(devices, log);
+            self.apply_editor_changes(ctx);
         }
     }
 
@@ -897,25 +811,25 @@ impl InspectTab {
         }
     }
 
-    fn apply_editor_changes(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {
+    fn apply_editor_changes(&mut self, ctx: &mut TabContext) {
         let table = match &self.partition_table {
             Some(t) => t.clone(),
             None => {
-                log.error("No partition table loaded");
+                ctx.log.error("No partition table loaded");
                 return;
             }
         };
 
         let source_path = self.image_file_path.clone().or_else(|| {
             self.selected_device_idx
-                .and_then(|idx| devices.get(idx))
+                .and_then(|idx| ctx.devices.get(idx))
                 .map(|d| d.path.clone())
         });
 
         let path = match source_path {
             Some(p) => p,
             None => {
-                log.error("No source path for editing");
+                ctx.log.error("No source path for editing");
                 return;
             }
         };
@@ -926,7 +840,7 @@ impl InspectTab {
         // For devices, we need write access
         let is_device = self.selected_device_idx.is_some();
 
-        log.info(format!(
+        ctx.log.info(format!(
             "Applying {} partition table edit(s) to {}...",
             edits.len(),
             path.display()
@@ -940,7 +854,7 @@ impl InspectTab {
                     &table,
                     &edits,
                     disk_size,
-                    &mut |msg| log.info(msg),
+                    &mut |msg| ctx.log.info(msg),
                 ),
                 Err(e) => Err(e),
             }
@@ -953,7 +867,7 @@ impl InspectTab {
             {
                 Ok(mut file) => {
                     pt_editor::apply_edits(&mut file, &table, &edits, disk_size, &mut |msg| {
-                        log.info(msg)
+                        ctx.log.info(msg)
                     })
                 }
                 Err(e) => Err(e.into()),
@@ -962,7 +876,7 @@ impl InspectTab {
 
         match result {
             Ok(()) => {
-                log.info("Partition table updated successfully.");
+                ctx.log.info("Partition table updated successfully.");
                 self.editor.status = Some(
                     "Changes applied successfully! Close and re-inspect to see updates."
                         .to_string(),
@@ -970,72 +884,22 @@ impl InspectTab {
                 self.editor.edits.clear();
             }
             Err(e) => {
-                log.error(format!("Failed to apply edits: {:#}", e));
+                ctx.log.error(format!("Failed to apply edits: {:#}", e));
                 self.editor.status = Some(format!("Error: {:#}", e));
             }
         }
     }
 
     fn init_export_configs(&mut self) {
-        self.export_partition_configs.clear();
-
-        // Open the source once so we can probe HFS partitions for their
-        // block-size-dependent max growable size.
-        let mut source_reader: Option<BufReader<File>> = self
-            .image_file_path
-            .as_ref()
-            .and_then(|p| File::open(p).ok())
-            .map(BufReader::new);
-
-        for part in &self.partitions {
-            if part.is_extended_container {
-                continue;
-            }
-            let min_size = self
-                .backup_metadata
-                .as_ref()
-                .and_then(|m| {
-                    m.partitions
-                        .iter()
-                        .find(|pm| pm.index == part.index)
-                        .map(|pm| pm.imaged_size_bytes)
-                })
-                .filter(|&sz| sz > 0)
-                .or_else(|| self.partition_min_sizes.get(&part.index).copied())
-                .unwrap_or(part.size_bytes);
-
-            // Probe classic HFS to find the u16/VBM ceiling. Only relevant for
-            // "Apple_HFS" APM partitions (which may actually be HFS, HFS+, or
-            // wrapped HFS+ — hfs_max_growable_size returns None for the
-            // non-classic cases). For other filesystem types, no cap.
-            let max_size = if let Some(reader) = source_reader.as_mut() {
-                let is_hfs_candidate = part
-                    .partition_type_string
-                    .as_deref()
-                    .map(|s| s.eq_ignore_ascii_case("Apple_HFS"))
-                    .unwrap_or(false);
-                if is_hfs_candidate {
-                    hfs_max_growable_size(reader, part.start_lba * 512)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            self.export_partition_configs.push(PartitionExportConfig {
-                index: part.index,
-                type_name: part.type_name.clone(),
-                original_size: part.size_bytes,
-                minimum_size: min_size,
-                max_size,
-                choice: ExportSizeChoice::Original,
-                custom_size_mib: (part.size_bytes / (1024 * 1024)) as u32,
-            });
-        }
+        self.export_partition_configs = export_runner::build_partition_configs(
+            &self.partitions,
+            self.backup_metadata.as_ref(),
+            &self.partition_min_sizes,
+            self.image_file_path.as_ref(),
+        );
     }
 
-    fn show_export_popup(&mut self, ui: &mut egui::Ui, devices: &[DiskDevice], log: &mut LogPanel) {
+    fn show_export_popup(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
         egui::Window::new("Export Disk Image")
             .collapsible(false)
             .resizable(true)
@@ -1162,7 +1026,7 @@ impl InspectTab {
                 ui.horizontal(|ui| {
                     if ui.button("Export...").clicked() {
                         self.export_popup = false;
-                        self.start_export(devices, log);
+                        self.start_export(ctx);
                     }
                     if ui.button("Cancel").clicked() {
                         self.export_popup = false;
@@ -1171,54 +1035,16 @@ impl InspectTab {
             });
     }
 
-    fn start_export(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {
+    fn start_export(&mut self, ctx: &mut TabContext) {
         let format = self.export_format;
-        let ext = format.extension();
         let format_desc = format.description();
 
-        // Collect partition sizing info
-        let size_map: HashMap<usize, u64> = self
-            .export_partition_configs
-            .iter()
-            .map(|cfg| (cfg.index, cfg.effective_size()))
-            .collect();
-
-        // Build partition size overrides for whole-disk export
-        let partition_overrides: Vec<PartitionSizeOverride> = self
-            .export_partition_configs
-            .iter()
-            .map(|cfg| {
-                let start_lba = self
-                    .partitions
-                    .iter()
-                    .find(|p| p.index == cfg.index)
-                    .map(|p| p.start_lba)
-                    .unwrap_or(0);
-                PartitionSizeOverride::size_only(
-                    cfg.index,
-                    start_lba,
-                    cfg.original_size,
-                    cfg.effective_size(),
-                )
-            })
-            .collect();
-
-        // Compute total bytes for progress tracking
+        let size_map = export_runner::build_size_map(&self.export_partition_configs);
+        let overrides =
+            export_runner::build_size_overrides(&self.export_partition_configs, &self.partitions);
         let total_bytes: u64 = size_map.values().sum();
 
-        let new_status = || {
-            Arc::new(Mutex::new(ExportStatus {
-                finished: false,
-                error: None,
-                log_messages: Vec::new(),
-                current_bytes: 0,
-                total_bytes,
-                cancel_requested: false,
-            }))
-        };
-
         if self.export_whole_disk {
-            // Pick a single file destination
             let (filter_label, filter_exts) = format.dialog_filter();
             let dialog = super::file_dialog()
                 .set_file_name(format.default_filename("disk"))
@@ -1228,400 +1054,93 @@ impl InspectTab {
                 None => return,
             };
 
-            // Clonezilla whole-disk export
-            if let Some(cz_image) = self.clonezilla_image.clone() {
+            let status = if let Some(cz_image) = self.clonezilla_image.clone() {
                 let source = match &self.backup_folder_path {
                     Some(f) => f.clone(),
                     None => {
-                        log.error("No backup folder for Clonezilla export");
+                        ctx.log.error("No backup folder for Clonezilla export");
                         return;
                     }
                 };
-                let overrides = partition_overrides;
-                let status = new_status();
-                self.export_status = Some(Arc::clone(&status));
-
-                log.info(format!(
+                ctx.log.info(format!(
                     "Exporting Clonezilla image as whole-disk {} to {}...",
                     format_desc,
                     dest.display()
                 ));
-
-                std::thread::spawn(move || {
-                    let status2 = Arc::clone(&status);
-                    let status3 = Arc::clone(&status);
-                    let result = rusty_backup::rbformats::export::export_clonezilla_disk(
-                        format,
-                        &cz_image,
-                        &source,
-                        &dest,
-                        &overrides,
-                        move |bytes| {
-                            if let Ok(mut s) = status2.lock() {
-                                s.current_bytes = bytes;
-                            }
-                        },
-                        move || status3.lock().map(|s| s.cancel_requested).unwrap_or(false),
-                        |msg| {
-                            if let Ok(mut s) = status.lock() {
-                                s.log_messages.push(msg.to_string());
-                            }
-                        },
-                    );
-                    if let Ok(mut s) = status.lock() {
-                        s.finished = true;
-                        if let Err(e) = result {
-                            s.error = Some(format!("{e:#}"));
-                        }
-                    }
-                });
+                export_runner::start_clonezilla_whole_disk(
+                    format,
+                    cz_image,
+                    source,
+                    dest,
+                    overrides,
+                    total_bytes,
+                )
             } else {
-                // Native backup or raw image export
                 let source_path = self
                     .backup_folder_path
                     .clone()
                     .or_else(|| self.image_file_path.clone())
                     .or_else(|| {
                         self.selected_device_idx
-                            .and_then(|idx| devices.get(idx))
+                            .and_then(|idx| ctx.devices.get(idx))
                             .map(|d| d.path.clone())
                     });
                 let source = match source_path {
                     Some(p) => p,
                     None => {
-                        log.error("No source available for export");
+                        ctx.log.error("No source available for export");
                         return;
                     }
                 };
-
-                let meta = self.backup_metadata.clone();
-                let overrides = partition_overrides;
-                let status = new_status();
-                self.export_status = Some(Arc::clone(&status));
-
-                log.info(format!(
+                ctx.log.info(format!(
                     "Exporting whole-disk {} to {}...",
                     format_desc,
                     dest.display()
                 ));
-
-                std::thread::spawn(move || {
-                    let status2 = Arc::clone(&status);
-                    let status3 = Arc::clone(&status);
-                    let result = rusty_backup::rbformats::export::export_whole_disk(
-                        format,
-                        &source,
-                        meta.as_ref(),
-                        None,
-                        &overrides,
-                        &dest,
-                        move |bytes| {
-                            if let Ok(mut s) = status2.lock() {
-                                s.current_bytes = bytes;
-                            }
-                        },
-                        move || status3.lock().map(|s| s.cancel_requested).unwrap_or(false),
-                        |msg| {
-                            if let Ok(mut s) = status.lock() {
-                                s.log_messages.push(msg.to_string());
-                            }
-                        },
-                    );
-                    if let Ok(mut s) = status.lock() {
-                        s.finished = true;
-                        if let Err(e) = result {
-                            s.error = Some(format!("{e:#}"));
-                        }
-                    }
-                });
-            }
+                export_runner::start_native_whole_disk(
+                    format,
+                    source,
+                    self.backup_metadata.clone(),
+                    overrides,
+                    dest,
+                    total_bytes,
+                )
+            };
+            self.export_status = Some(status);
         } else {
-            // Per-partition: pick a folder
             let dest_folder = match super::file_dialog().pick_folder() {
                 Some(p) => p,
                 None => return,
             };
 
-            let source_folder = self.backup_folder_path.clone();
             let source_image = self.image_file_path.clone().or_else(|| {
                 self.selected_device_idx
-                    .and_then(|idx| devices.get(idx))
+                    .and_then(|idx| ctx.devices.get(idx))
                     .map(|d| d.path.clone())
             });
-            let meta = self.backup_metadata.clone();
-            let partitions = self.partitions.clone();
-            let cz_image = self.clonezilla_image.clone();
 
-            let status = new_status();
-            self.export_status = Some(Arc::clone(&status));
-
-            log.info(format!(
+            ctx.log.info(format!(
                 "Exporting per-partition {} files to {}...",
                 format_desc,
                 dest_folder.display()
             ));
 
-            std::thread::spawn(move || {
-                let result = (|| -> anyhow::Result<()> {
-                    let mut overall_written: u64 = 0;
-
-                    if let (Some(cz), Some(_folder)) = (&cz_image, &source_folder) {
-                        // Clonezilla per-partition export
-                        for cz_part in &cz.partitions {
-                            if status.lock().map(|s| s.cancel_requested).unwrap_or(false) {
-                                anyhow::bail!("export cancelled");
-                            }
-                            if cz_part.is_extended || cz_part.partclone_files.is_empty() {
-                                continue;
-                            }
-
-                            let export_size = size_map
-                                .get(&cz_part.index)
-                                .copied()
-                                .unwrap_or(cz_part.size_bytes());
-                            let dest_path =
-                                dest_folder.join(format!("partition-{}.{}", cz_part.index, ext));
-
-                            if let Ok(mut s) = status.lock() {
-                                s.log_messages.push(format!(
-                                    "Exporting partition-{} ({}) to {}",
-                                    cz_part.index,
-                                    partition::format_size(export_size),
-                                    dest_path.display()
-                                ));
-                            }
-
-                            let base_written = overall_written;
-                            let status_progress = Arc::clone(&status);
-                            let status_cancel = Arc::clone(&status);
-                            rusty_backup::rbformats::export::export_clonezilla_partition(
-                                format,
-                                &cz_part.partclone_files,
-                                &dest_path,
-                                Some(export_size),
-                                move |bytes| {
-                                    if let Ok(mut s) = status_progress.lock() {
-                                        s.current_bytes = base_written + bytes;
-                                    }
-                                },
-                                move || {
-                                    status_cancel
-                                        .lock()
-                                        .map(|s| s.cancel_requested)
-                                        .unwrap_or(false)
-                                },
-                                |msg| {
-                                    if let Ok(mut s) = status.lock() {
-                                        s.log_messages.push(msg.to_string());
-                                    }
-                                },
-                            )?;
-
-                            overall_written += export_size;
-                        }
-                    } else if let (Some(folder), Some(meta)) = (&source_folder, &meta) {
-                        // Backup folder: export each partition file
-                        for pm in &meta.partitions {
-                            if status.lock().map(|s| s.cancel_requested).unwrap_or(false) {
-                                anyhow::bail!("export cancelled");
-                            }
-                            if pm.compressed_files.is_empty() {
-                                continue;
-                            }
-
-                            let export_size = size_map
-                                .get(&pm.index)
-                                .copied()
-                                .unwrap_or(pm.original_size_bytes);
-                            let data_file = &pm.compressed_files[0];
-                            let data_path = folder.join(data_file);
-                            let dest_path =
-                                dest_folder.join(format!("partition-{}.{}", pm.index, ext));
-
-                            if let Ok(mut s) = status.lock() {
-                                s.log_messages.push(format!(
-                                    "Exporting partition-{} ({}) to {}",
-                                    pm.index,
-                                    partition::format_size(export_size),
-                                    dest_path.display()
-                                ));
-                            }
-
-                            let base_written = overall_written;
-                            let status_progress = Arc::clone(&status);
-                            let status_cancel = Arc::clone(&status);
-                            rusty_backup::rbformats::export::export_partition(
-                                format,
-                                &data_path,
-                                &meta.compression_type,
-                                &dest_path,
-                                Some(export_size),
-                                move |bytes| {
-                                    if let Ok(mut s) = status_progress.lock() {
-                                        s.current_bytes = base_written + bytes;
-                                    }
-                                },
-                                move || {
-                                    status_cancel
-                                        .lock()
-                                        .map(|s| s.cancel_requested)
-                                        .unwrap_or(false)
-                                },
-                                |msg| {
-                                    if let Ok(mut s) = status.lock() {
-                                        s.log_messages.push(msg.to_string());
-                                    }
-                                },
-                            )?;
-
-                            // Resize FAT filesystem if the partition size changed
-                            if export_size != pm.original_size_bytes {
-                                let new_sectors = (export_size / 512) as u32;
-                                let mut rw = std::fs::OpenOptions::new()
-                                    .read(true)
-                                    .write(true)
-                                    .open(&dest_path)?;
-                                resize_fat_in_place(&mut rw, 0, new_sectors, &mut |msg| {
-                                    if let Ok(mut s) = status.lock() {
-                                        s.log_messages.push(msg.to_string());
-                                    }
-                                })?;
-                            }
-
-                            overall_written += export_size;
-                        }
-                    } else if let Some(image_path) = &source_image {
-                        if format.is_floppy_only() {
-                            anyhow::bail!(
-                                "{} per-partition export from a raw disk image is not supported — use Whole Disk export for floppy-only formats",
-                                format.description()
-                            );
-                        }
-                        // Raw image/device: extract each partition by offset
-                        for part in &partitions {
-                            if status.lock().map(|s| s.cancel_requested).unwrap_or(false) {
-                                anyhow::bail!("export cancelled");
-                            }
-                            if part.is_extended_container {
-                                continue;
-                            }
-
-                            let export_size = size_map
-                                .get(&part.index)
-                                .copied()
-                                .unwrap_or(part.size_bytes);
-                            let dest_path =
-                                dest_folder.join(format!("partition-{}.{}", part.index, ext));
-                            let offset = part.start_lba * 512;
-
-                            if let Ok(mut s) = status.lock() {
-                                s.log_messages.push(format!(
-                                    "Exporting partition-{} ({}) to {}",
-                                    part.index,
-                                    partition::format_size(export_size),
-                                    dest_path.display()
-                                ));
-                            }
-
-                            // Extract partition data
-                            let read_limit = export_size.min(part.size_bytes);
-                            let file = std::fs::File::open(image_path)?;
-                            let mut reader = std::io::BufReader::new(file);
-                            reader.seek(std::io::SeekFrom::Start(offset))?;
-                            let mut limited = reader.take(read_limit);
-
-                            let mut writer =
-                                std::io::BufWriter::new(std::fs::File::create(&dest_path)?);
-
-                            // Write format header (2MG only)
-                            if format == ExportFormat::TwoMg {
-                                let hdr =
-                                    rusty_backup::rbformats::twomg::build_twomg_header(export_size);
-                                writer.write_all(&hdr)?;
-                            }
-
-                            let mut buf = vec![0u8; 256 * 1024];
-                            let mut total: u64 = 0;
-                            let base_written = overall_written;
-                            loop {
-                                if status.lock().map(|s| s.cancel_requested).unwrap_or(false) {
-                                    anyhow::bail!("export cancelled");
-                                }
-                                let n = limited.read(&mut buf)?;
-                                if n == 0 {
-                                    break;
-                                }
-                                writer.write_all(&buf[..n])?;
-                                total += n as u64;
-                                if let Ok(mut s) = status.lock() {
-                                    s.current_bytes = base_written + total;
-                                }
-                            }
-
-                            // Pad with zeros if export_size > data read (growing)
-                            if total < export_size {
-                                let pad = export_size - total;
-                                let zeros = vec![0u8; 256 * 1024];
-                                let mut remaining = pad;
-                                while remaining > 0 {
-                                    let n = (remaining as usize).min(zeros.len());
-                                    writer.write_all(&zeros[..n])?;
-                                    remaining -= n as u64;
-                                }
-                                total = export_size;
-                            }
-                            writer.flush()?;
-
-                            // Resize FAT filesystem if the partition size changed
-                            if export_size != part.size_bytes {
-                                let new_sectors = (export_size / 512) as u32;
-                                // For 2MG, data starts at offset 64
-                                let fs_offset = if format == ExportFormat::TwoMg { 64 } else { 0 };
-                                resize_fat_in_place(
-                                    writer.get_mut(),
-                                    fs_offset,
-                                    new_sectors,
-                                    &mut |msg| {
-                                        if let Ok(mut s) = status.lock() {
-                                            s.log_messages.push(msg.to_string());
-                                        }
-                                    },
-                                )?;
-                                // Seek back to end
-                                let end = if format == ExportFormat::TwoMg {
-                                    64 + total
-                                } else {
-                                    total
-                                };
-                                writer.seek(std::io::SeekFrom::Start(end))?;
-                            }
-
-                            // Append format footer (VHD only)
-                            if format == ExportFormat::Vhd {
-                                let footer = build_vhd_footer(total);
-                                writer.write_all(&footer)?;
-                            }
-                            writer.flush()?;
-
-                            overall_written += export_size;
-                        }
-                    } else {
-                        anyhow::bail!("no source available for export");
-                    }
-                    Ok(())
-                })();
-
-                if let Ok(mut s) = status.lock() {
-                    s.finished = true;
-                    if let Err(e) = result {
-                        s.error = Some(format!("{e:#}"));
-                    }
-                }
+            let status = export_runner::start_per_partition(PerPartitionInputs {
+                format,
+                source_folder: self.backup_folder_path.clone(),
+                source_image,
+                meta: self.backup_metadata.clone(),
+                partitions: self.partitions.clone(),
+                cz_image: self.clonezilla_image.clone(),
+                size_map,
+                dest_folder,
+                total_bytes,
             });
+            self.export_status = Some(status);
         }
     }
 
-    fn poll_inspect_status(&mut self, log: &mut LogPanel) {
+    fn poll_inspect_status(&mut self, ctx: &mut TabContext) {
         let status_arc = match &self.inspect_status {
             Some(s) => Arc::clone(s),
             None => return,
@@ -1633,13 +1152,13 @@ impl InspectTab {
 
         // Drain log messages into the panel
         for msg in status.log_messages.drain(..) {
-            log.info(msg);
+            ctx.log.info(msg);
         }
 
         if status.finished {
             if let Some(err) = &status.error {
                 let msg = format!("Inspect failed: {err}");
-                log.error(&msg);
+                ctx.log.error(&msg);
                 self.last_error = Some(msg);
             } else {
                 self.partition_table = status.partition_table.take();
@@ -1662,7 +1181,7 @@ impl InspectTab {
         }
     }
 
-    fn poll_export_status(&mut self, log: &mut LogPanel) {
+    fn poll_export_status(&mut self, ctx: &mut TabContext) {
         let status_arc = match &self.export_status {
             Some(s) => Arc::clone(s),
             None => return,
@@ -1674,14 +1193,14 @@ impl InspectTab {
 
         // Drain log messages
         for msg in status.log_messages.drain(..) {
-            log.info(msg);
+            ctx.log.info(msg);
         }
 
         if status.finished {
             if let Some(err) = &status.error {
-                log.error(format!("Export failed: {err}"));
+                ctx.log.error(format!("Export failed: {err}"));
             } else {
-                log.info("Export completed successfully.");
+                ctx.log.info("Export completed successfully.");
             }
             drop(status);
             self.export_status = None;
@@ -1716,7 +1235,7 @@ impl InspectTab {
         self.open_device_guard = None;
     }
 
-    fn load_backup_metadata(&mut self, log: &mut LogPanel) {
+    fn load_backup_metadata(&mut self, ctx: &mut TabContext) {
         self.partition_table = None;
         self.alignment = None;
         self.partitions.clear();
@@ -1727,17 +1246,18 @@ impl InspectTab {
             None => return,
         };
 
-        log.info(format!("Loading backup folder {}...", folder.display()));
+        ctx.log
+            .info(format!("Loading backup folder {}...", folder.display()));
         match rusty_backup::model::backup_loader::load_backup(&folder) {
             Ok(rusty_backup::model::backup_loader::LoadOutcome::Backup(out)) => {
-                self.apply_backup_outcome(out, log);
+                self.apply_backup_outcome(out, ctx);
             }
             Ok(rusty_backup::model::backup_loader::LoadOutcome::Clonezilla(out)) => {
-                self.apply_clonezilla_outcome(out, log);
+                self.apply_clonezilla_outcome(out, ctx);
             }
             Err(e) => {
                 let msg = format!("{e:#}");
-                log.error(&msg);
+                ctx.log.error(&msg);
                 self.last_error = Some(msg);
             }
         }
@@ -1746,13 +1266,13 @@ impl InspectTab {
     fn apply_backup_outcome(
         &mut self,
         out: rusty_backup::model::backup_loader::BackupLoadOutcome,
-        log: &mut LogPanel,
+        ctx: &mut TabContext,
     ) {
         for msg in &out.info {
-            log.info(msg);
+            ctx.log.info(msg);
         }
         for msg in &out.warnings {
-            log.warn(msg);
+            ctx.log.warn(msg);
         }
         self.backup_metadata = Some(out.metadata);
         self.partition_table = out.partition_table;
@@ -1760,13 +1280,13 @@ impl InspectTab {
         self.partitions = out.partitions;
     }
 
-    fn run_inspect(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {
+    fn run_inspect(&mut self, ctx: &mut TabContext) {
         self.clear_results();
 
         let path = if let Some(img_path) = &self.image_file_path {
             img_path.clone()
         } else if let Some(idx) = self.selected_device_idx {
-            if let Some(device) = devices.get(idx) {
+            if let Some(device) = ctx.devices.get(idx) {
                 device.path.clone()
             } else {
                 self.last_error = Some("Selected device not found".into());
@@ -1776,7 +1296,7 @@ impl InspectTab {
             return;
         };
 
-        log.info(format!("Inspecting {}...", path.display()));
+        ctx.log.info(format!("Inspecting {}...", path.display()));
 
         // All device I/O runs on a background thread so DA unmount/claim
         // (which can block up to ~5 s) never freezes the GUI.
@@ -2037,16 +1557,16 @@ impl InspectTab {
     fn apply_clonezilla_outcome(
         &mut self,
         out: rusty_backup::model::backup_loader::ClonezillaLoadOutcome,
-        log: &mut LogPanel,
+        ctx: &mut TabContext,
     ) {
         for msg in &out.info {
-            log.info(msg);
+            ctx.log.info(msg);
         }
         for msg in &out.warnings {
-            log.warn(msg);
+            ctx.log.warn(msg);
         }
         if out.cached_metadata_count > 0 {
-            log.info(format!(
+            ctx.log.info(format!(
                 "Found {} cached metadata file(s) for browsing",
                 out.cached_metadata_count,
             ));
@@ -2132,7 +1652,7 @@ impl InspectTab {
         ui.add_space(8.0);
     }
 
-    fn show_results(&mut self, ui: &mut egui::Ui, devices: &[DiskDevice], log: &mut LogPanel) {
+    fn show_results(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
         // Partition table type - extract info before mutable borrow
         let (type_name, disk_sig, is_superfloppy) = if let Some(table) = &self.partition_table {
             (
@@ -2173,15 +1693,10 @@ impl InspectTab {
         }
 
         ui.add_space(8.0);
-        self.show_partition_list(ui, devices, log);
+        self.show_partition_list(ui, ctx);
     }
 
-    fn show_partition_list(
-        &mut self,
-        ui: &mut egui::Ui,
-        devices: &[DiskDevice],
-        log: &mut LogPanel,
-    ) {
+    fn show_partition_list(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
         if self.partitions.is_empty() {
             ui.label("No partitions found.");
             return;
@@ -2348,27 +1863,27 @@ impl InspectTab {
 
         // Handle browse request outside the grid (avoids borrow issues)
         if let Some((part_index, offset, ptype, type_string)) = browse_request {
-            self.open_browse(part_index, offset, ptype, type_string, devices, log);
+            self.open_browse(part_index, offset, ptype, type_string, ctx);
         }
 
         // Handle check (fsck) request
         if let Some((offset, ptype, type_string)) = check_request {
-            self.run_fsck(offset, ptype, type_string.clone(), devices, log);
+            self.run_fsck(offset, ptype, type_string.clone(), ctx);
             self.repair_context = Some((offset, ptype, type_string));
             self.repair_report = None;
         }
 
         // Handle expand-HFS request: probe the source, then open the dialog.
         if let Some((offset, partition_size)) = expand_request {
-            self.open_expand_hfs(offset, partition_size, devices, log);
+            self.open_expand_hfs(offset, partition_size, ctx);
         }
 
         // Fsck results popup
-        self.render_fsck_popup(ui, devices, log);
+        self.render_fsck_popup(ui, ctx);
 
         // Expand-HFS dialog
         if let Some(dlg) = &mut self.expand_hfs_dialog {
-            let still_open = dlg.show(ui.ctx(), log);
+            let still_open = dlg.show(ui.ctx(), ctx.log);
             if !still_open {
                 self.expand_hfs_dialog = None;
             }
@@ -2376,22 +1891,16 @@ impl InspectTab {
     }
 
     /// Resolve the source path and open the Expand-HFS dialog.
-    fn open_expand_hfs(
-        &mut self,
-        offset: u64,
-        partition_size: u64,
-        devices: &[DiskDevice],
-        log: &mut LogPanel,
-    ) {
+    fn open_expand_hfs(&mut self, offset: u64, partition_size: u64, ctx: &mut TabContext) {
         let source_path = self
             .selected_device_idx
-            .and_then(|idx| devices.get(idx))
+            .and_then(|idx| ctx.devices.get(idx))
             .map(|d| d.path.clone())
             .or_else(|| self.image_file_path.clone());
         let path = match source_path {
             Some(p) => p,
             None => {
-                log.error("No source available for HFS expand");
+                ctx.log.error("No source available for HFS expand");
                 return;
             }
         };
@@ -2400,7 +1909,7 @@ impl InspectTab {
                 self.expand_hfs_dialog = Some(ExpandHfsDialog::new(source));
             }
             Err(e) => {
-                log.error(format!("Cannot read source HFS volume: {e}"));
+                ctx.log.error(format!("Cannot read source HFS volume: {e}"));
             }
         }
     }
@@ -2411,19 +1920,18 @@ impl InspectTab {
         offset: u64,
         ptype: u8,
         type_string: Option<String>,
-        devices: &[DiskDevice],
-        log: &mut LogPanel,
+        ctx: &mut TabContext,
     ) {
         let source_path = self
             .selected_device_idx
-            .and_then(|idx| devices.get(idx))
+            .and_then(|idx| ctx.devices.get(idx))
             .map(|d| d.path.clone())
             .or_else(|| self.image_file_path.clone());
 
         let path = match source_path {
             Some(p) => p,
             None => {
-                log.error("No source available for filesystem check");
+                ctx.log.error("No source available for filesystem check");
                 return;
             }
         };
@@ -2436,13 +1944,13 @@ impl InspectTab {
         ) {
             Ok(Some(result)) => {
                 if result.is_clean() {
-                    log.info(format!(
+                    ctx.log.info(format!(
                         "Filesystem check: clean ({} files, {} dirs)",
                         result.stats.files_checked, result.stats.directories_checked,
                     ));
                 } else {
                     let visible_warns = result.warnings.iter().filter(|w| !w.debug).count();
-                    log.warn(format!(
+                    ctx.log.warn(format!(
                         "Filesystem check: {} error(s), {} warning(s)",
                         result.errors.len(),
                         visible_warns,
@@ -2452,16 +1960,17 @@ impl InspectTab {
                 self.show_fsck_popup = true;
             }
             Ok(None) => {
-                log.info("Filesystem check not supported for this filesystem type");
+                ctx.log
+                    .info("Filesystem check not supported for this filesystem type");
             }
             Err(e) => {
-                log.error(format!("{e:#}"));
+                ctx.log.error(format!("{e:#}"));
             }
         }
     }
 
     /// Render the filesystem check results popup.
-    fn render_fsck_popup(&mut self, ui: &mut egui::Ui, devices: &[DiskDevice], log: &mut LogPanel) {
+    fn render_fsck_popup(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
         if !self.show_fsck_popup {
             return;
         }
@@ -2586,16 +2095,11 @@ impl InspectTab {
         }
 
         // Repair confirmation dialog
-        self.render_repair_confirm_inspect(ui, devices, log);
+        self.render_repair_confirm_inspect(ui, ctx);
     }
 
     /// Render the repair confirmation dialog for the inspect tab.
-    fn render_repair_confirm_inspect(
-        &mut self,
-        ui: &mut egui::Ui,
-        devices: &[DiskDevice],
-        log: &mut LogPanel,
-    ) {
+    fn render_repair_confirm_inspect(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
         if !self.show_repair_confirm {
             return;
         }
@@ -2632,30 +2136,30 @@ impl InspectTab {
         }
         if confirmed {
             self.show_repair_confirm = false;
-            self.run_repair_inspect(devices, log);
+            self.run_repair_inspect(ctx);
         }
     }
 
     /// Execute repair on the filesystem via inspect tab context.
-    fn run_repair_inspect(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {
+    fn run_repair_inspect(&mut self, ctx: &mut TabContext) {
         let (offset, ptype, type_string) = match &self.repair_context {
             Some(ctx) => ctx.clone(),
             None => {
-                log.error("No repair context available");
+                ctx.log.error("No repair context available");
                 return;
             }
         };
 
         let source_path = self
             .selected_device_idx
-            .and_then(|idx| devices.get(idx))
+            .and_then(|idx| ctx.devices.get(idx))
             .map(|d| d.path.clone())
             .or_else(|| self.image_file_path.clone());
 
         let path = match source_path {
             Some(p) => p,
             None => {
-                log.error("No source available for repair");
+                ctx.log.error("No source available for repair");
                 return;
             }
         };
@@ -2667,17 +2171,17 @@ impl InspectTab {
             type_string.as_deref(),
         ) {
             Ok(report) => {
-                log.info(format!(
+                ctx.log.info(format!(
                     "Repair complete: {} fix(es) applied, {} failed",
                     report.fixes_applied.len(),
                     report.fixes_failed.len(),
                 ));
                 self.repair_report = Some(report);
                 // Re-run fsck to show updated state
-                self.run_fsck(offset, ptype, type_string, devices, log);
+                self.run_fsck(offset, ptype, type_string, ctx);
             }
             Err(e) => {
-                log.error(format!("{e:#}"));
+                ctx.log.error(format!("{e:#}"));
             }
         }
     }
@@ -2695,17 +2199,16 @@ impl InspectTab {
         offset: u64,
         ptype: u8,
         partition_type_string: Option<String>,
-        devices: &[DiskDevice],
-        log: &mut LogPanel,
+        ctx: &mut TabContext,
     ) {
         // Case 1: device or raw image file
         let device_path = self
             .selected_device_idx
-            .and_then(|idx| devices.get(idx))
+            .and_then(|idx| ctx.devices.get(idx))
             .map(|d| d.path.clone());
         let source_path = device_path.or_else(|| self.image_file_path.clone());
         if let Some(path) = source_path {
-            log.info(format!(
+            ctx.log.info(format!(
                 "Browsing partition {} from {} at offset {}",
                 part_index,
                 path.display(),
@@ -2731,7 +2234,7 @@ impl InspectTab {
 
         // Case 3: Clonezilla image — use seekable zstd cache
         if self.clonezilla_image.is_some() {
-            self.open_browse_clonezilla(part_index, ptype, log);
+            self.open_browse_clonezilla(part_index, ptype, ctx);
             return;
         }
 
@@ -2739,7 +2242,7 @@ impl InspectTab {
         let (folder, meta) = match (&self.backup_folder_path, &self.backup_metadata) {
             (Some(f), Some(m)) => (f.clone(), m.clone()),
             _ => {
-                log.error(format!(
+                ctx.log.error(format!(
                     "partition-{}: no source available for browsing",
                     part_index,
                 ));
@@ -2751,7 +2254,7 @@ impl InspectTab {
         let part_meta = match meta.partitions.iter().find(|p| p.index == part_index) {
             Some(pm) => pm,
             None => {
-                log.error(format!(
+                ctx.log.error(format!(
                     "partition-{}: not found in backup metadata",
                     part_index,
                 ));
@@ -2760,7 +2263,7 @@ impl InspectTab {
         };
 
         if part_meta.compressed_files.is_empty() {
-            log.error(format!(
+            ctx.log.error(format!(
                 "partition-{}: no data files listed in backup metadata",
                 part_index,
             ));
@@ -2769,7 +2272,7 @@ impl InspectTab {
 
         // Split files not supported for browsing
         if part_meta.compressed_files.len() > 1 {
-            log.warn(format!(
+            ctx.log.warn(format!(
                 "partition-{}: browsing split backup files is not supported (files: {})",
                 part_index,
                 part_meta.compressed_files.join(", "),
@@ -2781,7 +2284,7 @@ impl InspectTab {
         let data_path = folder.join(data_file);
 
         if !data_path.exists() {
-            log.error(format!(
+            ctx.log.error(format!(
                 "partition-{}: data file not found: {}",
                 part_index,
                 data_path.display(),
@@ -2796,7 +2299,7 @@ impl InspectTab {
         match meta.compression_type.as_str() {
             "none" => {
                 // Raw file — partition data starts at offset 0
-                log.info(format!(
+                ctx.log.info(format!(
                     "Browsing partition {} from {}",
                     part_index, data_file,
                 ));
@@ -2819,7 +2322,7 @@ impl InspectTab {
                     &data_path,
                     &folder,
                     &format!("partition-{}", part_index),
-                    log,
+                    ctx,
                 );
                 // Set archive edit context for decompress→edit→recompress flow
                 self.browse_view.set_archive_edit_context(
@@ -2834,7 +2337,7 @@ impl InspectTab {
             }
             "chd" => {
                 // CHD-compressed backup — open directly via ChdReader (on-demand decompression)
-                log.info(format!(
+                ctx.log.info(format!(
                     "Browsing partition {} from CHD: {}",
                     part_index, data_file,
                 ));
@@ -2857,7 +2360,7 @@ impl InspectTab {
                 );
             }
             "woz" => {
-                log.info(format!(
+                ctx.log.info(format!(
                     "Browsing partition {} from WOZ: {}",
                     part_index, data_file,
                 ));
@@ -2879,7 +2382,7 @@ impl InspectTab {
                 );
             }
             other => {
-                log.warn(format!(
+                ctx.log.warn(format!(
                     "partition-{}: browsing {} compressed backups is not yet supported (file: {})",
                     part_index, other, data_file,
                 ));
@@ -2888,7 +2391,7 @@ impl InspectTab {
     }
 
     /// Open browse for a Clonezilla partition using seekable zstd cache.
-    fn open_browse_clonezilla(&mut self, part_index: usize, ptype: u8, log: &mut LogPanel) {
+    fn open_browse_clonezilla(&mut self, part_index: usize, ptype: u8, ctx: &mut TabContext) {
         let cz_image = match &self.clonezilla_image {
             Some(cz) => cz.clone(),
             None => return,
@@ -2901,7 +2404,7 @@ impl InspectTab {
         let cz_part = match cz_image.partitions.iter().find(|p| p.index == part_index) {
             Some(p) => p.clone(),
             None => {
-                log.error(format!(
+                ctx.log.error(format!(
                     "partition-{}: not found in Clonezilla image",
                     part_index,
                 ));
@@ -2910,7 +2413,8 @@ impl InspectTab {
         };
 
         if cz_part.partclone_files.is_empty() {
-            log.error(format!("partition-{}: no partclone data files", part_index,));
+            ctx.log
+                .error(format!("partition-{}: no partclone data files", part_index,));
             return;
         }
 
@@ -2919,7 +2423,7 @@ impl InspectTab {
             if let Ok(c) = cache.lock() {
                 if c.state == clonezilla::block_cache::CacheState::Ready {
                     drop(c);
-                    log.info(format!(
+                    ctx.log.info(format!(
                         "Browsing partition {} from block cache",
                         part_index
                     ));
@@ -2931,7 +2435,8 @@ impl InspectTab {
 
         // Check if a scan is already running
         if self.block_cache_scan.is_some() {
-            log.warn("A metadata scan is already in progress. Please wait.");
+            ctx.log
+                .warn("A metadata scan is already in progress. Please wait.");
             return;
         }
 
@@ -2943,7 +2448,7 @@ impl InspectTab {
                 cz_part.partclone_files.clone(),
             ) {
                 Ok(loaded) => {
-                    log.info(format!(
+                    ctx.log.info(format!(
                         "Loaded cached metadata for partition {} ({} blocks)",
                         part_index,
                         loaded.cached_block_count(),
@@ -2961,7 +2466,7 @@ impl InspectTab {
         }
 
         // Start background metadata scan
-        log.info(format!(
+        ctx.log.info(format!(
             "Scanning metadata for partition {} ({})...",
             part_index,
             partition::format_size(cz_part.size_bytes()),
@@ -3011,12 +2516,12 @@ impl InspectTab {
         data_path: &PathBuf,
         folder: &PathBuf,
         cache_name: &str,
-        log: &mut LogPanel,
+        ctx: &mut TabContext,
     ) {
         // 1. If seekable cache already exists, use it directly
         if let Some(cache_path) = self.seekable_cache_files.get(&part_index).cloned() {
             if cache_path.exists() {
-                log.info(format!(
+                ctx.log.info(format!(
                     "Browsing partition {} from cached seekable file",
                     part_index,
                 ));
@@ -3030,12 +2535,13 @@ impl InspectTab {
 
         // 2. If a cache build is already running, warn and return
         if self.cache_status.is_some() {
-            log.warn("A seekable cache is already being created. Please wait.");
+            ctx.log
+                .warn("A seekable cache is already being created. Please wait.");
             return;
         }
 
         // 3. Open the browser immediately via streaming reader
-        log.info(format!(
+        ctx.log.info(format!(
             "Opening partition {} via streaming reader (seekable cache building in background)...",
             part_index,
         ));
@@ -3046,7 +2552,7 @@ impl InspectTab {
         let cache_path = folder.join(format!("_{cache_name}.seekable.zst"));
         let total_bytes = std::fs::metadata(data_path).map(|m| m.len()).unwrap_or(0);
 
-        log.info(format!(
+        ctx.log.info(format!(
             "Creating seekable cache for partition {} in the background...",
             part_index,
         ));
@@ -3073,7 +2579,7 @@ impl InspectTab {
         });
     }
 
-    fn poll_block_cache_scan(&mut self, log: &mut LogPanel) {
+    fn poll_block_cache_scan(&mut self, ctx: &mut TabContext) {
         let scan_arc = match &self.block_cache_scan {
             Some(s) => Arc::clone(s),
             None => return,
@@ -3088,12 +2594,12 @@ impl InspectTab {
             let ptype = scan.partition_type;
 
             if let Some(err) = &scan.error {
-                log.error(format!(
+                ctx.log.error(format!(
                     "Metadata scan failed for partition {}: {err}",
                     part_index,
                 ));
             } else {
-                log.info(format!(
+                ctx.log.info(format!(
                     "Metadata scan complete for partition {}.",
                     part_index,
                 ));
@@ -3112,7 +2618,7 @@ impl InspectTab {
         }
     }
 
-    fn poll_cache_status(&mut self, log: &mut LogPanel) {
+    fn poll_cache_status(&mut self, ctx: &mut TabContext) {
         let status_arc = match &self.cache_status {
             Some(s) => Arc::clone(s),
             None => return,
@@ -3125,14 +2631,14 @@ impl InspectTab {
         if status.finished {
             let part_index = status.partition_index;
             if let Some(err) = &status.error {
-                log.error(format!(
+                ctx.log.error(format!(
                     "Failed to create seekable cache for partition {}: {err}",
                     part_index,
                 ));
                 drop(status);
                 self.cache_status = None;
             } else if let Some(cache_path) = &status.cache_path {
-                log.info(
+                ctx.log.info(
                     "Seekable cache ready — browser upgraded to full seek support.".to_string(),
                 );
                 let cache_path = cache_path.clone();

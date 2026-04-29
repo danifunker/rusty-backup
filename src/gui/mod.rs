@@ -1,6 +1,7 @@
 mod backup_tab;
 mod browse_view;
 mod bulk_convert_dialog;
+mod context;
 mod elevation_dialog;
 mod expand_hfs_dialog;
 mod inspect_tab;
@@ -431,8 +432,8 @@ impl eframe::App for RustyBackupApp {
         // Central panel: active tab content
         egui::CentralPanel::default().show(ctx, |ui| match self.active_tab {
             Tab::Backup => {
-                self.backup_tab
-                    .show(ui, &self.devices, &mut self.log_panel, &mut self.progress);
+                let mut ctx = context::TabContext::new(&self.devices, &mut self.log_panel);
+                self.backup_tab.show(ui, &mut ctx, &mut self.progress);
             }
             Tab::Restore => {
                 // Share backup folder between tabs
@@ -446,8 +447,8 @@ impl eframe::App for RustyBackupApp {
                         .load_backup(self.loaded_backup_folder.as_ref().unwrap());
                 }
 
-                self.restore_tab
-                    .show(ui, &self.devices, &mut self.log_panel, &mut self.progress);
+                let mut ctx = context::TabContext::new(&self.devices, &mut self.log_panel);
+                self.restore_tab.show(ui, &mut ctx, &mut self.progress);
             }
             Tab::Inspect => {
                 // Share backup folder between tabs
@@ -461,8 +462,8 @@ impl eframe::App for RustyBackupApp {
                         .load_backup(self.loaded_backup_folder.as_ref().unwrap());
                 }
 
-                self.inspect_tab
-                    .show(ui, &self.devices, &mut self.log_panel);
+                let mut ctx = context::TabContext::new(&self.devices, &mut self.log_panel);
+                self.inspect_tab.show(ui, &mut ctx);
             }
             Tab::Optical => {
                 self.optical_tab

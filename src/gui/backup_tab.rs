@@ -7,13 +7,14 @@ use std::sync::{Arc, Mutex};
 use rusty_backup::backup::{
     BackupConfig, BackupProgress, ChecksumType, CompressionType, LogLevel as BackupLogLevel,
 };
-use rusty_backup::device::DiskDevice;
 use rusty_backup::fs;
+use rusty_backup::model::status::VhdExportStatus;
 use rusty_backup::partition::PartitionSizeOverride;
 use rusty_backup::partition::{self, PartitionInfo, PartitionTable};
 use rusty_backup::rbformats::vhd::export_whole_disk_vhd;
 
-use super::progress::{LogPanel, ProgressState};
+use super::context::TabContext;
+use super::progress::ProgressState;
 
 /// State for the Backup tab.
 pub struct BackupTab {
@@ -77,16 +78,6 @@ impl VhdPartitionConfig {
     }
 }
 
-/// Status of a VHD whole-disk export running on a background thread.
-struct VhdExportStatus {
-    finished: bool,
-    error: Option<String>,
-    current_bytes: u64,
-    total_bytes: u64,
-    cancel_requested: bool,
-    log_messages: Vec<String>,
-}
-
 impl Default for BackupTab {
     fn default() -> Self {
         Self {
@@ -127,15 +118,9 @@ impl BackupTab {
         }
     }
 
-    pub fn show(
-        &mut self,
-        ui: &mut egui::Ui,
-        devices: &[DiskDevice],
-        log: &mut LogPanel,
-        progress: &mut ProgressState,
-    ) {
+    pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext, progress: &mut ProgressState) {
         // Poll background backup thread
-        self.poll_progress(log, progress);
+        self.poll_progress(ctx, progress);
 
         ui.heading("Backup Disk");
         ui.add_space(8.0);
@@ -149,7 +134,7 @@ impl BackupTab {
                 let current_label = if let Some(path) = &self.image_file_path {
                     format!("Image: {}", path.display())
                 } else if let Some(idx) = self.selected_device_idx {
-                    devices
+                    ctx.devices
                         .get(idx)
                         .map(|d| d.display_name())
                         .unwrap_or_else(|| "Unknown".into())
@@ -162,7 +147,7 @@ impl BackupTab {
                     .width(400.0)
                     .height(400.0) // Allow more items to be visible without scrolling
                     .show_ui(ui, |ui| {
-                        for (i, device) in devices.iter().enumerate() {
+                        for (i, device) in ctx.devices.iter().enumerate() {
                             if ui
                                 .selectable_value(
                                     &mut self.selected_device_idx,
@@ -172,7 +157,7 @@ impl BackupTab {
                                 .clicked()
                             {
                                 self.image_file_path = None;
-                                self.update_backup_name(devices);
+                                self.update_backup_name(ctx);
                             }
                         }
                         ui.separator();
@@ -193,7 +178,7 @@ impl BackupTab {
                             {
                                 self.selected_device_idx = None;
                                 self.image_file_path = Some(path);
-                                self.update_backup_name(devices);
+                                self.update_backup_name(ctx);
                             }
                         }
                     });
@@ -207,7 +192,7 @@ impl BackupTab {
             if source_changed {
                 self.prev_device_idx = self.selected_device_idx;
                 self.prev_image_path = self.image_file_path.clone();
-                self.load_partition_preview(devices, log);
+                self.load_partition_preview(ctx);
             }
         }
 
@@ -360,7 +345,7 @@ impl BackupTab {
         ui.add_space(16.0);
 
         // Poll VHD export thread
-        self.poll_vhd_export(log, progress);
+        self.poll_vhd_export(ctx, progress);
 
         // Action buttons
         let vhd_exporting = self.vhd_export_status.is_some();
@@ -382,12 +367,12 @@ impl BackupTab {
                     if self.compression_type == CompressionType::Vhd {
                         // Scan partitions if not already loaded
                         if self.source_partitions.is_empty() {
-                            self.scan_source_partitions(devices, log);
+                            self.scan_source_partitions(ctx);
                         }
                         self.init_vhd_configs();
                         self.vhd_popup_open = true;
                     } else {
-                        self.start_backup(devices, log);
+                        self.start_backup(ctx);
                     }
                 }
             } else {
@@ -402,14 +387,14 @@ impl BackupTab {
                             s.cancel_requested = true;
                         }
                     }
-                    log.warn("Cancellation requested...");
+                    ctx.log.warn("Cancellation requested...");
                 }
             }
         });
 
         // VHD backup popup
         if self.vhd_popup_open {
-            self.show_vhd_popup(ui, devices, log);
+            self.show_vhd_popup(ui, ctx);
         }
     }
 
@@ -437,7 +422,7 @@ impl BackupTab {
         }
     }
 
-    fn show_vhd_popup(&mut self, ui: &mut egui::Ui, devices: &[DiskDevice], log: &mut LogPanel) {
+    fn show_vhd_popup(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
         egui::Window::new("VHD Backup Options")
             .collapsible(false)
             .resizable(true)
@@ -528,10 +513,10 @@ impl BackupTab {
                     if ui.button("Start VHD Backup").clicked() {
                         self.vhd_popup_open = false;
                         if self.vhd_whole_disk {
-                            self.start_vhd_whole_disk(devices, log);
+                            self.start_vhd_whole_disk(ctx);
                         } else {
                             // Per-partition uses the normal backup flow
-                            self.start_backup(devices, log);
+                            self.start_backup(ctx);
                         }
                     }
                     if ui.button("Cancel").clicked() {
@@ -541,11 +526,11 @@ impl BackupTab {
             });
     }
 
-    fn start_vhd_whole_disk(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {
-        let source_path = match self.source_path(devices) {
+    fn start_vhd_whole_disk(&mut self, ctx: &mut TabContext) {
+        let source_path = match self.source_path(ctx) {
             Some(p) => p,
             None => {
-                log.error("No source selected");
+                ctx.log.error("No source selected");
                 return;
             }
         };
@@ -553,7 +538,7 @@ impl BackupTab {
         let dest_dir = match &self.destination_folder {
             Some(d) => d.clone(),
             None => {
-                log.error("No destination folder selected");
+                ctx.log.error("No destination folder selected");
                 return;
             }
         };
@@ -588,7 +573,7 @@ impl BackupTab {
         self.vhd_export_status = Some(Arc::clone(&status));
         self.backup_running = true;
 
-        log.info(format!(
+        ctx.log.info(format!(
             "Starting whole-disk VHD backup: {} -> {}",
             source_path.display(),
             dest_path.display()
@@ -624,7 +609,7 @@ impl BackupTab {
         });
     }
 
-    fn poll_vhd_export(&mut self, log: &mut LogPanel, progress_state: &mut ProgressState) {
+    fn poll_vhd_export(&mut self, ctx: &mut TabContext, progress_state: &mut ProgressState) {
         let status_arc = match &self.vhd_export_status {
             Some(s) => Arc::clone(s),
             None => return,
@@ -636,7 +621,7 @@ impl BackupTab {
 
         // Drain log messages
         for msg in status.log_messages.drain(..) {
-            log.info(msg);
+            ctx.log.info(msg);
         }
 
         // Update progress bar
@@ -648,9 +633,9 @@ impl BackupTab {
 
         if status.finished {
             if let Some(err) = &status.error {
-                log.error(format!("VHD backup failed: {err}"));
+                ctx.log.error(format!("VHD backup failed: {err}"));
             } else {
-                log.info("VHD backup completed successfully.");
+                ctx.log.info("VHD backup completed successfully.");
             }
             drop(status);
             self.vhd_export_status = None;
@@ -660,18 +645,19 @@ impl BackupTab {
 
     /// Scan source partition table and compute minimum partition sizes.
     /// For devices, this uses OS-level elevation (may prompt for credentials).
-    fn scan_source_partitions(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {
+    fn scan_source_partitions(&mut self, ctx: &mut TabContext) {
         self.source_partitions.clear();
         self.selected_partitions.clear();
         self.partition_min_sizes.clear();
         self.partition_load_error = None;
 
-        let path = match self.source_path(devices) {
+        let path = match self.source_path(ctx) {
             Some(p) => p,
             None => return,
         };
 
-        log.info(format!("Scanning partitions on {}...", path.display()));
+        ctx.log
+            .info(format!("Scanning partitions on {}...", path.display()));
 
         let path_str = path.to_string_lossy();
         let is_device = path_str.starts_with("/dev/") || path_str.starts_with("\\\\.\\");
@@ -694,7 +680,7 @@ impl BackupTab {
             Ok(f) => f,
             Err(msg) => {
                 self.partition_load_error = Some(msg.clone());
-                log.error(msg);
+                ctx.log.error(msg);
                 return;
             }
         };
@@ -719,7 +705,7 @@ impl BackupTab {
                 } else {
                     table.type_name().to_string()
                 };
-                log.info(format!(
+                ctx.log.info(format!(
                     "Found {} partition(s) ({})",
                     self.source_partitions.len(),
                     table_desc,
@@ -740,7 +726,7 @@ impl BackupTab {
                         ) {
                             let clamped = min_size.min(part.size_bytes);
                             self.partition_min_sizes.insert(part.index, clamped);
-                            log.info(format!(
+                            ctx.log.info(format!(
                                 "Partition {}: minimum size {} (original {})",
                                 part.index,
                                 partition::format_size(clamped),
@@ -752,17 +738,17 @@ impl BackupTab {
             }
             Err(e) => {
                 self.partition_load_error = Some(format!("Could not read partition table: {e}"));
-                log.error(format!("Partition scan failed: {e}"));
+                ctx.log.error(format!("Partition scan failed: {e}"));
             }
         }
     }
 
-    fn load_partition_preview(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {
+    fn load_partition_preview(&mut self, ctx: &mut TabContext) {
         self.source_partitions.clear();
         self.selected_partitions.clear();
         self.partition_load_error = None;
 
-        let path = match self.source_path(devices) {
+        let path = match self.source_path(ctx) {
             Some(p) => p,
             None => return,
         };
@@ -782,7 +768,7 @@ impl BackupTab {
                     {
                         Ok(format) => {
                             let desc = format.description();
-                            log.info(format!("Detected format: {}", desc));
+                            ctx.log.info(format!("Detected format: {}", desc));
                             match File::open(&path) {
                                 Ok(f2) => {
                                     match rusty_backup::rbformats::wrap_image_reader(f2, format) {
@@ -791,7 +777,7 @@ impl BackupTab {
                                         }
                                         Err(e) => {
                                             // Fallback to raw
-                                            log.warn(format!("Format wrap failed: {e}"));
+                                            ctx.log.warn(format!("Format wrap failed: {e}"));
                                             match File::open(&path) {
                                                 Ok(f3) => {
                                                     let mut r = BufReader::new(f3);
@@ -826,7 +812,7 @@ impl BackupTab {
                         } else {
                             table.type_name().to_string()
                         };
-                        log.info(format!(
+                        ctx.log.info(format!(
                             "Source has {} partition(s) ({})",
                             self.source_partitions.len(),
                             table_desc,
@@ -854,24 +840,26 @@ impl BackupTab {
         }
     }
 
-    fn source_path(&self, devices: &[DiskDevice]) -> Option<PathBuf> {
+    fn source_path(&self, ctx: &TabContext) -> Option<PathBuf> {
         if let Some(path) = &self.image_file_path {
             Some(path.clone())
         } else if let Some(idx) = self.selected_device_idx {
-            devices.get(idx).map(|d| d.path.clone())
+            ctx.devices.get(idx).map(|d| d.path.clone())
         } else {
             None
         }
     }
 
-    fn update_backup_name(&mut self, devices: &[DiskDevice]) {
-        let path = match self.source_path(devices) {
+    fn update_backup_name(&mut self, ctx: &TabContext) {
+        let path = match self.source_path(ctx) {
             Some(p) => p,
             None => return,
         };
 
         // Try to get device size and first volume label
-        let device = self.selected_device_idx.and_then(|idx| devices.get(idx));
+        let device = self
+            .selected_device_idx
+            .and_then(|idx| ctx.devices.get(idx));
 
         let size_bytes = device
             .map(|d| d.size_bytes)
@@ -886,11 +874,11 @@ impl BackupTab {
             rusty_backup::backup::format::generate_backup_name(&path, size_bytes, volume_label);
     }
 
-    fn start_backup(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {
-        let source_path = match self.source_path(devices) {
+    fn start_backup(&mut self, ctx: &mut TabContext) {
+        let source_path = match self.source_path(ctx) {
             Some(p) => p,
             None => {
-                log.error("No source selected");
+                ctx.log.error("No source selected");
                 return;
             }
         };
@@ -898,7 +886,7 @@ impl BackupTab {
         let destination_dir = match &self.destination_folder {
             Some(d) => d.clone(),
             None => {
-                log.error("No destination folder selected");
+                ctx.log.error("No destination folder selected");
                 return;
             }
         };
@@ -935,7 +923,7 @@ impl BackupTab {
         self.backup_progress = Some(Arc::clone(&progress_arc));
         self.backup_running = true;
 
-        log.info(format!(
+        ctx.log.info(format!(
             "Starting backup: {} -> {}",
             config.source_path.display(),
             config.destination_dir.join(&config.backup_name).display()
@@ -951,7 +939,7 @@ impl BackupTab {
         });
     }
 
-    fn poll_progress(&mut self, log: &mut LogPanel, progress_state: &mut ProgressState) {
+    fn poll_progress(&mut self, ctx: &mut TabContext, progress_state: &mut ProgressState) {
         let progress_arc = match &self.backup_progress {
             Some(p) => Arc::clone(p),
             None => return,
@@ -964,9 +952,9 @@ impl BackupTab {
         // Drain log messages
         while let Some(msg) = p.log_messages.pop_front() {
             match msg.level {
-                BackupLogLevel::Info => log.info(msg.message),
-                BackupLogLevel::Warning => log.warn(msg.message),
-                BackupLogLevel::Error => log.error(msg.message),
+                BackupLogLevel::Info => ctx.log.info(msg.message),
+                BackupLogLevel::Warning => ctx.log.warn(msg.message),
+                BackupLogLevel::Error => ctx.log.error(msg.message),
             }
         }
 
@@ -979,7 +967,7 @@ impl BackupTab {
 
         if p.finished {
             if let Some(err) = &p.error {
-                log.error(format!("Backup failed: {err}"));
+                ctx.log.error(format!("Backup failed: {err}"));
             }
             self.backup_running = false;
             self.backup_progress = None;
