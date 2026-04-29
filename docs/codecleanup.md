@@ -208,8 +208,8 @@ Conventions:
 
 ## 9. rbformats / partition / backup miscellany
 
-- [ ] **`rbformats/mod.rs` is 1712 lines and hosts cross-format orchestration**
-  - **Suggested action:** Split: keep format dispatch + `reconstruct_disk_from_backup` here, move shared compress/decompress helpers to `src/rbformats/compress.rs`.
+- [x] **`rbformats/mod.rs` split — compress/decompress dispatch extracted.**
+  - **Done:** New `src/rbformats/compress.rs` (658 lines) owns `compress_partition`, `decompress_to_writer`, `decompress_partition_to_file`, `compress_file_to_archive`, plus the small shared helpers (`write_zeros`, `write_zeros_with_progress`, `is_all_zeros`, `output_path`, `file_name`, `SplitWriter`, `CHUNK_SIZE`). All eight tests covering these moved with them. mod.rs re-exports the public/`pub(crate)` items at the top of the file so existing call sites (`crate::rbformats::write_zeros`, `super::CHUNK_SIZE` from sibling format modules, etc.) continue to compile unchanged. mod.rs: 1703 → 1067 (−636); now hosts only `reconstruct_disk_from_backup`, `reconstruct_raw_apm_disk`, `detect_raw_apm`, image format detection (`ImageFormat`/`detect_image_format*`/`wrap_image_reader`/`SectionReader`), and the APM round-trip test.
 
 - [x] ~~VHD export and `reconstruct_disk_from_backup` share scaffolding~~ — already shared.
   - **Evidence:** `src/rbformats/vhd.rs:8` imports `reconstruct_disk_from_backup, write_zeros, CHUNK_SIZE` from the parent module. All zero-fill and gap-handling in vhd.rs goes through `super::write_zeros`. No duplication to factor out.

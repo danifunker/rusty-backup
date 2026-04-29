@@ -1022,8 +1022,8 @@ pub fn export_clonezilla_partition_vhd(
 
 #[cfg(test)]
 mod tests {
-    use super::super::CompressionType;
     use super::*;
+    use crate::backup::CompressionType;
     use std::io::Cursor;
     use tempfile::TempDir;
 
