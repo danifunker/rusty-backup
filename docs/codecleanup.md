@@ -214,8 +214,9 @@ Conventions:
 - [x] ~~VHD export and `reconstruct_disk_from_backup` share scaffolding~~ — already shared.
   - **Evidence:** `src/rbformats/vhd.rs:8` imports `reconstruct_disk_from_backup, write_zeros, CHUNK_SIZE` from the parent module. All zero-fill and gap-handling in vhd.rs goes through `super::write_zeros`. No duplication to factor out.
 
-- [ ] **`partition/mod.rs` (935) vs `partition/mbr.rs` (880) vs `partition/gpt.rs` (943) vs `partition/apm.rs` (554)**
-  - **Suggested action:** Audit `partition/mod.rs` for orchestration that should live elsewhere (alignment helpers belong in their own module; size override structs may belong in `restore`).
+- [x] **`partition/mod.rs` audit — alignment helpers extracted; size-override stays put.**
+  - **Done:** New `src/partition/alignment.rs` (271 lines) owns `AlignmentType`, `PartitionAlignment`, `detect_alignment`, plus the private CHS / GCD helpers (`extract_chs_geometry`, `check_cylinder_alignment`, `gcd_of_starts`, `gcd`) and the four alignment tests. mod.rs re-exports the three public items (`AlignmentType`, `PartitionAlignment`, `detect_alignment`) so existing call sites compile unchanged. mod.rs: 935 → 709 lines (−226).
+  - **Decision (size-override):** `PartitionSizeOverride` stays in `partition/mod.rs`. The audit's "may belong in `restore`" was wrong — the struct is consumed by `partition/mbr.rs::patch_mbr_entries`, `partition/apm.rs`, AND `partition/gpt.rs::patch_for_restore`, plus the VHD-export path (which is a backup operation, not restore). Moving it to `restore/` would force `partition/` to depend on `restore/`, the wrong dependency direction.
 
 - [ ] **`backup/mod.rs` is 1064 lines — orchestration + size accounting + checksum logic**
   - **Suggested action:** Pull the size-accounting helpers (`effective_sizes`, `stream_sizes`, etc., per `MEMORY.md`) into `backup/sizes.rs`.

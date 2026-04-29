@@ -941,7 +941,6 @@ impl<R: Read + Seek> Seek for SectionReader<R> {
 mod tests {
     use super::*;
     use std::io::Cursor;
-    use tempfile::TempDir;
 
     /// Build a minimal APM + classic HFS raw disk image for round-trip testing:
     /// block 0 = DDR, blocks 1-2 = APM (self-map + HFS), blocks 3+ = HFS data.
