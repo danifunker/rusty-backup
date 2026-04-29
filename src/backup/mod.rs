@@ -1,5 +1,6 @@
 pub mod format;
 pub mod metadata;
+mod sizes;
 pub mod verify;
 
 use std::collections::VecDeque;
@@ -378,194 +379,19 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
     let mut partition_metadata = Vec::new();
     let mut overall_bytes_done: u64 = 0;
 
-    // Pre-compute effective sizes for each partition.
-    // compact_sizes[i] is Some(compacted_size) if compaction is available for
-    // partition i, or None if we should fall back to trimming.
-    // minimum_sizes[i] is the true filesystem minimum (last_data_byte result),
-    // stored in metadata so the UI can offer shrink-to-minimum restore.
-    // effective_sizes[i] = actual bytes we will write to the backup stream.
-    //   For packed readers (FAT/NTFS/exFAT): = compacted_size (already optimal).
-    //   For layout-preserving readers (HFS/HFS+/ext/btrfs): = minimum_size (trimmed
-    //   to last-used-block; free tail is skipped).
-    //   For non-compact partitions: = effective_partition_size (trim-based).
-    //
-    // stream_sizes[i] = same as effective_sizes[i]; kept as a separate name to
-    //   match the progress-tracking variable naming used in the backup loop.
-    //
-    // is_layout_preserving_flags[i] = true if the compact reader for partition i
-    //   emits free blocks as zeros (HFS/HFS+/ext/btrfs).  Tracked separately because
-    //   after stream trimming both effective_size and stream_size equal minimum, so
-    //   we can no longer infer LP status from stream_size > image_size.
-    let mut effective_sizes: Vec<u64> = Vec::with_capacity(partitions.len());
-    let mut stream_sizes: Vec<u64> = Vec::with_capacity(partitions.len());
-    let mut compact_sizes: Vec<Option<u64>> = Vec::with_capacity(partitions.len());
-    let mut minimum_sizes: Vec<Option<u64>> = Vec::with_capacity(partitions.len());
-    let mut is_layout_preserving_flags: Vec<bool> = Vec::with_capacity(partitions.len());
-
-    for part in partitions.iter() {
-        log(
-            &progress,
-            LogLevel::Info,
-            format!(
-                "Analyzing partition-{}: {} at LBA {}",
-                part.index, part.type_name, part.start_lba
-            ),
-        );
-        // Skip GPT protective partitions (0xEE) — not a real partition.
-        if part.partition_type_byte == 0xEE {
-            effective_sizes.push(0);
-            stream_sizes.push(0);
-            compact_sizes.push(None);
-            minimum_sizes.push(None);
-            is_layout_preserving_flags.push(false);
-            continue;
-        }
-        if config.sector_by_sector || part.is_extended_container || is_superfloppy {
-            effective_sizes.push(part.size_bytes);
-            stream_sizes.push(part.size_bytes);
-            compact_sizes.push(None);
-            minimum_sizes.push(None);
-            is_layout_preserving_flags.push(false);
-            continue;
-        }
-
-        // Try compaction first
-        log(
-            &progress,
-            LogLevel::Info,
-            format!("Attempting compaction for partition-{}...", part.index),
-        );
-        let part_offset = part.start_lba * 512;
-        let clone_result = source.get_ref().try_clone();
-        if let Err(ref e) = clone_result {
-            log(
-                &progress,
-                LogLevel::Warning,
-                format!(
-                    "Failed to clone file handle for partition-{}: {}",
-                    part.index, e
-                ),
-            );
-        }
-        let compact_result = match clone_result {
-            Err(_) => None, // already warned above
-            Ok(clone) => {
-                match fs::try_compact_partition_reader(
-                    BufReader::new(clone),
-                    part_offset,
-                    part.partition_type_byte,
-                    part.partition_type_string.as_deref(),
-                ) {
-                    Ok((_, result)) => {
-                        log(
-                            &progress,
-                            LogLevel::Info,
-                            format!(
-                                "Compact analysis (partition-{}): {} allocated clusters, \
-                                 data={} stream={} original={} mode={}",
-                                part.index,
-                                result.clusters_used,
-                                partition::format_size(result.data_size),
-                                partition::format_size(result.compacted_size),
-                                partition::format_size(result.original_size),
-                                if result.compacted_size == result.original_size {
-                                    "layout-preserving (free blocks -> zeros)"
-                                } else {
-                                    "packed"
-                                },
-                            ),
-                        );
-                        Some(result)
-                    }
-                    Err(ref msg) if msg.starts_with("unsupported:") => {
-                        log(
-                            &progress,
-                            LogLevel::Info,
-                            format!(
-                                "Compact reader not available for partition-{} ({}): {msg}",
-                                part.index, part.type_name,
-                            ),
-                        );
-                        None
-                    }
-                    Err(ref msg) => {
-                        log(
-                            &progress,
-                            LogLevel::Warning,
-                            format!(
-                                "Compact reader failed for partition-{} ({}): {msg}",
-                                part.index, part.type_name,
-                            ),
-                        );
-                        None
-                    }
-                }
-            }
-        };
-
-        if let Some(ref result) = compact_result {
-            // LP = layout-preserving: free blocks emitted as zeros, compacted_size == original_size.
-            // Packed: allocated clusters packed contiguously, compacted_size < original_size.
-            let is_lp = result.compacted_size == result.original_size;
-            compact_sizes.push(Some(result.compacted_size));
-            is_layout_preserving_flags.push(is_lp);
-
-            // Minimum partition size:
-            // - Packed (FAT/NTFS/exFAT): data_size is the tightest possible image.
-            // - LP (HFS/HFS+/ext/btrfs): must ask the filesystem for the last-used-block
-            //   position via effective_partition_size / last_data_byte.
-            let minimum = if !is_lp && result.data_size < part.size_bytes {
-                Some(result.data_size)
-            } else {
-                source
-                    .get_ref()
-                    .try_clone()
-                    .ok()
-                    .and_then(|clone| {
-                        fs::effective_partition_size(
-                            BufReader::new(clone),
-                            part_offset,
-                            part.partition_type_byte,
-                            part.partition_type_string.as_deref(),
-                        )
-                    })
-                    .map(|min| min.min(part.size_bytes))
-            };
-            minimum_sizes.push(minimum);
-
-            // For LP readers: trim the stream to minimum so the free tail is not
-            // processed through the compressor.  For packed readers: stream_size ==
-            // compacted_size (already optimal, no trimming needed).
-            let stream = if is_lp {
-                minimum.unwrap_or(result.compacted_size)
-            } else {
-                result.compacted_size
-            };
-            effective_sizes.push(stream);
-            stream_sizes.push(stream);
-        } else {
-            // Fall back to trim-based sizing
-            let effective = source
-                .get_ref()
-                .try_clone()
-                .ok()
-                .and_then(|clone| {
-                    fs::effective_partition_size(
-                        BufReader::new(clone),
-                        part_offset,
-                        part.partition_type_byte,
-                        part.partition_type_string.as_deref(),
-                    )
-                })
-                .map(|data_end| data_end.min(part.size_bytes));
-            let sz = effective.unwrap_or(part.size_bytes);
-            effective_sizes.push(sz);
-            stream_sizes.push(sz);
-            compact_sizes.push(None);
-            minimum_sizes.push(effective);
-            is_layout_preserving_flags.push(false);
-        }
-    }
+    let sizes::PartitionSizing {
+        effective_sizes,
+        stream_sizes,
+        compact_sizes,
+        minimum_sizes,
+        is_layout_preserving_flags,
+    } = sizes::analyze_partitions(
+        source.get_ref(),
+        &partitions,
+        config.sector_by_sector,
+        is_superfloppy,
+        &progress,
+    );
 
     // Export mbr-min.bin for MBR tables: a copy of the MBR with each
     // partition's total_sectors reduced to the effective (imaged) size.
@@ -605,42 +431,16 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         }
     }
 
-    // Helper closure: returns true if a partition should be included in the backup.
-    let should_include = |p: &partition::PartitionInfo| -> bool {
-        if p.is_extended_container {
-            return false;
-        }
-        if let Some(ref filter) = config.partition_filter {
-            return filter.contains(&p.index);
-        }
-        true
-    };
-
-    // total_display_bytes: logical data bytes to image (excludes zero-filled free blocks
-    //   in layout-preserving readers). Used for the smart-sizing log message and
-    //   imaged_size_bytes metadata.
-    let total_display_bytes: u64 = partitions
-        .iter()
-        .zip(&effective_sizes)
-        .filter(|(p, _)| should_include(p))
-        .map(|(_, &sz)| sz)
-        .sum();
-
-    // total_stream_bytes: actual bytes that will flow through the compressor
-    //   (includes zero-fill for free blocks in layout-preserving readers).
-    //   Used for accurate progress-bar tracking.
-    let total_stream_bytes: u64 = partitions
-        .iter()
-        .zip(&stream_sizes)
-        .filter(|(p, _)| should_include(p))
-        .map(|(_, &sz)| sz)
-        .sum();
-
-    let full_partition_bytes: u64 = partitions
-        .iter()
-        .filter(|p| should_include(p))
-        .map(|p| p.size_bytes)
-        .sum();
+    let sizes::BackupTotals {
+        total_display_bytes,
+        total_stream_bytes,
+        full_partition_bytes,
+    } = sizes::compute_totals(
+        &partitions,
+        &effective_sizes,
+        &stream_sizes,
+        config.partition_filter.as_deref(),
+    );
 
     if let Ok(mut p) = progress.lock() {
         p.total_bytes = total_stream_bytes;

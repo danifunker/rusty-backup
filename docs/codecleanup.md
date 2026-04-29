@@ -218,8 +218,8 @@ Conventions:
   - **Done:** New `src/partition/alignment.rs` (271 lines) owns `AlignmentType`, `PartitionAlignment`, `detect_alignment`, plus the private CHS / GCD helpers (`extract_chs_geometry`, `check_cylinder_alignment`, `gcd_of_starts`, `gcd`) and the four alignment tests. mod.rs re-exports the three public items (`AlignmentType`, `PartitionAlignment`, `detect_alignment`) so existing call sites compile unchanged. mod.rs: 935 → 709 lines (−226).
   - **Decision (size-override):** `PartitionSizeOverride` stays in `partition/mod.rs`. The audit's "may belong in `restore`" was wrong — the struct is consumed by `partition/mbr.rs::patch_mbr_entries`, `partition/apm.rs`, AND `partition/gpt.rs::patch_for_restore`, plus the VHD-export path (which is a backup operation, not restore). Moving it to `restore/` would force `partition/` to depend on `restore/`, the wrong dependency direction.
 
-- [ ] **`backup/mod.rs` is 1064 lines — orchestration + size accounting + checksum logic**
-  - **Suggested action:** Pull the size-accounting helpers (`effective_sizes`, `stream_sizes`, etc., per `MEMORY.md`) into `backup/sizes.rs`.
+- [x] **`backup/mod.rs` size-accounting split.**
+  - **Done:** New `src/backup/sizes.rs` (264 lines) owns `PartitionSizing`, `analyze_partitions` (per-partition compaction probe + size selection), `BackupTotals`, `compute_totals`, and `should_include`. `run_backup` now calls `sizes::analyze_partitions` and `sizes::compute_totals` instead of inlining the parallel-vector loop and totals folds. mod.rs: 1064 → 864 lines (−200). Checksum logic stays in `verify.rs`; the remaining bulk in `run_backup` is the per-partition stream-and-write loop, which is genuine orchestration and doesn't decompose cleanly.
 
 ---
 
