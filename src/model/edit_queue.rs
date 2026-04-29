@@ -17,7 +17,7 @@ use crate::fs::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, FilesystemError,
     ResourceForkSource,
 };
-use crate::fs::resource_fork;
+use crate::fs::resource_fork::{self, ImportedResourceFork};
 
 /// A single edit operation queued by the GUI, applied later against an
 /// editable filesystem in insertion order.
@@ -191,5 +191,283 @@ pub fn apply_edit(
             &String::from_utf8_lossy(type_code),
             &String::from_utf8_lossy(creator_code),
         ),
+    }
+}
+
+/// Net free-space impact of a staged batch.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SpaceDelta {
+    /// Bytes that will be consumed once `AddFile` edits run.
+    pub added: u64,
+    /// Bytes that will be reclaimed once `Delete*` edits run.
+    pub freed: u64,
+}
+
+/// Staged-edit queue with the predicates and mutations the GUI needs while the
+/// user is staging changes. The queue is "dumb" — applying edits is still done
+/// via [`apply_edit`]; this type only owns the list and answers questions
+/// about it.
+#[derive(Debug, Default)]
+pub struct EditQueue {
+    edits: Vec<StagedEdit>,
+}
+
+impl EditQueue {
+    pub fn new() -> Self {
+        Self { edits: Vec::new() }
+    }
+
+    pub fn len(&self) -> usize {
+        self.edits.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.edits.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.edits.clear();
+    }
+
+    pub fn push(&mut self, edit: StagedEdit) {
+        self.edits.push(edit);
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, StagedEdit> {
+        self.edits.iter()
+    }
+
+    pub fn drain(&mut self) -> std::vec::Drain<'_, StagedEdit> {
+        self.edits.drain(..)
+    }
+
+    /// Full path for an `AddFile` / `CreateDirectory` edit, anchored at root.
+    fn pending_path(parent_path: &str, name: &str) -> String {
+        if parent_path == "/" {
+            format!("/{name}")
+        } else {
+            format!("{parent_path}/{name}")
+        }
+    }
+
+    /// True if any `Delete*` edit targets `entry_path`.
+    pub fn is_pending_delete(&self, entry_path: &str) -> bool {
+        self.edits.iter().any(|edit| match edit {
+            StagedEdit::DeleteEntry { entry: e, .. }
+            | StagedEdit::DeleteRecursive { entry: e, .. } => e.path == entry_path,
+            _ => false,
+        })
+    }
+
+    /// True if `entry_path` is a pending add (file or directory).
+    pub fn is_pending_add(&self, entry_path: &str) -> bool {
+        self.edits.iter().any(|edit| match edit {
+            StagedEdit::AddFile { parent, name, .. }
+            | StagedEdit::CreateDirectory { parent, name, .. } => {
+                Self::pending_path(&parent.path, name) == entry_path
+            }
+            _ => false,
+        })
+    }
+
+    /// Synthesize `FileEntry`s for pending adds whose parent is `parent_path`.
+    pub fn pending_adds_for(&self, parent_path: &str) -> Vec<FileEntry> {
+        self.edits
+            .iter()
+            .filter_map(|edit| match edit {
+                StagedEdit::AddFile {
+                    parent, name, size, ..
+                } if parent.path == parent_path => {
+                    let path = Self::pending_path(&parent.path, name);
+                    Some(FileEntry::new_file(name.clone(), path, *size, 0))
+                }
+                StagedEdit::CreateDirectory { parent, name, .. } if parent.path == parent_path => {
+                    let path = Self::pending_path(&parent.path, name);
+                    Some(FileEntry::new_directory(name.clone(), path, 0))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Remove the `AddFile` / `CreateDirectory` edit at `entry_path`. Returns
+    /// `true` if a matching edit was removed.
+    pub fn remove_pending_add(&mut self, entry_path: &str) -> bool {
+        let before = self.edits.len();
+        self.edits.retain(|edit| match edit {
+            StagedEdit::AddFile { parent, name, .. }
+            | StagedEdit::CreateDirectory { parent, name, .. } => {
+                Self::pending_path(&parent.path, name) != entry_path
+            }
+            _ => true,
+        });
+        self.edits.len() < before
+    }
+
+    /// Imported resource fork attached to the pending `AddFile` at `entry_path`.
+    pub fn pending_resource_fork_for(&self, entry_path: &str) -> Option<&ImportedResourceFork> {
+        self.edits.iter().find_map(|edit| match edit {
+            StagedEdit::AddFile {
+                parent,
+                name,
+                resource_fork: Some(imp),
+                ..
+            } if Self::pending_path(&parent.path, name) == entry_path => Some(imp),
+            _ => None,
+        })
+    }
+
+    /// Net space impact of the staged batch.
+    pub fn space_delta(&self) -> SpaceDelta {
+        let mut delta = SpaceDelta::default();
+        for edit in &self.edits {
+            match edit {
+                StagedEdit::AddFile { size, .. } => delta.added += size,
+                StagedEdit::DeleteEntry { entry, .. }
+                | StagedEdit::DeleteRecursive { entry, .. } => {
+                    if !entry.is_directory() {
+                        delta.freed += entry.size;
+                    }
+                }
+                _ => {}
+            }
+        }
+        delta
+    }
+
+    /// Resolve the effective HFS/HFS+ type/creator codes for `entry`,
+    /// considering pending overrides, imported AppleDouble FInfo, on-disk
+    /// catalog values, and the extension dictionary. Returns `[0;4]` for
+    /// either half if nothing is known.
+    pub fn resolved_hfs_type_creator(&self, entry: &FileEntry) -> ([u8; 4], [u8; 4]) {
+        for edit in &self.edits {
+            if let StagedEdit::AddFile {
+                parent,
+                name,
+                resource_fork,
+                hfs_type_override,
+                hfs_creator_override,
+                ..
+            } = edit
+            {
+                if Self::pending_path(&parent.path, name) != entry.path {
+                    continue;
+                }
+                let imp_t = resource_fork.as_ref().and_then(|i| i.type_code);
+                let imp_c = resource_fork.as_ref().and_then(|i| i.creator_code);
+                let dict = crate::fs::hfs_common::type_creator_for_extension(
+                    name.rsplit('.').next().unwrap_or(""),
+                );
+                let t = hfs_type_override
+                    .or(imp_t)
+                    .or(dict.map(|(t, _)| t))
+                    .unwrap_or([0; 4]);
+                let c = hfs_creator_override
+                    .or(imp_c)
+                    .or(dict.map(|(_, c)| c))
+                    .unwrap_or([0; 4]);
+                return (t, c);
+            }
+        }
+        let t = entry
+            .type_code
+            .as_deref()
+            .map(crate::fs::hfs_common::encode_fourcc)
+            .unwrap_or([0; 4]);
+        let c = entry
+            .creator_code
+            .as_deref()
+            .map(crate::fs::hfs_common::encode_fourcc)
+            .unwrap_or([0; 4]);
+        (t, c)
+    }
+
+    /// Set the per-entry HFS type/creator override on a pending `AddFile`.
+    /// Returns `true` if an entry at `entry_path` was found.
+    pub fn set_pending_hfs_override(
+        &mut self,
+        entry_path: &str,
+        type_code: [u8; 4],
+        creator_code: [u8; 4],
+    ) -> bool {
+        for edit in self.edits.iter_mut() {
+            if let StagedEdit::AddFile {
+                parent,
+                name,
+                hfs_type_override,
+                hfs_creator_override,
+                ..
+            } = edit
+            {
+                if Self::pending_path(&parent.path, name) == entry_path {
+                    *hfs_type_override = Some(type_code);
+                    *hfs_creator_override = Some(creator_code);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Set the per-entry ProDOS type/aux override on a pending `AddFile`.
+    /// Returns `true` if an entry at `entry_path` was found.
+    pub fn set_pending_prodos_override(
+        &mut self,
+        entry_path: &str,
+        type_byte: u8,
+        aux_type: u16,
+    ) -> bool {
+        for edit in self.edits.iter_mut() {
+            if let StagedEdit::AddFile {
+                parent,
+                name,
+                prodos_type,
+                prodos_aux,
+                ..
+            } = edit
+            {
+                if Self::pending_path(&parent.path, name) == entry_path {
+                    *prodos_type = Some(type_byte);
+                    *prodos_aux = Some(aux_type);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Push a `SetProdosType` edit, replacing any prior one targeting the
+    /// same on-disk path.
+    pub fn replace_set_prodos_type(&mut self, entry: &FileEntry, type_byte: u8, aux_type: u16) {
+        let path = entry.path.clone();
+        self.edits.retain(|e| match e {
+            StagedEdit::SetProdosType { entry: e2, .. } => e2.path != path,
+            _ => true,
+        });
+        self.edits.push(StagedEdit::SetProdosType {
+            entry: entry.clone(),
+            type_byte,
+            aux_type,
+        });
+    }
+
+    /// Push a `SetTypeCreator` edit, replacing any prior one targeting the
+    /// same on-disk path.
+    pub fn replace_set_type_creator(
+        &mut self,
+        entry: &FileEntry,
+        type_code: [u8; 4],
+        creator_code: [u8; 4],
+    ) {
+        let path = entry.path.clone();
+        self.edits.retain(|e| match e {
+            StagedEdit::SetTypeCreator { entry: e2, .. } => e2.path != path,
+            _ => true,
+        });
+        self.edits.push(StagedEdit::SetTypeCreator {
+            entry: entry.clone(),
+            type_code,
+            creator_code,
+        });
     }
 }

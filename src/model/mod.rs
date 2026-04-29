@@ -5,5 +5,7 @@
 
 pub mod archive_edit;
 pub mod backup_loader;
+pub mod browse_session;
 pub mod edit_queue;
 pub mod fsck_runner;
+pub mod partition_editor;
