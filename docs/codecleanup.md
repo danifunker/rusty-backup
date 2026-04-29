@@ -166,7 +166,9 @@ Conventions:
 ### ext (`src/fs/ext.rs`, 5289 — largest single FS file)
 - [x] ~~Inode handling overlaps with `unix_common/inode.rs`. Promote shared code there.~~ — already done.
   - **Evidence:** `src/fs/ext.rs:17–21` imports from `unix_common::bitmap`, `unix_common::compact`, and `unix_common::inode` (`unix_entry_from_inode`, `unix_file_type`, `UnixFileType`). The shared inode helpers live in `unix_common/inode.rs` (412 lines) and ext is the active consumer.
-- [ ] Consider splitting per-revision code (ext2 vs ext3 vs ext4) into submodules under `src/fs/ext/`.
+- [x] ~~Consider splitting per-revision code (ext2 vs ext3 vs ext4) into submodules under `src/fs/ext/`.~~ — misframed; closed.
+  - **Evidence:** ext2/3/4 are not separate codebases — they're feature bits on the same superblock (`has_extents`, `has_journal`, `is_64bit`). Per-version branches in `ext.rs` total 9 small `if self.has_extents`/`if self.is_64bit` checks; there's no per-revision code worth isolating. `ExtVersion` is just a display label.
+  - **The real split available** is functional (read / edit / resize / validate / extent helpers) — viable but not a priority right now. Logged for future consideration if `ext.rs` grows further.
 - [x] ~~Walk for any `eprintln!` debug calls; route through `log` crate.~~ — already clean.
   - **Evidence:** zero `eprintln!` instances in `src/fs/ext.rs` (also zero in `ntfs.rs` and `btrfs.rs`).
 
