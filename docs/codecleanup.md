@@ -191,7 +191,8 @@ Conventions:
 - [x] ~~Migrate to `btree_split_leaf_with_insert` (§1).~~ — done.
   - **Evidence:** `src/fs/hfsplus.rs:13` imports `btree_split_leaf_with_insert` and line 782 calls it during catalog inserts.
 - [x] Dead-code sweep done: `clump_size` documented and kept; the other two were false positives.
-- [ ] Currently lacks the editable surface HFS gained — confirm it's intentionally read-only or queue an edit-mode track.
+- [x] ~~Currently lacks the editable surface HFS gained — confirm it's intentionally read-only or queue an edit-mode track.~~ — not a refactor; logged as a missing feature.
+  - **Decision:** HFS+ editable surface is a real product gap, but it's a feature add (1500–2500 lines mirroring the HFS edit-mode work in `docs/hfs_write_tweaks.md`), not cleanup. Tracked in [`TODO_missing_features.md`](TODO_missing_features.md) under "HFS+ — editable surface".
 
 ### btrfs (`src/fs/btrfs.rs`, 1864)
 - [x] ~~Mostly skeleton; when extending, lean on `unix_common/` for inode/bitmap.~~ — already does.
