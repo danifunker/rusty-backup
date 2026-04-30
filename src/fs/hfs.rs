@@ -1030,6 +1030,67 @@ impl<R: Read + Seek> HfsFilesystem<R> {
     /// fragmented past the inline limit.
     ///
     /// `fork_type`: `0x00` for the data fork, `0xFF` for the resource fork.
+    /// Stream fork data (inline + extents-overflow) to a writer.
+    fn write_fork_with_overflow_to(
+        &mut self,
+        file_id: u32,
+        fork_type: u8,
+        inline: &[HfsExtDescriptor; 3],
+        size: u64,
+        writer: &mut dyn std::io::Write,
+    ) -> Result<u64, FilesystemError> {
+        let mut written = write_fork_data_to(
+            &mut self.reader,
+            self.partition_offset,
+            &self.mdb,
+            inline,
+            writer,
+            size,
+        )?;
+        if written >= size {
+            return Ok(written);
+        }
+        self.ensure_extents_overflow()?;
+        let Some(ext_data) = self.extents_overflow_data.as_ref() else {
+            return Err(FilesystemError::InvalidData(format!(
+                "file {file_id} fork {fork_type:#x}: {size} bytes requested but only {written} \
+                 bytes in inline extents and no extents-overflow B-tree present",
+            )));
+        };
+        let inline_blocks: u32 = inline.iter().map(|e| e.block_count as u32).sum();
+        let overflow = collect_fork_overflow_extents(ext_data, file_id, fork_type, inline_blocks);
+        let block_size = self.mdb.block_size as u64;
+        let first_alloc_offset = self.partition_offset + self.mdb.first_alloc_block as u64 * 512;
+        let mut buf = vec![0u8; 64 * 1024];
+        for ext in overflow {
+            if written >= size {
+                break;
+            }
+            if ext.block_count == 0 {
+                continue;
+            }
+            let offset = first_alloc_offset + ext.start_block as u64 * block_size;
+            let extent_len = ext.block_count as u64 * block_size;
+            let to_emit = extent_len.min(size - written);
+            self.reader.seek(SeekFrom::Start(offset))?;
+            let mut left = to_emit;
+            while left > 0 {
+                let n = (buf.len() as u64).min(left) as usize;
+                self.reader.read_exact(&mut buf[..n])?;
+                writer.write_all(&buf[..n])?;
+                left -= n as u64;
+            }
+            written += to_emit;
+        }
+        if written < size {
+            return Err(FilesystemError::InvalidData(format!(
+                "file {file_id} fork {fork_type:#x}: extents (inline + overflow) cover \
+                 {written} of {size} bytes",
+            )));
+        }
+        Ok(written)
+    }
+
     fn read_fork_with_overflow(
         &mut self,
         file_id: u32,
@@ -2316,6 +2377,22 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
         Ok(data)
     }
 
+    fn write_file_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn std::io::Write,
+    ) -> Result<u64, FilesystemError> {
+        if entry.is_directory() {
+            return Err(FilesystemError::NotADirectory(entry.path.clone()));
+        }
+        let file_id = entry.location as u32;
+        let (data_size, extents, _rsrc_size, _rsrc_extents) =
+            self.find_file_by_id(file_id).ok_or_else(|| {
+                FilesystemError::NotFound(format!("file id {file_id} not found in catalog"))
+            })?;
+        self.write_fork_with_overflow_to(file_id, 0x00, &extents, data_size as u64, writer)
+    }
+
     fn volume_label(&self) -> Option<&str> {
         if self.mdb.volume_name.is_empty() {
             None
@@ -2947,6 +3024,39 @@ fn read_fork_data<R: Read + Seek>(
 
     data.truncate(size as usize);
     Ok(data)
+}
+
+/// Stream fork data through inline extents to a writer. Returns bytes written.
+fn write_fork_data_to<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    mdb: &HfsMasterDirectoryBlock,
+    extents: &[HfsExtDescriptor; 3],
+    writer: &mut dyn std::io::Write,
+    size: u64,
+) -> Result<u64, FilesystemError> {
+    let first_alloc_offset = partition_offset + mdb.first_alloc_block as u64 * 512;
+    let mut written: u64 = 0;
+    let mut buf = vec![0u8; 64 * 1024];
+
+    for ext in extents {
+        if ext.block_count == 0 || written >= size {
+            break;
+        }
+        let offset = first_alloc_offset + ext.start_block as u64 * mdb.block_size as u64;
+        let extent_len = ext.block_count as u64 * mdb.block_size as u64;
+        let to_emit = extent_len.min(size - written);
+        reader.seek(SeekFrom::Start(offset))?;
+        let mut left = to_emit;
+        while left > 0 {
+            let n = (buf.len() as u64).min(left) as usize;
+            reader.read_exact(&mut buf[..n])?;
+            writer.write_all(&buf[..n])?;
+            left -= n as u64;
+        }
+        written += to_emit;
+    }
+    Ok(written)
 }
 
 /// Write fork data to disk through extent descriptors.

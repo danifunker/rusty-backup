@@ -364,6 +364,49 @@ impl<R: Read + Seek> FatFilesystem<R> {
     }
 
     /// Follow the cluster chain and read all cluster data.
+    /// Stream a cluster chain to a writer up to `max_bytes`, returning bytes
+    /// written. Avoids the full-file allocation in `read_cluster_chain`; used
+    /// by the streaming `write_file_to` override.
+    fn write_cluster_chain_to(
+        &mut self,
+        start_cluster: u32,
+        writer: &mut dyn std::io::Write,
+        max_bytes: u64,
+    ) -> Result<u64, FilesystemError> {
+        let cluster_size = self.cluster_size() as usize;
+        let mut written: u64 = 0;
+        let mut cluster = start_cluster;
+        let mut count = 0u32;
+        let mut buf = vec![0u8; cluster_size];
+
+        loop {
+            if cluster < 2 || count > self.total_clusters as u32 || written >= max_bytes {
+                break;
+            }
+            let offset = self.cluster_offset(cluster);
+            self.reader.seek(SeekFrom::Start(offset))?;
+            match self.reader.read(&mut buf) {
+                Ok(n) if n > 0 => {
+                    let remaining = max_bytes - written;
+                    let to_write = (n as u64).min(remaining) as usize;
+                    writer.write_all(&buf[..to_write])?;
+                    written += to_write as u64;
+                    if n < cluster_size {
+                        break;
+                    }
+                }
+                Ok(_) => break,
+                Err(e) => return Err(e.into()),
+            }
+            count += 1;
+            match self.next_cluster(cluster)? {
+                Some(next) => cluster = next,
+                None => break,
+            }
+        }
+        Ok(written)
+    }
+
     fn read_cluster_chain(&mut self, start_cluster: u32) -> Result<Vec<u8>, FilesystemError> {
         let cluster_size = self.cluster_size() as usize;
         let mut data = Vec::new();
@@ -617,6 +660,20 @@ impl<R: Read + Seek + Send> Filesystem for FatFilesystem<R> {
         let data = self.read_cluster_chain(entry.location as u32)?;
         let actual_size = (entry.size as usize).min(data.len()).min(max_bytes);
         Ok(data[..actual_size].to_vec())
+    }
+
+    fn write_file_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn std::io::Write,
+    ) -> Result<u64, FilesystemError> {
+        if entry.is_directory() {
+            return Err(FilesystemError::NotADirectory(entry.path.clone()));
+        }
+        if entry.location < 2 {
+            return Ok(0);
+        }
+        self.write_cluster_chain_to(entry.location as u32, writer, entry.size)
     }
 
     fn volume_label(&self) -> Option<&str> {
@@ -3549,6 +3606,12 @@ mod tests {
         // Read file back
         let data = fs.read_file(&entries[0], usize::MAX).unwrap();
         assert_eq!(&data, test_data);
+
+        // write_file_to streams the same bytes (no full-file allocation).
+        let mut streamed: Vec<u8> = Vec::new();
+        let n = fs.write_file_to(&entries[0], &mut streamed).unwrap();
+        assert_eq!(n as usize, test_data.len());
+        assert_eq!(&streamed, test_data);
     }
 
     #[test]

@@ -572,6 +572,113 @@ impl<R: Read + Seek + Send> BtrfsFilesystem<R> {
     // ---- File data reading ----
 
     /// Read file data by collecting EXTENT_DATA items.
+    /// Stream file data to a writer up to `max_bytes`. Mirrors `read_file_data`
+    /// but emits extent-by-extent instead of allocating the full buffer.
+    fn write_file_data_to(
+        &mut self,
+        tree_root: u64,
+        inode_num: u64,
+        file_size: u64,
+        writer: &mut dyn std::io::Write,
+        max_bytes: u64,
+    ) -> Result<u64, FilesystemError> {
+        let min_key = BtrfsKey {
+            objectid: inode_num,
+            key_type: EXTENT_DATA_KEY,
+            offset: 0,
+        };
+        let max_key = BtrfsKey {
+            objectid: inode_num,
+            key_type: EXTENT_DATA_KEY,
+            offset: u64::MAX,
+        };
+        let items = self.find_items_in_range(tree_root, &min_key, &max_key)?;
+        let limit = file_size.min(max_bytes);
+        let zeros = vec![0u8; 64 * 1024];
+        let mut written: u64 = 0;
+
+        let write_zeros = |writer: &mut dyn std::io::Write,
+                           zeros: &[u8],
+                           mut count: u64|
+         -> std::io::Result<()> {
+            while count > 0 {
+                let n = (zeros.len() as u64).min(count) as usize;
+                writer.write_all(&zeros[..n])?;
+                count -= n as u64;
+            }
+            Ok(())
+        };
+
+        for (key, data) in &items {
+            if data.len() < 21 || written >= limit {
+                break;
+            }
+            let file_offset = key.offset;
+            if file_offset >= limit {
+                break;
+            }
+            if file_offset > written {
+                let gap = (file_offset - written).min(limit - written);
+                write_zeros(writer, &zeros, gap)?;
+                written += gap;
+                if written >= limit {
+                    break;
+                }
+            }
+
+            let compression = data[16];
+            let extent_type = data[20];
+            match extent_type {
+                BTRFS_FILE_EXTENT_INLINE => {
+                    let len = (data.len().saturating_sub(21)) as u64;
+                    let to_emit = len.min(limit - written);
+                    if compression == 0 {
+                        let inline_data = &data[21..21 + to_emit as usize];
+                        writer.write_all(inline_data)?;
+                    } else {
+                        // Compressed inline — surface as zeros (matches read_file_data).
+                        write_zeros(writer, &zeros, to_emit)?;
+                    }
+                    written += to_emit;
+                }
+                BTRFS_FILE_EXTENT_REG | BTRFS_FILE_EXTENT_PREALLOC => {
+                    if data.len() < 53 {
+                        continue;
+                    }
+                    let disk_bytenr = le64(data, 21);
+                    let extent_offset = le64(data, 37);
+                    let num_bytes = le64(data, 45);
+                    let to_emit = num_bytes.min(limit - written);
+                    if compression != 0 || disk_bytenr == 0 {
+                        write_zeros(writer, &zeros, to_emit)?;
+                        written += to_emit;
+                        continue;
+                    }
+                    let read_logical = disk_bytenr + extent_offset;
+                    let physical = self.logical_to_physical(read_logical)?;
+                    self.reader
+                        .seek(SeekFrom::Start(self.partition_offset + physical))?;
+                    let mut buf = vec![0u8; 64 * 1024];
+                    let mut left = to_emit;
+                    while left > 0 {
+                        let n = (buf.len() as u64).min(left) as usize;
+                        self.reader.read_exact(&mut buf[..n])?;
+                        writer.write_all(&buf[..n])?;
+                        left -= n as u64;
+                    }
+                    written += to_emit;
+                }
+                _ => {}
+            }
+        }
+        // Trailing sparse region.
+        if written < limit {
+            write_zeros(writer, &zeros, limit - written)?;
+            written = limit;
+        }
+        Ok(written)
+    }
+
     fn read_file_data(
         &mut self,
         tree_root: u64,
@@ -827,6 +934,19 @@ impl<R: Read + Seek + Send> Filesystem for BtrfsFilesystem<R> {
         let (tree_root, inode_num) = self.resolve_location(entry)?;
         let inode = self.read_inode_item(tree_root, inode_num)?;
         self.read_file_data(tree_root, inode_num, inode.size, max_bytes)
+    }
+
+    fn write_file_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn std::io::Write,
+    ) -> Result<u64, FilesystemError> {
+        if entry.is_directory() {
+            return Err(FilesystemError::NotADirectory(entry.path.clone()));
+        }
+        let (tree_root, inode_num) = self.resolve_location(entry)?;
+        let inode = self.read_inode_item(tree_root, inode_num)?;
+        self.write_file_data_to(tree_root, inode_num, inode.size, writer, inode.size)
     }
 
     fn volume_label(&self) -> Option<&str> {

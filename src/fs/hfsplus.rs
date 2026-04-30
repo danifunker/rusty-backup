@@ -1169,6 +1169,27 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
         Ok(data)
     }
 
+    fn write_file_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn std::io::Write,
+    ) -> Result<u64, FilesystemError> {
+        if entry.is_directory() {
+            return Err(FilesystemError::NotADirectory(entry.path.clone()));
+        }
+        let file_id = entry.location as u32;
+        let (data_fork, _rsrc_fork) = self.find_file_by_id(file_id).ok_or_else(|| {
+            FilesystemError::NotFound(format!("file id {file_id} not found in catalog"))
+        })?;
+        write_fork_to(
+            &mut self.reader,
+            self.partition_offset,
+            self.vh.block_size,
+            &data_fork,
+            writer,
+        )
+    }
+
     fn volume_label(&self) -> Option<&str> {
         if self.label.is_empty() {
             None
@@ -1288,6 +1309,37 @@ impl<R: Read + Seek + Send> HfsPlusFilesystem<R> {
         // CNID set but can't resolve name
         Some((cnid as u64, format!("CNID {}", cnid)))
     }
+}
+
+/// Stream a fork's data through its extent descriptors to a writer.
+fn write_fork_to<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    block_size: u32,
+    fork: &ForkData,
+    writer: &mut dyn std::io::Write,
+) -> Result<u64, FilesystemError> {
+    let size = fork.logical_size;
+    let mut written: u64 = 0;
+    let mut buf = vec![0u8; 64 * 1024];
+    for ext in &fork.extents {
+        if ext.is_empty() || written >= size {
+            break;
+        }
+        let offset = partition_offset + ext.start_block as u64 * block_size as u64;
+        let extent_len = ext.block_count as u64 * block_size as u64;
+        let to_emit = extent_len.min(size - written);
+        reader.seek(SeekFrom::Start(offset))?;
+        let mut left = to_emit;
+        while left > 0 {
+            let n = (buf.len() as u64).min(left) as usize;
+            reader.read_exact(&mut buf[..n])?;
+            writer.write_all(&buf[..n])?;
+            left -= n as u64;
+        }
+        written += to_emit;
+    }
+    Ok(written)
 }
 
 /// Read a fork's data through its extent descriptors.

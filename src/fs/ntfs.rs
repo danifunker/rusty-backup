@@ -514,6 +514,70 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
         }
     }
 
+    /// Stream attribute data to a writer up to `max_bytes`. Avoids the full
+    /// allocation in `read_attribute_data`; used by `write_file_to`.
+    fn write_attribute_data_to(
+        &mut self,
+        attr: &MftAttribute,
+        writer: &mut dyn std::io::Write,
+        max_bytes: u64,
+    ) -> Result<u64, FilesystemError> {
+        if attr.resident {
+            let n = (attr.value.len() as u64).min(max_bytes) as usize;
+            writer.write_all(&attr.value[..n])?;
+            Ok(n as u64)
+        } else {
+            self.write_data_runs_to(&attr.data_runs, attr.real_size, writer, max_bytes)
+        }
+    }
+
+    /// Stream non-resident data runs to a writer.
+    fn write_data_runs_to(
+        &mut self,
+        runs: &[DataRun],
+        real_size: u64,
+        writer: &mut dyn std::io::Write,
+        max_bytes: u64,
+    ) -> Result<u64, FilesystemError> {
+        let limit = max_bytes.min(real_size);
+        let mut written: u64 = 0;
+        let zeros = vec![0u8; 64 * 1024];
+
+        for run in runs {
+            if written >= limit {
+                break;
+            }
+            let run_bytes = run.length * self.cluster_size;
+            let remaining = limit - written;
+            let to_write = run_bytes.min(remaining);
+
+            if run.cluster_offset == 0 {
+                // Sparse run — emit zeros in chunks.
+                let mut left = to_write;
+                while left > 0 {
+                    let n = (zeros.len() as u64).min(left) as usize;
+                    writer.write_all(&zeros[..n])?;
+                    left -= n as u64;
+                }
+            } else {
+                let offset = self.cluster_offset(run.cluster_offset as u64);
+                self.reader.seek(SeekFrom::Start(offset))?;
+                // Stream this run in 64 KiB chunks to avoid a per-run allocation
+                // for very large runs.
+                let mut buf = vec![0u8; 64 * 1024];
+                let mut left = to_write;
+                while left > 0 {
+                    let n = (buf.len() as u64).min(left) as usize;
+                    self.reader.read_exact(&mut buf[..n])?;
+                    writer.write_all(&buf[..n])?;
+                    left -= n as u64;
+                }
+            }
+            written += to_write;
+        }
+        Ok(written)
+    }
+
     /// Read data from data runs (non-resident attribute data).
     fn read_data_runs(
         &mut self,
@@ -907,6 +971,27 @@ impl<R: Read + Seek + Send> Filesystem for NtfsFilesystem<R> {
             }
         }
 
+        Err(FilesystemError::NotFound(format!(
+            "$DATA attribute not found for {}",
+            entry.path
+        )))
+    }
+
+    fn write_file_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn std::io::Write,
+    ) -> Result<u64, FilesystemError> {
+        if entry.is_directory() {
+            return Err(FilesystemError::NotADirectory(entry.path.clone()));
+        }
+        let record = self.read_mft_record(entry.location)?;
+        let attrs = parse_mft_attributes(&record, self.mft_record_size);
+        for attr in &attrs {
+            if attr.attr_type == ATTR_DATA {
+                return self.write_attribute_data_to(attr, writer, entry.size);
+            }
+        }
         Err(FilesystemError::NotFound(format!(
             "$DATA attribute not found for {}",
             entry.path

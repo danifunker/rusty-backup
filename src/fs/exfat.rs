@@ -218,6 +218,44 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
         }
     }
 
+    /// Stream a cluster chain to a writer up to `max_bytes`, returning bytes
+    /// written. Avoids the full-file allocation in `read_cluster_chain`; used
+    /// by the streaming `write_file_to` override.
+    fn write_cluster_chain_to(
+        &mut self,
+        start_cluster: u32,
+        writer: &mut dyn std::io::Write,
+        max_bytes: u64,
+    ) -> Result<u64, FilesystemError> {
+        let mut written: u64 = 0;
+        let mut cluster = start_cluster;
+        let mut count = 0u32;
+        let mut buf = vec![0u8; self.cluster_size as usize];
+
+        while cluster >= 2 && count <= self.cluster_count && written < max_bytes {
+            let offset = self.cluster_offset(cluster);
+            self.reader.seek(SeekFrom::Start(offset))?;
+            let remaining = max_bytes - written;
+            let to_read = self.cluster_size.min(remaining) as usize;
+            match self.reader.read(&mut buf[..to_read]) {
+                Ok(n) if n > 0 => {
+                    writer.write_all(&buf[..n])?;
+                    written += n as u64;
+                    if n < to_read {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+            count += 1;
+            match self.next_cluster(cluster)? {
+                Some(next) => cluster = next,
+                None => break,
+            }
+        }
+        Ok(written)
+    }
+
     /// Read cluster chain data.
     fn read_cluster_chain(
         &mut self,
@@ -568,6 +606,21 @@ impl<R: Read + Seek + Send> Filesystem for ExfatFilesystem<R> {
         }
 
         self.read_cluster_chain(cluster, Some(max_bytes as u64))
+    }
+
+    fn write_file_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn std::io::Write,
+    ) -> Result<u64, FilesystemError> {
+        if entry.is_directory() {
+            return Err(FilesystemError::NotADirectory(entry.path.clone()));
+        }
+        let cluster = entry.location as u32;
+        if cluster < 2 {
+            return Ok(0);
+        }
+        self.write_cluster_chain_to(cluster, writer, entry.size)
     }
 
     fn volume_label(&self) -> Option<&str> {

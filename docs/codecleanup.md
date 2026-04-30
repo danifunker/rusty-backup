@@ -33,9 +33,17 @@ Conventions:
 
 ## 2. Filesystem trait surface
 
-- [~] **Default `write_file_to` reads the entire file into RAM via `read_file(.., usize::MAX)`** (`src/fs/filesystem.rs:44`)
-  - **Evidence:** No FS overrides this (audit's claim that HFS/HFS+/ext override was wrong — every implementation inherits the default). Risk is bounded in practice (vintage disk-image files are typically <100 MiB).
-  - **Done (partial):** Added a doc comment + TODO at the trait method explaining the RAM behavior and what a future streaming override needs (a chunked `read_file_at(entry, offset, len)` API). Full streaming refactor deferred — would touch all 8 FS implementations and isn't blocking real workloads today.
+- [x] **`write_file_to` overridden in all 8 filesystems for true streaming.**
+  - **Done:** Each FS now ships a streaming variant of its data-read path that emits extent-by-extent without a full-file allocation, and overrides `write_file_to` to use it:
+    - FAT/exFAT — `write_cluster_chain_to` walks the cluster chain.
+    - NTFS — `write_attribute_data_to` / `write_data_runs_to` stream resident + non-resident attribute data, with sparse runs and 64 KiB extent chunks.
+    - ext — `write_inode_data_to` streams block-by-block, sparse blocks become zero-fills.
+    - btrfs — `write_file_data_to` walks `EXTENT_DATA_KEY` items in offset order, fills gaps + sparse + compressed extents with zeros, streams REG/PREALLOC extents in 64 KiB chunks.
+    - HFS — `write_fork_with_overflow_to` streams inline + extents-overflow descriptors.
+    - HFS+ — `write_fork_to` streams inline extents.
+    - ProDOS — `write_seedling_to` / `write_sapling_to` / `write_tree_to` stream the storage trees block-by-block.
+  - **Verification:** New FAT test asserts `write_file_to` yields the same bytes as `read_file`. All 604 lib tests pass; existing browse-view extraction (the main consumer) keeps working unchanged because the trait override is a drop-in.
+  - **Trait doc updated** to reflect that all built-in FSes override; default kept for new filesystems whose files are bounded by design.
 
 - [x] **`set_permissions` was a silent no-op for most filesystems** (`src/fs/filesystem.rs:234`)
   - **Done:** Default now returns `Err(Unsupported)`. ext continues to override with the real implementation; other filesystems surface the unsupported state instead of silently dropping mode bits. Audit's note that ProDOS overrides was wrong — only ext does.

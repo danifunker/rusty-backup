@@ -95,6 +95,52 @@ impl<R: Read + Seek + Send> Filesystem for ProDosFilesystem<R> {
         }
     }
 
+    fn write_file_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn std::io::Write,
+    ) -> Result<u64, FilesystemError> {
+        if entry.is_directory() {
+            return Err(FilesystemError::NotADirectory(entry.path.clone()));
+        }
+        if entry.size == 0 {
+            return Ok(0);
+        }
+        let key_ptr = entry.location as u16;
+        let eof = entry.size as usize;
+        let storage_type = entry.mode.unwrap_or_else(|| infer_storage_type(eof)) as u8;
+        match storage_type {
+            1 => write_seedling_to(
+                &mut self.reader,
+                self.partition_offset,
+                key_ptr,
+                eof,
+                writer,
+            ),
+            2 => write_sapling_to(
+                &mut self.reader,
+                self.partition_offset,
+                key_ptr,
+                eof,
+                writer,
+            ),
+            3 => write_tree_to(
+                &mut self.reader,
+                self.partition_offset,
+                key_ptr,
+                eof,
+                writer,
+            ),
+            _ => write_seedling_to(
+                &mut self.reader,
+                self.partition_offset,
+                key_ptr,
+                eof,
+                writer,
+            ),
+        }
+    }
+
     fn volume_label(&self) -> Option<&str> {
         Some(&self.header.name)
     }
@@ -1437,6 +1483,102 @@ fn read_index_block<R: Read + Seek>(
 }
 
 /// Read a seedling file (single data block, key_ptr → data).
+fn write_seedling_to<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    key_ptr: u16,
+    eof: usize,
+    writer: &mut dyn std::io::Write,
+) -> Result<u64, FilesystemError> {
+    let to_emit = eof.min(512);
+    if key_ptr == 0 {
+        writer.write_all(&vec![0u8; to_emit])?;
+        return Ok(to_emit as u64);
+    }
+    let offset = partition_offset + key_ptr as u64 * BLOCK_SIZE;
+    reader
+        .seek(SeekFrom::Start(offset))
+        .map_err(FilesystemError::Io)?;
+    let mut buf = [0u8; 512];
+    reader.read_exact(&mut buf).map_err(FilesystemError::Io)?;
+    writer.write_all(&buf[..to_emit])?;
+    Ok(to_emit as u64)
+}
+
+fn write_sapling_to<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    key_ptr: u16,
+    eof: usize,
+    writer: &mut dyn std::io::Write,
+) -> Result<u64, FilesystemError> {
+    let index = read_index_block(reader, partition_offset, key_ptr)?;
+    let mut written: u64 = 0;
+    let zeros = [0u8; 512];
+    for &data_block in index.iter() {
+        if written as usize >= eof {
+            break;
+        }
+        let remaining = eof - written as usize;
+        let to_take = remaining.min(512);
+        if data_block == 0 {
+            writer.write_all(&zeros[..to_take])?;
+        } else {
+            let offset = partition_offset + data_block as u64 * BLOCK_SIZE;
+            reader
+                .seek(SeekFrom::Start(offset))
+                .map_err(FilesystemError::Io)?;
+            let mut buf = [0u8; 512];
+            reader.read_exact(&mut buf).map_err(FilesystemError::Io)?;
+            writer.write_all(&buf[..to_take])?;
+        }
+        written += to_take as u64;
+    }
+    Ok(written)
+}
+
+fn write_tree_to<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    key_ptr: u16,
+    eof: usize,
+    writer: &mut dyn std::io::Write,
+) -> Result<u64, FilesystemError> {
+    let master = read_index_block(reader, partition_offset, key_ptr)?;
+    let mut written: u64 = 0;
+    let zeros = [0u8; 512];
+    for &index_block_num in master[..128].iter() {
+        if written as usize >= eof {
+            break;
+        }
+        let index = if index_block_num == 0 {
+            [0u16; 256]
+        } else {
+            read_index_block(reader, partition_offset, index_block_num)?
+        };
+        for &data_block in index.iter() {
+            if written as usize >= eof {
+                break;
+            }
+            let remaining = eof - written as usize;
+            let to_take = remaining.min(512);
+            if data_block == 0 {
+                writer.write_all(&zeros[..to_take])?;
+            } else {
+                let offset = partition_offset + data_block as u64 * BLOCK_SIZE;
+                reader
+                    .seek(SeekFrom::Start(offset))
+                    .map_err(FilesystemError::Io)?;
+                let mut buf = [0u8; 512];
+                reader.read_exact(&mut buf).map_err(FilesystemError::Io)?;
+                writer.write_all(&buf[..to_take])?;
+            }
+            written += to_take as u64;
+        }
+    }
+    Ok(written)
+}
+
 fn read_seedling<R: Read + Seek>(
     reader: &mut R,
     partition_offset: u64,

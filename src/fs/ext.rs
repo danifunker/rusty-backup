@@ -396,6 +396,38 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
         }
     }
 
+    /// Stream inode data to a writer up to `max_bytes`. Avoids the full-file
+    /// allocation in `read_inode_data`; used by `write_file_to`.
+    fn write_inode_data_to(
+        &mut self,
+        inode: &InodeData,
+        writer: &mut dyn std::io::Write,
+        max_bytes: u64,
+    ) -> Result<u64, FilesystemError> {
+        let blocks = self.inode_data_blocks(inode)?;
+        let limit = inode.size.min(max_bytes);
+        let block_size = self.block_size as usize;
+        let zeros = vec![0u8; block_size];
+        let mut written: u64 = 0;
+
+        for block_num in blocks {
+            if written >= limit {
+                break;
+            }
+            let remaining = limit - written;
+            let to_write = (block_size as u64).min(remaining) as usize;
+            if block_num == 0 {
+                writer.write_all(&zeros[..to_write])?;
+            } else {
+                let block_data = self.read_block(block_num)?;
+                let n = to_write.min(block_data.len());
+                writer.write_all(&block_data[..n])?;
+            }
+            written += to_write as u64;
+        }
+        Ok(written)
+    }
+
     /// Read all data for an inode.
     fn read_inode_data(
         &mut self,
@@ -695,6 +727,18 @@ impl<R: Read + Seek + Send> Filesystem for ExtFilesystem<R> {
 
         let inode = self.read_inode(entry.location as u32)?;
         self.read_inode_data(&inode, max_bytes)
+    }
+
+    fn write_file_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn std::io::Write,
+    ) -> Result<u64, FilesystemError> {
+        if entry.is_directory() {
+            return Err(FilesystemError::NotADirectory(entry.path.clone()));
+        }
+        let inode = self.read_inode(entry.location as u32)?;
+        self.write_inode_data_to(&inode, writer, inode.size)
     }
 
     fn volume_label(&self) -> Option<&str> {

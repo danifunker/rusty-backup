@@ -41,12 +41,11 @@ pub trait Filesystem: Send {
 
     /// Stream file data to a writer. Returns the number of bytes written.
     ///
-    /// Default loads the entire file into RAM via `read_file(entry,
-    /// usize::MAX)` and then writes it. This is acceptable for vintage
-    /// disk images (typical files <100 MiB) but is not true streaming.
-    /// TODO: when a chunked `read_file_at(entry, offset, len)` API is
-    /// added, override this per-FS to stream extent-by-extent and avoid
-    /// the full-file allocation.
+    /// All built-in filesystems (FAT/exFAT/NTFS/ext/btrfs/HFS/HFS+/ProDOS)
+    /// override this with an extent-by-extent implementation that doesn't
+    /// allocate the full file. The default falls back to loading the entire
+    /// file into RAM via `read_file(entry, usize::MAX)`; new filesystems
+    /// should override unless their files are bounded by design.
     fn write_file_to(
         &mut self,
         entry: &FileEntry,
