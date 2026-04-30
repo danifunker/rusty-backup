@@ -110,13 +110,10 @@ impl Read for MultiPartReader {
             }
 
             let file = File::open(&self.files[self.current_index]).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!(
-                        "failed to open {}: {e}",
-                        self.files[self.current_index].display()
-                    ),
-                )
+                io::Error::other(format!(
+                    "failed to open {}: {e}",
+                    self.files[self.current_index].display()
+                ))
             })?;
             self.current_reader = Some(BufReader::new(file));
         }
@@ -243,7 +240,7 @@ pub(crate) fn parse_bitmap(
 ) -> Result<PartcloneBitmap> {
     if header.version.as_str() >= "0002" {
         // v0002: bit-packed bitmap, ceil(total_blocks / 8) bytes
-        let bitmap_bytes = ((header.total_blocks + 7) / 8) as usize;
+        let bitmap_bytes = header.total_blocks.div_ceil(8) as usize;
         let mut data = vec![0u8; bitmap_bytes];
         reader.read_exact(&mut data).with_context(|| {
             format!(
@@ -335,11 +332,14 @@ impl<R: Read> PartcloneExpandReader<R> {
             self.used_blocks_read += 1;
 
             // Skip CRC32 checksum after every blocks_per_checksum used blocks
-            if self.header.checksum_mode > 0 && self.header.blocks_per_checksum > 0 {
-                if self.used_blocks_read % self.header.blocks_per_checksum as u64 == 0 {
-                    let mut _crc = [0u8; 4];
-                    self.reader.read_exact(&mut _crc)?;
-                }
+            if self.header.checksum_mode > 0
+                && self.header.blocks_per_checksum > 0
+                && self
+                    .used_blocks_read
+                    .is_multiple_of(self.header.blocks_per_checksum as u64)
+            {
+                let mut _crc = [0u8; 4];
+                self.reader.read_exact(&mut _crc)?;
             }
         } else {
             // Unused block: zeros
@@ -429,11 +429,14 @@ impl<R: Read> PartcloneCompactReader<R> {
                 self.used_blocks_read += 1;
 
                 // Skip CRC32 checksum
-                if self.header.checksum_mode > 0 && self.header.blocks_per_checksum > 0 {
-                    if self.used_blocks_read % self.header.blocks_per_checksum as u64 == 0 {
-                        let mut _crc = [0u8; 4];
-                        self.reader.read_exact(&mut _crc)?;
-                    }
+                if self.header.checksum_mode > 0
+                    && self.header.blocks_per_checksum > 0
+                    && self
+                        .used_blocks_read
+                        .is_multiple_of(self.header.blocks_per_checksum as u64)
+                {
+                    let mut _crc = [0u8; 4];
+                    self.reader.read_exact(&mut _crc)?;
                 }
 
                 self.block_loaded = true;
@@ -456,11 +459,9 @@ impl<R: Read> Read for PartcloneCompactReader<R> {
         let block_size = self.header.block_size;
 
         while total_read < buf.len() {
-            if !self.block_loaded {
-                if !self.load_next_used_block()? {
-                    self.finished = true;
-                    break;
-                }
+            if !self.block_loaded && !self.load_next_used_block()? {
+                self.finished = true;
+                break;
             }
 
             let available = block_size - self.offset_in_block;

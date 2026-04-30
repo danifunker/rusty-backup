@@ -197,7 +197,7 @@ fn walk_catalog(catalog: &[u8]) -> (Vec<SourceDirSnapshot>, Vec<SourceFileSnapsh
             let name_raw = node[rec_offset + 7..name_end].to_vec();
 
             let mut rec_data_offset = rec_offset + 1 + key_len;
-            if rec_data_offset % 2 != 0 {
+            if !rec_data_offset.is_multiple_of(2) {
                 rec_data_offset += 1;
             }
             if rec_data_offset + 2 > node.len() {
@@ -558,7 +558,7 @@ where
     R: Read + Seek,
     W: Read + Write + Seek,
 {
-    if hfs_image.len() % 512 != 0 {
+    if !hfs_image.len().is_multiple_of(512) {
         return Err(FilesystemError::InvalidData(format!(
             "hfs_image length {} is not a multiple of 512",
             hfs_image.len()

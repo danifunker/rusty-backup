@@ -106,6 +106,12 @@ pub enum LogLevel {
     Error,
 }
 
+impl Default for BackupProgress {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BackupProgress {
     pub fn new() -> Self {
         Self {

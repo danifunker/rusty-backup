@@ -1072,8 +1072,7 @@ impl<R: Read + Seek + Send> CompactBtrfsReader<R> {
 
             // Allocated range → MappedBlocks
             let aligned_start = range_start / sector_size * sector_size;
-            let aligned_end =
-                ((range_end + sector_size - 1) / sector_size * sector_size).min(total_bytes);
+            let aligned_end = (range_end.div_ceil(sector_size) * sector_size).min(total_bytes);
             let num_sectors = (aligned_end - aligned_start) / sector_size;
             let old_blocks: Vec<u64> = (0..num_sectors)
                 .map(|i| aligned_start / sector_size + i)
@@ -1099,7 +1098,7 @@ impl<R: Read + Seek + Send> CompactBtrfsReader<R> {
         let inner = CompactStreamReader::new(reader, layout);
 
         // data_size: only allocated sectors require disk reads.
-        let data_size = total_allocated_sectors as u64 * sector_size as u64;
+        let data_size = total_allocated_sectors * sector_size as u64;
         Ok((
             Self { inner },
             CompactResult {

@@ -449,7 +449,7 @@ impl<R: Read + Seek> HfsFilesystem<R> {
 
                 // Record data follows key (aligned to even boundary)
                 let mut rec_data_offset = rec_offset + 1 + key_len;
-                if rec_data_offset % 2 != 0 {
+                if !rec_data_offset.is_multiple_of(2) {
                     rec_data_offset += 1;
                 }
                 if rec_data_offset + 2 > node.len() {
@@ -567,7 +567,7 @@ impl<R: Read + Seek> HfsFilesystem<R> {
                     continue;
                 }
                 let mut rec_data_offset = rec_offset + 1 + key_len;
-                if rec_data_offset % 2 != 0 {
+                if !rec_data_offset.is_multiple_of(2) {
                     rec_data_offset += 1;
                 }
                 if rec_data_offset + 2 > node.len() {
@@ -769,7 +769,7 @@ impl<R: Read + Seek> HfsFilesystem<R> {
                 }
                 let key_len = rec[0] as usize;
                 let mut data_off = abs_off + 1 + key_len;
-                if data_off % 2 != 0 {
+                if !data_off.is_multiple_of(2) {
                     data_off += 1;
                 }
                 let abs_end = abs_off + rec.len();
@@ -1165,7 +1165,7 @@ impl<R: Read + Seek> HfsFilesystem<R> {
         if let Some((_, _, t_offset)) = self.find_catalog_record_by_cnid(cnid) {
             let key_len = self.catalog_data[t_offset] as usize;
             let mut rec_data_start = t_offset + 1 + key_len;
-            if rec_data_start % 2 != 0 {
+            if !rec_data_start.is_multiple_of(2) {
                 rec_data_start += 1;
             }
             let thread_parent =
@@ -1180,7 +1180,7 @@ impl<R: Read + Seek> HfsFilesystem<R> {
             {
                 let fkey_len = self.catalog_data[f_offset] as usize;
                 let mut frec_start = f_offset + 1 + fkey_len;
-                if frec_start % 2 != 0 {
+                if !frec_start.is_multiple_of(2) {
                     frec_start += 1;
                 }
                 return Ok(frec_start);
@@ -1224,7 +1224,7 @@ impl<R: Read + Seek> HfsFilesystem<R> {
                     return None;
                 }
                 let mut data_rel = 1 + key_len;
-                if data_rel % 2 != 0 {
+                if !data_rel.is_multiple_of(2) {
                     data_rel += 1;
                 }
                 if data_rel + 24 > rec.len() {
@@ -2094,7 +2094,7 @@ pub fn create_blank_hfs_sized(
     min_extents_bytes: u32,
     min_catalog_bytes: u32,
 ) -> Result<Vec<u8>, FilesystemError> {
-    if block_size == 0 || block_size % 512 != 0 {
+    if block_size == 0 || !block_size.is_multiple_of(512) {
         return Err(FilesystemError::InvalidData(format!(
             "HFS block_size must be a non-zero multiple of 512 (got {block_size})"
         )));
@@ -2456,7 +2456,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
         if let Some((_node, _rec, offset)) = self.find_catalog_record_by_cnid(cnid) {
             let key_len = self.catalog_data[offset] as usize;
             let mut rec_data_start = offset + 1 + key_len;
-            if rec_data_start % 2 != 0 {
+            if !rec_data_start.is_multiple_of(2) {
                 rec_data_start += 1;
             }
             // Thread record: type(1) + reserved(1) + reserved(8) + parentID(4) + name(Pascal)
@@ -2969,7 +2969,7 @@ fn collect_fork_overflow_extents(
                 continue;
             }
             let mut data_off = rec_start + 1 + key_len;
-            if data_off % 2 != 0 {
+            if !data_off.is_multiple_of(2) {
                 data_off += 1;
             }
             if data_off + 12 > node_size {

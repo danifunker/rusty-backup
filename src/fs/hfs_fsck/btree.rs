@@ -32,7 +32,7 @@ pub(super) fn check_btree_structure(
     let node_size = header.node_size as usize;
 
     // Check node size is a power of 2 multiple of 512
-    if node_size < 512 || node_size % 512 != 0 {
+    if node_size < 512 || !node_size.is_multiple_of(512) {
         errors.push(hfs_issue(
             HfsFsckCode::HeaderNodeBadKind,
             format!(
@@ -510,7 +510,7 @@ fn check_leaf_record_lengths(
             continue;
         }
         let mut data_start = key_total;
-        if data_start % 2 != 0 {
+        if !data_start.is_multiple_of(2) {
             data_start += 1;
         }
         if data_start >= rec_len {
@@ -625,7 +625,7 @@ pub(super) fn extract_child_pointers(node: &[u8], node_size: usize) -> Vec<u32> 
         }
         let key_len = rec[0] as usize;
         let mut ptr_off = 1 + key_len;
-        if ptr_off % 2 != 0 {
+        if !ptr_off.is_multiple_of(2) {
             ptr_off += 1;
         }
         if ptr_off + 4 <= rec.len() {

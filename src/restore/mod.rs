@@ -89,6 +89,12 @@ pub struct LogMessage {
     pub message: String,
 }
 
+impl Default for RestoreProgress {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RestoreProgress {
     pub fn new() -> Self {
         Self {
@@ -927,7 +933,7 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
             let is_io_stall = e.chain().any(|cause| {
                 cause
                     .downcast_ref::<std::io::Error>()
-                    .map_or(false, |io_err| {
+                    .is_some_and(|io_err| {
                         io_err.raw_os_error() == Some(5) // EIO
                             || io_err.kind() == std::io::ErrorKind::BrokenPipe
                     })
@@ -2049,10 +2055,9 @@ pub(crate) fn detect_partition_fs_type(
         .seek(SeekFrom::Start(partition_offset + 0x10000))
         .is_ok()
         && file.read_exact(&mut sector).is_ok()
+        && &sector[0x40..0x48] == b"_BHRfS_M"
     {
-        if &sector[0x40..0x48] == b"_BHRfS_M" {
-            return PartitionFsType::Btrfs;
-        }
+        return PartitionFsType::Btrfs;
     }
 
     PartitionFsType::Unknown

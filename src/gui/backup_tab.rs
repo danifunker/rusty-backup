@@ -304,14 +304,10 @@ impl BackupTab {
                         self.compression_type = CompressionType::Chd;
                     }
                 });
-                if ui
-                    .radio_value(&mut self.compression_type, CompressionType::Vhd, "VHD")
-                    .clicked()
-                {}
-                if ui
-                    .radio_value(&mut self.compression_type, CompressionType::Zstd, "zstd")
-                    .clicked()
-                {}
+                ui.radio_value(&mut self.compression_type, CompressionType::Vhd, "VHD")
+                    .clicked();
+                ui.radio_value(&mut self.compression_type, CompressionType::Zstd, "zstd")
+                    .clicked();
                 if ui
                     .radio_value(&mut self.compression_type, CompressionType::None, "None")
                     .clicked()

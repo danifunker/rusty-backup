@@ -220,11 +220,9 @@ impl OpticalTab {
         if self.disc_info.is_some() {
             ui.horizontal(|ui| {
                 ui.add_space(60.0);
-                if !self.browse_view.is_active() {
-                    if ui.button("Browse Contents").clicked() {
-                        if let Some(path) = self.get_browsable_path() {
-                            self.browse_view.open(&path);
-                        }
+                if !self.browse_view.is_active() && ui.button("Browse Contents").clicked() {
+                    if let Some(path) = self.get_browsable_path() {
+                        self.browse_view.open(&path);
                     }
                 }
                 if ui.button("Close Disc").clicked() {

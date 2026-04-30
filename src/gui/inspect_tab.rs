@@ -370,43 +370,47 @@ impl InspectTab {
             }
 
             // Close button — releases the device/image and clears results
-            if self.selected_device_idx.is_some() && !inspect_running && !export_running {
-                if ui.button("Close Device").clicked() {
-                    self.browse_view.close();
-                    self.clear_results();
-                    self.selected_device_idx = None;
-                    self.prev_device_idx = None;
-                    ctx.log.info("Device closed and remounted.");
-                }
+            if self.selected_device_idx.is_some()
+                && !inspect_running
+                && !export_running
+                && ui.button("Close Device").clicked()
+            {
+                self.browse_view.close();
+                self.clear_results();
+                self.selected_device_idx = None;
+                self.prev_device_idx = None;
+                ctx.log.info("Device closed and remounted.");
             }
-            if self.image_file_path.is_some() && !inspect_running && !export_running {
-                if ui.button("Close Image").clicked() {
-                    self.browse_view.close();
-                    self.clear_results();
-                    self.image_file_path = None;
-                    self.prev_image_path = None;
-                    ctx.log.info("Image file closed.");
-                }
+            if self.image_file_path.is_some()
+                && !inspect_running
+                && !export_running
+                && ui.button("Close Image").clicked()
+            {
+                self.browse_view.close();
+                self.clear_results();
+                self.image_file_path = None;
+                self.prev_image_path = None;
+                ctx.log.info("Image file closed.");
             }
-            if self.backup_folder_path.is_some() && !inspect_running && !export_running {
-                if ui.button("Close Backup").clicked() {
-                    self.browse_view.close();
-                    self.clear_results();
-                    self.backup_folder_path = None;
-                    self.prev_backup_path = None;
-                    ctx.log.info("Backup folder closed.");
-                }
+            if self.backup_folder_path.is_some()
+                && !inspect_running
+                && !export_running
+                && ui.button("Close Backup").clicked()
+            {
+                self.browse_view.close();
+                self.clear_results();
+                self.backup_folder_path = None;
+                self.prev_backup_path = None;
+                ctx.log.info("Backup folder closed.");
             }
 
-            if export_running {
-                if ui.button("Cancel Export").clicked() {
-                    if let Some(ref status_arc) = self.export_status {
-                        if let Ok(mut s) = status_arc.lock() {
-                            s.cancel_requested = true;
-                        }
+            if export_running && ui.button("Cancel Export").clicked() {
+                if let Some(ref status_arc) = self.export_status {
+                    if let Ok(mut s) = status_arc.lock() {
+                        s.cancel_requested = true;
                     }
-                    ctx.log.warn("Export cancellation requested...");
                 }
+                ctx.log.warn("Export cancellation requested...");
             }
         });
 
@@ -1801,7 +1805,7 @@ impl InspectTab {
                                             // Prefer explicit minimum_size_bytes (computed at
                                             // backup time); fall back to imaged_size_bytes for
                                             // older backups that lack the field.
-                                            pm.minimum_size_bytes.or_else(|| {
+                                            pm.minimum_size_bytes.or({
                                                 if pm.imaged_size_bytes > 0
                                                     && pm.imaged_size_bytes < pm.original_size_bytes
                                                 {
@@ -1869,14 +1873,14 @@ impl InspectTab {
                                     part.partition_type_string.clone(),
                                 ));
                             }
-                            if is_checkable_type(ptype, part.partition_type_string.as_deref()) {
-                                if ui.small_button("Check").clicked() {
-                                    check_request = Some((
-                                        part.start_lba * 512,
-                                        ptype,
-                                        part.partition_type_string.clone(),
-                                    ));
-                                }
+                            if is_checkable_type(ptype, part.partition_type_string.as_deref())
+                                && ui.small_button("Check").clicked()
+                            {
+                                check_request = Some((
+                                    part.start_lba * 512,
+                                    ptype,
+                                    part.partition_type_string.clone(),
+                                ));
                             }
                             if is_classic_hfs(
                                 part.partition_type_byte,
@@ -2958,7 +2962,7 @@ fn is_checkable_type(ptype: u8, type_str: Option<&str>) -> bool {
 /// Format an HFS allocation block size as "N KiB" when it's a whole
 /// number of kibibytes, else "N B".
 fn format_block_size(bytes: u32) -> String {
-    if bytes >= 1024 && bytes % 1024 == 0 {
+    if bytes >= 1024 && bytes.is_multiple_of(1024) {
         format!("{} KiB", bytes / 1024)
     } else {
         format!("{} B", bytes)

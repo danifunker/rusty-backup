@@ -450,7 +450,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
 
                 // Record data follows key (aligned to even offset from node start)
                 let mut rec_data_start = rec_offset + 2 + key_len;
-                if rec_data_start % 2 != 0 {
+                if !rec_data_start.is_multiple_of(2) {
                     rec_data_start += 1;
                 }
                 if rec_data_start + 2 > node.len() {
@@ -522,7 +522,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
                     return None;
                 }
                 let mut data_rel = 2 + key_len;
-                if data_rel % 2 != 0 {
+                if !data_rel.is_multiple_of(2) {
                     data_rel += 1;
                 }
                 if data_rel + 2 > rec.len() {
@@ -600,11 +600,11 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         let name_len_b = BigEndian::read_u16(&b[6..8]) as usize;
         let name_a: Vec<u16> = a[8..8 + name_len_a.min((a.len() - 8) / 2) * 2]
             .chunks_exact(2)
-            .map(|c| BigEndian::read_u16(c))
+            .map(BigEndian::read_u16)
             .collect();
         let name_b: Vec<u16> = b[8..8 + name_len_b.min((b.len() - 8) / 2) * 2]
             .chunks_exact(2)
-            .map(|c| BigEndian::read_u16(c))
+            .map(BigEndian::read_u16)
             .collect();
         hfs_common::compare_hfsplus_keys(parent_a, &name_a, parent_b, &name_b, false)
     }
@@ -667,7 +667,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
                 }
                 let key_len = BigEndian::read_u16(&rec[0..2]) as usize;
                 let mut data_off = abs_off + 2 + key_len;
-                if data_off % 2 != 0 {
+                if !data_off.is_multiple_of(2) {
                     data_off += 1;
                 }
                 let abs_end = abs_off + rec.len();
@@ -929,7 +929,7 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
             return Ok(ForkData::empty());
         }
         let block_size = self.vh.block_size as u64;
-        let blocks_needed = ((data_len + block_size - 1) / block_size) as u32;
+        let blocks_needed = data_len.div_ceil(block_size) as u32;
         let start_block = self.allocate_blocks(blocks_needed)?;
 
         // Write data block by block
@@ -1290,7 +1290,7 @@ impl<R: Read + Seek + Send> HfsPlusFilesystem<R> {
             let node_size = self.catalog_header.node_size as usize;
             let key_len = BigEndian::read_u16(&self.catalog_data[offset..offset + 2]) as usize;
             let mut rec_data_start = offset + 2 + key_len;
-            if rec_data_start % 2 != 0 {
+            if !rec_data_start.is_multiple_of(2) {
                 rec_data_start += 1;
             }
             // Thread record: type(2) + reserved(2) + parentID(4) + name_len(2) + name(UTF-16BE)
@@ -1397,10 +1397,7 @@ fn write_fork_data<R: Write + Seek>(
 
 /// Decode a UTF-16BE byte slice to a String.
 fn decode_utf16be(data: &[u8]) -> String {
-    let chars: Vec<u16> = data
-        .chunks_exact(2)
-        .map(|c| BigEndian::read_u16(c))
-        .collect();
+    let chars: Vec<u16> = data.chunks_exact(2).map(BigEndian::read_u16).collect();
     String::from_utf16_lossy(&chars)
 }
 
@@ -1454,7 +1451,7 @@ fn find_volume_label(catalog_data: &[u8], header: &BTreeHeaderRecord) -> String 
 
             // This is a thread record for the root — get the record data
             let mut rec_data_start = rec_offset + 2 + key_len;
-            if rec_data_start % 2 != 0 {
+            if !rec_data_start.is_multiple_of(2) {
                 rec_data_start += 1;
             }
             if rec_data_start + 10 > node.len() {
@@ -1487,7 +1484,7 @@ fn find_volume_label(catalog_data: &[u8], header: &BTreeHeaderRecord) -> String 
 /// Find the index of the last set bit in a bitmap (MSB-first).
 fn find_last_set_bit(bitmap: &[u8], max_bits: u32) -> Option<u32> {
     // Scan from the end for efficiency
-    let last_byte = ((max_bits as usize).min(bitmap.len() * 8) + 7) / 8;
+    let last_byte = (max_bits as usize).min(bitmap.len() * 8).div_ceil(8);
     for byte_idx in (0..last_byte.min(bitmap.len())).rev() {
         if bitmap[byte_idx] == 0 {
             continue;
@@ -1765,7 +1762,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsPlusFilesystem<R> 
         let node_size = self.catalog_header.node_size as usize;
         let key_len = BigEndian::read_u16(&self.catalog_data[t_offset..t_offset + 2]) as usize;
         let mut rec_data_start = t_offset + 2 + key_len;
-        if rec_data_start % 2 != 0 {
+        if !rec_data_start.is_multiple_of(2) {
             rec_data_start += 1;
         }
         let thread_parent =
@@ -1787,7 +1784,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsPlusFilesystem<R> 
         // Compute the record data offset
         let fkey_len = BigEndian::read_u16(&self.catalog_data[f_offset..f_offset + 2]) as usize;
         let mut frec_start = f_offset + 2 + fkey_len;
-        if frec_start % 2 != 0 {
+        if !frec_start.is_multiple_of(2) {
             frec_start += 1;
         }
 
@@ -1825,7 +1822,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsPlusFilesystem<R> 
 
         let key_len = BigEndian::read_u16(&self.catalog_data[t_offset..t_offset + 2]) as usize;
         let mut rec_data_start = t_offset + 2 + key_len;
-        if rec_data_start % 2 != 0 {
+        if !rec_data_start.is_multiple_of(2) {
             rec_data_start += 1;
         }
         let thread_parent =
@@ -1845,7 +1842,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsPlusFilesystem<R> 
 
         let fkey_len = BigEndian::read_u16(&self.catalog_data[f_offset..f_offset + 2]) as usize;
         let mut frec_start = f_offset + 2 + fkey_len;
-        if frec_start % 2 != 0 {
+        if !frec_start.is_multiple_of(2) {
             frec_start += 1;
         }
 

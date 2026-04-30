@@ -132,7 +132,7 @@ impl<'a> BitmapReader<'a> {
             if masked != mask {
                 // There's a clear bit in the valid range
                 let bit = masked.trailing_ones();
-                if (bit as u32) < remaining_bits {
+                if bit < remaining_bits {
                     return Some(full_bytes as u64 * 8 + bit as u64);
                 }
             }

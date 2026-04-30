@@ -129,7 +129,7 @@ pub(crate) fn vhd_chs_geometry(size_bytes: u64) -> (u32, u32, u32) {
 
     let mut spt = 17u32;
     let mut cyl_times_heads = total_sectors / spt;
-    let mut heads = (cyl_times_heads + 1023) / 1024;
+    let mut heads = cyl_times_heads.div_ceil(1024);
 
     if heads < 4 {
         heads = 4;

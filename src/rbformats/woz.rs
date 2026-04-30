@@ -127,7 +127,7 @@ fn parse_woz(data: Vec<u8>) -> Result<WozFile> {
 
 /// Get the bitstream for a given TMAP index.
 /// Returns (bitstream_slice, bit_count).
-fn get_track_bits<'a>(woz: &'a WozFile, tmap_idx: u8) -> Option<(&'a [u8], u32)> {
+fn get_track_bits(woz: &WozFile, tmap_idx: u8) -> Option<(&[u8], u32)> {
     if tmap_idx == 0xFF {
         return None;
     }

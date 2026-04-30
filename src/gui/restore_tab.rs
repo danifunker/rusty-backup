@@ -746,10 +746,8 @@ impl RestoreTab {
                         }
                     });
 
-                if self.sp_target_device_idx.is_some() {
-                    if ui.button("Scan Target").clicked() {
-                        self.scan_target_partitions(ctx);
-                    }
+                if self.sp_target_device_idx.is_some() && ui.button("Scan Target").clicked() {
+                    self.scan_target_partitions(ctx);
                 }
             });
 
@@ -947,7 +945,7 @@ impl RestoreTab {
             // last_data_byte). Fall back to imaged_size_bytes for older backups
             // that used packed compaction (where imaged < original), and finally
             // original_size_bytes when no sizing hint is available.
-            let minimum = pm.minimum_size_bytes.filter(|&s| s > 0).unwrap_or_else(|| {
+            let minimum = pm.minimum_size_bytes.filter(|&s| s > 0).unwrap_or({
                 if pm.imaged_size_bytes > 0 {
                     pm.imaged_size_bytes
                 } else {

@@ -50,7 +50,7 @@ pub(super) fn check_extents_btree_structure(extents_data: &[u8], errors: &mut Ve
     let node_size = header.node_size as usize;
 
     // Node size validation
-    if node_size < 512 || node_size % 512 != 0 || extents_data.len() < node_size {
+    if node_size < 512 || !node_size.is_multiple_of(512) || extents_data.len() < node_size {
         errors.push(hfs_issue(
             HfsFsckCode::ExtentsBtreeStructure,
             format!(
@@ -614,7 +614,7 @@ pub(super) fn repair_extents_btree_structure(
 
     let header = BTreeHeader::read(extents_data);
     let node_size = header.node_size as usize;
-    if node_size < 512 || node_size % 512 != 0 || extents_data.len() < node_size {
+    if node_size < 512 || !node_size.is_multiple_of(512) || extents_data.len() < node_size {
         report
             .fixes_failed
             .push("Cannot repair extents B-tree: invalid node size".into());

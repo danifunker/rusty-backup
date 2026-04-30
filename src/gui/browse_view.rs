@@ -621,7 +621,6 @@ impl BrowseView {
                     self.show_unsaved_dialog = true;
                 } else {
                     self.close();
-                    return;
                 }
             }
         });
@@ -1421,7 +1420,7 @@ impl BrowseView {
                     // Also check if the cache key itself matches
                     if path == parent_path {
                         // We need the entry for this path, find it
-                        for (_, siblings) in &self.directory_cache {
+                        for siblings in self.directory_cache.values() {
                             for e in siblings {
                                 if e.path == *path && e.is_directory() {
                                     return e.clone();
@@ -3406,7 +3405,7 @@ fn detect_content_type(entry: &FileEntry, data: &[u8]) -> FileContent {
 /// Render a hex dump view of binary data.
 fn render_hex_view(ui: &mut egui::Ui, data: &[u8]) {
     let bytes_per_line = 16;
-    let lines = (data.len() + bytes_per_line - 1) / bytes_per_line;
+    let lines = data.len().div_ceil(bytes_per_line);
     let max_lines = 256; // Limit display to ~4KB
 
     let display_lines = lines.min(max_lines);

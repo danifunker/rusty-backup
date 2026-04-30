@@ -94,16 +94,16 @@ pub fn detect_alignment(table: &PartitionTable) -> PartitionAlignment {
     }
 
     // Check for modern 1MB alignment: first partition at LBA 2048
-    if first_lba == 2048 || first_lba % 2048 == 0 {
-        if partitions.iter().all(|p| p.start_lba % 2048 == 0) {
-            return PartitionAlignment {
-                first_lba,
-                alignment_sectors: 2048,
-                alignment_type: AlignmentType::Modern1MB,
-                heads,
-                sectors_per_track,
-            };
-        }
+    if (first_lba == 2048 || first_lba % 2048 == 0)
+        && partitions.iter().all(|p| p.start_lba % 2048 == 0)
+    {
+        return PartitionAlignment {
+            first_lba,
+            alignment_sectors: 2048,
+            alignment_type: AlignmentType::Modern1MB,
+            heads,
+            sectors_per_track,
+        };
     }
 
     // Check for any custom alignment pattern

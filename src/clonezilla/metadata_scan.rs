@@ -480,7 +480,7 @@ fn identify_ext_metadata_blocks(data: &[u8], block_size: u64) -> Vec<u64> {
     }
 
     let blocks_count_lo = u32::from_le_bytes(data[sb_off..sb_off + 4].try_into().unwrap()) as u64;
-    let _inodes_count = u32::from_le_bytes(data[sb_off + 0x00..sb_off + 0x04].try_into().unwrap());
+    let _inodes_count = u32::from_le_bytes(data[sb_off..sb_off + 0x04].try_into().unwrap());
     let first_data_block =
         u32::from_le_bytes(data[sb_off + 0x14..sb_off + 0x18].try_into().unwrap()) as u64;
     let log_block_size = u32::from_le_bytes(data[sb_off + 0x18..sb_off + 0x1C].try_into().unwrap());
@@ -797,28 +797,28 @@ fn discover_linux_directory_blocks(cache: &PartcloneBlockCache, block_size: u32)
     let btrfs_sb_block = 0x10000 / bs;
     if let Some(sb_block_data) = cache.blocks.get(&btrfs_sb_block) {
         let sb_off_in_block = (0x10000 % bs) as usize;
-        if sb_block_data.len() >= sb_off_in_block + 0x48 {
-            if &sb_block_data[sb_off_in_block + 0x40..sb_off_in_block + 0x48] == b"_BHRfS_M" {
-                // Reconstruct 4096-byte superblock from cached blocks
-                let mut sb_buf = vec![0u8; 4096];
-                let mut filled = 0usize;
-                let mut byte_pos = 0x10000u64;
-                while filled < 4096 {
-                    let block_idx = byte_pos / bs;
-                    let block_off = (byte_pos % bs) as usize;
-                    if let Some(block_data) = cache.blocks.get(&block_idx) {
-                        let avail = (block_data.len() - block_off).min(4096 - filled);
-                        sb_buf[filled..filled + avail]
-                            .copy_from_slice(&block_data[block_off..block_off + avail]);
-                        filled += avail;
-                        byte_pos += avail as u64;
-                    } else {
-                        break;
-                    }
+        if sb_block_data.len() >= sb_off_in_block + 0x48
+            && &sb_block_data[sb_off_in_block + 0x40..sb_off_in_block + 0x48] == b"_BHRfS_M"
+        {
+            // Reconstruct 4096-byte superblock from cached blocks
+            let mut sb_buf = vec![0u8; 4096];
+            let mut filled = 0usize;
+            let mut byte_pos = 0x10000u64;
+            while filled < 4096 {
+                let block_idx = byte_pos / bs;
+                let block_off = (byte_pos % bs) as usize;
+                if let Some(block_data) = cache.blocks.get(&block_idx) {
+                    let avail = (block_data.len() - block_off).min(4096 - filled);
+                    sb_buf[filled..filled + avail]
+                        .copy_from_slice(&block_data[block_off..block_off + avail]);
+                    filled += avail;
+                    byte_pos += avail as u64;
+                } else {
+                    break;
                 }
-                if filled >= 0x60 {
-                    return identify_btrfs_metadata_blocks_from_sb(&sb_buf, bs);
-                }
+            }
+            if filled >= 0x60 {
+                return identify_btrfs_metadata_blocks_from_sb(&sb_buf, bs);
             }
         }
     }

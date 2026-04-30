@@ -841,7 +841,7 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
 
                 if let Some(entry) = self.parse_file_name_entry(content, parent_path, mft_ref) {
                     // Skip system metafiles (MFT records 0-23)
-                    if mft_ref >= 24 || (mft_ref >= 11 && mft_ref < 24) {
+                    if mft_ref >= 24 || (11..24).contains(&mft_ref) {
                         entries.push(entry);
                     }
                 }
@@ -1080,7 +1080,7 @@ fn min_unsigned_bytes(val: u64) -> usize {
         return 1;
     }
     let bits = 64 - val.leading_zeros() as usize;
-    (bits + 7) / 8
+    bits.div_ceil(8)
 }
 
 /// Minimum bytes to represent a signed value.
@@ -2311,24 +2311,20 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
         let mut file_data = vec![0u8; data_len as usize];
         if data_len > 0 {
             data.read_exact(&mut file_data)
-                .map_err(|e| FilesystemError::Io(e))?;
+                .map_err(FilesystemError::Io)?;
         }
 
         // Determine resident vs non-resident threshold
         // Approximate: record_size - header(0x38) - StdInfo(~72) - FileName(~104) - SD(~80) - DATA_header(~24) - end(4)
         let overhead = 0x38 + 72 + 104 + 80 + 24 + 4;
-        let resident_threshold = if self.mft_record_size as usize > overhead {
-            self.mft_record_size as usize - overhead
-        } else {
-            0
-        };
+        let resident_threshold = (self.mft_record_size as usize).saturating_sub(overhead);
 
         let data_attr = if data_len as usize <= resident_threshold {
             // Resident $DATA
             build_resident_attr(ATTR_DATA, &file_data)
         } else {
             // Non-resident: allocate clusters
-            let clusters_needed = ((data_len + self.cluster_size - 1) / self.cluster_size) as u32;
+            let clusters_needed = data_len.div_ceil(self.cluster_size) as u32;
             let runs = self.allocate_volume_clusters(clusters_needed)?;
 
             // Write data to allocated clusters
@@ -2655,11 +2651,11 @@ impl<R: Read + Seek> Read for CompactNtfsReader<R> {
                     let src_offset = self.partition_offset + src_cluster * self.cluster_size;
                     self.source
                         .seek(SeekFrom::Start(src_offset))
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                        .map_err(io::Error::other)?;
                     self.cluster_buf.resize(self.cluster_size as usize, 0);
                     self.source
                         .read_exact(&mut self.cluster_buf)
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                        .map_err(io::Error::other)?;
                 }
 
                 let avail = self.cluster_size as usize - within_cluster;

@@ -188,7 +188,7 @@ pub(super) fn check_mdb(mdb: &HfsMasterDirectoryBlock, errors: &mut Vec<FsckIssu
     // The data area starts at sector drAlBlSt.
     if mdb.block_size > 0 && mdb.total_blocks > 0 {
         let bits_per_sector: u32 = 512 * 8; // 4096 bits per 512-byte sector
-        let vbm_sectors = (mdb.total_blocks as u32 + bits_per_sector - 1) / bits_per_sector;
+        let vbm_sectors = (mdb.total_blocks as u32).div_ceil(bits_per_sector);
         let vbm_end = mdb.volume_bitmap_block as u32 + vbm_sectors;
         if vbm_end > mdb.first_alloc_block as u32 {
             errors.push(hfs_issue(

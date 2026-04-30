@@ -291,8 +291,8 @@ impl eframe::App for RustyBackupApp {
                     {
                         self.bulk_convert_dialog = Some(BulkConvertDialog::default());
                     }
-                    if bulk_running {
-                        if ui.button("Cancel Bulk").clicked() {
+                    if bulk_running
+                        && ui.button("Cancel Bulk").clicked() {
                             if let Some(ref s) = self.bulk_convert_status {
                                 if let Ok(mut g) = s.lock() {
                                     g.cancel_requested = true;
@@ -300,7 +300,6 @@ impl eframe::App for RustyBackupApp {
                             }
                             self.log_panel.warn("Bulk convert cancellation requested...");
                         }
-                    }
                 });
             });
         });

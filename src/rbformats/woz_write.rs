@@ -44,7 +44,7 @@ impl BitWriter {
 
     /// Bytes used so far (rounded up to whole bytes).
     pub fn byte_count(&self) -> usize {
-        (self.bit_pos + 7) / 8
+        self.bit_pos.div_ceil(8)
     }
 
     /// Consume the writer and return the underlying buffer.
@@ -672,7 +672,7 @@ pub fn build_woz2_file(disk_type: u8, sides: u8, tracks: &[(Vec<u8>, u32)]) -> V
     let mut largest_blocks: u16 = 0;
     let mut total_track_bytes = 0usize;
     for (bytes, _bit_count) in tracks {
-        let blocks = ((bytes.len() + BLOCK_SIZE - 1) / BLOCK_SIZE) as u16;
+        let blocks = bytes.len().div_ceil(BLOCK_SIZE) as u16;
         if blocks > largest_blocks {
             largest_blocks = blocks;
         }

@@ -947,7 +947,7 @@ fn repair_thread_record_lengths(
                 continue;
             }
             let mut data_start = key_total;
-            if data_start % 2 != 0 {
+            if !data_start.is_multiple_of(2) {
                 data_start += 1;
             }
             if data_start >= rec_len {
