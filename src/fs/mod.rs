@@ -369,6 +369,92 @@ pub fn effective_partition_size<R: Read + Seek + Send + 'static>(
     fs.last_data_byte().ok()
 }
 
+/// Outcome of a `partition_minimum_size` call.
+pub enum MinimumResult {
+    /// The minimum was computed (or determined to be unavailable for this FS type).
+    Computed(Option<u64>),
+    /// This filesystem requires an expensive volume walk and the caller did not
+    /// opt in via `allow_expensive`. The caller should surface a UI affordance
+    /// (e.g. a "Calculate minimum size" button) and re-invoke with `true`.
+    Deferred {
+        /// Human-readable filesystem name (e.g. "HFS", "ext", "btrfs"), suitable
+        /// for log messages like "Need to calculate minimum size due to filesystem X".
+        fs_name: &'static str,
+    },
+}
+
+/// Human-readable name of the filesystem associated with a partition type.
+fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &'static str {
+    if let Some(s) = partition_type_string {
+        return match s {
+            "Apple_HFS" => "HFS",
+            "Apple_HFSX" => "HFSX",
+            "Apple_UNIX_SVR2" => "ext/btrfs",
+            "Linux" => "ext/btrfs",
+            _ => "unknown",
+        };
+    }
+    match partition_type {
+        0xAF => "HFS/HFS+",
+        0x83 => "ext/btrfs",
+        0xA8 => "ProDOS",
+        0x07 => "NTFS/exFAT",
+        0x01 | 0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C => "FAT",
+        _ => "unknown",
+    }
+}
+
+/// True if computing the minimum size for this partition type requires an
+/// expensive filesystem walk (catalog/extent tree traversal).
+///
+/// Cheap path (allocation-bitmap reads): FAT, NTFS, exFAT.
+/// Expensive path (full volume walk): HFS, HFS+, ext, btrfs, ProDOS.
+pub fn is_expensive_minimum(partition_type: u8, partition_type_string: Option<&str>) -> bool {
+    if let Some(s) = partition_type_string {
+        return matches!(s, "Apple_HFS" | "Apple_HFSX" | "Apple_UNIX_SVR2" | "Linux");
+    }
+    matches!(partition_type, 0xAF | 0x83 | 0xA8)
+}
+
+/// Compute the minimum size for a partition, optionally gated behind an
+/// expensive-walk opt-in.
+///
+/// When `allow_expensive` is `false` and the filesystem requires a volume
+/// walk, returns `Deferred { fs_name }`. The caller is expected to log a
+/// message such as "Need to calculate minimum size due to filesystem {fs_name}"
+/// and surface a UI affordance to re-invoke with `allow_expensive=true`.
+///
+/// `progress` receives short phase strings ("Opening filesystem...",
+/// "Computing last data byte...") so a worker thread can update its status.
+pub fn partition_minimum_size<R: Read + Seek + Send + 'static>(
+    reader: R,
+    partition_offset: u64,
+    partition_type: u8,
+    partition_type_string: Option<&str>,
+    partition_size: u64,
+    allow_expensive: bool,
+    progress: &dyn Fn(&str),
+) -> MinimumResult {
+    if !allow_expensive && is_expensive_minimum(partition_type, partition_type_string) {
+        return MinimumResult::Deferred {
+            fs_name: fs_name_for(partition_type, partition_type_string),
+        };
+    }
+    progress("Opening filesystem...");
+    let mut fs = match open_filesystem(
+        reader,
+        partition_offset,
+        partition_type,
+        partition_type_string,
+    ) {
+        Ok(fs) => fs,
+        Err(_) => return MinimumResult::Computed(None),
+    };
+    progress("Computing last data byte...");
+    let min = fs.last_data_byte().ok().map(|m| m.min(partition_size));
+    MinimumResult::Computed(min)
+}
+
 /// Open a filesystem for browsing within a partition.
 ///
 /// `reader` must be seekable and positioned at the partition start.

@@ -37,6 +37,16 @@ pub struct BackupTab {
     selected_partitions: HashSet<usize>,
     /// Minimum sizes per partition (indexed by partition index), from filesystem analysis
     partition_min_sizes: std::collections::HashMap<usize, u64>,
+    /// Partitions whose minimum size requires an expensive volume walk; the
+    /// VHD-export popup surfaces a "Calc min" button per index.
+    deferred_min_sizes: std::collections::HashMap<usize, &'static str>,
+    /// Currently-running per-partition min-size worker threads.
+    pending_min_size_calcs: std::collections::HashMap<
+        usize,
+        Arc<Mutex<rusty_backup::model::min_size_runner::MinSizeStatus>>,
+    >,
+    /// Open file handle for the source (kept alive so min-size workers can clone it).
+    source_file: Option<Arc<File>>,
     partition_load_error: Option<String>,
     /// Change detection for auto-load
     prev_device_idx: Option<usize>,
@@ -59,6 +69,10 @@ struct VhdPartitionConfig {
     minimum_size: u64,
     choice: VhdSizeChoice,
     custom_size_mib: u32,
+    /// Filesystem name when the minimum size requires an expensive walk
+    /// (deferred at popup-open time). Cleared when the user clicks "Calc min"
+    /// and the worker finishes successfully.
+    deferred_fs: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -97,6 +111,9 @@ impl Default for BackupTab {
             source_partitions: Vec::new(),
             selected_partitions: HashSet::new(),
             partition_min_sizes: std::collections::HashMap::new(),
+            deferred_min_sizes: std::collections::HashMap::new(),
+            pending_min_size_calcs: std::collections::HashMap::new(),
+            source_file: None,
             partition_load_error: None,
             prev_device_idx: None,
             prev_image_path: None,
@@ -121,6 +138,9 @@ impl BackupTab {
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext, progress: &mut ProgressState) {
         // Poll background backup thread
         self.poll_progress(ctx, progress);
+
+        // Poll any pending per-partition minimum-size calculations
+        self.poll_min_size_calcs(ctx);
 
         ui.heading("Backup Disk");
         ui.add_space(8.0);
@@ -409,6 +429,7 @@ impl BackupTab {
                 .get(&part.index)
                 .copied()
                 .unwrap_or(part.size_bytes);
+            let deferred_fs = self.deferred_min_sizes.get(&part.index).copied();
 
             self.vhd_partition_configs.push(VhdPartitionConfig {
                 index: part.index,
@@ -418,6 +439,7 @@ impl BackupTab {
                 minimum_size: min_size,
                 choice: VhdSizeChoice::Original,
                 custom_size_mib: (part.size_bytes / (1024 * 1024)) as u32,
+                deferred_fs,
             });
         }
     }
@@ -457,11 +479,13 @@ impl BackupTab {
                             ui.label(egui::RichText::new("Size (MiB)").strong());
                             ui.end_row();
 
+                            let mut min_calc_request: Option<usize> = None;
                             for cfg in &mut self.vhd_partition_configs {
                                 ui.label(format!("{}", cfg.index));
                                 ui.label(&cfg.type_name);
 
                                 let prev_choice = cfg.choice;
+                                let pending = self.pending_min_size_calcs.contains_key(&cfg.index);
                                 ui.horizontal(|ui| {
                                     ui.radio_value(
                                         &mut cfg.choice,
@@ -474,6 +498,19 @@ impl BackupTab {
                                             VhdSizeChoice::Minimum,
                                             "Minimum",
                                         );
+                                    } else if pending {
+                                        ui.add(egui::Spinner::new())
+                                            .on_hover_text("Calculating minimum...");
+                                    } else if let Some(fs_name) = cfg.deferred_fs {
+                                        if ui
+                                            .small_button("Calc min")
+                                            .on_hover_text(format!(
+                                                "Compute minimum size (walks the {fs_name} volume)",
+                                            ))
+                                            .clicked()
+                                        {
+                                            min_calc_request = Some(cfg.index);
+                                        }
                                     }
                                     ui.radio_value(
                                         &mut cfg.choice,
@@ -502,6 +539,9 @@ impl BackupTab {
                                     ui.label(format!("{}", cfg.effective_size() / (1024 * 1024),));
                                 }
                                 ui.end_row();
+                            }
+                            if let Some(part_index) = min_calc_request {
+                                self.start_min_size_calc(part_index, ctx);
                             }
                         });
                     ui.add_space(4.0);
@@ -643,12 +683,110 @@ impl BackupTab {
         }
     }
 
+    /// Spawn a worker thread to compute the minimum size for a deferred partition.
+    fn start_min_size_calc(&mut self, part_index: usize, ctx: &mut TabContext) {
+        if self.pending_min_size_calcs.contains_key(&part_index) {
+            return;
+        }
+        let Some(part) = self
+            .source_partitions
+            .iter()
+            .find(|p| p.index == part_index)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(file_arc) = self.source_file.clone() else {
+            ctx.log.error(format!(
+                "Cannot calculate minimum size for partition {part_index}: no open source handle",
+            ));
+            return;
+        };
+        let path = self.source_path(ctx);
+        let is_device = path
+            .as_ref()
+            .map(|p| {
+                let s = p.to_string_lossy();
+                s.starts_with("/dev/") || s.starts_with("\\\\.\\")
+            })
+            .unwrap_or(false);
+
+        let fs_name = self
+            .deferred_min_sizes
+            .get(&part_index)
+            .copied()
+            .unwrap_or("unknown");
+        ctx.log.info(format!(
+            "Calculating minimum size for partition {part_index} ({fs_name})...",
+        ));
+
+        let req = rusty_backup::model::min_size_runner::MinSizeRequest {
+            file: file_arc,
+            partition_offset: part.start_lba * 512,
+            partition_type: part.partition_type_byte,
+            partition_type_string: part.partition_type_string.clone(),
+            partition_size: part.size_bytes,
+            partition_index: part_index,
+            use_sector_aligned: is_device,
+        };
+        let status = rusty_backup::model::min_size_runner::spawn(req);
+        self.pending_min_size_calcs.insert(part_index, status);
+    }
+
+    /// Poll all pending min-size workers; on completion, move results into
+    /// `partition_min_sizes` and refresh any matching `vhd_partition_configs`.
+    fn poll_min_size_calcs(&mut self, ctx: &mut TabContext) {
+        let finished_indices: Vec<usize> = self
+            .pending_min_size_calcs
+            .iter()
+            .filter_map(|(idx, status)| status.lock().ok().filter(|s| s.finished).map(|_| *idx))
+            .collect();
+        for idx in finished_indices {
+            if let Some(status_arc) = self.pending_min_size_calcs.remove(&idx) {
+                if let Ok(s) = status_arc.lock() {
+                    if let Some(err) = &s.error {
+                        ctx.log.error(format!(
+                            "Minimum size calculation failed for partition {idx}: {err}",
+                        ));
+                    } else if let Some(min) = s.result {
+                        let part_size = self
+                            .source_partitions
+                            .iter()
+                            .find(|p| p.index == idx)
+                            .map(|p| p.size_bytes)
+                            .unwrap_or(min);
+                        let clamped = min.min(part_size);
+                        self.partition_min_sizes.insert(idx, clamped);
+                        ctx.log.info(format!(
+                            "Partition {idx}: minimum size {} (computed)",
+                            partition::format_size(clamped),
+                        ));
+                        for cfg in &mut self.vhd_partition_configs {
+                            if cfg.index == idx {
+                                cfg.minimum_size = clamped;
+                                cfg.deferred_fs = None;
+                            }
+                        }
+                    } else {
+                        ctx.log.info(format!(
+                            "Partition {idx}: filesystem could not be opened for minimum-size calculation",
+                        ));
+                    }
+                }
+                self.deferred_min_sizes.remove(&idx);
+            }
+        }
+    }
+
     /// Scan source partition table and compute minimum partition sizes.
     /// For devices, this uses OS-level elevation (may prompt for credentials).
     fn scan_source_partitions(&mut self, ctx: &mut TabContext) {
         self.source_partitions.clear();
         self.selected_partitions.clear();
         self.partition_min_sizes.clear();
+        self.deferred_min_sizes.clear();
+        self.pending_min_size_calcs.clear();
+        self.source_file = None;
         self.partition_load_error = None;
 
         let path = match self.source_path(ctx) {
@@ -711,19 +849,29 @@ impl BackupTab {
                     table_desc,
                 ));
 
-                // Compute minimum partition sizes using filesystem analysis
+                // Compute minimum partition sizes using filesystem analysis.
+                // Cheap filesystems (FAT/NTFS/exFAT) compute eagerly here; expensive
+                // ones (HFS/HFS+/ext/btrfs/ProDOS) defer until the user clicks
+                // "Calc min" in the per-partition resize popup.
                 for part in &self.source_partitions {
                     if part.is_extended_container {
                         continue;
                     }
                     let offset = part.start_lba * 512;
-                    if let Ok(clone) = reader.get_ref().try_clone() {
-                        if let Some(min_size) = fs::effective_partition_size(
-                            BufReader::new(clone),
-                            offset,
-                            part.partition_type_byte,
-                            part.partition_type_string.as_deref(),
-                        ) {
+                    let Ok(clone) = reader.get_ref().try_clone() else {
+                        continue;
+                    };
+                    let result = fs::partition_minimum_size(
+                        BufReader::new(clone),
+                        offset,
+                        part.partition_type_byte,
+                        part.partition_type_string.as_deref(),
+                        part.size_bytes,
+                        false,
+                        &|_| {},
+                    );
+                    match result {
+                        fs::MinimumResult::Computed(Some(min_size)) => {
                             let clamped = min_size.min(part.size_bytes);
                             self.partition_min_sizes.insert(part.index, clamped);
                             ctx.log.info(format!(
@@ -733,7 +881,19 @@ impl BackupTab {
                                 partition::format_size(part.size_bytes),
                             ));
                         }
+                        fs::MinimumResult::Computed(None) => {}
+                        fs::MinimumResult::Deferred { fs_name } => {
+                            ctx.log.info(format!(
+                                "Partition {}: need to calculate minimum size due to filesystem {fs_name} (click \"Calc min\" to compute)",
+                                part.index,
+                            ));
+                            self.deferred_min_sizes.insert(part.index, fs_name);
+                        }
                     }
+                }
+                // Stash the open source file so worker threads can clone it later.
+                if let Ok(f) = reader.get_ref().try_clone() {
+                    self.source_file = Some(Arc::new(f));
                 }
             }
             Err(e) => {

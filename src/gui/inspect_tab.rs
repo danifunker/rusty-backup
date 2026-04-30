@@ -62,6 +62,12 @@ pub struct InspectTab {
     export_status: Option<Arc<Mutex<ExportStatus>>>,
     /// Filesystem-computed minimum partition sizes (partition index → bytes)
     partition_min_sizes: HashMap<usize, u64>,
+    /// Partitions whose minimum size requires an expensive volume walk; the
+    /// per-row UI surfaces a "Calc min" button that spawns a worker.
+    deferred_min_sizes: HashMap<usize, &'static str>,
+    /// Currently-running per-partition min-size worker threads.
+    pending_min_size_calcs:
+        HashMap<usize, Arc<Mutex<rusty_backup::model::min_size_runner::MinSizeStatus>>>,
     /// Clonezilla image metadata (when backup is a Clonezilla image)
     clonezilla_image: Option<ClonezillaImage>,
     /// Block caches per Clonezilla partition (for browse support)
@@ -123,6 +129,8 @@ impl Default for InspectTab {
             export_partition_configs: Vec::new(),
             export_status: None,
             partition_min_sizes: HashMap::new(),
+            deferred_min_sizes: HashMap::new(),
+            pending_min_size_calcs: HashMap::new(),
             clonezilla_image: None,
             block_caches: HashMap::new(),
             block_cache_scan: None,
@@ -171,6 +179,8 @@ impl InspectTab {
         self.alignment = None;
         self.browse_view.close();
         self.partition_min_sizes.clear();
+        self.deferred_min_sizes.clear();
+        self.pending_min_size_calcs.clear();
         self.clonezilla_image = None;
         self.block_caches.clear();
         self.block_cache_scan = None;
@@ -283,6 +293,9 @@ impl InspectTab {
 
         // Poll export status
         self.poll_export_status(ctx);
+
+        // Poll any pending per-partition minimum-size calculations
+        self.poll_min_size_calcs(ctx);
 
         // Re-inspect + Export VHD buttons
         ui.horizontal(|ui| {
@@ -1165,6 +1178,7 @@ impl InspectTab {
                 self.alignment = status.alignment.take();
                 self.partitions = std::mem::take(&mut status.partitions);
                 self.partition_min_sizes = std::mem::take(&mut status.partition_min_sizes);
+                self.deferred_min_sizes = std::mem::take(&mut status.deferred_min_sizes);
                 self.image_format_label = status.format_label.take();
                 // macOS only: capture the open device fd + guard so BrowseView
                 // can reuse it without re-opening (and without another auth dialog).
@@ -1224,6 +1238,8 @@ impl InspectTab {
         self.last_error = None;
         self.image_format_label = None;
         self.partition_min_sizes.clear();
+        self.deferred_min_sizes.clear();
+        self.pending_min_size_calcs.clear();
         self.clonezilla_image = None;
         self.block_caches.clear();
         self.block_cache_scan = None;
@@ -1309,6 +1325,7 @@ impl InspectTab {
             alignment: None,
             partitions: Vec::new(),
             partition_min_sizes: HashMap::new(),
+            deferred_min_sizes: HashMap::new(),
             format_label: None,
             device_file: None,
             device_guard: None,
@@ -1488,37 +1505,46 @@ impl InspectTab {
                         alignment.alignment_type, alignment.first_lba
                     ));
 
-                    // Compute minimum partition sizes via filesystem analysis
+                    // Compute minimum partition sizes via filesystem analysis.
+                    // Cheap filesystems (FAT/NTFS/exFAT) are computed eagerly here;
+                    // expensive ones (HFS/HFS+/ext/btrfs/ProDOS) come back as
+                    // Deferred and are surfaced in the UI as a per-row button.
                     set_step("Analyzing filesystem sizes...");
                     let mut partition_min_sizes = HashMap::new();
+                    let mut deferred_min_sizes: HashMap<usize, &'static str> = HashMap::new();
                     for part in &partitions {
                         if part.is_extended_container {
                             continue;
                         }
-                        // Skip GPT protective partitions (0xEE) — they span the
-                        // entire disk and have no filesystem to analyze.
                         if part.partition_type_byte == 0xEE {
                             continue;
                         }
-                        if let Ok(f) = device_file.try_clone() {
-                            // Use SectorAlignedReader for raw devices (/dev/rdiskN)
-                            // which require sector-aligned seeks and reads.
-                            let min_size = if is_device {
-                                rusty_backup::fs::effective_partition_size(
-                                    rusty_backup::os::SectorAlignedReader::new(f),
-                                    part.start_lba * 512,
-                                    part.partition_type_byte,
-                                    part.partition_type_string.as_deref(),
-                                )
-                            } else {
-                                rusty_backup::fs::effective_partition_size(
-                                    BufReader::new(f),
-                                    part.start_lba * 512,
-                                    part.partition_type_byte,
-                                    part.partition_type_string.as_deref(),
-                                )
-                            };
-                            if let Some(min_size) = min_size {
+                        let Ok(f) = device_file.try_clone() else {
+                            continue;
+                        };
+                        let result = if is_device {
+                            rusty_backup::fs::partition_minimum_size(
+                                rusty_backup::os::SectorAlignedReader::new(f),
+                                part.start_lba * 512,
+                                part.partition_type_byte,
+                                part.partition_type_string.as_deref(),
+                                part.size_bytes,
+                                false,
+                                &|_| {},
+                            )
+                        } else {
+                            rusty_backup::fs::partition_minimum_size(
+                                BufReader::new(f),
+                                part.start_lba * 512,
+                                part.partition_type_byte,
+                                part.partition_type_string.as_deref(),
+                                part.size_bytes,
+                                false,
+                                &|_| {},
+                            )
+                        };
+                        match result {
+                            rusty_backup::fs::MinimumResult::Computed(Some(min_size)) => {
                                 let clamped = min_size.min(part.size_bytes);
                                 partition_min_sizes.insert(part.index, clamped);
                                 push_log(format!(
@@ -1527,6 +1553,14 @@ impl InspectTab {
                                     rusty_backup::partition::format_size(clamped),
                                     rusty_backup::partition::format_size(part.size_bytes),
                                 ));
+                            }
+                            rusty_backup::fs::MinimumResult::Computed(None) => {}
+                            rusty_backup::fs::MinimumResult::Deferred { fs_name } => {
+                                push_log(format!(
+                                    "Partition {}: need to calculate minimum size due to filesystem {fs_name} (click \"Calc min\" to compute)",
+                                    part.index,
+                                ));
+                                deferred_min_sizes.insert(part.index, fs_name);
                             }
                         }
                     }
@@ -1537,6 +1571,7 @@ impl InspectTab {
                         s.alignment = Some(alignment);
                         s.partitions = partitions;
                         s.partition_min_sizes = partition_min_sizes;
+                        s.deferred_min_sizes = deferred_min_sizes;
                         // On macOS, pass the open fd + claim to the main thread
                         // so BrowseView can reuse it without re-opening/re-prompting.
                         #[cfg(target_os = "macos")]
@@ -1708,6 +1743,8 @@ impl InspectTab {
         let mut check_request: Option<(u64, u8, Option<String>)> = None;
         // Expand-HFS request: (offset, partition_size_bytes)
         let mut expand_request: Option<(u64, u64)> = None;
+        // "Calc min" button click: partition index to compute minimum size for.
+        let mut min_size_calc_request: Option<usize> = None;
 
         egui::Grid::new("partition_table")
             .striped(true)
@@ -1718,7 +1755,11 @@ impl InspectTab {
                 ui.label(egui::RichText::new("Type").strong());
                 ui.label(egui::RichText::new("Start LBA").strong());
                 ui.label(egui::RichText::new("Size").strong());
-                if self.backup_metadata.is_some() || !self.partition_min_sizes.is_empty() {
+                let show_min_col = self.backup_metadata.is_some()
+                    || !self.partition_min_sizes.is_empty()
+                    || !self.deferred_min_sizes.is_empty()
+                    || !self.pending_min_size_calcs.is_empty();
+                if show_min_col {
                     ui.label(egui::RichText::new("Min Size").strong());
                 }
                 ui.label(egui::RichText::new("Block Size").strong());
@@ -1745,7 +1786,7 @@ impl InspectTab {
                             egui::RichText::new(partition::format_size(part.size_bytes))
                                 .color(egui::Color32::GRAY),
                         );
-                        if self.backup_metadata.is_some() || !self.partition_min_sizes.is_empty() {
+                        if show_min_col {
                             if let Some(meta) = &self.backup_metadata {
                                 // Sum imaged_size_bytes of all logical partitions
                                 let logical_sum: u64 = meta
@@ -1774,7 +1815,7 @@ impl InspectTab {
                         ui.label(&part.type_name);
                         ui.label(format!("{}", part.start_lba));
                         ui.label(partition::format_size(part.size_bytes));
-                        if self.backup_metadata.is_some() || !self.partition_min_sizes.is_empty() {
+                        if show_min_col {
                             let min_size = self
                                 .backup_metadata
                                 .as_ref()
@@ -1806,6 +1847,24 @@ impl InspectTab {
                                 });
                             if let Some(sz) = min_size {
                                 ui.label(partition::format_size(sz));
+                            } else if let Some(pending) =
+                                self.pending_min_size_calcs.get(&part.index)
+                            {
+                                let phase = pending
+                                    .lock()
+                                    .map(|s| s.phase.clone())
+                                    .unwrap_or_else(|_| "...".to_string());
+                                ui.add(egui::Spinner::new()).on_hover_text(phase);
+                            } else if self.deferred_min_sizes.contains_key(&part.index) {
+                                if ui
+                                    .small_button("Calc min")
+                                    .on_hover_text(
+                                        "Compute minimum size (requires a filesystem walk)",
+                                    )
+                                    .clicked()
+                                {
+                                    min_size_calc_request = Some(part.index);
+                                }
                             } else {
                                 ui.label("");
                             }
@@ -1876,6 +1935,11 @@ impl InspectTab {
         // Handle expand-HFS request: probe the source, then open the dialog.
         if let Some((offset, partition_size)) = expand_request {
             self.open_expand_hfs(offset, partition_size, ctx);
+        }
+
+        // Handle "Calc min" click: spawn a worker for this partition.
+        if let Some(part_index) = min_size_calc_request {
+            self.start_min_size_calc(part_index, ctx);
         }
 
         // Fsck results popup
@@ -2182,6 +2246,95 @@ impl InspectTab {
             }
             Err(e) => {
                 ctx.log.error(format!("{e:#}"));
+            }
+        }
+    }
+
+    /// Spawn a worker thread to compute the minimum size for a deferred partition.
+    fn start_min_size_calc(&mut self, part_index: usize, ctx: &mut TabContext) {
+        if self.pending_min_size_calcs.contains_key(&part_index) {
+            return; // already running
+        }
+        let Some(part) = self
+            .partitions
+            .iter()
+            .find(|p| p.index == part_index)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(file_arc) = self.open_device_file.clone() else {
+            ctx.log.error(format!(
+                "Cannot calculate minimum size for partition {part_index}: no open device handle",
+            ));
+            return;
+        };
+        let is_device = self
+            .selected_device_idx
+            .and_then(|idx| ctx.devices.get(idx))
+            .map(|d| {
+                let s = d.path.to_string_lossy();
+                s.starts_with("/dev/") || s.starts_with("\\\\.\\")
+            })
+            .unwrap_or(false);
+
+        let fs_name = self
+            .deferred_min_sizes
+            .get(&part_index)
+            .copied()
+            .unwrap_or("unknown");
+        ctx.log.info(format!(
+            "Calculating minimum size for partition {part_index} ({fs_name})...",
+        ));
+
+        let req = rusty_backup::model::min_size_runner::MinSizeRequest {
+            file: file_arc,
+            partition_offset: part.start_lba * 512,
+            partition_type: part.partition_type_byte,
+            partition_type_string: part.partition_type_string.clone(),
+            partition_size: part.size_bytes,
+            partition_index: part_index,
+            use_sector_aligned: is_device,
+        };
+        let status = rusty_backup::model::min_size_runner::spawn(req);
+        self.pending_min_size_calcs.insert(part_index, status);
+    }
+
+    /// Poll all pending min-size workers; on completion, move results into
+    /// `partition_min_sizes` and clear the deferred entry.
+    fn poll_min_size_calcs(&mut self, ctx: &mut TabContext) {
+        let finished_indices: Vec<usize> = self
+            .pending_min_size_calcs
+            .iter()
+            .filter_map(|(idx, status)| status.lock().ok().filter(|s| s.finished).map(|_| *idx))
+            .collect();
+        for idx in finished_indices {
+            if let Some(status_arc) = self.pending_min_size_calcs.remove(&idx) {
+                if let Ok(s) = status_arc.lock() {
+                    if let Some(err) = &s.error {
+                        ctx.log.error(format!(
+                            "Minimum size calculation failed for partition {idx}: {err}",
+                        ));
+                    } else if let Some(min) = s.result {
+                        let part_size = self
+                            .partitions
+                            .iter()
+                            .find(|p| p.index == idx)
+                            .map(|p| p.size_bytes)
+                            .unwrap_or(min);
+                        let clamped = min.min(part_size);
+                        self.partition_min_sizes.insert(idx, clamped);
+                        ctx.log.info(format!(
+                            "Partition {idx}: minimum size {} (computed)",
+                            partition::format_size(clamped),
+                        ));
+                    } else {
+                        ctx.log.info(format!(
+                            "Partition {idx}: filesystem could not be opened for minimum-size calculation",
+                        ));
+                    }
+                }
+                self.deferred_min_sizes.remove(&idx);
             }
         }
     }

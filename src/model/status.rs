@@ -29,6 +29,10 @@ pub struct InspectStatus {
     pub alignment: Option<PartitionAlignment>,
     pub partitions: Vec<PartitionInfo>,
     pub partition_min_sizes: HashMap<usize, u64>,
+    /// Partitions whose minimum size requires an expensive volume walk; the
+    /// GUI surfaces a "Calculate minimum size" button per index. Value is the
+    /// human-readable filesystem name (for log/UI text).
+    pub deferred_min_sizes: HashMap<usize, &'static str>,
     /// Detected image format label (e.g. "WOZ 3.5\"", "Fixed VHD").
     pub format_label: Option<String>,
     /// The open device file handle, passed back to the main thread so
