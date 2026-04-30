@@ -8,6 +8,7 @@ use rusty_backup::backup::{
     BackupConfig, BackupProgress, ChecksumType, CompressionType, LogLevel as BackupLogLevel,
 };
 use rusty_backup::fs;
+use rusty_backup::model::size_mode::SizeMode;
 use rusty_backup::model::status::VhdExportStatus;
 use rusty_backup::partition::PartitionSizeOverride;
 use rusty_backup::partition::{self, PartitionInfo, PartitionTable};
@@ -67,7 +68,7 @@ struct VhdPartitionConfig {
     start_lba: u64,
     original_size: u64,
     minimum_size: u64,
-    choice: VhdSizeChoice,
+    choice: SizeMode,
     custom_size_mib: u32,
     /// Filesystem name when the minimum size requires an expensive walk
     /// (deferred at popup-open time). Cleared when the user clicks "Calc min"
@@ -75,20 +76,10 @@ struct VhdPartitionConfig {
     deferred_fs: Option<&'static str>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum VhdSizeChoice {
-    Original,
-    Minimum,
-    Custom,
-}
-
 impl VhdPartitionConfig {
     fn effective_size(&self) -> u64 {
-        match self.choice {
-            VhdSizeChoice::Original => self.original_size,
-            VhdSizeChoice::Minimum => self.minimum_size,
-            VhdSizeChoice::Custom => self.custom_size_mib as u64 * 1024 * 1024,
-        }
+        self.choice
+            .effective_size(self.original_size, self.minimum_size, self.custom_size_mib)
     }
 }
 
@@ -437,7 +428,7 @@ impl BackupTab {
                 start_lba: part.start_lba,
                 original_size: part.size_bytes,
                 minimum_size: min_size,
-                choice: VhdSizeChoice::Original,
+                choice: SizeMode::Original,
                 custom_size_mib: (part.size_bytes / (1024 * 1024)) as u32,
                 deferred_fs,
             });
@@ -484,59 +475,35 @@ impl BackupTab {
                                 ui.label(format!("{}", cfg.index));
                                 ui.label(&cfg.type_name);
 
-                                let prev_choice = cfg.choice;
-                                let pending = self.pending_min_size_calcs.contains_key(&cfg.index);
-                                ui.horizontal(|ui| {
-                                    ui.radio_value(
-                                        &mut cfg.choice,
-                                        VhdSizeChoice::Original,
-                                        "Original",
-                                    );
-                                    if cfg.minimum_size < cfg.original_size {
-                                        ui.radio_value(
-                                            &mut cfg.choice,
-                                            VhdSizeChoice::Minimum,
-                                            "Minimum",
-                                        );
-                                    } else if pending {
-                                        ui.add(egui::Spinner::new())
-                                            .on_hover_text("Calculating minimum...");
-                                    } else if let Some(fs_name) = cfg.deferred_fs {
-                                        if ui
-                                            .small_button("Calc min")
-                                            .on_hover_text(format!(
-                                                "Compute minimum size (walks the {fs_name} volume)",
-                                            ))
-                                            .clicked()
-                                        {
-                                            min_calc_request = Some(cfg.index);
-                                        }
-                                    }
-                                    ui.radio_value(
-                                        &mut cfg.choice,
-                                        VhdSizeChoice::Custom,
-                                        "Custom",
-                                    );
-                                });
-
-                                if cfg.choice == VhdSizeChoice::Custom
-                                    && prev_choice != VhdSizeChoice::Custom
-                                {
-                                    cfg.custom_size_mib =
-                                        (cfg.minimum_size / (1024 * 1024)).max(1) as u32;
-                                }
-
-                                if cfg.choice == VhdSizeChoice::Custom {
-                                    let min_mib = (cfg.minimum_size / (1024 * 1024)).max(1) as u32;
-                                    let max_mib = (cfg.original_size / (1024 * 1024))
-                                        .max(min_mib as u64)
-                                        as u32;
-                                    ui.add(
-                                        egui::DragValue::new(&mut cfg.custom_size_mib)
-                                            .range(min_mib..=max_mib),
-                                    );
+                                let pending_phase = self
+                                    .pending_min_size_calcs
+                                    .get(&cfg.index)
+                                    .and_then(|s| s.lock().ok().map(|st| st.phase.clone()));
+                                let deferred = if let Some(phase) = &pending_phase {
+                                    Some(super::size_mode_row::DeferredMin::Pending {
+                                        phase: phase.as_str(),
+                                    })
                                 } else {
-                                    ui.label(format!("{}", cfg.effective_size() / (1024 * 1024),));
+                                    cfg.deferred_fs.map(|fs_name| {
+                                        super::size_mode_row::DeferredMin::Available { fs_name }
+                                    })
+                                };
+                                let action = super::size_mode_row::size_mode_row(
+                                    ui,
+                                    &mut cfg.choice,
+                                    &mut cfg.custom_size_mib,
+                                    cfg.original_size,
+                                    cfg.minimum_size,
+                                    super::size_mode_row::SizeModeRowOptions {
+                                        max_size: Some(cfg.original_size),
+                                        deferred,
+                                        ..Default::default()
+                                    },
+                                );
+                                if action
+                                    == super::size_mode_row::SizeModeRowAction::CalcMinRequested
+                                {
+                                    min_calc_request = Some(cfg.index);
                                 }
                                 ui.end_row();
                             }

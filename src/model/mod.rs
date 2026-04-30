@@ -11,4 +11,5 @@ pub mod export_runner;
 pub mod fsck_runner;
 pub mod min_size_runner;
 pub mod partition_editor;
+pub mod size_mode;
 pub mod status;

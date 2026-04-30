@@ -1,7 +1,7 @@
 //! Export configuration + background-thread orchestration.
 //!
 //! Owns the data structures for the "Export Disk Image" popup
-//! ([`PartitionExportConfig`], [`ExportSizeChoice`]) and the shared status
+//! ([`PartitionExportConfig`], [`SizeMode`]) and the shared status
 //! struct that the GUI polls while a worker thread runs ([`ExportStatus`]).
 //!
 //! Each `start_*` function takes the prepared inputs, spawns a worker thread
@@ -21,6 +21,7 @@ use crate::backup::metadata::BackupMetadata;
 use crate::clonezilla::metadata::ClonezillaImage;
 use crate::fs::fat::resize_fat_in_place;
 use crate::fs::hfs_max_growable_size;
+use crate::model::size_mode::SizeMode;
 use crate::partition::{self, PartitionInfo, PartitionSizeOverride};
 use crate::rbformats::export::{
     export_clonezilla_disk, export_clonezilla_partition, export_partition, export_whole_disk,
@@ -39,14 +40,6 @@ pub struct ExportStatus {
     pub cancel_requested: bool,
 }
 
-/// Per-partition size choice for export.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ExportSizeChoice {
-    Original,
-    Minimum,
-    Custom,
-}
-
 /// Per-partition export configuration.
 #[derive(Debug, Clone)]
 pub struct PartitionExportConfig {
@@ -59,17 +52,14 @@ pub struct PartitionExportConfig {
     /// can't request a resize that would corrupt the MDB. `None` means no
     /// filesystem-specific cap.
     pub max_size: Option<u64>,
-    pub choice: ExportSizeChoice,
+    pub choice: SizeMode,
     pub custom_size_mib: u32,
 }
 
 impl PartitionExportConfig {
     pub fn effective_size(&self) -> u64 {
-        match self.choice {
-            ExportSizeChoice::Original => self.original_size,
-            ExportSizeChoice::Minimum => self.minimum_size,
-            ExportSizeChoice::Custom => self.custom_size_mib as u64 * 1024 * 1024,
-        }
+        self.choice
+            .effective_size(self.original_size, self.minimum_size, self.custom_size_mib)
     }
 }
 
@@ -133,7 +123,7 @@ pub fn build_partition_configs(
             original_size: part.size_bytes,
             minimum_size: min_size,
             max_size,
-            choice: ExportSizeChoice::Original,
+            choice: SizeMode::Original,
             custom_size_mib: (part.size_bytes / (1024 * 1024)) as u32,
         });
     }

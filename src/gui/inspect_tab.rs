@@ -10,7 +10,7 @@ use rusty_backup::backup::metadata::BackupMetadata;
 use rusty_backup::clonezilla;
 use rusty_backup::clonezilla::metadata::ClonezillaImage;
 use rusty_backup::model::export_runner::{
-    self, ExportSizeChoice, ExportStatus, PartitionExportConfig, PerPartitionInputs,
+    self, ExportStatus, PartitionExportConfig, PerPartitionInputs,
 };
 use rusty_backup::model::partition_editor::PartitionEditor;
 use rusty_backup::model::status::{BlockCacheScan, CacheStatus, InspectStatus};
@@ -974,60 +974,26 @@ impl InspectTab {
                                 ui.label(format!("{}", cfg.index));
                                 ui.label(&cfg.type_name);
 
-                                let prev_choice = cfg.choice;
-                                ui.horizontal(|ui| {
-                                    ui.radio_value(
-                                        &mut cfg.choice,
-                                        ExportSizeChoice::Original,
-                                        "Original",
-                                    );
-                                    // Only show Minimum if it differs from original
-                                    if cfg.minimum_size < cfg.original_size {
-                                        ui.radio_value(
-                                            &mut cfg.choice,
-                                            ExportSizeChoice::Minimum,
-                                            "Minimum",
-                                        );
-                                    }
-                                    ui.radio_value(
-                                        &mut cfg.choice,
-                                        ExportSizeChoice::Custom,
-                                        "Custom",
-                                    );
+                                let max_size_hover = cfg.max_size.map(|b| {
+                                    let max_mib = (b / (1024 * 1024)).max(1) as u32;
+                                    format!(
+                                        "HFS volumes are capped at 65535 allocation blocks. \
+                                         For this volume's block size, the maximum is {max_mib} MiB. \
+                                         Growing further requires reformatting.",
+                                    )
                                 });
-
-                                // When switching to Custom, initialize to minimum size
-                                if cfg.choice == ExportSizeChoice::Custom
-                                    && prev_choice != ExportSizeChoice::Custom
-                                {
-                                    cfg.custom_size_mib =
-                                        (cfg.minimum_size / (1024 * 1024)).max(1) as u32;
-                                }
-
-                                if cfg.choice == ExportSizeChoice::Custom {
-                                    let min_mib = (cfg.minimum_size / (1024 * 1024)).max(1) as u32;
-                                    // Default ceiling: 2 TiB (VHD max). Classic HFS volumes
-                                    // carry a per-volume cap from their allocation block size
-                                    // (u16 block count), so respect that when we've probed it.
-                                    let max_mib = cfg
-                                        .max_size
-                                        .map(|b| (b / (1024 * 1024)).max(min_mib as u64) as u32)
-                                        .unwrap_or(2_097_152u32);
-                                    let resp = ui.add(
-                                        egui::DragValue::new(&mut cfg.custom_size_mib)
-                                            .range(min_mib..=max_mib),
-                                    );
-                                    if cfg.max_size.is_some() {
-                                        resp.on_hover_text(format!(
-                                            "HFS volumes are capped at 65535 allocation blocks. \
-                                             For this volume's block size, the maximum is {} MiB. \
-                                             Growing further requires reformatting.",
-                                            max_mib
-                                        ));
-                                    }
-                                } else {
-                                    ui.label(format!("{}", cfg.effective_size() / (1024 * 1024)));
-                                }
+                                super::size_mode_row::size_mode_row(
+                                    ui,
+                                    &mut cfg.choice,
+                                    &mut cfg.custom_size_mib,
+                                    cfg.original_size,
+                                    cfg.minimum_size,
+                                    super::size_mode_row::SizeModeRowOptions {
+                                        max_size: cfg.max_size,
+                                        max_size_hover: max_size_hover.as_deref(),
+                                        ..Default::default()
+                                    },
+                                );
                                 ui.end_row();
                             }
                         });

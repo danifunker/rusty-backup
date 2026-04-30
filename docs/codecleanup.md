@@ -235,8 +235,10 @@ Conventions:
   - **Evidence:** Today some flows use `Arc<Mutex<Status>>`, others use callbacks, others use `LogPanel` borrows.
   - **Suggested action:** Pick one (most likely a typed `mpsc` channel + a status snapshot), document it in `docs/`, and migrate.
 
-- [ ] **`src/gui/inspect_tab.rs` and `src/gui/restore_tab.rs` share partition-row rendering**
-  - **Suggested action:** Extract a shared `partition_row_widget` so the redesign doesn't carry forward two copies.
+- [x] **Shared size-mode chooser widget extracted (doc framing was misframed).**
+  - **On inspection:** the inspect-tab `partition_table` (read-only display: type / start LBA / size / boot / actions) and the restore-tab `restore_partition_sizes` (interactive size config: original / minimum / size-mode radios / MiB) are structurally different — different columns, different interactivity, no real shared widget. The doc's framing pointed at the wrong files.
+  - **The actual duplication** was in the size-mode chooser used by **three** popups: restore-tab `restore_partition_sizes`, inspect-tab export popup `export_partition_sizes`, backup-tab VHD popup `vhd_backup_partition_sizes`. Each defined its own enum (`RestoreSizeUiChoice` / `ExportSizeChoice` / `VhdSizeChoice`) and re-implemented the radio set + DragValue + effective-size label.
+  - **Done:** New `src/model/size_mode.rs` (36 lines) defines a single `SizeMode { Original, Minimum, Custom, FillRemaining }` enum + `effective_size`. New `src/gui/size_mode_row.rs` (142 lines) provides `size_mode_row(ui, &mut choice, &mut custom_mib, original, minimum, opts) -> SizeModeRowAction` rendering both grid cells, with `SizeModeRowOptions { allow_fill, max_size, max_size_hover, deferred, custom_seed }` covering every per-site variation: restore's FillRemaining + seed-from-original, export's HFS-cap hover, and backup-tab's deferred Calc-min button + spinner. All three call sites collapsed: restore (~50 → ~14 lines), inspect-export (~55 → ~20), backup-VHD (~60 → ~30). Net GUI churn −111; new shared modules +178; behavior unified across the three popups (e.g. restore now seeds custom_mib consistently with the others' design choices via the explicit `custom_seed` knob).
 
 ---
 

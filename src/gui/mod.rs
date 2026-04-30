@@ -10,6 +10,7 @@ mod progress;
 mod resize_popup;
 mod restore_tab;
 mod settings_dialog;
+mod size_mode_row;
 
 use backup_tab::BackupTab;
 use bulk_convert_dialog::{BulkConvertDialog, DialogAction as BulkConvertAction};

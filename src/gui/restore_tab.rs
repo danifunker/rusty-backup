@@ -6,7 +6,10 @@ use std::sync::{Arc, Mutex};
 use rusty_backup::backup::metadata::BackupMetadata;
 use rusty_backup::clonezilla;
 use rusty_backup::clonezilla::metadata::ClonezillaImage;
+use rusty_backup::model::size_mode::SizeMode;
 use rusty_backup::partition::{self, PartitionInfo, PartitionTable};
+
+use super::size_mode_row::{size_mode_row, SizeModeRowOptions};
 use rusty_backup::restore::single::{
     NewDiskConfig, NewTableType, SinglePartitionRestoreConfig, SinglePartitionSource,
 };
@@ -37,26 +40,14 @@ struct RestorePartitionConfig {
     start_lba: u64,
     original_size: u64,
     minimum_size: u64,
-    choice: RestoreSizeUiChoice,
+    choice: SizeMode,
     custom_size_mib: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum RestoreSizeUiChoice {
-    Original,
-    Minimum,
-    Custom,
-    FillRemaining,
 }
 
 impl RestorePartitionConfig {
     fn effective_size(&self) -> u64 {
-        match self.choice {
-            RestoreSizeUiChoice::Original => self.original_size,
-            RestoreSizeUiChoice::Minimum => self.minimum_size,
-            RestoreSizeUiChoice::Custom => self.custom_size_mib as u64 * 1024 * 1024,
-            RestoreSizeUiChoice::FillRemaining => 0, // computed dynamically
-        }
+        self.choice
+            .effective_size(self.original_size, self.minimum_size, self.custom_size_mib)
     }
 }
 
@@ -495,52 +486,18 @@ impl RestoreTab {
                             ui.label(partition::format_size(cfg.original_size));
                             ui.label(partition::format_size(cfg.minimum_size));
 
-                            let prev_choice = cfg.choice;
-                            ui.horizontal(|ui| {
-                                ui.radio_value(
-                                    &mut cfg.choice,
-                                    RestoreSizeUiChoice::Original,
-                                    "Orig",
-                                );
-                                if cfg.minimum_size < cfg.original_size {
-                                    ui.radio_value(
-                                        &mut cfg.choice,
-                                        RestoreSizeUiChoice::Minimum,
-                                        "Min",
-                                    );
-                                }
-                                ui.radio_value(
-                                    &mut cfg.choice,
-                                    RestoreSizeUiChoice::Custom,
-                                    "Custom",
-                                );
-                                if Some(cfg.index) == last_index {
-                                    ui.radio_value(
-                                        &mut cfg.choice,
-                                        RestoreSizeUiChoice::FillRemaining,
-                                        "Fill",
-                                    );
-                                }
-                            });
-
-                            if cfg.choice == RestoreSizeUiChoice::Custom
-                                && prev_choice != RestoreSizeUiChoice::Custom
-                            {
-                                cfg.custom_size_mib =
-                                    (cfg.original_size / (1024 * 1024)).max(1) as u32;
-                            }
-
-                            if cfg.choice == RestoreSizeUiChoice::Custom {
-                                let min_mib = (cfg.minimum_size / (1024 * 1024)).max(1) as u32;
-                                ui.add(
-                                    egui::DragValue::new(&mut cfg.custom_size_mib)
-                                        .range(min_mib..=u32::MAX),
-                                );
-                            } else if cfg.choice == RestoreSizeUiChoice::FillRemaining {
-                                ui.label("(auto)");
-                            } else {
-                                ui.label(format!("{}", cfg.effective_size() / (1024 * 1024),));
-                            }
+                            size_mode_row(
+                                ui,
+                                &mut cfg.choice,
+                                &mut cfg.custom_size_mib,
+                                cfg.original_size,
+                                cfg.minimum_size,
+                                SizeModeRowOptions {
+                                    allow_fill: Some(cfg.index) == last_index,
+                                    custom_seed: super::size_mode_row::CustomSeed::Original,
+                                    ..Default::default()
+                                },
+                            );
                             ui.end_row();
                         }
                     });
@@ -552,7 +509,7 @@ impl RestoreTab {
                         .partition_configs
                         .iter()
                         .map(|c| {
-                            if c.choice == RestoreSizeUiChoice::FillRemaining {
+                            if c.choice == SizeMode::FillRemaining {
                                 0
                             } else {
                                 c.effective_size()
@@ -1004,7 +961,7 @@ impl RestoreTab {
                 start_lba: pm.start_lba,
                 original_size: pm.original_size_bytes,
                 minimum_size: minimum,
-                choice: RestoreSizeUiChoice::Original,
+                choice: SizeMode::Original,
                 custom_size_mib: (pm.original_size_bytes / (1024 * 1024)) as u32,
             });
         }
@@ -1051,7 +1008,7 @@ impl RestoreTab {
                 start_lba: cz_part.start_lba,
                 original_size: cz_part.size_bytes(),
                 minimum_size,
-                choice: RestoreSizeUiChoice::Original,
+                choice: SizeMode::Original,
                 custom_size_mib: (cz_part.size_bytes() / (1024 * 1024)) as u32,
             });
         }
@@ -1129,7 +1086,7 @@ impl RestoreTab {
                         ui.add_space(8.0);
 
                         for cfg in &self.partition_configs {
-                            let size_str = if cfg.choice == RestoreSizeUiChoice::FillRemaining {
+                            let size_str = if cfg.choice == SizeMode::FillRemaining {
                                 "Fill remaining".to_string()
                             } else {
                                 partition::format_size(cfg.effective_size())
@@ -1275,17 +1232,17 @@ impl RestoreTab {
             .map(|cfg| RestorePartitionSize {
                 index: cfg.index,
                 size_choice: match cfg.choice {
-                    RestoreSizeUiChoice::Original => RestoreSizeChoice::Original,
-                    RestoreSizeUiChoice::Minimum => {
+                    SizeMode::Original => RestoreSizeChoice::Original,
+                    SizeMode::Minimum => {
                         // Pass the concrete minimum size so layout calculation
                         // doesn't need to re-derive it (especially for Clonezilla
                         // where the partclone header has the real used size).
                         RestoreSizeChoice::Custom(cfg.minimum_size)
                     }
-                    RestoreSizeUiChoice::Custom => {
+                    SizeMode::Custom => {
                         RestoreSizeChoice::Custom(cfg.custom_size_mib as u64 * 1024 * 1024)
                     }
-                    RestoreSizeUiChoice::FillRemaining => RestoreSizeChoice::FillRemaining,
+                    SizeMode::FillRemaining => RestoreSizeChoice::FillRemaining,
                 },
             })
             .collect();
