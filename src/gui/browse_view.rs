@@ -13,21 +13,10 @@ use rusty_backup::fs::zstd_stream::ZstdStreamCache;
 use rusty_backup::model::archive_edit::{self, ArchiveEditContext, ArchiveEditProgress};
 use rusty_backup::model::browse_session::BrowseSession;
 use rusty_backup::model::edit_queue::{self, EditQueue, StagedEdit};
+use rusty_backup::model::status::ExtractionProgress;
 use rusty_backup::partition;
 
 const MAX_PREVIEW_SIZE: usize = 1024 * 1024; // 1 MB max file preview
-
-/// Shared extraction progress state between UI and background thread.
-struct ExtractionProgress {
-    current_bytes: u64,
-    total_bytes: u64,
-    current_file: String,
-    files_extracted: u32,
-    total_files: u32,
-    finished: bool,
-    error: Option<String>,
-    cancel_requested: bool,
-}
 
 /// Filesystem browser view for inspecting partition contents.
 pub struct BrowseView {

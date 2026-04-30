@@ -225,11 +225,11 @@ Conventions:
 
 ## 10. GUI redesign foundations
 
-- [ ] **Establish `src/model/` as the single home for non-GUI state** (currently nothing under that name)
-  - **Subdirs to seed:** `edit_queue.rs`, `archive_edit.rs`, `partition_editor.rs`, `export.rs`, `backup_loader.rs`, `fsck_runner.rs`, `extraction.rs`.
-  - **Goal:** when the new GUI is built, every tab is a renderer over a model object.
+- [x] **`src/model/` established as the home for non-GUI state.**
+  - **Done via §5:** `model/{edit_queue, archive_edit, browse_session, partition_editor, export_runner, backup_loader, fsck_runner, min_size_runner, status}.rs` are all in place. Every tab now reads/writes through a model object rather than embedding orchestration logic inline.
 
-- [ ] **Background-thread state structs (`*Status`, `*Progress`) move out of `gui/` into `model/`**
+- [x] **Background-thread state structs (`*Status` / `*Progress`) live in `model/status.rs`.**
+  - **Done:** All worker-thread Status structs are in `model/status.rs`: `InspectStatus`, `CacheStatus`, `BlockCacheScan`, `VhdExportStatus` (from §5), plus `ExtractionProgress` (browse_view), `ResizeStatus` (resize_popup), `ExpandStatus` (expand_hfs_dialog), and `BulkConvertStatus` + `BulkConvertLogLevel` (bulk_convert_dialog). `ProgressState` in `gui/progress.rs` is intentionally kept in the view layer — it's UI state (top-bar progress + `controls_enabled`), not worker shared-state.
 
 - [ ] **Decide on a progress / log channel pattern and apply consistently**
   - **Evidence:** Today some flows use `Arc<Mutex<Status>>`, others use callbacks, others use `LogPanel` borrows.

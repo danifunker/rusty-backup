@@ -5,20 +5,11 @@ use std::io::Seek;
 use std::sync::{Arc, Mutex};
 
 use rusty_backup::device::DiskDevice;
+use rusty_backup::model::status::ResizeStatus;
 use rusty_backup::partition::resize::{apply_resize, compute_resize_plan, detect_vhd};
 use rusty_backup::partition::{self, PartitionInfo, PartitionTable};
 
 use super::progress::LogPanel;
-
-/// Background thread status for the resize operation.
-struct ResizeStatus {
-    finished: bool,
-    error: Option<String>,
-    log_messages: Vec<String>,
-    current_bytes: u64,
-    total_bytes: u64,
-    cancel_requested: bool,
-}
 
 /// Per-partition entry in the resize grid.
 struct ResizeEntry {

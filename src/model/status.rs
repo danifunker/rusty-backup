@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::clonezilla::block_cache::PartcloneBlockCache;
+use crate::fs::hfs_clone::{CloneReport, EmitReport};
 use crate::os::TempFileGuard;
 use crate::partition::{PartitionAlignment, PartitionInfo, PartitionTable};
 
@@ -70,4 +71,61 @@ pub struct VhdExportStatus {
     pub total_bytes: u64,
     pub cancel_requested: bool,
     pub log_messages: Vec<String>,
+}
+
+/// Status of a background file/folder extraction from `BrowseView`.
+pub struct ExtractionProgress {
+    pub current_bytes: u64,
+    pub total_bytes: u64,
+    pub current_file: String,
+    pub files_extracted: u32,
+    pub total_files: u32,
+    pub finished: bool,
+    pub error: Option<String>,
+    pub cancel_requested: bool,
+}
+
+/// Status of an in-place partition resize running on a background thread.
+pub struct ResizeStatus {
+    pub finished: bool,
+    pub error: Option<String>,
+    pub log_messages: Vec<String>,
+    pub current_bytes: u64,
+    pub total_bytes: u64,
+    pub cancel_requested: bool,
+}
+
+/// Status of an "Expand HFS Volume…" run.
+pub struct ExpandStatus {
+    pub finished: bool,
+    pub error: Option<String>,
+    pub log_messages: Vec<String>,
+    pub current_step: String,
+    pub clone_report: Option<CloneReport>,
+    pub emit_report: Option<EmitReport>,
+}
+
+/// Log level for `BulkConvertStatus.log_messages`.
+#[derive(Clone, Copy)]
+pub enum BulkConvertLogLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+/// Status of a Bulk Convert dialog job.
+pub struct BulkConvertStatus {
+    pub finished: bool,
+    pub cancel_requested: bool,
+    /// 1-based index of the file currently being processed.
+    pub current_index: usize,
+    pub total_files: usize,
+    pub current_file: String,
+    /// Bytes written for the currently-processing file (for the progress bar).
+    pub current_bytes: u64,
+    pub current_total_bytes: u64,
+    pub succeeded: usize,
+    pub failed: usize,
+    /// Drained by the main thread into the GUI log panel each frame.
+    pub log_messages: Vec<(BulkConvertLogLevel, String)>,
 }

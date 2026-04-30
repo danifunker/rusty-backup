@@ -12,14 +12,12 @@ mod restore_tab;
 mod settings_dialog;
 
 use backup_tab::BackupTab;
-use bulk_convert_dialog::{
-    BulkConvertDialog, BulkConvertStatus, DialogAction as BulkConvertAction,
-    LogLevel as BulkConvertLogLevel,
-};
+use bulk_convert_dialog::{BulkConvertDialog, DialogAction as BulkConvertAction};
 use inspect_tab::InspectTab;
 use optical_tab::OpticalTab;
 use progress::{LogPanel, ProgressState};
 use restore_tab::RestoreTab;
+use rusty_backup::model::status::{BulkConvertLogLevel, BulkConvertStatus};
 use settings_dialog::SettingsDialog;
 use std::path::PathBuf;
 
