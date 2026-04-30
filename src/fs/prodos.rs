@@ -95,6 +95,52 @@ impl<R: Read + Seek + Send> Filesystem for ProDosFilesystem<R> {
         }
     }
 
+    fn write_file_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn std::io::Write,
+    ) -> Result<u64, FilesystemError> {
+        if entry.is_directory() {
+            return Err(FilesystemError::NotADirectory(entry.path.clone()));
+        }
+        if entry.size == 0 {
+            return Ok(0);
+        }
+        let key_ptr = entry.location as u16;
+        let eof = entry.size as usize;
+        let storage_type = entry.mode.unwrap_or_else(|| infer_storage_type(eof)) as u8;
+        match storage_type {
+            1 => write_seedling_to(
+                &mut self.reader,
+                self.partition_offset,
+                key_ptr,
+                eof,
+                writer,
+            ),
+            2 => write_sapling_to(
+                &mut self.reader,
+                self.partition_offset,
+                key_ptr,
+                eof,
+                writer,
+            ),
+            3 => write_tree_to(
+                &mut self.reader,
+                self.partition_offset,
+                key_ptr,
+                eof,
+                writer,
+            ),
+            _ => write_seedling_to(
+                &mut self.reader,
+                self.partition_offset,
+                key_ptr,
+                eof,
+                writer,
+            ),
+        }
+    }
+
     fn volume_label(&self) -> Option<&str> {
         Some(&self.header.name)
     }
@@ -188,7 +234,7 @@ impl<R: Read + Write + Seek + Send> ProDosFilesystem<R> {
     /// Flush the in-memory bitmap to disk.
     fn write_bitmap_to_disk(&mut self) -> Result<(), FilesystemError> {
         if let Some(ref bm) = self.bitmap {
-            let bitmap_blocks = ((self.header.total_blocks as u32 + 4095) / 4096) as usize;
+            let bitmap_blocks = (self.header.total_blocks as u32).div_ceil(4096) as usize;
             for i in 0..bitmap_blocks {
                 let offset = self.partition_offset
                     + (self.header.bitmap_pointer as u64 + i as u64) * BLOCK_SIZE;
@@ -402,7 +448,7 @@ impl<R: Read + Write + Seek + Send> ProDosFilesystem<R> {
     /// Write a sapling file (≤128KB): index block + up to 256 data blocks.
     /// Returns `(index_block, blocks_used)`.
     fn write_sapling(&mut self, data: &[u8]) -> Result<(u16, u16), FilesystemError> {
-        let data_block_count = (data.len() + 511) / 512;
+        let data_block_count = data.len().div_ceil(512);
         if data_block_count > 256 {
             return Err(FilesystemError::InvalidData(
                 "sapling file too large (>128KB)".into(),
@@ -434,8 +480,8 @@ impl<R: Read + Write + Seek + Send> ProDosFilesystem<R> {
     /// Write a tree file (≤16MB): master index + up to 128 index blocks + data blocks.
     /// Returns `(master_block, blocks_used)`.
     fn write_tree(&mut self, data: &[u8]) -> Result<(u16, u16), FilesystemError> {
-        let total_data_blocks = (data.len() + 511) / 512;
-        let index_block_count = (total_data_blocks + 255) / 256;
+        let total_data_blocks = data.len().div_ceil(512);
+        let index_block_count = total_data_blocks.div_ceil(256);
         if index_block_count > 128 {
             return Err(FilesystemError::InvalidData(
                 "tree file too large (>16MB)".into(),
@@ -1100,7 +1146,7 @@ pub fn resize_prodos_in_place(
     let bitmap_pointer = u16::from_le_bytes([sector[39], sector[40]]);
 
     // Count used blocks to guard against shrinking into data.
-    let bitmap_blocks_needed = ((old_total as u32 + 4095) / 4096) as usize;
+    let bitmap_blocks_needed = (old_total as u32).div_ceil(4096) as usize;
     let mut bitmap: Vec<u8> = Vec::with_capacity(bitmap_blocks_needed * 512);
     {
         let mut bm_block = [0u8; 512];
@@ -1144,7 +1190,7 @@ pub fn resize_prodos_in_place(
 
     // If growing, mark new blocks as free (bit=1) in the bitmap.
     if new_total > old_total {
-        let new_bitmap_blocks = ((new_total as u32 + 4095) / 4096) as usize;
+        let new_bitmap_blocks = (new_total as u32).div_ceil(4096) as usize;
         bitmap.resize(new_bitmap_blocks * 512, 0);
 
         for block in old_total as u32..new_total as u32 {
@@ -1277,7 +1323,7 @@ fn read_bitmap<R: Read + Seek>(
     header: &ProDosVolumeHeader,
 ) -> Result<Vec<u8>, FilesystemError> {
     let total_blocks = header.total_blocks as u32;
-    let bitmap_blocks = ((total_blocks + 4095) / 4096) as usize;
+    let bitmap_blocks = total_blocks.div_ceil(4096) as usize;
     let mut bitmap = Vec::with_capacity(bitmap_blocks * 512);
     let mut bm_block = [0u8; 512];
 
@@ -1437,6 +1483,102 @@ fn read_index_block<R: Read + Seek>(
 }
 
 /// Read a seedling file (single data block, key_ptr → data).
+fn write_seedling_to<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    key_ptr: u16,
+    eof: usize,
+    writer: &mut dyn std::io::Write,
+) -> Result<u64, FilesystemError> {
+    let to_emit = eof.min(512);
+    if key_ptr == 0 {
+        writer.write_all(&vec![0u8; to_emit])?;
+        return Ok(to_emit as u64);
+    }
+    let offset = partition_offset + key_ptr as u64 * BLOCK_SIZE;
+    reader
+        .seek(SeekFrom::Start(offset))
+        .map_err(FilesystemError::Io)?;
+    let mut buf = [0u8; 512];
+    reader.read_exact(&mut buf).map_err(FilesystemError::Io)?;
+    writer.write_all(&buf[..to_emit])?;
+    Ok(to_emit as u64)
+}
+
+fn write_sapling_to<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    key_ptr: u16,
+    eof: usize,
+    writer: &mut dyn std::io::Write,
+) -> Result<u64, FilesystemError> {
+    let index = read_index_block(reader, partition_offset, key_ptr)?;
+    let mut written: u64 = 0;
+    let zeros = [0u8; 512];
+    for &data_block in index.iter() {
+        if written as usize >= eof {
+            break;
+        }
+        let remaining = eof - written as usize;
+        let to_take = remaining.min(512);
+        if data_block == 0 {
+            writer.write_all(&zeros[..to_take])?;
+        } else {
+            let offset = partition_offset + data_block as u64 * BLOCK_SIZE;
+            reader
+                .seek(SeekFrom::Start(offset))
+                .map_err(FilesystemError::Io)?;
+            let mut buf = [0u8; 512];
+            reader.read_exact(&mut buf).map_err(FilesystemError::Io)?;
+            writer.write_all(&buf[..to_take])?;
+        }
+        written += to_take as u64;
+    }
+    Ok(written)
+}
+
+fn write_tree_to<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    key_ptr: u16,
+    eof: usize,
+    writer: &mut dyn std::io::Write,
+) -> Result<u64, FilesystemError> {
+    let master = read_index_block(reader, partition_offset, key_ptr)?;
+    let mut written: u64 = 0;
+    let zeros = [0u8; 512];
+    for &index_block_num in master[..128].iter() {
+        if written as usize >= eof {
+            break;
+        }
+        let index = if index_block_num == 0 {
+            [0u16; 256]
+        } else {
+            read_index_block(reader, partition_offset, index_block_num)?
+        };
+        for &data_block in index.iter() {
+            if written as usize >= eof {
+                break;
+            }
+            let remaining = eof - written as usize;
+            let to_take = remaining.min(512);
+            if data_block == 0 {
+                writer.write_all(&zeros[..to_take])?;
+            } else {
+                let offset = partition_offset + data_block as u64 * BLOCK_SIZE;
+                reader
+                    .seek(SeekFrom::Start(offset))
+                    .map_err(FilesystemError::Io)?;
+                let mut buf = [0u8; 512];
+                reader.read_exact(&mut buf).map_err(FilesystemError::Io)?;
+                writer.write_all(&buf[..to_take])?;
+            }
+            written += to_take as u64;
+        }
+    }
+    Ok(written)
+}
+
 fn read_seedling<R: Read + Seek>(
     reader: &mut R,
     partition_offset: u64,
@@ -1555,9 +1697,9 @@ fn parse_prodos_datetime(date: u16, time: u16) -> Option<String> {
     }
 
     let year = if year_raw < 70 {
-        2000 + year_raw as u16
+        2000 + year_raw
     } else {
-        1900 + year_raw as u16
+        1900 + year_raw
     };
 
     Some(format!(

@@ -6,8 +6,10 @@ use std::sync::{Arc, Mutex};
 use rusty_backup::backup::metadata::BackupMetadata;
 use rusty_backup::clonezilla;
 use rusty_backup::clonezilla::metadata::ClonezillaImage;
-use rusty_backup::device::DiskDevice;
+use rusty_backup::model::size_mode::SizeMode;
 use rusty_backup::partition::{self, PartitionInfo, PartitionTable};
+
+use super::size_mode_row::{size_mode_row, SizeModeRowOptions};
 use rusty_backup::restore::single::{
     NewDiskConfig, NewTableType, SinglePartitionRestoreConfig, SinglePartitionSource,
 };
@@ -15,7 +17,8 @@ use rusty_backup::restore::{
     self, RestoreAlignment, RestoreConfig, RestorePartitionSize, RestoreProgress, RestoreSizeChoice,
 };
 
-use super::progress::{LogPanel, ProgressState};
+use super::context::TabContext;
+use super::progress::ProgressState;
 
 /// Which restore mode is active.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -37,26 +40,14 @@ struct RestorePartitionConfig {
     start_lba: u64,
     original_size: u64,
     minimum_size: u64,
-    choice: RestoreSizeUiChoice,
+    choice: SizeMode,
     custom_size_mib: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum RestoreSizeUiChoice {
-    Original,
-    Minimum,
-    Custom,
-    FillRemaining,
 }
 
 impl RestorePartitionConfig {
     fn effective_size(&self) -> u64 {
-        match self.choice {
-            RestoreSizeUiChoice::Original => self.original_size,
-            RestoreSizeUiChoice::Minimum => self.minimum_size,
-            RestoreSizeUiChoice::Custom => self.custom_size_mib as u64 * 1024 * 1024,
-            RestoreSizeUiChoice::FillRemaining => 0, // computed dynamically
-        }
+        self.choice
+            .effective_size(self.original_size, self.minimum_size, self.custom_size_mib)
     }
 }
 
@@ -194,15 +185,9 @@ impl RestoreTab {
         self.partition_configs.clear();
     }
 
-    pub fn show(
-        &mut self,
-        ui: &mut egui::Ui,
-        devices: &[DiskDevice],
-        log: &mut LogPanel,
-        progress: &mut ProgressState,
-    ) {
+    pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext, progress: &mut ProgressState) {
         // Poll background restore thread
-        self.poll_progress(log, progress);
+        self.poll_progress(ctx, progress);
 
         ui.heading("Restore Backup");
         ui.add_space(8.0);
@@ -233,24 +218,23 @@ impl RestoreTab {
         ui.add_space(4.0);
 
         match self.restore_mode {
-            RestoreMode::FullDisk => self.show_full_disk_mode(ui, devices, log, controls_enabled),
+            RestoreMode::FullDisk => self.show_full_disk_mode(ui, ctx, controls_enabled),
             RestoreMode::SinglePartition => {
-                self.show_single_partition_mode(ui, devices, log, controls_enabled)
+                self.show_single_partition_mode(ui, ctx, controls_enabled)
             }
-            RestoreMode::NewDisk => self.show_new_disk_mode(ui, devices, log, controls_enabled),
+            RestoreMode::NewDisk => self.show_new_disk_mode(ui, ctx, controls_enabled),
         }
 
         // --- Confirmation popup ---
         if self.confirm_popup_open {
-            self.show_confirmation_popup(ui, devices, log);
+            self.show_confirmation_popup(ui, ctx);
         }
     }
 
     fn show_full_disk_mode(
         &mut self,
         ui: &mut egui::Ui,
-        devices: &[DiskDevice],
-        log: &mut LogPanel,
+        ctx: &mut TabContext,
         controls_enabled: bool,
     ) {
         // --- Section 1: Backup Source ---
@@ -276,7 +260,7 @@ impl RestoreTab {
             let folder_changed = self.backup_folder != self.prev_backup_folder;
             if folder_changed {
                 self.prev_backup_folder = self.backup_folder.clone();
-                self.load_backup_metadata(log);
+                self.load_backup_metadata(ctx);
             }
         }
 
@@ -340,7 +324,7 @@ impl RestoreTab {
                     ui.label("Device:");
                     let current_label = self
                         .selected_device_idx
-                        .and_then(|idx| devices.get(idx))
+                        .and_then(|idx| ctx.devices.get(idx))
                         .map(|d| d.display_name())
                         .unwrap_or_else(|| "Select a target device...".into());
 
@@ -349,7 +333,7 @@ impl RestoreTab {
                         .width(400.0)
                         .height(400.0) // Allow more items to be visible without scrolling
                         .show_ui(ui, |ui| {
-                            for (i, device) in devices.iter().enumerate() {
+                            for (i, device) in ctx.devices.iter().enumerate() {
                                 let label = format!(
                                     "{} ({}){}",
                                     device.display_name(),
@@ -363,7 +347,7 @@ impl RestoreTab {
 
                 // Show warning for system disks
                 if let Some(idx) = self.selected_device_idx {
-                    if let Some(device) = devices.get(idx) {
+                    if let Some(device) = ctx.devices.get(idx) {
                         if device.is_system {
                             ui.colored_label(
                                 egui::Color32::from_rgb(255, 100, 100),
@@ -399,7 +383,7 @@ impl RestoreTab {
                 .map(|m| m.source_size_bytes)
                 .or_else(|| self.clonezilla_image.as_ref().map(|c| c.source_size_bytes));
             if let Some(source_size) = source_size_opt {
-                let target_size = self.get_target_size(devices);
+                let target_size = self.get_target_size(ctx);
                 if target_size > 0 {
                     let color = if target_size >= source_size {
                         egui::Color32::GRAY
@@ -502,64 +486,30 @@ impl RestoreTab {
                             ui.label(partition::format_size(cfg.original_size));
                             ui.label(partition::format_size(cfg.minimum_size));
 
-                            let prev_choice = cfg.choice;
-                            ui.horizontal(|ui| {
-                                ui.radio_value(
-                                    &mut cfg.choice,
-                                    RestoreSizeUiChoice::Original,
-                                    "Orig",
-                                );
-                                if cfg.minimum_size < cfg.original_size {
-                                    ui.radio_value(
-                                        &mut cfg.choice,
-                                        RestoreSizeUiChoice::Minimum,
-                                        "Min",
-                                    );
-                                }
-                                ui.radio_value(
-                                    &mut cfg.choice,
-                                    RestoreSizeUiChoice::Custom,
-                                    "Custom",
-                                );
-                                if Some(cfg.index) == last_index {
-                                    ui.radio_value(
-                                        &mut cfg.choice,
-                                        RestoreSizeUiChoice::FillRemaining,
-                                        "Fill",
-                                    );
-                                }
-                            });
-
-                            if cfg.choice == RestoreSizeUiChoice::Custom
-                                && prev_choice != RestoreSizeUiChoice::Custom
-                            {
-                                cfg.custom_size_mib =
-                                    (cfg.original_size / (1024 * 1024)).max(1) as u32;
-                            }
-
-                            if cfg.choice == RestoreSizeUiChoice::Custom {
-                                let min_mib = (cfg.minimum_size / (1024 * 1024)).max(1) as u32;
-                                ui.add(
-                                    egui::DragValue::new(&mut cfg.custom_size_mib)
-                                        .range(min_mib..=u32::MAX),
-                                );
-                            } else if cfg.choice == RestoreSizeUiChoice::FillRemaining {
-                                ui.label("(auto)");
-                            } else {
-                                ui.label(format!("{}", cfg.effective_size() / (1024 * 1024),));
-                            }
+                            size_mode_row(
+                                ui,
+                                &mut cfg.choice,
+                                &mut cfg.custom_size_mib,
+                                cfg.original_size,
+                                cfg.minimum_size,
+                                SizeModeRowOptions {
+                                    allow_fill: Some(cfg.index) == last_index,
+                                    custom_seed: super::size_mode_row::CustomSeed::Original,
+                                    ..Default::default()
+                                },
+                            );
                             ui.end_row();
                         }
                     });
 
                 // Total size summary
-                let target_size = self.get_target_size(devices);
+                let target_size = self.get_target_size(ctx);
                 if target_size > 0 {
                     let total: u64 = self
                         .partition_configs
                         .iter()
                         .map(|c| {
-                            if c.choice == RestoreSizeUiChoice::FillRemaining {
+                            if c.choice == SizeMode::FillRemaining {
                                 0
                             } else {
                                 c.effective_size()
@@ -586,22 +536,17 @@ impl RestoreTab {
         ui.add_space(16.0);
 
         // --- Section 5: Action Buttons ---
-        self.show_action_buttons(ui, devices, log);
+        self.show_action_buttons(ui, ctx);
     }
 
-    fn show_action_buttons(
-        &mut self,
-        ui: &mut egui::Ui,
-        devices: &[DiskDevice],
-        log: &mut LogPanel,
-    ) {
+    fn show_action_buttons(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
         ui.add_space(16.0);
         ui.horizontal(|ui| {
             if !self.restore_running {
                 let can_start = match self.restore_mode {
                     RestoreMode::FullDisk => {
                         (self.backup_metadata.is_some() || self.clonezilla_image.is_some())
-                            && self.has_target(devices)
+                            && self.has_target(ctx)
                     }
                     RestoreMode::SinglePartition => {
                         let has_source = (self.backup_metadata.is_some()
@@ -638,7 +583,7 @@ impl RestoreTab {
                                 "Cancelling — waiting for current write to complete…".to_string();
                         }
                     }
-                    log.warn(
+                    ctx.log.warn(
                         "Cancellation requested — waiting for current disk write to complete...",
                     );
                 }
@@ -649,8 +594,7 @@ impl RestoreTab {
     fn show_single_partition_mode(
         &mut self,
         ui: &mut egui::Ui,
-        devices: &[DiskDevice],
-        log: &mut LogPanel,
+        ctx: &mut TabContext,
         controls_enabled: bool,
     ) {
         // --- Source Section ---
@@ -711,7 +655,7 @@ impl RestoreTab {
             let folder_changed = self.backup_folder != self.prev_backup_folder;
             if folder_changed {
                 self.prev_backup_folder = self.backup_folder.clone();
-                self.load_backup_metadata(log);
+                self.load_backup_metadata(ctx);
             }
         }
 
@@ -775,7 +719,7 @@ impl RestoreTab {
                 ui.label("Target Device:");
                 let current_label = self
                     .sp_target_device_idx
-                    .and_then(|idx| devices.get(idx))
+                    .and_then(|idx| ctx.devices.get(idx))
                     .map(|d| d.display_name())
                     .unwrap_or_else(|| "Select a target device...".into());
 
@@ -784,7 +728,7 @@ impl RestoreTab {
                     .width(400.0)
                     .height(400.0)
                     .show_ui(ui, |ui| {
-                        for (i, device) in devices.iter().enumerate() {
+                        for (i, device) in ctx.devices.iter().enumerate() {
                             let label = format!(
                                 "{} ({}){}",
                                 device.display_name(),
@@ -802,16 +746,14 @@ impl RestoreTab {
                         }
                     });
 
-                if self.sp_target_device_idx.is_some() {
-                    if ui.button("Scan Target").clicked() {
-                        self.scan_target_partitions(devices, log);
-                    }
+                if self.sp_target_device_idx.is_some() && ui.button("Scan Target").clicked() {
+                    self.scan_target_partitions(ctx);
                 }
             });
 
             // System disk warning
             if let Some(idx) = self.sp_target_device_idx {
-                if let Some(device) = devices.get(idx) {
+                if let Some(device) = ctx.devices.get(idx) {
                     if device.is_system {
                         ui.colored_label(
                             egui::Color32::from_rgb(255, 100, 100),
@@ -876,7 +818,7 @@ impl RestoreTab {
         });
 
         // Action buttons
-        self.show_action_buttons(ui, devices, log);
+        self.show_action_buttons(ui, ctx);
     }
 
     /// Get the source data size for the single-partition mode.
@@ -897,17 +839,20 @@ impl RestoreTab {
     }
 
     /// Scan the target device's partition table (requires elevation for devices).
-    fn scan_target_partitions(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {
+    fn scan_target_partitions(&mut self, ctx: &mut TabContext) {
         self.sp_target_partitions.clear();
         self.sp_target_partition_idx = None;
         self.sp_scan_error = None;
 
-        let device = match self.sp_target_device_idx.and_then(|idx| devices.get(idx)) {
+        let device = match self
+            .sp_target_device_idx
+            .and_then(|idx| ctx.devices.get(idx))
+        {
             Some(d) => d,
             None => return,
         };
 
-        log.info(format!(
+        ctx.log.info(format!(
             "Scanning target partitions on {}...",
             device.path.display()
         ));
@@ -919,7 +864,7 @@ impl RestoreTab {
                 match PartitionTable::detect(&mut reader) {
                     Ok(table) => {
                         self.sp_target_partitions = table.partitions();
-                        log.info(format!(
+                        ctx.log.info(format!(
                             "Found {} partition(s) on target ({})",
                             self.sp_target_partitions.len(),
                             table.type_name(),
@@ -927,18 +872,18 @@ impl RestoreTab {
                     }
                     Err(e) => {
                         self.sp_scan_error = Some(format!("Could not read partition table: {e}"));
-                        log.error(format!("Target scan failed: {e}"));
+                        ctx.log.error(format!("Target scan failed: {e}"));
                     }
                 }
             }
             Err(e) => {
                 self.sp_scan_error = Some(format!("Cannot access device: {e}"));
-                log.error(format!("Cannot access target device: {e}"));
+                ctx.log.error(format!("Cannot access target device: {e}"));
             }
         }
     }
 
-    fn load_backup_metadata(&mut self, log: &mut LogPanel) {
+    fn load_backup_metadata(&mut self, ctx: &mut TabContext) {
         self.backup_metadata = None;
         self.clonezilla_image = None;
         self.mbr_bytes = None;
@@ -952,9 +897,9 @@ impl RestoreTab {
 
         let metadata_path = folder.join("metadata.json");
         if metadata_path.exists() {
-            self.load_native_backup_metadata(&folder, &metadata_path, log);
+            self.load_native_backup_metadata(&folder, &metadata_path, ctx);
         } else if clonezilla::metadata::is_clonezilla_image(&folder) {
-            self.load_clonezilla_backup_metadata(&folder, log);
+            self.load_clonezilla_backup_metadata(&folder, ctx);
         } else {
             self.metadata_error =
                 Some("No backup found (metadata.json or Clonezilla image)".to_string());
@@ -965,7 +910,7 @@ impl RestoreTab {
         &mut self,
         folder: &std::path::Path,
         metadata_path: &std::path::Path,
-        log: &mut LogPanel,
+        ctx: &mut TabContext,
     ) {
         let file = match File::open(metadata_path) {
             Ok(f) => f,
@@ -1000,7 +945,7 @@ impl RestoreTab {
             // last_data_byte). Fall back to imaged_size_bytes for older backups
             // that used packed compaction (where imaged < original), and finally
             // original_size_bytes when no sizing hint is available.
-            let minimum = pm.minimum_size_bytes.filter(|&s| s > 0).unwrap_or_else(|| {
+            let minimum = pm.minimum_size_bytes.filter(|&s| s > 0).unwrap_or({
                 if pm.imaged_size_bytes > 0 {
                     pm.imaged_size_bytes
                 } else {
@@ -1014,12 +959,12 @@ impl RestoreTab {
                 start_lba: pm.start_lba,
                 original_size: pm.original_size_bytes,
                 minimum_size: minimum,
-                choice: RestoreSizeUiChoice::Original,
+                choice: SizeMode::Original,
                 custom_size_mib: (pm.original_size_bytes / (1024 * 1024)) as u32,
             });
         }
 
-        log.info(format!(
+        ctx.log.info(format!(
             "Loaded backup: {} partition(s) from {}",
             metadata.partitions.len(),
             metadata.source_device,
@@ -1028,7 +973,7 @@ impl RestoreTab {
         self.backup_metadata = Some(metadata);
     }
 
-    fn load_clonezilla_backup_metadata(&mut self, folder: &std::path::Path, log: &mut LogPanel) {
+    fn load_clonezilla_backup_metadata(&mut self, folder: &std::path::Path, ctx: &mut TabContext) {
         let cz_image = match clonezilla::metadata::load(folder) {
             Ok(img) => img,
             Err(e) => {
@@ -1061,12 +1006,12 @@ impl RestoreTab {
                 start_lba: cz_part.start_lba,
                 original_size: cz_part.size_bytes(),
                 minimum_size,
-                choice: RestoreSizeUiChoice::Original,
+                choice: SizeMode::Original,
                 custom_size_mib: (cz_part.size_bytes() / (1024 * 1024)) as u32,
             });
         }
 
-        log.info(format!(
+        ctx.log.info(format!(
             "Loaded Clonezilla image: {} partition(s) from /dev/{}",
             cz_image
                 .partitions
@@ -1079,10 +1024,10 @@ impl RestoreTab {
         self.clonezilla_image = Some(cz_image);
     }
 
-    fn get_target_size(&self, devices: &[DiskDevice]) -> u64 {
+    fn get_target_size(&self, ctx: &TabContext) -> u64 {
         if self.target_is_device {
             self.selected_device_idx
-                .and_then(|idx| devices.get(idx))
+                .and_then(|idx| ctx.devices.get(idx))
                 .map(|d| d.size_bytes)
                 .unwrap_or(0)
         } else {
@@ -1097,22 +1042,17 @@ impl RestoreTab {
         }
     }
 
-    fn has_target(&self, devices: &[DiskDevice]) -> bool {
+    fn has_target(&self, ctx: &TabContext) -> bool {
         if self.target_is_device {
             self.selected_device_idx
-                .and_then(|idx| devices.get(idx))
+                .and_then(|idx| ctx.devices.get(idx))
                 .is_some()
         } else {
             self.image_file_path.is_some()
         }
     }
 
-    fn show_confirmation_popup(
-        &mut self,
-        ui: &mut egui::Ui,
-        devices: &[DiskDevice],
-        log: &mut LogPanel,
-    ) {
+    fn show_confirmation_popup(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
         let mut close = false;
 
         egui::Window::new("Confirm Restore")
@@ -1124,7 +1064,7 @@ impl RestoreTab {
                     RestoreMode::FullDisk => {
                         let target_name = if self.target_is_device {
                             self.selected_device_idx
-                                .and_then(|idx| devices.get(idx))
+                                .and_then(|idx| ctx.devices.get(idx))
                                 .map(|d| d.display_name())
                                 .unwrap_or_else(|| "Unknown".into())
                         } else {
@@ -1144,7 +1084,7 @@ impl RestoreTab {
                         ui.add_space(8.0);
 
                         for cfg in &self.partition_configs {
-                            let size_str = if cfg.choice == RestoreSizeUiChoice::FillRemaining {
+                            let size_str = if cfg.choice == SizeMode::FillRemaining {
                                 "Fill remaining".to_string()
                             } else {
                                 partition::format_size(cfg.effective_size())
@@ -1158,7 +1098,7 @@ impl RestoreTab {
                     RestoreMode::SinglePartition => {
                         let target_name = self
                             .sp_target_device_idx
-                            .and_then(|idx| devices.get(idx))
+                            .and_then(|idx| ctx.devices.get(idx))
                             .map(|d| d.display_name())
                             .unwrap_or_else(|| "Unknown".into());
                         let target_part = self.sp_target_partition_idx.and_then(|idx| {
@@ -1184,7 +1124,7 @@ impl RestoreTab {
                     RestoreMode::NewDisk => {
                         let target_name = if self.nd_target_is_device {
                             self.nd_target_device_idx
-                                .and_then(|idx| devices.get(idx))
+                                .and_then(|idx| ctx.devices.get(idx))
                                 .map(|d| d.display_name())
                                 .unwrap_or_else(|| "Unknown".into())
                         } else {
@@ -1220,11 +1160,11 @@ impl RestoreTab {
                     {
                         close = true;
                         match self.restore_mode {
-                            RestoreMode::FullDisk => self.start_restore(devices, log),
+                            RestoreMode::FullDisk => self.start_restore(ctx),
                             RestoreMode::SinglePartition => {
-                                self.start_single_partition_restore(devices, log)
+                                self.start_single_partition_restore(ctx)
                             }
-                            RestoreMode::NewDisk => self.start_new_disk_restore(devices, log),
+                            RestoreMode::NewDisk => self.start_new_disk_restore(ctx),
                         }
                     }
                     if ui.button("Cancel").clicked() {
@@ -1238,20 +1178,23 @@ impl RestoreTab {
         }
     }
 
-    fn start_restore(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {
+    fn start_restore(&mut self, ctx: &mut TabContext) {
         let backup_folder = match &self.backup_folder {
             Some(f) => f.clone(),
             None => {
-                log.error("No backup folder selected");
+                ctx.log.error("No backup folder selected");
                 return;
             }
         };
 
         let (target_path, target_is_device, target_size) = if self.target_is_device {
-            let device = match self.selected_device_idx.and_then(|idx| devices.get(idx)) {
+            let device = match self
+                .selected_device_idx
+                .and_then(|idx| ctx.devices.get(idx))
+            {
                 Some(d) => d,
                 None => {
-                    log.error("No target device selected");
+                    ctx.log.error("No target device selected");
                     return;
                 }
             };
@@ -1260,7 +1203,7 @@ impl RestoreTab {
             let path = match &self.image_file_path {
                 Some(p) => p.clone(),
                 None => {
-                    log.error("No image file selected");
+                    ctx.log.error("No image file selected");
                     return;
                 }
             };
@@ -1287,17 +1230,17 @@ impl RestoreTab {
             .map(|cfg| RestorePartitionSize {
                 index: cfg.index,
                 size_choice: match cfg.choice {
-                    RestoreSizeUiChoice::Original => RestoreSizeChoice::Original,
-                    RestoreSizeUiChoice::Minimum => {
+                    SizeMode::Original => RestoreSizeChoice::Original,
+                    SizeMode::Minimum => {
                         // Pass the concrete minimum size so layout calculation
                         // doesn't need to re-derive it (especially for Clonezilla
                         // where the partclone header has the real used size).
                         RestoreSizeChoice::Custom(cfg.minimum_size)
                     }
-                    RestoreSizeUiChoice::Custom => {
+                    SizeMode::Custom => {
                         RestoreSizeChoice::Custom(cfg.custom_size_mib as u64 * 1024 * 1024)
                     }
-                    RestoreSizeUiChoice::FillRemaining => RestoreSizeChoice::FillRemaining,
+                    SizeMode::FillRemaining => RestoreSizeChoice::FillRemaining,
                 },
             })
             .collect();
@@ -1316,7 +1259,8 @@ impl RestoreTab {
         self.restore_progress = Some(Arc::clone(&progress_arc));
         self.restore_running = true;
 
-        log.info(format!("Starting restore to {}", target_path.display(),));
+        ctx.log
+            .info(format!("Starting restore to {}", target_path.display(),));
 
         std::thread::spawn(move || {
             if let Err(e) = restore::run_restore(config, Arc::clone(&progress_arc)) {
@@ -1328,7 +1272,7 @@ impl RestoreTab {
         });
     }
 
-    fn start_single_partition_restore(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {
+    fn start_single_partition_restore(&mut self, ctx: &mut TabContext) {
         // Determine source
         let source = if let Some(path) = &self.sp_image_file {
             SinglePartitionSource::ImageFile { path: path.clone() }
@@ -1336,7 +1280,7 @@ impl RestoreTab {
             let idx = match self.sp_source_partition_idx {
                 Some(i) => i,
                 None => {
-                    log.error("No source partition selected");
+                    ctx.log.error("No source partition selected");
                     return;
                 }
             };
@@ -1345,15 +1289,18 @@ impl RestoreTab {
                 partition_index: idx,
             }
         } else {
-            log.error("No source selected");
+            ctx.log.error("No source selected");
             return;
         };
 
         // Determine target
-        let device = match self.sp_target_device_idx.and_then(|idx| devices.get(idx)) {
+        let device = match self
+            .sp_target_device_idx
+            .and_then(|idx| ctx.devices.get(idx))
+        {
             Some(d) => d,
             None => {
-                log.error("No target device selected");
+                ctx.log.error("No target device selected");
                 return;
             }
         };
@@ -1363,7 +1310,7 @@ impl RestoreTab {
         {
             Some(p) => p.clone(),
             None => {
-                log.error("No target partition selected");
+                ctx.log.error("No target partition selected");
                 return;
             }
         };
@@ -1395,7 +1342,7 @@ impl RestoreTab {
         self.restore_progress = Some(Arc::clone(&progress_arc));
         self.restore_running = true;
 
-        log.info(format!(
+        ctx.log.info(format!(
             "Starting single-partition restore to partition {} on {}",
             target_part.index,
             device.path.display(),
@@ -1417,8 +1364,7 @@ impl RestoreTab {
     fn show_new_disk_mode(
         &mut self,
         ui: &mut egui::Ui,
-        devices: &[DiskDevice],
-        log: &mut LogPanel,
+        ctx: &mut TabContext,
         controls_enabled: bool,
     ) {
         // --- Source Section (same as single partition) ---
@@ -1476,7 +1422,7 @@ impl RestoreTab {
             let folder_changed = self.backup_folder != self.prev_backup_folder;
             if folder_changed {
                 self.prev_backup_folder = self.backup_folder.clone();
-                self.load_backup_metadata(log);
+                self.load_backup_metadata(ctx);
             }
         }
 
@@ -1543,7 +1489,7 @@ impl RestoreTab {
                     ui.label("Device:");
                     let current_label = self
                         .nd_target_device_idx
-                        .and_then(|idx| devices.get(idx))
+                        .and_then(|idx| ctx.devices.get(idx))
                         .map(|d| d.display_name())
                         .unwrap_or_else(|| "Select a target device...".into());
 
@@ -1552,7 +1498,7 @@ impl RestoreTab {
                         .width(400.0)
                         .height(400.0)
                         .show_ui(ui, |ui| {
-                            for (i, device) in devices.iter().enumerate() {
+                            for (i, device) in ctx.devices.iter().enumerate() {
                                 let label = format!(
                                     "{} ({}){}",
                                     device.display_name(),
@@ -1654,10 +1600,10 @@ impl RestoreTab {
             );
         });
 
-        self.show_action_buttons(ui, devices, log);
+        self.show_action_buttons(ui, ctx);
     }
 
-    fn start_new_disk_restore(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {
+    fn start_new_disk_restore(&mut self, ctx: &mut TabContext) {
         // Determine source
         let source = if let Some(path) = &self.sp_image_file {
             SinglePartitionSource::ImageFile { path: path.clone() }
@@ -1665,7 +1611,7 @@ impl RestoreTab {
             let idx = match self.sp_source_partition_idx {
                 Some(i) => i,
                 None => {
-                    log.error("No source partition selected");
+                    ctx.log.error("No source partition selected");
                     return;
                 }
             };
@@ -1674,16 +1620,19 @@ impl RestoreTab {
                 partition_index: idx,
             }
         } else {
-            log.error("No source selected");
+            ctx.log.error("No source selected");
             return;
         };
 
         // Determine target
         let (target_path, target_is_device, disk_size_bytes) = if self.nd_target_is_device {
-            let device = match self.nd_target_device_idx.and_then(|idx| devices.get(idx)) {
+            let device = match self
+                .nd_target_device_idx
+                .and_then(|idx| ctx.devices.get(idx))
+            {
                 Some(d) => d,
                 None => {
-                    log.error("No target device selected");
+                    ctx.log.error("No target device selected");
                     return;
                 }
             };
@@ -1692,7 +1641,7 @@ impl RestoreTab {
             let path = match &self.nd_image_file_path {
                 Some(p) => p.clone(),
                 None => {
-                    log.error("No target file selected");
+                    ctx.log.error("No target file selected");
                     return;
                 }
             };
@@ -1783,7 +1732,7 @@ impl RestoreTab {
         self.restore_progress = Some(Arc::clone(&progress_arc));
         self.restore_running = true;
 
-        log.info(format!(
+        ctx.log.info(format!(
             "Starting new-disk restore to {}",
             target_path.display(),
         ));
@@ -1801,7 +1750,7 @@ impl RestoreTab {
         });
     }
 
-    fn poll_progress(&mut self, log: &mut LogPanel, progress_state: &mut ProgressState) {
+    fn poll_progress(&mut self, ctx: &mut TabContext, progress_state: &mut ProgressState) {
         let progress_arc = match &self.restore_progress {
             Some(p) => Arc::clone(p),
             None => return,
@@ -1814,9 +1763,9 @@ impl RestoreTab {
         // Drain log messages
         while let Some(msg) = p.log_messages.pop_front() {
             match msg.level {
-                rusty_backup::backup::LogLevel::Info => log.info(msg.message),
-                rusty_backup::backup::LogLevel::Warning => log.warn(msg.message),
-                rusty_backup::backup::LogLevel::Error => log.error(msg.message),
+                rusty_backup::backup::LogLevel::Info => ctx.log.info(msg.message),
+                rusty_backup::backup::LogLevel::Warning => ctx.log.warn(msg.message),
+                rusty_backup::backup::LogLevel::Error => ctx.log.error(msg.message),
             }
         }
 
@@ -1829,9 +1778,9 @@ impl RestoreTab {
 
         if p.finished {
             if let Some(err) = &p.error {
-                log.error(format!("Restore failed: {err}"));
+                ctx.log.error(format!("Restore failed: {err}"));
             } else {
-                log.info("Restore completed successfully.");
+                ctx.log.info("Restore completed successfully.");
             }
             drop(p);
             self.restore_running = false;

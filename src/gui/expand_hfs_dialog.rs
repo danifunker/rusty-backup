@@ -17,6 +17,7 @@ use rusty_backup::fs::hfs::{create_blank_hfs_sized, HfsFilesystem};
 use rusty_backup::fs::hfs_clone::{
     clone_hfs_volume, emit_apm_disk_with_hfs, CloneReport, EmitReport,
 };
+use rusty_backup::model::status::ExpandStatus;
 
 use super::progress::LogPanel;
 
@@ -38,16 +39,6 @@ fn suggest_block_size(target_bytes: u64) -> u32 {
         }
     }
     *BLOCK_SIZE_CHOICES.last().unwrap()
-}
-
-/// Background-thread status for one expand run.
-struct ExpandStatus {
-    finished: bool,
-    error: Option<String>,
-    log_messages: Vec<String>,
-    current_step: String,
-    clone_report: Option<CloneReport>,
-    emit_report: Option<EmitReport>,
 }
 
 /// Source-volume summary the dialog displays + uses to validate inputs.

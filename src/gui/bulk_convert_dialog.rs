@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use rusty_backup::model::status::{BulkConvertLogLevel as LogLevel, BulkConvertStatus};
 use rusty_backup::rbformats::export::{export_whole_disk, ExportFormat};
 
 fn fmt_bytes(n: u64) -> String {
@@ -30,30 +31,6 @@ fn fmt_bytes(n: u64) -> String {
     } else {
         format!("{} B", n)
     }
-}
-
-/// Live state for a running bulk conversion job.
-pub struct BulkConvertStatus {
-    pub finished: bool,
-    pub cancel_requested: bool,
-    /// 1-based index of the file currently being processed.
-    pub current_index: usize,
-    pub total_files: usize,
-    pub current_file: String,
-    /// Bytes written for the currently-processing file (for the progress bar).
-    pub current_bytes: u64,
-    pub current_total_bytes: u64,
-    pub succeeded: usize,
-    pub failed: usize,
-    /// Drained by the main thread into the GUI log panel each frame.
-    pub log_messages: Vec<(LogLevel, String)>,
-}
-
-#[derive(Clone, Copy)]
-pub enum LogLevel {
-    Info,
-    Warn,
-    Error,
 }
 
 /// One entry in the review-phase checklist.

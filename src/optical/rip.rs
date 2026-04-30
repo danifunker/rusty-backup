@@ -44,6 +44,12 @@ pub struct RipProgress {
     pub log_messages: VecDeque<LogMessage>,
 }
 
+impl Default for RipProgress {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RipProgress {
     pub fn new() -> Self {
         Self {

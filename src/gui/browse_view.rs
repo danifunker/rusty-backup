@@ -1,145 +1,22 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Write};
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use rusty_backup::clonezilla::block_cache::{PartcloneBlockCache, PartcloneBlockReader};
 use rusty_backup::fs;
 use rusty_backup::fs::entry::{EntryType, FileEntry};
-use rusty_backup::fs::filesystem::ResourceForkSource;
-use rusty_backup::fs::filesystem::{
-    CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
-};
+use rusty_backup::fs::filesystem::Filesystem;
 use rusty_backup::fs::resource_fork::{self, ResourceForkMode};
-use rusty_backup::fs::zstd_stream::{ZstdStreamCache, ZstdStreamReader};
+use rusty_backup::fs::zstd_stream::ZstdStreamCache;
+use rusty_backup::model::archive_edit::{self, ArchiveEditContext, ArchiveEditProgress};
+use rusty_backup::model::browse_session::BrowseSession;
+use rusty_backup::model::edit_queue::{self, EditQueue, StagedEdit};
+use rusty_backup::model::status::ExtractionProgress;
 use rusty_backup::partition;
-use rusty_backup::rbformats::chd::ChdReader;
 
 const MAX_PREVIEW_SIZE: usize = 1024 * 1024; // 1 MB max file preview
-
-/// A staged edit operation that will be applied when the user clicks "Apply Edits".
-#[derive(Debug, Clone)]
-enum StagedEdit {
-    AddFile {
-        parent: FileEntry,
-        name: String,
-        host_path: PathBuf,
-        size: u64,
-        /// ProDOS-specific overrides. None means "auto-detect from the host
-        /// filename extension at apply time".
-        prodos_type: Option<u8>,
-        prodos_aux: Option<u16>,
-        /// Resource fork data detected from the host (HFS/HFS+ only).
-        resource_fork: Option<resource_fork::ImportedResourceFork>,
-        /// HFS/HFS+ type/creator overrides set by the user before Apply.
-        /// `None` means "let create_file pick the default" (FInfo from the
-        /// resource_fork sidecar if any, else the extension dictionary).
-        hfs_type_override: Option<[u8; 4]>,
-        hfs_creator_override: Option<[u8; 4]>,
-    },
-    CreateDirectory {
-        parent: FileEntry,
-        name: String,
-    },
-    DeleteEntry {
-        parent: FileEntry,
-        entry: FileEntry,
-    },
-    DeleteRecursive {
-        parent: FileEntry,
-        entry: FileEntry,
-    },
-    SetProdosType {
-        entry: FileEntry,
-        type_byte: u8,
-        aux_type: u16,
-    },
-    BlessFolder {
-        entry: FileEntry,
-    },
-    /// Set HFS/HFS+ type and creator codes on an existing on-disk file.
-    SetTypeCreator {
-        entry: FileEntry,
-        type_code: [u8; 4],
-        creator_code: [u8; 4],
-    },
-}
-
-/// Walk an editable filesystem from the root to the directory at `path`,
-/// returning its live `FileEntry`.
-///
-/// Staged edits capture a `parent` `FileEntry` at staging time, but for a
-/// pending-add directory the `location` (CNID/cluster) field is a placeholder
-/// because the directory does not yet exist on disk. Re-resolving by path at
-/// apply time picks up the real identifier assigned when the earlier
-/// `CreateDirectory` edit ran.
-fn resolve_dir_by_path(
-    efs: &mut dyn EditableFilesystem,
-    path: &str,
-) -> Result<FileEntry, FilesystemError> {
-    let mut current = efs.root()?;
-    if path == "/" || path.is_empty() {
-        return Ok(current);
-    }
-    for component in path.trim_start_matches('/').split('/') {
-        if component.is_empty() {
-            continue;
-        }
-        let children = efs.list_directory(&current)?;
-        current = children
-            .into_iter()
-            .find(|e| e.is_directory() && e.name == component)
-            .ok_or_else(|| {
-                FilesystemError::NotFound(format!(
-                    "directory '{component}' not found while resolving '{path}'"
-                ))
-            })?;
-    }
-    Ok(current)
-}
-
-/// Context for editing a backup archive partition (decompress → edit → recompress).
-struct ArchiveEditContext {
-    /// Path to the compressed archive file (e.g. partition-0.zst or partition-0.chd).
-    archive_path: PathBuf,
-    /// Compression type string ("zstd", "chd", etc.).
-    compression_type: String,
-    /// Original uncompressed partition size in bytes.
-    original_size: u64,
-    /// Whether the partition was compacted (stream < original_size).
-    compacted: bool,
-    /// Path to metadata.json for updating checksums.
-    metadata_path: PathBuf,
-    /// Partition index in metadata.
-    partition_index: usize,
-    /// Checksum type ("sha256" or "crc32").
-    checksum_type: String,
-}
-
-/// Progress state for archive edit extract/compress operations.
-struct ArchiveEditProgress {
-    phase: String, // "Extracting" or "Compressing"
-    current: u64,
-    total: u64,
-    finished: bool,
-    error: Option<String>,
-    cancel_requested: bool,
-    /// Path to the temp file (set after extraction completes).
-    temp_path: Option<PathBuf>,
-}
-
-/// Shared extraction progress state between UI and background thread.
-struct ExtractionProgress {
-    current_bytes: u64,
-    total_bytes: u64,
-    current_file: String,
-    files_extracted: u32,
-    total_files: u32,
-    finished: bool,
-    error: Option<String>,
-    cancel_requested: bool,
-}
 
 /// Filesystem browser view for inspecting partition contents.
 pub struct BrowseView {
@@ -161,21 +38,11 @@ pub struct BrowseView {
     /// Filesystem info.
     fs_type: String,
     volume_label: String,
-    /// Source file path + partition info for re-opening the filesystem.
-    source_path: Option<PathBuf>,
-    partition_offset: u64,
-    partition_type: u8,
-    /// APM partition type string (e.g. "Apple_HFS"). None for MBR/GPT.
-    partition_type_string: Option<String>,
-    /// Pre-opened device file (macOS raw disk, already elevated).
-    /// Wrapped in Arc so each open_fs() call can try_clone() an independent fd.
-    preopen_file: Option<std::sync::Arc<File>>,
+    /// Where to open the filesystem from (path / preopen handle / caches).
+    /// `Clone` so background workers can be handed a session value.
+    session: BrowseSession,
     /// Whether the browser is active (filesystem loaded).
     active: bool,
-    /// Shared block cache for Clonezilla partclone browsing.
-    partclone_cache: Option<Arc<Mutex<PartcloneBlockCache>>>,
-    /// Streaming zstd cache for native zstd backups (before seekable cache is ready).
-    zstd_cache: Option<Arc<Mutex<ZstdStreamCache>>>,
     /// Resource fork handling mode (HFS/HFS+ only).
     resource_fork_mode: ResourceForkMode,
     /// How to encode ProDOS type/aux on extract (ProDOS only).
@@ -221,9 +88,14 @@ pub struct BrowseView {
     /// Whether the tree popup shows filesystem IDs.
     tree_show_ids: bool,
     /// Queued edit operations awaiting "Apply Edits".
-    staged_edits: Vec<StagedEdit>,
+    staged_edits: EditQueue,
     /// Whether to show the "unsaved changes" confirmation dialog.
     show_unsaved_dialog: bool,
+    /// When true, a successful Discard/Apply from the unsaved dialog should
+    /// fully close the browse view rather than just leaving edit mode. Set by
+    /// `close_or_prompt()` when the caller wants to dismiss the view but
+    /// staged edits force the dialog first.
+    pending_close: bool,
     /// Inline ProDOS type/aux editor state, keyed by entry path. Reset when
     /// the selection changes.
     prodos_type_editor: Option<ProdosTypeEditorState>,
@@ -320,14 +192,8 @@ impl Default for BrowseView {
             error: None,
             fs_type: String::new(),
             volume_label: String::new(),
-            source_path: None,
-            partition_offset: 0,
-            partition_type: 0,
-            partition_type_string: None,
-            preopen_file: None,
+            session: BrowseSession::new(),
             active: false,
-            partclone_cache: None,
-            zstd_cache: None,
             resource_fork_mode: ResourceForkMode::AppleDouble,
             prodos_export_mode: ProdosExportMode::WithTypeSuffix,
             extraction_progress: None,
@@ -350,8 +216,9 @@ impl Default for BrowseView {
             tree_text: None,
             show_tree_popup: false,
             tree_show_ids: false,
-            staged_edits: Vec::new(),
+            staged_edits: EditQueue::new(),
             show_unsaved_dialog: false,
+            pending_close: false,
             prodos_type_editor: None,
             hfs_type_editor: None,
             staging_errors: Vec::new(),
@@ -377,11 +244,11 @@ impl BrowseView {
         preopen_file: Option<File>,
     ) {
         self.close();
-        self.source_path = Some(source_path.clone());
-        self.partition_offset = partition_offset;
-        self.partition_type = partition_type;
-        self.partition_type_string = partition_type_string;
-        self.preopen_file = preopen_file.map(std::sync::Arc::new);
+        self.session.source_path = Some(source_path.clone());
+        self.session.partition_offset = partition_offset;
+        self.session.partition_type = partition_type;
+        self.session.partition_type_string = partition_type_string;
+        self.session.preopen_file = preopen_file.map(std::sync::Arc::new);
         // Editing is supported for regular files (not Clonezilla/streaming)
         self.edit_supported = true;
 
@@ -418,7 +285,7 @@ impl BrowseView {
             });
         }
 
-        match self.open_fs() {
+        match self.session.open() {
             Ok(mut fs) => {
                 self.fs_type = fs.fs_type().to_string();
                 self.volume_label = fs.volume_label().unwrap_or("").to_string();
@@ -454,9 +321,9 @@ impl BrowseView {
     /// Open the browser using a partclone block cache (for Clonezilla images).
     pub fn open_partclone(&mut self, cache: Arc<Mutex<PartcloneBlockCache>>, partition_type: u8) {
         self.close();
-        self.partclone_cache = Some(cache.clone());
-        self.partition_type = partition_type;
-        self.partition_offset = 0;
+        self.session.partclone_cache = Some(cache.clone());
+        self.session.partition_type = partition_type;
+        self.session.partition_offset = 0;
 
         let reader = PartcloneBlockReader::new(cache);
         match fs::open_filesystem(reader, 0, partition_type, None) {
@@ -498,9 +365,9 @@ impl BrowseView {
     /// background seekable cache is ready to enable full random access.
     pub fn open_streaming(&mut self, path: PathBuf, ptype: u8, ptype_str: Option<String>) {
         self.close();
-        self.partition_type = ptype;
-        self.partition_type_string = ptype_str;
-        self.partition_offset = 0;
+        self.session.partition_type = ptype;
+        self.session.partition_type_string = ptype_str;
+        self.session.partition_offset = 0;
 
         let cache = match ZstdStreamCache::new(&path) {
             Ok(c) => Arc::new(Mutex::new(c)),
@@ -510,9 +377,9 @@ impl BrowseView {
                 return;
             }
         };
-        self.zstd_cache = Some(cache);
+        self.session.zstd_cache = Some(cache);
 
-        match self.open_fs() {
+        match self.session.open() {
             Ok(mut fs) => {
                 self.fs_type = fs.fs_type().to_string();
                 self.volume_label = fs.volume_label().unwrap_or("").to_string();
@@ -571,11 +438,11 @@ impl BrowseView {
     /// (`zstd_cache` is `Some`).  The directory cache is preserved so the
     /// user stays in the same place in the tree.
     pub fn upgrade_to_seekable_cache(&mut self, cache_path: PathBuf) {
-        if !self.active || self.zstd_cache.is_none() {
+        if !self.active || self.session.zstd_cache.is_none() {
             return;
         }
-        self.source_path = Some(cache_path);
-        self.zstd_cache = None;
+        self.session.source_path = Some(cache_path);
+        self.session.zstd_cache = None;
     }
 
     pub fn close(&mut self) {
@@ -588,10 +455,7 @@ impl BrowseView {
         self.active = false;
         self.fs_type.clear();
         self.volume_label.clear();
-        self.partclone_cache = None;
-        self.zstd_cache = None;
-        self.partition_type_string = None;
-        self.preopen_file = None;
+        self.session = BrowseSession::new();
         self.extraction_progress = None;
         self.extraction_result = None;
         self.edit_mode = false;
@@ -610,6 +474,7 @@ impl BrowseView {
         self.tree_show_ids = false;
         self.staged_edits.clear();
         self.show_unsaved_dialog = false;
+        self.pending_close = false;
         // Clean up archive temp file if present
         if let Some(temp) = self.archive_temp_path.take() {
             let _ = std::fs::remove_file(&temp);
@@ -622,16 +487,20 @@ impl BrowseView {
         self.active
     }
 
-    fn open_fs(&self) -> Result<Box<dyn Filesystem>, FilesystemError> {
-        create_filesystem(
-            self.source_path.as_ref(),
-            self.partition_offset,
-            self.partition_type,
-            self.partition_type_string.as_deref(),
-            self.partclone_cache.as_ref(),
-            self.zstd_cache.as_ref(),
-            self.preopen_file.as_ref(),
-        )
+    /// Close the browse view, prompting first if there are unsaved staged
+    /// edits. Returns true if the view is now closed; false if the unsaved
+    /// dialog was shown and the caller should retry on a later frame.
+    pub fn close_or_prompt(&mut self) -> bool {
+        if !self.active {
+            return true;
+        }
+        if self.edit_mode && !self.staged_edits.is_empty() {
+            self.show_unsaved_dialog = true;
+            self.pending_close = true;
+            return false;
+        }
+        self.close();
+        true
     }
 
     /// Returns true if the current filesystem is HFS or HFS+.
@@ -648,7 +517,7 @@ impl BrowseView {
     /// Validate a filename against the current filesystem's rules at
     /// staging time, so invalid names are rejected before apply.
     fn validate_staged_name(&self, name: &str) -> Result<(), String> {
-        let fs = self.open_fs().map_err(|e| e.to_string())?;
+        let fs = self.session.open().map_err(|e| e.to_string())?;
         fs.validate_name(name).map_err(|e| e.to_string())
     }
 
@@ -723,7 +592,7 @@ impl BrowseView {
 
             // Check filesystem button (HFS only for now)
             if self.fs_type == "HFS" && ui.button("Check").clicked() {
-                match self.open_fs() {
+                match self.session.open() {
                     Ok(mut fs) => match fs.fsck() {
                         Some(Ok(result)) => {
                             self.fsck_result = Some(result);
@@ -752,7 +621,6 @@ impl BrowseView {
                     self.show_unsaved_dialog = true;
                 } else {
                     self.close();
-                    return;
                 }
             }
         });
@@ -885,7 +753,7 @@ impl BrowseView {
     }
 
     fn render_tree_entry(&mut self, ui: &mut egui::Ui, entry: &FileEntry) {
-        let pending_del = self.edit_mode && self.is_pending_delete(entry);
+        let pending_del = self.edit_mode && self.staged_edits.is_pending_delete(&entry.path);
         let dimmed = egui::Color32::from_rgb(120, 120, 120);
 
         match entry.entry_type {
@@ -942,7 +810,7 @@ impl BrowseView {
 
                     // Append pending-add entries for this directory
                     if self.edit_mode {
-                        let pending = self.pending_adds_for(&path);
+                        let pending = self.staged_edits.pending_adds_for(&path);
                         for pentry in &pending {
                             self.render_pending_add_entry(ui, pentry);
                         }
@@ -1064,7 +932,7 @@ impl BrowseView {
         // Apply. HFS: no FInfo + no dict match + no override. ProDOS: type byte
         // not in the registry.
         let color = if self.is_hfs_type() && entry.is_file() {
-            let (t, c) = self.resolved_hfs_type_creator(entry);
+            let (t, c) = self.staged_edits.resolved_hfs_type_creator(entry);
             if t == [0; 4] && c == [0; 4] {
                 blue
             } else {
@@ -1087,21 +955,10 @@ impl BrowseView {
             .unwrap_or(false);
 
         // Look up the staged AddFile for this entry to surface rsrc/type info.
-        let rsrc_badge: Option<String> = self.staged_edits.iter().find_map(|e| match e {
-            StagedEdit::AddFile {
-                parent,
-                name,
-                resource_fork: Some(imp),
-                ..
-            } => {
-                let path = if parent.path == "/" {
-                    format!("/{name}")
-                } else {
-                    format!("{}/{name}", parent.path)
-                };
-                if path != entry.path {
-                    return None;
-                }
+        let rsrc_badge: Option<String> = self
+            .staged_edits
+            .pending_resource_fork_for(&entry.path)
+            .map(|imp| {
                 let tc = imp
                     .type_code
                     .map(|c| String::from_utf8_lossy(&c).to_string());
@@ -1114,14 +971,12 @@ impl BrowseView {
                     (None, Some(c)) => format!("?/{c} "),
                     (None, None) => String::new(),
                 };
-                Some(format!(
+                format!(
                     "[{}+rsrc {}]",
                     codes,
                     partition::format_size(imp.data.len() as u64)
-                ))
-            }
-            _ => None,
-        });
+                )
+            });
 
         let label = if entry.is_directory() {
             format!("+ {}", entry.name)
@@ -1140,7 +995,7 @@ impl BrowseView {
     }
 
     fn load_directory(&mut self, entry: &FileEntry) {
-        if let Ok(mut fs) = self.open_fs() {
+        if let Ok(mut fs) = self.session.open() {
             match fs.list_directory(entry) {
                 Ok(entries) => {
                     self.directory_cache.insert(entry.path.clone(), entries);
@@ -1182,7 +1037,7 @@ impl BrowseView {
             return;
         }
 
-        if let Ok(mut fs) = self.open_fs() {
+        if let Ok(mut fs) = self.session.open() {
             match fs.read_file(entry, MAX_PREVIEW_SIZE) {
                 Ok(data) => {
                     self.content = Some(detect_content_type(entry, &data));
@@ -1495,13 +1350,7 @@ impl BrowseView {
     /// Spawn the extraction thread. Separated from `start_extraction` so the
     /// overwrite confirmation dialog can resume it after the user confirms.
     fn launch_extraction(&mut self, entry: FileEntry, dest: PathBuf) {
-        let source_path = self.source_path.clone();
-        let partition_offset = self.partition_offset;
-        let partition_type = self.partition_type;
-        let partition_type_string = self.partition_type_string.clone();
-        let partclone_cache = self.partclone_cache.clone();
-        let zstd_cache = self.zstd_cache.clone();
-        let preopen_file = self.preopen_file.clone();
+        let session = self.session.clone();
         let resource_fork_mode = self.resource_fork_mode;
         let is_hfs = self.is_hfs_type();
         let is_prodos = self.is_prodos_type();
@@ -1523,13 +1372,7 @@ impl BrowseView {
 
         std::thread::spawn(move || {
             let result = run_extraction(
-                source_path.as_ref(),
-                partition_offset,
-                partition_type,
-                partition_type_string.as_deref(),
-                partclone_cache.as_ref(),
-                zstd_cache.as_ref(),
-                preopen_file.as_ref(),
+                &session,
                 &entry,
                 &dest,
                 resource_fork_mode,
@@ -1546,27 +1389,6 @@ impl BrowseView {
                 }
             }
         });
-    }
-
-    /// Open a writable filesystem for editing operations.
-    fn open_editable_fs(&self) -> Result<Box<dyn EditableFilesystem>, FilesystemError> {
-        let path = self
-            .source_path
-            .as_ref()
-            .ok_or_else(|| FilesystemError::Parse("no source path set".into()))?;
-
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .map_err(FilesystemError::Io)?;
-
-        fs::open_editable_filesystem(
-            file,
-            self.partition_offset,
-            self.partition_type,
-            self.partition_type_string.as_deref(),
-        )
     }
 
     /// Get the parent entry for the currently selected entry, or root if nothing selected.
@@ -1598,7 +1420,7 @@ impl BrowseView {
                     // Also check if the cache key itself matches
                     if path == parent_path {
                         // We need the entry for this path, find it
-                        for (_, siblings) in &self.directory_cache {
+                        for siblings in self.directory_cache.values() {
                             for e in siblings {
                                 if e.path == *path && e.is_directory() {
                                     return e.clone();
@@ -1615,77 +1437,33 @@ impl BrowseView {
 
     /// Start background extraction of an archive to a temp file for editing.
     fn start_archive_extract(&mut self) {
-        let ctx = match &self.archive_edit_ctx {
-            Some(c) => c,
-            None => return,
+        let Some(ctx) = self.archive_edit_ctx.clone() else {
+            return;
         };
 
-        let archive_path = ctx.archive_path.clone();
-        let compression_type = ctx.compression_type.clone();
-        let original_size = ctx.original_size;
-        let compacted = ctx.compacted;
-
         // Create temp file next to the archive
-        let parent = archive_path.parent().unwrap_or(std::path::Path::new("."));
+        let parent = ctx
+            .archive_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
         let temp_path = parent.join(format!(
             "{}-edit.img",
-            archive_path
+            ctx.archive_path
                 .file_stem()
                 .unwrap_or_default()
                 .to_string_lossy()
         ));
 
-        let progress = Arc::new(Mutex::new(ArchiveEditProgress {
-            phase: "Extracting".to_string(),
-            current: 0,
-            total: original_size,
-            finished: false,
-            error: None,
-            cancel_requested: false,
-            temp_path: Some(temp_path.clone()),
-        }));
-        self.archive_edit_progress = Some(Arc::clone(&progress));
-
-        let progress_thread = Arc::clone(&progress);
-        std::thread::spawn(move || {
-            let cancel = {
-                let p = Arc::clone(&progress_thread);
-                move || p.lock().map(|g| g.cancel_requested).unwrap_or(false)
-            };
-            let result = rusty_backup::rbformats::decompress_partition_to_file(
-                &archive_path,
-                &compression_type,
-                &temp_path,
-                original_size,
-                compacted,
-                &mut |bytes| {
-                    if let Ok(mut p) = progress_thread.lock() {
-                        p.current = bytes;
-                    }
-                },
-                &cancel,
-            );
-            if let Ok(mut p) = progress_thread.lock() {
-                p.finished = true;
-                if let Err(e) = result {
-                    p.error = Some(format!("{e:#}"));
-                    // Clean up temp file on error
-                    let _ = std::fs::remove_file(&temp_path);
-                }
-            }
-        });
+        self.archive_edit_progress = Some(archive_edit::start_extract(&ctx, temp_path));
     }
 
     /// Start background recompression of the edited temp file back to the archive.
     fn start_archive_compress(&mut self) {
-        let ctx = match &self.archive_edit_ctx {
-            Some(c) => c,
-            None => return,
+        let Some(ctx) = self.archive_edit_ctx.clone() else {
+            return;
         };
-
-        let temp_path = match &self.archive_temp_path {
-            Some(p) => p.clone(),
-            None => return,
+        let Some(temp_path) = self.archive_temp_path.clone() else {
+            return;
         };
 
         // Disable edit mode immediately
@@ -1694,109 +1472,14 @@ impl BrowseView {
         self.show_new_folder_dialog = false;
         self.pending_delete = None;
 
-        let archive_path = ctx.archive_path.clone();
-        let compression_type = ctx.compression_type.clone();
-        let metadata_path = ctx.metadata_path.clone();
-        let partition_index = ctx.partition_index;
-        let checksum_type = ctx.checksum_type.clone();
-
-        let input_size = std::fs::metadata(&temp_path).map(|m| m.len()).unwrap_or(0);
-
-        let progress = Arc::new(Mutex::new(ArchiveEditProgress {
-            phase: "Compressing".to_string(),
-            current: 0,
-            total: input_size,
-            finished: false,
-            error: None,
-            cancel_requested: false,
-            temp_path: None,
-        }));
-        self.archive_edit_progress = Some(Arc::clone(&progress));
-
         // Switch browse source back to archive (read-only) — close the browser
-        // while compressing to release the temp file
+        // while compressing to release the temp file.
         self.root = None;
         self.directory_cache.clear();
         self.selected_entry = None;
         self.content = None;
 
-        let progress_thread = Arc::clone(&progress);
-        std::thread::spawn(move || {
-            let cancel = {
-                let p = Arc::clone(&progress_thread);
-                move || p.lock().map(|g| g.cancel_requested).unwrap_or(false)
-            };
-
-            // Compute checksum of the temp file before compressing
-            let checksum_result = compute_file_checksum(&temp_path, &checksum_type);
-
-            // Remove old archive, compress temp → new archive
-            let archive_base = archive_path.with_extension("");
-            log::info!(
-                "Compressing {} -> {} (type={})",
-                temp_path.display(),
-                archive_base.display(),
-                compression_type
-            );
-            let result = rusty_backup::rbformats::compress_file_to_archive(
-                &temp_path,
-                &archive_base,
-                &compression_type,
-                &mut |bytes| {
-                    if let Ok(mut p) = progress_thread.lock() {
-                        p.current = bytes;
-                    }
-                },
-                &cancel,
-                &mut |msg| log::info!("{}", msg),
-            );
-
-            if let Ok(mut p) = progress_thread.lock() {
-                p.finished = true;
-                match result {
-                    Ok(new_files) => {
-                        log::info!("Compress succeeded: {:?}", new_files);
-                        // Remove old archive file (in case extension changed)
-                        if archive_path.exists() {
-                            // The new file may have the same path; only remove if different
-                            let new_path = archive_path
-                                .parent()
-                                .unwrap_or(std::path::Path::new("."))
-                                .join(&new_files[0]);
-                            if new_path != archive_path {
-                                let _ = std::fs::remove_file(&archive_path);
-                            }
-                        }
-
-                        // Update metadata checksum (skip for standalone
-                        // container files where metadata_path is empty)
-                        if !metadata_path.as_os_str().is_empty() {
-                            if let Ok(checksum) = checksum_result {
-                                if let Err(e) =
-                                    rusty_backup::backup::metadata::update_partition_checksum(
-                                        &metadata_path,
-                                        partition_index,
-                                        &checksum,
-                                        Some(&new_files),
-                                    )
-                                {
-                                    p.error = Some(format!(
-                                        "Saved archive but failed to update metadata: {e}"
-                                    ));
-                                }
-                            }
-                        }
-
-                        // Clean up temp file
-                        let _ = std::fs::remove_file(&temp_path);
-                    }
-                    Err(e) => {
-                        p.error = Some(format!("{e:#}"));
-                        // Keep temp file on error so user can retry
-                    }
-                }
-            }
-        });
+        self.archive_edit_progress = Some(archive_edit::start_compress(&ctx, temp_path));
     }
 
     /// Poll archive edit background operations for completion.
@@ -1831,13 +1514,13 @@ impl BrowseView {
             // Extraction done — switch source to temp file, enable editing
             if let Some(temp) = temp_path {
                 self.archive_temp_path = Some(temp.clone());
-                self.source_path = Some(temp);
-                self.partition_offset = 0;
-                self.zstd_cache = None;
+                self.session.source_path = Some(temp);
+                self.session.partition_offset = 0;
+                self.session.zstd_cache = None;
                 self.edit_mode = true;
 
                 // Re-open filesystem from temp file
-                match self.open_fs() {
+                match self.session.open() {
                     Ok(mut fs) => {
                         self.fs_type = fs.fs_type().to_string();
                         self.volume_label = fs.volume_label().unwrap_or("").to_string();
@@ -1858,11 +1541,11 @@ impl BrowseView {
         } else {
             // Compression done — re-open original archive for browsing
             if let Some(ctx) = &self.archive_edit_ctx {
-                self.source_path = Some(ctx.archive_path.clone());
-                self.partition_offset = 0;
+                self.session.source_path = Some(ctx.archive_path.clone());
+                self.session.partition_offset = 0;
                 self.archive_temp_path = None;
 
-                match self.open_fs() {
+                match self.session.open() {
                     Ok(mut fs) => {
                         self.fs_type = fs.fs_type().to_string();
                         self.volume_label = fs.volume_label().unwrap_or("").to_string();
@@ -1883,84 +1566,6 @@ impl BrowseView {
                 }
             }
         }
-    }
-
-    /// Check if an entry is pending deletion in the staged edits.
-    fn is_pending_delete(&self, entry: &FileEntry) -> bool {
-        self.staged_edits.iter().any(|edit| match edit {
-            StagedEdit::DeleteEntry { entry: e, .. }
-            | StagedEdit::DeleteRecursive { entry: e, .. } => e.path == entry.path,
-            _ => false,
-        })
-    }
-
-    /// Check if an entry is a pending add (not yet on disk).
-    fn is_pending_add(&self, entry_path: &str) -> bool {
-        self.staged_edits.iter().any(|edit| match edit {
-            StagedEdit::AddFile { parent, name, .. } => {
-                let path = if parent.path == "/" {
-                    format!("/{name}")
-                } else {
-                    format!("{}/{name}", parent.path)
-                };
-                path == entry_path
-            }
-            StagedEdit::CreateDirectory { parent, name, .. } => {
-                let path = if parent.path == "/" {
-                    format!("/{name}")
-                } else {
-                    format!("{}/{name}", parent.path)
-                };
-                path == entry_path
-            }
-            _ => false,
-        })
-    }
-
-    /// Collect pending add entries for a given parent path.
-    fn pending_adds_for(&self, parent_path: &str) -> Vec<FileEntry> {
-        self.staged_edits
-            .iter()
-            .filter_map(|edit| match edit {
-                StagedEdit::AddFile {
-                    parent, name, size, ..
-                } if parent.path == parent_path => {
-                    let path = if parent.path == "/" {
-                        format!("/{name}")
-                    } else {
-                        format!("{}/{name}", parent.path)
-                    };
-                    Some(FileEntry::new_file(name.clone(), path, *size, 0))
-                }
-                StagedEdit::CreateDirectory { parent, name, .. } if parent.path == parent_path => {
-                    let path = if parent.path == "/" {
-                        format!("/{name}")
-                    } else {
-                        format!("{}/{name}", parent.path)
-                    };
-                    Some(FileEntry::new_directory(name.clone(), path, 0))
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Remove a pending-add entry from staged_edits by path. Returns true if found.
-    fn remove_pending_add(&mut self, entry_path: &str) -> bool {
-        let before = self.staged_edits.len();
-        self.staged_edits.retain(|edit| match edit {
-            StagedEdit::AddFile { parent, name, .. }
-            | StagedEdit::CreateDirectory { parent, name, .. } => {
-                let path = if parent.path == "/" {
-                    format!("/{name}")
-                } else {
-                    format!("{}/{name}", parent.path)
-                };
-                path != entry_path
-            }
-            _ => true,
-        });
-        self.staged_edits.len() < before
     }
 
     /// Render the edit mode toolbar with action buttons and free space.
@@ -2001,8 +1606,8 @@ impl BrowseView {
             {
                 if let Some(ref sel) = self.selected_entry.clone() {
                     // If it's a pending-add, just remove it from staged_edits
-                    if self.is_pending_add(&sel.path) {
-                        self.remove_pending_add(&sel.path);
+                    if self.staged_edits.is_pending_add(&sel.path) {
+                        self.staged_edits.remove_pending_add(&sel.path);
                         self.edit_result = Some(format!("Unstaged '{}'", sel.name));
                         self.selected_entry = None;
                         self.content = None;
@@ -2058,28 +1663,15 @@ impl BrowseView {
             ui.add_space(8.0);
 
             // Free space indicator with projected space after staged edits
-            if let Ok(mut efs) = self.open_editable_fs() {
+            if let Ok(mut efs) = self.session.open_editable() {
                 if let Ok(free) = efs.free_space() {
                     ui.label(format!("Free: {}", partition::format_size(free)));
 
                     if !self.staged_edits.is_empty() {
-                        let mut bytes_added: u64 = 0;
-                        let mut bytes_freed: u64 = 0;
-                        for edit in &self.staged_edits {
-                            match edit {
-                                StagedEdit::AddFile { size, .. } => bytes_added += size,
-                                StagedEdit::DeleteEntry { entry, .. }
-                                | StagedEdit::DeleteRecursive { entry, .. } => {
-                                    if !entry.is_directory() {
-                                        bytes_freed += entry.size;
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
+                        let delta = self.staged_edits.space_delta();
                         let projected =
-                            free.saturating_add(bytes_freed).saturating_sub(bytes_added);
-                        let color = if bytes_added > free + bytes_freed {
+                            free.saturating_add(delta.freed).saturating_sub(delta.added);
+                        let color = if delta.added > free + delta.freed {
                             egui::Color32::from_rgb(255, 100, 100) // red — won't fit
                         } else if projected < free / 10 {
                             egui::Color32::from_rgb(255, 200, 100) // yellow — tight
@@ -2189,7 +1781,7 @@ impl BrowseView {
         }
 
         // Duplicate-name check against pending adds in this parent.
-        let pending = self.pending_adds_for(&parent.path);
+        let pending = self.staged_edits.pending_adds_for(&parent.path);
         if pending.iter().any(|e| e.name == name) {
             errors.push((
                 host_path.to_path_buf(),
@@ -2295,7 +1887,7 @@ impl BrowseView {
             .map_err(|e| format!("'{name}': {e}"))?;
 
         // Check for duplicate name in pending adds for this parent
-        let pending = self.pending_adds_for(&parent.path);
+        let pending = self.staged_edits.pending_adds_for(&parent.path);
         if pending.iter().any(|e| e.name == name) {
             return Err(format!("'{name}' is already staged in this directory"));
         }
@@ -2338,12 +1930,13 @@ impl BrowseView {
         log::info!(
             "Applying {} staged edit(s) to {}",
             self.staged_edits.len(),
-            self.source_path
+            self.session
+                .source_path
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default()
         );
-        let mut efs = match self.open_editable_fs() {
+        let mut efs = match self.session.open_editable() {
             Ok(fs) => fs,
             Err(e) => {
                 log::error!("Failed to open editable filesystem: {e}");
@@ -2352,135 +1945,11 @@ impl BrowseView {
             }
         };
 
-        let edits: Vec<StagedEdit> = self.staged_edits.drain(..).collect();
+        let edits: Vec<StagedEdit> = self.staged_edits.drain().collect();
         let total = edits.len();
 
         for (i, edit) in edits.iter().enumerate() {
-            let result = match edit {
-                StagedEdit::AddFile {
-                    parent,
-                    name,
-                    host_path,
-                    size,
-                    prodos_type,
-                    prodos_aux,
-                    resource_fork: rsrc_import,
-                    hfs_type_override,
-                    hfs_creator_override,
-                } => {
-                    // Build CreateFileOptions with resource fork and type/creator
-                    // from the detected import, if any.
-                    let mut opts = CreateFileOptions {
-                        type_code: prodos_type.map(|t| format!("${:02X}", t)),
-                        aux_type: *prodos_aux,
-                        ..Default::default()
-                    };
-
-                    if let Some(ref imp) = rsrc_import {
-                        if !imp.data.is_empty() {
-                            opts.resource_fork = Some(ResourceForkSource::Data(imp.data.clone()));
-                        }
-                        // Type/creator from container overrides auto-detect,
-                        // but not explicit ProDOS overrides.
-                        if opts.type_code.is_none() {
-                            if let Some(tc) = imp.type_code {
-                                opts.type_code = Some(String::from_utf8_lossy(&tc).to_string());
-                            }
-                        }
-                        if opts.creator_code.is_none() {
-                            if let Some(cc) = imp.creator_code {
-                                opts.creator_code = Some(String::from_utf8_lossy(&cc).to_string());
-                            }
-                        }
-                    }
-
-                    // Per-staged-file HFS overrides (from the inline editor)
-                    // win over both AppleDouble FInfo and the dictionary.
-                    if let Some(tc) = hfs_type_override {
-                        opts.type_code = Some(String::from_utf8_lossy(tc).to_string());
-                    }
-                    if let Some(cc) = hfs_creator_override {
-                        opts.creator_code = Some(String::from_utf8_lossy(cc).to_string());
-                    }
-
-                    // For MacBinary imports, use the extracted data fork
-                    // instead of the raw .bin file.
-                    if let Some(ref imp) = rsrc_import {
-                        if let Some(ref data_fork) = imp.data_fork {
-                            let mut cursor = std::io::Cursor::new(data_fork);
-                            let df_size = data_fork.len() as u64;
-                            resolve_dir_by_path(&mut *efs, &parent.path).and_then(
-                                |resolved_parent| {
-                                    efs.create_file(
-                                        &resolved_parent,
-                                        name,
-                                        &mut cursor,
-                                        df_size,
-                                        &opts,
-                                    )
-                                    .map(|_| ())
-                                },
-                            )
-                        } else {
-                            match File::open(host_path) {
-                                Ok(mut file) => resolve_dir_by_path(&mut *efs, &parent.path)
-                                    .and_then(|resolved_parent| {
-                                        efs.create_file(
-                                            &resolved_parent,
-                                            name,
-                                            &mut file,
-                                            *size,
-                                            &opts,
-                                        )
-                                        .map(|_| ())
-                                    }),
-                                Err(e) => Err(FilesystemError::Io(e)),
-                            }
-                        }
-                    } else {
-                        match File::open(host_path) {
-                            Ok(mut file) => resolve_dir_by_path(&mut *efs, &parent.path).and_then(
-                                |resolved_parent| {
-                                    efs.create_file(&resolved_parent, name, &mut file, *size, &opts)
-                                        .map(|_| ())
-                                },
-                            ),
-                            Err(e) => Err(FilesystemError::Io(e)),
-                        }
-                    }
-                }
-                StagedEdit::CreateDirectory { parent, name } => {
-                    resolve_dir_by_path(&mut *efs, &parent.path).and_then(|resolved_parent| {
-                        efs.create_directory(
-                            &resolved_parent,
-                            name,
-                            &CreateDirectoryOptions::default(),
-                        )
-                        .map(|_| ())
-                    })
-                }
-                StagedEdit::DeleteEntry { parent, entry } => efs.delete_entry(parent, entry),
-                StagedEdit::DeleteRecursive { parent, entry } => {
-                    efs.delete_recursive(parent, entry)
-                }
-                StagedEdit::SetProdosType {
-                    entry,
-                    type_byte,
-                    aux_type,
-                } => efs.set_prodos_type(entry, *type_byte, *aux_type),
-                StagedEdit::BlessFolder { entry } => efs.set_blessed_folder(entry),
-                StagedEdit::SetTypeCreator {
-                    entry,
-                    type_code,
-                    creator_code,
-                } => efs.set_type_creator(
-                    entry,
-                    &String::from_utf8_lossy(type_code),
-                    &String::from_utf8_lossy(creator_code),
-                ),
-            };
-
-            if let Err(e) = result {
+            if let Err(e) = edit_queue::apply_edit(&mut *efs, edit) {
                 self.edit_result = Some(format!("Error on edit {}/{total}: {e}", i + 1));
                 return;
             }
@@ -2495,7 +1964,7 @@ impl BrowseView {
         self.invalidate_all_caches();
 
         // Update blessed folder info after apply
-        if let Ok(mut fs) = self.open_fs() {
+        if let Ok(mut fs) = self.session.open() {
             self.blessed_folder = fs.blessed_system_folder();
         }
     }
@@ -2513,7 +1982,7 @@ impl BrowseView {
         self.selected_entry = None;
         self.content = None;
         // Reload root from filesystem
-        if let Ok(mut fs) = self.open_fs() {
+        if let Ok(mut fs) = self.session.open() {
             if let Ok(root) = fs.root() {
                 if let Ok(children) = fs.list_directory(&root) {
                     self.directory_cache.insert(root.path.clone(), children);
@@ -2523,82 +1992,11 @@ impl BrowseView {
         }
     }
 
-    /// Resolve the effective type/creator codes for an HFS/HFS+ entry,
-    /// considering any pending `AddFile` overrides or imported AppleDouble
-    /// FInfo. Returns `[0;4]` for either half if nothing is known.
-    ///
-    /// Lookup order: per-entry HFS override → imported FInfo → on-disk catalog
-    /// (entry.type_code/creator_code) → extension dictionary → all-zeros.
-    fn resolved_hfs_type_creator(&self, entry: &FileEntry) -> ([u8; 4], [u8; 4]) {
-        // 1) Pending AddFile override or imported FInfo
-        for edit in &self.staged_edits {
-            if let StagedEdit::AddFile {
-                parent,
-                name,
-                resource_fork,
-                hfs_type_override,
-                hfs_creator_override,
-                ..
-            } = edit
-            {
-                let path = if parent.path == "/" {
-                    format!("/{name}")
-                } else {
-                    format!("{}/{name}", parent.path)
-                };
-                if path != entry.path {
-                    continue;
-                }
-                let imp_t = resource_fork.as_ref().and_then(|i| i.type_code);
-                let imp_c = resource_fork.as_ref().and_then(|i| i.creator_code);
-                let dict = rusty_backup::fs::hfs_common::type_creator_for_extension(
-                    name.rsplit('.').next().unwrap_or(""),
-                );
-                let t = hfs_type_override
-                    .or(imp_t)
-                    .or(dict.map(|(t, _)| t))
-                    .unwrap_or([0; 4]);
-                let c = hfs_creator_override
-                    .or(imp_c)
-                    .or(dict.map(|(_, c)| c))
-                    .unwrap_or([0; 4]);
-                return (t, c);
-            }
-        }
-        // 2) Existing on-disk catalog values
-        let t = entry
-            .type_code
-            .as_deref()
-            .map(rusty_backup::fs::hfs_common::encode_fourcc)
-            .unwrap_or([0; 4]);
-        let c = entry
-            .creator_code
-            .as_deref()
-            .map(rusty_backup::fs::hfs_common::encode_fourcc)
-            .unwrap_or([0; 4]);
-        (t, c)
-    }
-
-    /// Find the index of a pending `AddFile` for the given full path.
-    fn pending_add_index(&self, full_path: &str) -> Option<usize> {
-        self.staged_edits.iter().position(|e| match e {
-            StagedEdit::AddFile { parent, name, .. } => {
-                let p = if parent.path == "/" {
-                    format!("/{name}")
-                } else {
-                    format!("{}/{name}", parent.path)
-                };
-                p == full_path
-            }
-            _ => false,
-        })
-    }
-
     /// Render the HFS/HFS+ type/creator row beneath the file-info header.
     /// Read-only when not in edit mode; full editor (text + pulldown + Set
     /// button) when edit mode is on. For directories, no-op.
     fn render_hfs_type_row(&mut self, ui: &mut egui::Ui, entry: &FileEntry) {
-        let (cur_t, cur_c) = self.resolved_hfs_type_creator(entry);
+        let (cur_t, cur_c) = self.staged_edits.resolved_hfs_type_creator(entry);
         let cur_t_str = String::from_utf8_lossy(&cur_t).to_string();
         let cur_c_str = String::from_utf8_lossy(&cur_c).to_string();
         let cur_desc = rusty_backup::fs::hfs_common::describe_type_creator(&cur_t, &cur_c);
@@ -2724,17 +2122,10 @@ impl BrowseView {
         }
 
         if let Some((t, c)) = stage_action {
-            // Pending add → mutate the staged entry in place.
-            if let Some(idx) = self.pending_add_index(&entry.path) {
-                if let Some(StagedEdit::AddFile {
-                    hfs_type_override,
-                    hfs_creator_override,
-                    ..
-                }) = self.staged_edits.get_mut(idx)
-                {
-                    *hfs_type_override = Some(t);
-                    *hfs_creator_override = Some(c);
-                }
+            if self
+                .staged_edits
+                .set_pending_hfs_override(&entry.path, t, c)
+            {
                 self.edit_result = Some(format!(
                     "Updated pending '{}' to {}/{}",
                     entry.name,
@@ -2742,17 +2133,7 @@ impl BrowseView {
                     String::from_utf8_lossy(&c),
                 ));
             } else {
-                // Existing on-disk file → push or replace SetTypeCreator edit.
-                let path = entry.path.clone();
-                self.staged_edits.retain(|e| match e {
-                    StagedEdit::SetTypeCreator { entry: e2, .. } => e2.path != path,
-                    _ => true,
-                });
-                self.staged_edits.push(StagedEdit::SetTypeCreator {
-                    entry: entry.clone(),
-                    type_code: t,
-                    creator_code: c,
-                });
+                self.staged_edits.replace_set_type_creator(entry, t, c);
                 self.edit_result = Some(format!(
                     "Staged type/creator {}/{} on '{}'",
                     String::from_utf8_lossy(&t),
@@ -2768,7 +2149,7 @@ impl BrowseView {
     /// when nothing is known.
     fn resolved_prodos_type(&self, entry: &FileEntry) -> (u8, u16) {
         // 1) Pending AddFile override
-        for edit in &self.staged_edits {
+        for edit in self.staged_edits.iter() {
             if let StagedEdit::AddFile {
                 parent,
                 name,
@@ -2924,33 +2305,16 @@ impl BrowseView {
         }
 
         if let Some((t, a)) = stage_action {
-            // Pending add → mutate the staged entry in place.
-            if let Some(idx) = self.pending_add_index(&entry.path) {
-                if let Some(StagedEdit::AddFile {
-                    prodos_type,
-                    prodos_aux,
-                    ..
-                }) = self.staged_edits.get_mut(idx)
-                {
-                    *prodos_type = Some(t);
-                    *prodos_aux = Some(a);
-                }
+            if self
+                .staged_edits
+                .set_pending_prodos_override(&entry.path, t, a)
+            {
                 self.edit_result = Some(format!(
                     "Updated pending '{}' to ${t:02X}/${a:04X}",
                     entry.name,
                 ));
             } else {
-                // Existing on-disk file → push or replace SetProdosType edit.
-                let path = entry.path.clone();
-                self.staged_edits.retain(|e| match e {
-                    StagedEdit::SetProdosType { entry: e2, .. } => e2.path != path,
-                    _ => true,
-                });
-                self.staged_edits.push(StagedEdit::SetProdosType {
-                    entry: entry.clone(),
-                    type_byte: t,
-                    aux_type: a,
-                });
+                self.staged_edits.replace_set_prodos_type(entry, t, a);
                 self.edit_result =
                     Some(format!("Staged type ${t:02X}/${a:04X} on '{}'", entry.name,));
             }
@@ -2999,7 +2363,7 @@ impl BrowseView {
                 let mut dirs_added = 0usize;
                 let mut entries_deleted = 0usize;
                 let mut bytes_added: u64 = 0;
-                for edit in &self.staged_edits {
+                for edit in self.staged_edits.iter() {
                     match edit {
                         StagedEdit::AddFile { size, .. } => {
                             files_added += 1;
@@ -3037,22 +2401,31 @@ impl BrowseView {
                     if ui.button("Discard Edits").clicked() {
                         self.staged_edits.clear();
                         self.show_unsaved_dialog = false;
-                        self.exit_edit_mode();
+                        if self.pending_close {
+                            self.close();
+                        } else {
+                            self.exit_edit_mode();
+                        }
                     }
                     if ui.button("Apply Edits").clicked() {
                         self.show_unsaved_dialog = false;
                         self.apply_staged_edits();
-                        if self
+                        let ok = self
                             .edit_result
                             .as_ref()
                             .map(|r| !r.starts_with("Error"))
-                            .unwrap_or(true)
-                        {
-                            self.exit_edit_mode();
+                            .unwrap_or(true);
+                        if ok {
+                            if self.pending_close {
+                                self.close();
+                            } else {
+                                self.exit_edit_mode();
+                            }
                         }
                     }
                     if ui.button("Cancel").clicked() {
                         self.show_unsaved_dialog = false;
+                        self.pending_close = false;
                     }
                 });
             });
@@ -3458,13 +2831,13 @@ impl BrowseView {
 
     /// Execute repair on the filesystem and re-run check.
     fn run_repair(&mut self) {
-        match self.open_editable_fs() {
+        match self.session.open_editable() {
             Ok(mut efs) => match efs.repair() {
                 Ok(report) => {
                     self.repair_report = Some(report);
                     // Re-run fsck to show updated state
                     drop(efs);
-                    match self.open_fs() {
+                    match self.session.open() {
                         Ok(mut fs) => {
                             if let Some(Ok(result)) = fs.fsck() {
                                 self.fsck_result = Some(result);
@@ -3488,7 +2861,7 @@ impl BrowseView {
     }
 
     fn generate_tree_text(&mut self) {
-        match self.open_fs() {
+        match self.session.open() {
             Ok(mut fs) => {
                 let result = if self.tree_show_ids {
                     rusty_backup::fs::tree::format_tree_with_ids(&mut *fs)
@@ -3592,7 +2965,7 @@ impl BrowseView {
         let parent = self.current_parent_entry();
 
         // Check for duplicate name in pending adds
-        let pending = self.pending_adds_for(&parent.path);
+        let pending = self.staged_edits.pending_adds_for(&parent.path);
         if pending.iter().any(|e| e.name == name) {
             self.edit_result = Some(format!(
                 "Error: '{name}' is already staged in this directory"
@@ -3657,179 +3030,9 @@ impl BrowseView {
     }
 }
 
-/// Compute a checksum (SHA256 or CRC32) of a file.
-fn compute_file_checksum(
-    path: &std::path::Path,
-    checksum_type: &str,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    use std::io::Read;
-    let mut file = File::open(path)?;
-    let mut buf = vec![0u8; 256 * 1024];
-
-    match checksum_type {
-        "sha256" => {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            loop {
-                let n = file.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buf[..n]);
-            }
-            Ok(format!("{:x}", hasher.finalize()))
-        }
-        "crc32" => {
-            let mut hasher = crc32fast::Hasher::new();
-            loop {
-                let n = file.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buf[..n]);
-            }
-            Ok(format!("{:08x}", hasher.finalize()))
-        }
-        other => Err(format!("unsupported checksum type: {other}").into()),
-    }
-}
-
-/// Create a filesystem instance from the browse view's configuration.
-/// This is a standalone function so it can be called from background threads.
-fn create_filesystem(
-    source_path: Option<&PathBuf>,
-    partition_offset: u64,
-    partition_type: u8,
-    partition_type_string: Option<&str>,
-    partclone_cache: Option<&Arc<Mutex<PartcloneBlockCache>>>,
-    zstd_cache: Option<&Arc<Mutex<ZstdStreamCache>>>,
-    preopen_file: Option<&std::sync::Arc<File>>,
-) -> Result<Box<dyn Filesystem>, FilesystemError> {
-    // If we have a partclone block cache, use it
-    if let Some(cache) = partclone_cache {
-        let reader = PartcloneBlockReader::new(Arc::clone(cache));
-        return fs::open_filesystem(reader, 0, partition_type, None);
-    }
-
-    // If we have a streaming zstd cache, use it
-    if let Some(cache) = zstd_cache {
-        let reader = ZstdStreamReader::new(Arc::clone(cache));
-        return fs::open_filesystem(
-            reader,
-            partition_offset,
-            partition_type,
-            partition_type_string,
-        );
-    }
-
-    // Pre-opened device file (already elevated, e.g. macOS raw disk).
-    // try_clone() gives an independent fd so each open_fs() call can seek freely.
-    // Wrap in SectorAlignedReader because macOS raw character devices (/dev/rdiskN)
-    // require all seeks and reads to be sector-aligned (512-byte multiples).
-    // Filesystem code (FAT's next_cluster, ext's read_inode, etc.) performs
-    // sub-sector seeks, so a plain BufReader would cause EINVAL errors.
-    if let Some(arc) = preopen_file {
-        let file = arc.try_clone().map_err(FilesystemError::Io)?;
-        let reader = rusty_backup::os::SectorAlignedReader::new(file);
-        return fs::open_filesystem(
-            reader,
-            partition_offset,
-            partition_type,
-            partition_type_string,
-        );
-    }
-
-    let path = source_path.ok_or_else(|| FilesystemError::Parse("no source path set".into()))?;
-
-    // Sniff first 8 bytes to detect content-addressable formats regardless of
-    // file extension (users often have mislabeled files).
-    let mut magic = [0u8; 8];
-    if let Ok(mut f) = File::open(path) {
-        use std::io::Read as _;
-        let _ = f.read(&mut magic);
-    }
-
-    // CHD — 8-byte magic "MComprHD" at offset 0.
-    if &magic == b"MComprHD" {
-        let chd_reader = ChdReader::open(path)
-            .map_err(|e| FilesystemError::Parse(format!("failed to open CHD: {e}")))?;
-        return fs::open_filesystem(chd_reader, 0, partition_type, partition_type_string);
-    }
-
-    // Seekable zstd cache files — keep extension-based detection since there
-    // is no reliable content-level signal distinguishing them from other zstd.
-    let is_seekable_zst = path.extension().map(|e| e == "zst").unwrap_or(false)
-        && path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(|s| s.ends_with(".seekable"))
-            .unwrap_or(false);
-
-    if is_seekable_zst {
-        let file = File::open(path).map_err(FilesystemError::Io)?;
-        let decoder = match zeekstd::Decoder::new(file) {
-            Ok(d) => d,
-            Err(e) => {
-                // Stale or corrupt cache file — delete it so it gets recreated
-                let _ = std::fs::remove_file(path);
-                return Err(FilesystemError::Parse(format!(
-                    "stale seekable zstd cache removed ({e}). Click Browse again to rebuild."
-                )));
-            }
-        };
-        fs::open_filesystem(
-            decoder,
-            partition_offset,
-            partition_type,
-            partition_type_string,
-        )
-    } else {
-        // For all other formats (raw images, VHD, 2MG, DiskCopy 4.2, DOS-order, etc.),
-        // use the unified format detection pipeline so container wrappers are peeled off.
-        let file = File::open(path).map_err(FilesystemError::Io)?;
-        match rusty_backup::rbformats::detect_image_format_with_path(file, Some(path)) {
-            Ok(format) if !matches!(format, rusty_backup::rbformats::ImageFormat::Raw) => {
-                let file2 = File::open(path).map_err(FilesystemError::Io)?;
-                let (reader, _size) = rusty_backup::rbformats::wrap_image_reader(file2, format)
-                    .map_err(|e| FilesystemError::Parse(format!("failed to unwrap image: {e}")))?;
-                // Container formats present unwrapped data starting at offset 0;
-                // use partition_offset=0 for superfloppies.
-                let effective_offset = if partition_type == 0 {
-                    0
-                } else {
-                    partition_offset
-                };
-                fs::open_filesystem(
-                    reader,
-                    effective_offset,
-                    partition_type,
-                    partition_type_string,
-                )
-            }
-            _ => {
-                let file = File::open(path).map_err(FilesystemError::Io)?;
-                let reader = BufReader::new(file);
-                fs::open_filesystem(
-                    reader,
-                    partition_offset,
-                    partition_type,
-                    partition_type_string,
-                )
-            }
-        }
-    }
-}
-
 /// Run the extraction in a background thread.
-#[allow(clippy::too_many_arguments)]
 fn run_extraction(
-    source_path: Option<&PathBuf>,
-    partition_offset: u64,
-    partition_type: u8,
-    partition_type_string: Option<&str>,
-    partclone_cache: Option<&Arc<Mutex<PartcloneBlockCache>>>,
-    zstd_cache: Option<&Arc<Mutex<ZstdStreamCache>>>,
-    preopen_file: Option<&std::sync::Arc<File>>,
+    session: &BrowseSession,
     entry: &FileEntry,
     dest: &std::path::Path,
     resource_fork_mode: ResourceForkMode,
@@ -3838,15 +3041,7 @@ fn run_extraction(
     prodos_export_mode: ProdosExportMode,
     progress: &Arc<Mutex<ExtractionProgress>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut counting_fs = create_filesystem(
-        source_path,
-        partition_offset,
-        partition_type,
-        partition_type_string,
-        partclone_cache,
-        zstd_cache,
-        preopen_file,
-    )?;
+    let mut counting_fs = session.open()?;
 
     // Pre-count files and bytes for progress tracking
     let (total_files, total_bytes) = count_entry(&mut *counting_fs, entry)?;
@@ -3857,15 +3052,7 @@ fn run_extraction(
     drop(counting_fs);
 
     // Open a fresh filesystem for extraction
-    let mut fs = create_filesystem(
-        source_path,
-        partition_offset,
-        partition_type,
-        partition_type_string,
-        partclone_cache,
-        zstd_cache,
-        preopen_file,
-    )?;
+    let mut fs = session.open()?;
 
     extract_entry(
         &mut *fs,
@@ -4218,7 +3405,7 @@ fn detect_content_type(entry: &FileEntry, data: &[u8]) -> FileContent {
 /// Render a hex dump view of binary data.
 fn render_hex_view(ui: &mut egui::Ui, data: &[u8]) {
     let bytes_per_line = 16;
-    let lines = (data.len() + bytes_per_line - 1) / bytes_per_line;
+    let lines = data.len().div_ceil(bytes_per_line);
     let max_lines = 256; // Limit display to ~4KB
 
     let display_lines = lines.min(max_lines);

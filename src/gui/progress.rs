@@ -115,6 +115,7 @@ impl LogPanel {
 }
 
 /// Progress state for long-running operations.
+#[derive(Default)]
 pub struct ProgressState {
     pub current_bytes: u64,
     pub total_bytes: u64,
@@ -123,18 +124,6 @@ pub struct ProgressState {
     pub full_size_bytes: u64,
     pub operation: String,
     pub active: bool,
-}
-
-impl Default for ProgressState {
-    fn default() -> Self {
-        Self {
-            current_bytes: 0,
-            total_bytes: 0,
-            full_size_bytes: 0,
-            operation: String::new(),
-            active: false,
-        }
-    }
 }
 
 impl ProgressState {

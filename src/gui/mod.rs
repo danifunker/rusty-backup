@@ -1,6 +1,7 @@
 mod backup_tab;
 mod browse_view;
 mod bulk_convert_dialog;
+mod context;
 mod elevation_dialog;
 mod expand_hfs_dialog;
 mod inspect_tab;
@@ -9,16 +10,15 @@ mod progress;
 mod resize_popup;
 mod restore_tab;
 mod settings_dialog;
+mod size_mode_row;
 
 use backup_tab::BackupTab;
-use bulk_convert_dialog::{
-    BulkConvertDialog, BulkConvertStatus, DialogAction as BulkConvertAction,
-    LogLevel as BulkConvertLogLevel,
-};
+use bulk_convert_dialog::{BulkConvertDialog, DialogAction as BulkConvertAction};
 use inspect_tab::InspectTab;
 use optical_tab::OpticalTab;
 use progress::{LogPanel, ProgressState};
 use restore_tab::RestoreTab;
+use rusty_backup::model::status::{BulkConvertLogLevel, BulkConvertStatus};
 use settings_dialog::SettingsDialog;
 use std::path::PathBuf;
 
@@ -291,8 +291,8 @@ impl eframe::App for RustyBackupApp {
                     {
                         self.bulk_convert_dialog = Some(BulkConvertDialog::default());
                     }
-                    if bulk_running {
-                        if ui.button("Cancel Bulk").clicked() {
+                    if bulk_running
+                        && ui.button("Cancel Bulk").clicked() {
                             if let Some(ref s) = self.bulk_convert_status {
                                 if let Ok(mut g) = s.lock() {
                                     g.cancel_requested = true;
@@ -300,7 +300,6 @@ impl eframe::App for RustyBackupApp {
                             }
                             self.log_panel.warn("Bulk convert cancellation requested...");
                         }
-                    }
                 });
             });
         });
@@ -431,8 +430,8 @@ impl eframe::App for RustyBackupApp {
         // Central panel: active tab content
         egui::CentralPanel::default().show(ctx, |ui| match self.active_tab {
             Tab::Backup => {
-                self.backup_tab
-                    .show(ui, &self.devices, &mut self.log_panel, &mut self.progress);
+                let mut ctx = context::TabContext::new(&self.devices, &mut self.log_panel);
+                self.backup_tab.show(ui, &mut ctx, &mut self.progress);
             }
             Tab::Restore => {
                 // Share backup folder between tabs
@@ -441,13 +440,14 @@ impl eframe::App for RustyBackupApp {
                         self.loaded_backup_folder = Some(new_backup.clone());
                         self.inspect_tab.load_backup(&new_backup);
                     }
-                } else if self.loaded_backup_folder.is_some() && !self.restore_tab.has_backup() {
-                    self.restore_tab
-                        .load_backup(self.loaded_backup_folder.as_ref().unwrap());
+                } else if !self.restore_tab.has_backup() {
+                    if let Some(folder) = self.loaded_backup_folder.as_ref() {
+                        self.restore_tab.load_backup(folder);
+                    }
                 }
 
-                self.restore_tab
-                    .show(ui, &self.devices, &mut self.log_panel, &mut self.progress);
+                let mut ctx = context::TabContext::new(&self.devices, &mut self.log_panel);
+                self.restore_tab.show(ui, &mut ctx, &mut self.progress);
             }
             Tab::Inspect => {
                 // Share backup folder between tabs
@@ -456,13 +456,14 @@ impl eframe::App for RustyBackupApp {
                         self.loaded_backup_folder = Some(new_backup.clone());
                         self.restore_tab.load_backup(&new_backup);
                     }
-                } else if self.loaded_backup_folder.is_some() && !self.inspect_tab.has_backup() {
-                    self.inspect_tab
-                        .load_backup(self.loaded_backup_folder.as_ref().unwrap());
+                } else if !self.inspect_tab.has_backup() {
+                    if let Some(folder) = self.loaded_backup_folder.as_ref() {
+                        self.inspect_tab.load_backup(folder);
+                    }
                 }
 
-                self.inspect_tab
-                    .show(ui, &self.devices, &mut self.log_panel);
+                let mut ctx = context::TabContext::new(&self.devices, &mut self.log_panel);
+                self.inspect_tab.show(ui, &mut ctx);
             }
             Tab::Optical => {
                 self.optical_tab

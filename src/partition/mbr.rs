@@ -205,7 +205,7 @@ pub fn parse_ebr_chain(
         let offset = current_ebr_lba as u64 * 512;
         reader
             .seek(SeekFrom::Start(offset))
-            .map_err(|e| RustyBackupError::Io(e))?;
+            .map_err(RustyBackupError::Io)?;
 
         let mut ebr_data = [0u8; 512];
         if reader.read_exact(&mut ebr_data).is_err() {
@@ -238,7 +238,7 @@ pub fn parse_ebr_chain(
         // Entry 0's start_lba is relative to current EBR position
         if !entry0.is_empty() {
             let mut logical = entry0;
-            logical.start_lba = current_ebr_lba + logical.start_lba;
+            logical.start_lba += current_ebr_lba;
             logical_partitions.push(logical);
         }
 

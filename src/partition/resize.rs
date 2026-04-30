@@ -508,45 +508,12 @@ fn patch_filesystem_hidden_sectors(
     use crate::restore::PartitionFsType;
 
     match fs_type {
-        PartitionFsType::Fat => {
-            crate::fs::fat::patch_bpb_hidden_sectors(
-                file,
-                partition_offset,
-                new_start_lba,
-                log_cb,
-            )?;
-        }
-        PartitionFsType::Ntfs => {
-            crate::fs::ntfs::patch_ntfs_hidden_sectors(
-                file,
-                partition_offset,
-                new_start_lba,
-                log_cb,
-            )?;
-        }
-        PartitionFsType::Exfat => {
-            crate::fs::exfat::patch_exfat_hidden_sectors(
-                file,
-                partition_offset,
-                new_start_lba,
-                log_cb,
-            )?;
-        }
-        PartitionFsType::Hfs => {
-            crate::fs::hfs::patch_hfs_hidden_sectors(
-                file,
-                partition_offset,
-                new_start_lba,
-                log_cb,
-            )?;
-        }
-        PartitionFsType::HfsPlus => {
-            crate::fs::hfsplus::patch_hfsplus_hidden_sectors(
-                file,
-                partition_offset,
-                new_start_lba,
-                log_cb,
-            )?;
+        PartitionFsType::Fat
+        | PartitionFsType::Ntfs
+        | PartitionFsType::Exfat
+        | PartitionFsType::Hfs
+        | PartitionFsType::HfsPlus => {
+            crate::fs::patch_hidden_sectors_for(file, partition_offset, new_start_lba, log_cb)?;
         }
         // ext, btrfs, prodos have no hidden sectors field
         PartitionFsType::Ext
@@ -612,7 +579,7 @@ mod tests {
 
     #[test]
     fn test_shift_region_zero_delta() {
-        let mut data = vec![0xAA; 64];
+        let data = vec![0xAA; 64];
         let mut cursor = Cursor::new(data.clone());
         shift_region(&mut cursor, 0, 64, 0, &mut |_, _| {}).unwrap();
         // No change
@@ -742,7 +709,7 @@ mod tests {
 
     #[test]
     fn test_detect_vhd_false() {
-        let mut data = vec![0u8; 1024];
+        let data = vec![0u8; 1024];
         let mut cursor = Cursor::new(data);
         assert!(!detect_vhd(&mut cursor, 1024));
     }

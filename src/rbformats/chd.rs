@@ -49,16 +49,12 @@ impl ChdReader {
         if self.cached_hunk_index == Some(hunk_index) {
             return Ok(());
         }
-        let mut hunk = self.chd.hunk(hunk_index).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("CHD hunk error: {:?}", e))
-        })?;
+        let mut hunk = self
+            .chd
+            .hunk(hunk_index)
+            .map_err(|e| io::Error::other(format!("CHD hunk error: {:?}", e)))?;
         hunk.read_hunk_in(&mut self.cmp_buf, &mut self.hunk_buf)
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("CHD decompress error: {:?}", e),
-                )
-            })?;
+            .map_err(|e| io::Error::other(format!("CHD decompress error: {:?}", e)))?;
         self.cached_hunk_index = Some(hunk_index);
         Ok(())
     }

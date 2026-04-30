@@ -12,6 +12,7 @@ pub mod hfs_fsck;
 pub mod hfsplus;
 pub mod mac_alias;
 pub mod ntfs;
+pub mod patch;
 pub mod prodos;
 pub mod prodos_types;
 pub mod resource_fork;
@@ -28,7 +29,7 @@ pub use exfat::{
 pub use ext::{resize_ext_in_place, validate_ext_integrity, CompactExtReader, ExtFilesystem};
 pub use fat::{
     patch_bpb_hidden_sectors, resize_fat_in_place, set_fat_clean_flags, validate_fat_integrity,
-    CompactFatReader, CompactInfo,
+    CompactFatReader,
 };
 pub use filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, ResourceForkSource,
@@ -36,19 +37,60 @@ pub use filesystem::{
 use filesystem::{Filesystem, FilesystemError};
 pub use fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry, RepairReport};
 pub use hfs::{
-    hfs_max_growable_size, patch_hfs_hidden_sectors, resize_hfs_in_place, validate_hfs_integrity,
-    CompactHfsReader,
+    hfs_max_growable_size, resize_hfs_in_place, validate_hfs_integrity, CompactHfsReader,
 };
-pub use hfsplus::{
-    patch_hfsplus_hidden_sectors, resize_hfsplus_in_place, validate_hfsplus_integrity,
-    CompactHfsPlusReader,
-};
+pub use hfsplus::{resize_hfsplus_in_place, validate_hfsplus_integrity, CompactHfsPlusReader};
 pub use ntfs::{
     patch_ntfs_hidden_sectors, resize_ntfs_in_place, validate_ntfs_integrity, CompactNtfsReader,
 };
 pub use prodos::{resize_prodos_in_place, validate_prodos_integrity, CompactProDosReader};
 
+/// Update the BPB/VBR hidden-sectors / partition-offset field for whichever
+/// filesystem is present at `partition_offset`. Each per-FS patcher checks
+/// its own magic and is a no-op on mismatch, so this is safe to call
+/// unconditionally during restore. HFS / HFS+ have no LBA-dependent VBR
+/// field and are intentionally absent from the dispatch list.
+pub fn patch_hidden_sectors_for(
+    file: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    start_lba: u64,
+    log_cb: &mut impl FnMut(&str),
+) -> anyhow::Result<()> {
+    fat::patch_bpb_hidden_sectors(file, partition_offset, start_lba, log_cb)?;
+    ntfs::patch_ntfs_hidden_sectors(file, partition_offset, start_lba, log_cb)?;
+    exfat::patch_exfat_hidden_sectors(file, partition_offset, start_lba, log_cb)?;
+    Ok(())
+}
+
+/// Resize whichever filesystem is present at `partition_offset` to
+/// `new_size_bytes`. Each per-FS resize is a no-op when its magic doesn't
+/// match, so this is safe to call without first probing the type. Use this
+/// for code paths (like VHD export reconstruction) that don't already track
+/// the filesystem type — code paths that *do* know the type should call
+/// the per-FS resize directly.
+pub fn resize_filesystem_for(
+    file: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    new_size_bytes: u64,
+    log_cb: &mut impl FnMut(&str),
+) -> anyhow::Result<()> {
+    let new_sectors_u32 = (new_size_bytes / 512) as u32;
+    let new_sectors_u64 = new_size_bytes / 512;
+    fat::resize_fat_in_place(file, partition_offset, new_sectors_u32, log_cb)?;
+    ntfs::resize_ntfs_in_place(file, partition_offset, new_sectors_u64, log_cb)?;
+    exfat::resize_exfat_in_place(file, partition_offset, new_sectors_u64, log_cb)?;
+    hfs::resize_hfs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
+    hfsplus::resize_hfsplus_in_place(file, partition_offset, new_size_bytes, log_cb)?;
+    ext::resize_ext_in_place(file, partition_offset, new_size_bytes, log_cb)?;
+    btrfs::resize_btrfs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
+    Ok(())
+}
+
 /// Result of filesystem compaction.
+///
+/// See `src/fs/README.md` ("Compact reader sizing model") for the full
+/// description of how `original_size`, `compacted_size`, and `data_size`
+/// relate for packed vs. layout-preserving readers.
 pub struct CompactResult {
     pub original_size: u64,
     /// Actual bytes that the compact reader will emit (= `original_size` for
@@ -223,39 +265,15 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
             match fs_type {
                 "fat" => {
                     let (reader, info) = CompactFatReader::new(reader, partition_offset).ok()?;
-                    Some((
-                        Box::new(reader),
-                        CompactResult {
-                            original_size: info.original_size,
-                            compacted_size: info.compacted_size,
-                            data_size: info.compacted_size,
-                            clusters_used: info.clusters_used,
-                        },
-                    ))
+                    Some((Box::new(reader), info))
                 }
                 "ntfs" => {
                     let (reader, info) = CompactNtfsReader::new(reader, partition_offset).ok()?;
-                    Some((
-                        Box::new(reader),
-                        CompactResult {
-                            original_size: info.original_size,
-                            compacted_size: info.compacted_size,
-                            data_size: info.compacted_size,
-                            clusters_used: info.clusters_used,
-                        },
-                    ))
+                    Some((Box::new(reader), info))
                 }
                 "exfat" => {
                     let (reader, info) = CompactExfatReader::new(reader, partition_offset).ok()?;
-                    Some((
-                        Box::new(reader),
-                        CompactResult {
-                            original_size: info.original_size,
-                            compacted_size: info.compacted_size,
-                            data_size: info.compacted_size,
-                            clusters_used: info.clusters_used,
-                        },
-                    ))
+                    Some((Box::new(reader), info))
                 }
                 "ext" => {
                     let (reader, info) = CompactExtReader::new(reader, partition_offset).ok()?;
@@ -275,15 +293,7 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
         // FAT types
         0x01 | 0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C => {
             let (reader, info) = CompactFatReader::new(reader, partition_offset).ok()?;
-            Some((
-                Box::new(reader),
-                CompactResult {
-                    original_size: info.original_size,
-                    compacted_size: info.compacted_size,
-                    data_size: info.compacted_size,
-                    clusters_used: info.clusters_used,
-                },
-            ))
+            Some((Box::new(reader), info))
         }
         // NTFS / exFAT
         0x07 => {
@@ -291,27 +301,11 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
             match fs_type {
                 "ntfs" => {
                     let (reader, info) = CompactNtfsReader::new(reader, partition_offset).ok()?;
-                    Some((
-                        Box::new(reader),
-                        CompactResult {
-                            original_size: info.original_size,
-                            compacted_size: info.compacted_size,
-                            data_size: info.compacted_size,
-                            clusters_used: info.clusters_used,
-                        },
-                    ))
+                    Some((Box::new(reader), info))
                 }
                 "exfat" => {
                     let (reader, info) = CompactExfatReader::new(reader, partition_offset).ok()?;
-                    Some((
-                        Box::new(reader),
-                        CompactResult {
-                            original_size: info.original_size,
-                            compacted_size: info.compacted_size,
-                            data_size: info.compacted_size,
-                            clusters_used: info.clusters_used,
-                        },
-                    ))
+                    Some((Box::new(reader), info))
                 }
                 _ => None,
             }
@@ -373,6 +367,92 @@ pub fn effective_partition_size<R: Read + Seek + Send + 'static>(
     )
     .ok()?;
     fs.last_data_byte().ok()
+}
+
+/// Outcome of a `partition_minimum_size` call.
+pub enum MinimumResult {
+    /// The minimum was computed (or determined to be unavailable for this FS type).
+    Computed(Option<u64>),
+    /// This filesystem requires an expensive volume walk and the caller did not
+    /// opt in via `allow_expensive`. The caller should surface a UI affordance
+    /// (e.g. a "Calculate minimum size" button) and re-invoke with `true`.
+    Deferred {
+        /// Human-readable filesystem name (e.g. "HFS", "ext", "btrfs"), suitable
+        /// for log messages like "Need to calculate minimum size due to filesystem X".
+        fs_name: &'static str,
+    },
+}
+
+/// Human-readable name of the filesystem associated with a partition type.
+fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &'static str {
+    if let Some(s) = partition_type_string {
+        return match s {
+            "Apple_HFS" => "HFS",
+            "Apple_HFSX" => "HFSX",
+            "Apple_UNIX_SVR2" => "ext/btrfs",
+            "Linux" => "ext/btrfs",
+            _ => "unknown",
+        };
+    }
+    match partition_type {
+        0xAF => "HFS/HFS+",
+        0x83 => "ext/btrfs",
+        0xA8 => "ProDOS",
+        0x07 => "NTFS/exFAT",
+        0x01 | 0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C => "FAT",
+        _ => "unknown",
+    }
+}
+
+/// True if computing the minimum size for this partition type requires an
+/// expensive filesystem walk (catalog/extent tree traversal).
+///
+/// Cheap path (allocation-bitmap reads): FAT, NTFS, exFAT.
+/// Expensive path (full volume walk): HFS, HFS+, ext, btrfs, ProDOS.
+pub fn is_expensive_minimum(partition_type: u8, partition_type_string: Option<&str>) -> bool {
+    if let Some(s) = partition_type_string {
+        return matches!(s, "Apple_HFS" | "Apple_HFSX" | "Apple_UNIX_SVR2" | "Linux");
+    }
+    matches!(partition_type, 0xAF | 0x83 | 0xA8)
+}
+
+/// Compute the minimum size for a partition, optionally gated behind an
+/// expensive-walk opt-in.
+///
+/// When `allow_expensive` is `false` and the filesystem requires a volume
+/// walk, returns `Deferred { fs_name }`. The caller is expected to log a
+/// message such as "Need to calculate minimum size due to filesystem {fs_name}"
+/// and surface a UI affordance to re-invoke with `allow_expensive=true`.
+///
+/// `progress` receives short phase strings ("Opening filesystem...",
+/// "Computing last data byte...") so a worker thread can update its status.
+pub fn partition_minimum_size<R: Read + Seek + Send + 'static>(
+    reader: R,
+    partition_offset: u64,
+    partition_type: u8,
+    partition_type_string: Option<&str>,
+    partition_size: u64,
+    allow_expensive: bool,
+    progress: &dyn Fn(&str),
+) -> MinimumResult {
+    if !allow_expensive && is_expensive_minimum(partition_type, partition_type_string) {
+        return MinimumResult::Deferred {
+            fs_name: fs_name_for(partition_type, partition_type_string),
+        };
+    }
+    progress("Opening filesystem...");
+    let mut fs = match open_filesystem(
+        reader,
+        partition_offset,
+        partition_type,
+        partition_type_string,
+    ) {
+        Ok(fs) => fs,
+        Err(_) => return MinimumResult::Computed(None),
+    };
+    progress("Computing last data byte...");
+    let min = fs.last_data_byte().ok().map(|m| m.min(partition_size));
+    MinimumResult::Computed(min)
 }
 
 /// Open a filesystem for browsing within a partition.

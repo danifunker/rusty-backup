@@ -6,6 +6,7 @@ use super::entry::{EntryType, FileEntry};
 use super::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
 };
+use super::CompactResult;
 
 // Well-known MFT record numbers
 const MFT_RECORD_VOLUME: u64 = 3;
@@ -513,6 +514,70 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
         }
     }
 
+    /// Stream attribute data to a writer up to `max_bytes`. Avoids the full
+    /// allocation in `read_attribute_data`; used by `write_file_to`.
+    fn write_attribute_data_to(
+        &mut self,
+        attr: &MftAttribute,
+        writer: &mut dyn std::io::Write,
+        max_bytes: u64,
+    ) -> Result<u64, FilesystemError> {
+        if attr.resident {
+            let n = (attr.value.len() as u64).min(max_bytes) as usize;
+            writer.write_all(&attr.value[..n])?;
+            Ok(n as u64)
+        } else {
+            self.write_data_runs_to(&attr.data_runs, attr.real_size, writer, max_bytes)
+        }
+    }
+
+    /// Stream non-resident data runs to a writer.
+    fn write_data_runs_to(
+        &mut self,
+        runs: &[DataRun],
+        real_size: u64,
+        writer: &mut dyn std::io::Write,
+        max_bytes: u64,
+    ) -> Result<u64, FilesystemError> {
+        let limit = max_bytes.min(real_size);
+        let mut written: u64 = 0;
+        let zeros = vec![0u8; 64 * 1024];
+
+        for run in runs {
+            if written >= limit {
+                break;
+            }
+            let run_bytes = run.length * self.cluster_size;
+            let remaining = limit - written;
+            let to_write = run_bytes.min(remaining);
+
+            if run.cluster_offset == 0 {
+                // Sparse run — emit zeros in chunks.
+                let mut left = to_write;
+                while left > 0 {
+                    let n = (zeros.len() as u64).min(left) as usize;
+                    writer.write_all(&zeros[..n])?;
+                    left -= n as u64;
+                }
+            } else {
+                let offset = self.cluster_offset(run.cluster_offset as u64);
+                self.reader.seek(SeekFrom::Start(offset))?;
+                // Stream this run in 64 KiB chunks to avoid a per-run allocation
+                // for very large runs.
+                let mut buf = vec![0u8; 64 * 1024];
+                let mut left = to_write;
+                while left > 0 {
+                    let n = (buf.len() as u64).min(left) as usize;
+                    self.reader.read_exact(&mut buf[..n])?;
+                    writer.write_all(&buf[..n])?;
+                    left -= n as u64;
+                }
+            }
+            written += to_write;
+        }
+        Ok(written)
+    }
+
     /// Read data from data runs (non-resident attribute data).
     fn read_data_runs(
         &mut self,
@@ -776,7 +841,7 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
 
                 if let Some(entry) = self.parse_file_name_entry(content, parent_path, mft_ref) {
                     // Skip system metafiles (MFT records 0-23)
-                    if mft_ref >= 24 || (mft_ref >= 11 && mft_ref < 24) {
+                    if mft_ref >= 24 || (11..24).contains(&mft_ref) {
                         entries.push(entry);
                     }
                 }
@@ -912,6 +977,27 @@ impl<R: Read + Seek + Send> Filesystem for NtfsFilesystem<R> {
         )))
     }
 
+    fn write_file_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn std::io::Write,
+    ) -> Result<u64, FilesystemError> {
+        if entry.is_directory() {
+            return Err(FilesystemError::NotADirectory(entry.path.clone()));
+        }
+        let record = self.read_mft_record(entry.location)?;
+        let attrs = parse_mft_attributes(&record, self.mft_record_size);
+        for attr in &attrs {
+            if attr.attr_type == ATTR_DATA {
+                return self.write_attribute_data_to(attr, writer, entry.size);
+            }
+        }
+        Err(FilesystemError::NotFound(format!(
+            "$DATA attribute not found for {}",
+            entry.path
+        )))
+    }
+
     fn volume_label(&self) -> Option<&str> {
         self.label.as_deref()
     }
@@ -994,7 +1080,7 @@ fn min_unsigned_bytes(val: u64) -> usize {
         return 1;
     }
     let bits = 64 - val.leading_zeros() as usize;
-    (bits + 7) / 8
+    bits.div_ceil(8)
 }
 
 /// Minimum bytes to represent a signed value.
@@ -2225,24 +2311,20 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
         let mut file_data = vec![0u8; data_len as usize];
         if data_len > 0 {
             data.read_exact(&mut file_data)
-                .map_err(|e| FilesystemError::Io(e))?;
+                .map_err(FilesystemError::Io)?;
         }
 
         // Determine resident vs non-resident threshold
         // Approximate: record_size - header(0x38) - StdInfo(~72) - FileName(~104) - SD(~80) - DATA_header(~24) - end(4)
         let overhead = 0x38 + 72 + 104 + 80 + 24 + 4;
-        let resident_threshold = if self.mft_record_size as usize > overhead {
-            self.mft_record_size as usize - overhead
-        } else {
-            0
-        };
+        let resident_threshold = (self.mft_record_size as usize).saturating_sub(overhead);
 
         let data_attr = if data_len as usize <= resident_threshold {
             // Resident $DATA
             build_resident_attr(ATTR_DATA, &file_data)
         } else {
             // Non-resident: allocate clusters
-            let clusters_needed = ((data_len + self.cluster_size - 1) / self.cluster_size) as u32;
+            let clusters_needed = data_len.div_ceil(self.cluster_size) as u32;
             let runs = self.allocate_volume_clusters(clusters_needed)?;
 
             // Write data to allocated clusters
@@ -2411,13 +2493,6 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
 // Compaction
 // =============================================================================
 
-/// Information about an NTFS compaction result.
-pub struct CompactNtfsInfo {
-    pub original_size: u64,
-    pub compacted_size: u64,
-    pub clusters_used: u32,
-}
-
 /// A reader that streams only the used clusters of an NTFS partition.
 ///
 /// Layout: boot sector(s) | used clusters in order (skipping free ones)
@@ -2442,7 +2517,7 @@ impl<R: Read + Seek> CompactNtfsReader<R> {
     pub fn new(
         mut source: R,
         partition_offset: u64,
-    ) -> Result<(Self, CompactNtfsInfo), FilesystemError> {
+    ) -> Result<(Self, CompactResult), FilesystemError> {
         // Read VBR
         source.seek(SeekFrom::Start(partition_offset))?;
         let mut vbr_buf = [0u8; 512];
@@ -2532,9 +2607,10 @@ impl<R: Read + Seek> CompactNtfsReader<R> {
                 total_size: compacted_size,
                 cluster_buf: Vec::new(),
             },
-            CompactNtfsInfo {
+            CompactResult {
                 original_size,
                 compacted_size,
+                data_size: compacted_size,
                 clusters_used,
             },
         ))
@@ -2575,11 +2651,11 @@ impl<R: Read + Seek> Read for CompactNtfsReader<R> {
                     let src_offset = self.partition_offset + src_cluster * self.cluster_size;
                     self.source
                         .seek(SeekFrom::Start(src_offset))
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                        .map_err(io::Error::other)?;
                     self.cluster_buf.resize(self.cluster_size as usize, 0);
                     self.source
                         .read_exact(&mut self.cluster_buf)
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                        .map_err(io::Error::other)?;
                 }
 
                 let avail = self.cluster_size as usize - within_cluster;
@@ -2826,23 +2902,17 @@ pub fn patch_ntfs_hidden_sectors(
     start_lba: u64,
     log_cb: &mut impl FnMut(&str),
 ) -> Result<()> {
-    file.seek(SeekFrom::Start(partition_offset))?;
-    let mut vbr = [0u8; 512];
-    file.read_exact(&mut vbr)?;
+    let mut vbr = crate::fs::patch::read_boot_sector(file, partition_offset)?;
 
     if &vbr[3..11] != b"NTFS    " {
         return Ok(());
     }
 
-    let old_hidden = u32::from_le_bytes([vbr[0x1C], vbr[0x1D], vbr[0x1E], vbr[0x1F]]);
-    let new_hidden = start_lba as u32;
-
-    if old_hidden != new_hidden {
-        vbr[0x1C..0x20].copy_from_slice(&new_hidden.to_le_bytes());
-
+    if let Some(old_hidden) =
+        crate::fs::patch::patch_u32_le_in_buf(&mut vbr, 0x1C, start_lba as u32)
+    {
         // Write primary VBR
-        file.seek(SeekFrom::Start(partition_offset))?;
-        file.write_all(&vbr)?;
+        crate::fs::patch::write_sector_at(file, partition_offset, &vbr)?;
 
         // Write backup boot sector at last sector
         let total_sectors = u64::from_le_bytes([
@@ -2851,13 +2921,12 @@ pub fn patch_ntfs_hidden_sectors(
         let bytes_per_sector = u16::from_le_bytes([vbr[0x0B], vbr[0x0C]]) as u64;
         if total_sectors > 0 && bytes_per_sector > 0 {
             let backup_offset = partition_offset + (total_sectors - 1) * bytes_per_sector;
-            file.seek(SeekFrom::Start(backup_offset))?;
-            file.write_all(&vbr)?;
+            crate::fs::patch::write_sector_at(file, backup_offset, &vbr)?;
         }
 
         log_cb(&format!(
             "NTFS: patched hidden sectors {} -> {}",
-            old_hidden, new_hidden
+            old_hidden, start_lba as u32
         ));
     }
 

@@ -56,7 +56,7 @@ pub(crate) fn compress_zstd(
 
 #[cfg(test)]
 mod tests {
-    use super::super::CompressionType;
+    use crate::backup::CompressionType;
     use std::io::Cursor;
     use tempfile::TempDir;
 

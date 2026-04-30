@@ -126,7 +126,7 @@ pub fn export_mbr_min(
         patched[offset..offset + 4].copy_from_slice(&new_total.to_le_bytes());
     }
     let bin_path = folder.join("mbr-min.bin");
-    fs::write(&bin_path, &patched)
+    fs::write(&bin_path, patched)
         .with_context(|| format!("failed to write {}", bin_path.display()))?;
     Ok(())
 }

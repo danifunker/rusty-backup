@@ -6,6 +6,7 @@ use super::entry::{EntryType, FileEntry};
 use super::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
 };
+use super::CompactResult;
 
 // exFAT directory entry types
 const ENTRY_TYPE_ALLOCATION_BITMAP: u8 = 0x81;
@@ -210,11 +211,49 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
         self.reader.read_exact(&mut buf)?;
         let next = u32::from_le_bytes(buf);
 
-        if next >= 0xFFFFFFF8 || next < 2 {
+        if !(2..0xFFFFFFF8).contains(&next) {
             Ok(None)
         } else {
             Ok(Some(next))
         }
+    }
+
+    /// Stream a cluster chain to a writer up to `max_bytes`, returning bytes
+    /// written. Avoids the full-file allocation in `read_cluster_chain`; used
+    /// by the streaming `write_file_to` override.
+    fn write_cluster_chain_to(
+        &mut self,
+        start_cluster: u32,
+        writer: &mut dyn std::io::Write,
+        max_bytes: u64,
+    ) -> Result<u64, FilesystemError> {
+        let mut written: u64 = 0;
+        let mut cluster = start_cluster;
+        let mut count = 0u32;
+        let mut buf = vec![0u8; self.cluster_size as usize];
+
+        while cluster >= 2 && count <= self.cluster_count && written < max_bytes {
+            let offset = self.cluster_offset(cluster);
+            self.reader.seek(SeekFrom::Start(offset))?;
+            let remaining = max_bytes - written;
+            let to_read = self.cluster_size.min(remaining) as usize;
+            match self.reader.read(&mut buf[..to_read]) {
+                Ok(n) if n > 0 => {
+                    writer.write_all(&buf[..n])?;
+                    written += n as u64;
+                    if n < to_read {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+            count += 1;
+            match self.next_cluster(cluster)? {
+                Some(next) => cluster = next,
+                None => break,
+            }
+        }
+        Ok(written)
     }
 
     /// Read cluster chain data.
@@ -569,6 +608,21 @@ impl<R: Read + Seek + Send> Filesystem for ExfatFilesystem<R> {
         self.read_cluster_chain(cluster, Some(max_bytes as u64))
     }
 
+    fn write_file_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn std::io::Write,
+    ) -> Result<u64, FilesystemError> {
+        if entry.is_directory() {
+            return Err(FilesystemError::NotADirectory(entry.path.clone()));
+        }
+        let cluster = entry.location as u32;
+        if cluster < 2 {
+            return Ok(0);
+        }
+        self.write_cluster_chain_to(cluster, writer, entry.size)
+    }
+
     fn volume_label(&self) -> Option<&str> {
         self.label.as_deref()
     }
@@ -642,7 +696,7 @@ impl<R: Read + Write + Seek> ExfatFilesystem<R> {
         let offset = self.cluster_offset(self.bitmap_start_cluster);
         self.reader.seek(SeekFrom::Start(offset))?;
         // Pad to sector alignment for raw device compatibility
-        let aligned_size = ((bitmap.len() + 511) / 512) * 512;
+        let aligned_size = bitmap.len().div_ceil(512) * 512;
         let mut aligned = vec![0u8; aligned_size];
         aligned[..bitmap.len()].copy_from_slice(bitmap);
         self.reader.write_all(&aligned)?;
@@ -803,7 +857,7 @@ impl<R: Read + Write + Seek> ExfatFilesystem<R> {
     /// Build a complete entry set (File + Stream + FileName entries).
     fn build_entry_set(name: &str, attrs: u16, first_cluster: u32, data_len: u64) -> Vec<u8> {
         let name_utf16: Vec<u16> = name.encode_utf16().collect();
-        let name_entry_count = (name_utf16.len() + 14) / 15; // ceil(len/15)
+        let name_entry_count = name_utf16.len().div_ceil(15); // ceil(len/15)
         let secondary_count = 1 + name_entry_count; // stream + name entries
         let total_entries = 1 + secondary_count; // file + secondaries
         let mut entries = vec![0u8; total_entries * 32];
@@ -1185,7 +1239,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExfatFilesystem<R> {
         let clusters_needed = if data_len == 0 {
             0
         } else {
-            ((data_len as usize + cluster_size - 1) / cluster_size) as u32
+            (data_len as usize).div_ceil(cluster_size) as u32
         };
 
         let first_cluster = if clusters_needed > 0 {
@@ -1264,7 +1318,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExfatFilesystem<R> {
         self.write_cluster_data(new_cluster, &zeroed)?;
 
         // Build entry set with directory attribute
-        let entry_bytes = Self::build_entry_set(name, ATTR_DIRECTORY as u16, new_cluster, 0);
+        let entry_bytes = Self::build_entry_set(name, ATTR_DIRECTORY, new_cluster, 0);
         self.add_entry_to_directory(parent, &entry_bytes)?;
 
         let path = if parent.path == "/" {
@@ -1338,12 +1392,6 @@ fn count_set_bits(data: &[u8], max_clusters: u32) -> u64 {
 // Compaction
 // =============================================================================
 
-pub struct CompactExfatInfo {
-    pub original_size: u64,
-    pub compacted_size: u64,
-    pub clusters_used: u32,
-}
-
 /// A reader that streams only used clusters of an exFAT partition.
 ///
 /// Layout: boot region (12 sectors) + FAT + used clusters in order
@@ -1374,7 +1422,7 @@ impl<R: Read + Seek> CompactExfatReader<R> {
     pub fn new(
         mut source: R,
         partition_offset: u64,
-    ) -> Result<(Self, CompactExfatInfo), FilesystemError> {
+    ) -> Result<(Self, CompactResult), FilesystemError> {
         // Read VBR
         source.seek(SeekFrom::Start(partition_offset))?;
         let mut vbr_buf = [0u8; 512];
@@ -1478,9 +1526,10 @@ impl<R: Read + Seek> CompactExfatReader<R> {
                 boot_region_size,
                 fat_region_size: fat_size,
             },
-            CompactExfatInfo {
+            CompactResult {
                 original_size,
                 compacted_size,
+                data_size: compacted_size,
                 clusters_used,
             },
         ))
@@ -1541,11 +1590,11 @@ impl<R: Read + Seek> Read for CompactExfatReader<R> {
 
                     self.source
                         .seek(SeekFrom::Start(src_offset))
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                        .map_err(io::Error::other)?;
                     self.cluster_buf.resize(self.cluster_size as usize, 0);
                     self.source
                         .read_exact(&mut self.cluster_buf)
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                        .map_err(io::Error::other)?;
                 }
 
                 let avail = self.cluster_size as usize - within_cluster;
@@ -1658,7 +1707,7 @@ pub fn resize_exfat_in_place(
         + cluster_heap_offset as u64 * bytes_per_sector
         + (bitmap_cluster as u64 - 2) * cluster_size;
     // Read bitmap with sector-aligned size for raw device compatibility
-    let bitmap_aligned_size = ((bitmap_size as usize + 511) / 512) * 512;
+    let bitmap_aligned_size = (bitmap_size as usize).div_ceil(512) * 512;
     file.seek(SeekFrom::Start(bmp_offset))?;
     let mut bitmap_data = vec![0u8; bitmap_aligned_size];
     file.read_exact(&mut bitmap_data)?;
@@ -1669,14 +1718,15 @@ pub fn resize_exfat_in_place(
         for byte_idx in (0..bitmap_data.len()).rev() {
             for bit in (0..8).rev() {
                 let cluster = byte_idx as u32 * 8 + bit as u32;
-                if cluster >= new_cluster_count && cluster < old_cluster_count {
-                    if bitmap_data[byte_idx] & (1 << bit) != 0 {
-                        bail!(
-                            "exFAT resize rejected: cluster {} is in use but beyond new boundary ({})",
-                            cluster + 2,
-                            new_cluster_count
-                        );
-                    }
+                if cluster >= new_cluster_count
+                    && cluster < old_cluster_count
+                    && bitmap_data[byte_idx] & (1 << bit) != 0
+                {
+                    bail!(
+                        "exFAT resize rejected: cluster {} is in use but beyond new boundary ({})",
+                        cluster + 2,
+                        new_cluster_count
+                    );
                 }
             }
         }
@@ -1688,7 +1738,7 @@ pub fn resize_exfat_in_place(
     ));
 
     // Resize bitmap
-    let new_bitmap_size = ((new_cluster_count as u64 + 7) / 8) as usize;
+    let new_bitmap_size = (new_cluster_count as u64).div_ceil(8) as usize;
     if new_bitmap_size > bitmap_data.len() {
         // Growing: extend with zeros
         bitmap_data.resize(new_bitmap_size, 0);
@@ -1704,7 +1754,7 @@ pub fn resize_exfat_in_place(
     }
 
     // Write resized bitmap (sector-aligned for raw device compatibility)
-    let write_aligned_size = ((new_bitmap_size + 511) / 512) * 512;
+    let write_aligned_size = new_bitmap_size.div_ceil(512) * 512;
     bitmap_data.resize(write_aligned_size, 0);
     file.seek(SeekFrom::Start(bmp_offset))?;
     file.write_all(&bitmap_data)?;
@@ -1729,7 +1779,7 @@ pub fn resize_exfat_in_place(
         let first_byte = first_cluster as u64 * 4;
         let last_byte = last_cluster as u64 * 4;
         let first_sector_off = (first_byte / 512) * 512;
-        let last_sector_off = ((last_byte + 511) / 512) * 512;
+        let last_sector_off = last_byte.div_ceil(512) * 512;
 
         let mut sector = [0u8; 512];
         let mut sector_off = first_sector_off;
@@ -1904,10 +1954,7 @@ pub fn patch_exfat_hidden_sectors(
     start_lba: u64,
     log_cb: &mut impl FnMut(&str),
 ) -> Result<()> {
-    // Read full boot region for checksum recalculation
-    file.seek(SeekFrom::Start(partition_offset))?;
-    let mut vbr = [0u8; 512];
-    file.read_exact(&mut vbr)?;
+    let mut vbr = crate::fs::patch::read_boot_sector(file, partition_offset)?;
 
     if &vbr[3..11] != b"EXFAT   " {
         return Ok(());

@@ -7,13 +7,7 @@ use anyhow::{bail, Context, Result};
 
 use super::{decompress_to_writer, reconstruct_disk_from_backup, write_zeros, CHUNK_SIZE};
 use crate::backup::metadata::BackupMetadata;
-use crate::fs::btrfs::resize_btrfs_in_place;
-use crate::fs::exfat::{patch_exfat_hidden_sectors, resize_exfat_in_place};
-use crate::fs::ext::resize_ext_in_place;
-use crate::fs::fat::{patch_bpb_hidden_sectors, resize_fat_in_place};
-use crate::fs::hfs::{patch_hfs_hidden_sectors, resize_hfs_in_place};
-use crate::fs::hfsplus::{patch_hfsplus_hidden_sectors, resize_hfsplus_in_place};
-use crate::fs::ntfs::{patch_ntfs_hidden_sectors, resize_ntfs_in_place};
+use crate::fs::{patch_hidden_sectors_for, resize_filesystem_for};
 use crate::partition::mbr::{
     build_ebr_chain, parse_ebr_chain, patch_mbr_entries, LogicalPartitionInfo, Mbr,
 };
@@ -135,7 +129,7 @@ pub(crate) fn vhd_chs_geometry(size_bytes: u64) -> (u32, u32, u32) {
 
     let mut spt = 17u32;
     let mut cyl_times_heads = total_sectors / spt;
-    let mut heads = (cyl_times_heads + 1023) / 1024;
+    let mut heads = cyl_times_heads.div_ceil(1024);
 
     if heads < 4 {
         heads = 4;
@@ -357,7 +351,7 @@ pub fn export_whole_disk_vhd(
     if let Some(meta) = backup_metadata {
         // Backup folder reconstruction — use File directly (not BufWriter)
         // because reconstruct_disk_from_backup needs Read + Write + Seek.
-        // Must open with read+write (not O_WRONLY) because patch_bpb_hidden_sectors
+        // Must open with read+write (not O_WRONLY) because patch_hidden_sectors_for
         // and similar functions read back from the writer to detect filesystem type.
         let mut file = std::fs::OpenOptions::new()
             .read(true)
@@ -651,31 +645,7 @@ pub fn export_whole_disk_vhd(
                 {
                     writer.flush()?;
                     let end_pos = total_written;
-                    patch_bpb_hidden_sectors(
-                        writer.get_mut(),
-                        dest_offset,
-                        pw.dest_lba,
-                        &mut log_cb,
-                    )?;
-                    patch_ntfs_hidden_sectors(
-                        writer.get_mut(),
-                        dest_offset,
-                        pw.dest_lba,
-                        &mut log_cb,
-                    )?;
-                    patch_exfat_hidden_sectors(
-                        writer.get_mut(),
-                        dest_offset,
-                        pw.dest_lba,
-                        &mut log_cb,
-                    )?;
-                    patch_hfs_hidden_sectors(
-                        writer.get_mut(),
-                        dest_offset,
-                        pw.dest_lba,
-                        &mut log_cb,
-                    )?;
-                    patch_hfsplus_hidden_sectors(
+                    patch_hidden_sectors_for(
                         writer.get_mut(),
                         dest_offset,
                         pw.dest_lba,
@@ -688,40 +658,7 @@ pub fn export_whole_disk_vhd(
                 if pw.export_size != pw.original_size {
                     writer.flush()?;
                     let end_pos = total_written;
-                    let new_sectors = (pw.export_size / 512) as u32;
-                    let new_sectors_u64 = pw.export_size / 512;
-                    resize_fat_in_place(writer.get_mut(), dest_offset, new_sectors, &mut log_cb)?;
-                    resize_ntfs_in_place(
-                        writer.get_mut(),
-                        dest_offset,
-                        new_sectors_u64,
-                        &mut log_cb,
-                    )?;
-                    resize_exfat_in_place(
-                        writer.get_mut(),
-                        dest_offset,
-                        new_sectors_u64,
-                        &mut log_cb,
-                    )?;
-                    resize_hfs_in_place(
-                        writer.get_mut(),
-                        dest_offset,
-                        pw.export_size,
-                        &mut log_cb,
-                    )?;
-                    resize_hfsplus_in_place(
-                        writer.get_mut(),
-                        dest_offset,
-                        pw.export_size,
-                        &mut log_cb,
-                    )?;
-                    resize_ext_in_place(
-                        writer.get_mut(),
-                        dest_offset,
-                        pw.export_size,
-                        &mut log_cb,
-                    )?;
-                    resize_btrfs_in_place(
+                    resize_filesystem_for(
                         writer.get_mut(),
                         dest_offset,
                         pw.export_size,
@@ -990,22 +927,10 @@ pub fn export_clonezilla_disk_vhd(
                 .map(|ps| ps.effective_start_lba())
                 .unwrap_or(cz_part.start_lba);
 
-            patch_bpb_hidden_sectors(&mut file, part_offset, effective_lba, &mut log_cb)?;
-            patch_ntfs_hidden_sectors(&mut file, part_offset, effective_lba, &mut log_cb)?;
-            patch_exfat_hidden_sectors(&mut file, part_offset, effective_lba, &mut log_cb)?;
-            patch_hfs_hidden_sectors(&mut file, part_offset, effective_lba, &mut log_cb)?;
-            patch_hfsplus_hidden_sectors(&mut file, part_offset, effective_lba, &mut log_cb)?;
+            patch_hidden_sectors_for(&mut file, part_offset, effective_lba, &mut log_cb)?;
 
             if export_size != cz_part.size_bytes() {
-                let new_sectors = (export_size / 512) as u32;
-                let new_sectors_u64 = export_size / 512;
-                resize_fat_in_place(&mut file, part_offset, new_sectors, &mut log_cb)?;
-                resize_ntfs_in_place(&mut file, part_offset, new_sectors_u64, &mut log_cb)?;
-                resize_exfat_in_place(&mut file, part_offset, new_sectors_u64, &mut log_cb)?;
-                resize_hfs_in_place(&mut file, part_offset, export_size, &mut log_cb)?;
-                resize_hfsplus_in_place(&mut file, part_offset, export_size, &mut log_cb)?;
-                resize_ext_in_place(&mut file, part_offset, export_size, &mut log_cb)?;
-                resize_btrfs_in_place(&mut file, part_offset, export_size, &mut log_cb)?;
+                resize_filesystem_for(&mut file, part_offset, export_size, &mut log_cb)?;
             }
 
             // Seek back to end for next partition
@@ -1097,8 +1022,8 @@ pub fn export_clonezilla_partition_vhd(
 
 #[cfg(test)]
 mod tests {
-    use super::super::CompressionType;
     use super::*;
+    use crate::backup::CompressionType;
     use std::io::Cursor;
     use tempfile::TempDir;
 

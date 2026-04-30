@@ -7,13 +7,15 @@ use std::sync::{Arc, Mutex};
 use rusty_backup::backup::{
     BackupConfig, BackupProgress, ChecksumType, CompressionType, LogLevel as BackupLogLevel,
 };
-use rusty_backup::device::DiskDevice;
 use rusty_backup::fs;
+use rusty_backup::model::size_mode::SizeMode;
+use rusty_backup::model::status::VhdExportStatus;
 use rusty_backup::partition::PartitionSizeOverride;
 use rusty_backup::partition::{self, PartitionInfo, PartitionTable};
 use rusty_backup::rbformats::vhd::export_whole_disk_vhd;
 
-use super::progress::{LogPanel, ProgressState};
+use super::context::TabContext;
+use super::progress::ProgressState;
 
 /// State for the Backup tab.
 pub struct BackupTab {
@@ -36,6 +38,16 @@ pub struct BackupTab {
     selected_partitions: HashSet<usize>,
     /// Minimum sizes per partition (indexed by partition index), from filesystem analysis
     partition_min_sizes: std::collections::HashMap<usize, u64>,
+    /// Partitions whose minimum size requires an expensive volume walk; the
+    /// VHD-export popup surfaces a "Calc min" button per index.
+    deferred_min_sizes: std::collections::HashMap<usize, &'static str>,
+    /// Currently-running per-partition min-size worker threads.
+    pending_min_size_calcs: std::collections::HashMap<
+        usize,
+        Arc<Mutex<rusty_backup::model::min_size_runner::MinSizeStatus>>,
+    >,
+    /// Open file handle for the source (kept alive so min-size workers can clone it).
+    source_file: Option<Arc<File>>,
     partition_load_error: Option<String>,
     /// Change detection for auto-load
     prev_device_idx: Option<usize>,
@@ -56,35 +68,19 @@ struct VhdPartitionConfig {
     start_lba: u64,
     original_size: u64,
     minimum_size: u64,
-    choice: VhdSizeChoice,
+    choice: SizeMode,
     custom_size_mib: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum VhdSizeChoice {
-    Original,
-    Minimum,
-    Custom,
+    /// Filesystem name when the minimum size requires an expensive walk
+    /// (deferred at popup-open time). Cleared when the user clicks "Calc min"
+    /// and the worker finishes successfully.
+    deferred_fs: Option<&'static str>,
 }
 
 impl VhdPartitionConfig {
     fn effective_size(&self) -> u64 {
-        match self.choice {
-            VhdSizeChoice::Original => self.original_size,
-            VhdSizeChoice::Minimum => self.minimum_size,
-            VhdSizeChoice::Custom => self.custom_size_mib as u64 * 1024 * 1024,
-        }
+        self.choice
+            .effective_size(self.original_size, self.minimum_size, self.custom_size_mib)
     }
-}
-
-/// Status of a VHD whole-disk export running on a background thread.
-struct VhdExportStatus {
-    finished: bool,
-    error: Option<String>,
-    current_bytes: u64,
-    total_bytes: u64,
-    cancel_requested: bool,
-    log_messages: Vec<String>,
 }
 
 impl Default for BackupTab {
@@ -106,6 +102,9 @@ impl Default for BackupTab {
             source_partitions: Vec::new(),
             selected_partitions: HashSet::new(),
             partition_min_sizes: std::collections::HashMap::new(),
+            deferred_min_sizes: std::collections::HashMap::new(),
+            pending_min_size_calcs: std::collections::HashMap::new(),
+            source_file: None,
             partition_load_error: None,
             prev_device_idx: None,
             prev_image_path: None,
@@ -127,15 +126,12 @@ impl BackupTab {
         }
     }
 
-    pub fn show(
-        &mut self,
-        ui: &mut egui::Ui,
-        devices: &[DiskDevice],
-        log: &mut LogPanel,
-        progress: &mut ProgressState,
-    ) {
+    pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext, progress: &mut ProgressState) {
         // Poll background backup thread
-        self.poll_progress(log, progress);
+        self.poll_progress(ctx, progress);
+
+        // Poll any pending per-partition minimum-size calculations
+        self.poll_min_size_calcs(ctx);
 
         ui.heading("Backup Disk");
         ui.add_space(8.0);
@@ -149,7 +145,7 @@ impl BackupTab {
                 let current_label = if let Some(path) = &self.image_file_path {
                     format!("Image: {}", path.display())
                 } else if let Some(idx) = self.selected_device_idx {
-                    devices
+                    ctx.devices
                         .get(idx)
                         .map(|d| d.display_name())
                         .unwrap_or_else(|| "Unknown".into())
@@ -162,7 +158,7 @@ impl BackupTab {
                     .width(400.0)
                     .height(400.0) // Allow more items to be visible without scrolling
                     .show_ui(ui, |ui| {
-                        for (i, device) in devices.iter().enumerate() {
+                        for (i, device) in ctx.devices.iter().enumerate() {
                             if ui
                                 .selectable_value(
                                     &mut self.selected_device_idx,
@@ -172,7 +168,7 @@ impl BackupTab {
                                 .clicked()
                             {
                                 self.image_file_path = None;
-                                self.update_backup_name(devices);
+                                self.update_backup_name(ctx);
                             }
                         }
                         ui.separator();
@@ -193,7 +189,7 @@ impl BackupTab {
                             {
                                 self.selected_device_idx = None;
                                 self.image_file_path = Some(path);
-                                self.update_backup_name(devices);
+                                self.update_backup_name(ctx);
                             }
                         }
                     });
@@ -207,7 +203,7 @@ impl BackupTab {
             if source_changed {
                 self.prev_device_idx = self.selected_device_idx;
                 self.prev_image_path = self.image_file_path.clone();
-                self.load_partition_preview(devices, log);
+                self.load_partition_preview(ctx);
             }
         }
 
@@ -308,14 +304,10 @@ impl BackupTab {
                         self.compression_type = CompressionType::Chd;
                     }
                 });
-                if ui
-                    .radio_value(&mut self.compression_type, CompressionType::Vhd, "VHD")
-                    .clicked()
-                {}
-                if ui
-                    .radio_value(&mut self.compression_type, CompressionType::Zstd, "zstd")
-                    .clicked()
-                {}
+                ui.radio_value(&mut self.compression_type, CompressionType::Vhd, "VHD")
+                    .clicked();
+                ui.radio_value(&mut self.compression_type, CompressionType::Zstd, "zstd")
+                    .clicked();
                 if ui
                     .radio_value(&mut self.compression_type, CompressionType::None, "None")
                     .clicked()
@@ -360,7 +352,7 @@ impl BackupTab {
         ui.add_space(16.0);
 
         // Poll VHD export thread
-        self.poll_vhd_export(log, progress);
+        self.poll_vhd_export(ctx, progress);
 
         // Action buttons
         let vhd_exporting = self.vhd_export_status.is_some();
@@ -382,12 +374,12 @@ impl BackupTab {
                     if self.compression_type == CompressionType::Vhd {
                         // Scan partitions if not already loaded
                         if self.source_partitions.is_empty() {
-                            self.scan_source_partitions(devices, log);
+                            self.scan_source_partitions(ctx);
                         }
                         self.init_vhd_configs();
                         self.vhd_popup_open = true;
                     } else {
-                        self.start_backup(devices, log);
+                        self.start_backup(ctx);
                     }
                 }
             } else {
@@ -402,14 +394,14 @@ impl BackupTab {
                             s.cancel_requested = true;
                         }
                     }
-                    log.warn("Cancellation requested...");
+                    ctx.log.warn("Cancellation requested...");
                 }
             }
         });
 
         // VHD backup popup
         if self.vhd_popup_open {
-            self.show_vhd_popup(ui, devices, log);
+            self.show_vhd_popup(ui, ctx);
         }
     }
 
@@ -424,6 +416,7 @@ impl BackupTab {
                 .get(&part.index)
                 .copied()
                 .unwrap_or(part.size_bytes);
+            let deferred_fs = self.deferred_min_sizes.get(&part.index).copied();
 
             self.vhd_partition_configs.push(VhdPartitionConfig {
                 index: part.index,
@@ -431,13 +424,14 @@ impl BackupTab {
                 start_lba: part.start_lba,
                 original_size: part.size_bytes,
                 minimum_size: min_size,
-                choice: VhdSizeChoice::Original,
+                choice: SizeMode::Original,
                 custom_size_mib: (part.size_bytes / (1024 * 1024)) as u32,
+                deferred_fs,
             });
         }
     }
 
-    fn show_vhd_popup(&mut self, ui: &mut egui::Ui, devices: &[DiskDevice], log: &mut LogPanel) {
+    fn show_vhd_popup(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
         egui::Window::new("VHD Backup Options")
             .collapsible(false)
             .resizable(true)
@@ -472,51 +466,45 @@ impl BackupTab {
                             ui.label(egui::RichText::new("Size (MiB)").strong());
                             ui.end_row();
 
+                            let mut min_calc_request: Option<usize> = None;
                             for cfg in &mut self.vhd_partition_configs {
                                 ui.label(format!("{}", cfg.index));
                                 ui.label(&cfg.type_name);
 
-                                let prev_choice = cfg.choice;
-                                ui.horizontal(|ui| {
-                                    ui.radio_value(
-                                        &mut cfg.choice,
-                                        VhdSizeChoice::Original,
-                                        "Original",
-                                    );
-                                    if cfg.minimum_size < cfg.original_size {
-                                        ui.radio_value(
-                                            &mut cfg.choice,
-                                            VhdSizeChoice::Minimum,
-                                            "Minimum",
-                                        );
-                                    }
-                                    ui.radio_value(
-                                        &mut cfg.choice,
-                                        VhdSizeChoice::Custom,
-                                        "Custom",
-                                    );
-                                });
-
-                                if cfg.choice == VhdSizeChoice::Custom
-                                    && prev_choice != VhdSizeChoice::Custom
-                                {
-                                    cfg.custom_size_mib =
-                                        (cfg.minimum_size / (1024 * 1024)).max(1) as u32;
-                                }
-
-                                if cfg.choice == VhdSizeChoice::Custom {
-                                    let min_mib = (cfg.minimum_size / (1024 * 1024)).max(1) as u32;
-                                    let max_mib = (cfg.original_size / (1024 * 1024))
-                                        .max(min_mib as u64)
-                                        as u32;
-                                    ui.add(
-                                        egui::DragValue::new(&mut cfg.custom_size_mib)
-                                            .range(min_mib..=max_mib),
-                                    );
+                                let pending_phase = self
+                                    .pending_min_size_calcs
+                                    .get(&cfg.index)
+                                    .and_then(|s| s.lock().ok().map(|st| st.phase.clone()));
+                                let deferred = if let Some(phase) = &pending_phase {
+                                    Some(super::size_mode_row::DeferredMin::Pending {
+                                        phase: phase.as_str(),
+                                    })
                                 } else {
-                                    ui.label(format!("{}", cfg.effective_size() / (1024 * 1024),));
+                                    cfg.deferred_fs.map(|fs_name| {
+                                        super::size_mode_row::DeferredMin::Available { fs_name }
+                                    })
+                                };
+                                let action = super::size_mode_row::size_mode_row(
+                                    ui,
+                                    &mut cfg.choice,
+                                    &mut cfg.custom_size_mib,
+                                    cfg.original_size,
+                                    cfg.minimum_size,
+                                    super::size_mode_row::SizeModeRowOptions {
+                                        max_size: Some(cfg.original_size),
+                                        deferred,
+                                        ..Default::default()
+                                    },
+                                );
+                                if action
+                                    == super::size_mode_row::SizeModeRowAction::CalcMinRequested
+                                {
+                                    min_calc_request = Some(cfg.index);
                                 }
                                 ui.end_row();
+                            }
+                            if let Some(part_index) = min_calc_request {
+                                self.start_min_size_calc(part_index, ctx);
                             }
                         });
                     ui.add_space(4.0);
@@ -528,10 +516,10 @@ impl BackupTab {
                     if ui.button("Start VHD Backup").clicked() {
                         self.vhd_popup_open = false;
                         if self.vhd_whole_disk {
-                            self.start_vhd_whole_disk(devices, log);
+                            self.start_vhd_whole_disk(ctx);
                         } else {
                             // Per-partition uses the normal backup flow
-                            self.start_backup(devices, log);
+                            self.start_backup(ctx);
                         }
                     }
                     if ui.button("Cancel").clicked() {
@@ -541,11 +529,11 @@ impl BackupTab {
             });
     }
 
-    fn start_vhd_whole_disk(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {
-        let source_path = match self.source_path(devices) {
+    fn start_vhd_whole_disk(&mut self, ctx: &mut TabContext) {
+        let source_path = match self.source_path(ctx) {
             Some(p) => p,
             None => {
-                log.error("No source selected");
+                ctx.log.error("No source selected");
                 return;
             }
         };
@@ -553,7 +541,7 @@ impl BackupTab {
         let dest_dir = match &self.destination_folder {
             Some(d) => d.clone(),
             None => {
-                log.error("No destination folder selected");
+                ctx.log.error("No destination folder selected");
                 return;
             }
         };
@@ -588,7 +576,7 @@ impl BackupTab {
         self.vhd_export_status = Some(Arc::clone(&status));
         self.backup_running = true;
 
-        log.info(format!(
+        ctx.log.info(format!(
             "Starting whole-disk VHD backup: {} -> {}",
             source_path.display(),
             dest_path.display()
@@ -624,7 +612,7 @@ impl BackupTab {
         });
     }
 
-    fn poll_vhd_export(&mut self, log: &mut LogPanel, progress_state: &mut ProgressState) {
+    fn poll_vhd_export(&mut self, ctx: &mut TabContext, progress_state: &mut ProgressState) {
         let status_arc = match &self.vhd_export_status {
             Some(s) => Arc::clone(s),
             None => return,
@@ -636,7 +624,7 @@ impl BackupTab {
 
         // Drain log messages
         for msg in status.log_messages.drain(..) {
-            log.info(msg);
+            ctx.log.info(msg);
         }
 
         // Update progress bar
@@ -648,9 +636,9 @@ impl BackupTab {
 
         if status.finished {
             if let Some(err) = &status.error {
-                log.error(format!("VHD backup failed: {err}"));
+                ctx.log.error(format!("VHD backup failed: {err}"));
             } else {
-                log.info("VHD backup completed successfully.");
+                ctx.log.info("VHD backup completed successfully.");
             }
             drop(status);
             self.vhd_export_status = None;
@@ -658,20 +646,119 @@ impl BackupTab {
         }
     }
 
+    /// Spawn a worker thread to compute the minimum size for a deferred partition.
+    fn start_min_size_calc(&mut self, part_index: usize, ctx: &mut TabContext) {
+        if self.pending_min_size_calcs.contains_key(&part_index) {
+            return;
+        }
+        let Some(part) = self
+            .source_partitions
+            .iter()
+            .find(|p| p.index == part_index)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(file_arc) = self.source_file.clone() else {
+            ctx.log.error(format!(
+                "Cannot calculate minimum size for partition {part_index}: no open source handle",
+            ));
+            return;
+        };
+        let path = self.source_path(ctx);
+        let is_device = path
+            .as_ref()
+            .map(|p| {
+                let s = p.to_string_lossy();
+                s.starts_with("/dev/") || s.starts_with("\\\\.\\")
+            })
+            .unwrap_or(false);
+
+        let fs_name = self
+            .deferred_min_sizes
+            .get(&part_index)
+            .copied()
+            .unwrap_or("unknown");
+        ctx.log.info(format!(
+            "Calculating minimum size for partition {part_index} ({fs_name})...",
+        ));
+
+        let req = rusty_backup::model::min_size_runner::MinSizeRequest {
+            file: file_arc,
+            partition_offset: part.start_lba * 512,
+            partition_type: part.partition_type_byte,
+            partition_type_string: part.partition_type_string.clone(),
+            partition_size: part.size_bytes,
+            partition_index: part_index,
+            use_sector_aligned: is_device,
+        };
+        let status = rusty_backup::model::min_size_runner::spawn(req);
+        self.pending_min_size_calcs.insert(part_index, status);
+    }
+
+    /// Poll all pending min-size workers; on completion, move results into
+    /// `partition_min_sizes` and refresh any matching `vhd_partition_configs`.
+    fn poll_min_size_calcs(&mut self, ctx: &mut TabContext) {
+        let finished_indices: Vec<usize> = self
+            .pending_min_size_calcs
+            .iter()
+            .filter_map(|(idx, status)| status.lock().ok().filter(|s| s.finished).map(|_| *idx))
+            .collect();
+        for idx in finished_indices {
+            if let Some(status_arc) = self.pending_min_size_calcs.remove(&idx) {
+                if let Ok(s) = status_arc.lock() {
+                    if let Some(err) = &s.error {
+                        ctx.log.error(format!(
+                            "Minimum size calculation failed for partition {idx}: {err}",
+                        ));
+                    } else if let Some(min) = s.result {
+                        let part_size = self
+                            .source_partitions
+                            .iter()
+                            .find(|p| p.index == idx)
+                            .map(|p| p.size_bytes)
+                            .unwrap_or(min);
+                        let clamped = min.min(part_size);
+                        self.partition_min_sizes.insert(idx, clamped);
+                        ctx.log.info(format!(
+                            "Partition {idx}: minimum size {} (computed)",
+                            partition::format_size(clamped),
+                        ));
+                        for cfg in &mut self.vhd_partition_configs {
+                            if cfg.index == idx {
+                                cfg.minimum_size = clamped;
+                                cfg.deferred_fs = None;
+                            }
+                        }
+                    } else {
+                        ctx.log.info(format!(
+                            "Partition {idx}: filesystem could not be opened for minimum-size calculation",
+                        ));
+                    }
+                }
+                self.deferred_min_sizes.remove(&idx);
+            }
+        }
+    }
+
     /// Scan source partition table and compute minimum partition sizes.
     /// For devices, this uses OS-level elevation (may prompt for credentials).
-    fn scan_source_partitions(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {
+    fn scan_source_partitions(&mut self, ctx: &mut TabContext) {
         self.source_partitions.clear();
         self.selected_partitions.clear();
         self.partition_min_sizes.clear();
+        self.deferred_min_sizes.clear();
+        self.pending_min_size_calcs.clear();
+        self.source_file = None;
         self.partition_load_error = None;
 
-        let path = match self.source_path(devices) {
+        let path = match self.source_path(ctx) {
             Some(p) => p,
             None => return,
         };
 
-        log.info(format!("Scanning partitions on {}...", path.display()));
+        ctx.log
+            .info(format!("Scanning partitions on {}...", path.display()));
 
         let path_str = path.to_string_lossy();
         let is_device = path_str.starts_with("/dev/") || path_str.starts_with("\\\\.\\");
@@ -694,7 +781,7 @@ impl BackupTab {
             Ok(f) => f,
             Err(msg) => {
                 self.partition_load_error = Some(msg.clone());
-                log.error(msg);
+                ctx.log.error(msg);
                 return;
             }
         };
@@ -719,50 +806,72 @@ impl BackupTab {
                 } else {
                     table.type_name().to_string()
                 };
-                log.info(format!(
+                ctx.log.info(format!(
                     "Found {} partition(s) ({})",
                     self.source_partitions.len(),
                     table_desc,
                 ));
 
-                // Compute minimum partition sizes using filesystem analysis
+                // Compute minimum partition sizes using filesystem analysis.
+                // Cheap filesystems (FAT/NTFS/exFAT) compute eagerly here; expensive
+                // ones (HFS/HFS+/ext/btrfs/ProDOS) defer until the user clicks
+                // "Calc min" in the per-partition resize popup.
                 for part in &self.source_partitions {
                     if part.is_extended_container {
                         continue;
                     }
                     let offset = part.start_lba * 512;
-                    if let Ok(clone) = reader.get_ref().try_clone() {
-                        if let Some(min_size) = fs::effective_partition_size(
-                            BufReader::new(clone),
-                            offset,
-                            part.partition_type_byte,
-                            part.partition_type_string.as_deref(),
-                        ) {
+                    let Ok(clone) = reader.get_ref().try_clone() else {
+                        continue;
+                    };
+                    let result = fs::partition_minimum_size(
+                        BufReader::new(clone),
+                        offset,
+                        part.partition_type_byte,
+                        part.partition_type_string.as_deref(),
+                        part.size_bytes,
+                        false,
+                        &|_| {},
+                    );
+                    match result {
+                        fs::MinimumResult::Computed(Some(min_size)) => {
                             let clamped = min_size.min(part.size_bytes);
                             self.partition_min_sizes.insert(part.index, clamped);
-                            log.info(format!(
+                            ctx.log.info(format!(
                                 "Partition {}: minimum size {} (original {})",
                                 part.index,
                                 partition::format_size(clamped),
                                 partition::format_size(part.size_bytes),
                             ));
                         }
+                        fs::MinimumResult::Computed(None) => {}
+                        fs::MinimumResult::Deferred { fs_name } => {
+                            ctx.log.info(format!(
+                                "Partition {}: need to calculate minimum size due to filesystem {fs_name} (click \"Calc min\" to compute)",
+                                part.index,
+                            ));
+                            self.deferred_min_sizes.insert(part.index, fs_name);
+                        }
                     }
+                }
+                // Stash the open source file so worker threads can clone it later.
+                if let Ok(f) = reader.get_ref().try_clone() {
+                    self.source_file = Some(Arc::new(f));
                 }
             }
             Err(e) => {
                 self.partition_load_error = Some(format!("Could not read partition table: {e}"));
-                log.error(format!("Partition scan failed: {e}"));
+                ctx.log.error(format!("Partition scan failed: {e}"));
             }
         }
     }
 
-    fn load_partition_preview(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {
+    fn load_partition_preview(&mut self, ctx: &mut TabContext) {
         self.source_partitions.clear();
         self.selected_partitions.clear();
         self.partition_load_error = None;
 
-        let path = match self.source_path(devices) {
+        let path = match self.source_path(ctx) {
             Some(p) => p,
             None => return,
         };
@@ -782,7 +891,7 @@ impl BackupTab {
                     {
                         Ok(format) => {
                             let desc = format.description();
-                            log.info(format!("Detected format: {}", desc));
+                            ctx.log.info(format!("Detected format: {}", desc));
                             match File::open(&path) {
                                 Ok(f2) => {
                                     match rusty_backup::rbformats::wrap_image_reader(f2, format) {
@@ -791,7 +900,7 @@ impl BackupTab {
                                         }
                                         Err(e) => {
                                             // Fallback to raw
-                                            log.warn(format!("Format wrap failed: {e}"));
+                                            ctx.log.warn(format!("Format wrap failed: {e}"));
                                             match File::open(&path) {
                                                 Ok(f3) => {
                                                     let mut r = BufReader::new(f3);
@@ -826,7 +935,7 @@ impl BackupTab {
                         } else {
                             table.type_name().to_string()
                         };
-                        log.info(format!(
+                        ctx.log.info(format!(
                             "Source has {} partition(s) ({})",
                             self.source_partitions.len(),
                             table_desc,
@@ -854,24 +963,26 @@ impl BackupTab {
         }
     }
 
-    fn source_path(&self, devices: &[DiskDevice]) -> Option<PathBuf> {
+    fn source_path(&self, ctx: &TabContext) -> Option<PathBuf> {
         if let Some(path) = &self.image_file_path {
             Some(path.clone())
         } else if let Some(idx) = self.selected_device_idx {
-            devices.get(idx).map(|d| d.path.clone())
+            ctx.devices.get(idx).map(|d| d.path.clone())
         } else {
             None
         }
     }
 
-    fn update_backup_name(&mut self, devices: &[DiskDevice]) {
-        let path = match self.source_path(devices) {
+    fn update_backup_name(&mut self, ctx: &TabContext) {
+        let path = match self.source_path(ctx) {
             Some(p) => p,
             None => return,
         };
 
         // Try to get device size and first volume label
-        let device = self.selected_device_idx.and_then(|idx| devices.get(idx));
+        let device = self
+            .selected_device_idx
+            .and_then(|idx| ctx.devices.get(idx));
 
         let size_bytes = device
             .map(|d| d.size_bytes)
@@ -886,11 +997,11 @@ impl BackupTab {
             rusty_backup::backup::format::generate_backup_name(&path, size_bytes, volume_label);
     }
 
-    fn start_backup(&mut self, devices: &[DiskDevice], log: &mut LogPanel) {
-        let source_path = match self.source_path(devices) {
+    fn start_backup(&mut self, ctx: &mut TabContext) {
+        let source_path = match self.source_path(ctx) {
             Some(p) => p,
             None => {
-                log.error("No source selected");
+                ctx.log.error("No source selected");
                 return;
             }
         };
@@ -898,7 +1009,7 @@ impl BackupTab {
         let destination_dir = match &self.destination_folder {
             Some(d) => d.clone(),
             None => {
-                log.error("No destination folder selected");
+                ctx.log.error("No destination folder selected");
                 return;
             }
         };
@@ -935,7 +1046,7 @@ impl BackupTab {
         self.backup_progress = Some(Arc::clone(&progress_arc));
         self.backup_running = true;
 
-        log.info(format!(
+        ctx.log.info(format!(
             "Starting backup: {} -> {}",
             config.source_path.display(),
             config.destination_dir.join(&config.backup_name).display()
@@ -951,7 +1062,7 @@ impl BackupTab {
         });
     }
 
-    fn poll_progress(&mut self, log: &mut LogPanel, progress_state: &mut ProgressState) {
+    fn poll_progress(&mut self, ctx: &mut TabContext, progress_state: &mut ProgressState) {
         let progress_arc = match &self.backup_progress {
             Some(p) => Arc::clone(p),
             None => return,
@@ -964,9 +1075,9 @@ impl BackupTab {
         // Drain log messages
         while let Some(msg) = p.log_messages.pop_front() {
             match msg.level {
-                BackupLogLevel::Info => log.info(msg.message),
-                BackupLogLevel::Warning => log.warn(msg.message),
-                BackupLogLevel::Error => log.error(msg.message),
+                BackupLogLevel::Info => ctx.log.info(msg.message),
+                BackupLogLevel::Warning => ctx.log.warn(msg.message),
+                BackupLogLevel::Error => ctx.log.error(msg.message),
             }
         }
 
@@ -979,7 +1090,7 @@ impl BackupTab {
 
         if p.finished {
             if let Some(err) = &p.error {
-                log.error(format!("Backup failed: {err}"));
+                ctx.log.error(format!("Backup failed: {err}"));
             }
             self.backup_running = false;
             self.backup_progress = None;

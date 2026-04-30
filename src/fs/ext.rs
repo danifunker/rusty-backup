@@ -152,7 +152,7 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
         let feature_incompat = le32(&sb, 0x60);
 
         let block_size = 1024u64 << log_block_size;
-        if block_size < 1024 || block_size > 65536 {
+        if !(1024..=65536).contains(&block_size) {
             return Err(FilesystemError::Parse(format!(
                 "ext: invalid block size {block_size}"
             )));
@@ -208,8 +208,8 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
         if blocks_per_group == 0 {
             return Err(FilesystemError::Parse("ext: blocks_per_group is 0".into()));
         }
-        let group_count = ((total_blocks - first_data_block as u64 + blocks_per_group as u64 - 1)
-            / blocks_per_group as u64) as u32;
+        let group_count =
+            (total_blocks - first_data_block as u64).div_ceil(blocks_per_group as u64) as u32;
 
         if inodes_count == 0 || inodes_per_group == 0 {
             return Err(FilesystemError::Parse(
@@ -396,6 +396,38 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
         }
     }
 
+    /// Stream inode data to a writer up to `max_bytes`. Avoids the full-file
+    /// allocation in `read_inode_data`; used by `write_file_to`.
+    fn write_inode_data_to(
+        &mut self,
+        inode: &InodeData,
+        writer: &mut dyn std::io::Write,
+        max_bytes: u64,
+    ) -> Result<u64, FilesystemError> {
+        let blocks = self.inode_data_blocks(inode)?;
+        let limit = inode.size.min(max_bytes);
+        let block_size = self.block_size as usize;
+        let zeros = vec![0u8; block_size];
+        let mut written: u64 = 0;
+
+        for block_num in blocks {
+            if written >= limit {
+                break;
+            }
+            let remaining = limit - written;
+            let to_write = (block_size as u64).min(remaining) as usize;
+            if block_num == 0 {
+                writer.write_all(&zeros[..to_write])?;
+            } else {
+                let block_data = self.read_block(block_num)?;
+                let n = to_write.min(block_data.len());
+                writer.write_all(&block_data[..n])?;
+            }
+            written += to_write as u64;
+        }
+        Ok(written)
+    }
+
     /// Read all data for an inode.
     fn read_inode_data(
         &mut self,
@@ -414,7 +446,7 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
                 // Sparse block — fill with zeros
                 let chunk = self.block_size as usize;
                 let need = (limit - data.len()).min(chunk);
-                data.extend(std::iter::repeat(0u8).take(need));
+                data.extend(std::iter::repeat_n(0u8, need));
             } else {
                 let block_data = self.read_block(block_num)?;
                 let need = (limit - data.len()).min(block_data.len());
@@ -514,7 +546,7 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
                     }
                 } else {
                     // Sparse — push zeros for the whole range
-                    blocks.extend(std::iter::repeat(0u64).take(ptrs_per_block));
+                    blocks.extend(std::iter::repeat_n(0u64, ptrs_per_block));
                 }
             }
         }
@@ -535,11 +567,11 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
                                 blocks.push(le32(&ind3, k * 4) as u64);
                             }
                         } else {
-                            blocks.extend(std::iter::repeat(0u64).take(ptrs_per_block));
+                            blocks.extend(std::iter::repeat_n(0u64, ptrs_per_block));
                         }
                     }
                 } else {
-                    blocks.extend(std::iter::repeat(0u64).take(ptrs_per_block * ptrs_per_block));
+                    blocks.extend(std::iter::repeat_n(0u64, ptrs_per_block * ptrs_per_block));
                 }
             }
         }
@@ -697,6 +729,18 @@ impl<R: Read + Seek + Send> Filesystem for ExtFilesystem<R> {
         self.read_inode_data(&inode, max_bytes)
     }
 
+    fn write_file_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn std::io::Write,
+    ) -> Result<u64, FilesystemError> {
+        if entry.is_directory() {
+            return Err(FilesystemError::NotADirectory(entry.path.clone()));
+        }
+        let inode = self.read_inode(entry.location as u32)?;
+        self.write_inode_data_to(&inode, writer, inode.size)
+    }
+
     fn volume_label(&self) -> Option<&str> {
         self.label.as_deref()
     }
@@ -719,8 +763,7 @@ impl<R: Read + Seek + Send> Filesystem for ExtFilesystem<R> {
 
     fn last_data_byte(&mut self) -> Result<u64, FilesystemError> {
         let mut highest_block: u64 = 0;
-        let blocks_per_group =
-            (self.total_blocks + self.group_count as u64 - 1) / self.group_count as u64;
+        let blocks_per_group = self.total_blocks.div_ceil(self.group_count as u64);
 
         for group in 0..self.group_count as usize {
             let bitmap_data = self.read_block_bitmap(group)?;
@@ -729,7 +772,7 @@ impl<R: Read + Seek + Send> Filesystem for ExtFilesystem<R> {
             let group_start = self.first_data_block as u64 + group as u64 * blocks_per_group;
             let group_blocks = if group as u32 == self.group_count - 1 {
                 // Last group may be smaller
-                (self.total_blocks - group_start).min(blocks_per_group) as u64
+                (self.total_blocks - group_start).min(blocks_per_group)
             } else {
                 blocks_per_group
             };
@@ -902,8 +945,7 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
         }
 
         let blocks_per_group =
-            ((self.total_blocks - self.first_data_block as u64) + self.group_count as u64 - 1)
-                / self.group_count as u64;
+            (self.total_blocks - self.first_data_block as u64).div_ceil(self.group_count as u64);
 
         let mut allocated = Vec::with_capacity(count);
         let mut remaining = count;
@@ -972,8 +1014,7 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
         }
 
         let blocks_per_group =
-            ((self.total_blocks - self.first_data_block as u64) + self.group_count as u64 - 1)
-                / self.group_count as u64;
+            (self.total_blocks - self.first_data_block as u64).div_ceil(self.group_count as u64);
 
         // Group blocks by their group for efficient bitmap updates
         let mut by_group: std::collections::HashMap<u32, Vec<u64>> =
@@ -1106,7 +1147,7 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
         // i_links_count (0x1A)
         buf[0x1A..0x1C].copy_from_slice(&links.to_le_bytes());
         // i_blocks_lo (0x1C) — number of 512-byte sectors (we compute from size)
-        let sectors = ((size + 511) / 512) as u32;
+        let sectors = size.div_ceil(512) as u32;
         buf[0x1C..0x20].copy_from_slice(&sectors.to_le_bytes());
         // i_flags (0x20)
         buf[0x20..0x24].copy_from_slice(&flags.to_le_bytes());
@@ -1366,7 +1407,7 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
         inode: &InodeData,
     ) -> Result<(), FilesystemError> {
         // Count how many blocks currently used
-        let blocks_used = (inode.size + self.block_size - 1) / self.block_size;
+        let blocks_used = inode.size.div_ceil(self.block_size);
 
         if blocks_used < 12 {
             // Direct block — just update i_block[blocks_used]
@@ -1642,7 +1683,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
         let blocks_needed = if data_len == 0 {
             0
         } else {
-            ((data_len as usize + block_size - 1) / block_size) as usize
+            (data_len as usize).div_ceil(block_size)
         };
 
         let data_blocks = self.allocate_blocks(blocks_needed, parent_group)?;
@@ -1972,7 +2013,7 @@ fn metadata_blocks_in_group(
         count += 1; // superblock (or boot block + superblock for group 0 with 1K blocks)
                     // GDT: ceil(total_groups * desc_size / block_size)
         let gdt_bytes = total_groups as u64 * desc_size as u64;
-        count += (gdt_bytes + block_size - 1) / block_size;
+        count += gdt_bytes.div_ceil(block_size);
     }
 
     // Block bitmap: 1 block
@@ -1981,7 +2022,7 @@ fn metadata_blocks_in_group(
     count += 1;
     // Inode table: ceil(inodes_per_group * inode_size / block_size)
     let inode_table_bytes = inodes_per_group as u64 * inode_size as u64;
-    count += (inode_table_bytes + block_size - 1) / block_size;
+    count += inode_table_bytes.div_ceil(block_size);
 
     // Never exceed blocks_per_group
     count.min(blocks_per_group as u64)
@@ -2062,8 +2103,8 @@ pub fn build_relocation_map<R: Read + Seek>(
         ));
     }
 
-    let group_count = ((total_blocks - first_data_block as u64 + blocks_per_group as u64 - 1)
-        / blocks_per_group as u64) as u32;
+    let group_count =
+        (total_blocks - first_data_block as u64).div_ceil(blocks_per_group as u64) as u32;
 
     // ---- Read GDT ----
     let sb_block = if block_size == 1024 { 1 } else { 0 };
@@ -2337,8 +2378,8 @@ pub fn scan_and_patch_inodes<R: Read + Seek>(
         blocks_count_lo as u64
     };
 
-    let group_count = ((total_blocks - first_data_block as u64 + blocks_per_group as u64 - 1)
-        / blocks_per_group as u64) as u32;
+    let group_count =
+        (total_blocks - first_data_block as u64).div_ceil(blocks_per_group as u64) as u32;
 
     // ---- Read GDT ----
     let sb_block = if block_size == 1024 { 1 } else { 0 };
@@ -2869,8 +2910,8 @@ pub fn rebuild_metadata_for_shrink<R: Read + Seek>(
         blocks_count_lo as u64
     };
 
-    let group_count = ((total_blocks - first_data_block as u64 + blocks_per_group as u64 - 1)
-        / blocks_per_group as u64) as u32;
+    let group_count =
+        (total_blocks - first_data_block as u64).div_ceil(blocks_per_group as u64) as u32;
 
     let min_groups = plan.min_groups;
 
@@ -3196,8 +3237,8 @@ pub fn validate_ext_integrity(
         le32(&sb, 0x04) as u64
     };
 
-    let expected_groups = ((total_blocks - first_data_block + blocks_per_group as u64 - 1)
-        / blocks_per_group as u64) as u32;
+    let expected_groups =
+        (total_blocks - first_data_block).div_ceil(blocks_per_group as u64) as u32;
 
     // Check inode size
     let inode_size = u16::from_le_bytes([sb[0x58], sb[0x59]]);
@@ -3322,8 +3363,7 @@ impl<R: Read + Seek + Send> CompactExtReader<R> {
 
         let min_groups = plan.min_groups;
         let new_total_blocks = plan.new_total_blocks;
-        let inode_table_blocks =
-            ((inodes_per_group as u64 * inode_size as u64) + block_size - 1) / block_size;
+        let inode_table_blocks = (inodes_per_group as u64 * inode_size as u64).div_ceil(block_size);
 
         // Parse GDT to find bitmap/inode-table block numbers per group
         struct GroupMeta {
@@ -3403,7 +3443,7 @@ impl<R: Read + Seek + Send> CompactExtReader<R> {
 
         // GDT blocks (immediately after superblock block)
         let gdt_bytes = &shrink_meta.gdt;
-        let gdt_total_blocks = (gdt_bytes.len() as u64 + block_size - 1) / block_size;
+        let gdt_total_blocks = (gdt_bytes.len() as u64).div_ceil(block_size);
         // Pad GDT to full blocks
         let mut gdt_padded = gdt_bytes.clone();
         let gdt_padded_len = gdt_total_blocks as usize * block_size as usize;
@@ -3626,8 +3666,8 @@ impl<R: Read + Seek + Send> CompactExtReader<R> {
             ));
         }
 
-        let group_count = ((total_blocks - first_data_block as u64 + blocks_per_group as u64 - 1)
-            / blocks_per_group as u64) as u32;
+        let group_count =
+            (total_blocks - first_data_block as u64).div_ceil(blocks_per_group as u64) as u32;
 
         // Read group descriptors
         let sb_block = if block_size == 1024 { 1 } else { 0 };
@@ -4692,7 +4732,7 @@ mod tests {
     fn test_resize_shrink() {
         let image = make_test_image();
         let block_size = 4096u64;
-        let mut data = image;
+        let data = image;
 
         // Shrink from 32768 blocks to 16384 blocks
         let new_size = 16384 * block_size;

@@ -10,6 +10,7 @@ use super::entry::FileEntry;
 use super::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
 };
+use super::CompactResult;
 
 const CHUNK_SIZE: usize = 256 * 1024; // 256 KB I/O buffer
 
@@ -125,8 +126,7 @@ impl<R: Read + Seek> FatFilesystem<R> {
         };
 
         // Determine data region start
-        let root_dir_sectors =
-            ((root_entry_count as u64 * 32) + (bytes_per_sector - 1)) / bytes_per_sector;
+        let root_dir_sectors = (root_entry_count as u64 * 32).div_ceil(bytes_per_sector);
         let data_start_sector =
             reserved_sectors + (num_fats as u64 * sectors_per_fat) + root_dir_sectors;
         let data_sectors = total_sectors.saturating_sub(data_start_sector);
@@ -194,8 +194,7 @@ impl<R: Read + Seek> FatFilesystem<R> {
 
     /// Absolute byte offset for the start of a cluster's data.
     fn cluster_offset(&self, cluster: u32) -> u64 {
-        let root_dir_sectors = ((self.root_entry_count as u64 * 32) + (self.bytes_per_sector - 1))
-            / self.bytes_per_sector;
+        let root_dir_sectors = (self.root_entry_count as u64 * 32).div_ceil(self.bytes_per_sector);
         let data_start_sector = self.reserved_sectors
             + (self.num_fats as u64 * self.sectors_per_fat)
             + root_dir_sectors;
@@ -210,8 +209,7 @@ impl<R: Read + Seek> FatFilesystem<R> {
 
     /// Start of the data region, in bytes from partition start.
     fn data_region_offset(&self) -> u64 {
-        let root_dir_sectors = ((self.root_entry_count as u64 * 32) + (self.bytes_per_sector - 1))
-            / self.bytes_per_sector;
+        let root_dir_sectors = (self.root_entry_count as u64 * 32).div_ceil(self.bytes_per_sector);
         let data_start_sector = self.reserved_sectors
             + (self.num_fats as u64 * self.sectors_per_fat)
             + root_dir_sectors;
@@ -234,7 +232,7 @@ impl<R: Read + Seek> FatFilesystem<R> {
         match self.fat_type {
             FatType::Fat12 => {
                 // FAT12 is always small (max ~6 KB) — read entire FAT
-                let fat_size = ((total_entries as usize) * 3 + 1) / 2;
+                let fat_size = ((total_entries as usize) * 3).div_ceil(2);
                 self.reader.seek(SeekFrom::Start(fat_offset))?;
                 let mut fat_data = vec![0u8; fat_size];
                 let actually_read = self.reader.read(&mut fat_data)?;
@@ -353,7 +351,7 @@ impl<R: Read + Seek> FatFilesystem<R> {
                 let next = self.reader.read_u32::<LittleEndian>()? & 0x0FFF_FFFF;
                 if next >= 0x0FFF_FFF8 {
                     Ok(None)
-                } else if next < 2 || next >= 0x0FFF_FFF0 {
+                } else if !(2..0x0FFF_FFF0).contains(&next) {
                     Ok(None)
                 } else {
                     Ok(Some(next))
@@ -363,6 +361,49 @@ impl<R: Read + Seek> FatFilesystem<R> {
     }
 
     /// Follow the cluster chain and read all cluster data.
+    /// Stream a cluster chain to a writer up to `max_bytes`, returning bytes
+    /// written. Avoids the full-file allocation in `read_cluster_chain`; used
+    /// by the streaming `write_file_to` override.
+    fn write_cluster_chain_to(
+        &mut self,
+        start_cluster: u32,
+        writer: &mut dyn std::io::Write,
+        max_bytes: u64,
+    ) -> Result<u64, FilesystemError> {
+        let cluster_size = self.cluster_size() as usize;
+        let mut written: u64 = 0;
+        let mut cluster = start_cluster;
+        let mut count = 0u32;
+        let mut buf = vec![0u8; cluster_size];
+
+        loop {
+            if cluster < 2 || count > self.total_clusters as u32 || written >= max_bytes {
+                break;
+            }
+            let offset = self.cluster_offset(cluster);
+            self.reader.seek(SeekFrom::Start(offset))?;
+            match self.reader.read(&mut buf) {
+                Ok(n) if n > 0 => {
+                    let remaining = max_bytes - written;
+                    let to_write = (n as u64).min(remaining) as usize;
+                    writer.write_all(&buf[..to_write])?;
+                    written += to_write as u64;
+                    if n < cluster_size {
+                        break;
+                    }
+                }
+                Ok(_) => break,
+                Err(e) => return Err(e.into()),
+            }
+            count += 1;
+            match self.next_cluster(cluster)? {
+                Some(next) => cluster = next,
+                None => break,
+            }
+        }
+        Ok(written)
+    }
+
     fn read_cluster_chain(&mut self, start_cluster: u32) -> Result<Vec<u8>, FilesystemError> {
         let cluster_size = self.cluster_size() as usize;
         let mut data = Vec::new();
@@ -618,6 +659,20 @@ impl<R: Read + Seek + Send> Filesystem for FatFilesystem<R> {
         Ok(data[..actual_size].to_vec())
     }
 
+    fn write_file_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn std::io::Write,
+    ) -> Result<u64, FilesystemError> {
+        if entry.is_directory() {
+            return Err(FilesystemError::NotADirectory(entry.path.clone()));
+        }
+        if entry.location < 2 {
+            return Ok(0);
+        }
+        self.write_cluster_chain_to(entry.location as u32, writer, entry.size)
+    }
+
     fn volume_label(&self) -> Option<&str> {
         self.label.as_deref()
     }
@@ -648,8 +703,7 @@ impl<R: Read + Seek + Send> Filesystem for FatFilesystem<R> {
                 let cluster_end_abs = self.cluster_offset(cluster) + self.cluster_size();
                 let relative = cluster_end_abs - self.partition_offset;
                 // Round up to sector boundary
-                let aligned = ((relative + self.bytes_per_sector - 1) / self.bytes_per_sector)
-                    * self.bytes_per_sector;
+                let aligned = relative.div_ceil(self.bytes_per_sector) * self.bytes_per_sector;
                 Ok(aligned)
             }
             None => {
@@ -709,12 +763,13 @@ fn current_fat_datetime() -> (u16, u16) {
     let mut year = 0u16;
     let mut remaining_days = days as u32;
     loop {
-        let days_in_year =
-            if (year + 1980) % 4 == 0 && ((year + 1980) % 100 != 0 || (year + 1980) % 400 == 0) {
-                366
-            } else {
-                365
-            };
+        let days_in_year = if (year + 1980).is_multiple_of(4)
+            && (!(year + 1980).is_multiple_of(100) || (year + 1980).is_multiple_of(400))
+        {
+            366
+        } else {
+            365
+        };
         if remaining_days < days_in_year {
             break;
         }
@@ -725,7 +780,8 @@ fn current_fat_datetime() -> (u16, u16) {
             break;
         }
     }
-    let is_leap = (year + 1980) % 4 == 0 && ((year + 1980) % 100 != 0 || (year + 1980) % 400 == 0);
+    let is_leap = (year + 1980).is_multiple_of(4)
+        && (!(year + 1980).is_multiple_of(100) || (year + 1980).is_multiple_of(400));
     let days_in_months: [u32; 12] = [
         31,
         if is_leap { 29 } else { 28 },
@@ -999,7 +1055,7 @@ impl<R: Read + Write + Seek> FatFilesystem<R> {
                 // If we hit end-of-dir marker (0x00), all subsequent slots are free too
                 if dir_data[off] == 0x00 {
                     let remaining = num_entries - i;
-                    if consecutive + remaining - 1 >= slots_needed {
+                    if consecutive + remaining > slots_needed {
                         return Some(start);
                     }
                 }
@@ -1036,7 +1092,7 @@ impl<R: Read + Write + Seek> FatFilesystem<R> {
         if needs_lfn {
             let ucs2 = encode_ucs2_lfn(name);
             // LFN entries hold 13 chars each
-            let lfn_count = (ucs2.len() + 12) / 13;
+            let lfn_count = ucs2.len().div_ceil(13);
             // Pad to full 13-char slots
             let mut padded = ucs2;
             while padded.len() < lfn_count * 13 {
@@ -1473,7 +1529,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
         let clusters_needed = if data_len == 0 {
             0
         } else {
-            ((data_len as usize + cluster_size - 1) / cluster_size) as u32
+            (data_len as usize).div_ceil(cluster_size) as u32
         };
 
         let first_cluster = if clusters_needed > 0 {
@@ -1731,13 +1787,6 @@ fn format_fat_datetime(date: u16, time: u16) -> String {
 // CompactFatReader — streaming compacted FAT image
 // ---------------------------------------------------------------------------
 
-/// Result of filesystem compaction analysis.
-pub struct CompactInfo {
-    pub original_size: u64,
-    pub compacted_size: u64,
-    pub clusters_used: u32,
-}
-
 /// A streaming `Read` that produces a compacted FAT partition image.
 ///
 /// Allocated clusters are packed contiguously from cluster 2 onwards, producing
@@ -1792,7 +1841,7 @@ impl<R: Read + Seek> CompactFatReader<R> {
     pub fn new(
         mut source: R,
         partition_offset: u64,
-    ) -> Result<(Self, CompactInfo), FilesystemError> {
+    ) -> Result<(Self, CompactResult), FilesystemError> {
         // --- Parse BPB ---
         source.seek(SeekFrom::Start(partition_offset))?;
         let mut bpb = [0u8; 512];
@@ -1838,8 +1887,7 @@ impl<R: Read + Seek> CompactFatReader<R> {
             sectors_per_fat_32
         };
 
-        let root_dir_sectors =
-            ((root_entry_count as u64 * 32) + (bytes_per_sector - 1)) / bytes_per_sector;
+        let root_dir_sectors = (root_entry_count as u64 * 32).div_ceil(bytes_per_sector);
         let original_data_start_sector =
             reserved_sectors + (num_fats * original_sectors_per_fat) + root_dir_sectors;
         let data_sectors = original_total_sectors.saturating_sub(original_data_start_sector);
@@ -1970,8 +2018,8 @@ impl<R: Read + Seek> CompactFatReader<R> {
         let new_cluster_count = clusters_used as u64;
 
         let new_sectors_per_fat = if fat_type == FatType::Fat12 {
-            let fat_bytes = ((new_cluster_count + 2) * 3 + 1) / 2;
-            (fat_bytes + bytes_per_sector - 1) / bytes_per_sector
+            let fat_bytes = ((new_cluster_count + 2) * 3).div_ceil(2);
+            fat_bytes.div_ceil(bytes_per_sector)
         } else {
             let entry_bytes: u64 = match fat_type {
                 FatType::Fat16 => 2,
@@ -1979,7 +2027,7 @@ impl<R: Read + Seek> CompactFatReader<R> {
                 _ => unreachable!(),
             };
             let fat_bytes = (new_cluster_count + 2) * entry_bytes;
-            (fat_bytes + bytes_per_sector - 1) / bytes_per_sector
+            fat_bytes.div_ceil(bytes_per_sector)
         };
 
         let new_data_sectors = new_cluster_count * sectors_per_cluster;
@@ -2062,7 +2110,7 @@ impl<R: Read + Seek> CompactFatReader<R> {
                     // Free count = 0 (all clusters in compacted image are used)
                     boot_sector[fs_off + 488..fs_off + 492].copy_from_slice(&0u32.to_le_bytes());
                     // Next free = first cluster past used data
-                    let next_free = (clusters_used as u32) + 2;
+                    let next_free = clusters_used + 2;
                     boot_sector[fs_off + 492..fs_off + 496]
                         .copy_from_slice(&next_free.to_le_bytes());
                 }
@@ -2164,9 +2212,10 @@ impl<R: Read + Seek> CompactFatReader<R> {
         let data_offset_in_image = root_dir_offset_in_image + (root_dir_sectors * bytes_per_sector);
         let total_virtual_size = new_total_sectors * bytes_per_sector;
 
-        let info = CompactInfo {
+        let info = CompactResult {
             original_size,
             compacted_size: total_virtual_size,
+            data_size: total_virtual_size,
             clusters_used,
         };
 
@@ -2180,7 +2229,7 @@ impl<R: Read + Seek> CompactFatReader<R> {
                 new_to_old,
                 old_to_new,
                 directory_clusters,
-                src_data_start_abs: src_data_start_abs,
+                src_data_start_abs,
                 bytes_per_sector,
                 sectors_per_cluster,
                 cluster_size,
@@ -2690,7 +2739,7 @@ pub fn resize_fat_in_place(
     let root_dir_sectors = if is_fat32 {
         0u32
     } else {
-        ((root_entry_count as u32 * 32) + (bytes_per_sector as u32 - 1)) / bytes_per_sector as u32
+        (root_entry_count as u32 * 32).div_ceil(bytes_per_sector as u32)
     };
 
     // --- 2. Calculate old layout ---
@@ -2875,8 +2924,7 @@ pub fn set_fat_clean_flags(
         } else {
             total_sectors32
         };
-        let root_dir_sectors = ((root_entry_count as u32 * 32) + bytes_per_sector as u32 - 1)
-            / bytes_per_sector as u32;
+        let root_dir_sectors = (root_entry_count as u32 * 32).div_ceil(bytes_per_sector as u32);
         let data_sectors = total_sectors
             .saturating_sub(reserved_sectors)
             .saturating_sub(num_fats * spf16 as u32)
@@ -3008,7 +3056,7 @@ pub fn validate_fat_integrity(
     let root_dir_sectors = if is_fat32 {
         0u32
     } else {
-        ((root_entry_count as u32 * 32) + (bytes_per_sector as u32 - 1)) / bytes_per_sector as u32
+        (root_entry_count as u32 * 32).div_ceil(bytes_per_sector as u32)
     };
 
     let data_start = reserved_sectors + num_fats * spf + root_dir_sectors;
@@ -3179,10 +3227,8 @@ pub fn validate_fat_integrity(
             _ => false,
         };
 
-        if !is_free && !is_eoc && !is_bad {
-            if entry < 2 || entry >= total_entries {
-                out_of_bounds += 1;
-            }
+        if !is_free && !is_eoc && !is_bad && (entry < 2 || entry >= total_entries) {
+            out_of_bounds += 1;
         }
     }
 
@@ -3211,9 +3257,7 @@ pub fn patch_bpb_hidden_sectors(
     start_lba: u64,
     log_cb: &mut impl FnMut(&str),
 ) -> Result<()> {
-    file.seek(SeekFrom::Start(partition_offset))?;
-    let mut bpb = [0u8; 512];
-    file.read_exact(&mut bpb)?;
+    let mut bpb = crate::fs::patch::read_boot_sector(file, partition_offset)?;
 
     if bpb[0] != 0xEB && bpb[0] != 0xE9 {
         return Ok(()); // Not a FAT BPB
@@ -3224,12 +3268,9 @@ pub fn patch_bpb_hidden_sectors(
         return Ok(()); // Not a valid FAT BPB
     }
 
-    let old_hidden = u32::from_le_bytes([bpb[0x1C], bpb[0x1D], bpb[0x1E], bpb[0x1F]]);
-    let new_hidden = start_lba as u32;
-
-    if old_hidden != new_hidden {
-        bpb[0x1C..0x20].copy_from_slice(&new_hidden.to_le_bytes());
-
+    if let Some(old_hidden) =
+        crate::fs::patch::patch_u32_le_in_buf(&mut bpb, 0x1C, start_lba as u32)
+    {
         let spf16 = u16::from_le_bytes([bpb[22], bpb[23]]);
         let root_entry_count = u16::from_le_bytes([bpb[17], bpb[18]]);
         let is_fat32 = spf16 == 0 && root_entry_count == 0;
@@ -3237,7 +3278,7 @@ pub fn patch_bpb_hidden_sectors(
         write_bpb(file, partition_offset, &bpb, is_fat32, bytes_per_sector)?;
         log_cb(&format!(
             "Patched BPB hidden sectors: {} -> {}",
-            old_hidden, new_hidden
+            old_hidden, start_lba as u32
         ));
     }
 
@@ -3296,8 +3337,8 @@ fn compute_fat_sectors(
             loop {
                 let data_sectors = avail.saturating_sub(n * spf as u64);
                 let clusters = data_sectors / spc;
-                let fat_bytes = ((clusters + 2) * 3 + 1) / 2;
-                let needed = ((fat_bytes + bps - 1) / bps) as u32;
+                let fat_bytes = ((clusters + 2) * 3).div_ceil(2);
+                let needed = fat_bytes.div_ceil(bps) as u32;
                 if needed <= spf {
                     return spf;
                 }
@@ -3309,13 +3350,13 @@ fn compute_fat_sectors(
             // Closed-form: ceil(2 * (avail + 2*spc) / (bps*spc + 2*n))
             let num = 2 * (avail + 2 * spc);
             let den = bps * spc + 2 * n;
-            ((num + den - 1) / den) as u32
+            num.div_ceil(den) as u32
         }
         32 => {
             // FAT32: 4 bytes per entry
             let num = 4 * (avail + 2 * spc);
             let den = bps * spc + 4 * n;
-            ((num + den - 1) / den) as u32
+            num.div_ceil(den) as u32
         }
         _ => 1,
     }
@@ -3559,6 +3600,12 @@ mod tests {
         // Read file back
         let data = fs.read_file(&entries[0], usize::MAX).unwrap();
         assert_eq!(&data, test_data);
+
+        // write_file_to streams the same bytes (no full-file allocation).
+        let mut streamed: Vec<u8> = Vec::new();
+        let n = fs.write_file_to(&entries[0], &mut streamed).unwrap();
+        assert_eq!(n as usize, test_data.len());
+        assert_eq!(&streamed, test_data);
     }
 
     #[test]

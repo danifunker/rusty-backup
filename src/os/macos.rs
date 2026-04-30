@@ -439,7 +439,7 @@ fn da_unmount_disk_attempt(bsd_name: &str, attempt: u32) -> Result<()> {
 
     if !callback_fired {
         if attempt < 5 {
-            eprintln!(
+            log::warn!(
                 "DA unmount of {} timed out (attempt {}), retrying...",
                 bsd_name,
                 attempt + 1
@@ -497,7 +497,7 @@ unsafe extern "C-unwind" fn claim_release_deny(
     _disk: NonNull<DADisk>,
     _context: *mut c_void,
 ) -> *const DADissenter {
-    eprintln!("DA: another client tried to steal our disk claim — denied");
+    log::warn!("DA: another client tried to steal our disk claim — denied");
     let reason = CFString::from_str("Rusty Backup has exclusive access");
     let dissenter = unsafe { DADissenter::new(None, kDAReturnExclusiveAccess, Some(&reason)) };
     objc2_core_foundation::CFRetained::into_raw(dissenter).as_ptr()
@@ -571,7 +571,7 @@ fn da_claim_disk(bsd_name: &str) -> Result<Option<DiskClaim>> {
                 session.unschedule_from_run_loop(&main_run_loop, mode);
                 let _ = Box::from_raw(state);
             }
-            eprintln!(
+            log::warn!(
                 "DA claim of {} timed out — proceeding without exclusive access",
                 bsd_name
             );
@@ -584,14 +584,14 @@ fn da_claim_disk(bsd_name: &str) -> Result<Option<DiskClaim>> {
 
     if !state.ok.load(Ordering::SeqCst) {
         unsafe { session.unschedule_from_run_loop(&main_run_loop, mode) };
-        eprintln!(
+        log::warn!(
             "DA claim of {} failed — proceeding without exclusive access",
             bsd_name
         );
         return Ok(None);
     }
 
-    eprintln!("DA: claimed {} for exclusive access", bsd_name);
+    log::info!("DA: claimed {} for exclusive access", bsd_name);
 
     Ok(Some(DiskClaim {
         _session: session,
@@ -793,7 +793,7 @@ fn open_device(path: &str, flags: libc::c_int) -> Result<File> {
             if msg.contains("cancelled") || msg.contains("canceled") {
                 return Err(e);
             }
-            eprintln!("authopen warning: {} — falling back to direct open", e);
+            log::warn!("authopen warning: {} — falling back to direct open", e);
         }
     }
 
@@ -804,13 +804,13 @@ fn open_device(path: &str, flags: libc::c_int) -> Result<File> {
     for attempt in 0..5 {
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_millis(500));
-            eprintln!("Retrying open of {} (attempt {}/5)...", path, attempt + 1);
+            log::info!("Retrying open of {} (attempt {}/5)...", path, attempt + 1);
         }
 
         let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
         if fd >= 0 {
             unsafe { libc::fcntl(fd, F_NOCACHE, 1) };
-            eprintln!("Opened {} directly (attempt {})", path, attempt + 1);
+            log::info!("Opened {} directly (attempt {})", path, attempt + 1);
             return Ok(unsafe { File::from_raw_fd(fd) });
         }
 
@@ -900,14 +900,14 @@ pub(crate) fn open_target_for_writing(path: &Path) -> Result<(File, Option<DiskC
     // Unmount all volumes before claiming/opening
     if let Err(e) = da_unmount_disk(disk_name) {
         // Not fatal — the disk might not be mounted
-        eprintln!("DA unmount warning: {}", e);
+        log::warn!("DA unmount warning: {}", e);
     }
 
     // Claim the disk to keep other DA clients (e.g. VMware) away
     let claim = match da_claim_disk(disk_name) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("DA claim warning: {}", e);
+            log::warn!("DA claim warning: {}", e);
             None
         }
     };
@@ -940,14 +940,14 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
 
         // Unmount all volumes before claiming/opening
         if let Err(e) = da_unmount_disk(disk_name) {
-            eprintln!("DA unmount warning: {}", e);
+            log::warn!("DA unmount warning: {}", e);
         }
 
         // Claim the disk to keep other DA clients (e.g. VMware) away
         let disk_claim = match da_claim_disk(disk_name) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("DA claim warning: {}", e);
+                log::warn!("DA claim warning: {}", e);
                 None
             }
         };
