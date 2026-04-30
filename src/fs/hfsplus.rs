@@ -2360,7 +2360,7 @@ mod tests {
         BigEndian::write_u16(&mut img[lot - 6..lot - 4], free_rel); // free space offset
 
         // Volume Header at byte 1024
-        let mut vh = HfsPlusVolumeHeader {
+        let vh = HfsPlusVolumeHeader {
             signature: HFS_PLUS_SIGNATURE,
             version: 4,
             attributes: 0,

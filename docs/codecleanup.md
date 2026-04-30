@@ -263,10 +263,10 @@ Conventions:
 
 ## 12. Final pass — eliminate compilation warnings
 
-- [ ] **Once all other refactor work is done, drive `cargo build --all-targets` to zero warnings.**
-  - **Current state (refactor in progress):** `cargo build` (lib + bin) is already clean. `cargo build --all-targets` reports 14 warnings, mostly in `#[cfg(test)]` blocks and the `examples/` scratch binaries (unused imports, unused `mut`, unused variables, dead helpers like `build_empty_hfs_catalog`).
-  - **Suggested action:** After landing the remaining real-work items in §8/§9/§10, do a single sweep: `cargo fix --lib --tests` for the auto-fixable ones, hand-edit the rest, and consider adding `#![deny(warnings)]` to the lib root or a CI check so regressions can't slip back in.
-  - **Why last:** warnings churn during refactoring; cleaning them up before the refactor settles wastes work. Keep this as the final step before considering the cleanup pass complete.
+- [x] **Once all other refactor work is done, drive `cargo build --all-targets` to zero warnings.**
+  - Cleared the 12 remaining warnings: dropped unused `mut` on test locals (ext.rs, hfsplus.rs, partition/resize.rs, example/probe_hfs_btree.rs), removed an unused `use std::io::Write` in partition/mod.rs, deleted the unused `build_empty_hfs_catalog` shim in hfs.rs, and pruned a duplicated catalog-write block in hfs_fsck/mod.rs whose first pass was overwritten by the second.
+  - `cargo build --all-targets` is now clean; `cargo test --lib` still passes (604/604).
+  - Did NOT add `#![deny(warnings)]` — leaving that to a separate decision (future Rust versions add new lints; CI-side `-D warnings` is safer).
 
 ---
 

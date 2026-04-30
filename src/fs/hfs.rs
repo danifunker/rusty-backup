@@ -1793,13 +1793,6 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
     }
 }
 
-/// Build a fresh classic HFS catalog B-tree with a header node plus a single
-/// leaf node containing the root directory record and its thread record.
-#[cfg(test)]
-fn build_empty_hfs_catalog(catalog_size: usize) -> Result<Vec<u8>, FilesystemError> {
-    build_empty_hfs_catalog_with_node_size(catalog_size, 512, &[])
-}
-
 /// Classic Mac OS expects HFS B-tree node size = 512 bytes. While the on-disk
 /// format technically allows larger node sizes, Apple's reference tools and
 /// CiderPress2 both hard-code 512, and an emulated Quadra produced "error

@@ -4736,7 +4736,7 @@ mod tests {
     fn test_resize_shrink() {
         let image = make_test_image();
         let block_size = 4096u64;
-        let mut data = image;
+        let data = image;
 
         // Shrink from 32768 blocks to 16384 blocks
         let new_size = 16384 * block_size;

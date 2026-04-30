@@ -554,7 +554,6 @@ mod tests {
         // Step 3: Simulate get_file_size bypassing BufReader
         // (In real code: get_file_size(source.get_ref(), ...) seeks the
         // underlying File directly via &File impl Seek)
-        use std::io::Write;
         {
             let inner: &std::fs::File = source.get_ref();
             let mut file_ref = inner;

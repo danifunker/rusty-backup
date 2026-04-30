@@ -579,7 +579,7 @@ mod tests {
 
     #[test]
     fn test_shift_region_zero_delta() {
-        let mut data = vec![0xAA; 64];
+        let data = vec![0xAA; 64];
         let mut cursor = Cursor::new(data.clone());
         shift_region(&mut cursor, 0, 64, 0, &mut |_, _| {}).unwrap();
         // No change
@@ -709,7 +709,7 @@ mod tests {
 
     #[test]
     fn test_detect_vhd_false() {
-        let mut data = vec![0u8; 1024];
+        let data = vec![0u8; 1024];
         let mut cursor = Cursor::new(data);
         assert!(!detect_vhd(&mut cursor, 1024));
     }

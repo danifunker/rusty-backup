@@ -753,37 +753,10 @@ mod tests {
         data[n1 + 8] = BTREE_LEAF_NODE as u8;
         data[n1 + 9] = 1; // height
 
-        let mut write_pos = n1 + 14;
-        let mut num_recs = 0u16;
-
-        // Record 0: Dir thread for root dir — key: parent_id=2, name=""
-        let r0_start = write_pos;
-        data[write_pos] = 6; // key_len = 6 (1 reserved + 4 parentID + 1 nameLen)
-                             // reserved byte at +1 already 0
-        BigEndian::write_u32(&mut data[write_pos + 2..write_pos + 6], 2); // key parent_id = CNID 2
-        data[write_pos + 6] = 0; // name_len = 0
-                                 // Even-align record data
-        let rec_off = write_pos + 8; // 1+6 = 7 → pad to 8
-        data[rec_off] = CATALOG_DIR_THREAD as u8; // type = 3
-                                                  // reserved 8 bytes (already 0)
-        BigEndian::write_u32(&mut data[rec_off + 10..rec_off + 14], 1); // parent_id = 1
-        data[rec_off + 14] = 4; // name_len = 4
-        data[rec_off + 15..rec_off + 19].copy_from_slice(b"Test");
-        write_pos = rec_off + 46; // dir thread = 46 bytes
-        num_recs += 1;
-
-        // Record 1: Root dir — key: parent_id=1, name="" (but actually the root dir
-        // record uses parent_id=1 and typically the volume name... for simplicity use
-        // a zero-length name which sorts before "File")
-        // Actually we need keys in order. Thread key (2,"") should come AFTER dir key
-        // (1,"name"). Let me reorder: put root dir first.
-        // Rewrite: clear and redo in proper key order.
         // Key order: (1,"Test") < (2,"") < (2,"File") < (file_cnid,"")
         // So: rec0=root dir, rec1=root dir thread, rec2=file, rec3=file thread
-
-        // Start over at offset 14
-        write_pos = n1 + 14;
-        num_recs = 0;
+        let mut write_pos = n1 + 14;
+        let mut num_recs = 0u16;
 
         // Record 0: Root directory — key (parent_id=1, name="Test")
         {
@@ -847,7 +820,6 @@ mod tests {
             BigEndian::write_u32(&mut data[rec_off + 10..rec_off + 14], 2); // parent=2
             data[rec_off + 14] = 4;
             data[rec_off + 15..rec_off + 19].copy_from_slice(b"File");
-            write_pos = rec_off + 46;
             num_recs += 1;
         }
 

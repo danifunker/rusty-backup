@@ -33,7 +33,7 @@ fn main() {
         }
     };
 
-    let mut fs = HfsFilesystem::open(File::open(&path).unwrap(), off).unwrap();
+    let fs = HfsFilesystem::open(File::open(&path).unwrap(), off).unwrap();
     let s = fs.volume_summary();
     println!(
         "\nHFS volume:\n  name={:?}\n  block_size={}\n  total_blocks={}\n  free_blocks={}\n  files={}\n  folders={}\n  catalog_file_size={} ({} KiB)\n  extents_file_size={} ({} KiB)",
