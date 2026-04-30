@@ -231,9 +231,10 @@ Conventions:
 - [x] **Background-thread state structs (`*Status` / `*Progress`) live in `model/status.rs`.**
   - **Done:** All worker-thread Status structs are in `model/status.rs`: `InspectStatus`, `CacheStatus`, `BlockCacheScan`, `VhdExportStatus` (from §5), plus `ExtractionProgress` (browse_view), `ResizeStatus` (resize_popup), `ExpandStatus` (expand_hfs_dialog), and `BulkConvertStatus` + `BulkConvertLogLevel` (bulk_convert_dialog). `ProgressState` in `gui/progress.rs` is intentionally kept in the view layer — it's UI state (top-bar progress + `controls_enabled`), not worker shared-state.
 
-- [ ] **Decide on a progress / log channel pattern and apply consistently**
-  - **Evidence:** Today some flows use `Arc<Mutex<Status>>`, others use callbacks, others use `LogPanel` borrows.
-  - **Suggested action:** Pick one (most likely a typed `mpsc` channel + a status snapshot), document it in `docs/`, and migrate.
+- [x] **Progress / log channel pattern documented.**
+  - **Done:** [`docs/progress_pattern.md`](progress_pattern.md) codifies the two-layer convention already dominant in the codebase: leaf I/O (`rbformats`, `backup`, `restore`, `fs::*`) takes `progress_cb` / `cancel_check` / `log_cb` callbacks; runners (`model/*_runner.rs` and the per-tab spawns in `gui/`) own `Arc<Mutex<XxxStatus>>` and translate callbacks into Status field writes; GUI polls each frame, drains `log_messages`, snapshots scalars.
+  - **Why not mpsc:** The audit flagged `Arc<Mutex<Status>>` vs. callbacks as a mix, but the mix is the design — callbacks at the leaf, Status at the runner. A typed-mpsc migration would either rewrite every leaf I/O function (loses CLI/test reuse) or wrap each callback with a `Sender → fn` adapter (same code shape, more boilerplate). Lock contention isn't measured; critical sections are microseconds. Doc records the decision so it isn't re-litigated.
+  - **No migration required:** No site currently violates the pattern. The doc lists field-naming + lock-discipline rules as lint targets so future additions don't drift.
 
 - [x] **Shared size-mode chooser widget extracted (doc framing was misframed).**
   - **On inspection:** the inspect-tab `partition_table` (read-only display: type / start LBA / size / boot / actions) and the restore-tab `restore_partition_sizes` (interactive size config: original / minimum / size-mode radios / MiB) are structurally different — different columns, different interactivity, no real shared widget. The doc's framing pointed at the wrong files.
