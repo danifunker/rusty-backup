@@ -441,9 +441,10 @@ impl eframe::App for RustyBackupApp {
                         self.loaded_backup_folder = Some(new_backup.clone());
                         self.inspect_tab.load_backup(&new_backup);
                     }
-                } else if self.loaded_backup_folder.is_some() && !self.restore_tab.has_backup() {
-                    self.restore_tab
-                        .load_backup(self.loaded_backup_folder.as_ref().unwrap());
+                } else if !self.restore_tab.has_backup() {
+                    if let Some(folder) = self.loaded_backup_folder.as_ref() {
+                        self.restore_tab.load_backup(folder);
+                    }
                 }
 
                 let mut ctx = context::TabContext::new(&self.devices, &mut self.log_panel);
@@ -456,9 +457,10 @@ impl eframe::App for RustyBackupApp {
                         self.loaded_backup_folder = Some(new_backup.clone());
                         self.restore_tab.load_backup(&new_backup);
                     }
-                } else if self.loaded_backup_folder.is_some() && !self.inspect_tab.has_backup() {
-                    self.inspect_tab
-                        .load_backup(self.loaded_backup_folder.as_ref().unwrap());
+                } else if !self.inspect_tab.has_backup() {
+                    if let Some(folder) = self.loaded_backup_folder.as_ref() {
+                        self.inspect_tab.load_backup(folder);
+                    }
                 }
 
                 let mut ctx = context::TabContext::new(&self.devices, &mut self.log_panel);

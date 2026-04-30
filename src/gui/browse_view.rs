@@ -91,6 +91,11 @@ pub struct BrowseView {
     staged_edits: EditQueue,
     /// Whether to show the "unsaved changes" confirmation dialog.
     show_unsaved_dialog: bool,
+    /// When true, a successful Discard/Apply from the unsaved dialog should
+    /// fully close the browse view rather than just leaving edit mode. Set by
+    /// `close_or_prompt()` when the caller wants to dismiss the view but
+    /// staged edits force the dialog first.
+    pending_close: bool,
     /// Inline ProDOS type/aux editor state, keyed by entry path. Reset when
     /// the selection changes.
     prodos_type_editor: Option<ProdosTypeEditorState>,
@@ -213,6 +218,7 @@ impl Default for BrowseView {
             tree_show_ids: false,
             staged_edits: EditQueue::new(),
             show_unsaved_dialog: false,
+            pending_close: false,
             prodos_type_editor: None,
             hfs_type_editor: None,
             staging_errors: Vec::new(),
@@ -468,6 +474,7 @@ impl BrowseView {
         self.tree_show_ids = false;
         self.staged_edits.clear();
         self.show_unsaved_dialog = false;
+        self.pending_close = false;
         // Clean up archive temp file if present
         if let Some(temp) = self.archive_temp_path.take() {
             let _ = std::fs::remove_file(&temp);
@@ -478,6 +485,22 @@ impl BrowseView {
 
     pub fn is_active(&self) -> bool {
         self.active
+    }
+
+    /// Close the browse view, prompting first if there are unsaved staged
+    /// edits. Returns true if the view is now closed; false if the unsaved
+    /// dialog was shown and the caller should retry on a later frame.
+    pub fn close_or_prompt(&mut self) -> bool {
+        if !self.active {
+            return true;
+        }
+        if self.edit_mode && !self.staged_edits.is_empty() {
+            self.show_unsaved_dialog = true;
+            self.pending_close = true;
+            return false;
+        }
+        self.close();
+        true
     }
 
     /// Returns true if the current filesystem is HFS or HFS+.
@@ -2379,22 +2402,31 @@ impl BrowseView {
                     if ui.button("Discard Edits").clicked() {
                         self.staged_edits.clear();
                         self.show_unsaved_dialog = false;
-                        self.exit_edit_mode();
+                        if self.pending_close {
+                            self.close();
+                        } else {
+                            self.exit_edit_mode();
+                        }
                     }
                     if ui.button("Apply Edits").clicked() {
                         self.show_unsaved_dialog = false;
                         self.apply_staged_edits();
-                        if self
+                        let ok = self
                             .edit_result
                             .as_ref()
                             .map(|r| !r.starts_with("Error"))
-                            .unwrap_or(true)
-                        {
-                            self.exit_edit_mode();
+                            .unwrap_or(true);
+                        if ok {
+                            if self.pending_close {
+                                self.close();
+                            } else {
+                                self.exit_edit_mode();
+                            }
                         }
                     }
                     if ui.button("Cancel").clicked() {
                         self.show_unsaved_dialog = false;
+                        self.pending_close = false;
                     }
                 });
             });

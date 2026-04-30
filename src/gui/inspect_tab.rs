@@ -278,13 +278,21 @@ impl InspectTab {
             || self.backup_folder_path != self.prev_backup_path;
 
         if selection_changed {
-            self.prev_device_idx = self.selected_device_idx;
-            self.prev_image_path = self.image_file_path.clone();
-            self.prev_backup_path = self.backup_folder_path.clone();
-            if self.backup_folder_path.is_some() {
-                self.load_backup_metadata(ctx);
-            } else if self.selected_device_idx.is_some() || self.image_file_path.is_some() {
-                self.run_inspect(ctx);
+            if self.browse_view.is_active() && !self.browse_view.close_or_prompt() {
+                // Unsaved-edits dialog shown; revert the selection until the
+                // user resolves it. They can re-pick the new source after.
+                self.selected_device_idx = self.prev_device_idx;
+                self.image_file_path = self.prev_image_path.clone();
+                self.backup_folder_path = self.prev_backup_path.clone();
+            } else {
+                self.prev_device_idx = self.selected_device_idx;
+                self.prev_image_path = self.image_file_path.clone();
+                self.prev_backup_path = self.backup_folder_path.clone();
+                if self.backup_folder_path.is_some() {
+                    self.load_backup_metadata(ctx);
+                } else if self.selected_device_idx.is_some() || self.image_file_path.is_some() {
+                    self.run_inspect(ctx);
+                }
             }
         }
 
