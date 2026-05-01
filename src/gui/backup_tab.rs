@@ -184,7 +184,7 @@ impl BackupTab {
                                     "Disk Images",
                                     &[
                                         "img", "raw", "bin", "iso", "dd", "vhd", "hda", "hdv",
-                                        "2mg", "dmg", "po", "do", "dsk", "dc42", "woz",
+                                        "2mg", "dmg", "po", "do", "dsk", "dc42", "woz", "chd",
                                     ],
                                 )
                                 .add_filter("All Files", &["*"])

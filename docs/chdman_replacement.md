@@ -207,35 +207,27 @@ for the ISO case.
 
 ---
 
-## Stage 7.5 — CD CHD browsing (cooked-sector adapter)
+## Stage 7.5 — CD CHD browsing (cooked-sector adapter) ✅
 
 HD and DVD CHDs already browse correctly after Stage 2 because they're flat byte streams
-that `Read+Seek` over `Chd::read_bytes` exposes directly. CD CHDs are different: they
-store 2352-byte raw sectors + 96-byte subcode = 2448-byte frames, but our filesystem code
-(ISO9660 / UDF) wants 2048-byte cooked user data.
+that `Read+Seek` over `Chd::read_bytes` exposes directly. CD CHDs need a cooked-sector
+adapter that reads 2048-byte MODE1 user data out of the 2448-byte raw frames.
 
-`opticaldiscs::browse::open_disc_filesystem` currently handles CD-CHD browse and is gated
-behind `chdman_available` in `optical_tab.rs:286`, suggesting the existing path shells out.
-Confirm during this stage what `opticaldiscs` does today and replace it.
-
-- [ ] Confirm whether `opticaldiscs` shells out to `chdman` for CD CHDs. If yes, the fix
-      lives in this repo's wrapper rather than upstream.
-- [ ] Add `CdCookedReader` in `src/rbformats/chd.rs`: wraps `libchdman_rs::Chd` + a
-      `cdrom_file` view (via `cd::list_tracks` + `chd_shim_cdrom_read_data` indirectly —
-      but libchdman-rs exposes the cooked read through its `cd::extract_to_iso` path
-      internally). Implementation options:
-      - **A.** Extend libchdman-rs with `pub fn cooked_reader(&Chd) -> impl Read+Seek`
-        that reads MODE1 user bytes (track type 0) — mirrors what `extract_to_iso`'s loop
-        does but exposes it as a stream. Cleanest API; ~30 LoC upstream.
-      - **B.** Decompress the whole CD CHD to a temp ISO via `cd::extract_to_iso` and
-        browse that. Simple, but defeats the "no temp files" win.
-      - Recommend **A** — small upstream addition, big downstream cleanup.
-- [ ] Plumb `CdCookedReader` into `model/browse_session.rs`: when the CHD's `info().is_cd`
-      is true and there's exactly one MODE1 track, route through `CdCookedReader` instead
-      of the raw `ChdReader`. Multi-track / mixed-mode CDs surface a clear error
-      ("multi-track CDs cannot be browsed in-place; extract to BIN/CUE first").
-- [ ] In `optical_tab.rs:286`, drop the `chdman_available` gate on the CHD source option —
-      it now works without external chdman.
+- [x] Confirmed: `opticaldiscs` does NOT shell out to chdman — it uses the Rust `chd` crate
+      directly via `crate::chd::open_chd` + `sector_reader.rs`. CD CHD browsing inside the
+      optical tab already works without external chdman.
+- [x] Used libchdman-rs's upstream `cd::CdCookedReader` (option A) — the upstream crate
+      already exposes a `Read+Seek` cooked MODE1 stream via `chd_shim_cdrom_read_data`.
+      Wrapped it in `src/rbformats/chd.rs::CdCookedReader::open_path` for symmetry with
+      our `ChdReader`. Multi-track / non-MODE1 surfaces a clear error.
+- [x] Plumbed via the unified detect/wrap pipeline in `src/rbformats/mod.rs`:
+      `detect_image_format_with_path` calls `chd_is_cd()` and emits
+      `ImageFormat::ChdCdCooked` for CD CHDs and `ImageFormat::Chd` for HD/DVD.
+      `wrap_image_reader` opens the right adapter. `model/browse_session.rs` already
+      routes through this pipeline, so disk-image browse picks up CHDs automatically.
+- [x] No CHD source gate remained in `optical_tab.rs` — opticaldiscs handled CHD natively
+      already. The remaining `chdman_available` references gate the CHD *output* path
+      (rip / convert) and will be removed in Stage 10.
 - [ ] Verify: open a CD CHD (game ISO ripped to CHD) in Browse, navigate the ISO9660 tree,
       extract a file, SHA256-match against the same file extracted via mounting the source ISO.
 

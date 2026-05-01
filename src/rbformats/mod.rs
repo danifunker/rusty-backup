@@ -14,7 +14,7 @@ pub mod zstd;
 
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
@@ -645,6 +645,11 @@ pub enum ImageFormat {
     DiskCopy42(dc42::Dc42Header),
     /// WOZ 1.0/2.0 — nibble/bitstream floppy image, decoded to logical sectors.
     Woz(woz::WozReader),
+    /// MAME CHD — opened on-demand by path; logical_size is the uncompressed length.
+    Chd { path: PathBuf, logical_size: u64 },
+    /// MAME CD CHD — single-track MODE1, browsed via the cooked 2048-byte adapter.
+    /// `logical_size` is `frames * 2048`.
+    ChdCdCooked { path: PathBuf, logical_size: u64 },
 }
 
 impl ImageFormat {
@@ -686,6 +691,12 @@ impl ImageFormat {
                     reader.len()
                 )
             }
+            ImageFormat::Chd { logical_size, .. } => {
+                format!("MAME CHD ({} bytes decoded)", logical_size)
+            }
+            ImageFormat::ChdCdCooked { logical_size, .. } => {
+                format!("MAME CD CHD ({} bytes cooked MODE1)", logical_size)
+            }
         }
     }
 }
@@ -706,6 +717,38 @@ pub fn detect_image_format(file: File) -> Result<ImageFormat> {
 pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<ImageFormat> {
     let file_size = file.metadata()?.len();
     let mut file = file;
+
+    // 0. Check first 8 bytes for CHD magic ("MComprHD"). CHD is opened on-demand
+    //    via libchdman_rs by path, so we don't keep the File handle.
+    if file_size >= 16 {
+        file.seek(SeekFrom::Start(0))?;
+        let mut magic = [0u8; 8];
+        if file.read_exact(&mut magic).is_ok() && &magic == b"MComprHD" {
+            if let Some(p) = path {
+                // CD CHDs need the cooked-sector adapter to expose 2048 B/sector
+                // user data. HD/DVD CHDs are flat byte streams and use ChdReader.
+                let is_cd = chd::chd_is_cd(p).unwrap_or(false);
+                if is_cd {
+                    if let Ok(reader) = chd::CdCookedReader::open_path(p) {
+                        let logical_size = reader.logical_size();
+                        drop(reader);
+                        return Ok(ImageFormat::ChdCdCooked {
+                            path: p.to_path_buf(),
+                            logical_size,
+                        });
+                    }
+                }
+                if let Ok(reader) = chd::ChdReader::open(p) {
+                    let logical_size = reader.logical_size();
+                    drop(reader);
+                    return Ok(ImageFormat::Chd {
+                        path: p.to_path_buf(),
+                        logical_size,
+                    });
+                }
+            }
+        }
+    }
 
     // 1. Check first 8 bytes for WOZ magic (WOZ1/WOZ2 + high-bit check).
     //    WOZ has a very strong 8-byte signature, so check it first.
@@ -880,6 +923,17 @@ pub fn wrap_image_reader(file: File, format: ImageFormat) -> Result<(BoxReadSeek
             drop(file);
             let size = reader.len();
             Ok((Box::new(reader), size))
+        }
+        ImageFormat::Chd { path, logical_size } => {
+            // CHD is opened directly via libchdman_rs; the raw File is unused.
+            drop(file);
+            let reader = chd::ChdReader::open(&path)?;
+            Ok((Box::new(reader), logical_size))
+        }
+        ImageFormat::ChdCdCooked { path, logical_size } => {
+            drop(file);
+            let reader = chd::CdCookedReader::open_path(&path)?;
+            Ok((Box::new(reader), logical_size))
         }
     }
 }

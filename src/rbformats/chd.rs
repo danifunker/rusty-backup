@@ -48,6 +48,68 @@ impl ChdReader {
     }
 }
 
+/// Probe a CHD file to determine if it is a CD CHD (vs HD/DVD).
+///
+/// CD CHDs store 2352-byte raw sectors + 96-byte subcode = 2448-byte frames,
+/// which can't be parsed directly as a flat byte stream by ISO9660/UDF code.
+/// Use [`CdCookedReader::open_path`] to expose the cooked 2048-byte user data.
+pub fn chd_is_cd(path: &Path) -> Result<bool> {
+    let path_str = path
+        .to_str()
+        .with_context(|| format!("CHD path is not valid UTF-8: {}", path.display()))?;
+    let chd = libchdman_rs::Chd::open(path_str, false, None)
+        .map_err(|e| anyhow::anyhow!("failed to open CHD {}: {:?}", path.display(), e))?;
+    let info = chd
+        .info()
+        .map_err(|e| anyhow::anyhow!("failed to read CHD info: {:?}", e))?;
+    Ok(info.is_cd)
+}
+
+/// Read+Seek adapter over a CD CHD's cooked MODE1 user data (2048 B/sector).
+///
+/// Single-track MODE1 / MODE1_RAW CHDs only — multi-track or audio mixes return
+/// an error. Mirrors [`ChdReader`] but the underlying frames are decoded by
+/// libchdman-rs's `cdrom` shim so ISO9660/UDF code sees a flat 2048-byte stream.
+pub struct CdCookedReader {
+    inner: libchdman_rs::cd::CdCookedReader,
+}
+
+// SAFETY: identical reasoning to ChdReader — single-threaded access via &mut self.
+unsafe impl Send for CdCookedReader {}
+
+impl CdCookedReader {
+    pub fn open_path(path: &Path) -> Result<Self> {
+        let path_str = path
+            .to_str()
+            .with_context(|| format!("CHD path is not valid UTF-8: {}", path.display()))?;
+        let chd = libchdman_rs::Chd::open(path_str, false, None)
+            .map_err(|e| anyhow::anyhow!("failed to open CHD {}: {:?}", path.display(), e))?;
+        let inner = libchdman_rs::cd::CdCookedReader::open(chd).map_err(|e| {
+            anyhow::anyhow!(
+                "CHD is not a single-track MODE1 CD (multi-track CDs cannot be browsed in-place; extract to BIN/CUE first): {:?}",
+                e
+            )
+        })?;
+        Ok(Self { inner })
+    }
+
+    pub fn logical_size(&self) -> u64 {
+        self.inner.len()
+    }
+}
+
+impl Read for CdCookedReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl Seek for CdCookedReader {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
 impl Read for ChdReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.position >= self.logical_size {

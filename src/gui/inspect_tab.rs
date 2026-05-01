@@ -246,7 +246,7 @@ impl InspectTab {
                                 "Disk Images",
                                 &[
                                     "vhd", "img", "raw", "bin", "iso", "dd", "hda", "hdv", "2mg",
-                                    "dmg", "po", "do", "dsk", "dc42", "woz",
+                                    "dmg", "po", "do", "dsk", "dc42", "woz", "chd",
                                 ],
                             )
                             .add_filter("All Files", &["*"])
