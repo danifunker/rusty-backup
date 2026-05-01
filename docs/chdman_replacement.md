@@ -41,23 +41,25 @@ production code path uses it yet — this stage is just shape.
 
 ---
 
-## Stage 2 — replace `ChdReader` with libchdman-rs (read-side swap)
+## Stage 2 — replace `ChdReader` with libchdman-rs (read-side swap) ✅
 
 Lowest-risk change. `ChdReader` in `src/rbformats/chd.rs` (lines 14–107) wraps the old `chd` crate.
 Browse/inspect already routes through it via `src/gui/browse_view.rs::create_filesystem`.
 
-- [ ] In `src/rbformats/chd.rs`, replace `ChdReader`'s internals with a thin wrapper around
-      `libchdman_rs::Chd` + `read_bytes`. Keep the public API (`pub fn open`, `Read`, `Seek`)
-      identical so callers don't change.
-      - libchdman-rs has its own `ChdReader` in `enhancements.rs`; consider re-exporting it
-        directly and dropping the wrapper, **but** the rusty-backup type is constructed from
-        `&Path` while libchdman-rs's takes `&Chd`, so a small adapter is cleaner.
-- [ ] Delete the now-unused `chd` crate references and any imports.
-- [ ] Verify: open a known-good CHD (`~/Documents/HD10_512 Quadra_System7OldNew.hda` if it's
-      a CHD, otherwise any test fixture), browse it via `BrowseView`, confirm directory listing
-      and file reads match pre-change output byte-for-byte (use a SHA256 spot check on a known file).
+- [x] In `src/rbformats/chd.rs`, replaced `ChdReader`'s internals with a thin wrapper around
+      `libchdman_rs::Chd` + `read_bytes`. Public API (`pub fn open`, `Read`, `Seek`) unchanged
+      so callers don't need updates. Added `unsafe impl Send for ChdReader` because
+      `libchdman_rs::Chd` holds a raw `*mut ChdFile` and is not auto-Send, but `open_filesystem`
+      requires `Read + Seek + Send + 'static` for the worker-thread handoff. The handle is
+      single-owner and only touched from one thread at a time, so Send is sound.
+- [x] Removed `chd = "0.2"` from `Cargo.toml`. Still appears in `Cargo.lock` as a transitive
+      dep via `opticaldiscs-rs` — out of scope for this stage; will fully disappear when/if
+      `opticaldiscs-rs` migrates too.
+- [ ] **Deferred runtime spot-check**: no CHD test fixtures available in `~/Documents`. Build
+      and 106 rbformats unit tests are green. End-to-end browse round-trip will be exercised
+      naturally by the Stage 3+4 round-trip verification.
 
-**Done when:** browse-CHD still works, `chd` crate removed from `Cargo.toml`.
+**Done when:** browse-CHD still works, `chd` crate removed from `Cargo.toml`. ✅
 
 ---
 

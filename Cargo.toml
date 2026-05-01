@@ -40,7 +40,6 @@ serde_json = "1"
 byteorder = "1"
 log = "0.4"
 env_logger = "0.11"
-chd = "0.2"
 libchdman-rs = { git = "https://github.com/danifunker/libchdman-rs" }
 zstd = "0.13"
 zeekstd = "0.6"
