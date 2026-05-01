@@ -75,6 +75,16 @@ pub fn compress_partition(
             &cancel_check,
             &mut log_cb,
         ),
+        CompressionType::Dvd => chd::compress_chd_dvd(
+            reader,
+            output_base,
+            logical_size,
+            split_size,
+            None,
+            &mut progress_cb,
+            &cancel_check,
+            &mut log_cb,
+        ),
     }
 }
 
@@ -182,7 +192,7 @@ pub fn decompress_to_writer(
                 progress_cb(total_written);
             }
         }
-        "chd" => {
+        "chd" | "chd-dvd" => {
             log_cb(&format!("Extracting CHD: {}", data_path.display()));
             let chd_reader = chd::ChdReader::open(data_path)
                 .with_context(|| format!("failed to open CHD: {}", data_path.display()))?;
@@ -275,6 +285,19 @@ pub fn compress_file_to_archive(
         "chd" => {
             let logical_size = reader.get_ref().metadata()?.len();
             chd::compress_chd(
+                &mut reader,
+                output_path_base,
+                logical_size,
+                None,
+                None,
+                progress_cb,
+                cancel_check,
+                log_cb,
+            )
+        }
+        "chd-dvd" => {
+            let logical_size = reader.get_ref().metadata()?.len();
+            chd::compress_chd_dvd(
                 &mut reader,
                 output_path_base,
                 logical_size,

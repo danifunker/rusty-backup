@@ -117,25 +117,33 @@ temp file, then streamed that temp into the recompression pipeline.
 
 ---
 
-## Stage 5 — add DVD CHD as a backup target
+## Stage 5 — add DVD CHD as a backup target ✅
 
-DVDs are useful for backing up larger images (CHD's HD profile maxes the same way but DVD
-hunk size + codecs are tuned for 2048-byte sectors). Adding now lets the GUI reuse it later.
+DVDs are useful for backing up larger images. The HD profile uses 512-byte units; DVD uses
+2048-byte sectors and writes a `DVD ` metadata tag so MAME / `chdman info` recognise it.
 
-- [ ] Extend `CompressionType` in `src/backup/mod.rs` with a new variant `Dvd` (file extension
-      `.chd`, `as_str()` returning `"chd-dvd"` to disambiguate in metadata).
-      - **Decision point:** Do we want DVD as a separate `CompressionType`, or as a flag on
-        `CompressionType::Chd`? Separate variant is clearer in metadata; flag avoids enum
-        sprawl. Recommend: separate variant. Document in metadata.json schema notes.
-- [ ] In `src/rbformats/chd.rs`, add `compress_chd_dvd(...)` calling
-      `libchdman_rs::dvd::create_from_reader` with `DvdCreateOptions`.
-- [ ] In `src/rbformats/compress.rs`, route `CompressionType::Dvd` through the new function.
-- [ ] In the restore path (Stage 4 covers HD; DVD uses the same `Chd::read_bytes` route since
-      both are flat sector streams), confirm the same extract works for DVD CHDs without
-      branching.
+- [x] Extended `CompressionType` in `src/backup/mod.rs` with a new variant `Dvd`.
+      `as_str()` returns `"chd-dvd"` (disambiguates in metadata.json); `file_extension()`
+      returns `"chd"` for both `Chd` and `Dvd` (same on-disk format).
+- [x] Added `compress_chd_dvd` in `src/rbformats/chd.rs` calling
+      `libchdman_rs::dvd::create_from_reader` with `DvdCreateOptions`. `logical_size` is
+      rounded up to a 2048-byte multiple; tail is zero-padded by libchdman-rs. Defaults pull
+      from `ChdOptions::defaults_for(ChdProfile::Dvd)`.
+- [x] `compress_partition` in `src/rbformats/compress.rs` routes `CompressionType::Dvd`
+      through `compress_chd_dvd`. `compress_file_to_archive` likewise accepts the
+      `"chd-dvd"` string for archive-edit recompression.
+- [x] Restore path: extended `decompress_to_writer` chd branch from `"chd"` to
+      `"chd" | "chd-dvd"` — same `ChdReader` stream works for both because libchdman-rs's
+      `read_bytes` is format-agnostic. Same one-line widen in `inspect_tab.rs` for browse.
+- [x] GUI: added a "DVD CHD" radio button next to the HD CHD option in `backup_tab.rs`
+      (gated behind `chdman_available` like the HD radio). Codec/hunk-size controls are
+      Stage 8.
+- [x] Verify: new `compress_chd_dvd_round_trip` test in `rbformats::chd::tests` compresses
+      4 MiB → reads back via `ChdReader` byte-equal → asserts `Chd::info().is_dvd`. All
+      614 lib tests pass.
 
 **Done when:** A backup with `CompressionType::Dvd` produces a DVD CHD that `chdman info`
-identifies as DVD, and restore round-trips bit-perfectly.
+identifies as DVD, and restore round-trips bit-perfectly. ✅
 
 ---
 

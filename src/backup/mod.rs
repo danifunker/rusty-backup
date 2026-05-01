@@ -21,6 +21,10 @@ use metadata::{AlignmentMetadata, BackupMetadata, ExtendedContainerMetadata, Par
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum CompressionType {
     Chd,
+    /// DVD-profile CHD (MAME 0.287+). On disk it's still a `.chd` file;
+    /// the metadata tag distinguishes it. Hunk size + codecs default to
+    /// chdman's DVD profile (4096-byte hunks, 2048-byte sectors).
+    Dvd,
     Vhd,
     Zstd,
     None,
@@ -30,6 +34,7 @@ impl CompressionType {
     pub fn as_str(&self) -> &'static str {
         match self {
             CompressionType::Chd => "chd",
+            CompressionType::Dvd => "chd-dvd",
             CompressionType::Vhd => "vhd",
             CompressionType::Zstd => "zstd",
             CompressionType::None => "none",
@@ -38,7 +43,7 @@ impl CompressionType {
 
     pub fn file_extension(&self) -> &'static str {
         match self {
-            CompressionType::Chd => "chd",
+            CompressionType::Chd | CompressionType::Dvd => "chd",
             CompressionType::Vhd => "vhd",
             CompressionType::Zstd => "zst",
             CompressionType::None => "raw",

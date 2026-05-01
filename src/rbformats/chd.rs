@@ -4,6 +4,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use libchdman_rs::{
+    dvd::{create_from_reader as dvd_create_from_reader, DvdCreateOptions, DVD_SECTOR_SIZE},
     hd::{create_from_reader, HdCreateOptions},
     ChdError, CompressionProgress,
 };
@@ -157,6 +158,68 @@ pub(crate) fn compress_chd(
     Ok(vec![file_name(&chd_path)])
 }
 
+/// Compress raw data into a DVD-profile CHD (MAME 0.287+) via libchdman-rs.
+///
+/// Same shape as [`compress_chd`] but uses DVD's 2048-byte sector unit and
+/// writes the `DVD ` metadata tag so MAME / `chdman info` recognises it as
+/// a DVD CHD. `logical_size` is rounded up to a 2048-byte multiple; any
+/// tail shortfall is zero-padded by libchdman-rs.
+pub(crate) fn compress_chd_dvd(
+    reader: &mut impl Read,
+    output_base: &Path,
+    logical_size: u64,
+    split_size: Option<u64>,
+    opts: Option<ChdOptions>,
+    progress_cb: &mut impl FnMut(u64),
+    cancel_check: &impl Fn() -> bool,
+    log_cb: &mut impl FnMut(&str),
+) -> Result<Vec<String>> {
+    let chd_opts = opts.unwrap_or_else(|| ChdOptions::defaults_for(ChdProfile::Dvd));
+
+    let unit_size = u64::from(DVD_SECTOR_SIZE);
+    let padded_size = logical_size.div_ceil(unit_size) * unit_size;
+
+    let chd_path = output_path(output_base, "chd", false, 0);
+    log_cb(&format!(
+        "Writing DVD CHD {} (logical {} bytes, hunk {}, codecs {:?})",
+        chd_path.display(),
+        padded_size,
+        chd_opts.hunk_size,
+        chd_opts.codecs,
+    ));
+
+    let dvd_opts = DvdCreateOptions {
+        logical_size: padded_size,
+        hunk_size: chd_opts.hunk_size,
+        codecs: chd_opts.codecs,
+    };
+
+    let mut progress = |p: CompressionProgress| {
+        progress_cb(p.bytes_done.min(logical_size));
+    };
+
+    dvd_create_from_reader(reader, &chd_path, dvd_opts, &mut progress, cancel_check).map_err(
+        |e| match e {
+            ChdError::Cancelled => anyhow::anyhow!("backup cancelled"),
+            other => anyhow::anyhow!("DVD CHD create failed: {:?}", other),
+        },
+    )?;
+
+    progress_cb(logical_size);
+
+    if let Some(split_bytes) = split_size {
+        let chd_size = fs::metadata(&chd_path)
+            .with_context(|| format!("failed to stat CHD output: {}", chd_path.display()))?
+            .len();
+
+        if chd_size > split_bytes {
+            return split_file(&chd_path, output_base, "chd", split_bytes);
+        }
+    }
+
+    Ok(vec![file_name(&chd_path)])
+}
+
 /// Split an existing file into chunks, removing the original.
 pub(crate) fn split_file(
     source: &Path,
@@ -245,5 +308,42 @@ mod tests {
         let mut decoded = vec![0u8; data.len()];
         chd_reader.read_exact(&mut decoded).unwrap();
         assert_eq!(decoded, data, "CHD round-trip mismatch");
+    }
+
+    #[test]
+    fn compress_chd_dvd_round_trip() {
+        // 4 MiB of pseudo-random data, sized to a 2048-byte multiple so
+        // libchdman-rs's DVD validate() accepts it without padding.
+        let tmp = TempDir::new().unwrap();
+        let mut data = vec![0u8; 4 * 1024 * 1024];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = ((i * 17) ^ (i >> 9)) as u8;
+        }
+        let mut reader = Cursor::new(&data);
+        let base = tmp.path().join("partition-0");
+
+        let files = compress_chd_dvd(
+            &mut reader,
+            &base,
+            data.len() as u64,
+            None,
+            None,
+            &mut |_| {},
+            &|| false,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(files, vec!["partition-0.chd"]);
+
+        let chd_path = base.with_extension("chd");
+        let mut chd_reader = ChdReader::open(&chd_path).unwrap();
+        let mut decoded = vec![0u8; data.len()];
+        chd_reader.read_exact(&mut decoded).unwrap();
+        assert_eq!(decoded, data, "DVD CHD round-trip mismatch");
+
+        // Confirm the DVD metadata tag landed — libchdman-rs flags it as DVD
+        // via Chd::info().is_dvd.
+        let chd = libchdman_rs::Chd::open(chd_path.to_str().unwrap(), false, None).unwrap();
+        assert!(chd.info().unwrap().is_dvd, "expected is_dvd flag");
     }
 }

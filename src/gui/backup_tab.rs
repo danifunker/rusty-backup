@@ -121,7 +121,10 @@ impl BackupTab {
     pub fn set_chdman_available(&mut self, available: bool) {
         self.chdman_available = available;
         // Don't default to CHD if not available
-        if !available && self.compression_type == CompressionType::Chd {
+        if !available
+            && (self.compression_type == CompressionType::Chd
+                || self.compression_type == CompressionType::Dvd)
+        {
             self.compression_type = CompressionType::Zstd;
         }
     }
@@ -302,6 +305,19 @@ impl BackupTab {
                 .then(|| {
                     if self.chdman_available {
                         self.compression_type = CompressionType::Chd;
+                    }
+                });
+                ui.add_enabled(
+                    self.chdman_available,
+                    egui::RadioButton::new(
+                        self.compression_type == CompressionType::Dvd,
+                        "DVD CHD",
+                    ),
+                )
+                .clicked()
+                .then(|| {
+                    if self.chdman_available {
+                        self.compression_type = CompressionType::Dvd;
                     }
                 });
                 ui.radio_value(&mut self.compression_type, CompressionType::Vhd, "VHD")

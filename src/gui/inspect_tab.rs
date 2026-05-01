@@ -2466,7 +2466,7 @@ impl InspectTab {
                     checksum_type,
                 );
             }
-            "chd" => {
+            "chd" | "chd-dvd" => {
                 // CHD-compressed backup — open directly via ChdReader (on-demand decompression)
                 ctx.log.info(format!(
                     "Browsing partition {} from CHD: {}",
