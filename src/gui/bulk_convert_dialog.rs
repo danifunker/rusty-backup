@@ -16,7 +16,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use rusty_backup::model::status::{BulkConvertLogLevel as LogLevel, BulkConvertStatus};
-use rusty_backup::rbformats::export::{export_whole_disk, ExportFormat};
+use rusty_backup::rbformats::chd_options::{ChdOptions, ChdProfile};
+use rusty_backup::rbformats::export::{
+    export_whole_disk, export_whole_disk_bincue, export_whole_disk_chd, export_whole_disk_chd_cd,
+    ExportFormat,
+};
+
+use super::chd_options_ui::ChdOptionsControl;
 
 fn fmt_bytes(n: u64) -> String {
     const KB: u64 = 1024;
@@ -67,6 +73,15 @@ pub struct BulkConvertDialog {
     pub source_folder: Option<PathBuf>,
     pub output_folder: Option<PathBuf>,
     pub format: ExportFormat,
+    /// CHD options state — one per profile so toggling between HD/DVD/CD
+    /// keeps each profile's last custom selection.
+    chd_hd_control: ChdOptionsControl,
+    chd_dvd_control: ChdOptionsControl,
+    chd_cd_control: ChdOptionsControl,
+    /// When the BIN/CUE output format is selected, write one .bin per track
+    /// instead of a single concatenated .bin. Multi-bin is a feature beyond
+    /// chdman, built on top of libchdman-rs's track metadata.
+    bincue_multi_bin: bool,
     phase: Phase,
     /// Set when scan returns no usable entries; surfaced inline in the dialog.
     scan_error: Option<String>,
@@ -78,6 +93,10 @@ impl Default for BulkConvertDialog {
             source_folder: None,
             output_folder: None,
             format: ExportFormat::Vhd,
+            chd_hd_control: ChdOptionsControl::new(ChdProfile::Hd),
+            chd_dvd_control: ChdOptionsControl::new(ChdProfile::Dvd),
+            chd_cd_control: ChdOptionsControl::new(ChdProfile::Cd),
+            bincue_multi_bin: false,
             phase: Phase::Setup,
             scan_error: None,
         }
@@ -92,6 +111,10 @@ pub enum DialogAction {
     Start {
         files: Vec<PathBuf>,
         extension: String,
+        /// Resolved CHD options when `format` is HD/DVD/CD CHD; `None` otherwise.
+        chd_options: Option<ChdOptions>,
+        /// True only for `ExportFormat::BinCue` when the user wants per-track .bin files.
+        bincue_multi_bin: bool,
     },
     Cancel,
 }
@@ -155,7 +178,7 @@ impl BulkConvertDialog {
                 ui.add_space(8.0);
 
                 ui.label(egui::RichText::new("Output format:").strong());
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.radio_value(&mut self.format, ExportFormat::Vhd, "VHD");
                     ui.radio_value(&mut self.format, ExportFormat::Raw, "Raw (.img)");
                     ui.radio_value(&mut self.format, ExportFormat::TwoMg, "2MG (.2mg)");
@@ -163,7 +186,57 @@ impl BulkConvertDialog {
                         .on_hover_text("Floppy only: 140K / 400K / 800K sources");
                     ui.radio_value(&mut self.format, ExportFormat::Dc42, "DiskCopy 4.2 (.dsk)")
                         .on_hover_text("Floppy only: 400K / 720K / 800K / 1440K sources");
+                    ui.radio_value(&mut self.format, ExportFormat::Chd, "HD CHD")
+                        .on_hover_text("MAME hard-disk CHD (512-byte unit)");
+                    ui.radio_value(&mut self.format, ExportFormat::ChdDvd, "DVD CHD")
+                        .on_hover_text("MAME DVD CHD (2048-byte unit, MAME 0.287+)");
+                    ui.radio_value(&mut self.format, ExportFormat::ChdCd, "CD CHD")
+                        .on_hover_text("MAME CD CHD — input must be .iso or .cue");
+                    ui.radio_value(&mut self.format, ExportFormat::BinCue, "BIN/CUE")
+                        .on_hover_text("Extract a CD CHD into a BIN/CUE pair");
                 });
+
+                match self.format {
+                    ExportFormat::Chd => {
+                        ui.add_space(4.0);
+                        super::chd_options_ui::show(
+                            ui,
+                            "bulk_chd",
+                            ChdProfile::Hd,
+                            &mut self.chd_hd_control,
+                        );
+                    }
+                    ExportFormat::ChdDvd => {
+                        ui.add_space(4.0);
+                        super::chd_options_ui::show(
+                            ui,
+                            "bulk_chd",
+                            ChdProfile::Dvd,
+                            &mut self.chd_dvd_control,
+                        );
+                    }
+                    ExportFormat::ChdCd => {
+                        ui.add_space(4.0);
+                        super::chd_options_ui::show(
+                            ui,
+                            "bulk_chd",
+                            ChdProfile::Cd,
+                            &mut self.chd_cd_control,
+                        );
+                    }
+                    ExportFormat::BinCue => {
+                        ui.add_space(4.0);
+                        ui.checkbox(
+                            &mut self.bincue_multi_bin,
+                            "Multi-bin (one .bin per track)",
+                        )
+                        .on_hover_text(
+                            "Beyond chdman: writes <name> (Track NN).bin per track plus a \
+                             multi-FILE cue. Falls back to single-bin if track sizes don't match.",
+                        );
+                    }
+                    _ => {}
+                }
 
                 if let (Some(src), Some(out)) = (&self.source_folder, &self.output_folder) {
                     if src == out {
@@ -198,7 +271,7 @@ impl BulkConvertDialog {
             });
 
         if go_to_review {
-            match scan_source_folder(self.source_folder.as_ref().unwrap()) {
+            match scan_source_folder(self.source_folder.as_ref().unwrap(), self.format) {
                 Ok(files) if files.is_empty() => {
                     self.scan_error = Some("No files found in source folder.".to_string());
                 }
@@ -228,6 +301,13 @@ impl BulkConvertDialog {
 
         let recommended_ext = self.format.extension();
         let output_folder = self.output_folder.clone();
+        let chd_options: Option<ChdOptions> = match self.format {
+            ExportFormat::Chd => Some(self.chd_hd_control.effective(ChdProfile::Hd)),
+            ExportFormat::ChdDvd => Some(self.chd_dvd_control.effective(ChdProfile::Dvd)),
+            ExportFormat::ChdCd => Some(self.chd_cd_control.effective(ChdProfile::Cd)),
+            _ => None,
+        };
+        let bincue_multi_bin = self.format == ExportFormat::BinCue && self.bincue_multi_bin;
         let Phase::Review {
             files,
             extension,
@@ -356,7 +436,7 @@ impl BulkConvertDialog {
         // If the user clicked Start, detect output-folder collisions before
         // emitting the action. If any are found, populate `pending_conflicts`
         // so the modal renders next frame; otherwise emit Start immediately.
-        let mut emit_start: Option<(Vec<PathBuf>, String)> = None;
+        let mut emit_start: Option<(Vec<PathBuf>, String, Option<ChdOptions>, bool)> = None;
         if start {
             let ext = extension.trim().to_string();
             let chosen_paths: Vec<PathBuf> = files
@@ -372,7 +452,7 @@ impl BulkConvertDialog {
             };
 
             if conflicts.is_empty() {
-                emit_start = Some((chosen_paths, ext));
+                emit_start = Some((chosen_paths, ext, chd_options.clone(), bincue_multi_bin));
             } else {
                 *pending_conflicts = Some(conflicts);
             }
@@ -400,7 +480,7 @@ impl BulkConvertDialog {
                 let ext = extension.trim().to_string();
                 *pending_conflicts = None;
                 if !chosen.is_empty() {
-                    emit_start = Some((chosen, ext));
+                    emit_start = Some((chosen, ext, chd_options.clone(), bincue_multi_bin));
                 }
             }
             ConflictResolution::Overwrite => {
@@ -411,7 +491,7 @@ impl BulkConvertDialog {
                     .collect();
                 let ext = extension.trim().to_string();
                 *pending_conflicts = None;
-                emit_start = Some((chosen, ext));
+                emit_start = Some((chosen, ext, chd_options.clone(), bincue_multi_bin));
             }
             ConflictResolution::Back => {
                 *pending_conflicts = None;
@@ -423,8 +503,13 @@ impl BulkConvertDialog {
         if go_back {
             self.phase = Phase::Setup;
         }
-        if let Some((files, extension)) = emit_start {
-            action = DialogAction::Start { files, extension };
+        if let Some((files, extension, chd_options, bincue_multi_bin)) = emit_start {
+            action = DialogAction::Start {
+                files,
+                extension,
+                chd_options,
+                bincue_multi_bin,
+            };
         }
 
         action
@@ -506,11 +591,21 @@ fn show_conflict_modal(ctx: &egui::Context, conflicts: &[Conflict]) -> ConflictR
     resolution
 }
 
-/// Read the source folder and return one entry per regular file. No filtering
-/// — the user picks what to skip in the Review phase. Hidden dotfiles are
-/// still excluded since they're rarely user-visible disk images and clutter
-/// the list (e.g. `.DS_Store` on macOS).
-fn scan_source_folder(source: &std::path::Path) -> std::io::Result<Vec<ScannedFile>> {
+/// Read the source folder and return one entry per regular file. Hidden
+/// dotfiles are excluded. The `format` filter narrows the listing to files
+/// the chosen output can sensibly consume:
+///
+/// - **CD CHD**: only `.iso` and `.cue`. `.bin` files are referenced by their
+///   matching cue, so listing them separately would either fail (no header)
+///   or produce broken output.
+/// - **BIN/CUE**: only `.chd`. Other inputs can't be extracted to BIN/CUE.
+/// - **HD/DVD CHD**: skip `.cue` and `.bin` (those are CD content); accept
+///   anything else `wrap_image_reader` might recognise.
+/// - **All other formats**: no filtering beyond dotfiles.
+fn scan_source_folder(
+    source: &std::path::Path,
+    format: ExportFormat,
+) -> std::io::Result<Vec<ScannedFile>> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(source)? {
         let entry = entry?;
@@ -523,6 +618,23 @@ fn scan_source_folder(source: &std::path::Path) -> std::io::Result<Vec<ScannedFi
             None => continue,
         };
         if name.starts_with('.') {
+            continue;
+        }
+        let ext_lower = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase());
+        let keep = match format {
+            ExportFormat::ChdCd => {
+                matches!(ext_lower.as_deref(), Some("iso" | "cue"))
+            }
+            ExportFormat::BinCue => matches!(ext_lower.as_deref(), Some("chd")),
+            ExportFormat::Chd | ExportFormat::ChdDvd => {
+                !matches!(ext_lower.as_deref(), Some("cue" | "bin"))
+            }
+            _ => true,
+        };
+        if !keep {
             continue;
         }
         let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
@@ -543,6 +655,8 @@ pub fn start_bulk_convert(
     output: PathBuf,
     format: ExportFormat,
     extension: String,
+    chd_options: Option<ChdOptions>,
+    bincue_multi_bin: bool,
 ) -> Arc<Mutex<BulkConvertStatus>> {
     let status = Arc::new(Mutex::new(BulkConvertStatus {
         finished: false,
@@ -561,7 +675,15 @@ pub fn start_bulk_convert(
     std::thread::spawn(move || {
         let status_panic = Arc::clone(&status_thread);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_bulk_convert(files, output, format, extension, status_thread);
+            run_bulk_convert(
+                files,
+                output,
+                format,
+                extension,
+                chd_options,
+                bincue_multi_bin,
+                status_thread,
+            );
         }));
         if let Err(payload) = result {
             let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
@@ -589,6 +711,8 @@ fn run_bulk_convert(
     output: PathBuf,
     format: ExportFormat,
     extension: String,
+    chd_options: Option<ChdOptions>,
+    bincue_multi_bin: bool,
     status: Arc<Mutex<BulkConvertStatus>>,
 ) {
     let push_log = |level: LogLevel, msg: String| {
@@ -666,42 +790,81 @@ fn run_bulk_convert(
         let mut last_logged_bytes: u64 = 0;
         const LOG_EVERY_BYTES: u64 = 64 * 1024 * 1024;
 
-        let result = export_whole_disk(
-            format,
-            file,
-            None,
-            None,
-            &[],
-            &dest,
-            move |bytes| {
-                if let Ok(mut s) = status_progress.lock() {
-                    s.current_bytes = bytes;
+        let progress_cb = move |bytes: u64| {
+            if let Ok(mut s) = status_progress.lock() {
+                s.current_bytes = bytes;
+            }
+            if bytes >= last_logged_bytes + LOG_EVERY_BYTES {
+                last_logged_bytes = bytes;
+                let elapsed = started.elapsed().as_secs_f64().max(0.001);
+                let mbs = (bytes as f64 / 1_048_576.0) / elapsed;
+                if let Ok(mut s) = log_for_progress.lock() {
+                    s.log_messages.push((
+                        LogLevel::Info,
+                        format!("    … {} written ({:.1} MB/s)", fmt_bytes(bytes), mbs),
+                    ));
                 }
-                if bytes >= last_logged_bytes + LOG_EVERY_BYTES {
-                    last_logged_bytes = bytes;
-                    let elapsed = started.elapsed().as_secs_f64().max(0.001);
-                    let mbs = (bytes as f64 / 1_048_576.0) / elapsed;
-                    if let Ok(mut s) = log_for_progress.lock() {
-                        s.log_messages.push((
-                            LogLevel::Info,
-                            format!("    … {} written ({:.1} MB/s)", fmt_bytes(bytes), mbs),
-                        ));
-                    }
-                }
-            },
-            move || {
-                status_cancel
-                    .lock()
-                    .map(|s| s.cancel_requested)
-                    .unwrap_or(false)
-            },
-            move |msg| {
-                if let Ok(mut s) = status_log.lock() {
-                    s.log_messages.push((LogLevel::Info, msg.to_string()));
-                }
-            },
-        );
+            }
+        };
+        let cancel_cb = move || {
+            status_cancel
+                .lock()
+                .map(|s| s.cancel_requested)
+                .unwrap_or(false)
+        };
+        let log_cb = move |msg: &str| {
+            if let Ok(mut s) = status_log.lock() {
+                s.log_messages.push((LogLevel::Info, msg.to_string()));
+            }
+        };
 
+        let result = match format {
+            ExportFormat::Chd => export_whole_disk_chd(
+                file,
+                None,
+                None,
+                &[],
+                &dest,
+                ChdProfile::Hd,
+                chd_options.clone(),
+                progress_cb,
+                cancel_cb,
+                log_cb,
+            ),
+            ExportFormat::ChdDvd => export_whole_disk_chd(
+                file,
+                None,
+                None,
+                &[],
+                &dest,
+                ChdProfile::Dvd,
+                chd_options.clone(),
+                progress_cb,
+                cancel_cb,
+                log_cb,
+            ),
+            ExportFormat::ChdCd => {
+                // Intra-file progress isn't surfaced for CD CHD (see helper
+                // doc); drop the progress closure on the floor here.
+                let _ = progress_cb;
+                export_whole_disk_chd_cd(file, &dest, chd_options.clone(), cancel_cb, log_cb)
+            }
+            ExportFormat::BinCue => {
+                let _ = progress_cb;
+                export_whole_disk_bincue(file, &dest, bincue_multi_bin, cancel_cb, log_cb)
+            }
+            _ => export_whole_disk(
+                format,
+                file,
+                None,
+                None,
+                &[],
+                &dest,
+                progress_cb,
+                cancel_cb,
+                log_cb,
+            ),
+        };
         match result {
             Ok(()) => {
                 if let Ok(mut s) = status.lock() {

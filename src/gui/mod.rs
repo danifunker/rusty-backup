@@ -1,6 +1,7 @@
 mod backup_tab;
 mod browse_view;
 mod bulk_convert_dialog;
+mod chd_options_ui;
 mod context;
 mod elevation_dialog;
 mod expand_hfs_dialog;
@@ -305,7 +306,12 @@ impl eframe::App for RustyBackupApp {
         // Bulk Convert dialog (modal-ish window, always reachable).
         if let Some(ref mut dlg) = self.bulk_convert_dialog {
             match dlg.show(ctx) {
-                BulkConvertAction::Start { files, extension } => {
+                BulkConvertAction::Start {
+                    files,
+                    extension,
+                    chd_options,
+                    bincue_multi_bin,
+                } => {
                     if let Some(out) = dlg.output_folder.clone() {
                         let format = dlg.format;
                         let count = files.len();
@@ -316,7 +322,12 @@ impl eframe::App for RustyBackupApp {
                             format.description(),
                         ));
                         self.bulk_convert_status = Some(bulk_convert_dialog::start_bulk_convert(
-                            files, out, format, extension,
+                            files,
+                            out,
+                            format,
+                            extension,
+                            chd_options,
+                            bincue_multi_bin,
                         ));
                     }
                 }

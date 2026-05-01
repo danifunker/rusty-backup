@@ -151,6 +151,7 @@ pub fn start_compress(
             &temp_path,
             &archive_base,
             &compression_type,
+            None,
             &mut |bytes| {
                 if let Ok(mut p) = progress_thread.lock() {
                     p.current = bytes;

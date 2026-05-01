@@ -236,42 +236,129 @@ longer gates the source option.
 
 ---
 
-## Stage 8 — UI: codec + hunk-size controls
+## Stage 8 — UI: codec + hunk-size controls ✅
 
 The plumbing exists (`ChdOptions` from Stage 1); now expose it.
 
-- [ ] In `src/gui/backup_tab.rs`, when `CompressionType::Chd` (or `Dvd`) is selected, show:
-      - Hunk size dropdown: HD presets {4096, 8192, 16384}; DVD presets {4096, 16384, 32768};
-        CD presets {19584, 9408 (4 frames)}; "Custom" → numeric entry validated to be a
-        multiple of unit size.
-      - Codec slot 1–4 dropdowns. Populate from `libchdman_rs::codec_exists` checks: only
-        offer codecs the build supports. HD profile shows {none, zlib, zstd, lzma, huff, flac};
-        CD profile shows {none, cdzl, cdzs, cdlz, cdfl}; DVD profile reuses HD set.
-      - Live-validate the codec combo via `parse_codec_spec` and disable the Start button on
-        invalid input (e.g. CD codec in an HD slot).
-- [ ] Wire backup_tab → `BackupOptions::chd_options: Option<ChdOptions>` → `run_backup` →
-      `compress_partition` (Stage 3 already accepts `ChdOptions`).
-- [ ] Same controls in `src/gui/optical_tab.rs` for the CHD output target (Stages 6/7).
-- [ ] Persist last-used choice in `UpdateConfig` as `last_chd_codecs: Option<String>` and
-      `last_chd_hunk_size: Option<u32>` (NOT `chdman_path` — that field gets removed in Stage 10).
+- [x] `src/gui/backup_tab.rs` shows hunk-size dropdown + 4 codec-slot dropdowns
+      whenever `CompressionType::Chd` or `CompressionType::Dvd` is selected.
+      Hunk presets: HD {4096, 8192, 16384, 32768}; DVD {4096, 16384, 32768, 65536}
+      (custom hunk-size entry is omitted for now — presets cover the realistic
+      range and stay aligned to the format unit; non-aligned values are flagged
+      red and disable Start). Codec slot dropdowns populate from
+      `is_codec_supported` so unbuilt codecs never appear. Profile-filtered
+      codec lists prevent cross-profile picks (no CD codec in HD slot).
+- [x] `BackupConfig.chd_options: Option<ChdOptions>` plumbed through
+      `run_backup` → `compress_partition` (and `compress_file_to_archive` for
+      archive-edit recompression). `chd_options_for_compression()` selects HD
+      vs DVD options based on the active `CompressionType`.
+- [x] `src/gui/optical_tab.rs` reuses `show_chd_options_ui` with
+      `ChdProfile::Cd` whenever CHD output is selected. `to_chd()` and
+      `rip_to_chd_worker()` now accept `Option<ChdOptions>` and translate
+      to `libchdman_rs::cd::CdCreateOptions`.
+- [x] `UpdateConfig` gained `last_chd_codecs: Option<String>` and
+      `last_chd_hunk_size: Option<u32>` (`#[serde(default)]`). `set_chdman_available`
+      restores them at startup; `start_backup` / `start_convert` /
+      `start_rip_to_chd` persist the active choice. Profile guards prevent CD
+      codecs from being applied to HD slots and vice-versa.
+- [x] Verify: `cargo build` clean, all 618 lib tests pass, `cargo clippy` reports
+      no new errors/warnings beyond the pre-existing baseline.
 
-**Done when:** users can set codecs and hunk size from the UI for every CHD produced.
+**Done when:** users can set codecs and hunk size from the UI for every CHD produced. ✅
 
 ---
 
-## Stage 9 — bulk-convert: CHD as a target
+## Stage 9 — bulk-convert: CHD as a target ✅
 
-The bulk converter currently has CHD as an optical-only output. Extend it to accept any
-input that produces a flat byte stream (raw disk image, VHD, zstd backup) and emit HD or DVD
-CHD with user-selected codecs.
+The bulk converter previously listed only VHD/Raw/2MG/WOZ/DC42 as outputs. Extended
+to accept any input that `wrap_image_reader` understands (raw image, VHD, 2MG, DMG,
+DiskCopy 4.2, WOZ, an existing CHD) and emit HD or DVD CHD with user-selected codecs.
 
-- [ ] In `src/optical/convert.rs` (or a new `src/rbformats/bulk_chd.rs` if optical convert isn't
-      the right home), add converters for raw-image → HD CHD and raw-image → DVD CHD.
-- [ ] Hook into the bulk-convert UI selector with the same `ChdOptions` controls from Stage 8.
-- [ ] Verify: convert a raw partition image → HD CHD → restore, SHA256 round-trip.
-      Convert an ISO → DVD CHD → extract back to ISO, SHA256 round-trip.
+- [x] Added `ExportFormat::Chd` and `ExportFormat::ChdDvd` variants in
+      `src/rbformats/export.rs`. Both report extension `"chd"`; descriptions
+      `"HD CHD"` / `"DVD CHD"`; dialog filter `("MAME CHD", &["chd"])`.
+- [x] New `pub fn export_whole_disk_chd(source, _meta, _mbr, _sizes, dest,
+      profile, chd_options, progress, cancel, log)` in `export.rs`. Detects
+      input via `detect_image_format_with_path` + `wrap_image_reader` so VHD
+      footers and 2MG headers get stripped automatically; dispatches to
+      `compress_chd` (HD) or `compress_chd_dvd` (DVD). Backup-folder reconstruction
+      into CHD is rejected with a clear error — bulk only operates on raw images.
+- [x] `export_whole_disk` routes `Chd`/`ChdDvd` through `export_whole_disk_chd`
+      with `chd_options=None` (defaults from `ChdOptions::defaults_for(profile)`).
+- [x] `src/gui/bulk_convert_dialog.rs`: added "HD CHD" + "DVD CHD" radio buttons
+      and embeds `super::chd_options_ui::show(...)` (HD profile when `Chd`,
+      DVD when `ChdDvd`) in the setup view. `BulkConvertDialog` now holds a
+      `ChdOptionsControl` per profile so toggling between them preserves each
+      one's custom selection. `DialogAction::Start` now carries
+      `chd_options: Option<ChdOptions>`; `start_bulk_convert` and
+      `run_bulk_convert` thread it through. The worker dispatches to
+      `export_whole_disk_chd` on `Chd`/`ChdDvd` and `export_whole_disk` for the
+      other formats.
+- [x] `src/gui/mod.rs`: caller updated to pass `chd_options` through the new
+      `BulkConvertAction::Start` shape.
+- [x] Verify: `cargo build` clean, `cargo clippy` clean (no new warnings —
+      remaining warnings are pre-existing baseline). New unit test
+      `test_export_whole_disk_chd_round_trip` writes a 1 MiB pseudo-random raw
+      image, runs it through `export_whole_disk_chd(ChdProfile::Hd)`, reopens
+      via `ChdReader`, and asserts byte-equality. All 619 lib tests pass.
+- [ ] **Deferred** (real-world end-to-end check): pick a real partition image
+      from `~/Documents`, run bulk-convert → HD CHD with custom codec set
+      `[zstd, zlib, 0, 0]`, then restore the CHD via the existing extract path
+      and SHA256 against the source. Same for ISO → DVD CHD via bulk → extract.
 
-**Done when:** bulk convert can produce both HD and DVD CHDs with chosen codecs.
+**Done when:** bulk convert can produce both HD and DVD CHDs with chosen codecs. ✅
+
+---
+
+## Stage 9.5 — bulk-convert: CD CHD + BIN/CUE (single + multi-bin) ✅
+
+Round out the bulk converter so it can both produce CD CHDs (from .iso / .cue
+sources) and extract them back to BIN/CUE pairs. Multi-bin BIN/CUE output is
+new ground beyond chdman: chdman's `extractcd` only ever emits single-bin.
+
+- [x] `ExportFormat::ChdCd` and `ExportFormat::BinCue` variants in
+      `src/rbformats/export.rs`. CHD variants share extension `"chd"`;
+      BIN/CUE uses `"cue"` (the .bin sits alongside, named after the cue).
+- [x] `pub fn export_whole_disk_chd_cd(source, dest, chd_options, cancel,
+      log)` — wraps `optical::convert::to_chd` so libchdman-rs's
+      `parse_toc` handles multi-FILE cues, audio tracks, and mixed mode
+      transparently. Intra-file progress isn't surfaced (helper doc explains).
+- [x] `pub fn export_whole_disk_bincue(source_chd, dest_cue, multi_bin,
+      cancel, log)` — single-bin via `chd_to_bincue`, multi-bin via the
+      new `chd_to_bincue_multi`. Both delegate to libchdman-rs for the
+      heavy lifting.
+- [x] `pub fn chd_to_bincue_multi` in `src/optical/convert.rs`: post-processes
+      libchdman-rs's single-bin output by parsing the cue we just wrote
+      (`parse_libchdman_cue`) and using `cd::list_tracks` for frames per track,
+      then splits the .bin at `frames * datasize` boundaries into
+      `<stem> (Track NN).bin` files and rewrites the cue with per-FILE entries.
+      Falls back to single-bin output (with a warning) when the byte-sum
+      doesn't match — typically only happens when the CHD has stored
+      padframes/splitframes the public API can't see.
+- [x] Bulk dialog (`src/gui/bulk_convert_dialog.rs`):
+      - Added "CD CHD" and "BIN/CUE" radio buttons.
+      - When CD CHD selected: embeds `chd_options_ui::show` with
+        `ChdProfile::Cd` (MiSTer preset available); per-profile
+        `ChdOptionsControl` so toggling between HD/DVD/CD preserves each
+        profile's last selection.
+      - When BIN/CUE selected: a "Multi-bin (one .bin per track)" checkbox.
+      - `scan_source_folder` now takes `ExportFormat` and filters: CD CHD
+        accepts only `.iso` + `.cue` (skips raw `.bin` files), BIN/CUE
+        accepts only `.chd`, HD/DVD CHD skips `.cue`/`.bin`.
+      - `DialogAction::Start` carries `bincue_multi_bin: bool`;
+        `start_bulk_convert` and `run_bulk_convert` plumb it through.
+      - Worker dispatches `ChdCd` to `export_whole_disk_chd_cd` and
+        `BinCue` to `export_whole_disk_bincue`.
+- [x] `src/gui/mod.rs` caller updated for the new action shape.
+- [x] Verify: build clean, clippy clean (no new warnings), 620 lib tests pass.
+      New `test_chd_to_bincue_multi_round_trip` builds an inline multi-FILE
+      cue (MODE1 data + AUDIO), encodes to CHD via `to_chd`, extracts via
+      `chd_to_bincue_multi`, and asserts: 2 per-track .bin files exist with
+      `(Track NN).bin` names, the single-bin is removed, the cue has 2 FILE
+      entries, and per-track sizes match `frames * 2352`.
+
+**Done when:** bulk converter handles all four CHD profiles in both
+directions, with multi-bin BIN/CUE as a feature beyond chdman. ✅
 
 ---
 

@@ -9,6 +9,13 @@ pub struct UpdateConfig {
     pub update_check: UpdateCheckConfig,
     #[serde(default)]
     pub chdman_path: Option<String>,
+    /// Last-used CHD codec spec (chdman-style, e.g. `"lzma,zlib,huff,flac"`).
+    /// `None` = use the profile default.
+    #[serde(default)]
+    pub last_chd_codecs: Option<String>,
+    /// Last-used CHD hunk size in bytes. `None` = use the profile default.
+    #[serde(default)]
+    pub last_chd_hunk_size: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -53,6 +60,8 @@ impl Default for UpdateConfig {
                 repository_url: "https://github.com/danifunker/rusty-backup".to_string(),
             },
             chdman_path: None,
+            last_chd_codecs: None,
+            last_chd_hunk_size: None,
         }
     }
 }

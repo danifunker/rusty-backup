@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::fs;
 use crate::partition::{self, PartitionTable};
+use crate::rbformats::chd_options::ChdOptions;
 use metadata::{AlignmentMetadata, BackupMetadata, ExtendedContainerMetadata, PartitionMetadata};
 
 /// Compression type for backup output.
@@ -82,6 +83,9 @@ pub struct BackupConfig {
     /// When set, only back up partitions whose index is in the list.
     /// The partition table is always exported in full regardless.
     pub partition_filter: Option<Vec<usize>>,
+    /// CHD codec + hunk-size options (only consulted when `compression`
+    /// is `Chd` or `Dvd`). `None` = use the profile's chdman defaults.
+    pub chd_options: Option<ChdOptions>,
 }
 
 /// Shared progress state between background backup thread and the GUI.
@@ -652,6 +656,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 stream_size,
                 split_bytes,
                 false, // compacted image has no wasted space, don't skip zeros
+                config.chd_options.clone(),
                 |bytes_read| {
                     set_progress_bytes(
                         &progress_clone,
@@ -698,6 +703,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 image_size,
                 split_bytes,
                 !config.sector_by_sector,
+                config.chd_options.clone(),
                 |bytes_read| {
                     set_progress_bytes(
                         &progress_clone,

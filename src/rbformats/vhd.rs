@@ -1041,6 +1041,7 @@ mod tests {
             data.len() as u64,
             None,
             false,
+            None,
             |_| {},
             || false,
             |_| {},

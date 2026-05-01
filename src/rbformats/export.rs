@@ -30,6 +30,15 @@ pub enum ExportFormat {
     Woz,
     /// DiskCopy 4.2 (Mac / Apple IIgs) — floppy-only: 400K / 720K / 800K / 1440K sources.
     Dc42,
+    /// MAME CHD, hard-disk profile (512-byte unit).
+    Chd,
+    /// MAME CHD, DVD profile (2048-byte unit, MAME 0.287+).
+    ChdDvd,
+    /// MAME CHD, CD profile (2448-byte frame). Input must be ISO or CUE.
+    ChdCd,
+    /// BIN/CUE pair extracted from a CD CHD. Single-bin by default; the
+    /// bulk-convert worker can request multi-bin via a separate flag.
+    BinCue,
 }
 
 impl ExportFormat {
@@ -41,6 +50,8 @@ impl ExportFormat {
             Self::TwoMg => "2mg",
             Self::Woz => "woz",
             Self::Dc42 => "dsk",
+            Self::Chd | Self::ChdDvd | Self::ChdCd => "chd",
+            Self::BinCue => "cue",
         }
     }
 
@@ -52,6 +63,10 @@ impl ExportFormat {
             Self::TwoMg => "2MG (Apple II)",
             Self::Woz => "WOZ (Apple II)",
             Self::Dc42 => "DiskCopy 4.2",
+            Self::Chd => "HD CHD",
+            Self::ChdDvd => "DVD CHD",
+            Self::ChdCd => "CD CHD",
+            Self::BinCue => "BIN/CUE",
         }
     }
 
@@ -68,6 +83,8 @@ impl ExportFormat {
             Self::TwoMg => ("2MG Files", &["2mg"]),
             Self::Woz => ("WOZ Files", &["woz"]),
             Self::Dc42 => ("DiskCopy 4.2", &["dsk", "image", "dc42", "img"]),
+            Self::Chd | Self::ChdDvd | Self::ChdCd => ("MAME CHD", &["chd"]),
+            Self::BinCue => ("BIN/CUE Sheet", &["cue"]),
         }
     }
 
@@ -225,6 +242,37 @@ pub fn export_whole_disk(
             cancel_check,
             log_cb,
         );
+    }
+
+    // CHD outputs go through libchdman-rs. Bulk-convert is the only caller
+    // today and uses a separate entry point that threads `ChdOptions`; the
+    // generic export path here defaults the codecs/hunk-size from chdman.
+    if format == ExportFormat::Chd || format == ExportFormat::ChdDvd {
+        let profile = if format == ExportFormat::Chd {
+            super::chd_options::ChdProfile::Hd
+        } else {
+            super::chd_options::ChdProfile::Dvd
+        };
+        return export_whole_disk_chd(
+            source_path,
+            backup_metadata,
+            mbr_bytes,
+            partition_sizes,
+            dest_path,
+            profile,
+            None,
+            progress_cb,
+            cancel_check,
+            log_cb,
+        );
+    }
+
+    if format == ExportFormat::ChdCd {
+        return export_whole_disk_chd_cd(source_path, dest_path, None, cancel_check, log_cb);
+    }
+
+    if format == ExportFormat::BinCue {
+        return export_whole_disk_bincue(source_path, dest_path, false, cancel_check, log_cb);
     }
 
     // WOZ and DiskCopy 4.2: floppy-only.  Reconstruct (or slurp) the source
@@ -675,6 +723,148 @@ fn convert_from_vhd_temp(
     Ok(())
 }
 
+/// Export a whole disk as a MAME CHD (HD or DVD profile) via libchdman-rs.
+///
+/// Takes any source `wrap_image_reader` understands (raw image, VHD, 2MG, DMG,
+/// DiskCopy 4.2, WOZ, an existing CHD, …) and writes a CHD with the chosen
+/// profile + optional codec/hunk overrides. `backup_metadata` is rejected for
+/// now — the bulk-convert pipeline (the only caller today) operates on raw
+/// image files; full backup-folder reconstruction into CHD can be added later
+/// if needed.
+#[allow(clippy::too_many_arguments)]
+pub fn export_whole_disk_chd(
+    source_path: &Path,
+    backup_metadata: Option<&BackupMetadata>,
+    _mbr_bytes: Option<&[u8; 512]>,
+    _partition_sizes: &[PartitionSizeOverride],
+    dest_path: &Path,
+    profile: super::chd_options::ChdProfile,
+    chd_options: Option<super::chd_options::ChdOptions>,
+    mut progress_cb: impl FnMut(u64),
+    cancel_check: impl Fn() -> bool,
+    mut log_cb: impl FnMut(&str),
+) -> Result<()> {
+    if backup_metadata.is_some() {
+        bail!("CHD export from backup folders is not implemented; export to VHD/Raw first");
+    }
+
+    let file = File::open(source_path)
+        .with_context(|| format!("failed to open {}", source_path.display()))?;
+    let file2 = File::open(source_path)?;
+    let fmt = super::detect_image_format_with_path(file, Some(source_path))?;
+    let (mut reader, source_data_size) = super::wrap_image_reader(file2, fmt)?;
+
+    // compress_chd writes "<base>.chd" — strip the trailing extension from
+    // dest_path so the output filename matches what the caller asked for.
+    let output_base = dest_path.with_extension("");
+
+    let names = match profile {
+        super::chd_options::ChdProfile::Hd => super::chd::compress_chd(
+            &mut reader,
+            &output_base,
+            source_data_size,
+            None,
+            chd_options,
+            &mut progress_cb,
+            &cancel_check,
+            &mut log_cb,
+        )?,
+        super::chd_options::ChdProfile::Dvd => super::chd::compress_chd_dvd(
+            &mut reader,
+            &output_base,
+            source_data_size,
+            None,
+            chd_options,
+            &mut progress_cb,
+            &cancel_check,
+            &mut log_cb,
+        )?,
+        super::chd_options::ChdProfile::Cd => {
+            bail!("CD CHD output is not supported by export_whole_disk_chd; use the optical tab")
+        }
+    };
+
+    log_cb(&format!(
+        "CHD export complete: {} file(s) written ({} data bytes)",
+        names.len(),
+        source_data_size,
+    ));
+
+    Ok(())
+}
+
+/// Export an ISO or BIN/CUE source as a CD CHD via libchdman-rs.
+///
+/// Routes through `optical::convert::to_chd` so all the existing logic for
+/// `parse_toc` (multi-FILE cues, audio tracks, mixed mode) is reused. Only
+/// `.iso` and `.cue` source paths produce CD CHDs cleanly — anything else
+/// fails with a clear error from `opticaldiscs::DiscFormat::from_path`.
+///
+/// Intra-file progress isn't surfaced to the caller's `progress_cb` here —
+/// `to_chd` writes into a shared `ConvertProgress` on its own clock. The
+/// bulk-convert UI shows per-file progress (the per-CHD worker bumps the
+/// file index when it returns) which is granular enough for the dialog.
+pub fn export_whole_disk_chd_cd(
+    source_path: &Path,
+    dest_path: &Path,
+    chd_options: Option<super::chd_options::ChdOptions>,
+    cancel_check: impl Fn() -> bool,
+    mut log_cb: impl FnMut(&str),
+) -> Result<()> {
+    use crate::optical::convert::{to_chd, ConvertProgress};
+    use std::sync::{Arc, Mutex};
+
+    let shared = Arc::new(Mutex::new(ConvertProgress::new()));
+    if cancel_check() {
+        if let Ok(mut s) = shared.lock() {
+            s.cancel_requested = true;
+        }
+    }
+    to_chd(source_path, dest_path, chd_options, Arc::clone(&shared))?;
+
+    log_cb(&format!(
+        "CD CHD export complete: {} -> {}",
+        source_path.display(),
+        dest_path.display(),
+    ));
+    Ok(())
+}
+
+/// Export a CD CHD as a BIN/CUE pair (single-bin or multi-bin).
+///
+/// Single-bin output mirrors chdman's `extractcd`. Multi-bin output writes one
+/// `<base> (Track NN).bin` per track and a multi-FILE cue — a feature beyond
+/// chdman built on top of libchdman-rs's track metadata.
+pub fn export_whole_disk_bincue(
+    source_chd: &Path,
+    dest_cue: &Path,
+    multi_bin: bool,
+    cancel_check: impl Fn() -> bool,
+    mut log_cb: impl FnMut(&str),
+) -> Result<()> {
+    use crate::optical::convert::{chd_to_bincue, chd_to_bincue_multi, ConvertProgress};
+    use std::sync::{Arc, Mutex};
+
+    let shared = Arc::new(Mutex::new(ConvertProgress::new()));
+    if cancel_check() {
+        if let Ok(mut s) = shared.lock() {
+            s.cancel_requested = true;
+        }
+    }
+    if multi_bin {
+        chd_to_bincue_multi(source_chd, dest_cue, Arc::clone(&shared))?;
+    } else {
+        chd_to_bincue(source_chd, dest_cue, Arc::clone(&shared))?;
+    }
+
+    log_cb(&format!(
+        "BIN/CUE export complete ({}): {}",
+        if multi_bin { "multi-bin" } else { "single-bin" },
+        dest_cue.display(),
+    ));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -709,5 +899,52 @@ mod tests {
         assert_eq!(ExportFormat::Vhd.default_filename("disk"), "disk.vhd");
         assert_eq!(ExportFormat::Raw.default_filename("disk"), "disk.img");
         assert_eq!(ExportFormat::TwoMg.default_filename("disk"), "disk.2mg");
+        assert_eq!(ExportFormat::Chd.default_filename("disk"), "disk.chd");
+        assert_eq!(ExportFormat::ChdDvd.default_filename("disk"), "disk.chd");
+    }
+
+    /// Bulk-convert path: raw image -> HD CHD -> read back via `ChdReader`,
+    /// must round-trip byte-equal up to the partition's logical size.
+    #[test]
+    fn test_export_whole_disk_chd_round_trip() {
+        use crate::rbformats::chd::ChdReader;
+        use crate::rbformats::chd_options::ChdProfile;
+        use std::io::Write;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src_path = tmp.path().join("src.img");
+        let dst_path = tmp.path().join("out.chd");
+
+        // 1 MiB pseudo-random source, 512-byte aligned.
+        let logical_size: usize = 1024 * 1024;
+        let mut src = vec![0u8; logical_size];
+        for (i, b) in src.iter_mut().enumerate() {
+            *b = (i.wrapping_mul(31337) ^ (i >> 3)) as u8;
+        }
+        std::fs::File::create(&src_path)
+            .unwrap()
+            .write_all(&src)
+            .unwrap();
+
+        export_whole_disk_chd(
+            &src_path,
+            None,
+            None,
+            &[],
+            &dst_path,
+            ChdProfile::Hd,
+            None,
+            |_| {},
+            || false,
+            |_| {},
+        )
+        .expect("export_whole_disk_chd should succeed");
+
+        assert!(dst_path.exists(), "dest CHD should exist");
+
+        let mut reader = ChdReader::open(&dst_path).expect("open CHD");
+        let mut roundtrip = vec![0u8; logical_size];
+        std::io::Read::read_exact(&mut reader, &mut roundtrip).unwrap();
+        assert_eq!(roundtrip, src, "CHD round-trip must be byte-equal");
     }
 }

@@ -266,6 +266,7 @@ pub fn bincue_to_iso(
 pub fn to_chd(
     input_path: &Path,
     output_path: &Path,
+    chd_options: Option<crate::rbformats::chd_options::ChdOptions>,
     progress: Arc<Mutex<ConvertProgress>>,
 ) -> Result<()> {
     set_operation(&progress, "Converting to CHD...");
@@ -273,7 +274,13 @@ pub fn to_chd(
     let format = opticaldiscs::DiscFormat::from_path(input_path)
         .with_context(|| format!("Unrecognized format: {}", input_path.display()))?;
 
-    let opts = libchdman_rs::cd::CdCreateOptions::default();
+    let opts = match chd_options {
+        Some(co) => libchdman_rs::cd::CdCreateOptions {
+            hunk_size: co.hunk_size,
+            codecs: co.codecs,
+        },
+        None => libchdman_rs::cd::CdCreateOptions::default(),
+    };
     log(
         &progress,
         LogLevel::Info,
@@ -407,6 +414,270 @@ pub fn chd_to_bincue(
     Ok(())
 }
 
+/// Extract a CD CHD into a multi-bin BIN/CUE pair (one .bin per track).
+///
+/// libchdman-rs (and chdman) only emit single-bin output. Multi-bin layout is
+/// a feature beyond chdman: each track gets its own `<base> (Track NN).bin`
+/// and the cue references them via separate `FILE` lines, with each file's
+/// MSF restarting at `00:00:00`.
+///
+/// Implementation: extract single-bin first via [`chd_to_bincue`], then split
+/// the resulting `.bin` along track boundaries and rewrite the cue. Track byte
+/// boundaries come from `list_tracks` (frames per track) and the per-track
+/// `MODE1/2352` etc. token in the cue (datasize per track). When
+/// `sum(frames * datasize) != bin_size` (typically only happens when the CHD
+/// has stored padframes/splitframes the public API can't see), we fall back to
+/// single-bin output and log a warning so the user isn't surprised.
+pub fn chd_to_bincue_multi(
+    chd_path: &Path,
+    cue_path: &Path,
+    progress: Arc<Mutex<ConvertProgress>>,
+) -> Result<()> {
+    // Step 1: produce single-bin via libchdman-rs.
+    chd_to_bincue(chd_path, cue_path, Arc::clone(&progress))?;
+
+    let single_bin = cue_path.with_extension("bin");
+
+    // Step 2: read the cue we just wrote and the track list. Both come from
+    // libchdman-rs so we have a tight contract on the format.
+    let cue_text = std::fs::read_to_string(cue_path)
+        .with_context(|| format!("failed to read cue {}", cue_path.display()))?;
+    let parsed = parse_libchdman_cue(&cue_text).context("failed to parse generated cue")?;
+
+    let chd = libchdman_rs::Chd::open(
+        chd_path
+            .to_str()
+            .with_context(|| format!("CHD path is not valid UTF-8: {}", chd_path.display()))?,
+        false,
+        None,
+    )
+    .map_err(|e| anyhow::anyhow!("open CHD failed: {:?}", e))?;
+    let tracks = libchdman_rs::cd::list_tracks(&chd)
+        .map_err(|e| anyhow::anyhow!("list CHD tracks failed: {:?}", e))?;
+
+    if tracks.len() != parsed.tracks.len() {
+        bail!(
+            "track count mismatch between CHD ({}) and cue ({}) — multi-bin split aborted",
+            tracks.len(),
+            parsed.tracks.len(),
+        );
+    }
+
+    let bin_size = std::fs::metadata(&single_bin)
+        .with_context(|| format!("failed to stat {}", single_bin.display()))?
+        .len();
+    let claimed: u64 = tracks
+        .iter()
+        .zip(parsed.tracks.iter())
+        .map(|(t, p)| u64::from(t.frames) * u64::from(p.datasize))
+        .sum();
+
+    if claimed != bin_size {
+        log(
+            &progress,
+            LogLevel::Warning,
+            format!(
+                "multi-bin: track sizes (sum {}) don't match bin size ({}); the CHD likely has \
+                 padframes/splitframes that aren't exposed publicly — falling back to single-bin output",
+                claimed, bin_size,
+            ),
+        );
+        // Single-bin output is already on disk from step 1; nothing else to do.
+        if let Ok(mut p) = progress.lock() {
+            p.finished = true;
+        }
+        return Ok(());
+    }
+
+    // Step 3: split the bin into per-track files. Stream rather than slurp so
+    // we don't peak at the full bin size in RAM (CDs commonly run > 700 MB).
+    let stem = cue_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow::anyhow!("invalid cue path: {}", cue_path.display()))?
+        .to_string();
+    let parent = cue_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| Path::new(".").to_path_buf());
+
+    let mut bin_reader = BufReader::with_capacity(
+        64 * 1024,
+        File::open(&single_bin).with_context(|| format!("open {}", single_bin.display()))?,
+    );
+
+    let mut per_track_bins: Vec<std::path::PathBuf> = Vec::with_capacity(tracks.len());
+    let mut buf = vec![0u8; 64 * 1024];
+    for (i, t) in tracks.iter().enumerate() {
+        let track_bytes = u64::from(t.frames) * u64::from(parsed.tracks[i].datasize);
+        let track_bin = parent.join(format!("{} (Track {:02}).bin", stem, i + 1));
+        let mut writer = BufWriter::with_capacity(
+            64 * 1024,
+            File::create(&track_bin).with_context(|| format!("create {}", track_bin.display()))?,
+        );
+        let mut remaining = track_bytes;
+        while remaining > 0 {
+            let to_read = (remaining as usize).min(buf.len());
+            let n = bin_reader
+                .read(&mut buf[..to_read])
+                .with_context(|| format!("read {}", single_bin.display()))?;
+            if n == 0 {
+                bail!(
+                    "unexpected EOF in {} while splitting track {}",
+                    single_bin.display(),
+                    i + 1
+                );
+            }
+            writer
+                .write_all(&buf[..n])
+                .with_context(|| format!("write {}", track_bin.display()))?;
+            remaining -= n as u64;
+        }
+        writer.flush().ok();
+        per_track_bins.push(track_bin);
+    }
+
+    drop(bin_reader);
+
+    // Step 4: rewrite the cue with per-FILE entries and fresh MSF offsets.
+    let mut cue_writer = BufWriter::new(
+        File::create(cue_path).with_context(|| format!("create {}", cue_path.display()))?,
+    );
+    for (i, parsed_track) in parsed.tracks.iter().enumerate() {
+        let bin_name = per_track_bins[i]
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("track.bin");
+        writeln!(cue_writer, "FILE \"{}\" BINARY", bin_name)?;
+        writeln!(
+            cue_writer,
+            "  TRACK {:02} {}",
+            i + 1,
+            parsed_track.mode_token
+        )?;
+        if let Some(pregap) = &parsed_track.pregap_msf {
+            writeln!(cue_writer, "    PREGAP {}", pregap)?;
+        }
+        if parsed_track.has_index_00 {
+            writeln!(cue_writer, "    INDEX 00 00:00:00")?;
+            // INDEX 01 sits `pregap_data_frames` after INDEX 00. The original
+            // cue has INDEX 01 at frame_offset + pregap; we only need the
+            // delta, which equals tracks[i].pregap when pgdatasize > 0.
+            let pregap_frames = tracks[i].pregap;
+            writeln!(cue_writer, "    INDEX 01 {}", msf_string(pregap_frames))?;
+        } else {
+            writeln!(cue_writer, "    INDEX 01 00:00:00")?;
+        }
+        if let Some(postgap) = &parsed_track.postgap_msf {
+            writeln!(cue_writer, "    POSTGAP {}", postgap)?;
+        }
+    }
+    cue_writer.flush()?;
+
+    // Step 5: remove the single-bin (it's been split).
+    std::fs::remove_file(&single_bin)
+        .with_context(|| format!("remove single-bin {}", single_bin.display()))?;
+
+    log(
+        &progress,
+        LogLevel::Info,
+        format!(
+            "multi-bin extraction complete: {} ({} tracks)",
+            cue_path.display(),
+            tracks.len()
+        ),
+    );
+    if let Ok(mut p) = progress.lock() {
+        p.finished = true;
+    }
+    Ok(())
+}
+
+/// Format a frame count as `MM:SS:FF` (75 frames/second).
+fn msf_string(frames: u32) -> String {
+    let m = frames / (75 * 60);
+    let s = (frames / 75) % 60;
+    let f = frames % 75;
+    format!("{:02}:{:02}:{:02}", m, s, f)
+}
+
+#[derive(Debug, Clone)]
+struct ParsedTrack {
+    /// Cue mode token, e.g. `MODE1/2352` or `AUDIO`.
+    mode_token: String,
+    /// Bytes per sector for this track — derived from `mode_token`. AUDIO is 2352.
+    datasize: u32,
+    /// `Some(msf)` when the cue carries a `PREGAP MM:SS:FF` line (pgdatasize == 0).
+    pregap_msf: Option<String>,
+    /// True when the cue carries an `INDEX 00` line (pgdatasize > 0 → pregap data is in bin).
+    has_index_00: bool,
+    /// `Some(msf)` when the cue carries a `POSTGAP MM:SS:FF` line.
+    postgap_msf: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct ParsedCue {
+    tracks: Vec<ParsedTrack>,
+}
+
+/// Tight parser for libchdman-rs's cue output (not a general cue parser).
+/// Recognizes `FILE … BINARY`, `TRACK NN <mode>`, `INDEX 00/01 MSF`,
+/// `PREGAP MSF`, `POSTGAP MSF`. Unknown lines are tolerated and skipped.
+fn parse_libchdman_cue(text: &str) -> Result<ParsedCue> {
+    let mut out = ParsedCue::default();
+    let mut current: Option<ParsedTrack> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("TRACK ") {
+            if let Some(prev) = current.take() {
+                out.tracks.push(prev);
+            }
+            // "TRACK NN <mode_token>"
+            let mut parts = rest.splitn(2, ' ');
+            let _num = parts.next();
+            let mode = parts.next().unwrap_or("").trim().to_string();
+            let datasize = if mode.starts_with("MODE") {
+                // "MODE1/2352" or "MODE2/2336"
+                mode.split('/')
+                    .nth(1)
+                    .and_then(|n| n.parse::<u32>().ok())
+                    .unwrap_or(2352)
+            } else {
+                // AUDIO is always 2352
+                2352
+            };
+            current = Some(ParsedTrack {
+                mode_token: mode,
+                datasize,
+                pregap_msf: None,
+                has_index_00: false,
+                postgap_msf: None,
+            });
+            continue;
+        }
+        if let Some(t) = current.as_mut() {
+            if let Some(rest) = trimmed.strip_prefix("PREGAP ") {
+                t.pregap_msf = Some(rest.trim().to_string());
+            } else if let Some(rest) = trimmed.strip_prefix("POSTGAP ") {
+                t.postgap_msf = Some(rest.trim().to_string());
+            } else if trimmed.starts_with("INDEX 00") {
+                t.has_index_00 = true;
+            }
+            // INDEX 01 / FILE lines: ignored (we recompute offsets per track).
+        }
+    }
+    if let Some(prev) = current.take() {
+        out.tracks.push(prev);
+    }
+    if out.tracks.is_empty() {
+        bail!("no TRACK entries found in cue");
+    }
+    Ok(out)
+}
+
 /// Extract a single-track MODE1 CD CHD straight to ISO.
 ///
 /// libchdman-rs's `cd::extract_to_iso` rejects multi-track or non-MODE1
@@ -514,7 +785,7 @@ mod tests {
 
         let chd_path = dir.path().join("out.chd");
         let progress = Arc::new(Mutex::new(ConvertProgress::new()));
-        to_chd(&iso_path, &chd_path, Arc::clone(&progress)).unwrap();
+        to_chd(&iso_path, &chd_path, None, Arc::clone(&progress)).unwrap();
         assert!(chd_path.exists(), "CHD output missing");
 
         let chd = libchdman_rs::Chd::open(chd_path.to_str().unwrap(), false, None).unwrap();
@@ -555,6 +826,7 @@ mod tests {
         to_chd(
             &cue_path,
             &chd_path,
+            None,
             Arc::new(Mutex::new(ConvertProgress::new())),
         )
         .unwrap();
@@ -584,6 +856,7 @@ mod tests {
         to_chd(
             &iso_path,
             &chd_path,
+            None,
             Arc::new(Mutex::new(ConvertProgress::new())),
         )
         .unwrap();
@@ -623,6 +896,7 @@ mod tests {
         to_chd(
             &cue_path,
             &chd_path,
+            None,
             Arc::new(Mutex::new(ConvertProgress::new())),
         )
         .unwrap();
@@ -675,5 +949,112 @@ mod tests {
         // Roundtripped ISO should match original
         let iso2_data = std::fs::read(&iso2_path).unwrap();
         assert_eq!(iso_data, iso2_data);
+    }
+
+    /// Multi-FILE cue (MODE1 data + AUDIO) -> CHD -> multi-bin extraction.
+    ///
+    /// Mirrors the layout of `libchdman-rs/target/test-fixtures/libchdman-rs-cd.cue`
+    /// but built inline so we don't depend on that crate's test-fixture
+    /// extraction. After round-trip we must end up with one .bin per track
+    /// (named `<stem> (Track NN).bin`) and a multi-FILE cue.
+    #[test]
+    fn test_chd_to_bincue_multi_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Track 1: MODE1 data via the iso_to_bincue helper (32 sectors, already
+        // 4-frame aligned). Throw away its solo cue — we'll write our own.
+        let iso_path = dir.path().join("seed.iso");
+        let iso_data = {
+            let mut v = vec![0u8; 2048 * 32];
+            for (i, b) in v.iter_mut().enumerate() {
+                *b = ((i * 17) ^ (i >> 2)) as u8;
+            }
+            v
+        };
+        std::fs::write(&iso_path, &iso_data).unwrap();
+        let data_bin = dir.path().join("data.bin");
+        let _scratch_cue = dir.path().join("scratch.cue");
+        iso_to_bincue(
+            &iso_path,
+            &data_bin,
+            &_scratch_cue,
+            Arc::new(Mutex::new(ConvertProgress::new())),
+        )
+        .unwrap();
+        let data_bin_size = std::fs::metadata(&data_bin).unwrap().len();
+        assert_eq!(data_bin_size, 32 * 2352);
+
+        // Track 2: AUDIO — 8 sectors (4-frame aligned) of raw bytes.
+        let audio_bin = dir.path().join("audio.bin");
+        let audio_data: Vec<u8> = (0..(8usize * 2352))
+            .map(|i| ((i.wrapping_mul(53) ^ (i >> 1)) & 0xff) as u8)
+            .collect();
+        std::fs::write(&audio_bin, &audio_data).unwrap();
+
+        // Multi-FILE cue.
+        let cue_path = dir.path().join("disc.cue");
+        std::fs::write(
+            &cue_path,
+            "FILE \"data.bin\" BINARY\n  \
+             TRACK 01 MODE1/2352\n    \
+             INDEX 01 00:00:00\n\
+             FILE \"audio.bin\" BINARY\n  \
+             TRACK 02 AUDIO\n    \
+             INDEX 01 00:00:00\n",
+        )
+        .unwrap();
+
+        // Encode to CHD (libchdman-rs handles multi-FILE input via parse_toc).
+        let chd_path = dir.path().join("disc.chd");
+        to_chd(
+            &cue_path,
+            &chd_path,
+            None,
+            Arc::new(Mutex::new(ConvertProgress::new())),
+        )
+        .unwrap();
+
+        // Verify the CHD is multi-track.
+        let chd = libchdman_rs::Chd::open(chd_path.to_str().unwrap(), false, None).unwrap();
+        let tracks = libchdman_rs::cd::list_tracks(&chd).unwrap();
+        assert_eq!(tracks.len(), 2, "expected 2-track CHD");
+        drop(chd);
+
+        // Extract via multi-bin.
+        let out_cue = dir.path().join("out.cue");
+        chd_to_bincue_multi(
+            &chd_path,
+            &out_cue,
+            Arc::new(Mutex::new(ConvertProgress::new())),
+        )
+        .unwrap();
+
+        // Per-track .bin files must exist with the expected names.
+        let track1 = dir.path().join("out (Track 01).bin");
+        let track2 = dir.path().join("out (Track 02).bin");
+        assert!(track1.exists(), "Track 01 bin missing");
+        assert!(track2.exists(), "Track 02 bin missing");
+
+        // The single-bin alongside the cue must have been removed.
+        let single = dir.path().join("out.bin");
+        assert!(!single.exists(), "single-bin should have been removed");
+
+        // Cue must have two FILE entries.
+        let out_cue_text = std::fs::read_to_string(&out_cue).unwrap();
+        let file_lines = out_cue_text
+            .lines()
+            .filter(|l| l.trim_start().starts_with("FILE "))
+            .count();
+        assert_eq!(file_lines, 2, "cue should have one FILE per track");
+        assert!(out_cue_text.contains("(Track 01).bin"));
+        assert!(out_cue_text.contains("(Track 02).bin"));
+
+        // Sizes must equal frames * datasize per track. We don't reach for
+        // exact byte-equality against the originals because libchdman-rs may
+        // pad to 4-frame boundaries (we already aligned, so padding=0 here).
+        let t1_size = std::fs::metadata(&track1).unwrap().len();
+        let t2_size = std::fs::metadata(&track2).unwrap().len();
+        assert_eq!(t1_size, u64::from(tracks[0].frames) * 2352);
+        assert_eq!(t2_size, u64::from(tracks[1].frames) * 2352);
     }
 }

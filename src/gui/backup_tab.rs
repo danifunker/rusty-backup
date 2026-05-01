@@ -8,6 +8,12 @@ use rusty_backup::backup::{
     BackupConfig, BackupProgress, ChecksumType, CompressionType, LogLevel as BackupLogLevel,
 };
 use rusty_backup::fs;
+use rusty_backup::rbformats::chd_options::{
+    codec_label, parse_codec_string, ChdOptions, ChdProfile,
+};
+use rusty_backup::update::UpdateConfig;
+
+use super::chd_options_ui::{ChdOptionsControl, ChdOptionsMode};
 use rusty_backup::model::size_mode::SizeMode;
 use rusty_backup::model::status::VhdExportStatus;
 use rusty_backup::partition::PartitionSizeOverride;
@@ -29,6 +35,8 @@ pub struct BackupTab {
     split_size_mib: u32,
     checksum_type: ChecksumType,
     compression_type: CompressionType,
+    chd_hd_control: ChdOptionsControl,
+    chd_dvd_control: ChdOptionsControl,
     chdman_available: bool,
     backup_running: bool,
     backup_progress: Option<Arc<Mutex<BackupProgress>>>,
@@ -96,6 +104,8 @@ impl Default for BackupTab {
             split_size_mib: 4000,
             checksum_type: ChecksumType::Sha256,
             compression_type: CompressionType::Zstd,
+            chd_hd_control: ChdOptionsControl::new(ChdProfile::Hd),
+            chd_dvd_control: ChdOptionsControl::new(ChdProfile::Dvd),
             chdman_available: false,
             backup_running: false,
             backup_progress: None,
@@ -126,6 +136,28 @@ impl BackupTab {
                 || self.compression_type == CompressionType::Dvd)
         {
             self.compression_type = CompressionType::Zstd;
+        }
+        // Restore last-used codec/hunk choices from disk so users don't have
+        // to retune every launch. Failures are silent — the in-struct chdman
+        // defaults remain valid.
+        // Restore last-used custom codec/hunk choices so users don't re-tune
+        // every launch. Defaults/MiSTer presets are pure functions so we
+        // don't persist mode — restored values land in the Custom slot, ready
+        // to apply as soon as the user flips into Custom mode.
+        let cfg = UpdateConfig::load();
+        if let Some(spec) = cfg.last_chd_codecs.as_deref() {
+            if let Ok(codecs) = parse_codec_string(spec) {
+                self.chd_hd_control.custom.codecs = codecs;
+                self.chd_dvd_control.custom.codecs = codecs;
+            }
+        }
+        if let Some(hs) = cfg.last_chd_hunk_size {
+            if hs % 512 == 0 {
+                self.chd_hd_control.custom.hunk_size = hs;
+            }
+            if hs % 2048 == 0 {
+                self.chd_dvd_control.custom.hunk_size = hs;
+            }
         }
     }
 
@@ -330,6 +362,19 @@ impl BackupTab {
                 {}
             });
 
+            // CHD codec / hunk-size knobs (only visible when a CHD profile is selected)
+            if matches!(
+                self.compression_type,
+                CompressionType::Chd | CompressionType::Dvd
+            ) {
+                let (profile, control) = if self.compression_type == CompressionType::Dvd {
+                    (ChdProfile::Dvd, &mut self.chd_dvd_control)
+                } else {
+                    (ChdProfile::Hd, &mut self.chd_hd_control)
+                };
+                super::chd_options_ui::show(ui, "backup_chd", profile, control);
+            }
+
             // Sector-by-sector option
             ui.checkbox(
                 &mut self.sector_by_sector,
@@ -378,10 +423,16 @@ impl BackupTab {
                     self.selected_device_idx.is_some() || self.image_file_path.is_some();
                 let has_partitions =
                     self.source_partitions.is_empty() || !self.selected_partitions.is_empty();
+                let chd_ok = match self.compression_type {
+                    CompressionType::Chd => self.chd_hd_control.is_valid(ChdProfile::Hd),
+                    CompressionType::Dvd => self.chd_dvd_control.is_valid(ChdProfile::Dvd),
+                    _ => true,
+                };
                 let can_start = has_source
                     && self.destination_folder.is_some()
                     && !self.backup_name.is_empty()
-                    && has_partitions;
+                    && has_partitions
+                    && chd_ok;
 
                 if ui
                     .add_enabled(can_start, egui::Button::new("Start Backup"))
@@ -1013,6 +1064,48 @@ impl BackupTab {
             rusty_backup::backup::format::generate_backup_name(&path, size_bytes, volume_label);
     }
 
+    /// Returns the ChdOptions matching the active compression type, or
+    /// `None` when the selected output isn't a CHD profile.
+    fn chd_options_for_compression(&self) -> Option<ChdOptions> {
+        match self.compression_type {
+            CompressionType::Chd => Some(self.chd_hd_control.effective(ChdProfile::Hd)),
+            CompressionType::Dvd => Some(self.chd_dvd_control.effective(ChdProfile::Dvd)),
+            _ => None,
+        }
+    }
+
+    /// Persist only when the user is in Custom mode — Default/MiSTer are pure
+    /// functions of the profile and don't need round-tripping.
+    fn maybe_persist_chd_options(&self) {
+        let custom = match self.compression_type {
+            CompressionType::Chd if self.chd_hd_control.mode == ChdOptionsMode::Custom => {
+                Some(&self.chd_hd_control.custom)
+            }
+            CompressionType::Dvd if self.chd_dvd_control.mode == ChdOptionsMode::Custom => {
+                Some(&self.chd_dvd_control.custom)
+            }
+            _ => None,
+        };
+        if let Some(opts) = custom {
+            self.persist_chd_options(opts);
+        }
+    }
+
+    /// Persist the active CHD codec/hunk-size choice to `config.json`.
+    /// Called at backup start so future launches restore the user's pick.
+    fn persist_chd_options(&self, opts: &ChdOptions) {
+        let mut cfg = UpdateConfig::load();
+        cfg.last_chd_codecs = Some(
+            opts.codecs
+                .iter()
+                .map(|c| codec_label(*c))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        cfg.last_chd_hunk_size = Some(opts.hunk_size);
+        let _ = cfg.save();
+    }
+
     fn start_backup(&mut self, ctx: &mut TabContext) {
         let source_path = match self.source_path(ctx) {
             Some(p) => p,
@@ -1056,7 +1149,10 @@ impl BackupTab {
             },
             sector_by_sector: self.sector_by_sector,
             partition_filter,
+            chd_options: self.chd_options_for_compression(),
         };
+
+        self.maybe_persist_chd_options();
 
         let progress_arc = Arc::new(Mutex::new(BackupProgress::new()));
         self.backup_progress = Some(Arc::clone(&progress_arc));
