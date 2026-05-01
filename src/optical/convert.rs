@@ -2,13 +2,11 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 
 use crate::backup::{LogLevel, LogMessage};
-use crate::update::UpdateConfig;
 
 /// Shared progress state between a conversion thread and the GUI.
 #[derive(Default)]
@@ -51,12 +49,6 @@ fn set_progress(progress: &Arc<Mutex<ConvertProgress>>, current_bytes: u64) {
     if let Ok(mut p) = progress.lock() {
         p.current_bytes = current_bytes;
     }
-}
-
-fn get_chdman_command() -> String {
-    UpdateConfig::load()
-        .chdman_path
-        .unwrap_or_else(|| "chdman".to_string())
 }
 
 /// Mode 1 CD-ROM sync pattern (12 bytes at the start of each raw sector).
@@ -342,7 +334,13 @@ pub fn to_chd(
     Ok(())
 }
 
-/// Convert a CHD image to BIN/CUE using chdman extractcd.
+/// Extract a CD CHD into a BIN/CUE pair via libchdman-rs.
+///
+/// libchdman-rs's `cd::extract_to_cue` writes the BIN next to the CUE
+/// (filename derived from the CUE) and emits chdman-equivalent CUE
+/// metadata (per-track MODE/AUDIO + INDEX/PREGAP/POSTGAP). Tracks with
+/// stored subcode are silently dropped (CUE/BIN can't carry it); we log
+/// a one-liner so the user isn't surprised.
 pub fn chd_to_bincue(
     chd_path: &Path,
     cue_path: &Path,
@@ -351,46 +349,50 @@ pub fn chd_to_bincue(
     set_operation(&progress, "Extracting CHD to BIN/CUE...");
 
     let bin_path = cue_path.with_extension("bin");
-    let chdman = get_chdman_command();
 
     log(
         &progress,
         LogLevel::Info,
         format!(
-            "Running: {} extractcd -i {} -o {} -ob {}",
-            chdman,
+            "Extracting CHD: {} -> {} + {}",
             chd_path.display(),
             cue_path.display(),
             bin_path.display()
         ),
     );
 
-    let output = Command::new(&chdman)
-        .arg("extractcd")
-        .arg("-i")
-        .arg(chd_path)
-        .arg("-o")
-        .arg(cue_path)
-        .arg("-ob")
-        .arg(&bin_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .with_context(|| format!("Failed to run {chdman}"))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    for line in stdout.lines().chain(stderr.lines()) {
-        if !line.is_empty() {
-            log(&progress, LogLevel::Info, line.to_string());
+    // Pre-flight: warn if any track stored subcode that the CUE/BIN
+    // pair will lose.
+    if let Ok(chd) = libchdman_rs::Chd::open(
+        chd_path
+            .to_str()
+            .with_context(|| format!("CHD path is not valid UTF-8: {}", chd_path.display()))?,
+        false,
+        None,
+    ) {
+        if let Ok(tracks) = libchdman_rs::cd::list_tracks(&chd) {
+            if tracks
+                .iter()
+                .any(|t| t.subcode_type != libchdman_rs::cd::SubcodeType::None)
+            {
+                log(
+                    &progress,
+                    LogLevel::Info,
+                    "Subcode data dropped (CUE/BIN format limitation)",
+                );
+            }
         }
     }
 
-    if !output.status.success() {
-        let msg = format!("chdman extractcd failed (exit {})", output.status);
-        log(&progress, LogLevel::Error, &msg);
-        bail!("{msg}");
-    }
+    let progress_for_cb = Arc::clone(&progress);
+    let mut on_progress = move |bytes_done: u64| {
+        if let Ok(mut s) = progress_for_cb.lock() {
+            s.current_bytes = bytes_done;
+        }
+    };
+
+    libchdman_rs::cd::extract_to_cue(chd_path, cue_path, &bin_path, &mut on_progress)
+        .map_err(|e| anyhow::anyhow!("CD CHD extract to BIN/CUE failed: {:?}", e))?;
 
     log(
         &progress,
@@ -405,7 +407,10 @@ pub fn chd_to_bincue(
     Ok(())
 }
 
-/// Convert a CHD image to ISO (via CHD → BIN/CUE → ISO).
+/// Extract a single-track MODE1 CD CHD straight to ISO.
+///
+/// libchdman-rs's `cd::extract_to_iso` rejects multi-track or non-MODE1
+/// CHDs — we surface a friendly error pointing at chd_to_bincue.
 pub fn chd_to_iso(
     chd_path: &Path,
     iso_path: &Path,
@@ -413,42 +418,31 @@ pub fn chd_to_iso(
 ) -> Result<()> {
     set_operation(&progress, "Converting CHD to ISO...");
 
-    // Extract to temporary BIN/CUE next to the output
-    let parent = iso_path
-        .parent()
-        .context("output path has no parent directory")?;
-    let temp_cue = parent.join(".rusty-backup-temp-chd.cue");
-    let temp_bin = parent.join(".rusty-backup-temp-chd.bin");
+    log(
+        &progress,
+        LogLevel::Info,
+        format!(
+            "Extracting CHD to ISO: {} -> {}",
+            chd_path.display(),
+            iso_path.display()
+        ),
+    );
 
-    // Create a sub-progress for the extraction step
-    let extract_progress = Arc::new(Mutex::new(ConvertProgress::new()));
-    chd_to_bincue(chd_path, &temp_cue, Arc::clone(&extract_progress))?;
-
-    // Drain log messages from sub-step
-    if let Ok(mut ep) = extract_progress.lock() {
-        while let Some(msg) = ep.log_messages.pop_front() {
-            if let Ok(mut p) = progress.lock() {
-                p.log_messages.push_back(msg);
-            }
+    let progress_for_cb = Arc::clone(&progress);
+    let mut on_progress = move |bytes_done: u64| {
+        if let Ok(mut s) = progress_for_cb.lock() {
+            s.current_bytes = bytes_done;
         }
-    }
+    };
 
-    // Now convert the temp BIN/CUE to ISO
-    let convert_progress = Arc::new(Mutex::new(ConvertProgress::new()));
-    bincue_to_iso(&temp_cue, iso_path, Arc::clone(&convert_progress))?;
-
-    // Drain log messages from sub-step
-    if let Ok(mut cp) = convert_progress.lock() {
-        while let Some(msg) = cp.log_messages.pop_front() {
-            if let Ok(mut p) = progress.lock() {
-                p.log_messages.push_back(msg);
+    libchdman_rs::cd::extract_to_iso(chd_path, iso_path, &mut on_progress).map_err(
+        |e| match e {
+            libchdman_rs::ChdError::UnsupportedFormat => {
+                anyhow::anyhow!("CHD is multi-track or not MODE1 — extract to BIN/CUE instead")
             }
-        }
-    }
-
-    // Clean up temp files
-    let _ = std::fs::remove_file(&temp_cue);
-    let _ = std::fs::remove_file(&temp_bin);
+            other => anyhow::anyhow!("CD CHD extract to ISO failed: {:?}", other),
+        },
+    )?;
 
     log(
         &progress,
@@ -572,6 +566,77 @@ mod tests {
         libchdman_rs::cd::extract_to_iso(&chd_path, &restored, &mut |_| {}).unwrap();
         let restored_bytes = std::fs::read(&restored).unwrap();
         assert_eq!(restored_bytes, iso_data, "BIN/CUE -> CHD -> ISO mismatch");
+    }
+
+    #[test]
+    fn test_chd_to_iso_native() {
+        // Single-track MODE1 CHD -> ISO via the new libchdman-rs path.
+        // Round-trip must be byte-equal against the source ISO.
+        let dir = tempfile::tempdir().unwrap();
+        let iso_path = dir.path().join("seed.iso");
+        let mut iso_data = vec![0u8; 2048 * 48];
+        for (i, b) in iso_data.iter_mut().enumerate() {
+            *b = ((i * 23) ^ (i >> 4)) as u8;
+        }
+        std::fs::write(&iso_path, &iso_data).unwrap();
+
+        let chd_path = dir.path().join("disc.chd");
+        to_chd(
+            &iso_path,
+            &chd_path,
+            Arc::new(Mutex::new(ConvertProgress::new())),
+        )
+        .unwrap();
+
+        let restored = dir.path().join("restored.iso");
+        chd_to_iso(
+            &chd_path,
+            &restored,
+            Arc::new(Mutex::new(ConvertProgress::new())),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&restored).unwrap(), iso_data);
+    }
+
+    #[test]
+    fn test_chd_to_bincue_native() {
+        // BIN/CUE -> CHD -> BIN/CUE via the native pipeline. The
+        // restored .bin must equal the original (chdman pads tracks to a
+        // 4-frame boundary; our 32-sector seed is already aligned).
+        let dir = tempfile::tempdir().unwrap();
+        let iso_path = dir.path().join("seed.iso");
+        let iso_data = vec![0xA5u8; 2048 * 32];
+        std::fs::write(&iso_path, &iso_data).unwrap();
+
+        let bin_path = dir.path().join("seed.bin");
+        let cue_path = dir.path().join("seed.cue");
+        iso_to_bincue(
+            &iso_path,
+            &bin_path,
+            &cue_path,
+            Arc::new(Mutex::new(ConvertProgress::new())),
+        )
+        .unwrap();
+        let bin_in = std::fs::read(&bin_path).unwrap();
+
+        let chd_path = dir.path().join("disc.chd");
+        to_chd(
+            &cue_path,
+            &chd_path,
+            Arc::new(Mutex::new(ConvertProgress::new())),
+        )
+        .unwrap();
+
+        let out_cue = dir.path().join("out.cue");
+        chd_to_bincue(
+            &chd_path,
+            &out_cue,
+            Arc::new(Mutex::new(ConvertProgress::new())),
+        )
+        .unwrap();
+        let out_bin = out_cue.with_extension("bin");
+        assert!(out_bin.exists());
+        assert_eq!(std::fs::read(&out_bin).unwrap(), bin_in);
     }
 
     #[test]

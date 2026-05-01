@@ -1507,7 +1507,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2529,7 +2529,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 [[package]]
 name = "libchdman-rs"
 version = "0.287.0-l1"
-source = "git+https://github.com/danifunker/libchdman-rs#37454988642c00ed68ee4e7c75ad6bf913ff69dc"
+source = "git+https://github.com/danifunker/libchdman-rs#fa9bb6d2e9a6470fcda5e69fb82d48afd8b602bc"
 dependencies = [
  "cc",
  "libc",
@@ -3964,7 +3964,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4470,7 +4470,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

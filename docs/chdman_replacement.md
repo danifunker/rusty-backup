@@ -179,23 +179,31 @@ for the ISO case.
 
 ---
 
-## Stage 7 — native optical CHD extract (replace `chdman extractcd`)
+## Stage 7 — native optical CHD extract (replace `chdman extractcd`) ✅
 
-`src/optical/convert.rs::chd_to_bincue` (lines 370–430) and `chd_to_iso` (lines 433+) shell out.
+`src/optical/convert.rs::chd_to_bincue` and `chd_to_iso` previously shelled out to
+`chdman extractcd`; the chd→iso path went via a temp BIN/CUE round-trip.
 
-- [ ] Replace `chd_to_bincue` with `libchdman_rs::cd::extract_to_cue(chd_path, cue_path, bin_path, &mut |bytes| ...)`.
-- [ ] Replace `chd_to_iso` with `libchdman_rs::cd::extract_to_iso(chd_path, iso_path, ...)`.
-      The library returns an error on multi-track / non-MODE1 CHDs — propagate that as the
-      existing user-facing error suggesting CUE extraction instead.
-- [ ] Drop the temp BIN/CUE round-trip in the chd→iso path (libchdman-rs's `extract_to_iso`
-      goes direct from CHD to ISO without an intermediate file).
-- [ ] If a stored CHD has subcode, libchdman-rs silently drops it (CUE format can't carry it).
-      Add a one-line log: `"Subcode data dropped (CUE/BIN format limitation)"` so users aren't
-      surprised — match behavior with chdman, which warns.
-- [ ] Verify: extract one of the CHDs from Stage 6 back to BIN/CUE and to ISO; SHA256 the
-      bytes against the original input. Round-trip must be bit-perfect.
+- [x] `chd_to_bincue` now calls `libchdman_rs::cd::extract_to_cue(chd_path, cue_path,
+      bin_path, &mut on_progress)`. CUE/BIN naming convention preserved (`bin_path =
+      cue_path.with_extension("bin")`).
+- [x] `chd_to_iso` now calls `libchdman_rs::cd::extract_to_iso` directly — no temp
+      BIN/CUE round-trip. Multi-track / non-MODE1 CHDs surface as a friendly
+      "extract to BIN/CUE instead" error mapped from
+      `ChdError::UnsupportedFormat`.
+- [x] Subcode pre-flight: opens the CHD via `libchdman_rs::cd::list_tracks` before
+      extraction; if any track's `subcode_type != SubcodeType::None`, logs
+      `"Subcode data dropped (CUE/BIN format limitation)"` so users aren't surprised
+      (chdman warns; we match the spirit).
+- [x] Dropped now-unused `std::process::{Command, Stdio}`, `crate::update::UpdateConfig`
+      imports, and the `get_chdman_command()` helper from this file. `optical/convert.rs`
+      is now free of `Command::new` and `chdman_path` references.
+- [x] Verify: two new tests in `optical::convert::tests` —
+      `test_chd_to_iso_native` (ISO -> CHD -> ISO byte-equal) and
+      `test_chd_to_bincue_native` (BIN/CUE -> CHD -> BIN/CUE, restored .bin equals the
+      original). All 618 lib tests pass; clippy clean.
 
-**Done when:** all extract paths in `optical/convert.rs` are native, file is free of `Command::new`.
+**Done when:** all extract paths in `optical/convert.rs` are native, file is free of `Command::new`. ✅
 
 ---
 
