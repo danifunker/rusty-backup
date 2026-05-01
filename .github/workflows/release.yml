@@ -80,7 +80,7 @@ jobs:
           fi
       
       - name: Upload artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: Rusty-Backup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
           path: Rusty-Backup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip
@@ -255,7 +255,7 @@ jobs:
           fi
       
       - name: Upload artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: Rusty-Backup-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
           path: Rusty-Backup-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg
@@ -365,7 +365,7 @@ jobs:
           ARCH=${{ matrix.arch }} ./squashfs-root/appimagetool --no-appstream AppDir Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.AppImage
       
       - name: Upload artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-appimage
           path: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.AppImage
@@ -466,19 +466,19 @@ jobs:
           tar -czf ../../Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.pkg.tar.zst *
 
       - name: Upload Debian package
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-deb
           path: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.deb
 
       - name: Upload RPM package
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-rpm
           path: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.rpm
 
       - name: Upload Arch package
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-arch
           path: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.pkg.tar.zst
