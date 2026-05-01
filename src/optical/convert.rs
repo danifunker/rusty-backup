@@ -266,10 +266,11 @@ pub fn bincue_to_iso(
     Ok(())
 }
 
-/// Convert any supported format to CHD using chdman.
+/// Convert any supported optical format (ISO or BIN/CUE) to CD CHD via libchdman-rs.
 ///
-/// For BIN/CUE: runs `chdman createcd -i input.cue -o output.chd`
-/// For ISO: synthesizes a temporary CUE pointing at the ISO, then runs chdman.
+/// BIN/CUE feeds straight into `cd::create_from_cue`; ISO uses
+/// `cd::create_from_iso` (which synthesises a tempfile CUE next to the
+/// source — no manual `.rusty-backup-temp.cue` to clean up).
 pub fn to_chd(
     input_path: &Path,
     output_path: &Path,
@@ -280,84 +281,59 @@ pub fn to_chd(
     let format = opticaldiscs::DiscFormat::from_path(input_path)
         .with_context(|| format!("Unrecognized format: {}", input_path.display()))?;
 
-    let temp_cue_path: Option<std::path::PathBuf>;
+    let opts = libchdman_rs::cd::CdCreateOptions::default();
+    log(
+        &progress,
+        LogLevel::Info,
+        format!(
+            "Creating CD CHD: {} -> {} (hunk {}, codecs {:?})",
+            input_path.display(),
+            output_path.display(),
+            opts.hunk_size,
+            opts.codecs,
+        ),
+    );
 
-    let cue_path = match format {
-        opticaldiscs::DiscFormat::BinCue => {
-            temp_cue_path = None;
-            input_path.to_path_buf()
+    let progress_for_cb = Arc::clone(&progress);
+    let mut on_progress = move |p: libchdman_rs::CompressionProgress| {
+        if let Ok(mut s) = progress_for_cb.lock() {
+            s.current_bytes = p.bytes_done;
+            s.total_bytes = p.bytes_total;
         }
-        opticaldiscs::DiscFormat::Iso => {
-            // Synthesize a temp CUE sheet next to the output file
-            let parent = output_path
-                .parent()
-                .context("output path has no parent directory")?;
-            let cue_file = parent.join(".rusty-backup-temp.cue");
-            // Use absolute path for the ISO in the CUE so chdman can find it
-            let iso_abs = input_path
-                .canonicalize()
-                .unwrap_or_else(|_| input_path.to_path_buf());
-            let cue_text = format!(
-                "FILE \"{}\" BINARY\n  TRACK 01 MODE1/2048\n    INDEX 01 00:00:00\n",
-                iso_abs.display()
-            );
-            std::fs::write(&cue_file, &cue_text)?;
-            temp_cue_path = Some(cue_file.clone());
-            cue_file
-        }
+    };
+    let progress_for_cancel = Arc::clone(&progress);
+    let cancel = move || is_cancelled(&progress_for_cancel);
+
+    let result = match format {
+        opticaldiscs::DiscFormat::BinCue => libchdman_rs::cd::create_from_cue(
+            input_path,
+            output_path,
+            opts,
+            &mut on_progress,
+            &cancel,
+        ),
+        opticaldiscs::DiscFormat::Iso => libchdman_rs::cd::create_from_iso(
+            input_path,
+            output_path,
+            opts,
+            &mut on_progress,
+            &cancel,
+        ),
         _ => {
             bail!("Cannot convert {} to CHD directly", format.display_name());
         }
     };
 
-    let chdman = get_chdman_command();
-    log(
-        &progress,
-        LogLevel::Info,
-        format!(
-            "Running: {} createcd -i {} -o {}",
-            chdman,
-            cue_path.display(),
-            output_path.display()
-        ),
-    );
-
-    let output = Command::new(&chdman)
-        .arg("createcd")
-        .arg("-i")
-        .arg(&cue_path)
-        .arg("-o")
-        .arg(output_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .with_context(|| format!("Failed to run {chdman}"))?;
-
-    // Log stdout/stderr
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    for line in stdout.lines().chain(stderr.lines()) {
-        if !line.is_empty() {
-            log(&progress, LogLevel::Info, line.to_string());
-        }
-    }
-
-    if !output.status.success() {
-        let msg = format!("chdman createcd failed (exit {})", output.status);
-        log(&progress, LogLevel::Error, &msg);
-        bail!("{msg}");
-    }
+    result.map_err(|e| match e {
+        libchdman_rs::ChdError::Cancelled => anyhow::anyhow!("conversion cancelled"),
+        other => anyhow::anyhow!("CD CHD create failed: {:?}", other),
+    })?;
 
     log(
         &progress,
         LogLevel::Info,
         format!("CHD creation complete: {}", output_path.display()),
     );
-
-    // Clean up temp CUE if created
-    if let Some(ref path) = temp_cue_path {
-        let _ = std::fs::remove_file(path);
-    }
 
     if let Ok(mut p) = progress.lock() {
         p.finished = true;
@@ -526,6 +502,76 @@ mod tests {
         assert!(p.error.is_none());
         assert!(!p.cancel_requested);
         assert!(p.log_messages.is_empty());
+    }
+
+    #[test]
+    fn test_iso_to_chd_native() {
+        // Single-track MODE1/2048 ISO → CHD via the new libchdman-rs
+        // create_from_iso path. Verify the CHD opens, reports CD format,
+        // and that extract_to_iso round-trips byte-equal.
+        let dir = tempfile::tempdir().unwrap();
+
+        let iso_path = dir.path().join("source.iso");
+        let mut iso_data = vec![0u8; 2048 * 64];
+        for (i, b) in iso_data.iter_mut().enumerate() {
+            *b = ((i * 41) ^ (i >> 5)) as u8;
+        }
+        std::fs::write(&iso_path, &iso_data).unwrap();
+
+        let chd_path = dir.path().join("out.chd");
+        let progress = Arc::new(Mutex::new(ConvertProgress::new()));
+        to_chd(&iso_path, &chd_path, Arc::clone(&progress)).unwrap();
+        assert!(chd_path.exists(), "CHD output missing");
+
+        let chd = libchdman_rs::Chd::open(chd_path.to_str().unwrap(), false, None).unwrap();
+        let info = chd.info().unwrap();
+        assert!(info.is_cd, "expected is_cd flag on CD CHD");
+
+        let restored = dir.path().join("restored.iso");
+        libchdman_rs::cd::extract_to_iso(&chd_path, &restored, &mut |_| {}).unwrap();
+        let restored_bytes = std::fs::read(&restored).unwrap();
+        assert_eq!(restored_bytes, iso_data, "ISO -> CHD -> ISO mismatch");
+    }
+
+    #[test]
+    fn test_bincue_to_chd_native() {
+        // Build a BIN/CUE from a synthetic ISO via iso_to_bincue, then
+        // convert that through the native to_chd path and verify the
+        // CHD comes back as a CD with the right cooked sector count.
+        let dir = tempfile::tempdir().unwrap();
+
+        let iso_path = dir.path().join("seed.iso");
+        let mut iso_data = vec![0u8; 2048 * 32];
+        for (i, b) in iso_data.iter_mut().enumerate() {
+            *b = ((i * 7) ^ (i >> 3)) as u8;
+        }
+        std::fs::write(&iso_path, &iso_data).unwrap();
+
+        let bin_path = dir.path().join("seed.bin");
+        let cue_path = dir.path().join("seed.cue");
+        iso_to_bincue(
+            &iso_path,
+            &bin_path,
+            &cue_path,
+            Arc::new(Mutex::new(ConvertProgress::new())),
+        )
+        .unwrap();
+
+        let chd_path = dir.path().join("out.chd");
+        to_chd(
+            &cue_path,
+            &chd_path,
+            Arc::new(Mutex::new(ConvertProgress::new())),
+        )
+        .unwrap();
+
+        let chd = libchdman_rs::Chd::open(chd_path.to_str().unwrap(), false, None).unwrap();
+        assert!(chd.info().unwrap().is_cd);
+
+        let restored = dir.path().join("restored.iso");
+        libchdman_rs::cd::extract_to_iso(&chd_path, &restored, &mut |_| {}).unwrap();
+        let restored_bytes = std::fs::read(&restored).unwrap();
+        assert_eq!(restored_bytes, iso_data, "BIN/CUE -> CHD -> ISO mismatch");
     }
 
     #[test]

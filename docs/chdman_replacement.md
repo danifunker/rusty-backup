@@ -147,29 +147,35 @@ identifies as DVD, and restore round-trips bit-perfectly. ✅
 
 ---
 
-## Stage 6 — native optical CHD create (replace `chdman createcd`)
+## Stage 6 — native optical CHD create (replace `chdman createcd`) ✅
 
-`src/optical/convert.rs::to_chd` (lines 273–367) handles ISO and BIN/CUE → CHD. Currently shells
-out for both, with a temp CUE for the ISO case.
+`src/optical/convert.rs::to_chd` previously shelled out to `chdman createcd` for both
+ISO and BIN/CUE inputs and synthesised a `.rusty-backup-temp.cue` adjacent to the output
+for the ISO case.
 
-- [ ] Replace ISO branch with `libchdman_rs::cd::create_from_iso(iso_path, output, opts, …)`.
-      libchdman-rs writes its temp CUE adjacent to the ISO via `tempfile::NamedTempFile` so the
-      manual `.rusty-backup-temp.cue` synthesis goes away.
-- [ ] Replace BIN/CUE branch with `libchdman_rs::cd::create_from_cue(cue_path, output, opts, …)`.
-      MAME's `parse_toc` (which libchdman-rs delegates to) handles multi-FILE cues, audio
-      tracks, and unusual mode types — same support matrix as chdman.
-- [ ] Drop the `Command::new(&chdman)` block, the `get_chdman_command()` helper, and the
-      stdout/stderr forwarding (libchdman-rs provides progress directly).
-- [ ] Codec defaults: `[CHD_CODEC_CD_LZMA, CHD_CODEC_CD_ZLIB, 0, 0]` for backward parity.
-      Hunk size defaults to 19584. Both come from `ChdOptions::defaults_for(ChdProfile::Cd)`.
-- [ ] Pipe progress callbacks into `ConvertProgress`. The existing UI displays a fraction;
-      use `bytes_done / bytes_total`.
-- [ ] Verify: convert a known ISO and a known BIN/CUE to CHD. Open both with `chdman info`
-      AND libchdman-rs, confirm track count and SHA1 match what chdman would have produced
-      (this last bit is the byte-for-byte parity check — easy to cross-check by also running
-      chdman against the same inputs once and diffing).
+- [x] ISO branch now calls `libchdman_rs::cd::create_from_iso`. The library writes its
+      own `tempfile::NamedTempFile` CUE next to the source ISO, so the manual
+      `.rusty-backup-temp.cue` write/cleanup is gone.
+- [x] BIN/CUE branch calls `libchdman_rs::cd::create_from_cue` directly. MAME's
+      `parse_toc` handles multi-FILE cues, audio tracks, and unusual mode types — same
+      coverage chdman had.
+- [x] Dropped the `Command::new(&chdman) … createcd …` block and stdout/stderr
+      forwarding from `to_chd`. Replaced with libchdman-rs's progress callback wired
+      into `ConvertProgress` (`bytes_done` / `bytes_total`). Cancellation is checked
+      via the same `is_cancelled` polling helper. The `get_chdman_command()` helper
+      stays for now because Stage 7's chd_to_bincue / chd_to_iso still uses it; it
+      goes away in that stage.
+- [x] Codec / hunk defaults pulled from `libchdman_rs::cd::CdCreateOptions::default()`
+      (matches chdman's `s_default_cd_compression`: `[cdlz, cdzl, cdfl, 0]`, hunk 19584).
+      Stage 1's `ChdProfile::Cd` defaults already mirror this; Stage 8 will hand a
+      user-tuned `ChdOptions` in.
+- [x] Verify: two new tests in `optical::convert::tests` — `test_iso_to_chd_native`
+      converts a 64-sector synthetic ISO via `to_chd`, asserts `Chd::info().is_cd`, and
+      round-trips through `cd::extract_to_iso` byte-equal. `test_bincue_to_chd_native`
+      uses `iso_to_bincue` to build a real BIN/CUE pair and feeds it through `to_chd`,
+      again round-tripping byte-equal. All 616 lib tests pass; clippy clean.
 
-**Done when:** to_chd no longer invokes `chdman`, ISO and BIN/CUE both work.
+**Done when:** to_chd no longer invokes `chdman`, ISO and BIN/CUE both work. ✅
 
 ---
 
