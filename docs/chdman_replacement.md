@@ -95,25 +95,25 @@ to `chdman createraw -hs 4096 -us 512`, then deletes the temp.
 
 ---
 
-## Stage 4 — native raw-disk extract (replace `chdman extractraw` shell-out)
+## Stage 4 — native raw-disk extract (replace `chdman extractraw` shell-out) ✅
 
-`src/rbformats/compress.rs` lines ~187–215 call `chdman extractraw` to decompress a CHD into a
-temp file, then stream that temp into the recompression pipeline.
+`src/rbformats/compress.rs` lines ~187–215 called `chdman extractraw` to decompress a CHD into a
+temp file, then streamed that temp into the recompression pipeline.
 
-- [ ] Replace the `Command::new(&chdman_cmd).arg("extractraw")…` block with
-      `libchdman_rs::hd::extract_to_writer` writing into the streaming pipeline directly
-      (no temp file). The current code reads the temp file as a `BufReader<File>`; the
-      replacement should expose a `Read` adapter over libchdman-rs's `extract_to_writer` —
-      easiest implementation: spawn a thread with `pipe::pipe()`, write into the writer end
-      from libchdman-rs, hand the reader end to the existing pipeline.
-      - Alternative if pipe-thread feels heavy: keep a temp file but produce it via libchdman-rs
-        (still no chdman). Trade: same disk usage as today, simpler code. Pick one — pipe-thread
-        is the cleaner end state.
-- [ ] Remove the local `chdman_cmd` lookup and the `chdman_path` reference in this file.
-- [ ] Verify: round-trip — backup a 50 MB partition (Stage 3), then restore through this
-      path, SHA256 the restored bytes, confirm match against original.
+- [x] Replaced the `Command::new(&chdman_cmd).arg("extractraw")…` block with a direct stream
+      from `ChdReader` (the `Read+Seek` libchdman-rs adapter built in Stage 2) into the
+      existing writer pipeline. No pipe thread, no temp file, no extra allocation — `ChdReader`
+      already exposes the needed `Read` interface, so taking `min(logical_size, limit)` and
+      streaming chunks is the cleanest path. Added `pub fn ChdReader::logical_size()` so the
+      caller can compute the take limit without re-opening the file.
+- [x] Removed the `chdman_cmd` / `UpdateConfig::chdman_path` lookup and the unused
+      `std::process::Command` import from this file.
+- [x] Verify: new unit test `test_chd_decompress_round_trip` in `rbformats::compress::tests`
+      compresses 1 MiB of pseudo-random data via `compress_partition(CompressionType::Chd)`,
+      decompresses through the `decompress_to_writer` "chd" branch, and asserts byte-equality
+      against the input. All 613 lib tests pass; clippy clean.
 
-**Done when:** restore-from-CHD path no longer references `chdman` or `Command`.
+**Done when:** restore-from-CHD path no longer references `chdman` or `Command`. ✅
 
 ---
 

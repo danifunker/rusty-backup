@@ -27,6 +27,11 @@ unsafe impl Send for ChdReader {}
 
 impl ChdReader {
     /// Open a CHD file for reading.
+    /// Logical (uncompressed) byte length of the CHD's contents.
+    pub fn logical_size(&self) -> u64 {
+        self.logical_size
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         let path_str = path
             .to_str()
