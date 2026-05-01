@@ -23,24 +23,19 @@ ends with a green build + targeted verification. Tick each box as it lands.
 
 ---
 
-## Stage 1 — CHD options type + config plumbing (no behavior change yet)
+## Stage 1 — CHD options type + config plumbing (no behavior change yet) ✅
 
 Goal: a single source of truth for "how to write a CHD" that every call site can take. No
 production code path uses it yet — this stage is just shape.
 
-- [ ] New module `src/rbformats/chd_options.rs` defining:
-  ```rust
-  pub struct ChdOptions {
-      pub hunk_size: u32,    // default per format (HD=4096, CD=19584, DVD=4096)
-      pub codecs: [u32; 4],  // FourCCs from libchdman_rs
-  }
-  pub enum ChdProfile { Hd, Cd, Dvd }
-  impl ChdOptions { pub fn defaults_for(profile: ChdProfile) -> Self; }
-  pub fn parse_codec_string(s: &str) -> anyhow::Result<[u32; 4]>; // wraps libchdman_rs::parse_codec_spec
-  pub fn codec_label(code: u32) -> String; // for UI: e.g. 0x63647A73 -> "cdzs"
-  ```
-- [ ] Re-export from `src/rbformats/mod.rs`.
-- [ ] No call sites use it yet. Add unit tests for `parse_codec_string("cdzs,cdfl")` and the three default profiles.
+- [x] New module `src/rbformats/chd_options.rs` with `ChdOptions { hunk_size, codecs }`,
+      `ChdProfile { Hd, Cd, Dvd }`, `defaults_for()` matching chdman's `s_default_*_compression`
+      tables exactly, plus helpers `parse_codec_string`, `codec_label`, `codec_long_name`,
+      `is_codec_supported`.
+- [x] Module declared in `src/rbformats/mod.rs`.
+- [x] 8 unit tests — three default-matchers (HD/CD/DVD), parse round-trip + reject garbage,
+      codec_label round-trip, supported-codec sanity. All pass.
+- [x] No production call sites use it yet — Stage 3 is the first consumer.
 
 **Done when:** `cargo test rbformats::chd_options` passes, `cargo clippy` clean.
 

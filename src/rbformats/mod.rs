@@ -1,4 +1,5 @@
 pub mod chd;
+pub mod chd_options;
 pub mod compress;
 pub mod dc42;
 pub mod dmg;
