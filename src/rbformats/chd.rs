@@ -1,12 +1,15 @@
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
+use libchdman_rs::{
+    hd::{create_from_reader, HdCreateOptions},
+    ChdError, CompressionProgress,
+};
 
+use super::chd_options::{ChdOptions, ChdProfile};
 use super::{file_name, output_path, CHUNK_SIZE};
-use crate::update::UpdateConfig;
 
 /// Read+Seek adapter over a CHD file backed by libchdman-rs. Enables
 /// filesystem browsing without extracting to a temp file.
@@ -75,149 +78,67 @@ impl Seek for ChdReader {
     }
 }
 
-/// Get the chdman command name or path to use (from config or default to PATH)
-fn get_chdman_command() -> String {
-    UpdateConfig::load()
-        .chdman_path
-        .unwrap_or_else(|| "chdman".to_string())
-}
-
-/// Detect whether `chdman` is available on PATH or at configured path.
-pub fn detect_chdman() -> bool {
-    let cmd = get_chdman_command();
-    Command::new(&cmd)
-        .arg("help")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
-}
-
-/// Compress via chdman external tool.
+/// Compress raw partition data into a hard-disk CHD via libchdman-rs.
 ///
-/// Steps:
-/// 1. Write raw data to a temp file next to the output
-/// 2. Run `chdman createraw -i temp -o output.chd -hs 4096`
-/// 3. Clean up temp file
-/// 4. If splitting is needed, split the output CHD manually
+/// `logical_size` is the partition's natural byte length. It is rounded
+/// up to the nearest unit (512 byte) boundary for the CHD; any tail
+/// shortfall in `reader` is zero-padded by libchdman-rs internally.
+/// `opts` selects hunk size + codecs; `None` falls back to chdman's HD
+/// defaults (`lzma, zlib, huff, flac`, 4096-byte hunks).
 pub(crate) fn compress_chd(
     reader: &mut impl Read,
     output_base: &Path,
+    logical_size: u64,
     split_size: Option<u64>,
+    opts: Option<ChdOptions>,
     progress_cb: &mut impl FnMut(u64),
     cancel_check: &impl Fn() -> bool,
     log_cb: &mut impl FnMut(&str),
 ) -> Result<Vec<String>> {
-    let parent = output_base
-        .parent()
-        .context("output path has no parent directory")?;
+    let chd_opts = opts.unwrap_or_else(|| ChdOptions::defaults_for(ChdProfile::Hd));
 
-    // Step 1: Write raw data to temp file
-    let temp_path = parent.join(format!(
-        ".{}.tmp",
-        output_base
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-    ));
-    {
-        let mut temp_writer = BufWriter::new(
-            File::create(&temp_path)
-                .with_context(|| format!("failed to create temp file: {}", temp_path.display()))?,
-        );
-        let mut total_read: u64 = 0;
-        let mut buf = vec![0u8; CHUNK_SIZE];
-        loop {
-            if cancel_check() {
-                let _ = fs::remove_file(&temp_path);
-                bail!("backup cancelled");
-            }
-            let n = reader.read(&mut buf).context("failed to read source")?;
-            if n == 0 {
-                break;
-            }
-            temp_writer
-                .write_all(&buf[..n])
-                .context("failed to write temp file")?;
-            total_read += n as u64;
-            progress_cb(total_read);
-        }
-        temp_writer.flush()?;
-    }
-
-    // Step 2: Determine raw data size for chdman (must be known)
-    let raw_size = fs::metadata(&temp_path)
-        .with_context(|| format!("failed to stat temp file: {}", temp_path.display()))?
-        .len();
-
-    // chdman createraw parameters:
-    // -us (unit size) = sector size, always 512 bytes
-    // -hs (hunk size) = must be a multiple of unit size, and total data
-    //     must be a multiple of hunk size. Default to 4096 (8 sectors).
-    let unit_size: u64 = 512;
-    let hunk_size: u64 = 4096;
-
-    // Pad the raw data to the nearest hunk_size boundary if needed
-    let remainder = raw_size % hunk_size;
-    if remainder != 0 {
-        let pad_bytes = hunk_size - remainder;
-        let pad_file = fs::OpenOptions::new()
-            .append(true)
-            .open(&temp_path)
-            .context("failed to open temp file for padding")?;
-        let mut pad_writer = BufWriter::new(pad_file);
-        let zeros = vec![0u8; pad_bytes as usize];
-        pad_writer
-            .write_all(&zeros)
-            .context("failed to pad temp file")?;
-        pad_writer.flush()?;
-    }
+    // chdman uses 512-byte units for HD CHDs. Round logical_size up so
+    // libchdman-rs's `logical_size % unit_size == 0` precondition holds;
+    // any padding bytes are written by libchdman-rs as zeros.
+    const UNIT_SIZE: u64 = 512;
+    let padded_size = logical_size.div_ceil(UNIT_SIZE) * UNIT_SIZE;
 
     let chd_path = output_path(output_base, "chd", false, 0);
     log_cb(&format!(
-        "Running chdman createraw -> {}",
-        chd_path.display()
+        "Writing CHD {} (logical {} bytes, hunk {}, codecs {:?})",
+        chd_path.display(),
+        padded_size,
+        chd_opts.hunk_size,
+        chd_opts.codecs,
     ));
-    let chdman_cmd = get_chdman_command();
-    let output = Command::new(&chdman_cmd)
-        .arg("createraw")
-        .arg("-i")
-        .arg(&temp_path)
-        .arg("-o")
-        .arg(&chd_path)
-        .arg("-hs")
-        .arg(hunk_size.to_string())
-        .arg("-us")
-        .arg(unit_size.to_string())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .context("failed to run chdman")?;
 
-    // Forward chdman output to log
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let trimmed = line.trim();
-        if !trimmed.is_empty() {
-            log_cb(trimmed);
-        }
-    }
-    for line in String::from_utf8_lossy(&output.stderr).lines() {
-        let trimmed = line.trim();
-        if !trimmed.is_empty() {
-            log_cb(trimmed);
-        }
-    }
+    let hd_opts = HdCreateOptions {
+        logical_size: padded_size,
+        hunk_size: chd_opts.hunk_size,
+        unit_size: UNIT_SIZE as u32,
+        codecs: chd_opts.codecs,
+        geometry: None,
+        ident: None,
+    };
 
-    let _ = fs::remove_file(&temp_path);
+    let mut progress = |p: CompressionProgress| {
+        // Clamp to the user-facing logical size so the progress bar never
+        // reports more bytes than the caller knows about (CHD pads up to
+        // the next hunk; the caller's "total" is `logical_size`).
+        progress_cb(p.bytes_done.min(logical_size));
+    };
 
-    if !output.status.success() {
-        bail!(
-            "chdman exited with status {}",
-            output.status.code().unwrap_or(-1)
-        );
-    }
+    create_from_reader(reader, &chd_path, hd_opts, &mut progress, cancel_check).map_err(
+        |e| match e {
+            ChdError::Cancelled => anyhow::anyhow!("backup cancelled"),
+            other => anyhow::anyhow!("CHD create failed: {:?}", other),
+        },
+    )?;
 
-    // Step 3: Split the CHD file if requested
+    // Final progress tick at logical_size — libchdman-rs reports in
+    // terms of padded size, but the caller's total is `logical_size`.
+    progress_cb(logical_size);
+
     if let Some(split_bytes) = split_size {
         let chd_size = fs::metadata(&chd_path)
             .with_context(|| format!("failed to stat CHD output: {}", chd_path.display()))?
@@ -288,10 +209,36 @@ pub(crate) fn split_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+    use tempfile::TempDir;
 
     #[test]
-    fn test_detect_chdman() {
-        // Just ensure it doesn't panic; result depends on system
-        let _available = detect_chdman();
+    fn compress_chd_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let mut data = vec![0u8; 1024 * 1024];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = ((i * 31) ^ (i >> 7)) as u8;
+        }
+        let mut reader = Cursor::new(&data);
+        let base = tmp.path().join("partition-0");
+
+        let files = compress_chd(
+            &mut reader,
+            &base,
+            data.len() as u64,
+            None,
+            None,
+            &mut |_| {},
+            &|| false,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(files, vec!["partition-0.chd"]);
+
+        let chd_path = base.with_extension("chd");
+        let mut chd_reader = ChdReader::open(&chd_path).unwrap();
+        let mut decoded = vec![0u8; data.len()];
+        chd_reader.read_exact(&mut decoded).unwrap();
+        assert_eq!(decoded, data, "CHD round-trip mismatch");
     }
 }

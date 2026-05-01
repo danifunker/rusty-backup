@@ -644,6 +644,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 &mut limited,
                 &output_base,
                 effective_compression,
+                stream_size,
                 split_bytes,
                 false, // compacted image has no wasted space, don't skip zeros
                 |bytes_read| {
@@ -689,6 +690,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 &mut limited,
                 &output_base,
                 effective_compression,
+                image_size,
                 split_bytes,
                 !config.sector_by_sector,
                 |bytes_read| {

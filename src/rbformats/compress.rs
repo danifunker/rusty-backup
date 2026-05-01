@@ -29,6 +29,7 @@ pub fn compress_partition(
     reader: &mut impl Read,
     output_base: &Path,
     compression: CompressionType,
+    logical_size: u64,
     split_size: Option<u64>,
     skip_zeros: bool,
     mut progress_cb: impl FnMut(u64),
@@ -65,17 +66,16 @@ pub fn compress_partition(
                 &cancel_check,
             )
         }
-        CompressionType::Chd => {
-            // CHD needs complete raw temp file; chdman handles zero compression
-            chd::compress_chd(
-                reader,
-                output_base,
-                split_size,
-                &mut progress_cb,
-                &cancel_check,
-                &mut log_cb,
-            )
-        }
+        CompressionType::Chd => chd::compress_chd(
+            reader,
+            output_base,
+            logical_size,
+            split_size,
+            None,
+            &mut progress_cb,
+            &cancel_check,
+            &mut log_cb,
+        ),
     }
 }
 
@@ -308,14 +308,19 @@ pub fn compress_file_to_archive(
             progress_cb,
             cancel_check,
         ),
-        "chd" => chd::compress_chd(
-            &mut reader,
-            output_path_base,
-            None,
-            progress_cb,
-            cancel_check,
-            log_cb,
-        ),
+        "chd" => {
+            let logical_size = reader.get_ref().metadata()?.len();
+            chd::compress_chd(
+                &mut reader,
+                output_path_base,
+                logical_size,
+                None,
+                None,
+                progress_cb,
+                cancel_check,
+                log_cb,
+            )
+        }
         "none" | "raw" => raw::stream_with_split(
             &mut reader,
             output_path_base,
@@ -492,6 +497,7 @@ mod tests {
             &mut reader,
             &base,
             CompressionType::None,
+            data.len() as u64,
             None,
             false,
             |_| {},
@@ -517,6 +523,7 @@ mod tests {
             &mut reader,
             &base,
             CompressionType::None,
+            data.len() as u64,
             Some(1024),
             false,
             |_| {},
@@ -550,6 +557,7 @@ mod tests {
             &mut reader,
             &base,
             CompressionType::None,
+            data.len() as u64,
             None,
             true,
             |_| {},
@@ -576,6 +584,7 @@ mod tests {
             &mut reader,
             &base,
             CompressionType::None,
+            data.len() as u64,
             None,
             true,
             |_| {},
@@ -645,6 +654,7 @@ mod tests {
             &mut reader,
             &base,
             CompressionType::None,
+            data.len() as u64,
             None,
             false,
             |_| {},

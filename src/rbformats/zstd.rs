@@ -72,6 +72,7 @@ mod tests {
             &mut reader,
             &base,
             CompressionType::Zstd,
+            data.len() as u64,
             None,
             false,
             |_| {},

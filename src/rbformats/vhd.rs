@@ -1038,6 +1038,7 @@ mod tests {
             &mut reader,
             &base,
             CompressionType::Vhd,
+            data.len() as u64,
             None,
             false,
             |_| {},

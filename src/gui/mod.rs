@@ -23,7 +23,6 @@ use settings_dialog::SettingsDialog;
 use std::path::PathBuf;
 
 use rusty_backup::device::{self, DiskDevice};
-use rusty_backup::rbformats::chd::detect_chdman;
 use rusty_backup::update::{check_for_updates, UpdateConfig, UpdateInfo};
 
 #[cfg(target_os = "linux")]
@@ -129,13 +128,12 @@ impl Default for RustyBackupApp {
             dialog
         };
 
-        // Detect chdman availability
-        let chdman_available = detect_chdman();
-        if chdman_available {
-            log.info("chdman detected: CHD compression available");
-        } else {
-            log.info("chdman not found: CHD compression disabled");
-        }
+        // CHD support is always available now (libchdman-rs is linked in).
+        // Stage 10 of the chdman-removal plan will rip out the remaining
+        // `chdman_available` plumbing across the GUI; for Stage 3 we just
+        // pin it to true so existing call sites keep working.
+        let chdman_available = true;
+        log.info("CHD compression available (libchdman-rs)");
 
         let mut backup_tab = BackupTab::default();
         backup_tab.set_chdman_available(chdman_available);

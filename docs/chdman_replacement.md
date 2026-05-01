@@ -63,32 +63,35 @@ Browse/inspect already routes through it via `src/gui/browse_view.rs::create_fil
 
 ---
 
-## Stage 3 — native raw-disk compress (replace `chdman createraw` shell-out)
+## Stage 3 — native raw-disk compress (replace `chdman createraw` shell-out) ✅
 
 `src/rbformats/chd.rs::compress_chd` (lines 134–263) currently writes a temp file, shells out
 to `chdman createraw -hs 4096 -us 512`, then deletes the temp.
 
-- [ ] Rewrite `compress_chd` to:
-  1. Wrap the `&mut impl Read` source in `libchdman_rs::hd::create_from_reader`.
-  2. Build `HdCreateOptions` from the new `ChdOptions` (Stage 1) — hunk size, codecs.
-       Default to `[CHD_CODEC_LZMA, CHD_CODEC_ZLIB, CHD_CODEC_HUFF, CHD_CODEC_FLAC]` to match
-       chdman's `s_default_hd_compression`.
-  3. `logical_size` = caller-provided partition size. The reader will be zero-padded by libchdman-rs.
-  4. Hook `progress_cb` into the `&mut dyn FnMut(CompressionProgress)` callback —
-       use `bytes_done` (not the ratio).
-  5. Hook `cancel_check` into the `&dyn Fn() -> bool` callback. libchdman-rs deletes the partial
-       file on cancel; we no longer need the manual `fs::remove_file(&temp_path)` cleanup.
-- [ ] Update the function signature: take `ChdOptions` (or accept `Option<ChdOptions>` and use
-      defaults). Threading through callers will happen in Stage 8.
-- [ ] Drop `detect_chdman()` and `get_chdman_command()` from `chd.rs` — both unused after this stage.
-      Keep the splitting helper (`split_file`) — still needed if `split_size` is set.
-- [ ] No temp file. No `Command`. No `chdman`.
-- [ ] Verify: backup a small partition (~50 MB), confirm output CHD opens with `chdman info`
-      AND with libchdman-rs (`Chd::open` + `verify()`), confirm SHA1 matches. Then restore
-      it (Stage 4 not done yet, so use chdman temporarily for the readback only — or stage this
-      verification with Stage 4 below).
+- [x] Rewrote `compress_chd` to call `libchdman_rs::hd::create_from_reader` directly. Builds
+      `HdCreateOptions` from `ChdOptions` (Stage 1); `None` falls back to
+      `ChdOptions::defaults_for(ChdProfile::Hd)` which matches chdman's `s_default_hd_compression`.
+      `logical_size` is rounded up to the 512-byte unit boundary; libchdman-rs zero-pads the
+      tail. `progress_cb` is fed `CompressionProgress::bytes_done` clamped to `logical_size`
+      so the GUI progress bar never overshoots. `cancel_check` is passed straight through;
+      libchdman-rs handles the partial-file unlink on cancel.
+- [x] Function signature now: `compress_chd(reader, output_base, logical_size, split_size,
+      opts: Option<ChdOptions>, progress_cb, cancel_check, log_cb)`. Threaded `logical_size`
+      through `compress_partition` (using `stream_size` for compacted, `image_size` for
+      trim-based) and `compress_file_to_archive` (uses `metadata().len()` of the input file).
+      Threading user-selectable `ChdOptions` through callers stays for Stage 8.
+- [x] Dropped `detect_chdman()` and `get_chdman_command()` from `chd.rs`. Kept `split_file`.
+- [x] No temp file. No `Command::new`. No `chdman`.
+- [x] `gui/mod.rs`: replaced runtime `detect_chdman()` with a hardcoded `chdman_available =
+      true` and a single log line ("CHD compression available (libchdman-rs)"). The
+      `set_chdman_available` plumbing in tabs stays for now — Stage 10 rips it out.
+- [x] Verify: `cargo test --lib` passes (612 tests including new `compress_chd_round_trip`
+      that compresses 1 MiB of pseudo-random data, reopens via `ChdReader`, and asserts
+      byte-equality). Build clean, no new clippy warnings.
+- [ ] **Deferred**: end-to-end real-partition backup + cross-tool `chdman info` SHA1 check
+      will come naturally with Stage 4's restore round-trip.
 
-**Done when:** raw-disk backup writes a CHD without invoking `chdman` and the output verifies.
+**Done when:** raw-disk backup writes a CHD without invoking `chdman` and the output verifies. ✅
 
 ---
 
