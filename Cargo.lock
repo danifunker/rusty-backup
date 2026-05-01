@@ -2527,6 +2527,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
+name = "libchdman-rs"
+version = "0.287.0-l1"
+source = "git+https://github.com/danifunker/libchdman-rs#eb074b39cb8a1d6869e66eb058aefd2aaddc849a"
+dependencies = [
+ "cc",
+ "libc",
+ "tempfile",
+]
+
+[[package]]
 name = "libfuzzer-sys"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4018,6 +4028,7 @@ dependencies = [
  "flate2",
  "image",
  "libc",
+ "libchdman-rs",
  "log",
  "nix",
  "objc2-core-foundation",
