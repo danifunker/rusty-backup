@@ -726,12 +726,6 @@ impl BackupTab {
         else {
             return;
         };
-        let Some(file_arc) = self.source_file.clone() else {
-            ctx.log.error(format!(
-                "Cannot calculate minimum size for partition {part_index}: no open source handle",
-            ));
-            return;
-        };
         let path = self.source_path(ctx);
         let is_device = path
             .as_ref()
@@ -740,6 +734,24 @@ impl BackupTab {
                 s.starts_with("/dev/") || s.starts_with("\\\\.\\")
             })
             .unwrap_or(false);
+
+        let source = match path.as_deref() {
+            Some(p) if rusty_backup::model::source_reader::is_chd_path(p) => {
+                rusty_backup::model::min_size_runner::MinSizeSource::Chd(p.to_path_buf())
+            }
+            _ => {
+                let Some(file_arc) = self.source_file.clone() else {
+                    ctx.log.error(format!(
+                        "Cannot calculate minimum size for partition {part_index}: no open source handle",
+                    ));
+                    return;
+                };
+                rusty_backup::model::min_size_runner::MinSizeSource::File {
+                    file: file_arc,
+                    use_sector_aligned: is_device,
+                }
+            }
+        };
 
         let fs_name = self
             .deferred_min_sizes
@@ -751,13 +763,12 @@ impl BackupTab {
         ));
 
         let req = rusty_backup::model::min_size_runner::MinSizeRequest {
-            file: file_arc,
+            source,
             partition_offset: part.start_lba * 512,
             partition_type: part.partition_type_byte,
             partition_type_string: part.partition_type_string.clone(),
             partition_size: part.size_bytes,
             partition_index: part_index,
-            use_sector_aligned: is_device,
         };
         let status = rusty_backup::model::min_size_runner::spawn(req);
         self.pending_min_size_calcs.insert(part_index, status);

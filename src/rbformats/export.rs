@@ -63,7 +63,7 @@ impl ExportFormat {
             Self::TwoMg => "2MG (Apple II)",
             Self::Woz => "WOZ (Apple II)",
             Self::Dc42 => "DiskCopy 4.2",
-            Self::Chd => "HD CHD",
+            Self::Chd => "CHD (Hard Disk)",
             Self::ChdDvd => "DVD CHD",
             Self::ChdCd => "CD CHD",
             Self::BinCue => "BIN/CUE",

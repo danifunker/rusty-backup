@@ -186,7 +186,7 @@ impl BulkConvertDialog {
                         .on_hover_text("Floppy only: 140K / 400K / 800K sources");
                     ui.radio_value(&mut self.format, ExportFormat::Dc42, "DiskCopy 4.2 (.dsk)")
                         .on_hover_text("Floppy only: 400K / 720K / 800K / 1440K sources");
-                    ui.radio_value(&mut self.format, ExportFormat::Chd, "HD CHD")
+                    ui.radio_value(&mut self.format, ExportFormat::Chd, "CHD (Hard Disk)")
                         .on_hover_text("MAME hard-disk CHD (512-byte unit)");
                     ui.radio_value(&mut self.format, ExportFormat::ChdDvd, "DVD CHD")
                         .on_hover_text("MAME DVD CHD (2048-byte unit, MAME 0.287+)");

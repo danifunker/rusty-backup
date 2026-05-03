@@ -23,9 +23,10 @@ use crate::fs::fat::resize_fat_in_place;
 use crate::fs::hfs_max_growable_size;
 use crate::model::size_mode::SizeMode;
 use crate::partition::{self, PartitionInfo, PartitionSizeOverride};
+use crate::rbformats::chd_options::{ChdOptions, ChdProfile};
 use crate::rbformats::export::{
     export_clonezilla_disk, export_clonezilla_partition, export_partition, export_whole_disk,
-    ExportFormat,
+    export_whole_disk_bincue, export_whole_disk_chd, export_whole_disk_chd_cd, ExportFormat,
 };
 use crate::rbformats::vhd::build_vhd_footer;
 
@@ -241,6 +242,90 @@ pub fn start_native_whole_disk(
                 }
             },
         );
+        if let Ok(mut s) = status_thread.lock() {
+            s.finished = true;
+            if let Err(e) = result {
+                s.error = Some(format!("{e:#}"));
+            }
+        }
+    });
+
+    status
+}
+
+/// Spawn a CHD whole-disk export for raw images / devices. CHD doesn't
+/// support backup-folder reconstruction or per-partition splitting (those
+/// produce headless partition slices that no emulator can consume), so the
+/// caller is responsible for gating availability before reaching here.
+///
+/// `format` must be one of `Chd`, `ChdDvd`, `ChdCd`, or `BinCue`. For the
+/// first three, `chd_options` selects the user's codec/hunk-size choice
+/// (None = profile defaults). For `BinCue`, `bincue_multi_bin` toggles
+/// single- vs. multi-bin output.
+pub fn start_native_whole_disk_chd(
+    format: ExportFormat,
+    source: PathBuf,
+    dest: PathBuf,
+    chd_options: Option<ChdOptions>,
+    bincue_multi_bin: bool,
+    total_bytes: u64,
+) -> Arc<Mutex<ExportStatus>> {
+    let status = new_status(total_bytes);
+    let status_thread = Arc::clone(&status);
+
+    std::thread::spawn(move || {
+        let status2 = Arc::clone(&status_thread);
+        let status3 = Arc::clone(&status_thread);
+        let status_log = Arc::clone(&status_thread);
+        let progress_cb = move |bytes| {
+            if let Ok(mut s) = status2.lock() {
+                s.current_bytes = bytes;
+            }
+        };
+        let cancel_cb = move || status3.lock().map(|s| s.cancel_requested).unwrap_or(false);
+        let log_cb = |msg: &str| {
+            if let Ok(mut s) = status_log.lock() {
+                s.log_messages.push(msg.to_string());
+            }
+        };
+
+        let result = match format {
+            ExportFormat::Chd => export_whole_disk_chd(
+                &source,
+                None,
+                None,
+                &[],
+                &dest,
+                ChdProfile::Hd,
+                chd_options,
+                progress_cb,
+                cancel_cb,
+                log_cb,
+            ),
+            ExportFormat::ChdDvd => export_whole_disk_chd(
+                &source,
+                None,
+                None,
+                &[],
+                &dest,
+                ChdProfile::Dvd,
+                chd_options,
+                progress_cb,
+                cancel_cb,
+                log_cb,
+            ),
+            ExportFormat::ChdCd => {
+                export_whole_disk_chd_cd(&source, &dest, chd_options, cancel_cb, log_cb)
+            }
+            ExportFormat::BinCue => {
+                export_whole_disk_bincue(&source, &dest, bincue_multi_bin, cancel_cb, log_cb)
+            }
+            other => Err(anyhow::anyhow!(
+                "start_native_whole_disk_chd called with non-CHD format {:?}",
+                other
+            )),
+        };
+
         if let Ok(mut s) = status_thread.lock() {
             s.finished = true;
             if let Err(e) = result {

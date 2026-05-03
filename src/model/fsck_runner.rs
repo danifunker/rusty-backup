@@ -6,13 +6,13 @@
 //!
 //! Extracted from `gui/inspect_tab.rs` per §5 of `docs/codecleanup.md`.
 
-use std::fs::{File, OpenOptions};
-use std::io::BufReader;
+use std::fs::OpenOptions;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 
 use crate::fs::{open_editable_filesystem, open_filesystem, FsckResult, RepairReport};
+use crate::model::source_reader::{is_chd_path, open_read};
 
 /// Run `fsck` against the partition at `offset` inside `path`.
 ///
@@ -25,9 +25,7 @@ pub fn run_fsck(
     ptype: u8,
     type_string: Option<&str>,
 ) -> Result<Option<FsckResult>> {
-    let file =
-        File::open(path).with_context(|| format!("failed to open {} for fsck", path.display()))?;
-    let reader = BufReader::new(file);
+    let reader = open_read(path)?;
     let mut fs = open_filesystem(reader, offset, ptype, type_string)
         .with_context(|| "failed to open filesystem")?;
     match fs.fsck() {
@@ -43,6 +41,11 @@ pub fn run_repair(
     ptype: u8,
     type_string: Option<&str>,
 ) -> Result<RepairReport> {
+    if is_chd_path(path) {
+        return Err(anyhow!(
+            "repair is not supported for CHD-compressed sources (decompress to a raw image first)"
+        ));
+    }
     let file = OpenOptions::new()
         .read(true)
         .write(true)

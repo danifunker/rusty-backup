@@ -105,7 +105,7 @@ impl BrowseSession {
                 .map_err(|e| FilesystemError::Parse(format!("failed to open CHD: {e}")))?;
             return fs::open_filesystem(
                 chd_reader,
-                0,
+                self.partition_offset,
                 self.partition_type,
                 self.partition_type_string.as_deref(),
             );

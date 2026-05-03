@@ -7,11 +7,13 @@
 
 use std::fs::File;
 use std::io::BufReader;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::fs::{self, MinimumResult};
 use crate::os::SectorAlignedReader;
+use crate::rbformats::chd::ChdReader;
 
 /// Shared state between the GUI poll loop and the worker thread.
 pub struct MinSizeStatus {
@@ -36,17 +38,28 @@ impl MinSizeStatus {
     }
 }
 
-/// Inputs to `spawn`. The file handle is shared via `Arc<File>` so multiple
-/// concurrent calculations (one per partition) can clone independently.
+/// What the worker should read from. Most callers hand in a pre-opened
+/// (possibly elevated) `File`; CHD sources are addressed by path because we
+/// open a fresh `ChdReader` per worker.
+pub enum MinSizeSource {
+    /// Pre-opened raw file/device handle. `try_clone` is called per worker.
+    /// Set `use_sector_aligned` for raw block devices (`/dev/rdiskN`).
+    File {
+        file: Arc<File>,
+        use_sector_aligned: bool,
+    },
+    /// Path to a CHD container — the worker opens its own `ChdReader`.
+    Chd(PathBuf),
+}
+
+/// Inputs to `spawn`.
 pub struct MinSizeRequest {
-    pub file: Arc<File>,
+    pub source: MinSizeSource,
     pub partition_offset: u64,
     pub partition_type: u8,
     pub partition_type_string: Option<String>,
     pub partition_size: u64,
     pub partition_index: usize,
-    /// Use `SectorAlignedReader` for raw block devices (`/dev/rdiskN`).
-    pub use_sector_aligned: bool,
 }
 
 /// Spawn a worker thread; returns the shared status the GUI polls.
@@ -54,17 +67,6 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
     let status = Arc::new(Mutex::new(MinSizeStatus::new(req.partition_index)));
     let status_thread = Arc::clone(&status);
     thread::spawn(move || {
-        let clone = match req.file.try_clone() {
-            Ok(f) => f,
-            Err(e) => {
-                if let Ok(mut s) = status_thread.lock() {
-                    s.error = Some(format!("clone failed: {e}"));
-                    s.finished = true;
-                }
-                return;
-            }
-        };
-
         let progress_status = Arc::clone(&status_thread);
         let progress = move |phase: &str| {
             if let Ok(mut s) = progress_status.lock() {
@@ -72,26 +74,61 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
             }
         };
 
-        let result = if req.use_sector_aligned {
-            fs::partition_minimum_size(
-                SectorAlignedReader::new(clone),
-                req.partition_offset,
-                req.partition_type,
-                req.partition_type_string.as_deref(),
-                req.partition_size,
-                true,
-                &progress,
-            )
-        } else {
-            fs::partition_minimum_size(
-                BufReader::new(clone),
-                req.partition_offset,
-                req.partition_type,
-                req.partition_type_string.as_deref(),
-                req.partition_size,
-                true,
-                &progress,
-            )
+        let result = match req.source {
+            MinSizeSource::File {
+                file,
+                use_sector_aligned,
+            } => {
+                let clone = match file.try_clone() {
+                    Ok(f) => f,
+                    Err(e) => {
+                        if let Ok(mut s) = status_thread.lock() {
+                            s.error = Some(format!("clone failed: {e}"));
+                            s.finished = true;
+                        }
+                        return;
+                    }
+                };
+                if use_sector_aligned {
+                    fs::partition_minimum_size(
+                        SectorAlignedReader::new(clone),
+                        req.partition_offset,
+                        req.partition_type,
+                        req.partition_type_string.as_deref(),
+                        req.partition_size,
+                        true,
+                        &progress,
+                    )
+                } else {
+                    fs::partition_minimum_size(
+                        BufReader::new(clone),
+                        req.partition_offset,
+                        req.partition_type,
+                        req.partition_type_string.as_deref(),
+                        req.partition_size,
+                        true,
+                        &progress,
+                    )
+                }
+            }
+            MinSizeSource::Chd(path) => match ChdReader::open(&path) {
+                Ok(reader) => fs::partition_minimum_size(
+                    reader,
+                    req.partition_offset,
+                    req.partition_type,
+                    req.partition_type_string.as_deref(),
+                    req.partition_size,
+                    true,
+                    &progress,
+                ),
+                Err(e) => {
+                    if let Ok(mut s) = status_thread.lock() {
+                        s.error = Some(format!("open CHD failed: {e}"));
+                        s.finished = true;
+                    }
+                    return;
+                }
+            },
         };
 
         if let Ok(mut s) = status_thread.lock() {

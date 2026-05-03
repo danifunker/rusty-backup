@@ -8,8 +8,7 @@
 //!
 //! Source disk is opened read-only; the output is always a brand-new file.
 
-use std::fs::File;
-use std::io::{BufReader, Cursor};
+use std::io::{Cursor, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -17,6 +16,7 @@ use rusty_backup::fs::hfs::{create_blank_hfs_sized, HfsFilesystem};
 use rusty_backup::fs::hfs_clone::{
     clone_hfs_volume, emit_apm_disk_with_hfs, CloneReport, EmitReport,
 };
+use rusty_backup::model::source_reader::open_read;
 use rusty_backup::model::status::ExpandStatus;
 
 use super::progress::LogPanel;
@@ -414,17 +414,14 @@ fn run_expand(
     ));
 
     step("Reading source catalog…");
-    let source_file =
-        File::open(&source.source_path).map_err(|e| anyhow::anyhow!("open source: {e}"))?;
-    let source_buffered = BufReader::new(
-        source_file
-            .try_clone()
-            .map_err(|e| anyhow::anyhow!("clone source: {e}"))?,
-    );
-    let source_disk_size = source_file
-        .metadata()
-        .map(|m| m.len())
-        .map_err(|e| anyhow::anyhow!("source metadata: {e}"))?;
+    let mut source_buffered =
+        open_read(&source.source_path).map_err(|e| anyhow::anyhow!("open source: {e}"))?;
+    let source_disk_size = source_buffered
+        .seek(SeekFrom::End(0))
+        .map_err(|e| anyhow::anyhow!("source size: {e}"))?;
+    source_buffered
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| anyhow::anyhow!("source rewind: {e}"))?;
 
     let mut source_fs = HfsFilesystem::open(source_buffered, source.partition_offset)
         .map_err(|e| anyhow::anyhow!("open source HFS: {e}"))?;
@@ -498,7 +495,7 @@ fn run_expand(
         .open(&output_path)
         .map_err(|e| anyhow::anyhow!("create output: {e}"))?;
     let mut source_for_apm =
-        File::open(&source.source_path).map_err(|e| anyhow::anyhow!("reopen source: {e}"))?;
+        open_read(&source.source_path).map_err(|e| anyhow::anyhow!("reopen source: {e}"))?;
     let emit_report = {
         // emit_apm_disk_with_hfs needs Read+Write+Seek on the writer.
         let mut writer = output_file;
@@ -528,9 +525,8 @@ pub fn summarize_source(
     partition_offset: u64,
     partition_size: u64,
 ) -> anyhow::Result<ExpandSource> {
-    let file = File::open(source_path)
-        .map_err(|e| anyhow::anyhow!("open {}: {e}", source_path.display()))?;
-    let summary = HfsFilesystem::open(BufReader::new(file), partition_offset)
+    let reader = open_read(source_path)?;
+    let summary = HfsFilesystem::open(reader, partition_offset)
         .map_err(|e| anyhow::anyhow!("open HFS: {e}"))?
         .volume_summary();
     Ok(ExpandSource {
