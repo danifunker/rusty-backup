@@ -37,7 +37,6 @@ pub struct BackupTab {
     compression_type: CompressionType,
     chd_hd_control: ChdOptionsControl,
     chd_dvd_control: ChdOptionsControl,
-    chdman_available: bool,
     backup_running: bool,
     backup_progress: Option<Arc<Mutex<BackupProgress>>>,
     /// Auto-loaded partition info for the selected source
@@ -104,9 +103,41 @@ impl Default for BackupTab {
             split_size_mib: 4000,
             checksum_type: ChecksumType::Sha256,
             compression_type: CompressionType::Zstd,
-            chd_hd_control: ChdOptionsControl::new(ChdProfile::Hd),
-            chd_dvd_control: ChdOptionsControl::new(ChdProfile::Dvd),
-            chdman_available: false,
+            chd_hd_control: {
+                let mut ctl = ChdOptionsControl::new(ChdProfile::Hd);
+                // Restore last-used custom codec/hunk choices so users don't
+                // re-tune every launch. Defaults/MiSTer presets are pure
+                // functions so we don't persist mode — restored values land
+                // in the Custom slot, ready to apply once the user flips into
+                // Custom mode.
+                let cfg = UpdateConfig::load();
+                if let Some(spec) = cfg.last_chd_codecs.as_deref() {
+                    if let Ok(codecs) = parse_codec_string(spec) {
+                        ctl.custom.codecs = codecs;
+                    }
+                }
+                if let Some(hs) = cfg.last_chd_hunk_size {
+                    if hs % 512 == 0 {
+                        ctl.custom.hunk_size = hs;
+                    }
+                }
+                ctl
+            },
+            chd_dvd_control: {
+                let mut ctl = ChdOptionsControl::new(ChdProfile::Dvd);
+                let cfg = UpdateConfig::load();
+                if let Some(spec) = cfg.last_chd_codecs.as_deref() {
+                    if let Ok(codecs) = parse_codec_string(spec) {
+                        ctl.custom.codecs = codecs;
+                    }
+                }
+                if let Some(hs) = cfg.last_chd_hunk_size {
+                    if hs % 2048 == 0 {
+                        ctl.custom.hunk_size = hs;
+                    }
+                }
+                ctl
+            },
             backup_running: false,
             backup_progress: None,
             source_partitions: Vec::new(),
@@ -127,40 +158,6 @@ impl Default for BackupTab {
 }
 
 impl BackupTab {
-    /// Set chdman availability (detected at app startup).
-    pub fn set_chdman_available(&mut self, available: bool) {
-        self.chdman_available = available;
-        // Don't default to CHD if not available
-        if !available
-            && (self.compression_type == CompressionType::Chd
-                || self.compression_type == CompressionType::Dvd)
-        {
-            self.compression_type = CompressionType::Zstd;
-        }
-        // Restore last-used codec/hunk choices from disk so users don't have
-        // to retune every launch. Failures are silent — the in-struct chdman
-        // defaults remain valid.
-        // Restore last-used custom codec/hunk choices so users don't re-tune
-        // every launch. Defaults/MiSTer presets are pure functions so we
-        // don't persist mode — restored values land in the Custom slot, ready
-        // to apply as soon as the user flips into Custom mode.
-        let cfg = UpdateConfig::load();
-        if let Some(spec) = cfg.last_chd_codecs.as_deref() {
-            if let Ok(codecs) = parse_codec_string(spec) {
-                self.chd_hd_control.custom.codecs = codecs;
-                self.chd_dvd_control.custom.codecs = codecs;
-            }
-        }
-        if let Some(hs) = cfg.last_chd_hunk_size {
-            if hs % 512 == 0 {
-                self.chd_hd_control.custom.hunk_size = hs;
-            }
-            if hs % 2048 == 0 {
-                self.chd_dvd_control.custom.hunk_size = hs;
-            }
-        }
-    }
-
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext, progress: &mut ProgressState) {
         // Poll background backup thread
         self.poll_progress(ctx, progress);
@@ -321,45 +318,15 @@ impl BackupTab {
             // Output format
             ui.horizontal(|ui| {
                 ui.label("Output Format:");
-                let chd_label = if self.chdman_available {
-                    "CHD (chdman)"
-                } else {
-                    "CHD (chdman not found)"
-                };
-                ui.add_enabled(
-                    self.chdman_available,
-                    egui::RadioButton::new(
-                        self.compression_type == CompressionType::Chd,
-                        chd_label,
-                    ),
-                )
-                .clicked()
-                .then(|| {
-                    if self.chdman_available {
-                        self.compression_type = CompressionType::Chd;
-                    }
-                });
-                ui.add_enabled(
-                    self.chdman_available,
-                    egui::RadioButton::new(
-                        self.compression_type == CompressionType::Dvd,
-                        "DVD CHD",
-                    ),
-                )
-                .clicked()
-                .then(|| {
-                    if self.chdman_available {
-                        self.compression_type = CompressionType::Dvd;
-                    }
-                });
-                ui.radio_value(&mut self.compression_type, CompressionType::Vhd, "VHD")
-                    .clicked();
-                ui.radio_value(&mut self.compression_type, CompressionType::Zstd, "zstd")
-                    .clicked();
-                if ui
-                    .radio_value(&mut self.compression_type, CompressionType::None, "None")
-                    .clicked()
-                {}
+                ui.radio_value(
+                    &mut self.compression_type,
+                    CompressionType::Chd,
+                    "CHD (Hard Disk)",
+                );
+                ui.radio_value(&mut self.compression_type, CompressionType::Dvd, "DVD CHD");
+                ui.radio_value(&mut self.compression_type, CompressionType::Vhd, "VHD");
+                ui.radio_value(&mut self.compression_type, CompressionType::Zstd, "zstd");
+                ui.radio_value(&mut self.compression_type, CompressionType::None, "None");
             });
 
             // CHD codec / hunk-size knobs (only visible when a CHD profile is selected)

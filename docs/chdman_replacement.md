@@ -362,29 +362,34 @@ directions, with multi-bin BIN/CUE as a feature beyond chdman. ✅
 
 ---
 
-## Stage 10 — purge the chdman external dependency
+## Stage 10 — purge the chdman external dependency ✅
 
-Now that nothing calls `chdman`, rip out the detection, config, and gating.
+Now that nothing calls `chdman`, ripped out the detection, config, and gating.
 
-- [ ] Delete `chdman_path` from `UpdateConfig` in `src/update.rs`. Migrate the on-disk config
-      file with a version bump or just ignore the field on read (serde handles missing fields
-      with `#[serde(default)]`).
-- [ ] Delete `detect_chdman` from `src/rbformats/chd.rs` (Stage 3 already removed callers, so
-      this just removes the dead function).
-- [ ] Remove `chdman_available: bool` field, `set_chdman_available`, and all conditional UI
+- [x] Deleted `chdman_path` from `UpdateConfig` in `src/update.rs`. Serde tolerates the
+      missing field on existing config files; no migration needed.
+- [x] `detect_chdman` was already gone (removed in Stage 3 along with the last shell-out
+      callers).
+- [x] Removed `chdman_available: bool` field, `set_chdman_available`, and all conditional UI
       strings ("CHD (chdman)", "chdman not found") from:
-      - `src/gui/backup_tab.rs` (lines 32, 99, 121–122, 289–303)
-      - `src/gui/optical_tab.rs` (lines 51, 75, 83–84, 268, 286, 300–302)
-- [ ] Remove the startup detection block in `src/gui/mod.rs` (lines 26, 133–144).
-- [ ] Remove the entire "chdman Configuration" section from `src/gui/settings_dialog.rs`
-      (lines ~7, 26, 31–37, 112, 123–126).
-- [ ] Update `src/rbformats/README.md` to drop the "Requires chdman on PATH" column and the
-      `chd.rs` description's "external chdman tool" wording.
-- [ ] Update `CLAUDE.md` if it references chdman as an external dep.
-- [ ] `grep -rn chdman src/` should return zero hits in production code (test fixtures may
-      keep references for cross-tool compat tests).
+      - `src/gui/backup_tab.rs` — output-format radio now offers "CHD (Hard Disk)" / "DVD
+        CHD" unconditionally; the codec-restore-from-config logic moved into
+        `Default::default()`.
+      - `src/gui/optical_tab.rs` — CHD radio is always enabled; codec-restore moved into
+        `Default::default()` as well.
+- [x] Removed the startup detection block in `src/gui/mod.rs` (the `chdman_available = true`
+      pin + the two `set_chdman_available` calls + the "CHD compression available" log line).
+- [x] Removed the entire "chdman Configuration" section from `src/gui/settings_dialog.rs`
+      (the path field, browse button, and load/save plumbing).
+- [x] Updated `src/rbformats/README.md`: `chd.rs` description now says "via the in-process
+      `libchdman-rs` crate"; the format table notes "Native via `libchdman-rs` (no external
+      tool)" instead of "Requires `chdman` on PATH".
+- [x] `CLAUDE.md` and `PROJECT-SPEC.md` had no chdman references.
+- [x] `grep -rn chdman src/` only matches test names (`defaults_match_chdman_*`) and a
+      "Beyond chdman:" tooltip explaining a feature that goes past chdman's behaviour. No
+      runtime references remain.
 
-**Done when:** the codebase is `chdman`-free.
+**Done when:** the codebase is `chdman`-free. ✅
 
 ---
 

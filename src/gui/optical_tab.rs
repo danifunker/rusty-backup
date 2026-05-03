@@ -55,7 +55,6 @@ pub struct OpticalTab {
     convert_progress: Option<Arc<Mutex<ConvertProgress>>>,
     browse_view: OpticalDiscBrowseView,
     chd_cd_control: ChdOptionsControl,
-    chdman_available: bool,
     /// Track source changes for auto-detection
     prev_drive_idx: Option<usize>,
     prev_image_path: Option<PathBuf>,
@@ -79,8 +78,29 @@ impl Default for OpticalTab {
             convert_running: false,
             convert_progress: None,
             browse_view: OpticalDiscBrowseView::default(),
-            chd_cd_control: ChdOptionsControl::new(ChdProfile::Cd),
-            chdman_available: false,
+            chd_cd_control: {
+                let mut ctl = ChdOptionsControl::new(ChdProfile::Cd);
+                // Restore last-used CD codec/hunk choice. CD codecs ("cdlz"
+                // etc.) are distinct from HD codecs, so the persisted value
+                // only round-trips safely for the matching profile.
+                let cfg = UpdateConfig::load();
+                if let Some(spec) = cfg.last_chd_codecs.as_deref() {
+                    if let Ok(codecs) = parse_codec_string(spec) {
+                        if codecs
+                            .iter()
+                            .all(|c| codec_label(*c).starts_with("cd") || *c == 0)
+                        {
+                            ctl.custom.codecs = codecs;
+                        }
+                    }
+                }
+                if let Some(hs) = cfg.last_chd_hunk_size {
+                    if hs % 2448 == 0 {
+                        ctl.custom.hunk_size = hs;
+                    }
+                }
+                ctl
+            },
             prev_drive_idx: None,
             prev_image_path: None,
         }
@@ -88,32 +108,6 @@ impl Default for OpticalTab {
 }
 
 impl OpticalTab {
-    pub fn set_chdman_available(&mut self, available: bool) {
-        self.chdman_available = available;
-        if !available && self.output_format == OutputFormat::Chd {
-            self.output_format = OutputFormat::Iso;
-        }
-        // Restore last-used CD codec/hunk choice. CD codecs ("cdlz" etc.)
-        // are distinct from HD codecs, so the persisted value only round-trips
-        // safely for the matching profile.
-        let cfg = UpdateConfig::load();
-        if let Some(spec) = cfg.last_chd_codecs.as_deref() {
-            if let Ok(codecs) = parse_codec_string(spec) {
-                if codecs
-                    .iter()
-                    .all(|c| codec_label(*c).starts_with("cd") || *c == 0)
-                {
-                    self.chd_cd_control.custom.codecs = codecs;
-                }
-            }
-        }
-        if let Some(hs) = cfg.last_chd_hunk_size {
-            if hs % 2448 == 0 {
-                self.chd_cd_control.custom.hunk_size = hs;
-            }
-        }
-    }
-
     fn persist_chd_options(&self, opts: &ChdOptions) {
         let mut cfg = UpdateConfig::load();
         cfg.last_chd_codecs = Some(
@@ -305,7 +299,7 @@ impl OpticalTab {
                     Action::Rip => vec![
                         (OutputFormat::Iso, "ISO", true),
                         (OutputFormat::BinCue, "BIN/CUE", true),
-                        (OutputFormat::Chd, "CHD", self.chdman_available),
+                        (OutputFormat::Chd, "CHD", true),
                     ],
                     Action::Convert => {
                         let source_format = self.disc_info.as_ref().map(|i| &i.format);
@@ -323,7 +317,7 @@ impl OpticalTab {
                             (
                                 OutputFormat::Chd,
                                 "CHD",
-                                self.chdman_available && source_format != Some(&DiscFormat::Chd),
+                                source_format != Some(&DiscFormat::Chd),
                             ),
                         ]
                     }
@@ -336,11 +330,6 @@ impl OpticalTab {
                     );
                     if response.clicked() {
                         self.output_format = *fmt;
-                    }
-                    if !enabled && *fmt == OutputFormat::Chd && !self.chdman_available {
-                        response.on_disabled_hover_text(
-                            "chdman not found. Configure path in Settings.",
-                        );
                     }
                 }
             });
@@ -760,7 +749,7 @@ fn run_conversion(
         }
         (Some(DiscFormat::Iso), OutputFormat::Chd)
         | (Some(DiscFormat::BinCue), OutputFormat::Chd) => {
-            let chdman_input = if source_format == Some(DiscFormat::BinCue)
+            let cue_input = if source_format == Some(DiscFormat::BinCue)
                 && input_path
                     .extension()
                     .map(|e| e.eq_ignore_ascii_case("bin"))
@@ -770,7 +759,7 @@ fn run_conversion(
             } else {
                 input_path.to_path_buf()
             };
-            convert::to_chd(&chdman_input, output_path, chd_options, progress)
+            convert::to_chd(&cue_input, output_path, chd_options, progress)
         }
         (Some(DiscFormat::Chd), OutputFormat::BinCue) => {
             convert::chd_to_bincue(input_path, output_path, progress)

@@ -129,18 +129,9 @@ impl Default for RustyBackupApp {
             dialog
         };
 
-        // CHD support is always available now (libchdman-rs is linked in).
-        // Stage 10 of the chdman-removal plan will rip out the remaining
-        // `chdman_available` plumbing across the GUI; for Stage 3 we just
-        // pin it to true so existing call sites keep working.
-        let chdman_available = true;
-        log.info("CHD compression available (libchdman-rs)");
-
-        let mut backup_tab = BackupTab::default();
-        backup_tab.set_chdman_available(chdman_available);
+        let backup_tab = BackupTab::default();
 
         let mut optical_tab = OpticalTab::default();
-        optical_tab.set_chdman_available(chdman_available);
         optical_tab.refresh_drives();
         if optical_tab.drive_count() > 0 {
             log.info(format!(
