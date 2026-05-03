@@ -113,6 +113,8 @@ pub struct InspectTab {
     repair_context: Option<(u64, u8, Option<String>)>,
     /// "Expand HFS Volume…" dialog (classic HFS only).
     expand_hfs_dialog: Option<ExpandHfsDialog>,
+    /// CHD info popup text. `Some` while the popup is open.
+    chd_info_text: Option<String>,
 }
 
 impl Default for InspectTab {
@@ -159,6 +161,7 @@ impl Default for InspectTab {
             repair_report: None,
             repair_context: None,
             expand_hfs_dialog: None,
+            chd_info_text: None,
         }
     }
 }
@@ -377,6 +380,18 @@ impl InspectTab {
                 .clicked()
             {
                 self.init_resize_popup(ctx);
+            }
+
+            // CHD Info — visible whenever the source is a .chd file
+            if let Some(chd_path) = self.chd_image_path.clone() {
+                if ui.button("CHD Info").clicked() {
+                    match rusty_backup::rbformats::chd::format_chd_info(&chd_path) {
+                        Ok(text) => self.chd_info_text = Some(text),
+                        Err(e) => {
+                            ctx.log.error(format!("CHD Info failed: {}", e));
+                        }
+                    }
+                }
             }
 
             // Close button — releases the device/image and clears results
@@ -2057,6 +2072,9 @@ impl InspectTab {
         // Fsck results popup
         self.render_fsck_popup(ui, ctx);
 
+        // CHD Info popup
+        self.render_chd_info_popup(ui);
+
         // Expand-HFS dialog
         if let Some(dlg) = &mut self.expand_hfs_dialog {
             let still_open = dlg.show(ui.ctx(), ctx.log);
@@ -2146,6 +2164,35 @@ impl InspectTab {
     }
 
     /// Render the filesystem check results popup.
+    fn render_chd_info_popup(&mut self, ui: &mut egui::Ui) {
+        let Some(text) = self.chd_info_text.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut buf = text.clone();
+        egui::Window::new("CHD Info")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(560.0)
+            .default_height(420.0)
+            .show(ui.ctx(), |ui| {
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut buf)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(20)
+                                .interactive(true),
+                        );
+                    });
+            });
+        if !open {
+            self.chd_info_text = None;
+        }
+    }
+
     fn render_fsck_popup(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
         if !self.show_fsck_popup {
             return;
@@ -2610,7 +2657,12 @@ impl InspectTab {
                 );
             }
             "chd" | "chd-dvd" => {
-                // CHD-compressed backup — open directly via ChdReader (on-demand decompression)
+                // CHD-compressed backup — open directly via ChdReader (on-demand
+                // decompression). Editing flows through `chd_edit::ChdEditSession`
+                // (diff-against-parent for compressed, in-place for uncompressed),
+                // so no `archive_edit_ctx` is set here. NOTE: backup metadata.json
+                // checksum / compressed_files entries are NOT auto-updated after
+                // a CHD edit yet — that lives on the Phase 2 follow-up TODO.
                 ctx.log.info(format!(
                     "Browsing partition {} from CHD: {}",
                     part_index, data_file,
@@ -2622,16 +2674,7 @@ impl InspectTab {
                     partition_type_string.clone(),
                     None,
                 );
-                // Set archive edit context for decompress→edit→recompress flow
-                self.browse_view.set_archive_edit_context(
-                    data_path,
-                    compression_type_str,
-                    part_meta.original_size_bytes,
-                    part_meta.compacted,
-                    metadata_path,
-                    part_index,
-                    checksum_type,
-                );
+                let _ = (metadata_path, checksum_type, compression_type_str);
             }
             "woz" => {
                 ctx.log.info(format!(

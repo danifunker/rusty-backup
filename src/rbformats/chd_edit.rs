@@ -20,6 +20,7 @@
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use libchdman_rs::hd::HdImage;
@@ -235,6 +236,79 @@ impl Drop for ChdEditSession {
                 log::error!("ChdEditSession dropped with unflushed write: {e}");
             }
         }
+    }
+}
+
+/// `Read + Write + Seek` handle backed by an `Arc<Mutex<ChdEditSession>>`.
+///
+/// The filesystem opener (`fs::open_filesystem` / `open_editable_filesystem`)
+/// takes ownership of its reader, but during edit mode we want one
+/// long-lived `ChdEditSession` shared across multiple opens (browse refresh,
+/// staged-edit replay, etc.). `ChdEditHandle` clones the `Arc` cheaply and
+/// locks per I/O call. The mutex is uncontended in practice — the GUI is
+/// single-threaded — but Rust requires the `Send` bound for the worker
+/// threads that run apply / flatten.
+#[derive(Clone)]
+pub struct ChdEditHandle {
+    inner: Arc<Mutex<ChdEditSession>>,
+}
+
+impl ChdEditHandle {
+    pub fn new(session: ChdEditSession) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(session)),
+        }
+    }
+
+    pub fn from_arc(inner: Arc<Mutex<ChdEditSession>>) -> Self {
+        Self { inner }
+    }
+
+    pub fn arc(&self) -> Arc<Mutex<ChdEditSession>> {
+        Arc::clone(&self.inner)
+    }
+
+    pub fn logical_size(&self) -> u64 {
+        self.inner
+            .lock()
+            .expect("ChdEditSession poisoned")
+            .logical_size()
+    }
+
+    /// Force a flush of the cached sector. Call before dropping the last
+    /// handle if you can't tolerate a silent error in `Drop`.
+    pub fn flush(&self) -> io::Result<()> {
+        self.inner.lock().expect("ChdEditSession poisoned").flush()
+    }
+}
+
+impl Read for ChdEditHandle {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner
+            .lock()
+            .expect("ChdEditSession poisoned")
+            .read(buf)
+    }
+}
+
+impl Write for ChdEditHandle {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner
+            .lock()
+            .expect("ChdEditSession poisoned")
+            .write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.lock().expect("ChdEditSession poisoned").flush()
+    }
+}
+
+impl Seek for ChdEditHandle {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.inner
+            .lock()
+            .expect("ChdEditSession poisoned")
+            .seek(pos)
     }
 }
 

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rusty_backup::clonezilla::block_cache::{PartcloneBlockCache, PartcloneBlockReader};
@@ -15,6 +15,9 @@ use rusty_backup::model::browse_session::BrowseSession;
 use rusty_backup::model::edit_queue::{self, EditQueue, StagedEdit};
 use rusty_backup::model::status::ExtractionProgress;
 use rusty_backup::partition;
+use rusty_backup::rbformats::chd_edit::{
+    self, is_compressed_chd, make_backup_copy, ChdEditSession,
+};
 
 const MAX_PREVIEW_SIZE: usize = 1024 * 1024; // 1 MB max file preview
 
@@ -75,6 +78,8 @@ pub struct BrowseView {
     fsck_result: Option<rusty_backup::fs::FsckResult>,
     /// Whether to show the fsck results popup.
     show_fsck_popup: bool,
+    /// CHD info popup text. `Some` while the popup is open.
+    chd_info_text: Option<String>,
     /// Whether to show debug-level fsck messages.
     show_fsck_debug: bool,
     /// Whether to show the repair confirmation dialog.
@@ -111,6 +116,36 @@ pub struct BrowseView {
     show_staging_errors: bool,
     /// Extraction parameters awaiting overwrite confirmation.
     pending_extraction: Option<PendingExtraction>,
+    /// Live CHD edit-mode state. Present while editing a CHD via
+    /// [`chd_edit::ChdEditSession`] (diff-against-parent for compressed,
+    /// in-place for uncompressed). The `Arc<Mutex<ChdEditSession>>` itself
+    /// lives on `self.session.chd_edit_session`; this struct just holds the
+    /// paths needed to flatten / clean up on exit.
+    chd_edit: Option<ChdEditState>,
+    /// Background flatten progress (compressed CHD apply): merges the diff
+    /// into a fresh compressed CHD that overwrites the parent.
+    chd_flatten_progress: Option<Arc<Mutex<ChdFlattenProgress>>>,
+}
+
+/// State carried for the duration of a CHD edit-mode session.
+struct ChdEditState {
+    /// Original CHD file the user is editing (and which `flatten_to_parent`
+    /// will overwrite on exit).
+    parent_path: PathBuf,
+    /// Companion diff file. `Some` for compressed CHDs; `None` when editing
+    /// an uncompressed CHD in place.
+    diff_path: Option<PathBuf>,
+}
+
+/// Background flatten progress for compressed CHD edit-apply. Mirrors
+/// [`ArchiveEditProgress`] but lives in the GUI crate so the worker thread
+/// can update it without pulling chd_edit into model/.
+struct ChdFlattenProgress {
+    current: u64,
+    total: u64,
+    finished: bool,
+    error: Option<String>,
+    cancel_requested: bool,
 }
 
 /// Captured state from `start_extraction` so the extraction can resume after
@@ -210,6 +245,7 @@ impl Default for BrowseView {
             blessed_folder: None,
             fsck_result: None,
             show_fsck_popup: false,
+            chd_info_text: None,
             show_fsck_debug: false,
             show_repair_confirm: false,
             repair_report: None,
@@ -224,6 +260,8 @@ impl Default for BrowseView {
             staging_errors: Vec::new(),
             show_staging_errors: false,
             pending_extraction: None,
+            chd_edit: None,
+            chd_flatten_progress: None,
         }
     }
 }
@@ -252,23 +290,20 @@ impl BrowseView {
         // Editing is supported for regular files (not Clonezilla/streaming)
         self.edit_supported = true;
 
-        // Container formats (WOZ, CHD) can't be edited in-place — route
-        // through the decompress→edit→recompress flow automatically.
+        // WOZ images still go through the decompress→edit→recompress
+        // archive flow (no in-place / diff support). CHDs use the lighter
+        // chd_edit path: nothing to set up here — the edit-mode toggle
+        // calls `enter_chd_edit_mode` which opens a `ChdEditSession`
+        // (diff-against-parent for compressed, in-place for uncompressed).
         let ext = source_path
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
-        if ext == "woz" || ext == "chd" {
-            let original_size = match ext.as_str() {
-                "woz" => rusty_backup::rbformats::woz::WozReader::open(&source_path)
-                    .map(|r| r.len())
-                    .unwrap_or(0),
-                "chd" => std::fs::metadata(&source_path)
-                    .map(|m| m.len())
-                    .unwrap_or(0),
-                _ => 0,
-            };
+        if ext == "woz" {
+            let original_size = rusty_backup::rbformats::woz::WozReader::open(&source_path)
+                .map(|r| r.len())
+                .unwrap_or(0);
             log::info!(
                 "Container edit context set for {} ({} decoded bytes)",
                 source_path.display(),
@@ -276,7 +311,7 @@ impl BrowseView {
             );
             self.archive_edit_ctx = Some(ArchiveEditContext {
                 archive_path: source_path.clone(),
-                compression_type: ext.clone(),
+                compression_type: "woz".to_string(),
                 original_size,
                 compacted: false,
                 metadata_path: PathBuf::new(),
@@ -481,6 +516,10 @@ impl BrowseView {
         }
         self.archive_edit_ctx = None;
         self.archive_edit_progress = None;
+        // Drop any live CHD edit session and remove its diff. The parent
+        // CHD is left untouched; user's `.chd_backup` is preserved.
+        self.discard_chd_edit_session();
+        self.chd_flatten_progress = None;
     }
 
     pub fn is_active(&self) -> bool {
@@ -545,8 +584,9 @@ impl BrowseView {
 
             // Edit mode toggle
             if self.edit_supported {
-                let busy =
-                    self.extraction_progress.is_some() || self.archive_edit_progress.is_some();
+                let busy = self.extraction_progress.is_some()
+                    || self.archive_edit_progress.is_some()
+                    || self.chd_flatten_progress.is_some();
                 ui.add_space(8.0);
                 let edit_btn = if self.edit_mode {
                     egui::Button::new("Edit Mode ON")
@@ -556,11 +596,22 @@ impl BrowseView {
                 let btn = ui.add_enabled(!busy, edit_btn);
                 if btn.clicked() {
                     log::info!(
-                        "Edit Mode clicked: archive_edit_ctx={}, edit_mode={}",
+                        "Edit Mode clicked: archive_edit_ctx={}, chd_edit={}, edit_mode={}",
                         self.archive_edit_ctx.is_some(),
+                        self.chd_edit.is_some(),
                         self.edit_mode
                     );
-                    if self.archive_edit_ctx.is_some() {
+                    if self.is_chd_source() {
+                        // CHD editing: open ChdEditSession on entry; flatten
+                        // the diff back into the parent on exit.
+                        if !self.edit_mode {
+                            self.enter_chd_edit_mode();
+                        } else if !self.staged_edits.is_empty() {
+                            self.show_unsaved_dialog = true;
+                        } else {
+                            self.exit_edit_mode();
+                        }
+                    } else if self.archive_edit_ctx.is_some() {
                         // Archive editing: toggle triggers decompress/recompress
                         if !self.edit_mode {
                             log::info!("Starting archive extract for editing");
@@ -608,6 +659,19 @@ impl BrowseView {
                     },
                     Err(e) => {
                         self.error = Some(format!("Failed to open filesystem: {}", e));
+                    }
+                }
+            }
+
+            if self.is_chd_source() {
+                if let Some(chd_path) = self.session.source_path.clone() {
+                    if ui.button("CHD Info").clicked() {
+                        match rusty_backup::rbformats::chd::format_chd_info(&chd_path) {
+                            Ok(text) => self.chd_info_text = Some(text),
+                            Err(e) => {
+                                self.error = Some(format!("CHD Info failed: {}", e));
+                            }
+                        }
                     }
                 }
             }
@@ -670,11 +734,33 @@ impl BrowseView {
             }
         }
 
+        // CHD flatten progress bar (compressed CHD edit-apply)
+        self.poll_chd_flatten(ui);
+        if let Some(progress) = &self.chd_flatten_progress {
+            if let Ok(p) = progress.lock() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Flattening CHD...");
+                    if p.total > 0 {
+                        let frac = p.current as f32 / p.total as f32;
+                        ui.add(egui::ProgressBar::new(frac).show_percentage());
+                    }
+                });
+                ui.ctx().request_repaint();
+            }
+        }
+
         // Info banner while editing an archive
         if self.edit_mode && self.archive_edit_ctx.is_some() {
             ui.colored_label(
                 egui::Color32::from_rgb(100, 160, 255),
                 "Editing temporary copy. Click 'Apply Edits' to write changes.",
+            );
+        }
+        if self.edit_mode && self.chd_edit.is_some() {
+            ui.colored_label(
+                egui::Color32::from_rgb(100, 160, 255),
+                "Editing CHD via diff. Click 'Apply Edits' to flush, or exit Edit Mode to merge into the CHD.",
             );
         }
 
@@ -749,6 +835,7 @@ impl BrowseView {
 
         // Fsck results popup window
         self.render_fsck_popup(ui);
+        self.render_chd_info_popup(ui);
         self.render_tree_popup(ui);
     }
 
@@ -1511,11 +1598,16 @@ impl BrowseView {
         }
 
         if phase == "Extracting" {
-            // Extraction done — switch source to temp file, enable editing
+            // Extraction done — switch source to temp file, enable editing.
+            // `partition_offset` is preserved: the temp file is byte-identical
+            // to the archive's decompressed content, so a partition that lived
+            // at offset N inside the original (e.g. an HFS volume inside a
+            // whole-disk APM CHD) is at offset N in the temp too. Resetting
+            // it to 0 here used to break edits of any non-single-partition
+            // container.
             if let Some(temp) = temp_path {
                 self.archive_temp_path = Some(temp.clone());
                 self.session.source_path = Some(temp);
-                self.session.partition_offset = 0;
                 self.session.zstd_cache = None;
                 self.edit_mode = true;
 
@@ -1539,10 +1631,12 @@ impl BrowseView {
                 }
             }
         } else {
-            // Compression done — re-open original archive for browsing
+            // Compression done — re-open original archive for browsing.
+            // Preserve `partition_offset` for the same reason as above: the
+            // recompressed archive's logical bytes match the temp file, so
+            // the partition is still at the original offset.
             if let Some(ctx) = &self.archive_edit_ctx {
                 self.session.source_path = Some(ctx.archive_path.clone());
-                self.session.partition_offset = 0;
                 self.archive_temp_path = None;
 
                 match self.session.open() {
@@ -1566,6 +1660,201 @@ impl BrowseView {
                 }
             }
         }
+    }
+
+    /// True if the current session is editing a CHD file (extension match —
+    /// the chd_edit path covers both compressed and uncompressed CHDs).
+    fn is_chd_source(&self) -> bool {
+        self.session
+            .source_path
+            .as_ref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("chd"))
+            .unwrap_or(false)
+    }
+
+    /// Diff path for a compressed CHD edit session: sibling `<stem>.edit-diff.chd`.
+    fn diff_path_for(parent: &Path) -> PathBuf {
+        let parent_dir = parent.parent().unwrap_or(Path::new("."));
+        let stem = parent
+            .file_stem()
+            .map(|s| s.to_os_string())
+            .unwrap_or_default();
+        let mut diff_name = stem;
+        diff_name.push(".edit-diff.chd");
+        parent_dir.join(diff_name)
+    }
+
+    /// Open a [`ChdEditSession`] for the current source CHD and install it
+    /// on `self.session.chd_edit_session` so subsequent reads / writes flow
+    /// through the diff (or in-place for uncompressed). Reloads the
+    /// filesystem from the live session so the browser reflects the
+    /// current state. On failure leaves edit_mode false and reports the
+    /// error via `edit_result`.
+    fn enter_chd_edit_mode(&mut self) {
+        let Some(parent_path) = self.session.source_path.clone() else {
+            self.edit_result = Some("Error: no source path".to_string());
+            return;
+        };
+
+        // Backup copy first — preserves the original CHD as `<name>.chd_backup`
+        // so the user has an easy revert point. No-op if the backup already
+        // exists from a previous edit session.
+        if let Err(e) = make_backup_copy(&parent_path) {
+            self.edit_result = Some(format!("Error creating backup: {e}"));
+            return;
+        }
+
+        let compressed = match is_compressed_chd(&parent_path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.edit_result = Some(format!("Error inspecting CHD: {e}"));
+                return;
+            }
+        };
+
+        let (session, diff_path) = if compressed {
+            let diff = Self::diff_path_for(&parent_path);
+            let res = if diff.exists() {
+                ChdEditSession::reopen_with_diff(&parent_path, &diff)
+            } else {
+                ChdEditSession::open_with_diff(&parent_path, &diff)
+            };
+            match res {
+                Ok(s) => (s, Some(diff)),
+                Err(e) => {
+                    self.edit_result = Some(format!("Error opening CHD diff: {e}"));
+                    return;
+                }
+            }
+        } else {
+            match ChdEditSession::open_uncompressed(&parent_path) {
+                Ok(s) => (s, None),
+                Err(e) => {
+                    self.edit_result = Some(format!("Error opening CHD: {e}"));
+                    return;
+                }
+            }
+        };
+
+        let arc = Arc::new(Mutex::new(session));
+        self.session.chd_edit_session = Some(Arc::clone(&arc));
+        self.chd_edit = Some(ChdEditState {
+            parent_path,
+            diff_path,
+        });
+        self.edit_mode = true;
+
+        // Reload the filesystem through the session so any pre-existing
+        // diff content is visible.
+        self.invalidate_all_caches();
+        log::info!(
+            "Entered CHD edit mode (compressed={compressed}, diff={})",
+            self.chd_edit
+                .as_ref()
+                .and_then(|s| s.diff_path.as_ref())
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<none>".into())
+        );
+    }
+
+    /// Discard the live CHD edit session, deleting the diff (if any). The
+    /// parent CHD is left untouched. Caller is responsible for any UI state
+    /// transitions (clearing `edit_mode`, etc.).
+    fn discard_chd_edit_session(&mut self) {
+        self.session.chd_edit_session = None;
+        if let Some(state) = self.chd_edit.take() {
+            if let Some(diff) = state.diff_path {
+                if diff.exists() {
+                    let _ = std::fs::remove_file(&diff);
+                }
+            }
+        }
+    }
+
+    /// Apply the current CHD edit session by flattening the diff back into
+    /// the parent CHD. For uncompressed CHDs there's no diff — writes were
+    /// already in place — so this just drops the session and reloads.
+    /// Compressed CHDs spawn a background worker that calls
+    /// `flatten_to_parent`; progress is polled by `poll_chd_flatten`.
+    fn start_chd_flatten(&mut self) {
+        let Some(state) = self.chd_edit.take() else {
+            return;
+        };
+
+        // Drop the session so the diff handle is released before flatten
+        // re-opens it via `reopen_with_diff`.
+        self.session.chd_edit_session = None;
+
+        let Some(diff_path) = state.diff_path else {
+            // Uncompressed: writes already landed in the parent. Just reload.
+            self.invalidate_all_caches();
+            self.edit_result = Some("Changes saved successfully.".to_string());
+            return;
+        };
+
+        let parent_path = state.parent_path;
+        let total = std::fs::metadata(&diff_path).map(|m| m.len()).unwrap_or(0);
+
+        let progress = Arc::new(Mutex::new(ChdFlattenProgress {
+            current: 0,
+            total,
+            finished: false,
+            error: None,
+            cancel_requested: false,
+        }));
+        let progress_thread = Arc::clone(&progress);
+        std::thread::spawn(move || {
+            let cancel = {
+                let p = Arc::clone(&progress_thread);
+                move || p.lock().map(|g| g.cancel_requested).unwrap_or(false)
+            };
+            let result = chd_edit::flatten_to_parent(
+                &parent_path,
+                &diff_path,
+                None,
+                &mut |bytes| {
+                    if let Ok(mut p) = progress_thread.lock() {
+                        p.current = bytes;
+                    }
+                },
+                &cancel,
+                &mut |msg| log::info!("{msg}"),
+            );
+            if let Ok(mut p) = progress_thread.lock() {
+                p.finished = true;
+                if let Err(e) = result {
+                    p.error = Some(format!("{e:#}"));
+                }
+            }
+        });
+        self.chd_flatten_progress = Some(progress);
+    }
+
+    /// Poll the background CHD flatten worker. On completion, reload the
+    /// filesystem from the freshly-merged parent CHD.
+    fn poll_chd_flatten(&mut self, ui: &egui::Ui) {
+        let progress_arc = match &self.chd_flatten_progress {
+            Some(p) => Arc::clone(p),
+            None => return,
+        };
+        let Ok(p) = progress_arc.lock() else { return };
+        if !p.finished {
+            ui.ctx().request_repaint();
+            return;
+        }
+        let error = p.error.clone();
+        drop(p);
+        self.chd_flatten_progress = None;
+
+        if let Some(err) = error {
+            self.edit_result = Some(format!("Error flattening CHD: {err}"));
+            return;
+        }
+        // Re-open the now-replaced parent CHD for browsing.
+        self.invalidate_all_caches();
+        self.edit_result = Some("Changes saved successfully.".to_string());
     }
 
     /// Render the edit mode toolbar with action buttons and free space.
@@ -2401,6 +2690,14 @@ impl BrowseView {
                     if ui.button("Discard Edits").clicked() {
                         self.staged_edits.clear();
                         self.show_unsaved_dialog = false;
+                        // For CHD edit sessions, "Discard" must also drop
+                        // the diff so prior Apply Edits aren't flattened
+                        // into the parent. Without this, a discard followed
+                        // by exit_edit_mode would still flatten any work
+                        // that was previously written to the diff.
+                        if self.chd_edit.is_some() {
+                            self.discard_chd_edit_session();
+                        }
                         if self.pending_close {
                             self.close();
                         } else {
@@ -2513,7 +2810,9 @@ impl BrowseView {
         self.pending_delete = None;
         self.staged_edits.clear();
 
-        if self.archive_edit_ctx.is_some() {
+        if self.chd_edit.is_some() {
+            self.start_chd_flatten();
+        } else if self.archive_edit_ctx.is_some() {
             self.start_archive_compress();
         }
     }
@@ -2603,6 +2902,34 @@ impl BrowseView {
     }
 
     /// Render the filesystem check results popup.
+    fn render_chd_info_popup(&mut self, ui: &mut egui::Ui) {
+        let Some(text) = self.chd_info_text.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut buf = text;
+        egui::Window::new("CHD Info")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(560.0)
+            .default_height(420.0)
+            .show(ui.ctx(), |ui| {
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut buf)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(20),
+                        );
+                    });
+            });
+        if !open {
+            self.chd_info_text = None;
+        }
+    }
+
     fn render_fsck_popup(&mut self, ui: &mut egui::Ui) {
         if !self.show_fsck_popup {
             return;

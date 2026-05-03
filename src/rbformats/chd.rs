@@ -48,6 +48,202 @@ impl ChdReader {
     }
 }
 
+/// Render a human-readable summary of a CHD file, mimicking the layout of
+/// `chdman info`. Used by the GUI's "CHD Info" button so users can inspect
+/// version, codecs, hunk/unit size, SHA1s, and metadata tags without leaving
+/// the app.
+pub fn format_chd_info(path: &Path) -> Result<String> {
+    use libchdman_rs::cd;
+    use libchdman_rs::codec::codec_name;
+
+    let path_str = path
+        .to_str()
+        .with_context(|| format!("CHD path is not valid UTF-8: {}", path.display()))?;
+    let chd = libchdman_rs::Chd::open(path_str, false, None)
+        .map_err(|e| anyhow::anyhow!("failed to open CHD {}: {:?}", path.display(), e))?;
+    let info = chd
+        .info()
+        .map_err(|e| anyhow::anyhow!("failed to read CHD info: {:?}", e))?;
+
+    let file_size = fs::metadata(path).map(|m| m.len()).ok();
+    let total_units = if info.unit_bytes > 0 {
+        info.logical_bytes / info.unit_bytes as u64
+    } else {
+        0
+    };
+
+    let mut out = String::new();
+    out.push_str(&format!("Input file:   {}\n", path.display()));
+    let kind = if info.is_cd {
+        "CD"
+    } else if info.is_dvd {
+        "DVD"
+    } else if info.is_gd {
+        "GD"
+    } else if info.is_hd {
+        "HD"
+    } else if info.is_av {
+        "AV"
+    } else {
+        "Unknown"
+    };
+    out.push_str(&format!("Type:         {}\n", kind));
+    out.push_str(&format!("File Version: {}\n", info.version));
+    out.push_str(&format!(
+        "Logical size: {} bytes ({})\n",
+        format_with_commas(info.logical_bytes),
+        format_size_human(info.logical_bytes),
+    ));
+    out.push_str(&format!(
+        "Hunk Size:    {} bytes\n",
+        format_with_commas(info.hunk_bytes as u64)
+    ));
+    out.push_str(&format!(
+        "Total Hunks:  {}\n",
+        format_with_commas(info.hunk_count as u64)
+    ));
+    out.push_str(&format!(
+        "Unit Size:    {} bytes\n",
+        format_with_commas(info.unit_bytes as u64)
+    ));
+    out.push_str(&format!(
+        "Total Units:  {}\n",
+        format_with_commas(total_units)
+    ));
+
+    out.push_str("Compression:  ");
+    if info.compressed {
+        let parts: Vec<String> = info
+            .codecs
+            .iter()
+            .filter(|c| **c != 0)
+            .map(|c| {
+                let label = super::chd_options::codec_label(*c);
+                let long = codec_name(*c).unwrap_or("");
+                if long.is_empty() {
+                    label
+                } else {
+                    format!("{} ({})", label, long)
+                }
+            })
+            .collect();
+        if parts.is_empty() {
+            out.push_str("none");
+        } else {
+            out.push_str(&parts.join(", "));
+        }
+    } else {
+        out.push_str("none");
+    }
+    out.push('\n');
+
+    if let Some(fs) = file_size {
+        out.push_str(&format!(
+            "CHD size:     {} bytes ({})\n",
+            format_with_commas(fs),
+            format_size_human(fs),
+        ));
+        if info.logical_bytes > 0 {
+            let ratio = (fs as f64 / info.logical_bytes as f64) * 100.0;
+            out.push_str(&format!("Ratio:        {:.1}%\n", ratio));
+        }
+    }
+
+    out.push_str(&format!("SHA1:         {}\n", hex_lower(&info.sha1)));
+    if info.version >= 4 {
+        out.push_str(&format!("Data SHA1:    {}\n", hex_lower(&info.raw_sha1)));
+    }
+    if info.has_parent {
+        out.push_str(&format!("Parent SHA1:  {}\n", hex_lower(&info.parent_sha1)));
+    }
+
+    if !info.metadata_tags.is_empty() {
+        out.push_str("Metadata:\n");
+        for (tag, index) in &info.metadata_tags {
+            out.push_str(&format!(
+                "  Tag='{}'  Index={}\n",
+                fourcc_to_string(*tag),
+                index,
+            ));
+        }
+    }
+
+    if info.is_cd || info.is_gd {
+        match cd::list_tracks(&chd) {
+            Ok(tracks) if !tracks.is_empty() => {
+                out.push_str("Tracks:\n");
+                for t in &tracks {
+                    out.push_str(&format!(
+                        "  Track {:>2}: {:?}  frames={}  pregap={}  postgap={}  subcode={:?}\n",
+                        t.track_num,
+                        t.track_type,
+                        format_with_commas(t.frames as u64),
+                        t.pregap,
+                        t.postgap,
+                        t.subcode_type,
+                    ));
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                out.push_str(&format!("Tracks:       (failed to read: {:?})\n", e));
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+fn fourcc_to_string(code: u32) -> String {
+    let bytes = [
+        ((code >> 24) & 0xff) as u8,
+        ((code >> 16) & 0xff) as u8,
+        ((code >> 8) & 0xff) as u8,
+        (code & 0xff) as u8,
+    ];
+    if bytes.iter().all(|b| (0x20..=0x7e).contains(b)) {
+        String::from_utf8(bytes.to_vec()).unwrap()
+    } else {
+        format!("{:08x}", code)
+    }
+}
+
+fn hex_lower(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for byte in b {
+        s.push_str(&format!("{:02x}", byte));
+    }
+    s
+}
+
+fn format_with_commas(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out.chars().rev().collect()
+}
+
+fn format_size_human(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.2} GiB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.2} MiB", b / MIB)
+    } else if b >= KIB {
+        format!("{:.2} KiB", b / KIB)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
 /// Probe a CHD file to determine if it is a CD CHD (vs HD/DVD).
 ///
 /// CD CHDs store 2352-byte raw sectors + 96-byte subcode = 2448-byte frames,

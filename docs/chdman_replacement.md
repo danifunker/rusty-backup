@@ -418,9 +418,67 @@ Now that nothing calls `chdman`, ripped out the detection, config, and gating.
   someone asks.
 - AV/laserdisc CHDs — same.
 - CHD parent/child diff CHDs — libchdman-rs supports them (`Chd::open` parent arg) but we
-  have no current use case.
+  have no current use case. *Update:* now used by `src/rbformats/chd_edit.rs` for in-place
+  editing of compressed CHDs (browse-view edit mode). Backups still don't use them.
 - Switching codecs on an existing backup CHD — `libchdman_rs::copy::copy()` does this but
   we don't currently surface a "re-compress this archive" UI. Easy follow-up.
+
+---
+
+## Open question — per-partition CHD backups
+
+**Status:** flagged 2026-05-03, needs investigation before next major backup-format work.
+
+Today the backup folder layout emits one CHD per partition (`partition-0.chd`,
+`partition-1.chd`, …) alongside `metadata.json` + `mbr.bin` / `gpt.json`. CHD was designed
+around whole-disk images (geometry record from the disk, partition table inside the
+hunk-mapped data, SHA1 over the entire logical stream). A bare partition's bytes are a
+valid CHD logically — it's just a flat block stream — but it discards the context CHD was
+built for, and "a CHD that's actually one HFS partition" isn't something `chdman info` /
+MAME / standard tooling expect to see in the wild.
+
+Concerns to think through before deciding:
+
+- **Cross-tool legibility.** Other CHD-aware tools (chdman, MAME, CHDMan-MAME GUIs,
+  retro emulators) assume a CHD is a whole disk or whole optical disc. Our per-partition
+  CHDs round-trip fine inside rusty-backup but won't behave like the user expects when
+  inspected externally — `chdman info` will read codecs/SHA1 happily but the geometry
+  record we synthesize is for "the partition pretending to be a disk" rather than a real
+  drive.
+- **Partition tables, alignment, and DDR/APM context** are stored separately in
+  `metadata.json` / `mbr.bin` / `gpt.json`. A whole-disk CHD per backup folder would carry
+  this implicitly inside the CHD, so a single file would be self-describing. With multiple
+  per-partition CHDs we have the "metadata.json is the source of truth, files are loose
+  payloads" situation that loses portability.
+- **CHD's own diff-against-parent flow is whole-disk-shaped.** Editing
+  `partition-0.chd` via `chd_edit::flatten_to_parent` works, but the "natural"
+  CHD edit story — open whole-disk CHD, write to partition N inside it — assumes
+  whole-disk layout.
+- **Existing user expectations.** Users who already have rusty-backup folders on disk
+  rely on the current per-partition layout. A switch to whole-disk-CHD backups is a
+  format break; either we keep both or we migrate.
+- **Restore path.** `reconstruct_disk_from_backup` already streams partitions back into a
+  whole disk image at their correct offsets — switching the source from N CHDs to one
+  CHD-with-partition-table is a non-trivial refactor (offset maths and partition-table
+  patching come from `metadata.json` today, would come from the CHD's own MBR/GPT/APM
+  if we go whole-disk).
+
+Deliverables when we revisit:
+
+- [ ] Decide: stay per-partition, switch to whole-disk CHD per backup, or support both
+      (e.g. `chd-disk` vs `chd-partition` compression types in `metadata.json`).
+- [ ] If switching: define new `metadata.json` shape (partition list now references byte
+      ranges *inside* one CHD instead of separate files).
+- [ ] If switching: migration path for existing backup folders — probably a one-shot
+      "upgrade" command rather than auto-migration on open.
+- [ ] Update restore + inspect + browse-view CHD code paths so a single whole-disk CHD is
+      a first-class source.
+- [ ] Re-evaluate `chd_edit.rs` flow: editing one partition inside a whole-disk CHD is
+      cleaner than today's per-partition flatten (no metadata.json checksum side-effect
+      issue — the partition is just a byte range inside one file).
+- [ ] Cross-tool sanity: `chdman info <whole-disk-backup.chd>` should report sensible
+      output, and the file should be openable in MAME if the user wanted to (even if we
+      don't officially support that).
 
 ## Risks to watch
 

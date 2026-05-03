@@ -58,6 +58,8 @@ pub struct OpticalTab {
     /// Track source changes for auto-detection
     prev_drive_idx: Option<usize>,
     prev_image_path: Option<PathBuf>,
+    /// CHD info popup text. `Some` while the popup is open.
+    chd_info_text: Option<String>,
 }
 
 impl Default for OpticalTab {
@@ -103,6 +105,7 @@ impl Default for OpticalTab {
             },
             prev_drive_idx: None,
             prev_image_path: None,
+            chd_info_text: None,
         }
     }
 }
@@ -262,7 +265,49 @@ impl OpticalTab {
                 if ui.button("Close Disc").clicked() {
                     self.close_disc();
                 }
+                if let Some(path) = self.image_file_path.clone() {
+                    if path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.eq_ignore_ascii_case("chd"))
+                        .unwrap_or(false)
+                        && ui.button("CHD Info").clicked()
+                    {
+                        match rusty_backup::rbformats::chd::format_chd_info(&path) {
+                            Ok(text) => self.chd_info_text = Some(text),
+                            Err(e) => {
+                                log.error(format!("CHD Info failed: {}", e));
+                            }
+                        }
+                    }
+                }
             });
+        }
+
+        // CHD Info popup
+        if let Some(text) = self.chd_info_text.clone() {
+            let mut open = true;
+            let mut buf = text;
+            egui::Window::new("CHD Info")
+                .open(&mut open)
+                .resizable(true)
+                .default_width(560.0)
+                .default_height(420.0)
+                .show(ui.ctx(), |ui| {
+                    egui::ScrollArea::both()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut buf)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(20),
+                            );
+                        });
+                });
+            if !open {
+                self.chd_info_text = None;
+            }
         }
 
         ui.separator();

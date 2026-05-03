@@ -24,6 +24,7 @@ use crate::fs::filesystem::{EditableFilesystem, Filesystem, FilesystemError};
 use crate::fs::zstd_stream::{ZstdStreamCache, ZstdStreamReader};
 use crate::fs::{self};
 use crate::rbformats::chd::ChdReader;
+use crate::rbformats::chd_edit::{ChdEditHandle, ChdEditSession};
 
 /// Parameters and caches that locate a filesystem to browse.
 #[derive(Default, Clone)]
@@ -46,6 +47,11 @@ pub struct BrowseSession {
     pub partclone_cache: Option<Arc<Mutex<PartcloneBlockCache>>>,
     /// Streaming zstd cache for native zstd backups.
     pub zstd_cache: Option<Arc<Mutex<ZstdStreamCache>>>,
+    /// Live CHD edit session. When set, every `open` and `open_editable`
+    /// call clones this handle as the backing reader instead of touching
+    /// `source_path` — the GUI's CHD edit-mode flow installs it for the
+    /// duration of editing and clears it on apply/discard.
+    pub chd_edit_session: Option<Arc<Mutex<ChdEditSession>>>,
 }
 
 impl BrowseSession {
@@ -55,6 +61,18 @@ impl BrowseSession {
 
     /// Open a read-only filesystem from this session.
     pub fn open(&self) -> Result<Box<dyn Filesystem>, FilesystemError> {
+        // Live CHD edit session — read-through preserves any unflushed
+        // writes the editor has staged in memory.
+        if let Some(arc) = &self.chd_edit_session {
+            let handle = ChdEditHandle::from_arc(Arc::clone(arc));
+            return fs::open_filesystem(
+                handle,
+                self.partition_offset,
+                self.partition_type,
+                self.partition_type_string.as_deref(),
+            );
+        }
+
         // Partclone cache short-circuits all other paths.
         if let Some(cache) = &self.partclone_cache {
             let reader = PartcloneBlockReader::new(Arc::clone(cache));
@@ -178,9 +196,23 @@ impl BrowseSession {
 
     /// Open the filesystem read-write for editing operations.
     ///
-    /// Unlike [`open`](Self::open) this requires a real `source_path` —
-    /// partclone / zstd / preopen paths are read-only.
+    /// Unlike [`open`](Self::open) this requires a real `source_path` (or a
+    /// live CHD edit session) — partclone / zstd / preopen paths are
+    /// read-only.
     pub fn open_editable(&self) -> Result<Box<dyn EditableFilesystem>, FilesystemError> {
+        // Live CHD edit session: writes go through the diff (compressed
+        // parent) or in-place (uncompressed). No File handle to source_path
+        // is opened.
+        if let Some(arc) = &self.chd_edit_session {
+            let handle = ChdEditHandle::from_arc(Arc::clone(arc));
+            return fs::open_editable_filesystem(
+                handle,
+                self.partition_offset,
+                self.partition_type,
+                self.partition_type_string.as_deref(),
+            );
+        }
+
         let path = self
             .source_path
             .as_ref()
