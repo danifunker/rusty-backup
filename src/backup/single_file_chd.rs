@@ -6,9 +6,12 @@
 //!
 //! Scope of the initial implementation (intentionally bounded):
 //!
-//! - **MBR sources only.** GPT and APM fall back to the legacy per-partition
-//!   layout. Adding GPT support requires emitting the alternate header at
-//!   the end of the synthesised disk; APM needs equivalent treatment.
+//! - **MBR / GPT / APM sources supported.** GPT rebuilds the primary header
+//!   at LBA 1 and the backup header at the last 33 LBAs from the parsed
+//!   `Gpt` so any tweaks the parser normalises (e.g. CRCs) are reflected
+//!   in the synthesised image. APM reads the disk's head region (DDR +
+//!   partition map + drivers) verbatim from the source up to the first
+//!   real partition.
 //! - **Source layout preserved.** Partition offsets and sizes equal those
 //!   on the source disk; no resize at backup time. Backup-time resize is a
 //!   follow-up and will plug in here via a `SizePlan` argument.
@@ -88,9 +91,14 @@ pub struct SingleFileChdResult {
 }
 
 /// True if `inputs` describes a source layout we can currently handle in
-/// single-file CHD mode. MBR only for now.
+/// single-file CHD mode. MBR / GPT / APM are supported; superfloppy still
+/// falls back to the per-partition path because there is no partition table
+/// to embed at sector 0.
 pub fn is_supported(inputs_table: &PartitionTable) -> bool {
-    matches!(inputs_table, PartitionTable::Mbr(_))
+    matches!(
+        inputs_table,
+        PartitionTable::Mbr(_) | PartitionTable::Gpt { .. } | PartitionTable::Apm(_)
+    )
 }
 
 /// Run the single-file CHD backup. Caller-supplied callbacks follow the
@@ -106,10 +114,8 @@ pub fn run(
 ) -> Result<SingleFileChdResult> {
     if !is_supported(inputs.partition_table) {
         anyhow::bail!(
-            "single-file CHD backup currently supports MBR sources only; \
-             this disk uses {} — pick zstd/raw, or use the per-partition CHD \
-             flow on a future build that supports {} for single-file.",
-            inputs.partition_table.type_name(),
+            "single-file CHD backup does not support {} sources yet — \
+             pick zstd/raw, or use the per-partition CHD flow.",
             inputs.partition_table.type_name(),
         );
     }
@@ -117,18 +123,23 @@ pub fn run(
     let mut builder = DiskImageStreamBuilder::new(inputs.source_size);
     let mut partition_ranges: Vec<ChdPartitionRange> = Vec::new();
 
-    // Segment 0: the partition table sectors verbatim. Putting the MBR at
-    // offset 0 is what makes the resulting CHD a real disk image rather
-    // than an opaque container.
-    builder
-        .add_segment(
-            0,
-            inputs.source_partition_table_bytes.len() as u64,
-            Box::new(std::io::Cursor::new(
-                inputs.source_partition_table_bytes.to_vec(),
-            )),
-        )
-        .map_err(|e| anyhow!("disk-image stream rejected MBR segment: {}", e))?;
+    // Head segment: bytes that live before the first partition. Differs by
+    // table type — see `build_head_segments`. Putting these at offset 0 is
+    // what makes the resulting CHD a real disk image rather than an opaque
+    // container.
+    let (head_segments, backup_gpt_tail) = build_head_segments(
+        inputs.source_file,
+        inputs.source_partition_table_bytes,
+        inputs.partition_table,
+        inputs.partitions,
+        inputs.source_size,
+        log_cb,
+    )?;
+    for (offset, length, reader) in head_segments {
+        builder
+            .add_segment(offset, length, reader)
+            .map_err(|e| anyhow!("disk-image stream rejected head segment at {offset}: {e}"))?;
+    }
 
     for part in inputs.partitions {
         // Skip partitions the user filtered out.
@@ -176,6 +187,14 @@ pub fn run(
             length: part_length,
             checksum_sha256: String::new(), // filled in after CHD write
         });
+    }
+
+    // GPT backup header lives at the last 33 LBAs of the synthesised disk.
+    // Add it as the final segment so it's emitted after every partition.
+    if let Some((offset, length, reader)) = backup_gpt_tail {
+        builder
+            .add_segment(offset, length, reader)
+            .map_err(|e| anyhow!("disk-image stream rejected backup-GPT tail segment: {}", e))?;
     }
 
     let mut stream = builder.build();
@@ -243,6 +262,127 @@ pub fn run(
         container_sha1,
         partition_ranges,
     })
+}
+
+/// Type alias for a stream segment: `(offset_in_disk, length, reader)`.
+type Segment = (u64, u64, Box<dyn Read + Send>);
+
+/// Build the segments that sit before the first partition (the "head"
+/// region) and, for GPT only, the backup-GPT tail segment.
+///
+/// - **MBR**: head = the 512-byte MBR captured by the caller.
+/// - **GPT**: head = protective MBR (verbatim) + freshly-built primary GPT
+///   header + entries (33 sectors at LBAs 1..=33). Tail = backup GPT at
+///   the last 33 LBAs.
+/// - **APM**: head = bytes 0..first_partition_offset read verbatim from
+///   the source. This covers the Driver Descriptor Record, the partition
+///   map itself, any Apple_Driver* partitions, and the unused tail before
+///   the first user partition.
+fn build_head_segments(
+    source_file: &File,
+    source_partition_table_bytes: &[u8],
+    table: &PartitionTable,
+    partitions: &[PartitionInfo],
+    source_size: u64,
+    log_cb: &mut dyn FnMut(&str),
+) -> Result<(Vec<Segment>, Option<Segment>)> {
+    match table {
+        PartitionTable::Mbr(_) => {
+            let head: Segment = (
+                0,
+                source_partition_table_bytes.len() as u64,
+                Box::new(std::io::Cursor::new(source_partition_table_bytes.to_vec())),
+            );
+            log_cb("  table: MBR sector embedded at offset 0");
+            Ok((vec![head], None))
+        }
+        PartitionTable::Gpt { gpt, .. } => {
+            // Source partition table bytes hold the protective MBR (at
+            // LBA 0). Emit it verbatim, then rebuild the primary + backup
+            // GPT from the parsed `Gpt`. Rebuilding (rather than copying
+            // raw bytes) ensures CRCs are correct and that any header
+            // fields the parser has normalised land in the output.
+            let mut head: Vec<Segment> = Vec::new();
+            head.push((
+                0,
+                source_partition_table_bytes.len() as u64,
+                Box::new(std::io::Cursor::new(source_partition_table_bytes.to_vec())),
+            ));
+
+            let total_sectors = source_size / 512;
+            let primary = gpt.build_primary_gpt(total_sectors);
+            let primary_len = primary.len() as u64;
+            head.push((512, primary_len, Box::new(std::io::Cursor::new(primary))));
+
+            let backup_bytes = gpt.build_backup_gpt(total_sectors);
+            let backup_len = backup_bytes.len() as u64;
+            let backup_offset = source_size.checked_sub(backup_len).ok_or_else(|| {
+                anyhow!("source size {} smaller than backup GPT region", source_size)
+            })?;
+            let tail: Segment = (
+                backup_offset,
+                backup_len,
+                Box::new(std::io::Cursor::new(backup_bytes)),
+            );
+
+            log_cb(&format!(
+                "  table: GPT — protective MBR + primary GPT (33 sectors) at offset 0; \
+                 backup GPT at offset {backup_offset}",
+            ));
+            Ok((head, Some(tail)))
+        }
+        PartitionTable::Apm(_) => {
+            // Read sectors 0..first_partition_offset verbatim. APM keeps
+            // its DDR + partition map + driver partitions inside that
+            // region, and reproducing them by hand would require parsing +
+            // re-emitting every Apple_Driver* extension; copying bytes is
+            // both simpler and faithful.
+            let head_end = partitions
+                .iter()
+                .filter(|p| {
+                    !matches!(
+                        p.partition_type_string.as_deref(),
+                        Some("Apple_partition_map")
+                    )
+                })
+                .map(|p| p.start_lba * 512)
+                .min()
+                .unwrap_or_else(|| {
+                    // No non-map partitions? Cover at least the first 64
+                    // sectors so the partition map is still embedded.
+                    64 * 512
+                });
+            let head_end = head_end.min(source_size);
+            if head_end == 0 {
+                anyhow::bail!("APM head region computed as 0 bytes — partition table looks empty");
+            }
+            // Read eagerly into a Vec rather than handing the stream a
+            // `File` clone: on Unix, `try_clone` uses dup(), and dup'd fds
+            // share the file offset. The partition loop builds its own
+            // clones below and seeks them — those seeks would race with
+            // the head reader's lazy reads. Eager-read sidesteps the
+            // problem and keeps APM heads (~tens of KiB) cheap.
+            let mut clone = source_file
+                .try_clone()
+                .context("clone source for APM head")?;
+            clone.seek(SeekFrom::Start(0)).context("seek to APM head")?;
+            let mut head_buf = vec![0u8; head_end as usize];
+            clone
+                .read_exact(&mut head_buf)
+                .context("read APM head region")?;
+            log_cb(&format!(
+                "  table: APM — head region {} bytes (DDR + partition map + drivers) read verbatim",
+                head_end
+            ));
+            Ok((
+                vec![(0, head_end, Box::new(std::io::Cursor::new(head_buf)))],
+                None,
+            ))
+        }
+        PartitionTable::None { .. } => {
+            anyhow::bail!("single-file CHD: superfloppy sources are not supported on this path")
+        }
+    }
 }
 
 /// Build a `Read` covering one partition's full source extent.
@@ -507,16 +647,210 @@ mod tests {
     }
 
     #[test]
-    fn is_supported_only_returns_true_for_mbr() {
-        // Build a synthetic MBR via our test helper and confirm.
+    fn is_supported_accepts_mbr() {
         let mbr_bytes = build_test_mbr(64);
         let mut br = std::io::Cursor::new(mbr_bytes.to_vec());
         let table = PartitionTable::detect(&mut br).expect("detect MBR");
         assert!(is_supported(&table));
-        // GPT/APM/None constructions live behind module-private fields, so
-        // covering them via constructed values would couple this test to
-        // their internals. The MBR-positive path here is enough — the
-        // negative branch in `run()` is exercised whenever the matched
-        // variant isn't `Mbr`.
+    }
+
+    /// Build a tiny GPT-formatted disk and round-trip it through
+    /// `single_file_chd::run`, then assert that the resulting CHD has both
+    /// the protective MBR + primary GPT at the start and a backup GPT at
+    /// the last 33 LBAs.
+    #[test]
+    fn end_to_end_round_trip_gpt() {
+        use crate::partition::gpt::{build_minimal_gpt, Gpt, Guid};
+
+        const TOTAL_SECTORS: u64 = 8192; // 4 MiB
+        const SECTOR_SIZE: u64 = 512;
+        let total_bytes = TOTAL_SECTORS * SECTOR_SIZE;
+
+        // One Linux-data partition spanning LBAs 64..4095 (~2 MiB).
+        let linux_data_guid = Guid::from_string("0FC63DAF-8483-4772-8E79-3D69D8477DE4").unwrap();
+        let gpt = build_minimal_gpt(
+            &[(linux_data_guid, 64, 4095, "linux".to_string())],
+            total_bytes,
+        );
+
+        // Synthesise the on-disk image: protective MBR at 0, primary GPT
+        // at LBA 1.., partition at LBA 64, backup GPT at last 33 LBAs.
+        let mut data = vec![0u8; total_bytes as usize];
+        let prot_mbr = Gpt::build_protective_mbr(TOTAL_SECTORS);
+        data[..512].copy_from_slice(&prot_mbr);
+        let primary = gpt.build_primary_gpt(TOTAL_SECTORS);
+        data[512..512 + primary.len()].copy_from_slice(&primary);
+        // Fill the partition body with a recognizable pattern.
+        let part_offset = 64 * 512;
+        let part_end = (4095 + 1) * 512;
+        for i in 0..(part_end - part_offset) as usize {
+            data[part_offset as usize + i] = ((i % 251) as u8).wrapping_add(1);
+        }
+        let backup = gpt.build_backup_gpt(TOTAL_SECTORS);
+        let backup_offset = (total_bytes - backup.len() as u64) as usize;
+        data[backup_offset..backup_offset + backup.len()].copy_from_slice(&backup);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_path = tmp.path().join("source.img");
+        std::fs::write(&source_path, &data).unwrap();
+        let source_file = File::open(&source_path).unwrap();
+
+        let mut br = BufReader::new(source_file.try_clone().unwrap());
+        let table = PartitionTable::detect(&mut br).expect("detect GPT");
+        assert!(matches!(table, PartitionTable::Gpt { .. }));
+        let partitions = table.partitions();
+
+        let output_base = tmp.path().join("disk");
+        let mbr_bytes: [u8; 512] = data[..512].try_into().unwrap();
+        let mut log_buf: Vec<String> = Vec::new();
+        let mut log_cb = |s: &str| log_buf.push(s.to_string());
+        let mut progress_cb = |_: u64| {};
+        let cancel = || false;
+        let result = run(
+            SingleFileChdInputs {
+                source_file: &source_file,
+                source_size: total_bytes,
+                source_partition_table_bytes: &mbr_bytes,
+                partition_table: &table,
+                partitions: &partitions,
+                partition_filter: None,
+                sector_by_sector: false,
+                chd_options: None,
+                is_dvd: false,
+                output_base: &output_base,
+            },
+            &mut progress_cb,
+            &cancel,
+            &mut log_cb,
+        )
+        .expect("GPT single-file CHD backup");
+        assert_eq!(result.container_logical_size, total_bytes);
+
+        // Read back via ChdReader and assert the resulting image parses as
+        // GPT — that's the strongest assertion the synthesised image is
+        // tool-compatible (CRCs, headers, backup header all valid).
+        let chd_path = tmp.path().join("disk.chd");
+        let chd_reader = ChdReader::open(&chd_path).unwrap();
+        let mut br = BufReader::new(chd_reader);
+        let detected = PartitionTable::detect(&mut br).expect("detect after round-trip");
+        assert!(
+            matches!(detected, PartitionTable::Gpt { .. }),
+            "round-tripped CHD should still parse as GPT, got: {}",
+            detected.type_name(),
+        );
+    }
+
+    /// Tiny APM source (DDR + 2 partition map entries + an HFS-shaped data
+    /// partition) — confirms the head region is copied verbatim and the
+    /// partition data lands at its declared offset in the CHD.
+    #[test]
+    fn end_to_end_round_trip_apm() {
+        const TOTAL_BLOCKS: u64 = 8192;
+        const SECTOR: u64 = 512;
+        let total_bytes = TOTAL_BLOCKS * SECTOR;
+
+        let mut data = vec![0u8; total_bytes as usize];
+        // DDR at block 0.
+        const DDR_SIG: u16 = 0x4552; // 'ER'
+        data[0..2].copy_from_slice(&DDR_SIG.to_be_bytes());
+        data[2..4].copy_from_slice(&512u16.to_be_bytes());
+        data[4..8].copy_from_slice(&(TOTAL_BLOCKS as u32).to_be_bytes());
+
+        // Two APM entries at blocks 1 and 2.
+        const ENTRY_SIG: u16 = 0x504D; // 'PM'
+        let entries = [
+            ("Apple", "Apple_partition_map", 1u32, 2u32),
+            ("MacOS", "Apple_HFS", 64u32, 4096u32),
+        ];
+        for (i, (name, ptype, start, count)) in entries.iter().enumerate() {
+            let off = (1 + i) * 512;
+            data[off..off + 2].copy_from_slice(&ENTRY_SIG.to_be_bytes());
+            data[off + 4..off + 8].copy_from_slice(&(entries.len() as u32).to_be_bytes());
+            data[off + 8..off + 12].copy_from_slice(&start.to_be_bytes());
+            data[off + 12..off + 16].copy_from_slice(&count.to_be_bytes());
+            // Name: 32-byte C string at offset 16
+            let nb = name.as_bytes();
+            data[off + 16..off + 16 + nb.len()].copy_from_slice(nb);
+            // Type: 32-byte C string at offset 48
+            let tb = ptype.as_bytes();
+            data[off + 48..off + 48 + tb.len()].copy_from_slice(tb);
+            data[off + 84..off + 88].copy_from_slice(&count.to_be_bytes());
+            data[off + 88..off + 92].copy_from_slice(&0x33u32.to_be_bytes());
+        }
+
+        // Pattern bytes in the data partition (block 64 .. 64+4096).
+        let part_offset = 64usize * 512;
+        let part_len = 4096usize * 512;
+        for i in 0..part_len {
+            data[part_offset + i] = ((i % 251) as u8).wrapping_add(2);
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_path = tmp.path().join("source.img");
+        std::fs::write(&source_path, &data).unwrap();
+        let source_file = File::open(&source_path).unwrap();
+
+        let mut br = BufReader::new(source_file.try_clone().unwrap());
+        let table = PartitionTable::detect(&mut br).expect("detect APM");
+        assert!(matches!(table, PartitionTable::Apm(_)));
+        let partitions = table.partitions();
+
+        let output_base = tmp.path().join("disk");
+        let mbr_bytes: [u8; 512] = data[..512].try_into().unwrap();
+        let mut log_buf: Vec<String> = Vec::new();
+        let mut log_cb = |s: &str| log_buf.push(s.to_string());
+        let mut progress_cb = |_: u64| {};
+        let cancel = || false;
+        let result = run(
+            SingleFileChdInputs {
+                source_file: &source_file,
+                source_size: total_bytes,
+                source_partition_table_bytes: &mbr_bytes,
+                partition_table: &table,
+                partitions: &partitions,
+                partition_filter: None,
+                sector_by_sector: true, // exercises raw passthrough for HFS-typed partition
+                chd_options: None,
+                is_dvd: false,
+                output_base: &output_base,
+            },
+            &mut progress_cb,
+            &cancel,
+            &mut log_cb,
+        )
+        .expect("APM single-file CHD backup");
+        assert_eq!(result.container_logical_size, total_bytes);
+
+        // Reopen + verify the head region (DDR + APM entries) round-trips
+        // and the data partition still has its pattern at the declared
+        // offset.
+        let chd_path = tmp.path().join("disk.chd");
+        let mut reader = ChdReader::open(&chd_path).unwrap();
+        let mut readback = vec![0u8; total_bytes as usize];
+        reader.read_exact(&mut readback).unwrap();
+        // log_buf retained for in-test diagnostics if this regresses.
+        let _ = &log_buf;
+
+        // First two blocks must equal source verbatim.
+        assert_eq!(
+            &readback[..1024],
+            &data[..1024],
+            "DDR + first APM entry mismatch"
+        );
+        // Partition data must equal source.
+        assert_eq!(
+            &readback[part_offset..part_offset + part_len],
+            &data[part_offset..part_offset + part_len],
+            "APM partition body mismatch",
+        );
+
+        // And the table re-parses as APM.
+        let mut br2 = BufReader::new(std::io::Cursor::new(readback));
+        let detected = PartitionTable::detect(&mut br2).expect("detect after round-trip");
+        assert!(
+            matches!(detected, PartitionTable::Apm(_)),
+            "round-tripped CHD should still parse as APM, got {}",
+            detected.type_name(),
+        );
     }
 }

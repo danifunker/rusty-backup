@@ -358,33 +358,61 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             }
         }
         PartitionTable::Gpt { gpt, .. } => {
-            format::export_gpt(gpt, &mbr_bytes, &backup_folder)?;
-            log(
-                &progress,
-                LogLevel::Info,
-                "Exported GPT (gpt.json + mbr.bin)",
-            );
-            if let Err(e) = format::export_gpt_bin(&mut source, &backup_folder) {
-                log(
-                    &progress,
-                    LogLevel::Warning,
-                    format!("Failed to export gpt.bin: {e}"),
-                );
-            } else {
+            if single_file_chd_planned {
+                // Raw GPT sectors live inside disk.chd; only emit the JSON
+                // sidecar for fast inspect.
+                let json =
+                    serde_json::to_string_pretty(gpt).context("failed to serialize GPT to JSON")?;
+                std::fs::write(backup_folder.join("gpt.json"), json)
+                    .context("failed to write gpt.json")?;
                 log(
                     &progress,
                     LogLevel::Info,
-                    "Exported raw GPT sectors (gpt.bin)",
+                    "Exported GPT (gpt.json only — raw sectors live in disk.chd)",
                 );
+            } else {
+                format::export_gpt(gpt, &mbr_bytes, &backup_folder)?;
+                log(
+                    &progress,
+                    LogLevel::Info,
+                    "Exported GPT (gpt.json + mbr.bin)",
+                );
+                if let Err(e) = format::export_gpt_bin(&mut source, &backup_folder) {
+                    log(
+                        &progress,
+                        LogLevel::Warning,
+                        format!("Failed to export gpt.bin: {e}"),
+                    );
+                } else {
+                    log(
+                        &progress,
+                        LogLevel::Info,
+                        "Exported raw GPT sectors (gpt.bin)",
+                    );
+                }
             }
         }
         PartitionTable::Apm(apm) => {
-            format::export_apm(apm, &backup_folder)?;
-            log(
-                &progress,
-                LogLevel::Info,
-                "Exported APM (apm.json + apm.bin)",
-            );
+            if single_file_chd_planned {
+                // apm.bin would duplicate the DDR + partition map already
+                // embedded in disk.chd; emit only the JSON sidecar.
+                let json =
+                    serde_json::to_string_pretty(apm).context("failed to serialize APM to JSON")?;
+                std::fs::write(backup_folder.join("apm.json"), json)
+                    .context("failed to write apm.json")?;
+                log(
+                    &progress,
+                    LogLevel::Info,
+                    "Exported APM (apm.json only — raw blocks live in disk.chd)",
+                );
+            } else {
+                format::export_apm(apm, &backup_folder)?;
+                log(
+                    &progress,
+                    LogLevel::Info,
+                    "Exported APM (apm.json + apm.bin)",
+                );
+            }
         }
         PartitionTable::None { fs_hint, .. } => {
             log(

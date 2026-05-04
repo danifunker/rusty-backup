@@ -222,9 +222,34 @@ Follow-ups tracked under their own stages:
 
 - Stage 4b — backup-time resize (per-partition `SizePlan`, rewrites the
   partition-table sector before emitting it).
-- Stage 4c — GPT + APM source support.
+- Stage 4c ✅ — GPT + APM source support landed.
 - Stage 4d — layout-preserving FAT/NTFS/exFAT compact readers so smart
   mode benefits more filesystems.
+
+**Stage 4c — GPT + APM source support ✅**
+
+- [x] `is_supported` accepts `Gpt { .. }` and `Apm(_)` (in addition to
+      MBR). Superfloppy still falls back.
+- [x] `build_head_segments` selects the right head (and, for GPT, tail)
+      shape per table type:
+      - **MBR**: 512-byte sector verbatim from caller-provided buffer.
+      - **GPT**: protective MBR (verbatim) + freshly-built primary GPT
+        (33 sectors at LBA 1–33) at the head; freshly-built backup GPT
+        at the last 33 LBAs.
+      - **APM**: bytes 0..first_partition_offset read eagerly from the
+        source. Eager-read sidesteps a `try_clone`/`dup` fd-offset race
+        with the partition-loop seeks.
+- [x] `run_backup` skips the raw `mbr.bin` / `gpt.bin` / `apm.bin`
+      sidecars on the single-file CHD path for GPT and APM (parallels
+      the MBR behavior already in place); the JSON sidecars stay for
+      fast inspect.
+- [x] Round-trip unit tests: `end_to_end_round_trip_gpt` (4 MiB GPT
+      disk → CHD → re-detect as GPT after readback) and
+      `end_to_end_round_trip_apm` (DDR + APM map + HFS-shaped data
+      partition → CHD → head verbatim, partition body byte-equal,
+      re-detects as APM).
+- [x] `cargo build --all-targets` zero new warnings;
+      `cargo test --lib` 647 passing.
 
 **Original spec preserved below for reference.**
 
