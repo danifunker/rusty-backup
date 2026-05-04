@@ -701,20 +701,14 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
     let metadata: BackupMetadata =
         serde_json::from_reader(metadata_file).context("failed to parse metadata.json")?;
 
-    // Single-file-chd restore is a follow-up stage. Until it lands the
-    // existing per-partition restore path can't read these backups (the
-    // partition data lives inside disk.chd, not partition-N.chd files), so
-    // we error out with a clear pointer.
+    // Single-file-CHD layout: the whole disk image lives inside disk.chd, so
+    // restore is just `io::copy` of its logical bytes onto the target.
+    // Re-resize support (Stage 5b) will branch here on a different path.
     if matches!(
         metadata.layout,
         crate::backup::metadata::BackupLayout::SingleFileChd
     ) {
-        bail!(
-            "this backup uses the single-file-CHD layout (disk.chd); restore \
-             support for that layout is not yet implemented. You can still \
-             use the CHD outside rusty-backup: chdman info / MAME / any \
-             CHD-aware tool will load it as a regular hard-disk image."
-        );
+        return run_single_file_chd_restore_as_is(&config, progress, &metadata);
     }
 
     log(
@@ -1139,6 +1133,141 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
         p.operation = "Restore complete".to_string();
     }
 
+    Ok(())
+}
+
+/// As-is restore for `BackupLayout::SingleFileChd` backups.
+///
+/// The CHD already contains a real disk image (partition table at sector 0,
+/// gaps zero-filled, partitions in place), so restore is `io::copy` of the
+/// CHD's logical bytes onto the target. Per-partition size choices from the
+/// GUI are ignored on this path — re-resize lands in a follow-up stage; we
+/// log a warning so the user isn't surprised when they passed sizing options.
+fn run_single_file_chd_restore_as_is(
+    config: &RestoreConfig,
+    progress: Arc<Mutex<RestoreProgress>>,
+    metadata: &BackupMetadata,
+) -> Result<()> {
+    use crate::rbformats::chd::ChdReader;
+
+    let container_name = metadata.container.as_deref().unwrap_or("disk.chd");
+    let chd_path = config.backup_folder.join(container_name);
+    if !chd_path.exists() {
+        bail!(
+            "single-file-CHD backup is missing its container: {}",
+            chd_path.display()
+        );
+    }
+
+    log(
+        &progress,
+        LogLevel::Info,
+        format!(
+            "Single-file-CHD restore (as-is): {} -> {}",
+            chd_path.display(),
+            config.target_path.display(),
+        ),
+    );
+
+    let nontrivial_sizing = config.partition_sizes.iter().any(|p| {
+        !matches!(
+            p.size_choice,
+            RestoreSizeChoice::Original | RestoreSizeChoice::FillRemaining
+        )
+    });
+    if nontrivial_sizing {
+        log(
+            &progress,
+            LogLevel::Warning,
+            "Per-partition size choices are ignored on single-file-CHD as-is \
+             restore. Re-resize support is a follow-up stage.",
+        );
+    }
+
+    set_operation(&progress, "Opening CHD container...");
+    let mut reader = ChdReader::open(&chd_path)
+        .with_context(|| format!("failed to open {}", chd_path.display()))?;
+    let logical_size = metadata
+        .container_logical_size
+        .unwrap_or_else(|| reader.logical_size());
+
+    if logical_size > config.target_size {
+        bail!(
+            "target ({} bytes) is smaller than the CHD's logical size ({} bytes); \
+             restore would overflow",
+            config.target_size,
+            logical_size,
+        );
+    }
+
+    set_progress_bytes(&progress, 0, logical_size);
+
+    set_operation(&progress, "Opening target...");
+    let device_handle = if config.target_is_device {
+        log(
+            &progress,
+            LogLevel::Info,
+            format!(
+                "Opening device {} for writing...",
+                config.target_path.display()
+            ),
+        );
+        crate::os::open_target_for_writing(&config.target_path)
+            .with_context(|| format!("cannot open {} for writing", config.target_path.display()))?
+    } else {
+        log(
+            &progress,
+            LogLevel::Info,
+            format!("Creating image file {}...", config.target_path.display()),
+        );
+        let file = File::create(&config.target_path)
+            .with_context(|| format!("failed to create {}", config.target_path.display()))?;
+        crate::os::DeviceWriteHandle::from_file(file)
+    };
+    let target_file = device_handle.file;
+    let mut target = SectorAlignedWriter::new(target_file);
+
+    if is_cancelled(&progress) {
+        bail!("restore cancelled");
+    }
+
+    // Stream the CHD's logical bytes onto the target. 1 MiB chunks per the
+    // I/O sizing guidance in CONTRIBUTING.md.
+    set_operation(&progress, "Writing disk image...");
+    let mut buf = vec![0u8; 1024 * 1024];
+    let mut written: u64 = 0;
+    let mut remaining = logical_size;
+    while remaining > 0 {
+        if is_cancelled(&progress) {
+            bail!("restore cancelled");
+        }
+        let want = (remaining as usize).min(buf.len());
+        reader
+            .read_exact(&mut buf[..want])
+            .with_context(|| format!("failed to read CHD logical bytes at offset {written}"))?;
+        target
+            .write_all(&buf[..want])
+            .with_context(|| format!("failed to write to target at offset {written}"))?;
+        written += want as u64;
+        remaining -= want as u64;
+        set_progress_bytes(&progress, written, logical_size);
+    }
+    target.flush().context("failed to flush target")?;
+
+    log(
+        &progress,
+        LogLevel::Info,
+        format!(
+            "Restore complete: {} bytes written to {}",
+            written,
+            config.target_path.display(),
+        ),
+    );
+
+    if let Ok(mut p) = progress.lock() {
+        p.finished = true;
+        p.operation = "Restore complete".to_string();
+    }
     Ok(())
 }
 
@@ -2077,4 +2206,141 @@ pub(crate) fn detect_partition_fs_type(
     }
 
     PartitionFsType::Unknown
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backup::metadata::{AlignmentMetadata, BackupLayout, PartitionMetadata};
+    use crate::backup::single_file_chd::{self, SingleFileChdInputs};
+    use crate::partition::PartitionTable;
+    use std::io::BufReader;
+
+    fn build_test_mbr(part_sectors: u32) -> [u8; 512] {
+        let mut mbr = [0u8; 512];
+        mbr[510] = 0x55;
+        mbr[511] = 0xAA;
+        mbr[450] = 0x83;
+        mbr[454..458].copy_from_slice(&1u32.to_le_bytes());
+        mbr[458..462].copy_from_slice(&part_sectors.to_le_bytes());
+        mbr
+    }
+
+    #[test]
+    fn single_file_chd_as_is_restore_round_trips() {
+        // Build a synthetic 4 MiB MBR disk → CHD backup folder → restore to
+        // a fresh image file, verify byte-for-byte equality.
+        const TOTAL_SECTORS: u32 = 8192;
+        const PART_SECTORS: u32 = 4095;
+        const SECTOR_SIZE: u64 = 512;
+        let total_bytes = (TOTAL_SECTORS as u64) * SECTOR_SIZE;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_path = tmp.path().join("source.img");
+        let mut data = vec![0u8; total_bytes as usize];
+        data[..512].copy_from_slice(&build_test_mbr(PART_SECTORS));
+        for i in 0..((PART_SECTORS as u64) * SECTOR_SIZE) as usize {
+            data[512 + i] = ((i % 251) as u8).wrapping_add(1);
+        }
+        std::fs::write(&source_path, &data).unwrap();
+
+        let backup_folder = tmp.path().join("backup");
+        std::fs::create_dir_all(&backup_folder).unwrap();
+        let output_base = backup_folder.join("disk");
+        let source_file = File::open(&source_path).unwrap();
+        let mut br = BufReader::new(source_file.try_clone().unwrap());
+        let table = PartitionTable::detect(&mut br).expect("detect MBR");
+        let partitions = table.partitions();
+        let mbr_bytes: [u8; 512] = data[..512].try_into().unwrap();
+
+        let mut log_buf: Vec<String> = Vec::new();
+        let mut log_cb = |s: &str| log_buf.push(s.to_string());
+        let mut progress_cb = |_: u64| {};
+        let cancel_check = || false;
+        let chd_result = single_file_chd::run(
+            SingleFileChdInputs {
+                source_file: &source_file,
+                source_size: total_bytes,
+                source_partition_table_bytes: &mbr_bytes,
+                partition_table: &table,
+                partitions: &partitions,
+                partition_filter: None,
+                sector_by_sector: false,
+                chd_options: None,
+                is_dvd: false,
+                output_base: &output_base,
+            },
+            &mut progress_cb,
+            &cancel_check,
+            &mut log_cb,
+        )
+        .expect("backup");
+
+        // Write metadata.json to mark this as a SingleFileChd backup folder.
+        let metadata = BackupMetadata {
+            version: 1,
+            created: "2026-05-04T00:00:00Z".to_string(),
+            source_device: source_path.display().to_string(),
+            source_size_bytes: total_bytes,
+            partition_table_type: table.type_name().to_string(),
+            checksum_type: "sha256".to_string(),
+            compression_type: "chd".to_string(),
+            split_size_mib: None,
+            sector_by_sector: false,
+            layout: BackupLayout::SingleFileChd,
+            container: Some(chd_result.container_filename.clone()),
+            container_logical_size: Some(chd_result.container_logical_size),
+            container_sha1: Some(chd_result.container_sha1.clone()),
+            size_policy: Some(crate::backup::metadata::SizePolicy::Original),
+            alignment: AlignmentMetadata {
+                detected_type: "None detected".to_string(),
+                first_partition_lba: 1,
+                alignment_sectors: 1,
+                heads: 0,
+                sectors_per_track: 0,
+            },
+            partitions: chd_result
+                .partition_ranges
+                .iter()
+                .map(|r| PartitionMetadata {
+                    index: r.partition_index,
+                    type_name: "Linux".to_string(),
+                    partition_type_byte: 0x83,
+                    start_lba: r.offset_in_disk / 512,
+                    original_size_bytes: r.length,
+                    imaged_size_bytes: r.length,
+                    compressed_files: vec![],
+                    checksum: r.checksum_sha256.clone(),
+                    resized: false,
+                    compacted: true,
+                    is_logical: false,
+                    partition_type_string: None,
+                    minimum_size_bytes: None,
+                })
+                .collect(),
+            bad_sectors: vec![],
+            extended_container: None,
+        };
+        let meta_path = backup_folder.join("metadata.json");
+        std::fs::write(&meta_path, serde_json::to_string_pretty(&metadata).unwrap()).unwrap();
+
+        // Run restore to a target image file.
+        let target_path = tmp.path().join("restored.img");
+        let cfg = RestoreConfig {
+            backup_folder: backup_folder.clone(),
+            target_path: target_path.clone(),
+            target_is_device: false,
+            target_size: total_bytes,
+            alignment: RestoreAlignment::Original,
+            partition_sizes: vec![],
+            write_zeros_to_unused: false,
+        };
+        let progress = Arc::new(Mutex::new(RestoreProgress::new()));
+        run_restore(cfg, progress.clone()).expect("restore");
+        assert!(progress.lock().unwrap().finished);
+
+        let restored = std::fs::read(&target_path).unwrap();
+        assert_eq!(restored.len(), data.len(), "restored length mismatch");
+        assert_eq!(restored, data, "restored bytes must match source");
+    }
 }

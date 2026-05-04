@@ -259,6 +259,29 @@ a sensible drive with the right SHA1.
 
 ### Stage 5 — restore branch
 
+**Stage 5a — as-is restore ✅**
+
+- [x] `run_restore` branches on `BackupLayout::SingleFileChd` and calls
+      `run_single_file_chd_restore_as_is`, replacing the prior
+      "not implemented" bail.
+- [x] Helper opens `disk.chd` via `ChdReader`, pre-checks
+      `target_size >= container_logical_size`, and `read_exact` /
+      `write_all` 1 MiB chunks through the existing `SectorAlignedWriter`.
+      Cancel polled at chunk boundaries; progress driven off bytes written.
+- [x] Per-partition size choices coming from the restore tab are logged
+      as ignored on this path — re-resize is Stage 5b.
+- [x] Round-trip unit test (`single_file_chd_as_is_restore_round_trips`)
+      builds a synthetic CHD backup folder, runs `run_restore`, and
+      asserts the restored image is byte-equal to the source disk.
+- [x] `cargo build --all-targets` zero new warnings; `cargo test --lib`
+      645 passing.
+
+**Stage 5b — re-resize restore (still TODO)**: lands together with Stage
+3b, since the per-partition extract+resize pipeline is shared between
+backup-time resize and restore-time re-resize.
+
+**Original spec preserved below for reference.**
+
 `restore::reconstruct_disk_from_backup` reads metadata.json, branches on
 `layout`:
 
