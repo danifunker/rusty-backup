@@ -1,5 +1,37 @@
 use serde::{Deserialize, Serialize};
 
+/// Backup folder layout. Selects how partition data is stored on disk.
+///
+/// `PerPartition` is the legacy layout: one compressed file per selected
+/// partition (`partition-0.zst`, `partition-1.chd`, …) plus a `metadata.json`
+/// index. Defaults via `#[serde(default)]` so existing folders load unchanged.
+///
+/// `SingleFileChd` is the new CHD-only layout introduced for chdman/MAME
+/// compatibility: a single `disk.chd` containing a real disk image (partition
+/// table at sector 0, gaps zero-filled). Other compression types stay on
+/// `PerPartition`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackupLayout {
+    #[default]
+    PerPartition,
+    SingleFileChd,
+}
+
+/// Partition-size policy applied at backup time. Recorded for traceability —
+/// the actual sizes live on each `PartitionMetadata` entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SizePolicy {
+    /// Each partition keeps its source size.
+    Original,
+    /// Each partition shrunk to its filesystem's minimum, plus 20% headroom.
+    /// Falls back to `Original` for partition types that can't be shrunk.
+    MinPlus20,
+    /// User-supplied size per partition.
+    Custom,
+}
+
 /// Top-level backup metadata written to `metadata.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupMetadata {
@@ -15,6 +47,26 @@ pub struct BackupMetadata {
     /// including blank space). False means zero blocks were skipped.
     #[serde(default)]
     pub sector_by_sector: bool,
+    /// Backup folder layout. Defaults to `PerPartition` so existing
+    /// `metadata.json` files load unchanged.
+    #[serde(default)]
+    pub layout: BackupLayout,
+    /// For `SingleFileChd`: the relative filename of the CHD container
+    /// (typically `"disk.chd"`). `None` for `PerPartition`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
+    /// For `SingleFileChd`: total logical bytes of the synthesised disk image
+    /// stored in the CHD. `None` for `PerPartition`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_logical_size: Option<u64>,
+    /// For `SingleFileChd`: hex SHA1 reported by the CHD itself (the value
+    /// `chdman info` prints). `None` for `PerPartition`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_sha1: Option<String>,
+    /// Sizing policy chosen at backup time. `None` means the field wasn't set
+    /// by the writer (older metadata or non-CHD output).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_policy: Option<SizePolicy>,
     pub alignment: AlignmentMetadata,
     pub partitions: Vec<PartitionMetadata>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -137,6 +189,11 @@ mod tests {
             compression_type: "zstd".to_string(),
             split_size_mib: Some(4000),
             sector_by_sector: false,
+            layout: BackupLayout::PerPartition,
+            container: None,
+            container_logical_size: None,
+            container_sha1: None,
+            size_policy: None,
             alignment: AlignmentMetadata {
                 detected_type: "DOS Traditional (255x63)".to_string(),
                 first_partition_lba: 63,
@@ -175,6 +232,96 @@ mod tests {
     }
 
     #[test]
+    fn test_legacy_metadata_loads_with_default_layout() {
+        // metadata.json from before the BackupLayout field existed must still
+        // parse, with `layout` defaulting to PerPartition.
+        let json = r#"{
+            "version": 1,
+            "created": "2024-12-01T00:00:00Z",
+            "source_device": "/dev/disk2",
+            "source_size_bytes": 1000000000,
+            "partition_table_type": "MBR",
+            "checksum_type": "sha256",
+            "compression_type": "zstd",
+            "split_size_mib": null,
+            "alignment": {
+                "detected_type": "None detected",
+                "first_partition_lba": 0,
+                "alignment_sectors": 0,
+                "heads": 0,
+                "sectors_per_track": 0
+            },
+            "partitions": []
+        }"#;
+        let parsed: BackupMetadata = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.layout, BackupLayout::PerPartition);
+        assert!(parsed.container.is_none());
+        assert!(parsed.container_logical_size.is_none());
+        assert!(parsed.container_sha1.is_none());
+        assert!(parsed.size_policy.is_none());
+        assert!(!parsed.sector_by_sector);
+    }
+
+    #[test]
+    fn test_single_file_chd_metadata_round_trip() {
+        let metadata = BackupMetadata {
+            version: 1,
+            created: "2026-05-03T12:00:00Z".to_string(),
+            source_device: "/dev/disk2".to_string(),
+            source_size_bytes: 4_000_000_000,
+            partition_table_type: "MBR".to_string(),
+            checksum_type: "sha256".to_string(),
+            compression_type: "chd".to_string(),
+            split_size_mib: None,
+            sector_by_sector: false,
+            layout: BackupLayout::SingleFileChd,
+            container: Some("disk.chd".to_string()),
+            container_logical_size: Some(2_147_483_648),
+            container_sha1: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+            size_policy: Some(SizePolicy::MinPlus20),
+            alignment: AlignmentMetadata {
+                detected_type: "DOS Traditional (255x63)".to_string(),
+                first_partition_lba: 63,
+                alignment_sectors: 16065,
+                heads: 255,
+                sectors_per_track: 63,
+            },
+            partitions: vec![PartitionMetadata {
+                index: 0,
+                type_name: "FAT32 (LBA)".to_string(),
+                partition_type_byte: 0x0C,
+                start_lba: 63,
+                original_size_bytes: 2_000_000_000,
+                imaged_size_bytes: 600_000_000,
+                compressed_files: vec![],
+                checksum: "abcdef".to_string(),
+                resized: true,
+                compacted: true,
+                is_logical: false,
+                partition_type_string: None,
+                minimum_size_bytes: Some(500_000_000),
+            }],
+            bad_sectors: vec![],
+            extended_container: None,
+        };
+        let json = serde_json::to_string_pretty(&metadata).unwrap();
+        // kebab-case for the layout enum. heck's kebab-case keeps trailing
+        // digits attached to the previous word ("MinPlus20" -> "min-plus20").
+        assert!(json.contains("\"single-file-chd\""), "json was: {json}");
+        assert!(
+            json.contains("\"min-plus20\"") || json.contains("\"min-plus-20\""),
+            "size_policy serialization changed; json was: {json}"
+        );
+        let parsed: BackupMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.layout, BackupLayout::SingleFileChd);
+        assert_eq!(parsed.container.as_deref(), Some("disk.chd"));
+        assert_eq!(parsed.container_logical_size, Some(2_147_483_648));
+        assert_eq!(parsed.size_policy, Some(SizePolicy::MinPlus20));
+        assert_eq!(parsed.partitions.len(), 1);
+        assert!(parsed.partitions[0].compressed_files.is_empty());
+    }
+
+    #[test]
     fn test_metadata_with_bad_sectors() {
         let metadata = BackupMetadata {
             version: 1,
@@ -186,6 +333,11 @@ mod tests {
             compression_type: "none".to_string(),
             split_size_mib: None,
             sector_by_sector: true,
+            layout: BackupLayout::PerPartition,
+            container: None,
+            container_logical_size: None,
+            container_sha1: None,
+            size_policy: None,
             alignment: AlignmentMetadata {
                 detected_type: "None detected".to_string(),
                 first_partition_lba: 0,

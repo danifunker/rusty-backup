@@ -832,6 +832,11 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         },
         split_size_mib: config.split_size_mib,
         sector_by_sector: config.sector_by_sector,
+        layout: crate::backup::metadata::BackupLayout::PerPartition,
+        container: None,
+        container_logical_size: None,
+        container_sha1: None,
+        size_policy: None,
         alignment: AlignmentMetadata {
             detected_type: format!("{}", alignment.alignment_type),
             first_partition_lba: alignment.first_lba,
