@@ -36,7 +36,6 @@ pub struct BackupTab {
     checksum_type: ChecksumType,
     compression_type: CompressionType,
     chd_hd_control: ChdOptionsControl,
-    chd_dvd_control: ChdOptionsControl,
     backup_running: bool,
     backup_progress: Option<Arc<Mutex<BackupProgress>>>,
     /// Auto-loaded partition info for the selected source
@@ -118,21 +117,6 @@ impl Default for BackupTab {
                 }
                 if let Some(hs) = cfg.last_chd_hunk_size {
                     if hs % 512 == 0 {
-                        ctl.custom.hunk_size = hs;
-                    }
-                }
-                ctl
-            },
-            chd_dvd_control: {
-                let mut ctl = ChdOptionsControl::new(ChdProfile::Dvd);
-                let cfg = UpdateConfig::load();
-                if let Some(spec) = cfg.last_chd_codecs.as_deref() {
-                    if let Ok(codecs) = parse_codec_string(spec) {
-                        ctl.custom.codecs = codecs;
-                    }
-                }
-                if let Some(hs) = cfg.last_chd_hunk_size {
-                    if hs % 2048 == 0 {
                         ctl.custom.hunk_size = hs;
                     }
                 }
@@ -323,23 +307,22 @@ impl BackupTab {
                     CompressionType::Chd,
                     "CHD (Hard Disk)",
                 );
-                ui.radio_value(&mut self.compression_type, CompressionType::Dvd, "DVD CHD");
+                // DVD CHD is intentionally NOT offered here — DVDs are
+                // optical media, handled by the Optical tab. The backup
+                // tab is for hard disks only.
                 ui.radio_value(&mut self.compression_type, CompressionType::Vhd, "VHD");
                 ui.radio_value(&mut self.compression_type, CompressionType::Zstd, "zstd");
                 ui.radio_value(&mut self.compression_type, CompressionType::None, "None");
             });
 
-            // CHD codec / hunk-size knobs (only visible when a CHD profile is selected)
-            if matches!(
-                self.compression_type,
-                CompressionType::Chd | CompressionType::Dvd
-            ) {
-                let (profile, control) = if self.compression_type == CompressionType::Dvd {
-                    (ChdProfile::Dvd, &mut self.chd_dvd_control)
-                } else {
-                    (ChdProfile::Hd, &mut self.chd_hd_control)
-                };
-                super::chd_options_ui::show(ui, "backup_chd", profile, control);
+            // CHD codec / hunk-size knobs (only visible when CHD is selected)
+            if matches!(self.compression_type, CompressionType::Chd) {
+                super::chd_options_ui::show(
+                    ui,
+                    "backup_chd",
+                    ChdProfile::Hd,
+                    &mut self.chd_hd_control,
+                );
             }
 
             // Sector-by-sector option
@@ -392,7 +375,6 @@ impl BackupTab {
                     self.source_partitions.is_empty() || !self.selected_partitions.is_empty();
                 let chd_ok = match self.compression_type {
                     CompressionType::Chd => self.chd_hd_control.is_valid(ChdProfile::Hd),
-                    CompressionType::Dvd => self.chd_dvd_control.is_valid(ChdProfile::Dvd),
                     _ => true,
                 };
                 let can_start = has_source
@@ -1047,7 +1029,6 @@ impl BackupTab {
     fn chd_options_for_compression(&self) -> Option<ChdOptions> {
         match self.compression_type {
             CompressionType::Chd => Some(self.chd_hd_control.effective(ChdProfile::Hd)),
-            CompressionType::Dvd => Some(self.chd_dvd_control.effective(ChdProfile::Dvd)),
             _ => None,
         }
     }
@@ -1058,9 +1039,6 @@ impl BackupTab {
         let custom = match self.compression_type {
             CompressionType::Chd if self.chd_hd_control.mode == ChdOptionsMode::Custom => {
                 Some(&self.chd_hd_control.custom)
-            }
-            CompressionType::Dvd if self.chd_dvd_control.mode == ChdOptionsMode::Custom => {
-                Some(&self.chd_dvd_control.custom)
             }
             _ => None,
         };

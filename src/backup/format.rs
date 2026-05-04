@@ -97,13 +97,18 @@ pub fn export_mbr(mbr: &Mbr, raw_bytes: &[u8; 512], folder: &Path) -> Result<()>
     let bin_path = folder.join("mbr.bin");
     fs::write(&bin_path, raw_bytes)
         .with_context(|| format!("failed to write {}", bin_path.display()))?;
+    export_mbr_json(mbr, folder)
+}
 
-    // Write structured JSON
+/// Export only `mbr.json` (no `mbr.bin`). Used for single-file CHD backups
+/// where the raw MBR sector already lives at offset 0 of `disk.chd` — a
+/// separate `mbr.bin` would just duplicate those bytes. The parsed JSON
+/// stays useful for fast inspect-tab loads that don't need to open the CHD.
+pub fn export_mbr_json(mbr: &Mbr, folder: &Path) -> Result<()> {
     let json_path = folder.join("mbr.json");
     let json = serde_json::to_string_pretty(mbr).context("failed to serialize MBR to JSON")?;
     fs::write(&json_path, json)
         .with_context(|| format!("failed to write {}", json_path.display()))?;
-
     Ok(())
 }
 

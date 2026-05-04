@@ -326,15 +326,36 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
     );
 
     // Step 3: Export partition table
+    //
+    // Single-file CHD backups already carry the raw partition-table sector
+    // inside `disk.chd` at offset 0 — writing a separate `mbr.bin` would
+    // duplicate those bytes. We still emit the parsed JSON sidecar
+    // (`mbr.json`) for fast inspect loads.
+    let single_file_chd_planned = matches!(
+        config.compression,
+        CompressionType::Chd | CompressionType::Dvd
+    ) && !is_superfloppy
+        && config.split_size_mib.is_none()
+        && single_file_chd::is_supported(&table);
+
     set_operation(&progress, "Exporting partition table...");
     match &table {
         PartitionTable::Mbr(mbr) => {
-            format::export_mbr(mbr, &mbr_bytes, &backup_folder)?;
-            log(
-                &progress,
-                LogLevel::Info,
-                "Exported MBR (mbr.bin + mbr.json)",
-            );
+            if single_file_chd_planned {
+                format::export_mbr_json(mbr, &backup_folder)?;
+                log(
+                    &progress,
+                    LogLevel::Info,
+                    "Exported MBR (mbr.json only — raw bytes live in disk.chd)",
+                );
+            } else {
+                format::export_mbr(mbr, &mbr_bytes, &backup_folder)?;
+                log(
+                    &progress,
+                    LogLevel::Info,
+                    "Exported MBR (mbr.bin + mbr.json)",
+                );
+            }
         }
         PartitionTable::Gpt { gpt, .. } => {
             format::export_gpt(gpt, &mbr_bytes, &backup_folder)?;
@@ -378,17 +399,35 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         bail!("backup cancelled");
     }
 
-    // Single-file CHD branch: when the user asked for CHD/DVD output and the
+    // Single-file CHD branch: when the user asked for CHD output and the
     // source has a partition table single_file_chd can handle, synthesise a
     // whole-disk image into one CHD and skip the per-partition loop. Falls
     // through to the legacy per-partition path otherwise.
-    let single_file_chd_requested = matches!(
+    if single_file_chd_planned {
+        return run_single_file_chd_path(
+            &config,
+            &progress,
+            &source,
+            source_size,
+            &mbr_bytes,
+            &table,
+            &partitions,
+            &alignment,
+            &backup_folder,
+        );
+    } else if matches!(
         config.compression,
         CompressionType::Chd | CompressionType::Dvd
-    ) && !is_superfloppy
-        && config.split_size_mib.is_none();
-    if single_file_chd_requested {
-        if !single_file_chd::is_supported(&table) {
+    ) {
+        if config.split_size_mib.is_some() {
+            log(
+                &progress,
+                LogLevel::Warning,
+                "Split-size set with CHD output: splitting is incompatible with \
+                 chdman/MAME single-file CHDs and is ignored.",
+            );
+        }
+        if !is_superfloppy && !single_file_chd::is_supported(&table) {
             log(
                 &progress,
                 LogLevel::Info,
@@ -398,31 +437,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                     table.type_name(),
                 ),
             );
-        } else {
-            return run_single_file_chd_path(
-                &config,
-                &progress,
-                &source,
-                source_size,
-                &mbr_bytes,
-                &table,
-                &partitions,
-                &alignment,
-                &backup_folder,
-            );
         }
-    } else if matches!(
-        config.compression,
-        CompressionType::Chd | CompressionType::Dvd
-    ) && config.split_size_mib.is_some()
-    {
-        log(
-            &progress,
-            LogLevel::Warning,
-            "Split-size set with CHD output: splitting is incompatible with \
-             chdman/MAME single-file CHDs and is ignored. Output will be a \
-             single CHD per partition (legacy per-partition layout).",
-        );
     }
 
     // Step 4: Analyze partitions for smart sizing
