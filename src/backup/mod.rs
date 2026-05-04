@@ -18,7 +18,10 @@ use serde::{Deserialize, Serialize};
 use crate::fs;
 use crate::partition::{self, PartitionTable};
 use crate::rbformats::chd_options::ChdOptions;
-use metadata::{AlignmentMetadata, BackupMetadata, ExtendedContainerMetadata, PartitionMetadata};
+use metadata::{
+    AlignmentMetadata, BackupLayout, BackupMetadata, ExtendedContainerMetadata, PartitionMetadata,
+    SizePolicy,
+};
 
 /// Compression type for backup output.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -88,6 +91,18 @@ pub struct BackupConfig {
     /// CHD codec + hunk-size options (only consulted when `compression`
     /// is `Chd` or `Dvd`). `None` = use the profile's chdman defaults.
     pub chd_options: Option<ChdOptions>,
+    /// Backup-time partition size policy (single-file CHD only). `None`
+    /// keeps source sizes. The actual per-partition sizes the user picked
+    /// live in `partition_target_sizes`; `size_policy` is the policy label
+    /// recorded in metadata for traceability.
+    pub size_policy: Option<SizePolicy>,
+    /// Per-partition target sizes in bytes, keyed by partition index
+    /// (single-file CHD only). Entries omitted from this map default to
+    /// the partition's source size. Backup-time resize execution itself
+    /// is Stage 4b — for now, non-Original entries are recorded in
+    /// metadata but the CHD body still uses source sizes; `run_backup`
+    /// logs a warning when this happens.
+    pub partition_target_sizes: Option<Vec<(usize, u64)>>,
 }
 
 /// Shared progress state between background backup thread and the GUI.
@@ -924,11 +939,11 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         },
         split_size_mib: config.split_size_mib,
         sector_by_sector: config.sector_by_sector,
-        layout: crate::backup::metadata::BackupLayout::PerPartition,
+        layout: BackupLayout::PerPartition,
         container: None,
         container_logical_size: None,
         container_sha1: None,
-        size_policy: None,
+        size_policy: config.size_policy,
         alignment: AlignmentMetadata {
             detected_type: format!("{}", alignment.alignment_type),
             first_partition_lba: alignment.first_lba,
@@ -993,6 +1008,34 @@ fn run_single_file_chd_path(
             source_size,
         ),
     );
+
+    // Backup-time resize (Min+20% / Custom) is Stage 4b; until it lands we
+    // honour the picker's selection in metadata only and fall back to
+    // source sizes for the CHD body. Warn explicitly so users aren't
+    // surprised.
+    let requested_policy = config.size_policy.unwrap_or(SizePolicy::Original);
+    let nontrivial_targets = config
+        .partition_target_sizes
+        .as_deref()
+        .map(|v| {
+            v.iter().any(|(idx, target)| {
+                partitions
+                    .iter()
+                    .find(|p| p.index == *idx)
+                    .map(|p| *target != p.size_bytes)
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    if requested_policy != SizePolicy::Original || nontrivial_targets {
+        log(
+            progress,
+            LogLevel::Warning,
+            "Backup-time partition resize is a follow-up stage. The CHD will \
+             contain partitions at their source sizes for now; the requested \
+             size policy is recorded in metadata.json for traceability.",
+        );
+    }
 
     // Output base for compress_chd (the .chd extension is appended by the
     // compressor). Every single-file CHD backup uses the literal name
@@ -1083,11 +1126,14 @@ fn run_single_file_chd_path(
         compression_type: config.compression.as_str().to_string(),
         split_size_mib: None, // splitting is rejected on this path
         sector_by_sector: config.sector_by_sector,
-        layout: metadata::BackupLayout::SingleFileChd,
+        layout: BackupLayout::SingleFileChd,
         container: Some(result.container_filename.clone()),
         container_logical_size: Some(result.container_logical_size),
         container_sha1: Some(result.container_sha1.clone()),
-        size_policy: Some(metadata::SizePolicy::Original),
+        // Records what the user asked for — `effective_policy` is what
+        // actually shaped the CHD. They differ only while Stage 4b is
+        // outstanding; once it lands they will always match.
+        size_policy: Some(requested_policy),
         alignment: AlignmentMetadata {
             detected_type: format!("{}", alignment.alignment_type),
             first_partition_lba: alignment.first_lba,

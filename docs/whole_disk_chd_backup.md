@@ -175,19 +175,29 @@ fully unit-testable without any filesystem I/O.
 
 ### Stage 3 — backup tab UI for CHD output
 
-Reuse the existing resize widget (currently in the restore tab) inside the
-backup tab. Show it only when the output is CHD/DVD.
+**Stage 3b — picker UI + plumbing ✅**
 
-- Lift the resize widget into a shared `gui::partition_size_picker` module
-  if it isn't already shared. (Check first — most of this state is in
-  `resize_popup.rs` and may already be reusable.)
-- Backup tab gains a "Read mode" radio (Smart compaction / Sector-by-sector)
-  and the partition size picker (with `MinPlus20` as the default).
-- Hide the split-size control when CHD/DVD is selected.
-- Persist last-used read-mode + default-size-policy in `UpdateConfig`.
+- [x] Backup tab embeds the shared `size_mode_row` widget inline when
+      CHD output is selected. Default selection per row is `MinPlus20`
+      when the partition's minimum is known and below source size, else
+      `Original`. The deferred Calc-min button + spinner is wired through
+      the existing `pending_min_size_calcs` map.
+- [x] Split-size control is hidden for CHD and DVD output (chdman /
+      MAME load a single file). VHD continues to suppress it as before.
+- [x] `BackupConfig` gained `size_policy: Option<SizePolicy>` and
+      `partition_target_sizes: Option<Vec<(usize, u64)>>`. The values
+      land in `metadata.json` for traceability.
+- [x] **Resize execution itself is Stage 4b**: when the picker selects
+      anything other than Original, `run_backup` logs a warning and the
+      CHD body still uses source sizes. Recording the user's intent
+      keeps the next stage's data flow intact without misleading users.
+- [x] Last-used read-mode + size-policy persistence in `UpdateConfig`
+      is deferred to Stage 9 (UI polish).
+- [x] `cargo build --all-targets` zero new warnings; `cargo test --lib`
+      647 passing.
 
 **Done when:** the backup tab shows the right controls for CHD output and
-their values plumb through to a `BackupConfig` extension.
+their values plumb through to a `BackupConfig` extension. ✅
 
 ---
 
