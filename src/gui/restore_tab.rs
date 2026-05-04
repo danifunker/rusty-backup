@@ -1237,6 +1237,11 @@ impl RestoreTab {
                         // where the partclone header has the real used size).
                         RestoreSizeChoice::Custom(cfg.minimum_size)
                     }
+                    SizeMode::MinPlus20 => RestoreSizeChoice::Custom(cfg.choice.effective_size(
+                        cfg.original_size,
+                        cfg.minimum_size,
+                        cfg.custom_size_mib,
+                    )),
                     SizeMode::Custom => {
                         RestoreSizeChoice::Custom(cfg.custom_size_mib as u64 * 1024 * 1024)
                     }
