@@ -701,6 +701,22 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
     let metadata: BackupMetadata =
         serde_json::from_reader(metadata_file).context("failed to parse metadata.json")?;
 
+    // Single-file-chd restore is a follow-up stage. Until it lands the
+    // existing per-partition restore path can't read these backups (the
+    // partition data lives inside disk.chd, not partition-N.chd files), so
+    // we error out with a clear pointer.
+    if matches!(
+        metadata.layout,
+        crate::backup::metadata::BackupLayout::SingleFileChd
+    ) {
+        bail!(
+            "this backup uses the single-file-CHD layout (disk.chd); restore \
+             support for that layout is not yet implemented. You can still \
+             use the CHD outside rusty-backup: chdman info / MAME / any \
+             CHD-aware tool will load it as a regular hard-disk image."
+        );
+    }
+
     log(
         &progress,
         LogLevel::Info,

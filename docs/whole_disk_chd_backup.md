@@ -191,7 +191,42 @@ their values plumb through to a `BackupConfig` extension.
 
 ---
 
-### Stage 4 — backup orchestration branch
+### Stage 4 — backup orchestration branch ✅ (initial slice)
+
+Initial slice landed: MBR sources only, source layout preserved (no
+backup-time resize yet), smart compaction = layout-preserving compact
+reader where available with raw passthrough fallback. GPT/APM/superfloppy
+sources fall back to the legacy per-partition layout with a logged
+explanation. `split_size_mib` paired with CHD output logs a warning and
+is ignored.
+
+- [x] `src/backup/single_file_chd.rs` — `SingleFileChdInputs`,
+      `SingleFileChdResult`, `is_supported`, `run`, plus end-to-end
+      round-trip test (synthetic 4 MiB MBR disk → CHD → byte-equal
+      readback via `ChdReader`).
+- [x] `run_backup` branches when `compression == Chd|Dvd` and the table
+      type is supported, calling `single_file_chd::run` and writing a
+      `single-file-chd` `metadata.json`. Returns early; per-partition
+      loop is skipped.
+- [x] Restore stub: `run_restore` rejects `BackupLayout::SingleFileChd`
+      with a clear error pointing the user at chdman/MAME for now —
+      keeps the user out of a corrupt-restore footgun until Stage 5.
+- [x] Inspect-tab redirect: when the user opens a single-file-chd
+      backup folder, swap the source to `folder/disk.chd` and run the
+      existing CHD-image inspect/browse path. Gives users immediate
+      browsability of their backup without new GUI plumbing.
+- [x] `cargo fmt` clean; `cargo build --all-targets` zero warnings;
+      `cargo test --lib` 644 passing.
+
+Follow-ups tracked under their own stages:
+
+- Stage 4b — backup-time resize (per-partition `SizePlan`, rewrites the
+  partition-table sector before emitting it).
+- Stage 4c — GPT + APM source support.
+- Stage 4d — layout-preserving FAT/NTFS/exFAT compact readers so smart
+  mode benefits more filesystems.
+
+**Original spec preserved below for reference.**
 
 `backup::run_backup` adds a pre-loop branch:
 

@@ -1371,6 +1371,32 @@ impl InspectTab {
         for msg in &out.warnings {
             ctx.log.warn(msg);
         }
+        // Single-file-CHD backups put the entire disk image inside
+        // `disk.chd`. The existing per-partition inspect/browse path
+        // doesn't know how to slice byte ranges out of the container, so
+        // redirect the user to "Open VHD/Disk Image" on the CHD itself —
+        // that path already handles CHD via ChdReader and gives full
+        // browse + CHD-info access.
+        if matches!(
+            out.metadata.layout,
+            rusty_backup::backup::metadata::BackupLayout::SingleFileChd
+        ) {
+            if let Some(folder) = &self.backup_folder_path {
+                let container = out.metadata.container.as_deref().unwrap_or("disk.chd");
+                let chd_path = folder.join(container);
+                ctx.log.info(format!(
+                    "Single-file-CHD backup detected; opening {} as a disk image \
+                     for inspection (instead of the backup folder).",
+                    chd_path.display(),
+                ));
+                self.backup_folder_path = None;
+                self.prev_backup_path = None;
+                self.image_file_path = Some(chd_path);
+                self.prev_image_path = self.image_file_path.clone();
+                self.run_inspect(ctx);
+                return;
+            }
+        }
         self.backup_metadata = Some(out.metadata);
         self.partition_table = out.partition_table;
         self.alignment = out.alignment;
