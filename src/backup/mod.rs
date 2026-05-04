@@ -1,3 +1,4 @@
+pub mod disk_image_stream;
 pub mod format;
 pub mod metadata;
 mod sizes;

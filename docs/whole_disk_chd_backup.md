@@ -142,33 +142,34 @@ Each stage builds + tests green and is one session-sized chunk.
 
 ---
 
-### Stage 2 — disk-image stream builder
+### Stage 2 — disk-image stream composer ✅
 
-New module `src/backup/disk_image_stream.rs`. Builds a `Read + Seek` over a
-synthesised whole disk that:
+Scope shrunk from the original draft: Stage 2 is the **pure sparse-stream
+composer** that takes ordered `(offset, length, Read)` segments and emits
+a `Read` over the synthesised disk, zero-filling gaps. The orchestration
+that builds those segments from a real source + partition table + resize
+plan moves to Stage 4 (backup orchestration). This split keeps Stage 2
+fully unit-testable without any filesystem I/O.
 
-1. Emits a *new* MBR or GPT at sector 0, generated from the user's resize
-   plan (not copied from source — partition offsets and sizes change when
-   the user resizes).
-2. For each partition slot:
-   - Read mode = Smart + supported FS: `compact_partition_reader()` cropped
-     or padded to `imaged_size_after_resize`.
-   - Read mode = Smart + unsupported FS: raw passthrough cropped/padded.
-   - Read mode = SectorBySector: raw passthrough only.
-3. Zero-fills gaps between partitions and the post-last-partition tail to
-   the target disk-image size.
-4. The total logical size is `last_partition_end + tail_padding` rounded
-   up to the CHD unit boundary.
+- [x] New module `src/backup/disk_image_stream.rs` with
+      `DiskImageStreamBuilder` + `DiskImageStream`. Forward-only `Read` —
+      `Seek` isn't needed because `compress_chd` only reads forward.
+- [x] Builder enforces non-overlapping, in-order segments at registration
+      time so a misconfigured caller fails fast rather than producing a
+      corrupt CHD.
+- [x] Source readers shorter than their declared `length` get zero-padded;
+      readers longer than declared get truncated. Both behaviors tested.
+- [x] 11 inline unit tests covering: empty stream, single segment at
+      origin, segment in middle, two segments with gap, source-short
+      zero-pad, source-long truncate, out-of-order rejection, overlap
+      rejection, past-end rejection, zero-length rejection,
+      touching-segments-no-gap.
+- [x] Module declared in `src/backup/mod.rs`. No production callers yet —
+      Stage 4 wires it into the backup orchestrator.
+- [x] `cargo fmt` clean; `cargo build --all-targets` zero warnings;
+      `cargo test --lib` 638 passing.
 
-Reuses the partition-table builder code from `restore::reconstruct_disk_from_backup`
-(MBR patching + GPT primary/backup header generation). No new partition-table
-logic; we're piping the existing builder into a different consumer.
-
-- Unit tests: synthetic 16 MiB MBR disk with two FAT partitions; verify
-  the stream's bytes equal `[mbr][part0_compacted_padded][gap_zeros][part1_compacted_padded][tail_zeros]`,
-  and that the embedded partition table parses to the resized layout.
-
-**Done when:** `cargo test backup::disk_image_stream` green; no callers yet.
+**Done when:** `cargo test backup::disk_image_stream` green; no callers yet. ✅
 
 ---
 
