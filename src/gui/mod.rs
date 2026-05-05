@@ -212,7 +212,9 @@ impl eframe::App for RustyBackupApp {
 
         // Drain bulk-convert worker logs into the panel and clear when done.
         self.poll_bulk_convert();
+    }
 
+    fn ui(&mut self, ctx: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Top panel: tab bar
         egui::TopBottomPanel::top("tab_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -404,7 +406,6 @@ impl eframe::App for RustyBackupApp {
                     if let Err(e) = rusty_backup::os::linux::relaunch_with_elevation() {
                         self.log_panel.error(format!("Failed to elevate: {}", e));
                     }
-                    // If relaunch_with_elevation returns, something went wrong
                 }
                 ElevationAction::Cancel => {
                     self.log_panel

@@ -342,11 +342,23 @@ impl BackupTab {
                 "Sector-by-sector copy (includes all blank space)",
             );
 
-            // Resize option
-            ui.checkbox(
-                &mut self.resize_partitions,
-                "Resize partitions to minimum size",
-            );
+            // Resize option. Sector-by-sector preserves the source byte-for-
+            // byte (free space + unrecognized regions), so resizing would
+            // defeat the point — force-disabled and unchecked while it's on.
+            if self.sector_by_sector {
+                self.resize_partitions = false;
+            }
+            ui.add_enabled_ui(!self.sector_by_sector, |ui| {
+                ui.horizontal(|ui| {
+                    ui.checkbox(
+                        &mut self.resize_partitions,
+                        "Resize partitions to minimum size",
+                    );
+                    if self.sector_by_sector {
+                        ui.label("(not available with sector-by-sector copy)");
+                    }
+                });
+            });
 
             // Split archives. Hidden for CHD/DVD (chdman + MAME don't
             // recognise split CHDs); disabled with a note for VHD (always
