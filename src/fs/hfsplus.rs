@@ -17,6 +17,16 @@ use super::CompactResult;
 const HFS_PLUS_SIGNATURE: u16 = 0x482B;
 const HFSX_SIGNATURE: u16 = 0x4858;
 
+/// HFS+ reserved CNIDs (Inside Macintosh: Files / TN1150).
+const HFSPLUS_EXTENTS_FILE_ID: u32 = 3;
+const HFSPLUS_CATALOG_FILE_ID: u32 = 4;
+const HFSPLUS_ALLOCATION_FILE_ID: u32 = 6;
+
+/// Fork-type byte used in extents-overflow keys.
+const HFSPLUS_FORK_DATA: u8 = 0x00;
+#[allow(dead_code)]
+const HFSPLUS_FORK_RESOURCE: u8 = 0xFF;
+
 /// HFS+ extent descriptor: start_block (u32) + block_count (u32).
 #[derive(Debug, Clone, Copy)]
 struct ExtentDescriptor {
@@ -346,6 +356,9 @@ pub struct HfsPlusFilesystem<R: Read + Seek> {
     label: String,
     /// Cached allocation bitmap (loaded on first write operation).
     bitmap: Option<Vec<u8>>,
+    /// Cached extents-overflow B-tree file data (None until first fragmented
+    /// fork forces it to load; stays None on volumes with no overflow file).
+    extents_overflow_data: Option<Vec<u8>>,
 }
 
 impl<R: Read + Seek> HfsPlusFilesystem<R> {
@@ -363,12 +376,31 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
             )));
         }
 
-        // Read the catalog file through its fork extents
-        let catalog_data = read_fork(
+        // Eagerly load the extents-overflow B-tree (its own 8 inline extents
+        // are authoritative — the overflow file can't have overflow records),
+        // then read the catalog with overflow support. Volumes with hundreds
+        // of thousands of files can have catalog forks that exceed 8 inline
+        // extents; reading inline-only would silently truncate and lead to
+        // corrupt walks (and, with no cycle detection, hangs).
+        let extents_overflow_data = if vh.extents_file.logical_size > 0 {
+            Some(read_fork(
+                &mut reader,
+                partition_offset,
+                vh.block_size,
+                &vh.extents_file,
+            )?)
+        } else {
+            None
+        };
+
+        let catalog_data = read_fork_with_overflow(
             &mut reader,
             partition_offset,
             vh.block_size,
             &vh.catalog_file,
+            HFSPLUS_CATALOG_FILE_ID,
+            HFSPLUS_FORK_DATA,
+            extents_overflow_data.as_deref(),
         )?;
 
         // Parse B-tree header from node 0
@@ -390,6 +422,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
             catalog_header,
             label,
             bitmap: None,
+            extents_overflow_data,
         })
     }
 
@@ -550,13 +583,36 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
 
     /// Read the allocation bitmap and return it.
     fn read_allocation_bitmap(&mut self) -> Result<Vec<u8>, FilesystemError> {
-        let alloc_data = read_fork(
+        // Allocation files on large volumes can run beyond 8 inline extents;
+        // route through the overflow-aware reader.
+        read_fork_with_overflow(
             &mut self.reader,
             self.partition_offset,
             self.vh.block_size,
             &self.vh.allocation_file,
-        )?;
-        Ok(alloc_data)
+            HFSPLUS_ALLOCATION_FILE_ID,
+            HFSPLUS_FORK_DATA,
+            self.extents_overflow_data.as_deref(),
+        )
+    }
+
+    /// Read a user fork (data or resource) belonging to `file_id`, consulting
+    /// the extents-overflow B-tree when the inline 8 extents are insufficient.
+    fn read_user_fork(
+        &mut self,
+        file_id: u32,
+        fork_type: u8,
+        fork: &ForkData,
+    ) -> Result<Vec<u8>, FilesystemError> {
+        read_fork_with_overflow(
+            &mut self.reader,
+            self.partition_offset,
+            self.vh.block_size,
+            fork,
+            file_id,
+            fork_type,
+            self.extents_overflow_data.as_deref(),
+        )
     }
 
     /// Ensure the allocation bitmap is cached in memory.
@@ -1105,12 +1161,9 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
                         && data_size > 0
                         && data_size <= 4096
                     {
-                        if let Ok(data) = read_fork(
-                            &mut self.reader,
-                            self.partition_offset,
-                            self.vh.block_size,
-                            &data_fork,
-                        ) {
+                        if let Ok(data) =
+                            self.read_user_fork(file_id, HFSPLUS_FORK_DATA, &data_fork)
+                        {
                             if let Ok(target) = std::str::from_utf8(&data) {
                                 let trimmed = target.trim_end_matches('\0').trim();
                                 if !trimmed.is_empty() {
@@ -1129,12 +1182,9 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
                         && rsrc_size > 0
                         && fe.symlink_target.is_none()
                     {
-                        if let Ok(rsrc) = read_fork(
-                            &mut self.reader,
-                            self.partition_offset,
-                            self.vh.block_size,
-                            &rsrc_fork,
-                        ) {
+                        if let Ok(rsrc) =
+                            self.read_user_fork(file_id, HFSPLUS_FORK_RESOURCE, &rsrc_fork)
+                        {
                             if let Some(target) = super::mac_alias::resolve_alias_target(&rsrc) {
                                 fe.symlink_target = Some(target);
                             }
@@ -1159,12 +1209,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
             FilesystemError::NotFound(format!("file id {file_id} not found in catalog"))
         })?;
 
-        let mut data = read_fork(
-            &mut self.reader,
-            self.partition_offset,
-            self.vh.block_size,
-            &data_fork,
-        )?;
+        let mut data = self.read_user_fork(file_id, HFSPLUS_FORK_DATA, &data_fork)?;
         data.truncate(max_bytes);
         Ok(data)
     }
@@ -1372,6 +1417,176 @@ fn read_fork<R: Read + Seek>(
     Ok(data)
 }
 
+/// Walk the extents-overflow B-tree leaf chain and collect every extent
+/// belonging to (`file_id`, `fork_type`) whose `startBlock` key is at or
+/// past `min_start_block`.
+///
+/// The HFS+ extents-overflow record is:
+/// ```text
+/// HFSPlusExtentKey { keyLength: u16 = 10, forkType: u8, pad: u8,
+///                    fileID: u32, startBlock: u32 }
+/// HFSPlusExtentRecord { extents: [HFSPlusExtentDescriptor; 8] }
+/// ```
+/// Each `HFSPlusExtentDescriptor` is `{ startBlock: u32, blockCount: u32 }`.
+fn collect_hfsplus_overflow_extents(
+    extents_data: &[u8],
+    file_id: u32,
+    fork_type: u8,
+    min_start_block: u32,
+) -> Vec<ExtentDescriptor> {
+    use super::hfs_common::walk_leaf_records;
+
+    if extents_data.len() < 14 + 30 {
+        return Vec::new();
+    }
+    let header = BTreeHeaderRecord::parse(&extents_data[14..14 + 30.min(extents_data.len() - 14)]);
+    let node_size = header.node_size as usize;
+    if node_size == 0 {
+        return Vec::new();
+    }
+
+    let mut out: Vec<(u32, ExtentDescriptor)> = Vec::new();
+    walk_leaf_records::<(), _>(
+        extents_data,
+        header.first_leaf_node,
+        node_size,
+        |_node, _rec_idx, _abs_off, rec| {
+            if rec.len() < 12 {
+                return None;
+            }
+            let key_len = BigEndian::read_u16(&rec[0..2]) as usize;
+            // HFS+ extent key: forkType(1) pad(1) fileID(4) startBlock(4) = 10 bytes.
+            if key_len < 10 || 2 + key_len > rec.len() {
+                return None;
+            }
+            let rec_fork = rec[2];
+            let rec_file = BigEndian::read_u32(&rec[4..8]);
+            let rec_start_block = BigEndian::read_u32(&rec[8..12]);
+            if rec_fork != fork_type || rec_file != file_id {
+                return None;
+            }
+            if rec_start_block < min_start_block {
+                return None;
+            }
+            // Record body is 8 × 8-byte HFSPlusExtentDescriptor immediately
+            // after the key; HFS+ keys are 2-byte aligned by construction.
+            let data_off = 2 + key_len;
+            if data_off + 64 > rec.len() {
+                return None;
+            }
+            for j in 0..8 {
+                let ext = ExtentDescriptor::parse(&rec[data_off + j * 8..data_off + j * 8 + 8]);
+                if ext.block_count > 0 {
+                    out.push((rec_start_block, ext));
+                }
+            }
+            None
+        },
+    );
+
+    out.sort_by_key(|(sb, _)| *sb);
+    out.into_iter().map(|(_, e)| e).collect()
+}
+
+/// Like `read_fork`, but consults the extents-overflow B-tree when the inline
+/// 8 extents don't cover `fork.logical_size`.
+///
+/// `extents_overflow_data` is the bytes of `vh.extents_file` (loaded once via
+/// `read_fork`; the extents-overflow file itself can't have overflow records
+/// — its 8 inline extents are authoritative). Pass `None` if the volume has
+/// no extents-overflow file or you've already verified the fork fits inline.
+fn read_fork_with_overflow<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    block_size: u32,
+    fork: &ForkData,
+    file_id: u32,
+    fork_type: u8,
+    extents_overflow_data: Option<&[u8]>,
+) -> Result<Vec<u8>, FilesystemError> {
+    let mut data = read_fork(reader, partition_offset, block_size, fork)?;
+    let target = fork.logical_size as usize;
+    if data.len() >= target {
+        return Ok(data);
+    }
+    let Some(ext_data) = extents_overflow_data else {
+        return Err(FilesystemError::InvalidData(format!(
+            "file {file_id} fork {fork_type:#x}: {} bytes requested but only \
+             {} bytes in inline extents and no extents-overflow B-tree available",
+            fork.logical_size,
+            data.len()
+        )));
+    };
+    let inline_blocks: u32 = fork.extents.iter().map(|e| e.block_count).sum();
+    let overflow = collect_hfsplus_overflow_extents(ext_data, file_id, fork_type, inline_blocks);
+    for ext in overflow {
+        if data.len() >= target {
+            break;
+        }
+        if ext.block_count == 0 {
+            continue;
+        }
+        let offset = partition_offset + ext.start_block as u64 * block_size as u64;
+        let extent_len = ext.block_count as u64 * block_size as u64;
+        let to_read = extent_len.min((target - data.len()) as u64) as usize;
+        reader.seek(SeekFrom::Start(offset))?;
+        let mut buf = vec![0u8; to_read];
+        reader.read_exact(&mut buf)?;
+        data.extend_from_slice(&buf);
+    }
+    if data.len() < target {
+        return Err(FilesystemError::InvalidData(format!(
+            "file {file_id} fork {fork_type:#x}: extents (inline + overflow) \
+             cover {} of {} bytes",
+            data.len(),
+            fork.logical_size
+        )));
+    }
+    Ok(data)
+}
+
+/// Probe an HFS+ volume header at `partition_offset` and return the volume
+/// label (root folder thread name) without loading the full catalog.
+///
+/// Reads only the first inline extent of the catalog file (capped at 1 MiB)
+/// — enough in practice to contain the B-tree header node and the leaf node
+/// holding the root thread record. Returns None if the partition doesn't
+/// hold an HFS+/HFSX volume or the label can't be located cheaply.
+pub fn probe_hfsplus_volume_label<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+) -> Option<String> {
+    reader.seek(SeekFrom::Start(partition_offset + 1024)).ok()?;
+    let mut vh_buf = [0u8; 512];
+    reader.read_exact(&mut vh_buf).ok()?;
+    let vh = HfsPlusVolumeHeader::parse(&vh_buf).ok()?;
+    if vh.block_size == 0 {
+        return None;
+    }
+    let ext = vh.catalog_file.extents[0];
+    if ext.block_count == 0 {
+        return None;
+    }
+    let want = (ext.block_count as u64 * vh.block_size as u64).min(1 << 20) as usize;
+    if want < 14 + 106 {
+        return None;
+    }
+    reader
+        .seek(SeekFrom::Start(
+            partition_offset + ext.start_block as u64 * vh.block_size as u64,
+        ))
+        .ok()?;
+    let mut buf = vec![0u8; want];
+    reader.read_exact(&mut buf).ok()?;
+    let header = BTreeHeaderRecord::parse(&buf[14..14 + 106]);
+    let label = find_volume_label(&buf, &header);
+    if label.is_empty() {
+        None
+    } else {
+        Some(label)
+    }
+}
+
 /// Write data through a fork's extent descriptors.
 fn write_fork_data<R: Write + Seek>(
     writer: &mut R,
@@ -1403,82 +1618,61 @@ fn decode_utf16be(data: &[u8]) -> String {
 
 /// Find the volume label from the catalog B-tree (root folder thread record).
 fn find_volume_label(catalog_data: &[u8], header: &BTreeHeaderRecord) -> String {
+    use super::hfs_common::walk_leaf_records;
+
     let node_size = header.node_size as usize;
     if node_size == 0 {
         return String::new();
     }
 
-    // Search leaf nodes for the folder thread of CNID 2 (root)
-    let mut node_idx = header.first_leaf_node;
-
-    while node_idx != 0 {
-        let offset = node_idx as usize * node_size;
-        if offset + node_size > catalog_data.len() {
-            break;
-        }
-        let node = &catalog_data[offset..offset + node_size];
-        let desc = BTreeNodeDescriptor::parse(node);
-        if desc.kind != -1 {
-            node_idx = desc.next;
-            continue;
-        }
-
-        for i in 0..desc.num_records as usize {
-            let offset_pos = node_size - 2 * (i + 1);
-            if offset_pos + 2 > node.len() {
-                break;
+    walk_leaf_records::<String, _>(
+        catalog_data,
+        header.first_leaf_node,
+        node_size,
+        |_node_idx, _rec_idx, _abs_off, rec| {
+            if rec.len() < 8 {
+                return None;
             }
-            let rec_offset = BigEndian::read_u16(&node[offset_pos..offset_pos + 2]) as usize;
-            if rec_offset + 8 > node.len() {
-                continue;
+            let key_len = BigEndian::read_u16(&rec[0..2]) as usize;
+            if key_len < 6 || 2 + key_len > rec.len() {
+                return None;
             }
-
-            let key_len = BigEndian::read_u16(&node[rec_offset..rec_offset + 2]) as usize;
-            if key_len < 6 || rec_offset + 2 + key_len > node.len() {
-                continue;
-            }
-            let key_data = &node[rec_offset + 2..rec_offset + 2 + key_len];
-            let parent_id = BigEndian::read_u32(&key_data[0..4]);
-
-            // Thread records for CNID 2 have parent_id = 2 and name_length = 0
+            // Catalog key: parent_id(4) + name_length(2) + name(UTF-16BE)
+            let parent_id = BigEndian::read_u32(&rec[2..6]);
             if parent_id != 2 {
-                continue;
+                return None;
             }
-            let name_length = BigEndian::read_u16(&key_data[4..6]) as usize;
+            let name_length = BigEndian::read_u16(&rec[6..8]) as usize;
             if name_length != 0 {
-                continue;
+                return None;
             }
 
-            // This is a thread record for the root — get the record data
-            let mut rec_data_start = rec_offset + 2 + key_len;
-            if !rec_data_start.is_multiple_of(2) {
-                rec_data_start += 1;
+            // Record data follows the key, 2-byte aligned. HFS+ keys are
+            // already 2-byte sized so no padding is needed in the standard
+            // case, but tolerate odd offsets defensively.
+            let mut data_start = 2 + key_len;
+            if !data_start.is_multiple_of(2) {
+                data_start += 1;
             }
-            if rec_data_start + 10 > node.len() {
-                continue;
+            if data_start + 10 > rec.len() {
+                return None;
             }
-
-            let record_type = BigEndian::read_i16(&node[rec_data_start..rec_data_start + 2]);
-            if record_type == 3 {
-                // Folder thread: type(2) + reserved(2) + parentID(4) + nodeName(2+N*2)
-                if rec_data_start + 10 > node.len() {
-                    continue;
-                }
-                let thread_name_len =
-                    BigEndian::read_u16(&node[rec_data_start + 8..rec_data_start + 10]) as usize;
-                if rec_data_start + 10 + thread_name_len * 2 > node.len() {
-                    continue;
-                }
-                return decode_utf16be(
-                    &node[rec_data_start + 10..rec_data_start + 10 + thread_name_len * 2],
-                );
+            let record_type = BigEndian::read_i16(&rec[data_start..data_start + 2]);
+            // Folder thread = 3
+            if record_type != 3 {
+                return None;
             }
-        }
-
-        node_idx = desc.next;
-    }
-
-    String::new()
+            let thread_name_len =
+                BigEndian::read_u16(&rec[data_start + 8..data_start + 10]) as usize;
+            let body_start = data_start + 10;
+            let body_end = body_start + thread_name_len * 2;
+            if body_end > rec.len() {
+                return None;
+            }
+            Some(decode_utf16be(&rec[body_start..body_end]))
+        },
+    )
+    .unwrap_or_default()
 }
 
 /// Find the index of the last set bit in a bitmap (MSB-first).
@@ -1918,12 +2112,28 @@ impl<R: Read + Seek> CompactHfsPlusReader<R> {
             vh.allocation_file.extents[0].block_count,
         );
 
+        // Load extents-overflow first so the allocation file can use it if
+        // it's fragmented past 8 inline extents.
+        let extents_overflow_data = if vh.extents_file.logical_size > 0 {
+            Some(read_fork(
+                &mut reader,
+                partition_offset,
+                vh.block_size,
+                &vh.extents_file,
+            )?)
+        } else {
+            None
+        };
+
         // Read allocation file
-        let alloc_data = read_fork(
+        let alloc_data = read_fork_with_overflow(
             &mut reader,
             partition_offset,
             vh.block_size,
             &vh.allocation_file,
+            HFSPLUS_ALLOCATION_FILE_ID,
+            HFSPLUS_FORK_DATA,
+            extents_overflow_data.as_deref(),
         )
         .map_err(|e| {
             log::debug!("[HFS+ compact] read_fork(alloc_file) failed: {e}");

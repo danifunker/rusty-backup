@@ -1843,23 +1843,94 @@ impl InspectTab {
                         };
 
                     // For APM disks, probe "Apple_HFS" partitions to show the
-                    // actual HFS variant (HFS vs HFS+ vs HFSX) in the type name.
+                    // actual HFS variant (HFS vs HFS+ vs HFSX) in the type
+                    // name, and prefer the HFS+ volume header label over the
+                    // (often auto-generated) APM partition name. The APM-only
+                    // type_name format from `PartitionTable::partitions()` is
+                    // `"{type_string} ({apm_name})"`; we rebuild it here.
                     if matches!(table, PartitionTable::Apm(_)) {
                         for part in &mut partitions {
-                            if part.partition_type_string.as_deref() == Some("Apple_HFS") {
-                                if let Some(mut br) = make_probe_reader() {
-                                    let detected = rusty_backup::fs::probe_apple_hfs_type(
-                                        &mut br,
-                                        part.start_lba * 512,
-                                    );
-                                    if detected == "HFS+" || detected == "HFSX" {
-                                        part.type_name = part.type_name.replace(
-                                            "Apple_HFS",
-                                            &format!("Apple_HFS ({detected})"),
-                                        );
-                                    }
-                                }
+                            let Some(type_string) = part.partition_type_string.as_deref() else {
+                                continue;
+                            };
+                            if type_string != "Apple_HFS" {
+                                continue;
                             }
+                            // Extract the APM name from the existing
+                            // "Apple_HFS (NAME)" formatted string.
+                            let apm_name = part
+                                .type_name
+                                .strip_prefix(type_string)
+                                .and_then(|s| s.trim_start().strip_prefix('('))
+                                .and_then(|s| s.strip_suffix(')'))
+                                .unwrap_or("")
+                                .to_string();
+
+                            let part_offset = part.start_lba * 512;
+                            let detected = make_probe_reader()
+                                .map(|mut br| {
+                                    rusty_backup::fs::probe_apple_hfs_type(&mut br, part_offset)
+                                        .to_string()
+                                })
+                                .unwrap_or_default();
+                            let variant_tag: Option<&'static str> = match detected.as_str() {
+                                "HFS+" => Some("HFS+"),
+                                "HFSX" => Some("HFSX"),
+                                _ => None,
+                            };
+
+                            // Probe HFS+ volume label cheaply (header + first
+                            // catalog extent only). HFS variant doesn't matter
+                            // for the helper — it bails on non-HFS+ signatures.
+                            let label = if variant_tag.is_some() {
+                                make_probe_reader().and_then(|mut br| {
+                                    rusty_backup::fs::hfsplus::probe_hfsplus_volume_label(
+                                        &mut br,
+                                        part_offset,
+                                    )
+                                })
+                            } else {
+                                None
+                            };
+
+                            // Pick the most informative display name:
+                            //   - HFS+ label if we have one.
+                            //   - Otherwise APM name, but suppress the noisy
+                            //     auto-generated "Apple_HFS_Untitled_N" form
+                            //     macOS Disk Utility writes when no name was
+                            //     provided.
+                            let apm_is_default = apm_name.starts_with("Apple_HFS_Untitled");
+                            let display_name = match (label.as_deref(), apm_name.as_str()) {
+                                (Some(lab), _) if !lab.is_empty() => lab.to_string(),
+                                (_, n) if !n.is_empty() && !apm_is_default => n.to_string(),
+                                _ => String::new(),
+                            };
+                            // If both a real label and a non-default APM name
+                            // exist and they differ, surface the APM name too.
+                            let trailing_apm = match (label.as_deref(), apm_name.as_str()) {
+                                (Some(lab), n)
+                                    if !lab.is_empty()
+                                        && !n.is_empty()
+                                        && !apm_is_default
+                                        && lab != n =>
+                                {
+                                    Some(n.to_string())
+                                }
+                                _ => None,
+                            };
+
+                            let mut new_name = match variant_tag {
+                                Some(tag) => format!("Apple_HFS ({tag})"),
+                                None => "Apple_HFS".to_string(),
+                            };
+                            if !display_name.is_empty() {
+                                new_name.push(' ');
+                                new_name.push_str(&display_name);
+                            }
+                            if let Some(extra) = trailing_apm {
+                                new_name.push_str(&format!(" [APM: {extra}]"));
+                            }
+                            part.type_name = new_name;
                         }
                     }
 
