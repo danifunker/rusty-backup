@@ -15,6 +15,10 @@ use rusty_backup::model::size_mode::SizeMode;
 pub struct SizeModeRowOptions<'a> {
     /// Show a `FillRemaining` radio (restore last-partition only).
     pub allow_fill: bool,
+    /// Show a `MinPlus20` radio (single-file CHD backup tab). The radio is
+    /// also gated on `minimum_size < original_size` because there's no
+    /// headroom worth surfacing otherwise.
+    pub allow_min_plus_20: bool,
     /// Upper bound on Custom DragValue. `None` = 2 TiB default.
     pub max_size: Option<u64>,
     /// Tooltip shown on the DragValue when `max_size` is set.
@@ -38,6 +42,7 @@ impl<'a> Default for SizeModeRowOptions<'a> {
     fn default() -> Self {
         Self {
             allow_fill: false,
+            allow_min_plus_20: false,
             max_size: None,
             max_size_hover: None,
             deferred: None,
@@ -100,6 +105,10 @@ pub fn size_mode_row(
                 }
                 None => {}
             }
+        }
+        if opts.allow_min_plus_20 && minimum_size < original_size {
+            ui.radio_value(choice, SizeMode::MinPlus20, "Min+20%")
+                .on_hover_text("Filesystem minimum plus 20% headroom (capped at original size)");
         }
         ui.radio_value(choice, SizeMode::Custom, "Custom");
         if opts.allow_fill {

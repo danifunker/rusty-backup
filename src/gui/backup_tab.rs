@@ -5,9 +5,16 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use rusty_backup::backup::{
-    BackupConfig, BackupProgress, ChecksumType, CompressionType, LogLevel as BackupLogLevel,
+    metadata::SizePolicy, BackupConfig, BackupProgress, ChecksumType, CompressionType,
+    LogLevel as BackupLogLevel,
 };
 use rusty_backup::fs;
+use rusty_backup::rbformats::chd_options::{
+    codec_label, parse_codec_string, ChdOptions, ChdProfile,
+};
+use rusty_backup::update::UpdateConfig;
+
+use super::chd_options_ui::{ChdOptionsControl, ChdOptionsMode};
 use rusty_backup::model::size_mode::SizeMode;
 use rusty_backup::model::status::VhdExportStatus;
 use rusty_backup::partition::PartitionSizeOverride;
@@ -29,7 +36,7 @@ pub struct BackupTab {
     split_size_mib: u32,
     checksum_type: ChecksumType,
     compression_type: CompressionType,
-    chdman_available: bool,
+    chd_hd_control: ChdOptionsControl,
     backup_running: bool,
     backup_progress: Option<Arc<Mutex<BackupProgress>>>,
     /// Auto-loaded partition info for the selected source
@@ -96,7 +103,26 @@ impl Default for BackupTab {
             split_size_mib: 4000,
             checksum_type: ChecksumType::Sha256,
             compression_type: CompressionType::Zstd,
-            chdman_available: false,
+            chd_hd_control: {
+                let mut ctl = ChdOptionsControl::new(ChdProfile::Hd);
+                // Restore last-used custom codec/hunk choices so users don't
+                // re-tune every launch. Defaults/MiSTer presets are pure
+                // functions so we don't persist mode — restored values land
+                // in the Custom slot, ready to apply once the user flips into
+                // Custom mode.
+                let cfg = UpdateConfig::load();
+                if let Some(spec) = cfg.last_chd_codecs.as_deref() {
+                    if let Ok(codecs) = parse_codec_string(spec) {
+                        ctl.custom.codecs = codecs;
+                    }
+                }
+                if let Some(hs) = cfg.last_chd_hunk_size {
+                    if hs % 512 == 0 {
+                        ctl.custom.hunk_size = hs;
+                    }
+                }
+                ctl
+            },
             backup_running: false,
             backup_progress: None,
             source_partitions: Vec::new(),
@@ -117,15 +143,6 @@ impl Default for BackupTab {
 }
 
 impl BackupTab {
-    /// Set chdman availability (detected at app startup).
-    pub fn set_chdman_available(&mut self, available: bool) {
-        self.chdman_available = available;
-        // Don't default to CHD if not available
-        if !available && self.compression_type == CompressionType::Chd {
-            self.compression_type = CompressionType::Zstd;
-        }
-    }
-
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext, progress: &mut ProgressState) {
         // Poll background backup thread
         self.poll_progress(ctx, progress);
@@ -181,7 +198,7 @@ impl BackupTab {
                                     "Disk Images",
                                     &[
                                         "img", "raw", "bin", "iso", "dd", "vhd", "hda", "hdv",
-                                        "2mg", "dmg", "po", "do", "dsk", "dc42", "woz",
+                                        "2mg", "dmg", "po", "do", "dsk", "dc42", "woz", "chd",
                                     ],
                                 )
                                 .add_filter("All Files", &["*"])
@@ -286,33 +303,33 @@ impl BackupTab {
             // Output format
             ui.horizontal(|ui| {
                 ui.label("Output Format:");
-                let chd_label = if self.chdman_available {
-                    "CHD (chdman)"
-                } else {
-                    "CHD (chdman not found)"
-                };
-                ui.add_enabled(
-                    self.chdman_available,
-                    egui::RadioButton::new(
-                        self.compression_type == CompressionType::Chd,
-                        chd_label,
-                    ),
-                )
-                .clicked()
-                .then(|| {
-                    if self.chdman_available {
-                        self.compression_type = CompressionType::Chd;
-                    }
-                });
-                ui.radio_value(&mut self.compression_type, CompressionType::Vhd, "VHD")
-                    .clicked();
-                ui.radio_value(&mut self.compression_type, CompressionType::Zstd, "zstd")
-                    .clicked();
-                if ui
-                    .radio_value(&mut self.compression_type, CompressionType::None, "None")
-                    .clicked()
-                {}
+                ui.radio_value(
+                    &mut self.compression_type,
+                    CompressionType::Chd,
+                    "CHD (Hard Disk)",
+                );
+                // DVD CHD is intentionally NOT offered here — DVDs are
+                // optical media, handled by the Optical tab. The backup
+                // tab is for hard disks only.
+                ui.radio_value(&mut self.compression_type, CompressionType::Vhd, "VHD");
+                ui.radio_value(&mut self.compression_type, CompressionType::Zstd, "zstd");
+                ui.radio_value(&mut self.compression_type, CompressionType::None, "None");
             });
+
+            // CHD codec / hunk-size knobs (only visible when CHD is selected)
+            if matches!(self.compression_type, CompressionType::Chd) {
+                ui.label(
+                    egui::RichText::new("Output: single CHD file (chdman/MAME compatible).")
+                        .small()
+                        .weak(),
+                );
+                super::chd_options_ui::show(
+                    ui,
+                    "backup_chd",
+                    ChdProfile::Hd,
+                    &mut self.chd_hd_control,
+                );
+            }
 
             // Sector-by-sector option
             ui.checkbox(
@@ -320,26 +337,49 @@ impl BackupTab {
                 "Sector-by-sector copy (includes all blank space)",
             );
 
-            // Resize option
-            ui.checkbox(
-                &mut self.resize_partitions,
-                "Resize partitions to minimum size",
-            );
-
-            // Split archives (disabled for VHD output)
-            let split_enabled = self.compression_type != CompressionType::Vhd;
-            ui.horizontal(|ui| {
-                ui.add_enabled_ui(split_enabled, |ui| {
-                    ui.checkbox(&mut self.split_archives, "Split archives");
-                    if self.split_archives && split_enabled {
-                        ui.label("Split size (MiB):");
-                        ui.add(egui::DragValue::new(&mut self.split_size_mib).range(100..=64000));
+            // Resize option. Sector-by-sector preserves the source byte-for-
+            // byte (free space + unrecognized regions), so resizing would
+            // defeat the point — force-disabled and unchecked while it's on.
+            if self.sector_by_sector {
+                self.resize_partitions = false;
+            }
+            ui.add_enabled_ui(!self.sector_by_sector, |ui| {
+                ui.horizontal(|ui| {
+                    ui.checkbox(
+                        &mut self.resize_partitions,
+                        "Resize partitions to minimum size",
+                    );
+                    if self.sector_by_sector {
+                        ui.label("(not available with sector-by-sector copy)");
                     }
                 });
-                if !split_enabled {
-                    ui.label("(not available for VHD)");
-                }
             });
+
+            // Split archives. Hidden for CHD/DVD (chdman + MAME don't
+            // recognise split CHDs); disabled with a note for VHD (always
+            // one .vhd file).
+            let split_hidden = matches!(
+                self.compression_type,
+                CompressionType::Chd | CompressionType::Dvd
+            );
+            let split_enabled =
+                !split_hidden && !matches!(self.compression_type, CompressionType::Vhd);
+            if !split_hidden {
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(split_enabled, |ui| {
+                        ui.checkbox(&mut self.split_archives, "Split archives");
+                        if self.split_archives && split_enabled {
+                            ui.label("Split size (MiB):");
+                            ui.add(
+                                egui::DragValue::new(&mut self.split_size_mib).range(100..=64000),
+                            );
+                        }
+                    });
+                    if !split_enabled && matches!(self.compression_type, CompressionType::Vhd) {
+                        ui.label("(not available for VHD)");
+                    }
+                });
+            }
 
             // Checksum type
             ui.horizontal(|ui| {
@@ -362,10 +402,15 @@ impl BackupTab {
                     self.selected_device_idx.is_some() || self.image_file_path.is_some();
                 let has_partitions =
                     self.source_partitions.is_empty() || !self.selected_partitions.is_empty();
+                let chd_ok = match self.compression_type {
+                    CompressionType::Chd => self.chd_hd_control.is_valid(ChdProfile::Hd),
+                    _ => true,
+                };
                 let can_start = has_source
                     && self.destination_folder.is_some()
                     && !self.backup_name.is_empty()
-                    && has_partitions;
+                    && has_partitions
+                    && chd_ok;
 
                 if ui
                     .add_enabled(can_start, egui::Button::new("Start Backup"))
@@ -659,12 +704,6 @@ impl BackupTab {
         else {
             return;
         };
-        let Some(file_arc) = self.source_file.clone() else {
-            ctx.log.error(format!(
-                "Cannot calculate minimum size for partition {part_index}: no open source handle",
-            ));
-            return;
-        };
         let path = self.source_path(ctx);
         let is_device = path
             .as_ref()
@@ -673,6 +712,24 @@ impl BackupTab {
                 s.starts_with("/dev/") || s.starts_with("\\\\.\\")
             })
             .unwrap_or(false);
+
+        let source = match path.as_deref() {
+            Some(p) if rusty_backup::model::source_reader::is_chd_path(p) => {
+                rusty_backup::model::min_size_runner::MinSizeSource::Chd(p.to_path_buf())
+            }
+            _ => {
+                let Some(file_arc) = self.source_file.clone() else {
+                    ctx.log.error(format!(
+                        "Cannot calculate minimum size for partition {part_index}: no open source handle",
+                    ));
+                    return;
+                };
+                rusty_backup::model::min_size_runner::MinSizeSource::File {
+                    file: file_arc,
+                    use_sector_aligned: is_device,
+                }
+            }
+        };
 
         let fs_name = self
             .deferred_min_sizes
@@ -684,13 +741,12 @@ impl BackupTab {
         ));
 
         let req = rusty_backup::model::min_size_runner::MinSizeRequest {
-            file: file_arc,
+            source,
             partition_offset: part.start_lba * 512,
             partition_type: part.partition_type_byte,
             partition_type_string: part.partition_type_string.clone(),
             partition_size: part.size_bytes,
             partition_index: part_index,
-            use_sector_aligned: is_device,
         };
         let status = rusty_backup::model::min_size_runner::spawn(req);
         self.pending_min_size_calcs.insert(part_index, status);
@@ -997,6 +1053,44 @@ impl BackupTab {
             rusty_backup::backup::format::generate_backup_name(&path, size_bytes, volume_label);
     }
 
+    /// Returns the ChdOptions matching the active compression type, or
+    /// `None` when the selected output isn't a CHD profile.
+    fn chd_options_for_compression(&self) -> Option<ChdOptions> {
+        match self.compression_type {
+            CompressionType::Chd => Some(self.chd_hd_control.effective(ChdProfile::Hd)),
+            _ => None,
+        }
+    }
+
+    /// Persist only when the user is in Custom mode — Default/MiSTer are pure
+    /// functions of the profile and don't need round-tripping.
+    fn maybe_persist_chd_options(&self) {
+        let custom = match self.compression_type {
+            CompressionType::Chd if self.chd_hd_control.mode == ChdOptionsMode::Custom => {
+                Some(&self.chd_hd_control.custom)
+            }
+            _ => None,
+        };
+        if let Some(opts) = custom {
+            self.persist_chd_options(opts);
+        }
+    }
+
+    /// Persist the active CHD codec/hunk-size choice to `config.json`.
+    /// Called at backup start so future launches restore the user's pick.
+    fn persist_chd_options(&self, opts: &ChdOptions) {
+        let mut cfg = UpdateConfig::load();
+        cfg.last_chd_codecs = Some(
+            opts.codecs
+                .iter()
+                .map(|c| codec_label(*c))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        cfg.last_chd_hunk_size = Some(opts.hunk_size);
+        let _ = cfg.save();
+    }
+
     fn start_backup(&mut self, ctx: &mut TabContext) {
         let source_path = match self.source_path(ctx) {
             Some(p) => p,
@@ -1026,21 +1120,63 @@ impl BackupTab {
             None // All selected — no filter needed
         };
 
+        // Single-file CHD: derive size_policy + per-partition target sizes
+        // from the simple "Resize partitions to minimum size" checkbox. When
+        // the box is on, every partition with a known minimum gets MinPlus20;
+        // partitions whose minimum hasn't been computed fall back to Original.
+        let (size_policy, partition_target_sizes) =
+            if matches!(self.compression_type, CompressionType::Chd)
+                && !self.sector_by_sector
+                && self.resize_partitions
+            {
+                let mut targets: Vec<(usize, u64)> = Vec::new();
+                let mut used_min_plus_20 = false;
+                for part in &self.source_partitions {
+                    if part.is_extended_container {
+                        continue;
+                    }
+                    let target = match self.partition_min_sizes.get(&part.index).copied() {
+                        Some(min) if min < part.size_bytes => {
+                            used_min_plus_20 = true;
+                            SizeMode::MinPlus20.effective_size(part.size_bytes, min, 0)
+                        }
+                        _ => part.size_bytes,
+                    };
+                    targets.push((part.index, target));
+                }
+                let policy = if used_min_plus_20 {
+                    SizePolicy::MinPlus20
+                } else {
+                    SizePolicy::Original
+                };
+                (Some(policy), Some(targets))
+            } else {
+                (None, None)
+            };
+
+        let split_disabled_for_compression = matches!(
+            self.compression_type,
+            CompressionType::Vhd | CompressionType::Chd | CompressionType::Dvd
+        );
         let config = BackupConfig {
             source_path,
             destination_dir,
             backup_name: self.backup_name.clone(),
             compression: self.compression_type,
             checksum: self.checksum_type,
-            split_size_mib: if self.split_archives && self.compression_type != CompressionType::Vhd
-            {
+            split_size_mib: if self.split_archives && !split_disabled_for_compression {
                 Some(self.split_size_mib)
             } else {
                 None
             },
             sector_by_sector: self.sector_by_sector,
             partition_filter,
+            chd_options: self.chd_options_for_compression(),
+            size_policy,
+            partition_target_sizes,
         };
+
+        self.maybe_persist_chd_options();
 
         let progress_arc = Arc::new(Mutex::new(BackupProgress::new()));
         self.backup_progress = Some(Arc::clone(&progress_arc));

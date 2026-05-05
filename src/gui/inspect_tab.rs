@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
@@ -18,7 +18,10 @@ use rusty_backup::partition::editor as pt_editor;
 use rusty_backup::partition::{
     self, detect_alignment, PartitionAlignment, PartitionInfo, PartitionTable,
 };
+use rusty_backup::rbformats::chd_options::ChdProfile;
 use rusty_backup::rbformats::export::ExportFormat;
+
+use super::chd_options_ui::ChdOptionsControl;
 
 use super::browse_view::BrowseView;
 use super::context::TabContext;
@@ -56,6 +59,8 @@ pub struct InspectTab {
     export_whole_disk: bool,
     /// Export format selection
     export_format: ExportFormat,
+    /// CHD (Hard Disk) codec/hunk-size choice.
+    export_chd_hd_control: ChdOptionsControl,
     /// Per-partition sizing configuration for VHD export
     export_partition_configs: Vec<PartitionExportConfig>,
     /// VHD export background thread status
@@ -85,6 +90,9 @@ pub struct InspectTab {
     open_device_file: Option<Arc<File>>,
     /// Guard that keeps the DiskClaim (and any temp file) alive while browsing.
     open_device_guard: Option<rusty_backup::os::TempFileGuard>,
+    /// When the source is a CHD container, we route every reader through a
+    /// fresh `ChdReader` opened from this path. `None` for raw devices/images.
+    chd_image_path: Option<PathBuf>,
     /// Partition table editor popup
     editor_popup: bool,
     /// Partition table editor model state.
@@ -105,6 +113,14 @@ pub struct InspectTab {
     repair_context: Option<(u64, u8, Option<String>)>,
     /// "Expand HFS Volume…" dialog (classic HFS only).
     expand_hfs_dialog: Option<ExpandHfsDialog>,
+    /// CHD info popup text. `Some` while the popup is open.
+    chd_info_text: Option<String>,
+    /// When the user opens a single-file-chd backup folder, the redirect
+    /// swaps the source to `<folder>/<container>` and inspects it as a
+    /// raw CHD. We remember the original backup folder here so per-
+    /// partition browse can hand it to BrowseView, which uses it to
+    /// refresh `metadata.json` after a successful chd_edit save.
+    single_file_chd_backup_folder: Option<PathBuf>,
 }
 
 impl Default for InspectTab {
@@ -126,6 +142,7 @@ impl Default for InspectTab {
             export_popup: false,
             export_whole_disk: true,
             export_format: ExportFormat::Vhd,
+            export_chd_hd_control: ChdOptionsControl::new(ChdProfile::Hd),
             export_partition_configs: Vec::new(),
             export_status: None,
             partition_min_sizes: HashMap::new(),
@@ -139,6 +156,7 @@ impl Default for InspectTab {
             inspect_status: None,
             open_device_file: None,
             open_device_guard: None,
+            chd_image_path: None,
             editor_popup: false,
             editor: PartitionEditor::new(),
             resize_popup: None,
@@ -149,6 +167,8 @@ impl Default for InspectTab {
             repair_report: None,
             repair_context: None,
             expand_hfs_dialog: None,
+            chd_info_text: None,
+            single_file_chd_backup_folder: None,
         }
     }
 }
@@ -246,7 +266,7 @@ impl InspectTab {
                                 "Disk Images",
                                 &[
                                     "vhd", "img", "raw", "bin", "iso", "dd", "hda", "hdv", "2mg",
-                                    "dmg", "po", "do", "dsk", "dc42", "woz",
+                                    "dmg", "po", "do", "dsk", "dc42", "woz", "chd",
                                 ],
                             )
                             .add_filter("All Files", &["*"])
@@ -367,6 +387,18 @@ impl InspectTab {
                 .clicked()
             {
                 self.init_resize_popup(ctx);
+            }
+
+            // CHD Info — visible whenever the source is a .chd file
+            if let Some(chd_path) = self.chd_image_path.clone() {
+                if ui.button("CHD Info").clicked() {
+                    match rusty_backup::rbformats::chd::format_chd_info(&chd_path) {
+                        Ok(text) => self.chd_info_text = Some(text),
+                        Err(e) => {
+                            ctx.log.error(format!("CHD Info failed: {}", e));
+                        }
+                    }
+                }
             }
 
             // Close button — releases the device/image and clears results
@@ -925,6 +957,26 @@ impl InspectTab {
     }
 
     fn show_export_popup(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
+        // CHD (Hard Disk) requires a raw image / device source. The
+        // underlying export_whole_disk_chd bails on backup folders, and
+        // Clonezilla disks go through a VHD-temp convert path that doesn't
+        // reach the CHD encoder. DVD CHD / CD CHD / BIN-CUE belong on the
+        // optical tab — they're not offered here.
+        let chd_hd_enabled = self.backup_folder_path.is_none() && self.clonezilla_image.is_none();
+
+        // If CHD was selected and the source no longer supports it, fall
+        // back to VHD before the popup renders.
+        if self.export_format == ExportFormat::Chd && !chd_hd_enabled {
+            self.export_format = ExportFormat::Vhd;
+        }
+
+        let is_chd_format = self.export_format == ExportFormat::Chd;
+        if is_chd_format {
+            // Per-partition CHD would emit headless partition slices that no
+            // emulator consumes — force whole-disk.
+            self.export_whole_disk = true;
+        }
+
         egui::Window::new("Export Disk Image")
             .collapsible(false)
             .resizable(true)
@@ -939,17 +991,30 @@ impl InspectTab {
                     true,
                     "Whole Disk (single file)",
                 );
-                ui.radio_value(
-                    &mut self.export_whole_disk,
-                    false,
-                    "Per Partition (one file per partition)",
+                let per_part_resp = ui.add_enabled(
+                    !is_chd_format,
+                    egui::RadioButton::new(
+                        !self.export_whole_disk && !is_chd_format,
+                        "Per Partition (one file per partition)",
+                    ),
                 );
+                if per_part_resp.clicked() && !is_chd_format {
+                    self.export_whole_disk = false;
+                }
+                if is_chd_format {
+                    per_part_resp.on_hover_text(
+                        "Per-partition export is not supported for CHD — each \
+                         partition would be a headless slice with no MBR/GPT, \
+                         which no emulator can consume. Use whole-disk export \
+                         instead.",
+                    );
+                }
 
                 ui.add_space(4.0);
 
                 // Export format
                 ui.label(egui::RichText::new("Format:").strong());
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.radio_value(&mut self.export_format, ExportFormat::Vhd, "VHD");
                     ui.radio_value(&mut self.export_format, ExportFormat::Raw, "Raw (.img)");
                     ui.radio_value(&mut self.export_format, ExportFormat::TwoMg, "2MG (.2mg)");
@@ -965,7 +1030,39 @@ impl InspectTab {
                     .on_hover_text(
                         "Mac / Apple IIgs DiskCopy 4.2 (floppy only: 400K / 720K / 800K / 1440K)",
                     );
+
+                    let hd_resp = ui.add_enabled(
+                        chd_hd_enabled,
+                        egui::RadioButton::new(
+                            self.export_format == ExportFormat::Chd,
+                            "CHD (Hard Disk)",
+                        ),
+                    );
+                    if hd_resp.clicked() {
+                        self.export_format = ExportFormat::Chd;
+                    }
+                    if chd_hd_enabled {
+                        hd_resp.on_hover_text(
+                            "MAME hard-disk CHD (512-byte unit). DVD / CD CHD and BIN/CUE \
+                             extraction live on the Optical tab.",
+                        );
+                    } else {
+                        hd_resp.on_hover_text(
+                            "CHD export needs a raw image or device source — backup \
+                             folders and Clonezilla images aren't supported.",
+                        );
+                    }
                 });
+
+                if self.export_format == ExportFormat::Chd {
+                    ui.add_space(4.0);
+                    super::chd_options_ui::show(
+                        ui,
+                        "inspect_chd",
+                        ChdProfile::Hd,
+                        &mut self.export_chd_hd_control,
+                    );
+                }
 
                 ui.add_space(8.0);
 
@@ -1014,6 +1111,92 @@ impl InspectTab {
 
                 ui.add_space(8.0);
 
+                // CHD re-export workflow + disk-usage banner. Visible
+                // only for whole-disk CHD output. Free-space check runs
+                // at Export-click time, not here, because we don't know
+                // the destination directory until the user picks one.
+                if self.export_whole_disk
+                    && matches!(self.export_format, ExportFormat::Chd)
+                    && self.partition_table.is_some()
+                {
+                    let is_chd_source = self
+                        .image_file_path
+                        .as_deref()
+                        .map(rusty_backup::model::source_reader::is_chd_path)
+                        .unwrap_or(false);
+                    let has_resize = self.export_picker_has_resize();
+                    let workflow = match (is_chd_source, has_resize) {
+                        (true, true) => {
+                            "Workflow: decompress source CHD to a temp file -> apply \
+                             resize plan -> recompress to destination CHD."
+                        }
+                        (true, false) => {
+                            "Workflow: stream source CHD -> recompress to destination CHD \
+                             (no scratch file)."
+                        }
+                        (false, true) => {
+                            "Workflow: build resized image in a sparse temp file -> \
+                             compress to destination CHD."
+                        }
+                        (false, false) => {
+                            "Workflow: stream source -> compress to destination CHD \
+                             (no scratch file)."
+                        }
+                    };
+                    ui.label(egui::RichText::new(workflow).small().italics());
+
+                    // Disk-usage estimate. Source CHD file size feeds the
+                    // output upper bound; raw-image source falls back to
+                    // logical disk size.
+                    let source_chd_file_size = if is_chd_source {
+                        self.image_file_path
+                            .as_ref()
+                            .and_then(|p| std::fs::metadata(p).ok())
+                            .map(|m| m.len())
+                    } else {
+                        None
+                    };
+                    let logical_size = self
+                        .partitions
+                        .iter()
+                        .map(|p| p.start_lba.saturating_mul(512).saturating_add(p.size_bytes))
+                        .max()
+                        .unwrap_or(0);
+                    let est = rusty_backup::backup::single_file_chd::estimate_export_disk_usage(
+                        logical_size,
+                        source_chd_file_size,
+                        &self.partitions,
+                        has_resize,
+                    );
+                    ui.label(format!(
+                        "Estimated peak new disk usage: {} MiB \
+                         (scratch {} MiB + output {} MiB). \
+                         Available space is checked when you pick a destination.",
+                        est.required_total() / (1024 * 1024),
+                        est.scratch_bytes / (1024 * 1024),
+                        est.output_bytes / (1024 * 1024),
+                    ));
+
+                    // Sector-by-sector source warning. Only shown when
+                    // resizing — re-export at original sizes preserves
+                    // the byte-for-byte property recorded in the source
+                    // backup.
+                    if has_resize && self.source_is_sector_by_sector_backup() {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "Warning: the source is a sector-by-sector backup. \
+                                 Re-exporting with new partition sizes drops the \
+                                 byte-for-byte preservation of free space and \
+                                 unrecognized filesystem regions — only smart-compact \
+                                 areas of recognized partitions carry over.",
+                            )
+                            .color(egui::Color32::from_rgb(220, 160, 70)),
+                        );
+                    }
+                    ui.add_space(8.0);
+                }
+
                 ui.horizontal(|ui| {
                     if ui.button("Export...").clicked() {
                         self.export_popup = false;
@@ -1024,6 +1207,123 @@ impl InspectTab {
                     }
                 });
             });
+    }
+
+    /// True if the source backup is sector-by-sector (preserves free
+    /// space + unrecognized FS regions byte-for-byte). Only meaningful
+    /// when the inspect tab is looking at a single-file-CHD backup body
+    /// (the Stage 6 redirect set `single_file_chd_backup_folder`); falls
+    /// back to `false` for plain CHDs and raw images.
+    fn source_is_sector_by_sector_backup(&self) -> bool {
+        let folder = match self.single_file_chd_backup_folder.as_ref() {
+            Some(f) => f,
+            None => return false,
+        };
+        let path = folder.join("metadata.json");
+        let bytes = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        match serde_json::from_str::<rusty_backup::backup::metadata::BackupMetadata>(&bytes) {
+            Ok(m) => m.sector_by_sector,
+            Err(_) => false,
+        }
+    }
+
+    /// Sum of "we'd actually emit a different-sized partition" across the
+    /// per-partition picker. Used to gate the resize-only banners.
+    fn export_picker_has_resize(&self) -> bool {
+        self.export_partition_configs.iter().any(|cfg| {
+            self.partitions
+                .iter()
+                .find(|p| p.index == cfg.index)
+                .map(|p| p.size_bytes != cfg.effective_size())
+                .unwrap_or(false)
+        })
+    }
+
+    /// Build the partition context for a CHD whole-disk export, when the
+    /// source has a parsed table the single-file-CHD pipeline supports.
+    /// Returns `None` (and falls back to the legacy raw-stream path) when
+    /// there's no table or it's an unsupported variant — that case loses
+    /// resize but still produces a valid CHD via the streaming path.
+    fn build_chd_partition_context(
+        &self,
+        source: &Path,
+        ctx: &mut TabContext,
+    ) -> Option<export_runner::NativeWholeDiskChdPartitionContext> {
+        use rusty_backup::backup::single_file_chd;
+        let table = self.partition_table.clone()?;
+        if !single_file_chd::is_supported(&table) {
+            return None;
+        }
+        let partitions = self.partitions.clone();
+        let alignment_sectors = self
+            .alignment
+            .as_ref()
+            .map(|a| a.alignment_sectors)
+            .unwrap_or(0);
+
+        // Sector 0 of the source. Routed through ChdReader for CHD
+        // sources so we don't have to special-case the inspect-tab CHD
+        // path here. Falls back to a plain file read for raw images and
+        // device paths.
+        let mut sector0 = [0u8; 512];
+        let read_result = if rusty_backup::model::source_reader::is_chd_path(source) {
+            match rusty_backup::rbformats::chd::ChdReader::open(source) {
+                Ok(mut r) => r.read_exact(&mut sector0),
+                Err(e) => {
+                    ctx.log.error(format!(
+                        "Couldn't read CHD source for partition-table sector: {e}; \
+                             falling back to streaming export."
+                    ));
+                    return None;
+                }
+            }
+        } else {
+            match std::fs::File::open(source) {
+                Ok(mut f) => f.read_exact(&mut sector0),
+                Err(e) => {
+                    ctx.log.error(format!(
+                        "Couldn't open source to read partition-table sector: {e}; \
+                             falling back to streaming export."
+                    ));
+                    return None;
+                }
+            }
+        };
+        if let Err(e) = read_result {
+            ctx.log.error(format!(
+                "Couldn't read sector 0 from source: {e}; \
+                 falling back to streaming export."
+            ));
+            return None;
+        }
+
+        // Build resize targets from the picker. When the user kept
+        // every partition at Original, the runner sees an empty Vec and
+        // chooses the no-scratch fast path.
+        let resize_targets: Vec<(usize, u64)> = self
+            .export_partition_configs
+            .iter()
+            .filter_map(|cfg| {
+                let new = cfg.effective_size();
+                if let Some(part) = partitions.iter().find(|p| p.index == cfg.index) {
+                    if part.size_bytes != new {
+                        return Some((cfg.index, new));
+                    }
+                }
+                None
+            })
+            .collect();
+
+        Some(export_runner::NativeWholeDiskChdPartitionContext {
+            partition_table: table,
+            partitions,
+            source_partition_table_bytes: sector0,
+            alignment_sectors,
+            resize_targets,
+        })
     }
 
     fn start_export(&mut self, ctx: &mut TabContext) {
@@ -1044,6 +1344,55 @@ impl InspectTab {
                 Some(p) => p,
                 None => return,
             };
+
+            // CHD whole-disk: check free space at the picked destination
+            // against the disk-usage estimate. Only blocks when we can
+            // actually measure free space (returns None on unsupported
+            // FS). Underlying writes still error cleanly if disk fills up
+            // mid-encode, so this is just a friendly heads-up.
+            if matches!(format, ExportFormat::Chd) && self.partition_table.is_some() {
+                let is_chd_source = self
+                    .image_file_path
+                    .as_deref()
+                    .map(rusty_backup::model::source_reader::is_chd_path)
+                    .unwrap_or(false);
+                let source_chd_size = if is_chd_source {
+                    self.image_file_path
+                        .as_ref()
+                        .and_then(|p| std::fs::metadata(p).ok())
+                        .map(|m| m.len())
+                } else {
+                    None
+                };
+                let logical_size = self
+                    .partitions
+                    .iter()
+                    .map(|p| p.start_lba.saturating_mul(512).saturating_add(p.size_bytes))
+                    .max()
+                    .unwrap_or(0);
+                let est = rusty_backup::backup::single_file_chd::estimate_export_disk_usage(
+                    logical_size,
+                    source_chd_size,
+                    &self.partitions,
+                    self.export_picker_has_resize(),
+                );
+                let dest_dir = dest.parent().unwrap_or(Path::new("."));
+                if let Some(avail) = rusty_backup::os::available_space(dest_dir) {
+                    if est.required_total() > avail {
+                        let msg = format!(
+                            "Estimated peak new disk usage ({} MiB) exceeds available \
+                             space at {} ({} MiB). Free up space or pick a different \
+                             destination, then try again.",
+                            est.required_total() / (1024 * 1024),
+                            dest_dir.display(),
+                            avail / (1024 * 1024),
+                        );
+                        ctx.log.error(&msg);
+                        self.last_error = Some(msg);
+                        return;
+                    }
+                }
+            }
 
             let status = if let Some(cz_image) = self.clonezilla_image.clone() {
                 let source = match &self.backup_folder_path {
@@ -1088,14 +1437,28 @@ impl InspectTab {
                     format_desc,
                     dest.display()
                 ));
-                export_runner::start_native_whole_disk(
-                    format,
-                    source,
-                    self.backup_metadata.clone(),
-                    overrides,
-                    dest,
-                    total_bytes,
-                )
+                if format == ExportFormat::Chd {
+                    let opts = self.export_chd_hd_control.effective(ChdProfile::Hd);
+                    let partition_context = self.build_chd_partition_context(&source, ctx);
+                    export_runner::start_native_whole_disk_chd(
+                        format,
+                        source,
+                        dest,
+                        Some(opts),
+                        false,
+                        total_bytes,
+                        partition_context,
+                    )
+                } else {
+                    export_runner::start_native_whole_disk(
+                        format,
+                        source,
+                        self.backup_metadata.clone(),
+                        overrides,
+                        dest,
+                        total_bytes,
+                    )
+                }
             };
             self.export_status = Some(status);
         } else {
@@ -1227,6 +1590,8 @@ impl InspectTab {
         // Release the open device fd and disk claim (remounts the disk).
         self.open_device_file = None;
         self.open_device_guard = None;
+        self.chd_image_path = None;
+        self.single_file_chd_backup_folder = None;
     }
 
     fn load_backup_metadata(&mut self, ctx: &mut TabContext) {
@@ -1268,6 +1633,37 @@ impl InspectTab {
         for msg in &out.warnings {
             ctx.log.warn(msg);
         }
+        // Single-file-CHD backups put the entire disk image inside
+        // `disk.chd`. The existing per-partition inspect/browse path
+        // doesn't know how to slice byte ranges out of the container, so
+        // redirect the user to "Open VHD/Disk Image" on the CHD itself —
+        // that path already handles CHD via ChdReader and gives full
+        // browse + CHD-info access.
+        if matches!(
+            out.metadata.layout,
+            rusty_backup::backup::metadata::BackupLayout::SingleFileChd
+        ) {
+            if let Some(folder) = &self.backup_folder_path {
+                let container = out.metadata.container.as_deref().unwrap_or("disk.chd");
+                let chd_path = folder.join(container);
+                ctx.log.info(format!(
+                    "Single-file-CHD backup detected; opening {} as a disk image \
+                     for inspection (instead of the backup folder).",
+                    chd_path.display(),
+                ));
+                let original_folder = folder.clone();
+                self.backup_folder_path = None;
+                self.prev_backup_path = None;
+                self.image_file_path = Some(chd_path);
+                self.prev_image_path = self.image_file_path.clone();
+                self.run_inspect(ctx);
+                // Set after run_inspect, since run_inspect → clear_results
+                // would otherwise wipe this field. Edit-mode save path on
+                // the now-open CHD will use it to refresh metadata.json.
+                self.single_file_chd_backup_folder = Some(original_folder);
+                return;
+            }
+        }
         self.backup_metadata = Some(out.metadata);
         self.partition_table = out.partition_table;
         self.alignment = out.alignment;
@@ -1291,6 +1687,15 @@ impl InspectTab {
         };
 
         ctx.log.info(format!("Inspecting {}...", path.display()));
+
+        // Cache CHD path: subsequent per-partition probes (HFS variant probe,
+        // hfs_block_size, partition_minimum_size) need a fresh ChdReader rather
+        // than reading partition_offset off the raw .chd file.
+        self.chd_image_path = if rusty_backup::model::source_reader::is_chd_path(&path) {
+            Some(path.clone())
+        } else {
+            None
+        };
 
         // All device I/O runs on a background thread so DA unmount/claim
         // (which can block up to ~5 s) never freezes the GUI.
@@ -1414,13 +1819,35 @@ impl InspectTab {
                     let alignment = detect_alignment(&table);
                     let mut partitions = table.partitions();
 
+                    // CHD-aware reader factory for per-partition probes. For
+                    // CHD sources the raw .chd file is compressed at byte
+                    // offsets, so partition_offset reads off it return garbage
+                    // (e.g. 0x504D "PM" inside an APM map). Open a fresh
+                    // ChdReader instead so partition_offset addresses the
+                    // unwrapped disk image.
+                    let is_chd = rusty_backup::model::source_reader::is_chd_path(&path);
+                    let make_probe_reader =
+                        || -> Option<Box<dyn rusty_backup::rbformats::ReadSeek>> {
+                            if is_chd {
+                                rusty_backup::rbformats::chd::ChdReader::open(&path)
+                                    .ok()
+                                    .map(|r| {
+                                        Box::new(r) as Box<dyn rusty_backup::rbformats::ReadSeek>
+                                    })
+                            } else {
+                                device_file.try_clone().ok().map(|f| {
+                                    Box::new(BufReader::new(f))
+                                        as Box<dyn rusty_backup::rbformats::ReadSeek>
+                                })
+                            }
+                        };
+
                     // For APM disks, probe "Apple_HFS" partitions to show the
                     // actual HFS variant (HFS vs HFS+ vs HFSX) in the type name.
                     if matches!(table, PartitionTable::Apm(_)) {
                         for part in &mut partitions {
                             if part.partition_type_string.as_deref() == Some("Apple_HFS") {
-                                if let Ok(f) = device_file.try_clone() {
-                                    let mut br = BufReader::new(f);
+                                if let Some(mut br) = make_probe_reader() {
                                     let detected = rusty_backup::fs::probe_apple_hfs_type(
                                         &mut br,
                                         part.start_lba * 512,
@@ -1457,8 +1884,7 @@ impl InspectTab {
                         if !(is_hfs_apm || is_hfs_mbr || is_hfs_superfloppy) {
                             continue;
                         }
-                        if let Ok(f) = device_file.try_clone() {
-                            let mut br = BufReader::new(f);
+                        if let Some(mut br) = make_probe_reader() {
                             part.hfs_block_size = rusty_backup::fs::hfs_block_size_at_offset(
                                 &mut br,
                                 part.start_lba * 512,
@@ -1497,12 +1923,13 @@ impl InspectTab {
                         if part.partition_type_byte == 0xEE {
                             continue;
                         }
-                        let Ok(f) = device_file.try_clone() else {
-                            continue;
-                        };
-                        let result = if is_device {
+                        let result = if is_chd {
+                            let Ok(reader) = rusty_backup::rbformats::chd::ChdReader::open(&path)
+                            else {
+                                continue;
+                            };
                             rusty_backup::fs::partition_minimum_size(
-                                rusty_backup::os::SectorAlignedReader::new(f),
+                                reader,
                                 part.start_lba * 512,
                                 part.partition_type_byte,
                                 part.partition_type_string.as_deref(),
@@ -1511,15 +1938,30 @@ impl InspectTab {
                                 &|_| {},
                             )
                         } else {
-                            rusty_backup::fs::partition_minimum_size(
-                                BufReader::new(f),
-                                part.start_lba * 512,
-                                part.partition_type_byte,
-                                part.partition_type_string.as_deref(),
-                                part.size_bytes,
-                                false,
-                                &|_| {},
-                            )
+                            let Ok(f) = device_file.try_clone() else {
+                                continue;
+                            };
+                            if is_device {
+                                rusty_backup::fs::partition_minimum_size(
+                                    rusty_backup::os::SectorAlignedReader::new(f),
+                                    part.start_lba * 512,
+                                    part.partition_type_byte,
+                                    part.partition_type_string.as_deref(),
+                                    part.size_bytes,
+                                    false,
+                                    &|_| {},
+                                )
+                            } else {
+                                rusty_backup::fs::partition_minimum_size(
+                                    BufReader::new(f),
+                                    part.start_lba * 512,
+                                    part.partition_type_byte,
+                                    part.partition_type_string.as_deref(),
+                                    part.size_bytes,
+                                    false,
+                                    &|_| {},
+                                )
+                            }
                         };
                         match result {
                             rusty_backup::fs::MinimumResult::Computed(Some(min_size)) => {
@@ -1923,6 +2365,9 @@ impl InspectTab {
         // Fsck results popup
         self.render_fsck_popup(ui, ctx);
 
+        // CHD Info popup
+        self.render_chd_info_popup(ui);
+
         // Expand-HFS dialog
         if let Some(dlg) = &mut self.expand_hfs_dialog {
             let still_open = dlg.show(ui.ctx(), ctx.log);
@@ -2012,6 +2457,35 @@ impl InspectTab {
     }
 
     /// Render the filesystem check results popup.
+    fn render_chd_info_popup(&mut self, ui: &mut egui::Ui) {
+        let Some(text) = self.chd_info_text.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut buf = text.clone();
+        egui::Window::new("CHD Info")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(560.0)
+            .default_height(420.0)
+            .show(ui.ctx(), |ui| {
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut buf)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(20)
+                                .interactive(true),
+                        );
+                    });
+            });
+        if !open {
+            self.chd_info_text = None;
+        }
+    }
+
     fn render_fsck_popup(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
         if !self.show_fsck_popup {
             return;
@@ -2241,12 +2715,6 @@ impl InspectTab {
         else {
             return;
         };
-        let Some(file_arc) = self.open_device_file.clone() else {
-            ctx.log.error(format!(
-                "Cannot calculate minimum size for partition {part_index}: no open device handle",
-            ));
-            return;
-        };
         let is_device = self
             .selected_device_idx
             .and_then(|idx| ctx.devices.get(idx))
@@ -2255,6 +2723,22 @@ impl InspectTab {
                 s.starts_with("/dev/") || s.starts_with("\\\\.\\")
             })
             .unwrap_or(false);
+
+        // Prefer a CHD path source over the raw device handle: opening the
+        // raw .chd file at partition_offset would read compressed bytes.
+        let source = if let Some(chd_path) = self.chd_image_path.clone() {
+            rusty_backup::model::min_size_runner::MinSizeSource::Chd(chd_path)
+        } else if let Some(file_arc) = self.open_device_file.clone() {
+            rusty_backup::model::min_size_runner::MinSizeSource::File {
+                file: file_arc,
+                use_sector_aligned: is_device,
+            }
+        } else {
+            ctx.log.error(format!(
+                "Cannot calculate minimum size for partition {part_index}: no open source handle",
+            ));
+            return;
+        };
 
         let fs_name = self
             .deferred_min_sizes
@@ -2266,13 +2750,12 @@ impl InspectTab {
         ));
 
         let req = rusty_backup::model::min_size_runner::MinSizeRequest {
-            file: file_arc,
+            source,
             partition_offset: part.start_lba * 512,
             partition_type: part.partition_type_byte,
             partition_type_string: part.partition_type_string.clone(),
             partition_size: part.size_bytes,
             partition_index: part_index,
-            use_sector_aligned: is_device,
         };
         let status = rusty_backup::model::min_size_runner::spawn(req);
         self.pending_min_size_calcs.insert(part_index, status);
@@ -2360,6 +2843,13 @@ impl InspectTab {
             let preopen = None;
             self.browse_view
                 .open(path, offset, ptype, partition_type_string, preopen);
+            // If this CHD is the body of a single-file-chd backup, hand
+            // the backup folder to BrowseView so a successful chd_edit
+            // save refreshes metadata.json (per-partition checksums +
+            // container SHA-1). Plain-CHD images won't have this set.
+            if let Some(folder) = self.single_file_chd_backup_folder.clone() {
+                self.browse_view.set_single_file_chd_backup_folder(folder);
+            }
             return;
         }
 
@@ -2466,8 +2956,13 @@ impl InspectTab {
                     checksum_type,
                 );
             }
-            "chd" => {
-                // CHD-compressed backup — open directly via ChdReader (on-demand decompression)
+            "chd" | "chd-dvd" => {
+                // CHD-compressed backup — open directly via ChdReader (on-demand
+                // decompression). Editing flows through `chd_edit::ChdEditSession`
+                // (diff-against-parent for compressed, in-place for uncompressed),
+                // so no `archive_edit_ctx` is set here. NOTE: backup metadata.json
+                // checksum / compressed_files entries are NOT auto-updated after
+                // a CHD edit yet — that lives on the Phase 2 follow-up TODO.
                 ctx.log.info(format!(
                     "Browsing partition {} from CHD: {}",
                     part_index, data_file,
@@ -2479,16 +2974,7 @@ impl InspectTab {
                     partition_type_string.clone(),
                     None,
                 );
-                // Set archive edit context for decompress→edit→recompress flow
-                self.browse_view.set_archive_edit_context(
-                    data_path,
-                    compression_type_str,
-                    part_meta.original_size_bytes,
-                    part_meta.compacted,
-                    metadata_path,
-                    part_index,
-                    checksum_type,
-                );
+                let _ = (metadata_path, checksum_type, compression_type_str);
             }
             "woz" => {
                 ctx.log.info(format!(

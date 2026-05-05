@@ -4,7 +4,6 @@ use rusty_backup::update::UpdateConfig;
 #[derive(Default)]
 pub struct SettingsDialog {
     pub open: bool,
-    chdman_path: String,
     update_check_enabled: bool,
     update_repo_url: String,
     status_message: Option<String>,
@@ -23,28 +22,6 @@ impl SettingsDialog {
             .collapsible(false)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.heading("chdman Configuration");
-                    ui.add_space(10.0);
-
-                    ui.label("Path to chdman executable:");
-                    ui.horizontal(|ui| {
-                        ui.text_edit_singleline(&mut self.chdman_path);
-                        if ui.button("Browse...").clicked() {
-                            if let Some(path) = super::file_dialog()
-                                .set_title("Select chdman executable")
-                                .pick_file()
-                            {
-                                self.chdman_path = path.to_string_lossy().to_string();
-                            }
-                        }
-                    });
-
-                    ui.label("Leave empty to use system PATH");
-                    ui.add_space(20.0);
-
-                    ui.separator();
-                    ui.add_space(10.0);
-
                     // macOS permissions info
                     #[cfg(target_os = "macos")]
                     {
@@ -107,9 +84,7 @@ impl SettingsDialog {
     }
 
     pub fn open_dialog(&mut self) {
-        // Load current config
         let config = UpdateConfig::load();
-        self.chdman_path = config.chdman_path.unwrap_or_default();
         self.update_check_enabled = config.update_check.enabled;
         self.update_repo_url = config.update_check.repository_url;
         self.status_message = None;
@@ -119,14 +94,6 @@ impl SettingsDialog {
     fn save_settings(&mut self) {
         let mut config = UpdateConfig::load();
 
-        // Update chdman path
-        config.chdman_path = if self.chdman_path.trim().is_empty() {
-            None
-        } else {
-            Some(self.chdman_path.trim().to_string())
-        };
-
-        // Update update check settings
         config.update_check.enabled = self.update_check_enabled;
         config.update_check.repository_url = self.update_repo_url.trim().to_string();
 
@@ -136,8 +103,6 @@ impl SettingsDialog {
                     "Settings saved successfully! Restart to apply update check changes."
                         .to_string(),
                 );
-                // Note: chdman detection will use new path on next backup
-                // Note: update check settings take effect on next app start
             }
             Err(e) => {
                 self.status_message = Some(format!("Error saving settings: {}", e));

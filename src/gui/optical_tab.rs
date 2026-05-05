@@ -9,6 +9,12 @@ use rusty_backup::backup::LogLevel as BackupLogLevel;
 use rusty_backup::optical::browse_view::OpticalDiscBrowseView;
 use rusty_backup::optical::convert::ConvertProgress;
 use rusty_backup::optical::rip::{RipConfig, RipFormat, RipProgress};
+use rusty_backup::rbformats::chd_options::{
+    codec_label, parse_codec_string, ChdOptions, ChdProfile,
+};
+use rusty_backup::update::UpdateConfig;
+
+use super::chd_options_ui::{ChdOptionsControl, ChdOptionsMode};
 
 use super::progress::{LogPanel, ProgressState};
 
@@ -48,10 +54,12 @@ pub struct OpticalTab {
     convert_running: bool,
     convert_progress: Option<Arc<Mutex<ConvertProgress>>>,
     browse_view: OpticalDiscBrowseView,
-    chdman_available: bool,
+    chd_cd_control: ChdOptionsControl,
     /// Track source changes for auto-detection
     prev_drive_idx: Option<usize>,
     prev_image_path: Option<PathBuf>,
+    /// CHD info popup text. `Some` while the popup is open.
+    chd_info_text: Option<String>,
 }
 
 impl Default for OpticalTab {
@@ -72,19 +80,48 @@ impl Default for OpticalTab {
             convert_running: false,
             convert_progress: None,
             browse_view: OpticalDiscBrowseView::default(),
-            chdman_available: false,
+            chd_cd_control: {
+                let mut ctl = ChdOptionsControl::new(ChdProfile::Cd);
+                // Restore last-used CD codec/hunk choice. CD codecs ("cdlz"
+                // etc.) are distinct from HD codecs, so the persisted value
+                // only round-trips safely for the matching profile.
+                let cfg = UpdateConfig::load();
+                if let Some(spec) = cfg.last_chd_codecs.as_deref() {
+                    if let Ok(codecs) = parse_codec_string(spec) {
+                        if codecs
+                            .iter()
+                            .all(|c| codec_label(*c).starts_with("cd") || *c == 0)
+                        {
+                            ctl.custom.codecs = codecs;
+                        }
+                    }
+                }
+                if let Some(hs) = cfg.last_chd_hunk_size {
+                    if hs % 2448 == 0 {
+                        ctl.custom.hunk_size = hs;
+                    }
+                }
+                ctl
+            },
             prev_drive_idx: None,
             prev_image_path: None,
+            chd_info_text: None,
         }
     }
 }
 
 impl OpticalTab {
-    pub fn set_chdman_available(&mut self, available: bool) {
-        self.chdman_available = available;
-        if !available && self.output_format == OutputFormat::Chd {
-            self.output_format = OutputFormat::Iso;
-        }
+    fn persist_chd_options(&self, opts: &ChdOptions) {
+        let mut cfg = UpdateConfig::load();
+        cfg.last_chd_codecs = Some(
+            opts.codecs
+                .iter()
+                .map(|c| codec_label(*c))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        cfg.last_chd_hunk_size = Some(opts.hunk_size);
+        let _ = cfg.save();
     }
 
     pub fn refresh_drives(&mut self) {
@@ -228,7 +265,49 @@ impl OpticalTab {
                 if ui.button("Close Disc").clicked() {
                     self.close_disc();
                 }
+                if let Some(path) = self.image_file_path.clone() {
+                    if path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.eq_ignore_ascii_case("chd"))
+                        .unwrap_or(false)
+                        && ui.button("CHD Info").clicked()
+                    {
+                        match rusty_backup::rbformats::chd::format_chd_info(&path) {
+                            Ok(text) => self.chd_info_text = Some(text),
+                            Err(e) => {
+                                log.error(format!("CHD Info failed: {}", e));
+                            }
+                        }
+                    }
+                }
             });
+        }
+
+        // CHD Info popup
+        if let Some(text) = self.chd_info_text.clone() {
+            let mut open = true;
+            let mut buf = text;
+            egui::Window::new("CHD Info")
+                .open(&mut open)
+                .resizable(true)
+                .default_width(560.0)
+                .default_height(420.0)
+                .show(ui.ctx(), |ui| {
+                    egui::ScrollArea::both()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut buf)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(20),
+                            );
+                        });
+                });
+            if !open {
+                self.chd_info_text = None;
+            }
         }
 
         ui.separator();
@@ -265,7 +344,7 @@ impl OpticalTab {
                     Action::Rip => vec![
                         (OutputFormat::Iso, "ISO", true),
                         (OutputFormat::BinCue, "BIN/CUE", true),
-                        (OutputFormat::Chd, "CHD", self.chdman_available),
+                        (OutputFormat::Chd, "CHD", true),
                     ],
                     Action::Convert => {
                         let source_format = self.disc_info.as_ref().map(|i| &i.format);
@@ -283,7 +362,7 @@ impl OpticalTab {
                             (
                                 OutputFormat::Chd,
                                 "CHD",
-                                self.chdman_available && source_format != Some(&DiscFormat::Chd),
+                                source_format != Some(&DiscFormat::Chd),
                             ),
                         ]
                     }
@@ -297,13 +376,18 @@ impl OpticalTab {
                     if response.clicked() {
                         self.output_format = *fmt;
                     }
-                    if !enabled && *fmt == OutputFormat::Chd && !self.chdman_available {
-                        response.on_disabled_hover_text(
-                            "chdman not found. Configure path in Settings.",
-                        );
-                    }
                 }
             });
+
+            // CHD codec / hunk-size knobs (only when CHD output is selected)
+            if self.output_format == OutputFormat::Chd {
+                super::chd_options_ui::show(
+                    ui,
+                    "optical_chd",
+                    ChdProfile::Cd,
+                    &mut self.chd_cd_control,
+                );
+            }
 
             // ── Output path ─────────────────────────────────────────────────
             ui.horizontal(|ui| {
@@ -518,6 +602,10 @@ impl OpticalTab {
     /// Rip to CHD: rip to temporary BIN/CUE, convert to CHD, clean up temps.
     fn start_rip_to_chd(&mut self, device_path: PathBuf, chd_path: PathBuf, log: &mut LogPanel) {
         let eject_after = self.eject_after;
+        if self.chd_cd_control.mode == ChdOptionsMode::Custom {
+            self.persist_chd_options(&self.chd_cd_control.custom);
+        }
+        let chd_options = self.chd_cd_control.effective(ChdProfile::Cd);
 
         log.info(format!(
             "Starting rip to CHD: {} -> {}",
@@ -530,7 +618,13 @@ impl OpticalTab {
         self.convert_running = true;
 
         std::thread::spawn(move || {
-            let result = rip_to_chd_worker(&device_path, &chd_path, eject_after, &progress_arc);
+            let result = rip_to_chd_worker(
+                &device_path,
+                &chd_path,
+                eject_after,
+                chd_options,
+                &progress_arc,
+            );
             if let Err(e) = result {
                 if let Ok(mut p) = progress_arc.lock() {
                     if !p.finished {
@@ -572,6 +666,14 @@ impl OpticalTab {
         self.convert_running = true;
 
         let output_format = self.output_format;
+        let chd_options = if output_format == OutputFormat::Chd {
+            if self.chd_cd_control.mode == ChdOptionsMode::Custom {
+                self.persist_chd_options(&self.chd_cd_control.custom);
+            }
+            Some(self.chd_cd_control.effective(ChdProfile::Cd))
+        } else {
+            None
+        };
 
         std::thread::spawn(move || {
             let result = run_conversion(
@@ -579,6 +681,7 @@ impl OpticalTab {
                 &output_path,
                 source_format,
                 output_format,
+                chd_options,
                 Arc::clone(&progress_arc),
             );
 
@@ -666,6 +769,7 @@ fn run_conversion(
     output_path: &std::path::Path,
     source_format: Option<DiscFormat>,
     output_format: OutputFormat,
+    chd_options: Option<ChdOptions>,
     progress: Arc<Mutex<ConvertProgress>>,
 ) -> anyhow::Result<()> {
     use rusty_backup::optical::convert;
@@ -690,7 +794,7 @@ fn run_conversion(
         }
         (Some(DiscFormat::Iso), OutputFormat::Chd)
         | (Some(DiscFormat::BinCue), OutputFormat::Chd) => {
-            let chdman_input = if source_format == Some(DiscFormat::BinCue)
+            let cue_input = if source_format == Some(DiscFormat::BinCue)
                 && input_path
                     .extension()
                     .map(|e| e.eq_ignore_ascii_case("bin"))
@@ -700,7 +804,7 @@ fn run_conversion(
             } else {
                 input_path.to_path_buf()
             };
-            convert::to_chd(&chdman_input, output_path, progress)
+            convert::to_chd(&cue_input, output_path, chd_options, progress)
         }
         (Some(DiscFormat::Chd), OutputFormat::BinCue) => {
             convert::chd_to_bincue(input_path, output_path, progress)
@@ -723,6 +827,7 @@ fn rip_to_chd_worker(
     device_path: &std::path::Path,
     chd_path: &std::path::Path,
     eject_after: bool,
+    chd_options: ChdOptions,
     progress: &Arc<Mutex<ConvertProgress>>,
 ) -> anyhow::Result<()> {
     use rusty_backup::backup::LogLevel;
@@ -768,7 +873,12 @@ fn rip_to_chd_worker(
     }
 
     let convert_progress = Arc::new(Mutex::new(ConvertProgress::new()));
-    let convert_result = convert::to_chd(&temp_cue, chd_path, Arc::clone(&convert_progress));
+    let convert_result = convert::to_chd(
+        &temp_cue,
+        chd_path,
+        Some(chd_options),
+        Arc::clone(&convert_progress),
+    );
 
     // Drain convert log messages
     if let Ok(mut cp) = convert_progress.lock() {

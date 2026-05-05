@@ -1,62 +1,308 @@
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
+use libchdman_rs::{
+    dvd::{create_from_reader as dvd_create_from_reader, DvdCreateOptions, DVD_SECTOR_SIZE},
+    hd::{create_from_reader, HdCreateOptions},
+    ChdError, CompressionProgress,
+};
 
+use super::chd_options::{ChdOptions, ChdProfile};
 use super::{file_name, output_path, CHUNK_SIZE};
-use crate::update::UpdateConfig;
 
-/// Read+Seek adapter over a CHD file using the `chd` crate for on-demand
-/// hunk decompression. Enables filesystem browsing without extracting to a
-/// temp file.
+/// Read+Seek adapter over a CHD file backed by libchdman-rs. Enables
+/// filesystem browsing without extracting to a temp file.
 pub struct ChdReader {
-    chd: chd::Chd<BufReader<File>>,
-    hunk_size: u32,
+    chd: libchdman_rs::Chd,
     logical_size: u64,
     position: u64,
-    cached_hunk_index: Option<u32>,
-    hunk_buf: Vec<u8>,
-    cmp_buf: Vec<u8>,
 }
+
+// SAFETY: `libchdman_rs::Chd` holds a raw pointer to a heap-allocated CHD file
+// handle. Operations are routed through &self, but the handle is only accessed
+// from one thread at a time (we hand the reader off to a worker thread). The
+// underlying C++ object is not shared across threads, so Send is sound.
+unsafe impl Send for ChdReader {}
 
 impl ChdReader {
     /// Open a CHD file for reading.
-    pub fn open(path: &Path) -> Result<Self> {
-        let file =
-            File::open(path).with_context(|| format!("failed to open CHD: {}", path.display()))?;
-        let reader = BufReader::new(file);
-        let chd = chd::Chd::open(reader, None)
-            .map_err(|e| anyhow::anyhow!("failed to open CHD: {:?}", e))?;
-        let hunk_size = chd.header().hunk_size();
-        let logical_size = chd.header().logical_bytes();
-        let hunk_buf = vec![0u8; hunk_size as usize];
-        let cmp_buf = Vec::new();
-        Ok(Self {
-            chd,
-            hunk_size,
-            logical_size,
-            position: 0,
-            cached_hunk_index: None,
-            hunk_buf,
-            cmp_buf,
-        })
+    /// Logical (uncompressed) byte length of the CHD's contents.
+    pub fn logical_size(&self) -> u64 {
+        self.logical_size
     }
 
-    /// Decompress a hunk into the internal buffer if not already cached.
-    fn ensure_hunk(&mut self, hunk_index: u32) -> io::Result<()> {
-        if self.cached_hunk_index == Some(hunk_index) {
-            return Ok(());
+    pub fn open(path: &Path) -> Result<Self> {
+        let path_str = path
+            .to_str()
+            .with_context(|| format!("CHD path is not valid UTF-8: {}", path.display()))?;
+        let chd = libchdman_rs::Chd::open(path_str, false, None)
+            .map_err(|e| anyhow::anyhow!("failed to open CHD {}: {:?}", path.display(), e))?;
+        let logical_size = chd.logical_bytes();
+        Ok(Self {
+            chd,
+            logical_size,
+            position: 0,
+        })
+    }
+}
+
+/// Render a human-readable summary of a CHD file, mimicking the layout of
+/// `chdman info`. Used by the GUI's "CHD Info" button so users can inspect
+/// version, codecs, hunk/unit size, SHA1s, and metadata tags without leaving
+/// the app.
+pub fn format_chd_info(path: &Path) -> Result<String> {
+    use libchdman_rs::cd;
+    use libchdman_rs::codec::codec_name;
+
+    let path_str = path
+        .to_str()
+        .with_context(|| format!("CHD path is not valid UTF-8: {}", path.display()))?;
+    let chd = libchdman_rs::Chd::open(path_str, false, None)
+        .map_err(|e| anyhow::anyhow!("failed to open CHD {}: {:?}", path.display(), e))?;
+    let info = chd
+        .info()
+        .map_err(|e| anyhow::anyhow!("failed to read CHD info: {:?}", e))?;
+
+    let file_size = fs::metadata(path).map(|m| m.len()).ok();
+    let total_units = if info.unit_bytes > 0 {
+        info.logical_bytes / info.unit_bytes as u64
+    } else {
+        0
+    };
+
+    let mut out = String::new();
+    out.push_str(&format!("Input file:   {}\n", path.display()));
+    let kind = if info.is_cd {
+        "CD"
+    } else if info.is_dvd {
+        "DVD"
+    } else if info.is_gd {
+        "GD"
+    } else if info.is_hd {
+        "HD"
+    } else if info.is_av {
+        "AV"
+    } else {
+        "Unknown"
+    };
+    out.push_str(&format!("Type:         {}\n", kind));
+    out.push_str(&format!("File Version: {}\n", info.version));
+    out.push_str(&format!(
+        "Logical size: {} bytes ({})\n",
+        format_with_commas(info.logical_bytes),
+        format_size_human(info.logical_bytes),
+    ));
+    out.push_str(&format!(
+        "Hunk Size:    {} bytes\n",
+        format_with_commas(info.hunk_bytes as u64)
+    ));
+    out.push_str(&format!(
+        "Total Hunks:  {}\n",
+        format_with_commas(info.hunk_count as u64)
+    ));
+    out.push_str(&format!(
+        "Unit Size:    {} bytes\n",
+        format_with_commas(info.unit_bytes as u64)
+    ));
+    out.push_str(&format!(
+        "Total Units:  {}\n",
+        format_with_commas(total_units)
+    ));
+
+    out.push_str("Compression:  ");
+    if info.compressed {
+        let parts: Vec<String> = info
+            .codecs
+            .iter()
+            .filter(|c| **c != 0)
+            .map(|c| {
+                let label = super::chd_options::codec_label(*c);
+                let long = codec_name(*c).unwrap_or("");
+                if long.is_empty() {
+                    label
+                } else {
+                    format!("{} ({})", label, long)
+                }
+            })
+            .collect();
+        if parts.is_empty() {
+            out.push_str("none");
+        } else {
+            out.push_str(&parts.join(", "));
         }
-        let mut hunk = self
-            .chd
-            .hunk(hunk_index)
-            .map_err(|e| io::Error::other(format!("CHD hunk error: {:?}", e)))?;
-        hunk.read_hunk_in(&mut self.cmp_buf, &mut self.hunk_buf)
-            .map_err(|e| io::Error::other(format!("CHD decompress error: {:?}", e)))?;
-        self.cached_hunk_index = Some(hunk_index);
-        Ok(())
+    } else {
+        out.push_str("none");
+    }
+    out.push('\n');
+
+    if let Some(fs) = file_size {
+        out.push_str(&format!(
+            "CHD size:     {} bytes ({})\n",
+            format_with_commas(fs),
+            format_size_human(fs),
+        ));
+        if info.logical_bytes > 0 {
+            let ratio = (fs as f64 / info.logical_bytes as f64) * 100.0;
+            out.push_str(&format!("Ratio:        {:.1}%\n", ratio));
+        }
+    }
+
+    out.push_str(&format!("SHA1:         {}\n", hex_lower(&info.sha1)));
+    if info.version >= 4 {
+        out.push_str(&format!("Data SHA1:    {}\n", hex_lower(&info.raw_sha1)));
+    }
+    if info.has_parent {
+        out.push_str(&format!("Parent SHA1:  {}\n", hex_lower(&info.parent_sha1)));
+    }
+
+    if !info.metadata_tags.is_empty() {
+        out.push_str("Metadata:\n");
+        for (tag, index) in &info.metadata_tags {
+            out.push_str(&format!(
+                "  Tag='{}'  Index={}\n",
+                fourcc_to_string(*tag),
+                index,
+            ));
+        }
+    }
+
+    if info.is_cd || info.is_gd {
+        match cd::list_tracks(&chd) {
+            Ok(tracks) if !tracks.is_empty() => {
+                out.push_str("Tracks:\n");
+                for t in &tracks {
+                    out.push_str(&format!(
+                        "  Track {:>2}: {:?}  frames={}  pregap={}  postgap={}  subcode={:?}\n",
+                        t.track_num,
+                        t.track_type,
+                        format_with_commas(t.frames as u64),
+                        t.pregap,
+                        t.postgap,
+                        t.subcode_type,
+                    ));
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                out.push_str(&format!("Tracks:       (failed to read: {:?})\n", e));
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+fn fourcc_to_string(code: u32) -> String {
+    let bytes = [
+        ((code >> 24) & 0xff) as u8,
+        ((code >> 16) & 0xff) as u8,
+        ((code >> 8) & 0xff) as u8,
+        (code & 0xff) as u8,
+    ];
+    if bytes.iter().all(|b| (0x20..=0x7e).contains(b)) {
+        String::from_utf8(bytes.to_vec()).unwrap()
+    } else {
+        format!("{:08x}", code)
+    }
+}
+
+fn hex_lower(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for byte in b {
+        s.push_str(&format!("{:02x}", byte));
+    }
+    s
+}
+
+fn format_with_commas(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out.chars().rev().collect()
+}
+
+fn format_size_human(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.2} GiB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.2} MiB", b / MIB)
+    } else if b >= KIB {
+        format!("{:.2} KiB", b / KIB)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+/// Probe a CHD file to determine if it is a CD CHD (vs HD/DVD).
+///
+/// CD CHDs store 2352-byte raw sectors + 96-byte subcode = 2448-byte frames,
+/// which can't be parsed directly as a flat byte stream by ISO9660/UDF code.
+/// Use [`CdCookedReader::open_path`] to expose the cooked 2048-byte user data.
+pub fn chd_is_cd(path: &Path) -> Result<bool> {
+    let path_str = path
+        .to_str()
+        .with_context(|| format!("CHD path is not valid UTF-8: {}", path.display()))?;
+    let chd = libchdman_rs::Chd::open(path_str, false, None)
+        .map_err(|e| anyhow::anyhow!("failed to open CHD {}: {:?}", path.display(), e))?;
+    let info = chd
+        .info()
+        .map_err(|e| anyhow::anyhow!("failed to read CHD info: {:?}", e))?;
+    Ok(info.is_cd)
+}
+
+/// Read+Seek adapter over a CD CHD's cooked MODE1 user data (2048 B/sector).
+///
+/// Single-track MODE1 / MODE1_RAW CHDs only — multi-track or audio mixes return
+/// an error. Mirrors [`ChdReader`] but the underlying frames are decoded by
+/// libchdman-rs's `cdrom` shim so ISO9660/UDF code sees a flat 2048-byte stream.
+pub struct CdCookedReader {
+    inner: libchdman_rs::cd::CdCookedReader,
+}
+
+// SAFETY: identical reasoning to ChdReader — single-threaded access via &mut self.
+unsafe impl Send for CdCookedReader {}
+
+impl CdCookedReader {
+    pub fn open_path(path: &Path) -> Result<Self> {
+        let path_str = path
+            .to_str()
+            .with_context(|| format!("CHD path is not valid UTF-8: {}", path.display()))?;
+        let chd = libchdman_rs::Chd::open(path_str, false, None)
+            .map_err(|e| anyhow::anyhow!("failed to open CHD {}: {:?}", path.display(), e))?;
+        let inner = libchdman_rs::cd::CdCookedReader::open(chd).map_err(|e| {
+            anyhow::anyhow!(
+                "CHD is not a single-track MODE1 CD (multi-track CDs cannot be browsed in-place; extract to BIN/CUE first): {:?}",
+                e
+            )
+        })?;
+        Ok(Self { inner })
+    }
+
+    pub fn logical_size(&self) -> u64 {
+        self.inner.len()
+    }
+}
+
+impl Read for CdCookedReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl Seek for CdCookedReader {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(pos)
     }
 }
 
@@ -66,25 +312,15 @@ impl Read for ChdReader {
             return Ok(0);
         }
         let remaining = self.logical_size - self.position;
-        let to_read = buf.len().min(remaining as usize);
+        let to_read = (buf.len() as u64).min(remaining) as usize;
         if to_read == 0 {
             return Ok(0);
         }
-
-        let mut total = 0;
-        while total < to_read {
-            let hunk_index = (self.position / self.hunk_size as u64) as u32;
-            let offset_in_hunk = (self.position % self.hunk_size as u64) as usize;
-            let avail = (self.hunk_size as usize - offset_in_hunk).min(to_read - total);
-
-            self.ensure_hunk(hunk_index)?;
-            buf[total..total + avail]
-                .copy_from_slice(&self.hunk_buf[offset_in_hunk..offset_in_hunk + avail]);
-
-            total += avail;
-            self.position += avail as u64;
-        }
-        Ok(total)
+        self.chd
+            .read_bytes(self.position, &mut buf[..to_read])
+            .map_err(|e| io::Error::other(format!("CHD read error: {:?}", e)))?;
+        self.position += to_read as u64;
+        Ok(to_read)
     }
 }
 
@@ -106,149 +342,129 @@ impl Seek for ChdReader {
     }
 }
 
-/// Get the chdman command name or path to use (from config or default to PATH)
-fn get_chdman_command() -> String {
-    UpdateConfig::load()
-        .chdman_path
-        .unwrap_or_else(|| "chdman".to_string())
-}
-
-/// Detect whether `chdman` is available on PATH or at configured path.
-pub fn detect_chdman() -> bool {
-    let cmd = get_chdman_command();
-    Command::new(&cmd)
-        .arg("help")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
-}
-
-/// Compress via chdman external tool.
+/// Compress raw partition data into a hard-disk CHD via libchdman-rs.
 ///
-/// Steps:
-/// 1. Write raw data to a temp file next to the output
-/// 2. Run `chdman createraw -i temp -o output.chd -hs 4096`
-/// 3. Clean up temp file
-/// 4. If splitting is needed, split the output CHD manually
+/// `logical_size` is the partition's natural byte length. It is rounded
+/// up to the nearest unit (512 byte) boundary for the CHD; any tail
+/// shortfall in `reader` is zero-padded by libchdman-rs internally.
+/// `opts` selects hunk size + codecs; `None` falls back to chdman's HD
+/// defaults (`lzma, zlib, huff, flac`, 4096-byte hunks).
 pub(crate) fn compress_chd(
     reader: &mut impl Read,
     output_base: &Path,
+    logical_size: u64,
     split_size: Option<u64>,
+    opts: Option<ChdOptions>,
     progress_cb: &mut impl FnMut(u64),
     cancel_check: &impl Fn() -> bool,
     log_cb: &mut impl FnMut(&str),
 ) -> Result<Vec<String>> {
-    let parent = output_base
-        .parent()
-        .context("output path has no parent directory")?;
+    let chd_opts = opts.unwrap_or_else(|| ChdOptions::defaults_for(ChdProfile::Hd));
 
-    // Step 1: Write raw data to temp file
-    let temp_path = parent.join(format!(
-        ".{}.tmp",
-        output_base
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-    ));
-    {
-        let mut temp_writer = BufWriter::new(
-            File::create(&temp_path)
-                .with_context(|| format!("failed to create temp file: {}", temp_path.display()))?,
-        );
-        let mut total_read: u64 = 0;
-        let mut buf = vec![0u8; CHUNK_SIZE];
-        loop {
-            if cancel_check() {
-                let _ = fs::remove_file(&temp_path);
-                bail!("backup cancelled");
-            }
-            let n = reader.read(&mut buf).context("failed to read source")?;
-            if n == 0 {
-                break;
-            }
-            temp_writer
-                .write_all(&buf[..n])
-                .context("failed to write temp file")?;
-            total_read += n as u64;
-            progress_cb(total_read);
-        }
-        temp_writer.flush()?;
-    }
-
-    // Step 2: Determine raw data size for chdman (must be known)
-    let raw_size = fs::metadata(&temp_path)
-        .with_context(|| format!("failed to stat temp file: {}", temp_path.display()))?
-        .len();
-
-    // chdman createraw parameters:
-    // -us (unit size) = sector size, always 512 bytes
-    // -hs (hunk size) = must be a multiple of unit size, and total data
-    //     must be a multiple of hunk size. Default to 4096 (8 sectors).
-    let unit_size: u64 = 512;
-    let hunk_size: u64 = 4096;
-
-    // Pad the raw data to the nearest hunk_size boundary if needed
-    let remainder = raw_size % hunk_size;
-    if remainder != 0 {
-        let pad_bytes = hunk_size - remainder;
-        let pad_file = fs::OpenOptions::new()
-            .append(true)
-            .open(&temp_path)
-            .context("failed to open temp file for padding")?;
-        let mut pad_writer = BufWriter::new(pad_file);
-        let zeros = vec![0u8; pad_bytes as usize];
-        pad_writer
-            .write_all(&zeros)
-            .context("failed to pad temp file")?;
-        pad_writer.flush()?;
-    }
+    // chdman uses 512-byte units for HD CHDs. Round logical_size up so
+    // libchdman-rs's `logical_size % unit_size == 0` precondition holds;
+    // any padding bytes are written by libchdman-rs as zeros.
+    const UNIT_SIZE: u64 = 512;
+    let padded_size = logical_size.div_ceil(UNIT_SIZE) * UNIT_SIZE;
 
     let chd_path = output_path(output_base, "chd", false, 0);
     log_cb(&format!(
-        "Running chdman createraw -> {}",
-        chd_path.display()
+        "Writing CHD {} (logical {} bytes, hunk {}, codecs {:?})",
+        chd_path.display(),
+        padded_size,
+        chd_opts.hunk_size,
+        chd_opts.codecs,
     ));
-    let chdman_cmd = get_chdman_command();
-    let output = Command::new(&chdman_cmd)
-        .arg("createraw")
-        .arg("-i")
-        .arg(&temp_path)
-        .arg("-o")
-        .arg(&chd_path)
-        .arg("-hs")
-        .arg(hunk_size.to_string())
-        .arg("-us")
-        .arg(unit_size.to_string())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .context("failed to run chdman")?;
 
-    // Forward chdman output to log
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let trimmed = line.trim();
-        if !trimmed.is_empty() {
-            log_cb(trimmed);
+    let hd_opts = HdCreateOptions {
+        logical_size: padded_size,
+        hunk_size: chd_opts.hunk_size,
+        unit_size: UNIT_SIZE as u32,
+        codecs: chd_opts.codecs,
+        geometry: None,
+        ident: None,
+    };
+
+    let mut progress = |p: CompressionProgress| {
+        // Clamp to the user-facing logical size so the progress bar never
+        // reports more bytes than the caller knows about (CHD pads up to
+        // the next hunk; the caller's "total" is `logical_size`).
+        progress_cb(p.bytes_done.min(logical_size));
+    };
+
+    create_from_reader(reader, &chd_path, hd_opts, &mut progress, cancel_check).map_err(
+        |e| match e {
+            ChdError::Cancelled => anyhow::anyhow!("backup cancelled"),
+            other => anyhow::anyhow!("CHD create failed: {:?}", other),
+        },
+    )?;
+
+    // Final progress tick at logical_size — libchdman-rs reports in
+    // terms of padded size, but the caller's total is `logical_size`.
+    progress_cb(logical_size);
+
+    if let Some(split_bytes) = split_size {
+        let chd_size = fs::metadata(&chd_path)
+            .with_context(|| format!("failed to stat CHD output: {}", chd_path.display()))?
+            .len();
+
+        if chd_size > split_bytes {
+            return split_file(&chd_path, output_base, "chd", split_bytes);
         }
     }
-    for line in String::from_utf8_lossy(&output.stderr).lines() {
-        let trimmed = line.trim();
-        if !trimmed.is_empty() {
-            log_cb(trimmed);
-        }
-    }
 
-    let _ = fs::remove_file(&temp_path);
+    Ok(vec![file_name(&chd_path)])
+}
 
-    if !output.status.success() {
-        bail!(
-            "chdman exited with status {}",
-            output.status.code().unwrap_or(-1)
-        );
-    }
+/// Compress raw data into a DVD-profile CHD (MAME 0.287+) via libchdman-rs.
+///
+/// Same shape as [`compress_chd`] but uses DVD's 2048-byte sector unit and
+/// writes the `DVD ` metadata tag so MAME / `chdman info` recognises it as
+/// a DVD CHD. `logical_size` is rounded up to a 2048-byte multiple; any
+/// tail shortfall is zero-padded by libchdman-rs.
+pub(crate) fn compress_chd_dvd(
+    reader: &mut impl Read,
+    output_base: &Path,
+    logical_size: u64,
+    split_size: Option<u64>,
+    opts: Option<ChdOptions>,
+    progress_cb: &mut impl FnMut(u64),
+    cancel_check: &impl Fn() -> bool,
+    log_cb: &mut impl FnMut(&str),
+) -> Result<Vec<String>> {
+    let chd_opts = opts.unwrap_or_else(|| ChdOptions::defaults_for(ChdProfile::Dvd));
 
-    // Step 3: Split the CHD file if requested
+    let unit_size = u64::from(DVD_SECTOR_SIZE);
+    let padded_size = logical_size.div_ceil(unit_size) * unit_size;
+
+    let chd_path = output_path(output_base, "chd", false, 0);
+    log_cb(&format!(
+        "Writing DVD CHD {} (logical {} bytes, hunk {}, codecs {:?})",
+        chd_path.display(),
+        padded_size,
+        chd_opts.hunk_size,
+        chd_opts.codecs,
+    ));
+
+    let dvd_opts = DvdCreateOptions {
+        logical_size: padded_size,
+        hunk_size: chd_opts.hunk_size,
+        codecs: chd_opts.codecs,
+    };
+
+    let mut progress = |p: CompressionProgress| {
+        progress_cb(p.bytes_done.min(logical_size));
+    };
+
+    dvd_create_from_reader(reader, &chd_path, dvd_opts, &mut progress, cancel_check).map_err(
+        |e| match e {
+            ChdError::Cancelled => anyhow::anyhow!("backup cancelled"),
+            other => anyhow::anyhow!("DVD CHD create failed: {:?}", other),
+        },
+    )?;
+
+    progress_cb(logical_size);
+
     if let Some(split_bytes) = split_size {
         let chd_size = fs::metadata(&chd_path)
             .with_context(|| format!("failed to stat CHD output: {}", chd_path.display()))?
@@ -319,10 +535,73 @@ pub(crate) fn split_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+    use tempfile::TempDir;
 
     #[test]
-    fn test_detect_chdman() {
-        // Just ensure it doesn't panic; result depends on system
-        let _available = detect_chdman();
+    fn compress_chd_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let mut data = vec![0u8; 1024 * 1024];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = ((i * 31) ^ (i >> 7)) as u8;
+        }
+        let mut reader = Cursor::new(&data);
+        let base = tmp.path().join("disk");
+
+        let files = compress_chd(
+            &mut reader,
+            &base,
+            data.len() as u64,
+            None,
+            None,
+            &mut |_| {},
+            &|| false,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(files, vec!["disk.chd"]);
+
+        let chd_path = base.with_extension("chd");
+        let mut chd_reader = ChdReader::open(&chd_path).unwrap();
+        let mut decoded = vec![0u8; data.len()];
+        chd_reader.read_exact(&mut decoded).unwrap();
+        assert_eq!(decoded, data, "CHD round-trip mismatch");
+    }
+
+    #[test]
+    fn compress_chd_dvd_round_trip() {
+        // 4 MiB of pseudo-random data, sized to a 2048-byte multiple so
+        // libchdman-rs's DVD validate() accepts it without padding.
+        let tmp = TempDir::new().unwrap();
+        let mut data = vec![0u8; 4 * 1024 * 1024];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = ((i * 17) ^ (i >> 9)) as u8;
+        }
+        let mut reader = Cursor::new(&data);
+        let base = tmp.path().join("disk");
+
+        let files = compress_chd_dvd(
+            &mut reader,
+            &base,
+            data.len() as u64,
+            None,
+            None,
+            &mut |_| {},
+            &|| false,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(files, vec!["disk.chd"]);
+
+        let chd_path = base.with_extension("chd");
+        let mut chd_reader = ChdReader::open(&chd_path).unwrap();
+        let mut decoded = vec![0u8; data.len()];
+        chd_reader.read_exact(&mut decoded).unwrap();
+        assert_eq!(decoded, data, "DVD CHD round-trip mismatch");
+
+        // Confirm the DVD metadata tag landed — libchdman-rs flags it as DVD
+        // via Chd::info().is_dvd.
+        let chd = libchdman_rs::Chd::open(chd_path.to_str().unwrap(), false, None).unwrap();
+        assert!(chd.info().unwrap().is_dvd, "expected is_dvd flag");
     }
 }

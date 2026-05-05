@@ -35,8 +35,12 @@ The app has three tabs:
 - **Backup** — pick a source (physical device or image file), choose a
   destination folder, pick an output format and checksum type, and start.
   Each backup is written as a folder containing `metadata.json`, the partition
-  table (`mbr.bin`/`mbr.json` or `gpt.json`), and one compressed file per
-  partition with its checksum sidecar.
+  table (`mbr.json` / `gpt.json` / `apm.json`), and either one compressed
+  file per partition (Zstd / Raw / per-partition VHD) or a single
+  `<backup-name>.chd` disk image that `chdman info` opens and MAME loads
+  directly (CHD output). The single-file CHD also serves as the unit edit
+  mode operates on, so changes flow back into a CHD that any CHD-aware
+  tool can still read.
 - **Restore** — pick a backup folder and a target device or image file.
   Partition sizes can be left at original, shrunk to the filesystem minimum,
   or set to a custom value; the filesystem is expanded in place when the
@@ -59,7 +63,7 @@ VHD export is available from the Inspect tab: produce either a whole-disk
 | Raw            | `.img`, `.raw`, `.hda` | Yes     | Yes             | Sparse zero-skipping; optional splitting |
 | Fixed VHD      | `.vhd`          | Yes            | Yes             | 512-byte footer; also used for VHD export |
 | Zstd stream    | `.zst`          | Yes            | Yes             | Good general compression, splittable |
-| CHD (MAME)     | `.chd`          | Yes            | Yes             | Requires `chdman` on `PATH` |
+| CHD (MAME)     | `.chd`          | Yes            | Yes             | Native (MAME's CHD core is bundled — no external `chdman` needed) |
 | Apple 2MG      | `.2mg`          | Yes            | No              | Apple II / IIgs disk images |
 | Disk Copy 4.2  | `.dc42`, `.image` | Yes          | No              | Classic Mac floppy images |
 | Apple DMG      | `.dmg`          | Yes (raw/UDRW) | No              | Uncompressed DMGs only |
@@ -119,7 +123,7 @@ that shows up via the platform enumerator (Disk Management / `diskutil` /
 | Internal SATA / NVMe drives             | Yes                  | Yes                 | Requires elevation; verify target |
 | USB floppy drives (1.44 MB, 720 KB)     | Yes (as block device)| Yes                 | Treated as a regular block device; no copy-protection support |
 | 5.25" / 3.5" floppies via Kryoflux / Greaseweazle / Applesauce | No (use their tools) | No | Dump to `.woz` / `.dc42` / `.2mg` and feed that image in |
-| Optical media (CD/DVD/BD)               | No                   | No                  | Use `chdman` or dedicated tools |
+| Optical media (CD/DVD/BD)               | No                   | No                  | Rip with a dedicated CD/DVD tool first; rusty-backup operates on disk images |
 | Tape drives                             | No                   | No                  |       |
 
 Physical floppies are supported only through the OS block-device layer, which

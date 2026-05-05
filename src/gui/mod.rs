@@ -1,6 +1,7 @@
 mod backup_tab;
 mod browse_view;
 mod bulk_convert_dialog;
+mod chd_options_ui;
 mod context;
 mod elevation_dialog;
 mod expand_hfs_dialog;
@@ -23,7 +24,6 @@ use settings_dialog::SettingsDialog;
 use std::path::PathBuf;
 
 use rusty_backup::device::{self, DiskDevice};
-use rusty_backup::rbformats::chd::detect_chdman;
 use rusty_backup::update::{check_for_updates, UpdateConfig, UpdateInfo};
 
 #[cfg(target_os = "linux")]
@@ -129,19 +129,9 @@ impl Default for RustyBackupApp {
             dialog
         };
 
-        // Detect chdman availability
-        let chdman_available = detect_chdman();
-        if chdman_available {
-            log.info("chdman detected: CHD compression available");
-        } else {
-            log.info("chdman not found: CHD compression disabled");
-        }
-
-        let mut backup_tab = BackupTab::default();
-        backup_tab.set_chdman_available(chdman_available);
+        let backup_tab = BackupTab::default();
 
         let mut optical_tab = OpticalTab::default();
-        optical_tab.set_chdman_available(chdman_available);
         optical_tab.refresh_drives();
         if optical_tab.drive_count() > 0 {
             log.info(format!(
@@ -222,7 +212,9 @@ impl eframe::App for RustyBackupApp {
 
         // Drain bulk-convert worker logs into the panel and clear when done.
         self.poll_bulk_convert();
+    }
 
+    fn ui(&mut self, ctx: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Top panel: tab bar
         egui::TopBottomPanel::top("tab_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -307,7 +299,12 @@ impl eframe::App for RustyBackupApp {
         // Bulk Convert dialog (modal-ish window, always reachable).
         if let Some(ref mut dlg) = self.bulk_convert_dialog {
             match dlg.show(ctx) {
-                BulkConvertAction::Start { files, extension } => {
+                BulkConvertAction::Start {
+                    files,
+                    extension,
+                    chd_options,
+                    bincue_multi_bin,
+                } => {
                     if let Some(out) = dlg.output_folder.clone() {
                         let format = dlg.format;
                         let count = files.len();
@@ -318,7 +315,12 @@ impl eframe::App for RustyBackupApp {
                             format.description(),
                         ));
                         self.bulk_convert_status = Some(bulk_convert_dialog::start_bulk_convert(
-                            files, out, format, extension,
+                            files,
+                            out,
+                            format,
+                            extension,
+                            chd_options,
+                            bincue_multi_bin,
                         ));
                     }
                 }
@@ -404,7 +406,6 @@ impl eframe::App for RustyBackupApp {
                     if let Err(e) = rusty_backup::os::linux::relaunch_with_elevation() {
                         self.log_panel.error(format!("Failed to elevate: {}", e));
                     }
-                    // If relaunch_with_elevation returns, something went wrong
                 }
                 ElevationAction::Cancel => {
                     self.log_panel

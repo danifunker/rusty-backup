@@ -103,7 +103,8 @@ cargo build --release
 - [ ] Output folder contains:
   - [ ] `metadata.json`
   - [ ] `mbr.bin` or `gpt.json`
-  - [ ] `partition-N.chd` files
+  - [ ] `<backup-name>.chd` (single-file CHD layout) **or** `partition-N.<ext>`
+        files (Zstd / Raw / per-partition VHD)
   - [ ] Checksum files
 
 **If it fails**:

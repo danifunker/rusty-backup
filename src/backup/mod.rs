@@ -1,5 +1,7 @@
+pub mod disk_image_stream;
 pub mod format;
 pub mod metadata;
+pub mod single_file_chd;
 mod sizes;
 pub mod verify;
 
@@ -15,12 +17,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::fs;
 use crate::partition::{self, PartitionTable};
-use metadata::{AlignmentMetadata, BackupMetadata, ExtendedContainerMetadata, PartitionMetadata};
+use crate::rbformats::chd_options::ChdOptions;
+use metadata::{
+    AlignmentMetadata, BackupLayout, BackupMetadata, ExtendedContainerMetadata, PartitionMetadata,
+    SizePolicy,
+};
 
 /// Compression type for backup output.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum CompressionType {
     Chd,
+    /// DVD-profile CHD (MAME 0.287+). On disk it's still a `.chd` file;
+    /// the metadata tag distinguishes it. Hunk size + codecs default to
+    /// chdman's DVD profile (4096-byte hunks, 2048-byte sectors).
+    Dvd,
     Vhd,
     Zstd,
     None,
@@ -30,6 +40,7 @@ impl CompressionType {
     pub fn as_str(&self) -> &'static str {
         match self {
             CompressionType::Chd => "chd",
+            CompressionType::Dvd => "chd-dvd",
             CompressionType::Vhd => "vhd",
             CompressionType::Zstd => "zstd",
             CompressionType::None => "none",
@@ -38,7 +49,7 @@ impl CompressionType {
 
     pub fn file_extension(&self) -> &'static str {
         match self {
-            CompressionType::Chd => "chd",
+            CompressionType::Chd | CompressionType::Dvd => "chd",
             CompressionType::Vhd => "vhd",
             CompressionType::Zstd => "zst",
             CompressionType::None => "raw",
@@ -77,6 +88,19 @@ pub struct BackupConfig {
     /// When set, only back up partitions whose index is in the list.
     /// The partition table is always exported in full regardless.
     pub partition_filter: Option<Vec<usize>>,
+    /// CHD codec + hunk-size options (only consulted when `compression`
+    /// is `Chd` or `Dvd`). `None` = use the profile's chdman defaults.
+    pub chd_options: Option<ChdOptions>,
+    /// Backup-time partition size policy (single-file CHD only). `None`
+    /// keeps source sizes. The actual per-partition sizes the user picked
+    /// live in `partition_target_sizes`; `size_policy` is the policy label
+    /// recorded in metadata for traceability.
+    pub size_policy: Option<SizePolicy>,
+    /// Per-partition target sizes in bytes, keyed by partition index
+    /// (single-file CHD only). Entries omitted from this map default to
+    /// the partition's source size. Non-trivial entries trigger
+    /// `single_file_chd::run`'s temp-file resize pipeline.
+    pub partition_target_sizes: Option<Vec<(usize, u64)>>,
 }
 
 /// Shared progress state between background backup thread and the GUI.
@@ -315,44 +339,93 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
     );
 
     // Step 3: Export partition table
+    //
+    // Single-file CHD backups already carry the raw partition-table sector
+    // inside `disk.chd` at offset 0 — writing a separate `mbr.bin` would
+    // duplicate those bytes. We still emit the parsed JSON sidecar
+    // (`mbr.json`) for fast inspect loads.
+    let single_file_chd_planned = matches!(
+        config.compression,
+        CompressionType::Chd | CompressionType::Dvd
+    ) && !is_superfloppy
+        && config.split_size_mib.is_none()
+        && single_file_chd::is_supported(&table);
+
     set_operation(&progress, "Exporting partition table...");
     match &table {
         PartitionTable::Mbr(mbr) => {
-            format::export_mbr(mbr, &mbr_bytes, &backup_folder)?;
-            log(
-                &progress,
-                LogLevel::Info,
-                "Exported MBR (mbr.bin + mbr.json)",
-            );
-        }
-        PartitionTable::Gpt { gpt, .. } => {
-            format::export_gpt(gpt, &mbr_bytes, &backup_folder)?;
-            log(
-                &progress,
-                LogLevel::Info,
-                "Exported GPT (gpt.json + mbr.bin)",
-            );
-            if let Err(e) = format::export_gpt_bin(&mut source, &backup_folder) {
-                log(
-                    &progress,
-                    LogLevel::Warning,
-                    format!("Failed to export gpt.bin: {e}"),
-                );
-            } else {
+            if single_file_chd_planned {
+                format::export_mbr_json(mbr, &backup_folder)?;
                 log(
                     &progress,
                     LogLevel::Info,
-                    "Exported raw GPT sectors (gpt.bin)",
+                    "Exported MBR (mbr.json only — raw bytes live in disk.chd)",
+                );
+            } else {
+                format::export_mbr(mbr, &mbr_bytes, &backup_folder)?;
+                log(
+                    &progress,
+                    LogLevel::Info,
+                    "Exported MBR (mbr.bin + mbr.json)",
                 );
             }
         }
+        PartitionTable::Gpt { gpt, .. } => {
+            if single_file_chd_planned {
+                // Raw GPT sectors live inside disk.chd; only emit the JSON
+                // sidecar for fast inspect.
+                let json =
+                    serde_json::to_string_pretty(gpt).context("failed to serialize GPT to JSON")?;
+                std::fs::write(backup_folder.join("gpt.json"), json)
+                    .context("failed to write gpt.json")?;
+                log(
+                    &progress,
+                    LogLevel::Info,
+                    "Exported GPT (gpt.json only — raw sectors live in disk.chd)",
+                );
+            } else {
+                format::export_gpt(gpt, &mbr_bytes, &backup_folder)?;
+                log(
+                    &progress,
+                    LogLevel::Info,
+                    "Exported GPT (gpt.json + mbr.bin)",
+                );
+                if let Err(e) = format::export_gpt_bin(&mut source, &backup_folder) {
+                    log(
+                        &progress,
+                        LogLevel::Warning,
+                        format!("Failed to export gpt.bin: {e}"),
+                    );
+                } else {
+                    log(
+                        &progress,
+                        LogLevel::Info,
+                        "Exported raw GPT sectors (gpt.bin)",
+                    );
+                }
+            }
+        }
         PartitionTable::Apm(apm) => {
-            format::export_apm(apm, &backup_folder)?;
-            log(
-                &progress,
-                LogLevel::Info,
-                "Exported APM (apm.json + apm.bin)",
-            );
+            if single_file_chd_planned {
+                // apm.bin would duplicate the DDR + partition map already
+                // embedded in disk.chd; emit only the JSON sidecar.
+                let json =
+                    serde_json::to_string_pretty(apm).context("failed to serialize APM to JSON")?;
+                std::fs::write(backup_folder.join("apm.json"), json)
+                    .context("failed to write apm.json")?;
+                log(
+                    &progress,
+                    LogLevel::Info,
+                    "Exported APM (apm.json only — raw blocks live in disk.chd)",
+                );
+            } else {
+                format::export_apm(apm, &backup_folder)?;
+                log(
+                    &progress,
+                    LogLevel::Info,
+                    "Exported APM (apm.json + apm.bin)",
+                );
+            }
         }
         PartitionTable::None { fs_hint, .. } => {
             log(
@@ -365,6 +438,42 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
 
     if is_cancelled(&progress) {
         bail!("backup cancelled");
+    }
+
+    // Single-file CHD branch: when the user asked for CHD output and the
+    // source has a partition table single_file_chd can handle, synthesise a
+    // whole-disk image into one CHD and skip the per-partition loop. Falls
+    // through to the legacy per-partition path otherwise.
+    if single_file_chd_planned {
+        return run_single_file_chd_path(
+            &config,
+            &progress,
+            &source,
+            source_size,
+            &mbr_bytes,
+            &table,
+            &partitions,
+            &alignment,
+            &backup_folder,
+        );
+    }
+    // CHD/DVD selected on a source single_file_chd can't handle (only
+    // superfloppies fit this today — every other shape is_supported).
+    // Superfloppies route through the per-partition loop with
+    // `effective_compression` forced to `None` (raw .img), so the user
+    // ends up with a `partition-0.img` rather than a CHD. We don't emit
+    // per-partition CHDs anywhere; CHD output is single-file or nothing.
+    if matches!(
+        config.compression,
+        CompressionType::Chd | CompressionType::Dvd
+    ) && config.split_size_mib.is_some()
+    {
+        log(
+            &progress,
+            LogLevel::Warning,
+            "Split-size set with CHD output: splitting is incompatible with \
+             chdman/MAME single-file CHDs and is ignored.",
+        );
     }
 
     // Step 4: Analyze partitions for smart sizing
@@ -644,8 +753,10 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 &mut limited,
                 &output_base,
                 effective_compression,
+                stream_size,
                 split_bytes,
                 false, // compacted image has no wasted space, don't skip zeros
+                config.chd_options.clone(),
                 |bytes_read| {
                     set_progress_bytes(
                         &progress_clone,
@@ -689,8 +800,10 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 &mut limited,
                 &output_base,
                 effective_compression,
+                image_size,
                 split_bytes,
                 !config.sector_by_sector,
+                config.chd_options.clone(),
                 |bytes_read| {
                     set_progress_bytes(
                         &progress_clone,
@@ -819,6 +932,11 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         },
         split_size_mib: config.split_size_mib,
         sector_by_sector: config.sector_by_sector,
+        layout: BackupLayout::PerPartition,
+        container: None,
+        container_logical_size: None,
+        container_sha1: None,
+        size_policy: config.size_policy,
         alignment: AlignmentMetadata {
             detected_type: format!("{}", alignment.alignment_type),
             first_partition_lba: alignment.first_lba,
@@ -844,6 +962,182 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
     );
 
     // Step 6: Mark finished
+    if let Ok(mut p) = progress.lock() {
+        p.finished = true;
+        p.operation = "Backup complete".to_string();
+    }
+
+    Ok(())
+}
+
+/// Single-file CHD backup path. Synthesises a whole-disk image into one
+/// CHD container (chdman/MAME compatible) and writes a `single-file-chd`
+/// `metadata.json` describing the byte ranges inside it.
+///
+/// When the user picks a non-Original `size_policy`,
+/// `single_file_chd::run` takes the temp-file resize pipeline (Stage 4b,
+/// Approach A); otherwise the cheaper `DiskImageStream` path produces a
+/// CHD whose layout matches the source disk byte-for-byte.
+#[allow(clippy::too_many_arguments)] // intentional — pulls run_backup's locals
+fn run_single_file_chd_path(
+    config: &BackupConfig,
+    progress: &Arc<Mutex<BackupProgress>>,
+    source: &BufReader<File>,
+    source_size: u64,
+    mbr_bytes: &[u8; 512],
+    table: &PartitionTable,
+    partitions: &[partition::PartitionInfo],
+    alignment: &partition::PartitionAlignment,
+    backup_folder: &std::path::Path,
+) -> Result<()> {
+    set_operation(progress, "Building disk-image stream...");
+    log(
+        progress,
+        LogLevel::Info,
+        format!(
+            "Single-file CHD layout selected ({} disk, {} bytes)",
+            table.type_name(),
+            source_size,
+        ),
+    );
+
+    let requested_policy = config.size_policy.unwrap_or(SizePolicy::Original);
+
+    // Output base for compress_chd (the .chd extension is appended by the
+    // compressor). Use the backup folder's name so the resulting file is
+    // `<backup_name>/<backup_name>.chd`. Falls back to the literal `disk`
+    // when the path has no final component (shouldn't happen in practice
+    // — backup_folder is always created with a name).
+    let output_stem = backup_folder
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("disk");
+    let output_base = backup_folder.join(output_stem);
+
+    let inputs = single_file_chd::SingleFileChdInputs {
+        source_file: source.get_ref(),
+        source_size,
+        source_partition_table_bytes: mbr_bytes,
+        partition_table: table,
+        partitions,
+        partition_filter: config.partition_filter.as_deref(),
+        sector_by_sector: config.sector_by_sector,
+        chd_options: config.chd_options.clone(),
+        is_dvd: matches!(config.compression, CompressionType::Dvd),
+        output_base: &output_base,
+        resize_targets: config.partition_target_sizes.as_deref(),
+        alignment_sectors: alignment.alignment_sectors,
+    };
+
+    {
+        let mut p = progress.lock().expect("backup progress mutex poisoned");
+        p.total_bytes = source_size;
+        p.full_size_bytes = source_size;
+        p.current_bytes = 0;
+    }
+
+    let progress_for_cb = progress.clone();
+    let progress_for_cancel = progress.clone();
+    let progress_for_log = progress.clone();
+    let mut progress_cb = move |n: u64| {
+        if let Ok(mut p) = progress_for_cb.lock() {
+            p.current_bytes = n;
+        }
+    };
+    let cancel_check = move || {
+        progress_for_cancel
+            .lock()
+            .map(|p| p.cancel_requested)
+            .unwrap_or(false)
+    };
+    let mut log_cb = move |s: &str| {
+        if let Ok(mut p) = progress_for_log.lock() {
+            p.log_messages.push_back(LogMessage {
+                level: LogLevel::Info,
+                message: s.to_string(),
+            });
+        }
+    };
+
+    let result = single_file_chd::run(inputs, &mut progress_cb, &cancel_check, &mut log_cb)?;
+
+    // Build per-partition metadata. The byte range inside the CHD lives in
+    // `result.partition_ranges`; we cross-reference each partition's
+    // PartitionInfo for the type-name + alignment data.
+    set_operation(progress, "Writing metadata...");
+    let partition_metadata: Vec<PartitionMetadata> = result
+        .partition_ranges
+        .iter()
+        .filter_map(|range| {
+            let part = partitions
+                .iter()
+                .find(|p| p.index == range.partition_index)?;
+            // `start_lba` records where the partition lives inside the CHD's
+            // synthesised disk image — that's the new offset when the
+            // backup-time resize plan moved it, otherwise the source LBA.
+            let new_start_lba = range.offset_in_disk / 512;
+            Some(PartitionMetadata {
+                index: range.partition_index,
+                type_name: part.type_name.clone(),
+                partition_type_byte: part.partition_type_byte,
+                start_lba: new_start_lba,
+                original_size_bytes: part.size_bytes,
+                imaged_size_bytes: range.length,
+                compressed_files: vec![], // data is inside the container
+                checksum: range.checksum_sha256.clone(),
+                resized: range.length != part.size_bytes || new_start_lba != part.start_lba,
+                compacted: !config.sector_by_sector,
+                is_logical: part.is_logical,
+                partition_type_string: part.partition_type_string.clone(),
+                minimum_size_bytes: None,
+            })
+        })
+        .collect();
+
+    let metadata = BackupMetadata {
+        version: 1,
+        created: Utc::now().to_rfc3339(),
+        source_device: config.source_path.display().to_string(),
+        source_size_bytes: source_size,
+        partition_table_type: table.type_name().to_string(),
+        checksum_type: config.checksum.as_str().to_string(),
+        compression_type: config.compression.as_str().to_string(),
+        split_size_mib: None, // splitting is rejected on this path
+        sector_by_sector: config.sector_by_sector,
+        layout: BackupLayout::SingleFileChd,
+        container: Some(result.container_filename.clone()),
+        container_logical_size: Some(result.container_logical_size),
+        container_sha1: Some(result.container_sha1.clone()),
+        size_policy: Some(requested_policy),
+        alignment: AlignmentMetadata {
+            detected_type: format!("{}", alignment.alignment_type),
+            first_partition_lba: alignment.first_lba,
+            alignment_sectors: alignment.alignment_sectors,
+            heads: alignment.heads,
+            sectors_per_track: alignment.sectors_per_track,
+        },
+        partitions: partition_metadata,
+        bad_sectors: vec![],
+        extended_container: None,
+    };
+
+    let metadata_path = backup_folder.join("metadata.json");
+    let metadata_file = File::create(&metadata_path)
+        .with_context(|| format!("failed to create {}", metadata_path.display()))?;
+    serde_json::to_writer_pretty(metadata_file, &metadata)
+        .context("failed to write metadata.json")?;
+
+    log(
+        progress,
+        LogLevel::Info,
+        format!(
+            "Single-file CHD backup complete: {} ({}, SHA1 {})",
+            backup_folder.display(),
+            result.container_filename,
+            result.container_sha1,
+        ),
+    );
+
     if let Ok(mut p) = progress.lock() {
         p.finished = true;
         p.operation = "Backup complete".to_string();

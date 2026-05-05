@@ -8,12 +8,12 @@
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
 use crate::backup::CompressionType;
 
+use super::chd_options::ChdOptions;
 use super::{chd, raw, vhd, woz, woz_write, zstd};
 
 pub(crate) const CHUNK_SIZE: usize = 256 * 1024; // 256 KB I/O buffer
@@ -29,8 +29,10 @@ pub fn compress_partition(
     reader: &mut impl Read,
     output_base: &Path,
     compression: CompressionType,
+    logical_size: u64,
     split_size: Option<u64>,
     skip_zeros: bool,
+    chd_options: Option<ChdOptions>,
     mut progress_cb: impl FnMut(u64),
     cancel_check: impl Fn() -> bool,
     mut log_cb: impl FnMut(&str),
@@ -65,17 +67,26 @@ pub fn compress_partition(
                 &cancel_check,
             )
         }
-        CompressionType::Chd => {
-            // CHD needs complete raw temp file; chdman handles zero compression
-            chd::compress_chd(
-                reader,
-                output_base,
-                split_size,
-                &mut progress_cb,
-                &cancel_check,
-                &mut log_cb,
-            )
-        }
+        CompressionType::Chd => chd::compress_chd(
+            reader,
+            output_base,
+            logical_size,
+            split_size,
+            chd_options,
+            &mut progress_cb,
+            &cancel_check,
+            &mut log_cb,
+        ),
+        CompressionType::Dvd => chd::compress_chd_dvd(
+            reader,
+            output_base,
+            logical_size,
+            split_size,
+            chd_options,
+            &mut progress_cb,
+            &cancel_check,
+            &mut log_cb,
+        ),
     }
 }
 
@@ -183,49 +194,15 @@ pub fn decompress_to_writer(
                 progress_cb(total_written);
             }
         }
-        "chd" => {
-            // Use chdman to extract raw data to a temp file, then stream it
-            let parent = data_path.parent().unwrap_or(Path::new("."));
-            let temp_path = parent.join(format!(
-                ".vhd-export-{}.tmp",
-                data_path.file_stem().unwrap_or_default().to_string_lossy()
-            ));
-
+        "chd" | "chd-dvd" => {
             log_cb(&format!("Extracting CHD: {}", data_path.display()));
-            let chdman_cmd = crate::update::UpdateConfig::load()
-                .chdman_path
-                .unwrap_or_else(|| "chdman".to_string());
-            let output = Command::new(&chdman_cmd)
-                .arg("extractraw")
-                .arg("-i")
-                .arg(data_path)
-                .arg("-o")
-                .arg(&temp_path)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .output()
-                .context("failed to run chdman extractraw")?;
-
-            if !output.status.success() {
-                let _ = fs::remove_file(&temp_path);
-                bail!(
-                    "chdman extractraw failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
-            }
-
-            let temp_size = fs::metadata(&temp_path)
-                .map(|m| m.len())
-                .unwrap_or(u64::MAX);
-            let effective_size = temp_size.min(limit);
-            let mut reader =
-                BufReader::new(File::open(&temp_path).with_context(|| {
-                    format!("failed to open temp file: {}", temp_path.display())
-                })?)
-                .take(effective_size);
+            let chd_reader = chd::ChdReader::open(data_path)
+                .with_context(|| format!("failed to open CHD: {}", data_path.display()))?;
+            let logical_size = chd_reader.logical_size();
+            let effective_size = logical_size.min(limit);
+            let mut reader = chd_reader.take(effective_size);
             loop {
                 if cancel_check() {
-                    let _ = fs::remove_file(&temp_path);
                     bail!("export cancelled");
                 }
                 let n = reader.read(&mut buf)?;
@@ -236,7 +213,6 @@ pub fn decompress_to_writer(
                 total_written += n as u64;
                 progress_cb(total_written);
             }
-            let _ = fs::remove_file(&temp_path);
         }
         other => {
             bail!("unsupported compression type for VHD export: {}", other);
@@ -291,6 +267,7 @@ pub fn compress_file_to_archive(
     input_path: &Path,
     output_path_base: &Path,
     compression_type: &str,
+    chd_options: Option<ChdOptions>,
     progress_cb: &mut impl FnMut(u64),
     cancel_check: &impl Fn() -> bool,
     log_cb: &mut impl FnMut(&str),
@@ -308,14 +285,32 @@ pub fn compress_file_to_archive(
             progress_cb,
             cancel_check,
         ),
-        "chd" => chd::compress_chd(
-            &mut reader,
-            output_path_base,
-            None,
-            progress_cb,
-            cancel_check,
-            log_cb,
-        ),
+        "chd" => {
+            let logical_size = reader.get_ref().metadata()?.len();
+            chd::compress_chd(
+                &mut reader,
+                output_path_base,
+                logical_size,
+                None,
+                chd_options,
+                progress_cb,
+                cancel_check,
+                log_cb,
+            )
+        }
+        "chd-dvd" => {
+            let logical_size = reader.get_ref().metadata()?.len();
+            chd::compress_chd_dvd(
+                &mut reader,
+                output_path_base,
+                logical_size,
+                None,
+                chd_options,
+                progress_cb,
+                cancel_check,
+                log_cb,
+            )
+        }
         "none" | "raw" => raw::stream_with_split(
             &mut reader,
             output_path_base,
@@ -492,8 +487,10 @@ mod tests {
             &mut reader,
             &base,
             CompressionType::None,
+            data.len() as u64,
             None,
             false,
+            None,
             |_| {},
             || false,
             |_| {},
@@ -517,8 +514,10 @@ mod tests {
             &mut reader,
             &base,
             CompressionType::None,
+            data.len() as u64,
             Some(1024),
             false,
+            None,
             |_| {},
             || false,
             |_| {},
@@ -550,8 +549,10 @@ mod tests {
             &mut reader,
             &base,
             CompressionType::None,
+            data.len() as u64,
             None,
             true,
+            None,
             |_| {},
             || false,
             |_| {},
@@ -576,8 +577,10 @@ mod tests {
             &mut reader,
             &base,
             CompressionType::None,
+            data.len() as u64,
             None,
             true,
+            None,
             |_| {},
             || false,
             |_| {},
@@ -620,6 +623,7 @@ mod tests {
             &raw_path,
             &out_base,
             "woz",
+            None,
             &mut |_| {},
             &|| false,
             &mut |_| {},
@@ -645,8 +649,10 @@ mod tests {
             &mut reader,
             &base,
             CompressionType::None,
+            data.len() as u64,
             None,
             false,
+            None,
             |_| {},
             || true,
             |_| {},
@@ -654,5 +660,49 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("cancelled"));
+    }
+
+    #[test]
+    fn test_chd_decompress_round_trip() {
+        // Compress raw bytes to a CHD, then stream them back through
+        // decompress_to_writer (the path Stage 4 swapped from chdman extractraw
+        // to libchdman-rs). Result must equal the input byte-for-byte.
+        let tmp = TempDir::new().unwrap();
+        let mut input = vec![0u8; 1024 * 1024];
+        for (i, b) in input.iter_mut().enumerate() {
+            *b = ((i * 31) ^ (i >> 7)) as u8;
+        }
+        let mut reader = Cursor::new(&input);
+        let base = tmp.path().join("partition-0");
+
+        compress_partition(
+            &mut reader,
+            &base,
+            CompressionType::Chd,
+            input.len() as u64,
+            None,
+            false,
+            None,
+            |_| {},
+            || false,
+            |_| {},
+        )
+        .unwrap();
+
+        let chd_path = base.with_extension("chd");
+        let mut output: Vec<u8> = Vec::new();
+        let written = decompress_to_writer(
+            &chd_path,
+            "chd",
+            &mut output,
+            Some(input.len() as u64),
+            &mut |_| {},
+            &|| false,
+            &mut |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(written as usize, input.len());
+        assert_eq!(output, input, "CHD decompress round-trip mismatch");
     }
 }

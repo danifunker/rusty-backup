@@ -19,36 +19,19 @@ All settings can be configured through the GUI (Settings button in top bar) or b
     "enabled": true,
     "repository_url": "https://github.com/danifunker/rusty-backup"
   },
-  "chdman_path": null
+  "last_chd_codecs": null,
+  "last_chd_hunk_size": null
 }
 ```
 
-- **update_check.enabled**: Enable/disable automatic update checking at startup
-- **update_check.repository_url**: GitHub repository URL for update checks
-- **chdman_path**: Full path to chdman executable. Set to `null` or omit to use system PATH
+- **update_check.enabled**: Enable/disable automatic update checking at startup.
+- **update_check.repository_url**: GitHub repository URL for update checks.
+- **last_chd_codecs**: Last-used CHD codec spec (e.g. `"lzma,zlib,huff,flac"`),
+  remembered across launches. `null` = profile default.
+- **last_chd_hunk_size**: Last-used CHD hunk size in bytes. `null` = profile
+  default.
 
-## Example
-
-To specify a custom chdman location:
-
-```json
-{
-  "update_check": {
-    "enabled": true,
-    "repository_url": "https://github.com/danifunker/rusty-backup"
-  },
-  "chdman_path": "/usr/local/bin/chdman"
-}
-```
-
-Windows example:
-
-```json
-{
-  "update_check": {
-    "enabled": true,
-    "repository_url": "https://github.com/danifunker/rusty-backup"
-  },
-  "chdman_path": "C:\\Tools\\mame\\chdman.exe"
-}
-```
+CHD compression and decompression are built into the binary via
+[libchdman-rs](https://github.com/danifunker/libchdman-rs); there is no
+external `chdman` dependency to configure. See `docs/chd_native.md` for
+details.

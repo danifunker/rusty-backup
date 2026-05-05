@@ -6,7 +6,7 @@ Compress/decompress handlers for backup output formats, plus disk reconstruction
 
 - **`mod.rs`** — Orchestration functions (`compress_partition`, `decompress_to_writer`, `reconstruct_disk_from_backup`) and shared utilities (`SplitWriter`, `write_zeros`, `is_all_zeros`, `output_path`, `file_name`, `CHUNK_SIZE`).
 - **`vhd.rs`** — VHD (Fixed) format: `build_vhd_footer`, `vhd_chs_geometry`, `export_whole_disk_vhd`, `export_partition_vhd`, `VHD_COOKIE`.
-- **`chd.rs`** — CHD (MAME) format via external `chdman` tool: `detect_chdman`, `compress_chd`, `split_file`.
+- **`chd.rs`** — CHD (MAME) format via the in-process `libchdman-rs` crate: `compress_chd`, `compress_chd_dvd`, `ChdReader`, `CdCookedReader`.
 - **`zstd.rs`** — Zstd streaming compression: `compress_zstd`.
 - **`raw.rs`** — Raw streaming with optional file splitting and sparse zero-skipping: `stream_with_split`.
 
@@ -17,7 +17,7 @@ Compress/decompress handlers for backup output formats, plus disk reconstruction
 | Raw    | `.raw`    | None        | Yes       | Supports sparse zero-skipping |
 | VHD    | `.vhd`    | None        | No        | Fixed VHD with 512-byte footer |
 | Zstd   | `.zst`    | Zstd level 3 | Yes (post-hoc) | Good compression ratio |
-| CHD    | `.chd`    | MAME CHD    | Yes (post-hoc) | Requires `chdman` on PATH |
+| CHD    | `.chd`    | MAME CHD    | Yes (post-hoc) | Native via `libchdman-rs` (no external tool) |
 
 ## How to Add a New Output Format
 
