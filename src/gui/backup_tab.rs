@@ -323,6 +323,11 @@ impl BackupTab {
 
             // CHD codec / hunk-size knobs (only visible when CHD is selected)
             if matches!(self.compression_type, CompressionType::Chd) {
+                ui.label(
+                    egui::RichText::new("Output: single CHD file (chdman/MAME compatible).")
+                        .small()
+                        .weak(),
+                );
                 super::chd_options_ui::show(
                     ui,
                     "backup_chd",
@@ -343,33 +348,31 @@ impl BackupTab {
                 "Resize partitions to minimum size",
             );
 
-            // Split archives. Disabled for VHD (always one .vhd) and CHD/DVD
-            // (chdman + MAME don't recognise split CHDs).
-            let split_enabled = !matches!(
+            // Split archives. Hidden for CHD/DVD (chdman + MAME don't
+            // recognise split CHDs); disabled with a note for VHD (always
+            // one .vhd file).
+            let split_hidden = matches!(
                 self.compression_type,
-                CompressionType::Vhd | CompressionType::Chd | CompressionType::Dvd
+                CompressionType::Chd | CompressionType::Dvd
             );
-            ui.horizontal(|ui| {
-                ui.add_enabled_ui(split_enabled, |ui| {
-                    ui.checkbox(&mut self.split_archives, "Split archives");
-                    if self.split_archives && split_enabled {
-                        ui.label("Split size (MiB):");
-                        ui.add(egui::DragValue::new(&mut self.split_size_mib).range(100..=64000));
+            let split_enabled =
+                !split_hidden && !matches!(self.compression_type, CompressionType::Vhd);
+            if !split_hidden {
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(split_enabled, |ui| {
+                        ui.checkbox(&mut self.split_archives, "Split archives");
+                        if self.split_archives && split_enabled {
+                            ui.label("Split size (MiB):");
+                            ui.add(
+                                egui::DragValue::new(&mut self.split_size_mib).range(100..=64000),
+                            );
+                        }
+                    });
+                    if !split_enabled && matches!(self.compression_type, CompressionType::Vhd) {
+                        ui.label("(not available for VHD)");
                     }
                 });
-                if !split_enabled {
-                    let why = match self.compression_type {
-                        CompressionType::Vhd => "(not available for VHD)",
-                        CompressionType::Chd | CompressionType::Dvd => {
-                            "(not available for CHD — chdman/MAME load one file)"
-                        }
-                        _ => "",
-                    };
-                    if !why.is_empty() {
-                        ui.label(why);
-                    }
-                }
-            });
+            }
 
             // Checksum type
             ui.horizontal(|ui| {

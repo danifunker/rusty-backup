@@ -454,7 +454,7 @@ one partition and saves correctly, with metadata checksums updated. ✅
 
 ---
 
-### Stage 8 — re-export with resize (inspect-tab Export Disk Image)
+### Stage 8 — re-export with resize (inspect-tab Export Disk Image) ✅
 
 **Stage 8a — backend (`run_export` + estimator + free-space helper) ✅**
 
@@ -550,16 +550,26 @@ layout. Bulk-convert remains unchanged.
 
 ---
 
-### Stage 9 — UI cleanup + per-CHD split disablement
+### Stage 9 — UI cleanup + per-CHD split disablement ✅
 
-- Backup tab: split-size dropdown hidden when CHD/DVD selected.
-- `BackupConfig::split_size` ignored for CHD/DVD with a logged warning if
-  set.
-- Backup tab: small note next to the CHD/DVD radio: "Output: single CHD file
-  (chdman/MAME compatible)."
+- [x] Backup tab: split-archives checkbox + split-size DragValue are now
+      hidden entirely when CHD/DVD output is selected (previously rendered
+      disabled with an explanatory label). VHD continues to render the
+      checkbox disabled with a "(not available for VHD)" note since users
+      may still want to see why splitting isn't on offer for that path.
+- [x] `BackupConfig::split_size_mib` was already ignored for CHD/DVD with a
+      `LogLevel::Warning` ("Split-size set with CHD output: splitting is
+      incompatible with chdman/MAME single-file CHDs and is ignored.")
+      emitted from `run_backup` — see `src/backup/mod.rs:463`. Stage 9
+      verified the path; no code change needed beyond the UI hide.
+- [x] Small note rendered immediately below the Output Format row when CHD
+      is selected: "Output: single CHD file (chdman/MAME compatible)."
+      Sits above the CHD codec / hunk-size knobs so it lands next to the
+      radio without crowding the format row itself.
+- [x] `cargo build --all-targets` clean.
 
 **Done when:** UI no longer offers nonsensical options; warnings cover any
-config-file edge case.
+config-file edge case. ✅
 
 ---
 
