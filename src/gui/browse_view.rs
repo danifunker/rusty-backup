@@ -11,7 +11,7 @@ use rusty_backup::fs::filesystem::Filesystem;
 use rusty_backup::fs::resource_fork::{self, ResourceForkMode};
 use rusty_backup::fs::zstd_stream::ZstdStreamCache;
 use rusty_backup::model::archive_edit::{self, ArchiveEditContext, ArchiveEditProgress};
-use rusty_backup::model::browse_session::BrowseSession;
+use rusty_backup::model::browse_session::{BrowseOpenStatus, BrowseSession};
 use rusty_backup::model::edit_queue::{self, EditQueue, StagedEdit};
 use rusty_backup::model::status::ExtractionProgress;
 use rusty_backup::partition;
@@ -130,6 +130,13 @@ pub struct BrowseView {
     /// can refresh `metadata.json` (per-partition checksums + container
     /// SHA-1). `None` for plain CHD images that aren't part of a backup.
     single_file_chd_backup_folder: Option<PathBuf>,
+
+    /// Set while the worker spawned by `BrowseSession::spawn_open` is loading
+    /// the filesystem and root listing. Polled each frame in `show()`; once
+    /// the worker reports `finished`, its results are drained into this view's
+    /// state. Showing a spinner + phase here is much friendlier than freezing
+    /// the UI for the seconds a 500k-file HFS+ open can take.
+    pending_open: Option<Arc<Mutex<BrowseOpenStatus>>>,
 }
 
 /// State carried for the duration of a CHD edit-mode session.
@@ -268,6 +275,7 @@ impl Default for BrowseView {
             chd_edit: None,
             chd_flatten_progress: None,
             single_file_chd_backup_folder: None,
+            pending_open: None,
         }
     }
 }
@@ -326,37 +334,11 @@ impl BrowseView {
             });
         }
 
-        match self.session.open() {
-            Ok(mut fs) => {
-                self.fs_type = fs.fs_type().to_string();
-                self.volume_label = fs.volume_label().unwrap_or("").to_string();
-                self.blessed_folder = fs.blessed_system_folder();
-                self.active = true;
-
-                match fs.root() {
-                    Ok(root) => {
-                        // Auto-expand and cache root directory
-                        match fs.list_directory(&root) {
-                            Ok(entries) => {
-                                self.directory_cache.insert("/".into(), entries);
-                                self.expanded_paths.insert("/".into());
-                            }
-                            Err(e) => {
-                                self.error = Some(format!("Failed to read root directory: {e}"));
-                            }
-                        }
-                        self.root = Some(root);
-                    }
-                    Err(e) => {
-                        self.error = Some(format!("Failed to get root: {e}"));
-                    }
-                }
-            }
-            Err(e) => {
-                self.error = Some(format!("Cannot open filesystem: {e}"));
-                self.active = true;
-            }
-        }
+        // Open + initial root listing run on a worker thread so the UI can
+        // paint a spinner + phase while we wait. `show()` drains the result
+        // each frame.
+        self.active = true;
+        self.pending_open = Some(self.session.spawn_open());
     }
 
     /// Open the browser using a partclone block cache (for Clonezilla images).
@@ -523,6 +505,9 @@ impl BrowseView {
         self.staged_edits.clear();
         self.show_unsaved_dialog = false;
         self.pending_close = false;
+        // Detach any in-flight open worker. The thread keeps running but its
+        // result will be dropped when the Arc dies on completion.
+        self.pending_open = None;
         // Clean up archive temp file if present
         if let Some(temp) = self.archive_temp_path.take() {
             let _ = std::fs::remove_file(&temp);
@@ -577,6 +562,16 @@ impl BrowseView {
     pub fn show(&mut self, ui: &mut egui::Ui) {
         if !self.active {
             return;
+        }
+
+        // If a background open is in progress, drain its status and either
+        // render a spinner or finalize the open with the results it produced.
+        if self.pending_open.is_some() {
+            self.poll_pending_open(ui);
+            if self.pending_open.is_some() {
+                // Still loading — show only the progress indicator.
+                return;
+            }
         }
 
         // Poll extraction progress
@@ -3366,6 +3361,49 @@ impl BrowseView {
     }
 
     /// Poll extraction progress and update UI state.
+    /// Drain the background-open worker. While it's still running, render a
+    /// spinner + phase label and request a repaint. Once finished, copy the
+    /// fs metadata + root listing into self and clear `pending_open`.
+    fn poll_pending_open(&mut self, ui: &mut egui::Ui) {
+        let mut take_now = false;
+        if let Some(arc) = &self.pending_open {
+            if let Ok(g) = arc.lock() {
+                if g.finished {
+                    take_now = true;
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new());
+                        ui.label(format!("Loading filesystem: {}", g.phase));
+                    });
+                    ui.label(
+                        "Large volumes (e.g. HFS+ catalogs with hundreds of \
+                         thousands of files) can take several seconds.",
+                    );
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
+        if take_now {
+            if let Some(arc) = self.pending_open.take() {
+                if let Ok(mut g) = arc.lock() {
+                    self.fs_type = std::mem::take(&mut g.fs_type);
+                    self.volume_label = std::mem::take(&mut g.volume_label);
+                    self.blessed_folder = g.blessed_folder.take();
+                    if let Some(root) = g.root.take() {
+                        if let Some(entries) = g.root_entries.take() {
+                            self.directory_cache.insert("/".into(), entries);
+                            self.expanded_paths.insert("/".into());
+                        }
+                        self.root = Some(root);
+                    }
+                    if let Some(err) = g.error.take() {
+                        self.error = Some(err);
+                    }
+                }
+            }
+        }
+    }
+
     fn poll_extraction(&mut self, ui: &egui::Ui) {
         let finished_msg = if let Some(progress) = &self.extraction_progress {
             if let Ok(p) = progress.lock() {

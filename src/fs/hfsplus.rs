@@ -18,6 +18,7 @@ const HFS_PLUS_SIGNATURE: u16 = 0x482B;
 const HFSX_SIGNATURE: u16 = 0x4858;
 
 /// HFS+ reserved CNIDs (Inside Macintosh: Files / TN1150).
+#[allow(dead_code)]
 const HFSPLUS_EXTENTS_FILE_ID: u32 = 3;
 const HFSPLUS_CATALOG_FILE_ID: u32 = 4;
 const HFSPLUS_ALLOCATION_FILE_ID: u32 = 6;
@@ -376,12 +377,41 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
             )));
         }
 
+        // Sanity bound: the catalog and extents-overflow forks must fit
+        // within the volume. A corrupt logical_size that says "50 GiB" on a
+        // 58 GiB volume would otherwise drive `Vec::with_capacity` into swap.
+        let volume_bytes = vh.total_blocks as u64 * vh.block_size as u64;
+        if vh.catalog_file.logical_size > volume_bytes {
+            return Err(FilesystemError::Parse(format!(
+                "catalog file logical_size {} exceeds volume size {}",
+                vh.catalog_file.logical_size, volume_bytes
+            )));
+        }
+        if vh.extents_file.logical_size > volume_bytes {
+            return Err(FilesystemError::Parse(format!(
+                "extents-overflow file logical_size {} exceeds volume size {}",
+                vh.extents_file.logical_size, volume_bytes
+            )));
+        }
+
+        log::debug!(
+            "[HFS+ open @ {partition_offset}] vh ok: block_size={}, total_blocks={} ({} bytes), \
+             catalog={} bytes, extents_file={} bytes, alloc_file={} bytes",
+            vh.block_size,
+            vh.total_blocks,
+            volume_bytes,
+            vh.catalog_file.logical_size,
+            vh.extents_file.logical_size,
+            vh.allocation_file.logical_size,
+        );
+
         // Eagerly load the extents-overflow B-tree (its own 8 inline extents
         // are authoritative — the overflow file can't have overflow records),
         // then read the catalog with overflow support. Volumes with hundreds
         // of thousands of files can have catalog forks that exceed 8 inline
         // extents; reading inline-only would silently truncate and lead to
         // corrupt walks (and, with no cycle detection, hangs).
+        log::debug!("[HFS+ open] reading extents-overflow file...");
         let extents_overflow_data = if vh.extents_file.logical_size > 0 {
             Some(read_fork(
                 &mut reader,
@@ -392,7 +422,12 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         } else {
             None
         };
+        log::debug!(
+            "[HFS+ open] extents-overflow loaded: {} bytes",
+            extents_overflow_data.as_ref().map(|d| d.len()).unwrap_or(0)
+        );
 
+        log::debug!("[HFS+ open] reading catalog file...");
         let catalog_data = read_fork_with_overflow(
             &mut reader,
             partition_offset,
@@ -402,6 +437,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
             HFSPLUS_FORK_DATA,
             extents_overflow_data.as_deref(),
         )?;
+        log::debug!("[HFS+ open] catalog loaded: {} bytes", catalog_data.len());
 
         // Parse B-tree header from node 0
         if catalog_data.len() < 14 + 106 {
@@ -427,6 +463,13 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
     }
 
     /// List all children of a given parent CNID.
+    ///
+    /// HFS+ catalog records are ordered by (parent_id, name), so all children
+    /// of a given parent occupy a contiguous run in the leaf chain. We stop
+    /// the walk as soon as we encounter a record with parent_id > target —
+    /// otherwise listing the root of a 500k-file volume would scan every
+    /// leaf node in the catalog. The `visited` set guards against cycles
+    /// from corrupt `next` pointers.
     fn list_children(&self, parent_cnid: u32) -> Result<Vec<CatalogEntry>, FilesystemError> {
         let node_size = self.catalog_header.node_size as usize;
         if node_size == 0 {
@@ -435,8 +478,13 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
 
         let mut results = Vec::new();
         let mut node_idx = self.catalog_header.first_leaf_node;
+        let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut seen_target = false;
 
-        while node_idx != 0 {
+        'outer: while node_idx != 0 {
+            if !visited.insert(node_idx) {
+                break;
+            }
             let offset = node_idx as usize * node_size;
             if offset + node_size > self.catalog_data.len() {
                 break;
@@ -470,7 +518,22 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
 
                 // Key: parent_id (4) + name_length (2) + name (UTF-16BE)
                 let key_parent_id = BigEndian::read_u32(&key_data[0..4]);
-                if key_parent_id != parent_cnid {
+                if key_parent_id == parent_cnid {
+                    seen_target = true;
+                } else if key_parent_id > parent_cnid {
+                    // Catalog is sorted by (parent_id, name). Once we pass
+                    // the target, no further records will match. If we
+                    // already collected matches we're done; if not, the
+                    // target may still appear in a later leaf only if we
+                    // somehow started past it (shouldn't happen). Either
+                    // way, stop scanning.
+                    break 'outer;
+                } else {
+                    // key_parent_id < parent_cnid: not yet at the target.
+                    if seen_target {
+                        // (defensive) records out of order — bail.
+                        break 'outer;
+                    }
                     continue;
                 }
 
@@ -1545,13 +1608,65 @@ fn read_fork_with_overflow<R: Read + Seek>(
     Ok(data)
 }
 
+/// Translate a byte offset within a fork (file space) to a byte offset on
+/// the underlying device, using the fork's inline 8 extents. Returns
+/// `Some((device_offset, contiguous_bytes_remaining))` for the extent that
+/// contains `fork_offset`, or `None` if `fork_offset` falls past the inline
+/// extents (caller would need to consult the extents-overflow B-tree).
+fn translate_fork_offset(
+    fork: &ForkData,
+    block_size: u32,
+    partition_offset: u64,
+    fork_offset: u64,
+) -> Option<(u64, u64)> {
+    let bs = block_size as u64;
+    let mut cursor: u64 = 0;
+    for ext in &fork.extents {
+        if ext.block_count == 0 {
+            continue;
+        }
+        let len = ext.block_count as u64 * bs;
+        if fork_offset < cursor + len {
+            let local = fork_offset - cursor;
+            let dev = partition_offset + ext.start_block as u64 * bs + local;
+            return Some((dev, len - local));
+        }
+        cursor += len;
+    }
+    None
+}
+
+/// Read exactly one B-tree node from a fork, by node index.
+fn read_node_from_fork<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    block_size: u32,
+    fork: &ForkData,
+    node_idx: u32,
+    node_size: usize,
+) -> Option<Vec<u8>> {
+    let fork_offset = (node_idx as u64).checked_mul(node_size as u64)?;
+    let (dev_off, contig) = translate_fork_offset(fork, block_size, partition_offset, fork_offset)?;
+    if (contig as usize) < node_size {
+        // Node straddles an extent boundary — should never happen for HFS+
+        // since node_size divides block_size. Bail rather than do a multi-
+        // extent read for the cheap probe path.
+        return None;
+    }
+    reader.seek(SeekFrom::Start(dev_off)).ok()?;
+    let mut buf = vec![0u8; node_size];
+    reader.read_exact(&mut buf).ok()?;
+    Some(buf)
+}
+
 /// Probe an HFS+ volume header at `partition_offset` and return the volume
 /// label (root folder thread name) without loading the full catalog.
 ///
-/// Reads only the first inline extent of the catalog file (capped at 1 MiB)
-/// — enough in practice to contain the B-tree header node and the leaf node
-/// holding the root thread record. Returns None if the partition doesn't
-/// hold an HFS+/HFSX volume or the label can't be located cheaply.
+/// Reads node 0 (the B-tree header) and the first leaf node of the catalog
+/// file directly from disk via the fork's inline extents — typically two
+/// small reads. Returns None if the partition doesn't hold an HFS+/HFSX
+/// volume, or the root thread record isn't where it should be (the empty
+/// name sorts first, so it lives in record 0 of the first leaf node).
 pub fn probe_hfsplus_volume_label<R: Read + Seek>(
     reader: &mut R,
     partition_offset: u64,
@@ -1563,28 +1678,87 @@ pub fn probe_hfsplus_volume_label<R: Read + Seek>(
     if vh.block_size == 0 {
         return None;
     }
-    let ext = vh.catalog_file.extents[0];
-    if ext.block_count == 0 {
+
+    // Read node 0 to learn the catalog's actual node_size and first_leaf_node.
+    // We don't yet know node_size, so probe with the volume's allocation block
+    // size (HFS+ catalog node sizes are typically 4 KiB or 8 KiB and never
+    // exceed the allocation block size on commonly-encountered volumes).
+    let probe_size = (vh.block_size as usize).clamp(512, 32 * 1024);
+    let node0 = read_node_from_fork(
+        reader,
+        partition_offset,
+        vh.block_size,
+        &vh.catalog_file,
+        0,
+        probe_size,
+    )?;
+    if node0.len() < 14 + 30 {
         return None;
     }
-    let want = (ext.block_count as u64 * vh.block_size as u64).min(1 << 20) as usize;
-    if want < 14 + 106 {
+    let header = BTreeHeaderRecord::parse(&node0[14..14 + 30]);
+    let node_size = header.node_size as usize;
+    if node_size == 0 || node_size > 32 * 1024 || header.first_leaf_node == 0 {
         return None;
     }
-    reader
-        .seek(SeekFrom::Start(
-            partition_offset + ext.start_block as u64 * vh.block_size as u64,
-        ))
-        .ok()?;
-    let mut buf = vec![0u8; want];
-    reader.read_exact(&mut buf).ok()?;
-    let header = BTreeHeaderRecord::parse(&buf[14..14 + 106]);
-    let label = find_volume_label(&buf, &header);
-    if label.is_empty() {
-        None
-    } else {
-        Some(label)
+
+    // Read the first leaf node and look at its first record. The root thread
+    // (parent=2, name="") sorts before all other records in the catalog.
+    let leaf = read_node_from_fork(
+        reader,
+        partition_offset,
+        vh.block_size,
+        &vh.catalog_file,
+        header.first_leaf_node,
+        node_size,
+    )?;
+    if leaf.len() < node_size || leaf[8] as i8 != -1 {
+        return None;
     }
+    let num_records = BigEndian::read_u16(&leaf[10..12]) as usize;
+    for i in 0..num_records {
+        let (rec_start, rec_end) = super::hfs_common::btree_record_range(&leaf, node_size, i);
+        if rec_start >= rec_end || rec_end > node_size {
+            continue;
+        }
+        let rec = &leaf[rec_start..rec_end];
+        if rec.len() < 8 {
+            continue;
+        }
+        let key_len = BigEndian::read_u16(&rec[0..2]) as usize;
+        if key_len < 6 || 2 + key_len > rec.len() {
+            continue;
+        }
+        let parent_id = BigEndian::read_u32(&rec[2..6]);
+        if parent_id != 2 {
+            continue;
+        }
+        let name_length = BigEndian::read_u16(&rec[6..8]) as usize;
+        if name_length != 0 {
+            continue;
+        }
+        let mut data_start = 2 + key_len;
+        if !data_start.is_multiple_of(2) {
+            data_start += 1;
+        }
+        if data_start + 10 > rec.len() {
+            continue;
+        }
+        let record_type = BigEndian::read_i16(&rec[data_start..data_start + 2]);
+        if record_type != 3 {
+            continue;
+        }
+        let thread_name_len = BigEndian::read_u16(&rec[data_start + 8..data_start + 10]) as usize;
+        let body_start = data_start + 10;
+        let body_end = body_start + thread_name_len * 2;
+        if body_end > rec.len() {
+            continue;
+        }
+        let label = decode_utf16be(&rec[body_start..body_end]);
+        if !label.is_empty() {
+            return Some(label);
+        }
+    }
+    None
 }
 
 /// Write data through a fork's extent descriptors.
