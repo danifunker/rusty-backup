@@ -262,6 +262,20 @@ pub fn start_native_whole_disk(
 /// first three, `chd_options` selects the user's codec/hunk-size choice
 /// (None = profile defaults). For `BinCue`, `bincue_multi_bin` toggles
 /// single- vs. multi-bin output.
+/// Optional partition context that lets `start_native_whole_disk_chd`
+/// route through `single_file_chd::run_export` (resize-capable) instead
+/// of the legacy raw-stream `export_whole_disk_chd`. Only meaningful for
+/// `Chd` / `ChdDvd` formats; the optical paths ignore it.
+pub struct NativeWholeDiskChdPartitionContext {
+    pub partition_table: crate::partition::PartitionTable,
+    pub partitions: Vec<PartitionInfo>,
+    pub source_partition_table_bytes: [u8; 512],
+    pub alignment_sectors: u64,
+    /// `(partition_index, new_size_bytes)` per partition. Empty (or all
+    /// no-op) routes to the no-scratch fast path inside `run_export`.
+    pub resize_targets: Vec<(usize, u64)>,
+}
+
 pub fn start_native_whole_disk_chd(
     format: ExportFormat,
     source: PathBuf,
@@ -269,6 +283,7 @@ pub fn start_native_whole_disk_chd(
     chd_options: Option<ChdOptions>,
     bincue_multi_bin: bool,
     total_bytes: u64,
+    partition_context: Option<NativeWholeDiskChdPartitionContext>,
 ) -> Arc<Mutex<ExportStatus>> {
     let status = new_status(total_bytes);
     let status_thread = Arc::clone(&status);
@@ -290,6 +305,35 @@ pub fn start_native_whole_disk_chd(
         };
 
         let result = match format {
+            ExportFormat::Chd | ExportFormat::ChdDvd if partition_context.is_some() => {
+                let ctx = partition_context.expect("checked just above");
+                let p_cb = progress_cb;
+                let c_cb = cancel_cb;
+                let l_cb = log_cb;
+                let mut p_cb_dyn = p_cb;
+                let c_cb_dyn = c_cb;
+                let mut l_cb_dyn = l_cb;
+                crate::backup::single_file_chd::run_export(
+                    crate::backup::single_file_chd::SingleFileChdExportInputs {
+                        source_path: &source,
+                        partition_table: &ctx.partition_table,
+                        partitions: &ctx.partitions,
+                        source_partition_table_bytes: &ctx.source_partition_table_bytes,
+                        alignment_sectors: ctx.alignment_sectors,
+                        dest_path: &dest,
+                        chd_options,
+                        is_dvd: matches!(format, ExportFormat::ChdDvd),
+                        resize_targets: if ctx.resize_targets.is_empty() {
+                            None
+                        } else {
+                            Some(ctx.resize_targets.as_slice())
+                        },
+                    },
+                    &mut p_cb_dyn,
+                    &c_cb_dyn,
+                    &mut l_cb_dyn,
+                )
+            }
             ExportFormat::Chd => export_whole_disk_chd(
                 &source,
                 None,

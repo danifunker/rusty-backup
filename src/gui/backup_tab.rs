@@ -387,6 +387,7 @@ impl BackupTab {
         // until that lands.
         if matches!(self.compression_type, CompressionType::Chd)
             && !self.source_partitions.is_empty()
+            && !self.sector_by_sector
         {
             self.sync_chd_configs();
             ui.add_space(8.0);
@@ -452,6 +453,29 @@ impl BackupTab {
                     .italics(),
                 );
             });
+        }
+
+        // Explain why the picker is hidden when sector-by-sector + CHD are
+        // both selected. Sector-by-sector backups copy the disk byte-for-
+        // byte (preserving free space + unrecognized filesystem regions),
+        // so resizing at backup time would defeat the point. Users can
+        // still re-export the resulting CHD with new partition sizes
+        // later (Stage 8) — they'll just lose the byte-for-byte property.
+        if matches!(self.compression_type, CompressionType::Chd)
+            && !self.source_partitions.is_empty()
+            && self.sector_by_sector
+        {
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(
+                    "Sector-by-sector backups capture the source byte-for-byte \
+                     (including free space and unrecognized filesystems) and \
+                     cannot be resized at backup time. Use re-export from the \
+                     Inspect tab if you need to change partition sizes later.",
+                )
+                .small()
+                .italics(),
+            );
         }
 
         ui.add_space(16.0);
@@ -1230,7 +1254,7 @@ impl BackupTab {
         // from the inline picker. Other output types ignore this — picker
         // isn't shown.
         let (size_policy, partition_target_sizes) =
-            if matches!(self.compression_type, CompressionType::Chd) {
+            if matches!(self.compression_type, CompressionType::Chd) && !self.sector_by_sector {
                 let any_min_plus_20 = self
                     .chd_partition_configs
                     .iter()

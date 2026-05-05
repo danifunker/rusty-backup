@@ -771,6 +771,50 @@ pub fn is_elevated() -> bool {
     false
 }
 
+/// Free bytes available to the calling user on the filesystem that holds
+/// `path`. Returns `None` if the query fails (path doesn't exist, FS is
+/// unsupported, etc.) — callers should treat that as "can't tell" rather
+/// than "zero free space".
+///
+/// `path` may be a file or a directory; the caller most often passes the
+/// destination directory of a forthcoming write.
+pub fn available_space(path: &Path) -> Option<u64> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    unsafe {
+        use std::ffi::CString;
+        let c = CString::new(path.to_string_lossy().as_bytes()).ok()?;
+        let mut s: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c.as_ptr(), &mut s) != 0 {
+            return None;
+        }
+        // f_bavail is in units of f_frsize on Linux/macOS.
+        Some((s.f_bavail as u64).saturating_mul(s.f_frsize as u64))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+        // GetDiskFreeSpaceExW accepts any path (file or directory) on the
+        // target volume.
+        let wide: Vec<u16> = path
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut free_to_caller: u64 = 0;
+        unsafe {
+            GetDiskFreeSpaceExW(PCWSTR(wide.as_ptr()), Some(&mut free_to_caller), None, None)
+                .ok()?;
+        }
+        Some(free_to_caller)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 /// Request elevation by relaunching the application with administrator privileges.
 ///
 /// On Windows, uses `ShellExecuteW` with the "runas" verb to trigger the UAC dialog.

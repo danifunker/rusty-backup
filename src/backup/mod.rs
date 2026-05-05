@@ -1009,9 +1009,15 @@ fn run_single_file_chd_path(
     let requested_policy = config.size_policy.unwrap_or(SizePolicy::Original);
 
     // Output base for compress_chd (the .chd extension is appended by the
-    // compressor). Every single-file CHD backup uses the literal name
-    // `disk` so callers can find it without parsing metadata.
-    let output_base = backup_folder.join("disk");
+    // compressor). Use the backup folder's name so the resulting file is
+    // `<backup_name>/<backup_name>.chd`. Falls back to the literal `disk`
+    // when the path has no final component (shouldn't happen in practice
+    // — backup_folder is always created with a name).
+    let output_stem = backup_folder
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("disk");
+    let output_base = backup_folder.join(output_stem);
 
     let inputs = single_file_chd::SingleFileChdInputs {
         source_file: source.get_ref(),

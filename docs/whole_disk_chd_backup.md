@@ -173,7 +173,7 @@ fully unit-testable without any filesystem I/O.
 
 ---
 
-### Stage 3 — backup tab UI for CHD output
+### Stage 3 — backup tab UI for CHD output ✅
 
 **Stage 3b — picker UI + plumbing ✅**
 
@@ -324,7 +324,7 @@ a sensible drive with the right SHA1.
 
 ---
 
-### Stage 5 — restore branch
+### Stage 5 — restore branch ✅
 
 **Stage 5a — as-is restore ✅**
 
@@ -397,55 +397,156 @@ restore re-resize produces a valid resized target with passing fs check.
 
 ---
 
-### Stage 6 — inspect + browse on single-file-chd backups
+### Stage 6 — inspect + browse on single-file-chd backups ✅
 
-When inspect tab opens a backup folder with `layout = single-file-chd`:
-- Set `chd_image_path = Some(folder/disk.chd)`.
-- Reuse the existing CHD-on-image-file inspect path. Most plumbing exists
-  from "inspect a raw .chd image".
-- Browse view: per-partition browse opens `ChdReader`, seeks to the
-  partition offset, slices to `imaged_size`, and feeds that to
-  `open_filesystem`. Same as today's "browse a partition inside a CHD on
-  disk image".
-- The "CHD Info" button shows up automatically because `chd_image_path`
-  is set.
+Delivered via the Stage 4 redirect: opening a single-file-chd backup
+folder in inspect tab swaps the source to `<folder>/<container>` and re-
+runs inspect on the CHD directly. Browse, per-partition extract, and the
+"CHD Info" button all come for free from the existing CHD-image inspect
+path. The metadata.json sidecars (`mbr.json` / `gpt.json` / `apm.json`)
+remain in the folder for users who want to peek at the recorded layout.
+
+Trade-off accepted: the backup-folder framing (size_policy,
+container_sha1, recorded checksums) doesn't surface in the inspect view —
+users see the CHD as a disk image, not as a backup. Acceptable because
+the CHD is the source of truth and any in-CHD partition data is reachable
+through the standard inspect/browse flow.
+
+Container filename: `<backup_name>/<backup_name>.chd` (the backup folder's
+own name, not the literal `disk.chd`). `metadata.container` records the
+actual filename so old backups written with `disk.chd` continue to load.
 
 **Done when:** opening a single-file-chd backup in inspect tab shows the
-partition list + lets the user browse + extract files.
+partition list + lets the user browse + extract files. ✅
 
 ---
 
-### Stage 7 — edit mode on single-file-chd backups
+### Stage 7 — edit mode on single-file-chd backups ✅
 
-`chd_edit::ChdEditSession` already takes a parent CHD + diff path:
-- Edit mode opens a session on `disk.chd` with diff
-  `disk.edit-diff.chd`.
-- All edits flow through the existing chd_edit flatten-on-save path.
-- On save, recompute per-partition checksums in `metadata.json` for any
-  partition whose byte range was touched (derivable from the diff's hunk
-  map; conservatively recompute all if the map is hard to inspect).
+The chd_edit flow (compressed-CHD diff-against-parent + flatten-on-save)
+already covers the editing side. The Stage 6 redirect means the user is
+editing the backup's `<container>` directly, so no new edit plumbing was
+needed. What Stage 7 added:
+
+- New helper `backup::single_file_chd::refresh_metadata_after_edit(folder, log_cb)`
+  reads `metadata.json`, re-opens the container, and conservatively
+  recomputes every partition's SHA-256 (over `[start_lba * 512,
+  +imaged_size_bytes)`) plus the container's own SHA-1, then writes the
+  metadata back. Conservative recompute beats parsing the diff's hunk
+  map and is fast enough for typical backup sizes.
+- `BrowseView` gained `single_file_chd_backup_folder: Option<PathBuf>`
+  + `set_single_file_chd_backup_folder(folder)`. After a successful
+  `chd_edit::flatten_to_parent`, `poll_chd_flatten` calls the helper
+  when the field is set; failures surface as a warning suffix on the
+  "Changes saved successfully." message rather than rolling back the
+  on-disk save (the bytes are already correct).
+- `InspectTab` mirrors the field. The Stage 6 redirect now records the
+  original backup folder *after* `run_inspect` (which would otherwise
+  clear it via `clear_results`); `open_browse`'s raw-image branch
+  forwards it into `BrowseView` whenever it's set.
+
+Round-trip test: `refresh_metadata_after_edit_recomputes_checksums`
+builds a real backup, writes a `metadata.json` with stale partition + container
+checksums, and asserts the helper restores both to the live values.
 
 **Done when:** edit mode on a single-file-chd backup adds/removes files in
-one partition and saves correctly, with metadata checksums updated.
+one partition and saves correctly, with metadata checksums updated. ✅
 
 ---
 
-### Stage 8 — bulk-convert / re-export
+### Stage 8 — re-export with resize (inspect-tab Export Disk Image)
 
-The bulk-convert dialog already produces CHDs from arbitrary disk images
-(Stage 9 of the chdman-removal plan). Extend it to accept the same backup-
-time size picker + read-mode radio when the destination is HD CHD or DVD
-CHD. This gives users a "re-export this CHD with new sizes" workflow
+**Stage 8a — backend (`run_export` + estimator + free-space helper) ✅**
+
+- [x] `os::available_space(path) -> Option<u64>` cross-platform helper
+      (libc `statvfs` on macOS/Linux, `GetDiskFreeSpaceExW` on Windows).
+      Returns `None` rather than `0` when the query fails so callers
+      can distinguish "couldn't tell" from "really full".
+- [x] `single_file_chd::ExportDiskEstimate` + `estimate_export_disk_usage`.
+      Disk-usage math per the in-thread analysis: sparse temp scratch
+      consumes ~`sum(partition imaged_size_bytes) + 1 MiB head/tail
+      allowance` (grow regions cost ~0 because they're sparse holes that
+      compress_chd encodes as zero-hunks); output `.chd` upper bound is
+      the source CHD's existing file size when re-exporting from CHD,
+      else the source data size for raw images.
+- [x] `single_file_chd::SingleFileChdExportInputs` + `run_export`. The
+      no-resize path streams source → `compress_chd` directly via
+      `wrap_image_reader` (works for raw, VHD, 2MG, *and* CHD sources —
+      no scratch needed). The resize path needs raw `File` semantics, so
+      CHD sources are decompressed to a temp `.img` next to the dest
+      first (cleaned up by RAII guard); then the existing `run`
+      machinery drives the temp-file resize pipeline. Output filename
+      derived from `dest_path.with_extension("")`.
+- [x] Three new tests: `run_export_no_resize_round_trips_raw_to_chd`,
+      `run_export_with_resize_shrinks_partition`, and
+      `estimate_export_disk_usage_matches_partition_layout`. 661 lib
+      tests passing.
+
+**Stage 8b — UI + sector-by-sector warning ✅**
+
+- [x] Inspect-tab Export Disk Image popup keeps the existing per-
+      partition `size_mode_row` picker (already shown there for VHD
+      per-partition / whole-disk exports). For CHD output the picker
+      values now flow through to `single_file_chd::run_export` instead
+      of being ignored.
+- [x] `start_native_whole_disk_chd` gained a
+      `partition_context: Option<NativeWholeDiskChdPartitionContext>`
+      parameter. When provided (and format is `Chd` / `ChdDvd`), the
+      worker routes through `run_export`; otherwise it falls back to
+      the legacy raw-stream `export_whole_disk_chd` (no resize).
+- [x] Inspect-tab `build_chd_partition_context` reads sector 0 from the
+      source (`ChdReader` for `.chd` sources, `File::open` otherwise),
+      copies the parsed table + partitions + alignment, derives
+      `resize_targets` from the picker (filters out no-op entries — an
+      empty Vec keeps the no-scratch fast path inside `run_export`).
+- [x] On-screen workflow banner + disk-usage estimate: visible in the
+      popup whenever CHD output is selected for whole-disk export. Picks
+      one of four workflow strings depending on (CHD vs raw source) ×
+      (resize vs not), then shows scratch + output + total estimates in
+      MiB sourced from `estimate_export_disk_usage`. Final free-space
+      check runs at Export-click time (because we don't know the dest
+      directory until then), comparing `os::available_space(dest_dir)`
+      against `estimate.required_total()` — blocks the export with an
+      error message if insufficient and measurable.
+- [x] Sector-by-sector source warning: triggered when the user is
+      re-exporting *with resize* and the source is the body of a
+      single-file-CHD backup whose `metadata.json` records
+      `sector_by_sector: true`. Surfaces as an amber notice that the
+      byte-for-byte preservation of free space + unrecognized FS
+      regions only carries over when re-exporting at original sizes.
+
+**Done when:** the Export Disk Image popup lets the user re-export an
+opened source (raw image or `.chd`) to a CHD with new partition sizes,
+shows the workflow + disk-usage estimate, blocks on insufficient free
+space, and warns when resizing a sector-by-sector source. ✅
+
+---
+
+
+
+The inspect-tab "Export Disk Image..." popup already emits whole-disk CHDs
+from raw image / device sources. Extend just that flow with the backup-
+time size picker so users can re-export an opened source (including a
+loaded `.chd`) with new partition sizes — a "re-resize this disk" workflow
 without leaving the app.
 
-- Bulk-convert dialog: when destination is HD CHD or DVD CHD, embed the
-  partition size picker (sourced from each input's parsed partition table)
-  and the read-mode radio.
-- `export_whole_disk_chd` extends to accept an optional resize plan; falls
-  back to "Original" sizing when none is given (current behavior).
+Bulk-convert is intentionally out of scope: it batches many heterogeneous
+inputs and a per-input partition picker doesn't fit that UI.
 
-**Done when:** users can drop a CHD on bulk-convert, change partition
-sizes, and emit a new CHD with the new layout. Same for non-CHD inputs.
+- Inspect-tab Export Disk Image popup: when format is CHD (Hard Disk),
+  embed the shared `size_mode_row` widget per partition (sourced from the
+  inspect tab's already-parsed partition table + min-size cache, same
+  plumbing the backup tab uses in Stage 3b).
+- `export_whole_disk_chd` (or its single-file-CHD-aware sibling) accepts
+  an optional resize plan; falls back to "Original" when none is given
+  (current behavior preserved).
+- Read-mode radio is *not* added here — inspect-tab export is always
+  smart-compact today, and sector-by-sector re-export from an already-
+  imaged source is meaningless.
+
+**Done when:** with a raw image or `.chd` open in inspect, the user can
+pick new partition sizes in Export Disk Image and emit a CHD with the new
+layout. Bulk-convert remains unchanged.
 
 ---
 
@@ -484,31 +585,35 @@ config-file edge case.
 
 ---
 
-## Open questions / risks
+## Open questions / risks (resolved)
 
-- **Bad-sector handling.** Today bad sectors get recorded in
-  `metadata.json` and zero-filled in the per-partition stream. Same
-  approach works inside the disk-image stream: read full extent, zero out
-  bad ranges, record them in metadata. Sector-by-sector mode treats bad
-  sectors the same way (read attempt → zero on failure → record).
+- **Bad-sector handling.** Parity with the per-partition path: neither
+  populates `metadata.bad_sectors` in production today (the field is
+  defined but no code path writes to it). Read errors propagate as IO
+  errors and abort the backup in both layouts. Wiring up real bad-sector
+  recording is a separate cross-cutting effort, not specific to this
+  plan; tracking it under `docs/TODO_missing_features.md` if/when it
+  matters.
 
-- **GPT alternate header.** Stream builder must emit the GPT backup header
-  at the synthesised disk's last 33 LBAs. `Gpt::patch_for_restore` already
-  handles this when given the new disk size.
+- **GPT alternate header.** Resolved in Stage 4c — `build_head_segments`
+  emits a freshly-built primary GPT at LBA 1–33 and a backup GPT at the
+  last 33 LBAs of the synthesised disk; `Gpt::patch_for_restore` is used
+  on the resize path so both copies stay consistent.
 
-- **Sector-by-sector + resize.** Sector-by-sector reads the source byte
-  for byte, which assumes the partition's `imaged_size` equals its source
-  size. If the user picks sector-by-sector and *also* requests a smaller
-  size, we should reject the combination at config-validate time (or
-  fall back to truncate, with a loud warning that data past the new end
-  is dropped). Likewise growing a partition with sector-by-sector zero-pads
-  the tail — fine, but worth surfacing.
+- **Sector-by-sector + resize.** Resolved by disallowing the combination
+  outright. Sector-by-sector backups are point-in-time forensic copies
+  that preserve free space and unrecognized filesystem regions; resizing
+  at backup time would defeat the property. Enforced in two places:
+  the backup tab hides the per-partition size picker when sector-by-
+  sector is checked (with an explanatory note), and `single_file_chd::run`
+  bails defensively if a caller still hands it `resize_targets` with
+  changes. Re-export via Inspect (Stage 8) remains the supported way to
+  change sizes after the fact, with a warning that the byte-for-byte
+  property is lost in the re-exported file.
 
-- **APM disks.** Apple Partition Map sources work the same way — partition
-  table at sector 0 instead of MBR/GPT. The existing APM emission code
-  (e.g. `emit_apm_disk_with_hfs`) plugs into the disk-image stream the
-  same way as MBR.
-
-- **Migration.** Out of scope. Old per-partition CHD backups keep working
-  forever (layout discriminator defaults to `per-partition`). Users can
-  re-back-up if they want the new format.
+- **APM disks.** Resolved in Stage 4c — `build_head_segments` reads the
+  pre-first-partition region (DDR + map + Apple_Driver* partitions)
+  verbatim from the source. APM-aware emission already existed
+  (`emit_apm_disk_with_hfs`) but the single-file-CHD path doesn't need
+  it: copying the source's head bytes preserves bootability without re-
+  synthesising the map.

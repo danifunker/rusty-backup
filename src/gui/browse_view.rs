@@ -125,6 +125,11 @@ pub struct BrowseView {
     /// Background flatten progress (compressed CHD apply): merges the diff
     /// into a fresh compressed CHD that overwrites the parent.
     chd_flatten_progress: Option<Arc<Mutex<ChdFlattenProgress>>>,
+    /// When the CHD being edited is the body of a single-file-chd backup,
+    /// this carries the backup folder path so that on flatten-success we
+    /// can refresh `metadata.json` (per-partition checksums + container
+    /// SHA-1). `None` for plain CHD images that aren't part of a backup.
+    single_file_chd_backup_folder: Option<PathBuf>,
 }
 
 /// State carried for the duration of a CHD edit-mode session.
@@ -262,6 +267,7 @@ impl Default for BrowseView {
             pending_extraction: None,
             chd_edit: None,
             chd_flatten_progress: None,
+            single_file_chd_backup_folder: None,
         }
     }
 }
@@ -470,6 +476,13 @@ impl BrowseView {
         self.edit_supported = true;
     }
 
+    /// Mark the currently-open CHD as the body of a single-file-chd backup.
+    /// On a successful chd_edit flatten we'll refresh the backup's
+    /// `metadata.json` (per-partition SHA-256 + container SHA-1).
+    pub fn set_single_file_chd_backup_folder(&mut self, backup_folder: PathBuf) {
+        self.single_file_chd_backup_folder = Some(backup_folder);
+    }
+
     /// (`zstd_cache` is `Some`).  The directory cache is preserved so the
     /// user stays in the same place in the tree.
     pub fn upgrade_to_seekable_cache(&mut self, cache_path: PathBuf) {
@@ -520,6 +533,7 @@ impl BrowseView {
         // CHD is left untouched; user's `.chd_backup` is preserved.
         self.discard_chd_edit_session();
         self.chd_flatten_progress = None;
+        self.single_file_chd_backup_folder = None;
     }
 
     pub fn is_active(&self) -> bool {
@@ -1854,7 +1868,31 @@ impl BrowseView {
         }
         // Re-open the now-replaced parent CHD for browsing.
         self.invalidate_all_caches();
-        self.edit_result = Some("Changes saved successfully.".to_string());
+
+        // If the CHD is the body of a single-file-chd backup, refresh
+        // metadata.json so per-partition checksums + container SHA-1 stay
+        // in sync with the new container contents. Best-effort: failure
+        // surfaces in the edit result but doesn't roll back the save —
+        // the bytes on disk are already correct.
+        let mut result_msg = String::from("Changes saved successfully.");
+        if let Some(folder) = self.single_file_chd_backup_folder.clone() {
+            let mut log_lines: Vec<String> = Vec::new();
+            let mut log_cb = |s: &str| log_lines.push(s.to_string());
+            match rusty_backup::backup::single_file_chd::refresh_metadata_after_edit(
+                &folder,
+                &mut log_cb,
+            ) {
+                Ok(()) => {
+                    result_msg.push_str(" Backup metadata.json refreshed.");
+                }
+                Err(e) => {
+                    result_msg.push_str(&format!(
+                        " (Warning: failed to refresh backup metadata.json: {e:#})"
+                    ));
+                }
+            }
+        }
+        self.edit_result = Some(result_msg);
     }
 
     /// Render the edit mode toolbar with action buttons and free space.

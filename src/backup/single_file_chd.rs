@@ -38,6 +38,7 @@ use std::path::Path;
 use anyhow::{anyhow, Context, Result};
 
 use super::disk_image_stream::DiskImageStreamBuilder;
+use super::metadata::{BackupLayout, BackupMetadata};
 use crate::fs;
 use crate::partition::mbr::patch_mbr_entries;
 use crate::partition::resize::{compute_resize_plan, PartitionResizePlan};
@@ -109,6 +110,76 @@ pub struct SingleFileChdResult {
     pub partition_ranges: Vec<ChdPartitionRange>,
 }
 
+/// Estimate of the new on-disk usage that a re-export will incur. All
+/// values are upper bounds; sparse temp files mean actual scratch usage
+/// is typically lower, and CHD compression of zero-grow regions makes the
+/// output smaller in practice. Use [`required_total`](Self::required_total)
+/// for the free-space check.
+#[derive(Debug, Clone, Copy)]
+pub struct ExportDiskEstimate {
+    /// Bytes the scratch temp file will consume at peak. Only set when a
+    /// resize plan is in play; zero otherwise (the no-resize path streams
+    /// directly into the encoder with no scratch file).
+    pub scratch_bytes: u64,
+    /// Bytes the output `.chd` is expected to occupy. Estimated as the
+    /// existing source `.chd` file size when re-exporting from a CHD
+    /// (compressed grow regions add little), or as the source data size
+    /// when re-exporting from a raw image.
+    pub output_bytes: u64,
+}
+
+impl ExportDiskEstimate {
+    /// Total *new* on-disk usage during the export — what the destination
+    /// filesystem needs free.
+    pub fn required_total(&self) -> u64 {
+        self.scratch_bytes.saturating_add(self.output_bytes)
+    }
+}
+
+/// Estimate the disk usage a re-export will incur.
+///
+/// - `source_logical_size` — total logical bytes the source disk image
+///   covers (== source data size for raw images; == container_logical_size
+///   for CHD sources).
+/// - `source_chd_file_size` — `Some(bytes)` when re-exporting from a CHD
+///   (used as the output upper bound). `None` for raw-image sources, in
+///   which case `source_logical_size` is used as the output upper bound.
+/// - `partitions` — the parsed source partitions (post-resize sizes are
+///   *not* applied here; this estimator works at the disk-image level
+///   for the scratch upper bound).
+/// - `has_resize` — true if any partition is being resized or moved. The
+///   no-resize path uses no scratch file at all.
+///
+/// The scratch upper bound is the sum of partition `size_bytes` (which
+/// covers the actually-written regions; sparse grow regions cost ~0)
+/// plus a small head/tail allowance.
+pub fn estimate_export_disk_usage(
+    source_logical_size: u64,
+    source_chd_file_size: Option<u64>,
+    partitions: &[PartitionInfo],
+    has_resize: bool,
+) -> ExportDiskEstimate {
+    // 1 MiB head/tail allowance covers MBR (1 sector), GPT (33 sectors at
+    // each end), or APM (driver region up to a few hundred KiB). Cheap to
+    // be generous here.
+    const HEAD_TAIL_ALLOWANCE: u64 = 1024 * 1024;
+    let scratch_bytes = if has_resize {
+        partitions
+            .iter()
+            .filter(|p| !p.is_extended_container && p.partition_type_byte != 0xEE)
+            .map(|p| p.size_bytes)
+            .fold(0u64, u64::saturating_add)
+            .saturating_add(HEAD_TAIL_ALLOWANCE)
+    } else {
+        0
+    };
+    let output_bytes = source_chd_file_size.unwrap_or(source_logical_size);
+    ExportDiskEstimate {
+        scratch_bytes,
+        output_bytes,
+    }
+}
+
 /// True if `inputs` describes a source layout we can currently handle in
 /// single-file CHD mode. MBR / GPT / APM are supported; superfloppy still
 /// falls back to the per-partition path because there is no partition table
@@ -137,6 +208,31 @@ pub fn run(
              pick zstd/raw, or use the per-partition CHD flow.",
             inputs.partition_table.type_name(),
         );
+    }
+
+    // Sector-by-sector + backup-time resize is rejected: sector-by-sector's
+    // whole point is preserving the source byte-for-byte (free space +
+    // unrecognized filesystem regions included), and resizing during
+    // backup would defeat that. Users who want different sizes should
+    // re-export the resulting CHD via the Inspect tab.
+    if inputs.sector_by_sector {
+        if let Some(targets) = inputs.resize_targets {
+            let any_change = targets.iter().any(|(idx, new_size)| {
+                inputs
+                    .partitions
+                    .iter()
+                    .find(|p| p.index == *idx)
+                    .map(|p| p.size_bytes != *new_size)
+                    .unwrap_or(false)
+            });
+            if any_change {
+                anyhow::bail!(
+                    "sector-by-sector backups cannot be resized at backup time — \
+                     they capture the source byte-for-byte. Re-export the resulting \
+                     CHD via Inspect if you need to change partition sizes."
+                );
+            }
+        }
     }
 
     // If the caller passed a non-trivial resize plan, fork off to the
@@ -288,6 +384,214 @@ pub fn run(
         container_sha1,
         partition_ranges,
     })
+}
+
+/// Inputs for re-exporting an existing disk image (raw or `.chd`) to a
+/// `.chd` via the single-file pipeline. Differs from `SingleFileChdInputs`
+/// in two ways:
+///
+/// - Source is a path (not a pre-opened `&File`): when the source is a
+///   `.chd` and a resize plan is requested, [`run_export`] decompresses
+///   it to a temp file first because the resize pipeline needs raw
+///   `File` semantics. Raw-image sources are opened directly.
+/// - The output path is the user's literal destination filename
+///   (e.g. `~/Desktop/MyDisk.chd`), not a `<folder>/<stem>` base —
+///   `run_export` derives the `compress_chd` base by stripping the
+///   trailing extension.
+///
+/// Used by the inspect-tab "Export Disk Image" popup; not by `run_backup`.
+pub struct SingleFileChdExportInputs<'a> {
+    /// Source disk image path (raw, VHD, 2MG, or `.chd`).
+    pub source_path: &'a Path,
+    /// Already-parsed partition table for the source.
+    pub partition_table: &'a PartitionTable,
+    /// Already-parsed partitions for the source.
+    pub partitions: &'a [PartitionInfo],
+    /// MBR sector bytes (only consulted when the table is MBR).
+    pub source_partition_table_bytes: &'a [u8; 512],
+    /// Source-disk alignment (typically copied from the inspect tab).
+    pub alignment_sectors: u64,
+    /// Final destination `.chd` path. Must end in `.chd`; the encoder
+    /// writes `<dest_path with .chd stripped>.chd`.
+    pub dest_path: &'a Path,
+    /// CHD encoder options (codec / hunk size). `None` = profile defaults.
+    pub chd_options: Option<ChdOptions>,
+    /// `true` to emit a DVD-profile CHD (2048-byte unit + DVD metadata).
+    pub is_dvd: bool,
+    /// Per-partition resize targets `(partition_index, new_size_bytes)`.
+    /// `None` (or empty / all no-op) routes to the fast streaming path
+    /// with no scratch file.
+    pub resize_targets: Option<&'a [(usize, u64)]>,
+}
+
+/// Re-export an opened disk image to a `.chd` file, optionally applying
+/// per-partition resize. Mirrors what the inspect-tab "Export Disk Image"
+/// popup needs: caller provides parsed partition info (from the open
+/// inspect view) and an optional resize plan; the encoder picks the fast
+/// streaming path when no resize is requested.
+///
+/// CHD-source + resize: the source is decompressed into a temp `.img`
+/// next to the destination first, since the resize pipeline needs raw
+/// `File` semantics for seek/read. The temp file is removed on return
+/// (success or error) — see the RAII guard at the top of the function.
+pub fn run_export(
+    inputs: SingleFileChdExportInputs<'_>,
+    progress_cb: &mut dyn FnMut(u64),
+    cancel_check: &dyn Fn() -> bool,
+    log_cb: &mut dyn FnMut(&str),
+) -> Result<()> {
+    if !is_supported(inputs.partition_table) {
+        anyhow::bail!(
+            "single-file CHD export does not support {} sources yet",
+            inputs.partition_table.type_name(),
+        );
+    }
+
+    // compress_chd writes "<base>.chd" — strip the extension from the
+    // user's destination so the final filename matches what they asked
+    // for. (e.g. ~/Desktop/MyDisk.chd → output_base = ~/Desktop/MyDisk.)
+    let output_base = inputs.dest_path.with_extension("");
+
+    let has_resize = inputs
+        .resize_targets
+        .map(|t| {
+            t.iter().any(|(idx, new)| {
+                inputs
+                    .partitions
+                    .iter()
+                    .find(|p| p.index == *idx)
+                    .map(|p| p.size_bytes != *new)
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+
+    // No-resize path: stream source -> compress_chd directly. Works for
+    // raw images (`wrap_image_reader` returns a BufReader) and for `.chd`
+    // sources (`wrap_image_reader` returns a ChdReader-backed stream).
+    // No scratch file required.
+    if !has_resize {
+        log_cb("Re-exporting whole disk to CHD (no resize)...");
+        let probe = File::open(inputs.source_path)
+            .with_context(|| format!("failed to open {}", inputs.source_path.display()))?;
+        let probe_path = inputs.source_path.to_path_buf();
+        let fmt = crate::rbformats::detect_image_format_with_path(probe, Some(&probe_path))?;
+        let file2 = File::open(inputs.source_path)?;
+        let (mut reader, source_data_size) = crate::rbformats::wrap_image_reader(file2, fmt)?;
+
+        let mut p_cb = |n: u64| progress_cb(n);
+        let c_cb = || cancel_check();
+        let mut l_cb = |s: &str| log_cb(s);
+        let _written = if inputs.is_dvd {
+            compress_chd_dvd(
+                &mut reader,
+                &output_base,
+                source_data_size,
+                None,
+                inputs.chd_options.clone(),
+                &mut p_cb,
+                &c_cb,
+                &mut l_cb,
+            )?
+        } else {
+            compress_chd(
+                &mut reader,
+                &output_base,
+                source_data_size,
+                None,
+                inputs.chd_options.clone(),
+                &mut p_cb,
+                &c_cb,
+                &mut l_cb,
+            )?
+        };
+        return Ok(());
+    }
+
+    // Resize path: build a real `&File` over the source bytes (decompress
+    // CHD sources to a temp .img next to the destination first), then
+    // hand off to the existing `run_with_resize` pipeline through `run`.
+    log_cb("Re-exporting whole disk to CHD with resize plan...");
+    let dest_dir = inputs.dest_path.parent().unwrap_or(Path::new("."));
+    let temp_decompressed = if is_chd_extension(inputs.source_path) {
+        let path = dest_dir.join(format!(".rusty-backup-export-{}.img", std::process::id(),));
+        log_cb(&format!(
+            "Decompressing source CHD to {}...",
+            path.display()
+        ));
+        decompress_chd_to_file(inputs.source_path, &path, cancel_check)
+            .with_context(|| format!("failed to decompress source CHD to {}", path.display()))?;
+        Some(path)
+    } else {
+        None
+    };
+    // RAII guard so the temp .img is always cleaned up.
+    struct TempFileGuard(Option<std::path::PathBuf>);
+    impl Drop for TempFileGuard {
+        fn drop(&mut self) {
+            if let Some(p) = self.0.take() {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+    let _guard = TempFileGuard(temp_decompressed.clone());
+
+    let working_path = temp_decompressed.as_deref().unwrap_or(inputs.source_path);
+    let source_file = File::open(working_path)
+        .with_context(|| format!("failed to open {}", working_path.display()))?;
+    let source_size = source_file.metadata()?.len();
+
+    let run_inputs = SingleFileChdInputs {
+        source_file: &source_file,
+        source_size,
+        source_partition_table_bytes: inputs.source_partition_table_bytes,
+        partition_table: inputs.partition_table,
+        partitions: inputs.partitions,
+        partition_filter: None,
+        sector_by_sector: false,
+        chd_options: inputs.chd_options.clone(),
+        is_dvd: inputs.is_dvd,
+        output_base: &output_base,
+        resize_targets: inputs.resize_targets,
+        alignment_sectors: inputs.alignment_sectors,
+    };
+
+    // `run` returns post-write metadata; we don't need it here — the
+    // caller writes no metadata.json on the export path.
+    let _ = run(run_inputs, progress_cb, cancel_check, log_cb)?;
+    Ok(())
+}
+
+fn is_chd_extension(p: &Path) -> bool {
+    matches!(
+        p.extension().and_then(|s| s.to_str()).map(|s| s.to_ascii_lowercase()),
+        Some(ref s) if s == "chd"
+    )
+}
+
+/// Stream the entire logical contents of a CHD into a fresh raw `.img`
+/// at `dest`. Used by the resize re-export path because the resize
+/// pipeline needs raw `File` semantics on the source.
+fn decompress_chd_to_file(
+    chd_path: &Path,
+    dest: &Path,
+    cancel_check: &dyn Fn() -> bool,
+) -> Result<()> {
+    let mut reader = ChdReader::open(chd_path)?;
+    let mut out = File::create(dest)?;
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        if cancel_check() {
+            anyhow::bail!("operation cancelled");
+        }
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        out.write_all(&buf[..n])?;
+    }
+    out.flush()?;
+    Ok(())
 }
 
 /// Build a per-partition resize plan from `inputs.resize_targets`. Returns
@@ -993,6 +1297,78 @@ fn compute_post_write_metadata(
     Ok(hex_lower(&sha1_bytes))
 }
 
+/// Refresh `metadata.json` after an in-place edit of a single-file-CHD
+/// backup's container. Recomputes every partition's SHA-256 over its
+/// recorded `[start_lba * 512, +imaged_size_bytes)` byte range and the
+/// container's own SHA-1, then writes the updated metadata back.
+///
+/// Conservative by design: the chd_edit diff carries no easy-to-inspect
+/// hunk map at this layer, so every partition is re-hashed regardless of
+/// which one(s) the user touched. For typical backups (a handful of
+/// partitions, single-digit GiB each) the second pass is fast.
+///
+/// Errors out (with the metadata untouched) if the layout isn't
+/// `SingleFileChd`, the container is missing, or any byte range overflows
+/// the container.
+pub fn refresh_metadata_after_edit(
+    backup_folder: &Path,
+    log_cb: &mut dyn FnMut(&str),
+) -> Result<()> {
+    let metadata_path = backup_folder.join("metadata.json");
+    let data = std::fs::read_to_string(&metadata_path)
+        .with_context(|| format!("failed to read {}", metadata_path.display()))?;
+    let mut metadata: BackupMetadata = serde_json::from_str(&data)
+        .with_context(|| format!("failed to parse {}", metadata_path.display()))?;
+
+    if !matches!(metadata.layout, BackupLayout::SingleFileChd) {
+        anyhow::bail!(
+            "refresh_metadata_after_edit called on non single-file-chd backup at {}",
+            backup_folder.display(),
+        );
+    }
+
+    let container_name = metadata
+        .container
+        .as_deref()
+        .ok_or_else(|| anyhow!("metadata.container missing for single-file-chd backup"))?;
+    let chd_path = backup_folder.join(container_name);
+
+    let mut ranges: Vec<ChdPartitionRange> = metadata
+        .partitions
+        .iter()
+        .map(|p| ChdPartitionRange {
+            partition_index: p.index,
+            offset_in_disk: p.start_lba.saturating_mul(512),
+            length: p.imaged_size_bytes,
+            checksum_sha256: String::new(),
+        })
+        .collect();
+
+    log_cb(&format!(
+        "Recomputing checksums for {} partition(s) in {}",
+        ranges.len(),
+        chd_path.display(),
+    ));
+    let new_sha1 = compute_post_write_metadata(&chd_path, &mut ranges, log_cb)?;
+
+    for range in &ranges {
+        if let Some(part) = metadata
+            .partitions
+            .iter_mut()
+            .find(|p| p.index == range.partition_index)
+        {
+            part.checksum = range.checksum_sha256.clone();
+        }
+    }
+    metadata.container_sha1 = Some(new_sha1);
+
+    let json = serde_json::to_string_pretty(&metadata)?;
+    std::fs::write(&metadata_path, json)
+        .with_context(|| format!("failed to write {}", metadata_path.display()))?;
+    log_cb("metadata.json updated.");
+    Ok(())
+}
+
 fn hex_lower(b: &[u8]) -> String {
     let mut s = String::with_capacity(b.len() * 2);
     for byte in b {
@@ -1604,5 +1980,307 @@ mod tests {
             src_free.iter().any(|b| *b == 0xAB),
             "test setup failed — source free region must contain garbage",
         );
+    }
+
+    /// Stage 7: feed `refresh_metadata_after_edit` a backup folder whose
+    /// metadata.json has stale partition + container checksums. After the
+    /// call, both should reflect the actual CHD's contents.
+    #[test]
+    fn refresh_metadata_after_edit_recomputes_checksums() {
+        use crate::backup::metadata::{
+            AlignmentMetadata, BackupLayout, BackupMetadata, PartitionMetadata,
+        };
+
+        // Build a real single-file CHD backup body via `run` so the
+        // recomputed numbers match values the production path agrees with.
+        const TOTAL_SECTORS: u32 = 8192;
+        const PART_SECTORS: u32 = 4095;
+        const SECTOR_SIZE: u64 = 512;
+        let total_bytes = (TOTAL_SECTORS as u64) * SECTOR_SIZE;
+        let part_bytes = (PART_SECTORS as u64) * SECTOR_SIZE;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let backup_folder = tmp.path().join("mybackup");
+        std::fs::create_dir(&backup_folder).unwrap();
+        let source_path = tmp.path().join("source.img");
+
+        let mut data = vec![0u8; total_bytes as usize];
+        data[..512].copy_from_slice(&build_test_mbr(PART_SECTORS));
+        for i in 0..(part_bytes as usize) {
+            data[512 + i] = ((i % 251) as u8).wrapping_add(1);
+        }
+        std::fs::write(&source_path, &data).unwrap();
+
+        let source_file = File::open(&source_path).unwrap();
+        let source_size = source_file.metadata().unwrap().len();
+        let mut br = BufReader::new(source_file.try_clone().unwrap());
+        let table = PartitionTable::detect(&mut br).expect("detect MBR");
+        let partitions = table.partitions();
+        let mbr_bytes = {
+            let mut buf = [0u8; 512];
+            buf.copy_from_slice(&data[..512]);
+            buf
+        };
+        let output_base = backup_folder.join("mybackup");
+        let inputs = SingleFileChdInputs {
+            source_file: &source_file,
+            source_size,
+            source_partition_table_bytes: &mbr_bytes,
+            partition_table: &table,
+            partitions: &partitions,
+            partition_filter: None,
+            sector_by_sector: false,
+            chd_options: None,
+            is_dvd: false,
+            output_base: &output_base,
+            resize_targets: None,
+            alignment_sectors: 0,
+        };
+        let mut log_cb = |_: &str| {};
+        let mut progress_cb = |_: u64| {};
+        let cancel_check = || false;
+        let result = run(inputs, &mut progress_cb, &cancel_check, &mut log_cb)
+            .expect("single-file CHD backup");
+
+        let real_part_checksum = result.partition_ranges[0].checksum_sha256.clone();
+        let real_container_sha1 = result.container_sha1.clone();
+
+        // Write a metadata.json with intentionally-stale checksums.
+        let metadata = BackupMetadata {
+            version: 1,
+            created: "2026-05-05T00:00:00Z".to_string(),
+            source_device: source_path.display().to_string(),
+            source_size_bytes: source_size,
+            partition_table_type: "MBR".to_string(),
+            checksum_type: "sha256".to_string(),
+            compression_type: "chd".to_string(),
+            split_size_mib: None,
+            sector_by_sector: false,
+            layout: BackupLayout::SingleFileChd,
+            container: Some(result.container_filename.clone()),
+            container_logical_size: Some(result.container_logical_size),
+            container_sha1: Some("stale-container-sha1".to_string()),
+            size_policy: None,
+            alignment: AlignmentMetadata {
+                detected_type: "None".to_string(),
+                first_partition_lba: 1,
+                alignment_sectors: 0,
+                heads: 0,
+                sectors_per_track: 0,
+            },
+            partitions: vec![PartitionMetadata {
+                index: 0,
+                type_name: "Linux".to_string(),
+                partition_type_byte: 0x83,
+                start_lba: 1,
+                original_size_bytes: part_bytes,
+                imaged_size_bytes: part_bytes,
+                compressed_files: vec![],
+                checksum: "stale-partition-checksum".to_string(),
+                resized: false,
+                compacted: true,
+                is_logical: false,
+                partition_type_string: None,
+                minimum_size_bytes: None,
+            }],
+            bad_sectors: vec![],
+            extended_container: None,
+        };
+        let metadata_path = backup_folder.join("metadata.json");
+        std::fs::write(
+            &metadata_path,
+            serde_json::to_string_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        // Run the helper and re-read.
+        refresh_metadata_after_edit(&backup_folder, &mut |_| {}).expect("refresh metadata");
+
+        let after: BackupMetadata =
+            serde_json::from_str(&std::fs::read_to_string(&metadata_path).unwrap()).unwrap();
+        assert_eq!(
+            after.partitions[0].checksum, real_part_checksum,
+            "partition checksum must be refreshed to the live CHD value",
+        );
+        assert_eq!(
+            after.container_sha1.as_deref(),
+            Some(real_container_sha1.as_str()),
+            "container_sha1 must be refreshed to the live CHD value",
+        );
+    }
+
+    /// Stage 8a: re-export a raw image to a CHD with no resize plan.
+    /// Verifies the destination filename matches what the user asked for
+    /// and the bytes round-trip.
+    #[test]
+    fn run_export_no_resize_round_trips_raw_to_chd() {
+        const TOTAL_SECTORS: u32 = 8192;
+        const PART_SECTORS: u32 = 4095;
+        const SECTOR_SIZE: u64 = 512;
+        let total_bytes = (TOTAL_SECTORS as u64) * SECTOR_SIZE;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_path = tmp.path().join("source.img");
+
+        let mut data = vec![0u8; total_bytes as usize];
+        data[..512].copy_from_slice(&build_test_mbr(PART_SECTORS));
+        for i in 0..(PART_SECTORS as u64 * SECTOR_SIZE) as usize {
+            data[512 + i] = ((i % 251) as u8).wrapping_add(13);
+        }
+        std::fs::write(&source_path, &data).unwrap();
+
+        let mut br = BufReader::new(File::open(&source_path).unwrap());
+        let table = PartitionTable::detect(&mut br).unwrap();
+        let partitions = table.partitions();
+        let mbr_bytes: [u8; 512] = data[..512].try_into().unwrap();
+
+        let dest_path = tmp.path().join("export.chd");
+        let mut log_buf: Vec<String> = Vec::new();
+        let mut log_cb = |s: &str| log_buf.push(s.to_string());
+        let mut progress_cb = |_: u64| {};
+        let cancel = || false;
+
+        run_export(
+            SingleFileChdExportInputs {
+                source_path: &source_path,
+                partition_table: &table,
+                partitions: &partitions,
+                source_partition_table_bytes: &mbr_bytes,
+                alignment_sectors: 0,
+                dest_path: &dest_path,
+                chd_options: None,
+                is_dvd: false,
+                resize_targets: None,
+            },
+            &mut progress_cb,
+            &cancel,
+            &mut log_cb,
+        )
+        .expect("run_export no-resize");
+
+        assert!(
+            dest_path.exists(),
+            "export must produce {}",
+            dest_path.display()
+        );
+        let mut reader = ChdReader::open(&dest_path).unwrap();
+        let mut readback = vec![0u8; total_bytes as usize];
+        reader.read_exact(&mut readback).unwrap();
+        assert_eq!(
+            readback, data,
+            "no-resize re-export must round-trip the source byte-for-byte",
+        );
+    }
+
+    /// Stage 8a: re-export a raw image with a per-partition shrink plan.
+    /// Verifies the output's MBR carries the new partition size and the
+    /// (smaller) partition body bytes match the source's prefix.
+    #[test]
+    fn run_export_with_resize_shrinks_partition() {
+        const TOTAL_SECTORS: u32 = 8192;
+        const PART_SECTORS: u32 = 4095;
+        const NEW_PART_SECTORS: u32 = 2048;
+        const SECTOR_SIZE: u64 = 512;
+        let total_bytes = (TOTAL_SECTORS as u64) * SECTOR_SIZE;
+        let new_part_bytes = (NEW_PART_SECTORS as u64) * SECTOR_SIZE;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_path = tmp.path().join("source.img");
+
+        let mut data = vec![0u8; total_bytes as usize];
+        data[..512].copy_from_slice(&build_test_mbr(PART_SECTORS));
+        for i in 0..(PART_SECTORS as u64 * SECTOR_SIZE) as usize {
+            data[512 + i] = ((i % 251) as u8).wrapping_add(19);
+        }
+        std::fs::write(&source_path, &data).unwrap();
+
+        let mut br = BufReader::new(File::open(&source_path).unwrap());
+        let table = PartitionTable::detect(&mut br).unwrap();
+        let partitions = table.partitions();
+        let mbr_bytes: [u8; 512] = data[..512].try_into().unwrap();
+
+        let dest_path = tmp.path().join("export.chd");
+        let resize_targets = vec![(0usize, new_part_bytes)];
+        let mut log_buf: Vec<String> = Vec::new();
+        let mut log_cb = |s: &str| log_buf.push(s.to_string());
+        let mut progress_cb = |_: u64| {};
+        let cancel = || false;
+
+        run_export(
+            SingleFileChdExportInputs {
+                source_path: &source_path,
+                partition_table: &table,
+                partitions: &partitions,
+                source_partition_table_bytes: &mbr_bytes,
+                alignment_sectors: 0,
+                dest_path: &dest_path,
+                chd_options: None,
+                is_dvd: false,
+                resize_targets: Some(&resize_targets),
+            },
+            &mut progress_cb,
+            &cancel,
+            &mut log_cb,
+        )
+        .expect("run_export with resize");
+
+        let mut reader = ChdReader::open(&dest_path).unwrap();
+        // MBR entry should reflect the new size.
+        let mut head = [0u8; 512];
+        reader.read_exact(&mut head).unwrap();
+        let entry_size_lba = u32::from_le_bytes([
+            head[0x1BE + 12],
+            head[0x1BE + 13],
+            head[0x1BE + 14],
+            head[0x1BE + 15],
+        ]);
+        assert_eq!(
+            entry_size_lba as u64, NEW_PART_SECTORS as u64,
+            "MBR entry size must be the new size after resize",
+        );
+        // Partition body prefix should match the source's first
+        // `new_part_bytes` of partition data.
+        reader.seek(SeekFrom::Start(SECTOR_SIZE)).unwrap();
+        let mut body = vec![0u8; new_part_bytes as usize];
+        reader.read_exact(&mut body).unwrap();
+        assert_eq!(
+            body,
+            data[512..(512 + new_part_bytes as usize)],
+            "shrunk partition body must match source prefix",
+        );
+    }
+
+    /// Stage 8a: estimate sums partition sizes + adds a head/tail
+    /// allowance for the resize path; output_bytes uses the supplied CHD
+    /// file size when provided.
+    #[test]
+    fn estimate_export_disk_usage_matches_partition_layout() {
+        const TOTAL_SECTORS: u32 = 8192;
+        const PART_SECTORS: u32 = 4095;
+        let mbr_bytes = build_test_mbr(PART_SECTORS);
+        let mut br = std::io::Cursor::new(mbr_bytes.to_vec());
+        let table = PartitionTable::detect(&mut br).unwrap();
+        let partitions = table.partitions();
+
+        let est_no_resize = estimate_export_disk_usage(
+            (TOTAL_SECTORS as u64) * 512,
+            Some(123_456_789),
+            &partitions,
+            false,
+        );
+        assert_eq!(est_no_resize.scratch_bytes, 0);
+        assert_eq!(est_no_resize.output_bytes, 123_456_789);
+
+        let est_resize = estimate_export_disk_usage(
+            (TOTAL_SECTORS as u64) * 512,
+            Some(123_456_789),
+            &partitions,
+            true,
+        );
+        // Sum of partition sizes + 1 MiB head/tail allowance.
+        let sum: u64 = partitions.iter().map(|p| p.size_bytes).sum();
+        assert_eq!(est_resize.scratch_bytes, sum + 1024 * 1024);
+        assert_eq!(est_resize.output_bytes, 123_456_789);
+        assert_eq!(est_resize.required_total(), sum + 1024 * 1024 + 123_456_789,);
     }
 }
