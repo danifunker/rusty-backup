@@ -10,6 +10,7 @@ pub mod hfs_clone;
 pub mod hfs_common;
 pub mod hfs_fsck;
 pub mod hfsplus;
+pub mod layout_preserving;
 pub mod mac_alias;
 pub mod ntfs;
 pub mod patch;
@@ -344,6 +345,103 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
             let (compact, info) = CompactProDosReader::new(reader, partition_offset).ok()?;
             Some((Box::new(compact), info))
         }
+        _ => None,
+    }
+}
+
+/// Like `compact_partition_reader`, but always produces a *layout-preserving*
+/// stream — `info.compacted_size == info.original_size`, with allocated
+/// regions byte-equal to the source and free regions emitted as zeros.
+///
+/// FAT/NTFS/exFAT route through their `into_layout_preserving` adapters
+/// (which reuse the existing parsing pass). HFS, HFS+, ext, btrfs, and
+/// ProDOS already emit layout-preserving streams from `compact_partition_reader`,
+/// so they're forwarded through unchanged. Any FS without a layout-preserving
+/// reader returns `None`, leaving the caller to fall back to raw passthrough.
+///
+/// Used by the single-file CHD backup path: the resulting stream lines up
+/// with the synthesised disk image's offsets, so `compress_chd` produces
+/// a CHD whose hunks match the source disk image byte-for-byte for every
+/// allocated cluster.
+pub fn layout_preserving_partition_reader<R: Read + Seek + Send + 'static>(
+    mut reader: R,
+    partition_offset: u64,
+    partition_type: u8,
+    partition_type_string: Option<&str>,
+) -> Option<(Box<dyn Read + Send>, CompactResult)> {
+    // String-typed (APM) partitions go through the existing dispatcher
+    // since their compact readers (HFS/HFS+/ext/btrfs) are already
+    // layout-preserving.
+    if partition_type_string.is_some() {
+        return compact_partition_reader(
+            reader,
+            partition_offset,
+            partition_type,
+            partition_type_string,
+        );
+    }
+
+    match partition_type {
+        // Auto-detect: probe the boot sector then choose.
+        0x00 => {
+            let fs_type = detect_filesystem_type(&mut reader, partition_offset);
+            match fs_type {
+                "fat" => {
+                    let (compact, _) = CompactFatReader::new(reader, partition_offset).ok()?;
+                    let (lp, info) = compact.into_layout_preserving();
+                    Some((Box::new(lp), info))
+                }
+                "ntfs" => {
+                    let (compact, _) = CompactNtfsReader::new(reader, partition_offset).ok()?;
+                    let (lp, info) = compact.into_layout_preserving();
+                    Some((Box::new(lp), info))
+                }
+                "exfat" => {
+                    let (compact, _) = CompactExfatReader::new(reader, partition_offset).ok()?;
+                    let (lp, info) = compact.into_layout_preserving();
+                    Some((Box::new(lp), info))
+                }
+                // ext / btrfs / prodos compact readers are already
+                // layout-preserving — defer to the existing dispatcher.
+                _ => compact_partition_reader(
+                    reader,
+                    partition_offset,
+                    partition_type,
+                    partition_type_string,
+                ),
+            }
+        }
+        // FAT family
+        0x01 | 0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C => {
+            let (compact, _) = CompactFatReader::new(reader, partition_offset).ok()?;
+            let (lp, info) = compact.into_layout_preserving();
+            Some((Box::new(lp), info))
+        }
+        // NTFS / exFAT (shared type byte; probe to disambiguate)
+        0x07 => {
+            let fs_type = detect_0x07_type(&mut reader, partition_offset);
+            match fs_type {
+                "ntfs" => {
+                    let (compact, _) = CompactNtfsReader::new(reader, partition_offset).ok()?;
+                    let (lp, info) = compact.into_layout_preserving();
+                    Some((Box::new(lp), info))
+                }
+                "exfat" => {
+                    let (compact, _) = CompactExfatReader::new(reader, partition_offset).ok()?;
+                    let (lp, info) = compact.into_layout_preserving();
+                    Some((Box::new(lp), info))
+                }
+                _ => None,
+            }
+        }
+        // HFS/HFS+/ext/btrfs/ProDOS — existing readers are already
+        // layout-preserving.
+        0x83 | 0xAF | 0xA8 => compact_partition_reader(
+            reader,
+            partition_offset,
+            partition_type,
+            partition_type_string,
+        ),
         _ => None,
     }
 }

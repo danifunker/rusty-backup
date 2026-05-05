@@ -252,8 +252,21 @@ Follow-ups tracked under their own stages:
   regions hit disk), and FS resize functions need `Read + Write + Seek`
   which the forward-only stream can't provide.
 - Stage 4c ✅ — GPT + APM source support landed.
-- Stage 4d — layout-preserving FAT/NTFS/exFAT compact readers so smart
-  mode benefits more filesystems.
+- Stage 4d ✅ — layout-preserving FAT/NTFS/exFAT readers. New module
+  `src/fs/layout_preserving.rs` houses a generic `LayoutPreservingReader<R>`
+  that streams source bytes verbatim except inside caller-supplied zero
+  ranges. Each of `CompactFatReader` / `CompactNtfsReader` /
+  `CompactExfatReader` gains an `into_layout_preserving()` method that
+  reuses the already-parsed allocation state to derive free-cluster byte
+  ranges and hand back a `LayoutPreservingReader` + `CompactResult` with
+  `compacted_size == original_size`. New `fs::layout_preserving_partition_reader()`
+  dispatcher routes FAT/NTFS/exFAT through the new path and forwards the
+  HFS/HFS+/ext/btrfs/ProDOS readers (already layout-preserving) unchanged.
+  `single_file_chd::build_partition_reader` calls the new dispatcher
+  before falling back to raw passthrough. Round-trip test
+  (`layout_preserving_fat_zeros_free_clusters`) verifies a synthetic
+  FAT12 partition with garbage-filled free clusters round-trips with
+  metadata + allocated regions byte-equal and free regions zeroed.
 
 **Stage 4c — GPT + APM source support ✅**
 

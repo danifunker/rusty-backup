@@ -1801,7 +1801,6 @@ fn format_fat_datetime(date: u16, time: u16) -> String {
 ///   [ Data clusters 2, 3, 4, ... packed contiguously ]
 pub struct CompactFatReader<R> {
     source: R,
-    #[allow(dead_code)]
     partition_offset: u64,
 
     // Pre-built sections
@@ -1818,6 +1817,12 @@ pub struct CompactFatReader<R> {
     src_data_start_abs: u64,
     bytes_per_sector: u64,
     sectors_per_cluster: u64,
+    /// Source's total data-cluster count (entries 2..2+total_clusters).
+    /// Needed by `into_layout_preserving` to derive free-cluster ranges.
+    src_total_clusters: u64,
+    /// Source partition's original byte size; equals
+    /// `original_total_sectors * bytes_per_sector`.
+    src_original_size: u64,
 
     // Virtual image geometry
     cluster_size: usize,
@@ -2232,6 +2237,8 @@ impl<R: Read + Seek> CompactFatReader<R> {
                 src_data_start_abs,
                 bytes_per_sector,
                 sectors_per_cluster,
+                src_total_clusters: total_clusters,
+                src_original_size: original_size,
                 cluster_size,
                 fat_offset: fat_offset_in_image,
                 root_dir_offset: root_dir_offset_in_image,
@@ -2273,6 +2280,65 @@ impl<R: Read + Seek> CompactFatReader<R> {
     /// Total size of the compacted virtual image.
     pub fn total_size(&self) -> u64 {
         self.total_size
+    }
+
+    /// Convert this packed-output compact reader into a layout-preserving
+    /// reader over the same source. The returned reader streams the
+    /// partition's bytes verbatim except for unallocated data clusters,
+    /// which are emitted as zeros — handing the result to `compress_chd`
+    /// produces a CHD whose hunks line up with the source disk image.
+    ///
+    /// All FAT metadata (boot sector, reserved sectors, FAT tables, and
+    /// the FAT12/16 root directory) is read straight from the source, so
+    /// the output disk-image is byte-equal to the source for every
+    /// allocated cluster and zero elsewhere.
+    pub fn into_layout_preserving(
+        self,
+    ) -> (
+        super::layout_preserving::LayoutPreservingReader<R>,
+        CompactResult,
+    ) {
+        let cluster_size = self.cluster_size as u64;
+        // Where data clusters begin, *relative to the start of the partition*.
+        let data_start_in_partition = self.src_data_start_abs - self.partition_offset;
+
+        // Walk the cluster index range and merge runs of free clusters
+        // into single zero ranges. Cluster numbers run 2..2+total_clusters.
+        let mut zero_ranges: Vec<(u64, u64)> = Vec::new();
+        let mut run_start: Option<u64> = None;
+        let last_cluster = self.src_total_clusters as u32 + 2;
+        for cluster in 2..last_cluster {
+            let off = data_start_in_partition + (cluster as u64 - 2) * cluster_size;
+            let is_free = !self.old_to_new.contains_key(&cluster);
+            match (is_free, run_start) {
+                (true, None) => run_start = Some(off),
+                (false, Some(start)) => {
+                    zero_ranges.push((start, off - start));
+                    run_start = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(start) = run_start {
+            let end = data_start_in_partition + self.src_total_clusters * cluster_size;
+            zero_ranges.push((start, end - start));
+        }
+
+        let clusters_used = self.old_to_new.len() as u32;
+        let info = CompactResult {
+            original_size: self.src_original_size,
+            compacted_size: self.src_original_size,
+            data_size: clusters_used as u64 * cluster_size,
+            clusters_used,
+        };
+        let reader = super::layout_preserving::LayoutPreservingReader::new(
+            self.source,
+            self.partition_offset,
+            self.src_original_size,
+            zero_ranges,
+        )
+        .expect("FAT zero ranges must be sorted, non-overlapping, in-bounds");
+        (reader, info)
     }
 }
 

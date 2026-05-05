@@ -2504,8 +2504,15 @@ pub struct CompactNtfsReader<R> {
     // Boot sector region (first cluster worth of data)
     boot_sectors: Vec<u8>,
 
-    // Bitmap of which clusters are in use
+    // Bitmap of which clusters are in use (sorted ascending; all entries
+    // strictly less than `src_total_clusters`).
     used_cluster_list: Vec<u64>,
+
+    /// Source's total cluster count (volume_size / cluster_size). Needed
+    /// to derive the free-cluster set in `into_layout_preserving`.
+    src_total_clusters: u64,
+    /// Source partition's original byte size.
+    src_original_size: u64,
 
     // Streaming state
     position: u64,
@@ -2603,6 +2610,8 @@ impl<R: Read + Seek> CompactNtfsReader<R> {
                 cluster_size,
                 boot_sectors,
                 used_cluster_list,
+                src_total_clusters: total_clusters,
+                src_original_size: original_size,
                 position: 0,
                 total_size: compacted_size,
                 cluster_buf: Vec::new(),
@@ -2614,6 +2623,59 @@ impl<R: Read + Seek> CompactNtfsReader<R> {
                 clusters_used,
             },
         ))
+    }
+
+    /// Convert this packed-output compact reader into a layout-preserving
+    /// reader over the same source. Allocated clusters stream verbatim
+    /// from the source; free clusters (per the parsed `$Bitmap`) emit
+    /// zeros without reading. See `LayoutPreservingReader` for the
+    /// design rationale.
+    pub fn into_layout_preserving(
+        self,
+    ) -> (
+        super::layout_preserving::LayoutPreservingReader<R>,
+        CompactResult,
+    ) {
+        let cluster_size = self.cluster_size;
+        // NTFS clusters span the entire volume from offset 0 — no
+        // separate "data start". Free clusters lie in the gaps between
+        // entries of the (sorted) used_cluster_list.
+        let mut zero_ranges: Vec<(u64, u64)> = Vec::new();
+        let mut next_used = 0usize;
+        let mut run_start: Option<u64> = None;
+        for cluster in 0..self.src_total_clusters {
+            let off = cluster * cluster_size;
+            let is_used = next_used < self.used_cluster_list.len()
+                && self.used_cluster_list[next_used] == cluster;
+            if is_used {
+                next_used += 1;
+                if let Some(start) = run_start.take() {
+                    zero_ranges.push((start, off - start));
+                }
+            } else if run_start.is_none() {
+                run_start = Some(off);
+            }
+        }
+        if let Some(start) = run_start {
+            let end = self.src_total_clusters * cluster_size;
+            zero_ranges.push((start, end - start));
+        }
+
+        let clusters_used = self.used_cluster_list.len() as u32;
+        let info = CompactResult {
+            original_size: self.src_original_size,
+            compacted_size: self.src_original_size,
+            data_size: clusters_used as u64 * cluster_size,
+            clusters_used,
+        };
+        let reader = super::layout_preserving::LayoutPreservingReader::new(
+            self.source,
+            self.partition_offset,
+            self.src_original_size,
+            zero_ranges,
+        )
+        .expect("NTFS zero ranges must be sorted, non-overlapping, in-bounds");
+        (reader, info)
     }
 }
 

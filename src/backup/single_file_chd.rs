@@ -858,36 +858,42 @@ fn build_partition_reader(
     let part_length = part.size_bytes;
 
     if !sector_by_sector {
-        // Smart mode: try a compact reader. Only useful if it's
-        // layout-preserving (`compacted_size == original_size`); otherwise
-        // its output bytes don't align to disk-image positions and we'd
-        // produce garbage. Falls through to raw passthrough on any miss.
+        // Smart mode: ask for a layout-preserving reader. The single
+        // dispatcher routes FAT/NTFS/exFAT through their
+        // `into_layout_preserving` adapters, while HFS/HFS+/ext/btrfs/
+        // ProDOS use their existing layout-preserving compact readers,
+        // and unsupported types fall through to raw passthrough below.
         let clone = source_file
             .try_clone()
             .context("failed to clone source for compact reader")?;
-        if let Some((reader, info)) = fs::compact_partition_reader(
+        if let Some((reader, info)) = fs::layout_preserving_partition_reader(
             clone,
             part_offset,
             part.partition_type_byte,
             part.partition_type_string.as_deref(),
         ) {
+            // Defensive guard: a future regression that lets a packed
+            // reader leak through here would silently corrupt the disk
+            // image. Crash early instead.
+            debug_assert_eq!(
+                info.compacted_size, info.original_size,
+                "single-file CHD requires layout-preserving streams",
+            );
             if info.compacted_size == info.original_size {
                 log_cb(&format!(
-                    "  partition-{}: layout-preserving compact reader \
-                     (data {} of {} bytes)",
+                    "  partition-{}: layout-preserving reader (allocated {} of {} bytes)",
                     part.index, info.data_size, info.original_size,
                 ));
                 return Ok(reader);
             }
             log_cb(&format!(
-                "  partition-{}: compact reader is packed (compacted {} < \
-                 original {}); falling back to raw passthrough — disk-image \
-                 mode needs full-extent reads",
-                part.index, info.compacted_size, info.original_size,
+                "  partition-{}: dispatcher returned packed reader unexpectedly; \
+                 falling back to raw passthrough",
+                part.index,
             ));
         } else {
             log_cb(&format!(
-                "  partition-{}: no compact reader for type 0x{:02X}; \
+                "  partition-{}: no layout-preserving reader for type 0x{:02X}; \
                  using raw passthrough",
                 part.index, part.partition_type_byte,
             ));
@@ -1434,6 +1440,169 @@ mod tests {
             tail.iter().all(|b| *b == 0),
             "shrunk-out tail must be zero-filled (was {} non-zero bytes)",
             tail.iter().filter(|b| **b != 0).count(),
+        );
+    }
+
+    /// Build an in-memory FAT12 partition image with cluster 2 allocated
+    /// (EOF chain) and clusters 3..N free. Free-cluster sectors are
+    /// pre-filled with 0xAB so we can prove the layout-preserving reader
+    /// emits zeros there even though the source had garbage.
+    fn build_test_fat12_partition() -> Vec<u8> {
+        const BYTES_PER_SECTOR: usize = 512;
+        const TOTAL_SECTORS: usize = 16;
+        let mut img = vec![0u8; TOTAL_SECTORS * BYTES_PER_SECTOR];
+
+        // Boot sector (BPB).
+        img[0] = 0xEB;
+        img[1] = 0x3C;
+        img[2] = 0x90;
+        img[3..11].copy_from_slice(b"MSDOS5.0");
+        img[11..13].copy_from_slice(&(BYTES_PER_SECTOR as u16).to_le_bytes());
+        img[13] = 1; // sectors per cluster
+        img[14..16].copy_from_slice(&1u16.to_le_bytes()); // reserved sectors
+        img[16] = 1; // num FATs
+        img[17..19].copy_from_slice(&16u16.to_le_bytes()); // root entries
+        img[19..21].copy_from_slice(&(TOTAL_SECTORS as u16).to_le_bytes());
+        img[21] = 0xF8; // media byte
+        img[22..24].copy_from_slice(&1u16.to_le_bytes()); // sectors per FAT
+        img[510] = 0x55;
+        img[511] = 0xAA;
+
+        // FAT (1 sector at offset 512). FAT12 entries 0+1 are reserved
+        // (0xFF8 + 0xFFF), entry 2 = EOF (0xFFF), entries 3..N = 0 (free).
+        let fat = 1 * BYTES_PER_SECTOR;
+        // FAT12 packing: entries 0,1 share 3 bytes.
+        img[fat] = 0xF8;
+        img[fat + 1] = 0xFF;
+        img[fat + 2] = 0xFF;
+        // Entry 2 occupies bytes 3..4.5 — the low nibble of byte 4 is
+        // entry 2's high 4 bits, the high nibble of byte 4 is entry 3's
+        // low 4 bits. We want entry 2 = 0xFFF, entry 3 = 0x000.
+        img[fat + 3] = 0xFF;
+        img[fat + 4] = 0x0F;
+        // All later FAT bytes stay 0 → clusters 3..N are free.
+
+        // Root dir (1 sector, all zero = empty directory). Already zero.
+
+        // Data area starts at sector 3. Cluster 2 = sector 3.
+        let data_start = 3 * BYTES_PER_SECTOR;
+        let cluster2 = &mut img[data_start..data_start + BYTES_PER_SECTOR];
+        let payload = b"hello layout-preserving FAT world";
+        cluster2[..payload.len()].copy_from_slice(payload);
+
+        // Fill clusters 3..N with 0xAB garbage so we can detect the
+        // layout-preserving reader actually zeros them.
+        for cluster in 3..(TOTAL_SECTORS - 3) {
+            let off = (3 + cluster - 2) * BYTES_PER_SECTOR;
+            for b in &mut img[off..off + BYTES_PER_SECTOR] {
+                *b = 0xAB;
+            }
+        }
+
+        img
+    }
+
+    /// Stage 4d round-trip: a synthetic FAT12 partition with cluster 2
+    /// allocated and clusters 3..N free-but-garbage-filled goes through
+    /// the single-file CHD pipeline. We assert that the resulting CHD's
+    /// bytes match the source for every metadata + allocated cluster
+    /// region, AND that the free-cluster regions come back as zeros
+    /// (proving `into_layout_preserving` zeroed them on the way out
+    /// rather than streaming the source's 0xAB garbage).
+    #[test]
+    fn layout_preserving_fat_zeros_free_clusters() {
+        const PART_SECTORS: u32 = 16;
+        const TOTAL_SECTORS: u32 = PART_SECTORS + 1;
+        const SECTOR_SIZE: u64 = 512;
+        let total_bytes = (TOTAL_SECTORS as u64) * SECTOR_SIZE;
+
+        let fat_image = build_test_fat12_partition();
+        assert_eq!(fat_image.len(), (PART_SECTORS as usize) * 512);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_path = tmp.path().join("source.img");
+        let mut data = vec![0u8; total_bytes as usize];
+        // MBR with one FAT12 partition (type 0x01) starting at LBA 1.
+        let mut mbr = [0u8; 512];
+        mbr[510] = 0x55;
+        mbr[511] = 0xAA;
+        mbr[450] = 0x01; // FAT12
+        mbr[454..458].copy_from_slice(&1u32.to_le_bytes());
+        mbr[458..462].copy_from_slice(&PART_SECTORS.to_le_bytes());
+        data[..512].copy_from_slice(&mbr);
+        data[512..512 + fat_image.len()].copy_from_slice(&fat_image);
+        std::fs::write(&source_path, &data).unwrap();
+
+        let source_file = File::open(&source_path).unwrap();
+        let mut br = BufReader::new(source_file.try_clone().unwrap());
+        let table = PartitionTable::detect(&mut br).expect("detect MBR");
+        let partitions = table.partitions();
+        let mbr_bytes: [u8; 512] = data[..512].try_into().unwrap();
+
+        let output_base = tmp.path().join("disk");
+        let mut log_buf: Vec<String> = Vec::new();
+        let mut log_cb = |s: &str| log_buf.push(s.to_string());
+        let mut progress_cb = |_: u64| {};
+        let cancel = || false;
+        let result = run(
+            SingleFileChdInputs {
+                source_file: &source_file,
+                source_size: total_bytes,
+                source_partition_table_bytes: &mbr_bytes,
+                partition_table: &table,
+                partitions: &partitions,
+                partition_filter: None,
+                sector_by_sector: false,
+                chd_options: None,
+                is_dvd: false,
+                output_base: &output_base,
+                resize_targets: None,
+                alignment_sectors: 0,
+            },
+            &mut progress_cb,
+            &cancel,
+            &mut log_cb,
+        )
+        .expect("layout-preserving FAT backup");
+
+        assert_eq!(result.container_logical_size, total_bytes);
+        let joined = log_buf.join("\n");
+        assert!(
+            joined.contains("layout-preserving reader"),
+            "log must mention layout-preserving reader; got:\n{joined}",
+        );
+
+        let chd_path = tmp.path().join("disk.chd");
+        let mut reader = ChdReader::open(&chd_path).expect("reopen CHD");
+        let mut readback = vec![0u8; total_bytes as usize];
+        reader.read_exact(&mut readback).unwrap();
+
+        // MBR + boot sector + FAT + root dir + cluster 2 must equal
+        // source byte-for-byte (allocated + metadata regions).
+        let allocated_end = 512 + 4 * 512; // through cluster 2 (data_start + 1 cluster)
+        assert_eq!(
+            &readback[..allocated_end],
+            &data[..allocated_end],
+            "MBR + FAT metadata + allocated cluster must round-trip",
+        );
+
+        // Free cluster region in the CHD must be all zeros even though
+        // the source had 0xAB garbage there.
+        let free_start = allocated_end;
+        let free_end = 512 + (PART_SECTORS as usize) * 512;
+        let free = &readback[free_start..free_end];
+        assert!(
+            free.iter().all(|b| *b == 0),
+            "free clusters must be zero in the round-tripped CHD; saw {} non-zero bytes",
+            free.iter().filter(|b| **b != 0).count(),
+        );
+
+        // Sanity: the source had 0xAB garbage there, so we know the
+        // assertion above is meaningful.
+        let src_free = &data[free_start..free_end];
+        assert!(
+            src_free.iter().any(|b| *b == 0xAB),
+            "test setup failed — source free region must contain garbage",
         );
     }
 }

@@ -1405,8 +1405,18 @@ pub struct CompactExfatReader<R> {
     boot_region: Vec<u8>,
     fat_data: Vec<u8>,
 
-    // Used clusters list
+    // Used clusters list (cluster numbers are 2-based per exFAT spec).
+    // Sorted ascending by construction.
     used_cluster_list: Vec<u32>,
+
+    /// Source cluster heap offset in bytes, relative to the partition
+    /// start. Cluster N (≥ 2) occupies bytes
+    /// `cluster_heap_offset + (N-2) * cluster_size`.
+    src_cluster_heap_offset: u64,
+    /// Source cluster count (cluster numbers 2..2+cluster_count).
+    src_cluster_count: u32,
+    /// Source partition's original byte size.
+    src_original_size: u64,
 
     // Streaming state
     position: u64,
@@ -1520,6 +1530,9 @@ impl<R: Read + Seek> CompactExfatReader<R> {
                 boot_region,
                 fat_data,
                 used_cluster_list,
+                src_cluster_heap_offset: cluster_heap_offset,
+                src_cluster_count: vbr.cluster_count,
+                src_original_size: original_size,
                 position: 0,
                 total_size: compacted_size,
                 cluster_buf: Vec::new(),
@@ -1533,6 +1546,60 @@ impl<R: Read + Seek> CompactExfatReader<R> {
                 clusters_used,
             },
         ))
+    }
+
+    /// Convert this packed-output compact reader into a layout-preserving
+    /// reader over the same source. Boot region, FAT, and the cluster
+    /// heap's allocated clusters stream verbatim; free clusters in the
+    /// heap (per the parsed allocation bitmap) emit zeros without
+    /// reading. See `LayoutPreservingReader` for the design rationale.
+    pub fn into_layout_preserving(
+        self,
+    ) -> (
+        super::layout_preserving::LayoutPreservingReader<R>,
+        CompactResult,
+    ) {
+        let cluster_size = self.cluster_size;
+        let heap_off = self.src_cluster_heap_offset;
+        // exFAT clusters are 2-based; the bitmap lists allocated cluster
+        // numbers in the same 2-based namespace.
+        let mut zero_ranges: Vec<(u64, u64)> = Vec::new();
+        let mut next_used = 0usize;
+        let mut run_start: Option<u64> = None;
+        let last_cluster = self.src_cluster_count + 2;
+        for cluster in 2..last_cluster {
+            let off = heap_off + (cluster as u64 - 2) * cluster_size;
+            let is_used = next_used < self.used_cluster_list.len()
+                && self.used_cluster_list[next_used] == cluster;
+            if is_used {
+                next_used += 1;
+                if let Some(start) = run_start.take() {
+                    zero_ranges.push((start, off - start));
+                }
+            } else if run_start.is_none() {
+                run_start = Some(off);
+            }
+        }
+        if let Some(start) = run_start {
+            let end = heap_off + self.src_cluster_count as u64 * cluster_size;
+            zero_ranges.push((start, end - start));
+        }
+
+        let clusters_used = self.used_cluster_list.len() as u32;
+        let info = CompactResult {
+            original_size: self.src_original_size,
+            compacted_size: self.src_original_size,
+            data_size: clusters_used as u64 * cluster_size,
+            clusters_used,
+        };
+        let reader = super::layout_preserving::LayoutPreservingReader::new(
+            self.source,
+            self.partition_offset,
+            self.src_original_size,
+            zero_ranges,
+        )
+        .expect("exFAT zero ranges must be sorted, non-overlapping, in-bounds");
+        (reader, info)
     }
 }
 
