@@ -792,8 +792,8 @@ pub fn available_space(path: &Path) -> Option<u64> {
     }
     #[cfg(target_os = "windows")]
     {
-        use windows::core::PCWSTR;
-        use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+        use ::windows::core::PCWSTR;
+        use ::windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
         // GetDiskFreeSpaceExW accepts any path (file or directory) on the
         // target volume.
         let wide: Vec<u16> = path

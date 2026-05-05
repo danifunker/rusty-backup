@@ -2084,8 +2084,6 @@ fn write_clonezilla_disk(
     disk_target_size: u64,
     progress: &Arc<Mutex<RestoreProgress>>,
 ) -> Result<u64> {
-    use std::io;
-
     let mut total_written: u64 = 0;
     let target_size = progress.lock().map(|p| p.total_bytes).unwrap_or(0);
     let target_sectors = disk_target_size / 512;
