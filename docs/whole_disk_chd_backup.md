@@ -205,10 +205,11 @@ their values plumb through to a `BackupConfig` extension. ✅
 
 Initial slice landed: MBR sources only, source layout preserved (no
 backup-time resize yet), smart compaction = layout-preserving compact
-reader where available with raw passthrough fallback. GPT/APM/superfloppy
-sources fall back to the legacy per-partition layout with a logged
-explanation. `split_size_mib` paired with CHD output logs a warning and
-is ignored.
+reader where available with raw passthrough fallback. GPT/APM landed in
+Stage 4c. Superfloppy sources continue to take the per-partition path
+with `effective_compression` forced to raw (`.img`); CHD output never
+produces per-partition `.chd` files. `split_size_mib` paired with CHD
+output logs a warning and is ignored.
 
 - [x] `src/backup/single_file_chd.rs` — `SingleFileChdInputs`,
       `SingleFileChdResult`, `is_supported`, `run`, plus end-to-end

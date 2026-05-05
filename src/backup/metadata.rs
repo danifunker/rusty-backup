@@ -2,9 +2,10 @@ use serde::{Deserialize, Serialize};
 
 /// Backup folder layout. Selects how partition data is stored on disk.
 ///
-/// `PerPartition` is the legacy layout: one compressed file per selected
-/// partition (`partition-0.zst`, `partition-1.chd`, …) plus a `metadata.json`
-/// index. Defaults via `#[serde(default)]` so existing folders load unchanged.
+/// `PerPartition` is the layout used by Zstd / Raw / per-partition VHD
+/// output: one compressed file per selected partition (`partition-0.zst`,
+/// `partition-1.zst`, …) plus a `metadata.json` index. Defaults via
+/// `#[serde(default)]` so existing folders load unchanged.
 ///
 /// `SingleFileChd` is the new CHD-only layout introduced for chdman/MAME
 /// compatibility: a single `disk.chd` containing a real disk image (partition

@@ -456,29 +456,24 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             &alignment,
             &backup_folder,
         );
-    } else if matches!(
+    }
+    // CHD/DVD selected on a source single_file_chd can't handle (only
+    // superfloppies fit this today — every other shape is_supported).
+    // Superfloppies route through the per-partition loop with
+    // `effective_compression` forced to `None` (raw .img), so the user
+    // ends up with a `partition-0.img` rather than a CHD. We don't emit
+    // per-partition CHDs anywhere; CHD output is single-file or nothing.
+    if matches!(
         config.compression,
         CompressionType::Chd | CompressionType::Dvd
-    ) {
-        if config.split_size_mib.is_some() {
-            log(
-                &progress,
-                LogLevel::Warning,
-                "Split-size set with CHD output: splitting is incompatible with \
-                 chdman/MAME single-file CHDs and is ignored.",
-            );
-        }
-        if !is_superfloppy && !single_file_chd::is_supported(&table) {
-            log(
-                &progress,
-                LogLevel::Info,
-                format!(
-                    "Single-file CHD layout not yet supported for {} sources; \
-                     falling back to per-partition CHD",
-                    table.type_name(),
-                ),
-            );
-        }
+    ) && config.split_size_mib.is_some()
+    {
+        log(
+            &progress,
+            LogLevel::Warning,
+            "Split-size set with CHD output: splitting is incompatible with \
+             chdman/MAME single-file CHDs and is ignored.",
+        );
     }
 
     // Step 4: Analyze partitions for smart sizing

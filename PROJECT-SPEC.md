@@ -275,7 +275,7 @@ disabled for CHD output (chdman/MAME load one file).
       "original_size_bytes": 4294967296,
       "minimum_size_bytes": 2147483648,
       "compressed_size_bytes": 1073741824,
-      "chd_files": ["partition-0.chd"],
+      "compressed_files": ["partition-0.zst"],
       "checksum": "abc123...",
       "label": "DISK_LABEL",
       "resized": true,
@@ -346,11 +346,14 @@ disabled for CHD output (chdman/MAME load one file).
    - Implement streaming compression to avoid loading entire partition in memory
    - Support CHD v5 format (current MAME standard)
 
-2. **File splitting for large partitions**:
+2. **File splitting for large partitions** (per-partition layouts only —
+   Zstd / Raw / per-partition VHD):
    - Default split size: just under 4GB (4000 MiB) for FAT32 compatibility
    - User-configurable split size in MiB
-   - Create sequential CHD files: `partition-0.chd`, `partition-0.001.chd`, etc.
-   - Update metadata.json with list of CHD files per partition
+   - Create sequential files: `partition-0.zst`, `partition-0.001.zst`, etc.
+   - Update metadata.json with list of compressed files per partition
+   - CHD output uses the single-file layout instead and ignores split size
+     (chdman/MAME load one file).
 
 3. **Progress indication**:
    - Track bytes processed vs total

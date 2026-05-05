@@ -71,11 +71,25 @@ The codebase separates GUI from core logic with these major modules:
 
 ### Backup Format
 
-Each backup is a folder containing:
+Each backup is a folder. Two layouts depending on the chosen output:
+
+**Per-partition** (Zstd / Raw / per-partition VHD):
 - `metadata.json` - partition info, alignment data, checksums, bad sectors
 - `mbr.bin` / `mbr.json` or `gpt.json` - partition table exports
-- `partition-N.chd` - compressed partition images
+- `partition-N.<ext>` - one compressed file per partition (`.zst`, `.raw`, `.vhd`)
 - Per-file checksum files (`.sha256` or `.crc32`)
+
+**Single-file CHD** (CHD output):
+- `metadata.json` with `layout: "single-file-chd"` and per-partition
+  `offset_in_disk` byte ranges instead of per-file references
+- `mbr.json` / `gpt.json` / `apm.json` - parsed partition-table sidecar (raw
+  bytes live inside the CHD)
+- `<backup-name>.chd` - one disk image with table at sector 0, partitions
+  at their declared offsets, gaps zero-filled. `chdman info` opens it,
+  MAME loads it.
+
+CHD output never produces per-partition CHDs — the single-file layout is
+the only CHD shape rusty-backup writes.
 
 ### Key Design Patterns
 

@@ -63,7 +63,7 @@ VHD export is available from the Inspect tab: produce either a whole-disk
 | Raw            | `.img`, `.raw`, `.hda` | Yes     | Yes             | Sparse zero-skipping; optional splitting |
 | Fixed VHD      | `.vhd`          | Yes            | Yes             | 512-byte footer; also used for VHD export |
 | Zstd stream    | `.zst`          | Yes            | Yes             | Good general compression, splittable |
-| CHD (MAME)     | `.chd`          | Yes            | Yes             | Requires `chdman` on `PATH` |
+| CHD (MAME)     | `.chd`          | Yes            | Yes             | Native (MAME's CHD core is bundled — no external `chdman` needed) |
 | Apple 2MG      | `.2mg`          | Yes            | No              | Apple II / IIgs disk images |
 | Disk Copy 4.2  | `.dc42`, `.image` | Yes          | No              | Classic Mac floppy images |
 | Apple DMG      | `.dmg`          | Yes (raw/UDRW) | No              | Uncompressed DMGs only |
@@ -123,7 +123,7 @@ that shows up via the platform enumerator (Disk Management / `diskutil` /
 | Internal SATA / NVMe drives             | Yes                  | Yes                 | Requires elevation; verify target |
 | USB floppy drives (1.44 MB, 720 KB)     | Yes (as block device)| Yes                 | Treated as a regular block device; no copy-protection support |
 | 5.25" / 3.5" floppies via Kryoflux / Greaseweazle / Applesauce | No (use their tools) | No | Dump to `.woz` / `.dc42` / `.2mg` and feed that image in |
-| Optical media (CD/DVD/BD)               | No                   | No                  | Use `chdman` or dedicated tools |
+| Optical media (CD/DVD/BD)               | No                   | No                  | Rip with a dedicated CD/DVD tool first; rusty-backup operates on disk images |
 | Tape drives                             | No                   | No                  |       |
 
 Physical floppies are supported only through the OS block-device layer, which

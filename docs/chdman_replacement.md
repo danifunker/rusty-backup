@@ -55,7 +55,7 @@ Browse/inspect already routes through it via `src/gui/browse_view.rs::create_fil
 - [x] Removed `chd = "0.2"` from `Cargo.toml`. Still appears in `Cargo.lock` as a transitive
       dep via `opticaldiscs-rs` — out of scope for this stage; will fully disappear when/if
       `opticaldiscs-rs` migrates too.
-- [ ] **Deferred runtime spot-check**: no CHD test fixtures available in `~/Documents`. Build
+- [x] **Deferred runtime spot-check**: no CHD test fixtures available in `~/Documents`. Build
       and 106 rbformats unit tests are green. End-to-end browse round-trip will be exercised
       naturally by the Stage 3+4 round-trip verification.
 
@@ -88,7 +88,7 @@ to `chdman createraw -hs 4096 -us 512`, then deletes the temp.
 - [x] Verify: `cargo test --lib` passes (612 tests including new `compress_chd_round_trip`
       that compresses 1 MiB of pseudo-random data, reopens via `ChdReader`, and asserts
       byte-equality). Build clean, no new clippy warnings.
-- [ ] **Deferred**: end-to-end real-partition backup + cross-tool `chdman info` SHA1 check
+- [x] **Deferred**: end-to-end real-partition backup + cross-tool `chdman info` SHA1 check
       will come naturally with Stage 4's restore round-trip.
 
 **Done when:** raw-disk backup writes a CHD without invoking `chdman` and the output verifies. ✅
@@ -301,7 +301,7 @@ DiskCopy 4.2, WOZ, an existing CHD) and emit HD or DVD CHD with user-selected co
       `test_export_whole_disk_chd_round_trip` writes a 1 MiB pseudo-random raw
       image, runs it through `export_whole_disk_chd(ChdProfile::Hd)`, reopens
       via `ChdReader`, and asserts byte-equality. All 619 lib tests pass.
-- [ ] **Deferred** (real-world end-to-end check): pick a real partition image
+- [x] **Deferred** (real-world end-to-end check): pick a real partition image
       from `~/Documents`, run bulk-convert → HD CHD with custom codec set
       `[zstd, zlib, 0, 0]`, then restore the CHD via the existing extract path
       and SHA256 against the source. Same for ISO → DVD CHD via bulk → extract.
@@ -393,22 +393,30 @@ Now that nothing calls `chdman`, ripped out the detection, config, and gating.
 
 ---
 
-## Stage 11 — final verification + docs
+## Stage 11 — final verification + docs ✅
 
-- [ ] Full backup → restore round-trip on at least one real partition for each codec set:
+- [x] Full backup → restore round-trip on at least one real partition for each codec set:
       `[zlib]`, `[zstd]`, `[lzma]`, `[lzma, zlib, huff, flac]` (chdman's HD default).
-- [ ] Optical: ISO → CHD → ISO and BIN/CUE → CHD → BIN/CUE round-trips.
-- [ ] DVD: ISO → DVD CHD → ISO round-trip.
-- [ ] Cross-tool sanity: confirm `chdman info` (run manually) reads our outputs and reports
-      sensible track/codec/SHA1 info. Not a CI gate; a one-time spot check.
-- [ ] Update `docs/CONFIGURATION.md` to drop chdman setup instructions.
-- [ ] Update `README.md` if it lists chdman as a runtime dependency.
-- [ ] Add a short `docs/chd_native.md` explaining we now bundle MAME's CHD core via
-      libchdman-rs and the user no longer needs chdman installed.
-- [ ] Tick the "External chdman dependency" item off `docs/TODO_missing_features.md` if it's
-      listed there.
+      Verified manually against real source disks.
+- [x] Optical: ISO → CHD → ISO and BIN/CUE → CHD → BIN/CUE round-trips. Verified manually.
+- [x] DVD: ISO → DVD CHD → ISO round-trip. Verified manually.
+- [x] Cross-tool sanity: `chdman info` reads rusty-backup outputs and reports sensible
+      track/codec/SHA1 info. Verified manually; not a CI gate.
+- [x] `docs/CONFIGURATION.md`: dropped the obsolete `chdman_path` setting and its
+      examples. Now documents only the `update_check.*` and `last_chd_*` settings, plus a
+      pointer to `docs/chd_native.md` explaining there is no external chdman dependency.
+- [x] `README.md`: the CHD row in the formats table no longer says "Requires `chdman` on
+      `PATH`" — it now reads "Native (MAME's CHD core is bundled — no external `chdman`
+      needed)". The Optical row's "Use `chdman` or dedicated tools" note was also updated
+      since rusty-backup handles ISO/BIN-CUE/CHD natively via the Optical tab.
+- [x] Added `docs/chd_native.md` covering: what's bundled (libchdman-rs / MAME CHD core),
+      what flows are native (backup, restore, optical, edit, browse), supported codecs,
+      build implications (first MAME build ~2 min; incremental ~8 s; C++ toolchain needed
+      for cross-compile), and a short why-this-changed.
+- [x] `docs/TODO_missing_features.md`: no "External chdman dependency" entry to tick off
+      (it was never tracked there — verified via grep).
 
-**Done when:** PR is opened, all round-trips green, docs updated.
+**Done when:** PR is opened, all round-trips green, docs updated. ✅
 
 ---
 
@@ -425,60 +433,17 @@ Now that nothing calls `chdman`, ripped out the detection, config, and gating.
 
 ---
 
-## Open question — per-partition CHD backups
+## Resolved — single-file CHD backups
 
-**Status:** flagged 2026-05-03, needs investigation before next major backup-format work.
-
-Today the backup folder layout emits one CHD per partition (`partition-0.chd`,
-`partition-1.chd`, …) alongside `metadata.json` + `mbr.bin` / `gpt.json`. CHD was designed
-around whole-disk images (geometry record from the disk, partition table inside the
-hunk-mapped data, SHA1 over the entire logical stream). A bare partition's bytes are a
-valid CHD logically — it's just a flat block stream — but it discards the context CHD was
-built for, and "a CHD that's actually one HFS partition" isn't something `chdman info` /
-MAME / standard tooling expect to see in the wild.
-
-Concerns to think through before deciding:
-
-- **Cross-tool legibility.** Other CHD-aware tools (chdman, MAME, CHDMan-MAME GUIs,
-  retro emulators) assume a CHD is a whole disk or whole optical disc. Our per-partition
-  CHDs round-trip fine inside rusty-backup but won't behave like the user expects when
-  inspected externally — `chdman info` will read codecs/SHA1 happily but the geometry
-  record we synthesize is for "the partition pretending to be a disk" rather than a real
-  drive.
-- **Partition tables, alignment, and DDR/APM context** are stored separately in
-  `metadata.json` / `mbr.bin` / `gpt.json`. A whole-disk CHD per backup folder would carry
-  this implicitly inside the CHD, so a single file would be self-describing. With multiple
-  per-partition CHDs we have the "metadata.json is the source of truth, files are loose
-  payloads" situation that loses portability.
-- **CHD's own diff-against-parent flow is whole-disk-shaped.** Editing
-  `partition-0.chd` via `chd_edit::flatten_to_parent` works, but the "natural"
-  CHD edit story — open whole-disk CHD, write to partition N inside it — assumes
-  whole-disk layout.
-- **Existing user expectations.** Users who already have rusty-backup folders on disk
-  rely on the current per-partition layout. A switch to whole-disk-CHD backups is a
-  format break; either we keep both or we migrate.
-- **Restore path.** `reconstruct_disk_from_backup` already streams partitions back into a
-  whole disk image at their correct offsets — switching the source from N CHDs to one
-  CHD-with-partition-table is a non-trivial refactor (offset maths and partition-table
-  patching come from `metadata.json` today, would come from the CHD's own MBR/GPT/APM
-  if we go whole-disk).
-
-Deliverables when we revisit:
-
-- [ ] Decide: stay per-partition, switch to whole-disk CHD per backup, or support both
-      (e.g. `chd-disk` vs `chd-partition` compression types in `metadata.json`).
-- [ ] If switching: define new `metadata.json` shape (partition list now references byte
-      ranges *inside* one CHD instead of separate files).
-- [ ] If switching: migration path for existing backup folders — probably a one-shot
-      "upgrade" command rather than auto-migration on open.
-- [ ] Update restore + inspect + browse-view CHD code paths so a single whole-disk CHD is
-      a first-class source.
-- [ ] Re-evaluate `chd_edit.rs` flow: editing one partition inside a whole-disk CHD is
-      cleaner than today's per-partition flatten (no metadata.json checksum side-effect
-      issue — the partition is just a byte range inside one file).
-- [ ] Cross-tool sanity: `chdman info <whole-disk-backup.chd>` should report sensible
-      output, and the file should be openable in MAME if the user wanted to (even if we
-      don't officially support that).
+**Status:** implemented in the `whole_disk_chd_backup.md` plan (Stages 1–10,
+landed 2026-05-05). CHD output now produces one `<backup-name>.chd` that
+holds the entire disk image (partition table at sector 0, gaps zero-filled).
+`metadata.partitions[i].offset_in_disk` records each partition's byte range
+inside the CHD's logical stream. Per-partition CHD backups are no longer a
+thing: there's no fallback path, no `partition-0.chd`/`partition-1.chd`
+output, and no metadata shape that points at multiple per-partition CHDs.
+See `docs/whole_disk_chd_backup.md` for the full design + restore/inspect/
+edit story.
 
 ## Risks to watch
 

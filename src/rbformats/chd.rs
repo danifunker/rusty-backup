@@ -546,7 +546,7 @@ mod tests {
             *b = ((i * 31) ^ (i >> 7)) as u8;
         }
         let mut reader = Cursor::new(&data);
-        let base = tmp.path().join("partition-0");
+        let base = tmp.path().join("disk");
 
         let files = compress_chd(
             &mut reader,
@@ -559,7 +559,7 @@ mod tests {
             &mut |_| {},
         )
         .unwrap();
-        assert_eq!(files, vec!["partition-0.chd"]);
+        assert_eq!(files, vec!["disk.chd"]);
 
         let chd_path = base.with_extension("chd");
         let mut chd_reader = ChdReader::open(&chd_path).unwrap();
@@ -578,7 +578,7 @@ mod tests {
             *b = ((i * 17) ^ (i >> 9)) as u8;
         }
         let mut reader = Cursor::new(&data);
-        let base = tmp.path().join("partition-0");
+        let base = tmp.path().join("disk");
 
         let files = compress_chd_dvd(
             &mut reader,
@@ -591,7 +591,7 @@ mod tests {
             &mut |_| {},
         )
         .unwrap();
-        assert_eq!(files, vec!["partition-0.chd"]);
+        assert_eq!(files, vec!["disk.chd"]);
 
         let chd_path = base.with_extension("chd");
         let mut chd_reader = ChdReader::open(&chd_path).unwrap();

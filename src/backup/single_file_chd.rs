@@ -181,9 +181,9 @@ pub fn estimate_export_disk_usage(
 }
 
 /// True if `inputs` describes a source layout we can currently handle in
-/// single-file CHD mode. MBR / GPT / APM are supported; superfloppy still
-/// falls back to the per-partition path because there is no partition table
-/// to embed at sector 0.
+/// single-file CHD mode. MBR / GPT / APM are supported; superfloppy is
+/// rejected at the GUI layer (CHD output requires a partition table to
+/// embed at sector 0).
 pub fn is_supported(inputs_table: &PartitionTable) -> bool {
     matches!(
         inputs_table,
@@ -204,8 +204,8 @@ pub fn run(
 ) -> Result<SingleFileChdResult> {
     if !is_supported(inputs.partition_table) {
         anyhow::bail!(
-            "single-file CHD backup does not support {} sources yet — \
-             pick zstd/raw, or use the per-partition CHD flow.",
+            "single-file CHD backup requires a partition table; \
+             {} sources are not supported. Pick zstd, raw, or VHD instead.",
             inputs.partition_table.type_name(),
         );
     }
