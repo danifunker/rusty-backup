@@ -701,14 +701,26 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
     let metadata: BackupMetadata =
         serde_json::from_reader(metadata_file).context("failed to parse metadata.json")?;
 
-    // Single-file-CHD layout: the whole disk image lives inside disk.chd, so
-    // restore is just `io::copy` of its logical bytes onto the target.
-    // Re-resize support (Stage 5b) will branch here on a different path.
+    // Single-file-CHD layout: the whole disk image lives inside disk.chd.
+    // When the user kept every partition at "Original" we just `io::copy`
+    // the CHD's logical bytes onto the target (as-is). Any non-Original
+    // choice — including FillRemaining, Custom, or Minimum — drops to the
+    // re-resize path: extract each partition from the CHD and re-emit it
+    // at its new offset/size, fixing up the partition table + FS
+    // metadata along the way.
     if matches!(
         metadata.layout,
         crate::backup::metadata::BackupLayout::SingleFileChd
     ) {
-        return run_single_file_chd_restore_as_is(&config, progress, &metadata);
+        let any_non_original = config
+            .partition_sizes
+            .iter()
+            .any(|p| !matches!(p.size_choice, RestoreSizeChoice::Original));
+        return if any_non_original {
+            run_single_file_chd_restore_resize(&config, progress, &metadata)
+        } else {
+            run_single_file_chd_restore_as_is(&config, progress, &metadata)
+        };
     }
 
     log(
@@ -1140,9 +1152,9 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
 ///
 /// The CHD already contains a real disk image (partition table at sector 0,
 /// gaps zero-filled, partitions in place), so restore is `io::copy` of the
-/// CHD's logical bytes onto the target. Per-partition size choices from the
-/// GUI are ignored on this path — re-resize lands in a follow-up stage; we
-/// log a warning so the user isn't surprised when they passed sizing options.
+/// CHD's logical bytes onto the target. Selected when every per-partition
+/// size choice is `Original`; non-Original choices route through
+/// `run_single_file_chd_restore_resize`.
 fn run_single_file_chd_restore_as_is(
     config: &RestoreConfig,
     progress: Arc<Mutex<RestoreProgress>>,
@@ -1168,21 +1180,6 @@ fn run_single_file_chd_restore_as_is(
             config.target_path.display(),
         ),
     );
-
-    let nontrivial_sizing = config.partition_sizes.iter().any(|p| {
-        !matches!(
-            p.size_choice,
-            RestoreSizeChoice::Original | RestoreSizeChoice::FillRemaining
-        )
-    });
-    if nontrivial_sizing {
-        log(
-            &progress,
-            LogLevel::Warning,
-            "Per-partition size choices are ignored on single-file-CHD as-is \
-             restore. Re-resize support is a follow-up stage.",
-        );
-    }
 
     set_operation(&progress, "Opening CHD container...");
     let mut reader = ChdReader::open(&chd_path)
@@ -1264,6 +1261,333 @@ fn run_single_file_chd_restore_as_is(
         ),
     );
 
+    if let Ok(mut p) = progress.lock() {
+        p.finished = true;
+        p.operation = "Restore complete".to_string();
+    }
+    Ok(())
+}
+
+/// Re-resize restore for `BackupLayout::SingleFileChd` backups.
+///
+/// Extracts each partition body from `disk.chd`, lays it out at the
+/// user-chosen new offset/size on the target, patches the partition
+/// table accordingly, and runs the standard `resize_*_in_place` +
+/// `patch_hidden_sectors_for` fixups so the resulting disk is a
+/// self-consistent image.
+///
+/// "Original" partition sizing in this path means "as-stored in the CHD"
+/// (i.e. `imaged_size_bytes`), not the source disk's pre-Stage-4b
+/// original — once a backup is committed, its CHD layout is the source
+/// of truth.
+///
+/// Logical / extended partitions are not yet supported on this path
+/// (the EBR rebuild that the per-partition restore does isn't wired in
+/// here yet). The function bails with a clear error if any are present.
+fn run_single_file_chd_restore_resize(
+    config: &RestoreConfig,
+    progress: Arc<Mutex<RestoreProgress>>,
+    metadata: &BackupMetadata,
+) -> Result<()> {
+    use crate::rbformats::chd::ChdReader;
+
+    if metadata.partitions.iter().any(|pm| pm.is_logical) {
+        bail!(
+            "re-resize restore for single-file-CHD backups with logical \
+             partitions is not yet supported — restore as-is and use a \
+             separate tool to resize, or restore to an image and re-back-up."
+        );
+    }
+
+    let container_name = metadata.container.as_deref().unwrap_or("disk.chd");
+    let chd_path = config.backup_folder.join(container_name);
+    if !chd_path.exists() {
+        bail!(
+            "single-file-CHD backup is missing its container: {}",
+            chd_path.display()
+        );
+    }
+
+    log(
+        &progress,
+        LogLevel::Info,
+        format!(
+            "Single-file-CHD restore (re-resize): {} -> {}",
+            chd_path.display(),
+            config.target_path.display(),
+        ),
+    );
+
+    // Treat the CHD's current layout (imaged_size_bytes) as the baseline
+    // for "Original". `calculate_restore_layout` keys off
+    // `original_size_bytes`, so swap them in a clone before calling.
+    let mut adjusted = metadata.clone();
+    for pm in &mut adjusted.partitions {
+        pm.original_size_bytes = pm.imaged_size_bytes;
+    }
+
+    set_operation(&progress, "Calculating new partition layout...");
+    let overrides = calculate_restore_layout(
+        &adjusted,
+        &config.alignment,
+        &config.partition_sizes,
+        config.target_size,
+    )?;
+    for ov in &overrides {
+        log(
+            &progress,
+            LogLevel::Info,
+            format!(
+                "Partition {}: LBA {} -> {}, size {} bytes",
+                ov.index,
+                ov.start_lba,
+                ov.effective_start_lba(),
+                ov.export_size,
+            ),
+        );
+    }
+
+    set_operation(&progress, "Opening CHD container...");
+    let mut chd_reader = ChdReader::open(&chd_path)
+        .with_context(|| format!("failed to open {}", chd_path.display()))?;
+
+    set_operation(&progress, "Opening target...");
+    let device_handle = if config.target_is_device {
+        crate::os::open_target_for_writing(&config.target_path)
+            .with_context(|| format!("cannot open {} for writing", config.target_path.display()))?
+    } else {
+        // Open read+write+truncate: the FS resize fixups in step 3
+        // read back partition data to inspect VBR/MDB structures, so
+        // a write-only `File::create` would fail with EBADF.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&config.target_path)
+            .with_context(|| format!("failed to create {}", config.target_path.display()))?;
+        // Pre-size the image so seeks past EOF don't surprise the FS
+        // resize routines that read back from the alt-VH region.
+        file.set_len(config.target_size)
+            .context("failed to size target image")?;
+        crate::os::DeviceWriteHandle::from_file(file)
+    };
+    let target_file = device_handle.file;
+    let mut target = SectorAlignedWriter::new(target_file);
+
+    let target_sectors = config.target_size / 512;
+    let is_gpt = metadata.partition_table_type == "GPT";
+    let is_apm = metadata.partition_table_type == "APM";
+    let is_superfloppy = metadata.partition_table_type == "None";
+
+    // Step 1: write the patched partition table at sector 0 (and APM
+    // head / GPT primary as appropriate). The backup GPT goes at the
+    // end after partition data is written.
+    set_operation(&progress, "Writing partition table...");
+    let mut gpt_for_backup_header: Option<Gpt> = None;
+    if is_superfloppy {
+        // No table to write.
+    } else if is_gpt {
+        let gpt_path = config.backup_folder.join("gpt.json");
+        let gpt: Gpt = serde_json::from_reader(
+            File::open(&gpt_path)
+                .with_context(|| format!("failed to open {}", gpt_path.display()))?,
+        )
+        .context("failed to parse gpt.json")?;
+        let patched = gpt.patch_for_restore(&overrides, target_sectors);
+        target
+            .write_all(&Gpt::build_protective_mbr(target_sectors))
+            .context("failed to write protective MBR")?;
+        target
+            .write_all(&patched.build_primary_gpt(target_sectors))
+            .context("failed to write primary GPT")?;
+        gpt_for_backup_header = Some(patched);
+    } else if is_apm {
+        let apm_path = config.backup_folder.join("apm.json");
+        let apm: Apm = serde_json::from_reader(
+            File::open(&apm_path)
+                .with_context(|| format!("failed to open {}", apm_path.display()))?,
+        )
+        .context("failed to parse apm.json")?;
+        let block_size = apm.ddr.block_size as u64;
+        let target_blocks = (config.target_size / block_size) as u32;
+        let patched = apm.patch_for_restore(&overrides, target_blocks);
+        let blocks = patched.build_apm_blocks(Some(target_blocks));
+        target
+            .write_all(&blocks)
+            .context("failed to write APM head")?;
+        // Driver partitions sit AFTER the APM entry blocks but BEFORE
+        // the first user partition; their bodies come through the
+        // normal partition loop below since they appear in
+        // `metadata.partitions`.
+    } else {
+        // MBR: pull sector 0 from the CHD (it already carries any Stage
+        // 4b patches from backup time) and re-patch with the new
+        // overrides for restore-time changes.
+        let mut mbr = [0u8; 512];
+        chd_reader
+            .seek(SeekFrom::Start(0))
+            .context("failed to seek CHD to sector 0")?;
+        chd_reader
+            .read_exact(&mut mbr)
+            .context("failed to read MBR from CHD")?;
+        patch_mbr_entries(&mut mbr, &overrides);
+        target
+            .write_all(&mbr)
+            .context("failed to write MBR to target")?;
+    }
+
+    // Pre-flight: a 1 MiB chunk size for the partition copy loop, sized
+    // per CONTRIBUTING.md's I/O guidance.
+    const CHUNK: usize = 1024 * 1024;
+    let total_logical_bytes: u64 = overrides
+        .iter()
+        .map(|o| o.effective_start_lba() * 512 + o.export_size)
+        .max()
+        .unwrap_or(config.target_size)
+        .min(config.target_size);
+    set_progress_bytes(&progress, 0, total_logical_bytes);
+
+    // Step 2: write each partition body into its new home. Sort by new
+    // start LBA so we always seek forward — APM driver+data ordering
+    // can interleave indices.
+    let mut sorted: Vec<&crate::backup::metadata::PartitionMetadata> =
+        metadata.partitions.iter().collect();
+    sorted.sort_by_key(|pm| {
+        overrides
+            .iter()
+            .find(|o| o.index == pm.index)
+            .map(|o| o.effective_start_lba())
+            .unwrap_or(pm.start_lba)
+    });
+
+    let mut buf = vec![0u8; CHUNK];
+    let mut bytes_progressed: u64 = 0;
+    for pm in &sorted {
+        if is_cancelled(&progress) {
+            bail!("restore cancelled");
+        }
+        let ov = match overrides.iter().find(|o| o.index == pm.index) {
+            Some(o) => o,
+            None => continue,
+        };
+        let new_offset = ov.effective_start_lba() * 512;
+        let export_size = ov.export_size;
+
+        // Source range inside the CHD: `pm.start_lba` was set by Stage
+        // 4b's metadata writer to the partition's in-CHD position.
+        let chd_offset = pm.start_lba * 512;
+        let chd_size = pm.imaged_size_bytes;
+        let to_copy = chd_size.min(export_size);
+
+        log(
+            &progress,
+            LogLevel::Info,
+            format!(
+                "Partition {}: copying {} bytes from CHD offset {} to target offset {}",
+                pm.index, to_copy, chd_offset, new_offset
+            ),
+        );
+
+        target
+            .seek(SeekFrom::Start(new_offset))
+            .with_context(|| format!("seek target to partition-{} offset", pm.index))?;
+        chd_reader
+            .seek(SeekFrom::Start(chd_offset))
+            .with_context(|| format!("seek CHD to partition-{} source", pm.index))?;
+
+        let mut remaining = to_copy;
+        while remaining > 0 {
+            if is_cancelled(&progress) {
+                bail!("restore cancelled");
+            }
+            let want = (remaining as usize).min(buf.len());
+            chd_reader
+                .read_exact(&mut buf[..want])
+                .with_context(|| format!("read partition-{} body from CHD", pm.index))?;
+            target
+                .write_all(&buf[..want])
+                .with_context(|| format!("write partition-{} body to target", pm.index))?;
+            remaining -= want as u64;
+            bytes_progressed += want as u64;
+            set_progress_bytes(&progress, bytes_progressed, total_logical_bytes);
+        }
+
+        // Grow case: zero-fill the gap between the copied source bytes
+        // and the new partition end so resize_filesystem_for can land
+        // its alt-VH / boot tail bytes in clean space. Sparse seek is
+        // not enough here because resize_*_in_place reads back, which
+        // returns whatever junk was on the device.
+        if to_copy < export_size {
+            let pad = export_size - to_copy;
+            let zeros = vec![0u8; CHUNK];
+            let mut left = pad;
+            while left > 0 {
+                let want = (left as usize).min(zeros.len());
+                target
+                    .write_all(&zeros[..want])
+                    .with_context(|| format!("zero-pad partition-{} grow region", pm.index))?;
+                left -= want as u64;
+            }
+        }
+    }
+
+    target
+        .flush()
+        .context("flush target after partition writes")?;
+
+    // Step 3: filesystem resize + hidden-sector patches per partition.
+    set_operation(&progress, "Finalizing filesystems...");
+    {
+        let inner_file = target
+            .inner_mut()
+            .context("failed to access target file for filesystem fixups")?;
+        for pm in &metadata.partitions {
+            let ov = match overrides.iter().find(|o| o.index == pm.index) {
+                Some(o) => o,
+                None => continue,
+            };
+            let new_offset = ov.effective_start_lba() * 512;
+            let export_size = ov.export_size;
+            let new_start_lba = ov.effective_start_lba();
+            // Resize is needed if the partition's size changed compared
+            // to what the CHD held.
+            if export_size != pm.imaged_size_bytes {
+                let mut local_log = |m: &str| log(&progress, LogLevel::Info, m);
+                crate::fs::resize_filesystem_for(
+                    inner_file,
+                    new_offset,
+                    export_size,
+                    &mut local_log,
+                )
+                .with_context(|| format!("resize partition-{} filesystem", pm.index))?;
+            }
+            let mut local_log = |m: &str| log(&progress, LogLevel::Info, m);
+            patch_hidden_sectors_for(inner_file, new_offset, new_start_lba, &mut local_log)
+                .with_context(|| format!("patch hidden sectors for partition-{}", pm.index))?;
+        }
+    }
+
+    // Step 4: GPT backup header at the end of the target.
+    if let Some(patched) = gpt_for_backup_header {
+        let backup = patched.build_backup_gpt(target_sectors);
+        let backup_offset = (target_sectors - 33) * 512;
+        target
+            .seek(SeekFrom::Start(backup_offset))
+            .context("seek to backup GPT offset")?;
+        target.write_all(&backup).context("write backup GPT")?;
+    }
+
+    target.flush().context("final flush")?;
+
+    log(
+        &progress,
+        LogLevel::Info,
+        format!(
+            "Re-resize restore complete: {}",
+            config.target_path.display()
+        ),
+    );
     if let Ok(mut p) = progress.lock() {
         p.finished = true;
         p.operation = "Restore complete".to_string();
@@ -2269,6 +2593,8 @@ mod tests {
                 chd_options: None,
                 is_dvd: false,
                 output_base: &output_base,
+                resize_targets: None,
+                alignment_sectors: 0,
             },
             &mut progress_cb,
             &cancel_check,
@@ -2342,5 +2668,167 @@ mod tests {
         let restored = std::fs::read(&target_path).unwrap();
         assert_eq!(restored.len(), data.len(), "restored length mismatch");
         assert_eq!(restored, data, "restored bytes must match source");
+    }
+
+    /// Stage 5b round-trip: build a 4 MiB MBR-disk single-file CHD backup
+    /// with one 0x83 (Linux) partition spanning sectors 1..=2047, then
+    /// restore with `RestoreSizeChoice::Custom` that GROWS the partition
+    /// to 3 MiB. The restore validator forbids shrinking past
+    /// `imaged_size_bytes`, since we'd be dropping live partition data;
+    /// growth is the in-bounds resize on this path. Verify the resulting
+    /// target carries a patched MBR + the partition body's leading half
+    /// (matching the CHD) + zero-padded grow region.
+    #[test]
+    fn single_file_chd_re_resize_restore_grows_partition() {
+        const TOTAL_SECTORS: u32 = 8192;
+        const PART_SECTORS: u32 = 2047;
+        const NEW_PART_SECTORS: u32 = 6144;
+        const SECTOR_SIZE: u64 = 512;
+        let total_bytes = (TOTAL_SECTORS as u64) * SECTOR_SIZE;
+        let part_bytes = (PART_SECTORS as u64) * SECTOR_SIZE;
+        let new_part_bytes = (NEW_PART_SECTORS as u64) * SECTOR_SIZE;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_path = tmp.path().join("source.img");
+        let mut data = vec![0u8; total_bytes as usize];
+        data[..512].copy_from_slice(&build_test_mbr(PART_SECTORS));
+        for i in 0..(part_bytes as usize) {
+            data[512 + i] = ((i % 251) as u8).wrapping_add(1);
+        }
+        std::fs::write(&source_path, &data).unwrap();
+
+        let backup_folder = tmp.path().join("backup");
+        std::fs::create_dir_all(&backup_folder).unwrap();
+        let output_base = backup_folder.join("disk");
+        let source_file = File::open(&source_path).unwrap();
+        let mut br = BufReader::new(source_file.try_clone().unwrap());
+        let table = PartitionTable::detect(&mut br).expect("detect MBR");
+        let partitions = table.partitions();
+        let mbr_bytes: [u8; 512] = data[..512].try_into().unwrap();
+
+        let mut log_buf: Vec<String> = Vec::new();
+        let mut log_cb = |s: &str| log_buf.push(s.to_string());
+        let mut progress_cb = |_: u64| {};
+        let cancel_check = || false;
+        let chd_result = single_file_chd::run(
+            SingleFileChdInputs {
+                source_file: &source_file,
+                source_size: total_bytes,
+                source_partition_table_bytes: &mbr_bytes,
+                partition_table: &table,
+                partitions: &partitions,
+                partition_filter: None,
+                sector_by_sector: false,
+                chd_options: None,
+                is_dvd: false,
+                output_base: &output_base,
+                resize_targets: None,
+                alignment_sectors: 0,
+            },
+            &mut progress_cb,
+            &cancel_check,
+            &mut log_cb,
+        )
+        .expect("backup");
+
+        let metadata = BackupMetadata {
+            version: 1,
+            created: "2026-05-04T00:00:00Z".to_string(),
+            source_device: source_path.display().to_string(),
+            source_size_bytes: total_bytes,
+            partition_table_type: table.type_name().to_string(),
+            checksum_type: "sha256".to_string(),
+            compression_type: "chd".to_string(),
+            split_size_mib: None,
+            sector_by_sector: false,
+            layout: BackupLayout::SingleFileChd,
+            container: Some(chd_result.container_filename.clone()),
+            container_logical_size: Some(chd_result.container_logical_size),
+            container_sha1: Some(chd_result.container_sha1.clone()),
+            size_policy: Some(crate::backup::metadata::SizePolicy::Original),
+            alignment: AlignmentMetadata {
+                detected_type: "None detected".to_string(),
+                first_partition_lba: 1,
+                alignment_sectors: 1,
+                heads: 0,
+                sectors_per_track: 0,
+            },
+            partitions: chd_result
+                .partition_ranges
+                .iter()
+                .map(|r| PartitionMetadata {
+                    index: r.partition_index,
+                    type_name: "Linux".to_string(),
+                    partition_type_byte: 0x83,
+                    start_lba: r.offset_in_disk / 512,
+                    original_size_bytes: r.length,
+                    imaged_size_bytes: r.length,
+                    compressed_files: vec![],
+                    checksum: r.checksum_sha256.clone(),
+                    resized: false,
+                    compacted: true,
+                    is_logical: false,
+                    partition_type_string: None,
+                    minimum_size_bytes: None,
+                })
+                .collect(),
+            bad_sectors: vec![],
+            extended_container: None,
+        };
+        let meta_path = backup_folder.join("metadata.json");
+        std::fs::write(&meta_path, serde_json::to_string_pretty(&metadata).unwrap()).unwrap();
+
+        // Restore with Custom shrink for partition 0.
+        let target_path = tmp.path().join("restored.img");
+        let cfg = RestoreConfig {
+            backup_folder: backup_folder.clone(),
+            target_path: target_path.clone(),
+            target_is_device: false,
+            target_size: total_bytes,
+            alignment: RestoreAlignment::Original,
+            partition_sizes: vec![RestorePartitionSize {
+                index: 0,
+                size_choice: RestoreSizeChoice::Custom(new_part_bytes),
+            }],
+            write_zeros_to_unused: false,
+        };
+        let progress = Arc::new(Mutex::new(RestoreProgress::new()));
+        run_restore(cfg, progress.clone()).expect("restore");
+        assert!(progress.lock().unwrap().finished);
+
+        let restored = std::fs::read(&target_path).unwrap();
+        // Restored MBR's partition entry must report the new (grown) size.
+        let entry_size_lba = u32::from_le_bytes([
+            restored[446 + 12],
+            restored[446 + 13],
+            restored[446 + 14],
+            restored[446 + 15],
+        ]);
+        assert_eq!(
+            entry_size_lba, NEW_PART_SECTORS,
+            "restored MBR must carry the grown partition size",
+        );
+
+        // The first `part_bytes` of the partition (= imaged from CHD)
+        // must equal source bytes verbatim.
+        assert_eq!(
+            &restored[512..512 + part_bytes as usize],
+            &data[512..512 + part_bytes as usize],
+            "imaged region must match source",
+        );
+
+        // The grow region (between source end and new partition end)
+        // must be zero-padded by run_single_file_chd_restore_resize.
+        let grow = &restored[(512 + part_bytes) as usize..(512 + new_part_bytes) as usize];
+        assert!(
+            grow.iter().all(|b| *b == 0),
+            "grow region must be zero-filled (saw {} non-zero)",
+            grow.iter().filter(|b| **b != 0).count(),
+        );
+        assert_eq!(
+            restored.len(),
+            total_bytes as usize,
+            "target sized correctly"
+        );
     }
 }

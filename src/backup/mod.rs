@@ -98,10 +98,8 @@ pub struct BackupConfig {
     pub size_policy: Option<SizePolicy>,
     /// Per-partition target sizes in bytes, keyed by partition index
     /// (single-file CHD only). Entries omitted from this map default to
-    /// the partition's source size. Backup-time resize execution itself
-    /// is Stage 4b — for now, non-Original entries are recorded in
-    /// metadata but the CHD body still uses source sizes; `run_backup`
-    /// logs a warning when this happens.
+    /// the partition's source size. Non-trivial entries trigger
+    /// `single_file_chd::run`'s temp-file resize pipeline.
     pub partition_target_sizes: Option<Vec<(usize, u64)>>,
 }
 
@@ -981,11 +979,10 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
 /// CHD container (chdman/MAME compatible) and writes a `single-file-chd`
 /// `metadata.json` describing the byte ranges inside it.
 ///
-/// Source layout is preserved exactly — partition table at sector 0 of the
-/// CHD comes verbatim from the source, partition data sits at original
-/// offsets, and gaps zero-fill. Backup-time resize is a follow-up: when
-/// added it will pass a `SizePlan` into `single_file_chd::run` and rewrite
-/// the partition-table sector to match.
+/// When the user picks a non-Original `size_policy`,
+/// `single_file_chd::run` takes the temp-file resize pipeline (Stage 4b,
+/// Approach A); otherwise the cheaper `DiskImageStream` path produces a
+/// CHD whose layout matches the source disk byte-for-byte.
 #[allow(clippy::too_many_arguments)] // intentional — pulls run_backup's locals
 fn run_single_file_chd_path(
     config: &BackupConfig,
@@ -1009,33 +1006,7 @@ fn run_single_file_chd_path(
         ),
     );
 
-    // Backup-time resize (Min+20% / Custom) is Stage 4b; until it lands we
-    // honour the picker's selection in metadata only and fall back to
-    // source sizes for the CHD body. Warn explicitly so users aren't
-    // surprised.
     let requested_policy = config.size_policy.unwrap_or(SizePolicy::Original);
-    let nontrivial_targets = config
-        .partition_target_sizes
-        .as_deref()
-        .map(|v| {
-            v.iter().any(|(idx, target)| {
-                partitions
-                    .iter()
-                    .find(|p| p.index == *idx)
-                    .map(|p| *target != p.size_bytes)
-                    .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false);
-    if requested_policy != SizePolicy::Original || nontrivial_targets {
-        log(
-            progress,
-            LogLevel::Warning,
-            "Backup-time partition resize is a follow-up stage. The CHD will \
-             contain partitions at their source sizes for now; the requested \
-             size policy is recorded in metadata.json for traceability.",
-        );
-    }
 
     // Output base for compress_chd (the .chd extension is appended by the
     // compressor). Every single-file CHD backup uses the literal name
@@ -1053,6 +1024,8 @@ fn run_single_file_chd_path(
         chd_options: config.chd_options.clone(),
         is_dvd: matches!(config.compression, CompressionType::Dvd),
         output_base: &output_base,
+        resize_targets: config.partition_target_sizes.as_deref(),
+        alignment_sectors: alignment.alignment_sectors,
     };
 
     {
@@ -1098,16 +1071,20 @@ fn run_single_file_chd_path(
             let part = partitions
                 .iter()
                 .find(|p| p.index == range.partition_index)?;
+            // `start_lba` records where the partition lives inside the CHD's
+            // synthesised disk image — that's the new offset when the
+            // backup-time resize plan moved it, otherwise the source LBA.
+            let new_start_lba = range.offset_in_disk / 512;
             Some(PartitionMetadata {
                 index: range.partition_index,
                 type_name: part.type_name.clone(),
                 partition_type_byte: part.partition_type_byte,
-                start_lba: part.start_lba,
+                start_lba: new_start_lba,
                 original_size_bytes: part.size_bytes,
                 imaged_size_bytes: range.length,
                 compressed_files: vec![], // data is inside the container
                 checksum: range.checksum_sha256.clone(),
-                resized: false,
+                resized: range.length != part.size_bytes || new_start_lba != part.start_lba,
                 compacted: !config.sector_by_sector,
                 is_logical: part.is_logical,
                 partition_type_string: part.partition_type_string.clone(),
@@ -1130,9 +1107,6 @@ fn run_single_file_chd_path(
         container: Some(result.container_filename.clone()),
         container_logical_size: Some(result.container_logical_size),
         container_sha1: Some(result.container_sha1.clone()),
-        // Records what the user asked for — `effective_policy` is what
-        // actually shaped the CHD. They differ only while Stage 4b is
-        // outstanding; once it lands they will always match.
         size_policy: Some(requested_policy),
         alignment: AlignmentMetadata {
             detected_type: format!("{}", alignment.alignment_type),

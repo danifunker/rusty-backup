@@ -230,8 +230,27 @@ is ignored.
 
 Follow-ups tracked under their own stages:
 
-- Stage 4b — backup-time resize (per-partition `SizePlan`, rewrites the
-  partition-table sector before emitting it).
+- Stage 4b ✅ — backup-time resize. `single_file_chd::run` now accepts
+  `resize_targets` + `alignment_sectors`; non-trivial plans take the
+  sparse-temp-file pipeline. `run_backup` drops its prior warning and
+  records actual resized sizes/offsets in `metadata.json` (with
+  `resized: true` per partition that moved or changed size). Round-trip
+  test (`resize_plan_round_trip_shrinks_mbr_partition`) verifies a 4 MiB
+  MBR disk's 0x83 partition halves cleanly: patched MBR entry, body at
+  declared offset, dropped tail zero-filled.
+
+  **Approach (decided):** sparse temp-file scratch. When the resize plan is
+  non-trivial, `single_file_chd::run` bypasses `DiskImageStream` and
+  assembles the synthesised disk into a sparse temp file: patched
+  MBR/GPT/APM at sector 0, each partition body written at its new offset
+  via the same compact-or-raw reader logic as today, then
+  `resize_*_in_place` and `patch_hidden_sectors_for` run against the temp
+  file. Finally the temp file is handed to `compress_chd` as a `Read`. The
+  Original-sized path keeps the streaming composer. Rationale: code reuse
+  with `reconstruct_disk_from_backup`'s resize+patch pipeline outweighs
+  the temporary disk cost (sparse files mean only the actually-used
+  regions hit disk), and FS resize functions need `Read + Write + Seek`
+  which the forward-only stream can't provide.
 - Stage 4c ✅ — GPT + APM source support landed.
 - Stage 4d — layout-preserving FAT/NTFS/exFAT compact readers so smart
   mode benefits more filesystems.
@@ -311,9 +330,32 @@ a sensible drive with the right SHA1.
 - [x] `cargo build --all-targets` zero new warnings; `cargo test --lib`
       645 passing.
 
-**Stage 5b — re-resize restore (still TODO)**: lands together with Stage
-3b, since the per-partition extract+resize pipeline is shared between
-backup-time resize and restore-time re-resize.
+**Stage 5b — re-resize restore ✅**
+
+- [x] `run_restore` routes `BackupLayout::SingleFileChd` to
+      `run_single_file_chd_restore_resize` when any per-partition size
+      choice is non-`Original`; otherwise stays on the as-is path.
+- [x] New helper extracts each partition body from `disk.chd` via
+      `ChdReader` (seek to in-CHD offset + read `imaged_size_bytes`),
+      writes it at the user-chosen new offset on the target, zero-pads
+      grow regions, then runs `fs::resize_filesystem_for` +
+      `patch_hidden_sectors_for` for FS metadata fixups. Patched MBR /
+      primary GPT / APM head land at sector 0; backup GPT lands at the
+      target's last 33 LBAs for GPT restores. Logical / extended-MBR
+      backups bail with a clear error (the EBR rebuild from the
+      per-partition path isn't wired in yet).
+- [x] `RestoreSizeChoice::Original` on this path means "as-stored in the
+      CHD" (i.e. `imaged_size_bytes`), since the CHD is the source of
+      truth post-Stage-4b. The function pre-swaps
+      `original_size_bytes := imaged_size_bytes` before calling
+      `calculate_restore_layout` so the existing validator (which
+      forbids shrink-below-imaged) keeps its meaning.
+- [x] Round-trip test
+      (`single_file_chd_re_resize_restore_grows_partition`) restores a
+      4 MiB MBR-disk CHD with a Custom-grown partition and verifies the
+      patched MBR + imaged region match + zero-padded grow region.
+- [x] `cargo test --lib` 649 passing; `cargo fmt --check` + `cargo
+      clippy --lib` clean (no new warnings).
 
 **Original spec preserved below for reference.**
 

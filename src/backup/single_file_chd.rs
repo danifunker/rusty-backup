@@ -12,9 +12,15 @@
 //!   in the synthesised image. APM reads the disk's head region (DDR +
 //!   partition map + drivers) verbatim from the source up to the first
 //!   real partition.
-//! - **Source layout preserved.** Partition offsets and sizes equal those
-//!   on the source disk; no resize at backup time. Backup-time resize is a
-//!   follow-up and will plug in here via a `SizePlan` argument.
+//! - **Backup-time resize supported.** When the caller passes
+//!   `resize_targets`, partitions get their new sizes via the same
+//!   `PartitionResizePlan` + `PartitionSizeOverride` machinery the restore
+//!   path uses: assemble the synthesised disk into a sparse temp file,
+//!   write the patched partition table at sector 0, drop each partition
+//!   body at its new offset, run `resize_*_in_place` + hidden-sector
+//!   patching, then hand the temp file to `compress_chd`. With no
+//!   resize requested (or a no-op plan) the cheaper `DiskImageStream`
+//!   path is used.
 //! - **Smart compaction = layout-preserving compact reader where available**
 //!   (HFS, HFS+, ext, btrfs, ProDOS), raw passthrough otherwise. Adding
 //!   layout-preserving FAT/NTFS/exFAT readers is a future stage.
@@ -25,15 +31,17 @@
 //! after compression so the metadata.json stays trustable for restore-time
 //! validation.
 
-use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
 
 use super::disk_image_stream::DiskImageStreamBuilder;
 use crate::fs;
-use crate::partition::{PartitionInfo, PartitionTable};
+use crate::partition::mbr::patch_mbr_entries;
+use crate::partition::resize::{compute_resize_plan, PartitionResizePlan};
+use crate::partition::{PartitionInfo, PartitionSizeOverride, PartitionTable};
 use crate::rbformats::chd::{compress_chd, compress_chd_dvd, ChdReader};
 use crate::rbformats::chd_options::ChdOptions;
 
@@ -64,6 +72,17 @@ pub struct SingleFileChdInputs<'a> {
     /// Where to write the CHD (e.g. `<backup_folder>/disk`). The `.chd`
     /// extension is appended by `compress_chd`.
     pub output_base: &'a Path,
+    /// Optional per-partition target sizes `(index, new_size_bytes)`.
+    /// `None` (or an empty slice / all-equal-to-source list) keeps source
+    /// sizes and uses the streaming `DiskImageStream` path. Anything else
+    /// triggers the temp-file resize path documented in
+    /// `docs/whole_disk_chd_backup.md` (Stage 4b, Approach A).
+    pub resize_targets: Option<&'a [(usize, u64)]>,
+    /// Sectors used to align partition starts when relocating after a
+    /// resize. Must match the source disk's detected alignment so that
+    /// vintage OSes still accept the layout. Ignored on the no-resize
+    /// streaming path.
+    pub alignment_sectors: u64,
 }
 
 /// Per-partition byte range + checksum, returned to the caller for
@@ -118,6 +137,13 @@ pub fn run(
              pick zstd/raw, or use the per-partition CHD flow.",
             inputs.partition_table.type_name(),
         );
+    }
+
+    // If the caller passed a non-trivial resize plan, fork off to the
+    // sparse-temp-file pipeline. The streaming path below handles the
+    // common "Original sizes" case at zero scratch-disk cost.
+    if let Some(plans) = build_resize_plans(&inputs)? {
+        return run_with_resize(inputs, &plans, progress_cb, cancel_check, log_cb);
     }
 
     let mut builder = DiskImageStreamBuilder::new(inputs.source_size);
@@ -262,6 +288,442 @@ pub fn run(
         container_sha1,
         partition_ranges,
     })
+}
+
+/// Build a per-partition resize plan from `inputs.resize_targets`. Returns
+/// `Ok(None)` when no resize is requested, or when every requested target
+/// matches the source size (i.e. a no-op the streaming path can serve
+/// faster). Returns `Ok(Some(plans))` when at least one partition would
+/// move or change size.
+fn build_resize_plans(
+    inputs: &SingleFileChdInputs<'_>,
+) -> Result<Option<Vec<PartitionResizePlan>>> {
+    let targets = match inputs.resize_targets {
+        Some(t) if !t.is_empty() => t,
+        _ => return Ok(None),
+    };
+
+    // Filter out no-op entries up front: any target equal to its source
+    // size adds no work, and we don't want to drag every partition into
+    // the temp-file branch when the user accepted "Original" for all.
+    let mut effective: Vec<(usize, u64)> = Vec::new();
+    for (idx, new_size) in targets {
+        if let Some(part) = inputs.partitions.iter().find(|p| p.index == *idx) {
+            if part.size_bytes != *new_size {
+                effective.push((*idx, *new_size));
+            }
+        }
+    }
+    if effective.is_empty() {
+        return Ok(None);
+    }
+
+    // Excluded partitions (skipped via filter) keep their original size in
+    // the plan: their on-disk region is zero-filled by the temp-file path
+    // but the partition table entry must still cover the same LBAs so
+    // restore can find them later.
+    let plans = compute_resize_plan(
+        inputs.partitions,
+        &effective,
+        inputs.alignment_sectors,
+        inputs.source_size,
+    )
+    .context("failed to compute single-file CHD resize plan")?;
+
+    // If alignment + cumulative shifts collapsed everything back to the
+    // original layout, drop to the streaming path.
+    let any_change = plans
+        .iter()
+        .any(|p| p.needs_data_move || p.new_size_bytes != p.old_size_bytes);
+    if !any_change {
+        return Ok(None);
+    }
+    Ok(Some(plans))
+}
+
+/// Convert a resize plan into the `PartitionSizeOverride` shape expected
+/// by `patch_mbr_entries` / `Gpt::patch_for_restore` /
+/// `Apm::patch_for_restore`. Heads/sectors-per-track stay at 0 because
+/// CHS recalculation is the caller's concern when it matters; the
+/// single-file-CHD path doesn't currently emit CHS-sensitive layouts.
+fn plans_to_overrides(plans: &[PartitionResizePlan]) -> Vec<PartitionSizeOverride> {
+    plans
+        .iter()
+        .map(|p| PartitionSizeOverride {
+            index: p.index,
+            start_lba: p.old_start_lba,
+            original_size: p.old_size_bytes,
+            export_size: p.new_size_bytes,
+            new_start_lba: if p.needs_data_move {
+                Some(p.new_start_lba)
+            } else {
+                None
+            },
+            heads: 0,
+            sectors_per_track: 0,
+        })
+        .collect()
+}
+
+/// Sparse-temp-file resize pipeline. See module-level doc and
+/// `docs/whole_disk_chd_backup.md` (Stage 4b, Approach A) for the
+/// design rationale.
+fn run_with_resize(
+    inputs: SingleFileChdInputs<'_>,
+    plans: &[PartitionResizePlan],
+    progress_cb: &mut dyn FnMut(u64),
+    cancel_check: &dyn Fn() -> bool,
+    log_cb: &mut dyn FnMut(&str),
+) -> Result<SingleFileChdResult> {
+    log_cb(&format!(
+        "Single-file CHD: backup-time resize plan covers {} partition(s)",
+        plans
+            .iter()
+            .filter(|p| p.new_size_bytes != p.old_size_bytes || p.needs_data_move)
+            .count(),
+    ));
+
+    let overrides = plans_to_overrides(plans);
+    // Disk-level logical size stays at the source's size for now: the
+    // resize plan is constrained against `source_size` already (see
+    // `compute_resize_plan`), so partitions never overflow it. Shrinking
+    // the disk envelope itself is a future enhancement.
+    let target_size = inputs.source_size;
+
+    // Scratch disk image lives next to the eventual CHD so it shares a
+    // filesystem with the destination — sparse semantics carry over and
+    // we avoid cross-volume copies. `tempfile::NamedTempFile` cleans up
+    // even on panic / early return.
+    let scratch_dir = inputs
+        .output_base
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let scratch = tempfile::Builder::new()
+        .prefix(".rb-chd-scratch-")
+        .suffix(".img")
+        .tempfile_in(&scratch_dir)
+        .with_context(|| {
+            format!(
+                "failed to create scratch disk image in {}",
+                scratch_dir.display()
+            )
+        })?;
+    let scratch_path = scratch.path().to_path_buf();
+
+    {
+        // Open with read+write; we'll seek heavily during partition writes
+        // and again during resize_*_in_place fixups.
+        let mut tf = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&scratch_path)
+            .context("failed to open scratch disk image read+write")?;
+        tf.set_len(target_size)
+            .context("failed to size scratch disk image")?;
+
+        write_patched_table(
+            &mut tf,
+            inputs.source_file,
+            inputs.source_partition_table_bytes,
+            inputs.partition_table,
+            inputs.partitions,
+            &overrides,
+            target_size,
+            log_cb,
+        )?;
+
+        for part in inputs.partitions {
+            if cancel_check() {
+                anyhow::bail!("operation cancelled");
+            }
+            if let Some(filter) = inputs.partition_filter {
+                if !filter.contains(&part.index) {
+                    continue;
+                }
+            }
+            if part.partition_type_byte == 0xEE {
+                continue;
+            }
+            if part.is_extended_container {
+                log_cb(&format!(
+                    "Skipping extended container partition-{} (logical partitions emitted individually)",
+                    part.index,
+                ));
+                continue;
+            }
+
+            let plan = plans.iter().find(|p| p.index == part.index);
+            let new_offset = plan
+                .map(|p| p.new_start_lba * 512)
+                .unwrap_or(part.start_lba * 512);
+            let new_size = plan.map(|p| p.new_size_bytes).unwrap_or(part.size_bytes);
+            let new_start_lba = new_offset / 512;
+
+            // Bytes to write: cap at min(source_extent, new_size). When
+            // shrinking, the FS resize call below is responsible for
+            // ensuring no live data lived past `new_size`; the picker's
+            // Min+20% computation guarantees this when used.
+            let to_write = part.size_bytes.min(new_size);
+            log_cb(&format!(
+                "  partition-{}: writing {} bytes at offset {} (source size {}, new size {})",
+                part.index, to_write, new_offset, part.size_bytes, new_size,
+            ));
+
+            tf.seek(SeekFrom::Start(new_offset))
+                .with_context(|| format!("seek scratch to partition-{} offset", part.index))?;
+            let mut reader =
+                build_partition_reader(inputs.source_file, part, inputs.sector_by_sector, log_cb)?;
+            copy_capped(&mut reader, &mut tf, to_write, cancel_check)
+                .with_context(|| format!("write partition-{} body to scratch", part.index))?;
+
+            // The grow case: ensure the temp file's logical extent
+            // reaches new_offset + new_size before resize_*_in_place reads
+            // back any tail bytes (resize functions seek to EOF-relative
+            // positions like the HFS alt MDB).
+            if to_write < new_size {
+                tf.seek(SeekFrom::Start(new_offset + new_size - 1))?;
+                tf.write_all(&[0u8])?;
+            }
+
+            // The fs::* helpers want a sized `impl FnMut(&str)`; rewrap
+            // the trait-object log callback into a local closure for
+            // each call.
+            if new_size != part.size_bytes {
+                let mut local_log = |s: &str| log_cb(s);
+                fs::resize_filesystem_for(&mut tf, new_offset, new_size, &mut local_log)
+                    .with_context(|| format!("resize filesystem in partition-{}", part.index))?;
+            }
+            // Always patch hidden_sectors when the partition moved (or in
+            // case the source's BPB drifted from the table); the per-FS
+            // patcher is a no-op on magic mismatch.
+            let mut local_log = |s: &str| log_cb(s);
+            fs::patch_hidden_sectors_for(&mut tf, new_offset, new_start_lba, &mut local_log)
+                .with_context(|| format!("patch hidden sectors for partition-{}", part.index))?;
+        }
+
+        tf.flush().context("flush scratch disk image")?;
+    }
+
+    // Reopen as a plain `Read` for compress_chd. Forward-only; CHD
+    // compression streams sequentially.
+    let mut input = File::open(&scratch_path).context("reopen scratch disk image for compress")?;
+
+    let mut chd_progress_cb = |n: u64| progress_cb(n);
+    let mut chd_log_cb = |s: &str| log_cb(s);
+    let chd_cancel_check = || cancel_check();
+
+    let written_files = if inputs.is_dvd {
+        compress_chd_dvd(
+            &mut input,
+            inputs.output_base,
+            target_size,
+            None,
+            inputs.chd_options.clone(),
+            &mut chd_progress_cb,
+            &chd_cancel_check,
+            &mut chd_log_cb,
+        )?
+    } else {
+        compress_chd(
+            &mut input,
+            inputs.output_base,
+            target_size,
+            None,
+            inputs.chd_options.clone(),
+            &mut chd_progress_cb,
+            &chd_cancel_check,
+            &mut chd_log_cb,
+        )?
+    };
+
+    let container_filename = written_files
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("compress_chd returned no output filename"))?;
+
+    // Build the post-write partition_ranges list at the NEW offsets so
+    // metadata.json reflects the resized layout.
+    let mut partition_ranges: Vec<ChdPartitionRange> = inputs
+        .partitions
+        .iter()
+        .filter(|p| {
+            if p.partition_type_byte == 0xEE || p.is_extended_container {
+                return false;
+            }
+            if let Some(filter) = inputs.partition_filter {
+                if !filter.contains(&p.index) {
+                    return false;
+                }
+            }
+            true
+        })
+        .map(|part| {
+            let plan = plans.iter().find(|p| p.index == part.index);
+            let off = plan
+                .map(|p| p.new_start_lba * 512)
+                .unwrap_or(part.start_lba * 512);
+            let len = plan.map(|p| p.new_size_bytes).unwrap_or(part.size_bytes);
+            ChdPartitionRange {
+                partition_index: part.index,
+                offset_in_disk: off,
+                length: len,
+                checksum_sha256: String::new(),
+            }
+        })
+        .collect();
+
+    let chd_path = inputs
+        .output_base
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(&container_filename);
+    log_cb(&format!(
+        "Computing per-partition checksums from {}",
+        chd_path.display()
+    ));
+    let container_sha1 = compute_post_write_metadata(&chd_path, &mut partition_ranges, log_cb)?;
+
+    Ok(SingleFileChdResult {
+        container_filename,
+        container_logical_size: target_size,
+        container_sha1,
+        partition_ranges,
+    })
+}
+
+/// Write the patched partition table at sector 0 (and the backup GPT
+/// at the disk tail when relevant). Mirrors the head-segment shapes
+/// `build_head_segments` produces for the streaming path, but writes
+/// directly to the scratch file so the partition loop can land bytes
+/// at any offset afterwards.
+#[allow(clippy::too_many_arguments)] // mirrors run_with_resize's locals
+fn write_patched_table(
+    scratch: &mut File,
+    source_file: &File,
+    source_partition_table_bytes: &[u8],
+    table: &PartitionTable,
+    partitions: &[PartitionInfo],
+    overrides: &[PartitionSizeOverride],
+    target_size: u64,
+    log_cb: &mut dyn FnMut(&str),
+) -> Result<()> {
+    match table {
+        PartitionTable::Mbr(_) => {
+            let mut mbr_buf = [0u8; 512];
+            let copy_len = source_partition_table_bytes.len().min(512);
+            mbr_buf[..copy_len].copy_from_slice(&source_partition_table_bytes[..copy_len]);
+            patch_mbr_entries(&mut mbr_buf, overrides);
+            scratch.seek(SeekFrom::Start(0))?;
+            scratch.write_all(&mbr_buf)?;
+            log_cb("  table: MBR (patched with new partition sizes/offsets)");
+        }
+        PartitionTable::Gpt { gpt, .. } => {
+            // Protective MBR is rebuilt deterministically; some sources
+            // carry a hand-written variant. Either way we want a clean,
+            // valid pMBR for the new disk size.
+            let total_sectors = target_size / 512;
+            let pmbr = crate::partition::gpt::Gpt::build_protective_mbr(total_sectors);
+            scratch.seek(SeekFrom::Start(0))?;
+            scratch.write_all(&pmbr)?;
+
+            let patched = gpt.patch_for_restore(overrides, total_sectors);
+            let primary = patched.build_primary_gpt(total_sectors);
+            scratch.write_all(&primary)?;
+
+            let backup = patched.build_backup_gpt(total_sectors);
+            let backup_offset = target_size
+                .checked_sub(backup.len() as u64)
+                .ok_or_else(|| anyhow!("target size smaller than backup GPT region"))?;
+            scratch.seek(SeekFrom::Start(backup_offset))?;
+            scratch.write_all(&backup)?;
+            log_cb(&format!(
+                "  table: GPT (patched primary at LBA 1, backup at offset {backup_offset})"
+            ));
+        }
+        PartitionTable::Apm(apm) => {
+            // Drivers (Apple_Driver*) live as APM partitions before the
+            // first user partition. Their data is real driver code that
+            // we copy verbatim from the source; only the APM entry blocks
+            // (DDR + map) get rewritten with patched sizes/offsets.
+            let head_end = partitions
+                .iter()
+                .filter(|p| {
+                    !matches!(
+                        p.partition_type_string.as_deref(),
+                        Some("Apple_partition_map")
+                    )
+                })
+                .map(|p| p.start_lba * 512)
+                .min()
+                .unwrap_or(64 * 512)
+                .min(target_size);
+            if head_end == 0 {
+                anyhow::bail!("APM head region computed as 0 bytes — partition table looks empty");
+            }
+            let mut head_buf = vec![0u8; head_end as usize];
+            let mut clone = source_file
+                .try_clone()
+                .context("clone source for APM head")?;
+            clone.seek(SeekFrom::Start(0))?;
+            clone
+                .read_exact(&mut head_buf)
+                .context("read APM head region")?;
+            scratch.seek(SeekFrom::Start(0))?;
+            scratch.write_all(&head_buf)?;
+
+            // Overlay patched DDR + entry blocks on top of the verbatim
+            // head. Driver partition bodies (which sit AFTER the entry
+            // blocks but inside `head_end`) are preserved by the
+            // verbatim copy above.
+            let block_size = apm.ddr.block_size as u64;
+            let target_blocks = (target_size / block_size) as u32;
+            let patched = apm.patch_for_restore(overrides, target_blocks);
+            let blocks = patched.build_apm_blocks(Some(target_blocks));
+            // build_apm_blocks returns DDR + entries only, sized at
+            // `(1 + entry_count) * 512`. Cap at head_end just in case.
+            let to_write = (blocks.len() as u64).min(head_end);
+            scratch.seek(SeekFrom::Start(0))?;
+            scratch.write_all(&blocks[..to_write as usize])?;
+            log_cb(&format!(
+                "  table: APM ({} bytes head copied verbatim, {} bytes of patched DDR+entries overlaid)",
+                head_end,
+                to_write,
+            ));
+        }
+        PartitionTable::None { .. } => {
+            anyhow::bail!("single-file CHD: superfloppy sources are not supported on this path");
+        }
+    }
+    Ok(())
+}
+
+/// `io::copy`-style helper that caps total bytes copied at `cap` and
+/// polls `cancel_check` between chunks.
+fn copy_capped(
+    reader: &mut dyn Read,
+    writer: &mut File,
+    cap: u64,
+    cancel_check: &dyn Fn() -> bool,
+) -> Result<u64> {
+    const CHUNK: usize = 1024 * 1024;
+    let mut buf = vec![0u8; CHUNK];
+    let mut remaining = cap;
+    let mut written = 0u64;
+    while remaining > 0 {
+        if cancel_check() {
+            anyhow::bail!("operation cancelled");
+        }
+        let want = (remaining as usize).min(CHUNK);
+        let n = reader.read(&mut buf[..want])?;
+        if n == 0 {
+            break;
+        }
+        writer.write_all(&buf[..n])?;
+        remaining -= n as u64;
+        written += n as u64;
+    }
+    Ok(written)
 }
 
 /// Type alias for a stream segment: `(offset_in_disk, length, reader)`.
@@ -609,6 +1071,8 @@ mod tests {
             chd_options: None,
             is_dvd: false,
             output_base: &output_base,
+            resize_targets: None,
+            alignment_sectors: 0,
         };
 
         let mut log_buf: Vec<String> = Vec::new();
@@ -718,6 +1182,8 @@ mod tests {
                 chd_options: None,
                 is_dvd: false,
                 output_base: &output_base,
+                resize_targets: None,
+                alignment_sectors: 0,
             },
             &mut progress_cb,
             &cancel,
@@ -813,6 +1279,8 @@ mod tests {
                 chd_options: None,
                 is_dvd: false,
                 output_base: &output_base,
+                resize_targets: None,
+                alignment_sectors: 0,
             },
             &mut progress_cb,
             &cancel,
@@ -851,6 +1319,121 @@ mod tests {
             matches!(detected, PartitionTable::Apm(_)),
             "round-tripped CHD should still parse as APM, got {}",
             detected.type_name(),
+        );
+    }
+
+    /// Backup-time resize round-trip: build a 4 MiB MBR disk with one
+    /// 0x83 (Linux) partition spanning sectors 1..=4095, ask
+    /// `single_file_chd::run` to shrink it to half size, and verify the
+    /// resulting CHD's MBR carries the new size + the partition body
+    /// lives at its declared offset. We use a 0x83 partition so no
+    /// in-place FS resize fires (the FS-specific resizers are tested in
+    /// their own modules) — this exercises the plumbing in isolation.
+    #[test]
+    fn resize_plan_round_trip_shrinks_mbr_partition() {
+        const TOTAL_SECTORS: u32 = 8192;
+        const PART_SECTORS: u32 = 4095;
+        const NEW_PART_SECTORS: u32 = 2048;
+        const SECTOR_SIZE: u64 = 512;
+        let total_bytes = (TOTAL_SECTORS as u64) * SECTOR_SIZE;
+        let new_part_bytes = (NEW_PART_SECTORS as u64) * SECTOR_SIZE;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_path = tmp.path().join("source.img");
+
+        let mut data = vec![0u8; total_bytes as usize];
+        data[..512].copy_from_slice(&build_test_mbr(PART_SECTORS));
+        // Distinct pattern in the partition body.
+        for i in 0..(PART_SECTORS as u64 * SECTOR_SIZE) as usize {
+            data[512 + i] = ((i % 251) as u8).wrapping_add(7);
+        }
+        std::fs::write(&source_path, &data).unwrap();
+        let source_file = File::open(&source_path).unwrap();
+
+        let mut br = BufReader::new(source_file.try_clone().unwrap());
+        let table = PartitionTable::detect(&mut br).expect("detect MBR");
+        let partitions = table.partitions();
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0].size_bytes, PART_SECTORS as u64 * SECTOR_SIZE);
+
+        let mbr_bytes: [u8; 512] = data[..512].try_into().unwrap();
+        let output_base = tmp.path().join("disk");
+        let resize_targets = vec![(0usize, new_part_bytes)];
+
+        let mut log_buf: Vec<String> = Vec::new();
+        let mut log_cb = |s: &str| log_buf.push(s.to_string());
+        let mut progress_cb = |_: u64| {};
+        let cancel = || false;
+
+        let result = run(
+            SingleFileChdInputs {
+                source_file: &source_file,
+                source_size: total_bytes,
+                source_partition_table_bytes: &mbr_bytes,
+                partition_table: &table,
+                partitions: &partitions,
+                partition_filter: None,
+                sector_by_sector: false,
+                chd_options: None,
+                is_dvd: false,
+                output_base: &output_base,
+                resize_targets: Some(&resize_targets),
+                alignment_sectors: 0,
+            },
+            &mut progress_cb,
+            &cancel,
+            &mut log_cb,
+        )
+        .expect("resize-plan single-file CHD backup");
+
+        assert_eq!(
+            result.container_logical_size, total_bytes,
+            "disk envelope size unchanged in stage 4b"
+        );
+        assert_eq!(result.partition_ranges.len(), 1);
+        assert_eq!(result.partition_ranges[0].offset_in_disk, 512);
+        assert_eq!(
+            result.partition_ranges[0].length, new_part_bytes,
+            "metadata length must reflect new partition size"
+        );
+
+        // Read back: MBR entry should now be NEW_PART_SECTORS.
+        let chd_path = tmp.path().join("disk.chd");
+        let mut reader = ChdReader::open(&chd_path).expect("reopen CHD");
+        let mut head = [0u8; 512];
+        reader.read_exact(&mut head).unwrap();
+        let entry_size_lba = u32::from_le_bytes([
+            head[446 + 12],
+            head[446 + 13],
+            head[446 + 14],
+            head[446 + 15],
+        ]);
+        assert_eq!(
+            entry_size_lba, NEW_PART_SECTORS,
+            "MBR partition size must be patched to the new value",
+        );
+
+        // Partition body bytes 0..new_part_bytes must equal source's
+        // first new_part_bytes — we shrank, so we kept the head data.
+        reader.seek(SeekFrom::Start(512)).unwrap();
+        let mut body = vec![0u8; new_part_bytes as usize];
+        reader.read_exact(&mut body).unwrap();
+        assert_eq!(
+            body,
+            data[512..512 + new_part_bytes as usize],
+            "partition body must equal source's leading new_part_bytes",
+        );
+
+        // Tail (between new partition end and old partition end) is
+        // zero-fill territory — bytes the source had there were dropped
+        // when we capped the copy at new_part_bytes.
+        reader.seek(SeekFrom::Start(512 + new_part_bytes)).unwrap();
+        let mut tail = vec![0u8; (PART_SECTORS - NEW_PART_SECTORS) as usize * 512];
+        reader.read_exact(&mut tail).unwrap();
+        assert!(
+            tail.iter().all(|b| *b == 0),
+            "shrunk-out tail must be zero-filled (was {} non-zero bytes)",
+            tail.iter().filter(|b| **b != 0).count(),
         );
     }
 }
