@@ -2513,7 +2513,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 [[package]]
 name = "libchdman-rs"
 version = "0.287.0-l3"
-source = "git+https://github.com/danifunker/libchdman-rs#e4f0004fcc5a2d2f71049767120f0fe56b2656e3"
+source = "git+https://github.com/danifunker/libchdman-rs#0c79dceb7ce0734170350e4c6305f5b49caa2b2f"
 dependencies = [
  "cc",
  "libc",
