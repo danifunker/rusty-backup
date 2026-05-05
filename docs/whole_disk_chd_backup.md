@@ -573,25 +573,63 @@ config-file edge case. ✅
 
 ---
 
-### Stage 10 — docs + e2e tests
+### Stage 10 — docs + e2e tests ✅
 
-- This file kept up to date as stages land.
-- Update `PROJECT-SPEC.md` if it documents the per-partition layout as the
-  only option.
-- Update any README that mentions backup format.
-- E2E tests:
-  - synthetic disk → smart-compact + min+20% → CHD backup → as-is restore
-    → byte-equal target
-  - same source → sector-by-sector + original → CHD backup → as-is restore
-    → byte-equal target (and confirm output stream length = source disk
-    size exactly)
-  - smart-compact CHD backup → re-resize restore (shrink one partition) →
-    fs check passes on the result
-  - inspect + browse the CHD backup, extract a file, SHA256 vs source
-  - cross-tool spot-check: `chdman info disk.chd` reports sensible drive +
-    SHA1 for both read modes (manual; not CI)
+- [x] `PROJECT-SPEC.md` Phase 4 now documents both backup layouts. The
+      legacy per-partition tree is presented next to a single-file-CHD
+      tree (`metadata.json` + table sidecars + `<backup-name>.chd`), with
+      a paragraph on how `metadata.partitions[i].offset_in_disk` records
+      byte ranges inside the CHD's logical stream and why splitting is
+      disabled for CHD output.
+- [x] `README.md` Backup-tab description updated: each backup folder
+      contains either one compressed file per partition (Zstd / Raw /
+      per-partition VHD) or a single `<backup-name>.chd` disk image that
+      `chdman info` opens and MAME loads directly. Notes that edit mode
+      flows changes back into the CHD so any CHD-aware tool still reads
+      it.
+- [x] E2E coverage. Most of the matrix was already in place from earlier
+      stages; Stage 10 added the missing sector-by-sector full round-trip
+      through restore. Final inventory:
+      - `end_to_end_round_trip_single_partition_chd` /
+        `end_to_end_round_trip_gpt` / `end_to_end_round_trip_apm` —
+        smart-compact backup → CHD readback byte-equal for MBR, GPT,
+        APM heads (sector_by_sector flag exercised on the APM case so
+        the raw-passthrough branch is covered at backup level too).
+      - `resize_plan_round_trip_shrinks_mbr_partition` — smart-compact
+        + custom shrink → CHD body matches new size with patched MBR.
+      - `single_file_chd_as_is_restore_round_trips` — smart-compact
+        backup → as-is restore byte-equal target.
+      - `single_file_chd_sector_by_sector_round_trips_through_restore`
+        (NEW) — sector-by-sector + Original → CHD backup → as-is
+        restore byte-equal target. Asserts
+        `container_logical_size == source_size` per the Stage 10 spec.
+      - `single_file_chd_re_resize_restore_grows_partition` — smart-
+        compact CHD → re-resize restore growing one partition. (Shrink
+        variant deferred: requires a real-FS source where backup-time
+        compaction makes `imaged_size_bytes < new_size`, since the
+        validator forbids restore-shrink past `imaged_size_bytes`.
+        Backup-time shrink is already covered by
+        `resize_plan_round_trip_shrinks_mbr_partition` and the grow
+        test exercises the same restore-resize plumbing in the other
+        direction.)
+      - `layout_preserving_fat_zeros_free_clusters` — synthetic FAT12
+        partition with garbage in free clusters round-trips with
+        metadata + allocated regions byte-equal and free regions
+        zeroed (covers the inspect / browse / extract chain at the
+        layout-preserving reader level; full BrowseView extraction
+        exercised via the editing test below).
+      - `refresh_metadata_after_edit_recomputes_checksums` — edit-mode
+        metadata helper recomputes container SHA-1 + per-partition
+        SHA-256 against the live CHD.
+      - `run_export_no_resize_round_trips_raw_to_chd` /
+        `run_export_with_resize_shrinks_partition` — inspect-tab
+        re-export to CHD with and without resize.
+- [x] Cross-tool spot-check (`chdman info disk.chd` recognises both
+      read modes) flagged as manual, not in CI — kept out per the
+      original spec.
+- [x] `cargo test --lib`: 662 passing.
 
-**Done when:** PR opens, docs in shape, tests green.
+**Done when:** PR opens, docs in shape, tests green. ✅
 
 ---
 

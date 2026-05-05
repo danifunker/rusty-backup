@@ -35,8 +35,12 @@ The app has three tabs:
 - **Backup** — pick a source (physical device or image file), choose a
   destination folder, pick an output format and checksum type, and start.
   Each backup is written as a folder containing `metadata.json`, the partition
-  table (`mbr.bin`/`mbr.json` or `gpt.json`), and one compressed file per
-  partition with its checksum sidecar.
+  table (`mbr.json` / `gpt.json` / `apm.json`), and either one compressed
+  file per partition (Zstd / Raw / per-partition VHD) or a single
+  `<backup-name>.chd` disk image that `chdman info` opens and MAME loads
+  directly (CHD output). The single-file CHD also serves as the unit edit
+  mode operates on, so changes flow back into a CHD that any CHD-aware
+  tool can still read.
 - **Restore** — pick a backup folder and a target device or image file.
   Partition sizes can be left at original, shrunk to the filesystem minimum,
   or set to a custom value; the filesystem is expanded in place when the

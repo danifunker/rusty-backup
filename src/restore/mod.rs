@@ -2831,4 +2831,139 @@ mod tests {
             "target sized correctly"
         );
     }
+
+    /// Stage 10 e2e: sector-by-sector + Original size → CHD backup →
+    /// as-is restore → byte-equal target. Also asserts the CHD's logical
+    /// stream length equals the source disk size exactly (sector-by-sector
+    /// is a verbatim copy by definition).
+    #[test]
+    fn single_file_chd_sector_by_sector_round_trips_through_restore() {
+        const TOTAL_SECTORS: u32 = 8192;
+        const PART_SECTORS: u32 = 4095;
+        const SECTOR_SIZE: u64 = 512;
+        let total_bytes = (TOTAL_SECTORS as u64) * SECTOR_SIZE;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_path = tmp.path().join("source.img");
+        let part_bytes = (PART_SECTORS as u64) * SECTOR_SIZE;
+        let mut data = vec![0u8; total_bytes as usize];
+        data[..512].copy_from_slice(&build_test_mbr(PART_SECTORS));
+        // Fill the partition body with a distinguishable pattern. Sector-
+        // by-sector preserves everything *inside* declared partitions
+        // verbatim; the post-partition tail is zero-filled by the disk-
+        // image stream composer (gap between segments), so we leave it
+        // zero in the source too.
+        for i in 0..(part_bytes as usize) {
+            data[512 + i] = ((i % 251) as u8).wrapping_add(7);
+        }
+        std::fs::write(&source_path, &data).unwrap();
+
+        let backup_folder = tmp.path().join("backup");
+        std::fs::create_dir_all(&backup_folder).unwrap();
+        let output_base = backup_folder.join("disk");
+        let source_file = File::open(&source_path).unwrap();
+        let mut br = BufReader::new(source_file.try_clone().unwrap());
+        let table = PartitionTable::detect(&mut br).expect("detect MBR");
+        let partitions = table.partitions();
+        let mbr_bytes: [u8; 512] = data[..512].try_into().unwrap();
+
+        let mut log_cb = |_: &str| {};
+        let mut progress_cb = |_: u64| {};
+        let cancel_check = || false;
+        let chd_result = single_file_chd::run(
+            SingleFileChdInputs {
+                source_file: &source_file,
+                source_size: total_bytes,
+                source_partition_table_bytes: &mbr_bytes,
+                partition_table: &table,
+                partitions: &partitions,
+                partition_filter: None,
+                sector_by_sector: true,
+                chd_options: None,
+                is_dvd: false,
+                output_base: &output_base,
+                resize_targets: None,
+                alignment_sectors: 0,
+            },
+            &mut progress_cb,
+            &cancel_check,
+            &mut log_cb,
+        )
+        .expect("backup");
+
+        // Stage 10 spec: container length must equal source size exactly
+        // when sector-by-sector is on.
+        assert_eq!(
+            chd_result.container_logical_size, total_bytes,
+            "sector-by-sector container must be the same size as the source",
+        );
+
+        let metadata = BackupMetadata {
+            version: 1,
+            created: "2026-05-05T00:00:00Z".to_string(),
+            source_device: source_path.display().to_string(),
+            source_size_bytes: total_bytes,
+            partition_table_type: table.type_name().to_string(),
+            checksum_type: "sha256".to_string(),
+            compression_type: "chd".to_string(),
+            split_size_mib: None,
+            sector_by_sector: true,
+            layout: BackupLayout::SingleFileChd,
+            container: Some(chd_result.container_filename.clone()),
+            container_logical_size: Some(chd_result.container_logical_size),
+            container_sha1: Some(chd_result.container_sha1.clone()),
+            size_policy: Some(crate::backup::metadata::SizePolicy::Original),
+            alignment: AlignmentMetadata {
+                detected_type: "None detected".to_string(),
+                first_partition_lba: 1,
+                alignment_sectors: 1,
+                heads: 0,
+                sectors_per_track: 0,
+            },
+            partitions: chd_result
+                .partition_ranges
+                .iter()
+                .map(|r| PartitionMetadata {
+                    index: r.partition_index,
+                    type_name: "Linux".to_string(),
+                    partition_type_byte: 0x83,
+                    start_lba: r.offset_in_disk / 512,
+                    original_size_bytes: r.length,
+                    imaged_size_bytes: r.length,
+                    compressed_files: vec![],
+                    checksum: r.checksum_sha256.clone(),
+                    resized: false,
+                    compacted: false,
+                    is_logical: false,
+                    partition_type_string: None,
+                    minimum_size_bytes: None,
+                })
+                .collect(),
+            bad_sectors: vec![],
+            extended_container: None,
+        };
+        let meta_path = backup_folder.join("metadata.json");
+        std::fs::write(&meta_path, serde_json::to_string_pretty(&metadata).unwrap()).unwrap();
+
+        let target_path = tmp.path().join("restored.img");
+        let cfg = RestoreConfig {
+            backup_folder: backup_folder.clone(),
+            target_path: target_path.clone(),
+            target_is_device: false,
+            target_size: total_bytes,
+            alignment: RestoreAlignment::Original,
+            partition_sizes: vec![],
+            write_zeros_to_unused: false,
+        };
+        let progress = Arc::new(Mutex::new(RestoreProgress::new()));
+        run_restore(cfg, progress.clone()).expect("restore");
+        assert!(progress.lock().unwrap().finished);
+
+        let restored = std::fs::read(&target_path).unwrap();
+        assert_eq!(restored.len(), data.len(), "restored length mismatch");
+        assert_eq!(
+            restored, data,
+            "sector-by-sector backup must round-trip the source disk byte-for-byte",
+        );
+    }
 }

@@ -208,18 +208,44 @@ fn detect_alignment(partition_table: &PartitionTable) -> PartitionAlignment {
 
 ### Phase 4: Backup Format and Metadata
 1. **Folder-based backup structure**:
+
+The backup folder uses one of two layouts depending on the chosen output
+format. CHD output produces a **single-file CHD** layout (one disk image
+that `chdman info` opens, MAME loads, and any other CHD-aware tool can
+read). All other formats (Zstd, Raw, VHD-per-partition) use the legacy
+**per-partition** layout. Restore, inspect, and edit handle both.
+
+Per-partition (Zstd / Raw / per-partition VHD):
 ```
 backup-name/
-├── metadata.json          # Backup metadata
+├── metadata.json          # Backup metadata (layout = "per-partition")
 ├── mbr.bin               # Raw MBR (for MBR disks only)
 ├── mbr.json              # Human-readable MBR info (for MBR disks)
 ├── gpt.json              # GPT partition table (for GPT disks)
-├── partition-0.chd       # Partition 0 compressed data
-├── partition-0.chd.sha256  # or .crc32 depending on user choice
-├── partition-1.chd       # Partition 1 compressed data
-├── partition-1.chd.sha256
+├── partition-0.<ext>     # Partition 0 compressed data (.zst / .raw / .vhd)
+├── partition-0.<ext>.sha256  # or .crc32 depending on user choice
+├── partition-1.<ext>     # Partition 1 compressed data
+├── partition-1.<ext>.sha256
 └── bad-sectors.json      # List of bad sectors encountered (if any)
 ```
+
+Single-file CHD (CHD output):
+```
+backup-name/
+├── metadata.json          # Backup metadata (layout = "single-file-chd")
+├── mbr.json              # Human-readable MBR info (for MBR disks)
+├── gpt.json              # GPT partition table (for GPT disks)
+├── apm.json              # APM partition map (for APM disks)
+└── backup-name.chd       # Single coherent disk image (table + partitions)
+```
+
+In the single-file-CHD layout the `.chd` is a real disk image: partition
+table at sector 0, each partition at its declared offset, gaps and
+post-last-partition tail zero-filled. `metadata.partitions[i].file` is
+absent and `offset_in_disk` records each partition's byte range *inside
+the CHD's logical stream*. The container's SHA-1 + per-partition SHA-256
+checksums are kept up to date by edit mode and re-export. Splitting is
+disabled for CHD output (chdman/MAME load one file).
 
 2. **metadata.json structure**:
 ```json
