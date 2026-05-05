@@ -245,9 +245,6 @@ impl BrowseSession {
                 Err(e) => (None, None, Some(format!("Failed to get root: {e}"))),
             };
 
-            // Drop fs explicitly — BrowseView opens fresh instances per-op.
-            drop(fs);
-
             if let Ok(mut g) = status_thread.lock() {
                 g.phase = "Done".to_string();
                 g.fs_type = fs_type;
@@ -256,6 +253,7 @@ impl BrowseSession {
                 g.root = root;
                 g.root_entries = root_entries;
                 g.error = list_err;
+                g.fs = Some(fs);
                 g.finished = true;
             }
         });
@@ -304,9 +302,15 @@ impl BrowseSession {
 /// Shared state between the GUI and the [`BrowseSession::spawn_open`] worker.
 ///
 /// The worker fills these fields as it makes progress: phase strings while it
-/// runs, then the parsed metadata (or an error) on completion. The GUI clones
-/// the `Arc` and polls each frame until `finished` flips true, then drains the
-/// fields into its own `BrowseView` state.
+/// runs, then the parsed metadata + the live `Filesystem` instance on
+/// completion. The GUI clones the `Arc` and polls each frame until `finished`
+/// flips true, then drains the fields into its own `BrowseView` state.
+///
+/// The `fs` slot lets the GUI keep one open `Filesystem` alive across reads
+/// (per-file previews, directory listings) instead of re-opening — which on
+/// HFS+ volumes with hundreds of thousands of files means re-reading the
+/// entire 100+ MB catalog every time. Edits invalidate the cached instance
+/// because they go through `open_editable` and write back to disk.
 pub struct BrowseOpenStatus {
     pub phase: String,
     pub finished: bool,
@@ -316,6 +320,9 @@ pub struct BrowseOpenStatus {
     pub root: Option<FileEntry>,
     pub root_entries: Option<Vec<FileEntry>>,
     pub error: Option<String>,
+    /// The opened filesystem itself, handed back to the UI thread so it can
+    /// cache it. `None` if the open failed.
+    pub fs: Option<Box<dyn Filesystem>>,
 }
 
 impl BrowseOpenStatus {
@@ -329,6 +336,7 @@ impl BrowseOpenStatus {
             root: None,
             root_entries: None,
             error: None,
+            fs: None,
         }
     }
 }

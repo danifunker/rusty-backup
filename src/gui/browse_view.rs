@@ -137,6 +137,15 @@ pub struct BrowseView {
     /// state. Showing a spinner + phase here is much friendlier than freezing
     /// the UI for the seconds a 500k-file HFS+ open can take.
     pending_open: Option<Arc<Mutex<BrowseOpenStatus>>>,
+
+    /// One open `Filesystem` instance reused across read-only operations
+    /// (directory listings, file previews, fsck, tree dumps). Re-opening for
+    /// every operation forces a re-read of the entire catalog — fine for
+    /// FAT, slow for HFS+ on a heavily-used volume. Read-only paths borrow
+    /// this via `take_or_open_fs` and return it via `return_fs`. Any code
+    /// that mutates the volume (sync_metadata, archive recompress, edit
+    /// apply) calls `invalidate_cached_fs` so the next read sees disk truth.
+    cached_fs: Option<Box<dyn Filesystem>>,
 }
 
 /// State carried for the duration of a CHD edit-mode session.
@@ -276,6 +285,7 @@ impl Default for BrowseView {
             chd_flatten_progress: None,
             single_file_chd_backup_folder: None,
             pending_open: None,
+            cached_fs: None,
         }
     }
 }
@@ -508,6 +518,7 @@ impl BrowseView {
         // Detach any in-flight open worker. The thread keeps running but its
         // result will be dropped when the Arc dies on completion.
         self.pending_open = None;
+        self.cached_fs = None;
         // Clean up archive temp file if present
         if let Some(temp) = self.archive_temp_path.take() {
             let _ = std::fs::remove_file(&temp);
@@ -652,22 +663,25 @@ impl BrowseView {
 
             // Check filesystem button (HFS only for now)
             if self.fs_type == "HFS" && ui.button("Check").clicked() {
-                match self.session.open() {
-                    Ok(mut fs) => match fs.fsck() {
-                        Some(Ok(result)) => {
-                            self.fsck_result = Some(result);
-                            self.show_fsck_popup = true;
+                match self.take_or_open_fs() {
+                    Some(mut fs) => {
+                        match fs.fsck() {
+                            Some(Ok(result)) => {
+                                self.fsck_result = Some(result);
+                                self.show_fsck_popup = true;
+                            }
+                            Some(Err(e)) => {
+                                self.error = Some(format!("Filesystem check failed: {}", e));
+                            }
+                            None => {
+                                self.error =
+                                    Some("Filesystem check not supported for this type".into());
+                            }
                         }
-                        Some(Err(e)) => {
-                            self.error = Some(format!("Filesystem check failed: {}", e));
-                        }
-                        None => {
-                            self.error =
-                                Some("Filesystem check not supported for this type".into());
-                        }
-                    },
-                    Err(e) => {
-                        self.error = Some(format!("Failed to open filesystem: {}", e));
+                        self.return_fs(fs);
+                    }
+                    None => {
+                        self.error = Some("Failed to open filesystem".into());
                     }
                 }
             }
@@ -1091,7 +1105,7 @@ impl BrowseView {
     }
 
     fn load_directory(&mut self, entry: &FileEntry) {
-        if let Ok(mut fs) = self.session.open() {
+        if let Some(mut fs) = self.take_or_open_fs() {
             match fs.list_directory(entry) {
                 Ok(entries) => {
                     self.directory_cache.insert(entry.path.clone(), entries);
@@ -1100,6 +1114,7 @@ impl BrowseView {
                     self.error = Some(format!("Failed to read {}: {e}", entry.path));
                 }
             }
+            self.return_fs(fs);
         }
     }
 
@@ -1133,7 +1148,7 @@ impl BrowseView {
             return;
         }
 
-        if let Ok(mut fs) = self.session.open() {
+        if let Some(mut fs) = self.take_or_open_fs() {
             match fs.read_file(entry, MAX_PREVIEW_SIZE) {
                 Ok(data) => {
                     self.content = Some(detect_content_type(entry, &data));
@@ -1142,6 +1157,7 @@ impl BrowseView {
                     self.error = Some(format!("Failed to read file: {e}"));
                 }
             }
+            self.return_fs(fs);
         }
     }
 
@@ -3399,9 +3415,43 @@ impl BrowseView {
                     if let Some(err) = g.error.take() {
                         self.error = Some(err);
                     }
+                    // Hand the live filesystem into the read cache so we
+                    // don't re-open (and re-read the catalog) for the first
+                    // user action.
+                    self.cached_fs = g.fs.take();
                 }
             }
         }
+    }
+
+    /// Borrow the cached read-only filesystem, opening fresh if the cache is
+    /// empty. The caller MUST return the fs via [`return_fs`](Self::return_fs)
+    /// after use so subsequent calls can reuse it. Returning an `Option` (vs.
+    /// a `&mut`) keeps the borrow off `self` so callers can also mutate other
+    /// `BrowseView` fields in the same scope.
+    fn take_or_open_fs(&mut self) -> Option<Box<dyn Filesystem>> {
+        if let Some(fs) = self.cached_fs.take() {
+            return Some(fs);
+        }
+        match self.session.open() {
+            Ok(fs) => Some(fs),
+            Err(e) => {
+                log::debug!("session.open() failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Return a previously taken filesystem to the cache.
+    fn return_fs(&mut self, fs: Box<dyn Filesystem>) {
+        self.cached_fs = Some(fs);
+    }
+
+    /// Drop the cached filesystem so the next read re-opens from disk.
+    /// Call this whenever the underlying volume bytes may have changed
+    /// (after sync_metadata, archive recompress, etc.).
+    fn invalidate_cached_fs(&mut self) {
+        self.cached_fs = None;
     }
 
     fn poll_extraction(&mut self, ui: &egui::Ui) {
