@@ -56,6 +56,19 @@ pub struct BrowseSession {
     pub chd_edit_session: Option<Arc<Mutex<ChdEditSession>>>,
 }
 
+/// True when the session is opening an HFS+ (or HFSX, or APM Apple_HFS that
+/// may resolve to HFS+) partition. Used to selectively disable F_NOCACHE on
+/// macOS so the catalog B-tree reads can hit the buffer cache.
+#[cfg(target_os = "macos")]
+fn is_hfs_plus_partition(partition_type: u8, partition_type_string: Option<&str>) -> bool {
+    if let Some(s) = partition_type_string {
+        if matches!(s, "Apple_HFS" | "Apple_HFSX" | "Apple_HFS+") {
+            return true;
+        }
+    }
+    partition_type == 0xAF
+}
+
 impl BrowseSession {
     pub fn new() -> Self {
         Self::default()
@@ -98,6 +111,19 @@ impl BrowseSession {
         // devices (/dev/rdiskN) require sector-aligned seeks/reads.
         if let Some(arc) = &self.preopen_file {
             let file = arc.try_clone().map_err(FilesystemError::Io)?;
+            #[cfg(target_os = "macos")]
+            {
+                if is_hfs_plus_partition(self.partition_type, self.partition_type_string.as_deref())
+                {
+                    if let Err(e) = crate::os::macos::clear_nocache(&file) {
+                        log::debug!("clear_nocache failed (ignored): {e}");
+                    } else {
+                        log::debug!(
+                            "[HFS+ open] cleared F_NOCACHE on inspect fd to enable buffer cache"
+                        );
+                    }
+                }
+            }
             let reader = crate::os::SectorAlignedReader::new(file);
             return fs::open_filesystem(
                 reader,

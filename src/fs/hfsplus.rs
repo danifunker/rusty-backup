@@ -1464,16 +1464,40 @@ fn read_fork<R: Read + Seek>(
     let size = fork.logical_size as usize;
     let mut data = Vec::with_capacity(size);
 
-    for ext in &fork.extents {
+    let extent_count = fork.extents.iter().filter(|e| !e.is_empty()).count();
+    let t_total = std::time::Instant::now();
+    log::debug!(
+        "[HFS+ read_fork] start: logical_size={} bytes, inline_extents={}",
+        size,
+        extent_count
+    );
+
+    for (idx, ext) in fork.extents.iter().enumerate() {
         if ext.is_empty() {
             break;
         }
         let offset = partition_offset + ext.start_block as u64 * block_size as u64;
         let len = ext.block_count as u64 * block_size as u64;
-        reader.seek(SeekFrom::Start(offset))?;
         let read_len = len.min((size - data.len()) as u64) as usize;
+        let t_ext = std::time::Instant::now();
+        reader.seek(SeekFrom::Start(offset))?;
         let mut buf = vec![0u8; read_len];
         reader.read_exact(&mut buf)?;
+        let elapsed_ms = t_ext.elapsed().as_secs_f64() * 1000.0;
+        let mb = read_len as f64 / (1024.0 * 1024.0);
+        let mbps = if elapsed_ms > 0.0 {
+            mb / (elapsed_ms / 1000.0)
+        } else {
+            f64::INFINITY
+        };
+        log::debug!(
+            "[HFS+ read_fork] ext[{}]: offset={} bytes={} time={:.1}ms throughput={:.2} MB/s",
+            idx,
+            offset,
+            read_len,
+            elapsed_ms,
+            mbps
+        );
         data.extend_from_slice(&buf);
         if data.len() >= size {
             break;
@@ -1481,6 +1505,19 @@ fn read_fork<R: Read + Seek>(
     }
 
     data.truncate(size);
+    let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
+    let total_mb = size as f64 / (1024.0 * 1024.0);
+    let total_mbps = if total_ms > 0.0 {
+        total_mb / (total_ms / 1000.0)
+    } else {
+        f64::INFINITY
+    };
+    log::debug!(
+        "[HFS+ read_fork] done: {} bytes in {:.1}ms ({:.2} MB/s)",
+        size,
+        total_ms,
+        total_mbps
+    );
     Ok(data)
 }
 

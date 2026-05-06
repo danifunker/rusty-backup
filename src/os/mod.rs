@@ -82,6 +82,29 @@ impl<R: Read + Seek> Read for SectorAlignedReader<R> {
         if out.is_empty() {
             return Ok(0);
         }
+
+        // Fast path: when both the position and at least one sector's worth of
+        // the destination buffer are sector-aligned, read straight from the
+        // underlying device into the caller's slice. This avoids the 512-byte
+        // bounce buffer that would otherwise turn a single large read_exact
+        // (e.g. HFS+ catalog at ~200 MB) into hundreds of thousands of
+        // per-sector syscalls on `/dev/rdisk*`.
+        if self.pos % SECTOR_SIZE as u64 == 0 && out.len() >= SECTOR_SIZE {
+            let aligned_len = out.len() - (out.len() % SECTOR_SIZE);
+            self.inner.seek(SeekFrom::Start(self.pos))?;
+            let n = self.inner.read(&mut out[..aligned_len])?;
+            // The kernel may return a short read; only the part that landed
+            // on a sector boundary is safe to surface to the caller. Round
+            // down so the next call still starts sector-aligned.
+            let aligned_n = n - (n % SECTOR_SIZE);
+            self.pos += aligned_n as u64;
+            // Cached sector is now stale relative to the new position;
+            // force the slow path to re-fill on the next sub-sector read.
+            self.buf_sector_start = u64::MAX;
+            self.buf_valid = 0;
+            return Ok(aligned_n);
+        }
+
         let mut written = 0;
         while written < out.len() {
             self.fill_buf()?;
