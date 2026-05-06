@@ -43,6 +43,11 @@ pub struct InspectTab {
     /// fallback (which re-loads from shared state when the tab has no
     /// backup) doesn't immediately re-open what the user just closed.
     close_backup_requested: bool,
+    /// Set when a partition's `type_name` changes (e.g. a volume-label probe
+    /// finishes and appends the label). The next `show` consumes it to force
+    /// one extra repaint so the partition-table Grid re-measures column
+    /// widths instead of clipping the wider text.
+    partitions_layout_dirty: bool,
     /// Parsed partition table result
     partition_table: Option<PartitionTable>,
     /// Detected alignment
@@ -148,6 +153,7 @@ impl Default for InspectTab {
             image_format_label: None,
             backup_folder_path: None,
             close_backup_requested: false,
+            partitions_layout_dirty: false,
             partition_table: None,
             alignment: None,
             partitions: Vec::new(),
@@ -355,6 +361,21 @@ impl InspectTab {
         // Poll any pending per-partition minimum-size calculations
         self.poll_min_size_calcs(ctx);
         self.poll_volume_label_probes(ctx);
+
+        // Background workers (min-size + volume-label probes) finish off the
+        // GUI thread; without an explicit repaint request egui only paints
+        // on user input, so the labels would only appear when the mouse
+        // moves. Keep a short poll cadence while anything's pending, and
+        // pulse one extra repaint on the frame after a label arrives so
+        // the Grid re-measures the now-wider Type column.
+        if !self.pending_min_size_calcs.is_empty() || !self.pending_volume_label_probes.is_empty() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(80));
+        }
+        if self.partitions_layout_dirty {
+            self.partitions_layout_dirty = false;
+            ui.ctx().request_repaint();
+        }
 
         // Re-inspect + Export VHD buttons
         ui.horizontal(|ui| {
@@ -3051,6 +3072,7 @@ impl InspectTab {
                         if let Some(part) = self.partitions.iter_mut().find(|p| p.index == idx) {
                             if !part.type_name.trim_end().ends_with(label.as_str()) {
                                 part.type_name = format!("{} {}", part.type_name, label);
+                                self.partitions_layout_dirty = true;
                             }
                             ctx.log.info(format!("Partition {idx} label: {label}"));
                         }
