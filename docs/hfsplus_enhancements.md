@@ -137,7 +137,7 @@ Each step builds on the one before. Snapshot/rollback first because every other 
 
 ### Step 7 — Extents overflow B-tree write side
 
-- [ ] **Goal:** Files with more than 8 extents persist correctly via the extents-overflow B-tree (read side already exists at `read_fork_with_overflow`).
+- [x] **Goal:** Files with more than 8 extents persist correctly via the extents-overflow B-tree (read side already exists at `read_fork_with_overflow`).
 
 **Files:** `src/fs/hfsplus.rs`
 
