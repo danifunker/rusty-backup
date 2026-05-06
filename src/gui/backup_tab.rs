@@ -890,7 +890,10 @@ impl BackupTab {
                         &|_| {},
                     );
                     match result {
-                        fs::MinimumResult::Computed(Some(min_size)) => {
+                        fs::MinimumResult::Computed {
+                            in_place: Some(min_size),
+                            ..
+                        } => {
                             let clamped = min_size.min(part.size_bytes);
                             self.partition_min_sizes.insert(part.index, clamped);
                             ctx.log.info(format!(
@@ -900,7 +903,7 @@ impl BackupTab {
                                 partition::format_size(part.size_bytes),
                             ));
                         }
-                        fs::MinimumResult::Computed(None) => {}
+                        fs::MinimumResult::Computed { in_place: None, .. } => {}
                         fs::MinimumResult::Deferred { fs_name } => {
                             ctx.log.info(format!(
                                 "Partition {}: need to calculate minimum size due to filesystem {fs_name} (click \"Calc min\" to compute)",

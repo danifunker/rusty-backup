@@ -21,8 +21,13 @@ pub struct MinSizeStatus {
     /// Latest phase reported by `partition_minimum_size` (e.g. "Opening filesystem...").
     pub phase: String,
     pub finished: bool,
-    /// `Some(bytes)` on successful computation; `None` if the FS could not be opened.
+    /// In-place trim point (no data moved). `Some(bytes)` on successful computation;
+    /// `None` if the FS could not be opened.
     pub result: Option<u64>,
+    /// Defragmented minimum (size the volume would shrink to after a packed clone).
+    /// Equals `result` for filesystems without a clone path; only meaningfully
+    /// smaller for HFS+ on fragmented volumes.
+    pub defragmented_min: Option<u64>,
     pub error: Option<String>,
 }
 
@@ -33,6 +38,7 @@ impl MinSizeStatus {
             phase: "Starting...".to_string(),
             finished: false,
             result: None,
+            defragmented_min: None,
             error: None,
         }
     }
@@ -133,7 +139,13 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
 
         if let Ok(mut s) = status_thread.lock() {
             match result {
-                MinimumResult::Computed(m) => s.result = m,
+                MinimumResult::Computed {
+                    in_place,
+                    defragmented,
+                } => {
+                    s.result = in_place;
+                    s.defragmented_min = defragmented;
+                }
                 MinimumResult::Deferred { fs_name } => {
                     s.error = Some(format!(
                         "internal: partition_minimum_size deferred unexpectedly ({fs_name})"

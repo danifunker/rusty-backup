@@ -2642,6 +2642,7 @@ mod tests {
                     is_logical: false,
                     partition_type_string: None,
                     minimum_size_bytes: None,
+                    defragmented_min_size_bytes: None,
                 })
                 .collect(),
             bad_sectors: vec![],
@@ -2770,6 +2771,7 @@ mod tests {
                     is_logical: false,
                     partition_type_string: None,
                     minimum_size_bytes: None,
+                    defragmented_min_size_bytes: None,
                 })
                 .collect(),
             bad_sectors: vec![],
@@ -2937,6 +2939,7 @@ mod tests {
                     is_logical: false,
                     partition_type_string: None,
                     minimum_size_bytes: None,
+                    defragmented_min_size_bytes: None,
                 })
                 .collect(),
             bad_sectors: vec![],

@@ -65,8 +65,12 @@ pub struct InspectTab {
     export_partition_configs: Vec<PartitionExportConfig>,
     /// VHD export background thread status
     export_status: Option<Arc<Mutex<ExportStatus>>>,
-    /// Filesystem-computed minimum partition sizes (partition index → bytes)
+    /// Filesystem-computed in-place minimum partition sizes (partition index → bytes).
+    /// "In-place" = the smallest size achievable by trim alone, no data movement.
     partition_min_sizes: HashMap<usize, u64>,
+    /// Defragmented minimum (after a clone-shrink). Only populated for
+    /// HFS+ where it can differ meaningfully from `partition_min_sizes`.
+    partition_defrag_min_sizes: HashMap<usize, u64>,
     /// Partitions whose minimum size requires an expensive volume walk; the
     /// per-row UI surfaces a "Calc min" button that spawns a worker.
     deferred_min_sizes: HashMap<usize, &'static str>,
@@ -146,6 +150,7 @@ impl Default for InspectTab {
             export_partition_configs: Vec::new(),
             export_status: None,
             partition_min_sizes: HashMap::new(),
+            partition_defrag_min_sizes: HashMap::new(),
             deferred_min_sizes: HashMap::new(),
             pending_min_size_calcs: HashMap::new(),
             clonezilla_image: None,
@@ -199,6 +204,7 @@ impl InspectTab {
         self.alignment = None;
         self.browse_view.close();
         self.partition_min_sizes.clear();
+        self.partition_defrag_min_sizes.clear();
         self.deferred_min_sizes.clear();
         self.pending_min_size_calcs.clear();
         self.clonezilla_image = None;
@@ -1519,6 +1525,8 @@ impl InspectTab {
                 self.alignment = status.alignment.take();
                 self.partitions = std::mem::take(&mut status.partitions);
                 self.partition_min_sizes = std::mem::take(&mut status.partition_min_sizes);
+                self.partition_defrag_min_sizes =
+                    std::mem::take(&mut status.partition_defrag_min_sizes);
                 self.deferred_min_sizes = std::mem::take(&mut status.deferred_min_sizes);
                 self.image_format_label = status.format_label.take();
                 // macOS only: capture the open device fd + guard so BrowseView
@@ -1579,6 +1587,7 @@ impl InspectTab {
         self.last_error = None;
         self.image_format_label = None;
         self.partition_min_sizes.clear();
+        self.partition_defrag_min_sizes.clear();
         self.deferred_min_sizes.clear();
         self.pending_min_size_calcs.clear();
         self.clonezilla_image = None;
@@ -1708,6 +1717,7 @@ impl InspectTab {
             alignment: None,
             partitions: Vec::new(),
             partition_min_sizes: HashMap::new(),
+            partition_defrag_min_sizes: HashMap::new(),
             deferred_min_sizes: HashMap::new(),
             format_label: None,
             device_file: None,
@@ -1986,6 +1996,7 @@ impl InspectTab {
                     // Deferred and are surfaced in the UI as a per-row button.
                     set_step("Analyzing filesystem sizes...");
                     let mut partition_min_sizes = HashMap::new();
+                    let mut partition_defrag_min_sizes: HashMap<usize, u64> = HashMap::new();
                     let mut deferred_min_sizes: HashMap<usize, &'static str> = HashMap::new();
                     for part in &partitions {
                         if part.is_extended_container {
@@ -2035,9 +2046,18 @@ impl InspectTab {
                             }
                         };
                         match result {
-                            rusty_backup::fs::MinimumResult::Computed(Some(min_size)) => {
+                            rusty_backup::fs::MinimumResult::Computed {
+                                in_place: Some(min_size),
+                                defragmented,
+                            } => {
                                 let clamped = min_size.min(part.size_bytes);
                                 partition_min_sizes.insert(part.index, clamped);
+                                if let Some(d) = defragmented {
+                                    let d_clamped = d.min(part.size_bytes);
+                                    if d_clamped < clamped {
+                                        partition_defrag_min_sizes.insert(part.index, d_clamped);
+                                    }
+                                }
                                 push_log(format!(
                                     "Partition {}: minimum size {} (original {})",
                                     part.index,
@@ -2045,7 +2065,9 @@ impl InspectTab {
                                     rusty_backup::partition::format_size(part.size_bytes),
                                 ));
                             }
-                            rusty_backup::fs::MinimumResult::Computed(None) => {}
+                            rusty_backup::fs::MinimumResult::Computed {
+                                in_place: None, ..
+                            } => {}
                             rusty_backup::fs::MinimumResult::Deferred { fs_name } => {
                                 push_log(format!(
                                     "Partition {}: need to calculate minimum size due to filesystem {fs_name} (click \"Calc min\" to compute)",
@@ -2062,6 +2084,7 @@ impl InspectTab {
                         s.alignment = Some(alignment);
                         s.partitions = partitions;
                         s.partition_min_sizes = partition_min_sizes;
+                        s.partition_defrag_min_sizes = partition_defrag_min_sizes;
                         s.deferred_min_sizes = deferred_min_sizes;
                         // On macOS, pass the open fd + claim to the main thread
                         // so BrowseView can reuse it without re-opening/re-prompting.
@@ -2337,7 +2360,24 @@ impl InspectTab {
                                         .filter(|&sz| sz < part.size_bytes)
                                 });
                             if let Some(sz) = min_size {
-                                ui.label(partition::format_size(sz));
+                                let defrag = self
+                                    .partition_defrag_min_sizes
+                                    .get(&part.index)
+                                    .copied()
+                                    .filter(|&d| d < sz);
+                                if let Some(d) = defrag {
+                                    ui.label(format!(
+                                        "{} / {} defrag",
+                                        partition::format_size(sz),
+                                        partition::format_size(d),
+                                    ))
+                                    .on_hover_text(
+                                        "Left = trim only; right = if cloned into a blank \
+                                         volume during backup.",
+                                    );
+                                } else {
+                                    ui.label(partition::format_size(sz));
+                                }
                             } else if let Some(pending) =
                                 self.pending_min_size_calcs.get(&part.index)
                             {
@@ -2856,10 +2896,27 @@ impl InspectTab {
                             .unwrap_or(min);
                         let clamped = min.min(part_size);
                         self.partition_min_sizes.insert(idx, clamped);
-                        ctx.log.info(format!(
-                            "Partition {idx}: minimum size {} (computed)",
-                            partition::format_size(clamped),
-                        ));
+                        if let Some(d) = s.defragmented_min {
+                            let d_clamped = d.min(part_size);
+                            if d_clamped < clamped {
+                                self.partition_defrag_min_sizes.insert(idx, d_clamped);
+                                ctx.log.info(format!(
+                                    "Partition {idx}: minimum size {} (computed); defragmented {}",
+                                    partition::format_size(clamped),
+                                    partition::format_size(d_clamped),
+                                ));
+                            } else {
+                                ctx.log.info(format!(
+                                    "Partition {idx}: minimum size {} (computed)",
+                                    partition::format_size(clamped),
+                                ));
+                            }
+                        } else {
+                            ctx.log.info(format!(
+                                "Partition {idx}: minimum size {} (computed)",
+                                partition::format_size(clamped),
+                            ));
+                        }
                     } else {
                         ctx.log.info(format!(
                             "Partition {idx}: filesystem could not be opened for minimum-size calculation",

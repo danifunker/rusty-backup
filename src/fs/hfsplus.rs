@@ -1368,6 +1368,24 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
         }
     }
 
+    fn defragmented_minimum_size(&mut self) -> Result<u64, FilesystemError> {
+        // After a packed clone the volume holds:
+        //   - boot blocks + primary VH (in allocation block 0)
+        //   - all currently-allocated user data + B-tree files + bitmap
+        //   - the alternate VH at the last 1024 bytes of the volume
+        //
+        // The source's bitmap already counts allocation block 0 (boot+VH) and
+        // the last 1-2 blocks (alt-VH) as allocated, so used_blocks covers all
+        // structural overhead in the source. The new alt-VH on the target
+        // lives at the end of the smaller image — we add 1024 bytes to make
+        // sure the rounded-up image is large enough to host it.
+        let block_size = self.vh.block_size as u64;
+        let used_blocks = self.vh.total_blocks.saturating_sub(self.vh.free_blocks) as u64;
+        let used_bytes = used_blocks * block_size;
+        let with_alt_vh = used_bytes.saturating_add(1024);
+        Ok(with_alt_vh.div_ceil(block_size) * block_size)
+    }
+
     fn write_resource_fork_to(
         &mut self,
         entry: &FileEntry,
@@ -1718,18 +1736,36 @@ fn read_node_from_fork<R: Read + Seek>(
 }
 
 /// Probe an HFS+ volume header at `partition_offset` and return the volume
-/// label (root folder thread name) without loading the full catalog.
+/// label without loading the full catalog.
+///
+/// The volume name lives in the *key* of the root folder record at
+/// `(parent=1, name=<vol_name>)`. Catalog records are sorted primarily by
+/// parent CNID (ascending u32), and `parent=1` is smaller than every other
+/// parent in the catalog — so the root folder record is guaranteed to be
+/// record 0 of the first leaf node. We don't need to look at the root
+/// thread record at all (it sorts after every `parent=1` and `parent=2`
+/// non-thread record, and on a volume with many top-level entries it can
+/// spill into a later leaf — which is what was causing this probe to come
+/// back empty for real volumes).
 ///
 /// Reads node 0 (the B-tree header) and the first leaf node of the catalog
-/// file directly from disk via the fork's inline extents — typically two
-/// small reads. Returns None if the partition doesn't hold an HFS+/HFSX
-/// volume, or the root thread record isn't where it should be (the empty
-/// name sorts first, so it lives in record 0 of the first leaf node).
+/// directly via the catalog fork's inline extents — typically two small
+/// reads. Returns None if the partition doesn't hold an HFS+/HFSX volume.
 pub fn probe_hfsplus_volume_label<R: Read + Seek>(
     reader: &mut R,
     partition_offset: u64,
 ) -> Option<String> {
-    reader.seek(SeekFrom::Start(partition_offset + 1024)).ok()?;
+    // APM "Apple_HFS" partitions can be pure classic HFS, native HFS+, or
+    // **HFS-wrapped HFS+** (the legacy hybrid where a classic HFS MDB at
+    // partition_offset+1024 carries `drEmbedSigWord=0x482B` and points at
+    // the embedded HFS+ region somewhere inside the partition). The wrapper
+    // case is the failure mode we hit on real volumes — `resolve_apple_hfs`
+    // returns the embedded HFS+ offset for all three cases.
+    let (fs_type, hfsplus_offset) = super::resolve_apple_hfs(reader, partition_offset);
+    if fs_type != "hfsplus" {
+        return None;
+    }
+    reader.seek(SeekFrom::Start(hfsplus_offset + 1024)).ok()?;
     let mut vh_buf = [0u8; 512];
     reader.read_exact(&mut vh_buf).ok()?;
     let vh = HfsPlusVolumeHeader::parse(&vh_buf).ok()?;
@@ -1744,7 +1780,7 @@ pub fn probe_hfsplus_volume_label<R: Read + Seek>(
     let probe_size = (vh.block_size as usize).clamp(512, 32 * 1024);
     let node0 = read_node_from_fork(
         reader,
-        partition_offset,
+        hfsplus_offset,
         vh.block_size,
         &vh.catalog_file,
         0,
@@ -1759,11 +1795,11 @@ pub fn probe_hfsplus_volume_label<R: Read + Seek>(
         return None;
     }
 
-    // Read the first leaf node and look at its first record. The root thread
-    // (parent=2, name="") sorts before all other records in the catalog.
+    // Read the first leaf node. Record 0 is the root folder record whose key
+    // is (parent=1, nameLength, name in UTF-16BE).
     let leaf = read_node_from_fork(
         reader,
-        partition_offset,
+        hfsplus_offset,
         vh.block_size,
         &vh.catalog_file,
         header.first_leaf_node,
@@ -1773,50 +1809,40 @@ pub fn probe_hfsplus_volume_label<R: Read + Seek>(
         return None;
     }
     let num_records = BigEndian::read_u16(&leaf[10..12]) as usize;
-    for i in 0..num_records {
-        let (rec_start, rec_end) = super::hfs_common::btree_record_range(&leaf, node_size, i);
-        if rec_start >= rec_end || rec_end > node_size {
-            continue;
-        }
-        let rec = &leaf[rec_start..rec_end];
-        if rec.len() < 8 {
-            continue;
-        }
-        let key_len = BigEndian::read_u16(&rec[0..2]) as usize;
-        if key_len < 6 || 2 + key_len > rec.len() {
-            continue;
-        }
-        let parent_id = BigEndian::read_u32(&rec[2..6]);
-        if parent_id != 2 {
-            continue;
-        }
-        let name_length = BigEndian::read_u16(&rec[6..8]) as usize;
-        if name_length != 0 {
-            continue;
-        }
-        let mut data_start = 2 + key_len;
-        if !data_start.is_multiple_of(2) {
-            data_start += 1;
-        }
-        if data_start + 10 > rec.len() {
-            continue;
-        }
-        let record_type = BigEndian::read_i16(&rec[data_start..data_start + 2]);
-        if record_type != 3 {
-            continue;
-        }
-        let thread_name_len = BigEndian::read_u16(&rec[data_start + 8..data_start + 10]) as usize;
-        let body_start = data_start + 10;
-        let body_end = body_start + thread_name_len * 2;
-        if body_end > rec.len() {
-            continue;
-        }
-        let label = decode_utf16be(&rec[body_start..body_end]);
-        if !label.is_empty() {
-            return Some(label);
-        }
+    if num_records == 0 {
+        return None;
     }
-    None
+    let (rec_start, rec_end) = super::hfs_common::btree_record_range(&leaf, node_size, 0);
+    if rec_start >= rec_end || rec_end > node_size {
+        return None;
+    }
+    let rec = &leaf[rec_start..rec_end];
+    if rec.len() < 8 {
+        return None;
+    }
+    let key_len = BigEndian::read_u16(&rec[0..2]) as usize;
+    if key_len < 6 || 2 + key_len > rec.len() {
+        return None;
+    }
+    let parent_id = BigEndian::read_u32(&rec[2..6]);
+    if parent_id != 1 {
+        return None;
+    }
+    let name_length = BigEndian::read_u16(&rec[6..8]) as usize;
+    if name_length == 0 {
+        return None;
+    }
+    let body_start = 8;
+    let body_end = body_start + name_length * 2;
+    if body_end > rec.len() || body_end > 2 + key_len {
+        return None;
+    }
+    let label = decode_utf16be(&rec[body_start..body_end]);
+    if label.is_empty() {
+        None
+    } else {
+        Some(label)
+    }
 }
 
 /// Write data through a fork's extent descriptors.
@@ -1908,29 +1934,28 @@ fn find_volume_label(catalog_data: &[u8], header: &BTreeHeaderRecord) -> String 
 }
 
 /// Find the index of the last set bit in a bitmap (MSB-first).
+///
+/// MSB-first means bit position 7 of byte N (mask 0x80) corresponds to
+/// global index `N*8`, and bit position 0 (mask 0x01) to global index
+/// `N*8 + 7`. The "last" set bit is the one with the highest global index.
 fn find_last_set_bit(bitmap: &[u8], max_bits: u32) -> Option<u32> {
-    // Scan from the end for efficiency
-    let last_byte = (max_bits as usize).min(bitmap.len() * 8).div_ceil(8);
-    for byte_idx in (0..last_byte.min(bitmap.len())).rev() {
-        if bitmap[byte_idx] == 0 {
+    let max = max_bits as usize;
+    let scan_bytes = max.div_ceil(8).min(bitmap.len());
+    for byte_idx in (0..scan_bytes).rev() {
+        let byte = bitmap[byte_idx];
+        if byte == 0 {
             continue;
         }
-        // Find highest set bit in this byte
-        for bit in 0..8 {
-            let global_bit = byte_idx * 8 + bit;
-            if global_bit >= max_bits as usize {
+        // Within the byte, the highest global index belongs to the lowest
+        // bit position (LSB). Iterate bit positions 0..8 ascending and
+        // return the first set one in range.
+        for bit_pos in 0..8u32 {
+            let global = (byte_idx as u32) * 8 + (7 - bit_pos);
+            if global >= max_bits {
                 continue;
             }
-            let bit_val = 7 - bit; // MSB-first
-            if (bitmap[byte_idx] >> bit_val) & 1 == 1 {
-                // This byte has set bits — but we need the *last* one globally
-                // Since we're scanning bytes from end, find last bit in this byte
-                for b2 in (0..8).rev() {
-                    let global_bit2 = byte_idx * 8 + (7 - b2);
-                    if global_bit2 < max_bits as usize && (bitmap[byte_idx] >> b2) & 1 == 1 {
-                        return Some(global_bit2 as u32);
-                    }
-                }
+            if (byte >> bit_pos) & 1 == 1 {
+                return Some(global);
             }
         }
     }
@@ -2623,6 +2648,23 @@ mod tests {
     }
 
     #[test]
+    fn test_find_last_set_bit_dense_byte() {
+        // Regression: when the highest non-zero byte has multiple set bits,
+        // the result must be the highest global index in that byte, not the
+        // lowest. 0b11111100 has bits 0..=5 set (MSB-first), so the answer
+        // is 5, not 0.
+        assert_eq!(find_last_set_bit(&[0b11111100], 8), Some(5));
+        assert_eq!(find_last_set_bit(&[0b11111111], 8), Some(7));
+        assert_eq!(find_last_set_bit(&[0b00000001], 8), Some(7));
+        assert_eq!(find_last_set_bit(&[0b10000000], 8), Some(0));
+        // Multi-byte: byte 0 dense, byte 1 zero — answer is in byte 0.
+        assert_eq!(find_last_set_bit(&[0b11111100, 0b00000000], 16), Some(5));
+        // Bound clipping: 0b11111111 with max_bits=4 → only bits 0..=3 are
+        // valid; the highest-valid one is 3.
+        assert_eq!(find_last_set_bit(&[0b11111111], 4), Some(3));
+    }
+
+    #[test]
     fn test_volume_header_serialize_roundtrip() {
         let mut data = [0u8; 512];
         BigEndian::write_u16(&mut data[0..2], HFS_PLUS_SIGNATURE);
@@ -2868,6 +2910,198 @@ mod tests {
         img
     }
 
+    /// Build a minimal HFS+ image whose first leaf node holds the root folder
+    /// record at `(parent=1, name=<volume_name>)` followed by N synthetic
+    /// "child" records keyed by `(parent=2, name=childN)` — pushing the root
+    /// thread record `(parent=2, name="")` into a later leaf. This mirrors
+    /// the failure mode `probe_hfsplus_volume_label` had on real volumes
+    /// where many top-level entries existed under the root.
+    fn make_hfsplus_image_with_label(volume_name: &str, num_children: usize) -> Vec<u8> {
+        let block_size = 4096u32;
+        let total_blocks = 256u32;
+        let image_size = total_blocks as usize * block_size as usize;
+        let mut img = vec![0u8; image_size];
+
+        // Layout: block 0 (VH region), block 1 (bitmap), blocks 2..=5 (catalog, 4 nodes).
+        let bitmap_block = 1u32;
+        let catalog_start_block = 2u32;
+        let catalog_blocks = 4u32;
+        // Bitmap byte 0 = 0b11111100 (blocks 0..=5 allocated).
+        img[bitmap_block as usize * block_size as usize] = 0b11111100;
+
+        let node_size = 4096usize;
+        let catalog_offset = catalog_start_block as usize * block_size as usize;
+
+        // Node 0: header.
+        let hdr = catalog_offset;
+        img[hdr + 8] = 1; // kind = header
+        BigEndian::write_u16(&mut img[hdr + 10..hdr + 12], 3);
+        let hr = hdr + 14;
+        BigEndian::write_u16(&mut img[hr..hr + 2], 1); // depth
+        BigEndian::write_u32(&mut img[hr + 2..hr + 6], 1); // root_node = 1 (first leaf)
+        BigEndian::write_u32(&mut img[hr + 6..hr + 10], (1 + num_children + 1) as u32);
+        BigEndian::write_u32(&mut img[hr + 10..hr + 14], 1); // first_leaf
+                                                             // Probe only ever reads the first leaf, so last_leaf can be anything ≥ 1.
+        BigEndian::write_u32(&mut img[hr + 14..hr + 18], 2);
+        BigEndian::write_u16(&mut img[hr + 18..hr + 20], node_size as u16);
+        BigEndian::write_u16(&mut img[hr + 20..hr + 22], 516);
+        BigEndian::write_u32(&mut img[hr + 22..hr + 26], 4);
+        BigEndian::write_u32(&mut img[hr + 26..hr + 30], 0);
+        // Header offset table.
+        let ot = hdr + node_size;
+        BigEndian::write_u16(&mut img[ot - 2..ot], 14); // header rec
+        BigEndian::write_u16(&mut img[ot - 4..ot - 2], 142); // user data
+        BigEndian::write_u16(&mut img[ot - 6..ot - 4], 270); // bitmap
+        BigEndian::write_u16(&mut img[ot - 8..ot - 6], 526); // free space
+
+        // Node 1: first leaf. Record 0 = root folder record at
+        // (parent=1, name=<volume_name>). The probe reads the volume name
+        // from this record's key alone.
+        let leaf = catalog_offset + node_size;
+        img[leaf + 8] = 0xFF; // kind = -1 (leaf)
+        img[leaf + 9] = 1; // height
+        let total_recs = 1 + num_children;
+        BigEndian::write_u16(&mut img[leaf + 10..leaf + 12], total_recs as u16);
+
+        // Record 0: root folder record key `(parent=1, name_len=N, name)` +
+        // a 88-byte folder data payload.
+        let name_units: Vec<u16> = volume_name.encode_utf16().collect();
+        let name_bytes = name_units.len() * 2;
+        let r0 = leaf + 14;
+        let key_len = 6 + name_bytes; // parent(4) + name_len(2) + name
+        BigEndian::write_u16(&mut img[r0..r0 + 2], key_len as u16);
+        BigEndian::write_u32(&mut img[r0 + 2..r0 + 6], 1); // parent = 1
+        BigEndian::write_u16(&mut img[r0 + 6..r0 + 8], name_units.len() as u16);
+        for (i, u) in name_units.iter().enumerate() {
+            BigEndian::write_u16(&mut img[r0 + 8 + i * 2..r0 + 10 + i * 2], *u);
+        }
+        let r0_data = r0 + 2 + key_len + ((2 + key_len) % 2); // 2-byte align
+        BigEndian::write_i16(&mut img[r0_data..r0_data + 2], CATALOG_FOLDER);
+        BigEndian::write_u32(&mut img[r0_data + 8..r0_data + 12], 2); // folderID
+
+        // Records 1..=N: synthetic child records keyed by (parent=2, name="cN")
+        // so the root thread (parent=2, name="") gets pushed past the first leaf.
+        // Using the smallest plausible record (we don't actually open the FS
+        // here, just probe), so payload size doesn't matter beyond bounds.
+        let mut rec_offsets = vec![14u16];
+        let mut cursor = r0_data + 88;
+        for i in 0..num_children {
+            let child_name = format!("c{i}");
+            let cn_units: Vec<u16> = child_name.encode_utf16().collect();
+            let key_len = 6 + cn_units.len() * 2;
+            let off = cursor;
+            BigEndian::write_u16(&mut img[off..off + 2], key_len as u16);
+            BigEndian::write_u32(&mut img[off + 2..off + 6], 2);
+            BigEndian::write_u16(&mut img[off + 6..off + 8], cn_units.len() as u16);
+            for (j, u) in cn_units.iter().enumerate() {
+                BigEndian::write_u16(&mut img[off + 8 + j * 2..off + 10 + j * 2], *u);
+            }
+            // 2-byte aligned data offset, minimal 4-byte folder-record stub
+            // (the probe never inspects it).
+            let data = off + 2 + key_len + ((2 + key_len) % 2);
+            BigEndian::write_i16(&mut img[data..data + 2], CATALOG_FOLDER);
+            rec_offsets.push((off - leaf) as u16);
+            cursor = data + 88;
+        }
+
+        // Offset table at end of leaf, MSB-first record-offset slots.
+        let lot = leaf + node_size;
+        for (i, off) in rec_offsets.iter().enumerate() {
+            BigEndian::write_u16(&mut img[lot - 2 - i * 2..lot - i * 2], *off);
+        }
+        BigEndian::write_u16(
+            &mut img[lot - 2 - rec_offsets.len() * 2..lot - rec_offsets.len() * 2],
+            (cursor - leaf) as u16,
+        );
+
+        // Volume header.
+        let vh = HfsPlusVolumeHeader {
+            signature: HFS_PLUS_SIGNATURE,
+            version: 4,
+            attributes: 0,
+            last_mounted_version: 0,
+            journal_info_block: 0,
+            create_date: 0,
+            modify_date: 0,
+            backup_date: 0,
+            checked_date: 0,
+            file_count: 0,
+            folder_count: num_children as u32,
+            block_size,
+            total_blocks,
+            free_blocks: total_blocks - 6,
+            next_allocation: 6,
+            rsrc_clump_size: 0,
+            data_clump_size: 0,
+            next_catalog_id: (16 + num_children) as u32,
+            write_count: 0,
+            encodings_bitmap: 0,
+            finder_info: [0; 8],
+            allocation_file: ForkData {
+                logical_size: block_size as u64,
+                clump_size: 0,
+                total_blocks: 1,
+                extents: {
+                    let mut e = [ExtentDescriptor {
+                        start_block: 0,
+                        block_count: 0,
+                    }; 8];
+                    e[0] = ExtentDescriptor {
+                        start_block: bitmap_block,
+                        block_count: 1,
+                    };
+                    e
+                },
+            },
+            extents_file: ForkData::empty(),
+            catalog_file: ForkData {
+                logical_size: (catalog_blocks as u64) * (block_size as u64),
+                clump_size: 0,
+                total_blocks: catalog_blocks,
+                extents: {
+                    let mut e = [ExtentDescriptor {
+                        start_block: 0,
+                        block_count: 0,
+                    }; 8];
+                    e[0] = ExtentDescriptor {
+                        start_block: catalog_start_block,
+                        block_count: catalog_blocks,
+                    };
+                    e
+                },
+            },
+            attributes_file: ForkData::empty(),
+            startup_file: ForkData::empty(),
+        };
+        let vh_bytes = vh.serialize();
+        img[1024..1024 + 512].copy_from_slice(&vh_bytes);
+        let alt = image_size - 1024;
+        img[alt..alt + 512].copy_from_slice(&vh_bytes);
+        img
+    }
+
+    #[test]
+    fn test_probe_hfsplus_volume_label_reads_from_root_key() {
+        // Volume name lives in the root folder record's key, even when the
+        // first leaf is dominated by `parent=2` child records that push the
+        // root thread out of the first leaf. This is the regression case
+        // that broke the probe on real volumes like Ariel-backup.
+        let img = make_hfsplus_image_with_label("Ariel-backup", 20);
+        let mut cursor = std::io::Cursor::new(img);
+        let label = probe_hfsplus_volume_label(&mut cursor, 0);
+        assert_eq!(label.as_deref(), Some("Ariel-backup"));
+    }
+
+    #[test]
+    fn test_probe_hfsplus_volume_label_short_name() {
+        let img = make_hfsplus_image_with_label("X", 0);
+        let mut cursor = std::io::Cursor::new(img);
+        assert_eq!(
+            probe_hfsplus_volume_label(&mut cursor, 0).as_deref(),
+            Some("X")
+        );
+    }
+
     #[test]
     fn test_hfsplus_editable_open_and_free_space() {
         let img = make_editable_hfsplus_image();
@@ -2878,6 +3112,63 @@ mod tests {
         assert!(free > 0);
         // 250 free blocks × 4096 = 1,024,000
         assert_eq!(free, 250 * 4096);
+    }
+
+    #[test]
+    fn test_hfsplus_defragmented_minimum_size() {
+        // The synthetic image has 256 blocks of 4096 bytes total, with 6
+        // blocks allocated near the front (VH/bitmap/catalog) and 250 free.
+        let img = make_editable_hfsplus_image();
+        let cursor = std::io::Cursor::new(img);
+        let mut fs = HfsPlusFilesystem::open(cursor, 0).unwrap();
+
+        let total = fs.total_size();
+        let in_place = fs.last_data_byte().unwrap();
+        let defrag = fs.defragmented_minimum_size().unwrap();
+
+        assert_eq!(total, 256 * 4096);
+        // Last allocated block is 5 (bits 0..=5 set in bitmap byte 0) →
+        // byte (5+1) * 4096 = 24 KiB.
+        assert_eq!(in_place, 6 * 4096);
+        // Defrag = 6 used blocks * 4096 + 1024 bytes alt-VH, rounded up to a
+        // 4096-byte block = 7 blocks.
+        assert_eq!(defrag, 7 * 4096);
+        assert!(defrag <= total);
+    }
+
+    #[test]
+    fn test_hfsplus_defragmented_min_smaller_on_fragmented() {
+        // Take the synthetic image and forge an extra allocation near the END
+        // of the bitmap. The in-place trim point must hug the tail; the
+        // defragmented minimum must reflect *only* the allocated count, not
+        // the position — that's the whole point of the metric.
+        let mut img = make_editable_hfsplus_image();
+        let block_size = 4096usize;
+        // Mark block 200 allocated (MSB-first bitmap, byte index 25, bit 0
+        // -> shift 7 to set the most-significant bit).
+        let bitmap_byte = block_size + 25; // bitmap lives in block 1
+        img[bitmap_byte] |= 0b1000_0000;
+        // Reflect the change in the VH so the defragmented calc sees one
+        // fewer free block.
+        let free_off = 1024 + 48;
+        let free = BigEndian::read_u32(&img[free_off..free_off + 4]);
+        BigEndian::write_u32(&mut img[free_off..free_off + 4], free - 1);
+        // Mirror the change to the alternate VH at the tail.
+        let image_size = img.len();
+        let alt_free_off = image_size - 1024 + 48;
+        BigEndian::write_u32(&mut img[alt_free_off..alt_free_off + 4], free - 1);
+
+        let cursor = std::io::Cursor::new(img);
+        let mut fs = HfsPlusFilesystem::open(cursor, 0).unwrap();
+
+        let in_place = fs.last_data_byte().unwrap();
+        let defrag = fs.defragmented_minimum_size().unwrap();
+
+        // In-place trim hugs the new tail allocation: byte (200+1)*4096.
+        assert_eq!(in_place, 201 * 4096);
+        // Defrag: 7 used blocks * 4096 + 1024 alt-VH, rounded up = 8 blocks.
+        assert_eq!(defrag, 8 * 4096);
+        assert!(defrag < in_place);
     }
 
     #[test]

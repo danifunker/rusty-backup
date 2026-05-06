@@ -467,10 +467,42 @@ pub fn effective_partition_size<R: Read + Seek + Send + 'static>(
     fs.last_data_byte().ok()
 }
 
+/// Calculate the defragmented minimum size for a partition — the smallest
+/// size the partition could shrink to **after a clone-into-blank**.
+///
+/// For most filesystems this matches `effective_partition_size` (no clone
+/// path); for HFS+ on fragmented volumes it can be substantially smaller.
+/// Returns `None` if the filesystem can't be opened or doesn't override
+/// the trait default. See `Filesystem::defragmented_minimum_size`.
+pub fn defragmented_partition_size<R: Read + Seek + Send + 'static>(
+    reader: R,
+    partition_offset: u64,
+    partition_type: u8,
+    partition_type_string: Option<&str>,
+) -> Option<u64> {
+    let mut fs = open_filesystem(
+        reader,
+        partition_offset,
+        partition_type,
+        partition_type_string,
+    )
+    .ok()?;
+    fs.defragmented_minimum_size().ok()
+}
+
 /// Outcome of a `partition_minimum_size` call.
 pub enum MinimumResult {
     /// The minimum was computed (or determined to be unavailable for this FS type).
-    Computed(Option<u64>),
+    ///
+    /// `in_place` is the smallest size achievable without moving any data
+    /// (trim only). `defragmented` is the smallest size achievable if the
+    /// volume were cloned into a fresh, packed target — for HFS+ this can
+    /// be substantially smaller on aged/fragmented volumes; for every other
+    /// filesystem it equals `in_place`.
+    Computed {
+        in_place: Option<u64>,
+        defragmented: Option<u64>,
+    },
     /// This filesystem requires an expensive volume walk and the caller did not
     /// opt in via `allow_expensive`. The caller should surface a UI affordance
     /// (e.g. a "Calculate minimum size" button) and re-invoke with `true`.
@@ -546,11 +578,24 @@ pub fn partition_minimum_size<R: Read + Seek + Send + 'static>(
         partition_type_string,
     ) {
         Ok(fs) => fs,
-        Err(_) => return MinimumResult::Computed(None),
+        Err(_) => {
+            return MinimumResult::Computed {
+                in_place: None,
+                defragmented: None,
+            };
+        }
     };
     progress("Computing last data byte...");
-    let min = fs.last_data_byte().ok().map(|m| m.min(partition_size));
-    MinimumResult::Computed(min)
+    let in_place = fs.last_data_byte().ok().map(|m| m.min(partition_size));
+    progress("Computing defragmented minimum...");
+    let defragmented = fs
+        .defragmented_minimum_size()
+        .ok()
+        .map(|m| m.min(partition_size));
+    MinimumResult::Computed {
+        in_place,
+        defragmented,
+    }
 }
 
 /// Open a filesystem for browsing within a partition.
@@ -995,7 +1040,10 @@ fn compact_partition_reader_by_string<R: Read + Seek + Send + 'static>(
 /// - Embedded HFS+ (HFS wrapper with 0x4244 MDB, drEmbedSigWord == 0x482B): `hfsplus_offset`
 ///   is calculated from the MDB's drAlBlSt/drAlBlkSiz/drEmbedExtent fields.
 /// - Pure HFS (0x4244, no embedded HFS+): returns `"hfs"`.
-fn resolve_apple_hfs<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> (&'static str, u64) {
+pub(crate) fn resolve_apple_hfs<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+) -> (&'static str, u64) {
     // The HFS MDB / HFS+ volume header sits at partition_offset + 1024 (sector-aligned).
     // Read 512 bytes (one sector) — all required fields are within the first 512 bytes
     // of the MDB (largest field needed is drEmbedExtent.startBlock at MDB offset 127).

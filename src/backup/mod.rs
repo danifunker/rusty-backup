@@ -499,6 +499,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         stream_sizes,
         compact_sizes,
         minimum_sizes,
+        defragmented_min_sizes,
         is_layout_preserving_flags,
     } = sizes::analyze_partitions(
         source.get_ref(),
@@ -884,6 +885,12 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         );
 
         let minimum_size = minimum_sizes[part_idx].filter(|&s| s < part.size_bytes);
+        let defragmented_min = defragmented_min_sizes[part_idx]
+            .filter(|&s| s < part.size_bytes)
+            .filter(|&d| match minimum_size {
+                Some(m) => d < m,
+                None => true,
+            });
         partition_metadata.push(PartitionMetadata {
             index: part.index,
             type_name: part.type_name.clone(),
@@ -898,6 +905,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             is_logical: part.is_logical,
             partition_type_string: part.partition_type_string.clone(),
             minimum_size_bytes: minimum_size,
+            defragmented_min_size_bytes: defragmented_min,
         });
     }
 
@@ -1090,6 +1098,7 @@ fn run_single_file_chd_path(
                 is_logical: part.is_logical,
                 partition_type_string: part.partition_type_string.clone(),
                 minimum_size_bytes: None,
+                defragmented_min_size_bytes: None,
             })
         })
         .collect();

@@ -111,6 +111,13 @@ pub struct PartitionMetadata {
     /// `original_size_bytes` (layout-preserving or sector-by-sector backups).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub minimum_size_bytes: Option<u64>,
+    /// Smallest size the partition could shrink to **after a defragmenting
+    /// clone** — only meaningfully different from `minimum_size_bytes` for
+    /// HFS+ on fragmented volumes. Restore offers this number when the user
+    /// selects "Restore from defrag-clone" (see Phase 8). `None` for
+    /// filesystems without a clone-shrink path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defragmented_min_size_bytes: Option<u64>,
 }
 
 /// Partition alignment information for the backup.
@@ -216,6 +223,7 @@ mod tests {
                 is_logical: false,
                 partition_type_string: None,
                 minimum_size_bytes: Some(480_000_000),
+                defragmented_min_size_bytes: None,
             }],
             bad_sectors: vec![],
             extended_container: None,
@@ -230,6 +238,74 @@ mod tests {
         assert_eq!(parsed.partitions[0].index, 0);
         assert_eq!(parsed.alignment.first_partition_lba, 63);
         assert!(parsed.bad_sectors.is_empty());
+    }
+
+    #[test]
+    fn test_defragmented_min_size_round_trip() {
+        // Round-trip serialize+deserialize with a populated and a None
+        // defragmented_min_size_bytes. Confirms `#[serde(default)]` lets old
+        // metadata (without the field) load without breaking.
+        let mut meta = sample_metadata();
+        meta.partitions[0].defragmented_min_size_bytes = Some(1_234_567_890);
+
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(json.contains("defragmented_min_size_bytes"));
+        let parsed: BackupMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.partitions[0].defragmented_min_size_bytes,
+            Some(1_234_567_890)
+        );
+
+        // Now drop the field from the JSON entirely (simulating a backup
+        // produced before this change) and verify it loads as None.
+        let stripped = json.replace(",\n  \"defragmented_min_size_bytes\": 1234567890", "");
+        let stripped = stripped.replace(",\"defragmented_min_size_bytes\":1234567890", "");
+        let reparsed: BackupMetadata = serde_json::from_str(&stripped).unwrap();
+        assert_eq!(reparsed.partitions[0].defragmented_min_size_bytes, None);
+    }
+
+    fn sample_metadata() -> BackupMetadata {
+        BackupMetadata {
+            version: 1,
+            created: "2026-05-06T00:00:00Z".to_string(),
+            source_device: "/dev/disk2".to_string(),
+            source_size_bytes: 1_000_000_000,
+            partition_table_type: "MBR".to_string(),
+            checksum_type: "sha256".to_string(),
+            compression_type: "zstd".to_string(),
+            split_size_mib: None,
+            sector_by_sector: false,
+            container_logical_size: None,
+            container_sha1: None,
+            size_policy: None,
+            alignment: AlignmentMetadata {
+                detected_type: "DosTraditional".to_string(),
+                first_partition_lba: 63,
+                alignment_sectors: 63,
+                heads: 255,
+                sectors_per_track: 63,
+            },
+            partitions: vec![PartitionMetadata {
+                index: 0,
+                type_name: "HFS+".to_string(),
+                partition_type_byte: 0xAF,
+                start_lba: 63,
+                original_size_bytes: 1_000_000_000,
+                imaged_size_bytes: 1_000_000_000,
+                compressed_files: vec![],
+                checksum: "abc".to_string(),
+                resized: false,
+                compacted: true,
+                is_logical: false,
+                partition_type_string: None,
+                minimum_size_bytes: Some(900_000_000),
+                defragmented_min_size_bytes: None,
+            }],
+            bad_sectors: vec![],
+            extended_container: None,
+            layout: BackupLayout::PerPartition,
+            container: None,
+        }
     }
 
     #[test]
@@ -301,6 +377,7 @@ mod tests {
                 is_logical: false,
                 partition_type_string: None,
                 minimum_size_bytes: Some(500_000_000),
+                defragmented_min_size_bytes: None,
             }],
             bad_sectors: vec![],
             extended_container: None,

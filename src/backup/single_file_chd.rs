@@ -2082,6 +2082,7 @@ mod tests {
                 is_logical: false,
                 partition_type_string: None,
                 minimum_size_bytes: None,
+                defragmented_min_size_bytes: None,
             }],
             bad_sectors: vec![],
             extended_container: None,
