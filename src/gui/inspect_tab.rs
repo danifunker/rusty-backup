@@ -3070,8 +3070,9 @@ impl InspectTab {
                         ));
                     } else if let Some(label) = s.label.clone() {
                         if let Some(part) = self.partitions.iter_mut().find(|p| p.index == idx) {
-                            if !part.type_name.trim_end().ends_with(label.as_str()) {
-                                part.type_name = format!("{} {}", part.type_name, label);
+                            let new_name = apply_volume_label(&part.type_name, &label);
+                            if part.type_name != new_name {
+                                part.type_name = new_name;
                                 self.partitions_layout_dirty = true;
                             }
                             ctx.log.info(format!("Partition {idx} label: {label}"));
@@ -3737,6 +3738,38 @@ fn format_block_size(bytes: u32) -> String {
     }
 }
 
+/// Apply a probed volume label to a partition's `type_name`, replacing any
+/// trailing parenthetical garbage that older metadata.json files baked in.
+///
+/// Old backups can carry `type_name` strings like
+/// `Apple_HFS (HFS+) (Apple_HFS (HFS+)_Untitled_1)` because the inspect-tab
+/// relabel logic that produces them ran before the auto-generated APM-name
+/// suppression existed. Once we have a real volume label from a fresh probe,
+/// the noise parenthetical adds no information — strip it and append the
+/// label so the row reads `Apple_HFS (HFS+) Ariel-backup`.
+fn apply_volume_label(type_name: &str, label: &str) -> String {
+    let trimmed = strip_apm_noise_parenthetical(type_name);
+    if trimmed.trim_end().ends_with(label) {
+        trimmed.to_string()
+    } else {
+        format!("{} {}", trimmed.trim_end(), label)
+    }
+}
+
+/// Drop any trailing parenthetical that lives *after* the variant tag for
+/// HFS-family type names. `Apple_HFS (HFS+) (Untitled_1)` -> `Apple_HFS (HFS+)`,
+/// `Apple_HFS (HFSX) (whatever)` -> `Apple_HFS (HFSX)`, leave non-HFS rows
+/// alone.
+fn strip_apm_noise_parenthetical(s: &str) -> String {
+    for tag in ["(HFS+)", "(HFSX)", "(HFS)"] {
+        if let Some(idx) = s.find(tag) {
+            let end = idx + tag.len();
+            return s[..end].to_string();
+        }
+    }
+    s.to_string()
+}
+
 /// Format a byte count with digit grouping for readability
 /// (e.g. 1,048,576).
 fn format_bytes_grouped(bytes: u64) -> String {
@@ -3749,4 +3782,56 @@ fn format_bytes_grouped(bytes: u64) -> String {
         result.push(ch);
     }
     result.chars().rev().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_volume_label_strips_legacy_apm_garbage() {
+        // Old metadata carried a doubly-nested parenthetical from the days
+        // before the relabel logic suppressed Disk-Utility-default names.
+        assert_eq!(
+            apply_volume_label(
+                "Apple_HFS (HFS+) (Apple_HFS (HFS+)_Untitled_1)",
+                "Ariel-backup",
+            ),
+            "Apple_HFS (HFS+) Ariel-backup",
+        );
+    }
+
+    #[test]
+    fn apply_volume_label_appends_to_clean_name() {
+        assert_eq!(
+            apply_volume_label("Apple_HFS (HFS+)", "Ariel-backup"),
+            "Apple_HFS (HFS+) Ariel-backup",
+        );
+    }
+
+    #[test]
+    fn apply_volume_label_idempotent_when_already_present() {
+        assert_eq!(
+            apply_volume_label("Apple_HFS (HFS+) Ariel-backup", "Ariel-backup"),
+            "Apple_HFS (HFS+) Ariel-backup",
+        );
+    }
+
+    #[test]
+    fn apply_volume_label_handles_hfsx_and_classic_hfs() {
+        assert_eq!(
+            apply_volume_label("Apple_HFS (HFSX) (Untitled_2)", "Foo"),
+            "Apple_HFS (HFSX) Foo",
+        );
+        assert_eq!(
+            apply_volume_label("Apple_HFS (HFS) (Old)", "Bar"),
+            "Apple_HFS (HFS) Bar",
+        );
+    }
+
+    #[test]
+    fn apply_volume_label_non_hfs_left_alone() {
+        // No HFS variant tag found -> nothing to strip; just append.
+        assert_eq!(apply_volume_label("Linux", "label"), "Linux label");
+    }
 }
