@@ -113,7 +113,7 @@ impl ForkData {
 }
 
 /// HFS+ Volume Header (512 bytes at partition_offset + 1024).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct HfsPlusVolumeHeader {
     signature: u16,
@@ -254,7 +254,7 @@ impl BTreeNodeDescriptor {
 }
 
 /// B-tree header record (after the node descriptor in node 0).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct BTreeHeaderRecord {
     depth: u16,
@@ -367,11 +367,34 @@ pub struct HfsPlusFilesystem<R: Read + Seek> {
     /// Cached extents-overflow B-tree file data (None until first fragmented
     /// fork forces it to load; stays None on volumes with no overflow file).
     extents_overflow_data: Option<Vec<u8>>,
+    /// Cached attributes B-tree file data. `None` until Phase 5 (xattr
+    /// write path) populates it; included in the snapshot now so
+    /// rollback semantics are forward-compatible.
+    attributes_data: Option<Vec<u8>>,
     /// Set of CNIDs that own at least one record in the attributes B-tree
     /// (extended attributes). Populated only by `prepare_for_edit` — `None`
     /// for read-only opens. Until the xattr write path lands (Phase 5 of
     /// `docs/hfsplus_enhancements.md`), `delete_entry` refuses any CNID in
     /// this set so we don't silently leave dangling attribute records.
+    xattr_cnids: Option<HashSet<u32>>,
+}
+
+/// Snapshot of every byte/value an HFS+ mutation can touch — taken at the
+/// start of each `EditableFilesystem` method so a mid-flight failure can
+/// rewind to byte-identical pre-call state instead of leaving the catalog
+/// half-applied.
+///
+/// Forward-compatible with Phase 5 (attributes B-tree write side) — the
+/// `attributes_data` slot is captured today even though it's always `None`
+/// until xattr writes ship.
+#[derive(Debug, Clone)]
+pub struct HfsPlusSnapshot {
+    vh: HfsPlusVolumeHeader,
+    catalog_data: Vec<u8>,
+    catalog_header: BTreeHeaderRecord,
+    bitmap: Option<Vec<u8>>,
+    extents_overflow_data: Option<Vec<u8>>,
+    attributes_data: Option<Vec<u8>>,
     xattr_cnids: Option<HashSet<u32>>,
 }
 
@@ -485,8 +508,37 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
             label,
             bitmap: None,
             extents_overflow_data,
+            attributes_data: None,
             xattr_cnids: None,
         })
+    }
+
+    /// Capture the full mutable state for snapshot/rollback. Cheap on the
+    /// scale of a single mutation: catalog + bitmap clone is O(volume
+    /// metadata size), not O(volume size).
+    pub fn snapshot(&self) -> HfsPlusSnapshot {
+        HfsPlusSnapshot {
+            vh: self.vh.clone(),
+            catalog_data: self.catalog_data.clone(),
+            catalog_header: self.catalog_header.clone(),
+            bitmap: self.bitmap.clone(),
+            extents_overflow_data: self.extents_overflow_data.clone(),
+            attributes_data: self.attributes_data.clone(),
+            xattr_cnids: self.xattr_cnids.clone(),
+        }
+    }
+
+    /// Restore previously captured state. Used by the snapshot guard
+    /// around every `EditableFilesystem` mutation when the body returns
+    /// `Err`.
+    pub fn restore_snapshot(&mut self, snap: HfsPlusSnapshot) {
+        self.vh = snap.vh;
+        self.catalog_data = snap.catalog_data;
+        self.catalog_header = snap.catalog_header;
+        self.bitmap = snap.bitmap;
+        self.extents_overflow_data = snap.extents_overflow_data;
+        self.attributes_data = snap.attributes_data;
+        self.xattr_cnids = snap.xattr_cnids;
     }
 
     /// Sanity-check the volume for edit-mode compatibility and pre-load the
@@ -920,12 +972,14 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
                 }
             },
         );
-        if let Some(val_offset) = val_offset {
-            let old_val = BigEndian::read_u32(&self.catalog_data[val_offset..val_offset + 4]);
-            let new_val = (old_val as i64 + delta as i64).max(0) as u32;
-            BigEndian::write_u32(&mut self.catalog_data[val_offset..val_offset + 4], new_val);
-        }
-        // If we can't find it, that's not fatal (could be root with no visible record)
+        let val_offset = val_offset.ok_or_else(|| {
+            FilesystemError::NotFound(format!(
+                "folder record for parent CNID {parent_cnid} not found in catalog"
+            ))
+        })?;
+        let old_val = BigEndian::read_u32(&self.catalog_data[val_offset..val_offset + 4]);
+        let new_val = (old_val as i64 + delta as i64).max(0) as u32;
+        BigEndian::write_u32(&mut self.catalog_data[val_offset..val_offset + 4], new_val);
         let _ = node_idx; // suppress warning
         Ok(())
     }
@@ -2057,6 +2111,96 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsPlusFilesystem<R> 
         data_len: u64,
         options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
+        let snap = self.snapshot();
+        let result = self.create_file_inner(parent, name, data, data_len, options);
+        if result.is_err() {
+            self.restore_snapshot(snap);
+        }
+        result
+    }
+
+    fn create_directory(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        options: &CreateDirectoryOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        let snap = self.snapshot();
+        let result = self.create_directory_inner(parent, name, options);
+        if result.is_err() {
+            self.restore_snapshot(snap);
+        }
+        result
+    }
+
+    fn delete_entry(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+    ) -> Result<(), FilesystemError> {
+        let snap = self.snapshot();
+        let result = self.delete_entry_inner(parent, entry);
+        if result.is_err() {
+            self.restore_snapshot(snap);
+        }
+        result
+    }
+
+    fn set_type_creator(
+        &mut self,
+        entry: &FileEntry,
+        type_code: &str,
+        creator_code: &str,
+    ) -> Result<(), FilesystemError> {
+        let snap = self.snapshot();
+        let result = self.set_type_creator_inner(entry, type_code, creator_code);
+        if result.is_err() {
+            self.restore_snapshot(snap);
+        }
+        result
+    }
+
+    fn write_resource_fork(
+        &mut self,
+        entry: &FileEntry,
+        data: &mut dyn std::io::Read,
+        len: u64,
+    ) -> Result<(), FilesystemError> {
+        let snap = self.snapshot();
+        let result = self.write_resource_fork_inner(entry, data, len);
+        if result.is_err() {
+            self.restore_snapshot(snap);
+        }
+        result
+    }
+
+    fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
+        self.do_sync_metadata()
+    }
+
+    fn free_space(&mut self) -> Result<u64, FilesystemError> {
+        Ok(self.vh.free_blocks as u64 * self.vh.block_size as u64)
+    }
+
+    fn set_blessed_folder(&mut self, entry: &FileEntry) -> Result<(), FilesystemError> {
+        let snap = self.snapshot();
+        let result = self.set_blessed_folder_inner(entry);
+        if result.is_err() {
+            self.restore_snapshot(snap);
+        }
+        result
+    }
+}
+
+impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
+    fn create_file_inner(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        data: &mut dyn std::io::Read,
+        data_len: u64,
+        options: &CreateFileOptions,
+    ) -> Result<FileEntry, FilesystemError> {
         let parent_cnid = parent.location as u32;
 
         validate_hfsplus_create_name(name)?;
@@ -2165,7 +2309,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsPlusFilesystem<R> 
         Ok(fe)
     }
 
-    fn create_directory(
+    fn create_directory_inner(
         &mut self,
         parent: &FileEntry,
         name: &str,
@@ -2226,7 +2370,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsPlusFilesystem<R> 
         ))
     }
 
-    fn delete_entry(
+    fn delete_entry_inner(
         &mut self,
         parent: &FileEntry,
         entry: &FileEntry,
@@ -2292,7 +2436,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsPlusFilesystem<R> 
         Ok(())
     }
 
-    fn set_type_creator(
+    fn set_type_creator_inner(
         &mut self,
         entry: &FileEntry,
         type_code: &str,
@@ -2346,7 +2490,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsPlusFilesystem<R> 
         Ok(())
     }
 
-    fn write_resource_fork(
+    fn write_resource_fork_inner(
         &mut self,
         entry: &FileEntry,
         data: &mut dyn std::io::Read,
@@ -2403,15 +2547,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsPlusFilesystem<R> 
         Ok(())
     }
 
-    fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
-        self.do_sync_metadata()
-    }
-
-    fn free_space(&mut self) -> Result<u64, FilesystemError> {
-        Ok(self.vh.free_blocks as u64 * self.vh.block_size as u64)
-    }
-
-    fn set_blessed_folder(&mut self, entry: &FileEntry) -> Result<(), FilesystemError> {
+    fn set_blessed_folder_inner(&mut self, entry: &FileEntry) -> Result<(), FilesystemError> {
         if !entry.is_directory() {
             return Err(FilesystemError::InvalidData(
                 "can only bless a directory".into(),
@@ -3230,6 +3366,44 @@ mod tests {
             .expect("clean volume should accept edit prep");
         // No xattrs on the synthetic image — the cached set is empty.
         assert!(fs.xattr_cnids.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_snapshot_rollback_on_disk_full_create_file() {
+        // The synthetic editable image has 250 free 4 KiB blocks. Asking
+        // create_file for 251 blocks' worth of data should trip the
+        // allocator's DiskFull and the snapshot guard must rewind every
+        // mutation made before the failure (next_catalog_id bump, bitmap
+        // dirty load, etc.).
+        let img = make_editable_hfsplus_image();
+        let cursor = std::io::Cursor::new(img);
+        let mut fs = HfsPlusFilesystem::open(cursor, 0).unwrap();
+        fs.prepare_for_edit().unwrap();
+
+        let next_cnid_before = fs.vh.next_catalog_id;
+        let free_blocks_before = fs.vh.free_blocks;
+        let file_count_before = fs.vh.file_count;
+        let catalog_before = fs.catalog_data.clone();
+
+        let root = fs.root().unwrap();
+        let big_len: u64 = 251 * 4096 + 1; // exceeds the 250 free blocks
+        let big_buf = vec![0u8; big_len as usize];
+        let mut reader = std::io::Cursor::new(big_buf);
+        let err = fs
+            .create_file(
+                &root,
+                "too-big.bin",
+                &mut reader,
+                big_len,
+                &CreateFileOptions::default(),
+            )
+            .expect_err("create_file should fail with DiskFull");
+        assert!(matches!(err, FilesystemError::DiskFull(_)), "got {err:?}");
+
+        assert_eq!(fs.vh.next_catalog_id, next_cnid_before);
+        assert_eq!(fs.vh.free_blocks, free_blocks_before);
+        assert_eq!(fs.vh.file_count, file_count_before);
+        assert_eq!(fs.catalog_data, catalog_before);
     }
 
     #[test]
