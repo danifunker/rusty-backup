@@ -9,7 +9,7 @@ use super::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
 };
 use super::hfs_common::{
-    self, bitmap_clear_bit_be, bitmap_find_clear_run_be, bitmap_set_bit_be, btree_free_node,
+    self, bitmap_clear_bit_be, bitmap_collect_clear_runs_be, bitmap_set_bit_be, btree_free_node,
     btree_grow_root, btree_insert_into_index, btree_insert_record, btree_remove_record,
     btree_split_leaf_with_insert, BTreeHeader,
 };
@@ -1169,20 +1169,77 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
         Ok(())
     }
 
-    /// Allocate `count` contiguous blocks from the allocation bitmap.
-    /// Returns the start block index.
-    fn allocate_blocks(&mut self, count: u32) -> Result<u32, FilesystemError> {
-        self.ensure_bitmap()?;
-        let bitmap = self.bitmap.as_mut().unwrap();
-        let start =
-            bitmap_find_clear_run_be(bitmap, self.vh.total_blocks, count).ok_or_else(|| {
-                FilesystemError::DiskFull(format!("cannot find {} contiguous free blocks", count))
-            })?;
-        for i in 0..count {
-            bitmap_set_bit_be(bitmap, start + i);
+    /// Allocate `blocks_needed` blocks from the allocation bitmap, possibly
+    /// across multiple non-contiguous extents.
+    ///
+    /// Strategy: greedy largest-run-first — collect every clear run, sort by
+    /// length descending, take a prefix of each run until the request is
+    /// satisfied. This avoids `DiskFull` on volumes that have plenty of free
+    /// space but no contiguous run large enough for the whole request.
+    ///
+    /// On success the bitmap is updated, `vh.free_blocks` is decremented,
+    /// and `vh.next_allocation` is set to the byte just past the last
+    /// extent so the next allocation starts looking forward instead of
+    /// re-scanning the same area.
+    fn allocate_extents(
+        &mut self,
+        blocks_needed: u32,
+    ) -> Result<Vec<ExtentDescriptor>, FilesystemError> {
+        if blocks_needed == 0 {
+            return Ok(Vec::new());
         }
-        self.vh.free_blocks -= count;
-        Ok(start)
+        self.ensure_bitmap()?;
+        let total_blocks = self.vh.total_blocks;
+        let bitmap = self.bitmap.as_mut().unwrap();
+
+        // Quick total-free check before any scan: if free_blocks < requested
+        // we cannot possibly satisfy the request, regardless of layout.
+        if self.vh.free_blocks < blocks_needed {
+            return Err(FilesystemError::DiskFull(format!(
+                "{} blocks free, {} requested",
+                self.vh.free_blocks, blocks_needed
+            )));
+        }
+
+        let mut runs = bitmap_collect_clear_runs_be(bitmap, total_blocks);
+        // Largest run first, ties broken by lower start (deterministic).
+        runs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+
+        let mut extents: Vec<ExtentDescriptor> = Vec::new();
+        let mut remaining = blocks_needed;
+        let mut last_end = 0u32;
+        for (start, len) in runs {
+            if remaining == 0 {
+                break;
+            }
+            let take = len.min(remaining);
+            extents.push(ExtentDescriptor {
+                start_block: start,
+                block_count: take,
+            });
+            for i in 0..take {
+                bitmap_set_bit_be(bitmap, start + i);
+            }
+            remaining -= take;
+            last_end = start + take;
+        }
+
+        if remaining > 0 {
+            // Roll back any partial allocation before reporting failure so
+            // the bitmap stays consistent for the snapshot guard.
+            for ext in &extents {
+                for i in 0..ext.block_count {
+                    bitmap_clear_bit_be(bitmap, ext.start_block + i);
+                }
+            }
+            return Err(FilesystemError::DiskFull(format!(
+                "needed {blocks_needed} blocks, short by {remaining} after gathering all free runs"
+            )));
+        }
+
+        self.vh.free_blocks -= blocks_needed;
+        self.vh.next_allocation = last_end;
+        Ok(extents)
     }
 
     /// Free `count` blocks starting at `start`.
@@ -1207,6 +1264,12 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
     }
 
     /// Write file data to allocated blocks. Returns the ForkData describing the allocation.
+    ///
+    /// Allocates via `allocate_extents`, so the result may span up to 8
+    /// non-contiguous runs (the inline-extent capacity in HFS+). Anything
+    /// beyond 8 extents is rejected here until Step 7 (extents-overflow
+    /// write side) lands — this keeps Step 6 a layout-only change with no
+    /// catalog/B-tree side effects.
     fn write_data_to_blocks(
         &mut self,
         data: &mut dyn std::io::Read,
@@ -1217,35 +1280,55 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
         }
         let block_size = self.vh.block_size as u64;
         let blocks_needed = data_len.div_ceil(block_size) as u32;
-        let start_block = self.allocate_blocks(blocks_needed)?;
+        let extents = self.allocate_extents(blocks_needed)?;
 
-        // Write data block by block
+        if extents.len() > 8 {
+            // Roll back the allocation we just took before bailing — the
+            // snapshot guard will rewind everything else, but the bitmap
+            // mutation came from inside `allocate_extents` and snapshot
+            // already captured the pre-call bitmap, so this is just here
+            // to keep the in-flight error path clean.
+            for ext in &extents {
+                for i in 0..ext.block_count {
+                    bitmap_clear_bit_be(self.bitmap.as_mut().unwrap(), ext.start_block + i);
+                }
+            }
+            self.vh.free_blocks += blocks_needed;
+            return Err(FilesystemError::Unsupported(format!(
+                "file needs {} extents but extents-overflow B-tree write side is not yet implemented",
+                extents.len()
+            )));
+        }
+
+        // Stream the data block-by-block, walking the extent vec in order.
         let mut buf = vec![0u8; block_size as usize];
         let mut remaining = data_len;
-        for i in 0..blocks_needed {
-            let to_read = remaining.min(block_size) as usize;
-            buf[..to_read].fill(0);
-            data.read_exact(&mut buf[..to_read]).map_err(|e| {
-                FilesystemError::Io(std::io::Error::new(
-                    e.kind(),
-                    format!("reading file data: {e}"),
-                ))
-            })?;
-            // Zero-pad the rest of the block
-            if to_read < block_size as usize {
-                buf[to_read..].fill(0);
+        'outer: for ext in &extents {
+            for i in 0..ext.block_count {
+                if remaining == 0 {
+                    break 'outer;
+                }
+                let to_read = remaining.min(block_size) as usize;
+                data.read_exact(&mut buf[..to_read]).map_err(|e| {
+                    FilesystemError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!("reading file data: {e}"),
+                    ))
+                })?;
+                if to_read < block_size as usize {
+                    buf[to_read..].fill(0);
+                }
+                self.write_block(ext.start_block + i, &buf)?;
+                remaining -= to_read as u64;
             }
-            self.write_block(start_block + i, &buf)?;
-            remaining -= to_read as u64;
         }
 
         let mut fork = ForkData::empty();
         fork.logical_size = data_len;
         fork.total_blocks = blocks_needed;
-        fork.extents[0] = ExtentDescriptor {
-            start_block,
-            block_count: blocks_needed,
-        };
+        for (slot, ext) in fork.extents.iter_mut().zip(extents.iter()) {
+            *slot = *ext;
+        }
         Ok(fork)
     }
 
@@ -3366,6 +3449,67 @@ mod tests {
             .expect("clean volume should accept edit prep");
         // No xattrs on the synthetic image — the cached set is empty.
         assert!(fs.xattr_cnids.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_allocate_extents_fragmented_bitmap() {
+        // Pre-fragment the synthetic volume so 4 free blocks exist as four
+        // 1-block runs (blocks 7, 9, 11, 13). Asking for 4 must return four
+        // single-block extents and the data must round-trip byte-equal.
+        let img = make_editable_hfsplus_image();
+        let cursor = std::io::Cursor::new(img);
+        let mut fs = HfsPlusFilesystem::open(cursor, 0).unwrap();
+        fs.prepare_for_edit().unwrap();
+
+        // Force the bitmap to load, then rewrite it. Block 0 = first byte
+        // (bits 0..=7 = blocks 0..=7); we want blocks 0..=255 all allocated
+        // EXCEPT 7, 9, 11, 13.
+        fs.ensure_bitmap().unwrap();
+        let bitmap = fs.bitmap.as_mut().unwrap();
+        for byte in bitmap.iter_mut().take(32) {
+            *byte = 0xFF;
+        }
+        // Clear blocks 7, 9, 11, 13.
+        for blk in [7u32, 9, 11, 13] {
+            bitmap_clear_bit_be(bitmap, blk);
+        }
+        fs.vh.free_blocks = 4;
+
+        let block_size = fs.vh.block_size as usize;
+        let payload: Vec<u8> = (0..(4 * block_size)).map(|i| (i % 251) as u8).collect();
+        let mut reader = std::io::Cursor::new(payload.clone());
+        let root = fs.root().unwrap();
+        let entry = fs
+            .create_file(
+                &root,
+                "frag.bin",
+                &mut reader,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("fragmented allocation should succeed");
+
+        let cnid = entry.location as u32;
+        let (data_fork, _rsrc) = fs.find_file_by_id(cnid).expect("file record present");
+
+        // 4 single-block extents in slots 0..3.
+        for (i, expected_start) in [7u32, 9, 11, 13].iter().enumerate() {
+            assert_eq!(data_fork.extents[i].block_count, 1, "slot {i}");
+            assert_eq!(
+                data_fork.extents[i].start_block, *expected_start,
+                "slot {i}"
+            );
+        }
+        for slot in &data_fork.extents[4..] {
+            assert!(slot.is_empty(), "slot past 4 should be empty");
+        }
+        assert_eq!(data_fork.total_blocks, 4);
+
+        // Read it back and confirm byte-equal.
+        let mut got = Vec::new();
+        fs.write_file_to(&entry, &mut got).unwrap();
+        assert_eq!(got, payload);
+        assert_eq!(fs.vh.free_blocks, 0);
     }
 
     #[test]

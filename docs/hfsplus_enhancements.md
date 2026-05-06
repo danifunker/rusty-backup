@@ -123,7 +123,7 @@ Each step builds on the one before. Snapshot/rollback first because every other 
 
 ### Step 6 — Fragmented block allocation
 
-- [ ] **Goal:** `allocate_blocks` no longer fails with `DiskFull` when free space exists but isn't contiguous.
+- [x] **Goal:** `allocate_blocks` no longer fails with `DiskFull` when free space exists but isn't contiguous.
 
 **Files:** `src/fs/hfsplus.rs`
 
