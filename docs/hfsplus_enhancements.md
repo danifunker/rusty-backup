@@ -84,7 +84,7 @@ One step, lands before any other write-side work so existing edit mode stops cor
 
 ### Step 4 — Refuse edits on journaled / xattr-bearing volumes (defensive)
 
-- [ ] **Goal:** Until the proper xattr B-tree write side (Phase 5) and journal replay (deferred) ship, return a clear error rather than corrupting metadata. The xattr half of this guard is removed in Step 13; the journaled half stays until journal replay ships separately.
+- [x] **Goal:** Until the proper xattr B-tree write side (Phase 5) and journal replay (deferred) ship, return a clear error rather than corrupting metadata. The xattr half of this guard is removed in Step 13; the journaled half stays until journal replay ships separately.
 
 **Files:** `src/fs/hfsplus.rs`, `src/gui/browse_view.rs` (error surface)
 

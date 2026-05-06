@@ -1,5 +1,6 @@
 use byteorder::{BigEndian, ByteOrder};
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom, Write};
 use unicode_normalization::UnicodeNormalization;
 
@@ -22,6 +23,12 @@ const HFSX_SIGNATURE: u16 = 0x4858;
 const HFSPLUS_EXTENTS_FILE_ID: u32 = 3;
 const HFSPLUS_CATALOG_FILE_ID: u32 = 4;
 const HFSPLUS_ALLOCATION_FILE_ID: u32 = 6;
+const HFSPLUS_ATTRIBUTES_FILE_ID: u32 = 8;
+
+/// Volume attribute bit (`vh.attributes`) set when the volume carries a
+/// journal. We refuse to enter edit mode on these volumes until journal
+/// replay is implemented — see Step 4 of `docs/hfsplus_enhancements.md`.
+const HFSPLUS_VOLUME_JOURNALED_BIT: u32 = 0x2000;
 
 /// Fork-type byte used in extents-overflow keys.
 const HFSPLUS_FORK_DATA: u8 = 0x00;
@@ -360,6 +367,12 @@ pub struct HfsPlusFilesystem<R: Read + Seek> {
     /// Cached extents-overflow B-tree file data (None until first fragmented
     /// fork forces it to load; stays None on volumes with no overflow file).
     extents_overflow_data: Option<Vec<u8>>,
+    /// Set of CNIDs that own at least one record in the attributes B-tree
+    /// (extended attributes). Populated only by `prepare_for_edit` — `None`
+    /// for read-only opens. Until the xattr write path lands (Phase 5 of
+    /// `docs/hfsplus_enhancements.md`), `delete_entry` refuses any CNID in
+    /// this set so we don't silently leave dangling attribute records.
+    xattr_cnids: Option<HashSet<u32>>,
 }
 
 impl<R: Read + Seek> HfsPlusFilesystem<R> {
@@ -472,7 +485,78 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
             label,
             bitmap: None,
             extents_overflow_data,
+            xattr_cnids: None,
         })
+    }
+
+    /// Sanity-check the volume for edit-mode compatibility and pre-load the
+    /// attributes-B-tree CNID set. Called by `open_editable_filesystem` —
+    /// not by read-only opens, so the cost is paid only when we're about
+    /// to mutate.
+    ///
+    /// Returns `Err(Unsupported)` for journaled volumes (Step 4 of
+    /// `docs/hfsplus_enhancements.md`); xattr-bearing volumes succeed but
+    /// later `delete_entry` calls against any of the cached CNIDs are
+    /// refused at the source until Phase 5 lands.
+    pub fn prepare_for_edit(&mut self) -> Result<(), FilesystemError> {
+        if self.vh.attributes & HFSPLUS_VOLUME_JOURNALED_BIT != 0 {
+            return Err(FilesystemError::Unsupported(
+                "journaled HFS+ volume — clear the journal in macOS or open read-only".into(),
+            ));
+        }
+
+        // No attributes file → nothing to scan, leave the set as `None`
+        // (delete_entry treats it as "no xattr-bearing CNIDs known").
+        if self.vh.attributes_file.logical_size == 0 {
+            self.xattr_cnids = Some(HashSet::new());
+            return Ok(());
+        }
+
+        // Load the attributes B-tree fork (with overflow extents if needed)
+        // and walk its leaves to harvest fileIDs from each record key.
+        // HFS+ attribute key layout (after the 2-byte keyLength prefix):
+        //   pad (2) | fileID (4) | startBlock (4) | nameLen (2) | name (UTF-16BE)
+        let attr_data = read_fork_with_overflow(
+            &mut self.reader,
+            self.partition_offset,
+            self.vh.block_size,
+            &self.vh.attributes_file,
+            HFSPLUS_ATTRIBUTES_FILE_ID,
+            HFSPLUS_FORK_DATA,
+            self.extents_overflow_data.as_deref(),
+        )?;
+        if attr_data.len() < 14 + 106 {
+            return Err(FilesystemError::Parse(
+                "attributes file too small for B-tree header".into(),
+            ));
+        }
+        let attr_header = BTreeHeaderRecord::parse(&attr_data[14..14 + 106]);
+        let node_size = attr_header.node_size as usize;
+        let mut cnids: HashSet<u32> = HashSet::new();
+        hfs_common::walk_leaf_records::<(), _>(
+            &attr_data,
+            attr_header.first_leaf_node,
+            node_size,
+            |_node_idx, _rec_idx, _abs_off, rec_bytes| {
+                if rec_bytes.len() < 2 {
+                    return None;
+                }
+                let key_len = BigEndian::read_u16(&rec_bytes[0..2]) as usize;
+                // key body must hold at least pad(2) + fileID(4)
+                if key_len < 6 || 2 + 6 > rec_bytes.len() {
+                    return None;
+                }
+                let file_id = BigEndian::read_u32(&rec_bytes[4..8]);
+                cnids.insert(file_id);
+                None
+            },
+        );
+        log::debug!(
+            "[HFS+ open_editable] attributes B-tree carries records for {} CNIDs",
+            cnids.len()
+        );
+        self.xattr_cnids = Some(cnids);
+        Ok(())
     }
 
     /// List all children of a given parent CNID.
@@ -2150,6 +2234,19 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsPlusFilesystem<R> 
         let parent_cnid = parent.location as u32;
         let cnid = entry.location as u32;
 
+        // Refuse deletes against entries that own xattr records — until the
+        // attributes-B-tree write path lands (Phase 5 of
+        // `docs/hfsplus_enhancements.md`) we'd otherwise leave dangling
+        // attribute records pointing at a freed CNID.
+        if let Some(set) = self.xattr_cnids.as_ref() {
+            if set.contains(&cnid) {
+                return Err(FilesystemError::Unsupported(format!(
+                    "'{}' carries extended attributes — delete-with-xattrs is not yet supported",
+                    entry.name
+                )));
+            }
+        }
+
         // Check directory is empty
         if entry.is_directory() {
             let children = self.list_children(cnid)?;
@@ -3100,6 +3197,75 @@ mod tests {
             probe_hfsplus_volume_label(&mut cursor, 0).as_deref(),
             Some("X")
         );
+    }
+
+    #[test]
+    fn test_prepare_for_edit_refuses_journaled_volume() {
+        // Build a clean image, then flip `vh.attributes` to set the
+        // journaled bit before opening. `prepare_for_edit` must refuse;
+        // a plain `open` continues to succeed (read-only is fine).
+        let mut img = make_editable_hfsplus_image();
+        let attr_off = 1024 + 4; // VH offset 4 = attributes (u32 BE)
+        let mut attrs = BigEndian::read_u32(&img[attr_off..attr_off + 4]);
+        attrs |= HFSPLUS_VOLUME_JOURNALED_BIT;
+        BigEndian::write_u32(&mut img[attr_off..attr_off + 4], attrs);
+
+        let cursor = std::io::Cursor::new(img);
+        let mut fs = HfsPlusFilesystem::open(cursor, 0).expect("read-only open should succeed");
+        let err = fs
+            .prepare_for_edit()
+            .expect_err("journaled volume must refuse edit prep");
+        match err {
+            FilesystemError::Unsupported(msg) => assert!(msg.contains("journaled")),
+            other => panic!("expected Unsupported(journaled...), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_prepare_for_edit_clean_volume_succeeds() {
+        let img = make_editable_hfsplus_image();
+        let cursor = std::io::Cursor::new(img);
+        let mut fs = HfsPlusFilesystem::open(cursor, 0).unwrap();
+        fs.prepare_for_edit()
+            .expect("clean volume should accept edit prep");
+        // No xattrs on the synthetic image — the cached set is empty.
+        assert!(fs.xattr_cnids.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_prepare_for_edit_caches_xattr_cnids_blocks_delete() {
+        // Inject a fake xattr CNID set on a clean editable filesystem,
+        // create a file under that CNID, and verify delete_entry refuses.
+        let img = make_editable_hfsplus_image();
+        let cursor = std::io::Cursor::new(img);
+        let mut fs = HfsPlusFilesystem::open(cursor, 0).unwrap();
+        fs.prepare_for_edit().unwrap();
+
+        let root = fs.root().unwrap();
+        let mut data = std::io::Cursor::new(b"x".as_slice());
+        let entry = fs
+            .create_file(
+                &root,
+                "with-xattr.txt",
+                &mut data,
+                1,
+                &CreateFileOptions::default(),
+            )
+            .expect("create_file should succeed");
+
+        // Pretend this CNID owns an xattr record.
+        fs.xattr_cnids
+            .as_mut()
+            .unwrap()
+            .insert(entry.location as u32);
+
+        let err = fs
+            .delete_entry(&root, &entry)
+            .expect_err("delete must refuse xattr-bearing CNIDs");
+        match err {
+            FilesystemError::Unsupported(msg) => assert!(msg.contains("extended attributes")),
+            other => panic!("expected Unsupported(extended attributes...), got {other:?}"),
+        }
     }
 
     #[test]
