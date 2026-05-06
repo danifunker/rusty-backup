@@ -91,6 +91,10 @@ pub struct BrowseView {
     show_tree_popup: bool,
     /// Whether the tree popup shows filesystem IDs.
     tree_show_ids: bool,
+    /// Set while a worker thread is running `format_tree`. The thread takes
+    /// ownership of the cached filesystem; we poll the status each frame and
+    /// hand the fs back to `cached_fs` once the walk completes.
+    pending_tree: Option<Arc<Mutex<TreeStatus>>>,
     /// Queued edit operations awaiting "Apply Edits".
     staged_edits: EditQueue,
     /// Whether to show the "unsaved changes" confirmation dialog.
@@ -285,8 +289,21 @@ impl Default for BrowseView {
             single_file_chd_backup_folder: None,
             pending_open: None,
             cached_fs: None,
+            pending_tree: None,
         }
     }
+}
+
+/// Shared state between the GUI and the worker thread that runs
+/// `format_tree`. The walk can take seconds on large HFS+ volumes, so it
+/// runs off the UI thread and the GUI polls this struct each frame. The
+/// `fs` slot lets us hand the filesystem back to `cached_fs` after the
+/// walk so subsequent reads don't re-open.
+pub struct TreeStatus {
+    pub finished: bool,
+    pub text: Option<String>,
+    pub error: Option<String>,
+    pub fs: Option<Box<dyn Filesystem>>,
 }
 
 impl BrowseView {
@@ -458,6 +475,7 @@ impl BrowseView {
         self.tree_text = None;
         self.show_tree_popup = false;
         self.tree_show_ids = false;
+        self.pending_tree = None;
         self.staged_edits.clear();
         self.show_unsaved_dialog = false;
         self.pending_close = false;
@@ -529,6 +547,12 @@ impl BrowseView {
                 // Still loading — show only the progress indicator.
                 return;
             }
+        }
+
+        // Poll background tree-view generation. Only renders a spinner here;
+        // the rest of the UI stays interactive while the walk runs.
+        if self.pending_tree.is_some() {
+            self.poll_pending_tree(ui);
         }
 
         // Poll extraction progress
@@ -3200,25 +3224,71 @@ impl BrowseView {
     }
 
     fn generate_tree_text(&mut self) {
-        let Some(mut fs) = self.take_or_open_fs() else {
+        if self.pending_tree.is_some() {
+            return;
+        }
+        let Some(fs) = self.take_or_open_fs() else {
             self.error = Some("Failed to open filesystem".into());
             return;
         };
-        let result = if self.tree_show_ids {
-            rusty_backup::fs::tree::format_tree_with_ids(&mut *fs)
-        } else {
-            rusty_backup::fs::tree::format_tree(&mut *fs)
-        };
-        match result {
-            Ok(text) => {
-                self.tree_text = Some(text);
-                self.show_tree_popup = true;
+        let show_ids = self.tree_show_ids;
+        let status = Arc::new(Mutex::new(TreeStatus {
+            finished: false,
+            text: None,
+            error: None,
+            fs: None,
+        }));
+        let status_thread = Arc::clone(&status);
+        std::thread::spawn(move || {
+            let mut fs = fs;
+            let result = if show_ids {
+                rusty_backup::fs::tree::format_tree_with_ids(&mut *fs)
+            } else {
+                rusty_backup::fs::tree::format_tree(&mut *fs)
+            };
+            if let Ok(mut g) = status_thread.lock() {
+                match result {
+                    Ok(text) => g.text = Some(text),
+                    Err(e) => g.error = Some(format!("Failed to generate tree: {e}")),
+                }
+                g.fs = Some(fs);
+                g.finished = true;
             }
-            Err(e) => {
-                self.error = Some(format!("Failed to generate tree: {}", e));
+        });
+        self.pending_tree = Some(status);
+    }
+
+    fn poll_pending_tree(&mut self, ui: &mut egui::Ui) {
+        let mut take_now = false;
+        if let Some(arc) = &self.pending_tree {
+            if let Ok(g) = arc.lock() {
+                if g.finished {
+                    take_now = true;
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new());
+                        ui.label("Generating tree view...");
+                    });
+                    ui.ctx().request_repaint();
+                }
             }
         }
-        self.return_fs(fs);
+        if take_now {
+            if let Some(arc) = self.pending_tree.take() {
+                if let Ok(mut g) = arc.lock() {
+                    if let Some(fs) = g.fs.take() {
+                        self.cached_fs = Some(fs);
+                    }
+                    if let Some(text) = g.text.take() {
+                        self.tree_text = Some(text);
+                        self.show_tree_popup = true;
+                    }
+                    if let Some(err) = g.error.take() {
+                        self.error = Some(err);
+                    }
+                }
+            }
+        }
     }
 
     fn render_tree_popup(&mut self, ui: &mut egui::Ui) {
