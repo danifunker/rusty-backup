@@ -86,8 +86,8 @@ restore or VHD export.
 | NTFS           | Yes    | Yes                        | Yes                           | Windows NT / 2000 / XP |
 | ext2 / ext3 / ext4 | Yes | Yes                       | Yes                           | Early Linux installs onward |
 | HFS (Mac OS Standard) | Yes | Yes                     | Yes                           | Classic Mac OS 68k / early PowerPC |
-| HFS+ (Mac OS Extended) | Yes | Yes                    | Yes                           | Mac OS 8.1 onward, non-case-sensitive |
-| btrfs          | Yes    | Yes                        | Yes                           | Modern Linux; read-only browse |
+| HFS+ (Mac OS Extended) | Yes* | No*                    | No                           | Actively working on HFS+, shrink doesn't seem to work, unsure about expand. Browsing works |
+| btrfs          | Yes    | No                        | No                           | Modern Linux; read-only browse |
 | ProDOS         | Yes    | Yes                        | No (planned)                  | Apple II / IIgs |
 
 ### What works well vs. what to watch out for
