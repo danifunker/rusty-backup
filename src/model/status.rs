@@ -30,6 +30,10 @@ pub struct InspectStatus {
     pub alignment: Option<PartitionAlignment>,
     pub partitions: Vec<PartitionInfo>,
     pub partition_min_sizes: HashMap<usize, u64>,
+    /// Defragmented minimum (size after a clone-shrink). Populated only for
+    /// HFS+ partitions where it can differ meaningfully from the in-place
+    /// trim point in `partition_min_sizes`.
+    pub partition_defrag_min_sizes: HashMap<usize, u64>,
     /// Partitions whose minimum size requires an expensive volume walk; the
     /// GUI surfaces a "Calculate minimum size" button per index. Value is the
     /// human-readable filesystem name (for log/UI text).
