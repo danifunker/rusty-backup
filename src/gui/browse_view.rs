@@ -4,8 +4,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use rusty_backup::clonezilla::block_cache::{PartcloneBlockCache, PartcloneBlockReader};
-use rusty_backup::fs;
+use rusty_backup::clonezilla::block_cache::PartcloneBlockCache;
 use rusty_backup::fs::entry::{EntryType, FileEntry};
 use rusty_backup::fs::filesystem::Filesystem;
 use rusty_backup::fs::resource_fork::{self, ResourceForkMode};
@@ -354,41 +353,13 @@ impl BrowseView {
     /// Open the browser using a partclone block cache (for Clonezilla images).
     pub fn open_partclone(&mut self, cache: Arc<Mutex<PartcloneBlockCache>>, partition_type: u8) {
         self.close();
-        self.session.partclone_cache = Some(cache.clone());
+        self.session.partclone_cache = Some(cache);
         self.session.partition_type = partition_type;
         self.session.partition_offset = 0;
-
-        let reader = PartcloneBlockReader::new(cache);
-        match fs::open_filesystem(reader, 0, partition_type, None) {
-            Ok(mut fs) => {
-                self.fs_type = fs.fs_type().to_string();
-                self.volume_label = fs.volume_label().unwrap_or("").to_string();
-                self.blessed_folder = fs.blessed_system_folder();
-                self.active = true;
-
-                match fs.root() {
-                    Ok(root) => {
-                        match fs.list_directory(&root) {
-                            Ok(entries) => {
-                                self.directory_cache.insert("/".into(), entries);
-                                self.expanded_paths.insert("/".into());
-                            }
-                            Err(e) => {
-                                self.error = Some(format!("Failed to read root directory: {e}"));
-                            }
-                        }
-                        self.root = Some(root);
-                    }
-                    Err(e) => {
-                        self.error = Some(format!("Failed to get root: {e}"));
-                    }
-                }
-            }
-            Err(e) => {
-                self.error = Some(format!("Cannot open filesystem: {e}"));
-                self.active = true;
-            }
-        }
+        // Same async pattern as `open` / `open_streaming`: hand the open and
+        // initial root listing to a worker so the UI can paint a spinner.
+        self.active = true;
+        self.pending_open = Some(self.session.spawn_open());
     }
 
     /// Open the browser by streaming a native zstd-compressed partition image.
@@ -412,36 +383,11 @@ impl BrowseView {
         };
         self.session.zstd_cache = Some(cache);
 
-        match self.session.open() {
-            Ok(mut fs) => {
-                self.fs_type = fs.fs_type().to_string();
-                self.volume_label = fs.volume_label().unwrap_or("").to_string();
-                self.blessed_folder = fs.blessed_system_folder();
-                self.active = true;
-
-                match fs.root() {
-                    Ok(root) => {
-                        match fs.list_directory(&root) {
-                            Ok(entries) => {
-                                self.directory_cache.insert("/".into(), entries);
-                                self.expanded_paths.insert("/".into());
-                            }
-                            Err(e) => {
-                                self.error = Some(format!("Failed to read root directory: {e}"));
-                            }
-                        }
-                        self.root = Some(root);
-                    }
-                    Err(e) => {
-                        self.error = Some(format!("Failed to get root: {e}"));
-                    }
-                }
-            }
-            Err(e) => {
-                self.error = Some(format!("Cannot open filesystem: {e}"));
-                self.active = true;
-            }
-        }
+        // Open + initial root listing on a worker thread so the UI can paint
+        // a spinner while a slow first read (NAS, large HFS+ catalog) runs.
+        // `show()` drains the result each frame.
+        self.active = true;
+        self.pending_open = Some(self.session.spawn_open());
     }
 
     /// Set up archive edit context so that toggling edit mode triggers
@@ -1636,7 +1582,9 @@ impl BrowseView {
                 self.session.zstd_cache = None;
                 self.edit_mode = true;
 
-                // Re-open filesystem from temp file
+                // Re-open filesystem from temp file. Invalidate the cache
+                // first because the source bytes have changed.
+                self.invalidate_cached_fs();
                 match self.session.open() {
                     Ok(mut fs) => {
                         self.fs_type = fs.fs_type().to_string();
@@ -1649,6 +1597,7 @@ impl BrowseView {
                         self.expanded_paths.clear();
                         self.selected_entry = None;
                         self.content = None;
+                        self.return_fs(fs);
                     }
                     Err(e) => {
                         self.edit_result = Some(format!("Error opening temp file: {e}"));
@@ -1663,6 +1612,7 @@ impl BrowseView {
             if let Some(ctx) = &self.archive_edit_ctx {
                 self.session.source_path = Some(ctx.archive_path.clone());
                 self.archive_temp_path = None;
+                self.invalidate_cached_fs();
 
                 match self.session.open() {
                     Ok(mut fs) => {
@@ -1677,6 +1627,7 @@ impl BrowseView {
                         self.selected_entry = None;
                         self.content = None;
                         self.edit_result = Some("Changes saved successfully.".to_string());
+                        self.return_fs(fs);
                     }
                     Err(e) => {
                         self.edit_result =
@@ -2301,9 +2252,13 @@ impl BrowseView {
         self.edit_result = Some(format!("Applied {total} edit(s) successfully"));
         self.invalidate_all_caches();
 
-        // Update blessed folder info after apply
-        if let Ok(mut fs) = self.session.open() {
+        // Update blessed folder info after apply. The volume bytes were
+        // mutated by the apply pass, so any cached read-only fs is stale —
+        // invalidate before re-opening.
+        self.invalidate_cached_fs();
+        if let Some(mut fs) = self.take_or_open_fs() {
             self.blessed_folder = fs.blessed_system_folder();
+            self.return_fs(fs);
         }
     }
 
@@ -2315,18 +2270,23 @@ impl BrowseView {
     }
 
     /// Invalidate all cached directory listings and reload root.
+    ///
+    /// Called after edit-apply / sync_metadata writes. The cached read-only
+    /// filesystem has stale in-memory tables (catalog, bitmap), so drop it
+    /// and re-open against the freshly written disk bytes.
     fn invalidate_all_caches(&mut self) {
         self.directory_cache.clear();
         self.selected_entry = None;
         self.content = None;
-        // Reload root from filesystem
-        if let Ok(mut fs) = self.session.open() {
+        self.invalidate_cached_fs();
+        if let Some(mut fs) = self.take_or_open_fs() {
             if let Ok(root) = fs.root() {
                 if let Ok(children) = fs.list_directory(&root) {
                     self.directory_cache.insert(root.path.clone(), children);
                 }
                 self.root = Some(root);
             }
+            self.return_fs(fs);
         }
     }
 
@@ -3211,16 +3171,19 @@ impl BrowseView {
             Ok(mut efs) => match efs.repair() {
                 Ok(report) => {
                     self.repair_report = Some(report);
-                    // Re-run fsck to show updated state
+                    // Re-run fsck to show updated state. Repair wrote to
+                    // disk, so any cached read-only fs is stale.
                     drop(efs);
-                    match self.session.open() {
-                        Ok(mut fs) => {
+                    self.invalidate_cached_fs();
+                    match self.take_or_open_fs() {
+                        Some(mut fs) => {
                             if let Some(Ok(result)) = fs.fsck() {
                                 self.fsck_result = Some(result);
                             }
+                            self.return_fs(fs);
                         }
-                        Err(e) => {
-                            self.error = Some(format!("Failed to re-check after repair: {}", e));
+                        None => {
+                            self.error = Some("Failed to re-check after repair".into());
                         }
                     }
                     // Invalidate directory cache
@@ -3237,27 +3200,25 @@ impl BrowseView {
     }
 
     fn generate_tree_text(&mut self) {
-        match self.session.open() {
-            Ok(mut fs) => {
-                let result = if self.tree_show_ids {
-                    rusty_backup::fs::tree::format_tree_with_ids(&mut *fs)
-                } else {
-                    rusty_backup::fs::tree::format_tree(&mut *fs)
-                };
-                match result {
-                    Ok(text) => {
-                        self.tree_text = Some(text);
-                        self.show_tree_popup = true;
-                    }
-                    Err(e) => {
-                        self.error = Some(format!("Failed to generate tree: {}", e));
-                    }
-                }
+        let Some(mut fs) = self.take_or_open_fs() else {
+            self.error = Some("Failed to open filesystem".into());
+            return;
+        };
+        let result = if self.tree_show_ids {
+            rusty_backup::fs::tree::format_tree_with_ids(&mut *fs)
+        } else {
+            rusty_backup::fs::tree::format_tree(&mut *fs)
+        };
+        match result {
+            Ok(text) => {
+                self.tree_text = Some(text);
+                self.show_tree_popup = true;
             }
             Err(e) => {
-                self.error = Some(format!("Failed to open filesystem: {}", e));
+                self.error = Some(format!("Failed to generate tree: {}", e));
             }
         }
+        self.return_fs(fs);
     }
 
     fn render_tree_popup(&mut self, ui: &mut egui::Ui) {
