@@ -151,7 +151,7 @@ Each step builds on the one before. Snapshot/rollback first because every other 
 
 ### Step 8 — Touch dates + counters on every mutation
 
-- [ ] **Goal:** Catalog records show correct `contentModDate`/`attributeModDate`/`accessDate`; volume header `file_count`/`folder_count`/`modify_date` stay in sync.
+- [x] **Goal:** Catalog records show correct `contentModDate`/`attributeModDate`/`accessDate`; volume header `file_count`/`folder_count`/`modify_date` stay in sync.
 
 **Files:** `src/fs/hfsplus.rs`
 
