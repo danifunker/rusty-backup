@@ -451,6 +451,16 @@ impl eframe::App for RustyBackupApp {
                 self.restore_tab.show(ui, &mut ctx, &mut self.progress);
             }
             Tab::Inspect => {
+                // The inspect tab's own "Close Backup" button signals the
+                // intent to fully close. Honor it before the share-state
+                // logic below — otherwise the auto-reopen branch would
+                // immediately re-load the backup from `loaded_backup_folder`
+                // on the very next frame.
+                if self.inspect_tab.take_close_backup_request() {
+                    self.loaded_backup_folder = None;
+                    self.restore_tab.clear_backup();
+                }
+
                 // Share backup folder between tabs
                 if let Some(new_backup) = self.inspect_tab.get_loaded_backup() {
                     if self.loaded_backup_folder.as_ref() != Some(&new_backup) {

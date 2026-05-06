@@ -37,6 +37,12 @@ pub struct InspectTab {
     image_format_label: Option<String>,
     /// Path to a backup folder (loaded via metadata.json)
     backup_folder_path: Option<PathBuf>,
+    /// Set when the user explicitly closes a backup via "Close Backup".
+    /// `gui::mod::update` consumes this signal via `take_close_backup_request`
+    /// to clear the cross-tab `loaded_backup_folder` so the auto-reopen
+    /// fallback (which re-loads from shared state when the tab has no
+    /// backup) doesn't immediately re-open what the user just closed.
+    close_backup_requested: bool,
     /// Parsed partition table result
     partition_table: Option<PartitionTable>,
     /// Detected alignment
@@ -141,6 +147,7 @@ impl Default for InspectTab {
             image_file_path: None,
             image_format_label: None,
             backup_folder_path: None,
+            close_backup_requested: false,
             partition_table: None,
             alignment: None,
             partitions: Vec::new(),
@@ -193,6 +200,14 @@ impl InspectTab {
 
     pub fn has_backup(&self) -> bool {
         self.backup_folder_path.is_some()
+    }
+
+    /// Returns and clears the "user clicked Close Backup" signal. The App-level
+    /// update loop calls this each frame to know when to clear the cross-tab
+    /// `loaded_backup_folder` (which would otherwise re-open the backup via
+    /// the auto-load fallback in `gui::mod::update`).
+    pub fn take_close_backup_request(&mut self) -> bool {
+        std::mem::take(&mut self.close_backup_requested)
     }
 
     pub fn load_backup(&mut self, path: &PathBuf) {
@@ -449,6 +464,10 @@ impl InspectTab {
                 self.clear_results();
                 self.backup_folder_path = None;
                 self.prev_backup_path = None;
+                // Signal to gui::mod that the cross-tab `loaded_backup_folder`
+                // should be cleared too — otherwise its auto-reopen fallback
+                // re-loads the backup on the very next frame.
+                self.close_backup_requested = true;
                 ctx.log.info("Backup folder closed.");
             }
 
