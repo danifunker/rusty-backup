@@ -123,7 +123,7 @@ that shows up via the platform enumerator (Disk Management / `diskutil` /
 | Internal SATA / NVMe drives             | Yes                  | Yes                 | Requires elevation; verify target |
 | USB floppy drives (1.44 MB, 720 KB)     | Yes (as block device)| Yes                 | Treated as a regular block device; no copy-protection support |
 | 5.25" / 3.5" floppies via Kryoflux / Greaseweazle / Applesauce | No (use their tools) | No | Dump to `.woz` / `.dc42` / `.2mg` and feed that image in |
-| Optical media (CD/DVD/BD)               | No                   | No                  | Rip with a dedicated CD/DVD tool first; rusty-backup operates on disk images |
+| Optical media (CD/DVD/BD)               | Yes*                 | No                  | Needs additional testing, many/most filesystems support for CD and DVD, I don't think it supports any form of copy protection |
 | Tape drives                             | No                   | No                  |       |
 
 Physical floppies are supported only through the OS block-device layer, which
