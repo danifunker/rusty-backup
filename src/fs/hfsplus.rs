@@ -490,7 +490,24 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         }
 
         let mut results = Vec::new();
-        let mut node_idx = self.catalog_header.first_leaf_node;
+        // Descend the catalog B-tree to find the leaf that would contain the
+        // smallest key for this parent_cnid (i.e. (parent_cnid, "")). Walking
+        // forward from there skips the leaves that hold smaller parent_cnids
+        // — for high-CNID parents on a 24k-node catalog, that's the difference
+        // between O(node_count) per call and O(depth + matches).
+        let header = hfs_common::BTreeHeader::read(&self.catalog_data);
+        let search_key = Self::build_catalog_key(parent_cnid, "");
+        let (start_leaf, _chain) = hfs_common::btree_find_insert_leaf(
+            &self.catalog_data,
+            &header,
+            &search_key,
+            &Self::catalog_compare,
+        );
+        let mut node_idx = if start_leaf != 0 {
+            start_leaf
+        } else {
+            self.catalog_header.first_leaf_node
+        };
         let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut seen_target = false;
 
