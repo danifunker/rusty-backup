@@ -615,14 +615,24 @@ impl BrowseView {
                         // Direct editing (raw image / device)
                         if self.edit_mode && !self.staged_edits.is_empty() {
                             self.show_unsaved_dialog = true;
-                        } else {
-                            self.edit_mode = !self.edit_mode;
-                            if !self.edit_mode {
-                                self.edit_result = None;
-                                self.show_new_folder_dialog = false;
-                                self.pending_delete = None;
-                                self.staged_edits.clear();
+                        } else if !self.edit_mode {
+                            // Probe the editable open up-front so guards like
+                            // the journaled-HFS+ refusal surface as a toast
+                            // instead of being deferred to the first edit.
+                            match self.session.open_editable() {
+                                Ok(_efs) => {
+                                    self.edit_mode = true;
+                                }
+                                Err(e) => {
+                                    self.error = Some(format!("Cannot enter edit mode: {e}"));
+                                }
                             }
+                        } else {
+                            self.edit_mode = false;
+                            self.edit_result = None;
+                            self.show_new_folder_dialog = false;
+                            self.pending_delete = None;
+                            self.staged_edits.clear();
                         }
                     }
                 }

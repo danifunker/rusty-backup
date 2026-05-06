@@ -747,10 +747,11 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
             "Apple_HFS" => {
                 let (fs_type, hfsplus_offset) = resolve_apple_hfs(&mut reader, partition_offset);
                 return match fs_type {
-                    "hfsplus" => Ok(Box::new(hfsplus::HfsPlusFilesystem::open(
-                        reader,
-                        hfsplus_offset,
-                    )?)),
+                    "hfsplus" => {
+                        let mut fs = hfsplus::HfsPlusFilesystem::open(reader, hfsplus_offset)?;
+                        fs.prepare_for_edit()?;
+                        Ok(Box::new(fs))
+                    }
                     "hfs" => Ok(Box::new(hfs::HfsFilesystem::open(
                         reader,
                         partition_offset,
@@ -761,10 +762,9 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                 };
             }
             "Apple_HFSX" => {
-                return Ok(Box::new(hfsplus::HfsPlusFilesystem::open(
-                    reader,
-                    partition_offset,
-                )?));
+                let mut fs = hfsplus::HfsPlusFilesystem::open(reader, partition_offset)?;
+                fs.prepare_for_edit()?;
+                return Ok(Box::new(fs));
             }
             "Apple_UNIX_SVR2" | "Apple_UNIX_SRVR2" => {
                 let fs_type = detect_filesystem_type(&mut reader, partition_offset);
@@ -816,10 +816,11 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
-                "hfsplus" => Ok(Box::new(hfsplus::HfsPlusFilesystem::open(
-                    reader,
-                    partition_offset,
-                )?)),
+                "hfsplus" => {
+                    let mut fs = hfsplus::HfsPlusFilesystem::open(reader, partition_offset)?;
+                    fs.prepare_for_edit()?;
+                    Ok(Box::new(fs))
+                }
                 "prodos" => Ok(Box::new(prodos::ProDosFilesystem::open(
                     reader,
                     partition_offset,
@@ -883,10 +884,11 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
         0xAF => {
             let (fs_type, hfsplus_offset) = resolve_apple_hfs(&mut reader, partition_offset);
             match fs_type {
-                "hfsplus" => Ok(Box::new(hfsplus::HfsPlusFilesystem::open(
-                    reader,
-                    hfsplus_offset,
-                )?)),
+                "hfsplus" => {
+                    let mut fs = hfsplus::HfsPlusFilesystem::open(reader, hfsplus_offset)?;
+                    fs.prepare_for_edit()?;
+                    Ok(Box::new(fs))
+                }
                 "hfs" => Ok(Box::new(hfs::HfsFilesystem::open(
                     reader,
                     partition_offset,
