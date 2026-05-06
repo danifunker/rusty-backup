@@ -14,3 +14,4 @@ pub mod partition_editor;
 pub mod size_mode;
 pub mod source_reader;
 pub mod status;
+pub mod volume_label_runner;

@@ -77,6 +77,13 @@ pub struct InspectTab {
     /// Currently-running per-partition min-size worker threads.
     pending_min_size_calcs:
         HashMap<usize, Arc<Mutex<rusty_backup::model::min_size_runner::MinSizeStatus>>>,
+    /// Currently-running per-partition HFS+ volume-label worker threads. Each
+    /// resolves to either a label that gets appended to `partitions[i].type_name`
+    /// or an error logged via `ctx.log`. Spawned during `apply_backup_outcome`
+    /// for backup folders since their data lives in compressed files that
+    /// can't be probed synchronously without freezing the GUI.
+    pending_volume_label_probes:
+        HashMap<usize, Arc<Mutex<rusty_backup::model::volume_label_runner::VolumeLabelStatus>>>,
     /// Clonezilla image metadata (when backup is a Clonezilla image)
     clonezilla_image: Option<ClonezillaImage>,
     /// Block caches per Clonezilla partition (for browse support)
@@ -153,6 +160,7 @@ impl Default for InspectTab {
             partition_defrag_min_sizes: HashMap::new(),
             deferred_min_sizes: HashMap::new(),
             pending_min_size_calcs: HashMap::new(),
+            pending_volume_label_probes: HashMap::new(),
             clonezilla_image: None,
             block_caches: HashMap::new(),
             block_cache_scan: None,
@@ -207,6 +215,7 @@ impl InspectTab {
         self.partition_defrag_min_sizes.clear();
         self.deferred_min_sizes.clear();
         self.pending_min_size_calcs.clear();
+        self.pending_volume_label_probes.clear();
         self.clonezilla_image = None;
         self.block_caches.clear();
         self.block_cache_scan = None;
@@ -330,6 +339,7 @@ impl InspectTab {
 
         // Poll any pending per-partition minimum-size calculations
         self.poll_min_size_calcs(ctx);
+        self.poll_volume_label_probes(ctx);
 
         // Re-inspect + Export VHD buttons
         ui.horizontal(|ui| {
@@ -1590,6 +1600,7 @@ impl InspectTab {
         self.partition_defrag_min_sizes.clear();
         self.deferred_min_sizes.clear();
         self.pending_min_size_calcs.clear();
+        self.pending_volume_label_probes.clear();
         self.clonezilla_image = None;
         self.block_caches.clear();
         self.block_cache_scan = None;
@@ -1677,6 +1688,7 @@ impl InspectTab {
         self.partition_table = out.partition_table;
         self.alignment = out.alignment;
         self.partitions = out.partitions;
+        self.spawn_volume_label_probes(ctx);
     }
 
     fn run_inspect(&mut self, ctx: &mut TabContext) {
@@ -2924,6 +2936,107 @@ impl InspectTab {
                     }
                 }
                 self.deferred_min_sizes.remove(&idx);
+            }
+        }
+    }
+
+    /// Spawn one volume-label probe per HFS+ partition in the loaded backup.
+    /// The worker reads the volume header + first catalog leaf out of the
+    /// partition's data file (raw / zstd / per-partition CHD) and posts the
+    /// label back through `pending_volume_label_probes`. Single-file-CHD
+    /// backups bypass this path because they re-enter `run_inspect` which
+    /// uses the synchronous live-disk probe.
+    fn spawn_volume_label_probes(&mut self, ctx: &mut TabContext) {
+        use rusty_backup::model::volume_label_runner::{
+            spawn as spawn_label, VolumeLabelRequest, VolumeLabelSource,
+        };
+
+        let folder = match &self.backup_folder_path {
+            Some(f) => f.clone(),
+            None => return,
+        };
+        let meta = match &self.backup_metadata {
+            Some(m) => m.clone(),
+            None => return,
+        };
+
+        let compression = meta.compression_type.clone();
+        for part in &self.partitions {
+            // Only HFS+/HFSX partitions have a label worth probing here.
+            // We use the same set of partition-type checks as the inspect-tab
+            // live-disk path (Apple_HFS APM string + 0xAF MBR byte).
+            let is_hfs_plus = part.partition_type_byte == 0xAF
+                || part.partition_type_string.as_deref() == Some("Apple_HFS")
+                || part.partition_type_string.as_deref() == Some("Apple_HFS+")
+                || part.partition_type_string.as_deref() == Some("Apple_HFSX");
+            if !is_hfs_plus {
+                continue;
+            }
+            let pm = match meta.partitions.iter().find(|p| p.index == part.index) {
+                Some(pm) => pm,
+                None => continue,
+            };
+            // Skip partitions whose data file is split across multiple parts
+            // (the probe needs random-access read; concatenating splits is
+            // out of scope here).
+            if pm.compressed_files.len() != 1 {
+                continue;
+            }
+            let data_path = folder.join(&pm.compressed_files[0]);
+            if !data_path.exists() {
+                continue;
+            }
+            let source = match compression.as_str() {
+                "none" => VolumeLabelSource::Raw {
+                    path: data_path,
+                    partition_offset: 0,
+                },
+                "zstd" => VolumeLabelSource::Zstd { path: data_path },
+                "chd" => VolumeLabelSource::Chd {
+                    path: data_path,
+                    partition_offset: 0,
+                },
+                _ => continue,
+            };
+            let status = spawn_label(VolumeLabelRequest {
+                source,
+                partition_index: part.index,
+            });
+            self.pending_volume_label_probes.insert(part.index, status);
+        }
+        let count = self.pending_volume_label_probes.len();
+        if count > 0 {
+            ctx.log.info(format!(
+                "Probing {count} HFS+ partition label(s) from backup data..."
+            ));
+        }
+    }
+
+    /// Poll all pending volume-label workers; on completion, append the label
+    /// to the matching partition's `type_name` so the partition list shows
+    /// "Apple_HFS (HFS+) Ariel-backup" instead of just the type.
+    fn poll_volume_label_probes(&mut self, ctx: &mut TabContext) {
+        let finished_indices: Vec<usize> = self
+            .pending_volume_label_probes
+            .iter()
+            .filter_map(|(idx, status)| status.lock().ok().filter(|s| s.finished).map(|_| *idx))
+            .collect();
+        for idx in finished_indices {
+            if let Some(status_arc) = self.pending_volume_label_probes.remove(&idx) {
+                if let Ok(s) = status_arc.lock() {
+                    if let Some(err) = &s.error {
+                        ctx.log.warn(format!(
+                            "Volume label probe failed for partition {idx}: {err}",
+                        ));
+                    } else if let Some(label) = s.label.clone() {
+                        if let Some(part) = self.partitions.iter_mut().find(|p| p.index == idx) {
+                            if !part.type_name.trim_end().ends_with(label.as_str()) {
+                                part.type_name = format!("{} {}", part.type_name, label);
+                            }
+                            ctx.log.info(format!("Partition {idx} label: {label}"));
+                        }
+                    }
+                }
             }
         }
     }
