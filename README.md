@@ -138,6 +138,12 @@ first and then ingested as a `.woz` / `.dc42` / `.2mg` image.
 - `docs/` — per-feature deep dives (VHD export, alignment, code signing,
   Apple II floppy formats, …).
 
+## Donations
+
+Support me on ko-fi!  
+(https://ko-fi.com/danifunker)
+
+
 ## License
 
 AGPL-3.0 — see `LICENSE`.
