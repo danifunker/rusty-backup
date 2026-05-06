@@ -446,9 +446,22 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
             ));
         }
         let catalog_header = BTreeHeaderRecord::parse(&catalog_data[14..14 + 106]);
+        log::debug!(
+            "[HFS+ open] catalog btree: depth={}, root_node={}, first_leaf={}, last_leaf={}, \
+             node_size={}, total_nodes={}, free_nodes={}",
+            catalog_header.depth,
+            catalog_header.root_node,
+            catalog_header.first_leaf_node,
+            catalog_header.last_leaf_node,
+            catalog_header.node_size,
+            catalog_header.total_nodes,
+            catalog_header.free_nodes,
+        );
 
-        // Try to find the volume label from the root folder thread
+        // Try to find the volume label from the root folder thread.
+        log::debug!("[HFS+ open] scanning catalog for volume label...");
         let label = find_volume_label(&catalog_data, &catalog_header);
+        log::debug!("[HFS+ open] volume label: {:?}", label);
 
         Ok(HfsPlusFilesystem {
             reader,
@@ -1217,42 +1230,33 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
                         format!("{}/{name}", entry.path)
                     };
                     let mut fe = FileEntry::new_file(name, path, data_size, file_id as u64);
-                    // HFS+ UNIX symlink: type "slnk" / creator "rhap", data
-                    // fork is the target path as UTF-8 (typically <256 bytes).
-                    if type_code == super::mac_alias::SLNK_TYPE
-                        && creator_code == super::mac_alias::RHAP_CREATOR
-                        && data_size > 0
-                        && data_size <= 4096
-                    {
-                        if let Ok(data) =
-                            self.read_user_fork(file_id, HFSPLUS_FORK_DATA, &data_fork)
-                        {
-                            if let Ok(target) = std::str::from_utf8(&data) {
-                                let trimmed = target.trim_end_matches('\0').trim();
-                                if !trimmed.is_empty() {
-                                    fe.symlink_target = Some(trimmed.to_string());
-                                }
-                            }
-                        }
-                    }
                     fe.type_code = Some(type_code);
                     fe.creator_code = Some(creator_code);
                     if rsrc_size > 0 {
                         fe.resource_fork_size = Some(rsrc_size);
                     }
-                    // Classic-Mac alias: fdFlags bit 0x8000 set.
-                    if finder_flags & super::mac_alias::IS_ALIAS_FLAG != 0
-                        && rsrc_size > 0
-                        && fe.symlink_target.is_none()
-                    {
-                        if let Ok(rsrc) =
-                            self.read_user_fork(file_id, HFSPLUS_FORK_RESOURCE, &rsrc_fork)
-                        {
-                            if let Some(target) = super::mac_alias::resolve_alias_target(&rsrc) {
-                                fe.symlink_target = Some(target);
-                            }
-                        }
-                    }
+                    // NOTE: symlink/alias *target resolution* used to happen
+                    // here (read the data fork for `slnk`/`rhap` files; read
+                    // the resource fork for entries with the IS_ALIAS finder
+                    // flag). On a slow or forward-only source — zstd
+                    // streaming backups, NAS-backed images — those reads can
+                    // each take minutes because the source has to decompress
+                    // gigabytes to reach the fork's extent. With Mac OS X
+                    // root directories typically holding a handful of
+                    // symlinks (etc → private/etc, var → private/var, etc.),
+                    // listing the root would stall for tens of minutes.
+                    //
+                    // The target isn't load-bearing for navigation: the GUI
+                    // file preview already reads the data fork on demand
+                    // when the user selects the entry, and an `slnk`/`rhap`
+                    // data fork is just the UTF-8 target path — it renders
+                    // fine as a text preview. The Finder-alias path
+                    // (`mac_alias::resolve_alias_target`) was inline-used
+                    // by the directory listing only; nothing else depends
+                    // on the alias having a resolved target. So we drop the
+                    // eager resolution and let the preview path do the read
+                    // when (and only when) the user actually clicks.
+                    let _ = (data_fork, rsrc_fork, finder_flags);
                     entries.push(fe);
                 }
             }
