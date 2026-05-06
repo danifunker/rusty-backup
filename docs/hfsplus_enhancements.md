@@ -103,7 +103,7 @@ Each step builds on the one before. Snapshot/rollback first because every other 
 
 ### Step 5 — Snapshot / rollback for HFS+ mutations
 
-- [ ] **Goal:** Any failure inside `create_file` / `create_directory` / `delete_entry` / `set_type_creator` / `write_resource_fork` / `set_blessed_folder` rewinds in-memory state instead of leaving a half-applied catalog.
+- [x] **Goal:** Any failure inside `create_file` / `create_directory` / `delete_entry` / `set_type_creator` / `write_resource_fork` / `set_blessed_folder` rewinds in-memory state instead of leaving a half-applied catalog.
 
 **Files:** `src/fs/hfsplus.rs`
 
