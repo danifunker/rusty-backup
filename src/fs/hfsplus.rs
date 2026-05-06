@@ -1539,6 +1539,33 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
         rec
     }
 
+    /// Stamp the per-record date fields. `frec_start` is the absolute byte
+    /// offset of the catalog record's data section (i.e. just past the
+    /// `recordType` field at offset 0 of the record body). At the standard
+    /// HFS+ file/folder record offsets:
+    ///   contentModDate @ +16, attributeModDate @ +20, accessDate @ +24.
+    ///
+    /// Pass `update_content = true` when the operation changed file content
+    /// (fork rewrite). Attribute-only changes (type/creator, finder flags,
+    /// blessed-folder) leave contentModDate alone.
+    fn stamp_record_dates(&mut self, frec_start: usize, update_content: bool) {
+        let now = hfs_common::hfs_now();
+        if update_content {
+            BigEndian::write_u32(
+                &mut self.catalog_data[frec_start + 16..frec_start + 20],
+                now,
+            );
+        }
+        BigEndian::write_u32(
+            &mut self.catalog_data[frec_start + 20..frec_start + 24],
+            now,
+        );
+        BigEndian::write_u32(
+            &mut self.catalog_data[frec_start + 24..frec_start + 28],
+            now,
+        );
+    }
+
     /// Build a complete HFS+ folder catalog record (88 bytes).
     fn build_folder_record(folder_id: u32) -> [u8; 88] {
         let mut rec = [0u8; 88];
@@ -2761,6 +2788,9 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
         self.catalog_data[frec_start + 48..frec_start + 52].copy_from_slice(&tc);
         self.catalog_data[frec_start + 52..frec_start + 56].copy_from_slice(&cc);
 
+        // Type/creator is an attribute-only change.
+        self.stamp_record_dates(frec_start, false);
+
         let _ = (f_node, f_rec, node_size); // suppress warnings
         Ok(())
     }
@@ -2819,6 +2849,9 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
         let mut rsrc_bytes = [0u8; 80];
         new_rsrc.serialize(&mut rsrc_bytes);
         self.catalog_data[frec_start + 168..frec_start + 248].copy_from_slice(&rsrc_bytes);
+
+        // Fork rewrite is a content change, so contentModDate also moves.
+        self.stamp_record_dates(frec_start, true);
 
         let _ = t_node;
         Ok(())
@@ -3740,6 +3773,113 @@ mod tests {
             .expect("clean volume should accept edit prep");
         // No xattrs on the synthetic image — the cached set is empty.
         assert!(fs.xattr_cnids.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_create_file_stamps_dates() {
+        // Newly-created files must have createDate / contentModDate /
+        // attributeModDate / accessDate equal to sync-time hfs_now() to
+        // within a couple seconds (test wall-clock jitter).
+        let img = make_editable_hfsplus_image();
+        let cursor = std::io::Cursor::new(img);
+        let mut fs = HfsPlusFilesystem::open(cursor, 0).unwrap();
+        fs.prepare_for_edit().unwrap();
+
+        let now_before = hfs_common::hfs_now();
+        let root = fs.root().unwrap();
+        let mut data = std::io::Cursor::new(b"hi".as_slice());
+        let entry = fs
+            .create_file(
+                &root,
+                "dated.txt",
+                &mut data,
+                2,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        let now_after = hfs_common::hfs_now();
+
+        // Locate the new file's catalog record and read all four dates.
+        let cnid = entry.location as u32;
+        let (_n, _r, f_off) = fs.find_catalog_record(2, "dated.txt").unwrap();
+        let fkey_len = BigEndian::read_u16(&fs.catalog_data[f_off..f_off + 2]) as usize;
+        let mut frec = f_off + 2 + fkey_len;
+        if !frec.is_multiple_of(2) {
+            frec += 1;
+        }
+        let create_date = BigEndian::read_u32(&fs.catalog_data[frec + 12..frec + 16]);
+        let content_mod = BigEndian::read_u32(&fs.catalog_data[frec + 16..frec + 20]);
+        let attr_mod = BigEndian::read_u32(&fs.catalog_data[frec + 20..frec + 24]);
+        let access = BigEndian::read_u32(&fs.catalog_data[frec + 24..frec + 28]);
+
+        for (label, value) in [
+            ("createDate", create_date),
+            ("contentModDate", content_mod),
+            ("attributeModDate", attr_mod),
+            ("accessDate", access),
+        ] {
+            assert!(
+                value >= now_before && value <= now_after + 1,
+                "{label} {value} not in [{now_before}, {now_after}+1]"
+            );
+        }
+
+        // Counter parity: VH file_count must have incremented by one.
+        assert_eq!(fs.vh.file_count, 1);
+        let _ = cnid;
+    }
+
+    #[test]
+    fn test_set_type_creator_bumps_attribute_mod_date() {
+        // set_type_creator is an attribute-only change: attributeModDate
+        // moves forward, but contentModDate (set at create-time) stays
+        // pinned to the original value.
+        let img = make_editable_hfsplus_image();
+        let cursor = std::io::Cursor::new(img);
+        let mut fs = HfsPlusFilesystem::open(cursor, 0).unwrap();
+        fs.prepare_for_edit().unwrap();
+
+        let root = fs.root().unwrap();
+        let mut data = std::io::Cursor::new(b"x".as_slice());
+        let entry = fs
+            .create_file(&root, "a.txt", &mut data, 1, &CreateFileOptions::default())
+            .unwrap();
+
+        let (_n, _r, f_off) = fs.find_catalog_record(2, "a.txt").unwrap();
+        let fkey_len = BigEndian::read_u16(&fs.catalog_data[f_off..f_off + 2]) as usize;
+        let mut frec = f_off + 2 + fkey_len;
+        if !frec.is_multiple_of(2) {
+            frec += 1;
+        }
+        let content_before = BigEndian::read_u32(&fs.catalog_data[frec + 16..frec + 20]);
+
+        // Force the timestamp to advance — hfs_now() has 1-second resolution.
+        // Stuff the create-time content date into the past so we can assert
+        // it stays put while attributeModDate moves to "now".
+        BigEndian::write_u32(
+            &mut fs.catalog_data[frec + 16..frec + 20],
+            content_before - 60,
+        );
+        BigEndian::write_u32(
+            &mut fs.catalog_data[frec + 20..frec + 24],
+            content_before - 60,
+        );
+
+        let now_before = hfs_common::hfs_now();
+        fs.set_type_creator(&entry, "TEXT", "ttxt").unwrap();
+        let now_after = hfs_common::hfs_now();
+
+        let content_after = BigEndian::read_u32(&fs.catalog_data[frec + 16..frec + 20]);
+        let attr_after = BigEndian::read_u32(&fs.catalog_data[frec + 20..frec + 24]);
+        assert_eq!(
+            content_after,
+            content_before - 60,
+            "contentModDate must not move on attribute-only change"
+        );
+        assert!(
+            attr_after >= now_before && attr_after <= now_after + 1,
+            "attributeModDate {attr_after} not in [{now_before}, {now_after}+1]"
+        );
     }
 
     #[test]
