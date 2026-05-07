@@ -208,7 +208,7 @@ Engine primitives the clone path needs. fsck lands before the clone so it's a ve
 
 ### Step 11 — `hfsplus_fsck` skeleton
 
-- [ ] **Goal:** Lightweight fsck that becomes the verification harness for every clone-related test from now on.
+- [x] **Goal:** Lightweight fsck that becomes the verification harness for every clone-related test from now on.
 
 **Files:** `src/fs/hfsplus_fsck.rs` (new), `src/fs/fsck.rs` (no changes — shared types already abstract)
 

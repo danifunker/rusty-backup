@@ -11,6 +11,7 @@ pub mod hfs_common;
 pub mod hfs_fsck;
 pub mod hfsplus;
 pub mod hfsplus_clone;
+pub mod hfsplus_fsck;
 pub mod layout_preserving;
 pub mod mac_alias;
 pub mod ntfs;
