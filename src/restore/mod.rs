@@ -519,11 +519,20 @@ fn compute_partition_size(
     match size_choice {
         RestoreSizeChoice::Original => pm.original_size_bytes,
         RestoreSizeChoice::Minimum => {
-            let min = if pm.imaged_size_bytes > 0 {
-                pm.imaged_size_bytes
-            } else {
-                pm.original_size_bytes
-            };
+            // Prefer the defragmented (post-clone) minimum when available —
+            // for filesystems with a defragmenting compaction path (FAT,
+            // HFS+) this can be substantially smaller than the in-place
+            // trim point. Fall back to the in-place minimum, then to the
+            // imaged size, then to the original.
+            let min = pm
+                .defragmented_min_size_bytes
+                .or(pm.minimum_size_bytes)
+                .or(if pm.imaged_size_bytes > 0 {
+                    Some(pm.imaged_size_bytes)
+                } else {
+                    None
+                })
+                .unwrap_or(pm.original_size_bytes);
             (min + 511) & !511
         }
         RestoreSizeChoice::Custom(bytes) => (bytes + 511) & !511,

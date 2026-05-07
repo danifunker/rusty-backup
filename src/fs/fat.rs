@@ -713,6 +713,40 @@ impl<R: Read + Seek + Send> Filesystem for FatFilesystem<R> {
             }
         }
     }
+
+    fn defragmented_minimum_size(&mut self) -> Result<u64, FilesystemError> {
+        // Smallest FAT volume that could host the live data after a packed
+        // clone: reserved + (num_fats * sectors_per_fat) + root_dir_sectors +
+        // used_clusters * sectors_per_cluster. Mirrors the geometry that
+        // CompactFatReader emits.
+        let fat_offset = self.sector_offset(self.reserved_sectors);
+        let fat_size = (self.sectors_per_fat * self.bytes_per_sector) as usize;
+        self.reader.seek(SeekFrom::Start(fat_offset))?;
+        let mut fat_data = vec![0u8; fat_size];
+        self.reader.read_exact(&mut fat_data)?;
+        let total_entries = self.total_clusters as u32 + 2;
+        let mut free: u64 = 0;
+        for cluster in 2..total_entries {
+            if read_fat_entry(&fat_data, cluster, self.fat_type) == 0 {
+                free += 1;
+            }
+        }
+        let used_clusters = self.total_clusters.saturating_sub(free);
+
+        let fat_bytes = match self.fat_type {
+            FatType::Fat12 => ((used_clusters + 2) * 3).div_ceil(2),
+            FatType::Fat16 => (used_clusters + 2) * 2,
+            FatType::Fat32 => (used_clusters + 2) * 4,
+        };
+        let new_sectors_per_fat = fat_bytes.div_ceil(self.bytes_per_sector);
+        let root_dir_sectors = (self.root_entry_count as u64 * 32).div_ceil(self.bytes_per_sector);
+        let new_data_sectors = used_clusters * self.sectors_per_cluster;
+        let new_total_sectors = self.reserved_sectors
+            + (self.num_fats as u64 * new_sectors_per_fat)
+            + root_dir_sectors
+            + new_data_sectors;
+        Ok(new_total_sectors * self.bytes_per_sector)
+    }
 }
 
 // ---------------------------------------------------------------------------
