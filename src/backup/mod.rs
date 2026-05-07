@@ -440,6 +440,41 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         bail!("backup cancelled");
     }
 
+    // Step 4: Analyze partitions for smart sizing
+    //
+    // When not in sector-by-sector mode, try filesystem-aware compaction first
+    // (FAT only — packs allocated clusters contiguously for a smaller, defragmented
+    // image). If compaction isn't possible, fall back to trim-based sizing that
+    // skips unused space beyond the last allocated cluster.
+    //
+    // This runs before the single-file-CHD branch so the CHD path can persist
+    // `minimum_size_bytes` / `defragmented_min_size_bytes` in metadata.json,
+    // which the restore-resize path uses to validate Custom shrinks and to
+    // populate the "Minimum" picker.
+    log(
+        &progress,
+        LogLevel::Info,
+        format!(
+            "Analyzing {} partitions for smart sizing...",
+            partitions.len()
+        ),
+    );
+
+    let sizes::PartitionSizing {
+        effective_sizes,
+        stream_sizes,
+        compact_sizes,
+        minimum_sizes,
+        defragmented_min_sizes,
+        is_layout_preserving_flags,
+    } = sizes::analyze_partitions(
+        source.get_ref(),
+        &partitions,
+        config.sector_by_sector,
+        is_superfloppy,
+        &progress,
+    );
+
     // Single-file CHD branch: when the user asked for CHD output and the
     // source has a partition table single_file_chd can handle, synthesise a
     // whole-disk image into one CHD and skip the per-partition loop. Falls
@@ -455,6 +490,8 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             &partitions,
             &alignment,
             &backup_folder,
+            &minimum_sizes,
+            &defragmented_min_sizes,
         );
     }
     // CHD/DVD selected on a source single_file_chd can't handle (only
@@ -476,38 +513,9 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         );
     }
 
-    // Step 4: Analyze partitions for smart sizing
-    //
-    // When not in sector-by-sector mode, try filesystem-aware compaction first
-    // (FAT only — packs allocated clusters contiguously for a smaller, defragmented
-    // image). If compaction isn't possible, fall back to trim-based sizing that
-    // skips unused space beyond the last allocated cluster.
-    log(
-        &progress,
-        LogLevel::Info,
-        format!(
-            "Analyzing {} partitions for smart sizing...",
-            partitions.len()
-        ),
-    );
     let split_bytes = config.split_size_mib.map(|mib| mib as u64 * 1024 * 1024);
     let mut partition_metadata = Vec::new();
     let mut overall_bytes_done: u64 = 0;
-
-    let sizes::PartitionSizing {
-        effective_sizes,
-        stream_sizes,
-        compact_sizes,
-        minimum_sizes,
-        defragmented_min_sizes,
-        is_layout_preserving_flags,
-    } = sizes::analyze_partitions(
-        source.get_ref(),
-        &partitions,
-        config.sector_by_sector,
-        is_superfloppy,
-        &progress,
-    );
 
     // Export mbr-min.bin for MBR tables: a copy of the MBR with each
     // partition's total_sectors reduced to the effective (imaged) size.
@@ -997,6 +1005,8 @@ fn run_single_file_chd_path(
     partitions: &[partition::PartitionInfo],
     alignment: &partition::PartitionAlignment,
     backup_folder: &std::path::Path,
+    minimum_sizes: &[Option<u64>],
+    defragmented_min_sizes: &[Option<u64>],
 ) -> Result<()> {
     set_operation(progress, "Building disk-image stream...");
     log(
@@ -1035,6 +1045,7 @@ fn run_single_file_chd_path(
         output_base: &output_base,
         resize_targets: config.partition_target_sizes.as_deref(),
         alignment_sectors: alignment.alignment_sectors,
+        checksum_type: config.checksum,
     };
 
     {
@@ -1047,6 +1058,7 @@ fn run_single_file_chd_path(
     let progress_for_cb = progress.clone();
     let progress_for_cancel = progress.clone();
     let progress_for_log = progress.clone();
+    let progress_for_checksum = progress.clone();
     let mut progress_cb = move |n: u64| {
         if let Ok(mut p) = progress_for_cb.lock() {
             p.current_bytes = n;
@@ -1066,8 +1078,30 @@ fn run_single_file_chd_path(
             });
         }
     };
+    // Post-write checksum phase: swap the progress bar over to the
+    // hashing total so the GUI doesn't sit at "100% / 100%" while we
+    // re-read the CHD. The first invocation (current=0, total=N) flips
+    // the operation label too.
+    let mut first_checksum_tick = true;
+    let progress_for_checksum_outer = progress_for_checksum;
+    let mut checksum_phase_cb = move |current: u64, total: u64| {
+        if let Ok(mut p) = progress_for_checksum_outer.lock() {
+            if first_checksum_tick {
+                p.operation = "Computing per-partition checksums...".to_string();
+                first_checksum_tick = false;
+            }
+            p.current_bytes = current;
+            p.total_bytes = total;
+        }
+    };
 
-    let result = single_file_chd::run(inputs, &mut progress_cb, &cancel_check, &mut log_cb)?;
+    let result = single_file_chd::run(
+        inputs,
+        &mut progress_cb,
+        &cancel_check,
+        &mut log_cb,
+        &mut checksum_phase_cb,
+    )?;
 
     // Build per-partition metadata. The byte range inside the CHD lives in
     // `result.partition_ranges`; we cross-reference each partition's
@@ -1077,13 +1111,30 @@ fn run_single_file_chd_path(
         .partition_ranges
         .iter()
         .filter_map(|range| {
-            let part = partitions
+            let (part_idx, part) = partitions
                 .iter()
-                .find(|p| p.index == range.partition_index)?;
+                .enumerate()
+                .find(|(_, p)| p.index == range.partition_index)?;
             // `start_lba` records where the partition lives inside the CHD's
             // synthesised disk image — that's the new offset when the
             // backup-time resize plan moved it, otherwise the source LBA.
             let new_start_lba = range.offset_in_disk / 512;
+            // Pull the per-partition minimum sizes computed by
+            // `analyze_partitions` upstream. Restore-resize uses these to
+            // populate the "Minimum" picker and to validate Custom shrinks.
+            // After a backup-time resize the partition has already been
+            // shrunk to ~minimum, so the stored minimum should not exceed
+            // the new imaged size.
+            let minimum_size = minimum_sizes
+                .get(part_idx)
+                .copied()
+                .flatten()
+                .map(|m| m.min(range.length));
+            let defragmented_min = defragmented_min_sizes
+                .get(part_idx)
+                .copied()
+                .flatten()
+                .map(|m| m.min(range.length));
             Some(PartitionMetadata {
                 index: range.partition_index,
                 type_name: part.type_name.clone(),
@@ -1092,13 +1143,13 @@ fn run_single_file_chd_path(
                 original_size_bytes: part.size_bytes,
                 imaged_size_bytes: range.length,
                 compressed_files: vec![], // data is inside the container
-                checksum: range.checksum_sha256.clone(),
+                checksum: range.checksum.clone(),
                 resized: range.length != part.size_bytes || new_start_lba != part.start_lba,
                 compacted: !config.sector_by_sector,
                 is_logical: part.is_logical,
                 partition_type_string: part.partition_type_string.clone(),
-                minimum_size_bytes: None,
-                defragmented_min_size_bytes: None,
+                minimum_size_bytes: minimum_size,
+                defragmented_min_size_bytes: defragmented_min,
             })
         })
         .collect();

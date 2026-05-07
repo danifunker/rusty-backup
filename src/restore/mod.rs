@@ -1356,6 +1356,42 @@ fn run_single_file_chd_restore_resize(
         );
     }
 
+    // Pre-flight: reject Custom shrinks that would clobber live filesystem
+    // data. `compute_partition_size` accepts any 512-aligned Custom value;
+    // the per-FS `resize_filesystem_for` would later refuse, but the
+    // failure surfaces mid-restore — half the new partition table written,
+    // half the body copied. Catch it here using the minimum-size hints
+    // persisted at backup time (or `imaged_size_bytes` as a last resort).
+    for ov in &overrides {
+        let pm = match metadata.partitions.iter().find(|p| p.index == ov.index) {
+            Some(p) => p,
+            None => continue,
+        };
+        // Floor uses the smallest known-safe size for this partition:
+        // defragmented < minimum < imaged. If none is known, skip the
+        // check (we'd rather attempt the resize than spuriously refuse).
+        let floor = pm.defragmented_min_size_bytes.or(pm.minimum_size_bytes).or(
+            if pm.imaged_size_bytes > 0 {
+                Some(pm.imaged_size_bytes)
+            } else {
+                None
+            },
+        );
+        if let Some(min) = floor {
+            if ov.export_size < min {
+                bail!(
+                    "partition-{} target size ({} bytes) is below its filesystem \
+                     minimum ({} bytes). Pick \"Minimum\" instead, or raise the \
+                     custom size to at least {} bytes.",
+                    ov.index,
+                    ov.export_size,
+                    min,
+                    min,
+                );
+            }
+        }
+    }
+
     set_operation(&progress, "Opening CHD container...");
     let mut chd_reader = ChdReader::open(&chd_path)
         .with_context(|| format!("failed to open {}", chd_path.display()))?;
@@ -2604,10 +2640,12 @@ mod tests {
                 output_base: &output_base,
                 resize_targets: None,
                 alignment_sectors: 0,
+                checksum_type: crate::backup::ChecksumType::Sha256,
             },
             &mut progress_cb,
             &cancel_check,
             &mut log_cb,
+            &mut |_, _| {},
         )
         .expect("backup");
 
@@ -2645,7 +2683,7 @@ mod tests {
                     original_size_bytes: r.length,
                     imaged_size_bytes: r.length,
                     compressed_files: vec![],
-                    checksum: r.checksum_sha256.clone(),
+                    checksum: r.checksum.clone(),
                     resized: false,
                     compacted: true,
                     is_logical: false,
@@ -2734,10 +2772,12 @@ mod tests {
                 output_base: &output_base,
                 resize_targets: None,
                 alignment_sectors: 0,
+                checksum_type: crate::backup::ChecksumType::Sha256,
             },
             &mut progress_cb,
             &cancel_check,
             &mut log_cb,
+            &mut |_, _| {},
         )
         .expect("backup");
 
@@ -2774,7 +2814,7 @@ mod tests {
                     original_size_bytes: r.length,
                     imaged_size_bytes: r.length,
                     compressed_files: vec![],
-                    checksum: r.checksum_sha256.clone(),
+                    checksum: r.checksum.clone(),
                     resized: false,
                     compacted: true,
                     is_logical: false,
@@ -2895,10 +2935,12 @@ mod tests {
                 output_base: &output_base,
                 resize_targets: None,
                 alignment_sectors: 0,
+                checksum_type: crate::backup::ChecksumType::Sha256,
             },
             &mut progress_cb,
             &cancel_check,
             &mut log_cb,
+            &mut |_, _| {},
         )
         .expect("backup");
 
@@ -2942,7 +2984,7 @@ mod tests {
                     original_size_bytes: r.length,
                     imaged_size_bytes: r.length,
                     compressed_files: vec![],
-                    checksum: r.checksum_sha256.clone(),
+                    checksum: r.checksum.clone(),
                     resized: false,
                     compacted: false,
                     is_logical: false,
