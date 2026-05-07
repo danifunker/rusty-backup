@@ -524,6 +524,108 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         })
     }
 
+    // ---- Accessors for `hfsplus_clone` (Step 10 of
+    //      docs/hfsplus_enhancements.md). The clone module captures source
+    //      metadata without taking a reference to the private VH/ForkData
+    //      types — these helpers expose primitives + raw fork bytes.
+
+    #[allow(dead_code)] // used in later HFS+ clone steps
+    pub(crate) fn partition_offset(&self) -> u64 {
+        self.partition_offset
+    }
+
+    pub(crate) fn block_size(&self) -> u32 {
+        self.vh.block_size
+    }
+
+    pub(crate) fn total_blocks(&self) -> u32 {
+        self.vh.total_blocks
+    }
+
+    pub(crate) fn signature(&self) -> u16 {
+        self.vh.signature
+    }
+
+    pub(crate) fn vh_attributes(&self) -> u32 {
+        self.vh.attributes
+    }
+
+    pub(crate) fn vh_create_date(&self) -> u32 {
+        self.vh.create_date
+    }
+
+    pub(crate) fn vh_modify_date(&self) -> u32 {
+        self.vh.modify_date
+    }
+
+    pub(crate) fn vh_backup_date(&self) -> u32 {
+        self.vh.backup_date
+    }
+
+    pub(crate) fn vh_checked_date(&self) -> u32 {
+        self.vh.checked_date
+    }
+
+    pub(crate) fn vh_file_count(&self) -> u32 {
+        self.vh.file_count
+    }
+
+    pub(crate) fn vh_folder_count(&self) -> u32 {
+        self.vh.folder_count
+    }
+
+    pub(crate) fn vh_finder_info(&self) -> [u32; 8] {
+        self.vh.finder_info
+    }
+
+    pub(crate) fn attributes_file_size(&self) -> u64 {
+        self.vh.attributes_file.logical_size
+    }
+
+    pub(crate) fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub(crate) fn catalog_data(&self) -> &[u8] {
+        &self.catalog_data
+    }
+
+    pub(crate) fn catalog_node_size(&self) -> usize {
+        self.catalog_header.node_size as usize
+    }
+
+    pub(crate) fn catalog_first_leaf(&self) -> u32 {
+        self.catalog_header.first_leaf_node
+    }
+
+    /// Read the first 1024 bytes of the partition (HFS+ "boot blocks" —
+    /// always zero on macOS-formatted volumes but copied verbatim by clone).
+    pub(crate) fn read_boot_blocks(&mut self) -> Result<[u8; 1024], FilesystemError> {
+        self.reader.seek(SeekFrom::Start(self.partition_offset))?;
+        let mut buf = [0u8; 1024];
+        self.reader.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Read a user fork given the raw 80 bytes of `HFSPlusForkData` from a
+    /// catalog file record. Routes through the extents-overflow B-tree when
+    /// the inline 8 extents don't cover `logical_size`.
+    pub(crate) fn read_user_fork_bytes(
+        &mut self,
+        file_id: u32,
+        fork_type: u8,
+        fork_record: &[u8],
+    ) -> Result<Vec<u8>, FilesystemError> {
+        if fork_record.len() < 80 {
+            return Err(FilesystemError::Parse(format!(
+                "fork record for file {file_id} truncated: {} bytes",
+                fork_record.len()
+            )));
+        }
+        let fork = ForkData::parse(fork_record);
+        self.read_user_fork(file_id, fork_type, &fork)
+    }
+
     /// Capture the full mutable state for snapshot/rollback. Cheap on the
     /// scale of a single mutation: catalog + bitmap clone is O(volume
     /// metadata size), not O(volume size).
