@@ -191,7 +191,7 @@ Engine primitives the clone path needs. fsck lands before the clone so it's a ve
 
 ### Step 10 — Source snapshot capture
 
-- [ ] **Goal:** New `src/fs/hfsplus_clone.rs` (parallel to `hfs_clone.rs`) defining `SourceVolumeSnapshot`, `SourceFileSnapshot`, `SourceDirSnapshot`, `SourceCatalogSnapshot::capture(fs: &mut HfsPlusFilesystem)`.
+- [x] **Goal:** New `src/fs/hfsplus_clone.rs` (parallel to `hfs_clone.rs`) defining `SourceVolumeSnapshot`, `SourceFileSnapshot`, `SourceDirSnapshot`, `SourceCatalogSnapshot::capture(fs: &mut HfsPlusFilesystem)`.
 
 **Files:** `src/fs/hfsplus_clone.rs` (new), `src/fs/mod.rs` (module wire-up)
 
