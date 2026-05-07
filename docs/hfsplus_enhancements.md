@@ -170,7 +170,7 @@ Engine primitives the clone path needs. fsck lands before the clone so it's a ve
 
 ### Step 9 — `create_blank_hfsplus` (HFS+ and HFSX)
 
-- [ ] **Goal:** Library function `pub fn create_blank_hfsplus(size_bytes: u64, block_size: u32, name: &str, case_sensitive: bool) -> Vec<u8>` that emits a freshly formatted, mountable HFS+ or HFSX image.
+- [x] **Goal:** Library function `pub fn create_blank_hfsplus(size_bytes: u64, block_size: u32, name: &str, case_sensitive: bool) -> Vec<u8>` that emits a freshly formatted, mountable HFS+ or HFSX image.
 
 **Files:** `src/fs/hfsplus.rs`
 
