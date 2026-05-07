@@ -3470,6 +3470,8 @@ impl InspectTab {
 
         let cache_for_thread = Arc::clone(&cache);
         std::thread::spawn(move || {
+            let _wake =
+                rusty_backup::os::wakelock::acquire("Rusty Backup: Clonezilla metadata scan");
             let result = clonezilla::metadata_scan::scan_metadata(
                 &cache_for_thread,
                 ptype,
@@ -3552,6 +3554,8 @@ impl InspectTab {
 
         let data_path = data_path.clone();
         std::thread::spawn(move || {
+            let _wake =
+                rusty_backup::os::wakelock::acquire("Rusty Backup: build zstd seekable cache");
             let result = create_seekable_cache_from_zstd(&data_path, &cache_path, &status);
             if let Ok(mut s) = status.lock() {
                 s.finished = true;

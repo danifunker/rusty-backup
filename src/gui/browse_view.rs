@@ -1463,6 +1463,7 @@ impl BrowseView {
         self.extraction_result = None;
 
         std::thread::spawn(move || {
+            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: extract files");
             let result = run_extraction(
                 &session,
                 &entry,
@@ -1816,6 +1817,7 @@ impl BrowseView {
         }));
         let progress_thread = Arc::clone(&progress);
         std::thread::spawn(move || {
+            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: CHD diff flatten");
             let cancel = {
                 let p = Arc::clone(&progress_thread);
                 move || p.lock().map(|g| g.cancel_requested).unwrap_or(false)

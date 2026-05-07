@@ -567,6 +567,7 @@ impl OpticalDiscBrowseView {
         self.extraction_result = None;
 
         std::thread::spawn(move || {
+            let _wake = crate::os::wakelock::acquire("Rusty Backup: extract optical disc files");
             let result = (|| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let info = DiscImageInfo::open(&disc_path)?;
 
