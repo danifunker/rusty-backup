@@ -227,7 +227,7 @@ Lands before the clone is enabled in user-facing code so xattrs survive the roun
 
 ### Step 12 — Attribute B-tree read parity
 
-- [ ] **Goal:** Parsed in-memory representation of the attributes B-tree alongside the existing extents-overflow buffer, plus a `list_xattrs(cnid)` accessor.
+- [x] **Goal:** Parsed in-memory representation of the attributes B-tree alongside the existing extents-overflow buffer, plus a `list_xattrs(cnid)` accessor.
 
 **Files:** `src/fs/hfsplus.rs`
 

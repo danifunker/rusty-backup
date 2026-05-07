@@ -46,11 +46,18 @@ const HFSPLUS_FORK_DATA: u8 = 0x00;
 #[allow(dead_code)]
 const HFSPLUS_FORK_RESOURCE: u8 = 0xFF;
 
+/// Attributes B-tree record types (per Apple TN1150 / `hfs_format.h`).
+const HFSPLUS_ATTR_INLINE_DATA: u32 = 0x10;
+#[allow(dead_code)] // matched by Step 13 (xattr writes); kept for completeness
+const HFSPLUS_ATTR_FORK_DATA: u32 = 0x20;
+#[allow(dead_code)]
+const HFSPLUS_ATTR_EXTENTS: u32 = 0x30;
+
 /// HFS+ extent descriptor: start_block (u32) + block_count (u32).
 #[derive(Debug, Clone, Copy)]
-struct ExtentDescriptor {
-    start_block: u32,
-    block_count: u32,
+pub(crate) struct ExtentDescriptor {
+    pub(crate) start_block: u32,
+    pub(crate) block_count: u32,
 }
 
 impl ExtentDescriptor {
@@ -73,15 +80,15 @@ impl ExtentDescriptor {
 
 /// HFS+ fork data (80 bytes).
 #[derive(Debug, Clone)]
-struct ForkData {
-    logical_size: u64,
+pub(crate) struct ForkData {
+    pub(crate) logical_size: u64,
     // Preserved for VH round-trip; HFS+ on-disk fork data has a clump_size
     // slot at bytes [8..12]. We never tune it, but parsing/emitting the
     // named field keeps the serializer symmetric with the parser.
     #[allow(dead_code)]
-    clump_size: u32,
-    total_blocks: u32,
-    extents: [ExtentDescriptor; 8],
+    pub(crate) clump_size: u32,
+    pub(crate) total_blocks: u32,
+    pub(crate) extents: [ExtentDescriptor; 8],
 }
 
 impl ForkData {
@@ -121,6 +128,37 @@ impl ForkData {
             }; 8],
         }
     }
+}
+
+/// One extended-attribute record decoded from the attributes B-tree.
+///
+/// The HFS+ attributes file stores xattrs keyed by `(fileID, startBlock, name)`;
+/// inline records carry their value byte-for-byte, fork records carry a fork
+/// header pointing at a separate xattr fork (read on demand), and extents
+/// records carry continuation extents for forks larger than 8 inline extents.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // accessor fields are read in upcoming Step 13/14 callers
+pub(crate) struct XattrRecord {
+    pub name: String,
+    /// Starting block of the value within an attribute fork. `0` for inline
+    /// records and the first segment of fork-style records; nonzero for
+    /// `Extents` continuation records.
+    pub start_block: u32,
+    pub kind: XattrKind,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Fork/Extents variants are surfaced once xattr writes ship
+pub(crate) enum XattrKind {
+    /// Value stored directly in the B-tree record (the common case for
+    /// `com.apple.FinderInfo` and most `com.apple.*` keys).
+    Inline(Vec<u8>),
+    /// Value stored in its own fork; the inline 8 extents in `ForkData`
+    /// cover the value (or anchor a chain of `Extents` records).
+    Fork(ForkData),
+    /// Continuation extents for a fork-style xattr that needed more than
+    /// 8 extents.
+    Extents(Vec<ExtentDescriptor>),
 }
 
 /// HFS+ Volume Header (512 bytes at partition_offset + 1024).
@@ -695,27 +733,13 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
 
         // Load the attributes B-tree fork (with overflow extents if needed)
         // and walk its leaves to harvest fileIDs from each record key.
-        // HFS+ attribute key layout (after the 2-byte keyLength prefix):
-        //   pad (2) | fileID (4) | startBlock (4) | nameLen (2) | name (UTF-16BE)
-        let attr_data = read_fork_with_overflow(
-            &mut self.reader,
-            self.partition_offset,
-            self.vh.block_size,
-            &self.vh.attributes_file,
-            HFSPLUS_ATTRIBUTES_FILE_ID,
-            HFSPLUS_FORK_DATA,
-            self.extents_overflow_data.as_deref(),
-        )?;
-        if attr_data.len() < 14 + 106 {
-            return Err(FilesystemError::Parse(
-                "attributes file too small for B-tree header".into(),
-            ));
-        }
-        let attr_header = BTreeHeaderRecord::parse(&attr_data[14..14 + 106]);
+        let (attr_data, attr_header) = self
+            .ensure_attributes_loaded()?
+            .expect("attributes_file.logical_size > 0 must produce a header (checked just above)");
         let node_size = attr_header.node_size as usize;
         let mut cnids: HashSet<u32> = HashSet::new();
         hfs_common::walk_leaf_records::<(), _>(
-            &attr_data,
+            attr_data,
             attr_header.first_leaf_node,
             node_size,
             |_node_idx, _rec_idx, _abs_off, rec_bytes| {
@@ -738,6 +762,154 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         );
         self.xattr_cnids = Some(cnids);
         Ok(())
+    }
+
+    /// Lazy-load the attributes B-tree file into `self.attributes_data`. Returns
+    /// `Ok(None)` if the volume has no attributes file (`logical_size == 0`),
+    /// otherwise `Ok(Some((&[u8], header)))`.
+    ///
+    /// Subsequent calls reuse the cached buffer, so xattr lookups across many
+    /// CNIDs cost one fork read total.
+    fn ensure_attributes_loaded(
+        &mut self,
+    ) -> Result<Option<(&[u8], BTreeHeaderRecord)>, FilesystemError> {
+        if self.vh.attributes_file.logical_size == 0 {
+            return Ok(None);
+        }
+        if self.attributes_data.is_none() {
+            let data = read_fork_with_overflow(
+                &mut self.reader,
+                self.partition_offset,
+                self.vh.block_size,
+                &self.vh.attributes_file,
+                HFSPLUS_ATTRIBUTES_FILE_ID,
+                HFSPLUS_FORK_DATA,
+                self.extents_overflow_data.as_deref(),
+            )?;
+            if data.len() < 14 + 106 {
+                return Err(FilesystemError::Parse(
+                    "attributes file too small for B-tree header".into(),
+                ));
+            }
+            self.attributes_data = Some(data);
+        }
+        let data = self.attributes_data.as_deref().expect("just populated");
+        let header = BTreeHeaderRecord::parse(&data[14..14 + 106]);
+        Ok(Some((data, header)))
+    }
+
+    /// Return every extended-attribute record attached to `cnid`, decoded into
+    /// [`XattrRecord`]. Returns an empty vec if the volume has no attributes
+    /// file or `cnid` owns no xattrs.
+    ///
+    /// Inline payloads are decoded eagerly (the common case for
+    /// `com.apple.FinderInfo` and the rest of the `com.apple.*` namespace).
+    /// Fork/extents records are returned with their on-disk metadata; the
+    /// actual fork bytes are read on demand by Step 13's xattr write/read
+    /// path, not here.
+    ///
+    /// HFS+ attribute key layout (after the 2-byte keyLength prefix):
+    ///   pad (2) | fileID (4) | startBlock (4) | nameLen (2) | name (UTF-16BE)
+    /// Records are 2-byte aligned; data follows the key at the next even
+    /// offset and starts with a u32 record type (`HFSPLUS_ATTR_*`).
+    #[allow(dead_code)] // first user lands in Step 13/14 (xattr writes + clone replay)
+    pub(crate) fn list_xattrs(&mut self, cnid: u32) -> Result<Vec<XattrRecord>, FilesystemError> {
+        let Some((data, header)) = self.ensure_attributes_loaded()? else {
+            return Ok(Vec::new());
+        };
+        let node_size = header.node_size as usize;
+        let first_leaf = header.first_leaf_node;
+        let mut out: Vec<XattrRecord> = Vec::new();
+        hfs_common::walk_leaf_records::<(), _>(
+            data,
+            first_leaf,
+            node_size,
+            |_node_idx, _rec_idx, _abs_off, rec_bytes| {
+                if rec_bytes.len() < 2 {
+                    return None;
+                }
+                let key_len = BigEndian::read_u16(&rec_bytes[0..2]) as usize;
+                // key body must hold pad(2) + fileID(4) + startBlock(4) + nameLen(2)
+                if key_len < 12 || 2 + key_len > rec_bytes.len() {
+                    return None;
+                }
+                let file_id = BigEndian::read_u32(&rec_bytes[4..8]);
+                if file_id != cnid {
+                    return None;
+                }
+                let start_block = BigEndian::read_u32(&rec_bytes[8..12]);
+                let name_len = BigEndian::read_u16(&rec_bytes[12..14]) as usize;
+                let name_bytes_end = 14 + name_len * 2;
+                if name_bytes_end > 2 + key_len {
+                    return None;
+                }
+                let name = decode_utf16be(&rec_bytes[14..name_bytes_end]);
+
+                // Record data starts at next even offset after the key (the
+                // key body is always an even number of bytes — pad+id+sb+nl
+                // is 12 plus 2*name_len — so data immediately follows).
+                let data_off = 2 + key_len;
+                if data_off + 4 > rec_bytes.len() {
+                    return None;
+                }
+                let record_type = BigEndian::read_u32(&rec_bytes[data_off..data_off + 4]);
+                let kind = match record_type {
+                    HFSPLUS_ATTR_INLINE_DATA => {
+                        // recordType(4) + reserved[2](8) + attrSize(4) + attrData[attrSize]
+                        let header_end = data_off + 4 + 8 + 4;
+                        if header_end > rec_bytes.len() {
+                            return None;
+                        }
+                        let attr_size =
+                            BigEndian::read_u32(&rec_bytes[header_end - 4..header_end]) as usize;
+                        if header_end + attr_size > rec_bytes.len() {
+                            return None;
+                        }
+                        XattrKind::Inline(rec_bytes[header_end..header_end + attr_size].to_vec())
+                    }
+                    HFSPLUS_ATTR_FORK_DATA => {
+                        // recordType(4) + reserved(4) + HFSPlusForkData(80)
+                        let fork_off = data_off + 4 + 4;
+                        if fork_off + 80 > rec_bytes.len() {
+                            return None;
+                        }
+                        XattrKind::Fork(ForkData::parse(&rec_bytes[fork_off..fork_off + 80]))
+                    }
+                    HFSPLUS_ATTR_EXTENTS => {
+                        // recordType(4) + reserved(4) + 8 × ExtentDescriptor(8) = 64
+                        let ext_off = data_off + 4 + 4;
+                        if ext_off + 64 > rec_bytes.len() {
+                            return None;
+                        }
+                        let mut extents = Vec::with_capacity(8);
+                        for i in 0..8 {
+                            let e = ExtentDescriptor::parse(
+                                &rec_bytes[ext_off + i * 8..ext_off + (i + 1) * 8],
+                            );
+                            extents.push(e);
+                        }
+                        XattrKind::Extents(extents)
+                    }
+                    _ => {
+                        log::warn!(
+                            "[HFS+ list_xattrs] unknown attribute record type 0x{:x} \
+                             on cnid={} name={:?}; skipping",
+                            record_type,
+                            cnid,
+                            name
+                        );
+                        return None;
+                    }
+                };
+                out.push(XattrRecord {
+                    name,
+                    start_block,
+                    kind,
+                });
+                None
+            },
+        );
+        Ok(out)
     }
 
     /// List all children of a given parent CNID.
@@ -4007,6 +4179,118 @@ mod tests {
         img
     }
 
+    /// Build an editable HFS+ image whose attributes B-tree carries one inline
+    /// `com.apple.FinderInfo` record for `cnid` with `value` as the payload.
+    /// Used by the Step 12 round-trip test.
+    ///
+    /// Layout (4 KiB blocks, 256 total = 1 MiB image):
+    /// - Block 0: VH/boot region
+    /// - Block 1: allocation bitmap
+    /// - Blocks 2-5: catalog B-tree
+    /// - Blocks 6-7: attributes B-tree (header + leaf)
+    /// - Blocks 8..255: free
+    fn make_editable_hfsplus_image_with_inline_xattr(cnid: u32, value: &[u8]) -> Vec<u8> {
+        let mut img = make_editable_hfsplus_image();
+        let block_size = 4096u32;
+        let node_size = 4096usize;
+        let attr_start_block = 6u32;
+        let attr_blocks = 2u32;
+
+        // Mark blocks 6 and 7 allocated. Seed image had byte 0 = 0b11111100
+        // (blocks 0..=5); set bits 6..=7 of byte 0.
+        let bitmap_off = 1usize * block_size as usize;
+        img[bitmap_off] = 0xFF; // blocks 0..=7 allocated
+
+        // --- Header node (block 6, node 0) ---
+        let hdr_off = attr_start_block as usize * block_size as usize;
+        img[hdr_off + 8] = 1; // kind = header
+        BigEndian::write_u16(&mut img[hdr_off + 10..hdr_off + 12], 3);
+
+        let hr = hdr_off + 14;
+        BigEndian::write_u16(&mut img[hr..hr + 2], 1); // depth = 1
+        BigEndian::write_u32(&mut img[hr + 2..hr + 6], 1); // root_node = 1
+        BigEndian::write_u32(&mut img[hr + 6..hr + 10], 1); // leaf_records = 1
+        BigEndian::write_u32(&mut img[hr + 10..hr + 14], 1); // first_leaf = 1
+        BigEndian::write_u32(&mut img[hr + 14..hr + 18], 1); // last_leaf = 1
+        BigEndian::write_u16(&mut img[hr + 18..hr + 20], node_size as u16);
+        BigEndian::write_u16(&mut img[hr + 20..hr + 22], 512); // max_key_len
+        BigEndian::write_u32(&mut img[hr + 22..hr + 26], attr_blocks); // total_nodes = 2
+
+        // Offset table for header node (header(14) / user(142) / bitmap(270) /
+        // free(526) — same shape as the catalog header node).
+        let ot = hdr_off + node_size;
+        BigEndian::write_u16(&mut img[ot - 2..ot], 14);
+        BigEndian::write_u16(&mut img[ot - 4..ot - 2], 142);
+        BigEndian::write_u16(&mut img[ot - 6..ot - 4], 270);
+        BigEndian::write_u16(&mut img[ot - 8..ot - 6], 526);
+
+        // Node bitmap (record 2): mark nodes 0 and 1 allocated.
+        img[hdr_off + 270] = 0b11000000;
+
+        // --- Leaf node (block 7, node 1) carrying one inline xattr record ---
+        let leaf_off = hdr_off + node_size;
+        img[leaf_off + 8] = 0xFF; // kind = -1 (leaf)
+        img[leaf_off + 9] = 1; // height = 1
+        BigEndian::write_u16(&mut img[leaf_off + 10..leaf_off + 12], 1); // 1 record
+
+        // Build the record: key + record-data.
+        // Key body: pad(2) + fileID(4) + startBlock(4) + nameLen(2) + name UTF-16BE
+        let name = "com.apple.FinderInfo";
+        let name_utf16: Vec<u16> = name.encode_utf16().collect();
+        let name_byte_len = name_utf16.len() * 2;
+        let key_body_len = 12 + name_byte_len;
+        // recordType(4) + reserved[2](8) + attrSize(4) + attrData(value.len())
+        let data_section_len = 4 + 8 + 4 + value.len();
+        let rec_total = 2 + key_body_len + data_section_len;
+
+        let r0 = leaf_off + 14;
+        BigEndian::write_u16(&mut img[r0..r0 + 2], key_body_len as u16);
+        // pad already zero
+        BigEndian::write_u32(&mut img[r0 + 4..r0 + 8], cnid);
+        BigEndian::write_u32(&mut img[r0 + 8..r0 + 12], 0); // startBlock = 0
+        BigEndian::write_u16(&mut img[r0 + 12..r0 + 14], name_utf16.len() as u16);
+        for (i, ch) in name_utf16.iter().enumerate() {
+            BigEndian::write_u16(&mut img[r0 + 14 + i * 2..r0 + 14 + i * 2 + 2], *ch);
+        }
+        let data_off = r0 + 2 + key_body_len;
+        BigEndian::write_u32(&mut img[data_off..data_off + 4], HFSPLUS_ATTR_INLINE_DATA);
+        // reserved[2] (8 bytes) already zero
+        BigEndian::write_u32(&mut img[data_off + 12..data_off + 16], value.len() as u32);
+        img[data_off + 16..data_off + 16 + value.len()].copy_from_slice(value);
+
+        // Offset table: record 0 at 14, free-space at 14 + rec_total.
+        let lot = leaf_off + node_size;
+        BigEndian::write_u16(&mut img[lot - 2..lot], 14);
+        BigEndian::write_u16(&mut img[lot - 4..lot - 2], (14 + rec_total) as u16);
+
+        // Patch the volume header: point attributes_file at blocks 6..7,
+        // decrement free_blocks by 2.
+        let mut vh = HfsPlusVolumeHeader::parse(&img[1024..1536]).expect("parse seed VH");
+        vh.attributes_file = ForkData {
+            logical_size: (attr_blocks as u64) * (block_size as u64),
+            clump_size: 0,
+            total_blocks: attr_blocks,
+            extents: {
+                let mut e = [ExtentDescriptor {
+                    start_block: 0,
+                    block_count: 0,
+                }; 8];
+                e[0] = ExtentDescriptor {
+                    start_block: attr_start_block,
+                    block_count: attr_blocks,
+                };
+                e
+            },
+        };
+        vh.free_blocks -= attr_blocks;
+        vh.next_allocation = 8;
+        let vh_bytes = vh.serialize();
+        img[1024..1536].copy_from_slice(&vh_bytes);
+        let alt = img.len() - 1024;
+        img[alt..alt + 512].copy_from_slice(&vh_bytes);
+        img
+    }
+
     /// Build a minimal HFS+ image whose first leaf node holds the root folder
     /// record at `(parent=1, name=<volume_name>)` followed by N synthetic
     /// "child" records keyed by `(parent=2, name=childN)` — pushing the root
@@ -4600,6 +4884,38 @@ mod tests {
             FilesystemError::Unsupported(msg) => assert!(msg.contains("extended attributes")),
             other => panic!("expected Unsupported(extended attributes...), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_list_xattrs_round_trips_inline_finder_info() {
+        // Synthesize a 32-byte com.apple.FinderInfo inline xattr on CNID 17,
+        // assert list_xattrs returns it byte-for-byte and reports an empty
+        // list for an unrelated CNID.
+        let cnid = 17u32;
+        let finder_info: Vec<u8> = (0..32u8).collect();
+        let img = make_editable_hfsplus_image_with_inline_xattr(cnid, &finder_info);
+        let cursor = std::io::Cursor::new(img);
+        let mut fs = HfsPlusFilesystem::open(cursor, 0).unwrap();
+
+        let recs = fs.list_xattrs(cnid).expect("list_xattrs cnid=17");
+        assert_eq!(recs.len(), 1, "expected exactly one xattr record");
+        let rec = &recs[0];
+        assert_eq!(rec.name, "com.apple.FinderInfo");
+        assert_eq!(rec.start_block, 0);
+        match &rec.kind {
+            XattrKind::Inline(bytes) => assert_eq!(bytes, &finder_info),
+            other => panic!("expected Inline xattr, got {other:?}"),
+        }
+
+        // Unrelated CNID returns empty.
+        let none = fs.list_xattrs(99).expect("list_xattrs cnid=99");
+        assert!(none.is_empty(), "expected no xattrs for cnid=99");
+
+        // Volume with no attributes file (the seed image) returns empty too.
+        let bare = make_editable_hfsplus_image();
+        let mut bare_fs = HfsPlusFilesystem::open(std::io::Cursor::new(bare), 0).unwrap();
+        let empty = bare_fs.list_xattrs(cnid).expect("list_xattrs no attr file");
+        assert!(empty.is_empty(), "no attributes file → no records");
     }
 
     #[test]

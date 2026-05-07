@@ -45,9 +45,7 @@ mod imp {
     impl Drop for WakeLock {
         fn drop(&mut self) {
             if let Some(id) = self.id.take() {
-                unsafe {
-                    IOPMAssertionRelease(id);
-                }
+                IOPMAssertionRelease(id);
                 log::debug!("wakelock released (macOS)");
             }
         }
