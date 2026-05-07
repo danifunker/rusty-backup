@@ -1268,6 +1268,7 @@ impl RestoreTab {
             .info(format!("Starting restore to {}", target_path.display(),));
 
         std::thread::spawn(move || {
+            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: disk restore");
             if let Err(e) = restore::run_restore(config, Arc::clone(&progress_arc)) {
                 if let Ok(mut p) = progress_arc.lock() {
                     p.error = Some(format!("{e:#}"));
@@ -1354,6 +1355,7 @@ impl RestoreTab {
         ));
 
         std::thread::spawn(move || {
+            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: partition restore");
             if let Err(e) = rusty_backup::restore::single::run_single_partition_restore(
                 config,
                 Arc::clone(&progress_arc),
@@ -1743,6 +1745,7 @@ impl RestoreTab {
         ));
 
         std::thread::spawn(move || {
+            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: new-disk restore");
             if let Err(e) = rusty_backup::restore::single::run_single_partition_restore(
                 config,
                 Arc::clone(&progress_arc),

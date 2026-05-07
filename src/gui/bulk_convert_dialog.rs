@@ -673,6 +673,7 @@ pub fn start_bulk_convert(
 
     let status_thread = Arc::clone(&status);
     std::thread::spawn(move || {
+        let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: bulk convert");
         let status_panic = Arc::clone(&status_thread);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_bulk_convert(

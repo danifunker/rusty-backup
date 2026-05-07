@@ -590,6 +590,7 @@ impl OpticalTab {
         self.rip_running = true;
 
         std::thread::spawn(move || {
+            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: optical rip");
             if let Err(e) = rusty_backup::optical::run_rip(config, Arc::clone(&progress_arc)) {
                 if let Ok(mut p) = progress_arc.lock() {
                     p.error = Some(format!("{e:#}"));
@@ -618,6 +619,7 @@ impl OpticalTab {
         self.convert_running = true;
 
         std::thread::spawn(move || {
+            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: optical rip to CHD");
             let result = rip_to_chd_worker(
                 &device_path,
                 &chd_path,
@@ -676,6 +678,7 @@ impl OpticalTab {
         };
 
         std::thread::spawn(move || {
+            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: optical convert");
             let result = run_conversion(
                 &input_path,
                 &output_path,

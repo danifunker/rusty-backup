@@ -66,7 +66,7 @@ libc = "0.2"
 nix = { version = "0.31", features = ["fs", "mount", "user"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2-io-kit = { version = "0.3", default-features = false, features = ["libc"] }
+objc2-io-kit = { version = "0.3", default-features = false, features = ["libc", "pwr_mgt"] }
 objc2-disk-arbitration = { version = "0.3", default-features = false, features = ["DASession", "DADisk", "DADissenter", "libc"] }
 objc2-core-foundation = { version = "0.3", features = ["CFString", "CFDictionary", "CFNumber", "CFRunLoop", "CFURL"] }
 objc2-foundation = { version = "0.3", features = ["NSBundle", "NSString"] }
@@ -82,6 +82,7 @@ windows = { version = "0.62", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Registry",
+    "Win32_System_Power",
 ] }
 
 [build-dependencies]

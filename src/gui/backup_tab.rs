@@ -628,6 +628,7 @@ impl BackupTab {
         ));
 
         std::thread::spawn(move || {
+            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: whole-disk VHD backup");
             let status2 = Arc::clone(&status);
             let status3 = Arc::clone(&status);
             let result = export_whole_disk_vhd(
@@ -1192,6 +1193,7 @@ impl BackupTab {
         ));
 
         std::thread::spawn(move || {
+            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: disk backup");
             if let Err(e) = rusty_backup::backup::run_backup(config, Arc::clone(&progress_arc)) {
                 if let Ok(mut p) = progress_arc.lock() {
                     p.error = Some(format!("{e:#}"));

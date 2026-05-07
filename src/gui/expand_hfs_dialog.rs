@@ -318,6 +318,7 @@ impl ExpandHfsDialog {
         ));
 
         std::thread::spawn(move || {
+            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: expand HFS volume");
             let result = run_expand(source, target_size, target_bs, output, &status);
             let mut s = status.lock().expect("expand status lock");
             s.finished = true;
