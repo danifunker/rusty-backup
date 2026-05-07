@@ -34,10 +34,42 @@ You also want a **Linux VM** (any modern distro) handy for one specific task:
 generating tiny EFS test fixtures with `mkfs_efs`. macOS has no EFS userspace
 and `xfsprogs` does not include EFS. See "Test fixtures" below.
 
-A copy of the IRIX 6.5 disk image used during initial reconnaissance lives at
-`~/Downloads/IRIX6.5/irix65.chd` on the primary dev machine. It is 5.3 GiB
-compressed / 93 GiB logical, uncompressed CHD. Copy it to the second machine
-or re-download from the same source if continuing work elsewhere.
+**Source for dir1 (XFS v1 directory format):** the Linux kernel removed dir1
+years ago, so we need the historical SGI XFS source. Grab this single RPM:
+
+```
+kernel-source-2.4.2-SGI_XFS_1.0.i386.rpm   (22.5 MB)
+```
+
+Despite the `i386` suffix it's a noarch source-tree package. Extract with:
+
+```bash
+rpm2cpio kernel-source-2.4.2-SGI_XFS_1.0.i386.rpm | cpio -idmv
+# look in usr/src/linux-2.4.2/fs/xfs/
+#   xfs_dir.[ch]        — dir1 entry points
+#   xfs_dir_leaf.[ch]   — dir1 leaf format
+#   xfs_dir_sf.h        — dir1 shortform layout
+#   xfs_da_btree.[ch]   — shared B+tree code (used by both dir1 and dir2)
+```
+
+The other RPMs in that release directory (`kernel-2.4.2-…i386/i586/i686`,
+`kernel-smp-…`, `kernel-enterprise-…`, `kernel-headers-…`) are compiled
+x86 binaries or trimmed headers — **skip them**. The `.src.rpm` (25.3 MB) is
+a fallback only if the `kernel-source` RPM is unavailable.
+
+**Reference disk images** (do **not** commit to the repo):
+- `~/Downloads/IRIX6.5/irix65.chd` — 5.3 GiB compressed / 93 GiB logical,
+  uncompressed CHD. Used for initial reconnaissance and large-scale
+  verification.
+- `~/Downloads/SGI_imaged-001.sample.hda` — 5 MiB head of a real SGI hard
+  disk. Confirmed dir1-format XFS v4 (see "Known images on hand" below).
+  Excellent for verifying the partition table, XFS superblock detection,
+  AG0 header reads, root-inode lookup, and end-of-file truncation
+  handling. Use it as a local-only fixture.
+
+If continuing work on a different machine, copy these images over or
+re-acquire from the same sources. We will craft and commit small synthetic
+fixtures (Step 1) to stand in for them in CI.
 
 ---
 
@@ -49,23 +81,28 @@ NOT EFS — EFS was deleted from staging in 2022. Plan to clone an older tag.**
 | Component                     | In latest Linux? | Where to look                                                    |
 |-------------------------------|------------------|------------------------------------------------------------------|
 | SGI Volume Header partitions  | Yes              | `block/partitions/sgi.c`, `block/partitions/sgi.h`               |
-| XFS (modern, v5/CRC)          | Yes              | `fs/xfs/libxfs/` — especially `xfs_format.h`, `xfs_sb.c`, `xfs_dir2_*.c`, `xfs_bmap*.c`, `xfs_inode_buf.c` |
-| XFS v1/v2 compatibility paths | Yes (gated)      | Same files — search for `XFS_SB_VERSION_1` / `_2`, `xfs_sb_version_*` predicates |
+| XFS modern (v5/CRC)           | Yes              | `fs/xfs/libxfs/` — especially `xfs_format.h`, `xfs_sb.c`, `xfs_dir2_*.c`, `xfs_bmap*.c`, `xfs_inode_buf.c` |
+| XFS v1/v2 sb compat paths     | Yes (gated)      | Same files — search for `XFS_SB_VERSION_1` / `_2`, `xfs_sb_version_*` predicates |
+| **XFS dir1 (v1 directory)**   | **Removed**      | Gone before v2.6.x. Use `kernel-source-2.4.2-SGI_XFS_1.0.i386.rpm` `fs/xfs/xfs_dir*.[ch]`. |
 | EFS (read-only)               | **Removed**      | Last present in `fs/efs/` through kernel **v5.17** (Mar 2022). Removed from staging in v5.18+. |
 
-**Recommended clones for the implementation machine:**
+**Recommended sources on the implementation machine:**
 
 ```bash
-# Modern kernel: XFS + SGI partitions (shallow clone is fine).
+# Modern kernel: XFS v2/v4 + SGI partitions (shallow clone is fine).
 git clone --depth 1 https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
 # Older kernel containing fs/efs/. v5.15 is an LTS and definitely has it.
 git clone --depth 1 --branch v5.15 https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git linux-5.15-efs
+# Historical SGI XFS source (dir1) — see "Software prep" above.
+rpm2cpio kernel-source-2.4.2-SGI_XFS_1.0.i386.rpm | cpio -idmv
 ```
 
 `fs/efs/` in v5.15 is small (~1.5 KLOC, read-only) and is the cleanest
-existing reference for the EFS on-disk format. SGI's original `efs(4)` and
-`efs(5)` man pages are also worth a read if you can find an IRIX manpage
-mirror — they document the cylinder-group layout in plain English.
+existing reference for the EFS on-disk format. The 2.4.2-SGI source tree's
+`fs/xfs/xfs_dir*.[ch]` is the only readable reference for the dir1 format
+on disks predating dir2 (~IRIX 6.4). SGI's original `efs(4)` and `efs(5)`
+man pages are also worth a read if you can find an IRIX manpage mirror —
+they document the cylinder-group layout in plain English.
 
 **Beyond the kernel, you will also want:**
 
@@ -77,11 +114,13 @@ mirror — they document the cylinder-group layout in plain English.
    `db/`, `repair/`, and `libxfs/` are the read-only reference implementation.
    `xfs_db -r <image>` is what you'll use to verify our parser against ground
    truth during development.
-3. **Historical SGI IRIX XFS source** — released under GPL in May 2000. The
-   original tarball ("linux-xfs" and "irix-xfs") is mirrored in a few archives.
-   Only worth chasing if a behavior diverges between IRIX-era and Linux XFS;
-   for IRIX 6.5 disks the modern Linux code paths handle v1/v2 fine via the
-   versionnum gates.
+3. **2.4.2-SGI_XFS_1.0 kernel source** (`kernel-source-2.4.2-SGI_XFS_1.0.i386.rpm`)
+   — required for dir1. It's the only readable reference for the XFS v1
+   directory format, which real IRIX disks still use (confirmed against a
+   sampled real disk — `versionnum & DIRV2BIT == 0`). Modern Linux removed
+   dir1 long before the v5.15 baseline.
+4. **SGI IRIX XFS GPL drop (May 2000)** — older still. Only chase if
+   2.4.2-SGI proves to be missing some IRIX-specific quirk; otherwise skip.
 4. **Indy/Indigo² hardware service manuals** — only relevant if you end up
    debugging physical-disk reads on real SGI hardware. Skip unless needed.
 
@@ -118,17 +157,61 @@ These shape every step below; re-read CONTRIBUTING.md §"Where code lives" and
 
 ## Test fixtures
 
-Commit small fixtures under `tests/fixtures/sgi/`:
+Commit small synthetic fixtures under `tests/fixtures/sgi/`:
 
 | File                         | Size      | How to produce                                                          |
 |------------------------------|-----------|-------------------------------------------------------------------------|
-| `irix_volhdr.bin`            | 4 KiB     | `chdman extractraw -i irix65.chd -o /tmp/h.bin -ib 4096`, take first 4 KiB. Trim sensitive bits. |
-| `efs_small.img`              | 4 MiB     | On a Linux VM with the v5.15-era `efs` kernel module: `dd if=/dev/zero of=efs.img bs=1M count=4 && mkfs_efs efs.img && mount -o loop ...`, populate with a few small files, unmount. |
-| `xfs_v2_small.img`           | 16 MiB    | `mkfs.xfs -m crc=0,finobt=0 -d agcount=2 -b size=4096 xfs.img` (modern xfsprogs — pass the `-m` flags to disable v5/CRC features so the result resembles IRIX-era v2). |
+| `irix_volhdr.bin`            | 4 KiB     | `chdman extractraw -i irix65.chd -o /tmp/h.bin -ib 4096`, take first 4 KiB. |
+| `efs_small.img`              | 4 MiB     | On a Linux VM with the v5.15-era `efs` kernel module: `dd if=/dev/zero of=efs.img bs=1M count=4 && mkfs_efs efs.img && mount -o loop ...`, populate, unmount. |
+| `xfs_v2_dir2_small.img`      | 16 MiB    | `mkfs.xfs -m crc=0,finobt=0 -d agcount=2 -b size=4096 xfs.img` (modern xfsprogs; `-m` disables v5/CRC). Produces dir2. |
+| `xfs_v2_dir1_small.bin`      | ≤64 KiB   | Hand-crafted byte fixture: superblock with `versionnum & DIRV2 == 0`, one AG, one shortform-dir1 root inode with three entries, one extent-format file inode. Constructed in code (a builder helper under `#[cfg(test)]`) rather than via a real `mkfs` — no modern tool produces dir1. |
 
-The IRIX disk itself is **not** committed; the small fixtures are sufficient
-for unit tests and CI. Manual verification against `irix65.chd` happens
-locally during the relevant steps.
+**Real-world disks are not committed** (per project preference). Reference
+images live locally on the implementation machine (`~/Downloads/IRIX6.5/…`,
+`~/Downloads/SGI_imaged-001.sample.hda`). When we need a "real-disk parity"
+test, we'll craft a small synthetic image from the parameters captured in
+"Known images on hand" rather than committing source material.
+
+## Known images on hand
+
+Used for manual verification at the relevant steps. **Do not commit.**
+
+### `~/Downloads/IRIX6.5/irix65.chd`
+Uncompressed CHD, 5.3 GiB / 93 GiB logical. SGI Volume Header. Partition 0
+is XFS at LBA `0x41000`. Confirmed parameters (extracted via
+`chdman extractraw -isb 136314880 -ib 4096`):
+
+- XFS superblock `versionnum=0x30b4`: v4 + ATTR + NLINK + ALIGN + EXTFLG +
+  **DIRV2 = true** → dir2 directory format.
+- `blocksize=4096`, `inodesize=256`, `inopblock=16`, `agcount=24`,
+  `agblocks=1,048,576` (4 GiB each), `dblocks=24,542,720` (~93.5 GiB
+  partition), `rootino=128`, `inopblog=4`, `agblklog=20`, `blocklog=12`,
+  no realtime, no CRC/v5.
+
+This is the canonical **dir2** verification target.
+
+### `~/Downloads/SGI_imaged-001.sample.hda`
+First 5 MiB of a real SGI hard disk. Confirmed parameters (do not depend on
+this file in CI — these values are documented here so a synthetic
+equivalent can be built later):
+
+- SGI Volume Header (magic `0x0BE5A941`); `bootfile = "/unix"`,
+  `root_part_num = 0`, `swap_part_num = 1`.
+- Volume directory entries: `sgilabel`, `ide`, `sash`.
+- Partitions: `[0]` XFS first=4360 blocks=16,309,640; `[1]` RAW (swap)
+  first=16,314,000 blocks=1,536,000; `[8]` VOLHDR first=0 blocks=4360;
+  `[10]` VOLUME first=0 blocks=17,850,000.
+- XFS superblock at LBA 4360 (byte `0x221000`): `magic=XFSB`,
+  `versionnum=0x1094` (v4 + ATTR + ALIGN + EXTFLG; **DIRV2 = false** →
+  dir1 directory format), `blocksize=4096`, `sectsize=512`,
+  `inodesize=256`, `inopblock=16`, `agcount=8`, `agblocks=254839`,
+  `dblocks=2,038,705` (~7.96 GiB), `rootino=128`,
+  `inopblog=4`, `agblklog=18`, `blocklog=12`, no realtime, no CRC/v5.
+- Root inode at byte offset `0x229000` from start of image (well within
+  the 5 MiB sample), so superblock + AG0 headers + root inode are all
+  reachable for testing.
+
+This image is the canonical **dir1** verification target.
 
 ---
 
@@ -176,9 +259,13 @@ partition list with correct names. No filesystem support yet.
 
 **On-disk shape (all big-endian, sector 0):**
 - `0x000` magic `0x0BE5A941` (u32)
+- `0x004` `root_part_num` (u16), `swap_part_num` (u16)
+- `0x008` `bootfile[16]` — null-terminated path of standalone boot program
+- `0x018` 48 unused bytes
 - `0x048` 15 × 16-byte volume directory entries (`name[8]`, `block_num`, `bytes`)
-- `0x130` 16 × 12-byte partition entries (`blocks`, `first`, `type`)
-- `0x1FC` checksum (u32) — verify but don't reject on mismatch (log a warning); some images have stale checksums.
+- `0x138` 16 × 12-byte partition entries (`blocks`, `first`, `type`) — note: `0x138`, not `0x130`. Off-by-eight here will silently mis-decode.
+- `0x1F8` checksum (u32) — verify but don't reject on mismatch (log a warning); some images have stale checksums.
+- `0x1FC` 4-byte pad
 
 **SGI partition type → display name mapping:**
 ```
@@ -331,6 +418,22 @@ xfs_v2_small.img -c 'sb 0' -c 'p'` for ground truth.
 - Validate `sb_blocksize` is a power of two in [512, 65536].
 - Validate `sb_sectsize` ≥ 512.
 
+**Directory-format detection (must surface on `XfsFilesystem`):**
+The `DIRV2` bit (`0x2000`) of `sb_versionnum` selects dir1 vs dir2. Both
+formats exist in the wild on IRIX disks (the sampled real disk is dir1;
+modern `mkfs.xfs` always produces dir2). Decode this bit, store it on the
+`XfsFilesystem` struct as a `dir_format: DirFormat` enum, and:
+- log it at open time via `log_cb` (e.g. `XFS dir format: dir1` / `dir2`),
+- have `list_directory` and `read_file` (when reading a directory) dispatch
+  on it. In Step 6 only the dir2 arm is implemented; the dir1 arm returns
+  `Unsupported("XFS dir1 not yet supported")` and is filled in by Step 6b.
+
+**Graceful EOF requirement:** all reads in `xfs/` and `efs/` must treat a
+short read past the end of the underlying file/device as
+`FilesystemError::Io(UnexpectedEof)` with the partition byte offset, never
+panic. Truncated samples (e.g. the 5 MiB SGI sample) and damaged disks both
+produce this case; tests must cover it.
+
 **Tasks:**
 1. `types.rs`: struct definitions for `XfsDsb`, `XfsAgf`, `XfsAgi`,
    `XfsAgfl`, `XfsDinodeCore`. Big-endian throughout.
@@ -370,11 +473,13 @@ a clear "not yet implemented" error.
 
 ---
 
-### Step 6 — XFS shortform + block directories, extent-list reader
+### Step 6 — XFS dir2 shortform + block directories, extent-list reader
 
-**Goal:** list and read files from an XFS partition where every directory
-fits in shortform or one block, and every file uses extent-list format
-(`di_format == 2`). Covers the vast majority of IRIX root-disk files.
+**Goal:** list and read files from an XFS **dir2** partition where every
+directory fits in shortform or one block, and every file uses extent-list
+format (`di_format == 2`). Covers `xfs_v2_dir2_small.img` and any IRIX disk
+with the `DIRV2` feature bit set. dir1 disks (the sampled real disk) are
+covered in Step 6b.
 
 **Branch:** `add-xfs-step2-browse`
 
@@ -426,17 +531,81 @@ fits in shortform or one block, and every file uses extent-list format
 - Integration: open `xfs_v2_small.img`, list `/`, descend two levels,
   read a known file, compare bytes.
 
-**Acceptance:** GUI browse + extract works on `xfs_v2_small.img` and on the
-real IRIX disk for any directory that fits this subset. Files with
-btree-format extents and dirs in leaf/node format show a clear error.
+**Acceptance:** GUI browse + extract works on `xfs_v2_dir2_small.img` and on
+the IRIX 6.5 disk (assuming dir2; verify in Step 1) for any directory that
+fits this subset. Files with btree-format extents and dirs in leaf/node
+format show a clear error. dir1 disks still fail with a clear `Unsupported`
+message.
 
 ---
 
-### Step 7 — XFS leaf/node directories + bmap btree (conditional)
+### Step 6b — XFS dir1 directories (real-IRIX support)
 
-**Goal:** handle the remaining XFS formats. **Run `xfs_db` against
-`irix65.chd` first** to determine whether this is needed for browseable
-files in IRIX 6.5. If not, this step can be deferred indefinitely.
+**Goal:** list and read files from XFS partitions whose `DIRV2` bit is
+clear — i.e., disks using the original IRIX dir1 directory format. The
+sampled SGI disk (`SGI_imaged-001.sample.hda`) is the canonical target;
+some IRIX 6.x systems will also use dir1.
+
+**Branch:** `add-xfs-step2b-dir1`
+
+**Reference:** `kernel-source-2.4.2-SGI_XFS_1.0/fs/xfs/`:
+- `xfs_dir.h`, `xfs_dir.c` — dir1 entry points and dispatcher
+- `xfs_dir_sf.h`, `xfs_dir_sf.c` — shortform-dir1 layout (different from dir2)
+- `xfs_dir_leaf.h`, `xfs_dir_leaf.c` — leaf-dir1 layout
+- `xfs_da_btree.[ch]` — shared B+tree code (same as dir2 uses)
+
+The XFS Algorithms PDF does **not** document dir1; this RPM is the only
+readable spec.
+
+**Files:**
+- `src/fs/xfs/dir1.rs` — new, parallel to `dir2.rs`
+- `src/fs/xfs/mod.rs` — extend the `dir_format` dispatch added in Step 5
+
+**On-disk shape (highlights — full layout in the 2.4.2 sources):**
+- **Shortform-dir1 (`xfs_dir_shortform_t`):** header is `xfs_dir_sf_hdr_t`
+  with parent inumber + `count` (u8). Each entry is
+  `xfs_dir_sf_entry_t`: `inumber` (8 bytes), `namelen` (u8), `name[]`.
+  Note these are NOT the same fields as dir2 shortform (no `i8count`,
+  fixed 8-byte inumber width). Differentiate carefully.
+- **Leaf-dir1 (`xfs_dir_leafblock_t`):** magic `0xfeeb`. Header
+  (`xfs_da_blkinfo_t` + counts), leaf entries, name-list region. Naming
+  conventions differ from dir2 (e.g. `xfs_dir_leaf_entry_t`).
+- **Node-dir1:** uses the shared `xfs_da_intnode_t` (same code as dir2's
+  node walk — the `xfs_da_btree.c` from 2.4.2-SGI is structurally
+  unchanged). For browse we again only need to enumerate child blocks in
+  order, not perform hash lookups.
+
+**Tasks:**
+1. Decode `xfs_dir_sf_hdr_t` + `xfs_dir_sf_entry_t` for `di_format=local`
+   when the parent FS is dir1.
+2. Decode leaf-dir1 blocks for `di_format=extents` when the parent FS is
+   dir1 and `di_size <= sb.dirblksize`.
+3. Decode node-dir1 (chained leaves) for larger directories. Like dir2 we
+   walk by data-block order rather than the hash btree.
+4. Wire dispatch in `xfs/mod.rs::list_directory` so dir1 cases route here
+   and dir2 cases route to `dir2.rs`. File reads (extent-list / btree)
+   are format-independent and reuse Steps 6 / 7 code.
+
+**Tests** (alongside `dir1.rs`):
+- Hand-built shortform-dir1 buffers: 0 entries, 1 entry, 5 entries, one
+  with a 255-char name, parent inumber preserved on round-trip.
+- Hand-built leaf-dir1 block (the `xfs_v2_dir1_small.bin` synthetic
+  fixture covers this end-to-end).
+- Integration: open `xfs_v2_dir1_small.bin` (or, locally, the `.hda`
+  sample), list `/`, read a known file.
+
+**Acceptance:** the SGI sample disk lists and extracts files cleanly. The
+dir1 detection log line appears on open. dir2 path remains unaffected.
+
+---
+
+### Step 7 — XFS leaf/node dir2 directories + bmap btree (conditional)
+
+**Goal:** handle the remaining XFS formats — leaf/node directories (dir2
+only; dir1 leaf/node landed in Step 6b) and btree-format extents in files.
+**Run `xfs_db` against `irix65.chd` first** to determine whether this is
+needed for browseable files in IRIX 6.5. If not, this step can be deferred
+indefinitely.
 
 **Branch:** `add-xfs-step3-leaf-node-and-btree`
 
