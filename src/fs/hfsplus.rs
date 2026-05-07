@@ -578,6 +578,22 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         self.vh.finder_info
     }
 
+    pub(crate) fn vh_free_blocks(&self) -> u32 {
+        self.vh.free_blocks
+    }
+
+    #[allow(dead_code)] // used in later HFS+ clone steps
+    pub(crate) fn vh_next_catalog_id(&self) -> u32 {
+        self.vh.next_catalog_id
+    }
+
+    /// Read and return the allocation-file bitmap. Routes through the
+    /// extents-overflow-aware fork reader, so volumes whose allocation file
+    /// spills past 8 inline extents work correctly.
+    pub(crate) fn read_allocation_bitmap_for_fsck(&mut self) -> Result<Vec<u8>, FilesystemError> {
+        self.read_allocation_bitmap()
+    }
+
     pub(crate) fn attributes_file_size(&self) -> u64 {
         self.vh.attributes_file.logical_size
     }
@@ -1970,6 +1986,10 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
             return self.lookup_folder_name(cnid_x);
         }
         self.lookup_folder_name(cnid)
+    }
+
+    fn fsck(&mut self) -> Option<Result<super::fsck::FsckResult, FilesystemError>> {
+        Some(super::hfsplus_fsck::check(self))
     }
 }
 
