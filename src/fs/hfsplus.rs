@@ -30,6 +30,17 @@ const HFSPLUS_ATTRIBUTES_FILE_ID: u32 = 8;
 /// replay is implemented — see Step 4 of `docs/hfsplus_enhancements.md`.
 const HFSPLUS_VOLUME_JOURNALED_BIT: u32 = 0x2000;
 
+/// `kHFSVolumeUnmountedBit` — set in `vh.attributes` to mark a cleanly-
+/// unmounted volume. Mac OS refuses to mount volumes without this bit
+/// (it triggers a "needs scavenging" path).
+const HFSPLUS_VOLUME_UNMOUNTED_BIT: u32 = 0x100;
+
+/// HFS+ B-tree `keyCompareType` byte values (BTHeaderRec offset 37 in
+/// node 0). Plain HFS+ uses case-folding NFD compare; HFSX with the
+/// case-sensitive attribute uses binary compare.
+const KEY_COMPARE_CASE_FOLDING: u8 = 0xCF;
+const KEY_COMPARE_BINARY: u8 = 0xBC;
+
 /// Fork-type byte used in extents-overflow keys.
 const HFSPLUS_FORK_DATA: u8 = 0x00;
 #[allow(dead_code)]
@@ -3031,6 +3042,330 @@ impl<R: Read + Seek> Read for CompactHfsPlusReader<R> {
     }
 }
 
+// --- Blank-volume builder ---
+
+/// Build a freshly-formatted, mountable HFS+ (or HFSX) image as a raw byte
+/// buffer.
+///
+/// Layout (sized for `block_size` ≤ `node_size`; node_size is fixed at
+/// 4096 to match Apple's default):
+///
+/// - Block 0: VH region (1024 boot bytes + primary VH at byte 1024)
+/// - Bitmap blocks: enough to hold `total_blocks / 8` bytes
+/// - Extents-overflow B-tree: 4 nodes (header + empty leaf + 2 free)
+/// - Catalog B-tree: 4 nodes (header + leaf with root folder + thread)
+/// - Free user-data area
+/// - Last 1024 bytes: alt VH (mirror of primary)
+///
+/// The catalog leaf carries two records: the root folder thread keyed by
+/// `(parent=2, name="")` (data: `recordType=3`, `parentID=1`, nodeName =
+/// `name`) and the root folder record keyed by `(parent=1, name=name)`
+/// (data: `recordType=1`, `folderID=2`, valence=0, dates set to now).
+///
+/// `case_sensitive=true` produces an HFSX volume (signature `H+`/`HX`,
+/// catalog header `keyCompareType = kHFSBinaryCompare`); `false` produces
+/// plain HFS+ with case-folding compare. The journaled bit is never set —
+/// edit mode refuses journaled volumes (Step 4) so a freshly built blank
+/// must opt out.
+///
+/// Panics if `size_bytes` is too small to hold the reserved region or if
+/// `block_size` isn't a power of 2 in `[512, 4096]`.
+pub fn create_blank_hfsplus(
+    size_bytes: u64,
+    block_size: u32,
+    name: &str,
+    case_sensitive: bool,
+) -> Vec<u8> {
+    assert!(
+        block_size.is_power_of_two() && (512..=4096).contains(&block_size),
+        "block_size must be a power of 2 in [512, 4096], got {block_size}"
+    );
+    let bs = block_size as u64;
+    let total_blocks = (size_bytes / bs) as u32;
+    assert!(total_blocks >= 64, "image too small ({size_bytes} bytes)");
+
+    // node_size pinned at 4096 — Apple's default and what every existing
+    // helper in this file assumes (compute_record_offsets, etc.).
+    let node_size: usize = 4096;
+    let nodes_per_block: u32 = (node_size as u32 / block_size).max(1);
+    let blocks_per_node: u32 = (block_size / node_size as u32).max(1);
+    // node_size >= block_size in our supported range, so nodes_per_block
+    // is always 1 in practice. Keep the variable for clarity.
+    let _ = nodes_per_block;
+
+    // 4 nodes for each B-tree. node_size=4096, block_size in [512,4096]:
+    // bs=512 → 8 blocks per node, 32 blocks per tree
+    // bs=1024 → 4 blocks per node, 16 blocks per tree
+    // bs=2048 → 2 blocks per node, 8 blocks per tree
+    // bs=4096 → 1 block per node, 4 blocks per tree
+    let btree_node_count: u32 = 4;
+    let btree_blocks: u32 = btree_node_count * blocks_per_node;
+
+    // Bitmap covers total_blocks bits, packed into bytes, rounded up to
+    // a whole block.
+    let bitmap_bytes = total_blocks.div_ceil(8) as u64;
+    let bitmap_blocks = ((bitmap_bytes + bs - 1) / bs) as u32;
+
+    let bitmap_start: u32 = 1;
+    let extents_start: u32 = bitmap_start + bitmap_blocks;
+    let catalog_start: u32 = extents_start + btree_blocks;
+    let reserved_blocks: u32 = catalog_start + btree_blocks;
+    assert!(
+        reserved_blocks + 1 < total_blocks,
+        "image too small for reserved region: need {} blocks, have {total_blocks}",
+        reserved_blocks + 1
+    );
+
+    let image_size = total_blocks as usize * block_size as usize;
+    let mut img = vec![0u8; image_size];
+
+    // --- Allocation bitmap ---
+    {
+        let bitmap_off = bitmap_start as usize * block_size as usize;
+        let bitmap = &mut img[bitmap_off..bitmap_off + (bitmap_bytes as usize).max(1)];
+        for blk in 0..reserved_blocks {
+            // MSB-first big-endian: bit position (7 - blk%8) of byte (blk/8).
+            let byte_idx = (blk / 8) as usize;
+            let bit_pos = 7 - (blk % 8);
+            bitmap[byte_idx] |= 1 << bit_pos;
+        }
+    }
+
+    // --- Extents-overflow B-tree (header + empty leaf) ---
+    {
+        let off = extents_start as usize * block_size as usize;
+        write_blank_btree_header_node(
+            &mut img[off..off + node_size],
+            node_size,
+            /* leaf_records= */ 0,
+            /* total_nodes= */ btree_node_count,
+            /* free_nodes= */ btree_node_count - 2, // header + empty leaf used
+            /* max_key_len= */ 10,
+            /* key_compare_type= */ 0, // unused for extents
+        );
+        let leaf_off = off + node_size;
+        write_empty_leaf_node(&mut img[leaf_off..leaf_off + node_size]);
+    }
+
+    // --- Catalog B-tree (header + leaf with root + thread) ---
+    let nfd_name: String = name.nfd().collect();
+    let name_utf16: Vec<u16> = nfd_name.encode_utf16().collect();
+    {
+        let off = catalog_start as usize * block_size as usize;
+        let key_compare = if case_sensitive {
+            KEY_COMPARE_BINARY
+        } else {
+            KEY_COMPARE_CASE_FOLDING
+        };
+        write_blank_btree_header_node(
+            &mut img[off..off + node_size],
+            node_size,
+            /* leaf_records= */ 2,
+            btree_node_count,
+            btree_node_count - 2,
+            /* max_key_len= */ 516, // HFS+ catalog max key
+            key_compare,
+        );
+        let leaf_off = off + node_size;
+        write_root_catalog_leaf(&mut img[leaf_off..leaf_off + node_size], &name_utf16);
+    }
+
+    // --- Volume header ---
+    let signature = if case_sensitive {
+        HFSX_SIGNATURE
+    } else {
+        HFS_PLUS_SIGNATURE
+    };
+    let now = hfs_common::hfs_now();
+    let vh = HfsPlusVolumeHeader {
+        signature,
+        version: if case_sensitive { 5 } else { 4 },
+        attributes: HFSPLUS_VOLUME_UNMOUNTED_BIT,
+        last_mounted_version: 0,
+        journal_info_block: 0,
+        create_date: now,
+        modify_date: now,
+        backup_date: 0,
+        checked_date: now,
+        file_count: 0,
+        folder_count: 1, // root folder
+        block_size,
+        total_blocks,
+        free_blocks: total_blocks - reserved_blocks,
+        next_allocation: reserved_blocks,
+        rsrc_clump_size: block_size,
+        data_clump_size: block_size,
+        next_catalog_id: 16,
+        write_count: 0,
+        encodings_bitmap: 1, // bit 0 = MacRoman, conventional default
+        finder_info: [0u32; 8],
+        allocation_file: ForkData {
+            logical_size: bitmap_blocks as u64 * bs,
+            clump_size: 0,
+            total_blocks: bitmap_blocks,
+            extents: extent_array(bitmap_start, bitmap_blocks),
+        },
+        extents_file: ForkData {
+            logical_size: btree_blocks as u64 * bs,
+            clump_size: 0,
+            total_blocks: btree_blocks,
+            extents: extent_array(extents_start, btree_blocks),
+        },
+        catalog_file: ForkData {
+            logical_size: btree_blocks as u64 * bs,
+            clump_size: 0,
+            total_blocks: btree_blocks,
+            extents: extent_array(catalog_start, btree_blocks),
+        },
+        attributes_file: ForkData::empty(),
+        startup_file: ForkData::empty(),
+    };
+    let vh_bytes = vh.serialize();
+
+    // Primary VH at offset 1024.
+    img[1024..1536].copy_from_slice(&vh_bytes);
+    // Alt VH 1024 bytes from the end.
+    let alt = image_size - 1024;
+    img[alt..alt + 512].copy_from_slice(&vh_bytes);
+
+    img
+}
+
+/// Helper for `create_blank_hfsplus`: build a single-extent inline array.
+fn extent_array(start: u32, count: u32) -> [ExtentDescriptor; 8] {
+    let mut e = [ExtentDescriptor {
+        start_block: 0,
+        block_count: 0,
+    }; 8];
+    e[0] = ExtentDescriptor {
+        start_block: start,
+        block_count: count,
+    };
+    e
+}
+
+/// Stamp a B-tree header node into `node` (must be exactly `node_size`
+/// bytes). Lays out three records — header(106), user-data(128), node
+/// bitmap (rest) — and marks node 0 (header) and node 1 (leaf) as
+/// allocated in the node bitmap.
+fn write_blank_btree_header_node(
+    node: &mut [u8],
+    node_size: usize,
+    leaf_records: u32,
+    total_nodes: u32,
+    free_nodes: u32,
+    max_key_len: u16,
+    key_compare_type: u8,
+) {
+    node.fill(0);
+    node[8] = 1; // kind = header
+    BigEndian::write_u16(&mut node[10..12], 3); // 3 records
+
+    // Record 0: BTHeaderRec at offset 14 (106 bytes).
+    let hr = 14usize;
+    BigEndian::write_u16(&mut node[hr..hr + 2], 1); // depth = 1
+    BigEndian::write_u32(&mut node[hr + 2..hr + 6], 1); // root = 1
+    BigEndian::write_u32(&mut node[hr + 6..hr + 10], leaf_records);
+    BigEndian::write_u32(&mut node[hr + 10..hr + 14], 1); // first leaf
+    BigEndian::write_u32(&mut node[hr + 14..hr + 18], 1); // last leaf
+    BigEndian::write_u16(&mut node[hr + 18..hr + 20], node_size as u16);
+    BigEndian::write_u16(&mut node[hr + 20..hr + 22], max_key_len);
+    BigEndian::write_u32(&mut node[hr + 22..hr + 26], total_nodes);
+    BigEndian::write_u32(&mut node[hr + 26..hr + 30], free_nodes);
+    // BTHeaderRec offset 36 = btreeType (0=control); offset 37 = keyCompareType
+    node[hr + 36] = 0; // kBTHFSTreeType
+    node[hr + 37] = key_compare_type;
+
+    // Record 1: 128-byte user data at offset 142 (after 14+106=120, but
+    // 128-aligned for clarity → start at 142 to match make_editable_hfsplus_image).
+    let user_off: u16 = 142;
+    let bitmap_off: u16 = 270;
+    let free_off: u16 = (node_size as u16).saturating_sub(8); // some headroom
+
+    let ot_end = node_size;
+    BigEndian::write_u16(&mut node[ot_end - 2..ot_end], 14); // record 0
+    BigEndian::write_u16(&mut node[ot_end - 4..ot_end - 2], user_off);
+    BigEndian::write_u16(&mut node[ot_end - 6..ot_end - 4], bitmap_off);
+    BigEndian::write_u16(&mut node[ot_end - 8..ot_end - 6], free_off);
+
+    // Mark nodes 0 and 1 allocated in the bitmap.
+    node[bitmap_off as usize] = 0b11000000;
+}
+
+/// Write an empty leaf node (kind=-1, height=1, 0 records).
+fn write_empty_leaf_node(node: &mut [u8]) {
+    node.fill(0);
+    node[8] = 0xFF; // kind = -1
+    node[9] = 1; // height
+    BigEndian::write_u16(&mut node[10..12], 0); // 0 records
+    let n = node.len();
+    BigEndian::write_u16(&mut node[n - 2..n], 14); // free-space offset
+}
+
+/// Write the catalog leaf node containing the root folder record (key =
+/// `(parent=1, name=<volume>)`) and the root thread record (key =
+/// `(parent=2, name="")`, data = recordType=3 + parentID=1 + name=volume).
+fn write_root_catalog_leaf(node: &mut [u8], name_utf16: &[u16]) {
+    node.fill(0);
+    let n = node.len();
+    node[8] = 0xFF; // kind = -1 leaf
+    node[9] = 1; // height
+    BigEndian::write_u16(&mut node[10..12], 2); // 2 records
+
+    let now = hfs_common::hfs_now();
+
+    // ---- Record 0: root folder record ----
+    // Key: key_len(2) + parent_id(4) + name_len(2) + name(UTF-16BE)
+    let r0_off = 14usize;
+    let key_body = 4 + 2 + name_utf16.len() * 2;
+    BigEndian::write_u16(&mut node[r0_off..r0_off + 2], key_body as u16);
+    BigEndian::write_u32(&mut node[r0_off + 2..r0_off + 6], 1); // parent = 1
+    BigEndian::write_u16(&mut node[r0_off + 6..r0_off + 8], name_utf16.len() as u16);
+    for (i, &u) in name_utf16.iter().enumerate() {
+        BigEndian::write_u16(&mut node[r0_off + 8 + i * 2..r0_off + 10 + i * 2], u);
+    }
+    let mut r0_data = r0_off + 2 + key_body;
+    if !r0_data.is_multiple_of(2) {
+        r0_data += 1;
+    }
+    BigEndian::write_i16(&mut node[r0_data..r0_data + 2], CATALOG_FOLDER);
+    // valence = 0 at +4, folderID = 2 at +8, then dates.
+    BigEndian::write_u32(&mut node[r0_data + 8..r0_data + 12], 2);
+    BigEndian::write_u32(&mut node[r0_data + 12..r0_data + 16], now);
+    BigEndian::write_u32(&mut node[r0_data + 16..r0_data + 20], now);
+    BigEndian::write_u32(&mut node[r0_data + 20..r0_data + 24], now);
+    BigEndian::write_u32(&mut node[r0_data + 24..r0_data + 28], now);
+    let r0_end = r0_data + 88; // folder record is 88 bytes total
+
+    // ---- Record 1: root thread record ----
+    // Key: key_len(2) + parent_id(4=2) + name_len(2=0)
+    let r1_off = r0_end;
+    BigEndian::write_u16(&mut node[r1_off..r1_off + 2], 6); // key_len
+    BigEndian::write_u32(&mut node[r1_off + 2..r1_off + 6], 2); // parent = 2 (root CNID)
+    BigEndian::write_u16(&mut node[r1_off + 6..r1_off + 8], 0); // name_len = 0
+    let mut r1_data = r1_off + 2 + 6;
+    if !r1_data.is_multiple_of(2) {
+        r1_data += 1;
+    }
+    // Thread data: type(2)=3, reserved(2)=0, parentID(4)=1, name_len(2),
+    // name(UTF-16BE).
+    BigEndian::write_i16(&mut node[r1_data..r1_data + 2], 3); // folder thread
+    BigEndian::write_u32(&mut node[r1_data + 4..r1_data + 8], 1);
+    BigEndian::write_u16(
+        &mut node[r1_data + 8..r1_data + 10],
+        name_utf16.len() as u16,
+    );
+    for (i, &u) in name_utf16.iter().enumerate() {
+        BigEndian::write_u16(&mut node[r1_data + 10 + i * 2..r1_data + 12 + i * 2], u);
+    }
+    let r1_end = r1_data + 10 + name_utf16.len() * 2;
+
+    // Offset table at the end of the node.
+    BigEndian::write_u16(&mut node[n - 2..n], 14); // record 0 offset
+    BigEndian::write_u16(&mut node[n - 4..n - 2], r1_off as u16);
+    BigEndian::write_u16(&mut node[n - 6..n - 4], r1_end as u16); // free-space offset
+}
+
 // --- Resize and validation ---
 
 /// Resize an HFS+ filesystem in place.
@@ -3773,6 +4108,71 @@ mod tests {
             .expect("clean volume should accept edit prep");
         // No xattrs on the synthetic image — the cached set is empty.
         assert!(fs.xattr_cnids.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_create_blank_hfsplus_32mib() {
+        let img = create_blank_hfsplus(32 * 1024 * 1024, 4096, "MyVol", false);
+        assert_eq!(img.len(), 32 * 1024 * 1024);
+
+        let cursor = std::io::Cursor::new(img);
+        let mut fs = HfsPlusFilesystem::open(cursor, 0).expect("blank should open");
+        assert_eq!(fs.fs_type(), "HFS+");
+        assert_eq!(fs.label, "MyVol");
+
+        let root = fs.root().unwrap();
+        let entries = fs.list_directory(&root).unwrap();
+        assert!(entries.is_empty(), "freshly built blank must list empty");
+
+        // 32 MiB / 4096 = 8192 blocks; reserved = 1 (VH) + 1 (bitmap) + 4
+        // (extents) + 4 (catalog) = 10. Free = 8182.
+        assert_eq!(fs.vh.total_blocks, 8192);
+        assert_eq!(fs.vh.free_blocks, 8192 - 10);
+        // Edit-mode prep should succeed (unmounted bit set, no journal).
+        fs.prepare_for_edit().expect("blank must accept edit prep");
+    }
+
+    #[test]
+    fn test_create_blank_hfsx_32mib_signature() {
+        let img = create_blank_hfsplus(32 * 1024 * 1024, 4096, "CSVol", true);
+        let cursor = std::io::Cursor::new(img);
+        let mut fs = HfsPlusFilesystem::open(cursor, 0).expect("HFSX blank should open");
+        assert_eq!(fs.fs_type(), "HFSX");
+        assert!(fs.vh.is_hfsx());
+        assert_eq!(fs.label, "CSVol");
+        let root = fs.root().unwrap();
+        assert!(fs.list_directory(&root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_create_blank_hfsplus_supports_create_file() {
+        // Round-trip: build a blank, create a file inside it, sync, reopen.
+        let img = create_blank_hfsplus(32 * 1024 * 1024, 4096, "Work", false);
+        let cursor = std::io::Cursor::new(img);
+        let mut fs = HfsPlusFilesystem::open(cursor, 0).unwrap();
+        fs.prepare_for_edit().unwrap();
+        let root = fs.root().unwrap();
+        let payload = b"hello world".to_vec();
+        let mut data = std::io::Cursor::new(payload.clone());
+        fs.create_file(
+            &root,
+            "hello.txt",
+            &mut data,
+            payload.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .expect("create_file on blank");
+        fs.sync_metadata().unwrap();
+
+        let img2 = fs.reader.into_inner();
+        let mut cursor2 = std::io::Cursor::new(img2);
+        let mut fs2 = HfsPlusFilesystem::open(&mut cursor2, 0).unwrap();
+        let root2 = fs2.root().unwrap();
+        let entries = fs2.list_directory(&root2).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "hello.txt");
+        let got = fs2.read_file(&entries[0], 1024).unwrap();
+        assert_eq!(got, payload);
     }
 
     #[test]
