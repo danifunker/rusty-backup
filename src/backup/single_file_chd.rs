@@ -1258,18 +1258,52 @@ fn build_partition_reader(
     }
 
     // Raw passthrough at the partition's source offset, capped to
-    // partition length. The take() guard is critical: even a stray over-read
-    // would push subsequent segments off-position in the stream.
-    let mut clone = source_file
+    // partition length.
+    //
+    // A naive `clone.seek(part_offset)` + `BufReader<File>` is unsafe
+    // here when more than one raw-passthrough segment is in play: on
+    // Unix `try_clone()` uses dup(), and dup'd file descriptors share
+    // the seek offset. The next call to `build_partition_reader` would
+    // re-seek the shared fd to its own partition's offset, retroactively
+    // moving the cursor of every previously-built reader. The
+    // `DiskImageStream` would then read partition bodies from the wrong
+    // disk locations.
+    //
+    // `PositionedSegmentReader` sidesteps this by tracking its own
+    // logical offset and seeking + reading on every `read()`. The seek
+    // is cheap on regular files; on raw devices it's amortised by the
+    // 256 KiB+ chunks the CHD encoder pulls.
+    let clone = source_file
         .try_clone()
         .context("failed to clone source for raw passthrough")?;
-    clone.seek(SeekFrom::Start(part_offset)).with_context(|| {
-        format!(
-            "failed to seek source to partition-{} offset {}",
-            part.index, part_offset
-        )
-    })?;
-    Ok(Box::new(BufReader::new(clone).take(part_length)))
+    Ok(Box::new(PositionedSegmentReader {
+        file: clone,
+        pos: part_offset,
+        end: part_offset + part_length,
+    }))
+}
+
+/// Forward-only reader over a fixed `[start, end)` byte range of a
+/// `File`. Re-seeks before each read so that other clones of the same
+/// underlying file descriptor (which share the kernel-level offset on
+/// Unix) can't shift this reader's position out from under it.
+struct PositionedSegmentReader {
+    file: File,
+    pos: u64,
+    end: u64,
+}
+
+impl Read for PositionedSegmentReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.end {
+            return Ok(0);
+        }
+        let want = ((self.end - self.pos) as usize).min(buf.len());
+        self.file.seek(SeekFrom::Start(self.pos))?;
+        let n = self.file.read(&mut buf[..want])?;
+        self.pos += n as u64;
+        Ok(n)
+    }
 }
 
 /// Open the freshly-written CHD, compute the per-partition checksum for

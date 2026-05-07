@@ -1300,14 +1300,6 @@ fn run_single_file_chd_restore_resize(
 ) -> Result<()> {
     use crate::rbformats::chd::ChdReader;
 
-    if metadata.partitions.iter().any(|pm| pm.is_logical) {
-        bail!(
-            "re-resize restore for single-file-CHD backups with logical \
-             partitions is not yet supported — restore as-is and use a \
-             separate tool to resize, or restore to an image and re-back-up."
-        );
-    }
-
     let container_name = metadata.container.as_deref().unwrap_or("disk.chd");
     let chd_path = config.backup_folder.join(container_name);
     if !chd_path.exists() {
@@ -1430,6 +1422,7 @@ fn run_single_file_chd_restore_resize(
     // end after partition data is written.
     set_operation(&progress, "Writing partition table...");
     let mut gpt_for_backup_header: Option<Gpt> = None;
+    let mut ebr_result: Option<EbrChainResult> = None;
     if is_superfloppy {
         // No table to write.
     } else if is_gpt {
@@ -1477,9 +1470,91 @@ fn run_single_file_chd_restore_resize(
             .read_exact(&mut mbr)
             .context("failed to read MBR from CHD")?;
         patch_mbr_entries(&mut mbr, &overrides);
+
+        // If the source had logical partitions, rebuild the EBR chain so
+        // it reflects the new sizes/positions. The CHD only carries each
+        // logical's body — the EBR sectors between them were zero-filled
+        // at backup time (see `single_file_chd::run`'s extended-container
+        // skip). We mirror `rbformats::reconstruct_disk_from_backup`'s
+        // approach: build the chain, repatch the MBR's extended-container
+        // total_sectors to match, then write the EBR sectors after the
+        // partition table.
+        ebr_result = build_restore_ebr_chain(metadata, &overrides, Some(&mbr));
+        if let Some(ref result) = ebr_result {
+            let extended_start = result.extended_start_lba as u64;
+            let last_end_lba = result
+                .logical_starts
+                .iter()
+                .filter_map(|(idx, start_lba)| {
+                    let size = overrides
+                        .iter()
+                        .find(|o| o.index == *idx)
+                        .map(|o| o.export_size / 512)
+                        .or_else(|| {
+                            metadata
+                                .partitions
+                                .iter()
+                                .find(|pm| pm.index == *idx)
+                                .map(|pm| pm.imaged_size_bytes / 512)
+                        })?;
+                    Some(start_lba + size)
+                })
+                .max();
+            if let Some(end_lba) = last_end_lba {
+                let new_total_sectors = (end_lba - extended_start) as u32;
+                for i in 0..4 {
+                    let off = 446 + i * 16;
+                    let type_byte = mbr[off + 4];
+                    if type_byte == 0x05 || type_byte == 0x0F || type_byte == 0x85 {
+                        let entry_start = u32::from_le_bytes([
+                            mbr[off + 8],
+                            mbr[off + 9],
+                            mbr[off + 10],
+                            mbr[off + 11],
+                        ]);
+                        if entry_start == extended_start as u32 {
+                            mbr[off + 12..off + 16]
+                                .copy_from_slice(&new_total_sectors.to_le_bytes());
+                            log(
+                                &progress,
+                                LogLevel::Info,
+                                format!(
+                                    "Patched MBR extended container: total_sectors = {}",
+                                    new_total_sectors,
+                                ),
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         target
             .write_all(&mbr)
             .context("failed to write MBR to target")?;
+
+        // Write the rebuilt EBR sectors. Each lives one sector before its
+        // logical partition's start LBA — body writes below land at
+        // `start_lba + 1 sector`, so they don't clobber these.
+        if let Some(ref result) = ebr_result {
+            log(
+                &progress,
+                LogLevel::Info,
+                format!(
+                    "Writing {} EBR sector(s) for logical partitions...",
+                    result.ebr_sectors.len()
+                ),
+            );
+            for (ebr_offset, ebr_sector) in &result.ebr_sectors {
+                target
+                    .seek(SeekFrom::Start(*ebr_offset))
+                    .context("failed to seek target to EBR offset")?;
+                target
+                    .write_all(ebr_sector)
+                    .context("failed to write EBR sector")?;
+            }
+        }
     }
 
     // Pre-flight: a 1 MiB chunk size for the partition copy loop, sized
@@ -1493,18 +1568,31 @@ fn run_single_file_chd_restore_resize(
         .min(config.target_size);
     set_progress_bytes(&progress, 0, total_logical_bytes);
 
-    // Step 2: write each partition body into its new home. Sort by new
-    // start LBA so we always seek forward — APM driver+data ordering
-    // can interleave indices.
-    let mut sorted: Vec<&crate::backup::metadata::PartitionMetadata> =
-        metadata.partitions.iter().collect();
-    sorted.sort_by_key(|pm| {
+    // Helper: resolve the *target* LBA for a partition, using the
+    // EBR-recalculated positions for logical partitions when present.
+    // Mirrors `rbformats::reconstruct_disk_from_backup` so the layouts
+    // produced by the two paths agree.
+    let get_partition_lba = |pm: &crate::backup::metadata::PartitionMetadata| -> u64 {
+        if pm.is_logical {
+            if let Some(ref r) = ebr_result {
+                if let Some((_, lba)) = r.logical_starts.iter().find(|(i, _)| *i == pm.index) {
+                    return *lba;
+                }
+            }
+        }
         overrides
             .iter()
             .find(|o| o.index == pm.index)
             .map(|o| o.effective_start_lba())
             .unwrap_or(pm.start_lba)
-    });
+    };
+
+    // Step 2: write each partition body into its new home. Sort by new
+    // start LBA so we always seek forward — APM driver+data ordering
+    // can interleave indices.
+    let mut sorted: Vec<&crate::backup::metadata::PartitionMetadata> =
+        metadata.partitions.iter().collect();
+    sorted.sort_by_key(|pm| get_partition_lba(pm));
 
     let mut buf = vec![0u8; CHUNK];
     let mut bytes_progressed: u64 = 0;
@@ -1516,7 +1604,7 @@ fn run_single_file_chd_restore_resize(
             Some(o) => o,
             None => continue,
         };
-        let new_offset = ov.effective_start_lba() * 512;
+        let new_offset = get_partition_lba(pm) * 512;
         let export_size = ov.export_size;
 
         // Source range inside the CHD: `pm.start_lba` was set by Stage
@@ -1592,9 +1680,9 @@ fn run_single_file_chd_restore_resize(
                 Some(o) => o,
                 None => continue,
             };
-            let new_offset = ov.effective_start_lba() * 512;
+            let new_start_lba = get_partition_lba(pm);
+            let new_offset = new_start_lba * 512;
             let export_size = ov.export_size;
-            let new_start_lba = ov.effective_start_lba();
             // Resize is needed if the partition's size changed compared
             // to what the CHD held.
             if export_size != pm.imaged_size_bytes {
@@ -3018,6 +3106,315 @@ mod tests {
         assert_eq!(
             restored, data,
             "sector-by-sector backup must round-trip the source disk byte-for-byte",
+        );
+    }
+
+    /// CHD backup with logical partitions in an extended container, then
+    /// restore-resize that shrinks the first logical. Asserts:
+    ///   - the rebuilt MBR's primary + extended-container entries are right,
+    ///   - the EBR chain is rebuilt at the new positions,
+    ///   - each logical's body lands at its new offset.
+    #[test]
+    fn single_file_chd_re_resize_restore_handles_logical_partitions() {
+        use crate::backup::metadata::ExtendedContainerMetadata;
+        use crate::partition::mbr::{build_ebr_chain, LogicalPartitionInfo};
+
+        // Layout (8 MiB / 16384 sectors):
+        //   [0]            MBR
+        //   [1..=1023]     primary Linux (1023 sectors)
+        //   [1024..=16383] extended container (15360 sectors)
+        //     EBR  @ 1024
+        //     L0   @ 1025..=3071  (2047 sectors)
+        //     EBR  @ 3072
+        //     L1   @ 3073..=5119  (2047 sectors)
+        //
+        // Restore shrinks L0 to 1023 sectors and lets L1 keep its size.
+        const TOTAL_SECTORS: u32 = 16384;
+        const PRIMARY_LBA: u32 = 1;
+        const PRIMARY_SECTORS: u32 = 1023;
+        const EXT_LBA: u32 = 1024;
+        const EXT_SECTORS: u32 = TOTAL_SECTORS - EXT_LBA;
+        const L0_LBA: u32 = 1025;
+        const L0_SECTORS: u32 = 2047;
+        const L1_LBA: u32 = 3073;
+        const L1_SECTORS: u32 = 2047;
+        const L0_NEW_SECTORS: u32 = 1023;
+        const SECTOR_SIZE: u64 = 512;
+        let total_bytes = TOTAL_SECTORS as u64 * SECTOR_SIZE;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_path = tmp.path().join("source.img");
+        let mut data = vec![0u8; total_bytes as usize];
+
+        // Hand-build the source MBR: primary 0x83 + extended 0x05.
+        data[510] = 0x55;
+        data[511] = 0xAA;
+        // Entry 0: primary
+        data[446 + 4] = 0x83;
+        data[446 + 8..446 + 12].copy_from_slice(&PRIMARY_LBA.to_le_bytes());
+        data[446 + 12..446 + 16].copy_from_slice(&PRIMARY_SECTORS.to_le_bytes());
+        // Entry 1: extended
+        data[462 + 4] = 0x05;
+        data[462 + 8..462 + 12].copy_from_slice(&EXT_LBA.to_le_bytes());
+        data[462 + 12..462 + 16].copy_from_slice(&EXT_SECTORS.to_le_bytes());
+
+        // EBR chain.
+        let ebrs = build_ebr_chain(
+            EXT_LBA,
+            &[
+                LogicalPartitionInfo {
+                    start_lba: L0_LBA,
+                    total_sectors: L0_SECTORS,
+                    partition_type: 0x83,
+                },
+                LogicalPartitionInfo {
+                    start_lba: L1_LBA,
+                    total_sectors: L1_SECTORS,
+                    partition_type: 0x83,
+                },
+            ],
+        );
+        for (offset, sector) in &ebrs {
+            data[*offset as usize..*offset as usize + 512].copy_from_slice(sector);
+        }
+
+        // Distinguishable per-partition fill so the body-copy loop is
+        // verifiable post-restore.
+        let fill = |buf: &mut [u8], seed: u8| {
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = seed.wrapping_add((i % 251) as u8);
+            }
+        };
+        fill(
+            &mut data
+                [(PRIMARY_LBA as usize * 512)..((PRIMARY_LBA + PRIMARY_SECTORS) as usize * 512)],
+            0x10,
+        );
+        fill(
+            &mut data[(L0_LBA as usize * 512)..((L0_LBA + L0_SECTORS) as usize * 512)],
+            0x40,
+        );
+        fill(
+            &mut data[(L1_LBA as usize * 512)..((L1_LBA + L1_SECTORS) as usize * 512)],
+            0x80,
+        );
+        std::fs::write(&source_path, &data).unwrap();
+
+        // Run the CHD backup.
+        let backup_folder = tmp.path().join("backup");
+        std::fs::create_dir_all(&backup_folder).unwrap();
+        let output_base = backup_folder.join("disk");
+        let source_file = File::open(&source_path).unwrap();
+        let mut br = BufReader::new(source_file.try_clone().unwrap());
+        let table = PartitionTable::detect(&mut br).expect("detect MBR");
+        let partitions = table.partitions();
+        let mbr_bytes: [u8; 512] = data[..512].try_into().unwrap();
+
+        let mut log_buf: Vec<String> = Vec::new();
+        let mut log_cb = |s: &str| log_buf.push(s.to_string());
+        let mut progress_cb = |_: u64| {};
+        let cancel_check = || false;
+        let chd_result = single_file_chd::run(
+            SingleFileChdInputs {
+                source_file: &source_file,
+                source_size: total_bytes,
+                source_partition_table_bytes: &mbr_bytes,
+                partition_table: &table,
+                partitions: &partitions,
+                partition_filter: None,
+                sector_by_sector: false,
+                chd_options: None,
+                is_dvd: false,
+                output_base: &output_base,
+                resize_targets: None,
+                alignment_sectors: 1,
+                checksum_type: crate::backup::ChecksumType::Sha256,
+            },
+            &mut progress_cb,
+            &cancel_check,
+            &mut log_cb,
+            &mut |_, _| {},
+        )
+        .expect("backup");
+
+        // Build single-file-CHD metadata. Primary (idx 0) + L0 (idx 2) +
+        // L1 (idx 3) all came back from `chd_result`; the extended
+        // container itself is recorded separately in
+        // `extended_container`.
+        // `imaged_floor` lets the test simulate a backup that already
+        // compacted the partition. The actual CHD body length is still
+        // `r.length` (the full source extent); the restore loop reads
+        // only `imaged_size_bytes` from it and zero-pads the rest. Setting
+        // a smaller imaged_size_bytes on L0 is what unlocks Custom shrink
+        // here without a real filesystem behind it.
+        let part_meta = |idx: usize, type_byte: u8, is_logical: bool, imaged_floor: Option<u64>| {
+            let r = chd_result
+                .partition_ranges
+                .iter()
+                .find(|r| r.partition_index == idx)
+                .expect("range");
+            PartitionMetadata {
+                index: idx,
+                type_name: "Linux".to_string(),
+                partition_type_byte: type_byte,
+                start_lba: r.offset_in_disk / 512,
+                original_size_bytes: r.length,
+                imaged_size_bytes: imaged_floor.unwrap_or(r.length),
+                compressed_files: vec![],
+                checksum: r.checksum.clone(),
+                resized: false,
+                compacted: true,
+                is_logical,
+                partition_type_string: None,
+                minimum_size_bytes: None,
+                defragmented_min_size_bytes: None,
+            }
+        };
+        let metadata = BackupMetadata {
+            version: 1,
+            created: "2026-05-04T00:00:00Z".to_string(),
+            source_device: source_path.display().to_string(),
+            source_size_bytes: total_bytes,
+            partition_table_type: "MBR".to_string(),
+            checksum_type: "sha256".to_string(),
+            compression_type: "chd".to_string(),
+            split_size_mib: None,
+            sector_by_sector: false,
+            layout: BackupLayout::SingleFileChd,
+            container: Some(chd_result.container_filename.clone()),
+            container_logical_size: Some(chd_result.container_logical_size),
+            container_sha1: Some(chd_result.container_sha1.clone()),
+            size_policy: Some(crate::backup::metadata::SizePolicy::Original),
+            alignment: AlignmentMetadata {
+                detected_type: "None detected".to_string(),
+                first_partition_lba: 1,
+                alignment_sectors: 1,
+                heads: 0,
+                sectors_per_track: 0,
+            },
+            partitions: vec![
+                part_meta(0, 0x83, false, None),
+                part_meta(4, 0x83, true, Some(L0_NEW_SECTORS as u64 * SECTOR_SIZE)),
+                part_meta(5, 0x83, true, None),
+            ],
+            bad_sectors: vec![],
+            extended_container: Some(ExtendedContainerMetadata {
+                mbr_index: 1,
+                partition_type_byte: 0x05,
+                start_lba: EXT_LBA as u64,
+                size_bytes: EXT_SECTORS as u64 * 512,
+            }),
+        };
+        std::fs::write(
+            backup_folder.join("metadata.json"),
+            serde_json::to_string_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        // Restore: shrink L0, leave L1 + primary at Original.
+        let target_path = tmp.path().join("restored.img");
+        let cfg = RestoreConfig {
+            backup_folder: backup_folder.clone(),
+            target_path: target_path.clone(),
+            target_is_device: false,
+            target_size: total_bytes,
+            alignment: RestoreAlignment::Custom(1),
+            partition_sizes: vec![RestorePartitionSize {
+                index: 4,
+                size_choice: RestoreSizeChoice::Custom(L0_NEW_SECTORS as u64 * SECTOR_SIZE),
+            }],
+            write_zeros_to_unused: false,
+        };
+        let progress = Arc::new(Mutex::new(RestoreProgress::new()));
+        run_restore(cfg, progress.clone()).expect("restore");
+        assert!(progress.lock().unwrap().finished);
+
+        let restored = std::fs::read(&target_path).unwrap();
+
+        // Primary entry must still report (PRIMARY_LBA, PRIMARY_SECTORS).
+        let primary_start = u32::from_le_bytes(restored[446 + 8..446 + 12].try_into().unwrap());
+        let primary_size = u32::from_le_bytes(restored[446 + 12..446 + 16].try_into().unwrap());
+        assert_eq!(primary_start, PRIMARY_LBA);
+        assert_eq!(primary_size, PRIMARY_SECTORS);
+
+        // Extended-container entry: start unchanged, total_sectors must
+        // shrink to cover only the new (smaller) logical layout.
+        let ext_start = u32::from_le_bytes(restored[462 + 8..462 + 12].try_into().unwrap());
+        let ext_size = u32::from_le_bytes(restored[462 + 12..462 + 16].try_into().unwrap());
+        assert_eq!(ext_start, EXT_LBA);
+        // After shrink: L0 = 1023 sectors, L1 = 2047 sectors,
+        // each preceded by a 1-sector EBR.
+        // Total = (1 + 1023) + (1 + 2047) = 3072 sectors.
+        let expected_ext_size = (1 + L0_NEW_SECTORS) + (1 + L1_SECTORS);
+        assert_eq!(
+            ext_size, expected_ext_size,
+            "extended container total_sectors must reflect repacked logicals",
+        );
+
+        // First EBR sits at EXT_LBA.
+        let first_ebr_off = (EXT_LBA as usize) * 512;
+        assert_eq!(
+            restored[first_ebr_off + 510],
+            0x55,
+            "first EBR must carry boot signature"
+        );
+        assert_eq!(restored[first_ebr_off + 511], 0xAA);
+        // First EBR entry-0: rel_start = 1, total = L0_NEW_SECTORS.
+        let l0_rel = u32::from_le_bytes(
+            restored[first_ebr_off + 446 + 8..first_ebr_off + 446 + 12]
+                .try_into()
+                .unwrap(),
+        );
+        let l0_size = u32::from_le_bytes(
+            restored[first_ebr_off + 446 + 12..first_ebr_off + 446 + 16]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(l0_rel, 1);
+        assert_eq!(l0_size, L0_NEW_SECTORS);
+
+        // Second EBR sits one sector before L1's new start. After shrink
+        // L0 ends at EXT_LBA + 1 + L0_NEW_SECTORS, so the next EBR is at
+        // that position.
+        let l1_new_lba = EXT_LBA + 1 + L0_NEW_SECTORS + 1;
+        let second_ebr_off = ((l1_new_lba - 1) as usize) * 512;
+        assert_eq!(restored[second_ebr_off + 510], 0x55);
+        assert_eq!(restored[second_ebr_off + 511], 0xAA);
+        // Second EBR's "next" link must be empty (last logical).
+        let next_link = u32::from_le_bytes(
+            restored[second_ebr_off + 462 + 8..second_ebr_off + 462 + 12]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(next_link, 0, "last EBR must not link to a next EBR");
+
+        // L0 body: imaged region (= L0_NEW_SECTORS * 512) must equal the
+        // first L0_NEW_SECTORS sectors of the source.
+        let l0_off = (EXT_LBA + 1) as usize * 512;
+        let l0_imaged_bytes = L0_NEW_SECTORS as usize * 512;
+        let l0_src = &data[(L0_LBA as usize * 512)..(L0_LBA as usize * 512 + l0_imaged_bytes)];
+        assert_eq!(
+            &restored[l0_off..l0_off + l0_imaged_bytes],
+            l0_src,
+            "L0 body must match source (imaged region)",
+        );
+
+        // L1 body: full bytes must equal source's L1 verbatim, but at
+        // the new offset.
+        let l1_off = l1_new_lba as usize * 512;
+        let l1_src = &data[(L1_LBA as usize * 512)..((L1_LBA + L1_SECTORS) as usize * 512)];
+        assert_eq!(
+            &restored[l1_off..l1_off + L1_SECTORS as usize * 512],
+            l1_src,
+            "L1 body must match source verbatim at its new offset",
+        );
+
+        // Primary body verbatim at its original location.
+        let prim_off = PRIMARY_LBA as usize * 512;
+        assert_eq!(
+            &restored[prim_off..prim_off + PRIMARY_SECTORS as usize * 512],
+            &data[prim_off..prim_off + PRIMARY_SECTORS as usize * 512],
+            "primary body must match source verbatim",
         );
     }
 }
