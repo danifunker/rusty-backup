@@ -79,9 +79,13 @@ pub struct InspectTab {
     /// Filesystem-computed in-place minimum partition sizes (partition index → bytes).
     /// "In-place" = the smallest size achievable by trim alone, no data movement.
     partition_min_sizes: HashMap<usize, u64>,
-    /// Defragmented minimum (after a clone-shrink). Only populated for
-    /// HFS+ where it can differ meaningfully from `partition_min_sizes`.
+    /// Defragmented minimum (after a clone-shrink). Populated for filesystems
+    /// with a defragmenting compaction path (FAT, HFS+) when it differs
+    /// meaningfully from `partition_min_sizes`.
     partition_defrag_min_sizes: HashMap<usize, u64>,
+    /// Per-partition volume labels (e.g. FAT label, HFS+ volume name) for
+    /// display in the inspect grid. Populated during partition probing.
+    partition_volume_labels: HashMap<usize, String>,
     /// Partitions whose minimum size requires an expensive volume walk; the
     /// per-row UI surfaces a "Calc min" button that spawns a worker.
     deferred_min_sizes: HashMap<usize, &'static str>,
@@ -171,6 +175,7 @@ impl Default for InspectTab {
             export_status: None,
             partition_min_sizes: HashMap::new(),
             partition_defrag_min_sizes: HashMap::new(),
+            partition_volume_labels: HashMap::new(),
             deferred_min_sizes: HashMap::new(),
             pending_min_size_calcs: HashMap::new(),
             pending_volume_label_probes: HashMap::new(),
@@ -234,6 +239,7 @@ impl InspectTab {
         self.browse_view.close();
         self.partition_min_sizes.clear();
         self.partition_defrag_min_sizes.clear();
+        self.partition_volume_labels.clear();
         self.deferred_min_sizes.clear();
         self.pending_min_size_calcs.clear();
         self.pending_volume_label_probes.clear();
@@ -1577,6 +1583,7 @@ impl InspectTab {
                 self.partition_min_sizes = std::mem::take(&mut status.partition_min_sizes);
                 self.partition_defrag_min_sizes =
                     std::mem::take(&mut status.partition_defrag_min_sizes);
+                self.partition_volume_labels = std::mem::take(&mut status.partition_volume_labels);
                 self.deferred_min_sizes = std::mem::take(&mut status.deferred_min_sizes);
                 self.image_format_label = status.format_label.take();
                 // macOS only: capture the open device fd + guard so BrowseView
@@ -1638,6 +1645,7 @@ impl InspectTab {
         self.image_format_label = None;
         self.partition_min_sizes.clear();
         self.partition_defrag_min_sizes.clear();
+        self.partition_volume_labels.clear();
         self.deferred_min_sizes.clear();
         self.pending_min_size_calcs.clear();
         self.pending_volume_label_probes.clear();
@@ -1770,6 +1778,7 @@ impl InspectTab {
             partitions: Vec::new(),
             partition_min_sizes: HashMap::new(),
             partition_defrag_min_sizes: HashMap::new(),
+            partition_volume_labels: HashMap::new(),
             deferred_min_sizes: HashMap::new(),
             format_label: None,
             device_file: None,
@@ -2042,6 +2051,51 @@ impl InspectTab {
                         alignment.alignment_type, alignment.first_lba
                     ));
 
+                    // Probe FAT volume labels cheaply (boot sector only) so the
+                    // inspect grid's Volume column has a value for FAT
+                    // partitions. HFS+ labels are populated above (folded into
+                    // type_name) and could move here in a future pass.
+                    let mut partition_volume_labels: HashMap<usize, String> = HashMap::new();
+                    for part in &partitions {
+                        if part.is_extended_container {
+                            continue;
+                        }
+                        let is_fat_byte = matches!(
+                            part.partition_type_byte,
+                            0x01 | 0x04
+                                | 0x06
+                                | 0x0B
+                                | 0x0C
+                                | 0x0E
+                                | 0x14
+                                | 0x16
+                                | 0x1B
+                                | 0x1C
+                                | 0x1E
+                        );
+                        let is_fat_superfloppy = matches!(
+                            &table,
+                            PartitionTable::None { fs_hint, .. } if fs_hint == "FAT"
+                        );
+                        if !(is_fat_byte || is_fat_superfloppy) {
+                            continue;
+                        }
+                        let Some(br) = make_probe_reader() else {
+                            continue;
+                        };
+                        if let Ok(fs) =
+                            rusty_backup::fs::fat::FatFilesystem::open(br, part.start_lba * 512)
+                        {
+                            use rusty_backup::fs::Filesystem;
+                            if let Some(label) = fs.volume_label() {
+                                let trimmed = label.trim();
+                                if !trimmed.is_empty() {
+                                    partition_volume_labels.insert(part.index, trimmed.to_string());
+                                }
+                            }
+                        }
+                    }
+
                     // Compute minimum partition sizes via filesystem analysis.
                     // Cheap filesystems (FAT/NTFS/exFAT) are computed eagerly here;
                     // expensive ones (HFS/HFS+/ext/btrfs/ProDOS) come back as
@@ -2137,6 +2191,7 @@ impl InspectTab {
                         s.partitions = partitions;
                         s.partition_min_sizes = partition_min_sizes;
                         s.partition_defrag_min_sizes = partition_defrag_min_sizes;
+                        s.partition_volume_labels = partition_volume_labels;
                         s.deferred_min_sizes = deferred_min_sizes;
                         // On macOS, pass the open fd + claim to the main thread
                         // so BrowseView can reuse it without re-opening/re-prompting.
@@ -2319,6 +2374,7 @@ impl InspectTab {
                 // Header
                 ui.label(egui::RichText::new("#").strong());
                 ui.label(egui::RichText::new("Type").strong());
+                ui.label(egui::RichText::new("Volume").strong());
                 ui.label(egui::RichText::new("Start LBA").strong());
                 ui.label(egui::RichText::new("Size").strong());
                 let show_min_col = self.backup_metadata.is_some()
@@ -2326,7 +2382,13 @@ impl InspectTab {
                     || !self.deferred_min_sizes.is_empty()
                     || !self.pending_min_size_calcs.is_empty();
                 if show_min_col {
-                    ui.label(egui::RichText::new("Min Size").strong());
+                    ui.label(egui::RichText::new("Min Size").strong())
+                        .on_hover_text("Smallest size achievable by trim alone (no data movement)");
+                    ui.label(egui::RichText::new("Defrag Min").strong())
+                        .on_hover_text(
+                            "Smallest size achievable by cloning into a packed target. \
+                             Used when restoring with \"Resize partitions to minimum size.\"",
+                        );
                 }
                 ui.label(egui::RichText::new("Block Size").strong());
                 ui.label(egui::RichText::new("Boot").strong());
@@ -2344,6 +2406,8 @@ impl InspectTab {
                     if part.is_extended_container {
                         ui.label(egui::RichText::new(index_label).color(egui::Color32::GRAY));
                         ui.label(egui::RichText::new(&part.type_name).color(egui::Color32::GRAY));
+                        // Volume column — extended containers have no filesystem.
+                        ui.label("");
                         ui.label(
                             egui::RichText::new(format!("{}", part.start_lba))
                                 .color(egui::Color32::GRAY),
@@ -2372,6 +2436,8 @@ impl InspectTab {
                             } else {
                                 ui.label("");
                             }
+                            // Defrag Min column.
+                            ui.label("");
                         }
                         ui.label("");
                         ui.label("");
@@ -2379,10 +2445,15 @@ impl InspectTab {
                     } else {
                         ui.label(index_label);
                         ui.label(&part.type_name);
+                        // Volume column. Always probed live from the
+                        // partition itself — never persisted to backup
+                        // metadata.
+                        let volume_label = self.partition_volume_labels.get(&part.index);
+                        ui.label(volume_label.map(String::as_str).unwrap_or(""));
                         ui.label(format!("{}", part.start_lba));
                         ui.label(partition::format_size(part.size_bytes));
                         if show_min_col {
-                            let min_size = self
+                            let in_place_min = self
                                 .backup_metadata
                                 .as_ref()
                                 .and_then(|m| {
@@ -2411,25 +2482,25 @@ impl InspectTab {
                                         .copied()
                                         .filter(|&sz| sz < part.size_bytes)
                                 });
-                            if let Some(sz) = min_size {
-                                let defrag = self
-                                    .partition_defrag_min_sizes
-                                    .get(&part.index)
-                                    .copied()
-                                    .filter(|&d| d < sz);
-                                if let Some(d) = defrag {
-                                    ui.label(format!(
-                                        "{} / {} defrag",
-                                        partition::format_size(sz),
-                                        partition::format_size(d),
-                                    ))
-                                    .on_hover_text(
-                                        "Left = trim only; right = if cloned into a blank \
-                                         volume during backup.",
-                                    );
-                                } else {
-                                    ui.label(partition::format_size(sz));
-                                }
+                            let defrag_min = self
+                                .backup_metadata
+                                .as_ref()
+                                .and_then(|m| {
+                                    m.partitions
+                                        .iter()
+                                        .find(|pm| pm.index == part.index)
+                                        .and_then(|pm| pm.defragmented_min_size_bytes)
+                                })
+                                .filter(|&sz| sz > 0 && sz < part.size_bytes)
+                                .or_else(|| {
+                                    self.partition_defrag_min_sizes
+                                        .get(&part.index)
+                                        .copied()
+                                        .filter(|&sz| sz < part.size_bytes)
+                                });
+                            // Min Size column (in-place trim point).
+                            if let Some(sz) = in_place_min {
+                                ui.label(partition::format_size(sz));
                             } else if let Some(pending) =
                                 self.pending_min_size_calcs.get(&part.index)
                             {
@@ -2450,6 +2521,18 @@ impl InspectTab {
                                 }
                             } else {
                                 ui.label("");
+                            }
+                            // Defrag Min column.
+                            match (defrag_min, in_place_min) {
+                                (Some(d), Some(m)) if d < m => {
+                                    ui.label(partition::format_size(d));
+                                }
+                                (Some(d), None) => {
+                                    ui.label(partition::format_size(d));
+                                }
+                                _ => {
+                                    ui.label("");
+                                }
                             }
                         }
                         if let Some(bs) = part.hfs_block_size {

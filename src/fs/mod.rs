@@ -32,10 +32,10 @@ pub use fat::{
     patch_bpb_hidden_sectors, resize_fat_in_place, set_fat_clean_flags, validate_fat_integrity,
     CompactFatReader,
 };
+use filesystem::FilesystemError;
 pub use filesystem::{
-    CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, ResourceForkSource,
+    CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, ResourceForkSource,
 };
-use filesystem::{Filesystem, FilesystemError};
 pub use fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry, RepairReport};
 pub use hfs::{
     hfs_max_growable_size, resize_hfs_in_place, validate_hfs_integrity, CompactHfsReader,
