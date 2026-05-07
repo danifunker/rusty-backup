@@ -125,6 +125,7 @@ pub enum FilesystemError {
     InvalidData(String),
     AlreadyExists(String),
     DiskFull(String),
+    XattrTooLarge(String),
 }
 
 impl fmt::Display for FilesystemError {
@@ -138,6 +139,7 @@ impl fmt::Display for FilesystemError {
             FilesystemError::InvalidData(msg) => write!(f, "invalid data: {msg}"),
             FilesystemError::AlreadyExists(p) => write!(f, "already exists: {p}"),
             FilesystemError::DiskFull(msg) => write!(f, "disk full: {msg}"),
+            FilesystemError::XattrTooLarge(msg) => write!(f, "extended attribute too large: {msg}"),
         }
     }
 }

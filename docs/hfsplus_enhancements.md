@@ -241,7 +241,7 @@ Lands before the clone is enabled in user-facing code so xattrs survive the roun
 
 ### Step 13 — Insert / delete xattr records
 
-- [ ] **Goal:** `set_xattr(cnid, name, value)` and `remove_xattr(cnid, name)` mutate the attribute B-tree under the snapshot/rollback guard from Step 5.
+- [x] **Goal:** `set_xattr(cnid, name, value)` and `remove_xattr(cnid, name)` mutate the attribute B-tree under the snapshot/rollback guard from Step 5.
 
 **Files:** `src/fs/hfsplus.rs`
 

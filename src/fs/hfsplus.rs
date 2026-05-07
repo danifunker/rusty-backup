@@ -1555,6 +1555,230 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
     }
 }
 
+// --- Attributes B-tree helpers (write side) ---
+
+impl<R: Read + Seek> HfsPlusFilesystem<R> {
+    /// Compare two attribute records by key. Per TN1150 the canonical order is
+    /// fileID, then attrName as UTF-16BE codepoints, then startBlock — even
+    /// though the on-disk byte layout puts startBlock before the name.
+    ///
+    /// Both arguments are full record bytes (or trimmed index records); the
+    /// 2-byte key_len prefix lives at offset 0..2 and the key body at 2..2+keyLen.
+    /// Key body layout: pad(2) + fileID(4) + startBlock(4) + nameLen(2) + name(UTF-16BE).
+    fn attr_compare(a: &[u8], b: &[u8]) -> Ordering {
+        if a.len() < 14 || b.len() < 14 {
+            return a.len().cmp(&b.len());
+        }
+        let af = BigEndian::read_u32(&a[4..8]);
+        let bf = BigEndian::read_u32(&b[4..8]);
+        if af != bf {
+            return af.cmp(&bf);
+        }
+        let an_len = BigEndian::read_u16(&a[12..14]) as usize;
+        let bn_len = BigEndian::read_u16(&b[12..14]) as usize;
+        let a_name_end = (14 + an_len * 2).min(a.len());
+        let b_name_end = (14 + bn_len * 2).min(b.len());
+        // UTF-16BE codepoint comparison via raw byte compare: high byte first
+        // makes byte-lexicographic ordering equal to u16-codepoint ordering.
+        let cmp = a[14..a_name_end].cmp(&b[14..b_name_end]);
+        if cmp != Ordering::Equal {
+            return cmp;
+        }
+        let asb = BigEndian::read_u32(&a[8..12]);
+        let bsb = BigEndian::read_u32(&b[8..12]);
+        asb.cmp(&bsb)
+    }
+
+    /// Build a complete inline attribute record:
+    /// `[key_len_u16, pad=0, fileID, startBlock=0, nameLen, name(UTF-16BE),
+    ///   recordType=HFSPLUS_ATTR_INLINE_DATA, reserved[2]=0, attrSize, attrData]`.
+    ///
+    /// Caller is expected to have already NFD-normalized `name` if needed; we
+    /// re-normalize defensively so on-disk keys stay canonical.
+    fn build_inline_attr_record(cnid: u32, name: &str, value: &[u8]) -> Vec<u8> {
+        let nfd: String = name.nfd().collect();
+        let utf16: Vec<u16> = nfd.encode_utf16().collect();
+        let key_body_len = 12 + utf16.len() * 2;
+        let data_section_len = 4 + 8 + 4 + value.len();
+        let mut rec = vec![0u8; 2 + key_body_len + data_section_len];
+        BigEndian::write_u16(&mut rec[0..2], key_body_len as u16);
+        // pad already zero at [2..4]
+        BigEndian::write_u32(&mut rec[4..8], cnid);
+        BigEndian::write_u32(&mut rec[8..12], 0); // startBlock = 0 for inline
+        BigEndian::write_u16(&mut rec[12..14], utf16.len() as u16);
+        for (i, ch) in utf16.iter().enumerate() {
+            BigEndian::write_u16(&mut rec[14 + i * 2..16 + i * 2], *ch);
+        }
+        let data_off = 2 + key_body_len;
+        BigEndian::write_u32(&mut rec[data_off..data_off + 4], HFSPLUS_ATTR_INLINE_DATA);
+        // reserved[2] (8 bytes) at [data_off+4..data_off+12] already zero
+        BigEndian::write_u32(&mut rec[data_off + 12..data_off + 16], value.len() as u32);
+        rec[data_off + 16..data_off + 16 + value.len()].copy_from_slice(value);
+        rec
+    }
+}
+
+impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
+    /// Insert a record into the attributes B-tree. Splits the leaf and grows
+    /// the root if the target leaf is full, mirroring `insert_catalog_record`.
+    fn insert_xattr_record(&mut self, key_record: &[u8]) -> Result<(), FilesystemError> {
+        if self.vh.attributes_file.logical_size == 0 {
+            return Err(FilesystemError::Unsupported(
+                "volume has no attributes B-tree — extended attribute writes \
+                 require an existing attributes file"
+                    .into(),
+            ));
+        }
+        self.ensure_attributes_loaded()?;
+        let data = self
+            .attributes_data
+            .as_mut()
+            .expect("ensure_attributes_loaded populated the buffer");
+        let header = BTreeHeader::read(data);
+        let node_size = header.node_size as usize;
+        if node_size == 0 {
+            return Err(FilesystemError::InvalidData(
+                "attributes B-tree has zero node_size".into(),
+            ));
+        }
+        // Reject records that can't fit in any leaf node — node has 14 bytes
+        // of descriptor + a 2-byte free-space slot in the offset table.
+        if key_record.len() + 2 > node_size.saturating_sub(14 + 2) {
+            return Err(FilesystemError::XattrTooLarge(format!(
+                "xattr record of {} bytes exceeds attributes node capacity ({} bytes); \
+                 fork-style attribute writes are not yet implemented",
+                key_record.len(),
+                node_size,
+            )));
+        }
+        let (leaf_idx, parent_chain) =
+            hfs_common::btree_find_insert_leaf(data, &header, key_record, &Self::attr_compare);
+        let off = leaf_idx as usize * node_size;
+        let node = &mut data[off..off + node_size];
+        match btree_insert_record(node, node_size, key_record, &Self::attr_compare) {
+            Ok(_) => {
+                let mut h = BTreeHeader::read(data);
+                h.leaf_records += 1;
+                h.write(data);
+                Ok(())
+            }
+            Err(_) => {
+                let mut h = BTreeHeader::read(data);
+                let (new_idx, split_key) = btree_split_leaf_with_insert(
+                    data,
+                    node_size,
+                    leaf_idx,
+                    &mut h,
+                    key_record,
+                    &Self::attr_compare,
+                )?;
+                h.leaf_records += 1;
+                if h.depth == 1 {
+                    btree_grow_root(data, node_size, &mut h, leaf_idx, new_idx, &split_key)?;
+                } else if let Some(&(_, parent_idx)) =
+                    parent_chain.iter().find(|&&(nidx, _)| nidx == leaf_idx)
+                {
+                    btree_insert_into_index(
+                        data,
+                        node_size,
+                        parent_idx,
+                        new_idx,
+                        &split_key,
+                        &mut h,
+                        &Self::attr_compare,
+                        &parent_chain,
+                    )?;
+                } else {
+                    btree_grow_root(data, node_size, &mut h, leaf_idx, new_idx, &split_key)?;
+                }
+                h.write(data);
+                Ok(())
+            }
+        }
+    }
+
+    /// Remove every attribute record matching `(cnid, name)`. Returns the
+    /// number of records removed (0 on a no-attributes-file volume or when no
+    /// records match). Used by both `remove_xattr` (caller-driven) and
+    /// `delete_entry` (cleanup, with `name == None` to drop all xattrs on the
+    /// CNID).
+    fn remove_xattr_records(
+        &mut self,
+        cnid: u32,
+        name: Option<&str>,
+    ) -> Result<u32, FilesystemError> {
+        if self.vh.attributes_file.logical_size == 0 {
+            return Ok(0);
+        }
+        self.ensure_attributes_loaded()?;
+        let data = self
+            .attributes_data
+            .as_mut()
+            .expect("ensure_attributes_loaded populated the buffer");
+        let header = BTreeHeader::read(data);
+        let node_size = header.node_size as usize;
+        if node_size == 0 {
+            return Ok(0);
+        }
+        let target_utf16: Option<Vec<u16>> = name.map(|n| {
+            let nfd: String = n.nfd().collect();
+            nfd.encode_utf16().collect()
+        });
+
+        let mut victims: Vec<(u32, usize)> = Vec::new();
+        hfs_common::walk_leaf_records::<(), _>(
+            data,
+            header.first_leaf_node,
+            node_size,
+            |node_idx, rec_idx, _abs_off, rec| {
+                if rec.len() < 14 {
+                    return None;
+                }
+                let key_len = BigEndian::read_u16(&rec[0..2]) as usize;
+                if key_len < 12 || 2 + key_len > rec.len() {
+                    return None;
+                }
+                let file_id = BigEndian::read_u32(&rec[4..8]);
+                if file_id != cnid {
+                    return None;
+                }
+                if let Some(target) = target_utf16.as_ref() {
+                    let nl = BigEndian::read_u16(&rec[12..14]) as usize;
+                    if nl != target.len() {
+                        return None;
+                    }
+                    if 14 + nl * 2 > 2 + key_len {
+                        return None;
+                    }
+                    for (i, ch) in target.iter().enumerate() {
+                        let off = 14 + i * 2;
+                        if BigEndian::read_u16(&rec[off..off + 2]) != *ch {
+                            return None;
+                        }
+                    }
+                }
+                victims.push((node_idx, rec_idx));
+                None
+            },
+        );
+        if victims.is_empty() {
+            return Ok(0);
+        }
+        // Highest (node, rec) first so earlier indices stay stable.
+        victims.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+        let mut removed: u32 = 0;
+        for (node_idx, rec_idx) in &victims {
+            let off = *node_idx as usize * node_size;
+            btree_remove_record(&mut data[off..off + node_size], node_size, *rec_idx);
+            removed += 1;
+        }
+        let mut h = BTreeHeader::read(data);
+        h.leaf_records = h.leaf_records.saturating_sub(removed);
+        h.write(data);
+        Ok(removed)
+    }
+}
+
 // --- Write helpers (require R: Read + Write + Seek) ---
 
 impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
@@ -1598,6 +1822,25 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
             self.partition_offset,
             self.vh.block_size,
             &self.vh.extents_file,
+            data,
+        )
+    }
+
+    /// Write the attributes B-tree data back to disk through the
+    /// attributes_file fork extents. No-op on volumes without an attributes
+    /// file or when the cached buffer hasn't been touched.
+    fn write_attributes(&mut self) -> Result<(), FilesystemError> {
+        if self.vh.attributes_file.logical_size == 0 {
+            return Ok(());
+        }
+        let Some(ref data) = self.attributes_data else {
+            return Ok(());
+        };
+        write_fork_data(
+            &mut self.reader,
+            self.partition_offset,
+            self.vh.block_size,
+            &self.vh.attributes_file,
             data,
         )
     }
@@ -1918,6 +2161,7 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
         self.vh.modify_date = hfs_common::hfs_now();
         self.write_catalog()?;
         self.write_extents_overflow()?;
+        self.write_attributes()?;
         self.write_allocation_bitmap()?;
         self.write_volume_header()?;
         self.reader.flush()?;
@@ -2790,6 +3034,65 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsPlusFilesystem<R> 
 }
 
 impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
+    /// Set (or replace) an inline extended attribute on `cnid`.
+    ///
+    /// Any existing record keyed by `(cnid, name)` is removed first so the
+    /// final state holds exactly one record per `(cnid, name)` pair. Records
+    /// whose payload would not fit in a single B-tree leaf node are rejected
+    /// with `XattrTooLarge` — fork-style storage is not yet wired up.
+    ///
+    /// Wrapped in the snapshot guard so partial failures (e.g. a leaf split
+    /// running out of free B-tree nodes) leave the in-memory state byte-equal
+    /// to the pre-call state.
+    pub fn set_xattr(
+        &mut self,
+        cnid: u32,
+        name: &str,
+        value: &[u8],
+    ) -> Result<(), FilesystemError> {
+        let snap = self.snapshot();
+        let result = (|| -> Result<(), FilesystemError> {
+            self.remove_xattr_records(cnid, Some(name))?;
+            let rec = Self::build_inline_attr_record(cnid, name, value);
+            self.insert_xattr_record(&rec)?;
+            if let Some(set) = self.xattr_cnids.as_mut() {
+                set.insert(cnid);
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.restore_snapshot(snap);
+        }
+        result
+    }
+
+    /// Remove a single extended attribute by name. Returns `NotFound` if no
+    /// matching record exists. Wrapped in the snapshot guard.
+    pub fn remove_xattr(&mut self, cnid: u32, name: &str) -> Result<(), FilesystemError> {
+        let snap = self.snapshot();
+        let result = (|| -> Result<(), FilesystemError> {
+            let removed = self.remove_xattr_records(cnid, Some(name))?;
+            if removed == 0 {
+                return Err(FilesystemError::NotFound(format!(
+                    "extended attribute '{name}' on cnid {cnid}"
+                )));
+            }
+            // Drop the cnid from the cached set if no records remain.
+            if self.list_xattrs(cnid)?.is_empty() {
+                if let Some(set) = self.xattr_cnids.as_mut() {
+                    set.remove(&cnid);
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.restore_snapshot(snap);
+        }
+        result
+    }
+}
+
+impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
     fn create_file_inner(
         &mut self,
         parent: &FileEntry,
@@ -2980,16 +3283,14 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
         let parent_cnid = parent.location as u32;
         let cnid = entry.location as u32;
 
-        // Refuse deletes against entries that own xattr records — until the
-        // attributes-B-tree write path lands (Phase 5 of
-        // `docs/hfsplus_enhancements.md`) we'd otherwise leave dangling
-        // attribute records pointing at a freed CNID.
-        if let Some(set) = self.xattr_cnids.as_ref() {
-            if set.contains(&cnid) {
-                return Err(FilesystemError::Unsupported(format!(
-                    "'{}' carries extended attributes — delete-with-xattrs is not yet supported",
-                    entry.name
-                )));
+        // Drop every attribute record attached to this CNID so we don't leave
+        // dangling rows in the attributes B-tree pointing at a freed CNID.
+        // No-op on volumes without an attributes file. Errors here trip the
+        // snapshot rollback in `delete_entry`.
+        let xattrs_removed = self.remove_xattr_records(cnid, None)?;
+        if xattrs_removed > 0 {
+            if let Some(set) = self.xattr_cnids.as_mut() {
+                set.remove(&cnid);
             }
         }
 
@@ -4851,10 +5152,17 @@ mod tests {
     }
 
     #[test]
-    fn test_prepare_for_edit_caches_xattr_cnids_blocks_delete() {
-        // Inject a fake xattr CNID set on a clean editable filesystem,
-        // create a file under that CNID, and verify delete_entry refuses.
-        let img = make_editable_hfsplus_image();
+    fn test_set_xattr_round_trip_and_delete_cleanup() {
+        // Step 13 round-trip: on a volume with an attributes B-tree, create a
+        // file, attach 3 inline xattrs, sync, reopen, verify all 3 round-trip,
+        // then delete the file and confirm every attribute record for its
+        // CNID is gone.
+        //
+        // Seed image carries a sentinel record on cnid=99 so the attributes
+        // file actually exists; the test never reads it back, just verifies
+        // it survives unaffected when an unrelated CNID's xattrs are deleted.
+        let sentinel_cnid = 99u32;
+        let img = make_editable_hfsplus_image_with_inline_xattr(sentinel_cnid, &[0xAA; 8]);
         let cursor = std::io::Cursor::new(img);
         let mut fs = HfsPlusFilesystem::open(cursor, 0).unwrap();
         fs.prepare_for_edit().unwrap();
@@ -4869,21 +5177,89 @@ mod tests {
                 1,
                 &CreateFileOptions::default(),
             )
-            .expect("create_file should succeed");
+            .expect("create_file");
+        let cnid = entry.location as u32;
 
-        // Pretend this CNID owns an xattr record.
-        fs.xattr_cnids
-            .as_mut()
-            .unwrap()
-            .insert(entry.location as u32);
+        let pairs: [(&str, &[u8]); 3] = [
+            ("com.apple.FinderInfo", &[1u8; 32]),
+            ("com.apple.metadata:_kMDItemUserTags", b"\x00bplist00 tag"),
+            ("user.short", b"hi"),
+        ];
+        for (name, value) in pairs.iter() {
+            fs.set_xattr(cnid, name, value).expect("set_xattr");
+        }
+        fs.sync_metadata().unwrap();
+
+        // Reopen the freshly synced bytes and verify all three records survived.
+        let img2 = fs.reader.into_inner();
+        let mut cursor2 = std::io::Cursor::new(img2);
+        let mut fs2 = HfsPlusFilesystem::open(&mut cursor2, 0).unwrap();
+        let mut got = fs2.list_xattrs(cnid).expect("list_xattrs");
+        got.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut want: Vec<(String, Vec<u8>)> = pairs
+            .iter()
+            .map(|(n, v)| (n.to_string(), v.to_vec()))
+            .collect();
+        want.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(got.len(), want.len());
+        for (rec, (wname, wval)) in got.iter().zip(want.iter()) {
+            assert_eq!(rec.name, *wname);
+            match &rec.kind {
+                XattrKind::Inline(bytes) => assert_eq!(bytes, wval),
+                other => panic!("expected Inline xattr, got {other:?}"),
+            }
+        }
+
+        // Sentinel xattr on the unrelated CNID still present.
+        let sentinel = fs2
+            .list_xattrs(sentinel_cnid)
+            .expect("sentinel list_xattrs");
+        assert_eq!(sentinel.len(), 1, "sentinel record should survive");
+
+        // Delete the file: every attribute row keyed at our cnid must vanish.
+        fs2.prepare_for_edit().unwrap();
+        let root2 = fs2.root().unwrap();
+        let listing = fs2.list_directory(&root2).unwrap();
+        let target = listing
+            .iter()
+            .find(|e| e.name == "with-xattr.txt")
+            .cloned()
+            .expect("entry on reopened volume");
+        fs2.delete_entry(&root2, &target).expect("delete");
+        let after = fs2.list_xattrs(cnid).expect("post-delete list_xattrs");
+        assert!(
+            after.is_empty(),
+            "expected 0 records after delete, got {}",
+            after.len()
+        );
+        let sentinel_after = fs2
+            .list_xattrs(sentinel_cnid)
+            .expect("sentinel post-delete");
+        assert_eq!(sentinel_after.len(), 1, "sentinel must survive delete");
+    }
+
+    #[test]
+    fn test_remove_xattr_not_found_and_cleanup() {
+        // remove_xattr on a missing name returns NotFound, and removing the
+        // last xattr drops the cnid from the cached set.
+        let cnid = 17u32;
+        let img = make_editable_hfsplus_image_with_inline_xattr(cnid, &[0u8; 16]);
+        let cursor = std::io::Cursor::new(img);
+        let mut fs = HfsPlusFilesystem::open(cursor, 0).unwrap();
+        fs.prepare_for_edit().unwrap();
+        assert!(fs.xattr_cnids.as_ref().unwrap().contains(&cnid));
 
         let err = fs
-            .delete_entry(&root, &entry)
-            .expect_err("delete must refuse xattr-bearing CNIDs");
-        match err {
-            FilesystemError::Unsupported(msg) => assert!(msg.contains("extended attributes")),
-            other => panic!("expected Unsupported(extended attributes...), got {other:?}"),
-        }
+            .remove_xattr(cnid, "com.apple.does-not-exist")
+            .expect_err("missing xattr must error");
+        assert!(matches!(err, FilesystemError::NotFound(_)));
+
+        fs.remove_xattr(cnid, "com.apple.FinderInfo")
+            .expect("remove existing xattr");
+        assert!(
+            !fs.xattr_cnids.as_ref().unwrap().contains(&cnid),
+            "cnid should be dropped from cache once its last xattr is gone"
+        );
     }
 
     #[test]
