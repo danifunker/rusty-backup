@@ -521,6 +521,7 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
                         gid: None,
                         resource_fork_size: None,
                         aux_type: None,
+                        link_target_cnid: None,
                     }
                 } else {
                     FileEntry {
@@ -539,6 +540,7 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
                         gid: None,
                         resource_fork_size: None,
                         aux_type: None,
+                        link_target_cnid: None,
                     }
                 };
 
@@ -574,6 +576,7 @@ impl<R: Read + Seek + Send> Filesystem for ExfatFilesystem<R> {
             gid: None,
             resource_fork_size: None,
             aux_type: None,
+            link_target_cnid: None,
         })
     }
 

@@ -118,6 +118,13 @@ pub struct PartitionMetadata {
     /// filesystems without a clone-shrink path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub defragmented_min_size_bytes: Option<u64>,
+    /// HFS+/HFSX volume header signature (`0x482B` for plain HFS+,
+    /// `0x4858` for HFSX). Captured at backup time so restore can warn
+    /// when the user picks a destination that doesn't match the source's
+    /// case-sensitivity flavor. `None` for non-HFS+/HFSX partitions and
+    /// for pre-Step-20 backups (`#[serde(default)]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hfsplus_signature: Option<u16>,
 }
 
 /// Partition alignment information for the backup.
@@ -224,6 +231,7 @@ mod tests {
                 partition_type_string: None,
                 minimum_size_bytes: Some(480_000_000),
                 defragmented_min_size_bytes: None,
+                hfsplus_signature: None,
             }],
             bad_sectors: vec![],
             extended_container: None,
@@ -238,6 +246,27 @@ mod tests {
         assert_eq!(parsed.partitions[0].index, 0);
         assert_eq!(parsed.alignment.first_partition_lba, 63);
         assert!(parsed.bad_sectors.is_empty());
+    }
+
+    #[test]
+    fn test_hfsplus_signature_round_trip() {
+        // Step 20: HFSX volumes (signature 0x4858) and plain HFS+ (0x482B)
+        // round-trip through serde, and pre-Step-20 metadata without the
+        // field loads as None thanks to `#[serde(default)]`.
+        let mut meta = sample_metadata();
+        meta.partitions[0].hfsplus_signature = Some(0x4858);
+
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(json.contains("hfsplus_signature"));
+        let parsed: BackupMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.partitions[0].hfsplus_signature, Some(0x4858));
+
+        // Drop the field from JSON entirely.
+        let stripped = json.replace(",\n  \"hfsplus_signature\": 18520", "");
+        let stripped = stripped.replace(",\"hfsplus_signature\":18520", "");
+        assert!(!stripped.contains("hfsplus_signature"));
+        let reparsed: BackupMetadata = serde_json::from_str(&stripped).unwrap();
+        assert_eq!(reparsed.partitions[0].hfsplus_signature, None);
     }
 
     #[test]
@@ -300,6 +329,7 @@ mod tests {
                 partition_type_string: None,
                 minimum_size_bytes: Some(900_000_000),
                 defragmented_min_size_bytes: None,
+                hfsplus_signature: None,
             }],
             bad_sectors: vec![],
             extended_container: None,
@@ -378,6 +408,7 @@ mod tests {
                 partition_type_string: None,
                 minimum_size_bytes: Some(500_000_000),
                 defragmented_min_size_bytes: None,
+                hfsplus_signature: None,
             }],
             bad_sectors: vec![],
             extended_container: None,

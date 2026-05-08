@@ -1,6 +1,6 @@
 use byteorder::{BigEndian, ByteOrder};
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use unicode_normalization::UnicodeNormalization;
 
@@ -315,10 +315,21 @@ struct BTreeHeaderRecord {
     max_key_len: u16,
     total_nodes: u32,
     free_nodes: u32,
+    /// `keyCompareType` byte (BTHeaderRec offset 37): `0xCF` =
+    /// case-folding NFD, `0xBC` = binary (HFSX case-sensitive). Older /
+    /// hand-built B-trees may leave this zero — callers should treat any
+    /// value other than `0xBC` as case-folding to stay compatible with
+    /// non-HFSX volumes.
+    key_compare_type: u8,
 }
 
 impl BTreeHeaderRecord {
     fn parse(data: &[u8]) -> Self {
+        // The keyCompareType byte sits 7 bytes past the freeNodes field,
+        // i.e. at offset 37 of the BTHeaderRec. The 106-byte slice handed
+        // to us is large enough to cover it; older callers that only had
+        // 30 bytes get treated as case-folding.
+        let key_compare_type = if data.len() >= 38 { data[37] } else { 0 };
         BTreeHeaderRecord {
             depth: BigEndian::read_u16(&data[0..2]),
             root_node: BigEndian::read_u32(&data[2..6]),
@@ -329,6 +340,7 @@ impl BTreeHeaderRecord {
             max_key_len: BigEndian::read_u16(&data[20..22]),
             total_nodes: BigEndian::read_u32(&data[22..26]),
             free_nodes: BigEndian::read_u32(&data[26..30]),
+            key_compare_type,
         }
     }
 }
@@ -397,7 +409,50 @@ enum CatalogEntry {
         creator_code: String,
         /// Finder flags (userInfo.fdFlags) — bit 0x8000 is `kIsAlias`.
         finder_flags: u16,
+        /// HFS+ file hardlink target inode number (`bsdInfo.special` u32).
+        /// `Some` only when the FInfo type/creator are `hlnk`/`hfs+`. The
+        /// inode itself lives at `iNode<N>` inside the volume's
+        /// `HFS+ Private Data` directory.
+        link_inode_num: Option<u32>,
+        /// HFS+ directory hardlink target inode number. `Some` only when
+        /// the FInfo type/creator are `fdrp`/`MACS`. The directory inode
+        /// lives at `dir_<N>` inside the volume's
+        /// `.HFS+ Private Directory Data\r` directory and replaces the
+        /// stub when surfaced through `list_directory`.
+        dir_link_inode_num: Option<u32>,
     },
+}
+
+/// Magic 4-byte type code on file hardlink stubs (`fdType`).
+const HFSPLUS_HARDLINK_FILE_TYPE: &[u8; 4] = b"hlnk";
+/// Magic 4-byte creator code on file hardlink stubs (`fdCreator`).
+const HFSPLUS_HARDLINK_FILE_CREATOR: &[u8; 4] = b"hfs+";
+/// Magic 4-byte type code on directory hardlink stubs (10.5+).
+const HFSPLUS_HARDLINK_DIR_TYPE: &[u8; 4] = b"fdrp";
+/// Magic 4-byte creator code on directory hardlink stubs.
+const HFSPLUS_HARDLINK_DIR_CREATOR: &[u8; 4] = b"MACS";
+
+/// Name of the hidden directory at the volume root that stores HFS+ file
+/// hardlink inodes (TN1150). Four NUL bytes followed by ASCII text — the
+/// nulls keep the directory invisible to clients that ignore zero-byte
+/// filename units.
+fn hfsplus_private_dir_name() -> String {
+    let mut s = String::with_capacity(4 + 17);
+    for _ in 0..4 {
+        s.push('\u{0}');
+    }
+    s.push_str("HFS+ Private Data");
+    s
+}
+
+/// Name of the hidden directory at the volume root that stores directory
+/// hardlink inodes (10.5+). The trailing carriage return keeps the
+/// directory hidden from clients that disallow `\r` in filenames.
+fn hfsplus_dir_private_dir_name() -> String {
+    let mut s = String::with_capacity(28 + 1);
+    s.push_str(".HFS+ Private Directory Data");
+    s.push('\u{D}');
+    s
 }
 
 /// HFS+ filesystem implementation.
@@ -426,6 +481,16 @@ pub struct HfsPlusFilesystem<R: Read + Seek> {
     /// `docs/hfsplus_enhancements.md`), `delete_entry` refuses any CNID in
     /// this set so we don't silently leave dangling attribute records.
     xattr_cnids: Option<HashSet<u32>>,
+    /// File hardlink resolution map (iNodeNum -> real inode CNID). Populated
+    /// lazily the first time a `list_directory` / `read_file` call needs to
+    /// follow a hardlink stub. `None` until consulted; `Some(map)` after the
+    /// first lookup, with `map` empty on volumes with no hardlinks. Cleared
+    /// by snapshot rollback so writes that move the private dir don't leave
+    /// a stale map behind.
+    hardlink_inode_map: Option<HashMap<u32, u32>>,
+    /// Directory hardlink resolution map (dir-inode iNodeNum -> directory
+    /// CNID). Same lazy/snapshot semantics as `hardlink_inode_map`.
+    dir_hardlink_inode_map: Option<HashMap<u32, u32>>,
 }
 
 /// Snapshot of every byte/value an HFS+ mutation can touch — taken at the
@@ -445,6 +510,8 @@ pub struct HfsPlusSnapshot {
     extents_overflow_data: Option<Vec<u8>>,
     attributes_data: Option<Vec<u8>>,
     xattr_cnids: Option<HashSet<u32>>,
+    hardlink_inode_map: Option<HashMap<u32, u32>>,
+    dir_hardlink_inode_map: Option<HashMap<u32, u32>>,
 }
 
 impl<R: Read + Seek> HfsPlusFilesystem<R> {
@@ -559,6 +626,8 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
             extents_overflow_data,
             attributes_data: None,
             xattr_cnids: None,
+            hardlink_inode_map: None,
+            dir_hardlink_inode_map: None,
         })
     }
 
@@ -692,6 +761,8 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
             extents_overflow_data: self.extents_overflow_data.clone(),
             attributes_data: self.attributes_data.clone(),
             xattr_cnids: self.xattr_cnids.clone(),
+            hardlink_inode_map: self.hardlink_inode_map.clone(),
+            dir_hardlink_inode_map: self.dir_hardlink_inode_map.clone(),
         }
     }
 
@@ -706,6 +777,8 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         self.extents_overflow_data = snap.extents_overflow_data;
         self.attributes_data = snap.attributes_data;
         self.xattr_cnids = snap.xattr_cnids;
+        self.hardlink_inode_map = snap.hardlink_inode_map;
+        self.dir_hardlink_inode_map = snap.dir_hardlink_inode_map;
     }
 
     /// Sanity-check the volume for edit-mode compatibility and pre-load the
@@ -934,12 +1007,10 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         // between O(node_count) per call and O(depth + matches).
         let header = hfs_common::BTreeHeader::read(&self.catalog_data);
         let search_key = Self::build_catalog_key(parent_cnid, "");
-        let (start_leaf, _chain) = hfs_common::btree_find_insert_leaf(
-            &self.catalog_data,
-            &header,
-            &search_key,
-            &Self::catalog_compare,
-        );
+        let cs = self.case_sensitive();
+        let cmp = |a: &[u8], b: &[u8]| Self::catalog_compare(a, b, cs);
+        let (start_leaf, _chain) =
+            hfs_common::btree_find_insert_leaf(&self.catalog_data, &header, &search_key, &cmp);
         let mut node_idx = if start_leaf != 0 {
             start_leaf
         } else {
@@ -1040,6 +1111,24 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
                         let type_code = decode_fourcc(&rec[48..52]);
                         let creator_code = decode_fourcc(&rec[52..56]);
                         let finder_flags = BigEndian::read_u16(&rec[56..58]);
+                        // BSD info at offset 32 (16 bytes); the `special` u32
+                        // at byte 12 of that block (offset 44 of the record)
+                        // is `iNodeNum` on hardlink stubs and the link
+                        // count on inodes — we only consume the former.
+                        let link_inode_num = if &rec[48..52] == HFSPLUS_HARDLINK_FILE_TYPE
+                            && &rec[52..56] == HFSPLUS_HARDLINK_FILE_CREATOR
+                        {
+                            Some(BigEndian::read_u32(&rec[44..48]))
+                        } else {
+                            None
+                        };
+                        let dir_link_inode_num = if &rec[48..52] == HFSPLUS_HARDLINK_DIR_TYPE
+                            && &rec[52..56] == HFSPLUS_HARDLINK_DIR_CREATOR
+                        {
+                            Some(BigEndian::read_u32(&rec[44..48]))
+                        } else {
+                            None
+                        };
                         // Data fork at offset 88 (80 bytes)
                         let data_fork = ForkData::parse(&rec[88..168]);
                         // Resource fork at offset 168 (80 bytes)
@@ -1054,6 +1143,8 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
                             type_code,
                             creator_code,
                             finder_flags,
+                            link_inode_num,
+                            dir_link_inode_num,
                         });
                     }
                     _ => {}
@@ -1064,6 +1155,139 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         }
 
         Ok(results)
+    }
+
+    /// Lazily build (and cache) the iNodeNum -> inode-CNID map by scanning
+    /// the children of the volume's `HFS+ Private Data` directory. Returns
+    /// `Ok(())` whether or not the directory exists; volumes without
+    /// hardlinks end up with an empty map and the lookup short-circuits.
+    fn ensure_hardlink_inode_map(&mut self) -> Result<(), FilesystemError> {
+        if self.hardlink_inode_map.is_some() {
+            return Ok(());
+        }
+        let mut map: HashMap<u32, u32> = HashMap::new();
+        let private_name = hfsplus_private_dir_name();
+        let private_cnid = self.list_children(2)?.into_iter().find_map(|c| match c {
+            CatalogEntry::Folder { folder_id, name } if name == private_name => Some(folder_id),
+            _ => None,
+        });
+        if let Some(cnid) = private_cnid {
+            for child in self.list_children(cnid)? {
+                if let CatalogEntry::File { file_id, name, .. } = child {
+                    if let Some(rest) = name.strip_prefix("iNode") {
+                        if let Ok(inode_num) = rest.parse::<u32>() {
+                            map.insert(inode_num, file_id);
+                        }
+                    }
+                }
+            }
+        }
+        self.hardlink_inode_map = Some(map);
+        Ok(())
+    }
+
+    /// Resolve a file hardlink stub's iNodeNum to its inode CNID. Returns
+    /// `None` when the volume has no `HFS+ Private Data` directory or the
+    /// inode is missing — callers fall back to treating the entry as an
+    /// ordinary file.
+    fn resolve_hardlink_inode(&mut self, inode_num: u32) -> Result<Option<u32>, FilesystemError> {
+        self.ensure_hardlink_inode_map()?;
+        Ok(self
+            .hardlink_inode_map
+            .as_ref()
+            .and_then(|m| m.get(&inode_num).copied()))
+    }
+
+    /// CNID of the volume's `HFS+ Private Data` directory, if present.
+    /// Lookup is O(root.children); cheap enough that we don't cache.
+    fn find_private_dir_cnid(&self) -> Result<Option<u32>, FilesystemError> {
+        let private_name = hfsplus_private_dir_name();
+        Ok(self.list_children(2)?.into_iter().find_map(|c| match c {
+            CatalogEntry::Folder { folder_id, name } if name == private_name => Some(folder_id),
+            _ => None,
+        }))
+    }
+
+    /// CNID of the volume's `.HFS+ Private Directory Data\r` directory, if
+    /// present. Same cost profile as `find_private_dir_cnid`.
+    fn find_dir_private_dir_cnid(&self) -> Result<Option<u32>, FilesystemError> {
+        let dir_private_name = hfsplus_dir_private_dir_name();
+        Ok(self.list_children(2)?.into_iter().find_map(|c| match c {
+            CatalogEntry::Folder { folder_id, name } if name == dir_private_name => Some(folder_id),
+            _ => None,
+        }))
+    }
+
+    /// Lazily build (and cache) the dir-hardlink iNodeNum -> directory-inode
+    /// CNID map. Mirrors `ensure_hardlink_inode_map` but scans children of
+    /// the directory-hardlink private dir for `dir_<N>` folders.
+    fn ensure_dir_hardlink_inode_map(&mut self) -> Result<(), FilesystemError> {
+        if self.dir_hardlink_inode_map.is_some() {
+            return Ok(());
+        }
+        let mut map: HashMap<u32, u32> = HashMap::new();
+        if let Some(cnid) = self.find_dir_private_dir_cnid()? {
+            for child in self.list_children(cnid)? {
+                if let CatalogEntry::Folder { folder_id, name } = child {
+                    if let Some(rest) = name.strip_prefix("dir_") {
+                        if let Ok(inode_num) = rest.parse::<u32>() {
+                            map.insert(inode_num, folder_id);
+                        }
+                    }
+                }
+            }
+        }
+        self.dir_hardlink_inode_map = Some(map);
+        Ok(())
+    }
+
+    /// Resolve a dir-hardlink stub's iNodeNum to the dir-inode CNID.
+    fn resolve_dir_hardlink_inode(
+        &mut self,
+        inode_num: u32,
+    ) -> Result<Option<u32>, FilesystemError> {
+        self.ensure_dir_hardlink_inode_map()?;
+        Ok(self
+            .dir_hardlink_inode_map
+            .as_ref()
+            .and_then(|m| m.get(&inode_num).copied()))
+    }
+
+    /// If the catalog record at `(parent_cnid, name)` is a file hardlink stub
+    /// (`fdType='hlnk' fdCreator='hfs+'`), return its target iNodeNum from
+    /// `bsdInfo.special`. `Ok(None)` for ordinary files / folders / missing
+    /// records — callers treat that as "not a hardlink".
+    fn read_file_record_link_inode_num(
+        &self,
+        parent_cnid: u32,
+        name: &str,
+    ) -> Result<Option<u32>, FilesystemError> {
+        let Some((_, _, abs_off)) = self.find_catalog_record(parent_cnid, name) else {
+            return Ok(None);
+        };
+        if abs_off + 2 > self.catalog_data.len() {
+            return Ok(None);
+        }
+        let key_len = BigEndian::read_u16(&self.catalog_data[abs_off..abs_off + 2]) as usize;
+        let mut body_start = abs_off + 2 + key_len;
+        if !body_start.is_multiple_of(2) {
+            body_start += 1;
+        }
+        if body_start + 56 > self.catalog_data.len() {
+            return Ok(None);
+        }
+        let record_type = BigEndian::read_i16(&self.catalog_data[body_start..body_start + 2]);
+        if record_type != CATALOG_FILE {
+            return Ok(None);
+        }
+        if &self.catalog_data[body_start + 48..body_start + 52] != HFSPLUS_HARDLINK_FILE_TYPE
+            || &self.catalog_data[body_start + 52..body_start + 56] != HFSPLUS_HARDLINK_FILE_CREATOR
+        {
+            return Ok(None);
+        }
+        Ok(Some(BigEndian::read_u32(
+            &self.catalog_data[body_start + 44..body_start + 48],
+        )))
     }
 
     /// Find a file record by its file_id (CNID) in the catalog B-tree.
@@ -1175,7 +1399,16 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
     }
 
     /// Compare function for catalog B-tree records (compares key portion only).
-    fn catalog_compare(a: &[u8], b: &[u8]) -> Ordering {
+    /// `true` on HFSX volumes whose catalog B-tree advertises binary (case-
+    /// sensitive) key compare. Plain HFS+ and HFSX-with-case-folding both
+    /// return `false`. Driven by the catalog header `keyCompareType` byte
+    /// rather than the volume signature alone — Apple's spec explicitly
+    /// allows an `H+` filesystem to declare itself HFSX-shaped.
+    pub(crate) fn case_sensitive(&self) -> bool {
+        self.catalog_header.key_compare_type == KEY_COMPARE_BINARY
+    }
+
+    fn catalog_compare(a: &[u8], b: &[u8], case_sensitive: bool) -> Ordering {
         // Both records start with: key_len(2) + parent_id(4) + name_len(2) + name(UTF-16BE)
         if a.len() < 8 || b.len() < 8 {
             return a.len().cmp(&b.len());
@@ -1192,7 +1425,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
             .chunks_exact(2)
             .map(BigEndian::read_u16)
             .collect();
-        hfs_common::compare_hfsplus_keys(parent_a, &name_a, parent_b, &name_b, false)
+        hfs_common::compare_hfsplus_keys(parent_a, &name_a, parent_b, &name_b, case_sensitive)
     }
 
     /// Find a catalog record by (parent_cnid, name).
@@ -1202,6 +1435,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         let search_key = Self::build_catalog_key(parent_cnid, name);
         let node_size = self.catalog_header.node_size as usize;
         let first_leaf = self.catalog_header.first_leaf_node;
+        let cs = self.case_sensitive();
 
         hfs_common::walk_leaf_records(
             &self.catalog_data,
@@ -1213,7 +1447,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
                 }
                 let key_len = BigEndian::read_u16(&rec[0..2]) as usize;
                 let key_portion = &rec[..2 + key_len.min(rec.len() - 2)];
-                if Self::catalog_compare(key_portion, &search_key) == Ordering::Equal {
+                if Self::catalog_compare(key_portion, &search_key, cs) == Ordering::Equal {
                     Some((node_idx, rec_idx, abs_off))
                 } else {
                     None
@@ -1289,19 +1523,17 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
     fn insert_catalog_record(&mut self, key_record: &[u8]) -> Result<(), FilesystemError> {
         let header = BTreeHeader::read(&self.catalog_data);
         let node_size = header.node_size as usize;
+        let cs = self.case_sensitive();
+        let cmp = |a: &[u8], b: &[u8]| Self::catalog_compare(a, b, cs);
 
         // Find the correct leaf node
-        let (leaf_idx, parent_chain) = hfs_common::btree_find_insert_leaf(
-            &self.catalog_data,
-            &header,
-            key_record,
-            &Self::catalog_compare,
-        );
+        let (leaf_idx, parent_chain) =
+            hfs_common::btree_find_insert_leaf(&self.catalog_data, &header, key_record, &cmp);
 
         // Try to insert into the leaf
         let offset = leaf_idx as usize * node_size;
         let node = &mut self.catalog_data[offset..offset + node_size];
-        match btree_insert_record(node, node_size, key_record, &Self::catalog_compare) {
+        match btree_insert_record(node, node_size, key_record, &cmp) {
             Ok(_) => {
                 // Update header leaf_records
                 let mut h = BTreeHeader::read(&self.catalog_data);
@@ -1322,7 +1554,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
                     leaf_idx,
                     &mut h,
                     key_record,
-                    &Self::catalog_compare,
+                    &cmp,
                 )?;
 
                 h.leaf_records += 1;
@@ -1350,7 +1582,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
                             new_idx,
                             &split_key,
                             &mut h,
-                            &Self::catalog_compare,
+                            &cmp,
                             &parent_chain,
                         )?;
                     } else {
@@ -2187,11 +2419,20 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
             gid: None,
             resource_fork_size: None,
             aux_type: None,
+            link_target_cnid: None,
         })
     }
 
     fn list_directory(&mut self, entry: &FileEntry) -> Result<Vec<FileEntry>, FilesystemError> {
-        let parent_cnid = entry.location as u32;
+        // For directory hardlinks, `entry.location` points at the stub
+        // catalog row; the actual children live under the `dir_<N>` inode
+        // referenced by `link_target_cnid`. Following the link here keeps
+        // recursive walks (browse view, fsck, capture) seeing the real
+        // contents instead of the empty stub.
+        let parent_cnid = entry
+            .link_target_cnid
+            .map(|c| c as u32)
+            .unwrap_or(entry.location as u32);
         let children = self.list_children(parent_cnid)?;
 
         let mut entries = Vec::new();
@@ -2215,17 +2456,52 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
                     type_code,
                     creator_code,
                     finder_flags,
+                    link_inode_num,
+                    dir_link_inode_num,
                 } => {
                     let path = if entry.path == "/" {
                         format!("/{name}")
                     } else {
                         format!("{}/{name}", entry.path)
                     };
-                    let mut fe = FileEntry::new_file(name, path, data_size, file_id as u64);
+                    // Directory hardlink: surface as a Directory entry that
+                    // points at the dir-inode under .HFS+ Private Directory
+                    // Data. list_directory called on it follows the link
+                    // (see the parent_cnid resolution at the top of this fn).
+                    if let Some(num) = dir_link_inode_num {
+                        let mut fe = FileEntry::new_directory(name, path, file_id as u64);
+                        fe.type_code = Some(type_code);
+                        fe.creator_code = Some(creator_code);
+                        if let Some(target_cnid) = self.resolve_dir_hardlink_inode(num)? {
+                            fe.link_target_cnid = Some(target_cnid as u64);
+                        }
+                        let _ = (data_fork, rsrc_fork, finder_flags);
+                        entries.push(fe);
+                        continue;
+                    }
+                    // For file hardlinks (`fdType='hlnk'`/`fdCreator='hfs+'`),
+                    // resolve the inode CNID and surface the inode's data /
+                    // resource fork sizes — the link's own forks are empty.
+                    let mut display_size = data_size;
+                    let mut display_rsrc = rsrc_size;
+                    let resolved_target = match link_inode_num {
+                        Some(num) => self.resolve_hardlink_inode(num)?,
+                        None => None,
+                    };
+                    if let Some(target_cnid) = resolved_target {
+                        if let Some((d, r)) = self.find_file_by_id(target_cnid) {
+                            display_size = d.logical_size;
+                            display_rsrc = r.logical_size;
+                        }
+                    }
+                    let mut fe = FileEntry::new_file(name, path, display_size, file_id as u64);
                     fe.type_code = Some(type_code);
                     fe.creator_code = Some(creator_code);
-                    if rsrc_size > 0 {
-                        fe.resource_fork_size = Some(rsrc_size);
+                    if display_rsrc > 0 {
+                        fe.resource_fork_size = Some(display_rsrc);
+                    }
+                    if let Some(target) = resolved_target {
+                        fe.link_target_cnid = Some(target as u64);
                     }
                     // NOTE: symlink/alias *target resolution* used to happen
                     // here (read the data fork for `slnk`/`rhap` files; read
@@ -2263,7 +2539,12 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
         entry: &FileEntry,
         max_bytes: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
-        let file_id = entry.location as u32;
+        // Hardlink stubs carry empty forks; follow the indirection to the
+        // inode under `HFS+ Private Data` and read its data fork instead.
+        let file_id = entry
+            .link_target_cnid
+            .map(|c| c as u32)
+            .unwrap_or(entry.location as u32);
         let (data_fork, _rsrc_fork) = self.find_file_by_id(file_id).ok_or_else(|| {
             FilesystemError::NotFound(format!("file id {file_id} not found in catalog"))
         })?;
@@ -2281,7 +2562,11 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
         if entry.is_directory() {
             return Err(FilesystemError::NotADirectory(entry.path.clone()));
         }
-        let file_id = entry.location as u32;
+        // Hardlink stubs: read forks from the inode CNID, not the stub.
+        let file_id = entry
+            .link_target_cnid
+            .map(|c| c as u32)
+            .unwrap_or(entry.location as u32);
         let (data_fork, _rsrc_fork) = self.find_file_by_id(file_id).ok_or_else(|| {
             FilesystemError::NotFound(format!("file id {file_id} not found in catalog"))
         })?;
@@ -3093,6 +3378,287 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
 }
 
 impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
+    /// Locate the `\0\0\0\0HFS+ Private Data` directory at root, creating
+    /// it if missing. Returns its `FileEntry`. The directory's existence is
+    /// the prerequisite for any hardlink-related write — both
+    /// [`Self::create_hardlink_inode`] and [`Self::create_hardlink`] call
+    /// this internally so the replay path doesn't need to.
+    pub fn ensure_private_dir(&mut self) -> Result<FileEntry, FilesystemError> {
+        let private_name = hfsplus_private_dir_name();
+        let root = self.root()?;
+        for entry in self.list_directory(&root)? {
+            if entry.is_directory() && entry.name == private_name {
+                return Ok(entry);
+            }
+        }
+        self.create_directory(&root, &private_name, &CreateDirectoryOptions::default())
+    }
+
+    /// Locate the `.HFS+ Private Directory Data\r` directory at root,
+    /// creating it if missing. Companion to [`Self::ensure_private_dir`]
+    /// for directory hardlinks.
+    pub fn ensure_dir_private_dir(&mut self) -> Result<FileEntry, FilesystemError> {
+        let dir_private_name = hfsplus_dir_private_dir_name();
+        let root = self.root()?;
+        for entry in self.list_directory(&root)? {
+            if entry.is_directory() && entry.name == dir_private_name {
+                return Ok(entry);
+            }
+        }
+        self.create_directory(&root, &dir_private_name, &CreateDirectoryOptions::default())
+    }
+
+    /// Create a hardlink inode (`iNode<inode_num>`) under the volume's
+    /// private directory. The inode's data and resource forks hold the
+    /// shared payload; its `bsdInfo.special` (linkCount) starts at zero
+    /// and is bumped per-link by [`Self::create_hardlink`]. The caller is
+    /// responsible for calling `sync_metadata` once all replay edits are
+    /// staged.
+    ///
+    /// Returns an `AlreadyExists` error if `iNode<inode_num>` already lives
+    /// in the private dir, so callers don't accidentally double-emit.
+    pub fn create_hardlink_inode(
+        &mut self,
+        inode_num: u32,
+        data: &mut dyn std::io::Read,
+        data_len: u64,
+        options: &CreateFileOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        let snap = self.snapshot();
+        let result = (|| -> Result<FileEntry, FilesystemError> {
+            let private = self.ensure_private_dir()?;
+            let inode_name = format!("iNode{inode_num}");
+            self.create_file(&private, &inode_name, data, data_len, options)
+        })();
+        if result.is_err() {
+            self.restore_snapshot(snap);
+        }
+        result
+    }
+
+    /// Create a file hardlink stub at `(parent, name)` referencing the
+    /// inode `iNode<inode_num>` under the private dir. The stub carries
+    /// empty forks and FInfo `('hlnk', 'hfs+')` with
+    /// `bsdInfo.special = inode_num`. The matching inode's linkCount
+    /// (`bsdInfo.special`) is bumped by 1.
+    ///
+    /// Returns the stub's `FileEntry` with `link_target_cnid` set to the
+    /// inode's CNID — callers that want the inode bytes can read through
+    /// it directly via [`Self::read_file`] / [`Self::write_file_to`].
+    pub fn create_hardlink(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        inode_num: u32,
+    ) -> Result<FileEntry, FilesystemError> {
+        let snap = self.snapshot();
+        let result = (|| -> Result<FileEntry, FilesystemError> {
+            let private_cnid = self.find_private_dir_cnid()?.ok_or_else(|| {
+                FilesystemError::NotFound(
+                    "HFS+ Private Data directory missing — call create_hardlink_inode first".into(),
+                )
+            })?;
+            // Locate the inode and confirm it exists; bump its linkCount.
+            let inode_name = format!("iNode{inode_num}");
+            let inode_cnid = self
+                .list_children(private_cnid)?
+                .into_iter()
+                .find_map(|c| match c {
+                    CatalogEntry::File {
+                        file_id, name: n, ..
+                    } if n == inode_name => Some(file_id),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    FilesystemError::NotFound(format!(
+                        "hardlink inode '{inode_name}' missing — create it before linking"
+                    ))
+                })?;
+
+            // Create the stub as an empty file with type/creator overrides.
+            let mut empty: &[u8] = &[];
+            let stub = self.create_file(
+                parent,
+                name,
+                &mut empty,
+                0,
+                &CreateFileOptions {
+                    type_code: Some("hlnk".into()),
+                    creator_code: Some("hfs+".into()),
+                    ..Default::default()
+                },
+            )?;
+
+            // Patch bsdInfo.special on the stub to hold the iNodeNum.
+            let parent_cnid = parent.location as u32;
+            let (_, _, abs) = self.find_catalog_record(parent_cnid, name).ok_or_else(|| {
+                FilesystemError::NotFound(format!(
+                    "freshly-created stub '{name}' missing from catalog"
+                ))
+            })?;
+            let key_len = BigEndian::read_u16(&self.catalog_data[abs..abs + 2]) as usize;
+            let mut body = abs + 2 + key_len;
+            if !body.is_multiple_of(2) {
+                body += 1;
+            }
+            BigEndian::write_u32(&mut self.catalog_data[body + 44..body + 48], inode_num);
+
+            // Bump linkCount on the inode (saturates if it overflows).
+            self.adjust_inode_link_count(private_cnid, inode_num, 1)?;
+
+            // Drop the cached inode_num -> CNID map so the next hardlink
+            // resolution sees the new inode without picking up stale state.
+            self.hardlink_inode_map = None;
+
+            // Surface the inode CNID on the returned entry so callers can
+            // inspect it without re-walking the catalog.
+            let mut fe = stub;
+            fe.link_target_cnid = Some(inode_cnid as u64);
+            Ok(fe)
+        })();
+        if result.is_err() {
+            self.restore_snapshot(snap);
+        }
+        result
+    }
+
+    /// Create a directory-hardlink inode (`dir_<inode_num>`) under the
+    /// volume's directory-private directory. The inode is a regular folder
+    /// — callers populate its contents like any other directory. Its
+    /// `bsdInfo.special` (linkCount) starts at zero and is bumped per stub
+    /// by [`Self::create_dir_hardlink`].
+    pub fn create_dir_hardlink_inode(
+        &mut self,
+        inode_num: u32,
+        options: &CreateDirectoryOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        let snap = self.snapshot();
+        let result = (|| -> Result<FileEntry, FilesystemError> {
+            let private = self.ensure_dir_private_dir()?;
+            let inode_name = format!("dir_{inode_num}");
+            self.create_directory(&private, &inode_name, options)
+        })();
+        if result.is_err() {
+            self.restore_snapshot(snap);
+        }
+        result
+    }
+
+    /// Create a directory-hardlink stub at `(parent, name)` referencing
+    /// `dir_<inode_num>` under the directory-private directory. The stub
+    /// is a FILE record (not a folder) with FInfo `('fdrp', 'MACS')` and
+    /// `bsdInfo.special = inode_num`; `list_directory` surfaces it as a
+    /// `Directory` entry that follows the link automatically. The matching
+    /// inode's linkCount (`bsdInfo.special`) is bumped by 1.
+    pub fn create_dir_hardlink(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        inode_num: u32,
+    ) -> Result<FileEntry, FilesystemError> {
+        let snap = self.snapshot();
+        let result = (|| -> Result<FileEntry, FilesystemError> {
+            let dir_private_cnid = self.find_dir_private_dir_cnid()?.ok_or_else(|| {
+                FilesystemError::NotFound(
+                    ".HFS+ Private Directory Data missing — call create_dir_hardlink_inode first"
+                        .into(),
+                )
+            })?;
+            let inode_name = format!("dir_{inode_num}");
+            let inode_cnid = self
+                .list_children(dir_private_cnid)?
+                .into_iter()
+                .find_map(|c| match c {
+                    CatalogEntry::Folder { folder_id, name: n } if n == inode_name => {
+                        Some(folder_id)
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    FilesystemError::NotFound(format!(
+                        "directory inode '{inode_name}' missing — create it before linking"
+                    ))
+                })?;
+
+            let mut empty: &[u8] = &[];
+            let stub = self.create_file(
+                parent,
+                name,
+                &mut empty,
+                0,
+                &CreateFileOptions {
+                    type_code: Some("fdrp".into()),
+                    creator_code: Some("MACS".into()),
+                    ..Default::default()
+                },
+            )?;
+
+            // Patch bsdInfo.special on the stub to hold the iNodeNum.
+            let parent_cnid = parent.location as u32;
+            let (_, _, abs) = self.find_catalog_record(parent_cnid, name).ok_or_else(|| {
+                FilesystemError::NotFound(format!(
+                    "freshly-created stub '{name}' missing from catalog"
+                ))
+            })?;
+            let key_len = BigEndian::read_u16(&self.catalog_data[abs..abs + 2]) as usize;
+            let mut body = abs + 2 + key_len;
+            if !body.is_multiple_of(2) {
+                body += 1;
+            }
+            BigEndian::write_u32(&mut self.catalog_data[body + 44..body + 48], inode_num);
+
+            // Bump linkCount on the dir-inode's folder record (lives at
+            // body+44..48 of the folder record too — DInfo doesn't overlap).
+            self.adjust_dir_inode_link_count(dir_private_cnid, inode_num, 1)?;
+
+            // Drop the cached map so the next lookup sees the new inode.
+            self.dir_hardlink_inode_map = None;
+
+            // Surface the inode CNID on the returned entry; flip its type
+            // to Directory so callers treat it as one.
+            let mut fe = stub;
+            fe.entry_type = crate::fs::entry::EntryType::Directory;
+            fe.size = 0;
+            fe.link_target_cnid = Some(inode_cnid as u64);
+            Ok(fe)
+        })();
+        if result.is_err() {
+            self.restore_snapshot(snap);
+        }
+        result
+    }
+
+    /// Adjust the directory-inode `linkCount` (`bsdInfo.special` u32 — at
+    /// folder-record body offset 32+12 = 44, same as file records) by
+    /// `delta`. Mirrors `adjust_inode_link_count` for file inodes.
+    fn adjust_dir_inode_link_count(
+        &mut self,
+        dir_private_cnid: u32,
+        inode_num: u32,
+        delta: i64,
+    ) -> Result<u32, FilesystemError> {
+        let inode_name = format!("dir_{inode_num}");
+        let (_, _, abs_off) = self
+            .find_catalog_record(dir_private_cnid, &inode_name)
+            .ok_or_else(|| {
+                FilesystemError::InvalidData(format!(
+                    "directory inode '{inode_name}' missing from .HFS+ Private Directory Data"
+                ))
+            })?;
+        let key_len = BigEndian::read_u16(&self.catalog_data[abs_off..abs_off + 2]) as usize;
+        let mut body_start = abs_off + 2 + key_len;
+        if !body_start.is_multiple_of(2) {
+            body_start += 1;
+        }
+        let cur = BigEndian::read_u32(&self.catalog_data[body_start + 44..body_start + 48]) as i64;
+        let new = (cur + delta).max(0) as u32;
+        BigEndian::write_u32(
+            &mut self.catalog_data[body_start + 44..body_start + 48],
+            new,
+        );
+        Ok(new)
+    }
+
     fn create_file_inner(
         &mut self,
         parent: &FileEntry,
@@ -3304,6 +3870,19 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
             }
         }
 
+        // File hardlink stub? If so, decrement the inode's linkCount before
+        // we touch the stub's catalog row. Last reference also frees the
+        // inode's forks and removes its iNode<N> entry from the private
+        // directory.
+        let link_inode_num = if entry.is_directory() {
+            None
+        } else {
+            self.read_file_record_link_inode_num(parent_cnid, &entry.name)?
+        };
+        if let Some(inode_num) = link_inode_num {
+            self.delete_hardlink_inode_ref(inode_num)?;
+        }
+
         // Find and remove the entry record
         let (node_idx, rec_idx, _offset) = self
             .find_catalog_record(parent_cnid, &entry.name)
@@ -3312,7 +3891,9 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
             })?;
 
         // If it's a file, free its data and resource fork blocks (including
-        // any overflow extents) and remove its overflow records.
+        // any overflow extents) and remove its overflow records. Hardlink
+        // stubs have empty forks (the data lives on the inode we already
+        // adjusted above), so this is a no-op for them.
         if !entry.is_directory() {
             if let Some((data_fork, rsrc_fork)) = self.find_file_by_id(cnid) {
                 self.free_fork_overflow_extents(cnid, HFSPLUS_FORK_DATA, &data_fork);
@@ -3341,6 +3922,95 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
             self.vh.file_count = self.vh.file_count.saturating_sub(1);
         }
 
+        Ok(())
+    }
+
+    /// Adjust the inode-record `linkCount` (`bsdInfo.special`, body offset
+    /// 44..48) by `delta` and return the post-update count. Locates the
+    /// record by `(private_dir_cnid, "iNode<N>")` so the in-memory edit
+    /// hits the live catalog leaf. Touches `attributeModDate` so users can
+    /// see when the inode was last referenced.
+    fn adjust_inode_link_count(
+        &mut self,
+        private_cnid: u32,
+        inode_num: u32,
+        delta: i64,
+    ) -> Result<u32, FilesystemError> {
+        let inode_name = format!("iNode{inode_num}");
+        let (_, _, abs_off) = self
+            .find_catalog_record(private_cnid, &inode_name)
+            .ok_or_else(|| {
+                FilesystemError::InvalidData(format!(
+                    "hardlink inode '{inode_name}' missing from HFS+ Private Data"
+                ))
+            })?;
+        let key_len = BigEndian::read_u16(&self.catalog_data[abs_off..abs_off + 2]) as usize;
+        let mut body_start = abs_off + 2 + key_len;
+        if !body_start.is_multiple_of(2) {
+            body_start += 1;
+        }
+        let cur = BigEndian::read_u32(&self.catalog_data[body_start + 44..body_start + 48]) as i64;
+        let new = (cur + delta).max(0) as u32;
+        BigEndian::write_u32(
+            &mut self.catalog_data[body_start + 44..body_start + 48],
+            new,
+        );
+        self.stamp_record_dates(body_start, false);
+        Ok(new)
+    }
+
+    /// Decrement `linkCount` on the inode named `iNode<inode_num>` under the
+    /// volume's `HFS+ Private Data` dir. When the count drops to zero, free
+    /// the inode's forks, drop its xattrs, and remove the inode catalog row
+    /// + thread + map entry. Bumps `vh.file_count` and the private dir's
+    /// valence accordingly.
+    fn delete_hardlink_inode_ref(&mut self, inode_num: u32) -> Result<(), FilesystemError> {
+        let private_cnid = self.find_private_dir_cnid()?.ok_or_else(|| {
+            FilesystemError::InvalidData(
+                "hardlink stub on volume with no HFS+ Private Data directory".into(),
+            )
+        })?;
+        let inode_cnid = self.resolve_hardlink_inode(inode_num)?.ok_or_else(|| {
+            FilesystemError::InvalidData(format!(
+                "hardlink target iNode{inode_num} missing from HFS+ Private Data"
+            ))
+        })?;
+
+        let new_count = self.adjust_inode_link_count(private_cnid, inode_num, -1)?;
+        if new_count > 0 {
+            return Ok(());
+        }
+
+        // Last reference — free the inode's forks and drop its rows.
+        if let Some((data_fork, rsrc_fork)) = self.find_file_by_id(inode_cnid) {
+            self.free_fork_overflow_extents(inode_cnid, HFSPLUS_FORK_DATA, &data_fork);
+            self.free_fork_overflow_extents(inode_cnid, HFSPLUS_FORK_RESOURCE, &rsrc_fork);
+            self.remove_extents_overflow_records_for(inode_cnid, HFSPLUS_FORK_DATA);
+            self.remove_extents_overflow_records_for(inode_cnid, HFSPLUS_FORK_RESOURCE);
+            self.free_fork_blocks(&data_fork);
+            self.free_fork_blocks(&rsrc_fork);
+        }
+
+        let xattrs_removed = self.remove_xattr_records(inode_cnid, None)?;
+        if xattrs_removed > 0 {
+            if let Some(set) = self.xattr_cnids.as_mut() {
+                set.remove(&inode_cnid);
+            }
+        }
+
+        let inode_name = format!("iNode{inode_num}");
+        if let Some((n, r, _)) = self.find_catalog_record(private_cnid, &inode_name) {
+            self.remove_catalog_record(n, r);
+        }
+        if let Some((tn, tr, _)) = self.find_catalog_record_by_cnid(inode_cnid) {
+            self.remove_catalog_record(tn, tr);
+        }
+        self.update_parent_valence(private_cnid, -1)?;
+        self.vh.file_count = self.vh.file_count.saturating_sub(1);
+
+        if let Some(map) = self.hardlink_inode_map.as_mut() {
+            map.remove(&inode_num);
+        }
         Ok(())
     }
 
@@ -5292,6 +5962,674 @@ mod tests {
         let mut bare_fs = HfsPlusFilesystem::open(std::io::Cursor::new(bare), 0).unwrap();
         let empty = bare_fs.list_xattrs(cnid).expect("list_xattrs no attr file");
         assert!(empty.is_empty(), "no attributes file → no records");
+    }
+
+    #[test]
+    fn test_hardlink_resolution_two_links_one_inode() {
+        // Step 15: synthesize a volume with two hardlinks pointing at one
+        // inode under `HFS+ Private Data`. Both link rows must surface as
+        // regular files in `list_directory`, carry `link_target_cnid` set
+        // to the inode CNID, and read back the inode's data fork bytes.
+        const PAYLOAD: &[u8] = b"INODE_PAYLOAD_42\n";
+        const I_NODE_NUM: u32 = 99;
+
+        let mut img = create_blank_hfsplus(32 * 1024 * 1024, 4096, "Links", false);
+
+        // Build the volume contents: private dir, inode, two link stubs.
+        // Patch the link stubs' catalog records to set FInfo type='hlnk'
+        // creator='hfs+' and bsdInfo.special = I_NODE_NUM. We do this via
+        // direct catalog-byte edits while holding the editable handle, then
+        // sync once at the end.
+        let inode_cnid: u32;
+        {
+            let cursor = std::io::Cursor::new(&mut img);
+            let mut fs = HfsPlusFilesystem::open(cursor, 0).expect("open blank");
+            fs.prepare_for_edit().expect("prepare_for_edit");
+            let root = fs.root().expect("root");
+
+            let private_dir = fs
+                .create_directory(
+                    &root,
+                    &hfsplus_private_dir_name(),
+                    &CreateDirectoryOptions::default(),
+                )
+                .expect("create private dir");
+
+            let mut inode_data = std::io::Cursor::new(PAYLOAD);
+            let inode_entry = fs
+                .create_file(
+                    &private_dir,
+                    &format!("iNode{I_NODE_NUM}"),
+                    &mut inode_data,
+                    PAYLOAD.len() as u64,
+                    &CreateFileOptions::default(),
+                )
+                .expect("create inode file");
+            inode_cnid = inode_entry.location as u32;
+
+            for link_name in ["linkA", "linkB"] {
+                let mut empty = std::io::Cursor::new(&[][..]);
+                fs.create_file(
+                    &root,
+                    link_name,
+                    &mut empty,
+                    0,
+                    &CreateFileOptions {
+                        type_code: Some("hlnk".into()),
+                        creator_code: Some("hfs+".into()),
+                        ..Default::default()
+                    },
+                )
+                .expect("create link stub");
+
+                // Patch bsdInfo.special on the freshly-created stub to point
+                // at the inode number. body offset 32+12 = 44.
+                let (_node, _rec, abs) = fs
+                    .find_catalog_record(2, link_name)
+                    .expect("link stub in catalog");
+                let key_len = BigEndian::read_u16(&fs.catalog_data[abs..abs + 2]) as usize;
+                let mut body_start = abs + 2 + key_len;
+                if !body_start.is_multiple_of(2) {
+                    body_start += 1;
+                }
+                BigEndian::write_u32(
+                    &mut fs.catalog_data[body_start + 44..body_start + 48],
+                    I_NODE_NUM,
+                );
+            }
+
+            fs.sync_metadata().expect("sync");
+        }
+
+        // Re-open, walk root, verify both link stubs resolve to the inode
+        // and read back the inode's bytes.
+        let cursor = std::io::Cursor::new(&mut img);
+        let mut fs = HfsPlusFilesystem::open(cursor, 0).expect("re-open");
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list root");
+        let link_a = entries
+            .iter()
+            .find(|e| e.name == "linkA")
+            .cloned()
+            .expect("linkA");
+        let link_b = entries
+            .iter()
+            .find(|e| e.name == "linkB")
+            .cloned()
+            .expect("linkB");
+
+        assert_eq!(
+            link_a.link_target_cnid,
+            Some(inode_cnid as u64),
+            "linkA must resolve to inode CNID"
+        );
+        assert_eq!(
+            link_b.link_target_cnid,
+            Some(inode_cnid as u64),
+            "linkB must resolve to inode CNID"
+        );
+        // Display size should reflect the inode's data fork, not the empty
+        // stub fork.
+        assert_eq!(link_a.size, PAYLOAD.len() as u64);
+        assert_eq!(link_b.size, PAYLOAD.len() as u64);
+
+        let bytes_a = fs.read_file(&link_a, usize::MAX).expect("read linkA");
+        let bytes_b = fs.read_file(&link_b, usize::MAX).expect("read linkB");
+        assert_eq!(bytes_a, PAYLOAD);
+        assert_eq!(bytes_b, PAYLOAD);
+
+        // Sanity: a file with no hardlink magic stays plain.
+        // The private dir itself shows up at root with `link_target_cnid`
+        // unset (it's a folder, not a file hardlink).
+        let private = entries
+            .iter()
+            .find(|e| e.name == hfsplus_private_dir_name())
+            .expect("private dir at root");
+        assert!(private.link_target_cnid.is_none());
+    }
+
+    #[test]
+    fn test_hardlink_delete_decrements_then_frees_inode() {
+        // Step 16: deleting a hardlink decrements `linkCount` on the inode;
+        // deleting the last reference frees the inode, drops it from the
+        // private directory, and reclaims its data fork blocks.
+        const PAYLOAD: &[u8] = b"INODE_DATA_FOR_DELETE\n";
+        const I_NODE_NUM: u32 = 7;
+
+        let mut img = create_blank_hfsplus(32 * 1024 * 1024, 4096, "DelLinks", false);
+
+        // Capture initial free-block count after the build, then synthesize
+        // private dir + inode (linkCount=2) + two stubs.
+        let inode_cnid: u32;
+        let private_cnid: u32;
+        let payload_blocks_used: u32;
+        let free_after_build: u32;
+        let free_with_inode: u32;
+        {
+            let cursor = std::io::Cursor::new(&mut img);
+            let mut fs = HfsPlusFilesystem::open(cursor, 0).expect("open blank");
+            fs.prepare_for_edit().expect("prepare_for_edit");
+            free_after_build = fs.vh.free_blocks;
+            let root = fs.root().expect("root");
+            let private_dir = fs
+                .create_directory(
+                    &root,
+                    &hfsplus_private_dir_name(),
+                    &CreateDirectoryOptions::default(),
+                )
+                .expect("create private dir");
+            private_cnid = private_dir.location as u32;
+
+            let mut inode_data = std::io::Cursor::new(PAYLOAD);
+            let inode_entry = fs
+                .create_file(
+                    &private_dir,
+                    &format!("iNode{I_NODE_NUM}"),
+                    &mut inode_data,
+                    PAYLOAD.len() as u64,
+                    &CreateFileOptions::default(),
+                )
+                .expect("create inode file");
+            inode_cnid = inode_entry.location as u32;
+            free_with_inode = fs.vh.free_blocks;
+            payload_blocks_used = free_after_build - free_with_inode;
+            assert!(
+                payload_blocks_used >= 1,
+                "inode payload must consume at least one block"
+            );
+
+            // Initialize bsdInfo.special on the inode record to linkCount=2.
+            {
+                let (_, _, abs) = fs
+                    .find_catalog_record(private_cnid, &format!("iNode{I_NODE_NUM}"))
+                    .expect("inode catalog record");
+                let key_len = BigEndian::read_u16(&fs.catalog_data[abs..abs + 2]) as usize;
+                let mut body = abs + 2 + key_len;
+                if !body.is_multiple_of(2) {
+                    body += 1;
+                }
+                BigEndian::write_u32(&mut fs.catalog_data[body + 44..body + 48], 2);
+            }
+
+            for link_name in ["linkA", "linkB"] {
+                let mut empty = std::io::Cursor::new(&[][..]);
+                fs.create_file(
+                    &root,
+                    link_name,
+                    &mut empty,
+                    0,
+                    &CreateFileOptions {
+                        type_code: Some("hlnk".into()),
+                        creator_code: Some("hfs+".into()),
+                        ..Default::default()
+                    },
+                )
+                .expect("create stub");
+                let (_, _, abs) = fs.find_catalog_record(2, link_name).expect("stub");
+                let key_len = BigEndian::read_u16(&fs.catalog_data[abs..abs + 2]) as usize;
+                let mut body = abs + 2 + key_len;
+                if !body.is_multiple_of(2) {
+                    body += 1;
+                }
+                BigEndian::write_u32(&mut fs.catalog_data[body + 44..body + 48], I_NODE_NUM);
+            }
+            fs.sync_metadata().expect("sync");
+        }
+
+        // Re-open editable, delete linkA. linkB and the inode must remain
+        // readable; linkCount must drop to 1.
+        let cursor = std::io::Cursor::new(&mut img);
+        let mut fs = HfsPlusFilesystem::open(cursor, 0).expect("re-open");
+        fs.prepare_for_edit().expect("prepare_for_edit");
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list");
+        let link_a = entries
+            .iter()
+            .find(|e| e.name == "linkA")
+            .cloned()
+            .expect("linkA");
+        let link_b = entries
+            .iter()
+            .find(|e| e.name == "linkB")
+            .cloned()
+            .expect("linkB");
+        let free_before_delete = fs.vh.free_blocks;
+
+        fs.delete_entry(&root, &link_a).expect("delete linkA");
+        // linkCount should now be 1; inode + linkB still alive.
+        let cnt_after_first = {
+            let (_, _, abs) = fs
+                .find_catalog_record(private_cnid, &format!("iNode{I_NODE_NUM}"))
+                .expect("inode still present");
+            let key_len = BigEndian::read_u16(&fs.catalog_data[abs..abs + 2]) as usize;
+            let mut body = abs + 2 + key_len;
+            if !body.is_multiple_of(2) {
+                body += 1;
+            }
+            BigEndian::read_u32(&fs.catalog_data[body + 44..body + 48])
+        };
+        assert_eq!(cnt_after_first, 1, "linkCount should decrement to 1");
+        assert_eq!(
+            fs.vh.free_blocks, free_before_delete,
+            "no blocks freed while inode still has refs"
+        );
+        // linkB still resolves and reads the original payload.
+        let bytes_b = fs.read_file(&link_b, usize::MAX).expect("read linkB");
+        assert_eq!(bytes_b, PAYLOAD);
+
+        fs.delete_entry(&root, &link_b).expect("delete linkB");
+        // Inode must be gone from the private dir, blocks reclaimed.
+        let private_children = fs.list_children(private_cnid).expect("list private dir");
+        assert!(
+            private_children.is_empty(),
+            "iNode entry should be removed once linkCount hits 0; got {} children",
+            private_children.len()
+        );
+        assert!(
+            fs.find_file_by_id(inode_cnid).is_none(),
+            "inode catalog row should be gone"
+        );
+        assert_eq!(
+            fs.vh.free_blocks,
+            free_before_delete + payload_blocks_used,
+            "inode payload blocks should be reclaimed"
+        );
+    }
+
+    #[test]
+    fn test_hardlink_capture_and_replay_dedupes_inode() {
+        // Step 17: source carries 1 inode + 3 file hardlinks. Capture
+        // routes the inode into `files` with `is_inode = true` and the
+        // three stubs into `hardlinks`. Replay onto a freshly built blank
+        // via `create_hardlink_inode` + `create_hardlink` produces a
+        // target with one inode + three stub rows (not four independent
+        // files), all reading the same payload bytes.
+        const PAYLOAD: &[u8] = b"shared inode contents (3 names)\n";
+        const I_NODE_NUM: u32 = 17;
+
+        // Build the source.
+        let mut source_img = create_blank_hfsplus(32 * 1024 * 1024, 4096, "Src", false);
+        let source_inode_cnid: u32;
+        {
+            let cursor = std::io::Cursor::new(&mut source_img);
+            let mut fs = HfsPlusFilesystem::open(cursor, 0).expect("open src blank");
+            fs.prepare_for_edit().expect("prepare_for_edit");
+            let mut data = std::io::Cursor::new(PAYLOAD);
+            let inode = fs
+                .create_hardlink_inode(
+                    I_NODE_NUM,
+                    &mut data,
+                    PAYLOAD.len() as u64,
+                    &CreateFileOptions::default(),
+                )
+                .expect("create source inode");
+            source_inode_cnid = inode.location as u32;
+            // Initialize linkCount=0 on the inode then let create_hardlink
+            // bump it three times.
+            let private_cnid = fs.find_private_dir_cnid().unwrap().expect("private dir");
+            let _ = fs
+                .adjust_inode_link_count(private_cnid, I_NODE_NUM, 0)
+                .expect("init linkCount");
+            let root = fs.root().expect("root");
+            for name in ["a.txt", "b.txt", "c.txt"] {
+                fs.create_hardlink(&root, name, I_NODE_NUM)
+                    .expect("create stub");
+            }
+            fs.sync_metadata().expect("sync src");
+        }
+
+        // Capture from the source.
+        let cursor = std::io::Cursor::new(&mut source_img);
+        let mut src_fs = HfsPlusFilesystem::open(cursor, 0).expect("re-open src");
+        let snap =
+            crate::fs::hfsplus_clone::SourceCatalogSnapshot::capture(&mut src_fs).expect("capture");
+
+        // Snapshot expectations: exactly one inode, three hardlink stubs.
+        let inodes: Vec<_> = snap.files.iter().filter(|f| f.is_inode).collect();
+        assert_eq!(inodes.len(), 1, "expected exactly one inode in snapshot");
+        let inode = inodes[0];
+        assert_eq!(inode.cnid, source_inode_cnid);
+        assert_eq!(inode.inode_num, Some(I_NODE_NUM));
+        assert_eq!(inode.data_fork_bytes, PAYLOAD);
+
+        let user_files: Vec<_> = snap.files.iter().filter(|f| !f.is_inode).collect();
+        assert!(
+            user_files.is_empty(),
+            "user-tree files should be empty (the three stubs are in `hardlinks`); \
+             got {:?}",
+            user_files.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
+
+        assert_eq!(snap.hardlinks.len(), 3, "expected 3 hardlink stubs");
+        for h in &snap.hardlinks {
+            assert_eq!(h.inode_num, I_NODE_NUM);
+            assert_eq!(h.inode_source_cnid, source_inode_cnid);
+            assert_eq!(h.parent_cnid, 2, "stubs live at root");
+        }
+
+        // Replay onto a fresh blank target using the capture data.
+        let mut target_img = create_blank_hfsplus(32 * 1024 * 1024, 4096, "Tgt", false);
+        let target_inode_cnid: u32;
+        {
+            let cursor = std::io::Cursor::new(&mut target_img);
+            let mut tgt = HfsPlusFilesystem::open(cursor, 0).expect("open tgt blank");
+            tgt.prepare_for_edit().expect("prepare_for_edit");
+
+            let mut data = std::io::Cursor::new(inode.data_fork_bytes.as_slice());
+            let target_inode = tgt
+                .create_hardlink_inode(
+                    inode.inode_num.unwrap(),
+                    &mut data,
+                    inode.data_fork_bytes.len() as u64,
+                    &CreateFileOptions::default(),
+                )
+                .expect("replay inode");
+            target_inode_cnid = target_inode.location as u32;
+
+            let root = tgt.root().expect("tgt root");
+            for h in &snap.hardlinks {
+                tgt.create_hardlink(&root, &h.name, h.inode_num)
+                    .expect("replay stub");
+            }
+            tgt.sync_metadata().expect("sync tgt");
+        }
+
+        // Verify the target.
+        let cursor = std::io::Cursor::new(&mut target_img);
+        let mut tgt_fs = HfsPlusFilesystem::open(cursor, 0).expect("re-open tgt");
+        let root = tgt_fs.root().expect("tgt root");
+        let entries = tgt_fs.list_directory(&root).expect("list tgt root");
+
+        // Three stubs at root, each pointing at the same inode CNID, each
+        // reading back the original payload.
+        let stubs: Vec<&FileEntry> = entries
+            .iter()
+            .filter(|e| ["a.txt", "b.txt", "c.txt"].contains(&e.name.as_str()))
+            .collect();
+        assert_eq!(stubs.len(), 3);
+        for stub in &stubs {
+            assert_eq!(
+                stub.link_target_cnid,
+                Some(target_inode_cnid as u64),
+                "stub {} must resolve to the single target inode",
+                stub.name
+            );
+            assert_eq!(stub.size, PAYLOAD.len() as u64);
+        }
+        for stub in &stubs {
+            let bytes = tgt_fs.read_file(stub, usize::MAX).expect("read tgt stub");
+            assert_eq!(bytes, PAYLOAD);
+        }
+
+        // Inode's linkCount on the target must be 3 (one per stub).
+        let private_cnid = tgt_fs
+            .find_private_dir_cnid()
+            .unwrap()
+            .expect("private dir");
+        let inode_name = format!("iNode{I_NODE_NUM}");
+        let (_, _, abs) = tgt_fs
+            .find_catalog_record(private_cnid, &inode_name)
+            .expect("inode in private dir");
+        let key_len = BigEndian::read_u16(&tgt_fs.catalog_data[abs..abs + 2]) as usize;
+        let mut body = abs + 2 + key_len;
+        if !body.is_multiple_of(2) {
+            body += 1;
+        }
+        let link_count = BigEndian::read_u32(&tgt_fs.catalog_data[body + 44..body + 48]);
+        assert_eq!(link_count, 3, "inode linkCount must equal stub count");
+    }
+
+    #[test]
+    fn test_dir_hardlink_capture_and_replay_resolves_to_inode() {
+        // Step 18: Time-Machine-shaped image — one directory inode under
+        // `.HFS+ Private Directory Data\r` with two hardlink stubs at the
+        // root. Capture must dedupe the inode (one entry in `dirs` with
+        // `is_dir_inode = true`, two entries in `dir_hardlinks`); replay
+        // must produce a target whose two link rows resolve to the same
+        // directory contents byte-for-byte.
+        const PAYLOAD: &[u8] = b"file inside dir-hardlinked folder\n";
+        const D_INODE_NUM: u32 = 13;
+
+        // ---- Build the source. ----
+        let mut source_img = create_blank_hfsplus(32 * 1024 * 1024, 4096, "DhSrc", false);
+        let source_inode_cnid: u32;
+        {
+            let cursor = std::io::Cursor::new(&mut source_img);
+            let mut fs = HfsPlusFilesystem::open(cursor, 0).expect("open src");
+            fs.prepare_for_edit().expect("prepare_for_edit");
+            let inode_dir = fs
+                .create_dir_hardlink_inode(D_INODE_NUM, &CreateDirectoryOptions::default())
+                .expect("create dir inode");
+            source_inode_cnid = inode_dir.location as u32;
+            // Put a file inside the inode dir so `list_directory` has
+            // something to compare on the replayed side.
+            let mut data = std::io::Cursor::new(PAYLOAD);
+            fs.create_file(
+                &inode_dir,
+                "inside.txt",
+                &mut data,
+                PAYLOAD.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create file in dir inode");
+            // Initialize linkCount=0 then bump per stub.
+            let dir_priv = fs
+                .find_dir_private_dir_cnid()
+                .unwrap()
+                .expect("dir private");
+            let _ = fs
+                .adjust_dir_inode_link_count(dir_priv, D_INODE_NUM, 0)
+                .expect("init dir linkCount");
+            let root = fs.root().expect("root");
+            for name in ["alpha", "beta"] {
+                fs.create_dir_hardlink(&root, name, D_INODE_NUM)
+                    .expect("create dir hardlink stub");
+            }
+            fs.sync_metadata().expect("sync src");
+        }
+
+        // ---- Capture from the source. ----
+        let cursor = std::io::Cursor::new(&mut source_img);
+        let mut src_fs = HfsPlusFilesystem::open(cursor, 0).expect("re-open src");
+        let snap =
+            crate::fs::hfsplus_clone::SourceCatalogSnapshot::capture(&mut src_fs).expect("capture");
+
+        // Snapshot expectations: exactly one directory inode, two stubs.
+        let dir_inodes: Vec<_> = snap.dirs.iter().filter(|d| d.is_dir_inode).collect();
+        assert_eq!(
+            dir_inodes.len(),
+            1,
+            "expected exactly one dir inode in snapshot; got {}",
+            dir_inodes.len()
+        );
+        let dir_inode = dir_inodes[0];
+        assert_eq!(dir_inode.cnid, source_inode_cnid);
+        assert_eq!(dir_inode.inode_num, Some(D_INODE_NUM));
+
+        assert_eq!(snap.dir_hardlinks.len(), 2, "expected 2 dir-hardlink stubs");
+        for h in &snap.dir_hardlinks {
+            assert_eq!(h.inode_num, D_INODE_NUM);
+            assert_eq!(h.inode_dir_source_cnid, source_inode_cnid);
+            assert_eq!(h.parent_cnid, 2, "stubs live at root");
+        }
+
+        // ---- Replay onto a fresh blank target. ----
+        let mut target_img = create_blank_hfsplus(32 * 1024 * 1024, 4096, "DhTgt", false);
+        let target_inode_cnid: u32;
+        {
+            let cursor = std::io::Cursor::new(&mut target_img);
+            let mut tgt = HfsPlusFilesystem::open(cursor, 0).expect("open tgt");
+            tgt.prepare_for_edit().expect("prepare_for_edit");
+
+            // Create the inode directory.
+            let inode = tgt
+                .create_dir_hardlink_inode(
+                    dir_inode.inode_num.unwrap(),
+                    &CreateDirectoryOptions::default(),
+                )
+                .expect("replay dir inode");
+            target_inode_cnid = inode.location as u32;
+
+            // Replay the inode's children. (For a real clone Step 21 will
+            // recursively walk; here it's just one file.)
+            let mut data = std::io::Cursor::new(PAYLOAD);
+            tgt.create_file(
+                &inode,
+                "inside.txt",
+                &mut data,
+                PAYLOAD.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("replay child file");
+
+            // Replay the stubs.
+            let root = tgt.root().expect("tgt root");
+            for h in &snap.dir_hardlinks {
+                tgt.create_dir_hardlink(&root, &h.name, h.inode_num)
+                    .expect("replay dir stub");
+            }
+            tgt.sync_metadata().expect("sync tgt");
+        }
+
+        // ---- Verify the target. ----
+        let cursor = std::io::Cursor::new(&mut target_img);
+        let mut tgt_fs = HfsPlusFilesystem::open(cursor, 0).expect("re-open tgt");
+        let root = tgt_fs.root().expect("tgt root");
+        let entries = tgt_fs.list_directory(&root).expect("list tgt root");
+
+        // Both stubs surface as Directory entries pointing at the single
+        // inode, and listing either of them returns the same children.
+        for stub_name in ["alpha", "beta"] {
+            let stub = entries
+                .iter()
+                .find(|e| e.name == stub_name)
+                .cloned()
+                .unwrap_or_else(|| panic!("stub {stub_name} missing from target root"));
+            assert!(
+                stub.is_directory(),
+                "stub {stub_name} must surface as a directory"
+            );
+            assert_eq!(
+                stub.link_target_cnid,
+                Some(target_inode_cnid as u64),
+                "stub {stub_name} must resolve to the single target inode"
+            );
+
+            let children = tgt_fs.list_directory(&stub).expect("list stub");
+            let inside = children
+                .iter()
+                .find(|c| c.name == "inside.txt")
+                .unwrap_or_else(|| panic!("inside.txt missing under {stub_name}"));
+            let bytes = tgt_fs
+                .read_file(inside, usize::MAX)
+                .expect("read inside.txt via stub");
+            assert_eq!(bytes, PAYLOAD);
+        }
+
+        // Inode's linkCount on the target must equal stub count (2).
+        let dir_priv = tgt_fs
+            .find_dir_private_dir_cnid()
+            .unwrap()
+            .expect("tgt dir private");
+        let inode_name = format!("dir_{D_INODE_NUM}");
+        let (_, _, abs) = tgt_fs
+            .find_catalog_record(dir_priv, &inode_name)
+            .expect("dir inode in private dir");
+        let key_len = BigEndian::read_u16(&tgt_fs.catalog_data[abs..abs + 2]) as usize;
+        let mut body = abs + 2 + key_len;
+        if !body.is_multiple_of(2) {
+            body += 1;
+        }
+        let link_count = BigEndian::read_u32(&tgt_fs.catalog_data[body + 44..body + 48]);
+        assert_eq!(link_count, 2, "dir inode linkCount must equal stub count");
+    }
+
+    #[test]
+    fn test_hfsx_case_sensitive_allows_distinct_case_siblings() {
+        // Step 19: HFSX volumes with `keyCompareType == 0xBC` (binary)
+        // must treat `Foo` and `foo` as distinct names. Plain HFS+ —
+        // including HFSX volumes built with `keyCompareType == 0xCF`
+        // (case-folding NFD compare) — must reject the second create with
+        // `AlreadyExists`.
+        const PAYLOAD: &[u8] = b"hi\n";
+
+        // ---- HFSX, case-sensitive: both creates succeed. ----
+        {
+            let mut img = create_blank_hfsplus(32 * 1024 * 1024, 4096, "HFSX", true);
+            let cursor = std::io::Cursor::new(&mut img);
+            let mut fs = HfsPlusFilesystem::open(cursor, 0).expect("open hfsx");
+            assert!(
+                fs.case_sensitive(),
+                "fresh HFSX blank must be case-sensitive"
+            );
+            fs.prepare_for_edit().expect("prepare");
+            let root = fs.root().expect("root");
+
+            let mut data = std::io::Cursor::new(PAYLOAD);
+            fs.create_file(
+                &root,
+                "Foo",
+                &mut data,
+                PAYLOAD.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create Foo");
+
+            let mut data = std::io::Cursor::new(PAYLOAD);
+            fs.create_file(
+                &root,
+                "foo",
+                &mut data,
+                PAYLOAD.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create foo on HFSX must succeed");
+
+            fs.sync_metadata().expect("sync");
+            // Both must list separately.
+            let entries = fs.list_directory(&root).expect("list");
+            let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+            assert!(names.contains(&"Foo"), "Foo missing: {names:?}");
+            assert!(names.contains(&"foo"), "foo missing: {names:?}");
+        }
+
+        // ---- HFS+, case-folding: second create rejects. ----
+        {
+            let mut img = create_blank_hfsplus(32 * 1024 * 1024, 4096, "HFSPLUS", false);
+            let cursor = std::io::Cursor::new(&mut img);
+            let mut fs = HfsPlusFilesystem::open(cursor, 0).expect("open hfs+");
+            assert!(
+                !fs.case_sensitive(),
+                "plain HFS+ blank must be case-folding"
+            );
+            fs.prepare_for_edit().expect("prepare");
+            let root = fs.root().expect("root");
+
+            let mut data = std::io::Cursor::new(PAYLOAD);
+            fs.create_file(
+                &root,
+                "Foo",
+                &mut data,
+                PAYLOAD.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create Foo");
+
+            let mut data = std::io::Cursor::new(PAYLOAD);
+            let err = fs
+                .create_file(
+                    &root,
+                    "foo",
+                    &mut data,
+                    PAYLOAD.len() as u64,
+                    &CreateFileOptions::default(),
+                )
+                .expect_err("create foo must fail on case-folding HFS+");
+            match err {
+                FilesystemError::AlreadyExists(_) => {}
+                other => panic!("expected AlreadyExists, got {other:?}"),
+            }
+        }
     }
 
     #[test]

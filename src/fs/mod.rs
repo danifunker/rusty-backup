@@ -1178,6 +1178,25 @@ pub fn hfs_block_size_at_offset<R: Read + Seek>(
 
 /// Probe an "Apple_HFS" APM partition to detect the actual filesystem type.
 ///
+/// Read the HFS+/HFSX volume header signature at `partition_offset`. Returns
+/// `Some(0x482B)` for HFS+, `Some(0x4858)` for HFSX, or `None` when the
+/// partition isn't an HFS+/HFSX volume (including pure classic HFS — those
+/// carry an MDB rather than a VH at offset+1024). Handles the embedded /
+/// wrapped HFS+ case via `resolve_apple_hfs`.
+pub fn probe_hfsplus_signature<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+) -> Option<u16> {
+    let (fs_type, hfsplus_offset) = resolve_apple_hfs(reader, partition_offset);
+    if fs_type != "hfsplus" {
+        return None;
+    }
+    reader.seek(SeekFrom::Start(hfsplus_offset + 1024)).ok()?;
+    let mut sig = [0u8; 2];
+    reader.read_exact(&mut sig).ok()?;
+    Some(u16::from_be_bytes(sig))
+}
+
 /// Returns `"HFS+"`, `"HFSX"`, `"HFS"`, or `"unknown"`. Useful for updating
 /// display names after partition table detection.
 pub fn probe_apple_hfs_type<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> &'static str {

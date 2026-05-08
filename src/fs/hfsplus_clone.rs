@@ -5,15 +5,16 @@
 //! capture every byte of metadata that must survive a clone-shrink so later
 //! steps can replay it onto a freshly-formatted target.
 //!
-//! Until later phases land, `SourceCatalogSnapshot::capture` returns
-//! `Err(Unsupported(...))` for volumes carrying:
-//!   - file or directory hardlinks (`fdType='hlnk' creator='hfs+'` or
-//!     `fdType='fdrp' creator='MACS'` in the userInfo block) — relaxed in
-//!     Steps 16–18.
-//!
-//! Step 14 (this revision) wires extended-attribute capture into both
-//! `SourceFileSnapshot` and `SourceDirSnapshot`, so xattr-bearing volumes
-//! flow through to the clone target byte-for-byte.
+//! Step 14 wired extended-attribute capture into both `SourceFileSnapshot`
+//! and `SourceDirSnapshot`. Step 17 added file-hardlink support: stubs
+//! routed into a separate `SourceHardlinkSnapshot` list and inodes
+//! (files under `\0\0\0\0HFS+ Private Data` named `iNode<N>`) flagged
+//! with `is_inode = true`. Step 18 (this revision) does the same for
+//! directory hardlinks: file rows with FInfo `fdrp`/`MACS` route into
+//! `SourceDirHardlinkSnapshot`, and folders under
+//! `.HFS+ Private Directory Data\r` named `dir_<N>` are flagged with
+//! `is_dir_inode = true`. Replay (Step 21) emits each directory inode
+//! once and points each link at it.
 
 use std::io::{Read, Seek};
 
@@ -102,8 +103,19 @@ pub struct SourceDirSnapshot {
     /// Extended attributes attached to this CNID. `XattrRecord::name` holds
     /// the key (e.g. `com.apple.FinderInfo`); `XattrRecord::kind` is the
     /// inline / fork / extents payload. Empty vector when the volume has no
-    /// attributes file or no records for this CNID.
-    pub xattrs: Vec<XattrRecord>,
+    /// attributes file or no records for this CNID. `pub(crate)` because
+    /// `XattrRecord` is itself crate-private; promote both together if a
+    /// non-test external consumer ever needs to read them.
+    pub(crate) xattrs: Vec<XattrRecord>,
+    /// `true` for folders that live under the source's
+    /// `.HFS+ Private Directory Data\r` directory whose name parses as
+    /// `dir_<N>` — i.e. directory-hardlink inodes. Replay must emit them
+    /// through `create_dir_hardlink_inode` rather than as ordinary
+    /// directories in the user-visible tree.
+    pub is_dir_inode: bool,
+    /// Source iNodeNum (decoded from the `dir_<N>` folder name) for
+    /// directory-inode rows; `None` for ordinary folders.
+    pub inode_num: Option<u32>,
 }
 
 /// Per-file metadata captured from a `kHFSPlusFileRecord`.
@@ -137,7 +149,51 @@ pub struct SourceFileSnapshot {
     pub rsrc_fork_bytes: Vec<u8>,
     /// Extended attributes attached to this CNID. See
     /// [`SourceDirSnapshot::xattrs`] for layout details.
-    pub xattrs: Vec<XattrRecord>,
+    pub(crate) xattrs: Vec<XattrRecord>,
+    /// `true` for files that live under the source's `HFS+ Private Data`
+    /// directory whose name parses as `iNode<N>` — i.e. file-hardlink
+    /// inodes. Replay must emit them through `create_hardlink_inode`
+    /// rather than as ordinary files in the user-visible tree, and the
+    /// hardlink stubs that reference them carry the source CNID stored
+    /// here. Always `false` until [`SourceCatalogSnapshot::capture`]
+    /// resolves the private dir.
+    pub is_inode: bool,
+    /// Source iNodeNum (decoded from the `iNode<N>` filename) for inode
+    /// rows; `None` for ordinary files. Carried so the replay path can
+    /// emit each hardlink stub with the same iNodeNum the inode itself
+    /// will be created under on the target.
+    pub inode_num: Option<u32>,
+}
+
+/// One file-hardlink stub captured from the source catalog. Replay creates
+/// `inode_count` inodes once and N stub rows pointing at them.
+#[derive(Debug, Clone)]
+pub struct SourceHardlinkSnapshot {
+    /// Stub name visible in the user directory.
+    pub name: String,
+    pub name_utf16: Vec<u16>,
+    /// Source CNID of the stub catalog row (not the inode).
+    pub cnid: u32,
+    /// User-visible parent CNID.
+    pub parent_cnid: u32,
+    /// Source CNID of the inode this stub references. The inode appears
+    /// in `SourceCatalogSnapshot::files` with `is_inode = true` and the
+    /// matching `cnid`.
+    pub inode_source_cnid: u32,
+    /// Original iNodeNum (`bsdInfo.special` u32). Replay can re-use this
+    /// number directly since target CNIDs differ from source CNIDs.
+    pub inode_num: u32,
+    pub flags: u16,
+    pub finder_info: [u8; 16],
+    pub extended_finder_info: [u8; 16],
+    pub bsd_info: [u8; 16],
+    pub create_date: u32,
+    pub content_mod_date: u32,
+    pub attribute_mod_date: u32,
+    pub access_date: u32,
+    pub backup_date: u32,
+    pub text_encoding: u32,
+    pub(crate) xattrs: Vec<XattrRecord>,
 }
 
 impl SourceFileSnapshot {
@@ -152,6 +208,33 @@ impl SourceFileSnapshot {
     }
 }
 
+/// One directory-hardlink stub captured from the source catalog. The stub
+/// is encoded as a FILE record on disk; replay re-emits it the same way
+/// (FInfo `fdrp`/`MACS` plus `bsdInfo.special = inode_num`).
+#[derive(Debug, Clone)]
+pub struct SourceDirHardlinkSnapshot {
+    pub name: String,
+    pub name_utf16: Vec<u16>,
+    pub cnid: u32,
+    pub parent_cnid: u32,
+    /// Source CNID of the directory inode this stub references. The
+    /// inode appears in `SourceCatalogSnapshot::dirs` with
+    /// `is_dir_inode = true` and the matching `cnid`.
+    pub inode_dir_source_cnid: u32,
+    pub inode_num: u32,
+    pub flags: u16,
+    pub finder_info: [u8; 16],
+    pub extended_finder_info: [u8; 16],
+    pub bsd_info: [u8; 16],
+    pub create_date: u32,
+    pub content_mod_date: u32,
+    pub attribute_mod_date: u32,
+    pub access_date: u32,
+    pub backup_date: u32,
+    pub text_encoding: u32,
+    pub(crate) xattrs: Vec<XattrRecord>,
+}
+
 /// Full capture of a source HFS+/HFSX volume: volume metadata plus every
 /// directory and file record. Catalog *thread* records are not captured —
 /// the target writer recreates them from scratch.
@@ -159,7 +242,17 @@ impl SourceFileSnapshot {
 pub struct SourceCatalogSnapshot {
     pub volume: SourceVolumeSnapshot,
     pub dirs: Vec<SourceDirSnapshot>,
+    /// Every captured file row, both user-visible files and the per-inode
+    /// `iNode<N>` rows under `HFS+ Private Data`. Inodes carry
+    /// `is_inode = true` and an `inode_num`; replay must emit them through
+    /// the dedicated hardlink-inode helper rather than as user-tree files.
     pub files: Vec<SourceFileSnapshot>,
+    /// Hardlink stub rows. Each references one `is_inode=true` entry in
+    /// `files` by source CNID.
+    pub hardlinks: Vec<SourceHardlinkSnapshot>,
+    /// Directory-hardlink stub rows. Each references one
+    /// `is_dir_inode=true` entry in `dirs` by source CNID.
+    pub dir_hardlinks: Vec<SourceDirHardlinkSnapshot>,
 }
 
 impl SourceVolumeSnapshot {
@@ -191,20 +284,18 @@ impl SourceCatalogSnapshot {
     /// thread records) and reads each file's data + resource fork into the
     /// snapshot. Index nodes are ignored.
     ///
-    /// Returns `Err(Unsupported)` early on volumes carrying hardlinks —
-    /// Steps 16–18 of `docs/hfsplus_enhancements.md` will relax that guard
-    /// once the supporting infrastructure lands. Extended attributes are
-    /// captured in full (Step 14).
+    /// File hardlinks (Step 17) are captured into a separate
+    /// [`SourceHardlinkSnapshot`] list and the inode rows under
+    /// `\0\0\0\0HFS+ Private Data` are flagged with `is_inode = true`.
+    /// Directory hardlinks (Step 18) still trip the `Unsupported` guard.
     pub fn capture<R: Read + Seek>(fs: &mut HfsPlusFilesystem<R>) -> Result<Self, FilesystemError> {
         let volume = SourceVolumeSnapshot::capture(fs)?;
 
-        // Walk the catalog leaves and accumulate dir / file metadata. File
-        // records carry the 80-byte data + resource fork descriptors which
-        // we hold onto so we can stream the fork bytes after the immutable
-        // catalog borrow is released.
         let mut dirs: Vec<SourceDirSnapshot> = Vec::new();
         let mut files: Vec<SourceFileSnapshot> = Vec::new();
         let mut pending_forks: Vec<([u8; 80], [u8; 80])> = Vec::new();
+        let mut pending_links: Vec<PendingHardlink> = Vec::new();
+        let mut pending_dir_links: Vec<PendingDirHardlink> = Vec::new();
         let mut walk_err: Option<FilesystemError> = None;
         {
             let catalog = fs.catalog_data();
@@ -229,6 +320,14 @@ impl SourceCatalogSnapshot {
                             pending_forks.push((data_fork, rsrc_fork));
                             None
                         }
+                        Ok(ParsedRecord::Hardlink(p)) => {
+                            pending_links.push(p);
+                            None
+                        }
+                        Ok(ParsedRecord::DirHardlink(p)) => {
+                            pending_dir_links.push(p);
+                            None
+                        }
                         Ok(ParsedRecord::Thread) | Ok(ParsedRecord::Skip) => None,
                         Err(e) => {
                             walk_err = Some(e);
@@ -240,6 +339,127 @@ impl SourceCatalogSnapshot {
         }
         if let Some(e) = walk_err {
             return Err(e);
+        }
+
+        // Resolve the source's HFS+ Private Data dir CNID and flag every
+        // captured file whose parent matches and whose name is `iNode<N>`
+        // as an inode. Build the iNodeNum -> source CNID map for the
+        // hardlink resolution pass below.
+        let private_name = hfsplus_private_dir_name();
+        let dir_private_name = hfsplus_dir_private_dir_name();
+        let private_cnid = dirs.iter().find_map(|d| {
+            if d.name == private_name {
+                Some(d.cnid)
+            } else {
+                None
+            }
+        });
+        let dir_private_cnid = dirs.iter().find_map(|d| {
+            if d.name == dir_private_name {
+                Some(d.cnid)
+            } else {
+                None
+            }
+        });
+        let mut inode_num_to_source_cnid: std::collections::HashMap<u32, u32> =
+            std::collections::HashMap::new();
+        let mut dir_inode_num_to_source_cnid: std::collections::HashMap<u32, u32> =
+            std::collections::HashMap::new();
+        if let Some(pcnid) = dir_private_cnid {
+            for d in dirs.iter_mut() {
+                if d.parent_cnid != pcnid {
+                    continue;
+                }
+                let Some(rest) = d.name.strip_prefix("dir_") else {
+                    continue;
+                };
+                let Ok(num) = rest.parse::<u32>() else {
+                    continue;
+                };
+                d.is_dir_inode = true;
+                d.inode_num = Some(num);
+                dir_inode_num_to_source_cnid.insert(num, d.cnid);
+            }
+        }
+        if let Some(pcnid) = private_cnid {
+            for f in files.iter_mut() {
+                if f.parent_cnid != pcnid {
+                    continue;
+                }
+                let Some(rest) = f.name.strip_prefix("iNode") else {
+                    continue;
+                };
+                let Ok(num) = rest.parse::<u32>() else {
+                    continue;
+                };
+                f.is_inode = true;
+                f.inode_num = Some(num);
+                inode_num_to_source_cnid.insert(num, f.cnid);
+            }
+        }
+
+        // Resolve pending hardlink stubs against the inode map. A stub
+        // with a missing iNode is treated as a corrupted source.
+        let mut hardlinks: Vec<SourceHardlinkSnapshot> = Vec::with_capacity(pending_links.len());
+        for p in pending_links {
+            let inode_source_cnid = inode_num_to_source_cnid.get(&p.inode_num).copied()
+                .ok_or_else(|| FilesystemError::InvalidData(format!(
+                    "source HFS+ catalog references iNode{} but no matching entry exists in HFS+ Private Data",
+                    p.inode_num,
+                )))?;
+            hardlinks.push(SourceHardlinkSnapshot {
+                name: p.name,
+                name_utf16: p.name_utf16,
+                cnid: p.cnid,
+                parent_cnid: p.parent_cnid,
+                inode_source_cnid,
+                inode_num: p.inode_num,
+                flags: p.flags,
+                finder_info: p.finder_info,
+                extended_finder_info: p.extended_finder_info,
+                bsd_info: p.bsd_info,
+                create_date: p.create_date,
+                content_mod_date: p.content_mod_date,
+                attribute_mod_date: p.attribute_mod_date,
+                access_date: p.access_date,
+                backup_date: p.backup_date,
+                text_encoding: p.text_encoding,
+                xattrs: Vec::new(),
+            });
+        }
+
+        let mut dir_hardlinks: Vec<SourceDirHardlinkSnapshot> =
+            Vec::with_capacity(pending_dir_links.len());
+        for p in pending_dir_links {
+            let inode_dir_source_cnid = dir_inode_num_to_source_cnid
+                .get(&p.inode_num)
+                .copied()
+                .ok_or_else(|| {
+                    FilesystemError::InvalidData(format!(
+                        "source HFS+ catalog references dir_{} but no matching entry exists \
+                         in .HFS+ Private Directory Data",
+                        p.inode_num,
+                    ))
+                })?;
+            dir_hardlinks.push(SourceDirHardlinkSnapshot {
+                name: p.name,
+                name_utf16: p.name_utf16,
+                cnid: p.cnid,
+                parent_cnid: p.parent_cnid,
+                inode_dir_source_cnid,
+                inode_num: p.inode_num,
+                flags: p.flags,
+                finder_info: p.finder_info,
+                extended_finder_info: p.extended_finder_info,
+                bsd_info: p.bsd_info,
+                create_date: p.create_date,
+                content_mod_date: p.content_mod_date,
+                attribute_mod_date: p.attribute_mod_date,
+                access_date: p.access_date,
+                backup_date: p.backup_date,
+                text_encoding: p.text_encoding,
+                xattrs: Vec::new(),
+            });
         }
 
         // Read fork bytes and xattrs now that the catalog borrow is released.
@@ -259,11 +479,19 @@ impl SourceCatalogSnapshot {
         for dir in dirs.iter_mut() {
             dir.xattrs = fs.list_xattrs(dir.cnid)?;
         }
+        for link in hardlinks.iter_mut() {
+            link.xattrs = fs.list_xattrs(link.cnid)?;
+        }
+        for link in dir_hardlinks.iter_mut() {
+            link.xattrs = fs.list_xattrs(link.cnid)?;
+        }
 
         Ok(SourceCatalogSnapshot {
             volume,
             dirs,
             files,
+            hardlinks,
+            dir_hardlinks,
         })
     }
 }
@@ -278,8 +506,70 @@ enum ParsedRecord {
         data_fork: [u8; 80],
         rsrc_fork: [u8; 80],
     },
+    Hardlink(PendingHardlink),
+    DirHardlink(PendingDirHardlink),
     Thread,
     Skip,
+}
+
+/// Catalog file row identified as a hardlink stub during the first pass.
+/// Held until [`SourceCatalogSnapshot::capture`] resolves the private dir
+/// and links each stub to its captured inode.
+struct PendingHardlink {
+    name: String,
+    name_utf16: Vec<u16>,
+    cnid: u32,
+    parent_cnid: u32,
+    inode_num: u32,
+    flags: u16,
+    finder_info: [u8; 16],
+    extended_finder_info: [u8; 16],
+    bsd_info: [u8; 16],
+    create_date: u32,
+    content_mod_date: u32,
+    attribute_mod_date: u32,
+    access_date: u32,
+    backup_date: u32,
+    text_encoding: u32,
+}
+
+/// Pending directory-hardlink stub. Same shape as `PendingHardlink` but
+/// resolved against the dir-inode map instead of the file-inode map.
+struct PendingDirHardlink {
+    name: String,
+    name_utf16: Vec<u16>,
+    cnid: u32,
+    parent_cnid: u32,
+    inode_num: u32,
+    flags: u16,
+    finder_info: [u8; 16],
+    extended_finder_info: [u8; 16],
+    bsd_info: [u8; 16],
+    create_date: u32,
+    content_mod_date: u32,
+    attribute_mod_date: u32,
+    access_date: u32,
+    backup_date: u32,
+    text_encoding: u32,
+}
+
+/// Build the source's `.HFS+ Private Directory Data\r` directory name.
+fn hfsplus_dir_private_dir_name() -> String {
+    let mut s = String::with_capacity(28 + 1);
+    s.push_str(".HFS+ Private Directory Data");
+    s.push('\u{D}');
+    s
+}
+
+/// Build the source's `\0\0\0\0HFS+ Private Data` directory name.
+/// Mirrors the helper in `hfsplus.rs` (which is module-private there).
+fn hfsplus_private_dir_name() -> String {
+    let mut s = String::with_capacity(4 + 17);
+    for _ in 0..4 {
+        s.push('\u{0}');
+    }
+    s.push_str("HFS+ Private Data");
+    s
 }
 
 fn parse_catalog_record(rec: &[u8]) -> Result<ParsedRecord, FilesystemError> {
@@ -339,17 +629,11 @@ fn parse_catalog_record(rec: &[u8]) -> Result<ParsedRecord, FilesystemError> {
             extended_finder_info.copy_from_slice(&body[64..80]);
             let text_encoding = BigEndian::read_u32(&body[80..84]);
 
-            // Directory hardlink (10.5+): aliasing record with FInfo
-            // fdType='fdrp' / fdCreator='MACS'. Step 18 will relax.
-            if &finder_info[0..4] == HARDLINK_DIR_TYPE && &finder_info[4..8] == HARDLINK_DIR_CREATOR
-            {
-                return Err(FilesystemError::Unsupported(
-                    "HFS+ source carries directory hardlinks; capture lands in Step 18 \
-                     of docs/hfsplus_enhancements.md"
-                        .into(),
-                ));
-            }
-
+            // Directory hardlinks are encoded as FILE records (handled in
+            // the CATALOG_FILE branch below), not as FOLDER records — so
+            // there is no fdrp/MACS check here. The folder-side flag
+            // `is_dir_inode` is set in capture's second pass for folders
+            // living under `.HFS+ Private Directory Data\r`.
             Ok(ParsedRecord::Folder(SourceDirSnapshot {
                 name,
                 name_utf16,
@@ -367,6 +651,8 @@ fn parse_catalog_record(rec: &[u8]) -> Result<ParsedRecord, FilesystemError> {
                 backup_date,
                 text_encoding,
                 xattrs: Vec::new(),
+                is_dir_inode: false,
+                inode_num: None,
             }))
         }
         CATALOG_FILE => {
@@ -394,16 +680,57 @@ fn parse_catalog_record(rec: &[u8]) -> Result<ParsedRecord, FilesystemError> {
             let mut rsrc_fork = [0u8; 80];
             rsrc_fork.copy_from_slice(&body[168..248]);
 
-            // File hardlink: aliasing record with FInfo fdType='hlnk' /
-            // fdCreator='hfs+'. Steps 16–17 will relax.
+            // File hardlink stub: FInfo `hlnk`/`hfs+`. Route into the
+            // pending-hardlinks list so the second pass can resolve the
+            // iNodeNum (`bsdInfo.special`, body offset 44..48) against the
+            // captured iNode<N> rows under HFS+ Private Data.
             if &finder_info[0..4] == HARDLINK_FILE_TYPE
                 && &finder_info[4..8] == HARDLINK_FILE_CREATOR
             {
-                return Err(FilesystemError::Unsupported(
-                    "HFS+ source carries file hardlinks; capture lands in Steps 16–17 \
-                     of docs/hfsplus_enhancements.md"
-                        .into(),
-                ));
+                let inode_num = BigEndian::read_u32(&body[44..48]);
+                return Ok(ParsedRecord::Hardlink(PendingHardlink {
+                    name,
+                    name_utf16,
+                    cnid,
+                    parent_cnid,
+                    inode_num,
+                    flags,
+                    finder_info,
+                    extended_finder_info,
+                    bsd_info,
+                    create_date,
+                    content_mod_date,
+                    attribute_mod_date,
+                    access_date,
+                    backup_date,
+                    text_encoding,
+                }));
+            }
+
+            // Directory hardlink stub: FILE record with FInfo `fdrp`/`MACS`.
+            // The `dir_<N>` directory inode is captured via the FOLDER
+            // branch and flagged with `is_dir_inode=true` in capture's
+            // second pass.
+            if &finder_info[0..4] == HARDLINK_DIR_TYPE && &finder_info[4..8] == HARDLINK_DIR_CREATOR
+            {
+                let inode_num = BigEndian::read_u32(&body[44..48]);
+                return Ok(ParsedRecord::DirHardlink(PendingDirHardlink {
+                    name,
+                    name_utf16,
+                    cnid,
+                    parent_cnid,
+                    inode_num,
+                    flags,
+                    finder_info,
+                    extended_finder_info,
+                    bsd_info,
+                    create_date,
+                    content_mod_date,
+                    attribute_mod_date,
+                    access_date,
+                    backup_date,
+                    text_encoding,
+                }));
             }
 
             Ok(ParsedRecord::File {
@@ -425,6 +752,8 @@ fn parse_catalog_record(rec: &[u8]) -> Result<ParsedRecord, FilesystemError> {
                     data_fork_bytes: Vec::new(),
                     rsrc_fork_bytes: Vec::new(),
                     xattrs: Vec::new(),
+                    is_inode: false,
+                    inode_num: None,
                 },
                 data_fork,
                 rsrc_fork,

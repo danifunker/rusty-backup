@@ -2231,6 +2231,7 @@ mod tests {
                 partition_type_string: None,
                 minimum_size_bytes: None,
                 defragmented_min_size_bytes: None,
+                hfsplus_signature: None,
             }],
             bad_sectors: vec![],
             extended_container: None,

@@ -30,6 +30,12 @@ pub struct FileEntry {
     /// (e.g. `$0801` = Applesoft BASIC load address, load addr for BIN,
     /// record length for random-access TXT). Only set for ProDOS entries.
     pub aux_type: Option<u16>,
+    /// HFS+ hardlink target inode CNID. Set on entries whose catalog row
+    /// is a hardlink stub (`fdType='hlnk' fdCreator='hfs+'`); the link's
+    /// data and resource forks live on the inode at this CNID under
+    /// `HFS+ Private Data`. `read_file` / `write_file_to` follow the
+    /// indirection automatically. `None` for ordinary files.
+    pub link_target_cnid: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -61,6 +67,7 @@ impl FileEntry {
             gid: None,
             resource_fork_size: None,
             aux_type: None,
+            link_target_cnid: None,
         }
     }
 
@@ -81,6 +88,7 @@ impl FileEntry {
             gid: None,
             resource_fork_size: None,
             aux_type: None,
+            link_target_cnid: None,
         }
     }
 
@@ -101,6 +109,7 @@ impl FileEntry {
             gid: None,
             resource_fork_size: None,
             aux_type: None,
+            link_target_cnid: None,
         }
     }
 
@@ -127,6 +136,7 @@ impl FileEntry {
             gid: None,
             resource_fork_size: None,
             aux_type: None,
+            link_target_cnid: None,
         }
     }
 
@@ -152,6 +162,7 @@ impl FileEntry {
             gid: None,
             resource_fork_size: None,
             aux_type: None,
+            link_target_cnid: None,
         }
     }
 

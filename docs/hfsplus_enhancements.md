@@ -272,7 +272,7 @@ Lands before the clone is enabled in user-facing code so xattrs survive the roun
 
 ### Step 15 — Detect + read hardlinks
 
-- [ ] **Goal:** `list_directory` returns hardlinks as regular files/dirs whose `target_cnid` points at the inode; `read_file` follows the indirection.
+- [x] **Goal:** `list_directory` returns hardlinks as regular files/dirs whose `target_cnid` points at the inode; `read_file` follows the indirection.
 
 **Files:** `src/fs/hfsplus.rs`
 
@@ -285,7 +285,7 @@ Lands before the clone is enabled in user-facing code so xattrs survive the roun
 
 ### Step 16 — Hardlink-aware delete + ref-counting
 
-- [ ] **Goal:** Deleting a hardlink decrements the inode's link count; deleting the last reference frees the inode.
+- [x] **Goal:** Deleting a hardlink decrements the inode's link count; deleting the last reference frees the inode.
 
 **Files:** `src/fs/hfsplus.rs`
 
@@ -297,7 +297,7 @@ Lands before the clone is enabled in user-facing code so xattrs survive the roun
 
 ### Step 17 — File hardlinks through capture + clone replay path
 
-- [ ] **Goal:** Capture preserves hardlink topology — N catalog rows pointing at one inode stay one inode in the snapshot. Clone replay (used in Step 21) emits each inode once.
+- [x] **Goal:** Capture preserves hardlink topology — N catalog rows pointing at one inode stay one inode in the snapshot. Clone replay (used in Step 21) emits each inode once.
 
 **Files:** `src/fs/hfsplus_clone.rs`, `src/fs/hfsplus.rs`
 
@@ -310,7 +310,7 @@ Lands before the clone is enabled in user-facing code so xattrs survive the roun
 
 ### Step 18 — Directory hardlink support (10.5+)
 
-- [ ] **Goal:** Same machinery as 15–17 but for `(type='fdrp', creator='hfs+')` directory hardlinks under `.HFS+ Private Directory Data`.
+- [x] **Goal:** Same machinery as 15–17 but for `(type='fdrp', creator='MACS')` directory hardlinks under `.HFS+ Private Directory Data\r`. (Plan typo: actual creator is `MACS`, per TN1150 / Darwin xnu.)
 
 **Files:** `src/fs/hfsplus.rs`, `src/fs/hfsplus_clone.rs`
 
@@ -328,7 +328,7 @@ The signature/keyCompareType piece landed in Step 9. These two steps cover the r
 
 ### Step 19 — Case-sensitive duplicate detection
 
-- [ ] **Goal:** `find_catalog_record(parent, name)` and the `AlreadyExists` check in `create_file` / `create_directory` honor the volume's case sensitivity.
+- [x] **Goal:** `find_catalog_record(parent, name)` and the `AlreadyExists` check in `create_file` / `create_directory` honor the volume's case sensitivity.
 
 **Files:** `src/fs/hfsplus.rs`
 
@@ -341,7 +341,7 @@ The signature/keyCompareType piece landed in Step 9. These two steps cover the r
 
 ### Step 20 — HFSX in min-size / clone reporting
 
-- [ ] **Goal:** UI strings and `metadata.json` distinguish HFS+ from HFSX where it matters.
+- [x] **Goal:** UI strings and `metadata.json` distinguish HFS+ from HFSX where it matters.
 
 **Files:** `src/fs/mod.rs` (`fs_name_for`), `src/gui/inspect_tab.rs`, `src/backup/metadata.rs`
 

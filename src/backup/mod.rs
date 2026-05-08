@@ -899,6 +899,13 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 Some(m) => d < m,
                 None => true,
             });
+        // Probe the HFS+/HFSX signature for HFS+-shaped partitions so
+        // restore can warn on case-sensitivity mismatches (Step 20).
+        // `probe_hfsplus_signature` returns None for non-HFS+ volumes.
+        let hfsplus_signature = source.get_ref().try_clone().ok().and_then(|c| {
+            let mut br = BufReader::new(c);
+            fs::probe_hfsplus_signature(&mut br, part.start_lba * 512)
+        });
         partition_metadata.push(PartitionMetadata {
             index: part.index,
             type_name: part.type_name.clone(),
@@ -914,6 +921,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             partition_type_string: part.partition_type_string.clone(),
             minimum_size_bytes: minimum_size,
             defragmented_min_size_bytes: defragmented_min,
+            hfsplus_signature,
         });
     }
 
@@ -1135,6 +1143,10 @@ fn run_single_file_chd_path(
                 .copied()
                 .flatten()
                 .map(|m| m.min(range.length));
+            let hfsplus_signature = source.get_ref().try_clone().ok().and_then(|c| {
+                let mut br = BufReader::new(c);
+                fs::probe_hfsplus_signature(&mut br, part.start_lba * 512)
+            });
             Some(PartitionMetadata {
                 index: range.partition_index,
                 type_name: part.type_name.clone(),
@@ -1150,6 +1162,7 @@ fn run_single_file_chd_path(
                 partition_type_string: part.partition_type_string.clone(),
                 minimum_size_bytes: minimum_size,
                 defragmented_min_size_bytes: defragmented_min,
+                hfsplus_signature,
             })
         })
         .collect();

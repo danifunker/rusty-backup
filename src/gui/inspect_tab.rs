@@ -1924,7 +1924,12 @@ impl InspectTab {
                             let Some(type_string) = part.partition_type_string.as_deref() else {
                                 continue;
                             };
-                            if type_string != "Apple_HFS" {
+                            // Apple_HFS is the ambiguous APM tag (HFS, HFS+, or
+                            // wrapped HFS+); Apple_HFSX is unambiguous but
+                            // benefits from the same volume-label lookup so
+                            // the inspect grid surfaces the user-facing name
+                            // rather than just the type string.
+                            if type_string != "Apple_HFS" && type_string != "Apple_HFSX" {
                                 continue;
                             }
                             // Extract the APM name from the existing
@@ -1990,9 +1995,16 @@ impl InspectTab {
                                 _ => None,
                             };
 
+                            // Use the partition's actual type string so
+                            // Apple_HFSX volumes don't get re-labelled
+                            // "Apple_HFS (HFSX)". Drop the redundant tag
+                            // when type_string already encodes it.
                             let mut new_name = match variant_tag {
-                                Some(tag) => format!("Apple_HFS ({tag})"),
-                                None => "Apple_HFS".to_string(),
+                                Some(tag) if tag == "HFSX" && type_string == "Apple_HFSX" => {
+                                    type_string.to_string()
+                                }
+                                Some(tag) => format!("{type_string} ({tag})"),
+                                None => type_string.to_string(),
                             };
                             if !display_name.is_empty() {
                                 new_name.push(' ');

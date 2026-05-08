@@ -157,6 +157,7 @@ mod tests {
                 gid: None,
                 resource_fork_size: None,
                 aux_type: None,
+                link_target_cnid: None,
             })
         }
 
@@ -179,6 +180,7 @@ mod tests {
                         gid: None,
                         resource_fork_size: None,
                         aux_type: None,
+                        link_target_cnid: None,
                     },
                     FileEntry {
                         name: "ReadMe".into(),
@@ -196,6 +198,7 @@ mod tests {
                         gid: None,
                         resource_fork_size: Some(512),
                         aux_type: None,
+                        link_target_cnid: None,
                     },
                 ]),
                 "/Documents" => Ok(vec![FileEntry {
@@ -214,6 +217,7 @@ mod tests {
                     gid: None,
                     resource_fork_size: None,
                     aux_type: None,
+                    link_target_cnid: None,
                 }]),
                 _ => Ok(vec![]),
             }

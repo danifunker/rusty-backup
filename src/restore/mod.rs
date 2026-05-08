@@ -2780,6 +2780,7 @@ mod tests {
                     partition_type_string: None,
                     minimum_size_bytes: None,
                     defragmented_min_size_bytes: None,
+                    hfsplus_signature: None,
                 })
                 .collect(),
             bad_sectors: vec![],
@@ -2911,6 +2912,7 @@ mod tests {
                     partition_type_string: None,
                     minimum_size_bytes: None,
                     defragmented_min_size_bytes: None,
+                    hfsplus_signature: None,
                 })
                 .collect(),
             bad_sectors: vec![],
@@ -3081,6 +3083,7 @@ mod tests {
                     partition_type_string: None,
                     minimum_size_bytes: None,
                     defragmented_min_size_bytes: None,
+                    hfsplus_signature: None,
                 })
                 .collect(),
             bad_sectors: vec![],
@@ -3270,6 +3273,7 @@ mod tests {
                 partition_type_string: None,
                 minimum_size_bytes: None,
                 defragmented_min_size_bytes: None,
+                hfsplus_signature: None,
             }
         };
         let metadata = BackupMetadata {
