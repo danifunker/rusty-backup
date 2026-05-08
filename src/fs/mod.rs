@@ -351,29 +351,69 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
     }
 }
 
-/// Like `compact_partition_reader`, but always produces a *layout-preserving*
-/// stream — `info.compacted_size == info.original_size`, with allocated
-/// regions byte-equal to the source and free regions emitted as zeros.
+/// `Read` adapter that emits an inner reader's bytes followed by zero-fill
+/// up to a fixed total length. Used by `packed_partition_reader_padded` to
+/// place a packed FS volume at the start of a partition extent and zero-fill
+/// the trailing slack so the partition table's extent size still matches.
+struct ZeroPaddedReader<R> {
+    inner: R,
+    inner_remaining: u64,
+    pad_remaining: u64,
+}
+
+impl<R: Read> Read for ZeroPaddedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.inner_remaining > 0 {
+            let want = (self.inner_remaining as usize).min(buf.len());
+            let n = self.inner.read(&mut buf[..want])?;
+            if n == 0 {
+                // Inner exhausted early — convert the rest of inner_remaining
+                // into pad_remaining so the caller still sees a stream of the
+                // declared total length. This mirrors LayoutPreservingReader's
+                // short-source handling.
+                self.pad_remaining = self.pad_remaining.saturating_add(self.inner_remaining);
+                self.inner_remaining = 0;
+                return self.read(buf);
+            }
+            self.inner_remaining -= n as u64;
+            Ok(n)
+        } else if self.pad_remaining > 0 {
+            let n = (self.pad_remaining as usize).min(buf.len());
+            buf[..n].fill(0);
+            self.pad_remaining -= n as u64;
+            Ok(n)
+        } else {
+            Ok(0)
+        }
+    }
+}
+
+/// Like `layout_preserving_partition_reader`, but for FAT/NTFS/exFAT it
+/// returns the *packed* compact reader (allocated clusters at the start,
+/// FS metadata shrunk to fit) padded with zeros up to `original_size`.
 ///
-/// FAT/NTFS/exFAT route through their `into_layout_preserving` adapters
-/// (which reuse the existing parsing pass). HFS, HFS+, ext, btrfs, and
-/// ProDOS already emit layout-preserving streams from `compact_partition_reader`,
-/// so they're forwarded through unchanged. Any FS without a layout-preserving
-/// reader returns `None`, leaving the caller to fall back to raw passthrough.
+/// The resulting stream still has length == `original_size`, so it slots
+/// into the partition's extent inside a synthesised disk image without
+/// changing the partition table. Inside that extent, the OS sees a smaller
+/// FAT/NTFS/exFAT volume at offset 0 (BPB / boot sector reflects the
+/// shrunken total_sectors) followed by a zero-filled tail. CHD compresses
+/// the tail to nothing.
 ///
-/// Used by the single-file CHD backup path: the resulting stream lines up
-/// with the synthesised disk image's offsets, so `compress_chd` produces
-/// a CHD whose hunks match the source disk image byte-for-byte for every
-/// allocated cluster.
-pub fn layout_preserving_partition_reader<R: Read + Seek + Send + 'static>(
+/// HFS/HFS+/ext/btrfs/ProDOS keep their existing layout-preserving stream
+/// (those readers are already byte-faithful at `original_size`).
+///
+/// Used by single-file CHD backup when not in sector-by-sector mode: the
+/// FAT-family partitions emerge defragmented in place, and the streaming
+/// pattern is sequential rather than seek-heavy.
+pub fn packed_partition_reader_padded<R: Read + Seek + Send + 'static>(
     mut reader: R,
     partition_offset: u64,
     partition_type: u8,
     partition_type_string: Option<&str>,
 ) -> Option<(Box<dyn Read + Send>, CompactResult)> {
-    // String-typed (APM) partitions go through the existing dispatcher
-    // since their compact readers (HFS/HFS+/ext/btrfs) are already
-    // layout-preserving.
+    // APM and HFS/ext/btrfs/ProDOS go through the existing dispatcher —
+    // those readers are already layout-preserving (compacted_size ==
+    // original_size), so no padding is needed.
     if partition_type_string.is_some() {
         return compact_partition_reader(
             reader,
@@ -382,70 +422,84 @@ pub fn layout_preserving_partition_reader<R: Read + Seek + Send + 'static>(
             partition_type_string,
         );
     }
-
     match partition_type {
-        // Auto-detect: probe the boot sector then choose.
+        0x83 | 0xAF | 0xA8 => {
+            return compact_partition_reader(
+                reader,
+                partition_offset,
+                partition_type,
+                partition_type_string,
+            );
+        }
+        _ => {}
+    }
+
+    // For FAT/NTFS/exFAT: build the packed reader (compacted_size <
+    // original_size) and pad it with zeros to original_size.
+    let (compact_reader, info): (Box<dyn Read + Send>, CompactResult) = match partition_type {
         0x00 => {
             let fs_type = detect_filesystem_type(&mut reader, partition_offset);
             match fs_type {
                 "fat" => {
-                    let (compact, _) = CompactFatReader::new(reader, partition_offset).ok()?;
-                    let (lp, info) = compact.into_layout_preserving();
-                    Some((Box::new(lp), info))
+                    let (r, info) = CompactFatReader::new(reader, partition_offset).ok()?;
+                    (Box::new(r), info)
                 }
                 "ntfs" => {
-                    let (compact, _) = CompactNtfsReader::new(reader, partition_offset).ok()?;
-                    let (lp, info) = compact.into_layout_preserving();
-                    Some((Box::new(lp), info))
+                    let (r, info) = CompactNtfsReader::new(reader, partition_offset).ok()?;
+                    (Box::new(r), info)
                 }
                 "exfat" => {
-                    let (compact, _) = CompactExfatReader::new(reader, partition_offset).ok()?;
-                    let (lp, info) = compact.into_layout_preserving();
-                    Some((Box::new(lp), info))
+                    let (r, info) = CompactExfatReader::new(reader, partition_offset).ok()?;
+                    (Box::new(r), info)
                 }
-                // ext / btrfs / prodos compact readers are already
-                // layout-preserving — defer to the existing dispatcher.
-                _ => compact_partition_reader(
-                    reader,
-                    partition_offset,
-                    partition_type,
-                    partition_type_string,
-                ),
+                _ => {
+                    return compact_partition_reader(
+                        reader,
+                        partition_offset,
+                        partition_type,
+                        partition_type_string,
+                    );
+                }
             }
         }
-        // FAT family
         0x01 | 0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C => {
-            let (compact, _) = CompactFatReader::new(reader, partition_offset).ok()?;
-            let (lp, info) = compact.into_layout_preserving();
-            Some((Box::new(lp), info))
+            let (r, info) = CompactFatReader::new(reader, partition_offset).ok()?;
+            (Box::new(r), info)
         }
-        // NTFS / exFAT (shared type byte; probe to disambiguate)
         0x07 => {
             let fs_type = detect_0x07_type(&mut reader, partition_offset);
             match fs_type {
                 "ntfs" => {
-                    let (compact, _) = CompactNtfsReader::new(reader, partition_offset).ok()?;
-                    let (lp, info) = compact.into_layout_preserving();
-                    Some((Box::new(lp), info))
+                    let (r, info) = CompactNtfsReader::new(reader, partition_offset).ok()?;
+                    (Box::new(r), info)
                 }
                 "exfat" => {
-                    let (compact, _) = CompactExfatReader::new(reader, partition_offset).ok()?;
-                    let (lp, info) = compact.into_layout_preserving();
-                    Some((Box::new(lp), info))
+                    let (r, info) = CompactExfatReader::new(reader, partition_offset).ok()?;
+                    (Box::new(r), info)
                 }
-                _ => None,
+                _ => return None,
             }
         }
-        // HFS/HFS+/ext/btrfs/ProDOS — existing readers are already
-        // layout-preserving.
-        0x83 | 0xAF | 0xA8 => compact_partition_reader(
-            reader,
-            partition_offset,
-            partition_type,
-            partition_type_string,
-        ),
-        _ => None,
-    }
+        _ => return None,
+    };
+
+    let original_size = info.original_size;
+    let compacted_size = info.compacted_size;
+    let pad = original_size.saturating_sub(compacted_size);
+    let padded: Box<dyn Read + Send> = Box::new(ZeroPaddedReader {
+        inner: compact_reader,
+        inner_remaining: compacted_size,
+        pad_remaining: pad,
+    });
+    let padded_info = CompactResult {
+        original_size,
+        // Stream length now equals original_size; downstream guards in
+        // single_file_chd assert this for layout-preserving correctness.
+        compacted_size: original_size,
+        data_size: info.data_size,
+        clusters_used: info.clusters_used,
+    };
+    Some((padded, padded_info))
 }
 
 /// Calculate the effective data size for a partition — the number of bytes

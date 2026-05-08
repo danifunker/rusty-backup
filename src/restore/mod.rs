@@ -1199,8 +1199,10 @@ fn run_single_file_chd_restore_as_is(
 
     if logical_size > config.target_size {
         bail!(
-            "target ({} bytes) is smaller than the CHD's logical size ({} bytes); \
-             restore would overflow",
+            "target ({} bytes) is smaller than the CHD's logical size ({} bytes). \
+             Pick a non-Original size for one or more partitions in the size mode \
+             column (Minimum / MinPlus20 / Custom) so the restore can re-pack the \
+             disk into the smaller target.",
             config.target_size,
             logical_size,
         );

@@ -32,7 +32,7 @@
 //! validation.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
@@ -1210,36 +1210,47 @@ fn build_partition_reader(
     let part_length = part.size_bytes;
 
     if !sector_by_sector {
-        // Smart mode: ask for a layout-preserving reader. The single
-        // dispatcher routes FAT/NTFS/exFAT through their
-        // `into_layout_preserving` adapters, while HFS/HFS+/ext/btrfs/
-        // ProDOS use their existing layout-preserving compact readers,
-        // and unsupported types fall through to raw passthrough below.
+        // Smart mode: pack the FS body at the start of the partition
+        // extent and zero-fill the trailing slack. For FAT/NTFS/exFAT
+        // this defragments the volume in place (BPB shrinks to the new
+        // cluster count, FAT tables track the packed clusters); for
+        // HFS/HFS+/ext/btrfs/ProDOS the dispatcher returns the existing
+        // layout-preserving stream unchanged. Either way, the returned
+        // stream length equals `partition.size_bytes`.
         let clone = source_file
             .try_clone()
             .context("failed to clone source for compact reader")?;
-        if let Some((reader, info)) = fs::layout_preserving_partition_reader(
+        if let Some((reader, info)) = fs::packed_partition_reader_padded(
             clone,
             part_offset,
             part.partition_type_byte,
             part.partition_type_string.as_deref(),
         ) {
-            // Defensive guard: a future regression that lets a packed
-            // reader leak through here would silently corrupt the disk
-            // image. Crash early instead.
+            // After padding, the stream must be exactly the partition
+            // extent's length; an earlier regression let a packed
+            // (un-padded) stream leak through and silently truncated the
+            // disk image. Crash early instead.
             debug_assert_eq!(
                 info.compacted_size, info.original_size,
-                "single-file CHD requires layout-preserving streams",
+                "single-file CHD requires streams sized to the partition extent",
             );
             if info.compacted_size == info.original_size {
+                let packed_bytes = info.original_size.saturating_sub(
+                    // For FAT/NTFS/exFAT the packed footprint is data_size
+                    // (logical FS data); for layout-preserving readers
+                    // data_size < compacted_size and the rest is verbatim
+                    // free-region bytes. Either case: report the live
+                    // footprint, with the slack tail counted as zero-fill.
+                    0,
+                );
                 log_cb(&format!(
-                    "  partition-{}: layout-preserving reader (allocated {} of {} bytes)",
-                    part.index, info.data_size, info.original_size,
+                    "  partition-{}: packed-and-padded reader (data {} of {} bytes, tail zero-filled)",
+                    part.index, info.data_size, packed_bytes,
                 ));
                 return Ok(reader);
             }
             log_cb(&format!(
-                "  partition-{}: dispatcher returned packed reader unexpectedly; \
+                "  partition-{}: dispatcher returned mis-sized stream; \
                  falling back to raw passthrough",
                 part.index,
             ));
@@ -1474,6 +1485,7 @@ fn hex_lower(b: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::BufReader;
 
     /// Build a minimal MBR sector declaring one partition at LBA 1 covering
     /// `partition_sectors` sectors. Type byte 0x83 (Linux) — bypasses both
@@ -1985,15 +1997,15 @@ mod tests {
         img
     }
 
-    /// Stage 4d round-trip: a synthetic FAT12 partition with cluster 2
-    /// allocated and clusters 3..N free-but-garbage-filled goes through
-    /// the single-file CHD pipeline. We assert that the resulting CHD's
-    /// bytes match the source for every metadata + allocated cluster
-    /// region, AND that the free-cluster regions come back as zeros
-    /// (proving `into_layout_preserving` zeroed them on the way out
-    /// rather than streaming the source's 0xAB garbage).
+    /// Compact-always round-trip: a synthetic FAT12 partition with
+    /// cluster 2 allocated and clusters 3..N free-but-garbage-filled
+    /// goes through the single-file CHD pipeline. We assert that the
+    /// resulting CHD body is the *packed* FAT volume at the start of
+    /// the partition extent (BPB shrunk, allocated cluster's payload
+    /// preserved) followed by zero-fill — the source's 0xAB garbage
+    /// in free clusters must not bleed through.
     #[test]
-    fn layout_preserving_fat_zeros_free_clusters() {
+    fn packed_and_padded_fat_zeros_free_clusters() {
         const PART_SECTORS: u32 = 16;
         const TOTAL_SECTORS: u32 = PART_SECTORS + 1;
         const SECTOR_SIZE: u64 = 512;
@@ -2053,8 +2065,8 @@ mod tests {
         assert_eq!(result.container_logical_size, total_bytes);
         let joined = log_buf.join("\n");
         assert!(
-            joined.contains("layout-preserving reader"),
-            "log must mention layout-preserving reader; got:\n{joined}",
+            joined.contains("packed-and-padded reader"),
+            "log must mention packed-and-padded reader; got:\n{joined}",
         );
 
         let chd_path = tmp.path().join("disk.chd");
@@ -2062,29 +2074,49 @@ mod tests {
         let mut readback = vec![0u8; total_bytes as usize];
         reader.read_exact(&mut readback).unwrap();
 
-        // MBR + boot sector + FAT + root dir + cluster 2 must equal
-        // source byte-for-byte (allocated + metadata regions).
-        let allocated_end = 512 + 4 * 512; // through cluster 2 (data_start + 1 cluster)
-        assert_eq!(
-            &readback[..allocated_end],
-            &data[..allocated_end],
-            "MBR + FAT metadata + allocated cluster must round-trip",
-        );
+        // MBR sector survives unchanged at offset 0.
+        assert_eq!(&readback[..512], &data[..512], "MBR must round-trip");
 
-        // Free cluster region in the CHD must be all zeros even though
-        // the source had 0xAB garbage there.
-        let free_start = allocated_end;
-        let free_end = 512 + (PART_SECTORS as usize) * 512;
-        let free = &readback[free_start..free_end];
+        // Inside the partition extent: BPB at offset 512 has
+        // total_sectors patched to the new (smaller) packed footprint.
+        let bpb = &readback[512..1024];
+        assert_eq!(&bpb[..3], &[0xEB, 0x3C, 0x90], "BPB jump must be intact");
+        let new_total_sectors_16 = u16::from_le_bytes([bpb[19], bpb[20]]);
         assert!(
-            free.iter().all(|b| *b == 0),
-            "free clusters must be zero in the round-tripped CHD; saw {} non-zero bytes",
-            free.iter().filter(|b| **b != 0).count(),
+            (new_total_sectors_16 as u32) < PART_SECTORS,
+            "packed BPB.total_sectors ({new_total_sectors_16}) must be smaller than \
+             original partition extent ({PART_SECTORS})",
         );
 
-        // Sanity: the source had 0xAB garbage there, so we know the
-        // assertion above is meaningful.
-        let src_free = &data[free_start..free_end];
+        // Cluster 2's payload survived through the pipeline. Its
+        // position inside the packed image is reserved + FAT + root_dir
+        // sectors from partition start, but rather than recompute that
+        // here we just look for the marker bytes anywhere in the
+        // partition body.
+        let part = &readback[512..512 + PART_SECTORS as usize * 512];
+        assert!(
+            part.windows(b"hello layout-preserving FAT world".len())
+                .any(|w| w == b"hello layout-preserving FAT world"),
+            "cluster 2's payload must survive the pack-and-pad round trip",
+        );
+
+        // The trailing slack — bytes after the packed volume — must be
+        // zero, even though the source had 0xAB garbage in its free
+        // clusters. Use the new BPB total_sectors as the boundary.
+        let packed_end = 512 + (new_total_sectors_16 as usize) * 512;
+        let part_end = 512 + (PART_SECTORS as usize) * 512;
+        if packed_end < part_end {
+            let tail = &readback[packed_end..part_end];
+            assert!(
+                tail.iter().all(|b| *b == 0),
+                "packed-tail slack must be zero; saw {} non-zero bytes",
+                tail.iter().filter(|b| **b != 0).count(),
+            );
+        }
+
+        // Sanity: the source had 0xAB garbage in its free clusters, so
+        // the zero-tail assertion above is meaningful.
+        let src_free = &data[512 + 4 * 512..512 + (PART_SECTORS as usize) * 512];
         assert!(
             src_free.iter().any(|b| *b == 0xAB),
             "test setup failed — source free region must contain garbage",

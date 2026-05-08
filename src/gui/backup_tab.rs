@@ -768,7 +768,7 @@ impl BackupTab {
                         ctx.log.error(format!(
                             "Minimum size calculation failed for partition {idx}: {err}",
                         ));
-                    } else if let Some(min) = s.result {
+                    } else if let Some(min) = s.defragmented_min.or(s.result) {
                         let part_size = self
                             .source_partitions
                             .iter()
@@ -778,8 +778,13 @@ impl BackupTab {
                         let clamped = min.min(part_size);
                         self.partition_min_sizes.insert(idx, clamped);
                         ctx.log.info(format!(
-                            "Partition {idx}: minimum size {} (computed)",
+                            "Partition {idx}: minimum size {} (computed{})",
                             partition::format_size(clamped),
+                            if s.defragmented_min.is_some() {
+                                ", defragmented floor"
+                            } else {
+                                ""
+                            },
                         ));
                         for cfg in &mut self.vhd_partition_configs {
                             if cfg.index == idx {
@@ -892,19 +897,32 @@ impl BackupTab {
                     );
                     match result {
                         fs::MinimumResult::Computed {
-                            in_place: Some(min_size),
-                            ..
+                            in_place,
+                            defragmented,
                         } => {
-                            let clamped = min_size.min(part.size_bytes);
-                            self.partition_min_sizes.insert(part.index, clamped);
-                            ctx.log.info(format!(
-                                "Partition {}: minimum size {} (original {})",
-                                part.index,
-                                partition::format_size(clamped),
-                                partition::format_size(part.size_bytes),
-                            ));
+                            // Prefer the defragmented floor when present:
+                            // CHD backups now always pack allocated clusters
+                            // at the start of the partition extent, so the
+                            // defragmented minimum is achievable for the
+                            // shrink path. Falls back to in_place for legacy
+                            // packed paths and per-partition VHD output.
+                            let chosen = defragmented.or(in_place);
+                            if let Some(min_size) = chosen {
+                                let clamped = min_size.min(part.size_bytes);
+                                self.partition_min_sizes.insert(part.index, clamped);
+                                ctx.log.info(format!(
+                                    "Partition {}: minimum size {} (original {}{})",
+                                    part.index,
+                                    partition::format_size(clamped),
+                                    partition::format_size(part.size_bytes),
+                                    if defragmented.is_some() {
+                                        ", defragmented floor"
+                                    } else {
+                                        ""
+                                    },
+                                ));
+                            }
                         }
-                        fs::MinimumResult::Computed { in_place: None, .. } => {}
                         fs::MinimumResult::Deferred { fs_name } => {
                             ctx.log.info(format!(
                                 "Partition {}: need to calculate minimum size due to filesystem {fs_name} (click \"Calc min\" to compute)",

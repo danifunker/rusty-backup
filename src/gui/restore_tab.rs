@@ -941,17 +941,23 @@ impl RestoreTab {
 
         // Build partition configs
         for pm in &metadata.partitions {
-            // Prefer explicit minimum_size_bytes (computed at backup time via
-            // last_data_byte). Fall back to imaged_size_bytes for older backups
-            // that used packed compaction (where imaged < original), and finally
+            // Prefer the smallest known-safe floor: defragmented_min when it
+            // exists (CHD backups produced with compact-always have allocated
+            // clusters packed at the start, so the defragmented floor is real),
+            // then in-place minimum_size_bytes (last_data_byte), then
+            // imaged_size_bytes for older packed backups, and finally
             // original_size_bytes when no sizing hint is available.
-            let minimum = pm.minimum_size_bytes.filter(|&s| s > 0).unwrap_or({
-                if pm.imaged_size_bytes > 0 {
-                    pm.imaged_size_bytes
-                } else {
-                    pm.original_size_bytes
-                }
-            });
+            let minimum = pm
+                .defragmented_min_size_bytes
+                .filter(|&s| s > 0)
+                .or(pm.minimum_size_bytes.filter(|&s| s > 0))
+                .unwrap_or({
+                    if pm.imaged_size_bytes > 0 {
+                        pm.imaged_size_bytes
+                    } else {
+                        pm.original_size_bytes
+                    }
+                });
 
             self.partition_configs.push(RestorePartitionConfig {
                 index: pm.index,
