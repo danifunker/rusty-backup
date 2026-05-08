@@ -7,11 +7,13 @@
 //!
 //! Until later phases land, `SourceCatalogSnapshot::capture` returns
 //! `Err(Unsupported(...))` for volumes carrying:
-//!   - extended attributes (`vh.attributes_file.logical_size > 0`) — relaxed
-//!     in Step 13 of the plan;
 //!   - file or directory hardlinks (`fdType='hlnk' creator='hfs+'` or
 //!     `fdType='fdrp' creator='MACS'` in the userInfo block) — relaxed in
 //!     Steps 16–18.
+//!
+//! Step 14 (this revision) wires extended-attribute capture into both
+//! `SourceFileSnapshot` and `SourceDirSnapshot`, so xattr-bearing volumes
+//! flow through to the clone target byte-for-byte.
 
 use std::io::{Read, Seek};
 
@@ -19,7 +21,7 @@ use byteorder::{BigEndian, ByteOrder};
 
 use super::filesystem::FilesystemError;
 use super::hfs_common::walk_leaf_records;
-use super::hfsplus::HfsPlusFilesystem;
+use super::hfsplus::{HfsPlusFilesystem, XattrRecord};
 
 /// Fork-type byte used in extents-overflow keys (mirrors the constant in
 /// `hfsplus`).
@@ -97,6 +99,11 @@ pub struct SourceDirSnapshot {
     pub access_date: u32,
     pub backup_date: u32,
     pub text_encoding: u32,
+    /// Extended attributes attached to this CNID. `XattrRecord::name` holds
+    /// the key (e.g. `com.apple.FinderInfo`); `XattrRecord::kind` is the
+    /// inline / fork / extents payload. Empty vector when the volume has no
+    /// attributes file or no records for this CNID.
+    pub xattrs: Vec<XattrRecord>,
 }
 
 /// Per-file metadata captured from a `kHFSPlusFileRecord`.
@@ -128,6 +135,9 @@ pub struct SourceFileSnapshot {
     /// Verbatim resource fork bytes. Empty when the file has no resource
     /// fork.
     pub rsrc_fork_bytes: Vec<u8>,
+    /// Extended attributes attached to this CNID. See
+    /// [`SourceDirSnapshot::xattrs`] for layout details.
+    pub xattrs: Vec<XattrRecord>,
 }
 
 impl SourceFileSnapshot {
@@ -181,19 +191,11 @@ impl SourceCatalogSnapshot {
     /// thread records) and reads each file's data + resource fork into the
     /// snapshot. Index nodes are ignored.
     ///
-    /// Returns `Err(Unsupported)` early on volumes carrying extended
-    /// attributes or hardlinks — Steps 13 / 16–18 of
-    /// `docs/hfsplus_enhancements.md` will relax these guards once the
-    /// supporting infrastructure lands.
+    /// Returns `Err(Unsupported)` early on volumes carrying hardlinks —
+    /// Steps 16–18 of `docs/hfsplus_enhancements.md` will relax that guard
+    /// once the supporting infrastructure lands. Extended attributes are
+    /// captured in full (Step 14).
     pub fn capture<R: Read + Seek>(fs: &mut HfsPlusFilesystem<R>) -> Result<Self, FilesystemError> {
-        if fs.attributes_file_size() > 0 {
-            return Err(FilesystemError::Unsupported(
-                "HFS+ source carries extended attributes; xattr capture lands in Phase 5 \
-                 (Step 13 of docs/hfsplus_enhancements.md)"
-                    .into(),
-            ));
-        }
-
         let volume = SourceVolumeSnapshot::capture(fs)?;
 
         // Walk the catalog leaves and accumulate dir / file metadata. File
@@ -240,7 +242,7 @@ impl SourceCatalogSnapshot {
             return Err(e);
         }
 
-        // Read fork bytes now that the catalog borrow is released.
+        // Read fork bytes and xattrs now that the catalog borrow is released.
         for (file, (data_fork, rsrc_fork)) in files.iter_mut().zip(pending_forks.into_iter()) {
             let data_logical = BigEndian::read_u64(&data_fork[0..8]);
             if data_logical > 0 {
@@ -252,6 +254,10 @@ impl SourceCatalogSnapshot {
                 file.rsrc_fork_bytes =
                     fs.read_user_fork_bytes(file.cnid, HFSPLUS_FORK_RESOURCE, &rsrc_fork)?;
             }
+            file.xattrs = fs.list_xattrs(file.cnid)?;
+        }
+        for dir in dirs.iter_mut() {
+            dir.xattrs = fs.list_xattrs(dir.cnid)?;
         }
 
         Ok(SourceCatalogSnapshot {
@@ -360,6 +366,7 @@ fn parse_catalog_record(rec: &[u8]) -> Result<ParsedRecord, FilesystemError> {
                 access_date,
                 backup_date,
                 text_encoding,
+                xattrs: Vec::new(),
             }))
         }
         CATALOG_FILE => {
@@ -417,6 +424,7 @@ fn parse_catalog_record(rec: &[u8]) -> Result<ParsedRecord, FilesystemError> {
                     text_encoding,
                     data_fork_bytes: Vec::new(),
                     rsrc_fork_bytes: Vec::new(),
+                    xattrs: Vec::new(),
                 },
                 data_fork,
                 rsrc_fork,
@@ -522,32 +530,33 @@ mod tests {
         assert!(note.rsrc_fork_bytes.is_empty());
     }
 
-    #[test]
-    fn capture_refuses_volumes_with_xattrs() {
-        // Hand-poke `attributes_file.logical_size` in the VH so capture
-        // exercises the early-out without us needing a real xattr writer
-        // (lands in Phase 5).
-        let mut img = create_blank_hfsplus(32 * 1024 * 1024, 4096, "Attrs", false);
-        // VH lives at offset 1024; attributes_file ForkData starts at +352.
-        // logical_size is the first 8 bytes (big-endian u64).
-        let attr_off = 1024 + 352;
-        let fake_size = 4096u64.to_be_bytes();
-        img[attr_off..attr_off + 8].copy_from_slice(&fake_size);
-        // Mirror to the alternate VH at end-of-volume so re-open doesn't
-        // bail; HFS+ open reads the primary first.
-        let alt_off = img.len() - 1024 + 352;
-        img[alt_off..alt_off + 8].copy_from_slice(&fake_size);
+    // The xattr round-trip capture test (Step 14) lives in hfsplus.rs's test
+    // module since it relies on `make_editable_hfsplus_image_with_inline_xattr`
+    // to seed an attributes B-tree (a freshly built blank from
+    // `create_blank_hfsplus` has `attributes_file.logical_size == 0`, so
+    // `set_xattr` on it would be rejected by `insert_xattr_record`).
 
+    #[test]
+    fn capture_no_xattrs_yields_empty_vec() {
+        let mut img = create_blank_hfsplus(32 * 1024 * 1024, 4096, "Plain", false);
+        {
+            let cursor = Cursor::new(&mut img);
+            let mut fs = HfsPlusFilesystem::open(cursor, 0).expect("open");
+            fs.prepare_for_edit().expect("prepare_for_edit");
+            let root = fs.root().expect("root");
+            let mut data = std::io::Cursor::new(&b"x"[..]);
+            fs.create_file(&root, "x.txt", &mut data, 1, &CreateFileOptions::default())
+                .expect("create");
+            fs.sync_metadata().expect("sync");
+        }
         let cursor = Cursor::new(&mut img);
-        let mut fs = HfsPlusFilesystem::open(cursor, 0).expect("open");
-        let err = SourceCatalogSnapshot::capture(&mut fs)
-            .err()
-            .expect("should refuse xattr volume");
-        match err {
-            FilesystemError::Unsupported(msg) => {
-                assert!(msg.contains("extended attributes"), "got: {msg}");
-            }
-            other => panic!("expected Unsupported, got {other:?}"),
+        let mut fs = HfsPlusFilesystem::open(cursor, 0).expect("re-open");
+        let snap = SourceCatalogSnapshot::capture(&mut fs).expect("capture");
+        for f in &snap.files {
+            assert!(f.xattrs.is_empty(), "file {} has xattrs", f.name);
+        }
+        for d in &snap.dirs {
+            assert!(d.xattrs.is_empty(), "dir {} has xattrs", d.name);
         }
     }
 }

@@ -256,7 +256,7 @@ Lands before the clone is enabled in user-facing code so xattrs survive the roun
 
 ### Step 14 — Capture xattrs through the snapshot
 
-- [ ] **Goal:** `SourceFileSnapshot` and `SourceDirSnapshot` carry xattrs; capture no longer refuses xattr-bearing volumes.
+- [x] **Goal:** `SourceFileSnapshot` and `SourceDirSnapshot` carry xattrs; capture no longer refuses xattr-bearing volumes.
 
 **Files:** `src/fs/hfsplus_clone.rs`
 
