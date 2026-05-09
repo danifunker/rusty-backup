@@ -28,12 +28,12 @@ const HFSPLUS_ATTRIBUTES_FILE_ID: u32 = 8;
 /// Volume attribute bit (`vh.attributes`) set when the volume carries a
 /// journal. We refuse to enter edit mode on these volumes until journal
 /// replay is implemented — see Step 4 of `docs/hfsplus_enhancements.md`.
-const HFSPLUS_VOLUME_JOURNALED_BIT: u32 = 0x2000;
+pub(crate) const HFSPLUS_VOLUME_JOURNALED_BIT: u32 = 0x2000;
 
 /// `kHFSVolumeUnmountedBit` — set in `vh.attributes` to mark a cleanly-
 /// unmounted volume. Mac OS refuses to mount volumes without this bit
 /// (it triggers a "needs scavenging" path).
-const HFSPLUS_VOLUME_UNMOUNTED_BIT: u32 = 0x100;
+pub(crate) const HFSPLUS_VOLUME_UNMOUNTED_BIT: u32 = 0x100;
 
 /// HFS+ B-tree `keyCompareType` byte values (BTHeaderRec offset 37 in
 /// node 0). Plain HFS+ uses case-folding NFD compare; HFSX with the
@@ -117,7 +117,7 @@ impl ForkData {
         }
     }
 
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         ForkData {
             logical_size: 0,
             clump_size: 0,
@@ -712,6 +712,27 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         self.vh.attributes_file.logical_size
     }
 
+    /// `total_blocks` field of the source's catalog file fork. Used by the
+    /// streamed defrag planner to size the target's catalog B-tree (with
+    /// a small safety margin) so it has enough free nodes to host every
+    /// inserted record without running out of B-tree node slots.
+    pub(crate) fn vh_catalog_total_blocks(&self) -> u32 {
+        self.vh.catalog_file.total_blocks
+    }
+
+    /// `total_blocks` field of the source's extents-overflow file fork.
+    /// Most defrag targets pack files contiguously and need little or no
+    /// overflow capacity, but matching source size is a safe ceiling.
+    pub(crate) fn vh_extents_total_blocks(&self) -> u32 {
+        self.vh.extents_file.total_blocks
+    }
+
+    /// `total_blocks` field of the source's attributes file fork. Zero on
+    /// volumes without xattrs.
+    pub(crate) fn vh_attributes_total_blocks(&self) -> u32 {
+        self.vh.attributes_file.total_blocks
+    }
+
     pub(crate) fn label(&self) -> &str {
         &self.label
     }
@@ -737,23 +758,77 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         Ok(buf)
     }
 
-    /// Read a user fork given the raw 80 bytes of `HFSPlusForkData` from a
-    /// catalog file record. Routes through the extents-overflow B-tree when
-    /// the inline 8 extents don't cover `logical_size`.
-    pub(crate) fn read_user_fork_bytes(
+    /// Open a streaming `Read` over a user fork without buffering its bytes.
+    /// Used by the clone pipeline (Step 21+) so a 38 GiB volume's data
+    /// forks don't have to materialise in RAM. The returned reader borrows
+    /// `self`'s underlying I/O for its lifetime — drop it before issuing
+    /// any other read against this filesystem.
+    pub(crate) fn fork_stream_reader(
         &mut self,
         file_id: u32,
         fork_type: u8,
-        fork_record: &[u8],
-    ) -> Result<Vec<u8>, FilesystemError> {
-        if fork_record.len() < 80 {
-            return Err(FilesystemError::Parse(format!(
-                "fork record for file {file_id} truncated: {} bytes",
-                fork_record.len()
-            )));
-        }
+        fork_record: &[u8; 80],
+    ) -> Result<ForkStreamReader<'_, R>, FilesystemError> {
         let fork = ForkData::parse(fork_record);
-        self.read_user_fork(file_id, fork_type, &fork)
+        let logical_size = fork.logical_size;
+
+        // Resolve every extent (inline + overflow) into device-offset / length
+        // pairs once at construction. The extents-overflow B-tree was already
+        // loaded eagerly during `open`; consulting it again here is O(records).
+        let block_size = self.vh.block_size as u64;
+        let mut extents: Vec<(u64, u64)> = Vec::new();
+        let mut covered: u64 = 0;
+        for ext in fork.extents.iter() {
+            if ext.block_count == 0 {
+                continue;
+            }
+            let off = self.partition_offset + ext.start_block as u64 * block_size;
+            let len = ext.block_count as u64 * block_size;
+            extents.push((off, len));
+            covered += len;
+        }
+        if covered < logical_size {
+            let inline_blocks: u32 = fork.extents.iter().map(|e| e.block_count).sum();
+            let overflow = match self.extents_overflow_data.as_deref() {
+                Some(data) => {
+                    collect_hfsplus_overflow_extents(data, file_id, fork_type, inline_blocks)
+                }
+                None => {
+                    return Err(FilesystemError::InvalidData(format!(
+                        "file {file_id} fork {fork_type:#x}: {} bytes requested but only \
+                         {} bytes in inline extents and no extents-overflow B-tree available",
+                        logical_size, covered
+                    )));
+                }
+            };
+            for ext in overflow {
+                if ext.block_count == 0 {
+                    continue;
+                }
+                let off = self.partition_offset + ext.start_block as u64 * block_size;
+                let len = ext.block_count as u64 * block_size;
+                extents.push((off, len));
+                covered += len;
+                if covered >= logical_size {
+                    break;
+                }
+            }
+            if covered < logical_size {
+                return Err(FilesystemError::InvalidData(format!(
+                    "file {file_id} fork {fork_type:#x}: extents (inline + overflow) \
+                     cover {covered} of {logical_size} bytes"
+                )));
+            }
+        }
+
+        Ok(ForkStreamReader {
+            reader: &mut self.reader,
+            extents,
+            logical_size,
+            pos: 0,
+            cur_extent: 0,
+            cur_extent_consumed: 0,
+        })
     }
 
     /// Capture the full mutable state for snapshot/rollback. Cheap on the
@@ -1385,7 +1460,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
     }
 
     /// Build HFS+ catalog key bytes: key_len(2) + parent_id(4) + name_length(2) + name(UTF-16BE NFD).
-    fn build_catalog_key(parent_cnid: u32, name: &str) -> Vec<u8> {
+    pub(crate) fn build_catalog_key(parent_cnid: u32, name: &str) -> Vec<u8> {
         let nfd: String = name.nfd().collect();
         let utf16: Vec<u16> = nfd.encode_utf16().collect();
         let key_len = 4 + 2 + utf16.len() * 2;
@@ -4303,6 +4378,59 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
 /// source; unallocated blocks are emitted as zeros. This preserves the original
 /// block layout so that `block_N` is always at byte offset `N * block_size`,
 /// enabling correct filesystem browsing and reliable restore.
+/// Streaming reader over a single user fork. Built by
+/// [`HfsPlusFilesystem::fork_stream_reader`] with all inline + overflow
+/// extents resolved up front; `read` walks the extent list, seeking the
+/// underlying source reader as it crosses extent boundaries. Bounded
+/// strictly by the fork's `logical_size` — the trailing partial block is
+/// truncated at the byte level rather than the block level.
+pub struct ForkStreamReader<'a, R: Read + Seek> {
+    reader: &'a mut R,
+    /// `(device_offset, byte_length)` for each extent, in fork order.
+    extents: Vec<(u64, u64)>,
+    /// Total bytes the reader is allowed to emit (`fork.logical_size`).
+    logical_size: u64,
+    /// Bytes already produced.
+    pos: u64,
+    cur_extent: usize,
+    /// Bytes already consumed from the current extent.
+    cur_extent_consumed: u64,
+}
+
+impl<'a, R: Read + Seek> Read for ForkStreamReader<'a, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.logical_size || buf.is_empty() {
+            return Ok(0);
+        }
+        // Skip past extents whose bytes are fully consumed.
+        while self.cur_extent < self.extents.len() {
+            let (_, len) = self.extents[self.cur_extent];
+            if self.cur_extent_consumed < len {
+                break;
+            }
+            self.cur_extent += 1;
+            self.cur_extent_consumed = 0;
+        }
+        if self.cur_extent >= self.extents.len() {
+            return Ok(0);
+        }
+        let (off, len) = self.extents[self.cur_extent];
+        let remaining_in_extent = len - self.cur_extent_consumed;
+        let remaining_logical = self.logical_size - self.pos;
+        let max_chunk = remaining_in_extent.min(remaining_logical);
+        let to_read = (buf.len() as u64).min(max_chunk) as usize;
+        self.reader
+            .seek(SeekFrom::Start(off + self.cur_extent_consumed))?;
+        let n = self.reader.read(&mut buf[..to_read])?;
+        if n == 0 {
+            return Ok(0);
+        }
+        self.cur_extent_consumed += n as u64;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
 pub struct CompactHfsPlusReader<R: Read + Seek> {
     reader: R,
     partition_offset: u64,
@@ -4492,6 +4620,25 @@ pub fn create_blank_hfsplus(
     name: &str,
     case_sensitive: bool,
 ) -> Vec<u8> {
+    let (front, vh_bytes, image_size) =
+        build_blank_hfsplus_front(size_bytes, block_size, name, case_sensitive);
+    let mut img = vec![0u8; image_size];
+    img[..front.len()].copy_from_slice(&front);
+    let alt = image_size - 1024;
+    img[alt..alt + 512].copy_from_slice(&vh_bytes);
+    img
+}
+
+/// Build only the front (boot/VH/bitmap/B-trees) region and the 512-byte
+/// VH bytes. Returns `(front_bytes, vh_bytes, total_image_size)`. Used by
+/// both [`create_blank_hfsplus`] (full Vec) and
+/// [`write_blank_hfsplus_into`] (sparse-file streaming).
+fn build_blank_hfsplus_front(
+    size_bytes: u64,
+    block_size: u32,
+    name: &str,
+    case_sensitive: bool,
+) -> (Vec<u8>, [u8; 512], usize) {
     assert!(
         block_size.is_power_of_two() && (512..=4096).contains(&block_size),
         "block_size must be a power of 2 in [512, 4096], got {block_size}"
@@ -4505,20 +4652,11 @@ pub fn create_blank_hfsplus(
     let node_size: usize = 4096;
     let nodes_per_block: u32 = (node_size as u32 / block_size).max(1);
     let blocks_per_node: u32 = (block_size / node_size as u32).max(1);
-    // node_size >= block_size in our supported range, so nodes_per_block
-    // is always 1 in practice. Keep the variable for clarity.
     let _ = nodes_per_block;
 
-    // 4 nodes for each B-tree. node_size=4096, block_size in [512,4096]:
-    // bs=512 → 8 blocks per node, 32 blocks per tree
-    // bs=1024 → 4 blocks per node, 16 blocks per tree
-    // bs=2048 → 2 blocks per node, 8 blocks per tree
-    // bs=4096 → 1 block per node, 4 blocks per tree
     let btree_node_count: u32 = 4;
     let btree_blocks: u32 = btree_node_count * blocks_per_node;
 
-    // Bitmap covers total_blocks bits, packed into bytes, rounded up to
-    // a whole block.
     let bitmap_bytes = total_blocks.div_ceil(8) as u64;
     let bitmap_blocks = ((bitmap_bytes + bs - 1) / bs) as u32;
 
@@ -4533,12 +4671,17 @@ pub fn create_blank_hfsplus(
     );
 
     let image_size = total_blocks as usize * block_size as usize;
-    let mut img = vec![0u8; image_size];
+    // Build only the front (boot/VH/bitmap/B-trees) and the 512-byte alt VH
+    // separately, so multi-GB blanks don't have to materialise a full image
+    // in RAM. The middle of the volume is free space — sparse-file zeroes
+    // are good enough.
+    let front_size = reserved_blocks as usize * block_size as usize;
+    let mut front = vec![0u8; front_size];
 
     // --- Allocation bitmap ---
     {
         let bitmap_off = bitmap_start as usize * block_size as usize;
-        let bitmap = &mut img[bitmap_off..bitmap_off + (bitmap_bytes as usize).max(1)];
+        let bitmap = &mut front[bitmap_off..bitmap_off + (bitmap_bytes as usize).max(1)];
         for blk in 0..reserved_blocks {
             // MSB-first big-endian: bit position (7 - blk%8) of byte (blk/8).
             let byte_idx = (blk / 8) as usize;
@@ -4551,7 +4694,7 @@ pub fn create_blank_hfsplus(
     {
         let off = extents_start as usize * block_size as usize;
         write_blank_btree_header_node(
-            &mut img[off..off + node_size],
+            &mut front[off..off + node_size],
             node_size,
             /* leaf_records= */ 0,
             /* total_nodes= */ btree_node_count,
@@ -4560,7 +4703,7 @@ pub fn create_blank_hfsplus(
             /* key_compare_type= */ 0, // unused for extents
         );
         let leaf_off = off + node_size;
-        write_empty_leaf_node(&mut img[leaf_off..leaf_off + node_size]);
+        write_empty_leaf_node(&mut front[leaf_off..leaf_off + node_size]);
     }
 
     // --- Catalog B-tree (header + leaf with root + thread) ---
@@ -4574,7 +4717,7 @@ pub fn create_blank_hfsplus(
             KEY_COMPARE_CASE_FOLDING
         };
         write_blank_btree_header_node(
-            &mut img[off..off + node_size],
+            &mut front[off..off + node_size],
             node_size,
             /* leaf_records= */ 2,
             btree_node_count,
@@ -4583,7 +4726,7 @@ pub fn create_blank_hfsplus(
             key_compare,
         );
         let leaf_off = off + node_size;
-        write_root_catalog_leaf(&mut img[leaf_off..leaf_off + node_size], &name_utf16);
+        write_root_catalog_leaf(&mut front[leaf_off..leaf_off + node_size], &name_utf16);
     }
 
     // --- Volume header ---
@@ -4638,13 +4781,36 @@ pub fn create_blank_hfsplus(
     };
     let vh_bytes = vh.serialize();
 
-    // Primary VH at offset 1024.
-    img[1024..1536].copy_from_slice(&vh_bytes);
-    // Alt VH 1024 bytes from the end.
-    let alt = image_size - 1024;
-    img[alt..alt + 512].copy_from_slice(&vh_bytes);
+    // Primary VH at offset 1024 (always inside the front region).
+    front[1024..1536].copy_from_slice(&vh_bytes);
 
-    img
+    (front, vh_bytes, image_size)
+}
+
+/// Streaming variant of [`create_blank_hfsplus`]. Writes the metadata
+/// regions (boot, VH, bitmap, B-trees, alt-VH) into `target` and leaves
+/// the free middle untouched. Caller is responsible for sizing the
+/// underlying file to `size_bytes` (e.g. via `File::set_len`) so reads of
+/// the free area return zeros.
+///
+/// Used by the defrag-clone backup path so a 38 GiB blank target doesn't
+/// need 38 GiB of contiguous RAM. Only the front region (~2 MiB worst
+/// case) plus the 512-byte alt VH is held in memory.
+pub fn write_blank_hfsplus_into<W: Write + Seek>(
+    target: &mut W,
+    size_bytes: u64,
+    block_size: u32,
+    name: &str,
+    case_sensitive: bool,
+) -> std::io::Result<()> {
+    let (front, vh_bytes, _image_size) =
+        build_blank_hfsplus_front(size_bytes, block_size, name, case_sensitive);
+    target.seek(SeekFrom::Start(0))?;
+    target.write_all(&front)?;
+    target.seek(SeekFrom::Start(size_bytes - 1024))?;
+    target.write_all(&vh_bytes)?;
+    target.write_all(&[0u8; 512])?;
+    Ok(())
 }
 
 /// Helper for `create_blank_hfsplus`: build a single-extent inline array.
@@ -4664,7 +4830,7 @@ fn extent_array(start: u32, count: u32) -> [ExtentDescriptor; 8] {
 /// bytes). Lays out three records — header(106), user-data(128), node
 /// bitmap (rest) — and marks node 0 (header) and node 1 (leaf) as
 /// allocated in the node bitmap.
-fn write_blank_btree_header_node(
+pub(crate) fn write_blank_btree_header_node(
     node: &mut [u8],
     node_size: usize,
     leaf_records: u32,
@@ -4709,7 +4875,7 @@ fn write_blank_btree_header_node(
 }
 
 /// Write an empty leaf node (kind=-1, height=1, 0 records).
-fn write_empty_leaf_node(node: &mut [u8]) {
+pub(crate) fn write_empty_leaf_node(node: &mut [u8]) {
     node.fill(0);
     node[8] = 0xFF; // kind = -1
     node[9] = 1; // height
@@ -5628,6 +5794,56 @@ mod tests {
     }
 
     #[test]
+    fn test_can_defrag_clone_accepts_clean_volume() {
+        let img = make_editable_hfsplus_image();
+        let mut cursor = std::io::Cursor::new(img);
+        super::super::can_defrag_clone_hfsplus(&mut cursor, 0)
+            .expect("plain unjournaled HFS+ must be accepted");
+    }
+
+    #[test]
+    fn test_can_defrag_clone_accepts_clean_journaled_volume() {
+        // Journaled bit set + unmounted bit set — clean. The on-disk
+        // journal is empty, so the catalog is authoritative.
+        let mut img = make_editable_hfsplus_image();
+        let attr_off = 1024 + 4;
+        let mut attrs = BigEndian::read_u32(&img[attr_off..attr_off + 4]);
+        attrs |= HFSPLUS_VOLUME_JOURNALED_BIT | HFSPLUS_VOLUME_UNMOUNTED_BIT;
+        BigEndian::write_u32(&mut img[attr_off..attr_off + 4], attrs);
+        let mut cursor = std::io::Cursor::new(img);
+        super::super::can_defrag_clone_hfsplus(&mut cursor, 0)
+            .expect("cleanly-unmounted journaled volume must be accepted");
+    }
+
+    #[test]
+    fn test_can_defrag_clone_refuses_dirty_journaled_volume() {
+        // Journaled bit set, unmounted bit *clear* — dirty.
+        let mut img = make_editable_hfsplus_image();
+        let attr_off = 1024 + 4;
+        let mut attrs = BigEndian::read_u32(&img[attr_off..attr_off + 4]);
+        attrs |= HFSPLUS_VOLUME_JOURNALED_BIT;
+        attrs &= !HFSPLUS_VOLUME_UNMOUNTED_BIT;
+        BigEndian::write_u32(&mut img[attr_off..attr_off + 4], attrs);
+        let mut cursor = std::io::Cursor::new(img);
+        let err = super::super::can_defrag_clone_hfsplus(&mut cursor, 0)
+            .expect_err("dirty journaled volume must be refused");
+        assert!(
+            err.contains("dirty") || err.contains("journal"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_can_defrag_clone_refuses_non_hfsplus() {
+        // 1 KiB of zeros at offset 0 → no VH at offset 1024. Refused.
+        let img = vec![0u8; 4096];
+        let mut cursor = std::io::Cursor::new(img);
+        let err = super::super::can_defrag_clone_hfsplus(&mut cursor, 0)
+            .expect_err("non-HFS+ partition must be refused");
+        assert!(err.contains("not an HFS"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn test_prepare_for_edit_clean_volume_succeeds() {
         let img = make_editable_hfsplus_image();
         let cursor = std::io::Cursor::new(img);
@@ -6441,7 +6657,19 @@ mod tests {
         let inode = inodes[0];
         assert_eq!(inode.cnid, source_inode_cnid);
         assert_eq!(inode.inode_num, Some(I_NODE_NUM));
-        assert_eq!(inode.data_fork_bytes, PAYLOAD);
+        assert_eq!(inode.data_fork_size, PAYLOAD.len() as u64);
+        // Stream the inode's data fork off the source and verify byte-equal.
+        let inode_payload = {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            src_fs
+                .fork_stream_reader(inode.cnid, 0x00, &inode.data_fork_raw)
+                .expect("fork reader")
+                .read_to_end(&mut buf)
+                .expect("read fork");
+            buf
+        };
+        assert_eq!(inode_payload, PAYLOAD);
 
         let user_files: Vec<_> = snap.files.iter().filter(|f| !f.is_inode).collect();
         assert!(
@@ -6466,12 +6694,12 @@ mod tests {
             let mut tgt = HfsPlusFilesystem::open(cursor, 0).expect("open tgt blank");
             tgt.prepare_for_edit().expect("prepare_for_edit");
 
-            let mut data = std::io::Cursor::new(inode.data_fork_bytes.as_slice());
+            let mut data = std::io::Cursor::new(&inode_payload);
             let target_inode = tgt
                 .create_hardlink_inode(
                     inode.inode_num.unwrap(),
                     &mut data,
-                    inode.data_fork_bytes.len() as u64,
+                    inode.data_fork_size,
                     &CreateFileOptions::default(),
                 )
                 .expect("replay inode");

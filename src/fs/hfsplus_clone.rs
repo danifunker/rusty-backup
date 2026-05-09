@@ -16,7 +16,7 @@
 //! `is_dir_inode = true`. Replay (Step 21) emits each directory inode
 //! once and points each link at it.
 
-use std::io::{Cursor, Read, Seek, Write};
+use std::io::{Read, Seek, Write};
 
 use byteorder::{BigEndian, ByteOrder};
 
@@ -74,6 +74,18 @@ pub struct SourceVolumeSnapshot {
     /// First 1024 bytes of the partition. Always zero on macOS-formatted
     /// volumes; copied verbatim by clone for round-trip parity.
     pub boot_blocks: [u8; 1024],
+    /// Source `vh.catalog_file.total_blocks`. The streamed defrag planner
+    /// uses this (with a safety margin) to size the target's catalog
+    /// B-tree so leaf splits don't run out of free nodes mid-emit.
+    pub catalog_total_blocks: u32,
+    /// Source `vh.extents_file.total_blocks`. Inherited as a ceiling for
+    /// the target's extents-overflow file size; the streamed target packs
+    /// files contiguously and typically needs less.
+    pub extents_total_blocks: u32,
+    /// Source `vh.attributes_file.total_blocks`. Zero on volumes without
+    /// xattrs; non-zero values flow through to the target's attributes
+    /// B-tree allocation.
+    pub attributes_total_blocks: u32,
 }
 
 /// Per-directory metadata captured from a `kHFSPlusFolderRecord`.
@@ -145,12 +157,18 @@ pub struct SourceFileSnapshot {
     pub access_date: u32,
     pub backup_date: u32,
     pub text_encoding: u32,
-    /// Verbatim data fork bytes (`logical_size` long). Empty for forkless
-    /// files like classic-Mac aliases without data.
-    pub data_fork_bytes: Vec<u8>,
-    /// Verbatim resource fork bytes. Empty when the file has no resource
-    /// fork.
-    pub rsrc_fork_bytes: Vec<u8>,
+    /// Raw 80-byte `HFSPlusForkData` for the data fork (8 inline extents +
+    /// logical/total/clump). Resolved into a streaming reader via
+    /// `HfsPlusFilesystem::fork_stream_reader` at clone time so the bytes
+    /// never have to materialise in RAM.
+    pub data_fork_raw: [u8; 80],
+    /// Raw 80-byte `HFSPlusForkData` for the resource fork.
+    pub rsrc_fork_raw: [u8; 80],
+    /// Logical data-fork size in bytes (mirror of bytes 0..8 of
+    /// `data_fork_raw`, broken out for convenience).
+    pub data_fork_size: u64,
+    /// Logical resource-fork size in bytes.
+    pub rsrc_fork_size: u64,
     /// Extended attributes attached to this CNID. See
     /// [`SourceDirSnapshot::xattrs`] for layout details.
     pub(crate) xattrs: Vec<XattrRecord>,
@@ -278,6 +296,9 @@ impl SourceVolumeSnapshot {
             file_count: fs.vh_file_count(),
             folder_count: fs.vh_folder_count(),
             boot_blocks,
+            catalog_total_blocks: fs.vh_catalog_total_blocks(),
+            extents_total_blocks: fs.vh_extents_total_blocks(),
+            attributes_total_blocks: fs.vh_attributes_total_blocks(),
         })
     }
 }
@@ -466,18 +487,14 @@ impl SourceCatalogSnapshot {
             });
         }
 
-        // Read fork bytes and xattrs now that the catalog borrow is released.
+        // Stash the raw fork records on each file snapshot so the clone
+        // pipeline can stream forks block-by-block instead of buffering
+        // them. Then load xattrs (small, bounded by node size).
         for (file, (data_fork, rsrc_fork)) in files.iter_mut().zip(pending_forks.into_iter()) {
-            let data_logical = BigEndian::read_u64(&data_fork[0..8]);
-            if data_logical > 0 {
-                file.data_fork_bytes =
-                    fs.read_user_fork_bytes(file.cnid, HFSPLUS_FORK_DATA, &data_fork)?;
-            }
-            let rsrc_logical = BigEndian::read_u64(&rsrc_fork[0..8]);
-            if rsrc_logical > 0 {
-                file.rsrc_fork_bytes =
-                    fs.read_user_fork_bytes(file.cnid, HFSPLUS_FORK_RESOURCE, &rsrc_fork)?;
-            }
+            file.data_fork_size = BigEndian::read_u64(&data_fork[0..8]);
+            file.rsrc_fork_size = BigEndian::read_u64(&rsrc_fork[0..8]);
+            file.data_fork_raw = data_fork;
+            file.rsrc_fork_raw = rsrc_fork;
             file.xattrs = fs.list_xattrs(file.cnid)?;
         }
         for dir in dirs.iter_mut() {
@@ -753,8 +770,10 @@ fn parse_catalog_record(rec: &[u8]) -> Result<ParsedRecord, FilesystemError> {
                     access_date,
                     backup_date,
                     text_encoding,
-                    data_fork_bytes: Vec::new(),
-                    rsrc_fork_bytes: Vec::new(),
+                    data_fork_raw: [0u8; 80],
+                    rsrc_fork_raw: [0u8; 80],
+                    data_fork_size: 0,
+                    rsrc_fork_size: 0,
                     xattrs: Vec::new(),
                     is_inode: false,
                     inode_num: None,
@@ -891,19 +910,23 @@ where
     // (inode_num, copied verbatim) keeps pointing at the right thing.
     for f in snapshot.files.iter().filter(|f| f.is_inode) {
         let inode_num = f.inode_num.expect("inode without inode_num");
-        let mut data = Cursor::new(&f.data_fork_bytes);
-        let inode_entry = target.create_hardlink_inode(
-            inode_num,
-            &mut data,
-            f.data_fork_bytes.len() as u64,
-            &CreateFileOptions::default(),
-        )?;
-        if !f.rsrc_fork_bytes.is_empty() {
-            let mut rsrc = Cursor::new(&f.rsrc_fork_bytes);
-            target.write_resource_fork(&inode_entry, &mut rsrc, f.rsrc_fork_bytes.len() as u64)?;
+        let inode_entry = {
+            let mut data =
+                source.fork_stream_reader(f.cnid, HFSPLUS_FORK_DATA, &f.data_fork_raw)?;
+            target.create_hardlink_inode(
+                inode_num,
+                &mut data,
+                f.data_fork_size,
+                &CreateFileOptions::default(),
+            )?
+        };
+        if f.rsrc_fork_size > 0 {
+            let mut rsrc =
+                source.fork_stream_reader(f.cnid, HFSPLUS_FORK_RESOURCE, &f.rsrc_fork_raw)?;
+            target.write_resource_fork(&inode_entry, &mut rsrc, f.rsrc_fork_size)?;
         }
-        report.data_bytes_copied += f.data_fork_bytes.len() as u64;
-        report.rsrc_bytes_copied += f.rsrc_fork_bytes.len() as u64;
+        report.data_bytes_copied += f.data_fork_size;
+        report.rsrc_bytes_copied += f.rsrc_fork_size;
         stamp_file_metadata(target, &inode_entry, f, &mut report)?;
     }
     for d in snapshot.dirs.iter().filter(|d| d.is_dir_inode) {
@@ -954,27 +977,30 @@ where
 
         if let Some(children) = files_by_parent.remove(&src_parent_cnid) {
             for f in children {
-                let mut data = Cursor::new(&f.data_fork_bytes);
-                let new_file = target.create_file(
-                    &parent_entry,
-                    &f.name,
-                    &mut data,
-                    f.data_fork_bytes.len() as u64,
-                    &CreateFileOptions {
-                        type_code: Some(f.type_code()),
-                        creator_code: Some(f.creator_code()),
-                        ..Default::default()
-                    },
-                )?;
-                report.data_bytes_copied += f.data_fork_bytes.len() as u64;
-                if !f.rsrc_fork_bytes.is_empty() {
-                    let mut rsrc = Cursor::new(&f.rsrc_fork_bytes);
-                    target.write_resource_fork(
-                        &new_file,
-                        &mut rsrc,
-                        f.rsrc_fork_bytes.len() as u64,
+                let new_file = {
+                    let mut data =
+                        source.fork_stream_reader(f.cnid, HFSPLUS_FORK_DATA, &f.data_fork_raw)?;
+                    target.create_file(
+                        &parent_entry,
+                        &f.name,
+                        &mut data,
+                        f.data_fork_size,
+                        &CreateFileOptions {
+                            type_code: Some(f.type_code()),
+                            creator_code: Some(f.creator_code()),
+                            ..Default::default()
+                        },
+                    )?
+                };
+                report.data_bytes_copied += f.data_fork_size;
+                if f.rsrc_fork_size > 0 {
+                    let mut rsrc = source.fork_stream_reader(
+                        f.cnid,
+                        HFSPLUS_FORK_RESOURCE,
+                        &f.rsrc_fork_raw,
                     )?;
-                    report.rsrc_bytes_copied += f.rsrc_fork_bytes.len() as u64;
+                    target.write_resource_fork(&new_file, &mut rsrc, f.rsrc_fork_size)?;
+                    report.rsrc_bytes_copied += f.rsrc_fork_size;
                 }
                 stamp_file_metadata(target, &new_file, f, &mut report)?;
                 cnid_map.insert(f.cnid, new_file.location as u32);
@@ -1220,8 +1246,17 @@ mod tests {
         let note = &snap.files[0];
         assert_eq!(note.name, "note.txt");
         assert_eq!(note.parent_cnid, 2);
-        assert_eq!(note.data_fork_bytes, b"hello world\n");
-        assert!(note.rsrc_fork_bytes.is_empty());
+        assert_eq!(note.data_fork_size, b"hello world\n".len() as u64);
+        assert_eq!(note.rsrc_fork_size, 0);
+        // Stream-read the data fork off the source and verify byte-equal.
+        let cnid = note.cnid;
+        let raw = note.data_fork_raw;
+        let mut buf = Vec::new();
+        fs.fork_stream_reader(cnid, 0x00, &raw)
+            .expect("fork reader")
+            .read_to_end(&mut buf)
+            .expect("read fork");
+        assert_eq!(buf, b"hello world\n");
     }
 
     // The xattr round-trip capture test (Step 14) lives in hfsplus.rs's test

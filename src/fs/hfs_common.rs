@@ -1465,6 +1465,82 @@ where
     }
 }
 
+/// Insert a fully-formed `key + record` pair into a B-tree backed by
+/// `data` (header lives in node 0 at offset 14, leaves chained from
+/// `first_leaf_node`). Drives `btree_find_insert_leaf`,
+/// `btree_insert_record`, and the `btree_split_leaf_with_insert` /
+/// `btree_grow_root` / `btree_insert_into_index` machinery so callers
+/// don't have to repeat the (find leaf, try insert, split on full,
+/// fix up parent or grow root) dance.
+///
+/// `cmp` compares two records by their key portion only — it must
+/// match whatever ordering the tree was built with (case-folding NFD
+/// for HFS+ catalog, binary for HFSX, case-insensitive Mac-Roman for
+/// classic HFS, raw byte order for extents-overflow / attributes).
+///
+/// On success the header's `leaf_records` is bumped and (for splits)
+/// `depth` / `root_node` / `last_leaf_node` are updated. Returns
+/// `Err(DiskFull)` when the B-tree is out of free nodes.
+///
+/// Used by the streamed defrag builder (Step 22c) to populate target
+/// catalog / extents-overflow / attributes B-trees from scratch, and
+/// matches the algorithm `HfsPlusFilesystem::insert_catalog_record`
+/// has been using.
+pub fn btree_insert_full<F>(
+    data: &mut Vec<u8>,
+    key_record: &[u8],
+    cmp: &F,
+) -> Result<(), super::filesystem::FilesystemError>
+where
+    F: Fn(&[u8], &[u8]) -> Ordering,
+{
+    let header = BTreeHeader::read(data);
+    let node_size = header.node_size as usize;
+    if node_size == 0 {
+        return Err(super::filesystem::FilesystemError::InvalidData(
+            "B-tree has zero node_size".into(),
+        ));
+    }
+    let (leaf_idx, parent_chain) = btree_find_insert_leaf(data, &header, key_record, cmp);
+
+    let off = leaf_idx as usize * node_size;
+    let node = &mut data[off..off + node_size];
+    match btree_insert_record(node, node_size, key_record, cmp) {
+        Ok(_) => {
+            let mut h = BTreeHeader::read(data);
+            h.leaf_records += 1;
+            h.write(data);
+            Ok(())
+        }
+        Err(_) => {
+            let mut h = BTreeHeader::read(data);
+            let (new_idx, split_key) =
+                btree_split_leaf_with_insert(data, node_size, leaf_idx, &mut h, key_record, cmp)?;
+            h.leaf_records += 1;
+            if h.depth == 1 {
+                btree_grow_root(data, node_size, &mut h, leaf_idx, new_idx, &split_key)?;
+            } else if let Some(&(_, parent_idx)) =
+                parent_chain.iter().find(|&&(nidx, _)| nidx == leaf_idx)
+            {
+                btree_insert_into_index(
+                    data,
+                    node_size,
+                    parent_idx,
+                    new_idx,
+                    &split_key,
+                    &mut h,
+                    cmp,
+                    &parent_chain,
+                )?;
+            } else {
+                btree_grow_root(data, node_size, &mut h, leaf_idx, new_idx, &split_key)?;
+            }
+            h.write(data);
+            Ok(())
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

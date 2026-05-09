@@ -375,40 +375,156 @@ By this point: snapshot capture, blank builder, fsck, xattrs, and hardlinks all 
 
 **Tests:** Clone a 32 MiB synthetic source containing ~30 files including a resource-fork-bearing file, a 12-extent fragmented file, an xattr-bearing file, and a hardlink pair. Assert byte-equal data forks, matching catalog metadata, surviving xattrs, preserved hardlink topology, and `fsck` clean on the target.
 
-### Step 22 — Backup-mode integration
+### Step 22 — Streamed defrag-clone backup integration
 
-- [ ] **Goal:** Backup pipeline gains a per-partition "Defragment HFS+" option; when set, the backup writes a packed clone instead of the layout-preserving stream.
+Step 21's `clone_hfsplus_volume` requires random-access target writes (B-tree splits, fork placement). Routing that through a multi-GB temp file and then re-streaming into the compressor would double the disk I/O on real-world disks. Step 22 instead builds a peer **streamed two-pass** engine that emits a forward-only image directly into the compressor — no temp file, ~½ the I/O. The user-facing toggle is opt-in (default off), framed as "Shrink partitions to minimum size" so the value proposition (smaller restore size) is named.
 
-**Files:** `src/model/backup_runner.rs` (or wherever the orchestrator lives — confirm via `grep -n run_backup src/backup/mod.rs`), `src/backup/sizes.rs`, `src/gui/backup_tab.rs`, `src/backup/metadata.rs`
+`clone_hfsplus_volume` stays in tree because it remains the cleanest engine for in-place editing tests and ad-hoc tooling. The streamed path is a separate function, not a refactor of Step 21.
+
+**Pre-flight rejections** (per partition, before any bytes flow):
+- **Embedded HFS+ inside an HFS wrapper** — `resolve_apple_hfs` reports `("hfsplus", embedded_offset != partition_offset)`. Cloning the inner volume to a flat HFS+ would silently drop the wrapper.
+- **Dirty journaled volume** — `kHFSVolumeJournaledBit (0x2000)` set with `kHFSVolumeUnmountedBit (0x100)` clear. The journal carries pending metadata changes the catalog hasn't absorbed; cloning the catalog as-is would lose them.
+
+A cleanly-unmounted journaled volume is *accepted* — the journal is empty/replayed, and the cloned target is built without the journaled bit, effectively nullifying the journal. Pre-flight failure aborts the whole backup with an explanatory error.
+
+#### Step 22a — Pre-flight detection
+
+- [x] **Goal:** `fs::can_defrag_clone_hfsplus(reader, partition_offset) -> Result<(), String>` returns the human-readable reason a partition can't be defrag-cloned, or `Ok(())` when it can.
+
+**Files:** `src/fs/mod.rs`, `src/fs/hfsplus.rs`
 
 **Changes:**
-- New backup option struct field: `defragment_hfsplus_partitions: HashSet<usize>` (partition indices opted in).
-- For opted-in partitions:
-  1. Compute `defragmented_min_size_bytes` (Step 1).
-  2. Open source HFS+ read-only; build target via `create_blank_hfsplus(defrag_size, source_block_size, source_name, source.is_hfsx())`.
-  3. `clone_hfsplus_volume(source, target)`.
-  4. `hfsplus_fsck(target)` — bail with `Err` if not clean.
-  5. Hand the *target image bytes* (in a `Cursor<Vec<u8>>` or temp file) to the existing compactor + compressor.
-  6. `metadata.json` records the original partition geometry plus a `cloned: true` flag and the original-volume checksum (so restore knows the source-byte image is *not* recoverable, only the data is).
-- Restore-side: a clone-backup partition restores at the chosen size with the cloned bytes — no re-clone needed. If the user picks "original size" the restore zero-pads the tail.
+- Promote `HFSPLUS_VOLUME_JOURNALED_BIT` and `HFSPLUS_VOLUME_UNMOUNTED_BIT` to `pub(crate)`.
+- Add `can_defrag_clone_hfsplus`. Branches on `resolve_apple_hfs` for the wrapper check, then reads `vh.attributes` at offset 1024+4 for the journal-state check.
 
-**Tests:** End-to-end: backup a synthesized fragmented HFS+ with xattrs and hardlinks, restore at "minimum" size, mount via `HfsPlusFilesystem::open`, assert data + xattrs + hardlinks all intact.
+**Tests:** Four unit tests in `hfsplus.rs::tests` (accept clean, accept clean-journaled, refuse dirty-journaled, refuse non-HFS+). Embedded-HFS+ refusal exists in code but isn't unit-tested — synthesizing an HFS-wrapped image is involved; integration coverage lands with 22f.
 
-### Step 23 — UI polish + log messages
+#### Step 22b — Defrag layout planner
+
+- [x] **Goal:** Pure-planning function that, given a `SourceCatalogSnapshot` plus a target size, returns a `TargetLayoutPlan` describing every block placement on the target.
+
+**Files:** `src/fs/hfsplus_defrag.rs` (new)
+
+**Changes:**
+- `TargetLayoutPlan` records: per-file contiguous data/resource fork extents in the user-data area, source→target CNID remap (sequential from CNID 16), reserved region sizes (boot/VH, bitmap, catalog file, extents-overflow file, attributes file).
+- Catalog/extents/attributes file sizes derive from source values with a small safety margin (1.5× for catalog).
+- Hardlinks: each inode is laid out once under HFS+ Private Data; stubs reference the inode CNID.
+- Pure function, no I/O — testable by snapshot fixtures.
+
+**Tests:** Plan a small fragmented synthetic source, assert per-file extents are contiguous and packed; CNID remap is sequential; reserved region sizes match expected.
+
+#### Step 22c — Defrag B-tree builder
+
+- [x] **Goal:** From a `TargetLayoutPlan` + `SourceCatalogSnapshot`, build the in-memory metadata image: catalog B-tree bytes, extents-overflow bytes (likely empty since we pack contiguously), attributes B-tree bytes, allocation bitmap, and the `HfsPlusVolumeHeader` for the target.
+
+**Status: basic shell landed.** Directories and ordinary files emit. Hardlinks (file + dir) and xattrs trip an explicit `Unsupported` early-out for now — landing them is a follow-up sub-step. Reusable `hfs_common::btree_insert_full` was added so xattr inserts share the catalog insert/split machinery.
+
+#### Step 22c-i — Hardlink emit (file + directory)
+
+- [ ] **Goal:** `build_target_metadata` emits hardlink topology: each file inode under `\0\0\0\0HFS+ Private Data` once, with N catalog stub rows pointing at it via `bsdInfo.special = inode_num`; same for directory inodes under `.HFS+ Private Directory Data\r`.
+
+**Files:** `src/fs/hfsplus_defrag.rs`
+
+**Changes:**
+- Drop the `snapshot.hardlinks.is_empty() && snapshot.dir_hardlinks.is_empty()` early-out in `build_target_metadata`.
+- For each file in `snapshot.files` with `is_inode = true`: emit as a regular file under the target's HFS+ Private Data dir (the planner already issues it a target CNID; the inode lives at `(target_private_dir_cnid, "iNode<inode_num>")`).
+- For each directory in `snapshot.dirs` with `is_dir_inode = true`: emit as a regular folder under the target's `.HFS+ Private Directory Data\r` dir.
+- For each `SourceHardlinkSnapshot`: emit a file record with `FInfo = ('hlnk', 'hfs+')`, `bsdInfo.special = inode_num`, empty forks, the source's per-record metadata.
+- For each `SourceDirHardlinkSnapshot`: emit a file record (yes, file — directory hardlinks are encoded as FILE records on disk per TN1150) with `FInfo = ('fdrp', 'MACS')`, `bsdInfo.special = inode_num`, empty forks.
+- Bump the inode's `bsdInfo.special` (linkCount) to the number of stubs that reference it.
+- Ensure the target's two private dirs exist in the snapshot before stub emission — they're regular `SourceDirSnapshot` rows on the source so they flow through the existing dir replay path; just need to make sure the BFS order places them before stub emission.
+
+**Tests:**
+- Two-stubs-one-inode round-trip: source with `iNode17` + 2 hardlink rows pointing at it. Build metadata, stitch into target image (with the inode's data fork present), open as `HfsPlusFilesystem`, assert both stub paths read identical bytes via the existing hardlink resolution path.
+- Same for a directory hardlink (one inode under `.HFS+ Private Directory Data\r` plus 2 stub rows).
+
+#### Step 22c-ii — Xattr emit
+
+- [ ] **Goal:** `build_target_metadata` emits inline extended attributes onto every captured CNID's remapped target CNID, populating the target's attributes B-tree.
+
+**Files:** `src/fs/hfsplus_defrag.rs`, possibly `src/fs/hfsplus.rs` (if the existing inline-xattr record builder isn't already exposed)
+
+**Changes:**
+- Drop the `xattrs.is_empty()` early-out and the `plan.attributes_blocks > 0` refusal in `build_target_metadata`.
+- Initialize the target's attributes B-tree buffer when `plan.attributes_blocks > 0` (mirrors the catalog/extents init via `init_btree_buffer` with the attribute-record `max_key_len`).
+- For each `(cnid, xattr)` from snapshot files / dirs / hardlinks / dir-hardlinks (whichever land in 22c-i): build an inline attr record (`XattrKind::Inline` only — fork-style xattrs trip a controlled error per Step 13's existing limitation) keyed by `(target_cnid, startBlock=0, name)`, insert via `hfs_common::btree_insert_full`.
+- `TargetMetadata.attributes` becomes `Some(buf)` whenever any record was inserted; populate VH `attributes_file` ForkData accordingly.
+- The planner already sizes `attributes_blocks` from the source's `vh.attributes_file.total_blocks`, so capacity is on hand.
+
+**Tests:**
+- Source with one `com.apple.FinderInfo` 32-byte inline xattr on a regular file; build + stitch + open; `list_xattrs(target_cnid)` returns the same bytes.
+- Source with a fork-style xattr: builder surfaces a clear error referencing Step 13's inline-only limitation rather than silently dropping.
+
+**Files:** `src/fs/hfsplus_defrag.rs`
+
+**Changes:**
+- Reuses `hfs_common::btree_split_leaf_with_insert`, `btree_alloc_node`, and the existing xattr-record builders against in-memory `Vec<u8>` backing buffers.
+- Catalog records carry new CNIDs and new fork extents; xattrs replayed onto remapped CNIDs.
+- Bitmap bits set for all reserved + allocated user blocks.
+- VH gets the source's volume metadata (label, dates, finder info — with CNID remap on slots that match a known source CNID, slots 6/7 zeroed for fresh Finder volume ID).
+- Memory bounded by source metadata size — typically hundreds of MB max on multi-GB volumes.
+
+**Tests:** Build metadata for the planner's fixture, open the resulting bytes (with a separate stub for fork content) as `HfsPlusFilesystem`, walk the catalog, verify byte-equal records.
+
+#### Step 22d — Streaming emit engine
+
+- [ ] **Goal:** `pub fn stream_defragmented_hfsplus<R, W>(source: &mut HfsPlusFilesystem<R>, target_size: u64, dst: &mut W) -> Result<DefragReport>` drives the planner + builder, then forward-only emits into `dst`.
+
+**Files:** `src/fs/hfsplus_defrag.rs`
+
+**Changes:**
+- Order: boot+VH region → bitmap → catalog file → extents-overflow file → attributes file → user files (in target-extent block order, streamed via `fork_stream_reader`) → zero padding → alt VH (512 B) + 512 B zero pad.
+- Single forward sweep; the only seek operations on `dst` happen if `W: Seek` is needed for alt-VH placement, but block-order emission obviates that.
+- `DefragReport` mirrors `HfsPlusCloneReport` (files copied, dirs copied, fork bytes, xattrs, hardlinks).
+
+**Tests:** Round-trip in 22e.
+
+#### Step 22e — Streamed defrag round-trip test
+
+- [ ] **Goal:** End-to-end engine test.
+
+**Files:** `src/fs/hfsplus_defrag.rs`
+
+**Changes:** Build a fragmented synthetic source HFS+ with a directory tree, files with both forks, an inline xattr, and a hardlink pair. Stream into a `Vec<u8>`. Open that Vec as `HfsPlusFilesystem`, walk catalog, verify byte-equal fork content, surviving xattrs, preserved hardlink topology, `fsck` clean.
+
+#### Step 22f — Backup pipeline integration
+
+- [ ] **Goal:** Backup tab gains a `shrink_to_minimum: bool` toggle; when set, HFS+/HFSX partitions route through `stream_defragmented_hfsplus` into the compressor instead of `CompactHfsPlusReader`.
+
+**Files:** `src/backup/mod.rs`, `src/backup/sizes.rs`, `src/backup/metadata.rs`
+
+**Changes:**
+- `BackupConfig.shrink_to_minimum: bool`. Disabled when `sector_by_sector` is on.
+- For opted-in partitions, run `can_defrag_clone_hfsplus` pre-flight at the top of the per-partition loop; on failure abort the whole backup with the human-readable reason.
+- Override sizing for those partitions: `effective_sizes[i] = stream_sizes[i] = compact_sizes[i] = defragmented_min_sizes[i]`, `is_layout_preserving_flags[i] = false`. Stream the partition via `stream_defragmented_hfsplus` directly into `compress_partition`'s reader.
+- `PartitionMetadata.defragmented_clone: bool` (`#[serde(default)]`).
+- Restore: a clone-backup partition restores at the chosen size with the streamed bytes verbatim. "Original size" restore zero-pads the tail (the cloned HFS+ inside is smaller than the partition window — Mac OS still mounts it). Volume-grow on restore is a separate feature; not in scope here.
+
+**Tests:** End-to-end: backup a synthesized fragmented HFS+ with xattrs and hardlinks (`shrink_to_minimum=true`), restore at "minimum" size, mount via `HfsPlusFilesystem::open`, assert data + xattrs + hardlinks intact, fsck clean.
+
+#### Step 22g — Backup-tab toggle
+
+- [ ] **Goal:** Surface the option in the GUI.
+
+**Files:** `src/gui/backup_tab.rs`
+
+**Changes:**
+- Checkbox: "Shrink partitions to minimum size". Tooltip: `"Repacks fragmented HFS+ volumes during backup so the restore can target a smaller partition. Other filesystems are unaffected. Requires a clean (non-journaled or cleanly-unmounted) HFS+ volume — embedded HFS+ wrappers and dirty journaled volumes will abort the backup."`
+- Disabled when `sector_by_sector` is on.
+
+### Step 23 — Log polish
 
 - [ ] **Goal:** The user understands what happened.
 
-**Files:** `src/gui/backup_tab.rs`, `src/gui/inspect_tab.rs`
+**Files:** `src/backup/mod.rs`
 
 **Changes:**
-- Backup tab partition list: small "Defrag" toggle next to HFS+ rows only. Tooltip: `"Cloning packs data toward the start; restore size reflects only used data. The original byte layout is not preserved."`
 - Log lines (ASCII only):
-  - `"Defragmenting HFS+ partition N: source 57.9 GiB -> clone target 38.2 GiB"`
-  - `"Cloned: 12,345 files / 678 folders / 38.1 GiB user data / 4 hardlinks / 89 xattrs"`
-  - `"fsck OK on clone"` or `"ERROR: fsck on clone failed: ..."` followed by abort.
-- Inspect-tab Min Size column tooltip references the backup-tab toggle.
+  - `"Streaming defragmented HFS+ for partition N: source 57.9 GiB -> 38.2 GiB"`
+  - `"Defrag emit: 12,345 files / 678 folders / 38.1 GiB user data / 4 hardlinks / 89 xattrs"`
+  - `"Aborting backup: partition N: <reason from can_defrag_clone_hfsplus>"`
 
-**Tests:** Manual `cargo run` on the user's reference disks; verify both partitions report sensible numbers and the toggle path produces a working backup.
+**Tests:** Manual `cargo run` on the user's reference disks; verify both partitions stream-defrag cleanly and the resulting backup restores to a smaller target.
 
 ---
 
@@ -444,7 +560,15 @@ By this point: snapshot capture, blank builder, fsck, xattrs, and hardlinks all 
 | 19 | HFSX | required | required | yes (Foo/foo coexist) | no |
 | 20 | HFSX | required | required | n/a | yes (inspect column) |
 | 21 | clone | required | required | yes (xattrs+hardlinks survive) | no |
-| 22 | backup | required | required | yes (e2e backup+restore) | yes (full flow) |
+| 22a | preflight | required | required | yes (4 accept/refuse cases) | no |
+| 22b | planner | required | required | yes (fixture-driven) | no |
+| 22c | builder | required | required | yes (in-memory parse round-trip) | no |
+| 22c-i | hardlinks | required | required | yes (file + dir hardlink replay) | no |
+| 22c-ii | xattrs | required | required | yes (inline xattr replay) | no |
+| 22d | emit | required | required | yes (covered by 22e) | no |
+| 22e | round-trip | required | required | yes (e2e engine) | no |
+| 22f | backup | required | required | yes (e2e backup+restore) | yes (full flow) |
+| 22g | gui | required | required | n/a | yes (toggle) |
 | 23 | polish | required | required | n/a | yes (reference disks) |
 
 ---

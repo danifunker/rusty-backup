@@ -11,6 +11,7 @@ pub mod hfs_common;
 pub mod hfs_fsck;
 pub mod hfsplus;
 pub mod hfsplus_clone;
+pub mod hfsplus_defrag;
 pub mod hfsplus_fsck;
 pub mod layout_preserving;
 pub mod mac_alias;
@@ -1195,6 +1196,71 @@ pub fn probe_hfsplus_signature<R: Read + Seek>(
     let mut sig = [0u8; 2];
     reader.read_exact(&mut sig).ok()?;
     Some(u16::from_be_bytes(sig))
+}
+
+/// Pre-flight check for the streamed defrag-clone backup path. Returns
+/// `Ok(())` when the partition is a plain HFS+/HFSX volume that the
+/// shrink-to-minimum pipeline can safely emit, or `Err(reason)` with a
+/// human-readable explanation when it cannot.
+///
+/// Refused cases:
+/// - **Embedded HFS+ inside an HFS wrapper** — the classic Mac OS 9
+///   layout where an outer `Apple_HFS` partition holds an HFS volume
+///   whose MDB points at an inner HFS+ via `drEmbedExtent`. Cloning the
+///   inner volume to a flat HFS+ would silently drop the wrapper.
+/// - **Dirty journaled volume** — `kHFSVolumeJournaledBit` set with
+///   `kHFSVolumeUnmountedBit` clear. The journal carries pending metadata
+///   changes the catalog hasn't yet absorbed; cloning the catalog as-is
+///   would lose them.
+///
+/// A cleanly-unmounted journaled volume is *accepted* — the journal is
+/// empty / replayed, so the catalog is authoritative and the cloned
+/// target (built without the journaled bit) effectively nullifies the
+/// journal.
+///
+/// Volumes that aren't HFS+/HFSX at all return `Err` with a generic
+/// "not an HFS+ volume" reason — callers should typically branch on
+/// fs-type before reaching this helper.
+pub fn can_defrag_clone_hfsplus<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+) -> Result<(), String> {
+    let (fs_type, hfsplus_offset) = resolve_apple_hfs(reader, partition_offset);
+    if fs_type != "hfsplus" {
+        return Err("not an HFS+/HFSX volume".into());
+    }
+    if hfsplus_offset != partition_offset {
+        return Err(
+            "embedded HFS+ inside an HFS wrapper — shrink-to-minimum is not supported \
+             for this layout. Disable shrink-to-minimum for this backup, or restore \
+             the disk first to a flat HFS+ volume."
+                .into(),
+        );
+    }
+    // Read the VH attributes word (offset 4, 4 bytes) to test the journal bits.
+    if reader
+        .seek(SeekFrom::Start(hfsplus_offset + 1024 + 4))
+        .is_err()
+    {
+        return Err("failed to seek to VH attributes word".into());
+    }
+    let mut buf = [0u8; 4];
+    if reader.read_exact(&mut buf).is_err() {
+        return Err("failed to read VH attributes word".into());
+    }
+    let attributes = u32::from_be_bytes(buf);
+    let journaled = attributes & 0x2000 != 0;
+    let unmounted_clean = attributes & 0x100 != 0;
+    if journaled && !unmounted_clean {
+        return Err(
+            "journaled HFS+ volume is dirty (kHFSVolumeUnmountedBit clear) — the \
+             on-disk journal carries pending metadata changes that haven't been \
+             applied to the catalog. Mount + cleanly unmount the volume first \
+             (or run `fsck_hfs -f` against it), then re-run the backup."
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 /// Returns `"HFS+"`, `"HFSX"`, `"HFS"`, or `"unknown"`. Useful for updating
