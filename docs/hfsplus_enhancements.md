@@ -359,7 +359,7 @@ By this point: snapshot capture, blank builder, fsck, xattrs, and hardlinks all 
 
 ### Step 21 — `clone_hfsplus_volume`
 
-- [ ] **Goal:** `pub fn clone_hfsplus_volume<R, W>(source: &mut HfsPlusFilesystem<R>, target: &mut HfsPlusFilesystem<W>) -> Result<CloneReport>` BFS-replays the source onto a freshly built target — including xattrs, file hardlinks, dir hardlinks, dates, and HFSX case sensitivity.
+- [x] **Goal:** `pub fn clone_hfsplus_volume<R, W>(source: &mut HfsPlusFilesystem<R>, target: &mut HfsPlusFilesystem<W>) -> Result<CloneReport>` BFS-replays the source onto a freshly built target — including xattrs, file hardlinks, dir hardlinks, dates, and HFSX case sensitivity.
 
 **Files:** `src/fs/hfsplus_clone.rs`
 

@@ -491,6 +491,12 @@ pub struct HfsPlusFilesystem<R: Read + Seek> {
     /// Directory hardlink resolution map (dir-inode iNodeNum -> directory
     /// CNID). Same lazy/snapshot semantics as `hardlink_inode_map`.
     dir_hardlink_inode_map: Option<HashMap<u32, u32>>,
+    /// Boot blocks staged via `set_boot_blocks` and flushed by
+    /// `do_sync_metadata`. Used by the clone path (Step 21) to carry the
+    /// source's first 1024 bytes onto the freshly-built target verbatim.
+    /// Not part of the snapshot — clone stages once at the end and only
+    /// the final `sync_metadata` writes to disk.
+    pending_boot_blocks: Option<Box<[u8; 1024]>>,
 }
 
 /// Snapshot of every byte/value an HFS+ mutation can touch — taken at the
@@ -628,6 +634,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
             xattr_cnids: None,
             hardlink_inode_map: None,
             dir_hardlink_inode_map: None,
+            pending_boot_blocks: None,
         })
     }
 
@@ -2396,6 +2403,10 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
         self.write_attributes()?;
         self.write_allocation_bitmap()?;
         self.write_volume_header()?;
+        if let Some(ref boot) = self.pending_boot_blocks {
+            self.reader.seek(SeekFrom::Start(self.partition_offset))?;
+            self.reader.write_all(boot.as_ref())?;
+        }
         self.reader.flush()?;
         Ok(())
     }
@@ -3374,6 +3385,146 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
             self.restore_snapshot(snap);
         }
         result
+    }
+}
+
+/// Captured per-record metadata, replayed by [`HfsPlusFilesystem::set_record_metadata`]
+/// onto a freshly-created target catalog record. Field offsets are
+/// identical for HFS+ file (248-byte) and folder (88-byte) records, so the
+/// same struct serves both shapes.
+///
+/// Used by the clone pipeline (Step 21 of `docs/hfsplus_enhancements.md`)
+/// to stamp the source's dates / Finder metadata / BSD info / text
+/// encoding onto each cloned entry after `create_file` /
+/// `create_directory` has assigned it a new CNID.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RecordMetadata {
+    pub create_date: u32,
+    pub content_mod_date: u32,
+    pub attribute_mod_date: u32,
+    pub access_date: u32,
+    pub backup_date: u32,
+    pub bsd_info: [u8; 16],
+    pub finder_info: [u8; 16],
+    pub extended_finder_info: [u8; 16],
+    pub text_encoding: u32,
+}
+
+impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
+    /// Replay captured per-record metadata onto the catalog record for
+    /// `cnid`. Patches dates, BSD info, FInfo / FXInfo (or DInfo / DXInfo
+    /// for folders — same offsets), and textEncoding. The locked-bit and
+    /// flags-word fields are intentionally untouched here so callers can
+    /// stamp them via dedicated paths (none today; the source's `flags` is
+    /// already mirrored by `create_file` / `create_directory` for the
+    /// fields the clone cares about).
+    ///
+    /// Mostly used by the clone replay path; tests cover the round-trip
+    /// in `clone_round_trip_*`.
+    pub(crate) fn set_record_metadata(
+        &mut self,
+        cnid: u32,
+        meta: &RecordMetadata,
+    ) -> Result<(), FilesystemError> {
+        // Resolve the catalog record body via the thread record.
+        let (_, _, t_offset) = self.find_catalog_record_by_cnid(cnid).ok_or_else(|| {
+            FilesystemError::NotFound(format!("thread record for CNID {cnid} not found"))
+        })?;
+        let key_len = BigEndian::read_u16(&self.catalog_data[t_offset..t_offset + 2]) as usize;
+        let mut rec_data_start = t_offset + 2 + key_len;
+        if !rec_data_start.is_multiple_of(2) {
+            rec_data_start += 1;
+        }
+        let thread_parent =
+            BigEndian::read_u32(&self.catalog_data[rec_data_start + 4..rec_data_start + 8]);
+        let thread_name_len =
+            BigEndian::read_u16(&self.catalog_data[rec_data_start + 8..rec_data_start + 10])
+                as usize;
+        let thread_name = decode_utf16be(
+            &self.catalog_data[rec_data_start + 10..rec_data_start + 10 + thread_name_len * 2],
+        );
+
+        let (_, _, f_offset) = self
+            .find_catalog_record(thread_parent, &thread_name)
+            .ok_or_else(|| {
+                FilesystemError::NotFound(format!(
+                    "catalog record for CNID {cnid} ('{thread_name}') not found"
+                ))
+            })?;
+        let fkey_len = BigEndian::read_u16(&self.catalog_data[f_offset..f_offset + 2]) as usize;
+        let mut frec = f_offset + 2 + fkey_len;
+        if !frec.is_multiple_of(2) {
+            frec += 1;
+        }
+        if frec + 84 > self.catalog_data.len() {
+            return Err(FilesystemError::InvalidData(format!(
+                "catalog record for CNID {cnid} truncated"
+            )));
+        }
+
+        BigEndian::write_u32(
+            &mut self.catalog_data[frec + 12..frec + 16],
+            meta.create_date,
+        );
+        BigEndian::write_u32(
+            &mut self.catalog_data[frec + 16..frec + 20],
+            meta.content_mod_date,
+        );
+        BigEndian::write_u32(
+            &mut self.catalog_data[frec + 20..frec + 24],
+            meta.attribute_mod_date,
+        );
+        BigEndian::write_u32(
+            &mut self.catalog_data[frec + 24..frec + 28],
+            meta.access_date,
+        );
+        BigEndian::write_u32(
+            &mut self.catalog_data[frec + 28..frec + 32],
+            meta.backup_date,
+        );
+        self.catalog_data[frec + 32..frec + 48].copy_from_slice(&meta.bsd_info);
+        self.catalog_data[frec + 48..frec + 64].copy_from_slice(&meta.finder_info);
+        self.catalog_data[frec + 64..frec + 80].copy_from_slice(&meta.extended_finder_info);
+        BigEndian::write_u32(
+            &mut self.catalog_data[frec + 80..frec + 84],
+            meta.text_encoding,
+        );
+        Ok(())
+    }
+
+    /// Set the volume's create / modify / backup / checked dates. The
+    /// `modify_date` is overwritten by `do_sync_metadata` with `hfs_now()`
+    /// at sync time, so callers that want the source's modifyDate to
+    /// survive should call this *after* the final mutation (i.e. as the
+    /// last step before sync) — but for the clone pipeline the modifyDate
+    /// is intentionally bumped to "now" anyway, so the input value here is
+    /// a fallback used only if sync doesn't run.
+    pub(crate) fn set_volume_dates(
+        &mut self,
+        create_date: u32,
+        modify_date: u32,
+        backup_date: u32,
+        checked_date: u32,
+    ) {
+        self.vh.create_date = create_date;
+        self.vh.modify_date = modify_date;
+        self.vh.backup_date = backup_date;
+        self.vh.checked_date = checked_date;
+    }
+
+    /// Replace the volume header's 8 × u32 Finder Info slots verbatim. The
+    /// caller is responsible for any CNID remap (slots 0/3/5 etc. may hold
+    /// CNIDs that point at the now-renumbered blessed folder / OS folder).
+    pub(crate) fn set_volume_finder_info(&mut self, finder_info: [u32; 8]) {
+        self.vh.finder_info = finder_info;
+    }
+
+    /// Stage the source volume's first 1024 bytes (boot blocks) for write
+    /// at the next `sync_metadata`. Macs only ever care about the boot
+    /// blocks on the System volume, but the area is part of the volume's
+    /// signature, so the clone copies it verbatim for round-trip parity.
+    pub(crate) fn set_boot_blocks(&mut self, blocks: &[u8; 1024]) {
+        self.pending_boot_blocks = Some(Box::new(*blocks));
     }
 }
 
