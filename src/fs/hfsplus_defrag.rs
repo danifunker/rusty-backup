@@ -315,7 +315,7 @@ use super::filesystem::FilesystemError;
 use super::hfs_common;
 use super::hfsplus::{
     write_blank_btree_header_node, write_empty_leaf_node, ExtentDescriptor, ForkData,
-    HfsPlusFilesystem, HFSPLUS_VOLUME_UNMOUNTED_BIT,
+    HfsPlusFilesystem, XattrKind, XattrRecord, HFSPLUS_VOLUME_UNMOUNTED_BIT,
 };
 
 /// HFS+ B-tree key compare types (`BTHeaderRec` offset 37).
@@ -367,24 +367,6 @@ pub fn build_target_metadata(
     plan: &TargetLayoutPlan,
     snapshot: &SourceCatalogSnapshot,
 ) -> Result<TargetMetadata, FilesystemError> {
-    if !snapshot.hardlinks.is_empty() || !snapshot.dir_hardlinks.is_empty() {
-        return Err(FilesystemError::Unsupported(
-            "streamed defrag does not yet emit hardlinks (Step 22c follow-up)".into(),
-        ));
-    }
-    if snapshot.files.iter().any(|f| !f.xattrs.is_empty())
-        || snapshot.dirs.iter().any(|d| !d.xattrs.is_empty())
-    {
-        return Err(FilesystemError::Unsupported(
-            "streamed defrag does not yet emit extended attributes (Step 22c follow-up)".into(),
-        ));
-    }
-    if plan.attributes_blocks > 0 {
-        return Err(FilesystemError::Unsupported(
-            "source has an attributes B-tree but xattr emit is not yet implemented".into(),
-        ));
-    }
-
     let block_size = plan.block_size;
     let block_size_u = block_size as usize;
     let case_sensitive = snapshot.volume.signature == 0x4858;
@@ -404,6 +386,17 @@ pub fn build_target_metadata(
         },
     );
     let mut extents_overflow = init_btree_buffer(extents_bytes, 10, 0);
+
+    // Attributes B-tree: only allocate when the source had xattrs. The
+    // planner sized `attributes_blocks` from `vh.attributes_file.total_blocks`
+    // so capacity matches. `max_key_len = 266` covers the worst-case
+    // attribute key: 4 fileID + 4 startBlock + 2 nameLen + 127*2 name.
+    let mut attributes: Option<Vec<u8>> = if plan.attributes_blocks > 0 {
+        let attr_bytes = plan.attributes_blocks as usize * block_size_u;
+        Some(init_btree_buffer(attr_bytes, 266, 0))
+    } else {
+        None
+    };
 
     // Bitmap: total_blocks bits, packed BE. All-zero start.
     let bitmap_bytes = (plan.total_blocks as usize).div_ceil(8);
@@ -535,6 +528,154 @@ pub fn build_target_metadata(
     }
 
     // ----------------------------------------------------------------
+    // Hardlink stubs (Step 22c-i). Each stub is a FILE catalog record —
+    // even directory hardlinks ride the FILE shape on disk per TN1150.
+    // The source already encoded `FInfo = ('hlnk','hfs+')` /
+    // `('fdrp','MACS')` and `bsdInfo.special = inode_num` on the stub
+    // row, so faithful replay is just "emit a file record with the
+    // captured metadata and empty forks." The matching inode (a regular
+    // file or directory under the target's HFS+ Private Data /
+    // .HFS+ Private Directory Data\r dir) was already laid down by the
+    // dir / file loops above; we just patch its `bsdInfo.special` to
+    // hold the live link count once we know how many stubs reference it.
+    // ----------------------------------------------------------------
+    use std::collections::HashMap as _HashMap;
+    let mut file_link_counts: _HashMap<u32, u32> = _HashMap::new();
+    let mut dir_link_counts: _HashMap<u32, u32> = _HashMap::new();
+
+    for h in &snapshot.hardlinks {
+        let target_cnid = *plan
+            .cnid_map
+            .get(&h.cnid)
+            .ok_or_else(|| missing_cnid("hardlink stub", h.cnid))?;
+        let target_parent = *plan
+            .cnid_map
+            .get(&h.parent_cnid)
+            .ok_or_else(|| missing_cnid("hardlink parent", h.parent_cnid))?;
+        let meta = file_hardlink_metadata(h);
+        let key = build_catalog_key(target_parent, &h.name);
+        let empty_data = ForkData::empty();
+        let empty_rsrc = ForkData::empty();
+        let body = build_file_body(target_cnid, &empty_data, &empty_rsrc, &meta);
+        let mut key_record = key.clone();
+        if !key_record.len().is_multiple_of(2) {
+            key_record.push(0);
+        }
+        key_record.extend_from_slice(&body);
+        hfs_common::btree_insert_full(&mut catalog, &key_record, &cmp)?;
+
+        let thread = build_thread_record(CATALOG_FILE_THREAD, target_parent, &h.name);
+        let mut tk = build_catalog_key(target_cnid, "");
+        if !tk.len().is_multiple_of(2) {
+            tk.push(0);
+        }
+        tk.extend_from_slice(&thread);
+        hfs_common::btree_insert_full(&mut catalog, &tk, &cmp)?;
+
+        *child_count.entry(target_parent).or_default() += 1;
+        *file_link_counts.entry(h.inode_num).or_default() += 1;
+    }
+
+    for h in &snapshot.dir_hardlinks {
+        let target_cnid = *plan
+            .cnid_map
+            .get(&h.cnid)
+            .ok_or_else(|| missing_cnid("dir hardlink stub", h.cnid))?;
+        let target_parent = *plan
+            .cnid_map
+            .get(&h.parent_cnid)
+            .ok_or_else(|| missing_cnid("dir hardlink parent", h.parent_cnid))?;
+        let meta = dir_hardlink_metadata(h);
+        let key = build_catalog_key(target_parent, &h.name);
+        let empty_data = ForkData::empty();
+        let empty_rsrc = ForkData::empty();
+        let body = build_file_body(target_cnid, &empty_data, &empty_rsrc, &meta);
+        let mut key_record = key.clone();
+        if !key_record.len().is_multiple_of(2) {
+            key_record.push(0);
+        }
+        key_record.extend_from_slice(&body);
+        hfs_common::btree_insert_full(&mut catalog, &key_record, &cmp)?;
+
+        let thread = build_thread_record(CATALOG_FILE_THREAD, target_parent, &h.name);
+        let mut tk = build_catalog_key(target_cnid, "");
+        if !tk.len().is_multiple_of(2) {
+            tk.push(0);
+        }
+        tk.extend_from_slice(&thread);
+        hfs_common::btree_insert_full(&mut catalog, &tk, &cmp)?;
+
+        *child_count.entry(target_parent).or_default() += 1;
+        *dir_link_counts.entry(h.inode_num).or_default() += 1;
+    }
+
+    // Patch each inode's bsdInfo.special with its live link count. The
+    // file/dir record carried the source's count through verbatim during
+    // its emission above; recomputing from actually-emitted stubs keeps
+    // us self-consistent even if the source lied (corrupted volume).
+    for f in snapshot.files.iter().filter(|f| f.is_inode) {
+        let target_cnid = *plan
+            .cnid_map
+            .get(&f.cnid)
+            .ok_or_else(|| missing_cnid("file inode", f.cnid))?;
+        let count = f
+            .inode_num
+            .and_then(|n| file_link_counts.get(&n).copied())
+            .unwrap_or(0);
+        patch_record_bsd_special(&mut catalog, target_cnid, count)?;
+    }
+    for d in snapshot.dirs.iter().filter(|d| d.is_dir_inode) {
+        let target_cnid = *plan
+            .cnid_map
+            .get(&d.cnid)
+            .ok_or_else(|| missing_cnid("dir inode", d.cnid))?;
+        let count = d
+            .inode_num
+            .and_then(|n| dir_link_counts.get(&n).copied())
+            .unwrap_or(0);
+        patch_record_bsd_special(&mut catalog, target_cnid, count)?;
+    }
+
+    // ----------------------------------------------------------------
+    // Extended attributes (Step 22c-ii). Inline xattrs replay against
+    // each remapped CNID; fork-style and extents-style xattrs are
+    // intentionally rejected (mirrors Step 13's inline-only limitation
+    // on the editing side, until fork-style xattr writes ship). The
+    // attributes buffer was pre-sized from source.vh.attributes_file
+    // so all source records fit in capacity.
+    // ----------------------------------------------------------------
+    if let Some(ref mut attr_buf) = attributes {
+        for f in &snapshot.files {
+            let target_cnid = *plan
+                .cnid_map
+                .get(&f.cnid)
+                .ok_or_else(|| missing_cnid("file xattr", f.cnid))?;
+            emit_xattrs_for_cnid(attr_buf, target_cnid, &f.xattrs, &f.name)?;
+        }
+        for d in &snapshot.dirs {
+            let target_cnid = *plan
+                .cnid_map
+                .get(&d.cnid)
+                .ok_or_else(|| missing_cnid("dir xattr", d.cnid))?;
+            emit_xattrs_for_cnid(attr_buf, target_cnid, &d.xattrs, &d.name)?;
+        }
+        for h in &snapshot.hardlinks {
+            let target_cnid = *plan
+                .cnid_map
+                .get(&h.cnid)
+                .ok_or_else(|| missing_cnid("hardlink xattr", h.cnid))?;
+            emit_xattrs_for_cnid(attr_buf, target_cnid, &h.xattrs, &h.name)?;
+        }
+        for h in &snapshot.dir_hardlinks {
+            let target_cnid = *plan
+                .cnid_map
+                .get(&h.cnid)
+                .ok_or_else(|| missing_cnid("dir hardlink xattr", h.cnid))?;
+            emit_xattrs_for_cnid(attr_buf, target_cnid, &h.xattrs, &h.name)?;
+        }
+    }
+
+    // ----------------------------------------------------------------
     // Patch parent valences. The root's valence comes straight from
     // the snapshot's root SourceDirSnapshot if present; otherwise we
     // accept whatever we counted.
@@ -616,7 +757,7 @@ pub fn build_target_metadata(
         bitmap,
         catalog,
         extents_overflow,
-        attributes: None,
+        attributes,
         vh_bytes,
     })
 }
@@ -708,6 +849,36 @@ fn file_metadata(f: &SourceFileSnapshot) -> CatalogRecordMeta {
         finder_info: f.finder_info,
         extended_finder_info: f.extended_finder_info,
         text_encoding: f.text_encoding,
+    }
+}
+
+fn file_hardlink_metadata(h: &SourceHardlinkSnapshot) -> CatalogRecordMeta {
+    CatalogRecordMeta {
+        flags: h.flags,
+        create_date: h.create_date,
+        content_mod_date: h.content_mod_date,
+        attribute_mod_date: h.attribute_mod_date,
+        access_date: h.access_date,
+        backup_date: h.backup_date,
+        bsd_info: h.bsd_info,
+        finder_info: h.finder_info,
+        extended_finder_info: h.extended_finder_info,
+        text_encoding: h.text_encoding,
+    }
+}
+
+fn dir_hardlink_metadata(h: &SourceDirHardlinkSnapshot) -> CatalogRecordMeta {
+    CatalogRecordMeta {
+        flags: h.flags,
+        create_date: h.create_date,
+        content_mod_date: h.content_mod_date,
+        attribute_mod_date: h.attribute_mod_date,
+        access_date: h.access_date,
+        backup_date: h.backup_date,
+        bsd_info: h.bsd_info,
+        finder_info: h.finder_info,
+        extended_finder_info: h.extended_finder_info,
+        text_encoding: h.text_encoding,
     }
 }
 
@@ -836,6 +1007,94 @@ fn serialize_fork(fork: &ForkData, out: &mut [u8]) {
 /// (root) or the source's valence (other dirs); for streamed defrag
 /// we recompute from the actually-inserted children to stay self-
 /// consistent.
+/// Emit one CNID's worth of xattrs into the target attributes B-tree.
+/// Inline records flow through `HfsPlusFilesystem::build_inline_attr_record`
+/// and `HfsPlusFilesystem::attr_compare` — same builders the editing
+/// path uses, so on-disk layout matches byte-for-byte. Fork-style
+/// (`Fork(...)`) and extents-continuation (`Extents(...)`) records
+/// surface a controlled error mirroring Step 13's inline-only
+/// limitation; landing fork-style xattr writes is a separate feature.
+fn emit_xattrs_for_cnid(
+    attr_buf: &mut Vec<u8>,
+    target_cnid: u32,
+    xattrs: &[XattrRecord],
+    label: &str,
+) -> Result<(), FilesystemError> {
+    for x in xattrs {
+        match &x.kind {
+            XattrKind::Inline(value) => {
+                let rec = HfsPlusFilesystem::<std::io::Cursor<Vec<u8>>>::build_inline_attr_record(
+                    target_cnid,
+                    &x.name,
+                    value,
+                );
+                hfs_common::btree_insert_full(
+                    attr_buf,
+                    &rec,
+                    &HfsPlusFilesystem::<std::io::Cursor<Vec<u8>>>::attr_compare,
+                )?;
+            }
+            XattrKind::Fork(_) | XattrKind::Extents(_) => {
+                return Err(FilesystemError::Unsupported(format!(
+                    "{label}: fork-style extended attribute '{}' is not supported by \
+                     the streamed defrag emit path (inline xattrs only — same limitation \
+                     as Step 13's editing path)",
+                    x.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Locate the catalog record for `target_cnid` (file or folder, not a
+/// thread) and stamp its `bsdInfo.special` u32 (record body offset
+/// 32+12 = 44) with `value`. Used by 22c-i to write live link counts
+/// onto inode rows after every stub has been emitted.
+fn patch_record_bsd_special(
+    catalog: &mut [u8],
+    target_cnid: u32,
+    value: u32,
+) -> Result<(), FilesystemError> {
+    let header = hfs_common::BTreeHeader::read(catalog);
+    let node_size = header.node_size as usize;
+    let mut node_idx = header.first_leaf_node;
+    while node_idx != 0 {
+        let off = node_idx as usize * node_size;
+        let next_node = BigEndian::read_u32(&catalog[off..off + 4]);
+        let num_records = BigEndian::read_u16(&catalog[off + 10..off + 12]) as usize;
+        for rec_idx in 0..num_records {
+            let (rec_start, _) =
+                hfs_common::btree_record_range(&catalog[off..off + node_size], node_size, rec_idx);
+            let abs = off + rec_start;
+            let key_len = BigEndian::read_u16(&catalog[abs..abs + 2]) as usize;
+            let mut body = abs + 2 + key_len;
+            if !body.is_multiple_of(2) {
+                body += 1;
+            }
+            if body + 48 > catalog.len() {
+                continue;
+            }
+            let record_type = BigEndian::read_i16(&catalog[body..body + 2]);
+            // Both folder (88B) and file (248B) records carry CNID at
+            // body+8 and bsdInfo at body+32; thread records (3/4) don't
+            // carry bsdInfo and are skipped.
+            if record_type != CATALOG_FOLDER && record_type != CATALOG_FILE {
+                continue;
+            }
+            let cnid = BigEndian::read_u32(&catalog[body + 8..body + 12]);
+            if cnid == target_cnid {
+                BigEndian::write_u32(&mut catalog[body + 44..body + 48], value);
+                return Ok(());
+            }
+        }
+        node_idx = next_node;
+    }
+    Err(FilesystemError::NotFound(format!(
+        "catalog record for inode CNID {target_cnid} not found while patching link count"
+    )))
+}
+
 fn patch_folder_valences(
     catalog: &mut [u8],
     counts: &std::collections::HashMap<u32, u32>,
@@ -1177,18 +1436,454 @@ mod tests {
         assert!(names.contains(&"b.txt"), "b.txt missing: {names:?}");
     }
 
+    /// Build a source with one file inode + 3 hardlink stub rows. Plan
+    /// + build target metadata, stitch into a target image, open as
+    /// HfsPlusFilesystem, walk the catalog. All 3 stubs and the inode
+    /// row must be present; the inode's bsdInfo.special (link count)
+    /// must equal 3.
     #[test]
-    fn build_metadata_refuses_xattrs_and_hardlinks() {
-        // Plain blank — no xattrs / hardlinks — this test only verifies
-        // that the explicit guards trip when the snapshot fields are
-        // populated. Build an empty snapshot fixture and stuff a fake
-        // xattr in.
+    fn build_metadata_emits_file_hardlinks_with_link_count() {
+        const PAYLOAD: &[u8] = b"shared\n";
+        const I_NODE_NUM: u32 = 42;
+
+        let mut src_img = create_blank_hfsplus(32 * 1024 * 1024, 4096, "Src", false);
+        {
+            let cursor = Cursor::new(&mut src_img);
+            let mut fs = HfsPlusFilesystem::open(cursor, 0).unwrap();
+            fs.prepare_for_edit().unwrap();
+            let mut data = Cursor::new(PAYLOAD);
+            fs.create_hardlink_inode(
+                I_NODE_NUM,
+                &mut data,
+                PAYLOAD.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            let root = fs.root().unwrap();
+            for name in ["a.txt", "b.txt", "c.txt"] {
+                fs.create_hardlink(&root, name, I_NODE_NUM).unwrap();
+            }
+            fs.sync_metadata().unwrap();
+        }
+
+        let cursor = Cursor::new(&mut src_img);
+        let mut src_fs = HfsPlusFilesystem::open(cursor, 0).unwrap();
+        let snap = SourceCatalogSnapshot::capture(&mut src_fs).unwrap();
+        assert_eq!(snap.hardlinks.len(), 3, "expected 3 hardlink stubs");
+        assert_eq!(
+            snap.files.iter().filter(|f| f.is_inode).count(),
+            1,
+            "expected 1 inode"
+        );
+
+        let target_size: u64 = 8 * 1024 * 1024;
+        let plan = plan_defrag_layout(&snap, target_size).unwrap();
+        let meta = build_target_metadata(&plan, &snap).expect("build metadata");
+
+        // Stitch a target image (no fork bytes streamed — those land in
+        // 22d; this test only exercises catalog correctness).
+        let bs = plan.block_size as usize;
+        let mut img = vec![0u8; target_size as usize];
+        img[..bs].copy_from_slice(&meta.block_zero);
+        let bitmap_off = plan.bitmap_start as usize * bs;
+        img[bitmap_off..bitmap_off + meta.bitmap.len()].copy_from_slice(&meta.bitmap);
+        let catalog_off = plan.catalog_start as usize * bs;
+        img[catalog_off..catalog_off + meta.catalog.len()].copy_from_slice(&meta.catalog);
+        let extents_off = plan.extents_start as usize * bs;
+        img[extents_off..extents_off + meta.extents_overflow.len()]
+            .copy_from_slice(&meta.extents_overflow);
+        let alt = target_size as usize - 1024;
+        img[alt..alt + 512].copy_from_slice(&meta.vh_bytes);
+
+        let cursor = Cursor::new(img);
+        let mut tgt = HfsPlusFilesystem::open(cursor, 0).expect("target opens");
+        let root = tgt.root().expect("root");
+        let kids = tgt.list_directory(&root).expect("list root");
+        let stub_names: Vec<&str> = kids
+            .iter()
+            .filter(|e| ["a.txt", "b.txt", "c.txt"].contains(&e.name.as_str()))
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(stub_names.len(), 3, "expected 3 stubs in root: {kids:?}");
+
+        // Verify the inode's link count was patched. We have to walk the
+        // catalog looking for the inode CNID's record body and reading
+        // bsdInfo.special.
+        let inode_target_cnid = {
+            let inode = snap.files.iter().find(|f| f.is_inode).unwrap();
+            *plan.cnid_map.get(&inode.cnid).unwrap()
+        };
+        let link_count =
+            read_inode_link_count(&meta.catalog, inode_target_cnid).expect("inode catalog record");
+        assert_eq!(link_count, 3, "inode should carry linkCount=3");
+    }
+
+    /// Directory hardlinks: 2 stub rows + 1 directory inode under
+    /// `.HFS+ Private Directory Data\r`. Build target metadata, open as
+    /// HfsPlusFilesystem, verify both stubs are present at root and the
+    /// inode dir is reachable under the dir-private dir.
+    #[test]
+    fn build_metadata_emits_dir_hardlinks_with_link_count() {
+        const D_INODE_NUM: u32 = 7;
+
+        let mut src_img = create_blank_hfsplus(32 * 1024 * 1024, 4096, "DhSrc", false);
+        {
+            let cursor = Cursor::new(&mut src_img);
+            let mut fs = HfsPlusFilesystem::open(cursor, 0).unwrap();
+            fs.prepare_for_edit().unwrap();
+            fs.create_dir_hardlink_inode(D_INODE_NUM, &CreateDirectoryOptions::default())
+                .unwrap();
+            let root = fs.root().unwrap();
+            for name in ["alpha", "beta"] {
+                fs.create_dir_hardlink(&root, name, D_INODE_NUM).unwrap();
+            }
+            fs.sync_metadata().unwrap();
+        }
+
+        let cursor = Cursor::new(&mut src_img);
+        let mut src_fs = HfsPlusFilesystem::open(cursor, 0).unwrap();
+        let snap = SourceCatalogSnapshot::capture(&mut src_fs).unwrap();
+        assert_eq!(snap.dir_hardlinks.len(), 2);
+        assert_eq!(snap.dirs.iter().filter(|d| d.is_dir_inode).count(), 1);
+
+        let target_size: u64 = 8 * 1024 * 1024;
+        let plan = plan_defrag_layout(&snap, target_size).unwrap();
+        let meta = build_target_metadata(&plan, &snap).expect("build metadata");
+
+        // Patch the target image and reopen.
+        let bs = plan.block_size as usize;
+        let mut img = vec![0u8; target_size as usize];
+        img[..bs].copy_from_slice(&meta.block_zero);
+        let bo = plan.bitmap_start as usize * bs;
+        img[bo..bo + meta.bitmap.len()].copy_from_slice(&meta.bitmap);
+        let co = plan.catalog_start as usize * bs;
+        img[co..co + meta.catalog.len()].copy_from_slice(&meta.catalog);
+        let eo = plan.extents_start as usize * bs;
+        img[eo..eo + meta.extents_overflow.len()].copy_from_slice(&meta.extents_overflow);
+        let alt = target_size as usize - 1024;
+        img[alt..alt + 512].copy_from_slice(&meta.vh_bytes);
+
+        let cursor = Cursor::new(img);
+        let mut tgt = HfsPlusFilesystem::open(cursor, 0).expect("target opens");
+        let root = tgt.root().expect("root");
+        let kids = tgt.list_directory(&root).expect("list root");
+        let stub_names: Vec<&str> = kids
+            .iter()
+            .filter(|e| ["alpha", "beta"].contains(&e.name.as_str()))
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(stub_names.len(), 2, "expected 2 dir-hardlink stubs");
+
+        // Verify the dir inode's link count.
+        let inode_target_cnid = {
+            let inode = snap.dirs.iter().find(|d| d.is_dir_inode).unwrap();
+            *plan.cnid_map.get(&inode.cnid).unwrap()
+        };
+        let link_count = read_inode_link_count(&meta.catalog, inode_target_cnid)
+            .expect("dir inode catalog record");
+        assert_eq!(link_count, 2, "dir inode should carry linkCount=2");
+    }
+
+    /// Walk a catalog buffer, find the file/folder record for `cnid`,
+    /// return its `bsdInfo.special` (record body offset 44, u32 BE).
+    fn read_inode_link_count(catalog: &[u8], cnid: u32) -> Option<u32> {
+        let header = super::super::hfs_common::BTreeHeader::read(catalog);
+        let node_size = header.node_size as usize;
+        let mut node_idx = header.first_leaf_node;
+        while node_idx != 0 {
+            let off = node_idx as usize * node_size;
+            let next = BigEndian::read_u32(&catalog[off..off + 4]);
+            let num = BigEndian::read_u16(&catalog[off + 10..off + 12]) as usize;
+            for rec_idx in 0..num {
+                let (rec_start, _) = super::super::hfs_common::btree_record_range(
+                    &catalog[off..off + node_size],
+                    node_size,
+                    rec_idx,
+                );
+                let abs = off + rec_start;
+                let key_len = BigEndian::read_u16(&catalog[abs..abs + 2]) as usize;
+                let mut body = abs + 2 + key_len;
+                if !body.is_multiple_of(2) {
+                    body += 1;
+                }
+                if body + 48 > catalog.len() {
+                    continue;
+                }
+                let rt = BigEndian::read_i16(&catalog[body..body + 2]);
+                if rt != CATALOG_FOLDER && rt != CATALOG_FILE {
+                    continue;
+                }
+                let rcnid = BigEndian::read_u32(&catalog[body + 8..body + 12]);
+                if rcnid == cnid {
+                    return Some(BigEndian::read_u32(&catalog[body + 44..body + 48]));
+                }
+            }
+            node_idx = next;
+        }
+        None
+    }
+
+    /// Plain blank — no xattrs, no hardlinks. With 22c-i shipped the
+    /// only remaining `Unsupported` guard is for xattr-bearing volumes;
+    /// a blank source flows through the basic dirs+files path cleanly.
+    /// Round-trip an inline xattr: synthesize a minimal source snapshot
+    /// carrying one file with `com.apple.FinderInfo` inline xattr,
+    /// build target metadata, parse the resulting attributes B-tree
+    /// back, verify the record's CNID is the planner-remapped target
+    /// CNID and the value bytes round-trip byte-equal.
+    #[test]
+    fn build_metadata_emits_inline_xattr() {
+        use super::super::hfsplus::{XattrKind, XattrRecord};
+        use super::super::hfsplus_clone::{
+            SourceCatalogSnapshot, SourceDirSnapshot, SourceFileSnapshot, SourceVolumeSnapshot,
+        };
+
+        let label = "Tgt".to_string();
+        let label_utf16: Vec<u16> = label.encode_utf16().collect();
+
+        // Root dir. CNID 2, parent 1, no xattrs.
+        let root = SourceDirSnapshot {
+            name: label.clone(),
+            name_utf16: label_utf16.clone(),
+            cnid: 2,
+            parent_cnid: 1,
+            valence: 1,
+            flags: 0,
+            finder_info: [0u8; 16],
+            extended_finder_info: [0u8; 16],
+            bsd_info: [0u8; 16],
+            create_date: 0,
+            content_mod_date: 0,
+            attribute_mod_date: 0,
+            access_date: 0,
+            backup_date: 0,
+            text_encoding: 0,
+            xattrs: Vec::new(),
+            is_dir_inode: false,
+            inode_num: None,
+        };
+        // One file, source CNID = 16, with one inline xattr.
+        let xattr_value = b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\
+                            \x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f"
+            .to_vec();
+        let xattr = XattrRecord {
+            name: "com.apple.FinderInfo".to_string(),
+            start_block: 0,
+            kind: XattrKind::Inline(xattr_value.clone()),
+        };
+        let f_name = "note.txt".to_string();
+        let f_name_utf16: Vec<u16> = f_name.encode_utf16().collect();
+        let mut data_fork_raw = [0u8; 80];
+        // logical_size = 0 → no data fork allocation. Planner skips it.
+        BigEndian::write_u64(&mut data_fork_raw[0..8], 0);
+        let file = SourceFileSnapshot {
+            name: f_name,
+            name_utf16: f_name_utf16,
+            cnid: 100,
+            parent_cnid: 2,
+            flags: 0,
+            finder_info: [0u8; 16],
+            extended_finder_info: [0u8; 16],
+            bsd_info: [0u8; 16],
+            create_date: 0,
+            content_mod_date: 0,
+            attribute_mod_date: 0,
+            access_date: 0,
+            backup_date: 0,
+            text_encoding: 0,
+            data_fork_raw,
+            rsrc_fork_raw: [0u8; 80],
+            data_fork_size: 0,
+            rsrc_fork_size: 0,
+            xattrs: vec![xattr],
+            is_inode: false,
+            inode_num: None,
+        };
+
+        let snap = SourceCatalogSnapshot {
+            volume: SourceVolumeSnapshot {
+                label: label.clone(),
+                signature: 0x482B,
+                attributes: 0x100,
+                create_date: 0,
+                modify_date: 0,
+                backup_date: 0,
+                checked_date: 0,
+                finder_info: [0u32; 8],
+                block_size: 4096,
+                total_blocks: 0,
+                file_count: 1,
+                folder_count: 0,
+                boot_blocks: [0u8; 1024],
+                catalog_total_blocks: 4,
+                extents_total_blocks: 4,
+                // Force the planner to size an attributes B-tree.
+                attributes_total_blocks: 4,
+            },
+            dirs: vec![root],
+            files: vec![file],
+            hardlinks: Vec::new(),
+            dir_hardlinks: Vec::new(),
+        };
+
+        let target_size: u64 = 8 * 1024 * 1024;
+        let plan = plan_defrag_layout(&snap, target_size).expect("plan");
+        assert!(
+            plan.attributes_blocks >= 4,
+            "planner must size attributes B-tree from source"
+        );
+        let meta = build_target_metadata(&plan, &snap).expect("build with xattr");
+        let attr_buf = meta.attributes.as_ref().expect("attributes buffer present");
+
+        // Parse the leaf, find our record, verify CNID + value.
+        let target_cnid = *plan.cnid_map.get(&100).expect("file CNID remapped");
+        let (found_cnid, found_value) =
+            read_first_inline_xattr(attr_buf).expect("at least one xattr record");
+        assert_eq!(
+            found_cnid, target_cnid,
+            "xattr record must reference remapped target CNID"
+        );
+        assert_eq!(found_value, xattr_value, "xattr value must round-trip");
+    }
+
+    /// Walk the leaf of an attributes B-tree, return the first inline
+    /// xattr record's `(fileID, valueBytes)`. Test-only.
+    fn read_first_inline_xattr(attr_buf: &[u8]) -> Option<(u32, Vec<u8>)> {
+        let header = super::super::hfs_common::BTreeHeader::read(attr_buf);
+        let node_size = header.node_size as usize;
+        let leaf_off = header.first_leaf_node as usize * node_size;
+        let num = BigEndian::read_u16(&attr_buf[leaf_off + 10..leaf_off + 12]) as usize;
+        if num == 0 {
+            return None;
+        }
+        let (rec_start, _) = super::super::hfs_common::btree_record_range(
+            &attr_buf[leaf_off..leaf_off + node_size],
+            node_size,
+            0,
+        );
+        let abs = leaf_off + rec_start;
+        let key_len = BigEndian::read_u16(&attr_buf[abs..abs + 2]) as usize;
+        let cnid = BigEndian::read_u32(&attr_buf[abs + 4..abs + 8]);
+        let name_len = BigEndian::read_u16(&attr_buf[abs + 12..abs + 14]) as usize;
+        let data_off = abs + 2 + key_len;
+        // Inline-data record body: recordType(4) + reserved(8) + attrSize(4) + attrData.
+        let attr_size = BigEndian::read_u32(&attr_buf[data_off + 12..data_off + 16]) as usize;
+        let value = attr_buf[data_off + 16..data_off + 16 + attr_size].to_vec();
+        let _ = name_len;
+        Some((cnid, value))
+    }
+
+    /// Fork-style xattrs trip a clear `Unsupported` error rather than
+    /// silently dropping. Mirrors Step 13's editing-side limitation.
+    #[test]
+    fn build_metadata_refuses_fork_style_xattr() {
+        use super::super::hfsplus::{ExtentDescriptor, ForkData, XattrKind, XattrRecord};
+        use super::super::hfsplus_clone::{
+            SourceCatalogSnapshot, SourceDirSnapshot, SourceFileSnapshot, SourceVolumeSnapshot,
+        };
+
+        let mut data_fork_raw = [0u8; 80];
+        BigEndian::write_u64(&mut data_fork_raw[0..8], 0);
+        let f = SourceFileSnapshot {
+            name: "f".into(),
+            name_utf16: "f".encode_utf16().collect(),
+            cnid: 100,
+            parent_cnid: 2,
+            flags: 0,
+            finder_info: [0u8; 16],
+            extended_finder_info: [0u8; 16],
+            bsd_info: [0u8; 16],
+            create_date: 0,
+            content_mod_date: 0,
+            attribute_mod_date: 0,
+            access_date: 0,
+            backup_date: 0,
+            text_encoding: 0,
+            data_fork_raw,
+            rsrc_fork_raw: [0u8; 80],
+            data_fork_size: 0,
+            rsrc_fork_size: 0,
+            xattrs: vec![XattrRecord {
+                name: "com.apple.bigxattr".into(),
+                start_block: 0,
+                kind: XattrKind::Fork(ForkData {
+                    logical_size: 16384,
+                    clump_size: 0,
+                    total_blocks: 4,
+                    extents: [ExtentDescriptor {
+                        start_block: 0,
+                        block_count: 0,
+                    }; 8],
+                }),
+            }],
+            is_inode: false,
+            inode_num: None,
+        };
+        let root = SourceDirSnapshot {
+            name: "T".into(),
+            name_utf16: "T".encode_utf16().collect(),
+            cnid: 2,
+            parent_cnid: 1,
+            valence: 1,
+            flags: 0,
+            finder_info: [0u8; 16],
+            extended_finder_info: [0u8; 16],
+            bsd_info: [0u8; 16],
+            create_date: 0,
+            content_mod_date: 0,
+            attribute_mod_date: 0,
+            access_date: 0,
+            backup_date: 0,
+            text_encoding: 0,
+            xattrs: Vec::new(),
+            is_dir_inode: false,
+            inode_num: None,
+        };
+        let snap = SourceCatalogSnapshot {
+            volume: SourceVolumeSnapshot {
+                label: "T".into(),
+                signature: 0x482B,
+                attributes: 0x100,
+                create_date: 0,
+                modify_date: 0,
+                backup_date: 0,
+                checked_date: 0,
+                finder_info: [0u32; 8],
+                block_size: 4096,
+                total_blocks: 0,
+                file_count: 1,
+                folder_count: 0,
+                boot_blocks: [0u8; 1024],
+                catalog_total_blocks: 4,
+                extents_total_blocks: 4,
+                attributes_total_blocks: 4,
+            },
+            dirs: vec![root],
+            files: vec![f],
+            hardlinks: Vec::new(),
+            dir_hardlinks: Vec::new(),
+        };
+        let plan = plan_defrag_layout(&snap, 8 * 1024 * 1024).unwrap();
+        let err = build_target_metadata(&plan, &snap)
+            .expect_err("fork-style xattr must trip Unsupported");
+        match err {
+            FilesystemError::Unsupported(msg) => {
+                assert!(
+                    msg.contains("fork-style") || msg.contains("inline"),
+                    "unexpected error: {msg}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_metadata_handles_plain_blank() {
         let mut img = create_blank_hfsplus(32 * 1024 * 1024, 4096, "Plain", false);
         let cur = Cursor::new(&mut img);
         let mut fs = HfsPlusFilesystem::open(cur, 0).unwrap();
         let snap = SourceCatalogSnapshot::capture(&mut fs).unwrap();
         let plan = plan_defrag_layout(&snap, 8 * 1024 * 1024).unwrap();
-        // Plain blank → build succeeds.
         build_target_metadata(&plan, &snap).expect("plain blank should build");
     }
 

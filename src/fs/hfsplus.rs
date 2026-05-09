@@ -47,7 +47,7 @@ const HFSPLUS_FORK_DATA: u8 = 0x00;
 const HFSPLUS_FORK_RESOURCE: u8 = 0xFF;
 
 /// Attributes B-tree record types (per Apple TN1150 / `hfs_format.h`).
-const HFSPLUS_ATTR_INLINE_DATA: u32 = 0x10;
+pub(crate) const HFSPLUS_ATTR_INLINE_DATA: u32 = 0x10;
 #[allow(dead_code)] // matched by Step 13 (xattr writes); kept for completeness
 const HFSPLUS_ATTR_FORK_DATA: u32 = 0x20;
 #[allow(dead_code)]
@@ -1879,7 +1879,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
     /// Both arguments are full record bytes (or trimmed index records); the
     /// 2-byte key_len prefix lives at offset 0..2 and the key body at 2..2+keyLen.
     /// Key body layout: pad(2) + fileID(4) + startBlock(4) + nameLen(2) + name(UTF-16BE).
-    fn attr_compare(a: &[u8], b: &[u8]) -> Ordering {
+    pub(crate) fn attr_compare(a: &[u8], b: &[u8]) -> Ordering {
         if a.len() < 14 || b.len() < 14 {
             return a.len().cmp(&b.len());
         }
@@ -1909,7 +1909,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
     ///
     /// Caller is expected to have already NFD-normalized `name` if needed; we
     /// re-normalize defensively so on-disk keys stay canonical.
-    fn build_inline_attr_record(cnid: u32, name: &str, value: &[u8]) -> Vec<u8> {
+    pub(crate) fn build_inline_attr_record(cnid: u32, name: &str, value: &[u8]) -> Vec<u8> {
         let nfd: String = name.nfd().collect();
         let utf16: Vec<u16> = nfd.encode_utf16().collect();
         let key_body_len = 12 + utf16.len() * 2;

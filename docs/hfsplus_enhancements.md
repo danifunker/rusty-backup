@@ -421,7 +421,7 @@ A cleanly-unmounted journaled volume is *accepted* — the journal is empty/repl
 
 #### Step 22c-i — Hardlink emit (file + directory)
 
-- [ ] **Goal:** `build_target_metadata` emits hardlink topology: each file inode under `\0\0\0\0HFS+ Private Data` once, with N catalog stub rows pointing at it via `bsdInfo.special = inode_num`; same for directory inodes under `.HFS+ Private Directory Data\r`.
+- [x] **Goal:** `build_target_metadata` emits hardlink topology: each file inode under `\0\0\0\0HFS+ Private Data` once, with N catalog stub rows pointing at it via `bsdInfo.special = inode_num`; same for directory inodes under `.HFS+ Private Directory Data\r`.
 
 **Files:** `src/fs/hfsplus_defrag.rs`
 
@@ -440,7 +440,7 @@ A cleanly-unmounted journaled volume is *accepted* — the journal is empty/repl
 
 #### Step 22c-ii — Xattr emit
 
-- [ ] **Goal:** `build_target_metadata` emits inline extended attributes onto every captured CNID's remapped target CNID, populating the target's attributes B-tree.
+- [x] **Goal:** `build_target_metadata` emits inline extended attributes onto every captured CNID's remapped target CNID, populating the target's attributes B-tree.
 
 **Files:** `src/fs/hfsplus_defrag.rs`, possibly `src/fs/hfsplus.rs` (if the existing inline-xattr record builder isn't already exposed)
 
