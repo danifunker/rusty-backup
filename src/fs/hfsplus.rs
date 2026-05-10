@@ -35,6 +35,17 @@ pub(crate) const HFSPLUS_VOLUME_JOURNALED_BIT: u32 = 0x2000;
 /// (it triggers a "needs scavenging" path).
 pub(crate) const HFSPLUS_VOLUME_UNMOUNTED_BIT: u32 = 0x100;
 
+/// `kHFSBootVolumeInconsistentBit` — set by Mac OS while a volume is
+/// mounted; cleared on clean unmount. Must be cleared on sync so the
+/// volume isn't flagged for repair on next mount.
+pub(crate) const HFSPLUS_BOOT_VOLUME_INCONSISTENT_BIT: u32 = 0x800;
+
+/// `kHFSVolumeInconsistentBit` — newer companion to the boot-inconsistent
+/// bit; Mac OS sets it when the volume is in a transient inconsistent
+/// state (mid-mount, mid-write). Must be cleared on sync so Disk Utility
+/// doesn't refuse to mount the volume.
+pub(crate) const HFSPLUS_VOLUME_INCONSISTENT_BIT: u32 = 0x4000;
+
 /// HFS+ B-tree `keyCompareType` byte values (BTHeaderRec offset 37 in
 /// node 0). Plain HFS+ uses case-folding NFD compare; HFSX with the
 /// case-sensitive attribute uses binary compare.
@@ -432,6 +443,28 @@ const HFSPLUS_HARDLINK_DIR_TYPE: &[u8; 4] = b"fdrp";
 /// Magic 4-byte creator code on directory hardlink stubs.
 const HFSPLUS_HARDLINK_DIR_CREATOR: &[u8; 4] = b"MACS";
 
+/// Free-function form of `HfsPlusFilesystem::catalog_compare`, callable
+/// from sibling modules (e.g. `hfsplus_fsck`) that only have the raw
+/// catalog bytes and no `<R>`-typed filesystem instance.
+pub(crate) fn catalog_compare_keys(a: &[u8], b: &[u8], case_sensitive: bool) -> Ordering {
+    if a.len() < 8 || b.len() < 8 {
+        return a.len().cmp(&b.len());
+    }
+    let parent_a = BigEndian::read_u32(&a[2..6]);
+    let parent_b = BigEndian::read_u32(&b[2..6]);
+    let name_len_a = BigEndian::read_u16(&a[6..8]) as usize;
+    let name_len_b = BigEndian::read_u16(&b[6..8]) as usize;
+    let name_a: Vec<u16> = a[8..8 + name_len_a.min((a.len() - 8) / 2) * 2]
+        .chunks_exact(2)
+        .map(BigEndian::read_u16)
+        .collect();
+    let name_b: Vec<u16> = b[8..8 + name_len_b.min((b.len() - 8) / 2) * 2]
+        .chunks_exact(2)
+        .map(BigEndian::read_u16)
+        .collect();
+    hfs_common::compare_hfsplus_keys(parent_a, &name_a, parent_b, &name_b, case_sensitive)
+}
+
 /// Name of the hidden directory at the volume root that stores HFS+ file
 /// hardlink inodes (TN1150). Four NUL bytes followed by ASCII text — the
 /// nulls keep the directory invisible to clients that ignore zero-byte
@@ -747,6 +780,10 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
 
     pub(crate) fn catalog_first_leaf(&self) -> u32 {
         self.catalog_header.first_leaf_node
+    }
+
+    pub(crate) fn case_sensitive_catalog(&self) -> bool {
+        self.case_sensitive()
     }
 
     /// Read the first 1024 bytes of the partition (HFS+ "boot blocks" —
@@ -2473,6 +2510,16 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
     /// Sync metadata: write catalog + allocation bitmap + volume header + flush.
     fn do_sync_metadata(&mut self) -> Result<(), FilesystemError> {
         self.vh.modify_date = hfs_common::hfs_now();
+        // Stamp clean-unmount state into the volume header. Without this,
+        // a VH read from a mounted/dirty volume (bit 8 clear, bits 11/14
+        // set) gets persisted as-is and Disk Utility refuses to mount the
+        // result. Mirrors the unconditional `drAtrbUmounted` set in
+        // classic HFS `write_mdb`. See ~/Downloads/HFSTests/ corruption
+        // case (2026-05): rusty-backup edit on /dev/rdisk preserved
+        // attributes 0x80004000 instead of writing 0x80000100.
+        self.vh.attributes |= HFSPLUS_VOLUME_UNMOUNTED_BIT;
+        self.vh.attributes &= !HFSPLUS_BOOT_VOLUME_INCONSISTENT_BIT;
+        self.vh.attributes &= !HFSPLUS_VOLUME_INCONSISTENT_BIT;
         self.write_catalog()?;
         self.write_extents_overflow()?;
         self.write_attributes()?;
@@ -4016,6 +4063,40 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
 
         validate_hfsplus_create_name(name)?;
 
+        // Diagnostic: refuse to create a second `\0\0\0\0HFS+ Private Data`
+        // or `.HFS+ Private Directory Data\r` directory at the volume root.
+        // The hardlink subsystem is the only legitimate creator of these
+        // magic-named directories (via `ensure_private_dir`), and it walks
+        // `list_directory(root)` to detect an existing one before falling
+        // back to create. If `find_catalog_record` later misses it (e.g.
+        // due to a key-compare quirk), the resulting duplicate is the bug
+        // observed in HFSTest6 (2026-05). Belt-and-suspenders: in addition
+        // to the find_catalog_record check below, scan root by CNID-aware
+        // lookup so neither a name-fold mismatch nor a misplaced record
+        // slips through. See docs/hfs_write_tweaks.md.
+        if parent_cnid == 2
+            && (name == hfsplus_private_dir_name() || name == hfsplus_dir_private_dir_name())
+        {
+            let already_present = self
+                .find_private_dir_cnid()?
+                .filter(|_| name == hfsplus_private_dir_name())
+                .is_some()
+                || self
+                    .find_dir_private_dir_cnid()?
+                    .filter(|_| name == hfsplus_dir_private_dir_name())
+                    .is_some();
+            if already_present {
+                let bt = std::backtrace::Backtrace::force_capture();
+                log::error!(
+                    "[HFS+] refused create_directory for magic name (already \
+                     present). parent_cnid={}, leading NULs={}\nbacktrace:\n{bt}",
+                    parent_cnid,
+                    name.chars().take_while(|c| *c == '\0').count()
+                );
+                return Err(FilesystemError::AlreadyExists(name.into()));
+            }
+        }
+
         // Check duplicates
         if self.find_catalog_record(parent_cnid, name).is_some() {
             return Err(FilesystemError::AlreadyExists(name.into()));
@@ -4747,7 +4828,12 @@ fn build_blank_hfsplus_front(
         backup_date: 0,
         checked_date: now,
         file_count: 0,
-        folder_count: 1, // root folder
+        // Per Apple TN1150, folder_count EXCLUDES the root directory.
+        // Matches what macOS / Disk Utility / fsck_hfs expect on a fresh
+        // volume; mismatching this causes false-positive
+        // FolderCountMismatch reports when fsck'ing volumes created
+        // elsewhere and edited here.
+        folder_count: 0,
         block_size,
         total_blocks,
         free_blocks: total_blocks - reserved_blocks,
@@ -5312,7 +5398,7 @@ mod tests {
             backup_date: 0,
             checked_date: 0,
             file_count: 0,
-            folder_count: 1, // root folder
+            folder_count: 0, // Apple TN1150: excludes root
             block_size,
             total_blocks,
             free_blocks: total_blocks - alloc_blocks,
@@ -5830,6 +5916,39 @@ mod tests {
         assert!(
             err.contains("dirty") || err.contains("journal"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_sync_metadata_stamps_clean_unmount_attributes() {
+        // Regression: an HFS+ volume opened from a "mounted/dirty" on-disk
+        // state (bit 8 clear, bit 14 set) must be persisted as cleanly
+        // unmounted (bit 8 set, bits 11/14 clear) after sync_metadata.
+        // Without this, Disk Utility / fsck_hfs flag the volume as
+        // inconsistent on next mount. See ~/Downloads/HFSTests/ case.
+        let mut img = make_editable_hfsplus_image();
+        let attr_off = 1024 + 4;
+        let dirty = 0x80004000u32 | HFSPLUS_BOOT_VOLUME_INCONSISTENT_BIT;
+        BigEndian::write_u32(&mut img[attr_off..attr_off + 4], dirty);
+
+        let cursor = std::io::Cursor::new(img);
+        let mut fs = HfsPlusFilesystem::open(cursor, 0).expect("open");
+        fs.prepare_for_edit().expect("prep");
+        fs.sync_metadata().expect("sync");
+
+        let img = fs.reader.into_inner();
+        let after = BigEndian::read_u32(&img[attr_off..attr_off + 4]);
+        assert!(
+            after & HFSPLUS_VOLUME_UNMOUNTED_BIT != 0,
+            "unmounted bit must be set after sync, got 0x{after:08x}"
+        );
+        assert!(
+            after & HFSPLUS_VOLUME_INCONSISTENT_BIT == 0,
+            "inconsistent bit must be cleared, got 0x{after:08x}"
+        );
+        assert!(
+            after & HFSPLUS_BOOT_VOLUME_INCONSISTENT_BIT == 0,
+            "boot-inconsistent bit must be cleared, got 0x{after:08x}"
         );
     }
 

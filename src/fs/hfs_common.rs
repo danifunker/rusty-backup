@@ -297,11 +297,51 @@ pub fn encode_fourcc(s: &str) -> [u8; 4] {
 // B-tree key comparison
 // ---------------------------------------------------------------------------
 
+/// Code points that Apple's `FastUnicodeCompare` treats as **ignorable**
+/// during case-folded comparison — they're skipped entirely, as if absent.
+///
+/// Source: Apple's `FastUnicodeCompare.c` `gLowerCaseTable`. The table
+/// maps zero-width / format / variation-selector ranges to 0x0000 (the
+/// algorithm's "skip" sentinel). Latin-letter casing is covered by
+/// `char::to_uppercase` below.
+///
+/// **Note**: U+0000 (NUL) is NOT in this list. Apple's table maps NUL to
+/// 0xFFFF — i.e. NUL is the highest-sorting character, not ignorable.
+/// That's how the on-disk `"\0\0\0\0HFS+ Private Data"` directory ends
+/// up sorting *last* among its parent's children rather than first.
+/// `fold_hfsplus_name_for_compare` rewrites NUL → U+FFFF before the
+/// final uppercase pass to match.
+fn is_hfsplus_ignored(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x00AD
+            | 0x034F
+            | 0x070F
+            | 0x180B..=0x180E
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x206A..=0x206F
+            | 0xFE00..=0xFE0F
+            | 0xFEFF
+    )
+}
+
+fn fold_hfsplus_name_for_compare(name: &[u16]) -> Vec<char> {
+    let s = String::from_utf16_lossy(name);
+    let nfd: String = s.nfd().collect();
+    nfd.chars()
+        .filter(|c| !is_hfsplus_ignored(*c))
+        .map(|c| if c == '\0' { '\u{FFFF}' } else { c })
+        .flat_map(|c| c.to_uppercase())
+        .collect()
+}
+
 /// Compare two HFS+ catalog keys (case-insensitive by default).
 ///
 /// Keys are: parent_cnid (u32) + name (UTF-16BE units).
 /// Comparison: parent CNID first (numeric), then name.
-/// Case-insensitive: NFD decompose, then compare uppercased chars.
+/// Case-insensitive: drop Apple-ignored code points, NFD decompose, then
+/// compare uppercased chars.
 pub fn compare_hfsplus_keys(
     parent_a: u32,
     name_a: &[u16],
@@ -314,17 +354,14 @@ pub fn compare_hfsplus_keys(
         other => return other,
     }
     if case_sensitive {
-        // HFSX binary comparison
+        // HFSX binary comparison — every code point is significant,
+        // including NULs. (Apple's HFSX uses straight UTF-16 binary
+        // compare, no folding, no ignore set.)
         return name_a.cmp(name_b);
     }
-    // Case-insensitive: NFD decompose both names, compare uppercased
-    let str_a = String::from_utf16_lossy(name_a);
-    let str_b = String::from_utf16_lossy(name_b);
-    let nfd_a: String = str_a.nfd().collect();
-    let nfd_b: String = str_b.nfd().collect();
-    let upper_a: Vec<char> = nfd_a.chars().flat_map(|c| c.to_uppercase()).collect();
-    let upper_b: Vec<char> = nfd_b.chars().flat_map(|c| c.to_uppercase()).collect();
-    upper_a.cmp(&upper_b)
+    let folded_a = fold_hfsplus_name_for_compare(name_a);
+    let folded_b = fold_hfsplus_name_for_compare(name_b);
+    folded_a.cmp(&folded_b)
 }
 
 #[allow(dead_code)]
@@ -1704,6 +1741,58 @@ mod tests {
         let a: Vec<u16> = "é".encode_utf16().collect();
         let b: Vec<u16> = "é".nfd().collect::<String>().encode_utf16().collect();
         assert_eq!(compare_hfsplus_keys(2, &a, 2, &b, false), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_compare_hfsplus_keys_private_data_dir_sorts_last() {
+        // Apple's FastUnicodeCompare maps U+0000 to 0xFFFF, so a name
+        // starting with NULs sorts AFTER all printable names with the
+        // same parent CNID. This is how `\0\0\0\0HFS+ Private Data`
+        // ends up at the END of root's children on a Mac-formatted
+        // volume rather than the front. Empirically verified against
+        // OS-formatted images (HFSTest6/TestHFS6-OSCopy.dmg, 2026-05).
+        // Pre-fix, our compare folded NULs as ignorable and our inserts
+        // sorted the dir before printable names — fsck_hfs flagged this
+        // as "key for HFS+ Private Data is out of order."
+        let private: Vec<u16> = "\u{0000}\u{0000}\u{0000}\u{0000}HFS+ Private Data"
+            .encode_utf16()
+            .collect();
+        let alpha: Vec<u16> = "Apple".encode_utf16().collect();
+        let dotted: Vec<u16> = ".HFS+ Private Directory Data\u{D}".encode_utf16().collect();
+        let later: Vec<u16> = "tone.wav".encode_utf16().collect();
+        let way_later: Vec<u16> = "zzz".encode_utf16().collect();
+
+        // All printable parent=2 entries must sort BEFORE NUL+name.
+        for (label, other) in [
+            ("Apple", &alpha),
+            (".HFS+ Private Directory Data\\r", &dotted),
+            ("tone.wav", &later),
+            ("zzz", &way_later),
+        ] {
+            assert_eq!(
+                compare_hfsplus_keys(2, other, 2, &private, false),
+                Ordering::Less,
+                "'{label}' must sort before NUL-prefixed private dir"
+            );
+            assert_eq!(
+                compare_hfsplus_keys(2, &private, 2, other, false),
+                Ordering::Greater,
+                "NUL-prefixed private dir must sort after '{label}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compare_hfsplus_keys_hfsx_binary_keeps_nuls() {
+        // Case-sensitive HFSX uses straight UTF-16 binary compare —
+        // NULs are preserved as 0x0000 there. A leading-NUL name MUST
+        // sort before a printable name in HFSX (binary order).
+        let nul_prefixed: Vec<u16> = "\u{0000}HFS".encode_utf16().collect();
+        let plain: Vec<u16> = "HFS".encode_utf16().collect();
+        assert_eq!(
+            compare_hfsplus_keys(2, &nul_prefixed, 2, &plain, true),
+            Ordering::Less
+        );
     }
 
     #[test]

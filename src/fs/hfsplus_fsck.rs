@@ -48,6 +48,9 @@ enum HfsPlusFsckCode {
     OrphanedEntry,
     OrphanedThread,
     DuplicateCnid,
+    DuplicateCatalogKey,
+    KeyOutOfOrder,
+    ParentValenceMismatch,
     BitmapAllocCountMismatch,
     BitmapTooShort,
 }
@@ -63,6 +66,9 @@ impl HfsPlusFsckCode {
             HfsPlusFsckCode::OrphanedEntry => "OrphanedEntry",
             HfsPlusFsckCode::OrphanedThread => "OrphanedThread",
             HfsPlusFsckCode::DuplicateCnid => "DuplicateCnid",
+            HfsPlusFsckCode::DuplicateCatalogKey => "DuplicateCatalogKey",
+            HfsPlusFsckCode::KeyOutOfOrder => "KeyOutOfOrder",
+            HfsPlusFsckCode::ParentValenceMismatch => "ParentValenceMismatch",
             HfsPlusFsckCode::BitmapAllocCountMismatch => "BitmapAllocCountMismatch",
             HfsPlusFsckCode::BitmapTooShort => "BitmapTooShort",
         }
@@ -113,25 +119,53 @@ pub(super) fn check<R: Read + Seek>(
         let catalog = fs.catalog_data();
         let node_size = fs.catalog_node_size();
         let first_leaf = fs.catalog_first_leaf();
+        let case_sensitive = fs.case_sensitive_catalog();
+        let mut prev_key: Option<(u32, usize, Vec<u8>)> = None;
         walk_leaf_records(
             catalog,
             first_leaf,
             node_size,
-            |_node_idx, _rec_idx, _abs_off, rec| -> Option<()> {
+            |node_idx, rec_idx, abs_off, rec| -> Option<()> {
+                if rec.len() >= 8 {
+                    let key_len = BigEndian::read_u16(&rec[0..2]) as usize;
+                    if 2 + key_len <= rec.len() {
+                        let cur_key = rec[..2 + key_len].to_vec();
+                        if let Some((prev_node, prev_rec, ref prev)) = prev_key {
+                            use std::cmp::Ordering as Ord2;
+                            let cmp = super::hfsplus::catalog_compare_keys(
+                                prev,
+                                &cur_key,
+                                case_sensitive,
+                            );
+                            if cmp != Ord2::Less {
+                                errors.push(issue(
+                                    HfsPlusFsckCode::KeyOutOfOrder,
+                                    format!(
+                                        "leaf record (node={node_idx}, idx={rec_idx}) at \
+                                         offset 0x{abs_off:x} sorts {cmp:?} relative to the \
+                                         preceding record (node={prev_node}, idx={prev_rec}); \
+                                         B-tree leaves must be strictly ascending",
+                                    ),
+                                ));
+                            }
+                        }
+                        prev_key = Some((node_idx, rec_idx, cur_key));
+                    }
+                }
                 walk.visit(rec);
                 None
             },
         );
     }
 
-    // Folder/file counters: this codebase counts the root folder in
-    // VH.folder_count (see hfsplus.rs:3314 — `create_blank_hfsplus`
-    // initializes folder_count = 1 to account for the root). Apple's
-    // TN1150 reads otherwise; we follow the established convention so
-    // round-trips through `create_directory` / `delete_entry`
-    // (lines 2790 / 2867) stay consistent.
+    // Folder/file counters: per Apple TN1150, VH.folder_count EXCLUDES
+    // the root directory (CNID 2). The catalog walk counts every folder
+    // record it visits, including root, so we subtract 1 for the
+    // comparison. `create_blank_hfsplus` / `create_directory` /
+    // `delete_entry` are aligned with this convention.
     let total_folder_count = walk.folder_cnids.len() as u32;
     let total_file_count = walk.file_cnids.len() as u32;
+    let folder_count_excl_root = total_folder_count.saturating_sub(1);
     let vh_folder = fs.vh_folder_count();
     let vh_file = fs.vh_file_count();
     if vh_file != total_file_count {
@@ -140,12 +174,12 @@ pub(super) fn check<R: Read + Seek>(
             format!("VH.file_count = {vh_file} but catalog walk found {total_file_count} files"),
         ));
     }
-    if vh_folder != total_folder_count {
+    if vh_folder != folder_count_excl_root {
         errors.push(issue(
             HfsPlusFsckCode::FolderCountMismatch,
             format!(
-                "VH.folder_count = {vh_folder} but catalog walk found {total_folder_count} \
-                 folders (including root)"
+                "VH.folder_count = {vh_folder} but catalog walk found {folder_count_excl_root} \
+                 folders (excluding root)"
             ),
         ));
     }
@@ -196,6 +230,48 @@ pub(super) fn check<R: Read + Seek>(
                 format!(
                     "thread record targets CNID {thread_cnid} which has no folder \
                      or file record"
+                ),
+            ));
+        }
+    }
+
+    // Duplicate (parent, name) catalog keys. macOS fsck_hfs reports this
+    // as "key for X is out of order" because two records sharing a key
+    // violates the B-tree's strict ordering invariant. Listing each
+    // collision lets users see exactly what got duplicated.
+    for hit in &walk.duplicate_keys {
+        let printable: String = hit
+            .name
+            .bytes()
+            .map(|b| {
+                if (0x20..0x7f).contains(&b) {
+                    (b as char).to_string()
+                } else {
+                    format!("\\x{b:02x}")
+                }
+            })
+            .collect();
+        errors.push(issue(
+            HfsPlusFsckCode::DuplicateCatalogKey,
+            format!(
+                "two catalog records share key (parent={}, name=\"{}\"): CNIDs {} and {}",
+                hit.parent_cnid, printable, hit.cnid_a, hit.cnid_b
+            ),
+        ));
+    }
+
+    // Per-folder valence: each folder record stores a `valence` field
+    // (number of immediate children). Compare against the actual child
+    // count from the walk. A mismatch usually indicates a stale folder
+    // record left over from a botched edit, or a missed valence update.
+    for (cnid, &stored_valence) in &walk.folder_valence {
+        let actual = walk.child_counts.get(cnid).copied().unwrap_or(0);
+        if stored_valence != actual {
+            errors.push(issue(
+                HfsPlusFsckCode::ParentValenceMismatch,
+                format!(
+                    "folder CNID {cnid} stores valence={stored_valence} but catalog \
+                     walk shows {actual} immediate children"
                 ),
             ));
         }
@@ -281,6 +357,28 @@ struct CatalogWalk {
     threads: Vec<u32>,
     duplicate_cnids: HashSet<u32>,
     seen_cnids: HashMap<u32, ()>,
+    /// `(parent_cnid, name_bytes)` keys we've already seen on a folder /
+    /// file record. A second hit means two records share the same catalog
+    /// key, which fsck_hfs flags as "key out of order" because the B-tree
+    /// invariant is violated. Tracked separately from CNIDs so we catch
+    /// the case where two records have *different* CNIDs but the same
+    /// `(parent, name)` — e.g. a stale `\0\0\0\0HFS+ Private Data` left
+    /// behind after a botched edit.
+    seen_keys: HashMap<(u32, Vec<u8>), u32>,
+    duplicate_keys: Vec<DuplicateKeyHit>,
+    /// Per-folder child counts derived from the walk. Compared against
+    /// each folder record's stored `valence` field at the end of phase 2.
+    child_counts: HashMap<u32, u32>,
+    /// Per-folder valence values (as stored in the on-disk folder record).
+    folder_valence: HashMap<u32, u32>,
+}
+
+#[derive(Debug)]
+struct DuplicateKeyHit {
+    parent_cnid: u32,
+    name: String,
+    cnid_a: u32,
+    cnid_b: u32,
 }
 
 struct WalkedEntry {
@@ -291,6 +389,21 @@ struct WalkedEntry {
 }
 
 impl CatalogWalk {
+    fn record_key_seen(&mut self, parent_cnid: u32, name_bytes: &[u8], name_str: &str, cnid: u32) {
+        let key = (parent_cnid, name_bytes.to_vec());
+        match self.seen_keys.insert(key, cnid) {
+            None => {}
+            Some(first_cnid) => {
+                self.duplicate_keys.push(DuplicateKeyHit {
+                    parent_cnid,
+                    name: name_str.to_string(),
+                    cnid_a: first_cnid,
+                    cnid_b: cnid,
+                });
+            }
+        }
+    }
+
     fn visit(&mut self, rec: &[u8]) {
         if rec.len() < 4 {
             return;
@@ -326,9 +439,15 @@ impl CatalogWalk {
                     return;
                 }
                 let cnid = BigEndian::read_u32(&body[8..12]);
+                let valence = BigEndian::read_u32(&body[4..8]);
                 if !self.seen_cnids.insert(cnid, ()).is_none() {
                     self.duplicate_cnids.insert(cnid);
                 }
+                self.record_key_seen(key_parent_cnid, name_bytes, &name, cnid);
+                if key_parent_cnid != ROOT_PARENT_CNID {
+                    *self.child_counts.entry(key_parent_cnid).or_insert(0) += 1;
+                }
+                self.folder_valence.insert(cnid, valence);
                 self.folder_cnids.insert(cnid);
                 self.entries.push(WalkedEntry {
                     cnid,
@@ -345,6 +464,8 @@ impl CatalogWalk {
                 if !self.seen_cnids.insert(cnid, ()).is_none() {
                     self.duplicate_cnids.insert(cnid);
                 }
+                self.record_key_seen(key_parent_cnid, name_bytes, &name, cnid);
+                *self.child_counts.entry(key_parent_cnid).or_insert(0) += 1;
                 self.file_cnids.insert(cnid);
                 self.entries.push(WalkedEntry {
                     cnid,
