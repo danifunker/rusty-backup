@@ -304,6 +304,28 @@ impl EditQueue {
         self.edits.len() < before
     }
 
+    /// Remove the pending add at `entry_path` plus every pending edit nested
+    /// underneath it (used when the user unstages a pending directory — its
+    /// staged children would otherwise become orphans whose `parent.path` no
+    /// longer resolves at apply time). Returns the number of edits removed.
+    pub fn remove_pending_subtree(&mut self, entry_path: &str) -> usize {
+        let prefix = if entry_path == "/" {
+            "/".to_string()
+        } else {
+            format!("{entry_path}/")
+        };
+        let before = self.edits.len();
+        self.edits.retain(|edit| match edit {
+            StagedEdit::AddFile { parent, name, .. }
+            | StagedEdit::CreateDirectory { parent, name, .. } => {
+                let path = Self::pending_path(&parent.path, name);
+                path != entry_path && !path.starts_with(&prefix)
+            }
+            _ => true,
+        });
+        before - self.edits.len()
+    }
+
     /// Imported resource fork attached to the pending `AddFile` at `entry_path`.
     pub fn pending_resource_fork_for(&self, entry_path: &str) -> Option<&ImportedResourceFork> {
         self.edits.iter().find_map(|edit| match edit {

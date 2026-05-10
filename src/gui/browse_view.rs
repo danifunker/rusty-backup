@@ -1077,7 +1077,30 @@ impl BrowseView {
         };
 
         let text = egui::RichText::new(&label).color(color);
-        if ui.selectable_label(is_selected, text).clicked() {
+
+        if entry.is_directory() {
+            // Pending directories collapse open just like real ones, and their
+            // staged children render underneath via recursion.
+            let id = ui.make_persistent_id(("pending-dir", &entry.path));
+            let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                id,
+                true,
+            );
+            let header_res = ui.horizontal(|ui| {
+                state.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
+                if ui.selectable_label(is_selected, text).clicked() {
+                    self.selected_entry = Some(entry.clone());
+                    self.content = None;
+                }
+            });
+            state.show_body_indented(&header_res.response, ui, |ui| {
+                let nested = self.staged_edits.pending_adds_for(&entry.path);
+                for child in &nested {
+                    self.render_pending_add_entry(ui, child);
+                }
+            });
+        } else if ui.selectable_label(is_selected, text).clicked() {
             // Allow selecting pending-add entries (for unstaging via delete)
             self.selected_entry = Some(entry.clone());
             self.content = None;
@@ -1930,10 +1953,25 @@ impl BrowseView {
                 .clicked()
             {
                 if let Some(ref sel) = self.selected_entry.clone() {
-                    // If it's a pending-add, just remove it from staged_edits
+                    // If it's a pending-add, just remove it from staged_edits.
+                    // For pending directories, also drop every nested staged
+                    // edit so we don't leave AddFile orphans whose parent.path
+                    // no longer resolves at apply time.
                     if self.staged_edits.is_pending_add(&sel.path) {
-                        self.staged_edits.remove_pending_add(&sel.path);
-                        self.edit_result = Some(format!("Unstaged '{}'", sel.name));
+                        let removed = if sel.is_directory() {
+                            self.staged_edits.remove_pending_subtree(&sel.path)
+                        } else {
+                            self.staged_edits.remove_pending_add(&sel.path) as usize
+                        };
+                        self.edit_result = if sel.is_directory() && removed > 1 {
+                            Some(format!(
+                                "Unstaged '{}' and {} nested edit(s)",
+                                sel.name,
+                                removed - 1
+                            ))
+                        } else {
+                            Some(format!("Unstaged '{}'", sel.name))
+                        };
                         self.selected_entry = None;
                         self.content = None;
                     } else {
