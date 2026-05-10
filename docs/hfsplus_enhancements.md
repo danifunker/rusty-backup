@@ -468,7 +468,7 @@ A cleanly-unmounted journaled volume is *accepted* — the journal is empty/repl
 
 #### Step 22d — Streaming emit engine
 
-- [ ] **Goal:** `pub fn stream_defragmented_hfsplus<R, W>(source: &mut HfsPlusFilesystem<R>, target_size: u64, dst: &mut W) -> Result<DefragReport>` drives the planner + builder, then forward-only emits into `dst`.
+- [x] **Goal:** `pub fn stream_defragmented_hfsplus<R, W>(source: &mut HfsPlusFilesystem<R>, target_size: u64, dst: &mut W) -> Result<DefragReport>` drives the planner + builder, then forward-only emits into `dst`.
 
 **Files:** `src/fs/hfsplus_defrag.rs`
 

@@ -14,10 +14,13 @@
 //!    image into a `Write` sink with user-fork bytes streamed straight
 //!    from source via `HfsPlusFilesystem::fork_stream_reader`.
 //!
-//! This module currently provides only step 22b (the planner). Steps
-//! 22c/22d follow in subsequent sessions.
+//! Steps 22a (pre-flight refusal), 22b (planner), 22c (in-memory
+//! metadata builder including hardlinks + xattrs), and 22d (forward-only
+//! emit engine) are wired up; the round-trip integration test lands in
+//! 22e.
 
 use std::collections::HashMap;
+use std::io::{Read, Seek, Write};
 
 use super::hfsplus_clone::{
     SourceCatalogSnapshot, SourceDirHardlinkSnapshot, SourceDirSnapshot, SourceFileSnapshot,
@@ -760,6 +763,298 @@ pub fn build_target_metadata(
         attributes,
         vh_bytes,
     })
+}
+
+// ----------------------------------------------------------------------
+// Step 22d — streaming emit engine.
+// ----------------------------------------------------------------------
+
+/// Outcome of [`stream_defragmented_hfsplus`]. Counts mirror the source
+/// snapshot — every captured directory, file, hardlink stub, and xattr
+/// is reflected in the emitted target.
+#[derive(Debug, Default, Clone)]
+pub struct DefragReport {
+    pub files_copied: u64,
+    pub dirs_copied: u64,
+    pub data_bytes_copied: u64,
+    pub rsrc_bytes_copied: u64,
+    pub xattrs_copied: u64,
+    pub hardlinks_copied: u64,
+    pub dir_hardlinks_copied: u64,
+    /// Total bytes emitted into the writer. Always equals `target_size`
+    /// (the function refuses to short-write).
+    pub bytes_emitted: u64,
+}
+
+/// Stream a defragmented copy of `source` into `dst` as exactly
+/// `target_size` bytes. Combines the planner (22b), the in-memory
+/// metadata builder (22c), and a forward-only emit pass that interleaves
+/// the metadata regions with user-fork bytes streamed from `source`.
+///
+/// The output is a flat HFS+ image suitable for opening with
+/// [`HfsPlusFilesystem::open`] (no APM wrapper is added — that's the
+/// caller's job, e.g. via [`emit_apm_disk_with_hfs`]).
+///
+/// Pre-conditions:
+/// - `source` is opened read-only; the function never mutates it.
+/// - `target_size` is a multiple of `source`'s block size and large
+///   enough to hold every captured fork (validated inside the planner).
+///
+/// `dst` only needs `Write` — emission is single-pass and never seeks.
+pub fn stream_defragmented_hfsplus<R, W>(
+    source: &mut HfsPlusFilesystem<R>,
+    target_size: u64,
+    dst: &mut W,
+) -> Result<DefragReport, FilesystemError>
+where
+    R: Read + Seek + Send,
+    W: Write,
+{
+    let snapshot = SourceCatalogSnapshot::capture(source)?;
+    let plan = plan_defrag_layout(&snapshot, target_size)
+        .map_err(|e| FilesystemError::InvalidData(format!("defrag plan failed: {e}")))?;
+    let meta = build_target_metadata(&plan, &snapshot)?;
+
+    let bs = plan.block_size as u64;
+    let mut writer = CountingWriter::new(dst);
+
+    // Block 0 — boot blocks + primary VH (already padded to block_size).
+    writer.write_all(&meta.block_zero)?;
+    debug_assert_eq!(writer.bytes_written, bs);
+
+    // Bitmap, catalog, extents-overflow, attributes — back-to-back per
+    // the planner's region layout (no gaps).
+    assert_region(
+        writer.bytes_written,
+        plan.bitmap_start as u64 * bs,
+        "bitmap_start",
+    )?;
+    writer.write_all(&meta.bitmap)?;
+    assert_region(
+        writer.bytes_written,
+        plan.catalog_start as u64 * bs,
+        "catalog_start",
+    )?;
+    writer.write_all(&meta.catalog)?;
+    assert_region(
+        writer.bytes_written,
+        plan.extents_start as u64 * bs,
+        "extents_start",
+    )?;
+    writer.write_all(&meta.extents_overflow)?;
+    // `plan.attributes_start` is a sentinel zero when the source had no
+    // xattrs (planner convention) — only assert the boundary when the
+    // attributes file actually exists.
+    if plan.attributes_blocks > 0 {
+        assert_region(
+            writer.bytes_written,
+            plan.attributes_start as u64 * bs,
+            "attributes_start",
+        )?;
+    }
+    if let Some(attrs) = meta.attributes.as_ref() {
+        writer.write_all(attrs)?;
+    }
+    assert_region(
+        writer.bytes_written,
+        plan.user_data_start as u64 * bs,
+        "user_data_start",
+    )?;
+
+    // Build an emission schedule for the user-data area: every fork the
+    // planner placed, sorted by start_block. Forks pack contiguously
+    // from `user_data_start`, but we still defensively zero-fill any
+    // gap between the previous fork's end and the next fork's start.
+    struct ForkEmit<'a> {
+        start_block: u32,
+        block_count: u32,
+        logical_size: u64,
+        source_cnid: u32,
+        fork_kind: u8,
+        fork_raw: &'a [u8; 80],
+    }
+
+    let mut emits: Vec<ForkEmit<'_>> = Vec::new();
+    for f in &snapshot.files {
+        let placement = plan
+            .file_placements
+            .get(&f.cnid)
+            .ok_or_else(|| missing_cnid("file", f.cnid))?;
+        if let Some(d) = placement.data_fork {
+            emits.push(ForkEmit {
+                start_block: d.start_block,
+                block_count: d.block_count,
+                logical_size: d.logical_size,
+                source_cnid: f.cnid,
+                fork_kind: HFSPLUS_FORK_DATA,
+                fork_raw: &f.data_fork_raw,
+            });
+        }
+        if let Some(r) = placement.rsrc_fork {
+            emits.push(ForkEmit {
+                start_block: r.start_block,
+                block_count: r.block_count,
+                logical_size: r.logical_size,
+                source_cnid: f.cnid,
+                fork_kind: HFSPLUS_FORK_RESOURCE,
+                fork_raw: &f.rsrc_fork_raw,
+            });
+        }
+    }
+    emits.sort_by_key(|e| e.start_block);
+
+    let mut report = DefragReport {
+        files_copied: snapshot.files.iter().filter(|f| !f.is_inode).count() as u64,
+        dirs_copied: snapshot
+            .dirs
+            .iter()
+            .filter(|d| d.cnid != 2 && !d.is_dir_inode)
+            .count() as u64,
+        hardlinks_copied: snapshot.hardlinks.len() as u64,
+        dir_hardlinks_copied: snapshot.dir_hardlinks.len() as u64,
+        xattrs_copied: snapshot
+            .files
+            .iter()
+            .map(|f| f.xattrs.len() as u64)
+            .sum::<u64>()
+            + snapshot
+                .dirs
+                .iter()
+                .map(|d| d.xattrs.len() as u64)
+                .sum::<u64>()
+            + snapshot
+                .hardlinks
+                .iter()
+                .map(|h| h.xattrs.len() as u64)
+                .sum::<u64>()
+            + snapshot
+                .dir_hardlinks
+                .iter()
+                .map(|h| h.xattrs.len() as u64)
+                .sum::<u64>(),
+        ..DefragReport::default()
+    };
+
+    for emit in &emits {
+        let target_offset = emit.start_block as u64 * bs;
+        let cursor = writer.bytes_written;
+        if target_offset > cursor {
+            zero_fill(&mut writer, target_offset - cursor)?;
+        } else if target_offset < cursor {
+            return Err(FilesystemError::InvalidData(format!(
+                "defrag emit overlap: fork at block {} starts before cursor at byte {}",
+                emit.start_block, cursor
+            )));
+        }
+
+        // Stream `logical_size` bytes from source, then zero-pad to
+        // `block_count * bs` so the next fork lands on its planned block.
+        let mut reader =
+            source.fork_stream_reader(emit.source_cnid, emit.fork_kind, emit.fork_raw)?;
+        let copied = std::io::copy(&mut reader, &mut writer)?;
+        if copied != emit.logical_size {
+            return Err(FilesystemError::InvalidData(format!(
+                "defrag emit short read: file {} fork {:#x}: expected {} bytes, got {}",
+                emit.source_cnid, emit.fork_kind, emit.logical_size, copied
+            )));
+        }
+        let extent_bytes = emit.block_count as u64 * bs;
+        if copied > extent_bytes {
+            return Err(FilesystemError::InvalidData(format!(
+                "defrag emit overflow: file {} fork {:#x}: {} bytes copied exceeds extent {}",
+                emit.source_cnid, emit.fork_kind, copied, extent_bytes
+            )));
+        }
+        zero_fill(&mut writer, extent_bytes - copied)?;
+
+        match emit.fork_kind {
+            HFSPLUS_FORK_DATA => report.data_bytes_copied += copied,
+            HFSPLUS_FORK_RESOURCE => report.rsrc_bytes_copied += copied,
+            _ => {}
+        }
+    }
+
+    // Zero-pad from the end of the last user fork up to the alt-VH
+    // region (last 1024 bytes of the volume).
+    let alt_vh_offset = target_size.saturating_sub(1024);
+    let cursor = writer.bytes_written;
+    if cursor > alt_vh_offset {
+        return Err(FilesystemError::InvalidData(format!(
+            "defrag emit overran into alt-VH region: cursor {cursor} > alt offset {alt_vh_offset}"
+        )));
+    }
+    zero_fill(&mut writer, alt_vh_offset - cursor)?;
+    writer.write_all(&meta.vh_bytes)?;
+    let trailing = target_size - writer.bytes_written;
+    zero_fill(&mut writer, trailing)?;
+
+    if writer.bytes_written != target_size {
+        return Err(FilesystemError::InvalidData(format!(
+            "defrag emit byte count mismatch: wrote {}, expected {}",
+            writer.bytes_written, target_size
+        )));
+    }
+    report.bytes_emitted = writer.bytes_written;
+    Ok(report)
+}
+
+/// HFS+ fork-type bytes (mirrors the constants in `hfsplus_clone.rs`).
+const HFSPLUS_FORK_DATA: u8 = 0x00;
+const HFSPLUS_FORK_RESOURCE: u8 = 0xFF;
+
+/// Wraps a `Write` and tracks total bytes emitted. The streaming emit
+/// engine relies on the running count for region-boundary debug
+/// assertions and for computing zero-fill spans.
+struct CountingWriter<'a, W: Write> {
+    inner: &'a mut W,
+    bytes_written: u64,
+}
+
+impl<'a, W: Write> CountingWriter<'a, W> {
+    fn new(inner: &'a mut W) -> Self {
+        Self {
+            inner,
+            bytes_written: 0,
+        }
+    }
+}
+
+impl<'a, W: Write> Write for CountingWriter<'a, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.bytes_written += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Verify that the streaming cursor lands exactly on the planned region
+/// boundary. Catches metadata-buffer length drift between the planner
+/// and the builder before we emit a malformed image.
+fn assert_region(actual: u64, expected: u64, name: &str) -> Result<(), FilesystemError> {
+    if actual != expected {
+        return Err(FilesystemError::InvalidData(format!(
+            "defrag emit cursor at {actual} but planner placed {name} at {expected}"
+        )));
+    }
+    Ok(())
+}
+
+/// Emit `n` zero bytes to `writer` using a 64 KiB scratch buffer.
+fn zero_fill<W: Write>(writer: &mut W, n: u64) -> std::io::Result<()> {
+    if n == 0 {
+        return Ok(());
+    }
+    const BUF: [u8; 65536] = [0u8; 65536];
+    let mut left = n;
+    while left > 0 {
+        let chunk = left.min(BUF.len() as u64) as usize;
+        writer.write_all(&BUF[..chunk])?;
+        left -= chunk as u64;
+    }
+    Ok(())
 }
 
 // ----------------------------------------------------------------------
@@ -1899,5 +2194,74 @@ mod tests {
             PlanError::TargetNotBlockAligned(_) => {}
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    /// Smoke test for [`stream_defragmented_hfsplus`]: emit a forward-only
+    /// image into a `Vec<u8>`, reopen it as `HfsPlusFilesystem`, and
+    /// verify dirs, files, and fork bytes round-trip. The full fixture
+    /// (xattrs + hardlinks + fragmented forks + fsck) lands in 22e.
+    #[test]
+    fn stream_emit_round_trips_dirs_and_files() {
+        let mut src_img = create_blank_hfsplus(32 * 1024 * 1024, 4096, "Stream", false);
+        {
+            let cur = Cursor::new(&mut src_img);
+            let mut fs = HfsPlusFilesystem::open(cur, 0).unwrap();
+            fs.prepare_for_edit().unwrap();
+            let root = fs.root().unwrap();
+            let _ = fs
+                .create_directory(&root, "Docs", &CreateDirectoryOptions::default())
+                .unwrap();
+            let payload_a = b"hello\n";
+            let mut a = Cursor::new(payload_a.as_ref());
+            fs.create_file(
+                &root,
+                "a.txt",
+                &mut a,
+                payload_a.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            let payload_b = vec![0xCDu8; 5000]; // > 1 block, exercises padding
+            let mut b = Cursor::new(&payload_b);
+            fs.create_file(
+                &root,
+                "b.bin",
+                &mut b,
+                payload_b.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            fs.sync_metadata().unwrap();
+        }
+
+        let cur = Cursor::new(&mut src_img);
+        let mut src_fs = HfsPlusFilesystem::open(cur, 0).unwrap();
+
+        let target_size: u64 = 8 * 1024 * 1024;
+        let mut out: Vec<u8> = Vec::with_capacity(target_size as usize);
+        let report = stream_defragmented_hfsplus(&mut src_fs, target_size, &mut out)
+            .expect("stream emit should succeed");
+        assert_eq!(out.len() as u64, target_size, "emit size mismatch");
+        assert_eq!(report.bytes_emitted, target_size);
+        assert_eq!(report.files_copied, 2);
+        assert_eq!(report.dirs_copied, 1);
+        assert_eq!(report.data_bytes_copied, 6 + 5000);
+
+        let cur = Cursor::new(out);
+        let mut tgt = HfsPlusFilesystem::open(cur, 0).expect("target opens");
+        let root = tgt.root().expect("root");
+        let kids = tgt.list_directory(&root).expect("list root");
+        let names: Vec<&str> = kids.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"Docs"));
+        assert!(names.contains(&"a.txt"));
+        assert!(names.contains(&"b.bin"));
+
+        let a = kids.iter().find(|e| e.name == "a.txt").unwrap().clone();
+        let bytes = tgt.read_file(&a, usize::MAX).expect("read a.txt");
+        assert_eq!(bytes, b"hello\n");
+        let b = kids.iter().find(|e| e.name == "b.bin").unwrap().clone();
+        let bytes = tgt.read_file(&b, usize::MAX).expect("read b.bin");
+        assert_eq!(bytes.len(), 5000);
+        assert!(bytes.iter().all(|&x| x == 0xCD));
     }
 }
