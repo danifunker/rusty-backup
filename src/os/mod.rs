@@ -623,9 +623,18 @@ pub fn open_target_for_writing(path: &Path) -> Result<DeviceWriteHandle> {
     let is_device = path_str.starts_with("/dev/") || path_str.starts_with("\\\\.\\");
 
     if !is_device {
-        // Regular file — just create/truncate
-        let file =
-            File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+        // Regular file — create/truncate AND open read+write. Restore's
+        // `reconstruct_disk_from_backup` calls `patch_hidden_sectors_for`
+        // after the per-partition write, which needs to *read* the boot
+        // sector to detect FAT/NTFS/exFAT signatures. A write-only handle
+        // (the `File::create` default on Unix) returns EBADF on read.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .with_context(|| format!("failed to create {}", path.display()))?;
         return Ok(DeviceWriteHandle::from_file(file));
     }
 

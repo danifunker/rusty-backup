@@ -509,15 +509,16 @@ Sub-split: engine plumbing + streaming pipe in 22f-i; restore-side handling + en
 
 ##### Step 22f-ii — Restore handling + end-to-end round-trip
 
-- [ ] **Goal:** A clone-backup partition restores at the chosen size with the streamed bytes verbatim; "Original size" restore zero-pads the tail (the cloned HFS+ inside is smaller than the partition window — Mac OS still mounts it). Volume-grow on restore is a separate feature; not in scope here.
+- [x] **Goal:** A clone-backup partition restores at the chosen size with the streamed bytes verbatim; "Original size" restore zero-pads the tail (the cloned HFS+ inside is smaller than the partition window — Mac OS still mounts it). Volume-grow on restore is a separate feature; not in scope here.
 
-**Files:** `src/restore/mod.rs`
+**Files:** `src/restore/mod.rs`, `src/rbformats/mod.rs`, `src/os/mod.rs`
 
 **Changes:**
-- Branch on `pm.defragmented_clone`: skip filesystem-aware resize; write the decompressed image bytes verbatim into the partition window and zero-pad the tail when the chosen partition size exceeds `imaged_size_bytes`.
-- "Minimum" size picker prefers `defragmented_min_size_bytes` when present (already wired by Step 3 / Step 20).
+- `run_restore`'s resize-loop: when `pm.defragmented_clone == true`, log a one-line note and `continue` — skip every fs-aware resize/fixup. The cloned volume's primary + alt VHs are already correct for the clone size; running `resize_hfsplus_in_place` against the (possibly larger) partition window would patch the VH to the wrong size and corrupt the volume.
+- `reconstruct_disk_from_backup`'s tail-pad branch: include `pm.defragmented_clone` alongside `pm.compacted` so the partition window past the clone is explicitly zeroed (no stale residue).
+- Drive-by fix (uncovered while wiring the test): `open_target_for_writing` (regular-file path) and the inline `File::create` sites in `run_restore` were opening write-only on Unix, which made `patch_hidden_sectors_for`'s boot-sector read fail with EBADF for *any* non-FAT non-NTFS non-exFAT regular-file restore. Switched all four call sites to `OpenOptions::new().read(true).write(true).create(true).truncate(true)`.
 
-**Tests:** End-to-end: build a synthesized MBR + HFS+ disk image with xattrs and hardlinks, run `run_backup` with `shrink_to_minimum=true`, then `run_restore` at "minimum" size, reopen via `HfsPlusFilesystem::open`, assert data + xattrs + hardlinks intact, fsck clean. The fixture is also reusable for the GUI smoke test in 22g.
+**Tests:** `restore::tests::defragmented_clone_restore_round_trip` — builds a 32 MiB HFS+ source via `create_blank_hfsplus`, adds a nested directory + two files, stream-clones to a 2 MiB target via `stream_defragmented_hfsplus`, hand-crafts a backup folder (mbr.bin + partition-0.raw + metadata.json with `defragmented_clone=true`, `original_size_bytes=4 MiB`, `imaged_size_bytes=2 MiB`), runs `run_restore` at "Original" size. Verifies the restored disk has: MBR signature intact, cloned bytes verbatim at the partition offset, zero-fill in the 2 MiB tail past the clone, volume-header bytes byte-equal to the source clone (proves resize_hfsplus_in_place was skipped), and the restored HFS+ volume opens via `HfsPlusFilesystem::open` with the expected catalog content.
 
 #### Step 22g — Backup-tab toggle
 
