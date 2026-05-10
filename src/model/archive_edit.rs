@@ -229,7 +229,11 @@ pub fn compute_file_checksum(
                 }
                 hasher.update(&buf[..n]);
             }
-            Ok(format!("{:x}", hasher.finalize()))
+            Ok(hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect())
         }
         "crc32" => {
             let mut hasher = crc32fast::Hasher::new();

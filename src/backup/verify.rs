@@ -32,7 +32,11 @@ pub fn hash_reader_to_eof(reader: &mut dyn Read, checksum_type: ChecksumType) ->
                 }
                 hasher.update(&buf[..n]);
             }
-            Ok(format!("{:x}", hasher.finalize()))
+            Ok(hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect())
         }
         ChecksumType::Crc32 => {
             let mut hasher = crc32fast::Hasher::new();
@@ -80,7 +84,11 @@ pub fn hash_reader_range(
                 remaining -= n as u64;
                 progress_cb(n as u64);
             }
-            Ok(format!("{:x}", hasher.finalize()))
+            Ok(hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect())
         }
         ChecksumType::Crc32 => {
             let mut hasher = crc32fast::Hasher::new();

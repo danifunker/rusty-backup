@@ -388,7 +388,7 @@ pub fn build_target_metadata(
             KEY_COMPARE_CASE_FOLDING
         },
     );
-    let mut extents_overflow = init_btree_buffer(extents_bytes, 10, 0);
+    let extents_overflow = init_btree_buffer(extents_bytes, 10, 0);
 
     // Attributes B-tree: only allocate when the source had xattrs. The
     // planner sized `attributes_blocks` from `vh.attributes_file.total_blocks`
@@ -418,7 +418,7 @@ pub fn build_target_metadata(
     {
         let folder_meta = root_folder_metadata(snapshot);
         let key = build_catalog_key(1, label);
-        let mut record = build_folder_body(2, /* valence */ 0, &folder_meta);
+        let record = build_folder_body(2, /* valence */ 0, &folder_meta);
         let mut key_record = key.clone();
         if !key_record.len().is_multiple_of(2) {
             key_record.push(0);

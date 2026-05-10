@@ -741,10 +741,6 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         self.read_allocation_bitmap()
     }
 
-    pub(crate) fn attributes_file_size(&self) -> u64 {
-        self.vh.attributes_file.logical_size
-    }
-
     /// `total_blocks` field of the source's catalog file fork. Used by the
     /// streamed defrag planner to size the target's catalog B-tree (with
     /// a small safety margin) so it has enough free nodes to host every
