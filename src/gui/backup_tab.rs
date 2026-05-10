@@ -1196,6 +1196,7 @@ impl BackupTab {
             chd_options: self.chd_options_for_compression(),
             size_policy,
             partition_target_sizes,
+            shrink_to_minimum: false,
         };
 
         self.maybe_persist_chd_options();

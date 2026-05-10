@@ -2781,6 +2781,7 @@ mod tests {
                     minimum_size_bytes: None,
                     defragmented_min_size_bytes: None,
                     hfsplus_signature: None,
+                    defragmented_clone: false,
                 })
                 .collect(),
             bad_sectors: vec![],
@@ -2913,6 +2914,7 @@ mod tests {
                     minimum_size_bytes: None,
                     defragmented_min_size_bytes: None,
                     hfsplus_signature: None,
+                    defragmented_clone: false,
                 })
                 .collect(),
             bad_sectors: vec![],
@@ -3084,6 +3086,7 @@ mod tests {
                     minimum_size_bytes: None,
                     defragmented_min_size_bytes: None,
                     hfsplus_signature: None,
+                    defragmented_clone: false,
                 })
                 .collect(),
             bad_sectors: vec![],
@@ -3274,6 +3277,7 @@ mod tests {
                 minimum_size_bytes: None,
                 defragmented_min_size_bytes: None,
                 hfsplus_signature: None,
+                defragmented_clone: false,
             }
         };
         let metadata = BackupMetadata {

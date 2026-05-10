@@ -2232,6 +2232,7 @@ mod tests {
                 minimum_size_bytes: None,
                 defragmented_min_size_bytes: None,
                 hfsplus_signature: None,
+                defragmented_clone: false,
             }],
             bad_sectors: vec![],
             extended_container: None,

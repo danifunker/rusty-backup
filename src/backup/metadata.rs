@@ -125,6 +125,15 @@ pub struct PartitionMetadata {
     /// for pre-Step-20 backups (`#[serde(default)]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hfsplus_signature: Option<u16>,
+    /// True when this partition's image is a defragmenting *clone* of the
+    /// source HFS+/HFSX volume produced by Phase 8's
+    /// [`stream_defragmented_hfsplus`] path — i.e. the image is a complete,
+    /// already-shrunk HFS+ volume rather than a compacted byte-for-byte
+    /// stream. Restore writes the bytes verbatim and zero-pads any
+    /// remaining partition window. Defaults to `false` so pre-Phase-8
+    /// metadata loads unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub defragmented_clone: bool,
 }
 
 /// Partition alignment information for the backup.
@@ -232,6 +241,7 @@ mod tests {
                 minimum_size_bytes: Some(480_000_000),
                 defragmented_min_size_bytes: None,
                 hfsplus_signature: None,
+                defragmented_clone: false,
             }],
             bad_sectors: vec![],
             extended_container: None,
@@ -330,6 +340,7 @@ mod tests {
                 minimum_size_bytes: Some(900_000_000),
                 defragmented_min_size_bytes: None,
                 hfsplus_signature: None,
+                defragmented_clone: false,
             }],
             bad_sectors: vec![],
             extended_container: None,
@@ -409,6 +420,7 @@ mod tests {
                 minimum_size_bytes: Some(500_000_000),
                 defragmented_min_size_bytes: None,
                 hfsplus_signature: None,
+                defragmented_clone: false,
             }],
             bad_sectors: vec![],
             extended_container: None,

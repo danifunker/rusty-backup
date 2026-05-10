@@ -2264,4 +2264,161 @@ mod tests {
         assert_eq!(bytes.len(), 5000);
         assert!(bytes.iter().all(|&x| x == 0xCD));
     }
+
+    /// Step 22e — full end-to-end engine fixture. Build a synthetic HFS+
+    /// source that exercises the clone-relevant features the blank
+    /// builder can seed: a nested directory tree, a file with both data
+    /// + resource forks, and a file hardlink pair. Stream into a
+    /// `Vec<u8>`, reopen as `HfsPlusFilesystem`, walk the catalog, and
+    /// verify byte-equal data forks + resource fork, preserved hardlink
+    /// topology (both link rows resolve to identical bytes), and `fsck`
+    /// clean on the target. Xattr emit is exercised separately by
+    /// `build_metadata_emits_inline_xattr` — `create_blank_hfsplus`
+    /// doesn't seed an attributes B-tree, so live `set_xattr` against
+    /// the blank source is a separate plumbing step.
+    #[test]
+    fn stream_emit_round_trips_full_fixture() {
+        use super::super::filesystem::ResourceForkSource;
+
+        const DATA_PAYLOAD: &[u8] = b"the quick brown fox\n";
+        const RSRC_PAYLOAD: &[u8] = b"resource-fork-bytes-12345\n";
+        const SHARED_PAYLOAD: &[u8] = b"shared via hardlink\n";
+        const I_NODE_NUM: u32 = 91;
+
+        let mut src_img = create_blank_hfsplus(32 * 1024 * 1024, 4096, "Full", false);
+        {
+            let cur = Cursor::new(&mut src_img);
+            let mut fs = HfsPlusFilesystem::open(cur, 0).unwrap();
+            fs.prepare_for_edit().unwrap();
+            let root = fs.root().unwrap();
+
+            // Nested directory tree.
+            let docs = fs
+                .create_directory(&root, "Docs", &CreateDirectoryOptions::default())
+                .unwrap();
+            let _nested = fs
+                .create_directory(&docs, "Nested", &CreateDirectoryOptions::default())
+                .unwrap();
+
+            // File with both forks.
+            let mut data = Cursor::new(DATA_PAYLOAD);
+            let opts = CreateFileOptions {
+                resource_fork: Some(ResourceForkSource::Data(RSRC_PAYLOAD.to_vec())),
+                ..CreateFileOptions::default()
+            };
+            fs.create_file(
+                &docs,
+                "with_forks.bin",
+                &mut data,
+                DATA_PAYLOAD.len() as u64,
+                &opts,
+            )
+            .unwrap();
+
+            // Hardlink pair: one inode + two stub rows in the root.
+            let mut shared = Cursor::new(SHARED_PAYLOAD);
+            fs.create_hardlink_inode(
+                I_NODE_NUM,
+                &mut shared,
+                SHARED_PAYLOAD.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            fs.create_hardlink(&root, "alpha.txt", I_NODE_NUM).unwrap();
+            fs.create_hardlink(&root, "beta.txt", I_NODE_NUM).unwrap();
+
+            fs.sync_metadata().unwrap();
+        }
+
+        // Stream the source into a fresh Vec<u8>.
+        let cur = Cursor::new(&mut src_img);
+        let mut src_fs = HfsPlusFilesystem::open(cur, 0).unwrap();
+        let target_size: u64 = 8 * 1024 * 1024;
+        let mut out: Vec<u8> = Vec::with_capacity(target_size as usize);
+        let report = stream_defragmented_hfsplus(&mut src_fs, target_size, &mut out)
+            .expect("stream emit should succeed");
+        assert_eq!(out.len() as u64, target_size, "emit size mismatch");
+        assert_eq!(report.bytes_emitted, target_size);
+        // `files_copied` excludes inodes (per DefragReport's filter), so just
+        // the dual-fork file. The inode's bytes still flow into
+        // `data_bytes_copied` below.
+        assert_eq!(report.files_copied, 1, "one non-inode file (dual)");
+        // Docs + Nested + the synthesized "HFS+ Private Data" dir; root and
+        // dir-inode dirs are excluded by the report filter.
+        assert_eq!(report.dirs_copied, 3);
+        assert_eq!(report.hardlinks_copied, 2);
+        assert_eq!(report.xattrs_copied, 0);
+        assert_eq!(
+            report.data_bytes_copied,
+            DATA_PAYLOAD.len() as u64 + SHARED_PAYLOAD.len() as u64
+        );
+        assert_eq!(report.rsrc_bytes_copied, RSRC_PAYLOAD.len() as u64);
+
+        // Reopen and verify catalog contents.
+        let cur = Cursor::new(out);
+        let mut tgt = HfsPlusFilesystem::open(cur, 0).expect("target opens");
+        let root = tgt.root().expect("root");
+        let kids = tgt.list_directory(&root).expect("list root");
+        let names: Vec<&str> = kids.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"Docs"), "Docs missing: {names:?}");
+        assert!(names.contains(&"alpha.txt"), "alpha missing: {names:?}");
+        assert!(names.contains(&"beta.txt"), "beta missing: {names:?}");
+
+        // Both hardlink rows must resolve to identical bytes.
+        let alpha = kids.iter().find(|e| e.name == "alpha.txt").unwrap().clone();
+        let beta = kids.iter().find(|e| e.name == "beta.txt").unwrap().clone();
+        assert!(
+            alpha.link_target_cnid.is_some(),
+            "alpha must carry a link_target_cnid"
+        );
+        assert_eq!(
+            alpha.link_target_cnid, beta.link_target_cnid,
+            "both stubs should resolve to the same inode"
+        );
+        let alpha_bytes = tgt.read_file(&alpha, usize::MAX).expect("read alpha");
+        let beta_bytes = tgt.read_file(&beta, usize::MAX).expect("read beta");
+        assert_eq!(alpha_bytes, SHARED_PAYLOAD);
+        assert_eq!(beta_bytes, SHARED_PAYLOAD);
+
+        // Data fork on the dual-fork file under Docs/.
+        let docs = kids.iter().find(|e| e.name == "Docs").unwrap().clone();
+        let docs_kids = tgt.list_directory(&docs).expect("list Docs");
+        let with_forks = docs_kids
+            .iter()
+            .find(|e| e.name == "with_forks.bin")
+            .expect("dual-fork file present")
+            .clone();
+        assert!(
+            docs_kids.iter().any(|e| e.name == "Nested"),
+            "Nested dir missing"
+        );
+        let data_bytes = tgt.read_file(&with_forks, usize::MAX).expect("read data");
+        assert_eq!(data_bytes, DATA_PAYLOAD);
+
+        // Resource fork: write_resource_fork_to streams it into a buffer.
+        let mut rsrc_buf: Vec<u8> = Vec::new();
+        let written = tgt
+            .write_resource_fork_to(&with_forks, &mut rsrc_buf)
+            .expect("read rsrc");
+        assert_eq!(written, RSRC_PAYLOAD.len() as u64);
+        assert_eq!(rsrc_buf, RSRC_PAYLOAD);
+        assert_eq!(
+            tgt.resource_fork_size(&with_forks),
+            RSRC_PAYLOAD.len() as u64
+        );
+
+        // fsck clean on the target.
+        let fsck = tgt
+            .fsck()
+            .expect("HFS+ supports fsck")
+            .expect("fsck runs without error");
+        assert!(
+            fsck.is_clean(),
+            "target should be fsck-clean: errors={:?}",
+            fsck.errors
+                .iter()
+                .map(|e| (&e.code, &e.message))
+                .collect::<Vec<_>>()
+        );
+    }
 }

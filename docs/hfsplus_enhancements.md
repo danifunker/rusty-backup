@@ -481,26 +481,43 @@ A cleanly-unmounted journaled volume is *accepted* — the journal is empty/repl
 
 #### Step 22e — Streamed defrag round-trip test
 
-- [ ] **Goal:** End-to-end engine test.
+- [x] **Goal:** End-to-end engine test.
 
 **Files:** `src/fs/hfsplus_defrag.rs`
 
-**Changes:** Build a fragmented synthetic source HFS+ with a directory tree, files with both forks, an inline xattr, and a hardlink pair. Stream into a `Vec<u8>`. Open that Vec as `HfsPlusFilesystem`, walk catalog, verify byte-equal fork content, surviving xattrs, preserved hardlink topology, `fsck` clean.
+**Changes:** Build a synthetic source HFS+ with a nested directory tree, a file carrying both data + resource forks, and a hardlink pair. Stream into a `Vec<u8>`. Open that Vec as `HfsPlusFilesystem`, walk catalog, verify byte-equal fork content, preserved hardlink topology (both link rows resolve to the same bytes via `link_target_cnid`), `fsck` clean. Xattr round-trip is covered by `build_metadata_emits_inline_xattr` in 22c-ii — `create_blank_hfsplus` doesn't seed an attributes B-tree, so a live-source xattr in this fixture would require a separate seed builder.
 
 #### Step 22f — Backup pipeline integration
 
-- [ ] **Goal:** Backup tab gains a `shrink_to_minimum: bool` toggle; when set, HFS+/HFSX partitions route through `stream_defragmented_hfsplus` into the compressor instead of `CompactHfsPlusReader`.
+Sub-split: engine plumbing + streaming pipe in 22f-i; restore-side handling + end-to-end backup→restore round-trip in 22f-ii.
 
-**Files:** `src/backup/mod.rs`, `src/backup/sizes.rs`, `src/backup/metadata.rs`
+##### Step 22f-i — Engine plumbing + streaming pipe
+
+- [x] **Goal:** Backup engine gains a `shrink_to_minimum: bool` toggle; when set, HFS+/HFSX partitions route through `stream_defragmented_hfsplus` into the compressor instead of `CompactHfsPlusReader`.
+
+**Files:** `src/backup/mod.rs`, `src/backup/metadata.rs`, `src/gui/backup_tab.rs` (default `false`)
 
 **Changes:**
-- `BackupConfig.shrink_to_minimum: bool`. Disabled when `sector_by_sector` is on.
-- For opted-in partitions, run `can_defrag_clone_hfsplus` pre-flight at the top of the per-partition loop; on failure abort the whole backup with the human-readable reason.
-- Override sizing for those partitions: `effective_sizes[i] = stream_sizes[i] = compact_sizes[i] = defragmented_min_sizes[i]`, `is_layout_preserving_flags[i] = false`. Stream the partition via `stream_defragmented_hfsplus` directly into `compress_partition`'s reader.
-- `PartitionMetadata.defragmented_clone: bool` (`#[serde(default)]`).
-- Restore: a clone-backup partition restores at the chosen size with the streamed bytes verbatim. "Original size" restore zero-pads the tail (the cloned HFS+ inside is smaller than the partition window — Mac OS still mounts it). Volume-grow on restore is a separate feature; not in scope here.
+- `BackupConfig.shrink_to_minimum: bool`. Logged-and-ignored when `sector_by_sector` is on or single-file-CHD is in play.
+- After `analyze_partitions`, for each HFS+/HFSX partition with a `defragmented_min_sizes[i]`, run `can_defrag_clone_hfsplus` pre-flight; on failure abort the whole backup with the human-readable reason.
+- Override sizing for those partitions: `effective_sizes[i] = stream_sizes[i] = defragmented_min_sizes[i]`, `is_layout_preserving_flags[i] = false`. `compact_sizes[i]` is left as-is — the per-partition loop dispatches on `clone_target_sizes` first, so neither the compacted nor the trim branch runs for cloned partitions.
+- New `channel_pipe()` helper (`ChannelPipeReader` / `ChannelPipeWriter`) — a bounded `sync_channel(4)` adapter so the producer thread (`stream_defragmented_hfsplus`) feeds the `compress_partition` consumer with backpressure but no temp file.
+- Per-partition loop: when `clone_target_sizes[i].is_some()`, spawn a producer thread that opens a fresh `HfsPlusFilesystem` over a cloned source `File` handle and streams into the pipe; the main thread runs `compress_partition` against the reader. Errors from either side propagate via `JoinHandle.join()`.
+- `PartitionMetadata.defragmented_clone: bool` (`#[serde(default, skip_serializing_if = std::ops::Not::not)]`); set to `true` in metadata for clone partitions.
 
-**Tests:** End-to-end: backup a synthesized fragmented HFS+ with xattrs and hardlinks (`shrink_to_minimum=true`), restore at "minimum" size, mount via `HfsPlusFilesystem::open`, assert data + xattrs + hardlinks intact, fsck clean.
+**Tests:** Inline `pipe_tests` cover the `ChannelPipe` round-trip + EOF-on-writer-drop behaviors and `Send` bounds. The end-to-end backup-pipeline round-trip lands with 22f-ii — fabricating an MBR-wrapped HFS+ disk image and exercising `run_backup` belongs with the restore-side work since both halves want to share the same fixture.
+
+##### Step 22f-ii — Restore handling + end-to-end round-trip
+
+- [ ] **Goal:** A clone-backup partition restores at the chosen size with the streamed bytes verbatim; "Original size" restore zero-pads the tail (the cloned HFS+ inside is smaller than the partition window — Mac OS still mounts it). Volume-grow on restore is a separate feature; not in scope here.
+
+**Files:** `src/restore/mod.rs`
+
+**Changes:**
+- Branch on `pm.defragmented_clone`: skip filesystem-aware resize; write the decompressed image bytes verbatim into the partition window and zero-pad the tail when the chosen partition size exceeds `imaged_size_bytes`.
+- "Minimum" size picker prefers `defragmented_min_size_bytes` when present (already wired by Step 3 / Step 20).
+
+**Tests:** End-to-end: build a synthesized MBR + HFS+ disk image with xattrs and hardlinks, run `run_backup` with `shrink_to_minimum=true`, then `run_restore` at "minimum" size, reopen via `HfsPlusFilesystem::open`, assert data + xattrs + hardlinks intact, fsck clean. The fixture is also reusable for the GUI smoke test in 22g.
 
 #### Step 22g — Backup-tab toggle
 
@@ -689,7 +706,8 @@ The phase splits into three concerns: read-only parse + replay (steps 24–25), 
 | 22c-ii | xattrs | required | required | yes (inline xattr replay) | no |
 | 22d | emit | required | required | yes (covered by 22e) | no |
 | 22e | round-trip | required | required | yes (e2e engine) | no |
-| 22f | backup | required | required | yes (e2e backup+restore) | yes (full flow) |
+| 22f-i | backup engine | required | required | yes (channel pipe) | no |
+| 22f-ii | backup restore | required | required | yes (e2e backup+restore) | yes (full flow) |
 | 22g | gui | required | required | n/a | yes (toggle) |
 | 23 | polish | required | required | n/a | yes (reference disks) |
 | 24 | journal | required | required | yes (parse + endian) | no |
