@@ -63,6 +63,33 @@ pub fn bitmap_find_clear_bit_be(data: &[u8], max_bits: u32) -> Option<u32> {
     None
 }
 
+/// Collect every contiguous run of clear bits in a big-endian bitmap as
+/// `(start, length)` pairs. Used by the HFS+ multi-extent allocator
+/// (largest-run-first) — see `allocate_extents` in `src/fs/hfsplus.rs`.
+pub fn bitmap_collect_clear_runs_be(data: &[u8], max_bits: u32) -> Vec<(u32, u32)> {
+    let mut runs = Vec::new();
+    let mut run_start = 0u32;
+    let mut run_len = 0u32;
+    for bit in 0..max_bits {
+        if bitmap_test_bit_be(data, bit) {
+            if run_len > 0 {
+                runs.push((run_start, run_len));
+                run_len = 0;
+            }
+            run_start = bit + 1;
+        } else {
+            if run_len == 0 {
+                run_start = bit;
+            }
+            run_len += 1;
+        }
+    }
+    if run_len > 0 {
+        runs.push((run_start, run_len));
+    }
+    runs
+}
+
 /// Find a contiguous run of `count` clear bits in a big-endian bitmap.
 /// Returns the starting bit index, or None if no such run exists.
 pub fn bitmap_find_clear_run_be(data: &[u8], max_bits: u32, count: u32) -> Option<u32> {
@@ -270,11 +297,51 @@ pub fn encode_fourcc(s: &str) -> [u8; 4] {
 // B-tree key comparison
 // ---------------------------------------------------------------------------
 
+/// Code points that Apple's `FastUnicodeCompare` treats as **ignorable**
+/// during case-folded comparison — they're skipped entirely, as if absent.
+///
+/// Source: Apple's `FastUnicodeCompare.c` `gLowerCaseTable`. The table
+/// maps zero-width / format / variation-selector ranges to 0x0000 (the
+/// algorithm's "skip" sentinel). Latin-letter casing is covered by
+/// `char::to_uppercase` below.
+///
+/// **Note**: U+0000 (NUL) is NOT in this list. Apple's table maps NUL to
+/// 0xFFFF — i.e. NUL is the highest-sorting character, not ignorable.
+/// That's how the on-disk `"\0\0\0\0HFS+ Private Data"` directory ends
+/// up sorting *last* among its parent's children rather than first.
+/// `fold_hfsplus_name_for_compare` rewrites NUL → U+FFFF before the
+/// final uppercase pass to match.
+fn is_hfsplus_ignored(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x00AD
+            | 0x034F
+            | 0x070F
+            | 0x180B..=0x180E
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x206A..=0x206F
+            | 0xFE00..=0xFE0F
+            | 0xFEFF
+    )
+}
+
+fn fold_hfsplus_name_for_compare(name: &[u16]) -> Vec<char> {
+    let s = String::from_utf16_lossy(name);
+    let nfd: String = s.nfd().collect();
+    nfd.chars()
+        .filter(|c| !is_hfsplus_ignored(*c))
+        .map(|c| if c == '\0' { '\u{FFFF}' } else { c })
+        .flat_map(|c| c.to_uppercase())
+        .collect()
+}
+
 /// Compare two HFS+ catalog keys (case-insensitive by default).
 ///
 /// Keys are: parent_cnid (u32) + name (UTF-16BE units).
 /// Comparison: parent CNID first (numeric), then name.
-/// Case-insensitive: NFD decompose, then compare uppercased chars.
+/// Case-insensitive: drop Apple-ignored code points, NFD decompose, then
+/// compare uppercased chars.
 pub fn compare_hfsplus_keys(
     parent_a: u32,
     name_a: &[u16],
@@ -287,17 +354,14 @@ pub fn compare_hfsplus_keys(
         other => return other,
     }
     if case_sensitive {
-        // HFSX binary comparison
+        // HFSX binary comparison — every code point is significant,
+        // including NULs. (Apple's HFSX uses straight UTF-16 binary
+        // compare, no folding, no ignore set.)
         return name_a.cmp(name_b);
     }
-    // Case-insensitive: NFD decompose both names, compare uppercased
-    let str_a = String::from_utf16_lossy(name_a);
-    let str_b = String::from_utf16_lossy(name_b);
-    let nfd_a: String = str_a.nfd().collect();
-    let nfd_b: String = str_b.nfd().collect();
-    let upper_a: Vec<char> = nfd_a.chars().flat_map(|c| c.to_uppercase()).collect();
-    let upper_b: Vec<char> = nfd_b.chars().flat_map(|c| c.to_uppercase()).collect();
-    upper_a.cmp(&upper_b)
+    let folded_a = fold_hfsplus_name_for_compare(name_a);
+    let folded_b = fold_hfsplus_name_for_compare(name_b);
+    folded_a.cmp(&folded_b)
 }
 
 #[allow(dead_code)]
@@ -1438,6 +1502,82 @@ where
     }
 }
 
+/// Insert a fully-formed `key + record` pair into a B-tree backed by
+/// `data` (header lives in node 0 at offset 14, leaves chained from
+/// `first_leaf_node`). Drives `btree_find_insert_leaf`,
+/// `btree_insert_record`, and the `btree_split_leaf_with_insert` /
+/// `btree_grow_root` / `btree_insert_into_index` machinery so callers
+/// don't have to repeat the (find leaf, try insert, split on full,
+/// fix up parent or grow root) dance.
+///
+/// `cmp` compares two records by their key portion only — it must
+/// match whatever ordering the tree was built with (case-folding NFD
+/// for HFS+ catalog, binary for HFSX, case-insensitive Mac-Roman for
+/// classic HFS, raw byte order for extents-overflow / attributes).
+///
+/// On success the header's `leaf_records` is bumped and (for splits)
+/// `depth` / `root_node` / `last_leaf_node` are updated. Returns
+/// `Err(DiskFull)` when the B-tree is out of free nodes.
+///
+/// Used by the streamed defrag builder (Step 22c) to populate target
+/// catalog / extents-overflow / attributes B-trees from scratch, and
+/// matches the algorithm `HfsPlusFilesystem::insert_catalog_record`
+/// has been using.
+pub fn btree_insert_full<F>(
+    data: &mut Vec<u8>,
+    key_record: &[u8],
+    cmp: &F,
+) -> Result<(), super::filesystem::FilesystemError>
+where
+    F: Fn(&[u8], &[u8]) -> Ordering,
+{
+    let header = BTreeHeader::read(data);
+    let node_size = header.node_size as usize;
+    if node_size == 0 {
+        return Err(super::filesystem::FilesystemError::InvalidData(
+            "B-tree has zero node_size".into(),
+        ));
+    }
+    let (leaf_idx, parent_chain) = btree_find_insert_leaf(data, &header, key_record, cmp);
+
+    let off = leaf_idx as usize * node_size;
+    let node = &mut data[off..off + node_size];
+    match btree_insert_record(node, node_size, key_record, cmp) {
+        Ok(_) => {
+            let mut h = BTreeHeader::read(data);
+            h.leaf_records += 1;
+            h.write(data);
+            Ok(())
+        }
+        Err(_) => {
+            let mut h = BTreeHeader::read(data);
+            let (new_idx, split_key) =
+                btree_split_leaf_with_insert(data, node_size, leaf_idx, &mut h, key_record, cmp)?;
+            h.leaf_records += 1;
+            if h.depth == 1 {
+                btree_grow_root(data, node_size, &mut h, leaf_idx, new_idx, &split_key)?;
+            } else if let Some(&(_, parent_idx)) =
+                parent_chain.iter().find(|&&(nidx, _)| nidx == leaf_idx)
+            {
+                btree_insert_into_index(
+                    data,
+                    node_size,
+                    parent_idx,
+                    new_idx,
+                    &split_key,
+                    &mut h,
+                    cmp,
+                    &parent_chain,
+                )?;
+            } else {
+                btree_grow_root(data, node_size, &mut h, leaf_idx, new_idx, &split_key)?;
+            }
+            h.write(data);
+            Ok(())
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1601,6 +1741,58 @@ mod tests {
         let a: Vec<u16> = "é".encode_utf16().collect();
         let b: Vec<u16> = "é".nfd().collect::<String>().encode_utf16().collect();
         assert_eq!(compare_hfsplus_keys(2, &a, 2, &b, false), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_compare_hfsplus_keys_private_data_dir_sorts_last() {
+        // Apple's FastUnicodeCompare maps U+0000 to 0xFFFF, so a name
+        // starting with NULs sorts AFTER all printable names with the
+        // same parent CNID. This is how `\0\0\0\0HFS+ Private Data`
+        // ends up at the END of root's children on a Mac-formatted
+        // volume rather than the front. Empirically verified against
+        // OS-formatted images (HFSTest6/TestHFS6-OSCopy.dmg, 2026-05).
+        // Pre-fix, our compare folded NULs as ignorable and our inserts
+        // sorted the dir before printable names — fsck_hfs flagged this
+        // as "key for HFS+ Private Data is out of order."
+        let private: Vec<u16> = "\u{0000}\u{0000}\u{0000}\u{0000}HFS+ Private Data"
+            .encode_utf16()
+            .collect();
+        let alpha: Vec<u16> = "Apple".encode_utf16().collect();
+        let dotted: Vec<u16> = ".HFS+ Private Directory Data\u{D}".encode_utf16().collect();
+        let later: Vec<u16> = "tone.wav".encode_utf16().collect();
+        let way_later: Vec<u16> = "zzz".encode_utf16().collect();
+
+        // All printable parent=2 entries must sort BEFORE NUL+name.
+        for (label, other) in [
+            ("Apple", &alpha),
+            (".HFS+ Private Directory Data\\r", &dotted),
+            ("tone.wav", &later),
+            ("zzz", &way_later),
+        ] {
+            assert_eq!(
+                compare_hfsplus_keys(2, other, 2, &private, false),
+                Ordering::Less,
+                "'{label}' must sort before NUL-prefixed private dir"
+            );
+            assert_eq!(
+                compare_hfsplus_keys(2, &private, 2, other, false),
+                Ordering::Greater,
+                "NUL-prefixed private dir must sort after '{label}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compare_hfsplus_keys_hfsx_binary_keeps_nuls() {
+        // Case-sensitive HFSX uses straight UTF-16 binary compare —
+        // NULs are preserved as 0x0000 there. A leading-NUL name MUST
+        // sort before a printable name in HFSX (binary order).
+        let nul_prefixed: Vec<u16> = "\u{0000}HFS".encode_utf16().collect();
+        let plain: Vec<u16> = "HFS".encode_utf16().collect();
+        assert_eq!(
+            compare_hfsplus_keys(2, &nul_prefixed, 2, &plain, true),
+            Ordering::Less
+        );
     }
 
     #[test]

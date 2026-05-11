@@ -37,6 +37,17 @@ pub struct InspectTab {
     image_format_label: Option<String>,
     /// Path to a backup folder (loaded via metadata.json)
     backup_folder_path: Option<PathBuf>,
+    /// Set when the user explicitly closes a backup via "Close Backup".
+    /// `gui::mod::update` consumes this signal via `take_close_backup_request`
+    /// to clear the cross-tab `loaded_backup_folder` so the auto-reopen
+    /// fallback (which re-loads from shared state when the tab has no
+    /// backup) doesn't immediately re-open what the user just closed.
+    close_backup_requested: bool,
+    /// Set when a partition's `type_name` changes (e.g. a volume-label probe
+    /// finishes and appends the label). The next `show` consumes it to force
+    /// one extra repaint so the partition-table Grid re-measures column
+    /// widths instead of clipping the wider text.
+    partitions_layout_dirty: bool,
     /// Parsed partition table result
     partition_table: Option<PartitionTable>,
     /// Detected alignment
@@ -65,14 +76,29 @@ pub struct InspectTab {
     export_partition_configs: Vec<PartitionExportConfig>,
     /// VHD export background thread status
     export_status: Option<Arc<Mutex<ExportStatus>>>,
-    /// Filesystem-computed minimum partition sizes (partition index → bytes)
+    /// Filesystem-computed in-place minimum partition sizes (partition index → bytes).
+    /// "In-place" = the smallest size achievable by trim alone, no data movement.
     partition_min_sizes: HashMap<usize, u64>,
+    /// Defragmented minimum (after a clone-shrink). Populated for filesystems
+    /// with a defragmenting compaction path (FAT, HFS+) when it differs
+    /// meaningfully from `partition_min_sizes`.
+    partition_defrag_min_sizes: HashMap<usize, u64>,
+    /// Per-partition volume labels (e.g. FAT label, HFS+ volume name) for
+    /// display in the inspect grid. Populated during partition probing.
+    partition_volume_labels: HashMap<usize, String>,
     /// Partitions whose minimum size requires an expensive volume walk; the
     /// per-row UI surfaces a "Calc min" button that spawns a worker.
     deferred_min_sizes: HashMap<usize, &'static str>,
     /// Currently-running per-partition min-size worker threads.
     pending_min_size_calcs:
         HashMap<usize, Arc<Mutex<rusty_backup::model::min_size_runner::MinSizeStatus>>>,
+    /// Currently-running per-partition HFS+ volume-label worker threads. Each
+    /// resolves to either a label that gets appended to `partitions[i].type_name`
+    /// or an error logged via `ctx.log`. Spawned during `apply_backup_outcome`
+    /// for backup folders since their data lives in compressed files that
+    /// can't be probed synchronously without freezing the GUI.
+    pending_volume_label_probes:
+        HashMap<usize, Arc<Mutex<rusty_backup::model::volume_label_runner::VolumeLabelStatus>>>,
     /// Clonezilla image metadata (when backup is a Clonezilla image)
     clonezilla_image: Option<ClonezillaImage>,
     /// Block caches per Clonezilla partition (for browse support)
@@ -130,6 +156,8 @@ impl Default for InspectTab {
             image_file_path: None,
             image_format_label: None,
             backup_folder_path: None,
+            close_backup_requested: false,
+            partitions_layout_dirty: false,
             partition_table: None,
             alignment: None,
             partitions: Vec::new(),
@@ -146,8 +174,11 @@ impl Default for InspectTab {
             export_partition_configs: Vec::new(),
             export_status: None,
             partition_min_sizes: HashMap::new(),
+            partition_defrag_min_sizes: HashMap::new(),
+            partition_volume_labels: HashMap::new(),
             deferred_min_sizes: HashMap::new(),
             pending_min_size_calcs: HashMap::new(),
+            pending_volume_label_probes: HashMap::new(),
             clonezilla_image: None,
             block_caches: HashMap::new(),
             block_cache_scan: None,
@@ -182,6 +213,14 @@ impl InspectTab {
         self.backup_folder_path.is_some()
     }
 
+    /// Returns and clears the "user clicked Close Backup" signal. The App-level
+    /// update loop calls this each frame to know when to clear the cross-tab
+    /// `loaded_backup_folder` (which would otherwise re-open the backup via
+    /// the auto-load fallback in `gui::mod::update`).
+    pub fn take_close_backup_request(&mut self) -> bool {
+        std::mem::take(&mut self.close_backup_requested)
+    }
+
     pub fn load_backup(&mut self, path: &PathBuf) {
         if self.backup_folder_path.as_ref() != Some(path) {
             self.backup_folder_path = Some(path.clone());
@@ -199,8 +238,11 @@ impl InspectTab {
         self.alignment = None;
         self.browse_view.close();
         self.partition_min_sizes.clear();
+        self.partition_defrag_min_sizes.clear();
+        self.partition_volume_labels.clear();
         self.deferred_min_sizes.clear();
         self.pending_min_size_calcs.clear();
+        self.pending_volume_label_probes.clear();
         self.clonezilla_image = None;
         self.block_caches.clear();
         self.block_cache_scan = None;
@@ -324,6 +366,22 @@ impl InspectTab {
 
         // Poll any pending per-partition minimum-size calculations
         self.poll_min_size_calcs(ctx);
+        self.poll_volume_label_probes(ctx);
+
+        // Background workers (min-size + volume-label probes) finish off the
+        // GUI thread; without an explicit repaint request egui only paints
+        // on user input, so the labels would only appear when the mouse
+        // moves. Keep a short poll cadence while anything's pending, and
+        // pulse one extra repaint on the frame after a label arrives so
+        // the Grid re-measures the now-wider Type column.
+        if !self.pending_min_size_calcs.is_empty() || !self.pending_volume_label_probes.is_empty() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(80));
+        }
+        if self.partitions_layout_dirty {
+            self.partitions_layout_dirty = false;
+            ui.ctx().request_repaint();
+        }
 
         // Re-inspect + Export VHD buttons
         ui.horizontal(|ui| {
@@ -433,6 +491,10 @@ impl InspectTab {
                 self.clear_results();
                 self.backup_folder_path = None;
                 self.prev_backup_path = None;
+                // Signal to gui::mod that the cross-tab `loaded_backup_folder`
+                // should be cleared too — otherwise its auto-reopen fallback
+                // re-loads the backup on the very next frame.
+                self.close_backup_requested = true;
                 ctx.log.info("Backup folder closed.");
             }
 
@@ -1519,6 +1581,9 @@ impl InspectTab {
                 self.alignment = status.alignment.take();
                 self.partitions = std::mem::take(&mut status.partitions);
                 self.partition_min_sizes = std::mem::take(&mut status.partition_min_sizes);
+                self.partition_defrag_min_sizes =
+                    std::mem::take(&mut status.partition_defrag_min_sizes);
+                self.partition_volume_labels = std::mem::take(&mut status.partition_volume_labels);
                 self.deferred_min_sizes = std::mem::take(&mut status.deferred_min_sizes);
                 self.image_format_label = status.format_label.take();
                 // macOS only: capture the open device fd + guard so BrowseView
@@ -1579,8 +1644,11 @@ impl InspectTab {
         self.last_error = None;
         self.image_format_label = None;
         self.partition_min_sizes.clear();
+        self.partition_defrag_min_sizes.clear();
+        self.partition_volume_labels.clear();
         self.deferred_min_sizes.clear();
         self.pending_min_size_calcs.clear();
+        self.pending_volume_label_probes.clear();
         self.clonezilla_image = None;
         self.block_caches.clear();
         self.block_cache_scan = None;
@@ -1668,6 +1736,7 @@ impl InspectTab {
         self.partition_table = out.partition_table;
         self.alignment = out.alignment;
         self.partitions = out.partitions;
+        self.spawn_volume_label_probes(ctx);
     }
 
     fn run_inspect(&mut self, ctx: &mut TabContext) {
@@ -1708,6 +1777,8 @@ impl InspectTab {
             alignment: None,
             partitions: Vec::new(),
             partition_min_sizes: HashMap::new(),
+            partition_defrag_min_sizes: HashMap::new(),
+            partition_volume_labels: HashMap::new(),
             deferred_min_sizes: HashMap::new(),
             format_label: None,
             device_file: None,
@@ -1843,23 +1914,106 @@ impl InspectTab {
                         };
 
                     // For APM disks, probe "Apple_HFS" partitions to show the
-                    // actual HFS variant (HFS vs HFS+ vs HFSX) in the type name.
+                    // actual HFS variant (HFS vs HFS+ vs HFSX) in the type
+                    // name, and prefer the HFS+ volume header label over the
+                    // (often auto-generated) APM partition name. The APM-only
+                    // type_name format from `PartitionTable::partitions()` is
+                    // `"{type_string} ({apm_name})"`; we rebuild it here.
                     if matches!(table, PartitionTable::Apm(_)) {
                         for part in &mut partitions {
-                            if part.partition_type_string.as_deref() == Some("Apple_HFS") {
-                                if let Some(mut br) = make_probe_reader() {
-                                    let detected = rusty_backup::fs::probe_apple_hfs_type(
-                                        &mut br,
-                                        part.start_lba * 512,
-                                    );
-                                    if detected == "HFS+" || detected == "HFSX" {
-                                        part.type_name = part.type_name.replace(
-                                            "Apple_HFS",
-                                            &format!("Apple_HFS ({detected})"),
-                                        );
-                                    }
-                                }
+                            let Some(type_string) = part.partition_type_string.as_deref() else {
+                                continue;
+                            };
+                            // Apple_HFS is the ambiguous APM tag (HFS, HFS+, or
+                            // wrapped HFS+); Apple_HFSX is unambiguous but
+                            // benefits from the same volume-label lookup so
+                            // the inspect grid surfaces the user-facing name
+                            // rather than just the type string.
+                            if type_string != "Apple_HFS" && type_string != "Apple_HFSX" {
+                                continue;
                             }
+                            // Extract the APM name from the existing
+                            // "Apple_HFS (NAME)" formatted string.
+                            let apm_name = part
+                                .type_name
+                                .strip_prefix(type_string)
+                                .and_then(|s| s.trim_start().strip_prefix('('))
+                                .and_then(|s| s.strip_suffix(')'))
+                                .unwrap_or("")
+                                .to_string();
+
+                            let part_offset = part.start_lba * 512;
+                            let detected = make_probe_reader()
+                                .map(|mut br| {
+                                    rusty_backup::fs::probe_apple_hfs_type(&mut br, part_offset)
+                                        .to_string()
+                                })
+                                .unwrap_or_default();
+                            let variant_tag: Option<&'static str> = match detected.as_str() {
+                                "HFS+" => Some("HFS+"),
+                                "HFSX" => Some("HFSX"),
+                                _ => None,
+                            };
+
+                            // Probe HFS+ volume label cheaply (header + first
+                            // catalog extent only). HFS variant doesn't matter
+                            // for the helper — it bails on non-HFS+ signatures.
+                            let label = if variant_tag.is_some() {
+                                make_probe_reader().and_then(|mut br| {
+                                    rusty_backup::fs::hfsplus::probe_hfsplus_volume_label(
+                                        &mut br,
+                                        part_offset,
+                                    )
+                                })
+                            } else {
+                                None
+                            };
+
+                            // Pick the most informative display name:
+                            //   - HFS+ label if we have one.
+                            //   - Otherwise APM name, but suppress the noisy
+                            //     auto-generated "Apple_HFS_Untitled_N" form
+                            //     macOS Disk Utility writes when no name was
+                            //     provided.
+                            let apm_is_default = apm_name.starts_with("Apple_HFS_Untitled");
+                            let display_name = match (label.as_deref(), apm_name.as_str()) {
+                                (Some(lab), _) if !lab.is_empty() => lab.to_string(),
+                                (_, n) if !n.is_empty() && !apm_is_default => n.to_string(),
+                                _ => String::new(),
+                            };
+                            // If both a real label and a non-default APM name
+                            // exist and they differ, surface the APM name too.
+                            let trailing_apm = match (label.as_deref(), apm_name.as_str()) {
+                                (Some(lab), n)
+                                    if !lab.is_empty()
+                                        && !n.is_empty()
+                                        && !apm_is_default
+                                        && lab != n =>
+                                {
+                                    Some(n.to_string())
+                                }
+                                _ => None,
+                            };
+
+                            // Use the partition's actual type string so
+                            // Apple_HFSX volumes don't get re-labelled
+                            // "Apple_HFS (HFSX)". Drop the redundant tag
+                            // when type_string already encodes it.
+                            let mut new_name = match variant_tag {
+                                Some(tag) if tag == "HFSX" && type_string == "Apple_HFSX" => {
+                                    type_string.to_string()
+                                }
+                                Some(tag) => format!("{type_string} ({tag})"),
+                                None => type_string.to_string(),
+                            };
+                            if !display_name.is_empty() {
+                                new_name.push(' ');
+                                new_name.push_str(&display_name);
+                            }
+                            if let Some(extra) = trailing_apm {
+                                new_name.push_str(&format!(" [APM: {extra}]"));
+                            }
+                            part.type_name = new_name;
                         }
                     }
 
@@ -1909,12 +2063,58 @@ impl InspectTab {
                         alignment.alignment_type, alignment.first_lba
                     ));
 
+                    // Probe FAT volume labels cheaply (boot sector only) so the
+                    // inspect grid's Volume column has a value for FAT
+                    // partitions. HFS+ labels are populated above (folded into
+                    // type_name) and could move here in a future pass.
+                    let mut partition_volume_labels: HashMap<usize, String> = HashMap::new();
+                    for part in &partitions {
+                        if part.is_extended_container {
+                            continue;
+                        }
+                        let is_fat_byte = matches!(
+                            part.partition_type_byte,
+                            0x01 | 0x04
+                                | 0x06
+                                | 0x0B
+                                | 0x0C
+                                | 0x0E
+                                | 0x14
+                                | 0x16
+                                | 0x1B
+                                | 0x1C
+                                | 0x1E
+                        );
+                        let is_fat_superfloppy = matches!(
+                            &table,
+                            PartitionTable::None { fs_hint, .. } if fs_hint == "FAT"
+                        );
+                        if !(is_fat_byte || is_fat_superfloppy) {
+                            continue;
+                        }
+                        let Some(br) = make_probe_reader() else {
+                            continue;
+                        };
+                        if let Ok(fs) =
+                            rusty_backup::fs::fat::FatFilesystem::open(br, part.start_lba * 512)
+                        {
+                            use rusty_backup::fs::Filesystem;
+                            if let Some(label) = fs.volume_label() {
+                                let trimmed = label.trim();
+                                if !trimmed.is_empty() {
+                                    partition_volume_labels.insert(part.index, trimmed.to_string());
+                                }
+                            }
+                        }
+                    }
+
                     // Compute minimum partition sizes via filesystem analysis.
                     // Cheap filesystems (FAT/NTFS/exFAT) are computed eagerly here;
                     // expensive ones (HFS/HFS+/ext/btrfs/ProDOS) come back as
                     // Deferred and are surfaced in the UI as a per-row button.
                     set_step("Analyzing filesystem sizes...");
                     let mut partition_min_sizes = HashMap::new();
+                    let mut partition_defrag_min_sizes: HashMap<usize, u64> = HashMap::new();
                     let mut deferred_min_sizes: HashMap<usize, &'static str> = HashMap::new();
                     for part in &partitions {
                         if part.is_extended_container {
@@ -1964,9 +2164,18 @@ impl InspectTab {
                             }
                         };
                         match result {
-                            rusty_backup::fs::MinimumResult::Computed(Some(min_size)) => {
+                            rusty_backup::fs::MinimumResult::Computed {
+                                in_place: Some(min_size),
+                                defragmented,
+                            } => {
                                 let clamped = min_size.min(part.size_bytes);
                                 partition_min_sizes.insert(part.index, clamped);
+                                if let Some(d) = defragmented {
+                                    let d_clamped = d.min(part.size_bytes);
+                                    if d_clamped < clamped {
+                                        partition_defrag_min_sizes.insert(part.index, d_clamped);
+                                    }
+                                }
                                 push_log(format!(
                                     "Partition {}: minimum size {} (original {})",
                                     part.index,
@@ -1974,7 +2183,9 @@ impl InspectTab {
                                     rusty_backup::partition::format_size(part.size_bytes),
                                 ));
                             }
-                            rusty_backup::fs::MinimumResult::Computed(None) => {}
+                            rusty_backup::fs::MinimumResult::Computed {
+                                in_place: None, ..
+                            } => {}
                             rusty_backup::fs::MinimumResult::Deferred { fs_name } => {
                                 push_log(format!(
                                     "Partition {}: need to calculate minimum size due to filesystem {fs_name} (click \"Calc min\" to compute)",
@@ -1991,6 +2202,8 @@ impl InspectTab {
                         s.alignment = Some(alignment);
                         s.partitions = partitions;
                         s.partition_min_sizes = partition_min_sizes;
+                        s.partition_defrag_min_sizes = partition_defrag_min_sizes;
+                        s.partition_volume_labels = partition_volume_labels;
                         s.deferred_min_sizes = deferred_min_sizes;
                         // On macOS, pass the open fd + claim to the main thread
                         // so BrowseView can reuse it without re-opening/re-prompting.
@@ -2173,6 +2386,7 @@ impl InspectTab {
                 // Header
                 ui.label(egui::RichText::new("#").strong());
                 ui.label(egui::RichText::new("Type").strong());
+                ui.label(egui::RichText::new("Volume").strong());
                 ui.label(egui::RichText::new("Start LBA").strong());
                 ui.label(egui::RichText::new("Size").strong());
                 let show_min_col = self.backup_metadata.is_some()
@@ -2180,7 +2394,13 @@ impl InspectTab {
                     || !self.deferred_min_sizes.is_empty()
                     || !self.pending_min_size_calcs.is_empty();
                 if show_min_col {
-                    ui.label(egui::RichText::new("Min Size").strong());
+                    ui.label(egui::RichText::new("Min Size").strong())
+                        .on_hover_text("Smallest size achievable by trim alone (no data movement)");
+                    ui.label(egui::RichText::new("Defrag Min").strong())
+                        .on_hover_text(
+                            "Smallest size achievable by cloning into a packed target. \
+                             Used when restoring with \"Resize partitions to minimum size.\"",
+                        );
                 }
                 ui.label(egui::RichText::new("Block Size").strong());
                 ui.label(egui::RichText::new("Boot").strong());
@@ -2198,6 +2418,8 @@ impl InspectTab {
                     if part.is_extended_container {
                         ui.label(egui::RichText::new(index_label).color(egui::Color32::GRAY));
                         ui.label(egui::RichText::new(&part.type_name).color(egui::Color32::GRAY));
+                        // Volume column — extended containers have no filesystem.
+                        ui.label("");
                         ui.label(
                             egui::RichText::new(format!("{}", part.start_lba))
                                 .color(egui::Color32::GRAY),
@@ -2226,6 +2448,8 @@ impl InspectTab {
                             } else {
                                 ui.label("");
                             }
+                            // Defrag Min column.
+                            ui.label("");
                         }
                         ui.label("");
                         ui.label("");
@@ -2233,10 +2457,15 @@ impl InspectTab {
                     } else {
                         ui.label(index_label);
                         ui.label(&part.type_name);
+                        // Volume column. Always probed live from the
+                        // partition itself — never persisted to backup
+                        // metadata.
+                        let volume_label = self.partition_volume_labels.get(&part.index);
+                        ui.label(volume_label.map(String::as_str).unwrap_or(""));
                         ui.label(format!("{}", part.start_lba));
                         ui.label(partition::format_size(part.size_bytes));
                         if show_min_col {
-                            let min_size = self
+                            let in_place_min = self
                                 .backup_metadata
                                 .as_ref()
                                 .and_then(|m| {
@@ -2265,7 +2494,24 @@ impl InspectTab {
                                         .copied()
                                         .filter(|&sz| sz < part.size_bytes)
                                 });
-                            if let Some(sz) = min_size {
+                            let defrag_min = self
+                                .backup_metadata
+                                .as_ref()
+                                .and_then(|m| {
+                                    m.partitions
+                                        .iter()
+                                        .find(|pm| pm.index == part.index)
+                                        .and_then(|pm| pm.defragmented_min_size_bytes)
+                                })
+                                .filter(|&sz| sz > 0 && sz < part.size_bytes)
+                                .or_else(|| {
+                                    self.partition_defrag_min_sizes
+                                        .get(&part.index)
+                                        .copied()
+                                        .filter(|&sz| sz < part.size_bytes)
+                                });
+                            // Min Size column (in-place trim point).
+                            if let Some(sz) = in_place_min {
                                 ui.label(partition::format_size(sz));
                             } else if let Some(pending) =
                                 self.pending_min_size_calcs.get(&part.index)
@@ -2287,6 +2533,18 @@ impl InspectTab {
                                 }
                             } else {
                                 ui.label("");
+                            }
+                            // Defrag Min column.
+                            match (defrag_min, in_place_min) {
+                                (Some(d), Some(m)) if d < m => {
+                                    ui.label(partition::format_size(d));
+                                }
+                                (Some(d), None) => {
+                                    ui.label(partition::format_size(d));
+                                }
+                                _ => {
+                                    ui.label("");
+                                }
                             }
                         }
                         if let Some(bs) = part.hfs_block_size {
@@ -2785,10 +3043,27 @@ impl InspectTab {
                             .unwrap_or(min);
                         let clamped = min.min(part_size);
                         self.partition_min_sizes.insert(idx, clamped);
-                        ctx.log.info(format!(
-                            "Partition {idx}: minimum size {} (computed)",
-                            partition::format_size(clamped),
-                        ));
+                        if let Some(d) = s.defragmented_min {
+                            let d_clamped = d.min(part_size);
+                            if d_clamped < clamped {
+                                self.partition_defrag_min_sizes.insert(idx, d_clamped);
+                                ctx.log.info(format!(
+                                    "Partition {idx}: minimum size {} (computed); defragmented {}",
+                                    partition::format_size(clamped),
+                                    partition::format_size(d_clamped),
+                                ));
+                            } else {
+                                ctx.log.info(format!(
+                                    "Partition {idx}: minimum size {} (computed)",
+                                    partition::format_size(clamped),
+                                ));
+                            }
+                        } else {
+                            ctx.log.info(format!(
+                                "Partition {idx}: minimum size {} (computed)",
+                                partition::format_size(clamped),
+                            ));
+                        }
                     } else {
                         ctx.log.info(format!(
                             "Partition {idx}: filesystem could not be opened for minimum-size calculation",
@@ -2796,6 +3071,109 @@ impl InspectTab {
                     }
                 }
                 self.deferred_min_sizes.remove(&idx);
+            }
+        }
+    }
+
+    /// Spawn one volume-label probe per HFS+ partition in the loaded backup.
+    /// The worker reads the volume header + first catalog leaf out of the
+    /// partition's data file (raw / zstd / per-partition CHD) and posts the
+    /// label back through `pending_volume_label_probes`. Single-file-CHD
+    /// backups bypass this path because they re-enter `run_inspect` which
+    /// uses the synchronous live-disk probe.
+    fn spawn_volume_label_probes(&mut self, ctx: &mut TabContext) {
+        use rusty_backup::model::volume_label_runner::{
+            spawn as spawn_label, VolumeLabelRequest, VolumeLabelSource,
+        };
+
+        let folder = match &self.backup_folder_path {
+            Some(f) => f.clone(),
+            None => return,
+        };
+        let meta = match &self.backup_metadata {
+            Some(m) => m.clone(),
+            None => return,
+        };
+
+        let compression = meta.compression_type.clone();
+        for part in &self.partitions {
+            // Only HFS+/HFSX partitions have a label worth probing here.
+            // We use the same set of partition-type checks as the inspect-tab
+            // live-disk path (Apple_HFS APM string + 0xAF MBR byte).
+            let is_hfs_plus = part.partition_type_byte == 0xAF
+                || part.partition_type_string.as_deref() == Some("Apple_HFS")
+                || part.partition_type_string.as_deref() == Some("Apple_HFS+")
+                || part.partition_type_string.as_deref() == Some("Apple_HFSX");
+            if !is_hfs_plus {
+                continue;
+            }
+            let pm = match meta.partitions.iter().find(|p| p.index == part.index) {
+                Some(pm) => pm,
+                None => continue,
+            };
+            // Skip partitions whose data file is split across multiple parts
+            // (the probe needs random-access read; concatenating splits is
+            // out of scope here).
+            if pm.compressed_files.len() != 1 {
+                continue;
+            }
+            let data_path = folder.join(&pm.compressed_files[0]);
+            if !data_path.exists() {
+                continue;
+            }
+            let source = match compression.as_str() {
+                "none" => VolumeLabelSource::Raw {
+                    path: data_path,
+                    partition_offset: 0,
+                },
+                "zstd" => VolumeLabelSource::Zstd { path: data_path },
+                "chd" => VolumeLabelSource::Chd {
+                    path: data_path,
+                    partition_offset: 0,
+                },
+                _ => continue,
+            };
+            let status = spawn_label(VolumeLabelRequest {
+                source,
+                partition_index: part.index,
+            });
+            self.pending_volume_label_probes.insert(part.index, status);
+        }
+        let count = self.pending_volume_label_probes.len();
+        if count > 0 {
+            ctx.log.info(format!(
+                "Probing {count} HFS+ partition label(s) from backup data..."
+            ));
+        }
+    }
+
+    /// Poll all pending volume-label workers; on completion, append the label
+    /// to the matching partition's `type_name` so the partition list shows
+    /// "Apple_HFS (HFS+) Ariel-backup" instead of just the type.
+    fn poll_volume_label_probes(&mut self, ctx: &mut TabContext) {
+        let finished_indices: Vec<usize> = self
+            .pending_volume_label_probes
+            .iter()
+            .filter_map(|(idx, status)| status.lock().ok().filter(|s| s.finished).map(|_| *idx))
+            .collect();
+        for idx in finished_indices {
+            if let Some(status_arc) = self.pending_volume_label_probes.remove(&idx) {
+                if let Ok(s) = status_arc.lock() {
+                    if let Some(err) = &s.error {
+                        ctx.log.warn(format!(
+                            "Volume label probe failed for partition {idx}: {err}",
+                        ));
+                    } else if let Some(label) = s.label.clone() {
+                        if let Some(part) = self.partitions.iter_mut().find(|p| p.index == idx) {
+                            let new_name = apply_volume_label(&part.type_name, &label);
+                            if part.type_name != new_name {
+                                part.type_name = new_name;
+                                self.partitions_layout_dirty = true;
+                            }
+                            ctx.log.info(format!("Partition {idx} label: {label}"));
+                        }
+                    }
+                }
             }
         }
     }
@@ -3104,6 +3482,8 @@ impl InspectTab {
 
         let cache_for_thread = Arc::clone(&cache);
         std::thread::spawn(move || {
+            let _wake =
+                rusty_backup::os::wakelock::acquire("Rusty Backup: Clonezilla metadata scan");
             let result = clonezilla::metadata_scan::scan_metadata(
                 &cache_for_thread,
                 ptype,
@@ -3186,6 +3566,8 @@ impl InspectTab {
 
         let data_path = data_path.clone();
         std::thread::spawn(move || {
+            let _wake =
+                rusty_backup::os::wakelock::acquire("Rusty Backup: build zstd seekable cache");
             let result = create_seekable_cache_from_zstd(&data_path, &cache_path, &status);
             if let Ok(mut s) = status.lock() {
                 s.finished = true;
@@ -3455,6 +3837,38 @@ fn format_block_size(bytes: u32) -> String {
     }
 }
 
+/// Apply a probed volume label to a partition's `type_name`, replacing any
+/// trailing parenthetical garbage that older metadata.json files baked in.
+///
+/// Old backups can carry `type_name` strings like
+/// `Apple_HFS (HFS+) (Apple_HFS (HFS+)_Untitled_1)` because the inspect-tab
+/// relabel logic that produces them ran before the auto-generated APM-name
+/// suppression existed. Once we have a real volume label from a fresh probe,
+/// the noise parenthetical adds no information — strip it and append the
+/// label so the row reads `Apple_HFS (HFS+) Ariel-backup`.
+fn apply_volume_label(type_name: &str, label: &str) -> String {
+    let trimmed = strip_apm_noise_parenthetical(type_name);
+    if trimmed.trim_end().ends_with(label) {
+        trimmed.to_string()
+    } else {
+        format!("{} {}", trimmed.trim_end(), label)
+    }
+}
+
+/// Drop any trailing parenthetical that lives *after* the variant tag for
+/// HFS-family type names. `Apple_HFS (HFS+) (Untitled_1)` -> `Apple_HFS (HFS+)`,
+/// `Apple_HFS (HFSX) (whatever)` -> `Apple_HFS (HFSX)`, leave non-HFS rows
+/// alone.
+fn strip_apm_noise_parenthetical(s: &str) -> String {
+    for tag in ["(HFS+)", "(HFSX)", "(HFS)"] {
+        if let Some(idx) = s.find(tag) {
+            let end = idx + tag.len();
+            return s[..end].to_string();
+        }
+    }
+    s.to_string()
+}
+
 /// Format a byte count with digit grouping for readability
 /// (e.g. 1,048,576).
 fn format_bytes_grouped(bytes: u64) -> String {
@@ -3467,4 +3881,56 @@ fn format_bytes_grouped(bytes: u64) -> String {
         result.push(ch);
     }
     result.chars().rev().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_volume_label_strips_legacy_apm_garbage() {
+        // Old metadata carried a doubly-nested parenthetical from the days
+        // before the relabel logic suppressed Disk-Utility-default names.
+        assert_eq!(
+            apply_volume_label(
+                "Apple_HFS (HFS+) (Apple_HFS (HFS+)_Untitled_1)",
+                "Ariel-backup",
+            ),
+            "Apple_HFS (HFS+) Ariel-backup",
+        );
+    }
+
+    #[test]
+    fn apply_volume_label_appends_to_clean_name() {
+        assert_eq!(
+            apply_volume_label("Apple_HFS (HFS+)", "Ariel-backup"),
+            "Apple_HFS (HFS+) Ariel-backup",
+        );
+    }
+
+    #[test]
+    fn apply_volume_label_idempotent_when_already_present() {
+        assert_eq!(
+            apply_volume_label("Apple_HFS (HFS+) Ariel-backup", "Ariel-backup"),
+            "Apple_HFS (HFS+) Ariel-backup",
+        );
+    }
+
+    #[test]
+    fn apply_volume_label_handles_hfsx_and_classic_hfs() {
+        assert_eq!(
+            apply_volume_label("Apple_HFS (HFSX) (Untitled_2)", "Foo"),
+            "Apple_HFS (HFSX) Foo",
+        );
+        assert_eq!(
+            apply_volume_label("Apple_HFS (HFS) (Old)", "Bar"),
+            "Apple_HFS (HFS) Bar",
+        );
+    }
+
+    #[test]
+    fn apply_volume_label_non_hfs_left_alone() {
+        // No HFS variant tag found -> nothing to strip; just append.
+        assert_eq!(apply_volume_label("Linux", "label"), "Linux label");
+    }
 }

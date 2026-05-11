@@ -14,8 +14,13 @@ pub fn compute_checksum(path: &Path, checksum_type: ChecksumType) -> Result<Stri
     let file = File::open(path)
         .with_context(|| format!("failed to open {} for checksum", path.display()))?;
     let mut reader = BufReader::new(file);
-    let mut buf = vec![0u8; READ_BUF_SIZE];
+    hash_reader_to_eof(&mut reader, checksum_type)
+}
 
+/// Compute a checksum by reading `reader` to EOF. Used for whole-file
+/// hashing where the size is determined by the stream itself.
+pub fn hash_reader_to_eof(reader: &mut dyn Read, checksum_type: ChecksumType) -> Result<String> {
+    let mut buf = vec![0u8; READ_BUF_SIZE];
     match checksum_type {
         ChecksumType::Sha256 => {
             use sha2::{Digest, Sha256};
@@ -27,7 +32,11 @@ pub fn compute_checksum(path: &Path, checksum_type: ChecksumType) -> Result<Stri
                 }
                 hasher.update(&buf[..n]);
             }
-            Ok(format!("{:x}", hasher.finalize()))
+            Ok(hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect())
         }
         ChecksumType::Crc32 => {
             let mut hasher = crc32fast::Hasher::new();
@@ -37,6 +46,64 @@ pub fn compute_checksum(path: &Path, checksum_type: ChecksumType) -> Result<Stri
                     break;
                 }
                 hasher.update(&buf[..n]);
+            }
+            Ok(format!("{:08x}", hasher.finalize()))
+        }
+    }
+}
+
+/// Compute a checksum over exactly `length` bytes read from `reader`,
+/// optionally invoking `progress_cb` with the cumulative byte count after
+/// each chunk. Used by single-file-CHD post-write hashing where each
+/// partition is a sub-range of the container, not a whole file.
+///
+/// `progress_cb` receives the *delta* since the last invocation as the
+/// `n` argument so the caller can blend per-partition progress into a
+/// running total without bookkeeping.
+pub fn hash_reader_range(
+    reader: &mut dyn Read,
+    length: u64,
+    checksum_type: ChecksumType,
+    progress_cb: &mut dyn FnMut(u64),
+) -> Result<String> {
+    let mut buf = vec![0u8; READ_BUF_SIZE];
+    match checksum_type {
+        ChecksumType::Sha256 => {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            let mut remaining = length;
+            while remaining > 0 {
+                let want = (remaining as usize).min(buf.len());
+                let n = reader
+                    .read(&mut buf[..want])
+                    .context("checksum read error")?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+                remaining -= n as u64;
+                progress_cb(n as u64);
+            }
+            Ok(hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect())
+        }
+        ChecksumType::Crc32 => {
+            let mut hasher = crc32fast::Hasher::new();
+            let mut remaining = length;
+            while remaining > 0 {
+                let want = (remaining as usize).min(buf.len());
+                let n = reader
+                    .read(&mut buf[..want])
+                    .context("checksum read error")?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+                remaining -= n as u64;
+                progress_cb(n as u64);
             }
             Ok(format!("{:08x}", hasher.finalize()))
         }

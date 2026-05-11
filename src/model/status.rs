@@ -30,6 +30,14 @@ pub struct InspectStatus {
     pub alignment: Option<PartitionAlignment>,
     pub partitions: Vec<PartitionInfo>,
     pub partition_min_sizes: HashMap<usize, u64>,
+    /// Defragmented minimum (size after a clone-shrink). Populated only for
+    /// HFS+ partitions where it can differ meaningfully from the in-place
+    /// trim point in `partition_min_sizes`.
+    pub partition_defrag_min_sizes: HashMap<usize, u64>,
+    /// Per-partition volume labels (FAT volume label, HFS+ volume name, etc.)
+    /// for display in the inspect grid. Empty when the filesystem has no
+    /// label or could not be probed.
+    pub partition_volume_labels: HashMap<usize, String>,
     /// Partitions whose minimum size requires an expensive volume walk; the
     /// GUI surfaces a "Calculate minimum size" button per index. Value is the
     /// human-readable filesystem name (for log/UI text).

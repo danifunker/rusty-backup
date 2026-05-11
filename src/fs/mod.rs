@@ -10,6 +10,9 @@ pub mod hfs_clone;
 pub mod hfs_common;
 pub mod hfs_fsck;
 pub mod hfsplus;
+pub mod hfsplus_clone;
+pub mod hfsplus_defrag;
+pub mod hfsplus_fsck;
 pub mod layout_preserving;
 pub mod mac_alias;
 pub mod ntfs;
@@ -32,10 +35,10 @@ pub use fat::{
     patch_bpb_hidden_sectors, resize_fat_in_place, set_fat_clean_flags, validate_fat_integrity,
     CompactFatReader,
 };
+use filesystem::FilesystemError;
 pub use filesystem::{
-    CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, ResourceForkSource,
+    CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, ResourceForkSource,
 };
-use filesystem::{Filesystem, FilesystemError};
 pub use fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry, RepairReport};
 pub use hfs::{
     hfs_max_growable_size, resize_hfs_in_place, validate_hfs_integrity, CompactHfsReader,
@@ -349,29 +352,69 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
     }
 }
 
-/// Like `compact_partition_reader`, but always produces a *layout-preserving*
-/// stream — `info.compacted_size == info.original_size`, with allocated
-/// regions byte-equal to the source and free regions emitted as zeros.
+/// `Read` adapter that emits an inner reader's bytes followed by zero-fill
+/// up to a fixed total length. Used by `packed_partition_reader_padded` to
+/// place a packed FS volume at the start of a partition extent and zero-fill
+/// the trailing slack so the partition table's extent size still matches.
+struct ZeroPaddedReader<R> {
+    inner: R,
+    inner_remaining: u64,
+    pad_remaining: u64,
+}
+
+impl<R: Read> Read for ZeroPaddedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.inner_remaining > 0 {
+            let want = (self.inner_remaining as usize).min(buf.len());
+            let n = self.inner.read(&mut buf[..want])?;
+            if n == 0 {
+                // Inner exhausted early — convert the rest of inner_remaining
+                // into pad_remaining so the caller still sees a stream of the
+                // declared total length. This mirrors LayoutPreservingReader's
+                // short-source handling.
+                self.pad_remaining = self.pad_remaining.saturating_add(self.inner_remaining);
+                self.inner_remaining = 0;
+                return self.read(buf);
+            }
+            self.inner_remaining -= n as u64;
+            Ok(n)
+        } else if self.pad_remaining > 0 {
+            let n = (self.pad_remaining as usize).min(buf.len());
+            buf[..n].fill(0);
+            self.pad_remaining -= n as u64;
+            Ok(n)
+        } else {
+            Ok(0)
+        }
+    }
+}
+
+/// Like `layout_preserving_partition_reader`, but for FAT/NTFS/exFAT it
+/// returns the *packed* compact reader (allocated clusters at the start,
+/// FS metadata shrunk to fit) padded with zeros up to `original_size`.
 ///
-/// FAT/NTFS/exFAT route through their `into_layout_preserving` adapters
-/// (which reuse the existing parsing pass). HFS, HFS+, ext, btrfs, and
-/// ProDOS already emit layout-preserving streams from `compact_partition_reader`,
-/// so they're forwarded through unchanged. Any FS without a layout-preserving
-/// reader returns `None`, leaving the caller to fall back to raw passthrough.
+/// The resulting stream still has length == `original_size`, so it slots
+/// into the partition's extent inside a synthesised disk image without
+/// changing the partition table. Inside that extent, the OS sees a smaller
+/// FAT/NTFS/exFAT volume at offset 0 (BPB / boot sector reflects the
+/// shrunken total_sectors) followed by a zero-filled tail. CHD compresses
+/// the tail to nothing.
 ///
-/// Used by the single-file CHD backup path: the resulting stream lines up
-/// with the synthesised disk image's offsets, so `compress_chd` produces
-/// a CHD whose hunks match the source disk image byte-for-byte for every
-/// allocated cluster.
-pub fn layout_preserving_partition_reader<R: Read + Seek + Send + 'static>(
+/// HFS/HFS+/ext/btrfs/ProDOS keep their existing layout-preserving stream
+/// (those readers are already byte-faithful at `original_size`).
+///
+/// Used by single-file CHD backup when not in sector-by-sector mode: the
+/// FAT-family partitions emerge defragmented in place, and the streaming
+/// pattern is sequential rather than seek-heavy.
+pub fn packed_partition_reader_padded<R: Read + Seek + Send + 'static>(
     mut reader: R,
     partition_offset: u64,
     partition_type: u8,
     partition_type_string: Option<&str>,
 ) -> Option<(Box<dyn Read + Send>, CompactResult)> {
-    // String-typed (APM) partitions go through the existing dispatcher
-    // since their compact readers (HFS/HFS+/ext/btrfs) are already
-    // layout-preserving.
+    // APM and HFS/ext/btrfs/ProDOS go through the existing dispatcher —
+    // those readers are already layout-preserving (compacted_size ==
+    // original_size), so no padding is needed.
     if partition_type_string.is_some() {
         return compact_partition_reader(
             reader,
@@ -380,70 +423,84 @@ pub fn layout_preserving_partition_reader<R: Read + Seek + Send + 'static>(
             partition_type_string,
         );
     }
-
     match partition_type {
-        // Auto-detect: probe the boot sector then choose.
+        0x83 | 0xAF | 0xA8 => {
+            return compact_partition_reader(
+                reader,
+                partition_offset,
+                partition_type,
+                partition_type_string,
+            );
+        }
+        _ => {}
+    }
+
+    // For FAT/NTFS/exFAT: build the packed reader (compacted_size <
+    // original_size) and pad it with zeros to original_size.
+    let (compact_reader, info): (Box<dyn Read + Send>, CompactResult) = match partition_type {
         0x00 => {
             let fs_type = detect_filesystem_type(&mut reader, partition_offset);
             match fs_type {
                 "fat" => {
-                    let (compact, _) = CompactFatReader::new(reader, partition_offset).ok()?;
-                    let (lp, info) = compact.into_layout_preserving();
-                    Some((Box::new(lp), info))
+                    let (r, info) = CompactFatReader::new(reader, partition_offset).ok()?;
+                    (Box::new(r), info)
                 }
                 "ntfs" => {
-                    let (compact, _) = CompactNtfsReader::new(reader, partition_offset).ok()?;
-                    let (lp, info) = compact.into_layout_preserving();
-                    Some((Box::new(lp), info))
+                    let (r, info) = CompactNtfsReader::new(reader, partition_offset).ok()?;
+                    (Box::new(r), info)
                 }
                 "exfat" => {
-                    let (compact, _) = CompactExfatReader::new(reader, partition_offset).ok()?;
-                    let (lp, info) = compact.into_layout_preserving();
-                    Some((Box::new(lp), info))
+                    let (r, info) = CompactExfatReader::new(reader, partition_offset).ok()?;
+                    (Box::new(r), info)
                 }
-                // ext / btrfs / prodos compact readers are already
-                // layout-preserving — defer to the existing dispatcher.
-                _ => compact_partition_reader(
-                    reader,
-                    partition_offset,
-                    partition_type,
-                    partition_type_string,
-                ),
+                _ => {
+                    return compact_partition_reader(
+                        reader,
+                        partition_offset,
+                        partition_type,
+                        partition_type_string,
+                    );
+                }
             }
         }
-        // FAT family
         0x01 | 0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C => {
-            let (compact, _) = CompactFatReader::new(reader, partition_offset).ok()?;
-            let (lp, info) = compact.into_layout_preserving();
-            Some((Box::new(lp), info))
+            let (r, info) = CompactFatReader::new(reader, partition_offset).ok()?;
+            (Box::new(r), info)
         }
-        // NTFS / exFAT (shared type byte; probe to disambiguate)
         0x07 => {
             let fs_type = detect_0x07_type(&mut reader, partition_offset);
             match fs_type {
                 "ntfs" => {
-                    let (compact, _) = CompactNtfsReader::new(reader, partition_offset).ok()?;
-                    let (lp, info) = compact.into_layout_preserving();
-                    Some((Box::new(lp), info))
+                    let (r, info) = CompactNtfsReader::new(reader, partition_offset).ok()?;
+                    (Box::new(r), info)
                 }
                 "exfat" => {
-                    let (compact, _) = CompactExfatReader::new(reader, partition_offset).ok()?;
-                    let (lp, info) = compact.into_layout_preserving();
-                    Some((Box::new(lp), info))
+                    let (r, info) = CompactExfatReader::new(reader, partition_offset).ok()?;
+                    (Box::new(r), info)
                 }
-                _ => None,
+                _ => return None,
             }
         }
-        // HFS/HFS+/ext/btrfs/ProDOS — existing readers are already
-        // layout-preserving.
-        0x83 | 0xAF | 0xA8 => compact_partition_reader(
-            reader,
-            partition_offset,
-            partition_type,
-            partition_type_string,
-        ),
-        _ => None,
-    }
+        _ => return None,
+    };
+
+    let original_size = info.original_size;
+    let compacted_size = info.compacted_size;
+    let pad = original_size.saturating_sub(compacted_size);
+    let padded: Box<dyn Read + Send> = Box::new(ZeroPaddedReader {
+        inner: compact_reader,
+        inner_remaining: compacted_size,
+        pad_remaining: pad,
+    });
+    let padded_info = CompactResult {
+        original_size,
+        // Stream length now equals original_size; downstream guards in
+        // single_file_chd assert this for layout-preserving correctness.
+        compacted_size: original_size,
+        data_size: info.data_size,
+        clusters_used: info.clusters_used,
+    };
+    Some((padded, padded_info))
 }
 
 /// Calculate the effective data size for a partition — the number of bytes
@@ -467,10 +524,42 @@ pub fn effective_partition_size<R: Read + Seek + Send + 'static>(
     fs.last_data_byte().ok()
 }
 
+/// Calculate the defragmented minimum size for a partition — the smallest
+/// size the partition could shrink to **after a clone-into-blank**.
+///
+/// For most filesystems this matches `effective_partition_size` (no clone
+/// path); for HFS+ on fragmented volumes it can be substantially smaller.
+/// Returns `None` if the filesystem can't be opened or doesn't override
+/// the trait default. See `Filesystem::defragmented_minimum_size`.
+pub fn defragmented_partition_size<R: Read + Seek + Send + 'static>(
+    reader: R,
+    partition_offset: u64,
+    partition_type: u8,
+    partition_type_string: Option<&str>,
+) -> Option<u64> {
+    let mut fs = open_filesystem(
+        reader,
+        partition_offset,
+        partition_type,
+        partition_type_string,
+    )
+    .ok()?;
+    fs.defragmented_minimum_size().ok()
+}
+
 /// Outcome of a `partition_minimum_size` call.
 pub enum MinimumResult {
     /// The minimum was computed (or determined to be unavailable for this FS type).
-    Computed(Option<u64>),
+    ///
+    /// `in_place` is the smallest size achievable without moving any data
+    /// (trim only). `defragmented` is the smallest size achievable if the
+    /// volume were cloned into a fresh, packed target — for HFS+ this can
+    /// be substantially smaller on aged/fragmented volumes; for every other
+    /// filesystem it equals `in_place`.
+    Computed {
+        in_place: Option<u64>,
+        defragmented: Option<u64>,
+    },
     /// This filesystem requires an expensive volume walk and the caller did not
     /// opt in via `allow_expensive`. The caller should surface a UI affordance
     /// (e.g. a "Calculate minimum size" button) and re-invoke with `true`.
@@ -546,11 +635,24 @@ pub fn partition_minimum_size<R: Read + Seek + Send + 'static>(
         partition_type_string,
     ) {
         Ok(fs) => fs,
-        Err(_) => return MinimumResult::Computed(None),
+        Err(_) => {
+            return MinimumResult::Computed {
+                in_place: None,
+                defragmented: None,
+            };
+        }
     };
     progress("Computing last data byte...");
-    let min = fs.last_data_byte().ok().map(|m| m.min(partition_size));
-    MinimumResult::Computed(min)
+    let in_place = fs.last_data_byte().ok().map(|m| m.min(partition_size));
+    progress("Computing defragmented minimum...");
+    let defragmented = fs
+        .defragmented_minimum_size()
+        .ok()
+        .map(|m| m.min(partition_size));
+    MinimumResult::Computed {
+        in_place,
+        defragmented,
+    }
 }
 
 /// Open a filesystem for browsing within a partition.
@@ -702,10 +804,11 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
             "Apple_HFS" => {
                 let (fs_type, hfsplus_offset) = resolve_apple_hfs(&mut reader, partition_offset);
                 return match fs_type {
-                    "hfsplus" => Ok(Box::new(hfsplus::HfsPlusFilesystem::open(
-                        reader,
-                        hfsplus_offset,
-                    )?)),
+                    "hfsplus" => {
+                        let mut fs = hfsplus::HfsPlusFilesystem::open(reader, hfsplus_offset)?;
+                        fs.prepare_for_edit()?;
+                        Ok(Box::new(fs))
+                    }
                     "hfs" => Ok(Box::new(hfs::HfsFilesystem::open(
                         reader,
                         partition_offset,
@@ -716,10 +819,9 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                 };
             }
             "Apple_HFSX" => {
-                return Ok(Box::new(hfsplus::HfsPlusFilesystem::open(
-                    reader,
-                    partition_offset,
-                )?));
+                let mut fs = hfsplus::HfsPlusFilesystem::open(reader, partition_offset)?;
+                fs.prepare_for_edit()?;
+                return Ok(Box::new(fs));
             }
             "Apple_UNIX_SVR2" | "Apple_UNIX_SRVR2" => {
                 let fs_type = detect_filesystem_type(&mut reader, partition_offset);
@@ -771,10 +873,11 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
-                "hfsplus" => Ok(Box::new(hfsplus::HfsPlusFilesystem::open(
-                    reader,
-                    partition_offset,
-                )?)),
+                "hfsplus" => {
+                    let mut fs = hfsplus::HfsPlusFilesystem::open(reader, partition_offset)?;
+                    fs.prepare_for_edit()?;
+                    Ok(Box::new(fs))
+                }
                 "prodos" => Ok(Box::new(prodos::ProDosFilesystem::open(
                     reader,
                     partition_offset,
@@ -838,10 +941,11 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
         0xAF => {
             let (fs_type, hfsplus_offset) = resolve_apple_hfs(&mut reader, partition_offset);
             match fs_type {
-                "hfsplus" => Ok(Box::new(hfsplus::HfsPlusFilesystem::open(
-                    reader,
-                    hfsplus_offset,
-                )?)),
+                "hfsplus" => {
+                    let mut fs = hfsplus::HfsPlusFilesystem::open(reader, hfsplus_offset)?;
+                    fs.prepare_for_edit()?;
+                    Ok(Box::new(fs))
+                }
                 "hfs" => Ok(Box::new(hfs::HfsFilesystem::open(
                     reader,
                     partition_offset,
@@ -995,7 +1099,10 @@ fn compact_partition_reader_by_string<R: Read + Seek + Send + 'static>(
 /// - Embedded HFS+ (HFS wrapper with 0x4244 MDB, drEmbedSigWord == 0x482B): `hfsplus_offset`
 ///   is calculated from the MDB's drAlBlSt/drAlBlkSiz/drEmbedExtent fields.
 /// - Pure HFS (0x4244, no embedded HFS+): returns `"hfs"`.
-fn resolve_apple_hfs<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> (&'static str, u64) {
+pub(crate) fn resolve_apple_hfs<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+) -> (&'static str, u64) {
     // The HFS MDB / HFS+ volume header sits at partition_offset + 1024 (sector-aligned).
     // Read 512 bytes (one sector) — all required fields are within the first 512 bytes
     // of the MDB (largest field needed is drEmbedExtent.startBlock at MDB offset 127).
@@ -1072,6 +1179,90 @@ pub fn hfs_block_size_at_offset<R: Read + Seek>(
 
 /// Probe an "Apple_HFS" APM partition to detect the actual filesystem type.
 ///
+/// Read the HFS+/HFSX volume header signature at `partition_offset`. Returns
+/// `Some(0x482B)` for HFS+, `Some(0x4858)` for HFSX, or `None` when the
+/// partition isn't an HFS+/HFSX volume (including pure classic HFS — those
+/// carry an MDB rather than a VH at offset+1024). Handles the embedded /
+/// wrapped HFS+ case via `resolve_apple_hfs`.
+pub fn probe_hfsplus_signature<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+) -> Option<u16> {
+    let (fs_type, hfsplus_offset) = resolve_apple_hfs(reader, partition_offset);
+    if fs_type != "hfsplus" {
+        return None;
+    }
+    reader.seek(SeekFrom::Start(hfsplus_offset + 1024)).ok()?;
+    let mut sig = [0u8; 2];
+    reader.read_exact(&mut sig).ok()?;
+    Some(u16::from_be_bytes(sig))
+}
+
+/// Pre-flight check for the streamed defrag-clone backup path. Returns
+/// `Ok(())` when the partition is a plain HFS+/HFSX volume that the
+/// shrink-to-minimum pipeline can safely emit, or `Err(reason)` with a
+/// human-readable explanation when it cannot.
+///
+/// Refused cases:
+/// - **Embedded HFS+ inside an HFS wrapper** — the classic Mac OS 9
+///   layout where an outer `Apple_HFS` partition holds an HFS volume
+///   whose MDB points at an inner HFS+ via `drEmbedExtent`. Cloning the
+///   inner volume to a flat HFS+ would silently drop the wrapper.
+/// - **Dirty journaled volume** — `kHFSVolumeJournaledBit` set with
+///   `kHFSVolumeUnmountedBit` clear. The journal carries pending metadata
+///   changes the catalog hasn't yet absorbed; cloning the catalog as-is
+///   would lose them.
+///
+/// A cleanly-unmounted journaled volume is *accepted* — the journal is
+/// empty / replayed, so the catalog is authoritative and the cloned
+/// target (built without the journaled bit) effectively nullifies the
+/// journal.
+///
+/// Volumes that aren't HFS+/HFSX at all return `Err` with a generic
+/// "not an HFS+ volume" reason — callers should typically branch on
+/// fs-type before reaching this helper.
+pub fn can_defrag_clone_hfsplus<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+) -> Result<(), String> {
+    let (fs_type, hfsplus_offset) = resolve_apple_hfs(reader, partition_offset);
+    if fs_type != "hfsplus" {
+        return Err("not an HFS+/HFSX volume".into());
+    }
+    if hfsplus_offset != partition_offset {
+        return Err(
+            "embedded HFS+ inside an HFS wrapper — shrink-to-minimum is not supported \
+             for this layout. Disable shrink-to-minimum for this backup, or restore \
+             the disk first to a flat HFS+ volume."
+                .into(),
+        );
+    }
+    // Read the VH attributes word (offset 4, 4 bytes) to test the journal bits.
+    if reader
+        .seek(SeekFrom::Start(hfsplus_offset + 1024 + 4))
+        .is_err()
+    {
+        return Err("failed to seek to VH attributes word".into());
+    }
+    let mut buf = [0u8; 4];
+    if reader.read_exact(&mut buf).is_err() {
+        return Err("failed to read VH attributes word".into());
+    }
+    let attributes = u32::from_be_bytes(buf);
+    let journaled = attributes & 0x2000 != 0;
+    let unmounted_clean = attributes & 0x100 != 0;
+    if journaled && !unmounted_clean {
+        return Err(
+            "journaled HFS+ volume is dirty (kHFSVolumeUnmountedBit clear) — the \
+             on-disk journal carries pending metadata changes that haven't been \
+             applied to the catalog. Mount + cleanly unmount the volume first \
+             (or run `fsck_hfs -f` against it), then re-run the backup."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// Returns `"HFS+"`, `"HFSX"`, `"HFS"`, or `"unknown"`. Useful for updating
 /// display names after partition table detection.
 pub fn probe_apple_hfs_type<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> &'static str {

@@ -176,6 +176,7 @@ pub fn start_clonezilla_whole_disk(
     let status_thread = Arc::clone(&status);
 
     std::thread::spawn(move || {
+        let _wake = crate::os::wakelock::acquire("Rusty Backup: Clonezilla disk export");
         let status2 = Arc::clone(&status_thread);
         let status3 = Arc::clone(&status_thread);
         let result = export_clonezilla_disk(
@@ -221,6 +222,7 @@ pub fn start_native_whole_disk(
     let status_thread = Arc::clone(&status);
 
     std::thread::spawn(move || {
+        let _wake = crate::os::wakelock::acquire("Rusty Backup: whole-disk export");
         let status2 = Arc::clone(&status_thread);
         let status3 = Arc::clone(&status_thread);
         let result = export_whole_disk(
@@ -289,6 +291,7 @@ pub fn start_native_whole_disk_chd(
     let status_thread = Arc::clone(&status);
 
     std::thread::spawn(move || {
+        let _wake = crate::os::wakelock::acquire("Rusty Backup: CHD/BinCue export");
         let status2 = Arc::clone(&status_thread);
         let status3 = Arc::clone(&status_thread);
         let status_log = Arc::clone(&status_thread);
@@ -414,6 +417,7 @@ pub fn start_per_partition(inputs: PerPartitionInputs) -> Arc<Mutex<ExportStatus
     let status_thread = Arc::clone(&status);
 
     std::thread::spawn(move || {
+        let _wake = crate::os::wakelock::acquire("Rusty Backup: per-partition export");
         let result = run_per_partition(
             format,
             ext,

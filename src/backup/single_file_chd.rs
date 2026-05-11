@@ -32,7 +32,7 @@
 //! validation.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
@@ -84,6 +84,11 @@ pub struct SingleFileChdInputs<'a> {
     /// vintage OSes still accept the layout. Ignored on the no-resize
     /// streaming path.
     pub alignment_sectors: u64,
+    /// Checksum algorithm for per-partition byte-range hashes recorded
+    /// in metadata.json. Defaults to SHA-256; the caller (`run_backup`)
+    /// passes `config.checksum` so backups stay consistent regardless
+    /// of layout.
+    pub checksum_type: super::ChecksumType,
 }
 
 /// Per-partition byte range + checksum, returned to the caller for
@@ -93,7 +98,7 @@ pub struct ChdPartitionRange {
     pub partition_index: usize,
     pub offset_in_disk: u64,
     pub length: u64,
-    pub checksum_sha256: String,
+    pub checksum: String,
 }
 
 /// Result of a successful single-file CHD backup.
@@ -196,11 +201,19 @@ pub fn is_supported(inputs_table: &PartitionTable) -> bool {
 /// is fired with cumulative logical bytes written, `cancel_check` is polled
 /// at chunk boundaries by `compress_chd`, and `log_cb` carries user-facing
 /// log lines into the shared `LogPanel`.
+///
+/// `checksum_phase_cb` is invoked once at the start of the post-write
+/// checksum phase with `(0, total_bytes)` and again periodically with
+/// `(current, total_bytes)` so the caller can swap the GUI's progress bar
+/// over from compression to hashing without bookkeeping. The default
+/// no-op closure (`|_, _| {}`) is fine for callers that don't surface
+/// per-phase progress (e.g. the inspect-tab export popup).
 pub fn run(
     inputs: SingleFileChdInputs<'_>,
     progress_cb: &mut dyn FnMut(u64),
     cancel_check: &dyn Fn() -> bool,
     log_cb: &mut dyn FnMut(&str),
+    checksum_phase_cb: &mut dyn FnMut(u64, u64),
 ) -> Result<SingleFileChdResult> {
     if !is_supported(inputs.partition_table) {
         anyhow::bail!(
@@ -239,7 +252,14 @@ pub fn run(
     // sparse-temp-file pipeline. The streaming path below handles the
     // common "Original sizes" case at zero scratch-disk cost.
     if let Some(plans) = build_resize_plans(&inputs)? {
-        return run_with_resize(inputs, &plans, progress_cb, cancel_check, log_cb);
+        return run_with_resize(
+            inputs,
+            &plans,
+            progress_cb,
+            cancel_check,
+            log_cb,
+            checksum_phase_cb,
+        );
     }
 
     let mut builder = DiskImageStreamBuilder::new(inputs.source_size);
@@ -307,7 +327,7 @@ pub fn run(
             partition_index: part.index,
             offset_in_disk: part_offset,
             length: part_length,
-            checksum_sha256: String::new(), // filled in after CHD write
+            checksum: String::new(), // filled in after CHD write
         });
     }
 
@@ -376,7 +396,15 @@ pub fn run(
         "Computing per-partition checksums from {}",
         chd_path.display()
     ));
-    let container_sha1 = compute_post_write_metadata(&chd_path, &mut partition_ranges, log_cb)?;
+    let checksum_total: u64 = partition_ranges.iter().map(|r| r.length).sum();
+    checksum_phase_cb(0, checksum_total);
+    let container_sha1 = compute_post_write_metadata(
+        &chd_path,
+        &mut partition_ranges,
+        inputs.checksum_type,
+        &mut |cur| checksum_phase_cb(cur, checksum_total),
+        log_cb,
+    )?;
 
     Ok(SingleFileChdResult {
         container_filename,
@@ -554,11 +582,22 @@ pub fn run_export(
         output_base: &output_base,
         resize_targets: inputs.resize_targets,
         alignment_sectors: inputs.alignment_sectors,
+        // The export path doesn't write metadata.json, so the only effect
+        // of `checksum_type` here is the per-partition checksum log line
+        // emitted during the post-write pass. SHA-256 is the historical
+        // default — keep it.
+        checksum_type: super::ChecksumType::Sha256,
     };
 
     // `run` returns post-write metadata; we don't need it here — the
     // caller writes no metadata.json on the export path.
-    let _ = run(run_inputs, progress_cb, cancel_check, log_cb)?;
+    let _ = run(
+        run_inputs,
+        progress_cb,
+        cancel_check,
+        log_cb,
+        &mut |_, _| {},
+    )?;
     Ok(())
 }
 
@@ -678,6 +717,7 @@ fn run_with_resize(
     progress_cb: &mut dyn FnMut(u64),
     cancel_check: &dyn Fn() -> bool,
     log_cb: &mut dyn FnMut(&str),
+    checksum_phase_cb: &mut dyn FnMut(u64, u64),
 ) -> Result<SingleFileChdResult> {
     log_cb(&format!(
         "Single-file CHD: backup-time resize plan covers {} partition(s)",
@@ -872,7 +912,7 @@ fn run_with_resize(
                 partition_index: part.index,
                 offset_in_disk: off,
                 length: len,
-                checksum_sha256: String::new(),
+                checksum: String::new(),
             }
         })
         .collect();
@@ -886,7 +926,15 @@ fn run_with_resize(
         "Computing per-partition checksums from {}",
         chd_path.display()
     ));
-    let container_sha1 = compute_post_write_metadata(&chd_path, &mut partition_ranges, log_cb)?;
+    let checksum_total: u64 = partition_ranges.iter().map(|r| r.length).sum();
+    checksum_phase_cb(0, checksum_total);
+    let container_sha1 = compute_post_write_metadata(
+        &chd_path,
+        &mut partition_ranges,
+        inputs.checksum_type,
+        &mut |cur| checksum_phase_cb(cur, checksum_total),
+        log_cb,
+    )?;
 
     Ok(SingleFileChdResult {
         container_filename,
@@ -1162,36 +1210,47 @@ fn build_partition_reader(
     let part_length = part.size_bytes;
 
     if !sector_by_sector {
-        // Smart mode: ask for a layout-preserving reader. The single
-        // dispatcher routes FAT/NTFS/exFAT through their
-        // `into_layout_preserving` adapters, while HFS/HFS+/ext/btrfs/
-        // ProDOS use their existing layout-preserving compact readers,
-        // and unsupported types fall through to raw passthrough below.
+        // Smart mode: pack the FS body at the start of the partition
+        // extent and zero-fill the trailing slack. For FAT/NTFS/exFAT
+        // this defragments the volume in place (BPB shrinks to the new
+        // cluster count, FAT tables track the packed clusters); for
+        // HFS/HFS+/ext/btrfs/ProDOS the dispatcher returns the existing
+        // layout-preserving stream unchanged. Either way, the returned
+        // stream length equals `partition.size_bytes`.
         let clone = source_file
             .try_clone()
             .context("failed to clone source for compact reader")?;
-        if let Some((reader, info)) = fs::layout_preserving_partition_reader(
+        if let Some((reader, info)) = fs::packed_partition_reader_padded(
             clone,
             part_offset,
             part.partition_type_byte,
             part.partition_type_string.as_deref(),
         ) {
-            // Defensive guard: a future regression that lets a packed
-            // reader leak through here would silently corrupt the disk
-            // image. Crash early instead.
+            // After padding, the stream must be exactly the partition
+            // extent's length; an earlier regression let a packed
+            // (un-padded) stream leak through and silently truncated the
+            // disk image. Crash early instead.
             debug_assert_eq!(
                 info.compacted_size, info.original_size,
-                "single-file CHD requires layout-preserving streams",
+                "single-file CHD requires streams sized to the partition extent",
             );
             if info.compacted_size == info.original_size {
+                let packed_bytes = info.original_size.saturating_sub(
+                    // For FAT/NTFS/exFAT the packed footprint is data_size
+                    // (logical FS data); for layout-preserving readers
+                    // data_size < compacted_size and the rest is verbatim
+                    // free-region bytes. Either case: report the live
+                    // footprint, with the slack tail counted as zero-fill.
+                    0,
+                );
                 log_cb(&format!(
-                    "  partition-{}: layout-preserving reader (allocated {} of {} bytes)",
-                    part.index, info.data_size, info.original_size,
+                    "  partition-{}: packed-and-padded reader (data {} of {} bytes, tail zero-filled)",
+                    part.index, info.data_size, packed_bytes,
                 ));
                 return Ok(reader);
             }
             log_cb(&format!(
-                "  partition-{}: dispatcher returned packed reader unexpectedly; \
+                "  partition-{}: dispatcher returned mis-sized stream; \
                  falling back to raw passthrough",
                 part.index,
             ));
@@ -1210,29 +1269,73 @@ fn build_partition_reader(
     }
 
     // Raw passthrough at the partition's source offset, capped to
-    // partition length. The take() guard is critical: even a stray over-read
-    // would push subsequent segments off-position in the stream.
-    let mut clone = source_file
+    // partition length.
+    //
+    // A naive `clone.seek(part_offset)` + `BufReader<File>` is unsafe
+    // here when more than one raw-passthrough segment is in play: on
+    // Unix `try_clone()` uses dup(), and dup'd file descriptors share
+    // the seek offset. The next call to `build_partition_reader` would
+    // re-seek the shared fd to its own partition's offset, retroactively
+    // moving the cursor of every previously-built reader. The
+    // `DiskImageStream` would then read partition bodies from the wrong
+    // disk locations.
+    //
+    // `PositionedSegmentReader` sidesteps this by tracking its own
+    // logical offset and seeking + reading on every `read()`. The seek
+    // is cheap on regular files; on raw devices it's amortised by the
+    // 256 KiB+ chunks the CHD encoder pulls.
+    let clone = source_file
         .try_clone()
         .context("failed to clone source for raw passthrough")?;
-    clone.seek(SeekFrom::Start(part_offset)).with_context(|| {
-        format!(
-            "failed to seek source to partition-{} offset {}",
-            part.index, part_offset
-        )
-    })?;
-    Ok(Box::new(BufReader::new(clone).take(part_length)))
+    Ok(Box::new(PositionedSegmentReader {
+        file: clone,
+        pos: part_offset,
+        end: part_offset + part_length,
+    }))
 }
 
-/// Open the freshly-written CHD, compute SHA-256 for each partition's byte
-/// range, return the CHD's own SHA1 (as `chdman info` would print).
+/// Forward-only reader over a fixed `[start, end)` byte range of a
+/// `File`. Re-seeks before each read so that other clones of the same
+/// underlying file descriptor (which share the kernel-level offset on
+/// Unix) can't shift this reader's position out from under it.
+struct PositionedSegmentReader {
+    file: File,
+    pos: u64,
+    end: u64,
+}
+
+impl Read for PositionedSegmentReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.end {
+            return Ok(0);
+        }
+        let want = ((self.end - self.pos) as usize).min(buf.len());
+        self.file.seek(SeekFrom::Start(self.pos))?;
+        let n = self.file.read(&mut buf[..want])?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+/// Open the freshly-written CHD, compute the per-partition checksum for
+/// each byte range using `checksum_type`, and return the CHD's own SHA1
+/// (as `chdman info` would print).
+///
+/// `progress_cb` receives the *cumulative* number of bytes hashed across
+/// all ranges so far — drop-in compatible with the cumulative-bytes
+/// callback the rest of the backup pipeline uses.
 fn compute_post_write_metadata(
     chd_path: &Path,
     ranges: &mut [ChdPartitionRange],
+    checksum_type: super::ChecksumType,
+    progress_cb: &mut dyn FnMut(u64),
     log_cb: &mut dyn FnMut(&str),
 ) -> Result<String> {
-    use sha2::{Digest, Sha256};
-
+    let mut cumulative: u64 = 0;
+    let mut delta_cb = |n: u64| {
+        cumulative += n;
+        progress_cb(cumulative);
+    };
     let mut reader = ChdReader::open(chd_path).with_context(|| {
         format!(
             "failed to reopen newly-written CHD for checksum: {}",
@@ -1240,11 +1343,11 @@ fn compute_post_write_metadata(
         )
     })?;
 
-    // Per-partition SHA-256 over the byte range. We re-seek for each
+    // Per-partition checksum over the byte range. We re-seek for each
     // partition; the caller has already paid the cost of streaming the
     // entire image once during compression, so a second pass here is
     // acceptable for the simplicity it buys.
-    let mut buf = vec![0u8; 1024 * 1024]; // 1 MiB chunks per CONTRIBUTING.md
+    let algo = checksum_type.as_str();
     for range in ranges.iter_mut() {
         reader
             .seek(SeekFrom::Start(range.offset_in_disk))
@@ -1254,26 +1357,21 @@ fn compute_post_write_metadata(
                     range.partition_index, range.offset_in_disk
                 )
             })?;
-        let mut hasher = Sha256::new();
-        let mut remaining = range.length;
-        while remaining > 0 {
-            let want = (remaining as usize).min(buf.len());
-            let n = reader.read(&mut buf[..want]).with_context(|| {
-                format!(
-                    "failed to read CHD partition-{} payload",
-                    range.partition_index
-                )
-            })?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-            remaining -= n as u64;
-        }
-        range.checksum_sha256 = format!("{:x}", hasher.finalize());
+        range.checksum = super::verify::hash_reader_range(
+            &mut reader,
+            range.length,
+            checksum_type,
+            &mut delta_cb,
+        )
+        .with_context(|| {
+            format!(
+                "failed to read CHD partition-{} payload",
+                range.partition_index
+            )
+        })?;
         log_cb(&format!(
-            "  partition-{} sha256: {}",
-            range.partition_index, range.checksum_sha256
+            "  partition-{} {}: {}",
+            range.partition_index, algo, range.checksum
         ));
     }
 
@@ -1340,7 +1438,7 @@ pub fn refresh_metadata_after_edit(
             partition_index: p.index,
             offset_in_disk: p.start_lba.saturating_mul(512),
             length: p.imaged_size_bytes,
-            checksum_sha256: String::new(),
+            checksum: String::new(),
         })
         .collect();
 
@@ -1349,7 +1447,14 @@ pub fn refresh_metadata_after_edit(
         ranges.len(),
         chd_path.display(),
     ));
-    let new_sha1 = compute_post_write_metadata(&chd_path, &mut ranges, log_cb)?;
+    // Honor the checksum_type recorded in the backup's metadata; a backup
+    // taken with CRC32 stays on CRC32 even after edits.
+    let checksum_type = match metadata.checksum_type.as_str() {
+        "crc32" => super::ChecksumType::Crc32,
+        _ => super::ChecksumType::Sha256,
+    };
+    let new_sha1 =
+        compute_post_write_metadata(&chd_path, &mut ranges, checksum_type, &mut |_| {}, log_cb)?;
 
     for range in &ranges {
         if let Some(part) = metadata
@@ -1357,7 +1462,7 @@ pub fn refresh_metadata_after_edit(
             .iter_mut()
             .find(|p| p.index == range.partition_index)
         {
-            part.checksum = range.checksum_sha256.clone();
+            part.checksum = range.checksum.clone();
         }
     }
     metadata.container_sha1 = Some(new_sha1);
@@ -1380,6 +1485,7 @@ fn hex_lower(b: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::BufReader;
 
     /// Build a minimal MBR sector declaring one partition at LBA 1 covering
     /// `partition_sectors` sectors. Type byte 0x83 (Linux) — bypasses both
@@ -1455,6 +1561,7 @@ mod tests {
             output_base: &output_base,
             resize_targets: None,
             alignment_sectors: 0,
+            checksum_type: crate::backup::ChecksumType::Sha256,
         };
 
         let mut log_buf: Vec<String> = Vec::new();
@@ -1463,8 +1570,14 @@ mod tests {
         let mut progress_cb = |n: u64| progress_seen = progress_seen.max(n);
         let cancel_check = || false;
 
-        let result = run(inputs, &mut progress_cb, &cancel_check, &mut log_cb)
-            .expect("single-file CHD backup");
+        let result = run(
+            inputs,
+            &mut progress_cb,
+            &cancel_check,
+            &mut log_cb,
+            &mut |_, _| {},
+        )
+        .expect("single-file CHD backup");
         assert_eq!(result.container_filename, "disk.chd");
         assert_eq!(result.container_logical_size, total_bytes);
         assert_eq!(result.partition_ranges.len(), 1);
@@ -1566,10 +1679,12 @@ mod tests {
                 output_base: &output_base,
                 resize_targets: None,
                 alignment_sectors: 0,
+                checksum_type: crate::backup::ChecksumType::Sha256,
             },
             &mut progress_cb,
             &cancel,
             &mut log_cb,
+            &mut |_, _| {},
         )
         .expect("GPT single-file CHD backup");
         assert_eq!(result.container_logical_size, total_bytes);
@@ -1663,10 +1778,12 @@ mod tests {
                 output_base: &output_base,
                 resize_targets: None,
                 alignment_sectors: 0,
+                checksum_type: crate::backup::ChecksumType::Sha256,
             },
             &mut progress_cb,
             &cancel,
             &mut log_cb,
+            &mut |_, _| {},
         )
         .expect("APM single-file CHD backup");
         assert_eq!(result.container_logical_size, total_bytes);
@@ -1761,10 +1878,12 @@ mod tests {
                 output_base: &output_base,
                 resize_targets: Some(&resize_targets),
                 alignment_sectors: 0,
+                checksum_type: crate::backup::ChecksumType::Sha256,
             },
             &mut progress_cb,
             &cancel,
             &mut log_cb,
+            &mut |_, _| {},
         )
         .expect("resize-plan single-file CHD backup");
 
@@ -1878,15 +1997,15 @@ mod tests {
         img
     }
 
-    /// Stage 4d round-trip: a synthetic FAT12 partition with cluster 2
-    /// allocated and clusters 3..N free-but-garbage-filled goes through
-    /// the single-file CHD pipeline. We assert that the resulting CHD's
-    /// bytes match the source for every metadata + allocated cluster
-    /// region, AND that the free-cluster regions come back as zeros
-    /// (proving `into_layout_preserving` zeroed them on the way out
-    /// rather than streaming the source's 0xAB garbage).
+    /// Compact-always round-trip: a synthetic FAT12 partition with
+    /// cluster 2 allocated and clusters 3..N free-but-garbage-filled
+    /// goes through the single-file CHD pipeline. We assert that the
+    /// resulting CHD body is the *packed* FAT volume at the start of
+    /// the partition extent (BPB shrunk, allocated cluster's payload
+    /// preserved) followed by zero-fill — the source's 0xAB garbage
+    /// in free clusters must not bleed through.
     #[test]
-    fn layout_preserving_fat_zeros_free_clusters() {
+    fn packed_and_padded_fat_zeros_free_clusters() {
         const PART_SECTORS: u32 = 16;
         const TOTAL_SECTORS: u32 = PART_SECTORS + 1;
         const SECTOR_SIZE: u64 = 512;
@@ -1934,18 +2053,20 @@ mod tests {
                 output_base: &output_base,
                 resize_targets: None,
                 alignment_sectors: 0,
+                checksum_type: crate::backup::ChecksumType::Sha256,
             },
             &mut progress_cb,
             &cancel,
             &mut log_cb,
+            &mut |_, _| {},
         )
         .expect("layout-preserving FAT backup");
 
         assert_eq!(result.container_logical_size, total_bytes);
         let joined = log_buf.join("\n");
         assert!(
-            joined.contains("layout-preserving reader"),
-            "log must mention layout-preserving reader; got:\n{joined}",
+            joined.contains("packed-and-padded reader"),
+            "log must mention packed-and-padded reader; got:\n{joined}",
         );
 
         let chd_path = tmp.path().join("disk.chd");
@@ -1953,29 +2074,49 @@ mod tests {
         let mut readback = vec![0u8; total_bytes as usize];
         reader.read_exact(&mut readback).unwrap();
 
-        // MBR + boot sector + FAT + root dir + cluster 2 must equal
-        // source byte-for-byte (allocated + metadata regions).
-        let allocated_end = 512 + 4 * 512; // through cluster 2 (data_start + 1 cluster)
-        assert_eq!(
-            &readback[..allocated_end],
-            &data[..allocated_end],
-            "MBR + FAT metadata + allocated cluster must round-trip",
-        );
+        // MBR sector survives unchanged at offset 0.
+        assert_eq!(&readback[..512], &data[..512], "MBR must round-trip");
 
-        // Free cluster region in the CHD must be all zeros even though
-        // the source had 0xAB garbage there.
-        let free_start = allocated_end;
-        let free_end = 512 + (PART_SECTORS as usize) * 512;
-        let free = &readback[free_start..free_end];
+        // Inside the partition extent: BPB at offset 512 has
+        // total_sectors patched to the new (smaller) packed footprint.
+        let bpb = &readback[512..1024];
+        assert_eq!(&bpb[..3], &[0xEB, 0x3C, 0x90], "BPB jump must be intact");
+        let new_total_sectors_16 = u16::from_le_bytes([bpb[19], bpb[20]]);
         assert!(
-            free.iter().all(|b| *b == 0),
-            "free clusters must be zero in the round-tripped CHD; saw {} non-zero bytes",
-            free.iter().filter(|b| **b != 0).count(),
+            (new_total_sectors_16 as u32) < PART_SECTORS,
+            "packed BPB.total_sectors ({new_total_sectors_16}) must be smaller than \
+             original partition extent ({PART_SECTORS})",
         );
 
-        // Sanity: the source had 0xAB garbage there, so we know the
-        // assertion above is meaningful.
-        let src_free = &data[free_start..free_end];
+        // Cluster 2's payload survived through the pipeline. Its
+        // position inside the packed image is reserved + FAT + root_dir
+        // sectors from partition start, but rather than recompute that
+        // here we just look for the marker bytes anywhere in the
+        // partition body.
+        let part = &readback[512..512 + PART_SECTORS as usize * 512];
+        assert!(
+            part.windows(b"hello layout-preserving FAT world".len())
+                .any(|w| w == b"hello layout-preserving FAT world"),
+            "cluster 2's payload must survive the pack-and-pad round trip",
+        );
+
+        // The trailing slack — bytes after the packed volume — must be
+        // zero, even though the source had 0xAB garbage in its free
+        // clusters. Use the new BPB total_sectors as the boundary.
+        let packed_end = 512 + (new_total_sectors_16 as usize) * 512;
+        let part_end = 512 + (PART_SECTORS as usize) * 512;
+        if packed_end < part_end {
+            let tail = &readback[packed_end..part_end];
+            assert!(
+                tail.iter().all(|b| *b == 0),
+                "packed-tail slack must be zero; saw {} non-zero bytes",
+                tail.iter().filter(|b| **b != 0).count(),
+            );
+        }
+
+        // Sanity: the source had 0xAB garbage in its free clusters, so
+        // the zero-tail assertion above is meaningful.
+        let src_free = &data[512 + 4 * 512..512 + (PART_SECTORS as usize) * 512];
         assert!(
             src_free.iter().any(|b| *b == 0xAB),
             "test setup failed — source free region must contain garbage",
@@ -2035,14 +2176,21 @@ mod tests {
             output_base: &output_base,
             resize_targets: None,
             alignment_sectors: 0,
+            checksum_type: crate::backup::ChecksumType::Sha256,
         };
         let mut log_cb = |_: &str| {};
         let mut progress_cb = |_: u64| {};
         let cancel_check = || false;
-        let result = run(inputs, &mut progress_cb, &cancel_check, &mut log_cb)
-            .expect("single-file CHD backup");
+        let result = run(
+            inputs,
+            &mut progress_cb,
+            &cancel_check,
+            &mut log_cb,
+            &mut |_, _| {},
+        )
+        .expect("single-file CHD backup");
 
-        let real_part_checksum = result.partition_ranges[0].checksum_sha256.clone();
+        let real_part_checksum = result.partition_ranges[0].checksum.clone();
         let real_container_sha1 = result.container_sha1.clone();
 
         // Write a metadata.json with intentionally-stale checksums.
@@ -2082,6 +2230,9 @@ mod tests {
                 is_logical: false,
                 partition_type_string: None,
                 minimum_size_bytes: None,
+                defragmented_min_size_bytes: None,
+                hfsplus_signature: None,
+                defragmented_clone: false,
             }],
             bad_sectors: vec![],
             extended_container: None,

@@ -628,6 +628,7 @@ impl BackupTab {
         ));
 
         std::thread::spawn(move || {
+            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: whole-disk VHD backup");
             let status2 = Arc::clone(&status);
             let status3 = Arc::clone(&status);
             let result = export_whole_disk_vhd(
@@ -767,7 +768,7 @@ impl BackupTab {
                         ctx.log.error(format!(
                             "Minimum size calculation failed for partition {idx}: {err}",
                         ));
-                    } else if let Some(min) = s.result {
+                    } else if let Some(min) = s.defragmented_min.or(s.result) {
                         let part_size = self
                             .source_partitions
                             .iter()
@@ -777,8 +778,13 @@ impl BackupTab {
                         let clamped = min.min(part_size);
                         self.partition_min_sizes.insert(idx, clamped);
                         ctx.log.info(format!(
-                            "Partition {idx}: minimum size {} (computed)",
+                            "Partition {idx}: minimum size {} (computed{})",
                             partition::format_size(clamped),
+                            if s.defragmented_min.is_some() {
+                                ", defragmented floor"
+                            } else {
+                                ""
+                            },
                         ));
                         for cfg in &mut self.vhd_partition_configs {
                             if cfg.index == idx {
@@ -890,17 +896,33 @@ impl BackupTab {
                         &|_| {},
                     );
                     match result {
-                        fs::MinimumResult::Computed(Some(min_size)) => {
-                            let clamped = min_size.min(part.size_bytes);
-                            self.partition_min_sizes.insert(part.index, clamped);
-                            ctx.log.info(format!(
-                                "Partition {}: minimum size {} (original {})",
-                                part.index,
-                                partition::format_size(clamped),
-                                partition::format_size(part.size_bytes),
-                            ));
+                        fs::MinimumResult::Computed {
+                            in_place,
+                            defragmented,
+                        } => {
+                            // Prefer the defragmented floor when present:
+                            // CHD backups now always pack allocated clusters
+                            // at the start of the partition extent, so the
+                            // defragmented minimum is achievable for the
+                            // shrink path. Falls back to in_place for legacy
+                            // packed paths and per-partition VHD output.
+                            let chosen = defragmented.or(in_place);
+                            if let Some(min_size) = chosen {
+                                let clamped = min_size.min(part.size_bytes);
+                                self.partition_min_sizes.insert(part.index, clamped);
+                                ctx.log.info(format!(
+                                    "Partition {}: minimum size {} (original {}{})",
+                                    part.index,
+                                    partition::format_size(clamped),
+                                    partition::format_size(part.size_bytes),
+                                    if defragmented.is_some() {
+                                        ", defragmented floor"
+                                    } else {
+                                        ""
+                                    },
+                                ));
+                            }
                         }
-                        fs::MinimumResult::Computed(None) => {}
                         fs::MinimumResult::Deferred { fs_name } => {
                             ctx.log.info(format!(
                                 "Partition {}: need to calculate minimum size due to filesystem {fs_name} (click \"Calc min\" to compute)",
@@ -1174,6 +1196,7 @@ impl BackupTab {
             chd_options: self.chd_options_for_compression(),
             size_policy,
             partition_target_sizes,
+            shrink_to_minimum: false,
         };
 
         self.maybe_persist_chd_options();
@@ -1189,6 +1212,7 @@ impl BackupTab {
         ));
 
         std::thread::spawn(move || {
+            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: disk backup");
             if let Err(e) = rusty_backup::backup::run_backup(config, Arc::clone(&progress_arc)) {
                 if let Ok(mut p) = progress_arc.lock() {
                     p.error = Some(format!("{e:#}"));

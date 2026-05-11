@@ -101,6 +101,13 @@ pub struct BackupConfig {
     /// the partition's source size. Non-trivial entries trigger
     /// `single_file_chd::run`'s temp-file resize pipeline.
     pub partition_target_sizes: Option<Vec<(usize, u64)>>,
+    /// When `true`, eligible HFS+/HFSX partitions are routed through the
+    /// streamed defrag-clone path: the captured image is a fully repacked
+    /// HFS+ volume sized at its `defragmented_min_size_bytes`. Other
+    /// filesystems are unaffected. Ignored when [`BackupConfig::sector_by_sector`]
+    /// is on. Pre-flight via [`fs::can_defrag_clone_hfsplus`] gates each
+    /// partition; failure aborts the whole backup with the reason.
+    pub shrink_to_minimum: bool,
 }
 
 /// Shared progress state between background backup thread and the GUI.
@@ -440,6 +447,149 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         bail!("backup cancelled");
     }
 
+    // Step 4: Analyze partitions for smart sizing
+    //
+    // When not in sector-by-sector mode, try filesystem-aware compaction first
+    // (FAT only — packs allocated clusters contiguously for a smaller, defragmented
+    // image). If compaction isn't possible, fall back to trim-based sizing that
+    // skips unused space beyond the last allocated cluster.
+    //
+    // This runs before the single-file-CHD branch so the CHD path can persist
+    // `minimum_size_bytes` / `defragmented_min_size_bytes` in metadata.json,
+    // which the restore-resize path uses to validate Custom shrinks and to
+    // populate the "Minimum" picker.
+    log(
+        &progress,
+        LogLevel::Info,
+        format!(
+            "Analyzing {} partitions for smart sizing...",
+            partitions.len()
+        ),
+    );
+
+    let sizes::PartitionSizing {
+        mut effective_sizes,
+        mut stream_sizes,
+        compact_sizes,
+        minimum_sizes,
+        defragmented_min_sizes,
+        mut is_layout_preserving_flags,
+    } = sizes::analyze_partitions(
+        source.get_ref(),
+        &partitions,
+        config.sector_by_sector,
+        is_superfloppy,
+        &progress,
+    );
+
+    // Phase-8 / Step-22f: shrink-to-minimum pre-flight + sizing override.
+    //
+    // For each clone-eligible HFS+/HFSX partition, run
+    // [`fs::can_defrag_clone_hfsplus`] before any bytes flow. On failure abort
+    // the whole backup with the human-readable reason — the user can either
+    // disable shrink-to-minimum or remediate the source (clean unmount, flatten
+    // the wrapper) and retry.
+    //
+    // Successful pre-flights cause the per-partition loop to stream the
+    // partition through `stream_defragmented_hfsplus` instead of the compact
+    // reader; size vectors are overridden so progress accounting and the smart-
+    // sizing log line reflect the post-clone footprint.
+    let mut clone_target_sizes: Vec<Option<u64>> = vec![None; partitions.len()];
+    if config.shrink_to_minimum && !config.sector_by_sector && !single_file_chd_planned {
+        for (i, part) in partitions.iter().enumerate() {
+            if part.is_extended_container || part.partition_type_byte == 0xEE {
+                continue;
+            }
+            if let Some(ref filter) = config.partition_filter {
+                if !filter.contains(&part.index) {
+                    continue;
+                }
+            }
+            // Only HFS+/HFSX partitions participate. Skip silently otherwise —
+            // the flag is global; non-HFS+ partitions just keep their default
+            // compaction path.
+            let probe = source
+                .get_ref()
+                .try_clone()
+                .ok()
+                .map(|c| {
+                    let mut br = BufReader::new(c);
+                    fs::probe_hfsplus_signature(&mut br, part.start_lba * 512)
+                })
+                .unwrap_or(None);
+            if probe.is_none() {
+                continue;
+            }
+            let target = match defragmented_min_sizes[i] {
+                Some(t) if t > 0 && t < part.size_bytes => t,
+                _ => {
+                    log(
+                        &progress,
+                        LogLevel::Info,
+                        format!(
+                            "partition-{}: shrink-to-minimum skipped — no defragmented \
+                             minimum size available",
+                            part.index
+                        ),
+                    );
+                    continue;
+                }
+            };
+            // Pre-flight on a fresh reader.
+            let pf = source
+                .get_ref()
+                .try_clone()
+                .map_err(|e| anyhow::anyhow!("clone source for shrink-preflight: {e}"))
+                .and_then(|c| {
+                    let mut br = BufReader::new(c);
+                    fs::can_defrag_clone_hfsplus(&mut br, part.start_lba * 512)
+                        .map_err(|reason| anyhow::anyhow!("{reason}"))
+                });
+            match pf {
+                Ok(()) => {
+                    log(
+                        &progress,
+                        LogLevel::Info,
+                        format!(
+                            "partition-{}: streaming defragmented HFS+ — \
+                             source {} -> {}",
+                            part.index,
+                            partition::format_size(part.size_bytes),
+                            partition::format_size(target),
+                        ),
+                    );
+                    clone_target_sizes[i] = Some(target);
+                    // Override sizing: the streamed image flows through the
+                    // compressor verbatim at `target` bytes. `compact_sizes`
+                    // is left as whatever `analyze_partitions` produced — the
+                    // per-partition loop dispatches on `clone_target_sizes`
+                    // first, so neither the compacted nor the trim branch
+                    // runs for cloned partitions.
+                    effective_sizes[i] = target;
+                    stream_sizes[i] = target;
+                    is_layout_preserving_flags[i] = false;
+                }
+                Err(e) => {
+                    bail!("Aborting backup: partition-{}: {e}", part.index);
+                }
+            }
+        }
+    } else if config.shrink_to_minimum && single_file_chd_planned {
+        log(
+            &progress,
+            LogLevel::Warning,
+            "shrink-to-minimum is not supported with single-file CHD output; \
+             ignoring the flag.",
+        );
+    } else if config.shrink_to_minimum && config.sector_by_sector {
+        log(
+            &progress,
+            LogLevel::Warning,
+            "shrink-to-minimum is incompatible with sector-by-sector mode; \
+             ignoring the flag.",
+        );
+    }
+
     // Single-file CHD branch: when the user asked for CHD output and the
     // source has a partition table single_file_chd can handle, synthesise a
     // whole-disk image into one CHD and skip the per-partition loop. Falls
@@ -455,6 +605,8 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             &partitions,
             &alignment,
             &backup_folder,
+            &minimum_sizes,
+            &defragmented_min_sizes,
         );
     }
     // CHD/DVD selected on a source single_file_chd can't handle (only
@@ -476,37 +628,9 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         );
     }
 
-    // Step 4: Analyze partitions for smart sizing
-    //
-    // When not in sector-by-sector mode, try filesystem-aware compaction first
-    // (FAT only — packs allocated clusters contiguously for a smaller, defragmented
-    // image). If compaction isn't possible, fall back to trim-based sizing that
-    // skips unused space beyond the last allocated cluster.
-    log(
-        &progress,
-        LogLevel::Info,
-        format!(
-            "Analyzing {} partitions for smart sizing...",
-            partitions.len()
-        ),
-    );
     let split_bytes = config.split_size_mib.map(|mib| mib as u64 * 1024 * 1024);
     let mut partition_metadata = Vec::new();
     let mut overall_bytes_done: u64 = 0;
-
-    let sizes::PartitionSizing {
-        effective_sizes,
-        stream_sizes,
-        compact_sizes,
-        minimum_sizes,
-        is_layout_preserving_flags,
-    } = sizes::analyze_partitions(
-        source.get_ref(),
-        &partitions,
-        config.sector_by_sector,
-        is_superfloppy,
-        &progress,
-    );
 
     // Export mbr-min.bin for MBR tables: a copy of the MBR with each
     // partition's total_sectors reduced to the effective (imaged) size.
@@ -718,7 +842,84 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             ),
         );
 
-        let compressed_files = if is_compacted {
+        let clone_target = clone_target_sizes[part_idx];
+        let compressed_files = if let Some(target_size) = clone_target {
+            // Phase-8 / Step-22f: stream a defragmented HFS+ clone directly
+            // into the compressor via a bounded channel pipe. The producer
+            // thread owns its own `HfsPlusFilesystem` over a cloned source
+            // file handle; the consumer (this thread) is the compressor.
+            // Errors from either side propagate through the join.
+            log(
+                &progress,
+                LogLevel::Info,
+                format!(
+                    "Defrag-cloning {} into {}",
+                    part_label,
+                    partition::format_size(target_size)
+                ),
+            );
+            let part_offset = part.start_lba * 512;
+            let producer_clone = source
+                .get_ref()
+                .try_clone()
+                .context("failed to clone source for defrag-clone producer")?;
+            let (mut writer, mut reader) = channel_pipe();
+            let progress_log_prod = Arc::clone(&progress);
+            let producer =
+                std::thread::spawn(move || -> Result<fs::hfsplus_defrag::DefragReport> {
+                    let br = BufReader::new(producer_clone);
+                    let mut hfs = fs::hfsplus::HfsPlusFilesystem::open(br, part_offset)
+                        .context("open source HFS+ for defrag-clone")?;
+                    let report = fs::hfsplus_defrag::stream_defragmented_hfsplus(
+                        &mut hfs,
+                        target_size,
+                        &mut writer,
+                    )
+                    .context("stream_defragmented_hfsplus")?;
+                    log(
+                        &progress_log_prod,
+                        LogLevel::Info,
+                        format!(
+                            "Defrag emit: {} files / {} folders / {} data / {} hardlinks / \
+                             {} xattrs",
+                            report.files_copied,
+                            report.dirs_copied,
+                            partition::format_size(report.data_bytes_copied),
+                            report.hardlinks_copied + report.dir_hardlinks_copied,
+                            report.xattrs_copied,
+                        ),
+                    );
+                    Ok(report)
+                });
+            let progress_log = Arc::clone(&progress);
+            let compress_result = crate::rbformats::compress_partition(
+                &mut reader,
+                &output_base,
+                effective_compression,
+                target_size,
+                split_bytes,
+                false, // streamed image is already packed; don't skip zeros
+                config.chd_options.clone(),
+                |bytes_read| {
+                    set_progress_bytes(
+                        &progress_clone,
+                        base_bytes + bytes_read,
+                        total_stream_bytes,
+                    );
+                },
+                || is_cancelled(&progress_clone),
+                |msg| log(&progress_log, LogLevel::Info, msg),
+            );
+            // Always join the producer so its errors surface even if the
+            // consumer succeeded (e.g. partial pipe).
+            let producer_result = producer
+                .join()
+                .map_err(|_| anyhow::anyhow!("defrag-clone producer thread panicked"))?;
+            let files = compress_result
+                .with_context(|| format!("failed to compress defrag-cloned {part_label}"))?;
+            producer_result.with_context(|| format!("defrag-clone failed for {part_label}"))?;
+            files
+        } else if is_compacted {
             // Use compacted reader — create a fresh compact reader for this filesystem
             log(
                 &progress,
@@ -884,6 +1085,19 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         );
 
         let minimum_size = minimum_sizes[part_idx].filter(|&s| s < part.size_bytes);
+        let defragmented_min = defragmented_min_sizes[part_idx]
+            .filter(|&s| s < part.size_bytes)
+            .filter(|&d| match minimum_size {
+                Some(m) => d < m,
+                None => true,
+            });
+        // Probe the HFS+/HFSX signature for HFS+-shaped partitions so
+        // restore can warn on case-sensitivity mismatches (Step 20).
+        // `probe_hfsplus_signature` returns None for non-HFS+ volumes.
+        let hfsplus_signature = source.get_ref().try_clone().ok().and_then(|c| {
+            let mut br = BufReader::new(c);
+            fs::probe_hfsplus_signature(&mut br, part.start_lba * 512)
+        });
         partition_metadata.push(PartitionMetadata {
             index: part.index,
             type_name: part.type_name.clone(),
@@ -898,6 +1112,9 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             is_logical: part.is_logical,
             partition_type_string: part.partition_type_string.clone(),
             minimum_size_bytes: minimum_size,
+            defragmented_min_size_bytes: defragmented_min,
+            hfsplus_signature,
+            defragmented_clone: clone_target.is_some(),
         });
     }
 
@@ -989,6 +1206,8 @@ fn run_single_file_chd_path(
     partitions: &[partition::PartitionInfo],
     alignment: &partition::PartitionAlignment,
     backup_folder: &std::path::Path,
+    minimum_sizes: &[Option<u64>],
+    defragmented_min_sizes: &[Option<u64>],
 ) -> Result<()> {
     set_operation(progress, "Building disk-image stream...");
     log(
@@ -1027,6 +1246,7 @@ fn run_single_file_chd_path(
         output_base: &output_base,
         resize_targets: config.partition_target_sizes.as_deref(),
         alignment_sectors: alignment.alignment_sectors,
+        checksum_type: config.checksum,
     };
 
     {
@@ -1039,6 +1259,7 @@ fn run_single_file_chd_path(
     let progress_for_cb = progress.clone();
     let progress_for_cancel = progress.clone();
     let progress_for_log = progress.clone();
+    let progress_for_checksum = progress.clone();
     let mut progress_cb = move |n: u64| {
         if let Ok(mut p) = progress_for_cb.lock() {
             p.current_bytes = n;
@@ -1058,8 +1279,30 @@ fn run_single_file_chd_path(
             });
         }
     };
+    // Post-write checksum phase: swap the progress bar over to the
+    // hashing total so the GUI doesn't sit at "100% / 100%" while we
+    // re-read the CHD. The first invocation (current=0, total=N) flips
+    // the operation label too.
+    let mut first_checksum_tick = true;
+    let progress_for_checksum_outer = progress_for_checksum;
+    let mut checksum_phase_cb = move |current: u64, total: u64| {
+        if let Ok(mut p) = progress_for_checksum_outer.lock() {
+            if first_checksum_tick {
+                p.operation = "Computing per-partition checksums...".to_string();
+                first_checksum_tick = false;
+            }
+            p.current_bytes = current;
+            p.total_bytes = total;
+        }
+    };
 
-    let result = single_file_chd::run(inputs, &mut progress_cb, &cancel_check, &mut log_cb)?;
+    let result = single_file_chd::run(
+        inputs,
+        &mut progress_cb,
+        &cancel_check,
+        &mut log_cb,
+        &mut checksum_phase_cb,
+    )?;
 
     // Build per-partition metadata. The byte range inside the CHD lives in
     // `result.partition_ranges`; we cross-reference each partition's
@@ -1069,13 +1312,34 @@ fn run_single_file_chd_path(
         .partition_ranges
         .iter()
         .filter_map(|range| {
-            let part = partitions
+            let (part_idx, part) = partitions
                 .iter()
-                .find(|p| p.index == range.partition_index)?;
+                .enumerate()
+                .find(|(_, p)| p.index == range.partition_index)?;
             // `start_lba` records where the partition lives inside the CHD's
             // synthesised disk image — that's the new offset when the
             // backup-time resize plan moved it, otherwise the source LBA.
             let new_start_lba = range.offset_in_disk / 512;
+            // Pull the per-partition minimum sizes computed by
+            // `analyze_partitions` upstream. Restore-resize uses these to
+            // populate the "Minimum" picker and to validate Custom shrinks.
+            // After a backup-time resize the partition has already been
+            // shrunk to ~minimum, so the stored minimum should not exceed
+            // the new imaged size.
+            let minimum_size = minimum_sizes
+                .get(part_idx)
+                .copied()
+                .flatten()
+                .map(|m| m.min(range.length));
+            let defragmented_min = defragmented_min_sizes
+                .get(part_idx)
+                .copied()
+                .flatten()
+                .map(|m| m.min(range.length));
+            let hfsplus_signature = source.get_ref().try_clone().ok().and_then(|c| {
+                let mut br = BufReader::new(c);
+                fs::probe_hfsplus_signature(&mut br, part.start_lba * 512)
+            });
             Some(PartitionMetadata {
                 index: range.partition_index,
                 type_name: part.type_name.clone(),
@@ -1084,12 +1348,15 @@ fn run_single_file_chd_path(
                 original_size_bytes: part.size_bytes,
                 imaged_size_bytes: range.length,
                 compressed_files: vec![], // data is inside the container
-                checksum: range.checksum_sha256.clone(),
+                checksum: range.checksum.clone(),
                 resized: range.length != part.size_bytes || new_start_lba != part.start_lba,
                 compacted: !config.sector_by_sector,
                 is_logical: part.is_logical,
                 partition_type_string: part.partition_type_string.clone(),
-                minimum_size_bytes: None,
+                minimum_size_bytes: minimum_size,
+                defragmented_min_size_bytes: defragmented_min,
+                hfsplus_signature,
+                defragmented_clone: false,
             })
         })
         .collect();
@@ -1160,5 +1427,122 @@ impl<R: Read> LimitedReader<R> {
 impl<R: Read> Read for LimitedReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.inner.read(buf)
+    }
+}
+
+/// Bounded in-memory pipe used to feed a `Write`-driven producer (e.g.
+/// [`fs::stream_defragmented_hfsplus`]) into a `Read`-consuming sink (e.g.
+/// `compress_partition`). Each `write` call enqueues one owned chunk; the
+/// reader serves bytes from a single pending chunk before pulling the next.
+/// `sync_channel(capacity=4)` bounds peak memory to a few hundred KiB at
+/// the chunk sizes the defrag emitter produces, with the producer blocked
+/// on backpressure when the consumer falls behind.
+pub(crate) fn channel_pipe() -> (ChannelPipeWriter, ChannelPipeReader) {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
+    (
+        ChannelPipeWriter { tx: Some(tx) },
+        ChannelPipeReader {
+            rx,
+            chunk: Vec::new(),
+            pos: 0,
+        },
+    )
+}
+
+pub(crate) struct ChannelPipeWriter {
+    tx: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+}
+
+impl std::io::Write for ChannelPipeWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.tx.as_ref().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer already closed")
+        })?;
+        tx.send(buf.to_vec()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "consumer dropped pipe reader",
+            )
+        })?;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for ChannelPipeWriter {
+    fn drop(&mut self) {
+        // Closing the sender wakes the reader, which then sees EOF.
+        self.tx = None;
+    }
+}
+
+pub(crate) struct ChannelPipeReader {
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    chunk: Vec<u8>,
+    pos: usize,
+}
+
+impl Read for ChannelPipeReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.chunk.len() {
+            match self.rx.recv() {
+                Ok(next) => {
+                    self.chunk = next;
+                    self.pos = 0;
+                }
+                Err(_) => return Ok(0), // sender dropped — clean EOF
+            }
+        }
+        let avail = self.chunk.len() - self.pos;
+        let n = avail.min(buf.len());
+        buf[..n].copy_from_slice(&self.chunk[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod pipe_tests {
+    use super::{channel_pipe, ChannelPipeReader, ChannelPipeWriter};
+    use std::io::{Read, Write};
+
+    #[test]
+    fn channel_pipe_round_trips_in_order() {
+        let (mut w, mut r) = channel_pipe();
+        let producer = std::thread::spawn(move || -> std::io::Result<()> {
+            for i in 0u8..16 {
+                let chunk = vec![i; 1024];
+                w.write_all(&chunk)?;
+            }
+            Ok(())
+        });
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        producer.join().unwrap().unwrap();
+        assert_eq!(got.len(), 16 * 1024);
+        for i in 0u8..16 {
+            let off = i as usize * 1024;
+            assert!(got[off..off + 1024].iter().all(|&b| b == i));
+        }
+    }
+
+    #[test]
+    fn channel_pipe_reader_eof_on_writer_drop() {
+        let (w, mut r) = channel_pipe();
+        drop(w);
+        let mut buf = [0u8; 8];
+        let n = r.read(&mut buf).unwrap();
+        assert_eq!(n, 0, "expected immediate EOF when writer dropped");
+    }
+
+    fn _assert_send_for_pipe_ends() {
+        fn assert_send<T: Send>() {}
+        assert_send::<ChannelPipeWriter>();
+        assert_send::<ChannelPipeReader>();
     }
 }

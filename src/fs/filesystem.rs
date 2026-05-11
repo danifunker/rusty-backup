@@ -32,11 +32,27 @@ pub trait Filesystem: Send {
     fn used_size(&self) -> u64;
 
     /// Returns the minimum number of bytes from the partition start needed to
-    /// capture all filesystem data. Used for smart backup trimming.
+    /// capture all filesystem data **without moving any data on disk** — i.e.
+    /// the position of the last allocated byte. Used for smart backup trimming.
     ///
     /// Default implementation returns `total_size()` (no trimming).
     fn last_data_byte(&mut self) -> Result<u64, FilesystemError> {
         Ok(self.total_size())
+    }
+
+    /// Returns the minimum partition size that could host all live filesystem
+    /// data **after a defragmenting clone** (data packed from offset 0).
+    ///
+    /// For most filesystems this is identical to `last_data_byte()` — there is
+    /// no clone-shrink path. HFS+ overrides this because a fragmented volume's
+    /// in-place trim point hugs the partition tail even when most blocks are
+    /// free. See `docs/hfsplus_enhancements.md` Phase 1.
+    ///
+    /// Callers should treat the value as an approximate target: the actual
+    /// clone may need a small additional margin for fresh B-tree headers and
+    /// alignment.
+    fn defragmented_minimum_size(&mut self) -> Result<u64, FilesystemError> {
+        self.last_data_byte()
     }
 
     /// Stream file data to a writer. Returns the number of bytes written.
@@ -109,6 +125,7 @@ pub enum FilesystemError {
     InvalidData(String),
     AlreadyExists(String),
     DiskFull(String),
+    XattrTooLarge(String),
 }
 
 impl fmt::Display for FilesystemError {
@@ -122,6 +139,7 @@ impl fmt::Display for FilesystemError {
             FilesystemError::InvalidData(msg) => write!(f, "invalid data: {msg}"),
             FilesystemError::AlreadyExists(p) => write!(f, "already exists: {p}"),
             FilesystemError::DiskFull(msg) => write!(f, "disk full: {msg}"),
+            FilesystemError::XattrTooLarge(msg) => write!(f, "extended attribute too large: {msg}"),
         }
     }
 }

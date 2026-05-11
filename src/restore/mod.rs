@@ -519,11 +519,20 @@ fn compute_partition_size(
     match size_choice {
         RestoreSizeChoice::Original => pm.original_size_bytes,
         RestoreSizeChoice::Minimum => {
-            let min = if pm.imaged_size_bytes > 0 {
-                pm.imaged_size_bytes
-            } else {
-                pm.original_size_bytes
-            };
+            // Prefer the defragmented (post-clone) minimum when available —
+            // for filesystems with a defragmenting compaction path (FAT,
+            // HFS+) this can be substantially smaller than the in-place
+            // trim point. Fall back to the in-place minimum, then to the
+            // imaged size, then to the original.
+            let min = pm
+                .defragmented_min_size_bytes
+                .or(pm.minimum_size_bytes)
+                .or(if pm.imaged_size_bytes > 0 {
+                    Some(pm.imaged_size_bytes)
+                } else {
+                    None
+                })
+                .unwrap_or(pm.original_size_bytes);
             (min + 511) & !511
         }
         RestoreSizeChoice::Custom(bytes) => (bytes + 511) & !511,
@@ -883,7 +892,16 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
             LogLevel::Info,
             format!("Creating image file {}...", config.target_path.display()),
         );
-        let file = File::create(&config.target_path)
+        // Open R+W (not write-only via File::create), since
+        // `reconstruct_disk_from_backup` later calls `patch_hidden_sectors_for`
+        // which needs to read the boot sector to detect FAT/NTFS/exFAT
+        // signatures. On Unix a write-only handle returns EBADF on read.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&config.target_path)
             .with_context(|| format!("failed to create {}", config.target_path.display()))?;
         crate::os::DeviceWriteHandle::from_file(file)
     };
@@ -985,6 +1003,27 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
         let inner_file = target
             .inner_mut()
             .context("failed to access device for filesystem operations")?;
+
+        // Defragmented-clone partitions (Phase-8 / Step 22f-i) hold a
+        // *complete* HFS+/HFSX volume image sized exactly at
+        // `imaged_size_bytes`. The volume's primary + alt VHs are already
+        // correct for that size; running resize_hfsplus_in_place against the
+        // partition window would patch the VH to a different size and
+        // corrupt the volume. Restore writes the bytes verbatim and
+        // zero-pads the tail when the chosen partition window is larger.
+        // Volume-grow on restore is a separate feature (out of Phase-8 scope).
+        if pm.defragmented_clone {
+            log(
+                &progress,
+                LogLevel::Info,
+                format!(
+                    "Partition {}: defragmented HFS+ clone — leaving volume bytes verbatim, \
+                     skipping in-place resize",
+                    pm.index
+                ),
+            );
+            continue;
+        }
 
         // Resize filesystem if the partition size changed.
         let needs_resize = export_size != pm.original_size_bytes;
@@ -1190,8 +1229,10 @@ fn run_single_file_chd_restore_as_is(
 
     if logical_size > config.target_size {
         bail!(
-            "target ({} bytes) is smaller than the CHD's logical size ({} bytes); \
-             restore would overflow",
+            "target ({} bytes) is smaller than the CHD's logical size ({} bytes). \
+             Pick a non-Original size for one or more partitions in the size mode \
+             column (Minimum / MinPlus20 / Custom) so the restore can re-pack the \
+             disk into the smaller target.",
             config.target_size,
             logical_size,
         );
@@ -1217,7 +1258,16 @@ fn run_single_file_chd_restore_as_is(
             LogLevel::Info,
             format!("Creating image file {}...", config.target_path.display()),
         );
-        let file = File::create(&config.target_path)
+        // Open R+W (not write-only via File::create), since
+        // `reconstruct_disk_from_backup` later calls `patch_hidden_sectors_for`
+        // which needs to read the boot sector to detect FAT/NTFS/exFAT
+        // signatures. On Unix a write-only handle returns EBADF on read.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&config.target_path)
             .with_context(|| format!("failed to create {}", config.target_path.display()))?;
         crate::os::DeviceWriteHandle::from_file(file)
     };
@@ -1291,14 +1341,6 @@ fn run_single_file_chd_restore_resize(
 ) -> Result<()> {
     use crate::rbformats::chd::ChdReader;
 
-    if metadata.partitions.iter().any(|pm| pm.is_logical) {
-        bail!(
-            "re-resize restore for single-file-CHD backups with logical \
-             partitions is not yet supported — restore as-is and use a \
-             separate tool to resize, or restore to an image and re-back-up."
-        );
-    }
-
     let container_name = metadata.container.as_deref().unwrap_or("disk.chd");
     let chd_path = config.backup_folder.join(container_name);
     if !chd_path.exists() {
@@ -1347,6 +1389,42 @@ fn run_single_file_chd_restore_resize(
         );
     }
 
+    // Pre-flight: reject Custom shrinks that would clobber live filesystem
+    // data. `compute_partition_size` accepts any 512-aligned Custom value;
+    // the per-FS `resize_filesystem_for` would later refuse, but the
+    // failure surfaces mid-restore — half the new partition table written,
+    // half the body copied. Catch it here using the minimum-size hints
+    // persisted at backup time (or `imaged_size_bytes` as a last resort).
+    for ov in &overrides {
+        let pm = match metadata.partitions.iter().find(|p| p.index == ov.index) {
+            Some(p) => p,
+            None => continue,
+        };
+        // Floor uses the smallest known-safe size for this partition:
+        // defragmented < minimum < imaged. If none is known, skip the
+        // check (we'd rather attempt the resize than spuriously refuse).
+        let floor = pm.defragmented_min_size_bytes.or(pm.minimum_size_bytes).or(
+            if pm.imaged_size_bytes > 0 {
+                Some(pm.imaged_size_bytes)
+            } else {
+                None
+            },
+        );
+        if let Some(min) = floor {
+            if ov.export_size < min {
+                bail!(
+                    "partition-{} target size ({} bytes) is below its filesystem \
+                     minimum ({} bytes). Pick \"Minimum\" instead, or raise the \
+                     custom size to at least {} bytes.",
+                    ov.index,
+                    ov.export_size,
+                    min,
+                    min,
+                );
+            }
+        }
+    }
+
     set_operation(&progress, "Opening CHD container...");
     let mut chd_reader = ChdReader::open(&chd_path)
         .with_context(|| format!("failed to open {}", chd_path.display()))?;
@@ -1385,6 +1463,7 @@ fn run_single_file_chd_restore_resize(
     // end after partition data is written.
     set_operation(&progress, "Writing partition table...");
     let mut gpt_for_backup_header: Option<Gpt> = None;
+    let mut ebr_result: Option<EbrChainResult> = None;
     if is_superfloppy {
         // No table to write.
     } else if is_gpt {
@@ -1432,9 +1511,91 @@ fn run_single_file_chd_restore_resize(
             .read_exact(&mut mbr)
             .context("failed to read MBR from CHD")?;
         patch_mbr_entries(&mut mbr, &overrides);
+
+        // If the source had logical partitions, rebuild the EBR chain so
+        // it reflects the new sizes/positions. The CHD only carries each
+        // logical's body — the EBR sectors between them were zero-filled
+        // at backup time (see `single_file_chd::run`'s extended-container
+        // skip). We mirror `rbformats::reconstruct_disk_from_backup`'s
+        // approach: build the chain, repatch the MBR's extended-container
+        // total_sectors to match, then write the EBR sectors after the
+        // partition table.
+        ebr_result = build_restore_ebr_chain(metadata, &overrides, Some(&mbr));
+        if let Some(ref result) = ebr_result {
+            let extended_start = result.extended_start_lba as u64;
+            let last_end_lba = result
+                .logical_starts
+                .iter()
+                .filter_map(|(idx, start_lba)| {
+                    let size = overrides
+                        .iter()
+                        .find(|o| o.index == *idx)
+                        .map(|o| o.export_size / 512)
+                        .or_else(|| {
+                            metadata
+                                .partitions
+                                .iter()
+                                .find(|pm| pm.index == *idx)
+                                .map(|pm| pm.imaged_size_bytes / 512)
+                        })?;
+                    Some(start_lba + size)
+                })
+                .max();
+            if let Some(end_lba) = last_end_lba {
+                let new_total_sectors = (end_lba - extended_start) as u32;
+                for i in 0..4 {
+                    let off = 446 + i * 16;
+                    let type_byte = mbr[off + 4];
+                    if type_byte == 0x05 || type_byte == 0x0F || type_byte == 0x85 {
+                        let entry_start = u32::from_le_bytes([
+                            mbr[off + 8],
+                            mbr[off + 9],
+                            mbr[off + 10],
+                            mbr[off + 11],
+                        ]);
+                        if entry_start == extended_start as u32 {
+                            mbr[off + 12..off + 16]
+                                .copy_from_slice(&new_total_sectors.to_le_bytes());
+                            log(
+                                &progress,
+                                LogLevel::Info,
+                                format!(
+                                    "Patched MBR extended container: total_sectors = {}",
+                                    new_total_sectors,
+                                ),
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         target
             .write_all(&mbr)
             .context("failed to write MBR to target")?;
+
+        // Write the rebuilt EBR sectors. Each lives one sector before its
+        // logical partition's start LBA — body writes below land at
+        // `start_lba + 1 sector`, so they don't clobber these.
+        if let Some(ref result) = ebr_result {
+            log(
+                &progress,
+                LogLevel::Info,
+                format!(
+                    "Writing {} EBR sector(s) for logical partitions...",
+                    result.ebr_sectors.len()
+                ),
+            );
+            for (ebr_offset, ebr_sector) in &result.ebr_sectors {
+                target
+                    .seek(SeekFrom::Start(*ebr_offset))
+                    .context("failed to seek target to EBR offset")?;
+                target
+                    .write_all(ebr_sector)
+                    .context("failed to write EBR sector")?;
+            }
+        }
     }
 
     // Pre-flight: a 1 MiB chunk size for the partition copy loop, sized
@@ -1448,18 +1609,31 @@ fn run_single_file_chd_restore_resize(
         .min(config.target_size);
     set_progress_bytes(&progress, 0, total_logical_bytes);
 
-    // Step 2: write each partition body into its new home. Sort by new
-    // start LBA so we always seek forward — APM driver+data ordering
-    // can interleave indices.
-    let mut sorted: Vec<&crate::backup::metadata::PartitionMetadata> =
-        metadata.partitions.iter().collect();
-    sorted.sort_by_key(|pm| {
+    // Helper: resolve the *target* LBA for a partition, using the
+    // EBR-recalculated positions for logical partitions when present.
+    // Mirrors `rbformats::reconstruct_disk_from_backup` so the layouts
+    // produced by the two paths agree.
+    let get_partition_lba = |pm: &crate::backup::metadata::PartitionMetadata| -> u64 {
+        if pm.is_logical {
+            if let Some(ref r) = ebr_result {
+                if let Some((_, lba)) = r.logical_starts.iter().find(|(i, _)| *i == pm.index) {
+                    return *lba;
+                }
+            }
+        }
         overrides
             .iter()
             .find(|o| o.index == pm.index)
             .map(|o| o.effective_start_lba())
             .unwrap_or(pm.start_lba)
-    });
+    };
+
+    // Step 2: write each partition body into its new home. Sort by new
+    // start LBA so we always seek forward — APM driver+data ordering
+    // can interleave indices.
+    let mut sorted: Vec<&crate::backup::metadata::PartitionMetadata> =
+        metadata.partitions.iter().collect();
+    sorted.sort_by_key(|pm| get_partition_lba(pm));
 
     let mut buf = vec![0u8; CHUNK];
     let mut bytes_progressed: u64 = 0;
@@ -1471,7 +1645,7 @@ fn run_single_file_chd_restore_resize(
             Some(o) => o,
             None => continue,
         };
-        let new_offset = ov.effective_start_lba() * 512;
+        let new_offset = get_partition_lba(pm) * 512;
         let export_size = ov.export_size;
 
         // Source range inside the CHD: `pm.start_lba` was set by Stage
@@ -1547,9 +1721,9 @@ fn run_single_file_chd_restore_resize(
                 Some(o) => o,
                 None => continue,
             };
-            let new_offset = ov.effective_start_lba() * 512;
+            let new_start_lba = get_partition_lba(pm);
+            let new_offset = new_start_lba * 512;
             let export_size = ov.export_size;
-            let new_start_lba = ov.effective_start_lba();
             // Resize is needed if the partition's size changed compared
             // to what the CHD held.
             if export_size != pm.imaged_size_bytes {
@@ -1848,7 +2022,16 @@ fn run_clonezilla_restore(
             LogLevel::Info,
             format!("Creating image file {}...", config.target_path.display()),
         );
-        let file = File::create(&config.target_path)
+        // Open R+W (not write-only via File::create), since
+        // `reconstruct_disk_from_backup` later calls `patch_hidden_sectors_for`
+        // which needs to read the boot sector to detect FAT/NTFS/exFAT
+        // signatures. On Unix a write-only handle returns EBADF on read.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&config.target_path)
             .with_context(|| format!("failed to create {}", config.target_path.display()))?;
         crate::os::DeviceWriteHandle::from_file(file)
     };
@@ -2595,10 +2778,12 @@ mod tests {
                 output_base: &output_base,
                 resize_targets: None,
                 alignment_sectors: 0,
+                checksum_type: crate::backup::ChecksumType::Sha256,
             },
             &mut progress_cb,
             &cancel_check,
             &mut log_cb,
+            &mut |_, _| {},
         )
         .expect("backup");
 
@@ -2636,12 +2821,15 @@ mod tests {
                     original_size_bytes: r.length,
                     imaged_size_bytes: r.length,
                     compressed_files: vec![],
-                    checksum: r.checksum_sha256.clone(),
+                    checksum: r.checksum.clone(),
                     resized: false,
                     compacted: true,
                     is_logical: false,
                     partition_type_string: None,
                     minimum_size_bytes: None,
+                    defragmented_min_size_bytes: None,
+                    hfsplus_signature: None,
+                    defragmented_clone: false,
                 })
                 .collect(),
             bad_sectors: vec![],
@@ -2724,10 +2912,12 @@ mod tests {
                 output_base: &output_base,
                 resize_targets: None,
                 alignment_sectors: 0,
+                checksum_type: crate::backup::ChecksumType::Sha256,
             },
             &mut progress_cb,
             &cancel_check,
             &mut log_cb,
+            &mut |_, _| {},
         )
         .expect("backup");
 
@@ -2764,12 +2954,15 @@ mod tests {
                     original_size_bytes: r.length,
                     imaged_size_bytes: r.length,
                     compressed_files: vec![],
-                    checksum: r.checksum_sha256.clone(),
+                    checksum: r.checksum.clone(),
                     resized: false,
                     compacted: true,
                     is_logical: false,
                     partition_type_string: None,
                     minimum_size_bytes: None,
+                    defragmented_min_size_bytes: None,
+                    hfsplus_signature: None,
+                    defragmented_clone: false,
                 })
                 .collect(),
             bad_sectors: vec![],
@@ -2884,10 +3077,12 @@ mod tests {
                 output_base: &output_base,
                 resize_targets: None,
                 alignment_sectors: 0,
+                checksum_type: crate::backup::ChecksumType::Sha256,
             },
             &mut progress_cb,
             &cancel_check,
             &mut log_cb,
+            &mut |_, _| {},
         )
         .expect("backup");
 
@@ -2931,12 +3126,15 @@ mod tests {
                     original_size_bytes: r.length,
                     imaged_size_bytes: r.length,
                     compressed_files: vec![],
-                    checksum: r.checksum_sha256.clone(),
+                    checksum: r.checksum.clone(),
                     resized: false,
                     compacted: false,
                     is_logical: false,
                     partition_type_string: None,
                     minimum_size_bytes: None,
+                    defragmented_min_size_bytes: None,
+                    hfsplus_signature: None,
+                    defragmented_clone: false,
                 })
                 .collect(),
             bad_sectors: vec![],
@@ -2965,5 +3163,525 @@ mod tests {
             restored, data,
             "sector-by-sector backup must round-trip the source disk byte-for-byte",
         );
+    }
+
+    /// CHD backup with logical partitions in an extended container, then
+    /// restore-resize that shrinks the first logical. Asserts:
+    ///   - the rebuilt MBR's primary + extended-container entries are right,
+    ///   - the EBR chain is rebuilt at the new positions,
+    ///   - each logical's body lands at its new offset.
+    #[test]
+    fn single_file_chd_re_resize_restore_handles_logical_partitions() {
+        use crate::backup::metadata::ExtendedContainerMetadata;
+        use crate::partition::mbr::{build_ebr_chain, LogicalPartitionInfo};
+
+        // Layout (8 MiB / 16384 sectors):
+        //   [0]            MBR
+        //   [1..=1023]     primary Linux (1023 sectors)
+        //   [1024..=16383] extended container (15360 sectors)
+        //     EBR  @ 1024
+        //     L0   @ 1025..=3071  (2047 sectors)
+        //     EBR  @ 3072
+        //     L1   @ 3073..=5119  (2047 sectors)
+        //
+        // Restore shrinks L0 to 1023 sectors and lets L1 keep its size.
+        const TOTAL_SECTORS: u32 = 16384;
+        const PRIMARY_LBA: u32 = 1;
+        const PRIMARY_SECTORS: u32 = 1023;
+        const EXT_LBA: u32 = 1024;
+        const EXT_SECTORS: u32 = TOTAL_SECTORS - EXT_LBA;
+        const L0_LBA: u32 = 1025;
+        const L0_SECTORS: u32 = 2047;
+        const L1_LBA: u32 = 3073;
+        const L1_SECTORS: u32 = 2047;
+        const L0_NEW_SECTORS: u32 = 1023;
+        const SECTOR_SIZE: u64 = 512;
+        let total_bytes = TOTAL_SECTORS as u64 * SECTOR_SIZE;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_path = tmp.path().join("source.img");
+        let mut data = vec![0u8; total_bytes as usize];
+
+        // Hand-build the source MBR: primary 0x83 + extended 0x05.
+        data[510] = 0x55;
+        data[511] = 0xAA;
+        // Entry 0: primary
+        data[446 + 4] = 0x83;
+        data[446 + 8..446 + 12].copy_from_slice(&PRIMARY_LBA.to_le_bytes());
+        data[446 + 12..446 + 16].copy_from_slice(&PRIMARY_SECTORS.to_le_bytes());
+        // Entry 1: extended
+        data[462 + 4] = 0x05;
+        data[462 + 8..462 + 12].copy_from_slice(&EXT_LBA.to_le_bytes());
+        data[462 + 12..462 + 16].copy_from_slice(&EXT_SECTORS.to_le_bytes());
+
+        // EBR chain.
+        let ebrs = build_ebr_chain(
+            EXT_LBA,
+            &[
+                LogicalPartitionInfo {
+                    start_lba: L0_LBA,
+                    total_sectors: L0_SECTORS,
+                    partition_type: 0x83,
+                },
+                LogicalPartitionInfo {
+                    start_lba: L1_LBA,
+                    total_sectors: L1_SECTORS,
+                    partition_type: 0x83,
+                },
+            ],
+        );
+        for (offset, sector) in &ebrs {
+            data[*offset as usize..*offset as usize + 512].copy_from_slice(sector);
+        }
+
+        // Distinguishable per-partition fill so the body-copy loop is
+        // verifiable post-restore.
+        let fill = |buf: &mut [u8], seed: u8| {
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = seed.wrapping_add((i % 251) as u8);
+            }
+        };
+        fill(
+            &mut data
+                [(PRIMARY_LBA as usize * 512)..((PRIMARY_LBA + PRIMARY_SECTORS) as usize * 512)],
+            0x10,
+        );
+        fill(
+            &mut data[(L0_LBA as usize * 512)..((L0_LBA + L0_SECTORS) as usize * 512)],
+            0x40,
+        );
+        fill(
+            &mut data[(L1_LBA as usize * 512)..((L1_LBA + L1_SECTORS) as usize * 512)],
+            0x80,
+        );
+        std::fs::write(&source_path, &data).unwrap();
+
+        // Run the CHD backup.
+        let backup_folder = tmp.path().join("backup");
+        std::fs::create_dir_all(&backup_folder).unwrap();
+        let output_base = backup_folder.join("disk");
+        let source_file = File::open(&source_path).unwrap();
+        let mut br = BufReader::new(source_file.try_clone().unwrap());
+        let table = PartitionTable::detect(&mut br).expect("detect MBR");
+        let partitions = table.partitions();
+        let mbr_bytes: [u8; 512] = data[..512].try_into().unwrap();
+
+        let mut log_buf: Vec<String> = Vec::new();
+        let mut log_cb = |s: &str| log_buf.push(s.to_string());
+        let mut progress_cb = |_: u64| {};
+        let cancel_check = || false;
+        let chd_result = single_file_chd::run(
+            SingleFileChdInputs {
+                source_file: &source_file,
+                source_size: total_bytes,
+                source_partition_table_bytes: &mbr_bytes,
+                partition_table: &table,
+                partitions: &partitions,
+                partition_filter: None,
+                sector_by_sector: false,
+                chd_options: None,
+                is_dvd: false,
+                output_base: &output_base,
+                resize_targets: None,
+                alignment_sectors: 1,
+                checksum_type: crate::backup::ChecksumType::Sha256,
+            },
+            &mut progress_cb,
+            &cancel_check,
+            &mut log_cb,
+            &mut |_, _| {},
+        )
+        .expect("backup");
+
+        // Build single-file-CHD metadata. Primary (idx 0) + L0 (idx 2) +
+        // L1 (idx 3) all came back from `chd_result`; the extended
+        // container itself is recorded separately in
+        // `extended_container`.
+        // `imaged_floor` lets the test simulate a backup that already
+        // compacted the partition. The actual CHD body length is still
+        // `r.length` (the full source extent); the restore loop reads
+        // only `imaged_size_bytes` from it and zero-pads the rest. Setting
+        // a smaller imaged_size_bytes on L0 is what unlocks Custom shrink
+        // here without a real filesystem behind it.
+        let part_meta = |idx: usize, type_byte: u8, is_logical: bool, imaged_floor: Option<u64>| {
+            let r = chd_result
+                .partition_ranges
+                .iter()
+                .find(|r| r.partition_index == idx)
+                .expect("range");
+            PartitionMetadata {
+                index: idx,
+                type_name: "Linux".to_string(),
+                partition_type_byte: type_byte,
+                start_lba: r.offset_in_disk / 512,
+                original_size_bytes: r.length,
+                imaged_size_bytes: imaged_floor.unwrap_or(r.length),
+                compressed_files: vec![],
+                checksum: r.checksum.clone(),
+                resized: false,
+                compacted: true,
+                is_logical,
+                partition_type_string: None,
+                minimum_size_bytes: None,
+                defragmented_min_size_bytes: None,
+                hfsplus_signature: None,
+                defragmented_clone: false,
+            }
+        };
+        let metadata = BackupMetadata {
+            version: 1,
+            created: "2026-05-04T00:00:00Z".to_string(),
+            source_device: source_path.display().to_string(),
+            source_size_bytes: total_bytes,
+            partition_table_type: "MBR".to_string(),
+            checksum_type: "sha256".to_string(),
+            compression_type: "chd".to_string(),
+            split_size_mib: None,
+            sector_by_sector: false,
+            layout: BackupLayout::SingleFileChd,
+            container: Some(chd_result.container_filename.clone()),
+            container_logical_size: Some(chd_result.container_logical_size),
+            container_sha1: Some(chd_result.container_sha1.clone()),
+            size_policy: Some(crate::backup::metadata::SizePolicy::Original),
+            alignment: AlignmentMetadata {
+                detected_type: "None detected".to_string(),
+                first_partition_lba: 1,
+                alignment_sectors: 1,
+                heads: 0,
+                sectors_per_track: 0,
+            },
+            partitions: vec![
+                part_meta(0, 0x83, false, None),
+                part_meta(4, 0x83, true, Some(L0_NEW_SECTORS as u64 * SECTOR_SIZE)),
+                part_meta(5, 0x83, true, None),
+            ],
+            bad_sectors: vec![],
+            extended_container: Some(ExtendedContainerMetadata {
+                mbr_index: 1,
+                partition_type_byte: 0x05,
+                start_lba: EXT_LBA as u64,
+                size_bytes: EXT_SECTORS as u64 * 512,
+            }),
+        };
+        std::fs::write(
+            backup_folder.join("metadata.json"),
+            serde_json::to_string_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        // Restore: shrink L0, leave L1 + primary at Original.
+        let target_path = tmp.path().join("restored.img");
+        let cfg = RestoreConfig {
+            backup_folder: backup_folder.clone(),
+            target_path: target_path.clone(),
+            target_is_device: false,
+            target_size: total_bytes,
+            alignment: RestoreAlignment::Custom(1),
+            partition_sizes: vec![RestorePartitionSize {
+                index: 4,
+                size_choice: RestoreSizeChoice::Custom(L0_NEW_SECTORS as u64 * SECTOR_SIZE),
+            }],
+            write_zeros_to_unused: false,
+        };
+        let progress = Arc::new(Mutex::new(RestoreProgress::new()));
+        run_restore(cfg, progress.clone()).expect("restore");
+        assert!(progress.lock().unwrap().finished);
+
+        let restored = std::fs::read(&target_path).unwrap();
+
+        // Primary entry must still report (PRIMARY_LBA, PRIMARY_SECTORS).
+        let primary_start = u32::from_le_bytes(restored[446 + 8..446 + 12].try_into().unwrap());
+        let primary_size = u32::from_le_bytes(restored[446 + 12..446 + 16].try_into().unwrap());
+        assert_eq!(primary_start, PRIMARY_LBA);
+        assert_eq!(primary_size, PRIMARY_SECTORS);
+
+        // Extended-container entry: start unchanged, total_sectors must
+        // shrink to cover only the new (smaller) logical layout.
+        let ext_start = u32::from_le_bytes(restored[462 + 8..462 + 12].try_into().unwrap());
+        let ext_size = u32::from_le_bytes(restored[462 + 12..462 + 16].try_into().unwrap());
+        assert_eq!(ext_start, EXT_LBA);
+        // After shrink: L0 = 1023 sectors, L1 = 2047 sectors,
+        // each preceded by a 1-sector EBR.
+        // Total = (1 + 1023) + (1 + 2047) = 3072 sectors.
+        let expected_ext_size = (1 + L0_NEW_SECTORS) + (1 + L1_SECTORS);
+        assert_eq!(
+            ext_size, expected_ext_size,
+            "extended container total_sectors must reflect repacked logicals",
+        );
+
+        // First EBR sits at EXT_LBA.
+        let first_ebr_off = (EXT_LBA as usize) * 512;
+        assert_eq!(
+            restored[first_ebr_off + 510],
+            0x55,
+            "first EBR must carry boot signature"
+        );
+        assert_eq!(restored[first_ebr_off + 511], 0xAA);
+        // First EBR entry-0: rel_start = 1, total = L0_NEW_SECTORS.
+        let l0_rel = u32::from_le_bytes(
+            restored[first_ebr_off + 446 + 8..first_ebr_off + 446 + 12]
+                .try_into()
+                .unwrap(),
+        );
+        let l0_size = u32::from_le_bytes(
+            restored[first_ebr_off + 446 + 12..first_ebr_off + 446 + 16]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(l0_rel, 1);
+        assert_eq!(l0_size, L0_NEW_SECTORS);
+
+        // Second EBR sits one sector before L1's new start. After shrink
+        // L0 ends at EXT_LBA + 1 + L0_NEW_SECTORS, so the next EBR is at
+        // that position.
+        let l1_new_lba = EXT_LBA + 1 + L0_NEW_SECTORS + 1;
+        let second_ebr_off = ((l1_new_lba - 1) as usize) * 512;
+        assert_eq!(restored[second_ebr_off + 510], 0x55);
+        assert_eq!(restored[second_ebr_off + 511], 0xAA);
+        // Second EBR's "next" link must be empty (last logical).
+        let next_link = u32::from_le_bytes(
+            restored[second_ebr_off + 462 + 8..second_ebr_off + 462 + 12]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(next_link, 0, "last EBR must not link to a next EBR");
+
+        // L0 body: imaged region (= L0_NEW_SECTORS * 512) must equal the
+        // first L0_NEW_SECTORS sectors of the source.
+        let l0_off = (EXT_LBA + 1) as usize * 512;
+        let l0_imaged_bytes = L0_NEW_SECTORS as usize * 512;
+        let l0_src = &data[(L0_LBA as usize * 512)..(L0_LBA as usize * 512 + l0_imaged_bytes)];
+        assert_eq!(
+            &restored[l0_off..l0_off + l0_imaged_bytes],
+            l0_src,
+            "L0 body must match source (imaged region)",
+        );
+
+        // L1 body: full bytes must equal source's L1 verbatim, but at
+        // the new offset.
+        let l1_off = l1_new_lba as usize * 512;
+        let l1_src = &data[(L1_LBA as usize * 512)..((L1_LBA + L1_SECTORS) as usize * 512)];
+        assert_eq!(
+            &restored[l1_off..l1_off + L1_SECTORS as usize * 512],
+            l1_src,
+            "L1 body must match source verbatim at its new offset",
+        );
+
+        // Primary body verbatim at its original location.
+        let prim_off = PRIMARY_LBA as usize * 512;
+        assert_eq!(
+            &restored[prim_off..prim_off + PRIMARY_SECTORS as usize * 512],
+            &data[prim_off..prim_off + PRIMARY_SECTORS as usize * 512],
+            "primary body must match source verbatim",
+        );
+    }
+
+    /// Step 22f-ii — restore a defragmented-clone HFS+ partition. Crafts a
+    /// backup folder by hand (one MBR + one HFS+ partition file produced by
+    /// [`stream_defragmented_hfsplus`]), then runs `run_restore` at the
+    /// source's "Original" partition size — exercising the new
+    /// `defragmented_clone` skip in the resize loop and the zero-fill
+    /// branch in `reconstruct_disk_from_backup`. Verifies the restored
+    /// HFS+ volume opens cleanly via `HfsPlusFilesystem::open`, the
+    /// catalog round-trips byte-equal, and the volume header still
+    /// reports the clone-time `total_blocks` (i.e. resize_hfsplus_in_place
+    /// wasn't called against the larger partition window).
+    #[test]
+    fn defragmented_clone_restore_round_trip() {
+        use crate::backup::CompressionType;
+        use crate::fs::filesystem::{
+            CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem,
+        };
+        use crate::fs::hfsplus::{create_blank_hfsplus, HfsPlusFilesystem};
+        use crate::fs::hfsplus_defrag::stream_defragmented_hfsplus;
+        use std::io::Cursor;
+
+        const SECTOR_SIZE: u64 = 512;
+        // Source HFS+ volume: 32 MiB, packed into a 2 MiB clone target.
+        const SRC_BYTES: u64 = 32 * 1024 * 1024;
+        const CLONE_BYTES: u64 = 2 * 1024 * 1024;
+        // Partition window the restore picks ("Original" choice) — twice the
+        // clone size so the zero-fill branch has a real tail to flush.
+        const PART_BYTES: u64 = 4 * 1024 * 1024;
+        const PART_SECTORS: u32 = (PART_BYTES / SECTOR_SIZE) as u32;
+        // Disk = MBR sector + partition window.
+        const TOTAL_BYTES: u64 = SECTOR_SIZE + PART_BYTES;
+
+        // Build a synthetic HFS+ source with one nested dir and two small
+        // files so the cloned target carries verifiable content.
+        let mut src_img = create_blank_hfsplus(SRC_BYTES, 4096, "DefragSrc", false);
+        {
+            let cur = Cursor::new(&mut src_img);
+            let mut hfs = HfsPlusFilesystem::open(cur, 0).unwrap();
+            hfs.prepare_for_edit().unwrap();
+            let root = hfs.root().unwrap();
+            let docs = hfs
+                .create_directory(&root, "Docs", &CreateDirectoryOptions::default())
+                .unwrap();
+            let mut a = Cursor::new(b"alpha\n".as_ref());
+            hfs.create_file(&docs, "alpha.txt", &mut a, 6, &CreateFileOptions::default())
+                .unwrap();
+            let mut b = Cursor::new(b"beta\n".as_ref());
+            hfs.create_file(&root, "beta.txt", &mut b, 5, &CreateFileOptions::default())
+                .unwrap();
+            hfs.sync_metadata().unwrap();
+        }
+
+        // Stream-clone the source into a Vec<u8> sized at CLONE_BYTES.
+        let mut clone_buf: Vec<u8> = Vec::with_capacity(CLONE_BYTES as usize);
+        {
+            let cur = Cursor::new(&mut src_img);
+            let mut hfs = HfsPlusFilesystem::open(cur, 0).unwrap();
+            stream_defragmented_hfsplus(&mut hfs, CLONE_BYTES, &mut clone_buf)
+                .expect("stream_defragmented_hfsplus");
+        }
+        assert_eq!(clone_buf.len() as u64, CLONE_BYTES);
+        // Snapshot the volume-header bytes (offset 1024..1536) so we can
+        // confirm restore did not patch them.
+        let original_vh: Vec<u8> = clone_buf[1024..1536].to_vec();
+
+        // Lay out the backup folder by hand.
+        let tmp = tempfile::tempdir().unwrap();
+        let backup_folder = tmp.path().join("backup");
+        std::fs::create_dir_all(&backup_folder).unwrap();
+        // Single HFS+ partition entry at LBA 1 spanning PART_SECTORS sectors.
+        let mut mbr = [0u8; 512];
+        mbr[440..444].copy_from_slice(&0xCAFEBABEu32.to_le_bytes());
+        let off = 446;
+        mbr[off] = 0x00;
+        mbr[off + 4] = 0xAF;
+        mbr[off + 8..off + 12].copy_from_slice(&1u32.to_le_bytes());
+        mbr[off + 12..off + 16].copy_from_slice(&PART_SECTORS.to_le_bytes());
+        mbr[510] = 0x55;
+        mbr[511] = 0xAA;
+        std::fs::write(backup_folder.join("mbr.bin"), &mbr).unwrap();
+        std::fs::write(backup_folder.join("partition-0.raw"), &clone_buf).unwrap();
+
+        // Compute the SHA256 over the partition file so verify::compute_checksum
+        // round-trips cleanly. Restore-side code does not currently re-verify,
+        // but populating the field keeps the metadata realistic.
+        let part_path = backup_folder.join("partition-0.raw");
+        let checksum = crate::backup::verify::compute_checksum(
+            &part_path,
+            crate::backup::ChecksumType::Sha256,
+        )
+        .unwrap();
+        std::fs::write(
+            backup_folder.join("partition-0.raw.sha256"),
+            format!("{checksum}  partition-0.raw\n"),
+        )
+        .unwrap();
+
+        let metadata = BackupMetadata {
+            version: 1,
+            created: "2026-05-10T00:00:00Z".to_string(),
+            source_device: "synthetic".to_string(),
+            source_size_bytes: TOTAL_BYTES,
+            partition_table_type: "MBR".to_string(),
+            checksum_type: "sha256".to_string(),
+            compression_type: CompressionType::None.as_str().to_string(),
+            split_size_mib: None,
+            sector_by_sector: false,
+            layout: BackupLayout::PerPartition,
+            container: None,
+            container_logical_size: None,
+            container_sha1: None,
+            size_policy: None,
+            alignment: AlignmentMetadata {
+                detected_type: "None detected".to_string(),
+                first_partition_lba: 1,
+                alignment_sectors: 1,
+                heads: 0,
+                sectors_per_track: 0,
+            },
+            partitions: vec![PartitionMetadata {
+                index: 0,
+                type_name: "HFS+".to_string(),
+                partition_type_byte: 0xAF,
+                start_lba: 1,
+                original_size_bytes: PART_BYTES,
+                imaged_size_bytes: CLONE_BYTES,
+                compressed_files: vec!["partition-0.raw".to_string()],
+                checksum,
+                resized: false,
+                compacted: false,
+                is_logical: false,
+                partition_type_string: None,
+                minimum_size_bytes: Some(CLONE_BYTES),
+                defragmented_min_size_bytes: Some(CLONE_BYTES),
+                hfsplus_signature: Some(0x482B),
+                defragmented_clone: true,
+            }],
+            bad_sectors: vec![],
+            extended_container: None,
+        };
+        std::fs::write(
+            backup_folder.join("metadata.json"),
+            serde_json::to_string_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        // Restore at "Original" — the partition window is PART_BYTES, the
+        // clone occupies the first CLONE_BYTES, the rest must zero-fill.
+        let target_path = tmp.path().join("restored.img");
+        let cfg = RestoreConfig {
+            backup_folder: backup_folder.clone(),
+            target_path: target_path.clone(),
+            target_is_device: false,
+            target_size: TOTAL_BYTES,
+            alignment: RestoreAlignment::Original,
+            partition_sizes: vec![RestorePartitionSize {
+                index: 0,
+                size_choice: RestoreSizeChoice::Original,
+            }],
+            write_zeros_to_unused: false,
+        };
+        let progress = Arc::new(Mutex::new(RestoreProgress::new()));
+        run_restore(cfg, progress.clone()).expect("restore");
+        assert!(progress.lock().unwrap().finished);
+
+        let restored = std::fs::read(&target_path).unwrap();
+        assert_eq!(restored.len() as u64, TOTAL_BYTES, "restored size mismatch");
+        // MBR signature.
+        assert_eq!(restored[510], 0x55);
+        assert_eq!(restored[511], 0xAA);
+
+        // Partition window: first CLONE_BYTES must equal the clone bytes
+        // verbatim — proves the resize loop's `defragmented_clone` skip
+        // kept resize_hfsplus_in_place from rewriting the volume.
+        let part_off = SECTOR_SIZE as usize;
+        let clone_end = part_off + CLONE_BYTES as usize;
+        assert_eq!(
+            &restored[part_off..clone_end],
+            clone_buf.as_slice(),
+            "cloned HFS+ bytes must restore verbatim",
+        );
+        // Tail past the clone must be zero-filled (Phase-8 zero-fill branch).
+        let tail = &restored[clone_end..(part_off + PART_BYTES as usize)];
+        assert!(
+            tail.iter().all(|&b| b == 0),
+            "partition tail past clone must be zero-filled, got non-zero",
+        );
+
+        // Volume-header bytes survive identical (resize would have rewritten
+        // total_blocks / alt-VH; clone-skip leaves them untouched).
+        assert_eq!(
+            &restored[part_off + 1024..part_off + 1536],
+            original_vh.as_slice(),
+            "volume header bytes must not be patched by restore",
+        );
+
+        // Open the restored partition's HFS+ volume and verify content.
+        let restored_for_open = restored.clone();
+        let cur = Cursor::new(restored_for_open);
+        let mut tgt = HfsPlusFilesystem::open(cur, SECTOR_SIZE).expect("open restored HFS+");
+        let root = tgt.root().expect("root");
+        let kids = tgt.list_directory(&root).expect("list root");
+        let names: Vec<&str> = kids.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"Docs"), "Docs missing: {names:?}");
+        assert!(names.contains(&"beta.txt"), "beta missing: {names:?}");
+        let beta = kids.iter().find(|e| e.name == "beta.txt").unwrap().clone();
+        let beta_bytes = tgt.read_file(&beta, usize::MAX).expect("read beta.txt");
+        assert_eq!(beta_bytes, b"beta\n");
     }
 }

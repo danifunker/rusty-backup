@@ -369,8 +369,11 @@ pub fn reconstruct_disk_from_backup(
             //   (a) no stale data from a previous install remains in the free region,
             //   (b) the alternate volume header slot (HFS/HFS+) is zeroed before step 8
             //       of restore writes the correct header there.
+            // Defragmented-clone partitions (Phase-8) carry a fully-packed HFS+ volume
+            // sized to the defragmented minimum; the tail past the volume must also be
+            // explicitly zeroed so no stale residue remains in the partition window.
             // Progress is reported chunk-by-chunk since the tail can be substantial.
-            if pm.compacted {
+            if pm.compacted || pm.defragmented_clone {
                 log_cb(&format!(
                     "partition-{}: trimmed backup — zero-filling {} bytes to complete partition \
                      (filesystem headers finalized in post-processing)",

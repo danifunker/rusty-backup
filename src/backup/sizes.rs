@@ -28,6 +28,10 @@ pub(super) struct PartitionSizing {
     pub compact_sizes: Vec<Option<u64>>,
     /// True filesystem minimum (last-data-byte) for the resize/restore UI.
     pub minimum_sizes: Vec<Option<u64>>,
+    /// Defragmented minimum (post-clone-shrink). `Some` only when the
+    /// filesystem reports a value smaller than `minimum_sizes[i]` — currently
+    /// HFS+ on fragmented volumes; `None` otherwise.
+    pub defragmented_min_sizes: Vec<Option<u64>>,
     /// True when the compact reader emits free blocks as zeros (HFS/HFS+/ext/btrfs).
     pub is_layout_preserving_flags: Vec<bool>,
 }
@@ -46,6 +50,7 @@ pub(super) fn analyze_partitions(
         stream_sizes: Vec::with_capacity(n),
         compact_sizes: Vec::with_capacity(n),
         minimum_sizes: Vec::with_capacity(n),
+        defragmented_min_sizes: Vec::with_capacity(n),
         is_layout_preserving_flags: Vec::with_capacity(n),
     };
 
@@ -165,6 +170,27 @@ pub(super) fn analyze_partitions(
             };
             sizing.minimum_sizes.push(minimum);
 
+            // Defragmented minimum: only meaningfully smaller than `minimum`
+            // for HFS+ on fragmented volumes; for every other FS this falls
+            // through to `last_data_byte` and matches `minimum`.
+            let defrag = source
+                .try_clone()
+                .ok()
+                .and_then(|clone| {
+                    fs::defragmented_partition_size(
+                        BufReader::new(clone),
+                        part_offset,
+                        part.partition_type_byte,
+                        part.partition_type_string.as_deref(),
+                    )
+                })
+                .map(|d| d.min(part.size_bytes))
+                .filter(|&d| match minimum {
+                    Some(m) => d < m,
+                    None => d < part.size_bytes,
+                });
+            sizing.defragmented_min_sizes.push(defrag);
+
             // LP: trim stream to minimum so the free tail isn't compressed.
             // Packed: stream == compacted (already optimal).
             let stream = if is_lp {
@@ -193,6 +219,7 @@ pub(super) fn analyze_partitions(
             sizing.stream_sizes.push(sz);
             sizing.compact_sizes.push(None);
             sizing.minimum_sizes.push(effective);
+            sizing.defragmented_min_sizes.push(None);
             sizing.is_layout_preserving_flags.push(false);
         }
     }
@@ -205,6 +232,7 @@ fn push_skip(sizing: &mut PartitionSizing, sz: u64) {
     sizing.stream_sizes.push(sz);
     sizing.compact_sizes.push(None);
     sizing.minimum_sizes.push(None);
+    sizing.defragmented_min_sizes.push(None);
     sizing.is_layout_preserving_flags.push(false);
 }
 

@@ -18,8 +18,10 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read as _};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::thread;
 
 use crate::clonezilla::block_cache::{PartcloneBlockCache, PartcloneBlockReader};
+use crate::fs::entry::FileEntry;
 use crate::fs::filesystem::{EditableFilesystem, Filesystem, FilesystemError};
 use crate::fs::zstd_stream::{ZstdStreamCache, ZstdStreamReader};
 use crate::fs::{self};
@@ -52,6 +54,19 @@ pub struct BrowseSession {
     /// `source_path` — the GUI's CHD edit-mode flow installs it for the
     /// duration of editing and clears it on apply/discard.
     pub chd_edit_session: Option<Arc<Mutex<ChdEditSession>>>,
+}
+
+/// True when the session is opening an HFS+ (or HFSX, or APM Apple_HFS that
+/// may resolve to HFS+) partition. Used to selectively disable F_NOCACHE on
+/// macOS so the catalog B-tree reads can hit the buffer cache.
+#[cfg(target_os = "macos")]
+fn is_hfs_plus_partition(partition_type: u8, partition_type_string: Option<&str>) -> bool {
+    if let Some(s) = partition_type_string {
+        if matches!(s, "Apple_HFS" | "Apple_HFSX" | "Apple_HFS+") {
+            return true;
+        }
+    }
+    partition_type == 0xAF
 }
 
 impl BrowseSession {
@@ -96,6 +111,19 @@ impl BrowseSession {
         // devices (/dev/rdiskN) require sector-aligned seeks/reads.
         if let Some(arc) = &self.preopen_file {
             let file = arc.try_clone().map_err(FilesystemError::Io)?;
+            #[cfg(target_os = "macos")]
+            {
+                if is_hfs_plus_partition(self.partition_type, self.partition_type_string.as_deref())
+                {
+                    if let Err(e) = crate::os::macos::clear_nocache(&file) {
+                        log::debug!("clear_nocache failed (ignored): {e}");
+                    } else {
+                        log::debug!(
+                            "[HFS+ open] cleared F_NOCACHE on inspect fd to enable buffer cache"
+                        );
+                    }
+                }
+            }
             let reader = crate::os::SectorAlignedReader::new(file);
             return fs::open_filesystem(
                 reader,
@@ -194,6 +222,70 @@ impl BrowseSession {
         }
     }
 
+    /// Spawn a worker that opens the filesystem and reads the root directory
+    /// listing on a background thread, so the GUI can keep painting (with a
+    /// spinner / phase label) while a slow open is in progress.
+    ///
+    /// Volumes with very large catalogs — HFS+ on a heavily-used volume can
+    /// have a 200+ MB catalog file — take seconds to load over a slow source
+    /// (SD-card raw I/O, network mounts). Doing it inline froze the UI; this
+    /// hands the work to a thread and surfaces phase strings via the shared
+    /// status struct.
+    pub fn spawn_open(&self) -> Arc<Mutex<BrowseOpenStatus>> {
+        let session = self.clone();
+        let status = Arc::new(Mutex::new(BrowseOpenStatus::starting()));
+        let status_thread = Arc::clone(&status);
+        thread::spawn(move || {
+            let set_phase = |s: &str| {
+                if let Ok(mut g) = status_thread.lock() {
+                    g.phase = s.to_string();
+                }
+            };
+
+            set_phase("Opening filesystem...");
+            let mut fs = match session.open() {
+                Ok(fs) => fs,
+                Err(e) => {
+                    if let Ok(mut g) = status_thread.lock() {
+                        g.error = Some(format!("Cannot open filesystem: {e}"));
+                        g.finished = true;
+                    }
+                    return;
+                }
+            };
+
+            let fs_type = fs.fs_type().to_string();
+            let volume_label = fs.volume_label().unwrap_or("").to_string();
+            let blessed_folder = fs.blessed_system_folder();
+
+            set_phase("Reading root directory...");
+            let (root, root_entries, list_err) = match fs.root() {
+                Ok(root) => match fs.list_directory(&root) {
+                    Ok(entries) => (Some(root), Some(entries), None),
+                    Err(e) => (
+                        Some(root),
+                        None,
+                        Some(format!("Failed to read root directory: {e}")),
+                    ),
+                },
+                Err(e) => (None, None, Some(format!("Failed to get root: {e}"))),
+            };
+
+            if let Ok(mut g) = status_thread.lock() {
+                g.phase = "Done".to_string();
+                g.fs_type = fs_type;
+                g.volume_label = volume_label;
+                g.blessed_folder = blessed_folder;
+                g.root = root;
+                g.root_entries = root_entries;
+                g.error = list_err;
+                g.fs = Some(fs);
+                g.finished = true;
+            }
+        });
+        status
+    }
+
     /// Open the filesystem read-write for editing operations.
     ///
     /// Unlike [`open`](Self::open) this requires a real `source_path` (or a
@@ -230,5 +322,47 @@ impl BrowseSession {
             self.partition_type,
             self.partition_type_string.as_deref(),
         )
+    }
+}
+
+/// Shared state between the GUI and the [`BrowseSession::spawn_open`] worker.
+///
+/// The worker fills these fields as it makes progress: phase strings while it
+/// runs, then the parsed metadata + the live `Filesystem` instance on
+/// completion. The GUI clones the `Arc` and polls each frame until `finished`
+/// flips true, then drains the fields into its own `BrowseView` state.
+///
+/// The `fs` slot lets the GUI keep one open `Filesystem` alive across reads
+/// (per-file previews, directory listings) instead of re-opening — which on
+/// HFS+ volumes with hundreds of thousands of files means re-reading the
+/// entire 100+ MB catalog every time. Edits invalidate the cached instance
+/// because they go through `open_editable` and write back to disk.
+pub struct BrowseOpenStatus {
+    pub phase: String,
+    pub finished: bool,
+    pub fs_type: String,
+    pub volume_label: String,
+    pub blessed_folder: Option<(u64, String)>,
+    pub root: Option<FileEntry>,
+    pub root_entries: Option<Vec<FileEntry>>,
+    pub error: Option<String>,
+    /// The opened filesystem itself, handed back to the UI thread so it can
+    /// cache it. `None` if the open failed.
+    pub fs: Option<Box<dyn Filesystem>>,
+}
+
+impl BrowseOpenStatus {
+    fn starting() -> Self {
+        Self {
+            phase: "Starting...".to_string(),
+            finished: false,
+            fs_type: String::new(),
+            volume_label: String::new(),
+            blessed_folder: None,
+            root: None,
+            root_entries: None,
+            error: None,
+            fs: None,
+        }
     }
 }

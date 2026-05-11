@@ -216,7 +216,7 @@ impl eframe::App for RustyBackupApp {
 
     fn ui(&mut self, ctx: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Top panel: tab bar
-        egui::TopBottomPanel::top("tab_bar").show(ctx, |ui| {
+        egui::Panel::top("tab_bar").show_inside(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.active_tab, Tab::Backup, "Backup");
                 ui.selectable_value(&mut self.active_tab, Tab::Restore, "Restore");
@@ -267,7 +267,7 @@ impl eframe::App for RustyBackupApp {
                         self.devices = device::enumerate_devices();
                         self.log_panel
                             .info(format!("Refreshed: {} device(s) found", self.devices.len()));
-                        ctx.request_repaint();
+                        ui.ctx().request_repaint();
                     }
                     ui.separator();
 
@@ -356,7 +356,7 @@ impl eframe::App for RustyBackupApp {
                             s.current_index, s.total_files, s.current_file,
                         )
                     };
-                    egui::TopBottomPanel::top("bulk_convert_progress").show(ctx, |ui| {
+                    egui::Panel::top("bulk_convert_progress").show_inside(ctx, |ui| {
                         ui.add(egui::ProgressBar::new(frac).text(text));
                     });
                 }
@@ -367,7 +367,7 @@ impl eframe::App for RustyBackupApp {
         if !self.update_dismissed {
             if let Ok(Some(ref info)) = self.update_info.lock().map(|guard| guard.clone()) {
                 if info.is_outdated {
-                    egui::TopBottomPanel::top("update_banner").show(ctx, |ui| {
+                    egui::Panel::top("update_banner").show_inside(ctx, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(
                                 egui::RichText::new("Update")
@@ -416,11 +416,11 @@ impl eframe::App for RustyBackupApp {
         }
 
         // Bottom panel: progress + log
-        egui::TopBottomPanel::bottom("log_panel")
+        egui::Panel::bottom("log_panel")
             .resizable(true)
-            .min_height(100.0)
-            .default_height(180.0)
-            .show(ctx, |ui| {
+            .min_size(100.0)
+            .default_size(180.0)
+            .show_inside(ctx, |ui| {
                 self.progress.show(ui);
                 if self.progress.active {
                     ui.separator();
@@ -429,7 +429,7 @@ impl eframe::App for RustyBackupApp {
             });
 
         // Central panel: active tab content
-        egui::CentralPanel::default().show(ctx, |ui| match self.active_tab {
+        egui::CentralPanel::default().show_inside(ctx, |ui| match self.active_tab {
             Tab::Backup => {
                 let mut ctx = context::TabContext::new(&self.devices, &mut self.log_panel);
                 self.backup_tab.show(ui, &mut ctx, &mut self.progress);
@@ -451,6 +451,16 @@ impl eframe::App for RustyBackupApp {
                 self.restore_tab.show(ui, &mut ctx, &mut self.progress);
             }
             Tab::Inspect => {
+                // The inspect tab's own "Close Backup" button signals the
+                // intent to fully close. Honor it before the share-state
+                // logic below — otherwise the auto-reopen branch would
+                // immediately re-load the backup from `loaded_backup_folder`
+                // on the very next frame.
+                if self.inspect_tab.take_close_backup_request() {
+                    self.loaded_backup_folder = None;
+                    self.restore_tab.clear_backup();
+                }
+
                 // Share backup folder between tabs
                 if let Some(new_backup) = self.inspect_tab.get_loaded_backup() {
                     if self.loaded_backup_folder.as_ref() != Some(&new_backup) {

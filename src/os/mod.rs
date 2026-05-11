@@ -7,6 +7,8 @@ pub mod linux;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
+pub mod wakelock;
+
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -82,6 +84,29 @@ impl<R: Read + Seek> Read for SectorAlignedReader<R> {
         if out.is_empty() {
             return Ok(0);
         }
+
+        // Fast path: when both the position and at least one sector's worth of
+        // the destination buffer are sector-aligned, read straight from the
+        // underlying device into the caller's slice. This avoids the 512-byte
+        // bounce buffer that would otherwise turn a single large read_exact
+        // (e.g. HFS+ catalog at ~200 MB) into hundreds of thousands of
+        // per-sector syscalls on `/dev/rdisk*`.
+        if self.pos % SECTOR_SIZE as u64 == 0 && out.len() >= SECTOR_SIZE {
+            let aligned_len = out.len() - (out.len() % SECTOR_SIZE);
+            self.inner.seek(SeekFrom::Start(self.pos))?;
+            let n = self.inner.read(&mut out[..aligned_len])?;
+            // The kernel may return a short read; only the part that landed
+            // on a sector boundary is safe to surface to the caller. Round
+            // down so the next call still starts sector-aligned.
+            let aligned_n = n - (n % SECTOR_SIZE);
+            self.pos += aligned_n as u64;
+            // Cached sector is now stale relative to the new position;
+            // force the slow path to re-fill on the next sub-sector read.
+            self.buf_sector_start = u64::MAX;
+            self.buf_valid = 0;
+            return Ok(aligned_n);
+        }
+
         let mut written = 0;
         while written < out.len() {
             self.fill_buf()?;
@@ -598,9 +623,18 @@ pub fn open_target_for_writing(path: &Path) -> Result<DeviceWriteHandle> {
     let is_device = path_str.starts_with("/dev/") || path_str.starts_with("\\\\.\\");
 
     if !is_device {
-        // Regular file — just create/truncate
-        let file =
-            File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+        // Regular file — create/truncate AND open read+write. Restore's
+        // `reconstruct_disk_from_backup` calls `patch_hidden_sectors_for`
+        // after the per-partition write, which needs to *read* the boot
+        // sector to detect FAT/NTFS/exFAT signatures. A write-only handle
+        // (the `File::create` default on Unix) returns EBADF on read.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .with_context(|| format!("failed to create {}", path.display()))?;
         return Ok(DeviceWriteHandle::from_file(file));
     }
 

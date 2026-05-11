@@ -45,6 +45,25 @@ const DKIOCGETBLOCKCOUNT: libc::c_ulong = 0x40086419;
 /// macOS fcntl command to bypass the buffer cache (equivalent to O_DIRECT on Linux).
 const F_NOCACHE: libc::c_int = 48;
 
+/// Re-enable the buffer cache on a previously-opened raw device fd.
+///
+/// `open_device_for_inspect` and friends set `F_NOCACHE` so backup/restore
+/// linear passes don't pollute the page cache. For B-tree-style filesystems
+/// (HFS+ on heavily-used volumes) the catalog is read in many small chunks
+/// scattered across the disk, and `F_NOCACHE` makes every read a synchronous
+/// device round-trip with no readahead — observed at ~2.4 MB/s on a fast SD
+/// card. Clearing the flag on the inspect fd lets the kernel cache + cluster
+/// reads for the duration of the browse session.
+pub fn clear_nocache(file: &File) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let r = unsafe { libc::fcntl(file.as_raw_fd(), F_NOCACHE, 0) };
+    if r < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// Get the size of a macOS block device using ioctl.
 ///
 /// `seek(SeekFrom::End(0))` returns 0 for macOS device files, so we must

@@ -74,6 +74,7 @@ pub fn start_extract(
 
     let progress_thread = Arc::clone(&progress);
     std::thread::spawn(move || {
+        let _wake = crate::os::wakelock::acquire("Rusty Backup: decompress partition for editing");
         let cancel = {
             let p = Arc::clone(&progress_thread);
             move || p.lock().map(|g| g.cancel_requested).unwrap_or(false)
@@ -132,6 +133,8 @@ pub fn start_compress(
 
     let progress_thread = Arc::clone(&progress);
     std::thread::spawn(move || {
+        let _wake =
+            crate::os::wakelock::acquire("Rusty Backup: recompress partition after editing");
         let cancel = {
             let p = Arc::clone(&progress_thread);
             move || p.lock().map(|g| g.cancel_requested).unwrap_or(false)
@@ -226,7 +229,11 @@ pub fn compute_file_checksum(
                 }
                 hasher.update(&buf[..n]);
             }
-            Ok(format!("{:x}", hasher.finalize()))
+            Ok(hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect())
         }
         "crc32" => {
             let mut hasher = crc32fast::Hasher::new();
