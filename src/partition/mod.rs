@@ -4,6 +4,7 @@ pub mod editor;
 pub mod gpt;
 pub mod mbr;
 pub mod resize;
+pub mod sgi;
 
 use std::io::{Read, Seek, SeekFrom};
 
@@ -11,6 +12,7 @@ use crate::error::RustyBackupError;
 use apm::Apm;
 use gpt::Gpt;
 use mbr::Mbr;
+use sgi::{SgiVolumeHeader, SGI_TYPE_BYTE_EFS, SGI_TYPE_BYTE_XFS, SGI_VOLHDR_MAGIC};
 
 pub use alignment::{detect_alignment, AlignmentType, PartitionAlignment};
 
@@ -23,6 +25,10 @@ pub enum PartitionTable {
         gpt: Gpt,
     },
     Apm(Apm),
+    /// SGI Volume Header (IRIX disks). Has 16 fixed-position partition slots
+    /// plus a volume directory of standalone executables (`sash`, `ide`,
+    /// `/unix`); see `src/partition/sgi.rs`.
+    Sgi(SgiVolumeHeader),
     /// Superfloppy / floppy: no partition table, filesystem at sector 0.
     None {
         /// Total disk size in bytes (needed to synthesize partition info).
@@ -162,6 +168,21 @@ impl PartitionTable {
         reader
             .read_exact(&mut mbr_data)
             .map_err(|e| RustyBackupError::InvalidMbr(format!("cannot read first sector: {e}")))?;
+
+        // Check for SGI Volume Header (IRIX) before MBR / APM. The 32-bit
+        // big-endian magic 0x0BE5A941 at offset 0 is unambiguous — no MBR,
+        // GPT-protective-MBR, or APM Driver Descriptor Record starts with
+        // those bytes.
+        let sgi_sig = u32::from_be_bytes([mbr_data[0], mbr_data[1], mbr_data[2], mbr_data[3]]);
+        if sgi_sig == SGI_VOLHDR_MAGIC {
+            if let Ok(vh) = SgiVolumeHeader::parse(&mbr_data) {
+                return Ok(PartitionTable::Sgi(vh));
+            }
+            // Magic matched but parsing failed — fall through to surface
+            // the InvalidSgi error path. Re-parsing here rather than caching
+            // the prior error keeps the control flow obvious.
+            return Err(SgiVolumeHeader::parse(&mbr_data).unwrap_err());
+        }
 
         // Check for APM (Driver Descriptor Record signature 0x4552 at offset 0)
         let ddr_sig = u16::from_be_bytes([mbr_data[0], mbr_data[1]]);
@@ -325,6 +346,49 @@ impl PartitionTable {
                     })
                     .collect()
             }
+            PartitionTable::Sgi(vh) => {
+                vh.partitions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| !e.is_empty())
+                    .filter_map(|(i, e)| {
+                        let ptype = e.partition_type();
+                        // Per the plan, skip VOLHDR, VOLUME, XFSLOG, XLV,
+                        // XVM, and RAW — none are browseable filesystems and
+                        // the disk-wide wrappers (VOLHDR, VOLUME) overlap
+                        // real partitions, which would confuse the list.
+                        if ptype.is_skipped_from_browse() {
+                            return None;
+                        }
+                        let partition_type_byte = match ptype {
+                            sgi::SgiPartitionType::Xfs => SGI_TYPE_BYTE_XFS,
+                            sgi::SgiPartitionType::Efs => SGI_TYPE_BYTE_EFS,
+                            _ => 0,
+                        };
+                        let type_name = match ptype {
+                            sgi::SgiPartitionType::Xfs => "SGI XFS".to_string(),
+                            sgi::SgiPartitionType::Efs => "SGI EFS".to_string(),
+                            other => format!("SGI {}", other.display_name()),
+                        };
+                        Some(PartitionInfo {
+                            index: i,
+                            type_name,
+                            partition_type_byte,
+                            start_lba: e.first as u64,
+                            size_bytes: e.size_bytes(),
+                            bootable: false,
+                            is_logical: false,
+                            is_extended_container: false,
+                            // SGI partitions route by synthetic byte
+                            // (0xA0 / 0xA1) per the plan; setting a type
+                            // string here would short-circuit
+                            // `open_filesystem` into the APM string router.
+                            partition_type_string: None,
+                            hfs_block_size: None,
+                        })
+                    })
+                    .collect()
+            }
             PartitionTable::None {
                 size_bytes,
                 fs_hint,
@@ -351,17 +415,18 @@ impl PartitionTable {
             PartitionTable::Mbr(_) => "MBR",
             PartitionTable::Gpt { .. } => "GPT",
             PartitionTable::Apm(_) => "APM",
+            PartitionTable::Sgi(_) => "SGI",
             PartitionTable::None { .. } => "None",
         }
     }
 
     /// Get the MBR disk signature (available for both MBR and GPT via protective MBR).
-    /// APM and superfloppy have no disk signature, returns 0.
+    /// APM, SGI, and superfloppy have no disk signature, returns 0.
     pub fn disk_signature(&self) -> u32 {
         match self {
             PartitionTable::Mbr(mbr) => mbr.disk_signature,
             PartitionTable::Gpt { protective_mbr, .. } => protective_mbr.disk_signature,
-            PartitionTable::Apm(_) | PartitionTable::None { .. } => 0,
+            PartitionTable::Apm(_) | PartitionTable::Sgi(_) | PartitionTable::None { .. } => 0,
         }
     }
 }
@@ -764,5 +829,65 @@ mod tests {
             result.is_err(),
             "Expected error when GPT header is corrupt, not a fallback to MBR"
         );
+    }
+
+    #[test]
+    fn test_detect_sgi_volhdr_fixture() {
+        // The fixture is just 4 KiB; detect() expects a seekable source it
+        // can also probe for size, so pad to a plausible disk image size.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sgi/irix_volhdr.bin");
+        let mut buf = std::fs::read(&path).expect("fixture present");
+        buf.resize(1 << 20, 0); // 1 MiB padding — the partition list math
+                                // doesn't need real data past the header.
+
+        let mut cursor = Cursor::new(buf);
+        let table = PartitionTable::detect(&mut cursor).expect("SGI detected");
+        assert_eq!(table.type_name(), "SGI");
+
+        let parts = table.partitions();
+        // Disk-wide wrappers (VOLHDR, VOLUME) are filtered out of the
+        // surfaced list; the IRIX 6.5 fixture has exactly one real
+        // partition (XFS at index 0).
+        assert_eq!(parts.len(), 1, "expected one displayed partition");
+        let xfs = &parts[0];
+        assert_eq!(xfs.type_name, "SGI XFS");
+        assert_eq!(xfs.partition_type_byte, sgi::SGI_TYPE_BYTE_XFS);
+        assert_eq!(xfs.start_lba, 0x0004_1000);
+        assert_eq!(xfs.size_bytes, 0x0BB3_F000u64 * 512);
+        assert_eq!(table.disk_signature(), 0);
+        // SGI partitions must NOT set `partition_type_string` — that field
+        // is the APM/GPT string-route channel and would short-circuit
+        // `open_filesystem` past the synthetic type-byte dispatch.
+        assert!(
+            xfs.partition_type_string.is_none(),
+            "SGI partitions must route by type byte, not string"
+        );
+    }
+
+    #[test]
+    fn test_sgi_magic_routed_to_sgi_not_mbr() {
+        // Build a 1 MiB cursor whose sector 0 has the SGI magic and a
+        // 0xAA55 trailing signature too. Detection must pick SGI, not
+        // misparse as a borked MBR.
+        let mut buf = vec![0u8; 1 << 20];
+        buf[0..4].copy_from_slice(&sgi::SGI_VOLHDR_MAGIC.to_be_bytes());
+        // Put a single XFS partition entry so partitions() yields a row.
+        let off = 0x138;
+        let blocks: u32 = 16 * 1024 * 2; // 16 MiB
+        let first: u32 = 64;
+        buf[off..off + 4].copy_from_slice(&blocks.to_be_bytes());
+        buf[off + 4..off + 8].copy_from_slice(&first.to_be_bytes());
+        buf[off + 8..off + 12].copy_from_slice(&sgi::SgiPartitionType::Xfs.as_u32().to_be_bytes());
+        // Boot-signature bytes are deliberately left as 0 — but even if a
+        // disk's bytes happened to look like a valid MBR signature, the SGI
+        // magic check runs first.
+        buf[510] = 0x55;
+        buf[511] = 0xAA;
+
+        let mut cursor = Cursor::new(buf);
+        let table = PartitionTable::detect(&mut cursor).expect("SGI detected");
+        assert_eq!(table.type_name(), "SGI");
+        assert_eq!(table.partitions().len(), 1);
     }
 }

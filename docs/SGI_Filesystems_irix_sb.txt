@@ -1,0 +1,72 @@
+# Ground-truth XFS superblock 0 from ~/Downloads/IRIX6.5/irix65.chd
+# (SGI volume header partition 0, first-block 0x00041000, blocks 0x0BB3F000).
+#
+# Reproduce with:
+#   chdman extractraw -i irix65.chd -o /tmp/p0.img -isb 136314880 -ib 67108864
+#   xfs_db -r /tmp/p0.img -c 'sb 0' -c 'p'
+#
+# Used as a known-good reference target for src/fs/xfs/sb.rs. Note this disk
+# has versionnum=0x30b4 which has the DIRV2 bit set (dir2 directory format).
+# The dir1 verification target is documented inline in
+# docs/SGI_Filesystems.md under "Known images on hand".
+#
+# The xfs_db "data size check failed" warning that appears on stderr when
+# regenerating this dump is benign: dblocks claims a 93 GiB partition but
+# we only extracted the first 64 MiB. Superblock 0 is at offset 0 and
+# unaffected.
+
+magicnum = 0x58465342
+blocksize = 4096
+dblocks = 24542720
+rblocks = 0
+rextents = 0
+uuid = ccac9f01-638a-101c-85dd-080069123456
+logstart = 12582916
+rootino = 128
+rbmino = 129
+rsumino = 130
+rextsize = 16
+agblocks = 1048576
+agcount = 24
+rbmblocks = 0
+logblocks = 2995
+versionnum = 0x30b4
+sectsize = 512
+inodesize = 256
+inopblock = 16
+fname = "\000\000\000\000\000\000\000\000\000\000\000\000"
+blocklog = 12
+sectlog = 9
+inodelog = 8
+inopblog = 4
+agblklog = 20
+rextslog = 0
+inprogress = 0
+imax_pct = 25
+icount = 149312
+ifree = 823
+fdblocks = 23346152
+frextents = 0
+uquotino = 0
+gquotino = 0
+qflags = 0
+flags = 0
+shared_vn = 0
+inoalignmt = 2
+unit = 0
+width = 0
+dirblklog = 0
+logsectlog = 0
+logsectsize = 0
+logsunit = 0
+features2 = 0
+bad_features2 = 0
+features_compat = 0
+features_ro_compat = 0
+features_incompat = 0
+features_log_incompat = 0
+crc = 0 (unchecked)
+spino_align = 0
+pquotino = 0
+lsn = 0
+meta_uuid = 00000000-0000-0000-0000-000000000000

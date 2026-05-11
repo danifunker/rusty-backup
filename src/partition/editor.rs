@@ -177,6 +177,7 @@ pub fn apply_edits(
             apply_gpt_edits(file, gpt, edits, disk_size_bytes, log_cb)
         }
         PartitionTable::Apm(apm) => apply_apm_edits(file, apm, edits, disk_size_bytes, log_cb),
+        PartitionTable::Sgi(_) => bail!("SGI Volume Header editing is not yet supported"),
         PartitionTable::None { .. } => bail!("cannot edit partition table on a superfloppy"),
     }
 }

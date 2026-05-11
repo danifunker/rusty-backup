@@ -159,16 +159,17 @@ These shape every step below; re-read CONTRIBUTING.md §"Where code lives" and
 
 Commit small synthetic fixtures under `tests/fixtures/sgi/`:
 
-| File                         | Size      | How to produce                                                          |
-|------------------------------|-----------|-------------------------------------------------------------------------|
-| `irix_volhdr.bin`            | 4 KiB     | `chdman extractraw -i irix65.chd -o /tmp/h.bin -ib 4096`, take first 4 KiB. |
-| `efs_small.img`              | 4 MiB     | On a Linux VM with the v5.15-era `efs` kernel module: `dd if=/dev/zero of=efs.img bs=1M count=4 && mkfs_efs efs.img && mount -o loop ...`, populate, unmount. |
-| `xfs_v2_dir2_small.img`      | 16 MiB    | `mkfs.xfs -m crc=0,finobt=0 -d agcount=2 -b size=4096 xfs.img` (modern xfsprogs; `-m` disables v5/CRC). Produces dir2. |
-| `xfs_v2_dir1_small.bin`      | ≤64 KiB   | Hand-crafted byte fixture: superblock with `versionnum & DIRV2 == 0`, one AG, one shortform-dir1 root inode with three entries, one extent-format file inode. Constructed in code (a builder helper under `#[cfg(test)]`) rather than via a real `mkfs` — no modern tool produces dir1. |
+| File                             | Size      | How to produce                                                          |
+|----------------------------------|-----------|-------------------------------------------------------------------------|
+| `irix_volhdr.bin`                | 4 KiB     | `chdman extractraw -i irix65.chd -o /tmp/h.bin -ib 4096`, take first 4 KiB. Committed raw (no compression). |
+| `efs_small.img.zst`              | ~550 KiB  | Slice a real EFS volume from IRIX 5.3 install media (we used `ULTRA64_2GIG_SCSI_IRIX53_confirmed2.img`). Parse the SGI volhdr, locate the type-7 (EFS) partition, `dd bs=512 skip=<first> count=8192` to take a 4 MiB head, then `zstd -19`. See "Known images on hand" for the exact offsets used. **`mkfs_efs` does NOT exist on Linux** — the v5.15 EFS module is read-only by design; the only mkfs implementation lives in IRIX userspace. Don't go hunting for it. |
+| `xfs_v2_dir2_small.img.zst`      | ~17 KiB   | `truncate -s 512M xfs.img && mkfs.xfs -f -m crc=0,finobt=0 -i nrext64=0 -d agcount=2 -b size=4096 -L RUSTYTEST -p proto xfs.img`, then `zstd -19`. v4 (no CRC) with dir2 (versionnum & DIRV2 set). Populate via `-p proto` file (no sudo / loop mount needed) — modern `mkfs.xfs` rejects agcount=2 below ~64 MiB so the fixture is a 512 MiB sparse image that compresses to ~17 KiB. The 16 MiB target listed in earlier drafts is unreachable with current xfsprogs. |
+| `xfs_v2_dir1_small.bin`          | ≤64 KiB   | Hand-crafted byte fixture: superblock with `versionnum & DIRV2 == 0`, one AG, one shortform-dir1 root inode with three entries, one extent-format file inode. Constructed in code (a builder helper under `#[cfg(test)]`) rather than via a real `mkfs` — no modern tool produces dir1. |
 
 **Real-world disks are not committed** (per project preference). Reference
-images live locally on the implementation machine (`~/Downloads/IRIX6.5/…`,
-`~/Downloads/SGI_imaged-001.sample.hda`). When we need a "real-disk parity"
+images live locally on the implementation machine (`~/xfs-efs/irix65.chd`,
+`~/xfs-efs/SGI_imaged-001.sample.hda`, `~/xfs-efs/ULTRA64_2GIG_SCSI_IRIX53_confirmed2.img`).
+When we need a "real-disk parity"
 test, we'll craft a small synthetic image from the parameters captured in
 "Known images on hand" rather than committing source material.
 
@@ -212,6 +213,54 @@ equivalent can be built later):
   reachable for testing.
 
 This image is the canonical **dir1** verification target.
+
+### `~/xfs-efs/ULTRA64_2GIG_SCSI_IRIX53_confirmed2.img`
+A 14.8 GiB raw dump of an Ultra64 2 GiB SCSI disk holding an IRIX 5.3
+installation. SGI Volume Header (magic `0x0BE5A941`). Confirmed parameters:
+
+- Partitions: `[0]` EFS first=32130 blocks=7,486,290 (~3655 MiB); `[1]` RAW
+  first=7,518,420 blocks=80,325; `[8]` VOLHDR first=0 blocks=32,130; `[10]`
+  VOLUME first=0 blocks=7,598,745.
+- EFS superblock at byte `0xFB0600` (partition first-block + 512): magic
+  `0x00072959` (old-magic) at sb+28, `fs_size=7,486,242`, `fs_firstcg=1830`,
+  `fs_cgfsize=95,954`, `fs_cgisize=2460`, `fs_sectors=63`, `fs_heads=10`,
+  `fs_ncg=78`, volume name "noname", pack "nopack".
+
+This is the canonical **EFS** verification target. The first 4 MiB of the
+EFS partition (offset 0xFB0400 onward) is shipped as
+`tests/fixtures/sgi/efs_small.img.zst` for CI.
+
+**EFS superblock alignment gotcha:** `struct efs_super` in
+`fs/efs/efs_fs_sb.h` is laid out without `__attribute__((packed))`, so the
+C compiler inserts 2 bytes of padding between `fs_dirty` (`__be16` at +20)
+and `fs_time` (`__be32` at +24). This shifts `fs_magic` to **sb+28**, not
+sb+26. Step 3's reader must read by explicit byte offset, not by mirroring
+the struct as `#[repr(C)]` — the on-disk layout depends on the compiler's
+natural-alignment behaviour, which is fragile. Field offsets in bytes:
+
+| Offset | Type      | Field         |
+|--------|-----------|---------------|
+| 0      | __be32    | fs_size       |
+| 4      | __be32    | fs_firstcg    |
+| 8      | __be32    | fs_cgfsize    |
+| 12     | __be16    | fs_cgisize    |
+| 14     | __be16    | fs_sectors    |
+| 16     | __be16    | fs_heads      |
+| 18     | __be16    | fs_ncg        |
+| 20     | __be16    | fs_dirty      |
+| 22     | (pad ×2)  | —             |
+| 24     | __be32    | fs_time       |
+| 28     | __be32    | fs_magic      |
+| 32     | char[6]   | fs_fname      |
+| 38     | char[6]   | fs_fpack      |
+| 44     | __be32    | fs_bmsize     |
+| 48     | __be32    | fs_tfree      |
+| 52     | __be32    | fs_tinode     |
+| 56     | __be32    | fs_bmblock    |
+| 60     | __be32    | fs_replsb     |
+| 64     | __be32    | fs_lastialloc |
+| 68     | char[20]  | fs_spare      |
+| 88     | __be32    | fs_checksum   |
 
 ---
 
@@ -317,8 +366,12 @@ reads yet.
 `super.c`, `inode.c`, `dir.c` once before starting.
 
 **On-disk shape (big-endian):**
-- Superblock at byte offset 1×512 of partition. Magic `0x00072959` (old) or
-  `0x0007295A` (new).
+- Superblock at byte offset 1×512 of partition. Magic is **at sb+28**, not
+  at sb+0 — the kernel `struct efs_super` is not packed and the compiler
+  inserts 2 bytes of natural-alignment padding before `fs_time`. See the
+  full field-offset table under "Known images on hand" for IRIX 5.3. Read
+  by explicit offset, not via `#[repr(C)]`. Magic value is `0x00072959`
+  (old) or `0x0007295A` (new).
 - Inode 2 = root directory. Inode size = 128 bytes.
 - 12 inline extents in the inode: each is 16 bytes packed as
   `(magic:8, bn:24, offset:8, length:8)` — `bn` is the start block,

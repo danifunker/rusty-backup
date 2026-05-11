@@ -63,7 +63,7 @@ pub fn detect_alignment(table: &PartitionTable) -> PartitionAlignment {
     let (heads, sectors_per_track) = match table {
         PartitionTable::Mbr(mbr) => extract_chs_geometry(mbr),
         PartitionTable::Gpt { protective_mbr, .. } => extract_chs_geometry(protective_mbr),
-        PartitionTable::Apm(_) | PartitionTable::None { .. } => (0, 0),
+        PartitionTable::Apm(_) | PartitionTable::Sgi(_) | PartitionTable::None { .. } => (0, 0),
     };
 
     // Check for DOS traditional alignment: first partition at LBA 63
