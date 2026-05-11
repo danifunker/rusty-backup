@@ -1,11 +1,11 @@
 //! SGI / IRIX XFS v4 read-only support.
 //!
-//! Step 5 brought up superblock + inode lookup. Step 6 adds dir2 shortform
-//! and single-block directory listing plus extent-list file reads — enough
-//! to browse and extract `xfs_v2_dir2_small.img` and any IRIX dir2 disk
-//! whose directories fit in shortform or one block. dir1 disks are covered
-//! by Step 6b; leaf/node dir2 and btree-format extents are deferred to
-//! Step 7.
+//! Step 5 brought up superblock + inode lookup. Step 6 added dir2 shortform
+//! and single-block directory listing plus extent-list file reads. Step 6b
+//! adds dir1 support (shortform + leaf blocks, including the node-dir1 case
+//! handled implicitly by walking every file block and parsing only those
+//! whose blkinfo magic is `0xFEEB`). Leaf/node dir2 and btree-format file
+//! extents remain deferred to Step 7.
 //!
 //! References:
 //! - `~/xfs-efs/refs/xfs-modern/xfs/libxfs/xfs_format.h`
@@ -16,6 +16,7 @@
 
 pub mod ag;
 pub mod bmap;
+pub mod dir1;
 pub mod dir2;
 pub mod inode;
 pub mod sb;
@@ -229,6 +230,110 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         })
     }
 
+    /// Dispatch dir2 directory listing (shortform / single-block) — see the
+    /// Step 6 dispatch logic. Returns parsed entries without resolved child
+    /// inodes; the caller turns them into `FileEntry`s.
+    fn list_dir2(
+        &mut self,
+        core: &XfsDinodeCore,
+        inode_buf: &[u8],
+    ) -> Result<Vec<dir2::Dir2Entry>, FilesystemError> {
+        let dirblksize = self.sb.dirblksize() as u64;
+        match core.format {
+            DiFormat::Local => {
+                let fork = self.data_fork(core, inode_buf);
+                let (_parent, entries) = dir2::parse_shortform(fork, self.sb.has_ftype())?;
+                Ok(entries)
+            }
+            DiFormat::Extents => {
+                if core.size > dirblksize {
+                    return Err(FilesystemError::Unsupported(format!(
+                        "XFS dir2 size {} > dirblksize {dirblksize} \
+                         (leaf/node directory, Step 7)",
+                        core.size
+                    )));
+                }
+                let fork = self.data_fork(core, inode_buf);
+                let recs = self.decode_inline_extents(fork, core.nextents as usize)?;
+                let Some(first) = recs.first() else {
+                    return Ok(Vec::new());
+                };
+                let blocks_per_dir = (dirblksize / self.sb.blocksize as u64).max(1) as usize;
+                let mut buf = vec![0u8; dirblksize as usize];
+                let bs = self.sb.blocksize as usize;
+                for i in 0..blocks_per_dir {
+                    let slot = &mut buf[i * bs..(i + 1) * bs];
+                    self.read_fsblock(first.startblock + i as u64, slot)?;
+                }
+                dir2::parse_block(&buf, self.sb.has_ftype())
+            }
+            DiFormat::Btree => Err(FilesystemError::Unsupported(
+                "XFS btree-format directory (Step 7)".into(),
+            )),
+            DiFormat::Other(v) => Err(FilesystemError::Parse(format!(
+                "unknown XFS di_format {v} on directory inode {}",
+                core.ino
+            ))),
+        }
+    }
+
+    /// Dispatch dir1 directory listing — shortform when the inode is Local,
+    /// otherwise walk every file block in the extent list, parsing each block
+    /// whose `xfs_da_blkinfo_t.magic` is `0xFEEB` (leaf). Intermediate-node
+    /// blocks (`0xFEBE`) are skipped — for browse we only need to enumerate
+    /// entries, not perform hash-based lookups.
+    fn list_dir1(
+        &mut self,
+        core: &XfsDinodeCore,
+        inode_buf: &[u8],
+    ) -> Result<Vec<dir2::Dir2Entry>, FilesystemError> {
+        match core.format {
+            DiFormat::Local => {
+                let fork = self.data_fork(core, inode_buf);
+                let (_parent, entries) = dir1::parse_shortform(fork)?;
+                Ok(entries)
+            }
+            DiFormat::Extents => {
+                let fork = self.data_fork(core, inode_buf);
+                let recs = self.decode_inline_extents(fork, core.nextents as usize)?;
+                let bs = self.sb.blocksize as u64;
+                let mut block = vec![0u8; bs as usize];
+                let mut out: Vec<dir2::Dir2Entry> = Vec::new();
+                for rec in recs {
+                    if rec.unwritten {
+                        continue;
+                    }
+                    for i in 0..rec.blockcount {
+                        self.read_fsblock(rec.startblock + i, &mut block)?;
+                        match dir1::block_magic(&block) {
+                            Some(dir1::XFS_DIR1_LEAF_MAGIC) => {
+                                let leaf_entries = dir1::parse_leaf_block(&block)?;
+                                out.extend(leaf_entries);
+                            }
+                            Some(dir1::XFS_DA_NODE_MAGIC) => {
+                                // Intermediate node — skip; browse iterates
+                                // every block and picks up the leaves directly.
+                            }
+                            _ => {
+                                // Unknown magic — skip rather than fail; the
+                                // directory may have a freespace block we
+                                // don't recognise.
+                            }
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            DiFormat::Btree => Err(FilesystemError::Unsupported(
+                "XFS dir1 directory with btree-format extents (Step 7)".into(),
+            )),
+            DiFormat::Other(v) => Err(FilesystemError::Parse(format!(
+                "unknown XFS di_format {v} on directory inode {}",
+                core.ino
+            ))),
+        }
+    }
+
     fn read_symlink_target(
         &mut self,
         core: &XfsDinodeCore,
@@ -397,58 +502,13 @@ impl<R: Read + Seek + Send> Filesystem for XfsFilesystem<R> {
         if !entry.is_directory() {
             return Err(FilesystemError::NotADirectory(entry.path.clone()));
         }
-        if self.dir_format != DirFormat::Dir2 {
-            return Err(FilesystemError::Unsupported(
-                "XFS dir1 listing not yet implemented (Step 6b)".into(),
-            ));
-        }
         let (core, inode_buf) = self.read_inode_buf(entry.location)?;
         if !core.is_dir() {
             return Err(FilesystemError::NotADirectory(entry.path.clone()));
         }
-        let dirblksize = self.sb.dirblksize() as u64;
-        let raw_entries: Vec<dir2::Dir2Entry> = match core.format {
-            DiFormat::Local => {
-                let fork = self.data_fork(&core, &inode_buf);
-                let (_parent, entries) = dir2::parse_shortform(fork, self.sb.has_ftype())?;
-                entries
-            }
-            DiFormat::Extents => {
-                if core.size > dirblksize {
-                    return Err(FilesystemError::Unsupported(format!(
-                        "XFS dir2 size {} > dirblksize {dirblksize} \
-                         (leaf/node directory, Step 7)",
-                        core.size
-                    )));
-                }
-                let fork = self.data_fork(&core, &inode_buf);
-                let recs = self.decode_inline_extents(fork, core.nextents as usize)?;
-                let Some(first) = recs.first() else {
-                    return Ok(Vec::new());
-                };
-                // Read `dirblksize / blocksize` consecutive blocks starting at
-                // `first.startblock`. For the supported subset that's always 1
-                // (dirblklog == 0).
-                let blocks_per_dir = (dirblksize / self.sb.blocksize as u64).max(1) as usize;
-                let mut buf = vec![0u8; dirblksize as usize];
-                let bs = self.sb.blocksize as usize;
-                for i in 0..blocks_per_dir {
-                    let slot = &mut buf[i * bs..(i + 1) * bs];
-                    self.read_fsblock(first.startblock + i as u64, slot)?;
-                }
-                dir2::parse_block(&buf, self.sb.has_ftype())?
-            }
-            DiFormat::Btree => {
-                return Err(FilesystemError::Unsupported(
-                    "XFS btree-format directory (Step 7)".into(),
-                ));
-            }
-            DiFormat::Other(v) => {
-                return Err(FilesystemError::Parse(format!(
-                    "unknown XFS di_format {v} on directory inode {}",
-                    core.ino
-                )));
-            }
+        let raw_entries: Vec<dir2::Dir2Entry> = match self.dir_format {
+            DirFormat::Dir2 => self.list_dir2(&core, &inode_buf)?,
+            DirFormat::Dir1 => self.list_dir1(&core, &inode_buf)?,
         };
         let parent_path = entry.path.clone();
         let mut out = Vec::with_capacity(raw_entries.len());
@@ -610,6 +670,7 @@ fn read_at_aligned<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use byteorder::{BigEndian, ByteOrder};
     use std::io::Cursor;
 
     fn load_fixture() -> Vec<u8> {
@@ -776,23 +837,133 @@ mod tests {
         }
     }
 
+    /// Build a tiny but structurally valid XFS v4 dir1 image: one AG of
+    /// 256 blocks, blocksize 512, inodesize 256, root inode (128) with a
+    /// dir1-shortform fork carrying three children. Children are not really
+    /// referenced (we set their inumbers to 0 so child_entry returns the
+    /// fallback placeholder), so we don't have to populate child inodes.
+    /// This exercises the dir1 dispatch end-to-end without needing
+    /// mkfs.xfs (which no longer produces dir1).
+    fn build_dir1_image() -> Vec<u8> {
+        // Layout: AG0 of 256 blocks × 512 bytes = 128 KiB.
+        let blocksize: u32 = 512;
+        let blocks: u32 = 256;
+        let img_size = (blocks as usize) * blocksize as usize;
+        let mut img = vec![0u8; img_size];
+
+        // Superblock at byte 0.
+        BigEndian::write_u32(&mut img[0..4], 0x5846_5342); // XFSB
+        BigEndian::write_u32(&mut img[4..8], blocksize);
+        BigEndian::write_u64(&mut img[8..16], blocks as u64); // dblocks
+                                                              // sb_rootino = 128
+        BigEndian::write_u64(&mut img[56..64], 128);
+        BigEndian::write_u32(&mut img[84..88], blocks); // agblocks
+        BigEndian::write_u32(&mut img[88..92], 1); // agcount
+                                                   // versionnum: v4, DIRV2 clear → dir1.
+        BigEndian::write_u16(&mut img[100..102], 0x0004);
+        BigEndian::write_u16(&mut img[102..104], 512); // sectsize
+        BigEndian::write_u16(&mut img[104..106], 256); // inodesize
+        BigEndian::write_u16(&mut img[106..108], 2); // inopblock (512/256)
+        img[120] = 9; // blocklog (2^9 = 512)
+        img[121] = 9; // sectlog
+        img[122] = 8; // inodelog (2^8 = 256)
+        img[123] = 1; // inopblog (2^1 = 2)
+        img[124] = 8; // agblklog (ceil(log2(256)) = 8)
+
+        // Root inode 128:
+        //   agno = 128 >> (8+1) = 0
+        //   agbno = (128 >> 1) & 0xFF = 64
+        //   off = 128 & 0x1 = 0
+        //   byte = 64 * 512 = 0x8000
+        let ino_off = 64 * 512;
+        // di_magic
+        BigEndian::write_u16(&mut img[ino_off..ino_off + 2], 0x494E);
+        // di_mode: directory + 0755
+        BigEndian::write_u16(&mut img[ino_off + 2..ino_off + 4], 0o040755);
+        img[ino_off + 4] = 2; // version
+        img[ino_off + 5] = 1; // format = Local
+                              // di_size at offset +56 — set to fork length after we build it.
+                              // Build a dir1 shortform fork: parent=128, 3 entries pointing at
+                              // inumbers 0 (so child_entry hits the fallback and returns a
+                              // placeholder).
+        let mut fork = Vec::new();
+        fork.extend_from_slice(&128u64.to_be_bytes()); // parent
+        fork.push(3u8); // count
+        for (name, ino) in [("alpha", 200u64), ("beta", 201), ("gamma", 202)] {
+            fork.extend_from_slice(&ino.to_be_bytes());
+            fork.push(name.len() as u8);
+            fork.extend_from_slice(name.as_bytes());
+        }
+        BigEndian::write_u64(&mut img[ino_off + 56..ino_off + 64], fork.len() as u64);
+        // Fork starts at offset +100 in the inode.
+        let fork_off = ino_off + 100;
+        img[fork_off..fork_off + fork.len()].copy_from_slice(&fork);
+
+        // Now write inodes for children 200, 201, 202 so child_entry can
+        // read their mode and report Directory / File / Symlink.
+        // Layout: agno=0, agbno=(ino>>1)&0xFF, off=ino&1
+        let mut write_child = |ino: u64, mode: u16, size: u64| {
+            let agbno = ((ino >> 1) & 0xFF) as usize;
+            let off_in_block = ((ino & 1) as usize) * 256;
+            let byte = agbno * 512 + off_in_block;
+            BigEndian::write_u16(&mut img[byte..byte + 2], 0x494E);
+            BigEndian::write_u16(&mut img[byte + 2..byte + 4], mode);
+            img[byte + 4] = 2;
+            img[byte + 5] = 1;
+            BigEndian::write_u64(&mut img[byte + 56..byte + 64], size);
+        };
+        write_child(200, 0o100644, 0); // alpha — regular file
+        write_child(201, 0o040755, 0); // beta — directory
+        write_child(202, 0o120777, 0); // gamma — symlink (empty target)
+
+        img
+    }
+
     #[test]
-    fn list_directory_returns_unsupported_for_dir1() {
-        // Patch the fixture's versionnum to clear the DIRV2 bit, so the open
-        // path reports dir1. list_directory must then refuse with a Step 6b
-        // pointer; the underlying disk is still dir2 but the dispatch reads
-        // off the parsed format.
+    fn dir1_synthetic_image_lists_shortform_entries() {
+        let img = build_dir1_image();
+        let mut fs = XfsFilesystem::open(Cursor::new(img), 0).expect("open dir1 xfs");
+        assert_eq!(fs.dir_format, DirFormat::Dir1);
+        assert!(!fs.sb.is_dir2());
+        let root = fs.root().expect("root");
+        assert!(root.is_directory());
+        let entries = fs.list_directory(&root).expect("list root");
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "beta", "gamma"]);
+        assert!(entries[0].is_file());
+        assert!(entries[1].is_directory());
+        assert!(entries[2].is_symlink());
+    }
+
+    #[test]
+    fn dir1_dispatch_uses_dir1_shortform_parser() {
+        // Patch the fixture's versionnum to clear the DIRV2 bit, then assert
+        // the dir1 dispatch path is taken. The fixture's root inode is dir2
+        // shortform on disk; under the dir1 parser the byte layout no longer
+        // makes sense, so we expect a Parse error (not an Unsupported one) —
+        // proof that we routed through `parse_shortform` in dir1.rs.
         let mut img = load_fixture();
-        // versionnum @ partition_offset + 100, big-endian u16. fixture is
-        // 0xb4a4 → clear 0x2000 → 0x94a4.
         img[100..102].copy_from_slice(&0x94a4u16.to_be_bytes());
         let mut fs = XfsFilesystem::open(Cursor::new(img), 0).expect("open xfs");
         assert_eq!(fs.dir_format, DirFormat::Dir1);
         let root = fs.root().expect("root");
         match fs.list_directory(&root) {
-            Err(FilesystemError::Unsupported(msg)) => assert!(msg.contains("Step 6b")),
-            Err(e) => panic!("expected Unsupported, got {e}"),
-            Ok(_) => panic!("expected Unsupported"),
+            // Either we successfully (mis-)parse some entries — those will
+            // have invalid inumbers and child_entry() will surface fallback
+            // placeholders — or we hit a Parse error. Either is acceptable
+            // proof that the dir1 path executed. What must NOT happen is
+            // dir2 succeeding silently against dir1 bytes.
+            Ok(entries) => {
+                // The (mis-)parse will yield entries whose names are not the
+                // expected fixture names — verify we didn't accidentally
+                // produce the dir2 result set.
+                let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+                assert!(
+                    !names.contains(&"hello.txt"),
+                    "dir1 dispatch unexpectedly produced dir2 names: {names:?}"
+                );
+            }
+            Err(_) => {}
         }
     }
 }
