@@ -136,6 +136,17 @@ impl XfsSuperblock {
         self.blocksize << self.dirblklog
     }
 
+    /// True iff the FTYPE feature is enabled in `sb_features2`. FTYPE adds a
+    /// 1-byte file-type field to every directory entry — shortform entries
+    /// store it right after the inumber, data-block entries store it right
+    /// after the name (before the alignment padding and the trailing tag).
+    /// Modern `mkfs.xfs` defaults to enabling FTYPE even on v4 superblocks.
+    pub fn has_ftype(&self) -> bool {
+        // XFS_SB_VERSION2_FTYPE — see libxfs/xfs_format.h.
+        const XFS_SB_VERSION2_FTYPE: u32 = 0x0000_0200;
+        (self.features2 & XFS_SB_VERSION2_FTYPE) != 0
+    }
+
     /// Volume label, trimmed of trailing NULs.
     pub fn label(&self) -> String {
         let end = self
