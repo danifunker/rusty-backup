@@ -1,4 +1,5 @@
 pub mod single;
+pub mod superfloppy_wrap;
 
 use std::collections::VecDeque;
 use std::fs::{self, File};

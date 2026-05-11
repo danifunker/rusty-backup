@@ -26,6 +26,7 @@ use super::chd_options_ui::ChdOptionsControl;
 use super::browse_view::BrowseView;
 use super::context::TabContext;
 use super::expand_hfs_dialog::{summarize_source as summarize_hfs_source, ExpandHfsDialog};
+use super::physical_disk_export::{PhysicalDiskExport, PhysicalDiskExportSource};
 
 /// State for the Inspect tab.
 pub struct InspectTab {
@@ -147,6 +148,8 @@ pub struct InspectTab {
     /// partition browse can hand it to BrowseView, which uses it to
     /// refresh `metadata.json` after a successful chd_edit save.
     single_file_chd_backup_folder: Option<PathBuf>,
+    /// "Physical Disk Export" sub-window state.
+    physical_disk_export: PhysicalDiskExport,
 }
 
 impl Default for InspectTab {
@@ -200,6 +203,7 @@ impl Default for InspectTab {
             expand_hfs_dialog: None,
             chd_info_text: None,
             single_file_chd_backup_folder: None,
+            physical_disk_export: PhysicalDiskExport::default(),
         }
     }
 }
@@ -559,6 +563,11 @@ impl InspectTab {
             }
         }
 
+        // Physical Disk Export sub-window
+        if self.physical_disk_export.open {
+            let _ = self.physical_disk_export.show(ui.ctx(), ctx);
+        }
+
         ui.add_space(12.0);
 
         // Show error if any
@@ -660,6 +669,24 @@ impl InspectTab {
     fn init_editor(&mut self) {
         self.editor.seed_from(&self.partitions);
         self.editor_popup = true;
+    }
+
+    /// Assemble a snapshot of the currently-loaded source for the Physical
+    /// Disk Export sub-window. Returns `None` if no raw image file is loaded.
+    fn build_physical_disk_export_source(&self) -> Option<PhysicalDiskExportSource> {
+        let path = self.image_file_path.as_ref()?.clone();
+        let size_bytes = std::fs::metadata(&path).ok().map(|m| m.len()).unwrap_or(0);
+        let (fs_hint, has_partition_table) = match &self.partition_table {
+            Some(PartitionTable::None { fs_hint, .. }) => (fs_hint.clone(), false),
+            Some(_) => ("partitioned".to_string(), true),
+            None => ("Unknown".to_string(), false),
+        };
+        Some(PhysicalDiskExportSource {
+            path,
+            size_bytes,
+            fs_hint,
+            has_partition_table,
+        })
     }
 
     fn init_resize_popup(&mut self, ctx: &mut TabContext) {
@@ -1263,6 +1290,25 @@ impl InspectTab {
                     if ui.button("Export...").clicked() {
                         self.export_popup = false;
                         self.start_export(ctx);
+                    }
+                    let can_physical = self.image_file_path.is_some();
+                    let pde_btn = ui.add_enabled(
+                        can_physical,
+                        egui::Button::new("Physical Disk Export..."),
+                    );
+                    if !can_physical {
+                        pde_btn.clone().on_hover_text(
+                            "Physical Disk Export currently supports raw image file \
+                             sources only. Backup folders, devices, and Clonezilla \
+                             images aren't wired in yet.",
+                        );
+                    }
+                    if pde_btn.clicked() {
+                        if let Some(src) = self.build_physical_disk_export_source() {
+                            self.export_popup = false;
+                            self.physical_disk_export
+                                .open_for(src, self.partition_table.as_ref());
+                        }
                     }
                     if ui.button("Cancel").clicked() {
                         self.export_popup = false;
