@@ -3786,6 +3786,8 @@ fn is_browsable_type_string(type_str: Option<&str>) -> bool {
                 | "Apple_UNIX_SRVR2"
                 | "Apple_PRODOS"
                 | "Apple_ProDOS"
+                // GPT "Linux Filesystem" GUID — ext, btrfs, or xfs at runtime.
+                | "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
         )
     )
 }

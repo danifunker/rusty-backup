@@ -135,6 +135,13 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     if sector0[0] == 0xEB || sector0[0] == 0xE9 {
         return "fat";
     }
+    // XFS superblock magic ("XFSB") at byte 0 of the partition. Both v4
+    // (IRIX-compatible) and v5/CRC superblocks share this magic; the
+    // XfsFilesystem parser will return a clear "v5 not supported" error
+    // on v5 disks until that work lands.
+    if &sector0[0..4] == b"XFSB" {
+        return "xfs";
+    }
 
     // Sectors 2-3 (offset 1024): HFS/HFS+ volume header / MDB and ext superblock.
     //   HFS/HFS+ signature is at byte 0 of this block.
@@ -709,6 +716,10 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "xfs" => Ok(Box::new(xfs::XfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 _ => Err(FilesystemError::Unsupported(
                     "could not detect filesystem type on superfloppy".into(),
                 )),
@@ -746,7 +757,7 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                 )),
             }
         }
-        // Linux — detect ext vs btrfs by magic bytes
+        // Linux — detect ext / btrfs / xfs by magic bytes
         0x83 => {
             let fs_type = detect_filesystem_type(&mut reader, partition_offset);
             match fs_type {
@@ -755,6 +766,10 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     partition_offset,
                 )?)),
                 "btrfs" => Ok(Box::new(btrfs::BtrfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "xfs" => Ok(Box::new(xfs::XfsFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),
@@ -1019,6 +1034,27 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
             reader,
             partition_offset,
         )?)),
+        // GPT Linux Filesystem GUID — host any of ext, btrfs, or xfs.
+        "0FC63DAF-8483-4772-8E79-3D69D8477DE4" => {
+            let fs_type = detect_filesystem_type(&mut reader, partition_offset);
+            match fs_type {
+                "ext" => Ok(Box::new(ext::ExtFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "btrfs" => Ok(Box::new(btrfs::BtrfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "xfs" => Ok(Box::new(xfs::XfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                _ => Err(FilesystemError::Unsupported(format!(
+                    "Linux Filesystem GPT partition: unrecognized filesystem (detected: {fs_type})"
+                ))),
+            }
+        }
         _ => Err(FilesystemError::Unsupported(format!(
             "APM partition type '{}' not supported for browsing",
             type_str
@@ -1295,5 +1331,65 @@ pub fn probe_apple_hfs_type<R: Read + Seek>(reader: &mut R, partition_offset: u6
         }
         "hfs" => "HFS",
         _ => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// Build a 4 KiB buffer whose first 4 bytes are the XFS superblock magic.
+    /// Enough to exercise `detect_filesystem_type` without needing a valid
+    /// XFS sb past byte 4.
+    fn xfsb_sector() -> Vec<u8> {
+        let mut buf = vec![0u8; 4096];
+        buf[0..4].copy_from_slice(b"XFSB");
+        buf
+    }
+
+    #[test]
+    fn detect_filesystem_type_recognises_xfsb_magic() {
+        let buf = xfsb_sector();
+        let mut cursor = Cursor::new(buf);
+        assert_eq!(detect_filesystem_type(&mut cursor, 0), "xfs");
+    }
+
+    #[test]
+    fn open_filesystem_routes_mbr_0x83_xfs_to_xfs_module() {
+        // Step A routing wiring: MBR type 0x83 with XFSB magic at sector 0
+        // must route to XfsFilesystem (not "unrecognized Linux filesystem").
+        // The parse will fail later — we only have 4 bytes of valid sb —
+        // but the error message must mention XFS, proving we reached
+        // XfsFilesystem::open.
+        let buf = xfsb_sector();
+        match open_filesystem(Cursor::new(buf), 0, 0x83, None) {
+            Err(FilesystemError::Parse(msg)) => assert!(
+                msg.to_lowercase().contains("xfs"),
+                "expected XFS-flavored parse error, got {msg}"
+            ),
+            Err(e) => panic!("expected XFS Parse error, got {e}"),
+            Ok(_) => panic!("expected error from stub sb"),
+        }
+    }
+
+    #[test]
+    fn open_filesystem_routes_gpt_linux_filesystem_guid_xfs() {
+        // Step A routing wiring: GPT "Linux Filesystem" GUID with XFSB
+        // magic must also reach XfsFilesystem.
+        let buf = xfsb_sector();
+        match open_filesystem(
+            Cursor::new(buf),
+            0,
+            0,
+            Some("0FC63DAF-8483-4772-8E79-3D69D8477DE4"),
+        ) {
+            Err(FilesystemError::Parse(msg)) => assert!(
+                msg.to_lowercase().contains("xfs"),
+                "expected XFS-flavored parse error, got {msg}"
+            ),
+            Err(e) => panic!("expected XFS Parse error, got {e}"),
+            Ok(_) => panic!("expected error from stub sb"),
+        }
     }
 }
