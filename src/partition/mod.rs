@@ -379,7 +379,11 @@ impl PartitionTable {
                             bootable: false,
                             is_logical: false,
                             is_extended_container: false,
-                            partition_type_string: Some(ptype.display_name().to_string()),
+                            // SGI partitions route by synthetic byte
+                            // (0xA0 / 0xA1) per the plan; setting a type
+                            // string here would short-circuit
+                            // `open_filesystem` into the APM string router.
+                            partition_type_string: None,
                             hfs_block_size: None,
                         })
                     })
@@ -852,6 +856,13 @@ mod tests {
         assert_eq!(xfs.start_lba, 0x0004_1000);
         assert_eq!(xfs.size_bytes, 0x0BB3_F000u64 * 512);
         assert_eq!(table.disk_signature(), 0);
+        // SGI partitions must NOT set `partition_type_string` — that field
+        // is the APM/GPT string-route channel and would short-circuit
+        // `open_filesystem` past the synthetic type-byte dispatch.
+        assert!(
+            xfs.partition_type_string.is_none(),
+            "SGI partitions must route by type byte, not string"
+        );
     }
 
     #[test]
