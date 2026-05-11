@@ -1,4 +1,5 @@
 pub mod btrfs;
+pub mod efs;
 pub mod entry;
 pub mod exfat;
 pub mod ext;
@@ -777,6 +778,11 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
         }
         // ProDOS on MBR disks (type byte 0xA8)
         0xA8 => Ok(Box::new(prodos::ProDosFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
+        // SGI EFS — synthetic type byte emitted by PartitionTable::Sgi.
+        0xA1 => Ok(Box::new(efs::EfsFilesystem::open(
             reader,
             partition_offset,
         )?)),

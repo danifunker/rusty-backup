@@ -3752,6 +3752,7 @@ fn is_browsable_type(ptype: u8) -> bool {
             | 0x1C
             | 0x1E
             | 0x83
+            | 0xA1
             | 0xA8
             | 0xAF
     )
