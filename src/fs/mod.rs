@@ -23,6 +23,7 @@ pub mod prodos_types;
 pub mod resource_fork;
 pub mod tree;
 pub mod unix_common;
+pub mod xfs;
 pub mod zstd_stream;
 
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -783,6 +784,11 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
         )?)),
         // SGI EFS — synthetic type byte emitted by PartitionTable::Sgi.
         0xA1 => Ok(Box::new(efs::EfsFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
+        // SGI XFS — synthetic type byte emitted by PartitionTable::Sgi.
+        0xA0 => Ok(Box::new(xfs::XfsFilesystem::open(
             reader,
             partition_offset,
         )?)),
