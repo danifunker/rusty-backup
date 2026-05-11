@@ -80,6 +80,20 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     // from an MBR. The partition table area (offsets 446-509) of a FAT VBR
     // contains bootstrap code which often has non-zero bytes that would look
     // like partition entries, so we do NOT check that area.
+    // NTFS / exFAT: detect via the 8-byte OEM ID at offset 3. Like FAT VBRs,
+    // these boot sectors carry the 0xAA55 signature at bytes 510-511 and
+    // would otherwise be misparsed as an MBR with junk partition entries
+    // sourced from the bootstrap code.
+    if first_sector[0] == 0xEB || first_sector[0] == 0xE9 {
+        let oem_id = &first_sector[3..11];
+        if oem_id == b"NTFS    " {
+            return Some("NTFS".to_string());
+        }
+        if oem_id == b"EXFAT   " {
+            return Some("exFAT".to_string());
+        }
+    }
+
     if first_sector[0] == 0xEB || first_sector[0] == 0xE9 {
         let bytes_per_sector = u16::from_le_bytes([first_sector[11], first_sector[12]]);
         let sectors_per_cluster = first_sector[13];
@@ -500,6 +514,53 @@ mod tests {
         assert_eq!(parts[0].start_lba, 0);
         assert_eq!(parts[0].size_bytes, 1474560);
         assert_eq!(parts[0].type_name, "FAT");
+    }
+
+    #[test]
+    fn test_detect_superfloppy_ntfs() {
+        // Build a minimal NTFS boot sector. The OEM ID "NTFS    " at offset 3
+        // is the discriminator; the bootstrap code (and the 0xAA55 signature)
+        // would otherwise be misread as an MBR with junk partition entries.
+        let mut data = vec![0u8; 1024 * 1024];
+        data[0] = 0xEB;
+        data[1] = 0x52;
+        data[2] = 0x90;
+        data[3..11].copy_from_slice(b"NTFS    ");
+        // Realistic bootstrap bytes in the would-be partition table area.
+        for i in 446..510 {
+            data[i] = 0x4E + (i as u8 % 13);
+        }
+        data[510] = 0x55;
+        data[511] = 0xAA;
+
+        let mut cursor = Cursor::new(data);
+        let table = PartitionTable::detect(&mut cursor).unwrap();
+        assert_eq!(table.type_name(), "None");
+        let parts = table.partitions();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].type_name, "NTFS");
+    }
+
+    #[test]
+    fn test_detect_superfloppy_exfat() {
+        // exFAT boot sector: OEM ID "EXFAT   " at offset 3.
+        let mut data = vec![0u8; 1024 * 1024];
+        data[0] = 0xEB;
+        data[1] = 0x76;
+        data[2] = 0x90;
+        data[3..11].copy_from_slice(b"EXFAT   ");
+        for i in 446..510 {
+            data[i] = 0x4E + (i as u8 % 13);
+        }
+        data[510] = 0x55;
+        data[511] = 0xAA;
+
+        let mut cursor = Cursor::new(data);
+        let table = PartitionTable::detect(&mut cursor).unwrap();
+        assert_eq!(table.type_name(), "None");
+        let parts = table.partitions();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].type_name, "exFAT");
     }
 
     #[test]
