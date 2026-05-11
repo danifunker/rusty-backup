@@ -1043,6 +1043,11 @@ fn write_patched_table(
                 to_write,
             ));
         }
+        PartitionTable::Sgi(_) => {
+            anyhow::bail!(
+                "single-file CHD: SGI Volume Header sources are not yet supported (browse only)"
+            );
+        }
         PartitionTable::None { .. } => {
             anyhow::bail!("single-file CHD: superfloppy sources are not supported on this path");
         }
@@ -1192,6 +1197,11 @@ fn build_head_segments(
                 vec![(0, head_end, Box::new(std::io::Cursor::new(head_buf)))],
                 None,
             ))
+        }
+        PartitionTable::Sgi(_) => {
+            anyhow::bail!(
+                "single-file CHD: SGI Volume Header sources are not yet supported (browse only)"
+            )
         }
         PartitionTable::None { .. } => {
             anyhow::bail!("single-file CHD: superfloppy sources are not supported on this path")

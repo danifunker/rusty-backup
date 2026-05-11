@@ -14,6 +14,9 @@ pub enum RustyBackupError {
     #[error("Invalid APM: {0}")]
     InvalidApm(String),
 
+    #[error("Invalid SGI Volume Header: {0}")]
+    InvalidSgi(String),
+
     #[error("Device is currently mounted: {0}")]
     DeviceMounted(String),
 

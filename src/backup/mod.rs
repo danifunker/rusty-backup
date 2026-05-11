@@ -434,6 +434,24 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 );
             }
         }
+        PartitionTable::Sgi(vh) => {
+            // Step 2 surfaces SGI partitions in the inspect tab; backup of
+            // SGI disks is a separate workflow (deferred). Emit a JSON
+            // sidecar so the partition layout is recorded if a future
+            // session does want to round-trip it, but bail before any
+            // per-partition data write — the data path needs SGI-aware
+            // sizing and the EFS/XFS readers to land first.
+            let json = serde_json::to_string_pretty(vh)
+                .context("failed to serialize SGI volume header to JSON")?;
+            std::fs::write(backup_folder.join("sgi.json"), json)
+                .context("failed to write sgi.json")?;
+            log(
+                &progress,
+                LogLevel::Info,
+                "Exported SGI volume header (sgi.json) — partition data backup not yet supported",
+            );
+            bail!("backing up SGI disks is not yet supported (browse only)");
+        }
         PartitionTable::None { fs_hint, .. } => {
             log(
                 &progress,
