@@ -30,6 +30,9 @@ struct Segment {
     offset: u64,
     length: u64,
     source: Box<dyn Read + Send>,
+    /// Set once the source returned 0 bytes — subsequent bytes in the
+    /// segment are zero-padded instead of read.
+    eof: bool,
 }
 
 /// Builder for a [`DiskImageStream`]. Add segments in ascending offset
@@ -98,6 +101,7 @@ impl DiskImageStreamBuilder {
             offset,
             length,
             source,
+            eof: false,
         });
         Ok(())
     }
@@ -169,19 +173,35 @@ impl Read for DiskImageStream {
             let seg = &mut self.segments[self.current_segment];
             let want_from_source =
                 (seg.length - self.bytes_read_from_current).min(chunk as u64) as usize;
-            let n = if want_from_source > 0 {
-                seg.source.read(&mut chunk_buf[..want_from_source])?
-            } else {
-                0
-            };
-            self.bytes_read_from_current += n as u64;
-            // Zero-pad if the source ran short of the declared segment length.
-            if n < chunk {
-                for b in &mut chunk_buf[n..chunk] {
+            if seg.eof || want_from_source == 0 {
+                // Source already hit EOF (or shouldn't be read further) —
+                // zero-pad the rest of the declared segment length so the
+                // total stream length stays correct.
+                for b in chunk_buf.iter_mut() {
                     *b = 0;
                 }
+                self.bytes_read_from_current += chunk as u64;
+                chunk
+            } else {
+                let n = seg.source.read(&mut chunk_buf[..want_from_source])?;
+                if n == 0 {
+                    // True EOF before declared length. Mark and zero-pad the
+                    // current chunk; subsequent calls will keep zero-padding.
+                    seg.eof = true;
+                    for b in chunk_buf.iter_mut() {
+                        *b = 0;
+                    }
+                    self.bytes_read_from_current += chunk as u64;
+                    chunk
+                } else {
+                    // Short reads are normal (Read may return any n in
+                    // 1..=buf.len()). Return only what we got — the outer
+                    // caller will call again. Treating a short read as EOF
+                    // would silently zero-fill real data.
+                    self.bytes_read_from_current += n as u64;
+                    n
+                }
             }
-            chunk
         } else {
             // Gap or tail: pure zeros.
             for b in chunk_buf.iter_mut() {
@@ -283,6 +303,64 @@ mod tests {
         let mut want = vec![0xCC; 4];
         want.extend(vec![0u8; 12]); // 8 padding + 4 tail
         assert_eq!(bytes, want);
+    }
+
+    /// A `Read` that hands out at most `chunk_size` bytes per call, even
+    /// when the caller asks for more. Mirrors `CompactHfsPlusReader`'s
+    /// block-by-block emission pattern.
+    struct ChunkedReader {
+        data: Vec<u8>,
+        pos: usize,
+        chunk_size: usize,
+    }
+
+    impl Read for ChunkedReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.pos >= self.data.len() || buf.is_empty() {
+                return Ok(0);
+            }
+            let want = buf
+                .len()
+                .min(self.chunk_size)
+                .min(self.data.len() - self.pos);
+            buf[..want].copy_from_slice(&self.data[self.pos..self.pos + want]);
+            self.pos += want;
+            Ok(want)
+        }
+    }
+
+    #[test]
+    fn short_reads_do_not_zero_fill_real_data() {
+        // Regression: a segment source that returns short reads (here, 4
+        // bytes per call) used to be treated as EOF, silently zero-filling
+        // the rest of the outer caller's buffer. That corrupted HFS+
+        // backups whose CompactHfsPlusReader emits one 4 KiB block per
+        // read(). Verify the full segment bytes come through intact.
+        let data: Vec<u8> = (0..64u8).collect();
+        let mut b = DiskImageStreamBuilder::new(64);
+        b.add_segment(
+            0,
+            64,
+            Box::new(ChunkedReader {
+                data: data.clone(),
+                pos: 0,
+                chunk_size: 4,
+            }),
+        )
+        .unwrap();
+        let mut stream = b.build();
+        // Read with a 64-byte buffer — much bigger than the source's
+        // 4-byte chunks. Loop until EOF.
+        let mut out = Vec::new();
+        let mut buf = [0u8; 64];
+        loop {
+            let n = stream.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(out, data, "short reads must not be treated as EOF");
     }
 
     #[test]

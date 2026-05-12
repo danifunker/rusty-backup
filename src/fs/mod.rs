@@ -600,6 +600,58 @@ fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &'sta
     }
 }
 
+/// True if this filesystem's `CompactReader` returns a layout-preserving
+/// stream (allocated blocks at their original byte offsets, free blocks
+/// zeroed) rather than a packed stream (allocated blocks repacked at the
+/// start with the FS metadata shrunk to match).
+///
+/// Used by the resize-to-minimum picker: layout-preserving filesystems
+/// cannot be shrunk below their `last_data_byte` without an actual data
+/// move (which the backup pipeline doesn't perform), so the defragmented
+/// minimum is **not** achievable for them — only the in-place trim is.
+/// Packing filesystems can be safely shrunk to their defragmented minimum
+/// because the reader does the packing during the backup write.
+pub fn is_layout_preserving_fs(partition_type: u8, partition_type_string: Option<&str>) -> bool {
+    if let Some(s) = partition_type_string {
+        return matches!(
+            s,
+            "Apple_HFS"
+                | "Apple_HFSX"
+                | "Apple_HFS+"
+                | "Apple_UNIX_SVR2"
+                | "Apple_UNIX_SRVR2"
+                | "Apple_PRODOS"
+                | "Apple_ProDOS"
+                | "Linux",
+        );
+    }
+    matches!(partition_type, 0xAF | 0x83 | 0xA8)
+}
+
+/// Pick the achievable shrink-to-minimum target for a partition given both
+/// the in-place trim point and the defragmented (used-only) minimum.
+///
+/// - **Packing filesystems** (FAT, NTFS, exFAT): the CompactReader repacks
+///   allocated clusters at the partition start, so the defragmented value
+///   is what the backup actually emits — use it.
+/// - **Layout-preserving filesystems** (HFS, HFS+, ext, btrfs, ProDOS):
+///   the backup pipeline does not yet relocate blocks, so anything below
+///   `in_place` would silently drop allocated blocks. Use the in-place
+///   value; the defragmented value is informational only until a true
+///   defragmenting writer lands.
+pub fn pick_shrink_target(
+    partition_type: u8,
+    partition_type_string: Option<&str>,
+    in_place: Option<u64>,
+    defragmented: Option<u64>,
+) -> Option<u64> {
+    if is_layout_preserving_fs(partition_type, partition_type_string) {
+        in_place.or(defragmented)
+    } else {
+        defragmented.or(in_place)
+    }
+}
+
 /// True if computing the minimum size for this partition type requires an
 /// expensive filesystem walk (catalog/extent tree traversal).
 ///
