@@ -2092,10 +2092,10 @@ impl InspectTab {
                         }
                     }
 
-                    if matches!(table, PartitionTable::None { .. }) {
+                    if let PartitionTable::None { fs_hint, .. } = &table {
                         push_log(format!(
-                            "Detected superfloppy (no partition table) with {} partition(s)",
-                            partitions.len()
+                            "Warning: image has no partition table (no MBR/GPT/APM/SGI signature). Detected bare {} filesystem at sector 0; synthesizing a single-partition view in memory so the volume can be browsed. The source file is not modified.",
+                            fs_hint
                         ));
                     } else {
                         push_log(format!(
@@ -3845,7 +3845,7 @@ fn is_browsable_superfloppy(ptype: u8, type_name: &str) -> bool {
     }
     matches!(
         type_name,
-        "FAT" | "HFS" | "HFS+" | "NTFS" | "exFAT" | "ProDOS" | "Unknown"
+        "FAT" | "HFS" | "HFS+" | "NTFS" | "exFAT" | "ProDOS" | "XFS" | "ext" | "btrfs" | "Unknown"
     )
 }
 
