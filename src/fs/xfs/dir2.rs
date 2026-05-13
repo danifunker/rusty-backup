@@ -1,9 +1,12 @@
-//! XFS dir2 directory parsers: shortform (`xfs_dir2_sf_*`) and single-block
-//! (`xfs_dir2_data_*` with `XD2B` magic). Sufficient for the dir2 fixture
-//! and for the dir2 IRIX 6.5 root directory.
+//! XFS dir2 directory parsers: shortform (`xfs_dir2_sf_*`), single-block
+//! (`xfs_dir2_data_*` with `XD2B` magic), and multi-block data blocks
+//! (`XD2D` magic) used by leaf/node format directories. Sufficient for the
+//! dir2 fixture, the dir2 IRIX 6.5 root directory, and any leaf/node
+//! directory we encounter (the hash btree itself is skipped — for browse
+//! we only need to enumerate entries, not look them up by name).
 //!
 //! References:
-//! - `~/xfs-efs/refs/xfs-modern/xfs/libxfs/xfs_da_format.h`
+//! - `~/efs-xfs-refs/xfs-modern/xfs/libxfs/xfs_da_format.h`
 //! - "XFS Algorithms & Data Structures" §5.
 
 use byteorder::{BigEndian, ByteOrder};
@@ -12,6 +15,9 @@ use crate::fs::filesystem::FilesystemError;
 
 /// `XD2B` — single-block dir2 magic (v4, no CRC).
 pub const XFS_DIR2_BLOCK_MAGIC: u32 = 0x5844_3242;
+/// `XD2D` — multi-block data block magic (v4, no CRC). Same body layout as
+/// `XD2B` but without the trailing leaf-entry / tail section.
+pub const XFS_DIR2_DATA_MAGIC: u32 = 0x5844_3244;
 /// `XDB3` — single-block dir2 magic (v5/CRC). We reject v5 in the sb, but
 /// surface the constant so detection messages can name what we saw.
 pub const XFS_DIR3_BLOCK_MAGIC: u32 = 0x5844_4233;
@@ -86,9 +92,10 @@ pub fn parse_shortform(
     Ok((parent, out))
 }
 
-/// Parse a single-block dir2 buffer. `buf.len()` must equal the directory
-/// block size. Returns the contained entries in on-disk order, skipping
-/// `.` and `..` (the caller already knows the parent inumber).
+/// Parse a single-block dir2 buffer (`XD2B` magic). `buf.len()` must equal
+/// the directory block size. Returns the contained entries in on-disk
+/// order, skipping `.` and `..` (the caller already knows the parent
+/// inumber).
 pub fn parse_block(buf: &[u8], has_ftype: bool) -> Result<Vec<Dir2Entry>, FilesystemError> {
     if buf.len() < 24 {
         return Err(FilesystemError::Parse(format!(
@@ -120,8 +127,40 @@ pub fn parse_block(buf: &[u8], has_ftype: bool) -> Result<Vec<Dir2Entry>, Filesy
         )));
     }
     let data_end = block_end - leaf_section_size;
+    parse_data_entries(buf, has_ftype, 16, data_end)
+}
 
-    let mut pos = 16usize;
+/// Parse a multi-block `XD2D` data block. Body layout matches `XD2B` minus
+/// the trailing leaf-entry section — entries fill the block right up to the
+/// end (free regions are recorded as `XFS_DIR2_DATA_FREE_TAG` unused records
+/// inline). Used by leaf-format and node-format dir2 directories.
+pub fn parse_data_block(buf: &[u8], has_ftype: bool) -> Result<Vec<Dir2Entry>, FilesystemError> {
+    if buf.len() < 16 {
+        return Err(FilesystemError::Parse(format!(
+            "dir2 data block buffer too small: {} bytes",
+            buf.len()
+        )));
+    }
+    let magic = BigEndian::read_u32(&buf[0..4]);
+    if magic != XFS_DIR2_DATA_MAGIC {
+        return Err(FilesystemError::Parse(format!(
+            "bad dir2 data block magic: 0x{magic:08X} (expected 0x{XFS_DIR2_DATA_MAGIC:08X})"
+        )));
+    }
+    parse_data_entries(buf, has_ftype, 16, buf.len())
+}
+
+/// Walk the entry/free-tag region of a dir2 data block from `start` up to
+/// (but not including) `data_end`. Shared between `XD2B` (single-block) and
+/// `XD2D` (multi-block data) parsers — the only difference is whether a
+/// leaf+tail section is reserved at the end of the block.
+fn parse_data_entries(
+    buf: &[u8],
+    has_ftype: bool,
+    start: usize,
+    data_end: usize,
+) -> Result<Vec<Dir2Entry>, FilesystemError> {
+    let mut pos = start;
     let mut out = Vec::new();
     while pos + 4 <= data_end {
         let freetag = BigEndian::read_u16(&buf[pos..pos + 2]);
@@ -340,6 +379,49 @@ mod tests {
             Err(FilesystemError::Unsupported(msg)) => assert!(msg.contains("dir3")),
             Err(e) => panic!("expected Unsupported, got {e}"),
             Ok(_) => panic!("expected error"),
+        }
+    }
+
+    #[test]
+    fn data_block_parses_xd2d_without_tail() {
+        // Multi-block `XD2D` data: header + entries fill the whole block,
+        // no trailing leaf/tail. Trailing free-space is one giant unused
+        // record (free tag at start). Verifies that `parse_data_block`
+        // walks right up to buf.len() and recognises XD2D — not XD2B.
+        let block_size = 512usize;
+        let mut buf = vec![0u8; block_size];
+        BigEndian::write_u32(&mut buf[0..4], XFS_DIR2_DATA_MAGIC);
+        let entries = [(50u64, "first"), (51u64, "second.txt"), (52u64, "third")];
+        let mut pos = 16usize;
+        for (ino, name) in entries {
+            BigEndian::write_u64(&mut buf[pos..pos + 8], ino);
+            buf[pos + 8] = name.len() as u8;
+            buf[pos + 9..pos + 9 + name.len()].copy_from_slice(name.as_bytes());
+            let raw = 8 + 1 + name.len() + 2;
+            let aligned = (raw + 7) & !7;
+            pos += aligned;
+        }
+        // Fill the rest of the block with a single unused record so the
+        // walker doesn't read garbage past the last entry.
+        if pos < block_size {
+            BigEndian::write_u16(&mut buf[pos..pos + 2], XFS_DIR2_DATA_FREE_TAG);
+            BigEndian::write_u16(&mut buf[pos + 2..pos + 4], (block_size - pos) as u16);
+        }
+        let parsed = parse_data_block(&buf, false).expect("parse");
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].name, "first");
+        assert_eq!(parsed[0].inumber, 50);
+        assert_eq!(parsed[2].name, "third");
+        assert_eq!(parsed[2].inumber, 52);
+    }
+
+    #[test]
+    fn data_block_rejects_wrong_magic() {
+        let mut buf = vec![0u8; 256];
+        BigEndian::write_u32(&mut buf[0..4], XFS_DIR2_BLOCK_MAGIC);
+        match parse_data_block(&buf, false) {
+            Err(FilesystemError::Parse(msg)) => assert!(msg.contains("magic")),
+            other => panic!("expected Parse error, got {other:?}"),
         }
     }
 

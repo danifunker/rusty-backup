@@ -4,8 +4,10 @@
 //! and single-block directory listing plus extent-list file reads. Step 6b
 //! adds dir1 support (shortform + leaf blocks, including the node-dir1 case
 //! handled implicitly by walking every file block and parsing only those
-//! whose blkinfo magic is `0xFEEB`). Leaf/node dir2 and btree-format file
-//! extents remain deferred to Step 7.
+//! whose blkinfo magic is `0xFEEB`). Step 7 adds leaf/node dir2 directories
+//! (walk the data-block address space, parse every `XD2D` block, ignore the
+//! hash leaf since we only enumerate) and the bmap btree walker so files
+//! with `di_format == 3` can be read.
 //!
 //! References:
 //! - `~/xfs-efs/refs/xfs-modern/xfs/libxfs/xfs_format.h`
@@ -25,9 +27,14 @@ pub mod types;
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
+use byteorder::{BigEndian, ByteOrder};
+
 use super::entry::{EntryType, FileEntry};
 use super::filesystem::{Filesystem, FilesystemError};
-use bmap::{decode_extent, fsblock_to_partition_byte, XfsBmbtIrec};
+use bmap::{
+    decode_extent, fsblock_to_partition_byte, XfsBmbtIrec, NULLFSBLOCK, XFS_BMAP_MAGIC,
+    XFS_BTREE_LBLOCK_LEN,
+};
 use inode::{inode_byte_offset, XfsDinodeCore};
 use sb::XfsSuperblock;
 use types::{DiFormat, DirFormat};
@@ -167,6 +174,118 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         Ok(recs)
     }
 
+    /// Decode the full extent list from either an inline-extents inode
+    /// (`di_format == Extents`) or a bmap-btree inode (`di_format == Btree`).
+    /// Returned records are sorted by file offset.
+    fn decode_data_extents(
+        &mut self,
+        core: &XfsDinodeCore,
+        inode_buf: &[u8],
+    ) -> Result<Vec<XfsBmbtIrec>, FilesystemError> {
+        match core.format {
+            DiFormat::Extents => {
+                let fork = self.data_fork(core, inode_buf);
+                self.decode_inline_extents(fork, core.nextents as usize)
+            }
+            DiFormat::Btree => {
+                let fork_len = self.data_fork(core, inode_buf).len();
+                let (root_level, first_child) = {
+                    let fork = self.data_fork(core, inode_buf);
+                    parse_bmbt_root(fork, fork_len)?
+                };
+                self.walk_bmbt(root_level, first_child)
+            }
+            DiFormat::Local => Err(FilesystemError::InvalidData(
+                "XFS local-format inode has no extent list".into(),
+            )),
+            DiFormat::Other(v) => Err(FilesystemError::Parse(format!(
+                "unknown XFS di_format {v} on inode {}",
+                core.ino
+            ))),
+        }
+    }
+
+    /// Walk a bmap btree to its leaves and collect every extent record.
+    ///
+    /// `root_level` is the level of the in-inode root (from `bb_level`).
+    /// `first_child` is the leftmost child pointer in the root. We descend
+    /// along the leftmost branch to level 0, then traverse the leaf chain
+    /// via `bb_rightsib` until we hit `NULLFSBLOCK`.
+    fn walk_bmbt(
+        &mut self,
+        root_level: u16,
+        first_child: u64,
+    ) -> Result<Vec<XfsBmbtIrec>, FilesystemError> {
+        if root_level == 0 {
+            return Err(FilesystemError::Parse(
+                "XFS bmap btree root claims level 0 — should be inline extents".into(),
+            ));
+        }
+        let bs = self.sb.blocksize as u64;
+        if (bs as usize) < XFS_BTREE_LBLOCK_LEN + 16 {
+            return Err(FilesystemError::Parse(format!(
+                "XFS blocksize {bs} too small for bmap btree block"
+            )));
+        }
+        let max_intermediate_recs = ((bs as usize) - XFS_BTREE_LBLOCK_LEN) / 16;
+
+        let mut block = vec![0u8; bs as usize];
+        let mut current = first_child;
+        let mut expected_level = root_level - 1;
+        loop {
+            if current == NULLFSBLOCK {
+                return Err(FilesystemError::Parse(
+                    "XFS bmap btree: NULL child pointer during descent".into(),
+                ));
+            }
+            self.read_fsblock(current, &mut block)?;
+            check_bmbt_header(&block, Some(expected_level))?;
+            if expected_level == 0 {
+                break;
+            }
+            // Intermediate node: pick the leftmost child (slot 0). Keys
+            // occupy `max_intermediate_recs * 8` bytes after the header;
+            // pointers follow.
+            let ptrs_off = XFS_BTREE_LBLOCK_LEN + max_intermediate_recs * 8;
+            if ptrs_off + 8 > block.len() {
+                return Err(FilesystemError::Parse(format!(
+                    "XFS bmap btree intermediate block truncated (ptrs_off={ptrs_off}, bs={bs})"
+                )));
+            }
+            current = BigEndian::read_u64(&block[ptrs_off..ptrs_off + 8]);
+            expected_level -= 1;
+        }
+
+        // Leaf level: walk via rightsib, collecting records.
+        let mut out = Vec::new();
+        loop {
+            let numrecs = BigEndian::read_u16(&block[6..8]) as usize;
+            let max_leaf_recs = ((bs as usize) - XFS_BTREE_LBLOCK_LEN) / 16;
+            if numrecs > max_leaf_recs {
+                return Err(FilesystemError::Parse(format!(
+                    "XFS bmap btree leaf numrecs {numrecs} > max {max_leaf_recs}"
+                )));
+            }
+            for i in 0..numrecs {
+                let off = XFS_BTREE_LBLOCK_LEN + i * 16;
+                let chunk: &[u8; 16] = block[off..off + 16]
+                    .try_into()
+                    .expect("16-byte extent record");
+                out.push(decode_extent(chunk));
+            }
+            // bb_rightsib at offset 16..24 (long-form header: leftsib@8,
+            // rightsib@16).
+            let rightsib = BigEndian::read_u64(&block[16..24]);
+            if rightsib == NULLFSBLOCK {
+                break;
+            }
+            self.read_fsblock(rightsib, &mut block)?;
+            check_bmbt_header(&block, Some(0))?;
+        }
+        out.sort_by_key(|e| e.startoff);
+        Ok(out)
+    }
+
     /// Read the bytes of one filesystem block at `fsblock` into `out`.
     fn read_fsblock(&mut self, fsblock: u64, out: &mut [u8]) -> Result<(), FilesystemError> {
         let bs = self.sb.blocksize as u64;
@@ -230,9 +349,20 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         })
     }
 
-    /// Dispatch dir2 directory listing (shortform / single-block) — see the
-    /// Step 6 dispatch logic. Returns parsed entries without resolved child
-    /// inodes; the caller turns them into `FileEntry`s.
+    /// Dispatch dir2 directory listing. Routing:
+    ///   - `Local`: shortform parser.
+    ///   - `Extents` with `core.size <= dirblksize`: one directory block
+    ///     (`XD2B` magic, single-block dir2).
+    ///   - `Extents` with `core.size > dirblksize`: leaf or node directory.
+    ///     We walk every file-block range in the inline extent map and
+    ///     parse only those whose 32-bit magic is `XD2D` (data block) —
+    ///     the leaf-1 / leaf-N / freespace / da-node blocks live at file
+    ///     offsets >= `XFS_DIR2_LEAF_OFFSET` and so will fail the magic
+    ///     check naturally. The hash btree is not consulted; for browse
+    ///     we only need to enumerate entries.
+    ///   - `Btree`: a directory whose extent map alone has spilled into
+    ///     a bmap btree. Deferred — IRIX disks don't produce these in
+    ///     practice.
     fn list_dir2(
         &mut self,
         core: &XfsDinodeCore,
@@ -246,35 +376,100 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
                 Ok(entries)
             }
             DiFormat::Extents => {
-                if core.size > dirblksize {
-                    return Err(FilesystemError::Unsupported(format!(
-                        "XFS dir2 size {} > dirblksize {dirblksize} \
-                         (leaf/node directory, Step 7)",
-                        core.size
-                    )));
-                }
                 let fork = self.data_fork(core, inode_buf);
                 let recs = self.decode_inline_extents(fork, core.nextents as usize)?;
-                let Some(first) = recs.first() else {
-                    return Ok(Vec::new());
-                };
-                let blocks_per_dir = (dirblksize / self.sb.blocksize as u64).max(1) as usize;
-                let mut buf = vec![0u8; dirblksize as usize];
-                let bs = self.sb.blocksize as usize;
-                for i in 0..blocks_per_dir {
-                    let slot = &mut buf[i * bs..(i + 1) * bs];
-                    self.read_fsblock(first.startblock + i as u64, slot)?;
-                }
-                dir2::parse_block(&buf, self.sb.has_ftype())
+                self.walk_dir2_data_blocks(&recs, dirblksize, core.size)
             }
             DiFormat::Btree => Err(FilesystemError::Unsupported(
-                "XFS btree-format directory (Step 7)".into(),
+                "XFS btree-format directory extent map (deferred)".into(),
             )),
             DiFormat::Other(v) => Err(FilesystemError::Parse(format!(
                 "unknown XFS di_format {v} on directory inode {}",
                 core.ino
             ))),
         }
+    }
+
+    /// Walk dir2 data-block address space. Each directory block is
+    /// `dirblksize` bytes (one or more fsblocks). The first directory
+    /// block carries `XD2B` magic if and only if the whole directory fits
+    /// in it (single-block format); otherwise data blocks carry `XD2D`
+    /// magic. Leaf / freespace / node blocks live above
+    /// `XFS_DIR2_LEAF_OFFSET` in the file address space and either fall
+    /// outside our extent walk's reachable file offsets (sparse) or fail
+    /// the magic check (we treat unknown magics as "skip").
+    fn walk_dir2_data_blocks(
+        &mut self,
+        extents: &[XfsBmbtIrec],
+        dirblksize: u64,
+        dir_size: u64,
+    ) -> Result<Vec<dir2::Dir2Entry>, FilesystemError> {
+        if extents.is_empty() {
+            return Ok(Vec::new());
+        }
+        let bs = self.sb.blocksize as u64;
+        let blocks_per_dir = (dirblksize / bs).max(1);
+
+        // Build a sorted lookup from file fsblock → disk fsblock so we can
+        // assemble directory blocks even when their fsblocks come from
+        // different extents.
+        let mut max_data_fb: u64 = 0;
+        for e in extents {
+            let end = e.startoff.saturating_add(e.blockcount);
+            if end > max_data_fb {
+                max_data_fb = end;
+            }
+        }
+        // dir2 leaf/free address spaces start at 32 GiB / blocksize. We
+        // cap the walk there so a malformed extent list with a leaf-space
+        // entry doesn't make us read garbage.
+        let leaf_first_fb = (1u64 << 32) / bs;
+        let walk_end_fb = max_data_fb.min(leaf_first_fb);
+
+        let has_ftype = self.sb.has_ftype();
+        let mut block_buf = vec![0u8; dirblksize as usize];
+        let mut out = Vec::new();
+        let mut fb = 0u64;
+        while fb < walk_end_fb {
+            // Assemble one directory block from `blocks_per_dir` fsblocks.
+            let mut got_all = true;
+            for i in 0..blocks_per_dir {
+                let want_fb = fb + i;
+                let Some((disk_fb, unwritten)) = fb_to_disk(extents, want_fb) else {
+                    got_all = false;
+                    break;
+                };
+                let slot = &mut block_buf[(i * bs) as usize..((i + 1) * bs) as usize];
+                if unwritten {
+                    slot.fill(0);
+                } else {
+                    self.read_fsblock(disk_fb, slot)?;
+                }
+            }
+            if got_all {
+                let magic = if block_buf.len() >= 4 {
+                    BigEndian::read_u32(&block_buf[0..4])
+                } else {
+                    0
+                };
+                match magic {
+                    dir2::XFS_DIR2_BLOCK_MAGIC => {
+                        out.extend(dir2::parse_block(&block_buf, has_ftype)?);
+                    }
+                    dir2::XFS_DIR2_DATA_MAGIC => {
+                        out.extend(dir2::parse_data_block(&block_buf, has_ftype)?);
+                    }
+                    _ => {
+                        // Unknown / leaf / freespace / node — skip silently.
+                    }
+                }
+            }
+            fb += blocks_per_dir;
+        }
+        // `dir_size` is informational; some empty trailing space is normal
+        // and we don't need to clamp by it for browse.
+        let _ = dir_size;
+        Ok(out)
     }
 
     /// Dispatch dir1 directory listing — shortform when the inode is Local,
@@ -361,11 +556,14 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         }
     }
 
-    /// Read the file's data into a `Vec<u8>` capped at `max_bytes`.
+    /// Read the file's data into a `Vec<u8>` capped at `max_bytes`. The
+    /// extent list (`recs`) must be sorted by file offset and may originate
+    /// from either the inline extent fork (`DiFormat::Extents`) or the
+    /// bmap btree (`DiFormat::Btree`).
     fn read_extents_file(
         &mut self,
         core: &XfsDinodeCore,
-        inode_buf: &[u8],
+        recs: &[XfsBmbtIrec],
         max_bytes: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
         let size = core.size as usize;
@@ -374,13 +572,11 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         if want == 0 {
             return Ok(out);
         }
-        let fork = self.data_fork(core, inode_buf);
-        let recs = self.decode_inline_extents(fork, core.nextents as usize)?;
         let bs = self.sb.blocksize as u64;
         let mut produced: u64 = 0;
         let want64 = want as u64;
         let mut block = vec![0u8; bs as usize];
-        for rec in recs {
+        for rec in recs.iter().copied() {
             // Zero-fill any hole between the running file offset and this extent.
             let extent_byte_off = rec.startoff * bs;
             if extent_byte_off > produced {
@@ -424,20 +620,18 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
     fn stream_extents_file(
         &mut self,
         core: &XfsDinodeCore,
-        inode_buf: &[u8],
+        recs: &[XfsBmbtIrec],
         writer: &mut dyn Write,
     ) -> Result<u64, FilesystemError> {
         let size = core.size;
         if size == 0 {
             return Ok(0);
         }
-        let fork = self.data_fork(core, inode_buf);
-        let recs = self.decode_inline_extents(fork, core.nextents as usize)?;
         let bs = self.sb.blocksize as u64;
         let mut written: u64 = 0;
         let mut block = vec![0u8; bs as usize];
         let zero_chunk = vec![0u8; STREAM_CHUNK];
-        for rec in recs {
+        for rec in recs.iter().copied() {
             let extent_byte_off = rec.startoff * bs;
             if extent_byte_off > written {
                 let hole = (extent_byte_off - written).min(size - written);
@@ -554,10 +748,10 @@ impl<R: Read + Seek + Send> Filesystem for XfsFilesystem<R> {
                 let take = want.min(fork.len());
                 Ok(fork[..take].to_vec())
             }
-            DiFormat::Extents => self.read_extents_file(&core, &inode_buf, max_bytes),
-            DiFormat::Btree => Err(FilesystemError::Unsupported(
-                "XFS btree-format file extents (Step 7)".into(),
-            )),
+            DiFormat::Extents | DiFormat::Btree => {
+                let recs = self.decode_data_extents(&core, &inode_buf)?;
+                self.read_extents_file(&core, &recs, max_bytes)
+            }
             DiFormat::Other(v) => Err(FilesystemError::Parse(format!(
                 "unknown XFS di_format {v} on inode {}",
                 core.ino
@@ -584,10 +778,10 @@ impl<R: Read + Seek + Send> Filesystem for XfsFilesystem<R> {
                 writer.write_all(&fork[..take])?;
                 Ok(take as u64)
             }
-            DiFormat::Extents => self.stream_extents_file(&core, &inode_buf, writer),
-            DiFormat::Btree => Err(FilesystemError::Unsupported(
-                "XFS btree-format file extents (Step 7)".into(),
-            )),
+            DiFormat::Extents | DiFormat::Btree => {
+                let recs = self.decode_data_extents(&core, &inode_buf)?;
+                self.stream_extents_file(&core, &recs, writer)
+            }
             DiFormat::Other(v) => Err(FilesystemError::Parse(format!(
                 "unknown XFS di_format {v} on inode {}",
                 core.ino
@@ -618,6 +812,90 @@ impl<R: Read + Seek + Send> Filesystem for XfsFilesystem<R> {
     fn last_data_byte(&mut self) -> Result<u64, FilesystemError> {
         Ok(self.total_size())
     }
+}
+
+/// Look up an extent record covering file fsblock `fb`. Returns
+/// `(disk_fsblock, unwritten)` or `None` if `fb` falls in a hole.
+fn fb_to_disk(extents: &[XfsBmbtIrec], fb: u64) -> Option<(u64, bool)> {
+    // Records are sorted by startoff; linear scan is fine for the small
+    // extent counts directories tend to have. A binary search is the
+    // obvious upgrade if this ever shows up in a profile.
+    for e in extents {
+        if fb >= e.startoff && fb < e.startoff + e.blockcount {
+            return Some((e.startblock + (fb - e.startoff), e.unwritten));
+        }
+    }
+    None
+}
+
+/// Parse a bmap-btree root header out of an inode's data fork (`di_format
+/// == Btree`). Returns `(root_level, first_child)`. `forklen` is the fork
+/// length in bytes (used to compute how many key+ptr slots the root
+/// reserves).
+fn parse_bmbt_root(fork: &[u8], forklen: usize) -> Result<(u16, u64), FilesystemError> {
+    if fork.len() < 4 {
+        return Err(FilesystemError::Parse(format!(
+            "XFS bmap btree root fork too small: {} bytes",
+            fork.len()
+        )));
+    }
+    let level = BigEndian::read_u16(&fork[0..2]);
+    let numrecs = BigEndian::read_u16(&fork[2..4]) as usize;
+    if level == 0 {
+        return Err(FilesystemError::Parse(
+            "XFS bmap btree root claims level 0 — should be inline extents".into(),
+        ));
+    }
+    if numrecs == 0 {
+        return Err(FilesystemError::Parse(
+            "XFS bmap btree root has zero records".into(),
+        ));
+    }
+    // `xfs_bmdr_maxrecs(forklen, leaf=false) = (forklen - 4) / 16` — the
+    // root reserves space for `maxrecs` (key, ptr) slots even though only
+    // `numrecs` are populated. Pointers start after `maxrecs` keys.
+    let maxrecs = (forklen.saturating_sub(4)) / 16;
+    if numrecs > maxrecs {
+        return Err(FilesystemError::Parse(format!(
+            "XFS bmap btree root numrecs {numrecs} > maxrecs {maxrecs}"
+        )));
+    }
+    let ptrs_off = 4 + maxrecs * 8;
+    if ptrs_off + 8 > fork.len() {
+        return Err(FilesystemError::Parse(format!(
+            "XFS bmap btree root ptr region truncated: ptrs_off={ptrs_off}, fork={}",
+            fork.len()
+        )));
+    }
+    let first_child = BigEndian::read_u64(&fork[ptrs_off..ptrs_off + 8]);
+    Ok((level, first_child))
+}
+
+/// Verify a bmap-btree disk block carries the expected magic and (if
+/// supplied) level. Header layout is the long-form `xfs_btree_block`:
+///   magic(4) + level(2) + numrecs(2) + leftsib(8) + rightsib(8).
+fn check_bmbt_header(block: &[u8], expected_level: Option<u16>) -> Result<(), FilesystemError> {
+    if block.len() < XFS_BTREE_LBLOCK_LEN {
+        return Err(FilesystemError::Parse(format!(
+            "XFS bmap btree block too small: {} bytes",
+            block.len()
+        )));
+    }
+    let magic = BigEndian::read_u32(&block[0..4]);
+    if magic != XFS_BMAP_MAGIC {
+        return Err(FilesystemError::Parse(format!(
+            "bad XFS bmap btree magic: 0x{magic:08X} (expected 0x{XFS_BMAP_MAGIC:08X})"
+        )));
+    }
+    if let Some(want) = expected_level {
+        let got = BigEndian::read_u16(&block[4..6]);
+        if got != want {
+            return Err(FilesystemError::Parse(format!(
+                "XFS bmap btree level mismatch: expected {want}, got {got}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn emit_zeros(
@@ -919,6 +1197,124 @@ mod tests {
         img
     }
 
+    /// Build a synthetic XFS v4 dir2 image containing a single regular file
+    /// in btree-format. Layout: one AG of 256 × 512-byte blocks. Root inode
+    /// 128 holds a dir2 shortform fork with one entry → inode 200. Inode
+    /// 200 is `di_format == Btree`; its bmap btree root has level=1 and one
+    /// pointer to a leaf block at fsblock 80, which holds one extent record
+    /// pointing at fsblock 90 (the file's single data block). The data
+    /// block contains `BTREE_FILE_PAYLOAD` and the file's `di_size` is set
+    /// to that string's length.
+    ///
+    /// This exercises the Step 7 BMBT walker end-to-end without needing a
+    /// large fixture.
+    const BTREE_FILE_PAYLOAD: &[u8] = b"Hello, btree XFS!\n";
+
+    fn build_btree_file_image() -> Vec<u8> {
+        let blocksize: u32 = 512;
+        let blocks: u32 = 256;
+        let img_size = (blocks as usize) * blocksize as usize;
+        let mut img = vec![0u8; img_size];
+
+        // Superblock at byte 0.
+        BigEndian::write_u32(&mut img[0..4], 0x5846_5342); // XFSB
+        BigEndian::write_u32(&mut img[4..8], blocksize);
+        BigEndian::write_u64(&mut img[8..16], blocks as u64); // dblocks
+        BigEndian::write_u64(&mut img[56..64], 128); // rootino
+        BigEndian::write_u32(&mut img[84..88], blocks); // agblocks
+        BigEndian::write_u32(&mut img[88..92], 1); // agcount
+                                                   // versionnum: v4 + DIRV2 → dir2.
+        BigEndian::write_u16(&mut img[100..102], 0x2004);
+        BigEndian::write_u16(&mut img[102..104], 512); // sectsize
+        BigEndian::write_u16(&mut img[104..106], 256); // inodesize
+        BigEndian::write_u16(&mut img[106..108], 2); // inopblock
+        img[120] = 9; // blocklog
+        img[121] = 9; // sectlog
+        img[122] = 8; // inodelog
+        img[123] = 1; // inopblog
+        img[124] = 8; // agblklog
+
+        // Root inode 128: agno=0, agbno=64, off=0 → byte 0x8000.
+        let root_off = 64 * 512;
+        BigEndian::write_u16(&mut img[root_off..root_off + 2], 0x494E); // di_magic
+        BigEndian::write_u16(&mut img[root_off + 2..root_off + 4], 0o040755);
+        img[root_off + 4] = 2; // version
+        img[root_off + 5] = 1; // format = Local
+
+        // Build dir2 shortform fork: count=1, i8count=0, parent[4]=128,
+        // entry: namelen=9, offset[2]=0, name="btreefile", inumber[4]=200.
+        let mut fork = Vec::new();
+        fork.push(1u8); // count
+        fork.push(0u8); // i8count
+        fork.extend_from_slice(&128u32.to_be_bytes()); // parent
+        fork.push(9u8); // namelen
+        fork.extend_from_slice(&[0u8, 0u8]); // offset
+        fork.extend_from_slice(b"btreefile");
+        fork.extend_from_slice(&200u32.to_be_bytes()); // inumber
+        BigEndian::write_u64(&mut img[root_off + 56..root_off + 64], fork.len() as u64);
+        img[root_off + 100..root_off + 100 + fork.len()].copy_from_slice(&fork);
+
+        // File inode 200: agno=0, agbno=(200>>1)&0xFF=100, off_in_block=
+        // (200 & 1) * 256 = 0. So this inode sits at the start of block
+        // 100 → byte 100*512 = 51200 = 0xC800.
+        let file_off = 100 * 512;
+        BigEndian::write_u16(&mut img[file_off..file_off + 2], 0x494E);
+        BigEndian::write_u16(&mut img[file_off + 2..file_off + 4], 0o100644);
+        img[file_off + 4] = 2; // version
+        img[file_off + 5] = 3; // format = Btree
+        BigEndian::write_u64(
+            &mut img[file_off + 56..file_off + 64],
+            BTREE_FILE_PAYLOAD.len() as u64,
+        );
+        BigEndian::write_u32(&mut img[file_off + 76..file_off + 80], 1); // nextents
+                                                                         // Fork at file_off+100..file_off+256 (156 bytes). Lay out bmbt root:
+                                                                         // header(4) + 9 keys + 9 ptrs (only slot 0 populated). maxrecs=9.
+        let fork_off = file_off + 100;
+        BigEndian::write_u16(&mut img[fork_off..fork_off + 2], 1); // level
+        BigEndian::write_u16(&mut img[fork_off + 2..fork_off + 4], 1); // numrecs
+                                                                       // key0 at fork+4..12 (startoff=0).
+                                                                       // ptr0 at fork+4+9*8 = fork+76..fork+84 → fsblock 80.
+        BigEndian::write_u64(&mut img[fork_off + 76..fork_off + 84], 80);
+
+        // Leaf btree block at fsblock 80 = byte 40960 = 0xA000.
+        let leaf_off = 80 * 512;
+        BigEndian::write_u32(&mut img[leaf_off..leaf_off + 4], XFS_BMAP_MAGIC);
+        BigEndian::write_u16(&mut img[leaf_off + 4..leaf_off + 6], 0); // level = leaf
+        BigEndian::write_u16(&mut img[leaf_off + 6..leaf_off + 8], 1); // numrecs
+        BigEndian::write_u64(&mut img[leaf_off + 8..leaf_off + 16], NULLFSBLOCK); // leftsib
+        BigEndian::write_u64(&mut img[leaf_off + 16..leaf_off + 24], NULLFSBLOCK); // rightsib
+                                                                                   // Extent record at offset 24: startoff=0, startblock=90, blockcount=1,
+                                                                                   // unwritten=0. l0=0, l1=(90<<21)|1.
+        BigEndian::write_u64(&mut img[leaf_off + 24..leaf_off + 32], 0);
+        BigEndian::write_u64(&mut img[leaf_off + 32..leaf_off + 40], (90u64 << 21) | 1);
+
+        // Data block at fsblock 90 = byte 46080 = 0xB400.
+        let data_off = 90 * 512;
+        img[data_off..data_off + BTREE_FILE_PAYLOAD.len()].copy_from_slice(BTREE_FILE_PAYLOAD);
+
+        img
+    }
+
+    #[test]
+    fn btree_format_file_round_trips_through_bmbt_walker() {
+        let img = build_btree_file_image();
+        let mut fs = XfsFilesystem::open(Cursor::new(img), 0).expect("open xfs");
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list root");
+        let file = entries
+            .iter()
+            .find(|e| e.name == "btreefile")
+            .expect("btreefile entry");
+        assert!(file.is_file());
+        assert_eq!(file.size, BTREE_FILE_PAYLOAD.len() as u64);
+        let direct = fs.read_file(file, usize::MAX).expect("read");
+        assert_eq!(direct, BTREE_FILE_PAYLOAD);
+        let mut streamed = Vec::new();
+        let n = fs.write_file_to(file, &mut streamed).expect("stream");
+        assert_eq!(n as usize, BTREE_FILE_PAYLOAD.len());
+        assert_eq!(streamed, BTREE_FILE_PAYLOAD);
+    }
+
     #[test]
     fn dir1_synthetic_image_lists_shortform_entries() {
         let img = build_dir1_image();
@@ -933,6 +1329,106 @@ mod tests {
         assert!(entries[0].is_file());
         assert!(entries[1].is_directory());
         assert!(entries[2].is_symlink());
+    }
+
+    #[test]
+    fn bmbt_root_parses_level_and_first_child() {
+        // 8-byte fork would only hold the header; use a 32-byte fork — fits
+        // header(4) + 1 key(8) + 1 ptr(8) = 20 bytes, plus padding.
+        // maxrecs = (32 - 4) / 16 = 1.
+        let mut fork = vec![0u8; 32];
+        BigEndian::write_u16(&mut fork[0..2], 1); // level
+        BigEndian::write_u16(&mut fork[2..4], 1); // numrecs
+                                                  // key at fork+4..12, ptr at fork+12..20.
+        BigEndian::write_u64(&mut fork[4..12], 0);
+        BigEndian::write_u64(&mut fork[12..20], 0xDEAD_BEEF_CAFE_BABE);
+        let (level, first_child) = parse_bmbt_root(&fork, fork.len()).expect("parse");
+        assert_eq!(level, 1);
+        assert_eq!(first_child, 0xDEAD_BEEF_CAFE_BABE);
+    }
+
+    #[test]
+    fn bmbt_root_rejects_level_zero() {
+        let mut fork = vec![0u8; 32];
+        BigEndian::write_u16(&mut fork[0..2], 0); // level=0 invalid for btree root
+        BigEndian::write_u16(&mut fork[2..4], 1);
+        match parse_bmbt_root(&fork, fork.len()) {
+            Err(FilesystemError::Parse(msg)) => assert!(msg.contains("level 0")),
+            other => panic!("expected Parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bmbt_root_uses_maxrecs_not_numrecs_for_ptr_offset() {
+        // A real btree root reserves space for `maxrecs` keys before the
+        // first pointer, even when only `numrecs` slots are populated.
+        // Fork of 36 bytes → maxrecs = 2. Header(4) + 2 keys(16) + ptr(8)
+        // = 28 bytes. Ptr should be read at offset 4 + 2*8 = 20, NOT at
+        // 4 + 1*8 = 12 (where the second key sits).
+        let mut fork = vec![0u8; 36];
+        BigEndian::write_u16(&mut fork[0..2], 2); // level
+        BigEndian::write_u16(&mut fork[2..4], 1); // numrecs (1 of 2 populated)
+                                                  // key0 at +4..12, key1 (unused) at +12..20.
+        BigEndian::write_u64(&mut fork[4..12], 0);
+        BigEndian::write_u64(&mut fork[12..20], 0xDEAD); // would be wrong ptr
+                                                         // ptr0 at +20..28 (= 4 + maxrecs*8).
+        BigEndian::write_u64(&mut fork[20..28], 0xBEEF);
+        let (level, first_child) = parse_bmbt_root(&fork, fork.len()).expect("parse");
+        assert_eq!(level, 2);
+        assert_eq!(first_child, 0xBEEF);
+    }
+
+    #[test]
+    fn bmbt_header_check_accepts_correct_block() {
+        let mut block = vec![0u8; XFS_BTREE_LBLOCK_LEN];
+        BigEndian::write_u32(&mut block[0..4], XFS_BMAP_MAGIC);
+        BigEndian::write_u16(&mut block[4..6], 0); // level
+        check_bmbt_header(&block, Some(0)).expect("ok");
+        check_bmbt_header(&block, None).expect("ok");
+    }
+
+    #[test]
+    fn bmbt_header_check_rejects_bad_magic_and_level() {
+        let mut block = vec![0u8; XFS_BTREE_LBLOCK_LEN];
+        BigEndian::write_u32(&mut block[0..4], 0xDEAD_BEEF);
+        match check_bmbt_header(&block, None) {
+            Err(FilesystemError::Parse(msg)) => assert!(msg.contains("magic")),
+            other => panic!("expected magic error, got {other:?}"),
+        }
+        BigEndian::write_u32(&mut block[0..4], XFS_BMAP_MAGIC);
+        BigEndian::write_u16(&mut block[4..6], 3);
+        match check_bmbt_header(&block, Some(1)) {
+            Err(FilesystemError::Parse(msg)) => assert!(msg.contains("level")),
+            other => panic!("expected level error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fb_to_disk_handles_extents_and_holes() {
+        let extents = vec![
+            XfsBmbtIrec {
+                startoff: 0,
+                startblock: 100,
+                blockcount: 4,
+                unwritten: false,
+            },
+            XfsBmbtIrec {
+                startoff: 10,
+                startblock: 200,
+                blockcount: 2,
+                unwritten: true,
+            },
+        ];
+        assert_eq!(fb_to_disk(&extents, 0), Some((100, false)));
+        assert_eq!(fb_to_disk(&extents, 3), Some((103, false)));
+        // Hole at fb=4..10.
+        assert_eq!(fb_to_disk(&extents, 4), None);
+        assert_eq!(fb_to_disk(&extents, 9), None);
+        // Unwritten extent at fb=10..12.
+        assert_eq!(fb_to_disk(&extents, 10), Some((200, true)));
+        assert_eq!(fb_to_disk(&extents, 11), Some((201, true)));
+        // Past the last extent.
+        assert_eq!(fb_to_disk(&extents, 12), None);
     }
 
     #[test]
