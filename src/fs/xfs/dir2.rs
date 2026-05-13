@@ -18,9 +18,19 @@ pub const XFS_DIR2_BLOCK_MAGIC: u32 = 0x5844_3242;
 /// `XD2D` — multi-block data block magic (v4, no CRC). Same body layout as
 /// `XD2B` but without the trailing leaf-entry / tail section.
 pub const XFS_DIR2_DATA_MAGIC: u32 = 0x5844_3244;
-/// `XDB3` — single-block dir2 magic (v5/CRC). We reject v5 in the sb, but
-/// surface the constant so detection messages can name what we saw.
+/// `XDB3` — single-block dir3 magic (v5/CRC). Same layout as `XD2B` but with
+/// a 64-byte `xfs_dir3_data_hdr` in place of the 16-byte v4 header.
 pub const XFS_DIR3_BLOCK_MAGIC: u32 = 0x5844_4233;
+/// `XDD3` — multi-block data block magic (v5/CRC). Same body layout as
+/// `XDB3` minus the trailing leaf+tail section.
+pub const XFS_DIR3_DATA_MAGIC: u32 = 0x5844_4433;
+
+/// Data-block header size for v4 dir2 (`xfs_dir2_data_hdr`: magic + 3
+/// best-free slots = 4 + 12 = 16 bytes).
+pub const XFS_DIR2_DATA_HDR_LEN: usize = 16;
+/// Data-block header size for v5 dir3 (`xfs_dir3_data_hdr`:
+/// `xfs_dir3_blk_hdr`(48) + best_free[3](12) + pad(4) = 64 bytes).
+pub const XFS_DIR3_DATA_HDR_LEN: usize = 64;
 
 /// Free-tag at the start of an unused-record entry in a dir2 data block.
 const XFS_DIR2_DATA_FREE_TAG: u16 = 0xFFFF;
@@ -92,10 +102,10 @@ pub fn parse_shortform(
     Ok((parent, out))
 }
 
-/// Parse a single-block dir2 buffer (`XD2B` magic). `buf.len()` must equal
-/// the directory block size. Returns the contained entries in on-disk
-/// order, skipping `.` and `..` (the caller already knows the parent
-/// inumber).
+/// Parse a single-block dir2 / dir3 buffer (`XD2B` or `XDB3` magic).
+/// `buf.len()` must equal the directory block size. Returns the contained
+/// entries in on-disk order, skipping `.` and `..` (the caller already knows
+/// the parent inumber).
 pub fn parse_block(buf: &[u8], has_ftype: bool) -> Result<Vec<Dir2Entry>, FilesystemError> {
     if buf.len() < 24 {
         return Err(FilesystemError::Parse(format!(
@@ -104,36 +114,36 @@ pub fn parse_block(buf: &[u8], has_ftype: bool) -> Result<Vec<Dir2Entry>, Filesy
         )));
     }
     let magic = BigEndian::read_u32(&buf[0..4]);
-    if magic == XFS_DIR3_BLOCK_MAGIC {
-        return Err(FilesystemError::Unsupported(
-            "XFS dir3 (v5/CRC) directory blocks not supported".into(),
-        ));
-    }
-    if magic != XFS_DIR2_BLOCK_MAGIC {
-        return Err(FilesystemError::Parse(format!(
-            "bad dir2 block magic: 0x{magic:08X} (expected 0x{XFS_DIR2_BLOCK_MAGIC:08X})"
-        )));
-    }
-    // Header: magic(4) + bestfree[3]*(off:2 + len:2) = 4 + 12 = 16 bytes for v4.
+    let hdr_len = match magic {
+        XFS_DIR2_BLOCK_MAGIC => XFS_DIR2_DATA_HDR_LEN,
+        XFS_DIR3_BLOCK_MAGIC => XFS_DIR3_DATA_HDR_LEN,
+        _ => {
+            return Err(FilesystemError::Parse(format!(
+                "bad dir2/dir3 block magic: 0x{magic:08X} \
+                 (expected 0x{XFS_DIR2_BLOCK_MAGIC:08X} or 0x{XFS_DIR3_BLOCK_MAGIC:08X})"
+            )));
+        }
+    };
     // Tail at end of block: count(4) + stale(4) = 8 bytes. Leaf entries
     // (8 bytes each) precede the tail.
     let block_end = buf.len();
     let tail_off = block_end - 8;
     let leaf_count = BigEndian::read_u32(&buf[tail_off..tail_off + 4]) as usize;
     let leaf_section_size = leaf_count.saturating_mul(8) + 8;
-    if leaf_section_size > block_end - 16 {
+    if leaf_section_size > block_end - hdr_len {
         return Err(FilesystemError::Parse(format!(
             "dir2 block tail count {leaf_count} overflows block size {block_end}"
         )));
     }
     let data_end = block_end - leaf_section_size;
-    parse_data_entries(buf, has_ftype, 16, data_end)
+    parse_data_entries(buf, has_ftype, hdr_len, data_end)
 }
 
-/// Parse a multi-block `XD2D` data block. Body layout matches `XD2B` minus
-/// the trailing leaf-entry section — entries fill the block right up to the
-/// end (free regions are recorded as `XFS_DIR2_DATA_FREE_TAG` unused records
-/// inline). Used by leaf-format and node-format dir2 directories.
+/// Parse a multi-block `XD2D` (v4) or `XDD3` (v5) data block. Body layout
+/// matches the single-block form minus the trailing leaf-entry section —
+/// entries fill the block right up to the end (free regions are recorded as
+/// `XFS_DIR2_DATA_FREE_TAG` unused records inline). Used by leaf-format and
+/// node-format dir2/dir3 directories.
 pub fn parse_data_block(buf: &[u8], has_ftype: bool) -> Result<Vec<Dir2Entry>, FilesystemError> {
     if buf.len() < 16 {
         return Err(FilesystemError::Parse(format!(
@@ -142,12 +152,17 @@ pub fn parse_data_block(buf: &[u8], has_ftype: bool) -> Result<Vec<Dir2Entry>, F
         )));
     }
     let magic = BigEndian::read_u32(&buf[0..4]);
-    if magic != XFS_DIR2_DATA_MAGIC {
-        return Err(FilesystemError::Parse(format!(
-            "bad dir2 data block magic: 0x{magic:08X} (expected 0x{XFS_DIR2_DATA_MAGIC:08X})"
-        )));
-    }
-    parse_data_entries(buf, has_ftype, 16, buf.len())
+    let hdr_len = match magic {
+        XFS_DIR2_DATA_MAGIC => XFS_DIR2_DATA_HDR_LEN,
+        XFS_DIR3_DATA_MAGIC => XFS_DIR3_DATA_HDR_LEN,
+        _ => {
+            return Err(FilesystemError::Parse(format!(
+                "bad dir2/dir3 data block magic: 0x{magic:08X} \
+                 (expected 0x{XFS_DIR2_DATA_MAGIC:08X} or 0x{XFS_DIR3_DATA_MAGIC:08X})"
+            )));
+        }
+    };
+    parse_data_entries(buf, has_ftype, hdr_len, buf.len())
 }
 
 /// Walk the entry/free-tag region of a dir2 data block from `start` up to
@@ -372,14 +387,61 @@ mod tests {
     }
 
     #[test]
-    fn block_rejects_dir3_magic() {
-        let mut buf = vec![0u8; 512];
+    fn block_parses_dir3_xdb3_with_64_byte_header() {
+        // Synthetic XDB3 block: 64-byte header + 2 entries + leaf+tail.
+        let block_size = 512usize;
+        let leaf_count = 2u32;
+        let leaf_section = (leaf_count as usize) * 8 + 8;
+        let mut buf = vec![0u8; block_size];
         BigEndian::write_u32(&mut buf[0..4], XFS_DIR3_BLOCK_MAGIC);
-        match parse_block(&buf, false) {
-            Err(FilesystemError::Unsupported(msg)) => assert!(msg.contains("dir3")),
-            Err(e) => panic!("expected Unsupported, got {e}"),
-            Ok(_) => panic!("expected error"),
+
+        let entries = [(20u64, "alpha3"), (21u64, "beta3v5")];
+        let mut pos = XFS_DIR3_DATA_HDR_LEN;
+        for (ino, name) in entries {
+            BigEndian::write_u64(&mut buf[pos..pos + 8], ino);
+            buf[pos + 8] = name.len() as u8;
+            buf[pos + 9..pos + 9 + name.len()].copy_from_slice(name.as_bytes());
+            let raw = 8 + 1 + name.len() + 2;
+            let aligned = (raw + 7) & !7;
+            pos += aligned;
         }
+        let data_end = block_size - leaf_section;
+        if pos < data_end {
+            BigEndian::write_u16(&mut buf[pos..pos + 2], XFS_DIR2_DATA_FREE_TAG);
+            BigEndian::write_u16(&mut buf[pos + 2..pos + 4], (data_end - pos) as u16);
+        }
+        let tail_off = block_size - 8;
+        BigEndian::write_u32(&mut buf[tail_off..tail_off + 4], leaf_count);
+
+        let parsed = parse_block(&buf, false).expect("parse XDB3");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, "alpha3");
+        assert_eq!(parsed[1].name, "beta3v5");
+    }
+
+    #[test]
+    fn data_block_parses_xdd3_with_64_byte_header() {
+        let block_size = 512usize;
+        let mut buf = vec![0u8; block_size];
+        BigEndian::write_u32(&mut buf[0..4], XFS_DIR3_DATA_MAGIC);
+        let entries = [(70u64, "f1v5"), (71u64, "second-v5"), (72u64, "third-v5")];
+        let mut pos = XFS_DIR3_DATA_HDR_LEN;
+        for (ino, name) in entries {
+            BigEndian::write_u64(&mut buf[pos..pos + 8], ino);
+            buf[pos + 8] = name.len() as u8;
+            buf[pos + 9..pos + 9 + name.len()].copy_from_slice(name.as_bytes());
+            let raw = 8 + 1 + name.len() + 2;
+            let aligned = (raw + 7) & !7;
+            pos += aligned;
+        }
+        if pos < block_size {
+            BigEndian::write_u16(&mut buf[pos..pos + 2], XFS_DIR2_DATA_FREE_TAG);
+            BigEndian::write_u16(&mut buf[pos + 2..pos + 4], (block_size - pos) as u16);
+        }
+        let parsed = parse_data_block(&buf, false).expect("parse XDD3");
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].inumber, 70);
+        assert_eq!(parsed[2].name, "third-v5");
     }
 
     #[test]

@@ -1,10 +1,11 @@
 //! XFS inode core parser and inode-number → byte-offset translation.
 //!
 //! Layout reference: `~/xfs-efs/refs/xfs-modern/xfs/libxfs/xfs_format.h`,
-//! `struct xfs_dinode`. Step 5 needs only the v1/v2 core fields (mode, size,
-//! format, nextents, gen). The v3/CRC fields after `di_next_unlinked` are
-//! never read because the superblock guard rejects v5 filesystems before
-//! we get here.
+//! `struct xfs_dinode`. The first 96 bytes (the v1/v2 core: mode, size,
+//! format, nextents, gen, ...) are byte-identical between v4 and v5/v3 inodes.
+//! v5/v3 adds a 76-byte CRC trailer (crc, changecount, lsn, flags2,
+//! cowextsize, pad, crtime, inumber, uuid) before the fork area, so v5 forks
+//! start at offset 176 instead of 100. `fork_offset` returns the right value.
 
 use byteorder::{BigEndian, ByteOrder};
 
@@ -81,6 +82,17 @@ impl XfsDinodeCore {
 
     pub fn is_symlink(&self) -> bool {
         (self.mode & 0o170000) == 0o120000
+    }
+}
+
+/// Byte offset of the data fork inside an on-disk inode. v1/v2 inodes have a
+/// 100-byte core (offsetof(`di_crc`)); v3 (v5/CRC) inodes grow the core to
+/// 176 bytes (offsetof(`di_literal_area`)).
+pub fn fork_offset(is_v5: bool) -> usize {
+    if is_v5 {
+        176
+    } else {
+        100
     }
 }
 

@@ -32,17 +32,14 @@ use byteorder::{BigEndian, ByteOrder};
 use super::entry::{EntryType, FileEntry};
 use super::filesystem::{Filesystem, FilesystemError};
 use bmap::{
-    decode_extent, fsblock_to_partition_byte, XfsBmbtIrec, NULLFSBLOCK, XFS_BMAP_MAGIC,
-    XFS_BTREE_LBLOCK_LEN,
+    decode_extent, fsblock_to_partition_byte, XfsBmbtIrec, NULLFSBLOCK, XFS_BMAP_CRC_MAGIC,
+    XFS_BMAP_MAGIC, XFS_BTREE_LBLOCK_CRC_LEN, XFS_BTREE_LBLOCK_LEN,
 };
-use inode::{inode_byte_offset, XfsDinodeCore};
+use inode::{fork_offset, inode_byte_offset, XfsDinodeCore};
 use sb::XfsSuperblock;
 use types::{DiFormat, DirFormat};
 
 const SECTOR: u64 = 512;
-
-/// Offset of the data fork within a v1/v2 on-disk inode (= offsetof(di_crc)).
-const V2_FORK_OFF: usize = 100;
 
 /// 1 MiB streaming chunk size — matches the rest of the codebase.
 const STREAM_CHUNK: usize = 1024 * 1024;
@@ -72,16 +69,21 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         let sb = XfsSuperblock::parse(&sector)?;
 
         let dir_format = sb.dir_format();
-        let fs_type_name = match sb.versionnum & types::XFS_SB_VERSION_NUMBITS {
-            1 => "XFS v1",
-            _ => "XFS v2",
+        let fs_type_name = if sb.is_v5() {
+            "XFS v5"
+        } else {
+            match sb.versionnum & types::XFS_SB_VERSION_NUMBITS {
+                1 => "XFS v1",
+                _ => "XFS v2",
+            }
         };
         log_cb(&format!(
-            "XFS dir format: {}",
+            "XFS dir format: {} ({})",
             match dir_format {
                 DirFormat::Dir1 => "dir1",
                 DirFormat::Dir2 => "dir2",
-            }
+            },
+            if sb.is_v5() { "v5/dir3" } else { "v4" }
         ));
 
         let label = sb.label();
@@ -136,18 +138,20 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         Ok(self.read_inode_buf(ino)?.0)
     }
 
-    /// Slice the data-fork bytes out of a full inode buffer. v1/v2 layout:
-    ///   data fork starts at offset 100 (V2_FORK_OFF). If `di_forkoff > 0`,
-    ///   data fork ends at offset `100 + (forkoff << 3)`; otherwise it
-    ///   consumes the rest of the literal area.
+    /// Slice the data-fork bytes out of a full inode buffer. The fork starts
+    /// at offset 100 on v4 (offsetof(`di_crc`)) and at offset 176 on v5/v3
+    /// (offsetof(`di_literal_area`)). If `di_forkoff > 0`, the data fork ends
+    /// at `fork_start + (forkoff << 3)`; otherwise it consumes the rest of
+    /// the literal area.
     fn data_fork<'a>(&self, core: &XfsDinodeCore, inode_buf: &'a [u8]) -> &'a [u8] {
+        let fork_start = fork_offset(self.sb.is_v5());
         let end = if core.forkoff > 0 {
-            V2_FORK_OFF + (core.forkoff as usize) * 8
+            fork_start + (core.forkoff as usize) * 8
         } else {
             self.sb.inodesize as usize
         };
         let end = end.min(inode_buf.len());
-        &inode_buf[V2_FORK_OFF..end]
+        &inode_buf[fork_start..end]
     }
 
     /// Decode `di_nextents` inline extent records from a fork buffer, sorted
@@ -222,12 +226,17 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
             ));
         }
         let bs = self.sb.blocksize as u64;
-        if (bs as usize) < XFS_BTREE_LBLOCK_LEN + 16 {
+        let hdr_len = if self.sb.is_v5() {
+            XFS_BTREE_LBLOCK_CRC_LEN
+        } else {
+            XFS_BTREE_LBLOCK_LEN
+        };
+        if (bs as usize) < hdr_len + 16 {
             return Err(FilesystemError::Parse(format!(
-                "XFS blocksize {bs} too small for bmap btree block"
+                "XFS blocksize {bs} too small for bmap btree block (hdr {hdr_len})"
             )));
         }
-        let max_intermediate_recs = ((bs as usize) - XFS_BTREE_LBLOCK_LEN) / 16;
+        let max_intermediate_recs = ((bs as usize) - hdr_len) / 16;
 
         let mut block = vec![0u8; bs as usize];
         let mut current = first_child;
@@ -239,14 +248,14 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
                 ));
             }
             self.read_fsblock(current, &mut block)?;
-            check_bmbt_header(&block, Some(expected_level))?;
+            check_bmbt_header(&block, Some(expected_level), self.sb.is_v5())?;
             if expected_level == 0 {
                 break;
             }
             // Intermediate node: pick the leftmost child (slot 0). Keys
             // occupy `max_intermediate_recs * 8` bytes after the header;
             // pointers follow.
-            let ptrs_off = XFS_BTREE_LBLOCK_LEN + max_intermediate_recs * 8;
+            let ptrs_off = hdr_len + max_intermediate_recs * 8;
             if ptrs_off + 8 > block.len() {
                 return Err(FilesystemError::Parse(format!(
                     "XFS bmap btree intermediate block truncated (ptrs_off={ptrs_off}, bs={bs})"
@@ -257,30 +266,31 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         }
 
         // Leaf level: walk via rightsib, collecting records.
+        // numrecs lives at offset 6 in both v4 and v5 long-form btree blocks.
+        // Siblings: v4 at 8 / 16, v5 at 8 / 16 too (the order is leftsib,
+        // rightsib at the top of the long-form union — see xfs_btree_block).
         let mut out = Vec::new();
         loop {
             let numrecs = BigEndian::read_u16(&block[6..8]) as usize;
-            let max_leaf_recs = ((bs as usize) - XFS_BTREE_LBLOCK_LEN) / 16;
+            let max_leaf_recs = ((bs as usize) - hdr_len) / 16;
             if numrecs > max_leaf_recs {
                 return Err(FilesystemError::Parse(format!(
                     "XFS bmap btree leaf numrecs {numrecs} > max {max_leaf_recs}"
                 )));
             }
             for i in 0..numrecs {
-                let off = XFS_BTREE_LBLOCK_LEN + i * 16;
+                let off = hdr_len + i * 16;
                 let chunk: &[u8; 16] = block[off..off + 16]
                     .try_into()
                     .expect("16-byte extent record");
                 out.push(decode_extent(chunk));
             }
-            // bb_rightsib at offset 16..24 (long-form header: leftsib@8,
-            // rightsib@16).
             let rightsib = BigEndian::read_u64(&block[16..24]);
             if rightsib == NULLFSBLOCK {
                 break;
             }
             self.read_fsblock(rightsib, &mut block)?;
-            check_bmbt_header(&block, Some(0))?;
+            check_bmbt_header(&block, Some(0), self.sb.is_v5())?;
         }
         out.sort_by_key(|e| e.startoff);
         Ok(out)
@@ -453,10 +463,10 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
                     0
                 };
                 match magic {
-                    dir2::XFS_DIR2_BLOCK_MAGIC => {
+                    dir2::XFS_DIR2_BLOCK_MAGIC | dir2::XFS_DIR3_BLOCK_MAGIC => {
                         out.extend(dir2::parse_block(&block_buf, has_ftype)?);
                     }
-                    dir2::XFS_DIR2_DATA_MAGIC => {
+                    dir2::XFS_DIR2_DATA_MAGIC | dir2::XFS_DIR3_DATA_MAGIC => {
                         out.extend(dir2::parse_data_block(&block_buf, has_ftype)?);
                     }
                     _ => {
@@ -874,7 +884,11 @@ fn parse_bmbt_root(fork: &[u8], forklen: usize) -> Result<(u16, u64), Filesystem
 /// Verify a bmap-btree disk block carries the expected magic and (if
 /// supplied) level. Header layout is the long-form `xfs_btree_block`:
 ///   magic(4) + level(2) + numrecs(2) + leftsib(8) + rightsib(8).
-fn check_bmbt_header(block: &[u8], expected_level: Option<u16>) -> Result<(), FilesystemError> {
+fn check_bmbt_header(
+    block: &[u8],
+    expected_level: Option<u16>,
+    is_v5: bool,
+) -> Result<(), FilesystemError> {
     if block.len() < XFS_BTREE_LBLOCK_LEN {
         return Err(FilesystemError::Parse(format!(
             "XFS bmap btree block too small: {} bytes",
@@ -882,9 +896,14 @@ fn check_bmbt_header(block: &[u8], expected_level: Option<u16>) -> Result<(), Fi
         )));
     }
     let magic = BigEndian::read_u32(&block[0..4]);
-    if magic != XFS_BMAP_MAGIC {
+    let want = if is_v5 {
+        XFS_BMAP_CRC_MAGIC
+    } else {
+        XFS_BMAP_MAGIC
+    };
+    if magic != want {
         return Err(FilesystemError::Parse(format!(
-            "bad XFS bmap btree magic: 0x{magic:08X} (expected 0x{XFS_BMAP_MAGIC:08X})"
+            "bad XFS bmap btree magic: 0x{magic:08X} (expected 0x{want:08X})"
         )));
     }
     if let Some(want) = expected_level {
@@ -1102,16 +1121,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_v5_filesystem_in_open() {
+    fn rejects_v5_filesystem_with_nrext64_feature() {
+        // Minimal v5 sb with NREXT64 bit (incompat 0x20) set — must be
+        // rejected because it changes the on-disk inode layout.
         let mut img = vec![0u8; 4096];
         img[0..4].copy_from_slice(&0x5846_5342u32.to_be_bytes());
         img[4..8].copy_from_slice(&4096u32.to_be_bytes());
         img[100..102].copy_from_slice(&0x0005u16.to_be_bytes());
         img[102..104].copy_from_slice(&512u16.to_be_bytes());
+        img[216..220].copy_from_slice(&(1u32 << 5).to_be_bytes());
         match XfsFilesystem::open(Cursor::new(img), 0) {
-            Err(FilesystemError::Unsupported(msg)) => assert!(msg.contains("v5")),
-            Err(e) => panic!("expected v5 rejection, got error {e}"),
-            Ok(_) => panic!("expected v5 rejection, got Ok"),
+            Err(FilesystemError::Unsupported(msg)) => assert!(msg.contains("NREXT64")),
+            Err(e) => panic!("expected NREXT64 rejection, got error {e}"),
+            Ok(_) => panic!("expected NREXT64 rejection, got Ok"),
         }
     }
 
@@ -1383,21 +1405,32 @@ mod tests {
         let mut block = vec![0u8; XFS_BTREE_LBLOCK_LEN];
         BigEndian::write_u32(&mut block[0..4], XFS_BMAP_MAGIC);
         BigEndian::write_u16(&mut block[4..6], 0); // level
-        check_bmbt_header(&block, Some(0)).expect("ok");
-        check_bmbt_header(&block, None).expect("ok");
+        check_bmbt_header(&block, Some(0), false).expect("ok");
+        check_bmbt_header(&block, None, false).expect("ok");
+    }
+
+    #[test]
+    fn bmbt_header_check_accepts_v5_bma3_magic() {
+        let mut block = vec![0u8; XFS_BTREE_LBLOCK_CRC_LEN];
+        BigEndian::write_u32(&mut block[0..4], XFS_BMAP_CRC_MAGIC);
+        BigEndian::write_u16(&mut block[4..6], 0);
+        check_bmbt_header(&block, Some(0), true).expect("ok");
+        // v4 magic must be rejected when caller said is_v5.
+        BigEndian::write_u32(&mut block[0..4], XFS_BMAP_MAGIC);
+        assert!(check_bmbt_header(&block, None, true).is_err());
     }
 
     #[test]
     fn bmbt_header_check_rejects_bad_magic_and_level() {
         let mut block = vec![0u8; XFS_BTREE_LBLOCK_LEN];
         BigEndian::write_u32(&mut block[0..4], 0xDEAD_BEEF);
-        match check_bmbt_header(&block, None) {
+        match check_bmbt_header(&block, None, false) {
             Err(FilesystemError::Parse(msg)) => assert!(msg.contains("magic")),
             other => panic!("expected magic error, got {other:?}"),
         }
         BigEndian::write_u32(&mut block[0..4], XFS_BMAP_MAGIC);
         BigEndian::write_u16(&mut block[4..6], 3);
-        match check_bmbt_header(&block, Some(1)) {
+        match check_bmbt_header(&block, Some(1), false) {
             Err(FilesystemError::Parse(msg)) => assert!(msg.contains("level")),
             other => panic!("expected level error, got {other:?}"),
         }
@@ -1429,6 +1462,59 @@ mod tests {
         assert_eq!(fb_to_disk(&extents, 11), Some((201, true)));
         // Past the last extent.
         assert_eq!(fb_to_disk(&extents, 12), None);
+    }
+
+    /// Decompress the bundled modern-XFS fixture (300 MiB of mostly zeros,
+    /// zstd → ~18 KiB on disk). Produced by a stock Linux `mkfs.xfs`
+    /// (v5/CRC, dir3, blocksize=4096, inodesize=512, 4 AGs).
+    fn load_modern_fixture() -> Vec<u8> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sgi/xfs_v5_modern_small.img.zst");
+        let compressed = std::fs::read(&path).expect("modern fixture present");
+        let mut decoder =
+            zstd::stream::read::Decoder::new(Cursor::new(compressed)).expect("zstd decoder");
+        let mut out = Vec::new();
+        decoder.read_to_end(&mut out).expect("decompress");
+        out
+    }
+
+    #[test]
+    fn opens_modern_xfs_v5_fixture() {
+        let img = load_modern_fixture();
+        let mut fs = XfsFilesystem::open(Cursor::new(img), 0).expect("open xfs v5");
+        assert!(fs.sb.is_v5(), "expected v5 fs");
+        assert_eq!(fs.sb.blocksize, 4096);
+        assert_eq!(fs.sb.inodesize, 512);
+        assert_eq!(fs.sb.rootino, 128);
+        assert_eq!(fs.sb.agcount, 4);
+        assert_eq!(fs.fs_type(), "XFS v5");
+        // dir3 carries FTYPE via features_incompat bit 0.
+        assert!(fs.sb.has_ftype());
+
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list root");
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        for n in [
+            "data_1.bin",
+            "data_2.bin",
+            "data_3.bin",
+            "data_4.bin",
+            "data_5.bin",
+            "hostname",
+        ] {
+            assert!(names.contains(&n), "missing {n} in {names:?}");
+        }
+
+        // hostname is 5 bytes ("m900\n") — verified via xfs_db. Confirm read
+        // and write_file_to both produce the same bytes.
+        let hostname = entries.iter().find(|e| e.name == "hostname").unwrap();
+        let direct = fs.read_file(hostname, 4096).expect("read hostname");
+        assert_eq!(direct.len() as u64, hostname.size);
+        assert_eq!(direct, b"m900\n");
+        let mut streamed = Vec::new();
+        let n = fs.write_file_to(hostname, &mut streamed).expect("stream");
+        assert_eq!(n, hostname.size);
+        assert_eq!(streamed, direct);
     }
 
     #[test]
