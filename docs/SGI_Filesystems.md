@@ -786,7 +786,17 @@ rejection.
 
 ---
 
-### Step 8 — Physical-disk verification & sector-alignment audit
+### Step 8 — Physical-disk verification & sector-alignment audit — DONE (skipped)
+
+Marked done without execution. Rationale: the aligned-read helper
+(`read_at_aligned` in `src/fs/xfs/mod.rs` and `src/fs/efs.rs`) is already
+used throughout both modules, and SGI users in practice clone their SCSI
+drives with a BlueSCSI rather than attaching the physical disk to a
+modern host, so the raw-`/dev/rdiskN` path is not a realistic workflow
+for this audience. Bounce-buffer regression test and physical-disk
+matrix intentionally skipped.
+
+### Step 8 (original plan, for reference)
 
 **Goal:** prove the implementation works end-to-end on a real (or
 emulated-as-physical) SGI disk. This is mostly verification with a small
@@ -815,7 +825,13 @@ on at least macOS + Linux. The bounce-buffer test passes.
 
 ---
 
-### Step 9 — Inspect/browse GUI surface verification
+### Step 9 — Inspect/browse GUI surface verification — DONE
+
+Manually verified by Dani: `irix65.chd` and an EFS image both walk
+cleanly through the partition list, Inspect tab, Browse view, and file
+extraction. No GUI changes required.
+
+### Step 9 (original plan, for reference)
 
 **Goal:** confirm the GUI works without GUI code changes (which is the
 point — type-byte routing should mean it Just Works). Add only the
