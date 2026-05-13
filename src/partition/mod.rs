@@ -124,7 +124,13 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
         }
     }
 
-    // Check for HFS / HFS+ / ProDOS at offset 1024.
+    // XFS superblock magic "XFSB" at byte 0 of the partition. v4 and v5/CRC
+    // share the magic; the XfsFilesystem parser handles version routing.
+    if &first_sector[0..4] == b"XFSB" {
+        return Some("XFS".to_string());
+    }
+
+    // Check for HFS / HFS+ / HFSX / ext / ProDOS at offset 1024.
     // Read a full 512-byte sector for raw device compatibility (macOS /dev/rdiskN
     // requires sector-aligned reads).
     if reader.seek(SeekFrom::Start(1024)).is_ok() {
@@ -135,6 +141,11 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
                 0x4244 => return Some("HFS".to_string()),
                 0x482B | 0x4858 => return Some("HFS+".to_string()),
                 _ => {}
+            }
+            // ext2/3/4 superblock magic 0xEF53 (LE u16) at byte 0x38 of the
+            // 1024-offset superblock.
+            if buf[0x38] == 0x53 && buf[0x39] == 0xEF {
+                return Some("ext".to_string());
             }
             // ProDOS volume directory key block: prev_block==0, storage_type nibble==0xF,
             // entry_length==39, entries_per_block==13.
@@ -151,6 +162,15 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
             {
                 return Some("ProDOS".to_string());
             }
+        }
+    }
+
+    // btrfs superblock magic "_BHRfS_M" at offset 0x40 of the superblock
+    // at byte offset 0x10000 (64 KiB) from the partition start.
+    if reader.seek(SeekFrom::Start(0x10000)).is_ok() {
+        let mut buf = [0u8; 512];
+        if reader.read_exact(&mut buf).is_ok() && &buf[0x40..0x48] == b"_BHRfS_M" {
+            return Some("btrfs".to_string());
         }
     }
 
@@ -626,6 +646,47 @@ mod tests {
         let parts = table.partitions();
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].type_name, "exFAT");
+    }
+
+    #[test]
+    fn test_detect_superfloppy_xfs() {
+        // XFS superblock magic "XFSB" at byte 0 of the partition.
+        let mut data = vec![0u8; 1024 * 1024];
+        data[0..4].copy_from_slice(b"XFSB");
+        // No 0xAA55 signature; bare-FS probe must fire before MBR parse.
+        let mut cursor = Cursor::new(data);
+        let table = PartitionTable::detect(&mut cursor).unwrap();
+        assert_eq!(table.type_name(), "None");
+        let parts = table.partitions();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].type_name, "XFS");
+    }
+
+    #[test]
+    fn test_detect_superfloppy_ext() {
+        // ext2/3/4: magic 0xEF53 (LE) at byte 0x38 of the superblock at offset 1024.
+        let mut data = vec![0u8; 1024 * 1024];
+        data[1024 + 0x38] = 0x53;
+        data[1024 + 0x39] = 0xEF;
+        let mut cursor = Cursor::new(data);
+        let table = PartitionTable::detect(&mut cursor).unwrap();
+        assert_eq!(table.type_name(), "None");
+        let parts = table.partitions();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].type_name, "ext");
+    }
+
+    #[test]
+    fn test_detect_superfloppy_btrfs() {
+        // btrfs: magic "_BHRfS_M" at offset 0x40 of the superblock at offset 0x10000.
+        let mut data = vec![0u8; 0x10000 + 4096];
+        data[0x10000 + 0x40..0x10000 + 0x48].copy_from_slice(b"_BHRfS_M");
+        let mut cursor = Cursor::new(data);
+        let table = PartitionTable::detect(&mut cursor).unwrap();
+        assert_eq!(table.type_name(), "None");
+        let parts = table.partitions();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].type_name, "btrfs");
     }
 
     #[test]

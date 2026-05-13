@@ -11,6 +11,23 @@
 
 use byteorder::{BigEndian, ByteOrder};
 
+/// `BMAP` — bmap btree block magic (v4, long-form pointers, no CRC).
+pub const XFS_BMAP_MAGIC: u32 = 0x424D_4150;
+
+/// `BMA3` — bmap btree block magic (v5, long-form pointers, CRC).
+pub const XFS_BMAP_CRC_MAGIC: u32 = 0x424D_4133;
+
+/// Long-form (v4 without CRC) bmap btree block header size:
+/// `magic(4) + level(2) + numrecs(2) + leftsib(8) + rightsib(8)` = 24 bytes.
+pub const XFS_BTREE_LBLOCK_LEN: usize = 24;
+
+/// Long-form CRC (v5) bmap btree block header size. v4 header (24) plus
+/// `blkno(8) + lsn(8) + uuid(16) + owner(8) + crc(4) + pad(4)` = 72 bytes.
+pub const XFS_BTREE_LBLOCK_CRC_LEN: usize = 72;
+
+/// `NULLFSBLOCK` — sentinel for "no sibling / no child" in btree pointers.
+pub const NULLFSBLOCK: u64 = u64::MAX;
+
 /// Decoded extent record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct XfsBmbtIrec {

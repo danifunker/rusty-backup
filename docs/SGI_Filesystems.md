@@ -692,7 +692,111 @@ directory: `core.format = 2` and `core.nextents > 1` → leaf format.
 
 ---
 
-### Step 8 — Physical-disk verification & sector-alignment audit
+### Step 7b — Modern XFS (v5 / CRC / dir3) support
+
+**Goal:** read XFS volumes produced by modern `mkfs.xfs` — the v5/CRC
+superblock format. This is the format any disk created on a current Linux
+kernel uses; v4 is now IRIX-only. Routing for MBR 0x83 / GPT
+"Linux Filesystem" GUID landed earlier (see `fs/mod.rs` — Step A), so once
+the v5 parsers compile, browse should "just work" against `xfs_volume.chd`
+and any modern-Linux XFS partition on MBR or GPT.
+
+**Branch:** `add-xfs-v5-support`
+
+**Reference:** `~/xfs-efs/refs/xfs-modern/xfs/libxfs/` — same tree we
+already use for v4. v5 is what those files were written for; v4 is the
+fallback path. The "XFS Algorithms & Data Structures" PDF covers v5/dir3
+in chapters 5–9.
+
+**Verification target:** `~/xfs-efs/xfs_volume.chd` (extracted to
+`/tmp/xfs_modern.img` via `chdman extractraw`). Confirmed via
+`xfs_db -r -c 'sb 0' -c 'p'`:
+- `versionnum=0xb4b5`, lower nibble = 5 → v5/CRC.
+- `blocksize=4096`, `inodesize=512`, `inopblock=8`, `agcount=4`,
+  `agblocks=19200`, `rootino=128`, `agblklog=15`, `inopblog=3`.
+- features bits typical of modern mkfs defaults (CRC, nrext64=0, FTYPE).
+
+This is a bare XFS volume — no partition table — so the existing
+superfloppy / auto-detect path (type byte 0) is what routes here once the
+v5 sb is accepted.
+
+**On-disk differences from v4 (all already documented in `xfs_format.h`):**
+- **Superblock** grows past the v4 `sb_bad_features2` field. New fields:
+  `sb_features_compat`, `sb_features_ro_compat`, `sb_features_incompat`,
+  `sb_features_log_incompat`, `sb_crc`, `sb_spino_align`, `sb_pquotino`,
+  `sb_lsn`, `sb_meta_uuid`. Total v5 sb ≈ 264 bytes (vs. v4's 208).
+- **Inode core** grows from 100 bytes to 176 bytes. New fields after
+  `di_next_unlinked`: `di_crc` (LE32), `di_changecount`, `di_lsn`,
+  `di_flags2`, `di_cowextsize`, `di_pad2[12]`, `di_crtime`, `di_ino`,
+  `di_uuid`. Fork data starts at offset **176**, not 100.
+- **Directory blocks** use the "dir3" magic family and a 56-byte
+  `xfs_dir3_blk_hdr` (magic + crc + blkno + lsn + uuid + owner) in
+  place of the 16-byte v4 `xfs_dir2_data_hdr`. Data entries inside
+  shift by +40 bytes. Magics:
+  - `XDB3` (`0x58444233`) — single-block dir3 (was `XD2B`)
+  - `XDD3` (`0x58444433`) — data block in larger dir3 (was `XD2D`)
+  - `XDL3` (`0x58444C33`) — leaf-1 dir3 (was `XD2L` / `XD2F`)
+  - `XDN3` (`0x5844334E`) — node dir3 (was `XD2N`)
+- **Extent records** unchanged (same `xfs_bmbt_disk_get_all` decode).
+- **Shortform** layout unchanged (`xfs_dir2_sf_*` is dir2/dir3 agnostic;
+  FTYPE handling already implemented).
+- **Realtime / log** unchanged; we already reject realtime.
+
+**CRCs are not verified.** We read past them; integrity is the user's
+responsibility (they can run `xfs_repair -n` separately).
+
+**Files:**
+- `src/fs/xfs/sb.rs` — accept v5; parse the trailing feature words; reject
+  realtime + unsupported incompat bits (`SPINODES`, `META_UUID`, `REFLINK`,
+  `RMAPBT`, `FINOBT`, `META_DIR` if they affect read paths).
+- `src/fs/xfs/inode.rs` — add a `core_size` accessor (100 for v4, 176 for
+  v5) so `data_fork()` knows where the fork starts.
+- `src/fs/xfs/dir2.rs` — accept `XDB3` magic in `parse_block`, skip the
+  extra 40 bytes of v5 header, and feed the data-entry walker the same
+  layout as v4 (entries themselves are byte-identical post-header).
+- `src/fs/xfs/types.rs` — extend `DiFormat` if v5 ever introduces new
+  format values we care about (currently no).
+
+**Tasks:**
+1. **sb.rs**: switch from a hard "v5 reject" to a "v5 accept with feature-
+   bit triage". Allow CRC, FTYPE, NREXT64=0, ATTR2, FREE_INODE_BTREE.
+   Reject (with a clear message) NREXT64=1, REFLINK, RMAPBT, RT inodes.
+2. **inode.rs**: switch the fork-offset constant to a method that returns
+   100 or 176 based on the parsed sb version. Inode magic is unchanged
+   (`IN`); the core parser already stops at offset 96 so it's
+   version-agnostic — only `data_fork()` needs the new offset.
+3. **dir2.rs**: in `parse_block`, accept `XDB3`. After matching, skip the
+   first 56 bytes of header instead of 16 before walking entries. Keep
+   the v4 path untouched.
+4. **mod.rs**: thread the sb version through to `data_fork`; flip the
+   "XFS dir format" log to also report v4 vs v5 ("XFS v5 / dir3" vs
+   "XFS v4 / dir2" vs "XFS v4 / dir1").
+
+**Tests:**
+- New unit: v5 sb parse + dir3 block parse on hand-built buffers.
+- Integration: open `/tmp/xfs_modern.img`, list `/`, read a known file
+  byte-for-byte against `xfs_db -c 'inode N' -c 'dblock M'` output.
+- Regression: every v4 test still passes (dir2 fixture, dir1 synthetic,
+  SGI sample disk).
+
+**Acceptance:** `xfs_volume.chd` lists `/` and extracts a known file.
+The MBR-0x83 and GPT-Linux-Filesystem routing tests added in Step A
+continue to pass — and now reach a successful open instead of a v5
+rejection.
+
+---
+
+### Step 8 — Physical-disk verification & sector-alignment audit — DONE (skipped)
+
+Marked done without execution. Rationale: the aligned-read helper
+(`read_at_aligned` in `src/fs/xfs/mod.rs` and `src/fs/efs.rs`) is already
+used throughout both modules, and SGI users in practice clone their SCSI
+drives with a BlueSCSI rather than attaching the physical disk to a
+modern host, so the raw-`/dev/rdiskN` path is not a realistic workflow
+for this audience. Bounce-buffer regression test and physical-disk
+matrix intentionally skipped.
+
+### Step 8 (original plan, for reference)
 
 **Goal:** prove the implementation works end-to-end on a real (or
 emulated-as-physical) SGI disk. This is mostly verification with a small
@@ -721,7 +825,13 @@ on at least macOS + Linux. The bounce-buffer test passes.
 
 ---
 
-### Step 9 — Inspect/browse GUI surface verification
+### Step 9 — Inspect/browse GUI surface verification — DONE
+
+Manually verified by Dani: `irix65.chd` and an EFS image both walk
+cleanly through the partition list, Inspect tab, Browse view, and file
+extraction. No GUI changes required.
+
+### Step 9 (original plan, for reference)
 
 **Goal:** confirm the GUI works without GUI code changes (which is the
 point — type-byte routing should mean it Just Works). Add only the

@@ -55,6 +55,15 @@ pub struct BackupTab {
     >,
     /// Open file handle for the source (kept alive so min-size workers can clone it).
     source_file: Option<Arc<File>>,
+    /// Human-readable description of the partition table type for the
+    /// currently-loaded source (e.g. "MBR", "GPT", "APM"). Shown above
+    /// the partition list.
+    source_partition_table_desc: Option<String>,
+    /// When the user clicks Start Backup with `resize_partitions` on but one
+    /// or more selected partitions still need their min-size walked, we
+    /// fire those calcs and arm this flag. As soon as the pending set is
+    /// empty `show()` clears the flag and calls `start_backup` for real.
+    pending_backup_after_min_sizes: bool,
     partition_load_error: Option<String>,
     /// Change detection for auto-load
     prev_device_idx: Option<usize>,
@@ -131,6 +140,8 @@ impl Default for BackupTab {
             deferred_min_sizes: std::collections::HashMap::new(),
             pending_min_size_calcs: std::collections::HashMap::new(),
             source_file: None,
+            source_partition_table_desc: None,
+            pending_backup_after_min_sizes: false,
             partition_load_error: None,
             prev_device_idx: None,
             prev_image_path: None,
@@ -149,6 +160,16 @@ impl BackupTab {
 
         // Poll any pending per-partition minimum-size calculations
         self.poll_min_size_calcs(ctx);
+
+        // If the user clicked Start Backup while min-size calcs were still
+        // pending, kick off the real backup as soon as the last one lands.
+        if self.pending_backup_after_min_sizes
+            && self.pending_min_size_calcs.is_empty()
+            && !self.backup_running
+        {
+            self.pending_backup_after_min_sizes = false;
+            self.start_backup(ctx);
+        }
 
         ui.heading("Backup Disk");
         ui.add_space(8.0);
@@ -225,8 +246,38 @@ impl BackupTab {
         }
 
         // Show partition selection checkboxes
+        // For devices we don't auto-scan (would prompt for elevation on every
+        // dropdown change). Offer a button to load partitions on demand.
+        if !self.backup_running
+            && self.source_partitions.is_empty()
+            && self.partition_load_error.is_none()
+            && self.selected_device_idx.is_some()
+            && self.image_file_path.is_none()
+        {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui.button("Load partition info").on_hover_text(
+                    "Read the partition table from the selected device (may prompt for administrator credentials)",
+                ).clicked() {
+                    self.scan_source_partitions(ctx);
+                }
+            });
+        }
+
         if !self.source_partitions.is_empty() {
             ui.add_space(4.0);
+            if let Some(desc) = &self.source_partition_table_desc {
+                ui.label(format!(
+                    "Partition table: {} ({} partition{})",
+                    desc,
+                    self.source_partitions.len(),
+                    if self.source_partitions.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                ));
+            }
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Partitions:").strong());
                 ui.add_enabled_ui(controls_enabled, |ui| {
@@ -242,31 +293,83 @@ impl BackupTab {
                     }
                 });
             });
+            let mut min_size_calc_request: Option<usize> = None;
             ui.add_enabled_ui(controls_enabled, |ui| {
-                for part in &self.source_partitions {
-                    if part.is_extended_container {
-                        continue;
-                    }
-                    let mut selected = self.selected_partitions.contains(&part.index);
-                    let label = format!(
-                        "#{}: {} ({})",
-                        part.index,
-                        part.type_name,
-                        partition::format_size(part.size_bytes),
-                    );
-                    if ui.checkbox(&mut selected, label).changed() {
-                        if selected {
-                            self.selected_partitions.insert(part.index);
-                        } else {
-                            self.selected_partitions.remove(&part.index);
+                egui::Grid::new("backup_partitions_grid")
+                    .num_columns(5)
+                    .spacing([12.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("Include").strong());
+                        ui.label(egui::RichText::new("#").strong());
+                        ui.label(egui::RichText::new("Type").strong());
+                        ui.label(egui::RichText::new("Size").strong());
+                        ui.label(egui::RichText::new("Min Size").strong());
+                        ui.end_row();
+
+                        for part in &self.source_partitions {
+                            if part.is_extended_container {
+                                continue;
+                            }
+                            let mut selected = self.selected_partitions.contains(&part.index);
+                            if ui.checkbox(&mut selected, "").changed() {
+                                if selected {
+                                    self.selected_partitions.insert(part.index);
+                                } else {
+                                    self.selected_partitions.remove(&part.index);
+                                }
+                            }
+                            ui.label(format!("{}", part.index));
+                            ui.label(&part.type_name);
+                            ui.label(partition::format_size(part.size_bytes));
+
+                            // Min-size cell: value, spinner, "Calc min" button,
+                            // or blank.
+                            if let Some(min) = self
+                                .partition_min_sizes
+                                .get(&part.index)
+                                .copied()
+                                .filter(|&sz| sz < part.size_bytes)
+                            {
+                                ui.label(partition::format_size(min));
+                            } else if let Some(pending) =
+                                self.pending_min_size_calcs.get(&part.index)
+                            {
+                                let phase = pending
+                                    .lock()
+                                    .map(|s| s.phase.clone())
+                                    .unwrap_or_else(|_| "...".to_string());
+                                ui.add(egui::Spinner::new()).on_hover_text(phase);
+                            } else if self.deferred_min_sizes.contains_key(&part.index) {
+                                if ui
+                                    .small_button("Calc min")
+                                    .on_hover_text(
+                                        "Compute minimum size (requires a filesystem walk)",
+                                    )
+                                    .clicked()
+                                {
+                                    min_size_calc_request = Some(part.index);
+                                }
+                            } else {
+                                ui.label("");
+                            }
+                            ui.end_row();
                         }
-                    }
-                }
+                    });
             });
+            if let Some(idx) = min_size_calc_request {
+                self.start_min_size_calc(idx, ctx);
+            }
             ui.add_space(4.0);
         }
         if let Some(err) = &self.partition_load_error {
             ui.colored_label(egui::Color32::from_rgb(200, 150, 100), err);
+        }
+
+        // Keep the UI ticking while background min-size workers run so the
+        // spinner animates and results appear without requiring mouse input.
+        if !self.pending_min_size_calcs.is_empty() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(80));
         }
 
         // Destination folder
@@ -412,8 +515,14 @@ impl BackupTab {
                     && has_partitions
                     && chd_ok;
 
+                let button_label = if self.pending_backup_after_min_sizes {
+                    "Computing minimum sizes..."
+                } else {
+                    "Start Backup"
+                };
+                let button_enabled = can_start && !self.pending_backup_after_min_sizes;
                 if ui
-                    .add_enabled(can_start, egui::Button::new("Start Backup"))
+                    .add_enabled(button_enabled, egui::Button::new(button_label))
                     .clicked()
                 {
                     if self.compression_type == CompressionType::Vhd {
@@ -423,8 +532,30 @@ impl BackupTab {
                         }
                         self.init_vhd_configs();
                         self.vhd_popup_open = true;
+                    } else if self.compression_type == CompressionType::Chd
+                        && !self.sector_by_sector
+                        && self.resize_partitions
+                        && self.has_deferred_selected_partitions()
+                    {
+                        // Resize-to-min was requested but one or more selected
+                        // partitions still need a filesystem walk. Fire those
+                        // calcs now; the poll loop in show() will call
+                        // start_backup once they all land.
+                        self.kick_off_pending_min_size_calcs(ctx);
+                        self.pending_backup_after_min_sizes = true;
                     } else {
                         self.start_backup(ctx);
+                    }
+                }
+                if self.pending_backup_after_min_sizes {
+                    ui.add(egui::Spinner::new())
+                        .on_hover_text("Waiting for minimum-size calculations to finish");
+                    if ui.button("Cancel").clicked() {
+                        // Calcs already running keep running (their results
+                        // still populate `partition_min_sizes` and are useful
+                        // later); we just stop auto-launching the backup.
+                        self.pending_backup_after_min_sizes = false;
+                        ctx.log.info("Auto-backup canceled; minimum-size calculations will still complete in the background");
                     }
                 }
             } else {
@@ -692,6 +823,39 @@ impl BackupTab {
         }
     }
 
+    /// True if any selected (non-extended) partition has a deferred minimum
+    /// size that hasn't been computed yet. Used to decide whether to fire
+    /// background calcs before kicking off a resize-to-minimum CHD backup.
+    fn has_deferred_selected_partitions(&self) -> bool {
+        self.source_partitions.iter().any(|part| {
+            !part.is_extended_container
+                && self.selected_partitions.contains(&part.index)
+                && !self.partition_min_sizes.contains_key(&part.index)
+                && self.deferred_min_sizes.contains_key(&part.index)
+        })
+    }
+
+    /// Fire `start_min_size_calc` for every selected partition that still
+    /// has a deferred min size and isn't already running. Safe to call when
+    /// some calcs are already in flight — duplicates are filtered out by
+    /// `start_min_size_calc` itself.
+    fn kick_off_pending_min_size_calcs(&mut self, ctx: &mut TabContext) {
+        let indices: Vec<usize> = self
+            .source_partitions
+            .iter()
+            .filter(|p| {
+                !p.is_extended_container
+                    && self.selected_partitions.contains(&p.index)
+                    && !self.partition_min_sizes.contains_key(&p.index)
+                    && self.deferred_min_sizes.contains_key(&p.index)
+            })
+            .map(|p| p.index)
+            .collect();
+        for idx in indices {
+            self.start_min_size_calc(idx, ctx);
+        }
+    }
+
     /// Spawn a worker thread to compute the minimum size for a deferred partition.
     fn start_min_size_calc(&mut self, part_index: usize, ctx: &mut TabContext) {
         if self.pending_min_size_calcs.contains_key(&part_index) {
@@ -768,34 +932,50 @@ impl BackupTab {
                         ctx.log.error(format!(
                             "Minimum size calculation failed for partition {idx}: {err}",
                         ));
-                    } else if let Some(min) = s.defragmented_min.or(s.result) {
-                        let part_size = self
-                            .source_partitions
-                            .iter()
-                            .find(|p| p.index == idx)
-                            .map(|p| p.size_bytes)
-                            .unwrap_or(min);
-                        let clamped = min.min(part_size);
-                        self.partition_min_sizes.insert(idx, clamped);
-                        ctx.log.info(format!(
-                            "Partition {idx}: minimum size {} (computed{})",
-                            partition::format_size(clamped),
-                            if s.defragmented_min.is_some() {
-                                ", defragmented floor"
+                    } else {
+                        let part = self.source_partitions.iter().find(|p| p.index == idx);
+                        let (part_size, ptype, pstring) = part
+                            .map(|p| {
+                                (
+                                    p.size_bytes,
+                                    p.partition_type_byte,
+                                    p.partition_type_string.clone(),
+                                )
+                            })
+                            .unwrap_or((u64::MAX, 0, None));
+                        let chosen = fs::pick_shrink_target(
+                            ptype,
+                            pstring.as_deref(),
+                            s.result,
+                            s.defragmented_min,
+                        );
+                        if let Some(min) = chosen {
+                            let clamped = min.min(part_size);
+                            self.partition_min_sizes.insert(idx, clamped);
+                            let is_layout = fs::is_layout_preserving_fs(ptype, pstring.as_deref());
+                            let suffix = if is_layout {
+                                " (in-place trim; defragmented shrink not yet supported for this FS)"
+                            } else if s.defragmented_min.is_some() {
+                                " (defragmented floor)"
                             } else {
                                 ""
-                            },
-                        ));
-                        for cfg in &mut self.vhd_partition_configs {
-                            if cfg.index == idx {
-                                cfg.minimum_size = clamped;
-                                cfg.deferred_fs = None;
+                            };
+                            ctx.log.info(format!(
+                                "Partition {idx}: minimum size {} (computed){}",
+                                partition::format_size(clamped),
+                                suffix,
+                            ));
+                            for cfg in &mut self.vhd_partition_configs {
+                                if cfg.index == idx {
+                                    cfg.minimum_size = clamped;
+                                    cfg.deferred_fs = None;
+                                }
                             }
+                        } else {
+                            ctx.log.info(format!(
+                                "Partition {idx}: filesystem could not be opened for minimum-size calculation",
+                            ));
                         }
-                    } else {
-                        ctx.log.info(format!(
-                            "Partition {idx}: filesystem could not be opened for minimum-size calculation",
-                        ));
                     }
                 }
                 self.deferred_min_sizes.remove(&idx);
@@ -812,6 +992,7 @@ impl BackupTab {
         self.deferred_min_sizes.clear();
         self.pending_min_size_calcs.clear();
         self.source_file = None;
+        self.source_partition_table_desc = None;
         self.partition_load_error = None;
 
         let path = match self.source_path(ctx) {
@@ -868,6 +1049,7 @@ impl BackupTab {
                 } else {
                     table.type_name().to_string()
                 };
+                self.source_partition_table_desc = Some(table_desc.clone());
                 ctx.log.info(format!(
                     "Found {} partition(s) ({})",
                     self.source_partitions.len(),
@@ -900,26 +1082,38 @@ impl BackupTab {
                             in_place,
                             defragmented,
                         } => {
-                            // Prefer the defragmented floor when present:
-                            // CHD backups now always pack allocated clusters
-                            // at the start of the partition extent, so the
-                            // defragmented minimum is achievable for the
-                            // shrink path. Falls back to in_place for legacy
-                            // packed paths and per-partition VHD output.
-                            let chosen = defragmented.or(in_place);
+                            // Layout-preserving filesystems (HFS+, ext, etc.)
+                            // get the in-place trim point — the only target
+                            // achievable without a defragmenting writer. The
+                            // packing filesystems (FAT/NTFS/exFAT) can use
+                            // the defragmented value because their compact
+                            // reader actually repacks during the write.
+                            let chosen = fs::pick_shrink_target(
+                                part.partition_type_byte,
+                                part.partition_type_string.as_deref(),
+                                in_place,
+                                defragmented,
+                            );
                             if let Some(min_size) = chosen {
                                 let clamped = min_size.min(part.size_bytes);
                                 self.partition_min_sizes.insert(part.index, clamped);
+                                let is_layout = fs::is_layout_preserving_fs(
+                                    part.partition_type_byte,
+                                    part.partition_type_string.as_deref(),
+                                );
+                                let suffix = if is_layout {
+                                    " (in-place trim; defragmented shrink not yet supported for this FS)"
+                                } else if defragmented.is_some() {
+                                    " (defragmented floor)"
+                                } else {
+                                    ""
+                                };
                                 ctx.log.info(format!(
-                                    "Partition {}: minimum size {} (original {}{})",
+                                    "Partition {}: minimum size {} (original {}){}",
                                     part.index,
                                     partition::format_size(clamped),
                                     partition::format_size(part.size_bytes),
-                                    if defragmented.is_some() {
-                                        ", defragmented floor"
-                                    } else {
-                                        ""
-                                    },
+                                    suffix,
                                 ));
                             }
                         }
@@ -947,6 +1141,10 @@ impl BackupTab {
     fn load_partition_preview(&mut self, ctx: &mut TabContext) {
         self.source_partitions.clear();
         self.selected_partitions.clear();
+        self.partition_min_sizes.clear();
+        self.deferred_min_sizes.clear();
+        self.pending_min_size_calcs.clear();
+        self.source_partition_table_desc = None;
         self.partition_load_error = None;
 
         let path = match self.source_path(ctx) {
@@ -1013,11 +1211,88 @@ impl BackupTab {
                         } else {
                             table.type_name().to_string()
                         };
+                        self.source_partition_table_desc = Some(table_desc.clone());
                         ctx.log.info(format!(
                             "Source has {} partition(s) ({})",
                             self.source_partitions.len(),
                             table_desc,
                         ));
+
+                        // Compute cheap minimum sizes, defer expensive ones.
+                        // Re-open the file for each probe so each partition's
+                        // call gets an independent seek cursor; format wrapping
+                        // (DMG/VHDX dynamic) is intentionally skipped here —
+                        // raw VHD and plain images have their tables at the
+                        // expected offsets.
+                        for part in &self.source_partitions {
+                            if part.is_extended_container {
+                                continue;
+                            }
+                            let probe_reader = match File::open(&path) {
+                                Ok(f) => BufReader::new(f),
+                                Err(_) => continue,
+                            };
+                            let offset = part.start_lba * 512;
+                            let result = fs::partition_minimum_size(
+                                probe_reader,
+                                offset,
+                                part.partition_type_byte,
+                                part.partition_type_string.as_deref(),
+                                part.size_bytes,
+                                false,
+                                &|_| {},
+                            );
+                            match result {
+                                fs::MinimumResult::Computed {
+                                    in_place,
+                                    defragmented,
+                                } => {
+                                    let chosen = fs::pick_shrink_target(
+                                        part.partition_type_byte,
+                                        part.partition_type_string.as_deref(),
+                                        in_place,
+                                        defragmented,
+                                    );
+                                    if let Some(min_size) = chosen {
+                                        let clamped = min_size.min(part.size_bytes);
+                                        self.partition_min_sizes.insert(part.index, clamped);
+                                        let is_layout = fs::is_layout_preserving_fs(
+                                            part.partition_type_byte,
+                                            part.partition_type_string.as_deref(),
+                                        );
+                                        let suffix = if is_layout {
+                                            " (in-place trim; defragmented shrink not yet supported for this FS)"
+                                        } else if defragmented.is_some() {
+                                            " (defragmented floor)"
+                                        } else {
+                                            ""
+                                        };
+                                        ctx.log.info(format!(
+                                            "Partition {}: minimum size {} (original {}){}",
+                                            part.index,
+                                            partition::format_size(clamped),
+                                            partition::format_size(part.size_bytes),
+                                            suffix,
+                                        ));
+                                    }
+                                }
+                                fs::MinimumResult::Deferred { fs_name } => {
+                                    ctx.log.info(format!(
+                                        "Partition {}: need to calculate minimum size due to filesystem {fs_name} (click \"Calc min\" to compute)",
+                                        part.index,
+                                    ));
+                                    self.deferred_min_sizes.insert(part.index, fs_name);
+                                }
+                            }
+                        }
+
+                        // Stash an unwrapped raw handle so the worker thread
+                        // can clone it later. For image files this is the raw
+                        // (still-wrapped) file; the worker will re-detect the
+                        // format if needed.
+                        if let Ok(f) = File::open(&path) {
+                            self.source_file = Some(Arc::new(f));
+                        }
                     }
                     Err(e) => {
                         self.partition_load_error =

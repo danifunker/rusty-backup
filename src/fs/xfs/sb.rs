@@ -1,5 +1,9 @@
-//! XFS v4 superblock parser. v5/CRC and realtime-device filesystems are
-//! rejected with a clear error per the Step 5 plan.
+//! XFS superblock parser. v4 (IRIX, older Linux) and v5/CRC (modern Linux)
+//! are both accepted; we reject realtime volumes and a small set of v5
+//! incompat features that change on-disk layouts we don't speak (NREXT64,
+//! NEEDSREPAIR, METADIR, ZONED).
+//!
+//! Reference: `~/xfs-efs/refs/xfs-modern/xfs/libxfs/xfs_format.h`.
 
 use byteorder::{BigEndian, ByteOrder};
 
@@ -8,6 +12,12 @@ use super::types::{
     XFS_SB_VERSION_NUMBITS,
 };
 use crate::fs::filesystem::FilesystemError;
+
+// v5 incompat feature bits we explicitly reject (read path can't cope).
+const XFS_SB_FEAT_INCOMPAT_NEEDSREPAIR: u32 = 1 << 4;
+const XFS_SB_FEAT_INCOMPAT_NREXT64: u32 = 1 << 5;
+const XFS_SB_FEAT_INCOMPAT_METADIR: u32 = 1 << 8;
+const XFS_SB_FEAT_INCOMPAT_ZONED: u32 = 1 << 9;
 
 /// Parsed XFS superblock. Only the fields Step 5 needs to look up the root
 /// inode (and a few cosmetic fields for `fs_type` / `volume_label`).
@@ -56,11 +66,7 @@ impl XfsSuperblock {
         }
         let versionnum = BigEndian::read_u16(&buf[100..102]);
         let version = versionnum & XFS_SB_VERSION_NUMBITS;
-        if version == XFS_SB_VERSION_5 {
-            return Err(FilesystemError::Unsupported(
-                "v5 XFS (CRC-enabled) not supported — IRIX disks are v4".into(),
-            ));
-        }
+        let is_v5 = version == XFS_SB_VERSION_5;
         let rextents = BigEndian::read_u64(&buf[24..32]);
         if rextents > 0 {
             return Err(FilesystemError::Unsupported(
@@ -91,6 +97,23 @@ impl XfsSuperblock {
         let features_ro_compat = BigEndian::read_u32(&buf[212..216]);
         let features_incompat = BigEndian::read_u32(&buf[216..220]);
 
+        if is_v5 {
+            // We're a read-only consumer, so ro_compat features (FINOBT,
+            // RMAPBT, REFLINK, INOBTCNT) never block us. Only incompat bits
+            // that change inode/dir layouts we read are fatal.
+            const REJECT_MASK: u32 = XFS_SB_FEAT_INCOMPAT_NEEDSREPAIR
+                | XFS_SB_FEAT_INCOMPAT_NREXT64
+                | XFS_SB_FEAT_INCOMPAT_METADIR
+                | XFS_SB_FEAT_INCOMPAT_ZONED;
+            let bad = features_incompat & REJECT_MASK;
+            if bad != 0 {
+                return Err(FilesystemError::Unsupported(format!(
+                    "XFS v5 incompat features 0x{bad:08X} not supported \
+                     (NEEDSREPAIR/NREXT64/METADIR/ZONED)"
+                )));
+            }
+        }
+
         Ok(XfsSuperblock {
             magicnum,
             blocksize,
@@ -118,9 +141,15 @@ impl XfsSuperblock {
         })
     }
 
-    /// True iff the DIRV2 bit is set (dir2 layout).
+    /// True iff this is a v5 (CRC-enabled, dir3) filesystem.
+    pub fn is_v5(&self) -> bool {
+        (self.versionnum & XFS_SB_VERSION_NUMBITS) == XFS_SB_VERSION_5
+    }
+
+    /// True iff the DIRV2 bit is set (dir2 layout). v5 implies dir3 which is
+    /// dir2-derived, so this also returns true on v5.
     pub fn is_dir2(&self) -> bool {
-        self.versionnum & XFS_SB_VERSION_DIRV2BIT != 0
+        self.is_v5() || (self.versionnum & XFS_SB_VERSION_DIRV2BIT != 0)
     }
 
     pub fn dir_format(&self) -> DirFormat {
@@ -142,9 +171,16 @@ impl XfsSuperblock {
     /// after the name (before the alignment padding and the trailing tag).
     /// Modern `mkfs.xfs` defaults to enabling FTYPE even on v4 superblocks.
     pub fn has_ftype(&self) -> bool {
-        // XFS_SB_VERSION2_FTYPE — see libxfs/xfs_format.h.
+        // XFS_SB_VERSION2_FTYPE — see libxfs/xfs_format.h. On v5 the v4
+        // features2 bit isn't always populated; v5 carries FTYPE in
+        // features_incompat instead (XFS_SB_FEAT_INCOMPAT_FTYPE = 0x1).
         const XFS_SB_VERSION2_FTYPE: u32 = 0x0000_0200;
-        (self.features2 & XFS_SB_VERSION2_FTYPE) != 0
+        const XFS_SB_FEAT_INCOMPAT_FTYPE: u32 = 0x0000_0001;
+        if self.is_v5() {
+            (self.features_incompat & XFS_SB_FEAT_INCOMPAT_FTYPE) != 0
+        } else {
+            (self.features2 & XFS_SB_VERSION2_FTYPE) != 0
+        }
     }
 
     /// Volume label, trimmed of trailing NULs.
@@ -195,13 +231,34 @@ mod tests {
     }
 
     #[test]
-    fn rejects_v5_crc_filesystem() {
-        // versionnum low nibble = 5 → v5/CRC. DIRV2 bit set or not; doesn't matter.
+    fn accepts_v5_crc_filesystem() {
+        // versionnum low nibble = 5 → v5/CRC. We should now accept it
+        // when no incompatible features are set.
         let buf = build_minimal_sb(0x0005, 0);
+        let sb = XfsSuperblock::parse(&buf).expect("parse v5");
+        assert!(sb.is_v5());
+        // v5 implies dir3 (dir2-style), so is_dir2() must return true.
+        assert!(sb.is_dir2());
+    }
+
+    #[test]
+    fn rejects_v5_with_nrext64_feature() {
+        let mut buf = build_minimal_sb(0x0005, 0);
+        // features_incompat at offset 216, set NREXT64 (bit 5).
+        BigEndian::write_u32(&mut buf[216..220], 1 << 5);
         match XfsSuperblock::parse(&buf) {
-            Err(FilesystemError::Unsupported(msg)) => assert!(msg.contains("v5")),
-            other => panic!("expected Unsupported v5 error, got {other:?}"),
+            Err(FilesystemError::Unsupported(msg)) => assert!(msg.contains("NREXT64")),
+            other => panic!("expected Unsupported NREXT64, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn accepts_v5_with_ftype_incompat_bit() {
+        // v5 carries FTYPE in features_incompat, not features2.
+        let mut buf = build_minimal_sb(0x0005, 0);
+        BigEndian::write_u32(&mut buf[216..220], 1);
+        let sb = XfsSuperblock::parse(&buf).expect("parse v5");
+        assert!(sb.has_ftype());
     }
 
     #[test]
