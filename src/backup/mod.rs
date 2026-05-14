@@ -1455,13 +1455,43 @@ fn run_single_file_chd_path(
         }
     })));
 
-    let result = single_file_chd::run(
-        inputs,
-        &mut progress_cb,
-        &cancel_check,
-        &mut log_cb,
-        &mut checksum_phase_cb,
-    );
+    // Route to the new two-phase staging path when its gates accept the
+    // current inputs (MBR/GPT, no HFS+ clone targets, no FS-level
+    // resize). Otherwise fall back to the legacy direct-stream /
+    // scratch-tempfile path. The router lives here rather than inside
+    // `single_file_chd` so the log line surfaces in the GUI before any
+    // bytes flow.
+    let staging_reason = single_file_chd::staging_path_unsupported_reason(&inputs);
+    let result = match staging_reason {
+        None => {
+            log(
+                progress,
+                LogLevel::Info,
+                "Using two-phase CHD path (stage zstd partitions, then assemble)".to_string(),
+            );
+            single_file_chd::run_via_staging(
+                inputs,
+                &mut progress_cb,
+                &cancel_check,
+                &mut log_cb,
+                &mut checksum_phase_cb,
+            )
+        }
+        Some(reason) => {
+            log(
+                progress,
+                LogLevel::Info,
+                format!("Using legacy CHD path ({reason})"),
+            );
+            single_file_chd::run(
+                inputs,
+                &mut progress_cb,
+                &cancel_check,
+                &mut log_cb,
+                &mut checksum_phase_cb,
+            )
+        }
+    };
 
     fs::hfsplus_defrag::set_progress_sink(None);
     let result = result?;

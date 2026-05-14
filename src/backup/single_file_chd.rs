@@ -1977,6 +1977,45 @@ impl<R: Read> Read for TakeOrPad<R> {
     }
 }
 
+/// Pre-flight check: returns `None` when [`run_via_staging`] can handle
+/// the given inputs, otherwise `Some(reason)` describing the gate that
+/// rejected them. The caller (typically the CHD router in
+/// `run_backup`) uses this to decide whether to take the new staging
+/// path or fall back to [`run`] / [`run_with_resize`] during the
+/// multi-commit migration.
+///
+/// Kept in sync with the bail-outs at the top of [`run_via_staging`] —
+/// new staging-path gates land here too.
+pub fn staging_path_unsupported_reason(inputs: &SingleFileChdInputs<'_>) -> Option<&'static str> {
+    if !is_supported(inputs.partition_table) {
+        return Some("partition table type not supported");
+    }
+    if matches!(inputs.partition_table, PartitionTable::Apm(_)) {
+        return Some("APM head region support pending");
+    }
+    if inputs
+        .hfsplus_clone_targets
+        .map(|t| !t.is_empty())
+        .unwrap_or(false)
+    {
+        return Some("HFS+ defrag-clone targets not yet supported on staging path");
+    }
+    // FS-level resize check: synthesise the plan the same way
+    // run_via_staging does, then look for any size or offset change.
+    let plans = match build_resize_plans(inputs) {
+        Ok(Some(p)) => p,
+        Ok(None) => synthesize_noop_plans(inputs.partitions),
+        Err(_) => return Some("resize plan construction failed"),
+    };
+    if plans
+        .iter()
+        .any(|p| p.new_size_bytes != p.old_size_bytes || p.needs_data_move)
+    {
+        return Some("backup-time FS resize not yet supported on staging path");
+    }
+    None
+}
+
 /// Two-phase CHD backup: stage each partition into its own zstd file
 /// under a temp staging dir, then call [`assemble_from_staging`] to fold
 /// the staging files into a single `.chd`. Drop-in alternative to
