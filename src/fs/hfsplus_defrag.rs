@@ -423,6 +423,90 @@ pub fn set_progress_sink(cb: Option<Box<dyn FnMut(&str)>>) {
 /// Internal helper — emit a progress message to both stderr (for the
 /// `tee /tmp/rusty-backup-run.log` capture) and, if set, the thread-local
 /// progress sink (for the in-GUI log).
+/// Print a fragmentation summary for the captured HFS+ snapshot — number
+/// of files with each extent-count bucket, plus how many forks overflow
+/// the 8 inline extent descriptors into the extents-overflow B-tree.
+/// Diagnostic-only; doesn't change the defrag pipeline. Output goes to
+/// both stderr and the GUI progress sink so it lands in /tmp logs and
+/// the in-app log panel.
+fn emit_fragmentation_report(snapshot: &SourceCatalogSnapshot) {
+    let mut files_with_data: u64 = 0;
+    let mut total_data_bytes: u64 = 0;
+    let mut total_data_inline_extents: u64 = 0;
+    let mut bucket_one: u64 = 0;
+    let mut bucket_two_three: u64 = 0;
+    let mut bucket_four_eight: u64 = 0;
+    let mut files_with_overflow: u64 = 0;
+    let mut max_inline_extents: u32 = 0;
+
+    let mut analyze_fork = |fork_raw: &[u8; 80]| {
+        let logical = BigEndian::read_u64(&fork_raw[0..8]);
+        if logical == 0 {
+            return;
+        }
+        let total_blocks = BigEndian::read_u32(&fork_raw[12..16]);
+        let mut inline_extents: u32 = 0;
+        let mut inline_block_total: u32 = 0;
+        for i in 0..8 {
+            let off = 16 + i * 8;
+            let start = BigEndian::read_u32(&fork_raw[off..off + 4]);
+            let count = BigEndian::read_u32(&fork_raw[off + 4..off + 8]);
+            if count > 0 {
+                inline_extents += 1;
+                inline_block_total = inline_block_total.saturating_add(count);
+                let _ = start;
+            }
+        }
+        files_with_data += 1;
+        total_data_bytes = total_data_bytes.saturating_add(logical);
+        total_data_inline_extents += inline_extents as u64;
+        max_inline_extents = max_inline_extents.max(inline_extents);
+        match inline_extents {
+            0 | 1 => bucket_one += 1,
+            2..=3 => bucket_two_three += 1,
+            _ => bucket_four_eight += 1,
+        }
+        if total_blocks > inline_block_total {
+            files_with_overflow += 1;
+        }
+    };
+
+    for f in &snapshot.files {
+        analyze_fork(&f.data_fork_raw);
+    }
+
+    let avg = if files_with_data > 0 {
+        total_data_inline_extents as f64 / files_with_data as f64
+    } else {
+        0.0
+    };
+    let pct = |n: u64| -> f64 {
+        if files_with_data == 0 {
+            0.0
+        } else {
+            100.0 * n as f64 / files_with_data as f64
+        }
+    };
+    emit_progress(&format!(
+        "[fragmentation] {} files with data fork ({} MiB total); \
+         1 extent: {} ({:.1}%), 2-3 extents: {} ({:.1}%), \
+         4-8 extents: {} ({:.1}%); >8 extents (overflow B-tree): {} ({:.1}%); \
+         avg inline extents/file: {:.2}; max inline extents seen: {}",
+        files_with_data,
+        total_data_bytes / (1024 * 1024),
+        bucket_one,
+        pct(bucket_one),
+        bucket_two_three,
+        pct(bucket_two_three),
+        bucket_four_eight,
+        pct(bucket_four_eight),
+        files_with_overflow,
+        pct(files_with_overflow),
+        avg,
+        max_inline_extents,
+    ));
+}
+
 fn emit_progress(msg: &str) {
     eprintln!("{msg}");
     PROGRESS_SINK.with(|cell| {
@@ -953,6 +1037,7 @@ where
     W: Write,
 {
     let snapshot = SourceCatalogSnapshot::capture(source)?;
+    emit_fragmentation_report(&snapshot);
     let plan = plan_defrag_layout(&snapshot, target_size)
         .map_err(|e| FilesystemError::InvalidData(format!("defrag plan failed: {e}")))?;
     let meta = build_target_metadata(&plan, &snapshot)?;
