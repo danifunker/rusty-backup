@@ -2090,6 +2090,7 @@ pub fn run_via_staging(
     log_cb: &mut dyn FnMut(&str),
     checksum_phase_cb: &mut dyn FnMut(u64, u64),
     phase_cb: &mut dyn FnMut(&str),
+    defrag_log_sink: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
 ) -> Result<SingleFileChdResult> {
     if !is_supported(inputs.partition_table) {
         anyhow::bail!(
@@ -2165,6 +2166,7 @@ pub fn run_via_staging(
         cancel_check,
         log_cb,
         phase_cb,
+        defrag_log_sink.as_ref(),
     )?;
 
     // Phase 2: assemble the staged files into the final CHD.
@@ -2229,6 +2231,7 @@ fn stage_partitions_to_zst(
     cancel_check: &dyn Fn() -> bool,
     log_cb: &mut dyn FnMut(&str),
     phase_cb: &mut dyn FnMut(&str),
+    defrag_log_sink: Option<&std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
 ) -> Result<()> {
     let total_target: u64 = plans.iter().map(|p| p.new_size_bytes).sum();
     let mut bytes_done: u64 = 0;
@@ -2322,8 +2325,30 @@ fn stage_partitions_to_zst(
                 .context("clone source for HFS+ defrag-clone producer")?;
             let (mut writer, mut reader) = super::channel_pipe();
 
+            // Install the same [defrag-build] progress sink the main
+            // backup thread has — without it the catalog-walk ticks
+            // only reach stderr and the GUI log goes silent for
+            // minutes during build_target_metadata.
+            let producer_sink: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>> =
+                defrag_log_sink.cloned();
             let producer =
                 std::thread::spawn(move || -> Result<fs::hfsplus_defrag::DefragReport> {
+                    // Defensive: clear the thread-local on the way out
+                    // regardless of how this thread exits, so a future
+                    // OS-thread reuse can't inherit our sink.
+                    struct ClearSinkOnDrop;
+                    impl Drop for ClearSinkOnDrop {
+                        fn drop(&mut self) {
+                            fs::hfsplus_defrag::set_progress_sink(None);
+                        }
+                    }
+                    let _sink_guard = ClearSinkOnDrop;
+                    if let Some(sink) = producer_sink {
+                        let sink_for_install = sink.clone();
+                        fs::hfsplus_defrag::set_progress_sink(Some(Box::new(move |msg: &str| {
+                            sink_for_install(msg)
+                        })));
+                    }
                     match shape {
                         fs::DefragCloneShape::Flat => {
                             let br = std::io::BufReader::new(producer_clone);
@@ -3707,6 +3732,7 @@ mod tests {
             &mut log_cb,
             &mut |_, _| {},
             &mut |_| {},
+            None,
         )
         .expect("run_via_staging");
 
@@ -3820,6 +3846,7 @@ mod tests {
             &mut log_cb,
             &mut |_, _| {},
             &mut |_| {},
+            None,
         )
         .expect("APM run_via_staging");
         assert_eq!(
@@ -3910,6 +3937,7 @@ mod tests {
             &mut |_| {},
             &mut |_, _| {},
             &mut |_| {},
+            None,
         )
         .expect_err("invalid HFS+ source must surface a clone-producer error");
         let msg = format!("{err:#}");

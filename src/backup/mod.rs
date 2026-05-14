@@ -1471,6 +1471,21 @@ fn run_single_file_chd_path(
             p.operation = label.to_string();
         }
     };
+    // Send-able sink for HFS+ [defrag-build] ticks: the producer
+    // thread spawned by the staging path can clone this Arc and
+    // install it as its own thread-local sink, so catalog-walk
+    // progress reaches the GUI log even though the work runs on a
+    // worker thread.
+    let progress_for_defrag = progress.clone();
+    let defrag_log_sink: std::sync::Arc<dyn Fn(&str) + Send + Sync> =
+        std::sync::Arc::new(move |msg: &str| {
+            if let Ok(mut p) = progress_for_defrag.lock() {
+                p.log_messages.push_back(LogMessage {
+                    level: LogLevel::Info,
+                    message: msg.to_string(),
+                });
+            }
+        });
     let staging_reason = single_file_chd::staging_path_unsupported_reason(&inputs);
     let result = match staging_reason {
         None => {
@@ -1486,6 +1501,7 @@ fn run_single_file_chd_path(
                 &mut log_cb,
                 &mut checksum_phase_cb,
                 &mut phase_cb,
+                Some(defrag_log_sink),
             )
         }
         Some(reason) => {
