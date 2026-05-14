@@ -567,7 +567,15 @@ impl PrivilegedDiskAccess for LinuxDiskAccess {
 ///
 /// This function never returns on success - the current process is replaced.
 pub fn relaunch_with_elevation() -> Result<()> {
-    let current_exe = std::env::current_exe()?;
+    // Inside an AppImage, current_exe() points at the user-private FUSE
+    // mount under /tmp/.mount_*, which root cannot read — pkexec fails with
+    // "Permission denied" before the binary loads. The AppImage runtime
+    // exports APPIMAGE with the path of the actual .AppImage file; elevating
+    // that re-bootstraps the squashfs mount as root and works normally.
+    let target = match std::env::var_os("APPIMAGE") {
+        Some(p) => PathBuf::from(p),
+        None => std::env::current_exe()?,
+    };
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     // Check if pkexec is available
@@ -579,13 +587,15 @@ pub fn relaunch_with_elevation() -> Result<()> {
     if !pkexec_check.status.success() {
         anyhow::bail!(
             "pkexec not found. Please install policykit-1 or run manually: sudo {}",
-            current_exe.display()
+            target.display()
         );
     }
 
     // Preserve environment variables since pkexec strips the environment.
     // Display vars allow the elevated process to connect to X11/Wayland.
     // User identity vars allow resolving the real user's home/config paths.
+    // APPIMAGE/ARGV0 keep the elevated process aware that it's running from
+    // an AppImage so subsequent code paths (e.g. update check) behave correctly.
     let passthrough_vars = [
         "DISPLAY",
         "WAYLAND_DISPLAY",
@@ -593,6 +603,8 @@ pub fn relaunch_with_elevation() -> Result<()> {
         "XAUTHORITY",
         "XDG_RUNTIME_DIR",
         "HOME",
+        "APPIMAGE",
+        "ARGV0",
     ];
     let mut env_args: Vec<String> = Vec::new();
     for var in &passthrough_vars {
@@ -608,12 +620,12 @@ pub fn relaunch_with_elevation() -> Result<()> {
     env_args.push(format!("SUDO_UID={}", nix::unistd::getuid()));
     env_args.push(format!("SUDO_GID={}", nix::unistd::getgid()));
 
-    // Use "env" to inject variables, --keep-cwd to preserve working directory.
-    // Exec replaces current process - never returns on success
+    // Use "env" to inject variables. Exec replaces current process — never
+    // returns on success.
     let err = Command::new("pkexec")
         .arg("env")
         .args(&env_args)
-        .arg(&current_exe)
+        .arg(&target)
         .args(&args)
         .exec();
 

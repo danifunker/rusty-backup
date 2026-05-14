@@ -394,6 +394,54 @@ jobs:
 
           ls -lh "$OUTPATH"
 
+      - name: Smoke-test AppImage elevation path
+        # Catches the regression where relaunch_with_elevation() hands pkexec
+        # the user-private FUSE-mounted binary (/tmp/.mount_*/...) instead of
+        # the .AppImage file itself — pkexec then fails with "Permission
+        # denied" before the GUI loads. We install a fake pkexec that records
+        # its argv, run the AppImage as a non-root user, and assert pkexec
+        # was invoked with the .AppImage path (not a FUSE mount path).
+        # arm64 jobs run on Ubuntu hosts but inside the same Arch container.
+        if: matrix.arch == 'x64'
+        run: |
+          VERSION="${{ needs.generate-version.outputs.version }}"
+          APPIMAGE_PATH="$PWD/dist/Rusty-Backup-linux-${{ matrix.arch }}-${VERSION}.AppImage"
+          test -x "$APPIMAGE_PATH"
+
+          # Fake pkexec: log argv to a world-readable file, exit non-zero so
+          # the AppImage falls through to running unprivileged.
+          LOG=/tmp/pkexec-argv.log
+          : > "$LOG" && chmod 666 "$LOG"
+          cat > /usr/local/bin/pkexec <<EOF
+          #!/bin/sh
+          printf '%s\n' "\$*" >> $LOG
+          exit 1
+          EOF
+          chmod 755 /usr/local/bin/pkexec
+
+          # Run AppImage as an unprivileged user so the elevation path triggers.
+          useradd -m -s /bin/bash smoketest || true
+          chown smoketest:smoketest "$APPIMAGE_PATH"
+          runuser -u smoketest -- timeout 10 "$APPIMAGE_PATH" > smoke.out 2>&1 || true
+
+          echo "--- AppImage output ---"
+          cat smoke.out || true
+          echo "--- pkexec argv log ---"
+          cat "$LOG" || true
+
+          if ! grep -qE '\.AppImage( |$)' "$LOG"; then
+            echo "FAIL: pkexec was not invoked with the .AppImage path"
+            echo "Likely regression: relaunch_with_elevation() is using current_exe() instead of \$APPIMAGE"
+            exit 1
+          fi
+          if grep -qE '/tmp/\.mount_[^ ]+/(usr/)?bin/rusty-backup' "$LOG"; then
+            echo "FAIL: pkexec received a FUSE-mounted path — this is the original bug"
+            exit 1
+          fi
+          echo "PASS: pkexec received the .AppImage path"
+
+          rm -f /usr/local/bin/pkexec
+
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
