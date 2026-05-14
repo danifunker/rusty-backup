@@ -1,12 +1,109 @@
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
 use super::ChecksumType;
 
 const READ_BUF_SIZE: usize = 1024 * 1024; // 1 MB
+
+/// Running-hash state shared between a [`ChecksumReader`] and the code
+/// that finalises the digest after the reader has been consumed. Wrap
+/// in `Arc<Mutex<>>` so the reader (often owned by a downstream
+/// consumer like a stream builder) can update the hash while the
+/// orchestrator retains a handle to extract the final digest at the
+/// end of the operation.
+pub enum RunningHasher {
+    Sha256(sha2::Sha256),
+    Crc32(crc32fast::Hasher),
+}
+
+impl RunningHasher {
+    pub fn new(checksum_type: ChecksumType) -> Self {
+        match checksum_type {
+            ChecksumType::Sha256 => {
+                use sha2::Digest;
+                RunningHasher::Sha256(sha2::Sha256::new())
+            }
+            ChecksumType::Crc32 => RunningHasher::Crc32(crc32fast::Hasher::new()),
+        }
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        match self {
+            RunningHasher::Sha256(h) => {
+                use sha2::Digest;
+                h.update(data);
+            }
+            RunningHasher::Crc32(h) => h.update(data),
+        }
+    }
+
+    /// Consume the hasher and return the hex-encoded digest. After
+    /// calling this the hasher must be replaced before further use;
+    /// the caller usually drops it.
+    pub fn finalize_hex(self) -> String {
+        match self {
+            RunningHasher::Sha256(h) => {
+                use sha2::Digest;
+                h.finalize().iter().map(|b| format!("{:02x}", b)).collect()
+            }
+            RunningHasher::Crc32(h) => format!("{:08x}", h.finalize()),
+        }
+    }
+}
+
+/// `Read` adapter that updates a shared [`RunningHasher`] on every
+/// successful read. Used to "tee" bytes flowing through a compression
+/// pipeline so the orchestrator can record the input bytes' checksum
+/// without a second read pass after the encoder finishes.
+///
+/// The hasher is `Arc<Mutex<>>` because the reader is typically moved
+/// into a downstream consumer (e.g. a stream builder), so the
+/// orchestrator can't recover ownership directly — it shares the
+/// hasher with the reader and finalises it after the consumer
+/// returns.
+pub struct ChecksumReader<R: Read> {
+    inner: R,
+    hasher: Arc<Mutex<Option<RunningHasher>>>,
+}
+
+impl<R: Read> ChecksumReader<R> {
+    pub fn new(inner: R, hasher: Arc<Mutex<Option<RunningHasher>>>) -> Self {
+        Self { inner, hasher }
+    }
+}
+
+impl<R: Read> Read for ChecksumReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            if let Ok(mut guard) = self.hasher.lock() {
+                if let Some(h) = guard.as_mut() {
+                    h.update(&buf[..n]);
+                }
+            }
+        }
+        Ok(n)
+    }
+}
+
+/// Finalise a shared hasher and return its hex digest. The hasher slot
+/// is emptied; calling this twice on the same handle returns an empty
+/// string the second time (so missing-tee bugs show up loudly in
+/// tests). Used after the consumer that owned the corresponding
+/// [`ChecksumReader`] has been dropped or returned.
+pub fn finalize_shared_hasher(handle: &Arc<Mutex<Option<RunningHasher>>>) -> String {
+    let Ok(mut guard) = handle.lock() else {
+        return String::new();
+    };
+    match guard.take() {
+        Some(h) => h.finalize_hex(),
+        None => String::new(),
+    }
+}
 
 /// Compute a checksum over the file at `path`.
 /// Returns the hex-encoded checksum string.

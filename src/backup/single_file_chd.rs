@@ -34,6 +34,7 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 
@@ -704,14 +705,37 @@ impl Read for PositionedSegmentReader {
     }
 }
 
-/// Open the freshly-written CHD, compute the per-partition checksum for
-/// each byte range using `checksum_type`, and return the CHD's own SHA1
-/// (as `chdman info` would print).
+/// Read the CHD container's own SHA-1 from its header (the value
+/// `chdman info` prints). Free — libchdman parses it out of the file
+/// metadata without decompressing any hunks.
+fn read_container_sha1(chd_path: &Path) -> Result<String> {
+    let info = libchdman_rs::Chd::open(
+        chd_path
+            .to_str()
+            .ok_or_else(|| anyhow!("CHD path is not valid UTF-8: {}", chd_path.display()))?,
+        false,
+        None,
+    )
+    .map_err(|e| anyhow!("failed to reopen CHD for info: {:?}", e))?
+    .info()
+    .map_err(|e| anyhow!("failed to read CHD info: {:?}", e))?;
+    let sha1_bytes = if info.version >= 4 {
+        info.raw_sha1
+    } else {
+        info.sha1
+    };
+    Ok(hex_lower(&sha1_bytes))
+}
+
+/// Rehash every partition's logical-byte range and return the
+/// container SHA-1. Decompresses the entire CHD via [`ChdReader`] —
+/// expensive on multi-GB volumes — so use only when the bytes can't
+/// have been teed during write (currently: post-edit metadata
+/// refresh, where the CHD's contents have changed since the last
+/// backup).
 ///
-/// `progress_cb` receives the *cumulative* number of bytes hashed across
-/// all ranges so far — drop-in compatible with the cumulative-bytes
-/// callback the rest of the backup pipeline uses.
-fn compute_post_write_metadata(
+/// `progress_cb` receives the cumulative number of bytes hashed.
+fn rehash_partitions_via_decode(
     chd_path: &Path,
     ranges: &mut [ChdPartitionRange],
     checksum_type: super::ChecksumType,
@@ -723,17 +747,8 @@ fn compute_post_write_metadata(
         cumulative += n;
         progress_cb(cumulative);
     };
-    let mut reader = ChdReader::open(chd_path).with_context(|| {
-        format!(
-            "failed to reopen newly-written CHD for checksum: {}",
-            chd_path.display()
-        )
-    })?;
-
-    // Per-partition checksum over the byte range. We re-seek for each
-    // partition; the caller has already paid the cost of streaming the
-    // entire image once during compression, so a second pass here is
-    // acceptable for the simplicity it buys.
+    let mut reader = ChdReader::open(chd_path)
+        .with_context(|| format!("failed to reopen CHD for rehash: {}", chd_path.display()))?;
     let algo = checksum_type.as_str();
     for range in ranges.iter_mut() {
         reader
@@ -761,25 +776,7 @@ fn compute_post_write_metadata(
             range.partition_index, algo, range.checksum
         ));
     }
-
-    // CHD's own SHA1 (mode-dependent: data SHA1 for v4+, overall for older).
-    let info = libchdman_rs::Chd::open(
-        chd_path
-            .to_str()
-            .ok_or_else(|| anyhow!("CHD path is not valid UTF-8: {}", chd_path.display()))?,
-        false,
-        None,
-    )
-    .map_err(|e| anyhow!("failed to reopen CHD for info: {:?}", e))?
-    .info()
-    .map_err(|e| anyhow!("failed to read CHD info: {:?}", e))?;
-
-    let sha1_bytes = if info.version >= 4 {
-        info.raw_sha1
-    } else {
-        info.sha1
-    };
-    Ok(hex_lower(&sha1_bytes))
+    read_container_sha1(chd_path)
 }
 
 /// Refresh `metadata.json` after an in-place edit of a single-file-CHD
@@ -841,7 +838,7 @@ pub fn refresh_metadata_after_edit(
         _ => super::ChecksumType::Sha256,
     };
     let new_sha1 =
-        compute_post_write_metadata(&chd_path, &mut ranges, checksum_type, &mut |_| {}, log_cb)?;
+        rehash_partitions_via_decode(&chd_path, &mut ranges, checksum_type, &mut |_| {}, log_cb)?;
 
     for range in &ranges {
         if let Some(part) = metadata
@@ -971,6 +968,14 @@ pub fn assemble_from_staging(
 
     let mut builder = DiskImageStreamBuilder::new(target_size);
     let mut partition_ranges: Vec<ChdPartitionRange> = Vec::with_capacity(inputs.plans.len());
+    // Per-partition checksum handles. Each entry holds an `Arc<Mutex<>>`
+    // shared with a `ChecksumReader` wrapping that partition's segment;
+    // once `compress_chd` finishes consuming the stream we finalise
+    // them in place. Lets us hash the logical-bytes side as they
+    // flow into the CHD encoder, instead of re-reading and
+    // decompressing the entire CHD after it's written.
+    let mut hash_handles: Vec<(usize, Arc<Mutex<Option<super::verify::RunningHasher>>>)> =
+        Vec::with_capacity(inputs.plans.len());
 
     for (offset, length, reader) in head_segments {
         builder
@@ -1015,7 +1020,16 @@ pub fn assemble_from_staging(
         // segment.
         let decoder = zstd::Decoder::new(file)
             .with_context(|| format!("failed to open zstd decoder on {}", staged.display(),))?;
-        let reader: Box<dyn Read + Send> = Box::new(decoder.take(part_length));
+        // Tee through a ChecksumReader so the encoder's pull of these
+        // bytes also feeds the partition's hasher. After the encode
+        // finishes we finalise via `finalize_shared_hasher`.
+        let hasher = Arc::new(Mutex::new(Some(super::verify::RunningHasher::new(
+            inputs.checksum_type,
+        ))));
+        let hashed: super::verify::ChecksumReader<
+            std::io::Take<zstd::Decoder<std::io::BufReader<File>>>,
+        > = super::verify::ChecksumReader::new(decoder.take(part_length), hasher.clone());
+        let reader: Box<dyn Read + Send> = Box::new(hashed);
         builder
             .add_segment(part_offset, part_length, reader)
             .map_err(|e| {
@@ -1030,6 +1044,7 @@ pub fn assemble_from_staging(
             length: part_length,
             checksum: String::new(),
         });
+        hash_handles.push((plan.index, hasher));
     }
 
     if let Some((offset, length, reader)) = backup_tail {
@@ -1079,19 +1094,33 @@ pub fn assemble_from_staging(
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(&container_filename);
-    log_cb(&format!(
-        "Computing per-partition checksums from {}",
-        chd_path.display()
-    ));
+
+    // Tee-on-input means every partition's bytes were already hashed
+    // as the encoder pulled them through the stream. Finalise each
+    // shared hasher and record its digest. Two notes:
+    //
+    //  - We do NOT re-read the CHD here. The previous implementation
+    //    decompressed the entire image via ChdReader and rehashed each
+    //    partition's range — a ~13 min penalty on a 55 GiB backup.
+    //  - The checksum_phase_cb is still fired with (total, total) so
+    //    the GUI's progress bar lands at 100% on this phase boundary
+    //    instead of hanging at the previous bar's value.
     let checksum_total: u64 = partition_ranges.iter().map(|r| r.length).sum();
     checksum_phase_cb(0, checksum_total);
-    let container_sha1 = compute_post_write_metadata(
-        &chd_path,
-        &mut partition_ranges,
-        inputs.checksum_type,
-        &mut |cur| checksum_phase_cb(cur, checksum_total),
-        log_cb,
-    )?;
+    let algo_label = inputs.checksum_type.as_str();
+    for (idx, hasher) in hash_handles.iter() {
+        let digest = super::verify::finalize_shared_hasher(hasher);
+        if let Some(range) = partition_ranges
+            .iter_mut()
+            .find(|r| r.partition_index == *idx)
+        {
+            range.checksum = digest.clone();
+        }
+        log_cb(&format!("  partition-{idx} {algo_label}: {digest}"));
+    }
+    checksum_phase_cb(checksum_total, checksum_total);
+
+    let container_sha1 = read_container_sha1(&chd_path)?;
 
     Ok(SingleFileChdResult {
         container_filename,
