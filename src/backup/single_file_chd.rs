@@ -2043,34 +2043,13 @@ pub fn staging_path_unsupported_reason(inputs: &SingleFileChdInputs<'_>) -> Opti
         // hard-disk backups only.
         return Some("DVD profile handled by the optical tab");
     }
-    // FS-level resize check: synthesise the plan the same way
-    // run_via_staging does, then look for any size or offset change
-    // that ISN'T already covered by an HFS+ defrag-clone target.
-    // Defrag-cloned partitions are sized to the plan's new_size by the
-    // clone pipeline itself, so they don't count as "FS-level resize"
-    // for routing purposes.
-    let plans = match build_resize_plans(inputs) {
-        Ok(Some(p)) => p,
-        Ok(None) => synthesize_noop_plans(inputs.partitions),
-        Err(_) => return Some("resize plan construction failed"),
-    };
-    let clone_idxs: std::collections::HashSet<usize> = inputs
-        .hfsplus_clone_targets
-        .map(|t| t.iter().map(|(i, _, _)| *i).collect())
-        .unwrap_or_default();
-    // "Moved but not resized" is supported by the staging path: each
-    // partition's bytes are read from its old offset, staged, then
-    // dropped at the new offset by the assembler. The only thing the
-    // staging path can't yet do is shrink/grow a partition whose
-    // filesystem needs an in-place resize (FAT/NTFS/exFAT BPB
-    // recomputation). Clone targets are also exempt because the
-    // defrag-clone pipeline resizes via the clone itself.
-    if plans.iter().any(|p| {
-        let size_changed = p.new_size_bytes != p.old_size_bytes;
-        size_changed && !clone_idxs.contains(&p.index)
-    }) {
-        return Some("backup-time FS resize not yet supported on staging path");
-    }
+    // All resize shapes the staging path knows about are now supported:
+    //   - No size change: read source bytes at old offset, write at new.
+    //   - HFS+ clone target: defrag-clone pipeline emits to target size.
+    //   - Non-clone size change: materialise partition to a .raw temp,
+    //     run resize_filesystem_for + patch_hidden_sectors_for, zstd-stage.
+    // The function is kept so we can re-add a guard if a future
+    // filesystem surfaces a shape this path can't handle.
     None
 }
 
@@ -2111,26 +2090,6 @@ pub fn run_via_staging(
         Some(p) => p,
         None => synthesize_noop_plans(inputs.partitions),
     };
-
-    // FS-level resize on non-cloned partitions still isn't supported on
-    // the staging path. Clone targets DO resize via the clone pipeline,
-    // so they're exempt. "Moved but not resized" (needs_data_move with
-    // unchanged size — common when an earlier shrink ripples downstream)
-    // is fine: read source bytes at old offset, write at new offset.
-    let clone_idxs: std::collections::HashSet<usize> = inputs
-        .hfsplus_clone_targets
-        .map(|t| t.iter().map(|(i, _, _)| *i).collect())
-        .unwrap_or_default();
-    let unsupported_resize = plans.iter().any(|p| {
-        let size_changed = p.new_size_bytes != p.old_size_bytes;
-        size_changed && !clone_idxs.contains(&p.index)
-    });
-    if unsupported_resize {
-        anyhow::bail!(
-            "run_via_staging: backup-time FS resize is not yet supported on the \
-             staging path for non-cloned partitions"
-        );
-    }
 
     // Staging dir lives next to the output. `tempfile::TempDir` removes
     // the directory on drop, so a bail-out mid-staging cleans up.
@@ -2477,6 +2436,112 @@ fn stage_partitions_to_zst(
                 report.hardlinks_copied + report.dir_hardlinks_copied,
                 report.xattrs_copied,
             ));
+        } else if plan.new_size_bytes != plan.old_size_bytes {
+            // Non-clone partition with a size change (FAT/NTFS/exFAT
+            // shrink, etc.). The compact reader packs allocated data
+            // at the start of the extent; we need to follow up with
+            // resize_filesystem_for to actually patch the BPB/MFT/VBR
+            // for the new partition size, which requires Read+Write+Seek.
+            // Materialise the partition's bytes to a per-partition .raw
+            // temp file, resize in place there, then zstd-stage the
+            // result. Temp file lives in the same staging dir so it
+            // shares a filesystem with the eventual .zst and gets the
+            // same sparse semantics for zero-filled grow regions.
+            phase_cb(&format!(
+                "Staging partition-{} ({} of {}): packing + resizing partition body...",
+                plan.index, stage_idx, staged_count,
+            ));
+            let raw_path = staging_dir.join(format!("partition-{}.raw", plan.index));
+            log_cb(&format!(
+                "  partition-{}: materialising {} bytes to {} for in-place resize",
+                plan.index,
+                target_len,
+                raw_path.display(),
+            ));
+
+            // RAII guard so the .raw temp is always cleaned up, even on
+            // a mid-resize bail or panic.
+            struct RawGuard(std::path::PathBuf);
+            impl Drop for RawGuard {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_file(&self.0);
+                }
+            }
+            let _raw_guard = RawGuard(raw_path.clone());
+
+            {
+                let mut tf = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&raw_path)
+                    .with_context(|| {
+                        format!("failed to create staging .raw for partition-{}", plan.index)
+                    })?;
+                tf.set_len(target_len).with_context(|| {
+                    format!("failed to size staging .raw for partition-{}", plan.index)
+                })?;
+                let body_reader = build_partition_reader(
+                    inputs.source_file,
+                    part,
+                    inputs.sector_by_sector,
+                    log_cb,
+                )?;
+                // Body is exactly `min(part.size_bytes, target_len)` bytes
+                // for shrink; for grow it's part.size_bytes, with zeros
+                // beyond. The build_partition_reader for packed FS already
+                // emits a stream sized to `part.size_bytes`.
+                let to_copy = part.size_bytes.min(target_len);
+                copy_capped(
+                    &mut std::io::BufReader::new(body_reader),
+                    &mut tf,
+                    to_copy,
+                    cancel_check,
+                )
+                .with_context(|| format!("write partition-{} body to staging .raw", plan.index))?;
+                // Resize the FS in place. partition_offset=0 because the
+                // .raw file holds only this one partition's bytes.
+                let mut local_log = |s: &str| log_cb(s);
+                fs::resize_filesystem_for(&mut tf, 0, target_len, &mut local_log)
+                    .with_context(|| format!("resize filesystem in partition-{}", plan.index))?;
+                // Patch BPB / VBR hidden_sectors for the partition's new
+                // start LBA on the eventual disk. No-op on filesystems
+                // that don't carry a hidden_sectors field.
+                fs::patch_hidden_sectors_for(&mut tf, 0, plan.new_start_lba, &mut local_log)
+                    .with_context(|| {
+                        format!("patch hidden sectors for partition-{}", plan.index)
+                    })?;
+                tf.flush()
+                    .with_context(|| format!("flush staging .raw for partition-{}", plan.index))?;
+            }
+
+            // Zstd-stage the resized .raw into partition-N.zst.
+            phase_cb(&format!(
+                "Staging partition-{} ({} of {}): zstd-compressing resized body...",
+                plan.index, stage_idx, staged_count,
+            ));
+            let raw_in = std::fs::File::open(&raw_path).with_context(|| {
+                format!(
+                    "reopen staging .raw for partition-{} compression",
+                    plan.index
+                )
+            })?;
+            let mut raw_reader = std::io::BufReader::new(raw_in).take(target_len);
+            let _files = crate::rbformats::compress_partition(
+                &mut raw_reader,
+                &stage_base,
+                super::CompressionType::Zstd,
+                target_len,
+                None,
+                false,
+                None,
+                |n_read| progress_cb(base_for_progress.saturating_add(n_read).min(total_target)),
+                || cancel_check(),
+                |msg| log_cb(msg),
+            )
+            .with_context(|| format!("failed to zstd-stage resized partition-{}", plan.index))?;
+            // RAII drop removes the .raw now that the .zst is closed.
         } else {
             phase_cb(&format!(
                 "Staging partition-{} ({} of {}): zstd-compressing partition body...",
