@@ -1741,6 +1741,13 @@ pub struct AssembleFromStagingInputs<'a> {
     pub is_dvd: bool,
     pub alignment_sectors: u64,
     pub checksum_type: super::ChecksumType,
+    /// APM only: bytes `[0, first_partition_offset)` from the source disk,
+    /// covering the DDR + partition map + any Apple_Driver* partition
+    /// bodies. The assembly path overlays patched DDR + entries on top
+    /// of this region before emitting the head segment. MBR and GPT
+    /// sources pass an empty slice — they rebuild the table from
+    /// `source_partition_table_bytes` + `partition_table`.
+    pub source_head_region: &'a [u8],
 }
 
 /// Assemble a single-file CHD by streaming per-partition zstd-compressed
@@ -1750,11 +1757,10 @@ pub struct AssembleFromStagingInputs<'a> {
 /// and each partition's bytes flow through a zstd decoder directly into
 /// the CHD encoder under the back-pressure of the encoder's hunk writes.
 ///
-/// **Status (commit 1a):** MBR and GPT sources supported. APM sources
-/// return `Err` for now; a follow-up commit will accept a
-/// `source_head_region: &[u8]` parameter so the driver partition bodies
-/// can be carried verbatim from the source-read phase into the
-/// patched APM head segment.
+/// **Status:** MBR, GPT, and APM sources supported. APM callers must
+/// pre-populate `source_head_region` with the source's pre-first-partition
+/// bytes (DDR + partition map + Apple_Driver* bodies); MBR / GPT
+/// callers pass an empty slice.
 pub fn assemble_from_staging(
     inputs: AssembleFromStagingInputs<'_>,
     progress_cb: &mut dyn FnMut(u64),
@@ -1768,10 +1774,12 @@ pub fn assemble_from_staging(
             inputs.partition_table.type_name(),
         );
     }
-    if matches!(inputs.partition_table, PartitionTable::Apm(_)) {
+    if matches!(inputs.partition_table, PartitionTable::Apm(_))
+        && inputs.source_head_region.is_empty()
+    {
         anyhow::bail!(
-            "assemble_from_staging: APM support pending — staging-path \
-             follow-up will carry the source head region through"
+            "assemble_from_staging: APM source requires source_head_region — \
+             caller did not populate it"
         );
     }
     if inputs.plans.is_empty() {
@@ -1794,7 +1802,9 @@ pub fn assemble_from_staging(
 
     let (head_segments, backup_tail) = build_patched_head_segments(
         inputs.source_partition_table_bytes,
+        inputs.source_head_region,
         inputs.partition_table,
+        inputs.partitions,
         &overrides,
         target_size,
         log_cb,
@@ -1932,6 +1942,41 @@ pub fn assemble_from_staging(
     })
 }
 
+/// Read the APM head region — bytes `[0, first_user_partition_offset)`
+/// — from the source disk into a `Vec<u8>`. Eager-read (vs handing the
+/// assembler a `File` clone) sidesteps the dup-shared-offset hazard
+/// the partition loop's clones would otherwise create.
+fn read_apm_head_region(
+    source_file: &File,
+    partitions: &[PartitionInfo],
+    source_size: u64,
+) -> Result<Vec<u8>> {
+    let head_end = partitions
+        .iter()
+        .filter(|p| {
+            !matches!(
+                p.partition_type_string.as_deref(),
+                Some("Apple_partition_map")
+            )
+        })
+        .map(|p| p.start_lba * 512)
+        .min()
+        .unwrap_or(64 * 512)
+        .min(source_size);
+    if head_end == 0 {
+        anyhow::bail!("APM head region computed as 0 bytes — partition table looks empty");
+    }
+    let mut clone = source_file
+        .try_clone()
+        .context("clone source for APM head region")?;
+    clone
+        .seek(SeekFrom::Start(0))
+        .context("seek to APM head region")?;
+    let mut buf = vec![0u8; head_end as usize];
+    clone.read_exact(&mut buf).context("read APM head region")?;
+    Ok(buf)
+}
+
 /// `Read` adapter that produces exactly `target_len` bytes from `inner`,
 /// truncating an over-long source or zero-padding a short one. Used by
 /// the staging path to make each per-partition zstd file decompress to
@@ -1996,9 +2041,6 @@ pub fn staging_path_unsupported_reason(inputs: &SingleFileChdInputs<'_>) -> Opti
         // hard-disk backups only.
         return Some("DVD profile handled by the optical tab");
     }
-    if matches!(inputs.partition_table, PartitionTable::Apm(_)) {
-        return Some("APM head region support pending");
-    }
     if inputs
         .hfsplus_clone_targets
         .map(|t| !t.is_empty())
@@ -2053,13 +2095,6 @@ pub fn run_via_staging(
             inputs.partition_table.type_name(),
         );
     }
-    if matches!(inputs.partition_table, PartitionTable::Apm(_)) {
-        anyhow::bail!(
-            "run_via_staging: APM support pending — staging-path follow-up will \
-             carry the source head region through"
-        );
-    }
-
     let has_clone_targets = inputs
         .hfsplus_clone_targets
         .map(|t| !t.is_empty())
@@ -2107,6 +2142,21 @@ pub fn run_via_staging(
         staging.path().display()
     ));
 
+    // For APM sources, capture the source head region eagerly before
+    // any partition reads touch the source file. The head covers the
+    // DDR + partition map + any Apple_Driver* partition bodies and
+    // must reach the assembler intact so patched DDR + entries can be
+    // overlaid on top of it.
+    let source_head_region = if matches!(inputs.partition_table, PartitionTable::Apm(_)) {
+        Some(read_apm_head_region(
+            inputs.source_file,
+            inputs.partitions,
+            inputs.source_size,
+        )?)
+    } else {
+        None
+    };
+
     // Phase 1: stage each partition's body as zstd.
     stage_partitions_to_zst(
         &inputs,
@@ -2118,6 +2168,7 @@ pub fn run_via_staging(
     )?;
 
     // Phase 2: assemble the staged files into the final CHD.
+    let head_region_slice: &[u8] = source_head_region.as_deref().unwrap_or(&[]);
     let assemble_inputs = AssembleFromStagingInputs {
         staging_dir: staging.path(),
         plans: &plans,
@@ -2130,6 +2181,7 @@ pub fn run_via_staging(
         is_dvd: inputs.is_dvd,
         alignment_sectors: inputs.alignment_sectors,
         checksum_type: inputs.checksum_type,
+        source_head_region: head_region_slice,
     };
     let result = assemble_from_staging(
         assemble_inputs,
@@ -2243,11 +2295,14 @@ fn stage_partitions_to_zst(
 /// to avoid materialising a scratch disk image just to host the table.
 fn build_patched_head_segments(
     source_partition_table_bytes: &[u8],
+    source_head_region: &[u8],
     table: &PartitionTable,
+    partitions: &[PartitionInfo],
     overrides: &[PartitionSizeOverride],
     target_size: u64,
     log_cb: &mut dyn FnMut(&str),
 ) -> Result<(Vec<Segment>, Option<Segment>)> {
+    let _ = partitions; // used only by APM today; kept for symmetry.
     match table {
         PartitionTable::Mbr(_) => {
             let mut mbr_buf = [0u8; 512];
@@ -2291,8 +2346,33 @@ fn build_patched_head_segments(
             );
             Ok((vec![head], Some(tail)))
         }
-        PartitionTable::Apm(_) => {
-            anyhow::bail!("assemble_from_staging: APM head segment synthesis pending in commit 1a");
+        PartitionTable::Apm(apm) => {
+            // Mirrors `write_patched_table`'s APM branch but produces a
+            // single in-memory segment instead of scratch-file writes.
+            // Take the source head bytes verbatim (DDR + map + drivers +
+            // any verbatim driver bodies) and overlay patched DDR +
+            // entry blocks on top.
+            if source_head_region.is_empty() {
+                anyhow::bail!("build_patched_head_segments: APM requires source_head_region");
+            }
+            let head_end = source_head_region.len() as u64;
+            let mut head_buf = source_head_region.to_vec();
+
+            let block_size = apm.ddr.block_size as u64;
+            if block_size == 0 {
+                anyhow::bail!("APM DDR block_size is 0 — corrupt partition table");
+            }
+            let target_blocks = (target_size / block_size) as u32;
+            let patched = apm.patch_for_restore(overrides, target_blocks);
+            let blocks = patched.build_apm_blocks(Some(target_blocks));
+            let to_overlay = (blocks.len() as u64).min(head_end);
+            head_buf[..to_overlay as usize].copy_from_slice(&blocks[..to_overlay as usize]);
+            log_cb(&format!(
+                "  table: APM ({} bytes head verbatim, {} bytes of patched DDR+entries overlaid)",
+                head_end, to_overlay,
+            ));
+            let head: Segment = (0, head_end, Box::new(std::io::Cursor::new(head_buf)));
+            Ok((vec![head], None))
         }
         PartitionTable::Sgi(_) => {
             anyhow::bail!(
@@ -3343,6 +3423,7 @@ mod tests {
             chd_options: None,
             is_dvd: false,
             alignment_sectors: 0,
+            source_head_region: &[],
             checksum_type: crate::backup::ChecksumType::Sha256,
         };
 
@@ -3482,6 +3563,124 @@ mod tests {
                 "staging dir leaked: {s}",
             );
         }
+    }
+
+    /// APM round-trip through the staging path. Mirrors
+    /// `end_to_end_round_trip_apm` but exercises `run_via_staging`
+    /// instead of `run` to confirm the head region is captured eagerly
+    /// and overlaid with patched DDR + entries on the assembly side.
+    #[test]
+    fn run_via_staging_round_trip_apm() {
+        const TOTAL_BLOCKS: u64 = 8192;
+        const SECTOR: u64 = 512;
+        let total_bytes = TOTAL_BLOCKS * SECTOR;
+
+        let mut data = vec![0u8; total_bytes as usize];
+        const DDR_SIG: u16 = 0x4552;
+        data[0..2].copy_from_slice(&DDR_SIG.to_be_bytes());
+        data[2..4].copy_from_slice(&512u16.to_be_bytes());
+        data[4..8].copy_from_slice(&(TOTAL_BLOCKS as u32).to_be_bytes());
+
+        const ENTRY_SIG: u16 = 0x504D;
+        let entries = [
+            ("Apple", "Apple_partition_map", 1u32, 2u32),
+            ("MacOS", "Apple_HFS", 64u32, 4096u32),
+        ];
+        for (i, (name, ptype, start, count)) in entries.iter().enumerate() {
+            let off = (1 + i) * 512;
+            data[off..off + 2].copy_from_slice(&ENTRY_SIG.to_be_bytes());
+            data[off + 4..off + 8].copy_from_slice(&(entries.len() as u32).to_be_bytes());
+            data[off + 8..off + 12].copy_from_slice(&start.to_be_bytes());
+            data[off + 12..off + 16].copy_from_slice(&count.to_be_bytes());
+            let nb = name.as_bytes();
+            data[off + 16..off + 16 + nb.len()].copy_from_slice(nb);
+            let tb = ptype.as_bytes();
+            data[off + 48..off + 48 + tb.len()].copy_from_slice(tb);
+            data[off + 84..off + 88].copy_from_slice(&count.to_be_bytes());
+            data[off + 88..off + 92].copy_from_slice(&0x33u32.to_be_bytes());
+        }
+        let part_offset = 64usize * 512;
+        let part_len = 4096usize * 512;
+        for i in 0..part_len {
+            data[part_offset + i] = ((i % 251) as u8).wrapping_add(2);
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_path = tmp.path().join("source.img");
+        std::fs::write(&source_path, &data).unwrap();
+        let source_file = File::open(&source_path).unwrap();
+
+        let mut br = BufReader::new(source_file.try_clone().unwrap());
+        let table = PartitionTable::detect(&mut br).expect("detect APM");
+        assert!(matches!(table, PartitionTable::Apm(_)));
+        let partitions = table.partitions();
+
+        let output_base = tmp.path().join("disk");
+        let mbr_bytes: [u8; 512] = data[..512].try_into().unwrap();
+        let mut log_buf: Vec<String> = Vec::new();
+        let mut log_cb = |s: &str| log_buf.push(s.to_string());
+        let mut progress_cb = |_: u64| {};
+        let cancel = || false;
+
+        let result = run_via_staging(
+            SingleFileChdInputs {
+                source_file: &source_file,
+                source_size: total_bytes,
+                source_partition_table_bytes: &mbr_bytes,
+                partition_table: &table,
+                partitions: &partitions,
+                partition_filter: None,
+                sector_by_sector: true,
+                chd_options: None,
+                is_dvd: false,
+                output_base: &output_base,
+                resize_targets: None,
+                hfsplus_clone_targets: None,
+                alignment_sectors: 0,
+                checksum_type: crate::backup::ChecksumType::Sha256,
+            },
+            &mut progress_cb,
+            &cancel,
+            &mut log_cb,
+            &mut |_, _| {},
+        )
+        .expect("APM run_via_staging");
+        assert_eq!(
+            result.container_logical_size,
+            (part_offset as u64) + (part_len as u64)
+        );
+
+        let chd_path = tmp.path().join("disk.chd");
+        let mut reader = ChdReader::open(&chd_path).unwrap();
+        let extent = result.container_logical_size as usize;
+        let mut readback = vec![0u8; extent];
+        reader.read_exact(&mut readback).unwrap();
+
+        // DDR signature + first APM entry signature survive through the
+        // head segment. (The DDR's block_count is rewritten to the
+        // shrunken envelope and the entries' map_entries / sizes get
+        // patched, so a byte-for-byte compare against source would
+        // fail by design — that's verified later via `re-detect APM`.)
+        assert_eq!(&readback[0..2], &data[0..2], "DDR signature mismatch");
+        assert_eq!(
+            &readback[512..514],
+            &data[512..514],
+            "first APM entry signature mismatch",
+        );
+        // Partition body survives at its declared offset.
+        assert_eq!(
+            &readback[part_offset..part_offset + part_len],
+            &data[part_offset..part_offset + part_len],
+            "APM partition body mismatch after run_via_staging",
+        );
+
+        let mut br2 = BufReader::new(std::io::Cursor::new(readback));
+        let detected = PartitionTable::detect(&mut br2).expect("re-detect APM");
+        assert!(
+            matches!(detected, PartitionTable::Apm(_)),
+            "round-tripped CHD should still parse as APM, got {}",
+            detected.type_name(),
+        );
     }
 
     /// Commit 1b: HFS+ defrag-clone targets are not yet supported on
