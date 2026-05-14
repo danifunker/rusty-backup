@@ -48,18 +48,43 @@ fn main() -> eframe::Result {
         height: icon_height,
     };
 
-    let options = eframe::NativeOptions {
+    // Allow forcing a specific renderer via env var; otherwise auto.
+    //   RUSTY_BACKUP_RENDERER=wgpu  -> wgpu only (Vulkan/Metal/DX12, no fallback)
+    //   RUSTY_BACKUP_RENDERER=glow  -> OpenGL only (no wgpu attempt)
+    //   unset                       -> try wgpu, fall back to glow on failure
+    let forced = std::env::var("RUSTY_BACKUP_RENDERER").ok();
+
+    let make_options = |renderer: eframe::Renderer| eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([900.0, 700.0])
             .with_min_inner_size([600.0, 400.0])
-            .with_icon(icon_data)
+            .with_icon(icon_data.clone())
             .with_drag_and_drop(true),
+        renderer,
         ..Default::default()
     };
 
-    eframe::run_native(
-        "Rusty Backup",
-        options,
-        Box::new(|_cc| Ok(Box::new(gui::RustyBackupApp::default()))),
-    )
+    let run = |renderer: eframe::Renderer| {
+        eframe::run_native(
+            "Rusty Backup",
+            make_options(renderer),
+            Box::new(|_cc| Ok(Box::new(gui::RustyBackupApp::default()))),
+        )
+    };
+
+    match forced.as_deref() {
+        Some("glow") => run(eframe::Renderer::Glow),
+        Some("wgpu") => run(eframe::Renderer::Wgpu),
+        _ => match run(eframe::Renderer::Wgpu) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // wgpu failed (commonly inside an AppImage when the bundled
+                // Vulkan ICDs don't match the host GPU — "Parent device is
+                // lost"). Retry with the OpenGL backend, which works through
+                // EGL/GL on the same mesa bundle.
+                log::warn!("wgpu renderer failed ({e}); falling back to OpenGL (glow)");
+                run(eframe::Renderer::Glow)
+            }
+        },
+    }
 }
