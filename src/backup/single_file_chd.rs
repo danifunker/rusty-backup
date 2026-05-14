@@ -2041,24 +2041,25 @@ pub fn staging_path_unsupported_reason(inputs: &SingleFileChdInputs<'_>) -> Opti
         // hard-disk backups only.
         return Some("DVD profile handled by the optical tab");
     }
-    if inputs
-        .hfsplus_clone_targets
-        .map(|t| !t.is_empty())
-        .unwrap_or(false)
-    {
-        return Some("HFS+ defrag-clone targets not yet supported on staging path");
-    }
     // FS-level resize check: synthesise the plan the same way
-    // run_via_staging does, then look for any size or offset change.
+    // run_via_staging does, then look for any size or offset change
+    // that ISN'T already covered by an HFS+ defrag-clone target.
+    // Defrag-cloned partitions are sized to the plan's new_size by the
+    // clone pipeline itself, so they don't count as "FS-level resize"
+    // for routing purposes.
     let plans = match build_resize_plans(inputs) {
         Ok(Some(p)) => p,
         Ok(None) => synthesize_noop_plans(inputs.partitions),
         Err(_) => return Some("resize plan construction failed"),
     };
-    if plans
-        .iter()
-        .any(|p| p.new_size_bytes != p.old_size_bytes || p.needs_data_move)
-    {
+    let clone_idxs: std::collections::HashSet<usize> = inputs
+        .hfsplus_clone_targets
+        .map(|t| t.iter().map(|(i, _, _)| *i).collect())
+        .unwrap_or_default();
+    if plans.iter().any(|p| {
+        let resized = p.new_size_bytes != p.old_size_bytes || p.needs_data_move;
+        resized && !clone_idxs.contains(&p.index)
+    }) {
         return Some("backup-time FS resize not yet supported on staging path");
     }
     None
@@ -2095,29 +2096,26 @@ pub fn run_via_staging(
             inputs.partition_table.type_name(),
         );
     }
-    let has_clone_targets = inputs
-        .hfsplus_clone_targets
-        .map(|t| !t.is_empty())
-        .unwrap_or(false);
-    if has_clone_targets {
-        anyhow::bail!(
-            "run_via_staging: HFS+ defrag-clone targets are not yet supported \
-             on the staging path (commit 1d will add this)"
-        );
-    }
-
     let plans = match build_resize_plans(&inputs)? {
         Some(p) => p,
         None => synthesize_noop_plans(inputs.partitions),
     };
 
-    let any_resize = plans
-        .iter()
-        .any(|p| p.new_size_bytes != p.old_size_bytes || p.needs_data_move);
-    if any_resize {
+    // FS-level resize on non-cloned partitions still isn't supported on
+    // the staging path. Clone targets DO resize via the clone pipeline,
+    // so they're exempt from this gate.
+    let clone_idxs: std::collections::HashSet<usize> = inputs
+        .hfsplus_clone_targets
+        .map(|t| t.iter().map(|(i, _, _)| *i).collect())
+        .unwrap_or_default();
+    let unsupported_resize = plans.iter().any(|p| {
+        let resized = p.new_size_bytes != p.old_size_bytes || p.needs_data_move;
+        resized && !clone_idxs.contains(&p.index)
+    });
+    if unsupported_resize {
         anyhow::bail!(
             "run_via_staging: backup-time FS resize is not yet supported on the \
-             staging path (commit 1c will add this via temp .raw materialisation)"
+             staging path for non-cloned partitions"
         );
     }
 
@@ -2255,34 +2253,168 @@ fn stage_partitions_to_zst(
         }
 
         let target_len = plan.new_size_bytes;
-        let body_reader =
-            build_partition_reader(inputs.source_file, part, inputs.sector_by_sector, log_cb)?;
-        let mut padded = TakeOrPad::new(body_reader, target_len);
-
         let stage_base = staging_dir.join(format!("partition-{}", plan.index));
-        log_cb(&format!(
-            "  staging partition-{} -> {}.zst ({} bytes)",
-            plan.index,
-            stage_base.display(),
-            target_len,
-        ));
 
-        // Use compress_partition with Zstd so the staging file is
-        // exactly what the existing zstd backup path emits, byte-for-byte.
+        // HFS+ defrag-clone branch: drive the source's defragmenter on
+        // a producer thread, pipe its bytes into compress_partition
+        // (zstd). The clone pipeline is sized to `target_len`, so the
+        // resulting staging file decompresses to exactly that length
+        // and TakeOrPad is unnecessary. Otherwise: raw / compact reader
+        // via build_partition_reader + TakeOrPad to guarantee length.
+        let clone_entry = inputs
+            .hfsplus_clone_targets
+            .and_then(|t| t.iter().find(|(idx, _, _)| *idx == plan.index).copied());
+
         let base_for_progress = bytes_done;
-        let _files = crate::rbformats::compress_partition(
-            &mut padded,
-            &stage_base,
-            super::CompressionType::Zstd,
-            target_len,
-            None,
-            false,
-            None,
-            |n_read| progress_cb(base_for_progress.saturating_add(n_read).min(total_target)),
-            || cancel_check(),
-            |msg| log_cb(msg),
-        )
-        .with_context(|| format!("failed to zstd-stage partition-{}", plan.index))?;
+        if let Some((_, clone_target, shape)) = clone_entry {
+            if clone_target != target_len {
+                anyhow::bail!(
+                    "stage_partitions: HFS+ clone target {} != plan new_size {} \
+                     for partition-{}",
+                    clone_target,
+                    target_len,
+                    plan.index,
+                );
+            }
+            log_cb(&format!(
+                "  staging partition-{} (HFS+ defrag-clone, {}) -> {}.zst ({} bytes)",
+                plan.index,
+                match shape {
+                    fs::DefragCloneShape::Flat => "flat HFS+",
+                    fs::DefragCloneShape::Wrapped => "wrapped HFS+",
+                },
+                stage_base.display(),
+                target_len,
+            ));
+
+            let part_offset = part.start_lba * 512;
+            let part_size = part.size_bytes;
+            let plan_index: usize = plan.index;
+            let producer_clone = inputs
+                .source_file
+                .try_clone()
+                .context("clone source for HFS+ defrag-clone producer")?;
+            let (mut writer, mut reader) = super::channel_pipe();
+
+            let producer =
+                std::thread::spawn(move || -> Result<fs::hfsplus_defrag::DefragReport> {
+                    match shape {
+                        fs::DefragCloneShape::Flat => {
+                            let br = std::io::BufReader::new(producer_clone);
+                            let mut hfs = fs::hfsplus::HfsPlusFilesystem::open(br, part_offset)
+                                .context("open source HFS+ for defrag-clone")?;
+                            fs::hfsplus_defrag::stream_defragmented_hfsplus(
+                                &mut hfs,
+                                target_len,
+                                &mut writer,
+                            )
+                            .context("stream_defragmented_hfsplus")
+                        }
+                        fs::DefragCloneShape::Wrapped => {
+                            let mut br = std::io::BufReader::new(producer_clone);
+                            let info = fs::hfsplus_wrapper_clone::detect_wrapped_hfsplus(
+                                &mut br,
+                                part_offset,
+                                part_size,
+                            )
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "wrapped HFS+ detection failed for partition-{}",
+                                    plan_index,
+                                )
+                            })?;
+                            let outer_overhead = (info.al_block_start_sector as u64) * 512
+                                + (info.embed_start_block as u64) * (info.al_block_size as u64)
+                                + 1024;
+                            let inner_target = target_len.saturating_sub(outer_overhead);
+                            let cplan =
+                                fs::hfsplus_wrapper_clone::plan_wrapped_clone(&info, inner_target)
+                                    .map_err(|e| anyhow!("{e}"))?;
+                            if cplan.new_partition_size != target_len {
+                                anyhow::bail!(
+                                    "wrapped HFS+ partition-{}: planned size {} \
+                                     disagrees with target {}",
+                                    plan_index,
+                                    cplan.new_partition_size,
+                                    target_len,
+                                );
+                            }
+                            fs::hfsplus_wrapper_clone::stream_wrapped_defragmented_hfsplus(
+                                &mut br,
+                                &cplan,
+                                &mut writer,
+                            )
+                            .map_err(|e| anyhow!("{e}"))
+                        }
+                    }
+                });
+
+            let compress_result = crate::rbformats::compress_partition(
+                &mut reader,
+                &stage_base,
+                super::CompressionType::Zstd,
+                target_len,
+                None,
+                false,
+                None,
+                |n_read| progress_cb(base_for_progress.saturating_add(n_read).min(total_target)),
+                || cancel_check(),
+                |msg| log_cb(msg),
+            );
+
+            // Always join the producer so its errors surface even when
+            // the consumer succeeded (and vice-versa). Mirrors the
+            // pattern in `run_backup`'s zstd path.
+            let producer_result = producer.join().map_err(|_| {
+                anyhow!(
+                    "HFS+ defrag-clone producer thread panicked for partition-{}",
+                    plan.index
+                )
+            })?;
+            compress_result.with_context(|| {
+                format!(
+                    "failed to zstd-stage defrag-cloned partition-{}",
+                    plan.index
+                )
+            })?;
+            let report = producer_result.with_context(|| {
+                format!("HFS+ defrag-clone failed for partition-{}", plan.index)
+            })?;
+            log_cb(&format!(
+                "  partition-{} defrag emit: {} files / {} folders / {} bytes / \
+                 {} hardlinks / {} xattrs",
+                plan.index,
+                report.files_copied,
+                report.dirs_copied,
+                report.data_bytes_copied,
+                report.hardlinks_copied + report.dir_hardlinks_copied,
+                report.xattrs_copied,
+            ));
+        } else {
+            let body_reader =
+                build_partition_reader(inputs.source_file, part, inputs.sector_by_sector, log_cb)?;
+            let mut padded = TakeOrPad::new(body_reader, target_len);
+            log_cb(&format!(
+                "  staging partition-{} -> {}.zst ({} bytes)",
+                plan.index,
+                stage_base.display(),
+                target_len,
+            ));
+            let _files = crate::rbformats::compress_partition(
+                &mut padded,
+                &stage_base,
+                super::CompressionType::Zstd,
+                target_len,
+                None,
+                false,
+                None,
+                |n_read| progress_cb(base_for_progress.saturating_add(n_read).min(total_target)),
+                || cancel_check(),
+                |msg| log_cb(msg),
+            )
+            .with_context(|| format!("failed to zstd-stage partition-{}", plan.index))?;
+        }
+
         bytes_done = bytes_done.saturating_add(target_len);
         progress_cb(bytes_done.min(total_target));
     }
@@ -3683,11 +3815,15 @@ mod tests {
         );
     }
 
-    /// Commit 1b: HFS+ defrag-clone targets are not yet supported on
-    /// the staging path; `run_via_staging` must reject them cleanly so
-    /// the caller can fall back to `run`.
+    /// HFS+ defrag-clone producer-thread error propagation: when the
+    /// caller flags a partition as a clone target but the underlying
+    /// bytes aren't valid HFS+, the producer thread's open error
+    /// surfaces back to `run_via_staging`'s caller (rather than being
+    /// swallowed or surfacing as a generic broken-pipe). Exercises the
+    /// `producer.join()` path and the producer/consumer error
+    /// reconciliation.
     #[test]
-    fn run_via_staging_rejects_hfsplus_clone_targets() {
+    fn run_via_staging_propagates_hfsplus_clone_producer_errors() {
         const PART_SECTORS: u32 = 4095;
         let mbr = build_test_mbr(PART_SECTORS);
         let mut br = std::io::Cursor::new(mbr.to_vec());
@@ -3695,6 +3831,8 @@ mod tests {
         let partitions = table.partitions();
         let tmp = tempfile::tempdir().unwrap();
         let source_path = tmp.path().join("source.img");
+        // All zeros — no valid HFS+ volume header, so the producer
+        // thread's HfsPlusFilesystem::open call must fail.
         std::fs::write(&source_path, vec![0u8; ((PART_SECTORS as usize) + 1) * 512]).unwrap();
         let source_file = File::open(&source_path).unwrap();
         let source_size = source_file.metadata().unwrap().len();
@@ -3721,11 +3859,15 @@ mod tests {
             checksum_type: crate::backup::ChecksumType::Sha256,
         };
         let err = run_via_staging(inputs, &mut |_| {}, &|| false, &mut |_| {}, &mut |_, _| {})
-            .expect_err("run_via_staging must reject HFS+ clone targets");
-        let msg = format!("{err}");
+            .expect_err("invalid HFS+ source must surface a clone-producer error");
+        let msg = format!("{err:#}");
+        // Error chain should reference either the clone pipeline or the
+        // HFS+ open. We don't pin to a specific layer since the exact
+        // chain depends on which side races to fail first.
         assert!(
-            msg.contains("HFS+ defrag-clone"),
-            "error message must explain the limitation: {msg}",
+            msg.to_ascii_lowercase().contains("hfs+")
+                || msg.to_ascii_lowercase().contains("defrag-clone"),
+            "error message must reference HFS+ / defrag-clone path: {msg}",
         );
     }
 }
