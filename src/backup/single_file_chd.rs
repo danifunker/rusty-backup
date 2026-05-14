@@ -945,15 +945,17 @@ fn run_with_resize(
                         })?
                     }
                     fs::DefragCloneShape::Wrapped => {
-                        let mut br = std::io::BufReader::new(producer_clone);
-                        let info = fs::hfsplus_wrapper_clone::detect_wrapped_hfsplus(
-                            &mut br,
+                        // Positioned-read MDB detection — shared fd offsets
+                        // are race-vulnerable across producer threads.
+                        let info = fs::hfsplus_wrapper_clone::detect_wrapped_hfsplus_at(
+                            &producer_clone,
                             part_offset,
                             part.size_bytes,
                         )
                         .ok_or_else(|| {
                             anyhow!("wrapped HFS+ detection failed for partition-{}", part.index)
                         })?;
+                        let mut br = std::io::BufReader::new(producer_clone);
                         let outer_overhead = (info.al_block_start_sector as u64) * 512
                             + (info.embed_start_block as u64) * (info.al_block_size as u64)
                             + 1024;
@@ -2371,9 +2373,12 @@ fn stage_partitions_to_zst(
                             .context("stream_defragmented_hfsplus")
                         }
                         fs::DefragCloneShape::Wrapped => {
-                            let mut br = std::io::BufReader::new(producer_clone);
-                            let info = fs::hfsplus_wrapper_clone::detect_wrapped_hfsplus(
-                                &mut br,
+                            // Detect the wrapper via positioned I/O so the
+                            // shared-fd offset on this thread's dup'd
+                            // source clone can't be clobbered by another
+                            // partition's producer thread mid-detect.
+                            let info = fs::hfsplus_wrapper_clone::detect_wrapped_hfsplus_at(
+                                &producer_clone,
                                 part_offset,
                                 part_size,
                             )
@@ -2383,6 +2388,7 @@ fn stage_partitions_to_zst(
                                     plan_index,
                                 )
                             })?;
+                            let mut br = std::io::BufReader::new(producer_clone);
                             let outer_overhead = (info.al_block_start_sector as u64) * 512
                                 + (info.embed_start_block as u64) * (info.al_block_size as u64)
                                 + 1024;
@@ -2391,37 +2397,20 @@ fn stage_partitions_to_zst(
                                 fs::hfsplus_wrapper_clone::plan_wrapped_clone(&info, inner_target)
                                     .map_err(|e| anyhow!("{e}"))?;
                             if cplan.new_partition_size != target_len {
-                                eprintln!(
-                                    "[plan_wrapped_clone diag] partition-{}: \
-                                     info(al_block_size={}, al_block_start_sector={}, \
+                                anyhow::bail!(
+                                    "wrapped HFS+ partition-{}: planned size {} \
+                                     disagrees with target {} \
+                                     (info: al_block_size={}, al_block_start_sector={}, \
                                      embed_start_block={}, embed_block_count={}, \
-                                     inner_offset={}, inner_size={}, \
-                                     source_total_blocks={}), \
-                                     target_len={}, outer_overhead={}, inner_target={}, \
-                                     cplan(new_inner_size={}, new_embed_block_count={}, \
-                                     new_total_blocks={}, new_partition_size={})",
+                                     inner_size={})",
                                     plan_index,
+                                    cplan.new_partition_size,
+                                    target_len,
                                     info.al_block_size,
                                     info.al_block_start_sector,
                                     info.embed_start_block,
                                     info.embed_block_count,
-                                    info.inner_offset,
                                     info.inner_size,
-                                    info.source_total_blocks,
-                                    target_len,
-                                    outer_overhead,
-                                    inner_target,
-                                    cplan.new_inner_size,
-                                    cplan.new_embed_block_count,
-                                    cplan.new_total_blocks,
-                                    cplan.new_partition_size,
-                                );
-                                anyhow::bail!(
-                                    "wrapped HFS+ partition-{}: planned size {} \
-                                     disagrees with target {}",
-                                    plan_index,
-                                    cplan.new_partition_size,
-                                    target_len,
                                 );
                             }
                             fs::hfsplus_wrapper_clone::stream_wrapped_defragmented_hfsplus(

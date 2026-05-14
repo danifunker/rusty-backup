@@ -939,15 +939,18 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                             .context("stream_defragmented_hfsplus")?
                         }
                         fs::DefragCloneShape::Wrapped => {
-                            let mut br = BufReader::new(producer_clone);
-                            let info = fs::hfsplus_wrapper_clone::detect_wrapped_hfsplus(
-                                &mut br,
+                            // Positioned-read MDB detection — avoids the
+                            // shared-fd-offset race when producer threads
+                            // run concurrently across partitions.
+                            let info = fs::hfsplus_wrapper_clone::detect_wrapped_hfsplus_at(
+                                &producer_clone,
                                 part_offset,
                                 part_size,
                             )
                             .ok_or_else(|| {
                                 anyhow::anyhow!("wrapped HFS+ detection failed at backup time")
                             })?;
+                            let mut br = BufReader::new(producer_clone);
                             // The clone target is a partition-level size;
                             // back-derive the inner target by stripping the
                             // wrapper overhead (alloc-block start + pre-embed

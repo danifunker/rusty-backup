@@ -86,6 +86,64 @@ pub fn detect_wrapped_hfsplus<R: Read + Seek>(
     reader.seek(SeekFrom::Start(partition_offset + 1024)).ok()?;
     let mut mdb = [0u8; 512];
     reader.read_exact(&mut mdb).ok()?;
+    parse_wrapper_mdb(&mdb, partition_offset, partition_size)
+}
+
+/// Same as [`detect_wrapped_hfsplus`] but reads the MDB sector via
+/// positioned I/O ([`std::os::unix::fs::FileExt::read_at`] on Unix,
+/// [`std::os::windows::fs::FileExt::seek_read`] on Windows). Use this
+/// from any context that shares the underlying file descriptor across
+/// threads — `try_clone()` on Unix uses `dup()`, which shares the
+/// kernel-level seek offset, so concurrent `seek + read` callers can
+/// clobber each other and return the wrong partition's MDB. Positioned
+/// reads carry the offset in the syscall itself and don't touch the
+/// shared cursor, so they're safe under any amount of fd sharing.
+pub fn detect_wrapped_hfsplus_at(
+    file: &std::fs::File,
+    partition_offset: u64,
+    partition_size: u64,
+) -> Option<WrappedHfsPlusInfo> {
+    let mut mdb = [0u8; 512];
+    read_exact_at(file, partition_offset + 1024, &mut mdb).ok()?;
+    parse_wrapper_mdb(&mdb, partition_offset, partition_size)
+}
+
+/// Read exactly `buf.len()` bytes from `file` at byte offset `offset`
+/// without touching the file's seek cursor. Uses `pread`/`seek_read`
+/// under the hood. Loops on short reads.
+fn read_exact_at(file: &std::fs::File, mut offset: u64, mut buf: &mut [u8]) -> io::Result<()> {
+    #[cfg(unix)]
+    use std::os::unix::fs::FileExt;
+    #[cfg(windows)]
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        #[cfg(unix)]
+        let n = file.read_at(buf, offset)?;
+        #[cfg(windows)]
+        let n = file.seek_read(buf, offset)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "unexpected EOF in positioned read",
+            ));
+        }
+        offset += n as u64;
+        let tmp = buf;
+        buf = &mut tmp[n..];
+    }
+    Ok(())
+}
+
+/// Parse a 512-byte HFS MDB sector and decide whether it carries a
+/// wrapped HFS+ volume. Pure function — no I/O. Both
+/// [`detect_wrapped_hfsplus`] (legacy `Read + Seek` API) and
+/// [`detect_wrapped_hfsplus_at`] (race-safe positioned-read API) call
+/// this so the validation logic lives in one place.
+fn parse_wrapper_mdb(
+    mdb: &[u8; 512],
+    partition_offset: u64,
+    partition_size: u64,
+) -> Option<WrappedHfsPlusInfo> {
     let sig = BigEndian::read_u16(&mdb[0..2]);
     if sig != 0x4244 {
         return None;
