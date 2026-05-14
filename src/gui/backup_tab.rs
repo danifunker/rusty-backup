@@ -814,6 +814,7 @@ impl BackupTab {
         progress_state.current_bytes = status.current_bytes;
         progress_state.total_bytes = status.total_bytes;
         progress_state.full_size_bytes = 0;
+        progress_state.record_sample();
 
         if status.finished {
             if let Some(err) = &status.error {
@@ -1635,6 +1636,7 @@ impl BackupTab {
         progress_state.current_bytes = p.current_bytes;
         progress_state.total_bytes = p.total_bytes;
         progress_state.full_size_bytes = p.full_size_bytes;
+        progress_state.record_sample();
 
         if p.finished {
             if let Some(err) = &p.error {

@@ -1789,6 +1789,7 @@ impl RestoreTab {
         progress_state.current_bytes = p.current_bytes;
         progress_state.total_bytes = p.total_bytes;
         progress_state.full_size_bytes = 0;
+        progress_state.record_sample();
 
         if p.finished {
             if let Some(err) = &p.error {
