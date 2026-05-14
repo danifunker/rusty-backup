@@ -1461,6 +1461,16 @@ fn run_single_file_chd_path(
     // scratch-tempfile path. The router lives here rather than inside
     // `single_file_chd` so the log line surfaces in the GUI before any
     // bytes flow.
+    // `phase_cb` lets the staging path swap the top-bar operation
+    // label as each stage starts ("Staging partition-N", "Assembling
+    // CHD", ...) — without it the user would see "Building disk-image
+    // stream..." for the entire multi-hour run.
+    let progress_for_phase = progress.clone();
+    let mut phase_cb = move |label: &str| {
+        if let Ok(mut p) = progress_for_phase.lock() {
+            p.operation = label.to_string();
+        }
+    };
     let staging_reason = single_file_chd::staging_path_unsupported_reason(&inputs);
     let result = match staging_reason {
         None => {
@@ -1475,6 +1485,7 @@ fn run_single_file_chd_path(
                 &cancel_check,
                 &mut log_cb,
                 &mut checksum_phase_cb,
+                &mut phase_cb,
             )
         }
         Some(reason) => {

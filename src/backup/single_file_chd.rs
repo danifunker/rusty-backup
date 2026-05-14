@@ -2089,6 +2089,7 @@ pub fn run_via_staging(
     cancel_check: &dyn Fn() -> bool,
     log_cb: &mut dyn FnMut(&str),
     checksum_phase_cb: &mut dyn FnMut(u64, u64),
+    phase_cb: &mut dyn FnMut(&str),
 ) -> Result<SingleFileChdResult> {
     if !is_supported(inputs.partition_table) {
         anyhow::bail!(
@@ -2163,6 +2164,7 @@ pub fn run_via_staging(
         progress_cb,
         cancel_check,
         log_cb,
+        phase_cb,
     )?;
 
     // Phase 2: assemble the staged files into the final CHD.
@@ -2181,6 +2183,7 @@ pub fn run_via_staging(
         checksum_type: inputs.checksum_type,
         source_head_region: head_region_slice,
     };
+    phase_cb("Assembling CHD container from staged partitions");
     let result = assemble_from_staging(
         assemble_inputs,
         progress_cb,
@@ -2225,9 +2228,26 @@ fn stage_partitions_to_zst(
     progress_cb: &mut dyn FnMut(u64),
     cancel_check: &dyn Fn() -> bool,
     log_cb: &mut dyn FnMut(&str),
+    phase_cb: &mut dyn FnMut(&str),
 ) -> Result<()> {
     let total_target: u64 = plans.iter().map(|p| p.new_size_bytes).sum();
     let mut bytes_done: u64 = 0;
+    let staged_count = plans
+        .iter()
+        .filter(|p| {
+            inputs
+                .partitions
+                .iter()
+                .find(|x| x.index == p.index)
+                .map(|x| !x.is_extended_container && x.partition_type_byte != 0xEE)
+                .unwrap_or(false)
+                && inputs
+                    .partition_filter
+                    .map(|f| f.contains(&p.index))
+                    .unwrap_or(true)
+        })
+        .count();
+    let mut stage_idx: usize = 0;
 
     for plan in plans {
         if cancel_check() {
@@ -2266,6 +2286,7 @@ fn stage_partitions_to_zst(
             .and_then(|t| t.iter().find(|(idx, _, _)| *idx == plan.index).copied());
 
         let base_for_progress = bytes_done;
+        stage_idx += 1;
         if let Some((_, clone_target, shape)) = clone_entry {
             if clone_target != target_len {
                 anyhow::bail!(
@@ -2276,13 +2297,18 @@ fn stage_partitions_to_zst(
                     plan.index,
                 );
             }
+            let shape_label = match shape {
+                fs::DefragCloneShape::Flat => "flat HFS+",
+                fs::DefragCloneShape::Wrapped => "wrapped HFS+",
+            };
+            phase_cb(&format!(
+                "Staging partition-{} ({} of {}): analyzing {} catalog (may take minutes)...",
+                plan.index, stage_idx, staged_count, shape_label,
+            ));
             log_cb(&format!(
                 "  staging partition-{} (HFS+ defrag-clone, {}) -> {}.zst ({} bytes)",
                 plan.index,
-                match shape {
-                    fs::DefragCloneShape::Flat => "flat HFS+",
-                    fs::DefragCloneShape::Wrapped => "wrapped HFS+",
-                },
+                shape_label,
                 stage_base.display(),
                 target_len,
             ));
@@ -2349,6 +2375,10 @@ fn stage_partitions_to_zst(
                     }
                 });
 
+            // Once the producer starts emitting bytes, swap the phase
+            // label so the user knows the catalog walk finished and
+            // bytes are flowing.
+            let mut emit_label_set = false;
             let compress_result = crate::rbformats::compress_partition(
                 &mut reader,
                 &stage_base,
@@ -2357,7 +2387,16 @@ fn stage_partitions_to_zst(
                 None,
                 false,
                 None,
-                |n_read| progress_cb(base_for_progress.saturating_add(n_read).min(total_target)),
+                |n_read| {
+                    if !emit_label_set && n_read > 0 {
+                        phase_cb(&format!(
+                            "Staging partition-{} ({} of {}): writing defragmented HFS+ body...",
+                            plan.index, stage_idx, staged_count,
+                        ));
+                        emit_label_set = true;
+                    }
+                    progress_cb(base_for_progress.saturating_add(n_read).min(total_target))
+                },
                 || cancel_check(),
                 |msg| log_cb(msg),
             );
@@ -2391,6 +2430,10 @@ fn stage_partitions_to_zst(
                 report.xattrs_copied,
             ));
         } else {
+            phase_cb(&format!(
+                "Staging partition-{} ({} of {}): zstd-compressing partition body...",
+                plan.index, stage_idx, staged_count,
+            ));
             let body_reader =
                 build_partition_reader(inputs.source_file, part, inputs.sector_by_sector, log_cb)?;
             let mut padded = TakeOrPad::new(body_reader, target_len);
@@ -3663,6 +3706,7 @@ mod tests {
             &cancel_check,
             &mut log_cb,
             &mut |_, _| {},
+            &mut |_| {},
         )
         .expect("run_via_staging");
 
@@ -3775,6 +3819,7 @@ mod tests {
             &cancel,
             &mut log_cb,
             &mut |_, _| {},
+            &mut |_| {},
         )
         .expect("APM run_via_staging");
         assert_eq!(
@@ -3858,8 +3903,15 @@ mod tests {
             alignment_sectors: 0,
             checksum_type: crate::backup::ChecksumType::Sha256,
         };
-        let err = run_via_staging(inputs, &mut |_| {}, &|| false, &mut |_| {}, &mut |_, _| {})
-            .expect_err("invalid HFS+ source must surface a clone-producer error");
+        let err = run_via_staging(
+            inputs,
+            &mut |_| {},
+            &|| false,
+            &mut |_| {},
+            &mut |_, _| {},
+            &mut |_| {},
+        )
+        .expect_err("invalid HFS+ source must surface a clone-producer error");
         let msg = format!("{err:#}");
         // Error chain should reference either the clone pipeline or the
         // HFS+ open. We don't pin to a specific layer since the exact
