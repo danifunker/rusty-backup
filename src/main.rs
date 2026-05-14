@@ -7,10 +7,23 @@ fn main() -> eframe::Result {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_millis()
         .init();
+    // Load icon from bytes with transparency preserved
+    let icon_bytes = include_bytes!("../assets/icons/icon-256.png");
+    let icon_image = image::load_from_memory_with_format(icon_bytes, image::ImageFormat::Png)
+        .expect("Failed to load icon");
+
     // Linux: Request elevation at startup if not already running as root
     #[cfg(target_os = "linux")]
     {
         if !nix::unistd::geteuid().is_root() {
+            // Install AppImage desktop integration *before* elevating, while
+            // we're still the real user — otherwise the .desktop and icon
+            // files would land in ~/.local/share/ owned by root, which
+            // breaks future user-mode runs. Wayland has no per-window icon
+            // protocol; the compositor resolves icons by app_id → installed
+            // .desktop. No-op outside AppImage.
+            rusty_backup::os::linux::install_appimage_desktop_integration(icon_bytes);
+
             log::info!("Rusty Backup requires administrator privileges for disk access.");
             log::info!("Requesting elevation...");
 
@@ -32,11 +45,6 @@ fn main() -> eframe::Result {
     // macOS: no startup elevation needed — authopen handles per-operation
     // privilege escalation via the native macOS auth dialog when the user
     // initiates a backup or restore.
-
-    // Load icon from bytes with transparency preserved
-    let icon_bytes = include_bytes!("../assets/icons/icon-256.png");
-    let icon_image = image::load_from_memory_with_format(icon_bytes, image::ImageFormat::Png)
-        .expect("Failed to load icon");
 
     // Ensure we have RGBA with alpha channel
     let icon_rgba = icon_image.to_rgba8();

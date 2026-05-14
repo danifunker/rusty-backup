@@ -668,3 +668,76 @@ pub fn set_permissive_umask_if_elevated() {
         nix::sys::stat::umask(nix::sys::stat::Mode::empty());
     }
 }
+
+/// When running from an AppImage, write the .desktop file and icon into the
+/// user's XDG data dirs so Wayland compositors can resolve the window's
+/// app_id back to an icon. Wayland has no `_NET_WM_ICON` equivalent, so
+/// without these files installed the compositor falls back to a generic
+/// placeholder icon regardless of what `with_icon()` does.
+///
+/// Best-effort: any failure is logged and swallowed. No-op outside AppImage.
+pub fn install_appimage_desktop_integration(icon_png: &[u8]) {
+    let appimage = match std::env::var_os("APPIMAGE") {
+        Some(p) => PathBuf::from(p),
+        None => return,
+    };
+
+    let home = match real_user_home() {
+        Some(h) => h,
+        None => return,
+    };
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/share"));
+    let apps_dir = data_home.join("applications");
+    let icon_dir = data_home.join("icons/hicolor/256x256/apps");
+    let desktop_path = apps_dir.join("rusty-backup.desktop");
+    let icon_path = icon_dir.join("rusty-backup.png");
+
+    let desktop = format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=Rusty Backup\n\
+         Comment=Backup and restore vintage computer hard disk images\n\
+         Exec={} %F\n\
+         Icon=rusty-backup\n\
+         Categories=Utility;System;\n\
+         Terminal=false\n\
+         StartupNotify=true\n\
+         StartupWMClass=rusty-backup\n",
+        appimage.display(),
+    );
+
+    let needs_install = std::fs::read_to_string(&desktop_path)
+        .map(|existing| existing != desktop)
+        .unwrap_or(true)
+        || !icon_path.exists();
+
+    if !needs_install {
+        return;
+    }
+
+    if let Err(e) = std::fs::create_dir_all(&apps_dir)
+        .and_then(|_| std::fs::create_dir_all(&icon_dir))
+        .and_then(|_| std::fs::write(&desktop_path, &desktop))
+        .and_then(|_| std::fs::write(&icon_path, icon_png))
+    {
+        log::warn!("Could not install AppImage desktop integration: {e}");
+        return;
+    }
+
+    log::info!(
+        "Installed desktop integration ({} / {})",
+        desktop_path.display(),
+        icon_path.display()
+    );
+
+    // Best-effort cache refresh; succeed silently if either tool is missing.
+    let _ = Command::new("update-desktop-database")
+        .arg(&apps_dir)
+        .status();
+    let _ = Command::new("gtk-update-icon-cache")
+        .arg("-t")
+        .arg(data_home.join("icons/hicolor"))
+        .status();
+}
