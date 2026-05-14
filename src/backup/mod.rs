@@ -98,8 +98,9 @@ pub struct BackupConfig {
     pub size_policy: Option<SizePolicy>,
     /// Per-partition target sizes in bytes, keyed by partition index
     /// (single-file CHD only). Entries omitted from this map default to
-    /// the partition's source size. Non-trivial entries trigger
-    /// `single_file_chd::run`'s temp-file resize pipeline.
+    /// the partition's source size. Non-trivial entries route through
+    /// the staging path's per-partition resize machinery (see
+    /// `single_file_chd::run_via_staging`).
     pub partition_target_sizes: Option<Vec<(usize, u64)>>,
     /// When `true`, eligible HFS+/HFSX partitions are routed through the
     /// streamed defrag-clone path: the captured image is a fully repacked
@@ -1283,12 +1284,10 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
 
 /// Single-file CHD backup path. Synthesises a whole-disk image into one
 /// CHD container (chdman/MAME compatible) and writes a `single-file-chd`
-/// `metadata.json` describing the byte ranges inside it.
-///
-/// When the user picks a non-Original `size_policy`,
-/// `single_file_chd::run` takes the temp-file resize pipeline (Stage 4b,
-/// Approach A); otherwise the cheaper `DiskImageStream` path produces a
-/// CHD whose layout matches the source disk byte-for-byte.
+/// `metadata.json` describing the byte ranges inside it. Always routes
+/// through `single_file_chd::run_via_staging`, which stages each
+/// partition's bytes as zstd into a temp dir, then folds the staging
+/// files into the final CHD without a whole-disk scratch image.
 #[allow(clippy::too_many_arguments)] // intentional — pulls run_backup's locals
 fn run_single_file_chd_path(
     config: &BackupConfig,
@@ -1344,11 +1343,12 @@ fn run_single_file_chd_path(
             if !already_set {
                 merged_resize.push((part.index, target));
             }
-            // Even when the user picked a custom size, record the clone target
-            // so `run_with_resize` knows this partition wants a clone stream.
-            // If user_size != clone_target the user wins for the resize plan
-            // but we still need to clone — the cloned HFS+ volume will be
-            // sized to the entry in `merged_resize`.
+            // Even when the user picked a custom size, record the clone
+            // target so the staging path knows this partition wants a
+            // clone stream. If user_size != clone_target the user wins
+            // for the resize plan but we still need to clone — the
+            // cloned HFS+ volume will be sized to the entry in
+            // `merged_resize`.
             let shape = clone_shapes[i].unwrap_or(fs::DefragCloneShape::Flat);
             hfsplus_clone_targets.push((part.index, target, shape));
         }
@@ -1444,10 +1444,10 @@ fn run_single_file_chd_path(
 
     // Install a thread-local progress sink so the HFS+ defrag-clone
     // pipeline can pipe its [defrag-build] tick messages into the GUI
-    // log queue (in addition to stderr). Cleared after `single_file_chd::run`
-    // returns. The sink closure owns its own `Arc<Mutex<BackupProgress>>`
-    // clone so it stays 'static + Send (a requirement for the thread-local
-    // Box-erased fn type).
+    // log queue (in addition to stderr). Cleared after
+    // `single_file_chd::run_via_staging` returns. The sink closure owns
+    // its own `Arc<Mutex<BackupProgress>>` clone so it stays 'static +
+    // Send (a requirement for the thread-local Box-erased fn type).
     let progress_for_sink = progress.clone();
     fs::hfsplus_defrag::set_progress_sink(Some(Box::new(move |msg: &str| {
         if let Ok(mut p) = progress_for_sink.lock() {
@@ -1489,39 +1489,15 @@ fn run_single_file_chd_path(
                 });
             }
         });
-    let staging_reason = single_file_chd::staging_path_unsupported_reason(&inputs);
-    let result = match staging_reason {
-        None => {
-            log(
-                progress,
-                LogLevel::Info,
-                "Using two-phase CHD path (stage zstd partitions, then assemble)".to_string(),
-            );
-            single_file_chd::run_via_staging(
-                inputs,
-                &mut progress_cb,
-                &cancel_check,
-                &mut log_cb,
-                &mut checksum_phase_cb,
-                &mut phase_cb,
-                Some(defrag_log_sink),
-            )
-        }
-        Some(reason) => {
-            log(
-                progress,
-                LogLevel::Info,
-                format!("Using legacy CHD path ({reason})"),
-            );
-            single_file_chd::run(
-                inputs,
-                &mut progress_cb,
-                &cancel_check,
-                &mut log_cb,
-                &mut checksum_phase_cb,
-            )
-        }
-    };
+    let result = single_file_chd::run_via_staging(
+        inputs,
+        &mut progress_cb,
+        &cancel_check,
+        &mut log_cb,
+        &mut checksum_phase_cb,
+        &mut phase_cb,
+        Some(defrag_log_sink),
+    );
 
     fs::hfsplus_defrag::set_progress_sink(None);
     let result = result?;

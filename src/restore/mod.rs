@@ -2765,7 +2765,7 @@ mod tests {
         let mut log_cb = |s: &str| log_buf.push(s.to_string());
         let mut progress_cb = |_: u64| {};
         let cancel_check = || false;
-        let chd_result = single_file_chd::run(
+        let chd_result = single_file_chd::run_via_staging(
             SingleFileChdInputs {
                 source_file: &source_file,
                 source_size: total_bytes,
@@ -2786,6 +2786,8 @@ mod tests {
             &cancel_check,
             &mut log_cb,
             &mut |_, _| {},
+            &mut |_| {},
+            None,
         )
         .expect("backup");
 
@@ -2900,7 +2902,7 @@ mod tests {
         let mut log_cb = |s: &str| log_buf.push(s.to_string());
         let mut progress_cb = |_: u64| {};
         let cancel_check = || false;
-        let chd_result = single_file_chd::run(
+        let chd_result = single_file_chd::run_via_staging(
             SingleFileChdInputs {
                 source_file: &source_file,
                 source_size: total_bytes,
@@ -2921,6 +2923,8 @@ mod tests {
             &cancel_check,
             &mut log_cb,
             &mut |_, _| {},
+            &mut |_| {},
+            None,
         )
         .expect("backup");
 
@@ -3066,7 +3070,7 @@ mod tests {
         let mut log_cb = |_: &str| {};
         let mut progress_cb = |_: u64| {};
         let cancel_check = || false;
-        let chd_result = single_file_chd::run(
+        let chd_result = single_file_chd::run_via_staging(
             SingleFileChdInputs {
                 source_file: &source_file,
                 source_size: total_bytes,
@@ -3087,6 +3091,8 @@ mod tests {
             &cancel_check,
             &mut log_cb,
             &mut |_, _| {},
+            &mut |_| {},
+            None,
         )
         .expect("backup");
 
@@ -3274,7 +3280,7 @@ mod tests {
         let mut log_cb = |s: &str| log_buf.push(s.to_string());
         let mut progress_cb = |_: u64| {};
         let cancel_check = || false;
-        let chd_result = single_file_chd::run(
+        let chd_result = single_file_chd::run_via_staging(
             SingleFileChdInputs {
                 source_file: &source_file,
                 source_size: total_bytes,
@@ -3295,6 +3301,8 @@ mod tests {
             &cancel_check,
             &mut log_cb,
             &mut |_, _| {},
+            &mut |_| {},
+            None,
         )
         .expect("backup");
 
