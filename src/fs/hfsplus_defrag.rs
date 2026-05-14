@@ -304,9 +304,39 @@ pub fn plan_defrag_layout(
     // Pack user file forks contiguously starting at user_data_start.
     let mut next_block = user_data_start;
     let mut file_placements: HashMap<u32, FilePlacement> = HashMap::new();
-    // Stable iteration order for deterministic placement.
+    // Sort files by the first extent's source start_block — this matches
+    // the target-placement order to source disk order so the emit phase
+    // reads the source sequentially. Earlier this sorted by CNID, which
+    // produced a randomish source-read pattern even on a 99.9%-contiguous
+    // disk and starved the encoder when the source is slow (SD cards).
+    // Files with no data fork (resource-only) fall back to their resource
+    // fork's start block; files with neither sort by CNID at the tail.
+    let fork_start_block = |raw: &[u8; 80]| -> Option<u32> {
+        if BigEndian::read_u64(&raw[0..8]) == 0 {
+            None
+        } else {
+            // First extent descriptor: start_block at offset 16, count at 20.
+            // count==0 means "no extent here" (defensive — a 0-byte fork
+            // would have been filtered by logical_size check above, but
+            // some captures may carry zero-count slots after the live data).
+            let count = BigEndian::read_u32(&raw[20..24]);
+            if count == 0 {
+                None
+            } else {
+                Some(BigEndian::read_u32(&raw[16..20]))
+            }
+        }
+    };
     let mut files_sorted: Vec<&SourceFileSnapshot> = snapshot.files.iter().collect();
-    files_sorted.sort_by_key(|f| f.cnid);
+    files_sorted.sort_by_key(|f| {
+        let data_first = fork_start_block(&f.data_fork_raw);
+        let rsrc_first = fork_start_block(&f.rsrc_fork_raw);
+        let primary = data_first.or(rsrc_first);
+        // (primary_or_u32max, cnid) — files without any fork sort to
+        // the end stably by CNID; everything with a fork sorts by
+        // source-disk position.
+        (primary.unwrap_or(u32::MAX), f.cnid)
+    });
     for f in files_sorted {
         let target_cnid = *cnid_map.get(&f.cnid).expect("file CNID must be in map");
         let data_fork = allocate_fork(&mut next_block, f.data_fork_size, bs);
