@@ -1932,6 +1932,266 @@ pub fn assemble_from_staging(
     })
 }
 
+/// `Read` adapter that produces exactly `target_len` bytes from `inner`,
+/// truncating an over-long source or zero-padding a short one. Used by
+/// the staging path to make each per-partition zstd file decompress to
+/// exactly the partition's plan'd `new_size_bytes`, regardless of
+/// whether the underlying compact reader emitted a slightly shorter
+/// stream.
+struct TakeOrPad<R: Read> {
+    inner: R,
+    remaining: u64,
+    inner_done: bool,
+}
+
+impl<R: Read> TakeOrPad<R> {
+    fn new(inner: R, target_len: u64) -> Self {
+        Self {
+            inner,
+            remaining: target_len,
+            inner_done: false,
+        }
+    }
+}
+
+impl<R: Read> Read for TakeOrPad<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            return Ok(0);
+        }
+        let cap = (self.remaining as usize).min(buf.len());
+        if !self.inner_done {
+            let n = self.inner.read(&mut buf[..cap])?;
+            if n > 0 {
+                self.remaining -= n as u64;
+                return Ok(n);
+            }
+            self.inner_done = true;
+        }
+        // Inner finished — zero-pad to target.
+        for b in buf[..cap].iter_mut() {
+            *b = 0;
+        }
+        self.remaining -= cap as u64;
+        Ok(cap)
+    }
+}
+
+/// Two-phase CHD backup: stage each partition into its own zstd file
+/// under a temp staging dir, then call [`assemble_from_staging`] to fold
+/// the staging files into a single `.chd`. Drop-in alternative to
+/// [`run`] / [`run_with_resize`] for the same `SingleFileChdInputs`
+/// shape.
+///
+/// **Status (commit 1b):** Handles raw / compact-reader partitions where
+/// every requested `new_size_bytes` equals the source `size_bytes`
+/// (no FS-level shrink). Partitions flagged for HFS+ defrag-clone or
+/// any partition whose plan changes size return `Err(Unsupported)` for
+/// now — those branches land in commits 1c (FS resize via temp .raw)
+/// and 1d (HFS+ defrag-clone streamed into the staging file). APM
+/// sources are rejected via [`assemble_from_staging`].
+///
+/// The staging dir lives next to `inputs.output_base` so it shares a
+/// filesystem with the destination; sparse semantics carry over for
+/// zstd's zero-block runs. Cleaned up on success and on every error
+/// via the RAII guard.
+pub fn run_via_staging(
+    inputs: SingleFileChdInputs<'_>,
+    progress_cb: &mut dyn FnMut(u64),
+    cancel_check: &dyn Fn() -> bool,
+    log_cb: &mut dyn FnMut(&str),
+    checksum_phase_cb: &mut dyn FnMut(u64, u64),
+) -> Result<SingleFileChdResult> {
+    if !is_supported(inputs.partition_table) {
+        anyhow::bail!(
+            "run_via_staging: {} sources not supported",
+            inputs.partition_table.type_name(),
+        );
+    }
+    if matches!(inputs.partition_table, PartitionTable::Apm(_)) {
+        anyhow::bail!(
+            "run_via_staging: APM support pending — staging-path follow-up will \
+             carry the source head region through"
+        );
+    }
+
+    let has_clone_targets = inputs
+        .hfsplus_clone_targets
+        .map(|t| !t.is_empty())
+        .unwrap_or(false);
+    if has_clone_targets {
+        anyhow::bail!(
+            "run_via_staging: HFS+ defrag-clone targets are not yet supported \
+             on the staging path (commit 1d will add this)"
+        );
+    }
+
+    let plans = match build_resize_plans(&inputs)? {
+        Some(p) => p,
+        None => synthesize_noop_plans(inputs.partitions),
+    };
+
+    let any_resize = plans
+        .iter()
+        .any(|p| p.new_size_bytes != p.old_size_bytes || p.needs_data_move);
+    if any_resize {
+        anyhow::bail!(
+            "run_via_staging: backup-time FS resize is not yet supported on the \
+             staging path (commit 1c will add this via temp .raw materialisation)"
+        );
+    }
+
+    // Staging dir lives next to the output. `tempfile::TempDir` removes
+    // the directory on drop, so a bail-out mid-staging cleans up.
+    let staging_parent = inputs
+        .output_base
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let staging = tempfile::Builder::new()
+        .prefix(".rb-chd-staging-")
+        .tempdir_in(&staging_parent)
+        .with_context(|| {
+            format!(
+                "failed to create staging dir in {}",
+                staging_parent.display()
+            )
+        })?;
+    log_cb(&format!(
+        "Staging per-partition zstd bodies in {}",
+        staging.path().display()
+    ));
+
+    // Phase 1: stage each partition's body as zstd.
+    stage_partitions_to_zst(
+        &inputs,
+        &plans,
+        staging.path(),
+        progress_cb,
+        cancel_check,
+        log_cb,
+    )?;
+
+    // Phase 2: assemble the staged files into the final CHD.
+    let assemble_inputs = AssembleFromStagingInputs {
+        staging_dir: staging.path(),
+        plans: &plans,
+        source_partition_table_bytes: inputs.source_partition_table_bytes,
+        partition_table: inputs.partition_table,
+        partitions: inputs.partitions,
+        source_size: inputs.source_size,
+        output_base: inputs.output_base,
+        chd_options: inputs.chd_options.clone(),
+        is_dvd: inputs.is_dvd,
+        alignment_sectors: inputs.alignment_sectors,
+        checksum_type: inputs.checksum_type,
+    };
+    let result = assemble_from_staging(
+        assemble_inputs,
+        progress_cb,
+        cancel_check,
+        log_cb,
+        checksum_phase_cb,
+    )?;
+
+    // staging.drop() removes the staging dir + all partition-N.zst files
+    drop(staging);
+    Ok(result)
+}
+
+/// Build a "no resize" plan that mirrors each partition's current
+/// offset and size. Used by [`run_via_staging`] when the caller passes
+/// no `resize_targets`.
+fn synthesize_noop_plans(partitions: &[PartitionInfo]) -> Vec<PartitionResizePlan> {
+    partitions
+        .iter()
+        .filter(|p| !p.is_extended_container && p.partition_type_byte != 0xEE)
+        .map(|p| PartitionResizePlan {
+            index: p.index,
+            old_start_lba: p.start_lba,
+            old_size_bytes: p.size_bytes,
+            new_start_lba: p.start_lba,
+            new_size_bytes: p.size_bytes,
+            needs_data_move: false,
+            move_delta_bytes: 0,
+        })
+        .collect()
+}
+
+/// Phase 1 of the staging path: write one `partition-N.zst` per
+/// partition into `staging_dir`. Each file decompresses to exactly
+/// `plan.new_size_bytes` bytes (truncated or zero-padded as needed)
+/// so [`assemble_from_staging`] can wire them up as fixed-length
+/// segments.
+fn stage_partitions_to_zst(
+    inputs: &SingleFileChdInputs<'_>,
+    plans: &[PartitionResizePlan],
+    staging_dir: &Path,
+    progress_cb: &mut dyn FnMut(u64),
+    cancel_check: &dyn Fn() -> bool,
+    log_cb: &mut dyn FnMut(&str),
+) -> Result<()> {
+    let total_target: u64 = plans.iter().map(|p| p.new_size_bytes).sum();
+    let mut bytes_done: u64 = 0;
+
+    for plan in plans {
+        if cancel_check() {
+            anyhow::bail!("operation cancelled");
+        }
+        let part = inputs
+            .partitions
+            .iter()
+            .find(|p| p.index == plan.index)
+            .ok_or_else(|| {
+                anyhow!(
+                    "stage_partitions: plan references unknown partition index {}",
+                    plan.index,
+                )
+            })?;
+        if part.is_extended_container || part.partition_type_byte == 0xEE {
+            continue;
+        }
+        if let Some(filter) = inputs.partition_filter {
+            if !filter.contains(&part.index) {
+                continue;
+            }
+        }
+
+        let target_len = plan.new_size_bytes;
+        let body_reader =
+            build_partition_reader(inputs.source_file, part, inputs.sector_by_sector, log_cb)?;
+        let mut padded = TakeOrPad::new(body_reader, target_len);
+
+        let stage_base = staging_dir.join(format!("partition-{}", plan.index));
+        log_cb(&format!(
+            "  staging partition-{} -> {}.zst ({} bytes)",
+            plan.index,
+            stage_base.display(),
+            target_len,
+        ));
+
+        // Use compress_partition with Zstd so the staging file is
+        // exactly what the existing zstd backup path emits, byte-for-byte.
+        let base_for_progress = bytes_done;
+        let _files = crate::rbformats::compress_partition(
+            &mut padded,
+            &stage_base,
+            super::CompressionType::Zstd,
+            target_len,
+            None,
+            false,
+            None,
+            |n_read| progress_cb(base_for_progress.saturating_add(n_read).min(total_target)),
+            || cancel_check(),
+            |msg| log_cb(msg),
+        )
+        .with_context(|| format!("failed to zstd-stage partition-{}", plan.index))?;
+        bytes_done = bytes_done.saturating_add(target_len);
+        progress_cb(bytes_done.min(total_target));
+    }
+    Ok(())
+}
+
 /// In-memory analogue of [`write_patched_table`]: returns the synthesised
 /// patched-table bytes (and, for GPT, the backup-GPT tail) as
 /// `DiskImageStreamBuilder` segments. Used by [`assemble_from_staging`]
@@ -3077,6 +3337,151 @@ mod tests {
             readback,
             data[..expected_extent as usize],
             "assembled CHD must round-trip the synthesised disk image byte-for-byte over the envelope",
+        );
+    }
+
+    /// Commit 1b: `run_via_staging` (no resize, MBR, raw passthrough)
+    /// produces a CHD that round-trips the source disk. Exercises the
+    /// full stage-then-assemble cycle end-to-end and verifies the
+    /// staging dir is cleaned up afterwards.
+    #[test]
+    fn run_via_staging_round_trip_mbr_no_resize() {
+        const TOTAL_SECTORS: u32 = 8192;
+        const PART_SECTORS: u32 = 4095;
+        const SECTOR_SIZE: u64 = 512;
+        let total_bytes = (TOTAL_SECTORS as u64) * SECTOR_SIZE;
+        let part_bytes = (PART_SECTORS as u64) * SECTOR_SIZE;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let source_path = tmp.path().join("source.img");
+
+        let mut data = vec![0u8; total_bytes as usize];
+        data[..512].copy_from_slice(&build_test_mbr(PART_SECTORS));
+        for i in 0..(part_bytes as usize) {
+            data[512 + i] = ((i % 251) as u8).wrapping_add(1);
+        }
+        std::fs::write(&source_path, &data).unwrap();
+
+        let source_file = File::open(&source_path).unwrap();
+        let source_size = source_file.metadata().unwrap().len();
+        let mut br = BufReader::new(source_file.try_clone().unwrap());
+        let table = PartitionTable::detect(&mut br).unwrap();
+        let partitions = table.partitions();
+        assert_eq!(partitions.len(), 1);
+
+        let mbr_bytes = {
+            let mut buf = [0u8; 512];
+            buf.copy_from_slice(&data[..512]);
+            buf
+        };
+
+        let output_base = tmp.path().join("disk");
+        let inputs = SingleFileChdInputs {
+            source_file: &source_file,
+            source_size,
+            source_partition_table_bytes: &mbr_bytes,
+            partition_table: &table,
+            partitions: &partitions,
+            partition_filter: None,
+            sector_by_sector: false,
+            chd_options: None,
+            is_dvd: false,
+            output_base: &output_base,
+            resize_targets: None,
+            hfsplus_clone_targets: None,
+            alignment_sectors: 0,
+            checksum_type: crate::backup::ChecksumType::Sha256,
+        };
+
+        let mut log_buf: Vec<String> = Vec::new();
+        let mut log_cb = |s: &str| log_buf.push(s.to_string());
+        let mut progress_seen: u64 = 0;
+        let mut progress_cb = |n: u64| progress_seen = progress_seen.max(n);
+        let cancel_check = || false;
+
+        let result = run_via_staging(
+            inputs,
+            &mut progress_cb,
+            &cancel_check,
+            &mut log_cb,
+            &mut |_, _| {},
+        )
+        .expect("run_via_staging");
+
+        let expected_extent = 512 + part_bytes;
+        assert_eq!(result.container_filename, "disk.chd");
+        assert_eq!(result.container_logical_size, expected_extent);
+        assert_eq!(result.partition_ranges.len(), 1);
+        assert_eq!(result.partition_ranges[0].offset_in_disk, 512);
+        assert_eq!(result.partition_ranges[0].length, part_bytes);
+        assert!(progress_seen > 0, "progress callback never fired");
+
+        let chd_path = tmp.path().join("disk.chd");
+        let mut reader = ChdReader::open(&chd_path).expect("reopen CHD");
+        let mut readback = vec![0u8; expected_extent as usize];
+        reader.read_exact(&mut readback).expect("read full CHD");
+        assert_eq!(
+            readback,
+            data[..expected_extent as usize],
+            "run_via_staging must round-trip the source disk byte-for-byte over the envelope",
+        );
+
+        // Staging dir must be gone — tempfile::TempDir's drop runs on
+        // success. Glob for any leftover ".rb-chd-staging-*" sibling.
+        let parent = output_base.parent().unwrap();
+        for entry in std::fs::read_dir(parent).unwrap() {
+            let name = entry.unwrap().file_name();
+            let s = name.to_string_lossy();
+            assert!(
+                !s.starts_with(".rb-chd-staging-"),
+                "staging dir leaked: {s}",
+            );
+        }
+    }
+
+    /// Commit 1b: HFS+ defrag-clone targets are not yet supported on
+    /// the staging path; `run_via_staging` must reject them cleanly so
+    /// the caller can fall back to `run`.
+    #[test]
+    fn run_via_staging_rejects_hfsplus_clone_targets() {
+        const PART_SECTORS: u32 = 4095;
+        let mbr = build_test_mbr(PART_SECTORS);
+        let mut br = std::io::Cursor::new(mbr.to_vec());
+        let table = PartitionTable::detect(&mut br).unwrap();
+        let partitions = table.partitions();
+        let tmp = tempfile::tempdir().unwrap();
+        let source_path = tmp.path().join("source.img");
+        std::fs::write(&source_path, vec![0u8; ((PART_SECTORS as usize) + 1) * 512]).unwrap();
+        let source_file = File::open(&source_path).unwrap();
+        let source_size = source_file.metadata().unwrap().len();
+        let output_base = tmp.path().join("disk");
+        let clone_targets = vec![(
+            partitions[0].index,
+            partitions[0].size_bytes,
+            fs::DefragCloneShape::Flat,
+        )];
+        let inputs = SingleFileChdInputs {
+            source_file: &source_file,
+            source_size,
+            source_partition_table_bytes: &mbr,
+            partition_table: &table,
+            partitions: &partitions,
+            partition_filter: None,
+            sector_by_sector: false,
+            chd_options: None,
+            is_dvd: false,
+            output_base: &output_base,
+            resize_targets: None,
+            hfsplus_clone_targets: Some(&clone_targets),
+            alignment_sectors: 0,
+            checksum_type: crate::backup::ChecksumType::Sha256,
+        };
+        let err = run_via_staging(inputs, &mut |_| {}, &|| false, &mut |_| {}, &mut |_, _| {})
+            .expect_err("run_via_staging must reject HFS+ clone targets");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("HFS+ defrag-clone"),
+            "error message must explain the limitation: {msg}",
         );
     }
 }
