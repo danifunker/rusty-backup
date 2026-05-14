@@ -1710,6 +1710,296 @@ fn hex_lower(b: &[u8]) -> String {
     s
 }
 
+/// Inputs for [`assemble_from_staging`]. Mirrors the shape of
+/// [`SingleFileChdInputs`] but reads partition bodies from
+/// per-partition zstd files in `staging_dir` instead of from a live
+/// source disk. The patched partition table is synthesised in-memory
+/// from `partition_table` + `plans`, so the source disk does not need
+/// to be re-read here.
+pub struct AssembleFromStagingInputs<'a> {
+    /// Directory containing one `partition-N.zst` file per partition
+    /// listed in `plans`. Each file decompresses to exactly
+    /// `plan.new_size_bytes` bytes.
+    pub staging_dir: &'a Path,
+    /// Per-partition resize plan, one entry per partition to embed in
+    /// the output CHD. Drives both the patched-table offsets and the
+    /// segment placement.
+    pub plans: &'a [PartitionResizePlan],
+    /// MBR sector (or GPT pMBR sector) captured by the caller before
+    /// the staging phase. Used to seed the patched-table emit step;
+    /// for GPT the primary header + entries are rebuilt from
+    /// `partition_table` so only the 512-byte pMBR portion is consulted.
+    pub source_partition_table_bytes: &'a [u8],
+    pub partition_table: &'a PartitionTable,
+    pub partitions: &'a [PartitionInfo],
+    /// Source disk size in bytes. Used as the upper bound for
+    /// [`compute_resized_envelope`].
+    pub source_size: u64,
+    /// `<folder>/<stem>` base. `compress_chd` appends `.chd`.
+    pub output_base: &'a Path,
+    pub chd_options: Option<ChdOptions>,
+    pub is_dvd: bool,
+    pub alignment_sectors: u64,
+    pub checksum_type: super::ChecksumType,
+}
+
+/// Assemble a single-file CHD by streaming per-partition zstd-compressed
+/// bodies from a staging directory into the disk-image stream builder,
+/// then through `compress_chd` / `compress_chd_dvd`. No scratch disk
+/// image required: the patched partition table is synthesised in-memory
+/// and each partition's bytes flow through a zstd decoder directly into
+/// the CHD encoder under the back-pressure of the encoder's hunk writes.
+///
+/// **Status (commit 1a):** MBR and GPT sources supported. APM sources
+/// return `Err` for now; a follow-up commit will accept a
+/// `source_head_region: &[u8]` parameter so the driver partition bodies
+/// can be carried verbatim from the source-read phase into the
+/// patched APM head segment.
+pub fn assemble_from_staging(
+    inputs: AssembleFromStagingInputs<'_>,
+    progress_cb: &mut dyn FnMut(u64),
+    cancel_check: &dyn Fn() -> bool,
+    log_cb: &mut dyn FnMut(&str),
+    checksum_phase_cb: &mut dyn FnMut(u64, u64),
+) -> Result<SingleFileChdResult> {
+    if !is_supported(inputs.partition_table) {
+        anyhow::bail!(
+            "assemble_from_staging: {} sources not supported",
+            inputs.partition_table.type_name(),
+        );
+    }
+    if matches!(inputs.partition_table, PartitionTable::Apm(_)) {
+        anyhow::bail!(
+            "assemble_from_staging: APM support pending — staging-path \
+             follow-up will carry the source head region through"
+        );
+    }
+    if inputs.plans.is_empty() {
+        anyhow::bail!("assemble_from_staging: empty resize plan");
+    }
+
+    let overrides = plans_to_overrides(inputs.plans);
+    let target_size = compute_resized_envelope(
+        inputs.plans,
+        inputs.alignment_sectors,
+        inputs.source_size,
+        inputs.partition_table,
+    );
+    log_cb(&format!(
+        "Assembling single-file CHD from staging dir {} (logical {} bytes, {} partition(s))",
+        inputs.staging_dir.display(),
+        target_size,
+        inputs.plans.len(),
+    ));
+
+    let (head_segments, backup_tail) = build_patched_head_segments(
+        inputs.source_partition_table_bytes,
+        inputs.partition_table,
+        &overrides,
+        target_size,
+        log_cb,
+    )?;
+
+    let mut builder = DiskImageStreamBuilder::new(target_size);
+    let mut partition_ranges: Vec<ChdPartitionRange> = Vec::with_capacity(inputs.plans.len());
+
+    for (offset, length, reader) in head_segments {
+        builder
+            .add_segment(offset, length, reader)
+            .map_err(|e| anyhow!("disk-image stream rejected head segment at {offset}: {e}"))?;
+    }
+
+    for plan in inputs.plans {
+        if cancel_check() {
+            anyhow::bail!("operation cancelled");
+        }
+        let part = inputs
+            .partitions
+            .iter()
+            .find(|p| p.index == plan.index)
+            .ok_or_else(|| {
+                anyhow!(
+                    "assemble_from_staging: plan references unknown partition index {}",
+                    plan.index,
+                )
+            })?;
+        if part.is_extended_container || part.partition_type_byte == 0xEE {
+            // Containers and protective-MBR entries don't have a body
+            // file in staging; they live inside the patched table.
+            continue;
+        }
+        let part_offset = plan.new_start_lba * 512;
+        let part_length = plan.new_size_bytes;
+        let staged = inputs
+            .staging_dir
+            .join(format!("partition-{}.zst", plan.index));
+        let file = File::open(&staged).with_context(|| {
+            format!(
+                "failed to open staging file {} for partition-{}",
+                staged.display(),
+                plan.index
+            )
+        })?;
+        // zstd::Decoder requires BufRead; wrap with BufReader for
+        // efficient chunked reads. Cap to `part_length` so a
+        // miscompressed staging file can't overrun its assigned
+        // segment.
+        let decoder = zstd::Decoder::new(file)
+            .with_context(|| format!("failed to open zstd decoder on {}", staged.display(),))?;
+        let reader: Box<dyn Read + Send> = Box::new(decoder.take(part_length));
+        builder
+            .add_segment(part_offset, part_length, reader)
+            .map_err(|e| {
+                anyhow!(
+                    "disk-image stream rejected partition-{} segment at {part_offset}: {e}",
+                    plan.index,
+                )
+            })?;
+        partition_ranges.push(ChdPartitionRange {
+            partition_index: plan.index,
+            offset_in_disk: part_offset,
+            length: part_length,
+            checksum: String::new(),
+        });
+    }
+
+    if let Some((offset, length, reader)) = backup_tail {
+        builder
+            .add_segment(offset, length, reader)
+            .map_err(|e| anyhow!("disk-image stream rejected backup-GPT tail segment: {e}"))?;
+    }
+
+    let mut stream = builder.build();
+    let logical_size = stream.total_length();
+
+    let mut chd_progress_cb = |n: u64| progress_cb(n);
+    let mut chd_log_cb = |s: &str| log_cb(s);
+    let chd_cancel_check = || cancel_check();
+
+    let written_files = if inputs.is_dvd {
+        compress_chd_dvd(
+            &mut stream,
+            inputs.output_base,
+            logical_size,
+            None,
+            inputs.chd_options.clone(),
+            &mut chd_progress_cb,
+            &chd_cancel_check,
+            &mut chd_log_cb,
+        )?
+    } else {
+        compress_chd(
+            &mut stream,
+            inputs.output_base,
+            logical_size,
+            None,
+            inputs.chd_options.clone(),
+            &mut chd_progress_cb,
+            &chd_cancel_check,
+            &mut chd_log_cb,
+        )?
+    };
+
+    let container_filename = written_files
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("compress_chd returned no output filename"))?;
+
+    let chd_path = inputs
+        .output_base
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(&container_filename);
+    log_cb(&format!(
+        "Computing per-partition checksums from {}",
+        chd_path.display()
+    ));
+    let checksum_total: u64 = partition_ranges.iter().map(|r| r.length).sum();
+    checksum_phase_cb(0, checksum_total);
+    let container_sha1 = compute_post_write_metadata(
+        &chd_path,
+        &mut partition_ranges,
+        inputs.checksum_type,
+        &mut |cur| checksum_phase_cb(cur, checksum_total),
+        log_cb,
+    )?;
+
+    Ok(SingleFileChdResult {
+        container_filename,
+        container_logical_size: logical_size,
+        container_sha1,
+        partition_ranges,
+    })
+}
+
+/// In-memory analogue of [`write_patched_table`]: returns the synthesised
+/// patched-table bytes (and, for GPT, the backup-GPT tail) as
+/// `DiskImageStreamBuilder` segments. Used by [`assemble_from_staging`]
+/// to avoid materialising a scratch disk image just to host the table.
+fn build_patched_head_segments(
+    source_partition_table_bytes: &[u8],
+    table: &PartitionTable,
+    overrides: &[PartitionSizeOverride],
+    target_size: u64,
+    log_cb: &mut dyn FnMut(&str),
+) -> Result<(Vec<Segment>, Option<Segment>)> {
+    match table {
+        PartitionTable::Mbr(_) => {
+            let mut mbr_buf = [0u8; 512];
+            let copy_len = source_partition_table_bytes.len().min(512);
+            mbr_buf[..copy_len].copy_from_slice(&source_partition_table_bytes[..copy_len]);
+            patch_mbr_entries(&mut mbr_buf, overrides);
+            log_cb("  table: MBR (patched with new partition sizes/offsets)");
+            let head: Segment = (
+                0,
+                mbr_buf.len() as u64,
+                Box::new(std::io::Cursor::new(mbr_buf.to_vec())),
+            );
+            Ok((vec![head], None))
+        }
+        PartitionTable::Gpt { gpt, .. } => {
+            let total_sectors = target_size / 512;
+            let mut head_bytes: Vec<u8> = Vec::with_capacity(34 * 512);
+            head_bytes.extend_from_slice(&crate::partition::gpt::Gpt::build_protective_mbr(
+                total_sectors,
+            ));
+            let patched = gpt.patch_for_restore(overrides, total_sectors);
+            head_bytes.extend(patched.build_primary_gpt(total_sectors));
+
+            let backup = patched.build_backup_gpt(total_sectors);
+            let backup_offset = target_size
+                .checked_sub(backup.len() as u64)
+                .ok_or_else(|| anyhow!("target size smaller than backup GPT region"))?;
+            log_cb(&format!(
+                "  table: GPT (patched primary at LBA 1, backup at offset {backup_offset})"
+            ));
+            let backup_len = backup.len() as u64;
+            let head: Segment = (
+                0,
+                head_bytes.len() as u64,
+                Box::new(std::io::Cursor::new(head_bytes)),
+            );
+            let tail: Segment = (
+                backup_offset,
+                backup_len,
+                Box::new(std::io::Cursor::new(backup)),
+            );
+            Ok((vec![head], Some(tail)))
+        }
+        PartitionTable::Apm(_) => {
+            anyhow::bail!("assemble_from_staging: APM head segment synthesis pending in commit 1a");
+        }
+        PartitionTable::Sgi(_) => {
+            anyhow::bail!(
+                "assemble_from_staging: SGI Volume Header sources are not supported (browse only)"
+            );
+        }
+        PartitionTable::None { .. } => {
+            anyhow::bail!("assemble_from_staging: superfloppy sources are not supported");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2678,5 +2968,115 @@ mod tests {
         assert_eq!(est_resize.scratch_bytes, sum + 1024 * 1024);
         assert_eq!(est_resize.output_bytes, 123_456_789);
         assert_eq!(est_resize.required_total(), sum + 1024 * 1024 + 123_456_789,);
+    }
+
+    /// Commit 1a: `assemble_from_staging` reads a zstd-staged partition
+    /// body and emits a CHD whose decompressed image matches the source.
+    /// Builds a synthetic 4 MiB MBR disk with one partition, writes the
+    /// partition body to `<staging>/partition-0.zst`, runs the assembler,
+    /// and verifies the round-trip.
+    #[test]
+    fn assemble_from_staging_round_trip_mbr_single_partition() {
+        const TOTAL_SECTORS: u32 = 8192;
+        const PART_SECTORS: u32 = 4095;
+        const SECTOR_SIZE: u64 = 512;
+        let total_bytes = (TOTAL_SECTORS as u64) * SECTOR_SIZE;
+        let part_bytes = (PART_SECTORS as u64) * SECTOR_SIZE;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let staging = tmp.path().join("staging");
+        std::fs::create_dir(&staging).unwrap();
+
+        // Build the source bytes (MBR + body + zero tail) just so we can
+        // compare against the decompressed CHD. Only the MBR + body are
+        // fed to the assembler; the tail is zero-filled by the stream
+        // builder.
+        let mut data = vec![0u8; total_bytes as usize];
+        let mbr = build_test_mbr(PART_SECTORS);
+        data[..512].copy_from_slice(&mbr);
+        for i in 0..(part_bytes as usize) {
+            data[512 + i] = ((i % 251) as u8).wrapping_add(1);
+        }
+
+        // Stage the partition body as partition-0.zst.
+        let body = &data[512..(512 + part_bytes as usize)];
+        let staged_path = staging.join("partition-0.zst");
+        {
+            let f = File::create(&staged_path).unwrap();
+            let mut enc = zstd::Encoder::new(f, 3).unwrap();
+            enc.write_all(body).unwrap();
+            enc.finish().unwrap();
+        }
+
+        // Parse the synthesised MBR the same way `run_backup` would.
+        let mut br = std::io::Cursor::new(mbr.to_vec());
+        let table = PartitionTable::detect(&mut br).unwrap();
+        let partitions = table.partitions();
+        assert_eq!(partitions.len(), 1);
+
+        // No resize: plan mirrors the source layout.
+        let part = &partitions[0];
+        let plans = vec![PartitionResizePlan {
+            index: part.index,
+            old_start_lba: part.start_lba,
+            old_size_bytes: part.size_bytes,
+            new_start_lba: part.start_lba,
+            new_size_bytes: part.size_bytes,
+            needs_data_move: false,
+            move_delta_bytes: 0,
+        }];
+
+        let output_base = tmp.path().join("disk");
+        let inputs = AssembleFromStagingInputs {
+            staging_dir: &staging,
+            plans: &plans,
+            source_partition_table_bytes: &mbr,
+            partition_table: &table,
+            partitions: &partitions,
+            source_size: total_bytes,
+            output_base: &output_base,
+            chd_options: None,
+            is_dvd: false,
+            alignment_sectors: 0,
+            checksum_type: crate::backup::ChecksumType::Sha256,
+        };
+
+        let mut log_buf: Vec<String> = Vec::new();
+        let mut log_cb = |s: &str| log_buf.push(s.to_string());
+        let mut progress_seen: u64 = 0;
+        let mut progress_cb = |n: u64| progress_seen = progress_seen.max(n);
+        let cancel_check = || false;
+
+        let result = assemble_from_staging(
+            inputs,
+            &mut progress_cb,
+            &cancel_check,
+            &mut log_cb,
+            &mut |_, _| {},
+        )
+        .expect("assemble_from_staging");
+
+        // The shrunken envelope is the byte just past the last partition's
+        // new extent (no GPT trailer, no aligned-up source size). For
+        // this single-MBR-partition layout the assembled disk covers
+        // sectors 0..(1 + PART_SECTORS) bytes — the source disk's
+        // trailing zero pad is not part of the CHD.
+        let expected_extent = 512 + part_bytes;
+        assert_eq!(result.container_filename, "disk.chd");
+        assert_eq!(result.container_logical_size, expected_extent);
+        assert_eq!(result.partition_ranges.len(), 1);
+        assert_eq!(result.partition_ranges[0].offset_in_disk, 512);
+        assert_eq!(result.partition_ranges[0].length, part_bytes);
+        assert!(progress_seen > 0, "progress callback never fired");
+
+        let chd_path = tmp.path().join("disk.chd");
+        let mut reader = ChdReader::open(&chd_path).expect("reopen CHD");
+        let mut readback = vec![0u8; expected_extent as usize];
+        reader.read_exact(&mut readback).expect("read full CHD");
+        assert_eq!(
+            readback,
+            data[..expected_extent as usize],
+            "assembled CHD must round-trip the synthesised disk image byte-for-byte over the envelope",
+        );
     }
 }
