@@ -3545,7 +3545,7 @@ mod tests {
         {
             let cur = Cursor::new(&mut src_img);
             let mut hfs = HfsPlusFilesystem::open(cur, 0).unwrap();
-            stream_defragmented_hfsplus(&mut hfs, CLONE_BYTES, &mut clone_buf)
+            stream_defragmented_hfsplus(&mut hfs, CLONE_BYTES, &mut clone_buf, None)
                 .expect("stream_defragmented_hfsplus");
         }
         assert_eq!(clone_buf.len() as u64, CLONE_BYTES);

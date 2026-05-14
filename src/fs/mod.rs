@@ -724,6 +724,7 @@ pub fn partition_minimum_size<R: Read + Seek + Send + 'static>(
     partition_type_string: Option<&str>,
     partition_size: u64,
     allow_expensive: bool,
+    wrapper_hint: Option<hfsplus_wrapper_clone::WrappedHfsPlusInfo>,
     progress: &dyn Fn(&str),
 ) -> MinimumResult {
     if !allow_expensive && is_expensive_minimum(partition_type, partition_type_string) {
@@ -739,13 +740,25 @@ pub fn partition_minimum_size<R: Read + Seek + Send + 'static>(
     // the inner up to the outer wrapper's allocation-block boundary at
     // clone time and disagree with the precomputed value (the engine then
     // bails with "planned size disagrees with resize plan size").
+    //
+    // When `wrapper_hint` is supplied, the caller has already probed the
+    // MDB via a race-safe path (positioned read on a non-shared handle)
+    // and we skip our own seek+read probe. This matters when the reader
+    // is a `try_clone`'d fd that shares its seek offset with other workers:
+    // a concurrent seek can clobber the probe and leak another partition's
+    // wrapper params. See min_size_runner.
     let mut reader = reader;
-    progress("Probing for HFS wrapper...");
-    let wrapper_info =
-        hfsplus_wrapper_clone::detect_wrapped_hfsplus(&mut reader, partition_offset, u64::MAX);
+    let (wrapper_info, wrapper_source) = if let Some(hint) = wrapper_hint {
+        (Some(hint), "hint")
+    } else {
+        progress("Probing for HFS wrapper...");
+        let info =
+            hfsplus_wrapper_clone::detect_wrapped_hfsplus(&mut reader, partition_offset, u64::MAX);
+        (info, "probe")
+    };
     match wrapper_info.as_ref() {
         Some(info) => progress(&format!(
-            "Wrapper detected: al_block_size={} drAlBlSt={} drNmAlBlks={} \
+            "Wrapper detected ({wrapper_source}): al_block_size={} drAlBlSt={} drNmAlBlks={} \
              embed_start_block={} embed_block_count={} inner_offset={} inner_size={}",
             info.al_block_size,
             info.al_block_start_sector,

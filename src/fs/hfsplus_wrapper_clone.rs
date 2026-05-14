@@ -289,6 +289,7 @@ pub fn stream_wrapped_defragmented_hfsplus<R, W>(
     reader: &mut R,
     plan: &WrappedClonePlan,
     dst: &mut W,
+    before_emit: Option<&dyn Fn()>,
 ) -> Result<DefragReport, WrappedCloneError>
 where
     R: Read + Seek + Send,
@@ -382,7 +383,7 @@ where
         return Err(WrappedCloneError::InnerOuterBlockMismatch(inner_bs));
     }
 
-    let report = stream_defragmented_hfsplus(&mut inner_fs, plan.new_inner_size, dst)
+    let report = stream_defragmented_hfsplus(&mut inner_fs, plan.new_inner_size, dst, before_emit)
         .map_err(WrappedCloneError::Filesystem)?;
     written += plan.new_inner_size;
 
@@ -609,7 +610,7 @@ mod tests {
 
         let mut out: Vec<u8> = Vec::with_capacity(partition_size as usize);
         let mut src_cur = Cursor::new(img.as_slice());
-        let report = stream_wrapped_defragmented_hfsplus(&mut src_cur, &plan, &mut out)
+        let report = stream_wrapped_defragmented_hfsplus(&mut src_cur, &plan, &mut out, None)
             .expect("clone should succeed");
         // Empty inner volume — no files copied, but stream completed.
         assert_eq!(report.files_copied, 0);
@@ -644,7 +645,7 @@ mod tests {
 
         let mut out: Vec<u8> = Vec::with_capacity(plan.new_partition_size as usize);
         let mut src_cur = Cursor::new(img.as_slice());
-        stream_wrapped_defragmented_hfsplus(&mut src_cur, &plan, &mut out)
+        stream_wrapped_defragmented_hfsplus(&mut src_cur, &plan, &mut out, None)
             .expect("shrink clone should succeed");
         assert_eq!(out.len(), plan.new_partition_size as usize);
 

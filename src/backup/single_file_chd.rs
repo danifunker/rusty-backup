@@ -1514,6 +1514,7 @@ fn stage_partitions_to_zst(
                                 &mut hfs,
                                 target_len,
                                 &mut writer,
+                                None,
                             )
                             .context("stream_defragmented_hfsplus")
                         }
@@ -1562,6 +1563,7 @@ fn stage_partitions_to_zst(
                                 &mut br,
                                 &cplan,
                                 &mut writer,
+                                None,
                             )
                             .map_err(|e| anyhow!("{e}"))
                         }

@@ -1061,6 +1061,7 @@ pub fn stream_defragmented_hfsplus<R, W>(
     source: &mut HfsPlusFilesystem<R>,
     target_size: u64,
     dst: &mut W,
+    before_emit: Option<&dyn Fn()>,
 ) -> Result<DefragReport, FilesystemError>
 where
     R: Read + Seek + Send,
@@ -1071,6 +1072,15 @@ where
     let plan = plan_defrag_layout(&snapshot, target_size)
         .map_err(|e| FilesystemError::InvalidData(format!("defrag plan failed: {e}")))?;
     let meta = build_target_metadata(&plan, &snapshot)?;
+    // Random-access phases (catalog walk in `capture`, B-tree population
+    // in `build_target_metadata`) are now done; what follows is a long,
+    // mostly-sequential drain of fork bytes from the source. Callers can
+    // use this hook to flip a wrapping `BulkBufReader` into bulk fill
+    // mode so the next phase collapses thousands of small reads into a
+    // handful of multi-hundred-MiB syscalls.
+    if let Some(cb) = before_emit {
+        cb();
+    }
 
     let bs = plan.block_size as u64;
     let mut writer = CountingWriter::new(dst);
@@ -2537,7 +2547,7 @@ mod tests {
 
         let target_size: u64 = 8 * 1024 * 1024;
         let mut out: Vec<u8> = Vec::with_capacity(target_size as usize);
-        let report = stream_defragmented_hfsplus(&mut src_fs, target_size, &mut out)
+        let report = stream_defragmented_hfsplus(&mut src_fs, target_size, &mut out, None)
             .expect("stream emit should succeed");
         assert_eq!(out.len() as u64, target_size, "emit size mismatch");
         assert_eq!(report.bytes_emitted, target_size);
@@ -2633,7 +2643,7 @@ mod tests {
         let mut src_fs = HfsPlusFilesystem::open(cur, 0).unwrap();
         let target_size: u64 = 8 * 1024 * 1024;
         let mut out: Vec<u8> = Vec::with_capacity(target_size as usize);
-        let report = stream_defragmented_hfsplus(&mut src_fs, target_size, &mut out)
+        let report = stream_defragmented_hfsplus(&mut src_fs, target_size, &mut out, None)
             .expect("stream emit should succeed");
         assert_eq!(out.len() as u64, target_size, "emit size mismatch");
         assert_eq!(report.bytes_emitted, target_size);

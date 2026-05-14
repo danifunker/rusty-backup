@@ -951,6 +951,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                                 &mut hfs,
                                 target_size,
                                 &mut writer,
+                                None,
                             )
                             .context("stream_defragmented_hfsplus")?
                         }
@@ -982,6 +983,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                                 &mut br,
                                 &plan,
                                 &mut writer,
+                                None,
                             )
                             .map_err(|e| anyhow::anyhow!("{e}"))?
                         }

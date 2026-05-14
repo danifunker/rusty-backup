@@ -91,6 +91,21 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
                 file,
                 use_sector_aligned,
             } => {
+                // Race-safe wrapper probe: `try_clone` on Unix is `dup()`,
+                // which shares the kernel seek offset across workers, so a
+                // concurrent `seek + read` from another partition's worker
+                // can clobber a plain `detect_wrapped_hfsplus` probe and
+                // leak the wrong partition's wrapper params. Read the MDB
+                // here via positioned I/O on the original handle (which
+                // doesn't touch the shared cursor) and pass the parsed
+                // info into `partition_minimum_size` as a hint so it skips
+                // its own probe.
+                progress("Probing for HFS wrapper...");
+                let wrapper_hint = fs::hfsplus_wrapper_clone::detect_wrapped_hfsplus_at(
+                    &file,
+                    req.partition_offset,
+                    u64::MAX,
+                );
                 let clone = match file.try_clone() {
                     Ok(f) => f,
                     Err(e) => {
@@ -109,6 +124,7 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
                         req.partition_type_string.as_deref(),
                         req.partition_size,
                         true,
+                        wrapper_hint,
                         &progress,
                     )
                 } else {
@@ -119,6 +135,7 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
                         req.partition_type_string.as_deref(),
                         req.partition_size,
                         true,
+                        wrapper_hint,
                         &progress,
                     )
                 }
@@ -131,6 +148,7 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
                     req.partition_type_string.as_deref(),
                     req.partition_size,
                     true,
+                    None,
                     &progress,
                 ),
                 Err(e) => {

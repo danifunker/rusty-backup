@@ -1109,6 +1109,7 @@ impl BackupTab {
                         part.partition_type_string.as_deref(),
                         part.size_bytes,
                         false,
+                        None,
                         &|_| {},
                     );
                     match result {
@@ -1280,6 +1281,7 @@ impl BackupTab {
                                 part.partition_type_string.as_deref(),
                                 part.size_bytes,
                                 false,
+                                None,
                                 &|_| {},
                             );
                             match result {

@@ -2185,6 +2185,7 @@ impl InspectTab {
                                 part.partition_type_string.as_deref(),
                                 part.size_bytes,
                                 false,
+                                None,
                                 &|_| {},
                             )
                         } else {
@@ -2199,6 +2200,7 @@ impl InspectTab {
                                     part.partition_type_string.as_deref(),
                                     part.size_bytes,
                                     false,
+                                    None,
                                     &|_| {},
                                 )
                             } else {
@@ -2209,6 +2211,7 @@ impl InspectTab {
                                     part.partition_type_string.as_deref(),
                                     part.size_bytes,
                                     false,
+                                    None,
                                     &|_| {},
                                 )
                             }
