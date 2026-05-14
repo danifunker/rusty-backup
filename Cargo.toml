@@ -32,7 +32,7 @@ default = []
 [dependencies]
 eframe = { version = "0.34", features = ["glow"] }
 egui = "0.34"
-rfd = "0.17"
+rfd = { version = "0.17", default-features = false, features = ["gtk3"] }
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

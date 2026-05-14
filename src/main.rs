@@ -49,10 +49,18 @@ fn main() -> eframe::Result {
     };
 
     // Allow forcing a specific renderer via env var; otherwise auto.
-    //   RUSTY_BACKUP_RENDERER=wgpu  -> wgpu only (Vulkan/Metal/DX12, no fallback)
-    //   RUSTY_BACKUP_RENDERER=glow  -> OpenGL only (no wgpu attempt)
-    //   unset                       -> try wgpu, fall back to glow on failure
+    //   RUSTY_BACKUP_RENDERER=wgpu     -> wgpu only (Vulkan/Metal/DX12, no fallback)
+    //   RUSTY_BACKUP_RENDERER=glow     -> OpenGL only (no wgpu attempt)
+    //   RUSTY_BACKUP_RENDERER=software -> OpenGL via mesa llvmpipe (no GPU)
+    //   unset                          -> try wgpu, fall back to glow, then software
     let forced = std::env::var("RUSTY_BACKUP_RENDERER").ok();
+    let force_software = || {
+        // mesa software rasterizer — ignores GPU drivers entirely.
+        unsafe {
+            std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
+            std::env::set_var("GALLIUM_DRIVER", "llvmpipe");
+        }
+    };
 
     let make_options = |renderer: eframe::Renderer| eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -75,6 +83,10 @@ fn main() -> eframe::Result {
     match forced.as_deref() {
         Some("glow") => run(eframe::Renderer::Glow),
         Some("wgpu") => run(eframe::Renderer::Wgpu),
+        Some("software") => {
+            force_software();
+            run(eframe::Renderer::Glow)
+        }
         _ => match run(eframe::Renderer::Wgpu) {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -83,7 +95,18 @@ fn main() -> eframe::Result {
                 // lost"). Retry with the OpenGL backend, which works through
                 // EGL/GL on the same mesa bundle.
                 log::warn!("wgpu renderer failed ({e}); falling back to OpenGL (glow)");
-                run(eframe::Renderer::Glow)
+                match run(eframe::Renderer::Glow) {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        // Even glow failed — last resort is mesa's llvmpipe
+                        // software rasterizer, which has no GPU dependency.
+                        log::warn!(
+                            "glow renderer failed ({e}); falling back to software rendering"
+                        );
+                        force_software();
+                        run(eframe::Renderer::Glow)
+                    }
+                }
             }
         },
     }
