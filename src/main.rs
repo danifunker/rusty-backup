@@ -67,6 +67,11 @@ fn main() -> eframe::Result {
             .with_inner_size([900.0, 700.0])
             .with_min_inner_size([600.0, 400.0])
             .with_icon(icon_data.clone())
+            // app_id must match the .desktop file name so Wayland
+            // compositors can look up the installed icon instead of
+            // falling back to a generic placeholder (e.g. a "W" glyph).
+            // X11 WM_CLASS is set from argv[0] (also "rusty-backup").
+            .with_app_id("rusty-backup")
             .with_drag_and_drop(true),
         renderer,
         ..Default::default()
