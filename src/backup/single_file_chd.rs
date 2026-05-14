@@ -2056,9 +2056,16 @@ pub fn staging_path_unsupported_reason(inputs: &SingleFileChdInputs<'_>) -> Opti
         .hfsplus_clone_targets
         .map(|t| t.iter().map(|(i, _, _)| *i).collect())
         .unwrap_or_default();
+    // "Moved but not resized" is supported by the staging path: each
+    // partition's bytes are read from its old offset, staged, then
+    // dropped at the new offset by the assembler. The only thing the
+    // staging path can't yet do is shrink/grow a partition whose
+    // filesystem needs an in-place resize (FAT/NTFS/exFAT BPB
+    // recomputation). Clone targets are also exempt because the
+    // defrag-clone pipeline resizes via the clone itself.
     if plans.iter().any(|p| {
-        let resized = p.new_size_bytes != p.old_size_bytes || p.needs_data_move;
-        resized && !clone_idxs.contains(&p.index)
+        let size_changed = p.new_size_bytes != p.old_size_bytes;
+        size_changed && !clone_idxs.contains(&p.index)
     }) {
         return Some("backup-time FS resize not yet supported on staging path");
     }
@@ -2105,14 +2112,16 @@ pub fn run_via_staging(
 
     // FS-level resize on non-cloned partitions still isn't supported on
     // the staging path. Clone targets DO resize via the clone pipeline,
-    // so they're exempt from this gate.
+    // so they're exempt. "Moved but not resized" (needs_data_move with
+    // unchanged size — common when an earlier shrink ripples downstream)
+    // is fine: read source bytes at old offset, write at new offset.
     let clone_idxs: std::collections::HashSet<usize> = inputs
         .hfsplus_clone_targets
         .map(|t| t.iter().map(|(i, _, _)| *i).collect())
         .unwrap_or_default();
     let unsupported_resize = plans.iter().any(|p| {
-        let resized = p.new_size_bytes != p.old_size_bytes || p.needs_data_move;
-        resized && !clone_idxs.contains(&p.index)
+        let size_changed = p.new_size_bytes != p.old_size_bytes;
+        size_changed && !clone_idxs.contains(&p.index)
     });
     if unsupported_resize {
         anyhow::bail!(
