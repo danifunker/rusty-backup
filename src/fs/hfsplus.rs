@@ -4702,24 +4702,53 @@ impl<R: Read + Seek> Read for CompactHfsPlusReader<R> {
         }
 
         let block_size = self.block_size as u64;
-        let remaining_in_block = block_size - self.block_pos;
-        let to_read = (remaining_in_block as usize).min(buf.len());
 
-        let n = if self.is_block_allocated(self.current_block) {
+        // Find the longest run starting at the current block whose
+        // allocation state matches the current block's, then service as
+        // much of that run as fits in `buf`. Coalescing turns a 24 GiB
+        // partition's ~6M per-4-KiB-block syscalls into far fewer reads
+        // (typically one per file extent), critical on slow source media
+        // where each seek + read costs milliseconds.
+        let allocated = self.is_block_allocated(self.current_block);
+        let mut run_end = self.current_block + 1;
+        while run_end < self.total_blocks && self.is_block_allocated(run_end) == allocated {
+            run_end += 1;
+        }
+
+        let bytes_in_run = (run_end - self.current_block) as u64 * block_size - self.block_pos;
+        let to_read = (bytes_in_run as usize).min(buf.len());
+
+        let n = if allocated {
             let offset =
                 self.partition_offset + self.current_block as u64 * block_size + self.block_pos;
             self.reader.seek(SeekFrom::Start(offset))?;
             self.reader.read(&mut buf[..to_read])?
         } else {
-            // Unallocated block — emit zeros so free space compresses to nothing.
+            // Unallocated run — emit zeros so free space compresses to nothing.
             buf[..to_read].fill(0);
             to_read
         };
 
-        self.block_pos += n as u64;
-        if self.block_pos >= block_size {
-            self.block_pos = 0;
-            self.current_block += 1;
+        // Advance cursor by however many bytes we actually produced.
+        let mut remaining_in_n = n as u64;
+        // First, finish the partial block we may have been mid-way through.
+        if self.block_pos > 0 {
+            let want = block_size - self.block_pos;
+            let take = remaining_in_n.min(want);
+            self.block_pos += take;
+            remaining_in_n -= take;
+            if self.block_pos >= block_size {
+                self.block_pos = 0;
+                self.current_block += 1;
+            }
+        }
+        // Then jump whole blocks.
+        let whole = (remaining_in_n / block_size) as u32;
+        self.current_block += whole;
+        remaining_in_n -= whole as u64 * block_size;
+        // Finally the trailing partial block.
+        if remaining_in_n > 0 {
+            self.block_pos = remaining_in_n;
         }
 
         Ok(n)

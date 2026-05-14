@@ -3248,10 +3248,20 @@ impl<R: Read + Seek> Read for CompactHfsReader<R> {
         }
 
         let block_size = self.mdb.block_size as u64;
-        let remaining_in_block = block_size - self.block_pos;
-        let to_read = (remaining_in_block as usize).min(buf.len());
 
-        let n = if self.is_block_allocated(self.current_block) {
+        // Coalesce the longest run starting at current_block whose
+        // allocation state matches. Each per-block seek + read on a
+        // slow source media (SD card) costs milliseconds; this turns
+        // O(blocks) syscalls into O(extents).
+        let allocated = self.is_block_allocated(self.current_block);
+        let mut run_end = self.current_block + 1;
+        while run_end < total_blocks && self.is_block_allocated(run_end) == allocated {
+            run_end += 1;
+        }
+        let bytes_in_run = (run_end - self.current_block) as u64 * block_size - self.block_pos;
+        let to_read = (bytes_in_run as usize).min(buf.len());
+
+        let n = if allocated {
             let offset = self.partition_offset
                 + self.mdb.first_alloc_block as u64 * 512
                 + self.current_block as u64 * block_size
@@ -3261,15 +3271,28 @@ impl<R: Read + Seek> Read for CompactHfsReader<R> {
                 .map_err(std::io::Error::other)?;
             self.reader.read(&mut buf[..to_read])?
         } else {
-            // Free block — emit zeros so free space compresses to nothing.
+            // Free run — emit zeros so free space compresses to nothing.
             buf[..to_read].fill(0);
             to_read
         };
 
-        self.block_pos += n as u64;
-        if self.block_pos >= block_size {
-            self.block_pos = 0;
-            self.current_block += 1;
+        // Advance cursor (current_block + block_pos) by `n` bytes.
+        let mut remaining_in_n = n as u64;
+        if self.block_pos > 0 {
+            let want = block_size - self.block_pos;
+            let take = remaining_in_n.min(want);
+            self.block_pos += take;
+            remaining_in_n -= take;
+            if self.block_pos >= block_size {
+                self.block_pos = 0;
+                self.current_block += 1;
+            }
+        }
+        let whole = (remaining_in_n / block_size) as u32;
+        self.current_block += whole;
+        remaining_in_n -= whole as u64 * block_size;
+        if remaining_in_n > 0 {
+            self.block_pos = remaining_in_n;
         }
 
         Ok(n)

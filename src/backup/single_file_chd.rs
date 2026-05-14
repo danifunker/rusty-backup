@@ -2391,6 +2391,31 @@ fn stage_partitions_to_zst(
                                 fs::hfsplus_wrapper_clone::plan_wrapped_clone(&info, inner_target)
                                     .map_err(|e| anyhow!("{e}"))?;
                             if cplan.new_partition_size != target_len {
+                                eprintln!(
+                                    "[plan_wrapped_clone diag] partition-{}: \
+                                     info(al_block_size={}, al_block_start_sector={}, \
+                                     embed_start_block={}, embed_block_count={}, \
+                                     inner_offset={}, inner_size={}, \
+                                     source_total_blocks={}), \
+                                     target_len={}, outer_overhead={}, inner_target={}, \
+                                     cplan(new_inner_size={}, new_embed_block_count={}, \
+                                     new_total_blocks={}, new_partition_size={})",
+                                    plan_index,
+                                    info.al_block_size,
+                                    info.al_block_start_sector,
+                                    info.embed_start_block,
+                                    info.embed_block_count,
+                                    info.inner_offset,
+                                    info.inner_size,
+                                    info.source_total_blocks,
+                                    target_len,
+                                    outer_overhead,
+                                    inner_target,
+                                    cplan.new_inner_size,
+                                    cplan.new_embed_block_count,
+                                    cplan.new_total_blocks,
+                                    cplan.new_partition_size,
+                                );
                                 anyhow::bail!(
                                     "wrapped HFS+ partition-{}: planned size {} \
                                      disagrees with target {}",
