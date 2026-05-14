@@ -34,8 +34,8 @@ pub use compress::{
     decompress_to_writer,
 };
 pub(crate) use compress::{
-    file_name, is_all_zeros, output_path, write_zeros, write_zeros_with_progress, SplitWriter,
-    CHUNK_SIZE,
+    compress_partition_hashed, file_name, is_all_zeros, output_path, write_zeros,
+    write_zeros_with_progress, OutputHasherHandle, SplitWriter, CHUNK_SIZE,
 };
 
 /// Reconstruct a disk image from a backup folder, writing to any seekable writer.

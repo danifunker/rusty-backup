@@ -4,18 +4,49 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
+use super::compress::OutputHasherHandle;
 use super::{file_name, is_all_zeros, output_path, CHUNK_SIZE};
 
 /// Stream raw data with optional splitting and zero-skipping.
+///
+/// `output_hasher` is honoured only when there's a single output file
+/// (no split). With split enabled, the produced files have separate
+/// sidecar checksums and the caller falls back to a post-write hash
+/// pass for each — handing them all through one shared hasher would
+/// produce a digest that doesn't correspond to any single on-disk
+/// file. When tee'd, the hasher sees every source byte (including
+/// zero runs that get sparse-seeked instead of explicitly written),
+/// so the digest matches what reading the output file back would
+/// produce.
 pub(crate) fn stream_with_split(
     reader: &mut impl Read,
     output_base: &Path,
     extension: &str,
     split_size: Option<u64>,
     skip_zeros: bool,
-    progress_cb: &mut impl FnMut(u64),
-    cancel_check: &impl Fn() -> bool,
+    output_hasher: Option<OutputHasherHandle>,
+    progress_cb: &mut dyn FnMut(u64),
+    cancel_check: &dyn Fn() -> bool,
 ) -> Result<Vec<String>> {
+    // Tee is only sound when there's one output file — see the doc
+    // comment. The compressor itself doesn't know up-front how many
+    // files it'll produce, so we accept the hasher and only call into
+    // it when split_size is None. Callers should pass None when
+    // split_size is Some to avoid building a hasher that won't fire.
+    let hasher = if split_size.is_none() {
+        output_hasher
+    } else {
+        None
+    };
+    let update_hasher = |bytes: &[u8]| {
+        if let Some(h) = hasher.as_ref() {
+            if let Ok(mut guard) = h.lock() {
+                if let Some(running) = guard.as_mut() {
+                    running.update(bytes);
+                }
+            }
+        }
+    };
     let mut files = Vec::new();
     let mut total_read: u64 = 0;
     let mut part_index: u32 = 0;
@@ -45,6 +76,10 @@ pub(crate) fn stream_with_split(
         // in the output instead of writing. This creates a sparse file on
         // supported filesystems and saves I/O time on large mostly-empty partitions.
         if skip_zeros && is_all_zeros(&buf[..n]) {
+            // Even though we skip the write, the file's read-back content
+            // includes these zeros (OS fills holes with zeros). Tee them
+            // to the hasher so the digest matches a post-write hash pass.
+            update_hasher(&buf[..n]);
             // We still need to account for split boundaries
             let mut remaining = n;
             while remaining > 0 {
@@ -88,6 +123,7 @@ pub(crate) fn stream_with_split(
             writer
                 .write_all(&buf[written..written + to_write])
                 .context("failed to write output")?;
+            update_hasher(&buf[written..written + to_write]);
             current_file_bytes += to_write as u64;
             written += to_write;
 

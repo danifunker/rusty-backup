@@ -3,15 +3,22 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
+use super::compress::OutputHasherHandle;
 use super::{file_name, output_path, SplitWriter, CHUNK_SIZE};
+use crate::backup::verify::ChecksumWriter;
 
 /// Compress with zstd, streaming through the encoder with optional splitting.
+/// When `output_hasher` is `Some`, every compressed byte that lands in the
+/// destination file is fed to the shared hasher; the caller can then
+/// finalise and use the digest as the `.zst` file's checksum without a
+/// post-write read pass.
 pub(crate) fn compress_zstd(
     reader: &mut impl Read,
     output_base: &Path,
     split_size: Option<u64>,
-    progress_cb: &mut impl FnMut(u64),
-    cancel_check: &impl Fn() -> bool,
+    output_hasher: Option<OutputHasherHandle>,
+    progress_cb: &mut dyn FnMut(u64),
+    cancel_check: &dyn Fn() -> bool,
 ) -> Result<Vec<String>> {
     let mut files = Vec::new();
     let mut total_read: u64 = 0;
@@ -19,17 +26,22 @@ pub(crate) fn compress_zstd(
     let split_bytes = split_size.unwrap_or(u64::MAX);
 
     let first_path = output_path(output_base, "zst", split_size.is_some(), part_index);
-    let mut encoder = zstd::Encoder::new(
-        SplitWriter::new(
-            &first_path,
-            split_bytes,
-            &mut files,
-            &mut part_index,
-            output_base,
-        )?,
-        3, // compression level
-    )
-    .context("failed to create zstd encoder")?;
+    let split_writer = SplitWriter::new(
+        &first_path,
+        split_bytes,
+        &mut files,
+        &mut part_index,
+        output_base,
+    )?;
+    // Optionally tee compressed bytes through a hasher before they
+    // hit disk. `Box<dyn Write>` lets us erase the two concrete
+    // shapes (raw SplitWriter vs ChecksumWriter<SplitWriter>) so the
+    // zstd encoder doesn't need to be generic over the inner type.
+    let sink: Box<dyn Write> = match output_hasher {
+        Some(h) => Box::new(ChecksumWriter::new(split_writer, h)),
+        None => Box::new(split_writer),
+    };
+    let mut encoder = zstd::Encoder::new(sink, 3).context("failed to create zstd encoder")?;
     files.push(file_name(&first_path));
 
     let mut buf = vec![0u8; CHUNK_SIZE];

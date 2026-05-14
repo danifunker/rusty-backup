@@ -11,12 +11,22 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
+use crate::backup::verify::RunningHasher;
 use crate::backup::CompressionType;
 
 use super::chd_options::ChdOptions;
 use super::{chd, raw, vhd, woz, woz_write, zstd};
 
 pub(crate) const CHUNK_SIZE: usize = 256 * 1024; // 256 KB I/O buffer
+
+/// Optional shared-hash handle threaded into the per-format
+/// compressors. When `Some`, every byte that lands in the destination
+/// `.zst` / `.raw` / `.vhd` file is also fed to the hasher; the
+/// caller finalises it after `compress_partition` returns and
+/// records the digest without a second read pass. When `None`, no
+/// tee — used by the staging-path callers that don't need a
+/// file-level checksum on their intermediate `.zst` files.
+pub(crate) type OutputHasherHandle = std::sync::Arc<std::sync::Mutex<Option<RunningHasher>>>;
 
 /// Compress partition data from `reader` to `output_base` using the given compression method.
 ///
@@ -37,6 +47,43 @@ pub fn compress_partition(
     cancel_check: impl Fn() -> bool,
     mut log_cb: impl FnMut(&str),
 ) -> Result<Vec<String>> {
+    compress_partition_hashed(
+        reader,
+        output_base,
+        compression,
+        logical_size,
+        split_size,
+        skip_zeros,
+        chd_options,
+        None,
+        &mut progress_cb,
+        &cancel_check,
+        &mut log_cb,
+    )
+}
+
+/// Same as [`compress_partition`] but threads an optional shared
+/// hasher through to the underlying compressor. When `output_hasher`
+/// is `Some`, every byte written to the destination file is teed
+/// through it; the caller finalises and reads the digest after this
+/// returns. zstd / raw / vhd all honour it; CHD/DVD currently
+/// ignore it (CHD checksums are computed via tee-on-input in
+/// `assemble_from_staging` and the container SHA-1 comes from the
+/// CHD header).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compress_partition_hashed(
+    reader: &mut impl Read,
+    output_base: &Path,
+    compression: CompressionType,
+    logical_size: u64,
+    split_size: Option<u64>,
+    skip_zeros: bool,
+    chd_options: Option<ChdOptions>,
+    output_hasher: Option<OutputHasherHandle>,
+    progress_cb: &mut dyn FnMut(u64),
+    cancel_check: &dyn Fn() -> bool,
+    log_cb: &mut dyn FnMut(&str),
+) -> Result<Vec<String>> {
     match compression {
         CompressionType::None => raw::stream_with_split(
             reader,
@@ -44,8 +91,9 @@ pub fn compress_partition(
             "raw",
             split_size,
             skip_zeros,
-            &mut progress_cb,
-            &cancel_check,
+            output_hasher,
+            progress_cb,
+            cancel_check,
         ),
         CompressionType::Vhd => {
             // VHD = raw data + 512-byte footer; no splitting support
@@ -53,8 +101,9 @@ pub fn compress_partition(
                 reader,
                 output_base,
                 skip_zeros,
-                &mut progress_cb,
-                &cancel_check,
+                output_hasher,
+                progress_cb,
+                cancel_check,
             )
         }
         CompressionType::Zstd => {
@@ -63,30 +112,44 @@ pub fn compress_partition(
                 reader,
                 output_base,
                 split_size,
-                &mut progress_cb,
-                &cancel_check,
+                output_hasher,
+                progress_cb,
+                cancel_check,
             )
         }
-        CompressionType::Chd => chd::compress_chd(
-            reader,
-            output_base,
-            logical_size,
-            split_size,
-            chd_options,
-            &mut progress_cb,
-            &cancel_check,
-            &mut log_cb,
-        ),
-        CompressionType::Dvd => chd::compress_chd_dvd(
-            reader,
-            output_base,
-            logical_size,
-            split_size,
-            chd_options,
-            &mut progress_cb,
-            &cancel_check,
-            &mut log_cb,
-        ),
+        CompressionType::Chd => {
+            // compress_chd takes `&mut impl FnMut(...)` / `&impl Fn(...)`
+            // (generic), not trait objects. Re-wrap our dyn refs in
+            // local closures so the generic substitution works.
+            let mut p = |n: u64| progress_cb(n);
+            let c = || cancel_check();
+            let mut l = |s: &str| log_cb(s);
+            chd::compress_chd(
+                reader,
+                output_base,
+                logical_size,
+                split_size,
+                chd_options,
+                &mut p,
+                &c,
+                &mut l,
+            )
+        }
+        CompressionType::Dvd => {
+            let mut p = |n: u64| progress_cb(n);
+            let c = || cancel_check();
+            let mut l = |s: &str| log_cb(s);
+            chd::compress_chd_dvd(
+                reader,
+                output_base,
+                logical_size,
+                split_size,
+                chd_options,
+                &mut p,
+                &c,
+                &mut l,
+            )
+        }
     }
 }
 
@@ -277,13 +340,20 @@ pub fn compress_file_to_archive(
             .with_context(|| format!("failed to open {}", input_path.display()))?,
     );
 
+    // Re-wrap the caller's generic closures as trait-object refs so
+    // the zstd / raw functions (which now take &mut dyn FnMut) can
+    // accept them. The CHD functions are still generic, so we pass
+    // the original refs.
+    let mut p_dyn = |n: u64| progress_cb(n);
+    let c_dyn = || cancel_check();
     match compression_type {
         "zstd" => zstd::compress_zstd(
             &mut reader,
             output_path_base,
             None,
-            progress_cb,
-            cancel_check,
+            None,
+            &mut p_dyn,
+            &c_dyn,
         ),
         "chd" => {
             let logical_size = reader.get_ref().metadata()?.len();
@@ -317,8 +387,9 @@ pub fn compress_file_to_archive(
             "raw",
             None,
             false,
-            progress_cb,
-            cancel_check,
+            None,
+            &mut p_dyn,
+            &c_dyn,
         ),
         "woz" => {
             // Read the whole raw sector buffer (floppies are small), encode

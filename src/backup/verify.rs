@@ -94,7 +94,7 @@ impl<R: Read> Read for ChecksumReader<R> {
 /// is emptied; calling this twice on the same handle returns an empty
 /// string the second time (so missing-tee bugs show up loudly in
 /// tests). Used after the consumer that owned the corresponding
-/// [`ChecksumReader`] has been dropped or returned.
+/// [`ChecksumReader`] / [`ChecksumWriter`] has been dropped or returned.
 pub fn finalize_shared_hasher(handle: &Arc<Mutex<Option<RunningHasher>>>) -> String {
     let Ok(mut guard) = handle.lock() else {
         return String::new();
@@ -102,6 +102,41 @@ pub fn finalize_shared_hasher(handle: &Arc<Mutex<Option<RunningHasher>>>) -> Str
     match guard.take() {
         Some(h) => h.finalize_hex(),
         None => String::new(),
+    }
+}
+
+/// `Write` adapter that updates a shared [`RunningHasher`] on every
+/// successful write. Mirror of [`ChecksumReader`] for the output side
+/// of a compression pipeline — used to hash the bytes flowing into
+/// the destination `.zst` / `.raw` / `.vhd` file as they're written,
+/// avoiding a second read pass to compute the file's checksum after
+/// the encode finishes.
+pub struct ChecksumWriter<W: Write> {
+    inner: W,
+    hasher: Arc<Mutex<Option<RunningHasher>>>,
+}
+
+impl<W: Write> ChecksumWriter<W> {
+    pub fn new(inner: W, hasher: Arc<Mutex<Option<RunningHasher>>>) -> Self {
+        Self { inner, hasher }
+    }
+}
+
+impl<W: Write> Write for ChecksumWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        if n > 0 {
+            if let Ok(mut guard) = self.hasher.lock() {
+                if let Some(h) = guard.as_mut() {
+                    h.update(&buf[..n]);
+                }
+            }
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -311,5 +346,41 @@ mod tests {
         assert!(sidecar.exists());
         let content = fs::read_to_string(&sidecar).unwrap();
         assert_eq!(content, "deadbeef  partition-0.raw\n");
+    }
+
+    /// ChecksumWriter must produce the same digest as if the written
+    /// bytes were re-read and hashed in a separate pass. This is the
+    /// invariant the tee-on-output backup pipeline relies on.
+    #[test]
+    fn checksum_writer_matches_post_write_hash() {
+        use std::io::Cursor;
+
+        let data: Vec<u8> = (0..65536u32).map(|i| (i & 0xff) as u8).collect();
+
+        for algo in [ChecksumType::Sha256, ChecksumType::Crc32] {
+            // Tee'd digest: write data through ChecksumWriter and finalise.
+            let hasher = Arc::new(Mutex::new(Some(RunningHasher::new(algo))));
+            let mut sink: Vec<u8> = Vec::new();
+            {
+                let mut writer = ChecksumWriter::new(Cursor::new(&mut sink), hasher.clone());
+                writer.write_all(&data).unwrap();
+                writer.flush().unwrap();
+            }
+            let tee_digest = finalize_shared_hasher(&hasher);
+
+            // Independent digest: hash a fresh reader over the sink bytes.
+            let mut reader = Cursor::new(&sink);
+            let direct_digest = hash_reader_to_eof(&mut reader, algo).unwrap();
+
+            assert_eq!(
+                tee_digest,
+                direct_digest,
+                "tee'd {} digest must match post-write hash",
+                match algo {
+                    ChecksumType::Sha256 => "sha256",
+                    ChecksumType::Crc32 => "crc32",
+                }
+            );
+        }
     }
 }

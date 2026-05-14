@@ -893,6 +893,21 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
 
         let clone_target = clone_target_sizes[part_idx];
         let clone_shape = clone_shapes[part_idx];
+        // When the output is a single file (no user-selected split),
+        // build a shared hasher and tee it through the compressor so
+        // we can read the digest back without a post-write file
+        // re-read. The compressors honour the hasher only when a
+        // single output file is produced (zstd / raw / vhd with
+        // split_size = None). For CHD/DVD outputs, or any split
+        // output, the hasher stays empty and the fall-back
+        // compute_checksum read pass handles each file.
+        let output_hasher: Option<crate::rbformats::OutputHasherHandle> = if split_bytes.is_none() {
+            Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
+                verify::RunningHasher::new(config.checksum),
+            ))))
+        } else {
+            None
+        };
         let compressed_files = if let Some(target_size) = clone_target {
             // Phase-8 / Step-22f: stream a defragmented HFS+ clone directly
             // into the compressor via a bounded channel pipe. The producer
@@ -987,7 +1002,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                     Ok(report)
                 });
             let progress_log = Arc::clone(&progress);
-            let compress_result = crate::rbformats::compress_partition(
+            let compress_result = crate::rbformats::compress_partition_hashed(
                 &mut reader,
                 &output_base,
                 effective_compression,
@@ -995,15 +1010,16 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 split_bytes,
                 false, // streamed image is already packed; don't skip zeros
                 config.chd_options.clone(),
-                |bytes_read| {
+                output_hasher.clone(),
+                &mut |bytes_read| {
                     set_progress_bytes(
                         &progress_clone,
                         base_bytes + bytes_read,
                         total_stream_bytes,
                     );
                 },
-                || is_cancelled(&progress_clone),
-                |msg| log(&progress_log, LogLevel::Info, msg),
+                &|| is_cancelled(&progress_clone),
+                &mut |msg| log(&progress_log, LogLevel::Info, msg),
             );
             // Always join the producer so its errors surface even if the
             // consumer succeeded (e.g. partial pipe).
@@ -1045,7 +1061,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 format!("Calling compress_partition for compacted {}", part_label),
             );
             let progress_log = Arc::clone(&progress);
-            crate::rbformats::compress_partition(
+            crate::rbformats::compress_partition_hashed(
                 &mut limited,
                 &output_base,
                 effective_compression,
@@ -1053,15 +1069,16 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 split_bytes,
                 false, // compacted image has no wasted space, don't skip zeros
                 config.chd_options.clone(),
-                |bytes_read| {
+                output_hasher.clone(),
+                &mut |bytes_read| {
                     set_progress_bytes(
                         &progress_clone,
                         base_bytes + bytes_read,
                         total_stream_bytes,
                     );
                 },
-                || is_cancelled(&progress_clone),
-                |msg| log(&progress_log, LogLevel::Info, msg),
+                &|| is_cancelled(&progress_clone),
+                &mut |msg| log(&progress_log, LogLevel::Info, msg),
             )
             .with_context(|| format!("failed to compress {part_label}"))?
         } else {
@@ -1092,7 +1109,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 format!("Calling compress_partition for trim-based {}", part_label),
             );
             let progress_log = Arc::clone(&progress);
-            crate::rbformats::compress_partition(
+            crate::rbformats::compress_partition_hashed(
                 &mut limited,
                 &output_base,
                 effective_compression,
@@ -1100,15 +1117,16 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 split_bytes,
                 !config.sector_by_sector,
                 config.chd_options.clone(),
-                |bytes_read| {
+                output_hasher.clone(),
+                &mut |bytes_read| {
                     set_progress_bytes(
                         &progress_clone,
                         base_bytes + bytes_read,
                         total_stream_bytes,
                     );
                 },
-                || is_cancelled(&progress_clone),
-                |msg| log(&progress_log, LogLevel::Info, msg),
+                &|| is_cancelled(&progress_clone),
+                &mut |msg| log(&progress_log, LogLevel::Info, msg),
             )
             .with_context(|| format!("failed to compress {part_label}"))?
         };
@@ -1151,12 +1169,24 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             compressed_files
         };
 
-        // Compute checksums for each output file
+        // Compute checksums for each output file. When the compressor
+        // tee'd a hasher during write (single non-split output, format
+        // supports it), finalise that hasher and reuse the digest —
+        // skips a multi-GB re-read of the just-written file. Falls
+        // back to the post-write hash pass for split outputs, CHD,
+        // or any other case the compressor didn't honour the hasher.
+        let tee_digest = output_hasher
+            .as_ref()
+            .map(verify::finalize_shared_hasher)
+            .filter(|s| !s.is_empty());
         let mut all_checksums = Vec::new();
-        for file_name in &compressed_files {
+        for (i, file_name) in compressed_files.iter().enumerate() {
             let file_path = backup_folder.join(file_name);
-            let checksum = verify::compute_checksum(&file_path, config.checksum)
-                .with_context(|| format!("failed to checksum {file_name}"))?;
+            let checksum = match (&tee_digest, i, compressed_files.len()) {
+                (Some(d), 0, 1) => d.clone(),
+                _ => verify::compute_checksum(&file_path, config.checksum)
+                    .with_context(|| format!("failed to checksum {file_name}"))?,
+            };
             verify::write_checksum_file(&checksum, &file_path, config.checksum)
                 .with_context(|| format!("failed to write checksum for {file_name}"))?;
             all_checksums.push(checksum);

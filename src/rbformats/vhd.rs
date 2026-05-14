@@ -177,23 +177,31 @@ fn random_uuid() -> [u8; 16] {
     bytes
 }
 
-/// Write VHD (Fixed): stream raw data to a single file, then append a 512-byte footer.
+/// Write VHD (Fixed): stream raw data to a single file, then append a
+/// 512-byte footer. `output_hasher`, when provided, is updated with
+/// every byte that lands in the file (raw bytes + footer) so the
+/// caller can use the finalised digest as the `.vhd` file's checksum
+/// without a post-write read pass.
 pub(crate) fn write_vhd(
     reader: &mut impl Read,
     output_base: &Path,
     skip_zeros: bool,
-    progress_cb: &mut impl FnMut(u64),
-    cancel_check: &impl Fn() -> bool,
+    output_hasher: Option<super::compress::OutputHasherHandle>,
+    progress_cb: &mut dyn FnMut(u64),
+    cancel_check: &dyn Fn() -> bool,
 ) -> Result<Vec<String>> {
     use super::raw::stream_with_split;
 
-    // Write raw data (no splitting for VHD)
+    // Write raw data (no splitting for VHD). The hasher receives the
+    // raw body via stream_with_split's internal tee; we feed it the
+    // footer below.
     let files = stream_with_split(
         reader,
         output_base,
         "vhd",
         None,
         skip_zeros,
+        output_hasher.clone(),
         progress_cb,
         cancel_check,
     )?;
@@ -217,6 +225,15 @@ pub(crate) fn write_vhd(
     file.write_all(&footer)
         .context("failed to write VHD footer")?;
     file.flush()?;
+
+    // Footer is part of the on-disk file, so feed it to the hasher too.
+    if let Some(h) = output_hasher.as_ref() {
+        if let Ok(mut guard) = h.lock() {
+            if let Some(running) = guard.as_mut() {
+                running.update(&footer);
+            }
+        }
+    }
 
     Ok(files)
 }
