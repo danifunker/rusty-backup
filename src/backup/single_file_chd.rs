@@ -1990,6 +1990,12 @@ pub fn staging_path_unsupported_reason(inputs: &SingleFileChdInputs<'_>) -> Opti
     if !is_supported(inputs.partition_table) {
         return Some("partition table type not supported");
     }
+    if inputs.is_dvd {
+        // DVD-profile CHDs (optical media) are produced by the optical
+        // tab's own pipeline. The single-file-CHD staging path is for
+        // hard-disk backups only.
+        return Some("DVD profile handled by the optical tab");
+    }
     if matches!(inputs.partition_table, PartitionTable::Apm(_)) {
         return Some("APM head region support pending");
     }
