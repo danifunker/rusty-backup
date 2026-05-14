@@ -20,6 +20,10 @@ pub struct MinSizeStatus {
     pub partition_index: usize,
     /// Latest phase reported by `partition_minimum_size` (e.g. "Opening filesystem...").
     pub phase: String,
+    /// Append-only log of every phase emitted by the worker. The GUI poll loop
+    /// drains this each frame so transient diagnostic lines (e.g. wrapper-info
+    /// dumps) aren't lost when multiple progress() calls land between polls.
+    pub phase_log: Vec<String>,
     pub finished: bool,
     /// In-place trim point (no data moved). `Some(bytes)` on successful computation;
     /// `None` if the FS could not be opened.
@@ -36,6 +40,7 @@ impl MinSizeStatus {
         Self {
             partition_index,
             phase: "Starting...".to_string(),
+            phase_log: Vec::new(),
             finished: false,
             result: None,
             defragmented_min: None,
@@ -77,6 +82,7 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
         let progress = move |phase: &str| {
             if let Ok(mut s) = progress_status.lock() {
                 s.phase = phase.to_string();
+                s.phase_log.push(phase.to_string());
             }
         };
 

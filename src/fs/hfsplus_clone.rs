@@ -423,15 +423,42 @@ impl SourceCatalogSnapshot {
             }
         }
 
-        // Resolve pending hardlink stubs against the inode map. A stub
-        // with a missing iNode is treated as a corrupted source.
+        // Resolve pending hardlink stubs against the inode map. Stubs whose
+        // iNode<N> is missing aren't necessarily corruption: some pre-Time-
+        // Machine HFS+ volumes have files tagged with the hardlink FInfo
+        // signature (`hlnk`/`hfs+`) without the corresponding `HFS+ Private
+        // Data` iNode entry — typically a leftover after a tooling round-
+        // trip. Demote them to ordinary files (using the captured fork
+        // bytes) so the clone preserves the source verbatim.
         let mut hardlinks: Vec<SourceHardlinkSnapshot> = Vec::with_capacity(pending_links.len());
         for p in pending_links {
-            let inode_source_cnid = inode_num_to_source_cnid.get(&p.inode_num).copied()
-                .ok_or_else(|| FilesystemError::InvalidData(format!(
-                    "source HFS+ catalog references iNode{} but no matching entry exists in HFS+ Private Data",
-                    p.inode_num,
-                )))?;
+            let Some(inode_source_cnid) = inode_num_to_source_cnid.get(&p.inode_num).copied()
+            else {
+                files.push(SourceFileSnapshot {
+                    name: p.name,
+                    name_utf16: p.name_utf16,
+                    cnid: p.cnid,
+                    parent_cnid: p.parent_cnid,
+                    flags: p.flags,
+                    finder_info: p.finder_info,
+                    extended_finder_info: p.extended_finder_info,
+                    bsd_info: p.bsd_info,
+                    create_date: p.create_date,
+                    content_mod_date: p.content_mod_date,
+                    attribute_mod_date: p.attribute_mod_date,
+                    access_date: p.access_date,
+                    backup_date: p.backup_date,
+                    text_encoding: p.text_encoding,
+                    data_fork_raw: p.data_fork_raw,
+                    rsrc_fork_raw: p.rsrc_fork_raw,
+                    data_fork_size: p.data_fork_size,
+                    rsrc_fork_size: p.rsrc_fork_size,
+                    xattrs: Vec::new(),
+                    is_inode: false,
+                    inode_num: None,
+                });
+                continue;
+            };
             hardlinks.push(SourceHardlinkSnapshot {
                 name: p.name,
                 name_utf16: p.name_utf16,
@@ -456,16 +483,41 @@ impl SourceCatalogSnapshot {
         let mut dir_hardlinks: Vec<SourceDirHardlinkSnapshot> =
             Vec::with_capacity(pending_dir_links.len());
         for p in pending_dir_links {
-            let inode_dir_source_cnid = dir_inode_num_to_source_cnid
-                .get(&p.inode_num)
-                .copied()
-                .ok_or_else(|| {
-                    FilesystemError::InvalidData(format!(
-                        "source HFS+ catalog references dir_{} but no matching entry exists \
-                         in .HFS+ Private Directory Data",
-                        p.inode_num,
-                    ))
-                })?;
+            let Some(inode_dir_source_cnid) =
+                dir_inode_num_to_source_cnid.get(&p.inode_num).copied()
+            else {
+                // No matching dir_<N> in .HFS+ Private Directory Data\r —
+                // this isn't a real HFS+ directory hardlink, just an
+                // ordinary Mac OS Finder folder alias that happens to use
+                // the same FInfo type/creator (`fdrp`/`MACS`). Demote back
+                // into the regular file list, preserving the captured
+                // fork bytes verbatim so the alias survives the clone
+                // intact.
+                files.push(SourceFileSnapshot {
+                    name: p.name,
+                    name_utf16: p.name_utf16,
+                    cnid: p.cnid,
+                    parent_cnid: p.parent_cnid,
+                    flags: p.flags,
+                    finder_info: p.finder_info,
+                    extended_finder_info: p.extended_finder_info,
+                    bsd_info: p.bsd_info,
+                    create_date: p.create_date,
+                    content_mod_date: p.content_mod_date,
+                    attribute_mod_date: p.attribute_mod_date,
+                    access_date: p.access_date,
+                    backup_date: p.backup_date,
+                    text_encoding: p.text_encoding,
+                    data_fork_raw: p.data_fork_raw,
+                    rsrc_fork_raw: p.rsrc_fork_raw,
+                    data_fork_size: p.data_fork_size,
+                    rsrc_fork_size: p.rsrc_fork_size,
+                    xattrs: Vec::new(),
+                    is_inode: false,
+                    inode_num: None,
+                });
+                continue;
+            };
             dir_hardlinks.push(SourceDirHardlinkSnapshot {
                 name: p.name,
                 name_utf16: p.name_utf16,
@@ -552,6 +604,14 @@ struct PendingHardlink {
     access_date: u32,
     backup_date: u32,
     text_encoding: u32,
+    /// Raw forks captured from the catalog record. Mirrors
+    /// `PendingDirHardlink`'s field — used to demote stubs back to
+    /// regular files when no matching `iNode<N>` exists in the source's
+    /// `HFS+ Private Data` directory.
+    data_fork_raw: [u8; 80],
+    rsrc_fork_raw: [u8; 80],
+    data_fork_size: u64,
+    rsrc_fork_size: u64,
 }
 
 /// Pending directory-hardlink stub. Same shape as `PendingHardlink` but
@@ -572,6 +632,16 @@ struct PendingDirHardlink {
     access_date: u32,
     backup_date: u32,
     text_encoding: u32,
+    /// Raw forks captured from the catalog record. Only used when the
+    /// pending stub turns out to be a normal Mac OS Finder folder alias
+    /// (FInfo `fdrp`/`MACS`) rather than a true HFS+ directory hardlink —
+    /// in that case the resolver demotes this entry back into a regular
+    /// `SourceFileSnapshot` and needs the fork bytes verbatim. For real
+    /// dir-hardlink stubs the forks are conventionally zero and ignored.
+    data_fork_raw: [u8; 80],
+    rsrc_fork_raw: [u8; 80],
+    data_fork_size: u64,
+    rsrc_fork_size: u64,
 }
 
 /// Build the source's `.HFS+ Private Directory Data\r` directory name.
@@ -709,6 +779,8 @@ fn parse_catalog_record(rec: &[u8]) -> Result<ParsedRecord, FilesystemError> {
                 && &finder_info[4..8] == HARDLINK_FILE_CREATOR
             {
                 let inode_num = BigEndian::read_u32(&body[44..48]);
+                let data_fork_size = BigEndian::read_u64(&data_fork[0..8]);
+                let rsrc_fork_size = BigEndian::read_u64(&rsrc_fork[0..8]);
                 return Ok(ParsedRecord::Hardlink(PendingHardlink {
                     name,
                     name_utf16,
@@ -725,6 +797,10 @@ fn parse_catalog_record(rec: &[u8]) -> Result<ParsedRecord, FilesystemError> {
                     access_date,
                     backup_date,
                     text_encoding,
+                    data_fork_raw: data_fork,
+                    rsrc_fork_raw: rsrc_fork,
+                    data_fork_size,
+                    rsrc_fork_size,
                 }));
             }
 
@@ -732,9 +808,23 @@ fn parse_catalog_record(rec: &[u8]) -> Result<ParsedRecord, FilesystemError> {
             // The `dir_<N>` directory inode is captured via the FOLDER
             // branch and flagged with `is_dir_inode=true` in capture's
             // second pass.
+            //
+            // Caveat: `fdrp`/`MACS` is also the FInfo signature for
+            // ordinary Mac OS Finder folder *aliases*. Pre-Time-Machine
+            // HFS+ volumes (e.g. wrapped Mac OS 9 disks) use this
+            // type/creator for plain Finder aliases without ever creating
+            // `.HFS+ Private Directory Data\r`. Routing such files into
+            // the dir-hardlink resolver would later bail with "no matching
+            // entry exists in .HFS+ Private Directory Data". The resolver
+            // checks for the private-dir + a matching `dir_<N>` and
+            // demotes any stubs that don't resolve back into
+            // `SourceFileSnapshot`s — keep the raw forks here so that
+            // demotion is lossless.
             if &finder_info[0..4] == HARDLINK_DIR_TYPE && &finder_info[4..8] == HARDLINK_DIR_CREATOR
             {
                 let inode_num = BigEndian::read_u32(&body[44..48]);
+                let data_fork_size = BigEndian::read_u64(&data_fork[0..8]);
+                let rsrc_fork_size = BigEndian::read_u64(&rsrc_fork[0..8]);
                 return Ok(ParsedRecord::DirHardlink(PendingDirHardlink {
                     name,
                     name_utf16,
@@ -751,6 +841,10 @@ fn parse_catalog_record(rec: &[u8]) -> Result<ParsedRecord, FilesystemError> {
                     access_date,
                     backup_date,
                     text_encoding,
+                    data_fork_raw: data_fork,
+                    rsrc_fork_raw: rsrc_fork,
+                    data_fork_size,
+                    rsrc_fork_size,
                 }));
             }
 

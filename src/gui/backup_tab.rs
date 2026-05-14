@@ -53,6 +53,9 @@ pub struct BackupTab {
         usize,
         Arc<Mutex<rusty_backup::model::min_size_runner::MinSizeStatus>>,
     >,
+    /// Last phase string logged for each in-flight min-size calc, so we
+    /// can emit a log line on each transition without spamming.
+    last_logged_min_size_phase: std::collections::HashMap<usize, String>,
     /// Open file handle for the source (kept alive so min-size workers can clone it).
     source_file: Option<Arc<File>>,
     /// Human-readable description of the partition table type for the
@@ -139,6 +142,7 @@ impl Default for BackupTab {
             partition_min_sizes: std::collections::HashMap::new(),
             deferred_min_sizes: std::collections::HashMap::new(),
             pending_min_size_calcs: std::collections::HashMap::new(),
+            last_logged_min_size_phase: std::collections::HashMap::new(),
             source_file: None,
             source_partition_table_desc: None,
             pending_backup_after_min_sizes: false,
@@ -920,6 +924,30 @@ impl BackupTab {
     /// Poll all pending min-size workers; on completion, move results into
     /// `partition_min_sizes` and refresh any matching `vhd_partition_configs`.
     fn poll_min_size_calcs(&mut self, ctx: &mut TabContext) {
+        // Emit a log line whenever a worker's `phase` string changes, so
+        // long HFS+ catalog walks don't look like a hang. The phase set is
+        // small (Opening filesystem -> Computing last data byte ->
+        // Computing defragmented minimum) plus the one-shot
+        // "open_filesystem failed: <err>" leak from `partition_minimum_size`.
+        let phase_updates: Vec<(usize, Vec<String>)> = self
+            .pending_min_size_calcs
+            .iter()
+            .filter_map(|(idx, status)| {
+                status.lock().ok().map(|mut s| {
+                    let drained = std::mem::take(&mut s.phase_log);
+                    (*idx, drained)
+                })
+            })
+            .collect();
+        for (idx, phases) in phase_updates {
+            for phase in phases {
+                if phase.is_empty() {
+                    continue;
+                }
+                ctx.log.info(format!("Partition {idx}: {phase}"));
+                self.last_logged_min_size_phase.insert(idx, phase);
+            }
+        }
         let finished_indices: Vec<usize> = self
             .pending_min_size_calcs
             .iter()
@@ -952,8 +980,11 @@ impl BackupTab {
                         if let Some(min) = chosen {
                             let clamped = min.min(part_size);
                             self.partition_min_sizes.insert(idx, clamped);
+                            let has_clone = fs::has_defragmenting_writer(ptype, pstring.as_deref());
                             let is_layout = fs::is_layout_preserving_fs(ptype, pstring.as_deref());
-                            let suffix = if is_layout {
+                            let suffix = if has_clone {
+                                " (defragmented via clone)"
+                            } else if is_layout {
                                 " (in-place trim; defragmented shrink not yet supported for this FS)"
                             } else if s.defragmented_min.is_some() {
                                 " (defragmented floor)"
@@ -973,12 +1004,14 @@ impl BackupTab {
                             }
                         } else {
                             ctx.log.info(format!(
-                                "Partition {idx}: filesystem could not be opened for minimum-size calculation",
+                                "Partition {idx}: filesystem could not be opened for minimum-size calculation (last phase: {})",
+                                s.phase,
                             ));
                         }
                     }
                 }
                 self.deferred_min_sizes.remove(&idx);
+                self.last_logged_min_size_phase.remove(&idx);
             }
         }
     }
@@ -1097,11 +1130,17 @@ impl BackupTab {
                             if let Some(min_size) = chosen {
                                 let clamped = min_size.min(part.size_bytes);
                                 self.partition_min_sizes.insert(part.index, clamped);
+                                let has_clone = fs::has_defragmenting_writer(
+                                    part.partition_type_byte,
+                                    part.partition_type_string.as_deref(),
+                                );
                                 let is_layout = fs::is_layout_preserving_fs(
                                     part.partition_type_byte,
                                     part.partition_type_string.as_deref(),
                                 );
-                                let suffix = if is_layout {
+                                let suffix = if has_clone {
+                                    " (defragmented via clone)"
+                                } else if is_layout {
                                     " (in-place trim; defragmented shrink not yet supported for this FS)"
                                 } else if defragmented.is_some() {
                                     " (defragmented floor)"
@@ -1256,11 +1295,17 @@ impl BackupTab {
                                     if let Some(min_size) = chosen {
                                         let clamped = min_size.min(part.size_bytes);
                                         self.partition_min_sizes.insert(part.index, clamped);
+                                        let has_clone = fs::has_defragmenting_writer(
+                                            part.partition_type_byte,
+                                            part.partition_type_string.as_deref(),
+                                        );
                                         let is_layout = fs::is_layout_preserving_fs(
                                             part.partition_type_byte,
                                             part.partition_type_string.as_deref(),
                                         );
-                                        let suffix = if is_layout {
+                                        let suffix = if has_clone {
+                                            " (defragmented via clone)"
+                                        } else if is_layout {
                                             " (in-place trim; defragmented shrink not yet supported for this FS)"
                                         } else if defragmented.is_some() {
                                             " (defragmented floor)"
@@ -1421,35 +1466,55 @@ impl BackupTab {
         // from the simple "Resize partitions to minimum size" checkbox. When
         // the box is on, every partition with a known minimum gets MinPlus20;
         // partitions whose minimum hasn't been computed fall back to Original.
-        let (size_policy, partition_target_sizes) =
-            if matches!(self.compression_type, CompressionType::Chd)
-                && !self.sector_by_sector
-                && self.resize_partitions
-            {
-                let mut targets: Vec<(usize, u64)> = Vec::new();
-                let mut used_min_plus_20 = false;
-                for part in &self.source_partitions {
-                    if part.is_extended_container {
-                        continue;
-                    }
-                    let target = match self.partition_min_sizes.get(&part.index).copied() {
-                        Some(min) if min < part.size_bytes => {
-                            used_min_plus_20 = true;
-                            SizeMode::MinPlus20.effective_size(part.size_bytes, min, 0)
-                        }
-                        _ => part.size_bytes,
-                    };
-                    targets.push((part.index, target));
+        //
+        // HFS+/HFSX partitions are intentionally *skipped* from the list:
+        // their shrink is performed by the HFS+ defrag-clone pipeline that
+        // `run_backup` activates via `shrink_to_minimum`. The clone uses the
+        // partition's defragmented minimum (a true lower bound) — emitting a
+        // MinPlus20-of-the-in-place-trim entry here would either no-op
+        // (MinPlus20 ≥ original collapses to original) or override the
+        // clone target.
+        let resize_for_chd = matches!(self.compression_type, CompressionType::Chd)
+            && !self.sector_by_sector
+            && self.resize_partitions;
+        let (size_policy, partition_target_sizes) = if resize_for_chd {
+            let mut targets: Vec<(usize, u64)> = Vec::new();
+            let mut used_min_plus_20 = false;
+            for part in &self.source_partitions {
+                if part.is_extended_container {
+                    continue;
                 }
-                let policy = if used_min_plus_20 {
-                    SizePolicy::MinPlus20
-                } else {
-                    SizePolicy::Original
+                // HFS+/HFSX handled by the clone pipeline; don't seed a
+                // target_size for them.
+                if fs::is_layout_preserving_fs(
+                    part.partition_type_byte,
+                    part.partition_type_string.as_deref(),
+                ) {
+                    continue;
+                }
+                let target = match self.partition_min_sizes.get(&part.index).copied() {
+                    Some(min) if min < part.size_bytes => {
+                        used_min_plus_20 = true;
+                        SizeMode::MinPlus20.effective_size(part.size_bytes, min, 0)
+                    }
+                    _ => part.size_bytes,
                 };
-                (Some(policy), Some(targets))
+                targets.push((part.index, target));
+            }
+            let policy = if used_min_plus_20 {
+                SizePolicy::MinPlus20
             } else {
-                (None, None)
+                SizePolicy::Original
             };
+            let targets_opt = if targets.is_empty() {
+                None
+            } else {
+                Some(targets)
+            };
+            (Some(policy), targets_opt)
+        } else {
+            (None, None)
+        };
 
         let split_disabled_for_compression = matches!(
             self.compression_type,
@@ -1471,7 +1536,26 @@ impl BackupTab {
             chd_options: self.chd_options_for_compression(),
             size_policy,
             partition_target_sizes,
-            shrink_to_minimum: false,
+            // For single-file CHD output the "Resize partitions to minimum
+            // size" checkbox enables the HFS+ defrag-clone pipeline (other
+            // FSes are sized via `partition_target_sizes` above). For
+            // per-partition (zstd / raw / per-partition VHD) output the
+            // same flag enables the regular HFS+ clone branch in
+            // `run_backup`. Sector-by-sector keeps it off.
+            shrink_to_minimum: self.resize_partitions && !self.sector_by_sector,
+            // Hand the GUI's "Calc min" cache straight to the backup engine
+            // so it doesn't re-walk every HFS+ catalog the user already
+            // computed. Empty cache = engine walks normally.
+            precomputed_minimum_sizes: if self.partition_min_sizes.is_empty() {
+                None
+            } else {
+                Some(
+                    self.partition_min_sizes
+                        .iter()
+                        .map(|(idx, sz)| (*idx, *sz))
+                        .collect(),
+                )
+            },
         };
 
         self.maybe_persist_chd_options();
@@ -1488,10 +1572,39 @@ impl BackupTab {
 
         std::thread::spawn(move || {
             let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: disk backup");
-            if let Err(e) = rusty_backup::backup::run_backup(config, Arc::clone(&progress_arc)) {
-                if let Ok(mut p) = progress_arc.lock() {
-                    p.error = Some(format!("{e:#}"));
-                    p.finished = true;
+            // Catch panics from `run_backup` so the GUI poll loop always
+            // observes `finished = true`. Without this, a panic in a
+            // sub-thread (or in any of the producer/consumer threads
+            // run_backup spawns) silently kills the worker, leaving the
+            // GUI stuck at whatever progress was last written. The panic
+            // message is preserved as the displayed error so we can
+            // diagnose it from the log instead of having to attach a
+            // debugger.
+            let progress_for_panic = Arc::clone(&progress_arc);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rusty_backup::backup::run_backup(config, Arc::clone(&progress_arc))
+            }));
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if let Ok(mut p) = progress_for_panic.lock() {
+                        p.error = Some(format!("{e:#}"));
+                        p.finished = true;
+                    }
+                }
+                Err(panic_payload) => {
+                    let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                        (*s).to_string()
+                    } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        format!("<non-string panic payload: {:?}>", panic_payload.type_id())
+                    };
+                    eprintln!("[backup-thread] PANIC: {msg}");
+                    if let Ok(mut p) = progress_for_panic.lock() {
+                        p.error = Some(format!("backup worker panicked: {msg}"));
+                        p.finished = true;
+                    }
                 }
             }
         });

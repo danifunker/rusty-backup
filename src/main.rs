@@ -12,6 +12,30 @@ fn main() -> eframe::Result {
     let icon_image = image::load_from_memory_with_format(icon_bytes, image::ImageFormat::Png)
         .expect("Failed to load icon");
 
+
+    // Install a panic hook that prints the panic location AND a backtrace
+    // to stderr for every thread that panics — including sub-threads spawned
+    // inside the backup worker. Without this, panics in producer/consumer
+    // threads die silently and the GUI hangs at "0 B / X GiB" because the
+    // top-level worker never sees a failure to propagate. `RUST_BACKTRACE`
+    // is set to 1 if the user hasn't already chosen a value, so symbolized
+    // frames land in the stderr capture (`tee /tmp/rusty-backup-run.log`).
+    if std::env::var_os("RUST_BACKTRACE").is_none() {
+        // SAFETY: set before any threads spawn that could read this env var.
+        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
+    }
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("<unnamed>");
+        eprintln!("=== PANIC in thread '{name}' ===");
+        eprintln!("{info}");
+        let bt = std::backtrace::Backtrace::force_capture();
+        eprintln!("backtrace:\n{bt}");
+        eprintln!("=== END PANIC ===");
+        // Defer to the default hook too so existing behavior is preserved.
+        default_hook(info);
+    }));
     // Linux: Request elevation at startup if not already running as root
     #[cfg(target_os = "linux")]
     {

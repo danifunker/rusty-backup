@@ -14,6 +14,7 @@ pub mod hfsplus;
 pub mod hfsplus_clone;
 pub mod hfsplus_defrag;
 pub mod hfsplus_fsck;
+pub mod hfsplus_wrapper_clone;
 pub mod layout_preserving;
 pub mod mac_alias;
 pub mod ntfs;
@@ -541,11 +542,26 @@ pub fn effective_partition_size<R: Read + Seek + Send + 'static>(
 /// Returns `None` if the filesystem can't be opened or doesn't override
 /// the trait default. See `Filesystem::defragmented_minimum_size`.
 pub fn defragmented_partition_size<R: Read + Seek + Send + 'static>(
-    reader: R,
+    mut reader: R,
     partition_offset: u64,
     partition_type: u8,
     partition_type_string: Option<&str>,
 ) -> Option<u64> {
+    // Wrapped HFS+ detection happens before the generic FS open so we can
+    // account for the outer wrapper overhead when reporting the partition-
+    // level minimum. `open_filesystem` for Apple_HFS already resolves the
+    // wrapper and returns an inner HfsPlusFilesystem, but loses the
+    // wrapper-shell sizing — which we need for callers (sizes.rs, the
+    // shrink-to-minimum picker) to target the right partition extent.
+    //
+    // Use a 1 MiB source-extent ceiling for the source partition size
+    // probe: detect_wrapped_hfsplus only needs `partition_size` to bound
+    // its sanity check (inner extent must fit inside the partition). The
+    // real source partition size isn't known here — callers pass it in
+    // at the slot level. Use u64::MAX so the check always passes; the
+    // real bound is enforced by the eventual resize plan.
+    let wrapper_info =
+        hfsplus_wrapper_clone::detect_wrapped_hfsplus(&mut reader, partition_offset, u64::MAX);
     let mut fs = open_filesystem(
         reader,
         partition_offset,
@@ -553,7 +569,13 @@ pub fn defragmented_partition_size<R: Read + Seek + Send + 'static>(
         partition_type_string,
     )
     .ok()?;
-    fs.defragmented_minimum_size().ok()
+    let inner_min = fs.defragmented_minimum_size().ok()?;
+    if let Some(info) = wrapper_info {
+        let plan = hfsplus_wrapper_clone::plan_wrapped_clone(&info, inner_min).ok()?;
+        Some(plan.new_partition_size)
+    } else {
+        Some(inner_min)
+    }
 }
 
 /// Outcome of a `partition_minimum_size` call.
@@ -628,13 +650,32 @@ pub fn is_layout_preserving_fs(partition_type: u8, partition_type_string: Option
     matches!(partition_type, 0xAF | 0x83 | 0xA8)
 }
 
+/// True if this filesystem has a true defragmenting writer (clone pipeline)
+/// that the shrink-to-minimum backup path can use to relocate data blocks.
+/// When `true`, the defragmented minimum is genuinely achievable — the
+/// clone re-emits the volume packed at the smaller size — so picking it as
+/// the shrink target is safe.
+///
+/// Currently: HFS+/HFSX (via `stream_defragmented_hfsplus`). HFS (classic),
+/// ext, btrfs, and ProDOS still rely on the layout-preserving reader and
+/// must use the in-place trim instead.
+pub fn has_defragmenting_writer(partition_type: u8, partition_type_string: Option<&str>) -> bool {
+    if let Some(s) = partition_type_string {
+        return matches!(s, "Apple_HFS" | "Apple_HFSX" | "Apple_HFS+");
+    }
+    matches!(partition_type, 0xAF)
+}
+
 /// Pick the achievable shrink-to-minimum target for a partition given both
 /// the in-place trim point and the defragmented (used-only) minimum.
 ///
 /// - **Packing filesystems** (FAT, NTFS, exFAT): the CompactReader repacks
 ///   allocated clusters at the partition start, so the defragmented value
 ///   is what the backup actually emits — use it.
-/// - **Layout-preserving filesystems** (HFS, HFS+, ext, btrfs, ProDOS):
+/// - **HFS+/HFSX**: the defrag-clone pipeline
+///   ([`hfsplus_defrag::stream_defragmented_hfsplus`]) packs the volume at
+///   the smaller size during the backup write — use the defragmented value.
+/// - **Other layout-preserving filesystems** (HFS, ext, btrfs, ProDOS):
 ///   the backup pipeline does not yet relocate blocks, so anything below
 ///   `in_place` would silently drop allocated blocks. Use the in-place
 ///   value; the defragmented value is informational only until a true
@@ -645,7 +686,9 @@ pub fn pick_shrink_target(
     in_place: Option<u64>,
     defragmented: Option<u64>,
 ) -> Option<u64> {
-    if is_layout_preserving_fs(partition_type, partition_type_string) {
+    if has_defragmenting_writer(partition_type, partition_type_string) {
+        defragmented.or(in_place)
+    } else if is_layout_preserving_fs(partition_type, partition_type_string) {
         in_place.or(defragmented)
     } else {
         defragmented.or(in_place)
@@ -688,6 +731,32 @@ pub fn partition_minimum_size<R: Read + Seek + Send + 'static>(
             fs_name: fs_name_for(partition_type, partition_type_string),
         };
     }
+    // Detect wrapper layout BEFORE consuming the reader into open_filesystem.
+    // For wrapped HFS+ we keep the parsed `WrappedHfsPlusInfo` so that the
+    // reported defragmented value can be routed through
+    // `plan_wrapped_clone`, matching exactly what the clone-time pipeline
+    // will produce. Inflating with a raw "inner + overhead" sum would round
+    // the inner up to the outer wrapper's allocation-block boundary at
+    // clone time and disagree with the precomputed value (the engine then
+    // bails with "planned size disagrees with resize plan size").
+    let mut reader = reader;
+    progress("Probing for HFS wrapper...");
+    let wrapper_info =
+        hfsplus_wrapper_clone::detect_wrapped_hfsplus(&mut reader, partition_offset, u64::MAX);
+    match wrapper_info.as_ref() {
+        Some(info) => progress(&format!(
+            "Wrapper detected: al_block_size={} drAlBlSt={} drNmAlBlks={} \
+             embed_start_block={} embed_block_count={} inner_offset={} inner_size={}",
+            info.al_block_size,
+            info.al_block_start_sector,
+            info.source_total_blocks,
+            info.embed_start_block,
+            info.embed_block_count,
+            info.inner_offset,
+            info.inner_size,
+        )),
+        None => progress("No HFS wrapper detected (flat HFS+ or non-HFS)"),
+    }
     progress("Opening filesystem...");
     let mut fs = match open_filesystem(
         reader,
@@ -696,7 +765,14 @@ pub fn partition_minimum_size<R: Read + Seek + Send + 'static>(
         partition_type_string,
     ) {
         Ok(fs) => fs,
-        Err(_) => {
+        Err(e) => {
+            // Pipe the actual error through the progress callback so the
+            // caller (min_size_runner -> backup_tab/inspect_tab) can log
+            // why the volume couldn't be opened. Surfaces issues like
+            // sector-aligned read failures, embedded HFS+ resolution
+            // mismatches, or VH parse errors that would otherwise be
+            // silently turned into "filesystem could not be opened".
+            progress(&format!("open_filesystem failed: {e}"));
             return MinimumResult::Computed {
                 in_place: None,
                 defragmented: None,
@@ -706,10 +782,41 @@ pub fn partition_minimum_size<R: Read + Seek + Send + 'static>(
     progress("Computing last data byte...");
     let in_place = fs.last_data_byte().ok().map(|m| m.min(partition_size));
     progress("Computing defragmented minimum...");
-    let defragmented = fs
-        .defragmented_minimum_size()
-        .ok()
-        .map(|m| m.min(partition_size));
+    let inner_defrag = fs.defragmented_minimum_size().ok();
+    let defragmented = inner_defrag.and_then(|m| {
+        progress(&format!("inner_defragmented_minimum_size={m}"));
+        let partition_level = match wrapper_info.as_ref() {
+            // For wrapped HFS+, the partition extent must be:
+            //   wrapper_overhead + ceil(inner_min / outer_al_block_size) * outer_al_block_size
+            // Routing through plan_wrapped_clone guarantees the cached
+            // minimum equals what the clone pipeline will emit — matching
+            // both `new_partition_size` and the resize plan exactly.
+            Some(info) => match hfsplus_wrapper_clone::plan_wrapped_clone(info, m) {
+                Ok(plan) => {
+                    progress(&format!(
+                        "plan_wrapped_clone OK: new_partition_size={} new_inner_size={} \
+                         new_embed_block_count={} new_total_blocks={}",
+                        plan.new_partition_size,
+                        plan.new_inner_size,
+                        plan.new_embed_block_count,
+                        plan.new_total_blocks,
+                    ));
+                    plan.new_partition_size
+                }
+                Err(e) => {
+                    progress(&format!("plan_wrapped_clone failed: {e}"));
+                    return None;
+                }
+            },
+            None => m,
+        };
+        let clamped = partition_level.min(partition_size);
+        progress(&format!(
+            "partition-level defragmented={} (clamped from {} by partition_size={})",
+            clamped, partition_level, partition_size,
+        ));
+        Some(clamped)
+    });
     MinimumResult::Computed {
         in_place,
         defragmented,
@@ -1199,7 +1306,7 @@ fn compact_partition_reader_by_string<R: Read + Seek + Send + 'static>(
 /// - Embedded HFS+ (HFS wrapper with 0x4244 MDB, drEmbedSigWord == 0x482B): `hfsplus_offset`
 ///   is calculated from the MDB's drAlBlSt/drAlBlkSiz/drEmbedExtent fields.
 /// - Pure HFS (0x4244, no embedded HFS+): returns `"hfs"`.
-pub(crate) fn resolve_apple_hfs<R: Read + Seek>(
+pub fn resolve_apple_hfs<R: Read + Seek>(
     reader: &mut R,
     partition_offset: u64,
 ) -> (&'static str, u64) {
@@ -1298,16 +1405,23 @@ pub fn probe_hfsplus_signature<R: Read + Seek>(
     Some(u16::from_be_bytes(sig))
 }
 
+/// Shape of HFS+ defrag-clone the backup pipeline should use for a
+/// partition. Returned by [`defrag_clone_shape`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefragCloneShape {
+    /// Native (flat) HFS+/HFSX volume at the partition root. Use
+    /// [`hfsplus_defrag::stream_defragmented_hfsplus`].
+    Flat,
+    /// HFS wrapper with an embedded HFS+/HFSX inside (Mac OS 8/9 style).
+    /// Use [`hfsplus_wrapper_clone::stream_wrapped_defragmented_hfsplus`].
+    Wrapped,
+}
+
 /// Pre-flight check for the streamed defrag-clone backup path. Returns
-/// `Ok(())` when the partition is a plain HFS+/HFSX volume that the
-/// shrink-to-minimum pipeline can safely emit, or `Err(reason)` with a
-/// human-readable explanation when it cannot.
+/// `Ok(shape)` describing how the partition should be cloned, or
+/// `Err(reason)` with a human-readable explanation when it cannot.
 ///
 /// Refused cases:
-/// - **Embedded HFS+ inside an HFS wrapper** — the classic Mac OS 9
-///   layout where an outer `Apple_HFS` partition holds an HFS volume
-///   whose MDB points at an inner HFS+ via `drEmbedExtent`. Cloning the
-///   inner volume to a flat HFS+ would silently drop the wrapper.
 /// - **Dirty journaled volume** — `kHFSVolumeJournaledBit` set with
 ///   `kHFSVolumeUnmountedBit` clear. The journal carries pending metadata
 ///   changes the catalog hasn't yet absorbed; cloning the catalog as-is
@@ -1318,37 +1432,38 @@ pub fn probe_hfsplus_signature<R: Read + Seek>(
 /// target (built without the journaled bit) effectively nullifies the
 /// journal.
 ///
+/// Embedded HFS+ inside an HFS wrapper is now supported — it returns
+/// [`DefragCloneShape::Wrapped`] and the wrapper-aware streamer rebuilds
+/// the outer HFS shell around the shrunken inner volume.
+///
 /// Volumes that aren't HFS+/HFSX at all return `Err` with a generic
 /// "not an HFS+ volume" reason — callers should typically branch on
 /// fs-type before reaching this helper.
-pub fn can_defrag_clone_hfsplus<R: Read + Seek>(
+pub fn defrag_clone_shape<R: Read + Seek>(
     reader: &mut R,
     partition_offset: u64,
-) -> Result<(), String> {
+) -> Result<DefragCloneShape, String> {
     let (fs_type, hfsplus_offset) = resolve_apple_hfs(reader, partition_offset);
     if fs_type != "hfsplus" {
         return Err("not an HFS+/HFSX volume".into());
     }
-    if hfsplus_offset != partition_offset {
-        return Err(
-            "embedded HFS+ inside an HFS wrapper — shrink-to-minimum is not supported \
-             for this layout. Disable shrink-to-minimum for this backup, or restore \
-             the disk first to a flat HFS+ volume."
-                .into(),
-        );
+    let shape = if hfsplus_offset == partition_offset {
+        DefragCloneShape::Flat
+    } else {
+        DefragCloneShape::Wrapped
+    };
+    // Read the VH attributes word (offset 4, 4 bytes). Raw block devices
+    // (macOS /dev/diskN, Linux /dev/sdX) reject sub-sector reads and reads
+    // at non-sector-aligned offsets, so do a 512-byte sector-aligned read
+    // and slice out the four bytes we need.
+    if reader.seek(SeekFrom::Start(hfsplus_offset + 1024)).is_err() {
+        return Err("failed to seek to VH sector".into());
     }
-    // Read the VH attributes word (offset 4, 4 bytes) to test the journal bits.
-    if reader
-        .seek(SeekFrom::Start(hfsplus_offset + 1024 + 4))
-        .is_err()
-    {
-        return Err("failed to seek to VH attributes word".into());
+    let mut sector = [0u8; 512];
+    if reader.read_exact(&mut sector).is_err() {
+        return Err("failed to read VH sector".into());
     }
-    let mut buf = [0u8; 4];
-    if reader.read_exact(&mut buf).is_err() {
-        return Err("failed to read VH attributes word".into());
-    }
-    let attributes = u32::from_be_bytes(buf);
+    let attributes = u32::from_be_bytes([sector[4], sector[5], sector[6], sector[7]]);
     let journaled = attributes & 0x2000 != 0;
     let unmounted_clean = attributes & 0x100 != 0;
     if journaled && !unmounted_clean {
@@ -1360,7 +1475,18 @@ pub fn can_defrag_clone_hfsplus<R: Read + Seek>(
                 .into(),
         );
     }
-    Ok(())
+    Ok(shape)
+}
+
+/// Back-compat wrapper around [`defrag_clone_shape`] that flattens the
+/// shape into a unit result. Used by callers that don't care which
+/// variant of the clone pipeline runs, only whether *some* clone is
+/// possible.
+pub fn can_defrag_clone_hfsplus<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+) -> Result<(), String> {
+    defrag_clone_shape(reader, partition_offset).map(|_| ())
 }
 
 /// Returns `"HFS+"`, `"HFSX"`, `"HFS"`, or `"unknown"`. Useful for updating

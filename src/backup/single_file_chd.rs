@@ -79,6 +79,15 @@ pub struct SingleFileChdInputs<'a> {
     /// triggers the temp-file resize path documented in
     /// `docs/whole_disk_chd_backup.md` (Stage 4b, Approach A).
     pub resize_targets: Option<&'a [(usize, u64)]>,
+    /// HFS+/HFSX partitions that should be reproduced as a fully repacked
+    /// (defragmented) volume via [`fs::hfsplus_defrag::stream_defragmented_hfsplus`]
+    /// rather than via raw read + in-place resize. Entries are
+    /// `(partition_index, target_size_bytes)`. The new partition size in the
+    /// resize plan is taken from `resize_targets`; this list just flags which
+    /// entries should be served by the clone pipeline. Set by `run_backup`
+    /// when `BackupConfig::shrink_to_minimum` is on. `None` (or empty) keeps
+    /// the legacy raw-read + in-place resize behaviour for every partition.
+    pub hfsplus_clone_targets: Option<&'a [(usize, u64, crate::fs::DefragCloneShape)]>,
     /// Sectors used to align partition starts when relocating after a
     /// resize. Must match the source disk's detected alignment so that
     /// vintage OSes still accept the layout. Ignored on the no-resize
@@ -581,6 +590,9 @@ pub fn run_export(
         is_dvd: inputs.is_dvd,
         output_base: &output_base,
         resize_targets: inputs.resize_targets,
+        // Re-export path: no shrink-to-minimum clone — partitions are resized
+        // in place by `resize_filesystem_for` as before.
+        hfsplus_clone_targets: None,
         alignment_sectors: inputs.alignment_sectors,
         // The export path doesn't write metadata.json, so the only effect
         // of `checksum_type` here is the per-partition checksum log line
@@ -638,11 +650,19 @@ fn decompress_chd_to_file(
 /// matches the source size (i.e. a no-op the streaming path can serve
 /// faster). Returns `Ok(Some(plans))` when at least one partition would
 /// move or change size.
-fn build_resize_plans(
+pub fn build_resize_plans(
     inputs: &SingleFileChdInputs<'_>,
 ) -> Result<Option<Vec<PartitionResizePlan>>> {
+    // Whenever any partition is flagged for HFS+ defrag-clone we MUST take
+    // the temp-file branch — the streaming path can't run the clone pipeline
+    // — so force a plan even when `resize_targets` is None / a no-op set.
+    let has_clone_targets = inputs
+        .hfsplus_clone_targets
+        .map(|t| !t.is_empty())
+        .unwrap_or(false);
     let targets = match inputs.resize_targets {
         Some(t) if !t.is_empty() => t,
+        _ if has_clone_targets => &[][..],
         _ => return Ok(None),
     };
 
@@ -657,7 +677,7 @@ fn build_resize_plans(
             }
         }
     }
-    if effective.is_empty() {
+    if effective.is_empty() && !has_clone_targets {
         return Ok(None);
     }
 
@@ -678,7 +698,7 @@ fn build_resize_plans(
     let any_change = plans
         .iter()
         .any(|p| p.needs_data_move || p.new_size_bytes != p.old_size_bytes);
-    if !any_change {
+    if !any_change && !has_clone_targets {
         return Ok(None);
     }
     Ok(Some(plans))
@@ -708,6 +728,56 @@ fn plans_to_overrides(plans: &[PartitionResizePlan]) -> Vec<PartitionSizeOverrid
         .collect()
 }
 
+/// Compute the shrunken disk envelope for a resize-active backup. The
+/// envelope is the byte just past the last partition's new extent, rounded
+/// up to the disk's alignment sector (and with a GPT trailer reservation
+/// when applicable), capped at the source size. Pure function — shared
+/// between `run_with_resize` (sizes the scratch file + CHD container) and
+/// `run_backup` (sets the GUI progress total before any bytes flow).
+pub fn compute_resized_envelope(
+    plans: &[PartitionResizePlan],
+    alignment_sectors: u64,
+    source_size: u64,
+    partition_table: &PartitionTable,
+) -> u64 {
+    let alignment_bytes = (alignment_sectors.max(1) * 512).max(512);
+    let last_partition_end = plans
+        .iter()
+        .map(|p| p.new_start_lba * 512 + p.new_size_bytes)
+        .max()
+        .unwrap_or(source_size);
+    let trailer_reserve: u64 = match partition_table {
+        PartitionTable::Gpt { .. } => 33 * 512,
+        _ => 0,
+    };
+    let raw_target = last_partition_end.saturating_add(trailer_reserve);
+    let aligned_target = raw_target.div_ceil(alignment_bytes) * alignment_bytes;
+    aligned_target.min(source_size)
+}
+
+/// Thin `Write` wrapper that ticks a progress callback per write call.
+/// Used by `run_with_resize` to surface mid-partition progress during the
+/// HFS+ defrag-clone stream (otherwise the GUI sits at 0 B for the entire
+/// multi-minute write phase on slow NAS targets). The callback receives
+/// the cumulative byte count across the whole scratch file.
+struct ProgressingWriter<'a, W: Write> {
+    inner: W,
+    cumulative: &'a mut u64,
+    on_tick: &'a mut dyn FnMut(u64),
+}
+
+impl<'a, W: Write> Write for ProgressingWriter<'a, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        *self.cumulative = self.cumulative.saturating_add(n as u64);
+        (self.on_tick)(*self.cumulative);
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Sparse-temp-file resize pipeline. See module-level doc and
 /// `docs/whole_disk_chd_backup.md` (Stage 4b, Approach A) for the
 /// design rationale.
@@ -728,11 +798,16 @@ fn run_with_resize(
     ));
 
     let overrides = plans_to_overrides(plans);
-    // Disk-level logical size stays at the source's size for now: the
-    // resize plan is constrained against `source_size` already (see
-    // `compute_resize_plan`), so partitions never overflow it. Shrinking
-    // the disk envelope itself is a future enhancement.
-    let target_size = inputs.source_size;
+    let target_size = compute_resized_envelope(
+        plans,
+        inputs.alignment_sectors,
+        inputs.source_size,
+        inputs.partition_table,
+    );
+    log_cb(&format!(
+        "  disk envelope: {} bytes (source {} bytes)",
+        target_size, inputs.source_size,
+    ));
 
     // Scratch disk image lives next to the eventual CHD so it shares a
     // filesystem with the destination — sparse semantics carry over and
@@ -765,6 +840,16 @@ fn run_with_resize(
             .context("failed to open scratch disk image read+write")?;
         tf.set_len(target_size)
             .context("failed to size scratch disk image")?;
+
+        // Track bytes written into the scratch file so the GUI progress bar
+        // advances during the partition-write phase (which dominates wall
+        // time on slow NAS targets). `progress_cb` total is already
+        // `target_size` (the shrunken envelope) — we feed it cumulative
+        // bytes written. Coarse: tick once per partition with the
+        // partition's new_size. The CHD compression pass at the end will
+        // restart the bar (it calls progress_cb from 0..target_size again
+        // with its own counter).
+        let mut bytes_written_total: u64 = 0;
 
         write_patched_table(
             &mut tf,
@@ -803,6 +888,136 @@ fn run_with_resize(
                 .unwrap_or(part.start_lba * 512);
             let new_size = plan.map(|p| p.new_size_bytes).unwrap_or(part.size_bytes);
             let new_start_lba = new_offset / 512;
+
+            // HFS+ defrag-clone path: stream a freshly-repacked HFS+ volume
+            // directly into the scratch file at `new_offset`. The clone
+            // pipeline produces a fully-consistent volume sized to the entry
+            // recorded in the resize plan, so `resize_filesystem_for` must NOT
+            // run afterwards — it would either no-op (already at target) or
+            // corrupt the freshly-built MDB / volume header.
+            let clone_entry = inputs
+                .hfsplus_clone_targets
+                .and_then(|t| t.iter().find(|(idx, _, _)| *idx == part.index).copied());
+
+            if let Some((_, _, shape)) = clone_entry {
+                let shape_label = match shape {
+                    fs::DefragCloneShape::Flat => "flat HFS+",
+                    fs::DefragCloneShape::Wrapped => "wrapped HFS+ (HFS shell preserved)",
+                };
+                log_cb(&format!(
+                    "  partition-{}: streaming defragmented {} at offset {} \
+                     (source size {}, new size {})",
+                    part.index, shape_label, new_offset, part.size_bytes, new_size,
+                ));
+                tf.seek(SeekFrom::Start(new_offset))
+                    .with_context(|| format!("seek scratch to partition-{} offset", part.index))?;
+                let producer_clone = inputs
+                    .source_file
+                    .try_clone()
+                    .context("clone source for HFS+ defrag-clone producer")?;
+                let part_offset = part.start_lba * 512;
+                // Wrap `tf` so each write call inside the clone stream ticks
+                // `progress_cb` with the cumulative scratch-file bytes.
+                // Without this the GUI bar stays at 0 for the full
+                // partition write (tens of GiB on a slow NAS).
+                let mut tick = |n: u64| progress_cb(n);
+                let mut tf_progress = ProgressingWriter {
+                    inner: &mut tf,
+                    cumulative: &mut bytes_written_total,
+                    on_tick: &mut tick,
+                };
+                let report = match shape {
+                    fs::DefragCloneShape::Flat => {
+                        let mut hfs = fs::hfsplus::HfsPlusFilesystem::open(
+                            std::io::BufReader::new(producer_clone),
+                            part_offset,
+                        )
+                        .with_context(|| {
+                            format!("open source HFS+ for partition-{}", part.index)
+                        })?;
+                        fs::hfsplus_defrag::stream_defragmented_hfsplus(
+                            &mut hfs,
+                            new_size,
+                            &mut tf_progress,
+                        )
+                        .with_context(|| {
+                            format!("stream_defragmented_hfsplus for partition-{}", part.index)
+                        })?
+                    }
+                    fs::DefragCloneShape::Wrapped => {
+                        let mut br = std::io::BufReader::new(producer_clone);
+                        let info = fs::hfsplus_wrapper_clone::detect_wrapped_hfsplus(
+                            &mut br,
+                            part_offset,
+                            part.size_bytes,
+                        )
+                        .ok_or_else(|| {
+                            anyhow!("wrapped HFS+ detection failed for partition-{}", part.index)
+                        })?;
+                        let outer_overhead = (info.al_block_start_sector as u64) * 512
+                            + (info.embed_start_block as u64) * (info.al_block_size as u64)
+                            + 1024;
+                        let inner_target = new_size.saturating_sub(outer_overhead);
+                        let plan =
+                            fs::hfsplus_wrapper_clone::plan_wrapped_clone(&info, inner_target)
+                                .map_err(|e| anyhow!("{e}"))?;
+                        if plan.new_partition_size != new_size {
+                            anyhow::bail!(
+                                "wrapped HFS+ partition-{}: planned size {} disagrees with \
+                                 resize plan size {}",
+                                part.index,
+                                plan.new_partition_size,
+                                new_size,
+                            );
+                        }
+                        fs::hfsplus_wrapper_clone::stream_wrapped_defragmented_hfsplus(
+                            &mut br,
+                            &plan,
+                            &mut tf_progress,
+                        )
+                        .map_err(|e| anyhow!("{e}"))?
+                    }
+                };
+                drop(tf_progress);
+                log_cb(&format!(
+                    "  partition-{}: defrag emit: {} files / {} folders / {} bytes / \
+                     {} hardlinks / {} xattrs",
+                    part.index,
+                    report.files_copied,
+                    report.dirs_copied,
+                    report.data_bytes_copied,
+                    report.hardlinks_copied + report.dir_hardlinks_copied,
+                    report.xattrs_copied,
+                ));
+                // No resize_filesystem_for / patch_hidden_sectors_for here:
+                // the cloned volume already matches `new_size` byte-for-byte,
+                // and HFS+ has no hidden_sectors field to patch. The
+                // ProgressingWriter ticks already advanced
+                // bytes_written_total; emit one final tick to land on
+                // exactly the partition's end byte (clone output may emit
+                // slightly less than new_size if metadata was padded, in
+                // which case round up so the bar reaches the expected
+                // boundary).
+                let target_total = (new_offset).saturating_add(new_size);
+                if bytes_written_total < target_total {
+                    bytes_written_total = target_total;
+                    progress_cb(bytes_written_total);
+                }
+                // Flush the partition's writes to the scratch file before
+                // moving to the next one. On a slow target (NAS / USB
+                // bridge) this fsync can take many seconds during which
+                // the progress bar would otherwise look stuck; surface a
+                // log line so the user can tell why.
+                log_cb(&format!(
+                    "  partition-{}: flushing scratch writes to disk...",
+                    part.index,
+                ));
+                tf.flush().with_context(|| {
+                    format!("flush scratch after partition-{} clone", part.index)
+                })?;
+                log_cb(&format!("  partition-{}: flushed.", part.index,));
+                continue;
+            }
 
             // Bytes to write: cap at min(source_extent, new_size). When
             // shrinking, the FS resize call below is responsible for
@@ -844,6 +1059,9 @@ fn run_with_resize(
             let mut local_log = |s: &str| log_cb(s);
             fs::patch_hidden_sectors_for(&mut tf, new_offset, new_start_lba, &mut local_log)
                 .with_context(|| format!("patch hidden sectors for partition-{}", part.index))?;
+
+            bytes_written_total = bytes_written_total.saturating_add(new_size);
+            progress_cb(bytes_written_total);
         }
 
         tf.flush().context("flush scratch disk image")?;
@@ -1570,6 +1788,7 @@ mod tests {
             is_dvd: false,
             output_base: &output_base,
             resize_targets: None,
+            hfsplus_clone_targets: None,
             alignment_sectors: 0,
             checksum_type: crate::backup::ChecksumType::Sha256,
         };
@@ -1688,6 +1907,7 @@ mod tests {
                 is_dvd: false,
                 output_base: &output_base,
                 resize_targets: None,
+                hfsplus_clone_targets: None,
                 alignment_sectors: 0,
                 checksum_type: crate::backup::ChecksumType::Sha256,
             },
@@ -1787,6 +2007,7 @@ mod tests {
                 is_dvd: false,
                 output_base: &output_base,
                 resize_targets: None,
+                hfsplus_clone_targets: None,
                 alignment_sectors: 0,
                 checksum_type: crate::backup::ChecksumType::Sha256,
             },
@@ -1887,6 +2108,7 @@ mod tests {
                 is_dvd: false,
                 output_base: &output_base,
                 resize_targets: Some(&resize_targets),
+                hfsplus_clone_targets: None,
                 alignment_sectors: 0,
                 checksum_type: crate::backup::ChecksumType::Sha256,
             },
@@ -1897,9 +2119,19 @@ mod tests {
         )
         .expect("resize-plan single-file CHD backup");
 
+        // Disk envelope now shrinks to fit the resized partition extent
+        // (was previously locked to `total_bytes`). Floor: end-of-last-
+        // partition rounded up to alignment. For this MBR fixture
+        // (alignment_sectors=0 → 512-byte alignment, no GPT trailer) it
+        // equals new_part_start + new_part_bytes = 512 + new_part_bytes.
+        let expected_envelope = 512 + new_part_bytes;
         assert_eq!(
-            result.container_logical_size, total_bytes,
-            "disk envelope size unchanged in stage 4b"
+            result.container_logical_size, expected_envelope,
+            "disk envelope shrinks to fit resized partition"
+        );
+        assert!(
+            result.container_logical_size < total_bytes,
+            "shrunken envelope must be smaller than source"
         );
         assert_eq!(result.partition_ranges.len(), 1);
         assert_eq!(result.partition_ranges[0].offset_in_disk, 512);
@@ -1935,16 +2167,17 @@ mod tests {
             "partition body must equal source's leading new_part_bytes",
         );
 
-        // Tail (between new partition end and old partition end) is
-        // zero-fill territory — bytes the source had there were dropped
-        // when we capped the copy at new_part_bytes.
+        // Disk envelope now shrinks to (512 + new_part_bytes), so the
+        // old "tail past new partition end" no longer exists in the CHD.
+        // Verify by reading one byte at the old-partition tail offset and
+        // confirming the read fails (past EOF).
         reader.seek(SeekFrom::Start(512 + new_part_bytes)).unwrap();
-        let mut tail = vec![0u8; (PART_SECTORS - NEW_PART_SECTORS) as usize * 512];
-        reader.read_exact(&mut tail).unwrap();
+        let mut one = [0u8; 1];
+        let beyond = reader.read_exact(&mut one);
         assert!(
-            tail.iter().all(|b| *b == 0),
-            "shrunk-out tail must be zero-filled (was {} non-zero bytes)",
-            tail.iter().filter(|b| **b != 0).count(),
+            beyond.is_err(),
+            "disk envelope must end exactly at 512 + new_part_bytes; \
+             reading past that should EOF (got {beyond:?})"
         );
     }
 
@@ -2062,6 +2295,7 @@ mod tests {
                 is_dvd: false,
                 output_base: &output_base,
                 resize_targets: None,
+                hfsplus_clone_targets: None,
                 alignment_sectors: 0,
                 checksum_type: crate::backup::ChecksumType::Sha256,
             },
@@ -2185,6 +2419,7 @@ mod tests {
             is_dvd: false,
             output_base: &output_base,
             resize_targets: None,
+            hfsplus_clone_targets: None,
             alignment_sectors: 0,
             checksum_type: crate::backup::ChecksumType::Sha256,
         };

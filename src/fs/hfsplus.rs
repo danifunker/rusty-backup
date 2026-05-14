@@ -681,7 +681,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         self.partition_offset
     }
 
-    pub(crate) fn block_size(&self) -> u32 {
+    pub fn block_size(&self) -> u32 {
         self.vh.block_size
     }
 
@@ -1663,7 +1663,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
                 // split-then-insert failure mode where the target half
                 // can't accept the new record.
                 let mut h = BTreeHeader::read(&self.catalog_data);
-                let (new_idx, split_key) = btree_split_leaf_with_insert(
+                let splits = btree_split_leaf_with_insert(
                     &mut self.catalog_data,
                     node_size,
                     leaf_idx,
@@ -1674,42 +1674,66 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
 
                 h.leaf_records += 1;
 
-                // Insert separator into parent
+                // Install the first separator into the existing parent (or
+                // grow the root). Any additional separators come from N-way
+                // splits and are routed through `btree_insert_into_index`
+                // against a freshly-resolved parent — once the tree depth
+                // grows past 1 the root-grow branch never re-fires.
+                let first = &splits[0];
                 if h.depth == 1 {
-                    // Root was a leaf — grow root
                     btree_grow_root(
                         &mut self.catalog_data,
                         node_size,
                         &mut h,
                         leaf_idx,
-                        new_idx,
-                        &split_key,
+                        first.0,
+                        &first.1,
+                    )?;
+                } else if let Some(&(_, parent_idx)) =
+                    parent_chain.iter().find(|&&(nidx, _)| nidx == leaf_idx)
+                {
+                    btree_insert_into_index(
+                        &mut self.catalog_data,
+                        node_size,
+                        parent_idx,
+                        first.0,
+                        &first.1,
+                        &mut h,
+                        &cmp,
+                        &parent_chain,
                     )?;
                 } else {
-                    // Find the parent index node for the leaf
-                    if let Some(&(_, parent_idx)) =
-                        parent_chain.iter().find(|&&(nidx, _)| nidx == leaf_idx)
-                    {
-                        btree_insert_into_index(
-                            &mut self.catalog_data,
-                            node_size,
-                            parent_idx,
-                            new_idx,
-                            &split_key,
-                            &mut h,
-                            &cmp,
-                            &parent_chain,
-                        )?;
-                    } else {
-                        btree_grow_root(
-                            &mut self.catalog_data,
-                            node_size,
-                            &mut h,
-                            leaf_idx,
-                            new_idx,
-                            &split_key,
-                        )?;
-                    }
+                    btree_grow_root(
+                        &mut self.catalog_data,
+                        node_size,
+                        &mut h,
+                        leaf_idx,
+                        first.0,
+                        &first.1,
+                    )?;
+                }
+                for split in &splits[1..] {
+                    let header_now = BTreeHeader::read(&self.catalog_data);
+                    let (_, fresh_chain) = hfs_common::btree_find_insert_leaf(
+                        &self.catalog_data,
+                        &header_now,
+                        &split.1,
+                        &cmp,
+                    );
+                    let parent_for_sep = fresh_chain
+                        .last()
+                        .map(|&(_, p)| p)
+                        .unwrap_or(header_now.root_node);
+                    btree_insert_into_index(
+                        &mut self.catalog_data,
+                        node_size,
+                        parent_for_sep,
+                        split.0,
+                        &split.1,
+                        &mut h,
+                        &cmp,
+                        &fresh_chain,
+                    )?;
                 }
 
                 h.write(&mut self.catalog_data);
@@ -2011,7 +2035,7 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
             }
             Err(_) => {
                 let mut h = BTreeHeader::read(data);
-                let (new_idx, split_key) = btree_split_leaf_with_insert(
+                let splits = btree_split_leaf_with_insert(
                     data,
                     node_size,
                     leaf_idx,
@@ -2020,8 +2044,9 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
                     &Self::attr_compare,
                 )?;
                 h.leaf_records += 1;
+                let first = &splits[0];
                 if h.depth == 1 {
-                    btree_grow_root(data, node_size, &mut h, leaf_idx, new_idx, &split_key)?;
+                    btree_grow_root(data, node_size, &mut h, leaf_idx, first.0, &first.1)?;
                 } else if let Some(&(_, parent_idx)) =
                     parent_chain.iter().find(|&&(nidx, _)| nidx == leaf_idx)
                 {
@@ -2029,14 +2054,37 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
                         data,
                         node_size,
                         parent_idx,
-                        new_idx,
-                        &split_key,
+                        first.0,
+                        &first.1,
                         &mut h,
                         &Self::attr_compare,
                         &parent_chain,
                     )?;
                 } else {
-                    btree_grow_root(data, node_size, &mut h, leaf_idx, new_idx, &split_key)?;
+                    btree_grow_root(data, node_size, &mut h, leaf_idx, first.0, &first.1)?;
+                }
+                for split in &splits[1..] {
+                    let header_now = BTreeHeader::read(data);
+                    let (_, fresh_chain) = hfs_common::btree_find_insert_leaf(
+                        data,
+                        &header_now,
+                        &split.1,
+                        &Self::attr_compare,
+                    );
+                    let parent_for_sep = fresh_chain
+                        .last()
+                        .map(|&(_, p)| p)
+                        .unwrap_or(header_now.root_node);
+                    btree_insert_into_index(
+                        data,
+                        node_size,
+                        parent_for_sep,
+                        split.0,
+                        &split.1,
+                        &mut h,
+                        &Self::attr_compare,
+                        &fresh_chain,
+                    )?;
                 }
                 h.write(data);
                 Ok(())
@@ -2763,16 +2811,31 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
         //   - all currently-allocated user data + B-tree files + bitmap
         //   - the alternate VH at the last 1024 bytes of the volume
         //
-        // The source's bitmap already counts allocation block 0 (boot+VH) and
-        // the last 1-2 blocks (alt-VH) as allocated, so used_blocks covers all
-        // structural overhead in the source. The new alt-VH on the target
-        // lives at the end of the smaller image — we add 1024 bytes to make
-        // sure the rounded-up image is large enough to host it.
+        // We can't access the `SourceCatalogSnapshot` here (it's built
+        // later by the clone pipeline), so we can't run the precise
+        // record-byte tally that [`hfsplus_defrag::plan_defrag_layout`]
+        // uses. Instead, over-estimate the target catalog as
+        // `2× source_catalog_file.logical_size`, matching the packing
+        // overhead multiplier the planner applies. Then add an extra ×2
+        // safety pad: the planner's exact estimate could in theory exceed
+        // 2× source catalog if a volume has been heavily deleted (lots of
+        // empty space inside leaves that the precise estimator wouldn't
+        // count), but it can't exceed 4×. This puts a hard ceiling on the
+        // partition envelope without the catalog-growth invariant the
+        // planner enforces precisely on the clone path.
+        //
+        // We also add 1024 bytes to host the new alt-VH at the end of the
+        // smaller image and round up to a whole block.
         let block_size = self.vh.block_size as u64;
         let used_blocks = self.vh.total_blocks.saturating_sub(self.vh.free_blocks) as u64;
-        let used_bytes = used_blocks * block_size;
-        let with_alt_vh = used_bytes.saturating_add(1024);
-        Ok(with_alt_vh.div_ceil(block_size) * block_size)
+        let used_bytes = used_blocks.saturating_mul(block_size);
+        // Catalog-growth pad: 3× source catalog logical size. Combined
+        // with the catalog blocks already counted in `used_blocks` (the
+        // source's allocated catalog) that's 4× source total — the safe
+        // over-estimate for the planner's exact-record-bytes × 2 result.
+        let catalog_pad = self.vh.catalog_file.logical_size.saturating_mul(3);
+        let total = used_bytes.saturating_add(catalog_pad).saturating_add(1024);
+        Ok(total.div_ceil(block_size) * block_size)
     }
 
     fn write_resource_fork_to(
@@ -7247,9 +7310,10 @@ mod tests {
         // Last allocated block is 5 (bits 0..=5 set in bitmap byte 0) →
         // byte (5+1) * 4096 = 24 KiB.
         assert_eq!(in_place, 6 * 4096);
-        // Defrag = 6 used blocks * 4096 + 1024 bytes alt-VH, rounded up to a
-        // 4096-byte block = 7 blocks.
-        assert_eq!(defrag, 7 * 4096);
+        // Defrag = (used + catalog_total_blocks*3) blocks * block_size +
+        // 1024 alt-VH, rounded up. Synthetic image's catalog_total_blocks
+        // is 4 → delta is 12 → 6 + 12 = 18 user blocks + alt-VH = 19.
+        assert_eq!(defrag, 19 * 4096);
         assert!(defrag <= total);
     }
 
@@ -7283,8 +7347,9 @@ mod tests {
 
         // In-place trim hugs the new tail allocation: byte (200+1)*4096.
         assert_eq!(in_place, 201 * 4096);
-        // Defrag: 7 used blocks * 4096 + 1024 alt-VH, rounded up = 8 blocks.
-        assert_eq!(defrag, 8 * 4096);
+        // Defrag: (7 used + 12 catalog-growth) blocks * 4096 + 1024 alt-VH,
+        // rounded up = 20 blocks. Still well under in_place (201 blocks).
+        assert_eq!(defrag, 20 * 4096);
         assert!(defrag < in_place);
     }
 

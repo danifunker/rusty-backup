@@ -33,12 +33,82 @@ use super::hfsplus_clone::{
 /// here, in source-CNID order, so the remap is stable and reproducible.
 const FIRST_USER_CNID: u32 = 16;
 
-/// Catalog-size safety margin. The planner sizes the target's catalog
-/// B-tree to `source_blocks * CATALOG_GROWTH_NUM / CATALOG_GROWTH_DEN`
-/// so leaf splits during emit don't run out of free nodes. 1.5× matches
-/// the value the HFS expand-block-size dialog ships with.
-const CATALOG_GROWTH_NUM: u32 = 3;
-const CATALOG_GROWTH_DEN: u32 = 2;
+/// Catalog growth multiplier applied AFTER computing the exact per-record
+/// byte cost from the snapshot. The exact estimate covers the densely-
+/// packed final state (~95% leaf utilisation); the multiplier accounts for
+/// split-induced fragmentation during incremental insertion (records
+/// arrive in source-CNID order, not sorted by catalog key, so splits leave
+/// nodes ~50% full until later inserts fill them back). 2× the exact
+/// estimate is a comfortable overprovision; the unused tail is zeros and
+/// compresses to nothing in CHD.
+const CATALOG_PACKING_OVERHEAD_NUM: u32 = 2;
+const CATALOG_PACKING_OVERHEAD_DEN: u32 = 1;
+/// Approximate body sizes (excluding the key portion) of each HFS+ catalog
+/// record kind, used by [`estimate_catalog_bytes`] to compute the exact
+/// catalog footprint for a given snapshot. Real records are slightly
+/// larger (variable name length in thread records, possible alignment
+/// padding); the per-record `+8` slop and the
+/// `CATALOG_PACKING_OVERHEAD_*` multiplier together absorb the variance.
+const HFSPLUS_FOLDER_BODY_BYTES: usize = 88;
+const HFSPLUS_FILE_BODY_BYTES: usize = 248;
+const HFSPLUS_THREAD_BODY_FIXED_BYTES: usize = 10;
+
+/// Compute the byte cost of a single catalog record (key + body + offset
+/// table slot). HFS+ catalog keys are `key_len(2) + parentID(4) +
+/// name_len(2) + name(UTF-16BE NFD)`, even-aligned.
+fn catalog_record_cost(name_utf16_len: usize, body_bytes: usize) -> usize {
+    let key_bytes = 6 + name_utf16_len * 2;
+    let key_padded = (key_bytes + 1) & !1;
+    // +2 for the per-record offset table slot the leaf stores at the tail.
+    // +8 slop covers per-record variance (thread `recordType` padding,
+    // round-ups inside `build_*_body`, etc.). Cheap insurance.
+    key_padded + body_bytes + 2 + 8
+}
+
+/// Walk a [`SourceCatalogSnapshot`] and return the exact catalog byte
+/// requirement for the target B-tree, including:
+///   - dir record + dir thread per directory
+///   - file record + file thread per file (incl. inodes)
+///   - hardlink-stub record + thread per file hardlink and dir hardlink
+///   - header + map placeholder + ~5% index overhead
+/// The caller multiplies by [`CATALOG_PACKING_OVERHEAD_NUM`] /
+/// [`CATALOG_PACKING_OVERHEAP_DEN`] to absorb split-induced fragmentation.
+fn estimate_catalog_bytes(snapshot: &SourceCatalogSnapshot) -> u64 {
+    let mut record_bytes: u64 = 0;
+    // Helper to add (record cost + thread cost) where the thread carries
+    // the same UTF-16 name in its body. The thread record itself uses an
+    // empty key (`parent=cnid, name=""`).
+    let mut accumulate = |name: &str, body_bytes: usize| {
+        let name_utf16: usize = name.encode_utf16().count();
+        let main_cost = catalog_record_cost(name_utf16, body_bytes);
+        // Thread record: key has empty name (so name_utf16=0), body is
+        // recordType(2) + reserved(2) + parentID(4) + name_len(2) + name.
+        let thread_body = HFSPLUS_THREAD_BODY_FIXED_BYTES + name_utf16 * 2;
+        let thread_cost = catalog_record_cost(0, thread_body);
+        record_bytes = record_bytes.saturating_add((main_cost + thread_cost) as u64);
+    };
+    for d in &snapshot.dirs {
+        accumulate(&d.name, HFSPLUS_FOLDER_BODY_BYTES);
+    }
+    for f in &snapshot.files {
+        accumulate(&f.name, HFSPLUS_FILE_BODY_BYTES);
+    }
+    for h in &snapshot.hardlinks {
+        accumulate(&h.name, HFSPLUS_FILE_BODY_BYTES);
+    }
+    for h in &snapshot.dir_hardlinks {
+        accumulate(&h.name, HFSPLUS_FILE_BODY_BYTES);
+    }
+    // Convert byte sum to leaf nodes. Each leaf has `NODE_SIZE - 14
+    // (descriptor) - 2 (free-space slot) = NODE_SIZE - 16` bytes of
+    // payload. Round up.
+    let payload = (NODE_SIZE - 16) as u64;
+    let leaf_nodes = record_bytes.div_ceil(payload);
+    // Add 5% for index nodes + 2 for header + map placeholder. Big
+    // catalogs amortise to ~2-3% index overhead; 5% is a safe upper bound.
+    let total_nodes = leaf_nodes.saturating_mul(105) / 100 + 2;
+    total_nodes.saturating_mul(NODE_SIZE as u64)
+}
 
 /// Where one user fork lives on the target volume.
 #[derive(Debug, Clone, Copy)]
@@ -162,14 +232,20 @@ pub fn plan_defrag_layout(
     let bitmap_bytes = total_blocks.div_ceil(8) as u64;
     let bitmap_blocks = bitmap_bytes.div_ceil(bs) as u32;
 
-    let catalog_blocks = snapshot
-        .volume
-        .catalog_total_blocks
-        .saturating_mul(CATALOG_GROWTH_NUM)
-        / CATALOG_GROWTH_DEN;
-    // Floor at the source value so a degenerate source (extremely small
-    // catalog) still gets at least its own size of headroom.
-    let catalog_blocks = catalog_blocks.max(snapshot.volume.catalog_total_blocks);
+    // Exact catalog sizing: walk the snapshot, sum per-record byte costs,
+    // convert to leaf nodes, add 5% index overhead, and multiply by the
+    // packing-overhead factor (2× by default) to absorb split-induced
+    // fragmentation. This is precise and deterministic — no more
+    // heuristic multiples-of-source guesses. The unused tail of the
+    // catalog file is zeros and compresses to ~nothing in CHD output.
+    let exact_catalog_bytes = estimate_catalog_bytes(snapshot)
+        .saturating_mul(CATALOG_PACKING_OVERHEAD_NUM as u64)
+        / CATALOG_PACKING_OVERHEAD_DEN as u64;
+    let catalog_bytes_needed = exact_catalog_bytes.div_ceil(bs).saturating_mul(bs);
+    let catalog_blocks_exact: u32 = (catalog_bytes_needed / bs).try_into().unwrap_or(u32::MAX);
+    // Floor at the source value so degenerate sources (extremely small
+    // catalogs, e.g. fresh-formatted volumes) still get sensible space.
+    let catalog_blocks = catalog_blocks_exact.max(snapshot.volume.catalog_total_blocks);
 
     let extents_blocks = snapshot.volume.extents_total_blocks;
     let attributes_blocks = snapshot.volume.attributes_total_blocks;
@@ -321,6 +397,41 @@ use super::hfsplus::{
     HfsPlusFilesystem, XattrKind, XattrRecord, HFSPLUS_VOLUME_UNMOUNTED_BIT,
 };
 
+thread_local! {
+    /// Thread-local progress sink for the defrag pipeline. Callers
+    /// (`run_with_resize` etc.) `set_progress_sink(Some(cb))` before
+    /// invoking [`stream_defragmented_hfsplus`] /
+    /// [`build_target_metadata`] / wrappers, and clear it on the way out.
+    /// Tests and other callers leave it `None`; the defrag code emits to
+    /// stderr only as before. Avoids threading a `log_cb` through 8+
+    /// signatures while still piping the per-50k-records ticks into the
+    /// GUI log queue.
+    static PROGRESS_SINK: std::cell::RefCell<Option<Box<dyn FnMut(&str)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install or clear a progress sink for the current thread. Pass `Some(cb)`
+/// to receive log lines (one per 50k catalog inserts during build, plus
+/// phase boundaries); pass `None` to suppress GUI logging and rely on
+/// stderr only. Safe to call from anywhere; the previous value is dropped.
+pub fn set_progress_sink(cb: Option<Box<dyn FnMut(&str)>>) {
+    PROGRESS_SINK.with(|cell| {
+        *cell.borrow_mut() = cb;
+    });
+}
+
+/// Internal helper — emit a progress message to both stderr (for the
+/// `tee /tmp/rusty-backup-run.log` capture) and, if set, the thread-local
+/// progress sink (for the in-GUI log).
+fn emit_progress(msg: &str) {
+    eprintln!("{msg}");
+    PROGRESS_SINK.with(|cell| {
+        if let Some(cb) = cell.borrow_mut().as_mut() {
+            cb(msg);
+        }
+    });
+}
+
 /// HFS+ B-tree key compare types (`BTHeaderRec` offset 37).
 const KEY_COMPARE_CASE_FOLDING: u8 = 0xCF;
 const KEY_COMPARE_BINARY: u8 = 0xBC;
@@ -453,6 +564,25 @@ pub fn build_target_metadata(
 
     let mut queue: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
     queue.push_back(2);
+    // Diagnostic: stderr trace every N catalog inserts so a multi-million-
+    // record clone shows progress (vs. looking like a hang). Captures
+    // wall-clock between ticks so the user can compare slow-but-progressing
+    // against truly stuck.
+    let mut insert_count: u64 = 0;
+    let tick = 50_000u64;
+    let start = std::time::Instant::now();
+    let mut last_tick = start;
+    let log_progress = |insert_count: u64, phase: &str, last_tick: &mut std::time::Instant| {
+        let now = std::time::Instant::now();
+        let dt = now.duration_since(*last_tick).as_secs_f64();
+        let total = now.duration_since(start).as_secs_f64();
+        let msg = format!(
+            "[defrag-build] {phase}: {insert_count} catalog inserts \
+             (+{tick} in {dt:.2}s, total {total:.1}s)"
+        );
+        emit_progress(&msg);
+        *last_tick = now;
+    };
     while let Some(src_parent) = queue.pop_front() {
         if let Some(children) = dirs_by_parent.remove(&src_parent) {
             for d in children {
@@ -485,9 +615,15 @@ pub fn build_target_metadata(
 
                 *child_count.entry(target_parent).or_default() += 1;
                 queue.push_back(d.cnid);
+
+                insert_count += 2;
+                if insert_count % tick == 0 {
+                    log_progress(insert_count, "dirs", &mut last_tick);
+                }
             }
         }
     }
+    log_progress(insert_count, "dirs done", &mut last_tick);
 
     // ----------------------------------------------------------------
     // Insert files. Forks come from the planner; no allocation here.
@@ -528,7 +664,13 @@ pub fn build_target_metadata(
         hfs_common::btree_insert_full(&mut catalog, &tk, &cmp)?;
 
         *child_count.entry(target_parent).or_default() += 1;
+
+        insert_count += 2;
+        if insert_count % tick == 0 {
+            log_progress(insert_count, "files", &mut last_tick);
+        }
     }
+    log_progress(insert_count, "files done", &mut last_tick);
 
     // ----------------------------------------------------------------
     // Hardlink stubs (Step 22c-i). Each stub is a FILE catalog record —
@@ -1075,18 +1217,59 @@ fn init_btree_buffer(total_bytes: usize, max_key_len: u16, key_compare_type: u8)
         "btree size must be node-aligned"
     );
     let total_nodes = (total_bytes / NODE_SIZE) as u32;
-    assert!(total_nodes >= 4, "need at least 4 nodes (header+leaf+2)");
+    // Layout: 0 = header, 1 = empty leaf, 2..2+map_nodes = map nodes
+    // (BTNodeKind=2), then free nodes for B-tree growth. Map nodes are
+    // required whenever the catalog exceeds the header bitmap's capacity
+    // (~30,720 nodes at NODE_SIZE=4096, i.e. ~120 MiB catalog file).
+    // OS 9 volumes with 100k+ catalog records routinely need map nodes.
+    let map_nodes = hfs_common::map_nodes_required(total_nodes, NODE_SIZE);
+    let used_nodes = 2 + map_nodes;
+    assert!(
+        total_nodes >= used_nodes + 2,
+        "need at least {} nodes (header + leaf + {} map nodes + 2 free), got {}",
+        used_nodes + 2,
+        map_nodes,
+        total_nodes,
+    );
     let mut buf = vec![0u8; total_bytes];
     write_blank_btree_header_node(
         &mut buf[..NODE_SIZE],
         NODE_SIZE,
         /* leaf_records= */ 0,
         total_nodes,
-        /* free_nodes= */ total_nodes - 2,
+        /* free_nodes= */ total_nodes - used_nodes,
         max_key_len,
         key_compare_type,
     );
     write_empty_leaf_node(&mut buf[NODE_SIZE..2 * NODE_SIZE]);
+
+    if map_nodes > 0 {
+        // Header.fLink points at the first map node so `btree_bitmap_segments`
+        // walks the chain when allocating from the global node space.
+        BigEndian::write_u32(&mut buf[0..4], 2);
+        // Mark each map node as allocated in the header's bitmap (record 2,
+        // at offset 270 — matches `write_blank_btree_header_node`). With
+        // NODE_SIZE=4096 the header bitmap covers ~30,720 bits; map nodes
+        // sit at indices 2..2+map_nodes, comfortably inside that range.
+        let bitmap_rec_offset = 270usize;
+        let header_bitmap_len = NODE_SIZE - 256; // = 3840 bytes
+        for i in 0..map_nodes {
+            let bit = 2 + i;
+            let byte_idx = (bit / 8) as usize;
+            let bit_in_byte = 7 - (bit % 8) as u8;
+            if byte_idx < header_bitmap_len {
+                buf[bitmap_rec_offset + byte_idx] |= 1u8 << bit_in_byte;
+            }
+        }
+        // Initialise each map node with the prev/next chain pointers.
+        for i in 0..map_nodes {
+            let node_idx = 2 + i;
+            let next_link = if i + 1 < map_nodes { node_idx + 1 } else { 0 };
+            let prev_link = if i == 0 { 0 } else { node_idx - 1 };
+            hfs_common::init_map_node(&mut buf, NODE_SIZE, node_idx, prev_link, next_link);
+        }
+    }
+
     buf
 }
 
