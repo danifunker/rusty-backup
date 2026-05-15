@@ -462,7 +462,13 @@ impl PartitionTable {
                 .enumerate()
                 .map(|(i, p)| PartitionInfo {
                     index: i,
-                    type_name: format!("{} ({})", p.dos_type_string(), p.drv_name),
+                    // Show both the human name and the device name, e.g.
+                    // "AmigaDOS FFS-Intl (DH0)" or "SFS (Amiga) (DH1)".
+                    type_name: format!(
+                        "{} ({})",
+                        rdb::dos_type_display_name(p.dos_type),
+                        p.drv_name,
+                    ),
                     partition_type_byte: 0,
                     start_lba: p.start_lba_512(),
                     size_bytes: p.size_bytes(),
@@ -483,9 +489,16 @@ impl PartitionTable {
                 // ext, etc.) keep `partition_type_string: None` so dispatch
                 // falls back to MBR type-byte detection.
                 let is_amiga_dos = fs_hint.starts_with("DOS\\") && fs_hint.len() == 5;
+                let display_name = if is_amiga_dos {
+                    let variant = fs_hint.as_bytes()[4] - b'0';
+                    let raw = u32::from_be_bytes([b'D', b'O', b'S', variant]);
+                    rdb::dos_type_display_name(raw)
+                } else {
+                    fs_hint.clone()
+                };
                 vec![PartitionInfo {
                     index: 0,
-                    type_name: fs_hint.clone(),
+                    type_name: display_name,
                     partition_type_byte: 0,
                     start_lba: 0,
                     size_bytes: *size_bytes,
