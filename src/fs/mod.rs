@@ -1,5 +1,6 @@
 pub mod affs;
 pub mod affs_common;
+pub mod affs_fsck;
 pub mod btrfs;
 pub mod efs;
 pub mod entry;

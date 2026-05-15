@@ -315,11 +315,32 @@ state.
       header is created with `access=0` → `----rwed`, no comment).
 
 ### Phase 4 — FFS Disk Validator
-- [ ] `src/fs/affs_fsck.rs` with four phases.
-- [ ] Hook into existing fsck UI (per-partition Check button).
-- [ ] Repair path for `AffsBitmapMismatch`, `AffsBadChecksum`,
-      `AffsBrokenHashChain`, `AffsOrphanBlock`.
-- [ ] Test on a deliberately-corrupted copy of `DiskDoctor.adf`.
+- [x] `src/fs/affs_fsck.rs` with `check_affs` + `repair_affs`. BFS over
+      the directory tree from the root, validates each entry block's
+      checksum, walks file-extension chains, rebuilds the bitmap, and
+      diffs against the on-disk bitmap.
+- [x] Hooked into the existing fsck UI: `Filesystem::fsck()` returns
+      a `FsckResult`; `is_checkable_type` in `inspect_tab` accepts the
+      AmigaDOS DosType strings.
+- [x] Repair path for `AffsBitmapMismatch` via `EditableFilesystem::repair()`
+      → rewrites every bitmap page from the observed allocation set and
+      flushes through the dirty-block cache.
+- [x] Issue codes surfaced: `AffsBadChecksum`, `AffsBitmapMismatch`,
+      `AffsOrphanBlock`, `AffsBrokenHashChain`, `AffsBadType`,
+      `AffsOutOfRange`, `AffsBadDateStamp`.
+- [x] Round-trip test: clean image → fsck reports clean; corrupt a
+      bitmap page → fsck flags `AffsBitmapMismatch` as repairable;
+      `repair()` → re-fsck reports clean.
+- [x] `examples/fsck_amiga.rs` smoke-test tool. Runs cleanly on the
+      synthetic test image; on the real `DiskDoctor.adf` and
+      `4x4OffRoadRacing_v1.00_1480.hdf` images it reports a handful of
+      bad-checksum + bitmap-orphan findings consistent with the
+      "validation needed" condition AmigaDOS itself flags on these
+      vintage images.
+- [ ] Repair path for `AffsBadChecksum` / `AffsBrokenHashChain` /
+      `AffsOrphanBlock`. *Intentionally deferred — silently recomputing
+      a stale header checksum risks locking in deeper corruption.
+      Surface as errors; the user can wipe + restore from backup.*
 
 ### Phase 5 — PFS3 read + browse + backup
 - [ ] `src/fs/pfs3.rs` — root block, anode B-tree, dir block reading,
