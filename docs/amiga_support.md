@@ -537,9 +537,21 @@ state.
       (~36 extents, ~50 object-nodes on a 512-byte-block volume).
 
 ### Phase 9 — Polish
-- [ ] CLAUDE.md: add Amiga section describing dispatch + DosType strings.
-- [ ] User-facing docs (README or in-app help): supported formats list.
-- [ ] CI: add a tiny synthetic RDB+FFS test image to `tests/` (under 64 KiB).
+- [x] CLAUDE.md: Amiga section describes dispatch + DosType strings
+      (`is_amiga_dos_type` / `is_amiga_pfs3_type` / `is_amiga_sfs_type`),
+      links to the four reference C source trees, and flags the
+      bitmap-set-bit-is-free + big-endian gotchas.
+- [x] README supported-formats list: added `.adf`/`.hdf`/`.adz`/`.hdz`
+      to the image-formats table and AFFS / PFS3 / SFS to the
+      filesystems table (browse + edit, no shrink — layout-preserving).
+- [x] CI: synthetic RDB+FFS test
+      (`tests/filesystem_e2e.rs::test_synthetic_rdb_ffs_pipeline`)
+      builds a complete in-memory disk (24 KiB) — RDSK at block 0 +
+      PART block + FFS bootblock + root + bitmap — then runs it
+      through `PartitionTable::detect` → `open_filesystem` to verify
+      the full dispatch wiring. Asserts `disk.len() <= 64 KiB` so it
+      stays the "tiny fixture" the plan asked for, no binary
+      checked in.
 
 ---
 
