@@ -2867,6 +2867,16 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
             .unwrap_or(0)
     }
 
+    fn fragmentation_stats(
+        &mut self,
+    ) -> Option<Result<super::filesystem::FragmentationStats, FilesystemError>> {
+        Some(Ok(hfsplus_fragmentation_stats(
+            self.catalog_data(),
+            self.catalog_first_leaf(),
+            self.catalog_node_size(),
+        )))
+    }
+
     fn blessed_system_folder(&mut self) -> Option<(u64, String)> {
         // finderInfo[0] = Classic Mac OS System Folder CNID
         let cnid = self.vh.finder_info[0];
@@ -3331,6 +3341,76 @@ fn decode_utf16be(data: &[u8]) -> String {
 }
 
 /// Find the volume label from the catalog B-tree (root folder thread record).
+/// Count data-fork extents per file by walking catalog leaves. Cheap —
+/// all catalog data already lives in `catalog_data` (loaded at FS open),
+/// so this is a pure in-memory scan. Each file record's data fork holds 8
+/// inline extent descriptors at offset 88+16; we tally non-zero ones and
+/// flag forks that overflow into the extents-overflow B-tree as having
+/// >1 extent (the most common cause of real-world fragmentation).
+fn hfsplus_fragmentation_stats(
+    catalog_data: &[u8],
+    first_leaf: u32,
+    node_size: usize,
+) -> super::filesystem::FragmentationStats {
+    use super::hfs_common::walk_leaf_records;
+    use byteorder::{BigEndian, ByteOrder};
+
+    let mut stats = super::filesystem::FragmentationStats::default();
+    if node_size == 0 || catalog_data.is_empty() {
+        return stats;
+    }
+    walk_leaf_records::<(), _>(
+        catalog_data,
+        first_leaf,
+        node_size,
+        |_node_idx, _rec_idx, _abs_off, rec| {
+            // HFS+ catalog leaf record: u16 keyLength at offset 0, then the
+            // key payload (parentID + HFSUniStr255), then the record body
+            // (padded to even offset). The body's first 2 bytes carry the
+            // record type — 0x0002 = file, 0x0001 = folder, threads = 3/4.
+            if rec.len() < 4 {
+                return None;
+            }
+            let key_len = BigEndian::read_u16(&rec[0..2]) as usize;
+            let mut body_start = 2 + key_len;
+            if !body_start.is_multiple_of(2) {
+                body_start += 1;
+            }
+            if body_start + 88 + 80 > rec.len() {
+                return None;
+            }
+            let body = &rec[body_start..];
+            let rec_type = BigEndian::read_u16(&body[0..2]);
+            if rec_type != 0x0002 {
+                return None;
+            }
+            let data_fork = &body[88..88 + 80];
+            let total_blocks = BigEndian::read_u32(&data_fork[12..16]);
+            if total_blocks == 0 {
+                return None;
+            }
+            let mut inline_extents: u32 = 0;
+            let mut inline_blocks: u32 = 0;
+            for i in 0..8 {
+                let off = 16 + i * 8;
+                let count = BigEndian::read_u32(&data_fork[off + 4..off + 8]);
+                if count > 0 {
+                    inline_extents += 1;
+                    inline_blocks = inline_blocks.saturating_add(count);
+                }
+            }
+            stats.files_with_data += 1;
+            // Multiple inline extents OR overflow into the extents B-tree
+            // both count as fragmented for UI purposes.
+            if inline_extents > 1 || total_blocks > inline_blocks {
+                stats.fragmented_files += 1;
+            }
+            None
+        },
+    );
+    stats
+}
+
 fn find_volume_label(catalog_data: &[u8], header: &BTreeHeaderRecord) -> String {
     use super::hfs_common::walk_leaf_records;
 

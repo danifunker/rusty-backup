@@ -32,6 +32,10 @@ pub struct MinSizeStatus {
     /// Equals `result` for filesystems without a clone path; only meaningfully
     /// smaller for HFS+ on fragmented volumes.
     pub defragmented_min: Option<u64>,
+    /// Percent of files with data forks that have more than one extent.
+    /// `None` when the filesystem doesn't expose fragmentation (FAT/NTFS/exFAT)
+    /// or when the volume has no files with data forks.
+    pub fragmentation_percent: Option<f32>,
     pub error: Option<String>,
 }
 
@@ -44,6 +48,7 @@ impl MinSizeStatus {
             finished: false,
             result: None,
             defragmented_min: None,
+            fragmentation_percent: None,
             error: None,
         }
     }
@@ -166,9 +171,11 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
                 MinimumResult::Computed {
                     in_place,
                     defragmented,
+                    fragmentation_percent,
                 } => {
                     s.result = in_place;
                     s.defragmented_min = defragmented;
+                    s.fragmentation_percent = fragmentation_percent;
                 }
                 MinimumResult::Deferred { fs_name } => {
                     s.error = Some(format!(

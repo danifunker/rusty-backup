@@ -2220,6 +2220,7 @@ impl InspectTab {
                             rusty_backup::fs::MinimumResult::Computed {
                                 in_place: Some(min_size),
                                 defragmented,
+                                fragmentation_percent: _,
                             } => {
                                 let clamped = min_size.min(part.size_bytes);
                                 partition_min_sizes.insert(part.index, clamped);

@@ -116,6 +116,15 @@ pub struct BackupConfig {
     /// Empty / `None` = walk every eligible HFS+/HFS partition (the legacy
     /// behavior).
     pub precomputed_minimum_sizes: Option<Vec<(usize, u64)>>,
+    /// Per-partition opt-in for the HFS+ defrag-clone path. When `None`,
+    /// the legacy "global" behavior applies: every HFS+/HFSX partition
+    /// gets defrag-cloned whenever [`BackupConfig::shrink_to_minimum`] is
+    /// on. When `Some(set)`, only partitions whose index appears in
+    /// `set` are routed through the clone pipeline; the rest fall back to
+    /// the layout-preserving in-place trim path (same as
+    /// `shrink_to_minimum=false` for that partition). Drives the new
+    /// per-partition Defrag checkbox in the backup UI.
+    pub defrag_partition_indices: Option<std::collections::HashSet<usize>>,
 }
 
 /// Shared progress state between background backup thread and the GUI.
@@ -530,6 +539,16 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             }
             if let Some(ref filter) = config.partition_filter {
                 if !filter.contains(&part.index) {
+                    continue;
+                }
+            }
+            // Per-partition Defrag opt-in (new GUI). When the caller supplies
+            // an explicit allowlist, only those partitions get the clone
+            // pipeline; the rest fall back to the layout-preserving in-place
+            // trim. When the field is `None`, behave as before (clone every
+            // HFS+/HFSX partition).
+            if let Some(set) = config.defrag_partition_indices.as_ref() {
+                if !set.contains(&part.index) {
                     continue;
                 }
             }

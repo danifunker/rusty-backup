@@ -116,6 +116,73 @@ fn validate_hfs_create_name(name: &str) -> Result<Vec<u8>, FilesystemError> {
 /// Some formatters (notably Disk Jockey's "Empty HFS" image) allocate the
 /// catalog extents but leave the bytes zeroed, which would otherwise cause a
 /// panic on the first insert because `node_size` parses as 0.
+/// Count data-fork extents per file by walking classic HFS catalog leaves.
+/// Mirror of `hfsplus_fragmentation_stats` but for the smaller HFS file
+/// record layout: 3 inline extents at offset 74, physical-size at offset
+/// 30. Forks whose `physical_size_blocks > sum(inline blockCounts)` are
+/// flagged as fragmented (overflow into the extents B-tree).
+fn hfs_fragmentation_stats(catalog_data: &[u8]) -> super::filesystem::FragmentationStats {
+    use super::hfs_common::walk_leaf_records;
+
+    let mut stats = super::filesystem::FragmentationStats::default();
+    if catalog_data.len() < 34 {
+        return stats;
+    }
+    let node_size = BigEndian::read_u16(&catalog_data[32..34]) as usize;
+    let first_leaf = BigEndian::read_u32(&catalog_data[24..28]);
+    if node_size == 0 || first_leaf == 0 {
+        return stats;
+    }
+    walk_leaf_records::<(), _>(
+        catalog_data,
+        first_leaf,
+        node_size,
+        |_node_idx, _rec_idx, _abs_off, rec| {
+            if rec.is_empty() {
+                return None;
+            }
+            let key_len = rec[0] as usize;
+            let mut data_off = 1 + key_len;
+            if !data_off.is_multiple_of(2) {
+                data_off += 1;
+            }
+            if data_off + 102 > rec.len() {
+                return None;
+            }
+            if rec[data_off] as i8 != CATALOG_FILE {
+                return None;
+            }
+            let body = &rec[data_off..];
+            let phys_bytes = BigEndian::read_u32(&body[30..34]);
+            if phys_bytes == 0 {
+                return None;
+            }
+            let mut inline_extents: u32 = 0;
+            let mut inline_blocks: u32 = 0;
+            for j in 0..3 {
+                let count = BigEndian::read_u16(&body[74 + j * 4 + 2..74 + j * 4 + 4]);
+                if count > 0 {
+                    inline_extents += 1;
+                    inline_blocks = inline_blocks.saturating_add(count as u32);
+                }
+            }
+            stats.files_with_data += 1;
+            // Compare physical-size in blocks against inline block coverage.
+            // We don't have block_size here (it's in MDB, not catalog), so use
+            // ratio approximately: any data fork where inline blocks < physical
+            // bytes / 512 (the smallest possible block size) must overflow.
+            // Since physical-size is already block-rounded, `inline_blocks
+            // == 0 && phys_bytes > 0` is the unambiguous overflow signal.
+            let overflows = inline_blocks == 0 && phys_bytes > 0;
+            if inline_extents > 1 || overflows {
+                stats.fragmented_files += 1;
+            }
+            None
+        },
+    );
+    stats
+}
+
 fn is_catalog_uninitialized(catalog_data: &[u8]) -> bool {
     if catalog_data.len() < 34 {
         return true;
@@ -2446,6 +2513,12 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
         self.find_file_by_id(file_id)
             .map(|(_ds, _de, rs, _re)| rs as u64)
             .unwrap_or(0)
+    }
+
+    fn fragmentation_stats(
+        &mut self,
+    ) -> Option<Result<super::filesystem::FragmentationStats, FilesystemError>> {
+        Some(Ok(hfs_fragmentation_stats(&self.catalog_data)))
     }
 
     fn blessed_system_folder(&mut self) -> Option<(u64, String)> {

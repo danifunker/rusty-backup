@@ -590,6 +590,13 @@ pub enum MinimumResult {
     Computed {
         in_place: Option<u64>,
         defragmented: Option<u64>,
+        /// Percent of files with data forks whose data spans more than one
+        /// extent. Drives the per-partition Defrag checkbox in the GUI:
+        /// auto-checked when this is >= 90.0. `None` when the filesystem
+        /// doesn't compute fragmentation (FAT/NTFS/exFAT — their packing
+        /// CompactReader makes the toggle irrelevant) or when no files
+        /// have data forks (empty volume).
+        fragmentation_percent: Option<f32>,
     },
     /// This filesystem requires an expensive volume walk and the caller did not
     /// opt in via `allow_expensive`. The caller should surface a UI affordance
@@ -789,11 +796,32 @@ pub fn partition_minimum_size<R: Read + Seek + Send + 'static>(
             return MinimumResult::Computed {
                 in_place: None,
                 defragmented: None,
+                fragmentation_percent: None,
             };
         }
     };
     progress("Computing last data byte...");
     let in_place = fs.last_data_byte().ok().map(|m| m.min(partition_size));
+    progress("Computing fragmentation...");
+    let fragmentation_percent = match fs.fragmentation_stats() {
+        Some(Ok(stats)) => {
+            let p = stats.percent();
+            if let Some(pv) = p {
+                progress(&format!(
+                    "fragmentation: {}/{} files with multiple extents ({:.1}%)",
+                    stats.fragmented_files, stats.files_with_data, pv,
+                ));
+            } else {
+                progress("fragmentation: no files with data forks");
+            }
+            p
+        }
+        Some(Err(e)) => {
+            progress(&format!("fragmentation stats failed: {e}"));
+            None
+        }
+        None => None,
+    };
     progress("Computing defragmented minimum...");
     let inner_defrag = fs.defragmented_minimum_size().ok();
     let defragmented = inner_defrag.and_then(|m| {
@@ -833,6 +861,7 @@ pub fn partition_minimum_size<R: Read + Seek + Send + 'static>(
     MinimumResult::Computed {
         in_place,
         defragmented,
+        fragmentation_percent,
     }
 }
 

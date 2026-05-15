@@ -55,6 +55,20 @@ pub trait Filesystem: Send {
         self.last_data_byte()
     }
 
+    /// Returns per-fork fragmentation statistics for this volume, or `None`
+    /// when the filesystem can't compute them (e.g. cluster-allocation
+    /// filesystems whose CompactReader already repacks during the backup
+    /// stream so "fragmentation" doesn't translate into a backup-time
+    /// decision the user can make).
+    ///
+    /// Only HFS+/HFS implement this today; FAT/NTFS/exFAT return `None`
+    /// because the packing CompactReader inherently emits a defragmented
+    /// layout for them, and the UI doesn't surface a defrag toggle on
+    /// those rows.
+    fn fragmentation_stats(&mut self) -> Option<Result<FragmentationStats, FilesystemError>> {
+        None
+    }
+
     /// Stream file data to a writer. Returns the number of bytes written.
     ///
     /// All built-in filesystems (FAT/exFAT/NTFS/ext/btrfs/HFS/HFS+/ProDOS)
@@ -111,6 +125,27 @@ pub trait Filesystem: Send {
             return Err(FilesystemError::InvalidData("name cannot be empty".into()));
         }
         Ok(())
+    }
+}
+
+/// Aggregate fragmentation counts for a volume's user data forks.
+///
+/// `files_with_data` counts forks that have at least one allocated extent;
+/// `fragmented_files` counts forks whose data spans more than one extent
+/// (including the extents-overflow B-tree). The UI derives a percentage
+/// from these two counts.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FragmentationStats {
+    pub files_with_data: u64,
+    pub fragmented_files: u64,
+}
+
+impl FragmentationStats {
+    pub fn percent(&self) -> Option<f32> {
+        if self.files_with_data == 0 {
+            return None;
+        }
+        Some(100.0 * self.fragmented_files as f32 / self.files_with_data as f32)
     }
 }
 
