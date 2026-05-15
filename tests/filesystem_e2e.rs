@@ -2007,3 +2007,137 @@ fn test_sfs_staged_edits_round_trip() {
         "hello.txt should be gone after staged delete"
     );
 }
+
+/// End-to-end synthetic test: build a tiny RDB+FFS disk in memory (well
+/// under 64 KiB), run it through the full `PartitionTable::detect` →
+/// `open_filesystem` dispatch pipeline, and verify the AFFS volume
+/// inside the RDB partition opens cleanly. Substitutes for a
+/// checked-in binary fixture — exercises the same code paths without
+/// committing any opaque bytes.
+#[test]
+fn test_synthetic_rdb_ffs_pipeline() {
+    use byteorder::{BigEndian, ByteOrder};
+    use rusty_backup::fs::{self, filesystem::Filesystem};
+    use rusty_backup::partition::PartitionTable;
+
+    const BSIZE: usize = 512;
+    let surfaces = 2u32;
+    let blk_per_trk = 16u32;
+    let low_cyl = 1u32;
+    let high_cyl = 2u32;
+    let part_blocks = surfaces * blk_per_trk * (high_cyl - low_cyl + 1);
+    let start_lba = surfaces * blk_per_trk * low_cyl;
+    let total_blocks = start_lba + part_blocks;
+    let mut disk = vec![0u8; total_blocks as usize * BSIZE];
+
+    // RDSK at block 0.
+    let mut rdsk = [0u8; BSIZE];
+    rdsk[0..4].copy_from_slice(b"RDSK");
+    BigEndian::write_u32(&mut rdsk[4..8], 64);
+    BigEndian::write_u32(&mut rdsk[16..20], 512);
+    BigEndian::write_u32(&mut rdsk[28..32], 1); // part_list -> block 1
+    BigEndian::write_u32(&mut rdsk[32..36], 0xFFFFFFFF);
+    BigEndian::write_u32(&mut rdsk[24..28], 0xFFFFFFFF);
+    BigEndian::write_u32(&mut rdsk[36..40], 0xFFFFFFFF);
+    BigEndian::write_i32(&mut rdsk[8..12], 0);
+    let mut sum: i32 = 0;
+    for w in 0..128 {
+        sum = sum.wrapping_add(BigEndian::read_i32(&rdsk[w * 4..w * 4 + 4]));
+    }
+    BigEndian::write_i32(&mut rdsk[8..12], sum.wrapping_neg());
+    disk[0..BSIZE].copy_from_slice(&rdsk);
+
+    // PART block at block 1.
+    let mut part = [0u8; BSIZE];
+    part[0..4].copy_from_slice(b"PART");
+    BigEndian::write_u32(&mut part[4..8], 64);
+    BigEndian::write_u32(&mut part[16..20], 0xFFFFFFFF);
+    BigEndian::write_u32(&mut part[20..24], 1); // flags = bootable
+    part[36] = 3;
+    part[37..40].copy_from_slice(b"DH0");
+    BigEndian::write_u32(&mut part[32 * 4..32 * 4 + 4], 16);
+    BigEndian::write_u32(&mut part[33 * 4..33 * 4 + 4], 128);
+    BigEndian::write_u32(&mut part[35 * 4..35 * 4 + 4], surfaces);
+    BigEndian::write_u32(&mut part[36 * 4..36 * 4 + 4], 1);
+    BigEndian::write_u32(&mut part[37 * 4..37 * 4 + 4], blk_per_trk);
+    BigEndian::write_u32(&mut part[41 * 4..41 * 4 + 4], low_cyl);
+    BigEndian::write_u32(&mut part[42 * 4..42 * 4 + 4], high_cyl);
+    BigEndian::write_u32(&mut part[48 * 4..48 * 4 + 4], 0x444F5301); // DOS\1 (FFS)
+    BigEndian::write_i32(&mut part[8..12], 0);
+    let mut sum: i32 = 0;
+    for w in 0..128 {
+        sum = sum.wrapping_add(BigEndian::read_i32(&part[w * 4..w * 4 + 4]));
+    }
+    BigEndian::write_i32(&mut part[8..12], sum.wrapping_neg());
+    disk[BSIZE..2 * BSIZE].copy_from_slice(&part);
+
+    // Place a blank FFS volume at the partition's start_lba.
+    let part_off = start_lba as usize * BSIZE;
+    disk[part_off..part_off + 4].copy_from_slice(b"DOS\x01");
+    let root_blk = (part_blocks / 2) as usize;
+    let root_off = part_off + root_blk * BSIZE;
+    BigEndian::write_u32(&mut disk[root_off..root_off + 4], 2); // T_HEADER
+    BigEndian::write_u32(&mut disk[root_off + 12..root_off + 16], 0x48);
+    BigEndian::write_u32(&mut disk[root_off + 0x138..root_off + 0x13C], 0xFFFFFFFF);
+    let bm_blk = root_blk + 1;
+    BigEndian::write_u32(&mut disk[root_off + 0x13C..root_off + 0x140], bm_blk as u32);
+    disk[root_off + 0x1B0] = 7;
+    disk[root_off + 0x1B1..root_off + 0x1B8].copy_from_slice(b"RdbTest");
+    BigEndian::write_u32(&mut disk[root_off + 0x1FC..root_off + 0x200], 1u32);
+    let mut s: u32 = 0;
+    for w in 0..128 {
+        if w == 5 {
+            continue;
+        }
+        let v = BigEndian::read_u32(&disk[root_off + w * 4..root_off + w * 4 + 4]);
+        s = s.wrapping_add(v);
+    }
+    BigEndian::write_u32(
+        &mut disk[root_off + 20..root_off + 24],
+        0u32.wrapping_sub(s),
+    );
+    let bm_off = part_off + bm_blk * BSIZE;
+    for w in 1..56 {
+        BigEndian::write_u32(&mut disk[bm_off + w * 4..bm_off + w * 4 + 4], 0xFFFF_FFFF);
+    }
+    for &block in &[root_blk as u32, bm_blk as u32] {
+        let block_in_bm = block - 2;
+        let word = 1 + (block_in_bm / 32) as usize;
+        let bit = block_in_bm % 32;
+        let mut v = BigEndian::read_u32(&disk[bm_off + word * 4..bm_off + word * 4 + 4]);
+        v &= !(1u32 << bit);
+        BigEndian::write_u32(&mut disk[bm_off + word * 4..bm_off + word * 4 + 4], v);
+    }
+    let mut bs: u32 = 0;
+    for w in 1..128 {
+        bs = bs.wrapping_add(BigEndian::read_u32(
+            &disk[bm_off + w * 4..bm_off + w * 4 + 4],
+        ));
+    }
+    BigEndian::write_u32(&mut disk[bm_off..bm_off + 4], 0u32.wrapping_sub(bs));
+
+    // Run it through the full detect → open dispatch.
+    assert!(
+        disk.len() <= 64 * 1024,
+        "synthetic RDB+FFS disk should be <= 64 KiB: got {} bytes",
+        disk.len()
+    );
+    let mut cur = Cursor::new(disk);
+    let table = PartitionTable::detect(&mut cur).expect("detect");
+    let parts = table.partitions();
+    assert_eq!(parts.len(), 1, "expected single RDB partition");
+    let p = &parts[0];
+    assert_eq!(p.partition_type_string.as_deref(), Some("DOS\\1"));
+    assert_eq!(p.start_lba * 512, part_off as u64);
+    let mut fs = fs::open_filesystem(
+        cur,
+        p.start_lba * 512,
+        p.partition_type_byte,
+        p.partition_type_string.as_deref(),
+    )
+    .expect("open AFFS via dispatch");
+    assert_eq!(fs.volume_label(), Some("RdbTest"));
+    let root = fs.root().expect("root");
+    let kids = fs.list_directory(&root).expect("list");
+    assert!(kids.is_empty(), "blank RDB+FFS volume should be empty");
+}
