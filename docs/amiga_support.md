@@ -386,10 +386,31 @@ state.
 - [ ] Round-trip add/delete file test.
 
 ### Phase 7 — SFS read + browse + backup
-- [ ] `src/fs/sfs.rs` — `OBJC` B-tree, journal recognition (read-only on
-      uncommitted journal with a warning).
-- [ ] Dispatch for `"SFS\\0"`, `"SFS\\2"`.
-- [ ] Backup/restore round-trip on an SFS partition.
+- [x] `src/fs/sfs.rs` — root block parse (block 0 + last block, pick
+      highest sequencenumber), ObjectContainer chain walk for directory
+      listing, NodeContainer tree lookup (leaf entries stride =
+      `sizeof(fsObjectNode)` = 10; internal entries `BLCKn` with
+      `>>shifts_block32` shift to recover the block, low bit = full
+      flag), extent B-tree walk (BNDC, leaf = `fsExtentBNode`
+      key/next/prev/blocks), file streaming, soft-link surface as
+      file body, bitmap walk for compaction.
+- [x] Dispatch for `"SFS\\0"`, `"SFS\\2"`: `is_amiga_sfs_type` helper
+      added to `src/fs/mod.rs`; `fs_name_for` returns "SFS";
+      `is_layout_preserving_fs` = true; `is_expensive_minimum` =
+      false; `open_filesystem_by_string` and
+      `compact_partition_reader_by_string` route to
+      `sfs::SfsFilesystem` / `sfs::CompactSfsReader`. GUI
+      `is_browsable_type_string` accepts SFS too.
+      `open_editable_filesystem_by_string` returns
+      `Unsupported` until Phase 8.
+- [x] Manual validation against `~/amiga-filesystems/amiga128gb.chd`:
+      three SFS\0 partitions open, list their root directories, read
+      `.info` icon files byte-for-byte (verified Amiga magic `e3 10 00
+      01`), and the compact reader walks the bitmap to report sane
+      data ratios (62%, 38%, 13%) consistent with how full each
+      partition is.
+- [ ] Backup/restore round-trip on an SFS partition (deferred to a
+      follow-up GUI run against the real CHD image).
 
 ### Phase 8 — SFS write
 - [ ] Journal append + commit ordering.

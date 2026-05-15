@@ -10,6 +10,7 @@ use std::path::Path;
 
 use rusty_backup::fs;
 use rusty_backup::fs::pfs3::CompactPfs3Reader;
+use rusty_backup::fs::sfs::CompactSfsReader;
 use rusty_backup::partition::PartitionTable;
 use rusty_backup::rbformats::chd::ChdReader;
 
@@ -60,7 +61,10 @@ fn main() -> anyhow::Result<()> {
 
         // Browse AFFS partitions inline.
         let type_str = part.partition_type_string.as_deref().unwrap_or("");
-        if !fs::is_amiga_dos_type(type_str) && !fs::is_amiga_pfs3_type(type_str) {
+        if !fs::is_amiga_dos_type(type_str)
+            && !fs::is_amiga_pfs3_type(type_str)
+            && !fs::is_amiga_sfs_type(type_str)
+        {
             continue;
         }
         let offset = part.start_lba * 512;
@@ -116,6 +120,29 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             Err(e) => println!("      open failed: {e}"),
+        }
+
+        // For SFS, exercise the compact reader so we get used vs total
+        // from the bitmap walk.
+        if fs::is_amiga_sfs_type(type_str) {
+            let compact: Result<(_, _), _> = if path.to_lowercase().ends_with(".chd") {
+                let reader = ChdReader::open(Path::new(path))?;
+                CompactSfsReader::new(reader, offset).map(|(_r, res)| ((), res))
+            } else {
+                let file = File::open(path)?;
+                CompactSfsReader::new(file, offset).map(|(_r, res)| ((), res))
+            };
+            match compact {
+                Ok(((), result)) => {
+                    println!(
+                        "      sfs compact: data={} orig={} (ratio {:.2}%)",
+                        result.data_size,
+                        result.original_size,
+                        100.0 * result.data_size as f64 / result.original_size.max(1) as f64,
+                    );
+                }
+                Err(e) => println!("      sfs compact reader: {e}"),
+            }
         }
 
         // For PFS3, also exercise the compact-reader bitmap walk so we
