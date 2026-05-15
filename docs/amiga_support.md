@@ -380,10 +380,56 @@ state.
       images don't claim past their declared end.
 
 ### Phase 6 — PFS3 write
-- [ ] Anode allocation + free-list management.
-- [ ] Postponed-operations log discipline (write new, commit, invalidate old).
-- [ ] Snapshot/rollback.
-- [ ] Round-trip add/delete file test.
+- [x] `create_blank_pfs3(total_sectors, name)` formatter producing a
+      minimum mountable empty volume (RB 0 rootblock+reserved bitmap,
+      RB 1 EX extension, RB 2 MI bitmap-index, RB 3+ BM data bitmap,
+      then IB anode-index, AB anodeblock 0, root DB dirblock; anodes
+      0..4 sentinel-allocated, anode 5 = ROOTDIR).
+- [x] Reserved-block alloc/free against the cluster's BM bitmap;
+      decrements/increments `rootblock.reserved_free` and zeros newly
+      allocated blocks.
+- [x] Data-block alloc/free walking the rootblock's bitmapindex →
+      bitmapindex blocks (MI) → bitmap blocks (BM) for a contiguous
+      run; updates `rootblock.blocks_free`.
+- [x] Anode alloc/free in anodeblock 0 (84 user slots per AB); uses
+      the pfs3aio sentinel `(0, 0xFFFFFFFF, 0)` for the "allocated but
+      empty" state.
+- [x] Direntry encoder (`build_direntry`) for minimal-mode entries
+      (next/type/anode/fsize/dates/protection/nlength/name + comment
+      length+comment, padded even). `add_direntry_to_dir` walks the
+      directory's anode chain looking for a dirblock with room and
+      grows the chain by allocating a fresh dirblock + anode when the
+      tail runs out. `remove_direntry_from_dir` shifts later entries
+      up by `next` bytes and zeros the tail.
+- [x] `Pfs3Snapshot` + `snapshot()`/`restore_snapshot()`: every
+      `EditableFilesystem` mutation wraps in a snapshot guard so a
+      partial failure (e.g. AlreadyExists, DiskFull) leaves the
+      in-memory volume identical to the pre-call state. Snapshot
+      captures rootblock + both dirty maps + cache.
+- [x] `sync_metadata` flushes `dirty_reserved` then `dirty_data` in
+      ascending HW-sector order; clears both maps and refreshes the
+      LRU read cache so subsequent reads observe the persisted bytes.
+- [x] Dispatch wired through `open_editable_filesystem_by_string`:
+      PFS3 partitions now open editable (was returning `Unsupported`).
+- [x] Round-trip tests in `src/fs/pfs3.rs`:
+      `write_round_trip_create_dir_and_file` (format → create dir +
+      file → sync → reopen → list root → read file body byte-equal),
+      `write_round_trip_delete_entry` (create both then delete; verify
+      root empty after reopen and `free_space` grew), and
+      `create_directory_rolls_back_on_duplicate` (duplicate name
+      returns `AlreadyExists` and rollback restores free space).
+- [ ] Postponed-operations log discipline — the pfs3aio approach
+      (write new state, commit pointer, invalidate old) is **not** what
+      we implement: rusty-backup's edit model batches mutations into
+      dirty buffers and flushes atomically on `sync_metadata` (the same
+      pattern AFFS/HFS use). A real Amiga-style postponed-ops log
+      would only matter for crash recovery; we accept "metadata writes
+      flushed in ascending order" as the consistency story for now.
+- [ ] Wire PFS3 into the GUI's `EditableFilesystem` staged-edits flow
+      and verify end-to-end against a real PFS3 image. Deferred — the
+      library API is in place and the round-trip tests exercise it;
+      pull this in alongside the existing edit-mode UI work when the
+      AFFS path graduates.
 
 ### Phase 7 — SFS read + browse + backup
 - [x] `src/fs/sfs.rs` — root block parse (block 0 + last block, pick

@@ -1111,11 +1111,10 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                 )?));
             }
             s if is_amiga_pfs3_type(s) => {
-                // PFS3 is read-only in Phase 5; editing arrives in Phase 6.
-                return Err(FilesystemError::Unsupported(format!(
-                    "editing not yet supported for PFS3 type '{}'",
-                    s
-                )));
+                return Ok(Box::new(pfs3::Pfs3Filesystem::open(
+                    reader,
+                    partition_offset,
+                )?));
             }
             s if is_amiga_sfs_type(s) => {
                 // SFS is read-only in Phase 7; editing arrives in Phase 8.
