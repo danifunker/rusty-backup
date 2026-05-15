@@ -466,10 +466,59 @@ state.
       follow-up GUI run against the real CHD image).
 
 ### Phase 8 — SFS write
-- [ ] Journal append + commit ordering.
-- [ ] B-tree insert/delete with rebalance.
-- [ ] Snapshot/rollback.
-- [ ] Round-trip test.
+- [x] `create_blank_sfs(total_blocks, name)` formatter producing a
+      minimum mountable empty volume: rootblock at 0 (and duplicated at
+      totalblocks-1), AdminSpaceContainer at 1 (6 admin slots
+      pre-marked allocated via bits=0xFC000000), root OBJC at 2 with
+      the root fsObject, empty HashTable at 3, transaction-OK
+      placeholder (TROK) at 4, empty extent B-tree leaf (BNDC) at 5,
+      object-node root NodeContainer (NDC ) at 6, BTMP bitmap blocks
+      starting at 33.
+- [x] `stamp_checksum` helper centralizing the CALCCHECKSUM convention
+      (sum-all-longs + 1 == 0). All metadata blocks re-stamped on
+      `sync_metadata` flush; data blocks (no header) flow through
+      verbatim. `is_metadata_block` distinguishes the two by first u32.
+- [x] Allocators: `alloc_data_blocks` walks the BTMP bitmap for a
+      contiguous run, `alloc_admin_block` scans
+      `adminspace[0].bits`, `alloc_object_node` finds a free
+      `fsObjectNode` slot in the leaf NDC. Free variants flip the bits
+      back. Object-node `data` field records the OBJC block that holds
+      the new entry — `lookup_object_block` then walks the same chain
+      to find the fsObject.
+- [x] OBJC chain mutation: `ensure_dir_chain_room` finds (or
+      allocates) an OBJC with enough free tail for a new fsObject,
+      growing the chain by linking a fresh admin block via `next`/
+      `previous`. `splice_object_into_block` appends the encoded
+      fsObject. Delete reverses the operation, unlinking and freeing
+      OBJC blocks that go empty (other than the root OBJC).
+- [x] Extent B-tree insert/remove for single-leaf BNDCs: sorted
+      `fsExtentBNode` records `(key=first_data_block, blocks)`.
+      Splits + rebalance are deferred — `DiskFull` surfaces if the
+      leaf overflows. Sufficient for the round-trip test surface.
+- [x] `SfsSnapshot` clones rootblock + dirty map + cache +
+      free-blocks counter; every mutation wraps in snapshot/rollback
+      so partial failures (e.g. `AlreadyExists`, `DiskFull`) leave the
+      in-memory volume identical to its pre-call state.
+- [x] `sync_metadata` bumps the rootblock `sequencenumber`, writes
+      both primary + backup root copies, then flushes every dirty
+      block in ascending order. Metadata blocks get re-stamped
+      checksums; data blocks flush verbatim.
+- [x] Dispatch wired: `open_editable_filesystem_by_string` routes
+      `SFS\0`/`SFS\2` to `SfsFilesystem` (was returning
+      `Unsupported`). GUI staged-edits flow now works against SFS
+      without any GUI-side changes — the trait dispatch is enough.
+- [x] Round-trip tests in `src/fs/sfs.rs` and
+      `tests/filesystem_e2e.rs::test_sfs_staged_edits_round_trip`:
+      blank-volume image, create dir + file, sync, reopen, list root,
+      read file byte-equal; delete pass restores empty root + grows
+      free-space; duplicate name rolls back via snapshot.
+- [ ] Journal append + commit ordering (TRST/TRFA). Deliberately
+      deferred — we use sync-boundary atomicity (write all dirty
+      blocks then both roots with bumped sequencenumber), matching
+      what rusty-backup already does for AFFS/HFS/PFS3.
+- [ ] B-tree splits + rebalance (extent BNDC + object-node NDC tree).
+      Deferred until a real workload exceeds the single-leaf capacity
+      (~36 extents, ~50 object-nodes on a 512-byte-block volume).
 
 ### Phase 9 — Polish
 - [ ] CLAUDE.md: add Amiga section describing dispatch + DosType strings.
