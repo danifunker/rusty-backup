@@ -442,46 +442,60 @@ allocator + format code is in `disk.c` and `format.c`).
 
 ## Shared infrastructure (Phase X — do once)
 
-### X.1 — RDB PART-entry resize fixup
+### X.1 — RDB PART-entry resize fixup (✓ DONE)
 
-When a partition shrinks or grows, recompute its `de_LowCyl` /
-`de_HighCyl` from the new block count and surface heads / sectors.
-If a subsequent partition slides, recompute its entries too. New helper
-in `src/partition/rdb.rs`:
+`Rdb::patch_for_restore(overrides, source)` in `src/partition/rdb.rs`
+takes a `PartitionSizeOverride` list, recomputes `de_LowCyl` /
+`de_HighCyl` per partition from the new (LBA, size) pair while
+preserving each partition's geometry (`surfaces`, `blk_per_trk`,
+`fs_block_size`), updates the RDSK `cylinders` / `hi_cyl` to span the
+highest partition end, and re-stamps every 32-bit checksum. Returns
+an `RdbRestorePlan` with `(block_num, 512-byte buffer)` pairs for
+each modified block plus a `RdbPartitionPlan` per partition describing
+the source → dest copy. Cylinder-alignment is enforced — unaligned
+overrides fail with a clear error rather than silently producing a
+malformed RDB.
 
-```rust
-pub fn patch_partition_size(
-    rdb: &mut Rdb,
-    part_index: usize,
-    new_block_count: u32,
-) -> Result<(), ...>;
-```
+### X.2 — `resize_filesystem_for` Amiga dispatch (✓ DONE)
 
-The MBR-logicals packing pass in `src/partition/mbr.rs` is the
-structural reference; RDB is simpler (no extended-partition chain) but
-uses cylinder geometry instead of LBA, which means rounding.
+`src/fs/mod.rs::resize_filesystem_for` calls
+`sfs::resize_sfs_in_place` unconditionally; the SFS function probes
+the rootblock id at the partition offset and silently no-ops for
+non-SFS volumes. AFFS / PFS3 will plug in the same way once their
+resize lands.
 
-### X.2 — `resize_filesystem_for` Amiga dispatch
+### X.3 — Export-pipeline RDB dispatch (✓ DONE)
 
-`src/fs/mod.rs` already exposes `resize_filesystem_for`; it has no
-Amiga branch. Add arms keyed on `partition_type_string`, using the
-existing `is_amiga_dos_type` / `is_amiga_pfs3_type` /
-`is_amiga_sfs_type` helpers.
+The Raw/VHD export paths in `src/rbformats/{export,vhd}.rs` now do
+APM-then-RDB detection via `detect_raw_apm` / `detect_raw_rdb` and
+route RDB sources through `reconstruct_raw_rdb_disk` in
+`src/rbformats/mod.rs`. That function:
+1. Copies the first 16 sectors (RDB region) verbatim so FSHD/LSEG
+   driver chains and BADB lists survive.
+2. Overlays the patched RDSK + PART blocks from
+   `Rdb::patch_for_restore` at their original block numbers.
+3. Copies each partition's bytes from source LBA to dest LBA, zero-
+   filling any growth tail.
+4. Invokes `crate::fs::resize_filesystem_for` per resized partition
+   so the SFS rootblock (and future AFFS / PFS3 metadata) lands at
+   the new size on the dest.
+5. Pads to the new total disk size (derived from the highest patched
+   partition end).
 
-### X.3 — Restore-flow dispatch
+Without these pieces, the SFS resize code was correct but never got
+called end-to-end — the original bug report exactly matched that
+gap. End-to-end coverage is `test_rdb_sfs_export_shrink_round_trip`
+in `tests/filesystem_e2e.rs`.
 
-`src/restore/mod.rs` has a `PartitionFsType` switch around line 1011
-that decides which resize function to call after writing a partition
-image. The switch is currently keyed on MBR partition byte. Either:
+### X.4 — Restore-flow / backup-folder dispatch (partial)
 
-- Thread `partition_type_string` through to the switch alongside the
-  byte, or
-- Add a parallel switch on the type string that runs after the
-  byte-based switch falls through.
-
-Either pattern works; the second is closer to how the rest of the FS
-dispatch code is shaped (CLAUDE.md memory: `open_filesystem_by_string`,
-`compact_partition_reader_by_string`, etc.).
+`reconstruct_disk_from_backup` (`src/rbformats/mod.rs`) bails with a
+clear message when the backup folder's `partition_table_type` is
+"RDB". A full backup-folder restore for Amiga disks requires raw
+RDB-block preservation in the backup format plus a complete RDB
+encoder (we currently only emit a parsed `rdb.json` sidecar). That
+work is deferred — the direct-from-source export path covers the
+"resize my Amiga disk" workflow today.
 
 ### X.4 — GUI hooks
 

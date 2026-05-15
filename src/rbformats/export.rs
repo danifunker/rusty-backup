@@ -397,6 +397,15 @@ pub fn export_whole_disk(
             None
         };
 
+        // RDB twin: Amiga disks (PFS3 / SFS / OFS-FFS) with size overrides
+        // route through reconstruct_raw_rdb_disk, which patches the RDSK +
+        // PART chain and invokes resize_filesystem_for per partition.
+        let rdb = if format == ExportFormat::Raw && apm.is_none() && !partition_sizes.is_empty() {
+            super::detect_raw_rdb(&mut reader)
+        } else {
+            None
+        };
+
         if apm.is_some() {
             // Open destination with Read+Write+Seek for the APM reconstruction.
             let mut file = std::fs::OpenOptions::new()
@@ -420,6 +429,32 @@ pub fn export_whole_disk(
 
             log_cb(&format!(
                 "{} export complete: {} ({} data bytes, APM reconstructed)",
+                format.description(),
+                dest_path.display(),
+                total_written,
+            ));
+        } else if rdb.is_some() {
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(dest_path)
+                .with_context(|| format!("failed to create {}", dest_path.display()))?;
+
+            total_written = super::reconstruct_raw_rdb_disk(
+                &mut reader,
+                source_data_size,
+                &mut file,
+                partition_sizes,
+                &mut progress_cb,
+                &cancel_check,
+                &mut log_cb,
+            )?;
+            file.flush()?;
+
+            log_cb(&format!(
+                "{} export complete: {} ({} data bytes, RDB reconstructed)",
                 format.description(),
                 dest_path.display(),
                 total_written,

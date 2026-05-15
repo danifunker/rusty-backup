@@ -2141,3 +2141,163 @@ fn test_synthetic_rdb_ffs_pipeline() {
     let kids = fs.list_directory(&root).expect("list");
     assert!(kids.is_empty(), "blank RDB+FFS volume should be empty");
 }
+
+/// Synthetic RDB+SFS disk, shrink an SFS partition via the export
+/// reconstruct pipeline (`reconstruct_raw_rdb_disk`), then verify:
+///   - the output disk is smaller than the source (RDSK + PART blocks
+///     reflect new geometry, total bytes reduced),
+///   - the patched RDB still parses and points at the shrunk partition,
+///   - the SFS partition at its new size reopens and still lists its
+///     contents.
+///
+/// This is the end-to-end "user shrinks an SFS partition and re-exports
+/// the disk" path that the original bug report was about.
+#[test]
+fn test_rdb_sfs_export_shrink_round_trip() {
+    use byteorder::{BigEndian, ByteOrder};
+    use rusty_backup::fs;
+    use rusty_backup::partition::{PartitionSizeOverride, PartitionTable};
+    use rusty_backup::rbformats::reconstruct_raw_rdb_disk;
+
+    const BSIZE: usize = 512;
+    let surfaces = 2u32;
+    let blk_per_trk = 16u32;
+    let cyl_lbas = surfaces * blk_per_trk; // 32 LBAs/cyl = 16 KiB/cyl
+
+    // SFS partition: low_cyl=1, high_cyl=200 = 200 cyls = 6400 LBAs = 3.2 MiB.
+    let low_cyl = 1u32;
+    let high_cyl = 200u32;
+    let part_lbas = cyl_lbas * (high_cyl - low_cyl + 1);
+    let start_lba = cyl_lbas * low_cyl;
+    let total_lbas = start_lba + part_lbas;
+    let mut disk = vec![0u8; total_lbas as usize * BSIZE];
+
+    // RDSK at block 0.
+    let mut rdsk = [0u8; BSIZE];
+    rdsk[0..4].copy_from_slice(b"RDSK");
+    BigEndian::write_u32(&mut rdsk[4..8], 64);
+    BigEndian::write_u32(&mut rdsk[16..20], 512); // block_size
+    BigEndian::write_u32(&mut rdsk[28..32], 1); // part_list -> block 1
+    BigEndian::write_u32(&mut rdsk[32..36], 0xFFFFFFFF); // fs_list
+    BigEndian::write_u32(&mut rdsk[24..28], 0xFFFFFFFF); // badblk_list
+                                                         // Geometry: cylinders @ long 16, hi_cyl @ long 35, cyl_blks @ long 36.
+    BigEndian::write_u32(&mut rdsk[16 * 4..16 * 4 + 4], high_cyl + 1);
+    BigEndian::write_u32(&mut rdsk[35 * 4..35 * 4 + 4], high_cyl);
+    BigEndian::write_u32(&mut rdsk[36 * 4..36 * 4 + 4], cyl_lbas);
+    BigEndian::write_i32(&mut rdsk[8..12], 0);
+    let mut sum: i32 = 0;
+    for w in 0..128 {
+        sum = sum.wrapping_add(BigEndian::read_i32(&rdsk[w * 4..w * 4 + 4]));
+    }
+    BigEndian::write_i32(&mut rdsk[8..12], sum.wrapping_neg());
+    disk[0..BSIZE].copy_from_slice(&rdsk);
+
+    // PART block at block 1.
+    let mut part = [0u8; BSIZE];
+    part[0..4].copy_from_slice(b"PART");
+    BigEndian::write_u32(&mut part[4..8], 64);
+    BigEndian::write_u32(&mut part[16..20], 0xFFFFFFFF); // next = NO_BLOCK
+    BigEndian::write_u32(&mut part[20..24], 0); // flags = not bootable
+    part[36] = 3;
+    part[37..40].copy_from_slice(b"DH0");
+    BigEndian::write_u32(&mut part[32 * 4..32 * 4 + 4], 16); // env_size
+    BigEndian::write_u32(&mut part[33 * 4..33 * 4 + 4], 128); // env_block_size_longs = 128 -> 512 bytes
+    BigEndian::write_u32(&mut part[35 * 4..35 * 4 + 4], surfaces);
+    BigEndian::write_u32(&mut part[36 * 4..36 * 4 + 4], 1); // sec_per_blk
+    BigEndian::write_u32(&mut part[37 * 4..37 * 4 + 4], blk_per_trk);
+    BigEndian::write_u32(&mut part[41 * 4..41 * 4 + 4], low_cyl);
+    BigEndian::write_u32(&mut part[42 * 4..42 * 4 + 4], high_cyl);
+    BigEndian::write_u32(&mut part[48 * 4..48 * 4 + 4], 0x53465300); // SFS\0
+    BigEndian::write_i32(&mut part[8..12], 0);
+    let mut sum: i32 = 0;
+    for w in 0..128 {
+        sum = sum.wrapping_add(BigEndian::read_i32(&part[w * 4..w * 4 + 4]));
+    }
+    BigEndian::write_i32(&mut part[8..12], sum.wrapping_neg());
+    disk[BSIZE..2 * BSIZE].copy_from_slice(&part);
+
+    // SFS volume at partition offset. 6400 blocks @ 512 = 3.2 MiB.
+    let sfs_img =
+        rusty_backup::fs::sfs::create_blank_sfs(part_lbas, "RdbSfsRT").expect("create_blank_sfs");
+    assert_eq!(sfs_img.len(), part_lbas as usize * BSIZE);
+    let part_off = start_lba as usize * BSIZE;
+    disk[part_off..part_off + sfs_img.len()].copy_from_slice(&sfs_img);
+
+    let source_size_bytes = disk.len() as u64;
+
+    // Source disk is parseable as RDB+SFS.
+    let mut src_cur = Cursor::new(disk.clone());
+    let table = PartitionTable::detect(&mut src_cur).expect("detect");
+    let parts = table.partitions();
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0].partition_type_string.as_deref(), Some("SFS\\0"));
+
+    // Pick a shrink target: 100 cylinders = 1.6 MiB = 3200 LBAs. Must be
+    // cylinder-aligned to satisfy Rdb::patch_for_restore.
+    let new_part_lbas = cyl_lbas * 100;
+    let new_part_bytes = new_part_lbas as u64 * 512;
+    let overrides = vec![PartitionSizeOverride::size_only(
+        parts[0].index,
+        parts[0].start_lba,
+        parts[0].size_bytes,
+        new_part_bytes,
+    )];
+
+    // Run the export reconstruct.
+    let mut out_disk: Vec<u8> = Vec::new();
+    out_disk.resize(source_size_bytes as usize, 0);
+    let mut dest = Cursor::new(out_disk);
+    let mut src2 = Cursor::new(disk.clone());
+    let mut log_lines: Vec<String> = Vec::new();
+    let total_written = reconstruct_raw_rdb_disk(
+        &mut src2,
+        source_size_bytes,
+        &mut dest,
+        &overrides,
+        &mut |_| {},
+        &|| false,
+        &mut |s| log_lines.push(s.to_string()),
+    )
+    .expect("rdb reconstruct");
+    assert!(
+        log_lines.iter().any(|l| l.contains("RDB export")),
+        "expected RDB export log line; got {log_lines:?}"
+    );
+
+    // Output disk should be smaller than source: new partition end =
+    // start_lba (32) + new_part_lbas (3200) = 3232 LBAs ≈ 1.62 MiB.
+    let expected_total_lbas = start_lba + new_part_lbas;
+    let expected_disk_bytes = expected_total_lbas as u64 * 512;
+    assert_eq!(
+        total_written, expected_disk_bytes,
+        "total_written should match expected new disk size"
+    );
+    assert!(
+        total_written < source_size_bytes,
+        "output ({total_written}) should be smaller than source ({source_size_bytes})"
+    );
+
+    // Reopen the output disk and verify the RDB + SFS still parse.
+    let out_bytes = dest.into_inner();
+    let truncated = out_bytes[..total_written as usize].to_vec();
+    let mut out_cur = Cursor::new(truncated);
+    let out_table = PartitionTable::detect(&mut out_cur).expect("detect output");
+    let out_parts = out_table.partitions();
+    assert_eq!(out_parts.len(), 1, "should still have 1 partition");
+    let p = &out_parts[0];
+    assert_eq!(p.partition_type_string.as_deref(), Some("SFS\\0"));
+    assert_eq!(
+        p.size_bytes, new_part_bytes,
+        "partition size should reflect shrink"
+    );
+    let mut fs = fs::open_filesystem(
+        out_cur,
+        p.start_lba * 512,
+        p.partition_type_byte,
+        p.partition_type_string.as_deref(),
+    )
+    .expect("open SFS after shrink");
+    let root = fs.root().expect("root");
+    let kids = fs.list_directory(&root).expect("list");
+    assert!(kids.is_empty(), "blank SFS volume should still be empty");
+}

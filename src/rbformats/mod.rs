@@ -24,6 +24,7 @@ use crate::fs::patch_hidden_sectors_for;
 use crate::partition::apm::Apm;
 use crate::partition::gpt::Gpt;
 use crate::partition::mbr::patch_mbr_entries;
+use crate::partition::rdb::{Rdb, RDB_SCAN_BLOCKS, RDSK_SIGNATURE};
 use crate::partition::PartitionSizeOverride;
 
 // Re-exports keep the historical `crate::rbformats::write_zeros` /
@@ -88,8 +89,24 @@ pub fn reconstruct_disk_from_backup(
 
     let target_sectors = target_size / 512;
     let is_superfloppy = metadata.partition_table_type == "None";
+    let is_rdb = metadata.partition_table_type == "RDB";
 
-    if is_superfloppy {
+    if is_rdb {
+        // Backup-folder restore for RDB-based Amiga disks is not yet wired
+        // up: backups save a parsed `rdb.json` sidecar but not the raw
+        // 512-byte RDSK/PART blocks, and re-serializing the parsed form
+        // without losing FSHD/LSEG driver chains and BADB lists needs a
+        // full RDB encoder we haven't written yet. For resize-aware
+        // export of an Amiga disk today, point the user at the
+        // direct-from-source path (Inspect tab -> Export raw/VHD), which
+        // routes through `reconstruct_raw_rdb_disk` and works end-to-end.
+        bail!(
+            "RDB-based Amiga disks cannot yet be restored from a backup folder. \
+             To resize an Amiga disk, export directly from the source image \
+             (Inspect tab -> Export to Raw or VHD with size overrides) — that \
+             path is RDB-aware and patches the partition table for you."
+        );
+    } else if is_superfloppy {
         // Superfloppy: no partition table to write — data starts at offset 0
         log_cb("Superfloppy: no partition table to write");
     } else if let Some(gpt_data) = gpt {
@@ -624,6 +641,249 @@ pub fn reconstruct_raw_apm_disk(
             }
             writer.seek(SeekFrom::Start(total_written))?;
         }
+    }
+
+    Ok(total_written)
+}
+
+/// Probe a raw source reader for an RDB partition table. Returns the
+/// parsed Rdb when found, or None for non-RDB sources. Always restores
+/// the reader cursor to 0 so a fall-through stream copy doesn't lose
+/// the first bytes.
+///
+/// Twin of [`detect_raw_apm`] — wired into the Raw / VHD export paths so
+/// Amiga RDB disks pick up the resize-aware reconstruction path
+/// ([`reconstruct_raw_rdb_disk`]) instead of being copied verbatim.
+pub fn detect_raw_rdb(reader: &mut (impl Read + Seek)) -> Option<Rdb> {
+    reader.seek(SeekFrom::Start(0)).ok()?;
+    // Scan the first RDB_SCAN_BLOCKS sectors for an RDSK signature so we
+    // don't try to parse an MBR/APM/GPT disk as RDB.
+    let mut found = false;
+    let mut sec = [0u8; 4];
+    for block in 0..RDB_SCAN_BLOCKS {
+        if reader.seek(SeekFrom::Start(block * 512)).is_err() {
+            break;
+        }
+        if reader.read_exact(&mut sec).is_err() {
+            break;
+        }
+        if sec == *RDSK_SIGNATURE {
+            found = true;
+            break;
+        }
+    }
+    let _ = reader.seek(SeekFrom::Start(0));
+    if !found {
+        return None;
+    }
+    Rdb::parse(reader).ok()
+}
+
+/// Reconstruct a raw RDB-based Amiga disk with partition-size overrides.
+///
+/// Counterpart to [`reconstruct_raw_apm_disk`]. For an Amiga source disk
+/// (RDB at sector 0..16), this:
+///
+/// 1. Copies the entire RDB region (sectors `[0, RDB_SCAN_BLOCKS)`) from
+///    source to destination verbatim so FSHD / LSEG driver chains and
+///    bad-block lists survive untouched.
+/// 2. Overlays the patched RDSK + PART blocks from
+///    [`Rdb::patch_for_restore`] at their original block numbers.
+/// 3. Copies each partition's data from its source LBA to its
+///    (possibly different) destination LBA, zero-filling growth tail.
+/// 4. For partitions whose size changed, invokes
+///    [`crate::fs::resize_filesystem_for`] so the filesystem metadata
+///    (currently SFS via `resize_sfs_in_place`) is updated on the dest.
+///
+/// The output disk is sized to `plan.new_disk_size_bytes`, which is
+/// derived from the highest patched partition end — shrinking the last
+/// partition therefore yields a smaller output file.
+///
+/// Returns the total bytes written, equal to `plan.new_disk_size_bytes`.
+pub fn reconstruct_raw_rdb_disk(
+    reader: &mut (impl Read + Seek),
+    source_data_size: u64,
+    writer: &mut (impl Read + Write + Seek),
+    partition_sizes: &[PartitionSizeOverride],
+    progress_cb: &mut impl FnMut(u64),
+    cancel_check: &impl Fn() -> bool,
+    log_cb: &mut impl FnMut(&str),
+) -> Result<u64> {
+    let rdb = Rdb::parse(reader).context("failed to parse RDB from source")?;
+    let plan = rdb
+        .patch_for_restore(partition_sizes, reader)
+        .context("failed to patch RDB for restore")?;
+
+    let target_size = plan.new_disk_size_bytes;
+    log_cb(&format!(
+        "RDB export: {} partitions, target disk size {} bytes ({} MiB)",
+        plan.partition_plans.len(),
+        target_size,
+        target_size / 1024 / 1024,
+    ));
+
+    // --- 1. Copy the entire RDB region verbatim. ---
+    let rdb_bytes = (RDB_SCAN_BLOCKS * 512).min(source_data_size);
+    reader.seek(SeekFrom::Start(0))?;
+    writer.seek(SeekFrom::Start(0))?;
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    let mut copied: u64 = 0;
+    while copied < rdb_bytes {
+        let to_read = ((rdb_bytes - copied) as usize).min(CHUNK_SIZE);
+        let n = reader
+            .read(&mut buf[..to_read])
+            .context("read RDB region")?;
+        if n == 0 {
+            break;
+        }
+        writer.write_all(&buf[..n]).context("write RDB region")?;
+        copied += n as u64;
+    }
+    // If the destination is smaller than RDB_SCAN_BLOCKS sectors (very
+    // unlikely but defensive), bail.
+    if copied < (rdb.header.block_num + 1) * 512 {
+        bail!(
+            "RDB export: copied only {} bytes of RDB region, can't overlay header at block {}",
+            copied,
+            rdb.header.block_num
+        );
+    }
+
+    // --- 2. Overlay patched RDSK + PART blocks. ---
+    let (rdsk_blk, rdsk_buf) = plan.rdsk_block;
+    writer.seek(SeekFrom::Start(rdsk_blk * 512))?;
+    writer
+        .write_all(&rdsk_buf)
+        .context("overlay patched RDSK")?;
+    for (part_blk, part_buf) in &plan.part_blocks {
+        // PART blocks may live outside the first 16 sectors on
+        // unusual disks; trust the source's block_num.
+        if *part_blk * 512 + 512 > target_size {
+            bail!(
+                "RDB export: PART block at {} lies past target disk size {}",
+                part_blk,
+                target_size
+            );
+        }
+        writer.seek(SeekFrom::Start(part_blk * 512))?;
+        writer
+            .write_all(part_buf)
+            .with_context(|| format!("overlay patched PART block {part_blk}"))?;
+    }
+
+    let mut total_written = copied;
+    progress_cb(total_written);
+    // The PART overlay seeks left the writer at some block_num inside the
+    // RDB region — seek back to `total_written` so the partition loop
+    // below appends contiguously.
+    writer.seek(SeekFrom::Start(total_written))?;
+
+    // --- 3. Copy each partition. ---
+    let mut plans: Vec<_> = plan.partition_plans.clone();
+    plans.sort_by_key(|p| p.dest_lba);
+    for p in &plans {
+        if cancel_check() {
+            bail!("export cancelled");
+        }
+        let dest_offset = p.dest_lba * 512;
+        if dest_offset < total_written {
+            // Partition starts before where we've already written —
+            // probably overlapping the RDB region. RDB partitions
+            // conventionally start at or after the RDB scan range, so
+            // this is unexpected. Bail rather than silently corrupting.
+            bail!(
+                "RDB export: partition '{}' dest LBA {} ({} bytes) starts before \
+                 already-written {} bytes",
+                p.drv_name,
+                p.dest_lba,
+                dest_offset,
+                total_written
+            );
+        }
+        if dest_offset > total_written {
+            let gap = dest_offset - total_written;
+            writer.seek(SeekFrom::Start(total_written))?;
+            write_zeros_with_progress(writer, gap, 0, &mut |_| {})?;
+            total_written += gap;
+            progress_cb(total_written);
+        }
+        // Make sure subsequent partition writes land at dest_offset, not
+        // wherever the writer happened to be left.
+        writer.seek(SeekFrom::Start(dest_offset))?;
+
+        // Copy the actual partition bytes from the source.
+        let source_offset = p.source_lba * 512;
+        let copy_bound = p
+            .copy_size
+            .min(source_data_size.saturating_sub(source_offset));
+        reader.seek(SeekFrom::Start(source_offset))?;
+        let mut remaining = copy_bound;
+        while remaining > 0 {
+            if cancel_check() {
+                bail!("export cancelled");
+            }
+            let to_read = (remaining as usize).min(CHUNK_SIZE);
+            let n = reader
+                .read(&mut buf[..to_read])
+                .with_context(|| format!("read partition '{}' data", p.drv_name))?;
+            if n == 0 {
+                break;
+            }
+            writer
+                .write_all(&buf[..n])
+                .with_context(|| format!("write partition '{}' data", p.drv_name))?;
+            total_written += n as u64;
+            remaining -= n as u64;
+            progress_cb(total_written);
+        }
+
+        // Zero-fill growth tail when shrinking is NOT happening (i.e.
+        // the partition grew). For shrink, copy_size < export_size is
+        // impossible (we take the min) — copy_bound caps at copy_size,
+        // and export_size <= copy_size means no tail to zero.
+        if p.export_size > p.copy_size {
+            let extra = p.export_size - p.copy_size;
+            write_zeros_with_progress(writer, extra, 0, &mut |_| {})?;
+            total_written += extra;
+            progress_cb(total_written);
+        }
+    }
+
+    // --- 4. Per-partition filesystem fixup for resized partitions. ---
+    for p in &plans {
+        if p.export_size == (p.copy_size).max(p.export_size).min(p.export_size)
+            && p.source_lba == p.dest_lba
+            && {
+                // size unchanged AND no offset change → nothing to fix
+                let orig_size = plan
+                    .partition_plans
+                    .iter()
+                    .find(|q| q.source_lba == p.source_lba)
+                    .map(|q| q.copy_size)
+                    .unwrap_or(p.copy_size);
+                orig_size == p.export_size
+            }
+        {
+            continue;
+        }
+        let part_offset = p.dest_lba * 512;
+        let mut local_log = |m: &str| log_cb(&format!("  [{}] {m}", p.dos_type_string));
+        if let Err(e) =
+            crate::fs::resize_filesystem_for(writer, part_offset, p.export_size, &mut local_log)
+        {
+            log_cb(&format!(
+                "RDB export: resize for partition '{}' ({}) failed: {e}",
+                p.drv_name, p.dos_type_string
+            ));
+        }
+    }
+
+    // --- 5. Pad to the declared target size. ---
+    if total_written < target_size {
+        let pad = target_size - total_written;
+        write_zeros_with_progress(writer, pad, 0, &mut |_| {})?;
+        total_written += pad;
+        progress_cb(total_written);
     }
 
     Ok(total_written)
