@@ -1,3 +1,5 @@
+pub mod affs;
+pub mod affs_common;
 pub mod btrfs;
 pub mod efs;
 pub mod entry;
@@ -611,6 +613,9 @@ pub enum MinimumResult {
 /// Human-readable name of the filesystem associated with a partition type.
 fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &'static str {
     if let Some(s) = partition_type_string {
+        if is_amiga_dos_type(s) {
+            return "AmigaDOS";
+        }
         return match s {
             "Apple_HFS" => "HFS",
             "Apple_HFSX" => "HFSX",
@@ -642,6 +647,9 @@ fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &'sta
 /// because the reader does the packing during the backup write.
 pub fn is_layout_preserving_fs(partition_type: u8, partition_type_string: Option<&str>) -> bool {
     if let Some(s) = partition_type_string {
+        if is_amiga_dos_type(s) {
+            return true;
+        }
         return matches!(
             s,
             "Apple_HFS"
@@ -709,6 +717,10 @@ pub fn pick_shrink_target(
 /// Expensive path (full volume walk): HFS, HFS+, ext, btrfs, ProDOS.
 pub fn is_expensive_minimum(partition_type: u8, partition_type_string: Option<&str>) -> bool {
     if let Some(s) = partition_type_string {
+        if is_amiga_dos_type(s) {
+            // AFFS minimum is a cheap bitmap scan — last allocated block.
+            return false;
+        }
         return matches!(s, "Apple_HFS" | "Apple_HFSX" | "Apple_UNIX_SVR2" | "Linux");
     }
     matches!(partition_type, 0xAF | 0x83 | 0xA8)
@@ -1235,6 +1247,13 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
             reader,
             partition_offset,
         )?)),
+        // AmigaDOS Fast/Original File System — DosType DOS\0..DOS\7. PFS and
+        // SFS share the same string convention via RDB but route to other
+        // modules (Phase 5/7); we only claim the DOS\ prefix here.
+        s if is_amiga_dos_type(s) => Ok(Box::new(affs::AffsFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
         // GPT Linux Filesystem GUID — host any of ext, btrfs, or xfs.
         "0FC63DAF-8483-4772-8E79-3D69D8477DE4" => {
             let fs_type = detect_filesystem_type(&mut reader, partition_offset);
@@ -1333,8 +1352,23 @@ fn compact_partition_reader_by_string<R: Read + Seek + Send + 'static>(
                 })?;
             Ok(Some((Box::new(compact), info)))
         }
+        s if is_amiga_dos_type(s) => {
+            let (compact, info) =
+                affs::CompactAffsReader::new(reader, partition_offset).map_err(|e| {
+                    format!("CompactAffsReader::new failed at offset {partition_offset}: {e}")
+                })?;
+            Ok(Some((Box::new(compact), info)))
+        }
         _ => Ok(None),
     }
+}
+
+/// True for AmigaDOS Fast/Original File System DosType tags (`DOS\0`..`DOS\7`).
+/// PFS / SFS share the DosType-string convention but route to different
+/// modules and are intentionally excluded here.
+pub fn is_amiga_dos_type(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() == 5 && &bytes[0..4] == b"DOS\\" && matches!(bytes[4], b'0'..=b'7')
 }
 
 /// Resolve the actual HFS filesystem variant for an "Apple_HFS" APM partition.
