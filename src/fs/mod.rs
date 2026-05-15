@@ -26,6 +26,7 @@ pub mod pfs3;
 pub mod prodos;
 pub mod prodos_types;
 pub mod resource_fork;
+pub mod sfs;
 pub mod tree;
 pub mod unix_common;
 pub mod xfs;
@@ -621,6 +622,9 @@ fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &'sta
         if is_amiga_pfs3_type(s) {
             return "PFS3";
         }
+        if is_amiga_sfs_type(s) {
+            return "SFS";
+        }
         return match s {
             "Apple_HFS" => "HFS",
             "Apple_HFSX" => "HFSX",
@@ -656,6 +660,9 @@ pub fn is_layout_preserving_fs(partition_type: u8, partition_type_string: Option
             return true;
         }
         if is_amiga_pfs3_type(s) {
+            return true;
+        }
+        if is_amiga_sfs_type(s) {
             return true;
         }
         return matches!(
@@ -730,8 +737,11 @@ pub fn is_expensive_minimum(partition_type: u8, partition_type_string: Option<&s
             return false;
         }
         if is_amiga_pfs3_type(s) {
-            // PFS3 last_data_byte falls back to total_size for now (no
-            // bitmap walk yet) — cheap.
+            // PFS3 last_data_byte is a bitmap-index walk — cheap.
+            return false;
+        }
+        if is_amiga_sfs_type(s) {
+            // SFS last_data_byte is a bitmap walk — cheap.
             return false;
         }
         return matches!(s, "Apple_HFS" | "Apple_HFSX" | "Apple_UNIX_SVR2" | "Linux");
@@ -1107,6 +1117,13 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     s
                 )));
             }
+            s if is_amiga_sfs_type(s) => {
+                // SFS is read-only in Phase 7; editing arrives in Phase 8.
+                return Err(FilesystemError::Unsupported(format!(
+                    "editing not yet supported for SFS type '{}'",
+                    s
+                )));
+            }
             _ => {
                 return Err(FilesystemError::Unsupported(format!(
                     "editing not yet supported for APM type '{type_str}'"
@@ -1286,6 +1303,12 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
             reader,
             partition_offset,
         )?)),
+        // SFS family — `SFS\0`, `SFS\2`. Read-only browse + backup
+        // (Phase 7); editing arrives in Phase 8.
+        s if is_amiga_sfs_type(s) => Ok(Box::new(sfs::SfsFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
         // GPT Linux Filesystem GUID — host any of ext, btrfs, or xfs.
         "0FC63DAF-8483-4772-8E79-3D69D8477DE4" => {
             let fs_type = detect_filesystem_type(&mut reader, partition_offset);
@@ -1398,6 +1421,13 @@ fn compact_partition_reader_by_string<R: Read + Seek + Send + 'static>(
                 })?;
             Ok(Some((Box::new(compact), info)))
         }
+        s if is_amiga_sfs_type(s) => {
+            let (compact, info) =
+                sfs::CompactSfsReader::new(reader, partition_offset).map_err(|e| {
+                    format!("CompactSfsReader::new failed at offset {partition_offset}: {e}")
+                })?;
+            Ok(Some((Box::new(compact), info)))
+        }
         _ => Ok(None),
     }
 }
@@ -1415,6 +1445,13 @@ pub fn is_amiga_dos_type(s: &str) -> bool {
 /// pfs3-aio), and `muFS` (multi-user PFS3, RDB type `muAF` / `muPF`).
 pub fn is_amiga_pfs3_type(s: &str) -> bool {
     matches!(s, "PFS\\3" | "PDS\\3" | "muFS")
+}
+
+/// True for Smart File System (SFS) DosType tags: `SFS\0` (original) and
+/// `SFS\2` (newer journal format). Both share the same on-disk
+/// structures for read.
+pub fn is_amiga_sfs_type(s: &str) -> bool {
+    matches!(s, "SFS\\0" | "SFS\\2")
 }
 
 /// Resolve the actual HFS filesystem variant for an "Apple_HFS" APM partition.

@@ -3929,6 +3929,9 @@ fn is_browsable_type_string(type_str: Option<&str>) -> bool {
     if rusty_backup::fs::is_amiga_pfs3_type(s) {
         return true;
     }
+    if rusty_backup::fs::is_amiga_sfs_type(s) {
+        return true;
+    }
     matches!(
         s,
         "Apple_HFS"
