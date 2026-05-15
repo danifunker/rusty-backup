@@ -95,6 +95,7 @@ pub fn resize_filesystem_for(
     hfsplus::resize_hfsplus_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     ext::resize_ext_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     btrfs::resize_btrfs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
+    sfs::resize_sfs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     Ok(())
 }
 
