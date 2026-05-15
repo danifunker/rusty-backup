@@ -218,12 +218,16 @@ const MAX_CACHE_ENTRIES: usize = 128;
 
 impl<R: Read + Seek> Pfs3Filesystem<R> {
     pub fn open(mut reader: R, partition_offset: u64) -> Result<Self, FilesystemError> {
-        // Determine partition size.
+        // Determine an upper-bound partition size from EOF. This is later
+        // narrowed to `root.disksize * HW_SECTOR` once the rootblock is
+        // parsed, so multi-partition images don't claim everything past
+        // their start.
         let end = reader.seek(SeekFrom::End(0))?;
-        let partition_size = end.saturating_sub(partition_offset);
-        if partition_size < 8 * HW_SECTOR {
+        let partition_size_upper = end.saturating_sub(partition_offset);
+        if partition_size_upper < 8 * HW_SECTOR {
             return Err(parse_err("partition too small for PFS3"));
         }
+        let partition_size = partition_size_upper;
 
         // Boot block (HW sector 0): magic at offset 0.
         let mut boot = [0u8; 512];
@@ -274,6 +278,21 @@ impl<R: Read + Seek> Pfs3Filesystem<R> {
             // Floppy mode (non-harddisk) — old PFS layout we don't support.
             return Err(parse_err("PFS floppy mode not supported"));
         }
+
+        // Narrow partition_size to root.disksize when it's plausible.
+        // PFS3 records disksize in HW sectors; multi-partition images on
+        // RDB store DH0 immediately followed by DH1, so the EOF-based
+        // upper bound would include subsequent partitions.
+        let partition_size = if root.disksize > 0 {
+            let rs = root.disksize as u64 * HW_SECTOR;
+            if rs > 0 && rs <= partition_size_upper {
+                rs
+            } else {
+                partition_size_upper
+            }
+        } else {
+            partition_size_upper
+        };
 
         // Optional rootblock extension — needed for supermode reads.
         let ext = if (root.options & MODE_EXTENSION) != 0 && root.extension != 0 {
@@ -725,11 +744,33 @@ impl<R: Read + Seek + Send> Filesystem for Pfs3Filesystem<R> {
     }
 
     fn last_data_byte(&mut self) -> Result<u64, FilesystemError> {
-        // Without a full bitmap walk we can't know the last allocated
-        // block. Conservatively return total_size — the smart-shrink path
-        // will treat the partition as un-shrinkable, which is correct for
-        // a layout-preserving FS we don't repack.
-        Ok(self.total_size())
+        let bitmap = read_user_bitmap(self)?;
+        if bitmap.is_empty() {
+            return Ok(self.total_size());
+        }
+        let bitmap_start = self.root.last_reserved.saturating_add(1);
+        // Find the highest data-area sector that is allocated (bit clear).
+        let mut last_alloc: Option<u32> = None;
+        for byte_idx in (0..bitmap.len()).rev() {
+            let byte = bitmap[byte_idx];
+            if byte == 0xFF {
+                continue;
+            }
+            // Walk bits MSB-first inside the byte to find the topmost
+            // allocated (cleared) bit.
+            for bit in (0..8u8).rev() {
+                let sec_off = (byte_idx as u64) * 8 + bit as u64;
+                if (byte >> bit) & 1 == 0 {
+                    last_alloc = Some(bitmap_start + sec_off as u32);
+                    break;
+                }
+            }
+            if last_alloc.is_some() {
+                break;
+            }
+        }
+        let last_sec = last_alloc.unwrap_or(self.root.last_reserved);
+        Ok((last_sec as u64 + 1) * HW_SECTOR)
     }
 }
 
@@ -762,11 +803,11 @@ impl<R: Read + Seek> CompactPfs3Reader<R> {
         mut reader: R,
         partition_offset: u64,
     ) -> Result<(Self, CompactResult), FilesystemError> {
-        let fs = Pfs3Filesystem::open(&mut reader, partition_offset)?;
+        let mut fs = Pfs3Filesystem::open(&mut reader, partition_offset)?;
         let partition_size = fs.partition_size;
         let last_reserved = fs.root.last_reserved;
         let bitmap_start = last_reserved.saturating_add(1);
-        let bitmap = read_user_bitmap(&fs)?;
+        let bitmap = read_user_bitmap(&mut fs)?;
         let total_blocks = (partition_size / HW_SECTOR) as u32;
         let bitmap_bits = bitmap.len() * 8;
         let mut free_blocks: u64 = 0;
@@ -849,33 +890,85 @@ impl<R: Read + Seek> Read for CompactPfs3Reader<R> {
 /// Walk the user-data bitmap (bitmapindex blocks → bitmapblocks) and
 /// produce a flat byte vector with one bit per HW sector starting at
 /// `last_reserved + 1`. Each byte stores eight bits in least-significant-bit
-/// order. Returns an empty vector when the bitmap structure is unreadable;
-/// the compact reader then falls back to emitting the partition verbatim.
-fn read_user_bitmap<R: Read + Seek>(fs: &Pfs3Filesystem<R>) -> Result<Vec<u8>, FilesystemError> {
-    // We need a mutable reader; clone what we need from `fs` and read
-    // directly. (The Pfs3Filesystem doesn't expose its reader, but
-    // CompactPfs3Reader::new already opened the fs with our reader —
-    // we'd reopen here. Instead, use a local read closure backed by the
-    // fs's underlying reader through a helper.)
-    //
-    // Implementation note: we shadow `fs` reads by re-reading via the
-    // same underlying file. This is wasteful but only happens once at
-    // open time. To keep the interface clean, we accept a Pfs3Filesystem
-    // by &Self and use its already-cached reserved blocks where possible.
-    // Bitmap data blocks aren't in the dirblock cache, so we read them
-    // through a fresh helper that re-seeks.
-    let bitmap_indices: Vec<u32> = fs.root.bitmapindex.iter().copied().collect();
-    let _ = bitmap_indices; // silence "unused" until impl lands
-                            // For Phase 5 we ship the compact reader with NO bitmap — every
-                            // sector is emitted verbatim. This produces a correct (but
-                            // non-compactable) stream so backups still work end-to-end while we
-                            // sort out a clean bitmap iterator. The CompactResult.data_size
-                            // will reflect the full partition size, which is conservative.
-                            //
-                            // TODO(phase-6): implement the actual bitmapindex → bitmapblock walk
-                            // and return the assembled bitmap.
-    let _ = fs;
-    Ok(Vec::new())
+/// order (bit `b` of byte `B` represents sector `bitmap_start + B*8 + b`).
+/// Set bit = free (AmigaDOS convention).
+///
+/// On-disk bitmap is u32 BE words; within a word, bit position `31 - i`
+/// represents sector `i` of that word (pfs3aio allocation.c:318).
+///
+/// Returns an empty vector when the bitmap structure is unreadable or
+/// no bitmap-index pointers are present — the compact reader then falls
+/// back to emitting the partition verbatim.
+fn read_user_bitmap<R: Read + Seek>(
+    fs: &mut Pfs3Filesystem<R>,
+) -> Result<Vec<u8>, FilesystemError> {
+    let bitmap_start = fs.root.last_reserved.saturating_add(1);
+    let total_sectors = (fs.partition_size / HW_SECTOR) as u32;
+    if total_sectors <= bitmap_start {
+        return Ok(Vec::new());
+    }
+    let data_sectors = total_sectors - bitmap_start;
+    let total_bytes = ((data_sectors as usize) + 7) / 8;
+    let mut out = vec![0u8; total_bytes];
+
+    let longs_per_bmb = (fs.reserved_blksize / 4).saturating_sub(3) as usize;
+    let indexperblock = fs.indexperblock as usize;
+
+    // sectors_per_bmb tells us where each BM block starts within the
+    // flat bitmap. Each word covers 32 sectors.
+    let sectors_per_bmb: u64 = longs_per_bmb as u64 * 32;
+
+    let mi_pointers: Vec<u32> = fs.root.bitmapindex.iter().copied().collect();
+    for (mi_seq, &mi_blk) in mi_pointers.iter().enumerate() {
+        if mi_blk == 0 {
+            continue;
+        }
+        let mi = fs.read_reserved_block(mi_blk)?.to_vec();
+        if mi.len() < 12 || rd_u16(&mi, 0) != ID_BITMAPINDEXBLOCK {
+            // Not an MI block — skip silently; treat as unmapped.
+            continue;
+        }
+        for i in 0..indexperblock {
+            let off = 12 + i * 4;
+            if off + 4 > mi.len() {
+                break;
+            }
+            let bm_blk = rd_u32(&mi, off);
+            if bm_blk == 0 {
+                continue;
+            }
+            let bm_seq = (mi_seq * indexperblock + i) as u64;
+            let bm = fs.read_reserved_block(bm_blk)?.to_vec();
+            if bm.len() < 12 || rd_u16(&bm, 0) != ID_BITMAPBLOCK {
+                continue;
+            }
+            // Sector base within data area covered by this BM block.
+            let base_sector = bm_seq * sectors_per_bmb;
+            for w in 0..longs_per_bmb {
+                let o = 12 + w * 4;
+                if o + 4 > bm.len() {
+                    break;
+                }
+                let word = rd_u32(&bm, o);
+                if word == 0 {
+                    continue;
+                }
+                for i in 0..32u32 {
+                    if (word >> (31 - i)) & 1 == 0 {
+                        continue;
+                    }
+                    let sec = base_sector + (w as u64) * 32 + i as u64;
+                    if sec >= data_sectors as u64 {
+                        continue;
+                    }
+                    let byte_idx = (sec / 8) as usize;
+                    let bit_off = (sec % 8) as u8;
+                    out[byte_idx] |= 1u8 << bit_off;
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
