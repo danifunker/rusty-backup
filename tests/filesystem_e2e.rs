@@ -1753,3 +1753,98 @@ fn test_pfs3_staged_edits_round_trip() {
         "hello.txt should be gone after staged delete"
     );
 }
+
+/// Same end-to-end shape as the PFS3 test but for SFS — staged
+/// CreateDirectory + AddFile + DeleteEntry against a fresh blank
+/// SFS volume, dispatched through `edit_queue::apply_edit`.
+#[test]
+fn test_sfs_staged_edits_round_trip() {
+    use rusty_backup::fs::filesystem::EditableFilesystem;
+    use rusty_backup::fs::sfs::{create_blank_sfs, SfsFilesystem};
+    use rusty_backup::model::edit_queue::{apply_edit, StagedEdit};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let img_path = tmp.path().join("vol.hdf");
+    std::fs::write(&img_path, create_blank_sfs(8192, "StagedSFS").unwrap())
+        .expect("write blank image");
+
+    let host_payload: &[u8] = b"hello via SFS staged edits";
+    let host_file = tmp.path().join("hello.txt");
+    std::fs::write(&host_file, host_payload).expect("write host payload");
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&img_path)
+        .expect("open editable");
+    let mut efs: Box<dyn EditableFilesystem> =
+        Box::new(SfsFilesystem::open(file, 0).expect("open SfsFilesystem"));
+    let root = efs.root().expect("root");
+    let edits = vec![
+        StagedEdit::CreateDirectory {
+            parent: root.clone(),
+            name: "Sub".to_string(),
+        },
+        StagedEdit::AddFile {
+            parent: root.clone(),
+            name: "hello.txt".to_string(),
+            host_path: host_file.clone(),
+            size: host_payload.len() as u64,
+            prodos_type: None,
+            prodos_aux: None,
+            resource_fork: None,
+            hfs_type_override: None,
+            hfs_creator_override: None,
+        },
+    ];
+    for edit in &edits {
+        apply_edit(&mut *efs, edit).expect("apply staged edit");
+    }
+    efs.sync_metadata().expect("sync batch 1");
+    drop(efs);
+
+    let f2 = std::fs::File::open(&img_path).expect("reopen");
+    let mut fs = SfsFilesystem::open(f2, 0).expect("reopen SfsFilesystem");
+    let r = fs.root().expect("root after");
+    let kids = fs.list_directory(&r).expect("list");
+    assert_eq!(kids.len(), 2, "got {:?}", kids);
+    let names: Vec<&str> = kids.iter().map(|c| c.name.as_str()).collect();
+    assert!(names.contains(&"Sub"));
+    assert!(names.contains(&"hello.txt"));
+    let hello = kids.iter().find(|c| c.name == "hello.txt").unwrap();
+    let data = fs.read_file(hello, host_payload.len()).expect("read");
+    assert_eq!(data, host_payload);
+
+    let hello_fe = hello.clone();
+    let r_fe = r.clone();
+    drop(fs);
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&img_path)
+        .expect("reopen editable");
+    let mut efs: Box<dyn EditableFilesystem> =
+        Box::new(SfsFilesystem::open(file, 0).expect("open editable"));
+    apply_edit(
+        &mut *efs,
+        &StagedEdit::DeleteEntry {
+            parent: r_fe,
+            entry: hello_fe,
+        },
+    )
+    .expect("apply delete");
+    efs.sync_metadata().expect("sync after delete");
+    drop(efs);
+
+    let f3 = std::fs::File::open(&img_path).expect("reopen 3");
+    let mut fs = SfsFilesystem::open(f3, 0).expect("reopen 3");
+    let r = fs.root().expect("root after delete");
+    let kids = fs.list_directory(&r).expect("list after delete");
+    let names: Vec<&str> = kids.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["Sub"],
+        "hello.txt should be gone after staged delete"
+    );
+}

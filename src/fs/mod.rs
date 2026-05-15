@@ -1117,11 +1117,10 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                 )?));
             }
             s if is_amiga_sfs_type(s) => {
-                // SFS is read-only in Phase 7; editing arrives in Phase 8.
-                return Err(FilesystemError::Unsupported(format!(
-                    "editing not yet supported for SFS type '{}'",
-                    s
-                )));
+                return Ok(Box::new(sfs::SfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?));
             }
             _ => {
                 return Err(FilesystemError::Unsupported(format!(
