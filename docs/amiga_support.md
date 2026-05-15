@@ -236,10 +236,14 @@ state.
       RDB / 3× SFS\0 (via transparent CHD wrapper).
 - [x] Unit tests for RDSK + PART parsing and `format_dos_type`.
 - [x] `examples/probe_amiga.rs` smoke-test tool.
-- [ ] `.adz` / `.hdz` transparent gzip-decompress on open. *(Deferred to
-      Phase 2 — needs to hook the GUI file-open paths in inspect/backup/
-      restore tabs rather than the parser, since `PartitionTable::detect`
-      already works on any `Read + Seek` stream.)*
+- [x] `.adz` / `.hdz` transparent gzip-decompress on open. Helper
+      `gui::materialize_amiga_image_path` (src/gui/mod.rs) sniffs the
+      file extension, validates the gzip magic, and decompresses to a
+      `<stem>.adf` / `<stem>.hdf` in a fresh `tempfile::TempDir` that
+      the calling tab keeps alive. Wired into inspect, backup, and
+      restore (single-partition source) file-picker hooks; close /
+      device-switch paths drop the tempdir guard. Unit tests cover
+      raw-passthrough, round-trip decompress, and bogus-magic rejection.
 
 ### Phase 2 — OFS/FFS read + browse + backup
 - [x] `src/fs/affs_common.rs` — checksums (normal + bitmap + boot), AFFS

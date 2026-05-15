@@ -34,6 +34,10 @@ pub struct InspectTab {
     selected_device_idx: Option<usize>,
     /// Path to an image file (when using file picker instead of device)
     image_file_path: Option<PathBuf>,
+    /// Keeps the temporary decompressed `.adz` / `.hdz` payload alive for
+    /// as long as `image_file_path` points at it. Cleared whenever the
+    /// user picks a different file or closes the image.
+    amiga_tempdir: Option<tempfile::TempDir>,
     /// Detected image format label (e.g. "WOZ 3.5\"", "Fixed VHD", "2MG")
     image_format_label: Option<String>,
     /// Path to a backup folder (loaded via metadata.json)
@@ -160,6 +164,7 @@ impl Default for InspectTab {
         Self {
             selected_device_idx: None,
             image_file_path: None,
+            amiga_tempdir: None,
             image_format_label: None,
             backup_folder_path: None,
             close_backup_requested: false,
@@ -302,6 +307,7 @@ impl InspectTab {
                             .clicked()
                         {
                             self.image_file_path = None;
+                            self.amiga_tempdir = None;
                             self.backup_folder_path = None;
                             self.clear_results();
                         }
@@ -325,7 +331,20 @@ impl InspectTab {
                         {
                             self.selected_device_idx = None;
                             self.backup_folder_path = None;
-                            self.image_file_path = Some(path);
+                            // Transparently decompress .adz / .hdz so the
+                            // rest of the pipeline (PartitionTable::detect,
+                            // backup, browse) sees a raw image.
+                            match super::materialize_amiga_image_path(&path) {
+                                Ok((materialized, guard)) => {
+                                    self.image_file_path = Some(materialized);
+                                    self.amiga_tempdir = guard;
+                                }
+                                Err(e) => {
+                                    log::error!("Failed to decompress {}: {}", path.display(), e);
+                                    self.image_file_path = Some(path);
+                                    self.amiga_tempdir = None;
+                                }
+                            }
                             self.clear_results();
                         }
                     }
@@ -488,6 +507,7 @@ impl InspectTab {
                 self.browse_view.close();
                 self.clear_results();
                 self.image_file_path = None;
+                self.amiga_tempdir = None;
                 self.prev_image_path = None;
                 ctx.log.info("Image file closed.");
             }

@@ -62,6 +62,103 @@ fn file_dialog() -> rfd::FileDialog {
     dialog
 }
 
+/// If `path` points at an `.adz` / `.hdz` (gzip-wrapped Amiga image),
+/// decompress it to a temporary `.adf` / `.hdf` next to the system temp
+/// directory and return that path instead. Otherwise return the original
+/// path verbatim.
+///
+/// The decompressed file is named `<stem>.adf` (for `.adz`) or
+/// `<stem>.hdf` (for `.hdz`) inside a fresh `tempfile::tempdir` so the
+/// caller can keep the `_guard` alive for the duration of the operation
+/// — once the guard drops, the tempdir is removed. Callers that need the
+/// file to outlive the dialog should hold the `TempDir` (returned as the
+/// second tuple element) until the work is done.
+///
+/// Returns `Err` if the magic gzip bytes are missing or `flate2` fails.
+pub fn materialize_amiga_image_path(
+    path: &std::path::Path,
+) -> std::io::Result<(std::path::PathBuf, Option<tempfile::TempDir>)> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase());
+    let target_ext = match ext.as_deref() {
+        Some("adz") => "adf",
+        Some("hdz") => "hdf",
+        _ => return Ok((path.to_path_buf(), None)),
+    };
+    let mut input = std::fs::File::open(path)?;
+    // Spot-check the gzip magic so we surface a clear error if the
+    // user renamed something to .adz that isn't actually gzipped.
+    let mut magic = [0u8; 2];
+    use std::io::Read;
+    input.read_exact(&mut magic)?;
+    if magic != [0x1F, 0x8B] {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} does not start with gzip magic 1f 8b", path.display()),
+        ));
+    }
+    use std::io::Seek;
+    input.seek(std::io::SeekFrom::Start(0))?;
+    let tmp = tempfile::tempdir()?;
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("amiga");
+    let out_path = tmp.path().join(format!("{}.{}", stem, target_ext));
+    let mut decoder = flate2::read::GzDecoder::new(input);
+    let mut out = std::fs::File::create(&out_path)?;
+    std::io::copy(&mut decoder, &mut out)?;
+    out.sync_all()?;
+    log::info!(
+        "Materialized {} -> {} ({} bytes)",
+        path.display(),
+        out_path.display(),
+        out.metadata().map(|m| m.len()).unwrap_or(0)
+    );
+    Ok((out_path, Some(tmp)))
+}
+
+#[cfg(test)]
+mod materialize_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    #[test]
+    fn materialize_passes_raw_adf_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let raw = tmp.path().join("disk.adf");
+        std::fs::write(&raw, b"raw bytes").unwrap();
+        let (out, guard) = materialize_amiga_image_path(&raw).unwrap();
+        assert_eq!(out, raw);
+        assert!(guard.is_none());
+    }
+
+    #[test]
+    fn materialize_decompresses_adz() {
+        let payload: &[u8] = b"PAYLOAD bytes for an adz round-trip";
+        let tmp = tempfile::tempdir().unwrap();
+        let adz_path = tmp.path().join("disk.adz");
+        // Write a tiny gzipped file.
+        let f = std::fs::File::create(&adz_path).unwrap();
+        let mut enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
+        enc.write_all(payload).unwrap();
+        enc.finish().unwrap();
+        let (out, guard) = materialize_amiga_image_path(&adz_path).unwrap();
+        assert!(guard.is_some(), "decompressed path needs a tempdir guard");
+        assert_eq!(out.extension().and_then(|s| s.to_str()), Some("adf"));
+        let actual = std::fs::read(&out).unwrap();
+        assert_eq!(actual, payload);
+    }
+
+    #[test]
+    fn materialize_rejects_non_gzip_adz() {
+        let tmp = tempfile::tempdir().unwrap();
+        let adz = tmp.path().join("bogus.adz");
+        std::fs::write(&adz, b"not gzip data").unwrap();
+        let err = materialize_amiga_image_path(&adz).unwrap_err();
+        assert!(err.to_string().contains("gzip magic"));
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Tab {
     Backup,
