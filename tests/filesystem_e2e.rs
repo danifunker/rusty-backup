@@ -1652,3 +1652,104 @@ fn test_prodos_read_file_contents() {
     assert_eq!(bin_data.len(), antetris_bin.size as usize);
     assert!(bin_data.iter().any(|&b| b != 0));
 }
+
+/// Exercise the GUI staged-edits machinery end-to-end against PFS3: stage
+/// AddFile + CreateDirectory + DeleteEntry against a fresh blank volume,
+/// dispatch through `edit_queue::apply_edit`, then sync and reopen.
+/// Mirrors what `BrowseView::apply_staged_edits` does at runtime.
+#[test]
+fn test_pfs3_staged_edits_round_trip() {
+    use rusty_backup::fs::filesystem::EditableFilesystem;
+    use rusty_backup::fs::pfs3::{create_blank_pfs3, Pfs3Filesystem};
+    use rusty_backup::model::edit_queue::{apply_edit, StagedEdit};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let img_path = tmp.path().join("vol.hdf");
+    std::fs::write(&img_path, create_blank_pfs3(8192, "StagedEd").unwrap())
+        .expect("write blank image");
+
+    let host_payload: &[u8] = b"hello via staged edits";
+    let host_file = tmp.path().join("hello.txt");
+    std::fs::write(&host_file, host_payload).expect("write host payload");
+
+    // Open editable, capture the live root, build the staged-edit batch.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&img_path)
+        .expect("open editable");
+    let mut efs: Box<dyn EditableFilesystem> =
+        Box::new(Pfs3Filesystem::open(file, 0).expect("open Pfs3Filesystem"));
+    let root = efs.root().expect("root");
+
+    let edits = vec![
+        StagedEdit::CreateDirectory {
+            parent: root.clone(),
+            name: "Sub".to_string(),
+        },
+        StagedEdit::AddFile {
+            parent: root.clone(),
+            name: "hello.txt".to_string(),
+            host_path: host_file.clone(),
+            size: host_payload.len() as u64,
+            prodos_type: None,
+            prodos_aux: None,
+            resource_fork: None,
+            hfs_type_override: None,
+            hfs_creator_override: None,
+        },
+    ];
+    for edit in &edits {
+        apply_edit(&mut *efs, edit).expect("apply staged edit");
+    }
+    efs.sync_metadata().expect("sync after batch 1");
+    drop(efs);
+
+    // Re-open read-only and verify both entries landed.
+    let f2 = std::fs::File::open(&img_path).expect("reopen");
+    let mut fs = Pfs3Filesystem::open(f2, 0).expect("reopen Pfs3Filesystem");
+    let r = fs.root().expect("root after");
+    let kids = fs.list_directory(&r).expect("list");
+    assert_eq!(kids.len(), 2, "got {:?}", kids);
+    let names: Vec<&str> = kids.iter().map(|c| c.name.as_str()).collect();
+    assert!(names.contains(&"Sub"));
+    assert!(names.contains(&"hello.txt"));
+    let hello = kids.iter().find(|c| c.name == "hello.txt").unwrap();
+    let data = fs.read_file(hello, host_payload.len()).expect("read");
+    assert_eq!(data, host_payload);
+    let sub = kids.iter().find(|c| c.name == "Sub").unwrap();
+    let sub_kids = fs.list_directory(sub).expect("list sub");
+    assert!(sub_kids.is_empty(), "new dir should start empty");
+
+    let hello_fe = hello.clone();
+    let r_fe = r.clone();
+    drop(fs);
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&img_path)
+        .expect("reopen editable");
+    let mut efs: Box<dyn EditableFilesystem> =
+        Box::new(Pfs3Filesystem::open(file, 0).expect("open editable"));
+    let del_batch = vec![StagedEdit::DeleteEntry {
+        parent: r_fe,
+        entry: hello_fe,
+    }];
+    for edit in &del_batch {
+        apply_edit(&mut *efs, edit).expect("apply delete");
+    }
+    efs.sync_metadata().expect("sync after delete");
+    drop(efs);
+
+    let f3 = std::fs::File::open(&img_path).expect("reopen 3");
+    let mut fs = Pfs3Filesystem::open(f3, 0).expect("reopen Pfs3Filesystem 3");
+    let r = fs.root().expect("root after delete");
+    let kids = fs.list_directory(&r).expect("list after delete");
+    let names: Vec<&str> = kids.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["Sub"],
+        "hello.txt should be gone after staged delete"
+    );
+}
