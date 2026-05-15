@@ -708,6 +708,10 @@ impl<R: Read + Seek + Send> Filesystem for Pfs3Filesystem<R> {
                 FileEntry::new_file(de.name.clone(), child_path, de.fsize, de.anode as u64)
             };
             fe.modified = datestamp_string(de.cd as i32, de.cm as i32, de.ct as i32);
+            fe.amiga_protection = Some(de.protection as u32);
+            if !de.comment.is_empty() {
+                fe.amiga_comment = Some(de.comment.clone());
+            }
             out.push(fe);
         }
         Ok(out)

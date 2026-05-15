@@ -158,6 +158,8 @@ mod tests {
                 resource_fork_size: None,
                 aux_type: None,
                 link_target_cnid: None,
+                amiga_protection: None,
+                amiga_comment: None,
             })
         }
 
@@ -181,6 +183,8 @@ mod tests {
                         resource_fork_size: None,
                         aux_type: None,
                         link_target_cnid: None,
+                        amiga_protection: None,
+                        amiga_comment: None,
                     },
                     FileEntry {
                         name: "ReadMe".into(),
@@ -199,6 +203,8 @@ mod tests {
                         resource_fork_size: Some(512),
                         aux_type: None,
                         link_target_cnid: None,
+                        amiga_protection: None,
+                        amiga_comment: None,
                     },
                 ]),
                 "/Documents" => Ok(vec![FileEntry {
@@ -218,6 +224,8 @@ mod tests {
                     resource_fork_size: None,
                     aux_type: None,
                     link_target_cnid: None,
+                    amiga_protection: None,
+                    amiga_comment: None,
                 }]),
                 _ => Ok(vec![]),
             }
