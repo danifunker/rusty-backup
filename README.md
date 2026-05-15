@@ -68,6 +68,8 @@ VHD export is available from the Inspect tab: produce either a whole-disk
 | Disk Copy 4.2  | `.dc42`, `.image` | Yes          | No              | Classic Mac floppy images |
 | Apple DMG      | `.dmg`          | Yes (raw/UDRW) | No              | Uncompressed DMGs only |
 | WOZ            | `.woz`          | Yes            | Yes (export)    | Apple II 5.25" and 3.5"; WOZ2 writer regenerates a clean image |
+| Amiga ADF / HDF | `.adf`, `.hdf` | Yes            | Yes (raw)       | Floppy + hard-disk images. RDB partition tables parsed. |
+| Amiga gzipped  | `.adz`, `.hdz`  | Yes            | No              | Transparently decompressed to a temp file at open |
 | Raw physical disk | —            | Yes            | Yes (restore target) | CF/SD/USB/HDD/SSD — see below |
 
 ### Filesystems
@@ -89,6 +91,9 @@ restore or VHD export.
 | HFS+ (Mac OS Extended) | Yes* | No*                    | No                           | Actively working on HFS+, shrink doesn't seem to work, unsure about expand. Browsing works |
 | btrfs          | Yes    | No                        | No                           | Modern Linux; read-only browse |
 | ProDOS         | Yes    | Yes                        | No (planned)                  | Apple II / IIgs |
+| AFFS (OFS / FFS)  | Yes | No (layout-preserving)     | No                            | Amiga `DOS\0`..`DOS\7`. Read + edit (add file / new folder / delete); Disk Validator fsck included |
+| PFS3 / PDS3 / muFS | Yes | No (layout-preserving)    | No                            | Amiga PFS3 family. Read + edit (add file / new folder / delete) with sync-boundary atomicity |
+| SFS (Smart File System) | Yes | No (layout-preserving) | No                          | Amiga `SFS\0` / `SFS\2`. Read + edit (add file / new folder / delete) — single-leaf btree only |
 
 ### What works well vs. what to watch out for
 

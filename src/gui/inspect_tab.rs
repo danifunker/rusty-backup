@@ -34,6 +34,10 @@ pub struct InspectTab {
     selected_device_idx: Option<usize>,
     /// Path to an image file (when using file picker instead of device)
     image_file_path: Option<PathBuf>,
+    /// Keeps the temporary decompressed `.adz` / `.hdz` payload alive for
+    /// as long as `image_file_path` points at it. Cleared whenever the
+    /// user picks a different file or closes the image.
+    amiga_tempdir: Option<tempfile::TempDir>,
     /// Detected image format label (e.g. "WOZ 3.5\"", "Fixed VHD", "2MG")
     image_format_label: Option<String>,
     /// Path to a backup folder (loaded via metadata.json)
@@ -160,6 +164,7 @@ impl Default for InspectTab {
         Self {
             selected_device_idx: None,
             image_file_path: None,
+            amiga_tempdir: None,
             image_format_label: None,
             backup_folder_path: None,
             close_backup_requested: false,
@@ -302,6 +307,7 @@ impl InspectTab {
                             .clicked()
                         {
                             self.image_file_path = None;
+                            self.amiga_tempdir = None;
                             self.backup_folder_path = None;
                             self.clear_results();
                         }
@@ -316,7 +322,8 @@ impl InspectTab {
                                 "Disk Images",
                                 &[
                                     "vhd", "img", "raw", "bin", "iso", "dd", "hda", "hdv", "2mg",
-                                    "dmg", "po", "do", "dsk", "dc42", "woz", "chd",
+                                    "dmg", "po", "do", "dsk", "dc42", "woz", "chd", "adf", "hdf",
+                                    "adz", "hdz",
                                 ],
                             )
                             .add_filter("All Files", &["*"])
@@ -324,7 +331,20 @@ impl InspectTab {
                         {
                             self.selected_device_idx = None;
                             self.backup_folder_path = None;
-                            self.image_file_path = Some(path);
+                            // Transparently decompress .adz / .hdz so the
+                            // rest of the pipeline (PartitionTable::detect,
+                            // backup, browse) sees a raw image.
+                            match super::materialize_amiga_image_path(&path) {
+                                Ok((materialized, guard)) => {
+                                    self.image_file_path = Some(materialized);
+                                    self.amiga_tempdir = guard;
+                                }
+                                Err(e) => {
+                                    log::error!("Failed to decompress {}: {}", path.display(), e);
+                                    self.image_file_path = Some(path);
+                                    self.amiga_tempdir = None;
+                                }
+                            }
                             self.clear_results();
                         }
                     }
@@ -487,6 +507,7 @@ impl InspectTab {
                 self.browse_view.close();
                 self.clear_results();
                 self.image_file_path = None;
+                self.amiga_tempdir = None;
                 self.prev_image_path = None;
                 ctx.log.info("Image file closed.");
             }
@@ -853,9 +874,36 @@ impl InspectTab {
                                     .id(egui::Id::new(&size_id)),
                             );
 
-                            // Bootable checkbox (MBR only)
+                            // Bootable cell — table-type-specific.
+                            // MBR carries a checkbox (legacy behaviour);
+                            // RDB renders explicit "boot" / "no boot" radio
+                            // buttons so the choice is impossible to flip
+                            // accidentally. GPT / APM have no per-partition
+                            // bootable bit, so the cell is read-only there.
                             if table_type == "MBR" {
                                 ui.checkbox(&mut self.editor.entries[i].bootable, "");
+                            } else if table_type == "RDB" {
+                                ui.horizontal(|ui| {
+                                    let tip = "Whether this RDB partition is eligible to boot. \
+                                               Multiple partitions can be set to boot at once — \
+                                               the Amiga ROM picks the one with the highest boot \
+                                               priority among them.";
+                                    let mut val = self.editor.entries[i].bootable;
+                                    if ui
+                                        .radio_value(&mut val, true, "boot")
+                                        .on_hover_text(tip)
+                                        .changed()
+                                    {
+                                        self.editor.entries[i].bootable = val;
+                                    }
+                                    if ui
+                                        .radio_value(&mut val, false, "no boot")
+                                        .on_hover_text(tip)
+                                        .changed()
+                                    {
+                                        self.editor.entries[i].bootable = val;
+                                    }
+                                });
                             } else {
                                 ui.label(if bootable { "Yes" } else { "" });
                             }
@@ -2067,6 +2115,45 @@ impl InspectTab {
                         }
                     }
 
+                    // MBR type 0x83 is officially "Linux", but MSX HDD formatters
+                    // (Nextor and similar) reuse it for FAT12/16. Probe the VBR
+                    // and replace the generic "Linux" label with the real
+                    // filesystem family so the inspect grid reflects what the
+                    // browse/edit dispatch will actually open. For FAT VBRs at
+                    // 0x83, also tag "(MSX)" since standard PC tooling never
+                    // writes FAT under 0x83 — it's specific to MSX HDD layouts.
+                    for part in &mut partitions {
+                        if part.partition_type_byte != 0x83 || part.is_extended_container {
+                            continue;
+                        }
+                        if let Some(mut br) = make_probe_reader() {
+                            match rusty_backup::fs::probe_0x83_fs_type(
+                                &mut br,
+                                part.start_lba * 512,
+                            ) {
+                                Some("FAT") => {
+                                    let part_offset = part.start_lba * 512;
+                                    let subtype = make_probe_reader().and_then(|br2| {
+                                        rusty_backup::fs::fat::FatFilesystem::open(br2, part_offset)
+                                            .ok()
+                                            .map(|fs| {
+                                                use rusty_backup::fs::Filesystem;
+                                                fs.fs_type().to_string()
+                                            })
+                                    });
+                                    part.type_name = match subtype {
+                                        Some(t) => format!("{t} (MSX)"),
+                                        None => "FAT (MSX)".to_string(),
+                                    };
+                                }
+                                Some(other) => {
+                                    part.type_name = other.to_string();
+                                }
+                                None => {}
+                            }
+                        }
+                    }
+
                     // Probe HFS/HFS+ partitions for their allocation block size
                     // so the inspect grid can show it. Covers APM Apple_HFS,
                     // MBR type 0xAF, and HFS/HFS+ superfloppies.
@@ -2113,10 +2200,10 @@ impl InspectTab {
                         alignment.alignment_type, alignment.first_lba
                     ));
 
-                    // Probe FAT volume labels cheaply (boot sector only) so the
-                    // inspect grid's Volume column has a value for FAT
-                    // partitions. HFS+ labels are populated above (folded into
-                    // type_name) and could move here in a future pass.
+                    // Probe volume labels cheaply (boot/root block reads only)
+                    // so the inspect grid's Volume column has a value. HFS+
+                    // labels are still folded into type_name and could move
+                    // here in a future pass.
                     let mut partition_volume_labels: HashMap<usize, String> = HashMap::new();
                     for part in &partitions {
                         if part.is_extended_container {
@@ -2139,22 +2226,87 @@ impl InspectTab {
                             &table,
                             PartitionTable::None { fs_hint, .. } if fs_hint == "FAT"
                         );
-                        if !(is_fat_byte || is_fat_superfloppy) {
-                            continue;
-                        }
-                        let Some(br) = make_probe_reader() else {
-                            continue;
+                        let is_amiga_dos = part
+                            .partition_type_string
+                            .as_deref()
+                            .map(rusty_backup::fs::is_amiga_dos_type)
+                            .unwrap_or(false);
+                        let is_amiga_pfs3 = part
+                            .partition_type_string
+                            .as_deref()
+                            .map(rusty_backup::fs::is_amiga_pfs3_type)
+                            .unwrap_or(false);
+                        let is_amiga_sfs = part
+                            .partition_type_string
+                            .as_deref()
+                            .map(rusty_backup::fs::is_amiga_sfs_type)
+                            .unwrap_or(false);
+
+                        let label_opt: Option<String> = if is_fat_byte || is_fat_superfloppy {
+                            make_probe_reader().and_then(|br| {
+                                rusty_backup::fs::fat::FatFilesystem::open(br, part.start_lba * 512)
+                                    .ok()
+                                    .and_then(|fs| {
+                                        use rusty_backup::fs::Filesystem;
+                                        fs.volume_label().map(str::to_string)
+                                    })
+                            })
+                        } else if is_amiga_dos {
+                            make_probe_reader().and_then(|br| {
+                                rusty_backup::fs::affs::AffsFilesystem::open(
+                                    br,
+                                    part.start_lba * 512,
+                                )
+                                .ok()
+                                .and_then(|fs| {
+                                    use rusty_backup::fs::Filesystem;
+                                    fs.volume_label().map(str::to_string)
+                                })
+                            })
+                        } else if is_amiga_pfs3 {
+                            make_probe_reader().and_then(|br| {
+                                rusty_backup::fs::pfs3::Pfs3Filesystem::open(
+                                    br,
+                                    part.start_lba * 512,
+                                )
+                                .ok()
+                                .and_then(|fs| {
+                                    use rusty_backup::fs::Filesystem;
+                                    fs.volume_label().map(str::to_string)
+                                })
+                            })
+                        } else if is_amiga_sfs {
+                            make_probe_reader().and_then(|br| {
+                                rusty_backup::fs::sfs::SfsFilesystem::open(br, part.start_lba * 512)
+                                    .ok()
+                                    .and_then(|fs| {
+                                        use rusty_backup::fs::Filesystem;
+                                        fs.volume_label().map(str::to_string)
+                                    })
+                            })
+                        } else {
+                            None
                         };
-                        if let Ok(fs) =
-                            rusty_backup::fs::fat::FatFilesystem::open(br, part.start_lba * 512)
+
+                        // For Amiga RDB partitions, combine drive name + volume
+                        // label so the column shows both ("DH0 - Workbench").
+                        // Drive name alone is also useful when the volume name
+                        // is empty, so include it as a fallback. See
+                        // partition::PartitionInfo::drv_name for the source.
+                        let combined_label = match (part.drv_name.as_deref(), label_opt.as_deref())
                         {
-                            use rusty_backup::fs::Filesystem;
-                            if let Some(label) = fs.volume_label() {
-                                let trimmed = label.trim();
-                                if !trimmed.is_empty() {
-                                    partition_volume_labels.insert(part.index, trimmed.to_string());
-                                }
+                            (Some(drv), Some(vol)) if !drv.is_empty() && !vol.trim().is_empty() => {
+                                Some(format!("{drv} - {}", vol.trim()))
                             }
+                            (Some(drv), _) if !drv.is_empty() => Some(drv.to_string()),
+                            (_, Some(vol)) if !vol.trim().is_empty() => {
+                                Some(vol.trim().to_string())
+                            }
+                            _ => None,
+                        };
+
+                        if let Some(label) = combined_label {
+                            partition_volume_labels.insert(part.index, label);
                         }
                     }
 
@@ -3298,6 +3450,17 @@ impl InspectTab {
             let preopen = None;
             self.browse_view
                 .open(path, offset, ptype, partition_type_string, preopen);
+            // Surface the Amiga drive name ("DH0") in the browser header so
+            // users tracking several RDB partitions can tell which one is
+            // open without going back to the inspect grid. The volume label
+            // (populated after open) gets concatenated as "DH0 - <label>".
+            if let Some(part) = self.partitions.iter().find(|p| p.index == part_index) {
+                if let Some(drv) = part.drv_name.as_deref() {
+                    if !drv.is_empty() {
+                        self.browse_view.set_label_prefix(drv.to_string());
+                    }
+                }
+            }
             // If this CHD is the body of a single-file-chd backup, hand
             // the backup folder to BrowseView so a successful chd_edit
             // save refreshes metadata.json (per-partition checksums +
@@ -3853,19 +4016,31 @@ fn is_classic_hfs(ptype: u8, type_string: Option<&str>, type_name: &str) -> bool
 
 /// Check if an APM partition type string corresponds to a browsable filesystem.
 fn is_browsable_type_string(type_str: Option<&str>) -> bool {
+    let Some(s) = type_str else {
+        return false;
+    };
+    // AmigaDOS DosType tags (DOS\0..DOS\7) — RDB-partitioned hard drives and
+    // single-partition HDFs / ADFs both route through this string.
+    if rusty_backup::fs::is_amiga_dos_type(s) {
+        return true;
+    }
+    if rusty_backup::fs::is_amiga_pfs3_type(s) {
+        return true;
+    }
+    if rusty_backup::fs::is_amiga_sfs_type(s) {
+        return true;
+    }
     matches!(
-        type_str,
-        Some(
-            "Apple_HFS"
-                | "Apple_HFSX"
-                | "Apple_HFS+"
-                | "Apple_UNIX_SVR2"
-                | "Apple_UNIX_SRVR2"
-                | "Apple_PRODOS"
-                | "Apple_ProDOS"
-                // GPT "Linux Filesystem" GUID — ext, btrfs, or xfs at runtime.
-                | "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
-        )
+        s,
+        "Apple_HFS"
+            | "Apple_HFSX"
+            | "Apple_HFS+"
+            | "Apple_UNIX_SVR2"
+            | "Apple_UNIX_SRVR2"
+            | "Apple_PRODOS"
+            | "Apple_ProDOS"
+            // GPT "Linux Filesystem" GUID — ext, btrfs, or xfs at runtime.
+            | "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
     )
 }
 
@@ -3903,9 +4078,14 @@ fn format_size_decimal(bytes: u64) -> String {
 }
 
 /// Check if a partition type supports filesystem checking (fsck).
-/// Currently only classic HFS (0xAF or APM "Apple_HFS").
+/// Classic HFS (0xAF or APM "Apple_HFS") and AmigaDOS OFS/FFS variants.
 fn is_checkable_type(ptype: u8, type_str: Option<&str>) -> bool {
-    ptype == 0xAF || matches!(type_str, Some("Apple_HFS"))
+    if ptype == 0xAF || matches!(type_str, Some("Apple_HFS")) {
+        return true;
+    }
+    type_str
+        .map(rusty_backup::fs::is_amiga_dos_type)
+        .unwrap_or(false)
 }
 
 /// Format an HFS allocation block size as "N KiB" when it's a whole

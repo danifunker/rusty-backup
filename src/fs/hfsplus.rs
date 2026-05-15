@@ -2597,6 +2597,8 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
             resource_fork_size: None,
             aux_type: None,
             link_target_cnid: None,
+            amiga_protection: None,
+            amiga_comment: None,
         })
     }
 

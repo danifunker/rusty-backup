@@ -3,6 +3,7 @@ pub mod apm;
 pub mod editor;
 pub mod gpt;
 pub mod mbr;
+pub mod rdb;
 pub mod resize;
 pub mod sgi;
 
@@ -12,6 +13,7 @@ use crate::error::RustyBackupError;
 use apm::Apm;
 use gpt::Gpt;
 use mbr::Mbr;
+use rdb::{Rdb, RDSK_SIGNATURE};
 use sgi::{SgiVolumeHeader, SGI_TYPE_BYTE_EFS, SGI_TYPE_BYTE_XFS, SGI_VOLHDR_MAGIC};
 
 pub use alignment::{detect_alignment, AlignmentType, PartitionAlignment};
@@ -25,6 +27,9 @@ pub enum PartitionTable {
         gpt: Gpt,
     },
     Apm(Apm),
+    /// Amiga Rigid Disk Block — `RDSK` table in the first 16 sectors of a
+    /// hard-disk image, used by AmigaDOS, PFS, SFS. See `src/partition/rdb.rs`.
+    Rdb(Rdb),
     /// SGI Volume Header (IRIX disks). Has 16 fixed-position partition slots
     /// plus a volume directory of standalone executables (`sash`, `ide`,
     /// `/unix`); see `src/partition/sgi.rs`.
@@ -57,6 +62,15 @@ pub struct PartitionInfo {
     /// Allocation block size in bytes for HFS / HFS+ partitions. `None` for
     /// non-HFS partitions or when the volume header could not be probed.
     pub hfs_block_size: Option<u32>,
+    /// 512-byte sector number of the PART block on disk, for RDB partitions
+    /// only. Used by GUI actions that need to mutate the partition entry
+    /// in place (e.g. toggling the bootable flag). `None` for all other
+    /// partition table types.
+    pub rdb_part_block: Option<u64>,
+    /// AmigaDOS drive name (e.g. "DH0") from the RDB PART block. Distinct
+    /// from the volume label, which is the disk name in the AFFS/PFS3/SFS
+    /// root block. `None` for non-RDB partitions.
+    pub drv_name: Option<String>,
 }
 
 /// Standard floppy disk image sizes (bytes).
@@ -71,7 +85,9 @@ fn is_floppy_size(size: u64) -> bool {
         | 409_600   // 3.5" 400K single-sided GCR
         | 819_200   // 3.5" 800K double-sided GCR
         | 737_280   // 3.5" 720K MFM (PC double-density)
+        | 901_120   // 3.5" 880K Amiga DD (.adf)
         | 1_474_560 // 3.5" 1.44MB MFM (PC/Mac high-density)
+        | 1_802_240 // 3.5" 1.76MB Amiga HD (.adf)
     )
 }
 
@@ -128,6 +144,15 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     // share the magic; the XfsFilesystem parser handles version routing.
     if &first_sector[0..4] == b"XFSB" {
         return Some("XFS".to_string());
+    }
+
+    // AmigaDOS boot block: "DOS\x?" at offset 0 (variants 0..7 = OFS/FFS,
+    // Intl, DirCache, Long Names). PFS / SFS use the same shape for their
+    // RDB DosType but never appear on bare ADFs — those are RDB-partitioned
+    // hard-disk images instead. Returning the DosType string here lets the
+    // dispatcher route to the AFFS driver.
+    if &first_sector[0..3] == b"DOS" && first_sector[3] <= 7 {
+        return Some(format!("DOS\\{}", first_sector[3]));
     }
 
     // Check for HFS / HFS+ / HFSX / ext / ProDOS at offset 1024.
@@ -219,6 +244,37 @@ impl PartitionTable {
                 .map_err(RustyBackupError::Io)?;
         }
 
+        // Check for an Amiga Rigid Disk Block. RDSK can be at any of the
+        // first 16 sectors (in practice it sits at sector 0). The signature
+        // 'RDSK' doesn't clash with MBR/GPT/APM/SGI signatures, so we can
+        // probe before falling through to MBR parsing.
+        let rdsk_present = {
+            let mut scan = [0u8; 4];
+            let mut found = false;
+            for block in 0..rdb::RDB_SCAN_BLOCKS {
+                if reader.seek(SeekFrom::Start(block * 512)).is_err() {
+                    break;
+                }
+                if reader.read_exact(&mut scan).is_err() {
+                    continue;
+                }
+                if &scan == RDSK_SIGNATURE {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if rdsk_present {
+            reader.seek(SeekFrom::Start(0))?;
+            if let Ok(parsed) = Rdb::parse(reader) {
+                return Ok(PartitionTable::Rdb(parsed));
+            }
+            // Fall through if parsing failed (bad checksum etc.) — surface
+            // the lower-level error from MBR/superfloppy paths instead.
+            reader.seek(SeekFrom::Start(0))?;
+        }
+
         // Check for superfloppy (no partition table) before MBR parsing
         if let Some(fs_hint) = detect_superfloppy(&mbr_data, reader) {
             // Get disk size via seek to end
@@ -308,6 +364,8 @@ impl PartitionTable {
                         is_extended_container: e.is_extended(),
                         partition_type_string: None,
                         hfs_block_size: None,
+                        rdb_part_block: None,
+                        drv_name: None,
                     })
                     .collect();
 
@@ -324,6 +382,8 @@ impl PartitionTable {
                         is_extended_container: false,
                         partition_type_string: None,
                         hfs_block_size: None,
+                        rdb_part_block: None,
+                        drv_name: None,
                     });
                 }
 
@@ -344,6 +404,8 @@ impl PartitionTable {
                     is_extended_container: false,
                     partition_type_string: Some(e.type_guid.to_string_formatted()),
                     hfs_block_size: None,
+                    rdb_part_block: None,
+                    drv_name: None,
                 })
                 .collect(),
             PartitionTable::Apm(apm) => {
@@ -363,6 +425,8 @@ impl PartitionTable {
                         is_extended_container: false,
                         partition_type_string: Some(e.partition_type.clone()),
                         hfs_block_size: None,
+                        rdb_part_block: None,
+                        drv_name: None,
                     })
                     .collect()
             }
@@ -405,25 +469,71 @@ impl PartitionTable {
                             // `open_filesystem` into the APM string router.
                             partition_type_string: None,
                             hfs_block_size: None,
+                            rdb_part_block: None,
+                            drv_name: None,
                         })
                     })
                     .collect()
             }
+            PartitionTable::Rdb(rdb) => rdb
+                .partitions
+                .iter()
+                .enumerate()
+                .map(|(i, p)| PartitionInfo {
+                    index: i,
+                    // Show both the human name and the device name, e.g.
+                    // "AmigaDOS FFS-Intl (DH0)" or "SFS (Amiga) (DH1)".
+                    type_name: format!(
+                        "{} ({})",
+                        rdb::dos_type_display_name(p.dos_type),
+                        p.drv_name,
+                    ),
+                    partition_type_byte: 0,
+                    start_lba: p.start_lba_512(),
+                    size_bytes: p.size_bytes(),
+                    bootable: p.is_bootable(),
+                    is_logical: false,
+                    is_extended_container: false,
+                    partition_type_string: Some(p.dos_type_string()),
+                    hfs_block_size: None,
+                    rdb_part_block: Some(p.block_num),
+                    drv_name: Some(p.drv_name.clone()),
+                })
+                .collect(),
             PartitionTable::None {
                 size_bytes,
                 fs_hint,
             } => {
+                // AmigaDOS superfloppies report their DosType as the fs_hint
+                // (e.g. "DOS\\1"); route that through `partition_type_string`
+                // so the AFFS driver gets dispatched. Other hints (FAT, HFS,
+                // ext, etc.) keep `partition_type_string: None` so dispatch
+                // falls back to MBR type-byte detection.
+                let is_amiga_dos = fs_hint.starts_with("DOS\\") && fs_hint.len() == 5;
+                let display_name = if is_amiga_dos {
+                    let variant = fs_hint.as_bytes()[4] - b'0';
+                    let raw = u32::from_be_bytes([b'D', b'O', b'S', variant]);
+                    rdb::dos_type_display_name(raw)
+                } else {
+                    fs_hint.clone()
+                };
                 vec![PartitionInfo {
                     index: 0,
-                    type_name: fs_hint.clone(),
+                    type_name: display_name,
                     partition_type_byte: 0,
                     start_lba: 0,
                     size_bytes: *size_bytes,
                     bootable: false,
                     is_logical: false,
                     is_extended_container: false,
-                    partition_type_string: None,
+                    partition_type_string: if is_amiga_dos {
+                        Some(fs_hint.clone())
+                    } else {
+                        None
+                    },
                     hfs_block_size: None,
+                    rdb_part_block: None,
+                    drv_name: None,
                 }]
             }
         }
@@ -435,6 +545,7 @@ impl PartitionTable {
             PartitionTable::Mbr(_) => "MBR",
             PartitionTable::Gpt { .. } => "GPT",
             PartitionTable::Apm(_) => "APM",
+            PartitionTable::Rdb(_) => "RDB",
             PartitionTable::Sgi(_) => "SGI",
             PartitionTable::None { .. } => "None",
         }
@@ -446,7 +557,10 @@ impl PartitionTable {
         match self {
             PartitionTable::Mbr(mbr) => mbr.disk_signature,
             PartitionTable::Gpt { protective_mbr, .. } => protective_mbr.disk_signature,
-            PartitionTable::Apm(_) | PartitionTable::Sgi(_) | PartitionTable::None { .. } => 0,
+            PartitionTable::Apm(_)
+            | PartitionTable::Rdb(_)
+            | PartitionTable::Sgi(_)
+            | PartitionTable::None { .. } => 0,
         }
     }
 }

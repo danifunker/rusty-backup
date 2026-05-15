@@ -297,6 +297,41 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         }
     }
 
+    // MBR type 0x83 is officially "Linux", but MSX HDD formatters (Nextor and
+    // similar) reuse it for FAT12/16. Probe the VBR so backup logs/metadata
+    // show the actual FS family rather than the generic "Linux" label. For
+    // FAT VBRs we additionally open the BPB to tag the FAT subtype + "(MSX)".
+    for part in &mut partitions {
+        if part.partition_type_byte != 0x83 || part.is_extended_container {
+            continue;
+        }
+        let Ok(clone) = source.get_ref().try_clone() else {
+            continue;
+        };
+        let mut br = std::io::BufReader::new(clone);
+        let part_offset = part.start_lba * 512;
+        match fs::probe_0x83_fs_type(&mut br, part_offset) {
+            Some("FAT") => {
+                let subtype = source.get_ref().try_clone().ok().and_then(|c| {
+                    fs::fat::FatFilesystem::open(std::io::BufReader::new(c), part_offset)
+                        .ok()
+                        .map(|fs| {
+                            use crate::fs::Filesystem;
+                            fs.fs_type().to_string()
+                        })
+                });
+                part.type_name = match subtype {
+                    Some(t) => format!("{t} (MSX)"),
+                    None => "FAT (MSX)".to_string(),
+                };
+            }
+            Some(other) => {
+                part.type_name = other.to_string();
+            }
+            None => {}
+        }
+    }
+
     if is_superfloppy {
         log(
             &progress,
@@ -450,6 +485,17 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                     "Exported APM (apm.json + apm.bin)",
                 );
             }
+        }
+        PartitionTable::Rdb(rdb) => {
+            // Emit a JSON sidecar of the RDB layout so inspect tools and
+            // future round-trip restores can read it. Per-partition data
+            // backup follows the standard layout-preserving path once the
+            // AFFS/PFS/SFS readers land.
+            let json =
+                serde_json::to_string_pretty(rdb).context("failed to serialize RDB to JSON")?;
+            std::fs::write(backup_folder.join("rdb.json"), json)
+                .context("failed to write rdb.json")?;
+            log(&progress, LogLevel::Info, "Exported RDB (rdb.json)");
         }
         PartitionTable::Sgi(vh) => {
             // Step 2 surfaces SGI partitions in the inspect tab; backup of

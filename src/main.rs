@@ -12,7 +12,6 @@ fn main() -> eframe::Result {
     let icon_image = image::load_from_memory_with_format(icon_bytes, image::ImageFormat::Png)
         .expect("Failed to load icon");
 
-
     // Install a panic hook that prints the panic location AND a backtrace
     // to stderr for every thread that panics — including sub-threads spawned
     // inside the backup worker. Without this, panics in producer/consumer

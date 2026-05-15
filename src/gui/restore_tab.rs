@@ -93,6 +93,9 @@ pub struct RestoreTab {
     // --- Single Partition mode state ---
     /// Source image file for single-partition restore (alternative to backup folder)
     sp_image_file: Option<PathBuf>,
+    /// Keeps a decompressed `.adz` / `.hdz` source alive while
+    /// `sp_image_file` references it.
+    sp_amiga_tempdir: Option<tempfile::TempDir>,
     /// Which partition index to restore (from backup)
     sp_source_partition_idx: Option<usize>,
     /// Target device for single-partition restore
@@ -138,6 +141,7 @@ impl Default for RestoreTab {
             restore_running: false,
             restore_progress: None,
             sp_image_file: None,
+            sp_amiga_tempdir: None,
             sp_source_partition_idx: None,
             sp_target_device_idx: None,
             sp_target_partitions: Vec::new(),
@@ -634,13 +638,23 @@ impl RestoreTab {
                             "Disk Images",
                             &[
                                 "img", "raw", "bin", "vhd", "2mg", "iso", "dd", "po", "do", "dsk",
-                                "dc42", "woz",
+                                "dc42", "woz", "adf", "hdf", "adz", "hdz",
                             ],
                         )
                         .add_filter("All Files", &["*"])
                         .pick_file()
                     {
-                        self.sp_image_file = Some(path);
+                        match super::materialize_amiga_image_path(&path) {
+                            Ok((materialized, guard)) => {
+                                self.sp_image_file = Some(materialized);
+                                self.sp_amiga_tempdir = guard;
+                            }
+                            Err(e) => {
+                                log::error!("Failed to decompress {}: {}", path.display(), e);
+                                self.sp_image_file = Some(path);
+                                self.sp_amiga_tempdir = None;
+                            }
+                        }
                         self.backup_folder = None;
                         self.backup_metadata = None;
                         self.sp_source_partition_idx = None;
@@ -1414,13 +1428,23 @@ impl RestoreTab {
                             "Disk Images",
                             &[
                                 "img", "raw", "bin", "vhd", "2mg", "iso", "dd", "po", "do", "dsk",
-                                "dc42", "woz",
+                                "dc42", "woz", "adf", "hdf", "adz", "hdz",
                             ],
                         )
                         .add_filter("All Files", &["*"])
                         .pick_file()
                     {
-                        self.sp_image_file = Some(path);
+                        match super::materialize_amiga_image_path(&path) {
+                            Ok((materialized, guard)) => {
+                                self.sp_image_file = Some(materialized);
+                                self.sp_amiga_tempdir = guard;
+                            }
+                            Err(e) => {
+                                log::error!("Failed to decompress {}: {}", path.display(), e);
+                                self.sp_image_file = Some(path);
+                                self.sp_amiga_tempdir = None;
+                            }
+                        }
                         self.backup_folder = None;
                         self.backup_metadata = None;
                         self.sp_source_partition_idx = None;

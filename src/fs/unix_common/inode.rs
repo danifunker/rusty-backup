@@ -161,6 +161,8 @@ pub fn unix_entry_from_inode(
         resource_fork_size: None,
         aux_type: None,
         link_target_cnid: None,
+        amiga_protection: None,
+        amiga_comment: None,
     }
 }
 

@@ -97,6 +97,22 @@ the only CHD shape rusty-backup writes.
 - **Partition alignment preservation** - backups record detected alignment (DosTraditional, Modern1MB, Custom, None) so restores can preserve original geometry for vintage OS compatibility.
 - **Flexible restore** - users can configure partition sizes during restore (entire disk, minimum, or custom per-partition), with automatic filesystem expansion.
 
+### Amiga Support
+
+Amiga images (`.adf`, `.hdf`, `.adz`, `.hdz`, and CHD-wrapped HDFs) and the three filesystems that matter on Classic Amiga hardware (AFFS, PFS3, SFS) are first-class:
+
+- **Partition table**: `PartitionTable::Rdb` parses RDSK + PART chain (`src/partition/rdb.rs`). Each `PartitionInfo` carries the 4-byte `DosType` as `partition_type_string` (e.g. `"DOS\\3"`, `"PFS\\3"`, `"SFS\\0"`).
+- **Filesystem dispatch**: extend the `partition_type_string` matchers in `src/fs/mod.rs` (`fs_name_for`, `is_layout_preserving_fs`, `is_expensive_minimum`, `open_filesystem_by_string`, `open_editable_filesystem_by_string`, `compact_partition_reader_by_string`). Helpers `is_amiga_dos_type` / `is_amiga_pfs3_type` / `is_amiga_sfs_type` group the relevant strings.
+- **Filesystems**:
+  - **AFFS** (`src/fs/affs.rs`) — DOS\0..DOS\7, read + edit + Disk Validator fsck. Files inherit `amiga_protection` (offset 0x140) and `amiga_comment` (BSTR at 0x148) via `CreateFileOptions`; the same fields surface on `FileEntry` for the browse view.
+  - **PFS3** (`src/fs/pfs3.rs`) — PFS\3, PDS\3, muFS. Read + edit (allocator + EditableFilesystem with snapshot/rollback). `create_blank_pfs3` formats a blank volume for tests.
+  - **SFS** (`src/fs/sfs.rs`) — SFS\0, SFS\2. Read + edit (single-leaf btree only); journal blocks (TRST/TRFA) are not maintained — we use sync-boundary atomicity instead. `create_blank_sfs` formats a blank volume.
+- **Bitmap convention**: All three filesystems use **set bit = free** (opposite of most other FS we deal with). Easy bug source.
+- **Endianness**: every multi-byte field on Amiga disks is big-endian. Easy bug source #2.
+- **`.adz` / `.hdz`**: the GUI helper `gui::materialize_amiga_image_path` decompresses gzip-wrapped images to a tempfile at file-pick time. Each tab keeps a `tempfile::TempDir` guard alive for the lifetime of `image_file_path`.
+
+See `docs/amiga_support.md` for the full phased implementation plan + reference C-source pointers (`~/repos/amigasources/{ADFlib,amitools,pfs3aio,smartfilesystem}`).
+
 ### Platform-Specific Concerns
 
 Device paths differ by platform: `/dev/sdX` (Linux), `/dev/diskX` (macOS), `\\.\PhysicalDriveX` (Windows). Raw disk access requires elevated privileges. The `nix` crate handles Unix-specific operations; `windows` crate handles Windows.

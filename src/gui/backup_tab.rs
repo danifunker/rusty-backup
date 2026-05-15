@@ -28,6 +28,10 @@ use super::progress::ProgressState;
 pub struct BackupTab {
     selected_device_idx: Option<usize>,
     image_file_path: Option<PathBuf>,
+    /// Holds the decompressed `.adz` / `.hdz` payload alive for the
+    /// lifetime of `image_file_path` when it points at a synthesized
+    /// tempfile.
+    amiga_tempdir: Option<tempfile::TempDir>,
     destination_folder: Option<PathBuf>,
     backup_name: String,
     sector_by_sector: bool,
@@ -124,6 +128,7 @@ impl Default for BackupTab {
         Self {
             selected_device_idx: None,
             image_file_path: None,
+            amiga_tempdir: None,
             destination_folder: None,
             backup_name: String::new(),
             sector_by_sector: false,
@@ -231,6 +236,7 @@ impl BackupTab {
                                 .clicked()
                             {
                                 self.image_file_path = None;
+                                self.amiga_tempdir = None;
                                 self.update_backup_name(ctx);
                             }
                         }
@@ -245,13 +251,28 @@ impl BackupTab {
                                     &[
                                         "img", "raw", "bin", "iso", "dd", "vhd", "hda", "hdv",
                                         "2mg", "dmg", "po", "do", "dsk", "dc42", "woz", "chd",
+                                        "adf", "hdf", "adz", "hdz",
                                     ],
                                 )
                                 .add_filter("All Files", &["*"])
                                 .pick_file()
                             {
                                 self.selected_device_idx = None;
-                                self.image_file_path = Some(path);
+                                match super::materialize_amiga_image_path(&path) {
+                                    Ok((materialized, guard)) => {
+                                        self.image_file_path = Some(materialized);
+                                        self.amiga_tempdir = guard;
+                                    }
+                                    Err(e) => {
+                                        log::error!(
+                                            "Failed to decompress {}: {}",
+                                            path.display(),
+                                            e
+                                        );
+                                        self.image_file_path = Some(path);
+                                        self.amiga_tempdir = None;
+                                    }
+                                }
                                 self.update_backup_name(ctx);
                             }
                         }
