@@ -230,9 +230,16 @@ impl OpticalTab {
             };
 
             if source_changed {
+                let was_browsing = self.browse_view.is_active();
+                self.browse_view.close();
                 self.prev_drive_idx = self.selected_drive_idx;
                 self.prev_image_path = self.image_file_path.clone();
                 self.detect_disc_info(log);
+                if was_browsing && self.disc_info.is_some() {
+                    if let Some(path) = self.get_browsable_path() {
+                        self.browse_view.open(&path);
+                    }
+                }
             }
         }
 

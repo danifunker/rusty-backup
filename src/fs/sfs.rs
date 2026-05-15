@@ -1449,38 +1449,40 @@ impl<R: Read + Seek> SfsFilesystem<R> {
         Ok(())
     }
 
-    /// Find the OBJC block containing the fsObject for `objectnode` in
-    /// the directory chain starting at `first_obj_blk`. Returns the block
-    /// number plus the byte offset of that fsObject within the block.
-    fn find_object_in_chain(
-        &mut self,
-        first_obj_blk: u32,
-        objectnode: u32,
-    ) -> Result<(u32, usize), FilesystemError> {
-        let mut blk = first_obj_blk;
-        while blk != 0 {
-            let buf = self.read_block(blk)?.to_vec();
-            validate_block(&buf, OBJECTCONTAINER_ID, blk)?;
-            let next = rd_u32(&buf, 16);
-            let mut off = 24usize;
-            while off < buf.len() {
-                match parse_object(&buf, off) {
-                    Some((obj, consumed)) => {
-                        if obj.objectnode == objectnode {
-                            return Ok((blk, off));
-                        }
-                        off += consumed;
-                    }
-                    None => break,
-                }
-            }
-            blk = next;
-        }
-        Err(parse_err(format!(
-            "find_object_in_chain: objectnode {} not found",
-            objectnode
-        )))
-    }
+    // Find the OBJC block containing the fsObject for `objectnode` in the
+    // directory chain starting at `first_obj_blk`. Returns the block number
+    // plus the byte offset of that fsObject within the block. Currently
+    // unused; kept for future filesystem-resize work.
+    //
+    // fn find_object_in_chain(
+    //     &mut self,
+    //     first_obj_blk: u32,
+    //     objectnode: u32,
+    // ) -> Result<(u32, usize), FilesystemError> {
+    //     let mut blk = first_obj_blk;
+    //     while blk != 0 {
+    //         let buf = self.read_block(blk)?.to_vec();
+    //         validate_block(&buf, OBJECTCONTAINER_ID, blk)?;
+    //         let next = rd_u32(&buf, 16);
+    //         let mut off = 24usize;
+    //         while off < buf.len() {
+    //             match parse_object(&buf, off) {
+    //                 Some((obj, consumed)) => {
+    //                     if obj.objectnode == objectnode {
+    //                         return Ok((blk, off));
+    //                     }
+    //                     off += consumed;
+    //                 }
+    //                 None => break,
+    //             }
+    //         }
+    //         blk = next;
+    //     }
+    //     Err(parse_err(format!(
+    //         "find_object_in_chain: objectnode {} not found",
+    //         objectnode
+    //     )))
+    // }
 
     /// Locate the parent directory's fsObject within the root OBJC chain.
     /// For ROOTNODE this is the fsObject embedded in the root OBJC at
