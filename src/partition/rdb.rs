@@ -266,20 +266,32 @@ impl Rdb {
         }
 
         // --- Per-partition patch + plan ---
+        //
+        // Partitions are processed in source-order. When the caller does NOT
+        // supply an explicit `new_start_lba` for a partition, the dest LBA
+        // auto-slides to the running "next available cylinder" cursor so that
+        // shrinking partition N causes partitions N+1..end to move down and
+        // close the gap. Without this, a shrunk earlier partition leaves
+        // 31 GB of zero-filled gap before the next partition's frozen
+        // original start. (Honoring an explicit `new_start_lba` is still
+        // supported — the cursor jumps forward to match.)
+        //
+        // The cursor is seeded with the first partition's source_lba so we
+        // never push a partition earlier than where its source data lives.
         let mut plans: Vec<RdbPartitionPlan> = Vec::with_capacity(self.partitions.len());
         let mut max_end_lba: u64 = (RDB_SCAN_BLOCKS).max(self.header.block_num + 1);
+        let mut next_avail_lba: u64 = self
+            .partitions
+            .iter()
+            .map(|p| p.start_lba_512())
+            .min()
+            .unwrap_or(RDB_SCAN_BLOCKS);
         for (i, p) in self.partitions.iter().enumerate() {
             let source_lba = p.start_lba_512();
             let original_size = p.size_bytes();
-            let (dest_lba, export_size) =
-                if let Some(ov) = overrides.iter().find(|o| o.start_lba == source_lba) {
-                    (ov.effective_start_lba(), ov.export_size)
-                } else {
-                    (source_lba, original_size)
-                };
-
-            // Compute new low_cyl / high_cyl from dest_lba + export_size,
-            // preserving (surfaces, blk_per_trk, fs_block_size).
+            let ov = overrides.iter().find(|o| o.start_lba == source_lba);
+            let export_size = ov.map(|o| o.export_size).unwrap_or(original_size);
+            // dest_lba precedence: explicit new_start_lba > auto-packed cursor.
             let cyl_lbas = p.surfaces as u64 * p.blk_per_trk as u64 * p.fs_block_size() / 512;
             if cyl_lbas == 0 {
                 return Err(RustyBackupError::InvalidRdb(format!(
@@ -290,6 +302,16 @@ impl Rdb {
                     p.fs_block_size()
                 )));
             }
+            let dest_lba = if let Some(o) = ov.and_then(|o| o.new_start_lba) {
+                o
+            } else {
+                // Round the running cursor up to the next cyl boundary for
+                // this partition's geometry. RDB allows per-partition
+                // (surfaces, blk_per_trk) so cyl_lbas can vary; aligning
+                // against this partition's cyl_lbas keeps low_cyl integral.
+                next_avail_lba.div_ceil(cyl_lbas) * cyl_lbas
+            };
+
             if dest_lba % cyl_lbas != 0 {
                 return Err(RustyBackupError::InvalidRdb(format!(
                     "partition {} dest LBA {} not cylinder-aligned (cyl_lbas={})",
@@ -344,6 +366,10 @@ impl Rdb {
             if end_lba > max_end_lba {
                 max_end_lba = end_lba;
             }
+            // Advance the auto-pack cursor past this partition. Subsequent
+            // partitions without explicit new_start_lba slide down into the
+            // gap created by any shrink that happened above.
+            next_avail_lba = end_lba;
         }
 
         // --- Patch RDSK header: cylinders + hi_cyl reflect new disk size ---
