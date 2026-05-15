@@ -54,9 +54,7 @@ const MODE_LARGEFILE: u32 = 2048;
 const ID_DIRBLOCK: u16 = 0x4442; // 'DB'
 const ID_ANODEBLOCK: u16 = 0x4142; // 'AB'
 const ID_INDEXBLOCK: u16 = 0x4942; // 'IB'
-#[allow(dead_code)]
 const ID_BITMAPBLOCK: u16 = 0x424D; // 'BM'
-#[allow(dead_code)]
 const ID_BITMAPINDEXBLOCK: u16 = 0x4D49; // 'MI'
 const ID_EXTENSIONBLOCK: u16 = 0x4558; // 'EX'
 const ID_SUPERBLOCK: u16 = 0x5342; // 'SB'
@@ -809,13 +807,27 @@ impl<R: Read + Seek> CompactPfs3Reader<R> {
         let bitmap_start = last_reserved.saturating_add(1);
         let bitmap = read_user_bitmap(&mut fs)?;
         let total_blocks = (partition_size / HW_SECTOR) as u32;
-        let bitmap_bits = bitmap.len() * 8;
+        // The flat bitmap is rounded up to byte size, so it may contain
+        // trailing pad bits beyond the actual data-sector range. Count
+        // only bits that correspond to a real sector.
+        let data_sectors = total_blocks.saturating_sub(bitmap_start) as u64;
         let mut free_blocks: u64 = 0;
-        for byte in &bitmap {
-            free_blocks += byte.count_ones() as u64;
+        for (i, &byte) in bitmap.iter().enumerate() {
+            let base = i as u64 * 8;
+            if base + 8 <= data_sectors {
+                free_blocks += byte.count_ones() as u64;
+            } else if base < data_sectors {
+                let valid_bits = (data_sectors - base) as u32;
+                let mask = (1u8 << valid_bits) - 1;
+                free_blocks += (byte & mask).count_ones() as u64;
+            }
         }
-        // free_blocks is the count of bits in the data area only.
-        let allocated_data = bitmap_bits as u64 - free_blocks;
+        let allocated_data = if bitmap.is_empty() {
+            // No bitmap available: treat the whole data area as allocated.
+            data_sectors
+        } else {
+            data_sectors.saturating_sub(free_blocks)
+        };
         let reserved_blocks = bitmap_start as u64; // sectors 0..=last_reserved
         let allocated = allocated_data + reserved_blocks;
 
@@ -971,6 +983,219 @@ fn read_user_bitmap<R: Read + Seek>(
     Ok(out)
 }
 
+// === Phase 6: formatter for a blank PFS3 volume =============================
+//
+// Produces a minimum mountable empty PFS3 volume so the write path has a
+// known-good starting state for round-trip tests. Mirrors the layout that
+// `pfs3aio/format.c::FDSFormat` would emit for a small "small-mode" disk:
+//
+// Reserved layout (1 KiB reserved blocks, 32 reserved total, first at HW
+// sector 2; reserved block N starts at HW sector `2 + N*2`):
+//   RB 0 — rootblock (first 512 B) + reserved bitmap (next 512 B)
+//   RB 1 — rootblock extension (`EX`)
+//   RB 2 — bitmap-index block (`MI`)
+//   RB 3..3+no_bmb-1 — data bitmap blocks (`BM`)
+//   next — anode-index block (`IB`) reachable from `small_indexblocks[0]`
+//   next — anodeblock 0 (`AB`) — holds anodes 0..(anodesperblock-1)
+//   next — root dirblock (`DB`)
+//
+// Anode 5 is reserved for the root directory (ANODE_ROOTDIR); anodes 0..4
+// are pre-allocated as the format flow does (blocknr=0xFFFFFFFF sentinel
+// marks them as taken-but-empty). All other anodes are zeroed → free.
+//
+// We deliberately set only `MODE_HARDDISK | MODE_SPLITTED_ANODES |
+// MODE_EXTENSION` in `options`. Real PFS3 volumes also enable
+// DIR_EXTENSION / DATESTAMP / LONGFN, but those add extra direntry tail
+// fields. Keeping options minimal keeps the formatter and the matching
+// dirblock write path simple. The reader handles minimal mode fine; this
+// is enough for our round-trip tests.
+
+const PFS3_BLANK_NUMRESERVED: u32 = 32;
+const PFS3_BLANK_RESBLKSIZE: u32 = 1024;
+const PFS3_BLANK_FIRST_RESERVED: u32 = 2;
+const HW_SECTOR_U32: u32 = 512;
+
+fn write_u16(buf: &mut [u8], o: usize, v: u16) {
+    buf[o..o + 2].copy_from_slice(&v.to_be_bytes());
+}
+fn write_u32(buf: &mut [u8], o: usize, v: u32) {
+    buf[o..o + 4].copy_from_slice(&v.to_be_bytes());
+}
+
+/// Create a blank PFS3 volume sized for `total_sectors` HW sectors of 512
+/// bytes (`total_sectors * 512` bytes total). The volume mounts as empty
+/// with diskname `name` (truncated to 31 bytes).
+pub fn create_blank_pfs3(total_sectors: u32, name: &str) -> Result<Vec<u8>, FilesystemError> {
+    let resblksize = PFS3_BLANK_RESBLKSIZE;
+    let rscluster = resblksize / HW_SECTOR_U32; // 2
+    let numreserved = PFS3_BLANK_NUMRESERVED;
+    let first_reserved = PFS3_BLANK_FIRST_RESERVED;
+    let last_reserved = first_reserved + rscluster * numreserved - 1;
+
+    // Need at least last_reserved + 1 data sector beyond.
+    if total_sectors < last_reserved + 8 {
+        return Err(parse_err(format!(
+            "PFS3 formatter: total_sectors {} too small (need > {})",
+            total_sectors,
+            last_reserved + 8
+        )));
+    }
+
+    let bitmap_start_sector = last_reserved + 1;
+    let data_sectors = total_sectors - bitmap_start_sector;
+    let longsperbmb = (resblksize - 12) / 4;
+    let sectors_per_bmb = longsperbmb * 32;
+    let no_bmb = (data_sectors + sectors_per_bmb - 1) / sectors_per_bmb;
+    let indexperblock = (resblksize - 12) / 4;
+    if no_bmb > indexperblock {
+        return Err(parse_err(format!(
+            "PFS3 formatter: disk too large for single MI block ({} BM > {} index slots)",
+            no_bmb, indexperblock
+        )));
+    }
+    let anodesperblock = (resblksize - 16) / 12;
+
+    // Reserved-block index assignments.
+    let rb_idx_root = 0u32;
+    let rb_idx_ext = 1u32;
+    let rb_idx_mi = 2u32;
+    let rb_idx_bm0 = 3u32;
+    let rb_idx_ib0 = rb_idx_bm0 + no_bmb;
+    let rb_idx_ab0 = rb_idx_ib0 + 1;
+    let rb_idx_rootdir = rb_idx_ab0 + 1;
+    let used_rb = rb_idx_rootdir + 1;
+    if used_rb > numreserved {
+        return Err(parse_err(format!(
+            "PFS3 formatter: reserved-block budget exceeded ({} > {})",
+            used_rb, numreserved
+        )));
+    }
+
+    let rb_to_sector = |idx: u32| -> u32 { first_reserved + idx * rscluster };
+    let rb_to_offset = |idx: u32| -> usize { rb_to_sector(idx) as usize * 512 };
+
+    let mut img = vec![0u8; total_sectors as usize * 512];
+
+    // === Boot block at HW sector 0 ===
+    img[0..4].copy_from_slice(b"PFS\x01");
+
+    // === Rootblock at RB 0 ===
+    let rb = rb_to_offset(rb_idx_root);
+    img[rb..rb + 4].copy_from_slice(b"PFS\x01");
+    let options = MODE_HARDDISK | MODE_SPLITTED_ANODES | MODE_EXTENSION;
+    write_u32(&mut img, rb + 4, options);
+    write_u32(&mut img, rb + 8, 1); // datestamp
+                                    // creationday/min/tick at 12..18: zero
+    img[rb + 18] = 0xf0; // protection
+    let n = name.as_bytes();
+    let n_len = n.len().min(31);
+    img[rb + 20] = n_len as u8;
+    img[rb + 21..rb + 21 + n_len].copy_from_slice(&n[..n_len]);
+    write_u32(&mut img, rb + 52, last_reserved);
+    write_u32(&mut img, rb + 56, first_reserved);
+    let reserved_free = numreserved - used_rb;
+    write_u32(&mut img, rb + 60, reserved_free);
+    write_u16(&mut img, rb + 64, resblksize as u16);
+    write_u16(&mut img, rb + 66, 1); // rblkcluster: 1 reserved block
+    write_u32(&mut img, rb + 68, data_sectors); // blocks_free
+                                                // alwaysfree at 72: 0
+                                                // roving_ptr at 76: 0
+                                                // deldir at 80: 0
+    write_u32(&mut img, rb + 84, total_sectors); // disksize (HW sectors)
+    write_u32(&mut img, rb + 88, rb_to_sector(rb_idx_ext)); // extension blocknr
+                                                            // not_used at 92: 0
+                                                            // Small layout starts at offset 96:
+                                                            //   bitmapindex[5] @ 96..116
+                                                            //   indexblocks[99] @ 116..512
+    write_u32(&mut img, rb + 96, rb_to_sector(rb_idx_mi));
+    write_u32(&mut img, rb + 116, rb_to_sector(rb_idx_ib0));
+
+    // === Reserved bitmap immediately after the rootblock (offset 512) ===
+    let bm_res = rb + 512;
+    write_u16(&mut img, bm_res, ID_BITMAPBLOCK);
+    write_u32(&mut img, bm_res + 4, 1); // datestamp
+                                        // seqnr at +8: 0
+                                        // bitmap[0] at +12: bits 0..numreserved-1 = free, then mask off used.
+    let mut res_bm = 0u32;
+    for i in 0..numreserved {
+        res_bm |= 1u32 << (31 - i);
+    }
+    for i in 0..used_rb {
+        res_bm &= !(1u32 << (31 - i));
+    }
+    write_u32(&mut img, bm_res + 12, res_bm);
+
+    // === Rootblock extension at RB 1 ===
+    let ext = rb_to_offset(rb_idx_ext);
+    write_u16(&mut img, ext, ID_EXTENSIONBLOCK);
+    write_u32(&mut img, ext + 8, 1); // datestamp
+
+    // === Bitmap-index block (MI) at RB 2 ===
+    let mi = rb_to_offset(rb_idx_mi);
+    write_u16(&mut img, mi, ID_BITMAPINDEXBLOCK);
+    write_u32(&mut img, mi + 4, 1); // datestamp
+                                    // seqnr at +8: 0
+                                    // index[N] starts at +12; populate with BM block sectors.
+    for i in 0..no_bmb {
+        write_u32(
+            &mut img,
+            mi + 12 + i as usize * 4,
+            rb_to_sector(rb_idx_bm0 + i),
+        );
+    }
+
+    // === Data bitmap (BM) blocks ===
+    // Each BM holds `longsperbmb` u32 words; all 1s = all free.
+    for i in 0..no_bmb {
+        let bm = rb_to_offset(rb_idx_bm0 + i);
+        write_u16(&mut img, bm, ID_BITMAPBLOCK);
+        write_u32(&mut img, bm + 4, 1); // datestamp
+        write_u32(&mut img, bm + 8, i); // seqnr
+        for w in 0..longsperbmb as usize {
+            write_u32(&mut img, bm + 12 + w * 4, 0xFFFF_FFFF);
+        }
+    }
+
+    // === Anode-index block (IB) at rb_idx_ib0 ===
+    let ib = rb_to_offset(rb_idx_ib0);
+    write_u16(&mut img, ib, ID_INDEXBLOCK);
+    write_u32(&mut img, ib + 4, 1); // datestamp
+                                    // seqnr at +8: 0
+                                    // index[0] = anodeblock 0 sector
+    write_u32(&mut img, ib + 12, rb_to_sector(rb_idx_ab0));
+
+    // === Anodeblock 0 (AB) at rb_idx_ab0 ===
+    let ab = rb_to_offset(rb_idx_ab0);
+    write_u16(&mut img, ab, ID_ANODEBLOCK);
+    write_u32(&mut img, ab + 4, 1); // datestamp
+                                    // seqnr at +8: 0
+                                    // Anodes 0..4: blocknr=0xFFFFFFFF (taken sentinel, per AllocAnode).
+    for slot in 0..ANODE_ROOTDIR as usize {
+        let aoff = ab + 16 + slot * 12;
+        write_u32(&mut img, aoff, 0); // clustersize
+        write_u32(&mut img, aoff + 4, 0xFFFF_FFFF); // blocknr sentinel
+        write_u32(&mut img, aoff + 8, 0); // next
+    }
+    // Anode 5 (ROOTDIR): clustersize=1, blocknr=rootdir sector, next=0.
+    let aoff_root = ab + 16 + ANODE_ROOTDIR as usize * 12;
+    write_u32(&mut img, aoff_root, 1);
+    write_u32(&mut img, aoff_root + 4, rb_to_sector(rb_idx_rootdir));
+    write_u32(&mut img, aoff_root + 8, 0);
+    // Anodes 6..anodesperblock-1: zero = free (already zeroed).
+    let _ = anodesperblock;
+
+    // === Root dirblock (DB) at rb_idx_rootdir ===
+    let db = rb_to_offset(rb_idx_rootdir);
+    write_u16(&mut img, db, ID_DIRBLOCK);
+    write_u32(&mut img, db + 4, 1); // datestamp
+                                    // not_used_2 at +8: 0 (2 UWORDs)
+    write_u32(&mut img, db + 12, ANODE_ROOTDIR); // anodenr
+    write_u32(&mut img, db + 16, 0); // parent
+                                     // entries at +20: empty (first byte already 0)
+
+    Ok(img)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -990,6 +1215,41 @@ mod tests {
         let seqnr = anodenr >> 16;
         let off = anodenr & 0xFFFF;
         assert_eq!((seqnr, off), (2, 3));
+    }
+
+    #[test]
+    fn blank_volume_round_trips_through_reader() {
+        // 4 MiB blank disk: 8192 sectors, 32 reserved, 8126 data sectors.
+        let img = create_blank_pfs3(8192, "TestPFS").expect("format");
+        assert_eq!(img.len(), 8192 * 512);
+        let cur = std::io::Cursor::new(img);
+        let mut fs = Pfs3Filesystem::open(cur, 0).expect("open");
+        assert_eq!(fs.volume_label(), Some("TestPFS"));
+        assert_eq!(fs.fs_type(), "PFS3");
+        let root = fs.root().expect("root");
+        let kids = fs.list_directory(&root).expect("list");
+        assert!(kids.is_empty(), "blank root should be empty");
+        // total_size == 4 MiB
+        assert_eq!(fs.total_size(), 8192 * 512);
+        // used_size = total - free*512. Free = data_sectors_in_bitmap_words *
+        // 32 minus 0 used... actually all data sectors are free in a blank
+        // disk, so used == reserved area only.
+        let used = fs.used_size();
+        let reserved_bytes = 66u64 * 512; // sectors 0..65 = boot + reserved area
+                                          // The reader's used_size formula is total - blocks_free*512. We set
+                                          // blocks_free = data_sectors (8126). So used = 66 sectors = 33792.
+        assert_eq!(used, reserved_bytes);
+    }
+
+    #[test]
+    fn blank_volume_compact_reader_walks_bitmap() {
+        let img = create_blank_pfs3(8192, "T").expect("format");
+        let cur = std::io::Cursor::new(img);
+        let (_compact, info) = CompactPfs3Reader::new(cur, 0).expect("compact");
+        // For a blank disk, every data-area bit is "free", so the compact
+        // reader sees ONLY the reserved area as allocated.
+        assert_eq!(info.original_size, 8192 * 512);
+        assert_eq!(info.data_size, 66 * 512);
     }
 
     #[test]
