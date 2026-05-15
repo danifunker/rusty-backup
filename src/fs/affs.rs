@@ -449,6 +449,12 @@ impl<R: Read + Seek> AffsFilesystem<R> {
     }
 
     /// Synthesize a new file header block in the cache.
+    ///
+    /// `access` is the AmigaDOS protection word stored at offset 0x140
+    /// (0 = `----rwed`, matching the on-disk default). `comment` is the
+    /// optional Amiga filenote stored at offset 0x148; pass `""` to
+    /// leave it empty.
+    #[allow(clippy::too_many_arguments)]
     fn build_file_header_block(
         &mut self,
         block: u32,
@@ -458,6 +464,8 @@ impl<R: Read + Seek> AffsFilesystem<R> {
         data_blocks_first_72: &[u32],
         first_data: u32,
         extension: u32,
+        access: u32,
+        comment: &str,
     ) -> Result<(), FilesystemError> {
         let mut buf = [0u8; BSIZE];
         buf[0..4].copy_from_slice(&T_HEADER.to_be_bytes());
@@ -474,8 +482,18 @@ impl<R: Read + Seek> AffsFilesystem<R> {
             let slot = MAX_DATA_BLOCKS - 1 - i;
             buf[0x18 + slot * 4..0x18 + slot * 4 + 4].copy_from_slice(&dblk.to_be_bytes());
         }
+        // protection (access) at 0x140
+        buf[0x140..0x144].copy_from_slice(&access.to_be_bytes());
         // byte_size at 0x144.
         buf[0x144..0x148].copy_from_slice(&byte_size.to_be_bytes());
+        // comment BSTR at 0x148 (length + up to MAX_COMMENT_LEN bytes).
+        // Skip the encoder for empty comments — the buffer is already
+        // zeroed (length=0) so the on-disk BSTR is the correct empty
+        // form, and `write_bstr` rejects empty strings on the grounds
+        // that it's primarily a filename encoder.
+        if !comment.is_empty() {
+            write_bstr(&mut buf, 0x148, MAX_COMMENT_LEN, comment)?;
+        }
         let (days, mins, ticks) = Self::now_datestamp();
         buf[0x1A4..0x1A8].copy_from_slice(&days.to_be_bytes());
         buf[0x1A8..0x1AC].copy_from_slice(&mins.to_be_bytes());
@@ -700,6 +718,10 @@ impl<R: Read + Seek> AffsFilesystem<R> {
             ),
         };
         fe.modified = datestamp_string(entry.modify_days, entry.modify_mins, entry.modify_ticks);
+        fe.amiga_protection = Some(entry.access);
+        if !entry.comment.is_empty() {
+            fe.amiga_comment = Some(entry.comment.clone());
+        }
         fe
     }
 
@@ -1102,7 +1124,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AffsFilesystem<R> {
         name: &str,
         data: &mut dyn Read,
         data_len: u64,
-        _options: &CreateFileOptions,
+        options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
         self.validate_name(name)?;
         let parent_block = if parent.location == 0 {
@@ -1210,6 +1232,8 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AffsFilesystem<R> {
         }
 
         let first_data = data_blocks.first().copied().unwrap_or(0);
+        let access = options.amiga_protection.unwrap_or(0);
+        let comment_str = options.amiga_comment.as_deref().unwrap_or("");
         self.build_file_header_block(
             header_block,
             parent_block,
@@ -1218,6 +1242,8 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AffsFilesystem<R> {
             header_data_blocks,
             first_data,
             header_extension,
+            access,
+            comment_str,
         )?;
         self.hash_chain_insert(parent_block, header_block, name)?;
 
@@ -1873,5 +1899,43 @@ mod tests {
         assert!(out[880 * BSIZE..881 * BSIZE].iter().any(|&b| b != 0));
         // Block 881 should have the bitmap — non-zero.
         assert!(out[881 * BSIZE..882 * BSIZE].iter().any(|&b| b != 0));
+    }
+
+    /// Verify that `CreateFileOptions::amiga_protection` /
+    /// `amiga_comment` round-trip through `create_file` → `sync_metadata`
+    /// → reopen → `peek_entry_block`.
+    #[test]
+    fn create_file_persists_amiga_protection_and_comment() {
+        use super::super::filesystem::CreateFileOptions;
+
+        let img = make_empty_floppy_image(1, "META");
+        let mut cur = Cursor::new(img);
+        let header_block;
+        {
+            let mut fs = AffsFilesystem::open(&mut cur, 0).expect("open");
+            let root = fs.root().expect("root");
+            let payload = b"protected".to_vec();
+            let mut src = std::io::Cursor::new(payload.clone());
+            let opts = CreateFileOptions {
+                // AmigaDOS protection: archive | hold | script | pure (high
+                // nibble) plus the standard r/w/e/d in the low nibble. The
+                // exact value doesn't matter — what matters is that it
+                // round-trips byte-for-byte through the header block.
+                amiga_protection: Some(0x0000_00A5),
+                amiga_comment: Some("a test filenote".to_string()),
+                ..Default::default()
+            };
+            let fe = fs
+                .create_file(&root, "secret", &mut src, payload.len() as u64, &opts)
+                .expect("create_file");
+            header_block = fe.location as u32;
+            fs.sync_metadata().expect("sync");
+        }
+        // Re-open and re-parse the header block.
+        let mut fs = AffsFilesystem::open(&mut cur, 0).expect("reopen");
+        let entry = fs.peek_entry_block(header_block).expect("peek");
+        assert_eq!(entry.name, "secret");
+        assert_eq!(entry.access, 0x0000_00A5);
+        assert_eq!(entry.comment, "a test filenote");
     }
 }

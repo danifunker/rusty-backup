@@ -272,11 +272,11 @@ state.
         "4x4OffRoadRacing", used 854 528 / 1 064 960 bytes, 7 root entries.
 - [x] Unit tests: empty FFS floppy open, empty-root list, compact-reader
       zero-fill for free blocks.
-- [ ] Amiga metadata in `FileEntry` (protection bits, comment). *Deferred
-      to Phase 3 — `FileEntry` is shared across 9+ filesystems and the
-      field additions are easier to land alongside write support so the
-      Edit UI can surface them too. `mtime` is already plumbed via
-      `FileEntry::modified` (AmigaDOS DateStamp → ISO-8601 string).*
+- [x] Amiga metadata in `FileEntry` (protection bits, comment).
+      `FileEntry::amiga_protection: Option<u32>` and
+      `FileEntry::amiga_comment: Option<String>` populated by AFFS and
+      PFS3 `list_directory`. All other constructors initialize them
+      to `None`.
 - [ ] Backup test on `DiskDoctor.adf` and `4x4OffRoadRacing_v1.00_1480.hdf`
       via the GUI / `run_backup` end-to-end.
 - [ ] Restore round-trip byte-equal.
@@ -314,9 +314,21 @@ state.
       if a single high-level edit needs to fail-and-revert without
       tearing down the cache. Add when the GUI's staged-edits "Apply
       Edits" flow surfaces a need.*
-- [ ] GUI staged-edits flow exercised on a real AFFS image.
-- [ ] Persist Amiga protection + comment on `create_file` (currently the
-      header is created with `access=0` → `----rwed`, no comment).
+- [x] GUI staged-edits flow exercised on a real AFFS image —
+      `tests/filesystem_e2e.rs::test_affs_staged_edits_round_trip`
+      builds a minimal blank FFS floppy, dispatches
+      `CreateDirectory` + `AddFile` + `DeleteEntry` through
+      `edit_queue::apply_edit`, syncs, reopens, and verifies the
+      writes landed. Also confirms `FileEntry::amiga_protection` round-trips
+      (default 0 = `----rwed`).
+- [x] Persist Amiga protection + comment on `create_file`.
+      `CreateFileOptions::amiga_protection` (`Option<u32>`) and
+      `amiga_comment` (`Option<String>`) feed
+      `AffsFilesystem::build_file_header_block`, which stamps the
+      protection word at offset 0x140 and the BSTR comment at offset
+      0x148. Round-trip verified by
+      `create_file_persists_amiga_protection_and_comment` —
+      access=0xA5 + "a test filenote" survive sync + reopen.
 
 ### Phase 4 — FFS Disk Validator
 - [x] `src/fs/affs_fsck.rs` with `check_affs` + `repair_affs`. BFS over

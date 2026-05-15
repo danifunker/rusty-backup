@@ -36,6 +36,13 @@ pub struct FileEntry {
     /// `HFS+ Private Data`. `read_file` / `write_file_to` follow the
     /// indirection automatically. `None` for ordinary files.
     pub link_target_cnid: Option<u64>,
+    /// AmigaDOS protection word (`access` field of an AFFS file header).
+    /// `0` displays as `----rwed`. Only set for AmigaDOS / Fast File
+    /// System entries.
+    pub amiga_protection: Option<u32>,
+    /// AmigaDOS filenote (comment), up to 79 bytes. Only set for
+    /// AmigaDOS / Fast File System entries; `None` outside that family.
+    pub amiga_comment: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -68,6 +75,8 @@ impl FileEntry {
             resource_fork_size: None,
             aux_type: None,
             link_target_cnid: None,
+            amiga_protection: None,
+            amiga_comment: None,
         }
     }
 
@@ -89,6 +98,8 @@ impl FileEntry {
             resource_fork_size: None,
             aux_type: None,
             link_target_cnid: None,
+            amiga_protection: None,
+            amiga_comment: None,
         }
     }
 
@@ -110,6 +121,8 @@ impl FileEntry {
             resource_fork_size: None,
             aux_type: None,
             link_target_cnid: None,
+            amiga_protection: None,
+            amiga_comment: None,
         }
     }
 
@@ -137,6 +150,8 @@ impl FileEntry {
             resource_fork_size: None,
             aux_type: None,
             link_target_cnid: None,
+            amiga_protection: None,
+            amiga_comment: None,
         }
     }
 
@@ -163,6 +178,8 @@ impl FileEntry {
             resource_fork_size: None,
             aux_type: None,
             link_target_cnid: None,
+            amiga_protection: None,
+            amiga_comment: None,
         }
     }
 

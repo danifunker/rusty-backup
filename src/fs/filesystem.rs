@@ -208,6 +208,13 @@ pub struct CreateFileOptions {
     pub aux_type: Option<u16>,
     /// Optional resource fork data source (HFS/HFS+ only).
     pub resource_fork: Option<ResourceForkSource>,
+    /// AmigaDOS protection bits (`access` word) for AFFS/FFS. The
+    /// on-disk default of 0 displays as `----rwed`. Ignored on
+    /// non-Amiga filesystems.
+    pub amiga_protection: Option<u32>,
+    /// AmigaDOS filenote (comment, up to 79 bytes). Ignored on
+    /// non-Amiga filesystems.
+    pub amiga_comment: Option<String>,
 }
 
 /// Options for creating a directory on an editable filesystem.

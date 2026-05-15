@@ -1754,6 +1754,165 @@ fn test_pfs3_staged_edits_round_trip() {
     );
 }
 
+/// Stage `CreateDirectory` + `AddFile` + `DeleteEntry` against a fresh
+/// blank AFFS floppy via the GUI-style dispatcher; round-trip through
+/// reopen to verify writes landed. Mirrors the PFS3 / SFS staged-edits
+/// tests so the BrowseView::apply_staged_edits codepath has explicit
+/// AFFS coverage.
+#[test]
+fn test_affs_staged_edits_round_trip() {
+    use byteorder::{BigEndian, ByteOrder};
+    use rusty_backup::fs::affs::AffsFilesystem;
+    use rusty_backup::fs::filesystem::EditableFilesystem;
+    use rusty_backup::model::edit_queue::{apply_edit, StagedEdit};
+
+    // Build a minimal empty FFS floppy: 1760 blocks, FFS variant, root at
+    // block 880, bitmap at 881, bootblocks @ 0–1.
+    fn make_blank_ffs(name: &str) -> Vec<u8> {
+        const BSIZE: usize = 512;
+        let total_blocks = 1760usize;
+        let mut img = vec![0u8; total_blocks * BSIZE];
+        // Boot block 0: 'DOS\1' (FFS).
+        img[0..4].copy_from_slice(b"DOS\x01");
+        // Root block at 880.
+        let root = 880usize;
+        let bm = 881usize;
+        let off = root * BSIZE;
+        BigEndian::write_u32(&mut img[off..off + 4], 2); // T_HEADER
+        BigEndian::write_u32(&mut img[off + 12..off + 16], 0x48); // hash table size
+        BigEndian::write_u32(&mut img[off + 0x138..off + 0x13C], 0xFFFFFFFF); // bm_flag = valid
+        BigEndian::write_u32(&mut img[off + 0x13C..off + 0x140], bm as u32);
+        // Volume name BSTR at 0x1B0.
+        let nb = name.as_bytes();
+        let n = nb.len().min(30);
+        img[off + 0x1B0] = n as u8;
+        img[off + 0x1B1..off + 0x1B1 + n].copy_from_slice(&nb[..n]);
+        BigEndian::write_u32(&mut img[off + 0x1FC..off + 0x200], 1u32); // ST_ROOT
+                                                                        // Normal checksum over root: word 5 = -(sum of others).
+        let mut sum: u32 = 0;
+        for w in 0..128 {
+            if w == 5 {
+                continue;
+            }
+            let v = BigEndian::read_u32(&img[off + w * 4..off + w * 4 + 4]);
+            sum = sum.wrapping_add(v);
+        }
+        BigEndian::write_u32(&mut img[off + 20..off + 24], 0u32.wrapping_sub(sum));
+        // Bitmap at 881: word 0 reserved for checksum. Set all 1758 data-area
+        // bits as free; clear bits for root + bitmap themselves.
+        let bm_off = bm * BSIZE;
+        // 55 u32 words after the checksum cover 1760 bits.
+        for w in 1..56 {
+            BigEndian::write_u32(&mut img[bm_off + w * 4..bm_off + w * 4 + 4], 0xFFFF_FFFF);
+        }
+        // Bitmap covers blocks 2..1760 (skip boot blocks). Bit b of word w
+        // is block_index = 2 + (w-1)*32 + b. Mark root (880) + bm (881) used.
+        for &block in &[root as u32, bm as u32] {
+            let block_in_bm = block - 2;
+            let word = 1 + (block_in_bm / 32) as usize;
+            let bit = block_in_bm % 32;
+            let mut v = BigEndian::read_u32(&img[bm_off + word * 4..bm_off + word * 4 + 4]);
+            v &= !(1u32 << bit);
+            BigEndian::write_u32(&mut img[bm_off + word * 4..bm_off + word * 4 + 4], v);
+        }
+        // Bitmap-block checksum: -(sum of all other words). (Word 0 is the
+        // checksum slot.)
+        let mut bsum: u32 = 0;
+        for w in 1..128 {
+            let v = BigEndian::read_u32(&img[bm_off + w * 4..bm_off + w * 4 + 4]);
+            bsum = bsum.wrapping_add(v);
+        }
+        BigEndian::write_u32(&mut img[bm_off..bm_off + 4], 0u32.wrapping_sub(bsum));
+        img
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let img_path = tmp.path().join("vol.adf");
+    std::fs::write(&img_path, make_blank_ffs("AffsEdit")).expect("write blank image");
+
+    let host_payload: &[u8] = b"hello via AFFS staged edits";
+    let host_file = tmp.path().join("hello.txt");
+    std::fs::write(&host_file, host_payload).expect("write host payload");
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&img_path)
+        .expect("open editable");
+    let mut efs: Box<dyn EditableFilesystem> =
+        Box::new(AffsFilesystem::open(file, 0).expect("open AffsFilesystem"));
+    let root = efs.root().expect("root");
+    let edits = vec![
+        StagedEdit::CreateDirectory {
+            parent: root.clone(),
+            name: "Sub".to_string(),
+        },
+        StagedEdit::AddFile {
+            parent: root.clone(),
+            name: "hello.txt".to_string(),
+            host_path: host_file.clone(),
+            size: host_payload.len() as u64,
+            prodos_type: None,
+            prodos_aux: None,
+            resource_fork: None,
+            hfs_type_override: None,
+            hfs_creator_override: None,
+        },
+    ];
+    for edit in &edits {
+        apply_edit(&mut *efs, edit).expect("apply staged edit");
+    }
+    efs.sync_metadata().expect("sync after batch 1");
+    drop(efs);
+
+    let f2 = std::fs::File::open(&img_path).expect("reopen");
+    let mut fs = AffsFilesystem::open(f2, 0).expect("reopen AffsFilesystem");
+    let r = fs.root().expect("root after");
+    let kids = fs.list_directory(&r).expect("list");
+    assert_eq!(kids.len(), 2, "got {:?}", kids);
+    let names: Vec<&str> = kids.iter().map(|c| c.name.as_str()).collect();
+    assert!(names.contains(&"Sub"));
+    assert!(names.contains(&"hello.txt"));
+    let hello = kids.iter().find(|c| c.name == "hello.txt").unwrap();
+    let data = fs.read_file(hello, host_payload.len()).expect("read");
+    assert_eq!(data, host_payload);
+    // amiga_protection is now plumbed via FileEntry — default access=0.
+    assert_eq!(hello.amiga_protection, Some(0));
+
+    let hello_fe = hello.clone();
+    let r_fe = r.clone();
+    drop(fs);
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&img_path)
+        .expect("reopen editable");
+    let mut efs: Box<dyn EditableFilesystem> =
+        Box::new(AffsFilesystem::open(file, 0).expect("open editable"));
+    apply_edit(
+        &mut *efs,
+        &StagedEdit::DeleteEntry {
+            parent: r_fe,
+            entry: hello_fe,
+        },
+    )
+    .expect("apply delete");
+    efs.sync_metadata().expect("sync after delete");
+    drop(efs);
+
+    let f3 = std::fs::File::open(&img_path).expect("reopen 3");
+    let mut fs = AffsFilesystem::open(f3, 0).expect("reopen AffsFilesystem 3");
+    let r = fs.root().expect("root after delete");
+    let kids = fs.list_directory(&r).expect("list after delete");
+    let names: Vec<&str> = kids.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["Sub"],
+        "hello.txt should be gone after staged delete"
+    );
+}
+
 /// Same end-to-end shape as the PFS3 test but for SFS — staged
 /// CreateDirectory + AddFile + DeleteEntry against a fresh blank
 /// SFS volume, dispatched through `edit_queue::apply_edit`.

@@ -522,6 +522,8 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
                         resource_fork_size: None,
                         aux_type: None,
                         link_target_cnid: None,
+                        amiga_protection: None,
+                        amiga_comment: None,
                     }
                 } else {
                     FileEntry {
@@ -541,6 +543,8 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
                         resource_fork_size: None,
                         aux_type: None,
                         link_target_cnid: None,
+                        amiga_protection: None,
+                        amiga_comment: None,
                     }
                 };
 
@@ -577,6 +581,8 @@ impl<R: Read + Seek + Send> Filesystem for ExfatFilesystem<R> {
             resource_fork_size: None,
             aux_type: None,
             link_target_cnid: None,
+            amiga_protection: None,
+            amiga_comment: None,
         })
     }
 
