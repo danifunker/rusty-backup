@@ -3930,9 +3930,14 @@ fn format_size_decimal(bytes: u64) -> String {
 }
 
 /// Check if a partition type supports filesystem checking (fsck).
-/// Currently only classic HFS (0xAF or APM "Apple_HFS").
+/// Classic HFS (0xAF or APM "Apple_HFS") and AmigaDOS OFS/FFS variants.
 fn is_checkable_type(ptype: u8, type_str: Option<&str>) -> bool {
-    ptype == 0xAF || matches!(type_str, Some("Apple_HFS"))
+    if ptype == 0xAF || matches!(type_str, Some("Apple_HFS")) {
+        return true;
+    }
+    type_str
+        .map(rusty_backup::fs::is_amiga_dos_type)
+        .unwrap_or(false)
 }
 
 /// Format an HFS allocation block size as "N KiB" when it's a whole

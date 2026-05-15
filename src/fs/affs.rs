@@ -790,6 +790,76 @@ impl<R: Read + Seek> AffsFilesystem<R> {
         self.total_blocks
     }
 
+    /// True if `block` is a bitmap page (root inline or extension).
+    /// Used by the fsck rebuild to ensure bitmap blocks remain marked
+    /// allocated even though they're never reached via directory walks.
+    pub fn bitmap_page_owns_block(&self, block: u32) -> bool {
+        self.bitmap_pages.iter().any(|&b| b == block)
+    }
+
+    /// Public accessor — same semantics as the private `block_is_allocated`.
+    pub fn block_is_allocated_public(&self, block: u32) -> bool {
+        self.block_is_allocated(block)
+    }
+
+    /// Read-only owned copy of the volume label, if set.
+    pub fn volume_label_owned(&self) -> Option<String> {
+        if self.root.disk_name.is_empty() {
+            None
+        } else {
+            Some(self.root.disk_name.clone())
+        }
+    }
+
+    /// Short label for the FS variant ("FFS", "OFS", "FFS Intl", …).
+    pub fn fs_type_label(&self) -> &'static str {
+        match (
+            self.ffs,
+            self.intl,
+            is_dircache_variant(self.variant),
+            is_lnfs_variant(self.variant),
+        ) {
+            (false, false, false, _) => "OFS",
+            (true, false, false, false) => "FFS",
+            (false, true, false, _) => "OFS Intl",
+            (true, true, false, false) => "FFS Intl",
+            (false, _, true, _) => "OFS DirCache",
+            (true, _, true, _) => "FFS DirCache",
+            (_, _, _, true) => "FFS Long Names",
+        }
+    }
+
+    /// Root block modify-date `(days, mins, ticks)` triplet.
+    pub fn root_modify_datestamp(&self) -> (i32, i32, i32) {
+        (
+            self.root.modify_days,
+            self.root.modify_mins,
+            self.root.modify_ticks,
+        )
+    }
+
+    /// Parse the directory/root block at `block` and return its hash table.
+    /// Used by fsck's BFS walk; surfaces parse errors so the validator can
+    /// flag corruption rather than crashing the walk.
+    pub fn peek_directory_hash_table(&mut self, block: u32) -> Result<Vec<u32>, FilesystemError> {
+        if block == self.root_block {
+            return Ok(self.root.hash_table.clone());
+        }
+        let entry = self.read_entry(block)?;
+        if entry.hash_table.is_empty() {
+            return Err(parse_err(format!(
+                "block {block}: expected a directory hash table but secType is {}",
+                entry.sec_type
+            )));
+        }
+        Ok(entry.hash_table)
+    }
+
+    /// Parse the entry block at `block` for fsck inspection.
+    pub fn peek_entry_block(&mut self, block: u32) -> Result<AffsEntry, FilesystemError> {
+        self.read_entry(block)
+    }
+
     pub fn allocated_blocks(&self) -> u32 {
         let mut count = 2u32; // boot blocks always allocated
         for block in 2..self.total_blocks {
@@ -1018,6 +1088,10 @@ impl<R: Read + Seek + Send> Filesystem for AffsFilesystem<R> {
             }
         }
         Ok(())
+    }
+
+    fn fsck(&mut self) -> Option<Result<super::fsck::FsckResult, FilesystemError>> {
+        Some(super::affs_fsck::check_affs(self))
     }
 }
 
@@ -1274,6 +1348,77 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AffsFilesystem<R> {
             }
         }
         Ok(free)
+    }
+
+    fn repair(&mut self) -> Result<super::fsck::RepairReport, FilesystemError> {
+        super::affs_fsck::repair_affs(self)
+    }
+}
+
+impl<R: Read + Write + Seek> AffsFilesystem<R> {
+    /// Rebuild every bitmap page from a flat `observed` byte array where
+    /// bit `i` set = block `(2 + i)` is allocated. Updates `self.bitmap`
+    /// in-memory and re-stages each bitmap page in the dirty cache with
+    /// a fresh checksum. Caller must `flush_metadata`/`sync_metadata` after.
+    pub fn rewrite_bitmap_from(&mut self, observed: &[u8]) -> Result<(), FilesystemError> {
+        let total = self.total_blocks;
+        let bits = total.saturating_sub(2) as usize;
+        // Update the flat in-memory bitmap to match `observed`, converting
+        // from "set = allocated" (observed convention) to "set = free"
+        // (on-disk AmigaDOS convention).
+        for byte_idx in 0..self.bitmap.len() {
+            self.bitmap[byte_idx] = 0;
+        }
+        for bit in 0..bits {
+            let alloc = (observed[bit / 8] >> (bit % 8)) & 1 != 0;
+            if !alloc {
+                self.bitmap[bit / 8] |= 1u8 << (bit % 8);
+            }
+        }
+
+        // Rewrite each bitmap page from scratch.
+        for (page_idx, &page_block) in self.bitmap_pages.clone().iter().enumerate() {
+            let mut buf = [0u8; BSIZE];
+            // 127 map words follow the checksum at slot 0.
+            for word_idx in 0..127 {
+                let mut w: u32 = 0;
+                for bit in 0..32 {
+                    let global = page_idx * 4064 + word_idx * 32 + bit;
+                    if global >= bits {
+                        break;
+                    }
+                    // On-disk: set bit = free. We flip the observed
+                    // allocation bit accordingly.
+                    let alloc = (observed[global / 8] >> (global % 8)) & 1 != 0;
+                    if !alloc {
+                        w |= 1u32 << bit;
+                    }
+                }
+                let slot = (word_idx + 1) * 4;
+                buf[slot..slot + 4].copy_from_slice(&w.to_be_bytes());
+            }
+            let sum = bitmap_checksum(&buf);
+            buf[0..4].copy_from_slice(&sum.to_be_bytes());
+            self.write_block_cached(page_block, buf);
+        }
+        Ok(())
+    }
+
+    /// Convenience: flush every dirty block to disk and clear the cache.
+    /// Same effect as `sync_metadata` but available without the
+    /// `EditableFilesystem` trait import at the call site.
+    pub fn flush_metadata(&mut self) -> Result<(), FilesystemError> {
+        let mut keys: Vec<u32> = self.dirty.keys().copied().collect();
+        keys.sort_unstable();
+        for block in keys {
+            let buf = self.dirty.get(&block).copied().unwrap();
+            let off = self.partition_offset + block as u64 * self.block_size;
+            self.reader.seek(SeekFrom::Start(off))?;
+            self.reader.write_all(&buf).map_err(FilesystemError::Io)?;
+        }
+        self.reader.flush().map_err(FilesystemError::Io)?;
+        self.dirty.clear();
+        Ok(())
     }
 }
 
@@ -1616,6 +1761,95 @@ mod tests {
         let root = fs.root().expect("root");
         let children = fs.list_directory(&root).expect("list");
         assert!(children.iter().all(|c| c.name != "big"));
+    }
+
+    #[test]
+    fn fsck_clean_volume_reports_no_errors() {
+        let img = make_empty_floppy_image(1, "Clean");
+        let mut cur = Cursor::new(img);
+        let mut fs = AffsFilesystem::open(&mut cur, 0).expect("open");
+        let res = fs.fsck().expect("fsck available").expect("fsck succeeded");
+        assert!(
+            res.errors.is_empty(),
+            "errors: {:?}",
+            res.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+        assert!(res.is_clean());
+        assert!(res.stats.directories_checked >= 1);
+    }
+
+    #[test]
+    fn fsck_detects_and_repairs_bitmap_mismatch() {
+        use super::super::filesystem::CreateFileOptions;
+
+        let img = make_empty_floppy_image(1, "BitmapCorrupt");
+        let mut cur = Cursor::new(img);
+
+        // Step 1: create a file to populate the bitmap, sync to disk.
+        {
+            let mut fs = AffsFilesystem::open(&mut cur, 0).expect("open");
+            let root = fs.root().expect("root");
+            let payload = vec![0xCDu8; 1500];
+            let mut src = std::io::Cursor::new(payload);
+            fs.create_file(&root, "data", &mut src, 1500, &CreateFileOptions::default())
+                .expect("create_file");
+            fs.sync_metadata().expect("sync");
+        }
+
+        // Step 2: corrupt the bitmap on disk. Bitmap page is block 881.
+        // Find the word covering some allocated bit and flip it to "free"
+        // (set the bit) — that simulates an unclean unmount.
+        {
+            // Flip word index 0 (covering blocks 2..=33) entirely to "all
+            // free" — any block actually allocated in that range becomes a
+            // bitmap mismatch.
+            let bm_off = 881 * BSIZE;
+            let inner = cur.get_mut();
+            let word_slot = bm_off + 4; // word_idx 0 + 1 (skip checksum)
+            inner[word_slot..word_slot + 4].copy_from_slice(&0xFFFFFFFFu32.to_be_bytes());
+            // Recompute checksum.
+            let bm = &mut inner[bm_off..bm_off + BSIZE];
+            let mut sum_buf = [0u8; BSIZE];
+            sum_buf.copy_from_slice(bm);
+            sum_buf[0..4].copy_from_slice(&[0u8; 4]);
+            let sum = bitmap_checksum(&sum_buf);
+            bm[0..4].copy_from_slice(&sum.to_be_bytes());
+        }
+
+        // Step 3: fsck should now report a repairable bitmap mismatch.
+        {
+            let mut fs = AffsFilesystem::open(&mut cur, 0).expect("reopen");
+            let res = fs.fsck().expect("fsck").expect("fsck ok");
+            assert!(!res.is_clean(), "fsck should detect bitmap mismatch");
+            assert!(
+                res.errors.iter().any(|e| e.code == "AffsBitmapMismatch"),
+                "expected AffsBitmapMismatch among {:?}",
+                res.errors.iter().map(|e| &e.code).collect::<Vec<_>>(),
+            );
+            assert!(res.repairable);
+        }
+
+        // Step 4: repair, then re-check — should be clean.
+        {
+            use super::super::filesystem::EditableFilesystem;
+            let mut fs = AffsFilesystem::open(&mut cur, 0).expect("reopen");
+            let report = fs.repair().expect("repair");
+            assert!(
+                !report.fixes_applied.is_empty(),
+                "expected at least one fix; applied={:?} failed={:?}",
+                report.fixes_applied,
+                report.fixes_failed,
+            );
+        }
+        {
+            let mut fs = AffsFilesystem::open(&mut cur, 0).expect("reopen after repair");
+            let res = fs.fsck().expect("fsck").expect("ok");
+            assert!(
+                res.is_clean(),
+                "fsck should be clean after repair; errors: {:?}",
+                res.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
+            );
+        }
     }
 
     #[test]
