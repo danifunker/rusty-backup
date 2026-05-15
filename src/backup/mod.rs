@@ -98,8 +98,9 @@ pub struct BackupConfig {
     pub size_policy: Option<SizePolicy>,
     /// Per-partition target sizes in bytes, keyed by partition index
     /// (single-file CHD only). Entries omitted from this map default to
-    /// the partition's source size. Non-trivial entries trigger
-    /// `single_file_chd::run`'s temp-file resize pipeline.
+    /// the partition's source size. Non-trivial entries route through
+    /// the staging path's per-partition resize machinery (see
+    /// `single_file_chd::run_via_staging`).
     pub partition_target_sizes: Option<Vec<(usize, u64)>>,
     /// When `true`, eligible HFS+/HFSX partitions are routed through the
     /// streamed defrag-clone path: the captured image is a fully repacked
@@ -108,6 +109,22 @@ pub struct BackupConfig {
     /// is on. Pre-flight via [`fs::can_defrag_clone_hfsplus`] gates each
     /// partition; failure aborts the whole backup with the reason.
     pub shrink_to_minimum: bool,
+    /// Pre-computed defragmented minimum sizes from the GUI's "Calc min"
+    /// affordance, keyed by partition index. When present, `analyze_partitions`
+    /// skips the (slow) per-partition defragmented-minimum walk and uses these
+    /// values directly. Sizes that are absent here still trigger the walk.
+    /// Empty / `None` = walk every eligible HFS+/HFS partition (the legacy
+    /// behavior).
+    pub precomputed_minimum_sizes: Option<Vec<(usize, u64)>>,
+    /// Per-partition opt-in for the HFS+ defrag-clone path. When `None`,
+    /// the legacy "global" behavior applies: every HFS+/HFSX partition
+    /// gets defrag-cloned whenever [`BackupConfig::shrink_to_minimum`] is
+    /// on. When `Some(set)`, only partitions whose index appears in
+    /// `set` are routed through the clone pipeline; the rest fall back to
+    /// the layout-preserving in-place trim path (same as
+    /// `shrink_to_minimum=false` for that partition). Drives the new
+    /// per-partition Defrag checkbox in the backup UI.
+    pub defrag_partition_indices: Option<std::collections::HashSet<usize>>,
 }
 
 /// Shared progress state between background backup thread and the GUI.
@@ -167,7 +184,7 @@ fn log(progress: &Arc<Mutex<BackupProgress>>, level: LogLevel, message: impl Int
     }
 }
 
-fn set_operation(progress: &Arc<Mutex<BackupProgress>>, op: impl Into<String>) {
+pub(super) fn set_operation(progress: &Arc<Mutex<BackupProgress>>, op: impl Into<String>) {
     if let Ok(mut p) = progress.lock() {
         p.operation = op.into();
     }
@@ -497,6 +514,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         &partitions,
         config.sector_by_sector,
         is_superfloppy,
+        config.precomputed_minimum_sizes.as_deref(),
         &progress,
     );
 
@@ -513,13 +531,24 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
     // reader; size vectors are overridden so progress accounting and the smart-
     // sizing log line reflect the post-clone footprint.
     let mut clone_target_sizes: Vec<Option<u64>> = vec![None; partitions.len()];
-    if config.shrink_to_minimum && !config.sector_by_sector && !single_file_chd_planned {
+    let mut clone_shapes: Vec<Option<fs::DefragCloneShape>> = vec![None; partitions.len()];
+    if config.shrink_to_minimum && !config.sector_by_sector {
         for (i, part) in partitions.iter().enumerate() {
             if part.is_extended_container || part.partition_type_byte == 0xEE {
                 continue;
             }
             if let Some(ref filter) = config.partition_filter {
                 if !filter.contains(&part.index) {
+                    continue;
+                }
+            }
+            // Per-partition Defrag opt-in (new GUI). When the caller supplies
+            // an explicit allowlist, only those partitions get the clone
+            // pipeline; the rest fall back to the layout-preserving in-place
+            // trim. When the field is `None`, behave as before (clone every
+            // HFS+/HFSX partition).
+            if let Some(set) = config.defrag_partition_indices.as_ref() {
+                if !set.contains(&part.index) {
                     continue;
                 }
             }
@@ -553,52 +582,71 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                     continue;
                 }
             };
-            // Pre-flight on a fresh reader.
+            // Pre-flight on a fresh reader. Returns the shape (Flat or
+            // Wrapped) that the streaming side should use.
             let pf = source
                 .get_ref()
                 .try_clone()
                 .map_err(|e| anyhow::anyhow!("clone source for shrink-preflight: {e}"))
                 .and_then(|c| {
                     let mut br = BufReader::new(c);
-                    fs::can_defrag_clone_hfsplus(&mut br, part.start_lba * 512)
+                    fs::defrag_clone_shape(&mut br, part.start_lba * 512)
                         .map_err(|reason| anyhow::anyhow!("{reason}"))
                 });
             match pf {
-                Ok(()) => {
+                Ok(shape) => {
+                    let shape_label = match shape {
+                        fs::DefragCloneShape::Flat => "flat HFS+",
+                        fs::DefragCloneShape::Wrapped => "wrapped HFS+ (HFS shell preserved)",
+                    };
                     log(
                         &progress,
                         LogLevel::Info,
                         format!(
-                            "partition-{}: streaming defragmented HFS+ — \
+                            "partition-{}: streaming defragmented {} — \
                              source {} -> {}",
                             part.index,
+                            shape_label,
                             partition::format_size(part.size_bytes),
                             partition::format_size(target),
                         ),
                     );
                     clone_target_sizes[i] = Some(target);
+                    clone_shapes[i] = Some(shape);
                     // Override sizing: the streamed image flows through the
                     // compressor verbatim at `target` bytes. `compact_sizes`
                     // is left as whatever `analyze_partitions` produced — the
                     // per-partition loop dispatches on `clone_target_sizes`
                     // first, so neither the compacted nor the trim branch
-                    // runs for cloned partitions.
+                    // runs for cloned partitions. The single-file CHD path
+                    // reads `clone_target_sizes` directly and doesn't consume
+                    // these size vectors, so the override is harmless there.
                     effective_sizes[i] = target;
                     stream_sizes[i] = target;
                     is_layout_preserving_flags[i] = false;
                 }
                 Err(e) => {
-                    bail!("Aborting backup: partition-{}: {e}", part.index);
+                    // Pre-flight refused this partition (typically embedded
+                    // HFS+ inside an HFS wrapper, or a dirty journal). Skip
+                    // the clone for this partition only — it'll fall back to
+                    // the regular layout-preserving / packed-padded path at
+                    // its original size, and other partitions can still be
+                    // cloned. The user gets a smaller-than-no-shrink image
+                    // (any cloneable partitions still shrink) without losing
+                    // the whole backup to one un-cloneable volume.
+                    log(
+                        &progress,
+                        LogLevel::Warning,
+                        format!(
+                            "partition-{}: skipping shrink-to-minimum — {e}. \
+                             This partition keeps its original size; other \
+                             partitions are unaffected.",
+                            part.index,
+                        ),
+                    );
                 }
             }
         }
-    } else if config.shrink_to_minimum && single_file_chd_planned {
-        log(
-            &progress,
-            LogLevel::Warning,
-            "shrink-to-minimum is not supported with single-file CHD output; \
-             ignoring the flag.",
-        );
     } else if config.shrink_to_minimum && config.sector_by_sector {
         log(
             &progress,
@@ -625,6 +673,8 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             &backup_folder,
             &minimum_sizes,
             &defragmented_min_sizes,
+            &clone_target_sizes,
+            &clone_shapes,
         );
     }
     // CHD/DVD selected on a source single_file_chd can't handle (only
@@ -861,22 +911,48 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         );
 
         let clone_target = clone_target_sizes[part_idx];
+        let clone_shape = clone_shapes[part_idx];
+        // When the output is a single file (no user-selected split),
+        // build a shared hasher and tee it through the compressor so
+        // we can read the digest back without a post-write file
+        // re-read. The compressors honour the hasher only when a
+        // single output file is produced (zstd / raw / vhd with
+        // split_size = None). For CHD/DVD outputs, or any split
+        // output, the hasher stays empty and the fall-back
+        // compute_checksum read pass handles each file.
+        let output_hasher: Option<crate::rbformats::OutputHasherHandle> = if split_bytes.is_none() {
+            Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
+                verify::RunningHasher::new(config.checksum),
+            ))))
+        } else {
+            None
+        };
         let compressed_files = if let Some(target_size) = clone_target {
             // Phase-8 / Step-22f: stream a defragmented HFS+ clone directly
             // into the compressor via a bounded channel pipe. The producer
             // thread owns its own `HfsPlusFilesystem` over a cloned source
             // file handle; the consumer (this thread) is the compressor.
             // Errors from either side propagate through the join.
+            //
+            // For wrapped HFS+ the producer instead drives
+            // `stream_wrapped_defragmented_hfsplus`, which rebuilds the
+            // outer HFS shell around the shrunken inner volume.
+            let shape = clone_shape.unwrap_or(fs::DefragCloneShape::Flat);
             log(
                 &progress,
                 LogLevel::Info,
                 format!(
-                    "Defrag-cloning {} into {}",
+                    "Defrag-cloning {} into {} ({})",
                     part_label,
-                    partition::format_size(target_size)
+                    partition::format_size(target_size),
+                    match shape {
+                        fs::DefragCloneShape::Flat => "flat HFS+",
+                        fs::DefragCloneShape::Wrapped => "wrapped HFS+",
+                    },
                 ),
             );
             let part_offset = part.start_lba * 512;
+            let part_size = part.size_bytes;
             let producer_clone = source
                 .get_ref()
                 .try_clone()
@@ -885,15 +961,52 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             let progress_log_prod = Arc::clone(&progress);
             let producer =
                 std::thread::spawn(move || -> Result<fs::hfsplus_defrag::DefragReport> {
-                    let br = BufReader::new(producer_clone);
-                    let mut hfs = fs::hfsplus::HfsPlusFilesystem::open(br, part_offset)
-                        .context("open source HFS+ for defrag-clone")?;
-                    let report = fs::hfsplus_defrag::stream_defragmented_hfsplus(
-                        &mut hfs,
-                        target_size,
-                        &mut writer,
-                    )
-                    .context("stream_defragmented_hfsplus")?;
+                    let report = match shape {
+                        fs::DefragCloneShape::Flat => {
+                            let br = BufReader::new(producer_clone);
+                            let mut hfs = fs::hfsplus::HfsPlusFilesystem::open(br, part_offset)
+                                .context("open source HFS+ for defrag-clone")?;
+                            fs::hfsplus_defrag::stream_defragmented_hfsplus(
+                                &mut hfs,
+                                target_size,
+                                &mut writer,
+                                None,
+                            )
+                            .context("stream_defragmented_hfsplus")?
+                        }
+                        fs::DefragCloneShape::Wrapped => {
+                            // Positioned-read MDB detection — avoids the
+                            // shared-fd-offset race when producer threads
+                            // run concurrently across partitions.
+                            let info = fs::hfsplus_wrapper_clone::detect_wrapped_hfsplus_at(
+                                &producer_clone,
+                                part_offset,
+                                part_size,
+                            )
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("wrapped HFS+ detection failed at backup time")
+                            })?;
+                            let mut br = BufReader::new(producer_clone);
+                            // The clone target is a partition-level size;
+                            // back-derive the inner target by stripping the
+                            // wrapper overhead (alloc-block start + pre-embed
+                            // wrapper alloc blocks + 1024 alt-MDB tail).
+                            let outer_overhead = (info.al_block_start_sector as u64) * 512
+                                + (info.embed_start_block as u64) * (info.al_block_size as u64)
+                                + 1024;
+                            let inner_target = target_size.saturating_sub(outer_overhead);
+                            let plan =
+                                fs::hfsplus_wrapper_clone::plan_wrapped_clone(&info, inner_target)
+                                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                            fs::hfsplus_wrapper_clone::stream_wrapped_defragmented_hfsplus(
+                                &mut br,
+                                &plan,
+                                &mut writer,
+                                None,
+                            )
+                            .map_err(|e| anyhow::anyhow!("{e}"))?
+                        }
+                    };
                     log(
                         &progress_log_prod,
                         LogLevel::Info,
@@ -910,7 +1023,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                     Ok(report)
                 });
             let progress_log = Arc::clone(&progress);
-            let compress_result = crate::rbformats::compress_partition(
+            let compress_result = crate::rbformats::compress_partition_hashed(
                 &mut reader,
                 &output_base,
                 effective_compression,
@@ -918,15 +1031,16 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 split_bytes,
                 false, // streamed image is already packed; don't skip zeros
                 config.chd_options.clone(),
-                |bytes_read| {
+                output_hasher.clone(),
+                &mut |bytes_read| {
                     set_progress_bytes(
                         &progress_clone,
                         base_bytes + bytes_read,
                         total_stream_bytes,
                     );
                 },
-                || is_cancelled(&progress_clone),
-                |msg| log(&progress_log, LogLevel::Info, msg),
+                &|| is_cancelled(&progress_clone),
+                &mut |msg| log(&progress_log, LogLevel::Info, msg),
             );
             // Always join the producer so its errors surface even if the
             // consumer succeeded (e.g. partial pipe).
@@ -968,7 +1082,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 format!("Calling compress_partition for compacted {}", part_label),
             );
             let progress_log = Arc::clone(&progress);
-            crate::rbformats::compress_partition(
+            crate::rbformats::compress_partition_hashed(
                 &mut limited,
                 &output_base,
                 effective_compression,
@@ -976,15 +1090,16 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 split_bytes,
                 false, // compacted image has no wasted space, don't skip zeros
                 config.chd_options.clone(),
-                |bytes_read| {
+                output_hasher.clone(),
+                &mut |bytes_read| {
                     set_progress_bytes(
                         &progress_clone,
                         base_bytes + bytes_read,
                         total_stream_bytes,
                     );
                 },
-                || is_cancelled(&progress_clone),
-                |msg| log(&progress_log, LogLevel::Info, msg),
+                &|| is_cancelled(&progress_clone),
+                &mut |msg| log(&progress_log, LogLevel::Info, msg),
             )
             .with_context(|| format!("failed to compress {part_label}"))?
         } else {
@@ -1015,7 +1130,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 format!("Calling compress_partition for trim-based {}", part_label),
             );
             let progress_log = Arc::clone(&progress);
-            crate::rbformats::compress_partition(
+            crate::rbformats::compress_partition_hashed(
                 &mut limited,
                 &output_base,
                 effective_compression,
@@ -1023,15 +1138,16 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 split_bytes,
                 !config.sector_by_sector,
                 config.chd_options.clone(),
-                |bytes_read| {
+                output_hasher.clone(),
+                &mut |bytes_read| {
                     set_progress_bytes(
                         &progress_clone,
                         base_bytes + bytes_read,
                         total_stream_bytes,
                     );
                 },
-                || is_cancelled(&progress_clone),
-                |msg| log(&progress_log, LogLevel::Info, msg),
+                &|| is_cancelled(&progress_clone),
+                &mut |msg| log(&progress_log, LogLevel::Info, msg),
             )
             .with_context(|| format!("failed to compress {part_label}"))?
         };
@@ -1074,12 +1190,24 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             compressed_files
         };
 
-        // Compute checksums for each output file
+        // Compute checksums for each output file. When the compressor
+        // tee'd a hasher during write (single non-split output, format
+        // supports it), finalise that hasher and reuse the digest —
+        // skips a multi-GB re-read of the just-written file. Falls
+        // back to the post-write hash pass for split outputs, CHD,
+        // or any other case the compressor didn't honour the hasher.
+        let tee_digest = output_hasher
+            .as_ref()
+            .map(verify::finalize_shared_hasher)
+            .filter(|s| !s.is_empty());
         let mut all_checksums = Vec::new();
-        for file_name in &compressed_files {
+        for (i, file_name) in compressed_files.iter().enumerate() {
             let file_path = backup_folder.join(file_name);
-            let checksum = verify::compute_checksum(&file_path, config.checksum)
-                .with_context(|| format!("failed to checksum {file_name}"))?;
+            let checksum = match (&tee_digest, i, compressed_files.len()) {
+                (Some(d), 0, 1) => d.clone(),
+                _ => verify::compute_checksum(&file_path, config.checksum)
+                    .with_context(|| format!("failed to checksum {file_name}"))?,
+            };
             verify::write_checksum_file(&checksum, &file_path, config.checksum)
                 .with_context(|| format!("failed to write checksum for {file_name}"))?;
             all_checksums.push(checksum);
@@ -1207,12 +1335,10 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
 
 /// Single-file CHD backup path. Synthesises a whole-disk image into one
 /// CHD container (chdman/MAME compatible) and writes a `single-file-chd`
-/// `metadata.json` describing the byte ranges inside it.
-///
-/// When the user picks a non-Original `size_policy`,
-/// `single_file_chd::run` takes the temp-file resize pipeline (Stage 4b,
-/// Approach A); otherwise the cheaper `DiskImageStream` path produces a
-/// CHD whose layout matches the source disk byte-for-byte.
+/// `metadata.json` describing the byte ranges inside it. Always routes
+/// through `single_file_chd::run_via_staging`, which stages each
+/// partition's bytes as zstd into a temp dir, then folds the staging
+/// files into the final CHD without a whole-disk scratch image.
 #[allow(clippy::too_many_arguments)] // intentional — pulls run_backup's locals
 fn run_single_file_chd_path(
     config: &BackupConfig,
@@ -1226,6 +1352,8 @@ fn run_single_file_chd_path(
     backup_folder: &std::path::Path,
     minimum_sizes: &[Option<u64>],
     defragmented_min_sizes: &[Option<u64>],
+    clone_target_sizes: &[Option<u64>],
+    clone_shapes: &[Option<fs::DefragCloneShape>],
 ) -> Result<()> {
     set_operation(progress, "Building disk-image stream...");
     log(
@@ -1251,6 +1379,43 @@ fn run_single_file_chd_path(
         .unwrap_or("disk");
     let output_base = backup_folder.join(output_stem);
 
+    // Merge user-supplied per-partition target sizes with HFS+ defrag-clone
+    // targets derived from `shrink_to_minimum`. User-supplied entries take
+    // precedence on conflict; clone targets fill in HFS+/HFSX partitions that
+    // the user left at "Original". `hfsplus_clone_targets` flags which of the
+    // resulting resize entries should be produced via
+    // `stream_defragmented_hfsplus` instead of in-place resize.
+    let mut merged_resize: Vec<(usize, u64)> =
+        config.partition_target_sizes.clone().unwrap_or_default();
+    let mut hfsplus_clone_targets: Vec<(usize, u64, fs::DefragCloneShape)> = Vec::new();
+    for (i, part) in partitions.iter().enumerate() {
+        if let Some(target) = clone_target_sizes[i] {
+            let already_set = merged_resize.iter().any(|(idx, _)| *idx == part.index);
+            if !already_set {
+                merged_resize.push((part.index, target));
+            }
+            // Even when the user picked a custom size, record the clone
+            // target so the staging path knows this partition wants a
+            // clone stream. If user_size != clone_target the user wins
+            // for the resize plan but we still need to clone — the
+            // cloned HFS+ volume will be sized to the entry in
+            // `merged_resize`.
+            let shape = clone_shapes[i].unwrap_or(fs::DefragCloneShape::Flat);
+            hfsplus_clone_targets.push((part.index, target, shape));
+        }
+    }
+    let resize_targets_slice: Option<&[(usize, u64)]> = if merged_resize.is_empty() {
+        None
+    } else {
+        Some(merged_resize.as_slice())
+    };
+    let clone_targets_slice: Option<&[(usize, u64, fs::DefragCloneShape)]> =
+        if hfsplus_clone_targets.is_empty() {
+            None
+        } else {
+            Some(hfsplus_clone_targets.as_slice())
+        };
+
     let inputs = single_file_chd::SingleFileChdInputs {
         source_file: source.get_ref(),
         source_size,
@@ -1262,15 +1427,29 @@ fn run_single_file_chd_path(
         chd_options: config.chd_options.clone(),
         is_dvd: matches!(config.compression, CompressionType::Dvd),
         output_base: &output_base,
-        resize_targets: config.partition_target_sizes.as_deref(),
+        resize_targets: resize_targets_slice,
+        hfsplus_clone_targets: clone_targets_slice,
         alignment_sectors: alignment.alignment_sectors,
         checksum_type: config.checksum,
     };
 
+    // Compute the shrunken-envelope total BEFORE bytes flow so the GUI
+    // progress bar reads "0 / 53 GiB" (not "0 / 58 GiB") on resize-active
+    // backups. `build_resize_plans` is a pure-arithmetic plan derived from
+    // the already-merged resize targets; it doesn't touch the device.
+    let envelope_total = match single_file_chd::build_resize_plans(&inputs) {
+        Ok(Some(plans)) => single_file_chd::compute_resized_envelope(
+            &plans,
+            alignment.alignment_sectors,
+            source_size,
+            table,
+        ),
+        _ => source_size,
+    };
     {
         let mut p = progress.lock().expect("backup progress mutex poisoned");
-        p.total_bytes = source_size;
-        p.full_size_bytes = source_size;
+        p.total_bytes = envelope_total;
+        p.full_size_bytes = envelope_total;
         p.current_bytes = 0;
     }
 
@@ -1314,13 +1493,65 @@ fn run_single_file_chd_path(
         }
     };
 
-    let result = single_file_chd::run(
+    // Install a thread-local progress sink so the HFS+ defrag-clone
+    // pipeline can pipe its [defrag-build] tick messages into the GUI
+    // log queue (in addition to stderr). Cleared after
+    // `single_file_chd::run_via_staging` returns. The sink closure owns
+    // its own `Arc<Mutex<BackupProgress>>` clone so it stays 'static +
+    // Send (a requirement for the thread-local Box-erased fn type).
+    let progress_for_sink = progress.clone();
+    fs::hfsplus_defrag::set_progress_sink(Some(Box::new(move |msg: &str| {
+        if let Ok(mut p) = progress_for_sink.lock() {
+            p.log_messages.push_back(LogMessage {
+                level: LogLevel::Info,
+                message: msg.to_string(),
+            });
+        }
+    })));
+
+    // Route to the new two-phase staging path when its gates accept the
+    // current inputs (MBR/GPT, no HFS+ clone targets, no FS-level
+    // resize). Otherwise fall back to the legacy direct-stream /
+    // scratch-tempfile path. The router lives here rather than inside
+    // `single_file_chd` so the log line surfaces in the GUI before any
+    // bytes flow.
+    // `phase_cb` lets the staging path swap the top-bar operation
+    // label as each stage starts ("Staging partition-N", "Assembling
+    // CHD", ...) — without it the user would see "Building disk-image
+    // stream..." for the entire multi-hour run.
+    let progress_for_phase = progress.clone();
+    let mut phase_cb = move |label: &str| {
+        if let Ok(mut p) = progress_for_phase.lock() {
+            p.operation = label.to_string();
+        }
+    };
+    // Send-able sink for HFS+ [defrag-build] ticks: the producer
+    // thread spawned by the staging path can clone this Arc and
+    // install it as its own thread-local sink, so catalog-walk
+    // progress reaches the GUI log even though the work runs on a
+    // worker thread.
+    let progress_for_defrag = progress.clone();
+    let defrag_log_sink: std::sync::Arc<dyn Fn(&str) + Send + Sync> =
+        std::sync::Arc::new(move |msg: &str| {
+            if let Ok(mut p) = progress_for_defrag.lock() {
+                p.log_messages.push_back(LogMessage {
+                    level: LogLevel::Info,
+                    message: msg.to_string(),
+                });
+            }
+        });
+    let result = single_file_chd::run_via_staging(
         inputs,
         &mut progress_cb,
         &cancel_check,
         &mut log_cb,
         &mut checksum_phase_cb,
-    )?;
+        &mut phase_cb,
+        Some(defrag_log_sink),
+    );
+
+    fs::hfsplus_defrag::set_progress_sink(None);
+    let result = result?;
 
     // Build per-partition metadata. The byte range inside the CHD lives in
     // `result.partition_ranges`; we cross-reference each partition's

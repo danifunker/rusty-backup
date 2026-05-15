@@ -20,6 +20,10 @@ pub struct MinSizeStatus {
     pub partition_index: usize,
     /// Latest phase reported by `partition_minimum_size` (e.g. "Opening filesystem...").
     pub phase: String,
+    /// Append-only log of every phase emitted by the worker. The GUI poll loop
+    /// drains this each frame so transient diagnostic lines (e.g. wrapper-info
+    /// dumps) aren't lost when multiple progress() calls land between polls.
+    pub phase_log: Vec<String>,
     pub finished: bool,
     /// In-place trim point (no data moved). `Some(bytes)` on successful computation;
     /// `None` if the FS could not be opened.
@@ -28,6 +32,10 @@ pub struct MinSizeStatus {
     /// Equals `result` for filesystems without a clone path; only meaningfully
     /// smaller for HFS+ on fragmented volumes.
     pub defragmented_min: Option<u64>,
+    /// Percent of files with data forks that have more than one extent.
+    /// `None` when the filesystem doesn't expose fragmentation (FAT/NTFS/exFAT)
+    /// or when the volume has no files with data forks.
+    pub fragmentation_percent: Option<f32>,
     pub error: Option<String>,
 }
 
@@ -36,9 +44,11 @@ impl MinSizeStatus {
         Self {
             partition_index,
             phase: "Starting...".to_string(),
+            phase_log: Vec::new(),
             finished: false,
             result: None,
             defragmented_min: None,
+            fragmentation_percent: None,
             error: None,
         }
     }
@@ -77,6 +87,7 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
         let progress = move |phase: &str| {
             if let Ok(mut s) = progress_status.lock() {
                 s.phase = phase.to_string();
+                s.phase_log.push(phase.to_string());
             }
         };
 
@@ -85,6 +96,21 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
                 file,
                 use_sector_aligned,
             } => {
+                // Race-safe wrapper probe: `try_clone` on Unix is `dup()`,
+                // which shares the kernel seek offset across workers, so a
+                // concurrent `seek + read` from another partition's worker
+                // can clobber a plain `detect_wrapped_hfsplus` probe and
+                // leak the wrong partition's wrapper params. Read the MDB
+                // here via positioned I/O on the original handle (which
+                // doesn't touch the shared cursor) and pass the parsed
+                // info into `partition_minimum_size` as a hint so it skips
+                // its own probe.
+                progress("Probing for HFS wrapper...");
+                let wrapper_hint = fs::hfsplus_wrapper_clone::detect_wrapped_hfsplus_at(
+                    &file,
+                    req.partition_offset,
+                    u64::MAX,
+                );
                 let clone = match file.try_clone() {
                     Ok(f) => f,
                     Err(e) => {
@@ -103,6 +129,7 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
                         req.partition_type_string.as_deref(),
                         req.partition_size,
                         true,
+                        wrapper_hint,
                         &progress,
                     )
                 } else {
@@ -113,6 +140,7 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
                         req.partition_type_string.as_deref(),
                         req.partition_size,
                         true,
+                        wrapper_hint,
                         &progress,
                     )
                 }
@@ -125,6 +153,7 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
                     req.partition_type_string.as_deref(),
                     req.partition_size,
                     true,
+                    None,
                     &progress,
                 ),
                 Err(e) => {
@@ -142,9 +171,11 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
                 MinimumResult::Computed {
                     in_place,
                     defragmented,
+                    fragmentation_percent,
                 } => {
                     s.result = in_place;
                     s.defragmented_min = defragmented;
+                    s.fragmentation_percent = fragmentation_percent;
                 }
                 MinimumResult::Deferred { fs_name } => {
                     s.error = Some(format!(

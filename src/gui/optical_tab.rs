@@ -716,6 +716,7 @@ impl OpticalTab {
                 progress_state.operation = p.operation.clone();
                 progress_state.current_bytes = p.current_bytes;
                 progress_state.total_bytes = p.total_bytes;
+                progress_state.record_sample();
 
                 if p.finished {
                     if let Some(err) = &p.error {
@@ -748,6 +749,7 @@ impl OpticalTab {
                 progress_state.operation = p.operation.clone();
                 progress_state.current_bytes = p.current_bytes;
                 progress_state.total_bytes = p.total_bytes;
+                progress_state.record_sample();
 
                 if p.finished {
                     if let Some(err) = &p.error {

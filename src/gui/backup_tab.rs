@@ -45,6 +45,23 @@ pub struct BackupTab {
     selected_partitions: HashSet<usize>,
     /// Minimum sizes per partition (indexed by partition index), from filesystem analysis
     partition_min_sizes: std::collections::HashMap<usize, u64>,
+    /// Defragmented-minimum sizes per partition (HFS+/HFSX only — the smaller
+    /// value the clone pipeline can achieve when defrag is opted in).
+    partition_defrag_min_sizes: std::collections::HashMap<usize, u64>,
+    /// Fragmentation percent per partition (HFS+/HFS, populated after the
+    /// min-size walk completes). Drives the auto-check threshold on the
+    /// per-partition Defrag checkbox.
+    partition_fragmentation: std::collections::HashMap<usize, f32>,
+    /// User-controlled per-partition Defrag toggle. Auto-checked when
+    /// fragmentation >= 90%. Only meaningful for filesystems with a
+    /// defragmenting writer (HFS+/HFSX); the disabled checkbox shown on
+    /// other layout-preserving filesystems writes here but the backup
+    /// engine ignores it (until those FSes get a real clone pipeline).
+    partition_defrag_enabled: std::collections::HashMap<usize, bool>,
+    /// Tracks which partition indices have already had their default
+    /// (frag >= 90%) auto-applied. Prevents re-overriding the user's
+    /// explicit toggle when min-size is re-run.
+    partition_defrag_default_applied: std::collections::HashSet<usize>,
     /// Partitions whose minimum size requires an expensive volume walk; the
     /// VHD-export popup surfaces a "Calc min" button per index.
     deferred_min_sizes: std::collections::HashMap<usize, &'static str>,
@@ -53,6 +70,9 @@ pub struct BackupTab {
         usize,
         Arc<Mutex<rusty_backup::model::min_size_runner::MinSizeStatus>>,
     >,
+    /// Last phase string logged for each in-flight min-size calc, so we
+    /// can emit a log line on each transition without spamming.
+    last_logged_min_size_phase: std::collections::HashMap<usize, String>,
     /// Open file handle for the source (kept alive so min-size workers can clone it).
     source_file: Option<Arc<File>>,
     /// Human-readable description of the partition table type for the
@@ -137,8 +157,13 @@ impl Default for BackupTab {
             source_partitions: Vec::new(),
             selected_partitions: HashSet::new(),
             partition_min_sizes: std::collections::HashMap::new(),
+            partition_defrag_min_sizes: std::collections::HashMap::new(),
+            partition_fragmentation: std::collections::HashMap::new(),
+            partition_defrag_enabled: std::collections::HashMap::new(),
+            partition_defrag_default_applied: std::collections::HashSet::new(),
             deferred_min_sizes: std::collections::HashMap::new(),
             pending_min_size_calcs: std::collections::HashMap::new(),
+            last_logged_min_size_phase: std::collections::HashMap::new(),
             source_file: None,
             source_partition_table_desc: None,
             pending_backup_after_min_sizes: false,
@@ -294,9 +319,10 @@ impl BackupTab {
                 });
             });
             let mut min_size_calc_request: Option<usize> = None;
+            let mut defrag_toggles: Vec<(usize, bool)> = Vec::new();
             ui.add_enabled_ui(controls_enabled, |ui| {
                 egui::Grid::new("backup_partitions_grid")
-                    .num_columns(5)
+                    .num_columns(7)
                     .spacing([12.0, 4.0])
                     .show(ui, |ui| {
                         ui.label(egui::RichText::new("Include").strong());
@@ -304,6 +330,17 @@ impl BackupTab {
                         ui.label(egui::RichText::new("Type").strong());
                         ui.label(egui::RichText::new("Size").strong());
                         ui.label(egui::RichText::new("Min Size").strong());
+                        ui.label(egui::RichText::new("Frag.").strong())
+                            .on_hover_text("Percent of files with data in more than one extent");
+                        ui.label(egui::RichText::new("Compact").strong())
+                            .on_hover_text(
+                                "Compact Space re-emits every allocated fork back-to-back, \
+                                 closing the holes between files and producing a smaller backup. \
+                                 Drastically increases backup time — recommended only when the \
+                                 Min Size column shows meaningful savings vs. the in-place trim. \
+                                 Available for HFS+/HFSX today; other layout-preserving \
+                                 filesystems show the toggle as not implemented.",
+                            );
                         ui.end_row();
 
                         for part in &self.source_partitions {
@@ -322,14 +359,14 @@ impl BackupTab {
                             ui.label(&part.type_name);
                             ui.label(partition::format_size(part.size_bytes));
 
-                            // Min-size cell: value, spinner, "Calc min" button,
+                            // Min-size cell: value (toggle-aware), spinner, "Calc min" button,
                             // or blank.
-                            if let Some(min) = self
-                                .partition_min_sizes
-                                .get(&part.index)
-                                .copied()
-                                .filter(|&sz| sz < part.size_bytes)
-                            {
+                            let effective = self.effective_min_size(
+                                part.index,
+                                part.partition_type_byte,
+                                part.partition_type_string.as_deref(),
+                            );
+                            if let Some(min) = effective.filter(|&sz| sz < part.size_bytes) {
                                 ui.label(partition::format_size(min));
                             } else if let Some(pending) =
                                 self.pending_min_size_calcs.get(&part.index)
@@ -352,10 +389,56 @@ impl BackupTab {
                             } else {
                                 ui.label("");
                             }
+
+                            // Fragmentation %
+                            match self.partition_fragmentation.get(&part.index).copied() {
+                                Some(pct) => {
+                                    ui.label(format!("{:.0}%", pct));
+                                }
+                                None => {
+                                    ui.label("");
+                                }
+                            }
+
+                            // Defrag checkbox: only shown for layout-preserving
+                            // filesystems where defrag would matter; disabled
+                            // (with "not implemented" tooltip) when the FS
+                            // doesn't have a clone pipeline yet.
+                            let is_layout = fs::is_layout_preserving_fs(
+                                part.partition_type_byte,
+                                part.partition_type_string.as_deref(),
+                            );
+                            let has_clone = fs::has_defragmenting_writer(
+                                part.partition_type_byte,
+                                part.partition_type_string.as_deref(),
+                            );
+                            if is_layout {
+                                let mut enabled = self
+                                    .partition_defrag_enabled
+                                    .get(&part.index)
+                                    .copied()
+                                    .unwrap_or(false);
+                                let resp = ui
+                                    .add_enabled(has_clone, egui::Checkbox::new(&mut enabled, ""));
+                                if !has_clone {
+                                    resp.on_hover_text(
+                                        "Compact Space not yet implemented for this filesystem",
+                                    );
+                                } else if resp.changed() {
+                                    defrag_toggles.push((part.index, enabled));
+                                }
+                            } else {
+                                // FAT/NTFS/exFAT: the packing CompactReader
+                                // already emits a defragmented layout.
+                                ui.label("");
+                            }
                             ui.end_row();
                         }
                     });
             });
+            for (idx, val) in defrag_toggles {
+                self.partition_defrag_enabled.insert(idx, val);
+            }
             if let Some(idx) = min_size_calc_request {
                 self.start_min_size_calc(idx, ctx);
             }
@@ -810,6 +893,7 @@ impl BackupTab {
         progress_state.current_bytes = status.current_bytes;
         progress_state.total_bytes = status.total_bytes;
         progress_state.full_size_bytes = 0;
+        progress_state.record_sample();
 
         if status.finished {
             if let Some(err) = &status.error {
@@ -919,7 +1003,112 @@ impl BackupTab {
 
     /// Poll all pending min-size workers; on completion, move results into
     /// `partition_min_sizes` and refresh any matching `vhd_partition_configs`.
+    /// Effective per-partition min size, honouring the per-partition Defrag
+    /// checkbox: when defrag is enabled AND this filesystem has a
+    /// defragmenting writer, prefer the (smaller) defragmented floor;
+    /// otherwise use the in-place trim point. Falls back through.
+    fn effective_min_size(
+        &self,
+        idx: usize,
+        partition_type: u8,
+        partition_type_string: Option<&str>,
+    ) -> Option<u64> {
+        let in_place = self.partition_min_sizes.get(&idx).copied();
+        let defrag = self.partition_defrag_min_sizes.get(&idx).copied();
+        let has_clone = fs::has_defragmenting_writer(partition_type, partition_type_string);
+        let enabled = self
+            .partition_defrag_enabled
+            .get(&idx)
+            .copied()
+            .unwrap_or(false);
+        if has_clone && enabled {
+            defrag.or(in_place)
+        } else {
+            in_place.or(defrag)
+        }
+    }
+
+    /// Common post-min-size-walk bookkeeping shared between the auto-load
+    /// path (`load_partitions`) and the worker-poll path. Stores in-place
+    /// + defrag floors, fragmentation %, and auto-checks the Compact Space
+    /// toggle when compacting would save at least
+    /// [`Self::COMPACT_AUTOCHECK_SAVINGS_PCT`] of the in-place trim size on
+    /// a clone-capable filesystem. The user can still toggle the box
+    /// manually to override the default — e.g. to squeeze the backup onto
+    /// a slightly-smaller destination disk when the auto threshold didn't
+    /// fire.
+    fn record_min_size_result(
+        &mut self,
+        idx: usize,
+        in_place: Option<u64>,
+        defragmented: Option<u64>,
+        fragmentation_percent: Option<f32>,
+        partition_size: u64,
+        partition_type: u8,
+        partition_type_string: Option<&str>,
+    ) {
+        let in_place_clamped = in_place.map(|v| v.min(partition_size));
+        let defrag_clamped = defragmented.map(|v| v.min(partition_size));
+        if let Some(v) = in_place_clamped {
+            self.partition_min_sizes.insert(idx, v);
+        }
+        if let Some(v) = defrag_clamped {
+            self.partition_defrag_min_sizes.insert(idx, v);
+        }
+        if let Some(pct) = fragmentation_percent {
+            self.partition_fragmentation.insert(idx, pct);
+        }
+        // Auto-check criterion: clone-capable FS AND space savings >=
+        // threshold. File fragmentation % is shown for context but isn't
+        // the decision signal — a volume with 0% file fragmentation can
+        // still have meaningful inter-file holes that compaction recovers.
+        if !self.partition_defrag_default_applied.contains(&idx)
+            && fs::has_defragmenting_writer(partition_type, partition_type_string)
+        {
+            if let (Some(ip), Some(df)) = (in_place_clamped, defrag_clamped) {
+                if ip > 0 && df < ip {
+                    let savings_pct = 100.0 * (ip - df) as f32 / ip as f32;
+                    if savings_pct >= Self::COMPACT_AUTOCHECK_SAVINGS_PCT {
+                        self.partition_defrag_enabled.insert(idx, true);
+                    }
+                }
+            }
+        }
+        self.partition_defrag_default_applied.insert(idx);
+    }
+
+    /// Minimum space-savings (% of in-place trim size) at which Compact
+    /// Space is auto-checked. 5% catches volumes with a few GiB of holes
+    /// on a 30+ GiB partition while staying off for the common case of a
+    /// nearly-perfectly-packed disk where compaction would just be a long
+    /// no-op.
+    const COMPACT_AUTOCHECK_SAVINGS_PCT: f32 = 5.0;
+
     fn poll_min_size_calcs(&mut self, ctx: &mut TabContext) {
+        // Emit a log line whenever a worker's `phase` string changes, so
+        // long HFS+ catalog walks don't look like a hang. The phase set is
+        // small (Opening filesystem -> Computing last data byte ->
+        // Computing defragmented minimum) plus the one-shot
+        // "open_filesystem failed: <err>" leak from `partition_minimum_size`.
+        let phase_updates: Vec<(usize, Vec<String>)> = self
+            .pending_min_size_calcs
+            .iter()
+            .filter_map(|(idx, status)| {
+                status.lock().ok().map(|mut s| {
+                    let drained = std::mem::take(&mut s.phase_log);
+                    (*idx, drained)
+                })
+            })
+            .collect();
+        for (idx, phases) in phase_updates {
+            for phase in phases {
+                if phase.is_empty() {
+                    continue;
+                }
+                ctx.log.info(format!("Partition {idx}: {phase}"));
+                self.last_logged_min_size_phase.insert(idx, phase);
+            }
+        }
         let finished_indices: Vec<usize> = self
             .pending_min_size_calcs
             .iter()
@@ -943,42 +1132,54 @@ impl BackupTab {
                                 )
                             })
                             .unwrap_or((u64::MAX, 0, None));
-                        let chosen = fs::pick_shrink_target(
+                        let frag_pct = s.fragmentation_percent;
+                        let last_phase = s.phase.clone();
+                        let in_place = s.result;
+                        let defrag = s.defragmented_min;
+                        drop(s);
+                        self.record_min_size_result(
+                            idx,
+                            in_place,
+                            defrag,
+                            frag_pct,
+                            part_size,
                             ptype,
                             pstring.as_deref(),
-                            s.result,
-                            s.defragmented_min,
                         );
-                        if let Some(min) = chosen {
-                            let clamped = min.min(part_size);
-                            self.partition_min_sizes.insert(idx, clamped);
-                            let is_layout = fs::is_layout_preserving_fs(ptype, pstring.as_deref());
-                            let suffix = if is_layout {
-                                " (in-place trim; defragmented shrink not yet supported for this FS)"
-                            } else if s.defragmented_min.is_some() {
-                                " (defragmented floor)"
+                        if let Some(min) = self.effective_min_size(idx, ptype, pstring.as_deref()) {
+                            let suffix = if self
+                                .partition_defrag_enabled
+                                .get(&idx)
+                                .copied()
+                                .unwrap_or(false)
+                            {
+                                " (space compacted via clone)"
                             } else {
                                 ""
                             };
+                            let frag = frag_pct
+                                .map(|p| format!(", fragmentation {:.1}%", p))
+                                .unwrap_or_default();
                             ctx.log.info(format!(
-                                "Partition {idx}: minimum size {} (computed){}",
-                                partition::format_size(clamped),
-                                suffix,
+                                "Partition {idx}: minimum size {} (computed){suffix}{frag}",
+                                partition::format_size(min),
                             ));
                             for cfg in &mut self.vhd_partition_configs {
                                 if cfg.index == idx {
-                                    cfg.minimum_size = clamped;
+                                    cfg.minimum_size = min;
                                     cfg.deferred_fs = None;
                                 }
                             }
                         } else {
+                            let s_phase = last_phase;
                             ctx.log.info(format!(
-                                "Partition {idx}: filesystem could not be opened for minimum-size calculation",
+                                "Partition {idx}: filesystem could not be opened for minimum-size calculation (last phase: {s_phase})",
                             ));
                         }
                     }
                 }
                 self.deferred_min_sizes.remove(&idx);
+                self.last_logged_min_size_phase.remove(&idx);
             }
         }
     }
@@ -989,6 +1190,10 @@ impl BackupTab {
         self.source_partitions.clear();
         self.selected_partitions.clear();
         self.partition_min_sizes.clear();
+        self.partition_defrag_min_sizes.clear();
+        self.partition_fragmentation.clear();
+        self.partition_defrag_enabled.clear();
+        self.partition_defrag_default_applied.clear();
         self.deferred_min_sizes.clear();
         self.pending_min_size_calcs.clear();
         self.source_file = None;
@@ -1060,69 +1265,80 @@ impl BackupTab {
                 // Cheap filesystems (FAT/NTFS/exFAT) compute eagerly here; expensive
                 // ones (HFS/HFS+/ext/btrfs/ProDOS) defer until the user clicks
                 // "Calc min" in the per-partition resize popup.
-                for part in &self.source_partitions {
-                    if part.is_extended_container {
+                let probes: Vec<(usize, u64, u64, u8, Option<String>, bool)> = self
+                    .source_partitions
+                    .iter()
+                    .map(|p| {
+                        (
+                            p.index,
+                            p.start_lba * 512,
+                            p.size_bytes,
+                            p.partition_type_byte,
+                            p.partition_type_string.clone(),
+                            p.is_extended_container,
+                        )
+                    })
+                    .collect();
+                for (idx, offset, size_bytes, type_byte, type_str, ext_container) in probes {
+                    if ext_container {
                         continue;
                     }
-                    let offset = part.start_lba * 512;
                     let Ok(clone) = reader.get_ref().try_clone() else {
                         continue;
                     };
                     let result = fs::partition_minimum_size(
                         BufReader::new(clone),
                         offset,
-                        part.partition_type_byte,
-                        part.partition_type_string.as_deref(),
-                        part.size_bytes,
+                        type_byte,
+                        type_str.as_deref(),
+                        size_bytes,
                         false,
+                        None,
                         &|_| {},
                     );
                     match result {
                         fs::MinimumResult::Computed {
                             in_place,
                             defragmented,
+                            fragmentation_percent,
                         } => {
-                            // Layout-preserving filesystems (HFS+, ext, etc.)
-                            // get the in-place trim point — the only target
-                            // achievable without a defragmenting writer. The
-                            // packing filesystems (FAT/NTFS/exFAT) can use
-                            // the defragmented value because their compact
-                            // reader actually repacks during the write.
-                            let chosen = fs::pick_shrink_target(
-                                part.partition_type_byte,
-                                part.partition_type_string.as_deref(),
+                            self.record_min_size_result(
+                                idx,
                                 in_place,
                                 defragmented,
+                                fragmentation_percent,
+                                size_bytes,
+                                type_byte,
+                                type_str.as_deref(),
                             );
-                            if let Some(min_size) = chosen {
-                                let clamped = min_size.min(part.size_bytes);
-                                self.partition_min_sizes.insert(part.index, clamped);
-                                let is_layout = fs::is_layout_preserving_fs(
-                                    part.partition_type_byte,
-                                    part.partition_type_string.as_deref(),
-                                );
-                                let suffix = if is_layout {
-                                    " (in-place trim; defragmented shrink not yet supported for this FS)"
-                                } else if defragmented.is_some() {
-                                    " (defragmented floor)"
+                            if let Some(min) =
+                                self.effective_min_size(idx, type_byte, type_str.as_deref())
+                            {
+                                let suffix = if self
+                                    .partition_defrag_enabled
+                                    .get(&idx)
+                                    .copied()
+                                    .unwrap_or(false)
+                                {
+                                    " (space compacted via clone)"
                                 } else {
                                     ""
                                 };
+                                let frag = fragmentation_percent
+                                    .map(|p| format!(", fragmentation {:.1}%", p))
+                                    .unwrap_or_default();
                                 ctx.log.info(format!(
-                                    "Partition {}: minimum size {} (original {}){}",
-                                    part.index,
-                                    partition::format_size(clamped),
-                                    partition::format_size(part.size_bytes),
-                                    suffix,
+                                    "Partition {idx}: minimum size {} (original {}){suffix}{frag}",
+                                    partition::format_size(min),
+                                    partition::format_size(size_bytes),
                                 ));
                             }
                         }
                         fs::MinimumResult::Deferred { fs_name } => {
                             ctx.log.info(format!(
-                                "Partition {}: need to calculate minimum size due to filesystem {fs_name} (click \"Calc min\" to compute)",
-                                part.index,
+                                "Partition {idx}: need to calculate minimum size due to filesystem {fs_name} (click \"Calc min\" to compute)",
                             ));
-                            self.deferred_min_sizes.insert(part.index, fs_name);
+                            self.deferred_min_sizes.insert(idx, fs_name);
                         }
                     }
                 }
@@ -1142,6 +1358,10 @@ impl BackupTab {
         self.source_partitions.clear();
         self.selected_partitions.clear();
         self.partition_min_sizes.clear();
+        self.partition_defrag_min_sizes.clear();
+        self.partition_fragmentation.clear();
+        self.partition_defrag_enabled.clear();
+        self.partition_defrag_default_applied.clear();
         self.deferred_min_sizes.clear();
         self.pending_min_size_calcs.clear();
         self.source_partition_table_desc = None;
@@ -1224,64 +1444,82 @@ impl BackupTab {
                         // (DMG/VHDX dynamic) is intentionally skipped here —
                         // raw VHD and plain images have their tables at the
                         // expected offsets.
-                        for part in &self.source_partitions {
-                            if part.is_extended_container {
+                        let probes: Vec<(usize, u64, u64, u8, Option<String>, bool)> = self
+                            .source_partitions
+                            .iter()
+                            .map(|p| {
+                                (
+                                    p.index,
+                                    p.start_lba * 512,
+                                    p.size_bytes,
+                                    p.partition_type_byte,
+                                    p.partition_type_string.clone(),
+                                    p.is_extended_container,
+                                )
+                            })
+                            .collect();
+                        for (idx, offset, size_bytes, type_byte, type_str, ext_container) in probes
+                        {
+                            if ext_container {
                                 continue;
                             }
                             let probe_reader = match File::open(&path) {
                                 Ok(f) => BufReader::new(f),
                                 Err(_) => continue,
                             };
-                            let offset = part.start_lba * 512;
                             let result = fs::partition_minimum_size(
                                 probe_reader,
                                 offset,
-                                part.partition_type_byte,
-                                part.partition_type_string.as_deref(),
-                                part.size_bytes,
+                                type_byte,
+                                type_str.as_deref(),
+                                size_bytes,
                                 false,
+                                None,
                                 &|_| {},
                             );
                             match result {
                                 fs::MinimumResult::Computed {
                                     in_place,
                                     defragmented,
+                                    fragmentation_percent,
                                 } => {
-                                    let chosen = fs::pick_shrink_target(
-                                        part.partition_type_byte,
-                                        part.partition_type_string.as_deref(),
+                                    self.record_min_size_result(
+                                        idx,
                                         in_place,
                                         defragmented,
+                                        fragmentation_percent,
+                                        size_bytes,
+                                        type_byte,
+                                        type_str.as_deref(),
                                     );
-                                    if let Some(min_size) = chosen {
-                                        let clamped = min_size.min(part.size_bytes);
-                                        self.partition_min_sizes.insert(part.index, clamped);
-                                        let is_layout = fs::is_layout_preserving_fs(
-                                            part.partition_type_byte,
-                                            part.partition_type_string.as_deref(),
-                                        );
-                                        let suffix = if is_layout {
-                                            " (in-place trim; defragmented shrink not yet supported for this FS)"
-                                        } else if defragmented.is_some() {
-                                            " (defragmented floor)"
+                                    if let Some(min) =
+                                        self.effective_min_size(idx, type_byte, type_str.as_deref())
+                                    {
+                                        let suffix = if self
+                                            .partition_defrag_enabled
+                                            .get(&idx)
+                                            .copied()
+                                            .unwrap_or(false)
+                                        {
+                                            " (space compacted via clone)"
                                         } else {
                                             ""
                                         };
+                                        let frag = fragmentation_percent
+                                            .map(|p| format!(", fragmentation {:.1}%", p))
+                                            .unwrap_or_default();
                                         ctx.log.info(format!(
-                                            "Partition {}: minimum size {} (original {}){}",
-                                            part.index,
-                                            partition::format_size(clamped),
-                                            partition::format_size(part.size_bytes),
-                                            suffix,
+                                            "Partition {idx}: minimum size {} (original {}){suffix}{frag}",
+                                            partition::format_size(min),
+                                            partition::format_size(size_bytes),
                                         ));
                                     }
                                 }
                                 fs::MinimumResult::Deferred { fs_name } => {
                                     ctx.log.info(format!(
-                                        "Partition {}: need to calculate minimum size due to filesystem {fs_name} (click \"Calc min\" to compute)",
-                                        part.index,
+                                        "Partition {idx}: need to calculate minimum size due to filesystem {fs_name} (click \"Calc min\" to compute)",
                                     ));
-                                    self.deferred_min_sizes.insert(part.index, fs_name);
+                                    self.deferred_min_sizes.insert(idx, fs_name);
                                 }
                             }
                         }
@@ -1421,40 +1659,117 @@ impl BackupTab {
         // from the simple "Resize partitions to minimum size" checkbox. When
         // the box is on, every partition with a known minimum gets MinPlus20;
         // partitions whose minimum hasn't been computed fall back to Original.
-        let (size_policy, partition_target_sizes) =
-            if matches!(self.compression_type, CompressionType::Chd)
-                && !self.sector_by_sector
-                && self.resize_partitions
-            {
-                let mut targets: Vec<(usize, u64)> = Vec::new();
-                let mut used_min_plus_20 = false;
-                for part in &self.source_partitions {
-                    if part.is_extended_container {
-                        continue;
-                    }
-                    let target = match self.partition_min_sizes.get(&part.index).copied() {
-                        Some(min) if min < part.size_bytes => {
-                            used_min_plus_20 = true;
-                            SizeMode::MinPlus20.effective_size(part.size_bytes, min, 0)
-                        }
-                        _ => part.size_bytes,
-                    };
-                    targets.push((part.index, target));
+        //
+        // HFS+/HFSX partitions are intentionally *skipped* from the list:
+        // their shrink is performed by the HFS+ defrag-clone pipeline that
+        // `run_backup` activates via `shrink_to_minimum`. The clone uses the
+        // partition's defragmented minimum (a true lower bound) — emitting a
+        // MinPlus20-of-the-in-place-trim entry here would either no-op
+        // (MinPlus20 ≥ original collapses to original) or override the
+        // clone target.
+        let resize_for_chd = matches!(self.compression_type, CompressionType::Chd)
+            && !self.sector_by_sector
+            && self.resize_partitions;
+        let (size_policy, partition_target_sizes) = if resize_for_chd {
+            let mut targets: Vec<(usize, u64)> = Vec::new();
+            let mut used_min_plus_20 = false;
+            for part in &self.source_partitions {
+                if part.is_extended_container {
+                    continue;
                 }
-                let policy = if used_min_plus_20 {
-                    SizePolicy::MinPlus20
-                } else {
-                    SizePolicy::Original
+                // HFS+/HFSX partitions with the per-partition Defrag toggle
+                // ON are handled by the clone pipeline (via
+                // `defrag_partition_indices`), so don't seed a target_size
+                // here — the clone emits its own size. With Defrag OFF, fall
+                // through to the in-place trim path: seed a target so the
+                // staging path resizes the partition to its in-place minimum.
+                let defrag_enabled = self
+                    .partition_defrag_enabled
+                    .get(&part.index)
+                    .copied()
+                    .unwrap_or(false);
+                let has_clone = fs::has_defragmenting_writer(
+                    part.partition_type_byte,
+                    part.partition_type_string.as_deref(),
+                );
+                if defrag_enabled && has_clone {
+                    continue;
+                }
+                let effective = self.effective_min_size(
+                    part.index,
+                    part.partition_type_byte,
+                    part.partition_type_string.as_deref(),
+                );
+                let target = match effective {
+                    Some(min) if min < part.size_bytes => {
+                        used_min_plus_20 = true;
+                        SizeMode::MinPlus20.effective_size(part.size_bytes, min, 0)
+                    }
+                    _ => part.size_bytes,
                 };
-                (Some(policy), Some(targets))
+                targets.push((part.index, target));
+            }
+            let policy = if used_min_plus_20 {
+                SizePolicy::MinPlus20
             } else {
-                (None, None)
+                SizePolicy::Original
             };
+            let targets_opt = if targets.is_empty() {
+                None
+            } else {
+                Some(targets)
+            };
+            (Some(policy), targets_opt)
+        } else {
+            (None, None)
+        };
 
         let split_disabled_for_compression = matches!(
             self.compression_type,
             CompressionType::Vhd | CompressionType::Chd | CompressionType::Dvd
         );
+        // Per-partition defrag opt-in: only HFS+/HFSX partitions whose
+        // checkbox is checked AND whose FS has a defragmenting writer.
+        let mut defrag_set: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for part in &self.source_partitions {
+            if part.is_extended_container {
+                continue;
+            }
+            if !self
+                .partition_defrag_enabled
+                .get(&part.index)
+                .copied()
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if !fs::has_defragmenting_writer(
+                part.partition_type_byte,
+                part.partition_type_string.as_deref(),
+            ) {
+                continue;
+            }
+            defrag_set.insert(part.index);
+        }
+
+        // Send the toggle-aware effective minimum (defrag if checked, else
+        // in-place) for every partition that has a precomputed value. The
+        // engine uses this to seed `defragmented_min_sizes[i]` and to
+        // short-circuit volume walks it already ran in the GUI.
+        let precomputed: Vec<(usize, u64)> = self
+            .source_partitions
+            .iter()
+            .filter(|p| !p.is_extended_container)
+            .filter_map(|p| {
+                self.effective_min_size(
+                    p.index,
+                    p.partition_type_byte,
+                    p.partition_type_string.as_deref(),
+                )
+                .map(|sz| (p.index, sz))
+            })
+            .collect();
+
         let config = BackupConfig {
             source_path,
             destination_dir,
@@ -1471,7 +1786,22 @@ impl BackupTab {
             chd_options: self.chd_options_for_compression(),
             size_policy,
             partition_target_sizes,
-            shrink_to_minimum: false,
+            // For single-file CHD output the "Resize partitions to minimum
+            // size" checkbox enables the HFS+ defrag-clone pipeline (other
+            // FSes are sized via `partition_target_sizes` above). For
+            // per-partition (zstd / raw / per-partition VHD) output the
+            // same flag enables the regular HFS+ clone branch in
+            // `run_backup`. Sector-by-sector keeps it off. With the new
+            // per-partition Defrag checkbox, the actual set of partitions
+            // that get the clone is further narrowed by
+            // `defrag_partition_indices` below.
+            shrink_to_minimum: self.resize_partitions && !self.sector_by_sector,
+            precomputed_minimum_sizes: if precomputed.is_empty() {
+                None
+            } else {
+                Some(precomputed)
+            },
+            defrag_partition_indices: Some(defrag_set),
         };
 
         self.maybe_persist_chd_options();
@@ -1488,10 +1818,39 @@ impl BackupTab {
 
         std::thread::spawn(move || {
             let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: disk backup");
-            if let Err(e) = rusty_backup::backup::run_backup(config, Arc::clone(&progress_arc)) {
-                if let Ok(mut p) = progress_arc.lock() {
-                    p.error = Some(format!("{e:#}"));
-                    p.finished = true;
+            // Catch panics from `run_backup` so the GUI poll loop always
+            // observes `finished = true`. Without this, a panic in a
+            // sub-thread (or in any of the producer/consumer threads
+            // run_backup spawns) silently kills the worker, leaving the
+            // GUI stuck at whatever progress was last written. The panic
+            // message is preserved as the displayed error so we can
+            // diagnose it from the log instead of having to attach a
+            // debugger.
+            let progress_for_panic = Arc::clone(&progress_arc);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rusty_backup::backup::run_backup(config, Arc::clone(&progress_arc))
+            }));
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if let Ok(mut p) = progress_for_panic.lock() {
+                        p.error = Some(format!("{e:#}"));
+                        p.finished = true;
+                    }
+                }
+                Err(panic_payload) => {
+                    let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                        (*s).to_string()
+                    } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        format!("<non-string panic payload: {:?}>", panic_payload.type_id())
+                    };
+                    eprintln!("[backup-thread] PANIC: {msg}");
+                    if let Ok(mut p) = progress_for_panic.lock() {
+                        p.error = Some(format!("backup worker panicked: {msg}"));
+                        p.finished = true;
+                    }
                 }
             }
         });
@@ -1522,6 +1881,7 @@ impl BackupTab {
         progress_state.current_bytes = p.current_bytes;
         progress_state.total_bytes = p.total_bytes;
         progress_state.full_size_bytes = p.full_size_bytes;
+        progress_state.record_sample();
 
         if p.finished {
             if let Some(err) = &p.error {

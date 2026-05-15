@@ -93,6 +93,9 @@ pub struct InspectTab {
     /// Currently-running per-partition min-size worker threads.
     pending_min_size_calcs:
         HashMap<usize, Arc<Mutex<rusty_backup::model::min_size_runner::MinSizeStatus>>>,
+    /// Last phase string we already logged for each in-flight min-size
+    /// calc, so each phase transition produces exactly one log line.
+    last_logged_min_size_phase: HashMap<usize, String>,
     /// Currently-running per-partition HFS+ volume-label worker threads. Each
     /// resolves to either a label that gets appended to `partitions[i].type_name`
     /// or an error logged via `ctx.log`. Spawned during `apply_backup_outcome`
@@ -181,6 +184,7 @@ impl Default for InspectTab {
             partition_volume_labels: HashMap::new(),
             deferred_min_sizes: HashMap::new(),
             pending_min_size_calcs: HashMap::new(),
+            last_logged_min_size_phase: HashMap::new(),
             pending_volume_label_probes: HashMap::new(),
             clonezilla_image: None,
             block_caches: HashMap::new(),
@@ -2181,6 +2185,7 @@ impl InspectTab {
                                 part.partition_type_string.as_deref(),
                                 part.size_bytes,
                                 false,
+                                None,
                                 &|_| {},
                             )
                         } else {
@@ -2195,6 +2200,7 @@ impl InspectTab {
                                     part.partition_type_string.as_deref(),
                                     part.size_bytes,
                                     false,
+                                    None,
                                     &|_| {},
                                 )
                             } else {
@@ -2205,6 +2211,7 @@ impl InspectTab {
                                     part.partition_type_string.as_deref(),
                                     part.size_bytes,
                                     false,
+                                    None,
                                     &|_| {},
                                 )
                             }
@@ -2213,6 +2220,7 @@ impl InspectTab {
                             rusty_backup::fs::MinimumResult::Computed {
                                 in_place: Some(min_size),
                                 defragmented,
+                                fragmentation_percent: _,
                             } => {
                                 let clamped = min_size.min(part.size_bytes);
                                 partition_min_sizes.insert(part.index, clamped);
@@ -3068,6 +3076,27 @@ impl InspectTab {
     /// Poll all pending min-size workers; on completion, move results into
     /// `partition_min_sizes` and clear the deferred entry.
     fn poll_min_size_calcs(&mut self, ctx: &mut TabContext) {
+        // Emit a log line whenever a worker's `phase` advances so long HFS+
+        // catalog walks don't look like a hang. Mirrors backup_tab.rs.
+        let phase_updates: Vec<(usize, Vec<String>)> = self
+            .pending_min_size_calcs
+            .iter()
+            .filter_map(|(idx, status)| {
+                status.lock().ok().map(|mut s| {
+                    let drained = std::mem::take(&mut s.phase_log);
+                    (*idx, drained)
+                })
+            })
+            .collect();
+        for (idx, phases) in phase_updates {
+            for phase in phases {
+                if phase.is_empty() {
+                    continue;
+                }
+                ctx.log.info(format!("Partition {idx}: {phase}"));
+                self.last_logged_min_size_phase.insert(idx, phase);
+            }
+        }
         let finished_indices: Vec<usize> = self
             .pending_min_size_calcs
             .iter()
@@ -3112,11 +3141,13 @@ impl InspectTab {
                         }
                     } else {
                         ctx.log.info(format!(
-                            "Partition {idx}: filesystem could not be opened for minimum-size calculation",
+                            "Partition {idx}: filesystem could not be opened for minimum-size calculation (last phase: {})",
+                            s.phase,
                         ));
                     }
                 }
                 self.deferred_min_sizes.remove(&idx);
+                self.last_logged_min_size_phase.remove(&idx);
             }
         }
     }

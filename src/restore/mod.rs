@@ -2765,7 +2765,7 @@ mod tests {
         let mut log_cb = |s: &str| log_buf.push(s.to_string());
         let mut progress_cb = |_: u64| {};
         let cancel_check = || false;
-        let chd_result = single_file_chd::run(
+        let chd_result = single_file_chd::run_via_staging(
             SingleFileChdInputs {
                 source_file: &source_file,
                 source_size: total_bytes,
@@ -2778,6 +2778,7 @@ mod tests {
                 is_dvd: false,
                 output_base: &output_base,
                 resize_targets: None,
+                hfsplus_clone_targets: None,
                 alignment_sectors: 0,
                 checksum_type: crate::backup::ChecksumType::Sha256,
             },
@@ -2785,6 +2786,8 @@ mod tests {
             &cancel_check,
             &mut log_cb,
             &mut |_, _| {},
+            &mut |_| {},
+            None,
         )
         .expect("backup");
 
@@ -2899,7 +2902,7 @@ mod tests {
         let mut log_cb = |s: &str| log_buf.push(s.to_string());
         let mut progress_cb = |_: u64| {};
         let cancel_check = || false;
-        let chd_result = single_file_chd::run(
+        let chd_result = single_file_chd::run_via_staging(
             SingleFileChdInputs {
                 source_file: &source_file,
                 source_size: total_bytes,
@@ -2912,6 +2915,7 @@ mod tests {
                 is_dvd: false,
                 output_base: &output_base,
                 resize_targets: None,
+                hfsplus_clone_targets: None,
                 alignment_sectors: 0,
                 checksum_type: crate::backup::ChecksumType::Sha256,
             },
@@ -2919,6 +2923,8 @@ mod tests {
             &cancel_check,
             &mut log_cb,
             &mut |_, _| {},
+            &mut |_| {},
+            None,
         )
         .expect("backup");
 
@@ -3064,7 +3070,7 @@ mod tests {
         let mut log_cb = |_: &str| {};
         let mut progress_cb = |_: u64| {};
         let cancel_check = || false;
-        let chd_result = single_file_chd::run(
+        let chd_result = single_file_chd::run_via_staging(
             SingleFileChdInputs {
                 source_file: &source_file,
                 source_size: total_bytes,
@@ -3077,6 +3083,7 @@ mod tests {
                 is_dvd: false,
                 output_base: &output_base,
                 resize_targets: None,
+                hfsplus_clone_targets: None,
                 alignment_sectors: 0,
                 checksum_type: crate::backup::ChecksumType::Sha256,
             },
@@ -3084,6 +3091,8 @@ mod tests {
             &cancel_check,
             &mut log_cb,
             &mut |_, _| {},
+            &mut |_| {},
+            None,
         )
         .expect("backup");
 
@@ -3271,7 +3280,7 @@ mod tests {
         let mut log_cb = |s: &str| log_buf.push(s.to_string());
         let mut progress_cb = |_: u64| {};
         let cancel_check = || false;
-        let chd_result = single_file_chd::run(
+        let chd_result = single_file_chd::run_via_staging(
             SingleFileChdInputs {
                 source_file: &source_file,
                 source_size: total_bytes,
@@ -3284,6 +3293,7 @@ mod tests {
                 is_dvd: false,
                 output_base: &output_base,
                 resize_targets: None,
+                hfsplus_clone_targets: None,
                 alignment_sectors: 1,
                 checksum_type: crate::backup::ChecksumType::Sha256,
             },
@@ -3291,6 +3301,8 @@ mod tests {
             &cancel_check,
             &mut log_cb,
             &mut |_, _| {},
+            &mut |_| {},
+            None,
         )
         .expect("backup");
 
@@ -3533,7 +3545,7 @@ mod tests {
         {
             let cur = Cursor::new(&mut src_img);
             let mut hfs = HfsPlusFilesystem::open(cur, 0).unwrap();
-            stream_defragmented_hfsplus(&mut hfs, CLONE_BYTES, &mut clone_buf)
+            stream_defragmented_hfsplus(&mut hfs, CLONE_BYTES, &mut clone_buf, None)
                 .expect("stream_defragmented_hfsplus");
         }
         assert_eq!(clone_buf.len() as u64, CLONE_BYTES);

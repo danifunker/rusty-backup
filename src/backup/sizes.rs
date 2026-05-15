@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use crate::fs;
 use crate::partition::{self, PartitionInfo};
 
-use super::{log, BackupProgress, LogLevel};
+use super::{log, set_operation, BackupProgress, LogLevel};
 
 /// Parallel per-partition vectors produced by `analyze_partitions`.
 pub(super) struct PartitionSizing {
@@ -42,6 +42,7 @@ pub(super) fn analyze_partitions(
     partitions: &[PartitionInfo],
     sector_by_sector: bool,
     is_superfloppy: bool,
+    precomputed_min: Option<&[(usize, u64)]>,
     progress: &Arc<Mutex<BackupProgress>>,
 ) -> PartitionSizing {
     let n = partitions.len();
@@ -172,23 +173,99 @@ pub(super) fn analyze_partitions(
 
             // Defragmented minimum: only meaningfully smaller than `minimum`
             // for HFS+ on fragmented volumes; for every other FS this falls
-            // through to `last_data_byte` and matches `minimum`.
-            let defrag = source
-                .try_clone()
-                .ok()
-                .and_then(|clone| {
-                    fs::defragmented_partition_size(
-                        BufReader::new(clone),
-                        part_offset,
-                        part.partition_type_byte,
-                        part.partition_type_string.as_deref(),
-                    )
-                })
-                .map(|d| d.min(part.size_bytes))
-                .filter(|&d| match minimum {
-                    Some(m) => d < m,
-                    None => d < part.size_bytes,
-                });
+            // through to `last_data_byte` and matches `minimum`. The HFS+
+            // walk reads the catalog + extents-overflow B-trees and can
+            // take seconds to minutes on a large volume — surface a per-
+            // partition op label and log line so the GUI doesn't appear
+            // hung at "Exporting partition table…".
+            let pre = precomputed_min.and_then(|tbl| {
+                tbl.iter()
+                    .find(|(idx, _)| *idx == part.index)
+                    .map(|(_, v)| *v)
+            });
+            let needs_walk = fs::is_expensive_minimum(
+                part.partition_type_byte,
+                part.partition_type_string.as_deref(),
+            ) && pre.is_none();
+            if let Some(v) = pre {
+                log(
+                    progress,
+                    LogLevel::Info,
+                    format!(
+                        "Partition-{}: reusing precomputed defragmented minimum {} (skipped volume walk)",
+                        part.index,
+                        partition::format_size(v),
+                    ),
+                );
+            }
+            if needs_walk {
+                set_operation(
+                    progress,
+                    format!(
+                        "Computing defragmented minimum for partition-{} (this can take a while)…",
+                        part.index
+                    ),
+                );
+                log(
+                    progress,
+                    LogLevel::Info,
+                    format!(
+                        "Walking partition-{} to compute defragmented minimum…",
+                        part.index
+                    ),
+                );
+            }
+            let defrag = if let Some(v) = pre {
+                // Precomputed value is partition-level (already includes
+                // wrapper overhead for wrapped HFS+); compare against the
+                // partition extent only — `minimum` is the inner-volume
+                // trim point and isn't apples-to-apples with partition-
+                // level. Filtering on `minimum` here would wrongly skip
+                // wrapped HFS+ partitions whose partition-level shrink is
+                // larger than the inner trim but still smaller than the
+                // source extent.
+                Some(v.min(part.size_bytes)).filter(|&d| d < part.size_bytes)
+            } else {
+                source
+                    .try_clone()
+                    .ok()
+                    .and_then(|clone| {
+                        fs::defragmented_partition_size(
+                            BufReader::new(clone),
+                            part_offset,
+                            part.partition_type_byte,
+                            part.partition_type_string.as_deref(),
+                        )
+                    })
+                    .map(|d| d.min(part.size_bytes))
+                    .filter(|&d| match minimum {
+                        Some(m) => d < m,
+                        None => d < part.size_bytes,
+                    })
+            };
+            if needs_walk {
+                if let Some(d) = defrag {
+                    log(
+                        progress,
+                        LogLevel::Info,
+                        format!(
+                            "Partition-{}: defragmented minimum {}",
+                            part.index,
+                            partition::format_size(d)
+                        ),
+                    );
+                } else {
+                    log(
+                        progress,
+                        LogLevel::Info,
+                        format!(
+                            "Partition-{}: defragmented minimum unavailable \
+                             (filesystem refused to open or volume could not be walked)",
+                            part.index
+                        ),
+                    );
+                }
+            }
             sizing.defragmented_min_sizes.push(defrag);
 
             // LP: trim stream to minimum so the free tail isn't compressed.
