@@ -297,22 +297,29 @@ impl Rdb {
                 )));
             }
             let new_low_cyl = (dest_lba / cyl_lbas) as u32;
-            let export_lbas = export_size / 512;
-            if export_lbas == 0 || export_lbas % cyl_lbas != 0 {
+            // Round the requested export size UP to the next cylinder boundary.
+            // RDB partition geometry is cylinder-granular (low_cyl/high_cyl are
+            // u32 cylinder counts), so an MB-aligned size from the GUI almost
+            // never lands exactly on a cyl boundary on real Amiga disks where
+            // cyl_lbas can be e.g. 1008. Rounding up keeps the partition at
+            // least the requested size — for shrink this still produces a
+            // smaller output disk, for grow it slightly exceeds the request.
+            let requested_lbas = export_size.div_ceil(512);
+            if requested_lbas == 0 {
                 return Err(RustyBackupError::InvalidRdb(format!(
-                    "partition {} export_size {} not a multiple of cylinder size {} bytes",
-                    i,
-                    export_size,
-                    cyl_lbas * 512
-                )));
-            }
-            let new_cyls = (export_lbas / cyl_lbas) as u32;
-            if new_cyls == 0 {
-                return Err(RustyBackupError::InvalidRdb(format!(
-                    "partition {} export_size {} resolves to zero cylinders",
+                    "partition {} export_size {} resolves to zero LBAs",
                     i, export_size
                 )));
             }
+            let new_cyls_u64 = requested_lbas.div_ceil(cyl_lbas);
+            let new_cyls = u32::try_from(new_cyls_u64).map_err(|_| {
+                RustyBackupError::InvalidRdb(format!(
+                    "partition {} new cyl count {} overflows u32",
+                    i, new_cyls_u64
+                ))
+            })?;
+            let aligned_export_lbas = new_cyls_u64 * cyl_lbas;
+            let aligned_export_size = aligned_export_lbas * 512;
             let new_high_cyl = new_low_cyl + new_cyls - 1;
 
             // Patch in place.
@@ -324,13 +331,16 @@ impl Rdb {
             plans.push(RdbPartitionPlan {
                 source_lba,
                 dest_lba,
-                copy_size: original_size.min(export_size),
-                export_size,
+                copy_size: original_size.min(aligned_export_size),
+                // Surface the rounded size so resize_filesystem_for and the
+                // copy/zero-fill loop work in sync with what's recorded in
+                // the patched PART block.
+                export_size: aligned_export_size,
                 dos_type_string: p.dos_type_string(),
                 drv_name: p.drv_name.clone(),
             });
 
-            let end_lba = dest_lba + export_lbas;
+            let end_lba = dest_lba + aligned_export_lbas;
             if end_lba > max_end_lba {
                 max_end_lba = end_lba;
             }
