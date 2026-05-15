@@ -50,7 +50,8 @@ consulted, not linked.
 - DMS, ADZ-of-DMS, LZX, RP9 — packaging layers, not block storage.
 - LHA / WHDLoad browsing.
 - JXFS (PPC-only, vanishingly small install base).
-- Floppy disk expand-block-size or PFS/SFS in-place resize.
+- Floppy disk expand-block-size. (In-place resize for AFFS / PFS3 / SFS
+  is planned — see Phase 10.)
 
 ### Reference images (already on disk)
 | Path | Size | What it is |
@@ -549,6 +550,95 @@ state.
       the full dispatch wiring. Asserts `disk.len() <= 64 KiB` so it
       stays the "tiny fixture" the plan asked for, no binary
       checked in.
+
+### Phase 10 — Filesystem resize (AFFS / PFS3 / SFS)
+
+Currently none of the Amiga filesystems implement resize. All three are
+tagged `is_layout_preserving_fs = true` in `src/fs/mod.rs:684`, so the
+framework would only ever do an in-place trim (no defragmenting writer).
+`resize_filesystem_for` (`src/fs/mod.rs:83`) has no Amiga branch, and the
+`PartitionFsType` switch in `src/restore/mod.rs:1011+` has no Amiga arms —
+restores of resized Amiga partitions silently no-op the filesystem fixup
+today. This phase adds in-place trim + grow for all three filesystems,
+plus the shared wiring to drive them from the restore path.
+
+Bitmap convention reminder: all three Amiga filesystems use **set bit =
+free** (opposite of FAT/NTFS/etc.) and every multi-byte field is
+big-endian. Easy bug source on both axes.
+
+Shared scope (do once, used by all three):
+- [ ] `src/fs/mod.rs`: add Amiga arms to `resize_filesystem_for`
+      keyed on `partition_type_string` (no MBR byte for RDB
+      partitions). Use `is_amiga_dos_type` / `is_amiga_pfs3_type` /
+      `is_amiga_sfs_type` to route.
+- [ ] `src/restore/mod.rs`: extend the resize switch (or thread a
+      `partition_type_string` into the existing dispatch) so AFFS /
+      PFS3 / SFS partitions actually get resized on restore.
+- [ ] RDB PART-entry fixup: when a partition shrinks/grows during
+      restore, recompute `de_LowCyl` / `de_HighCyl` for the affected
+      and any following entries. The packing pass for MBR logicals
+      is MBR-only — write an analogous RDB pass in
+      `src/partition/rdb.rs`.
+- [ ] No hidden-sectors patching needed (RDB carries geometry per
+      partition, not a hidden-sectors count like BPB).
+
+#### Phase 10a — AFFS in-place resize (~2-3 days)
+- [ ] `pub fn resize_affs_in_place(file, partition_offset,
+      new_size_bytes, log_cb) -> Result<()>` in `src/fs/affs.rs`.
+- [ ] Trim: walk bitmap to confirm no allocated block lives past the
+      new last block; relocate the root block (sits at
+      `(2 + total_blocks - 1) / 2` — it **moves** when the volume
+      shrinks/grows) and rewrite the hashtable + bitmap pages to
+      match the new size; update root checksum.
+- [ ] Grow: extend bitmap pages (mark new blocks free), relocate the
+      root to the new midpoint, fix up checksums.
+- [ ] `pub fn validate_affs_integrity(...)` mirroring the FAT / NTFS
+      helpers — re-open, sanity-check root + bitmap pages.
+- [ ] Reference: `~/repos/amigasources/ADFlib`.
+
+#### Phase 10b — SFS in-place resize (~3-5 days)
+- [ ] `pub fn resize_sfs_in_place(...)` in `src/fs/sfs.rs`.
+- [ ] Trim: relocate the journal region (TRST/TRFA) — currently
+      near the end of the volume — to sit before the new last block;
+      truncate the bitmap; update root-block size fields and
+      object-node/admin tree pointers that reference the journal.
+      We don't maintain the journal at runtime (sync-boundary
+      atomicity instead), so this is a mechanical move.
+- [ ] Grow: extend bitmap blocks (set=free for the new tail) and
+      either grow the journal in place or leave it where it is —
+      pick whichever matches what SFS's own tools expect.
+- [ ] `pub fn validate_sfs_integrity(...)`.
+- [ ] Reference: `~/repos/amigasources/smartfilesystem`.
+
+#### Phase 10c — PFS3 in-place resize (~4-6 days)
+- [ ] `pub fn resize_pfs3_in_place(...)` in `src/fs/pfs3.rs`.
+- [ ] Hardest of the three. Rootblock has many size-derived fields
+      (`rovingPointer`, `alwaysFree`, reserved-area extents) plus
+      rootblock extension blocks pointing at deldir / anode-bitmap /
+      bitmap-index trees. Trim needs to: shrink the reserved area at
+      end of volume, walk the bitmap-index tree to confirm no
+      allocation past the new end, rewrite the affected anode
+      bitmaps, and recompute every size-derived field in the
+      rootblock + extensions. Grow is roughly the inverse.
+- [ ] `pub fn validate_pfs3_integrity(...)`.
+- [ ] Reference: `~/repos/amigasources/pfs3aio` (non-trivial read).
+
+#### Phase 10d — restore wiring + tests
+- [ ] Synthetic e2e: extend `tests/filesystem_e2e.rs` with one
+      shrink + one grow case per filesystem (AFFS / SFS / PFS3),
+      reusing the tiny-fixture style from
+      `test_synthetic_rdb_ffs_pipeline`. Each test mounts the
+      resized volume back through `open_filesystem` and walks the
+      root to confirm files survive.
+- [ ] Round-trip against the reference images
+      (`~/amiga-filesystems/...`) — gated behind the same env-var
+      guard as the existing deferred round-trip tests so CI stays
+      self-contained.
+
+Rough total: ~10 days for all three, ~3 days for AFFS-only as a first
+slice. AFFS alone covers the most common Amiga restore case (DOS\3 FFS
+on RDB) and unblocks the standard "restore to a larger CF card"
+workflow without touching PFS3/SFS.
 
 ---
 
