@@ -17,6 +17,9 @@ pub enum RustyBackupError {
     #[error("Invalid SGI Volume Header: {0}")]
     InvalidSgi(String),
 
+    #[error("Invalid RDB: {0}")]
+    InvalidRdb(String),
+
     #[error("Device is currently mounted: {0}")]
     DeviceMounted(String),
 
