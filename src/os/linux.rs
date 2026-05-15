@@ -567,7 +567,15 @@ impl PrivilegedDiskAccess for LinuxDiskAccess {
 ///
 /// This function never returns on success - the current process is replaced.
 pub fn relaunch_with_elevation() -> Result<()> {
-    let current_exe = std::env::current_exe()?;
+    // Inside an AppImage, current_exe() points at the user-private FUSE
+    // mount under /tmp/.mount_*, which root cannot read — pkexec fails with
+    // "Permission denied" before the binary loads. The AppImage runtime
+    // exports APPIMAGE with the path of the actual .AppImage file; elevating
+    // that re-bootstraps the squashfs mount as root and works normally.
+    let target = match std::env::var_os("APPIMAGE") {
+        Some(p) => PathBuf::from(p),
+        None => std::env::current_exe()?,
+    };
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     // Check if pkexec is available
@@ -579,13 +587,15 @@ pub fn relaunch_with_elevation() -> Result<()> {
     if !pkexec_check.status.success() {
         anyhow::bail!(
             "pkexec not found. Please install policykit-1 or run manually: sudo {}",
-            current_exe.display()
+            target.display()
         );
     }
 
     // Preserve environment variables since pkexec strips the environment.
     // Display vars allow the elevated process to connect to X11/Wayland.
     // User identity vars allow resolving the real user's home/config paths.
+    // APPIMAGE/ARGV0 keep the elevated process aware that it's running from
+    // an AppImage so subsequent code paths (e.g. update check) behave correctly.
     let passthrough_vars = [
         "DISPLAY",
         "WAYLAND_DISPLAY",
@@ -593,6 +603,8 @@ pub fn relaunch_with_elevation() -> Result<()> {
         "XAUTHORITY",
         "XDG_RUNTIME_DIR",
         "HOME",
+        "APPIMAGE",
+        "ARGV0",
     ];
     let mut env_args: Vec<String> = Vec::new();
     for var in &passthrough_vars {
@@ -608,12 +620,12 @@ pub fn relaunch_with_elevation() -> Result<()> {
     env_args.push(format!("SUDO_UID={}", nix::unistd::getuid()));
     env_args.push(format!("SUDO_GID={}", nix::unistd::getgid()));
 
-    // Use "env" to inject variables, --keep-cwd to preserve working directory.
-    // Exec replaces current process - never returns on success
+    // Use "env" to inject variables. Exec replaces current process — never
+    // returns on success.
     let err = Command::new("pkexec")
         .arg("env")
         .args(&env_args)
-        .arg(&current_exe)
+        .arg(&target)
         .args(&args)
         .exec();
 
@@ -655,4 +667,77 @@ pub fn set_permissive_umask_if_elevated() {
     if nix::unistd::geteuid().is_root() {
         nix::sys::stat::umask(nix::sys::stat::Mode::empty());
     }
+}
+
+/// When running from an AppImage, write the .desktop file and icon into the
+/// user's XDG data dirs so Wayland compositors can resolve the window's
+/// app_id back to an icon. Wayland has no `_NET_WM_ICON` equivalent, so
+/// without these files installed the compositor falls back to a generic
+/// placeholder icon regardless of what `with_icon()` does.
+///
+/// Best-effort: any failure is logged and swallowed. No-op outside AppImage.
+pub fn install_appimage_desktop_integration(icon_png: &[u8]) {
+    let appimage = match std::env::var_os("APPIMAGE") {
+        Some(p) => PathBuf::from(p),
+        None => return,
+    };
+
+    let home = match real_user_home() {
+        Some(h) => h,
+        None => return,
+    };
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/share"));
+    let apps_dir = data_home.join("applications");
+    let icon_dir = data_home.join("icons/hicolor/256x256/apps");
+    let desktop_path = apps_dir.join("rusty-backup.desktop");
+    let icon_path = icon_dir.join("rusty-backup.png");
+
+    let desktop = format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=Rusty Backup\n\
+         Comment=Backup and restore vintage computer hard disk images\n\
+         Exec={} %F\n\
+         Icon=rusty-backup\n\
+         Categories=Utility;System;\n\
+         Terminal=false\n\
+         StartupNotify=true\n\
+         StartupWMClass=rusty-backup\n",
+        appimage.display(),
+    );
+
+    let needs_install = std::fs::read_to_string(&desktop_path)
+        .map(|existing| existing != desktop)
+        .unwrap_or(true)
+        || !icon_path.exists();
+
+    if !needs_install {
+        return;
+    }
+
+    if let Err(e) = std::fs::create_dir_all(&apps_dir)
+        .and_then(|_| std::fs::create_dir_all(&icon_dir))
+        .and_then(|_| std::fs::write(&desktop_path, &desktop))
+        .and_then(|_| std::fs::write(&icon_path, icon_png))
+    {
+        log::warn!("Could not install AppImage desktop integration: {e}");
+        return;
+    }
+
+    log::info!(
+        "Installed desktop integration ({} / {})",
+        desktop_path.display(),
+        icon_path.display()
+    );
+
+    // Best-effort cache refresh; succeed silently if either tool is missing.
+    let _ = Command::new("update-desktop-database")
+        .arg(&apps_dir)
+        .status();
+    let _ = Command::new("gtk-update-icon-cache")
+        .arg("-t")
+        .arg(data_home.join("icons/hicolor"))
+        .status();
 }
