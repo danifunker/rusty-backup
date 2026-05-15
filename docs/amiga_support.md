@@ -278,16 +278,41 @@ state.
 - [ ] Restore round-trip byte-equal.
 
 ### Phase 3 — FFS write / EditableFilesystem
-- [ ] Block allocator (find free bit in bitmap, mark, recompute bitmap
-      checksum).
-- [ ] Header block synthesis (file/dir) with correct hash insertion.
-- [ ] Hash-chain delete (relink predecessor).
-- [ ] Extension block chain growth/shrink.
-- [ ] Snapshot/rollback wrapper around every mutation.
-- [ ] `sync_metadata()` flushes all dirty blocks with fresh checksums.
-- [ ] GUI staged-edits flow works on an AFFS image.
-- [ ] Round-trip test: add file → close → reopen → file is there with
-      correct contents, protection, comment, mtime.
+- [x] Block allocator (`alloc_block` / `free_block` / `mark_bitmap`):
+      finds the lowest free bit, clears it in both the flat in-memory
+      bitmap and the on-disk bitmap-page cache, recomputes the bitmap
+      page checksum.
+- [x] Header block synthesis (`build_dir_block`, `build_file_header_block`,
+      `build_file_ext_block`, `build_data_block`) with the correct
+      checksums and AmigaDOS reverse-order dataBlocks[].
+- [x] Hash-chain insert (`hash_chain_insert`) — places new entry at the
+      front of the chain so existing predecessors don't need rewiring.
+- [x] Hash-chain remove (`hash_chain_remove`) — relinks the predecessor
+      or updates the parent's hash slot, handling root specially.
+- [x] Extension block chain growth — `create_file` allocates one ext
+      block per 72 data blocks beyond the header inline, chaining via
+      `extension` field.
+- [x] Dirty-block cache in `AffsFilesystem` — all mutations write into a
+      `HashMap<u32, [u8; BSIZE]>` instead of the disk. `sync_metadata()`
+      flushes in ascending block order; failure mid-mutation leaves the
+      on-disk volume untouched (atomicity at the sync boundary).
+- [x] `sync_metadata()` flushes every dirty block with fresh checksums
+      already in place (set by the build_*/mark_bitmap helpers).
+- [x] `validate_name` rejects empty names, names > 30 bytes, and the
+      forbidden bytes NUL / '/' / ':'.
+- [x] Dispatcher wired in `open_editable_filesystem`.
+- [x] Round-trip tests: create dir + create file + sync + reopen + read
+      back contents; create file + delete + verify allocation returns
+      to baseline.
+- [ ] Snapshot/rollback wrapper for in-memory state (matches HFS
+      pattern). *Deferred — the dirty-block cache already provides
+      atomicity at the sync boundary; snapshot/rollback only matters
+      if a single high-level edit needs to fail-and-revert without
+      tearing down the cache. Add when the GUI's staged-edits "Apply
+      Edits" flow surfaces a need.*
+- [ ] GUI staged-edits flow exercised on a real AFFS image.
+- [ ] Persist Amiga protection + comment on `create_file` (currently the
+      header is created with `access=0` → `----rwed`, no comment).
 
 ### Phase 4 — FFS Disk Validator
 - [ ] `src/fs/affs_fsck.rs` with four phases.

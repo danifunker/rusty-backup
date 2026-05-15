@@ -14,11 +14,15 @@
 //! size from the DosEnv. This module currently requires `block_size == 512`
 //! and rejects others — every real-world AFFS volume uses 512.
 
+use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::affs_common::*;
 use super::entry::FileEntry;
-use super::filesystem::{Filesystem, FilesystemError};
+use super::filesystem::{
+    CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
+};
 use super::CompactResult;
 
 /// Reusable error helper.
@@ -209,8 +213,17 @@ pub struct AffsFilesystem<R: Read + Seek> {
     /// to allocation block `(2 + i)` — the first two blocks (boot) are not
     /// represented in the bitmap. Bit **set** = block is **free**.
     bitmap: Vec<u8>,
+    /// Bitmap block numbers in order — index `i` of `bitmap_pages` holds
+    /// the 127 u32 map words covering bits `[i*4064 .. (i+1)*4064)`.
+    bitmap_pages: Vec<u32>,
     /// Total blocks tracked by the bitmap.
     total_blocks: u32,
+
+    /// In-memory cache of blocks that have been mutated but not yet flushed
+    /// to disk. `sync_metadata` writes every entry and clears the map; if
+    /// any mutation fails before sync, none of the changes ever hit disk.
+    /// Reads consult this map before falling back to the underlying reader.
+    dirty: HashMap<u32, [u8; BSIZE]>,
 }
 
 impl<R: Read + Seek> AffsFilesystem<R> {
@@ -253,7 +266,7 @@ impl<R: Read + Seek> AffsFilesystem<R> {
         let root = AffsRootBlock::parse(&root_buf, root_block)?;
 
         // Load the bitmap.
-        let bitmap = read_bitmap(
+        let (bitmap, bitmap_pages) = read_bitmap(
             &mut reader,
             partition_offset,
             block_size,
@@ -272,7 +285,9 @@ impl<R: Read + Seek> AffsFilesystem<R> {
             root_block,
             root,
             bitmap,
+            bitmap_pages,
             total_blocks,
+            dirty: HashMap::new(),
         })
     }
 
@@ -293,6 +308,9 @@ impl<R: Read + Seek> AffsFilesystem<R> {
     }
 
     fn read_block(&mut self, block: u32) -> Result<[u8; BSIZE], FilesystemError> {
+        if let Some(buf) = self.dirty.get(&block) {
+            return Ok(*buf);
+        }
         let offset = self.partition_offset + block as u64 * self.block_size;
         if offset + BSIZE_U64 > self.partition_offset + self.partition_size {
             return Err(parse_err(format!(
@@ -303,6 +321,329 @@ impl<R: Read + Seek> AffsFilesystem<R> {
         self.reader.seek(SeekFrom::Start(offset))?;
         self.reader.read_exact(&mut buf)?;
         Ok(buf)
+    }
+
+    fn write_block_cached(&mut self, block: u32, buf: [u8; BSIZE]) {
+        self.dirty.insert(block, buf);
+    }
+
+    /// Mark `block` as allocated in the in-memory bitmap and update the
+    /// dirty bitmap-page block accordingly. Recomputes the page checksum
+    /// before caching.
+    fn mark_bitmap(&mut self, block: u32, allocated: bool) -> Result<(), FilesystemError> {
+        if block < 2 || block >= self.total_blocks {
+            return Err(parse_err(format!(
+                "mark_bitmap: block {block} outside the bitmap range"
+            )));
+        }
+        let bit = (block - 2) as usize;
+        let byte = bit / 8;
+        let off = bit % 8;
+        // Update flat bitmap.
+        if allocated {
+            self.bitmap[byte] &= !(1u8 << off);
+        } else {
+            self.bitmap[byte] |= 1u8 << off;
+        }
+
+        // Find which bitmap page covers this bit and rewrite it. Each page
+        // holds 127 u32 map words = 4064 bits.
+        let page_idx = bit / 4064;
+        if page_idx >= self.bitmap_pages.len() {
+            return Err(parse_err(format!(
+                "mark_bitmap: no bitmap page covers block {block}"
+            )));
+        }
+        let page_block = self.bitmap_pages[page_idx];
+        let bit_in_page = bit - page_idx * 4064;
+        let word_idx = bit_in_page / 32; // 0..=126
+        let bit_in_word = bit_in_page % 32;
+
+        let mut buf = self.read_block(page_block)?;
+        // Word slot (word_idx + 1) — slot 0 is the page checksum.
+        let slot = (word_idx + 1) * 4;
+        let mut w = read_u32(&buf, slot);
+        if allocated {
+            w &= !(1u32 << bit_in_word);
+        } else {
+            w |= 1u32 << bit_in_word;
+        }
+        buf[slot..slot + 4].copy_from_slice(&w.to_be_bytes());
+        // Recompute bitmap-block checksum (offset 0).
+        buf[0..4].copy_from_slice(&[0u8; 4]);
+        let sum = bitmap_checksum(&buf);
+        buf[0..4].copy_from_slice(&sum.to_be_bytes());
+        self.write_block_cached(page_block, buf);
+        Ok(())
+    }
+
+    /// Find the lowest-numbered free block and mark it allocated, returning
+    /// its block number. Reserves blocks 0/1 (boot) and never returns the
+    /// root or any current bitmap page.
+    fn alloc_block(&mut self) -> Result<u32, FilesystemError> {
+        for block in 2..self.total_blocks {
+            // Skip blocks that are already allocated.
+            if self.block_is_allocated(block) {
+                continue;
+            }
+            // Mark and return.
+            self.mark_bitmap(block, true)?;
+            // Zero the new block in the cache so callers can synth content
+            // from a known state.
+            self.write_block_cached(block, [0u8; BSIZE]);
+            return Ok(block);
+        }
+        Err(FilesystemError::DiskFull(
+            "AFFS: no free blocks available".into(),
+        ))
+    }
+
+    fn free_block(&mut self, block: u32) -> Result<(), FilesystemError> {
+        self.mark_bitmap(block, false)?;
+        Ok(())
+    }
+
+    /// Returns the AmigaDOS DateStamp triplet for the current wall-clock time.
+    fn now_datestamp() -> (i32, i32, i32) {
+        let dur = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let unix = dur.as_secs() as i64;
+        // 1978-01-01 epoch:
+        let amiga_secs = unix - 2922 * 86_400;
+        if amiga_secs <= 0 {
+            return (0, 0, 0);
+        }
+        let days = (amiga_secs / 86_400) as i32;
+        let tod = amiga_secs % 86_400;
+        let mins = (tod / 60) as i32;
+        let secs_in_min = (tod % 60) as i32;
+        let ticks = secs_in_min * 50; // 50 Hz PAL
+        (days, mins, ticks)
+    }
+
+    /// Synthesize a new directory header block in the cache.
+    fn build_dir_block(
+        &mut self,
+        block: u32,
+        parent: u32,
+        name: &str,
+    ) -> Result<(), FilesystemError> {
+        let mut buf = [0u8; BSIZE];
+        buf[0..4].copy_from_slice(&T_HEADER.to_be_bytes());
+        buf[4..8].copy_from_slice(&block.to_be_bytes());
+        // bytes 8..0x14 are the rest of the header prefix — left zero.
+        // Hash table at 0x18..0x138 — already zero from buf initialization.
+        let (days, mins, ticks) = Self::now_datestamp();
+        buf[0x1A4..0x1A8].copy_from_slice(&days.to_be_bytes());
+        buf[0x1A8..0x1AC].copy_from_slice(&mins.to_be_bytes());
+        buf[0x1AC..0x1B0].copy_from_slice(&ticks.to_be_bytes());
+        write_bstr(&mut buf, 0x1B0, MAX_NAME_LEN, name)?;
+        buf[0x1F4..0x1F8].copy_from_slice(&parent.to_be_bytes());
+        // extension = 0 (no DirCache linked) at 0x1F8 — already zero.
+        buf[0x1FC..0x200].copy_from_slice(&ST_DIR.to_be_bytes());
+        let sum = normal_checksum(&buf, 5);
+        buf[0x14..0x18].copy_from_slice(&sum.to_be_bytes());
+        self.write_block_cached(block, buf);
+        Ok(())
+    }
+
+    /// Synthesize a new file header block in the cache.
+    fn build_file_header_block(
+        &mut self,
+        block: u32,
+        parent: u32,
+        name: &str,
+        byte_size: u32,
+        data_blocks_first_72: &[u32],
+        first_data: u32,
+        extension: u32,
+    ) -> Result<(), FilesystemError> {
+        let mut buf = [0u8; BSIZE];
+        buf[0..4].copy_from_slice(&T_HEADER.to_be_bytes());
+        buf[4..8].copy_from_slice(&block.to_be_bytes());
+        // high_seq = number of data block pointers actually stored in this
+        // header (max 72).
+        let high_seq = data_blocks_first_72.len() as u32;
+        buf[8..12].copy_from_slice(&high_seq.to_be_bytes());
+        // data_size — kept zero per AmigaDOS convention; byte_size at 0x144
+        // is the authoritative size.
+        buf[0x10..0x14].copy_from_slice(&first_data.to_be_bytes());
+        // dataBlocks[72] in REVERSE order: dataBlocks[71] = first data block.
+        for (i, &dblk) in data_blocks_first_72.iter().enumerate() {
+            let slot = MAX_DATA_BLOCKS - 1 - i;
+            buf[0x18 + slot * 4..0x18 + slot * 4 + 4].copy_from_slice(&dblk.to_be_bytes());
+        }
+        // byte_size at 0x144.
+        buf[0x144..0x148].copy_from_slice(&byte_size.to_be_bytes());
+        let (days, mins, ticks) = Self::now_datestamp();
+        buf[0x1A4..0x1A8].copy_from_slice(&days.to_be_bytes());
+        buf[0x1A8..0x1AC].copy_from_slice(&mins.to_be_bytes());
+        buf[0x1AC..0x1B0].copy_from_slice(&ticks.to_be_bytes());
+        write_bstr(&mut buf, 0x1B0, MAX_NAME_LEN, name)?;
+        buf[0x1F4..0x1F8].copy_from_slice(&parent.to_be_bytes());
+        buf[0x1F8..0x1FC].copy_from_slice(&extension.to_be_bytes());
+        buf[0x1FC..0x200].copy_from_slice(&ST_FILE.to_be_bytes());
+        let sum = normal_checksum(&buf, 5);
+        buf[0x14..0x18].copy_from_slice(&sum.to_be_bytes());
+        self.write_block_cached(block, buf);
+        Ok(())
+    }
+
+    /// Synthesize a file-extension block (T_LIST) listing the next batch
+    /// of data block pointers.
+    fn build_file_ext_block(
+        &mut self,
+        block: u32,
+        parent: u32,
+        data_blocks: &[u32],
+        next_extension: u32,
+    ) -> Result<(), FilesystemError> {
+        let mut buf = [0u8; BSIZE];
+        buf[0..4].copy_from_slice(&T_LIST.to_be_bytes());
+        buf[4..8].copy_from_slice(&block.to_be_bytes());
+        let high_seq = data_blocks.len() as u32;
+        buf[8..12].copy_from_slice(&high_seq.to_be_bytes());
+        for (i, &dblk) in data_blocks.iter().enumerate() {
+            let slot = MAX_DATA_BLOCKS - 1 - i;
+            buf[0x18 + slot * 4..0x18 + slot * 4 + 4].copy_from_slice(&dblk.to_be_bytes());
+        }
+        buf[0x1F4..0x1F8].copy_from_slice(&parent.to_be_bytes());
+        buf[0x1F8..0x1FC].copy_from_slice(&next_extension.to_be_bytes());
+        buf[0x1FC..0x200].copy_from_slice(&ST_FILE.to_be_bytes());
+        let sum = normal_checksum(&buf, 5);
+        buf[0x14..0x18].copy_from_slice(&sum.to_be_bytes());
+        self.write_block_cached(block, buf);
+        Ok(())
+    }
+
+    /// Write a payload byte slice as either an OFS data block (24-byte header
+    /// + up to 488 payload bytes) or an FFS data block (raw 512 bytes).
+    fn build_data_block(
+        &mut self,
+        block: u32,
+        file_header: u32,
+        seq_num: u32,
+        payload: &[u8],
+        next_data: u32,
+    ) -> Result<(), FilesystemError> {
+        let mut buf = [0u8; BSIZE];
+        if self.ffs {
+            let n = payload.len().min(BSIZE);
+            buf[..n].copy_from_slice(&payload[..n]);
+        } else {
+            // OFS header
+            buf[0..4].copy_from_slice(&T_DATA.to_be_bytes());
+            buf[4..8].copy_from_slice(&file_header.to_be_bytes());
+            buf[8..12].copy_from_slice(&seq_num.to_be_bytes());
+            let n = payload.len().min(488);
+            buf[12..16].copy_from_slice(&(n as u32).to_be_bytes());
+            buf[16..20].copy_from_slice(&next_data.to_be_bytes());
+            buf[24..24 + n].copy_from_slice(&payload[..n]);
+            // Checksum at 0x14 (long index 5).
+            let sum = normal_checksum(&buf, 5);
+            buf[0x14..0x18].copy_from_slice(&sum.to_be_bytes());
+        }
+        self.write_block_cached(block, buf);
+        Ok(())
+    }
+
+    /// Insert `entry_block` into the hash chain of `parent_dir_block` for
+    /// the given name. `parent_dir_block` must be ST_ROOT or ST_DIR.
+    fn hash_chain_insert(
+        &mut self,
+        parent_dir_block: u32,
+        entry_block: u32,
+        name: &str,
+    ) -> Result<(), FilesystemError> {
+        let hash = name_hash(name.as_bytes(), self.intl) as usize;
+        let slot_byte = 0x18 + hash * 4;
+        let mut parent = self.read_block(parent_dir_block)?;
+        let prev_head = read_u32(&parent, slot_byte);
+
+        // Update entry's nextSameHash → previous head; parent dir's hash
+        // slot → entry block.
+        let mut entry = self.read_block(entry_block)?;
+        entry[0x1F0..0x1F4].copy_from_slice(&prev_head.to_be_bytes());
+        // Recompute checksum (offset 0x14).
+        entry[0x14..0x18].copy_from_slice(&[0u8; 4]);
+        let sum = normal_checksum(&entry, 5);
+        entry[0x14..0x18].copy_from_slice(&sum.to_be_bytes());
+        self.write_block_cached(entry_block, entry);
+
+        parent[slot_byte..slot_byte + 4].copy_from_slice(&entry_block.to_be_bytes());
+        parent[0x14..0x18].copy_from_slice(&[0u8; 4]);
+        let sum = normal_checksum(&parent, 5);
+        parent[0x14..0x18].copy_from_slice(&sum.to_be_bytes());
+        self.write_block_cached(parent_dir_block, parent);
+
+        // Keep the cached `self.root` in sync if the parent is the root.
+        if parent_dir_block == self.root_block {
+            self.root.hash_table[hash] = entry_block;
+        }
+        Ok(())
+    }
+
+    /// Remove `entry_block` from `parent_dir_block`'s hash chain.
+    fn hash_chain_remove(
+        &mut self,
+        parent_dir_block: u32,
+        entry_block: u32,
+        name: &str,
+    ) -> Result<(), FilesystemError> {
+        let hash = name_hash(name.as_bytes(), self.intl) as usize;
+        let slot_byte = 0x18 + hash * 4;
+        let entry = self.read_block(entry_block)?;
+        let entry_next = read_u32(&entry, 0x1F0);
+
+        let mut parent = self.read_block(parent_dir_block)?;
+        let head = read_u32(&parent, slot_byte);
+
+        if head == entry_block {
+            parent[slot_byte..slot_byte + 4].copy_from_slice(&entry_next.to_be_bytes());
+            parent[0x14..0x18].copy_from_slice(&[0u8; 4]);
+            let sum = normal_checksum(&parent, 5);
+            parent[0x14..0x18].copy_from_slice(&sum.to_be_bytes());
+            self.write_block_cached(parent_dir_block, parent);
+            if parent_dir_block == self.root_block {
+                self.root.hash_table[hash] = entry_next;
+            }
+            return Ok(());
+        }
+
+        // Walk chain to find predecessor.
+        let mut prev = head;
+        loop {
+            if prev == 0 {
+                return Err(FilesystemError::NotFound(format!(
+                    "hash_chain_remove: entry {entry_block} not in chain of {parent_dir_block}"
+                )));
+            }
+            let prev_buf = self.read_block(prev)?;
+            let next = read_u32(&prev_buf, 0x1F0);
+            if next == entry_block {
+                let mut updated = prev_buf;
+                updated[0x1F0..0x1F4].copy_from_slice(&entry_next.to_be_bytes());
+                updated[0x14..0x18].copy_from_slice(&[0u8; 4]);
+                let sum = normal_checksum(&updated, 5);
+                updated[0x14..0x18].copy_from_slice(&sum.to_be_bytes());
+                self.write_block_cached(prev, updated);
+                return Ok(());
+            }
+            prev = next;
+        }
+    }
+
+    /// True if the directory at `dir_block` has at least one child.
+    fn dir_is_empty(&mut self, dir_block: u32) -> Result<bool, FilesystemError> {
+        let buf = self.read_block(dir_block)?;
+        for slot in 0..HT_SIZE {
+            let v = read_u32(&buf, 0x18 + slot * 4);
+            if v != 0 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn read_entry(&mut self, block: u32) -> Result<AffsEntry, FilesystemError> {
@@ -460,13 +801,43 @@ impl<R: Read + Seek> AffsFilesystem<R> {
     }
 }
 
+/// Encode `name` as an AFFS BSTR at byte offset `offset` of `buf`, with
+/// length capped at `max`. Returns an error if the name is empty or
+/// contains a forbidden byte (NUL, '/', ':').
+fn write_bstr(
+    buf: &mut [u8; BSIZE],
+    offset: usize,
+    max: usize,
+    name: &str,
+) -> Result<(), FilesystemError> {
+    if name.is_empty() {
+        return Err(FilesystemError::InvalidData("name cannot be empty".into()));
+    }
+    let bytes = name.as_bytes();
+    if bytes.len() > max {
+        return Err(FilesystemError::InvalidData(format!(
+            "AFFS name '{name}' exceeds {max} bytes"
+        )));
+    }
+    for &b in bytes {
+        if b == 0 || b == b'/' || b == b':' {
+            return Err(FilesystemError::InvalidData(format!(
+                "AFFS name '{name}' contains forbidden character"
+            )));
+        }
+    }
+    buf[offset] = bytes.len() as u8;
+    buf[offset + 1..offset + 1 + bytes.len()].copy_from_slice(bytes);
+    Ok(())
+}
+
 fn read_bitmap<R: Read + Seek>(
     reader: &mut R,
     partition_offset: u64,
     block_size: u64,
     root: &AffsRootBlock,
     total_blocks: u32,
-) -> Result<Vec<u8>, FilesystemError> {
+) -> Result<(Vec<u8>, Vec<u32>), FilesystemError> {
     // Each bitmap block holds 127 u32 map entries = 127*32 = 4064 bits.
     // We concatenate map[1..128] from each bitmap block into a flat byte
     // array. The bitmap covers blocks [2 .. total_blocks).
@@ -526,7 +897,7 @@ fn read_bitmap<R: Read + Seek>(
             }
         }
     }
-    Ok(bitmap)
+    Ok((bitmap, pages))
 }
 
 impl<R: Read + Seek + Send> Filesystem for AffsFilesystem<R> {
@@ -627,6 +998,341 @@ impl<R: Read + Seek + Send> Filesystem for AffsFilesystem<R> {
         }
         Ok((last as u64 + 1) * self.block_size)
     }
+
+    fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
+        if name.is_empty() {
+            return Err(FilesystemError::InvalidData(
+                "AFFS name cannot be empty".into(),
+            ));
+        }
+        if name.as_bytes().len() > MAX_NAME_LEN {
+            return Err(FilesystemError::InvalidData(format!(
+                "AFFS name '{name}' exceeds {MAX_NAME_LEN} bytes (Long Names not yet supported for write)"
+            )));
+        }
+        for b in name.as_bytes() {
+            if *b == 0 || *b == b'/' || *b == b':' {
+                return Err(FilesystemError::InvalidData(format!(
+                    "AFFS name '{name}' contains forbidden character"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<R: Read + Write + Seek + Send> EditableFilesystem for AffsFilesystem<R> {
+    fn create_file(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        data: &mut dyn Read,
+        data_len: u64,
+        _options: &CreateFileOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        self.validate_name(name)?;
+        let parent_block = if parent.location == 0 {
+            self.root_block
+        } else {
+            parent.location as u32
+        };
+        // Reject duplicates.
+        let existing = self.lookup_in_dir(parent_block, name)?;
+        if existing.is_some() {
+            return Err(FilesystemError::AlreadyExists(name.to_string()));
+        }
+
+        // Allocate the file header block first.
+        let header_block = self.alloc_block()?;
+
+        // Per-data-block payload size depends on variant.
+        let payload_per_block = if self.ffs { BSIZE as u64 } else { 488 };
+        let num_data_blocks = if data_len == 0 {
+            0
+        } else {
+            data_len.div_ceil(payload_per_block) as u32
+        };
+
+        // Read all payload up-front so we know we have enough disk for the
+        // whole file before allocating data blocks. (For very large files
+        // we'd want a streaming approach; AFFS volumes are at most ~2 GiB
+        // so loading the whole file is acceptable for v1.)
+        let mut payload = Vec::with_capacity(data_len as usize);
+        if data_len > 0 {
+            // Reading exactly `data_len` bytes; if the source provides fewer,
+            // surface a clear error rather than silently truncating.
+            let mut taker = data.take(data_len);
+            taker
+                .read_to_end(&mut payload)
+                .map_err(FilesystemError::Io)?;
+            if (payload.len() as u64) != data_len {
+                self.free_block(header_block)?;
+                return Err(FilesystemError::InvalidData(format!(
+                    "create_file: source produced {} bytes, expected {}",
+                    payload.len(),
+                    data_len
+                )));
+            }
+        }
+
+        // Allocate every data block.
+        let mut data_blocks: Vec<u32> = Vec::with_capacity(num_data_blocks as usize);
+        for _ in 0..num_data_blocks {
+            match self.alloc_block() {
+                Ok(b) => data_blocks.push(b),
+                Err(e) => {
+                    // Roll back partial allocation.
+                    for &b in &data_blocks {
+                        let _ = self.free_block(b);
+                    }
+                    let _ = self.free_block(header_block);
+                    return Err(e);
+                }
+            }
+        }
+
+        // Write data blocks.
+        let mut payload_offset = 0usize;
+        for (i, &block) in data_blocks.iter().enumerate() {
+            let chunk_end = (payload_offset + payload_per_block as usize).min(payload.len());
+            let chunk = &payload[payload_offset..chunk_end];
+            let seq = (i as u32) + 1;
+            let next_data = data_blocks.get(i + 1).copied().unwrap_or(0);
+            self.build_data_block(block, header_block, seq, chunk, next_data)?;
+            payload_offset = chunk_end;
+        }
+
+        // For files with > MAX_DATA_BLOCKS data blocks, build the chain of
+        // file-extension blocks. The first MAX_DATA_BLOCKS pointers live in
+        // the header; each extension holds MAX_DATA_BLOCKS more.
+        let inline_count = data_blocks.len().min(MAX_DATA_BLOCKS);
+        let header_data_blocks = &data_blocks[..inline_count];
+        let remainder = &data_blocks[inline_count..];
+
+        // Allocate extension blocks up front so we know where to chain.
+        let ext_count = remainder.chunks(MAX_DATA_BLOCKS).count();
+        let mut ext_blocks: Vec<u32> = Vec::with_capacity(ext_count);
+        for _ in 0..ext_count {
+            match self.alloc_block() {
+                Ok(b) => ext_blocks.push(b),
+                Err(e) => {
+                    for &b in &ext_blocks {
+                        let _ = self.free_block(b);
+                    }
+                    for &b in &data_blocks {
+                        let _ = self.free_block(b);
+                    }
+                    let _ = self.free_block(header_block);
+                    return Err(e);
+                }
+            }
+        }
+        let header_extension = ext_blocks.first().copied().unwrap_or(0);
+
+        for (idx, chunk) in remainder.chunks(MAX_DATA_BLOCKS).enumerate() {
+            let this_block = ext_blocks[idx];
+            let next_ext = ext_blocks.get(idx + 1).copied().unwrap_or(0);
+            self.build_file_ext_block(this_block, header_block, chunk, next_ext)?;
+        }
+
+        let first_data = data_blocks.first().copied().unwrap_or(0);
+        self.build_file_header_block(
+            header_block,
+            parent_block,
+            name,
+            data_len as u32,
+            header_data_blocks,
+            first_data,
+            header_extension,
+        )?;
+        self.hash_chain_insert(parent_block, header_block, name)?;
+
+        // Build the returned FileEntry.
+        let path = if parent.path == "/" {
+            format!("/{name}")
+        } else {
+            format!("{}/{}", parent.path, name)
+        };
+        Ok(FileEntry::new_file(
+            name.to_string(),
+            path,
+            data_len,
+            header_block as u64,
+        ))
+    }
+
+    fn create_directory(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        _options: &CreateDirectoryOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        self.validate_name(name)?;
+        let parent_block = if parent.location == 0 {
+            self.root_block
+        } else {
+            parent.location as u32
+        };
+        let existing = self.lookup_in_dir(parent_block, name)?;
+        if existing.is_some() {
+            return Err(FilesystemError::AlreadyExists(name.to_string()));
+        }
+        let block = self.alloc_block()?;
+        self.build_dir_block(block, parent_block, name)?;
+        self.hash_chain_insert(parent_block, block, name)?;
+        let path = if parent.path == "/" {
+            format!("/{name}")
+        } else {
+            format!("{}/{}", parent.path, name)
+        };
+        Ok(FileEntry::new_directory(
+            name.to_string(),
+            path,
+            block as u64,
+        ))
+    }
+
+    fn delete_entry(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+    ) -> Result<(), FilesystemError> {
+        let parent_block = if parent.location == 0 {
+            self.root_block
+        } else {
+            parent.location as u32
+        };
+        let block = entry.location as u32;
+        let parsed = self.read_entry(block)?;
+
+        match parsed.sec_type {
+            ST_DIR => {
+                if !self.dir_is_empty(block)? {
+                    return Err(FilesystemError::InvalidData(format!(
+                        "directory '{}' is not empty",
+                        entry.name
+                    )));
+                }
+                self.hash_chain_remove(parent_block, block, &entry.name)?;
+                self.free_block(block)?;
+            }
+            ST_FILE => {
+                // Walk data blocks (header + all extensions) and free.
+                let mut cur_data = parsed.data_blocks.clone();
+                let mut next_ext = parsed.extension;
+                loop {
+                    for &dblk in &cur_data {
+                        if dblk != 0 {
+                            self.free_block(dblk)?;
+                        }
+                    }
+                    if next_ext == 0 {
+                        break;
+                    }
+                    let ext = self.read_entry(next_ext)?;
+                    let this_ext = next_ext;
+                    cur_data = ext.data_blocks.clone();
+                    next_ext = ext.extension;
+                    self.free_block(this_ext)?;
+                }
+                self.hash_chain_remove(parent_block, block, &entry.name)?;
+                self.free_block(block)?;
+            }
+            _ => {
+                return Err(FilesystemError::Unsupported(format!(
+                    "deleting AFFS entry with secType {} is not supported",
+                    parsed.sec_type
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
+        // Write every dirty block to disk in block-number order — gives the
+        // OS a clean forward sweep for the file system cache and makes the
+        // worst case (a half-flushed sync) the most innocuous: bitmap
+        // pages and the root come last.
+        let mut keys: Vec<u32> = self.dirty.keys().copied().collect();
+        keys.sort_unstable();
+        for block in keys {
+            let buf = self.dirty.get(&block).copied().unwrap();
+            let off = self.partition_offset + block as u64 * self.block_size;
+            self.reader.seek(SeekFrom::Start(off))?;
+            self.reader.write_all(&buf).map_err(FilesystemError::Io)?;
+        }
+        self.reader.flush().map_err(FilesystemError::Io)?;
+        self.dirty.clear();
+        Ok(())
+    }
+
+    fn free_space(&mut self) -> Result<u64, FilesystemError> {
+        let mut free = 0u64;
+        for block in 2..self.total_blocks {
+            if !self.block_is_allocated(block) {
+                free += self.block_size;
+            }
+        }
+        Ok(free)
+    }
+}
+
+impl<R: Read + Seek> AffsFilesystem<R> {
+    /// Find a child of `dir_block` matching `name` (case-insensitive per
+    /// the active variant's folding). Returns `None` when absent.
+    fn lookup_in_dir(
+        &mut self,
+        dir_block: u32,
+        name: &str,
+    ) -> Result<Option<u32>, FilesystemError> {
+        let hash = name_hash(name.as_bytes(), self.intl) as usize;
+        let dir_buf = if dir_block == self.root_block {
+            // Use the cached root hash table to avoid re-parsing the block.
+            None
+        } else {
+            Some(self.read_block(dir_block)?)
+        };
+        let mut chain = match &dir_buf {
+            Some(buf) => read_u32(buf, 0x18 + hash * 4),
+            None => self.root.hash_table[hash],
+        };
+        while chain != 0 {
+            let entry = self.read_entry(chain)?;
+            if names_equal(&entry.name, name, self.intl) {
+                return Ok(Some(chain));
+            }
+            chain = entry.next_same_hash;
+        }
+        Ok(None)
+    }
+}
+
+/// Case-insensitive name comparison using the same case folding as the
+/// hash function. Always operates byte-for-byte on the ISO-8859-1 encoding.
+fn names_equal(a: &str, b: &str, intl: bool) -> bool {
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    if ab.len() != bb.len() {
+        return false;
+    }
+    for i in 0..ab.len() {
+        let ua = fold(ab[i], intl);
+        let ub = fold(bb[i], intl);
+        if ua != ub {
+            return false;
+        }
+    }
+    true
+}
+
+fn fold(b: u8, intl: bool) -> u8 {
+    if (b'a'..=b'z').contains(&b) {
+        return b - 0x20;
+    }
+    if intl && (0xE0..=0xFE).contains(&b) && b != 0xF7 {
+        return b - 0x20;
+    }
+    b
 }
 
 /// Layout-preserving compaction reader for AFFS volumes.
@@ -828,6 +1534,88 @@ mod tests {
         let root = fs.root().expect("root");
         let entries = fs.list_directory(&root).expect("list");
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn create_file_and_directory_roundtrip() {
+        use super::super::filesystem::{CreateDirectoryOptions, CreateFileOptions};
+
+        let img = make_empty_floppy_image(1, "RW");
+        let mut cur = Cursor::new(img);
+        {
+            let mut fs = AffsFilesystem::open(&mut cur, 0).expect("open");
+            let root = fs.root().expect("root");
+            fs.create_directory(&root, "Docs", &CreateDirectoryOptions::default())
+                .expect("mkdir");
+            let payload = b"Hello, Amiga!".to_vec();
+            let mut src = std::io::Cursor::new(payload.clone());
+            fs.create_file(
+                &root,
+                "README",
+                &mut src,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create_file");
+            fs.sync_metadata().expect("sync");
+        }
+        // Re-open and read back.
+        let mut fs = AffsFilesystem::open(&mut cur, 0).expect("reopen");
+        let root = fs.root().expect("root");
+        let children = fs.list_directory(&root).expect("list");
+        let names: Vec<&str> = children.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"Docs"), "Docs missing: {names:?}");
+        assert!(names.contains(&"README"), "README missing: {names:?}");
+        let readme = children.iter().find(|c| c.name == "README").unwrap();
+        assert_eq!(readme.size, 13);
+        let data = fs.read_file(readme, usize::MAX).expect("read");
+        assert_eq!(&data, b"Hello, Amiga!");
+    }
+
+    #[test]
+    fn delete_entry_frees_blocks() {
+        use super::super::filesystem::CreateFileOptions;
+
+        let img = make_empty_floppy_image(1, "DEL");
+        let mut cur = Cursor::new(img);
+        let allocated_before;
+        let allocated_after_create;
+        let allocated_after_delete;
+        {
+            let mut fs = AffsFilesystem::open(&mut cur, 0).expect("open");
+            allocated_before = fs.allocated_blocks();
+            let root = fs.root().expect("root");
+            let payload = vec![0xAAu8; 2000];
+            let mut src = std::io::Cursor::new(payload.clone());
+            fs.create_file(
+                &root,
+                "big",
+                &mut src,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create_file");
+            fs.sync_metadata().expect("sync");
+            allocated_after_create = fs.allocated_blocks();
+            // The file should have grown the allocation by:
+            //   1 header + ceil(2000/512) = 1 + 4 = 5 blocks.
+            assert_eq!(allocated_after_create - allocated_before, 5);
+
+            let children = fs.list_directory(&root).expect("list");
+            let big = children.iter().find(|c| c.name == "big").unwrap().clone();
+            fs.delete_entry(&root, &big).expect("delete");
+            fs.sync_metadata().expect("sync");
+            allocated_after_delete = fs.allocated_blocks();
+        }
+        assert_eq!(
+            allocated_after_delete, allocated_before,
+            "delete should free all blocks the file occupied"
+        );
+        // Reopen and verify the entry is gone.
+        let mut fs = AffsFilesystem::open(&mut cur, 0).expect("reopen");
+        let root = fs.root().expect("root");
+        let children = fs.list_directory(&root).expect("list");
+        assert!(children.iter().all(|c| c.name != "big"));
     }
 
     #[test]
