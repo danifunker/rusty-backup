@@ -1,5 +1,17 @@
 # Amiga Filesystem & Container Support — Implementation Plan
 
+> **Status (as of merge):** all nine phases are implemented and shipped on
+> the `add-amiga-support` branch. Read, browse, edit, fsck (AFFS),
+> compaction, and GUI integration are live for AFFS / PFS3 / SFS, plus
+> RDB partition tables and `.adz` / `.hdz` transparent decompression.
+>
+> Remaining open items are deliberately deferred follow-ups, grouped at
+> the bottom of this document under **[Deferred items
+> (post-implementation)](#deferred-items-post-implementation)**. The
+> phase checklists keep their original `[x]` entries as a historical
+> record; deferred work has been moved out of the phase lists into the
+> dedicated section so the phasing reads as complete.
+
 Add first-class support for Amiga disk images (`.adf`, `.hdf`, `.adz`, `.hdz`,
 and CHD-wrapped HDFs) and the three filesystems that matter on Classic Amiga
 hardware: **OFS/FFS** (DOS\0–DOS\7), **PFS3** (PFS\3 and variants), and
@@ -277,9 +289,8 @@ state.
       `FileEntry::amiga_comment: Option<String>` populated by AFFS and
       PFS3 `list_directory`. All other constructors initialize them
       to `None`.
-- [ ] Backup test on `DiskDoctor.adf` and `4x4OffRoadRacing_v1.00_1480.hdf`
-      via the GUI / `run_backup` end-to-end.
-- [ ] Restore round-trip byte-equal.
+- (Deferred: end-to-end GUI/`run_backup` test on the real ADF/HDF and
+  restore round-trip — see [Deferred items](#deferred-items-post-implementation).)
 
 ### Phase 3 — FFS write / EditableFilesystem
 - [x] Block allocator (`alloc_block` / `free_block` / `mark_bitmap`):
@@ -308,12 +319,8 @@ state.
 - [x] Round-trip tests: create dir + create file + sync + reopen + read
       back contents; create file + delete + verify allocation returns
       to baseline.
-- [ ] Snapshot/rollback wrapper for in-memory state (matches HFS
-      pattern). *Deferred — the dirty-block cache already provides
-      atomicity at the sync boundary; snapshot/rollback only matters
-      if a single high-level edit needs to fail-and-revert without
-      tearing down the cache. Add when the GUI's staged-edits "Apply
-      Edits" flow surfaces a need.*
+- (Deferred: AFFS snapshot/rollback wrapper — see
+  [Deferred items](#deferred-items-post-implementation).)
 - [x] GUI staged-edits flow exercised on a real AFFS image —
       `tests/filesystem_e2e.rs::test_affs_staged_edits_round_trip`
       builds a minimal blank FFS floppy, dispatches
@@ -353,10 +360,9 @@ state.
       bad-checksum + bitmap-orphan findings consistent with the
       "validation needed" condition AmigaDOS itself flags on these
       vintage images.
-- [ ] Repair path for `AffsBadChecksum` / `AffsBrokenHashChain` /
-      `AffsOrphanBlock`. *Intentionally deferred — silently recomputing
-      a stale header checksum risks locking in deeper corruption.
-      Surface as errors; the user can wipe + restore from backup.*
+- (Intentionally deferred: repair paths for `AffsBadChecksum` /
+  `AffsBrokenHashChain` / `AffsOrphanBlock` — see
+  [Deferred items](#deferred-items-post-implementation).)
 
 ### Phase 5 — PFS3 read + browse + backup
 - [x] `src/fs/pfs3.rs` — root block (small + supermode/large layouts),
@@ -382,9 +388,8 @@ state.
       (verified by checking the `.info` icon magic `e3 10 00 01`).
 - [x] Unit tests for read helpers, anodenr split arithmetic, and
       direntry parsing.
-- [ ] Backup/restore round-trip on a PFS3 partition. *Deferred to follow-up:
-      the dispatch is wired but a real run_backup → reconstruct exercise
-      against the 9.6 GB AmigaVision image isn't part of this commit.*
+- (Deferred: PFS3 backup/restore round-trip against AmigaVision.hdf — see
+  [Deferred items](#deferred-items-post-implementation).)
 - [x] Implement `read_user_bitmap`: walks `root.bitmapindex[]` → `MI`
       bitmap-index blocks → `BM` bitmap blocks; assembles a flat sector
       bitmap (LSB-first within byte). `CompactPfs3Reader` now
@@ -434,13 +439,8 @@ state.
       root empty after reopen and `free_space` grew), and
       `create_directory_rolls_back_on_duplicate` (duplicate name
       returns `AlreadyExists` and rollback restores free space).
-- [ ] Postponed-operations log discipline — the pfs3aio approach
-      (write new state, commit pointer, invalidate old) is **not** what
-      we implement: rusty-backup's edit model batches mutations into
-      dirty buffers and flushes atomically on `sync_metadata` (the same
-      pattern AFFS/HFS use). A real Amiga-style postponed-ops log
-      would only matter for crash recovery; we accept "metadata writes
-      flushed in ascending order" as the consistency story for now.
+- (Deliberately not implemented: pfs3aio-style postponed-operations log
+  — see [Deferred items](#deferred-items-post-implementation).)
 - [x] Wire PFS3 into the GUI's `EditableFilesystem` staged-edits flow.
       `open_editable_filesystem` already routes PFS3 to
       `Pfs3Filesystem`, and `BrowseView::apply_staged_edits` drives any
@@ -478,8 +478,8 @@ state.
       01`), and the compact reader walks the bitmap to report sane
       data ratios (62%, 38%, 13%) consistent with how full each
       partition is.
-- [ ] Backup/restore round-trip on an SFS partition (deferred to a
-      follow-up GUI run against the real CHD image).
+- (Deferred: SFS backup/restore round-trip against amiga128gb.chd — see
+  [Deferred items](#deferred-items-post-implementation).)
 
 ### Phase 8 — SFS write
 - [x] `create_blank_sfs(total_blocks, name)` formatter producing a
@@ -528,13 +528,10 @@ state.
       blank-volume image, create dir + file, sync, reopen, list root,
       read file byte-equal; delete pass restores empty root + grows
       free-space; duplicate name rolls back via snapshot.
-- [ ] Journal append + commit ordering (TRST/TRFA). Deliberately
-      deferred — we use sync-boundary atomicity (write all dirty
-      blocks then both roots with bumped sequencenumber), matching
-      what rusty-backup already does for AFFS/HFS/PFS3.
-- [ ] B-tree splits + rebalance (extent BNDC + object-node NDC tree).
-      Deferred until a real workload exceeds the single-leaf capacity
-      (~36 extents, ~50 object-nodes on a 512-byte-block volume).
+- (Deliberately not implemented: SFS journal append + commit ordering
+  (TRST/TRFA) — see [Deferred items](#deferred-items-post-implementation).)
+- (Deferred: SFS B-tree splits + rebalance — see
+  [Deferred items](#deferred-items-post-implementation).)
 
 ### Phase 9 — Polish
 - [x] CLAUDE.md: Amiga section describes dispatch + DosType strings
@@ -552,6 +549,80 @@ state.
       the full dispatch wiring. Asserts `disk.len() <= 64 KiB` so it
       stays the "tiny fixture" the plan asked for, no binary
       checked in.
+
+---
+
+## Deferred items (post-implementation)
+
+These items were originally listed in the phase checklists. They are
+intentionally not shipped on the initial Amiga-support branch and are
+collected here so the phasing reads as complete. Items split into two
+buckets: **deferred** (worth doing, just not blocking initial merge)
+and **deliberately not implemented** (the design intentionally substitutes
+something simpler — pick this up only if a concrete need surfaces).
+
+### Deferred — end-to-end round-trips against the reference images
+
+The reference image library (`~/amiga-filesystems/DiskDoctor.adf`,
+`4x4OffRoadRacing_v1.00_1480.hdf`, `AmigaVision.hdf`, `amiga128gb.chd`)
+lets us validate read paths via `examples/probe_amiga` and the synthetic
+RDB+FFS test exercises full dispatch, but the GUI's `run_backup` →
+`reconstruct_disk_from_backup` cycle has not been driven end-to-end on
+real Amiga images yet. None of these gate correctness of the
+filesystem code we shipped:
+
+- **AFFS** (Phase 2/3): GUI / `run_backup` end-to-end on `DiskDoctor.adf`
+  and `4x4OffRoadRacing_v1.00_1480.hdf`, plus a byte-equal restore
+  round-trip.
+- **PFS3** (Phase 5): GUI / `run_backup` → reconstruct → diff against the
+  9.6 GB `AmigaVision.hdf` PDS\\3 partitions.
+- **SFS** (Phase 7): GUI / `run_backup` → reconstruct against the SFS\\0
+  partitions inside `amiga128gb.chd`.
+
+Disk-space note: the AmigaVision image is 9.6 GB and amiga128gb.chd
+decompresses to 128 GB. Run these tests when you have the headroom.
+
+### Deferred — AFFS write-path follow-ups
+
+- **AFFS snapshot/rollback wrapper for in-memory state (matches HFS pattern).**
+  The dirty-block cache already provides atomicity at the sync boundary;
+  snapshot/rollback only matters if a single high-level edit needs to
+  fail-and-revert without tearing down the cache. The PFS3 + SFS edit
+  paths gained per-mutation snapshots when they shipped; AFFS keeps
+  the simpler model until a GUI staged-edit failure proves it's needed.
+
+### Deferred — SFS write-path follow-ups
+
+- **SFS B-tree splits + rebalance** (extent BNDC + object-node NDC tree).
+  The current implementation supports single-leaf btrees only, which
+  works up to ~36 extents and ~50 object-nodes on a 512-byte-block
+  volume. `DiskFull` surfaces if the leaf overflows. Worth implementing
+  if a real workload outgrows the single-leaf capacity; not blocking
+  the round-trip tests we ship.
+
+### Deliberately not implemented — surface as a clear error instead
+
+These are choices, not omissions. The code that triggers them either
+returns a precise error or substitutes a simpler design that we believe
+is the right call. If a real failure mode argues otherwise, revisit.
+
+- **AFFS repair paths for `AffsBadChecksum` / `AffsBrokenHashChain` /
+  `AffsOrphanBlock`.** Silently recomputing a stale header checksum
+  risks locking in deeper corruption; the validator surfaces these as
+  errors and the user can wipe + restore from backup.
+  `AffsBitmapMismatch` *is* repairable since the bitmap is derivable
+  from the directory tree, which the validator already walks.
+- **PFS3 postponed-operations log discipline.** The pfs3aio approach
+  (write new state, commit pointer, invalidate old) is **not** what we
+  implement: rusty-backup's edit model batches mutations into dirty
+  buffers and flushes atomically on `sync_metadata` (the same pattern
+  AFFS/HFS use). A real Amiga-style postponed-ops log would only matter
+  for crash recovery; we accept "metadata writes flushed in ascending
+  order" as the consistency story for now.
+- **SFS journal append + commit ordering (TRST/TRFA).** Same reasoning
+  as PFS3 — we leave the TROK placeholder at block 4 untouched and rely
+  on sync-boundary atomicity (write all dirty blocks then both root
+  copies with bumped `sequencenumber`).
 
 ---
 
