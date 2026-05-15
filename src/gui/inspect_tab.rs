@@ -2115,6 +2115,45 @@ impl InspectTab {
                         }
                     }
 
+                    // MBR type 0x83 is officially "Linux", but MSX HDD formatters
+                    // (Nextor and similar) reuse it for FAT12/16. Probe the VBR
+                    // and replace the generic "Linux" label with the real
+                    // filesystem family so the inspect grid reflects what the
+                    // browse/edit dispatch will actually open. For FAT VBRs at
+                    // 0x83, also tag "(MSX)" since standard PC tooling never
+                    // writes FAT under 0x83 — it's specific to MSX HDD layouts.
+                    for part in &mut partitions {
+                        if part.partition_type_byte != 0x83 || part.is_extended_container {
+                            continue;
+                        }
+                        if let Some(mut br) = make_probe_reader() {
+                            match rusty_backup::fs::probe_0x83_fs_type(
+                                &mut br,
+                                part.start_lba * 512,
+                            ) {
+                                Some("FAT") => {
+                                    let part_offset = part.start_lba * 512;
+                                    let subtype = make_probe_reader().and_then(|br2| {
+                                        rusty_backup::fs::fat::FatFilesystem::open(br2, part_offset)
+                                            .ok()
+                                            .map(|fs| {
+                                                use rusty_backup::fs::Filesystem;
+                                                fs.fs_type().to_string()
+                                            })
+                                    });
+                                    part.type_name = match subtype {
+                                        Some(t) => format!("{t} (MSX)"),
+                                        None => "FAT (MSX)".to_string(),
+                                    };
+                                }
+                                Some(other) => {
+                                    part.type_name = other.to_string();
+                                }
+                                None => {}
+                            }
+                        }
+                    }
+
                     // Probe HFS/HFS+ partitions for their allocation block size
                     // so the inspect grid can show it. Covers APM Apple_HFS,
                     // MBR type 0xAF, and HFS/HFS+ superfloppies.
@@ -2197,6 +2236,11 @@ impl InspectTab {
                             .as_deref()
                             .map(rusty_backup::fs::is_amiga_pfs3_type)
                             .unwrap_or(false);
+                        let is_amiga_sfs = part
+                            .partition_type_string
+                            .as_deref()
+                            .map(rusty_backup::fs::is_amiga_sfs_type)
+                            .unwrap_or(false);
 
                         let label_opt: Option<String> = if is_fat_byte || is_fat_superfloppy {
                             make_probe_reader().and_then(|br| {
@@ -2231,15 +2275,38 @@ impl InspectTab {
                                     fs.volume_label().map(str::to_string)
                                 })
                             })
+                        } else if is_amiga_sfs {
+                            make_probe_reader().and_then(|br| {
+                                rusty_backup::fs::sfs::SfsFilesystem::open(br, part.start_lba * 512)
+                                    .ok()
+                                    .and_then(|fs| {
+                                        use rusty_backup::fs::Filesystem;
+                                        fs.volume_label().map(str::to_string)
+                                    })
+                            })
                         } else {
                             None
                         };
 
-                        if let Some(label) = label_opt {
-                            let trimmed = label.trim();
-                            if !trimmed.is_empty() {
-                                partition_volume_labels.insert(part.index, trimmed.to_string());
+                        // For Amiga RDB partitions, combine drive name + volume
+                        // label so the column shows both ("DH0 - Workbench").
+                        // Drive name alone is also useful when the volume name
+                        // is empty, so include it as a fallback. See
+                        // partition::PartitionInfo::drv_name for the source.
+                        let combined_label = match (part.drv_name.as_deref(), label_opt.as_deref())
+                        {
+                            (Some(drv), Some(vol)) if !drv.is_empty() && !vol.trim().is_empty() => {
+                                Some(format!("{drv} - {}", vol.trim()))
                             }
+                            (Some(drv), _) if !drv.is_empty() => Some(drv.to_string()),
+                            (_, Some(vol)) if !vol.trim().is_empty() => {
+                                Some(vol.trim().to_string())
+                            }
+                            _ => None,
+                        };
+
+                        if let Some(label) = combined_label {
+                            partition_volume_labels.insert(part.index, label);
                         }
                     }
 
@@ -3383,6 +3450,17 @@ impl InspectTab {
             let preopen = None;
             self.browse_view
                 .open(path, offset, ptype, partition_type_string, preopen);
+            // Surface the Amiga drive name ("DH0") in the browser header so
+            // users tracking several RDB partitions can tell which one is
+            // open without going back to the inspect grid. The volume label
+            // (populated after open) gets concatenated as "DH0 - <label>".
+            if let Some(part) = self.partitions.iter().find(|p| p.index == part_index) {
+                if let Some(drv) = part.drv_name.as_deref() {
+                    if !drv.is_empty() {
+                        self.browse_view.set_label_prefix(drv.to_string());
+                    }
+                }
+            }
             // If this CHD is the body of a single-file-chd backup, hand
             // the backup folder to BrowseView so a successful chd_edit
             // save refreshes metadata.json (per-partition checksums +

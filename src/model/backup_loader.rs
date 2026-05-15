@@ -198,6 +198,7 @@ pub fn load_clonezilla(folder: &Path) -> Result<ClonezillaLoadOutcome> {
             partition_type_string: None,
             hfs_block_size: None,
             rdb_part_block: None,
+            drv_name: None,
         })
         .collect();
 
@@ -276,6 +277,7 @@ fn partitions_from_metadata(meta: &BackupMetadata) -> Vec<PartitionInfo> {
                 partition_type_string: p.partition_type_string.clone(),
                 hfs_block_size: None,
                 rdb_part_block: None,
+                drv_name: None,
             }
         })
         .collect()
@@ -325,6 +327,7 @@ fn merge_logical_partitions_from_metadata(
                 partition_type_string: pm.partition_type_string.clone(),
                 hfs_block_size: None,
                 rdb_part_block: None,
+                drv_name: None,
             });
             added += 1;
         }

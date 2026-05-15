@@ -67,6 +67,10 @@ pub struct PartitionInfo {
     /// in place (e.g. toggling the bootable flag). `None` for all other
     /// partition table types.
     pub rdb_part_block: Option<u64>,
+    /// AmigaDOS drive name (e.g. "DH0") from the RDB PART block. Distinct
+    /// from the volume label, which is the disk name in the AFFS/PFS3/SFS
+    /// root block. `None` for non-RDB partitions.
+    pub drv_name: Option<String>,
 }
 
 /// Standard floppy disk image sizes (bytes).
@@ -361,6 +365,7 @@ impl PartitionTable {
                         partition_type_string: None,
                         hfs_block_size: None,
                         rdb_part_block: None,
+                        drv_name: None,
                     })
                     .collect();
 
@@ -378,6 +383,7 @@ impl PartitionTable {
                         partition_type_string: None,
                         hfs_block_size: None,
                         rdb_part_block: None,
+                        drv_name: None,
                     });
                 }
 
@@ -399,6 +405,7 @@ impl PartitionTable {
                     partition_type_string: Some(e.type_guid.to_string_formatted()),
                     hfs_block_size: None,
                     rdb_part_block: None,
+                    drv_name: None,
                 })
                 .collect(),
             PartitionTable::Apm(apm) => {
@@ -419,6 +426,7 @@ impl PartitionTable {
                         partition_type_string: Some(e.partition_type.clone()),
                         hfs_block_size: None,
                         rdb_part_block: None,
+                        drv_name: None,
                     })
                     .collect()
             }
@@ -462,6 +470,7 @@ impl PartitionTable {
                             partition_type_string: None,
                             hfs_block_size: None,
                             rdb_part_block: None,
+                            drv_name: None,
                         })
                     })
                     .collect()
@@ -488,6 +497,7 @@ impl PartitionTable {
                     partition_type_string: Some(p.dos_type_string()),
                     hfs_block_size: None,
                     rdb_part_block: Some(p.block_num),
+                    drv_name: Some(p.drv_name.clone()),
                 })
                 .collect(),
             PartitionTable::None {
@@ -523,6 +533,7 @@ impl PartitionTable {
                     },
                     hfs_block_size: None,
                     rdb_part_block: None,
+                    drv_name: None,
                 }]
             }
         }

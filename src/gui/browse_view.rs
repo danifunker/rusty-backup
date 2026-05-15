@@ -20,6 +20,12 @@ use rusty_backup::rbformats::chd_edit::{
 
 const MAX_PREVIEW_SIZE: usize = 1024 * 1024; // 1 MB max file preview
 
+/// Beyond this many bytes, the tree-view popup's `TextEdit::multiline` widget
+/// becomes unresponsive (egui re-lays the entire text every frame). We route
+/// past the threshold straight to a save-to-file dialog with a "show anyway"
+/// escape hatch. 1 MiB ~= 30–50k lines depending on indentation.
+const TREE_INLINE_RENDER_LIMIT: usize = 1024 * 1024;
+
 /// Filesystem browser view for inspecting partition contents.
 pub struct BrowseView {
     /// Root entry of the filesystem.
@@ -40,6 +46,11 @@ pub struct BrowseView {
     /// Filesystem info.
     fs_type: String,
     volume_label: String,
+    /// Optional prefix prepended to the volume label in the header (e.g. the
+    /// Amiga drive name "DH0"). Set by the caller via `set_label_prefix`
+    /// right after `open` so the header reads "Label: DH0 - Workbench". When
+    /// the volume label is empty the prefix is shown on its own.
+    label_prefix: String,
     /// Where to open the filesystem from (path / preopen handle / caches).
     /// `Clone` so background workers can be handed a session value.
     session: BrowseSession,
@@ -91,6 +102,12 @@ pub struct BrowseView {
     show_tree_popup: bool,
     /// Whether the tree popup shows filesystem IDs.
     tree_show_ids: bool,
+    /// When the generated tree text exceeds `TREE_INLINE_RENDER_LIMIT`, the
+    /// poll routine routes through a "save first" dialog instead of opening
+    /// the multiline TextEdit popup — egui's text widget repaints the entire
+    /// laid-out text every frame and grinds to a halt at multi-MB sizes
+    /// (originally hit on a 128 GB Amiga RDB partition).
+    show_tree_large_dialog: bool,
     /// Set while a worker thread is running `format_tree`. The thread takes
     /// ownership of the cached filesystem; we poll the status each frame and
     /// hand the fs back to `cached_fs` once the walk completes.
@@ -251,6 +268,7 @@ impl Default for BrowseView {
             error: None,
             fs_type: String::new(),
             volume_label: String::new(),
+            label_prefix: String::new(),
             session: BrowseSession::new(),
             active: false,
             resource_fork_mode: ResourceForkMode::AppleDouble,
@@ -276,6 +294,7 @@ impl Default for BrowseView {
             tree_text: None,
             show_tree_popup: false,
             tree_show_ids: false,
+            show_tree_large_dialog: false,
             staged_edits: EditQueue::new(),
             show_unsaved_dialog: false,
             pending_close: false,
@@ -407,6 +426,14 @@ impl BrowseView {
         self.pending_open = Some(self.session.spawn_open());
     }
 
+    /// Set a label prefix shown alongside the volume label in the header.
+    /// Used to surface the Amiga drive name (e.g. "DH0") so users don't lose
+    /// track of which RDB partition they're browsing when several share the
+    /// same volume name (or none have one). Pass an empty string to clear.
+    pub fn set_label_prefix(&mut self, prefix: String) {
+        self.label_prefix = prefix;
+    }
+
     /// Set up archive edit context so that toggling edit mode triggers
     /// decompress → edit → recompress flow instead of direct editing.
     pub fn set_archive_edit_context(
@@ -458,6 +485,7 @@ impl BrowseView {
         self.active = false;
         self.fs_type.clear();
         self.volume_label.clear();
+        self.label_prefix.clear();
         self.session = BrowseSession::new();
         self.extraction_progress = None;
         self.extraction_result = None;
@@ -474,6 +502,7 @@ impl BrowseView {
         self.repair_report = None;
         self.tree_text = None;
         self.show_tree_popup = false;
+        self.show_tree_large_dialog = false;
         self.tree_show_ids = false;
         self.pending_tree = None;
         self.staged_edits.clear();
@@ -565,8 +594,14 @@ impl BrowseView {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Filesystem Browser").strong());
             ui.label(format!("[{}]", self.fs_type));
-            if !self.volume_label.is_empty() {
-                ui.label(format!("Label: {}", self.volume_label));
+            let display_label = match (self.label_prefix.is_empty(), self.volume_label.is_empty()) {
+                (false, false) => format!("{} - {}", self.label_prefix, self.volume_label),
+                (false, true) => self.label_prefix.clone(),
+                (true, false) => self.volume_label.clone(),
+                (true, true) => String::new(),
+            };
+            if !display_label.is_empty() {
+                ui.label(format!("Label: {}", display_label));
             }
             if let Some((_, ref name)) = self.blessed_folder {
                 ui.label(format!("Blessed: {}", name));
@@ -840,6 +875,7 @@ impl BrowseView {
         self.render_fsck_popup(ui);
         self.render_chd_info_popup(ui);
         self.render_tree_popup(ui);
+        self.render_tree_large_dialog(ui);
     }
 
     fn render_tree_entry(&mut self, ui: &mut egui::Ui, entry: &FileEntry) {
@@ -3330,8 +3366,13 @@ impl BrowseView {
                         self.cached_fs = Some(fs);
                     }
                     if let Some(text) = g.text.take() {
+                        let oversized = text.len() > TREE_INLINE_RENDER_LIMIT;
                         self.tree_text = Some(text);
-                        self.show_tree_popup = true;
+                        if oversized {
+                            self.show_tree_large_dialog = true;
+                        } else {
+                            self.show_tree_popup = true;
+                        }
                     }
                     if let Some(err) = g.error.take() {
                         self.error = Some(err);
@@ -3401,6 +3442,76 @@ impl BrowseView {
                     }
                 }
             }
+        }
+    }
+
+    /// Confirmation dialog shown when the generated tree text would choke the
+    /// in-app multiline TextEdit. Offers a Save-to-File button (the primary
+    /// path) and a smaller "Show in app anyway" escape hatch.
+    fn render_tree_large_dialog(&mut self, ui: &mut egui::Ui) {
+        if !self.show_tree_large_dialog {
+            return;
+        }
+        let size = self.tree_text.as_deref().map(|t| t.len()).unwrap_or(0);
+        let lines = self
+            .tree_text
+            .as_deref()
+            .map(|t| t.bytes().filter(|b| *b == b'\n').count())
+            .unwrap_or(0);
+        let mut open = true;
+        let mut save_clicked = false;
+        let mut show_anyway = false;
+        egui::Window::new("Tree view is large")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ui.ctx(), |ui| {
+                ui.label(format!(
+                    "The generated tree is {:.1} MB (~{} entries).",
+                    size as f64 / (1024.0 * 1024.0),
+                    lines,
+                ));
+                ui.label(
+                    "Rendering this many lines in the app would freeze the UI. \
+                     Save it to a file instead.",
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save to File...").clicked() {
+                        save_clicked = true;
+                    }
+                    if ui.small_button("Show in app anyway (slow)").clicked() {
+                        show_anyway = true;
+                    }
+                });
+            });
+        if !open {
+            self.show_tree_large_dialog = false;
+        }
+        if save_clicked {
+            if let Some(text) = self.tree_text.clone() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Save tree view")
+                    .set_file_name("tree.txt")
+                    .add_filter("Text files", &["txt"])
+                    .save_file()
+                {
+                    match std::fs::write(&path, &text) {
+                        Ok(()) => {
+                            self.show_tree_large_dialog = false;
+                        }
+                        Err(e) => {
+                            self.error = Some(format!("Failed to save tree: {}", e));
+                        }
+                    }
+                }
+            } else {
+                self.show_tree_large_dialog = false;
+            }
+        }
+        if show_anyway {
+            self.show_tree_large_dialog = false;
+            self.show_tree_popup = true;
         }
     }
 

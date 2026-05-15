@@ -210,6 +210,28 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     "unknown"
 }
 
+/// Probe the filesystem inside an MBR type-0x83 partition.
+///
+/// 0x83 is officially "Linux native" but some MSX HDD formatters (Nextor
+/// and similar) reuse it for FAT12/16 partitions. Callers that show the
+/// type-name column use this to replace the generic "Linux" label with the
+/// actual filesystem family.
+///
+/// Returns one of: `"FAT"`, `"ext"`, `"btrfs"`, `"xfs"`, or `None` when the
+/// content isn't a filesystem this function recognizes.
+pub fn probe_0x83_fs_type<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+) -> Option<&'static str> {
+    match detect_filesystem_type(reader, partition_offset) {
+        "fat" => Some("FAT"),
+        "ext" => Some("ext"),
+        "btrfs" => Some("btrfs"),
+        "xfs" => Some("xfs"),
+        _ => None,
+    }
+}
+
 /// Detect whether a type-0x07 partition is NTFS or exFAT by reading the OEM ID.
 /// Returns `"ntfs"`, `"exfat"`, or `"unknown"`.
 ///
@@ -329,7 +351,8 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
                 _ => None,
             }
         }
-        // Linux (ext2/3/4, btrfs)
+        // Linux (ext2/3/4, btrfs). Also FAT for MSX HDDs that mis-stamp
+        // the type byte (Nextor / similar write 0x83 for FAT partitions).
         0x83 => {
             let fs_type = detect_filesystem_type(&mut reader, partition_offset);
             match fs_type {
@@ -339,6 +362,10 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
                 }
                 "btrfs" => {
                     let (reader, info) = CompactBtrfsReader::new(reader, partition_offset).ok()?;
+                    Some((Box::new(reader), info))
+                }
+                "fat" => {
+                    let (reader, info) = CompactFatReader::new(reader, partition_offset).ok()?;
                     Some((Box::new(reader), info))
                 }
                 _ => None,
@@ -993,7 +1020,9 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                 )),
             }
         }
-        // Linux — detect ext / btrfs / xfs by magic bytes
+        // Linux — detect ext / btrfs / xfs by magic bytes.
+        // Also accept FAT: some MSX HDD formatters (Nextor and friends) write
+        // type 0x83 for FAT12/16 partitions instead of the standard 0x01/0x06.
         0x83 => {
             let fs_type = detect_filesystem_type(&mut reader, partition_offset);
             match fs_type {
@@ -1009,8 +1038,12 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "fat" => Ok(Box::new(fat::FatFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 _ => Err(FilesystemError::Unsupported(
-                    "type 0x83 partition: unrecognized Linux filesystem".into(),
+                    "type 0x83 partition: unrecognized filesystem".into(),
                 )),
             }
         }
@@ -1200,7 +1233,8 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                 )),
             }
         }
-        // Linux — detect ext2/3/4
+        // Linux — detect ext2/3/4. Also FAT for MSX HDDs that mis-stamp the
+        // type byte (Nextor / similar write 0x83 for FAT partitions).
         0x83 => {
             let fs_type = detect_filesystem_type(&mut reader, partition_offset);
             match fs_type {
@@ -1208,8 +1242,12 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "fat" => Ok(Box::new(fat::FatFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 _ => Err(FilesystemError::Unsupported(format!(
-                    "editing not yet supported for Linux filesystem type '{fs_type}'"
+                    "editing not yet supported for type 0x83 filesystem '{fs_type}'"
                 ))),
             }
         }
@@ -1706,6 +1744,45 @@ mod tests {
             Err(e) => panic!("expected XFS Parse error, got {e}"),
             Ok(_) => panic!("expected error from stub sb"),
         }
+    }
+
+    /// Build a 4 KiB buffer that looks like a FAT VBR (EB jump + minimal BPB).
+    /// Enough for `detect_filesystem_type` to return "fat"; the FAT parser
+    /// will then take it from there and either succeed or surface a Parse
+    /// error mentioning FAT-specific fields. Either outcome proves we routed
+    /// through the FAT module rather than the previous ext/btrfs/xfs-only
+    /// dispatch which silently returned `Unsupported`.
+    fn fat_vbr_sector() -> Vec<u8> {
+        let mut buf = vec![0u8; 4096];
+        buf[0] = 0xEB;
+        buf[1] = 0x3C;
+        buf[2] = 0x90;
+        buf[3..11].copy_from_slice(b"MTOO4032"); // mimic MSX OEM ID
+        buf[11..13].copy_from_slice(&512u16.to_le_bytes()); // bytes/sector
+        buf[13] = 32; // sectors/cluster
+        buf[14..16].copy_from_slice(&1u16.to_le_bytes()); // reserved
+        buf[16] = 2; // num FATs
+        buf[17..19].copy_from_slice(&512u16.to_le_bytes()); // root entries
+        buf[21] = 0xF8; // media ID
+        buf[22..24].copy_from_slice(&250u16.to_le_bytes()); // sectors/FAT
+        buf[32..36].copy_from_slice(&2_047_999u32.to_le_bytes()); // total_sec_32
+        buf[510] = 0x55;
+        buf[511] = 0xAA;
+        buf
+    }
+
+    #[test]
+    fn open_filesystem_routes_mbr_0x83_fat_to_fat_module() {
+        // MSX HDDs (Nextor / similar) write MBR type 0x83 for FAT partitions.
+        // The 0x83 dispatch must fall through to the FAT module rather than
+        // erroring out as "unrecognized Linux filesystem".
+        let buf = fat_vbr_sector();
+        let fs = open_filesystem(Cursor::new(buf), 0, 0x83, None)
+            .expect("0x83 with FAT VBR should open via FAT module");
+        // Spot-check: the resulting filesystem must be browsable as FAT.
+        // We deliberately don't poke at the trait — just opening successfully
+        // is the regression signal.
+        drop(fs);
     }
 
     #[test]

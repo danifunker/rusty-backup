@@ -109,6 +109,7 @@ pub fn validate_edits(
                     partition_type_string: None,
                     hfs_block_size: None,
                     rdb_part_block: None,
+                    drv_name: None,
                 });
             }
         }
