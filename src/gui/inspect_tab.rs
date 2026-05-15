@@ -316,7 +316,8 @@ impl InspectTab {
                                 "Disk Images",
                                 &[
                                     "vhd", "img", "raw", "bin", "iso", "dd", "hda", "hdv", "2mg",
-                                    "dmg", "po", "do", "dsk", "dc42", "woz", "chd",
+                                    "dmg", "po", "do", "dsk", "dc42", "woz", "chd", "adf", "hdf",
+                                    "adz", "hdz",
                                 ],
                             )
                             .add_filter("All Files", &["*"])
@@ -3853,19 +3854,25 @@ fn is_classic_hfs(ptype: u8, type_string: Option<&str>, type_name: &str) -> bool
 
 /// Check if an APM partition type string corresponds to a browsable filesystem.
 fn is_browsable_type_string(type_str: Option<&str>) -> bool {
+    let Some(s) = type_str else {
+        return false;
+    };
+    // AmigaDOS DosType tags (DOS\0..DOS\7) — RDB-partitioned hard drives and
+    // single-partition HDFs / ADFs both route through this string.
+    if rusty_backup::fs::is_amiga_dos_type(s) {
+        return true;
+    }
     matches!(
-        type_str,
-        Some(
-            "Apple_HFS"
-                | "Apple_HFSX"
-                | "Apple_HFS+"
-                | "Apple_UNIX_SVR2"
-                | "Apple_UNIX_SRVR2"
-                | "Apple_PRODOS"
-                | "Apple_ProDOS"
-                // GPT "Linux Filesystem" GUID — ext, btrfs, or xfs at runtime.
-                | "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
-        )
+        s,
+        "Apple_HFS"
+            | "Apple_HFSX"
+            | "Apple_HFS+"
+            | "Apple_UNIX_SVR2"
+            | "Apple_UNIX_SRVR2"
+            | "Apple_PRODOS"
+            | "Apple_ProDOS"
+            // GPT "Linux Filesystem" GUID — ext, btrfs, or xfs at runtime.
+            | "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
     )
 }
 
