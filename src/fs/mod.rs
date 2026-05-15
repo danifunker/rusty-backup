@@ -1081,6 +1081,12 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     partition_offset,
                 )?));
             }
+            s if is_amiga_dos_type(s) => {
+                return Ok(Box::new(affs::AffsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?));
+            }
             _ => {
                 return Err(FilesystemError::Unsupported(format!(
                     "editing not yet supported for APM type '{type_str}'"
