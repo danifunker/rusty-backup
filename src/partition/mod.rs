@@ -62,6 +62,11 @@ pub struct PartitionInfo {
     /// Allocation block size in bytes for HFS / HFS+ partitions. `None` for
     /// non-HFS partitions or when the volume header could not be probed.
     pub hfs_block_size: Option<u32>,
+    /// 512-byte sector number of the PART block on disk, for RDB partitions
+    /// only. Used by GUI actions that need to mutate the partition entry
+    /// in place (e.g. toggling the bootable flag). `None` for all other
+    /// partition table types.
+    pub rdb_part_block: Option<u64>,
 }
 
 /// Standard floppy disk image sizes (bytes).
@@ -355,6 +360,7 @@ impl PartitionTable {
                         is_extended_container: e.is_extended(),
                         partition_type_string: None,
                         hfs_block_size: None,
+                        rdb_part_block: None,
                     })
                     .collect();
 
@@ -371,6 +377,7 @@ impl PartitionTable {
                         is_extended_container: false,
                         partition_type_string: None,
                         hfs_block_size: None,
+                        rdb_part_block: None,
                     });
                 }
 
@@ -391,6 +398,7 @@ impl PartitionTable {
                     is_extended_container: false,
                     partition_type_string: Some(e.type_guid.to_string_formatted()),
                     hfs_block_size: None,
+                    rdb_part_block: None,
                 })
                 .collect(),
             PartitionTable::Apm(apm) => {
@@ -410,6 +418,7 @@ impl PartitionTable {
                         is_extended_container: false,
                         partition_type_string: Some(e.partition_type.clone()),
                         hfs_block_size: None,
+                        rdb_part_block: None,
                     })
                     .collect()
             }
@@ -452,6 +461,7 @@ impl PartitionTable {
                             // `open_filesystem` into the APM string router.
                             partition_type_string: None,
                             hfs_block_size: None,
+                            rdb_part_block: None,
                         })
                     })
                     .collect()
@@ -477,6 +487,7 @@ impl PartitionTable {
                     is_extended_container: false,
                     partition_type_string: Some(p.dos_type_string()),
                     hfs_block_size: None,
+                    rdb_part_block: Some(p.block_num),
                 })
                 .collect(),
             PartitionTable::None {
@@ -511,6 +522,7 @@ impl PartitionTable {
                         None
                     },
                     hfs_block_size: None,
+                    rdb_part_block: None,
                 }]
             }
         }

@@ -854,9 +854,36 @@ impl InspectTab {
                                     .id(egui::Id::new(&size_id)),
                             );
 
-                            // Bootable checkbox (MBR only)
+                            // Bootable cell — table-type-specific.
+                            // MBR carries a checkbox (legacy behaviour);
+                            // RDB renders explicit "boot" / "no boot" radio
+                            // buttons so the choice is impossible to flip
+                            // accidentally. GPT / APM have no per-partition
+                            // bootable bit, so the cell is read-only there.
                             if table_type == "MBR" {
                                 ui.checkbox(&mut self.editor.entries[i].bootable, "");
+                            } else if table_type == "RDB" {
+                                ui.horizontal(|ui| {
+                                    let tip = "Whether this RDB partition is eligible to boot. \
+                                               Multiple partitions can be set to boot at once — \
+                                               the Amiga ROM picks the one with the highest boot \
+                                               priority among them.";
+                                    let mut val = self.editor.entries[i].bootable;
+                                    if ui
+                                        .radio_value(&mut val, true, "boot")
+                                        .on_hover_text(tip)
+                                        .changed()
+                                    {
+                                        self.editor.entries[i].bootable = val;
+                                    }
+                                    if ui
+                                        .radio_value(&mut val, false, "no boot")
+                                        .on_hover_text(tip)
+                                        .changed()
+                                    {
+                                        self.editor.entries[i].bootable = val;
+                                    }
+                                });
                             } else {
                                 ui.label(if bootable { "Yes" } else { "" });
                             }
@@ -2145,6 +2172,11 @@ impl InspectTab {
                             .as_deref()
                             .map(rusty_backup::fs::is_amiga_dos_type)
                             .unwrap_or(false);
+                        let is_amiga_pfs3 = part
+                            .partition_type_string
+                            .as_deref()
+                            .map(rusty_backup::fs::is_amiga_pfs3_type)
+                            .unwrap_or(false);
 
                         let label_opt: Option<String> = if is_fat_byte || is_fat_superfloppy {
                             make_probe_reader().and_then(|br| {
@@ -2158,6 +2190,18 @@ impl InspectTab {
                         } else if is_amiga_dos {
                             make_probe_reader().and_then(|br| {
                                 rusty_backup::fs::affs::AffsFilesystem::open(
+                                    br,
+                                    part.start_lba * 512,
+                                )
+                                .ok()
+                                .and_then(|fs| {
+                                    use rusty_backup::fs::Filesystem;
+                                    fs.volume_label().map(str::to_string)
+                                })
+                            })
+                        } else if is_amiga_pfs3 {
+                            make_probe_reader().and_then(|br| {
+                                rusty_backup::fs::pfs3::Pfs3Filesystem::open(
                                     br,
                                     part.start_lba * 512,
                                 )
@@ -3880,6 +3924,9 @@ fn is_browsable_type_string(type_str: Option<&str>) -> bool {
     // AmigaDOS DosType tags (DOS\0..DOS\7) — RDB-partitioned hard drives and
     // single-partition HDFs / ADFs both route through this string.
     if rusty_backup::fs::is_amiga_dos_type(s) {
+        return true;
+    }
+    if rusty_backup::fs::is_amiga_pfs3_type(s) {
         return true;
     }
     matches!(

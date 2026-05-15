@@ -197,6 +197,7 @@ pub fn load_clonezilla(folder: &Path) -> Result<ClonezillaLoadOutcome> {
             is_extended_container: p.is_extended,
             partition_type_string: None,
             hfs_block_size: None,
+            rdb_part_block: None,
         })
         .collect();
 
@@ -274,6 +275,7 @@ fn partitions_from_metadata(meta: &BackupMetadata) -> Vec<PartitionInfo> {
                 is_extended_container: false,
                 partition_type_string: p.partition_type_string.clone(),
                 hfs_block_size: None,
+                rdb_part_block: None,
             }
         })
         .collect()
@@ -322,6 +324,7 @@ fn merge_logical_partitions_from_metadata(
                 is_extended_container: false,
                 partition_type_string: pm.partition_type_string.clone(),
                 hfs_block_size: None,
+                rdb_part_block: None,
             });
             added += 1;
         }

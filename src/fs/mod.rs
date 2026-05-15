@@ -22,6 +22,7 @@ pub mod layout_preserving;
 pub mod mac_alias;
 pub mod ntfs;
 pub mod patch;
+pub mod pfs3;
 pub mod prodos;
 pub mod prodos_types;
 pub mod resource_fork;
@@ -617,6 +618,9 @@ fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &'sta
         if is_amiga_dos_type(s) {
             return "AmigaDOS";
         }
+        if is_amiga_pfs3_type(s) {
+            return "PFS3";
+        }
         return match s {
             "Apple_HFS" => "HFS",
             "Apple_HFSX" => "HFSX",
@@ -649,6 +653,9 @@ fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &'sta
 pub fn is_layout_preserving_fs(partition_type: u8, partition_type_string: Option<&str>) -> bool {
     if let Some(s) = partition_type_string {
         if is_amiga_dos_type(s) {
+            return true;
+        }
+        if is_amiga_pfs3_type(s) {
             return true;
         }
         return matches!(
@@ -720,6 +727,11 @@ pub fn is_expensive_minimum(partition_type: u8, partition_type_string: Option<&s
     if let Some(s) = partition_type_string {
         if is_amiga_dos_type(s) {
             // AFFS minimum is a cheap bitmap scan — last allocated block.
+            return false;
+        }
+        if is_amiga_pfs3_type(s) {
+            // PFS3 last_data_byte falls back to total_size for now (no
+            // bitmap walk yet) — cheap.
             return false;
         }
         return matches!(s, "Apple_HFS" | "Apple_HFSX" | "Apple_UNIX_SVR2" | "Linux");
@@ -1088,6 +1100,13 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     partition_offset,
                 )?));
             }
+            s if is_amiga_pfs3_type(s) => {
+                // PFS3 is read-only in Phase 5; editing arrives in Phase 6.
+                return Err(FilesystemError::Unsupported(format!(
+                    "editing not yet supported for PFS3 type '{}'",
+                    s
+                )));
+            }
             _ => {
                 return Err(FilesystemError::Unsupported(format!(
                     "editing not yet supported for APM type '{type_str}'"
@@ -1261,6 +1280,12 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
             reader,
             partition_offset,
         )?)),
+        // PFS3 family — `PFS\3`, `PDS\3`, `muFS`. Read-only browse +
+        // backup (Phase 5); editing arrives in Phase 6.
+        s if is_amiga_pfs3_type(s) => Ok(Box::new(pfs3::Pfs3Filesystem::open(
+            reader,
+            partition_offset,
+        )?)),
         // GPT Linux Filesystem GUID — host any of ext, btrfs, or xfs.
         "0FC63DAF-8483-4772-8E79-3D69D8477DE4" => {
             let fs_type = detect_filesystem_type(&mut reader, partition_offset);
@@ -1366,6 +1391,13 @@ fn compact_partition_reader_by_string<R: Read + Seek + Send + 'static>(
                 })?;
             Ok(Some((Box::new(compact), info)))
         }
+        s if is_amiga_pfs3_type(s) => {
+            let (compact, info) =
+                pfs3::CompactPfs3Reader::new(reader, partition_offset).map_err(|e| {
+                    format!("CompactPfs3Reader::new failed at offset {partition_offset}: {e}")
+                })?;
+            Ok(Some((Box::new(compact), info)))
+        }
         _ => Ok(None),
     }
 }
@@ -1376,6 +1408,13 @@ fn compact_partition_reader_by_string<R: Read + Seek + Send + 'static>(
 pub fn is_amiga_dos_type(s: &str) -> bool {
     let bytes = s.as_bytes();
     bytes.len() == 5 && &bytes[0..4] == b"DOS\\" && matches!(bytes[4], b'0'..=b'7')
+}
+
+/// True for Professional File System 3 (PFS3) DosType tags. The on-disk
+/// format is identical for all three: `PFS\3` (classic), `PDS\3` (modern
+/// pfs3-aio), and `muFS` (multi-user PFS3, RDB type `muAF` / `muPF`).
+pub fn is_amiga_pfs3_type(s: &str) -> bool {
+    matches!(s, "PFS\\3" | "PDS\\3" | "muFS")
 }
 
 /// Resolve the actual HFS filesystem variant for an "Apple_HFS" APM partition.

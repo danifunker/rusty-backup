@@ -343,11 +343,38 @@ state.
       Surface as errors; the user can wipe + restore from backup.*
 
 ### Phase 5 — PFS3 read + browse + backup
-- [ ] `src/fs/pfs3.rs` — root block, anode B-tree, dir block reading,
-      file extent reading, bitmap.
-- [ ] Dispatch for `"PFS\\3"`, `"PDS\\3"`, `"muFS"`.
-- [ ] Backup/restore round-trip on a PFS3 partition inside
-      `AmigaVision.hdf` (or `amiga128gb.chd` if present there).
+- [x] `src/fs/pfs3.rs` — root block (small + supermode/large layouts),
+      rootblock extension (`EX`), anode resolution (`MODE_SPLITTED_ANODES`
+      + superindex two-level indirection), dirblock walk via anode
+      chains, file data streaming in HW-sector clusters, `LARGEFILE`
+      48-bit file size support, reserved-block LRU cache.
+- [x] Dispatch for `"PFS\\3"`, `"PDS\\3"`, `"muFS"` wired in
+      `src/fs/mod.rs`: `is_amiga_pfs3_type` helper, `fs_name_for`
+      ("PFS3"), `is_layout_preserving_fs` (true), `is_expensive_minimum`
+      (false), read-only `open_filesystem_by_string`, and
+      `compact_partition_reader_by_string`. GUI `is_browsable_type_string`
+      in `inspect_tab.rs` updated. Editable dispatch site returns
+      `Unsupported` until Phase 6.
+- [x] `CompactPfs3Reader` — layout-preserving stream. Reserved area
+      (HW sectors 0..=last_reserved) is emitted verbatim; data area
+      sectors default to verbatim too because the bitmapindex →
+      bitmapblock walk is intentionally deferred (see TODO below). The
+      stream is correct but not yet compactable.
+- [x] Manual validation against `~/amiga-filesystems/AmigaVision.hdf`:
+      both `PDS\3` partitions open, return labels ("Amiga" / "Data"),
+      list their root directories, and stream file contents byte-for-byte
+      (verified by checking the `.info` icon magic `e3 10 00 01`).
+- [x] Unit tests for read helpers, anodenr split arithmetic, and
+      direntry parsing.
+- [ ] Backup/restore round-trip on a PFS3 partition. *Deferred to follow-up:
+      the dispatch is wired but a real run_backup → reconstruct exercise
+      against the 9.6 GB AmigaVision image isn't part of this commit.*
+- [ ] Implement `read_user_bitmap`: walk
+      `root.bitmapindex[]` → bitmapindex blocks → bitmapblocks and
+      assemble a flat sector bitmap so `CompactPfs3Reader` zero-fills
+      free user-data sectors and `last_data_byte` can report a real
+      shrink target. Currently a stub that returns an empty vector;
+      the stream is correct but not compactable yet.
 
 ### Phase 6 — PFS3 write
 - [ ] Anode allocation + free-list management.
