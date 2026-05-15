@@ -9,6 +9,7 @@ use std::io::BufReader;
 use std::path::Path;
 
 use rusty_backup::fs;
+use rusty_backup::fs::pfs3::CompactPfs3Reader;
 use rusty_backup::partition::PartitionTable;
 use rusty_backup::rbformats::chd::ChdReader;
 
@@ -115,6 +116,29 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             Err(e) => println!("      open failed: {e}"),
+        }
+
+        // For PFS3, also exercise the compact-reader bitmap walk so we
+        // can compare data_size against used_size from the rootblock.
+        if fs::is_amiga_pfs3_type(type_str) {
+            let compact: Result<(_, _), _> = if path.to_lowercase().ends_with(".chd") {
+                let reader = ChdReader::open(Path::new(path))?;
+                CompactPfs3Reader::new(reader, offset).map(|(_r, res)| ((), res))
+            } else {
+                let file = File::open(path)?;
+                CompactPfs3Reader::new(file, offset).map(|(_r, res)| ((), res))
+            };
+            match compact {
+                Ok(((), result)) => {
+                    println!(
+                        "      compact: data={} orig={} (ratio {:.2}%)",
+                        result.data_size,
+                        result.original_size,
+                        100.0 * result.data_size as f64 / result.original_size.max(1) as f64,
+                    );
+                }
+                Err(e) => println!("      compact reader: {e}"),
+            }
         }
     }
 

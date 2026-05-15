@@ -369,12 +369,15 @@ state.
 - [ ] Backup/restore round-trip on a PFS3 partition. *Deferred to follow-up:
       the dispatch is wired but a real run_backup → reconstruct exercise
       against the 9.6 GB AmigaVision image isn't part of this commit.*
-- [ ] Implement `read_user_bitmap`: walk
-      `root.bitmapindex[]` → bitmapindex blocks → bitmapblocks and
-      assemble a flat sector bitmap so `CompactPfs3Reader` zero-fills
-      free user-data sectors and `last_data_byte` can report a real
-      shrink target. Currently a stub that returns an empty vector;
-      the stream is correct but not compactable yet.
+- [x] Implement `read_user_bitmap`: walks `root.bitmapindex[]` → `MI`
+      bitmap-index blocks → `BM` bitmap blocks; assembles a flat sector
+      bitmap (LSB-first within byte). `CompactPfs3Reader` now
+      zero-fills free user-data sectors; `last_data_byte` returns the
+      last allocated sector's end. Verified against AmigaVision.hdf:
+      DH0 compact data 544 MB vs used 544 MB (≤1 BM-word rounding),
+      DH1 compact 9069 MB vs used 9069 MB. `Pfs3Filesystem::open` now
+      narrows partition_size to `root.disksize * 512` so multi-partition
+      images don't claim past their declared end.
 
 ### Phase 6 — PFS3 write
 - [ ] Anode allocation + free-list management.
