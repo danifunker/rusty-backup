@@ -425,11 +425,18 @@ state.
       pattern AFFS/HFS use). A real Amiga-style postponed-ops log
       would only matter for crash recovery; we accept "metadata writes
       flushed in ascending order" as the consistency story for now.
-- [ ] Wire PFS3 into the GUI's `EditableFilesystem` staged-edits flow
-      and verify end-to-end against a real PFS3 image. Deferred — the
-      library API is in place and the round-trip tests exercise it;
-      pull this in alongside the existing edit-mode UI work when the
-      AFFS path graduates.
+- [x] Wire PFS3 into the GUI's `EditableFilesystem` staged-edits flow.
+      `open_editable_filesystem` already routes PFS3 to
+      `Pfs3Filesystem`, and `BrowseView::apply_staged_edits` drives any
+      `EditableFilesystem` through `edit_queue::apply_edit`, so the
+      existing edit-mode toggle + Add File / New Folder / Delete UI
+      now operate on PFS3 volumes without per-fs branching. Added
+      `tests/filesystem_e2e.rs::test_pfs3_staged_edits_round_trip`:
+      blank-volume image, staged `CreateDirectory` + `AddFile` from a
+      host file, dispatch through `apply_edit`, `sync_metadata`,
+      reopen and verify both entries landed and file body is byte-equal;
+      then a second pass stages `DeleteEntry`, syncs, and reopens to
+      confirm the file is gone and the directory remains.
 
 ### Phase 7 — SFS read + browse + backup
 - [x] `src/fs/sfs.rs` — root block parse (block 0 + last block, pick
