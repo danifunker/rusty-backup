@@ -1848,6 +1848,11 @@ fn build_patched_head_segments(
             let head: Segment = (0, head_end, Box::new(std::io::Cursor::new(head_buf)));
             Ok((vec![head], None))
         }
+        PartitionTable::Rdb(_) => {
+            anyhow::bail!(
+                "assemble_from_staging: Amiga RDB sources are not yet supported by single-file CHD"
+            );
+        }
         PartitionTable::Sgi(_) => {
             anyhow::bail!(
                 "assemble_from_staging: SGI Volume Header sources are not supported (browse only)"

@@ -451,6 +451,17 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 );
             }
         }
+        PartitionTable::Rdb(rdb) => {
+            // Emit a JSON sidecar of the RDB layout so inspect tools and
+            // future round-trip restores can read it. Per-partition data
+            // backup follows the standard layout-preserving path once the
+            // AFFS/PFS/SFS readers land.
+            let json =
+                serde_json::to_string_pretty(rdb).context("failed to serialize RDB to JSON")?;
+            std::fs::write(backup_folder.join("rdb.json"), json)
+                .context("failed to write rdb.json")?;
+            log(&progress, LogLevel::Info, "Exported RDB (rdb.json)");
+        }
         PartitionTable::Sgi(vh) => {
             // Step 2 surfaces SGI partitions in the inspect tab; backup of
             // SGI disks is a separate workflow (deferred). Emit a JSON
