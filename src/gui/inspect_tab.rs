@@ -2114,10 +2114,10 @@ impl InspectTab {
                         alignment.alignment_type, alignment.first_lba
                     ));
 
-                    // Probe FAT volume labels cheaply (boot sector only) so the
-                    // inspect grid's Volume column has a value for FAT
-                    // partitions. HFS+ labels are populated above (folded into
-                    // type_name) and could move here in a future pass.
+                    // Probe volume labels cheaply (boot/root block reads only)
+                    // so the inspect grid's Volume column has a value. HFS+
+                    // labels are still folded into type_name and could move
+                    // here in a future pass.
                     let mut partition_volume_labels: HashMap<usize, String> = HashMap::new();
                     for part in &partitions {
                         if part.is_extended_container {
@@ -2140,21 +2140,41 @@ impl InspectTab {
                             &table,
                             PartitionTable::None { fs_hint, .. } if fs_hint == "FAT"
                         );
-                        if !(is_fat_byte || is_fat_superfloppy) {
-                            continue;
-                        }
-                        let Some(br) = make_probe_reader() else {
-                            continue;
+                        let is_amiga_dos = part
+                            .partition_type_string
+                            .as_deref()
+                            .map(rusty_backup::fs::is_amiga_dos_type)
+                            .unwrap_or(false);
+
+                        let label_opt: Option<String> = if is_fat_byte || is_fat_superfloppy {
+                            make_probe_reader().and_then(|br| {
+                                rusty_backup::fs::fat::FatFilesystem::open(br, part.start_lba * 512)
+                                    .ok()
+                                    .and_then(|fs| {
+                                        use rusty_backup::fs::Filesystem;
+                                        fs.volume_label().map(str::to_string)
+                                    })
+                            })
+                        } else if is_amiga_dos {
+                            make_probe_reader().and_then(|br| {
+                                rusty_backup::fs::affs::AffsFilesystem::open(
+                                    br,
+                                    part.start_lba * 512,
+                                )
+                                .ok()
+                                .and_then(|fs| {
+                                    use rusty_backup::fs::Filesystem;
+                                    fs.volume_label().map(str::to_string)
+                                })
+                            })
+                        } else {
+                            None
                         };
-                        if let Ok(fs) =
-                            rusty_backup::fs::fat::FatFilesystem::open(br, part.start_lba * 512)
-                        {
-                            use rusty_backup::fs::Filesystem;
-                            if let Some(label) = fs.volume_label() {
-                                let trimmed = label.trim();
-                                if !trimmed.is_empty() {
-                                    partition_volume_labels.insert(part.index, trimmed.to_string());
-                                }
+
+                        if let Some(label) = label_opt {
+                            let trimmed = label.trim();
+                            if !trimmed.is_empty() {
+                                partition_volume_labels.insert(part.index, trimmed.to_string());
                             }
                         }
                     }

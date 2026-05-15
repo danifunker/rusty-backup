@@ -306,6 +306,36 @@ fn parse_part(buf: &[u8; 512], block_num: u64) -> Result<RdbPartition, RustyBack
     })
 }
 
+/// Human-readable name for an AmigaDOS DosType tag. Falls back to the raw
+/// `format_dos_type` string for unrecognized tags so the user still sees
+/// something meaningful.
+///
+/// Examples:
+/// - `DOS\0` → "AmigaDOS OFS"
+/// - `DOS\3` → "AmigaDOS FFS-Intl"
+/// - `PFS\3` → "PFS3 (Amiga)"
+/// - `SFS\0` → "SFS (Amiga)"
+pub fn dos_type_display_name(dos_type: u32) -> String {
+    let tag = format_dos_type(dos_type);
+    let pretty = match tag.as_str() {
+        "DOS\\0" => "AmigaDOS OFS",
+        "DOS\\1" => "AmigaDOS FFS",
+        "DOS\\2" => "AmigaDOS OFS-Intl",
+        "DOS\\3" => "AmigaDOS FFS-Intl",
+        "DOS\\4" => "AmigaDOS OFS-DC",
+        "DOS\\5" => "AmigaDOS FFS-DC",
+        "DOS\\6" => "AmigaDOS OFS-LNFS",
+        "DOS\\7" => "AmigaDOS FFS-LNFS",
+        "PFS\\0" | "PFS\\1" | "PFS\\2" | "PFS\\3" | "PDS\\3" => "PFS (Amiga)",
+        "muFS" => "muFS (Amiga PFS)",
+        "SFS\\0" => "SFS (Amiga)",
+        "SFS\\2" => "SFS2 (Amiga)",
+        "JXF\\4" => "JXFS (Amiga)",
+        _ => return tag,
+    };
+    pretty.to_string()
+}
+
 /// Format a 4-byte DosType tag using AmigaDOS convention: three ASCII
 /// characters followed by a backslash-escaped version byte (e.g. `DOS\0`,
 /// `PFS\3`, `SFS\2`). This is the form used as `partition_type_string`.
