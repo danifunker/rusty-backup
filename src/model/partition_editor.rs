@@ -213,6 +213,14 @@ impl PartitionEditor {
                             });
                         }
                     }
+                    PartitionTable::Rdb(_) => {
+                        if entry.bootable != orig.bootable {
+                            self.edits.push(PartitionTableEdit::SetBootable {
+                                index: entry.index,
+                                bootable: entry.bootable,
+                            });
+                        }
+                    }
                     _ => {}
                 }
             } else {

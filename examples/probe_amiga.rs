@@ -59,7 +59,7 @@ fn main() -> anyhow::Result<()> {
 
         // Browse AFFS partitions inline.
         let type_str = part.partition_type_string.as_deref().unwrap_or("");
-        if !fs::is_amiga_dos_type(type_str) {
+        if !fs::is_amiga_dos_type(type_str) && !fs::is_amiga_pfs3_type(type_str) {
             continue;
         }
         let offset = part.start_lba * 512;
@@ -90,6 +90,26 @@ fn main() -> anyhow::Result<()> {
                         }
                         if children.len() > 5 {
                             println!("        ... and {} more", children.len() - 5);
+                        }
+                        // Pick the first plain file under 4 KiB and read it
+                        // so we exercise the file-data path end-to-end.
+                        if let Some(small) = children
+                            .iter()
+                            .find(|c| !c.is_directory() && c.size > 0 && c.size < 4096)
+                        {
+                            match fs.read_file(small, small.size as usize) {
+                                Ok(data) => {
+                                    let preview = data.iter().take(16).copied().collect::<Vec<_>>();
+                                    println!(
+                                        "        read {} bytes from {}: {:02x?}{}",
+                                        data.len(),
+                                        small.name,
+                                        preview,
+                                        if data.len() > 16 { " ..." } else { "" }
+                                    );
+                                }
+                                Err(e) => println!("        read_file({}) failed: {e}", small.name),
+                            }
                         }
                     }
                 }

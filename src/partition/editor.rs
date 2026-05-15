@@ -34,6 +34,12 @@ pub enum PartitionTableEdit {
         type_string: Option<String>,
         bootable: bool,
     },
+    /// Toggle the bootable flag on an existing partition. Only RDB tables
+    /// honor this edit today; other tables either fold the flag into
+    /// `AddEntry` (MBR) or don't carry a per-partition bootable bit (GPT,
+    /// APM). On RDB it flips bit 0 of the PART block's `flags` field and
+    /// recomputes the block checksum.
+    SetBootable { index: usize, bootable: bool },
 }
 
 /// Validate a set of edits against the current partition table.
@@ -79,6 +85,11 @@ pub fn validate_edits(
             PartitionTableEdit::DeleteEntry { index } => {
                 partitions.retain(|p| p.index != *index);
             }
+            PartitionTableEdit::SetBootable { index, .. } => {
+                if !partitions.iter().any(|p| p.index == *index) {
+                    bail!("partition index {} not found", index);
+                }
+            }
             PartitionTableEdit::AddEntry {
                 start_lba,
                 size_bytes,
@@ -97,6 +108,7 @@ pub fn validate_edits(
                     is_extended_container: false,
                     partition_type_string: None,
                     hfs_block_size: None,
+                    rdb_part_block: None,
                 });
             }
         }
@@ -177,10 +189,43 @@ pub fn apply_edits(
             apply_gpt_edits(file, gpt, edits, disk_size_bytes, log_cb)
         }
         PartitionTable::Apm(apm) => apply_apm_edits(file, apm, edits, disk_size_bytes, log_cb),
-        PartitionTable::Rdb(_) => bail!("RDB partition table editing is not yet supported"),
+        PartitionTable::Rdb(rdb) => apply_rdb_edits(file, rdb, edits, log_cb),
         PartitionTable::Sgi(_) => bail!("SGI Volume Header editing is not yet supported"),
         PartitionTable::None { .. } => bail!("cannot edit partition table on a superfloppy"),
     }
+}
+
+/// RDB tables only support `SetBootable` edits for now — full RDB editing
+/// (resize / add / delete) is out of scope until we have a clean story for
+/// AmigaDOS DosEnv geometry and the PFS/SFS block-size constraints. Any
+/// other edit variant produces an error so the caller can surface it.
+fn apply_rdb_edits(
+    file: &mut (impl Read + Write + Seek),
+    rdb: &super::rdb::Rdb,
+    edits: &[PartitionTableEdit],
+    log_cb: &mut impl FnMut(&str),
+) -> Result<()> {
+    for edit in edits {
+        match edit {
+            PartitionTableEdit::SetBootable { index, bootable } => {
+                let part = rdb
+                    .partitions
+                    .get(*index)
+                    .ok_or_else(|| anyhow::anyhow!("RDB partition index {} not found", index))?;
+                let now = super::rdb::set_partition_bootable(file, part.block_num, *bootable)?;
+                log_cb(&format!(
+                    "Partition {} ({}): bootable -> {}",
+                    index,
+                    part.drv_name,
+                    if now { "Yes" } else { "No" }
+                ));
+            }
+            _ => bail!(
+                "RDB partition table only supports toggling the bootable flag in this release"
+            ),
+        }
+    }
+    Ok(())
 }
 
 fn apply_mbr_edits(
@@ -349,6 +394,13 @@ fn apply_mbr_edits(
                     slot, start_lba, sectors, partition_type
                 ));
             }
+            PartitionTableEdit::SetBootable { .. } => {
+                // MBR carries the bootable bit in the entry itself; the
+                // editor folds it into `AddEntry` for new rows, but flipping
+                // it on an existing row is not yet wired through this
+                // apply path.
+                log_cb("SetBootable: not yet supported on MBR partitions");
+            }
         }
     }
 
@@ -459,6 +511,12 @@ fn apply_gpt_edits(
                     "Added GPT partition at LBA {}..{}",
                     start_lba, end_lba
                 ));
+            }
+            PartitionTableEdit::SetBootable { .. } => {
+                // GPT has no per-partition bootable bit. Boot ordering is
+                // handled by the firmware (UEFI BootOrder) outside the
+                // partition table, so this edit is a no-op here.
+                log_cb("SetBootable: ignored on GPT (use firmware boot order)");
             }
         }
     }
@@ -590,6 +648,12 @@ fn apply_apm_edits(
                     "Added APM partition at block {} ({} blocks, type {})",
                     start_block, block_count, ts
                 ));
+            }
+            PartitionTableEdit::SetBootable { .. } => {
+                // APM bootability is encoded in `status` plus the
+                // pmBoot* metadata, not a simple flag we expose. Treat the
+                // edit as a no-op until that surface is built out.
+                log_cb("SetBootable: not yet supported on APM partitions");
             }
         }
     }

@@ -173,6 +173,55 @@ impl Rdb {
     }
 }
 
+/// Toggle the bootable flag on the PART block at `block_num` (in 512-byte
+/// sectors). Reads the existing block, flips bit 0 of `flags`, recomputes the
+/// 32-bit block checksum, and writes the block back in place. Returns the new
+/// bootable state.
+///
+/// The PART block is the only block touched — other RDB structures are
+/// untouched. The Amiga ROM picks the actual boot partition by sorting
+/// bootable-flag-set partitions by `boot_pri` (highest wins), so flipping the
+/// bootable bit on multiple partitions is legal — only one will boot at a
+/// time but the user can change priority later.
+pub fn set_partition_bootable<W: Read + std::io::Write + Seek>(
+    rw: &mut W,
+    part_block_num: u64,
+    bootable: bool,
+) -> Result<bool, RustyBackupError> {
+    let mut buf = [0u8; 512];
+    rw.seek(SeekFrom::Start(part_block_num * 512))?;
+    rw.read_exact(&mut buf)?;
+    if &buf[0..4] != PART_SIGNATURE {
+        return Err(RustyBackupError::InvalidRdb(format!(
+            "expected PART signature at block {part_block_num}"
+        )));
+    }
+    verify_checksum(&buf, "PART")?;
+
+    let flags = get_long(&buf, 5);
+    let new_flags = if bootable {
+        flags | PART_FLAG_BOOTABLE
+    } else {
+        flags & !PART_FLAG_BOOTABLE
+    };
+    BigEndian::write_u32(&mut buf[5 * 4..5 * 4 + 4], new_flags);
+
+    // Recompute checksum: zero the checksum word, sum the rest, store the
+    // 2's-complement negation. The PART (and RDSK) checksum lives at long 2.
+    BigEndian::write_u32(&mut buf[2 * 4..2 * 4 + 4], 0);
+    let mut sum: i32 = 0;
+    for i in 0..128 {
+        sum = sum.wrapping_add(BigEndian::read_i32(&buf[i * 4..i * 4 + 4]));
+    }
+    BigEndian::write_i32(&mut buf[2 * 4..2 * 4 + 4], sum.wrapping_neg());
+
+    rw.seek(SeekFrom::Start(part_block_num * 512))?;
+    rw.write_all(&buf)?;
+    rw.flush()?;
+
+    Ok(new_flags & PART_FLAG_BOOTABLE != 0)
+}
+
 fn find_rdsk(reader: &mut (impl Read + Seek)) -> Result<(u64, [u8; 512]), RustyBackupError> {
     let mut buf = [0u8; 512];
     for block in 0..RDB_SCAN_BLOCKS {
@@ -470,6 +519,64 @@ mod tests {
         assert_eq!(p.start_byte_offset(), 2 * 4 * 32 * 512);
         assert_eq!(p.size_bytes(), 2 * 4 * 32 * 512);
         assert_eq!(p.start_lba_512(), 2 * 4 * 32);
+    }
+
+    #[test]
+    fn set_bootable_round_trip() {
+        // Reuse the parse_minimal_rdb fixture inline so the toggle test
+        // has its own block of disk to mutate.
+        let mut disk = vec![0u8; 16 * 512];
+        let rdsk = make_block(
+            RDSK_SIGNATURE,
+            &[
+                (1, 64),
+                (4, 512),
+                (7, 1),
+                (8, NO_BLOCK),
+                (6, NO_BLOCK),
+                (9, NO_BLOCK),
+            ],
+        );
+        disk[0..512].copy_from_slice(&rdsk);
+
+        let mut bstr = [0u8; 4 * 8];
+        bstr[0] = 3;
+        bstr[1..4].copy_from_slice(b"DH0");
+        let part = {
+            let mut buf = [0u8; 512];
+            buf[0..4].copy_from_slice(PART_SIGNATURE);
+            BigEndian::write_u32(&mut buf[4..8], 64);
+            BigEndian::write_u32(&mut buf[4 * 4..4 * 4 + 4], NO_BLOCK);
+            BigEndian::write_u32(&mut buf[5 * 4..5 * 4 + 4], 1); // bootable
+            buf[9 * 4..9 * 4 + bstr.len()].copy_from_slice(&bstr);
+            BigEndian::write_u32(&mut buf[32 * 4..32 * 4 + 4], 16); // env_size
+            BigEndian::write_u32(&mut buf[33 * 4..33 * 4 + 4], 128); // env_block_size_longs
+            BigEndian::write_u32(&mut buf[35 * 4..35 * 4 + 4], 4); // surfaces
+            BigEndian::write_u32(&mut buf[37 * 4..37 * 4 + 4], 32); // blk_per_trk
+            BigEndian::write_u32(&mut buf[41 * 4..41 * 4 + 4], 2); // low_cyl
+            BigEndian::write_u32(&mut buf[42 * 4..42 * 4 + 4], 3); // high_cyl
+            BigEndian::write_u32(&mut buf[48 * 4..48 * 4 + 4], 0x444F5303); // DOS\3
+            let mut sum: i32 = 0;
+            for i in 0..128 {
+                sum = sum.wrapping_add(BigEndian::read_i32(&buf[i * 4..i * 4 + 4]));
+            }
+            BigEndian::write_i32(&mut buf[2 * 4..2 * 4 + 4], sum.wrapping_neg());
+            buf
+        };
+        disk[512..1024].copy_from_slice(&part);
+
+        let mut cursor = Cursor::new(disk);
+        // Toggle off.
+        let now = set_partition_bootable(&mut cursor, 1, false).expect("toggle off");
+        assert!(!now);
+        // Re-parse — checksum must validate, flag must be clear.
+        let rdb = Rdb::parse(&mut cursor).expect("re-parse after toggle off");
+        assert!(!rdb.partitions[0].is_bootable());
+        // Toggle back on.
+        let now = set_partition_bootable(&mut cursor, 1, true).expect("toggle on");
+        assert!(now);
+        let rdb = Rdb::parse(&mut cursor).expect("re-parse after toggle on");
+        assert!(rdb.partitions[0].is_bootable());
     }
 
     #[test]
