@@ -1003,6 +1003,324 @@ impl<R: Read + Seek> Read for CompactSfsReader<R> {
     }
 }
 
+// === Phase 8: formatter for a blank SFS volume =============================
+//
+// Produces a minimum mountable empty SFS volume so the write path has a
+// known-good starting state for round-trip tests. Mirrors the layout
+// `filesystemmain.c::ACTION_FORMAT` emits for a no-recycled disk:
+//
+//   block 0                       — root block (SFS\0)
+//   block 1 (block_adminspace)    — AdminSpaceContainer (ADMC)
+//   block 2 (block_root)          — root ObjectContainer (OBJC) holding the
+//                                   root directory's fsObject
+//   block 3                       — root HashTable (HTAB)
+//   block 4                       — transaction-OK placeholder (TROK)
+//   block 5 (block_extentbnoderoot) — empty extent B-tree leaf (BNDC)
+//   block 6 (block_objectnoderoot)  — leaf NodeContainer (NDC ) with the
+//                                     reserved object-node slots
+//   blocks 33..(33+blocks_bitmap-1) — bitmap blocks (BTMP)
+//   block totalblocks-1            — backup root block
+//
+// `blocks_admin = 32` reserves a 32-block admin region starting at block 1.
+// The AdminSpaceContainer's `adminspace[0].bits = 0xFC000000` records the
+// 6 already-allocated blocks (root OBJC, hashtable, transaction, extent
+// btree leaf, object-node leaf) within that region. We don't emit the
+// `.recycled` directory.
+//
+// **Checksum convention.** Every metadata block ends with
+// `sum_all_longs.wrapping_add(1) == 0`. We compute by zeroing the
+// checksum slot at offset 4 first, summing the rest, then storing
+// `0u32.wrapping_sub(sum).wrapping_sub(1)`.
+
+const SFS_BLOCKS_RESERVED_START: u32 = 1;
+const SFS_BLOCKS_RESERVED_END: u32 = 1;
+const SFS_BLOCKS_ADMIN: u32 = 32;
+/// AdminSpace bits showing the first six blocks of the admin region as
+/// allocated: ADMC, root OBJC, root HTAB, TROK, BNDC, NDC.
+const SFS_ADMIN_INITIAL_BITS: u32 = 0xFC000000;
+
+const FIBF_READ: u32 = 1 << 3;
+const FIBF_WRITE: u32 = 1 << 2;
+const FIBF_EXECUTE: u32 = 1 << 1;
+const FIBF_DELETE: u32 = 1 << 0;
+
+fn write_u16(buf: &mut [u8], o: usize, v: u16) {
+    buf[o..o + 2].copy_from_slice(&v.to_be_bytes());
+}
+fn write_u32(buf: &mut [u8], o: usize, v: u32) {
+    buf[o..o + 4].copy_from_slice(&v.to_be_bytes());
+}
+
+/// Compute and stamp the SFS block checksum. The checksum slot at offset 4
+/// is zeroed first; the function then walks every u32 word in the block
+/// and stores `-(sum + 1)` at offset 4 so a later `sum.wrapping_add(1)`
+/// over all longs yields 0 (matches `CALCCHECKSUM` in
+/// `SFSsaveextents/asmsupport.s`).
+fn stamp_checksum(buf: &mut [u8]) {
+    write_u32(buf, 4, 0);
+    let mut sum: u32 = 0;
+    for o in (0..buf.len()).step_by(4) {
+        sum = sum.wrapping_add(rd_u32(buf, o));
+    }
+    let chk = 0u32.wrapping_sub(sum).wrapping_sub(1);
+    write_u32(buf, 4, chk);
+}
+
+/// Write one fsObject into `buf[off..]`. Returns the number of bytes
+/// consumed (aligned even). Layout matches `parse_object`.
+fn encode_object(
+    buf: &mut [u8],
+    off: usize,
+    objectnode: u32,
+    protection: u32,
+    data_or_ht: u32,
+    size_or_fdb: u32,
+    datemodified: u32,
+    bits: u8,
+    name: &str,
+    comment: &str,
+) -> usize {
+    let name_bytes = name.as_bytes();
+    let cmt_bytes = comment.as_bytes();
+    let header_len = 25;
+    let unaligned = header_len + name_bytes.len() + 1 + cmt_bytes.len() + 1;
+    let aligned = (unaligned + 1) & !1;
+    // owneruid + ownergid at off..off+4 stay 0.
+    write_u32(buf, off + 4, objectnode);
+    write_u32(buf, off + 8, protection);
+    write_u32(buf, off + 12, data_or_ht);
+    write_u32(buf, off + 16, size_or_fdb);
+    write_u32(buf, off + 20, datemodified);
+    buf[off + 24] = bits;
+    let name_start = off + 25;
+    buf[name_start..name_start + name_bytes.len()].copy_from_slice(name_bytes);
+    buf[name_start + name_bytes.len()] = 0;
+    let cmt_start = name_start + name_bytes.len() + 1;
+    buf[cmt_start..cmt_start + cmt_bytes.len()].copy_from_slice(cmt_bytes);
+    buf[cmt_start + cmt_bytes.len()] = 0;
+    aligned
+}
+
+/// Create a blank SFS volume of `total_blocks` 512-byte blocks. The volume
+/// mounts with diskname `name` (truncated to 30 bytes) and no `.recycled`
+/// directory.
+pub fn create_blank_sfs(total_blocks: u32, name: &str) -> Result<Vec<u8>, FilesystemError> {
+    let blocksize: u32 = 512;
+    if total_blocks < 64 {
+        return Err(parse_err(format!(
+            "SFS formatter: total_blocks {} too small (need >= 64)",
+            total_blocks
+        )));
+    }
+    let blocks_inbitmap = (blocksize - 12) * 8;
+    let blocks_bitmap = (total_blocks + blocks_inbitmap - 1) / blocks_inbitmap;
+    let blocks_admin = SFS_BLOCKS_ADMIN;
+    let reserved_start = SFS_BLOCKS_RESERVED_START;
+    let reserved_end = SFS_BLOCKS_RESERVED_END;
+
+    let block_adminspace = reserved_start;
+    let block_root = reserved_start + 1;
+    let block_hashtable = block_root + 1;
+    let block_transaction = block_root + 2;
+    let block_extentbnoderoot = block_root + 3;
+    let block_objectnoderoot = block_root + 4;
+    let block_bitmapbase = block_adminspace + blocks_admin;
+
+    if block_bitmapbase + blocks_bitmap + reserved_end > total_blocks {
+        return Err(parse_err(format!(
+            "SFS formatter: layout doesn't fit (admin+bitmap+reserved > total)"
+        )));
+    }
+
+    let total_size = total_blocks as usize * blocksize as usize;
+    let mut img = vec![0u8; total_size];
+    let bs = blocksize as usize;
+    let block_off = |b: u32| -> usize { b as usize * bs };
+
+    // === Root block (block 0 + duplicated at totalblocks-1) ===
+    let mut rb_buf = vec![0u8; bs];
+    write_u32(&mut rb_buf, 0, ROOTBLOCK_ID);
+    // checksum at 4 stamped below
+    write_u32(&mut rb_buf, 8, 0); // ownblock = 0 for the primary root
+    write_u16(&mut rb_buf, 12, STRUCTURE_VERSION);
+    write_u16(&mut rb_buf, 14, 0); // sequencenumber
+    write_u32(&mut rb_buf, 16, 0); // datecreated
+                                   // bits @ 20: ROOTBITS_CASESENSITIVE=0, ROOTBITS_RECYCLED=0 (no .recycled).
+                                   // pad1 @ 21, pad2 @ 22, reserved1 @ 24..32 stay zero.
+                                   // firstbyteh/firstbyte at 32/36: 0 (single-partition file image)
+                                   // lastbyteh/lastbyte at 40/44: last byte offset of partition
+    let last_byte = (total_blocks as u64 * blocksize as u64).saturating_sub(1);
+    write_u32(&mut rb_buf, 40, (last_byte >> 32) as u32);
+    write_u32(&mut rb_buf, 44, last_byte as u32);
+    write_u32(&mut rb_buf, 48, total_blocks);
+    write_u32(&mut rb_buf, 52, blocksize);
+    // reserved2 (8) at 56, reserved3 (32) at 64.
+    write_u32(&mut rb_buf, 96, block_bitmapbase);
+    write_u32(&mut rb_buf, 100, block_adminspace);
+    write_u32(&mut rb_buf, 104, block_root);
+    write_u32(&mut rb_buf, 108, block_extentbnoderoot);
+    write_u32(&mut rb_buf, 112, block_objectnoderoot);
+    stamp_checksum(&mut rb_buf);
+    img[block_off(0)..block_off(0) + bs].copy_from_slice(&rb_buf);
+
+    // Backup root at totalblocks-1: identical except ownblock.
+    let mut rb2 = rb_buf.clone();
+    write_u32(&mut rb2, 8, total_blocks - 1);
+    stamp_checksum(&mut rb2);
+    let backup_off = block_off(total_blocks - 1);
+    img[backup_off..backup_off + bs].copy_from_slice(&rb2);
+
+    // === AdminSpaceContainer at block 1 ===
+    {
+        let off = block_off(block_adminspace);
+        let blk = &mut img[off..off + bs];
+        write_u32(blk, 0, u32::from_be_bytes(*b"ADMC"));
+        write_u32(blk, 8, block_adminspace); // ownblock
+                                             // next/previous BLCK at 12/16: 0
+                                             // bits at 24 = blocks_admin (per filesystemmain.c:874)
+        blk[24] = blocks_admin as u8;
+        // adminspace[0]: space at 28..32, bits at 32..36
+        write_u32(blk, 28, block_adminspace);
+        write_u32(blk, 32, SFS_ADMIN_INITIAL_BITS);
+        stamp_checksum(blk);
+    }
+
+    // === Root ObjectContainer at block 2 ===
+    let datecreated = 0u32;
+    {
+        let off = block_off(block_root);
+        let blk = &mut img[off..off + bs];
+        write_u32(blk, 0, OBJECTCONTAINER_ID);
+        write_u32(blk, 8, block_root); // ownblock
+                                       // parent NODE at 12: 0 (root has no parent)
+                                       // next/previous BLCK at 16/20: 0
+        let object_off = 24usize;
+        encode_object(
+            blk,
+            object_off,
+            ROOTNODE,
+            FIBF_READ | FIBF_WRITE | FIBF_EXECUTE | FIBF_DELETE,
+            block_hashtable,
+            0,
+            datecreated,
+            OTYPE_DIR,
+            name,
+            "",
+        );
+        // The trailing bytes of an OBJC carry the fsRootInfo block at the
+        // very end (last sizeof(fsRootInfo) bytes of the block). Initialize
+        // it so future format-parity tools can find it.
+        let ri_size = 32usize; // fsRootInfo: 4*5 = 20 + 12 reserved = 32-ish
+        let ri_off = bs - ri_size;
+        // freeblocks at fsRootInfo offset 8 (after deletedblocks+deletedfiles)
+        let freeblocks =
+            total_blocks - blocks_admin - reserved_start - reserved_end - blocks_bitmap;
+        write_u32(blk, ri_off + 8, freeblocks);
+        write_u32(blk, ri_off + 12, datecreated);
+        stamp_checksum(blk);
+    }
+
+    // === Root HashTable at block 3 ===
+    {
+        let off = block_off(block_hashtable);
+        let blk = &mut img[off..off + bs];
+        write_u32(blk, 0, HASHTABLE_ID);
+        write_u32(blk, 8, block_hashtable);
+        write_u32(blk, 12, ROOTNODE); // parent NODE
+                                      // hashentry[] all zero — empty.
+        stamp_checksum(blk);
+    }
+
+    // === Transaction-OK placeholder at block 4 ===
+    {
+        let off = block_off(block_transaction);
+        let blk = &mut img[off..off + bs];
+        // TRANSACTIONOK_ID = MAKE_ID('T','R','O','K')
+        write_u32(blk, 0, u32::from_be_bytes(*b"TROK"));
+        write_u32(blk, 8, block_transaction);
+        stamp_checksum(blk);
+    }
+
+    // === Extent B-tree root (empty leaf) at block 5 ===
+    {
+        let off = block_off(block_extentbnoderoot);
+        let blk = &mut img[off..off + bs];
+        write_u32(blk, 0, BNODECONTAINER_ID);
+        write_u32(blk, 8, block_extentbnoderoot);
+        // BTreeContainer at offset 12: nodecount(u16)=0, isleaf(u8)=1,
+        // nodesize(u8)=sizeof(fsExtentBNode)=14
+        write_u16(blk, 12, 0);
+        blk[14] = 1; // isleaf
+        blk[15] = 14; // nodesize
+        stamp_checksum(blk);
+    }
+
+    // === Object-node root NodeContainer (leaf) at block 6 ===
+    {
+        let off = block_off(block_objectnoderoot);
+        let blk = &mut img[off..off + bs];
+        write_u32(blk, 0, NODECONTAINER_ID);
+        write_u32(blk, 8, block_objectnoderoot);
+        write_u32(blk, 12, 1); // nodenumber: objectnode 0 is reserved
+        write_u32(blk, 16, 1); // nodes==1 → leaf NodeContainer
+                               // node[0] is fsObjectNode (10 bytes): data BLCK + next + hash16.
+                               // ObjectNode 1 = root → data = block_root, hash16/next zero.
+        write_u32(blk, 20, block_root);
+        // Slots 2..6 reserved (filesystemmain.c writes data=-1 for reserved
+        // slots, so we emit 0xFFFFFFFF too).
+        for slot in 1..6 {
+            write_u32(blk, 20 + slot * 10, 0xFFFF_FFFF);
+        }
+        stamp_checksum(blk);
+    }
+
+    // === Bitmap blocks at blocks 33..(33+blocks_bitmap-1) ===
+    // The bitmap covers all `total_blocks`. Bits 1 = free, 0 = allocated.
+    // Allocated regions: blocks 0..reserved_start, the admin region,
+    // the bitmap region itself, and the trailing reserved-end block.
+    {
+        let mut alloc = vec![false; total_blocks as usize];
+        for b in 0..reserved_start {
+            alloc[b as usize] = true;
+        }
+        for b in block_adminspace..block_adminspace + blocks_admin {
+            alloc[b as usize] = true;
+        }
+        for b in block_bitmapbase..block_bitmapbase + blocks_bitmap {
+            alloc[b as usize] = true;
+        }
+        for b in (total_blocks - reserved_end)..total_blocks {
+            alloc[b as usize] = true;
+        }
+        for bm_idx in 0..blocks_bitmap {
+            let off = block_off(block_bitmapbase + bm_idx);
+            let blk = &mut img[off..off + bs];
+            write_u32(blk, 0, BITMAP_ID);
+            write_u32(blk, 8, block_bitmapbase + bm_idx);
+            // bitmap[] at offset 12. words_per_block = (bs-12)/4.
+            let words_per_block = (bs - 12) / 4;
+            let bits_per_block = words_per_block * 32;
+            let base_block = bm_idx as usize * bits_per_block;
+            for w in 0..words_per_block {
+                let mut word: u32 = 0;
+                for i in 0..32 {
+                    let global_blk = base_block + w * 32 + i;
+                    if global_blk >= total_blocks as usize {
+                        break;
+                    }
+                    if !alloc[global_blk] {
+                        word |= 1u32 << (31 - i as u32);
+                    }
+                }
+                write_u32(blk, 12 + w * 4, word);
+            }
+            stamp_checksum(blk);
+        }
+    }
+
+    Ok(img)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1014,6 +1332,26 @@ mod tests {
         assert_eq!(BITMAP_ID, 0x42544D50);
         assert_eq!(BNODECONTAINER_ID, 0x424E4443);
         assert_eq!(NODECONTAINER_ID, 0x4E444320);
+    }
+
+    #[test]
+    fn blank_sfs_round_trips_through_reader() {
+        // 4 MiB blank volume: 8192 blocks @ 512 bytes.
+        let img = create_blank_sfs(8192, "BlankSFS").expect("format");
+        assert_eq!(img.len(), 8192 * 512);
+        let cur = std::io::Cursor::new(img);
+        let mut fs = SfsFilesystem::open(cur, 0).expect("open");
+        let root = fs.root().expect("root");
+        let kids = fs.list_directory(&root).expect("list");
+        assert!(kids.is_empty(), "blank SFS root should be empty");
+        assert_eq!(fs.total_size(), 8192 * 512);
+        // free_blocks_cached is computed at open via read_bitmap.
+        let used = fs.used_size();
+        let free = fs.total_size() - used;
+        // Sanity: free should be at least the data area we left unallocated.
+        // total - admin(32) - bitmap(N) - reserved_start(1) - reserved_end(1)
+        // = 8192 - 32 - 1 - 1 - 1 = 8157 (one BM block covers all 8192 bits).
+        assert!(free >= 8000 * 512);
     }
 
     #[test]
