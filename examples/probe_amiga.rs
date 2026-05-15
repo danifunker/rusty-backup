@@ -8,6 +8,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 
+use rusty_backup::fs;
 use rusty_backup::partition::PartitionTable;
 use rusty_backup::rbformats::chd::ChdReader;
 
@@ -55,6 +56,46 @@ fn main() -> anyhow::Result<()> {
             part.size_bytes,
             part.bootable,
         );
+
+        // Browse AFFS partitions inline.
+        let type_str = part.partition_type_string.as_deref().unwrap_or("");
+        if !fs::is_amiga_dos_type(type_str) {
+            continue;
+        }
+        let offset = part.start_lba * 512;
+        let opened: Result<Box<dyn fs::filesystem::Filesystem>, _> =
+            if path.to_lowercase().ends_with(".chd") {
+                let reader = ChdReader::open(Path::new(path))?;
+                fs::open_filesystem(reader, offset, 0, Some(type_str))
+            } else {
+                let file = File::open(path)?;
+                fs::open_filesystem(file, offset, 0, Some(type_str))
+            };
+        match opened {
+            Ok(mut fs) => {
+                let label = fs.volume_label().map(|s| s.to_string());
+                let typ = fs.fs_type().to_string();
+                let total = fs.total_size();
+                let used = fs.used_size();
+                println!("      label={label:?} type={typ} used={used}/{total}");
+                if let Ok(root) = fs.root() {
+                    if let Ok(children) = fs.list_directory(&root) {
+                        for child in children.iter().take(5) {
+                            println!(
+                                "        - {} ({} bytes, {})",
+                                child.name,
+                                child.size,
+                                if child.is_directory() { "dir" } else { "file" }
+                            );
+                        }
+                        if children.len() > 5 {
+                            println!("        ... and {} more", children.len() - 5);
+                        }
+                    }
+                }
+            }
+            Err(e) => println!("      open failed: {e}"),
+        }
     }
 
     Ok(())

@@ -242,16 +242,39 @@ state.
       already works on any `Read + Seek` stream.)*
 
 ### Phase 2 — OFS/FFS read + browse + backup
-- [ ] `src/fs/affs_common.rs` — checksums, big-endian helpers, DateStamp.
-- [ ] `src/fs/affs.rs` — open, root block, bitmap walk, hash-chain
-      directory listing, file read (OFS 24-byte header vs FFS 512-byte data).
-- [ ] All DOS\0..DOS\7 variants detected; Intl case folding correct.
-- [ ] Amiga metadata in `FileEntry` (protection, comment, mtime).
-- [ ] Dispatch wired in `src/fs/mod.rs`: name, layout-preserving=true,
-      expensive-min=false, browsable, compactor.
-- [ ] Compaction reader: zero-stream unused blocks (layout-preserving).
-- [ ] Backup test on `DiskDoctor.adf` (FFS floppy) and
-      `4x4OffRoadRacing_v1.00_1480.hdf` (OFS single-partition HDF).
+- [x] `src/fs/affs_common.rs` — checksums (normal + bitmap + boot), AFFS
+      hash with Intl case folding, AmigaDOS DateStamp conversion, BSTR
+      reader, protection-bits string, variant classification helpers.
+- [x] `src/fs/affs.rs` — open, root block parser, bitmap walk (root inline
+      pages + ext chain), hash-chain directory listing, file read (OFS
+      24-byte header + 488-byte payload vs FFS 512-byte payload), header
+      block + extension chain traversal.
+- [x] All DOS\0..DOS\7 variants detected. Intl case folding implemented;
+      DirCache (DOS\4/5) blocks are ignored on read (canonical hash chain
+      is authoritative); Long Names (DOS\6/7) currently read up to 30
+      chars (full 107-char support deferred until write lands so the
+      naming rules can be enforced consistently).
+- [x] Dispatch wired in `src/fs/mod.rs`: `is_amiga_dos_type` helper,
+      `fs_name_for`, `is_layout_preserving_fs` (true), `is_expensive_minimum`
+      (false — bitmap scan only), `open_filesystem_by_string`,
+      `compact_partition_reader_by_string`.
+- [x] `CompactAffsReader`: layout-preserving stream emitting allocated
+      blocks verbatim and zero-filling free blocks (AmigaDOS bit convention:
+      set bit = free).
+- [x] Manual validation against real images via `examples/probe_amiga`:
+      - `DiskDoctor.adf` (FFS floppy, DOS\1) → label "DiskDoctor",
+        used 729 600 / 901 120 bytes, 7 root entries.
+      - `4x4OffRoadRacing_v1.00_1480.hdf` (OFS HDF, DOS\0) → label
+        "4x4OffRoadRacing", used 854 528 / 1 064 960 bytes, 7 root entries.
+- [x] Unit tests: empty FFS floppy open, empty-root list, compact-reader
+      zero-fill for free blocks.
+- [ ] Amiga metadata in `FileEntry` (protection bits, comment). *Deferred
+      to Phase 3 — `FileEntry` is shared across 9+ filesystems and the
+      field additions are easier to land alongside write support so the
+      Edit UI can surface them too. `mtime` is already plumbed via
+      `FileEntry::modified` (AmigaDOS DateStamp → ISO-8601 string).*
+- [ ] Backup test on `DiskDoctor.adf` and `4x4OffRoadRacing_v1.00_1480.hdf`
+      via the GUI / `run_backup` end-to-end.
 - [ ] Restore round-trip byte-equal.
 
 ### Phase 3 — FFS write / EditableFilesystem
