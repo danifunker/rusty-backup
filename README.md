@@ -92,8 +92,8 @@ restore or VHD export.
 | btrfs          | Yes    | No                        | No                           | Modern Linux; read-only browse |
 | ProDOS         | Yes    | Yes                        | No (planned)                  | Apple II / IIgs |
 | AFFS (OFS / FFS)  | Yes | No (layout-preserving)     | No                            | Amiga `DOS\0`..`DOS\7`. Read + edit (add file / new folder / delete); Disk Validator fsck included |
-| PFS3 / PDS3 / muFS | Yes | No (layout-preserving)    | No                            | Amiga PFS3 family. Read + edit (add file / new folder / delete) with sync-boundary atomicity |
-| SFS (Smart File System) | Yes | No (layout-preserving) | No                          | Amiga `SFS\0` / `SFS\2`. Read + edit (add file / new folder / delete) — single-leaf btree only |
+| PFS3 / PDS3 / muFS | Yes | Yes (in-place trim/grow)  | Yes (in-place trim/grow)      | Amiga PFS3 family. Read + edit + in-place resize (shrink refuses to truncate live data; grow stays within existing bitmap capacity) |
+| SFS (Smart File System) | Yes | Yes (in-place trim/grow) | Yes (in-place trim/grow)    | Amiga `SFS\0` / `SFS\2`. Read + edit + in-place resize. Editing limited to single-leaf btree |
 
 ### What works well vs. what to watch out for
 

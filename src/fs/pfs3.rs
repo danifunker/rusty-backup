@@ -2122,6 +2122,561 @@ pub fn create_blank_pfs3(total_sectors: u32, name: &str) -> Result<Vec<u8>, File
     Ok(img)
 }
 
+// === PFS3 in-place resize ===================================================
+//
+// Mirrors the pattern used by AFFS / HFS / HFS+ / FAT / NTFS / SFS:
+// `resize_pfs3_in_place` adjusts the rootblock's `disksize` (in HW sectors
+// of 512 bytes) and `blocks_free` fields, and for grows marks the newly
+// visible sectors as free in the data bitmap. Shrink path refuses to
+// throw away allocated data; grow path refuses to extend past the
+// existing bitmap-block capacity (Phase R.3 territory).
+//
+// No backup root exists in PFS3, so the commit point is a single
+// rootblock write at HW sector `ROOTBLOCK_SECTOR` (2).
+//
+// The function is a no-op when the volume at `partition_offset` isn't
+// a PFS3 volume (boot magic doesn't match), so it's safe to call from
+// the dispatch in `resize_filesystem_for` regardless of FS type.
+
+const PFS3_RB_DISKSIZE_OFFSET: usize = 84;
+const PFS3_RB_BLOCKS_FREE_OFFSET: usize = 68;
+const PFS3_RB_OPTIONS_OFFSET: usize = 4;
+
+/// Resize a PFS3 volume at `partition_offset` to `new_size_bytes`.
+///
+/// - **Shrink**: rejects if any allocated user-data sector lies at or
+///   beyond `new_size_bytes / 512`; otherwise stamps the new
+///   `disksize` and adjusts `blocks_free` for the lost bits.
+/// - **Grow**: marks the new sectors free in the data bitmap, bumps
+///   `blocks_free`, and stamps the new `disksize`. Refuses to grow
+///   past the capacity of the existing BM-block chain (adding BM
+///   blocks needs reserved-block allocation, which we defer).
+/// - **No-op** when the volume isn't PFS3, or when `new_size_bytes`
+///   rounds to the existing block count.
+pub fn resize_pfs3_in_place(
+    device: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    new_size_bytes: u64,
+    log: &mut impl FnMut(&str),
+) -> anyhow::Result<()> {
+    // --- 1. Probe boot magic at HW sector 0. ---
+    device.seek(SeekFrom::Start(partition_offset))?;
+    let mut boot = [0u8; 512];
+    if device.read_exact(&mut boot).is_err() {
+        return Ok(());
+    }
+    let mag = &boot[0..4];
+    let valid = mag == b"PFS\x01"
+        || mag == b"PDS\x01"
+        || mag == b"muAF"
+        || mag == b"muPF"
+        || mag == b"AFS\x01"
+        || mag == b"PFS\x02";
+    if !valid {
+        return Ok(());
+    }
+
+    // --- 2. Read rootblock (first 512 bytes of the rootblock cluster). ---
+    let rb_offset = partition_offset + ROOTBLOCK_SECTOR as u64 * HW_SECTOR;
+    let mut rb_buf = [0u8; 512];
+    device.seek(SeekFrom::Start(rb_offset))?;
+    device.read_exact(&mut rb_buf)?;
+    let root = match Pfs3RootBlock::parse(&rb_buf) {
+        Ok(r) => r,
+        Err(e) => {
+            log(&format!(
+                "PFS3 resize: rootblock parse failed: {e}; skipping"
+            ));
+            return Ok(());
+        }
+    };
+
+    let reserved_blksize = root.reserved_blksize as u32;
+    if reserved_blksize == 0 || reserved_blksize % 512 != 0 {
+        log(&format!(
+            "PFS3 resize: invalid reserved_blksize {}, skipping",
+            reserved_blksize
+        ));
+        return Ok(());
+    }
+
+    let new_total_u64 = new_size_bytes / HW_SECTOR;
+    if new_total_u64 == 0 || new_total_u64 > u32::MAX as u64 {
+        anyhow::bail!(
+            "PFS3 resize: target {} bytes resolves to {} sectors, out of u32 range",
+            new_size_bytes,
+            new_total_u64,
+        );
+    }
+    let new_total = new_total_u64 as u32;
+
+    // `disksize == 0` on older volumes (MODE_SIZEFIELD off) means
+    // "fills the partition"; in that case derive the effective old
+    // size from the partition extent we just read from. We can still
+    // grow / shrink the FS by stamping disksize during this resize.
+    let old_total = if root.disksize > 0 {
+        root.disksize
+    } else {
+        // Compute from EOF — but `partition_offset` might be 0 inside
+        // a larger container, so use the explicit new_size as a
+        // fallback. We can't trust EOF here.
+        log("PFS3 resize: rootblock disksize==0 (pre-SIZEFIELD volume); will stamp disksize");
+        // Treat the current rootblock as authoritative for "old" by
+        // reading partition end via seek.
+        let end = device.seek(SeekFrom::End(0))?;
+        let bytes = end.saturating_sub(partition_offset);
+        (bytes / HW_SECTOR).min(u32::MAX as u64) as u32
+    };
+
+    if new_total == old_total {
+        log("PFS3 resize: no size change, skipping");
+        return Ok(());
+    }
+
+    // Reserved area must remain inside the volume.
+    let min_total = root.last_reserved + 2;
+    if new_total < min_total {
+        anyhow::bail!(
+            "PFS3 resize: target {} sectors below the metadata-region minimum {}",
+            new_total,
+            min_total,
+        );
+    }
+
+    let bitmap_start = root.last_reserved + 1;
+    let longsperbmb = (reserved_blksize / 4) - 3; // u32 words per BM block
+    let sectors_per_bmb = longsperbmb * 32;
+
+    if new_total > old_total {
+        resize_pfs3_grow(
+            device,
+            partition_offset,
+            &root,
+            old_total,
+            new_total,
+            bitmap_start,
+            sectors_per_bmb,
+            log,
+        )
+    } else {
+        resize_pfs3_shrink(
+            device,
+            partition_offset,
+            &root,
+            old_total,
+            new_total,
+            bitmap_start,
+            sectors_per_bmb,
+            log,
+        )
+    }
+}
+
+/// Shrink path: refuse if any sector >= new_total is allocated,
+/// otherwise update `disksize` + `blocks_free` and re-stamp the
+/// rootblock.
+fn resize_pfs3_shrink(
+    device: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    root: &Pfs3RootBlock,
+    old_total: u32,
+    new_total: u32,
+    bitmap_start: u32,
+    sectors_per_bmb: u32,
+    log: &mut impl FnMut(&str),
+) -> anyhow::Result<()> {
+    let reserved_blksize = root.reserved_blksize as u32;
+    // Walk the data bitmap and find the highest allocated sector.
+    let (highest, freed_inside_old_visible) = pfs3_highest_alloc_and_free_count(
+        device,
+        partition_offset,
+        root,
+        bitmap_start,
+        sectors_per_bmb,
+        new_total,
+        old_total,
+    )?;
+    if let Some(h) = highest {
+        if h >= new_total {
+            anyhow::bail!(
+                "PFS3 resize: highest allocated user sector {} >= target {} sectors, \
+                 cannot shrink to {} bytes. Shrink to at least {} sectors (~{} bytes), \
+                 or pick a larger target.",
+                h,
+                new_total,
+                new_total as u64 * HW_SECTOR,
+                h + 1,
+                (h as u64 + 1) * HW_SECTOR,
+            );
+        }
+    }
+
+    // blocks_free originally counted free sectors in the user-data area.
+    // We're dropping the range [new_total, old_total) from view; subtract
+    // the free bits that lived in that range.
+    let new_blocks_free = root.blocks_free.saturating_sub(freed_inside_old_visible);
+
+    let mut new_root = root.clone();
+    new_root.disksize = new_total;
+    new_root.blocks_free = new_blocks_free;
+    pfs3_write_rootblock(device, partition_offset, &new_root, reserved_blksize)?;
+
+    log(&format!(
+        "PFS3 resize: shrunk from {} to {} HW sectors ({} -> {} bytes), blocks_free {} -> {}",
+        old_total,
+        new_total,
+        old_total as u64 * HW_SECTOR,
+        new_total as u64 * HW_SECTOR,
+        root.blocks_free,
+        new_blocks_free,
+    ));
+    Ok(())
+}
+
+/// Grow path: mark the new sectors free in the data bitmap, update
+/// `disksize` + `blocks_free`, re-stamp the rootblock.
+#[allow(clippy::too_many_arguments)]
+fn resize_pfs3_grow(
+    device: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    root: &Pfs3RootBlock,
+    old_total: u32,
+    new_total: u32,
+    bitmap_start: u32,
+    sectors_per_bmb: u32,
+    log: &mut impl FnMut(&str),
+) -> anyhow::Result<()> {
+    let reserved_blksize = root.reserved_blksize as u32;
+    if new_total <= bitmap_start {
+        anyhow::bail!(
+            "PFS3 resize: target {} sectors leaves no room for data area",
+            new_total,
+        );
+    }
+    // Capacity check: count how many BM blocks the existing
+    // bitmapindex chain references. Each BM covers `sectors_per_bmb`
+    // sectors of the data area.
+    let existing_bms = pfs3_count_bm_blocks(device, partition_offset, root)?;
+    let bitmap_capacity_sectors = existing_bms.saturating_mul(sectors_per_bmb) as u64;
+    let new_data_sectors = (new_total - bitmap_start) as u64;
+    if new_data_sectors > bitmap_capacity_sectors {
+        anyhow::bail!(
+            "PFS3 resize: growing from {} to {} sectors needs {} data sectors \
+             but the existing {} BM block(s) cover only {} sectors. Allocating \
+             more BM blocks requires reserved-block headroom and is not \
+             implemented. Maximum grow without extending the bitmap chain: \
+             {} sectors (~{} bytes).",
+            old_total,
+            new_total,
+            new_data_sectors,
+            existing_bms,
+            bitmap_capacity_sectors,
+            bitmap_start as u64 + bitmap_capacity_sectors,
+            (bitmap_start as u64 + bitmap_capacity_sectors) * HW_SECTOR,
+        );
+    }
+
+    // Mark [old_total, new_total) free in the bitmap. Old volumes with
+    // disksize==0 have already had the bitmap fully populated by the
+    // formatter, so this might be a no-op for them; that's fine — the
+    // operation is idempotent.
+    let first_to_free = old_total.max(bitmap_start);
+    if first_to_free < new_total {
+        pfs3_set_data_bitmap_range(
+            device,
+            partition_offset,
+            root,
+            bitmap_start,
+            sectors_per_bmb,
+            first_to_free,
+            new_total - first_to_free,
+            /*set_free=*/ true,
+        )?;
+    }
+
+    let added = new_total - old_total;
+    let new_blocks_free = root.blocks_free.saturating_add(added);
+
+    let mut new_root = root.clone();
+    new_root.disksize = new_total;
+    new_root.blocks_free = new_blocks_free;
+    pfs3_write_rootblock(device, partition_offset, &new_root, reserved_blksize)?;
+
+    log(&format!(
+        "PFS3 resize: grew from {} to {} HW sectors ({} -> {} bytes), blocks_free {} -> {}",
+        old_total,
+        new_total,
+        old_total as u64 * HW_SECTOR,
+        new_total as u64 * HW_SECTOR,
+        root.blocks_free,
+        new_blocks_free,
+    ));
+    Ok(())
+}
+
+/// Walk every BM block referenced from the rootblock's bitmapindex.
+/// Returns:
+/// - `highest`: highest allocated sector across the bitmap, ignoring
+///   sectors >= `old_total` (which may carry stale "allocated" bits
+///   left over from format-time fill).
+/// - `freed_inside_dropped_range`: count of bits that were *free* (=1)
+///   in the range `[new_total, old_total)`. We subtract these from
+///   `blocks_free` when shrinking.
+#[allow(clippy::too_many_arguments)]
+fn pfs3_highest_alloc_and_free_count(
+    device: &mut (impl Read + Seek),
+    partition_offset: u64,
+    root: &Pfs3RootBlock,
+    bitmap_start: u32,
+    sectors_per_bmb: u32,
+    new_total: u32,
+    old_total: u32,
+) -> anyhow::Result<(Option<u32>, u32)> {
+    let reserved_blksize = root.reserved_blksize as usize;
+    let longsperbmb = ((reserved_blksize / 4) - 3) as u32;
+    let mut highest: Option<u32> = None;
+    let mut freed_inside_dropped_range: u32 = 0;
+    let mut buf = vec![0u8; reserved_blksize];
+
+    for (mi_seq, &mi_blk) in root.bitmapindex.iter().enumerate() {
+        if mi_blk == 0 {
+            continue;
+        }
+        // Read MI block.
+        device.seek(SeekFrom::Start(
+            partition_offset + mi_blk as u64 * HW_SECTOR,
+        ))?;
+        device.read_exact(&mut buf)?;
+        if rd_u16(&buf, 0) != ID_BITMAPINDEXBLOCK {
+            anyhow::bail!(
+                "PFS3 resize: bitmapindex block {} has bad id at MI seq {}",
+                mi_blk,
+                mi_seq,
+            );
+        }
+        let mi_bytes = buf.clone();
+        let indexperblock = ((reserved_blksize - 12) / 4) as u32;
+        for i in 0..indexperblock {
+            let off = 12 + i as usize * 4;
+            if off + 4 > mi_bytes.len() {
+                break;
+            }
+            let bm_blk = rd_u32(&mi_bytes, off);
+            if bm_blk == 0 {
+                continue;
+            }
+            let bm_seq = mi_seq as u32 * indexperblock + i;
+            // Read BM block.
+            device.seek(SeekFrom::Start(
+                partition_offset + bm_blk as u64 * HW_SECTOR,
+            ))?;
+            device.read_exact(&mut buf)?;
+            if rd_u16(&buf, 0) != ID_BITMAPBLOCK {
+                anyhow::bail!("PFS3 resize: bitmap block {} has bad id", bm_blk);
+            }
+            let base_sector = bitmap_start as u64 + bm_seq as u64 * sectors_per_bmb as u64;
+            for w in 0..longsperbmb {
+                let o = 12 + w as usize * 4;
+                if o + 4 > buf.len() {
+                    break;
+                }
+                let word = rd_u32(&buf, o);
+                if word == 0xFFFF_FFFF {
+                    // All free — only matters for the dropped-range count.
+                    let word_first = base_sector + w as u64 * 32;
+                    let word_last = word_first + 31;
+                    if word_first >= new_total as u64 && word_last < old_total as u64 {
+                        freed_inside_dropped_range += 32;
+                        continue;
+                    }
+                }
+                for i in 0..32u32 {
+                    let sec = base_sector + (w as u64) * 32 + i as u64;
+                    if sec >= old_total as u64 {
+                        break;
+                    }
+                    let is_free = (word >> (31 - i)) & 1 == 1;
+                    if !is_free {
+                        // Allocated.
+                        if highest.map_or(true, |h| sec as u32 > h) {
+                            highest = Some(sec as u32);
+                        }
+                    } else if sec >= new_total as u64 && sec < old_total as u64 {
+                        freed_inside_dropped_range += 1;
+                    }
+                }
+            }
+        }
+    }
+    Ok((highest, freed_inside_dropped_range))
+}
+
+/// Count the number of non-zero BM-block pointers in the rootblock's
+/// bitmapindex array (i.e. how many BM blocks currently exist).
+fn pfs3_count_bm_blocks(
+    device: &mut (impl Read + Seek),
+    partition_offset: u64,
+    root: &Pfs3RootBlock,
+) -> anyhow::Result<u32> {
+    let reserved_blksize = root.reserved_blksize as usize;
+    let indexperblock = ((reserved_blksize - 12) / 4) as u32;
+    let mut buf = vec![0u8; reserved_blksize];
+    let mut total = 0u32;
+    for &mi_blk in &root.bitmapindex {
+        if mi_blk == 0 {
+            continue;
+        }
+        device.seek(SeekFrom::Start(
+            partition_offset + mi_blk as u64 * HW_SECTOR,
+        ))?;
+        device.read_exact(&mut buf)?;
+        if rd_u16(&buf, 0) != ID_BITMAPINDEXBLOCK {
+            continue;
+        }
+        for i in 0..indexperblock {
+            let off = 12 + i as usize * 4;
+            if off + 4 > buf.len() {
+                break;
+            }
+            if rd_u32(&buf, off) != 0 {
+                total += 1;
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// Toggle a contiguous range of bits in the data bitmap. The
+/// implementation reads each affected BM block exactly once, applies
+/// all bit flips, then writes the block back.
+#[allow(clippy::too_many_arguments)]
+fn pfs3_set_data_bitmap_range(
+    device: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    root: &Pfs3RootBlock,
+    bitmap_start: u32,
+    sectors_per_bmb: u32,
+    first_sector: u32,
+    count: u32,
+    set_free: bool,
+) -> anyhow::Result<()> {
+    if count == 0 {
+        return Ok(());
+    }
+    let reserved_blksize = root.reserved_blksize as usize;
+    let indexperblock = ((reserved_blksize - 12) / 4) as u32;
+    // Translate sector range to BM-block-relative range.
+    let first_local = first_sector
+        .checked_sub(bitmap_start)
+        .ok_or_else(|| anyhow::anyhow!("PFS3 resize: first_sector below bitmap_start"))?;
+    let last_local = first_local
+        .checked_add(count - 1)
+        .ok_or_else(|| anyhow::anyhow!("PFS3 resize: bitmap range overflow"))?;
+    let first_bm_seq = first_local / sectors_per_bmb;
+    let last_bm_seq = last_local / sectors_per_bmb;
+
+    let mut mi_buf = vec![0u8; reserved_blksize];
+    let mut bm_buf = vec![0u8; reserved_blksize];
+
+    for bm_seq in first_bm_seq..=last_bm_seq {
+        let mi_idx = (bm_seq / indexperblock) as usize;
+        let mi_offset = (bm_seq % indexperblock) as usize;
+        let mi_blk = *root.bitmapindex.get(mi_idx).ok_or_else(|| {
+            anyhow::anyhow!(
+                "PFS3 resize: bm_seq {} maps to MI index {} out of range",
+                bm_seq,
+                mi_idx,
+            )
+        })?;
+        if mi_blk == 0 {
+            anyhow::bail!(
+                "PFS3 resize: bm_seq {} references zero MI pointer at index {}",
+                bm_seq,
+                mi_idx,
+            );
+        }
+        device.seek(SeekFrom::Start(
+            partition_offset + mi_blk as u64 * HW_SECTOR,
+        ))?;
+        device.read_exact(&mut mi_buf)?;
+        if rd_u16(&mi_buf, 0) != ID_BITMAPINDEXBLOCK {
+            anyhow::bail!("PFS3 resize: MI block {} bad id", mi_blk);
+        }
+        let bm_blk = rd_u32(&mi_buf, 12 + mi_offset * 4);
+        if bm_blk == 0 {
+            anyhow::bail!(
+                "PFS3 resize: bm_seq {} has zero BM pointer at MI {} slot {}",
+                bm_seq,
+                mi_blk,
+                mi_offset,
+            );
+        }
+        let bm_off = partition_offset + bm_blk as u64 * HW_SECTOR;
+        device.seek(SeekFrom::Start(bm_off))?;
+        device.read_exact(&mut bm_buf)?;
+        if rd_u16(&bm_buf, 0) != ID_BITMAPBLOCK {
+            anyhow::bail!("PFS3 resize: BM block {} bad id", bm_blk);
+        }
+        let range_start_local = bm_seq * sectors_per_bmb;
+        let range_end_local = range_start_local + sectors_per_bmb;
+        let lo = first_local.max(range_start_local);
+        let hi = (last_local + 1).min(range_end_local);
+        for local in lo..hi {
+            let within = local - range_start_local;
+            let word_idx = within / 32;
+            let bit_pos = within % 32;
+            let o = 12 + word_idx as usize * 4;
+            let mut word = rd_u32(&bm_buf, o);
+            let mask = 1u32 << (31 - bit_pos);
+            if set_free {
+                word |= mask;
+            } else {
+                word &= !mask;
+            }
+            bm_buf[o..o + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        device.seek(SeekFrom::Start(bm_off))?;
+        device.write_all(&bm_buf)?;
+    }
+    Ok(())
+}
+
+/// Write the updated rootblock back to the first 512 bytes of the
+/// rootblock cluster, then flush. Sets `MODE_SIZEFIELD` so future
+/// readers honour our `disksize` field even on volumes that didn't
+/// originally have it set.
+fn pfs3_write_rootblock(
+    device: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    new_root: &Pfs3RootBlock,
+    _reserved_blksize: u32,
+) -> anyhow::Result<()> {
+    let rb_offset = partition_offset + ROOTBLOCK_SECTOR as u64 * HW_SECTOR;
+    let mut rb_buf = [0u8; 512];
+    device.seek(SeekFrom::Start(rb_offset))?;
+    device.read_exact(&mut rb_buf)?;
+    // Update the in-memory bytes directly — `write_into` rewrites a
+    // handful of fields but leaves the rest of the block untouched,
+    // which preserves anything we don't model (creation timestamps,
+    // protection bits, index-table heads, etc).
+    rb_buf[PFS3_RB_DISKSIZE_OFFSET..PFS3_RB_DISKSIZE_OFFSET + 4]
+        .copy_from_slice(&new_root.disksize.to_be_bytes());
+    rb_buf[PFS3_RB_BLOCKS_FREE_OFFSET..PFS3_RB_BLOCKS_FREE_OFFSET + 4]
+        .copy_from_slice(&new_root.blocks_free.to_be_bytes());
+    // Set MODE_SIZEFIELD so future opens trust the `disksize` we just
+    // stamped. Leave every other option bit untouched.
+    let mut options =
+        u32::from_be_bytes(rb_buf[PFS3_RB_OPTIONS_OFFSET..PFS3_RB_OPTIONS_OFFSET + 4].try_into()?);
+    options |= MODE_SIZEFIELD;
+    rb_buf[PFS3_RB_OPTIONS_OFFSET..PFS3_RB_OPTIONS_OFFSET + 4]
+        .copy_from_slice(&options.to_be_bytes());
+
+    device.seek(SeekFrom::Start(rb_offset))?;
+    device.write_all(&rb_buf)?;
+    device.flush()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2330,6 +2885,138 @@ mod tests {
         assert_eq!(
             before_free, after_free,
             "rollback should restore free space"
+        );
+    }
+
+    /// Shrink a blank 8192-sector volume to 4096 sectors. The data area
+    /// is entirely free, so the resize should succeed and the
+    /// rootblock should reflect the new size.
+    #[test]
+    fn resize_shrink_blank_volume() {
+        let img = create_blank_pfs3(8192, "Shrink").expect("format");
+        let mut cur = std::io::Cursor::new(img);
+        let mut log: Vec<String> = Vec::new();
+        let new_size = 4096u64 * HW_SECTOR;
+        resize_pfs3_in_place(&mut cur, 0, new_size, &mut |s| log.push(s.to_string()))
+            .expect("shrink");
+        assert!(log.iter().any(|l| l.contains("shrunk")), "log: {log:?}");
+        // Re-open at the new size and verify the rootblock now reports it.
+        let img2 = cur.into_inner();
+        let img_truncated = img2[..new_size as usize].to_vec();
+        let cur2 = std::io::Cursor::new(img_truncated);
+        let fs = Pfs3Filesystem::open(cur2, 0).expect("reopen");
+        assert_eq!(fs.total_size(), new_size);
+    }
+
+    /// Shrink should reject if a file would be lost.
+    #[test]
+    fn resize_shrink_refuses_when_data_lost() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem};
+        let img = create_blank_pfs3(8192, "Reject").expect("format");
+        let cur = std::io::Cursor::new(img);
+        let mut fs = Pfs3Filesystem::open(cur, 0).expect("open");
+        let root = fs.root().expect("root");
+        // Create a file large enough that it lives near the tail.
+        // Data allocations come from the end of the data bitmap walked
+        // forward in `alloc_data_blocks`, so even a small file lands
+        // near `bitmap_start` of the blank volume. To force a
+        // late-sector allocation we instead pad with a bigger file.
+        let payload: Vec<u8> = vec![0xCDu8; 1024 * 1024];
+        let mut c = std::io::Cursor::new(&payload);
+        fs.create_file(
+            &root,
+            "big.bin",
+            &mut c,
+            payload.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .expect("create_file");
+        EditableFilesystem::sync_metadata(&mut fs).expect("sync");
+
+        // Try to shrink small enough that the new tail truncates the
+        // file. The file occupies sectors low in the data area, but
+        // our allocator may place data anywhere; pick a target that's
+        // below `bitmap_start + ceil(1 MiB / 512)` = 66 + 2048 = 2114.
+        // 200 sectors is well below that and forces a rejection.
+        let img2 = fs.reader.into_inner();
+        let mut cur2 = std::io::Cursor::new(img2);
+        let mut log: Vec<String> = Vec::new();
+        let result = resize_pfs3_in_place(&mut cur2, 0, 200 * HW_SECTOR, &mut |s| {
+            log.push(s.to_string())
+        });
+        assert!(result.is_err(), "expected refusal, got log: {log:?}");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("highest allocated"),
+            "unexpected error: {err_msg}"
+        );
+    }
+
+    /// Grow within the existing BM-block capacity should succeed.
+    /// Blank 8192-sector volume has 1 BM block covering 8096 data
+    /// sectors, so growing to 8192 -> 9000 stays within the existing
+    /// BM (still 1 block, capacity 8162 data sectors with
+    /// bitmap_start=66). 9000 - 66 = 8934 — exceeds. Pick 8160 -> 8160.
+    /// Instead grow from 4096 -> 8192 after a prior shrink so we
+    /// know we're well within bitmap capacity.
+    #[test]
+    fn resize_grow_after_shrink_round_trips() {
+        let img = create_blank_pfs3(8192, "GrowBack").expect("format");
+        let mut cur = std::io::Cursor::new(img);
+        let mut log: Vec<String> = Vec::new();
+        // Shrink to 4096 sectors.
+        resize_pfs3_in_place(&mut cur, 0, 4096 * HW_SECTOR, &mut |s| {
+            log.push(s.to_string())
+        })
+        .expect("shrink");
+        // Re-pad the buffer to 8192 sectors so the grow has bytes to
+        // work with (the underlying medium needs to be at least that
+        // big).
+        let mut img = cur.into_inner();
+        img.resize(8192 * HW_SECTOR as usize, 0);
+        let mut cur = std::io::Cursor::new(img);
+        resize_pfs3_in_place(&mut cur, 0, 8000 * HW_SECTOR, &mut |s| {
+            log.push(s.to_string())
+        })
+        .expect("grow");
+        assert!(
+            log.iter().any(|l| l.contains("grew")),
+            "log missing grew: {log:?}"
+        );
+        let img = cur.into_inner();
+        let cur = std::io::Cursor::new(img);
+        let fs = Pfs3Filesystem::open(cur, 0).expect("reopen after grow");
+        assert_eq!(fs.total_size(), 8000 * HW_SECTOR);
+    }
+
+    /// Resize on a non-PFS volume should be a silent no-op.
+    #[test]
+    fn resize_skips_non_pfs_volume() {
+        let mut img = vec![0u8; 8192 * HW_SECTOR as usize];
+        // Stamp something that isn't PFS at boot magic.
+        img[0..4].copy_from_slice(b"DEAD");
+        let mut cur = std::io::Cursor::new(img);
+        let mut log: Vec<String> = Vec::new();
+        resize_pfs3_in_place(&mut cur, 0, 4096 * HW_SECTOR, &mut |s| {
+            log.push(s.to_string())
+        })
+        .expect("noop");
+        assert!(log.is_empty(), "expected silent no-op, got: {log:?}");
+    }
+
+    /// Equal sizes should log "no size change" and exit clean.
+    #[test]
+    fn resize_no_op_when_unchanged() {
+        let img = create_blank_pfs3(8192, "Same").expect("format");
+        let mut cur = std::io::Cursor::new(img);
+        let mut log: Vec<String> = Vec::new();
+        resize_pfs3_in_place(&mut cur, 0, 8192 * HW_SECTOR, &mut |s| {
+            log.push(s.to_string())
+        })
+        .expect("noop");
+        assert!(
+            log.iter().any(|l| l.contains("no size change")),
+            "log: {log:?}"
         );
     }
 }
