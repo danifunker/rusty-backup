@@ -41,6 +41,8 @@ pub struct ResizePopup {
     plan_error: Option<String>,
     /// Background resize thread status.
     resize_status: Option<Arc<Mutex<ResizeStatus>>>,
+    /// Rate / ETA estimator for the in-progress resize bar.
+    resize_rate: super::progress::RateTracker,
     /// Alignment in sectors (0 = no alignment).
     alignment_sectors: u64,
     /// Total disk size in bytes.
@@ -95,6 +97,7 @@ impl ResizePopup {
             preview: None,
             plan_error: None,
             resize_status: None,
+            resize_rate: super::progress::RateTracker::default(),
             alignment_sectors,
             disk_size_bytes,
             is_device,
@@ -252,12 +255,15 @@ impl ResizePopup {
                 if let Some(ref status_arc) = self.resize_status {
                     if let Ok(s) = status_arc.lock() {
                         if !s.finished && s.total_bytes > 0 {
+                            self.resize_rate.record(s.current_bytes, "Resizing");
                             let fraction = s.current_bytes as f32 / s.total_bytes as f32;
+                            let suffix = self.resize_rate.suffix(s.current_bytes, s.total_bytes);
                             let text = format!(
-                                "Resizing: {} / {} ({:.0}%)",
+                                "Resizing: {} / {} ({:.0}%){}",
                                 partition::format_size(s.current_bytes),
                                 partition::format_size(s.total_bytes),
                                 fraction * 100.0,
+                                suffix,
                             );
                             ui.add(egui::ProgressBar::new(fraction).text(text).animate(true));
                         } else if !s.finished {
@@ -433,6 +439,7 @@ impl ResizePopup {
             cancel_requested: false,
         }));
         self.resize_status = Some(Arc::clone(&status));
+        self.resize_rate.reset();
 
         let path = self.source_path.clone();
         let table = self.partition_table.clone();

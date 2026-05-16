@@ -81,6 +81,13 @@ pub struct InspectTab {
     export_partition_configs: Vec<PartitionExportConfig>,
     /// VHD export background thread status
     export_status: Option<Arc<Mutex<ExportStatus>>>,
+    /// Rate / ETA estimator for the VHD-export progress bar. Reset
+    /// when a new export starts and consulted each frame to render the
+    /// `N/s, ETA Hh Mm` suffix shared with the Backup / Restore bars.
+    export_rate: super::progress::RateTracker,
+    /// Rate / ETA estimator for the seekable-zstd cache-build progress
+    /// bar (native zstd Inspect path).
+    cache_rate: super::progress::RateTracker,
     /// Filesystem-computed in-place minimum partition sizes (partition index → bytes).
     /// "In-place" = the smallest size achievable by trim alone, no data movement.
     partition_min_sizes: HashMap<usize, u64>,
@@ -184,6 +191,8 @@ impl Default for InspectTab {
             export_chd_hd_control: ChdOptionsControl::new(ChdProfile::Hd),
             export_partition_configs: Vec::new(),
             export_status: None,
+            export_rate: super::progress::RateTracker::default(),
+            cache_rate: super::progress::RateTracker::default(),
             partition_min_sizes: HashMap::new(),
             partition_defrag_min_sizes: HashMap::new(),
             partition_volume_labels: HashMap::new(),
@@ -541,12 +550,15 @@ impl InspectTab {
         if let Some(ref status_arc) = self.export_status {
             if let Ok(s) = status_arc.lock() {
                 if !s.finished && s.total_bytes > 0 {
+                    self.export_rate.record(s.current_bytes, "Exporting");
                     let fraction = s.current_bytes as f32 / s.total_bytes as f32;
+                    let suffix = self.export_rate.suffix(s.current_bytes, s.total_bytes);
                     let text = format!(
-                        "Exporting: {} / {} ({:.0}%)",
+                        "Exporting: {} / {} ({:.0}%){}",
                         partition::format_size(s.current_bytes),
                         partition::format_size(s.total_bytes),
                         fraction * 100.0,
+                        suffix,
                     );
                     ui.add(egui::ProgressBar::new(fraction).text(text).animate(true));
                 } else if !s.finished {
@@ -644,13 +656,17 @@ impl InspectTab {
         if let Some(ref status_arc) = self.cache_status {
             if let Ok(s) = status_arc.lock() {
                 if !s.finished && s.total_bytes > 0 {
+                    let stage = format!("zstd-index-{}", s.partition_index);
+                    self.cache_rate.record(s.current_bytes, &stage);
                     let fraction = s.current_bytes as f32 / s.total_bytes as f32;
+                    let suffix = self.cache_rate.suffix(s.current_bytes, s.total_bytes);
                     let text = format!(
-                        "Building seekable zstd index for partition {}: {} / {} ({:.0}%)",
+                        "Building seekable zstd index for partition {}: {} / {} ({:.0}%){}",
                         s.partition_index,
                         partition::format_size(s.current_bytes),
                         partition::format_size(s.total_bytes),
                         fraction * 100.0,
+                        suffix,
                     );
                     ui.add(egui::ProgressBar::new(fraction).text(text).animate(true));
                 } else if !s.finished {
@@ -1621,6 +1637,7 @@ impl InspectTab {
                 }
             };
             self.export_status = Some(status);
+            self.export_rate.reset();
         } else {
             let dest_folder = match super::file_dialog().pick_folder() {
                 Some(p) => p,
@@ -1651,6 +1668,7 @@ impl InspectTab {
                 total_bytes,
             });
             self.export_status = Some(status);
+            self.export_rate.reset();
         }
     }
 
@@ -3803,6 +3821,7 @@ impl InspectTab {
             total_bytes,
         }));
         self.cache_status = Some(Arc::clone(&status));
+        self.cache_rate.reset();
 
         let data_path = data_path.clone();
         std::thread::spawn(move || {
