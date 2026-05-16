@@ -2463,3 +2463,85 @@ fn test_rdb_multi_partition_shrink_auto_packs() {
         "P1 should report its NEW packed start LBA"
     );
 }
+
+/// End-to-end: invoke the universal `resize_filesystem_for` dispatcher
+/// against an in-memory blank AFFS floppy, then verify the volume
+/// reopens at its new geometry. Confirms AFFS is wired into the
+/// dispatch alongside FAT / NTFS / HFS / SFS / PFS3.
+#[test]
+fn test_resize_filesystem_for_affs_shrink_round_trip() {
+    use byteorder::{BigEndian, ByteOrder};
+    use rusty_backup::fs::{self, filesystem::Filesystem, resize_filesystem_for};
+
+    const BSIZE: usize = 512;
+
+    // Build a 1760-sector blank FFS floppy inline (same recipe as
+    // make_blank_ffs above, kept local so this test stands alone).
+    fn make_blank(name: &str) -> Vec<u8> {
+        let total = 1760usize;
+        let mut img = vec![0u8; total * BSIZE];
+        img[0..4].copy_from_slice(b"DOS\x01");
+        let root = 880usize;
+        let bm = 881usize;
+        let off = root * BSIZE;
+        BigEndian::write_u32(&mut img[off..off + 4], 2); // T_HEADER
+        BigEndian::write_u32(&mut img[off + 4..off + 8], 880);
+        BigEndian::write_u32(&mut img[off + 12..off + 16], 0x48);
+        BigEndian::write_u32(&mut img[off + 0x138..off + 0x13C], 0xFFFFFFFF);
+        BigEndian::write_u32(&mut img[off + 0x13C..off + 0x140], bm as u32);
+        let nb = name.as_bytes();
+        let n = nb.len().min(30);
+        img[off + 0x1B0] = n as u8;
+        img[off + 0x1B1..off + 0x1B1 + n].copy_from_slice(&nb[..n]);
+        BigEndian::write_u32(&mut img[off + 0x1FC..off + 0x200], 1);
+        let mut s: u32 = 0;
+        for w in 0..128 {
+            if w == 5 {
+                continue;
+            }
+            let v = BigEndian::read_u32(&img[off + w * 4..off + w * 4 + 4]);
+            s = s.wrapping_add(v);
+        }
+        BigEndian::write_u32(&mut img[off + 20..off + 24], 0u32.wrapping_sub(s));
+        let bm_off = bm * BSIZE;
+        for w in 1..56 {
+            BigEndian::write_u32(&mut img[bm_off + w * 4..bm_off + w * 4 + 4], 0xFFFF_FFFF);
+        }
+        for &block in &[root as u32, bm as u32] {
+            let block_in_bm = block - 2;
+            let word = 1 + (block_in_bm / 32) as usize;
+            let bit = block_in_bm % 32;
+            let mut v = BigEndian::read_u32(&img[bm_off + word * 4..bm_off + word * 4 + 4]);
+            v &= !(1u32 << bit);
+            BigEndian::write_u32(&mut img[bm_off + word * 4..bm_off + word * 4 + 4], v);
+        }
+        let mut bs: u32 = 0;
+        for w in 1..128 {
+            bs = bs.wrapping_add(BigEndian::read_u32(
+                &img[bm_off + w * 4..bm_off + w * 4 + 4],
+            ));
+        }
+        BigEndian::write_u32(&mut img[bm_off..bm_off + 4], 0u32.wrapping_sub(bs));
+        img
+    }
+
+    let img = make_blank("DispRT");
+    let mut cur = Cursor::new(img);
+    let mut log: Vec<String> = Vec::new();
+    let new_size = 800u64 * BSIZE as u64;
+    resize_filesystem_for(&mut cur, 0, new_size, &mut |s| log.push(s.to_string()))
+        .expect("dispatcher resize");
+    assert!(
+        log.iter().any(|l| l.contains("AFFS resize")),
+        "expected AFFS resize log, got {log:?}"
+    );
+
+    // Truncate to new size and verify reopen.
+    let mut bytes = cur.into_inner();
+    bytes.truncate(new_size as usize);
+    let mut cur2 = Cursor::new(bytes);
+    let fs = fs::affs::AffsFilesystem::open(&mut cur2, 0).expect("reopen");
+    assert_eq!(fs.total_blocks(), 800);
+    assert_eq!(fs.root_block_num(), 400);
+    assert_eq!(fs.volume_label(), Some("DispRT"));
+}

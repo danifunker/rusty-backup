@@ -18,6 +18,8 @@ use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use byteorder::{BigEndian, ByteOrder};
+
 use super::affs_common::*;
 use super::entry::FileEntry;
 use super::filesystem::{
@@ -1611,6 +1613,438 @@ impl<R: Read + Seek> Read for CompactAffsReader<R> {
     }
 }
 
+// === AFFS in-place resize ===================================================
+//
+// Unlike FAT / NTFS / HFS / PFS3 / SFS — all of which keep their primary
+// metadata block at a fixed offset and only need a field update on
+// resize — AFFS computes the root-block position as
+// `(2 + total_blocks - 1) / 2`. Resizing therefore requires physically
+// moving the root block (and its adjacent bitmap pages) to a new
+// position derived from the new total. Plus the bitmap itself has to
+// be rebuilt to reflect the new layout.
+//
+// Scope of this implementation:
+// - Volumes whose bitmap fits in `root.bm_pages[..]` (up to 25 pages =
+//   ~50 MB at 512-byte blocks). Volumes that use the `root.bm_ext`
+//   chain are refused with a clear error so we don't silently corrupt
+//   anything.
+// - Both shrink and grow paths, both with the same set of safety
+//   guards: every currently-allocated user-data block must still fit
+//   in the new volume AND must not collide with any of the new
+//   metadata positions.
+//
+// The function is a silent no-op on non-AFFS volumes, matching every
+// other `resize_*_in_place` in `resize_filesystem_for`.
+
+const AFFS_BITS_PER_BM_PAGE: u32 = 127 * 32; // 4064
+const AFFS_BM_PAGES_ROOT: u32 = 25;
+
+/// Resize an AFFS volume at `partition_offset` to `new_size_bytes`. See
+/// the module-level resize comment for the scope and safety contract.
+pub fn resize_affs_in_place(
+    device: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    new_size_bytes: u64,
+    log: &mut impl FnMut(&str),
+) -> anyhow::Result<()> {
+    // --- 1. Probe boot block for the DOS magic. ---
+    device.seek(SeekFrom::Start(partition_offset))?;
+    let mut boot = [0u8; 4];
+    if device.read_exact(&mut boot).is_err() {
+        return Ok(());
+    }
+    if &boot[0..3] != b"DOS" {
+        return Ok(());
+    }
+    if boot[3] > 7 {
+        log(&format!(
+            "AFFS resize: unknown DosType variant {}, skipping",
+            boot[3]
+        ));
+        return Ok(());
+    }
+
+    // --- 2. Locate the current root block. ---
+    //
+    // The on-disk layout doesn't store `total_blocks`; AFFS computes the
+    // root location from the partition extent at mount time. That means
+    // we can't trust the EOF-based formula here: by the time
+    // `resize_filesystem_for` runs, the partition may already be at the
+    // NEW size (e.g. on a fresh restore), so `(2 + EOF_total - 1) / 2`
+    // points at the wrong sector. Instead, try the EOF formula first
+    // (handles the common case where the medium hasn't been resized
+    // yet), then fall back to a bounded scan for an ST_ROOT block whose
+    // header-key matches its own position.
+    let upper_eof = device.seek(SeekFrom::End(0))?;
+    let upper_partition_size = upper_eof.saturating_sub(partition_offset);
+    if upper_partition_size < (4 * BSIZE) as u64 {
+        log("AFFS resize: partition too small, skipping");
+        return Ok(());
+    }
+    let upper_total = (upper_partition_size / BSIZE_U64) as u32;
+    let old_root = match find_affs_root_block(device, partition_offset, upper_total)? {
+        Some(blk) => blk,
+        None => {
+            log("AFFS resize: no ST_ROOT block found, skipping");
+            return Ok(());
+        }
+    };
+    let old_total = old_root
+        .checked_mul(2)
+        .and_then(|n| n.checked_sub(1))
+        .ok_or_else(|| anyhow::anyhow!("AFFS resize: old_root {} overflows", old_root))?;
+    // root = (2 + total - 1) / 2 = (total + 1) / 2 — integer floor division.
+    // So total ∈ {2*root - 1, 2*root}. Disambiguate by checking which fits
+    // in the medium and roundtrips back to the same root.
+    let candidate_a = 2 * old_root - 1;
+    let candidate_b = 2 * old_root;
+    let old_total = if (2 + candidate_b - 1) / 2 == old_root && candidate_b <= upper_total {
+        candidate_b
+    } else if (2 + candidate_a - 1) / 2 == old_root {
+        candidate_a
+    } else {
+        old_total // candidate_a from earlier computation
+    };
+
+    let new_total_u64 = new_size_bytes / BSIZE_U64;
+    if new_total_u64 < 4 {
+        anyhow::bail!(
+            "AFFS resize: target {} bytes ({} sectors) is below the minimum",
+            new_size_bytes,
+            new_total_u64,
+        );
+    }
+    if new_total_u64 > u32::MAX as u64 {
+        anyhow::bail!(
+            "AFFS resize: target {} bytes resolves to {} sectors, out of u32 range",
+            new_size_bytes,
+            new_total_u64,
+        );
+    }
+    let new_total = new_total_u64 as u32;
+    let new_root = (2 + new_total - 1) / 2;
+
+    if new_total == old_total {
+        log("AFFS resize: no size change, skipping");
+        return Ok(());
+    }
+
+    // --- 3. Read the old root block. ---
+    let mut old_root_buf = [0u8; BSIZE];
+    device.seek(SeekFrom::Start(
+        partition_offset + old_root as u64 * BSIZE_U64,
+    ))?;
+    device.read_exact(&mut old_root_buf)?;
+    let old_root_parsed = AffsRootBlock::parse(&old_root_buf, old_root)
+        .map_err(|e| anyhow::anyhow!("AFFS resize: root parse failed: {e}"))?;
+
+    // We don't support bm_ext chains here (see module comment).
+    if old_root_parsed.bm_ext != 0 {
+        anyhow::bail!(
+            "AFFS resize: volume uses a bitmap-extension chain (bm_ext = {}), \
+             which is not yet supported by the in-place resize.",
+            old_root_parsed.bm_ext,
+        );
+    }
+
+    let old_pages: Vec<u32> = old_root_parsed
+        .bm_pages
+        .iter()
+        .copied()
+        .take_while(|&p| p != 0)
+        .collect();
+    let new_pages_needed = affs_bm_pages_needed(new_total);
+    if new_pages_needed > AFFS_BM_PAGES_ROOT as usize {
+        anyhow::bail!(
+            "AFFS resize: target {} sectors needs {} bitmap pages, but only {} \
+             fit in the root block (bm_ext chain growth not yet implemented).",
+            new_total,
+            new_pages_needed,
+            AFFS_BM_PAGES_ROOT,
+        );
+    }
+    let new_pages: Vec<u32> = (0..new_pages_needed as u32)
+        .map(|i| new_root + 1 + i)
+        .collect();
+
+    // --- 4. Reconstruct the old logical bitmap (set bit = free). ---
+    let (bitmap, _) = read_bitmap(
+        device,
+        partition_offset,
+        BSIZE_U64,
+        &old_root_parsed,
+        old_total,
+    )
+    .map_err(|e| anyhow::anyhow!("AFFS resize: reading bitmap failed: {e}"))?;
+
+    // `bitmap` is `(old_total - 2 + 7) / 8` bytes, where bit i covers block
+    // (i + 2). Build a helper closure for is-allocated.
+    let bit_set = |bm: &[u8], blk: u32| -> bool {
+        if blk < 2 {
+            return true;
+        }
+        let bit = (blk - 2) as usize;
+        let byte = bit / 8;
+        let off = bit % 8;
+        if byte >= bm.len() {
+            return false;
+        }
+        (bm[byte] >> off) & 1 != 0
+    };
+    let is_allocated = |bm: &[u8], blk: u32| -> bool {
+        if blk < 2 {
+            return true;
+        }
+        // Old metadata (root + bm_pages) is also marked allocated. We
+        // treat those specially during the move check.
+        !bit_set(bm, blk)
+    };
+
+    // --- 5. Walk every old-bitmap entry, accumulate user-data blocks
+    //        (every allocated block that isn't old_root or an old bm_page),
+    //        check the safety contract. ---
+    let old_metadata: std::collections::HashSet<u32> = std::iter::once(old_root)
+        .chain(old_pages.iter().copied())
+        .collect();
+    let new_metadata: std::collections::HashSet<u32> = std::iter::once(new_root)
+        .chain(new_pages.iter().copied())
+        .collect();
+
+    let mut user_blocks: Vec<u32> = Vec::new();
+    for blk in 2..old_total {
+        if !is_allocated(&bitmap, blk) {
+            continue;
+        }
+        if old_metadata.contains(&blk) {
+            continue;
+        }
+        user_blocks.push(blk);
+    }
+
+    for &blk in &user_blocks {
+        if blk >= new_total {
+            anyhow::bail!(
+                "AFFS resize: allocated block {} lies past the target tail \
+                 ({} sectors). Shrink to at least {} sectors to keep this \
+                 data, or pick a larger target.",
+                blk,
+                new_total,
+                blk + 1,
+            );
+        }
+        if new_metadata.contains(&blk) {
+            anyhow::bail!(
+                "AFFS resize: allocated user block {} collides with the new \
+                 root/bitmap position. Move or delete the file occupying \
+                 that block, or pick a different target size.",
+                blk,
+            );
+        }
+    }
+
+    // --- 6. Build the new flat bitmap. Bits cover [2..new_total). Start
+    //        with everything free, then mark user blocks + new metadata as
+    //        allocated. ---
+    let new_bits = new_total.saturating_sub(2) as usize;
+    let new_bitmap_bytes = new_bits.div_ceil(8);
+    let mut new_bm = vec![0xFFu8; new_bitmap_bytes];
+    // Trim padding bits past `new_bits` so they don't leak into the
+    // written bitmap pages.
+    if new_bits % 8 != 0 {
+        let mask = (1u8 << (new_bits % 8)) - 1;
+        if let Some(last) = new_bm.last_mut() {
+            *last &= mask;
+        }
+    }
+    let clear_bit = |bm: &mut [u8], blk: u32| {
+        if blk < 2 {
+            return;
+        }
+        let bit = (blk - 2) as usize;
+        if bit / 8 >= bm.len() {
+            return;
+        }
+        bm[bit / 8] &= !(1u8 << (bit % 8));
+    };
+    for &blk in &user_blocks {
+        clear_bit(&mut new_bm, blk);
+    }
+    clear_bit(&mut new_bm, new_root);
+    for &p in &new_pages {
+        clear_bit(&mut new_bm, p);
+    }
+
+    // --- 7. Build the new root block buffer. Start from the old root,
+    //        update bm_pages[] + headerKey, rewrite checksum. ---
+    let mut new_root_buf = old_root_buf;
+    // headerKey at long 1 (offset 4..8).
+    BigEndian::write_u32(&mut new_root_buf[4..8], new_root);
+    // bm_pages[0..25] at 0x13C onward, zero-fill unused slots.
+    for i in 0..AFFS_BM_PAGES_ROOT as usize {
+        let off = 0x13C + i * 4;
+        let val = new_pages.get(i).copied().unwrap_or(0);
+        BigEndian::write_u32(&mut new_root_buf[off..off + 4], val);
+    }
+    // bm_ext stays zero (we refused bm_ext volumes earlier).
+    BigEndian::write_u32(&mut new_root_buf[0x1A0..0x1A4], 0);
+    // bm_flag at 0x138 stays -1 (valid).
+    BigEndian::write_i32(&mut new_root_buf[0x138..0x13C], -1);
+    // Re-stamp the normal checksum (word 5).
+    BigEndian::write_u32(&mut new_root_buf[0x14..0x18], 0);
+    let sum = normal_checksum(&new_root_buf, 5);
+    BigEndian::write_u32(&mut new_root_buf[0x14..0x18], sum);
+
+    // --- 8. Build each new bitmap-page buffer. ---
+    let mut new_bm_page_bufs: Vec<[u8; BSIZE]> = Vec::with_capacity(new_pages.len());
+    for page_idx in 0..new_pages.len() {
+        let mut buf = [0u8; BSIZE];
+        let bits_offset_in_page = page_idx as u32 * AFFS_BITS_PER_BM_PAGE;
+        for word_idx in 0..127u32 {
+            let mut word: u32 = 0;
+            for bit_in_word in 0..32u32 {
+                let global_bit = bits_offset_in_page + word_idx * 32 + bit_in_word;
+                let global_block = global_bit + 2;
+                if global_block >= new_total {
+                    break;
+                }
+                // Set bit if `clear_bit` did NOT clear it (i.e. block is free).
+                let byte = (global_bit / 8) as usize;
+                let off = (global_bit % 8) as u8;
+                let is_free = new_bm.get(byte).map_or(false, |b| (b >> off) & 1 == 1);
+                if is_free {
+                    word |= 1u32 << bit_in_word;
+                }
+            }
+            let o = (word_idx as usize + 1) * 4;
+            BigEndian::write_u32(&mut buf[o..o + 4], word);
+        }
+        // Bitmap checksum at offset 0.
+        let chk = bitmap_checksum(&buf);
+        BigEndian::write_u32(&mut buf[0..4], chk);
+        new_bm_page_bufs.push(buf);
+    }
+
+    // --- 9. Move data blocks that fall on old-metadata positions but not
+    //        on new-metadata positions out of the way. (No: that would
+    //        need actual data relocation. Instead, the safety contract
+    //        already requires user data NOT to live at new_metadata
+    //        positions. Old metadata blocks become free space.)
+    //
+    //        Plan: write new root + new bitmap pages at the new positions
+    //        first, then zero the old metadata block bodies for cleanliness.
+    //        Order matters for crash safety: write bitmap pages first, then
+    //        the root last (since the root is what the reader keys off).
+
+    for (page_idx, &page_blk) in new_pages.iter().enumerate() {
+        device.seek(SeekFrom::Start(
+            partition_offset + page_blk as u64 * BSIZE_U64,
+        ))?;
+        device.write_all(&new_bm_page_bufs[page_idx])?;
+    }
+    device.seek(SeekFrom::Start(
+        partition_offset + new_root as u64 * BSIZE_U64,
+    ))?;
+    device.write_all(&new_root_buf)?;
+
+    // --- 10. Zero the OLD metadata positions IF they fall inside the new
+    //         volume AND aren't reused as new metadata. ---
+    let mut zero_buf = [0u8; BSIZE];
+    let to_zero: Vec<u32> = old_metadata
+        .iter()
+        .copied()
+        .filter(|&blk| blk < new_total && !new_metadata.contains(&blk))
+        .collect();
+    for blk in to_zero {
+        // Re-zero to remove the stale root / bitmap so a stray scan
+        // doesn't trip over a misplaced ST_ROOT.
+        zero_buf.fill(0);
+        device.seek(SeekFrom::Start(partition_offset + blk as u64 * BSIZE_U64))?;
+        device.write_all(&zero_buf)?;
+    }
+
+    device.flush()?;
+
+    log(&format!(
+        "AFFS resize: {} -> {} sectors ({} -> {} bytes), root {} -> {}, \
+         {} bitmap page(s)",
+        old_total,
+        new_total,
+        old_total as u64 * BSIZE_U64,
+        new_total as u64 * BSIZE_U64,
+        old_root,
+        new_root,
+        new_pages.len(),
+    ));
+    Ok(())
+}
+
+/// Scan for an ST_ROOT block whose header-key matches its own block
+/// number. Tries `(2 + upper_total - 1) / 2` first (cheap path for
+/// volumes that haven't been resized yet), then walks the plausible
+/// range upward looking for the marker. Returns the block number, or
+/// `None` if no ST_ROOT was found in the volume.
+fn find_affs_root_block(
+    device: &mut (impl Read + Seek),
+    partition_offset: u64,
+    upper_total: u32,
+) -> anyhow::Result<Option<u32>> {
+    let probe_at = |device: &mut (dyn AffsRootProbe), blk: u32| -> std::io::Result<bool> {
+        let mut buf = [0u8; BSIZE];
+        device.read_block(partition_offset + blk as u64 * BSIZE_U64, &mut buf)?;
+        if read_i32(&buf, BSIZE - 4) != ST_ROOT {
+            return Ok(false);
+        }
+        if read_i32(&buf, 0) != T_HEADER {
+            return Ok(false);
+        }
+        if read_u32(&buf, 4) != blk {
+            return Ok(false);
+        }
+        Ok(true)
+    };
+
+    // Adapter: Read+Seek -> AffsRootProbe trait so we can reuse one helper.
+    struct Adapter<'a, D: Read + Seek + ?Sized>(&'a mut D);
+    impl<'a, D: Read + Seek + ?Sized> AffsRootProbe for Adapter<'a, D> {
+        fn read_block(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+            self.0.seek(SeekFrom::Start(offset))?;
+            self.0.read_exact(buf)
+        }
+    }
+    let mut adapter = Adapter(device);
+
+    // Cheap path: try the EOF-derived root first.
+    let cheap = (2 + upper_total.saturating_sub(1)) / 2;
+    if cheap >= 2 && cheap < upper_total && probe_at(&mut adapter, cheap)? {
+        return Ok(Some(cheap));
+    }
+    // Bounded scan. The root sits at `(2 + total - 1) / 2` for some
+    // `total <= upper_total`, so the search space is
+    // `[2, upper_total / 2 + 1]`. Walk it linearly.
+    let scan_end = upper_total / 2 + 1;
+    for blk in 2..=scan_end {
+        if probe_at(&mut adapter, blk)? {
+            return Ok(Some(blk));
+        }
+    }
+    Ok(None)
+}
+
+trait AffsRootProbe {
+    fn read_block(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<()>;
+}
+
+/// How many bitmap pages are needed to cover blocks `[2..total)`. Returns
+/// 1 for the trivial case where `total <= 2` (no data area). Each page
+/// covers 4064 bits.
+fn affs_bm_pages_needed(total: u32) -> usize {
+    let bits = total.saturating_sub(2) as u64;
+    if bits == 0 {
+        return 1;
+    }
+    ((bits + AFFS_BITS_PER_BM_PAGE as u64 - 1) / AFFS_BITS_PER_BM_PAGE as u64) as usize
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1937,5 +2371,167 @@ mod tests {
         assert_eq!(entry.name, "secret");
         assert_eq!(entry.access, 0x0000_00A5);
         assert_eq!(entry.comment, "a test filenote");
+    }
+
+    /// Shrink a blank FFS floppy from 1760 → 800 sectors. The new root
+    /// lands at (2 + 800 - 1) / 2 = 400, which is currently free. The
+    /// old root + bitmap blocks (880, 881) are inside the new tail and
+    /// become free space.
+    #[test]
+    fn resize_shrink_blank_floppy() {
+        let img = make_empty_floppy_image(1, "Shrink");
+        let mut cur = Cursor::new(img);
+        let mut log: Vec<String> = Vec::new();
+        let new_size = 800u64 * BSIZE_U64;
+        resize_affs_in_place(&mut cur, 0, new_size, &mut |s| log.push(s.to_string()))
+            .expect("shrink");
+        assert!(
+            log.iter().any(|l| l.contains("1760 -> 800")),
+            "log: {log:?}"
+        );
+
+        // The image bytes are still 1760 sectors long, but truncate to
+        // the new size and verify reopen sees the volume at its new
+        // total. The actual partition-table layer would truncate too.
+        let mut bytes = cur.into_inner();
+        bytes.truncate(new_size as usize);
+        let mut cur2 = Cursor::new(bytes);
+        let fs = AffsFilesystem::open(&mut cur2, 0).expect("reopen");
+        assert_eq!(fs.total_blocks(), 800);
+        assert_eq!(fs.root_block_num(), 400);
+        // The new bitmap page at 401 should claim blocks 400+401 as
+        // allocated, everything else free.
+        let alloc_count = fs.allocated_blocks();
+        // Boot blocks (2) + root + 1 bm page = 4.
+        assert_eq!(alloc_count, 4, "expected 4 alloc, got {alloc_count}");
+    }
+
+    /// Grow a blank FFS floppy from 1760 → 3520 sectors. New root lands
+    /// at (2 + 3520 - 1) / 2 = 1760, which is exactly past the old
+    /// tail — fully free space in the grown medium.
+    #[test]
+    fn resize_grow_blank_floppy() {
+        let mut img = make_empty_floppy_image(1, "Grow");
+        // Pad to the new size so we can write into it.
+        let new_size = 3520usize * BSIZE;
+        img.resize(new_size, 0);
+        let mut cur = Cursor::new(img);
+        let mut log: Vec<String> = Vec::new();
+        resize_affs_in_place(&mut cur, 0, new_size as u64, &mut |s| {
+            log.push(s.to_string())
+        })
+        .expect("grow");
+        assert!(
+            log.iter().any(|l| l.contains("1760 -> 3520")),
+            "log: {log:?}"
+        );
+        // Reopen and verify.
+        let mut cur = cur;
+        let fs = AffsFilesystem::open(&mut cur, 0).expect("reopen after grow");
+        assert_eq!(fs.total_blocks(), 3520);
+        assert_eq!(fs.root_block_num(), 1760);
+        let alloc = fs.allocated_blocks();
+        // boot(2) + new root + 1 bm page = 4. (The OLD root/bm at
+        // 880/881 were inside the volume but get marked free in the new
+        // bitmap.)
+        assert_eq!(alloc, 4, "expected 4 alloc, got {alloc}");
+    }
+
+    /// Refuse to shrink past a file's data block. The AFFS allocator
+    /// places data blocks at the lowest free sectors. By writing a
+    /// large file we push the data tail high enough to set up a
+    /// meaningful shrink-refusal target.
+    #[test]
+    fn resize_shrink_refuses_when_data_lost() {
+        use super::super::filesystem::CreateFileOptions;
+        let img = make_empty_floppy_image(1, "Reject");
+        let mut cur = Cursor::new(img);
+        let header_block: u32;
+        let last_data_block: u32;
+        {
+            let mut fs = AffsFilesystem::open(&mut cur, 0).expect("open");
+            let root = fs.root().expect("root");
+            // 100 KiB → 200 data blocks (FFS, 512-byte blocks). With
+            // alloc-from-low, those occupy sectors 2..~202 plus the
+            // file header.
+            let payload = vec![0xABu8; 100 * 1024];
+            let mut src = std::io::Cursor::new(payload.clone());
+            let fe = fs
+                .create_file(
+                    &root,
+                    "big",
+                    &mut src,
+                    payload.len() as u64,
+                    &CreateFileOptions::default(),
+                )
+                .expect("create");
+            fs.sync_metadata().expect("sync");
+            header_block = fe.location as u32;
+            let entry = fs.peek_entry_block(header_block).expect("peek");
+            last_data_block = *entry.data_blocks.last().expect("data blocks");
+        }
+        // Place the new tail BELOW the highest allocated block (but
+        // above the 4-sector minimum). The resize must refuse with a
+        // "past the target tail" error.
+        let highest = header_block.max(last_data_block);
+        assert!(
+            highest > 10,
+            "test setup expected high block, got {highest}"
+        );
+        let target_sectors = (highest - 1) as u64;
+        let mut log: Vec<String> = Vec::new();
+        let result = resize_affs_in_place(&mut cur, 0, target_sectors * BSIZE_U64, &mut |s| {
+            log.push(s.to_string())
+        });
+        assert!(result.is_err(), "expected refusal, log: {log:?}");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("past the target tail") || err.contains("collides"),
+            "unexpected error: {err}",
+        );
+    }
+
+    /// Non-AFFS volume is a silent no-op.
+    #[test]
+    fn resize_skips_non_affs_volume() {
+        let mut img = vec![0u8; 1760 * BSIZE];
+        img[0..4].copy_from_slice(b"NOTA");
+        let mut cur = Cursor::new(img);
+        let mut log: Vec<String> = Vec::new();
+        resize_affs_in_place(&mut cur, 0, 800 * BSIZE_U64, &mut |s| {
+            log.push(s.to_string())
+        })
+        .expect("noop");
+        assert!(log.is_empty(), "expected silent no-op, got: {log:?}");
+    }
+
+    /// Equal sizes log "no size change" and exit clean.
+    #[test]
+    fn resize_no_op_when_unchanged() {
+        let img = make_empty_floppy_image(1, "Same");
+        let mut cur = Cursor::new(img);
+        let mut log: Vec<String> = Vec::new();
+        resize_affs_in_place(&mut cur, 0, 1760 * BSIZE_U64, &mut |s| {
+            log.push(s.to_string())
+        })
+        .expect("noop");
+        assert!(
+            log.iter().any(|l| l.contains("no size change")),
+            "log: {log:?}"
+        );
+    }
+
+    /// bm_pages_needed correctly accounts for the bitmap page size.
+    #[test]
+    fn bm_pages_needed_math() {
+        // Empty volume.
+        assert_eq!(affs_bm_pages_needed(0), 1);
+        assert_eq!(affs_bm_pages_needed(2), 1);
+        // 4064 + 2 = 4066 = exactly one page.
+        assert_eq!(affs_bm_pages_needed(4066), 1);
+        // One bit over: 4067 needs two pages.
+        assert_eq!(affs_bm_pages_needed(4067), 2);
+        // 50 pages worth.
+        assert_eq!(affs_bm_pages_needed(2 + 50 * 4064), 50, "50 pages",);
     }
 }

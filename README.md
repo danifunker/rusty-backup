@@ -91,7 +91,7 @@ restore or VHD export.
 | HFS+ (Mac OS Extended) | Yes* | No*                    | No                           | Actively working on HFS+, shrink doesn't seem to work, unsure about expand. Browsing works |
 | btrfs          | Yes    | No                        | No                           | Modern Linux; read-only browse |
 | ProDOS         | Yes    | Yes                        | No (planned)                  | Apple II / IIgs |
-| AFFS (OFS / FFS)  | Yes | No (layout-preserving)     | No                            | Amiga `DOS\0`..`DOS\7`. Read + edit (add file / new folder / delete); Disk Validator fsck included |
+| AFFS (OFS / FFS)  | Yes | Yes (in-place trim/grow, bm_pages only) | Yes (in-place trim/grow, bm_pages only) | Amiga `DOS\0`..`DOS\7`. Read + edit + in-place resize (root + bitmap pages physically relocated; refuses on bm_ext-chain volumes or when allocated data would be clobbered). Disk Validator fsck included |
 | PFS3 / PDS3 / muFS | Yes | Yes (in-place trim/grow)  | Yes (in-place trim/grow)      | Amiga PFS3 family. Read + edit + in-place resize (shrink refuses to truncate live data; grow stays within existing bitmap capacity) |
 | SFS (Smart File System) | Yes | Yes (in-place trim/grow) | Yes (in-place trim/grow)    | Amiga `SFS\0` / `SFS\2`. Read + edit + in-place resize. Editing limited to single-leaf btree |
 
