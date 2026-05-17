@@ -2648,9 +2648,9 @@ checksum = "7a79a3332a6609480d7d0c9eab957bca6b455b91bb84e66d19f5ff66294b85b8"
 
 [[package]]
 name = "libbz2-rs-sys"
-version = "0.2.4"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8fc329e1457d97a9d58a4e2ca49e3be572431a7e096008efc2e3a3c19d428f4"
+checksum = "34b357333733e8260735ba5894eb928c02ecc69c78715f01a8019e7fa7f2db4c"
 
 [[package]]
 name = "libc"
@@ -3386,8 +3386,8 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "opticaldiscs"
-version = "0.3.0"
-source = "git+https://github.com/danifunker/opticaldiscs-rs#b6bffeef4e651ab3202a5bd4024c246fa0d50ff6"
+version = "0.3.1"
+source = "git+https://github.com/danifunker/opticaldiscs-rs#0edeb0d4aae07f3bce1362bddd0eca77581529da"
 dependencies = [
  "chd",
  "cue_sheet",

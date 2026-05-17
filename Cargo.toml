@@ -8,6 +8,7 @@ description = "Cross-platform GUI for backing up and restoring vintage computer 
 homepage = "https://github.com/dani/rusty-backup"
 repository = "https://github.com/dani/rusty-backup"
 resolver = "2"
+default-run = "rusty-backup"
 
 # Main GUI binary
 [[bin]]
