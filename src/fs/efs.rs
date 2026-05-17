@@ -420,9 +420,14 @@ impl<R: Read + Seek> EfsFilesystem<R> {
     }
 
     /// Read the bitmap via the read-only path. Used by fsck.
-    /// Distinct name from the mutating `read_bitmap` so the type
-    /// system doesn't accidentally pull in the editable bound.
+    /// Prefers `staged_bitmap` when present — this is what lets
+    /// "fsck before sync" produce the correct verdict on the
+    /// prospective state during grow/shrink, because the bytes on
+    /// disk at `sb.bmblock` may not yet match the pending edits.
     pub(crate) fn read_bitmap_readonly(&mut self) -> Result<Vec<u8>, FilesystemError> {
+        if let Some(bm) = &self.staged_bitmap {
+            return Ok(bm.clone());
+        }
         let bmsize = self.sb.bmsize as usize;
         if bmsize == 0 {
             return Err(FilesystemError::InvalidData("EFS bitmap size is 0".into()));
@@ -574,6 +579,11 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
     /// caller-supplied buffer must be `sb.bmsize` bytes long; the I/O
     /// rounds up to whole sectors and zero-pads the trailing bytes of
     /// the final sector if the bitmap isn't sector-aligned.
+    ///
+    /// Also updates `staged_bitmap` so the in-memory copy stays in
+    /// sync with disk — important because `read_bitmap_readonly`
+    /// (used by fsck) prefers the staged copy when present, and we
+    /// don't want a `write_bitmap` to disk to bypass a stale stage.
     pub(crate) fn write_bitmap(&mut self, bm: &[u8]) -> Result<(), FilesystemError> {
         let bmsize = self.sb.bmsize as usize;
         if bm.len() != bmsize {
@@ -588,6 +598,10 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
         let off = self.partition_offset + self.effective_bmblock() as u64 * EFS_BLOCKSIZE;
         self.reader.seek(SeekFrom::Start(off))?;
         self.reader.write_all(&padded)?;
+        // Mirror into the staged buffer if one is loaded.
+        if self.staged_bitmap.is_some() {
+            self.staged_bitmap = Some(bm.to_vec());
+        }
         Ok(())
     }
 

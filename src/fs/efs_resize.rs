@@ -113,21 +113,49 @@ pub fn grow_efs<R: Read + Write + Seek>(
         delta as u64 / 2
     ));
 
-    // Bitmap capacity check: every block in the volume must be
-    // addressable from the bitmap. If the existing bitmap has spare
-    // bits, we can grow within that. Otherwise refuse — bitmap
-    // relocation is future work (see doc Phase 3a step 3).
-    let bitmap_bits = sb.bmsize as u64 * 8;
-    if (new_size_blocks as u64) > bitmap_bits {
-        return Err(FilesystemError::Unsupported(format!(
-            "EFS grow: new size {} blocks exceeds bitmap capacity ({} bits); \
-             bitmap relocation is not implemented in this slice. \
-             Try a smaller increase (max {} additional blocks).",
-            new_size_blocks,
-            bitmap_bits,
-            bitmap_bits.saturating_sub(old_size as u64)
-        )));
+    // Safety pre-check + reservation for Phase 3b. When new CGs are
+    // appended, each one's inode-region [cg_start..cg_start+cgisize)
+    // must currently be free in the bitmap — otherwise zeroing those
+    // sectors below would destroy live file data. We reserve them
+    // (mark in-use) BEFORE bitmap relocation so the relocate's
+    // contiguous-free-run search avoids them.
+    let added_cgs_preview = delta / sb.cgfsize;
+    if added_cgs_preview > 0 {
+        let bm = fs.staged_bitmap_mut()?;
+        for new_cg_index in 0..added_cgs_preview {
+            let cg = sb.ncg as u32 + new_cg_index;
+            let cg_start = sb.firstcg + cg * sb.cgfsize;
+            for blk in cg_start..cg_start + sb.cgisize as u32 {
+                let by = (blk / 8) as usize;
+                if by >= bm.len() {
+                    // Past the current bitmap's coverage — relocation
+                    // will grow the buffer; reservation deferred.
+                    break;
+                }
+                let bb = 7 - (blk % 8);
+                if bm[by] & (1u8 << bb) != 0 {
+                    return Err(FilesystemError::InvalidData(format!(
+                        "EFS grow: cannot append new CG at block {cg_start}: \
+                         inode-region block {blk} is already in use by a file. \
+                         A future slice could relocate the conflicting data block; \
+                         for now, fsck the volume and retry with a smaller increase."
+                    )));
+                }
+                bm[by] |= 1u8 << bb; // reserve
+            }
+        }
     }
+
+    // Bitmap capacity check + optional relocation. If the existing
+    // bitmap has enough bits for the new volume size, leave it where
+    // it is. Otherwise find a free contiguous run in the current
+    // volume (now with new CG inode regions reserved) and relocate.
+    let bitmap_bits = sb.bmsize as u64 * 8;
+    let sb = if (new_size_blocks as u64) <= bitmap_bits {
+        sb
+    } else {
+        relocate_bitmap(&mut fs, &sb, new_size_blocks, log)?
+    };
 
     // Mark the new tail blocks as free in the bitmap. Per the doc,
     // any stale bits left over from prior shrink rounds get cleared.
@@ -157,17 +185,20 @@ pub fn grow_efs<R: Read + Write + Seek>(
         // slot = free) and mark inode-region bits as in-use in the
         // bitmap. Data-region bits stay clear (already cleared by the
         // tail loop above).
+        // Inode-region bits were already marked in-use by the
+        // pre-check / reservation step above. Here we just zero the
+        // inode-table sectors on disk so every new slot reads as
+        // mode==0 (free).
         for new_cg_index in 0..added_cgs {
             let cg = sb.ncg as u32 + new_cg_index;
             let cg_start = sb.firstcg + cg * sb.cgfsize;
-            // Zero `cgisize` blocks starting at `cg_start`.
             let zero_sector = [0u8; EFS_BLOCKSIZE_USIZE];
             for i in 0..sb.cgisize as u32 {
                 fs.write_block(cg_start + i, &zero_sector)?;
             }
-            // Mark inode-region bits as in-use so the data-block
-            // allocator avoids them. The verifier doesn't require
-            // this direction, but the allocator does.
+            // Reservation may have been deferred for blocks past the
+            // pre-relocation bitmap end. Catch up here now that the
+            // bitmap may have been expanded.
             let bm = fs.staged_bitmap_mut()?;
             for blk in cg_start..cg_start + sb.cgisize as u32 {
                 let by = (blk / 8) as usize;
@@ -211,11 +242,15 @@ pub fn grow_efs<R: Read + Write + Seek>(
     // `fs` goes out of scope.
     let result = super::efs_fsck::fsck_efs(&mut fs)?;
     if !result.errors.is_empty() {
-        let codes: Vec<String> = result.errors.iter().map(|e| e.code.clone()).collect();
+        let msgs: Vec<String> = result
+            .errors
+            .iter()
+            .map(|e| format!("{}: {}", e.code, e.message))
+            .collect();
         return Err(FilesystemError::InvalidData(format!(
-            "EFS grow: post-grow fsck reported {} error(s): [{}]",
+            "EFS grow: post-grow fsck reported {} error(s): {}",
             result.errors.len(),
-            codes.join(", ")
+            msgs.join("; ")
         )));
     }
     log(&format!(
@@ -226,6 +261,74 @@ pub fn grow_efs<R: Read + Write + Seek>(
     fs.do_sync_metadata()?;
     log("EFS grow: committed new superblock pair");
     Ok(new_size_blocks)
+}
+
+/// Find a free contiguous run inside the current volume large enough
+/// to hold the new bitmap, copy the existing bitmap forward into the
+/// staged buffer (which gets resized), mark the old bitmap blocks as
+/// free, mark the new bitmap blocks as in-use, and update sb.bmblock
+/// + sb.bmsize. Returns the updated superblock; the caller installs
+/// it via `fs.set_sb` once the rest of the grow finishes.
+///
+/// The write to the new location happens at sync_metadata time —
+/// `do_sync_metadata` calls `write_bitmap` which uses the current
+/// `sb.bmblock`. Since we update `sb.bmblock` here before sync runs,
+/// the bitmap bytes land at the new location naturally.
+fn relocate_bitmap<R: Read + Write + Seek>(
+    fs: &mut EfsFilesystem<R>,
+    sb: &super::efs::EfsSuperblock,
+    new_size_blocks: u32,
+    log: &mut impl FnMut(&str),
+) -> Result<super::efs::EfsSuperblock, FilesystemError> {
+    let new_bmsize_bytes = (new_size_blocks as u64).div_ceil(8) as u32;
+    let new_bmsize_sectors = (new_bmsize_bytes as u64).div_ceil(EFS_BLOCKSIZE) as u32;
+    let old_bmblock = fs.effective_bmblock();
+    let old_bmsize_sectors = (sb.bmsize as u64).div_ceil(EFS_BLOCKSIZE) as u32;
+
+    log(&format!(
+        "EFS grow: relocating bitmap (need {new_bmsize_bytes} bytes, \
+         {new_bmsize_sectors} sectors); old loc=block {old_bmblock}, size={} sectors",
+        old_bmsize_sectors
+    ));
+
+    let bm = fs.staged_bitmap_mut()?;
+
+    // The bitmap's own blocks are already marked in-use, so the
+    // allocator naturally skips them. Find a contiguous run.
+    let new_ext = EfsFilesystem::<R>::alloc_contiguous_in_bitmap(bm, new_bmsize_sectors, 0)
+        .map_err(|e| match e {
+            FilesystemError::DiskFull(_) => FilesystemError::Unsupported(format!(
+                "EFS grow: bitmap relocation needs {new_bmsize_sectors} contiguous free \
+             sectors in the current volume; none found. The volume may be too fragmented; \
+             consider shrinking first or running fsck repair."
+            )),
+            other => other,
+        })?;
+    let new_bmblock = new_ext.bn;
+    log(&format!(
+        "EFS grow: new bitmap at block {new_bmblock} ({} sectors)",
+        new_bmsize_sectors
+    ));
+
+    // Free old bitmap blocks.
+    for blk in old_bmblock..old_bmblock + old_bmsize_sectors {
+        let by = (blk / 8) as usize;
+        if by >= bm.len() {
+            break;
+        }
+        let bb = 7 - (blk % 8);
+        bm[by] &= !(1u8 << bb);
+    }
+
+    // Expand the in-memory buffer to the new bitmap size. New bytes
+    // default to 0 (all blocks free); the grow path's tail loop and
+    // CG-append step will set the appropriate bits before sync.
+    bm.resize(new_bmsize_bytes as usize, 0);
+
+    let mut new_sb = sb.clone();
+    new_sb.bmblock = new_bmblock;
+    new_sb.bmsize = new_bmsize_bytes;
+    Ok(new_sb)
 }
 
 /// Shrink an EFS volume in-place to `new_size_blocks` (conservative:
@@ -515,15 +618,41 @@ mod tests {
     }
 
     #[test]
-    fn grow_rejects_when_beyond_bitmap_capacity() {
-        // Volume 512, bitmap 768 bits. Try 1000 → must refuse.
+    fn grow_relocates_bitmap_when_beyond_capacity() {
+        // Volume 512, bitmap 768 bits. Grow to 1000 → exceeds
+        // bitmap capacity AND adds 7 new CGs. The relocate path
+        // moves the bitmap to a fresh location with enough bits.
         let img = build_test_volume();
         let cur = Cursor::new(img);
-        let err = grow_efs(cur, 0, 1000, &mut |_| {}).expect_err("too big");
+        let mut log_lines: Vec<String> = Vec::new();
+        let new_size = grow_efs(cur, 0, 1000, &mut |s| log_lines.push(s.into()))
+            .expect("grow with bitmap relocation");
+        assert_eq!(new_size, 1000);
         assert!(
-            matches!(err, FilesystemError::Unsupported(_)),
-            "got {err:?}"
+            log_lines.iter().any(|l| l.contains("relocating bitmap")),
+            "missing relocate log line in: {log_lines:?}"
         );
+        assert!(log_lines.iter().any(|l| l.contains("committed")));
+    }
+
+    #[test]
+    fn grow_relocate_then_reopen_round_trip() {
+        // Same as above, but reopen and verify the new bitmap is
+        // readable at sb.bmblock and addresses the full new volume.
+        let img = build_test_volume();
+        let mut buf = img;
+        grow_efs(Cursor::new(&mut buf), 0, 1000, &mut |_| {}).expect("grow + relocate");
+        let mut fs = EfsFilesystem::open(Cursor::new(buf), 0).expect("reopen");
+        let sb = fs.sb_clone();
+        assert_eq!(sb.fs_size, 1000);
+        assert!(
+            (sb.bmsize as u64) * 8 >= sb.fs_size as u64,
+            "new bitmap ({} bits) does not cover new fs_size {}",
+            sb.bmsize as u64 * 8,
+            sb.fs_size
+        );
+        let bm = fs.read_bitmap_readonly().expect("read new bitmap");
+        assert_eq!(bm.len(), sb.bmsize as usize);
     }
 
     #[test]
