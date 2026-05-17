@@ -472,6 +472,42 @@ impl InspectTab {
                 self.init_editor();
             }
 
+            // Add Partition button (Phase 5 of disk_expansion.md) — opens
+            // the partition editor with the new-entry inputs pre-filled
+            // for the trailing free space, so the user doesn't have to
+            // hand-compute the start LBA + size. Only meaningful when
+            // there's >= 1 MiB of trailing free space.
+            let trailing_free = self
+                .actual_disk_size_bytes()
+                .map(|disk| {
+                    let used = self
+                        .partitions
+                        .iter()
+                        .filter(|p| !p.is_extended_container)
+                        .map(|p| p.start_lba.saturating_mul(512).saturating_add(p.size_bytes))
+                        .max()
+                        .unwrap_or(0);
+                    disk.saturating_sub(used)
+                })
+                .unwrap_or(0);
+            if ui
+                .add_enabled(
+                    is_editable_source && !export_running && trailing_free >= 1024 * 1024,
+                    egui::Button::new("Add Partition..."),
+                )
+                .on_hover_text(if trailing_free >= 1024 * 1024 {
+                    format!(
+                        "Add a new partition into the {} of trailing free space",
+                        partition::format_size(trailing_free),
+                    )
+                } else {
+                    "No trailing free space available".to_string()
+                })
+                .clicked()
+            {
+                self.init_add_partition(trailing_free);
+            }
+
             // Resize Partitions button — same conditions as Edit Partition Table
             let resize_running = self.resize_popup.as_ref().is_some_and(|p| p.is_running());
             if ui
@@ -709,6 +745,43 @@ impl InspectTab {
 
     fn init_editor(&mut self) {
         self.editor.seed_from(&self.partitions);
+        self.editor_popup = true;
+    }
+
+    /// Open the partition-table editor pre-filled to add one new partition
+    /// into the trailing free space. The user reviews/changes the size +
+    /// type, then clicks Validate + Apply through the existing editor flow.
+    ///
+    /// Defaults:
+    ///   - Start LBA: first sector past the existing partitions
+    ///   - Size: all trailing free space, in MiB (rounded down)
+    ///   - Type: platform-appropriate (XFS for SGI, 0x83 for MBR Linux,
+    ///     Linux Filesystem GUID for GPT, Apple_HFS for APM)
+    fn init_add_partition(&mut self, trailing_free_bytes: u64) {
+        self.editor.seed_from(&self.partitions);
+
+        let first_free_lba = self
+            .partitions
+            .iter()
+            .filter(|p| !p.is_extended_container)
+            .map(|p| p.start_lba + (p.size_bytes / 512))
+            .max()
+            .unwrap_or(0);
+        let size_mib = (trailing_free_bytes / (1024 * 1024)).max(1);
+
+        // Pick a sensible default partition type per table layout.
+        let default_type: &str = match self.partition_table.as_ref() {
+            Some(PartitionTable::Sgi(_)) => "XFS",
+            Some(PartitionTable::Apm(_)) => "Apple_HFS",
+            Some(PartitionTable::Gpt { .. }) => "0FC63DAF-8483-4772-8E79-3D69D8477DE4",
+            Some(PartitionTable::Mbr(_)) => "83",
+            _ => "83",
+        };
+
+        self.editor.add_start_lba = first_free_lba.to_string();
+        self.editor.add_size_mb = format!("{}", size_mib);
+        self.editor.add_type = default_type.to_string();
+        self.editor.add_bootable = false;
         self.editor_popup = true;
     }
 
@@ -2659,14 +2732,51 @@ impl InspectTab {
         if self.partitions.is_empty() {
             return;
         }
+        let actual_disk_size = self.actual_disk_size_bytes();
         egui::CollapsingHeader::new("Disk layout")
             .default_open(true)
             .show(ui, |ui| {
-                let segments =
-                    build_disk_layout_segments(&self.partitions, &self.partition_volume_labels);
+                let segments = build_disk_layout_segments(
+                    &self.partitions,
+                    &self.partition_volume_labels,
+                    actual_disk_size,
+                );
                 super::partition_bar::PartitionBar::new(segments).show(ui);
             });
         ui.add_space(4.0);
+    }
+
+    /// Best-effort estimate of the total disk size (bytes), used to draw the
+    /// trailing-free-space segment on the disk-layout bar. Sources:
+    ///
+    /// * Backup metadata — `source_size_bytes` is the authoritative recorded
+    ///   disk size, including any trailing free space the source had.
+    /// * Clonezilla image — same idea via `source_size_bytes`.
+    /// * Live device — physical disk size.
+    /// * Raw image file — filesystem-reported file length.
+    ///
+    /// Returns `None` when no source applies (e.g. before inspection has
+    /// finished); callers should suppress the trailing-free segment then.
+    fn actual_disk_size_bytes(&self) -> Option<u64> {
+        if let Some(meta) = &self.backup_metadata {
+            if meta.source_size_bytes > 0 {
+                return Some(meta.source_size_bytes);
+            }
+        }
+        if let Some(cz) = &self.clonezilla_image {
+            if cz.source_size_bytes > 0 {
+                return Some(cz.source_size_bytes);
+            }
+        }
+        if let Some(path) = &self.image_file_path {
+            if let Ok(meta) = std::fs::metadata(path) {
+                let len = meta.len();
+                if len > 0 {
+                    return Some(len);
+                }
+            }
+        }
+        None
     }
 
     fn show_partition_list(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
@@ -4255,14 +4365,23 @@ fn format_bytes_grouped(bytes: u64) -> String {
 fn build_disk_layout_segments(
     partitions: &[PartitionInfo],
     volume_labels: &HashMap<usize, String>,
+    actual_disk_size: Option<u64>,
 ) -> Vec<super::partition_bar::Segment> {
     use super::partition_bar::{Segment, SegmentKind};
 
     let mut color_index: usize = 0;
     let mut segments = Vec::with_capacity(partitions.len());
+    let mut max_end_bytes: u64 = 0;
     for part in partitions {
         if part.is_extended_container {
             continue;
+        }
+        let part_end = part
+            .start_lba
+            .saturating_mul(512)
+            .saturating_add(part.size_bytes);
+        if part_end > max_end_bytes {
+            max_end_bytes = part_end;
         }
         let label = volume_labels
             .get(&part.index)
@@ -4289,6 +4408,27 @@ fn build_disk_layout_segments(
             kind,
         });
     }
+
+    // Trailing free space at the end of the disk — only surfaced when we
+    // know the real disk size (from backup metadata, the loaded file, or a
+    // live device). Threshold of 1 MiB avoids cluttering the bar with the
+    // rounding-noise gaps that show up on real disks (e.g. GPT secondary
+    // header reserves 33 sectors; partition alignment may leave 1-2 MiB
+    // unused — those are not user-actionable "free space").
+    if let Some(disk_size) = actual_disk_size {
+        if disk_size > max_end_bytes {
+            let free = disk_size - max_end_bytes;
+            if free >= 1024 * 1024 {
+                segments.push(Segment {
+                    label: String::new(),
+                    fs: String::new(),
+                    size_bytes: free,
+                    kind: SegmentKind::Free,
+                });
+            }
+        }
+    }
+
     segments
 }
 
