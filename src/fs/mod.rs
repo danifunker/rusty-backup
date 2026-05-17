@@ -224,7 +224,7 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
 /// type-name column use this to replace the generic "Linux" label with the
 /// actual filesystem family.
 ///
-/// Returns one of: `"FAT"`, `"ext"`, `"btrfs"`, `"xfs"`, or `None` when the
+/// Returns one of: `"FAT"`, `"ext"`, `"btrfs"`, `"XFS"`, or `None` when the
 /// content isn't a filesystem this function recognizes.
 pub fn probe_0x83_fs_type<R: Read + Seek>(
     reader: &mut R,
@@ -234,7 +234,7 @@ pub fn probe_0x83_fs_type<R: Read + Seek>(
         "fat" => Some("FAT"),
         "ext" => Some("ext"),
         "btrfs" => Some("btrfs"),
-        "xfs" => Some("xfs"),
+        "xfs" => Some("XFS"),
         _ => None,
     }
 }
@@ -669,10 +669,13 @@ fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &'sta
     }
     match partition_type {
         0xAF => "HFS/HFS+",
-        0x83 => "ext/btrfs",
+        0x83 => "ext/btrfs/xfs",
         0xA8 => "ProDOS",
         0x07 => "NTFS/exFAT",
         0x01 | 0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C => "FAT",
+        // SGI synthetic type bytes (PartitionTable::Sgi).
+        0xA0 => "XFS",
+        0xA1 => "SGI EFS",
         _ => "unknown",
     }
 }

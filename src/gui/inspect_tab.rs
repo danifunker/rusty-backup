@@ -2198,7 +2198,16 @@ impl InspectTab {
                     // 0x83, also tag "(MSX)" since standard PC tooling never
                     // writes FAT under 0x83 — it's specific to MSX HDD layouts.
                     for part in &mut partitions {
-                        if part.partition_type_byte != 0x83 || part.is_extended_container {
+                        if part.is_extended_container {
+                            continue;
+                        }
+                        // MBR 0x83 (Linux native) or GPT "Linux Filesystem"
+                        // GUID — both can hold ext, btrfs, or XFS. Probe the
+                        // VBR to label the inspect grid with the real family.
+                        let is_linux_mbr = part.partition_type_byte == 0x83;
+                        let is_linux_gpt = part.partition_type_string.as_deref()
+                            == Some("0FC63DAF-8483-4772-8E79-3D69D8477DE4");
+                        if !is_linux_mbr && !is_linux_gpt {
                             continue;
                         }
                         if let Some(mut br) = make_probe_reader() {
@@ -2206,7 +2215,7 @@ impl InspectTab {
                                 &mut br,
                                 part.start_lba * 512,
                             ) {
-                                Some("FAT") => {
+                                Some("FAT") if is_linux_mbr => {
                                     let part_offset = part.start_lba * 512;
                                     let subtype = make_probe_reader().and_then(|br2| {
                                         rusty_backup::fs::fat::FatFilesystem::open(br2, part_offset)

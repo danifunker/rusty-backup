@@ -302,7 +302,16 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
     // show the actual FS family rather than the generic "Linux" label. For
     // FAT VBRs we additionally open the BPB to tag the FAT subtype + "(MSX)".
     for part in &mut partitions {
-        if part.partition_type_byte != 0x83 || part.is_extended_container {
+        if part.is_extended_container {
+            continue;
+        }
+        // MBR 0x83 (Linux native) or GPT "Linux Filesystem" GUID — both can
+        // hold ext, btrfs, or XFS. Probe the VBR so the backup metadata
+        // reflects the real family rather than the generic GPT label.
+        let is_linux_mbr = part.partition_type_byte == 0x83;
+        let is_linux_gpt =
+            part.partition_type_string.as_deref() == Some("0FC63DAF-8483-4772-8E79-3D69D8477DE4");
+        if !is_linux_mbr && !is_linux_gpt {
             continue;
         }
         let Ok(clone) = source.get_ref().try_clone() else {
@@ -311,7 +320,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
         let mut br = std::io::BufReader::new(clone);
         let part_offset = part.start_lba * 512;
         match fs::probe_0x83_fs_type(&mut br, part_offset) {
-            Some("FAT") => {
+            Some("FAT") if is_linux_mbr => {
                 let subtype = source.get_ref().try_clone().ok().and_then(|c| {
                     fs::fat::FatFilesystem::open(std::io::BufReader::new(c), part_offset)
                         .ok()
