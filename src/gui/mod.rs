@@ -7,6 +7,7 @@ mod elevation_dialog;
 mod expand_hfs_dialog;
 mod inspect_tab;
 mod optical_tab;
+mod partition_bar;
 mod physical_disk_export;
 mod progress;
 mod resize_popup;

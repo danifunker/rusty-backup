@@ -2642,7 +2642,22 @@ impl InspectTab {
         }
 
         ui.add_space(8.0);
+        self.show_disk_layout_section(ui);
         self.show_partition_list(ui, ctx);
+    }
+
+    fn show_disk_layout_section(&self, ui: &mut egui::Ui) {
+        if self.partitions.is_empty() {
+            return;
+        }
+        egui::CollapsingHeader::new("Disk layout")
+            .default_open(true)
+            .show(ui, |ui| {
+                let segments =
+                    build_disk_layout_segments(&self.partitions, &self.partition_volume_labels);
+                super::partition_bar::PartitionBar::new(segments).show(ui);
+            });
+        ui.add_space(4.0);
     }
 
     fn show_partition_list(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
@@ -4218,6 +4233,54 @@ fn format_bytes_grouped(bytes: u64) -> String {
         result.push(ch);
     }
     result.chars().rev().collect()
+}
+
+/// Build the `Vec<Segment>` driving the inspect tab's disk-layout bar from the
+/// current partition list and any volume labels that have been probed.
+///
+/// Partitions are listed in their existing order (which already reflects the
+/// partition table). Extended-container entries are skipped. APM
+/// `Apple_partition_map` and SGI volume-header entries render dimmed. Color
+/// indices are assigned sequentially across the real (non-dimmed) partitions
+/// so the palette cycles predictably.
+fn build_disk_layout_segments(
+    partitions: &[PartitionInfo],
+    volume_labels: &HashMap<usize, String>,
+) -> Vec<super::partition_bar::Segment> {
+    use super::partition_bar::{Segment, SegmentKind};
+
+    let mut color_index: usize = 0;
+    let mut segments = Vec::with_capacity(partitions.len());
+    for part in partitions {
+        if part.is_extended_container {
+            continue;
+        }
+        let label = volume_labels
+            .get(&part.index)
+            .cloned()
+            .or_else(|| part.drv_name.clone())
+            .unwrap_or_else(|| format!("Partition {}", part.index + 1));
+        let fs = part.type_name.clone();
+
+        let is_dimmed = matches!(
+            part.partition_type_string.as_deref(),
+            Some("Apple_partition_map") | Some("SGI_volhdr") | Some("SGI_volume"),
+        );
+        let kind = if is_dimmed {
+            SegmentKind::Dimmed
+        } else {
+            let k = SegmentKind::Partition { color_index };
+            color_index += 1;
+            k
+        };
+        segments.push(Segment {
+            label,
+            fs,
+            size_bytes: part.size_bytes,
+            kind,
+        });
+    }
+    segments
 }
 
 #[cfg(test)]

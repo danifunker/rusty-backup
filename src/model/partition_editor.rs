@@ -164,21 +164,33 @@ impl PartitionEditor {
             }
 
             if let Some(orig) = orig {
-                let new_size_mib: f64 = entry.size_text.trim().parse().unwrap_or(-1.0);
-                if new_size_mib > 0.0 {
-                    let new_size_bytes = (new_size_mib * 1024.0 * 1024.0) as u64;
-                    let new_size_bytes = (new_size_bytes / 512) * 512;
-                    if new_size_bytes != orig.size_bytes {
-                        self.edits.push(PartitionTableEdit::ResizeEntry {
-                            index: entry.index,
-                            new_size_bytes,
-                        });
+                // Skip the size diff entirely when the displayed text still
+                // matches the original. `size_text` is initialized as
+                // `"{:.2}"` MiB, which throws away precision on partitions
+                // whose byte count isn't a clean MiB multiple (notably RDB /
+                // Amiga geometries). Round-tripping that string back to
+                // bytes shifts the partition's end by up to ~5 KiB, which is
+                // enough to push a tail partition past the disk and emit a
+                // spurious "extends beyond disk" validation error when the
+                // user hasn't actually touched anything.
+                let orig_size_text = format!("{:.2}", orig.size_bytes as f64 / (1024.0 * 1024.0));
+                if entry.size_text.trim() != orig_size_text {
+                    let new_size_mib: f64 = entry.size_text.trim().parse().unwrap_or(-1.0);
+                    if new_size_mib > 0.0 {
+                        let new_size_bytes = (new_size_mib * 1024.0 * 1024.0) as u64;
+                        let new_size_bytes = (new_size_bytes / 512) * 512;
+                        if new_size_bytes != orig.size_bytes {
+                            self.edits.push(PartitionTableEdit::ResizeEntry {
+                                index: entry.index,
+                                new_size_bytes,
+                            });
+                        }
+                    } else {
+                        self.errors.push(format!(
+                            "Invalid size for partition {}: '{}'",
+                            entry.index, entry.size_text
+                        ));
                     }
-                } else {
-                    self.errors.push(format!(
-                        "Invalid size for partition {}: '{}'",
-                        entry.index, entry.size_text
-                    ));
                 }
 
                 match table {
