@@ -85,6 +85,18 @@ jobs:
           name: Rusty-Backup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
           path: Rusty-Backup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip
 
+      - name: Stage CLI binary
+        shell: bash
+        run: |
+          cp "target/${{ matrix.target }}/release/rusty-backup-cli.exe" \
+             "Rusty-Backup-CLI-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.exe"
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: Rusty-Backup-CLI-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: Rusty-Backup-CLI-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.exe
+
   build-macos:
     name: Build macOS
     needs: generate-version
@@ -246,6 +258,46 @@ jobs:
           echo "Stapling notarization ticket..."
           xcrun stapler staple "$DMG_FILE"
 
+      - name: Sign CLI binary
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+        run: |
+          CLI_BIN="target/${{ matrix.target }}/release/rusty-backup-cli"
+          if [ -n "$MACOS_CERTIFICATE" ] && [ -n "$MACOS_TEAM_ID" ]; then
+            IDENTITY=$(security find-identity -v -p codesigning "$RUNNER_TEMP/app-signing.keychain-db" | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+            echo "Signing CLI with identity: $IDENTITY"
+            codesign --force --options runtime --timestamp --sign "$IDENTITY" "$CLI_BIN"
+          else
+            echo "No signing certificate found, using ad-hoc signature..."
+            codesign --force --sign - "$CLI_BIN"
+          fi
+
+      - name: Package CLI for notarization
+        run: |
+          ZIP_NAME="Rusty-Backup-CLI-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip"
+          # ditto produces the zip layout notarytool / Gatekeeper expect for
+          # loose binaries; plain `zip` works too but ditto is the canonical
+          # tool on macOS.
+          ditto -c -k --keepParent "target/${{ matrix.target }}/release/rusty-backup-cli" "$ZIP_NAME"
+
+      - name: Notarize CLI
+        if: ${{ env.HAS_SIGNING_CERT == 'true' }}
+        env:
+          MACOS_NOTARIZE_APPLE_ID: ${{ secrets.MACOS_NOTARIZE_APPLE_ID }}
+          MACOS_NOTARIZE_PASSWORD: ${{ secrets.MACOS_NOTARIZE_PASSWORD }}
+          MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+        run: |
+          ZIP_NAME="Rusty-Backup-CLI-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip"
+          echo "Submitting CLI zip for notarization..."
+          xcrun notarytool submit "$ZIP_NAME" \
+            --apple-id "$MACOS_NOTARIZE_APPLE_ID" \
+            --password "$MACOS_NOTARIZE_PASSWORD" \
+            --team-id "$MACOS_TEAM_ID" \
+            --wait
+          # Stapler can't attach a ticket to a bare binary inside a zip;
+          # Gatekeeper performs an online check on first launch instead.
+
       - name: Cleanup keychain
         if: always()
         run: |
@@ -253,12 +305,18 @@ jobs:
           if [ -f "$KEYCHAIN_PATH" ]; then
             security delete-keychain "$KEYCHAIN_PATH"
           fi
-      
+
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
           name: Rusty-Backup-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
           path: Rusty-Backup-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: Rusty-Backup-CLI-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: Rusty-Backup-CLI-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip
 
   build-linux-appimage:
     name: Build Linux AppImage (Anylinux)
@@ -462,7 +520,7 @@ jobs:
             runs-on: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             arch: arm64
-            runs-on: [self-hosted, linux, ARM64]
+            runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v5
 
@@ -563,6 +621,17 @@ jobs:
           name: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-arch
           path: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.pkg.tar.zst
 
+      - name: Package CLI
+        run: |
+          TGZ="Rusty-Backup-CLI-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz"
+          tar -C "target/${{ matrix.target }}/release" -czf "$TGZ" rusty-backup-cli
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: Rusty-Backup-CLI-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: Rusty-Backup-CLI-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz
+
   release:
     name: Create Release
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
@@ -580,7 +649,7 @@ jobs:
       - name: Flatten artifacts
         run: |
           mkdir -p release-files
-          find artifacts -type f \( -name "*.zip" -o -name "*.dmg" -o -name "*.AppImage" -o -name "*.AppImage.zsync" -o -name "*.deb" -o -name "*.rpm" -o -name "*.pkg.tar.zst" \) -exec cp {} release-files/ \;
+          find artifacts -type f \( -name "*.zip" -o -name "*.dmg" -o -name "*.AppImage" -o -name "*.AppImage.zsync" -o -name "*.deb" -o -name "*.rpm" -o -name "*.pkg.tar.zst" -o -name "*.exe" -o -name "*.tar.gz" \) -exec cp {} release-files/ \;
           ls -lh release-files/
       
       - name: Create Release
