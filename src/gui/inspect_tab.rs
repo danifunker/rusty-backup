@@ -146,6 +146,9 @@ pub struct InspectTab {
     expand_image_dialog_open: bool,
     /// MiB to add when the user clicks Expand in the Expand Image dialog.
     expand_image_add_mib: u32,
+    /// Status of the background CHD-expand worker (Phase 6c). `None` when no
+    /// expansion has been started in this session.
+    chd_expand_status: Option<Arc<Mutex<rusty_backup::model::status::ChdExpandStatus>>>,
     /// Partition table editor model state.
     editor: PartitionEditor,
     /// Resize popup (in-place partition resizing)
@@ -223,6 +226,7 @@ impl Default for InspectTab {
             editor_popup: false,
             expand_image_dialog_open: false,
             expand_image_add_mib: 0,
+            chd_expand_status: None,
             editor: PartitionEditor::new(),
             resize_popup: None,
             fsck_result: None,
@@ -418,6 +422,7 @@ impl InspectTab {
         // Poll any pending per-partition minimum-size calculations
         self.poll_min_size_calcs(ctx);
         self.poll_volume_label_probes(ctx);
+        self.poll_chd_expand_status(ctx);
 
         // Background workers (min-size + volume-label probes) finish off the
         // GUI thread; without an explicit repaint request egui only paints
@@ -522,27 +527,31 @@ impl InspectTab {
                 self.init_add_partition(trailing_free);
             }
 
-            // Expand Image button (Phase 6b of disk_expansion.md) — grows
-            // the underlying image file with zero-padding so the user can
-            // then partition the new trailing space via Add Partition or
-            // grow an existing partition via the editor. Raw + VHD now;
-            // CHD waits on Phase 6c's re-encode worker.
+            // Expand Image button (Phases 6b + 6c of disk_expansion.md) —
+            // grows the underlying image file with zero-padding so the
+            // user can then partition the new trailing space via Add
+            // Partition or grow an existing partition via the editor.
+            // Raw + VHD via set_len in-place; CHD via a background
+            // re-encode worker (the CHD hunk layout is fixed at creation,
+            // so growing means writing a fresh CHD).
             let is_image_file = self.image_file_path.is_some()
                 && self.selected_device_idx.is_none()
                 && self.backup_folder_path.is_none()
                 && self.clonezilla_image.is_none();
-            let is_chd_source = self.chd_image_path.is_some();
+            let chd_expand_running = self
+                .chd_expand_status
+                .as_ref()
+                .map(|s| s.lock().map(|g| !g.finished).unwrap_or(false))
+                .unwrap_or(false);
             if ui
                 .add_enabled(
-                    is_image_file && !is_chd_source && !export_running,
+                    is_image_file && !export_running && !chd_expand_running,
                     egui::Button::new("Expand Image..."),
                 )
-                .on_hover_text(if is_chd_source {
-                    "CHD expansion requires re-encoding — coming in Phase 6c. \
-                     Export to VHD/raw first, expand that, then re-encode."
-                        .to_string()
-                } else if !is_image_file {
-                    "Only raw and VHD image files can be expanded in place.".to_string()
+                .on_hover_text(if !is_image_file {
+                    "Only image files can be expanded — devices have fixed size.".to_string()
+                } else if chd_expand_running {
+                    "CHD expansion already running.".to_string()
                 } else {
                     "Grow the image file with zero-padding so you can add or extend \
                      partitions in the new free space."
@@ -911,23 +920,38 @@ impl InspectTab {
                 }
             };
             let add_bytes = (self.expand_image_add_mib as u64) * 1024 * 1024;
+            let is_chd = self.chd_image_path.is_some();
             ctx.log.info(format!(
                 "Expanding image '{}' by {}...",
                 path.display(),
                 partition::format_size(add_bytes),
             ));
-            match rusty_backup::partition::resize::expand_image_file(&path, add_bytes, &mut |msg| {
-                ctx.log.info(msg)
-            }) {
-                Ok(new_total) => {
-                    ctx.log.info(format!(
-                        "Image expanded to {}. Click Re-inspect to refresh.",
-                        partition::format_size(new_total),
-                    ));
-                    self.cached_disk_size = None;
-                }
-                Err(e) => {
-                    ctx.log.error(format!("Expand Image failed: {e}"));
+            if is_chd {
+                // Route through the background re-encode worker. Status is
+                // polled each frame; on completion we invalidate the cached
+                // disk size so the user's next re-inspect sees the new
+                // logical size.
+                let status = rusty_backup::model::chd_expand_runner::spawn(path, add_bytes);
+                self.chd_expand_status = Some(status);
+                ctx.log.info(
+                    "CHD expansion runs in the background — log lines will appear as it progresses.",
+                );
+            } else {
+                match rusty_backup::partition::resize::expand_image_file(
+                    &path,
+                    add_bytes,
+                    &mut |msg| ctx.log.info(msg),
+                ) {
+                    Ok(new_total) => {
+                        ctx.log.info(format!(
+                            "Image expanded to {}. Click Re-inspect to refresh.",
+                            partition::format_size(new_total),
+                        ));
+                        self.cached_disk_size = None;
+                    }
+                    Err(e) => {
+                        ctx.log.error(format!("Expand Image failed: {e}"));
+                    }
                 }
             }
             self.expand_image_dialog_open = false;
@@ -2104,6 +2128,32 @@ impl InspectTab {
             }
             drop(status);
             self.export_status = None;
+        }
+    }
+
+    /// Drain log messages from the CHD-expand worker into the global log
+    /// panel and react to completion (success/error). On success we
+    /// invalidate `cached_disk_size` so the user's next re-inspect picks
+    /// up the new logical size.
+    fn poll_chd_expand_status(&mut self, ctx: &mut TabContext) {
+        let arc = match &self.chd_expand_status {
+            Some(s) => s.clone(),
+            None => return,
+        };
+        let Ok(mut status) = arc.lock() else { return };
+        for msg in status.log_messages.drain(..) {
+            ctx.log.info(msg);
+        }
+        if status.finished {
+            if let Some(err) = &status.error {
+                ctx.log.error(format!("Expand Image (CHD) failed: {err}"));
+            } else {
+                ctx.log
+                    .info("CHD expansion complete. Click Re-inspect to refresh.");
+                self.cached_disk_size = None;
+            }
+            drop(status);
+            self.chd_expand_status = None;
         }
     }
 
