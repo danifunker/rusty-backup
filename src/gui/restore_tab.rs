@@ -9,6 +9,7 @@ use rusty_backup::clonezilla::metadata::ClonezillaImage;
 use rusty_backup::model::size_mode::SizeMode;
 use rusty_backup::partition::{self, PartitionInfo, PartitionTable};
 
+use super::partition_bar::{PartitionBar, Segment, SegmentKind};
 use super::size_mode_row::{size_mode_row, SizeModeRowOptions};
 use rusty_backup::restore::single::{
     NewDiskConfig, NewTableType, SinglePartitionRestoreConfig, SinglePartitionSource,
@@ -107,6 +108,16 @@ pub struct RestoreTab {
     /// Error from scanning target
     sp_scan_error: Option<String>,
 
+    // --- "Add free space for in-OS expansion" (Phase 2 of disk_expansion plan) ---
+    /// Enabled by the "Add free space for in-OS expansion" checkbox. Image
+    /// targets only — disabled for device targets since physical disk size
+    /// is fixed.
+    expand_disk_enabled: bool,
+    /// How much free space to leave at the end of the target image, in MiB.
+    /// Mode A only: partition table stays at original layout; the trailing
+    /// region is unallocated and the user partitions it in their guest OS.
+    expand_free_space_mib: u32,
+
     // --- New Disk mode state ---
     /// Table type for new disk
     nd_table_type: NewTableType,
@@ -154,6 +165,8 @@ impl Default for RestoreTab {
             nd_target_device_idx: None,
             nd_image_file_path: None,
             nd_target_is_device: true,
+            expand_disk_enabled: false,
+            expand_free_space_mib: 0,
         }
     }
 }
@@ -410,6 +423,69 @@ impl RestoreTab {
                 }
             }
         });
+
+        // --- Section 2b: Add free space for in-OS expansion ---
+        // Image-file targets only — for device targets the disk size is
+        // fixed by the hardware, so the toggle doesn't apply. Recommends
+        // Mode A ("leave as unpartitioned free space") which works for every
+        // filesystem on every guest OS; Mode B is added in Phase 4 of
+        // docs/disk_expansion.md.
+        let source_size_bytes = self
+            .backup_metadata
+            .as_ref()
+            .map(|m| m.source_size_bytes)
+            .or_else(|| self.clonezilla_image.as_ref().map(|c| c.source_size_bytes))
+            .unwrap_or(0);
+        if !self.target_is_device
+            && source_size_bytes > 0
+            && (self.backup_metadata.is_some() || self.clonezilla_image.is_some())
+        {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Add free space for in-OS expansion").strong());
+            ui.separator();
+
+            ui.add_enabled_ui(controls_enabled, |ui| {
+                ui.checkbox(
+                    &mut self.expand_disk_enabled,
+                    "Pad the target image with unallocated free space",
+                )
+                .on_hover_text(
+                    "Useful for restoring a backup onto a larger virtual disk and \
+                     letting the guest OS extend or add a partition there. After \
+                     restore, run your OS's partitioner (parted, fdisk, IRIX fx, \
+                     Disk Management) followed by your filesystem's grow tool \
+                     (xfs_growfs, resize2fs, ...). Works for any filesystem.",
+                );
+
+                if self.expand_disk_enabled {
+                    let source_mib = (source_size_bytes / (1024 * 1024)).max(1) as u32;
+                    let cap = source_mib.saturating_mul(8).max(source_mib + 8192);
+                    ui.horizontal(|ui| {
+                        ui.label("Free space:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.expand_free_space_mib)
+                                .range(0..=cap)
+                                .suffix(" MiB"),
+                        );
+                        let new_total_bytes = source_size_bytes
+                            .saturating_add((self.expand_free_space_mib as u64) * 1024 * 1024);
+                        ui.label(format!(
+                            "(target size {} -> {})",
+                            partition::format_size(source_size_bytes),
+                            partition::format_size(new_total_bytes),
+                        ));
+                    });
+
+                    // Visualization: current vs after PartitionBar pair.
+                    self.show_expand_preview_bars(ui, source_size_bytes);
+                }
+            });
+        } else if self.expand_disk_enabled {
+            // Auto-disable when the user flips back to a device target so
+            // the next file-target render doesn't surprise them with a
+            // stale "free space" value still in the target-size readout.
+            self.expand_disk_enabled = false;
+        }
 
         // --- Section 3: Alignment (only when metadata loaded) ---
         if self.backup_metadata.is_some() || self.clonezilla_image.is_some() {
@@ -1044,6 +1120,100 @@ impl RestoreTab {
         self.clonezilla_image = Some(cz_image);
     }
 
+    /// Render the before/after PartitionBar pair for the expand-disk preview.
+    /// `source_size` is the original backup-source disk size in bytes; the
+    /// "After" bar appends a `Free` segment sized by the expansion toggle.
+    /// Both bars use the same byte-per-pixel scale, so the After bar is
+    /// physically wider by the growth ratio — the visual "this disk is now
+    /// bigger" cue.
+    fn show_expand_preview_bars(&self, ui: &mut egui::Ui, source_size: u64) {
+        let segments = self.build_expand_preview_segments();
+        let added_bytes = self.expand_free_space_bytes();
+        let new_total = source_size.saturating_add(added_bytes);
+
+        ui.add_space(6.0);
+        ui.label("Current:");
+        let available_width = ui.available_width().max(120.0);
+        // Avoid div-by-zero; clamp to 1 byte to make the math work even on
+        // edge-case empty backups.
+        let denom = new_total.max(1);
+        let current_ratio = (source_size as f64 / denom as f64) as f32;
+        let current_width = available_width * current_ratio;
+        let current_segments = segments.clone();
+        ui.scope(|ui| {
+            ui.set_width(current_width.max(60.0));
+            PartitionBar {
+                segments: current_segments,
+                show_inline_labels: true,
+                show_legend: false,
+            }
+            .show(ui);
+        });
+
+        ui.add_space(6.0);
+        ui.label(format!(
+            "After  (+ {} free):",
+            partition::format_size(added_bytes),
+        ));
+        let mut after_segments = segments;
+        if added_bytes > 0 {
+            after_segments.push(Segment {
+                label: String::new(),
+                fs: String::new(),
+                size_bytes: added_bytes,
+                kind: SegmentKind::Free,
+            });
+        }
+        PartitionBar {
+            segments: after_segments,
+            show_inline_labels: true,
+            show_legend: true,
+        }
+        .show(ui);
+    }
+
+    /// Build the partition-bar segments matching the current backup source.
+    /// Skips extended-container entries; partitions get sequential color
+    /// indices so the palette is stable across the current/after bars.
+    fn build_expand_preview_segments(&self) -> Vec<Segment> {
+        let mut color_index: usize = 0;
+        let mut segs = Vec::new();
+
+        if let Some(meta) = &self.backup_metadata {
+            for pm in &meta.partitions {
+                if pm.is_logical {
+                    // Logical partitions live inside an extended container —
+                    // we render the container, not the children, to keep the
+                    // bar a flat view of the disk layout.
+                    continue;
+                }
+                let kind = SegmentKind::Partition { color_index };
+                color_index += 1;
+                segs.push(Segment {
+                    label: format!("Partition {}", pm.index + 1),
+                    fs: pm.type_name.clone(),
+                    size_bytes: pm.original_size_bytes,
+                    kind,
+                });
+            }
+        } else if let Some(cz) = &self.clonezilla_image {
+            for cp in &cz.partitions {
+                if cp.is_logical || cp.is_extended {
+                    continue;
+                }
+                let kind = SegmentKind::Partition { color_index };
+                color_index += 1;
+                segs.push(Segment {
+                    label: format!("Partition {}", cp.index + 1),
+                    fs: cp.filesystem_type.clone(),
+                    size_bytes: cp.size_sectors * 512,
+                    kind,
+                });
+            }
+        }
+        segs
+    }
+
     fn get_target_size(&self, ctx: &TabContext) -> u64 {
         if self.target_is_device {
             self.selected_device_idx
@@ -1051,14 +1221,30 @@ impl RestoreTab {
                 .map(|d| d.size_bytes)
                 .unwrap_or(0)
         } else {
-            // For image files, use the source disk size as default target
-            if let Some(meta) = &self.backup_metadata {
+            // For image files, use the source disk size as default target.
+            // The "Add free space for in-OS expansion" toggle (Mode A of
+            // docs/disk_expansion.md) pads the trailing region of the
+            // output image so the guest OS can extend or add partitions
+            // there and absorb the space with its native grow tool.
+            let base = if let Some(meta) = &self.backup_metadata {
                 meta.source_size_bytes
             } else if let Some(cz) = &self.clonezilla_image {
                 cz.source_size_bytes
             } else {
                 0
-            }
+            };
+            base.saturating_add(self.expand_free_space_bytes())
+        }
+    }
+
+    /// Free-space contribution from the expansion toggle, in bytes. Zero when
+    /// the toggle is off (or when the target is a device, since physical disk
+    /// size isn't user-controllable).
+    pub fn expand_free_space_bytes(&self) -> u64 {
+        if self.expand_disk_enabled && !self.target_is_device {
+            (self.expand_free_space_mib as u64) * 1024 * 1024
+        } else {
+            0
         }
     }
 
