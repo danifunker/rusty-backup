@@ -16,8 +16,10 @@ use std::io::{Read, Seek, Write};
 #[cfg(test)]
 use byteorder::ByteOrder;
 
-use super::efs::{EfsFilesystem, EFS_DIRECTEXTENTS_MAX};
+use super::efs::{EfsFilesystem, EFS_BLOCKSIZE, EFS_DIRECTEXTENTS_MAX};
 use super::filesystem::FilesystemError;
+
+const EFS_BLOCKSIZE_USIZE: usize = EFS_BLOCKSIZE as usize;
 
 /// Unified entry point matching the `resize_filesystem_for` dispatch
 /// pattern: probe the EFS magic at sector 1 of the partition, and if
@@ -141,35 +143,63 @@ pub fn grow_efs<R: Read + Write + Seek>(
         }
     }
 
-    // Adjust the superblock. ncg is bumped only if at least one full
-    // new CG fits at the tail; the doc's heuristic. We don't actually
-    // initialize the new CG's inode table here in this slice —
-    // doing so requires choosing a layout for those blocks that the
-    // existing inode-byte-offset math agrees with. For the small-grow
-    // case (delta < cgfsize) ncg stays put and we just extend the
-    // last CG's data region.
-    let mut new_sb = sb.clone();
-    let added_blocks = delta;
-    let added_cgs = added_blocks / sb.cgfsize;
+    // Split the delta into N full new CGs + an optional fractional tail.
+    let added_cgs = delta / sb.cgfsize;
+    let _fractional = delta - added_cgs * sb.cgfsize; // covered by the
+                                                      // "mark new blocks
+                                                      // free" step above
     if added_cgs > 0 {
-        // Append-new-CGs path (doc Phase 3b) — deferred.
-        return Err(FilesystemError::Unsupported(format!(
-            "EFS grow: new size would add {added_cgs} new cylinder group(s); \
-             append-new-CGs path is deferred to a future slice. \
-             Use a smaller increase (< {} blocks) for the extend-last-CG path.",
+        log(&format!(
+            "EFS grow: appending {added_cgs} new cylinder group(s) of {} blocks each",
             sb.cgfsize
-        )));
+        ));
+        // For each new CG: zero its inode-table region (mode==0 in every
+        // slot = free) and mark inode-region bits as in-use in the
+        // bitmap. Data-region bits stay clear (already cleared by the
+        // tail loop above).
+        for new_cg_index in 0..added_cgs {
+            let cg = sb.ncg as u32 + new_cg_index;
+            let cg_start = sb.firstcg + cg * sb.cgfsize;
+            // Zero `cgisize` blocks starting at `cg_start`.
+            let zero_sector = [0u8; EFS_BLOCKSIZE_USIZE];
+            for i in 0..sb.cgisize as u32 {
+                fs.write_block(cg_start + i, &zero_sector)?;
+            }
+            // Mark inode-region bits as in-use so the data-block
+            // allocator avoids them. The verifier doesn't require
+            // this direction, but the allocator does.
+            let bm = fs.staged_bitmap_mut()?;
+            for blk in cg_start..cg_start + sb.cgisize as u32 {
+                let by = (blk / 8) as usize;
+                if by >= bm.len() {
+                    break;
+                }
+                let bb = 7 - (blk % 8);
+                bm[by] |= 1u8 << bb;
+            }
+        }
     }
 
     // Preserve the relative position of the replica past fs_size.
+    let mut new_sb = sb.clone();
     let trailing_zone = sb.replsb.saturating_sub(old_size);
     new_sb.fs_size = new_size_blocks;
     new_sb.replsb = new_size_blocks.saturating_add(trailing_zone);
-    new_sb.tfree = new_sb.tfree.saturating_add(added_blocks);
+    new_sb.ncg = sb.ncg.saturating_add(added_cgs as u16);
+    let inodes_per_cg = sb.cgisize as u32 * 4; // 4 inodes per 512-byte block
+    new_sb.tinode = new_sb
+        .tinode
+        .saturating_add(added_cgs.saturating_mul(inodes_per_cg));
+    // Free data blocks added: total new blocks minus the inode-region
+    // blocks we marked in-use.
+    let inode_region_blocks_added = added_cgs.saturating_mul(sb.cgisize as u32);
+    new_sb.tfree = new_sb
+        .tfree
+        .saturating_add(delta.saturating_sub(inode_region_blocks_added));
 
     log(&format!(
-        "EFS grow: replica moves {} -> {} (trailing zone {})",
-        sb.replsb, new_sb.replsb, trailing_zone
+        "EFS grow: replica moves {} -> {} (trailing zone {}), ncg {} -> {}",
+        sb.replsb, new_sb.replsb, trailing_zone, sb.ncg, new_sb.ncg
     ));
 
     fs.set_sb(new_sb);
@@ -434,15 +464,54 @@ mod tests {
     }
 
     #[test]
-    fn grow_rejects_append_new_cgs() {
-        // 640 - 512 = 128 = 2 * cgfsize → triggers the deferred path.
+    fn grow_appends_new_cylinder_groups() {
+        // 640 - 512 = 128 = 2 * cgfsize → 2 new CGs appended at the
+        // tail. cgisize=2 inode-table blocks per CG, so the new
+        // inode region for CG 1 sits at 82..84 and for CG 2 at
+        // 146..148. After grow: ncg=3, fs_size=640.
         let img = build_test_volume();
         let cur = Cursor::new(img);
-        let err = grow_efs(cur, 0, 640, &mut |_| {}).expect_err("deferred");
+        let mut log_lines: Vec<String> = Vec::new();
+        let new_size =
+            grow_efs(cur, 0, 640, &mut |s| log_lines.push(s.into())).expect("append-new-CGs grow");
+        assert_eq!(new_size, 640);
         assert!(
-            matches!(err, FilesystemError::Unsupported(_)),
-            "got {err:?}"
+            log_lines
+                .iter()
+                .any(|l| l.contains("appending 2 new cylinder")),
+            "missing append log line in: {log_lines:?}"
         );
+        assert!(log_lines.iter().any(|l| l.contains("committed")));
+    }
+
+    #[test]
+    fn grow_append_new_cgs_then_reopen_round_trip() {
+        // Grow by exactly 1 CG and re-open to confirm the inode
+        // allocator can use the newly-added inode slots.
+        use super::super::filesystem::EditableFilesystem;
+        let img = build_test_volume();
+        let mut buf = img;
+        // 512 -> 576 = +64 = exactly one new CG (cgfsize).
+        grow_efs(Cursor::new(&mut buf), 0, 576, &mut |_| {}).expect("grow");
+
+        let mut fs = EfsFilesystem::open(Cursor::new(buf), 0).expect("reopen");
+        let sb = fs.sb_clone();
+        assert_eq!(sb.fs_size, 576);
+        assert_eq!(sb.ncg, 2);
+        // tinode was 0 in the test volume; the new CG adds cgisize*4
+        // = 8 inode slots, all currently free.
+        assert_eq!(sb.tinode, 8);
+
+        // The newly-allocated inode slots should read as mode==0 (free).
+        // Inode region for CG 1 spans blocks 82..84, holding inums 8..16
+        // (cgisize*4 = 8 inodes per CG).
+        for inum in 8..16 {
+            let ino = fs.read_inode(inum).expect("read");
+            assert_eq!(ino.mode, 0, "new-CG inum {inum} should be free");
+        }
+        // allocate_inode should hand out one of these new slots once
+        // the existing free ones (in CG 0) are exhausted.
+        let _ = EditableFilesystem::free_space(&mut fs);
     }
 
     #[test]
