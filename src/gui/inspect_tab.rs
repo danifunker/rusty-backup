@@ -1296,6 +1296,19 @@ impl InspectTab {
                 ui.label("Export partitions as disk image files.");
                 ui.add_space(4.0);
 
+                // Current vs After disk layout. Current = loaded partition
+                // sizes; After applies each export config's effective_size
+                // (which honours Original / Minimum / Custom / FillRemaining
+                // exactly the way the export engine will). Both bars share
+                // a byte-per-pixel scale so shrinks/grows are immediately
+                // visible.
+                show_export_disk_layout_bars(
+                    ui,
+                    &self.partitions,
+                    &self.export_partition_configs,
+                );
+                ui.add_space(8.0);
+
                 // Export mode
                 ui.radio_value(
                     &mut self.export_whole_disk,
@@ -4534,6 +4547,98 @@ fn build_disk_layout_segments(
     }
 
     segments
+}
+
+/// Render the Current vs After PartitionBar pair inside the Export Disk
+/// Image popup. "After" reuses each `PartitionExportConfig::effective_size`,
+/// so what the user sees in the bar is exactly the size the export engine
+/// will write.
+fn show_export_disk_layout_bars(
+    ui: &mut egui::Ui,
+    partitions: &[PartitionInfo],
+    configs: &[PartitionExportConfig],
+) {
+    use super::partition_bar::{PartitionBar, Segment, SegmentKind};
+
+    let mut current = Vec::new();
+    let mut color_index = 0usize;
+    for p in partitions {
+        if p.is_extended_container || p.is_logical {
+            continue;
+        }
+        let kind = SegmentKind::Partition { color_index };
+        color_index += 1;
+        current.push(Segment {
+            label: format!("Partition {}", p.index + 1),
+            fs: p.type_name.clone(),
+            size_bytes: p.size_bytes,
+            kind,
+        });
+    }
+
+    let mut after = Vec::new();
+    color_index = 0;
+    for p in partitions {
+        if p.is_extended_container || p.is_logical {
+            continue;
+        }
+        let cfg = configs.iter().find(|c| c.index == p.index);
+        let size = match cfg {
+            Some(c) => {
+                let eff = c.effective_size();
+                if eff == 0 {
+                    // FillRemaining — keep the segment visible at original
+                    // size so it doesn't disappear from the bar.
+                    p.size_bytes
+                } else {
+                    eff
+                }
+            }
+            None => p.size_bytes,
+        };
+        let kind = SegmentKind::Partition { color_index };
+        color_index += 1;
+        after.push(Segment {
+            label: format!("Partition {}", p.index + 1),
+            fs: p.type_name.clone(),
+            size_bytes: size,
+            kind,
+        });
+    }
+
+    let current_total: u64 = current.iter().map(|s| s.size_bytes).sum();
+    let after_total: u64 = after.iter().map(|s| s.size_bytes).sum();
+    let max_total = current_total.max(after_total).max(1);
+    let available_width = ui.available_width().max(120.0);
+
+    ui.label("Current:");
+    let current_w = available_width * (current_total as f64 / max_total as f64) as f32;
+    ui.scope(|ui| {
+        ui.set_width(current_w.max(60.0));
+        PartitionBar {
+            segments: current,
+            show_inline_labels: true,
+            show_legend: false,
+        }
+        .show(ui);
+    });
+
+    ui.add_space(4.0);
+    ui.label(format!(
+        "After  ({} -> {}):",
+        partition::format_size(current_total),
+        partition::format_size(after_total),
+    ));
+    let after_w = available_width * (after_total as f64 / max_total as f64) as f32;
+    ui.scope(|ui| {
+        ui.set_width(after_w.max(60.0));
+        PartitionBar {
+            segments: after,
+            show_inline_labels: true,
+            show_legend: true,
+        }
+        .show(ui);
+    });
 }
 
 /// Render the Current vs After PartitionBar pair inside the partition-table
