@@ -314,12 +314,21 @@ impl EfsInode {
     }
 }
 
-/// EFS filesystem reader.
+/// EFS filesystem reader + (with `R: Write`) editor.
+///
+/// The free-space bitmap is large (~915 KiB on a 1 GB volume) and
+/// re-reading it on every mutation would dominate edit-session cost.
+/// Once loaded for mutation it stays in `staged_bitmap`; `sync_metadata`
+/// flushes it. Inode and dirblock writes go through to disk
+/// immediately (single 512-byte RMW each — cheap, no batching upside).
 pub struct EfsFilesystem<R: Read + Seek + Send> {
     reader: R,
     partition_offset: u64,
     sb: EfsSuperblock,
     label: String,
+    staged_bitmap: Option<Vec<u8>>,
+    /// True when `sb` has been mutated in memory since the last sync.
+    sb_dirty: bool,
 }
 
 impl<R: Read + Seek + Send> EfsFilesystem<R> {
@@ -341,6 +350,8 @@ impl<R: Read + Seek + Send> EfsFilesystem<R> {
             partition_offset,
             sb,
             label,
+            staged_bitmap: None,
+            sb_dirty: false,
         })
     }
 
@@ -439,6 +450,22 @@ impl<R: Read + Seek + Send> EfsFilesystem<R> {
 /// SB) are also marked in-use by convention.
 #[allow(dead_code)] // wired up across EFS Slices 3–8
 impl<R: Read + Write + Seek + Send> EfsFilesystem<R> {
+    /// Lazy-load the free-space bitmap into `staged_bitmap` and return
+    /// a mutable reference. Subsequent calls return the staged copy
+    /// (so mutations accumulate). `sync_metadata` flushes it.
+    pub(crate) fn staged_bitmap_mut(&mut self) -> Result<&mut Vec<u8>, FilesystemError> {
+        if self.staged_bitmap.is_none() {
+            self.staged_bitmap = Some(self.read_bitmap()?);
+        }
+        Ok(self.staged_bitmap.as_mut().unwrap())
+    }
+
+    /// Discard any staged bitmap edits without flushing. Used by the
+    /// snapshot/rollback machinery (Slice 6+).
+    pub(crate) fn discard_staged_bitmap(&mut self) {
+        self.staged_bitmap = None;
+    }
+
     /// Read the full free-space bitmap into memory. Size is exactly
     /// `sb.bmsize` bytes, rounded up to a 512-byte sector boundary for
     /// the underlying I/O.
@@ -789,6 +816,124 @@ impl<R: Read + Write + Seek + Send> EfsFilesystem<R> {
         )))
     }
 
+    /// Allocate disk space for `data_len` bytes via the in-memory
+    /// bitmap, populate `inode.extents` / `numextents`, then stream
+    /// `data` into the allocated blocks. The strategy starts with one
+    /// large contiguous extent and falls back to progressively smaller
+    /// chunks, accumulating up to 12 extents before failing with
+    /// `DiskFull`. On failure every partially-allocated extent is
+    /// freed in the bitmap.
+    pub(crate) fn write_file_data(
+        &mut self,
+        bm: &mut [u8],
+        inode: &mut EfsInode,
+        data: &mut dyn Read,
+        data_len: u64,
+    ) -> Result<(), FilesystemError> {
+        // Zero out any previously-recorded extents — caller is
+        // expected to free those before calling, but the on-inode
+        // bytes need to be cleared so a partial-allocation inode
+        // doesn't leak garbage into the catalog if we fail mid-way.
+        inode.extents = [EfsExtent {
+            magic: 0,
+            bn: 0,
+            length: 0,
+            offset: 0,
+        }; EFS_DIRECTEXTENTS];
+        inode.numextents = 0;
+        inode.size = data_len as u32;
+
+        if data_len == 0 {
+            return Ok(());
+        }
+        let needed_blocks = data_len.div_ceil(EFS_BLOCKSIZE) as u32;
+
+        let mut allocated: Vec<EfsExtent> = Vec::new();
+        let mut logical_offset = 0u32;
+        let mut remaining = needed_blocks;
+        while remaining > 0 {
+            if allocated.len() >= EFS_DIRECTEXTENTS {
+                // Roll back partial allocations.
+                for ext in &allocated {
+                    Self::free_extent_in_bitmap(bm, ext);
+                }
+                return Err(FilesystemError::DiskFull(format!(
+                    "EFS write_file_data: required more than {} extents \
+                     (volume too fragmented for {data_len}-byte file)",
+                    EFS_DIRECTEXTENTS
+                )));
+            }
+            // Try the largest possible run first; halve on failure
+            // until we find something that fits or chunk drops to 1.
+            let mut chunk = remaining.min(u8::MAX as u32);
+            let ext = loop {
+                match Self::alloc_contiguous_in_bitmap(bm, chunk, 0) {
+                    Ok(mut e) => {
+                        e.offset = logical_offset;
+                        break e;
+                    }
+                    Err(FilesystemError::DiskFull(_)) if chunk > 1 => {
+                        chunk /= 2;
+                    }
+                    Err(e) => {
+                        for ext in &allocated {
+                            Self::free_extent_in_bitmap(bm, ext);
+                        }
+                        return Err(e);
+                    }
+                }
+            };
+            logical_offset += ext.length as u32;
+            remaining -= ext.length as u32;
+            allocated.push(ext);
+        }
+
+        // Record extents on the inode.
+        for (i, ext) in allocated.iter().enumerate() {
+            inode.extents[i] = *ext;
+        }
+        inode.numextents = allocated.len() as u16;
+
+        // Stream payload into the allocated blocks.
+        let mut written: u64 = 0;
+        let mut block = [0u8; EFS_BLOCKSIZE as usize];
+        for ext in &allocated {
+            for i in 0..ext.length as u32 {
+                block.fill(0); // zero-fill trailing partial block
+                let want = (data_len - written).min(EFS_BLOCKSIZE) as usize;
+                if want > 0 {
+                    data.read_exact(&mut block[..want])?;
+                }
+                self.write_block(ext.bn + i, &block)?;
+                written += want as u64;
+                if written >= data_len {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Free every block referenced by `inode`'s extents and zero the
+    /// extent records. Bitmap is updated in `bm`; caller flushes.
+    pub(crate) fn free_inode_data(&self, bm: &mut [u8], inode: &mut EfsInode) {
+        for i in 0..inode.numextents as usize {
+            let ext = inode.extents[i];
+            if ext.length == 0 {
+                continue;
+            }
+            Self::free_extent_in_bitmap(bm, &ext);
+        }
+        inode.extents = [EfsExtent {
+            magic: 0,
+            bn: 0,
+            length: 0,
+            offset: 0,
+        }; EFS_DIRECTEXTENTS];
+        inode.numextents = 0;
+        inode.size = 0;
+    }
+
     /// Look up `name` in `dir_inum`. Returns the child inum if found.
     pub(crate) fn dir_find(
         &mut self,
@@ -840,6 +985,279 @@ impl<R: Read + Write + Seek + Send> EfsFilesystem<R> {
             .seek(SeekFrom::Start(self.partition_offset + EFS_BLOCKSIZE))?;
         self.reader.write_all(&primary_sector)?;
         Ok(())
+    }
+}
+
+/// Helper to build a `FileEntry` from an `EfsInode` + name/path.
+/// Symlink targets are intentionally not resolved here — the editable
+/// flow returns entries the GUI then re-reads via the read-only path
+/// that resolves targets.
+fn entry_from_inode(name: &str, parent_path: &str, ino: &EfsInode) -> FileEntry {
+    let path = if parent_path == "/" {
+        format!("/{name}")
+    } else {
+        format!("{parent_path}/{name}")
+    };
+    let size = if ino.is_dir() { 0 } else { ino.size as u64 };
+    FileEntry {
+        name: name.to_string(),
+        path,
+        entry_type: ino.entry_type(),
+        size,
+        location: ino.inum as u64,
+        modified: None,
+        type_code: None,
+        creator_code: None,
+        symlink_target: None,
+        special_type: ino.special_type(),
+        mode: Some(ino.mode as u32),
+        uid: Some(ino.uid as u32),
+        gid: Some(ino.gid as u32),
+        resource_fork_size: None,
+        aux_type: None,
+        link_target_cnid: None,
+        amiga_protection: None,
+        amiga_comment: None,
+        amiga_date: None,
+    }
+}
+
+impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for EfsFilesystem<R> {
+    fn create_file(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        data: &mut dyn Read,
+        data_len: u64,
+        options: &super::filesystem::CreateFileOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        if !parent.is_directory() {
+            return Err(FilesystemError::NotADirectory(parent.path.clone()));
+        }
+        let name_bytes = name.as_bytes();
+        validate_name(name_bytes)?;
+        let parent_inum = parent.location as u32;
+
+        // Pre-flight: name must not already exist in parent.
+        let parent_inode = self.read_inode(parent_inum)?;
+        if self.dir_find(&parent_inode, name_bytes)?.is_some() {
+            return Err(FilesystemError::AlreadyExists(name.into()));
+        }
+
+        // Take the bitmap out of staging so we can hold it as a local
+        // mut and still call other &mut self methods (write_block etc).
+        // Restored to staging on every exit path (success or error).
+        let mut bm = match self.staged_bitmap.take() {
+            Some(b) => b,
+            None => self.read_bitmap()?,
+        };
+
+        let res = (|| -> Result<FileEntry, FilesystemError> {
+            let inum = self.allocate_inode()?;
+            let mut new_ino = EfsInode::empty(inum);
+            new_ino.mode = options.mode.unwrap_or(0o100644) as u16;
+            new_ino.nlink = 1;
+            new_ino.uid = options.uid.unwrap_or(0) as u16;
+            new_ino.gid = options.gid.unwrap_or(0) as u16;
+
+            self.write_file_data(&mut bm, &mut new_ino, data, data_len)?;
+            self.write_inode(&new_ino)?;
+
+            // Link into parent. dir_insert may mutate parent_inode
+            // (extent growth on overflow), so re-read fresh.
+            let mut parent_ino = self.read_inode(parent_inum)?;
+            self.dir_insert(&mut parent_ino, &mut bm, name_bytes, inum)?;
+            self.write_inode(&parent_ino)?;
+
+            self.sb.tinode = self.sb.tinode.saturating_sub(1);
+            self.sb.lastialloc = inum;
+            self.sb_dirty = true;
+            Ok(entry_from_inode(name, &parent.path, &new_ino))
+        })();
+
+        self.staged_bitmap = Some(bm);
+        res
+    }
+
+    fn create_directory(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        options: &super::filesystem::CreateDirectoryOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        if !parent.is_directory() {
+            return Err(FilesystemError::NotADirectory(parent.path.clone()));
+        }
+        let name_bytes = name.as_bytes();
+        validate_name(name_bytes)?;
+        let parent_inum = parent.location as u32;
+
+        let parent_inode_initial = self.read_inode(parent_inum)?;
+        if self.dir_find(&parent_inode_initial, name_bytes)?.is_some() {
+            return Err(FilesystemError::AlreadyExists(name.into()));
+        }
+
+        let mut bm = match self.staged_bitmap.take() {
+            Some(b) => b,
+            None => self.read_bitmap()?,
+        };
+
+        let res = (|| -> Result<FileEntry, FilesystemError> {
+            let inum = self.allocate_inode()?;
+            // Allocate one disk block for the new dir's initial
+            // dirblock (holding `.` and `..`).
+            let mut ext = Self::alloc_contiguous_in_bitmap(&mut bm, 1, 0)?;
+            ext.offset = 0;
+
+            // Write the initial dirblock with "." and "..".
+            let initial = serialize_dir_block(&[
+                DirEntry {
+                    inum,
+                    name: b".".to_vec(),
+                },
+                DirEntry {
+                    inum: parent_inum,
+                    name: b"..".to_vec(),
+                },
+            ])
+            .expect("./.. always fits in one block");
+            self.write_block(ext.bn, &initial)?;
+
+            let mut new_dir = EfsInode::empty(inum);
+            new_dir.mode = options.mode.unwrap_or(0o040755) as u16;
+            new_dir.nlink = 2; // `.` is the second link
+            new_dir.uid = options.uid.unwrap_or(0) as u16;
+            new_dir.gid = options.gid.unwrap_or(0) as u16;
+            new_dir.size = EFS_BLOCKSIZE as u32;
+            new_dir.numextents = 1;
+            new_dir.extents[0] = ext;
+            self.write_inode(&new_dir)?;
+
+            // Link into parent.
+            let mut parent_inode = self.read_inode(parent_inum)?;
+            self.dir_insert(&mut parent_inode, &mut bm, name_bytes, inum)?;
+            // Parent's nlink increases by 1 (the new dir's ".." back-link).
+            parent_inode.nlink = parent_inode.nlink.saturating_add(1);
+            self.write_inode(&parent_inode)?;
+
+            self.sb.tinode = self.sb.tinode.saturating_sub(1);
+            self.sb.lastialloc = inum;
+            self.sb_dirty = true;
+            Ok(entry_from_inode(name, &parent.path, &new_dir))
+        })();
+
+        self.staged_bitmap = Some(bm);
+        res
+    }
+
+    fn delete_entry(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+    ) -> Result<(), FilesystemError> {
+        if !parent.is_directory() {
+            return Err(FilesystemError::NotADirectory(parent.path.clone()));
+        }
+        let parent_inum = parent.location as u32;
+        let entry_inum = entry.location as u32;
+        if entry_inum < 2 {
+            return Err(FilesystemError::InvalidData(format!(
+                "EFS delete_entry: refusing to delete reserved inum {entry_inum}"
+            )));
+        }
+        let mut target = self.read_inode(entry_inum)?;
+        // For directories, ensure empty (`.`/`..` only).
+        if target.is_dir() {
+            let mut found_other = false;
+            let mut extents: Vec<EfsExtent> = target
+                .extents
+                .iter()
+                .take(target.numextents as usize)
+                .copied()
+                .collect();
+            extents.sort_by_key(|e| e.offset);
+            'scan: for ext in &extents {
+                for i in 0..ext.length as u32 {
+                    let block = self.read_block(ext.bn + i)?;
+                    let entries = parse_dir_block(&block);
+                    for de in &entries {
+                        if de.name != b"." && de.name != b".." {
+                            found_other = true;
+                            break 'scan;
+                        }
+                    }
+                }
+            }
+            if found_other {
+                return Err(FilesystemError::InvalidData(format!(
+                    "EFS delete_entry: directory '{}' not empty",
+                    entry.path
+                )));
+            }
+        }
+
+        let mut bm = match self.staged_bitmap.take() {
+            Some(b) => b,
+            None => self.read_bitmap()?,
+        };
+
+        let res = (|| -> Result<(), FilesystemError> {
+            // Unlink from parent first so a crash before the inode is
+            // freed leaves an orphan inode (recoverable via fsck)
+            // rather than a dangling dirent.
+            let mut parent_inode = self.read_inode(parent_inum)?;
+            let removed_inum = self.dir_remove(&parent_inode, entry.name.as_bytes())?;
+            if removed_inum != entry_inum {
+                return Err(FilesystemError::InvalidData(format!(
+                    "EFS delete_entry: dirent inum {} does not match entry inum {}",
+                    removed_inum, entry_inum
+                )));
+            }
+
+            // Free the inode's data blocks.
+            self.free_inode_data(&mut bm, &mut target);
+
+            // If the target was a directory, free its own dirblocks
+            // too (free_inode_data already covered them via the
+            // extent list).
+
+            // Zero the inode slot so allocate_inode sees it as free.
+            let zero = EfsInode::empty(entry_inum);
+            self.write_inode(&zero)?;
+
+            // Directory parent's nlink decreases when we delete a
+            // child directory (its ".." back-link goes away).
+            if entry.is_directory() {
+                parent_inode.nlink = parent_inode.nlink.saturating_sub(1);
+                self.write_inode(&parent_inode)?;
+            }
+
+            self.sb.tinode = self.sb.tinode.saturating_add(1);
+            self.sb_dirty = true;
+            Ok(())
+        })();
+
+        self.staged_bitmap = Some(bm);
+        res
+    }
+
+    fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
+        // Flush the staged bitmap if it was loaded.
+        if let Some(bm) = self.staged_bitmap.take() {
+            self.write_bitmap(&bm)?;
+            // Put it back so subsequent edits in the same session
+            // reuse the warm copy.
+            self.staged_bitmap = Some(bm);
+        }
+        if self.sb_dirty {
+            self.write_superblock_pair()?;
+            self.sb_dirty = false;
+        }
+        Ok(())
+    }
+
+    fn free_space(&mut self) -> Result<u64, FilesystemError> {
+        Ok(self.sb.tfree as u64 * EFS_BLOCKSIZE)
     }
 }
 
@@ -1157,6 +1575,10 @@ impl<R: Read + Seek + Send> Filesystem for EfsFilesystem<R> {
     fn used_size(&self) -> u64 {
         // No allocation summary parsed yet; report total for now.
         self.total_size()
+    }
+
+    fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
+        validate_name(name.as_bytes())
     }
 }
 
@@ -2105,6 +2527,121 @@ mod tests {
         assert!(validate_name(b"good_name").is_ok());
         // 255-byte name is the boundary.
         assert!(validate_name(&[b'y'; 255]).is_ok());
+    }
+
+    #[test]
+    fn editable_create_file_round_trip() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        let img = build_synthetic_with_root_dir();
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        // Populate sb.tfree to a sensible value so post-create
+        // accounting is meaningful (the synthetic image leaves it 0).
+        fs.sb.tfree = 200;
+        fs.sb.tinode = 8;
+
+        let root = fs.root().expect("root");
+        let payload = b"hello world".to_vec();
+        let mut cur = Cursor::new(payload.clone());
+        let opts = CreateFileOptions {
+            mode: Some(0o100600),
+            ..Default::default()
+        };
+        let new_entry = fs
+            .create_file(&root, "greeting.txt", &mut cur, payload.len() as u64, &opts)
+            .expect("create_file");
+        assert!(new_entry.is_file());
+        assert_eq!(new_entry.size, payload.len() as u64);
+
+        fs.sync_metadata().expect("sync");
+
+        // Re-open and verify.
+        let bytes = fs.reader.into_inner();
+        let mut fs2 = EfsFilesystem::open(Cursor::new(bytes), 0).expect("reopen");
+        let root2 = fs2.root().unwrap();
+        let kids = fs2.list_directory(&root2).expect("list");
+        let entry = kids
+            .iter()
+            .find(|e| e.name == "greeting.txt")
+            .expect("file present");
+        let data = fs2.read_file(entry, usize::MAX).expect("read");
+        assert_eq!(data, payload);
+    }
+
+    #[test]
+    fn editable_create_directory_round_trip() {
+        use super::super::filesystem::{
+            CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem,
+        };
+        let img = build_synthetic_with_root_dir();
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        fs.sb.tfree = 200;
+        fs.sb.tinode = 8;
+
+        let root = fs.root().expect("root");
+        let dir_entry = fs
+            .create_directory(&root, "subdir", &CreateDirectoryOptions::default())
+            .expect("mkdir");
+        assert!(dir_entry.is_directory());
+
+        // Create a file inside the new dir.
+        let payload = b"nested".to_vec();
+        let mut cur = Cursor::new(payload.clone());
+        fs.create_file(
+            &dir_entry,
+            "inner.txt",
+            &mut cur,
+            payload.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .expect("create inside subdir");
+        fs.sync_metadata().expect("sync");
+
+        // Re-open + verify path.
+        let bytes = fs.reader.into_inner();
+        let mut fs2 = EfsFilesystem::open(Cursor::new(bytes), 0).expect("reopen");
+        let root2 = fs2.root().unwrap();
+        let kids = fs2.list_directory(&root2).unwrap();
+        let sub = kids.iter().find(|e| e.name == "subdir").expect("subdir");
+        assert!(sub.is_directory());
+        let sub_kids = fs2.list_directory(sub).expect("list subdir");
+        assert!(sub_kids.iter().any(|e| e.name == "inner.txt"));
+    }
+
+    #[test]
+    fn editable_delete_entry_frees_inode_and_blocks() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        let img = build_synthetic_with_root_dir();
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        fs.sb.tfree = 200;
+        fs.sb.tinode = 8;
+
+        let root = fs.root().expect("root");
+        let payload = vec![0xCD; 1500];
+        let mut cur = Cursor::new(payload.clone());
+        let entry = fs
+            .create_file(
+                &root,
+                "tmp.bin",
+                &mut cur,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create");
+
+        let tinode_after_create = fs.sb.tinode;
+        fs.delete_entry(&root, &entry).expect("delete");
+        assert_eq!(fs.sb.tinode, tinode_after_create + 1, "tinode bumped back");
+
+        // The dirent is gone after sync.
+        fs.sync_metadata().expect("sync");
+        let bytes = fs.reader.into_inner();
+        let mut fs2 = EfsFilesystem::open(Cursor::new(bytes), 0).expect("reopen");
+        let root2 = fs2.root().unwrap();
+        let kids = fs2.list_directory(&root2).expect("list");
+        assert!(
+            !kids.iter().any(|e| e.name == "tmp.bin"),
+            "deleted file still present: {kids:?}"
+        );
     }
 
     #[test]

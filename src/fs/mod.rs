@@ -708,7 +708,8 @@ pub fn is_layout_preserving_fs(partition_type: u8, partition_type_string: Option
                 | "Linux",
         );
     }
-    matches!(partition_type, 0xAF | 0x83 | 0xA8)
+    // 0xA1 is our synthetic byte for SGI EFS (PartitionTable::Sgi).
+    matches!(partition_type, 0xAF | 0x83 | 0xA8 | 0xA1)
 }
 
 /// True if this filesystem has a true defragmenting writer (clone pipeline)
@@ -1261,6 +1262,11 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
         }
         // ProDOS
         0xA8 => Ok(Box::new(prodos::ProDosFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
+        // SGI EFS — synthetic type byte emitted by PartitionTable::Sgi.
+        0xA1 => Ok(Box::new(efs::EfsFilesystem::open(
             reader,
             partition_offset,
         )?)),
