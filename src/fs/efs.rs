@@ -627,6 +627,194 @@ impl<R: Read + Write + Seek + Send> EfsFilesystem<R> {
         )))
     }
 
+    /// Read one 512-byte block at disk block `bn` (raw I/O — no magic
+    /// check). Used by directory mutation to RMW a dirblock.
+    pub(crate) fn read_block(
+        &mut self,
+        bn: u32,
+    ) -> Result<[u8; EFS_BLOCKSIZE as usize], FilesystemError> {
+        let mut buf = [0u8; EFS_BLOCKSIZE as usize];
+        read_at_aligned(
+            &mut self.reader,
+            self.partition_offset + bn as u64 * EFS_BLOCKSIZE,
+            EFS_BLOCKSIZE,
+            &mut buf,
+        )?;
+        Ok(buf)
+    }
+
+    pub(crate) fn write_block(
+        &mut self,
+        bn: u32,
+        buf: &[u8; EFS_BLOCKSIZE as usize],
+    ) -> Result<(), FilesystemError> {
+        self.reader.seek(SeekFrom::Start(
+            self.partition_offset + bn as u64 * EFS_BLOCKSIZE,
+        ))?;
+        self.reader.write_all(buf)?;
+        Ok(())
+    }
+
+    /// Insert `(child_inum, name)` into `dir_inum`'s entry list.
+    /// Walks the directory's dirblocks in extent order; appends to the
+    /// first block with room. When no existing block fits, allocates
+    /// a fresh disk block via `bm` and adds it as a new extent on the
+    /// directory's inode (errors with TooLarge when the inode already
+    /// has 12 extents). Returns the updated bitmap so the caller can
+    /// persist it. The inode write is deferred to the caller too —
+    /// they orchestrate the sync order.
+    ///
+    /// The directory's size field is updated in `dir_inode` (in
+    /// memory). Caller must `write_inode(dir_inode)` after.
+    ///
+    /// Naming rules: rejects empty names, names containing '/' or NUL,
+    /// and names longer than 255 bytes. Does NOT enforce uniqueness;
+    /// callers check `find_in_dir` first.
+    pub(crate) fn dir_insert(
+        &mut self,
+        dir_inode: &mut EfsInode,
+        bm: &mut [u8],
+        name: &[u8],
+        child_inum: u32,
+    ) -> Result<(), FilesystemError> {
+        validate_name(name)?;
+        if !dir_inode.is_dir() {
+            return Err(FilesystemError::InvalidData(format!(
+                "EFS dir_insert: inum {} is not a directory (mode=0o{:o})",
+                dir_inode.inum, dir_inode.mode
+            )));
+        }
+        let new_entry = DirEntry {
+            inum: child_inum,
+            name: name.to_vec(),
+        };
+
+        // Try to append to an existing dirblock that has room.
+        let mut extents: Vec<EfsExtent> = dir_inode
+            .extents
+            .iter()
+            .take(dir_inode.numextents as usize)
+            .copied()
+            .collect();
+        extents.sort_by_key(|e| e.offset);
+
+        for ext in &extents {
+            for i in 0..ext.length as u32 {
+                let bn = ext.bn + i;
+                let block = self.read_block(bn)?;
+                let mut entries = parse_dir_block(&block);
+                entries.push(new_entry.clone());
+                if let Some(new_block) = serialize_dir_block(&entries) {
+                    self.write_block(bn, &new_block)?;
+                    return Ok(());
+                }
+                // No room in this block — try the next.
+            }
+        }
+
+        // Every existing dirblock is full. Allocate one more.
+        if dir_inode.numextents as usize >= EFS_DIRECTEXTENTS {
+            return Err(FilesystemError::DiskFull(format!(
+                "EFS dir_insert: directory inum {} already has {} extents (max {}); \
+                 directory cannot grow further on this volume",
+                dir_inode.inum, dir_inode.numextents, EFS_DIRECTEXTENTS
+            )));
+        }
+        let new_ext = Self::alloc_contiguous_in_bitmap(bm, 1, 0)?;
+        // Initialize the new block with just our single entry.
+        let init =
+            serialize_dir_block(&[new_entry]).expect("single entry always fits in 512 bytes");
+        self.write_block(new_ext.bn, &init)?;
+        // Append to the inode's extent list. `offset` is the next
+        // logical block in the directory's address space.
+        let next_logical_offset = extents
+            .iter()
+            .map(|e| e.offset + e.length as u32)
+            .max()
+            .unwrap_or(0);
+        let extent = EfsExtent {
+            magic: 0,
+            bn: new_ext.bn,
+            length: 1,
+            offset: next_logical_offset,
+        };
+        let slot = dir_inode.numextents as usize;
+        dir_inode.extents[slot] = extent;
+        dir_inode.numextents += 1;
+        dir_inode.size = dir_inode.size.saturating_add(EFS_BLOCKSIZE as u32);
+        Ok(())
+    }
+
+    /// Remove the dirent named `name` from `dir_inum`. Returns the
+    /// child inum on success, or NotFound if absent. The block is
+    /// re-serialized after the removal, compacting any gaps left by
+    /// previous deletions. The dir inode's `size` is not changed
+    /// (blocks stay allocated until a future compaction pass).
+    pub(crate) fn dir_remove(
+        &mut self,
+        dir_inode: &EfsInode,
+        name: &[u8],
+    ) -> Result<u32, FilesystemError> {
+        if !dir_inode.is_dir() {
+            return Err(FilesystemError::InvalidData(format!(
+                "EFS dir_remove: inum {} is not a directory",
+                dir_inode.inum
+            )));
+        }
+        let mut extents: Vec<EfsExtent> = dir_inode
+            .extents
+            .iter()
+            .take(dir_inode.numextents as usize)
+            .copied()
+            .collect();
+        extents.sort_by_key(|e| e.offset);
+
+        for ext in &extents {
+            for i in 0..ext.length as u32 {
+                let bn = ext.bn + i;
+                let block = self.read_block(bn)?;
+                let mut entries = parse_dir_block(&block);
+                if let Some(pos) = entries.iter().position(|e| e.name == name) {
+                    let removed = entries.remove(pos);
+                    let new_block =
+                        serialize_dir_block(&entries).expect("removal only shrinks the block");
+                    self.write_block(bn, &new_block)?;
+                    return Ok(removed.inum);
+                }
+            }
+        }
+        Err(FilesystemError::NotFound(format!(
+            "EFS dir_remove: name not found in dir inum {}",
+            dir_inode.inum
+        )))
+    }
+
+    /// Look up `name` in `dir_inum`. Returns the child inum if found.
+    pub(crate) fn dir_find(
+        &mut self,
+        dir_inode: &EfsInode,
+        name: &[u8],
+    ) -> Result<Option<u32>, FilesystemError> {
+        let mut extents: Vec<EfsExtent> = dir_inode
+            .extents
+            .iter()
+            .take(dir_inode.numextents as usize)
+            .copied()
+            .collect();
+        extents.sort_by_key(|e| e.offset);
+        for ext in &extents {
+            for i in 0..ext.length as u32 {
+                let bn = ext.bn + i;
+                let block = self.read_block(bn)?;
+                let entries = parse_dir_block(&block);
+                if let Some(e) = entries.iter().find(|e| e.name == name) {
+                    return Ok(Some(e.inum));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Write the primary superblock (sector 1) AND the replica
     /// (`sb.replsb`). Both are written from the in-memory `self.sb`.
     /// The primary write is the commit point — callers should
@@ -653,6 +841,95 @@ impl<R: Read + Write + Seek + Send> EfsFilesystem<R> {
         self.reader.write_all(&primary_sector)?;
         Ok(())
     }
+}
+
+/// One directory entry decoded from a dirblock. `name` is the raw
+/// 8-bit bytes — EFS made no Unicode promises and we round-trip them
+/// verbatim.
+#[derive(Debug, Clone)]
+pub(crate) struct DirEntry {
+    pub inum: u32,
+    pub name: Vec<u8>,
+}
+
+/// Parse one 512-byte directory block into a Vec of entries in slot
+/// order. Skips zero slot bytes. Returns an empty Vec on bad magic so
+/// callers can decide whether to treat that as corruption or
+/// uninitialized.
+pub(crate) fn parse_dir_block(buf: &[u8; EFS_BLOCKSIZE as usize]) -> Vec<DirEntry> {
+    let magic = BigEndian::read_u16(&buf[0..2]);
+    if magic != EFS_DIRBLK_MAGIC {
+        return Vec::new();
+    }
+    let slots = buf[3] as usize;
+    let max_slots = (EFS_BLOCKSIZE as usize - EFS_DIRBLK_HEADERSIZE).min(slots);
+    let mut out: Vec<DirEntry> = Vec::new();
+    for slot in 0..max_slots {
+        let raw = buf[EFS_DIRBLK_HEADERSIZE + slot];
+        if raw == 0 {
+            continue;
+        }
+        let off = (raw as usize) << 1;
+        if off + 5 > EFS_BLOCKSIZE as usize {
+            continue;
+        }
+        let inum = BigEndian::read_u32(&buf[off..off + 4]);
+        let namelen = buf[off + 4] as usize;
+        if namelen == 0 || off + 5 + namelen > EFS_BLOCKSIZE as usize {
+            continue;
+        }
+        out.push(DirEntry {
+            inum,
+            name: buf[off + 5..off + 5 + namelen].to_vec(),
+        });
+    }
+    out
+}
+
+/// Serialize `entries` into a fresh 512-byte directory block. Returns
+/// `None` when the entries don't fit — caller must split / spill into
+/// the next dirblock. Dirents are laid out from the top of the block
+/// downward; the slot table starts at byte 4 and grows up. Each
+/// dirent occupies `align_up_even(5 + namelen)` bytes.
+pub(crate) fn serialize_dir_block(entries: &[DirEntry]) -> Option<[u8; EFS_BLOCKSIZE as usize]> {
+    let mut buf = [0u8; EFS_BLOCKSIZE as usize];
+    BigEndian::write_u16(&mut buf[0..2], EFS_DIRBLK_MAGIC);
+    let n = entries.len();
+    if n > 255 {
+        return None;
+    }
+    // Compute total dirent bytes, plus 4 header + n slot bytes.
+    let mut dirent_bytes: usize = 0;
+    for e in entries {
+        if e.name.len() > 255 {
+            return None;
+        }
+        let raw = 5 + e.name.len();
+        dirent_bytes += (raw + 1) & !1; // round up to even
+    }
+    let slot_table_end = EFS_DIRBLK_HEADERSIZE + n;
+    if slot_table_end + dirent_bytes > EFS_BLOCKSIZE as usize {
+        return None;
+    }
+    // Lay out dirents from byte 512 downward.
+    let mut cursor = EFS_BLOCKSIZE as usize;
+    let mut firstused = 0u8;
+    for (i, e) in entries.iter().enumerate() {
+        let dirent_len = (5 + e.name.len() + 1) & !1;
+        let start = cursor - dirent_len;
+        BigEndian::write_u32(&mut buf[start..start + 4], e.inum);
+        buf[start + 4] = e.name.len() as u8;
+        buf[start + 5..start + 5 + e.name.len()].copy_from_slice(&e.name);
+        // Even-padding byte (if any) stays 0 from buf init.
+        buf[EFS_DIRBLK_HEADERSIZE + i] = (start >> 1) as u8;
+        cursor = start;
+        if firstused == 0 || ((start >> 1) as u8) < firstused {
+            firstused = (start >> 1) as u8;
+        }
+    }
+    buf[2] = firstused;
+    buf[3] = n as u8;
+    Some(buf)
 }
 
 /// Decode one EFS directory block. Each block is 512 bytes with a 4-byte
@@ -1012,6 +1289,31 @@ fn read_at_aligned<R: Read + Seek>(
             )));
         }
         filled += n;
+    }
+    Ok(())
+}
+
+/// Per the EFS conventions used by IRIX `mkfs_efs`, file names are
+/// 8-bit clean Unix bytes up to 255 bytes long with no embedded NUL
+/// or '/'. Empty names are rejected. This matches IRIX `link(2)`
+/// semantics.
+#[allow(dead_code)] // wired up in EFS Slice 4 (dir_insert) callers
+pub(crate) fn validate_name(name: &[u8]) -> Result<(), FilesystemError> {
+    if name.is_empty() {
+        return Err(FilesystemError::InvalidData(
+            "EFS: empty name is not allowed".into(),
+        ));
+    }
+    if name.len() > 255 {
+        return Err(FilesystemError::InvalidData(format!(
+            "EFS: name length {} exceeds 255",
+            name.len()
+        )));
+    }
+    if name.iter().any(|&b| b == 0 || b == b'/') {
+        return Err(FilesystemError::InvalidData(
+            "EFS: name contains NUL or '/'".into(),
+        ));
     }
     Ok(())
 }
@@ -1621,6 +1923,213 @@ mod tests {
         }
         let err = fs.allocate_inode().expect_err("expected DiskFull");
         assert!(matches!(err, FilesystemError::DiskFull(_)), "got {err:?}");
+    }
+
+    /// Build a synthetic EFS image whose root inode (2) is a directory
+    /// with one allocated dirblock at disk block 25. Bitmap covers
+    /// `total_blocks` blocks; blocks 0,1,2 (boot/sb/bitmap), 18..20
+    /// (inode region), and 25 (root dirblock) are marked in-use.
+    fn build_synthetic_with_root_dir() -> Vec<u8> {
+        let mut img = vec![0u8; 256 * 512];
+        let sb_off = 512;
+        let total_blocks = (img.len() / 512) as u32;
+        let sb = EfsSuperblock {
+            fs_size: total_blocks,
+            firstcg: 18,
+            cgfsize: 64,
+            cgisize: 2,
+            sectors: 63,
+            heads: 1,
+            ncg: 1,
+            dirty: 0,
+            fs_time: 0,
+            magic: EFS_MAGIC_OLD,
+            fname: *b"dirtst",
+            fpack: *b"dirtst",
+            bmsize: 32,
+            tfree: 0,
+            tinode: 0,
+            bmblock: 2,
+            replsb: total_blocks - 1,
+            lastialloc: 2,
+            checksum: 0,
+        };
+        sb.write_into(&mut img[sb_off..sb_off + EFS_SUPERBLOCK_SIZE]);
+
+        // Bitmap: mark in-use bits.
+        let bm_off = 2 * 512;
+        for b in [0u32, 1, 2, 18, 19, 25, total_blocks - 1] {
+            let by = (b / 8) as usize;
+            let bb = 7 - (b % 8);
+            img[bm_off + by] |= 1 << bb;
+        }
+
+        // Root inode (2) at byte (firstcg=18)*512 + 2*128.
+        let ino2_off = 18 * 512 + 2 * 128;
+        let root = EfsInode {
+            inum: 2,
+            mode: 0o040755,
+            nlink: 2,
+            uid: 0,
+            gid: 0,
+            size: 512,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+            gen: 0,
+            numextents: 1,
+            version: 0,
+            extents: {
+                let mut e = [EfsExtent {
+                    magic: 0,
+                    bn: 0,
+                    length: 0,
+                    offset: 0,
+                }; EFS_DIRECTEXTENTS];
+                e[0] = EfsExtent {
+                    magic: 0,
+                    bn: 25,
+                    length: 1,
+                    offset: 0,
+                };
+                e
+            },
+        };
+        let mut slot = [0u8; 128];
+        root.write_into(&mut slot);
+        img[ino2_off..ino2_off + 128].copy_from_slice(&slot);
+
+        // Root dirblock at block 25: empty for now (no entries).
+        let mut dirblk = [0u8; EFS_BLOCKSIZE as usize];
+        BigEndian::write_u16(&mut dirblk[0..2], EFS_DIRBLK_MAGIC);
+        dirblk[2] = 0;
+        dirblk[3] = 0;
+        img[25 * 512..26 * 512].copy_from_slice(&dirblk);
+
+        img
+    }
+
+    #[test]
+    fn dir_insert_then_find_round_trip() {
+        let img = build_synthetic_with_root_dir();
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let mut root = fs.read_inode(2).expect("root");
+        let mut bm = fs.read_bitmap().expect("bm");
+
+        fs.dir_insert(&mut root, &mut bm, b"hello", 17)
+            .expect("insert");
+        fs.dir_insert(&mut root, &mut bm, b"world", 18)
+            .expect("insert");
+
+        // Persist the inode so subsequent reads via inode-2 see the
+        // new entries; bitmap unchanged here because we appended to
+        // the existing dirblock.
+        fs.write_inode(&root).expect("write inode");
+
+        let h = fs.dir_find(&root, b"hello").expect("find").expect("found");
+        assert_eq!(h, 17);
+        let w = fs.dir_find(&root, b"world").expect("find").expect("found");
+        assert_eq!(w, 18);
+        let none = fs.dir_find(&root, b"missing").expect("find");
+        assert_eq!(none, None);
+    }
+
+    #[test]
+    fn dir_remove_returns_inum_and_drops_entry() {
+        let img = build_synthetic_with_root_dir();
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let mut root = fs.read_inode(2).expect("root");
+        let mut bm = fs.read_bitmap().expect("bm");
+        fs.dir_insert(&mut root, &mut bm, b"one", 10).expect("ins");
+        fs.dir_insert(&mut root, &mut bm, b"two", 11).expect("ins");
+        let removed = fs.dir_remove(&root, b"one").expect("remove");
+        assert_eq!(removed, 10);
+        assert_eq!(fs.dir_find(&root, b"one").unwrap(), None);
+        assert_eq!(fs.dir_find(&root, b"two").unwrap(), Some(11));
+        // Remove again returns NotFound.
+        let err = fs.dir_remove(&root, b"one").expect_err("not found");
+        assert!(matches!(err, FilesystemError::NotFound(_)));
+    }
+
+    #[test]
+    fn dir_insert_grows_to_new_block_when_first_full() {
+        let img = build_synthetic_with_root_dir();
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let mut root = fs.read_inode(2).expect("root");
+        let mut bm = fs.read_bitmap().expect("bm");
+
+        // Fill the first dirblock with as many small entries as fit.
+        // Each entry: 5 + 3 = 8 bytes dirent + 1 slot byte = 9 bytes;
+        // 4 header bytes + 9 * N <= 512 → N <= 56.
+        let mut inserted = 0usize;
+        for i in 0..200u32 {
+            let name = format!("f{i:03}").into_bytes();
+            match fs.dir_insert(&mut root, &mut bm, &name, 100 + i) {
+                Ok(()) => inserted += 1,
+                Err(_) => break,
+            }
+            // Stop once we've forced a second extent.
+            if root.numextents > 1 {
+                inserted += 1;
+                continue;
+            }
+        }
+        assert!(
+            root.numextents >= 2,
+            "expected dir growth: only {} entries inserted, numextents={}",
+            inserted,
+            root.numextents
+        );
+        // The bitmap must reflect the new dirblock allocation.
+        fs.write_bitmap(&bm).expect("flush bitmap");
+        fs.write_inode(&root).expect("write inode");
+
+        // Re-open and verify a few entries land.
+        let reopened_img = fs.reader.into_inner();
+        let mut fs2 = EfsFilesystem::open(Cursor::new(reopened_img), 0).expect("reopen");
+        let root2 = fs2.read_inode(2).expect("root2");
+        assert!(root2.numextents >= 2);
+        let found = fs2
+            .dir_find(&root2, b"f005")
+            .expect("find")
+            .expect("present");
+        assert_eq!(found, 105);
+    }
+
+    #[test]
+    fn validate_name_rejects_bad_input() {
+        assert!(validate_name(b"").is_err());
+        assert!(validate_name(b"a/b").is_err());
+        assert!(validate_name(b"a\0b").is_err());
+        assert!(validate_name(&[b'x'; 256]).is_err());
+        assert!(validate_name(b"good_name").is_ok());
+        // 255-byte name is the boundary.
+        assert!(validate_name(&[b'y'; 255]).is_ok());
+    }
+
+    #[test]
+    fn parse_then_serialize_dir_block_round_trips() {
+        let entries = vec![
+            DirEntry {
+                inum: 2,
+                name: b".".to_vec(),
+            },
+            DirEntry {
+                inum: 2,
+                name: b"..".to_vec(),
+            },
+            DirEntry {
+                inum: 17,
+                name: b"hello".to_vec(),
+            },
+        ];
+        let block = serialize_dir_block(&entries).expect("serialize");
+        let parsed = parse_dir_block(&block);
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].name, b".");
+        assert_eq!(parsed[1].name, b"..");
+        assert_eq!(parsed[2].name, b"hello");
+        assert_eq!(parsed[2].inum, 17);
     }
 
     #[test]
