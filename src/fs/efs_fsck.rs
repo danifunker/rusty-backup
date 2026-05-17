@@ -1,6 +1,8 @@
-//! EFS integrity verifier. Read-only — no repair. Used both as a
-//! standalone check (via `Filesystem::fsck`) and as the final sanity
-//! pass after every grow/shrink before the new superblock is sealed.
+//! EFS integrity verifier. Used both as a standalone check (via
+//! `Filesystem::fsck`) and as the final sanity pass after every
+//! grow/shrink before the new superblock is sealed. The companion
+//! repair driver lives in `efs.rs::repair_efs` (called from
+//! `EditableFilesystem::repair`).
 //!
 //! Checks (in order):
 //!   1. Superblock geometry sanity (firstcg + ncg * cgfsize <= fs_size,
@@ -11,13 +13,16 @@
 //!      numextents <= 12, no extent has a non-zero `magic` byte, and
 //!      every extent's [bn, bn+length) lies inside [0, fs_size).
 //!   4. Bitmap shadow: count set bits, compare against the sum of all
-//!      in-use inodes' allocated extents (+ the reserved-region blocks
-//!      that should always be in-use: block 0, primary SB, bitmap
-//!      blocks, inode-table blocks). Flag double-allocations.
+//!      in-use inodes' allocated extents. Flag double-allocations.
+//!   5. Connectivity: BFS from root inum 2; any mode!=0 inode outside
+//!      the reachable set is reported as `OrphanInode` and pushed into
+//!      `orphaned_entries` so the repair pass can adopt them into
+//!      `lost+found/`.
 //!
-//! Connectivity/directory checks are deferred to a future "Phase 6"
-//! repair-capable fsck — for the resize verifier the geometry +
-//! bitmap consistency above is what we need.
+//! Repairable codes (handled by `repair_efs`): Replica*Mismatch,
+//! BitmapMissingAllocation, OrphanInode. Unrepairable codes
+//! (geometry damage, ExtentPastVolume, DoubleAllocation, TooManyExtents,
+//! BitmapTooSmall, InodeReadFailed) are surfaced for diagnosis only.
 
 use std::collections::HashSet;
 use std::io::{Read, Seek};
