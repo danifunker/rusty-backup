@@ -10,7 +10,7 @@
 //! - `~/xfs-efs/refs/efs-linux-5.15/efs/` — Linux kernel v5.15 EFS sources.
 //! - `docs/SGI_Filesystems.md` — implementation plan and on-disk notes.
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use byteorder::{BigEndian, ByteOrder};
 
@@ -329,6 +329,21 @@ impl<R: Read + Seek + Send> EfsFilesystem<R> {
         Ok(EfsInode::parse(inum, &ino_buf))
     }
 
+    /// Resolve the effective disk-block number of the free-space
+    /// bitmap. When `sb.bmblock` is non-zero, trust it. Some
+    /// IRIX-formatted images (notably the IRIX 5.3 fixture) write
+    /// `fs_bmblock = 0` because the kernel read driver never consults
+    /// the field — by convention in those images the bitmap lives
+    /// immediately after the primary superblock, i.e. at disk block 2.
+    #[allow(dead_code)] // wired up in EFS Slice 5 (EditableFilesystem impl)
+    pub(crate) fn effective_bmblock(&self) -> u32 {
+        if self.sb.bmblock != 0 {
+            self.sb.bmblock
+        } else {
+            2
+        }
+    }
+
     /// Read one 512-byte directory block at disk block `bn`. Returns a flag
     /// indicating whether the block was successfully fetched and had a valid
     /// magic; truncated/missing blocks produce `Ok(None)` so callers can
@@ -354,6 +369,169 @@ impl<R: Read + Seek + Send> EfsFilesystem<R> {
             }
             Err(e) => Err(e),
         }
+    }
+}
+
+/// Editable / mutation primitives. Bounded by `R: Write` so the same
+/// `EfsFilesystem` type stays usable for read-only callers without
+/// pulling them into the writable surface.
+///
+/// Bitmap convention used here: 1 bit per disk block over the range
+/// `[0 .. bmsize * 8)`. **Set bit = block in use**, cleared bit = free.
+/// The bitmap covers the entire volume, with inode-table and reserved
+/// regions force-marked in-use by mkfs_efs; allocation simply respects
+/// the existing 1-bits. Block 0 (volume header) and block 1 (primary
+/// SB) are also marked in-use by convention.
+#[allow(dead_code)] // wired up across EFS Slices 3–8
+impl<R: Read + Write + Seek + Send> EfsFilesystem<R> {
+    /// Read the full free-space bitmap into memory. Size is exactly
+    /// `sb.bmsize` bytes, rounded up to a 512-byte sector boundary for
+    /// the underlying I/O.
+    pub(crate) fn read_bitmap(&mut self) -> Result<Vec<u8>, FilesystemError> {
+        let bmsize = self.sb.bmsize as usize;
+        if bmsize == 0 {
+            return Err(FilesystemError::InvalidData(
+                "EFS bitmap size is 0 — superblock not initialized for mutation".into(),
+            ));
+        }
+        let sectors = bmsize.div_ceil(EFS_BLOCKSIZE as usize);
+        let mut buf = vec![0u8; sectors * EFS_BLOCKSIZE as usize];
+        let off = self.partition_offset + self.effective_bmblock() as u64 * EFS_BLOCKSIZE;
+        read_at_aligned(
+            &mut self.reader,
+            off,
+            (sectors * EFS_BLOCKSIZE as usize) as u64,
+            &mut buf,
+        )?;
+        buf.truncate(bmsize);
+        Ok(buf)
+    }
+
+    /// Write the free-space bitmap back to its on-disk location. The
+    /// caller-supplied buffer must be `sb.bmsize` bytes long; the I/O
+    /// rounds up to whole sectors and zero-pads the trailing bytes of
+    /// the final sector if the bitmap isn't sector-aligned.
+    pub(crate) fn write_bitmap(&mut self, bm: &[u8]) -> Result<(), FilesystemError> {
+        let bmsize = self.sb.bmsize as usize;
+        if bm.len() != bmsize {
+            return Err(FilesystemError::InvalidData(format!(
+                "write_bitmap: buffer is {} bytes, expected {bmsize}",
+                bm.len()
+            )));
+        }
+        let sectors = bmsize.div_ceil(EFS_BLOCKSIZE as usize);
+        let mut padded = vec![0u8; sectors * EFS_BLOCKSIZE as usize];
+        padded[..bmsize].copy_from_slice(bm);
+        let off = self.partition_offset + self.effective_bmblock() as u64 * EFS_BLOCKSIZE;
+        self.reader.seek(SeekFrom::Start(off))?;
+        self.reader.write_all(&padded)?;
+        Ok(())
+    }
+
+    /// Allocate a contiguous run of `want_blocks` free disk blocks via
+    /// a first-fit scan over the bitmap. Returns one extent (always
+    /// contiguous on disk by construction) and marks the bits as
+    /// in-use in `bm`. The caller is responsible for writing `bm` back
+    /// via `write_bitmap` once all allocation decisions are made.
+    ///
+    /// EFS supports up to 12 extents per inode. Callers that need
+    /// non-contiguous space across multiple extents should call this
+    /// repeatedly with smaller `want_blocks` and watch the 12-extent
+    /// ceiling themselves.
+    pub(crate) fn alloc_contiguous_in_bitmap(
+        bm: &mut [u8],
+        want_blocks: u32,
+        avoid_below: u32,
+    ) -> Result<EfsExtent, FilesystemError> {
+        if want_blocks == 0 {
+            return Err(FilesystemError::InvalidData(
+                "alloc_contiguous_in_bitmap: want_blocks must be > 0".into(),
+            ));
+        }
+        let total_bits = (bm.len() as u64) * 8;
+        let mut run_start: Option<u32> = None;
+        let mut run_len: u32 = 0;
+        for bit in 0..(total_bits as u32) {
+            if bit < avoid_below {
+                run_start = None;
+                run_len = 0;
+                continue;
+            }
+            let byte = (bit / 8) as usize;
+            let bit_in_byte = 7 - (bit % 8); // big-endian bit order, MSB first
+            let in_use = (bm[byte] >> bit_in_byte) & 1 == 1;
+            if in_use {
+                run_start = None;
+                run_len = 0;
+            } else {
+                if run_start.is_none() {
+                    run_start = Some(bit);
+                    run_len = 1;
+                } else {
+                    run_len += 1;
+                }
+                if run_len >= want_blocks {
+                    let start = run_start.unwrap();
+                    // Mark bits [start..start+want_blocks) as in-use.
+                    for b in start..start + want_blocks {
+                        let by = (b / 8) as usize;
+                        let bb = 7 - (b % 8);
+                        bm[by] |= 1 << bb;
+                    }
+                    return Ok(EfsExtent {
+                        magic: 0,
+                        bn: start,
+                        length: want_blocks as u8,
+                        offset: 0,
+                    });
+                }
+            }
+        }
+        Err(FilesystemError::DiskFull(format!(
+            "EFS: no contiguous run of {want_blocks} free blocks in bitmap"
+        )))
+    }
+
+    /// Mark a previously-allocated extent as free in the in-memory
+    /// bitmap. Caller writes the bitmap back via `write_bitmap`.
+    pub(crate) fn free_extent_in_bitmap(bm: &mut [u8], ext: &EfsExtent) {
+        let start = ext.bn;
+        let len = ext.length as u32;
+        for b in start..start + len {
+            let by = (b / 8) as usize;
+            if by >= bm.len() {
+                break;
+            }
+            let bb = 7 - (b % 8);
+            bm[by] &= !(1u8 << bb);
+        }
+    }
+
+    /// Write the primary superblock (sector 1) AND the replica
+    /// (`sb.replsb`). Both are written from the in-memory `self.sb`.
+    /// The primary write is the commit point — callers should
+    /// sequence: data → inodes → bitmap → replica → primary.
+    pub(crate) fn write_superblock_pair(&mut self) -> Result<(), FilesystemError> {
+        let mut primary_sector = [0u8; EFS_BLOCKSIZE as usize];
+        // Re-read the primary sector first so any pad/spare bytes the
+        // sector held outside our serializer's coverage are preserved.
+        read_at_aligned(
+            &mut self.reader,
+            self.partition_offset + EFS_BLOCKSIZE,
+            EFS_BLOCKSIZE,
+            &mut primary_sector,
+        )?;
+        self.sb.write_into(&mut primary_sector);
+
+        // Replica first — primary is the commit point.
+        let replica_off = self.partition_offset + self.sb.replsb as u64 * EFS_BLOCKSIZE;
+        self.reader.seek(SeekFrom::Start(replica_off))?;
+        self.reader.write_all(&primary_sector)?;
+
+        self.reader
+            .seek(SeekFrom::Start(self.partition_offset + EFS_BLOCKSIZE))?;
+        self.reader.write_all(&primary_sector)?;
+        Ok(())
     }
 }
 
@@ -1129,5 +1307,148 @@ mod tests {
         let mut streamed = Vec::new();
         fs.write_file_to(&entry, &mut streamed).unwrap();
         assert_eq!(streamed, data);
+    }
+
+    /// Build a synthetic EFS image with a writable bitmap of `bmsize`
+    /// bytes at block `bmblock`. Returns the image and the parsed
+    /// filesystem. Used by the Slice-2 allocator tests.
+    fn build_synthetic_for_bitmap_tests() -> Vec<u8> {
+        // Layout (sectors):
+        //   0: pad
+        //   1: superblock
+        //   2: bitmap (one sector = 4096 bits = up to 4096 data blocks)
+        //   3..18: pad to firstcg
+        //   18: CG 0 inode region start
+        //   etc.
+        let mut img = vec![0u8; 256 * 512];
+        let sb_off = 512;
+        let total_blocks = (img.len() / 512) as u32;
+        let sb = EfsSuperblock {
+            fs_size: total_blocks,
+            firstcg: 18,
+            cgfsize: 64,
+            cgisize: 2,
+            sectors: 63,
+            heads: 1,
+            ncg: 1,
+            dirty: 0,
+            fs_time: 0,
+            magic: EFS_MAGIC_OLD,
+            fname: *b"alloct",
+            fpack: *b"alloct",
+            bmsize: 32, // 32 bytes = 256 bits — covers `total_blocks`
+            tfree: 0,
+            tinode: 0,
+            bmblock: 2,
+            replsb: total_blocks - 1,
+            lastialloc: 0,
+            checksum: 0,
+        };
+        sb.write_into(&mut img[sb_off..sb_off + EFS_SUPERBLOCK_SIZE]);
+        // Mark blocks 0, 1 (boot, primary SB), 2 (bitmap), 18..20 (CG 0
+        // inode region) as in-use. Leave everything else free.
+        let bm_off = 2 * 512;
+        let in_use_blocks = [0u32, 1, 2, 18, 19, total_blocks - 1];
+        for b in in_use_blocks {
+            let by = (b / 8) as usize;
+            let bb = 7 - (b % 8);
+            img[bm_off + by] |= 1 << bb;
+        }
+        img
+    }
+
+    #[test]
+    fn read_bitmap_round_trips_through_write_bitmap() {
+        let img = build_synthetic_for_bitmap_tests();
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let bm = fs.read_bitmap().expect("read bitmap");
+        assert_eq!(bm.len(), fs.sb.bmsize as usize);
+        // Block 0 bit must be set; block 100 (well inside the free
+        // region of the synthetic) must be clear.
+        assert!(bm[0] & 0b1000_0000 != 0, "block 0 must be marked in-use");
+        assert!(bm[100 / 8] & (1 << (7 - (100 % 8))) == 0, "block 100 free");
+        // Round-trip: write back and re-read; expect identical bytes.
+        let mut bm2 = bm.clone();
+        bm2[5] = 0xFF;
+        fs.write_bitmap(&bm2).expect("write bitmap");
+        let bm3 = fs.read_bitmap().expect("re-read bitmap");
+        assert_eq!(bm3, bm2);
+    }
+
+    #[test]
+    fn alloc_contiguous_finds_first_fit_and_marks_in_use() {
+        let img = build_synthetic_for_bitmap_tests();
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let mut bm = fs.read_bitmap().unwrap();
+        let ext = EfsFilesystem::<Cursor<Vec<u8>>>::alloc_contiguous_in_bitmap(&mut bm, 4, 20)
+            .expect("alloc 4 blocks");
+        // First-fit with avoid_below=20 in the synthetic gives bn=20
+        // (block 19 is in-use; 20..23 are free).
+        assert_eq!(ext.bn, 20);
+        assert_eq!(ext.length, 4);
+        // The bits should now read as in-use.
+        for b in 20..24 {
+            let by = (b / 8) as usize;
+            let bb = 7 - (b % 8);
+            assert!(bm[by] & (1 << bb) != 0, "block {b} not marked");
+        }
+        // A second alloc starts past the run we just took.
+        let ext2 = EfsFilesystem::<Cursor<Vec<u8>>>::alloc_contiguous_in_bitmap(&mut bm, 2, 20)
+            .expect("alloc 2 more");
+        assert_eq!(ext2.bn, 24);
+    }
+
+    #[test]
+    fn alloc_contiguous_errors_when_no_run_fits() {
+        // 256-bit bitmap with everything in-use except a single block
+        // at index 50 — request for 4 contiguous blocks must fail.
+        let mut bm = vec![0xFFu8; 32];
+        let b = 50usize;
+        bm[b / 8] &= !(1 << (7 - (b % 8)));
+        let err = EfsFilesystem::<Cursor<Vec<u8>>>::alloc_contiguous_in_bitmap(&mut bm, 4, 0)
+            .expect_err("expected DiskFull");
+        assert!(matches!(err, FilesystemError::DiskFull(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn free_extent_returns_blocks_to_pool() {
+        let mut bm = vec![0u8; 32];
+        // Mark blocks 8..16 in-use.
+        let ext = EfsExtent {
+            magic: 0,
+            bn: 8,
+            length: 8,
+            offset: 0,
+        };
+        for b in ext.bn..ext.bn + ext.length as u32 {
+            bm[(b / 8) as usize] |= 1 << (7 - (b % 8));
+        }
+        EfsFilesystem::<Cursor<Vec<u8>>>::free_extent_in_bitmap(&mut bm, &ext);
+        for b in ext.bn..ext.bn + ext.length as u32 {
+            let by = (b / 8) as usize;
+            let bb = 7 - (b % 8);
+            assert!(bm[by] & (1 << bb) == 0, "block {b} still in-use after free");
+        }
+    }
+
+    #[test]
+    fn write_superblock_pair_updates_primary_and_replica() {
+        let img = build_synthetic_for_bitmap_tests();
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        // Bump tfree to a distinctive sentinel and write.
+        fs.sb.tfree = 0xDEAD_BEEF;
+        fs.write_superblock_pair().expect("write sb pair");
+
+        // Re-read primary by opening again from the now-mutated buffer.
+        let bytes = fs.reader.into_inner();
+        let mut fs2 = EfsFilesystem::open(Cursor::new(bytes.clone()), 0).expect("reopen");
+        assert_eq!(fs2.sb.tfree, 0xDEAD_BEEF);
+
+        // Replica must also carry the new tfree.
+        let replica_off = fs2.sb.replsb as usize * 512;
+        let replica =
+            EfsSuperblock::parse(&bytes[replica_off..replica_off + 92]).expect("parse replica");
+        assert_eq!(replica.tfree, 0xDEAD_BEEF);
+        assert_eq!(replica.fs_size, fs2.sb.fs_size);
     }
 }
