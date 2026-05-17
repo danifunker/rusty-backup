@@ -2,9 +2,15 @@
 //!
 //! Implements Steps 3 and 4 of the SGI Filesystem plan: superblock parsing,
 //! inode lookup, directory listing (recursive), file reads via inline
-//! extents, streaming writes, and symlink-target resolution. EFS has no
-//! indirect blocks — every file is bounded by 12 direct extents (max
-//! 12 * 16 MiB = 192 MiB per file).
+//! extents, streaming writes, and symlink-target resolution.
+//!
+//! EFS stores up to 12 extents inline in the inode. When a file needs more
+//! than 12 extents, EFS switches to **indirect** mode: the inode's extent
+//! slots no longer describe data, they describe runs of disk blocks that
+//! themselves contain arrays of `efs_extent` records (64 per 512-byte
+//! block). `numextents` is the total data-extent count; `extents[0].offset`
+//! is hijacked to hold `direxts`, the number of inode slots actually used
+//! to point at indirect blocks. See Linux `fs/efs/inode.c::efs_map_block`.
 //!
 //! References:
 //! - `~/xfs-efs/refs/efs-linux-5.15/efs/` — Linux kernel v5.15 EFS sources.
@@ -419,6 +425,14 @@ impl<R: Read + Seek> EfsFilesystem<R> {
         self.reader
     }
 
+    pub(crate) fn raw_reader_mut(&mut self) -> &mut R {
+        &mut self.reader
+    }
+
+    pub(crate) fn partition_offset_value(&self) -> u64 {
+        self.partition_offset
+    }
+
     /// Read the bitmap via the read-only path. Used by fsck.
     /// Prefers `staged_bitmap` when present — this is what lets
     /// "fsck before sync" produce the correct verdict on the
@@ -529,11 +543,15 @@ impl<R: Read + Seek> EfsFilesystem<R> {
 /// pulling them into the writable surface.
 ///
 /// Bitmap convention used here: 1 bit per disk block over the range
-/// `[0 .. bmsize * 8)`. **Set bit = block in use**, cleared bit = free.
-/// The bitmap covers the entire volume, with inode-table and reserved
-/// regions force-marked in-use by mkfs_efs; allocation simply respects
-/// the existing 1-bits. Block 0 (volume header) and block 1 (primary
-/// SB) are also marked in-use by convention.
+/// `[0 .. bmsize * 8)`. **Set bit = block FREE**, cleared bit = in use.
+/// This matches the convention used by IRIX `mkfs_efs` on real disks
+/// (verified against a 2 GB SCSI volume — 97%+ of inode-claimed data
+/// blocks have their bitmap bit cleared, ~tfree blocks have it set).
+/// It is opposite to the convention used by FAT/NTFS/exFAT but matches
+/// our Amiga filesystems (AFFS/PFS3/SFS). The bitmap covers the entire
+/// volume, with inode-table and reserved regions force-marked in-use
+/// (bit=0) by mkfs_efs; allocation flips bits from 1→0. Block 0
+/// (volume header) and block 1 (primary SB) are marked in-use (bit=0).
 #[allow(dead_code)] // wired up across EFS Slices 3–8
 impl<R: Read + Write + Seek> EfsFilesystem<R> {
     /// Lazy-load the free-space bitmap into `staged_bitmap` and return
@@ -636,8 +654,9 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
             }
             let byte = (bit / 8) as usize;
             let bit_in_byte = 7 - (bit % 8); // big-endian bit order, MSB first
-            let in_use = (bm[byte] >> bit_in_byte) & 1 == 1;
-            if in_use {
+                                             // set bit = FREE on real IRIX EFS, so a free block is bit==1.
+            let free = (bm[byte] >> bit_in_byte) & 1 == 1;
+            if !free {
                 run_start = None;
                 run_len = 0;
             } else {
@@ -649,11 +668,11 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
                 }
                 if run_len >= want_blocks {
                     let start = run_start.unwrap();
-                    // Mark bits [start..start+want_blocks) as in-use.
+                    // Mark bits [start..start+want_blocks) as in-use (clear).
                     for b in start..start + want_blocks {
                         let by = (b / 8) as usize;
                         let bb = 7 - (b % 8);
-                        bm[by] |= 1 << bb;
+                        bm[by] &= !(1u8 << bb);
                     }
                     return Ok(EfsExtent {
                         magic: 0,
@@ -671,6 +690,7 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
 
     /// Mark a previously-allocated extent as free in the in-memory
     /// bitmap. Caller writes the bitmap back via `write_bitmap`.
+    /// Convention: set bit = free.
     pub(crate) fn free_extent_in_bitmap(bm: &mut [u8], ext: &EfsExtent) {
         let start = ext.bn;
         let len = ext.length as u32;
@@ -680,7 +700,7 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
                 break;
             }
             let bb = 7 - (b % 8);
-            bm[by] &= !(1u8 << bb);
+            bm[by] |= 1u8 << bb;
         }
     }
 
@@ -1433,12 +1453,13 @@ fn repair_efs<R: Read + Write + Seek + Send>(
             continue;
         }
         let bb = 7 - (blk % 8);
-        bm[by] |= 1 << bb;
+        // set bit = free; mark as in-use by CLEARING the bit.
+        bm[by] &= !(1 << bb);
         bitmap_fixes += 1;
     }
     if bitmap_fixes > 0 {
         report.fixes_applied.push(format!(
-            "Bitmap: set {bitmap_fixes} missing in-use bit(s) for inode-claimed blocks"
+            "Bitmap: cleared {bitmap_fixes} stray free bit(s) for inode-claimed blocks"
         ));
     }
 
@@ -1894,9 +1915,104 @@ impl<R: Read + Seek + Send> Filesystem for EfsFilesystem<R> {
     }
 }
 
-/// Walk the inline extents of `inode` and return up to `max_bytes` of file
-/// data. EFS has no indirect blocks: a file is bounded by 12 extents and the
-/// inode's `di_size` is the authoritative file length.
+/// Resolve an inode's data extents, handling both direct and indirect mode.
+///
+/// Direct mode (`numextents <= 12`): the inode's extent array holds data
+/// extents directly. Indirect mode (`numextents > 12`): `extents[0].offset`
+/// stores `direxts`, the number of inode slots that point at runs of
+/// indirect blocks; each indirect block packs up to 64 data-extent records.
+/// Returns the data extents in file (logical) order.
+pub(crate) fn resolve_data_extents<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    inode: &EfsInode,
+) -> Result<Vec<EfsExtent>, FilesystemError> {
+    let total = inode.numextents as usize;
+    if total <= EFS_DIRECTEXTENTS {
+        let mut out: Vec<EfsExtent> = inode.extents.iter().take(total).copied().collect();
+        out.sort_by_key(|e| e.offset);
+        return Ok(out);
+    }
+    let direxts = inode.extents[0].offset as usize;
+    if direxts == 0 || direxts > EFS_DIRECTEXTENTS {
+        return Err(FilesystemError::InvalidData(format!(
+            "EFS inode {} indirect mode: bad direxts={direxts} (numextents={total})",
+            inode.inum
+        )));
+    }
+    const EXTS_PER_BLOCK: usize = (EFS_BLOCKSIZE as usize) / 8;
+    let mut out: Vec<EfsExtent> = Vec::with_capacity(total);
+    let mut block_buf = [0u8; EFS_BLOCKSIZE as usize];
+    'collect: for dirslot in 0..direxts {
+        let ind = inode.extents[dirslot];
+        for blk in 0..ind.length as u32 {
+            let bn = ind.bn + blk;
+            read_at_aligned(
+                reader,
+                partition_offset + bn as u64 * EFS_BLOCKSIZE,
+                EFS_BLOCKSIZE,
+                &mut block_buf,
+            )?;
+            for slot in 0..EXTS_PER_BLOCK {
+                let off = slot * 8;
+                let raw: &[u8; 8] = (&block_buf[off..off + 8]).try_into().unwrap();
+                let ext = EfsExtent::parse(raw);
+                if ext.magic != 0 {
+                    return Err(FilesystemError::InvalidData(format!(
+                        "EFS inode {} indirect extent slot {slot} in block {bn}: bad magic 0x{:02X}",
+                        inode.inum, ext.magic
+                    )));
+                }
+                out.push(ext);
+                if out.len() == total {
+                    break 'collect;
+                }
+            }
+        }
+    }
+    if out.len() != total {
+        return Err(FilesystemError::InvalidData(format!(
+            "EFS inode {} indirect: collected {} of {total} extents",
+            inode.inum,
+            out.len()
+        )));
+    }
+    out.sort_by_key(|e| e.offset);
+    Ok(out)
+}
+
+/// Like `resolve_data_extents`, but also returns the indirect-block extents
+/// (the disk regions used to hold extent records in indirect mode). The
+/// `(data, indirect)` split lets callers like fsck and the resize bitmap
+/// walker account for every disk block claimed by an inode — both file
+/// content and the indirect-extent index blocks themselves. In direct
+/// mode the indirect vector is empty.
+pub(crate) fn resolve_owned_extents<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    inode: &EfsInode,
+) -> Result<(Vec<EfsExtent>, Vec<EfsExtent>), FilesystemError> {
+    if (inode.numextents as usize) <= EFS_DIRECTEXTENTS {
+        return Ok((
+            resolve_data_extents(reader, partition_offset, inode)?,
+            Vec::new(),
+        ));
+    }
+    let direxts = inode.extents[0].offset as usize;
+    if direxts == 0 || direxts > EFS_DIRECTEXTENTS {
+        return Err(FilesystemError::InvalidData(format!(
+            "EFS inode {} indirect mode: bad direxts={direxts}",
+            inode.inum
+        )));
+    }
+    let indirect: Vec<EfsExtent> = inode.extents.iter().take(direxts).copied().collect();
+    let data = resolve_data_extents(reader, partition_offset, inode)?;
+    Ok((data, indirect))
+}
+
+/// Walk the data extents of `inode` (direct or indirect) and return up to
+/// `max_bytes` of file data. The inode's `di_size` is the authoritative
+/// file length.
 fn read_inode_data<R: Read + Seek>(
     reader: &mut R,
     partition_offset: u64,
@@ -1909,13 +2025,7 @@ fn read_inode_data<R: Read + Seek>(
     if want == 0 {
         return Ok(out);
     }
-    let mut extents: Vec<EfsExtent> = inode
-        .extents
-        .iter()
-        .take(inode.numextents as usize)
-        .copied()
-        .collect();
-    extents.sort_by_key(|e| e.offset);
+    let extents = resolve_data_extents(reader, partition_offset, inode)?;
     let mut block_buf = [0u8; EFS_BLOCKSIZE as usize];
     'outer: for ext in &extents {
         for i in 0..ext.length as u32 {
@@ -1954,13 +2064,7 @@ fn stream_inode_data<R: Read + Seek>(
     if size == 0 {
         return Ok(0);
     }
-    let mut extents: Vec<EfsExtent> = inode
-        .extents
-        .iter()
-        .take(inode.numextents as usize)
-        .copied()
-        .collect();
-    extents.sort_by_key(|e| e.offset);
+    let extents = resolve_data_extents(reader, partition_offset, inode)?;
 
     const CHUNK_BLOCKS: u32 = 1024 * 1024 / EFS_BLOCKSIZE as u32; // 1 MiB
     let mut buf = vec![0u8; (CHUNK_BLOCKS as usize) * EFS_BLOCKSIZE as usize];
@@ -2501,14 +2605,18 @@ mod tests {
             checksum: 0,
         };
         sb.write_into(&mut img[sb_off..sb_off + EFS_SUPERBLOCK_SIZE]);
-        // Mark blocks 0, 1 (boot, primary SB), 2 (bitmap), 18..20 (CG 0
-        // inode region) as in-use. Leave everything else free.
+        // Bitmap convention: set bit = free, clear bit = in-use. Fill
+        // the bitmap region with 0xFF (all free), then CLEAR bits for
+        // boot, primary SB, bitmap, CG 0 inode region, and last block.
         let bm_off = 2 * 512;
+        for b in 0..sb.bmsize as usize {
+            img[bm_off + b] = 0xFF;
+        }
         let in_use_blocks = [0u32, 1, 2, 18, 19, total_blocks - 1];
         for b in in_use_blocks {
             let by = (b / 8) as usize;
             let bb = 7 - (b % 8);
-            img[bm_off + by] |= 1 << bb;
+            img[bm_off + by] &= !(1 << bb);
         }
         img
     }
@@ -2519,10 +2627,10 @@ mod tests {
         let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
         let bm = fs.read_bitmap().expect("read bitmap");
         assert_eq!(bm.len(), fs.sb.bmsize as usize);
-        // Block 0 bit must be set; block 100 (well inside the free
-        // region of the synthetic) must be clear.
-        assert!(bm[0] & 0b1000_0000 != 0, "block 0 must be marked in-use");
-        assert!(bm[100 / 8] & (1 << (7 - (100 % 8))) == 0, "block 100 free");
+        // Convention: set bit = free. Block 0 (boot) is in-use so bit
+        // is clear; block 100 (inside free region) has bit set.
+        assert!(bm[0] & 0b1000_0000 == 0, "block 0 must be marked in-use");
+        assert!(bm[100 / 8] & (1 << (7 - (100 % 8))) != 0, "block 100 free");
         // Round-trip: write back and re-read; expect identical bytes.
         let mut bm2 = bm.clone();
         bm2[5] = 0xFF;
@@ -2542,11 +2650,12 @@ mod tests {
         // (block 19 is in-use; 20..23 are free).
         assert_eq!(ext.bn, 20);
         assert_eq!(ext.length, 4);
-        // The bits should now read as in-use.
+        // The bits should now read as in-use (set bit = free, so
+        // in-use means bit is cleared).
         for b in 20..24 {
             let by = (b / 8) as usize;
             let bb = 7 - (b % 8);
-            assert!(bm[by] & (1 << bb) != 0, "block {b} not marked");
+            assert!(bm[by] & (1 << bb) == 0, "block {b} not marked");
         }
         // A second alloc starts past the run we just took.
         let ext2 = EfsFilesystem::<Cursor<Vec<u8>>>::alloc_contiguous_in_bitmap(&mut bm, 2, 20)
@@ -2558,9 +2667,10 @@ mod tests {
     fn alloc_contiguous_errors_when_no_run_fits() {
         // 256-bit bitmap with everything in-use except a single block
         // at index 50 — request for 4 contiguous blocks must fail.
-        let mut bm = vec![0xFFu8; 32];
+        // set bit = free; start fully in-use (all zeros) then set bit 50.
+        let mut bm = vec![0u8; 32];
         let b = 50usize;
-        bm[b / 8] &= !(1 << (7 - (b % 8)));
+        bm[b / 8] |= 1 << (7 - (b % 8));
         let err = EfsFilesystem::<Cursor<Vec<u8>>>::alloc_contiguous_in_bitmap(&mut bm, 4, 0)
             .expect_err("expected DiskFull");
         assert!(matches!(err, FilesystemError::DiskFull(_)), "got {err:?}");
@@ -2568,22 +2678,19 @@ mod tests {
 
     #[test]
     fn free_extent_returns_blocks_to_pool() {
+        // Start fully in-use (set bit = free; all zeros = all in-use).
         let mut bm = vec![0u8; 32];
-        // Mark blocks 8..16 in-use.
         let ext = EfsExtent {
             magic: 0,
             bn: 8,
             length: 8,
             offset: 0,
         };
-        for b in ext.bn..ext.bn + ext.length as u32 {
-            bm[(b / 8) as usize] |= 1 << (7 - (b % 8));
-        }
         EfsFilesystem::<Cursor<Vec<u8>>>::free_extent_in_bitmap(&mut bm, &ext);
         for b in ext.bn..ext.bn + ext.length as u32 {
             let by = (b / 8) as usize;
             let bb = 7 - (b % 8);
-            assert!(bm[by] & (1 << bb) == 0, "block {b} still in-use after free");
+            assert!(bm[by] & (1 << bb) != 0, "block {b} still in-use after free");
         }
     }
 
@@ -2690,12 +2797,15 @@ mod tests {
         };
         sb.write_into(&mut img[sb_off..sb_off + EFS_SUPERBLOCK_SIZE]);
 
-        // Bitmap: mark in-use bits.
+        // Bitmap: set bit = free. Fill with 0xFF, then clear in-use bits.
         let bm_off = 2 * 512;
+        for b in 0..sb.bmsize as usize {
+            img[bm_off + b] = 0xFF;
+        }
         for b in [0u32, 1, 2, 18, 19, 25, total_blocks - 1] {
             let by = (b / 8) as usize;
             let bb = 7 - (b % 8);
-            img[bm_off + by] |= 1 << bb;
+            img[bm_off + by] &= !(1 << bb);
         }
 
         // Root inode (2) at byte (firstcg=18)*512 + 2*128.
@@ -2977,14 +3087,15 @@ mod tests {
             .expect("create");
         EditableFilesystem::sync_metadata(&mut fs).expect("sync");
 
-        // Reach into the bitmap and clear the bit for the file's
-        // data block — fsck should flag it.
+        // Reach into the bitmap and SET the bit for the file's data
+        // block (set bit = free), forging a "free but inode-claimed"
+        // corruption — fsck should flag it as BitmapMissingAllocation.
         let file_ino = fs.read_inode(entry.location as u32).expect("ino");
         let data_blk = file_ino.extents[0].bn;
         let mut bm = fs.read_bitmap().expect("bm");
         let by = (data_blk / 8) as usize;
         let bb = 7 - (data_blk % 8);
-        bm[by] &= !(1u8 << bb);
+        bm[by] |= 1u8 << bb;
         fs.write_bitmap(&bm).expect("write bm");
 
         let before = super::super::efs_fsck::fsck_efs(&mut fs).expect("fsck");

@@ -28,7 +28,8 @@ use std::collections::HashSet;
 use std::io::{Read, Seek};
 
 use super::efs::{
-    parse_dir_block, EfsFilesystem, EfsSuperblock, EFS_BLOCKSIZE, EFS_DIRECTEXTENTS_MAX,
+    parse_dir_block, resolve_owned_extents, EfsExtent, EfsFilesystem, EfsSuperblock, EFS_BLOCKSIZE,
+    EFS_DIRECTEXTENTS_MAX,
 };
 use super::filesystem::FilesystemError;
 use super::fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry};
@@ -107,6 +108,39 @@ impl Builder {
     }
 }
 
+fn walk_extent(
+    b: &mut Builder,
+    allocated: &mut HashSet<u32>,
+    sb: &EfsSuperblock,
+    inum: u32,
+    ext: &EfsExtent,
+    label: &str,
+    idx: usize,
+) {
+    if ext.length == 0 {
+        return;
+    }
+    let end = ext.bn.saturating_add(ext.length as u32);
+    if end > sb.fs_size {
+        b.err(
+            "ExtentPastVolume",
+            format!(
+                "inode {inum} {label} extent {idx}: [{}..{}) extends past fs_size {}",
+                ext.bn, end, sb.fs_size
+            ),
+        );
+        return;
+    }
+    for blk in ext.bn..end {
+        if !allocated.insert(blk) {
+            b.err(
+                "DoubleAllocation",
+                format!("block {blk} (inode {inum} {label} extent {idx}) also allocated elsewhere"),
+            );
+        }
+    }
+}
+
 /// Run the verifier. Requires read-only access; the editable surface
 /// `R: Read + Write + Seek + Send` works fine here because all
 /// methods used are inherited from the read-only impl.
@@ -144,56 +178,42 @@ pub fn fsck_efs<R: Read + Seek>(fs: &mut EfsFilesystem<R>) -> Result<FsckResult,
         } else {
             b.files_checked += 1;
         }
-        if ino.numextents as usize > EFS_DIRECTEXTENTS_MAX {
-            b.err(
-                "TooManyExtents",
-                format!(
-                    "inode {inum} has numextents={} (max {EFS_DIRECTEXTENTS_MAX})",
-                    ino.numextents
-                ),
-            );
-        }
-        for i in 0..(ino.numextents as usize).min(EFS_DIRECTEXTENTS_MAX) {
-            let ext = ino.extents[i];
+        // Walk both data extents and (in indirect mode) the inode's
+        // indirect-block runs themselves — both occupy bitmap-tracked
+        // disk regions and both count toward this inode's allocation.
+        let pofs = fs.partition_offset_value();
+        let (data_exts, indirect_exts) =
+            match resolve_owned_extents(fs.raw_reader_mut(), pofs, &ino) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    b.err("IndirectExtentReadFailed", format!("inode {inum}: {e}"));
+                    continue;
+                }
+            };
+        for (i, ext) in data_exts.iter().enumerate() {
             if ext.magic != 0 {
                 b.err(
                     "ExtentBadMagic",
                     format!(
-                        "inode {inum} extent {i}: magic=0x{:02X} (expected 0)",
+                        "inode {inum} data extent {i}: magic=0x{:02X} (expected 0)",
                         ext.magic
                     ),
                 );
             }
-            if ext.length == 0 {
-                continue;
-            }
-            let end = ext.bn.saturating_add(ext.length as u32);
-            if end > sb.fs_size {
-                b.err(
-                    "ExtentPastVolume",
-                    format!(
-                        "inode {inum} extent {i}: [{}..{}) extends past fs_size {}",
-                        ext.bn, end, sb.fs_size
-                    ),
-                );
-                continue;
-            }
-            for blk in ext.bn..end {
-                if !allocated.insert(blk) {
-                    b.err(
-                        "DoubleAllocation",
-                        format!("block {blk} allocated to inode {inum} but also to another inode"),
-                    );
-                }
-            }
+            walk_extent(&mut b, &mut allocated, &sb, inum, ext, "data", i);
         }
+        for (i, ext) in indirect_exts.iter().enumerate() {
+            walk_extent(&mut b, &mut allocated, &sb, inum, ext, "indirect-index", i);
+        }
+        let _ = EFS_DIRECTEXTENTS_MAX;
     }
 
     if let Some(bm) = bitmap {
-        // Cross-check: every "in use" inode-claimed block should have
-        // its bitmap bit set. (We don't check the reverse — the bitmap
-        // legitimately marks inode-table + reserved regions as in-use
-        // and those don't show up in inode extents.)
+        // EFS bitmap convention: set bit = FREE, clear bit = in use. So
+        // every inode-claimed block should have its bit CLEARED. (We
+        // don't check the reverse: the bitmap legitimately marks
+        // inode-table + reserved regions as in-use (bit=0) too, and
+        // those don't show up in inode extents.)
         for blk in &allocated {
             let byte = (*blk / 8) as usize;
             if byte >= bm.len() {
@@ -208,16 +228,16 @@ pub fn fsck_efs<R: Read + Seek>(fs: &mut EfsFilesystem<R>) -> Result<FsckResult,
                 continue;
             }
             let bit = 7 - (blk % 8);
-            if bm[byte] & (1 << bit) == 0 {
+            if bm[byte] & (1 << bit) != 0 {
                 b.err(
                     "BitmapMissingAllocation",
-                    format!("inode-allocated block {blk} is not marked in-use in bitmap"),
+                    format!("inode-allocated block {blk} is marked free in bitmap"),
                 );
             }
         }
         let set_bits: u32 = bm.iter().map(|b| b.count_ones()).sum();
         b.extra
-            .push(("bitmap_set_bits".into(), set_bits.to_string()));
+            .push(("bitmap_free_bits".into(), set_bits.to_string()));
     } else {
         b.warn("BitmapReadFailed", "could not read bitmap".into());
     }
@@ -408,12 +428,17 @@ mod tests {
         };
         sb.write_into(&mut img[sb_off..sb_off + super::super::efs::EFS_SUPERBLOCK_SIZE]);
 
-        // Bitmap: blocks 0/1/2 + 18/19 (CG 0 inode region) + 25 (root dir) + last block.
+        // Bitmap convention: set bit = free. Fill with 0xFF (all free)
+        // then CLEAR bits for in-use blocks: 0/1/2, 18/19 (CG 0 inode
+        // region), 25 (root dir), and last block.
         let bm_off = 2 * 512;
+        for b in 0..sb.bmsize as usize {
+            img[bm_off + b] = 0xFF;
+        }
         for b in [0u32, 1, 2, 18, 19, 25, total_blocks - 1] {
             let by = (b / 8) as usize;
             let bb = 7 - (b % 8);
-            img[bm_off + by] |= 1 << bb;
+            img[bm_off + by] &= !(1 << bb);
         }
         // Mirror the primary SB into the replica slot.
         let replica_off = (total_blocks as usize - 1) * 512;

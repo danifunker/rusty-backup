@@ -133,7 +133,8 @@ pub fn grow_efs<R: Read + Write + Seek>(
                     break;
                 }
                 let bb = 7 - (blk % 8);
-                if bm[by] & (1u8 << bb) != 0 {
+                // set bit = free, so in-use means the bit is CLEAR.
+                if bm[by] & (1u8 << bb) == 0 {
                     return Err(FilesystemError::InvalidData(format!(
                         "EFS grow: cannot append new CG at block {cg_start}: \
                          inode-region block {blk} is already in use by a file. \
@@ -141,7 +142,7 @@ pub fn grow_efs<R: Read + Write + Seek>(
                          for now, fsck the volume and retry with a smaller increase."
                     )));
                 }
-                bm[by] |= 1u8 << bb; // reserve
+                bm[by] &= !(1u8 << bb); // reserve (mark in-use)
             }
         }
     }
@@ -158,7 +159,8 @@ pub fn grow_efs<R: Read + Write + Seek>(
     };
 
     // Mark the new tail blocks as free in the bitmap. Per the doc,
-    // any stale bits left over from prior shrink rounds get cleared.
+    // any stale bits left over from prior shrink rounds get reset to
+    // the "free" state. Convention: set bit = free.
     {
         let bm = fs.staged_bitmap_mut()?;
         for blk in old_size..new_size_blocks {
@@ -167,7 +169,7 @@ pub fn grow_efs<R: Read + Write + Seek>(
                 break;
             }
             let bb = 7 - (blk % 8);
-            bm[by] &= !(1u8 << bb);
+            bm[by] |= 1u8 << bb;
         }
     }
 
@@ -206,7 +208,8 @@ pub fn grow_efs<R: Read + Write + Seek>(
                     break;
                 }
                 let bb = 7 - (blk % 8);
-                bm[by] |= 1u8 << bb;
+                // set bit = free; mark inode region as in-use by clearing.
+                bm[by] &= !(1u8 << bb);
             }
         }
     }
@@ -310,20 +313,20 @@ fn relocate_bitmap<R: Read + Write + Seek>(
         new_bmsize_sectors
     ));
 
-    // Free old bitmap blocks.
+    // Free old bitmap blocks. Convention: set bit = free.
     for blk in old_bmblock..old_bmblock + old_bmsize_sectors {
         let by = (blk / 8) as usize;
         if by >= bm.len() {
             break;
         }
         let bb = 7 - (blk % 8);
-        bm[by] &= !(1u8 << bb);
+        bm[by] |= 1u8 << bb;
     }
 
     // Expand the in-memory buffer to the new bitmap size. New bytes
-    // default to 0 (all blocks free); the grow path's tail loop and
-    // CG-append step will set the appropriate bits before sync.
-    bm.resize(new_bmsize_bytes as usize, 0);
+    // default to 0xFF (all blocks free); the grow path's tail loop and
+    // CG-append step will clear bits for in-use blocks before sync.
+    bm.resize(new_bmsize_bytes as usize, 0xFF);
 
     let mut new_sb = sb.clone();
     new_sb.bmblock = new_bmblock;
@@ -375,10 +378,10 @@ pub fn shrink_efs_conservative<R: Read + Write + Seek>(
         )));
     }
 
-    // Clear the bits for blocks [new_size_blocks..old_size) in the
-    // bitmap (they're now outside the volume). The bitmap itself
-    // stays at its current location and keeps its current size — the
-    // surplus bits past new_size_blocks are simply unused.
+    // Reset the bits for blocks [new_size_blocks..old_size) in the
+    // bitmap to "free" (they're now outside the volume; mark them
+    // consistently so a later grow doesn't observe stray in-use bits).
+    // Convention: set bit = free.
     {
         let bm = fs.staged_bitmap_mut()?;
         for blk in new_size_blocks..old_size {
@@ -387,7 +390,7 @@ pub fn shrink_efs_conservative<R: Read + Write + Seek>(
                 break;
             }
             let bb = 7 - (blk % 8);
-            bm[by] &= !(1u8 << bb);
+            bm[by] |= 1u8 << bb;
         }
     }
 
@@ -693,8 +696,14 @@ pub fn compute_conservative_floor<R: Read + Seek>(
         if inode_block_end > highest {
             highest = inode_block_end;
         }
-        for i in 0..(ino.numextents as usize).min(EFS_DIRECTEXTENTS_MAX) {
-            let ext = ino.extents[i];
+        // For indirect-mode inodes (numextents > 12) the inode's own
+        // extent slots describe indirect index blocks rather than data;
+        // resolve_owned_extents returns both sets so the shrink floor
+        // covers every block that must survive truncation.
+        let pofs = fs.partition_offset_value();
+        let (data_exts, indirect_exts) =
+            super::efs::resolve_owned_extents(fs.raw_reader_mut(), pofs, &ino)?;
+        for ext in data_exts.iter().chain(indirect_exts.iter()) {
             if ext.length == 0 {
                 continue;
             }
@@ -704,6 +713,7 @@ pub fn compute_conservative_floor<R: Read + Seek>(
             }
         }
     }
+    let _ = EFS_DIRECTEXTENTS_MAX;
     Ok(highest)
 }
 
@@ -750,12 +760,17 @@ mod tests {
         };
         sb.write_into(&mut img[sb_off..sb_off + EFS_SUPERBLOCK_SIZE]);
 
-        // Bitmap: mark reserved-region bits.
+        // Bitmap: set bit = free, clear bit = in use (matches real
+        // IRIX EFS). Pre-fill `bmsize` bytes with 0xFF (all free), then
+        // CLEAR bits for reserved/in-use blocks.
         let bm_off = 2 * 512;
+        for b in 0..sb.bmsize as usize {
+            img[bm_off + b] = 0xFF;
+        }
         for b in [0u32, 1, 2, 3, 4, 18, 19, 25] {
             let by = (b / 8) as usize;
             let bb = 7 - (b % 8);
-            img[bm_off + by] |= 1 << bb;
+            img[bm_off + by] &= !(1 << bb);
         }
         // Root inode (2) — same shape as the efs.rs synthetic tests.
         let ino2_off = 18 * 512 + 2 * 128;

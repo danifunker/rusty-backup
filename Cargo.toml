@@ -14,6 +14,11 @@ resolver = "2"
 name = "rusty-backup"
 path = "src/main.rs"
 
+# Headless CLI binary — scripted image construction, no eframe dependency.
+[[bin]]
+name = "rusty-backup-cli"
+path = "src/bin/cli.rs"
+
 [[example]]
 name = "probe_hfs_btree"
 path = "example/probe_hfs_btree.rs"
@@ -35,6 +40,7 @@ egui = "0.34"
 rfd = { version = "0.17", default-features = false, features = ["gtk3"] }
 anyhow = "1"
 thiserror = "2"
+clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 byteorder = "1"

@@ -1,5 +1,6 @@
 pub mod backup;
 pub mod bulk_buf_reader;
+pub mod cli;
 pub mod clonezilla;
 pub mod device;
 pub mod error;
