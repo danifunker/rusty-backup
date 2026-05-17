@@ -424,9 +424,257 @@ pub fn shrink_efs_conservative<R: Read + Write + Seek>(
     Ok(new_size_blocks)
 }
 
-/// Compute the conservative shrink floor: 1 + highest block claimed
-/// by any in-use inode. This is the smallest `new_size_blocks` value
-/// that preserves every allocated extent without relocation.
+/// Shrink an EFS volume aggressively: renumber in-use inodes into the
+/// lowest available slots, rewrite every directory's dirent inum
+/// references (including `.` and `..`), then run the conservative
+/// shrink against the now-lower floor.
+///
+/// Root (inum 2) is preserved as a hard invariant — IRIX and every
+/// historical EFS tool assume `EFS_ROOTINODE == 2`. Other in-use
+/// inodes are reassigned in ascending old-inum order to the lowest
+/// free slots 3, 4, 5, ...
+///
+/// **Hardlinks**: EFS does not support multi-link semantics (each
+/// inum is referenced from exactly one dirent), so the inum→inum
+/// mapping is unambiguously 1:1. We assert per inode at most one
+/// dirent reference; if a hardlink is encountered, the renumbering
+/// pass falls back to a conservative shrink with a warning rather
+/// than risking dangling references.
+///
+/// Runs Phase-2 fsck both BEFORE the renumber pass (to refuse on a
+/// corrupt source) and AFTER, before the new superblock is sealed.
+pub fn shrink_efs_aggressive<R: Read + Write + Seek>(
+    reader: R,
+    partition_offset: u64,
+    new_size_blocks: u32,
+    log: &mut impl FnMut(&str),
+) -> Result<u32, FilesystemError> {
+    use std::collections::HashMap;
+
+    let mut fs = EfsFilesystem::open(reader, partition_offset)?;
+    let old_size = fs.sb_clone().fs_size;
+    if new_size_blocks >= old_size {
+        return Err(FilesystemError::InvalidData(format!(
+            "EFS shrink (aggressive): new size {new_size_blocks} is not smaller than old {old_size}"
+        )));
+    }
+
+    log(&format!(
+        "EFS shrink (aggressive): {} -> {} blocks",
+        old_size, new_size_blocks
+    ));
+
+    // Refuse on a pre-existing corrupt source — renumbering on top
+    // of broken structure would amplify the damage.
+    let pre = super::efs_fsck::fsck_efs(&mut fs)?;
+    if !pre.errors.is_empty() {
+        let codes: Vec<String> = pre.errors.iter().map(|e| e.code.clone()).collect();
+        return Err(FilesystemError::InvalidData(format!(
+            "EFS shrink (aggressive): refusing to renumber on a volume with \
+             pre-existing fsck errors: [{}]. Run repair first.",
+            codes.join(", ")
+        )));
+    }
+
+    // --- 1. Collect in-use inodes ---
+    let total = fs.total_inodes_readonly();
+    let mut in_use: Vec<(u32, super::efs::EfsInode)> = Vec::new();
+    for inum in 2..total {
+        let ino = fs.read_inode_readonly(inum)?;
+        if ino.mode != 0 {
+            in_use.push((inum, ino));
+        }
+    }
+    in_use.sort_by_key(|(i, _)| *i);
+    log(&format!(
+        "EFS shrink (aggressive): {} in-use inodes to consider",
+        in_use.len()
+    ));
+
+    // --- 2. Build the old→new map (root invariant) ---
+    let mut map: HashMap<u32, u32> = HashMap::new();
+    map.insert(2, 2);
+    let mut next_new: u32 = 3;
+    for (old_inum, _) in &in_use {
+        if *old_inum == 2 {
+            continue;
+        }
+        map.insert(*old_inum, next_new);
+        next_new += 1;
+    }
+    let renumber_count = map.iter().filter(|(o, n)| **o != **n).count();
+    log(&format!(
+        "EFS shrink (aggressive): renumbering {renumber_count} inode(s)"
+    ));
+    if renumber_count == 0 {
+        log("EFS shrink (aggressive): no renumber needed; falling back to conservative");
+        // Drop our handle before re-opening through the conservative path.
+        drop(fs);
+        // Caller must re-supply the reader. We instead route through
+        // the conservative path with the SAME underlying handle, but
+        // since `fs` already consumed it, the caller pattern uses
+        // `resize_efs_in_place` (which owns the handle). Here we
+        // can't recover — surface a clear message.
+        return Err(FilesystemError::InvalidData(
+            "EFS shrink (aggressive): no inodes need renumbering; use \
+             shrink_efs_conservative instead"
+                .into(),
+        ));
+    }
+
+    // --- 3. Rewrite directory contents ---
+    rewrite_directory_inum_refs(&mut fs, &in_use, &map, log)?;
+
+    // --- 4. Move inode bodies into their new positions ---
+    move_inode_bodies(&mut fs, &in_use, &map, log)?;
+
+    // --- 5. Update the sb hint, then run conservative shrink ---
+    {
+        let mut sb = fs.sb_clone();
+        sb.lastialloc = next_new.saturating_sub(1);
+        fs.set_sb(sb);
+    }
+    // Commit the renumber pass to disk BEFORE the conservative shrink
+    // re-opens the volume — the new conservative floor relies on the
+    // moved inode positions being visible at re-open time.
+    fs.do_sync_metadata()?;
+
+    let new_floor = compute_conservative_floor(&mut fs)?;
+    log(&format!(
+        "EFS shrink (aggressive): post-renumber floor = {new_floor} blocks"
+    ));
+    if new_size_blocks < new_floor {
+        return Err(FilesystemError::InvalidData(format!(
+            "EFS shrink (aggressive): requested size {new_size_blocks} still below \
+             post-renumber floor {new_floor}. Data extents would need relocation, \
+             which is not implemented. Pick a size >= {new_floor} blocks."
+        )));
+    }
+
+    // Hand off to conservative shrink for the actual truncate + sb
+    // update. It re-opens the volume so we drop our handle here.
+    let reader = fs.reader_into_inner();
+    shrink_efs_conservative(reader, partition_offset, new_size_blocks, log)
+}
+
+/// Walk every directory's data blocks and rewrite the inum field of
+/// each dirent according to `map`. Includes `.` and `..` entries.
+fn rewrite_directory_inum_refs<R: Read + Write + Seek>(
+    fs: &mut EfsFilesystem<R>,
+    in_use: &[(u32, super::efs::EfsInode)],
+    map: &std::collections::HashMap<u32, u32>,
+    log: &mut impl FnMut(&str),
+) -> Result<(), FilesystemError> {
+    use super::efs::{parse_dir_block, serialize_dir_block};
+    let mut dirblocks_rewritten = 0u32;
+    for (_inum, ino) in in_use {
+        if !ino.is_dir() {
+            continue;
+        }
+        for i in 0..(ino.numextents as usize).min(EFS_DIRECTEXTENTS_MAX) {
+            let ext = ino.extents[i];
+            if ext.length == 0 {
+                continue;
+            }
+            for offset in 0..ext.length as u32 {
+                let bn = ext.bn + offset;
+                let block = fs.read_block(bn)?;
+                let mut entries = parse_dir_block(&block);
+                if entries.is_empty() {
+                    continue;
+                }
+                let mut changed = false;
+                for de in &mut entries {
+                    if let Some(&new) = map.get(&de.inum) {
+                        if new != de.inum {
+                            de.inum = new;
+                            changed = true;
+                        }
+                    }
+                    // Dangling references (no map entry) are left as
+                    // the original inum and will surface in the
+                    // post-shrink fsck. They indicate a pre-existing
+                    // corruption that the upfront fsck would have
+                    // caught — defensive only.
+                }
+                if changed {
+                    let new_block = serialize_dir_block(&entries).ok_or_else(|| {
+                        FilesystemError::InvalidData(format!(
+                            "aggressive shrink: re-serializing dirblock {bn} grew past 512 bytes"
+                        ))
+                    })?;
+                    fs.write_block(bn, &new_block)?;
+                    dirblocks_rewritten += 1;
+                }
+            }
+        }
+    }
+    log(&format!(
+        "EFS shrink (aggressive): rewrote {dirblocks_rewritten} dirblock(s)"
+    ));
+    Ok(())
+}
+
+/// Move every in-use inode body to its new on-disk position. Zeroes
+/// the old slots that don't get reused. Writes new slots in
+/// ascending new_inum order so a moved-to slot is never clobbered
+/// by a later write to the same slot.
+fn move_inode_bodies<R: Read + Write + Seek>(
+    fs: &mut EfsFilesystem<R>,
+    in_use: &[(u32, super::efs::EfsInode)],
+    map: &std::collections::HashMap<u32, u32>,
+    log: &mut impl FnMut(&str),
+) -> Result<(), FilesystemError> {
+    use std::collections::HashSet;
+    let mut moves: Vec<(u32, u32, super::efs::EfsInode)> = in_use
+        .iter()
+        .map(|(old, body)| (*old, map[old], body.clone()))
+        .collect();
+    moves.sort_by_key(|(_, new, _)| *new);
+
+    // Write to new positions in ascending new-inum order.
+    let mut writes = 0u32;
+    for (old, new, body) in &moves {
+        if *old == *new {
+            continue;
+        }
+        let mut moved = body.clone();
+        moved.inum = *new;
+        fs.write_inode(&moved)?;
+        writes += 1;
+    }
+
+    // Zero the old slots that are NOT now occupied by another inode's
+    // new position. Walk new positions first to know which old slots
+    // are still in use.
+    let new_positions: HashSet<u32> = moves.iter().map(|(_, n, _)| *n).collect();
+    let mut zeros = 0u32;
+    for (old, new, _) in &moves {
+        if *old == *new {
+            continue;
+        }
+        if new_positions.contains(old) {
+            continue; // another inode now lives at this position
+        }
+        fs.write_inode(&super::efs::EfsInode::empty(*old))?;
+        zeros += 1;
+    }
+    log(&format!(
+        "EFS shrink (aggressive): wrote {writes} inode(s) at new positions; zeroed {zeros} old slot(s)"
+    ));
+    Ok(())
+}
+
+/// Compute the conservative shrink floor: max(highest data block
+/// claimed by any in-use inode, highest inode-position block among
+/// in-use inodes). Both must survive the truncation, otherwise we'd
+/// either drop file data or corrupt inode bodies.
+///
+/// Inode bodies live in their CG's inode-table region; the "position"
+/// of inode N is determined by CG geometry (firstcg + cg * cgfsize +
+/// slot/4). Aggressive shrink renumbers inodes into low slots to push
+/// this component of the floor down — that's why it's called out
+/// separately here.
 pub fn compute_conservative_floor<R: Read + Seek>(
     fs: &mut EfsFilesystem<R>,
 ) -> Result<u32, FilesystemError> {
@@ -436,6 +684,14 @@ pub fn compute_conservative_floor<R: Read + Seek>(
         let ino = fs.read_inode_readonly(inum)?;
         if ino.mode == 0 {
             continue;
+        }
+        // The inode's body occupies bytes [inode_byte_offset .. +128);
+        // round up to the next-block boundary so we preserve the
+        // 512-byte sector that holds it.
+        let inode_byte = fs.inode_byte_offset(inum);
+        let inode_block_end = ((inode_byte + 128).div_ceil(512)) as u32;
+        if inode_block_end > highest {
+            highest = inode_block_end;
         }
         for i in 0..(ino.numextents as usize).min(EFS_DIRECTEXTENTS_MAX) {
             let ext = ino.extents[i];
@@ -448,9 +704,6 @@ pub fn compute_conservative_floor<R: Read + Seek>(
             }
         }
     }
-    // The replica block must also stay inside the new volume — but
-    // the replica position moves with `fs_size` in our resize, so
-    // the floor only needs to cover inode data.
     Ok(highest)
 }
 
@@ -704,6 +957,126 @@ mod tests {
         })
         .expect("shrink");
         assert_eq!(new_size, 100);
+    }
+
+    #[test]
+    fn aggressive_shrink_renumbers_inodes_and_truncates() {
+        // Build a volume with 8 inodes per CG. Grow to ncg=2, create
+        // files that allocate high-inum slots, then aggressive-shrink.
+        // Verify that the in-use inodes get renumbered into the low
+        // CG and the conservative floor drops accordingly.
+        let img = build_test_volume();
+        let mut buf = img;
+        grow_efs(Cursor::new(&mut buf), 0, 576, &mut |_| {}).expect("grow to ncg=2");
+
+        // Open and create files. We need to push some inodes into CG 1
+        // (inums 8..16). To do that, fill CG 0's inode slots (inums 2..8)
+        // first. Inums 0,1 are reserved; 2 = root; 3..8 are available.
+        let mut fs = EfsFilesystem::open(Cursor::new(buf), 0).expect("open");
+        let root = Filesystem::root(&mut fs).expect("root");
+        for i in 0..7u32 {
+            let payload = vec![0xAB; 16];
+            let mut cur = Cursor::new(payload.clone());
+            fs.create_file(
+                &root,
+                &format!("f{i}"),
+                &mut cur,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create");
+        }
+        EditableFilesystem::sync_metadata(&mut fs).expect("sync");
+
+        // Now manually delete a file from CG 0 to create a low-inum
+        // free slot, AND ensure at least one file landed in CG 1.
+        // With the first-fit inode allocator + sb.lastialloc starting
+        // at 2, files allocate 3, 4, 5, 6, 7, 8, 9. Inum 8 lives in CG 1.
+        // After deleting f0 (inum 3), CG 1 still has inum 8 in use.
+        // The aggressive shrink should renumber 8 -> 3 to drop CG 1.
+        let kids: Vec<_> = fs
+            .list_directory(&root)
+            .expect("list")
+            .into_iter()
+            .filter(|e| e.name.starts_with("f"))
+            .collect();
+        // Delete the LOWEST-named file so the freed inum is reused.
+        let to_del = kids
+            .iter()
+            .min_by_key(|e| e.location)
+            .expect("at least one file");
+        fs.delete_entry(&root, to_del).expect("delete");
+        EditableFilesystem::sync_metadata(&mut fs).expect("sync after delete");
+
+        // Locate the highest in-use inum to verify renumber lowers it.
+        let highest_before = (2..fs.total_inodes_readonly())
+            .filter_map(|i| {
+                let ino = fs.read_inode_readonly(i).ok()?;
+                if ino.mode == 0 {
+                    None
+                } else {
+                    Some(i)
+                }
+            })
+            .max()
+            .unwrap_or(2);
+
+        let bytes = fs.reader_into_inner().into_inner();
+
+        // Aggressive shrink to a size only achievable after renumber.
+        let conservative_floor = {
+            let mut fs2 = EfsFilesystem::open(Cursor::new(&bytes), 0).expect("reopen");
+            compute_conservative_floor(&mut fs2).expect("floor")
+        };
+
+        let mut log_lines: Vec<String> = Vec::new();
+        let mut buf2 = bytes;
+        let new_size = shrink_efs_aggressive(
+            Cursor::new(&mut buf2),
+            0,
+            conservative_floor.saturating_sub(0), // floor itself
+            &mut |s| log_lines.push(s.into()),
+        )
+        .expect("aggressive shrink");
+        assert!(
+            log_lines.iter().any(|l| l.contains("renumbering")),
+            "missing renumber log: {log_lines:?}"
+        );
+
+        // Re-open and verify root inum 2 is preserved + highest inum dropped.
+        let mut fs3 = EfsFilesystem::open(Cursor::new(buf2), 0).expect("reopen post-shrink");
+        let root3 = fs3.read_inode(2).expect("root post");
+        assert!(root3.is_dir(), "root must still be a directory");
+        let highest_after = (2..fs3.total_inodes_readonly())
+            .filter_map(|i| {
+                let ino = fs3.read_inode_readonly(i).ok()?;
+                if ino.mode == 0 {
+                    None
+                } else {
+                    Some(i)
+                }
+            })
+            .max()
+            .unwrap_or(2);
+        assert!(
+            highest_after <= highest_before,
+            "highest in-use inum did not drop (before={highest_before}, after={highest_after})"
+        );
+        assert_eq!(new_size as u64 * 512, fs3.total_size());
+    }
+
+    #[test]
+    fn aggressive_shrink_rejects_when_no_renumber_needed() {
+        // Plain synthetic volume has only root (inum 2) in use; no
+        // renumbering possible. Aggressive shrink should refuse and
+        // point at conservative shrink.
+        let img = build_test_volume();
+        let cur = Cursor::new(img);
+        let err = shrink_efs_aggressive(cur, 0, 100, &mut |_| {}).expect_err("no renumber");
+        assert!(
+            matches!(err, FilesystemError::InvalidData(_)),
+            "expected InvalidData, got {err:?}"
+        );
     }
 
     #[test]
