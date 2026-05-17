@@ -524,6 +524,75 @@ fn patch_filesystem_hidden_sectors(
     Ok(())
 }
 
+/// Grow a raw or VHD image file by `add_bytes` of zero-padding at the end.
+/// Returns the new total file size in bytes.
+///
+/// For raw images: `set_len(old + add_bytes)`. The file ends in a zeroed
+/// trailing region the user can then partition with the standard editor.
+///
+/// For VHDs: the 512-byte footer is at the end of the file and encodes
+/// the logical disk size. We strip the old footer, grow the data region
+/// by `add_bytes`, and append a fresh footer. The reader sees a larger
+/// virtual disk.
+///
+/// This is the Phase 6b path of `docs/disk_expansion.md`: an in-place
+/// "make room for more partitions" action on a backed-up image, separate
+/// from the restore-time "Add free space" toggle.
+pub fn expand_image_file(
+    path: &std::path::Path,
+    add_bytes: u64,
+    log_cb: &mut impl FnMut(&str),
+) -> std::io::Result<u64> {
+    use std::fs::OpenOptions;
+
+    if add_bytes == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "add_bytes must be > 0",
+        ));
+    }
+
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    let old_size = file.seek(SeekFrom::End(0))?;
+    let is_vhd = detect_vhd(&mut file, old_size);
+
+    if is_vhd {
+        // Drop the 512-byte footer, write `add_bytes` of zeros over the
+        // formerly-footer region + tail, then append a fresh footer with
+        // the new data size.
+        let old_data_size = old_size.saturating_sub(512);
+        let new_data_size = old_data_size + add_bytes;
+        log_cb(&format!(
+            "Growing VHD data region: {} -> {} (+{})",
+            crate::partition::format_size(old_data_size),
+            crate::partition::format_size(new_data_size),
+            crate::partition::format_size(add_bytes),
+        ));
+        // Step 1: extend the file so we can stamp the new footer at the end.
+        file.set_len(new_data_size + 512)?;
+        // Step 2: zero-fill the old footer location + everything up to the
+        // new footer. set_len already zero-pads on POSIX/Windows; do not
+        // do an explicit zero-write — keeps this O(1) regardless of size.
+        // Step 3: write the new footer.
+        let footer = crate::rbformats::vhd::build_vhd_footer(new_data_size);
+        file.seek(SeekFrom::Start(new_data_size))?;
+        file.write_all(&footer)?;
+        file.flush()?;
+        Ok(new_data_size + 512)
+    } else {
+        let new_size = old_size + add_bytes;
+        log_cb(&format!(
+            "Growing raw image: {} -> {} (+{})",
+            crate::partition::format_size(old_size),
+            crate::partition::format_size(new_size),
+            crate::partition::format_size(add_bytes),
+        ));
+        file.set_len(new_size)?;
+        file.flush()?;
+        Ok(new_size)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -714,5 +783,49 @@ mod tests {
         let data = vec![0u8; 1024];
         let mut cursor = Cursor::new(data);
         assert!(!detect_vhd(&mut cursor, 1024));
+    }
+
+    #[test]
+    fn expand_image_file_grows_raw() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        // Seed a 1 MiB raw image.
+        std::fs::write(&path, vec![0xAAu8; 1024 * 1024]).unwrap();
+
+        let mut log = Vec::<String>::new();
+        let new_total =
+            expand_image_file(&path, 2 * 1024 * 1024, &mut |m| log.push(m.into())).unwrap();
+        assert_eq!(new_total, 3 * 1024 * 1024);
+        let on_disk = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(on_disk, 3 * 1024 * 1024);
+
+        // Original bytes preserved.
+        let buf = std::fs::read(&path).unwrap();
+        assert!(buf[..1024 * 1024].iter().all(|&b| b == 0xAA));
+        // Tail is zero-padded.
+        assert!(buf[1024 * 1024..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn expand_image_file_grows_vhd_and_keeps_footer() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        // Build a 1 MiB raw region + VHD footer.
+        let data_size: u64 = 1024 * 1024;
+        let mut buf = vec![0xCDu8; data_size as usize];
+        buf.extend_from_slice(&crate::rbformats::vhd::build_vhd_footer(data_size));
+        std::fs::write(&path, &buf).unwrap();
+
+        let mut log = Vec::<String>::new();
+        let new_total = expand_image_file(&path, 512 * 1024, &mut |m| log.push(m.into())).unwrap();
+        // New data region = 1 MiB + 512 KiB; total = data + 512-byte footer.
+        let expected_data = data_size + 512 * 1024;
+        assert_eq!(new_total, expected_data + 512);
+
+        // Reading the file end-512 should now decode as a VHD footer for
+        // the new data size.
+        let mut file = std::fs::File::open(&path).unwrap();
+        let total = std::fs::metadata(&path).unwrap().len();
+        assert!(detect_vhd(&mut file, total));
     }
 }

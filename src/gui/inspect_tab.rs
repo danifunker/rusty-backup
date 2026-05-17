@@ -142,6 +142,10 @@ pub struct InspectTab {
     cached_disk_size: Option<u64>,
     /// Partition table editor popup
     editor_popup: bool,
+    /// "Expand Image..." dialog open (Phase 6b of disk_expansion.md).
+    expand_image_dialog_open: bool,
+    /// MiB to add when the user clicks Expand in the Expand Image dialog.
+    expand_image_add_mib: u32,
     /// Partition table editor model state.
     editor: PartitionEditor,
     /// Resize popup (in-place partition resizing)
@@ -217,6 +221,8 @@ impl Default for InspectTab {
             chd_image_path: None,
             cached_disk_size: None,
             editor_popup: false,
+            expand_image_dialog_open: false,
+            expand_image_add_mib: 0,
             editor: PartitionEditor::new(),
             resize_popup: None,
             fsck_result: None,
@@ -516,6 +522,38 @@ impl InspectTab {
                 self.init_add_partition(trailing_free);
             }
 
+            // Expand Image button (Phase 6b of disk_expansion.md) — grows
+            // the underlying image file with zero-padding so the user can
+            // then partition the new trailing space via Add Partition or
+            // grow an existing partition via the editor. Raw + VHD now;
+            // CHD waits on Phase 6c's re-encode worker.
+            let is_image_file = self.image_file_path.is_some()
+                && self.selected_device_idx.is_none()
+                && self.backup_folder_path.is_none()
+                && self.clonezilla_image.is_none();
+            let is_chd_source = self.chd_image_path.is_some();
+            if ui
+                .add_enabled(
+                    is_image_file && !is_chd_source && !export_running,
+                    egui::Button::new("Expand Image..."),
+                )
+                .on_hover_text(if is_chd_source {
+                    "CHD expansion requires re-encoding — coming in Phase 6c. \
+                     Export to VHD/raw first, expand that, then re-encode."
+                        .to_string()
+                } else if !is_image_file {
+                    "Only raw and VHD image files can be expanded in place.".to_string()
+                } else {
+                    "Grow the image file with zero-padding so you can add or extend \
+                     partitions in the new free space."
+                        .to_string()
+                })
+                .clicked()
+            {
+                self.expand_image_dialog_open = true;
+                self.expand_image_add_mib = 0;
+            }
+
             // Resize Partitions button — same conditions as Edit Partition Table
             let resize_running = self.resize_popup.as_ref().is_some_and(|p| p.is_running());
             if ui
@@ -634,6 +672,11 @@ impl InspectTab {
         // Editor popup
         if self.editor_popup {
             self.show_editor_popup(ui, ctx);
+        }
+
+        // Expand Image dialog (Phase 6b of disk_expansion.md)
+        if self.expand_image_dialog_open {
+            self.show_expand_image_dialog(ui, ctx);
         }
 
         // Resize popup
@@ -793,6 +836,104 @@ impl InspectTab {
         self.editor.add_type = default_type.to_string();
         self.editor.add_bootable = false;
         self.editor_popup = true;
+    }
+
+    /// Render the Expand Image dialog. Lets the user grow the current raw
+    /// or VHD image file by N MiB of zero-padding at the end. After the
+    /// growth completes the cached disk size is invalidated and the user
+    /// can re-inspect to see the new free space + use Add Partition.
+    fn show_expand_image_dialog(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
+        let mut open = self.expand_image_dialog_open;
+        let mut do_expand = false;
+        let current_size = self.actual_disk_size_bytes().unwrap_or(0);
+
+        egui::Window::new("Expand Image")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(420.0)
+            .show(ui.ctx(), |ui| {
+                ui.label(format!(
+                    "Current size: {}",
+                    partition::format_size(current_size),
+                ));
+                ui.add_space(4.0);
+
+                ui.horizontal(|ui| {
+                    ui.label("Add free space:");
+                    ui.add(
+                        egui::DragValue::new(&mut self.expand_image_add_mib)
+                            .range(0..=4_194_304u32) // 4 TiB upper bound
+                            .suffix(" MiB"),
+                    );
+                });
+
+                let add_bytes = (self.expand_image_add_mib as u64) * 1024 * 1024;
+                let new_size = current_size.saturating_add(add_bytes);
+                ui.label(format!("New size: {}", partition::format_size(new_size),));
+
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "After expansion, click Re-inspect to refresh the partition \
+                         list, then use 'Add Partition...' or 'Edit Partition Table...' \
+                         to allocate the new space.",
+                    )
+                    .weak(),
+                );
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(self.expand_image_add_mib > 0, egui::Button::new("Expand"))
+                        .clicked()
+                    {
+                        do_expand = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        do_expand = false;
+                    }
+                });
+            });
+
+        if !open {
+            self.expand_image_dialog_open = false;
+            return;
+        }
+
+        if do_expand {
+            let path = match &self.image_file_path {
+                Some(p) => p.clone(),
+                None => {
+                    ctx.log.error("Expand Image: no image file loaded");
+                    self.expand_image_dialog_open = false;
+                    return;
+                }
+            };
+            let add_bytes = (self.expand_image_add_mib as u64) * 1024 * 1024;
+            ctx.log.info(format!(
+                "Expanding image '{}' by {}...",
+                path.display(),
+                partition::format_size(add_bytes),
+            ));
+            match rusty_backup::partition::resize::expand_image_file(&path, add_bytes, &mut |msg| {
+                ctx.log.info(msg)
+            }) {
+                Ok(new_total) => {
+                    ctx.log.info(format!(
+                        "Image expanded to {}. Click Re-inspect to refresh.",
+                        partition::format_size(new_total),
+                    ));
+                    self.cached_disk_size = None;
+                }
+                Err(e) => {
+                    ctx.log.error(format!("Expand Image failed: {e}"));
+                }
+            }
+            self.expand_image_dialog_open = false;
+        } else {
+            self.expand_image_dialog_open = open;
+        }
     }
 
     /// Assemble a snapshot of the currently-loaded source for the Physical
