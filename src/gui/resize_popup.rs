@@ -20,6 +20,10 @@ struct ResizeEntry {
     is_extended_container: bool,
     /// User-editable new size text in MiB.
     new_size_text: String,
+    /// Quick-pick radio (Original / Minimum / Custom). Selecting a non-Custom
+    /// option re-stamps `new_size_text`; selecting Custom seeds it from the
+    /// current text and otherwise leaves it editable.
+    choice: rusty_backup::model::size_mode::SizeMode,
 }
 
 /// Preview row for showing planned changes.
@@ -92,6 +96,7 @@ impl ResizePopup {
                     // bug for partitions whose byte count isn't a clean MiB
                     // multiple (anything not aligned to 1 MiB).
                     new_size_text: format!("{:.2}", size_mib),
+                    choice: rusty_backup::model::size_mode::SizeMode::Original,
                 }
             })
             .collect();
@@ -146,6 +151,108 @@ impl ResizePopup {
         self.resize_status.is_some()
     }
 
+    /// Parse `new_size_text` for the entry, falling back to `original_size`
+    /// on a malformed value or when the text still matches the original-
+    /// formatted MiB string (avoids the precision-drift bug where validate
+    /// reports the same MiB number as a smaller byte size).
+    fn planned_size_bytes(&self, entry: &ResizeEntry) -> u64 {
+        let orig_text = format!("{:.2}", entry.original_size as f64 / (1024.0 * 1024.0));
+        if entry.new_size_text.trim() == orig_text {
+            return entry.original_size;
+        }
+        match entry.new_size_text.trim().parse::<f64>() {
+            Ok(v) if v > 0.0 => {
+                let bytes = (v * 1024.0 * 1024.0) as u64;
+                (bytes / 512) * 512
+            }
+            _ => entry.original_size,
+        }
+    }
+
+    /// Render the Current vs After PartitionBar pair using the working
+    /// edits. Both bars share the byte-per-pixel scale so growth/shrink is
+    /// visible.
+    fn show_disk_layout_bars(&self, ui: &mut egui::Ui) {
+        use super::partition_bar::{PartitionBar, Segment, SegmentKind};
+
+        // "Current" — same logic as the inspect-tab disk-layout builder,
+        // ignoring extended-container entries and assigning sequential color
+        // indices.
+        let mut color_index = 0usize;
+        let mut current: Vec<Segment> = Vec::new();
+        for p in &self.partitions {
+            if p.is_extended_container || p.is_logical {
+                continue;
+            }
+            let kind = SegmentKind::Partition { color_index };
+            color_index += 1;
+            current.push(Segment {
+                label: format!("Partition {}", p.index + 1),
+                fs: p.type_name.clone(),
+                size_bytes: p.size_bytes,
+                kind,
+            });
+        }
+
+        // "After" — same partitions in the same order, but `size_bytes` reads
+        // from `planned_size_bytes`. Color indices match Current.
+        let mut after: Vec<Segment> = Vec::new();
+        color_index = 0;
+        for p in &self.partitions {
+            if p.is_extended_container || p.is_logical {
+                continue;
+            }
+            let new_size = self
+                .entries
+                .iter()
+                .find(|e| e.index == p.index)
+                .map(|e| self.planned_size_bytes(e))
+                .unwrap_or(p.size_bytes);
+            let kind = SegmentKind::Partition { color_index };
+            color_index += 1;
+            after.push(Segment {
+                label: format!("Partition {}", p.index + 1),
+                fs: p.type_name.clone(),
+                size_bytes: new_size,
+                kind,
+            });
+        }
+
+        let current_total: u64 = current.iter().map(|s| s.size_bytes).sum();
+        let after_total: u64 = after.iter().map(|s| s.size_bytes).sum();
+        let max_total = current_total.max(after_total).max(1);
+
+        ui.label("Current:");
+        let available_width = ui.available_width().max(120.0);
+        let current_w = available_width * (current_total as f64 / max_total as f64) as f32;
+        ui.scope(|ui| {
+            ui.set_width(current_w.max(60.0));
+            PartitionBar {
+                segments: current,
+                show_inline_labels: true,
+                show_legend: false,
+            }
+            .show(ui);
+        });
+
+        ui.add_space(4.0);
+        ui.label(format!(
+            "After  ({} -> {}):",
+            partition::format_size(current_total),
+            partition::format_size(after_total),
+        ));
+        let after_w = available_width * (after_total as f64 / max_total as f64) as f32;
+        ui.scope(|ui| {
+            ui.set_width(after_w.max(60.0));
+            PartitionBar {
+                segments: after,
+                show_inline_labels: true,
+                show_legend: true,
+            }
+            .show(ui);
+        });
+    }
+
     /// Show the resize popup window. Returns false if the popup should close.
     pub fn show(&mut self, ui: &mut egui::Ui, _devices: &[DiskDevice], log: &mut LogPanel) -> bool {
         let mut keep_open = self.open;
@@ -172,6 +279,14 @@ impl ResizePopup {
                     ui.add_space(4.0);
                 }
 
+                // Before / After disk layout visualization. "Current" reads
+                // sizes from `partitions`; "After" applies the working
+                // `new_size_text` per entry. Both bars share a byte-per-pixel
+                // scale, so the After bar grows/shrinks visibly with the
+                // total of edits.
+                self.show_disk_layout_bars(ui);
+                ui.add_space(8.0);
+
                 // Partition grid
                 ui.label(egui::RichText::new("Partition Sizes:").strong());
                 egui::Grid::new("resize_partition_grid")
@@ -182,6 +297,7 @@ impl ResizePopup {
                         ui.label(egui::RichText::new("Type").strong());
                         ui.label(egui::RichText::new("Current Size").strong());
                         ui.label(egui::RichText::new("Min Size").strong());
+                        ui.label(egui::RichText::new("Size Mode").strong());
                         ui.label(egui::RichText::new("New Size (MiB)").strong());
                         ui.end_row();
 
@@ -199,6 +315,7 @@ impl ResizePopup {
                                 );
                                 ui.colored_label(egui::Color32::GRAY, "—");
                                 ui.colored_label(egui::Color32::GRAY, "—");
+                                ui.colored_label(egui::Color32::GRAY, "—");
                                 ui.end_row();
                                 continue;
                             }
@@ -212,8 +329,48 @@ impl ResizePopup {
                                 "—".to_string()
                             });
 
+                            // Size-mode radios. Selecting Original/Minimum
+                            // stamps `new_size_text` to the canonical MiB
+                            // string for that target; Custom keeps the user's
+                            // edits alive and lets the text field stay
+                            // editable for free-form entry.
+                            use rusty_backup::model::size_mode::SizeMode;
+                            let prev = entry.choice;
+                            ui.add_enabled_ui(!running, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.radio_value(&mut entry.choice, SizeMode::Original, "Original");
+                                    if entry.minimum_size > 0
+                                        && entry.minimum_size < entry.original_size
+                                    {
+                                        ui.radio_value(
+                                            &mut entry.choice,
+                                            SizeMode::Minimum,
+                                            "Minimum",
+                                        );
+                                    }
+                                    ui.radio_value(&mut entry.choice, SizeMode::Custom, "Custom");
+                                });
+                            });
+                            if entry.choice != prev {
+                                match entry.choice {
+                                    SizeMode::Original => {
+                                        entry.new_size_text = format!(
+                                            "{:.2}",
+                                            entry.original_size as f64 / (1024.0 * 1024.0),
+                                        );
+                                    }
+                                    SizeMode::Minimum => {
+                                        entry.new_size_text = format!(
+                                            "{:.2}",
+                                            entry.minimum_size as f64 / (1024.0 * 1024.0),
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                            }
+
                             ui.add_enabled(
-                                !running,
+                                !running && entry.choice == SizeMode::Custom,
                                 egui::TextEdit::singleline(&mut entry.new_size_text)
                                     .desired_width(80.0),
                             );

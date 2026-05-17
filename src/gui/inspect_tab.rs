@@ -752,7 +752,8 @@ impl InspectTab {
     }
 
     fn init_editor(&mut self) {
-        self.editor.seed_from(&self.partitions);
+        self.editor
+            .seed_from_with_minimums(&self.partitions, &self.partition_min_sizes);
         self.editor_popup = true;
     }
 
@@ -766,7 +767,8 @@ impl InspectTab {
     ///   - Type: platform-appropriate (XFS for SGI, 0x83 for MBR Linux,
     ///     Linux Filesystem GUID for GPT, Apple_HFS for APM)
     fn init_add_partition(&mut self, trailing_free_bytes: u64) {
-        self.editor.seed_from(&self.partitions);
+        self.editor
+            .seed_from_with_minimums(&self.partitions, &self.partition_min_sizes);
 
         let first_free_lba = self
             .partitions
@@ -873,6 +875,14 @@ impl InspectTab {
                 ui.label(format!("Table type: {}", table_type));
                 ui.add_space(4.0);
 
+                // Before / After disk layout. "Current" reads the loaded
+                // partition list, "After" walks the editor entries +
+                // add-partition inputs so the bar updates live as the user
+                // edits sizes, marks rows deleted, or fills in the
+                // Add Partition fields.
+                show_editor_disk_layout_bars(ui, &self.partitions, &self.editor);
+                ui.add_space(8.0);
+
                 // Partition entry grid
                 egui::Grid::new("editor_grid")
                     .striped(true)
@@ -881,6 +891,7 @@ impl InspectTab {
                         ui.label(egui::RichText::new("#").strong());
                         ui.label(egui::RichText::new("Type").strong());
                         ui.label(egui::RichText::new("Start LBA").strong());
+                        ui.label(egui::RichText::new("Size Mode").strong());
                         ui.label(egui::RichText::new("Size (MiB)").strong());
                         ui.label(egui::RichText::new("Boot").strong());
                         ui.label(egui::RichText::new("").strong());
@@ -913,6 +924,7 @@ impl InspectTab {
                                     egui::RichText::new(format!("{}", start_lba))
                                         .color(egui::Color32::GRAY),
                                 );
+                                ui.label("");
                                 ui.label(egui::RichText::new("deleted").color(egui::Color32::GRAY));
                                 ui.label("");
                                 if ui.small_button("Undo").clicked() {
@@ -934,6 +946,7 @@ impl InspectTab {
                                     egui::RichText::new(format!("{}", start_lba))
                                         .color(egui::Color32::GRAY),
                                 );
+                                ui.label("");
                                 let size_mib = size_bytes as f64 / (1024.0 * 1024.0);
                                 ui.label(
                                     egui::RichText::new(format!("{:.2}", size_mib))
@@ -963,9 +976,68 @@ impl InspectTab {
                             // Start LBA (read-only)
                             ui.label(format!("{}", start_lba));
 
-                            // Size (MiB) - editable
+                            // Size-mode radios (Original / Minimum / Custom).
+                            // Selecting a non-Custom mode re-stamps
+                            // `size_text` to the canonical "{:.2}" MiB for
+                            // that target. Minimum is hidden when the
+                            // per-partition min size isn't known (the
+                            // editor doesn't perform its own FS analysis;
+                            // it relies on whatever min sizes were probed
+                            // by the inspect tab and seeded in via
+                            // `seed_from_with_minimums`).
+                            {
+                                use rusty_backup::model::size_mode::SizeMode;
+                                let minimum_size = self.editor.entries[i].minimum_size;
+                                let original_size = size_bytes;
+                                let prev = self.editor.entries[i].choice;
+                                ui.horizontal(|ui| {
+                                    ui.radio_value(
+                                        &mut self.editor.entries[i].choice,
+                                        SizeMode::Original,
+                                        "Original",
+                                    );
+                                    if minimum_size > 0 && minimum_size < original_size {
+                                        ui.radio_value(
+                                            &mut self.editor.entries[i].choice,
+                                            SizeMode::Minimum,
+                                            "Minimum",
+                                        );
+                                    }
+                                    ui.radio_value(
+                                        &mut self.editor.entries[i].choice,
+                                        SizeMode::Custom,
+                                        "Custom",
+                                    );
+                                });
+                                if self.editor.entries[i].choice != prev {
+                                    match self.editor.entries[i].choice {
+                                        SizeMode::Original => {
+                                            self.editor.entries[i].size_text = format!(
+                                                "{:.2}",
+                                                original_size as f64 / (1024.0 * 1024.0),
+                                            );
+                                        }
+                                        SizeMode::Minimum => {
+                                            self.editor.entries[i].size_text = format!(
+                                                "{:.2}",
+                                                minimum_size as f64 / (1024.0 * 1024.0),
+                                            );
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+
+                            // Size (MiB) - editable when Custom; otherwise
+                            // displayed as a read-only field stamped by the
+                            // radio above.
+                            let size_editable = matches!(
+                                self.editor.entries[i].choice,
+                                rusty_backup::model::size_mode::SizeMode::Custom,
+                            );
                             let size_id = format!("ed_size_{}", i);
-                            ui.add(
+                            ui.add_enabled(
+                                size_editable,
                                 egui::TextEdit::singleline(&mut self.editor.entries[i].size_text)
                                     .desired_width(80.0)
                                     .id(egui::Id::new(&size_id)),
@@ -4462,6 +4534,123 @@ fn build_disk_layout_segments(
     }
 
     segments
+}
+
+/// Render the Current vs After PartitionBar pair inside the partition-table
+/// editor popup. "Current" mirrors the loaded `partitions` list; "After"
+/// walks the editor's working entries — applying parsed sizes, hiding
+/// deleted entries, and appending the pending Add-Partition row when its
+/// size field has a positive value. Both bars share the byte-per-pixel
+/// scale, so the After bar grows/shrinks visibly with the working edits.
+fn show_editor_disk_layout_bars(
+    ui: &mut egui::Ui,
+    partitions: &[PartitionInfo],
+    editor: &rusty_backup::model::partition_editor::PartitionEditor,
+) {
+    use super::partition_bar::{PartitionBar, Segment, SegmentKind};
+
+    fn parse_mib(text: &str) -> Option<u64> {
+        text.trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|v| *v > 0.0)
+            .map(|v| ((v * 1024.0 * 1024.0) as u64 / 512) * 512)
+    }
+
+    // Current bar from the loaded partition list (same shape as the
+    // inspect-tab disk-layout bar minus the trailing-free segment, since
+    // the editor's free space is implicit in the bar-pair scale).
+    let mut current = Vec::new();
+    let mut color_index = 0usize;
+    for p in partitions {
+        if p.is_extended_container || p.is_logical {
+            continue;
+        }
+        let kind = SegmentKind::Partition { color_index };
+        color_index += 1;
+        current.push(Segment {
+            label: format!("Partition {}", p.index + 1),
+            fs: p.type_name.clone(),
+            size_bytes: p.size_bytes,
+            kind,
+        });
+    }
+
+    // After bar from the editor working state. We preserve original entry
+    // order (partition table order) and reuse the same color cycle so the
+    // before/after pair stays visually aligned.
+    let mut after = Vec::new();
+    color_index = 0;
+    for entry in &editor.entries {
+        if entry.deleted || entry.is_extended_container || entry.is_logical {
+            // Reserve the color slot anyway so the next entry's color
+            // matches its Current counterpart.
+            if !entry.is_extended_container && !entry.is_logical {
+                color_index += 1;
+            }
+            continue;
+        }
+        let size_bytes = parse_mib(&entry.size_text).unwrap_or(entry.size_bytes);
+        let kind = SegmentKind::Partition { color_index };
+        color_index += 1;
+        after.push(Segment {
+            label: format!("Partition {}", entry.index + 1),
+            fs: entry.type_name.clone(),
+            size_bytes,
+            kind,
+        });
+    }
+
+    // Pending Add Partition row (rendered as a sequential segment in the
+    // current color slot). Surfaces while the user is filling in the
+    // Add-Partition fields, so they can see the addition in the bar before
+    // clicking Validate.
+    if let Some(add_size) = parse_mib(&editor.add_size_mb) {
+        after.push(Segment {
+            label: "New".to_string(),
+            fs: if editor.add_type.trim().is_empty() {
+                String::new()
+            } else {
+                editor.add_type.trim().to_string()
+            },
+            size_bytes: add_size,
+            kind: SegmentKind::Partition { color_index },
+        });
+    }
+
+    let current_total: u64 = current.iter().map(|s| s.size_bytes).sum();
+    let after_total: u64 = after.iter().map(|s| s.size_bytes).sum();
+    let max_total = current_total.max(after_total).max(1);
+    let available_width = ui.available_width().max(120.0);
+
+    ui.label("Current:");
+    let current_w = available_width * (current_total as f64 / max_total as f64) as f32;
+    ui.scope(|ui| {
+        ui.set_width(current_w.max(60.0));
+        PartitionBar {
+            segments: current,
+            show_inline_labels: true,
+            show_legend: false,
+        }
+        .show(ui);
+    });
+
+    ui.add_space(4.0);
+    ui.label(format!(
+        "After  ({} -> {}):",
+        partition::format_size(current_total),
+        partition::format_size(after_total),
+    ));
+    let after_w = available_width * (after_total as f64 / max_total as f64) as f32;
+    ui.scope(|ui| {
+        ui.set_width(after_w.max(60.0));
+        PartitionBar {
+            segments: after,
+            show_inline_labels: true,
+            show_legend: true,
+        }
+        .show(ui);
+    });
 }
 
 #[cfg(test)]
