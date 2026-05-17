@@ -257,6 +257,61 @@ impl EfsInode {
             _ => None,
         }
     }
+
+    /// Serialize this inode into a 128-byte buffer. `extents[i]` slots
+    /// past `numextents` are emitted as on-disk extents too — the read
+    /// path treats `magic != 0` as corrupt so unused slots must stay
+    /// zeroed by the caller (the EFS_DIRECTEXTENTS array is fixed
+    /// size on disk).
+    #[allow(dead_code)] // wired up in EFS Slice 3 (write_inode)
+    pub(crate) fn write_into(&self, buf: &mut [u8; 128]) {
+        BigEndian::write_u16(&mut buf[0..2], self.mode);
+        BigEndian::write_u16(&mut buf[2..4], self.nlink);
+        BigEndian::write_u16(&mut buf[4..6], self.uid);
+        BigEndian::write_u16(&mut buf[6..8], self.gid);
+        BigEndian::write_u32(&mut buf[8..12], self.size);
+        BigEndian::write_u32(&mut buf[12..16], self.atime);
+        BigEndian::write_u32(&mut buf[16..20], self.mtime);
+        BigEndian::write_u32(&mut buf[20..24], self.ctime);
+        BigEndian::write_u32(&mut buf[24..28], self.gen);
+        BigEndian::write_u16(&mut buf[28..30], self.numextents);
+        buf[30] = self.version;
+        buf[31] = 0; // pad — IRIX leaves it zero
+        for (i, ext) in self.extents.iter().enumerate() {
+            let off = 32 + i * 8;
+            let w0 = ((ext.magic as u32) << 24) | (ext.bn & 0x00FF_FFFF);
+            let w1 = ((ext.length as u32) << 24) | (ext.offset & 0x00FF_FFFF);
+            BigEndian::write_u32(&mut buf[off..off + 4], w0);
+            BigEndian::write_u32(&mut buf[off + 4..off + 8], w1);
+        }
+    }
+
+    /// Construct an empty/free inode (mode=0). Used when initializing
+    /// freshly-allocated CG inode-table regions or zeroing an inode
+    /// on delete.
+    #[allow(dead_code)] // wired up in EFS Slice 3+
+    pub(crate) fn empty(inum: u32) -> Self {
+        EfsInode {
+            inum,
+            mode: 0,
+            nlink: 0,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+            gen: 0,
+            numextents: 0,
+            version: 0,
+            extents: [EfsExtent {
+                magic: 0,
+                bn: 0,
+                length: 0,
+                offset: 0,
+            }; EFS_DIRECTEXTENTS],
+        }
+    }
 }
 
 /// EFS filesystem reader.
@@ -290,7 +345,7 @@ impl<R: Read + Seek + Send> EfsFilesystem<R> {
     }
 
     /// Compute the byte offset (from start of partition) of inode `inum`.
-    fn inode_byte_offset(&self, inum: u32) -> u64 {
+    pub(crate) fn inode_byte_offset(&self, inum: u32) -> u64 {
         // Mirrors `efs_iget` in Linux v5.15:
         //   inodes_per_cg = cgisize * (BLOCKSIZE / INODESIZE)
         //   cg            = inum / inodes_per_cg
@@ -307,7 +362,7 @@ impl<R: Read + Seek + Send> EfsFilesystem<R> {
     }
 
     /// Read a single inode by number.
-    fn read_inode(&mut self, inum: u32) -> Result<EfsInode, FilesystemError> {
+    pub(crate) fn read_inode(&mut self, inum: u32) -> Result<EfsInode, FilesystemError> {
         if inum == 0 {
             return Err(FilesystemError::InvalidData(
                 "EFS inode 0 is reserved".into(),
@@ -505,6 +560,71 @@ impl<R: Read + Write + Seek + Send> EfsFilesystem<R> {
             let bb = 7 - (b % 8);
             bm[by] &= !(1u8 << bb);
         }
+    }
+
+    /// Total inodes the volume can hold, derived from CG geometry.
+    /// `ncg * cgisize * 4` — every inode-table block holds 4 inodes.
+    pub(crate) fn total_inodes(&self) -> u32 {
+        self.sb.ncg as u32 * self.sb.cgisize as u32 * EFS_INODES_PER_BLOCK as u32
+    }
+
+    /// Write `inode` back to its on-disk slot. Performs a 512-byte
+    /// read-modify-write on the inode-table block — three other
+    /// inodes share each block, so we can't blind-write the slot
+    /// without preserving the surrounding bytes.
+    pub(crate) fn write_inode(&mut self, inode: &EfsInode) -> Result<(), FilesystemError> {
+        if inode.inum == 0 {
+            return Err(FilesystemError::InvalidData(
+                "EFS write_inode: inum 0 is reserved".into(),
+            ));
+        }
+        if inode.inum >= self.total_inodes() {
+            return Err(FilesystemError::InvalidData(format!(
+                "EFS write_inode: inum {} >= total inodes {}",
+                inode.inum,
+                self.total_inodes()
+            )));
+        }
+        let byte_off = self.inode_byte_offset(inode.inum);
+        let block_byte = (byte_off / EFS_BLOCKSIZE) * EFS_BLOCKSIZE;
+        let in_block = (byte_off - block_byte) as usize;
+
+        let mut block = [0u8; EFS_BLOCKSIZE as usize];
+        read_at_aligned(
+            &mut self.reader,
+            self.partition_offset + block_byte,
+            EFS_BLOCKSIZE,
+            &mut block,
+        )?;
+        let mut slot = [0u8; 128];
+        inode.write_into(&mut slot);
+        block[in_block..in_block + 128].copy_from_slice(&slot);
+
+        self.reader
+            .seek(SeekFrom::Start(self.partition_offset + block_byte))?;
+        self.reader.write_all(&block)?;
+        Ok(())
+    }
+
+    /// Allocate the lowest-numbered free inode (mode == 0). Skips
+    /// reserved inums 0 and 1; root (inum 2) is always returned as
+    /// in-use by `read_inode` if the volume is mounted. Uses
+    /// `sb.lastialloc` as a starting hint to avoid rescanning the
+    /// already-scanned prefix; falls back to a from-2 rescan if the
+    /// hint search misses, matching the bitmap allocator pattern.
+    pub(crate) fn allocate_inode(&mut self) -> Result<u32, FilesystemError> {
+        let total = self.total_inodes();
+        let start = self.sb.lastialloc.max(2);
+        for inum in (start..total).chain(2..start) {
+            let ino = self.read_inode(inum)?;
+            if ino.mode == 0 {
+                self.sb.lastialloc = inum;
+                return Ok(inum);
+            }
+        }
+        Err(FilesystemError::DiskFull(format!(
+            "EFS: no free inodes (total {total})"
+        )))
     }
 
     /// Write the primary superblock (sector 1) AND the replica
@@ -1429,6 +1549,78 @@ mod tests {
             let bb = 7 - (b % 8);
             assert!(bm[by] & (1 << bb) == 0, "block {b} still in-use after free");
         }
+    }
+
+    #[test]
+    fn inode_write_round_trips_through_read() {
+        let img = build_synthetic_for_bitmap_tests();
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        // Synthetic image has every inode zero (mode==0). Allocate
+        // and write a fresh one, then read it back.
+        let inum = fs.allocate_inode().expect("alloc inode");
+        assert_eq!(inum, 2, "first free inode should be root (inum 2)");
+
+        let mut ino = EfsInode::empty(inum);
+        ino.mode = 0o100644;
+        ino.nlink = 1;
+        ino.size = 1234;
+        ino.numextents = 1;
+        ino.extents[0] = EfsExtent {
+            magic: 0,
+            bn: 25,
+            length: 3,
+            offset: 0,
+        };
+        fs.write_inode(&ino).expect("write inode");
+
+        let read_back = fs.read_inode(inum).expect("read back");
+        assert_eq!(read_back.mode, 0o100644);
+        assert_eq!(read_back.size, 1234);
+        assert_eq!(read_back.numextents, 1);
+        assert_eq!(read_back.extents[0].bn, 25);
+        assert_eq!(read_back.extents[0].length, 3);
+    }
+
+    #[test]
+    fn write_inode_preserves_neighboring_slots_in_block() {
+        // Two inodes in the same 512-byte block. Writing one must not
+        // disturb the other.
+        let img = build_synthetic_for_bitmap_tests();
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+
+        // Inode 2 and inode 3 share the first inode-table block of CG 0.
+        let mut ino2 = EfsInode::empty(2);
+        ino2.mode = 0o040755;
+        ino2.size = 100;
+        fs.write_inode(&ino2).expect("write inode 2");
+
+        let mut ino3 = EfsInode::empty(3);
+        ino3.mode = 0o100644;
+        ino3.size = 200;
+        fs.write_inode(&ino3).expect("write inode 3");
+
+        // Reading inode 2 must still see size=100, mode=040755.
+        let r2 = fs.read_inode(2).expect("re-read 2");
+        assert_eq!(r2.mode, 0o040755);
+        assert_eq!(r2.size, 100);
+        let r3 = fs.read_inode(3).expect("re-read 3");
+        assert_eq!(r3.mode, 0o100644);
+        assert_eq!(r3.size, 200);
+    }
+
+    #[test]
+    fn allocate_inode_returns_disk_full_when_all_used() {
+        let img = build_synthetic_for_bitmap_tests();
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        // Fill every inode from 2..total with a non-zero mode.
+        let total = fs.total_inodes();
+        for inum in 2..total {
+            let mut ino = EfsInode::empty(inum);
+            ino.mode = 0o100644;
+            fs.write_inode(&ino).expect("write");
+        }
+        let err = fs.allocate_inode().expect_err("expected DiskFull");
+        assert!(matches!(err, FilesystemError::DiskFull(_)), "got {err:?}");
     }
 
     #[test]
