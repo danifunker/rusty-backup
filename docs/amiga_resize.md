@@ -438,6 +438,69 @@ Total: **~6 days**, matching Phase 10c's 4-6 estimate.
 Reference: `~/repos/amigasources/pfs3aio` (non-trivial read; the
 allocator + format code is in `disk.c` and `format.c`).
 
+### Phase PD — Defragmenting clone (✓ SHIPPED, alternative to P.2/P.3/P.4)
+
+Because PFS3's `rovingPointer` allocator scatters allocations
+throughout the volume, the in-place shrink floor reported by
+`last_data_byte` almost always equals the partition size — there's
+nearly always at least one allocated block sitting near the tail. To
+actually reclaim free space on a PFS3 volume, we needed a defragmenting
+path that rebuilds the on-disk layout packed at the smaller size.
+
+Rather than implement Phase P.2/P.3/P.4 (anode-aware in-place block
+relocation + reserved-area motion), we built `clone_pfs3_volume` in
+`src/fs/pfs3_clone.rs` modelled on the HFS clone pipeline:
+
+1. Format a blank target of exactly `target_size` via
+   `create_blank_pfs3`. Now sets `MODE_DATESTAMP` so dates we write
+   into direntries are honored without needing a real-Amiga mount.
+2. Walk the source's directory tree via `Filesystem::list_directory`,
+   replaying onto the target via `EditableFilesystem::create_directory`
+   / `create_file` / `create_symlink`. Each entry's
+   `amiga_protection`, `amiga_comment`, and `amiga_date` (new raw
+   `(i32,i32,i32)` triple on `FileEntry`) round-trip via
+   `CreateFileOptions` / `CreateDirectoryOptions`.
+3. Hardlinks are deferred to a second pass so any target order in the
+   source walk is OK; targets that never appear during the walk are
+   skipped with a warning.
+4. `stream_defragmented_pfs3` wraps the clone: build a blank target,
+   open it as `Pfs3Filesystem` over a tempfile (bounded RAM), clone,
+   then drain the tempfile into the backup pipeline's writer.
+
+Backup-pipeline integration: `DefragCloneShape::Pfs3` added next to
+`Flat` / `Wrapped`; `detect_defrag_clone_shape` dispatches by
+partition type string; both `src/backup/mod.rs` and
+`src/backup/single_file_chd.rs` producer threads now call the PFS3
+streamer for shape `Pfs3`. `has_defragmenting_writer` returns `true`
+for PFS3 type strings, so `pick_shrink_target` returns the
+defragmented value and the GUI's "Compact Space" checkbox lights up.
+
+Floor: `Pfs3Filesystem::defragmented_minimum_size` overrides the
+default `last_data_byte` and returns `used_size + 256 KiB` — a fast,
+conservative estimate that gives the GUI a useful pre-clone preview.
+The actual clone sizes precisely via `create_blank_pfs3`.
+
+**v1 limitations** (documented in `pfs3_clone.rs`):
+- PFS3 deldir (trashcan) is not enumerated by `list_directory`, so its
+  contents are dropped during clone. This is expected behavior;
+  surface as a warning in the GUI log.
+- Hardlinks: bidirectional — both the link's `extrafields.link`
+  (forward, resolver path) and the target's `extrafields.link` +
+  `linknode.next` chain (backward, "list all hardlinks to this file")
+  are wired. Mirrors pfs3aio `CreateLink` (`directory.c:2703-2727`).
+  The clone tracks target_anode → target_parent_anode in a
+  parent_map; pass 2 calls `register_hardlink_in_target_chain` after
+  each `create_hardlink`. In-place direntry patcher grows the target's
+  extrafields tail by 4-6 bytes; if the dirblock is full the patch
+  errors out (chain extension for that case is a future enhancement).
+- File body is buffered in a `Vec<u8>` per file during clone. Peak RAM
+  is bounded by the largest single source file. Future: streaming
+  pipe between source `write_file_to` and target `create_file`.
+
+Phase P.6 (`validate_pfs3_integrity`) and the rest of Phase P remain
+open for the pure in-place trim path; the defragmenting clone is the
+production answer for "shrink my PFS3 partition."
+
 ---
 
 ## Shared infrastructure (Phase X — do once)

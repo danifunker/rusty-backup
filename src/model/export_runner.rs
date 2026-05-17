@@ -77,10 +77,19 @@ fn new_status(total_bytes: u64) -> Arc<Mutex<ExportStatus>> {
 
 /// Build the per-partition config list. For classic HFS partitions, probes
 /// the source image to determine the volume's u16/VBM-derived size ceiling.
+///
+/// `partition_defrag_min_sizes` carries the defragmented-floor map for
+/// filesystems with a true defragmenting writer (HFS+, PFS3). When such
+/// a value is present and smaller than the in-place minimum, it's the
+/// useful shrink target — for PFS3 the in-place value typically equals
+/// the partition size (rovingPointer scatter) and only the defrag value
+/// surfaces real savings. Routed through `fs::pick_shrink_target` so
+/// per-FS policy decides which value to use.
 pub fn build_partition_configs(
     partitions: &[PartitionInfo],
     backup_metadata: Option<&BackupMetadata>,
     partition_min_sizes: &HashMap<usize, u64>,
+    partition_defrag_min_sizes: &HashMap<usize, u64>,
     image_file_path: Option<&PathBuf>,
 ) -> Vec<PartitionExportConfig> {
     let mut source_reader: Option<BufReader<File>> = image_file_path
@@ -92,16 +101,23 @@ pub fn build_partition_configs(
         if part.is_extended_container {
             continue;
         }
-        let min_size = backup_metadata
+        let backup_min = backup_metadata
             .and_then(|m| {
                 m.partitions
                     .iter()
                     .find(|pm| pm.index == part.index)
                     .map(|pm| pm.imaged_size_bytes)
             })
-            .filter(|&sz| sz > 0)
-            .or_else(|| partition_min_sizes.get(&part.index).copied())
-            .unwrap_or(part.size_bytes);
+            .filter(|&sz| sz > 0);
+        let live_in_place = partition_min_sizes.get(&part.index).copied();
+        let live_defrag = partition_defrag_min_sizes.get(&part.index).copied();
+        let live_min = crate::fs::pick_shrink_target(
+            part.partition_type_byte,
+            part.partition_type_string.as_deref(),
+            live_in_place,
+            live_defrag,
+        );
+        let min_size = backup_min.or(live_min).unwrap_or(part.size_bytes);
 
         let max_size = if let Some(reader) = source_reader.as_mut() {
             let is_hfs_candidate = part

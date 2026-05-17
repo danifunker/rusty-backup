@@ -700,11 +700,24 @@ pub fn detect_raw_rdb(reader: &mut (impl Read + Seek)) -> Option<Rdb> {
 /// partition therefore yields a smaller output file.
 ///
 /// Returns the total bytes written, equal to `plan.new_disk_size_bytes`.
+/// Reconstruct an RDB-on-RAW disk into `writer`, applying `partition_sizes`
+/// overrides.
+///
+/// `pfs3_clone_source`: when `Some(path)`, PFS3 partitions whose
+/// `export_size < source_size` (i.e. a real shrink) are rebuilt via
+/// [`crate::fs::pfs3_clone::stream_defragmented_pfs3`] instead of
+/// being copied verbatim + in-place trimmed. The path is opened with
+/// a fresh `File` for each PFS3 partition so the clone has its own
+/// reader independent of the byte-copy `reader` above. When `None`,
+/// all partitions fall back to the legacy verbatim-copy + in-place
+/// resize path (`resize_filesystem_for`), which can only trim
+/// trailing free sectors and typically refuses real shrinks on PFS3.
 pub fn reconstruct_raw_rdb_disk(
     reader: &mut (impl Read + Seek),
     source_data_size: u64,
     writer: &mut (impl Read + Write + Seek),
     partition_sizes: &[PartitionSizeOverride],
+    pfs3_clone_source: Option<&std::path::Path>,
     progress_cb: &mut impl FnMut(u64),
     cancel_check: &impl Fn() -> bool,
     log_cb: &mut impl FnMut(&str),
@@ -781,6 +794,10 @@ pub fn reconstruct_raw_rdb_disk(
     // --- 3. Copy each partition. ---
     let mut plans: Vec<_> = plan.partition_plans.clone();
     plans.sort_by_key(|p| p.dest_lba);
+    // Track partitions whose data was emitted via the PFS3 clone path —
+    // they're already complete and must skip the in-place fixup below
+    // (which would refuse the shrink and emit a misleading error).
+    let mut clone_emitted: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for p in &plans {
         if cancel_check() {
             bail!("export cancelled");
@@ -810,6 +827,87 @@ pub fn reconstruct_raw_rdb_disk(
         // Make sure subsequent partition writes land at dest_offset, not
         // wherever the writer happened to be left.
         writer.seek(SeekFrom::Start(dest_offset))?;
+
+        // PFS3 shrink fast-path: clone the source PFS3 volume into the
+        // destination at `export_size` bytes rather than copying source
+        // bytes verbatim. The in-place trim (`resize_pfs3_in_place`) is
+        // useless on most PFS3 volumes because the rovingPointer
+        // allocator scatters blocks throughout the volume — any
+        // allocated tail block forces `last_data_byte ≈ partition_size`
+        // and the in-place resize refuses. The clone rebuilds the
+        // layout packed, achieving the defragmented floor.
+        //
+        // Gated by `pfs3_clone_source` being set AND
+        // `export_size < copy_size` (an actual shrink). Grow / no-op
+        // paths still fall through to the verbatim copy below.
+        let is_pfs3 = crate::fs::is_amiga_pfs3_type(&p.dos_type_string);
+        // `copy_size = min(original, export)` so on any shrink it
+        // equals `export_size` — use `original_size` instead to
+        // detect a real shrink request.
+        let is_shrink = p.export_size < p.original_size;
+        if is_pfs3 && is_shrink {
+            if let Some(src_path) = pfs3_clone_source {
+                log_cb(&format!(
+                    "  [{}] PFS3 shrink: rebuilding volume via defragmenting clone \
+                     ({} -> {} bytes)",
+                    p.dos_type_string, p.copy_size, p.export_size
+                ));
+                let src_file = std::fs::File::open(src_path)
+                    .with_context(|| format!("open PFS3 clone source {}", src_path.display()))?;
+                let src_br = std::io::BufReader::new(src_file);
+                let mut src_fs = crate::fs::pfs3::Pfs3Filesystem::open(src_br, p.source_lba * 512)
+                    .with_context(|| {
+                        format!("open source PFS3 at LBA {} for clone-shrink", p.source_lba)
+                    })?;
+                let base_written = total_written;
+                let export_size = p.export_size;
+                let report = {
+                    let log_cb_ref = &mut *log_cb;
+                    let progress_cb_ref = &mut *progress_cb;
+                    let dos_label = p.dos_type_string.clone();
+                    let mut clone_log = |s: &str| {
+                        log_cb_ref(&format!("  [{}] {}", dos_label, s));
+                    };
+                    let mut clone_progress = |emitted: u64| {
+                        progress_cb_ref(base_written + emitted.min(export_size));
+                    };
+                    crate::fs::pfs3_clone::stream_defragmented_pfs3(
+                        &mut src_fs,
+                        export_size,
+                        writer,
+                        &mut clone_log,
+                        &mut clone_progress,
+                    )
+                    .with_context(|| format!("clone-shrink PFS3 partition '{}'", p.drv_name))?
+                };
+                for w in &report.warnings {
+                    log_cb(&format!(
+                        "  [{}] PFS3 clone warning: {w}",
+                        p.dos_type_string
+                    ));
+                }
+                log_cb(&format!(
+                    "  [{}] PFS3 clone: {} files / {} dirs / {} symlinks / {} hardlinks / \
+                     {} data bytes",
+                    p.dos_type_string,
+                    report.files_copied,
+                    report.dirs_copied,
+                    report.symlinks_copied,
+                    report.hardlinks_copied,
+                    report.bytes_copied,
+                ));
+                total_written += p.export_size;
+                progress_cb(total_written);
+                clone_emitted.insert(p.dest_lba);
+                continue;
+            } else {
+                log_cb(&format!(
+                    "  [{}] PFS3 shrink requested but no clone source provided; \
+                     falling back to in-place trim (likely to fail)",
+                    p.dos_type_string
+                ));
+            }
+        }
 
         // Copy the actual partition bytes from the source.
         let source_offset = p.source_lba * 512;
@@ -851,6 +949,13 @@ pub fn reconstruct_raw_rdb_disk(
 
     // --- 4. Per-partition filesystem fixup for resized partitions. ---
     for p in &plans {
+        // Partitions emitted via the PFS3 clone path are already
+        // complete + internally consistent — running the in-place
+        // resize over them would scribble on a fresh volume and
+        // (because export_size < the source's last_data_byte) fail.
+        if clone_emitted.contains(&p.dest_lba) {
+            continue;
+        }
         if p.export_size == (p.copy_size).max(p.export_size).min(p.export_size)
             && p.source_lba == p.dest_lba
             && {

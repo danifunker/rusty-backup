@@ -473,6 +473,7 @@ pub fn export_whole_disk_vhd(
                     source_data_size,
                     &mut file,
                     partition_sizes,
+                    Some(source_path),
                     &mut progress_cb,
                     &cancel_check,
                     &mut log_cb,

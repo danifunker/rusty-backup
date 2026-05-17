@@ -205,6 +205,11 @@ pub struct RdbRestorePlan {
 pub struct RdbPartitionPlan {
     pub source_lba: u64,
     pub dest_lba: u64,
+    /// Original (pre-resize) partition size from the source RDB. Needed
+    /// to detect "this partition was actually shrunk" — `copy_size`
+    /// alone is `min(original, export_size)`, so it equals `export_size`
+    /// on any shrink and can't distinguish shrink from grow / no-op.
+    pub original_size: u64,
     pub copy_size: u64,
     pub export_size: u64,
     pub dos_type_string: String,
@@ -353,6 +358,7 @@ impl Rdb {
             plans.push(RdbPartitionPlan {
                 source_lba,
                 dest_lba,
+                original_size,
                 copy_size: original_size.min(aligned_export_size),
                 // Surface the rounded size so resize_filesystem_for and the
                 // copy/zero-fill loop work in sync with what's recorded in

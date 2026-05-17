@@ -215,6 +215,12 @@ pub struct CreateFileOptions {
     /// AmigaDOS filenote (comment, up to 79 bytes). Ignored on
     /// non-Amiga filesystems.
     pub amiga_comment: Option<String>,
+    /// AmigaDOS raw datestamp triple `(days, minutes, ticks)` since
+    /// 1978-01-01. When set, written verbatim into the on-disk entry so
+    /// dates round-trip through clone/restore. Ignored on non-Amiga
+    /// filesystems. Default `None` leaves the date zero (which display
+    /// tools render as the epoch).
+    pub amiga_dates: Option<(i32, i32, i32)>,
 }
 
 /// Options for creating a directory on an editable filesystem.
@@ -226,6 +232,12 @@ pub struct CreateDirectoryOptions {
     pub uid: Option<u32>,
     /// Unix group ID (default 0). Ignored on FAT/exFAT/NTFS.
     pub gid: Option<u32>,
+    /// AmigaDOS protection bits. See `CreateFileOptions::amiga_protection`.
+    pub amiga_protection: Option<u32>,
+    /// AmigaDOS filenote (comment). See `CreateFileOptions::amiga_comment`.
+    pub amiga_comment: Option<String>,
+    /// AmigaDOS raw datestamp triple. See `CreateFileOptions::amiga_dates`.
+    pub amiga_dates: Option<(i32, i32, i32)>,
 }
 
 /// Source for resource fork data (HFS/HFS+ only).
@@ -364,6 +376,42 @@ pub trait EditableFilesystem: Filesystem {
     fn set_blessed_folder(&mut self, _entry: &FileEntry) -> Result<(), FilesystemError> {
         Err(FilesystemError::Unsupported(
             "set_blessed_folder not supported for this filesystem".into(),
+        ))
+    }
+
+    /// Create a symbolic link in `parent` pointing at `target` (a path
+    /// string interpreted by the filesystem's own resolver semantics).
+    /// Returns the new symlink's entry. Default returns `Unsupported` —
+    /// override on filesystems that support symlinks (PFS3, AFFS,
+    /// ext, etc).
+    fn create_symlink(
+        &mut self,
+        _parent: &FileEntry,
+        _name: &str,
+        _target: &str,
+        _options: &CreateFileOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        Err(FilesystemError::Unsupported(
+            "create_symlink not supported for this filesystem".into(),
+        ))
+    }
+
+    /// Create a hard link in `parent` pointing at an existing entry
+    /// already on this filesystem. `target` must be an entry returned
+    /// by a previous `create_file` / `create_directory` / `list_directory`
+    /// call on this same volume — its `location` identifies the inode /
+    /// anode / CNID that the new link references. Returns the new
+    /// hardlink's entry. Default returns `Unsupported` — override on
+    /// filesystems that support hardlinks (PFS3, HFS+, ext, etc).
+    fn create_hardlink(
+        &mut self,
+        _parent: &FileEntry,
+        _name: &str,
+        _target: &FileEntry,
+        _options: &CreateFileOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        Err(FilesystemError::Unsupported(
+            "create_hardlink not supported for this filesystem".into(),
         ))
     }
 }

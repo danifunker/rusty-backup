@@ -724,6 +724,7 @@ impl<R: Read + Seek> AffsFilesystem<R> {
         if !entry.comment.is_empty() {
             fe.amiga_comment = Some(entry.comment.clone());
         }
+        fe.amiga_date = Some((entry.modify_days, entry.modify_mins, entry.modify_ticks));
         fe
     }
 
@@ -1988,7 +1989,7 @@ fn find_affs_root_block(
     partition_offset: u64,
     upper_total: u32,
 ) -> anyhow::Result<Option<u32>> {
-    let probe_at = |device: &mut (dyn AffsRootProbe), blk: u32| -> std::io::Result<bool> {
+    let probe_at = |device: &mut dyn AffsRootProbe, blk: u32| -> std::io::Result<bool> {
         let mut buf = [0u8; BSIZE];
         device.read_block(partition_offset + blk as u64 * BSIZE_U64, &mut buf)?;
         if read_i32(&buf, BSIZE - 4) != ST_ROOT {

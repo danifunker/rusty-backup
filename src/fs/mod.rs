@@ -23,6 +23,7 @@ pub mod mac_alias;
 pub mod ntfs;
 pub mod patch;
 pub mod pfs3;
+pub mod pfs3_clone;
 pub mod prodos;
 pub mod prodos_types;
 pub mod resource_fork;
@@ -716,11 +717,15 @@ pub fn is_layout_preserving_fs(partition_type: u8, partition_type_string: Option
 /// clone re-emits the volume packed at the smaller size — so picking it as
 /// the shrink target is safe.
 ///
-/// Currently: HFS+/HFSX (via `stream_defragmented_hfsplus`). HFS (classic),
-/// ext, btrfs, and ProDOS still rely on the layout-preserving reader and
-/// must use the in-place trim instead.
+/// Currently: HFS+/HFSX (via `stream_defragmented_hfsplus`) and PFS3
+/// (via `clone_pfs3_volume`). HFS (classic), ext, btrfs, ProDOS, AFFS,
+/// and SFS still rely on the layout-preserving reader and must use the
+/// in-place trim instead.
 pub fn has_defragmenting_writer(partition_type: u8, partition_type_string: Option<&str>) -> bool {
     if let Some(s) = partition_type_string {
+        if is_amiga_pfs3_type(s) {
+            return true;
+        }
         return matches!(s, "Apple_HFS" | "Apple_HFSX" | "Apple_HFS+");
     }
     matches!(partition_type, 0xAF)
@@ -1613,6 +1618,10 @@ pub enum DefragCloneShape {
     /// HFS wrapper with an embedded HFS+/HFSX inside (Mac OS 8/9 style).
     /// Use [`hfsplus_wrapper_clone::stream_wrapped_defragmented_hfsplus`].
     Wrapped,
+    /// PFS3 volume (DosType `PFS\3`, `PDS\3`, `muFS`). Use
+    /// [`pfs3_clone::stream_defragmented_pfs3`]. Two-pass walk via the
+    /// EditableFilesystem trait; tempfile-backed to bound RAM.
+    Pfs3,
 }
 
 /// Pre-flight check for the streamed defrag-clone backup path. Returns
@@ -1685,6 +1694,46 @@ pub fn can_defrag_clone_hfsplus<R: Read + Seek>(
     partition_offset: u64,
 ) -> Result<(), String> {
     defrag_clone_shape(reader, partition_offset).map(|_| ())
+}
+
+/// Unified defrag-clone preflight that dispatches by partition type
+/// string. Returns the shape (`Flat` / `Wrapped` for HFS+/HFSX, `Pfs3`
+/// for PFS3) or `Err(reason)` when no clone path is available. The
+/// backup pipeline calls this once per partition that opted in to
+/// shrink-to-defragmented-minimum.
+pub fn detect_defrag_clone_shape<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    partition_type_string: Option<&str>,
+) -> Result<DefragCloneShape, String> {
+    if let Some(s) = partition_type_string {
+        if is_amiga_pfs3_type(s) {
+            // PFS3 sanity check: rootblock id at block 2.
+            if reader
+                .seek(SeekFrom::Start(partition_offset + 2 * 512))
+                .is_err()
+            {
+                return Err("failed to seek to PFS3 rootblock".into());
+            }
+            let mut id = [0u8; 4];
+            if reader.read_exact(&mut id).is_err() {
+                return Err("failed to read PFS3 rootblock id".into());
+            }
+            if &id == b"PFS\x01"
+                || &id == b"PFS\x02"
+                || &id == b"AFS\x01"
+                || &id == b"muPF"
+                || &id == b"muAF"
+            {
+                return Ok(DefragCloneShape::Pfs3);
+            }
+            return Err(format!(
+                "partition tagged {s} but rootblock id {:?} is not PFS3",
+                id
+            ));
+        }
+    }
+    defrag_clone_shape(reader, partition_offset)
 }
 
 /// Returns `"HFS+"`, `"HFSX"`, `"HFS"`, or `"unknown"`. Useful for updating

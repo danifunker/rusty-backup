@@ -598,19 +598,21 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                     continue;
                 }
             }
-            // Only HFS+/HFSX partitions participate. Skip silently otherwise —
-            // the flag is global; non-HFS+ partitions just keep their default
-            // compaction path.
-            let probe = source
+            // Only HFS+/HFSX and PFS3 partitions participate. Skip
+            // silently for other FS types — the flag is global; they
+            // keep their default compaction path.
+            let pts = part.partition_type_string.as_deref();
+            let is_hfsplus = source
                 .get_ref()
                 .try_clone()
                 .ok()
-                .map(|c| {
+                .and_then(|c| {
                     let mut br = BufReader::new(c);
                     fs::probe_hfsplus_signature(&mut br, part.start_lba * 512)
                 })
-                .unwrap_or(None);
-            if probe.is_none() {
+                .is_some();
+            let is_pfs3 = pts.map(fs::is_amiga_pfs3_type).unwrap_or(false);
+            if !is_hfsplus && !is_pfs3 {
                 continue;
             }
             let target = match defragmented_min_sizes[i] {
@@ -629,14 +631,15 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 }
             };
             // Pre-flight on a fresh reader. Returns the shape (Flat or
-            // Wrapped) that the streaming side should use.
+            // Wrapped for HFS+/HFSX, Pfs3 for PFS3) that the streaming
+            // side should use.
             let pf = source
                 .get_ref()
                 .try_clone()
                 .map_err(|e| anyhow::anyhow!("clone source for shrink-preflight: {e}"))
                 .and_then(|c| {
                     let mut br = BufReader::new(c);
-                    fs::defrag_clone_shape(&mut br, part.start_lba * 512)
+                    fs::detect_defrag_clone_shape(&mut br, part.start_lba * 512, pts)
                         .map_err(|reason| anyhow::anyhow!("{reason}"))
                 });
             match pf {
@@ -644,6 +647,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                     let shape_label = match shape {
                         fs::DefragCloneShape::Flat => "flat HFS+",
                         fs::DefragCloneShape::Wrapped => "wrapped HFS+ (HFS shell preserved)",
+                        fs::DefragCloneShape::Pfs3 => "PFS3 (Amiga)",
                     };
                     log(
                         &progress,
@@ -994,6 +998,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                     match shape {
                         fs::DefragCloneShape::Flat => "flat HFS+",
                         fs::DefragCloneShape::Wrapped => "wrapped HFS+",
+                        fs::DefragCloneShape::Pfs3 => "PFS3 (Amiga)",
                     },
                 ),
             );
@@ -1008,6 +1013,45 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             let producer =
                 std::thread::spawn(move || -> Result<fs::hfsplus_defrag::DefragReport> {
                     let report = match shape {
+                        fs::DefragCloneShape::Pfs3 => {
+                            let br = BufReader::new(producer_clone);
+                            let mut pfs = fs::pfs3::Pfs3Filesystem::open(br, part_offset)
+                                .context("open source PFS3 for defrag-clone")?;
+                            let progress_log_inner = Arc::clone(&progress_log_prod);
+                            let mut clone_log = |s: &str| {
+                                log(&progress_log_inner, LogLevel::Info, s.to_string());
+                            };
+                            let mut clone_progress = |_emitted: u64| {};
+                            let pr = fs::pfs3_clone::stream_defragmented_pfs3(
+                                &mut pfs,
+                                target_size,
+                                &mut writer,
+                                &mut clone_log,
+                                &mut clone_progress,
+                            )
+                            .context("stream_defragmented_pfs3")?;
+                            // Forward PFS3 warnings (skipped hardlinks,
+                            // deldir contents, etc) into the GUI log.
+                            for w in &pr.warnings {
+                                log(
+                                    &progress_log_prod,
+                                    LogLevel::Warning,
+                                    format!("PFS3 clone: {w}"),
+                                );
+                            }
+                            // Map PFS3 counters onto DefragReport so
+                            // the existing log line below renders.
+                            fs::hfsplus_defrag::DefragReport {
+                                files_copied: pr.files_copied,
+                                dirs_copied: pr.dirs_copied,
+                                data_bytes_copied: pr.bytes_copied,
+                                rsrc_bytes_copied: 0,
+                                xattrs_copied: 0,
+                                hardlinks_copied: pr.hardlinks_copied,
+                                dir_hardlinks_copied: 0,
+                                bytes_emitted: target_size,
+                            }
+                        }
                         fs::DefragCloneShape::Flat => {
                             let br = BufReader::new(producer_clone);
                             let mut hfs = fs::hfsplus::HfsPlusFilesystem::open(br, part_offset)

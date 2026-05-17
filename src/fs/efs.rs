@@ -368,6 +368,7 @@ impl<R: Read + Seek + Send> Filesystem for EfsFilesystem<R> {
             link_target_cnid: None,
             amiga_protection: None,
             amiga_comment: None,
+            amiga_date: None,
         })
     }
 
@@ -461,6 +462,7 @@ impl<R: Read + Seek + Send> Filesystem for EfsFilesystem<R> {
                                 link_target_cnid: None,
                                 amiga_protection: None,
                                 amiga_comment: None,
+                                amiga_date: None,
                             };
                             if matches!(e.entry_type, EntryType::Directory) {
                                 e.size = 0;

@@ -1109,6 +1109,7 @@ impl InspectTab {
             &self.partitions,
             self.backup_metadata.as_ref(),
             &self.partition_min_sizes,
+            &self.partition_defrag_min_sizes,
             self.image_file_path.as_ref(),
         );
     }
@@ -1262,6 +1263,62 @@ impl InspectTab {
                                 );
                                 ui.end_row();
                             }
+                        });
+                    ui.add_space(4.0);
+                }
+
+                // Limitations banner when at least one PFS3 partition is
+                // being shrunk. Export goes through the defragmenting
+                // clone path (`stream_defragmented_pfs3`), which rebuilds
+                // the volume layout — surface the user-visible side
+                // effects up-front so they're not surprised after the
+                // export completes.
+                let pfs3_shrink_partitions: Vec<&str> = self
+                    .export_partition_configs
+                    .iter()
+                    .filter(|cfg| cfg.effective_size() < cfg.original_size)
+                    .filter_map(|cfg| {
+                        self.partitions
+                            .iter()
+                            .find(|p| p.index == cfg.index)
+                            .and_then(|p| p.partition_type_string.as_deref())
+                            .filter(|s| rusty_backup::fs::is_amiga_pfs3_type(s))
+                            .map(|_| cfg.type_name.as_str())
+                    })
+                    .collect();
+                if !pfs3_shrink_partitions.is_empty() {
+                    egui::Frame::group(ui.style())
+                        .fill(ui.visuals().widgets.noninteractive.bg_fill)
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new("PFS3 shrink: volume will be rebuilt")
+                                    .strong(),
+                            );
+                            ui.label(format!(
+                                "Affected partitions: {}",
+                                pfs3_shrink_partitions.join(", ")
+                            ));
+                            ui.label(
+                                "PFS3's allocator scatters blocks throughout the volume, so \
+                                 in-place trim can't free up space. The export pipeline will \
+                                 instead walk the source and rebuild a packed copy at the new \
+                                 size — limitations to be aware of:",
+                            );
+                            ui.label(
+                                "  - PFS3 trashcan (deldir) contents are NOT preserved.",
+                            );
+                            ui.label(
+                                "  - File data, directory tree, protection bits, comments, \
+                                 dates, softlinks, and hardlinks (both directions) ARE preserved.",
+                            );
+                            ui.label(
+                                "  - Operation is slower than a verbatim copy: every file is \
+                                 read from the source and re-written to the destination.",
+                            );
+                            ui.label(
+                                "  - Uses a tempfile for the rebuilt image; ensure your \
+                                 temp directory has enough free space for the target partition size.",
+                            );
                         });
                     ui.add_space(4.0);
                 }

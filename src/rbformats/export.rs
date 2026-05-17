@@ -4,7 +4,7 @@
 //! functions that delegate to the appropriate format-specific code.
 
 use std::fs::File;
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -442,15 +442,21 @@ pub fn export_whole_disk(
                 .open(dest_path)
                 .with_context(|| format!("failed to create {}", dest_path.display()))?;
 
+            // TEMP: PFS3 defragmenting clone is disabled while the
+            // per-insert cost is investigated — `None` here forces the
+            // in-place trim path (`resize_pfs3_in_place`).
+            // See docs/pfs3_clone.md / memory pfs3_clone.md.
             total_written = super::reconstruct_raw_rdb_disk(
                 &mut reader,
                 source_data_size,
                 &mut file,
                 partition_sizes,
+                None,
                 &mut progress_cb,
                 &cancel_check,
                 &mut log_cb,
             )?;
+            let _ = source_path;
             file.flush()?;
 
             log_cb(&format!(
@@ -771,7 +777,7 @@ pub fn export_whole_disk_chd(
     source_path: &Path,
     backup_metadata: Option<&BackupMetadata>,
     _mbr_bytes: Option<&[u8; 512]>,
-    _partition_sizes: &[PartitionSizeOverride],
+    partition_sizes: &[PartitionSizeOverride],
     dest_path: &Path,
     profile: super::chd_options::ChdProfile,
     chd_options: Option<super::chd_options::ChdOptions>,
@@ -789,9 +795,68 @@ pub fn export_whole_disk_chd(
     let fmt = super::detect_image_format_with_path(file, Some(source_path))?;
     let (mut reader, source_data_size) = super::wrap_image_reader(file2, fmt)?;
 
+    // RDB-with-resize: route through reconstruct_raw_rdb_disk first
+    // (which also picks up the PFS3 defragmenting clone for shrinks),
+    // then compress the reconstructed image to CHD. The intermediate
+    // tempfile is bounded by the new disk size; smaller than the
+    // source when partitions are shrunk.
+    let rdb_resize_required =
+        !partition_sizes.is_empty() && profile == super::chd_options::ChdProfile::Hd && {
+            // Reuse the detector but reset the reader afterwards.
+            let mut probe_file = File::open(source_path)
+                .with_context(|| format!("reopen {} for RDB probe", source_path.display()))?;
+            let detected = super::detect_raw_rdb(&mut probe_file).is_some();
+            detected
+        };
+
     // compress_chd writes "<base>.chd" — strip the trailing extension from
     // dest_path so the output filename matches what the caller asked for.
     let output_base = dest_path.with_extension("");
+
+    if rdb_resize_required {
+        let tmp =
+            tempfile::tempfile().with_context(|| "create tempfile for RDB-resize CHD export")?;
+        let mut tmp = tmp;
+        // Pre-grow the tempfile if needed: reconstruct_raw_rdb_disk
+        // writes into a Read+Write+Seek sink.
+        let mut tmp_for_reconstruct = tmp.try_clone()?;
+        let mut rdb_reader = BufReader::new(
+            File::open(source_path)
+                .with_context(|| format!("reopen {} for RDB export", source_path.display()))?,
+        );
+        // TEMP: PFS3 defragmenting clone disabled — see Raw RDB export
+        // call site above for context.
+        let total_written = super::reconstruct_raw_rdb_disk(
+            &mut rdb_reader,
+            source_data_size,
+            &mut tmp_for_reconstruct,
+            partition_sizes,
+            None,
+            &mut progress_cb,
+            &cancel_check,
+            &mut log_cb,
+        )?;
+        tmp_for_reconstruct.flush()?;
+        drop(tmp_for_reconstruct);
+        tmp.seek(SeekFrom::Start(0))?;
+
+        let names = super::chd::compress_chd(
+            &mut tmp,
+            &output_base,
+            total_written,
+            None,
+            chd_options,
+            &mut progress_cb,
+            &cancel_check,
+            &mut log_cb,
+        )?;
+        log_cb(&format!(
+            "CHD export complete (RDB reconstructed): {} file(s) written ({} data bytes)",
+            names.len(),
+            total_written,
+        ));
+        return Ok(());
+    }
 
     let names = match profile {
         super::chd_options::ChdProfile::Hd => super::chd::compress_chd(

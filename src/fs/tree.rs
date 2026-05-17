@@ -160,6 +160,7 @@ mod tests {
                 link_target_cnid: None,
                 amiga_protection: None,
                 amiga_comment: None,
+                amiga_date: None,
             })
         }
 
@@ -185,6 +186,7 @@ mod tests {
                         link_target_cnid: None,
                         amiga_protection: None,
                         amiga_comment: None,
+                        amiga_date: None,
                     },
                     FileEntry {
                         name: "ReadMe".into(),
@@ -205,6 +207,7 @@ mod tests {
                         link_target_cnid: None,
                         amiga_protection: None,
                         amiga_comment: None,
+                        amiga_date: None,
                     },
                 ]),
                 "/Documents" => Ok(vec![FileEntry {
@@ -226,6 +229,7 @@ mod tests {
                     link_target_cnid: None,
                     amiga_protection: None,
                     amiga_comment: None,
+                    amiga_date: None,
                 }]),
                 _ => Ok(vec![]),
             }
