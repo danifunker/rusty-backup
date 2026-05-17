@@ -28,7 +28,8 @@ use std::collections::HashSet;
 use std::io::{Read, Seek};
 
 use super::efs::{
-    parse_dir_block, EfsFilesystem, EfsSuperblock, EFS_BLOCKSIZE, EFS_DIRECTEXTENTS_MAX,
+    parse_dir_block, resolve_owned_extents, EfsExtent, EfsFilesystem, EfsSuperblock, EFS_BLOCKSIZE,
+    EFS_DIRECTEXTENTS_MAX,
 };
 use super::filesystem::FilesystemError;
 use super::fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry};
@@ -107,6 +108,39 @@ impl Builder {
     }
 }
 
+fn walk_extent(
+    b: &mut Builder,
+    allocated: &mut HashSet<u32>,
+    sb: &EfsSuperblock,
+    inum: u32,
+    ext: &EfsExtent,
+    label: &str,
+    idx: usize,
+) {
+    if ext.length == 0 {
+        return;
+    }
+    let end = ext.bn.saturating_add(ext.length as u32);
+    if end > sb.fs_size {
+        b.err(
+            "ExtentPastVolume",
+            format!(
+                "inode {inum} {label} extent {idx}: [{}..{}) extends past fs_size {}",
+                ext.bn, end, sb.fs_size
+            ),
+        );
+        return;
+    }
+    for blk in ext.bn..end {
+        if !allocated.insert(blk) {
+            b.err(
+                "DoubleAllocation",
+                format!("block {blk} (inode {inum} {label} extent {idx}) also allocated elsewhere"),
+            );
+        }
+    }
+}
+
 /// Run the verifier. Requires read-only access; the editable surface
 /// `R: Read + Write + Seek + Send` works fine here because all
 /// methods used are inherited from the read-only impl.
@@ -144,49 +178,34 @@ pub fn fsck_efs<R: Read + Seek>(fs: &mut EfsFilesystem<R>) -> Result<FsckResult,
         } else {
             b.files_checked += 1;
         }
-        if ino.numextents as usize > EFS_DIRECTEXTENTS_MAX {
-            b.err(
-                "TooManyExtents",
-                format!(
-                    "inode {inum} has numextents={} (max {EFS_DIRECTEXTENTS_MAX})",
-                    ino.numextents
-                ),
-            );
-        }
-        for i in 0..(ino.numextents as usize).min(EFS_DIRECTEXTENTS_MAX) {
-            let ext = ino.extents[i];
+        // Walk both data extents and (in indirect mode) the inode's
+        // indirect-block runs themselves — both occupy bitmap-tracked
+        // disk regions and both count toward this inode's allocation.
+        let pofs = fs.partition_offset_value();
+        let (data_exts, indirect_exts) =
+            match resolve_owned_extents(fs.raw_reader_mut(), pofs, &ino) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    b.err("IndirectExtentReadFailed", format!("inode {inum}: {e}"));
+                    continue;
+                }
+            };
+        for (i, ext) in data_exts.iter().enumerate() {
             if ext.magic != 0 {
                 b.err(
                     "ExtentBadMagic",
                     format!(
-                        "inode {inum} extent {i}: magic=0x{:02X} (expected 0)",
+                        "inode {inum} data extent {i}: magic=0x{:02X} (expected 0)",
                         ext.magic
                     ),
                 );
             }
-            if ext.length == 0 {
-                continue;
-            }
-            let end = ext.bn.saturating_add(ext.length as u32);
-            if end > sb.fs_size {
-                b.err(
-                    "ExtentPastVolume",
-                    format!(
-                        "inode {inum} extent {i}: [{}..{}) extends past fs_size {}",
-                        ext.bn, end, sb.fs_size
-                    ),
-                );
-                continue;
-            }
-            for blk in ext.bn..end {
-                if !allocated.insert(blk) {
-                    b.err(
-                        "DoubleAllocation",
-                        format!("block {blk} allocated to inode {inum} but also to another inode"),
-                    );
-                }
-            }
+            walk_extent(&mut b, &mut allocated, &sb, inum, ext, "data", i);
         }
+        for (i, ext) in indirect_exts.iter().enumerate() {
+            walk_extent(&mut b, &mut allocated, &sb, inum, ext, "indirect-index", i);
+        }
+        let _ = EFS_DIRECTEXTENTS_MAX;
     }
 
     if let Some(bm) = bitmap {

@@ -693,8 +693,14 @@ pub fn compute_conservative_floor<R: Read + Seek>(
         if inode_block_end > highest {
             highest = inode_block_end;
         }
-        for i in 0..(ino.numextents as usize).min(EFS_DIRECTEXTENTS_MAX) {
-            let ext = ino.extents[i];
+        // For indirect-mode inodes (numextents > 12) the inode's own
+        // extent slots describe indirect index blocks rather than data;
+        // resolve_owned_extents returns both sets so the shrink floor
+        // covers every block that must survive truncation.
+        let pofs = fs.partition_offset_value();
+        let (data_exts, indirect_exts) =
+            super::efs::resolve_owned_extents(fs.raw_reader_mut(), pofs, &ino)?;
+        for ext in data_exts.iter().chain(indirect_exts.iter()) {
             if ext.length == 0 {
                 continue;
             }
@@ -704,6 +710,7 @@ pub fn compute_conservative_floor<R: Read + Seek>(
             }
         }
     }
+    let _ = EFS_DIRECTEXTENTS_MAX;
     Ok(highest)
 }
 
