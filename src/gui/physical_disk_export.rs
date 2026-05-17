@@ -67,6 +67,8 @@ pub struct PhysicalDiskExport {
     size_mode: SizeMode,
     custom_size_mib: u32,
     write_status: Option<Arc<Mutex<PhysicalWriteStatus>>>,
+    /// Rate / ETA estimator for the disk-write progress bar.
+    write_rate: super::progress::RateTracker,
     /// Source snapshot taken when the sub-window was opened.
     source: Option<PhysicalDiskExportSource>,
     last_error: Option<String>,
@@ -86,6 +88,7 @@ impl Default for PhysicalDiskExport {
             size_mode: SizeMode::Original,
             custom_size_mib: 0,
             write_status: None,
+            write_rate: super::progress::RateTracker::default(),
             source: None,
             last_error: None,
         }
@@ -361,7 +364,15 @@ impl PhysicalDiskExport {
                 0.0
             };
             let text = if total > 0 {
-                format!("{} / {} bytes ({:.0}%)", current, total, frac * 100.0)
+                self.write_rate.record(current, "Writing to disk");
+                let suffix = self.write_rate.suffix(current, total);
+                format!(
+                    "{} / {} ({:.0}%){}",
+                    rusty_backup::partition::format_size(current),
+                    rusty_backup::partition::format_size(total),
+                    frac * 100.0,
+                    suffix,
+                )
             } else {
                 "preparing...".to_string()
             };
@@ -433,6 +444,7 @@ impl PhysicalDiskExport {
         };
         self.last_error = None;
         self.write_status = Some(physical_write_runner::start_physical_write(req));
+        self.write_rate.reset();
     }
 
     fn resolved_alignment(&self) -> WrapAlignment {

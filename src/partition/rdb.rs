@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Seek, SeekFrom};
 
 use crate::error::RustyBackupError;
+use crate::partition::PartitionSizeOverride;
 
 pub const RDSK_SIGNATURE: &[u8; 4] = b"RDSK";
 pub const PART_SIGNATURE: &[u8; 4] = b"PART";
@@ -171,6 +172,247 @@ impl Rdb {
 
         Ok(Rdb { header, partitions })
     }
+}
+
+/// Result of `Rdb::patch_for_restore`. Carries the patched RDSK + each
+/// modified PART block as raw 512-byte buffers (already checksummed and
+/// ready to write at the recorded `block_num`), plus the new total disk
+/// size in bytes derived from the highest partition end after patching.
+///
+/// Unmodified RDB-region blocks (FSHD/LSEG driver chain, bad-block list,
+/// etc.) are NOT re-emitted here — the caller is expected to copy the
+/// first `RDB_SCAN_BLOCKS` sectors verbatim from the source and then
+/// overlay these patched blocks on top, so anything we don't understand
+/// survives the round-trip byte-for-byte.
+pub struct RdbRestorePlan {
+    /// `(block_num, 512-byte buffer)` for the patched RDSK header.
+    pub rdsk_block: (u64, [u8; 512]),
+    /// `(block_num, 512-byte buffer)` for each patched PART entry,
+    /// in the same order as `Rdb::partitions`.
+    pub part_blocks: Vec<(u64, [u8; 512])>,
+    /// Per-partition copy plan in source-order: (override-resolved
+    /// source/dest LBAs, copy size from source, requested export size,
+    /// dos-type string, drv_name). Used by the reconstruct path so it
+    /// doesn't need to re-derive geometry from the patched blocks.
+    pub partition_plans: Vec<RdbPartitionPlan>,
+    /// New total disk size in bytes = max(partition end LBA × 512).
+    /// At least `RDB_SCAN_BLOCKS * 512` so the RDB region fits.
+    pub new_disk_size_bytes: u64,
+}
+
+/// Per-partition copy plan emitted by `Rdb::patch_for_restore`.
+#[derive(Debug, Clone)]
+pub struct RdbPartitionPlan {
+    pub source_lba: u64,
+    pub dest_lba: u64,
+    /// Original (pre-resize) partition size from the source RDB. Needed
+    /// to detect "this partition was actually shrunk" — `copy_size`
+    /// alone is `min(original, export_size)`, so it equals `export_size`
+    /// on any shrink and can't distinguish shrink from grow / no-op.
+    pub original_size: u64,
+    pub copy_size: u64,
+    pub export_size: u64,
+    pub dos_type_string: String,
+    pub drv_name: String,
+}
+
+impl Rdb {
+    /// Patch the RDB for restore with the given partition-size overrides.
+    ///
+    /// Match overrides to partitions by their source `start_lba_512()`.
+    /// When an override is present:
+    /// - Use `effective_start_lba()` for the partition's new start position
+    ///   (falls back to original if `new_start_lba` is unset).
+    /// - Recompute `low_cyl` / `high_cyl` from the new start LBA and
+    ///   export size, using the partition's existing `(surfaces,
+    ///   blk_per_trk, fs_block_size)` geometry. Resize must preserve
+    ///   `surfaces` / `blk_per_trk` — they define how many 512-byte LBAs
+    ///   live in one Amiga cylinder, and any FS / driver that consults
+    ///   them across the resize would be confused otherwise.
+    ///
+    /// When no override matches, the partition keeps its original
+    /// geometry verbatim — including a potential gap if a preceding
+    /// partition shrank. (Sliding subsequent partitions down is left to
+    /// the caller via `new_start_lba`.)
+    ///
+    /// The RDSK header's `cylinders` / `hi_cyl` are recomputed from the
+    /// highest patched partition end so a shrunk last partition produces
+    /// a smaller output disk.
+    ///
+    /// Re-stamps all 32-bit checksums.
+    pub fn patch_for_restore(
+        &self,
+        overrides: &[PartitionSizeOverride],
+        source: &mut (impl Read + Seek),
+    ) -> Result<RdbRestorePlan, RustyBackupError> {
+        // --- Re-read raw RDSK + PART blocks from source ---
+        let mut rdsk_buf = [0u8; 512];
+        source.seek(SeekFrom::Start(self.header.block_num * 512))?;
+        source.read_exact(&mut rdsk_buf)?;
+        if &rdsk_buf[0..4] != RDSK_SIGNATURE {
+            return Err(RustyBackupError::InvalidRdb(format!(
+                "expected RDSK signature at block {}",
+                self.header.block_num
+            )));
+        }
+
+        let mut part_bufs: Vec<(u64, [u8; 512])> = Vec::with_capacity(self.partitions.len());
+        for p in &self.partitions {
+            let mut buf = [0u8; 512];
+            source.seek(SeekFrom::Start(p.block_num * 512))?;
+            source.read_exact(&mut buf)?;
+            if &buf[0..4] != PART_SIGNATURE {
+                return Err(RustyBackupError::InvalidRdb(format!(
+                    "expected PART signature at block {}",
+                    p.block_num
+                )));
+            }
+            part_bufs.push((p.block_num, buf));
+        }
+
+        // --- Per-partition patch + plan ---
+        //
+        // Partitions are processed in source-order. When the caller does NOT
+        // supply an explicit `new_start_lba` for a partition, the dest LBA
+        // auto-slides to the running "next available cylinder" cursor so that
+        // shrinking partition N causes partitions N+1..end to move down and
+        // close the gap. Without this, a shrunk earlier partition leaves
+        // 31 GB of zero-filled gap before the next partition's frozen
+        // original start. (Honoring an explicit `new_start_lba` is still
+        // supported — the cursor jumps forward to match.)
+        //
+        // The cursor is seeded with the first partition's source_lba so we
+        // never push a partition earlier than where its source data lives.
+        let mut plans: Vec<RdbPartitionPlan> = Vec::with_capacity(self.partitions.len());
+        let mut max_end_lba: u64 = (RDB_SCAN_BLOCKS).max(self.header.block_num + 1);
+        let mut next_avail_lba: u64 = self
+            .partitions
+            .iter()
+            .map(|p| p.start_lba_512())
+            .min()
+            .unwrap_or(RDB_SCAN_BLOCKS);
+        for (i, p) in self.partitions.iter().enumerate() {
+            let source_lba = p.start_lba_512();
+            let original_size = p.size_bytes();
+            let ov = overrides.iter().find(|o| o.start_lba == source_lba);
+            let export_size = ov.map(|o| o.export_size).unwrap_or(original_size);
+            // dest_lba precedence: explicit new_start_lba > auto-packed cursor.
+            let cyl_lbas = p.surfaces as u64 * p.blk_per_trk as u64 * p.fs_block_size() / 512;
+            if cyl_lbas == 0 {
+                return Err(RustyBackupError::InvalidRdb(format!(
+                    "partition {} has zero cyl_lbas (surfaces={} blk_per_trk={} fs_block_size={})",
+                    i,
+                    p.surfaces,
+                    p.blk_per_trk,
+                    p.fs_block_size()
+                )));
+            }
+            let dest_lba = if let Some(o) = ov.and_then(|o| o.new_start_lba) {
+                o
+            } else {
+                // Round the running cursor up to the next cyl boundary for
+                // this partition's geometry. RDB allows per-partition
+                // (surfaces, blk_per_trk) so cyl_lbas can vary; aligning
+                // against this partition's cyl_lbas keeps low_cyl integral.
+                next_avail_lba.div_ceil(cyl_lbas) * cyl_lbas
+            };
+
+            if dest_lba % cyl_lbas != 0 {
+                return Err(RustyBackupError::InvalidRdb(format!(
+                    "partition {} dest LBA {} not cylinder-aligned (cyl_lbas={})",
+                    i, dest_lba, cyl_lbas
+                )));
+            }
+            let new_low_cyl = (dest_lba / cyl_lbas) as u32;
+            // Round the requested export size UP to the next cylinder boundary.
+            // RDB partition geometry is cylinder-granular (low_cyl/high_cyl are
+            // u32 cylinder counts), so an MB-aligned size from the GUI almost
+            // never lands exactly on a cyl boundary on real Amiga disks where
+            // cyl_lbas can be e.g. 1008. Rounding up keeps the partition at
+            // least the requested size — for shrink this still produces a
+            // smaller output disk, for grow it slightly exceeds the request.
+            let requested_lbas = export_size.div_ceil(512);
+            if requested_lbas == 0 {
+                return Err(RustyBackupError::InvalidRdb(format!(
+                    "partition {} export_size {} resolves to zero LBAs",
+                    i, export_size
+                )));
+            }
+            let new_cyls_u64 = requested_lbas.div_ceil(cyl_lbas);
+            let new_cyls = u32::try_from(new_cyls_u64).map_err(|_| {
+                RustyBackupError::InvalidRdb(format!(
+                    "partition {} new cyl count {} overflows u32",
+                    i, new_cyls_u64
+                ))
+            })?;
+            let aligned_export_lbas = new_cyls_u64 * cyl_lbas;
+            let aligned_export_size = aligned_export_lbas * 512;
+            let new_high_cyl = new_low_cyl + new_cyls - 1;
+
+            // Patch in place.
+            let (_, buf) = &mut part_bufs[i];
+            BigEndian::write_u32(&mut buf[41 * 4..41 * 4 + 4], new_low_cyl);
+            BigEndian::write_u32(&mut buf[42 * 4..42 * 4 + 4], new_high_cyl);
+            restamp_checksum(buf);
+
+            plans.push(RdbPartitionPlan {
+                source_lba,
+                dest_lba,
+                original_size,
+                copy_size: original_size.min(aligned_export_size),
+                // Surface the rounded size so resize_filesystem_for and the
+                // copy/zero-fill loop work in sync with what's recorded in
+                // the patched PART block.
+                export_size: aligned_export_size,
+                dos_type_string: p.dos_type_string(),
+                drv_name: p.drv_name.clone(),
+            });
+
+            let end_lba = dest_lba + aligned_export_lbas;
+            if end_lba > max_end_lba {
+                max_end_lba = end_lba;
+            }
+            // Advance the auto-pack cursor past this partition. Subsequent
+            // partitions without explicit new_start_lba slide down into the
+            // gap created by any shrink that happened above.
+            next_avail_lba = end_lba;
+        }
+
+        // --- Patch RDSK header: cylinders + hi_cyl reflect new disk size ---
+        let cyl_blks = self.header.cyl_blks as u64;
+        if cyl_blks == 0 {
+            return Err(RustyBackupError::InvalidRdb(
+                "RDSK cyl_blks = 0".to_string(),
+            ));
+        }
+        // Round max_end_lba up to a cylinder boundary so cylinders is a
+        // whole number that covers all partitions.
+        let cyl_lbas_disk = cyl_blks; // RDSK cyl_blks is already in 512-byte LBAs.
+        let new_total_lbas = max_end_lba.div_ceil(cyl_lbas_disk) * cyl_lbas_disk;
+        let new_cylinders = (new_total_lbas / cyl_lbas_disk) as u32;
+        let new_hi_cyl = new_cylinders - 1;
+        BigEndian::write_u32(&mut rdsk_buf[16 * 4..16 * 4 + 4], new_cylinders);
+        BigEndian::write_u32(&mut rdsk_buf[35 * 4..35 * 4 + 4], new_hi_cyl);
+        restamp_checksum(&mut rdsk_buf);
+
+        Ok(RdbRestorePlan {
+            rdsk_block: (self.header.block_num, rdsk_buf),
+            part_blocks: part_bufs,
+            partition_plans: plans,
+            new_disk_size_bytes: new_total_lbas * 512,
+        })
+    }
+}
+
+/// Zero the checksum slot at long 2, sum all longs, write the
+/// 2's-complement negation back into long 2 so the full block sums to 0.
+fn restamp_checksum(buf: &mut [u8; 512]) {
+    BigEndian::write_u32(&mut buf[2 * 4..2 * 4 + 4], 0);
+    let mut sum: i32 = 0;
+    for i in 0..128 {
+        sum = sum.wrapping_add(BigEndian::read_i32(&buf[i * 4..i * 4 + 4]));
+    }
+    BigEndian::write_i32(&mut buf[2 * 4..2 * 4 + 4], sum.wrapping_neg());
 }
 
 /// Toggle the bootable flag on the PART block at `block_num` (in 512-byte

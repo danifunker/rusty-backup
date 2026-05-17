@@ -3,6 +3,8 @@ pub mod affs_common;
 pub mod affs_fsck;
 pub mod btrfs;
 pub mod efs;
+pub mod efs_fsck;
+pub mod efs_resize;
 pub mod entry;
 pub mod exfat;
 pub mod ext;
@@ -23,6 +25,7 @@ pub mod mac_alias;
 pub mod ntfs;
 pub mod patch;
 pub mod pfs3;
+pub mod pfs3_clone;
 pub mod prodos;
 pub mod prodos_types;
 pub mod resource_fork;
@@ -95,6 +98,10 @@ pub fn resize_filesystem_for(
     hfsplus::resize_hfsplus_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     ext::resize_ext_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     btrfs::resize_btrfs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
+    sfs::resize_sfs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
+    pfs3::resize_pfs3_in_place(file, partition_offset, new_size_bytes, log_cb)?;
+    affs::resize_affs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
+    efs_resize::resize_efs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     Ok(())
 }
 
@@ -217,7 +224,7 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
 /// type-name column use this to replace the generic "Linux" label with the
 /// actual filesystem family.
 ///
-/// Returns one of: `"FAT"`, `"ext"`, `"btrfs"`, `"xfs"`, or `None` when the
+/// Returns one of: `"FAT"`, `"ext"`, `"btrfs"`, `"XFS"`, or `None` when the
 /// content isn't a filesystem this function recognizes.
 pub fn probe_0x83_fs_type<R: Read + Seek>(
     reader: &mut R,
@@ -227,7 +234,7 @@ pub fn probe_0x83_fs_type<R: Read + Seek>(
         "fat" => Some("FAT"),
         "ext" => Some("ext"),
         "btrfs" => Some("btrfs"),
-        "xfs" => Some("xfs"),
+        "xfs" => Some("XFS"),
         _ => None,
     }
 }
@@ -662,10 +669,13 @@ fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &'sta
     }
     match partition_type {
         0xAF => "HFS/HFS+",
-        0x83 => "ext/btrfs",
+        0x83 => "ext/btrfs/xfs",
         0xA8 => "ProDOS",
         0x07 => "NTFS/exFAT",
         0x01 | 0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C => "FAT",
+        // SGI synthetic type bytes (PartitionTable::Sgi).
+        0xA0 => "XFS",
+        0xA1 => "SGI EFS",
         _ => "unknown",
     }
 }
@@ -704,7 +714,8 @@ pub fn is_layout_preserving_fs(partition_type: u8, partition_type_string: Option
                 | "Linux",
         );
     }
-    matches!(partition_type, 0xAF | 0x83 | 0xA8)
+    // 0xA1 is our synthetic byte for SGI EFS (PartitionTable::Sgi).
+    matches!(partition_type, 0xAF | 0x83 | 0xA8 | 0xA1)
 }
 
 /// True if this filesystem has a true defragmenting writer (clone pipeline)
@@ -713,11 +724,15 @@ pub fn is_layout_preserving_fs(partition_type: u8, partition_type_string: Option
 /// clone re-emits the volume packed at the smaller size — so picking it as
 /// the shrink target is safe.
 ///
-/// Currently: HFS+/HFSX (via `stream_defragmented_hfsplus`). HFS (classic),
-/// ext, btrfs, and ProDOS still rely on the layout-preserving reader and
-/// must use the in-place trim instead.
+/// Currently: HFS+/HFSX (via `stream_defragmented_hfsplus`) and PFS3
+/// (via `clone_pfs3_volume`). HFS (classic), ext, btrfs, ProDOS, AFFS,
+/// and SFS still rely on the layout-preserving reader and must use the
+/// in-place trim instead.
 pub fn has_defragmenting_writer(partition_type: u8, partition_type_string: Option<&str>) -> bool {
     if let Some(s) = partition_type_string {
+        if is_amiga_pfs3_type(s) {
+            return true;
+        }
         return matches!(s, "Apple_HFS" | "Apple_HFSX" | "Apple_HFS+");
     }
     matches!(partition_type, 0xAF)
@@ -773,7 +788,8 @@ pub fn is_expensive_minimum(partition_type: u8, partition_type_string: Option<&s
         }
         return matches!(s, "Apple_HFS" | "Apple_HFSX" | "Apple_UNIX_SVR2" | "Linux");
     }
-    matches!(partition_type, 0xAF | 0x83 | 0xA8)
+    // 0xA1 (SGI EFS): conservative floor requires an inode-table walk.
+    matches!(partition_type, 0xAF | 0x83 | 0xA8 | 0xA1)
 }
 
 /// Compute the minimum size for a partition, optionally gated behind an
@@ -1256,6 +1272,11 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
             reader,
             partition_offset,
         )?)),
+        // SGI EFS — synthetic type byte emitted by PartitionTable::Sgi.
+        0xA1 => Ok(Box::new(efs::EfsFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
         // HFS+ (MBR type 0xAF)
         0xAF => {
             let (fs_type, hfsplus_offset) = resolve_apple_hfs(&mut reader, partition_offset);
@@ -1610,6 +1631,10 @@ pub enum DefragCloneShape {
     /// HFS wrapper with an embedded HFS+/HFSX inside (Mac OS 8/9 style).
     /// Use [`hfsplus_wrapper_clone::stream_wrapped_defragmented_hfsplus`].
     Wrapped,
+    /// PFS3 volume (DosType `PFS\3`, `PDS\3`, `muFS`). Use
+    /// [`pfs3_clone::stream_defragmented_pfs3`]. Two-pass walk via the
+    /// EditableFilesystem trait; tempfile-backed to bound RAM.
+    Pfs3,
 }
 
 /// Pre-flight check for the streamed defrag-clone backup path. Returns
@@ -1682,6 +1707,46 @@ pub fn can_defrag_clone_hfsplus<R: Read + Seek>(
     partition_offset: u64,
 ) -> Result<(), String> {
     defrag_clone_shape(reader, partition_offset).map(|_| ())
+}
+
+/// Unified defrag-clone preflight that dispatches by partition type
+/// string. Returns the shape (`Flat` / `Wrapped` for HFS+/HFSX, `Pfs3`
+/// for PFS3) or `Err(reason)` when no clone path is available. The
+/// backup pipeline calls this once per partition that opted in to
+/// shrink-to-defragmented-minimum.
+pub fn detect_defrag_clone_shape<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    partition_type_string: Option<&str>,
+) -> Result<DefragCloneShape, String> {
+    if let Some(s) = partition_type_string {
+        if is_amiga_pfs3_type(s) {
+            // PFS3 sanity check: rootblock id at block 2.
+            if reader
+                .seek(SeekFrom::Start(partition_offset + 2 * 512))
+                .is_err()
+            {
+                return Err("failed to seek to PFS3 rootblock".into());
+            }
+            let mut id = [0u8; 4];
+            if reader.read_exact(&mut id).is_err() {
+                return Err("failed to read PFS3 rootblock id".into());
+            }
+            if &id == b"PFS\x01"
+                || &id == b"PFS\x02"
+                || &id == b"AFS\x01"
+                || &id == b"muPF"
+                || &id == b"muAF"
+            {
+                return Ok(DefragCloneShape::Pfs3);
+            }
+            return Err(format!(
+                "partition tagged {s} but rootblock id {:?} is not PFS3",
+                id
+            ));
+        }
+    }
+    defrag_clone_shape(reader, partition_offset)
 }
 
 /// Returns `"HFS+"`, `"HFSX"`, `"HFS"`, or `"unknown"`. Useful for updating

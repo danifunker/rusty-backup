@@ -114,52 +114,50 @@ impl LogPanel {
     }
 }
 
-/// Progress state for long-running operations.
+/// Rolling-window transfer-rate + ETA estimator. Shared by progress
+/// bars in different tabs (backup, restore, VHD export, physical-disk
+/// export) so the visible rate/ETA semantics stay consistent across
+/// the app.
+///
+/// Drop one in next to your view's progress state, call
+/// [`RateTracker::record`] each frame with the current byte counter and
+/// stage label (any string that changes when the work shifts to a new
+/// phase), then ask for [`RateTracker::rate_bytes_per_sec`] /
+/// [`RateTracker::eta_secs`] for display.
 #[derive(Default)]
-pub struct ProgressState {
-    pub current_bytes: u64,
-    pub total_bytes: u64,
-    /// Full untrimmed partition sizes (for displaying savings).
-    /// When this is larger than `total_bytes`, smart trimming is active.
-    pub full_size_bytes: u64,
-    pub operation: String,
-    pub active: bool,
-    /// Rolling sample buffer of (instant, current_bytes) for rate/ETA
-    /// estimation. Updated by the view each frame via
-    /// [`ProgressState::record_sample`]; older entries are pruned to
-    /// keep the window roughly 10s wide so ETA stays responsive to
-    /// stalls and phase changes without flapping on each frame.
+pub struct RateTracker {
+    /// (timestamp, bytes_so_far) samples. Front = oldest. Window is
+    /// trimmed to ~10s so the ETA stays responsive to stalls without
+    /// flapping each frame.
     samples: std::collections::VecDeque<(std::time::Instant, u64)>,
-    /// Operation label observed on the previous frame, used to detect
+    /// Stage label observed on the previous frame, used to detect
     /// stage transitions. When the label changes the rate window is
     /// cleared so a new stage starts with a fresh ETA estimate
     /// instead of dragging the previous stage's numbers along.
-    last_operation: String,
+    last_stage: String,
 }
 
-impl ProgressState {
-    /// Record one sample for the rate window. Called by the view each
-    /// frame after copying fields from the backup-thread snapshot.
-    /// Idempotent if called more than once per frame (the latest
-    /// sample overwrites previous samples within the same millisecond).
-    pub fn record_sample(&mut self) {
+impl RateTracker {
+    /// Record one sample. `stage` should be the operation label or any
+    /// other string that changes when the work moves to a new phase
+    /// (e.g. "Backing up partition 1" → "Checksum verify"). When the
+    /// stage changes the rolling window is cleared.
+    pub fn record(&mut self, current_bytes: u64, stage: &str) {
         const WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
-        // Phase change resets the window so ETAs don't carry across
-        // stages with different byte-rate profiles.
-        if self.operation != self.last_operation {
-            self.last_operation = self.operation.clone();
+        if stage != self.last_stage {
+            self.last_stage = stage.to_string();
             self.samples.clear();
         }
-        // Bytes regressing (e.g. checksum phase restarts the counter)
+        // Bytes regressing (e.g. a checksum phase restarts the counter)
         // also resets the window — we'd otherwise compute a negative
         // rate.
         if let Some(&(_, last_bytes)) = self.samples.back() {
-            if self.current_bytes < last_bytes {
+            if current_bytes < last_bytes {
                 self.samples.clear();
             }
         }
         let now = std::time::Instant::now();
-        self.samples.push_back((now, self.current_bytes));
+        self.samples.push_back((now, current_bytes));
         while let Some(&(t, _)) = self.samples.front() {
             if now.duration_since(t) > WINDOW {
                 self.samples.pop_front();
@@ -189,16 +187,61 @@ impl ProgressState {
         Some(db / dt)
     }
 
-    /// Estimated seconds remaining for this stage at the current rate.
-    /// Returns `None` when rate is unknown, zero, or the totals are
-    /// missing.
-    pub fn eta_secs(&self) -> Option<u64> {
+    /// Estimated seconds remaining at the current rate. Returns `None`
+    /// when rate is unknown, zero, or `total_bytes` is missing.
+    pub fn eta_secs(&self, current_bytes: u64, total_bytes: u64) -> Option<u64> {
         let rate = self.rate_bytes_per_sec()?;
-        if rate <= 0.0 || self.total_bytes == 0 {
+        if rate <= 0.0 || total_bytes == 0 {
             return None;
         }
-        let remaining = self.total_bytes.saturating_sub(self.current_bytes) as f64;
+        let remaining = total_bytes.saturating_sub(current_bytes) as f64;
         Some((remaining / rate) as u64)
+    }
+
+    /// Convenience: format the trailing " - <rate>/s, ETA <eta>"
+    /// suffix that progress bars append to their `bytes / total`
+    /// label. Returns an empty string when neither rate nor ETA is
+    /// available, so callers can splice this in unconditionally.
+    pub fn suffix(&self, current_bytes: u64, total_bytes: u64) -> String {
+        match (
+            self.rate_bytes_per_sec(),
+            self.eta_secs(current_bytes, total_bytes),
+        ) {
+            (Some(r), Some(eta)) if r > 0.0 => {
+                format!(" - {}/s, ETA {}", format_rate(r), format_eta(eta))
+            }
+            (Some(r), _) if r > 0.0 => format!(" - {}/s", format_rate(r)),
+            _ => String::new(),
+        }
+    }
+
+    /// Reset all sampling state. Useful when a worker is torn down and
+    /// a fresh one starts in the same view slot.
+    pub fn reset(&mut self) {
+        self.samples.clear();
+        self.last_stage.clear();
+    }
+}
+
+/// Progress state for long-running operations.
+#[derive(Default)]
+pub struct ProgressState {
+    pub current_bytes: u64,
+    pub total_bytes: u64,
+    /// Full untrimmed partition sizes (for displaying savings).
+    /// When this is larger than `total_bytes`, smart trimming is active.
+    pub full_size_bytes: u64,
+    pub operation: String,
+    pub active: bool,
+    tracker: RateTracker,
+}
+
+impl ProgressState {
+    /// Record one sample for the rate window. Called by the view each
+    /// frame after copying fields from the backup-thread snapshot.
+    pub fn record_sample(&mut self) {
+        let op = self.operation.clone();
+        self.tracker.record(self.current_bytes, &op);
     }
 
     pub fn show(&self, ui: &mut egui::Ui) {
@@ -210,13 +253,7 @@ impl ProgressState {
             ui.label(&self.operation);
             if self.total_bytes > 0 {
                 let fraction = self.current_bytes as f32 / self.total_bytes as f32;
-                let rate_eta = match (self.rate_bytes_per_sec(), self.eta_secs()) {
-                    (Some(r), Some(eta)) if r > 0.0 => {
-                        format!(" - {}/s, ETA {}", format_rate(r), format_eta(eta))
-                    }
-                    (Some(r), _) if r > 0.0 => format!(" - {}/s", format_rate(r)),
-                    _ => String::new(),
-                };
+                let rate_eta = self.tracker.suffix(self.current_bytes, self.total_bytes);
                 let text = if self.full_size_bytes > self.total_bytes {
                     format!(
                         "{} / {} to image of {} total ({:.0}%){}",
@@ -280,4 +317,60 @@ fn format_eta(total_secs: u64) -> String {
 /// Get current timestamp in local time.
 fn chrono_now() -> String {
     chrono::Local::now().format("%H:%M:%S").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    #[test]
+    fn rate_tracker_returns_none_before_two_samples() {
+        let mut t = RateTracker::default();
+        t.record(0, "stage");
+        assert!(t.rate_bytes_per_sec().is_none());
+        assert!(t.eta_secs(0, 1024).is_none());
+        assert_eq!(t.suffix(0, 1024), "");
+    }
+
+    #[test]
+    fn rate_tracker_computes_rate_after_window_opens() {
+        let mut t = RateTracker::default();
+        t.record(0, "stage");
+        sleep(Duration::from_millis(300));
+        t.record(1_000_000, "stage");
+        let rate = t.rate_bytes_per_sec().expect("rate available");
+        // We slept ~300ms and added 1 MB so rate should be in the
+        // ballpark of 3 MB/s. Allow a generous range for CI noise.
+        assert!(rate > 1_000_000.0 && rate < 20_000_000.0, "rate = {rate}");
+        let suffix = t.suffix(1_000_000, 10_000_000);
+        assert!(suffix.starts_with(" - "));
+        assert!(suffix.contains("/s"));
+        assert!(suffix.contains("ETA"));
+    }
+
+    #[test]
+    fn rate_tracker_resets_on_stage_change() {
+        let mut t = RateTracker::default();
+        t.record(0, "stage-A");
+        sleep(Duration::from_millis(300));
+        t.record(1_000_000, "stage-A");
+        assert!(t.rate_bytes_per_sec().is_some());
+        t.record(0, "stage-B");
+        // Window cleared; only one sample in the new stage.
+        assert!(t.rate_bytes_per_sec().is_none());
+    }
+
+    #[test]
+    fn rate_tracker_resets_on_byte_regression() {
+        let mut t = RateTracker::default();
+        t.record(500, "stage");
+        sleep(Duration::from_millis(300));
+        t.record(1_000_000, "stage");
+        assert!(t.rate_bytes_per_sec().is_some());
+        // A regression (counter restart) clears the window.
+        t.record(0, "stage");
+        assert!(t.rate_bytes_per_sec().is_none());
+    }
 }

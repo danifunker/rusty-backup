@@ -416,6 +416,33 @@ pub(crate) fn compress_chd(
     Ok(vec![file_name(&chd_path)])
 }
 
+/// Public wrapper around `compress_chd` for the CHD-expand worker
+/// (Phase 6c of `docs/disk_expansion.md`). Same signature, just `pub` so
+/// model-layer callers can re-encode an existing CHD with a new logical
+/// size. The wrapper is intentionally thin so this stays the one place
+/// that touches libchdman directly.
+pub fn compress_chd_expand(
+    reader: &mut impl Read,
+    output_base: &Path,
+    logical_size: u64,
+    split_size: Option<u64>,
+    opts: Option<ChdOptions>,
+    progress_cb: &mut impl FnMut(u64),
+    cancel_check: &impl Fn() -> bool,
+    log_cb: &mut impl FnMut(&str),
+) -> Result<Vec<String>> {
+    compress_chd(
+        reader,
+        output_base,
+        logical_size,
+        split_size,
+        opts,
+        progress_cb,
+        cancel_check,
+        log_cb,
+    )
+}
+
 /// Compress raw data into a DVD-profile CHD (MAME 0.287+) via libchdman-rs.
 ///
 /// Same shape as [`compress_chd`] but uses DVD's 2048-byte sector unit and

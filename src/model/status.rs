@@ -93,6 +93,20 @@ pub struct ExtractionProgress {
     pub cancel_requested: bool,
 }
 
+/// Status of a CHD "Expand Image" re-encode (Phase 6c of
+/// `docs/disk_expansion.md`). Decodes the existing logical CHD,
+/// concatenates a zero-padding tail, and writes a fresh CHD with the new
+/// logical size. The CHD layout is fixed at creation, so growing in place
+/// isn't possible — we re-encode and atomically rename on success.
+pub struct ChdExpandStatus {
+    pub finished: bool,
+    pub error: Option<String>,
+    pub current_bytes: u64,
+    pub total_bytes: u64,
+    pub cancel_requested: bool,
+    pub log_messages: Vec<String>,
+}
+
 /// Status of an in-place partition resize running on a background thread.
 pub struct ResizeStatus {
     pub finished: bool,

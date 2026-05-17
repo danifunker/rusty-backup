@@ -29,10 +29,22 @@ pub struct EditorEntry {
     pub type_text: String,
     /// Marked for deletion.
     pub deleted: bool,
+    /// Minimum size in bytes (from filesystem analysis). 0 when unknown —
+    /// in that case the Minimum radio is hidden so the user can't pick a
+    /// value the editor can't honor.
+    pub minimum_size: u64,
+    /// Quick-pick radio state mirroring the restore tab and resize popup:
+    /// `Original` / `Minimum` / `Custom`. Selecting Original/Minimum
+    /// re-stamps `size_text`; Custom keeps the existing text editable.
+    pub choice: crate::model::size_mode::SizeMode,
 }
 
 impl EditorEntry {
     pub fn from_partition(p: &PartitionInfo) -> Self {
+        Self::from_partition_with_minimum(p, 0)
+    }
+
+    pub fn from_partition_with_minimum(p: &PartitionInfo, minimum_size: u64) -> Self {
         let size_mib = p.size_bytes as f64 / (1024.0 * 1024.0);
         Self {
             index: p.index,
@@ -51,6 +63,8 @@ impl EditorEntry {
                 format!("{:02X}", p.partition_type_byte)
             },
             deleted: false,
+            minimum_size,
+            choice: crate::model::size_mode::SizeMode::Original,
         }
     }
 }
@@ -82,7 +96,24 @@ impl PartitionEditor {
 
     /// Reset state and seed `entries` from the current partition list.
     pub fn seed_from(&mut self, partitions: &[PartitionInfo]) {
-        self.entries = partitions.iter().map(EditorEntry::from_partition).collect();
+        self.seed_from_with_minimums(partitions, &std::collections::HashMap::new());
+    }
+
+    /// Reset state and seed entries with per-partition minimum sizes
+    /// available. Minimums populate the Min Size column and let the
+    /// editor's size-mode radios surface the Minimum option.
+    pub fn seed_from_with_minimums(
+        &mut self,
+        partitions: &[PartitionInfo],
+        minimums: &std::collections::HashMap<usize, u64>,
+    ) {
+        self.entries = partitions
+            .iter()
+            .map(|p| {
+                let min = minimums.get(&p.index).copied().unwrap_or(0);
+                EditorEntry::from_partition_with_minimum(p, min)
+            })
+            .collect();
         self.edits.clear();
         self.errors.clear();
         self.status = None;
@@ -134,6 +165,8 @@ impl PartitionEditor {
             size_text: format!("{:.2}", size_mib),
             type_text: self.add_type.trim().to_string(),
             deleted: false,
+            minimum_size: 0,
+            choice: crate::model::size_mode::SizeMode::Custom,
         });
         self.add_start_lba.clear();
         self.add_size_mb.clear();
@@ -164,21 +197,33 @@ impl PartitionEditor {
             }
 
             if let Some(orig) = orig {
-                let new_size_mib: f64 = entry.size_text.trim().parse().unwrap_or(-1.0);
-                if new_size_mib > 0.0 {
-                    let new_size_bytes = (new_size_mib * 1024.0 * 1024.0) as u64;
-                    let new_size_bytes = (new_size_bytes / 512) * 512;
-                    if new_size_bytes != orig.size_bytes {
-                        self.edits.push(PartitionTableEdit::ResizeEntry {
-                            index: entry.index,
-                            new_size_bytes,
-                        });
+                // Skip the size diff entirely when the displayed text still
+                // matches the original. `size_text` is initialized as
+                // `"{:.2}"` MiB, which throws away precision on partitions
+                // whose byte count isn't a clean MiB multiple (notably RDB /
+                // Amiga geometries). Round-tripping that string back to
+                // bytes shifts the partition's end by up to ~5 KiB, which is
+                // enough to push a tail partition past the disk and emit a
+                // spurious "extends beyond disk" validation error when the
+                // user hasn't actually touched anything.
+                let orig_size_text = format!("{:.2}", orig.size_bytes as f64 / (1024.0 * 1024.0));
+                if entry.size_text.trim() != orig_size_text {
+                    let new_size_mib: f64 = entry.size_text.trim().parse().unwrap_or(-1.0);
+                    if new_size_mib > 0.0 {
+                        let new_size_bytes = (new_size_mib * 1024.0 * 1024.0) as u64;
+                        let new_size_bytes = (new_size_bytes / 512) * 512;
+                        if new_size_bytes != orig.size_bytes {
+                            self.edits.push(PartitionTableEdit::ResizeEntry {
+                                index: entry.index,
+                                new_size_bytes,
+                            });
+                        }
+                    } else {
+                        self.errors.push(format!(
+                            "Invalid size for partition {}: '{}'",
+                            entry.index, entry.size_text
+                        ));
                     }
-                } else {
-                    self.errors.push(format!(
-                        "Invalid size for partition {}: '{}'",
-                        entry.index, entry.size_text
-                    ));
                 }
 
                 match table {

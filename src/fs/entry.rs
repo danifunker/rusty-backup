@@ -43,6 +43,15 @@ pub struct FileEntry {
     /// AmigaDOS filenote (comment), up to 79 bytes. Only set for
     /// AmigaDOS / Fast File System entries; `None` outside that family.
     pub amiga_comment: Option<String>,
+    /// AmigaDOS raw datestamp triple `(days, minutes, ticks)` from the
+    /// on-disk entry. Days since 1978-01-01, minutes within the day,
+    /// and ticks (1/50s) within the minute. Preserved verbatim for
+    /// byte-exact round-trips through clone/restore. AFFS stores these
+    /// as i32 on disk; PFS3 direntries narrow them to u16 — we widen
+    /// to i32 so both round-trip losslessly. The display string lives
+    /// in `modified`. Only set for AmigaDOS / PFS3 / SFS entries;
+    /// `None` outside that family.
+    pub amiga_date: Option<(i32, i32, i32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -77,6 +86,7 @@ impl FileEntry {
             link_target_cnid: None,
             amiga_protection: None,
             amiga_comment: None,
+            amiga_date: None,
         }
     }
 
@@ -100,6 +110,7 @@ impl FileEntry {
             link_target_cnid: None,
             amiga_protection: None,
             amiga_comment: None,
+            amiga_date: None,
         }
     }
 
@@ -123,6 +134,7 @@ impl FileEntry {
             link_target_cnid: None,
             amiga_protection: None,
             amiga_comment: None,
+            amiga_date: None,
         }
     }
 
@@ -152,6 +164,7 @@ impl FileEntry {
             link_target_cnid: None,
             amiga_protection: None,
             amiga_comment: None,
+            amiga_date: None,
         }
     }
 
@@ -180,6 +193,7 @@ impl FileEntry {
             link_target_cnid: None,
             amiga_protection: None,
             amiga_comment: None,
+            amiga_date: None,
         }
     }
 

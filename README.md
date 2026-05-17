@@ -30,29 +30,113 @@ build matrix.
 
 ## Usage
 
-The app has three tabs:
+The app has four tabs:
 
 - **Backup** — pick a source (physical device or image file), choose a
   destination folder, pick an output format and checksum type, and start.
   Each backup is written as a folder containing `metadata.json`, the partition
-  table (`mbr.json` / `gpt.json` / `apm.json`), and either one compressed
-  file per partition (Zstd / Raw / per-partition VHD) or a single
-  `<backup-name>.chd` disk image that `chdman info` opens and MAME loads
-  directly (CHD output). The single-file CHD also serves as the unit edit
-  mode operates on, so changes flow back into a CHD that any CHD-aware
-  tool can still read.
+  table sidecar (`mbr.json` / `gpt.json` / `apm.json` / RDB / SGI), and
+  either one compressed file per partition (Zstd / Raw / per-partition VHD)
+  or a single `<backup-name>.chd` disk image that `chdman info` opens and
+  MAME loads directly (CHD output). The single-file CHD also serves as the
+  unit edit mode operates on, so changes flow back into a CHD that any
+  CHD-aware tool can still read.
 - **Restore** — pick a backup folder and a target device or image file.
   Partition sizes can be left at original, shrunk to the filesystem minimum,
   or set to a custom value; the filesystem is expanded in place when the
   restored partition is larger than the minimum. Alignment (DOS/cylinder,
-  1 MB, or custom) is preserved from the source by default.
+  1 MB, or custom) is preserved from the source by default. A top-level
+  "Add free space for in-OS expansion" toggle pads the target image so
+  the guest OS can extend partitions there after boot — see the *Disk
+  expansion workflow* section below.
 - **Inspect** — pick any supported source and browse the partition table,
-  filesystem info, and file listings without modifying anything.
+  filesystem info, and file listings. Several actions live here:
+  - **Browse** filesystem contents read-only (per partition).
+  - **Edit Partition Table…** to add / resize / delete / retype
+    partition entries on raw disks, image files, and devices. Writers
+    cover MBR, GPT, APM, SGI, and RDB-bootable-flag.
+  - **Resize Partitions…** for in-place partition data moves with
+    filesystem-side patching.
+  - **Add Partition…** as a streamlined entry into the editor when
+    trailing free space exists, pre-filled per partition-table type.
+  - **Expand Image…** to grow a raw, VHD, or CHD image with trailing
+    zero-padding so you have room for new partitions.
+  - **Export Disk Image…** to write VHD, Raw, 2MG, WOZ, DC42, or CHD
+    (whole-disk or per-partition) — see `docs/vhd-export.md`.
+  - **Check** (`fsck`) on classic HFS, HFS+, AmigaDOS (Disk Validator),
+    and SGI EFS, with **Repair** that uses replica blocks + lost+found
+    where supported.
+  - **Edit mode** on FAT, NTFS, exFAT, ext, HFS, HFS+, AFFS, PFS3, SFS,
+    ProDOS, and EFS: stage create-file / new-folder / drag-and-drop /
+    delete edits, then Apply atomically with snapshot rollback on
+    error.
+- **Optical** — browse and extract files from CD/DVD images and physical
+  optical drives. Supports ISO9660, Joliet, Rock Ridge, and HFS hybrid
+  discs. Re-opens automatically when the underlying disc changes.
+
+Most popups (Resize Partitions, Edit Partition Table, Export Disk Image,
+restore-tab partition list) use a shared **Size Mode** radio set
+(Original / Minimum / Custom / Fill) and a **Current → After** disk-layout
+bar pair so the planned outcome is always visible before you commit.
 
 VHD export is available from the Inspect tab: produce either a whole-disk
 `.vhd` (partition table plus all partitions with their gaps) or per-partition
 `.vhd` files, ready to mount in VirtualBox, Hyper-V, or QEMU. See
 `docs/vhd-export.md`.
+
+### Disk expansion workflow
+
+Rusty Backup can grow an existing image so its guest OS sees a bigger
+disk. This is useful for any filesystem the OS can expand at runtime —
+XFS being the motivating case (`xfs_growfs` can only ever grow up to the
+partition boundary, never the disk boundary), but the same workflow
+works for ext, NTFS, FAT, HFS+, exFAT, btrfs, etc.
+
+**Open an existing image and add trailing free space:**
+
+1. Open the image in the **Inspect** tab. Any backup, raw disk image,
+   VHD, or CHD works.
+2. Click **Expand Image…** in the toolbar. Enter how much MiB to add and
+   click Expand. Raw/VHD images grow instantly via `set_len`; CHD images
+   re-encode in a background worker (the CHD hunk layout is fixed at
+   creation, so there's no in-place grow).
+3. Click **Re-inspect** to refresh the partition list. The new trailing
+   region appears as a gray "Free" segment in the **Disk layout** bar.
+4. Either:
+   - Click **Add Partition…** to allocate the free space as a new
+     partition (defaults are pre-filled per partition-table type — XFS
+     for SGI, `0x83` for MBR, Linux Filesystem GUID for GPT,
+     `Apple_HFS` for APM), or
+   - Click **Edit Partition Table…** and bump the last partition's size
+     via the *Size Mode* radios.
+5. Boot the guest OS and run the filesystem's native grow tool
+   (`xfs_growfs /mountpoint`, `resize2fs`, Disk Management's Extend
+   Volume, IRIX `fx` + `xfs_growfs`, …).
+
+**Same workflow during a restore** (useful when the target physical
+disk is larger than the source):
+
+1. **Restore** tab → pick the backup and an image-file target. (The
+   feature is disabled for device targets — physical disk size is
+   fixed.)
+2. Tick **Add free space for in-OS expansion** and enter MiB.
+3. Pick a mode:
+   - **Leave as unpartitioned free space** *(recommended)* — partition
+     table stays unchanged; the guest OS uses its native partitioner
+     plus `xfs_growfs` (or equivalent). Works for any filesystem on
+     any OS.
+   - **Extend last partition automatically** — the last partition is
+     sized to absorb the new free space during restore. After restore,
+     only the filesystem-side grow tool is needed.
+4. The **Current** / **After** disk-layout bar pair shows the planned
+   result before you commit.
+
+**Note on visualisations:** the Disk layout bar appears in five places
+(Inspect, Restore, Resize Partitions, Edit Partition Table, Export Disk
+Image) so what you see is always what'll be written. Partition colours
+cycle through a stable palette; tiny partitions (≤ ~1 MiB) get a
+minimum-width pip so GPT/APM disks with many small partitions stay
+readable.
 
 ## Compatibility
 
@@ -77,23 +161,40 @@ VHD export is available from the Inspect tab: produce either a whole-disk
 All listed filesystems support browsing in the **Inspect** tab and are
 preserved intact on backup/restore. "Shrink" means the filesystem can be
 safely compacted to its minimum size during backup and re-expanded during
-restore or VHD export.
+restore or VHD export. "Edit" means create / delete / drag-and-drop via the
+inspect-tab Edit Mode.
 
-| Filesystem     | Browse | Shrink / expand on restore | Shrink / expand on VHD export | Notes |
-|----------------|:------:|:--------------------------:|:-----------------------------:|-------|
-| FAT12          | Yes    | Yes                        | Yes                           | Apple II SuperDrive, DOS floppies |
-| FAT16          | Yes    | Yes                        | Yes                           | DOS / Windows 3.x / 9x |
-| FAT32          | Yes    | Yes                        | Yes                           | Windows 95 OSR2+ through XP, vintage Linux |
-| exFAT          | Yes    | Yes                        | Yes                           | Modern removable media |
-| NTFS           | Yes    | Yes                        | Yes                           | Windows NT / 2000 / XP |
-| ext2 / ext3 / ext4 | Yes | Yes                       | Yes                           | Early Linux installs onward |
-| HFS (Mac OS Standard) | Yes | Yes                     | Yes                           | Classic Mac OS 68k / early PowerPC |
-| HFS+ (Mac OS Extended) | Yes* | No*                    | No                           | Actively working on HFS+, shrink doesn't seem to work, unsure about expand. Browsing works |
-| btrfs          | Yes    | No                        | No                           | Modern Linux; read-only browse |
-| ProDOS         | Yes    | Yes                        | No (planned)                  | Apple II / IIgs |
-| AFFS (OFS / FFS)  | Yes | No (layout-preserving)     | No                            | Amiga `DOS\0`..`DOS\7`. Read + edit (add file / new folder / delete); Disk Validator fsck included |
-| PFS3 / PDS3 / muFS | Yes | No (layout-preserving)    | No                            | Amiga PFS3 family. Read + edit (add file / new folder / delete) with sync-boundary atomicity |
-| SFS (Smart File System) | Yes | No (layout-preserving) | No                          | Amiga `SFS\0` / `SFS\2`. Read + edit (add file / new folder / delete) — single-leaf btree only |
+| Filesystem     | Browse | Edit | Shrink / expand | fsck | Notes |
+|----------------|:------:|:----:|:---------------:|:----:|-------|
+| FAT12          | Yes    | Yes  | Yes             | —    | Apple II SuperDrive, DOS floppies |
+| FAT16          | Yes    | Yes  | Yes             | —    | DOS / Windows 3.x / 9x |
+| FAT32          | Yes    | Yes  | Yes             | —    | Windows 95 OSR2+ through XP, vintage Linux |
+| exFAT          | Yes    | Yes  | Yes             | —    | Modern removable media |
+| NTFS           | Yes    | Yes  | Yes             | —    | Windows NT / 2000 / XP |
+| ext2 / ext3 / ext4 | Yes | Yes | Yes             | —    | Early Linux installs onward |
+| HFS (Mac OS Standard) | Yes | Yes | Yes         | Yes (check + repair: replica copy, bitmap fixup, lost+found for orphans) | Classic Mac OS 68k / early PowerPC. Includes block-size expansion via clone (`Expand HFS Volume…`). |
+| HFS+ / HFSX    | Yes    | Yes  | Yes (defrag clone) | Yes (check + repair) | Mac OS Extended; hardlink resolution. |
+| btrfs          | Yes    | No   | No              | —    | Modern Linux; read-only browse |
+| ProDOS         | Yes    | Yes  | Yes             | —    | Apple II / IIgs |
+| AFFS (OFS / FFS)  | Yes | Yes | Yes (in-place; bm_pages only) | Yes (Amiga Disk Validator) | Amiga `DOS\0`..`DOS\7`. In-place resize relocates root + bitmap pages; refuses on bm_ext-chain volumes or when allocated data would be clobbered. |
+| PFS3 / PDS3 / muFS | Yes | Yes | Yes (in-place + defragmenting clone) | —    | Amiga PFS3 family. Shrink refuses to truncate live data; clone path packs the volume for genuinely smaller targets. |
+| SFS (Smart File System) | Yes | Yes (single-leaf btree) | Yes (in-place trim/grow) | —    | Amiga `SFS\0` / `SFS\2`. |
+| SGI EFS        | Yes    | Yes  | Yes (in-place grow + conservative + aggressive shrink) | Yes (check + repair: replica copy, bitmap fixup, lost+found) | IRIX < 6.0. Aggressive shrink renumbers inodes into low CGs. |
+| SGI XFS (v4 / v5) | Yes (read-only) | No | No           | —    | IRIX 6.x and Linux. Disk-level expansion supported via the "Add free space" workflow + in-OS `xfs_growfs`. |
+
+### Partition tables
+
+| Scheme | Parse | Edit (resize / add / delete / retype) | Notes |
+|--------|:-----:|:-------------------------------------:|-------|
+| MBR    | Yes   | Yes  | PC standard. Logical partitions inside an extended container are surfaced read-only. |
+| GPT    | Yes   | Yes  | Primary + backup header rewritten with refreshed CRCs on every edit. |
+| APM    | Yes   | Yes  | Apple Partition Map (68k / PowerPC Macs). |
+| RDB    | Yes   | Bootable flag only | Amiga `RDSK`. Full RDB editing deferred until the DosEnv geometry story is settled. |
+| SGI    | Yes   | Yes  | SGI Volume Header (IRIX). 16 fixed slots; checksum recomputed on every write. |
+| None (superfloppy) | Yes (FAT / HFS / HFS+ at sector 0) | — | Standard floppy sizes are recognised even without a partition table. |
+
+The Clonezilla image format is also parsed as a source (MBR, GPT, partclone
+images, partition table sidecars) for restore — see `docs/clonezilla.md`.
 
 ### What works well vs. what to watch out for
 
@@ -105,6 +206,15 @@ restore or VHD export.
   test-covered; verify the exported image by mounting it before trusting a
   restore from it. Some docs in `docs/` predate full coverage — the code
   now wires resize for every filesystem in the table.
+- **HFS classic block-size expansion** ("Expand HFS Volume…") clones a
+  source volume into a freshly formatted target with a larger allocation
+  block size and a verified-bootable APM layout (DDR + APM map + driver
+  partitions + alt MDB). Useful when an old 2 GB classic-HFS volume runs
+  out of 16-bit block addresses.
+- **SGI EFS / XFS**: EFS is fully read/write/resize; XFS is read-only
+  (browsing + display only). XFS growth is handled at the disk-layout
+  level (Add free space → in-OS `xfs_growfs`), not by patching the
+  filesystem.
 - **ProDOS → VHD** is not implemented yet; restore to raw / CHD / Zstd /
   physical disk works.
 - **Raw → raw** restore always works regardless of filesystem; only the
@@ -113,6 +223,10 @@ restore or VHD export.
   regenerates a clean WOZ from the decoded sector buffer). 2MG, DC42, and
   DMG are still read-only as sources — to round-trip those, restore to raw /
   VHD / CHD / Zstd or a physical disk.
+- **CHD as both source and edit target**: rusty-backup uses MAME's native
+  CHD core, so `.chd` files are first-class — no external `chdman` required
+  for read, write, browse, or in-place expand (Phase 6c of the disk-expansion
+  workflow re-encodes the CHD with a new logical size).
 - **Browsing compressed backups**: native `.zst` backups stream-decompress
   lazily on open, so browsing a multi-gigabyte zstd backup is fast. `.chd`
   backups currently require building a full seekable cache on open, which

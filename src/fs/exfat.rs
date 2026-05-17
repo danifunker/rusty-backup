@@ -524,6 +524,7 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
                         link_target_cnid: None,
                         amiga_protection: None,
                         amiga_comment: None,
+                        amiga_date: None,
                     }
                 } else {
                     FileEntry {
@@ -545,6 +546,7 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
                         link_target_cnid: None,
                         amiga_protection: None,
                         amiga_comment: None,
+                        amiga_date: None,
                     }
                 };
 
@@ -583,6 +585,7 @@ impl<R: Read + Seek + Send> Filesystem for ExfatFilesystem<R> {
             link_target_cnid: None,
             amiga_protection: None,
             amiga_comment: None,
+            amiga_date: None,
         })
     }
 

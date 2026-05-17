@@ -81,6 +81,13 @@ pub struct InspectTab {
     export_partition_configs: Vec<PartitionExportConfig>,
     /// VHD export background thread status
     export_status: Option<Arc<Mutex<ExportStatus>>>,
+    /// Rate / ETA estimator for the VHD-export progress bar. Reset
+    /// when a new export starts and consulted each frame to render the
+    /// `N/s, ETA Hh Mm` suffix shared with the Backup / Restore bars.
+    export_rate: super::progress::RateTracker,
+    /// Rate / ETA estimator for the seekable-zstd cache-build progress
+    /// bar (native zstd Inspect path).
+    cache_rate: super::progress::RateTracker,
     /// Filesystem-computed in-place minimum partition sizes (partition index → bytes).
     /// "In-place" = the smallest size achievable by trim alone, no data movement.
     partition_min_sizes: HashMap<usize, u64>,
@@ -127,8 +134,21 @@ pub struct InspectTab {
     /// When the source is a CHD container, we route every reader through a
     /// fresh `ChdReader` opened from this path. `None` for raw devices/images.
     chd_image_path: Option<PathBuf>,
+    /// Cached total disk size in bytes for the currently-loaded source.
+    /// Filled lazily by `actual_disk_size_bytes()` so the inspect tab's
+    /// disk-layout bar + "Add Partition" enable check don't re-open the
+    /// CHD container on every frame (which makes the UI visibly laggy).
+    /// Cleared whenever the source changes.
+    cached_disk_size: Option<u64>,
     /// Partition table editor popup
     editor_popup: bool,
+    /// "Expand Image..." dialog open (Phase 6b of disk_expansion.md).
+    expand_image_dialog_open: bool,
+    /// MiB to add when the user clicks Expand in the Expand Image dialog.
+    expand_image_add_mib: u32,
+    /// Status of the background CHD-expand worker (Phase 6c). `None` when no
+    /// expansion has been started in this session.
+    chd_expand_status: Option<Arc<Mutex<rusty_backup::model::status::ChdExpandStatus>>>,
     /// Partition table editor model state.
     editor: PartitionEditor,
     /// Resize popup (in-place partition resizing)
@@ -184,6 +204,8 @@ impl Default for InspectTab {
             export_chd_hd_control: ChdOptionsControl::new(ChdProfile::Hd),
             export_partition_configs: Vec::new(),
             export_status: None,
+            export_rate: super::progress::RateTracker::default(),
+            cache_rate: super::progress::RateTracker::default(),
             partition_min_sizes: HashMap::new(),
             partition_defrag_min_sizes: HashMap::new(),
             partition_volume_labels: HashMap::new(),
@@ -200,7 +222,11 @@ impl Default for InspectTab {
             open_device_file: None,
             open_device_guard: None,
             chd_image_path: None,
+            cached_disk_size: None,
             editor_popup: false,
+            expand_image_dialog_open: false,
+            expand_image_add_mib: 0,
+            chd_expand_status: None,
             editor: PartitionEditor::new(),
             resize_popup: None,
             fsck_result: None,
@@ -248,6 +274,7 @@ impl InspectTab {
         self.prev_backup_path = None;
         self.partitions.clear();
         self.partition_table = None;
+        self.cached_disk_size = None;
         self.alignment = None;
         self.browse_view.close();
         self.partition_min_sizes.clear();
@@ -395,6 +422,7 @@ impl InspectTab {
         // Poll any pending per-partition minimum-size calculations
         self.poll_min_size_calcs(ctx);
         self.poll_volume_label_probes(ctx);
+        self.poll_chd_expand_status(ctx);
 
         // Background workers (min-size + volume-label probes) finish off the
         // GUI thread; without an explicit repaint request egui only paints
@@ -461,6 +489,78 @@ impl InspectTab {
                 .clicked()
             {
                 self.init_editor();
+            }
+
+            // Add Partition button (Phase 5 of disk_expansion.md) — opens
+            // the partition editor with the new-entry inputs pre-filled
+            // for the trailing free space, so the user doesn't have to
+            // hand-compute the start LBA + size. Only meaningful when
+            // there's >= 1 MiB of trailing free space.
+            let trailing_free = self
+                .actual_disk_size_bytes()
+                .map(|disk| {
+                    let used = self
+                        .partitions
+                        .iter()
+                        .filter(|p| !p.is_extended_container)
+                        .map(|p| p.start_lba.saturating_mul(512).saturating_add(p.size_bytes))
+                        .max()
+                        .unwrap_or(0);
+                    disk.saturating_sub(used)
+                })
+                .unwrap_or(0);
+            if ui
+                .add_enabled(
+                    is_editable_source && !export_running && trailing_free >= 1024 * 1024,
+                    egui::Button::new("Add Partition..."),
+                )
+                .on_hover_text(if trailing_free >= 1024 * 1024 {
+                    format!(
+                        "Add a new partition into the {} of trailing free space",
+                        partition::format_size(trailing_free),
+                    )
+                } else {
+                    "No trailing free space available".to_string()
+                })
+                .clicked()
+            {
+                self.init_add_partition(trailing_free);
+            }
+
+            // Expand Image button (Phases 6b + 6c of disk_expansion.md) —
+            // grows the underlying image file with zero-padding so the
+            // user can then partition the new trailing space via Add
+            // Partition or grow an existing partition via the editor.
+            // Raw + VHD via set_len in-place; CHD via a background
+            // re-encode worker (the CHD hunk layout is fixed at creation,
+            // so growing means writing a fresh CHD).
+            let is_image_file = self.image_file_path.is_some()
+                && self.selected_device_idx.is_none()
+                && self.backup_folder_path.is_none()
+                && self.clonezilla_image.is_none();
+            let chd_expand_running = self
+                .chd_expand_status
+                .as_ref()
+                .map(|s| s.lock().map(|g| !g.finished).unwrap_or(false))
+                .unwrap_or(false);
+            if ui
+                .add_enabled(
+                    is_image_file && !export_running && !chd_expand_running,
+                    egui::Button::new("Expand Image..."),
+                )
+                .on_hover_text(if !is_image_file {
+                    "Only image files can be expanded — devices have fixed size.".to_string()
+                } else if chd_expand_running {
+                    "CHD expansion already running.".to_string()
+                } else {
+                    "Grow the image file with zero-padding so you can add or extend \
+                     partitions in the new free space."
+                        .to_string()
+                })
+                .clicked()
+            {
+                self.expand_image_dialog_open = true;
+                self.expand_image_add_mib = 0;
             }
 
             // Resize Partitions button — same conditions as Edit Partition Table
@@ -541,12 +641,15 @@ impl InspectTab {
         if let Some(ref status_arc) = self.export_status {
             if let Ok(s) = status_arc.lock() {
                 if !s.finished && s.total_bytes > 0 {
+                    self.export_rate.record(s.current_bytes, "Exporting");
                     let fraction = s.current_bytes as f32 / s.total_bytes as f32;
+                    let suffix = self.export_rate.suffix(s.current_bytes, s.total_bytes);
                     let text = format!(
-                        "Exporting: {} / {} ({:.0}%)",
+                        "Exporting: {} / {} ({:.0}%){}",
                         partition::format_size(s.current_bytes),
                         partition::format_size(s.total_bytes),
                         fraction * 100.0,
+                        suffix,
                     );
                     ui.add(egui::ProgressBar::new(fraction).text(text).animate(true));
                 } else if !s.finished {
@@ -578,6 +681,11 @@ impl InspectTab {
         // Editor popup
         if self.editor_popup {
             self.show_editor_popup(ui, ctx);
+        }
+
+        // Expand Image dialog (Phase 6b of disk_expansion.md)
+        if self.expand_image_dialog_open {
+            self.show_expand_image_dialog(ui, ctx);
         }
 
         // Resize popup
@@ -644,13 +752,17 @@ impl InspectTab {
         if let Some(ref status_arc) = self.cache_status {
             if let Ok(s) = status_arc.lock() {
                 if !s.finished && s.total_bytes > 0 {
+                    let stage = format!("zstd-index-{}", s.partition_index);
+                    self.cache_rate.record(s.current_bytes, &stage);
                     let fraction = s.current_bytes as f32 / s.total_bytes as f32;
+                    let suffix = self.cache_rate.suffix(s.current_bytes, s.total_bytes);
                     let text = format!(
-                        "Building seekable zstd index for partition {}: {} / {} ({:.0}%)",
+                        "Building seekable zstd index for partition {}: {} / {} ({:.0}%){}",
                         s.partition_index,
                         partition::format_size(s.current_bytes),
                         partition::format_size(s.total_bytes),
                         fraction * 100.0,
+                        suffix,
                     );
                     ui.add(egui::ProgressBar::new(fraction).text(text).animate(true));
                 } else if !s.finished {
@@ -692,8 +804,160 @@ impl InspectTab {
     }
 
     fn init_editor(&mut self) {
-        self.editor.seed_from(&self.partitions);
+        self.editor
+            .seed_from_with_minimums(&self.partitions, &self.partition_min_sizes);
         self.editor_popup = true;
+    }
+
+    /// Open the partition-table editor pre-filled to add one new partition
+    /// into the trailing free space. The user reviews/changes the size +
+    /// type, then clicks Validate + Apply through the existing editor flow.
+    ///
+    /// Defaults:
+    ///   - Start LBA: first sector past the existing partitions
+    ///   - Size: all trailing free space, in MiB (rounded down)
+    ///   - Type: platform-appropriate (XFS for SGI, 0x83 for MBR Linux,
+    ///     Linux Filesystem GUID for GPT, Apple_HFS for APM)
+    fn init_add_partition(&mut self, trailing_free_bytes: u64) {
+        self.editor
+            .seed_from_with_minimums(&self.partitions, &self.partition_min_sizes);
+
+        let first_free_lba = self
+            .partitions
+            .iter()
+            .filter(|p| !p.is_extended_container)
+            .map(|p| p.start_lba + (p.size_bytes / 512))
+            .max()
+            .unwrap_or(0);
+        let size_mib = (trailing_free_bytes / (1024 * 1024)).max(1);
+
+        // Pick a sensible default partition type per table layout.
+        let default_type: &str = match self.partition_table.as_ref() {
+            Some(PartitionTable::Sgi(_)) => "XFS",
+            Some(PartitionTable::Apm(_)) => "Apple_HFS",
+            Some(PartitionTable::Gpt { .. }) => "0FC63DAF-8483-4772-8E79-3D69D8477DE4",
+            Some(PartitionTable::Mbr(_)) => "83",
+            _ => "83",
+        };
+
+        self.editor.add_start_lba = first_free_lba.to_string();
+        self.editor.add_size_mb = format!("{}", size_mib);
+        self.editor.add_type = default_type.to_string();
+        self.editor.add_bootable = false;
+        self.editor_popup = true;
+    }
+
+    /// Render the Expand Image dialog. Lets the user grow the current raw
+    /// or VHD image file by N MiB of zero-padding at the end. After the
+    /// growth completes the cached disk size is invalidated and the user
+    /// can re-inspect to see the new free space + use Add Partition.
+    fn show_expand_image_dialog(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
+        let mut open = self.expand_image_dialog_open;
+        let mut do_expand = false;
+        let current_size = self.actual_disk_size_bytes().unwrap_or(0);
+
+        egui::Window::new("Expand Image")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(420.0)
+            .show(ui.ctx(), |ui| {
+                ui.label(format!(
+                    "Current size: {}",
+                    partition::format_size(current_size),
+                ));
+                ui.add_space(4.0);
+
+                ui.horizontal(|ui| {
+                    ui.label("Add free space:");
+                    ui.add(
+                        egui::DragValue::new(&mut self.expand_image_add_mib)
+                            .range(0..=4_194_304u32) // 4 TiB upper bound
+                            .suffix(" MiB"),
+                    );
+                });
+
+                let add_bytes = (self.expand_image_add_mib as u64) * 1024 * 1024;
+                let new_size = current_size.saturating_add(add_bytes);
+                ui.label(format!("New size: {}", partition::format_size(new_size),));
+
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "After expansion, click Re-inspect to refresh the partition \
+                         list, then use 'Add Partition...' or 'Edit Partition Table...' \
+                         to allocate the new space.",
+                    )
+                    .weak(),
+                );
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(self.expand_image_add_mib > 0, egui::Button::new("Expand"))
+                        .clicked()
+                    {
+                        do_expand = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        do_expand = false;
+                    }
+                });
+            });
+
+        if !open {
+            self.expand_image_dialog_open = false;
+            return;
+        }
+
+        if do_expand {
+            let path = match &self.image_file_path {
+                Some(p) => p.clone(),
+                None => {
+                    ctx.log.error("Expand Image: no image file loaded");
+                    self.expand_image_dialog_open = false;
+                    return;
+                }
+            };
+            let add_bytes = (self.expand_image_add_mib as u64) * 1024 * 1024;
+            let is_chd = self.chd_image_path.is_some();
+            ctx.log.info(format!(
+                "Expanding image '{}' by {}...",
+                path.display(),
+                partition::format_size(add_bytes),
+            ));
+            if is_chd {
+                // Route through the background re-encode worker. Status is
+                // polled each frame; on completion we invalidate the cached
+                // disk size so the user's next re-inspect sees the new
+                // logical size.
+                let status = rusty_backup::model::chd_expand_runner::spawn(path, add_bytes);
+                self.chd_expand_status = Some(status);
+                ctx.log.info(
+                    "CHD expansion runs in the background — log lines will appear as it progresses.",
+                );
+            } else {
+                match rusty_backup::partition::resize::expand_image_file(
+                    &path,
+                    add_bytes,
+                    &mut |msg| ctx.log.info(msg),
+                ) {
+                    Ok(new_total) => {
+                        ctx.log.info(format!(
+                            "Image expanded to {}. Click Re-inspect to refresh.",
+                            partition::format_size(new_total),
+                        ));
+                        self.cached_disk_size = None;
+                    }
+                    Err(e) => {
+                        ctx.log.error(format!("Expand Image failed: {e}"));
+                    }
+                }
+            }
+            self.expand_image_dialog_open = false;
+        } else {
+            self.expand_image_dialog_open = open;
+        }
     }
 
     /// Assemble a snapshot of the currently-loaded source for the Physical
@@ -776,6 +1040,14 @@ impl InspectTab {
                 ui.label(format!("Table type: {}", table_type));
                 ui.add_space(4.0);
 
+                // Before / After disk layout. "Current" reads the loaded
+                // partition list, "After" walks the editor entries +
+                // add-partition inputs so the bar updates live as the user
+                // edits sizes, marks rows deleted, or fills in the
+                // Add Partition fields.
+                show_editor_disk_layout_bars(ui, &self.partitions, &self.editor);
+                ui.add_space(8.0);
+
                 // Partition entry grid
                 egui::Grid::new("editor_grid")
                     .striped(true)
@@ -784,6 +1056,7 @@ impl InspectTab {
                         ui.label(egui::RichText::new("#").strong());
                         ui.label(egui::RichText::new("Type").strong());
                         ui.label(egui::RichText::new("Start LBA").strong());
+                        ui.label(egui::RichText::new("Size Mode").strong());
                         ui.label(egui::RichText::new("Size (MiB)").strong());
                         ui.label(egui::RichText::new("Boot").strong());
                         ui.label(egui::RichText::new("").strong());
@@ -816,6 +1089,7 @@ impl InspectTab {
                                     egui::RichText::new(format!("{}", start_lba))
                                         .color(egui::Color32::GRAY),
                                 );
+                                ui.label("");
                                 ui.label(egui::RichText::new("deleted").color(egui::Color32::GRAY));
                                 ui.label("");
                                 if ui.small_button("Undo").clicked() {
@@ -837,6 +1111,7 @@ impl InspectTab {
                                     egui::RichText::new(format!("{}", start_lba))
                                         .color(egui::Color32::GRAY),
                                 );
+                                ui.label("");
                                 let size_mib = size_bytes as f64 / (1024.0 * 1024.0);
                                 ui.label(
                                     egui::RichText::new(format!("{:.2}", size_mib))
@@ -866,9 +1141,68 @@ impl InspectTab {
                             // Start LBA (read-only)
                             ui.label(format!("{}", start_lba));
 
-                            // Size (MiB) - editable
+                            // Size-mode radios (Original / Minimum / Custom).
+                            // Selecting a non-Custom mode re-stamps
+                            // `size_text` to the canonical "{:.2}" MiB for
+                            // that target. Minimum is hidden when the
+                            // per-partition min size isn't known (the
+                            // editor doesn't perform its own FS analysis;
+                            // it relies on whatever min sizes were probed
+                            // by the inspect tab and seeded in via
+                            // `seed_from_with_minimums`).
+                            {
+                                use rusty_backup::model::size_mode::SizeMode;
+                                let minimum_size = self.editor.entries[i].minimum_size;
+                                let original_size = size_bytes;
+                                let prev = self.editor.entries[i].choice;
+                                ui.horizontal(|ui| {
+                                    ui.radio_value(
+                                        &mut self.editor.entries[i].choice,
+                                        SizeMode::Original,
+                                        "Original",
+                                    );
+                                    if minimum_size > 0 && minimum_size < original_size {
+                                        ui.radio_value(
+                                            &mut self.editor.entries[i].choice,
+                                            SizeMode::Minimum,
+                                            "Minimum",
+                                        );
+                                    }
+                                    ui.radio_value(
+                                        &mut self.editor.entries[i].choice,
+                                        SizeMode::Custom,
+                                        "Custom",
+                                    );
+                                });
+                                if self.editor.entries[i].choice != prev {
+                                    match self.editor.entries[i].choice {
+                                        SizeMode::Original => {
+                                            self.editor.entries[i].size_text = format!(
+                                                "{:.2}",
+                                                original_size as f64 / (1024.0 * 1024.0),
+                                            );
+                                        }
+                                        SizeMode::Minimum => {
+                                            self.editor.entries[i].size_text = format!(
+                                                "{:.2}",
+                                                minimum_size as f64 / (1024.0 * 1024.0),
+                                            );
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+
+                            // Size (MiB) - editable when Custom; otherwise
+                            // displayed as a read-only field stamped by the
+                            // radio above.
+                            let size_editable = matches!(
+                                self.editor.entries[i].choice,
+                                rusty_backup::model::size_mode::SizeMode::Custom,
+                            );
                             let size_id = format!("ed_size_{}", i);
-                            ui.add(
+                            ui.add_enabled(
+                                size_editable,
                                 egui::TextEdit::singleline(&mut self.editor.entries[i].size_text)
                                     .desired_width(80.0)
                                     .id(egui::Id::new(&size_id)),
@@ -1093,6 +1427,7 @@ impl InspectTab {
             &self.partitions,
             self.backup_metadata.as_ref(),
             &self.partition_min_sizes,
+            &self.partition_defrag_min_sizes,
             self.image_file_path.as_ref(),
         );
     }
@@ -1125,6 +1460,19 @@ impl InspectTab {
             .show(ui.ctx(), |ui| {
                 ui.label("Export partitions as disk image files.");
                 ui.add_space(4.0);
+
+                // Current vs After disk layout. Current = loaded partition
+                // sizes; After applies each export config's effective_size
+                // (which honours Original / Minimum / Custom / FillRemaining
+                // exactly the way the export engine will). Both bars share
+                // a byte-per-pixel scale so shrinks/grows are immediately
+                // visible.
+                show_export_disk_layout_bars(
+                    ui,
+                    &self.partitions,
+                    &self.export_partition_configs,
+                );
+                ui.add_space(8.0);
 
                 // Export mode
                 ui.radio_value(
@@ -1246,6 +1594,62 @@ impl InspectTab {
                                 );
                                 ui.end_row();
                             }
+                        });
+                    ui.add_space(4.0);
+                }
+
+                // Limitations banner when at least one PFS3 partition is
+                // being shrunk. Export goes through the defragmenting
+                // clone path (`stream_defragmented_pfs3`), which rebuilds
+                // the volume layout — surface the user-visible side
+                // effects up-front so they're not surprised after the
+                // export completes.
+                let pfs3_shrink_partitions: Vec<&str> = self
+                    .export_partition_configs
+                    .iter()
+                    .filter(|cfg| cfg.effective_size() < cfg.original_size)
+                    .filter_map(|cfg| {
+                        self.partitions
+                            .iter()
+                            .find(|p| p.index == cfg.index)
+                            .and_then(|p| p.partition_type_string.as_deref())
+                            .filter(|s| rusty_backup::fs::is_amiga_pfs3_type(s))
+                            .map(|_| cfg.type_name.as_str())
+                    })
+                    .collect();
+                if !pfs3_shrink_partitions.is_empty() {
+                    egui::Frame::group(ui.style())
+                        .fill(ui.visuals().widgets.noninteractive.bg_fill)
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new("PFS3 shrink: volume will be rebuilt")
+                                    .strong(),
+                            );
+                            ui.label(format!(
+                                "Affected partitions: {}",
+                                pfs3_shrink_partitions.join(", ")
+                            ));
+                            ui.label(
+                                "PFS3's allocator scatters blocks throughout the volume, so \
+                                 in-place trim can't free up space. The export pipeline will \
+                                 instead walk the source and rebuild a packed copy at the new \
+                                 size — limitations to be aware of:",
+                            );
+                            ui.label(
+                                "  - PFS3 trashcan (deldir) contents are NOT preserved.",
+                            );
+                            ui.label(
+                                "  - File data, directory tree, protection bits, comments, \
+                                 dates, softlinks, and hardlinks (both directions) ARE preserved.",
+                            );
+                            ui.label(
+                                "  - Operation is slower than a verbatim copy: every file is \
+                                 read from the source and re-written to the destination.",
+                            );
+                            ui.label(
+                                "  - Uses a tempfile for the rebuilt image; ensure your \
+                                 temp directory has enough free space for the target partition size.",
+                            );
                         });
                     ui.add_space(4.0);
                 }
@@ -1621,6 +2025,7 @@ impl InspectTab {
                 }
             };
             self.export_status = Some(status);
+            self.export_rate.reset();
         } else {
             let dest_folder = match super::file_dialog().pick_folder() {
                 Some(p) => p,
@@ -1651,6 +2056,7 @@ impl InspectTab {
                 total_bytes,
             });
             self.export_status = Some(status);
+            self.export_rate.reset();
         }
     }
 
@@ -1725,6 +2131,32 @@ impl InspectTab {
         }
     }
 
+    /// Drain log messages from the CHD-expand worker into the global log
+    /// panel and react to completion (success/error). On success we
+    /// invalidate `cached_disk_size` so the user's next re-inspect picks
+    /// up the new logical size.
+    fn poll_chd_expand_status(&mut self, ctx: &mut TabContext) {
+        let arc = match &self.chd_expand_status {
+            Some(s) => s.clone(),
+            None => return,
+        };
+        let Ok(mut status) = arc.lock() else { return };
+        for msg in status.log_messages.drain(..) {
+            ctx.log.info(msg);
+        }
+        if status.finished {
+            if let Some(err) = &status.error {
+                ctx.log.error(format!("Expand Image (CHD) failed: {err}"));
+            } else {
+                ctx.log
+                    .info("CHD expansion complete. Click Re-inspect to refresh.");
+                self.cached_disk_size = None;
+            }
+            drop(status);
+            self.chd_expand_status = None;
+        }
+    }
+
     fn pick_backup_folder(&mut self) {
         if let Some(path) = super::file_dialog().pick_folder() {
             self.backup_folder_path = Some(path);
@@ -1738,6 +2170,7 @@ impl InspectTab {
         self.partition_table = None;
         self.alignment = None;
         self.partitions.clear();
+        self.cached_disk_size = None;
         self.backup_metadata = None;
         self.last_error = None;
         self.image_format_label = None;
@@ -1757,6 +2190,7 @@ impl InspectTab {
         self.open_device_file = None;
         self.open_device_guard = None;
         self.chd_image_path = None;
+        self.cached_disk_size = None;
         self.single_file_chd_backup_folder = None;
     }
 
@@ -2123,7 +2557,16 @@ impl InspectTab {
                     // 0x83, also tag "(MSX)" since standard PC tooling never
                     // writes FAT under 0x83 — it's specific to MSX HDD layouts.
                     for part in &mut partitions {
-                        if part.partition_type_byte != 0x83 || part.is_extended_container {
+                        if part.is_extended_container {
+                            continue;
+                        }
+                        // MBR 0x83 (Linux native) or GPT "Linux Filesystem"
+                        // GUID — both can hold ext, btrfs, or XFS. Probe the
+                        // VBR to label the inspect grid with the real family.
+                        let is_linux_mbr = part.partition_type_byte == 0x83;
+                        let is_linux_gpt = part.partition_type_string.as_deref()
+                            == Some("0FC63DAF-8483-4772-8E79-3D69D8477DE4");
+                        if !is_linux_mbr && !is_linux_gpt {
                             continue;
                         }
                         if let Some(mut br) = make_probe_reader() {
@@ -2131,7 +2574,7 @@ impl InspectTab {
                                 &mut br,
                                 part.start_lba * 512,
                             ) {
-                                Some("FAT") => {
+                                Some("FAT") if is_linux_mbr => {
                                     let part_offset = part.start_lba * 512;
                                     let subtype = make_probe_reader().and_then(|br2| {
                                         rusty_backup::fs::fat::FatFilesystem::open(br2, part_offset)
@@ -2567,7 +3010,81 @@ impl InspectTab {
         }
 
         ui.add_space(8.0);
+        self.show_disk_layout_section(ui);
         self.show_partition_list(ui, ctx);
+    }
+
+    fn show_disk_layout_section(&mut self, ui: &mut egui::Ui) {
+        if self.partitions.is_empty() {
+            return;
+        }
+        let actual_disk_size = self.actual_disk_size_bytes();
+        egui::CollapsingHeader::new("Disk layout")
+            .default_open(true)
+            .show(ui, |ui| {
+                let segments = build_disk_layout_segments(
+                    &self.partitions,
+                    &self.partition_volume_labels,
+                    actual_disk_size,
+                );
+                super::partition_bar::PartitionBar::new(segments).show(ui);
+            });
+        ui.add_space(4.0);
+    }
+
+    /// Best-effort estimate of the total disk size (bytes), used to draw the
+    /// trailing-free-space segment on the disk-layout bar. Sources:
+    ///
+    /// * Backup metadata — `source_size_bytes` is the authoritative recorded
+    ///   disk size, including any trailing free space the source had.
+    /// * Clonezilla image — same idea via `source_size_bytes`.
+    /// * Live device — physical disk size.
+    /// * Raw image file — filesystem-reported file length.
+    ///
+    /// Returns `None` when no source applies (e.g. before inspection has
+    /// finished); callers should suppress the trailing-free segment then.
+    fn actual_disk_size_bytes(&mut self) -> Option<u64> {
+        if let Some(cached) = self.cached_disk_size {
+            return Some(cached);
+        }
+        let computed = self.compute_actual_disk_size_bytes();
+        self.cached_disk_size = computed;
+        computed
+    }
+
+    fn compute_actual_disk_size_bytes(&self) -> Option<u64> {
+        if let Some(meta) = &self.backup_metadata {
+            if meta.source_size_bytes > 0 {
+                return Some(meta.source_size_bytes);
+            }
+        }
+        if let Some(cz) = &self.clonezilla_image {
+            if cz.source_size_bytes > 0 {
+                return Some(cz.source_size_bytes);
+            }
+        }
+        // For raw .chd image files, the file size on disk is the
+        // *compressed* size — the logical disk seen by partition-table
+        // parsing comes from the CHD header. Use that, otherwise the
+        // trailing-free-space calculation thinks the disk is much smaller
+        // than it actually is and we wrongly disable "Add Partition...".
+        if let Some(chd_path) = &self.chd_image_path {
+            if let Ok(reader) = rusty_backup::rbformats::chd::ChdReader::open(chd_path) {
+                let logical = reader.logical_size();
+                if logical > 0 {
+                    return Some(logical);
+                }
+            }
+        }
+        if let Some(path) = &self.image_file_path {
+            if let Ok(meta) = std::fs::metadata(path) {
+                let len = meta.len();
+                if len > 0 {
+                    return Some(len);
+                }
+            }
+        }
+        None
     }
 
     fn show_partition_list(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
@@ -3803,6 +4320,7 @@ impl InspectTab {
             total_bytes,
         }));
         self.cache_status = Some(Arc::clone(&status));
+        self.cache_rate.reset();
 
         let data_path = data_path.clone();
         std::thread::spawn(move || {
@@ -4142,6 +4660,293 @@ fn format_bytes_grouped(bytes: u64) -> String {
         result.push(ch);
     }
     result.chars().rev().collect()
+}
+
+/// Build the `Vec<Segment>` driving the inspect tab's disk-layout bar from the
+/// current partition list and any volume labels that have been probed.
+///
+/// Partitions are listed in their existing order (which already reflects the
+/// partition table). Extended-container entries are skipped. APM
+/// `Apple_partition_map` and SGI volume-header entries render dimmed. Color
+/// indices are assigned sequentially across the real (non-dimmed) partitions
+/// so the palette cycles predictably.
+fn build_disk_layout_segments(
+    partitions: &[PartitionInfo],
+    volume_labels: &HashMap<usize, String>,
+    actual_disk_size: Option<u64>,
+) -> Vec<super::partition_bar::Segment> {
+    use super::partition_bar::{Segment, SegmentKind};
+
+    let mut color_index: usize = 0;
+    let mut segments = Vec::with_capacity(partitions.len());
+    let mut max_end_bytes: u64 = 0;
+    for part in partitions {
+        if part.is_extended_container {
+            continue;
+        }
+        let part_end = part
+            .start_lba
+            .saturating_mul(512)
+            .saturating_add(part.size_bytes);
+        if part_end > max_end_bytes {
+            max_end_bytes = part_end;
+        }
+        let label = volume_labels
+            .get(&part.index)
+            .cloned()
+            .or_else(|| part.drv_name.clone())
+            .unwrap_or_else(|| format!("Partition {}", part.index + 1));
+        let fs = part.type_name.clone();
+
+        let is_dimmed = matches!(
+            part.partition_type_string.as_deref(),
+            Some("Apple_partition_map") | Some("SGI_volhdr") | Some("SGI_volume"),
+        );
+        let kind = if is_dimmed {
+            SegmentKind::Dimmed
+        } else {
+            let k = SegmentKind::Partition { color_index };
+            color_index += 1;
+            k
+        };
+        segments.push(Segment {
+            label,
+            fs,
+            size_bytes: part.size_bytes,
+            kind,
+        });
+    }
+
+    // Trailing free space at the end of the disk — only surfaced when we
+    // know the real disk size (from backup metadata, the loaded file, or a
+    // live device). Threshold of 1 MiB avoids cluttering the bar with the
+    // rounding-noise gaps that show up on real disks (e.g. GPT secondary
+    // header reserves 33 sectors; partition alignment may leave 1-2 MiB
+    // unused — those are not user-actionable "free space").
+    if let Some(disk_size) = actual_disk_size {
+        if disk_size > max_end_bytes {
+            let free = disk_size - max_end_bytes;
+            if free >= 1024 * 1024 {
+                segments.push(Segment {
+                    label: String::new(),
+                    fs: String::new(),
+                    size_bytes: free,
+                    kind: SegmentKind::Free,
+                });
+            }
+        }
+    }
+
+    segments
+}
+
+/// Render the Current vs After PartitionBar pair inside the Export Disk
+/// Image popup. "After" reuses each `PartitionExportConfig::effective_size`,
+/// so what the user sees in the bar is exactly the size the export engine
+/// will write.
+fn show_export_disk_layout_bars(
+    ui: &mut egui::Ui,
+    partitions: &[PartitionInfo],
+    configs: &[PartitionExportConfig],
+) {
+    use super::partition_bar::{PartitionBar, Segment, SegmentKind};
+
+    let mut current = Vec::new();
+    let mut color_index = 0usize;
+    for p in partitions {
+        if p.is_extended_container || p.is_logical {
+            continue;
+        }
+        let kind = SegmentKind::Partition { color_index };
+        color_index += 1;
+        current.push(Segment {
+            label: format!("Partition {}", p.index + 1),
+            fs: p.type_name.clone(),
+            size_bytes: p.size_bytes,
+            kind,
+        });
+    }
+
+    let mut after = Vec::new();
+    color_index = 0;
+    for p in partitions {
+        if p.is_extended_container || p.is_logical {
+            continue;
+        }
+        let cfg = configs.iter().find(|c| c.index == p.index);
+        let size = match cfg {
+            Some(c) => {
+                let eff = c.effective_size();
+                if eff == 0 {
+                    // FillRemaining — keep the segment visible at original
+                    // size so it doesn't disappear from the bar.
+                    p.size_bytes
+                } else {
+                    eff
+                }
+            }
+            None => p.size_bytes,
+        };
+        let kind = SegmentKind::Partition { color_index };
+        color_index += 1;
+        after.push(Segment {
+            label: format!("Partition {}", p.index + 1),
+            fs: p.type_name.clone(),
+            size_bytes: size,
+            kind,
+        });
+    }
+
+    let current_total: u64 = current.iter().map(|s| s.size_bytes).sum();
+    let after_total: u64 = after.iter().map(|s| s.size_bytes).sum();
+    let max_total = current_total.max(after_total).max(1);
+    let available_width = ui.available_width().max(120.0);
+
+    ui.label("Current:");
+    let current_w = available_width * (current_total as f64 / max_total as f64) as f32;
+    ui.scope(|ui| {
+        ui.set_width(current_w.max(60.0));
+        PartitionBar {
+            segments: current,
+            show_inline_labels: true,
+            show_legend: false,
+        }
+        .show(ui);
+    });
+
+    ui.add_space(4.0);
+    ui.label(format!(
+        "After  ({} -> {}):",
+        partition::format_size(current_total),
+        partition::format_size(after_total),
+    ));
+    let after_w = available_width * (after_total as f64 / max_total as f64) as f32;
+    ui.scope(|ui| {
+        ui.set_width(after_w.max(60.0));
+        PartitionBar {
+            segments: after,
+            show_inline_labels: true,
+            show_legend: true,
+        }
+        .show(ui);
+    });
+}
+
+/// Render the Current vs After PartitionBar pair inside the partition-table
+/// editor popup. "Current" mirrors the loaded `partitions` list; "After"
+/// walks the editor's working entries — applying parsed sizes, hiding
+/// deleted entries, and appending the pending Add-Partition row when its
+/// size field has a positive value. Both bars share the byte-per-pixel
+/// scale, so the After bar grows/shrinks visibly with the working edits.
+fn show_editor_disk_layout_bars(
+    ui: &mut egui::Ui,
+    partitions: &[PartitionInfo],
+    editor: &rusty_backup::model::partition_editor::PartitionEditor,
+) {
+    use super::partition_bar::{PartitionBar, Segment, SegmentKind};
+
+    fn parse_mib(text: &str) -> Option<u64> {
+        text.trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|v| *v > 0.0)
+            .map(|v| ((v * 1024.0 * 1024.0) as u64 / 512) * 512)
+    }
+
+    // Current bar from the loaded partition list (same shape as the
+    // inspect-tab disk-layout bar minus the trailing-free segment, since
+    // the editor's free space is implicit in the bar-pair scale).
+    let mut current = Vec::new();
+    let mut color_index = 0usize;
+    for p in partitions {
+        if p.is_extended_container || p.is_logical {
+            continue;
+        }
+        let kind = SegmentKind::Partition { color_index };
+        color_index += 1;
+        current.push(Segment {
+            label: format!("Partition {}", p.index + 1),
+            fs: p.type_name.clone(),
+            size_bytes: p.size_bytes,
+            kind,
+        });
+    }
+
+    // After bar from the editor working state. We preserve original entry
+    // order (partition table order) and reuse the same color cycle so the
+    // before/after pair stays visually aligned.
+    let mut after = Vec::new();
+    color_index = 0;
+    for entry in &editor.entries {
+        if entry.deleted || entry.is_extended_container || entry.is_logical {
+            // Reserve the color slot anyway so the next entry's color
+            // matches its Current counterpart.
+            if !entry.is_extended_container && !entry.is_logical {
+                color_index += 1;
+            }
+            continue;
+        }
+        let size_bytes = parse_mib(&entry.size_text).unwrap_or(entry.size_bytes);
+        let kind = SegmentKind::Partition { color_index };
+        color_index += 1;
+        after.push(Segment {
+            label: format!("Partition {}", entry.index + 1),
+            fs: entry.type_name.clone(),
+            size_bytes,
+            kind,
+        });
+    }
+
+    // Pending Add Partition row (rendered as a sequential segment in the
+    // current color slot). Surfaces while the user is filling in the
+    // Add-Partition fields, so they can see the addition in the bar before
+    // clicking Validate.
+    if let Some(add_size) = parse_mib(&editor.add_size_mb) {
+        after.push(Segment {
+            label: "New".to_string(),
+            fs: if editor.add_type.trim().is_empty() {
+                String::new()
+            } else {
+                editor.add_type.trim().to_string()
+            },
+            size_bytes: add_size,
+            kind: SegmentKind::Partition { color_index },
+        });
+    }
+
+    let current_total: u64 = current.iter().map(|s| s.size_bytes).sum();
+    let after_total: u64 = after.iter().map(|s| s.size_bytes).sum();
+    let max_total = current_total.max(after_total).max(1);
+    let available_width = ui.available_width().max(120.0);
+
+    ui.label("Current:");
+    let current_w = available_width * (current_total as f64 / max_total as f64) as f32;
+    ui.scope(|ui| {
+        ui.set_width(current_w.max(60.0));
+        PartitionBar {
+            segments: current,
+            show_inline_labels: true,
+            show_legend: false,
+        }
+        .show(ui);
+    });
+
+    ui.add_space(4.0);
+    ui.label(format!(
+        "After  ({} -> {}):",
+        partition::format_size(current_total),
+        partition::format_size(after_total),
+    ));
+    let after_w = available_width * (after_total as f64 / max_total as f64) as f32;
+    ui.scope(|ui| {
+        ui.set_width(after_w.max(60.0));
+        PartitionBar {
+            segments: after,
+            show_inline_labels: true,
+            show_legend: true,
+        }
+        .show(ui);
+    });
 }
 
 #[cfg(test)]

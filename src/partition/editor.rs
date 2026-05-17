@@ -5,6 +5,9 @@ use anyhow::{bail, Result};
 use super::apm::Apm;
 use super::gpt::Gpt;
 use super::mbr::{lba_to_chs, Mbr};
+use super::sgi::{
+    SgiPartitionEntry, SgiPartitionType, SgiVolumeHeader, SGI_TYPE_BYTE_EFS, SGI_TYPE_BYTE_XFS,
+};
 use super::PartitionTable;
 
 /// A single edit operation on a partition table.
@@ -191,7 +194,7 @@ pub fn apply_edits(
         }
         PartitionTable::Apm(apm) => apply_apm_edits(file, apm, edits, disk_size_bytes, log_cb),
         PartitionTable::Rdb(rdb) => apply_rdb_edits(file, rdb, edits, log_cb),
-        PartitionTable::Sgi(_) => bail!("SGI Volume Header editing is not yet supported"),
+        PartitionTable::Sgi(vh) => apply_sgi_edits(file, vh, edits, log_cb),
         PartitionTable::None { .. } => bail!("cannot edit partition table on a superfloppy"),
     }
 }
@@ -669,6 +672,189 @@ fn apply_apm_edits(
     Ok(())
 }
 
+/// Map an [`PartitionTableEdit::AddEntry`]/[`PartitionTableEdit::ChangeType`]
+/// type byte/string into the SGI partition-type discriminant. Accepts both
+/// our synthetic MBR-bytes (0xA0 / 0xA1 — what `PartitionTable::partitions`
+/// hands out) and case-insensitive SGI type-name strings (e.g. "XFS",
+/// "EFS"). Falls back to `Unknown` when nothing matches so the user can
+/// type a raw decimal/hex value into the type field and we'll round-trip
+/// it through `partition_type_raw`.
+fn parse_sgi_type(byte: u8, type_string: Option<&str>) -> SgiPartitionType {
+    if let Some(s) = type_string {
+        let trimmed = s.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        match lower.as_str() {
+            "xfs" => return SgiPartitionType::Xfs,
+            "efs" => return SgiPartitionType::Efs,
+            "raw" => return SgiPartitionType::Raw,
+            "bsd" => return SgiPartitionType::Bsd,
+            "sysv" => return SgiPartitionType::SysV,
+            "volume" => return SgiPartitionType::Volume,
+            "volhdr" => return SgiPartitionType::VolHdr,
+            "xfslog" => return SgiPartitionType::XfsLog,
+            "xlv" => return SgiPartitionType::Xlv,
+            "xvm" => return SgiPartitionType::Xvm,
+            "lvol" => return SgiPartitionType::LVol,
+            "rlvol" => return SgiPartitionType::RLVol,
+            "trkrepl" => return SgiPartitionType::TrkRepl,
+            "secrepl" => return SgiPartitionType::SecRepl,
+            _ => {
+                // Accept "0x07" / "7" / "07" raw values for full fidelity.
+                let parsed = if let Some(hex) = trimmed
+                    .strip_prefix("0x")
+                    .or_else(|| trimmed.strip_prefix("0X"))
+                {
+                    u32::from_str_radix(hex, 16).ok()
+                } else {
+                    trimmed.parse::<u32>().ok()
+                };
+                if let Some(raw) = parsed {
+                    return SgiPartitionType::from_raw(raw);
+                }
+            }
+        }
+    }
+    match byte {
+        SGI_TYPE_BYTE_XFS => SgiPartitionType::Xfs,
+        SGI_TYPE_BYTE_EFS => SgiPartitionType::Efs,
+        _ => SgiPartitionType::Unknown(byte as u32),
+    }
+}
+
+fn apply_sgi_edits(
+    file: &mut (impl Read + Write + Seek),
+    vh: &SgiVolumeHeader,
+    edits: &[PartitionTableEdit],
+    log_cb: &mut impl FnMut(&str),
+) -> Result<()> {
+    use crate::partition::sgi::SGI_NUM_PARTITIONS;
+
+    // Work on a clone so we can roll the in-memory state forward, then
+    // serialize the whole sector once at the end (checksum is recomputed by
+    // `SgiVolumeHeader::to_bytes`).
+    let mut patched = vh.clone();
+    // Ensure the partitions vec has exactly SGI_NUM_PARTITIONS slots so
+    // index-based edits don't go out of range on disks whose parser
+    // truncated trailing empty entries.
+    while patched.partitions.len() < SGI_NUM_PARTITIONS {
+        patched.partitions.push(SgiPartitionEntry {
+            blocks: 0,
+            first: 0,
+            partition_type_raw: 0,
+        });
+    }
+
+    for edit in edits {
+        match edit {
+            PartitionTableEdit::ResizeEntry {
+                index,
+                new_size_bytes,
+            } => {
+                let entry = patched.partitions.get_mut(*index).ok_or_else(|| {
+                    anyhow::anyhow!("SGI partition slot {} out of range (max 15)", index)
+                })?;
+                let new_blocks = (*new_size_bytes / 512) as u32;
+                entry.blocks = new_blocks;
+                log_cb(&format!(
+                    "Resized SGI partition slot {} to {} sectors",
+                    index, new_blocks
+                ));
+            }
+            PartitionTableEdit::MoveEntry {
+                index,
+                new_start_lba,
+            } => {
+                let entry = patched.partitions.get_mut(*index).ok_or_else(|| {
+                    anyhow::anyhow!("SGI partition slot {} out of range (max 15)", index)
+                })?;
+                entry.first = (*new_start_lba) as u32;
+                log_cb(&format!(
+                    "Moved SGI partition slot {} to LBA {}",
+                    index, new_start_lba
+                ));
+            }
+            PartitionTableEdit::ChangeType {
+                index,
+                new_type_byte,
+                new_type_string,
+            } => {
+                let entry = patched.partitions.get_mut(*index).ok_or_else(|| {
+                    anyhow::anyhow!("SGI partition slot {} out of range (max 15)", index)
+                })?;
+                let new_type = parse_sgi_type(*new_type_byte, new_type_string.as_deref()).as_u32();
+                entry.partition_type_raw = new_type;
+                log_cb(&format!(
+                    "Changed SGI partition slot {} type to {}",
+                    index,
+                    SgiPartitionType::from_raw(new_type).display_name(),
+                ));
+            }
+            PartitionTableEdit::DeleteEntry { index } => {
+                // SGI uses fixed 16 slots — clear in place rather than
+                // removing, so subsequent edits' indices stay stable.
+                let entry = patched.partitions.get_mut(*index).ok_or_else(|| {
+                    anyhow::anyhow!("SGI partition slot {} out of range (max 15)", index)
+                })?;
+                entry.blocks = 0;
+                entry.first = 0;
+                entry.partition_type_raw = 0;
+                log_cb(&format!("Cleared SGI partition slot {}", index));
+            }
+            PartitionTableEdit::AddEntry {
+                start_lba,
+                size_bytes,
+                partition_type,
+                type_string,
+                ..
+            } => {
+                // SGI has 16 fixed slots. Find the first empty one — but
+                // refuse to touch slots 8 (VOLUME) and 10 (VOLHDR) since
+                // those are reserved disk-wide wrappers. (They're filtered
+                // out of the editor's view by .partitions(), so the user
+                // won't see them, but defensive check anyway.)
+                let new_type = parse_sgi_type(*partition_type, type_string.as_deref());
+                let slot = patched
+                    .partitions
+                    .iter()
+                    .enumerate()
+                    .find(|(i, e)| e.is_empty() && *i != 8 && *i != 10)
+                    .map(|(i, _)| i)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("no empty SGI partition slot available (all 16 used)")
+                    })?;
+                patched.partitions[slot] = SgiPartitionEntry {
+                    blocks: (*size_bytes / 512) as u32,
+                    first: (*start_lba) as u32,
+                    partition_type_raw: new_type.as_u32(),
+                };
+                log_cb(&format!(
+                    "Added SGI partition in slot {} ({}, {} sectors at LBA {})",
+                    slot,
+                    new_type.display_name(),
+                    size_bytes / 512,
+                    start_lba,
+                ));
+            }
+            PartitionTableEdit::SetBootable { .. } => {
+                // SGI has no per-entry bootable flag. The bootable selection
+                // lives in the volume header's `root_part_num` field, which
+                // we're not yet exposing through the editor.
+                log_cb("SetBootable: ignored on SGI (root partition is set in volume header)");
+            }
+        }
+    }
+
+    // Serialize the patched header (recomputes the sector checksum) and
+    // write it back to sector 0.
+    let sector = patched.to_bytes();
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&sector)?;
+    file.flush()?;
+    log_cb("SGI volume header updated (sector 0)");
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -774,5 +960,129 @@ mod tests {
         let non_empty: Vec<_> = updated.entries.iter().filter(|e| !e.is_empty()).collect();
         assert_eq!(non_empty.len(), 1);
         assert_eq!(non_empty[0].partition_type, 0x83);
+    }
+
+    // --- SGI disklabel writer tests (Phase 3 of disk_expansion.md) ---
+
+    fn mk_sgi_table_with_one_xfs() -> (PartitionTable, Vec<u8>) {
+        use crate::partition::sgi::{
+            SgiPartitionEntry, SgiVolumeDirEntry, SgiVolumeHeader, SGI_NUM_PARTITIONS,
+            SGI_NUM_VOL_DIR, SGI_VOLHDR_MAGIC,
+        };
+        // One Xfs partition at slot 0 starting at LBA 4096 with 1000 sectors.
+        let mut vh = SgiVolumeHeader {
+            magic: SGI_VOLHDR_MAGIC,
+            root_part_num: 0,
+            swap_part_num: 1,
+            bootfile: "/unix".to_string(),
+            volume_directory: Vec::new(),
+            partitions: Vec::new(),
+            checksum: 0,
+            checksum_valid: true,
+        };
+        while vh.volume_directory.len() < SGI_NUM_VOL_DIR {
+            vh.volume_directory.push(SgiVolumeDirEntry {
+                name: String::new(),
+                block_num: 0,
+                bytes: 0,
+            });
+        }
+        vh.partitions.push(SgiPartitionEntry {
+            blocks: 1000,
+            first: 4096,
+            partition_type_raw: SgiPartitionType::Xfs.as_u32(),
+        });
+        while vh.partitions.len() < SGI_NUM_PARTITIONS {
+            vh.partitions.push(SgiPartitionEntry {
+                blocks: 0,
+                first: 0,
+                partition_type_raw: 0,
+            });
+        }
+
+        let mut disk = vec![0u8; 100_000 * 512];
+        disk[..512].copy_from_slice(&vh.to_bytes());
+
+        (PartitionTable::Sgi(vh), disk)
+    }
+
+    #[test]
+    fn sgi_resize_grows_blocks_and_recomputes_checksum() {
+        let (table, mut disk) = mk_sgi_table_with_one_xfs();
+        let edits = vec![PartitionTableEdit::ResizeEntry {
+            index: 0,
+            new_size_bytes: 2000 * 512,
+        }];
+        let mut cursor = Cursor::new(&mut disk[..]);
+        apply_edits(&mut cursor, &table, &edits, 100_000 * 512, &mut |_| {}).unwrap();
+
+        let updated = SgiVolumeHeader::parse(&disk[..512]).unwrap();
+        assert_eq!(updated.partitions[0].blocks, 2000);
+        assert_eq!(updated.partitions[0].first, 4096);
+        assert_eq!(
+            updated.partitions[0].partition_type(),
+            SgiPartitionType::Xfs
+        );
+        // Checksum must round-trip — parse() rejects bad headers, so reaching
+        // here means the new sum-to-zero invariant holds.
+        assert!(updated.checksum_valid);
+    }
+
+    #[test]
+    fn sgi_add_entry_fills_first_free_slot() {
+        let (table, mut disk) = mk_sgi_table_with_one_xfs();
+        let edits = vec![PartitionTableEdit::AddEntry {
+            start_lba: 10_000,
+            size_bytes: 500 * 512,
+            partition_type: SGI_TYPE_BYTE_EFS,
+            type_string: None,
+            bootable: false,
+        }];
+        let mut cursor = Cursor::new(&mut disk[..]);
+        apply_edits(&mut cursor, &table, &edits, 100_000 * 512, &mut |_| {}).unwrap();
+
+        let updated = SgiVolumeHeader::parse(&disk[..512]).unwrap();
+        // Slot 0 still has the original XFS; the new EFS goes into slot 1
+        // (slot 8/10 are reserved for volume wrappers but stay empty here
+        // so the next empty slot is 1).
+        assert_eq!(
+            updated.partitions[0].partition_type(),
+            SgiPartitionType::Xfs
+        );
+        assert_eq!(
+            updated.partitions[1].partition_type(),
+            SgiPartitionType::Efs
+        );
+        assert_eq!(updated.partitions[1].first, 10_000);
+        assert_eq!(updated.partitions[1].blocks, 500);
+    }
+
+    #[test]
+    fn sgi_delete_clears_slot_in_place() {
+        let (table, mut disk) = mk_sgi_table_with_one_xfs();
+        let edits = vec![PartitionTableEdit::DeleteEntry { index: 0 }];
+        let mut cursor = Cursor::new(&mut disk[..]);
+        apply_edits(&mut cursor, &table, &edits, 100_000 * 512, &mut |_| {}).unwrap();
+
+        let updated = SgiVolumeHeader::parse(&disk[..512]).unwrap();
+        assert!(updated.partitions[0].is_empty());
+    }
+
+    #[test]
+    fn sgi_change_type_accepts_string_or_byte() {
+        let (table, mut disk) = mk_sgi_table_with_one_xfs();
+        let edits = vec![PartitionTableEdit::ChangeType {
+            index: 0,
+            new_type_byte: 0,
+            new_type_string: Some("EFS".into()),
+        }];
+        let mut cursor = Cursor::new(&mut disk[..]);
+        apply_edits(&mut cursor, &table, &edits, 100_000 * 512, &mut |_| {}).unwrap();
+
+        let updated = SgiVolumeHeader::parse(&disk[..512]).unwrap();
+        assert_eq!(
+            updated.partitions[0].partition_type(),
+            SgiPartitionType::Efs
+        );
     }
 }

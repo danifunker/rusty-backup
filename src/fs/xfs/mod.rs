@@ -358,6 +358,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
             link_target_cnid: None,
             amiga_protection: None,
             amiga_comment: None,
+            amiga_date: None,
         })
     }
 
@@ -703,6 +704,7 @@ impl<R: Read + Seek + Send> Filesystem for XfsFilesystem<R> {
             link_target_cnid: None,
             amiga_protection: None,
             amiga_comment: None,
+            amiga_date: None,
         })
     }
 

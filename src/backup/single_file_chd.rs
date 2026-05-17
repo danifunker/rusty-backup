@@ -1459,6 +1459,7 @@ fn stage_partitions_to_zst(
             let shape_label = match shape {
                 fs::DefragCloneShape::Flat => "flat HFS+",
                 fs::DefragCloneShape::Wrapped => "wrapped HFS+",
+                fs::DefragCloneShape::Pfs3 => "PFS3 (Amiga)",
             };
             phase_cb(&format!(
                 "Staging partition-{} ({} of {}): analyzing {} catalog (may take minutes)...",
@@ -1499,6 +1500,7 @@ fn stage_partitions_to_zst(
                         }
                     }
                     let _sink_guard = ClearSinkOnDrop;
+                    let sink_for_clone = producer_sink.clone();
                     if let Some(sink) = producer_sink {
                         let sink_for_install = sink.clone();
                         fs::hfsplus_defrag::set_progress_sink(Some(Box::new(move |msg: &str| {
@@ -1506,6 +1508,39 @@ fn stage_partitions_to_zst(
                         })));
                     }
                     match shape {
+                        fs::DefragCloneShape::Pfs3 => {
+                            let br = std::io::BufReader::new(producer_clone);
+                            let mut pfs = fs::pfs3::Pfs3Filesystem::open(br, part_offset)
+                                .context("open source PFS3 for defrag-clone")?;
+                            let sink_for_log = sink_for_clone.clone();
+                            let mut clone_log = |s: &str| {
+                                if let Some(sink) = &sink_for_log {
+                                    sink(s);
+                                }
+                            };
+                            let mut clone_progress = |_emitted: u64| {};
+                            let pr = fs::pfs3_clone::stream_defragmented_pfs3(
+                                &mut pfs,
+                                target_len,
+                                &mut writer,
+                                &mut clone_log,
+                                &mut clone_progress,
+                            )
+                            .context("stream_defragmented_pfs3")?;
+                            for w in &pr.warnings {
+                                eprintln!("PFS3 clone warning: {w}");
+                            }
+                            Ok(fs::hfsplus_defrag::DefragReport {
+                                files_copied: pr.files_copied,
+                                dirs_copied: pr.dirs_copied,
+                                data_bytes_copied: pr.bytes_copied,
+                                rsrc_bytes_copied: 0,
+                                xattrs_copied: 0,
+                                hardlinks_copied: pr.hardlinks_copied,
+                                dir_hardlinks_copied: 0,
+                                bytes_emitted: target_len,
+                            })
+                        }
                         fs::DefragCloneShape::Flat => {
                             let br = std::io::BufReader::new(producer_clone);
                             let mut hfs = fs::hfsplus::HfsPlusFilesystem::open(br, part_offset)

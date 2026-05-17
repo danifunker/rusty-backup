@@ -39,6 +39,17 @@ const ROOTBLOCK_SECTOR: u32 = 2;
 // rootblock.options bits
 const MODE_HARDDISK: u32 = 1;
 const MODE_SPLITTED_ANODES: u32 = 2;
+// Gates whether tools honor the per-direntry datestamps at offsets 10..16.
+// pfs3aio auto-sets it on first write-mount (`volume.c:546`), so any real
+// PFS3 volume that's been touched has it set. We mirror that for blank
+// volumes so dates we write into direntries are honored without needing a
+// real-Amiga mount to flip the bit.
+const MODE_DATESTAMP: u32 = 64;
+/// Long-filename support flag. When set, tooling honors the
+/// `fnsize` field in the rootblock extension (default 32 / max 107)
+/// to allow names beyond the standard AmigaDOS 31-char limit. Real
+/// AmigaVision-style volumes commonly enable this with `fnsize=107`.
+const MODE_LONGFN: u32 = 1024;
 #[allow(dead_code)]
 const MODE_DIR_EXTENSION: u32 = 4;
 #[allow(dead_code)]
@@ -193,7 +204,7 @@ struct Canode {
 type ResBlockBuf = Vec<u8>;
 
 pub struct Pfs3Filesystem<R: Read + Seek> {
-    reader: R,
+    pub(crate) reader: R,
     partition_offset: u64,
     partition_size: u64,
     root: Pfs3RootBlock,
@@ -220,6 +231,21 @@ pub struct Pfs3Filesystem<R: Read + Seek> {
     /// is 512 bytes. Kept separate from `dirty_reserved` to make
     /// snapshot/rollback granular.
     dirty_data: HashMap<u32, Vec<u8>>,
+
+    /// Rolling allocator hints. The allocators may safely start their
+    /// scan from these positions and treat anything before as fully
+    /// allocated. `free_*` paths lower them when blocks become available
+    /// again. Persisted in [`Pfs3Snapshot`] so rollback restores hints
+    /// alongside the rest of the mutable state.
+    alloc_anode_hint_seqnr: u32,
+    alloc_data_hint_local: u32,
+    /// Per-directory tail-of-chain hint: `dir_anodenr -> chain_anodenr`
+    /// of the dirblock most recently used for an append. Lets
+    /// `add_direntry_to_dir` skip the full head-of-chain walk on dirs
+    /// with thousands of entries (which made bulk clones O(N^2)).
+    /// Always safe — the insertion path still validates space and
+    /// walks forward from the hint if it's stale.
+    dir_append_hint: HashMap<u32, u32>,
 }
 
 /// Snapshot of mutable state for `EditableFilesystem` rollback. Captured
@@ -231,6 +257,9 @@ struct Pfs3Snapshot {
     dirty_reserved: HashMap<u32, Vec<u8>>,
     dirty_data: HashMap<u32, Vec<u8>>,
     cache_overrides: HashMap<u32, Vec<u8>>,
+    alloc_anode_hint_seqnr: u32,
+    alloc_data_hint_local: u32,
+    dir_append_hint: HashMap<u32, u32>,
 }
 
 const MAX_CACHE_ENTRIES: usize = 128;
@@ -341,6 +370,9 @@ impl<R: Read + Seek> Pfs3Filesystem<R> {
             cache: HashMap::new(),
             dirty_reserved: HashMap::new(),
             dirty_data: HashMap::new(),
+            alloc_anode_hint_seqnr: 0,
+            alloc_data_hint_local: 0,
+            dir_append_hint: HashMap::new(),
         })
     }
 
@@ -573,6 +605,20 @@ impl<R: Read + Seek> Pfs3Filesystem<R> {
         }
         Ok(written)
     }
+
+    /// Read a `ST_SOFTLINK` direntry's target path. The link's anode
+    /// points at one or more data blocks holding a NUL-terminated path
+    /// string (per pfs3aio `CreateSoftLink`: a 1024-byte buffer is
+    /// allocated, `strcpy`'d, and written verbatim). We follow the
+    /// anode, read up to 2048 bytes (well past any practical Amiga path
+    /// length), and truncate at the first NUL.
+    fn read_softlink_target(&mut self, link_anodenr: u32) -> Result<String, FilesystemError> {
+        let mut buf: Vec<u8> = Vec::with_capacity(2048);
+        let mut sink = std::io::Cursor::new(&mut buf);
+        self.stream_file_data(link_anodenr, 2048, &mut sink)?;
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        Ok(String::from_utf8_lossy(&buf[..end]).into_owned())
+    }
 }
 
 /// One direntry parsed from a dirblock.
@@ -589,6 +635,10 @@ struct DirEntry {
     name: String,
     #[allow(dead_code)]
     comment: String,
+    /// `extrafields.link` — for ST_LINKFILE / ST_LINKDIR this is the
+    /// target object's anode. Zero for non-link entries (no link bits
+    /// set in the packed extrafields flags).
+    extrafields_link: u32,
 }
 
 /// Parse a single direntry starting at `entries[off]` within a dirblock.
@@ -628,19 +678,56 @@ fn parse_direntry(entries: &[u8], off: usize, largefile: bool) -> Option<DirEntr
     } else {
         String::new()
     };
-    // LARGEFILE: high 16 bits live in extrafields at the tail of the
-    // direntry (after comment, then alignment, then extrafields). The
-    // padding makes total entry size even, then extrafields follow up to
-    // the entry boundary. We only need fsizex (last 2 bytes of the entry)
-    // when largefile mode is on.
-    let mut fsize = fsize_lo;
-    if largefile && next >= 20 {
-        let fsizex_off = off + next - 2;
-        if fsizex_off + 2 <= entries.len() {
-            let hi = rd_u16(entries, fsizex_off) as u64;
-            fsize = (hi << 32) | fsize_lo;
+    // Extrafields layout (pfs3aio `AddExtraFields`/`GetExtraFields`):
+    // packed at the END of the direntry, terminated by a u16 `flags`
+    // bitmap. Each set bit (LSB first) prepends one u16 field, walking
+    // backwards from the flags word. Field order matches the `struct
+    // extrafields` u16-stream:
+    //     bit 0 = link[hi], bit 1 = link[lo],
+    //     bit 2 = uid, bit 3 = gid,
+    //     bit 4 = prot[hi], bit 5 = prot[lo],
+    //     bit 6 = virtualsize[hi], bit 7 = virtualsize[lo],
+    //     bit 8 = rollpointer[hi], bit 9 = rollpointer[lo],
+    //     bit 10 = fsizex (LARGEFILE high 16 bits of fsize).
+    // We extract `link` (for ST_LINKFILE / ST_LINKDIR hardlinks) and
+    // `fsizex` (for LARGEFILE mode); other fields are not currently
+    // surfaced on the read path.
+    let entries_origin_off = name_start - 18; // = off
+    let extra_start_unaligned = cmt_pos + 1 + comment.len();
+    let extra_start = (extra_start_unaligned + 1) & !1;
+    let entry_end = entries_origin_off + next;
+    let mut link_hi: u16 = 0;
+    let mut link_lo: u16 = 0;
+    let mut fsizex_hi: u16 = 0;
+    if extra_start + 2 <= entry_end && entry_end <= entries.len() {
+        let mut flags = rd_u16(entries, entry_end - 2);
+        // Cursor walks backwards through the packed u16 fields.
+        let mut cursor = entry_end - 2;
+        for bit_idx in 0..11u32 {
+            let present = (flags & 1) == 1;
+            flags >>= 1;
+            if present {
+                if cursor < extra_start + 2 {
+                    break;
+                }
+                cursor -= 2;
+                let val = rd_u16(entries, cursor);
+                match bit_idx {
+                    0 => link_hi = val,
+                    1 => link_lo = val,
+                    10 => fsizex_hi = val,
+                    _ => {}
+                }
+            }
         }
     }
+    let extrafields_link = ((link_hi as u32) << 16) | (link_lo as u32);
+    // LARGEFILE: fsize high 16 bits come from extrafields.fsizex.
+    let fsize = if largefile {
+        ((fsizex_hi as u64) << 32) | fsize_lo
+    } else {
+        fsize_lo
+    };
     Some(DirEntry {
         ttype,
         anode,
@@ -651,6 +738,7 @@ fn parse_direntry(entries: &[u8], off: usize, largefile: bool) -> Option<DirEntr
         protection,
         name,
         comment,
+        extrafields_link,
     })
 }
 
@@ -693,25 +781,52 @@ impl<R: Read + Seek + Send> Filesystem for Pfs3Filesystem<R> {
         })?;
 
         for de in raw_entries {
-            // PFS3 type byte (from struct direntry): negative = file/link,
-            // positive = directory. Specifically: ST_FILE = -3, ST_DIR = 2,
-            // ST_LINKFILE = -4, ST_SOFTLINK = 3.
-            let is_dir = de.ttype > 0;
             let child_path = if parent_path == "/" {
                 format!("/{}", de.name)
             } else {
                 format!("{}/{}", parent_path, de.name)
             };
-            let mut fe = if is_dir {
-                FileEntry::new_directory(de.name.clone(), child_path, de.anode as u64)
-            } else {
-                FileEntry::new_file(de.name.clone(), child_path, de.fsize, de.anode as u64)
+            // Classify by exact ST_* value (positive does NOT imply
+            // directory — ST_SOFTLINK is positive too).
+            let mut fe = match de.ttype {
+                ST_DIR => FileEntry::new_directory(de.name.clone(), child_path, de.anode as u64),
+                ST_LINKDIR => {
+                    let mut e =
+                        FileEntry::new_directory(de.name.clone(), child_path, de.anode as u64);
+                    e.link_target_cnid = Some(de.extrafields_link as u64);
+                    e
+                }
+                ST_SOFTLINK => {
+                    // Resolve the target string from the anode's block.
+                    let target = self
+                        .read_softlink_target(de.anode)
+                        .unwrap_or_else(|_| String::new());
+                    FileEntry::new_symlink(
+                        de.name.clone(),
+                        child_path,
+                        de.fsize,
+                        de.anode as u64,
+                        target,
+                    )
+                }
+                ST_LINKFILE => {
+                    let mut e =
+                        FileEntry::new_file(de.name.clone(), child_path, de.fsize, de.anode as u64);
+                    e.link_target_cnid = Some(de.extrafields_link as u64);
+                    e
+                }
+                _ => {
+                    // ST_FILE, ST_ROLLOVERFILE, anything else defaults
+                    // to a regular file entry.
+                    FileEntry::new_file(de.name.clone(), child_path, de.fsize, de.anode as u64)
+                }
             };
             fe.modified = datestamp_string(de.cd as i32, de.cm as i32, de.ct as i32);
             fe.amiga_protection = Some(de.protection as u32);
             if !de.comment.is_empty() {
                 fe.amiga_comment = Some(de.comment.clone());
             }
+            fe.amiga_date = Some((de.cd as i32, de.cm as i32, de.ct as i32));
             out.push(fe);
         }
         Ok(out)
@@ -801,6 +916,28 @@ impl<R: Read + Seek + Send> Filesystem for Pfs3Filesystem<R> {
         }
         let last_sec = last_alloc.unwrap_or(self.root.last_reserved);
         Ok((last_sec as u64 + 1) * HW_SECTOR)
+    }
+
+    /// Floor that the defragmenting clone (`clone_pfs3_volume`) can
+    /// shrink this volume to. Computed from the actual used bytes
+    /// rather than the highest-allocated-sector high-water mark — the
+    /// rovingPointer allocator scatters blocks throughout the volume,
+    /// so `last_data_byte` typically equals the partition size on any
+    /// non-trivial PFS3 volume and reports no savings.
+    ///
+    /// Conservative: takes the source's `used_size` and adds a small
+    /// margin for the target's new reserved area + bitmap pages. The
+    /// actual clone sizes precisely via `create_blank_pfs3`; this
+    /// number is for "preview the shrink" UI gating.
+    fn defragmented_minimum_size(&mut self) -> Result<u64, FilesystemError> {
+        let used = self.used_size();
+        // 256 KiB headroom covers the blank-volume reserved area (32 KiB
+        // for PFS3_BLANK_NUMRESERVED * resblksize) plus extra bitmap
+        // pages for plausible target sizes. Far smaller than the
+        // partition size, so the user still sees a useful saving
+        // estimate.
+        const MARGIN_BYTES: u64 = 256 * 1024;
+        Ok(used.saturating_add(MARGIN_BYTES))
     }
 }
 
@@ -1041,10 +1178,16 @@ fn read_user_bitmap<R: Read + Seek>(
 const PFS3_ANODE_USERFIRST: u32 = 6;
 const PFS3_ANODE_EOF_SENTINEL: u32 = 0xFFFFFFFF;
 
-/// Direntry type byte (i8 on disk). Positive = directory variant,
-/// negative = file/link variant (per pfs3aio).
+/// Direntry type byte (i8 on disk). Values per pfs3aio / amitools:
+/// `ST_USERDIR=2`, `ST_SOFTLINK=3`, `ST_LINKDIR=4`, `ST_FILE=-3`,
+/// `ST_LINKFILE=-4`, `ST_ROLLOVERFILE=-16` (PFS extension).
+/// Positive does NOT imply "is a directory" — `ST_SOFTLINK=3` is a
+/// symlink to a file or dir; classify by exact value.
 const ST_FILE: i8 = -3;
 const ST_DIR: i8 = 2;
+const ST_SOFTLINK: i8 = 3;
+const ST_LINKDIR: i8 = 4;
+const ST_LINKFILE: i8 = -4;
 
 impl Pfs3RootBlock {
     /// Serialize the rootblock into the first 512 bytes of the cluster.
@@ -1098,6 +1241,9 @@ impl<R: Read + Seek> Pfs3Filesystem<R> {
             // entries we might evict. Mutation methods stay small so
             // this is cheap in practice.
             cache_overrides: self.cache.clone(),
+            alloc_anode_hint_seqnr: self.alloc_anode_hint_seqnr,
+            alloc_data_hint_local: self.alloc_data_hint_local,
+            dir_append_hint: self.dir_append_hint.clone(),
         }
     }
 
@@ -1106,6 +1252,9 @@ impl<R: Read + Seek> Pfs3Filesystem<R> {
         self.dirty_reserved = snap.dirty_reserved;
         self.dirty_data = snap.dirty_data;
         self.cache = snap.cache_overrides;
+        self.alloc_anode_hint_seqnr = snap.alloc_anode_hint_seqnr;
+        self.alloc_data_hint_local = snap.alloc_data_hint_local;
+        self.dir_append_hint = snap.dir_append_hint;
     }
 
     /// Return a mutable reference to the rootblock cluster buffer (loaded
@@ -1240,41 +1389,165 @@ impl<R: Read + Seek> Pfs3Filesystem<R> {
         Ok(())
     }
 
-    /// Find an unused anode slot (clustersize=0 AND blocknr=0 AND next=0)
-    /// in anodeblock 0 and mark it allocated by writing the
-    /// `(0, 0xFFFFFFFF, 0)` sentinel pfs3aio uses. Returns the anodenr.
+    /// Find an unused anode slot (clustersize=0 AND blocknr=0 AND
+    /// next=0) anywhere in the anodeblock chain and mark it allocated
+    /// by writing the `(0, 0xFFFFFFFF, 0)` sentinel pfs3aio uses.
+    /// Returns the anodenr.
     ///
-    /// Only anodeblock 0 is searched — our blank formatter only emits one
-    /// anodeblock and we don't grow it. For the round-trip test surface
-    /// (a few dozen mutations) the 84 user slots per AB are plenty.
+    /// Walks anodeblock seqnrs 0, 1, 2, … resolving each via
+    /// `anodeblock_blocknr`. The first AB that has a free slot wins.
+    /// If every existing AB is full, allocates a fresh AB (and a
+    /// fresh IB to host it, if the current IB is full), then returns
+    /// slot 0 of the new AB.
+    ///
+    /// Slots `0..PFS3_ANODE_USERFIRST` of seqnr 0 are reserved for
+    /// PFS3 bookkeeping (root anode, etc.) and are skipped during
+    /// search. Higher-seqnr ABs have no reserved slots — slot 0 is
+    /// usable.
     fn alloc_anode_in_memory(&mut self) -> Result<u32, FilesystemError> {
-        let ab_sec = self.anodeblock_blocknr(0)?;
-        self.ensure_reserved_dirty(ab_sec)?;
-        let blk = self.dirty_reserved.get_mut(&ab_sec).unwrap();
-        for slot in PFS3_ANODE_USERFIRST as usize..self.anodesperblock as usize {
-            let o = 16 + slot * 12;
-            if o + 12 > blk.len() {
-                break;
-            }
-            let cs = u32::from_be_bytes([blk[o], blk[o + 1], blk[o + 2], blk[o + 3]]);
-            let bn = u32::from_be_bytes([blk[o + 4], blk[o + 5], blk[o + 6], blk[o + 7]]);
-            let nx = u32::from_be_bytes([blk[o + 8], blk[o + 9], blk[o + 10], blk[o + 11]]);
-            if cs == 0 && bn == 0 && nx == 0 {
-                // Sentinel: clustersize=0, blocknr=0xFFFFFFFF, next=0.
-                blk[o..o + 4].copy_from_slice(&0u32.to_be_bytes());
-                blk[o + 4..o + 8].copy_from_slice(&PFS3_ANODE_EOF_SENTINEL.to_be_bytes());
-                blk[o + 8..o + 12].copy_from_slice(&0u32.to_be_bytes());
-                let anodenr = if self.anodesplitmode {
-                    slot as u32
-                } else {
-                    slot as u32
-                };
-                return Ok(anodenr);
+        let anodesperblock = self.anodesperblock;
+        // Start where the previous successful allocation left off. Skips
+        // the linear walk over already-full anodeblocks that made bulk
+        // clones O(N^2). `free_anode_in_memory` lowers this hint so we
+        // never miss a slot that came free again.
+        let mut seqnr: u32 = self.alloc_anode_hint_seqnr;
+        loop {
+            let ab_sec_or_err = self.anodeblock_blocknr(seqnr);
+            match ab_sec_or_err {
+                Ok(ab_sec) => {
+                    self.ensure_reserved_dirty(ab_sec)?;
+                    let blk = self.dirty_reserved.get_mut(&ab_sec).unwrap();
+                    let start_slot = if seqnr == 0 {
+                        PFS3_ANODE_USERFIRST as usize
+                    } else {
+                        0
+                    };
+                    for slot in start_slot..anodesperblock as usize {
+                        let o = 16 + slot * 12;
+                        if o + 12 > blk.len() {
+                            break;
+                        }
+                        let cs = u32::from_be_bytes([blk[o], blk[o + 1], blk[o + 2], blk[o + 3]]);
+                        let bn =
+                            u32::from_be_bytes([blk[o + 4], blk[o + 5], blk[o + 6], blk[o + 7]]);
+                        let nx =
+                            u32::from_be_bytes([blk[o + 8], blk[o + 9], blk[o + 10], blk[o + 11]]);
+                        if cs == 0 && bn == 0 && nx == 0 {
+                            blk[o..o + 4].copy_from_slice(&0u32.to_be_bytes());
+                            blk[o + 4..o + 8]
+                                .copy_from_slice(&PFS3_ANODE_EOF_SENTINEL.to_be_bytes());
+                            blk[o + 8..o + 12].copy_from_slice(&0u32.to_be_bytes());
+                            self.alloc_anode_hint_seqnr = seqnr;
+                            return Ok(self.encode_anodenr(seqnr, slot as u32));
+                        }
+                    }
+                    seqnr += 1;
+                }
+                Err(_) => {
+                    // No anodeblock at this seqnr — allocate one.
+                    let new_ab_sec = self.alloc_new_anodeblock(seqnr)?;
+                    self.ensure_reserved_dirty(new_ab_sec)?;
+                    let blk = self.dirty_reserved.get_mut(&new_ab_sec).unwrap();
+                    let slot = 0usize;
+                    let o = 16 + slot * 12;
+                    blk[o..o + 4].copy_from_slice(&0u32.to_be_bytes());
+                    blk[o + 4..o + 8].copy_from_slice(&PFS3_ANODE_EOF_SENTINEL.to_be_bytes());
+                    blk[o + 8..o + 12].copy_from_slice(&0u32.to_be_bytes());
+                    self.alloc_anode_hint_seqnr = seqnr;
+                    return Ok(self.encode_anodenr(seqnr, slot as u32));
+                }
             }
         }
-        Err(FilesystemError::DiskFull(
-            "PFS3: out of free anode slots in anodeblock 0".into(),
-        ))
+    }
+
+    /// Encode `(ab_seqnr, slot)` into an anodenr per the volume's
+    /// `MODE_SPLITTED_ANODES` setting.
+    fn encode_anodenr(&self, seqnr: u32, slot: u32) -> u32 {
+        if self.anodesplitmode {
+            (seqnr << 16) | slot
+        } else {
+            seqnr * self.anodesperblock + slot
+        }
+    }
+
+    /// Allocate a fresh anodeblock at sequence number `seqnr`. Wires
+    /// it into the appropriate index block (allocating a new IB +
+    /// updating `small_indexblocks` if needed). Returns the new AB's
+    /// HW-sector.
+    fn alloc_new_anodeblock(&mut self, seqnr: u32) -> Result<u32, FilesystemError> {
+        let indexperblock = self.indexperblock;
+        let indexblock_seqnr = seqnr / indexperblock;
+        let index_offset = (seqnr % indexperblock) as usize;
+
+        // Get-or-create the IB.
+        let ib_sec = match self
+            .root
+            .small_indexblocks
+            .get(indexblock_seqnr as usize)
+            .copied()
+        {
+            Some(s) if s != 0 => s,
+            Some(_) => {
+                // Slot exists but is zero — allocate a new IB and
+                // record it.
+                let new_ib_sec = self.alloc_new_indexblock(indexblock_seqnr)?;
+                new_ib_sec
+            }
+            None => {
+                return Err(FilesystemError::DiskFull(format!(
+                    "PFS3: indexblock seqnr {} exceeds small_indexblocks capacity ({})",
+                    indexblock_seqnr,
+                    self.root.small_indexblocks.len()
+                )));
+            }
+        };
+
+        // Allocate a reserved block for the new AB; init header.
+        let new_ab_sec = self.alloc_reserved_block()?;
+        {
+            let ab_blk = self.dirty_reserved.get_mut(&new_ab_sec).unwrap();
+            write_u16(ab_blk, 0, ID_ANODEBLOCK);
+            write_u32(ab_blk, 4, 1); // datestamp
+            write_u32(ab_blk, 8, seqnr); // seqnr
+        }
+
+        // Write the new AB's sector into the IB's index[index_offset].
+        self.ensure_reserved_dirty(ib_sec)?;
+        let ib_blk = self.dirty_reserved.get_mut(&ib_sec).unwrap();
+        let o = 12 + index_offset * 4;
+        if o + 4 > ib_blk.len() {
+            return Err(parse_err(format!(
+                "alloc_new_anodeblock: IB index_offset {} out of range for IB at sec {}",
+                index_offset, ib_sec
+            )));
+        }
+        ib_blk[o..o + 4].copy_from_slice(&new_ab_sec.to_be_bytes());
+
+        Ok(new_ab_sec)
+    }
+
+    /// Allocate a fresh indexblock at sequence number `indexblock_seqnr`,
+    /// record its HW-sector in `small_indexblocks[indexblock_seqnr]`,
+    /// and persist the updated rootblock cluster bytes.
+    fn alloc_new_indexblock(&mut self, indexblock_seqnr: u32) -> Result<u32, FilesystemError> {
+        let new_ib_sec = self.alloc_reserved_block()?;
+        {
+            let ib_blk = self.dirty_reserved.get_mut(&new_ib_sec).unwrap();
+            write_u16(ib_blk, 0, ID_INDEXBLOCK);
+            write_u32(ib_blk, 4, 1); // datestamp
+            write_u32(ib_blk, 8, indexblock_seqnr); // seqnr
+        }
+        // Update in-memory rootblock.
+        self.root.small_indexblocks[indexblock_seqnr as usize] = new_ib_sec;
+        // Persist directly into the on-disk rootblock cluster — only
+        // the one slot we changed. `Pfs3RootBlock::write_into`
+        // intentionally skips the index arrays at offset 96+ (see its
+        // doc), so we patch them surgically here. Small-mode layout:
+        // bitmapindex[5] @ 96..116, small_indexblocks[99] @ 116..512.
+        let slot_offset = 116 + indexblock_seqnr as usize * 4;
+        let cluster = self.rootblock_cluster_mut()?;
+        cluster[slot_offset..slot_offset + 4].copy_from_slice(&new_ib_sec.to_be_bytes());
+        Ok(new_ib_sec)
     }
 
     /// Free an anode: zero its slot. Caller is responsible for first
@@ -1291,6 +1564,10 @@ impl<R: Read + Seek> Pfs3Filesystem<R> {
         let blk = self.dirty_reserved.get_mut(&ab_sec).unwrap();
         for b in &mut blk[off..off + 12] {
             *b = 0;
+        }
+        let (seqnr, _) = self.split_anodenr(anodenr);
+        if seqnr < self.alloc_anode_hint_seqnr {
+            self.alloc_anode_hint_seqnr = seqnr;
         }
         Ok(())
     }
@@ -1311,12 +1588,28 @@ impl<R: Read + Seek> Pfs3Filesystem<R> {
         // Each MI block holds `indexperblock` BM pointers; we follow the
         // small layout convention.
         let mi_pointers: Vec<u32> = self.root.bitmapindex.iter().copied().collect();
+        // Start the search at the rolling hint to avoid an O(N) walk
+        // over already-allocated regions on every call. The hint
+        // monotonically advances as runs are consumed and is lowered by
+        // `free_data_blocks` when sectors come free again, so we never
+        // miss a run permanently.
+        let hint_local = self.alloc_data_hint_local.min(data_sectors);
+        let bits_per_mi = self.indexperblock.saturating_mul(sectors_per_bmb);
+        let hint_mi_seq = (hint_local / bits_per_mi.max(1)) as usize;
+        let hint_remainder_in_mi = hint_local % bits_per_mi.max(1);
+        let hint_i = (hint_remainder_in_mi / sectors_per_bmb.max(1)) as usize;
+        let hint_remainder_in_bm = hint_remainder_in_mi % sectors_per_bmb.max(1);
+        let hint_w = (hint_remainder_in_bm / 32) as u32;
+        let hint_bit = hint_remainder_in_bm % 32;
         // Linear scan to find a run of `count` consecutive free bits.
         let mut run_start: Option<u32> = None;
         let mut run_len: u32 = 0;
         let mut found: Option<u32> = None;
         let mut current_data_sector: u32 = 0;
         'outer: for (mi_seq, &mi_blk) in mi_pointers.iter().enumerate() {
+            if mi_seq < hint_mi_seq {
+                continue;
+            }
             if mi_blk == 0 {
                 continue;
             }
@@ -1326,6 +1619,9 @@ impl<R: Read + Seek> Pfs3Filesystem<R> {
                 continue;
             }
             for i in 0..self.indexperblock {
+                if mi_seq == hint_mi_seq && (i as usize) < hint_i {
+                    continue;
+                }
                 let off = 12 + i as usize * 4;
                 if off + 4 > mi_buf.len() {
                     break;
@@ -1345,12 +1641,22 @@ impl<R: Read + Seek> Pfs3Filesystem<R> {
                     continue;
                 }
                 for w in 0..longsperbmb {
+                    if mi_seq == hint_mi_seq && (i as usize) == hint_i && w < hint_w {
+                        continue;
+                    }
                     let o = 12 + w as usize * 4;
                     if o + 4 > bm.len() {
                         break;
                     }
                     let word = rd_u32(&bm, o);
                     for bit in 0..32u32 {
+                        if mi_seq == hint_mi_seq
+                            && (i as usize) == hint_i
+                            && w == hint_w
+                            && bit < hint_bit
+                        {
+                            continue;
+                        }
                         let local_sec = (mi_seq as u32 * self.indexperblock + i) * sectors_per_bmb
                             + w * 32
                             + bit;
@@ -1379,14 +1685,26 @@ impl<R: Read + Seek> Pfs3Filesystem<R> {
             }
         }
 
-        let first_local = found.ok_or_else(|| {
-            FilesystemError::DiskFull(format!(
-                "PFS3: no contiguous run of {} free data sectors",
-                count
-            ))
-        })?;
+        let first_local = match found {
+            Some(v) => v,
+            None if self.alloc_data_hint_local > 0 => {
+                // Hint-forward search missed (likely due to
+                // fragmentation that pushed the run before the hint).
+                // Reset and retry from sector 0.
+                self.alloc_data_hint_local = 0;
+                return self.alloc_data_blocks(count);
+            }
+            None => {
+                return Err(FilesystemError::DiskFull(format!(
+                    "PFS3: no contiguous run of {} free data sectors",
+                    count
+                )))
+            }
+        };
         // Clear the bits for sectors first_local..first_local+count.
         self.toggle_data_bitmap_bits(first_local, count, /*set_free=*/ false)?;
+        // Advance the rolling hint past the run we just consumed.
+        self.alloc_data_hint_local = first_local.saturating_add(count);
         self.root.blocks_free = self.root.blocks_free.saturating_sub(count);
         // Persist blocks_free into rootblock cluster.
         let root_clone = self.root.clone();
@@ -1408,6 +1726,9 @@ impl<R: Read + Seek> Pfs3Filesystem<R> {
         }
         let local = first_sec - bitmap_start;
         self.toggle_data_bitmap_bits(local, count, /*set_free=*/ true)?;
+        if local < self.alloc_data_hint_local {
+            self.alloc_data_hint_local = local;
+        }
         self.root.blocks_free = self.root.blocks_free.saturating_add(count);
         // Also drop any pending data writes that referenced the freed
         // sectors so we don't flush stale bytes after a delete.
@@ -1479,20 +1800,51 @@ fn build_direntry(
     fsize: u64,
     name: &str,
     comment: &str,
+    protection: u8,
+    dates: Option<(i32, i32, i32)>,
+    extra_link: Option<u32>,
 ) -> Result<Vec<u8>, FilesystemError> {
     let name_bytes = name.as_bytes();
     let comment_bytes = comment.as_bytes();
-    if name.is_empty() || name_bytes.len() > 30 {
+    // Practical cap matches pfs3aio's `fnsize` ceiling (107 bytes —
+    // the LONGFN-enabled max; standard AmigaDOS is 30 bytes). We set
+    // `fnsize = 107` in the blank-volume's rootblock extension so
+    // tools accept long names without truncation. The hard cap from
+    // direntry total = u8 max (255) leaves ~230 bytes after headers /
+    // comment / extrafields, but `fnsize` is the conventional limit.
+    if name.is_empty() || name_bytes.len() > 107 {
         return Err(parse_err(format!(
-            "build_direntry: name '{}' must be 1..30 bytes",
-            name
+            "build_direntry: name '{}' ({} bytes) must be 1..107 bytes",
+            name,
+            name_bytes.len()
         )));
     }
     if comment_bytes.len() > 79 {
         return Err(parse_err("build_direntry: comment exceeds 79 bytes"));
     }
-    let total_unaligned = 18 + name_bytes.len() + 1 + comment_bytes.len();
-    let total = (total_unaligned + 1) & !1;
+    // Compute extrafields tail size: each present u16 word costs 2 bytes
+    // plus a single trailing 2-byte `flags` word when any field is set.
+    // We only ever set `link` (split into link_hi + link_lo), so the
+    // tail is 0, 4, or 6 bytes.
+    let extra_tail = match extra_link {
+        None => 0usize,
+        Some(v) => {
+            let link_hi = (v >> 16) & 0xFFFF;
+            let link_lo = v & 0xFFFF;
+            // Non-zero u16s consume 2 bytes each. flags itself is 2.
+            let mut t = 2usize;
+            if link_hi != 0 {
+                t += 2;
+            }
+            if link_lo != 0 {
+                t += 2;
+            }
+            t
+        }
+    };
+    let header_and_payload_unaligned = 18 + name_bytes.len() + 1 + comment_bytes.len();
+    let aligned = (header_and_payload_unaligned + 1) & !1;
+    let total = aligned + extra_tail;
     if total > 255 {
         return Err(parse_err("build_direntry: entry exceeds 255 bytes"));
     }
@@ -1501,17 +1853,133 @@ fn build_direntry(
     buf[1] = ttype as u8;
     buf[2..6].copy_from_slice(&anode.to_be_bytes());
     buf[6..10].copy_from_slice(&(fsize as u32).to_be_bytes());
-    // creation_day/min/tick at 10..16: zero (MODE_DATESTAMP off)
-    buf[16] = 0; // protection
+    // creation_day/min/tick at 10..16. Honored by tooling only when the
+    // rootblock has MODE_DATESTAMP set; `create_blank_pfs3` always sets
+    // it, so the dates we write here round-trip on our targets.
+    if let Some((cd, cm, ct)) = dates {
+        write_u16(&mut buf, 10, cd as u16);
+        write_u16(&mut buf, 12, cm as u16);
+        write_u16(&mut buf, 14, ct as u16);
+    }
+    buf[16] = protection;
     buf[17] = name_bytes.len() as u8;
     buf[18..18 + name_bytes.len()].copy_from_slice(name_bytes);
     let cmt_pos = 18 + name_bytes.len();
     buf[cmt_pos] = comment_bytes.len() as u8;
     buf[cmt_pos + 1..cmt_pos + 1 + comment_bytes.len()].copy_from_slice(comment_bytes);
+    // Pack extrafields at the tail. Layout (see GetExtraFields back-
+    // walker): from the END going backwards: flags, link_hi, link_lo
+    // (each only present when its flag bit is set). LSB-first bit
+    // order: bit 0 = link_hi, bit 1 = link_lo.
+    if let Some(v) = extra_link {
+        let link_hi = ((v >> 16) & 0xFFFF) as u16;
+        let link_lo = (v & 0xFFFF) as u16;
+        // Order matches the back-walker: link_hi is the FIRST u16
+        // read (immediately before flags), link_lo is the second.
+        // Skip zero fields — those flag bits stay clear and no u16 is
+        // emitted for them.
+        let mut flags: u16 = 0;
+        let mut cursor = total - 2;
+        if link_hi != 0 {
+            cursor -= 2;
+            write_u16(&mut buf, cursor, link_hi);
+            flags |= 0b01;
+        }
+        if link_lo != 0 {
+            cursor -= 2;
+            write_u16(&mut buf, cursor, link_lo);
+            flags |= 0b10;
+        }
+        write_u16(&mut buf, total - 2, flags);
+    }
     Ok(buf)
 }
 
 impl<R: Read + Write + Seek + Send> Pfs3Filesystem<R> {
+    /// Register `new_link_anode` as a hardlink pointing at the entry
+    /// whose direntry lives in `target_parent_anode`'s dirblock chain
+    /// and whose own anode is `target_anode`. Updates the back-link
+    /// chain so tools that enumerate "all hardlinks to this file" by
+    /// walking `target.extrafields.link` + `linknode.next` find the
+    /// new link.
+    ///
+    /// Behavior matches pfs3aio `CreateLink` (`directory.c:2703-2727`):
+    /// - If target has no extrafields.link yet, patch its direntry
+    ///   in place to add `extrafields.link = new_link_anode`. The new
+    ///   linknode's `next` stays 0 (the linknode itself was already
+    ///   set up by `do_create_hardlink`).
+    /// - If target already has a link chain, walk it via `anode.next`
+    ///   and set the tail's `next` to `new_link_anode`.
+    ///
+    /// Wrapped in snapshot/rollback so a mid-operation error leaves
+    /// the volume unchanged.
+    pub fn register_hardlink_in_target_chain(
+        &mut self,
+        target_parent_anode: u32,
+        target_anode: u32,
+        new_link_anode: u32,
+    ) -> Result<(), FilesystemError> {
+        let snap = self.snapshot();
+        match self.do_register_hardlink_in_target_chain(
+            target_parent_anode,
+            target_anode,
+            new_link_anode,
+        ) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.restore_snapshot(snap);
+                Err(e)
+            }
+        }
+    }
+
+    /// Test/debug accessor: return the current `extrafields.link`
+    /// value stored on the direntry whose anode is `target_anode`
+    /// inside `parent_anode`'s dirblock chain. `0` means "no link
+    /// extrafield set." Returns `Err` if the target isn't found.
+    pub fn peek_direntry_extra_link(
+        &mut self,
+        parent_anode: u32,
+        target_anode: u32,
+    ) -> Result<u32, FilesystemError> {
+        let (db_sec, off) =
+            find_direntry_in_dir(self, parent_anode, target_anode)?.ok_or_else(|| {
+                parse_err(format!(
+                    "peek_direntry_extra_link: anode {target_anode} not found in dir {parent_anode}"
+                ))
+            })?;
+        read_direntry_extra_link_at(self, db_sec, off)
+    }
+
+    /// Test/debug accessor: return the `next` anode in a linknode's
+    /// chain. Used by the bidirectional hardlink test to walk the
+    /// back-link chain without leaking internals.
+    pub fn peek_anode_next(&mut self, anodenr: u32) -> Result<u32, FilesystemError> {
+        Ok(self.get_anode(anodenr)?.next)
+    }
+
+    fn do_register_hardlink_in_target_chain(
+        &mut self,
+        target_parent_anode: u32,
+        target_anode: u32,
+        new_link_anode: u32,
+    ) -> Result<(), FilesystemError> {
+        let (db_sec, off) = find_direntry_in_dir(self, target_parent_anode, target_anode)?
+            .ok_or_else(|| {
+                parse_err(format!(
+                    "register_hardlink: target anode {target_anode} not found in parent \
+                     dir anode {target_parent_anode}"
+                ))
+            })?;
+        let existing = read_direntry_extra_link_at(self, db_sec, off)?;
+        if existing == 0 {
+            append_link_extrafield_to_direntry(self, db_sec, off, new_link_anode)?;
+        } else {
+            append_to_linknode_chain(self, existing, new_link_anode)?;
+        }
+        Ok(())
+    }
+
     /// Implementation of `EditableFilesystem::create_directory` body —
     /// kept as a free function so the trait impl below only has to
     /// snapshot/restore around it.
@@ -1519,6 +1987,9 @@ impl<R: Read + Write + Seek + Send> Pfs3Filesystem<R> {
         &mut self,
         parent: &FileEntry,
         name: &str,
+        comment: &str,
+        protection: u8,
+        dates: Option<(i32, i32, i32)>,
     ) -> Result<FileEntry, FilesystemError> {
         check_no_duplicate(self, parent, name)?;
         let parent_anode = parent.location as u32;
@@ -1543,7 +2014,18 @@ impl<R: Read + Write + Seek + Send> Pfs3Filesystem<R> {
             },
         )?;
         // Add direntry to parent.
-        add_direntry_to_dir(self, parent_anode, ST_DIR, new_anode, 0, name)?;
+        add_direntry_to_dir(
+            self,
+            parent_anode,
+            ST_DIR,
+            new_anode,
+            0,
+            name,
+            comment,
+            protection,
+            dates,
+            None,
+        )?;
         let path = if parent.path == "/" {
             format!("/{}", name)
         } else {
@@ -1562,6 +2044,9 @@ impl<R: Read + Write + Seek + Send> Pfs3Filesystem<R> {
         name: &str,
         data: &mut dyn std::io::Read,
         data_len: u64,
+        comment: &str,
+        protection: u8,
+        dates: Option<(i32, i32, i32)>,
     ) -> Result<FileEntry, FilesystemError> {
         check_no_duplicate(self, parent, name)?;
         let parent_anode = parent.location as u32;
@@ -1599,7 +2084,18 @@ impl<R: Read + Write + Seek + Send> Pfs3Filesystem<R> {
                 next: 0,
             },
         )?;
-        add_direntry_to_dir(self, parent_anode, ST_FILE, new_anode, data_len, name)?;
+        add_direntry_to_dir(
+            self,
+            parent_anode,
+            ST_FILE,
+            new_anode,
+            data_len,
+            name,
+            comment,
+            protection,
+            dates,
+            None,
+        )?;
         let path = if parent.path == "/" {
             format!("/{}", name)
         } else {
@@ -1611,6 +2107,147 @@ impl<R: Read + Write + Seek + Send> Pfs3Filesystem<R> {
             data_len,
             new_anode as u64,
         ))
+    }
+
+    /// Create a softlink direntry. Allocates one data block (HW sector)
+    /// for the target path, writes it NUL-terminated, registers the
+    /// anode pointing at that block, then adds an `ST_SOFTLINK`
+    /// direntry to the parent with `fsize = target.len()`. Matches
+    /// pfs3aio `CreateSoftLink` semantics; capped at 510 bytes target
+    /// (one HW sector minus a NUL terminator).
+    fn do_create_symlink(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        target: &str,
+        comment: &str,
+        protection: u8,
+        dates: Option<(i32, i32, i32)>,
+    ) -> Result<FileEntry, FilesystemError> {
+        check_no_duplicate(self, parent, name)?;
+        let target_bytes = target.as_bytes();
+        if target_bytes.len() >= HW_SECTOR as usize {
+            return Err(parse_err(format!(
+                "create_symlink: target path '{}' exceeds {} bytes",
+                target,
+                HW_SECTOR - 1
+            )));
+        }
+        let parent_anode = parent.location as u32;
+        let new_anode = self.alloc_anode_in_memory()?;
+        let target_sec = self.alloc_data_blocks(1)?;
+        // Stage the target-string block: NUL-terminate then zero-fill.
+        let mut buf = vec![0u8; HW_SECTOR as usize];
+        buf[..target_bytes.len()].copy_from_slice(target_bytes);
+        self.dirty_data.insert(target_sec, buf);
+        self.save_anode_in_memory(
+            new_anode,
+            Canode {
+                clustersize: 1,
+                blocknr: target_sec,
+                next: 0,
+            },
+        )?;
+        add_direntry_to_dir(
+            self,
+            parent_anode,
+            ST_SOFTLINK,
+            new_anode,
+            target_bytes.len() as u64,
+            name,
+            comment,
+            protection,
+            dates,
+            None,
+        )?;
+        let path = if parent.path == "/" {
+            format!("/{}", name)
+        } else {
+            format!("{}/{}", parent.path, name)
+        };
+        Ok(FileEntry::new_symlink(
+            name.to_string(),
+            path,
+            target_bytes.len() as u64,
+            new_anode as u64,
+            target.to_string(),
+        ))
+    }
+
+    /// Create a hardlink direntry pointing at `target` (which must
+    /// already exist on this volume). Sets the link's
+    /// `extrafields.link` to the target's anode so resolvers can
+    /// follow it directly to the target data. Builds a placeholder
+    /// linknode at the new anode (clustersize/blocknr describe the
+    /// link's location, `next=0`).
+    ///
+    /// **Limitation (v1):** does NOT patch the target's direntry to
+    /// register this link in the target's extrafields chain. Tools
+    /// that enumerate "all hardlinks to this file" by walking the
+    /// target's linknode chain will miss it. The link resolves
+    /// correctly to target data; only the reverse query is affected.
+    /// Acceptable for clone-from-source workflows where the target
+    /// volume is read-only after construction.
+    fn do_create_hardlink(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        target: &FileEntry,
+        comment: &str,
+        protection: u8,
+        dates: Option<(i32, i32, i32)>,
+    ) -> Result<FileEntry, FilesystemError> {
+        check_no_duplicate(self, parent, name)?;
+        let parent_anode = parent.location as u32;
+        let target_anode = target.location as u32;
+        if target_anode == 0 {
+            return Err(parse_err(
+                "create_hardlink: target has no anode (uninitialized FileEntry)",
+            ));
+        }
+        let ttype = if target.is_directory() {
+            ST_LINKDIR
+        } else {
+            ST_LINKFILE
+        };
+        let new_anode = self.alloc_anode_in_memory()?;
+        // Linknode: clustersize is target-parent anode in pfs3aio
+        // (used for "which dir holds the target" lookups), blocknr is
+        // link-parent anode (used to find the link's location).
+        // Without scanning every dirblock to find target's parent, we
+        // record only the link side here. See struct-doc above.
+        self.save_anode_in_memory(
+            new_anode,
+            Canode {
+                clustersize: 0,
+                blocknr: parent_anode,
+                next: 0,
+            },
+        )?;
+        add_direntry_to_dir(
+            self,
+            parent_anode,
+            ttype,
+            new_anode,
+            target.size,
+            name,
+            comment,
+            protection,
+            dates,
+            Some(target_anode),
+        )?;
+        let path = if parent.path == "/" {
+            format!("/{}", name)
+        } else {
+            format!("{}/{}", parent.path, name)
+        };
+        let mut fe = if target.is_directory() {
+            FileEntry::new_directory(name.to_string(), path, new_anode as u64)
+        } else {
+            FileEntry::new_file(name.to_string(), path, target.size, new_anode as u64)
+        };
+        fe.link_target_cnid = Some(target_anode as u64);
+        Ok(fe)
     }
 
     fn do_delete_entry(
@@ -1735,10 +2372,25 @@ fn add_direntry_to_dir<R: Read + Seek>(
     new_anode: u32,
     fsize: u64,
     name: &str,
+    comment: &str,
+    protection: u8,
+    dates: Option<(i32, i32, i32)>,
+    extra_link: Option<u32>,
 ) -> Result<(), FilesystemError> {
-    let entry = build_direntry(ttype, new_anode, fsize, name, "")?;
-    let mut a = fs.get_anode(dir_anodenr)?;
-    let mut anode_for_chain = dir_anodenr;
+    let entry = build_direntry(
+        ttype, new_anode, fsize, name, comment, protection, dates, extra_link,
+    )?;
+    // Start the walk at the last anode we appended to for this dir, if
+    // any. The forward-walk below validates space, so a stale hint just
+    // means we scan a few extra blocks (matching old behavior). A
+    // current hint turns each insert from O(chain length) into O(1).
+    let start_anodenr = fs
+        .dir_append_hint
+        .get(&dir_anodenr)
+        .copied()
+        .unwrap_or(dir_anodenr);
+    let mut a = fs.get_anode(start_anodenr)?;
+    let mut anode_for_chain = start_anodenr;
     loop {
         if a.blocknr == 0 || a.blocknr == PFS3_ANODE_EOF_SENTINEL {
             break;
@@ -1762,6 +2414,7 @@ fn add_direntry_to_dir<R: Read + Seek>(
             // The next byte must be 0 (end marker). It already is, since
             // build_direntry padded to an even length and the trailing
             // bytes were 0 in the source buffer.
+            fs.dir_append_hint.insert(dir_anodenr, anode_for_chain);
             return Ok(());
         }
         if a.next == 0 {
@@ -1795,6 +2448,7 @@ fn add_direntry_to_dir<R: Read + Seek>(
     let mut tail = fs.get_anode(anode_for_chain)?;
     tail.next = new_anode_for_chain;
     fs.save_anode_in_memory(anode_for_chain, tail)?;
+    fs.dir_append_hint.insert(dir_anodenr, new_anode_for_chain);
     Ok(())
 }
 
@@ -1850,6 +2504,220 @@ fn remove_direntry_from_dir<R: Read + Seek>(
     )))
 }
 
+/// Locate the direntry whose `anode` field matches `target_anode`
+/// within a directory's dirblock chain. Returns `(dirblock_sec,
+/// offset_within_block)` on hit or `None` if the entry isn't found.
+/// Matches the scan in `remove_direntry_from_dir`; factored out so
+/// other in-place mutators can reuse it.
+fn find_direntry_in_dir<R: Read + Seek>(
+    fs: &mut Pfs3Filesystem<R>,
+    dir_anodenr: u32,
+    target_anode: u32,
+) -> Result<Option<(u32, usize)>, FilesystemError> {
+    let mut a = fs.get_anode(dir_anodenr)?;
+    loop {
+        if a.blocknr == 0 || a.blocknr == PFS3_ANODE_EOF_SENTINEL {
+            break;
+        }
+        let db_sec = a.blocknr;
+        let blk = fs.read_reserved_block(db_sec)?.to_vec();
+        let mut off = 20usize;
+        while off < blk.len() {
+            let n = blk[off] as usize;
+            if n == 0 {
+                break;
+            }
+            if off + 6 <= blk.len() {
+                let anr =
+                    u32::from_be_bytes([blk[off + 2], blk[off + 3], blk[off + 4], blk[off + 5]]);
+                if anr == target_anode {
+                    return Ok(Some((db_sec, off)));
+                }
+            }
+            off += n;
+        }
+        if a.next == 0 {
+            break;
+        }
+        a = fs.get_anode(a.next)?;
+    }
+    Ok(None)
+}
+
+/// Read the current `extrafields.link` value from a direntry at
+/// `(db_sec, off)`. Returns 0 if the direntry has no extrafields tail
+/// (no `flags` word) or no link bits set in its flags.
+fn read_direntry_extra_link_at<R: Read + Seek>(
+    fs: &mut Pfs3Filesystem<R>,
+    db_sec: u32,
+    off: usize,
+) -> Result<u32, FilesystemError> {
+    let blk = fs.read_reserved_block(db_sec)?.to_vec();
+    let total = blk[off] as usize;
+    let nlength = blk[off + 17] as usize;
+    let cmt_pos = off + 18 + nlength;
+    let comment_len = blk[cmt_pos] as usize;
+    let aligned_end_local = (cmt_pos + 1 + comment_len + 1) & !1;
+    let aligned_end = aligned_end_local - off; // size of header+name+comment+pad
+    if total <= aligned_end {
+        return Ok(0); // no extrafields tail
+    }
+    let mut flags = rd_u16(&blk, off + total - 2);
+    let mut cursor = off + total - 2;
+    let mut link_hi = 0u16;
+    let mut link_lo = 0u16;
+    for bit_idx in 0..11u32 {
+        let present = (flags & 1) == 1;
+        flags >>= 1;
+        if present {
+            if cursor < aligned_end_local + 2 {
+                break;
+            }
+            cursor -= 2;
+            let val = rd_u16(&blk, cursor);
+            match bit_idx {
+                0 => link_hi = val,
+                1 => link_lo = val,
+                _ => {}
+            }
+        }
+    }
+    Ok(((link_hi as u32) << 16) | (link_lo as u32))
+}
+
+/// Grow the direntry at `(db_sec, off)` by appending an
+/// `extrafields.link` tail pointing at `new_link_anode`. The caller
+/// must guarantee the direntry currently has NO extrafields tail
+/// (i.e. it was created via our own `build_direntry` with
+/// `extra_link=None`). Shifts following entries in the dirblock right
+/// by the tail size (4 or 6 bytes). Errors if the dirblock has
+/// insufficient trailing zero space — chain extension for that case
+/// is a future enhancement (rare in practice given typical dirblock
+/// occupancy).
+fn append_link_extrafield_to_direntry<R: Read + Write + Seek>(
+    fs: &mut Pfs3Filesystem<R>,
+    db_sec: u32,
+    off: usize,
+    new_link_anode: u32,
+) -> Result<(), FilesystemError> {
+    let blk = fs.read_reserved_block(db_sec)?.to_vec();
+    let total = blk[off] as usize;
+    let nlength = blk[off + 17] as usize;
+    let cmt_pos = off + 18 + nlength;
+    let comment_len = blk[cmt_pos] as usize;
+    let aligned_end_off = ((cmt_pos + 1 + comment_len + 1) & !1) - off;
+    if aligned_end_off != total {
+        return Err(parse_err(format!(
+            "append_link_extrafield: direntry at db {db_sec} off {off} already has \
+             extrafields tail ({} bytes); v1 patcher only handles bare entries",
+            total - aligned_end_off
+        )));
+    }
+    let link_hi = ((new_link_anode >> 16) & 0xFFFF) as u16;
+    let link_lo = (new_link_anode & 0xFFFF) as u16;
+    let mut tail_bytes = 2usize; // flags word always present
+    if link_hi != 0 {
+        tail_bytes += 2;
+    }
+    if link_lo != 0 {
+        tail_bytes += 2;
+    }
+    let new_total = total + tail_bytes;
+    if new_total > 255 {
+        return Err(parse_err(format!(
+            "append_link_extrafield: new direntry size {new_total} exceeds 255 bytes"
+        )));
+    }
+
+    // Find current end-of-entries: the first 0 byte at or past
+    // `off + total`. The dirblock keeps at least one trailing zero
+    // as the entries terminator.
+    let next_off = off + total;
+    let mut scan = next_off;
+    while scan < blk.len() {
+        if blk[scan] == 0 {
+            break;
+        }
+        let n = blk[scan] as usize;
+        if n == 0 || scan + n > blk.len() {
+            break;
+        }
+        scan += n;
+    }
+    let end_of_entries = scan;
+    // Need `tail_bytes` more bytes of room. The zero terminator must
+    // survive, so reserve 1 trailing zero.
+    let avail = blk.len() - end_of_entries - 1;
+    if avail < tail_bytes {
+        return Err(parse_err(format!(
+            "append_link_extrafield: dirblock at sec {db_sec} full ({} byte tail needed, \
+             {} avail); chain extension for this case is not implemented",
+            tail_bytes, avail
+        )));
+    }
+
+    fs.ensure_reserved_dirty(db_sec)?;
+    let db = fs.dirty_reserved.get_mut(&db_sec).unwrap();
+
+    // Shift following entries (and the trailing 0 marker) right by
+    // `tail_bytes` to make room for the new extrafields tail.
+    let shift_len = end_of_entries - next_off;
+    if shift_len > 0 {
+        db.copy_within(next_off..next_off + shift_len, next_off + tail_bytes);
+    }
+    // Zero the freshly-vacated tail region (the old start of the
+    // next direntry, now duplicated at the shifted position).
+    for i in next_off..next_off + tail_bytes {
+        db[i] = 0;
+    }
+    // Pack: walking back from the flags word, write link_hi then
+    // link_lo (matching the back-walker convention in parse_direntry).
+    let flags_pos = next_off + tail_bytes - 2;
+    let mut flags: u16 = 0;
+    let mut cursor = flags_pos;
+    if link_hi != 0 {
+        cursor -= 2;
+        write_u16(db, cursor, link_hi);
+        flags |= 0b01;
+    }
+    if link_lo != 0 {
+        cursor -= 2;
+        write_u16(db, cursor, link_lo);
+        flags |= 0b10;
+    }
+    write_u16(db, flags_pos, flags);
+    db[off] = new_total as u8;
+    Ok(())
+}
+
+/// Walk the linknode chain via `anode.next` starting at `first_anode`
+/// and set the tail's `next` to `new_link_anode`. Returns the tail's
+/// own anode for diagnostics. Errors if the chain is cyclic (defensive
+/// — pfs3aio doesn't emit cycles but on-disk corruption shouldn't loop
+/// us forever).
+fn append_to_linknode_chain<R: Read + Write + Seek>(
+    fs: &mut Pfs3Filesystem<R>,
+    first_anode: u32,
+    new_link_anode: u32,
+) -> Result<u32, FilesystemError> {
+    let mut cur = first_anode;
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        if !seen.insert(cur) {
+            return Err(parse_err(format!(
+                "append_to_linknode_chain: cycle detected at anode {cur}"
+            )));
+        }
+        let mut node = fs.get_anode(cur)?;
+        if node.next == 0 {
+            node.next = new_link_anode;
+            fs.save_anode_in_memory(cur, node)?;
+            return Ok(cur);
+        }
+        cur = node.next;
+    }
+}
+
 impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Pfs3Filesystem<R> {
     fn create_file(
         &mut self,
@@ -1857,10 +2725,13 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Pf
         name: &str,
         data: &mut dyn std::io::Read,
         data_len: u64,
-        _options: &super::filesystem::CreateFileOptions,
+        options: &super::filesystem::CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
+        let comment = options.amiga_comment.as_deref().unwrap_or("");
+        let protection = options.amiga_protection.unwrap_or(0) as u8;
+        let dates = options.amiga_dates;
         let snap = self.snapshot();
-        match self.do_create_file(parent, name, data, data_len) {
+        match self.do_create_file(parent, name, data, data_len, comment, protection, dates) {
             Ok(fe) => Ok(fe),
             Err(e) => {
                 self.restore_snapshot(snap);
@@ -1873,10 +2744,53 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Pf
         &mut self,
         parent: &FileEntry,
         name: &str,
-        _options: &super::filesystem::CreateDirectoryOptions,
+        options: &super::filesystem::CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
+        let comment = options.amiga_comment.as_deref().unwrap_or("");
+        let protection = options.amiga_protection.unwrap_or(0) as u8;
+        let dates = options.amiga_dates;
         let snap = self.snapshot();
-        match self.do_create_directory(parent, name) {
+        match self.do_create_directory(parent, name, comment, protection, dates) {
+            Ok(fe) => Ok(fe),
+            Err(e) => {
+                self.restore_snapshot(snap);
+                Err(e)
+            }
+        }
+    }
+
+    fn create_symlink(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        target: &str,
+        options: &super::filesystem::CreateFileOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        let comment = options.amiga_comment.as_deref().unwrap_or("");
+        let protection = options.amiga_protection.unwrap_or(0) as u8;
+        let dates = options.amiga_dates;
+        let snap = self.snapshot();
+        match self.do_create_symlink(parent, name, target, comment, protection, dates) {
+            Ok(fe) => Ok(fe),
+            Err(e) => {
+                self.restore_snapshot(snap);
+                Err(e)
+            }
+        }
+    }
+
+    fn create_hardlink(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        target: &FileEntry,
+        options: &super::filesystem::CreateFileOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        let comment = options.amiga_comment.as_deref().unwrap_or("");
+        let protection = options.amiga_protection.unwrap_or(0) as u8;
+        let dates = options.amiga_dates;
+        let snap = self.snapshot();
+        match self.do_create_hardlink(parent, name, target, comment, protection, dates) {
             Ok(fe) => Ok(fe),
             Err(e) => {
                 self.restore_snapshot(snap);
@@ -1929,12 +2843,13 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Pf
 // are pre-allocated as the format flow does (blocknr=0xFFFFFFFF sentinel
 // marks them as taken-but-empty). All other anodes are zeroed → free.
 //
-// We deliberately set only `MODE_HARDDISK | MODE_SPLITTED_ANODES |
-// MODE_EXTENSION` in `options`. Real PFS3 volumes also enable
-// DIR_EXTENSION / DATESTAMP / LONGFN, but those add extra direntry tail
-// fields. Keeping options minimal keeps the formatter and the matching
-// dirblock write path simple. The reader handles minimal mode fine; this
-// is enough for our round-trip tests.
+// We set `MODE_HARDDISK | MODE_SPLITTED_ANODES | MODE_EXTENSION |
+// MODE_DATESTAMP` in `options`. DATESTAMP is required so tooling
+// (pfs3aio, real Amigas) honors the per-direntry dates we write — the
+// date bytes at direntry offsets 10..16 always exist regardless of the
+// mode bit, but without it set they're ignored. DIR_EXTENSION / LONGFN
+// add extra direntry tail fields and remain off to keep the formatter +
+// dirblock writer simple; the reader handles minimal mode fine.
 
 const PFS3_BLANK_NUMRESERVED: u32 = 32;
 const PFS3_BLANK_RESBLKSIZE: u32 = 1024;
@@ -1951,11 +2866,63 @@ fn write_u32(buf: &mut [u8], o: usize, v: u32) {
 /// Create a blank PFS3 volume sized for `total_sectors` HW sectors of 512
 /// bytes (`total_sectors * 512` bytes total). The volume mounts as empty
 /// with diskname `name` (truncated to 31 bytes).
+///
+/// `resblksize` and `numreserved` scale with the target size:
+/// - Volumes ≤ ~100 MB use `resblksize = 1024` (matching the existing
+///   test layouts at 8192 sectors = 4 MB).
+/// - Larger volumes use `resblksize = 4096` so a single MI block can
+///   address every BM block via the rootblock's 5-slot `bitmapindex`
+///   without needing multi-MI chaining or supermode.
+/// - `numreserved` is computed from the actual BM-block count needed,
+///   floored at 32 (the original budget) and with 8 blocks of headroom.
 pub fn create_blank_pfs3(total_sectors: u32, name: &str) -> Result<Vec<u8>, FilesystemError> {
-    let resblksize = PFS3_BLANK_RESBLKSIZE;
-    let rscluster = resblksize / HW_SECTOR_U32; // 2
-    let numreserved = PFS3_BLANK_NUMRESERVED;
+    // Bump resblksize when the volume is large enough that BM blocks
+    // exceed `indexperblock` at the small size. 1024-byte reserved
+    // blocks give indexperblock=253; at 8096 sectors per BM that
+    // covers volumes up to ~1 GB in a single MI. Beyond that, jump
+    // to 4096-byte reserved blocks (indexperblock=1021, 32672 sectors
+    // per BM, single MI handles ~33 GB volumes).
+    const RESBLK_BUMP_THRESHOLD_SECTORS: u32 = 2_000_000; // ~1 GB
+    let resblksize: u32 = if total_sectors > RESBLK_BUMP_THRESHOLD_SECTORS {
+        4096
+    } else {
+        PFS3_BLANK_RESBLKSIZE
+    };
+    let rscluster = resblksize / HW_SECTOR_U32;
     let first_reserved = PFS3_BLANK_FIRST_RESERVED;
+    let longsperbmb = (resblksize - 12) / 4;
+    let sectors_per_bmb = longsperbmb * 32;
+    let indexperblock = (resblksize - 12) / 4;
+    let anodesperblock = (resblksize - 16) / 12;
+
+    // Compute numreserved from estimated need. The dependency on
+    // data_sectors (= total - last_reserved - 1) is weak —
+    // last_reserved grows linearly with numreserved but reserved
+    // overhead lands well under 1% of total_sectors at the budgets
+    // below — so a one-shot upper-bound estimate is safe.
+    //
+    // Budget categories:
+    //   6 fixed: root, ext, mi, ib0, ab0, rootdir
+    //   no_bmb:  one BM block per `sectors_per_bmb` data sectors
+    //   no_ab:   estimated anodeblocks for the file/dir population.
+    //            Worst-case Amiga workload: ~1 entry per 4 KB of data
+    //            (real images run 5-10 KB/entry; 4 KB is conservative).
+    //   no_ib_extra: indexblocks beyond the first one (added by
+    //                `alloc_new_indexblock` when an AB chain crosses
+    //                an IB boundary).
+    //   headroom: 16 blocks of allocator slack.
+    let approx_no_bmb =
+        ((total_sectors as u64) + sectors_per_bmb as u64 - 1) / sectors_per_bmb as u64;
+    let est_anodes = (total_sectors as u64).div_ceil(8); // sectors / 8 = ~1 per 4 KB
+    let approx_no_ab = est_anodes.div_ceil(anodesperblock as u64);
+    let approx_no_ib_extra = approx_no_ab
+        .div_ceil(indexperblock as u64)
+        .saturating_sub(1);
+    let required_reserved = 6u64 + approx_no_bmb + approx_no_ab + approx_no_ib_extra + 16;
+    // small_indexblocks has 99 slots; if `approx_no_ib_extra + 1 > 99`
+    // we'd need supermode (not yet implemented in the writer). Cap
+    // accordingly and error out below if the math demands more.
+    let numreserved = required_reserved.max(PFS3_BLANK_NUMRESERVED as u64) as u32;
     let last_reserved = first_reserved + rscluster * numreserved - 1;
 
     // Need at least last_reserved + 1 data sector beyond.
@@ -1969,13 +2936,11 @@ pub fn create_blank_pfs3(total_sectors: u32, name: &str) -> Result<Vec<u8>, File
 
     let bitmap_start_sector = last_reserved + 1;
     let data_sectors = total_sectors - bitmap_start_sector;
-    let longsperbmb = (resblksize - 12) / 4;
-    let sectors_per_bmb = longsperbmb * 32;
     let no_bmb = (data_sectors + sectors_per_bmb - 1) / sectors_per_bmb;
-    let indexperblock = (resblksize - 12) / 4;
     if no_bmb > indexperblock {
         return Err(parse_err(format!(
-            "PFS3 formatter: disk too large for single MI block ({} BM > {} index slots)",
+            "PFS3 formatter: disk too large for single MI block ({} BM > {} index slots); \
+             multi-MI / supermode formatting not yet implemented",
             no_bmb, indexperblock
         )));
     }
@@ -2008,7 +2973,8 @@ pub fn create_blank_pfs3(total_sectors: u32, name: &str) -> Result<Vec<u8>, File
     // === Rootblock at RB 0 ===
     let rb = rb_to_offset(rb_idx_root);
     img[rb..rb + 4].copy_from_slice(b"PFS\x01");
-    let options = MODE_HARDDISK | MODE_SPLITTED_ANODES | MODE_EXTENSION;
+    let options =
+        MODE_HARDDISK | MODE_SPLITTED_ANODES | MODE_EXTENSION | MODE_DATESTAMP | MODE_LONGFN;
     write_u32(&mut img, rb + 4, options);
     write_u32(&mut img, rb + 8, 1); // datestamp
                                     // creationday/min/tick at 12..18: zero
@@ -2041,20 +3007,33 @@ pub fn create_blank_pfs3(total_sectors: u32, name: &str) -> Result<Vec<u8>, File
     write_u16(&mut img, bm_res, ID_BITMAPBLOCK);
     write_u32(&mut img, bm_res + 4, 1); // datestamp
                                         // seqnr at +8: 0
-                                        // bitmap[0] at +12: bits 0..numreserved-1 = free, then mask off used.
-    let mut res_bm = 0u32;
-    for i in 0..numreserved {
-        res_bm |= 1u32 << (31 - i);
+                                        // bitmap[] starts at +12: bit i (MSB-first within each u32) = reserved
+                                        // block i is FREE when 1, ALLOCATED when 0 (AmigaDOS convention).
+                                        // We mark blocks 0..used_rb allocated and the rest free.
+    let words = ((numreserved + 31) / 32) as usize;
+    for w in 0..words {
+        let mut word: u32 = 0;
+        for bit in 0..32u32 {
+            let res_idx = w as u32 * 32 + bit;
+            if res_idx >= numreserved {
+                break;
+            }
+            if res_idx >= used_rb {
+                word |= 1u32 << (31 - bit);
+            }
+        }
+        write_u32(&mut img, bm_res + 12 + w * 4, word);
     }
-    for i in 0..used_rb {
-        res_bm &= !(1u32 << (31 - i));
-    }
-    write_u32(&mut img, bm_res + 12, res_bm);
 
     // === Rootblock extension at RB 1 ===
     let ext = rb_to_offset(rb_idx_ext);
     write_u16(&mut img, ext, ID_EXTENSIONBLOCK);
     write_u32(&mut img, ext + 8, 1); // datestamp
+                                     // fnsize at +56: long-filename ceiling. Standard PFS3 is 32
+                                     // (=> 31 chars + NUL); we use the LONGFN max of 107 to match
+                                     // real-world AmigaVision-style volumes whose direntries carry
+                                     // names > 30 bytes. `build_direntry` enforces the same cap.
+    write_u16(&mut img, ext + 56, 107);
 
     // === Bitmap-index block (MI) at RB 2 ===
     let mi = rb_to_offset(rb_idx_mi);
@@ -2122,6 +3101,561 @@ pub fn create_blank_pfs3(total_sectors: u32, name: &str) -> Result<Vec<u8>, File
     Ok(img)
 }
 
+// === PFS3 in-place resize ===================================================
+//
+// Mirrors the pattern used by AFFS / HFS / HFS+ / FAT / NTFS / SFS:
+// `resize_pfs3_in_place` adjusts the rootblock's `disksize` (in HW sectors
+// of 512 bytes) and `blocks_free` fields, and for grows marks the newly
+// visible sectors as free in the data bitmap. Shrink path refuses to
+// throw away allocated data; grow path refuses to extend past the
+// existing bitmap-block capacity (Phase R.3 territory).
+//
+// No backup root exists in PFS3, so the commit point is a single
+// rootblock write at HW sector `ROOTBLOCK_SECTOR` (2).
+//
+// The function is a no-op when the volume at `partition_offset` isn't
+// a PFS3 volume (boot magic doesn't match), so it's safe to call from
+// the dispatch in `resize_filesystem_for` regardless of FS type.
+
+const PFS3_RB_DISKSIZE_OFFSET: usize = 84;
+const PFS3_RB_BLOCKS_FREE_OFFSET: usize = 68;
+const PFS3_RB_OPTIONS_OFFSET: usize = 4;
+
+/// Resize a PFS3 volume at `partition_offset` to `new_size_bytes`.
+///
+/// - **Shrink**: rejects if any allocated user-data sector lies at or
+///   beyond `new_size_bytes / 512`; otherwise stamps the new
+///   `disksize` and adjusts `blocks_free` for the lost bits.
+/// - **Grow**: marks the new sectors free in the data bitmap, bumps
+///   `blocks_free`, and stamps the new `disksize`. Refuses to grow
+///   past the capacity of the existing BM-block chain (adding BM
+///   blocks needs reserved-block allocation, which we defer).
+/// - **No-op** when the volume isn't PFS3, or when `new_size_bytes`
+///   rounds to the existing block count.
+pub fn resize_pfs3_in_place(
+    device: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    new_size_bytes: u64,
+    log: &mut impl FnMut(&str),
+) -> anyhow::Result<()> {
+    // --- 1. Probe boot magic at HW sector 0. ---
+    device.seek(SeekFrom::Start(partition_offset))?;
+    let mut boot = [0u8; 512];
+    if device.read_exact(&mut boot).is_err() {
+        return Ok(());
+    }
+    let mag = &boot[0..4];
+    let valid = mag == b"PFS\x01"
+        || mag == b"PDS\x01"
+        || mag == b"muAF"
+        || mag == b"muPF"
+        || mag == b"AFS\x01"
+        || mag == b"PFS\x02";
+    if !valid {
+        return Ok(());
+    }
+
+    // --- 2. Read rootblock (first 512 bytes of the rootblock cluster). ---
+    let rb_offset = partition_offset + ROOTBLOCK_SECTOR as u64 * HW_SECTOR;
+    let mut rb_buf = [0u8; 512];
+    device.seek(SeekFrom::Start(rb_offset))?;
+    device.read_exact(&mut rb_buf)?;
+    let root = match Pfs3RootBlock::parse(&rb_buf) {
+        Ok(r) => r,
+        Err(e) => {
+            log(&format!(
+                "PFS3 resize: rootblock parse failed: {e}; skipping"
+            ));
+            return Ok(());
+        }
+    };
+
+    let reserved_blksize = root.reserved_blksize as u32;
+    if reserved_blksize == 0 || reserved_blksize % 512 != 0 {
+        log(&format!(
+            "PFS3 resize: invalid reserved_blksize {}, skipping",
+            reserved_blksize
+        ));
+        return Ok(());
+    }
+
+    let new_total_u64 = new_size_bytes / HW_SECTOR;
+    if new_total_u64 == 0 || new_total_u64 > u32::MAX as u64 {
+        anyhow::bail!(
+            "PFS3 resize: target {} bytes resolves to {} sectors, out of u32 range",
+            new_size_bytes,
+            new_total_u64,
+        );
+    }
+    let new_total = new_total_u64 as u32;
+
+    // `disksize == 0` on older volumes (MODE_SIZEFIELD off) means
+    // "fills the partition"; in that case derive the effective old
+    // size from the partition extent we just read from. We can still
+    // grow / shrink the FS by stamping disksize during this resize.
+    let old_total = if root.disksize > 0 {
+        root.disksize
+    } else {
+        // Compute from EOF — but `partition_offset` might be 0 inside
+        // a larger container, so use the explicit new_size as a
+        // fallback. We can't trust EOF here.
+        log("PFS3 resize: rootblock disksize==0 (pre-SIZEFIELD volume); will stamp disksize");
+        // Treat the current rootblock as authoritative for "old" by
+        // reading partition end via seek.
+        let end = device.seek(SeekFrom::End(0))?;
+        let bytes = end.saturating_sub(partition_offset);
+        (bytes / HW_SECTOR).min(u32::MAX as u64) as u32
+    };
+
+    if new_total == old_total {
+        log("PFS3 resize: no size change, skipping");
+        return Ok(());
+    }
+
+    // Reserved area must remain inside the volume.
+    let min_total = root.last_reserved + 2;
+    if new_total < min_total {
+        anyhow::bail!(
+            "PFS3 resize: target {} sectors below the metadata-region minimum {}",
+            new_total,
+            min_total,
+        );
+    }
+
+    let bitmap_start = root.last_reserved + 1;
+    let longsperbmb = (reserved_blksize / 4) - 3; // u32 words per BM block
+    let sectors_per_bmb = longsperbmb * 32;
+
+    if new_total > old_total {
+        resize_pfs3_grow(
+            device,
+            partition_offset,
+            &root,
+            old_total,
+            new_total,
+            bitmap_start,
+            sectors_per_bmb,
+            log,
+        )
+    } else {
+        resize_pfs3_shrink(
+            device,
+            partition_offset,
+            &root,
+            old_total,
+            new_total,
+            bitmap_start,
+            sectors_per_bmb,
+            log,
+        )
+    }
+}
+
+/// Shrink path: refuse if any sector >= new_total is allocated,
+/// otherwise update `disksize` + `blocks_free` and re-stamp the
+/// rootblock.
+fn resize_pfs3_shrink(
+    device: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    root: &Pfs3RootBlock,
+    old_total: u32,
+    new_total: u32,
+    bitmap_start: u32,
+    sectors_per_bmb: u32,
+    log: &mut impl FnMut(&str),
+) -> anyhow::Result<()> {
+    let reserved_blksize = root.reserved_blksize as u32;
+    // Walk the data bitmap and find the highest allocated sector.
+    let (highest, freed_inside_old_visible) = pfs3_highest_alloc_and_free_count(
+        device,
+        partition_offset,
+        root,
+        bitmap_start,
+        sectors_per_bmb,
+        new_total,
+        old_total,
+    )?;
+    if let Some(h) = highest {
+        if h >= new_total {
+            anyhow::bail!(
+                "PFS3 resize: highest allocated user sector {} >= target {} sectors, \
+                 cannot shrink to {} bytes. Shrink to at least {} sectors (~{} bytes), \
+                 or pick a larger target.",
+                h,
+                new_total,
+                new_total as u64 * HW_SECTOR,
+                h + 1,
+                (h as u64 + 1) * HW_SECTOR,
+            );
+        }
+    }
+
+    // blocks_free originally counted free sectors in the user-data area.
+    // We're dropping the range [new_total, old_total) from view; subtract
+    // the free bits that lived in that range.
+    let new_blocks_free = root.blocks_free.saturating_sub(freed_inside_old_visible);
+
+    let mut new_root = root.clone();
+    new_root.disksize = new_total;
+    new_root.blocks_free = new_blocks_free;
+    pfs3_write_rootblock(device, partition_offset, &new_root, reserved_blksize)?;
+
+    log(&format!(
+        "PFS3 resize: shrunk from {} to {} HW sectors ({} -> {} bytes), blocks_free {} -> {}",
+        old_total,
+        new_total,
+        old_total as u64 * HW_SECTOR,
+        new_total as u64 * HW_SECTOR,
+        root.blocks_free,
+        new_blocks_free,
+    ));
+    Ok(())
+}
+
+/// Grow path: mark the new sectors free in the data bitmap, update
+/// `disksize` + `blocks_free`, re-stamp the rootblock.
+#[allow(clippy::too_many_arguments)]
+fn resize_pfs3_grow(
+    device: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    root: &Pfs3RootBlock,
+    old_total: u32,
+    new_total: u32,
+    bitmap_start: u32,
+    sectors_per_bmb: u32,
+    log: &mut impl FnMut(&str),
+) -> anyhow::Result<()> {
+    let reserved_blksize = root.reserved_blksize as u32;
+    if new_total <= bitmap_start {
+        anyhow::bail!(
+            "PFS3 resize: target {} sectors leaves no room for data area",
+            new_total,
+        );
+    }
+    // Capacity check: count how many BM blocks the existing
+    // bitmapindex chain references. Each BM covers `sectors_per_bmb`
+    // sectors of the data area.
+    let existing_bms = pfs3_count_bm_blocks(device, partition_offset, root)?;
+    let bitmap_capacity_sectors = existing_bms.saturating_mul(sectors_per_bmb) as u64;
+    let new_data_sectors = (new_total - bitmap_start) as u64;
+    if new_data_sectors > bitmap_capacity_sectors {
+        anyhow::bail!(
+            "PFS3 resize: growing from {} to {} sectors needs {} data sectors \
+             but the existing {} BM block(s) cover only {} sectors. Allocating \
+             more BM blocks requires reserved-block headroom and is not \
+             implemented. Maximum grow without extending the bitmap chain: \
+             {} sectors (~{} bytes).",
+            old_total,
+            new_total,
+            new_data_sectors,
+            existing_bms,
+            bitmap_capacity_sectors,
+            bitmap_start as u64 + bitmap_capacity_sectors,
+            (bitmap_start as u64 + bitmap_capacity_sectors) * HW_SECTOR,
+        );
+    }
+
+    // Mark [old_total, new_total) free in the bitmap. Old volumes with
+    // disksize==0 have already had the bitmap fully populated by the
+    // formatter, so this might be a no-op for them; that's fine — the
+    // operation is idempotent.
+    let first_to_free = old_total.max(bitmap_start);
+    if first_to_free < new_total {
+        pfs3_set_data_bitmap_range(
+            device,
+            partition_offset,
+            root,
+            bitmap_start,
+            sectors_per_bmb,
+            first_to_free,
+            new_total - first_to_free,
+            /*set_free=*/ true,
+        )?;
+    }
+
+    let added = new_total - old_total;
+    let new_blocks_free = root.blocks_free.saturating_add(added);
+
+    let mut new_root = root.clone();
+    new_root.disksize = new_total;
+    new_root.blocks_free = new_blocks_free;
+    pfs3_write_rootblock(device, partition_offset, &new_root, reserved_blksize)?;
+
+    log(&format!(
+        "PFS3 resize: grew from {} to {} HW sectors ({} -> {} bytes), blocks_free {} -> {}",
+        old_total,
+        new_total,
+        old_total as u64 * HW_SECTOR,
+        new_total as u64 * HW_SECTOR,
+        root.blocks_free,
+        new_blocks_free,
+    ));
+    Ok(())
+}
+
+/// Walk every BM block referenced from the rootblock's bitmapindex.
+/// Returns:
+/// - `highest`: highest allocated sector across the bitmap, ignoring
+///   sectors >= `old_total` (which may carry stale "allocated" bits
+///   left over from format-time fill).
+/// - `freed_inside_dropped_range`: count of bits that were *free* (=1)
+///   in the range `[new_total, old_total)`. We subtract these from
+///   `blocks_free` when shrinking.
+#[allow(clippy::too_many_arguments)]
+fn pfs3_highest_alloc_and_free_count(
+    device: &mut (impl Read + Seek),
+    partition_offset: u64,
+    root: &Pfs3RootBlock,
+    bitmap_start: u32,
+    sectors_per_bmb: u32,
+    new_total: u32,
+    old_total: u32,
+) -> anyhow::Result<(Option<u32>, u32)> {
+    let reserved_blksize = root.reserved_blksize as usize;
+    let longsperbmb = ((reserved_blksize / 4) - 3) as u32;
+    let mut highest: Option<u32> = None;
+    let mut freed_inside_dropped_range: u32 = 0;
+    let mut buf = vec![0u8; reserved_blksize];
+
+    for (mi_seq, &mi_blk) in root.bitmapindex.iter().enumerate() {
+        if mi_blk == 0 {
+            continue;
+        }
+        // Read MI block.
+        device.seek(SeekFrom::Start(
+            partition_offset + mi_blk as u64 * HW_SECTOR,
+        ))?;
+        device.read_exact(&mut buf)?;
+        if rd_u16(&buf, 0) != ID_BITMAPINDEXBLOCK {
+            anyhow::bail!(
+                "PFS3 resize: bitmapindex block {} has bad id at MI seq {}",
+                mi_blk,
+                mi_seq,
+            );
+        }
+        let mi_bytes = buf.clone();
+        let indexperblock = ((reserved_blksize - 12) / 4) as u32;
+        for i in 0..indexperblock {
+            let off = 12 + i as usize * 4;
+            if off + 4 > mi_bytes.len() {
+                break;
+            }
+            let bm_blk = rd_u32(&mi_bytes, off);
+            if bm_blk == 0 {
+                continue;
+            }
+            let bm_seq = mi_seq as u32 * indexperblock + i;
+            // Read BM block.
+            device.seek(SeekFrom::Start(
+                partition_offset + bm_blk as u64 * HW_SECTOR,
+            ))?;
+            device.read_exact(&mut buf)?;
+            if rd_u16(&buf, 0) != ID_BITMAPBLOCK {
+                anyhow::bail!("PFS3 resize: bitmap block {} has bad id", bm_blk);
+            }
+            let base_sector = bitmap_start as u64 + bm_seq as u64 * sectors_per_bmb as u64;
+            for w in 0..longsperbmb {
+                let o = 12 + w as usize * 4;
+                if o + 4 > buf.len() {
+                    break;
+                }
+                let word = rd_u32(&buf, o);
+                if word == 0xFFFF_FFFF {
+                    // All free — only matters for the dropped-range count.
+                    let word_first = base_sector + w as u64 * 32;
+                    let word_last = word_first + 31;
+                    if word_first >= new_total as u64 && word_last < old_total as u64 {
+                        freed_inside_dropped_range += 32;
+                        continue;
+                    }
+                }
+                for i in 0..32u32 {
+                    let sec = base_sector + (w as u64) * 32 + i as u64;
+                    if sec >= old_total as u64 {
+                        break;
+                    }
+                    let is_free = (word >> (31 - i)) & 1 == 1;
+                    if !is_free {
+                        // Allocated.
+                        if highest.map_or(true, |h| sec as u32 > h) {
+                            highest = Some(sec as u32);
+                        }
+                    } else if sec >= new_total as u64 && sec < old_total as u64 {
+                        freed_inside_dropped_range += 1;
+                    }
+                }
+            }
+        }
+    }
+    Ok((highest, freed_inside_dropped_range))
+}
+
+/// Count the number of non-zero BM-block pointers in the rootblock's
+/// bitmapindex array (i.e. how many BM blocks currently exist).
+fn pfs3_count_bm_blocks(
+    device: &mut (impl Read + Seek),
+    partition_offset: u64,
+    root: &Pfs3RootBlock,
+) -> anyhow::Result<u32> {
+    let reserved_blksize = root.reserved_blksize as usize;
+    let indexperblock = ((reserved_blksize - 12) / 4) as u32;
+    let mut buf = vec![0u8; reserved_blksize];
+    let mut total = 0u32;
+    for &mi_blk in &root.bitmapindex {
+        if mi_blk == 0 {
+            continue;
+        }
+        device.seek(SeekFrom::Start(
+            partition_offset + mi_blk as u64 * HW_SECTOR,
+        ))?;
+        device.read_exact(&mut buf)?;
+        if rd_u16(&buf, 0) != ID_BITMAPINDEXBLOCK {
+            continue;
+        }
+        for i in 0..indexperblock {
+            let off = 12 + i as usize * 4;
+            if off + 4 > buf.len() {
+                break;
+            }
+            if rd_u32(&buf, off) != 0 {
+                total += 1;
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// Toggle a contiguous range of bits in the data bitmap. The
+/// implementation reads each affected BM block exactly once, applies
+/// all bit flips, then writes the block back.
+#[allow(clippy::too_many_arguments)]
+fn pfs3_set_data_bitmap_range(
+    device: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    root: &Pfs3RootBlock,
+    bitmap_start: u32,
+    sectors_per_bmb: u32,
+    first_sector: u32,
+    count: u32,
+    set_free: bool,
+) -> anyhow::Result<()> {
+    if count == 0 {
+        return Ok(());
+    }
+    let reserved_blksize = root.reserved_blksize as usize;
+    let indexperblock = ((reserved_blksize - 12) / 4) as u32;
+    // Translate sector range to BM-block-relative range.
+    let first_local = first_sector
+        .checked_sub(bitmap_start)
+        .ok_or_else(|| anyhow::anyhow!("PFS3 resize: first_sector below bitmap_start"))?;
+    let last_local = first_local
+        .checked_add(count - 1)
+        .ok_or_else(|| anyhow::anyhow!("PFS3 resize: bitmap range overflow"))?;
+    let first_bm_seq = first_local / sectors_per_bmb;
+    let last_bm_seq = last_local / sectors_per_bmb;
+
+    let mut mi_buf = vec![0u8; reserved_blksize];
+    let mut bm_buf = vec![0u8; reserved_blksize];
+
+    for bm_seq in first_bm_seq..=last_bm_seq {
+        let mi_idx = (bm_seq / indexperblock) as usize;
+        let mi_offset = (bm_seq % indexperblock) as usize;
+        let mi_blk = *root.bitmapindex.get(mi_idx).ok_or_else(|| {
+            anyhow::anyhow!(
+                "PFS3 resize: bm_seq {} maps to MI index {} out of range",
+                bm_seq,
+                mi_idx,
+            )
+        })?;
+        if mi_blk == 0 {
+            anyhow::bail!(
+                "PFS3 resize: bm_seq {} references zero MI pointer at index {}",
+                bm_seq,
+                mi_idx,
+            );
+        }
+        device.seek(SeekFrom::Start(
+            partition_offset + mi_blk as u64 * HW_SECTOR,
+        ))?;
+        device.read_exact(&mut mi_buf)?;
+        if rd_u16(&mi_buf, 0) != ID_BITMAPINDEXBLOCK {
+            anyhow::bail!("PFS3 resize: MI block {} bad id", mi_blk);
+        }
+        let bm_blk = rd_u32(&mi_buf, 12 + mi_offset * 4);
+        if bm_blk == 0 {
+            anyhow::bail!(
+                "PFS3 resize: bm_seq {} has zero BM pointer at MI {} slot {}",
+                bm_seq,
+                mi_blk,
+                mi_offset,
+            );
+        }
+        let bm_off = partition_offset + bm_blk as u64 * HW_SECTOR;
+        device.seek(SeekFrom::Start(bm_off))?;
+        device.read_exact(&mut bm_buf)?;
+        if rd_u16(&bm_buf, 0) != ID_BITMAPBLOCK {
+            anyhow::bail!("PFS3 resize: BM block {} bad id", bm_blk);
+        }
+        let range_start_local = bm_seq * sectors_per_bmb;
+        let range_end_local = range_start_local + sectors_per_bmb;
+        let lo = first_local.max(range_start_local);
+        let hi = (last_local + 1).min(range_end_local);
+        for local in lo..hi {
+            let within = local - range_start_local;
+            let word_idx = within / 32;
+            let bit_pos = within % 32;
+            let o = 12 + word_idx as usize * 4;
+            let mut word = rd_u32(&bm_buf, o);
+            let mask = 1u32 << (31 - bit_pos);
+            if set_free {
+                word |= mask;
+            } else {
+                word &= !mask;
+            }
+            bm_buf[o..o + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        device.seek(SeekFrom::Start(bm_off))?;
+        device.write_all(&bm_buf)?;
+    }
+    Ok(())
+}
+
+/// Write the updated rootblock back to the first 512 bytes of the
+/// rootblock cluster, then flush. Sets `MODE_SIZEFIELD` so future
+/// readers honour our `disksize` field even on volumes that didn't
+/// originally have it set.
+fn pfs3_write_rootblock(
+    device: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    new_root: &Pfs3RootBlock,
+    _reserved_blksize: u32,
+) -> anyhow::Result<()> {
+    let rb_offset = partition_offset + ROOTBLOCK_SECTOR as u64 * HW_SECTOR;
+    let mut rb_buf = [0u8; 512];
+    device.seek(SeekFrom::Start(rb_offset))?;
+    device.read_exact(&mut rb_buf)?;
+    // Update the in-memory bytes directly — `write_into` rewrites a
+    // handful of fields but leaves the rest of the block untouched,
+    // which preserves anything we don't model (creation timestamps,
+    // protection bits, index-table heads, etc).
+    rb_buf[PFS3_RB_DISKSIZE_OFFSET..PFS3_RB_DISKSIZE_OFFSET + 4]
+        .copy_from_slice(&new_root.disksize.to_be_bytes());
+    rb_buf[PFS3_RB_BLOCKS_FREE_OFFSET..PFS3_RB_BLOCKS_FREE_OFFSET + 4]
+        .copy_from_slice(&new_root.blocks_free.to_be_bytes());
+    // Set MODE_SIZEFIELD so future opens trust the `disksize` we just
+    // stamped. Leave every other option bit untouched.
+    let mut options =
+        u32::from_be_bytes(rb_buf[PFS3_RB_OPTIONS_OFFSET..PFS3_RB_OPTIONS_OFFSET + 4].try_into()?);
+    options |= MODE_SIZEFIELD;
+    rb_buf[PFS3_RB_OPTIONS_OFFSET..PFS3_RB_OPTIONS_OFFSET + 4]
+        .copy_from_slice(&options.to_be_bytes());
+
+    device.seek(SeekFrom::Start(rb_offset))?;
+    device.write_all(&rb_buf)?;
+    device.flush()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2157,25 +3691,36 @@ mod tests {
         assert!(kids.is_empty(), "blank root should be empty");
         // total_size == 4 MiB
         assert_eq!(fs.total_size(), 8192 * 512);
-        // used_size = total - free*512. Free = data_sectors_in_bitmap_words *
-        // 32 minus 0 used... actually all data sectors are free in a blank
-        // disk, so used == reserved area only.
+        // used_size = total - blocks_free*512. blocks_free is the
+        // data-area sector count; reserved area + boot are excluded.
+        // Derive the expected from `last_reserved` rather than
+        // hardcoding (the formatter's reserve estimate scales with
+        // size + anode budget — a hardcoded number would lock the
+        // test against future budget tweaks).
         let used = fs.used_size();
-        let reserved_bytes = 66u64 * 512; // sectors 0..65 = boot + reserved area
-                                          // The reader's used_size formula is total - blocks_free*512. We set
-                                          // blocks_free = data_sectors (8126). So used = 66 sectors = 33792.
-        assert_eq!(used, reserved_bytes);
+        let expected_used = (fs.root.last_reserved as u64 + 1) * 512;
+        assert_eq!(used, expected_used);
     }
 
     #[test]
     fn blank_volume_compact_reader_walks_bitmap() {
         let img = create_blank_pfs3(8192, "T").expect("format");
+        // Open once to read the actual reserved-area size from the
+        // rootblock, since the formatter scales it with the disk size
+        // + anode budget.
+        let last_reserved = {
+            let cur = std::io::Cursor::new(img.clone());
+            Pfs3Filesystem::open(cur, 0)
+                .expect("open for reserved-area probe")
+                .root
+                .last_reserved
+        };
         let cur = std::io::Cursor::new(img);
         let (_compact, info) = CompactPfs3Reader::new(cur, 0).expect("compact");
         // For a blank disk, every data-area bit is "free", so the compact
         // reader sees ONLY the reserved area as allocated.
         assert_eq!(info.original_size, 8192 * 512);
-        assert_eq!(info.data_size, 66 * 512);
+        assert_eq!(info.data_size, (last_reserved as u64 + 1) * 512);
     }
 
     #[test]
@@ -2198,6 +3743,39 @@ mod tests {
         assert_eq!(de.ttype, 2);
         assert_eq!(de.anode, 42);
         assert_eq!(de.name, "hi");
+        assert_eq!(de.extrafields_link, 0);
+    }
+
+    /// Verify the extrafields back-walker extracts `link` from a packed
+    /// trailer. Layout per pfs3aio: u16 fields packed at the tail,
+    /// terminated by a u16 `flags` bitmap (LSB-first; bit 0 = link_hi,
+    /// bit 1 = link_lo).
+    #[test]
+    fn parse_direntry_extracts_extrafields_link() {
+        // Direntry total = 24 bytes:
+        //   off  0: next=24
+        //   off  1: type=-4 (ST_LINKFILE)
+        //   off  2..6: anode=100 (BE)
+        //   off  6..10: fsize_lo=0
+        //   off 10..16: dates=0
+        //   off 16: protection=0
+        //   off 17: nlength=1
+        //   off 18: 'X'
+        //   off 19: comment_len=0
+        //   off 20: pad to even -> off 20 is already even after 19+1=20
+        //   extrafields region: off 20..22 = link_lo=0xCAFE, off 22..24 = flags=0b10 (bit1 set)
+        let mut e = vec![0u8; 24];
+        e[0] = 24;
+        e[1] = (-4i8) as u8;
+        e[2..6].copy_from_slice(&100u32.to_be_bytes());
+        e[17] = 1;
+        e[18] = b'X';
+        e[19] = 0;
+        e[20..22].copy_from_slice(&0xCAFEu16.to_be_bytes()); // link_lo
+        e[22..24].copy_from_slice(&0b10u16.to_be_bytes()); // flags: bit 1 set
+        let de = parse_direntry(&e, 0, false).expect("parse");
+        assert_eq!(de.ttype, -4);
+        assert_eq!(de.extrafields_link, 0xCAFE);
     }
 
     /// End-to-end Phase 6 smoke test: format a blank volume, create a
@@ -2331,5 +3909,366 @@ mod tests {
             before_free, after_free,
             "rollback should restore free space"
         );
+    }
+
+    /// Shrink a blank 8192-sector volume to 4096 sectors. The data area
+    /// is entirely free, so the resize should succeed and the
+    /// rootblock should reflect the new size.
+    #[test]
+    fn resize_shrink_blank_volume() {
+        let img = create_blank_pfs3(8192, "Shrink").expect("format");
+        let mut cur = std::io::Cursor::new(img);
+        let mut log: Vec<String> = Vec::new();
+        let new_size = 4096u64 * HW_SECTOR;
+        resize_pfs3_in_place(&mut cur, 0, new_size, &mut |s| log.push(s.to_string()))
+            .expect("shrink");
+        assert!(log.iter().any(|l| l.contains("shrunk")), "log: {log:?}");
+        // Re-open at the new size and verify the rootblock now reports it.
+        let img2 = cur.into_inner();
+        let img_truncated = img2[..new_size as usize].to_vec();
+        let cur2 = std::io::Cursor::new(img_truncated);
+        let fs = Pfs3Filesystem::open(cur2, 0).expect("reopen");
+        assert_eq!(fs.total_size(), new_size);
+    }
+
+    /// Shrink should reject if a file would be lost.
+    #[test]
+    fn resize_shrink_refuses_when_data_lost() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem};
+        let img = create_blank_pfs3(8192, "Reject").expect("format");
+        let cur = std::io::Cursor::new(img);
+        let mut fs = Pfs3Filesystem::open(cur, 0).expect("open");
+        let root = fs.root().expect("root");
+        // Create a file large enough that it lives near the tail.
+        // Data allocations come from the end of the data bitmap walked
+        // forward in `alloc_data_blocks`, so even a small file lands
+        // near `bitmap_start` of the blank volume. To force a
+        // late-sector allocation we instead pad with a bigger file.
+        let payload: Vec<u8> = vec![0xCDu8; 1024 * 1024];
+        let mut c = std::io::Cursor::new(&payload);
+        fs.create_file(
+            &root,
+            "big.bin",
+            &mut c,
+            payload.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .expect("create_file");
+        EditableFilesystem::sync_metadata(&mut fs).expect("sync");
+
+        // Try to shrink small enough that the new tail truncates the
+        // file. The file occupies sectors low in the data area, but
+        // our allocator may place data anywhere; pick a target that's
+        // below `bitmap_start + ceil(1 MiB / 512)` = 66 + 2048 = 2114.
+        // 200 sectors is well below that and forces a rejection.
+        let img2 = fs.reader.into_inner();
+        let mut cur2 = std::io::Cursor::new(img2);
+        let mut log: Vec<String> = Vec::new();
+        let result = resize_pfs3_in_place(&mut cur2, 0, 200 * HW_SECTOR, &mut |s| {
+            log.push(s.to_string())
+        });
+        assert!(result.is_err(), "expected refusal, got log: {log:?}");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("highest allocated"),
+            "unexpected error: {err_msg}"
+        );
+    }
+
+    /// Grow within the existing BM-block capacity should succeed.
+    /// Blank 8192-sector volume has 1 BM block covering 8096 data
+    /// sectors, so growing to 8192 -> 9000 stays within the existing
+    /// BM (still 1 block, capacity 8162 data sectors with
+    /// bitmap_start=66). 9000 - 66 = 8934 — exceeds. Pick 8160 -> 8160.
+    /// Instead grow from 4096 -> 8192 after a prior shrink so we
+    /// know we're well within bitmap capacity.
+    #[test]
+    fn resize_grow_after_shrink_round_trips() {
+        let img = create_blank_pfs3(8192, "GrowBack").expect("format");
+        let mut cur = std::io::Cursor::new(img);
+        let mut log: Vec<String> = Vec::new();
+        // Shrink to 4096 sectors.
+        resize_pfs3_in_place(&mut cur, 0, 4096 * HW_SECTOR, &mut |s| {
+            log.push(s.to_string())
+        })
+        .expect("shrink");
+        // Re-pad the buffer to 8192 sectors so the grow has bytes to
+        // work with (the underlying medium needs to be at least that
+        // big).
+        let mut img = cur.into_inner();
+        img.resize(8192 * HW_SECTOR as usize, 0);
+        let mut cur = std::io::Cursor::new(img);
+        resize_pfs3_in_place(&mut cur, 0, 8000 * HW_SECTOR, &mut |s| {
+            log.push(s.to_string())
+        })
+        .expect("grow");
+        assert!(
+            log.iter().any(|l| l.contains("grew")),
+            "log missing grew: {log:?}"
+        );
+        let img = cur.into_inner();
+        let cur = std::io::Cursor::new(img);
+        let fs = Pfs3Filesystem::open(cur, 0).expect("reopen after grow");
+        assert_eq!(fs.total_size(), 8000 * HW_SECTOR);
+    }
+
+    /// Resize on a non-PFS volume should be a silent no-op.
+    #[test]
+    fn resize_skips_non_pfs_volume() {
+        let mut img = vec![0u8; 8192 * HW_SECTOR as usize];
+        // Stamp something that isn't PFS at boot magic.
+        img[0..4].copy_from_slice(b"DEAD");
+        let mut cur = std::io::Cursor::new(img);
+        let mut log: Vec<String> = Vec::new();
+        resize_pfs3_in_place(&mut cur, 0, 4096 * HW_SECTOR, &mut |s| {
+            log.push(s.to_string())
+        })
+        .expect("noop");
+        assert!(log.is_empty(), "expected silent no-op, got: {log:?}");
+    }
+
+    /// Equal sizes should log "no size change" and exit clean.
+    #[test]
+    fn resize_no_op_when_unchanged() {
+        let img = create_blank_pfs3(8192, "Same").expect("format");
+        let mut cur = std::io::Cursor::new(img);
+        let mut log: Vec<String> = Vec::new();
+        resize_pfs3_in_place(&mut cur, 0, 8192 * HW_SECTOR, &mut |s| {
+            log.push(s.to_string())
+        })
+        .expect("noop");
+        assert!(
+            log.iter().any(|l| l.contains("no size change")),
+            "log: {log:?}"
+        );
+    }
+
+    /// `CreateFileOptions::amiga_protection` / `amiga_comment` /
+    /// `amiga_dates` round-trip through create_file -> sync -> reopen ->
+    /// list_directory.
+    #[test]
+    fn create_file_persists_amiga_metadata() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem};
+        let img = create_blank_pfs3(8192, "Meta").expect("format");
+        let cur = std::io::Cursor::new(img);
+        let mut fs = Pfs3Filesystem::open(cur, 0).expect("open");
+        let root = fs.root().expect("root");
+        let payload = b"protected".to_vec();
+        let mut src = std::io::Cursor::new(payload.clone());
+        let opts = CreateFileOptions {
+            amiga_protection: Some(0x0000_00A5),
+            amiga_comment: Some("a test filenote".to_string()),
+            amiga_dates: Some((12345, 678, 90)),
+            ..Default::default()
+        };
+        fs.create_file(&root, "secret", &mut src, payload.len() as u64, &opts)
+            .expect("create_file");
+        EditableFilesystem::sync_metadata(&mut fs).expect("sync");
+
+        let img2 = fs.reader.into_inner();
+        let cur2 = std::io::Cursor::new(img2);
+        let mut fs2 = Pfs3Filesystem::open(cur2, 0).expect("reopen");
+        let root2 = fs2.root().expect("root");
+        let kids = fs2.list_directory(&root2).expect("list");
+        let fe = kids
+            .iter()
+            .find(|e| e.name == "secret")
+            .expect("created entry visible");
+        assert_eq!(fe.amiga_protection, Some(0xA5));
+        assert_eq!(fe.amiga_comment.as_deref(), Some("a test filenote"));
+        assert_eq!(fe.amiga_date, Some((12345, 678, 90)));
+    }
+
+    /// `alloc_anode_in_memory` extends past anodeblock 0 when full.
+    /// At resblksize=1024 each AB holds 84 anodes (slots 0..83); the
+    /// first 6 slots of seqnr-0 are reserved for PFS3 bookkeeping, so
+    /// 78 user slots in seqnr 0. Creating 100 files forces the
+    /// allocator to spill into seqnr 1.
+    #[test]
+    fn anodeblock_chain_extends_when_first_ab_is_full() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem};
+        let img = create_blank_pfs3(8192, "Chain").expect("format");
+        let cur = std::io::Cursor::new(img);
+        let mut fs = Pfs3Filesystem::open(cur, 0).expect("open");
+        let root = fs.root().expect("root");
+        let payload = b"x".to_vec();
+        for i in 0..100 {
+            let name = format!("f{:03}", i);
+            let mut p = std::io::Cursor::new(payload.clone());
+            fs.create_file(
+                &root,
+                &name,
+                &mut p,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap_or_else(|e| panic!("create_file f{i} failed: {e}"));
+        }
+        EditableFilesystem::sync_metadata(&mut fs).expect("sync");
+
+        // Reopen and confirm all 100 files survive.
+        let img2 = fs.reader.into_inner();
+        let cur2 = std::io::Cursor::new(img2);
+        let mut fs2 = Pfs3Filesystem::open(cur2, 0).expect("reopen");
+        let root2 = fs2.root().expect("root");
+        let kids = fs2.list_directory(&root2).expect("list");
+        assert_eq!(kids.len(), 100, "all 100 files should round-trip");
+    }
+
+    /// `create_file` accepts long filenames (PFS3 LONGFN mode, fnsize=107).
+    /// Real Amiga volumes routinely carry names like "Sensible World of
+    /// Soccer 24-25.iff" (34 bytes) — well past the standard 30-byte
+    /// AmigaDOS cap.
+    #[test]
+    fn create_file_with_long_name_round_trips() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem};
+        let img = create_blank_pfs3(8192, "Long").expect("format");
+        let cur = std::io::Cursor::new(img);
+        let mut fs = Pfs3Filesystem::open(cur, 0).expect("open");
+        let root = fs.root().expect("root");
+        let long_name = "Sensible World of Soccer 24-25.iff";
+        assert!(long_name.len() > 30, "test premise: name > standard cap");
+        let payload = b"data".to_vec();
+        let mut p = std::io::Cursor::new(payload.clone());
+        fs.create_file(
+            &root,
+            long_name,
+            &mut p,
+            payload.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .expect("create with long name");
+        EditableFilesystem::sync_metadata(&mut fs).expect("sync");
+
+        let img2 = fs.reader.into_inner();
+        let cur2 = std::io::Cursor::new(img2);
+        let mut fs2 = Pfs3Filesystem::open(cur2, 0).expect("reopen");
+        let root2 = fs2.root().expect("root");
+        let kids = fs2.list_directory(&root2).expect("list");
+        let fe = kids
+            .iter()
+            .find(|e| e.name == long_name)
+            .expect("long name visible after reopen");
+        assert_eq!(fe.size, payload.len() as u64);
+    }
+
+    /// `create_blank_pfs3` must scale `resblksize` and `numreserved`
+    /// with the target size. The 4 MB layout in
+    /// `blank_volume_round_trips_through_reader` only exercises the
+    /// small-volume path; this test covers 650 MB (forces
+    /// numreserved >= ~180 at resblksize=1024) and 9 GB (forces
+    /// resblksize=4096 to keep no_bmb within a single MI).
+    #[test]
+    fn blank_volume_scales_to_real_amiga_partition_sizes() {
+        // 650 MB target (DH0-style): single MI, 1024-byte reserved
+        // blocks, numreserved scaled past 32 to ~180.
+        let img_650 = create_blank_pfs3(1_331_576, "DH0").expect("format 650 MB");
+        let mut cur = std::io::Cursor::new(img_650);
+        let fs = Pfs3Filesystem::open(&mut cur, 0).expect("open 650 MB");
+        assert_eq!(fs.volume_label(), Some("DH0"));
+        assert_eq!(fs.root.reserved_blksize, 1024);
+
+        // 9 GB target (DH1-style): forces resblksize=4096 so a single
+        // MI's 1021 index slots cover all BM blocks.
+        let img_9g = create_blank_pfs3(18_740_736, "DH1").expect("format 9 GB");
+        let mut cur = std::io::Cursor::new(img_9g);
+        let fs = Pfs3Filesystem::open(&mut cur, 0).expect("open 9 GB");
+        assert_eq!(fs.volume_label(), Some("DH1"));
+        assert_eq!(fs.root.reserved_blksize, 4096);
+    }
+
+    /// `create_symlink` round-trips through `sync_metadata` -> reopen
+    /// -> `list_directory`, surfacing the target path on the rebuilt
+    /// `FileEntry`.
+    #[test]
+    fn create_symlink_round_trips() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem};
+        let img = create_blank_pfs3(8192, "Sym").expect("format");
+        let cur = std::io::Cursor::new(img);
+        let mut fs = Pfs3Filesystem::open(cur, 0).expect("open");
+        let root = fs.root().expect("root");
+        let opts = CreateFileOptions::default();
+        fs.create_symlink(&root, "ptr", "Sys:Foo/bar", &opts)
+            .expect("create_symlink");
+        EditableFilesystem::sync_metadata(&mut fs).expect("sync");
+
+        let img2 = fs.reader.into_inner();
+        let cur2 = std::io::Cursor::new(img2);
+        let mut fs2 = Pfs3Filesystem::open(cur2, 0).expect("reopen");
+        let root2 = fs2.root().expect("root");
+        let kids = fs2.list_directory(&root2).expect("list");
+        let fe = kids
+            .iter()
+            .find(|e| e.name == "ptr")
+            .expect("symlink visible");
+        assert!(fe.is_symlink());
+        assert_eq!(fe.symlink_target.as_deref(), Some("Sys:Foo/bar"));
+        assert_eq!(fe.size, "Sys:Foo/bar".len() as u64);
+    }
+
+    /// `create_hardlink` round-trips: the link direntry surfaces with
+    /// `link_target_cnid` pointing at the original file's anode.
+    #[test]
+    fn create_hardlink_round_trips() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem};
+        let img = create_blank_pfs3(8192, "Hard").expect("format");
+        let cur = std::io::Cursor::new(img);
+        let mut fs = Pfs3Filesystem::open(cur, 0).expect("open");
+        let root = fs.root().expect("root");
+        let opts = CreateFileOptions::default();
+        let payload = b"original data".to_vec();
+        let mut p = std::io::Cursor::new(payload.clone());
+        let target_fe = fs
+            .create_file(&root, "orig", &mut p, payload.len() as u64, &opts)
+            .expect("create_file");
+        let target_anode = target_fe.location;
+        fs.create_hardlink(&root, "ln", &target_fe, &opts)
+            .expect("create_hardlink");
+        EditableFilesystem::sync_metadata(&mut fs).expect("sync");
+
+        let img2 = fs.reader.into_inner();
+        let cur2 = std::io::Cursor::new(img2);
+        let mut fs2 = Pfs3Filesystem::open(cur2, 0).expect("reopen");
+        let root2 = fs2.root().expect("root");
+        let kids = fs2.list_directory(&root2).expect("list");
+        let link = kids
+            .iter()
+            .find(|e| e.name == "ln")
+            .expect("hardlink visible");
+        assert_eq!(link.link_target_cnid, Some(target_anode));
+        // The link's size mirrors the target's size (per pfs3aio).
+        assert_eq!(link.size, payload.len() as u64);
+    }
+
+    /// `CreateDirectoryOptions` metadata round-trips the same way.
+    #[test]
+    fn create_directory_persists_amiga_metadata() {
+        use super::super::filesystem::{CreateDirectoryOptions, EditableFilesystem};
+        let img = create_blank_pfs3(8192, "Meta").expect("format");
+        let cur = std::io::Cursor::new(img);
+        let mut fs = Pfs3Filesystem::open(cur, 0).expect("open");
+        let root = fs.root().expect("root");
+        let opts = CreateDirectoryOptions {
+            amiga_protection: Some(0xF0),
+            amiga_comment: Some("dir note".to_string()),
+            amiga_dates: Some((100, 200, 300)),
+            ..Default::default()
+        };
+        fs.create_directory(&root, "Notes", &opts)
+            .expect("create_directory");
+        EditableFilesystem::sync_metadata(&mut fs).expect("sync");
+
+        let img2 = fs.reader.into_inner();
+        let cur2 = std::io::Cursor::new(img2);
+        let mut fs2 = Pfs3Filesystem::open(cur2, 0).expect("reopen");
+        let root2 = fs2.root().expect("root");
+        let kids = fs2.list_directory(&root2).expect("list");
+        let fe = kids
+            .iter()
+            .find(|e| e.name == "Notes")
+            .expect("created dir visible");
+        assert_eq!(fe.amiga_protection, Some(0xF0));
+        assert_eq!(fe.amiga_comment.as_deref(), Some("dir note"));
+        assert_eq!(fe.amiga_date, Some((100, 200, 300)));
     }
 }

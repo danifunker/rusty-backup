@@ -756,19 +756,35 @@ impl<R: Read + Seek + Send> Filesystem for SfsFilesystem<R> {
     }
 
     fn last_data_byte(&mut self) -> Result<u64, FilesystemError> {
+        // SFS keeps a backup rootblock at `totalblocks - 1` that is always
+        // marked allocated in the bitmap. On shrink it moves to the new
+        // tail, so for the resize floor we ignore the last
+        // SFS_BLOCKS_RESERVED_END block(s) and report the highest
+        // non-backup-root allocated position, plus 1 block of headroom for
+        // the relocated backup root at the new tail.
         match read_bitmap(self) {
             Ok(bitmap) => {
-                // Find highest allocated block (bit cleared).
                 let bs = self.root.blocksize as u64;
+                let total = self.root.totalblocks as u64;
+                // Highest block index to consider as "user data" — exclude
+                // the trailing backup-root region.
+                let last_user = total.saturating_sub(SFS_BLOCKS_RESERVED_END as u64);
                 for byte_idx in (0..bitmap.len()).rev() {
                     let byte = bitmap[byte_idx];
                     if byte == 0xFF {
                         continue;
                     }
                     for bit in (0..8u8).rev() {
+                        let block_idx = (byte_idx as u64) * 8 + bit as u64;
+                        if block_idx >= last_user {
+                            continue;
+                        }
                         if (byte >> bit) & 1 == 0 {
-                            let block_idx = (byte_idx as u64) * 8 + bit as u64;
-                            return Ok((block_idx + 1) * bs);
+                            // +1 for the byte after the highest allocated
+                            // user block, +1 more block for the relocated
+                            // backup root that lives at the new tail.
+                            let floor_blocks = block_idx + 1 + SFS_BLOCKS_RESERVED_END as u64;
+                            return Ok(floor_blocks * bs);
                         }
                     }
                 }
@@ -2387,6 +2403,410 @@ pub fn create_blank_sfs(total_blocks: u32, name: &str) -> Result<Vec<u8>, Filesy
     Ok(img)
 }
 
+/// In-place SFS resize. Operates directly on the underlying device/file at
+/// raw-I/O level, matching the convention used by `resize_hfs_in_place` and
+/// friends. Auto-detects by checking the rootblock id at the partition
+/// offset and silently skips non-SFS volumes.
+///
+/// Phase S.1 implements shrink-to-floor only: the new size must be at least
+/// `last_data_byte()` (as reported by the inspect-tab minimum-size column).
+/// Shrinking below that floor would require relocating user-data blocks,
+/// which is deferred indefinitely as a design choice — see
+/// `docs/amiga_resize.md` Phase S.3. Grow is implemented in Phase S.2.
+///
+/// Mechanics for shrink:
+///   1. Verify the block at `new_total - 1` is free (so the relocated
+///      backup rootblock can land there).
+///   2. Mark that block allocated in the bitmap.
+///   3. Update primary rootblock fields (`totalblocks`, `lastbyte_full`,
+///      bump `sequencenumber`).
+///   4. Write the new backup rootblock at the new tail.
+///   5. Write the updated primary rootblock at block 0.
+///
+/// The block at the OLD `totalblocks - 1` (former backup root) sits past
+/// the new volume tail after step 3 and is no longer relevant — the
+/// underlying bytes are left untouched. The partition table is responsible
+/// for trimming/extending the actual partition extent; this function only
+/// rewrites filesystem metadata.
+pub fn resize_sfs_in_place(
+    device: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    new_size_bytes: u64,
+    log: &mut impl FnMut(&str),
+) -> anyhow::Result<()> {
+    // --- 1. Probe rootblock at block 0 ---
+    device.seek(SeekFrom::Start(partition_offset))?;
+    let mut probe = [0u8; 512];
+    if device.read_exact(&mut probe).is_err() {
+        return Ok(());
+    }
+    if rd_u32(&probe, 0) != ROOTBLOCK_ID {
+        return Ok(());
+    }
+    let blocksize = rd_u32(&probe, 52) as u64;
+    if !(512..=65536).contains(&blocksize) || blocksize % 512 != 0 {
+        log(&format!(
+            "SFS resize: rootblock blocksize {} out of range, skipping",
+            blocksize
+        ));
+        return Ok(());
+    }
+
+    // Re-read at proper block size.
+    let mut prim_buf = vec![0u8; blocksize as usize];
+    device.seek(SeekFrom::Start(partition_offset))?;
+    device.read_exact(&mut prim_buf)?;
+    let root = SfsRootBlock::parse(&prim_buf, 0)
+        .map_err(|e| anyhow::anyhow!("SFS resize: rootblock parse failed: {e}"))?;
+
+    let old_total = root.totalblocks;
+    let new_total_u64 = new_size_bytes / blocksize;
+    if new_total_u64 == 0 || new_total_u64 > u32::MAX as u64 {
+        anyhow::bail!(
+            "SFS resize: target {} bytes resolves to {} blocks, out of u32 range",
+            new_size_bytes,
+            new_total_u64,
+        );
+    }
+    let new_total = new_total_u64 as u32;
+    if new_total == old_total {
+        log("SFS resize: no size change, skipping");
+        return Ok(());
+    }
+    if new_total > old_total {
+        return grow_sfs_in_place(device, partition_offset, &root, new_total, log);
+    }
+
+    // --- 2. Shrink path. Sanity-check minimums. ---
+    if new_total < SFS_BLOCKS_RESERVED_START + SFS_BLOCKS_ADMIN + 1 + SFS_BLOCKS_RESERVED_END {
+        anyhow::bail!(
+            "SFS resize: target {} blocks below the metadata-region minimum",
+            new_total,
+        );
+    }
+    let new_backup_blk = new_total - 1;
+
+    // Read the full bitmap to verify the floor invariant: every allocated
+    // block must lie at index < new_backup_blk, except the OLD backup root
+    // at old_total - 1 which we ignore (it sits past the new tail).
+    let bm = read_bitmap_raw(device, partition_offset, &root)?;
+    let highest_alloc = find_highest_allocated_excluding_old_backup(&bm, old_total);
+    if let Some(h) = highest_alloc {
+        if h >= new_backup_blk {
+            anyhow::bail!(
+                "SFS resize: highest allocated user block {} >= new backup root position {}, \
+                 cannot shrink to {} blocks. Shrink to at least {} blocks (~{} bytes), or use \
+                 a larger target.",
+                h,
+                new_backup_blk,
+                new_total,
+                h + 1 + SFS_BLOCKS_RESERVED_END,
+                (h as u64 + 1 + SFS_BLOCKS_RESERVED_END as u64) * blocksize,
+            );
+        }
+    }
+
+    // --- 3. Mark new backup-root block allocated in bitmap on disk. ---
+    set_bitmap_bit_on_disk(
+        device,
+        partition_offset,
+        &root,
+        new_backup_blk,
+        /*set_free=*/ false,
+    )?;
+
+    // --- 4. Build the updated rootblock (primary + backup) and stamp. ---
+    let mut new_root = root.clone();
+    new_root.totalblocks = new_total;
+    new_root.lastbyte_full = new_total as u64 * blocksize - 1;
+    new_root.sequencenumber = new_root.sequencenumber.wrapping_add(1);
+
+    let bs = blocksize as usize;
+    let mut prim_out = vec![0u8; bs];
+    new_root.write_into(&mut prim_out);
+    write_u32(&mut prim_out, 8, 0);
+    stamp_checksum(&mut prim_out);
+
+    let mut backup_out = vec![0u8; bs];
+    new_root.write_into(&mut backup_out);
+    write_u32(&mut backup_out, 8, new_backup_blk);
+    stamp_checksum(&mut backup_out);
+
+    // Write backup first, primary last — the primary is the commit point.
+    device.seek(SeekFrom::Start(
+        partition_offset + new_backup_blk as u64 * blocksize,
+    ))?;
+    device.write_all(&backup_out)?;
+    device.seek(SeekFrom::Start(partition_offset))?;
+    device.write_all(&prim_out)?;
+    device.flush()?;
+
+    log(&format!(
+        "SFS resize: shrunk from {} to {} blocks ({} -> {} bytes), backup root relocated to {}",
+        old_total,
+        new_total,
+        old_total as u64 * blocksize,
+        new_total as u64 * blocksize,
+        new_backup_blk,
+    ));
+    Ok(())
+}
+
+/// Read the SFS bitmap directly via raw I/O (no SfsFilesystem instance).
+/// Returns one bit per block in `[0..root.totalblocks)`, set = free.
+fn read_bitmap_raw(
+    device: &mut (impl Read + Seek),
+    partition_offset: u64,
+    root: &SfsRootBlock,
+) -> anyhow::Result<Vec<u8>> {
+    let bs = root.blocksize as u64;
+    let total = root.totalblocks as usize;
+    let total_bytes = (total + 7) / 8;
+    let mut out = vec![0u8; total_bytes];
+    let words_per_block = ((bs as usize) - 12) / 4;
+    let bits_per_block = words_per_block * 32;
+    let needed = total.div_ceil(bits_per_block);
+    let mut buf = vec![0u8; bs as usize];
+    let mut covered: usize = 0;
+    for i in 0..needed {
+        let blk = root.bitmapbase + i as u32;
+        device.seek(SeekFrom::Start(partition_offset + blk as u64 * bs))?;
+        device.read_exact(&mut buf)?;
+        if rd_u32(&buf, 0) != BITMAP_ID {
+            anyhow::bail!("SFS resize: bitmap block {} has bad id", blk);
+        }
+        for w in 0..words_per_block {
+            let word = rd_u32(&buf, 12 + w * 4);
+            for i in 0..32u32 {
+                let global_blk = covered + (w * 32) + i as usize;
+                if global_blk >= total {
+                    break;
+                }
+                if (word >> (31 - i)) & 1 == 1 {
+                    out[global_blk / 8] |= 1u8 << (global_blk % 8);
+                }
+            }
+        }
+        covered += bits_per_block;
+        if covered >= total {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Find the highest allocated block (bit clear) in the bitmap, ignoring
+/// the backup-root region at `[old_total - SFS_BLOCKS_RESERVED_END, old_total)`.
+fn find_highest_allocated_excluding_old_backup(bm: &[u8], old_total: u32) -> Option<u32> {
+    let cutoff = old_total.saturating_sub(SFS_BLOCKS_RESERVED_END);
+    for blk in (0..cutoff).rev() {
+        let byte = bm[(blk / 8) as usize];
+        let bit = (byte >> (blk % 8)) & 1;
+        if bit == 0 {
+            return Some(blk);
+        }
+    }
+    None
+}
+
+/// Grow path. Symmetric to shrink: free the old backup-root block, free
+/// the newly-claimed tail range, allocate the new backup-root position,
+/// write the new backup root, then commit by writing the primary.
+///
+/// Refuses to grow past the capacity of the existing bitmap chain — i.e.
+/// when adding more bitmap blocks would be required. Extending the bitmap
+/// chain itself means relocating whatever currently sits at
+/// `bitmapbase + old_blocks_bitmap`, which is user data on any non-blank
+/// volume and falls into Phase S.3 territory.
+fn grow_sfs_in_place(
+    device: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    root: &SfsRootBlock,
+    new_total: u32,
+    log: &mut impl FnMut(&str),
+) -> anyhow::Result<()> {
+    let blocksize = root.blocksize as u64;
+    let old_total = root.totalblocks;
+    let bs = blocksize as usize;
+    let words_per_block = (bs - 12) / 4;
+    let bits_per_block = words_per_block * 32;
+    let old_blocks_bitmap = (old_total as usize).div_ceil(bits_per_block);
+    let new_blocks_bitmap = (new_total as usize).div_ceil(bits_per_block);
+    if new_blocks_bitmap != old_blocks_bitmap {
+        anyhow::bail!(
+            "SFS resize: growing from {} to {} blocks needs {} bitmap blocks (have {}). \
+             Adding bitmap blocks requires relocating user data and is not implemented \
+             (Phase S.3). Maximum grow without bitmap extension: {} blocks (~{} bytes).",
+            old_total,
+            new_total,
+            new_blocks_bitmap,
+            old_blocks_bitmap,
+            old_blocks_bitmap * bits_per_block,
+            old_blocks_bitmap as u64 * bits_per_block as u64 * blocksize,
+        );
+    }
+
+    let old_backup_blk = old_total - 1;
+    let new_backup_blk = new_total - 1;
+    if new_backup_blk == old_backup_blk {
+        // Equal totals were handled by the caller; this would imply
+        // new_total == old_total. Defensive guard.
+        log("SFS resize: grow no-op, skipping");
+        return Ok(());
+    }
+
+    // Mark bits free for: old_backup_blk + every block in [old_total, new_total - 1).
+    // Mark bit allocated for: new_backup_blk.
+    set_bitmap_range_on_disk(device, partition_offset, root, old_backup_blk, 1, true)?;
+    if new_total - 1 > old_total {
+        // Range [old_total, new_total - 1) is newly visible — bits there are
+        // currently 0 (allocated) because the formatter zero-fills beyond
+        // total_blocks. Mark them free.
+        set_bitmap_range_on_disk(
+            device,
+            partition_offset,
+            root,
+            old_total,
+            new_backup_blk - old_total,
+            true,
+        )?;
+    }
+    set_bitmap_range_on_disk(device, partition_offset, root, new_backup_blk, 1, false)?;
+
+    // Update root copies and commit.
+    let mut new_root = root.clone();
+    new_root.totalblocks = new_total;
+    new_root.lastbyte_full = new_total as u64 * blocksize - 1;
+    new_root.sequencenumber = new_root.sequencenumber.wrapping_add(1);
+
+    let mut prim_out = vec![0u8; bs];
+    new_root.write_into(&mut prim_out);
+    write_u32(&mut prim_out, 8, 0);
+    stamp_checksum(&mut prim_out);
+
+    let mut backup_out = vec![0u8; bs];
+    new_root.write_into(&mut backup_out);
+    write_u32(&mut backup_out, 8, new_backup_blk);
+    stamp_checksum(&mut backup_out);
+
+    // Zero any garbage at the new backup-root position before stamping the
+    // backup, so leftover bytes from before the grow don't leak into the
+    // checksum. (The position was free in the new bitmap before this op.)
+    device.seek(SeekFrom::Start(
+        partition_offset + new_backup_blk as u64 * blocksize,
+    ))?;
+    device.write_all(&backup_out)?;
+    device.seek(SeekFrom::Start(partition_offset))?;
+    device.write_all(&prim_out)?;
+    device.flush()?;
+
+    log(&format!(
+        "SFS resize: grew from {} to {} blocks ({} -> {} bytes), backup root relocated to {}",
+        old_total,
+        new_total,
+        old_total as u64 * blocksize,
+        new_total as u64 * blocksize,
+        new_backup_blk,
+    ));
+    Ok(())
+}
+
+/// Toggle a contiguous range of `count` bitmap bits starting at block
+/// `first`. Batches per bitmap-block: reads each affected bitmap block
+/// once, applies all bit edits in that block, writes it back with a
+/// fresh checksum.
+fn set_bitmap_range_on_disk(
+    device: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    root: &SfsRootBlock,
+    first: u32,
+    count: u32,
+    set_free: bool,
+) -> anyhow::Result<()> {
+    if count == 0 {
+        return Ok(());
+    }
+    let bs = root.blocksize as u64;
+    let words_per_block = ((bs as usize) - 12) / 4;
+    let bits_per_block = words_per_block * 32;
+    let last = first
+        .checked_add(count - 1)
+        .ok_or_else(|| anyhow::anyhow!("SFS resize: bitmap range overflow"))?;
+    let first_bm_seq = (first as usize) / bits_per_block;
+    let last_bm_seq = (last as usize) / bits_per_block;
+    let mut buf = vec![0u8; bs as usize];
+    for bm_seq in first_bm_seq..=last_bm_seq {
+        let bm_blk = root.bitmapbase + bm_seq as u32;
+        let bm_off = partition_offset + bm_blk as u64 * bs;
+        device.seek(SeekFrom::Start(bm_off))?;
+        device.read_exact(&mut buf)?;
+        if rd_u32(&buf, 0) != BITMAP_ID {
+            anyhow::bail!("SFS resize: bitmap block {} has bad id", bm_blk);
+        }
+        let range_start = (bm_seq * bits_per_block) as u32;
+        let range_end = range_start.saturating_add(bits_per_block as u32);
+        let lo = first.max(range_start);
+        let hi = (last + 1).min(range_end);
+        for blk in lo..hi {
+            let within = (blk as usize) - bm_seq * bits_per_block;
+            let word_idx = within / 32;
+            let bit = within % 32;
+            let o = 12 + word_idx * 4;
+            let mut word = rd_u32(&buf, o);
+            let mask = 1u32 << (31 - bit as u32);
+            if set_free {
+                word |= mask;
+            } else {
+                word &= !mask;
+            }
+            buf[o..o + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        stamp_checksum(&mut buf);
+        device.seek(SeekFrom::Start(bm_off))?;
+        device.write_all(&buf)?;
+    }
+    Ok(())
+}
+
+/// Toggle a single bitmap bit on disk via raw I/O. Read-modify-write on
+/// the affected bitmap block, then re-stamp its checksum.
+fn set_bitmap_bit_on_disk(
+    device: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    root: &SfsRootBlock,
+    blk: u32,
+    set_free: bool,
+) -> anyhow::Result<()> {
+    let bs = root.blocksize as u64;
+    let words_per_block = ((bs as usize) - 12) / 4;
+    let bits_per_block = words_per_block * 32;
+    let bm_seq = (blk as usize) / bits_per_block;
+    let within = (blk as usize) % bits_per_block;
+    let word_idx = within / 32;
+    let bit = within % 32;
+    let bm_blk = root.bitmapbase + bm_seq as u32;
+
+    let mut buf = vec![0u8; bs as usize];
+    device.seek(SeekFrom::Start(partition_offset + bm_blk as u64 * bs))?;
+    device.read_exact(&mut buf)?;
+    if rd_u32(&buf, 0) != BITMAP_ID {
+        anyhow::bail!("SFS resize: bitmap block {} has bad id", bm_blk);
+    }
+    let o = 12 + word_idx * 4;
+    let mut word = rd_u32(&buf, o);
+    let mask = 1u32 << (31 - bit as u32);
+    if set_free {
+        word |= mask;
+    } else {
+        word &= !mask;
+    }
+    buf[o..o + 4].copy_from_slice(&word.to_be_bytes());
+    stamp_checksum(&mut buf);
+    device.seek(SeekFrom::Start(partition_offset + bm_blk as u64 * bs))?;
+    device.write_all(&buf)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2532,6 +2952,273 @@ mod tests {
         assert_eq!(
             before_free, after_free,
             "rollback should restore free space"
+        );
+    }
+
+    #[test]
+    fn sfs_last_data_byte_excludes_backup_root() {
+        // A blank 4 MiB SFS volume has the backup root allocated at block
+        // totalblocks - 1, plus admin + bitmap blocks at the start. The
+        // resize floor must report the highest user-data allocation
+        // (which on a blank volume is the bitmap region near block 33),
+        // NOT the backup root at the very end.
+        use super::super::filesystem::Filesystem;
+        let img = create_blank_sfs(8192, "FloorTest").expect("format");
+        let cur = std::io::Cursor::new(img);
+        let mut fs = SfsFilesystem::open(cur, 0).expect("open");
+        let total = fs.total_size();
+        let floor = fs.last_data_byte().expect("last_data_byte");
+        // Blank volume floor should be a small fraction of total size —
+        // the metadata at the front plus 1 block of headroom, not the
+        // full partition.
+        assert!(
+            floor < total / 4,
+            "blank SFS floor {floor} should be far less than total {total}"
+        );
+        assert!(
+            floor > 0,
+            "floor should report at least the metadata region"
+        );
+    }
+
+    #[test]
+    fn sfs_last_data_byte_grows_with_file_data() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        let img = create_blank_sfs(8192, "GrowTest").expect("format");
+        let cur = std::io::Cursor::new(img);
+        let mut fs = SfsFilesystem::open(cur, 0).expect("open");
+        let floor_empty = fs.last_data_byte().expect("floor empty");
+
+        // Write a small file. Its data block(s) will be allocated past
+        // the metadata region but still well below total.
+        let root = fs.root().expect("root");
+        let payload = vec![0xABu8; 4096];
+        let mut p = std::io::Cursor::new(&payload);
+        fs.create_file(
+            &root,
+            "f.bin",
+            &mut p,
+            payload.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .expect("create_file");
+        EditableFilesystem::sync_metadata(&mut fs).expect("sync");
+
+        let floor_after = fs.last_data_byte().expect("floor after");
+        assert!(
+            floor_after >= floor_empty,
+            "floor should not decrease after writing data: empty={floor_empty} after={floor_after}"
+        );
+    }
+
+    #[test]
+    fn sfs_resize_shrink_round_trip() {
+        // Format a 4 MiB SFS volume, drop a small file, shrink to the
+        // floor reported by last_data_byte, and verify the file survives
+        // when the volume is reopened at its smaller size.
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+
+        let bs: u64 = 512;
+        let img = create_blank_sfs(8192, "ShrinkRT").expect("format");
+        let mut cur = std::io::Cursor::new(img);
+        let mut fs = SfsFilesystem::open(&mut cur, 0).expect("open");
+        let root = fs.root().expect("root");
+        let payload = b"This is a small payload that survives an SFS shrink.\n".to_vec();
+        let mut p = std::io::Cursor::new(&payload);
+        fs.create_file(
+            &root,
+            "test.txt",
+            &mut p,
+            payload.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .expect("create_file");
+        EditableFilesystem::sync_metadata(&mut fs).expect("sync");
+        let floor = fs.last_data_byte().expect("floor");
+        // Pick a shrink target a few blocks above the floor for safety.
+        let target_bytes = floor + 4 * bs;
+        let target_blocks = (target_bytes / bs) as u32;
+        drop(fs);
+
+        // Reset cursor and run the resize.
+        cur.set_position(0);
+        let mut log_lines: Vec<String> = Vec::new();
+        resize_sfs_in_place(&mut cur, 0, target_blocks as u64 * bs, &mut |s| {
+            log_lines.push(s.to_string())
+        })
+        .expect("resize");
+        assert!(
+            log_lines.iter().any(|l| l.contains("shrunk")),
+            "expected a shrink log line, got: {:?}",
+            log_lines
+        );
+
+        // Reopen the smaller volume and verify totalblocks + file contents.
+        cur.set_position(0);
+        // Truncate the cursor's backing buffer to the new partition size
+        // so SfsFilesystem::open clamps partition_size correctly.
+        let img2 = cur.into_inner();
+        let new_size = target_blocks as usize * bs as usize;
+        let mut img2: Vec<u8> = img2[..new_size].to_vec();
+        let cur2 = std::io::Cursor::new(&mut img2);
+        let mut fs2 = SfsFilesystem::open(cur2, 0).expect("reopen shrunk");
+        assert_eq!(
+            fs2.root.totalblocks, target_blocks,
+            "totalblocks did not update after shrink"
+        );
+        let root2 = fs2.root().expect("root2");
+        let kids = fs2.list_directory(&root2).expect("list");
+        let f = kids
+            .iter()
+            .find(|c| c.name == "test.txt")
+            .expect("test.txt should be present after shrink");
+        let data = fs2.read_file(f, payload.len() * 2).expect("read");
+        assert_eq!(data, payload, "file contents corrupted by shrink");
+    }
+
+    #[test]
+    fn sfs_resize_refuses_shrink_below_floor() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        let bs: u64 = 512;
+        let img = create_blank_sfs(8192, "BelowFloor").expect("format");
+        let mut cur = std::io::Cursor::new(img);
+        let mut fs = SfsFilesystem::open(&mut cur, 0).expect("open");
+        let root = fs.root().expect("root");
+        let payload = vec![0xAAu8; 4096];
+        let mut p = std::io::Cursor::new(&payload);
+        fs.create_file(
+            &root,
+            "big.bin",
+            &mut p,
+            payload.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .expect("create_file");
+        EditableFilesystem::sync_metadata(&mut fs).expect("sync");
+        let floor = fs.last_data_byte().expect("floor");
+        drop(fs);
+
+        cur.set_position(0);
+        // Pick a target well below the floor.
+        let target_bytes = floor.saturating_sub(8 * bs);
+        let res = resize_sfs_in_place(&mut cur, 0, target_bytes, &mut |_| {});
+        assert!(
+            res.is_err(),
+            "shrink below floor should error, got: {:?}",
+            res
+        );
+    }
+
+    #[test]
+    fn sfs_resize_grow_round_trip() {
+        // Format a small SFS volume, write a file, grow the volume by a
+        // few hundred blocks (within the existing bitmap's capacity),
+        // reopen, verify the file survives and the volume reports the
+        // new total.
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+
+        let bs: u64 = 512;
+        // 4096 blocks @ 512 = 2 MiB. With bs=512, one bitmap block covers
+        // (512-12)/4 * 32 = 4000 bits, so a 4096-block volume has 2 bitmap
+        // blocks and capacity for up to 8000 blocks total without extending
+        // the bitmap chain. Grow target: 6000 blocks (~3 MiB).
+        let img = create_blank_sfs(4096, "GrowRT").expect("format");
+        let mut backing: Vec<u8> = img;
+        // Pad backing buffer to fit the post-grow volume.
+        backing.resize(6000 * bs as usize, 0);
+
+        let mut cur = std::io::Cursor::new(&mut backing);
+        let mut fs = SfsFilesystem::open(&mut cur, 0).expect("open");
+        let root = fs.root().expect("root");
+        let payload = b"Survives grow.\n".to_vec();
+        let mut p = std::io::Cursor::new(&payload);
+        fs.create_file(
+            &root,
+            "g.txt",
+            &mut p,
+            payload.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .expect("create_file");
+        EditableFilesystem::sync_metadata(&mut fs).expect("sync");
+        drop(fs);
+
+        cur.set_position(0);
+        let mut log_lines: Vec<String> = Vec::new();
+        resize_sfs_in_place(&mut cur, 0, 6000 * bs, &mut |s| {
+            log_lines.push(s.to_string())
+        })
+        .expect("grow");
+        assert!(
+            log_lines.iter().any(|l| l.contains("grew")),
+            "expected a grow log line, got: {:?}",
+            log_lines
+        );
+
+        cur.set_position(0);
+        let mut fs2 = SfsFilesystem::open(&mut cur, 0).expect("reopen grown");
+        let new_root = fs2.root.clone();
+        assert_eq!(new_root.totalblocks, 6000);
+        let root2 = fs2.root().expect("root2");
+        let kids = fs2.list_directory(&root2).expect("list");
+        let f = kids
+            .iter()
+            .find(|c| c.name == "g.txt")
+            .expect("file should survive grow");
+        let data = fs2.read_file(f, payload.len() * 2).expect("read");
+        assert_eq!(data, payload);
+        drop(fs2);
+        // Sanity: new tail blocks should now be free.
+        let bm = read_bitmap_raw(&mut cur, 0, &new_root).expect("bm");
+        for blk in 4096..5999u32 {
+            let byte = bm[(blk / 8) as usize];
+            let bit_set = (byte >> (blk % 8)) & 1 == 1;
+            assert!(bit_set, "block {blk} should be free in the grown bitmap");
+        }
+        // New backup root should be marked allocated.
+        let backup = 5999u32;
+        let byte = bm[(backup / 8) as usize];
+        let bit_set = (byte >> (backup % 8)) & 1 == 1;
+        assert!(
+            !bit_set,
+            "new backup root block {backup} should be allocated"
+        );
+    }
+
+    #[test]
+    fn sfs_resize_refuses_grow_past_bitmap_capacity() {
+        // A 4096-block volume has 2 bitmap blocks covering 8000 blocks.
+        // Asking to grow to 8001+ blocks would need a 3rd bitmap block,
+        // which Phase S.2 refuses.
+        let bs: u64 = 512;
+        let img = create_blank_sfs(4096, "TooBig").expect("format");
+        let mut backing = img;
+        backing.resize(10000 * bs as usize, 0);
+        let mut cur = std::io::Cursor::new(&mut backing);
+        let res = resize_sfs_in_place(&mut cur, 0, 10000 * bs, &mut |_| {});
+        assert!(res.is_err(), "grow past bitmap capacity should fail");
+        let msg = res.unwrap_err().to_string();
+        assert!(
+            msg.contains("bitmap block") || msg.contains("Phase S.3"),
+            "expected bitmap-capacity error message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn sfs_resize_skips_non_sfs() {
+        // A buffer with non-SFS bytes at sector 0 should be a no-op.
+        let mut buf = vec![0u8; 64 * 1024];
+        buf[0..4].copy_from_slice(b"NTFS");
+        let mut cur = std::io::Cursor::new(&mut buf);
+        let mut messages: Vec<String> = Vec::new();
+        resize_sfs_in_place(&mut cur, 0, 32 * 1024, &mut |s| {
+            messages.push(s.to_string())
+        })
+        .expect("non-sfs should be a clean skip");
+        assert!(
+            messages.is_empty() || !messages.iter().any(|m| m.contains("shrunk")),
+            "non-SFS resize should not log a shrink: {:?}",
+            messages
         );
     }
 

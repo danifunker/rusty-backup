@@ -60,6 +60,7 @@ pub struct OrphanedEntry {
 }
 
 /// Report from a repair operation.
+#[derive(Debug)]
 pub struct RepairReport {
     /// Descriptions of successfully applied fixes.
     pub fixes_applied: Vec<String>,

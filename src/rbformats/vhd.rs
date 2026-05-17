@@ -418,7 +418,18 @@ pub fn export_whole_disk_vhd(
             File::open(source_path)
                 .with_context(|| format!("failed to open {}", source_path.display()))?,
         );
-        if super::detect_raw_apm(&mut probe_reader).is_some() {
+        let is_apm = super::detect_raw_apm(&mut probe_reader).is_some();
+        let is_rdb = if is_apm {
+            false
+        } else {
+            // Re-probe — detect_raw_apm consumed/seeked the reader.
+            let mut probe2 = BufReader::new(
+                File::open(source_path)
+                    .with_context(|| format!("failed to open {}", source_path.display()))?,
+            );
+            super::detect_raw_rdb(&mut probe2).is_some()
+        };
+        if is_apm || is_rdb {
             let file_size = std::fs::metadata(source_path)?.len();
             // Strip trailing VHD footer if source is itself a VHD file.
             let source_data_size = {
@@ -446,25 +457,40 @@ pub fn export_whole_disk_vhd(
                 .open(dest_path)
                 .with_context(|| format!("failed to create {}", dest_path.display()))?;
 
-            total_written = super::reconstruct_raw_apm_disk(
-                &mut reader,
-                source_data_size,
-                &mut file,
-                partition_sizes,
-                &mut progress_cb,
-                &cancel_check,
-                &mut log_cb,
-            )?;
+            total_written = if is_apm {
+                super::reconstruct_raw_apm_disk(
+                    &mut reader,
+                    source_data_size,
+                    &mut file,
+                    partition_sizes,
+                    &mut progress_cb,
+                    &cancel_check,
+                    &mut log_cb,
+                )?
+            } else {
+                super::reconstruct_raw_rdb_disk(
+                    &mut reader,
+                    source_data_size,
+                    &mut file,
+                    partition_sizes,
+                    Some(source_path),
+                    &mut progress_cb,
+                    &cancel_check,
+                    &mut log_cb,
+                )?
+            };
 
             let footer = build_vhd_footer(total_written);
             file.write_all(&footer)
                 .context("failed to write VHD footer")?;
             file.flush()?;
 
+            let table_kind = if is_apm { "APM" } else { "RDB" };
             log_cb(&format!(
-                "VHD export complete: {} ({} data bytes + 512 byte footer, APM reconstructed)",
+                "VHD export complete: {} ({} data bytes + 512 byte footer, {} reconstructed)",
                 dest_path.display(),
                 total_written,
+                table_kind,
             ));
             return Ok(());
         }

@@ -163,6 +163,7 @@ pub fn unix_entry_from_inode(
         link_target_cnid: None,
         amiga_protection: None,
         amiga_comment: None,
+        amiga_date: None,
     }
 }
 
