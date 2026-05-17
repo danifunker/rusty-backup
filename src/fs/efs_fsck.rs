@@ -80,9 +80,7 @@ impl Builder {
 /// Run the verifier. Requires read-only access; the editable surface
 /// `R: Read + Write + Seek + Send` works fine here because all
 /// methods used are inherited from the read-only impl.
-pub fn fsck_efs<R: Read + Seek + Send>(
-    fs: &mut EfsFilesystem<R>,
-) -> Result<FsckResult, FilesystemError> {
+pub fn fsck_efs<R: Read + Seek>(fs: &mut EfsFilesystem<R>) -> Result<FsckResult, FilesystemError> {
     let mut b = Builder::new();
     let sb = fs.sb_clone();
 
@@ -238,7 +236,7 @@ fn check_geometry(sb: &EfsSuperblock, b: &mut Builder) {
     }
 }
 
-fn check_replica<R: Read + Seek + Send>(
+fn check_replica<R: Read + Seek>(
     fs: &mut EfsFilesystem<R>,
     primary: &EfsSuperblock,
     b: &mut Builder,

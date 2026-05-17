@@ -19,6 +19,59 @@ use byteorder::ByteOrder;
 use super::efs::{EfsFilesystem, EFS_DIRECTEXTENTS_MAX};
 use super::filesystem::{EditableFilesystem, FilesystemError};
 
+/// Unified entry point matching the `resize_filesystem_for` dispatch
+/// pattern: probe the EFS magic at sector 1 of the partition, and if
+/// present, route to grow_efs or shrink_efs_conservative based on the
+/// requested size. Non-EFS partitions are ignored (returns Ok), so
+/// this is safe to call alongside the other filesystem resize hooks.
+///
+/// Wraps the EFS-specific `FilesystemError` as an `anyhow::Error` so
+/// the function fits the common signature.
+pub fn resize_efs_in_place(
+    file: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    new_size_bytes: u64,
+    log: &mut impl FnMut(&str),
+) -> anyhow::Result<()> {
+    // Probe the primary superblock for the EFS magic before we
+    // commit to running a real resize. `EfsFilesystem::open` already
+    // validates magic; on mismatch we silently bail (this lets the
+    // unified `resize_filesystem_for` call every filesystem's hook
+    // without each one needing to know the partition type).
+    use std::io::SeekFrom;
+    file.seek(SeekFrom::Start(partition_offset + 512))?;
+    let mut probe = [0u8; 32];
+    if file.read_exact(&mut probe).is_err() {
+        return Ok(());
+    }
+    let magic = u32::from_be_bytes([probe[28], probe[29], probe[30], probe[31]]);
+    if magic != 0x0007_2959 && magic != 0x0007_295A {
+        return Ok(());
+    }
+
+    let new_size_blocks = (new_size_bytes / 512) as u32;
+    // Open just to read the current size; we'll re-open inside the
+    // grow/shrink path so they own the writable handle for the full
+    // mutation.
+    let cur_size = {
+        let mut fs = EfsFilesystem::open(&mut *file, partition_offset)
+            .map_err(|e| anyhow::anyhow!("EFS resize: {e}"))?;
+        fs.sb_clone().fs_size
+    };
+    if new_size_blocks == cur_size {
+        log("EFS resize: target equals current size, no-op");
+        return Ok(());
+    }
+    let result = if new_size_blocks > cur_size {
+        grow_efs(file, partition_offset, new_size_blocks, log)
+    } else {
+        shrink_efs_conservative(file, partition_offset, new_size_blocks, log)
+    };
+    result
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("EFS resize: {e}"))
+}
+
 /// Grow an EFS volume in place to `new_size_blocks` (512-byte blocks).
 /// Returns the new size in blocks on success. Errors when:
 ///   - `new_size_blocks <= old_size` (no growth requested).
@@ -35,7 +88,7 @@ use super::filesystem::{EditableFilesystem, FilesystemError};
 /// preserve N and write the new replica at `new_size_blocks + N`.
 /// The old replica block becomes orphaned but harmless — it's outside
 /// the new bitmap region by construction.
-pub fn grow_efs<R: Read + Write + Seek + Send>(
+pub fn grow_efs<R: Read + Write + Seek>(
     reader: R,
     partition_offset: u64,
     new_size_blocks: u32,
@@ -140,7 +193,7 @@ pub fn grow_efs<R: Read + Write + Seek + Send>(
         result.stats.files_checked, result.stats.directories_checked
     ));
 
-    fs.sync_metadata()?;
+    fs.do_sync_metadata()?;
     log("EFS grow: committed new superblock pair");
     Ok(new_size_blocks)
 }
@@ -157,7 +210,7 @@ pub fn grow_efs<R: Read + Write + Seek + Send>(
 /// This is the resize counterpart most useful during restore: pick a
 /// smaller partition, EFS shrinks itself to the floor or beyond if
 /// the user picked a custom size at or above the floor.
-pub fn shrink_efs_conservative<R: Read + Write + Seek + Send>(
+pub fn shrink_efs_conservative<R: Read + Write + Seek>(
     reader: R,
     partition_offset: u64,
     new_size_blocks: u32,
@@ -233,7 +286,7 @@ pub fn shrink_efs_conservative<R: Read + Write + Seek + Send>(
         result.stats.files_checked, result.stats.directories_checked
     ));
 
-    fs.sync_metadata()?;
+    fs.do_sync_metadata()?;
     log("EFS shrink: committed new superblock pair");
     Ok(new_size_blocks)
 }
@@ -241,7 +294,7 @@ pub fn shrink_efs_conservative<R: Read + Write + Seek + Send>(
 /// Compute the conservative shrink floor: 1 + highest block claimed
 /// by any in-use inode. This is the smallest `new_size_blocks` value
 /// that preserves every allocated extent without relocation.
-pub fn compute_conservative_floor<R: Read + Seek + Send>(
+pub fn compute_conservative_floor<R: Read + Seek>(
     fs: &mut EfsFilesystem<R>,
 ) -> Result<u32, FilesystemError> {
     let total = fs.total_inodes_readonly();

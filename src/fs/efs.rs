@@ -324,7 +324,7 @@ impl EfsInode {
 /// Once loaded for mutation it stays in `staged_bitmap`; `sync_metadata`
 /// flushes it. Inode and dirblock writes go through to disk
 /// immediately (single 512-byte RMW each — cheap, no batching upside).
-pub struct EfsFilesystem<R: Read + Seek + Send> {
+pub struct EfsFilesystem<R: Read + Seek> {
     reader: R,
     partition_offset: u64,
     sb: EfsSuperblock,
@@ -334,7 +334,7 @@ pub struct EfsFilesystem<R: Read + Seek + Send> {
     sb_dirty: bool,
 }
 
-impl<R: Read + Seek + Send> EfsFilesystem<R> {
+impl<R: Read + Seek> EfsFilesystem<R> {
     /// Open an EFS filesystem at the given byte offset within `reader`.
     pub fn open(mut reader: R, partition_offset: u64) -> Result<Self, FilesystemError> {
         // Superblock lives at sector 1 of the partition. Read a full
@@ -514,7 +514,7 @@ impl<R: Read + Seek + Send> EfsFilesystem<R> {
 /// the existing 1-bits. Block 0 (volume header) and block 1 (primary
 /// SB) are also marked in-use by convention.
 #[allow(dead_code)] // wired up across EFS Slices 3–8
-impl<R: Read + Write + Seek + Send> EfsFilesystem<R> {
+impl<R: Read + Write + Seek> EfsFilesystem<R> {
     /// Lazy-load the free-space bitmap into `staged_bitmap` and return
     /// a mutable reference. Subsequent calls return the staged copy
     /// (so mutations accumulate). `sync_metadata` flushes it.
@@ -1025,6 +1025,22 @@ impl<R: Read + Write + Seek + Send> EfsFilesystem<R> {
         Ok(None)
     }
 
+    /// Inherent flush — same body as the trait `sync_metadata`, but
+    /// available on the `R: Read + Write + Seek` bound (no Send).
+    /// The resize entry points need to call this without forcing
+    /// Send up the dispatch chain.
+    pub(crate) fn do_sync_metadata(&mut self) -> Result<(), FilesystemError> {
+        if let Some(bm) = self.staged_bitmap.take() {
+            self.write_bitmap(&bm)?;
+            self.staged_bitmap = Some(bm);
+        }
+        if self.sb_dirty {
+            self.write_superblock_pair()?;
+            self.sb_dirty = false;
+        }
+        Ok(())
+    }
+
     /// Write the primary superblock (sector 1) AND the replica
     /// (`sb.replsb`). Both are written from the in-memory `self.sb`.
     /// The primary write is the commit point — callers should
@@ -1307,18 +1323,7 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
     }
 
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
-        // Flush the staged bitmap if it was loaded.
-        if let Some(bm) = self.staged_bitmap.take() {
-            self.write_bitmap(&bm)?;
-            // Put it back so subsequent edits in the same session
-            // reuse the warm copy.
-            self.staged_bitmap = Some(bm);
-        }
-        if self.sb_dirty {
-            self.write_superblock_pair()?;
-            self.sb_dirty = false;
-        }
-        Ok(())
+        self.do_sync_metadata()
     }
 
     fn free_space(&mut self) -> Result<u64, FilesystemError> {
@@ -1640,6 +1645,15 @@ impl<R: Read + Seek + Send> Filesystem for EfsFilesystem<R> {
     fn used_size(&self) -> u64 {
         // No allocation summary parsed yet; report total for now.
         self.total_size()
+    }
+
+    fn last_data_byte(&mut self) -> Result<u64, FilesystemError> {
+        // Conservative floor: 1 + highest block claimed by any in-use
+        // inode. Multiplied to bytes for the caller. This drives the
+        // shrink-to-minimum picker in the GUI and the restore-flow
+        // resize plan.
+        let floor_blocks = super::efs_resize::compute_conservative_floor(self)?;
+        Ok(floor_blocks as u64 * EFS_BLOCKSIZE)
     }
 
     fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {

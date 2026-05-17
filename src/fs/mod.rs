@@ -101,6 +101,7 @@ pub fn resize_filesystem_for(
     sfs::resize_sfs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     pfs3::resize_pfs3_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     affs::resize_affs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
+    efs_resize::resize_efs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     Ok(())
 }
 
@@ -784,7 +785,8 @@ pub fn is_expensive_minimum(partition_type: u8, partition_type_string: Option<&s
         }
         return matches!(s, "Apple_HFS" | "Apple_HFSX" | "Apple_UNIX_SVR2" | "Linux");
     }
-    matches!(partition_type, 0xAF | 0x83 | 0xA8)
+    // 0xA1 (SGI EFS): conservative floor requires an inode-table walk.
+    matches!(partition_type, 0xAF | 0x83 | 0xA8 | 0xA1)
 }
 
 /// Compute the minimum size for a partition, optionally gated behind an
