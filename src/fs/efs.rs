@@ -21,10 +21,13 @@ const EFS_BLOCKSIZE: u64 = 512;
 const EFS_INODESIZE: u64 = 128;
 const EFS_INODES_PER_BLOCK: u64 = EFS_BLOCKSIZE / EFS_INODESIZE; // 4
 const EFS_DIRECTEXTENTS: usize = 12;
+/// Public alias of the 12-extent hard cap. Used by the fsck verifier
+/// and any other cross-module callers.
+pub const EFS_DIRECTEXTENTS_MAX: usize = EFS_DIRECTEXTENTS;
 /// On-disk size of the EFS superblock, per IRIX `struct efs_super` (with
 /// the implicit 2-byte natural-alignment pad between `fs_dirty` and
 /// `fs_time`). 92 bytes; the surrounding 512-byte sector is zero-padded.
-const EFS_SUPERBLOCK_SIZE: usize = 92;
+pub const EFS_SUPERBLOCK_SIZE: usize = 92;
 
 const EFS_MAGIC_OLD: u32 = 0x00072959;
 const EFS_MAGIC_NEW: u32 = 0x0007295A;
@@ -224,7 +227,7 @@ impl EfsInode {
         }
     }
 
-    fn is_dir(&self) -> bool {
+    pub(crate) fn is_dir(&self) -> bool {
         (self.mode & 0o170000) == 0o040000
     }
 
@@ -393,6 +396,53 @@ impl<R: Read + Seek + Send> EfsFilesystem<R> {
         let mut ino_buf = [0u8; 128];
         ino_buf.copy_from_slice(&block[in_block..in_block + 128]);
         Ok(EfsInode::parse(inum, &ino_buf))
+    }
+
+    /// Clone the in-memory superblock. Used by fsck as a stable
+    /// snapshot of the geometry before the iteration begins.
+    pub(crate) fn sb_clone(&self) -> EfsSuperblock {
+        self.sb.clone()
+    }
+
+    /// Read the bitmap via the read-only path. Used by fsck.
+    /// Distinct name from the mutating `read_bitmap` so the type
+    /// system doesn't accidentally pull in the editable bound.
+    pub(crate) fn read_bitmap_readonly(&mut self) -> Result<Vec<u8>, FilesystemError> {
+        let bmsize = self.sb.bmsize as usize;
+        if bmsize == 0 {
+            return Err(FilesystemError::InvalidData("EFS bitmap size is 0".into()));
+        }
+        let sectors = bmsize.div_ceil(EFS_BLOCKSIZE as usize);
+        let mut buf = vec![0u8; sectors * EFS_BLOCKSIZE as usize];
+        let off = self.partition_offset + self.effective_bmblock() as u64 * EFS_BLOCKSIZE;
+        read_at_aligned(
+            &mut self.reader,
+            off,
+            (sectors * EFS_BLOCKSIZE as usize) as u64,
+            &mut buf,
+        )?;
+        buf.truncate(bmsize);
+        Ok(buf)
+    }
+
+    /// Total inodes the volume can hold. Available on the read-only
+    /// surface for the fsck verifier (the editable copy lives on the
+    /// `R: Read + Write + Seek` impl).
+    pub(crate) fn total_inodes_readonly(&self) -> u32 {
+        self.sb.ncg as u32 * self.sb.cgisize as u32 * EFS_INODES_PER_BLOCK as u32
+    }
+
+    /// Read an inode without the editable bound. Reused by fsck.
+    pub(crate) fn read_inode_readonly(&mut self, inum: u32) -> Result<EfsInode, FilesystemError> {
+        self.read_inode(inum)
+    }
+
+    /// Read the replica superblock from sb.replsb. Used by fsck.
+    pub(crate) fn read_replica_superblock(&mut self) -> Result<EfsSuperblock, FilesystemError> {
+        let replica_off = self.partition_offset + self.sb.replsb as u64 * EFS_BLOCKSIZE;
+        let mut sector = [0u8; EFS_BLOCKSIZE as usize];
+        read_at_aligned(&mut self.reader, replica_off, EFS_BLOCKSIZE, &mut sector)?;
+        EfsSuperblock::parse(&sector)
     }
 
     /// Resolve the effective disk-block number of the free-space
@@ -1579,6 +1629,10 @@ impl<R: Read + Seek + Send> Filesystem for EfsFilesystem<R> {
 
     fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
         validate_name(name.as_bytes())
+    }
+
+    fn fsck(&mut self) -> Option<Result<super::fsck::FsckResult, FilesystemError>> {
+        Some(super::efs_fsck::fsck_efs(self))
     }
 }
 
