@@ -404,6 +404,21 @@ impl<R: Read + Seek + Send> EfsFilesystem<R> {
         self.sb.clone()
     }
 
+    /// Replace the in-memory superblock and mark it dirty so the next
+    /// `sync_metadata` writes the pair. Used by the grow / shrink
+    /// paths in `efs_resize`.
+    pub(crate) fn set_sb(&mut self, new_sb: EfsSuperblock) {
+        self.sb = new_sb;
+        self.sb_dirty = true;
+    }
+
+    /// Unwrap to the underlying reader. Used by tests to round-trip
+    /// the in-memory image through a re-open without giving up the
+    /// privacy of `reader`.
+    pub fn reader_into_inner(self) -> R {
+        self.reader
+    }
+
     /// Read the bitmap via the read-only path. Used by fsck.
     /// Distinct name from the mutating `read_bitmap` so the type
     /// system doesn't accidentally pull in the editable bound.

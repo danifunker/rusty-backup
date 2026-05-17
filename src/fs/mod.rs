@@ -4,6 +4,7 @@ pub mod affs_fsck;
 pub mod btrfs;
 pub mod efs;
 pub mod efs_fsck;
+pub mod efs_resize;
 pub mod entry;
 pub mod exfat;
 pub mod ext;
