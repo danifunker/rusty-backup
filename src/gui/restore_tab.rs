@@ -114,9 +114,16 @@ pub struct RestoreTab {
     /// is fixed.
     expand_disk_enabled: bool,
     /// How much free space to leave at the end of the target image, in MiB.
-    /// Mode A only: partition table stays at original layout; the trailing
-    /// region is unallocated and the user partitions it in their guest OS.
+    /// In Mode A the trailing region is unallocated and the user partitions
+    /// it in their guest OS; in Mode B the last partition is extended over
+    /// it so only a filesystem-side grow tool (xfs_growfs, resize2fs, ...)
+    /// is needed.
     expand_free_space_mib: u32,
+    /// True when the user chose "Extend last partition automatically"
+    /// (Mode B). Forces the last partition's restore size to FillRemaining
+    /// at restore-config build time. False is Mode A (the recommended
+    /// default).
+    expand_extend_last_partition: bool,
 
     // --- New Disk mode state ---
     /// Table type for new disk
@@ -167,6 +174,7 @@ impl Default for RestoreTab {
             nd_target_is_device: true,
             expand_disk_enabled: false,
             expand_free_space_mib: 0,
+            expand_extend_last_partition: false,
         }
     }
 }
@@ -475,6 +483,31 @@ impl RestoreTab {
                             partition::format_size(new_total_bytes),
                         ));
                     });
+
+                    // Mode A vs Mode B radio.
+                    ui.add_space(4.0);
+                    ui.radio_value(
+                        &mut self.expand_extend_last_partition,
+                        false,
+                        "Leave as unpartitioned free space (recommended)",
+                    )
+                    .on_hover_text(
+                        "Mode A: partition table stays unchanged; the trailing region is \
+                         unallocated. After restore, run your OS's partitioner to extend or \
+                         add a partition, then your filesystem's grow tool. Works for any \
+                         filesystem on any OS.",
+                    );
+                    ui.radio_value(
+                        &mut self.expand_extend_last_partition,
+                        true,
+                        "Extend last partition automatically",
+                    )
+                    .on_hover_text(
+                        "Mode B: the last partition is sized to absorb the new free space \
+                         during restore (equivalent to picking 'Fill' for the last partition \
+                         in the size table below). After restore, only the filesystem-side \
+                         grow tool (xfs_growfs, resize2fs, ...) is needed in the guest OS.",
+                    );
 
                     // Visualization: current vs after PartitionBar pair.
                     self.show_expand_preview_bars(ui, source_size_bytes);
@@ -1157,12 +1190,23 @@ impl RestoreTab {
         ));
         let mut after_segments = segments;
         if added_bytes > 0 {
-            after_segments.push(Segment {
-                label: String::new(),
-                fs: String::new(),
-                size_bytes: added_bytes,
-                kind: SegmentKind::Free,
-            });
+            if self.expand_extend_last_partition {
+                // Mode B: the last partition absorbs the new free space.
+                // Show this by growing its size_bytes; the bar renders the
+                // last segment longer in its own color, signalling "this
+                // partition will be larger after restore."
+                if let Some(last) = after_segments.last_mut() {
+                    last.size_bytes = last.size_bytes.saturating_add(added_bytes);
+                }
+            } else {
+                // Mode A: a separate gray Free segment at the end.
+                after_segments.push(Segment {
+                    label: String::new(),
+                    fs: String::new(),
+                    size_bytes: added_bytes,
+                    kind: SegmentKind::Free,
+                });
+            }
         }
         PartitionBar {
             segments: after_segments,
@@ -1413,12 +1457,16 @@ impl RestoreTab {
                     return;
                 }
             };
-            let size = self
+            let base = self
                 .backup_metadata
                 .as_ref()
                 .map(|m| m.source_size_bytes)
                 .or_else(|| self.clonezilla_image.as_ref().map(|c| c.source_size_bytes))
                 .unwrap_or(0);
+            // Add the "Add free space for in-OS expansion" amount so the
+            // target image is sized for both the original layout and the
+            // requested trailing free space (Phase 2 of disk_expansion).
+            let size = base.saturating_add(self.expand_free_space_bytes());
             (path, false, size)
         };
 
@@ -1430,28 +1478,43 @@ impl RestoreTab {
             }
         };
 
+        // Mode B of the disk-expansion feature: when "Extend last partition
+        // automatically" is selected alongside an image-file target, force
+        // the last partition's size to FillRemaining so the restore engine
+        // grows it over the trailing free space. Mode A (the default) skips
+        // this — the trailing region stays unallocated.
+        let last_idx = self.partition_configs.last().map(|c| c.index);
+        let mode_b_active =
+            self.expand_disk_enabled && self.expand_extend_last_partition && !self.target_is_device;
+
         let partition_sizes: Vec<RestorePartitionSize> = self
             .partition_configs
             .iter()
             .map(|cfg| RestorePartitionSize {
                 index: cfg.index,
-                size_choice: match cfg.choice {
-                    SizeMode::Original => RestoreSizeChoice::Original,
-                    SizeMode::Minimum => {
-                        // Pass the concrete minimum size so layout calculation
-                        // doesn't need to re-derive it (especially for Clonezilla
-                        // where the partclone header has the real used size).
-                        RestoreSizeChoice::Custom(cfg.minimum_size)
+                size_choice: if mode_b_active && Some(cfg.index) == last_idx {
+                    RestoreSizeChoice::FillRemaining
+                } else {
+                    match cfg.choice {
+                        SizeMode::Original => RestoreSizeChoice::Original,
+                        SizeMode::Minimum => {
+                            // Pass the concrete minimum size so layout calculation
+                            // doesn't need to re-derive it (especially for Clonezilla
+                            // where the partclone header has the real used size).
+                            RestoreSizeChoice::Custom(cfg.minimum_size)
+                        }
+                        SizeMode::MinPlus20 => {
+                            RestoreSizeChoice::Custom(cfg.choice.effective_size(
+                                cfg.original_size,
+                                cfg.minimum_size,
+                                cfg.custom_size_mib,
+                            ))
+                        }
+                        SizeMode::Custom => {
+                            RestoreSizeChoice::Custom(cfg.custom_size_mib as u64 * 1024 * 1024)
+                        }
+                        SizeMode::FillRemaining => RestoreSizeChoice::FillRemaining,
                     }
-                    SizeMode::MinPlus20 => RestoreSizeChoice::Custom(cfg.choice.effective_size(
-                        cfg.original_size,
-                        cfg.minimum_size,
-                        cfg.custom_size_mib,
-                    )),
-                    SizeMode::Custom => {
-                        RestoreSizeChoice::Custom(cfg.custom_size_mib as u64 * 1024 * 1024)
-                    }
-                    SizeMode::FillRemaining => RestoreSizeChoice::FillRemaining,
                 },
             })
             .collect();
