@@ -17,7 +17,7 @@ use std::io::{Read, Seek, Write};
 use byteorder::ByteOrder;
 
 use super::efs::{EfsFilesystem, EFS_DIRECTEXTENTS_MAX};
-use super::filesystem::{EditableFilesystem, FilesystemError};
+use super::filesystem::FilesystemError;
 
 /// Unified entry point matching the `resize_filesystem_for` dispatch
 /// pattern: probe the EFS magic at sector 1 of the partition, and if
@@ -54,7 +54,7 @@ pub fn resize_efs_in_place(
     // grow/shrink path so they own the writable handle for the full
     // mutation.
     let cur_size = {
-        let mut fs = EfsFilesystem::open(&mut *file, partition_offset)
+        let fs = EfsFilesystem::open(&mut *file, partition_offset)
             .map_err(|e| anyhow::anyhow!("EFS resize: {e}"))?;
         fs.sb_clone().fs_size
     };

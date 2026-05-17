@@ -17,7 +17,7 @@ use byteorder::{BigEndian, ByteOrder};
 use super::entry::{EntryType, FileEntry};
 use super::filesystem::{Filesystem, FilesystemError};
 
-const EFS_BLOCKSIZE: u64 = 512;
+pub(crate) const EFS_BLOCKSIZE: u64 = 512;
 const EFS_INODESIZE: u64 = 128;
 const EFS_INODES_PER_BLOCK: u64 = EFS_BLOCKSIZE / EFS_INODESIZE; // 4
 const EFS_DIRECTEXTENTS: usize = 12;
@@ -450,6 +450,22 @@ impl<R: Read + Seek> EfsFilesystem<R> {
     /// Read an inode without the editable bound. Reused by fsck.
     pub(crate) fn read_inode_readonly(&mut self, inum: u32) -> Result<EfsInode, FilesystemError> {
         self.read_inode(inum)
+    }
+
+    /// Raw 512-byte block read on the read-only surface. Used by
+    /// fsck's connectivity walk to crawl directory blocks without
+    /// requiring the editable bound.
+    pub(crate) fn read_block_readonly(
+        &mut self,
+        bn: u32,
+        out: &mut [u8; EFS_BLOCKSIZE as usize],
+    ) -> Result<(), FilesystemError> {
+        read_at_aligned(
+            &mut self.reader,
+            self.partition_offset + bn as u64 * EFS_BLOCKSIZE,
+            EFS_BLOCKSIZE,
+            out,
+        )
     }
 
     /// Read the replica superblock from sb.replsb. Used by fsck.
@@ -1329,6 +1345,205 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
     fn free_space(&mut self) -> Result<u64, FilesystemError> {
         Ok(self.sb.tfree as u64 * EFS_BLOCKSIZE)
     }
+
+    fn repair(&mut self) -> Result<super::fsck::RepairReport, FilesystemError> {
+        repair_efs(self)
+    }
+}
+
+/// EFS repair driver. Re-runs the verifier, fixes the repairable
+/// findings (replica copy, missing bitmap bits, orphan inodes adopted
+/// into `lost+found/`), then syncs. Returns a report compatible with
+/// the shared `RepairReport` type. Unrepairable errors (geometry
+/// damage, extents past volume, double allocation) are counted in
+/// `unrepairable_count` and left for a future repair pass.
+fn repair_efs<R: Read + Write + Seek + Send>(
+    fs: &mut EfsFilesystem<R>,
+) -> Result<super::fsck::RepairReport, FilesystemError> {
+    let mut report = super::fsck::RepairReport {
+        fixes_applied: Vec::new(),
+        fixes_failed: Vec::new(),
+        unrepairable_count: 0,
+    };
+
+    let result = super::efs_fsck::fsck_efs(fs)?;
+    if result.errors.is_empty() {
+        return Ok(report);
+    }
+
+    // --- Replica fixup ---
+    // Any Replica*Mismatch finding means the replica's bytes don't
+    // match the primary's. write_superblock_pair() rewrites the
+    // replica from the in-memory sb (which was loaded from primary),
+    // so a single sync_metadata after marking the sb dirty handles
+    // all replica mismatches at once.
+    let replica_errs = result
+        .errors
+        .iter()
+        .filter(|e| e.code.starts_with("Replica") && e.code.ends_with("Mismatch"))
+        .count();
+    if replica_errs > 0 {
+        fs.sb_dirty = true;
+        report.fixes_applied.push(format!(
+            "Replica superblock: copied primary fields ({replica_errs} field(s) corrected)"
+        ));
+    }
+
+    // --- Bitmap missing-allocation fixup ---
+    // The verifier reports one error per missing block; parse the
+    // block number out of the message. We do this rather than carry
+    // structured data through FsckIssue because the shared types
+    // don't have an EFS-specific extension slot.
+    let mut bitmap_fixes = 0u32;
+    for issue in result
+        .errors
+        .iter()
+        .filter(|e| e.code == "BitmapMissingAllocation")
+    {
+        let blk = match parse_block_number_from_msg(&issue.message) {
+            Some(b) => b,
+            None => {
+                report.fixes_failed.push(format!(
+                    "BitmapMissingAllocation: could not parse block number from '{}'",
+                    issue.message
+                ));
+                continue;
+            }
+        };
+        let bm = fs.staged_bitmap_mut()?;
+        let by = (blk / 8) as usize;
+        if by >= bm.len() {
+            report.fixes_failed.push(format!(
+                "BitmapMissingAllocation: block {blk} past bitmap end"
+            ));
+            continue;
+        }
+        let bb = 7 - (blk % 8);
+        bm[by] |= 1 << bb;
+        bitmap_fixes += 1;
+    }
+    if bitmap_fixes > 0 {
+        report.fixes_applied.push(format!(
+            "Bitmap: set {bitmap_fixes} missing in-use bit(s) for inode-claimed blocks"
+        ));
+    }
+
+    // --- Orphan adoption into lost+found ---
+    if !result.orphaned_entries.is_empty() {
+        let adopt_count = adopt_orphans_into_lost_found(fs, &result.orphaned_entries, &mut report)?;
+        if adopt_count > 0 {
+            report.fixes_applied.push(format!(
+                "Orphans: adopted {adopt_count} entry/entries into lost+found/"
+            ));
+        }
+    }
+
+    // --- Count unrepairable findings ---
+    report.unrepairable_count = result.errors.iter().filter(|e| !e.repairable).count();
+
+    fs.do_sync_metadata()?;
+    Ok(report)
+}
+
+/// Parse "...block <N>..." out of a fsck issue message. The verifier
+/// emits a stable format so this is a controlled-input parse.
+fn parse_block_number_from_msg(msg: &str) -> Option<u32> {
+    // Format: "inode-allocated block {blk} is not marked in-use in bitmap"
+    let tail = msg.strip_prefix("inode-allocated block ")?;
+    let num_str = tail.split_whitespace().next()?;
+    num_str.parse().ok()
+}
+
+/// Ensure a `lost+found/` directory exists under root and link each
+/// orphan into it as `ino_<inum>`. Returns the number of orphans
+/// actually adopted (may be less than `orphans.len()` if some were
+/// rejected — name collisions get a numeric suffix retry; other
+/// failures are logged in `report.fixes_failed`).
+fn adopt_orphans_into_lost_found<R: Read + Write + Seek + Send>(
+    fs: &mut EfsFilesystem<R>,
+    orphans: &[super::fsck::OrphanedEntry],
+    report: &mut super::fsck::RepairReport,
+) -> Result<u32, FilesystemError> {
+    use super::entry::EntryType;
+    use super::filesystem::EditableFilesystem;
+
+    // Find or create lost+found under root.
+    let root = fs.read_inode(2)?;
+    let lf_inum = match fs.dir_find(&root, b"lost+found")? {
+        Some(inum) => inum,
+        None => {
+            // Build a synthetic root FileEntry the trait method
+            // wants. The fields beyond `location` aren't consulted
+            // by create_directory.
+            let root_entry = super::entry::FileEntry {
+                name: "/".into(),
+                path: "/".into(),
+                entry_type: EntryType::Directory,
+                size: 0,
+                location: 2,
+                modified: None,
+                type_code: None,
+                creator_code: None,
+                symlink_target: None,
+                special_type: None,
+                mode: Some(root.mode as u32),
+                uid: Some(root.uid as u32),
+                gid: Some(root.gid as u32),
+                resource_fork_size: None,
+                aux_type: None,
+                link_target_cnid: None,
+                amiga_protection: None,
+                amiga_comment: None,
+                amiga_date: None,
+            };
+            let lf = fs.create_directory(
+                &root_entry,
+                "lost+found",
+                &super::filesystem::CreateDirectoryOptions::default(),
+            )?;
+            lf.location as u32
+        }
+    };
+
+    // Take the bitmap out so dir_insert can mutate it.
+    let mut bm = match fs.staged_bitmap.take() {
+        Some(b) => b,
+        None => fs.read_bitmap()?,
+    };
+    let res = (|| -> Result<u32, FilesystemError> {
+        let mut adopted: u32 = 0;
+        for orphan in orphans {
+            let inum = orphan.id as u32;
+            let mut lf_inode = fs.read_inode(lf_inum)?;
+            // Avoid name collisions: append a numeric suffix on retry.
+            let mut name = format!("ino_{inum}");
+            let mut suffix = 1u32;
+            while fs.dir_find(&lf_inode, name.as_bytes())?.is_some() {
+                name = format!("ino_{inum}_{suffix}");
+                suffix += 1;
+                if suffix > 1000 {
+                    report.fixes_failed.push(format!(
+                        "Orphan inum {inum}: could not generate unique lost+found name"
+                    ));
+                    continue;
+                }
+            }
+            match fs.dir_insert(&mut lf_inode, &mut bm, name.as_bytes(), inum) {
+                Ok(()) => {
+                    fs.write_inode(&lf_inode)?;
+                    adopted += 1;
+                }
+                Err(e) => {
+                    report.fixes_failed.push(format!(
+                        "Orphan inum {inum}: could not adopt into lost+found: {e}"
+                    ));
+                }
+            }
+        }
+        Ok(adopted)
+    })();
+    fs.staged_bitmap = Some(bm);
+    res
 }
 
 /// One directory entry decoded from a dirblock. `name` is the raw
@@ -2725,6 +2940,122 @@ mod tests {
             !kids.iter().any(|e| e.name == "tmp.bin"),
             "deleted file still present: {kids:?}"
         );
+    }
+
+    #[test]
+    fn repair_fixes_missing_bitmap_bit() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        let img = build_synthetic_with_root_dir();
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        fs.sb.tfree = 200;
+        fs.sb.tinode = 8;
+        let root = fs.root().expect("root");
+        let payload = vec![0xAA; 512];
+        let mut cur = Cursor::new(payload.clone());
+        let entry = fs
+            .create_file(
+                &root,
+                "f.bin",
+                &mut cur,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create");
+        EditableFilesystem::sync_metadata(&mut fs).expect("sync");
+
+        // Reach into the bitmap and clear the bit for the file's
+        // data block — fsck should flag it.
+        let file_ino = fs.read_inode(entry.location as u32).expect("ino");
+        let data_blk = file_ino.extents[0].bn;
+        let mut bm = fs.read_bitmap().expect("bm");
+        let by = (data_blk / 8) as usize;
+        let bb = 7 - (data_blk % 8);
+        bm[by] &= !(1u8 << bb);
+        fs.write_bitmap(&bm).expect("write bm");
+
+        let before = super::super::efs_fsck::fsck_efs(&mut fs).expect("fsck");
+        assert!(
+            before
+                .errors
+                .iter()
+                .any(|e| e.code == "BitmapMissingAllocation"),
+            "expected BitmapMissingAllocation"
+        );
+
+        let report = fs.repair().expect("repair");
+        assert!(
+            report.fixes_applied.iter().any(|s| s.contains("Bitmap")),
+            "expected bitmap fix, got: {:?}",
+            report
+        );
+        let after = super::super::efs_fsck::fsck_efs(&mut fs).expect("fsck after");
+        assert!(
+            !after
+                .errors
+                .iter()
+                .any(|e| e.code == "BitmapMissingAllocation"),
+            "BitmapMissingAllocation still present after repair: {:?}",
+            after.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn repair_adopts_orphans_into_lost_found() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        let img = build_synthetic_with_root_dir();
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        fs.sb.tfree = 200;
+        fs.sb.tinode = 8;
+        // Create a file (linked into root). Then manually unlink it
+        // from the parent directory without freeing the inode —
+        // simulating fsck-style corruption where the dirent was lost
+        // but the inode body and data blocks survived.
+        let root = fs.root().expect("root");
+        let payload = vec![0xEE; 100];
+        let mut cur = Cursor::new(payload.clone());
+        let orphan_entry = fs
+            .create_file(
+                &root,
+                "orphan",
+                &mut cur,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create");
+        let orphan_inum = orphan_entry.location as u32;
+        let root_inode = fs.read_inode(2).expect("root ino");
+        fs.dir_remove(&root_inode, b"orphan").expect("unlink");
+        EditableFilesystem::sync_metadata(&mut fs).expect("sync");
+
+        // Verify the inode is orphaned: fsck reports OrphanInode.
+        let before = super::super::efs_fsck::fsck_efs(&mut fs).expect("fsck");
+        assert!(
+            before.errors.iter().any(|e| e.code == "OrphanInode"),
+            "expected OrphanInode, got: {:?}",
+            before.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+        assert_eq!(before.orphaned_entries.len(), 1);
+        assert_eq!(before.orphaned_entries[0].id, orphan_inum as u64);
+
+        let report = fs.repair().expect("repair");
+        assert!(
+            report.fixes_applied.iter().any(|s| s.contains("Orphans")),
+            "expected orphan adoption, got: {:?}",
+            report
+        );
+
+        // After repair: lost+found exists under root and contains the orphan.
+        let root2 = fs.read_inode(2).expect("root2");
+        let lf_inum = fs
+            .dir_find(&root2, b"lost+found")
+            .expect("find lf")
+            .expect("lf present");
+        let lf_inode = fs.read_inode(lf_inum).expect("lf ino");
+        let adopted = fs
+            .dir_find(&lf_inode, format!("ino_{orphan_inum}").as_bytes())
+            .expect("find orphan")
+            .expect("adopted present");
+        assert_eq!(adopted, orphan_inum);
     }
 
     #[test]

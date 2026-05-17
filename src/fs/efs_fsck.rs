@@ -22,9 +22,31 @@
 use std::collections::HashSet;
 use std::io::{Read, Seek};
 
-use super::efs::{EfsFilesystem, EfsSuperblock, EFS_DIRECTEXTENTS_MAX};
+use super::efs::{
+    parse_dir_block, EfsFilesystem, EfsSuperblock, EFS_BLOCKSIZE, EFS_DIRECTEXTENTS_MAX,
+};
 use super::filesystem::FilesystemError;
-use super::fsck::{FsckIssue, FsckResult, FsckStats};
+use super::fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry};
+
+/// FsckIssue codes that the EFS `repair()` path knows how to fix.
+/// Issues with codes outside this set are emitted with `repairable =
+/// false` so the GUI can grey out the "Repair" button when none of the
+/// findings are actionable.
+fn is_repairable_code(code: &str) -> bool {
+    matches!(
+        code,
+        "ReplicaFsSizeMismatch"
+            | "ReplicaFirstCgMismatch"
+            | "ReplicaCgfSizeMismatch"
+            | "ReplicaCgiSizeMismatch"
+            | "ReplicaNcgMismatch"
+            | "ReplicaBmsizeMismatch"
+            | "ReplicaBmblockMismatch"
+            | "ReplicaReplsbMismatch"
+            | "BitmapMissingAllocation"
+            | "OrphanInode"
+    )
+}
 
 /// Wraps the boilerplate of building a `FsckResult` so the
 /// per-check closures stay focused on findings.
@@ -34,6 +56,7 @@ struct Builder {
     files_checked: u32,
     dirs_checked: u32,
     extra: Vec<(String, String)>,
+    orphaned: Vec<OrphanedEntry>,
 }
 
 impl Builder {
@@ -44,13 +67,14 @@ impl Builder {
             files_checked: 0,
             dirs_checked: 0,
             extra: Vec::new(),
+            orphaned: Vec::new(),
         }
     }
     fn err(&mut self, code: &str, msg: String) {
         self.errors.push(FsckIssue {
             code: code.into(),
             message: msg,
-            repairable: false,
+            repairable: is_repairable_code(code),
             debug: false,
         });
     }
@@ -63,6 +87,7 @@ impl Builder {
         });
     }
     fn finish(self) -> FsckResult {
+        let repairable = self.errors.iter().any(|e| e.repairable);
         FsckResult {
             errors: self.errors,
             warnings: self.warnings,
@@ -71,8 +96,8 @@ impl Builder {
                 directories_checked: self.dirs_checked,
                 extra: self.extra,
             },
-            repairable: false,
-            orphaned_entries: Vec::new(),
+            repairable,
+            orphaned_entries: self.orphaned,
         }
     }
 }
@@ -198,7 +223,84 @@ pub fn fsck_efs<R: Read + Seek>(fs: &mut EfsFilesystem<R>) -> Result<FsckResult,
         .push(("fs_size_blocks".into(), sb.fs_size.to_string()));
     b.extra.push(("ncg".into(), sb.ncg.to_string()));
 
+    // --- Step 5: connectivity (BFS from root inum 2) ---
+    // Every mode!=0 inode not reachable from the root is an orphan.
+    // The repair path can adopt orphans into a synthetic lost+found
+    // directory under the root.
+    check_connectivity(fs, &mut b)?;
+
     Ok(b.finish())
+}
+
+/// BFS from root inum 2 collecting reachable inums. Any in-use inode
+/// (mode != 0) outside the reachable set is reported as an
+/// `OrphanInode` error and pushed into `orphaned_entries` so the
+/// repair pass can adopt them.
+fn check_connectivity<R: Read + Seek>(
+    fs: &mut EfsFilesystem<R>,
+    b: &mut Builder,
+) -> Result<(), FilesystemError> {
+    use std::collections::VecDeque;
+    let mut reached: HashSet<u32> = HashSet::new();
+    reached.insert(2);
+    let mut queue: VecDeque<u32> = VecDeque::new();
+    queue.push_back(2);
+    while let Some(dir_inum) = queue.pop_front() {
+        let dir = match fs.read_inode_readonly(dir_inum) {
+            Ok(d) => d,
+            Err(_) => continue, // already reported elsewhere
+        };
+        if !dir.is_dir() {
+            continue;
+        }
+        for i in 0..(dir.numextents as usize).min(EFS_DIRECTEXTENTS_MAX) {
+            let ext = dir.extents[i];
+            if ext.length == 0 {
+                continue;
+            }
+            for blk in ext.bn..ext.bn.saturating_add(ext.length as u32) {
+                let mut buf = [0u8; EFS_BLOCKSIZE as usize];
+                if fs.read_block_readonly(blk, &mut buf).is_err() {
+                    continue;
+                }
+                for de in parse_dir_block(&buf) {
+                    if de.name == b"." || de.name == b".." {
+                        continue;
+                    }
+                    if de.inum < 2 {
+                        continue;
+                    }
+                    if reached.insert(de.inum) {
+                        queue.push_back(de.inum);
+                    }
+                }
+            }
+        }
+    }
+
+    let total = fs.total_inodes_readonly();
+    for inum in 2..total {
+        let ino = fs.read_inode_readonly(inum)?;
+        if ino.mode == 0 {
+            continue;
+        }
+        if !reached.contains(&inum) {
+            b.err(
+                "OrphanInode",
+                format!(
+                    "inode {inum} (mode=0o{:o}, size={}) is unreachable from root",
+                    ino.mode, ino.size
+                ),
+            );
+            b.orphaned.push(OrphanedEntry {
+                id: inum as u64,
+                name: format!("ino_{inum}"),
+                is_directory: ino.is_dir(),
+                missing_parent_id: 0,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn check_geometry(sb: &EfsSuperblock, b: &mut Builder) {
@@ -349,6 +451,33 @@ mod tests {
                 .any(|e| e.code == "ReplicaFsSizeMismatch"),
             "expected ReplicaFsSizeMismatch, got: {:?}",
             result.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+        // Repairable flag should propagate through to the aggregate.
+        assert!(result.repairable, "replica mismatch should be repairable");
+    }
+
+    #[test]
+    fn repair_fixes_replica_mismatch() {
+        use super::super::filesystem::EditableFilesystem;
+        let mut img = build_clean_volume();
+        let total_blocks = (img.len() / 512) as u32;
+        let replica_off = (total_blocks as usize - 1) * 512;
+        img[replica_off..replica_off + 4].copy_from_slice(&0xDEADu32.to_be_bytes());
+
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let report = fs.repair().expect("repair");
+        assert!(
+            report.fixes_applied.iter().any(|s| s.contains("Replica")),
+            "expected replica fix applied, got: {:?}",
+            report
+        );
+
+        // Re-running fsck should now report no errors.
+        let after = fsck_efs(&mut fs).expect("fsck after repair");
+        assert!(
+            after.errors.is_empty(),
+            "expected no errors after repair, got: {:?}",
+            after.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
         );
     }
 }
