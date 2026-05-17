@@ -134,6 +134,12 @@ pub struct InspectTab {
     /// When the source is a CHD container, we route every reader through a
     /// fresh `ChdReader` opened from this path. `None` for raw devices/images.
     chd_image_path: Option<PathBuf>,
+    /// Cached total disk size in bytes for the currently-loaded source.
+    /// Filled lazily by `actual_disk_size_bytes()` so the inspect tab's
+    /// disk-layout bar + "Add Partition" enable check don't re-open the
+    /// CHD container on every frame (which makes the UI visibly laggy).
+    /// Cleared whenever the source changes.
+    cached_disk_size: Option<u64>,
     /// Partition table editor popup
     editor_popup: bool,
     /// Partition table editor model state.
@@ -209,6 +215,7 @@ impl Default for InspectTab {
             open_device_file: None,
             open_device_guard: None,
             chd_image_path: None,
+            cached_disk_size: None,
             editor_popup: false,
             editor: PartitionEditor::new(),
             resize_popup: None,
@@ -257,6 +264,7 @@ impl InspectTab {
         self.prev_backup_path = None;
         self.partitions.clear();
         self.partition_table = None;
+        self.cached_disk_size = None;
         self.alignment = None;
         self.browse_view.close();
         self.partition_min_sizes.clear();
@@ -1886,6 +1894,7 @@ impl InspectTab {
         self.partition_table = None;
         self.alignment = None;
         self.partitions.clear();
+        self.cached_disk_size = None;
         self.backup_metadata = None;
         self.last_error = None;
         self.image_format_label = None;
@@ -1905,6 +1914,7 @@ impl InspectTab {
         self.open_device_file = None;
         self.open_device_guard = None;
         self.chd_image_path = None;
+        self.cached_disk_size = None;
         self.single_file_chd_backup_folder = None;
     }
 
@@ -2728,7 +2738,7 @@ impl InspectTab {
         self.show_partition_list(ui, ctx);
     }
 
-    fn show_disk_layout_section(&self, ui: &mut egui::Ui) {
+    fn show_disk_layout_section(&mut self, ui: &mut egui::Ui) {
         if self.partitions.is_empty() {
             return;
         }
@@ -2757,7 +2767,16 @@ impl InspectTab {
     ///
     /// Returns `None` when no source applies (e.g. before inspection has
     /// finished); callers should suppress the trailing-free segment then.
-    fn actual_disk_size_bytes(&self) -> Option<u64> {
+    fn actual_disk_size_bytes(&mut self) -> Option<u64> {
+        if let Some(cached) = self.cached_disk_size {
+            return Some(cached);
+        }
+        let computed = self.compute_actual_disk_size_bytes();
+        self.cached_disk_size = computed;
+        computed
+    }
+
+    fn compute_actual_disk_size_bytes(&self) -> Option<u64> {
         if let Some(meta) = &self.backup_metadata {
             if meta.source_size_bytes > 0 {
                 return Some(meta.source_size_bytes);
