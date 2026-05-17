@@ -54,6 +54,60 @@ VHD export is available from the Inspect tab: produce either a whole-disk
 `.vhd` files, ready to mount in VirtualBox, Hyper-V, or QEMU. See
 `docs/vhd-export.md`.
 
+### Disk expansion workflow
+
+Rusty Backup can grow an existing image so its guest OS sees a bigger
+disk. This is useful for any filesystem the OS can expand at runtime —
+XFS being the motivating case (`xfs_growfs` can only ever grow up to the
+partition boundary, never the disk boundary), but the same workflow
+works for ext, NTFS, FAT, HFS+, exFAT, btrfs, etc.
+
+**Open an existing image and add trailing free space:**
+
+1. Open the image in the **Inspect** tab. Any backup, raw disk image,
+   VHD, or CHD works.
+2. Click **Expand Image…** in the toolbar. Enter how much MiB to add and
+   click Expand. Raw/VHD images grow instantly via `set_len`; CHD images
+   re-encode in a background worker (the CHD hunk layout is fixed at
+   creation, so there's no in-place grow).
+3. Click **Re-inspect** to refresh the partition list. The new trailing
+   region appears as a gray "Free" segment in the **Disk layout** bar.
+4. Either:
+   - Click **Add Partition…** to allocate the free space as a new
+     partition (defaults are pre-filled per partition-table type — XFS
+     for SGI, `0x83` for MBR, Linux Filesystem GUID for GPT,
+     `Apple_HFS` for APM), or
+   - Click **Edit Partition Table…** and bump the last partition's size
+     via the *Size Mode* radios.
+5. Boot the guest OS and run the filesystem's native grow tool
+   (`xfs_growfs /mountpoint`, `resize2fs`, Disk Management's Extend
+   Volume, IRIX `fx` + `xfs_growfs`, …).
+
+**Same workflow during a restore** (useful when the target physical
+disk is larger than the source):
+
+1. **Restore** tab → pick the backup and an image-file target. (The
+   feature is disabled for device targets — physical disk size is
+   fixed.)
+2. Tick **Add free space for in-OS expansion** and enter MiB.
+3. Pick a mode:
+   - **Leave as unpartitioned free space** *(recommended)* — partition
+     table stays unchanged; the guest OS uses its native partitioner
+     plus `xfs_growfs` (or equivalent). Works for any filesystem on
+     any OS.
+   - **Extend last partition automatically** — the last partition is
+     sized to absorb the new free space during restore. After restore,
+     only the filesystem-side grow tool is needed.
+4. The **Current** / **After** disk-layout bar pair shows the planned
+   result before you commit.
+
+**Note on visualisations:** the Disk layout bar appears in five places
+(Inspect, Restore, Resize Partitions, Edit Partition Table, Export Disk
+Image) so what you see is always what'll be written. Partition colours
+cycle through a stable palette; tiny partitions (≤ ~1 MiB) get a
+minimum-width pip so GPT/APM disks with many small partitions stay
+readable.
+
 ## Compatibility
 
 ### Image / backup formats
