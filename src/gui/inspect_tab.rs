@@ -2768,6 +2768,19 @@ impl InspectTab {
                 return Some(cz.source_size_bytes);
             }
         }
+        // For raw .chd image files, the file size on disk is the
+        // *compressed* size — the logical disk seen by partition-table
+        // parsing comes from the CHD header. Use that, otherwise the
+        // trailing-free-space calculation thinks the disk is much smaller
+        // than it actually is and we wrongly disable "Add Partition...".
+        if let Some(chd_path) = &self.chd_image_path {
+            if let Ok(reader) = rusty_backup::rbformats::chd::ChdReader::open(chd_path) {
+                let logical = reader.logical_size();
+                if logical > 0 {
+                    return Some(logical);
+                }
+            }
+        }
         if let Some(path) = &self.image_file_path {
             if let Ok(meta) = std::fs::metadata(path) {
                 let len = meta.len();

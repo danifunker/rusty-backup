@@ -80,14 +80,18 @@ impl ResizePopup {
                     .copied()
                     .unwrap_or(0)
                     .max(512); // at least one sector
-                let size_mib = p.size_bytes / (1024 * 1024);
+                let size_mib = p.size_bytes as f64 / (1024.0 * 1024.0);
                 ResizeEntry {
                     index: p.index,
                     type_name: p.type_name.clone(),
                     original_size: p.size_bytes,
                     minimum_size: min_size,
                     is_extended_container: p.is_extended_container,
-                    new_size_text: format!("{}", size_mib),
+                    // Two-decimal MiB matches the partition editor's display
+                    // and avoids the "new size is silently lower than current"
+                    // bug for partitions whose byte count isn't a clean MiB
+                    // multiple (anything not aligned to 1 MiB).
+                    new_size_text: format!("{:.2}", size_mib),
                 }
             })
             .collect();
@@ -322,17 +326,30 @@ impl ResizePopup {
             if entry.is_extended_container {
                 continue;
             }
-            let new_mib: u64 = match entry.new_size_text.trim().parse() {
-                Ok(v) => v,
-                Err(_) => {
-                    self.plan_error = Some(format!(
-                        "Invalid size for partition {}: '{}'",
-                        entry.index, entry.new_size_text
-                    ));
-                    return;
-                }
+            // Skip the diff entirely when the displayed text still matches
+            // the original-formatted size — same pattern as the partition
+            // editor. The "{:.2}" round-trip otherwise shifts the size by
+            // up to ~5 KiB for partitions whose byte count isn't a clean
+            // MiB multiple, which is enough to push the user's
+            // "click verify with no changes" workflow below the original
+            // size.
+            let orig_size_text = format!("{:.2}", entry.original_size as f64 / (1024.0 * 1024.0));
+            let new_bytes = if entry.new_size_text.trim() == orig_size_text {
+                entry.original_size
+            } else {
+                let new_mib: f64 = match entry.new_size_text.trim().parse() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        self.plan_error = Some(format!(
+                            "Invalid size for partition {}: '{}'",
+                            entry.index, entry.new_size_text
+                        ));
+                        return;
+                    }
+                };
+                let bytes = (new_mib * 1024.0 * 1024.0) as u64;
+                (bytes / 512) * 512
             };
-            let new_bytes = new_mib * 1024 * 1024;
 
             // Validate against minimum
             if entry.minimum_size > 0 && new_bytes < entry.minimum_size {
