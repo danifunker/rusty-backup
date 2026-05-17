@@ -543,11 +543,15 @@ impl<R: Read + Seek> EfsFilesystem<R> {
 /// pulling them into the writable surface.
 ///
 /// Bitmap convention used here: 1 bit per disk block over the range
-/// `[0 .. bmsize * 8)`. **Set bit = block in use**, cleared bit = free.
-/// The bitmap covers the entire volume, with inode-table and reserved
-/// regions force-marked in-use by mkfs_efs; allocation simply respects
-/// the existing 1-bits. Block 0 (volume header) and block 1 (primary
-/// SB) are also marked in-use by convention.
+/// `[0 .. bmsize * 8)`. **Set bit = block FREE**, cleared bit = in use.
+/// This matches the convention used by IRIX `mkfs_efs` on real disks
+/// (verified against a 2 GB SCSI volume — 97%+ of inode-claimed data
+/// blocks have their bitmap bit cleared, ~tfree blocks have it set).
+/// It is opposite to the convention used by FAT/NTFS/exFAT but matches
+/// our Amiga filesystems (AFFS/PFS3/SFS). The bitmap covers the entire
+/// volume, with inode-table and reserved regions force-marked in-use
+/// (bit=0) by mkfs_efs; allocation flips bits from 1→0. Block 0
+/// (volume header) and block 1 (primary SB) are marked in-use (bit=0).
 #[allow(dead_code)] // wired up across EFS Slices 3–8
 impl<R: Read + Write + Seek> EfsFilesystem<R> {
     /// Lazy-load the free-space bitmap into `staged_bitmap` and return
@@ -650,8 +654,9 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
             }
             let byte = (bit / 8) as usize;
             let bit_in_byte = 7 - (bit % 8); // big-endian bit order, MSB first
-            let in_use = (bm[byte] >> bit_in_byte) & 1 == 1;
-            if in_use {
+                                             // set bit = FREE on real IRIX EFS, so a free block is bit==1.
+            let free = (bm[byte] >> bit_in_byte) & 1 == 1;
+            if !free {
                 run_start = None;
                 run_len = 0;
             } else {
@@ -663,11 +668,11 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
                 }
                 if run_len >= want_blocks {
                     let start = run_start.unwrap();
-                    // Mark bits [start..start+want_blocks) as in-use.
+                    // Mark bits [start..start+want_blocks) as in-use (clear).
                     for b in start..start + want_blocks {
                         let by = (b / 8) as usize;
                         let bb = 7 - (b % 8);
-                        bm[by] |= 1 << bb;
+                        bm[by] &= !(1u8 << bb);
                     }
                     return Ok(EfsExtent {
                         magic: 0,
@@ -685,6 +690,7 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
 
     /// Mark a previously-allocated extent as free in the in-memory
     /// bitmap. Caller writes the bitmap back via `write_bitmap`.
+    /// Convention: set bit = free.
     pub(crate) fn free_extent_in_bitmap(bm: &mut [u8], ext: &EfsExtent) {
         let start = ext.bn;
         let len = ext.length as u32;
@@ -694,7 +700,7 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
                 break;
             }
             let bb = 7 - (b % 8);
-            bm[by] &= !(1u8 << bb);
+            bm[by] |= 1u8 << bb;
         }
     }
 
@@ -1447,12 +1453,13 @@ fn repair_efs<R: Read + Write + Seek + Send>(
             continue;
         }
         let bb = 7 - (blk % 8);
-        bm[by] |= 1 << bb;
+        // set bit = free; mark as in-use by CLEARING the bit.
+        bm[by] &= !(1 << bb);
         bitmap_fixes += 1;
     }
     if bitmap_fixes > 0 {
         report.fixes_applied.push(format!(
-            "Bitmap: set {bitmap_fixes} missing in-use bit(s) for inode-claimed blocks"
+            "Bitmap: cleared {bitmap_fixes} stray free bit(s) for inode-claimed blocks"
         ));
     }
 
@@ -2598,14 +2605,18 @@ mod tests {
             checksum: 0,
         };
         sb.write_into(&mut img[sb_off..sb_off + EFS_SUPERBLOCK_SIZE]);
-        // Mark blocks 0, 1 (boot, primary SB), 2 (bitmap), 18..20 (CG 0
-        // inode region) as in-use. Leave everything else free.
+        // Bitmap convention: set bit = free, clear bit = in-use. Fill
+        // the bitmap region with 0xFF (all free), then CLEAR bits for
+        // boot, primary SB, bitmap, CG 0 inode region, and last block.
         let bm_off = 2 * 512;
+        for b in 0..sb.bmsize as usize {
+            img[bm_off + b] = 0xFF;
+        }
         let in_use_blocks = [0u32, 1, 2, 18, 19, total_blocks - 1];
         for b in in_use_blocks {
             let by = (b / 8) as usize;
             let bb = 7 - (b % 8);
-            img[bm_off + by] |= 1 << bb;
+            img[bm_off + by] &= !(1 << bb);
         }
         img
     }
@@ -2616,10 +2627,10 @@ mod tests {
         let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
         let bm = fs.read_bitmap().expect("read bitmap");
         assert_eq!(bm.len(), fs.sb.bmsize as usize);
-        // Block 0 bit must be set; block 100 (well inside the free
-        // region of the synthetic) must be clear.
-        assert!(bm[0] & 0b1000_0000 != 0, "block 0 must be marked in-use");
-        assert!(bm[100 / 8] & (1 << (7 - (100 % 8))) == 0, "block 100 free");
+        // Convention: set bit = free. Block 0 (boot) is in-use so bit
+        // is clear; block 100 (inside free region) has bit set.
+        assert!(bm[0] & 0b1000_0000 == 0, "block 0 must be marked in-use");
+        assert!(bm[100 / 8] & (1 << (7 - (100 % 8))) != 0, "block 100 free");
         // Round-trip: write back and re-read; expect identical bytes.
         let mut bm2 = bm.clone();
         bm2[5] = 0xFF;
@@ -2639,11 +2650,12 @@ mod tests {
         // (block 19 is in-use; 20..23 are free).
         assert_eq!(ext.bn, 20);
         assert_eq!(ext.length, 4);
-        // The bits should now read as in-use.
+        // The bits should now read as in-use (set bit = free, so
+        // in-use means bit is cleared).
         for b in 20..24 {
             let by = (b / 8) as usize;
             let bb = 7 - (b % 8);
-            assert!(bm[by] & (1 << bb) != 0, "block {b} not marked");
+            assert!(bm[by] & (1 << bb) == 0, "block {b} not marked");
         }
         // A second alloc starts past the run we just took.
         let ext2 = EfsFilesystem::<Cursor<Vec<u8>>>::alloc_contiguous_in_bitmap(&mut bm, 2, 20)
@@ -2655,9 +2667,10 @@ mod tests {
     fn alloc_contiguous_errors_when_no_run_fits() {
         // 256-bit bitmap with everything in-use except a single block
         // at index 50 — request for 4 contiguous blocks must fail.
-        let mut bm = vec![0xFFu8; 32];
+        // set bit = free; start fully in-use (all zeros) then set bit 50.
+        let mut bm = vec![0u8; 32];
         let b = 50usize;
-        bm[b / 8] &= !(1 << (7 - (b % 8)));
+        bm[b / 8] |= 1 << (7 - (b % 8));
         let err = EfsFilesystem::<Cursor<Vec<u8>>>::alloc_contiguous_in_bitmap(&mut bm, 4, 0)
             .expect_err("expected DiskFull");
         assert!(matches!(err, FilesystemError::DiskFull(_)), "got {err:?}");
@@ -2665,22 +2678,19 @@ mod tests {
 
     #[test]
     fn free_extent_returns_blocks_to_pool() {
+        // Start fully in-use (set bit = free; all zeros = all in-use).
         let mut bm = vec![0u8; 32];
-        // Mark blocks 8..16 in-use.
         let ext = EfsExtent {
             magic: 0,
             bn: 8,
             length: 8,
             offset: 0,
         };
-        for b in ext.bn..ext.bn + ext.length as u32 {
-            bm[(b / 8) as usize] |= 1 << (7 - (b % 8));
-        }
         EfsFilesystem::<Cursor<Vec<u8>>>::free_extent_in_bitmap(&mut bm, &ext);
         for b in ext.bn..ext.bn + ext.length as u32 {
             let by = (b / 8) as usize;
             let bb = 7 - (b % 8);
-            assert!(bm[by] & (1 << bb) == 0, "block {b} still in-use after free");
+            assert!(bm[by] & (1 << bb) != 0, "block {b} still in-use after free");
         }
     }
 
@@ -2787,12 +2797,15 @@ mod tests {
         };
         sb.write_into(&mut img[sb_off..sb_off + EFS_SUPERBLOCK_SIZE]);
 
-        // Bitmap: mark in-use bits.
+        // Bitmap: set bit = free. Fill with 0xFF, then clear in-use bits.
         let bm_off = 2 * 512;
+        for b in 0..sb.bmsize as usize {
+            img[bm_off + b] = 0xFF;
+        }
         for b in [0u32, 1, 2, 18, 19, 25, total_blocks - 1] {
             let by = (b / 8) as usize;
             let bb = 7 - (b % 8);
-            img[bm_off + by] |= 1 << bb;
+            img[bm_off + by] &= !(1 << bb);
         }
 
         // Root inode (2) at byte (firstcg=18)*512 + 2*128.
@@ -3074,14 +3087,15 @@ mod tests {
             .expect("create");
         EditableFilesystem::sync_metadata(&mut fs).expect("sync");
 
-        // Reach into the bitmap and clear the bit for the file's
-        // data block — fsck should flag it.
+        // Reach into the bitmap and SET the bit for the file's data
+        // block (set bit = free), forging a "free but inode-claimed"
+        // corruption — fsck should flag it as BitmapMissingAllocation.
         let file_ino = fs.read_inode(entry.location as u32).expect("ino");
         let data_blk = file_ino.extents[0].bn;
         let mut bm = fs.read_bitmap().expect("bm");
         let by = (data_blk / 8) as usize;
         let bb = 7 - (data_blk % 8);
-        bm[by] &= !(1u8 << bb);
+        bm[by] |= 1u8 << bb;
         fs.write_bitmap(&bm).expect("write bm");
 
         let before = super::super::efs_fsck::fsck_efs(&mut fs).expect("fsck");

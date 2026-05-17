@@ -209,10 +209,11 @@ pub fn fsck_efs<R: Read + Seek>(fs: &mut EfsFilesystem<R>) -> Result<FsckResult,
     }
 
     if let Some(bm) = bitmap {
-        // Cross-check: every "in use" inode-claimed block should have
-        // its bitmap bit set. (We don't check the reverse — the bitmap
-        // legitimately marks inode-table + reserved regions as in-use
-        // and those don't show up in inode extents.)
+        // EFS bitmap convention: set bit = FREE, clear bit = in use. So
+        // every inode-claimed block should have its bit CLEARED. (We
+        // don't check the reverse: the bitmap legitimately marks
+        // inode-table + reserved regions as in-use (bit=0) too, and
+        // those don't show up in inode extents.)
         for blk in &allocated {
             let byte = (*blk / 8) as usize;
             if byte >= bm.len() {
@@ -227,16 +228,16 @@ pub fn fsck_efs<R: Read + Seek>(fs: &mut EfsFilesystem<R>) -> Result<FsckResult,
                 continue;
             }
             let bit = 7 - (blk % 8);
-            if bm[byte] & (1 << bit) == 0 {
+            if bm[byte] & (1 << bit) != 0 {
                 b.err(
                     "BitmapMissingAllocation",
-                    format!("inode-allocated block {blk} is not marked in-use in bitmap"),
+                    format!("inode-allocated block {blk} is marked free in bitmap"),
                 );
             }
         }
         let set_bits: u32 = bm.iter().map(|b| b.count_ones()).sum();
         b.extra
-            .push(("bitmap_set_bits".into(), set_bits.to_string()));
+            .push(("bitmap_free_bits".into(), set_bits.to_string()));
     } else {
         b.warn("BitmapReadFailed", "could not read bitmap".into());
     }
@@ -427,12 +428,17 @@ mod tests {
         };
         sb.write_into(&mut img[sb_off..sb_off + super::super::efs::EFS_SUPERBLOCK_SIZE]);
 
-        // Bitmap: blocks 0/1/2 + 18/19 (CG 0 inode region) + 25 (root dir) + last block.
+        // Bitmap convention: set bit = free. Fill with 0xFF (all free)
+        // then CLEAR bits for in-use blocks: 0/1/2, 18/19 (CG 0 inode
+        // region), 25 (root dir), and last block.
         let bm_off = 2 * 512;
+        for b in 0..sb.bmsize as usize {
+            img[bm_off + b] = 0xFF;
+        }
         for b in [0u32, 1, 2, 18, 19, 25, total_blocks - 1] {
             let by = (b / 8) as usize;
             let bb = 7 - (b % 8);
-            img[bm_off + by] |= 1 << bb;
+            img[bm_off + by] &= !(1 << bb);
         }
         // Mirror the primary SB into the replica slot.
         let replica_off = (total_blocks as usize - 1) * 512;
