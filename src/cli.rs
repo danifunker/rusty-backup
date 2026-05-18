@@ -19,6 +19,7 @@ use std::path::PathBuf;
 
 use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
 use crate::fs::hfs::{create_blank_hfs_sized, validate_hfs_integrity, HfsFilesystem};
+use crate::partition::apm::Apm;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -53,6 +54,17 @@ pub enum ApiGroup {
         #[command(subcommand)]
         verb: SgiCommand,
     },
+    /// Apple Partition Map (APM) disk operations.
+    Apm {
+        #[command(subcommand)]
+        verb: ApmCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ApmCommand {
+    /// Print the partition map of an APM disk image.
+    Info { image: PathBuf },
 }
 
 #[derive(Subcommand, Debug)]
@@ -93,13 +105,21 @@ pub enum HfsCommand {
         block_size: Option<u32>,
     },
     /// Print volume name, sizes, and counts for an HFS image.
-    Info { image: PathBuf },
+    Info {
+        image: PathBuf,
+        /// APM partition index to open (1-based). If unset and the image is
+        /// an APM disk, the sole Apple_HFS partition is used.
+        #[arg(long)]
+        partition: Option<u32>,
+    },
     /// List a directory inside the HFS volume.
     Ls {
         image: PathBuf,
         /// Mac path (use `/` separators). Defaults to root.
         #[arg(default_value = "/")]
         path: String,
+        #[arg(long)]
+        partition: Option<u32>,
     },
     /// Copy a host file into the HFS volume.
     Put {
@@ -118,6 +138,8 @@ pub enum HfsCommand {
         /// Overwrite an existing entry at the destination path.
         #[arg(long)]
         force: bool,
+        #[arg(long)]
+        partition: Option<u32>,
     },
     /// Pre-allocate a zero-filled file at the given Mac path. Useful for
     /// reserving a results file the boot ROM will fill in.
@@ -132,21 +154,35 @@ pub enum HfsCommand {
         creator: String,
         #[arg(long)]
         force: bool,
+        #[arg(long)]
+        partition: Option<u32>,
     },
     /// Extract an HFS file to the host.
     Get {
         image: PathBuf,
         mac_path: String,
         host_file: PathBuf,
+        #[arg(long)]
+        partition: Option<u32>,
     },
     /// Delete a file from the HFS volume.
-    Rm { image: PathBuf, mac_path: String },
+    Rm {
+        image: PathBuf,
+        mac_path: String,
+        #[arg(long)]
+        partition: Option<u32>,
+    },
     /// Overwrite the 1024-byte boot block region at offset 0. The source
     /// must be at most 1024 bytes and is written verbatim — no padding,
-    /// no HFS B-tree touch.
+    /// no HFS B-tree touch. Operates on the file's byte 0 regardless of
+    /// any APM wrapping.
     PutBoot { image: PathBuf, bb_file: PathBuf },
     /// Run the lightweight HFS integrity check on the image.
-    Validate { image: PathBuf },
+    Validate {
+        image: PathBuf,
+        #[arg(long)]
+        partition: Option<u32>,
+    },
 }
 
 /// Run the parsed CLI and exit. Returns only when nothing matched (which
@@ -157,6 +193,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Api { group } => match group {
             ApiGroup::Hfs { verb } => run_hfs(verb),
             ApiGroup::Sgi { verb } => run_sgi(verb),
+            ApiGroup::Apm { verb } => run_apm(verb),
         },
     }
 }
@@ -169,8 +206,12 @@ fn run_hfs(verb: HfsCommand) -> Result<()> {
             name,
             block_size,
         } => cmd_new(image, &size, &name, block_size),
-        HfsCommand::Info { image } => cmd_info(image),
-        HfsCommand::Ls { image, path } => cmd_ls(image, &path),
+        HfsCommand::Info { image, partition } => cmd_info(image, partition),
+        HfsCommand::Ls {
+            image,
+            path,
+            partition,
+        } => cmd_ls(image, &path, partition),
         HfsCommand::Put {
             image,
             host_file,
@@ -178,6 +219,7 @@ fn run_hfs(verb: HfsCommand) -> Result<()> {
             type_code,
             creator,
             force,
+            partition,
         } => cmd_put(
             image,
             Some(host_file),
@@ -186,6 +228,7 @@ fn run_hfs(verb: HfsCommand) -> Result<()> {
             &creator,
             None,
             force,
+            partition,
         ),
         HfsCommand::PutZero {
             image,
@@ -194,6 +237,7 @@ fn run_hfs(verb: HfsCommand) -> Result<()> {
             type_code,
             creator,
             force,
+            partition,
         } => cmd_put(
             image,
             None,
@@ -202,16 +246,128 @@ fn run_hfs(verb: HfsCommand) -> Result<()> {
             &creator,
             Some(size),
             force,
+            partition,
         ),
         HfsCommand::Get {
             image,
             mac_path,
             host_file,
-        } => cmd_get(image, &mac_path, host_file),
-        HfsCommand::Rm { image, mac_path } => cmd_rm(image, &mac_path),
+            partition,
+        } => cmd_get(image, &mac_path, host_file, partition),
+        HfsCommand::Rm {
+            image,
+            mac_path,
+            partition,
+        } => cmd_rm(image, &mac_path, partition),
         HfsCommand::PutBoot { image, bb_file } => cmd_put_boot(image, bb_file),
-        HfsCommand::Validate { image } => cmd_validate(image),
+        HfsCommand::Validate { image, partition } => cmd_validate(image, partition),
     }
+}
+
+fn run_apm(verb: ApmCommand) -> Result<()> {
+    match verb {
+        ApmCommand::Info { image } => cmd_apm_info(image),
+    }
+}
+
+fn cmd_apm_info(image: PathBuf) -> Result<()> {
+    let mut file = open_image_ro(&image)?;
+    let apm = Apm::parse(&mut file).map_err(|e| anyhow!("parsing APM: {e}"))?;
+    let bs = apm.ddr.block_size as u64;
+    println!(
+        "DDR: block_size={} block_count={} drivers={}",
+        apm.ddr.block_size, apm.ddr.block_count, apm.ddr.driver_count
+    );
+    println!("Map entries: {}", apm.map_entry_count);
+    println!(
+        "{:>3}  {:<24}  {:<24}  {:>10}  {:>10}  {:>10}  status",
+        "idx", "type", "name", "start", "blocks", "bytes"
+    );
+    for (i, e) in apm.entries.iter().enumerate() {
+        println!(
+            "{:>3}  {:<24}  {:<24}  {:>10}  {:>10}  {:>10}  0x{:08x}",
+            i + 1,
+            e.partition_type,
+            e.name,
+            e.start_block,
+            e.block_count,
+            e.size_bytes(bs as u16),
+            e.status
+        );
+    }
+    Ok(())
+}
+
+/// Resolve the byte offset to open as an HFS partition. If the file starts
+/// with an APM signature ("ER"), parse it and pick the requested Apple_HFS
+/// partition (1-based index), or the sole Apple_HFS partition when `partition`
+/// is None. Returns offset=0 (raw HFS at byte 0) when there's no APM. The
+/// optional second element describes the selected APM partition, for logging.
+fn resolve_hfs_offset(
+    file: &mut std::fs::File,
+    partition: Option<u32>,
+) -> Result<(u64, Option<String>)> {
+    let mut sig = [0u8; 2];
+    file.seek(SeekFrom::Start(0))?;
+    if file.read(&mut sig)? < 2 {
+        return Ok((0, None));
+    }
+    let is_apm = sig == [b'E', b'R'];
+    if !is_apm {
+        if partition.is_some() {
+            bail!("--partition specified but image is not an APM disk");
+        }
+        return Ok((0, Some("Partition: raw HFS @ byte 0".to_string())));
+    }
+
+    file.seek(SeekFrom::Start(0))?;
+    let apm = Apm::parse(file).map_err(|e| anyhow!("parsing APM: {e}"))?;
+    let bs = apm.ddr.block_size as u64;
+    if bs == 0 {
+        bail!("APM DDR block_size is 0");
+    }
+
+    let (idx, entry) = match partition {
+        Some(idx) => {
+            if idx == 0 || (idx as usize) > apm.entries.len() {
+                bail!(
+                    "partition index {idx} out of range (have {} entries)",
+                    apm.entries.len()
+                );
+            }
+            let e = &apm.entries[idx as usize - 1];
+            if e.partition_type != "Apple_HFS" {
+                bail!("partition {idx} is {:?}, not Apple_HFS", e.partition_type);
+            }
+            (idx as usize, e)
+        }
+        None => {
+            let hfs: Vec<(usize, &_)> = apm
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.partition_type == "Apple_HFS")
+                .collect();
+            match hfs.len() {
+                0 => bail!("no Apple_HFS partition found in APM disk"),
+                1 => (hfs[0].0 + 1, hfs[0].1),
+                _ => {
+                    let indices: Vec<String> =
+                        hfs.iter().map(|(i, _)| (i + 1).to_string()).collect();
+                    bail!(
+                        "multiple Apple_HFS partitions found (indices {}); pass --partition N",
+                        indices.join(", ")
+                    );
+                }
+            }
+        }
+    };
+
+    let label = format!(
+        "Partition {} (APM): {} {:?} @ block {}, {} blocks",
+        idx, entry.partition_type, entry.name, entry.start_block, entry.block_count
+    );
+    Ok((entry.start_block as u64 * bs, Some(label)))
 }
 
 // ---------------------------------------------------------------------------
@@ -296,9 +452,13 @@ fn parse_size(s: &str) -> Result<u64> {
 // info / ls
 // ---------------------------------------------------------------------------
 
-fn cmd_info(image: PathBuf) -> Result<()> {
-    let file = open_image_ro(&image)?;
-    let fs = HfsFilesystem::open(file, 0).map_err(|e| anyhow!("opening HFS: {e}"))?;
+fn cmd_info(image: PathBuf, partition: Option<u32>) -> Result<()> {
+    let mut file = open_image_ro(&image)?;
+    let (offset, label) = resolve_hfs_offset(&mut file, partition)?;
+    if let Some(l) = &label {
+        eprintln!("{l}");
+    }
+    let fs = HfsFilesystem::open(file, offset).map_err(|e| anyhow!("opening HFS: {e}"))?;
     let s = fs.volume_summary();
     println!("Volume:      {}", s.volume_name);
     println!("Block size:  {} bytes", s.block_size);
@@ -310,9 +470,13 @@ fn cmd_info(image: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn cmd_ls(image: PathBuf, path: &str) -> Result<()> {
-    let file = open_image_ro(&image)?;
-    let mut fs = HfsFilesystem::open(file, 0).map_err(|e| anyhow!("opening HFS: {e}"))?;
+fn cmd_ls(image: PathBuf, path: &str, partition: Option<u32>) -> Result<()> {
+    let mut file = open_image_ro(&image)?;
+    let (offset, label) = resolve_hfs_offset(&mut file, partition)?;
+    if let Some(l) = &label {
+        eprintln!("{l}");
+    }
+    let mut fs = HfsFilesystem::open(file, offset).map_err(|e| anyhow!("opening HFS: {e}"))?;
     let entry = resolve_path(&mut fs, path)?;
     if !entry.is_directory() {
         bail!("not a directory: {path}");
@@ -341,14 +505,19 @@ fn cmd_put(
     creator: &str,
     zero_pad: Option<u64>,
     force: bool,
+    partition: Option<u32>,
 ) -> Result<()> {
     let (parent_path, name) = split_mac_path(mac_path)?;
     if name.is_empty() {
         bail!("destination path has no filename");
     }
 
-    let file = open_image_rw(&image)?;
-    let mut fs = HfsFilesystem::open(file, 0).map_err(|e| anyhow!("opening HFS: {e}"))?;
+    let mut file = open_image_rw(&image)?;
+    let (offset, label) = resolve_hfs_offset(&mut file, partition)?;
+    if let Some(l) = &label {
+        eprintln!("{l}");
+    }
+    let mut fs = HfsFilesystem::open(file, offset).map_err(|e| anyhow!("opening HFS: {e}"))?;
 
     let parent = resolve_path(&mut fs, &parent_path)?;
     if !parent.is_directory() {
@@ -396,9 +565,18 @@ fn cmd_put(
     Ok(())
 }
 
-fn cmd_get(image: PathBuf, mac_path: &str, host_file: PathBuf) -> Result<()> {
-    let file = open_image_ro(&image)?;
-    let mut fs = HfsFilesystem::open(file, 0).map_err(|e| anyhow!("opening HFS: {e}"))?;
+fn cmd_get(
+    image: PathBuf,
+    mac_path: &str,
+    host_file: PathBuf,
+    partition: Option<u32>,
+) -> Result<()> {
+    let mut file = open_image_ro(&image)?;
+    let (offset, label) = resolve_hfs_offset(&mut file, partition)?;
+    if let Some(l) = &label {
+        eprintln!("{l}");
+    }
+    let mut fs = HfsFilesystem::open(file, offset).map_err(|e| anyhow!("opening HFS: {e}"))?;
     let entry = resolve_path(&mut fs, mac_path)?;
     if entry.is_directory() {
         bail!("{mac_path} is a directory");
@@ -410,13 +588,17 @@ fn cmd_get(image: PathBuf, mac_path: &str, host_file: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn cmd_rm(image: PathBuf, mac_path: &str) -> Result<()> {
+fn cmd_rm(image: PathBuf, mac_path: &str, partition: Option<u32>) -> Result<()> {
     let (parent_path, name) = split_mac_path(mac_path)?;
     if name.is_empty() {
         bail!("path has no filename");
     }
-    let file = open_image_rw(&image)?;
-    let mut fs = HfsFilesystem::open(file, 0).map_err(|e| anyhow!("opening HFS: {e}"))?;
+    let mut file = open_image_rw(&image)?;
+    let (offset, label) = resolve_hfs_offset(&mut file, partition)?;
+    if let Some(l) = &label {
+        eprintln!("{l}");
+    }
+    let mut fs = HfsFilesystem::open(file, offset).map_err(|e| anyhow!("opening HFS: {e}"))?;
     let parent = resolve_path(&mut fs, &parent_path)?;
     let children = fs
         .list_directory(&parent)
@@ -455,9 +637,13 @@ fn cmd_put_boot(image: PathBuf, bb_file: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn cmd_validate(image: PathBuf) -> Result<()> {
+fn cmd_validate(image: PathBuf, partition: Option<u32>) -> Result<()> {
     let mut file = open_image_ro(&image)?;
-    validate_hfs_integrity(&mut file, 0, &mut |line| println!("{line}"))
+    let (offset, label) = resolve_hfs_offset(&mut file, partition)?;
+    if let Some(l) = &label {
+        eprintln!("{l}");
+    }
+    validate_hfs_integrity(&mut file, offset, &mut |line| println!("{line}"))
         .map_err(|e| anyhow!("{e}"))?;
     Ok(())
 }
