@@ -443,6 +443,187 @@ pub fn compress_chd_expand(
     )
 }
 
+/// Report from [`shrink_sgi_disk_to_chd`].
+pub struct ShrinkSgiReport {
+    /// Logical size of the source (file length for raw, CHD logical size for CHD).
+    pub source_logical_size: u64,
+    /// Logical size of the newly written CHD = SGI floor in bytes.
+    pub new_logical_size: u64,
+    /// Highest (first + blocks) across non-empty SGI partition entries.
+    pub partition_floor_sectors: u64,
+}
+impl ShrinkSgiReport {
+    pub fn bytes_dropped(&self) -> u64 {
+        self.source_logical_size
+            .saturating_sub(self.new_logical_size)
+    }
+}
+
+/// Re-encode an IRIX disk (raw `.img` or existing CHD) into a CHD whose
+/// logical size equals the SGI volume header's used floor — i.e. drops
+/// trailing zero padding past `max(first + blocks)` over all non-empty
+/// partition entries. The on-disk SGI label and partition data are
+/// copied verbatim; CHS geometry is auto-derived by libchdman from the
+/// new (smaller) logical size, which is fine because IRIX reads its own
+/// geometry from inside the SGI label.
+///
+/// Source detection is by extension: `*.chd` (case-insensitive) is read
+/// via [`ChdReader`]; anything else is treated as a raw image and read
+/// with a buffered file handle.
+///
+/// Path safety: refuses if `dst == src` (canonical paths compared),
+/// if `dst` already exists, or if `dst` lacks a `.chd` extension. The
+/// source is never opened for writing.
+pub fn shrink_sgi_disk_to_chd(
+    src: &Path,
+    dst: &Path,
+    progress_cb: &mut impl FnMut(u64),
+    cancel_check: &impl Fn() -> bool,
+    log_cb: &mut impl FnMut(&str),
+) -> Result<ShrinkSgiReport> {
+    use crate::partition::sgi::SgiVolumeHeader;
+
+    // Path validation. See `feedback_path_resolution_for_destructive_ops`
+    // in memory: this exact dance was missing in an earlier draft and a
+    // 14.84 GiB IRIX CHD got truncated to a 1952-byte header because
+    // `output_path` re-stemmed back onto the source.
+    let src_canon = fs::canonicalize(src)
+        .with_context(|| format!("source does not exist: {}", src.display()))?;
+    if let Ok(dst_canon) = fs::canonicalize(dst) {
+        if dst_canon == src_canon {
+            anyhow::bail!(
+                "output path {} resolves to the source file — refusing to overwrite",
+                dst.display()
+            );
+        }
+    }
+    if dst.exists() {
+        anyhow::bail!(
+            "output already exists: {} (refusing to overwrite; pick a fresh name)",
+            dst.display()
+        );
+    }
+    if dst.extension().and_then(|s| s.to_str()) != Some("chd") {
+        anyhow::bail!("output path must end in .chd (got {})", dst.display());
+    }
+    if let Some(parent) = dst.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            anyhow::bail!("output directory does not exist: {}", parent.display());
+        }
+    }
+
+    let is_chd = src
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.eq_ignore_ascii_case("chd"))
+        .unwrap_or(false);
+
+    // Sector-0 read for SGI header parsing.
+    let (source_logical, sector0) = if is_chd {
+        let mut r = ChdReader::open(src)?;
+        let logical = r.logical_size();
+        let mut buf = vec![0u8; 512];
+        r.read_exact(&mut buf)
+            .context("reading sector 0 from source CHD")?;
+        (logical, buf)
+    } else {
+        let meta = fs::metadata(src).with_context(|| format!("stat {}", src.display()))?;
+        let mut f = File::open(src).with_context(|| format!("open {}", src.display()))?;
+        let mut buf = vec![0u8; 512];
+        f.read_exact(&mut buf)
+            .context("reading sector 0 from source image")?;
+        (meta.len(), buf)
+    };
+
+    let vh = SgiVolumeHeader::parse(&sector0)
+        .map_err(|e| anyhow::anyhow!("sector 0 is not an SGI volume header: {e}"))?;
+    let mut max_end_sectors: u64 = 0;
+    for e in &vh.partitions {
+        if e.is_empty() {
+            continue;
+        }
+        let end = e.first as u64 + e.blocks as u64;
+        if end > max_end_sectors {
+            max_end_sectors = end;
+        }
+    }
+    if max_end_sectors == 0 {
+        anyhow::bail!("SGI volume header has no non-empty partitions");
+    }
+    let new_logical = max_end_sectors * 512;
+    if new_logical >= source_logical {
+        anyhow::bail!(
+            "nothing to shrink: SGI floor ({} bytes) >= source size ({} bytes)",
+            new_logical,
+            source_logical
+        );
+    }
+
+    log_cb(&format!(
+        "SGI floor at sector {} ({} bytes); dropping {} bytes of trailing padding",
+        max_end_sectors,
+        new_logical,
+        source_logical - new_logical,
+    ));
+
+    let inner: Box<dyn Read> = if is_chd {
+        Box::new(ChdReader::open(src)?)
+    } else {
+        Box::new(BufReader::new(
+            File::open(src).with_context(|| format!("open {}", src.display()))?,
+        ))
+    };
+    let mut truncated = TruncatedReader::new(inner, new_logical);
+
+    // Pass `dst` itself as the encoder's base — `output_path` calls
+    // `file_stem()` (strips the trailing `.chd`) and re-appends `.chd`,
+    // so the result is exactly `dst`. Critically, do NOT pre-strip the
+    // extension; that's the bug that destroyed the original source.
+    compress_chd_expand(
+        &mut truncated,
+        dst,
+        new_logical,
+        None,
+        None,
+        progress_cb,
+        cancel_check,
+        log_cb,
+    )?;
+
+    Ok(ShrinkSgiReport {
+        source_logical_size: source_logical,
+        new_logical_size: new_logical,
+        partition_floor_sectors: max_end_sectors,
+    })
+}
+
+/// Read adapter that caps the wrapped reader to at most `limit` bytes,
+/// then signals EOF. Mirror of `ChainedZeroPadReader` in
+/// `crate::model::chd_expand_runner`.
+struct TruncatedReader {
+    inner: Box<dyn Read>,
+    remaining: u64,
+}
+impl TruncatedReader {
+    fn new(inner: Box<dyn Read>, limit: u64) -> Self {
+        Self {
+            inner,
+            remaining: limit,
+        }
+    }
+}
+impl Read for TruncatedReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.remaining == 0 {
+            return Ok(0);
+        }
+        let cap = (buf.len() as u64).min(self.remaining) as usize;
+        let n = self.inner.read(&mut buf[..cap])?;
+        self.remaining -= n as u64;
+        Ok(n)
+    }
+}
+
 /// Compress raw data into a DVD-profile CHD (MAME 0.287+) via libchdman-rs.
 ///
 /// Same shape as [`compress_chd`] but uses DVD's 2048-byte sector unit and
