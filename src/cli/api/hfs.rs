@@ -1,88 +1,21 @@
-//! Command-line surface for rusty-backup.
-//!
-//! Everything currently lives under an `api` top-level namespace that is
-//! explicitly unstable: it exists so scripted consumers (build pipelines,
-//! automated tests) have *something* to call today, without committing to
-//! the eventual GUI-mirroring grammar (`inspect`, `backup`, `restore`,
-//! `optical`, `browse`, `shell`, ...). Expect verbs under `api` to be
-//! renamed or moved when that final structure lands.
+//! `api hfs` — Classic-HFS image operations (create, browse, edit
+//! single-partition `.dsk` and APM-wrapped images).
 //!
 //! Mac paths on the CLI use `/` as the separator. `/` is illegal in HFS
 //! filenames so there's no ambiguity. The HFS native separator `:` is
 //! not accepted to keep the surface small and shell-friendly.
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::Subcommand;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
+use crate::cli::io::{open_image_ro, open_image_rw};
+use crate::cli::parse::{parse_size, pick_block_size, split_mac_path, ZeroReader};
 use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
 use crate::fs::hfs::{create_blank_hfs_sized, validate_hfs_integrity, HfsFilesystem};
 use crate::partition::apm::Apm;
-
-#[derive(Parser, Debug)]
-#[command(
-    name = "rb-cli",
-    about = "Headless image-construction CLI for rusty-backup",
-    disable_help_subcommand = true
-)]
-pub struct Cli {
-    #[command(subcommand)]
-    pub command: Command,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum Command {
-    /// Unstable scratch namespace for low-level operations. Grammar inside
-    /// `api` is expected to churn — do not depend on it from durable scripts.
-    Api {
-        #[command(subcommand)]
-        group: ApiGroup,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-pub enum ApiGroup {
-    /// Classic-HFS image operations (create, browse, edit single-partition .dsk images).
-    Hfs {
-        #[command(subcommand)]
-        verb: HfsCommand,
-    },
-    /// SGI/IRIX disk operations.
-    Sgi {
-        #[command(subcommand)]
-        verb: SgiCommand,
-    },
-    /// Apple Partition Map (APM) disk operations.
-    Apm {
-        #[command(subcommand)]
-        verb: ApmCommand,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-pub enum ApmCommand {
-    /// Print the partition map of an APM disk image.
-    Info { image: PathBuf },
-}
-
-#[derive(Subcommand, Debug)]
-pub enum SgiCommand {
-    /// Re-encode an IRIX disk image into a CHD whose logical size matches
-    /// the SGI volume header's used floor. Drops trailing zero padding
-    /// past `max(first + blocks)` over all non-empty partition entries.
-    /// Accepts a raw `.img` or an existing `.chd` as input; always writes
-    /// a CHD. Refuses to overwrite the source or an existing output file.
-    Shrink {
-        /// Source image (raw `.img` or `.chd`). Must contain an SGI
-        /// volume header at sector 0.
-        input: PathBuf,
-        /// Destination CHD path. Must end in `.chd`, must not already
-        /// exist, and must not resolve to the same file as `input`.
-        output: PathBuf,
-    },
-}
 
 #[derive(Subcommand, Debug)]
 pub enum HfsCommand {
@@ -185,20 +118,7 @@ pub enum HfsCommand {
     },
 }
 
-/// Run the parsed CLI and exit. Returns only when nothing matched (which
-/// can't happen with the current grammar) so callers can fall through to
-/// the GUI launcher.
-pub fn run(cli: Cli) -> Result<()> {
-    match cli.command {
-        Command::Api { group } => match group {
-            ApiGroup::Hfs { verb } => run_hfs(verb),
-            ApiGroup::Sgi { verb } => run_sgi(verb),
-            ApiGroup::Apm { verb } => run_apm(verb),
-        },
-    }
-}
-
-fn run_hfs(verb: HfsCommand) -> Result<()> {
+pub fn run(verb: HfsCommand) -> Result<()> {
     match verb {
         HfsCommand::New {
             image,
@@ -264,46 +184,12 @@ fn run_hfs(verb: HfsCommand) -> Result<()> {
     }
 }
 
-fn run_apm(verb: ApmCommand) -> Result<()> {
-    match verb {
-        ApmCommand::Info { image } => cmd_apm_info(image),
-    }
-}
-
-fn cmd_apm_info(image: PathBuf) -> Result<()> {
-    let mut file = open_image_ro(&image)?;
-    let apm = Apm::parse(&mut file).map_err(|e| anyhow!("parsing APM: {e}"))?;
-    let bs = apm.ddr.block_size as u64;
-    println!(
-        "DDR: block_size={} block_count={} drivers={}",
-        apm.ddr.block_size, apm.ddr.block_count, apm.ddr.driver_count
-    );
-    println!("Map entries: {}", apm.map_entry_count);
-    println!(
-        "{:>3}  {:<24}  {:<24}  {:>10}  {:>10}  {:>10}  status",
-        "idx", "type", "name", "start", "blocks", "bytes"
-    );
-    for (i, e) in apm.entries.iter().enumerate() {
-        println!(
-            "{:>3}  {:<24}  {:<24}  {:>10}  {:>10}  {:>10}  0x{:08x}",
-            i + 1,
-            e.partition_type,
-            e.name,
-            e.start_block,
-            e.block_count,
-            e.size_bytes(bs as u16),
-            e.status
-        );
-    }
-    Ok(())
-}
-
 /// Resolve the byte offset to open as an HFS partition. If the file starts
 /// with an APM signature ("ER"), parse it and pick the requested Apple_HFS
 /// partition (1-based index), or the sole Apple_HFS partition when `partition`
 /// is None. Returns offset=0 (raw HFS at byte 0) when there's no APM. The
 /// optional second element describes the selected APM partition, for logging.
-fn resolve_hfs_offset(
+pub fn resolve_hfs_offset(
     file: &mut std::fs::File,
     partition: Option<u32>,
 ) -> Result<(u64, Option<String>)> {
@@ -411,43 +297,6 @@ fn cmd_new(image: PathBuf, size_arg: &str, name: &str, block_size: Option<u32>) 
     Ok(())
 }
 
-/// Smallest 512-byte-multiple block size that keeps total_blocks <= 65535.
-fn pick_block_size(volume_bytes: u64) -> u32 {
-    let mut bs: u32 = 512;
-    while volume_bytes / bs as u64 > 65535 {
-        bs = bs.saturating_mul(2);
-        if bs == 0 {
-            return 1 << 16;
-        }
-    }
-    bs
-}
-
-fn parse_size(s: &str) -> Result<u64> {
-    let s = s.trim();
-    if s.is_empty() {
-        bail!("empty size");
-    }
-    let (num_part, mult): (&str, u64) =
-        if let Some(rest) = s.strip_suffix("KiB").or_else(|| s.strip_suffix('K')) {
-            (rest, 1024)
-        } else if let Some(rest) = s.strip_suffix("MiB").or_else(|| s.strip_suffix('M')) {
-            (rest, 1024 * 1024)
-        } else if let Some(rest) = s.strip_suffix("GiB").or_else(|| s.strip_suffix('G')) {
-            (rest, 1024 * 1024 * 1024)
-        } else if let Some(rest) = s.strip_suffix('B') {
-            (rest, 1)
-        } else {
-            (s, 1)
-        };
-    let n: u64 = num_part
-        .trim()
-        .parse()
-        .map_err(|_| anyhow!("invalid size {s:?}"))?;
-    n.checked_mul(mult)
-        .ok_or_else(|| anyhow!("size {s:?} overflows u64"))
-}
-
 // ---------------------------------------------------------------------------
 // info / ls
 // ---------------------------------------------------------------------------
@@ -497,6 +346,7 @@ fn cmd_ls(image: PathBuf, path: &str, partition: Option<u32>) -> Result<()> {
 // put / get / rm
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_put(
     image: PathBuf,
     host_file: Option<PathBuf>,
@@ -649,95 +499,10 @@ fn cmd_validate(image: PathBuf, partition: Option<u32>) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// sgi
-// ---------------------------------------------------------------------------
-
-fn run_sgi(verb: SgiCommand) -> Result<()> {
-    match verb {
-        SgiCommand::Shrink { input, output } => cmd_sgi_shrink(input, output),
-    }
-}
-
-fn cmd_sgi_shrink(input: PathBuf, output: PathBuf) -> Result<()> {
-    use std::sync::atomic::AtomicBool;
-
-    let cancel = AtomicBool::new(false);
-    let mut last_mib: u64 = u64::MAX;
-    let mut progress_cb = |bytes: u64| {
-        let mib = bytes / (1024 * 1024);
-        if mib != last_mib {
-            eprint!("\rprogress: {mib} MiB written  ");
-            let _ = std::io::stderr().flush();
-            last_mib = mib;
-        }
-    };
-    let cancel_check = || cancel.load(std::sync::atomic::Ordering::Relaxed);
-    let mut log_cb = |msg: &str| {
-        eprintln!("\n  {msg}");
-    };
-
-    let report = crate::rbformats::chd::shrink_sgi_disk_to_chd(
-        &input,
-        &output,
-        &mut progress_cb,
-        &cancel_check,
-        &mut log_cb,
-    )?;
-
-    eprintln!();
-    println!("Shrunk {} -> {}", input.display(), output.display());
-    println!(
-        "  source logical: {} bytes ({:.3} GiB)",
-        report.source_logical_size,
-        report.source_logical_size as f64 / (1024.0 * 1024.0 * 1024.0)
-    );
-    println!(
-        "  new logical:    {} bytes ({:.3} GiB)",
-        report.new_logical_size,
-        report.new_logical_size as f64 / (1024.0 * 1024.0 * 1024.0)
-    );
-    println!(
-        "  floor:          sector {} (max first+blocks across SGI partitions)",
-        report.partition_floor_sectors
-    );
-    println!("  dropped:        {} bytes", report.bytes_dropped());
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
 
-fn open_image_ro(path: &PathBuf) -> Result<std::fs::File> {
-    std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))
-}
-
-fn open_image_rw(path: &PathBuf) -> Result<std::fs::File> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .with_context(|| format!("opening {} for read/write", path.display()))
-}
-
-fn split_mac_path(p: &str) -> Result<(String, String)> {
-    let normalized = p.trim_end_matches('/');
-    if normalized.is_empty() || normalized == "/" {
-        return Ok(("/".into(), String::new()));
-    }
-    let (parent, name) = match normalized.rsplit_once('/') {
-        Some((par, n)) => (par, n),
-        None => ("", normalized),
-    };
-    let parent = if parent.is_empty() {
-        "/".into()
-    } else {
-        parent.to_string()
-    };
-    Ok((parent, name.to_string()))
-}
-
-fn resolve_path<R: Read + Seek + Send>(
+pub fn resolve_path<R: Read + Seek + Send>(
     fs: &mut HfsFilesystem<R>,
     path: &str,
 ) -> Result<crate::fs::entry::FileEntry> {
@@ -760,56 +525,4 @@ fn resolve_path<R: Read + Seek + Send>(
         current = next;
     }
     Ok(current)
-}
-
-/// Adapter that pretends to be a file of `remaining` zero bytes.
-struct ZeroReader {
-    remaining: u64,
-}
-
-impl Read for ZeroReader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.remaining == 0 {
-            return Ok(0);
-        }
-        let n = buf.len().min(self.remaining as usize);
-        for b in &mut buf[..n] {
-            *b = 0;
-        }
-        self.remaining -= n as u64;
-        Ok(n)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_size_bytes() {
-        assert_eq!(parse_size("819200").unwrap(), 819200);
-        assert_eq!(parse_size("800K").unwrap(), 819200);
-        assert_eq!(parse_size("800KiB").unwrap(), 819200);
-        assert_eq!(parse_size("5M").unwrap(), 5 * 1024 * 1024);
-        assert_eq!(parse_size("1G").unwrap(), 1024 * 1024 * 1024);
-        assert!(parse_size("").is_err());
-        assert!(parse_size("nope").is_err());
-    }
-
-    #[test]
-    fn split_mac_path_cases() {
-        assert_eq!(split_mac_path("/foo").unwrap(), ("/".into(), "foo".into()));
-        assert_eq!(
-            split_mac_path("/foo/bar.txt").unwrap(),
-            ("/foo".into(), "bar.txt".into())
-        );
-        assert_eq!(split_mac_path("/").unwrap(), ("/".into(), String::new()));
-    }
-
-    #[test]
-    fn pick_block_size_floppy_and_large() {
-        assert_eq!(pick_block_size(819_200), 512);
-        // 60 MiB needs > 512: 60M/512 = 122880 > 65535, so bs jumps to 1024.
-        assert_eq!(pick_block_size(60 * 1024 * 1024), 1024);
-    }
 }
