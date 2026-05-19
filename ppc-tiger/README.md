@@ -6,7 +6,7 @@ A native PowerPC port of [rusty-backup](https://github.com/danifunker/rusty-back
 
 All core rusty-backup functionality, running natively on Tiger:
 
-- **Partition table support**: MBR (with EBR chain for logical partitions), APM, Superfloppy
+- **Partition table support**: MBR (with EBR chain for logical partitions), GPT (read, with CRC32 + entry-array validation), APM, Superfloppy
 - **Gzip compression**: `--format gzip` via zlib (ships with Tiger)
 - **VHD (Fixed) output**: `--format vhd` emits a single `.vhd` per partition with the MAME/Microsoft Fixed footer at the tail. Same byte layout as rb-cli's VHD output; mountable in Disk Utility / Hyper-V / VirtualBox.
 - **Split output**: `--split-size <MIB>` chunks raw/gzip streams into `partition-N.raw`, `partition-N.001.raw`, ... (matches rb-cli's split naming so cross-tool restore works)

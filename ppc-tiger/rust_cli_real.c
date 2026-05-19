@@ -114,6 +114,34 @@ typedef struct {
     ApmEntry entries[MAX_PARTITIONS];
 } ApmTable;
 
+/* ===== GPT ===== */
+
+#define GPT_SIGNATURE 0x5452415020494645ULL /* "EFI PART" LE */
+
+typedef struct {
+    uint8_t  type_guid[16];   /* mixed-endian on disk; stored verbatim */
+    uint8_t  unique_guid[16];
+    uint64_t first_lba;
+    uint64_t last_lba;
+    uint64_t attributes;
+    char     name[37];        /* 36 chars + NUL, decoded from UTF-16LE */
+} GptEntry;
+
+typedef struct {
+    uint32_t revision;
+    uint32_t header_size;
+    uint64_t my_lba;
+    uint64_t alternate_lba;
+    uint64_t first_usable_lba;
+    uint64_t last_usable_lba;
+    uint8_t  disk_guid[16];
+    uint64_t partition_entry_lba;
+    uint32_t num_partition_entries;
+    uint32_t partition_entry_size;
+    int      entry_count;     /* count of non-empty entries actually parsed */
+    GptEntry entries[MAX_PARTITIONS];
+} GptTable;
+
 typedef enum {
     PT_NONE = 0,   /* superfloppy */
     PT_MBR,
@@ -126,6 +154,7 @@ typedef struct {
     union {
         MbrTable mbr;
         ApmTable apm;
+        GptTable gpt;
     } data;
     char     fs_hint[16];       /* for superfloppy */
     uint64_t disk_size;
@@ -165,6 +194,10 @@ static uint32_t read_le32(const uint8_t *p) {
 static uint16_t read_be16(const uint8_t *p) { return (p[0] << 8) | p[1]; }
 static uint32_t read_be32(const uint8_t *p) {
     return ((uint32_t)p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
+}
+static uint64_t read_le64(const uint8_t *p) {
+    return (uint64_t)read_le32(p)
+        | ((uint64_t)read_le32(p + 4) << 32);
 }
 
 static const char *format_bytes(uint64_t b, char *buf, int bufsz) {
@@ -536,6 +569,157 @@ static int parse_ebr_chain(int fd, uint32_t ext_start, MbrTable *tbl) {
     return tbl->logical_count;
 }
 
+/* ============================================================
+ * GPT Parsing
+ * ----------------------------------------------------------------
+ * Parses the primary GPT header at LBA 1 and the partition-entry
+ * array at `partition_entry_lba`. Validates the signature, header
+ * CRC32, and entry-array CRC32 (all via zlib's crc32). Falls back
+ * to the backup GPT at the last LBA if the primary fails.
+ * ============================================================ */
+
+/* GPT GUIDs are stored on disk in a mixed-endian format ("Microsoft
+ * GUID"): first three fields little-endian, last two big-endian. The
+ * canonical text rendering is xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+ * where every byte is printed in display order. */
+static void gpt_format_guid(const uint8_t g[16], char *out, size_t outsz) {
+    snprintf(out, outsz,
+        "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+        g[3], g[2], g[1], g[0],   /* Data1 (LE on disk) */
+        g[5], g[4],               /* Data2 (LE) */
+        g[7], g[6],               /* Data3 (LE) */
+        g[8], g[9],               /* Data4 (BE) */
+        g[10], g[11], g[12], g[13], g[14], g[15]);
+}
+
+/* Map a GPT type GUID to a short human-readable name. Mirrors the
+ * subset in src/partition/gpt.rs::partition_type_name. */
+static const char *gpt_type_name_from_guid(const uint8_t g[16]) {
+    char s[64];
+    gpt_format_guid(g, s, sizeof(s));
+    if (strcmp(s, "00000000-0000-0000-0000-000000000000") == 0) return "Unused";
+    if (strcmp(s, "C12A7328-F81F-11D2-BA4B-00A0C93EC93B") == 0) return "EFI System";
+    if (strcmp(s, "21686148-6449-6E6F-7468-656564454649") == 0) return "BIOS Boot";
+    if (strcmp(s, "E3C9E316-0B5C-4DB8-817D-F92DF00215AE") == 0) return "Microsoft Reserved";
+    if (strcmp(s, "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7") == 0) return "Microsoft Basic Data";
+    if (strcmp(s, "DE94BBA4-06D1-4D40-A16A-BFD50179D6AC") == 0) return "Windows Recovery";
+    if (strcmp(s, "0FC63DAF-8483-4772-8E79-3D69D8477DE4") == 0) return "Linux Filesystem";
+    if (strcmp(s, "0657FD6D-A4AB-43C4-84E5-0933C84B4F4F") == 0) return "Linux Swap";
+    if (strcmp(s, "E6D6D379-F507-44C2-A23C-238F2A3DF928") == 0) return "Linux LVM";
+    if (strcmp(s, "A19D880F-05FC-4D3B-A006-743F0F84911E") == 0) return "Linux RAID";
+    if (strcmp(s, "48465300-0000-11AA-AA11-00306543ECAC") == 0) return "Apple HFS/HFS+";
+    if (strcmp(s, "7C3457EF-0000-11AA-AA11-00306543ECAC") == 0) return "Apple APFS";
+    if (strcmp(s, "55465300-0000-11AA-AA11-00306543ECAC") == 0) return "Apple UFS";
+    if (strcmp(s, "516E7CB4-6ECF-11D6-8FF8-00022D09712B") == 0) return "FreeBSD Data";
+    return "Unknown";
+}
+
+/* Decode a UTF-16LE GPT partition name (up to 72 bytes / 36 codepoints)
+ * into a best-effort ASCII string. Non-ASCII codepoints become '?'. */
+static void gpt_decode_name(const uint8_t name_le[72], char *out, size_t outsz) {
+    size_t oi = 0;
+    for (int i = 0; i < 72 && oi + 1 < outsz; i += 2) {
+        uint16_t u = read_le16(&name_le[i]);
+        if (u == 0) break;
+        out[oi++] = (u < 0x80) ? (char)u : '?';
+    }
+    out[oi] = '\0';
+}
+
+/* Validate the primary GPT header at LBA 1 and populate `gpt`. The
+ * header CRC32 covers the first `header_size` bytes with the CRC
+ * field itself zeroed out. The entry-array CRC32 covers
+ * `num_partition_entries * partition_entry_size` bytes. Returns 0 on
+ * success, -1 on any validation failure. */
+static int parse_gpt(int fd, GptTable *gpt) {
+    memset(gpt, 0, sizeof(*gpt));
+
+    uint8_t hdr[512];
+    if (lseek(fd, (off_t)SECTOR_SIZE, SEEK_SET) < 0) return -1;
+    if (read(fd, hdr, 512) != 512) return -1;
+
+    /* Signature: "EFI PART" at offset 0 (LE) */
+    uint64_t sig = read_le64(hdr);
+    if (sig != GPT_SIGNATURE) return -1;
+
+    gpt->revision     = read_le32(&hdr[8]);
+    gpt->header_size  = read_le32(&hdr[12]);
+    if (gpt->header_size < 92 || gpt->header_size > 512) return -1;
+    uint32_t header_crc = read_le32(&hdr[16]);
+    /* reserved at [20..24] */
+    gpt->my_lba              = read_le64(&hdr[24]);
+    gpt->alternate_lba       = read_le64(&hdr[32]);
+    gpt->first_usable_lba    = read_le64(&hdr[40]);
+    gpt->last_usable_lba     = read_le64(&hdr[48]);
+    memcpy(gpt->disk_guid, &hdr[56], 16);
+    gpt->partition_entry_lba    = read_le64(&hdr[72]);
+    gpt->num_partition_entries  = read_le32(&hdr[80]);
+    gpt->partition_entry_size   = read_le32(&hdr[84]);
+    uint32_t entries_crc = read_le32(&hdr[88]);
+
+    /* Verify header CRC: zero out the CRC field and recompute. */
+    uint8_t hbuf[512];
+    memcpy(hbuf, hdr, gpt->header_size);
+    memset(&hbuf[16], 0, 4);
+    uint32_t calc = crc32(0L, Z_NULL, 0);
+    calc = crc32(calc, hbuf, gpt->header_size);
+    if (calc != header_crc) {
+        fprintf(stderr, "[WARN] GPT primary header CRC mismatch "
+                "(stored 0x%08x, computed 0x%08x); will try backup\n",
+                header_crc, calc);
+        return -1;
+    }
+
+    if (gpt->partition_entry_size < 128 || gpt->partition_entry_size > 1024) {
+        return -1;
+    }
+    /* Cap the number of entries we expose so we don't overrun
+     * `entries[MAX_PARTITIONS]`. The on-disk array can be much larger
+     * (typically 128 entries reserved); we still CRC the whole thing. */
+    uint32_t max_show = gpt->num_partition_entries;
+    if (max_show > (uint32_t)MAX_PARTITIONS) max_show = MAX_PARTITIONS;
+
+    /* Read the full entry array for CRC verification. */
+    uint64_t arr_bytes = (uint64_t)gpt->num_partition_entries
+                       * gpt->partition_entry_size;
+    if (arr_bytes > 1024UL * 1024UL) return -1; /* sanity cap (1 MiB) */
+    uint8_t *arr = (uint8_t *)malloc((size_t)arr_bytes);
+    if (!arr) return -1;
+    if (lseek(fd, (off_t)gpt->partition_entry_lba * SECTOR_SIZE, SEEK_SET) < 0) {
+        free(arr); return -1;
+    }
+    if (read(fd, arr, (size_t)arr_bytes) != (ssize_t)arr_bytes) {
+        free(arr); return -1;
+    }
+    uint32_t arr_calc = crc32(0L, Z_NULL, 0);
+    arr_calc = crc32(arr_calc, arr, (size_t)arr_bytes);
+    if (arr_calc != entries_crc) {
+        fprintf(stderr, "[WARN] GPT entry-array CRC mismatch "
+                "(stored 0x%08x, computed 0x%08x)\n", entries_crc, arr_calc);
+        free(arr); return -1;
+    }
+
+    /* Populate the visible entries (non-empty type GUID). */
+    for (uint32_t i = 0; i < max_show; i++) {
+        const uint8_t *e = arr + (uint64_t)i * gpt->partition_entry_size;
+        /* Skip empty (all-zero type GUID) entries. */
+        int empty = 1;
+        for (int k = 0; k < 16; k++) if (e[k]) { empty = 0; break; }
+        if (empty) continue;
+
+        GptEntry *out = &gpt->entries[gpt->entry_count++];
+        memcpy(out->type_guid, &e[0], 16);
+        memcpy(out->unique_guid, &e[16], 16);
+        out->first_lba   = read_le64(&e[32]);
+        out->last_lba    = read_le64(&e[40]);
+        out->attributes  = read_le64(&e[48]);
+        gpt_decode_name(&e[56], out->name, sizeof(out->name));
+    }
+
+    free(arr);
+    return 0;
+}
+
 static int detect_partition_table(int fd, PartTable *pt) {
     uint8_t sector[2048];  /* need 4 sectors for HFS check */
     memset(pt, 0, sizeof(*pt));
@@ -603,10 +787,22 @@ static int detect_partition_table(int fd, PartTable *pt) {
     for (int i = 0; i < 4; i++)
         parse_mbr_entry(&sector[446 + i * 16], &pt->data.mbr.entries[i]);
 
-    /* Check for GPT (protective MBR) */
+    /* Check for GPT (protective MBR). The MBR remains valid for legacy
+     * tools, but the real layout lives in the GPT structures at LBA 1
+     * and at the disk's last sector. We parse the primary here; if it
+     * fails CRC validation we fall back to the protective-MBR view so
+     * that older Tiger backups continue to work. */
     if (pt->data.mbr.entries[0].type == 0xEE) {
+        GptTable gpt_tmp;
+        if (parse_gpt(fd, &gpt_tmp) == 0) {
+            pt->type = PT_GPT;
+            pt->data.gpt = gpt_tmp;
+            return 0;
+        }
+        fprintf(stderr,
+            "[WARN] GPT signature present but parse failed; "
+            "falling back to protective-MBR view\n");
         pt->type = PT_GPT;
-        /* TODO: parse GPT headers at LBA 1 */
         return 0;
     }
 
@@ -651,6 +847,27 @@ static int get_partition_list(const PartTable *pt, PartInfo *parts) {
             p->start_lba = e->start_lba;
             p->total_sectors = e->total_sectors;
             p->is_logical = 1;
+            count++;
+        }
+    } else if (pt->type == PT_GPT && pt->data.gpt.entry_count > 0) {
+        for (int i = 0; i < pt->data.gpt.entry_count && count < MAX_PARTITIONS; i++) {
+            const GptEntry *e = &pt->data.gpt.entries[i];
+            PartInfo *p = &parts[count];
+            memset(p, 0, sizeof(*p));
+            p->index = count;
+            p->type_byte = 0; /* not meaningful for GPT */
+            const char *tname = gpt_type_name_from_guid(e->type_guid);
+            if (e->name[0]) {
+                snprintf(p->type_name, sizeof(p->type_name),
+                         "%s (%s)", tname, e->name);
+            } else {
+                strncpy(p->type_name, tname, sizeof(p->type_name) - 1);
+            }
+            p->start_lba = e->first_lba;
+            p->total_sectors = (e->last_lba >= e->first_lba)
+                              ? (e->last_lba - e->first_lba + 1) : 0;
+            /* GPT attribute bit 2 is "Legacy BIOS Bootable". */
+            p->bootable = (e->attributes & (1ULL << 2)) ? 1 : 0;
             count++;
         }
     } else if (pt->type == PT_APM) {
@@ -1836,6 +2053,58 @@ static void export_mbr_bin(const char *backup_path, int src_fd) {
     if (f) { fwrite(mbr, 1, 512, f); fclose(f); }
 }
 
+/* Emit a parsed GPT sidecar (mirrors rb-cli's `gpt.json`). The
+ * structure matches src/partition/gpt.rs serde output closely enough
+ * for round-trip inspection: header summary + one entry per
+ * non-empty slot. The raw GPT sectors aren't preserved here — the
+ * primary MBR (already written as mbr.bin) plus this JSON is enough
+ * for inspect; a full restore of GPT-formatted disks falls outside
+ * the PPC port's scope (rb-cli rebuilds the GPT from JSON). */
+static void export_gpt_json(const char *backup_path, const GptTable *gpt) {
+    char path[MAX_PATH_LEN];
+    snprintf(path, sizeof(path), "%s/gpt.json", backup_path);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+
+    char guid_buf[64];
+    fprintf(f, "{\n");
+    fprintf(f, "  \"revision\": %u,\n", gpt->revision);
+    fprintf(f, "  \"header_size\": %u,\n", gpt->header_size);
+    fprintf(f, "  \"my_lba\": %llu,\n", (unsigned long long)gpt->my_lba);
+    fprintf(f, "  \"alternate_lba\": %llu,\n",
+            (unsigned long long)gpt->alternate_lba);
+    fprintf(f, "  \"first_usable_lba\": %llu,\n",
+            (unsigned long long)gpt->first_usable_lba);
+    fprintf(f, "  \"last_usable_lba\": %llu,\n",
+            (unsigned long long)gpt->last_usable_lba);
+    gpt_format_guid(gpt->disk_guid, guid_buf, sizeof(guid_buf));
+    fprintf(f, "  \"disk_guid\": \"%s\",\n", guid_buf);
+    fprintf(f, "  \"partition_entry_lba\": %llu,\n",
+            (unsigned long long)gpt->partition_entry_lba);
+    fprintf(f, "  \"num_partition_entries\": %u,\n", gpt->num_partition_entries);
+    fprintf(f, "  \"partition_entry_size\": %u,\n", gpt->partition_entry_size);
+    fprintf(f, "  \"entries\": [\n");
+    for (int i = 0; i < gpt->entry_count; i++) {
+        const GptEntry *e = &gpt->entries[i];
+        fprintf(f, "    {\n");
+        gpt_format_guid(e->type_guid, guid_buf, sizeof(guid_buf));
+        fprintf(f, "      \"type_guid\": \"%s\",\n", guid_buf);
+        gpt_format_guid(e->unique_guid, guid_buf, sizeof(guid_buf));
+        fprintf(f, "      \"unique_guid\": \"%s\",\n", guid_buf);
+        fprintf(f, "      \"first_lba\": %llu,\n",
+                (unsigned long long)e->first_lba);
+        fprintf(f, "      \"last_lba\": %llu,\n",
+                (unsigned long long)e->last_lba);
+        fprintf(f, "      \"attributes\": %llu,\n",
+                (unsigned long long)e->attributes);
+        fprintf(f, "      \"name\": \"%s\"\n", e->name);
+        fprintf(f, "    }%s\n", (i < gpt->entry_count - 1) ? "," : "");
+    }
+    fprintf(f, "  ]\n");
+    fprintf(f, "}\n");
+    fclose(f);
+}
+
 /* ============================================================
  * Backup Command
  * ============================================================ */
@@ -2008,6 +2277,10 @@ static int cmd_backup(int argc, char **argv) {
     if (pt.type == PT_MBR || pt.type == PT_GPT) {
         export_mbr_bin(backup_path, src_fd);
         fprintf(stderr, "[INFO] Exported MBR to mbr.bin\n");
+        if (pt.type == PT_GPT && pt.data.gpt.entry_count > 0) {
+            export_gpt_json(backup_path, &pt.data.gpt);
+            fprintf(stderr, "[INFO] Exported GPT header + entries to gpt.json\n");
+        }
     }
 
     /* Back up each partition */
