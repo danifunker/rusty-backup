@@ -852,6 +852,145 @@ static const char *comp_ext(CompressionMode m) {
 }
 
 /* ============================================================
+ * Split-file Writer
+ * ----------------------------------------------------------------
+ * Streams bytes into a sequence of output files, rolling over to a
+ * new file when `split_bytes` is reached. Matches rb-cli's naming
+ * convention:
+ *
+ *   no split:        partition-3.raw
+ *   split, file 0:   partition-3.raw      (first file is unindexed)
+ *   split, file 1:   partition-3.001.raw
+ *   split, file 2:   partition-3.002.raw
+ *
+ * Used for both raw output (`FILE *`) and gzip output (`gzFile`).
+ * After close, `files[]` lists the basenames of every emitted file
+ * so the caller can compute per-file checksums and populate the
+ * `compressed_files` array in `metadata.json`.
+ * ============================================================ */
+
+#define SPLIT_MAX_FILES 64
+#define SPLIT_NAME_LEN 128
+
+typedef struct {
+    char dir_path[MAX_PATH_LEN];   /* output directory */
+    char stem[64];                  /* e.g. "partition-3" */
+    char ext[8];                    /* ".raw" or ".gz" */
+    uint64_t split_bytes;           /* 0 = no split */
+    uint64_t bytes_in_current;
+    int part_index;                 /* 0 first, 1 = .001, 2 = .002, ... */
+    int is_gzip;
+    FILE *raw_fp;
+    gzFile gz_fp;
+    char files[SPLIT_MAX_FILES][SPLIT_NAME_LEN]; /* emitted basenames */
+    int num_files;
+} SplitWriter;
+
+/* Build the on-disk path for the n-th split file (0-indexed). The
+ * first file is unindexed; subsequent files get a zero-padded suffix
+ * before the extension, e.g. `partition-3.001.raw`. */
+static void splitwriter_build_path(const SplitWriter *sw, int idx,
+                                   char *full_path, size_t full_sz,
+                                   char *basename, size_t bn_sz) {
+    if (idx == 0) {
+        snprintf(basename, bn_sz, "%s%s", sw->stem, sw->ext);
+    } else {
+        snprintf(basename, bn_sz, "%s.%03d%s", sw->stem, idx, sw->ext);
+    }
+    snprintf(full_path, full_sz, "%s/%s", sw->dir_path, basename);
+}
+
+/* Open (or roll over to) the next output file. Returns 0 on success. */
+static int splitwriter_open_next(SplitWriter *sw) {
+    if (sw->num_files >= SPLIT_MAX_FILES) {
+        fprintf(stderr, "Error: split-file limit (%d) exceeded\n",
+                SPLIT_MAX_FILES);
+        return -1;
+    }
+    char full[MAX_PATH_LEN];
+    char *bn = sw->files[sw->num_files];
+    splitwriter_build_path(sw, sw->part_index, full, sizeof(full),
+                           bn, SPLIT_NAME_LEN);
+    if (sw->is_gzip) {
+        sw->gz_fp = gzopen(full, "wb9");
+        if (!sw->gz_fp) {
+            fprintf(stderr, "Error: cannot create %s\n", full);
+            return -1;
+        }
+    } else {
+        sw->raw_fp = fopen(full, "wb");
+        if (!sw->raw_fp) {
+            fprintf(stderr, "Error: cannot create %s\n", full);
+            return -1;
+        }
+    }
+    sw->num_files++;
+    sw->bytes_in_current = 0;
+    return 0;
+}
+
+static int splitwriter_open(SplitWriter *sw, const char *dir_path,
+                            const char *stem, const char *ext,
+                            int is_gzip, uint64_t split_bytes) {
+    memset(sw, 0, sizeof(*sw));
+    snprintf(sw->dir_path, sizeof(sw->dir_path), "%s", dir_path);
+    snprintf(sw->stem, sizeof(sw->stem), "%s", stem);
+    snprintf(sw->ext, sizeof(sw->ext), "%s", ext);
+    sw->is_gzip = is_gzip;
+    sw->split_bytes = split_bytes;
+    sw->part_index = 0;
+    return splitwriter_open_next(sw);
+}
+
+/* Close the currently-open output file (without freeing the writer). */
+static void splitwriter_close_current(SplitWriter *sw) {
+    if (sw->is_gzip) {
+        if (sw->gz_fp) { gzclose(sw->gz_fp); sw->gz_fp = NULL; }
+    } else {
+        if (sw->raw_fp) { fclose(sw->raw_fp); sw->raw_fp = NULL; }
+    }
+}
+
+static int splitwriter_close(SplitWriter *sw) {
+    splitwriter_close_current(sw);
+    return 0;
+}
+
+/* Write `n` bytes, rolling to a new split file at the boundary. */
+static int splitwriter_write(SplitWriter *sw, const uint8_t *buf, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        size_t chunk = n - off;
+        if (sw->split_bytes > 0) {
+            uint64_t room = sw->split_bytes - sw->bytes_in_current;
+            if ((uint64_t)chunk > room) chunk = (size_t)room;
+        }
+        if (sw->is_gzip) {
+            if (gzwrite(sw->gz_fp, buf + off, chunk) <= 0 && chunk > 0) {
+                fprintf(stderr, "Error: gzwrite failed\n");
+                return -1;
+            }
+        } else {
+            if (fwrite(buf + off, 1, chunk, sw->raw_fp) != chunk) {
+                fprintf(stderr, "Error: fwrite failed\n");
+                return -1;
+            }
+        }
+        sw->bytes_in_current += chunk;
+        off += chunk;
+
+        if (sw->split_bytes > 0 && sw->bytes_in_current >= sw->split_bytes
+            && off < n) {
+            /* roll over to next split */
+            splitwriter_close_current(sw);
+            sw->part_index++;
+            if (splitwriter_open_next(sw) != 0) return -1;
+        }
+    }
+    return 0;
+}
+
+/* ============================================================
  * FAT Compaction — only back up allocated clusters
  * ============================================================ */
 
@@ -1429,7 +1568,9 @@ static void write_metadata_json(const char *backup_path, const char *source,
                                   uint64_t source_size, const PartTable *pt,
                                   const PartInfo *parts, int part_count,
                                   const char *compression, const char *checksum,
-                                  int sector_by_sector, uint64_t *imaged_sizes) {
+                                  int sector_by_sector, uint64_t *imaged_sizes,
+                                  char (*part_files)[SPLIT_MAX_FILES][SPLIT_NAME_LEN],
+                                  const int *part_file_counts) {
     char meta_path[MAX_PATH_LEN];
     snprintf(meta_path, sizeof(meta_path), "%s/metadata.json", backup_path);
 
@@ -1469,10 +1610,6 @@ static void write_metadata_json(const char *backup_path, const char *source,
     for (int i = 0; i < part_count; i++) {
         if (parts[i].is_extended) continue;
 
-        char filename[128];
-        const char *_ext = (strcmp(compression, "gzip") == 0) ? ".gz" : ".raw";
-        snprintf(filename, sizeof(filename), "partition-%d%s", parts[i].index, _ext);
-
         fprintf(f, "    {\n");
         fprintf(f, "      \"index\": %d,\n", parts[i].index);
         fprintf(f, "      \"type_name\": \"%s\",\n", parts[i].type_name);
@@ -1483,7 +1620,21 @@ static void write_metadata_json(const char *backup_path, const char *source,
         fprintf(f, "      \"imaged_size_bytes\": %llu,\n",
                 (unsigned long long)(imaged_sizes ? imaged_sizes[i] :
                     parts[i].total_sectors * SECTOR_SIZE));
-        fprintf(f, "      \"compressed_files\": [\"%s\"],\n", filename);
+        /* compressed_files: list every split-file emitted for this
+         * partition. Falls back to a single conventional name when no
+         * list was recorded (defensive — shouldn't happen in practice). */
+        fprintf(f, "      \"compressed_files\": [");
+        int nfiles = part_file_counts ? part_file_counts[i] : 0;
+        if (nfiles > 0) {
+            for (int k = 0; k < nfiles; k++) {
+                fprintf(f, "%s\"%s\"", k == 0 ? "" : ", ",
+                        part_files[i][k]);
+            }
+        } else {
+            const char *_ext = (strcmp(compression, "gzip") == 0) ? ".gz" : ".raw";
+            fprintf(f, "\"partition-%d%s\"", parts[i].index, _ext);
+        }
+        fprintf(f, "],\n");
         fprintf(f, "      \"bootable\": %s,\n", parts[i].bootable ? "true" : "false");
         fprintf(f, "      \"is_logical\": %s\n", parts[i].is_logical ? "true" : "false");
         fprintf(f, "    }%s\n", (i < part_count - 1) ? "," : "");
@@ -1525,7 +1676,8 @@ static int cmd_backup(int argc, char **argv) {
             "  --name <NAME>          Backup name (default: backup)\n"
             "  --format <TYPE>        raw (default) or gzip\n"
             "  --checksum <TYPE>      none (default), crc32, or sha256\n"
-            "  --sector-by-sector     Full sector-by-sector (no FAT compaction)\n\n"
+            "  --sector-by-sector     Full sector-by-sector (no FAT compaction)\n"
+            "  --split-size <MIB>     Split output every N MiB (raw/gzip only)\n\n"
             "DEPRECATED (still accepted): --source, --dest, --compression\n"
         );
         return 0;
@@ -1542,7 +1694,17 @@ static int cmd_backup(int argc, char **argv) {
     const char *comp_str = flag_value(argc, argv, "--format");
     if (!comp_str) comp_str = flag_value(argc, argv, "--compression");
     const char *cksum_str = flag_value(argc, argv, "--checksum");
+    const char *split_str = flag_value(argc, argv, "--split-size");
     int sector_by_sector = has_flag(argc, argv, "--sector-by-sector");
+    uint64_t split_bytes = 0;
+    if (split_str) {
+        long mib = atol(split_str);
+        if (mib <= 0) {
+            fprintf(stderr, "Error: --split-size must be a positive MiB count\n");
+            return 1;
+        }
+        split_bytes = (uint64_t)mib * 1024ULL * 1024ULL;
+    }
 
     if (!source || !dest) {
         fprintf(stderr, "Error: SOURCE and DEST are required\n");
@@ -1648,8 +1810,20 @@ static int cmd_backup(int argc, char **argv) {
     if (!buf) { fprintf(stderr, "Out of memory\n"); close(src_fd); return 1; }
 
     uint64_t *imaged_sizes = (uint64_t *)calloc(part_count + 1, sizeof(uint64_t));
-    char checksums[MAX_PARTITIONS][128];
-    memset(checksums, 0, sizeof(checksums));
+
+    /* Per-partition output-file lists. With --split-size each partition
+     * may produce multiple files; without splitting, exactly one. The
+     * `metadata.json` writer below renders these as the
+     * `compressed_files` array. Heap-allocated to keep this off the
+     * stack (~512 KB at MAX_PARTITIONS=64 × SPLIT_MAX_FILES=64). */
+    int *part_file_counts = (int *)calloc(part_count + 1, sizeof(int));
+    char (*part_files)[SPLIT_MAX_FILES][SPLIT_NAME_LEN] =
+        calloc(part_count + 1, sizeof(*part_files));
+    if (!imaged_sizes || !part_file_counts || !part_files) {
+        fprintf(stderr, "Out of memory\n");
+        close(src_fd);
+        return 1;
+    }
 
     const char *comp_name = compression == COMP_GZIP ? "gzip" : "raw";
     const char *cksum_name = checksum == CKSUM_CRC32 ? "crc32"
@@ -1657,42 +1831,41 @@ static int cmd_backup(int argc, char **argv) {
 
     if (part_count == 0 && pt.type == PT_NONE) {
         /* Superfloppy: back up entire device as one partition */
-        const char *ext = compression == COMP_GZIP ? ".gz" : ".raw";
-        char out_path[MAX_PATH_LEN];
-        snprintf(out_path, sizeof(out_path), "%s/partition-0%s", backup_path, ext);
-
         fprintf(stderr, "Backing up entire %s image...\n", pt.fs_hint);
         lseek(src_fd, 0, SEEK_SET);
 
-        uint64_t written = 0;
-        if (compression == COMP_GZIP) {
-            gzFile gz = gzopen(out_path, "wb9");
-            if (!gz) { fprintf(stderr, "Error: Cannot create %s\n", out_path); free(buf); close(src_fd); return 1; }
-            ssize_t nr;
-            while ((nr = read(src_fd, buf, CHUNK_SIZE)) > 0) {
-                gzwrite(gz, buf, nr);
-                written += nr;
-                if (source_size > 0) draw_progress((double)written / source_size * 100.0, pt.fs_hint);
-            }
-            gzclose(gz);
-        } else {
-            FILE *out = fopen(out_path, "wb");
-            if (!out) { fprintf(stderr, "Error: Cannot create %s\n", out_path); free(buf); close(src_fd); return 1; }
-            ssize_t nr;
-            while ((nr = read(src_fd, buf, CHUNK_SIZE)) > 0) {
-                fwrite(buf, 1, nr, out);
-                written += nr;
-                if (source_size > 0) draw_progress((double)written / source_size * 100.0, pt.fs_hint);
-            }
-            fclose(out);
+        SplitWriter sw;
+        if (splitwriter_open(&sw, backup_path, "partition-0",
+                             comp_ext(compression),
+                             compression == COMP_GZIP, split_bytes) != 0) {
+            free(buf); close(src_fd); return 1;
         }
+
+        uint64_t written = 0;
+        ssize_t nr;
+        while ((nr = read(src_fd, buf, CHUNK_SIZE)) > 0) {
+            if (splitwriter_write(&sw, buf, nr) != 0) {
+                splitwriter_close(&sw); free(buf); close(src_fd); return 1;
+            }
+            written += nr;
+            if (source_size > 0)
+                draw_progress((double)written / source_size * 100.0, pt.fs_hint);
+        }
+        splitwriter_close(&sw);
         fprintf(stderr, "\n");
 
-        /* Checksum */
-        if (checksum != CKSUM_NONE) {
-            fprintf(stderr, "[INFO] Computing checksum...\n");
-            write_checksum(out_path, checksum, checksums[0], sizeof(checksums[0]));
-            fprintf(stderr, "[INFO] %s: %s\n", cksum_name, checksums[0]);
+        /* Record emitted files + per-file checksums */
+        part_file_counts[0] = sw.num_files;
+        for (int k = 0; k < sw.num_files; k++) {
+            strncpy(part_files[0][k], sw.files[k], SPLIT_NAME_LEN - 1);
+            if (checksum != CKSUM_NONE) {
+                char fpath[MAX_PATH_LEN];
+                char hex[128];
+                snprintf(fpath, sizeof(fpath), "%s/%s", backup_path, sw.files[k]);
+                fprintf(stderr, "[INFO] %s %s...\n", cksum_name, sw.files[k]);
+                write_checksum(fpath, checksum, hex, sizeof(hex));
+                fprintf(stderr, "[INFO]   %s\n", hex);
+            }
         }
 
         parts[0].index = 0;
@@ -1722,76 +1895,65 @@ static int cmd_backup(int argc, char **argv) {
                 cf = compact_fat_open(src_fd, part_offset, part_size);
             }
 
-            const char *ext = compression == COMP_GZIP ? ".gz" : ".raw";
-            char out_path[MAX_PATH_LEN];
-            snprintf(out_path, sizeof(out_path), "%s/partition-%d%s",
-                     backup_path, parts[i].index, ext);
+            char stem[64];
+            snprintf(stem, sizeof(stem), "partition-%d", parts[i].index);
+
+            SplitWriter sw;
+            if (splitwriter_open(&sw, backup_path, stem, comp_ext(compression),
+                                 compression == COMP_GZIP, split_bytes) != 0) {
+                compact_fat_close(cf);
+                continue;
+            }
 
             uint64_t total_to_write = cf ? cf->total_output_size : part_size;
             uint64_t written = 0;
+            const char *prog_label =
+                cf ? (compression == COMP_GZIP ? "compact+gz" : "compact")
+                   : (compression == COMP_GZIP ? "gzip" : parts[i].type_name);
 
-            if (compression == COMP_GZIP) {
-                gzFile gz = gzopen(out_path, "wb9");
-                if (!gz) { fprintf(stderr, "Error: Cannot create %s\n", out_path); compact_fat_close(cf); continue; }
-
-                if (cf) {
-                    ssize_t nr;
-                    while ((nr = compact_fat_read(cf, buf, CHUNK_SIZE)) > 0) {
-                        gzwrite(gz, buf, nr);
-                        written += nr;
-                        draw_progress((double)written / total_to_write * 100.0, "compact+gz");
-                    }
-                } else {
-                    lseek(src_fd, part_offset, SEEK_SET);
-                    uint64_t remaining = part_size;
-                    while (remaining > 0) {
-                        size_t to_read = remaining > CHUNK_SIZE ? CHUNK_SIZE : (size_t)remaining;
-                        ssize_t nr = read(src_fd, buf, to_read);
-                        if (nr <= 0) break;
-                        gzwrite(gz, buf, nr);
-                        written += nr;
-                        remaining -= nr;
-                        draw_progress((double)written / part_size * 100.0, "gzip");
-                    }
+            if (cf) {
+                ssize_t nr;
+                while ((nr = compact_fat_read(cf, buf, CHUNK_SIZE)) > 0) {
+                    if (splitwriter_write(&sw, buf, nr) != 0) break;
+                    written += nr;
+                    draw_progress((double)written / total_to_write * 100.0,
+                                  prog_label);
                 }
-                gzclose(gz);
             } else {
-                FILE *out = fopen(out_path, "wb");
-                if (!out) { fprintf(stderr, "Error: Cannot create %s\n", out_path); compact_fat_close(cf); continue; }
-
-                if (cf) {
-                    ssize_t nr;
-                    while ((nr = compact_fat_read(cf, buf, CHUNK_SIZE)) > 0) {
-                        fwrite(buf, 1, nr, out);
-                        written += nr;
-                        draw_progress((double)written / total_to_write * 100.0, "compact");
-                    }
-                } else {
-                    lseek(src_fd, part_offset, SEEK_SET);
-                    uint64_t remaining = part_size;
-                    while (remaining > 0) {
-                        size_t to_read = remaining > CHUNK_SIZE ? CHUNK_SIZE : (size_t)remaining;
-                        ssize_t nr = read(src_fd, buf, to_read);
-                        if (nr <= 0) break;
-                        fwrite(buf, 1, nr, out);
-                        written += nr;
-                        remaining -= nr;
-                        draw_progress((double)written / part_size * 100.0, parts[i].type_name);
-                    }
+                lseek(src_fd, part_offset, SEEK_SET);
+                uint64_t remaining = part_size;
+                while (remaining > 0) {
+                    size_t to_read = remaining > CHUNK_SIZE
+                                     ? CHUNK_SIZE : (size_t)remaining;
+                    ssize_t nr = read(src_fd, buf, to_read);
+                    if (nr <= 0) break;
+                    if (splitwriter_write(&sw, buf, nr) != 0) break;
+                    written += nr;
+                    remaining -= nr;
+                    draw_progress((double)written / part_size * 100.0,
+                                  prog_label);
                 }
-                fclose(out);
             }
+            splitwriter_close(&sw);
 
             imaged_sizes[i] = written;
             compact_fat_close(cf);
             fprintf(stderr, "\n");
 
-            /* Checksum */
-            if (checksum != CKSUM_NONE) {
-                fprintf(stderr, "[INFO] Computing %s for partition-%d...\n",
-                        cksum_name, parts[i].index);
-                write_checksum(out_path, checksum, checksums[i], sizeof(checksums[i]));
-                fprintf(stderr, "[INFO] %s: %s\n", cksum_name, checksums[i]);
+            /* Record emitted files + per-file checksums */
+            part_file_counts[i] = sw.num_files;
+            for (int k = 0; k < sw.num_files; k++) {
+                strncpy(part_files[i][k], sw.files[k], SPLIT_NAME_LEN - 1);
+                if (checksum != CKSUM_NONE) {
+                    char fpath[MAX_PATH_LEN];
+                    char hex[128];
+                    snprintf(fpath, sizeof(fpath), "%s/%s",
+                             backup_path, sw.files[k]);
+                    fprintf(stderr, "[INFO] %s %s...\n",
+                            cksum_name, sw.files[k]);
+                    write_checksum(fpath, checksum, hex, sizeof(hex));
+                    fprintf(stderr, "[INFO]   %s\n", hex);
+                }
             }
         }
     }
@@ -1801,10 +1963,13 @@ static int cmd_backup(int argc, char **argv) {
     /* Write metadata.json */
     write_metadata_json(backup_path, source, source_size, &pt,
                         parts, part_count, comp_name, cksum_name,
-                        sector_by_sector, imaged_sizes);
+                        sector_by_sector, imaged_sizes,
+                        part_files, part_file_counts);
     fprintf(stderr, "[INFO] Wrote metadata.json\n");
 
     free(imaged_sizes);
+    free(part_file_counts);
+    free(part_files);
     close(src_fd);
     fprintf(stderr, "\nBackup completed successfully.\n");
     return 0;
@@ -1906,8 +2071,15 @@ static int cmd_restore(int argc, char **argv) {
     uint8_t *buf = (uint8_t *)malloc(CHUNK_SIZE);
     if (!buf) { close(tgt_fd); closedir(bdir); return 1; }
 
-    /* Parse partition start_lba values from metadata for positioning */
-    struct { int index; uint64_t start_lba; uint64_t size; char filename[128]; } restorable[MAX_PARTITIONS];
+    /* Parse partition start_lba values + compressed_files list for
+     * positioning and split-file traversal. */
+    struct {
+        int index;
+        uint64_t start_lba;
+        uint64_t size;
+        char filenames[SPLIT_MAX_FILES][SPLIT_NAME_LEN];
+        int file_count;
+    } restorable[MAX_PARTITIONS];
     int restore_count = 0;
 
     /* Simple parser: find each partition entry */
@@ -1929,17 +2101,47 @@ static int cmd_restore(int argc, char **argv) {
             sscanf(size_p + 20, "%llu", (unsigned long long *)&isize);
         }
 
-        if (idx >= 0) {
+        if (idx >= 0 && restore_count < MAX_PARTITIONS) {
             restorable[restore_count].index = idx;
             restorable[restore_count].start_lba = slba;
             restorable[restore_count].size = isize;
-            /* Try .gz first, then .raw */
-            snprintf(restorable[restore_count].filename, 128,
-                     "%s/partition-%d.gz", backup_dir, idx);
-            struct stat _rs;
-            if (stat(restorable[restore_count].filename, &_rs) != 0) {
-                snprintf(restorable[restore_count].filename, 128,
-                         "%s/partition-%d.raw", backup_dir, idx);
+            restorable[restore_count].file_count = 0;
+
+            /* Parse `compressed_files: ["a", "b", ...]` for this entry. */
+            const char *cf = strstr(scan, "\"compressed_files\"");
+            if (cf && cf < scan + 800) {
+                const char *lb = strchr(cf, '[');
+                const char *rb = lb ? strchr(lb, ']') : NULL;
+                if (lb && rb) {
+                    const char *q = lb;
+                    while (q < rb
+                        && restorable[restore_count].file_count < SPLIT_MAX_FILES) {
+                        q = strchr(q, '"');
+                        if (!q || q >= rb) break;
+                        q++;
+                        const char *qe = strchr(q, '"');
+                        if (!qe || qe > rb) break;
+                        int len = qe - q;
+                        if (len > SPLIT_NAME_LEN - 1) len = SPLIT_NAME_LEN - 1;
+                        char *slot = restorable[restore_count].filenames[
+                            restorable[restore_count].file_count++];
+                        memcpy(slot, q, len);
+                        slot[len] = '\0';
+                        q = qe + 1;
+                    }
+                }
+            }
+            /* Fallback for older backups that pre-date compressed_files. */
+            if (restorable[restore_count].file_count == 0) {
+                struct stat _rs;
+                char *slot = restorable[restore_count].filenames[0];
+                snprintf(slot, SPLIT_NAME_LEN, "partition-%d.gz", idx);
+                char fpath[MAX_PATH_LEN];
+                snprintf(fpath, sizeof(fpath), "%s/%s", backup_dir, slot);
+                if (stat(fpath, &_rs) != 0) {
+                    snprintf(slot, SPLIT_NAME_LEN, "partition-%d.raw", idx);
+                }
+                restorable[restore_count].file_count = 1;
             }
             restore_count++;
         }
@@ -1950,53 +2152,65 @@ static int cmd_restore(int argc, char **argv) {
     fprintf(stderr, "Restoring %d partition(s) to %s\n\n", restore_count, target);
 
     for (int i = 0; i < restore_count; i++) {
-        const char *fname = restorable[i].filename;
-        int is_gz = (strlen(fname) > 3 && strcmp(fname + strlen(fname) - 3, ".gz") == 0);
-
-        /* Seek to partition offset in target */
+        /* Seek to partition offset in target. Subsequent split files
+         * stream directly to the current file position (the kernel
+         * keeps it advancing after each write). */
         off_t offset = (off_t)restorable[i].start_lba * SECTOR_SIZE;
         lseek(tgt_fd, offset, SEEK_SET);
 
-        fprintf(stderr, "Restoring partition %d to LBA %llu%s...\n",
-                restorable[i].index, (unsigned long long)restorable[i].start_lba,
-                is_gz ? " (decompressing)" : "");
+        const char *first = restorable[i].filenames[0];
+        int is_gz = (strlen(first) > 3
+                     && strcmp(first + strlen(first) - 3, ".gz") == 0);
+
+        fprintf(stderr, "Restoring partition %d to LBA %llu%s (%d file%s)...\n",
+                restorable[i].index,
+                (unsigned long long)restorable[i].start_lba,
+                is_gz ? " (decompressing)" : "",
+                restorable[i].file_count,
+                restorable[i].file_count == 1 ? "" : "s");
 
         uint64_t written = 0;
 
-        if (is_gz) {
-            gzFile gz = gzopen(fname, "rb");
-            if (!gz) {
-                fprintf(stderr, "[WARN] Cannot open %s, skipping\n", fname);
-                continue;
-            }
-            int nr;
-            while ((nr = gzread(gz, buf, CHUNK_SIZE)) > 0) {
-                write(tgt_fd, buf, nr);
-                written += nr;
-                if (restorable[i].size > 0) {
-                    draw_progress((double)written / restorable[i].size * 100.0, "Restoring");
-                }
-            }
-            gzclose(gz);
-        } else {
-            FILE *pf = fopen(fname, "rb");
-            if (!pf) {
-                fprintf(stderr, "[WARN] Cannot open %s, skipping\n", fname);
-                continue;
-            }
-            fseek(pf, 0, SEEK_END);
-            uint64_t file_size = ftell(pf);
-            fseek(pf, 0, SEEK_SET);
+        for (int k = 0; k < restorable[i].file_count; k++) {
+            char fpath[MAX_PATH_LEN];
+            snprintf(fpath, sizeof(fpath), "%s/%s",
+                     backup_dir, restorable[i].filenames[k]);
 
-            size_t nr;
-            while ((nr = fread(buf, 1, CHUNK_SIZE, pf)) > 0) {
-                write(tgt_fd, buf, nr);
-                written += nr;
-                if (file_size > 0) {
-                    draw_progress((double)written / file_size * 100.0, "Restoring");
+            if (is_gz) {
+                gzFile gz = gzopen(fpath, "rb");
+                if (!gz) {
+                    fprintf(stderr, "[WARN] Cannot open %s, skipping rest\n",
+                            fpath);
+                    break;
                 }
+                int nr;
+                while ((nr = gzread(gz, buf, CHUNK_SIZE)) > 0) {
+                    write(tgt_fd, buf, nr);
+                    written += nr;
+                    if (restorable[i].size > 0) {
+                        draw_progress((double)written / restorable[i].size * 100.0,
+                                      "Restoring");
+                    }
+                }
+                gzclose(gz);
+            } else {
+                FILE *pf = fopen(fpath, "rb");
+                if (!pf) {
+                    fprintf(stderr, "[WARN] Cannot open %s, skipping rest\n",
+                            fpath);
+                    break;
+                }
+                size_t nr;
+                while ((nr = fread(buf, 1, CHUNK_SIZE, pf)) > 0) {
+                    write(tgt_fd, buf, nr);
+                    written += nr;
+                    if (restorable[i].size > 0) {
+                        draw_progress((double)written / restorable[i].size * 100.0,
+                                      "Restoring");
+                    }
+                }
+                fclose(pf);
             }
-            fclose(pf);
         }
         fprintf(stderr, "\n[INFO] Wrote %llu bytes\n", (unsigned long long)written);
     }

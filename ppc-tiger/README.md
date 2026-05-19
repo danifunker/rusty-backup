@@ -7,7 +7,8 @@ A native PowerPC port of [rusty-backup](https://github.com/danifunker/rusty-back
 All core rusty-backup functionality, running natively on Tiger:
 
 - **Partition table support**: MBR (with EBR chain for logical partitions), APM, Superfloppy
-- **Gzip compression**: `--compression gzip` via zlib (ships with Tiger)
+- **Gzip compression**: `--format gzip` via zlib (ships with Tiger)
+- **Split output**: `--split-size <MIB>` chunks raw/gzip streams into `partition-N.raw`, `partition-N.001.raw`, ... (matches rb-cli's split naming so cross-tool restore works)
 - **Checksums**: CRC32 (`--checksum crc32`) and SHA-256 (`--checksum sha256`) — both match rb-cli's value set, so backups cross-verify in either direction. SHA-1 is intentionally not exposed.
 - **FAT compaction**: Automatic for FAT12/16/32 — only backs up allocated clusters
 - **Metadata**: Compatible `metadata.json` format
