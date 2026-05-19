@@ -368,6 +368,48 @@ fn write_requires_yes_flag() {
 }
 
 #[test]
+fn batch_applies_mkdir_put_rm_in_one_pass() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let img = dir.path().join("disk.dsk");
+    let img_s = img.to_str().unwrap();
+    run(&[
+        "new", img_s, "--fs", "hfs", "--size", "10M", "--name", "Batch",
+    ]);
+
+    let host_a = dir.path().join("a.bin");
+    std::fs::write(&host_a, b"AAA").unwrap();
+    let host_b = dir.path().join("b.bin");
+    std::fs::write(&host_b, b"BBB").unwrap();
+
+    let script = dir.path().join("script.json");
+    let script_text = serde_json::json!({
+        "schema": "rb-cli-batch/1",
+        "target": img_s,
+        "operations": [
+            { "op": "mkdir", "path": "/Stuff" },
+            { "op": "put", "src": host_a.to_str().unwrap(), "dst": "/Stuff/a.bin" },
+            { "op": "put", "src": host_b.to_str().unwrap(), "dst": "/Stuff/b.bin" },
+            { "op": "rm", "path": "/Stuff/a.bin" }
+        ]
+    });
+    std::fs::write(&script, serde_json::to_string_pretty(&script_text).unwrap()).unwrap();
+
+    // Dry-run prints a plan but doesn't write.
+    let dry = run(&["batch", script.to_str().unwrap(), "--dry-run"]);
+    let dry_text = String::from_utf8(dry.stdout).unwrap();
+    assert!(dry_text.contains("mkdir /Stuff"));
+    assert!(dry_text.contains("put"));
+
+    // Real apply.
+    run(&["batch", script.to_str().unwrap()]);
+
+    let ls = run(&["ls", img_s, "/Stuff"]);
+    let ls_text = String::from_utf8(ls.stdout).unwrap();
+    assert!(!ls_text.contains("a.bin"), "a.bin should be rm'd");
+    assert!(ls_text.contains("b.bin"), "b.bin should remain");
+}
+
+#[test]
 fn inspect_text_runs_on_raw_hfs_image() {
     let dir = tempfile::tempdir().expect("tempdir");
     let img = dir.path().join("disk.dsk");

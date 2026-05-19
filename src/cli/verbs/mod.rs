@@ -7,6 +7,7 @@
 //! through `src/model/*_runner.rs` runners shared with the GUI.
 
 pub mod backup;
+pub mod batch;
 pub mod completions;
 pub mod fsck;
 pub mod get;

@@ -87,6 +87,10 @@ pub enum Command {
     /// Stream an image file onto a block device.
     Write(verbs::write::WriteArgs),
 
+    /// Apply a JSON-described sequence of FS operations to an image as
+    /// one transaction-like batch.
+    Batch(verbs::batch::BatchArgs),
+
     /// Focused read-only queries.
     Show {
         #[command(subcommand)]
@@ -130,6 +134,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Backup(args) => verbs::backup::run(args),
         Command::Restore(args) => verbs::restore::run(args),
         Command::Write(args) => verbs::write::run(args),
+        Command::Batch(args) => verbs::batch::run(args),
         Command::Show { cmd } => verbs::show::run(cmd),
         Command::Completions(args) => verbs::completions::run_emit(args),
         Command::InstallCompletions(args) => verbs::completions::run_install(args),
