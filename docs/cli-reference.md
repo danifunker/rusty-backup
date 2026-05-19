@@ -371,6 +371,24 @@ Usage: convert [OPTIONS] <IN> <OUT>
 - `--bincue-multi-bin` — For BIN/CUE output, write one .bin per track instead of a single concatenated .bin. No effect for other formats
 - `--overwrite` — Overwrite destination files that already exist. Without this, existing outputs are skipped with a warning
 
+### `expand`
+
+Expand a classic-HFS volume to a new size + allocation block size by cloning into a fresh APM disk image
+
+```
+Usage: expand [OPTIONS] --size <SIZE> --output <OUTPUT> <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Source image reference (`path` or `path@N` for the classic HFS partition)
+
+**Options**
+
+- `--size` — Target volume size in bytes. Accepts suffixes (`K`, `M`, `G`)
+- `--block-size` — Allocation block size in bytes. One of: 4096, 8192, 16384, 32768, 65536. If omitted, picks the smallest block size whose 65535-block ceiling can hold `--size`
+- `--output` — Destination path for the new APM disk image. Created (or truncated)
+
 ### `fsck`
 
 Check (and optionally repair) a filesystem
@@ -507,6 +525,22 @@ Usage: put [OPTIONS] <IMAGE> [HOST_FILE] [DST]
 - `--type` — 4-character type code (HFS / HFS+ / ProDOS). Defaults to `BINA`
 - `--creator` — 4-character creator code (HFS / HFS+ only). Defaults to `????`
 - `--force` — Overwrite an existing entry at the destination path
+
+### `resize`
+
+Resize the filesystem at IMG@N to a new size (FAT/NTFS/exFAT/HFS+/ ext/btrfs/SFS/PFS3/AFFS/EFS — whichever magic matches)
+
+```
+Usage: resize --size <SIZE> <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
+
+**Options**
+
+- `--size` — New filesystem size in bytes. Accepts suffixes (`K`, `M`, `G`)
 
 ### `restore`
 

@@ -76,6 +76,14 @@ pub enum Command {
     /// dropped (SGI/IRIX today).
     Shrink(verbs::shrink::ShrinkArgs),
 
+    /// Resize the filesystem at IMG@N to a new size (FAT/NTFS/exFAT/HFS+/
+    /// ext/btrfs/SFS/PFS3/AFFS/EFS — whichever magic matches).
+    Resize(verbs::resize::ResizeArgs),
+
+    /// Expand a classic-HFS volume to a new size + allocation block size
+    /// by cloning into a fresh APM disk image.
+    Expand(verbs::expand::ExpandArgs),
+
     /// Whole-disk aggregate read-only view (partition table + per-partition
     /// summary + CHD metadata when applicable).
     Inspect(verbs::inspect::InspectArgs),
@@ -145,6 +153,8 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Mkdir(args) => verbs::mkdir::run(args),
         Command::Fsck(args) => verbs::fsck::run(args),
         Command::Shrink(args) => verbs::shrink::run(args),
+        Command::Resize(args) => verbs::resize::run(args),
+        Command::Expand(args) => verbs::expand::run(args),
         Command::Inspect(args) => verbs::inspect::run(args),
         Command::Backup(args) => verbs::backup::run(args),
         Command::Restore(args) => verbs::restore::run(args),

@@ -44,6 +44,8 @@ fn top_level_verbs_present() {
         "shrink",
         "inspect",
         "show",
+        "resize",
+        "expand",
         "convert",
         "batch-template",
         "completions",
