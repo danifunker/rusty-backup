@@ -288,6 +288,86 @@ fn ls_and_rm_support_glob_patterns() {
 }
 
 #[test]
+fn backup_then_restore_round_trip_file_to_file() {
+    // Phase C: rb-cli backup IMG DIR  ->  rb-cli restore DIR OUT
+    // Smoke-tests that the two flat verbs hand off through the on-disk
+    // backup folder. Uses an HFS image so we don't depend on having
+    // root or an actual block device.
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src_img = dir.path().join("src.dsk");
+    let src_s = src_img.to_str().unwrap();
+
+    // Build a small HFS image so the backup has something to chew.
+    run(&[
+        "new",
+        src_s,
+        "--fs",
+        "hfs",
+        "--size",
+        "5M",
+        "--name",
+        "BackupSrc",
+    ]);
+
+    let backups = dir.path().join("backups");
+    std::fs::create_dir_all(&backups).unwrap();
+
+    run(&[
+        "backup",
+        src_s,
+        backups.to_str().unwrap(),
+        "--name",
+        "round_trip",
+        "--format",
+        "zstd",
+        "--checksum",
+        "crc32",
+    ]);
+
+    let backup_dir = backups.join("round_trip");
+    assert!(
+        backup_dir.join("metadata.json").exists(),
+        "backup didn't produce metadata.json"
+    );
+
+    let restored = dir.path().join("restored.img");
+    run(&[
+        "restore",
+        backup_dir.to_str().unwrap(),
+        restored.to_str().unwrap(),
+    ]);
+
+    // Restored file exists and is non-empty.
+    let len = std::fs::metadata(&restored).unwrap().len();
+    assert!(len > 0, "restored file is empty");
+}
+
+#[test]
+fn write_requires_yes_flag() {
+    // We can't actually flash a device in a test, but we can verify the
+    // safety gate fires without --yes.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let img = dir.path().join("src.dsk");
+    let img_s = img.to_str().unwrap();
+    run(&[
+        "new",
+        img_s,
+        "--fs",
+        "hfs",
+        "--size",
+        "800K",
+        "--name",
+        "WriteTest",
+    ]);
+    // Targeting a regular file would actually copy bytes if we passed
+    // --yes; here we omit it to exercise the destructive-write refusal.
+    let target = dir.path().join("target.bin");
+    let target_s = target.to_str().unwrap();
+    run_expect_fail(&["write", img_s, target_s]);
+}
+
+#[test]
 fn inspect_text_runs_on_raw_hfs_image() {
     let dir = tempfile::tempdir().expect("tempdir");
     let img = dir.path().join("disk.dsk");

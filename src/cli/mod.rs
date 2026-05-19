@@ -78,6 +78,15 @@ pub enum Command {
     /// summary + CHD metadata when applicable).
     Inspect(verbs::inspect::InspectArgs),
 
+    /// Back up a disk image or device to a backup folder.
+    Backup(verbs::backup::BackupArgs),
+
+    /// Restore a backup folder to a target image or device.
+    Restore(verbs::restore::RestoreArgs),
+
+    /// Stream an image file onto a block device.
+    Write(verbs::write::WriteArgs),
+
     /// Focused read-only queries.
     Show {
         #[command(subcommand)]
@@ -118,6 +127,9 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Fsck(args) => verbs::fsck::run(args),
         Command::Shrink(args) => verbs::shrink::run(args),
         Command::Inspect(args) => verbs::inspect::run(args),
+        Command::Backup(args) => verbs::backup::run(args),
+        Command::Restore(args) => verbs::restore::run(args),
+        Command::Write(args) => verbs::write::run(args),
         Command::Show { cmd } => verbs::show::run(cmd),
         Command::Completions(args) => verbs::completions::run_emit(args),
         Command::InstallCompletions(args) => verbs::completions::run_install(args),

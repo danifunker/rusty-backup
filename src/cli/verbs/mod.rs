@@ -6,6 +6,7 @@
 //! touches threads or status structs directly; long-running work goes
 //! through `src/model/*_runner.rs` runners shared with the GUI.
 
+pub mod backup;
 pub mod completions;
 pub mod fsck;
 pub mod get;
@@ -14,6 +15,8 @@ pub mod ls;
 pub mod mkdir;
 pub mod new;
 pub mod put;
+pub mod restore;
 pub mod rm;
 pub mod show;
 pub mod shrink;
+pub mod write;
