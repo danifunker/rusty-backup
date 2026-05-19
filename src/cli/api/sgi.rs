@@ -28,7 +28,7 @@ pub fn run(verb: SgiCommand) -> Result<()> {
     }
 }
 
-fn cmd_shrink(input: PathBuf, output: PathBuf) -> Result<()> {
+pub(crate) fn cmd_shrink(input: PathBuf, output: PathBuf) -> Result<()> {
     use std::sync::atomic::AtomicBool;
 
     let cancel = AtomicBool::new(false);

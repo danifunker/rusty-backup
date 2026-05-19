@@ -26,6 +26,7 @@ pub mod io;
 pub mod logging;
 pub mod output;
 pub mod parse;
+pub mod verbs;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -45,8 +46,50 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Unstable scratch namespace for low-level operations. Grammar inside
-    /// `api` is expected to churn — do not depend on it from durable scripts.
+    /// Create a blank single-partition image (superfloppy or, in Phase
+    /// D, partition-table-wrapped).
+    New(verbs::new::NewArgs),
+
+    /// List a directory inside a filesystem.
+    Ls(verbs::ls::LsArgs),
+
+    /// Copy a host file (or zero-fill / write boot blocks) into a filesystem.
+    Put(verbs::put::PutArgs),
+
+    /// Extract a file from a filesystem to the host.
+    Get(verbs::get::GetArgs),
+
+    /// Delete a file or directory from a filesystem.
+    Rm(verbs::rm::RmArgs),
+
+    /// Create a directory inside a filesystem.
+    Mkdir(verbs::mkdir::MkdirArgs),
+
+    /// Check (and optionally repair) a filesystem.
+    Fsck(verbs::fsck::FsckArgs),
+
+    /// Re-encode a disk image into a CHD with trailing zero padding
+    /// dropped (SGI/IRIX today).
+    Shrink(verbs::shrink::ShrinkArgs),
+
+    /// Focused read-only queries.
+    Show {
+        #[command(subcommand)]
+        cmd: verbs::show::ShowCommand,
+    },
+
+    /// Emit a shell-completion script to stdout.
+    #[command(name = "completions")]
+    Completions(verbs::completions::EmitArgs),
+
+    /// Install shell completions to the user-scoped canonical location.
+    #[command(name = "install-completions")]
+    InstallCompletions(verbs::completions::InstallArgs),
+
+    /// Unstable scratch namespace for low-level operations. Kept as a
+    /// deprecated alias for the flat verbs above; grammar inside `api`
+    /// is expected to churn — do not depend on it from durable scripts.
+    #[command(hide = true)]
     Api {
         #[command(subcommand)]
         group: api::ApiGroup,
@@ -60,6 +103,17 @@ pub enum Command {
 pub fn run(cli: Cli) -> Result<()> {
     logging::install(&cli.globals)?;
     match cli.command {
+        Command::New(args) => verbs::new::run(args),
+        Command::Ls(args) => verbs::ls::run(args),
+        Command::Put(args) => verbs::put::run(args),
+        Command::Get(args) => verbs::get::run(args),
+        Command::Rm(args) => verbs::rm::run(args),
+        Command::Mkdir(args) => verbs::mkdir::run(args),
+        Command::Fsck(args) => verbs::fsck::run(args),
+        Command::Shrink(args) => verbs::shrink::run(args),
+        Command::Show { cmd } => verbs::show::run(cmd),
+        Command::Completions(args) => verbs::completions::run_emit(args),
+        Command::InstallCompletions(args) => verbs::completions::run_install(args),
         Command::Api { group } => api::run(group),
     }
 }

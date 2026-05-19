@@ -260,7 +260,12 @@ pub fn resolve_hfs_offset(
 // new
 // ---------------------------------------------------------------------------
 
-fn cmd_new(image: PathBuf, size_arg: &str, name: &str, block_size: Option<u32>) -> Result<()> {
+pub(crate) fn cmd_new(
+    image: PathBuf,
+    size_arg: &str,
+    name: &str,
+    block_size: Option<u32>,
+) -> Result<()> {
     let size = parse_size(size_arg)?;
     if size < 1024 {
         bail!("size {size} is too small for an HFS volume");
@@ -301,7 +306,7 @@ fn cmd_new(image: PathBuf, size_arg: &str, name: &str, block_size: Option<u32>) 
 // info / ls
 // ---------------------------------------------------------------------------
 
-fn cmd_info(image: PathBuf, partition: Option<u32>) -> Result<()> {
+pub(crate) fn cmd_info(image: PathBuf, partition: Option<u32>) -> Result<()> {
     let mut file = open_image_ro(&image)?;
     let (offset, label) = resolve_hfs_offset(&mut file, partition)?;
     if let Some(l) = &label {
@@ -319,7 +324,7 @@ fn cmd_info(image: PathBuf, partition: Option<u32>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_ls(image: PathBuf, path: &str, partition: Option<u32>) -> Result<()> {
+pub(crate) fn cmd_ls(image: PathBuf, path: &str, partition: Option<u32>) -> Result<()> {
     let mut file = open_image_ro(&image)?;
     let (offset, label) = resolve_hfs_offset(&mut file, partition)?;
     if let Some(l) = &label {
@@ -347,7 +352,7 @@ fn cmd_ls(image: PathBuf, path: &str, partition: Option<u32>) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-fn cmd_put(
+pub(crate) fn cmd_put(
     image: PathBuf,
     host_file: Option<PathBuf>,
     mac_path: &str,
@@ -415,7 +420,7 @@ fn cmd_put(
     Ok(())
 }
 
-fn cmd_get(
+pub(crate) fn cmd_get(
     image: PathBuf,
     mac_path: &str,
     host_file: PathBuf,
@@ -438,7 +443,7 @@ fn cmd_get(
     Ok(())
 }
 
-fn cmd_rm(image: PathBuf, mac_path: &str, partition: Option<u32>) -> Result<()> {
+pub(crate) fn cmd_rm(image: PathBuf, mac_path: &str, partition: Option<u32>) -> Result<()> {
     let (parent_path, name) = split_mac_path(mac_path)?;
     if name.is_empty() {
         bail!("path has no filename");
@@ -468,7 +473,7 @@ fn cmd_rm(image: PathBuf, mac_path: &str, partition: Option<u32>) -> Result<()> 
 // put-boot / validate
 // ---------------------------------------------------------------------------
 
-fn cmd_put_boot(image: PathBuf, bb_file: PathBuf) -> Result<()> {
+pub(crate) fn cmd_put_boot(image: PathBuf, bb_file: PathBuf) -> Result<()> {
     let bb = std::fs::read(&bb_file).with_context(|| format!("reading {}", bb_file.display()))?;
     if bb.len() > 1024 {
         bail!(
@@ -487,7 +492,7 @@ fn cmd_put_boot(image: PathBuf, bb_file: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn cmd_validate(image: PathBuf, partition: Option<u32>) -> Result<()> {
+pub(crate) fn cmd_validate(image: PathBuf, partition: Option<u32>) -> Result<()> {
     let mut file = open_image_ro(&image)?;
     let (offset, label) = resolve_hfs_offset(&mut file, partition)?;
     if let Some(l) = &label {

@@ -19,7 +19,7 @@ pub fn run(verb: ApmCommand) -> Result<()> {
     }
 }
 
-fn cmd_info(image: PathBuf) -> Result<()> {
+pub(crate) fn cmd_info(image: PathBuf) -> Result<()> {
     let mut file = open_image_ro(&image)?;
     let apm = Apm::parse(&mut file).map_err(|e| anyhow!("parsing APM: {e}"))?;
     let bs = apm.ddr.block_size as u64;
