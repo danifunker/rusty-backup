@@ -21,7 +21,10 @@ use clap::{Parser, Subcommand};
 
 pub mod api;
 pub mod exit;
+pub mod img_at;
 pub mod io;
+pub mod logging;
+pub mod output;
 pub mod parse;
 
 #[derive(Parser, Debug)]
@@ -31,6 +34,11 @@ pub mod parse;
     disable_help_subcommand = true
 )]
 pub struct Cli {
+    /// Global verbosity / progress / color / log-file flags applied to
+    /// every verb (see `logging::GlobalFlags`).
+    #[command(flatten)]
+    pub globals: logging::GlobalFlags,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -45,10 +53,12 @@ pub enum Command {
     },
 }
 
-/// Run the parsed CLI and return on completion. Errors propagate to the
-/// `main` shim, which maps them onto the exit-code table in
-/// `crate::cli::exit`.
+/// Run the parsed CLI and return on completion. Installs logging from
+/// the global flags before dispatching. Errors propagate to the `main`
+/// shim, which maps them onto the exit-code table in
+/// [`crate::cli::exit`].
 pub fn run(cli: Cli) -> Result<()> {
+    logging::install(&cli.globals)?;
     match cli.command {
         Command::Api { group } => api::run(group),
     }

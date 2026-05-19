@@ -65,6 +65,10 @@ bzip2 = "0.6"
 base64 = "0.22"
 opticaldiscs = { git = "https://github.com/danifunker/opticaldiscs-rs", features = ["drives"] }
 cd-da-reader = { git = "https://github.com/danifunker/rust-cd-da-reader", branch = "add-data-support-0-4-1" }
+serde_yml = "0.0.12"
+csv = "1"
+clap_complete = "4"
+clap_mangen = "0.2"
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 libc = "0.2"

@@ -5,16 +5,16 @@
 use clap::Parser;
 
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
-        .format_timestamp_millis()
-        .init();
-
+    // Note: `env_logger` is initialized inside `run()` once we've parsed
+    // the global flags, so the user-supplied --log-level takes effect.
     let cli = rusty_backup::cli::Cli::parse();
     let code = match rusty_backup::cli::run(cli) {
-        Ok(()) => 0,
+        Ok(()) => rusty_backup::cli::exit::SUCCESS,
         Err(e) => {
+            // Best-effort plain-text error. Verbs that need to surface
+            // structured errors do so before bubbling here.
             eprintln!("error: {e:#}");
-            1
+            rusty_backup::cli::exit::GENERIC_FAILURE
         }
     };
     std::process::exit(code);
