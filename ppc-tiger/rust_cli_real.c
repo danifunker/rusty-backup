@@ -32,9 +32,13 @@
 #include <sys/mount.h>
 #include <zlib.h>
 
-/* No strong-hash support on the PPC build. CRC32 (via zlib) is the
- * only non-trivial checksum exposed, matching the shared subset of
- * rb-cli's `--checksum` values. */
+/* CommonCrypto for SHA-256 — available since Tiger 10.4. SHA-1 was
+ * intentionally not exposed (rb-cli uses sha256 by default; sha1
+ * would not cross-verify). */
+#ifdef __APPLE__
+#include <CommonCrypto/CommonDigest.h>
+#define HAVE_SHA256 1
+#endif
 
 #ifdef __APPLE__
 #include <crt_externs.h>
@@ -741,12 +745,13 @@ static const char *detect_alignment(const PartInfo *parts, int count,
 }
 
 /* ============================================================
- * Checksum Functions (CRC32 via zlib)
+ * Checksum Functions (CRC32 via zlib, SHA-256 via CommonCrypto)
  * ============================================================ */
 
 typedef enum {
     CKSUM_NONE = 0,
-    CKSUM_CRC32
+    CKSUM_CRC32,
+    CKSUM_SHA256
 } ChecksumType;
 
 /* Compute CRC32 of a file and write .crc32 sidecar */
@@ -777,6 +782,45 @@ static void write_crc32_sidecar(const char *filepath, uint32_t crc) {
     }
 }
 
+#ifdef HAVE_SHA256
+/* Stream a file through CC_SHA256 and write a `.sha256` sidecar. The
+ * sidecar format matches rb-cli + GNU coreutils: `<hex>  <basename>\n`. */
+static void compute_file_sha256(const char *filepath, char *hex_out) {
+    FILE *f = fopen(filepath, "rb");
+    if (!f) { hex_out[0] = '\0'; return; }
+
+    CC_SHA256_CTX ctx;
+    CC_SHA256_Init(&ctx);
+
+    uint8_t buf[CHUNK_SIZE];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+        CC_SHA256_Update(&ctx, buf, n);
+    fclose(f);
+
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256_Final(digest, &ctx);
+
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++)
+        sprintf(&hex_out[i * 2], "%02x", digest[i]);
+    hex_out[CC_SHA256_DIGEST_LENGTH * 2] = '\0';
+}
+
+static void write_sha256_sidecar(const char *filepath, const char *hex) {
+    char sidecar[MAX_PATH_LEN];
+    snprintf(sidecar, sizeof(sidecar), "%s.sha256", filepath);
+
+    const char *fname = strrchr(filepath, '/');
+    fname = fname ? fname + 1 : filepath;
+
+    FILE *f = fopen(sidecar, "w");
+    if (f) {
+        fprintf(f, "%s  %s\n", hex, fname);
+        fclose(f);
+    }
+}
+#endif
+
 static void write_checksum(const char *filepath, ChecksumType type,
                             char *hex_out, int hexsz) {
     hex_out[0] = '\0';
@@ -785,6 +829,12 @@ static void write_checksum(const char *filepath, ChecksumType type,
         snprintf(hex_out, hexsz, "%08x", crc);
         write_crc32_sidecar(filepath, crc);
     }
+#ifdef HAVE_SHA256
+    else if (type == CKSUM_SHA256) {
+        compute_file_sha256(filepath, hex_out);
+        write_sha256_sidecar(filepath, hex_out);
+    }
+#endif
 }
 
 /* ============================================================
@@ -1474,7 +1524,7 @@ static int cmd_backup(int argc, char **argv) {
             "OPTIONS:\n"
             "  --name <NAME>          Backup name (default: backup)\n"
             "  --format <TYPE>        raw (default) or gzip\n"
-            "  --checksum <TYPE>      none (default) or crc32\n"
+            "  --checksum <TYPE>      none (default), crc32, or sha256\n"
             "  --sector-by-sector     Full sector-by-sector (no FAT compaction)\n\n"
             "DEPRECATED (still accepted): --source, --dest, --compression\n"
         );
@@ -1508,16 +1558,17 @@ static int cmd_backup(int argc, char **argv) {
     if (cksum_str) {
         if (strcmp(cksum_str, "crc32") == 0) {
             checksum = CKSUM_CRC32;
-        } else if (strcmp(cksum_str, "sha1") == 0
-                || strcmp(cksum_str, "sha256") == 0) {
+        } else if (strcmp(cksum_str, "sha256") == 0) {
+            checksum = CKSUM_SHA256;
+        } else if (strcmp(cksum_str, "sha1") == 0) {
             fprintf(stderr,
-                "Error: --checksum %s is not supported on the PPC build.\n"
-                "       Supported values: none, crc32.\n", cksum_str);
+                "Error: --checksum sha1 is not supported on the PPC build.\n"
+                "       Supported values: none, crc32, sha256.\n");
             return 1;
         } else if (strcmp(cksum_str, "none") != 0) {
             fprintf(stderr,
                 "Error: unknown --checksum value '%s'. "
-                "Supported: none, crc32.\n", cksum_str);
+                "Supported: none, crc32, sha256.\n", cksum_str);
             return 1;
         }
     }
@@ -1545,7 +1596,8 @@ static int cmd_backup(int argc, char **argv) {
             format_bytes(source_size, sz_buf, sizeof(sz_buf)));
     fprintf(stderr, "Compression: %s | Checksum: %s | Compact: %s\n",
             compression == COMP_GZIP ? "gzip" : "raw",
-            checksum == CKSUM_CRC32 ? "crc32" : "none",
+            checksum == CKSUM_CRC32 ? "crc32"
+                : checksum == CKSUM_SHA256 ? "sha256" : "none",
             sector_by_sector ? "off (sector-by-sector)" : "FAT-aware");
 
     /* Detect partition table */
@@ -1600,7 +1652,8 @@ static int cmd_backup(int argc, char **argv) {
     memset(checksums, 0, sizeof(checksums));
 
     const char *comp_name = compression == COMP_GZIP ? "gzip" : "raw";
-    const char *cksum_name = checksum == CKSUM_CRC32 ? "crc32" : "none";
+    const char *cksum_name = checksum == CKSUM_CRC32 ? "crc32"
+                            : checksum == CKSUM_SHA256 ? "sha256" : "none";
 
     if (part_count == 0 && pt.type == PT_NONE) {
         /* Superfloppy: back up entire device as one partition */
@@ -2308,7 +2361,7 @@ int main(int argc, char **argv) {
     } else if (strcmp(cmd, "--version") == 0 || strcmp(cmd, "-V") == 0) {
         printf("rusty-backup 0.3.0-ppc\n");
         printf("Platform: Mac OS X Tiger PowerPC\n");
-        printf("Features: MBR, APM, EBR chain, gzip, CRC32, FAT compaction\n");
+        printf("Features: MBR, APM, EBR chain, gzip, CRC32, SHA-256, FAT compaction\n");
         return 0;
     } else {
         fprintf(stderr, "Unknown subcommand: %s\n", cmd);

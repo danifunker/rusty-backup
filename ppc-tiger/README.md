@@ -8,7 +8,7 @@ All core rusty-backup functionality, running natively on Tiger:
 
 - **Partition table support**: MBR (with EBR chain for logical partitions), APM, Superfloppy
 - **Gzip compression**: `--compression gzip` via zlib (ships with Tiger)
-- **Checksums**: CRC32 (`--checksum crc32`) — same value rb-cli accepts; strong-hash variants (`sha1`/`sha256`) are intentionally not built into the PPC port
+- **Checksums**: CRC32 (`--checksum crc32`) and SHA-256 (`--checksum sha256`) — both match rb-cli's value set, so backups cross-verify in either direction. SHA-1 is intentionally not exposed.
 - **FAT compaction**: Automatic for FAT12/16/32 — only backs up allocated clusters
 - **Metadata**: Compatible `metadata.json` format
 - **Carbon GUI**: Native Aqua frontend with progress bars and file pickers
@@ -77,11 +77,11 @@ sudo ./rusty-backup-ppc optical rip \
 
 ### Checksum support
 
-PPC only exposes `--checksum {none,crc32}`. CRC32 is shared with the
-desktop `rb-cli`, so PPC-produced backups can be verified by either
-tool when CRC32 is selected. Strong hashes (SHA-1, SHA-256) are
-deliberately not built into the PPC port — pass `--checksum sha1` or
-`--checksum sha256` and the CLI will error out rather than silently
+PPC exposes `--checksum {none,crc32,sha256}` — the same value set
+rb-cli accepts, so backups cross-verify in either direction. SHA-256
+runs via CommonCrypto (`CC_SHA256_*`), available since Tiger 10.4.
+SHA-1 is deliberately not built in: rb-cli doesn't accept `sha1` either,
+and passing it explicitly returns an error rather than silently
 producing an incompatible sidecar.
 
 ## FAT Compaction
@@ -117,6 +117,7 @@ Key adaptations for Tiger:
 - `rdisk` (raw character devices) for ioctl device size detection
 - `statfs()` fallback for mounted partition sizes
 - zlib for gzip compression and CRC32 (ships with Tiger)
+- CommonCrypto for SHA-256 (available since Tiger 10.4)
 - Carbon HIToolbox for the native GUI
 - Navigation Services for file/folder pickers
 
