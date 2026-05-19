@@ -8,7 +8,7 @@ All core rusty-backup functionality, running natively on Tiger:
 
 - **Partition table support**: MBR (with EBR chain for logical partitions), APM, Superfloppy
 - **Gzip compression**: `--compression gzip` via zlib (ships with Tiger)
-- **Checksums**: CRC32 (`--checksum crc32`) and SHA-1 (`--checksum sha1`)
+- **Checksums**: CRC32 (`--checksum crc32`) — same value rb-cli accepts; strong-hash variants (`sha1`/`sha256`) are intentionally not built into the PPC port
 - **FAT compaction**: Automatic for FAT12/16/32 — only backs up allocated clusters
 - **Metadata**: Compatible `metadata.json` format
 - **Carbon GUI**: Native Aqua frontend with progress bars and file pickers
@@ -40,38 +40,49 @@ export TMPDIR="/Volumes/Macintosh HD"
 
 ## Usage
 
+The CLI grammar follows the main `rb-cli` surface: positional `<SOURCE>` /
+`<DEST>` / `<BACKUP_DIR>` / `<TARGET>` arguments, `show devices` for
+device enumeration, `optical rip` for disc ripping. The pre-alignment
+flag forms (`--source`, `--dest`, `--backup-dir`, `--target`,
+`--compression`, top-level `list-devices`, top-level `rip`) are still
+accepted as deprecated aliases.
+
 ```bash
 # List available disks
-./rusty-backup-ppc list-devices
+./rusty-backup-ppc show devices
 
 # Back up a disk with gzip compression and CRC32 checksums
-sudo ./rusty-backup-ppc backup \
-    --source /dev/rdisk2 \
-    --dest /Volumes/Backup \
+sudo ./rusty-backup-ppc backup /dev/rdisk2 /Volumes/Backup \
     --name my-backup \
-    --compression gzip \
+    --format gzip \
     --checksum crc32
 
 # Back up with FAT compaction disabled (sector-by-sector)
-sudo ./rusty-backup-ppc backup \
-    --source /dev/rdisk1 \
-    --dest /Volumes/Backup \
+sudo ./rusty-backup-ppc backup /dev/rdisk1 /Volumes/Backup \
     --name full-image \
     --sector-by-sector
 
-# Inspect a backup
+# Inspect a backup folder (reads metadata.json — PPC-specific; rb-cli's
+# `inspect` operates on a live disk image instead)
 ./rusty-backup-ppc inspect /Volumes/Backup/my-backup
 
 # Restore a backup (handles .gz files automatically)
-sudo ./rusty-backup-ppc restore \
-    --backup-dir /Volumes/Backup/my-backup \
-    --target /dev/rdisk2
+sudo ./rusty-backup-ppc restore /Volumes/Backup/my-backup /dev/rdisk2
 
 # Rip an optical disc
-sudo ./rusty-backup-ppc rip \
+sudo ./rusty-backup-ppc optical rip \
     --device /dev/disk1 \
     --output /Volumes/Backup/disc.iso
 ```
+
+### Checksum support
+
+PPC only exposes `--checksum {none,crc32}`. CRC32 is shared with the
+desktop `rb-cli`, so PPC-produced backups can be verified by either
+tool when CRC32 is selected. Strong hashes (SHA-1, SHA-256) are
+deliberately not built into the PPC port — pass `--checksum sha1` or
+`--checksum sha256` and the CLI will error out rather than silently
+producing an incompatible sidecar.
 
 ## FAT Compaction
 
@@ -106,7 +117,6 @@ Key adaptations for Tiger:
 - `rdisk` (raw character devices) for ioctl device size detection
 - `statfs()` fallback for mounted partition sizes
 - zlib for gzip compression and CRC32 (ships with Tiger)
-- CommonCrypto for SHA-1 (available since Tiger 10.4)
 - Carbon HIToolbox for the native GUI
 - Navigation Services for file/folder pickers
 

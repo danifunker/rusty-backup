@@ -32,11 +32,9 @@
 #include <sys/mount.h>
 #include <zlib.h>
 
-/* CommonCrypto for SHA-1 — available on Tiger 10.4+ */
-#ifdef __APPLE__
-#include <CommonCrypto/CommonDigest.h>
-#define HAVE_SHA1 1
-#endif
+/* No strong-hash support on the PPC build. CRC32 (via zlib) is the
+ * only non-trivial checksum exposed, matching the shared subset of
+ * rb-cli's `--checksum` values. */
 
 #ifdef __APPLE__
 #include <crt_externs.h>
@@ -241,6 +239,47 @@ static int has_flag(int argc, char **argv, const char *flag) {
     for (int i = 0; i < argc; i++)
         if (strcmp(argv[i], flag) == 0) return 1;
     return 0;
+}
+
+/* Boolean flags that don't take a value — used by nth_positional() to
+ * avoid eating a positional as the flag's argument. Keep in sync with
+ * the per-command argument parsers below. */
+static int is_bool_flag(const char *a) {
+    return strcmp(a, "--sector-by-sector") == 0
+        || strcmp(a, "--device") == 0
+        || strcmp(a, "--yes") == 0
+        || strcmp(a, "--write-to-system-disk") == 0
+        || strcmp(a, "--write-zeros-to-unused") == 0
+        || strcmp(a, "--removable-only") == 0
+        || strcmp(a, "--eject") == 0
+        || strcmp(a, "--help") == 0
+        || strcmp(a, "-h") == 0
+        || strcmp(a, "--version") == 0
+        || strcmp(a, "-V") == 0;
+}
+
+/* Return the nth bare positional argument (0-indexed), skipping any
+ * --flag tokens and the values that follow them. Returns NULL when
+ * the requested positional doesn't exist. Used by the rb-cli-aligned
+ * positional grammar (`backup SOURCE DEST`, `restore BACKUP_DIR TARGET`,
+ * `inspect BACKUP_DIR`). */
+static const char *nth_positional(int argc, char **argv, int n) {
+    int seen = 0;
+    for (int i = 0; i < argc; i++) {
+        const char *a = argv[i];
+        if (a[0] == '-' && a[1] == '-' && a[2] != '\0') {
+            /* `--flag=value` is self-contained. */
+            if (strchr(a, '=') != NULL) continue;
+            /* Boolean flag — doesn't consume the next token. */
+            if (is_bool_flag(a)) continue;
+            /* Value-taking flag: skip its argument. */
+            if (i + 1 < argc) i++;
+            continue;
+        }
+        if (seen == n) return a;
+        seen++;
+    }
+    return NULL;
 }
 
 /* ============================================================
@@ -702,13 +741,12 @@ static const char *detect_alignment(const PartInfo *parts, int count,
 }
 
 /* ============================================================
- * Checksum Functions (CRC32 via zlib, SHA-1 via CommonCrypto)
+ * Checksum Functions (CRC32 via zlib)
  * ============================================================ */
 
 typedef enum {
     CKSUM_NONE = 0,
-    CKSUM_CRC32,
-    CKSUM_SHA1
+    CKSUM_CRC32
 } ChecksumType;
 
 /* Compute CRC32 of a file and write .crc32 sidecar */
@@ -739,44 +777,6 @@ static void write_crc32_sidecar(const char *filepath, uint32_t crc) {
     }
 }
 
-#ifdef HAVE_SHA1
-/* Compute SHA-1 of a file and write .sha1 sidecar */
-static void compute_file_sha1(const char *filepath, char *hex_out) {
-    FILE *f = fopen(filepath, "rb");
-    if (!f) { hex_out[0] = '\0'; return; }
-
-    CC_SHA1_CTX ctx;
-    CC_SHA1_Init(&ctx);
-
-    uint8_t buf[CHUNK_SIZE];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
-        CC_SHA1_Update(&ctx, buf, n);
-    fclose(f);
-
-    unsigned char digest[CC_SHA1_DIGEST_LENGTH];
-    CC_SHA1_Final(digest, &ctx);
-
-    for (int i = 0; i < CC_SHA1_DIGEST_LENGTH; i++)
-        sprintf(&hex_out[i * 2], "%02x", digest[i]);
-    hex_out[CC_SHA1_DIGEST_LENGTH * 2] = '\0';
-}
-
-static void write_sha1_sidecar(const char *filepath, const char *hex) {
-    char sidecar[MAX_PATH_LEN];
-    snprintf(sidecar, sizeof(sidecar), "%s.sha1", filepath);
-
-    const char *fname = strrchr(filepath, '/');
-    fname = fname ? fname + 1 : filepath;
-
-    FILE *f = fopen(sidecar, "w");
-    if (f) {
-        fprintf(f, "%s  %s\n", hex, fname);
-        fclose(f);
-    }
-}
-#endif
-
 static void write_checksum(const char *filepath, ChecksumType type,
                             char *hex_out, int hexsz) {
     hex_out[0] = '\0';
@@ -785,12 +785,6 @@ static void write_checksum(const char *filepath, ChecksumType type,
         snprintf(hex_out, hexsz, "%08x", crc);
         write_crc32_sidecar(filepath, crc);
     }
-#ifdef HAVE_SHA1
-    else if (type == CKSUM_SHA1) {
-        compute_file_sha1(filepath, hex_out);
-        write_sha1_sidecar(filepath, hex_out);
-    }
-#endif
 }
 
 /* ============================================================
@@ -1473,27 +1467,35 @@ static void export_mbr_bin(const char *backup_path, int src_fd) {
 static int cmd_backup(int argc, char **argv) {
     if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
         fprintf(stderr,
-            "USAGE: rusty-backup backup [OPTIONS]\n\n"
+            "USAGE: rusty-backup backup <SOURCE> <DEST> [OPTIONS]\n\n"
+            "ARGUMENTS:\n"
+            "  <SOURCE>               Source device or image file\n"
+            "  <DEST>                 Destination directory\n\n"
             "OPTIONS:\n"
-            "  --source <PATH>        Source device or image file (required)\n"
-            "  --dest <PATH>          Destination directory (required)\n"
             "  --name <NAME>          Backup name (default: backup)\n"
-            "  --compression <TYPE>   raw (default) or gzip\n"
-            "  --checksum <TYPE>      none (default), crc32, or sha1\n"
-            "  --sector-by-sector     Full sector-by-sector (no FAT compaction)\n"
+            "  --format <TYPE>        raw (default) or gzip\n"
+            "  --checksum <TYPE>      none (default) or crc32\n"
+            "  --sector-by-sector     Full sector-by-sector (no FAT compaction)\n\n"
+            "DEPRECATED (still accepted): --source, --dest, --compression\n"
         );
         return 0;
     }
 
-    const char *source = flag_value(argc, argv, "--source");
-    const char *dest = flag_value(argc, argv, "--dest");
+    /* Positionals match rb-cli (`backup SOURCE DEST`); legacy --source /
+     * --dest flags remain accepted for back-compat. */
+    const char *source = nth_positional(argc, argv, 0);
+    const char *dest   = nth_positional(argc, argv, 1);
+    if (!source) source = flag_value(argc, argv, "--source");
+    if (!dest)   dest   = flag_value(argc, argv, "--dest");
     const char *name = flag_value(argc, argv, "--name");
-    const char *comp_str = flag_value(argc, argv, "--compression");
+    /* `--format` is the rb-cli spelling; `--compression` kept as alias. */
+    const char *comp_str = flag_value(argc, argv, "--format");
+    if (!comp_str) comp_str = flag_value(argc, argv, "--compression");
     const char *cksum_str = flag_value(argc, argv, "--checksum");
     int sector_by_sector = has_flag(argc, argv, "--sector-by-sector");
 
     if (!source || !dest) {
-        fprintf(stderr, "Error: --source and --dest are required\n");
+        fprintf(stderr, "Error: SOURCE and DEST are required\n");
         fprintf(stderr, "Run 'rusty-backup backup --help' for options\n");
         return 1;
     }
@@ -1504,8 +1506,20 @@ static int cmd_backup(int argc, char **argv) {
 
     ChecksumType checksum = CKSUM_NONE;
     if (cksum_str) {
-        if (strcmp(cksum_str, "crc32") == 0) checksum = CKSUM_CRC32;
-        else if (strcmp(cksum_str, "sha1") == 0) checksum = CKSUM_SHA1;
+        if (strcmp(cksum_str, "crc32") == 0) {
+            checksum = CKSUM_CRC32;
+        } else if (strcmp(cksum_str, "sha1") == 0
+                || strcmp(cksum_str, "sha256") == 0) {
+            fprintf(stderr,
+                "Error: --checksum %s is not supported on the PPC build.\n"
+                "       Supported values: none, crc32.\n", cksum_str);
+            return 1;
+        } else if (strcmp(cksum_str, "none") != 0) {
+            fprintf(stderr,
+                "Error: unknown --checksum value '%s'. "
+                "Supported: none, crc32.\n", cksum_str);
+            return 1;
+        }
     }
 
     /* Open source */
@@ -1531,7 +1545,7 @@ static int cmd_backup(int argc, char **argv) {
             format_bytes(source_size, sz_buf, sizeof(sz_buf)));
     fprintf(stderr, "Compression: %s | Checksum: %s | Compact: %s\n",
             compression == COMP_GZIP ? "gzip" : "raw",
-            checksum == CKSUM_CRC32 ? "crc32" : checksum == CKSUM_SHA1 ? "sha1" : "none",
+            checksum == CKSUM_CRC32 ? "crc32" : "none",
             sector_by_sector ? "off (sector-by-sector)" : "FAT-aware");
 
     /* Detect partition table */
@@ -1586,8 +1600,7 @@ static int cmd_backup(int argc, char **argv) {
     memset(checksums, 0, sizeof(checksums));
 
     const char *comp_name = compression == COMP_GZIP ? "gzip" : "raw";
-    const char *cksum_name = checksum == CKSUM_CRC32 ? "crc32" :
-                              checksum == CKSUM_SHA1 ? "sha1" : "none";
+    const char *cksum_name = checksum == CKSUM_CRC32 ? "crc32" : "none";
 
     if (part_count == 0 && pt.type == PT_NONE) {
         /* Superfloppy: back up entire device as one partition */
@@ -1751,20 +1764,24 @@ static int cmd_backup(int argc, char **argv) {
 static int cmd_restore(int argc, char **argv) {
     if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
         fprintf(stderr,
-            "USAGE: rusty-backup restore [OPTIONS]\n\n"
+            "USAGE: rusty-backup restore <BACKUP_DIR> <TARGET> [OPTIONS]\n\n"
+            "ARGUMENTS:\n"
+            "  <BACKUP_DIR>           Backup folder containing metadata.json\n"
+            "  <TARGET>               Target device or image file\n\n"
             "OPTIONS:\n"
-            "  --backup-dir <DIR>     Backup folder containing metadata.json (required)\n"
-            "  --target <PATH>        Target device or image file (required)\n"
-            "  --target-size <BYTES>  Target size in bytes (auto-detected for devices)\n"
+            "  --target-size <BYTES>  Target size in bytes (auto-detected for devices)\n\n"
+            "DEPRECATED (still accepted): --backup-dir, --target\n"
         );
         return 0;
     }
 
-    const char *backup_dir = flag_value(argc, argv, "--backup-dir");
-    const char *target = flag_value(argc, argv, "--target");
+    const char *backup_dir = nth_positional(argc, argv, 0);
+    const char *target     = nth_positional(argc, argv, 1);
+    if (!backup_dir) backup_dir = flag_value(argc, argv, "--backup-dir");
+    if (!target)     target     = flag_value(argc, argv, "--target");
 
     if (!backup_dir || !target) {
-        fprintf(stderr, "Error: --backup-dir and --target are required\n");
+        fprintf(stderr, "Error: BACKUP_DIR and TARGET are required\n");
         return 1;
     }
 
@@ -1944,14 +1961,30 @@ static int cmd_restore(int argc, char **argv) {
  * ============================================================ */
 
 static int cmd_inspect(int argc, char **argv) {
-    if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h") || argc < 1) {
-        fprintf(stderr, "USAGE: rusty-backup inspect <BACKUP_DIR>\n");
-        if (argc < 1) return 1;
+    if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
+        fprintf(stderr,
+            "USAGE: rusty-backup inspect <BACKUP_DIR> [--format text]\n\n"
+            "NOTE: PPC inspect reads a backup folder (metadata.json), not a\n"
+            "disk image. This differs from rb-cli's `inspect <IMAGE>` which\n"
+            "summarizes a live disk image's partition table.\n"
+        );
         return 0;
     }
 
+    const char *fmt = flag_value(argc, argv, "--format");
+    if (fmt && strcmp(fmt, "text") != 0) {
+        fprintf(stderr, "Error: only --format text is supported on PPC\n");
+        return 1;
+    }
+    const char *backup_dir = nth_positional(argc, argv, 0);
+    if (!backup_dir) {
+        fprintf(stderr, "Error: BACKUP_DIR is required\n");
+        fprintf(stderr, "USAGE: rusty-backup inspect <BACKUP_DIR>\n");
+        return 1;
+    }
+
     char meta_path[MAX_PATH_LEN];
-    snprintf(meta_path, sizeof(meta_path), "%s/metadata.json", argv[0]);
+    snprintf(meta_path, sizeof(meta_path), "%s/metadata.json", backup_dir);
 
     FILE *f = fopen(meta_path, "r");
     if (!f) {
@@ -2063,13 +2096,13 @@ static int cmd_inspect(int argc, char **argv) {
 
     /* Check what files exist in backup dir */
     printf("\n  Backup files:\n");
-    DIR *d = opendir(argv[0]);
+    DIR *d = opendir(backup_dir);
     if (d) {
         struct dirent *ent;
         while ((ent = readdir(d)) != NULL) {
             if (ent->d_name[0] == '.') continue;
             char fpath[MAX_PATH_LEN];
-            snprintf(fpath, sizeof(fpath), "%s/%s", argv[0], ent->d_name);
+            snprintf(fpath, sizeof(fpath), "%s/%s", backup_dir, ent->d_name);
             struct stat fst;
             if (stat(fpath, &fst) == 0) {
                 char fsz[32];
@@ -2104,6 +2137,12 @@ static int cmd_rip(int argc, char **argv) {
 
     const char *device = flag_value(argc, argv, "--device");
     const char *output = flag_value(argc, argv, "--output");
+    const char *fmt    = flag_value(argc, argv, "--format");
+    if (fmt && strcmp(fmt, "iso") != 0) {
+        fprintf(stderr, "Error: only --format iso is supported on PPC\n");
+        return 1;
+    }
+    (void)has_flag(argc, argv, "--eject"); /* accepted for rb-cli parity, not implemented */
 
     if (!device || !output) {
         fprintf(stderr, "Error: --device and --output are required\n");
@@ -2169,18 +2208,20 @@ static void print_usage(const char *prog) {
 
     fprintf(stderr,
         "Rusty Backup CLI — headless disk backup & restore\n"
-        "Transpiled from Rust to PowerPC by rust-ppc-tiger\n"
+        "PowerPC port (Mac OS X Tiger)\n"
         "\n"
         "USAGE:\n"
         "  %s <COMMAND> [OPTIONS]\n"
         "\n"
         "COMMANDS:\n"
-        "  backup         Back up a device or image\n"
-        "  restore        Restore a backup to a device or file\n"
-        "  list-devices   Enumerate available disk devices\n"
-        "  inspect        Show metadata for an existing backup\n"
-        "  rip            Rip an optical disc to ISO\n"
-        "  help           Show this help message\n"
+        "  backup <SOURCE> <DEST>          Back up a device or image\n"
+        "  restore <BACKUP_DIR> <TARGET>   Restore a backup\n"
+        "  inspect <BACKUP_DIR>            Show metadata for an existing backup\n"
+        "  show devices                    Enumerate available disk devices\n"
+        "  optical rip                     Rip an optical disc to ISO\n"
+        "  help                            Show this help message\n"
+        "\n"
+        "DEPRECATED aliases (still accepted): list-devices, rip\n"
         "\n"
         "Run '%s <COMMAND> --help' for per-command options.\n",
         name, name);
@@ -2228,20 +2269,46 @@ int main(int argc, char **argv) {
         return cmd_backup(sub_argc, sub_argv);
     } else if (strcmp(cmd, "restore") == 0) {
         return cmd_restore(sub_argc, sub_argv);
-    } else if (strcmp(cmd, "list-devices") == 0) {
-        return cmd_list_devices();
     } else if (strcmp(cmd, "inspect") == 0) {
         return cmd_inspect(sub_argc, sub_argv);
+    } else if (strcmp(cmd, "show") == 0) {
+        /* rb-cli surface: `show devices` is the only PPC-supported leaf
+         * (fs-info / partmap / chd-info aren't implemented here). */
+        if (sub_argc < 1) {
+            fprintf(stderr, "USAGE: rusty-backup show <devices>\n");
+            return 1;
+        }
+        if (strcmp(sub_argv[0], "devices") == 0) {
+            return cmd_list_devices();
+        }
+        fprintf(stderr, "Unknown 'show' subcommand: %s "
+                "(supported on PPC: devices)\n", sub_argv[0]);
+        return 1;
+    } else if (strcmp(cmd, "optical") == 0) {
+        if (sub_argc < 1) {
+            fprintf(stderr, "USAGE: rusty-backup optical <rip>\n");
+            return 1;
+        }
+        if (strcmp(sub_argv[0], "rip") == 0) {
+            return cmd_rip(sub_argc - 1, sub_argv + 1);
+        }
+        fprintf(stderr, "Unknown 'optical' subcommand: %s "
+                "(supported on PPC: rip)\n", sub_argv[0]);
+        return 1;
+    } else if (strcmp(cmd, "list-devices") == 0) {
+        /* Deprecated alias for `show devices`. */
+        return cmd_list_devices();
     } else if (strcmp(cmd, "rip") == 0) {
+        /* Deprecated alias for `optical rip`. */
         return cmd_rip(sub_argc, sub_argv);
     } else if (strcmp(cmd, "--help") == 0 || strcmp(cmd, "-h") == 0
             || strcmp(cmd, "help") == 0) {
         print_usage(av[0]);
         return 0;
     } else if (strcmp(cmd, "--version") == 0 || strcmp(cmd, "-V") == 0) {
-        printf("rusty-backup 0.3.0-ppc (transpiled from Rust by rust-ppc-tiger)\n");
+        printf("rusty-backup 0.3.0-ppc\n");
         printf("Platform: Mac OS X Tiger PowerPC\n");
-        printf("Features: MBR, APM, EBR chain, gzip, CRC32, SHA-1, FAT compaction\n");
+        printf("Features: MBR, APM, EBR chain, gzip, CRC32, FAT compaction\n");
         return 0;
     } else {
         fprintf(stderr, "Unknown subcommand: %s\n", cmd);
