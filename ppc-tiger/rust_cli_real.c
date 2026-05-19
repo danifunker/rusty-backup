@@ -256,6 +256,7 @@ static int is_bool_flag(const char *a) {
         || strcmp(a, "--write-zeros-to-unused") == 0
         || strcmp(a, "--removable-only") == 0
         || strcmp(a, "--eject") == 0
+        || strcmp(a, "--sparse") == 0
         || strcmp(a, "--help") == 0
         || strcmp(a, "-h") == 0
         || strcmp(a, "--version") == 0
@@ -880,6 +881,7 @@ typedef struct {
     uint64_t bytes_in_current;
     int part_index;                 /* 0 first, 1 = .001, 2 = .002, ... */
     int is_gzip;
+    int skip_zeros;                 /* sparse-seek all-zero chunks (raw only) */
     FILE *raw_fp;
     gzFile gz_fp;
     char files[SPLIT_MAX_FILES][SPLIT_NAME_LEN]; /* emitted basenames */
@@ -931,13 +933,17 @@ static int splitwriter_open_next(SplitWriter *sw) {
 
 static int splitwriter_open(SplitWriter *sw, const char *dir_path,
                             const char *stem, const char *ext,
-                            int is_gzip, uint64_t split_bytes) {
+                            int is_gzip, uint64_t split_bytes,
+                            int skip_zeros) {
     memset(sw, 0, sizeof(*sw));
     snprintf(sw->dir_path, sizeof(sw->dir_path), "%s", dir_path);
     snprintf(sw->stem, sizeof(sw->stem), "%s", stem);
     snprintf(sw->ext, sizeof(sw->ext), "%s", ext);
     sw->is_gzip = is_gzip;
     sw->split_bytes = split_bytes;
+    /* skip_zeros only makes sense for raw output — gzip can't represent
+     * file holes (the codec emits every byte). */
+    sw->skip_zeros = skip_zeros && !is_gzip;
     sw->part_index = 0;
     return splitwriter_open_next(sw);
 }
@@ -951,13 +957,33 @@ static void splitwriter_close_current(SplitWriter *sw) {
     }
 }
 
+static void splitwriter_finalize_sparse(SplitWriter *sw); /* fwd */
+
 static int splitwriter_close(SplitWriter *sw) {
+    splitwriter_finalize_sparse(sw);
     splitwriter_close_current(sw);
     return 0;
 }
 
-/* Write `n` bytes, rolling to a new split file at the boundary. */
+/* True if every byte in `buf[..n]` is zero. Used by the sparse-zero
+ * fast path in `splitwriter_write_sparse`. */
+static int buf_all_zeros(const uint8_t *buf, size_t n) {
+    for (size_t i = 0; i < n; i++)
+        if (buf[i]) return 0;
+    return 1;
+}
+
+/* Write `n` bytes, rolling to a new split file at the boundary.
+ *
+ * When `sw->skip_zeros` is set and `buf` is an all-zero chunk, the raw
+ * output path takes a sparse-seek shortcut: it advances the file
+ * position via `fseeko(SEEK_CUR)` instead of writing real bytes,
+ * leaving an unbacked hole. The file's logical size is reconciled
+ * with `ftruncate` at split-rollover and at close (see
+ * `splitwriter_finalize_sparse`). Gzip output ignores `skip_zeros` —
+ * the codec can't represent file holes. */
 static int splitwriter_write(SplitWriter *sw, const uint8_t *buf, size_t n) {
+    int sparse_chunk = sw->skip_zeros && buf_all_zeros(buf, n);
     size_t off = 0;
     while (off < n) {
         size_t chunk = n - off;
@@ -968,6 +994,11 @@ static int splitwriter_write(SplitWriter *sw, const uint8_t *buf, size_t n) {
         if (sw->is_gzip) {
             if (gzwrite(sw->gz_fp, buf + off, chunk) <= 0 && chunk > 0) {
                 fprintf(stderr, "Error: gzwrite failed\n");
+                return -1;
+            }
+        } else if (sparse_chunk) {
+            if (fseeko(sw->raw_fp, (off_t)chunk, SEEK_CUR) != 0) {
+                fprintf(stderr, "Error: sparse seek failed\n");
                 return -1;
             }
         } else {
@@ -981,13 +1012,25 @@ static int splitwriter_write(SplitWriter *sw, const uint8_t *buf, size_t n) {
 
         if (sw->split_bytes > 0 && sw->bytes_in_current >= sw->split_bytes
             && off < n) {
-            /* roll over to next split */
+            /* Reconcile any trailing sparse hole, then roll over. */
+            splitwriter_finalize_sparse(sw);
             splitwriter_close_current(sw);
             sw->part_index++;
             if (splitwriter_open_next(sw) != 0) return -1;
         }
     }
     return 0;
+}
+
+/* Before closing the current raw file, ensure its on-disk length
+ * matches `bytes_in_current` even if the final byte fell inside a
+ * sparse-skipped zero run (in which case fwrite never extended the
+ * file). ftruncate is non-destructive — POSIX guarantees that
+ * extending a file fills the new region with zeros. */
+static void splitwriter_finalize_sparse(SplitWriter *sw) {
+    if (sw->is_gzip || !sw->raw_fp || sw->bytes_in_current == 0) return;
+    fflush(sw->raw_fp);
+    ftruncate(fileno(sw->raw_fp), (off_t)sw->bytes_in_current);
 }
 
 /* ============================================================
@@ -1677,7 +1720,8 @@ static int cmd_backup(int argc, char **argv) {
             "  --format <TYPE>        raw (default) or gzip\n"
             "  --checksum <TYPE>      none (default), crc32, or sha256\n"
             "  --sector-by-sector     Full sector-by-sector (no FAT compaction)\n"
-            "  --split-size <MIB>     Split output every N MiB (raw/gzip only)\n\n"
+            "  --split-size <MIB>     Split output every N MiB (raw/gzip only)\n"
+            "  --sparse               Skip all-zero chunks as file holes (raw only)\n\n"
             "DEPRECATED (still accepted): --source, --dest, --compression\n"
         );
         return 0;
@@ -1696,6 +1740,7 @@ static int cmd_backup(int argc, char **argv) {
     const char *cksum_str = flag_value(argc, argv, "--checksum");
     const char *split_str = flag_value(argc, argv, "--split-size");
     int sector_by_sector = has_flag(argc, argv, "--sector-by-sector");
+    int sparse = has_flag(argc, argv, "--sparse");
     uint64_t split_bytes = 0;
     if (split_str) {
         long mib = atol(split_str);
@@ -1837,7 +1882,7 @@ static int cmd_backup(int argc, char **argv) {
         SplitWriter sw;
         if (splitwriter_open(&sw, backup_path, "partition-0",
                              comp_ext(compression),
-                             compression == COMP_GZIP, split_bytes) != 0) {
+                             compression == COMP_GZIP, split_bytes, sparse) != 0) {
             free(buf); close(src_fd); return 1;
         }
 
@@ -1900,7 +1945,7 @@ static int cmd_backup(int argc, char **argv) {
 
             SplitWriter sw;
             if (splitwriter_open(&sw, backup_path, stem, comp_ext(compression),
-                                 compression == COMP_GZIP, split_bytes) != 0) {
+                                 compression == COMP_GZIP, split_bytes, sparse) != 0) {
                 compact_fat_close(cf);
                 continue;
             }
