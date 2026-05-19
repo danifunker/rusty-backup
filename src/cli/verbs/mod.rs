@@ -26,4 +26,5 @@ pub mod restore;
 pub mod rm;
 pub mod show;
 pub mod shrink;
+pub mod terminal;
 pub mod write;

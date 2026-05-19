@@ -48,6 +48,7 @@ fn top_level_verbs_present() {
         "resize",
         "expand",
         "convert",
+        "terminal",
         "batch-template",
         "completions",
         "install-completions",

@@ -736,6 +736,14 @@ Usage: shrink <INPUT> <OUTPUT>
 - `<INPUT>` — Source image (raw `.img` or `.chd`). Must contain an SGI volume header at sector 0
 - `<OUTPUT>` — Destination CHD path. Must end in `.chd`, must not already exist, and must not resolve to the same file as `input`
 
+### `terminal`
+
+Open an interactive rb-cli shell (rustyline-based REPL)
+
+```
+Usage: terminal
+```
+
 ### `write`
 
 Stream an image file onto a block device

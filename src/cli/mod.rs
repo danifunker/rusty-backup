@@ -126,6 +126,9 @@ pub enum Command {
         cmd: verbs::optical::OpticalCommand,
     },
 
+    /// Open an interactive rb-cli shell (rustyline-based REPL).
+    Terminal,
+
     /// Emit a shell-completion script to stdout.
     #[command(name = "completions")]
     Completions(verbs::completions::EmitArgs),
@@ -150,7 +153,14 @@ pub enum Command {
 /// [`crate::cli::exit`].
 pub fn run(cli: Cli) -> Result<()> {
     logging::install(&cli.globals)?;
-    match cli.command {
+    dispatch(cli.command)
+}
+
+/// Dispatch one parsed `Command` to its verb. Separated from `run` so the
+/// REPL (`verbs::terminal`) can dispatch follow-up commands without
+/// re-installing logging.
+pub fn dispatch(command: Command) -> Result<()> {
+    match command {
         Command::New(args) => verbs::new::run(args),
         Command::Ls(args) => verbs::ls::run(args),
         Command::Put(args) => verbs::put::run(args),
@@ -171,6 +181,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Config { cmd } => verbs::config::run(cmd),
         Command::Show { cmd } => verbs::show::run(cmd),
         Command::Optical { cmd } => verbs::optical::run(cmd),
+        Command::Terminal => verbs::terminal::run(),
         Command::Completions(args) => verbs::completions::run_emit(args),
         Command::InstallCompletions(args) => verbs::completions::run_install(args),
         Command::Api { group } => api::run(group),
