@@ -28,6 +28,34 @@ Rusty Backup ships as a single self-contained binary per platform.
 To build from source: `cargo build --release`. See `CLAUDE.md` for the full
 build matrix.
 
+### The `rb-cli` headless CLI
+
+The release artifacts also include `rb-cli`, the scriptable counterpart to
+the GUI. Same engine, no eframe dependency, designed for shell pipelines
+and automated build farms.
+
+```
+rb-cli new disk.dsk --fs hfs --size 800K --name "My Disk"
+rb-cli put disk.dsk ./Finder /System/Finder --type FNDR --creator MACS
+rb-cli ls  disk.dsk /System
+rb-cli fsck disk.dsk --checkonly
+rb-cli inspect disk.hda
+rb-cli backup /dev/disk3 ./backups --format chd --checksum sha256
+rb-cli restore ./backups/my-backup ./restored.img
+rb-cli batch script.json --dry-run
+```
+
+Shell completions for bash / zsh / fish / PowerShell:
+
+```
+rb-cli install-completions          # auto-detects $SHELL
+rb-cli completions zsh > _rb-cli    # emit-to-stdout for packagers
+```
+
+Full verb-by-verb reference: [`docs/cli-reference.md`](docs/cli-reference.md)
+(regenerated from `cargo run --example generate_cli_reference`).
+Grammar plan: [`docs/cli-todo.md`](docs/cli-todo.md).
+
 ## Usage
 
 The app has four tabs:

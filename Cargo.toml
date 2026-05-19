@@ -36,6 +36,10 @@ path = "example/fsck_bare.rs"
 name = "generate_manpage"
 path = "example/generate_manpage.rs"
 
+[[example]]
+name = "generate_cli_reference"
+path = "example/generate_cli_reference.rs"
+
 [features]
 default = []
 
