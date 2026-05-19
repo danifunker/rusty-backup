@@ -72,6 +72,10 @@ pub enum Command {
     /// dropped (SGI/IRIX today).
     Shrink(verbs::shrink::ShrinkArgs),
 
+    /// Whole-disk aggregate read-only view (partition table + per-partition
+    /// summary + CHD metadata when applicable).
+    Inspect(verbs::inspect::InspectArgs),
+
     /// Focused read-only queries.
     Show {
         #[command(subcommand)]
@@ -111,6 +115,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Mkdir(args) => verbs::mkdir::run(args),
         Command::Fsck(args) => verbs::fsck::run(args),
         Command::Shrink(args) => verbs::shrink::run(args),
+        Command::Inspect(args) => verbs::inspect::run(args),
         Command::Show { cmd } => verbs::show::run(cmd),
         Command::Completions(args) => verbs::completions::run_emit(args),
         Command::InstallCompletions(args) => verbs::completions::run_install(args),

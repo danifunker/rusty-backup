@@ -9,6 +9,7 @@
 pub mod completions;
 pub mod fsck;
 pub mod get;
+pub mod inspect;
 pub mod ls;
 pub mod mkdir;
 pub mod new;

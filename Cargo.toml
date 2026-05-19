@@ -32,6 +32,10 @@ path = "example/test_clone_fix.rs"
 name = "fsck_bare"
 path = "example/fsck_bare.rs"
 
+[[example]]
+name = "generate_manpage"
+path = "example/generate_manpage.rs"
+
 [features]
 default = []
 
