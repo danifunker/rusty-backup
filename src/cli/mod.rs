@@ -120,6 +120,12 @@ pub enum Command {
         cmd: verbs::show::ShowCommand,
     },
 
+    /// Optical-media verbs (rip / convert / browse / extract).
+    Optical {
+        #[command(subcommand)]
+        cmd: verbs::optical::OpticalCommand,
+    },
+
     /// Emit a shell-completion script to stdout.
     #[command(name = "completions")]
     Completions(verbs::completions::EmitArgs),
@@ -164,6 +170,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::BatchTemplate(args) => verbs::batch_template::run(args),
         Command::Config { cmd } => verbs::config::run(cmd),
         Command::Show { cmd } => verbs::show::run(cmd),
+        Command::Optical { cmd } => verbs::optical::run(cmd),
         Command::Completions(args) => verbs::completions::run_emit(args),
         Command::InstallCompletions(args) => verbs::completions::run_install(args),
         Command::Api { group } => api::run(group),

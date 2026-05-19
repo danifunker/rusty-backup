@@ -503,6 +503,75 @@ Usage: new [OPTIONS] --fs <FS> <IMAGE>
 - `--name` — HFS volume name (1..=27 Mac Roman bytes for HFS). Defaults to `MacIIBench`
 - `--block-size` — HFS allocation block size in bytes. Must be a non-zero multiple of 512. When unset, the smallest size that keeps `total_blocks <= 65535` is chosen automatically
 
+### `optical`
+
+Optical-media verbs (rip / convert / browse / extract)
+
+```
+Usage: optical <COMMAND>
+```
+
+### `optical browse`
+
+List the file tree on an optical disc image
+
+```
+Usage: browse <SOURCE>
+```
+
+**Arguments**
+
+- `<SOURCE>` — Optical disc image (.iso, .cue, .chd)
+
+### `optical convert`
+
+Re-encode an optical image into a different format
+
+```
+Usage: convert --format <FORMAT> <SOURCE> <DEST>
+```
+
+**Arguments**
+
+- `<SOURCE>` — Source image (.iso, .cue, or .chd)
+- `<DEST>` — Destination file. Extension is *not* auto-derived — pass it explicitly
+
+**Options**
+
+- `--format` — Output format
+
+### `optical extract`
+
+Extract files from an optical disc image into a host folder
+
+```
+Usage: extract [OPTIONS] --to <TO> <SOURCE>
+```
+
+**Arguments**
+
+- `<SOURCE>` — Optical disc image (.iso, .cue, .chd)
+
+**Options**
+
+- `--to` — Destination folder (created if absent)
+- `--resource-forks` — How to handle HFS resource forks. Ignored on non-HFS discs
+
+### `optical rip`
+
+Rip a physical CD/DVD drive to a disk image file
+
+```
+Usage: rip [OPTIONS] --device <DEVICE> --output <OUTPUT>
+```
+
+**Options**
+
+- `--device` — Source drive (e.g. `/dev/sr0`, `disk6`, `\\.\E:`). See `rb-cli show devices`
+- `--output` — Output path: `.iso` for `--format iso`, `.cue` for `--format bincue`
+- `--format` — 
+- `--eject` — Eject the disc after a successful rip
+
 ### `put`
 
 Copy a host file (or zero-fill / write boot blocks) into a filesystem

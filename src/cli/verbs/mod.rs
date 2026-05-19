@@ -19,6 +19,7 @@ pub mod inspect;
 pub mod ls;
 pub mod mkdir;
 pub mod new;
+pub mod optical;
 pub mod put;
 pub mod resize;
 pub mod restore;
