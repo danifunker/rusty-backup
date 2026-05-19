@@ -76,6 +76,10 @@ sudo ./rusty-backup-ppc restore /Volumes/Backup/my-backup /dev/rdisk2
 sudo ./rusty-backup-ppc optical rip \
     --device /dev/disk1 \
     --output /Volumes/Backup/disc.iso
+
+# Read-only inspection of a raw image (no backup needed)
+./rusty-backup-ppc show partmap   /Volumes/Images/my-disk.img
+./rusty-backup-ppc show fs-info   /Volumes/Images/my-disk.img@1
 ```
 
 ### Checksum support

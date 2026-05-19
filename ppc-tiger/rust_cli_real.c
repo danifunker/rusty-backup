@@ -2966,6 +2966,263 @@ static int cmd_rip(int argc, char **argv) {
 }
 
 /* ============================================================
+ * show partmap / show fs-info
+ * ----------------------------------------------------------------
+ * Read-only views into a disk image. `show partmap` dumps the
+ * partition table (MBR / GPT / APM / Superfloppy). `show fs-info`
+ * digs into a specific partition's superblock — FAT BPB,
+ * HFS/HFS+ MDB header — and prints volume metadata.
+ * ============================================================ */
+
+/* Parse an `IMG[@N]` reference: returns the 1-based partition index
+ * (0 = "whole disk", -1 = parse error). The image path is written
+ * into `path_out` with the `@N` suffix stripped. */
+static int parse_img_at(const char *spec, char *path_out, size_t path_sz) {
+    const char *at = strrchr(spec, '@');
+    if (!at) {
+        snprintf(path_out, path_sz, "%s", spec);
+        return 0;
+    }
+    size_t plen = at - spec;
+    if (plen >= path_sz) plen = path_sz - 1;
+    memcpy(path_out, spec, plen);
+    path_out[plen] = '\0';
+    long n = atol(at + 1);
+    if (n <= 0) return -1;
+    return (int)n;
+}
+
+static int cmd_show_partmap(int argc, char **argv) {
+    const char *img = nth_positional(argc, argv, 0);
+    if (!img) {
+        fprintf(stderr,
+            "USAGE: rusty-backup show partmap <IMAGE>\n"
+            "  Prints the partition table (MBR / GPT / APM / Superfloppy).\n"
+        );
+        return 1;
+    }
+
+    int fd = open(img, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "Error: cannot open %s: %s\n", img, strerror(errno));
+        return 1;
+    }
+    PartTable pt;
+    if (detect_partition_table(fd, &pt) != 0) {
+        fprintf(stderr, "Error: no recognized partition table on %s\n", img);
+        close(fd);
+        return 1;
+    }
+
+    PartInfo parts[MAX_PARTITIONS];
+    int n = get_partition_list(&pt, parts);
+
+    const char *pt_name = "None";
+    if (pt.type == PT_MBR) pt_name = "MBR";
+    else if (pt.type == PT_APM) pt_name = "APM";
+    else if (pt.type == PT_GPT) pt_name = "GPT";
+
+    printf("Image: %s\n", img);
+    printf("Partition table: %s\n", pt_name);
+
+    if (pt.type == PT_GPT && pt.data.gpt.entry_count > 0) {
+        char guid[64];
+        gpt_format_guid(pt.data.gpt.disk_guid, guid, sizeof(guid));
+        printf("Disk GUID: %s\n", guid);
+        printf("First usable LBA: %llu, last usable LBA: %llu\n",
+               (unsigned long long)pt.data.gpt.first_usable_lba,
+               (unsigned long long)pt.data.gpt.last_usable_lba);
+    }
+    printf("Partitions: %d\n", n);
+
+    for (int i = 0; i < n; i++) {
+        char psz[32];
+        uint64_t bytes = parts[i].total_sectors * SECTOR_SIZE;
+        format_bytes(bytes, psz, sizeof(psz));
+        printf("  [%d] %-28s LBA %-10llu %s%s%s\n",
+               parts[i].index + 1, parts[i].type_name,
+               (unsigned long long)parts[i].start_lba, psz,
+               parts[i].bootable ? " [boot]" : "",
+               parts[i].is_logical ? " [logical]" : "");
+    }
+    close(fd);
+    return 0;
+}
+
+/* Print FAT volume metadata read directly from the BPB at `offset`. */
+static void show_fat_fs_info(int fd, off_t offset) {
+    uint8_t vbr[512];
+    if (lseek(fd, offset, SEEK_SET) < 0) return;
+    if (read(fd, vbr, 512) != 512) return;
+    if (!is_fat_vbr(vbr)) {
+        printf("  (FAT VBR validation failed — partition magic mismatch)\n");
+        return;
+    }
+    uint16_t bps      = read_le16(&vbr[11]);
+    uint8_t  spc      = vbr[13];
+    uint16_t resvd    = read_le16(&vbr[14]);
+    uint8_t  fats     = vbr[16];
+    uint16_t rootents = read_le16(&vbr[17]);
+    uint16_t tot16    = read_le16(&vbr[19]);
+    uint16_t fatsz16  = read_le16(&vbr[22]);
+    uint32_t tot32    = read_le32(&vbr[32]);
+    uint32_t fatsz32  = read_le32(&vbr[36]);
+
+    uint32_t total_sectors = tot16 ? tot16 : tot32;
+    uint32_t fat_sectors   = fatsz16 ? fatsz16 : fatsz32;
+    uint64_t total_bytes   = (uint64_t)total_sectors * bps;
+
+    /* OEM ID (offset 3, 8 bytes) — printable hint, often "MSWIN4.1". */
+    char oem[9];
+    memcpy(oem, &vbr[3], 8); oem[8] = '\0';
+    /* FAT32 volume label lives at VBR offset 71, 11 bytes. FAT12/16
+     * label lives at VBR offset 43. */
+    char label[12];
+    memcpy(label, fatsz16 ? &vbr[43] : &vbr[71], 11); label[11] = '\0';
+    /* Strip trailing spaces. */
+    for (int i = 10; i >= 0 && (label[i] == ' ' || label[i] == '\0'); i--) label[i] = '\0';
+
+    char sz[32];
+    format_bytes(total_bytes, sz, sizeof(sz));
+
+    printf("  Filesystem:        FAT (%s)\n",
+           fatsz16 ? (rootents > 0 ? "FAT12/16" : "FAT12/16") : "FAT32");
+    printf("  Volume label:      %s\n", label[0] ? label : "(none)");
+    printf("  OEM ID:            %s\n", oem);
+    printf("  Bytes per sector:  %u\n", bps);
+    printf("  Sectors per clust: %u\n", spc);
+    printf("  Reserved sectors:  %u\n", resvd);
+    printf("  FAT copies:        %u\n", fats);
+    printf("  Root entries:      %u\n", rootents);
+    printf("  Total sectors:     %u\n", total_sectors);
+    printf("  Sectors per FAT:   %u\n", fat_sectors);
+    printf("  Volume size:       %s\n", sz);
+}
+
+/* Print HFS/HFS+ volume metadata read from the MDB / VH at
+ * `offset + 1024`. */
+static void show_hfs_fs_info(int fd, off_t offset) {
+    uint8_t sb[512];
+    if (lseek(fd, offset + 1024, SEEK_SET) < 0) return;
+    if (read(fd, sb, 512) != 512) return;
+    uint16_t sig = read_be16(sb);
+    if (sig == 0x4244) {
+        /* Classic HFS MDB (Big Endian). */
+        uint16_t attr     = read_be16(&sb[2]);
+        uint16_t nm_files = read_be16(&sb[12]);
+        uint16_t nm_root  = read_be16(&sb[82]);
+        uint16_t total    = read_be16(&sb[18]);
+        uint16_t free_    = read_be16(&sb[34]);
+        uint32_t alblksz  = read_be32(&sb[20]);
+        uint8_t  vn_len   = sb[36];
+        if (vn_len > 27) vn_len = 27;
+        char vn[28];
+        memcpy(vn, &sb[37], vn_len);
+        vn[vn_len] = '\0';
+        printf("  Filesystem:        HFS (classic)\n");
+        printf("  Volume name:       %s\n", vn);
+        printf("  Block size:        %u\n", alblksz);
+        printf("  Total blocks:      %u\n", total);
+        printf("  Free blocks:       %u\n", free_);
+        printf("  Files (root):      %u files / %u dirs\n", nm_files, nm_root);
+        printf("  Attributes:        0x%04x%s\n", attr,
+               (attr & 0x0100) ? " (unmounted-clean)" : "");
+    } else if (sig == 0x482B || sig == 0x4858) {
+        /* HFS+ / HFSX VolumeHeader. Layout starts at offset 1024. */
+        uint32_t blk_size      = read_be32(&sb[40]);
+        uint32_t total_blocks  = read_be32(&sb[44]);
+        uint32_t free_blocks   = read_be32(&sb[48]);
+        uint32_t file_count    = read_be32(&sb[32]);
+        uint32_t folder_count  = read_be32(&sb[36]);
+        printf("  Filesystem:        HFS+ (%s)\n",
+               sig == 0x4858 ? "HFSX, case-sensitive" : "case-insensitive");
+        printf("  Block size:        %u\n", blk_size);
+        printf("  Total blocks:      %u\n", total_blocks);
+        printf("  Free blocks:       %u\n", free_blocks);
+        printf("  Files:             %u\n", file_count);
+        printf("  Folders:           %u\n", folder_count);
+    } else {
+        printf("  (no FAT/HFS magic at +1024; signature: 0x%04x)\n", sig);
+    }
+}
+
+static int cmd_show_fs_info(int argc, char **argv) {
+    const char *spec = nth_positional(argc, argv, 0);
+    if (!spec) {
+        fprintf(stderr,
+            "USAGE: rusty-backup show fs-info <IMAGE[@N]>\n"
+            "  Without @N: prints info for a superfloppy image (FAT/HFS).\n"
+            "  With @N:    selects partition N (1-based) from the table.\n"
+        );
+        return 1;
+    }
+    char img_path[MAX_PATH_LEN];
+    int part_n = parse_img_at(spec, img_path, sizeof(img_path));
+    if (part_n < 0) {
+        fprintf(stderr, "Error: invalid @N partition selector in '%s'\n", spec);
+        return 1;
+    }
+
+    int fd = open(img_path, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "Error: cannot open %s: %s\n", img_path, strerror(errno));
+        return 1;
+    }
+
+    PartTable pt;
+    if (detect_partition_table(fd, &pt) != 0) {
+        fprintf(stderr, "Error: no recognized partition table on %s\n", img_path);
+        close(fd);
+        return 1;
+    }
+
+    off_t fs_offset;
+    const char *fs_hint;
+    if (part_n == 0) {
+        if (pt.type != PT_NONE) {
+            fprintf(stderr, "Error: %s has a partition table; specify @N "
+                    "(1-based) to choose a partition.\n", img_path);
+            close(fd);
+            return 1;
+        }
+        fs_offset = 0;
+        fs_hint = pt.fs_hint;
+    } else {
+        PartInfo parts[MAX_PARTITIONS];
+        int n = get_partition_list(&pt, parts);
+        if (part_n > n) {
+            fprintf(stderr, "Error: partition %d out of range (%d available)\n",
+                    part_n, n);
+            close(fd);
+            return 1;
+        }
+        const PartInfo *p = &parts[part_n - 1];
+        fs_offset = (off_t)p->start_lba * SECTOR_SIZE;
+        fs_hint = p->type_name;
+        printf("Partition %d: %s, %llu sectors @ LBA %llu\n",
+               part_n, p->type_name, (unsigned long long)p->total_sectors,
+               (unsigned long long)p->start_lba);
+    }
+
+    /* Sniff for FAT first (its VBR has a strict signature), then HFS. */
+    uint8_t probe[2048];
+    if (lseek(fd, fs_offset, SEEK_SET) >= 0
+        && read(fd, probe, 2048) >= 1024) {
+        if (is_fat_vbr(probe)) {
+            show_fat_fs_info(fd, fs_offset);
+        } else if (is_hfs_sig(&probe[1024])) {
+            show_hfs_fs_info(fd, fs_offset);
+        } else {
+            printf("  (unrecognized filesystem; partition type hint: %s)\n",
+                   fs_hint);
+        }
+    }
+
+    close(fd);
+    return 0;
+}
+
+/* ============================================================
  * Print Usage
  * ============================================================ */
 
@@ -2990,6 +3247,8 @@ static void print_usage(const char *prog) {
         "  restore <BACKUP_DIR> <TARGET>   Restore a backup\n"
         "  inspect <BACKUP_DIR>            Show metadata for an existing backup\n"
         "  show devices                    Enumerate available disk devices\n"
+        "  show partmap <IMAGE>            Print partition table (MBR/GPT/APM)\n"
+        "  show fs-info <IMAGE[@N]>        Print FAT/HFS volume metadata\n"
         "  optical rip                     Rip an optical disc to ISO\n"
         "  help                            Show this help message\n"
         "\n"
@@ -3044,17 +3303,24 @@ int main(int argc, char **argv) {
     } else if (strcmp(cmd, "inspect") == 0) {
         return cmd_inspect(sub_argc, sub_argv);
     } else if (strcmp(cmd, "show") == 0) {
-        /* rb-cli surface: `show devices` is the only PPC-supported leaf
-         * (fs-info / partmap / chd-info aren't implemented here). */
+        /* rb-cli surface: devices / partmap / fs-info implemented;
+         * chd-info is not (no CHD support on the PPC build today). */
         if (sub_argc < 1) {
-            fprintf(stderr, "USAGE: rusty-backup show <devices>\n");
+            fprintf(stderr,
+                "USAGE: rusty-backup show <devices|partmap|fs-info> [ARGS]\n");
             return 1;
         }
         if (strcmp(sub_argv[0], "devices") == 0) {
             return cmd_list_devices();
         }
+        if (strcmp(sub_argv[0], "partmap") == 0) {
+            return cmd_show_partmap(sub_argc - 1, sub_argv + 1);
+        }
+        if (strcmp(sub_argv[0], "fs-info") == 0) {
+            return cmd_show_fs_info(sub_argc - 1, sub_argv + 1);
+        }
         fprintf(stderr, "Unknown 'show' subcommand: %s "
-                "(supported on PPC: devices)\n", sub_argv[0]);
+                "(supported on PPC: devices, partmap, fs-info)\n", sub_argv[0]);
         return 1;
     } else if (strcmp(cmd, "optical") == 0) {
         if (sub_argc < 1) {
