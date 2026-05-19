@@ -4,6 +4,37 @@ Planning doc for expanding `rb-cli` (renamed from `rusty-backup-cli`)
 from the current `api …` scratch namespace to something that mirrors
 the GUI's feature set without nesting commands four levels deep.
 
+## Implementation status (2026-05-19)
+
+Snapshot of what has shipped vs. what's still pending. Items list the
+git short SHA of the landing commit when relevant. The phase plan
+sections further down still describe full scope — including pieces
+not yet built — so this section is the single source of truth for "is
+it in the binary yet?"
+
+| Phase | Status | Notes |
+|---|---|---|
+| **A** Rename + flat verbs + infrastructure | **shipped** | `5d0c431..7bb1385` — binary rename, module split, IMG@N parser, `--format` envelope, logging flags, exit codes, flat verbs (`new`, `ls`, `put`, `get`, `rm`, `mkdir`, `fsck`, `shrink`, `inspect`, `show {partmap,fs-info,chd-info,devices}`, `completions`, `install-completions`), manpage example, `--help` snapshot tests |
+| **B** Generalize FS verbs + globbing | **shipped** | `b627eca..f40ed4c` — ls/put/get/rm/mkdir/fsck route through `open_filesystem` / `open_editable_filesystem`, bash-equivalent globs (`*`, `?`, `[...]`, `**`, `{a,b}`) with `--include`/`--exclude` (exclude-wins). Blank creators for FAT/EFS/AFFS still pending; `new --fs fat/efs/affs` gated on those landing. |
+| **C** Big-ticket verbs | **3 of 5 shipped** | `9c465d0` — `backup`, `restore`, `write` (background progress pump, `--yes` device safety gate, fs-aware `inspect` text/json/yaml). **Deferred**: `convert` (needs `src/gui/bulk_convert_dialog.rs::run_bulk_convert` lifted into `src/model/`). |
+| **D** Batch + resize/expand cluster | **1 of 3 shipped** | `6a59121` — `rb-cli batch SCRIPT.json` with mkdir/put/rm ops, `--dry-run`, `--continue-on-error`. **Deferred**: `resize`, `expand` (non-SGI filesystems), `batch-template` generator, whole-volume `format` op + multi-partition `disk` block. |
+| **E** Optical | **pending** | `optical rip / convert / browse / extract` — needs `opticaldiscs`/`cd-da-reader` plumbing wired to a new verb tree. |
+| **F** Interactive `terminal` REPL | **pending** | `rustyline`/`reedline` REPL on top of the one-shot verbs. |
+| **G** Config file | **shipped** | `15ce270` — INI loader, XDG-aware `default_path()`, `rb-cli config {init,path,show}`. Per-verb flag resolution (CLI > config > default) not yet threaded into every verb; the loader is in place and `config init` writes the template. |
+| **H** Documentation | **3 of 5 shipped** | `4cca5dd` — auto-generated `docs/cli-reference.md` (via `cargo run --example generate_cli_reference`), hand-written `docs/cli-examples.md` cookbook-lite, README rewrite. Manpage gen example shipped in Phase A. **Deferred**: `docs/cli-cookbook.md` (longform), Windows HTML help. |
+
+### Cross-cutting items still pending
+
+- **Convert verb model-lift** — Phase C carry-over; precondition for the verb.
+- **Per-verb config-file wiring** — Phase G carry-over.
+- **FAT/EFS/AFFS blank creators** — Phase B carry-over; gates new --fs.
+- **Resume support for partial backups/restores** — explicitly deferred in the doc; the partial-metadata side already lands with backup's metadata.json `"status": "partial"` field.
+- **Device-write auto-detection** — Phase C ships `--device` + `--yes`; the full system-disk refusal / mounted-target refusal / mount-point vs device-path disambiguation lands when `src/cli/device_safety.rs` exists.
+- **Globbing for `get`** — Phase B shipped globs for `ls` and `rm`; `get` waits for the recursive-extract design in Phase D.
+
+The detailed plan below remains the spec; check this table before starting work on a verb to see if it's already implemented.
+
+
 ### Binary rename
 
 `rusty-backup-cli` → `rb-cli`. Update `[[bin]]` block in `Cargo.toml`
