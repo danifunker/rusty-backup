@@ -45,6 +45,7 @@ fn top_level_verbs_present() {
         "inspect",
         "show",
         "convert",
+        "batch-template",
         "completions",
         "install-completions",
     ] {

@@ -95,6 +95,10 @@ pub enum Command {
     /// one transaction-like batch.
     Batch(verbs::batch::BatchArgs),
 
+    /// Generate a starter `batch` JSON script from a host directory.
+    #[command(name = "batch-template")]
+    BatchTemplate(verbs::batch_template::BatchTemplateArgs),
+
     /// Manage the rbcli.conf config file.
     Config {
         #[command(subcommand)]
@@ -146,6 +150,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Write(args) => verbs::write::run(args),
         Command::Convert(args) => verbs::convert::run(args),
         Command::Batch(args) => verbs::batch::run(args),
+        Command::BatchTemplate(args) => verbs::batch_template::run(args),
         Command::Config { cmd } => verbs::config::run(cmd),
         Command::Show { cmd } => verbs::show::run(cmd),
         Command::Completions(args) => verbs::completions::run_emit(args),

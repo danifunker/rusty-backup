@@ -8,6 +8,7 @@
 
 pub mod backup;
 pub mod batch;
+pub mod batch_template;
 pub mod completions;
 pub mod config;
 pub mod convert;

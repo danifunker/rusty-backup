@@ -274,6 +274,29 @@ Usage: batch [OPTIONS] <SCRIPT>
 - `--dry-run` — Validate + print the plan, don't apply
 - `--continue-on-error` — Continue with remaining ops after a non-fatal failure. Default is stop-on-first-error
 
+### `batch-template`
+
+Generate a starter `batch` JSON script from a host directory
+
+```
+Usage: batch-template [OPTIONS] --target <TARGET> <HOSTDIR>
+```
+
+**Arguments**
+
+- `<SOURCE>` — Host directory to mirror
+
+**Options**
+
+- `--target` — Target image (and optional partition) the batch script will modify. Written verbatim into the script's `target` field
+- `--dst` — Destination directory inside the target filesystem (`/` for root)
+- `--out` — Write the script here. Defaults to stdout
+- `--include` — Include only paths matching these globs (repeatable). Default is "all"
+- `--exclude` — Exclude paths matching these globs (repeatable). Exclude wins on conflict
+- `--icase` — Glob matching is case-insensitive
+- `--default-type` — Default HFS type code for files with no extension match
+- `--default-creator` — Default HFS creator code for files with no extension match
+
 ### `completions`
 
 Emit a shell-completion script to stdout
