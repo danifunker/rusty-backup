@@ -2163,6 +2163,155 @@ fn trim_ascii(b: &[u8]) -> String {
         .to_string()
 }
 
+/// Build a freshly-formatted EFS volume in memory.
+///
+/// Produces a single-cylinder-group EFS volume that `EfsFilesystem::open`
+/// can read and write. The root inode (inum 2) is a directory with one
+/// allocated 512-byte dirblock — empty, so the volume mounts as a clean
+/// `/` with no entries.
+///
+/// `size_bytes` must be at least 32 KiB. `name` is the 6-byte
+/// `fname`/`fpack` short label (padded with spaces; characters beyond 6
+/// bytes are truncated).
+pub fn create_blank_efs(size_bytes: u64, name: &str) -> anyhow::Result<Vec<u8>> {
+    use byteorder::{BigEndian, ByteOrder};
+
+    if size_bytes < 32 * 1024 {
+        return Err(anyhow::anyhow!(
+            "EFS volume must be at least 32 KiB, got {size_bytes}"
+        ));
+    }
+    let total_blocks_u64 = size_bytes / EFS_BLOCKSIZE;
+    if total_blocks_u64 > u32::MAX as u64 {
+        return Err(anyhow::anyhow!(
+            "EFS volume size {size_bytes} exceeds u32 block range"
+        ));
+    }
+    let total_blocks = total_blocks_u64 as u32;
+
+    // Single cylinder group layout. `firstcg` = 18 mirrors classic IRIX
+    // (boot + sb + bitmap + reserved space up to the inode region).
+    let firstcg: u32 = 18;
+    // Inode region size in blocks. 4 inodes per block (128-byte inodes).
+    //   ≤ 4 MiB:    8 blocks (32 inodes)
+    //   ≤ 64 MiB:   32 blocks (128 inodes)
+    //   ≤ 512 MiB:  128 blocks (512 inodes)
+    //   larger:     512 blocks (2048 inodes)
+    let cgisize: u16 = match size_bytes {
+        0..=4_194_304 => 8,
+        4_194_305..=67_108_864 => 32,
+        67_108_865..=536_870_912 => 128,
+        _ => 512,
+    };
+    // Single CG covers the entire data region past the inode table.
+    let cgfsize: u32 = total_blocks - firstcg;
+    if cgfsize <= cgisize as u32 + 4 {
+        return Err(anyhow::anyhow!(
+            "EFS volume too small to fit inode region + a root dirblock"
+        ));
+    }
+    // Bitmap byte size: 1 bit per block, packed.
+    let bmsize: u32 = (total_blocks as usize + 7) as u32 / 8;
+    let bm_sectors = bmsize.div_ceil(EFS_BLOCKSIZE as u32);
+    if bm_sectors > (firstcg - 2) {
+        return Err(anyhow::anyhow!(
+            "EFS bitmap too large for the reserved region (firstcg=18 sectors)"
+        ));
+    }
+    // Root dirblock: first block in the data region past the inode table.
+    let root_dirblock: u32 = firstcg + cgisize as u32;
+    let replsb: u32 = total_blocks - 1;
+
+    let mut img = vec![0u8; total_blocks as usize * EFS_BLOCKSIZE as usize];
+
+    let mut fname = [b' '; 6];
+    let nb = name.as_bytes();
+    let n = nb.len().min(6);
+    fname[..n].copy_from_slice(&nb[..n]);
+    let fpack = fname;
+
+    let sb = EfsSuperblock {
+        fs_size: total_blocks,
+        firstcg,
+        cgfsize,
+        cgisize,
+        sectors: 63,
+        heads: 1,
+        ncg: 1,
+        dirty: 0,
+        fs_time: 0,
+        magic: EFS_MAGIC_OLD,
+        fname,
+        fpack,
+        bmsize,
+        tfree: 0, // not maintained by our reader; fsck recomputes if needed
+        tinode: 0,
+        bmblock: 2,
+        replsb,
+        lastialloc: 2, // last allocated inode = root
+        checksum: 0,
+    };
+    let sb_off = EFS_BLOCKSIZE as usize;
+    sb.write_into(&mut img[sb_off..sb_off + EFS_SUPERBLOCK_SIZE]);
+    // Replica superblock at last block.
+    let rep_off = replsb as usize * EFS_BLOCKSIZE as usize;
+    sb.write_into(&mut img[rep_off..rep_off + EFS_SUPERBLOCK_SIZE]);
+
+    // Bitmap convention: set bit = free, clear bit = in-use.
+    let bm_off = 2 * EFS_BLOCKSIZE as usize;
+    for i in 0..bmsize as usize {
+        img[bm_off + i] = 0xFF;
+    }
+    // Clear bits for blocks that are in-use:
+    //   - boot (0)
+    //   - primary sb (1)
+    //   - bitmap blocks (2..2+bm_sectors)
+    //   - inode region (firstcg .. firstcg+cgisize)
+    //   - root dirblock
+    //   - last block (replica sb)
+    let mut in_use: Vec<u32> = Vec::new();
+    in_use.push(0);
+    in_use.push(1);
+    for b in 2..2 + bm_sectors {
+        in_use.push(b);
+    }
+    for b in firstcg..firstcg + cgisize as u32 {
+        in_use.push(b);
+    }
+    in_use.push(root_dirblock);
+    in_use.push(replsb);
+    for b in in_use {
+        let by = (b / 8) as usize;
+        let bit = 7 - (b % 8) as usize;
+        img[bm_off + by] &= !(1u8 << bit);
+    }
+
+    // Root inode (inum 2) at firstcg*BLOCKSIZE + 2*128.
+    let root_inode_off = firstcg as usize * EFS_BLOCKSIZE as usize + 2 * EFS_INODESIZE as usize;
+    let mut root = EfsInode::empty(2);
+    root.mode = 0o040755; // directory, rwxr-xr-x
+    root.nlink = 2; // . and ..
+    root.size = EFS_BLOCKSIZE as u32;
+    root.numextents = 1;
+    root.extents[0] = EfsExtent {
+        magic: 0,
+        bn: root_dirblock,
+        length: 1,
+        offset: 0,
+    };
+    let mut slot = [0u8; EFS_INODESIZE as usize];
+    root.write_into(&mut slot);
+    img[root_inode_off..root_inode_off + EFS_INODESIZE as usize].copy_from_slice(&slot);
+
+    // Root dirblock: just the EFS_DIRBLK header. No entries.
+    let dirblk_off = root_dirblock as usize * EFS_BLOCKSIZE as usize;
+    BigEndian::write_u16(&mut img[dirblk_off..dirblk_off + 2], EFS_DIRBLK_MAGIC);
+    img[dirblk_off + 2] = 0; // slot count
+    img[dirblk_off + 3] = 0; // first free byte
+
+    Ok(img)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2749,6 +2898,16 @@ mod tests {
         let r3 = fs.read_inode(3).expect("re-read 3");
         assert_eq!(r3.mode, 0o100644);
         assert_eq!(r3.size, 200);
+    }
+
+    #[test]
+    fn create_blank_efs_round_trips_through_open() {
+        let img = create_blank_efs(1024 * 1024, "rb-efs").expect("format 1M EFS");
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        assert!(root.is_directory());
+        let entries = fs.list_directory(&root).expect("list root");
+        assert!(entries.is_empty(), "fresh EFS must have an empty root");
     }
 
     #[test]

@@ -2046,6 +2046,118 @@ fn affs_bm_pages_needed(total: u32) -> usize {
     ((bits + AFFS_BITS_PER_BM_PAGE as u64 - 1) / AFFS_BITS_PER_BM_PAGE as u64) as usize
 }
 
+/// Build a freshly-formatted AFFS (Amiga Fast File System) volume in memory.
+///
+/// Produces a minimal AFFS volume with a boot block, root block, and one
+/// bitmap block. `AffsFilesystem::open` can read it; the root directory
+/// is empty.
+///
+/// `variant` is the DOS-block variant byte at offset 3 of the boot
+/// sector (0 = OFS, 1 = FFS, 2 = OFS+intl, 3 = FFS+intl, …). For Classic
+/// Amiga work the FFS variants (1, 3) are the common ones.
+///
+/// `size_bytes` must be at least 32 KiB and a multiple of 512.
+/// `volume_name` is the BCPL-style disk name (max 30 bytes; truncated).
+pub fn create_blank_affs(
+    size_bytes: u64,
+    variant: u8,
+    volume_name: &str,
+) -> anyhow::Result<Vec<u8>> {
+    use byteorder::{BigEndian, ByteOrder};
+
+    if size_bytes < 32 * 1024 {
+        return Err(anyhow::anyhow!(
+            "AFFS volume must be at least 32 KiB, got {size_bytes}"
+        ));
+    }
+    if size_bytes % BSIZE_U64 != 0 {
+        return Err(anyhow::anyhow!(
+            "AFFS volume size must be a multiple of 512, got {size_bytes}"
+        ));
+    }
+    let total_blocks_u64 = size_bytes / BSIZE_U64;
+    if total_blocks_u64 > u32::MAX as u64 {
+        return Err(anyhow::anyhow!(
+            "AFFS volume size {size_bytes} exceeds u32 block range"
+        ));
+    }
+    let total_blocks = total_blocks_u64 as u32;
+
+    // Root block lives at the middle of the data region (classic AFFS
+    // layout). The Amiga formatter picks `(2 + total_blocks - 1) / 2`.
+    let root_block: u32 = (2 + total_blocks - 1) / 2;
+    let bitmap_block: u32 = root_block + 1;
+    if bitmap_block >= total_blocks {
+        return Err(anyhow::anyhow!(
+            "AFFS volume too small to fit root + bitmap blocks"
+        ));
+    }
+
+    let mut img = vec![0u8; total_blocks as usize * BSIZE];
+
+    // Boot block: "DOS\x" magic.
+    img[0] = b'D';
+    img[1] = b'O';
+    img[2] = b'S';
+    img[3] = variant;
+
+    // Root block.
+    let root_off = root_block as usize * BSIZE;
+    let root = &mut img[root_off..root_off + BSIZE];
+    BigEndian::write_i32(&mut root[0..4], T_HEADER);
+    BigEndian::write_u32(&mut root[4..8], root_block); // headerKey = self
+    BigEndian::write_u32(&mut root[12..16], HT_SIZE as u32);
+    BigEndian::write_i32(&mut root[0x138..0x13C], -1); // bm_flag = valid
+    BigEndian::write_u32(&mut root[0x13C..0x140], bitmap_block); // bm_pages[0]
+    let name_bytes = volume_name.as_bytes();
+    let n = name_bytes.len().min(MAX_NAME_LEN);
+    root[0x1B0] = n as u8;
+    root[0x1B1..0x1B1 + n].copy_from_slice(&name_bytes[..n]);
+    BigEndian::write_i32(&mut root[0x1D8..0x1DC], 1); // last-access stamp
+    BigEndian::write_i32(&mut root[0x1E4..0x1E8], 1); // creation stamp
+    BigEndian::write_i32(&mut root[0x1FC..0x200], ST_ROOT);
+    let sum = normal_checksum(root, 5);
+    BigEndian::write_u32(&mut root[0x14..0x18], sum);
+
+    // Bitmap block: all free except blocks 0/1 (boot), root, bitmap, and
+    // any blocks past `total_blocks` within the same 4064-bit page.
+    let bm_off = bitmap_block as usize * BSIZE;
+    let bm = &mut img[bm_off..bm_off + BSIZE];
+    for i in 1..128 {
+        BigEndian::write_u32(&mut bm[i * 4..i * 4 + 4], 0xFFFFFFFF);
+    }
+    // AFFS bitmap addresses blocks starting at block 2. Bit `i` covers
+    // block `i + 2`. Mark in-use: root_block, bitmap_block.
+    for blk in [root_block, bitmap_block] {
+        if blk >= 2 {
+            let bit = (blk - 2) as usize;
+            let word_idx = bit / 32 + 1; // word 0 is the checksum
+            let bit_in_word = bit % 32;
+            let mut w = BigEndian::read_u32(&bm[word_idx * 4..word_idx * 4 + 4]);
+            w &= !(1u32 << bit_in_word);
+            BigEndian::write_u32(&mut bm[word_idx * 4..word_idx * 4 + 4], w);
+        }
+    }
+    // Clear bits for blocks past `total_blocks` (the bitmap covers a
+    // full 4064-bit page even if the volume is smaller). Without this,
+    // an allocator could hand out non-existent block numbers.
+    let last_block_idx_in_page = ((total_blocks - 2) as usize).min(4064);
+    for bit in last_block_idx_in_page..4064 {
+        let word_idx = bit / 32 + 1;
+        if word_idx >= 128 {
+            break;
+        }
+        let bit_in_word = bit % 32;
+        let mut w = BigEndian::read_u32(&bm[word_idx * 4..word_idx * 4 + 4]);
+        w &= !(1u32 << bit_in_word);
+        BigEndian::write_u32(&mut bm[word_idx * 4..word_idx * 4 + 4], w);
+    }
+    let sum = bitmap_checksum(bm);
+    BigEndian::write_u32(&mut bm[0..4], sum);
+
+    Ok(img)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2118,6 +2230,21 @@ mod tests {
         BigEndian::write_u32(&mut bm[0..4], sum);
 
         img
+    }
+
+    #[test]
+    fn create_blank_affs_round_trips_through_open() {
+        // 880 KiB Amiga DD floppy in FFS variant (1).
+        let img = create_blank_affs(880 * 1024, 1, "rb-affs").expect("format DD floppy");
+        let mut cur = Cursor::new(img);
+        let mut fs = AffsFilesystem::open(&mut cur, 0).expect("open");
+        assert_eq!(fs.variant(), 1);
+        assert!(fs.is_ffs());
+        assert_eq!(fs.total_blocks(), 1760);
+        assert_eq!(fs.root.disk_name, "rb-affs");
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list root");
+        assert!(entries.is_empty(), "fresh AFFS root must be empty");
     }
 
     #[test]

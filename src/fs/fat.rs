@@ -3571,6 +3571,200 @@ fn compute_free_clusters(
     Ok(free_count)
 }
 
+/// Build a freshly-formatted FAT12 or FAT16 volume in memory.
+///
+/// Auto-selects FAT12 for ≤ 32 MiB volumes (the classic floppy /
+/// small-CF range) and FAT16 for larger ones up to 2 GiB. Returns
+/// `Err` for sizes that would require FAT32 (FAT32 formatting is not
+/// implemented here yet — vintage targets rarely need it; restore
+/// from a backup for FAT32 volumes).
+///
+/// `label` is the 11-byte short volume label written to BPB + a root
+/// directory volume-ID entry. Padded with spaces; characters beyond
+/// 11 bytes are truncated; non-ASCII is replaced with `_`.
+///
+/// `size_bytes` must be at least 64 KiB (the absolute minimum to fit
+/// boot + 2 FATs + 1 root-dir sector + 1 data cluster). It is rounded
+/// down to a 512-byte sector boundary.
+pub fn create_blank_fat(size_bytes: u64, label: Option<&str>) -> Result<Vec<u8>> {
+    if size_bytes < 64 * 1024 {
+        return Err(anyhow::anyhow!(
+            "FAT volume must be at least 64 KiB, got {size_bytes}"
+        ));
+    }
+
+    const BYTES_PER_SECTOR: u32 = 512;
+    let total_sectors_u64 = size_bytes / BYTES_PER_SECTOR as u64;
+    if total_sectors_u64 > u32::MAX as u64 {
+        return Err(anyhow::anyhow!(
+            "FAT volume size {size_bytes} exceeds u32 sector range"
+        ));
+    }
+    let total_sectors = total_sectors_u64 as u32;
+
+    // Choose FAT type + sectors-per-cluster.
+    //   ≤ 32 MiB     → FAT12 (classic floppy / small CF)
+    //   ≤ 2 GiB      → FAT16
+    //   > 2 GiB      → error (FAT32 not implemented here)
+    let (fat_type, sectors_per_cluster, root_entry_count) = if size_bytes <= 32 * 1024 * 1024 {
+        // FAT12: clusters small enough for the 4085-cluster cap.
+        // 1 sector per cluster works for ≤ 2 MiB; bump for larger.
+        let spc: u32 = match size_bytes {
+            0..=2_097_152 => 1,          // ≤ 2 MiB
+            2_097_153..=8_388_608 => 2,  // ≤ 8 MiB
+            8_388_609..=16_777_216 => 4, // ≤ 16 MiB
+            _ => 8,                      // ≤ 32 MiB
+        };
+        (FatType::Fat12, spc, 224u16)
+    } else if size_bytes <= 2u64 * 1024 * 1024 * 1024 {
+        // FAT16: pick sectors-per-cluster so total_clusters stays under 65525.
+        let mut spc: u32 = 1;
+        while (total_sectors / spc) > 65500 && spc < 64 {
+            spc *= 2;
+        }
+        (FatType::Fat16, spc, 512u16)
+    } else {
+        return Err(anyhow::anyhow!(
+            "FAT volumes > 2 GiB require FAT32 (not implemented). \
+                 Use --fs fat with --size <= 2G, or restore from a backup."
+        ));
+    };
+
+    let reserved_sectors: u16 = 1;
+    let num_fats: u8 = 2;
+    let root_dir_sectors =
+        ((root_entry_count as u32 * 32) + (BYTES_PER_SECTOR - 1)) / BYTES_PER_SECTOR;
+
+    // Iterate sectors_per_fat until it covers the cluster count it itself enables.
+    let mut sectors_per_fat: u32 = 1;
+    loop {
+        let data_start =
+            reserved_sectors as u32 + (num_fats as u32 * sectors_per_fat) + root_dir_sectors;
+        if data_start >= total_sectors {
+            return Err(anyhow::anyhow!(
+                "FAT geometry overflowed (data_start={data_start} >= total_sectors={total_sectors})"
+            ));
+        }
+        let data_sectors = total_sectors - data_start;
+        let total_clusters = data_sectors / sectors_per_cluster;
+        // FAT entry width in bytes (FAT12 = 1.5, FAT16 = 2).
+        let fat_bytes_needed = match fat_type {
+            FatType::Fat12 => (((total_clusters + 2) as u64 * 3 + 1) / 2) as u32,
+            FatType::Fat16 => (total_clusters + 2) * 2,
+            FatType::Fat32 => unreachable!(),
+        };
+        let needed_spf = fat_bytes_needed.div_ceil(BYTES_PER_SECTOR);
+        if needed_spf <= sectors_per_fat {
+            break;
+        }
+        sectors_per_fat = needed_spf;
+    }
+
+    let image_size = total_sectors as usize * BYTES_PER_SECTOR as usize;
+    let mut img = vec![0u8; image_size];
+
+    // ---- Boot sector ----
+    img[0..3].copy_from_slice(&[0xEB, 0x3C, 0x90]); // jump
+    img[3..11].copy_from_slice(b"MSDOS5.0");
+    img[11..13].copy_from_slice(&(BYTES_PER_SECTOR as u16).to_le_bytes());
+    img[13] = sectors_per_cluster as u8;
+    img[14..16].copy_from_slice(&reserved_sectors.to_le_bytes());
+    img[16] = num_fats;
+    img[17..19].copy_from_slice(&root_entry_count.to_le_bytes());
+    if total_sectors <= u16::MAX as u32 {
+        img[19..21].copy_from_slice(&(total_sectors as u16).to_le_bytes());
+    } else {
+        img[19..21].copy_from_slice(&0u16.to_le_bytes());
+    }
+    img[21] = 0xF8; // media: fixed disk
+    img[22..24].copy_from_slice(&(sectors_per_fat as u16).to_le_bytes());
+    img[24..26].copy_from_slice(&63u16.to_le_bytes()); // sectors per track (cosmetic)
+    img[26..28].copy_from_slice(&16u16.to_le_bytes()); // heads
+    img[28..32].copy_from_slice(&0u32.to_le_bytes()); // hidden sectors
+    if total_sectors > u16::MAX as u32 {
+        img[32..36].copy_from_slice(&total_sectors.to_le_bytes());
+    } else {
+        img[32..36].copy_from_slice(&0u32.to_le_bytes());
+    }
+    // EBPB at offset 36 (FAT12/16 layout).
+    img[36] = 0x80; // drive number
+    img[37] = 0; // reserved
+    img[38] = 0x29; // extended boot signature
+    img[39..43].copy_from_slice(&0xDEADBEEFu32.to_le_bytes()); // volume serial
+    let label_bytes = fat_label_bytes(label);
+    img[43..54].copy_from_slice(&label_bytes);
+    img[54..62].copy_from_slice(match fat_type {
+        FatType::Fat12 => b"FAT12   ",
+        FatType::Fat16 => b"FAT16   ",
+        FatType::Fat32 => unreachable!(),
+    });
+    img[510] = 0x55;
+    img[511] = 0xAA;
+
+    // ---- FAT 0 and FAT 1 ----
+    let fat0_off = reserved_sectors as usize * BYTES_PER_SECTOR as usize;
+    let fat_bytes_total = sectors_per_fat as usize * BYTES_PER_SECTOR as usize;
+    // Entries 0 and 1 are reserved: media descriptor in entry 0, EOC in entry 1.
+    match fat_type {
+        FatType::Fat12 => {
+            // FAT12 packs 2 entries into 3 bytes. Entry 0 = 0xFF8, entry 1 = 0xFFF.
+            img[fat0_off] = 0xF8;
+            img[fat0_off + 1] = 0xFF;
+            img[fat0_off + 2] = 0xFF;
+        }
+        FatType::Fat16 => {
+            img[fat0_off..fat0_off + 2].copy_from_slice(&0xFFF8u16.to_le_bytes());
+            img[fat0_off + 2..fat0_off + 4].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        }
+        FatType::Fat32 => unreachable!(),
+    }
+    let fat1_off = fat0_off + fat_bytes_total;
+    img.copy_within(fat0_off..fat0_off + 4, fat1_off);
+
+    // ---- Root directory: one volume-ID entry, rest zeroed ----
+    let root_dir_off = fat1_off + fat_bytes_total;
+    if label.is_some() {
+        let entry = &mut img[root_dir_off..root_dir_off + 32];
+        entry[0..11].copy_from_slice(&label_bytes);
+        entry[11] = ATTR_VOLUME_ID;
+        // entry[12..] left zero (no NT-flags / cluster / date for the vol-id entry)
+    }
+    // Data region beyond is already zero — no allocated clusters.
+
+    Ok(img)
+}
+
+/// Format an 11-byte FAT volume label. Trims to 11 bytes, pads with
+/// spaces, uppercases ASCII, replaces non-ASCII with `_`. `None`
+/// produces "NO NAME    " (canonical sentinel).
+fn fat_label_bytes(label: Option<&str>) -> [u8; 11] {
+    let mut out = [b' '; 11];
+    let s = label.unwrap_or("NO NAME");
+    let mut written = 0;
+    for ch in s.chars() {
+        if written >= 11 {
+            break;
+        }
+        let b = if ch.is_ascii() {
+            let c = ch as u8;
+            if c.is_ascii_alphanumeric() || matches!(c, b' ' | b'_' | b'-' | b'.') {
+                if c.is_ascii_lowercase() {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                }
+            } else {
+                b'_'
+            }
+        } else {
+            b'_'
+        };
+        out[written] = b;
+        written += 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3658,6 +3852,43 @@ mod tests {
         img[fat2_offset + 2..fat2_offset + 4].copy_from_slice(&0xFFFFu16.to_le_bytes());
 
         std::io::Cursor::new(img)
+    }
+
+    #[test]
+    fn create_blank_fat_floppy_round_trips_through_open() {
+        let img = create_blank_fat(1_474_560, Some("FloppyVol")).expect("format 1.44M floppy");
+        let mut cur = std::io::Cursor::new(img);
+        let mut fs = FatFilesystem::open(&mut cur, 0).expect("open");
+        assert_eq!(fs.fat_type, FatType::Fat12);
+        assert_eq!(fs.label.as_deref(), Some("FLOPPYVOL"));
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list root");
+        assert!(entries.is_empty(), "blank volume root must be empty");
+    }
+
+    #[test]
+    fn create_blank_fat_picks_fat16_for_larger_volumes() {
+        // 64 MiB → over the FAT12 cap.
+        let img = create_blank_fat(64 * 1024 * 1024, Some("CFCARD")).expect("format 64M");
+        let mut cur = std::io::Cursor::new(img);
+        let fs = FatFilesystem::open(&mut cur, 0).expect("open");
+        assert_eq!(fs.fat_type, FatType::Fat16);
+        assert_eq!(fs.label.as_deref(), Some("CFCARD"));
+    }
+
+    #[test]
+    fn create_blank_fat_supports_create_file() {
+        let img = create_blank_fat(8 * 1024 * 1024, Some("RW")).expect("format 8M");
+        let mut cur = std::io::Cursor::new(img);
+        let mut fs = FatFilesystem::open(&mut cur, 0).expect("open");
+        let root = fs.root().expect("root");
+        let mut data = std::io::Cursor::new(b"hello".to_vec());
+        let f = fs
+            .create_file(&root, "hi.txt", &mut data, 5, &CreateFileOptions::default())
+            .expect("create file");
+        assert_eq!(f.name, "hi.txt");
+        let listing = fs.list_directory(&root).expect("list");
+        assert_eq!(listing.len(), 1);
     }
 
     #[test]

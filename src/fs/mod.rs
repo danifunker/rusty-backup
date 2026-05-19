@@ -201,6 +201,23 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
         }
     }
 
+    // Sector 1 (offset 512): EFS superblock. EFS magic is at offset 28
+    // of the sector (0x00072959 / 0x0007295A, big-endian).
+    if reader.seek(SeekFrom::Start(partition_offset + 512)).is_ok() {
+        let mut efs_buf = [0u8; 512];
+        if reader.read_exact(&mut efs_buf).is_ok() {
+            let magic = u32::from_be_bytes([efs_buf[28], efs_buf[29], efs_buf[30], efs_buf[31]]);
+            if magic == 0x0007_2959 || magic == 0x0007_295A {
+                return "efs";
+            }
+        }
+    }
+
+    // Sector 0 again: AmigaDOS "DOS\x" boot block (variants 0..7).
+    if &sector0[0..3] == b"DOS" && sector0[3] <= 7 {
+        return "affs";
+    }
+
     // Sector 128 (offset 65536 = 0x10000): btrfs superblock.
     // btrfs magic "_BHRfS_M" is at offset 0x40 (64) within the superblock,
     // i.e. byte 64 of a sector-aligned read from offset 65536.
@@ -999,6 +1016,14 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "efs" => Ok(Box::new(efs::EfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "affs" => Ok(Box::new(affs::AffsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 _ => Err(FilesystemError::Unsupported(
                     "could not detect filesystem type on superfloppy".into(),
                 )),
@@ -1209,6 +1234,14 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     Ok(Box::new(fs))
                 }
                 "prodos" => Ok(Box::new(prodos::ProDosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "efs" => Ok(Box::new(efs::EfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "affs" => Ok(Box::new(affs::AffsFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),
