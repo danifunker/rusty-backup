@@ -20,6 +20,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 pub mod api;
+pub mod config;
 pub mod exit;
 pub mod glob;
 pub mod img_at;
@@ -91,6 +92,12 @@ pub enum Command {
     /// one transaction-like batch.
     Batch(verbs::batch::BatchArgs),
 
+    /// Manage the rbcli.conf config file.
+    Config {
+        #[command(subcommand)]
+        cmd: verbs::config::ConfigCommand,
+    },
+
     /// Focused read-only queries.
     Show {
         #[command(subcommand)]
@@ -135,6 +142,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Restore(args) => verbs::restore::run(args),
         Command::Write(args) => verbs::write::run(args),
         Command::Batch(args) => verbs::batch::run(args),
+        Command::Config { cmd } => verbs::config::run(cmd),
         Command::Show { cmd } => verbs::show::run(cmd),
         Command::Completions(args) => verbs::completions::run_emit(args),
         Command::InstallCompletions(args) => verbs::completions::run_install(args),
