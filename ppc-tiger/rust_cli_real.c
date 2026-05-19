@@ -844,12 +844,122 @@ static void write_checksum(const char *filepath, ChecksumType type,
 
 typedef enum {
     COMP_RAW = 0,
-    COMP_GZIP
+    COMP_GZIP,
+    COMP_VHD
 } CompressionMode;
 
 /* Returns extension string for the compression mode */
 static const char *comp_ext(CompressionMode m) {
-    return m == COMP_GZIP ? ".gz" : ".raw";
+    if (m == COMP_GZIP) return ".gz";
+    if (m == COMP_VHD)  return ".vhd";
+    return ".raw";
+}
+
+/* ============================================================
+ * VHD (Fixed) Footer
+ * ----------------------------------------------------------------
+ * Microsoft VHD v1.0 "fixed" footer — 512 bytes appended to the raw
+ * partition data. Matches `src/rbformats/vhd.rs::build_vhd_footer`
+ * byte-for-byte so files round-trip with rb-cli.
+ * ============================================================ */
+
+#define VHD_FOOTER_SIZE 512
+#define VHD_EPOCH 946684800UL   /* 2000-01-01 00:00:00 UTC */
+
+/* Compute VHD CHS geometry from total disk size (bytes). Mirrors
+ * `vhd_chs_geometry()` in src/rbformats/vhd.rs. */
+static void vhd_chs_geometry(uint64_t size_bytes, uint32_t *cyl_out,
+                             uint32_t *heads_out, uint32_t *spt_out) {
+    uint64_t total_sectors_64 = size_bytes / 512ULL;
+    uint64_t cap = 65535ULL * 16ULL * 255ULL;
+    if (total_sectors_64 > cap) total_sectors_64 = cap;
+    uint32_t total_sectors = (uint32_t)total_sectors_64;
+
+    if (total_sectors == 0) {
+        *cyl_out = 0; *heads_out = 0; *spt_out = 0;
+        return;
+    }
+
+    if (total_sectors >= 65535U * 16U * 63U) {
+        uint32_t spt = 255U, heads = 16U;
+        *spt_out = spt; *heads_out = heads;
+        *cyl_out = total_sectors / (heads * spt);
+        return;
+    }
+
+    uint32_t spt = 17U;
+    uint32_t cyl_times_heads = total_sectors / spt;
+    uint32_t heads = (cyl_times_heads + 1023U) / 1024U; /* div_ceil */
+    if (heads < 4U) heads = 4U;
+
+    if (cyl_times_heads >= heads * 1024U || heads > 16U) {
+        spt = 31U; heads = 16U;
+        cyl_times_heads = total_sectors / spt;
+    }
+    if (cyl_times_heads >= heads * 1024U) {
+        spt = 63U; heads = 16U;
+        cyl_times_heads = total_sectors / spt;
+    }
+
+    *cyl_out = cyl_times_heads / heads;
+    *heads_out = heads;
+    *spt_out = spt;
+}
+
+static void vhd_put_be32(uint8_t *p, uint32_t v) {
+    p[0] = (v >> 24) & 0xff; p[1] = (v >> 16) & 0xff;
+    p[2] = (v >> 8) & 0xff;  p[3] = v & 0xff;
+}
+static void vhd_put_be64(uint8_t *p, uint64_t v) {
+    vhd_put_be32(p, (uint32_t)(v >> 32));
+    vhd_put_be32(p + 4, (uint32_t)(v & 0xffffffffULL));
+}
+
+/* Build a 512-byte VHD Fixed footer for `data_size`. */
+static void build_vhd_footer(uint64_t data_size, uint8_t footer[512]) {
+    memset(footer, 0, 512);
+    memcpy(&footer[0], "conectix", 8);
+    vhd_put_be32(&footer[8], 0x00000002);   /* Features: reserved bit */
+    vhd_put_be32(&footer[12], 0x00010000);  /* File Format Version 1.0 */
+    vhd_put_be64(&footer[16], 0xFFFFFFFFFFFFFFFFULL); /* Data Offset = none */
+
+    /* Timestamp: seconds since 2000-01-01 UTC. */
+    time_t now = time(NULL);
+    uint32_t ts = (now > (time_t)VHD_EPOCH) ? (uint32_t)(now - VHD_EPOCH) : 0;
+    vhd_put_be32(&footer[24], ts);
+
+    memcpy(&footer[28], "rsbk", 4);          /* Creator App */
+    vhd_put_be32(&footer[32], 0x00010000);   /* Creator Version */
+    memcpy(&footer[36], "Mac ", 4);          /* Creator Host OS */
+    vhd_put_be64(&footer[40], data_size);    /* Original Size */
+    vhd_put_be64(&footer[48], data_size);    /* Current Size */
+
+    uint32_t cyl, heads, spt;
+    vhd_chs_geometry(data_size, &cyl, &heads, &spt);
+    footer[56] = (uint8_t)((cyl >> 8) & 0xff);
+    footer[57] = (uint8_t)(cyl & 0xff);
+    footer[58] = (uint8_t)(heads & 0xff);
+    footer[59] = (uint8_t)(spt & 0xff);
+
+    vhd_put_be32(&footer[60], 2);            /* Disk Type: Fixed */
+    /* Checksum at [64..68] left zero for now; filled below. */
+
+    /* UUID (16 bytes) — mix time + pid like the Rust version. */
+    uint64_t pid = (uint64_t)getpid();
+    uint64_t mix1 = ((uint64_t)now * 2654435761ULL) ^ pid;
+    uint64_t mix2 = (mix1 ^ 0xDEADBEEFCAFEBABEULL) * 11400714819323198485ULL;
+    for (int i = 0; i < 8; i++) footer[68 + i] = (uint8_t)(mix1 >> (i * 8));
+    for (int i = 0; i < 8; i++) footer[76 + i] = (uint8_t)(mix2 >> (i * 8));
+
+    /* Checksum: one's complement of the sum of all bytes, treating the
+     * checksum field [64..68) as zero. */
+    uint32_t sum = 0;
+    for (int i = 0; i < 512; i++) {
+        if (i >= 64 && i < 68) continue;
+        sum += footer[i];
+    }
+    uint32_t cksum = ~sum;
+    vhd_put_be32(&footer[64], cksum);
 }
 
 /* ============================================================
@@ -961,6 +1071,26 @@ static void splitwriter_finalize_sparse(SplitWriter *sw); /* fwd */
 
 static int splitwriter_close(SplitWriter *sw) {
     splitwriter_finalize_sparse(sw);
+    splitwriter_close_current(sw);
+    return 0;
+}
+
+/* VHD output: append the 512-byte Fixed footer to the (single) raw
+ * file. `data_bytes_written` is the partition data size — it goes into
+ * the footer's Original/Current Size fields and CHS geometry. Caller
+ * must close the SplitWriter via this helper instead of
+ * splitwriter_close() when writing VHD. */
+static int splitwriter_close_vhd(SplitWriter *sw, uint64_t data_bytes_written) {
+    splitwriter_finalize_sparse(sw);
+    if (sw->raw_fp) {
+        uint8_t footer[VHD_FOOTER_SIZE];
+        build_vhd_footer(data_bytes_written, footer);
+        if (fwrite(footer, 1, VHD_FOOTER_SIZE, sw->raw_fp) != VHD_FOOTER_SIZE) {
+            fprintf(stderr, "Error: failed to write VHD footer\n");
+            splitwriter_close_current(sw);
+            return -1;
+        }
+    }
     splitwriter_close_current(sw);
     return 0;
 }
@@ -1674,7 +1804,9 @@ static void write_metadata_json(const char *backup_path, const char *source,
                         part_files[i][k]);
             }
         } else {
-            const char *_ext = (strcmp(compression, "gzip") == 0) ? ".gz" : ".raw";
+            const char *_ext =
+                (strcmp(compression, "gzip") == 0) ? ".gz"
+                : (strcmp(compression, "vhd") == 0) ? ".vhd" : ".raw";
             fprintf(f, "\"partition-%d%s\"", parts[i].index, _ext);
         }
         fprintf(f, "],\n");
@@ -1717,7 +1849,7 @@ static int cmd_backup(int argc, char **argv) {
             "  <DEST>                 Destination directory\n\n"
             "OPTIONS:\n"
             "  --name <NAME>          Backup name (default: backup)\n"
-            "  --format <TYPE>        raw (default) or gzip\n"
+            "  --format <TYPE>        raw (default), gzip, or vhd\n"
             "  --checksum <TYPE>      none (default), crc32, or sha256\n"
             "  --sector-by-sector     Full sector-by-sector (no FAT compaction)\n"
             "  --split-size <MIB>     Split output every N MiB (raw/gzip only)\n"
@@ -1759,7 +1891,32 @@ static int cmd_backup(int argc, char **argv) {
     if (!name) name = "backup";
 
     CompressionMode compression = COMP_RAW;
-    if (comp_str && strcmp(comp_str, "gzip") == 0) compression = COMP_GZIP;
+    if (comp_str) {
+        if (strcmp(comp_str, "gzip") == 0) compression = COMP_GZIP;
+        else if (strcmp(comp_str, "vhd") == 0) compression = COMP_VHD;
+        else if (strcmp(comp_str, "raw") != 0) {
+            fprintf(stderr,
+                "Error: unknown --format value '%s'. "
+                "Supported: raw, gzip, vhd.\n", comp_str);
+            return 1;
+        }
+    }
+    /* VHD output is incompatible with --split-size (footer must live at
+     * the very end of a single contiguous file). */
+    if (compression == COMP_VHD && split_bytes > 0) {
+        fprintf(stderr, "Error: --split-size is not compatible with --format vhd "
+                        "(the footer must live at the end of one file).\n");
+        return 1;
+    }
+    /* VHD output and FAT compaction are mutually exclusive — the VHD
+     * footer's size fields must match the on-disk partition geometry,
+     * which compaction breaks. rb-cli treats VHD as a layout-preserving
+     * format for the same reason. */
+    if (compression == COMP_VHD && !sector_by_sector) {
+        sector_by_sector = 1;
+        fprintf(stderr, "[INFO] --format vhd forces --sector-by-sector "
+                        "(layout-preserving).\n");
+    }
 
     ChecksumType checksum = CKSUM_NONE;
     if (cksum_str) {
@@ -1801,8 +1958,11 @@ static int cmd_backup(int argc, char **argv) {
     char sz_buf[32];
     fprintf(stderr, "Source: %s (%s)\n", source,
             format_bytes(source_size, sz_buf, sizeof(sz_buf)));
+    const char *comp_label =
+        compression == COMP_GZIP ? "gzip"
+        : compression == COMP_VHD ? "vhd" : "raw";
     fprintf(stderr, "Compression: %s | Checksum: %s | Compact: %s\n",
-            compression == COMP_GZIP ? "gzip" : "raw",
+            comp_label,
             checksum == CKSUM_CRC32 ? "crc32"
                 : checksum == CKSUM_SHA256 ? "sha256" : "none",
             sector_by_sector ? "off (sector-by-sector)" : "FAT-aware");
@@ -1870,7 +2030,8 @@ static int cmd_backup(int argc, char **argv) {
         return 1;
     }
 
-    const char *comp_name = compression == COMP_GZIP ? "gzip" : "raw";
+    const char *comp_name = compression == COMP_GZIP ? "gzip"
+                          : compression == COMP_VHD ? "vhd" : "raw";
     const char *cksum_name = checksum == CKSUM_CRC32 ? "crc32"
                             : checksum == CKSUM_SHA256 ? "sha256" : "none";
 
@@ -1896,7 +2057,11 @@ static int cmd_backup(int argc, char **argv) {
             if (source_size > 0)
                 draw_progress((double)written / source_size * 100.0, pt.fs_hint);
         }
-        splitwriter_close(&sw);
+        if (compression == COMP_VHD) {
+            splitwriter_close_vhd(&sw, written);
+        } else {
+            splitwriter_close(&sw);
+        }
         fprintf(stderr, "\n");
 
         /* Record emitted files + per-file checksums */
@@ -1979,7 +2144,11 @@ static int cmd_backup(int argc, char **argv) {
                                   prog_label);
                 }
             }
-            splitwriter_close(&sw);
+            if (compression == COMP_VHD) {
+                splitwriter_close_vhd(&sw, written);
+            } else {
+                splitwriter_close(&sw);
+            }
 
             imaged_sizes[i] = written;
             compact_fat_close(cf);
@@ -2204,13 +2373,14 @@ static int cmd_restore(int argc, char **argv) {
         lseek(tgt_fd, offset, SEEK_SET);
 
         const char *first = restorable[i].filenames[0];
-        int is_gz = (strlen(first) > 3
-                     && strcmp(first + strlen(first) - 3, ".gz") == 0);
+        size_t fl = strlen(first);
+        int is_gz  = (fl > 3 && strcmp(first + fl - 3, ".gz") == 0);
+        int is_vhd = (fl > 4 && strcmp(first + fl - 4, ".vhd") == 0);
 
         fprintf(stderr, "Restoring partition %d to LBA %llu%s (%d file%s)...\n",
                 restorable[i].index,
                 (unsigned long long)restorable[i].start_lba,
-                is_gz ? " (decompressing)" : "",
+                is_gz ? " (decompressing)" : is_vhd ? " (VHD)" : "",
                 restorable[i].file_count,
                 restorable[i].file_count == 1 ? "" : "s");
 
@@ -2245,14 +2415,31 @@ static int cmd_restore(int argc, char **argv) {
                             fpath);
                     break;
                 }
+                /* VHD: the last 512 bytes are the footer, not partition
+                 * data. Stop reading 512 bytes before EOF. */
+                uint64_t cap = UINT64_MAX;
+                if (is_vhd) {
+                    fseek(pf, 0, SEEK_END);
+                    long flen = ftell(pf);
+                    fseek(pf, 0, SEEK_SET);
+                    cap = (flen > VHD_FOOTER_SIZE)
+                          ? (uint64_t)(flen - VHD_FOOTER_SIZE) : 0;
+                }
                 size_t nr;
+                uint64_t this_file = 0;
                 while ((nr = fread(buf, 1, CHUNK_SIZE, pf)) > 0) {
-                    write(tgt_fd, buf, nr);
-                    written += nr;
+                    size_t to_write = nr;
+                    if (is_vhd && this_file + nr > cap) {
+                        to_write = (size_t)(cap - this_file);
+                    }
+                    if (to_write > 0) write(tgt_fd, buf, to_write);
+                    written += to_write;
+                    this_file += to_write;
                     if (restorable[i].size > 0) {
                         draw_progress((double)written / restorable[i].size * 100.0,
                                       "Restoring");
                     }
+                    if (is_vhd && this_file >= cap) break;
                 }
                 fclose(pf);
             }
