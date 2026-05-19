@@ -17,8 +17,8 @@ path = "src/main.rs"
 
 # Headless CLI binary — scripted image construction, no eframe dependency.
 [[bin]]
-name = "rusty-backup-cli"
-path = "src/bin/cli.rs"
+name = "rb-cli"
+path = "src/bin/rb_cli.rs"
 
 [[example]]
 name = "probe_hfs_btree"

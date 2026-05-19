@@ -1,5 +1,5 @@
-//! Headless CLI entry point. The GUI binary (`rusty-backup`) does not call
-//! into this; both bins share the parsing + handler code in
+//! Headless CLI entry point (`rb-cli`). The GUI binary (`rusty-backup`)
+//! does not call into this; both bins share the parsing + handler code in
 //! `rusty_backup::cli`.
 
 use clap::Parser;

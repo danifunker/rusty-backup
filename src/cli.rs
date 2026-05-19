@@ -23,7 +23,7 @@ use crate::partition::apm::Apm;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "rusty-backup-cli",
+    name = "rb-cli",
     about = "Headless image-construction CLI for rusty-backup",
     disable_help_subcommand = true
 )]

@@ -88,7 +88,7 @@ jobs:
       - name: Stage CLI binary
         shell: bash
         run: |
-          cp "target/${{ matrix.target }}/release/rusty-backup-cli.exe" \
+          cp "target/${{ matrix.target }}/release/rb-cli.exe" \
              "Rusty-Backup-CLI-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.exe"
 
       - name: Upload CLI artifact
@@ -263,7 +263,7 @@ jobs:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
         run: |
-          CLI_BIN="target/${{ matrix.target }}/release/rusty-backup-cli"
+          CLI_BIN="target/${{ matrix.target }}/release/rb-cli"
           if [ -n "$MACOS_CERTIFICATE" ] && [ -n "$MACOS_TEAM_ID" ]; then
             IDENTITY=$(security find-identity -v -p codesigning "$RUNNER_TEMP/app-signing.keychain-db" | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)".*/\1/')
             echo "Signing CLI with identity: $IDENTITY"
@@ -279,7 +279,7 @@ jobs:
           # ditto produces the zip layout notarytool / Gatekeeper expect for
           # loose binaries; plain `zip` works too but ditto is the canonical
           # tool on macOS.
-          ditto -c -k --keepParent "target/${{ matrix.target }}/release/rusty-backup-cli" "$ZIP_NAME"
+          ditto -c -k --keepParent "target/${{ matrix.target }}/release/rb-cli" "$ZIP_NAME"
 
       - name: Notarize CLI
         if: ${{ env.HAS_SIGNING_CERT == 'true' }}
@@ -624,7 +624,7 @@ jobs:
       - name: Package CLI
         run: |
           TGZ="Rusty-Backup-CLI-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz"
-          tar -C "target/${{ matrix.target }}/release" -czf "$TGZ" rusty-backup-cli
+          tar -C "target/${{ matrix.target }}/release" -czf "$TGZ" rb-cli
 
       - name: Upload CLI artifact
         uses: actions/upload-artifact@v6
