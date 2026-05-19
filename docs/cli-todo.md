@@ -28,7 +28,7 @@ it in the binary yet?"
 - **Per-verb config-file wiring** — Phase G carry-over.
 - **FAT/EFS/AFFS blank creators** — Phase B carry-over; gates new --fs.
 - **Resume support for partial backups/restores** — explicitly deferred in the doc; the partial-metadata side already lands with backup's metadata.json `"status": "partial"` field.
-- **Device-write auto-detection** — Phase C ships `--device` + `--yes`; the full system-disk refusal / mounted-target refusal / mount-point vs device-path disambiguation lands when `src/cli/device_safety.rs` exists.
+- **Device-write safety** — shipped in `src/cli/device_safety.rs`. System-disk refusal (`--write-to-system-disk` opts back in), mounted-target refusal, mount-point vs device-path disambiguation. Used by `restore --device` and `write`.
 - **Globbing for `get`** — Phase B shipped globs for `ls` and `rm`; `get` waits for the recursive-extract design in Phase D.
 
 The detailed plan below remains the spec; check this table before starting work on a verb to see if it's already implemented.

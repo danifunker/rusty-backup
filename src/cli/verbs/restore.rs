@@ -50,8 +50,8 @@ pub struct RestoreArgs {
     pub alignment: AlignmentMode,
 
     /// Treat `TARGET` as a block device (enables sector-aligned writes
-    /// and device-write safety summaries). Phase C: enforced via this
-    /// flag; Phase D's auto-detection lands in src/cli/device_safety.rs.
+    /// and the full device-write safety preflight in
+    /// [`crate::cli::device_safety`]).
     #[arg(long)]
     pub device: bool,
 
@@ -59,6 +59,11 @@ pub struct RestoreArgs {
     /// targets). For file targets the flag is a no-op.
     #[arg(long)]
     pub yes: bool,
+
+    /// Allow writing to the system boot disk (refused by default; only
+    /// meaningful with `--device`).
+    #[arg(long = "write-to-system-disk")]
+    pub write_to_system_disk: bool,
 
     /// Write zeros to unused filesystem space.
     #[arg(long = "write-zeros-to-unused")]
@@ -68,9 +73,18 @@ pub struct RestoreArgs {
 pub fn run(args: RestoreArgs) -> Result<()> {
     if args.device && !args.yes {
         bail!(
-            "--device target requires --yes (this will overwrite {}). \
-             Phase C safety check; see docs/cli-todo.md § Device-write safety.",
+            "--device target requires --yes (this will overwrite {}).",
             args.target.display()
+        );
+    }
+    if args.device {
+        let pre = crate::cli::device_safety::preflight(&args.target, args.write_to_system_disk)?;
+        crate::cli::device_safety::print_safety_summary(
+            "restore",
+            &args.backup_dir.display().to_string(),
+            &args.target,
+            args.target_size.unwrap_or(0),
+            pre.device.as_ref(),
         );
     }
 

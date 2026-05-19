@@ -525,8 +525,9 @@ Usage: restore [OPTIONS] <BACKUP_DIR> <TARGET>
 - `--target-size` — Target size in bytes (defaults to the original disk size from the backup metadata)
 - `--size` — Per-partition size policy
 - `--alignment` — Partition alignment policy
-- `--device` — Treat `TARGET` as a block device (enables sector-aligned writes and device-write safety summaries). Phase C: enforced via this flag; Phase D's auto-detection lands in src/cli/device_safety.rs
+- `--device` — Treat `TARGET` as a block device (enables sector-aligned writes and the full device-write safety preflight in [`crate::cli::device_safety`])
 - `--yes` — Confirm destructive write to the target (required for device targets). For file targets the flag is a no-op
+- `--write-to-system-disk` — Allow writing to the system boot disk (refused by default; only meaningful with `--device`)
 - `--write-zeros-to-unused` — Write zeros to unused filesystem space
 
 ### `rm`
@@ -647,4 +648,5 @@ Usage: write [OPTIONS] <IMAGE> <DEVICE>
 **Options**
 
 - `--yes` — Required confirmation. Skips the prompt but never the safety summary printed on stderr
+- `--write-to-system-disk` — Allow writing to the system boot disk (refused by default)
 
