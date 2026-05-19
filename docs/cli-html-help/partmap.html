@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli partmap</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>partmap</span></nav>
+<h1><code>rb-cli partmap</code></h1>
+<p>Edit the partition table (add / resize / delete / set-type / set-bootable). Partition *data* is never moved</p>
+<h2>Usage</h2>
+<pre><code>Usage: partmap &lt;COMMAND&gt;</code></pre>
+<h2>Subcommands</h2>
+<ul class="verbs">
+<li><a href="partmap-add.html"><code>add</code></a><span class="desc">Add a new partition entry</span></li>
+<li><a href="partmap-resize.html"><code>resize</code></a><span class="desc">Resize an existing partition entry (changes size only — data is not moved)</span></li>
+<li><a href="partmap-move.html"><code>move</code></a><span class="desc">Move a partition entry to a new start LBA (does not move data)</span></li>
+<li><a href="partmap-delete.html"><code>delete</code></a><span class="desc">Delete a partition entry (zeroes the slot)</span></li>
+<li><a href="partmap-set-type.html"><code>set-type</code></a><span class="desc">Change a partition's type byte / GUID / APM type string</span></li>
+<li><a href="partmap-set-bootable.html"><code>set-bootable</code></a><span class="desc">Toggle the bootable flag (MBR active-partition bit; RDB flag)</span></li>
+<li><a href="partmap-apply.html"><code>apply</code></a><span class="desc">Apply a JSON script of edits as one transaction</span></li>
+</ul>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_html_help</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

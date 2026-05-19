@@ -298,6 +298,37 @@ Usage: batch-template [OPTIONS] --target <TARGET> <HOSTDIR>
 - `--default-type` — Default HFS type code for files with no extension match
 - `--default-creator` — Default HFS creator code for files with no extension match
 
+### `bless`
+
+Mark an HFS / HFS+ folder as the bootable System Folder
+
+```
+Usage: bless <IMAGE> <PATH>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N`)
+- `<PATH>` — Absolute Mac path of the folder to bless (e.g. `/System Folder`)
+
+### `chmeta`
+
+Change the type and/or creator code on an existing HFS / HFS+ / ProDOS file
+
+```
+Usage: chmeta [OPTIONS] <IMAGE> <PATH>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N`)
+- `<PATH>` — Absolute Mac path of the file to update
+
+**Options**
+
+- `--type` — New 4-character type code
+- `--creator` — New 4-character creator code (HFS / HFS+ only)
+
 ### `completions`
 
 Emit a shell-completion script to stdout
@@ -420,6 +451,22 @@ Usage: get <IMAGE> <SRC> <DST>
 - `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
 - `<SRC>` — Source path inside the filesystem
 - `<DST>` — Destination path on the host
+
+### `grow`
+
+Grow a disk image by `--add SIZE` of trailing zero-padding so a subsequent `partmap` edit can place a new partition
+
+```
+Usage: grow --add <ADD> <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image to grow
+
+**Options**
+
+- `--add` — Bytes of zero-padding to add at the end (e.g. `512M`, `2G`)
 
 ### `inspect`
 
@@ -573,6 +620,133 @@ Usage: rip [OPTIONS] --device <DEVICE> --output <OUTPUT>
 - `--format` — 
 - `--eject` — Eject the disc after a successful rip
 
+### `partmap`
+
+Edit the partition table (add / resize / delete / set-type / set-bootable). Partition *data* is never moved
+
+```
+Usage: partmap <COMMAND>
+```
+
+### `partmap add`
+
+Add a new partition entry
+
+```
+Usage: add [OPTIONS] --start-lba <START_LBA> --size <SIZE> <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image to modify
+
+**Options**
+
+- `--start-lba` — Start LBA (512-byte sector). MBR / GPT: linear LBA. APM: block #
+- `--size` — Partition size in bytes (accepts `K`/`M`/`G` suffixes)
+- `--type-byte` — MBR type byte (decimal or `0xNN`). Ignored for non-MBR tables
+- `--type-string` — GPT type GUID string, or APM type string (`"Apple_HFS"`, etc.)
+- `--bootable` — Mark active/bootable
+
+### `partmap apply`
+
+Apply a JSON script of edits as one transaction
+
+```
+Usage: apply [OPTIONS] <IMAGE> <SCRIPT>
+```
+
+**Arguments**
+
+- `<IMAGE>` — 
+- `<SCRIPT>` — JSON script with the same schema as `PartitionEditScript` below (an `edits` array of typed entries)
+
+**Options**
+
+- `--dry-run` — Validate + print the plan, don't apply
+
+### `partmap delete`
+
+Delete a partition entry (zeroes the slot)
+
+```
+Usage: delete <IMAGE> <INDEX>
+```
+
+**Arguments**
+
+- `<IMAGE>` — 
+- `<INDEX>` — 
+
+### `partmap move`
+
+Move a partition entry to a new start LBA (does not move data)
+
+```
+Usage: move --start-lba <START_LBA> <IMAGE> <INDEX>
+```
+
+**Arguments**
+
+- `<IMAGE>` — 
+- `<INDEX>` — 
+
+**Options**
+
+- `--start-lba` — 
+
+### `partmap resize`
+
+Resize an existing partition entry (changes size only — data is not moved)
+
+```
+Usage: resize --size <SIZE> <IMAGE> <INDEX>
+```
+
+**Arguments**
+
+- `<IMAGE>` — 
+- `<INDEX>` — 1-based partition index
+
+**Options**
+
+- `--size` — 
+
+### `partmap set-bootable`
+
+Toggle the bootable flag (MBR active-partition bit; RDB flag)
+
+```
+Usage: set-bootable [OPTIONS] <IMAGE> <INDEX>
+```
+
+**Arguments**
+
+- `<IMAGE>` — 
+- `<INDEX>` — 
+
+**Options**
+
+- `--bootable` — 
+
+### `partmap set-type`
+
+Change a partition's type byte / GUID / APM type string
+
+```
+Usage: set-type [OPTIONS] <IMAGE> <INDEX>
+```
+
+**Arguments**
+
+- `<IMAGE>` — 
+- `<INDEX>` — 
+
+**Options**
+
+- `--type-byte` — MBR type byte (decimal or `0xNN`)
+- `--type-string` — GPT type GUID / APM type string
+
 ### `put`
 
 Copy a host file (or zero-fill / write boot blocks) into a filesystem
@@ -654,6 +828,23 @@ Usage: rm [OPTIONS] <IMAGE> <PATH>
 - `--exclude` — Exclude paths matching this glob from deletion. Repeatable. Exclude always wins over the positional pattern
 - `--ignore-case` — Match case-insensitively regardless of the target's native rule
 - `--case-sensitive` — Match case-sensitively regardless of the target's native rule
+
+### `setrsrc`
+
+Write the resource fork of an existing HFS / HFS+ file from a host file
+
+```
+Usage: setrsrc --from-file <FROM_FILE> <IMAGE> <PATH>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N`)
+- `<PATH>` — Absolute Mac path of the file whose resource fork should be replaced
+
+**Options**
+
+- `--from-file` — Host file whose contents become the new resource fork
 
 ### `show`
 

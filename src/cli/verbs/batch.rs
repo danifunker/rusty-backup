@@ -111,6 +111,32 @@ pub enum Operation {
     /// path. Must be the first operation if present. Mutually exclusive
     /// with a top-level `disk` block.
     Format(FormatOp),
+    /// Mark an HFS / HFS+ folder as the bootable System Folder.
+    Bless(BlessOp),
+    /// Change the type/creator codes on an existing file.
+    Chmeta(ChmetaOp),
+    /// Replace the resource fork of an existing file with host bytes.
+    Setrsrc(SetrsrcOp),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct BlessOp {
+    pub path: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ChmetaOp {
+    pub path: String,
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub type_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creator: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SetrsrcOp {
+    pub path: String,
+    pub from: PathBuf,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -258,49 +284,47 @@ pub fn run(args: BatchArgs) -> Result<()> {
         return Ok(());
     }
 
-    let (file, ctx) = resolve_partition_rw(&target.path, target.partition)?;
-    log_stderr(&ctx.label);
-    let mut fs = crate::fs::open_editable_filesystem(
-        file,
-        ctx.offset,
-        ctx.type_byte,
-        ctx.type_string.as_deref(),
-    )
-    .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
+    // Archive-edit path: when target is a backup folder, decompress
+    // partition N to a temp file, run ops on the temp, then recompress
+    // + update metadata.json checksum. Detected by the presence of a
+    // sibling metadata.json.
+    let archive_ctx = detect_archive_target(&target.path, target.partition)?;
 
-    let mut applied = fs_ops_start;
-    let mut failures: Vec<(usize, String)> = Vec::new();
-    for (i, op) in script.operations.iter().enumerate().skip(fs_ops_start) {
-        let res = apply_op(&mut *fs, op, &defaults);
-        match res {
-            Ok(()) => {
-                applied += 1;
-                log_stderr(format!(
-                    "  + [{}/{}] {}",
-                    i + 1,
-                    script.operations.len(),
-                    describe(op)
-                ));
-            }
-            Err(e) => {
-                let msg = format!(
-                    "[{}/{}] {}: {e}",
-                    i + 1,
-                    script.operations.len(),
-                    describe(op)
-                );
-                log_stderr(format!("  ! {msg}"));
-                failures.push((i + 1, msg));
-                if !args.continue_on_error {
-                    // Flush the partial work and bail.
-                    fs.sync_metadata().ok();
-                    bail!("batch aborted after {applied} successful op(s); rerun with --continue-on-error to keep going");
-                }
-            }
-        }
-    }
-    fs.sync_metadata()
-        .map_err(|e| anyhow!("sync_metadata: {e}"))?;
+    let (applied, failures) = if let Some(arch) = archive_ctx {
+        log_stderr(format!(
+            "archive-edit: decompressing partition {} from {}",
+            arch.partition_index,
+            arch.folder.display()
+        ));
+        let temp_path = arch
+            .folder
+            .join(format!(".batch-partition-{}.tmp", arch.partition_index));
+        let progress = crate::model::archive_edit::start_extract(&arch.edit_ctx, temp_path.clone());
+        drain_archive(progress)?;
+
+        let (applied, failures) = run_fs_ops_on_path(
+            &temp_path,
+            target.partition,
+            &script.operations,
+            fs_ops_start,
+            &defaults,
+            args.continue_on_error,
+        )?;
+
+        log_stderr("archive-edit: recompressing");
+        let cprog = crate::model::archive_edit::start_compress(&arch.edit_ctx, temp_path.clone());
+        drain_archive(cprog)?;
+        (applied, failures)
+    } else {
+        run_fs_ops_on_path(
+            &target.path,
+            target.partition,
+            &script.operations,
+            fs_ops_start,
+            &defaults,
+            args.continue_on_error,
+        )?
+    };
 
     out_stdout(format!(
         "Applied {applied}/{} op(s); {} failure(s)",
@@ -314,6 +338,157 @@ pub fn run(args: BatchArgs) -> Result<()> {
         bail!("batch completed with failures");
     }
     Ok(())
+}
+
+struct ArchiveTarget {
+    folder: std::path::PathBuf,
+    partition_index: usize,
+    edit_ctx: crate::model::archive_edit::ArchiveEditContext,
+}
+
+/// Inspect `target_path`. If it's a regular folder containing
+/// `metadata.json`, treat it as a backup-archive target and build the
+/// [`ArchiveEditContext`] for partition `partition` (1-based). Returns
+/// `None` for plain image files.
+fn detect_archive_target(
+    target_path: &std::path::Path,
+    partition: Option<u32>,
+) -> Result<Option<ArchiveTarget>> {
+    if !target_path.is_dir() {
+        return Ok(None);
+    }
+    let metadata_path = target_path.join("metadata.json");
+    if !metadata_path.exists() {
+        return Ok(None);
+    }
+    let part = partition.ok_or_else(|| {
+        anyhow!(
+            "{} is a backup folder; pass IMG@N to pick a partition",
+            target_path.display()
+        )
+    })? as usize;
+    let outcome = crate::model::backup_loader::load_backup_metadata(target_path)?;
+    let meta = outcome.metadata;
+    let pmeta = meta
+        .partitions
+        .iter()
+        .find(|p| p.index == part)
+        .or_else(|| meta.partitions.get(part.saturating_sub(1)))
+        .ok_or_else(|| anyhow!("partition {part} not found in backup metadata"))?;
+    if pmeta.compressed_files.is_empty() {
+        bail!("partition {part} has no compressed_files entry in metadata.json");
+    }
+    let archive_path = target_path.join(&pmeta.compressed_files[0]);
+    if !archive_path.exists() {
+        bail!("archive {} missing", archive_path.display());
+    }
+    if !matches!(meta.compression_type.as_str(), "zstd" | "none") {
+        bail!(
+            "archive-edit currently supports zstd / raw partition archives; got {}",
+            meta.compression_type
+        );
+    }
+    let edit_ctx = crate::model::archive_edit::ArchiveEditContext {
+        archive_path,
+        compression_type: meta.compression_type.clone(),
+        original_size: pmeta.original_size_bytes,
+        compacted: pmeta.compacted,
+        metadata_path,
+        // metadata.json keeps partitions keyed by their `index` field
+        // (often 0-based), not by user-facing 1-based selector position.
+        partition_index: pmeta.index,
+        checksum_type: meta.checksum_type.clone(),
+    };
+    Ok(Some(ArchiveTarget {
+        folder: target_path.to_path_buf(),
+        partition_index: part,
+        edit_ctx,
+    }))
+}
+
+fn drain_archive(
+    progress: std::sync::Arc<std::sync::Mutex<crate::model::archive_edit::ArchiveEditProgress>>,
+) -> Result<()> {
+    use std::time::Duration;
+    let mut last_pct: i32 = -1;
+    loop {
+        std::thread::sleep(Duration::from_millis(250));
+        let (phase, cur, total, finished, error) = match progress.lock() {
+            Ok(p) => (
+                p.phase.clone(),
+                p.current,
+                p.total,
+                p.finished,
+                p.error.clone(),
+            ),
+            Err(_) => bail!("archive_edit worker poisoned its status mutex"),
+        };
+        if total > 0 {
+            let pct = ((cur as f64 / total as f64) * 100.0) as i32;
+            if pct / 10 != last_pct / 10 {
+                log_stderr(format!(
+                    "  {phase}: {pct:>3}% ({}/{})",
+                    crate::partition::format_size(cur),
+                    crate::partition::format_size(total)
+                ));
+                last_pct = pct;
+            }
+        }
+        if finished {
+            if let Some(e) = error {
+                bail!("{phase}: {e}");
+            }
+            return Ok(());
+        }
+    }
+}
+
+fn run_fs_ops_on_path(
+    path: &std::path::Path,
+    partition: Option<u32>,
+    operations: &[Operation],
+    fs_ops_start: usize,
+    defaults: &DefaultOptions,
+    continue_on_error: bool,
+) -> Result<(usize, Vec<(usize, String)>)> {
+    let (file, ctx) = resolve_partition_rw(path, partition)?;
+    log_stderr(&ctx.label);
+    let mut fs = crate::fs::open_editable_filesystem(
+        file,
+        ctx.offset,
+        ctx.type_byte,
+        ctx.type_string.as_deref(),
+    )
+    .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
+
+    let mut applied = fs_ops_start;
+    let mut failures: Vec<(usize, String)> = Vec::new();
+    for (i, op) in operations.iter().enumerate().skip(fs_ops_start) {
+        let res = apply_op(&mut *fs, op, defaults);
+        match res {
+            Ok(()) => {
+                applied += 1;
+                log_stderr(format!(
+                    "  + [{}/{}] {}",
+                    i + 1,
+                    operations.len(),
+                    describe(op)
+                ));
+            }
+            Err(e) => {
+                let msg = format!("[{}/{}] {}: {e}", i + 1, operations.len(), describe(op));
+                log_stderr(format!("  ! {msg}"));
+                failures.push((i + 1, msg));
+                if !continue_on_error {
+                    fs.sync_metadata().ok();
+                    bail!("batch aborted after {applied} successful op(s); rerun with --continue-on-error to keep going");
+                }
+            }
+        }
+    }
+    fs.sync_metadata()
+        .map_err(|e| anyhow!("sync_metadata: {e}"))?;
+    Ok((applied, failures))
 }
 
 fn describe(op: &Operation) -> String {
@@ -338,6 +513,24 @@ fn describe(op: &Operation) -> String {
                     None => String::new(),
                 }
             )
+        }
+        Operation::Bless(BlessOp { path }) => format!("bless {path}"),
+        Operation::Chmeta(ChmetaOp {
+            path,
+            type_code,
+            creator,
+        }) => {
+            let mut bits = Vec::new();
+            if let Some(t) = type_code {
+                bits.push(format!("--type {t}"));
+            }
+            if let Some(c) = creator {
+                bits.push(format!("--creator {c}"));
+            }
+            format!("chmeta {path} {}", bits.join(" "))
+        }
+        Operation::Setrsrc(SetrsrcOp { path, from }) => {
+            format!("setrsrc {path} --from {}", from.display())
         }
     }
 }
@@ -384,7 +577,7 @@ fn build_blank_fs(
         "efs" => crate::fs::efs::create_blank_efs(size, name),
         "affs" => crate::fs::affs::create_blank_affs(size, affs_variant.unwrap_or(1), name),
         "hfs" => {
-            let bs = block_size.unwrap_or(0);
+            let bs = block_size.unwrap_or_else(|| crate::cli::parse::pick_block_size(size));
             crate::fs::hfs::create_blank_hfs_sized(size, bs, name, 0, 0)
                 .map_err(|e| anyhow!("create_blank_hfs_sized: {e}"))
         }
@@ -512,7 +705,58 @@ fn apply_op(
         // in `run`). Reaching here means the validation slipped — treat as
         // a bug.
         Operation::Format(_) => bail!("`format` op must be the first operation"),
+        Operation::Bless(BlessOp { path }) => apply_bless(fs, path),
+        Operation::Chmeta(op) => apply_chmeta(fs, op),
+        Operation::Setrsrc(op) => apply_setrsrc(fs, op),
     }
+}
+
+fn apply_bless(fs: &mut dyn crate::fs::filesystem::EditableFilesystem, path: &str) -> Result<()> {
+    let entry = super::ls::resolve_path(&mut *fs, path)?;
+    if !entry.is_directory() {
+        bail!("bless: {path} is not a directory");
+    }
+    fs.set_blessed_folder(&entry)
+        .map_err(|e| anyhow!("set_blessed_folder: {e}"))?;
+    Ok(())
+}
+
+fn apply_chmeta(
+    fs: &mut dyn crate::fs::filesystem::EditableFilesystem,
+    op: &ChmetaOp,
+) -> Result<()> {
+    if op.type_code.is_none() && op.creator.is_none() {
+        bail!("chmeta: pass at least one of type / creator");
+    }
+    let entry = super::ls::resolve_path(&mut *fs, &op.path)?;
+    let new_type = op
+        .type_code
+        .as_deref()
+        .or(entry.type_code.as_deref())
+        .unwrap_or("BINA");
+    let new_creator = op
+        .creator
+        .as_deref()
+        .or(entry.creator_code.as_deref())
+        .unwrap_or("????");
+    fs.set_type_creator(&entry, new_type, new_creator)
+        .map_err(|e| anyhow!("set_type_creator: {e}"))?;
+    Ok(())
+}
+
+fn apply_setrsrc(
+    fs: &mut dyn crate::fs::filesystem::EditableFilesystem,
+    op: &SetrsrcOp,
+) -> Result<()> {
+    let entry = super::ls::resolve_path(&mut *fs, &op.path)?;
+    let meta =
+        std::fs::metadata(&op.from).map_err(|e| anyhow!("stat {}: {e}", op.from.display()))?;
+    let len = meta.len();
+    let mut hf =
+        std::fs::File::open(&op.from).map_err(|e| anyhow!("open {}: {e}", op.from.display()))?;
+    fs.write_resource_fork(&entry, &mut hf, len)
+        .map_err(|e| anyhow!("write_resource_fork: {e}"))?;
+    Ok(())
 }
 
 fn apply_mkdir(fs: &mut dyn crate::fs::filesystem::EditableFilesystem, path: &str) -> Result<()> {

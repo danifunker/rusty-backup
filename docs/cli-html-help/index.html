@@ -29,22 +29,27 @@
 <li><a href="backup.html"><code>backup</code></a><span class="desc">Back up a disk image or device to a backup folder</span></li>
 <li><a href="batch.html"><code>batch</code></a><span class="desc">Apply a JSON-described sequence of FS operations to an image as one transaction-like batch</span></li>
 <li><a href="batch-template.html"><code>batch-template</code></a><span class="desc">Generate a starter `batch` JSON script from a host directory</span></li>
+<li><a href="bless.html"><code>bless</code></a><span class="desc">Mark an HFS / HFS+ folder as the bootable System Folder</span></li>
+<li><a href="chmeta.html"><code>chmeta</code></a><span class="desc">Change the type and/or creator code on an existing HFS / HFS+ / ProDOS file</span></li>
 <li><a href="completions.html"><code>completions</code></a><span class="desc">Emit a shell-completion script to stdout</span></li>
 <li><a href="config.html"><code>config</code></a><span class="desc">Manage the rbcli.conf config file</span></li>
 <li><a href="convert.html"><code>convert</code></a><span class="desc">Re-encode one or more disk images into a chosen output format</span></li>
 <li><a href="expand.html"><code>expand</code></a><span class="desc">Expand a classic-HFS volume to a new size + allocation block size by cloning into a fresh APM disk image</span></li>
 <li><a href="fsck.html"><code>fsck</code></a><span class="desc">Check (and optionally repair) a filesystem</span></li>
 <li><a href="get.html"><code>get</code></a><span class="desc">Extract a file from a filesystem to the host</span></li>
+<li><a href="grow.html"><code>grow</code></a><span class="desc">Grow a disk image by `--add SIZE` of trailing zero-padding so a subsequent `partmap` edit can place a new partition</span></li>
 <li><a href="inspect.html"><code>inspect</code></a><span class="desc">Whole-disk aggregate read-only view (partition table + per-partition summary + CHD metadata when applicable)</span></li>
 <li><a href="install-completions.html"><code>install-completions</code></a><span class="desc">Install shell completions to the user-scoped canonical location</span></li>
 <li><a href="ls.html"><code>ls</code></a><span class="desc">List a directory inside a filesystem</span></li>
 <li><a href="mkdir.html"><code>mkdir</code></a><span class="desc">Create a directory inside a filesystem</span></li>
 <li><a href="new.html"><code>new</code></a><span class="desc">Create a blank single-partition image (superfloppy or, in Phase D, partition-table-wrapped)</span></li>
 <li><a href="optical.html"><code>optical</code></a><span class="desc">Optical-media verbs (rip / convert / browse / extract)</span></li>
+<li><a href="partmap.html"><code>partmap</code></a><span class="desc">Edit the partition table (add / resize / delete / set-type / set-bootable). Partition *data* is never moved</span></li>
 <li><a href="put.html"><code>put</code></a><span class="desc">Copy a host file (or zero-fill / write boot blocks) into a filesystem</span></li>
 <li><a href="resize.html"><code>resize</code></a><span class="desc">Resize the filesystem at IMG@N to a new size (FAT/NTFS/exFAT/HFS+/ ext/btrfs/SFS/PFS3/AFFS/EFS — whichever magic matches)</span></li>
 <li><a href="restore.html"><code>restore</code></a><span class="desc">Restore a backup folder to a target image or device</span></li>
 <li><a href="rm.html"><code>rm</code></a><span class="desc">Delete a file or directory from a filesystem</span></li>
+<li><a href="setrsrc.html"><code>setrsrc</code></a><span class="desc">Write the resource fork of an existing HFS / HFS+ file from a host file</span></li>
 <li><a href="show.html"><code>show</code></a><span class="desc">Focused read-only queries</span></li>
 <li><a href="shrink.html"><code>shrink</code></a><span class="desc">Re-encode a disk image into a CHD with trailing zero padding dropped (SGI/IRIX today)</span></li>
 <li><a href="terminal.html"><code>terminal</code></a><span class="desc">Open an interactive rb-cli shell (rustyline-based REPL)</span></li>

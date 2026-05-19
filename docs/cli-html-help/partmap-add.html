@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli partmap add</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <a href="partmap.html">partmap</a> &raquo; <span>add</span></nav>
+<h1><code>rb-cli partmap add</code></h1>
+<p>Add a new partition entry</p>
+<h2>Usage</h2>
+<pre><code>Usage: add [OPTIONS] --start-lba &lt;START_LBA&gt; --size &lt;SIZE&gt; &lt;IMAGE&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>Image to modify</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--start-lba</code></dt>
+<dd>Start LBA (512-byte sector). MBR / GPT: linear LBA. APM: block #</dd>
+<dt><code>--size</code></dt>
+<dd>Partition size in bytes (accepts `K`/`M`/`G` suffixes)</dd>
+<dt><code>--type-byte</code></dt>
+<dd>MBR type byte (decimal or `0xNN`). Ignored for non-MBR tables</dd>
+<dt><code>--type-string</code></dt>
+<dd>GPT type GUID string, or APM type string (`&quot;Apple_HFS&quot;`, etc.)</dd>
+<dt><code>--bootable</code></dt>
+<dd>Mark active/bootable</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_html_help</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

@@ -76,6 +76,17 @@ pub enum Command {
     /// dropped (SGI/IRIX today).
     Shrink(verbs::shrink::ShrinkArgs),
 
+    /// Mark an HFS / HFS+ folder as the bootable System Folder.
+    Bless(verbs::bless::BlessArgs),
+
+    /// Change the type and/or creator code on an existing HFS / HFS+ /
+    /// ProDOS file.
+    Chmeta(verbs::chmeta::ChmetaArgs),
+
+    /// Write the resource fork of an existing HFS / HFS+ file from a
+    /// host file.
+    Setrsrc(verbs::setrsrc::SetRsrcArgs),
+
     /// Resize the filesystem at IMG@N to a new size (FAT/NTFS/exFAT/HFS+/
     /// ext/btrfs/SFS/PFS3/AFFS/EFS — whichever magic matches).
     Resize(verbs::resize::ResizeArgs),
@@ -83,6 +94,10 @@ pub enum Command {
     /// Expand a classic-HFS volume to a new size + allocation block size
     /// by cloning into a fresh APM disk image.
     Expand(verbs::expand::ExpandArgs),
+
+    /// Grow a disk image by `--add SIZE` of trailing zero-padding so a
+    /// subsequent `partmap` edit can place a new partition.
+    Grow(verbs::grow::GrowArgs),
 
     /// Whole-disk aggregate read-only view (partition table + per-partition
     /// summary + CHD metadata when applicable).
@@ -124,6 +139,13 @@ pub enum Command {
     Optical {
         #[command(subcommand)]
         cmd: verbs::optical::OpticalCommand,
+    },
+
+    /// Edit the partition table (add / resize / delete / set-type /
+    /// set-bootable). Partition *data* is never moved.
+    Partmap {
+        #[command(subcommand)]
+        cmd: verbs::partmap::PartmapCommand,
     },
 
     /// Open an interactive rb-cli shell (rustyline-based REPL).
@@ -169,8 +191,12 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Mkdir(args) => verbs::mkdir::run(args),
         Command::Fsck(args) => verbs::fsck::run(args),
         Command::Shrink(args) => verbs::shrink::run(args),
+        Command::Bless(args) => verbs::bless::run(args),
+        Command::Chmeta(args) => verbs::chmeta::run(args),
+        Command::Setrsrc(args) => verbs::setrsrc::run(args),
         Command::Resize(args) => verbs::resize::run(args),
         Command::Expand(args) => verbs::expand::run(args),
+        Command::Grow(args) => verbs::grow::run(args),
         Command::Inspect(args) => verbs::inspect::run(args),
         Command::Backup(args) => verbs::backup::run(args),
         Command::Restore(args) => verbs::restore::run(args),
@@ -181,6 +207,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Config { cmd } => verbs::config::run(cmd),
         Command::Show { cmd } => verbs::show::run(cmd),
         Command::Optical { cmd } => verbs::optical::run(cmd),
+        Command::Partmap { cmd } => verbs::partmap::run(cmd),
         Command::Terminal => verbs::terminal::run(),
         Command::Completions(args) => verbs::completions::run_emit(args),
         Command::InstallCompletions(args) => verbs::completions::run_install(args),
