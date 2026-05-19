@@ -10,6 +10,7 @@ pub mod backup;
 pub mod batch;
 pub mod completions;
 pub mod config;
+pub mod convert;
 pub mod fsck;
 pub mod get;
 pub mod inspect;

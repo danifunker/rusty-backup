@@ -327,6 +327,26 @@ Usage: show [OPTIONS]
 
 - `--path` — 
 
+### `convert`
+
+Re-encode one or more disk images into a chosen output format
+
+```
+Usage: convert [OPTIONS] <IN> <OUT>
+```
+
+**Arguments**
+
+- `<SOURCE>` — Source file or folder. When a folder, every convertible file is processed
+- `<DEST>` — Destination folder. Created if absent
+
+**Options**
+
+- `--format` — Output format
+- `--extension` — Output extension (no leading dot). Defaults to the format's natural extension (chd, vhd, img, …)
+- `--bincue-multi-bin` — For BIN/CUE output, write one .bin per track instead of a single concatenated .bin. No effect for other formats
+- `--overwrite` — Overwrite destination files that already exist. Without this, existing outputs are skipped with a warning
+
 ### `fsck`
 
 Check (and optionally repair) a filesystem

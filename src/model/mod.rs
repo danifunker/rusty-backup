@@ -6,6 +6,7 @@
 pub mod archive_edit;
 pub mod backup_loader;
 pub mod browse_session;
+pub mod bulk_convert_runner;
 pub mod chd_expand_runner;
 pub mod edit_queue;
 pub mod export_runner;

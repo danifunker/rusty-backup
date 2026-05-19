@@ -44,6 +44,7 @@ fn top_level_verbs_present() {
         "shrink",
         "inspect",
         "show",
+        "convert",
         "completions",
         "install-completions",
     ] {

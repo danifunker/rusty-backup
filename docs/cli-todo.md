@@ -16,7 +16,7 @@ it in the binary yet?"
 |---|---|---|
 | **A** Rename + flat verbs + infrastructure | **shipped** | `5d0c431..7bb1385` — binary rename, module split, IMG@N parser, `--format` envelope, logging flags, exit codes, flat verbs (`new`, `ls`, `put`, `get`, `rm`, `mkdir`, `fsck`, `shrink`, `inspect`, `show {partmap,fs-info,chd-info,devices}`, `completions`, `install-completions`), manpage example, `--help` snapshot tests |
 | **B** Generalize FS verbs + globbing | **shipped** | `b627eca..f40ed4c` — ls/put/get/rm/mkdir/fsck route through `open_filesystem` / `open_editable_filesystem`, bash-equivalent globs (`*`, `?`, `[...]`, `**`, `{a,b}`) with `--include`/`--exclude` (exclude-wins). Blank creators for FAT/EFS/AFFS still pending; `new --fs fat/efs/affs` gated on those landing. |
-| **C** Big-ticket verbs | **3 of 5 shipped** | `9c465d0` — `backup`, `restore`, `write` (background progress pump, `--yes` device safety gate, fs-aware `inspect` text/json/yaml). **Deferred**: `convert` (needs `src/gui/bulk_convert_dialog.rs::run_bulk_convert` lifted into `src/model/`). |
+| **C** Big-ticket verbs | **4 of 5 shipped** | `9c465d0` — `backup`, `restore`, `write` (background progress pump, `--yes` device safety gate, fs-aware `inspect` text/json/yaml). `convert` (this slice) lifts `run_bulk_convert` into `src/model/bulk_convert_runner.rs` and adds `rb-cli convert IN OUT --format FMT` over it; GUI Bulk Convert dialog now calls into the shared runner. |
 | **D** Batch + resize/expand cluster | **1 of 3 shipped** | `6a59121` — `rb-cli batch SCRIPT.json` with mkdir/put/rm ops, `--dry-run`, `--continue-on-error`. **Deferred**: `resize`, `expand` (non-SGI filesystems), `batch-template` generator, whole-volume `format` op + multi-partition `disk` block. |
 | **E** Optical | **pending** | `optical rip / convert / browse / extract` — needs `opticaldiscs`/`cd-da-reader` plumbing wired to a new verb tree. |
 | **F** Interactive `terminal` REPL | **pending** | `rustyline`/`reedline` REPL on top of the one-shot verbs. |
@@ -25,7 +25,6 @@ it in the binary yet?"
 
 ### Cross-cutting items still pending
 
-- **Convert verb model-lift** — Phase C carry-over; precondition for the verb.
 - **Per-verb config-file wiring** — Phase G carry-over.
 - **FAT/EFS/AFFS blank creators** — Phase B carry-over; gates new --fs.
 - **Resume support for partial backups/restores** — explicitly deferred in the doc; the partial-metadata side already lands with backup's metadata.json `"status": "partial"` field.

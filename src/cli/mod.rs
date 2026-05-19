@@ -88,6 +88,9 @@ pub enum Command {
     /// Stream an image file onto a block device.
     Write(verbs::write::WriteArgs),
 
+    /// Re-encode one or more disk images into a chosen output format.
+    Convert(verbs::convert::ConvertArgs),
+
     /// Apply a JSON-described sequence of FS operations to an image as
     /// one transaction-like batch.
     Batch(verbs::batch::BatchArgs),
@@ -141,6 +144,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Backup(args) => verbs::backup::run(args),
         Command::Restore(args) => verbs::restore::run(args),
         Command::Write(args) => verbs::write::run(args),
+        Command::Convert(args) => verbs::convert::run(args),
         Command::Batch(args) => verbs::batch::run(args),
         Command::Config { cmd } => verbs::config::run(cmd),
         Command::Show { cmd } => verbs::show::run(cmd),
