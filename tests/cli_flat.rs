@@ -244,6 +244,50 @@ fn generic_verbs_round_trip_against_hfsplus() {
 }
 
 #[test]
+fn ls_and_rm_support_glob_patterns() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let img = dir.path().join("disk.dsk");
+    let img_s = img.to_str().unwrap();
+    run(&[
+        "new", img_s, "--fs", "hfs", "--size", "50M", "--name", "GlobTest",
+    ]);
+
+    let a = dir.path().join("a.txt");
+    std::fs::write(&a, b"a").unwrap();
+    let b = dir.path().join("b.txt");
+    std::fs::write(&b, b"b").unwrap();
+    let c = dir.path().join("notes.md");
+    std::fs::write(&c, b"c").unwrap();
+    for (host, dst) in &[(&a, "/a.txt"), (&b, "/b.txt"), (&c, "/notes.md")] {
+        run(&["put", img_s, host.to_str().unwrap(), dst]);
+    }
+
+    // ls /*.txt finds the two .txt files anywhere under root.
+    let out = run(&["ls", img_s, "/*.txt"]);
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("/a.txt"), "expected /a.txt in {text}");
+    assert!(text.contains("/b.txt"), "expected /b.txt in {text}");
+    assert!(
+        !text.contains("notes.md"),
+        "notes.md should not match: {text}"
+    );
+
+    // exclude wins.
+    let out2 = run(&["ls", img_s, "/*.txt", "--exclude", "/a.txt"]);
+    let text2 = String::from_utf8(out2.stdout).unwrap();
+    assert!(text2.contains("/b.txt"));
+    assert!(!text2.contains("/a.txt"));
+
+    // rm glob removes both .txt files.
+    run(&["rm", img_s, "/*.txt"]);
+    let ls_after = run(&["ls", img_s, "/"]);
+    let text3 = String::from_utf8(ls_after.stdout).unwrap();
+    assert!(!text3.contains("a.txt"));
+    assert!(!text3.contains("b.txt"));
+    assert!(text3.contains("notes.md"));
+}
+
+#[test]
 fn inspect_text_runs_on_raw_hfs_image() {
     let dir = tempfile::tempdir().expect("tempdir");
     let img = dir.path().join("disk.dsk");

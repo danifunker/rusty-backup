@@ -21,6 +21,7 @@ use clap::{Parser, Subcommand};
 
 pub mod api;
 pub mod exit;
+pub mod glob;
 pub mod img_at;
 pub mod io;
 pub mod logging;

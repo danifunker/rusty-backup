@@ -8,6 +8,7 @@
 use anyhow::{anyhow, bail, Result};
 use clap::Args;
 
+use crate::cli::glob::{collect_matches, compile_patterns};
 use crate::cli::img_at::ImageRef;
 use crate::cli::logging::{log_stderr, out_stdout};
 use crate::cli::resolve::resolve_partition_ro;
@@ -18,10 +19,25 @@ pub struct LsArgs {
     /// Image reference (`path` or `path@N` for the 1-based partition index).
     pub image: ImageRef,
 
-    /// Path inside the filesystem (use `/` as the separator). Defaults to
-    /// the volume root.
+    /// Path or glob pattern inside the filesystem (use `/` as the
+    /// separator). A plain path lists that directory's contents;
+    /// patterns containing `*`, `?`, `[`, or `{` walk the volume and
+    /// emit one line per match.
     #[arg(default_value = "/")]
     pub path: String,
+
+    /// Exclude paths matching this glob. Repeatable.
+    /// Exclude always wins over `--include` / a positional path.
+    #[arg(long = "exclude")]
+    pub exclude: Vec<String>,
+
+    /// Treat case-insensitively, regardless of the target's native rule.
+    #[arg(long, conflicts_with = "case_sensitive")]
+    pub ignore_case: bool,
+
+    /// Treat case-sensitively, regardless of the target's native rule.
+    #[arg(long, conflicts_with = "ignore_case")]
+    pub case_sensitive: bool,
 }
 
 pub fn run(args: LsArgs) -> Result<()> {
@@ -31,6 +47,33 @@ pub fn run(args: LsArgs) -> Result<()> {
         crate::fs::open_filesystem(file, ctx.offset, ctx.type_byte, ctx.type_string.as_deref())
             .map_err(|e| anyhow!("opening filesystem: {e}"))?;
 
+    // Default case rule: insensitive on classic case-insensitive
+    // filesystems, sensitive elsewhere. Phase B is conservative and
+    // simply leaves the default insensitive on every filesystem because
+    // it's the safer match for retro disks; CLI flags override.
+    let case_insensitive = match (args.ignore_case, args.case_sensitive) {
+        (true, _) => true,
+        (_, true) => false,
+        _ => true,
+    };
+
+    let is_glob = has_glob_chars(&args.path);
+
+    if is_glob || !args.exclude.is_empty() {
+        // Glob path — walk the volume.
+        let includes = compile_patterns(&args.path, case_insensitive)?;
+        let mut excludes = Vec::new();
+        for ex in &args.exclude {
+            excludes.extend(compile_patterns(ex, case_insensitive)?);
+        }
+        let matches = collect_matches(&mut *fs, &includes, &excludes)?;
+        for (_, entry, full) in matches {
+            print_entry(&entry, &full);
+        }
+        return Ok(());
+    }
+
+    // Literal path: directory listing.
     let entry = resolve_path(&mut *fs, &args.path)?;
     if !entry.is_directory() {
         bail!("not a directory: {}", args.path);
@@ -39,13 +82,23 @@ pub fn run(args: LsArgs) -> Result<()> {
         .list_directory(&entry)
         .map_err(|e| anyhow!("list_directory: {e}"))?;
     for c in children {
-        let kind = if c.is_directory() { "DIR " } else { "FILE" };
-        // Type/creator are HFS-specific; ignore on other filesystems.
-        let t = c.type_code.as_deref().unwrap_or("    ");
-        let cr = c.creator_code.as_deref().unwrap_or("    ");
-        out_stdout(format!("{kind}  {:>10}  {t} {cr}  {}", c.size, c.name));
+        print_entry(&c, &c.name);
     }
     Ok(())
+}
+
+fn print_entry(entry: &crate::fs::entry::FileEntry, display_name: &str) {
+    let kind = if entry.is_directory() { "DIR " } else { "FILE" };
+    let t = entry.type_code.as_deref().unwrap_or("    ");
+    let cr = entry.creator_code.as_deref().unwrap_or("    ");
+    out_stdout(format!(
+        "{kind}  {:>10}  {t} {cr}  {display_name}",
+        entry.size
+    ));
+}
+
+fn has_glob_chars(s: &str) -> bool {
+    s.chars().any(|c| matches!(c, '*' | '?' | '[' | '{'))
 }
 
 /// Walk `path` inside a generic filesystem, one component at a time.

@@ -73,6 +73,7 @@ serde_yml = "0.0.12"
 csv = "1"
 clap_complete = "4"
 clap_mangen = "0.2"
+globset = "0.4"
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 libc = "0.2"
