@@ -1,21 +1,26 @@
 //! `rb-cli put` — copy a host file (or zero-fill) into a filesystem.
 //!
 //! Three shapes:
-//! - `put IMG[@N] HOST DST [--type X --creator Y --force]` — copy `HOST`
-//!   on the host filesystem to `DST` inside the image. Cp-like ordering.
-//! - `put IMG[@N] --zero BYTES --dst DST [--type X --creator Y --force]`
-//!   — pre-allocate a zero-filled file. `--dst` is required to avoid
-//!   positional ambiguity with the `HOST` slot.
-//! - `put IMG[@N] --boot BB_FILE` — write the 1024-byte boot block region
-//!   verbatim. Mutually exclusive with everything else.
+//! - `put IMG[@N] HOST DST [opts]` — cp-like copy.
+//! - `put IMG[@N] --zero BYTES --dst DST [opts]` — pre-allocate zero
+//!   bytes (the `--dst` flag avoids positional ambiguity).
+//! - `put IMG[@N] --boot BB_FILE` — write the 1024-byte boot block
+//!   region of the image verbatim. HFS-specific; other filesystems
+//!   return an error.
 //!
-//! Phase A: HFS only. Phase B generalizes via the editable FS dispatch.
+//! `--type` / `--creator` apply only to filesystems that carry per-file
+//! type/creator codes (HFS, HFS+, ProDOS); on other filesystems the
+//! flags are accepted but ignored with a warning.
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use clap::Args;
 use std::path::PathBuf;
 
 use crate::cli::img_at::ImageRef;
+use crate::cli::logging::log_stderr;
+use crate::cli::parse::{split_mac_path, ZeroReader};
+use crate::cli::resolve::resolve_partition_rw;
+use crate::fs::filesystem::CreateFileOptions;
 
 #[derive(Debug, Args)]
 pub struct PutArgs {
@@ -25,31 +30,29 @@ pub struct PutArgs {
     /// Host file to copy. Required when not using `--zero` or `--boot`.
     pub host_file: Option<PathBuf>,
 
-    /// Destination path inside the filesystem. Required positional in
-    /// the cp-like shape; for `--zero` use `--dst` instead.
+    /// Destination path inside the filesystem (cp-like positional).
     pub dst: Option<String>,
 
     /// Pre-allocate N zero bytes instead of copying a host file. Pair
-    /// with `--dst` to name the destination.
+    /// with `--dst`.
     #[arg(long, conflicts_with_all = ["host_file", "boot"])]
     pub zero: Option<u64>,
 
-    /// Explicit destination path inside the filesystem. Use with
-    /// `--zero`, where the positional `DST` slot is awkward to fill.
-    /// Cannot be combined with the positional `DST`.
+    /// Explicit destination flag; use this with `--zero` where the
+    /// positional `DST` slot is awkward.
     #[arg(long = "dst", conflicts_with_all = ["dst", "boot"])]
     pub dst_flag: Option<String>,
 
     /// Write the 1024-byte boot-block region of the image verbatim.
-    /// Mutually exclusive with all the per-file options.
+    /// HFS-only today.
     #[arg(long, conflicts_with_all = ["host_file", "dst", "dst_flag", "zero", "type_code", "creator", "force"])]
     pub boot: Option<PathBuf>,
 
-    /// HFS 4-character type code (HFS / HFS+ only). Defaults to `BINA`.
+    /// 4-character type code (HFS / HFS+ / ProDOS). Defaults to `BINA`.
     #[arg(long = "type", default_value = "BINA")]
     pub type_code: String,
 
-    /// HFS 4-character creator code (HFS / HFS+ only). Defaults to `????`.
+    /// 4-character creator code (HFS / HFS+ only). Defaults to `????`.
     #[arg(long, default_value = "????")]
     pub creator: String,
 
@@ -60,6 +63,9 @@ pub struct PutArgs {
 
 pub fn run(args: PutArgs) -> Result<()> {
     if let Some(bb_file) = args.boot {
+        // Boot-block write is a raw byte-0 sector smash — keep the
+        // existing HFS-only path. Phase D may generalize this to FAT
+        // BPB / NTFS boot loader as needed.
         return crate::cli::api::hfs::cmd_put_boot(args.image.path, bb_file);
     }
 
@@ -71,32 +77,65 @@ pub fn run(args: PutArgs) -> Result<()> {
         (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents both"),
     };
 
-    if let Some(n) = args.zero {
-        return crate::cli::api::hfs::cmd_put(
-            args.image.path,
-            None,
-            &dst,
-            &args.type_code,
-            &args.creator,
-            Some(n),
-            args.force,
-            args.image.partition,
-        );
+    let (parent_path, name) = split_mac_path(&dst)?;
+    if name.is_empty() {
+        bail!("destination path has no filename");
     }
 
-    let host = args.host_file.ok_or_else(|| {
-        anyhow::anyhow!(
-            "host file required (or pass --zero N for zero-fill, --boot FILE for boot blocks)"
-        )
-    })?;
-    crate::cli::api::hfs::cmd_put(
-        args.image.path,
-        Some(host),
-        &dst,
-        &args.type_code,
-        &args.creator,
-        None,
-        args.force,
-        args.image.partition,
+    let (file, ctx) = resolve_partition_rw(&args.image.path, args.image.partition)?;
+    log_stderr(&ctx.label);
+    let mut fs = crate::fs::open_editable_filesystem(
+        file,
+        ctx.offset,
+        ctx.type_byte,
+        ctx.type_string.as_deref(),
     )
+    .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
+
+    let parent = super::ls::resolve_path(&mut *fs, &parent_path)?;
+    if !parent.is_directory() {
+        bail!("parent is not a directory: {parent_path}");
+    }
+
+    // Duplicate check so we can honor --force consistently.
+    let existing = fs
+        .list_directory(&parent)
+        .map_err(|e| anyhow!("list_directory: {e}"))?
+        .into_iter()
+        .find(|e| e.name == name);
+    if let Some(ref e) = existing {
+        if !args.force {
+            bail!("{dst} already exists (pass --force to overwrite)");
+        }
+        fs.delete_entry(&parent, e)
+            .map_err(|e| anyhow!("delete existing: {e}"))?;
+    }
+
+    let options = CreateFileOptions {
+        type_code: Some(args.type_code.clone()),
+        creator_code: Some(args.creator.clone()),
+        ..Default::default()
+    };
+
+    if let Some(n) = args.zero {
+        let mut zr = ZeroReader { remaining: n };
+        fs.create_file(&parent, &name, &mut zr, n, &options)
+            .map_err(|e| anyhow!("create_file: {e}"))?;
+    } else {
+        let host = args.host_file.ok_or_else(|| {
+            anyhow!(
+                "host file required (or pass --zero N for zero-fill, --boot FILE for boot blocks)"
+            )
+        })?;
+        let meta = std::fs::metadata(&host).map_err(|e| anyhow!("stat {}: {e}", host.display()))?;
+        let len = meta.len();
+        let mut hf =
+            std::fs::File::open(&host).map_err(|e| anyhow!("open {}: {e}", host.display()))?;
+        fs.create_file(&parent, &name, &mut hf, len, &options)
+            .map_err(|e| anyhow!("create_file: {e}"))?;
+    }
+
+    fs.sync_metadata()
+        .map_err(|e| anyhow!("sync_metadata: {e}"))?;
+    Ok(())
 }

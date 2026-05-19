@@ -1,16 +1,14 @@
-//! `rb-cli mkdir IMG[@N] PATH` — create a new directory inside a filesystem.
-//!
-//! Phase A: HFS only. Phase B widens to every EditableFilesystem.
+//! `rb-cli mkdir IMG[@N] PATH` — create a directory inside a filesystem.
+//! Generic across every EditableFilesystem.
 
 use anyhow::{anyhow, bail, Result};
 use clap::Args;
 
-use crate::cli::api::hfs::resolve_hfs_offset;
 use crate::cli::img_at::ImageRef;
-use crate::cli::io::open_image_rw;
+use crate::cli::logging::log_stderr;
 use crate::cli::parse::split_mac_path;
-use crate::fs::filesystem::{CreateDirectoryOptions, EditableFilesystem, Filesystem};
-use crate::fs::hfs::HfsFilesystem;
+use crate::cli::resolve::resolve_partition_rw;
+use crate::fs::filesystem::CreateDirectoryOptions;
 
 #[derive(Debug, Args)]
 pub struct MkdirArgs {
@@ -18,7 +16,7 @@ pub struct MkdirArgs {
     pub image: ImageRef,
 
     /// Directory path to create. The parent must exist (no `-p`-style
-    /// auto-creation in Phase A).
+    /// auto-creation in Phase B).
     pub path: String,
 }
 
@@ -28,20 +26,22 @@ pub fn run(args: MkdirArgs) -> Result<()> {
         bail!("directory path has no basename");
     }
 
-    let mut file = open_image_rw(&args.image.path)?;
-    let (offset, label) = resolve_hfs_offset(&mut file, args.image.partition)?;
-    if let Some(l) = &label {
-        eprintln!("{l}");
-    }
-    let mut fs = HfsFilesystem::open(file, offset).map_err(|e| anyhow!("opening HFS: {e}"))?;
-    let parent =
-        crate::cli::api::hfs::resolve_path(&mut fs, &parent_path).map_err(|e| anyhow!("{e}"))?;
+    let (file, ctx) = resolve_partition_rw(&args.image.path, args.image.partition)?;
+    log_stderr(&ctx.label);
+    let mut fs = crate::fs::open_editable_filesystem(
+        file,
+        ctx.offset,
+        ctx.type_byte,
+        ctx.type_string.as_deref(),
+    )
+    .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
+
+    let parent = super::ls::resolve_path(&mut *fs, &parent_path)?;
     if !parent.is_directory() {
         bail!("parent is not a directory: {parent_path}");
     }
 
-    // Reject duplicate names early — HFS's create_directory raises AlreadyExists
-    // but the user-facing message benefits from spelling out the path.
+    // Early duplicate check so the user-facing message names the path.
     let already = fs
         .list_directory(&parent)
         .map_err(|e| anyhow!("list_directory: {e}"))?

@@ -26,6 +26,7 @@ pub mod io;
 pub mod logging;
 pub mod output;
 pub mod parse;
+pub mod resolve;
 pub mod verbs;
 
 #[derive(Parser, Debug)]

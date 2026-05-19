@@ -193,6 +193,57 @@ fn completions_emits_nonempty_script_for_each_shell() {
 }
 
 #[test]
+fn generic_verbs_round_trip_against_hfsplus() {
+    // Phase B: the flat verbs auto-detect filesystem via
+    // open_filesystem / open_editable_filesystem dispatch. Building an
+    // HFS+ image here (not the HFS image new --fs hfs makes) exercises
+    // that path end-to-end against a non-HFS target.
+    use rusty_backup::fs::hfsplus::create_blank_hfsplus;
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let img = dir.path().join("plus.img");
+
+    let bytes = create_blank_hfsplus(8 * 1024 * 1024, 4096, "HfsPlusRT", false);
+    let mut f = std::fs::File::create(&img).unwrap();
+    f.write_all(&bytes).unwrap();
+    drop(f);
+
+    let img_s = img.to_str().unwrap();
+
+    // ls / inspect work without --fs flag because the verb dispatch
+    // uses partition-table + magic-byte detection.
+    let inspect = run(&["inspect", img_s]);
+    assert!(String::from_utf8_lossy(&inspect.stdout).contains("Partition table"));
+
+    let ls0 = run(&["ls", img_s, "/"]);
+    // Fresh HFS+ root may be empty or carry only the system-area
+    // private-data dir — only assert we got a successful response.
+    let _ = String::from_utf8(ls0.stdout).unwrap();
+
+    // Put / get / rm roundtrip.
+    let host = dir.path().join("host.bin");
+    std::fs::write(&host, b"hfs+ rocks").unwrap();
+    run(&["put", img_s, host.to_str().unwrap(), "/host.bin"]);
+
+    let back = dir.path().join("back.bin");
+    run(&["get", img_s, "/host.bin", back.to_str().unwrap()]);
+    assert_eq!(
+        std::fs::read(&host).unwrap(),
+        std::fs::read(&back).unwrap(),
+        "HFS+ put -> get should round-trip"
+    );
+
+    run(&["mkdir", img_s, "/SubDir"]);
+    let ls_root = run(&["ls", img_s, "/"]);
+    let ls_text = String::from_utf8(ls_root.stdout).unwrap();
+    assert!(ls_text.contains("host.bin"));
+    assert!(ls_text.contains("SubDir"));
+
+    run(&["rm", img_s, "/host.bin"]);
+}
+
+#[test]
 fn inspect_text_runs_on_raw_hfs_image() {
     let dir = tempfile::tempdir().expect("tempdir");
     let img = dir.path().join("disk.dsk");
