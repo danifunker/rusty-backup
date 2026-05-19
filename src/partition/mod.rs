@@ -199,6 +199,18 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
         }
     }
 
+    // EFS (IRIX) superblock at sector 1: 4-byte big-endian magic
+    // 0x00072959 (legacy) or 0x0007295A (new) at offset 28 of the sector.
+    if reader.seek(SeekFrom::Start(512)).is_ok() {
+        let mut buf = [0u8; 512];
+        if reader.read_exact(&mut buf).is_ok() {
+            let magic = u32::from_be_bytes([buf[28], buf[29], buf[30], buf[31]]);
+            if magic == 0x0007_2959 || magic == 0x0007_295A {
+                return Some("EFS".to_string());
+            }
+        }
+    }
+
     None
 }
 

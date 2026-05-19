@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli expand</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>expand</span></nav>
+<h1><code>rb-cli expand</code></h1>
+<p>Expand a classic-HFS volume to a new size + allocation block size by cloning into a fresh APM disk image</p>
+<h2>Usage</h2>
+<pre><code>Usage: expand [OPTIONS] --size &lt;SIZE&gt; --output &lt;OUTPUT&gt; &lt;IMAGE&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>Source image reference (`path` or `path@N` for the classic HFS partition)</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--size</code></dt>
+<dd>Target volume size in bytes. Accepts suffixes (`K`, `M`, `G`)</dd>
+<dt><code>--block-size</code></dt>
+<dd>Allocation block size in bytes. One of: 4096, 8192, 16384, 32768, 65536. If omitted, picks the smallest block size whose 65535-block ceiling can hold `--size`</dd>
+<dt><code>--output</code></dt>
+<dd>Destination path for the new APM disk image. Created (or truncated)</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_html_help</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

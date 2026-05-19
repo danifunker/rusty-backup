@@ -17,8 +17,8 @@ path = "src/main.rs"
 
 # Headless CLI binary — scripted image construction, no eframe dependency.
 [[bin]]
-name = "rusty-backup-cli"
-path = "src/bin/cli.rs"
+name = "rb-cli"
+path = "src/bin/rb_cli.rs"
 
 [[example]]
 name = "probe_hfs_btree"
@@ -31,6 +31,18 @@ path = "example/test_clone_fix.rs"
 [[example]]
 name = "fsck_bare"
 path = "example/fsck_bare.rs"
+
+[[example]]
+name = "generate_manpage"
+path = "example/generate_manpage.rs"
+
+[[example]]
+name = "generate_cli_reference"
+path = "example/generate_cli_reference.rs"
+
+[[example]]
+name = "generate_cli_html_help"
+path = "example/generate_cli_html_help.rs"
 
 [features]
 default = []
@@ -65,6 +77,13 @@ bzip2 = "0.6"
 base64 = "0.22"
 opticaldiscs = { git = "https://github.com/danifunker/opticaldiscs-rs", features = ["drives"] }
 cd-da-reader = { git = "https://github.com/danifunker/rust-cd-da-reader", branch = "add-data-support-0-4-1" }
+serde_yml = "0.0.12"
+csv = "1"
+clap_complete = "4"
+clap_mangen = "0.2"
+globset = "0.4"
+rustyline = { version = "18.0.0", features = ["with-file-history"] }
+shell-words = "1.1.1"
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 libc = "0.2"

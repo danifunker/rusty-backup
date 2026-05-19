@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli batch-template</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>batch-template</span></nav>
+<h1><code>rb-cli batch-template</code></h1>
+<p>Generate a starter `batch` JSON script from a host directory</p>
+<h2>Usage</h2>
+<pre><code>Usage: batch-template [OPTIONS] --target &lt;TARGET&gt; &lt;HOSTDIR&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;SOURCE&gt;</code></dt>
+<dd>Host directory to mirror</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--target</code></dt>
+<dd>Target image (and optional partition) the batch script will modify. Written verbatim into the script's `target` field</dd>
+<dt><code>--dst</code></dt>
+<dd>Destination directory inside the target filesystem (`/` for root)</dd>
+<dt><code>--out</code></dt>
+<dd>Write the script here. Defaults to stdout</dd>
+<dt><code>--include</code></dt>
+<dd>Include only paths matching these globs (repeatable). Default is &quot;all&quot;</dd>
+<dt><code>--exclude</code></dt>
+<dd>Exclude paths matching these globs (repeatable). Exclude wins on conflict</dd>
+<dt><code>--icase</code></dt>
+<dd>Glob matching is case-insensitive</dd>
+<dt><code>--default-type</code></dt>
+<dd>Default HFS type code for files with no extension match</dd>
+<dt><code>--default-creator</code></dt>
+<dd>Default HFS creator code for files with no extension match</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_html_help</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

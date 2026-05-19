@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli install-completions</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>install-completions</span></nav>
+<h1><code>rb-cli install-completions</code></h1>
+<p>Install shell completions to the user-scoped canonical location</p>
+<h2>Usage</h2>
+<pre><code>Usage: install-completions [OPTIONS]</code></pre>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--shell</code></dt>
+<dd>Force the shell instead of auto-detecting from `$SHELL` / `$PSModulePath`</dd>
+<dt><code>--prefix</code></dt>
+<dd>Override the install prefix (rarely needed). When set, the file is written under `PREFIX/&lt;canonical-subdir&gt;`</dd>
+<dt><code>--print</code></dt>
+<dd>Print the script to stdout instead of writing to disk</dd>
+<dt><code>--uninstall</code></dt>
+<dd>Remove the installed completion file. No-op if it doesn't exist</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_html_help</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

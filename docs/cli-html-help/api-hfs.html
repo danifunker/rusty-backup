@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli api hfs</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <a href="api.html">api</a> &raquo; <span>hfs</span></nav>
+<h1><code>rb-cli api hfs</code></h1>
+<p>Classic-HFS image operations (create, browse, edit single-partition .dsk images)</p>
+<h2>Usage</h2>
+<pre><code>Usage: hfs &lt;COMMAND&gt;</code></pre>
+<h2>Subcommands</h2>
+<ul class="verbs">
+<li><a href="api-hfs-new.html"><code>new</code></a><span class="desc">Create a fresh blank HFS volume at the given path</span></li>
+<li><a href="api-hfs-info.html"><code>info</code></a><span class="desc">Print volume name, sizes, and counts for an HFS image</span></li>
+<li><a href="api-hfs-ls.html"><code>ls</code></a><span class="desc">List a directory inside the HFS volume</span></li>
+<li><a href="api-hfs-put.html"><code>put</code></a><span class="desc">Copy a host file into the HFS volume</span></li>
+<li><a href="api-hfs-put-zero.html"><code>put-zero</code></a><span class="desc">Pre-allocate a zero-filled file at the given Mac path. Useful for reserving a results file the boot ROM will fill in</span></li>
+<li><a href="api-hfs-get.html"><code>get</code></a><span class="desc">Extract an HFS file to the host</span></li>
+<li><a href="api-hfs-rm.html"><code>rm</code></a><span class="desc">Delete a file from the HFS volume</span></li>
+<li><a href="api-hfs-put-boot.html"><code>put-boot</code></a><span class="desc">Overwrite the 1024-byte boot block region at offset 0. The source must be at most 1024 bytes and is written verbatim — no padding, no HFS B-tree touch. Operates on the file's byte 0 regardless of any APM wrapping</span></li>
+<li><a href="api-hfs-validate.html"><code>validate</code></a><span class="desc">Run the lightweight HFS integrity check on the image</span></li>
+</ul>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_html_help</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

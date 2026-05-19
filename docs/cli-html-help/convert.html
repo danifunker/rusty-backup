@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli convert</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>convert</span></nav>
+<h1><code>rb-cli convert</code></h1>
+<p>Re-encode one or more disk images into a chosen output format</p>
+<h2>Usage</h2>
+<pre><code>Usage: convert [OPTIONS] &lt;IN&gt; &lt;OUT&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;SOURCE&gt;</code></dt>
+<dd>Source file or folder. When a folder, every convertible file is processed</dd>
+<dt><code>&lt;DEST&gt;</code></dt>
+<dd>Destination folder. Created if absent</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--format</code></dt>
+<dd>Output format</dd>
+<dt><code>--extension</code></dt>
+<dd>Output extension (no leading dot). Defaults to the format's natural extension (chd, vhd, img, …)</dd>
+<dt><code>--bincue-multi-bin</code></dt>
+<dd>For BIN/CUE output, write one .bin per track instead of a single concatenated .bin. No effect for other formats</dd>
+<dt><code>--overwrite</code></dt>
+<dd>Overwrite destination files that already exist. Without this, existing outputs are skipped with a warning</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_html_help</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

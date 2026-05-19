@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli api hfs put</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <a href="api.html">api</a> &raquo; <a href="api-hfs.html">hfs</a> &raquo; <span>put</span></nav>
+<h1><code>rb-cli api hfs put</code></h1>
+<p>Copy a host file into the HFS volume</p>
+<h2>Usage</h2>
+<pre><code>Usage: put [OPTIONS] &lt;IMAGE&gt; &lt;HOST_FILE&gt; &lt;MAC_PATH&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd></dd>
+<dt><code>&lt;HOST_FILE&gt;</code></dt>
+<dd>Source file on the host</dd>
+<dt><code>&lt;MAC_PATH&gt;</code></dt>
+<dd>Destination Mac path inside the volume. The parent directory must already exist</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--type</code></dt>
+<dd>HFS 4-character type code. Defaults to `BINA`</dd>
+<dt><code>--creator</code></dt>
+<dd>HFS 4-character creator code. Defaults to `????`</dd>
+<dt><code>--force</code></dt>
+<dd>Overwrite an existing entry at the destination path</dd>
+<dt><code>--partition</code></dt>
+<dd></dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_html_help</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

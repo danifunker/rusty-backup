@@ -6,10 +6,12 @@
 pub mod archive_edit;
 pub mod backup_loader;
 pub mod browse_session;
+pub mod bulk_convert_runner;
 pub mod chd_expand_runner;
 pub mod edit_queue;
 pub mod export_runner;
 pub mod fsck_runner;
+pub mod hfs_expand_runner;
 pub mod min_size_runner;
 pub mod partition_editor;
 pub mod physical_write_runner;

@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli optical extract</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <a href="optical.html">optical</a> &raquo; <span>extract</span></nav>
+<h1><code>rb-cli optical extract</code></h1>
+<p>Extract files from an optical disc image into a host folder</p>
+<h2>Usage</h2>
+<pre><code>Usage: extract [OPTIONS] --to &lt;TO&gt; &lt;SOURCE&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;SOURCE&gt;</code></dt>
+<dd>Optical disc image (.iso, .cue, .chd)</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--to</code></dt>
+<dd>Destination folder (created if absent)</dd>
+<dt><code>--resource-forks</code></dt>
+<dd>How to handle HFS resource forks. Ignored on non-HFS discs. Defaults to `appledouble`, or `[optical] resource-forks` from the config file when set</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_html_help</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

@@ -1,5 +1,5 @@
 //! End-to-end test for the `api hfs` CLI surface. Drives the
-//! `rusty-backup-cli` binary against scratch images in a tempdir.
+//! `rb-cli` binary against scratch images in a tempdir.
 //!
 //! These are deliberately black-box tests: they exercise the same code
 //! path scripted consumers (e.g. the lbmactwo build pipeline) hit, so
@@ -11,14 +11,14 @@ use std::process::Command;
 
 fn cli_bin() -> PathBuf {
     // Cargo sets CARGO_BIN_EXE_<name> for every [[bin]] target in scope.
-    PathBuf::from(env!("CARGO_BIN_EXE_rusty-backup-cli"))
+    PathBuf::from(env!("CARGO_BIN_EXE_rb-cli"))
 }
 
 fn run(args: &[&str]) -> std::process::Output {
     let out = Command::new(cli_bin())
         .args(args)
         .output()
-        .expect("spawn rusty-backup-cli");
+        .expect("spawn rb-cli");
     if !out.status.success() {
         panic!(
             "command {args:?} failed: status={:?}\nstdout:\n{}\nstderr:\n{}",

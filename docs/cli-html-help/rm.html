@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli rm</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>rm</span></nav>
+<h1><code>rb-cli rm</code></h1>
+<p>Delete a file or directory from a filesystem</p>
+<h2>Usage</h2>
+<pre><code>Usage: rm [OPTIONS] &lt;IMAGE&gt; &lt;PATH&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>Image reference (`path` or `path@N` for the 1-based partition index)</dd>
+<dt><code>&lt;PATH&gt;</code></dt>
+<dd>Path or glob pattern inside the filesystem. Patterns containing `*`, `?`, `[`, or `{` walk the volume and delete every match</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>-r / --recursive</code></dt>
+<dd>Recursively delete directories (matches will include directories without this flag, but they get rejected unless --recursive)</dd>
+<dt><code>--exclude</code></dt>
+<dd>Exclude paths matching this glob from deletion. Repeatable. Exclude always wins over the positional pattern</dd>
+<dt><code>--ignore-case</code></dt>
+<dd>Match case-insensitively regardless of the target's native rule</dd>
+<dt><code>--case-sensitive</code></dt>
+<dd>Match case-sensitively regardless of the target's native rule</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_html_help</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli grow</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>grow</span></nav>
+<h1><code>rb-cli grow</code></h1>
+<p>Grow a disk image by `--add SIZE` of trailing zero-padding so a subsequent `partmap` edit can place a new partition</p>
+<h2>Usage</h2>
+<pre><code>Usage: grow --add &lt;ADD&gt; &lt;IMAGE&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>Image to grow</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--add</code></dt>
+<dd>Bytes of zero-padding to add at the end (e.g. `512M`, `2G`)</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_html_help</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

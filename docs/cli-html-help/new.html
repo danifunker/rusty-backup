@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli new</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>new</span></nav>
+<h1><code>rb-cli new</code></h1>
+<p>Create a blank single-partition image (superfloppy or, in Phase D, partition-table-wrapped)</p>
+<h2>Usage</h2>
+<pre><code>Usage: new [OPTIONS] --fs &lt;FS&gt; &lt;IMAGE&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>Image file to create. Overwritten if it already exists</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--fs</code></dt>
+<dd>Filesystem to format</dd>
+<dt><code>--size</code></dt>
+<dd>Volume size, accepting plain bytes or `K`/`KiB`/`M`/`MiB`/`G`/`GiB` suffixes (e.g. `800K`, `5M`). Defaults to 800K (an 800 KiB floppy)</dd>
+<dt><code>--name</code></dt>
+<dd>Volume label/name. Defaults to `rusty-backup`. HFS: up to 27 Mac Roman bytes. FAT: up to 11 chars (uppercased; non-ASCII → `_`). EFS: 6-byte fname/fpack. AFFS: up to 30 bytes</dd>
+<dt><code>--block-size</code></dt>
+<dd>HFS allocation block size in bytes. Must be a non-zero multiple of 512. When unset, the smallest size that keeps `total_blocks &lt;= 65535` is chosen automatically. Ignored for other filesystems</dd>
+<dt><code>--affs-variant</code></dt>
+<dd>AFFS variant byte (0=OFS, 1=FFS, 2=OFS+intl, 3=FFS+intl, 4=OFS+dircache, 5=FFS+dircache). Defaults to 1 (FFS)</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_html_help</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>
