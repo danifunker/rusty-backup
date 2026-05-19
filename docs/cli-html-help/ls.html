@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli ls</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>ls</span></nav>
+<h1><code>rb-cli ls</code></h1>
+<p>List a directory inside a filesystem</p>
+<h2>Usage</h2>
+<pre><code>Usage: ls [OPTIONS] &lt;IMAGE&gt; [PATH]</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>Image reference (`path` or `path@N` for the 1-based partition index)</dd>
+<dt><code>&lt;PATH&gt;</code></dt>
+<dd>Path or glob pattern inside the filesystem (use `/` as the separator). A plain path lists that directory's contents; patterns containing `*`, `?`, `[`, or `{` walk the volume and emit one line per match</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--exclude</code></dt>
+<dd>Exclude paths matching this glob. Repeatable. Exclude always wins over `--include` / a positional path</dd>
+<dt><code>--ignore-case</code></dt>
+<dd>Treat case-insensitively, regardless of the target's native rule</dd>
+<dt><code>--case-sensitive</code></dt>
+<dd>Treat case-sensitively, regardless of the target's native rule</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_html_help</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

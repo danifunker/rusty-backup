@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli restore</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>restore</span></nav>
+<h1><code>rb-cli restore</code></h1>
+<p>Restore a backup folder to a target image or device</p>
+<h2>Usage</h2>
+<pre><code>Usage: restore [OPTIONS] &lt;BACKUP_DIR&gt; &lt;TARGET&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;BACKUP_DIR&gt;</code></dt>
+<dd>Source backup folder (the directory containing `metadata.json`)</dd>
+<dt><code>&lt;TARGET&gt;</code></dt>
+<dd>Target image file or block-device path</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--target-size</code></dt>
+<dd>Target size in bytes (defaults to the original disk size from the backup metadata)</dd>
+<dt><code>--size</code></dt>
+<dd>Per-partition size policy. Defaults to `original`, or `[restore] size` from the config file when set</dd>
+<dt><code>--alignment</code></dt>
+<dd>Partition alignment policy. Defaults to `original`, or `[restore] alignment` from the config file when set</dd>
+<dt><code>--device</code></dt>
+<dd>Treat `TARGET` as a block device (enables sector-aligned writes and the full device-write safety preflight in [`crate::cli::device_safety`])</dd>
+<dt><code>--yes</code></dt>
+<dd>Confirm destructive write to the target (required for device targets). For file targets the flag is a no-op</dd>
+<dt><code>--write-to-system-disk</code></dt>
+<dd>Allow writing to the system boot disk (refused by default; only meaningful with `--device`)</dd>
+<dt><code>--write-zeros-to-unused</code></dt>
+<dd>Write zeros to unused filesystem space</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_html_help</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

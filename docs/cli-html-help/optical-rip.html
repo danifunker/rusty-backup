@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli optical rip</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <a href="optical.html">optical</a> &raquo; <span>rip</span></nav>
+<h1><code>rb-cli optical rip</code></h1>
+<p>Rip a physical CD/DVD drive to a disk image file</p>
+<h2>Usage</h2>
+<pre><code>Usage: rip [OPTIONS] --device &lt;DEVICE&gt; --output &lt;OUTPUT&gt;</code></pre>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--device</code></dt>
+<dd>Source drive (e.g. `/dev/sr0`, `disk6`, `\\.\E:`). See `rb-cli show devices`</dd>
+<dt><code>--output</code></dt>
+<dd>Output path: `.iso` for `--format iso`, `.cue` for `--format bincue`</dd>
+<dt><code>--format</code></dt>
+<dd></dd>
+<dt><code>--eject</code></dt>
+<dd>Eject the disc after a successful rip</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_html_help</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

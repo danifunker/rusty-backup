@@ -405,7 +405,7 @@ Usage: fsck [OPTIONS] <IMAGE>
 
 - `--checkonly` — Scan only. Never prompt, never repair. Exits non-zero on issues
 - `--repair` — Auto-repair detected issues without prompting
-- `--prompt-timeout` — Seconds to wait for an interactive repair confirmation before resolving to "No" (default 30). `0` waits indefinitely (TTY only)
+- `--prompt-timeout` — Seconds to wait for an interactive repair confirmation before resolving to "No" (default 30; or `[fsck] prompt-timeout` from the config file when set). `0` waits indefinitely (TTY only)
 
 ### `get`
 
@@ -556,7 +556,7 @@ Usage: extract [OPTIONS] --to <TO> <SOURCE>
 **Options**
 
 - `--to` — Destination folder (created if absent)
-- `--resource-forks` — How to handle HFS resource forks. Ignored on non-HFS discs
+- `--resource-forks` — How to handle HFS resource forks. Ignored on non-HFS discs. Defaults to `appledouble`, or `[optical] resource-forks` from the config file when set
 
 ### `optical rip`
 
@@ -592,8 +592,8 @@ Usage: put [OPTIONS] <IMAGE> [HOST_FILE] [DST]
 - `--zero` — Pre-allocate N zero bytes instead of copying a host file. Pair with `--dst`
 - `--dst` — Explicit destination flag; use this with `--zero` where the positional `DST` slot is awkward
 - `--boot` — Write the 1024-byte boot-block region of the image verbatim. HFS-only today
-- `--type` — 4-character type code (HFS / HFS+ / ProDOS). Defaults to `BINA`
-- `--creator` — 4-character creator code (HFS / HFS+ only). Defaults to `????`
+- `--type` — 4-character type code (HFS / HFS+ / ProDOS). Defaults to `BINA`, or `[put] type` from the config file when set
+- `--creator` — 4-character creator code (HFS / HFS+ only). Defaults to `????`, or `[put] creator` from the config file when set
 - `--force` — Overwrite an existing entry at the destination path
 
 ### `resize`
@@ -628,8 +628,8 @@ Usage: restore [OPTIONS] <BACKUP_DIR> <TARGET>
 **Options**
 
 - `--target-size` — Target size in bytes (defaults to the original disk size from the backup metadata)
-- `--size` — Per-partition size policy
-- `--alignment` — Partition alignment policy
+- `--size` — Per-partition size policy. Defaults to `original`, or `[restore] size` from the config file when set
+- `--alignment` — Partition alignment policy. Defaults to `original`, or `[restore] alignment` from the config file when set
 - `--device` — Treat `TARGET` as a block device (enables sector-aligned writes and the full device-write safety preflight in [`crate::cli::device_safety`])
 - `--yes` — Confirm destructive write to the target (required for device targets). For file targets the flag is a no-op
 - `--write-to-system-disk` — Allow writing to the system boot disk (refused by default; only meaningful with `--device`)

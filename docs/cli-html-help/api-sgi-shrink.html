@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli api sgi shrink</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <a href="api.html">api</a> &raquo; <a href="api-sgi.html">sgi</a> &raquo; <span>shrink</span></nav>
+<h1><code>rb-cli api sgi shrink</code></h1>
+<p>Re-encode an IRIX disk image into a CHD whose logical size matches the SGI volume header's used floor. Drops trailing zero padding past `max(first + blocks)` over all non-empty partition entries. Accepts a raw `.img` or an existing `.chd` as input; always writes a CHD. Refuses to overwrite the source or an existing output file</p>
+<h2>Usage</h2>
+<pre><code>Usage: shrink &lt;INPUT&gt; &lt;OUTPUT&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;INPUT&gt;</code></dt>
+<dd>Source image (raw `.img` or `.chd`). Must contain an SGI volume header at sector 0</dd>
+<dt><code>&lt;OUTPUT&gt;</code></dt>
+<dd>Destination CHD path. Must end in `.chd`, must not already exist, and must not resolve to the same file as `input`</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_html_help</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

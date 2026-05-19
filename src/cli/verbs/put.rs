@@ -48,13 +48,15 @@ pub struct PutArgs {
     #[arg(long, conflicts_with_all = ["host_file", "dst", "dst_flag", "zero", "type_code", "creator", "force"])]
     pub boot: Option<PathBuf>,
 
-    /// 4-character type code (HFS / HFS+ / ProDOS). Defaults to `BINA`.
-    #[arg(long = "type", default_value = "BINA")]
-    pub type_code: String,
+    /// 4-character type code (HFS / HFS+ / ProDOS). Defaults to `BINA`,
+    /// or `[put] type` from the config file when set.
+    #[arg(long = "type")]
+    pub type_code: Option<String>,
 
-    /// 4-character creator code (HFS / HFS+ only). Defaults to `????`.
-    #[arg(long, default_value = "????")]
-    pub creator: String,
+    /// 4-character creator code (HFS / HFS+ only). Defaults to `????`,
+    /// or `[put] creator` from the config file when set.
+    #[arg(long)]
+    pub creator: Option<String>,
 
     /// Overwrite an existing entry at the destination path.
     #[arg(long)]
@@ -111,9 +113,27 @@ pub fn run(args: PutArgs) -> Result<()> {
             .map_err(|e| anyhow!("delete existing: {e}"))?;
     }
 
+    let type_code = args
+        .type_code
+        .clone()
+        .or_else(|| {
+            crate::cli::logging::loaded_config()
+                .and_then(|c| c.get("put", "type"))
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "BINA".to_string());
+    let creator = args
+        .creator
+        .clone()
+        .or_else(|| {
+            crate::cli::logging::loaded_config()
+                .and_then(|c| c.get("put", "creator"))
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "????".to_string());
     let options = CreateFileOptions {
-        type_code: Some(args.type_code.clone()),
-        creator_code: Some(args.creator.clone()),
+        type_code: Some(type_code),
+        creator_code: Some(creator),
         ..Default::default()
     };
 

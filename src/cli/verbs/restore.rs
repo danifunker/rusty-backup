@@ -41,13 +41,15 @@ pub struct RestoreArgs {
     #[arg(long = "target-size")]
     pub target_size: Option<u64>,
 
-    /// Per-partition size policy.
-    #[arg(long, value_enum, default_value = "original")]
-    pub size: SizeMode,
+    /// Per-partition size policy. Defaults to `original`, or
+    /// `[restore] size` from the config file when set.
+    #[arg(long, value_enum)]
+    pub size: Option<SizeMode>,
 
-    /// Partition alignment policy.
-    #[arg(long, value_enum, default_value = "original")]
-    pub alignment: AlignmentMode,
+    /// Partition alignment policy. Defaults to `original`, or
+    /// `[restore] alignment` from the config file when set.
+    #[arg(long, value_enum)]
+    pub alignment: Option<AlignmentMode>,
 
     /// Treat `TARGET` as a block device (enables sector-aligned writes
     /// and the full device-write safety preflight in
@@ -92,11 +94,25 @@ pub fn run(args: RestoreArgs) -> Result<()> {
         Some(n) => n,
         None => read_source_size_from_metadata(&args.backup_dir)?,
     };
-    let alignment = match args.alignment {
+    let alignment_choice = args
+        .alignment
+        .or_else(|| {
+            crate::cli::logging::loaded_config()
+                .and_then(|c| c.get("restore", "alignment"))
+                .and_then(parse_alignment_mode)
+        })
+        .unwrap_or(AlignmentMode::Original);
+    let _size_choice_unresolved = args.size.or_else(|| {
+        crate::cli::logging::loaded_config()
+            .and_then(|c| c.get("restore", "size"))
+            .and_then(parse_size_mode)
+    });
+    let alignment = match alignment_choice {
         AlignmentMode::Original => RestoreAlignment::Original,
         AlignmentMode::Modern1mb => RestoreAlignment::Modern1MB,
     };
-    let _size_choice = match args.size {
+    let size_choice = _size_choice_unresolved.unwrap_or(SizeMode::Original);
+    let _size_choice = match size_choice {
         SizeMode::Original => RestoreSizeChoice::Original,
         SizeMode::Minimum => RestoreSizeChoice::Minimum,
     };
@@ -186,4 +202,20 @@ fn spawn_progress_pump(progress: Arc<Mutex<RestoreProgress>>) {
     });
     // Silence unused-import / unused-result warnings in stripped builds.
     let _ = anyhow::Ok::<()>(());
+}
+
+fn parse_size_mode(s: &str) -> Option<SizeMode> {
+    match s.to_ascii_lowercase().as_str() {
+        "original" => Some(SizeMode::Original),
+        "minimum" => Some(SizeMode::Minimum),
+        _ => None,
+    }
+}
+
+fn parse_alignment_mode(s: &str) -> Option<AlignmentMode> {
+    match s.to_ascii_lowercase().as_str() {
+        "original" => Some(AlignmentMode::Original),
+        "modern1mb" | "modern-1mb" => Some(AlignmentMode::Modern1mb),
+        _ => None,
+    }
 }

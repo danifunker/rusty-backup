@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli api hfs new</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <a href="api.html">api</a> &raquo; <a href="api-hfs.html">hfs</a> &raquo; <span>new</span></nav>
+<h1><code>rb-cli api hfs new</code></h1>
+<p>Create a fresh blank HFS volume at the given path</p>
+<h2>Usage</h2>
+<pre><code>Usage: new [OPTIONS] &lt;IMAGE&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>Image file to create. Overwritten if it already exists</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--size</code></dt>
+<dd>Volume size, accepting plain bytes or `K`/`KiB`/`M`/`MiB` suffixes (e.g. `800K`, `5M`). Defaults to 800K (an 800 KiB floppy)</dd>
+<dt><code>--name</code></dt>
+<dd>HFS volume name (1..=27 Mac Roman bytes). Defaults to `MacIIBench`</dd>
+<dt><code>--block-size</code></dt>
+<dd>HFS allocation block size in bytes. Must be a non-zero multiple of 512. When unset, the smallest size that keeps `total_blocks &lt;= 65535` is chosen automatically (e.g. 512 for floppies, larger for multi-MiB SCSI images)</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_html_help</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

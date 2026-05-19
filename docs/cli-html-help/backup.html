@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli backup</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>backup</span></nav>
+<h1><code>rb-cli backup</code></h1>
+<p>Back up a disk image or device to a backup folder</p>
+<h2>Usage</h2>
+<pre><code>Usage: backup [OPTIONS] &lt;SOURCE&gt; &lt;DEST&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;SOURCE&gt;</code></dt>
+<dd>Source: an image file or a block-device path</dd>
+<dt><code>&lt;DEST&gt;</code></dt>
+<dd>Destination directory. The backup is written under `DEST/&lt;name&gt;/`. The directory is created if it doesn't exist</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--name</code></dt>
+<dd>Backup name (the subdirectory under `DEST`). Defaults to the source file's stem with a date suffix</dd>
+<dt><code>--format</code></dt>
+<dd>Output format. Defaults to `chd`, or the `[backup] format` value from the config file when set</dd>
+<dt><code>--checksum</code></dt>
+<dd>Checksum to record per file. Defaults to `sha256`, or the `[backup] checksum` value from the config file when set</dd>
+<dt><code>--sector-by-sector</code></dt>
+<dd>Skip filesystem-aware compaction; copy every sector verbatim</dd>
+<dt><code>--partitions</code></dt>
+<dd>Per-partition filter — comma-separated 1-based indices to include (e.g. `1,3,4`). Default is &quot;all partitions&quot;</dd>
+<dt><code>--split-size</code></dt>
+<dd>Split each output stream after this many MiB (Zstd / Raw only)</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_html_help</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

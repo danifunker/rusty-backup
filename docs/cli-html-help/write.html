@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli write</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>write</span></nav>
+<h1><code>rb-cli write</code></h1>
+<p>Stream an image file onto a block device</p>
+<h2>Usage</h2>
+<pre><code>Usage: write [OPTIONS] &lt;IMAGE&gt; &lt;DEVICE&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>Source image file</dd>
+<dt><code>&lt;DEVICE&gt;</code></dt>
+<dd>Destination block-device path: - Linux: `/dev/sdX` or `/dev/nvmeXnY` - macOS: `/dev/diskN` / `/dev/rdiskN` - Windows: `&quot;\\.\PhysicalDriveN&quot;` (quote for PowerShell)</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--yes</code></dt>
+<dd>Required confirmation. Skips the prompt but never the safety summary printed on stderr</dd>
+<dt><code>--write-to-system-disk</code></dt>
+<dd>Allow writing to the system boot disk (refused by default)</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_html_help</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

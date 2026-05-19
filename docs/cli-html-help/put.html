@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli put</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>put</span></nav>
+<h1><code>rb-cli put</code></h1>
+<p>Copy a host file (or zero-fill / write boot blocks) into a filesystem</p>
+<h2>Usage</h2>
+<pre><code>Usage: put [OPTIONS] &lt;IMAGE&gt; [HOST_FILE] [DST]</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>Image reference (`path` or `path@N` for the 1-based partition index)</dd>
+<dt><code>&lt;HOST_FILE&gt;</code></dt>
+<dd>Host file to copy. Required when not using `--zero` or `--boot`</dd>
+<dt><code>&lt;DST&gt;</code></dt>
+<dd>Destination path inside the filesystem (cp-like positional)</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--zero</code></dt>
+<dd>Pre-allocate N zero bytes instead of copying a host file. Pair with `--dst`</dd>
+<dt><code>--dst</code></dt>
+<dd>Explicit destination flag; use this with `--zero` where the positional `DST` slot is awkward</dd>
+<dt><code>--boot</code></dt>
+<dd>Write the 1024-byte boot-block region of the image verbatim. HFS-only today</dd>
+<dt><code>--type</code></dt>
+<dd>4-character type code (HFS / HFS+ / ProDOS). Defaults to `BINA`, or `[put] type` from the config file when set</dd>
+<dt><code>--creator</code></dt>
+<dd>4-character creator code (HFS / HFS+ only). Defaults to `????`, or `[put] creator` from the config file when set</dd>
+<dt><code>--force</code></dt>
+<dd>Overwrite an existing entry at the destination path</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_html_help</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli inspect</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>inspect</span></nav>
+<h1><code>rb-cli inspect</code></h1>
+<p>Whole-disk aggregate read-only view (partition table + per-partition summary + CHD metadata when applicable)</p>
+<h2>Usage</h2>
+<pre><code>Usage: inspect [OPTIONS] &lt;IMAGE&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>Image path. `inspect` always reads the whole disk — there is no `@N` form. For per-partition detail use `show fs-info IMG@N`</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--format</code></dt>
+<dd>Output format</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_html_help</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

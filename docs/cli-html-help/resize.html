@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli resize</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>resize</span></nav>
+<h1><code>rb-cli resize</code></h1>
+<p>Resize the filesystem at IMG@N to a new size (FAT/NTFS/exFAT/HFS+/ ext/btrfs/SFS/PFS3/AFFS/EFS — whichever magic matches)</p>
+<h2>Usage</h2>
+<pre><code>Usage: resize --size &lt;SIZE&gt; &lt;IMAGE&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>Image reference (`path` or `path@N` for the 1-based partition index)</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--size</code></dt>
+<dd>New filesystem size in bytes. Accepts suffixes (`K`, `M`, `G`)</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_html_help</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

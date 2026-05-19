@@ -40,6 +40,10 @@ path = "example/generate_manpage.rs"
 name = "generate_cli_reference"
 path = "example/generate_cli_reference.rs"
 
+[[example]]
+name = "generate_cli_html_help"
+path = "example/generate_cli_html_help.rs"
+
 [features]
 default = []
 

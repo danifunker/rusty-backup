@@ -54,7 +54,37 @@ pub struct Script {
     pub created_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_options: Option<DefaultOptions>,
+    /// Optional multi-partition disk layout. When present, the target
+    /// file is created with the named partition table and one partition
+    /// per entry; subsequent `operations` target partition 1 unless
+    /// they carry their own `@N` selector in the future.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk: Option<DiskBlock>,
     pub operations: Vec<Operation>,
+}
+
+/// Multi-partition layout for a freshly-created image.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct DiskBlock {
+    /// Partition table kind: `mbr` (only kind supported today).
+    pub table: String,
+    pub partitions: Vec<DiskPartition>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct DiskPartition {
+    pub fs: String,
+    pub size: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_size: Option<u32>,
+    /// AFFS variant byte (only meaningful for `fs = "affs"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affs_variant: Option<u8>,
+    /// Whether to mark this partition active/bootable (MBR only).
+    #[serde(default)]
+    pub bootable: bool,
 }
 
 fn default_schema() -> String {
@@ -77,6 +107,27 @@ pub enum Operation {
     Mkdir(MkdirOp),
     Put(PutOp),
     Rm(RmOp),
+    /// Create a fresh single-partition image at the script's `target`
+    /// path. Must be the first operation if present. Mutually exclusive
+    /// with a top-level `disk` block.
+    Format(FormatOp),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct FormatOp {
+    pub fs: String,
+    pub size: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_size: Option<u32>,
+    /// AFFS variant byte (only meaningful for `fs = "affs"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affs_variant: Option<u8>,
+    /// Optional partition-table wrapper: `none` (default, raw FS) or
+    /// `mbr` (single-partition MBR wrap at LBA 2048; FAT only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_table: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -130,15 +181,80 @@ pub fn run(args: BatchArgs) -> Result<()> {
     };
     let defaults = script.default_options.unwrap_or_default();
 
+    // Validation: `format` op (if present) must be at index 0, and
+    // can't coexist with a top-level `disk` block.
+    let has_format = matches!(script.operations.first(), Some(Operation::Format(_)));
+    if let Some(idx) = script
+        .operations
+        .iter()
+        .skip(1)
+        .position(|o| matches!(o, Operation::Format(_)))
+    {
+        bail!(
+            "`format` op must be the first operation (found at index {})",
+            idx + 1
+        );
+    }
+    if has_format && script.disk.is_some() {
+        bail!("script cannot carry both a `disk` block and a `format` op");
+    }
+
     if args.dry_run {
         out_stdout(format!(
             "dry-run plan: {} operation(s) on {}",
             script.operations.len(),
             target.path.display()
         ));
+        if let Some(d) = &script.disk {
+            out_stdout(format!(
+                "  disk: {} table, {} partition(s)",
+                d.table,
+                d.partitions.len()
+            ));
+        }
         for (i, op) in script.operations.iter().enumerate() {
             out_stdout(format!("  {:>3}  {}", i + 1, describe(op)));
         }
+        return Ok(());
+    }
+
+    // Apply the disk block (creates a fresh multi-partition image at target.path).
+    if let Some(d) = &script.disk {
+        apply_disk_block(&target.path, d)?;
+        log_stderr(format!(
+            "disk: created {} ({} partition(s))",
+            target.path.display(),
+            d.partitions.len()
+        ));
+    }
+
+    // Apply a leading `format` op (creates a single-partition image).
+    let fs_ops_start = if has_format {
+        if let Some(Operation::Format(fop)) = script.operations.first() {
+            apply_format_op(&target.path, fop)?;
+            log_stderr(format!(
+                "format: created {} (fs={}, size={})",
+                target.path.display(),
+                fop.fs,
+                fop.size
+            ));
+        }
+        1
+    } else {
+        0
+    };
+
+    // If the script only contained a `disk` / `format` op and no FS ops, we're done.
+    if script.operations.len() == fs_ops_start && script.disk.is_none() && !has_format {
+        out_stdout("Applied 0/0 op(s); 0 failure(s)");
+        return Ok(());
+    }
+    if script.operations.len() == fs_ops_start {
+        out_stdout(format!(
+            "Applied {}/{} op(s); 0 failure(s)",
+            fs_ops_start,
+            script.operations.len()
+        ));
         return Ok(());
     }
 
@@ -152,9 +268,9 @@ pub fn run(args: BatchArgs) -> Result<()> {
     )
     .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
 
-    let mut applied = 0usize;
+    let mut applied = fs_ops_start;
     let mut failures: Vec<(usize, String)> = Vec::new();
-    for (i, op) in script.operations.iter().enumerate() {
+    for (i, op) in script.operations.iter().enumerate().skip(fs_ops_start) {
         let res = apply_op(&mut *fs, op, &defaults);
         match res {
             Ok(()) => {
@@ -214,7 +330,173 @@ fn describe(op: &Operation) -> String {
                 format!("rm {path}")
             }
         }
+        Operation::Format(FormatOp { fs, size, name, .. }) => {
+            format!(
+                "format --fs {fs} --size {size}{}",
+                match name {
+                    Some(n) => format!(" --name {n:?}"),
+                    None => String::new(),
+                }
+            )
+        }
     }
+}
+
+/// Materialize a single-partition image at `path` based on a leading
+/// `format` op. Currently writes a raw filesystem at the start of the
+/// file; `partition_table = "mbr"` wraps a FAT volume in a 1-MiB-
+/// aligned MBR partition. Other PT wrappers are deferred.
+fn apply_format_op(path: &std::path::Path, op: &FormatOp) -> Result<()> {
+    let size = crate::cli::parse::parse_size(&op.size)
+        .with_context(|| format!("parsing format.size {:?}", op.size))?;
+    let name = op.name.as_deref().unwrap_or("rusty-backup");
+    let pt_kind = op
+        .partition_table
+        .as_deref()
+        .unwrap_or("none")
+        .to_lowercase();
+    if pt_kind != "none" && pt_kind != "mbr" {
+        bail!("unsupported partition_table {pt_kind:?}; only 'none' or 'mbr' for now");
+    }
+    let fs_bytes = build_blank_fs(&op.fs, size, name, op.block_size, op.affs_variant)?;
+    let final_bytes = if pt_kind == "mbr" {
+        if op.fs != "fat" {
+            bail!("partition_table = 'mbr' currently requires fs = 'fat'");
+        }
+        wrap_in_single_partition_mbr(&fs_bytes, fat_type_byte_for(size))?
+    } else {
+        fs_bytes
+    };
+    std::fs::write(path, &final_bytes).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+/// Dispatch to the right per-FS `create_blank_*` based on the JSON `fs` string.
+fn build_blank_fs(
+    fs: &str,
+    size: u64,
+    name: &str,
+    block_size: Option<u32>,
+    affs_variant: Option<u8>,
+) -> Result<Vec<u8>> {
+    match fs {
+        "fat" => crate::fs::fat::create_blank_fat(size, Some(name)),
+        "efs" => crate::fs::efs::create_blank_efs(size, name),
+        "affs" => crate::fs::affs::create_blank_affs(size, affs_variant.unwrap_or(1), name),
+        "hfs" => {
+            let bs = block_size.unwrap_or(0);
+            crate::fs::hfs::create_blank_hfs_sized(size, bs, name, 0, 0)
+                .map_err(|e| anyhow!("create_blank_hfs_sized: {e}"))
+        }
+        other => bail!("unsupported fs {other:?}; expected one of fat, efs, affs, hfs"),
+    }
+}
+
+/// Best-guess FAT type byte from volume size (mirrors `create_blank_fat`).
+fn fat_type_byte_for(size_bytes: u64) -> u8 {
+    if size_bytes <= 32 * 1024 * 1024 {
+        0x01 // FAT12
+    } else if size_bytes <= 2u64 * 1024 * 1024 * 1024 {
+        0x06 // FAT16 BIG (CHS-LBA mix; the parser accepts all FAT16 variants)
+    } else {
+        0x0C // FAT32 LBA
+    }
+}
+
+/// Wrap a single FAT filesystem image in a 1-MiB-aligned MBR.
+/// Returns a new buffer with [MBR + zero-padding + fs_bytes] sized to a
+/// 512-byte boundary. The FS's BPB `hidden_sectors` field is patched
+/// to the partition start LBA so DOS-era tools see consistent geometry.
+fn wrap_in_single_partition_mbr(fs_bytes: &[u8], type_byte: u8) -> Result<Vec<u8>> {
+    const ALIGN_SECTORS: u32 = 2048; // 1 MiB at 512-byte sectors
+    let fs_sectors = (fs_bytes.len() + 511) / 512;
+    if fs_sectors as u64 > u32::MAX as u64 - ALIGN_SECTORS as u64 {
+        bail!("filesystem too large for an MBR wrapper");
+    }
+    let total_sectors = ALIGN_SECTORS + fs_sectors as u32;
+    let mut out = vec![0u8; total_sectors as usize * 512];
+
+    // Patch a copy of the FS bytes so its hidden_sectors field reflects the LBA offset.
+    let mut fs = fs_bytes.to_vec();
+    if fs.len() >= 32 && (fs[0] == 0xEB || fs[0] == 0xE9) {
+        fs[28..32].copy_from_slice(&ALIGN_SECTORS.to_le_bytes());
+    }
+    out[ALIGN_SECTORS as usize * 512..ALIGN_SECTORS as usize * 512 + fs.len()].copy_from_slice(&fs);
+
+    let mbr = crate::partition::mbr::build_minimal_mbr(
+        0xDEADBEEF,
+        &[(type_byte, ALIGN_SECTORS, fs_sectors as u32, true)],
+        16,
+        63,
+    );
+    out[..512].copy_from_slice(&mbr);
+    Ok(out)
+}
+
+/// Materialize a multi-partition image from a `disk` block.
+/// Currently supports `table: "mbr"` only.
+fn apply_disk_block(path: &std::path::Path, disk: &DiskBlock) -> Result<()> {
+    let table = disk.table.to_lowercase();
+    if table != "mbr" {
+        bail!(
+            "unsupported disk.table {:?}; only 'mbr' for now",
+            disk.table
+        );
+    }
+    if disk.partitions.is_empty() {
+        bail!("disk.partitions is empty");
+    }
+    if disk.partitions.len() > 4 {
+        bail!(
+            "MBR supports up to 4 primary partitions; got {}",
+            disk.partitions.len()
+        );
+    }
+
+    const ALIGN_SECTORS: u32 = 2048;
+    let mut entries: Vec<(u8, u32, u32, bool)> = Vec::new();
+    let mut sections: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut cursor_lba: u32 = ALIGN_SECTORS;
+    for p in &disk.partitions {
+        let size = crate::cli::parse::parse_size(&p.size)
+            .with_context(|| format!("parsing disk.partitions[].size {:?}", p.size))?;
+        let name = p.name.as_deref().unwrap_or("rusty-backup");
+        let fs_bytes = build_blank_fs(&p.fs, size, name, p.block_size, p.affs_variant)?;
+        let fs_sectors_u64 = (fs_bytes.len() as u64 + 511) / 512;
+        if fs_sectors_u64 > u32::MAX as u64 {
+            bail!("partition too large for 32-bit LBA");
+        }
+        let fs_sectors = fs_sectors_u64 as u32;
+        let mut patched = fs_bytes;
+        if p.fs == "fat" && patched.len() >= 32 && (patched[0] == 0xEB || patched[0] == 0xE9) {
+            patched[28..32].copy_from_slice(&cursor_lba.to_le_bytes());
+        }
+        let type_byte = match p.fs.as_str() {
+            "fat" => fat_type_byte_for(size),
+            "efs" => 0x83, // Linux native; close enough — IRIX uses its own SGI table normally
+            "affs" => 0x83,
+            "hfs" => 0xAF, // Apple HFS
+            other => bail!("unsupported fs in disk.partitions: {other:?}"),
+        };
+        entries.push((type_byte, cursor_lba, fs_sectors, p.bootable));
+        sections.push((cursor_lba, patched));
+        cursor_lba = cursor_lba
+            .checked_add(fs_sectors)
+            .ok_or_else(|| anyhow!("partition layout overflowed u32 LBA"))?;
+        // 1-MiB alignment between partitions.
+        cursor_lba = (cursor_lba + ALIGN_SECTORS - 1) / ALIGN_SECTORS * ALIGN_SECTORS;
+    }
+
+    let total_sectors = cursor_lba;
+    let mut out = vec![0u8; total_sectors as usize * 512];
+    let mbr = crate::partition::mbr::build_minimal_mbr(0xDEADBEEF, &entries, 16, 63);
+    out[..512].copy_from_slice(&mbr);
+    for (lba, bytes) in sections {
+        let off = lba as usize * 512;
+        out[off..off + bytes.len()].copy_from_slice(&bytes);
+    }
+    std::fs::write(path, &out).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
 }
 
 fn apply_op(
@@ -226,6 +508,10 @@ fn apply_op(
         Operation::Mkdir(MkdirOp { path }) => apply_mkdir(fs, path),
         Operation::Put(op) => apply_put(fs, op, defaults),
         Operation::Rm(RmOp { path, recursive }) => apply_rm(fs, path, *recursive),
+        // Format ops are applied before the FS is opened (see `fs_ops_start`
+        // in `run`). Reaching here means the validation slipped — treat as
+        // a bug.
+        Operation::Format(_) => bail!("`format` op must be the first operation"),
     }
 }
 
@@ -340,6 +626,46 @@ mod tests {
         let s: Script = serde_json::from_str(json).unwrap();
         assert_eq!(s.operations.len(), 2);
         assert!(matches!(s.operations[0], Operation::Mkdir(_)));
+    }
+
+    #[test]
+    fn parses_format_op() {
+        let json = r#"{
+            "schema": "rb-cli-batch/1",
+            "target": "out.img",
+            "operations": [
+                { "op": "format", "fs": "fat", "size": "4M", "name": "X" },
+                { "op": "mkdir", "path": "/X" }
+            ]
+        }"#;
+        let s: Script = serde_json::from_str(json).unwrap();
+        match &s.operations[0] {
+            Operation::Format(f) => {
+                assert_eq!(f.fs, "fat");
+                assert_eq!(f.size, "4M");
+            }
+            _ => panic!("expected format"),
+        }
+    }
+
+    #[test]
+    fn parses_disk_block() {
+        let json = r#"{
+            "schema": "rb-cli-batch/1",
+            "target": "out.img@1",
+            "disk": {
+                "table": "mbr",
+                "partitions": [
+                    { "fs": "fat", "size": "4M", "name": "A", "bootable": true },
+                    { "fs": "fat", "size": "8M", "name": "B" }
+                ]
+            },
+            "operations": []
+        }"#;
+        let s: Script = serde_json::from_str(json).unwrap();
+        let d = s.disk.expect("disk block");
+        assert_eq!(d.partitions.len(), 2);
+        assert!(d.partitions[0].bootable);
     }
 
     #[test]

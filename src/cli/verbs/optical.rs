@@ -396,8 +396,10 @@ pub struct ExtractArgs {
     pub to: PathBuf,
 
     /// How to handle HFS resource forks. Ignored on non-HFS discs.
-    #[arg(long = "resource-forks", value_enum, default_value = "appledouble")]
-    pub resource_forks: CliResourceForkMode,
+    /// Defaults to `appledouble`, or `[optical] resource-forks` from
+    /// the config file when set.
+    #[arg(long = "resource-forks", value_enum)]
+    pub resource_forks: Option<CliResourceForkMode>,
 }
 
 fn run_extract_verb(args: ExtractArgs) -> Result<()> {
@@ -416,14 +418,22 @@ fn run_extract_verb(args: ExtractArgs) -> Result<()> {
         .root()
         .map_err(|e| anyhow::anyhow!("reading root: {e}"))?;
 
+    let rf_mode = args
+        .resource_forks
+        .or_else(|| {
+            crate::cli::logging::loaded_config()
+                .and_then(|c| c.get("optical", "resource-forks"))
+                .and_then(parse_resource_fork_mode)
+        })
+        .unwrap_or(CliResourceForkMode::Appledouble);
     log_stderr(format!(
         "rb-cli optical extract: {} -> {} (resource forks: {:?})",
         args.source.display(),
         args.to.display(),
-        args.resource_forks
+        rf_mode
     ));
 
-    let mode = args.resource_forks.into();
+    let mode = rf_mode.into();
     let mut count = 0u64;
     for child in fs
         .list_directory(&root)
@@ -536,4 +546,15 @@ fn fourcc(s: Option<&str>) -> [u8; 4] {
         out[..n].copy_from_slice(&bytes[..n]);
     }
     out
+}
+
+fn parse_resource_fork_mode(s: &str) -> Option<CliResourceForkMode> {
+    match s.to_ascii_lowercase().replace('-', "").as_str() {
+        "dataonly" | "data" => Some(CliResourceForkMode::DataOnly),
+        "native" => Some(CliResourceForkMode::Native),
+        "appledouble" => Some(CliResourceForkMode::Appledouble),
+        "separatersrc" | "separate" => Some(CliResourceForkMode::SeparateRsrc),
+        "macbinary" => Some(CliResourceForkMode::Macbinary),
+        _ => None,
+    }
 }

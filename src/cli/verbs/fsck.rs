@@ -31,12 +31,25 @@ pub struct FsckArgs {
     pub repair: bool,
 
     /// Seconds to wait for an interactive repair confirmation before
-    /// resolving to "No" (default 30). `0` waits indefinitely (TTY only).
-    #[arg(long = "prompt-timeout", default_value = "30")]
-    pub prompt_timeout: u64,
+    /// resolving to "No" (default 30; or `[fsck] prompt-timeout` from
+    /// the config file when set). `0` waits indefinitely (TTY only).
+    #[arg(long = "prompt-timeout")]
+    pub prompt_timeout: Option<u64>,
 }
 
 pub fn run(args: FsckArgs) -> Result<()> {
+    let _timeout = args
+        .prompt_timeout
+        .or_else(|| {
+            crate::cli::logging::loaded_config()
+                .and_then(|c| c.get("fsck", "prompt-timeout"))
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(30u64);
+    // Note: the interactive prompt is still on the roadmap; the flag is
+    // resolved here so callers / scripts get a deterministic value once
+    // it lands. The current `check_mode` / `repair_mode` paths don't
+    // prompt — they exit immediately.
     if args.repair {
         return repair_mode(&args.image);
     }

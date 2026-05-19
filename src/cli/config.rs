@@ -130,8 +130,19 @@ pub const TEMPLATE: &str = "\
 # format = chd            # chd|dvd|vhd|zstd|raw
 # checksum = sha256       # sha256|crc32
 
+[restore]
+# size = original         # original|minimum
+# alignment = original    # original|modern1mb
+
 [fsck]
 # prompt-timeout = 30     # seconds; 0 = wait indefinitely
+
+[put]
+# type = BINA             # 4-char HFS type code
+# creator = ????          # 4-char HFS creator code
+
+[optical]
+# resource-forks = appledouble  # data-only|native|appledouble|separate-rsrc|macbinary
 ";
 
 #[cfg(test)]
