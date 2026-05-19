@@ -163,6 +163,8 @@ Proposed verbs:
 | `convert`  | Re-encode between disk-image formats | Bulk Convert dialog |
 | `optical`  | CD/DVD subcommands (rip / convert / browse) | Optical tab |
 | `write`    | Image → physical device | Physical Disk Export |
+| `batch`    | Apply a JSON script of FS operations to one image | (no GUI — scripting only) |
+| `batch-template` | Generate a batch JSON from a host dir / target spec | (no GUI) |
 
 ## Partition selection: `IMG@N`
 
@@ -544,3 +546,367 @@ We are not introducing a config file in Phase A. If the flag list
 grows past comfortable, a `--config file.toml` escape hatch can be
 added later — but the flags must always work standalone for one-shot
 shell invocations.
+
+## Resolved follow-ups (2026-05-19)
+
+### Exit codes
+
+Small, git-style set. No bitmask convention — `fsck` follows the same
+table as every other verb.
+
+| Code | Meaning |
+|---|---|
+| 0   | Success |
+| 1   | Generic operation failure (I/O, parse error, `fsck --checkonly` found issues, partial backup kept on Ctrl-C) |
+| 2   | Usage / syntax error (bad flag, unknown verb) — clap default |
+| 3   | Not found (image, partition index out of range, path inside FS missing) |
+| 4   | Permission denied / needs elevation |
+| 5   | User declined a prompt, or prompt timed out to No |
+| 130 | SIGINT (Ctrl-C), shell convention 128 + signal number |
+
+Logging verbs / progress lines may include the exit-code-relevant
+summary on stderr (e.g. `fsck: 3 issues found, 0 repaired (exit 1)`)
+so wrapper scripts don't have to re-parse output.
+
+### Structured output (`--format`)
+
+Modeled on `kubectl -o …` and `gh --json`. Single flag, queries only.
+
+  - `--format text` (default) — human-readable tabular / paragraph form.
+  - `--format json` — pretty-printed JSON object. Always includes a
+    top-level `"schema_version": 1` for future-proofing.
+  - `--format yaml` — same structure as JSON, serialized to YAML.
+  - `--format csv` — flat tabular outputs only (`ls`, `show partmap`).
+    Errors out with usage-code 2 on nested-result verbs (`inspect`,
+    `show chd-info`, `show fs-info`).
+  - `--format tsv` — same scope as CSV.
+
+Applies to: `inspect`, `show partmap`, `show chd-info`, `show fs-info`,
+`ls`, `fsck` (report form). Long-running verbs (`backup`, `restore`,
+`convert`, `optical rip`, `expand`, `resize`, `write`, `batch`) stay
+plain-text + a final summary line. A future `--json-events` for
+streaming progress can be added if anyone asks; not in scope now.
+
+Be thorough: every queryable surface emits the same field set across
+all four structured formats. JSON is the canonical shape; YAML mirrors
+it; CSV/TSV is the flat projection (one row per partition / per
+directory entry / per fsck issue).
+
+Schema stability: declared stable from v1.0 onward. Pre-1.0 the
+`schema_version` field still exists but breaking changes are allowed
+between minor releases with a CHANGELOG note.
+
+### `get` / `put` semantics
+
+**Recursion.** Implicit when source is a directory — no `-r` flag.
+
+**Trailing-slash rule.** A trailing `/` on the destination means "into
+this directory" (create it if needed). No trailing slash means "to this
+exact path" (the source is renamed to the destination's basename).
+The `--help` text spells this out with examples:
+
+```
+# Extract Finder to ./Finder (file)
+rb-cli get disk.hda@2 /System/Finder ./Finder
+
+# Extract Finder into ./extracted/ as ./extracted/Finder
+rb-cli get disk.hda@2 /System/Finder ./extracted/
+
+# Recursive: extract /System into ./out/ as ./out/System/...
+rb-cli get disk.hda@2 /System ./out/
+
+# Recursive: rename root to ./mycopy/
+rb-cli get disk.hda@2 /System ./mycopy
+```
+
+The host filesystem's existing convention (rsync, cp -R) is the model.
+
+**Conflict handling.**
+
+  - Default: error and exit with code 1, leaving anything already
+    written in place.
+  - `--force` — overwrite existing entries.
+  - `--skip-existing` — leave existing entries untouched, copy the
+    rest. Good for resumable bulk puts.
+  - `--force` and `--skip-existing` are mutually exclusive.
+
+**Hidden / system files.** Many filesystems have them: HFS Finder
+invisible flag, FAT hidden+system attributes, AFFS H/S protection bits,
+NTFS hidden attribute. Extract all of them when traversing a directory
+(treat them like any other entry) and preserve the host-side attribute
+when possible. On hosts/host-filesystems that can't represent the
+attribute (e.g. FAT host extracting an HFS invisible flag), emit a
+single warning line per affected entry; the extraction itself
+succeeds.
+
+**Dates.** A `--preserve-dates` flag copies created/modified/backup
+dates from the FS to host (and host → FS on `put`). **Default off** —
+fresh writes get current date/time. Rationale: most retro workflows
+*want* the new timestamp; date-preservation is opt-in for
+archival-quality copies.
+
+**Resource forks (HFS / HFS+).** On extract, write a sidecar
+`<filename>.rsrc` next to the data fork when the resource fork is
+non-empty. Flags:
+
+  - `--no-rsrc` — skip the sidecar (data fork only).
+  - `--applesingle` — bundle data + rsrc + Finder info into a single
+    AppleSingle container.
+  - `--native-rsrc` (darwin only) — write to `<filename>/..namedfork/rsrc`
+    so the macOS host preserves it natively.
+
+On `put`, if a `<src>.rsrc` exists next to the source it's written to
+the resource fork automatically; `--rsrc PATH` overrides.
+
+**Symlinks.** Skip with a warning on both extract and ingest.
+Document in the verb help: "Symlinks inside filesystem images are not
+supported by rb-cli; use the GUI browse view or another tool."
+
+**Per-file metadata flags.** Already covered above — `--type CODE`,
+`--creator CODE` for HFS / HFS+. ProDOS uses a 1-byte file_type and a
+2-byte aux_type; same flag spellings (`--type`, `--aux`) work there.
+On filesystems where the flag is meaningless, a warning is emitted and
+the file is still written.
+
+### File globbing — to scope
+
+Globbing is a major feature in its own right and deserves its own
+design doc before coding. Open questions to settle:
+
+  1. **Where does it apply?** `get`, `rm`, `ls`, and the batch
+     generator are the obvious targets. Does `put` accept host-side
+     globs (shell does this for us) or need its own (for cross-shell
+     consistency)?
+  2. **Syntax.** Plain shell-style (`*.bin`, `**/*`) or full
+     regex-capable? POSIX glob is the safe default.
+  3. **Anchoring.** Are patterns anchored to the FS root (`/System/*`)
+     or path-relative (`Finder*` matches everywhere under cwd)? My
+     instinct: explicit `/`-anchored matches root; otherwise relative.
+  4. **Case sensitivity.** HFS is case-insensitive (HFSX optionally
+     sensitive); FAT is case-insensitive on lookup but case-preserving
+     on store. Default: match the filesystem's native rules. Flag
+     `--ignore-case` / `--case-sensitive` to override.
+  5. **`--include` / `--exclude` flags** on the batch generator
+     (definitely needed) — multiple-allowed, applied in order, last
+     match wins (rsync rules)?
+  6. **Glob expansion in batch JSON?** Probably not — globs are
+     resolved at generator time so the JSON is a deterministic list.
+  7. **Special HFS / ProDOS character ranges?** HFS allows `/` in
+     filenames (it's just displayed as `:` on classic Mac); how does
+     the glob escape that?
+
+Park this for a follow-up doc; it is **not** a Phase A blocker. The
+batch generator can ship with a minimal `--include`/`--exclude` for
+host-side patterns and grow from there.
+
+### Batch scripts (`rb-cli batch`)
+
+Single-target JSON script applied as one transaction-ish operation.
+Matches the GUI's staged-edits model: collect everything, run preflight
+checks, then apply.
+
+**Top-level shape:**
+
+```json
+{
+  "schema": "rb-cli-batch/1",
+  "target": "disk.hda@2",
+  "default_options": {
+    "force": false,
+    "creator": "MACS"
+  },
+  "operations": [
+    { "op": "mkdir", "path": "/System/Extensions" },
+    {
+      "op": "put",
+      "src": "./build/Finder",
+      "dst": "/System/Finder",
+      "type": "FNDR",
+      "creator": "MACS",
+      "rsrc": "./build/Finder.rsrc",
+      "locked": true
+    },
+    {
+      "op": "put",
+      "src": "./build/extensions/",
+      "dst": "/System/Extensions/"
+    },
+    { "op": "rm", "path": "/Trash/old.bin" },
+    { "op": "bless", "path": "/System Folder" }
+  ]
+}
+```
+
+  - **One target per script.** Loop in shell to hit multiple images.
+  - **`format` op allowed at the top of `operations`** when the target
+    doesn't exist yet — see "Whole-volume creation" below.
+  - **No mid-script `target` override.**
+  - **No variable substitution / templating.** Pipe through `jq` if you
+    want it.
+  - **JSON only.** YAML isn't a goal here because users won't be
+    hand-writing these — the generator emits them.
+
+**Preflight (matches GUI):** before any write, walk the operation list
+and check:
+
+  - All `src` paths exist on the host.
+  - All `dst` parents exist on the FS (or will be created earlier in
+    the list — preflight maintains a virtual view of the staged tree).
+  - No duplicate creations under the same parent.
+  - Projected free-space ≥ sum of file sizes (with FS overhead estimate).
+  - Type/creator/aux strings are valid 4-char (or ProDOS byte) values.
+  - Format-op preflight: target path is writable and (for `--force`)
+    overwriting is allowed.
+
+If preflight fails the script exits with code 1 and writes **nothing**.
+
+**Refactor note.** The GUI today does these preflight-style checks
+across `browse_view.rs` (free-space projection, duplicate-name check,
+type/creator validation) and the staged-edits queue. For the CLI to
+share them, we should lift the preflight logic into a model module
+(e.g. `src/model/batch_preflight.rs`) that both `browse_view` and the
+new CLI `batch` handler call. This is a real refactor but pays off
+twice. Plan the lift as part of Phase D (or whichever phase lands
+batch); don't duplicate the logic.
+
+**Apply semantics.**
+
+  - Open one `EditableFilesystem`, replay all ops in order, single
+    final `sync_metadata()` at the end. Same as `apply_staged_edits()`
+    in the GUI.
+  - Default: **stop on first error.** Whatever ran before the error
+    stays applied (one sync_metadata covers it); the report names the
+    failed op.
+  - `--continue-on-error` runs remaining ops after a failure and
+    summarizes at the end.
+  - Not transactional — no rollback on partial success. Same trade as
+    the GUI today.
+
+**Invocation:**
+
+```
+rb-cli batch script.json
+rb-cli batch script.json --dry-run            # preflight + plan, no write
+rb-cli batch script.json --target disk.hda@2  # override script's target
+rb-cli batch script.json --continue-on-error
+```
+
+### Batch generator (`rb-cli batch-template`)
+
+Scans a host directory (or an empty-volume spec) and emits a batch
+JSON script the user then edits + applies. The killer feature for
+"build a vintage volume from a host folder" workflows.
+
+**Modes:**
+
+```
+# Mirror a host dir into a fresh HFS HDD
+rb-cli batch-template ./build/ \
+    --format hfs \
+    --size 80M --block-size 4096 \
+    --name "Boot Disk" \
+    --include '*.bin' --exclude '*.tmp' \
+    > script.json
+
+# Floppy
+rb-cli batch-template ./floppy-contents/ \
+    --format hfs --size 800K --name "Disk 1" \
+    > floppy.json
+
+# Add to an existing image (no format op emitted)
+rb-cli batch-template ./additions/ \
+    --target disk.hda@2 --dst /System/ \
+    > additions.json
+```
+
+Hard-disk and floppy creation share the same generator — the only
+difference is the `--size` argument and (optionally) the geometry.
+Output script begins with a `{ "op": "format", "fs": "...", "size":
+"...", "block_size": "...", "name": "..." }` op when `--format` is
+specified.
+
+Files in the host tree become `put` ops; subdirectories become
+`mkdir` ops first, then their contents. Type/creator inference for
+HFS: by extension table (`.app` → APPL/MACS, `.txt` → TEXT/ttxt,
+etc.) or `--type-table file.json` to override. Resource forks are
+auto-detected from `.rsrc` sidecars or AppleSingle wrappers.
+
+`--include` / `--exclude` apply to the host walk (rsync-style ordering;
+last match wins). Globbing details are deferred to the file-globbing
+doc above.
+
+The generated JSON is fully self-contained — paths are absolute or
+relative-to-script-dir — so the user can review, tweak, check it into
+git, and re-run.
+
+### Whole-volume creation via `format` op
+
+Top of the `operations` array (and only there) may contain a single
+`format` op. When present, the target image is created from scratch
+before any subsequent ops run.
+
+```json
+{
+  "schema": "rb-cli-batch/1",
+  "target": "./out.hda",
+  "operations": [
+    {
+      "op": "format",
+      "fs": "hfs",
+      "size": "80M",
+      "block_size": 4096,
+      "name": "Boot Disk",
+      "partition_table": "apm"
+    },
+    { "op": "mkdir", "path": "/System Folder" },
+    { "op": "put", "src": "./System", "dst": "/System Folder/" },
+    { "op": "bless", "path": "/System Folder" }
+  ]
+}
+```
+
+Supported `fs` values for the format op follow the blank-creator
+priority list (HFS, HFS+, PFS3, SFS, FAT in Phase B; EFS / AFFS as
+they land). `partition_table` is optional; if omitted the volume is
+written raw (no PT). If present (`apm` / `mbr` / `gpt`) the generator
+emits the appropriate wrapper, and subsequent path ops implicitly
+target partition 1 unless the script's `target` says otherwise.
+
+### Ctrl-C / SIGINT behavior
+
+Per-verb behavior on first Ctrl-C:
+
+  - **`backup`** — set cancel flag, finish current sector write, prompt
+    `Keep partial backup at ./backups/mydisk? [Y/n]`. Yes ⇒ write
+    `metadata.json` with `"status": "partial"` and per-partition
+    `bytes_written`, exit 130. No ⇒ rm-rf the backup folder, exit 130.
+  - **`restore`** to a physical device — set cancel flag, stop writes,
+    prompt `Disk is in an inconsistent state. Continue anyway? [y/N]`
+    style — but inverted: this prompt is just a "what happened"
+    notification; the disk is whatever it is. Exit 130 either way.
+    User may have hit Ctrl-C because the target is bad.
+  - **`restore`** to a file — like `backup`: prompt to keep / discard
+    the partial output.
+  - **`convert`** — partial output is usually useless; default discard
+    with a `--keep-partial` flag to override.
+  - **`optical rip`** — prompt to keep partial rip. Discs are
+    sometimes intermittently readable and "what we got" has value.
+    Also expose `--skip-bad-sectors` (zero-fill unreadable sectors and
+    keep going) as a separate flag so the user can pre-decide.
+  - **`batch`** — current sub-op finishes if possible, no further ops,
+    final `sync_metadata` runs (so already-applied ops are durable),
+    exit 130.
+  - **All other verbs** — fast-exit, no prompt.
+
+A **second Ctrl-C** during the prompt = immediate hard abort, no
+discard, no metadata write. Exit 130.
+
+**Non-TTY:** keep things simple — same as TTY behavior, but the prompt
+defaults to "Keep" after a short timeout (1 second) and the choice is
+logged on stderr. Rationale: cron / ssh-without-tty users would rather
+keep partial data than lose it.
+
+**Resume support** is deferred to its own phase — partial outputs are
+written with enough state (`bytes_written` per partition) that a future
+`--resume` can read it, but no resume code ships yet. This phase can
+also feed the GUI (a "Resume previous backup" entry on the Backup tab).
