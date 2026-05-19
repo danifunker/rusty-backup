@@ -70,13 +70,15 @@ pub struct BackupArgs {
     #[arg(long)]
     pub name: Option<String>,
 
-    /// Output format.
-    #[arg(long, value_enum, default_value = "chd")]
-    pub format: BackupFormat,
+    /// Output format. Defaults to `chd`, or the `[backup] format` value
+    /// from the config file when set.
+    #[arg(long, value_enum)]
+    pub format: Option<BackupFormat>,
 
-    /// Checksum to record per file.
-    #[arg(long, value_enum, default_value = "sha256")]
-    pub checksum: ChecksumKind,
+    /// Checksum to record per file. Defaults to `sha256`, or the
+    /// `[backup] checksum` value from the config file when set.
+    #[arg(long, value_enum)]
+    pub checksum: Option<ChecksumKind>,
 
     /// Skip filesystem-aware compaction; copy every sector verbatim.
     #[arg(long = "sector-by-sector")]
@@ -102,12 +104,29 @@ pub fn run(args: BackupArgs) -> Result<()> {
         None => None,
     };
 
+    let format = args
+        .format
+        .or_else(|| {
+            crate::cli::logging::loaded_config()
+                .and_then(|c| c.get("backup", "format"))
+                .and_then(parse_format)
+        })
+        .unwrap_or(BackupFormat::Chd);
+    let checksum = args
+        .checksum
+        .or_else(|| {
+            crate::cli::logging::loaded_config()
+                .and_then(|c| c.get("backup", "checksum"))
+                .and_then(parse_checksum)
+        })
+        .unwrap_or(ChecksumKind::Sha256);
+
     let config = BackupConfig {
         source_path: args.source,
         destination_dir: args.dest,
         backup_name: name,
-        compression: args.format.into(),
-        checksum: args.checksum.into(),
+        compression: format.into(),
+        checksum: checksum.into(),
         split_size_mib: args.split_size_mib,
         sector_by_sector: args.sector_by_sector,
         partition_filter,
@@ -139,6 +158,25 @@ fn default_name(source: &std::path::Path) -> String {
         .unwrap_or("backup");
     let date = chrono::Local::now().format("%Y%m%d-%H%M%S");
     format!("{stem}-{date}")
+}
+
+fn parse_format(s: &str) -> Option<BackupFormat> {
+    match s.to_ascii_lowercase().as_str() {
+        "chd" => Some(BackupFormat::Chd),
+        "dvd" => Some(BackupFormat::Dvd),
+        "vhd" => Some(BackupFormat::Vhd),
+        "zstd" => Some(BackupFormat::Zstd),
+        "raw" => Some(BackupFormat::Raw),
+        _ => None,
+    }
+}
+
+fn parse_checksum(s: &str) -> Option<ChecksumKind> {
+    match s.to_ascii_lowercase().as_str() {
+        "sha256" => Some(ChecksumKind::Sha256),
+        "crc32" => Some(ChecksumKind::Crc32),
+        _ => None,
+    }
 }
 
 fn parse_indices(s: &str) -> Result<Vec<usize>> {

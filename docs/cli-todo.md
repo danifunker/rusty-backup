@@ -20,12 +20,12 @@ it in the binary yet?"
 | **D** Batch + resize/expand cluster | **2 of 3 shipped** | `6a59121` — `rb-cli batch SCRIPT.json` with mkdir/put/rm ops, `--dry-run`, `--continue-on-error`. `batch-template` (this slice) — add-to-existing-image mode (host dir → mkdir/put script, builtin extension→type/creator table, include/exclude globs). **Deferred**: `resize`, `expand` (non-SGI filesystems), whole-volume `format` op + multi-partition `disk` block (gated on FAT/EFS/AFFS blank creators from Phase B). |
 | **E** Optical | **pending** | `optical rip / convert / browse / extract` — needs `opticaldiscs`/`cd-da-reader` plumbing wired to a new verb tree. |
 | **F** Interactive `terminal` REPL | **pending** | `rustyline`/`reedline` REPL on top of the one-shot verbs. |
-| **G** Config file | **shipped** | `15ce270` — INI loader, XDG-aware `default_path()`, `rb-cli config {init,path,show}`. Per-verb flag resolution (CLI > config > default) not yet threaded into every verb; the loader is in place and `config init` writes the template. |
+| **G** Config file | **shipped** | `15ce270` — INI loader, XDG-aware `default_path()`, `rb-cli config {init,path,show}`. Per-verb flag resolution (CLI > config > default) wired for: `[defaults] log-level / progress / color` (globals applied in `logging::install`); `[backup] format / checksum`. New `--config PATH` global flag overrides the default location. Remaining per-verb keys (e.g. `[fsck] prompt-timeout`) will be threaded as the underlying flag becomes load-bearing. |
 | **H** Documentation | **3 of 5 shipped** | `4cca5dd` — auto-generated `docs/cli-reference.md` (via `cargo run --example generate_cli_reference`), hand-written `docs/cli-examples.md` cookbook-lite, README rewrite. Manpage gen example shipped in Phase A. **Deferred**: `docs/cli-cookbook.md` (longform), Windows HTML help. |
 
 ### Cross-cutting items still pending
 
-- **Per-verb config-file wiring** — Phase G carry-over.
+- **Per-verb config-file wiring (long tail)** — Phase G carry-over. First slice (globals + backup format/checksum) shipped; remaining keys land as their underlying flags become load-bearing.
 - **FAT/EFS/AFFS blank creators** — Phase B carry-over; gates new --fs.
 - **Resume support for partial backups/restores** — explicitly deferred in the doc; the partial-metadata side already lands with backup's metadata.json `"status": "partial"` field.
 - **Device-write safety** — shipped in `src/cli/device_safety.rs`. System-disk refusal (`--write-to-system-disk` opts back in), mounted-target refusal, mount-point vs device-path disambiguation. Used by `restore --device` and `write`.

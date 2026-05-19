@@ -83,40 +83,53 @@ pub enum ColorMode {
 }
 
 /// Global flags shared across every verb. Parsed via clap at the root.
+///
+/// Most fields are `Option<T>` rather than carrying a clap default
+/// directly — this lets [`install`] fall back to the config file's
+/// `[defaults]` section when the user didn't pass the flag. CLI > config
+/// > built-in default.
 #[derive(Debug, Clone, clap::Args)]
 pub struct GlobalFlags {
     /// Diagnostic verbosity for stderr logs.
-    #[arg(long, value_enum, default_value_t = LogLevel::Warn, global = true)]
-    pub log_level: LogLevel,
+    /// Falls back to `[defaults] log-level` from the config; built-in default `warn`.
+    #[arg(long, value_enum, global = true)]
+    pub log_level: Option<LogLevel>,
 
     /// Suppress all stderr output except errors and the final result.
     /// Mutually exclusive with `--log-level debug|trace`.
     #[arg(long, short = 'q', global = true, conflicts_with = "log_level")]
     pub quiet: bool,
 
-    /// Progress bar behavior. `auto` is the default; `never` is the
+    /// Progress bar behavior. Built-in default `auto`; `never` is the
     /// safest setting inside CI / cron / wrapper scripts.
-    #[arg(long, value_enum, default_value_t = ProgressMode::Auto, global = true)]
-    pub progress: ProgressMode,
+    #[arg(long, value_enum, global = true)]
+    pub progress: Option<ProgressMode>,
 
     /// ANSI color usage. Honors the `NO_COLOR` env var when set.
-    #[arg(long, value_enum, default_value_t = ColorMode::Auto, global = true)]
-    pub color: ColorMode,
+    /// Built-in default `auto`.
+    #[arg(long, value_enum, global = true)]
+    pub color: Option<ColorMode>,
 
     /// Mirror full trace-level log output to PATH regardless of
     /// `--log-level`. Useful on Windows cmd where redirection is awkward.
     #[arg(long, global = true)]
     pub log_file: Option<std::path::PathBuf>,
+
+    /// Path to a config file. Overrides the platform default location.
+    /// See `rb-cli config path` for what that location is.
+    #[arg(long, global = true)]
+    pub config: Option<std::path::PathBuf>,
 }
 
 impl Default for GlobalFlags {
     fn default() -> Self {
         Self {
-            log_level: LogLevel::default(),
+            log_level: None,
             quiet: false,
-            progress: ProgressMode::default(),
-            color: ColorMode::default(),
+            progress: None,
+            color: None,
             log_file: None,
+            config: None,
         }
     }
 }
@@ -135,20 +148,70 @@ pub struct EffectiveLogging {
 
 static EFFECTIVE: OnceLock<EffectiveLogging> = OnceLock::new();
 
+static LOADED_CONFIG: OnceLock<crate::cli::config::Config> = OnceLock::new();
+
+/// Return the config loaded at startup by [`install`]. Empty `Config` if
+/// no file existed; `None` only if `install` hasn't been called yet
+/// (shouldn't happen outside of unit tests).
+pub fn loaded_config() -> Option<&'static crate::cli::config::Config> {
+    LOADED_CONFIG.get()
+}
+
 /// Install the global logging configuration. Idempotent; the first
 /// caller wins. Initializes `env_logger` as a side effect.
 pub fn install(flags: &GlobalFlags) -> Result<&'static EffectiveLogging> {
+    // Load the config file (explicit --config wins, else platform default).
+    // Missing file is fine — yields an empty Config.
+    let config_path = flags
+        .config
+        .clone()
+        .or_else(crate::cli::config::default_path);
+    if let Some(path) = config_path {
+        let cfg = crate::cli::config::Config::load(&path)?;
+        let _ = LOADED_CONFIG.set(cfg);
+    } else {
+        let _ = LOADED_CONFIG.set(crate::cli::config::Config::default());
+    }
+
     let stderr_is_tty = std::io::stderr().is_terminal();
     let stdout_is_tty = std::io::stdout().is_terminal();
     let no_color_env = std::env::var_os("NO_COLOR").is_some();
 
-    let progress_enabled = match flags.progress {
+    let config_resolved_log_level = flags
+        .log_level
+        .or_else(|| {
+            LOADED_CONFIG
+                .get()
+                .and_then(|c| c.get("defaults", "log-level"))
+                .and_then(parse_log_level)
+        })
+        .unwrap_or_default();
+    let config_resolved_progress = flags
+        .progress
+        .or_else(|| {
+            LOADED_CONFIG
+                .get()
+                .and_then(|c| c.get("defaults", "progress"))
+                .and_then(parse_progress)
+        })
+        .unwrap_or_default();
+    let config_resolved_color = flags
+        .color
+        .or_else(|| {
+            LOADED_CONFIG
+                .get()
+                .and_then(|c| c.get("defaults", "color"))
+                .and_then(parse_color)
+        })
+        .unwrap_or_default();
+
+    let progress_enabled = match config_resolved_progress {
         ProgressMode::Always => true,
         ProgressMode::Never => false,
         ProgressMode::Auto => stderr_is_tty,
     } && !flags.quiet;
 
-    let color_enabled = match flags.color {
+    let color_enabled = match config_resolved_color {
         ColorMode::Always => true,
         ColorMode::Never => false,
         ColorMode::Auto => !no_color_env && (stderr_is_tty || stdout_is_tty),
@@ -157,7 +220,7 @@ pub fn install(flags: &GlobalFlags) -> Result<&'static EffectiveLogging> {
     let log_level = if flags.quiet {
         LogLevel::Error
     } else {
-        flags.log_level
+        config_resolved_log_level
     };
 
     let mut builder = env_logger::Builder::new();
@@ -201,6 +264,35 @@ pub fn install(flags: &GlobalFlags) -> Result<&'static EffectiveLogging> {
 /// Return the effective configuration if `install` has been called.
 pub fn effective() -> Option<&'static EffectiveLogging> {
     EFFECTIVE.get()
+}
+
+fn parse_log_level(s: &str) -> Option<LogLevel> {
+    match s.to_ascii_lowercase().as_str() {
+        "error" => Some(LogLevel::Error),
+        "warn" => Some(LogLevel::Warn),
+        "info" => Some(LogLevel::Info),
+        "debug" => Some(LogLevel::Debug),
+        "trace" => Some(LogLevel::Trace),
+        _ => None,
+    }
+}
+
+fn parse_progress(s: &str) -> Option<ProgressMode> {
+    match s.to_ascii_lowercase().as_str() {
+        "auto" => Some(ProgressMode::Auto),
+        "always" => Some(ProgressMode::Always),
+        "never" => Some(ProgressMode::Never),
+        _ => None,
+    }
+}
+
+fn parse_color(s: &str) -> Option<ColorMode> {
+    match s.to_ascii_lowercase().as_str() {
+        "auto" => Some(ColorMode::Auto),
+        "always" => Some(ColorMode::Always),
+        "never" => Some(ColorMode::Never),
+        _ => None,
+    }
 }
 
 /// Write a user-facing message to stdout (the "results" stream). Use this
@@ -254,10 +346,11 @@ mod tests {
     #[test]
     fn defaults() {
         let g = GlobalFlags::default();
-        assert_eq!(g.log_level, LogLevel::Warn);
+        assert_eq!(g.log_level, None);
         assert!(!g.quiet);
-        assert_eq!(g.progress, ProgressMode::Auto);
-        assert_eq!(g.color, ColorMode::Auto);
+        assert_eq!(g.progress, None);
+        assert_eq!(g.color, None);
         assert!(g.log_file.is_none());
+        assert!(g.config.is_none());
     }
 }

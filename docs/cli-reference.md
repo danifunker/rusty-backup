@@ -12,11 +12,12 @@ Usage: rb-cli [OPTIONS] <COMMAND>
 
 **Options**
 
-- `--log-level` — Diagnostic verbosity for stderr logs
+- `--log-level` — Diagnostic verbosity for stderr logs. Falls back to `[defaults] log-level` from the config; built-in default `warn`
 - `-q` / `--quiet` — Suppress all stderr output except errors and the final result. Mutually exclusive with `--log-level debug|trace`
-- `--progress` — Progress bar behavior. `auto` is the default; `never` is the safest setting inside CI / cron / wrapper scripts
-- `--color` — ANSI color usage. Honors the `NO_COLOR` env var when set
+- `--progress` — Progress bar behavior. Built-in default `auto`; `never` is the safest setting inside CI / cron / wrapper scripts
+- `--color` — ANSI color usage. Honors the `NO_COLOR` env var when set. Built-in default `auto`
 - `--log-file` — Mirror full trace-level log output to PATH regardless of `--log-level`. Useful on Windows cmd where redirection is awkward
+- `--config` — Path to a config file. Overrides the platform default location. See `rb-cli config path` for what that location is
 
 ## Verbs
 
@@ -250,8 +251,8 @@ Usage: backup [OPTIONS] <SOURCE> <DEST>
 **Options**
 
 - `--name` — Backup name (the subdirectory under `DEST`). Defaults to the source file's stem with a date suffix
-- `--format` — Output format
-- `--checksum` — Checksum to record per file
+- `--format` — Output format. Defaults to `chd`, or the `[backup] format` value from the config file when set
+- `--checksum` — Checksum to record per file. Defaults to `sha256`, or the `[backup] checksum` value from the config file when set
 - `--sector-by-sector` — Skip filesystem-aware compaction; copy every sector verbatim
 - `--partitions` — Per-partition filter — comma-separated 1-based indices to include (e.g. `1,3,4`). Default is "all partitions"
 - `--split-size` — Split each output stream after this many MiB (Zstd / Raw only)
