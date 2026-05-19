@@ -126,6 +126,8 @@ All OS-specific code lives in `src/os/`:
 ## Development Guidelines
 
 - Separate business logic from GUI code; core modules should be independently testable.
+- **GUI / CLI feature parity.** When adding a user-facing feature, consider whether it belongs in the CLI (`rb-cli`, formerly `rusty-backup-cli`) as well. The CLI mirrors the GUI's scriptable surface — backup, restore, inspect, browse-view editing, optical, resize/expand, etc. Rule of thumb: if it's a one-shot operation a user might want to script, it should land in both. The CLI grammar and phasing live in `docs/cli-todo.md`; consult it before adding a new verb or flag so naming stays consistent. Interactive-only dialogs (Settings, elevation prompts, free-form review modals) stay GUI-only — those are explicitly out of scope for the CLI.
+- **Shared business logic between GUI and CLI.** When implementing a feature, put the logic in a core module (e.g. `src/backup/`, `src/fs/`, `src/model/`) and have both `src/gui/` and `src/cli.rs` call into it. Don't reimplement the same operation twice. Preflight checks (free-space projection, duplicate-name detection, type/creator validation) especially need lifting into shared modules — see the `src/model/batch_preflight.rs` plan in `cli-todo.md`.
 - Use streaming I/O with large blocks (64KB-1MB chunks) for disk operations; never load entire partitions into RAM.
 - Disk I/O must be sector-aligned (512 bytes or 4KB).
 - Disable UI controls during active operations to prevent conflicts.

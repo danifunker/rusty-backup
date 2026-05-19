@@ -149,14 +149,14 @@ Proposed verbs:
 | `backup`   | Disk → backup folder/archive | Backup tab |
 | `restore`  | Backup → disk/image | Restore tab |
 | `inspect`  | Aggregate read-only view: PT + filesystems + CHD info | Inspect tab |
-| `show`     | Focused read-only sub-queries (`partmap`, `chd-info`, `fs-info`) | Inspect tab subsets |
+| `show`     | Focused read-only sub-queries (`partmap`, `chd-info`, `fs-info`, `devices`) | Inspect tab subsets |
 | `ls`       | List files in a directory inside a filesystem | Browse view |
 | `get`      | Extract file/dir from a filesystem | Browse view |
 | `put`      | Copy host file into a filesystem (with `--boot` for HFS boot blocks) | Browse view |
 | `mkdir`    | Create directory inside a filesystem | Browse view |
 | `rm`       | Delete file/dir from a filesystem | Browse view |
 | `fsck`     | Check filesystem; `--repair` / `--checkonly` modes | Inspect tab Check / Repair |
-| `new`      | Format a blank filesystem image | (no GUI yet) |
+| `new`      | Format a blank single-partition image (superfloppy / PT-wrapped) | (no GUI yet) |
 | `resize`   | Change partition / filesystem sizes | Resize popup |
 | `expand`   | HFS expand (clone to new block size) | Expand HFS dialog |
 | `shrink`   | Re-encode CHD dropping trailing zeros | (SGI today) |
@@ -402,7 +402,10 @@ Implementation notes (deferred to its own phase):
 
   1. **Phase A — add flat verbs alongside `api`.** Keep `api` working
      as a deprecated alias; new verbs share the same handler code, so
-     there's no duplication. Drop `api` in a future release.
+     there's no duplication. Drop `api` in a future release. Also
+     lands the cross-cutting infrastructure (`IMG@N` parser,
+     `--format` structured output, logging flags, exit-code table,
+     handler-per-verb pattern, `install-completions`).
      - `api hfs new`      → `new --fs hfs`
      - `api hfs info`     → `show fs-info` (and rolled into `inspect`)
      - `api hfs ls`       → `ls`
@@ -418,15 +421,19 @@ Implementation notes (deferred to its own phase):
   2. **Phase B — generalize the FS verbs.** `ls/put/get/rm/mkdir/fsck`
      auto-detect filesystem inside `IMG@N`. Wire FAT, HFS+, NTFS,
      exFAT, AFFS, PFS3, SFS, EFS via the existing
-     `open_filesystem` / `open_editable_filesystem` dispatch.
+     `open_filesystem` / `open_editable_filesystem` dispatch. Globbing
+     for `get` / `rm` / `ls` ships here.
 
   3. **Phase C — add the big-ticket verbs.** `backup`, `restore`,
      `inspect` (full), `write`, `convert`. These reuse existing GUI
      orchestration modules; the CLI is a thin headless front-end.
+     Device-write safety checks (system-disk refuse, mounted refuse,
+     safety summary, `show devices`) land here.
 
-  4. **Phase D — the resize/expand cluster.** `resize`, `expand`,
-     `shrink` for other filesystems. Lower priority — interactive
-     review is genuinely useful here.
+  4. **Phase D — batch + resize/expand cluster.** `batch`,
+     `batch-template`, `resize`, `expand`, `shrink` for other
+     filesystems. Includes the preflight-logic lift into
+     `src/model/batch_preflight.rs`.
 
   5. **Phase E — optical.** `optical rip / convert / browse / extract`.
      Often easiest with the GUI but worth scripting for bulk rips.
@@ -438,6 +445,14 @@ Implementation notes (deferred to its own phase):
   7. **Phase G — config file.** `rbcli.conf` plus `rb-cli config init`.
      Wait until the flag set has settled across at least one release
      so we're not renaming config keys every commit.
+
+  8. **Phase H — full documentation deliverables.** README rewrite,
+     `cli-reference.md` regenerator, `cli-examples.md` with
+     CI-tested fenced blocks, `cli-cookbook.md`, Windows HTML help.
+     Manpage + `--help` text + shell completions are produced as we
+     go (Phase A onward), but the polished end-user-facing docs land
+     after the verb set is stable so we're not constantly rewriting
+     them.
 
 ## Decisions locked in (2026-05-18)
 
@@ -506,6 +521,78 @@ Priority for new blank creators, in order:
 These don't block CLI Phase A; they slot into Phase B (filesystem
 generalization). `new --fs hfs|hfsplus|pfs3|sfs` ships in Phase A,
 others gated on the creator landing.
+
+### `new` verb scope — single-partition only; multi-partition via `batch`
+
+`new` is the simple path: one filesystem, one image file. Three
+shapes covered:
+
+```
+# Superfloppy / raw — filesystem at byte 0, no partition table
+rb-cli new floppy.dsk --fs hfs --size 800K --name "MyDisk"
+rb-cli new card.img  --fs fat --size 64M  --name "DOS"
+
+# Partition-table-wrapped single partition (APM / MBR / GPT)
+rb-cli new disk.hda --fs hfs    --size 80M --name "Boot" --pt apm
+rb-cli new disk.img --fs fat    --size 32M --name "DOS"  --pt mbr
+rb-cli new disk.img --fs hfsplus --size 2G --name "OSX"  --pt gpt
+```
+
+  - **No PT** (default): output is a raw filesystem (superfloppy).
+    Matches today's `api hfs new` behavior.
+  - **`--pt apm|mbr|gpt`**: wraps a single partition of the requested
+    FS in the chosen partition table. APM additionally auto-attaches
+    the known-good `Apple_Driver43` blob unless `--no-driver` is
+    passed (same machinery as `emit_apm_disk_with_hfs`).
+  - **No multi-partition support in `new`**. The flag surface stays
+    flat — one `--fs`, one `--size`, one `--name`. Trying to express
+    multiple partitions with comma-separated flags would be cryptic
+    and a footgun (which size goes with which fs?).
+
+**Multi-partition images go through `batch`**, where the top-of-script
+`format` op (already specified) handles whole-disk layouts. Each
+partition gets its own format op, with its own fs / size / name. The
+batch script becomes the readable, reviewable description of a
+multi-partition disk:
+
+```json
+{
+  "schema": "rb-cli-batch/1",
+  "target": "./multi.hda",
+  "operations": [
+    {
+      "op": "format",
+      "disk": {
+        "partition_table": "mbr",
+        "size": "256M"
+      },
+      "partitions": [
+        { "fs": "fat",  "size": "16M",  "name": "DOS",  "type": "0x06" },
+        { "fs": "fat",  "size": "64M",  "name": "DATA", "type": "0x0b" },
+        { "fs": "hfs",  "size": "176M", "name": "MAC",  "type": "0xaf" }
+      ]
+    },
+    { "op": "put", "src": "./dos-files/",   "dst": "@1:/", "recursive": true },
+    { "op": "put", "src": "./data-files/",  "dst": "@2:/", "recursive": true },
+    { "op": "put", "src": "./mac-system/",  "dst": "@3:/System Folder/" }
+  ]
+}
+```
+
+This requires extending the format-op schema (added a `disk` block
+with PT spec + a `partitions` array; the existing single-fs format-op
+shape stays valid for `new`-equivalent batches) and the path syntax
+inside batch ops to accept `@N:` partition prefixes for the
+just-created partitions. Both are batch-internal — the one-shot `new`
+verb is unaffected.
+
+**Sizes for multi-partition `format` ops** must add up to ≤ the disk
+size; preflight rejects over-allocation. If partition sizes leave a
+gap, the gap is zero-filled. If sizes are omitted, the last partition
+gets all remaining space (one omission max).
+
+`new` itself does not gain a `--partitions` flag — keeps the simple
+verb simple, sends complex cases through batch.
 
 ### `backup` flag surface — non-interactive only
 
@@ -658,9 +745,18 @@ non-empty. Flags:
 On `put`, if a `<src>.rsrc` exists next to the source it's written to
 the resource fork automatically; `--rsrc PATH` overrides.
 
-**Symlinks.** Skip with a warning on both extract and ingest.
-Document in the verb help: "Symlinks inside filesystem images are not
-supported by rb-cli; use the GUI browse view or another tool."
+**Symlinks.**
+
+  - **On `get` (extract)**: follow the link by default — write the
+    actual linked content as a plain file on the host. Flag
+    `--dont-follow-symlinks` skips symlinks entirely (no host file
+    written, warning emitted).
+  - **On `put` (ingest)**: prompt per symlink — *"`./foo` is a symlink
+    to `./bar`. Include the linked file? [y/N]"*. Flag
+    `--follow-symlinks` skips the prompt and silently follows them.
+    In batch mode the prompt is replaced by an op-level
+    `"follow_symlinks": true|false` (default false → skip with
+    warning); preflight surfaces the count.
 
 **Per-file metadata flags.** Already covered above — `--type CODE`,
 `--creator CODE` for HFS / HFS+. ProDOS uses a 1-byte file_type and a
@@ -668,36 +764,14 @@ supported by rb-cli; use the GUI browse view or another tool."
 On filesystems where the flag is meaningless, a warning is emitted and
 the file is still written.
 
-### File globbing — to scope
+### File globbing
 
-Globbing is a major feature in its own right and deserves its own
-design doc before coding. Open questions to settle:
-
-  1. **Where does it apply?** `get`, `rm`, `ls`, and the batch
-     generator are the obvious targets. Does `put` accept host-side
-     globs (shell does this for us) or need its own (for cross-shell
-     consistency)?
-  2. **Syntax.** Plain shell-style (`*.bin`, `**/*`) or full
-     regex-capable? POSIX glob is the safe default.
-  3. **Anchoring.** Are patterns anchored to the FS root (`/System/*`)
-     or path-relative (`Finder*` matches everywhere under cwd)? My
-     instinct: explicit `/`-anchored matches root; otherwise relative.
-  4. **Case sensitivity.** HFS is case-insensitive (HFSX optionally
-     sensitive); FAT is case-insensitive on lookup but case-preserving
-     on store. Default: match the filesystem's native rules. Flag
-     `--ignore-case` / `--case-sensitive` to override.
-  5. **`--include` / `--exclude` flags** on the batch generator
-     (definitely needed) — multiple-allowed, applied in order, last
-     match wins (rsync rules)?
-  6. **Glob expansion in batch JSON?** Probably not — globs are
-     resolved at generator time so the JSON is a deterministic list.
-  7. **Special HFS / ProDOS character ranges?** HFS allows `/` in
-     filenames (it's just displayed as `:` on classic Mac); how does
-     the glob escape that?
-
-Park this for a follow-up doc; it is **not** a Phase A blocker. The
-batch generator can ship with a minimal `--include`/`--exclude` for
-host-side patterns and grow from there.
+Fully specified in the "Globbing details" section below — bash-syntax
+baseline with `**` and `{a,b}` brace expansion, `--keep-relative-paths`
+flag, `/`-anchored to FS root, native case-sensitivity per filesystem,
+exclude-wins precedence on `--include`/`--exclude`, deterministic
+auto-rename on collisions, preflight-only resolution, no glob
+expansion in batch JSON. See that section for full details.
 
 ### Batch scripts (`rb-cli batch`)
 
@@ -874,39 +948,553 @@ target partition 1 unless the script's `target` says otherwise.
 
 ### Ctrl-C / SIGINT behavior
 
-Per-verb behavior on first Ctrl-C:
+Only verbs whose partial output has salvage value prompt; everything
+else exits 130 with a stderr message.
 
-  - **`backup`** — set cancel flag, finish current sector write, prompt
-    `Keep partial backup at ./backups/mydisk? [Y/n]`. Yes ⇒ write
-    `metadata.json` with `"status": "partial"` and per-partition
-    `bytes_written`, exit 130. No ⇒ rm-rf the backup folder, exit 130.
-  - **`restore`** to a physical device — set cancel flag, stop writes,
-    prompt `Disk is in an inconsistent state. Continue anyway? [y/N]`
-    style — but inverted: this prompt is just a "what happened"
-    notification; the disk is whatever it is. Exit 130 either way.
-    User may have hit Ctrl-C because the target is bad.
-  - **`restore`** to a file — like `backup`: prompt to keep / discard
-    the partial output.
-  - **`convert`** — partial output is usually useless; default discard
-    with a `--keep-partial` flag to override.
-  - **`optical rip`** — prompt to keep partial rip. Discs are
-    sometimes intermittently readable and "what we got" has value.
-    Also expose `--skip-bad-sectors` (zero-fill unreadable sectors and
-    keep going) as a separate flag so the user can pre-decide.
-  - **`batch`** — current sub-op finishes if possible, no further ops,
-    final `sync_metadata` runs (so already-applied ops are durable),
-    exit 130.
-  - **All other verbs** — fast-exit, no prompt.
+| Verb | First Ctrl-C |
+|---|---|
+| `backup` | Prompt: keep partial backup folder (with `metadata.json` `"status": "partial"` + per-partition `bytes_written`) or discard. |
+| `restore` → file | Prompt: keep or discard the partial image. |
+| `restore` → device | No prompt. Stop writes, exit 130, stderr: "target device is in an unknown state." |
+| `optical rip` | Prompt: keep partial rip. Dying discs may give you nothing on retry. Also see `--skip-bad-sectors` (zero-fill unreadable sectors, no abort). |
+| `convert` | No prompt. Partial output discarded. `--keep-partial` opts in. |
+| `expand` / `resize` / `shrink` | No prompt. Discard partial output (half-finished restructure corrupts the volume). |
+| `write` → device | No prompt. Exit 130, stderr: "target device is in an unknown state." |
+| `fsck --repair` | No prompt. Exit 130, stderr: "filesystem may be partially repaired; re-run fsck before relying on it." |
+| `batch` | No prompt. Current sub-op finishes if safe, final `sync_metadata` runs so already-applied ops are durable, exit 130. |
+| `get` / `put` / `ls` / `mkdir` / `rm` / queries | Fast exit, no prompt. |
 
 A **second Ctrl-C** during the prompt = immediate hard abort, no
 discard, no metadata write. Exit 130.
 
-**Non-TTY:** keep things simple — same as TTY behavior, but the prompt
-defaults to "Keep" after a short timeout (1 second) and the choice is
-logged on stderr. Rationale: cron / ssh-without-tty users would rather
-keep partial data than lose it.
+**Non-TTY:** prompt resolves to "Keep" after a 1-second timeout, logged
+on stderr. Cron / ssh-without-tty users would rather keep partial data
+than lose it.
 
 **Resume support** is deferred to its own phase — partial outputs are
 written with enough state (`bytes_written` per partition) that a future
 `--resume` can read it, but no resume code ships yet. This phase can
 also feed the GUI (a "Resume previous backup" entry on the Backup tab).
+
+## Resolved follow-ups (2026-05-19, round 2)
+
+### Logging / verbosity flags
+
+| Flag | Values | Default | Notes |
+|---|---|---|---|
+| `--log-level` | `error` / `warn` / `info` / `debug` / `trace` | `warn` | Per-file progress at `info`. No `-v`/`-vv` chains; pick the named level. |
+| `--quiet` / `-q` | — | off | Suppress everything on stderr except errors + the final result line. Mutually exclusive with `--log-level debug` / `trace`. |
+| `--progress` | `auto` / `always` / `never` | `auto` | TTY auto-detect with explicit override both ways (some terminals misreport; `--progress always` forces it on). |
+| `--color` | `auto` / `always` / `never` | `auto` | Honors `NO_COLOR` env. Auto disables when stdout isn't a TTY. |
+| `--log-file PATH` | path | unset | Mirror full trace-level log to disk regardless of `--log-level`. Useful on Windows cmd where redirection (`2>`) is awkward. |
+
+**Stream split (strict).** Results go to **stdout**, logs/progress to
+**stderr**. Always — even with `--quiet`, even with `--format json`.
+This means `rb-cli ls disk@2 / | grep Finder` works regardless of
+verbosity. The split is implemented behind a single `output()` /
+`log()` helper pair so it stays refactorable if we ever loosen it.
+
+**Errors in structured-output mode.** With `--format json|yaml|csv|tsv`,
+errors on stdout follow the same schema. The JSON/YAML shape gains
+three top-level fields:
+
+```json
+{
+  "schema_version": 1,
+  "status": {
+    "error": true,
+    "code": 3,
+    "message": "Partition 2 not found in disk.hda"
+  },
+  "result": null
+}
+```
+
+`error: false` populates `result`; `error: true` sets `result: null`
+(or partial result, depending on verb) and fills `code` + `message`.
+CSV / TSV can't represent the shape — on error they emit nothing on
+stdout and the error goes to stderr in plain text. Warnings (non-fatal)
+*always* go to stderr in plain text regardless of output format —
+keeping the structured-output schema clean.
+
+### Globbing details
+
+**Where globs apply.**
+
+  - **Read-side verbs** (`get`, `rm`, `ls`): accept globs directly.
+  - **Batch generator**: `--include` / `--exclude` patterns.
+  - **`put` (non-batch)**: when the source matches multiple host files
+    (globbed by the shell) or when `--glob` is passed, the CLI builds
+    an **implicit batch** in memory, runs preflight, then applies as
+    one atomic-ish operation. Same code path as `rb-cli batch`,
+    just without the JSON intermediate. Means a single `put` of 100
+    files still gets ONE `sync_metadata` and ONE preflight pass.
+
+**Syntax.** Bash-equivalent baseline:
+
+  - `*` — any sequence of chars except `/`
+  - `?` — any single char
+  - `[abc]` / `[a-z]` / `[!abc]` — character classes
+  - `**` — recursive (globstar); matches across `/` boundaries
+  - `{a,b,c}` — brace expansion (also bash-standard)
+  - Quoting / escaping with `\`
+
+`*/something*` works under this — `*` matches one path segment, so
+`/System/*/Prefs*` matches one level deep. For "everywhere under" use
+`/**/Prefs*` or `**/Prefs*`.
+
+**`--keep-relative-paths`** flag for ingest-side globs: when copying
+matches into the image, preserve the matched directory hierarchy
+relative to the glob's anchor. Without it, all matches flatten into
+the destination directory (with auto-rename on collision — see
+below). With it, `./build/**/*.bin` → `/Apps/**/*.bin` recreates the
+subdirs.
+
+**Anchoring.**
+
+  - Leading `/` in an FS-side glob = anchored to filesystem root.
+  - No leading `/` = relative to a verb-supplied base (for one-shot
+    verbs that's the dst dir; for `terminal` it's the current cwd).
+  - Host-side paths use the host OS's native separator: `C:\Users\…`
+    on Windows, `/Users/…` on macOS / Linux. The CLI does not
+    translate; it passes through to the host filesystem APIs.
+
+**Case sensitivity.** Default matches the *filesystem being globbed*:
+HFS / HFS+ / FAT / NTFS = insensitive; HFSX / ext / btrfs = sensitive.
+Flags `--ignore-case` / `--case-sensitive` override.
+
+**Cross-FS case handling.** Insensitive-source → sensitive-target
+extract preserves on-disk casing as-is (no possible collision —
+source only had one name). Sensitive-source → insensitive-target
+ingest is the collision direction — handled by the
+deterministic auto-rename rule (see "Cross-FS case + Unicode
+collisions on ingest" below). Same policy covers Unicode NFD vs NFC
+collisions on HFS+.
+
+**`--include` / `--exclude` precedence.** Exclude ALWAYS wins, no
+matter the flag order (NTFS-deny-style, not rsync-style). Implement
+as: build the full include match-set, subtract the exclude match-set.
+Single deny defeats any number of allows. The matcher should be a
+self-contained module so we can swap to rsync-style precedence later
+if it turns out to be needed.
+
+**Filename sanitization** (auto-rename on conflict / illegal chars):
+
+  - **Illegal-char substitution.** Characters not allowed by the target
+    filesystem are replaced with `_`. Per-FS rules table built into
+    the binary (FAT: no `\/:*?"<>|`; HFS: no `:`; NTFS: no `\/:*?"<>|`
+    plus reserved names; ProDOS: no `:`, ASCII letters/digits/period/
+    dot only). Warn once per renamed entry.
+  - **Length truncation.** When the source name exceeds the target's
+    max length (HFS 31 bytes, HFS+ 255 UTF-16 code units, FAT-LFN 255,
+    FAT-SFN 8.3, ProDOS 15), truncate to fit. On filesystems with a
+    structural extension (FAT, ProDOS) keep the extension and truncate
+    the stem; on HFS / HFS+ (no structural extension) truncate from
+    the tail.
+  - **Deduplication.** If after sanitization two entries collide,
+    append ` (2)`, ` (3)`, … until unique. Warn per dedupe.
+  - **Preflight enforcement.** Batch / implicit-batch preflight runs
+    the sanitizer in dry-run, surfaces every rename, and **fails the
+    whole batch if any explicit user-specified dst path would be
+    silently renamed**. The user has to either fix the script or pass
+    `--allow-rename` to acknowledge.
+
+### Resource-fork emit format default
+
+`--applesingle` and `--no-rsrc` flags stay. The default emit format
+becomes platform-dependent and configurable:
+
+  - **macOS / Linux** host default: **AppleDouble** (`._<filename>`
+    sidecar + data fork). macOS reads this natively from non-HFS+
+    volumes.
+  - **Windows** host default: **AppleSingle v2** (`<filename>.as`).
+    Single file is friendlier on a host without sidecar conventions.
+  - Config / flag override: `--rsrc-format applesingle|appledouble|macbinary|sidecar`.
+    (`sidecar` is the simple `<filename>.rsrc` form, our current
+    behavior.)
+
+On ingest, **all four formats are auto-detected** from extension +
+magic bytes. MacBinary II / III recognized but emitted only when
+`--rsrc-format macbinary` is explicit (it's a less common roundtrip).
+
+### Type / creator / Amiga-attribute tables
+
+Tables already exist in the GUI:
+
+  - `assets/hfs_file_types.json` — HFS type/creator → text/binary
+    classification.
+  - (HFS+ shares the same table.)
+  - ProDOS — table exists in `src/fs/prodos.rs` (file_type byte +
+    aux_type mappings).
+
+Plan: extract these into `src/fs/file_type_tables/` (or similar
+module), `include_str!`'d into the binary so both GUI and CLI link
+against the same source of truth. The CLI's batch generator inference
+and `put --type` validation use the same lookup helpers. No separate
+CLI tables, no separate maintenance.
+
+**Amiga**: the GUI doesn't currently surface a type table for AFFS /
+PFS3 / SFS — Amiga files don't carry 4cc types, only the protection
+bits + comment (already on `FileEntry` as `amiga_protection` /
+`amiga_comment`). The CLI mirrors that — no type/creator flags for
+Amiga filesystems, but `put --amiga-protection HSPARWED` /
+`--amiga-comment "…"` for setting those fields. If at some point we
+want amitools-style extension-to-protection inference, that table
+slots into the same module.
+
+### Dates — epoch and clamping rules
+
+Each filesystem has its own time range; the CLI accepts ISO 8601
+input and clamps + warns when out of range:
+
+| FS | Epoch | On-disk width | Range | Notes |
+|---|---|---|---|---|
+| HFS / HFS+ | 1904-01-01 | u32 seconds | 1904-01-01 .. 2040-02-06 | "Y2040" rollover; no patch in classic Mac OS — disk just shows 1904 again. |
+| FAT (DOS) | 1980-01-01 | packed 16-bit date + 16-bit time | 1980-01-01 .. 2107-12-31 | 2-second resolution. |
+| NTFS | 1601-01-01 | u64 100ns ticks | 1601 .. 30828 | Effectively unlimited for us. |
+| exFAT | 1980-01-01 | packed (like FAT) + 10ms tenths | 1980 .. 2107 | |
+| ext2/3/4 | 1970-01-01 | i32 / i64 seconds | varies | We only read these. |
+| ProDOS | 1940-01-01 (with quirk) | packed | 1940 .. 2039 | Two-digit year field; 00-39 = 2000-2039, 40-99 = 1940-1999. |
+| AFFS / PFS3 / SFS | 1978-01-01 | u32 seconds | 1978 .. ~2114 | |
+| EFS | 1970-01-01 | i32 seconds | 1970 .. 2038 | IRIX. |
+
+**Floor.** No date prior to **1904-01-01** is accepted as input
+anywhere — that's the earliest of any supported FS's epoch, and none
+of these filesystems existed before that anyway. Earlier inputs are
+rejected with usage error 2.
+
+**Per-FS clamping.** When a date is valid in ISO 8601 but out of the
+target FS's range (e.g. 2050 on HFS+, or 1975 on FAT), clamp to the
+boundary and emit a warning: `"date 2050-01-01 out of range for HFS+
+(max 2040-02-06); using 2040-02-06"`. No "Y2040 patch" exists in
+classic Mac OS — the on-disk value just wraps. We don't try to
+emulate any third-party patch.
+
+**No special HFS-Y2K handling.** Classic Mac OS didn't have a Y2K bug
+in the way DOS did; HFS dates are seconds-since-1904, not packed
+years. The 2040 rollover is the real concern, and it's just clamping.
+
+### Pre-1970 inputs
+
+Same as above — accepted down to each FS's epoch (HFS 1904, ext 1970,
+etc.). The CLI doesn't reject pre-1970 dates as a category; only
+pre-1904 globally and per-FS clamping handles the rest.
+
+### Batch script — minor decisions
+
+  - **`created_by` field** added at top level by the generator:
+    `"created_by": "rb-cli batch-template ./build/ --format hfs --size 80M"`.
+    Forensic / reproducibility metadata; ignored on apply.
+  - **`format` op partition_table = `apm`** auto-includes a known-good
+    `Apple_Driver43` partition (sourced from
+    `src/fs/hfs_clone::emit_apm_disk_with_hfs`'s machinery).
+    `"no_driver": true` on the format op disables it for users who
+    want a bare APM. Future SCSI drivers slot in via a `driver:` field
+    naming the variant.
+
+### Device-write safety (restore / write)
+
+When `restore` or `write` targets a block device, the following
+checks apply *in addition to* the existing `--yes` requirement:
+
+  - **System disk refused.** If the target is the OS boot device,
+    hard-error unless `--write-to-system-disk` is passed. Detection
+    per OS:
+    - Linux: device backing `/`.
+    - macOS: device backing `/`.
+    - Windows: drive containing the Windows directory (typically `C:`).
+  - **Mounted targets refused.** If any partition on the target device
+    is currently mounted, refuse with a message naming the mount and
+    instructing the user to unmount and retry. No auto-unmount — the
+    CLI does not unilaterally tear down a live filesystem. (The GUI
+    does this through the OS-mediated unmount flow; that lives in the
+    Optical / Backup tabs only.)
+  - **Mount points are not device paths.** `/Volumes/Foo`, `C:\Users\…`,
+    `/mnt/backup`, etc. are treated as plain file paths. Writing to
+    them creates / overwrites a file inside the mounted filesystem —
+    no device semantics, no partition-table access, no safety prompts
+    beyond the file-conflict rules. Users who want to overwrite a
+    device must pass a real device path:
+    - Linux: `/dev/sdX` or `/dev/nvmeXnY`.
+    - macOS: `/dev/diskN` (kernel-cached) or `/dev/rdiskN` (raw, faster
+      — what the GUI uses after auth). CLI accepts both, defaults to
+      `rdisk` semantics internally for performance.
+    - Windows: `\\.\PhysicalDriveN`. Shown quoted in `--help`
+      (`"\\.\PhysicalDrive2"`) so PowerShell users can copy-paste;
+      cmd accepts it unquoted too.
+  - **Safety summary printed to stderr before writing.** Device path,
+    size (human + bytes), model/serial when queryable, current
+    partition-table summary (one line: "MBR with 4 partitions:
+    0x07/0x83/0x82/0x07"), mount status. `--yes` skips the
+    confirmation prompt but *never* the summary.
+
+**Device-listing companion.** `rb-cli show devices` enumerates block
+devices on the host, sharing the same `src/os/` enumerators used by
+the GUI's source picker. Columns: path, size, model, serial,
+removable, mount status, partition-table type if detectable.
+Honors `--format text|json|yaml|csv|tsv`.
+
+```
+rb-cli show devices
+rb-cli show devices --format json
+rb-cli show devices --removable-only
+```
+
+### Cross-FS case + Unicode collisions on ingest
+
+Sensitive-source → insensitive-target ingest is the only direction
+that can produce filename collisions. HFS+'s NFD-vs-NFC normalization
+folds names the same way (`café` NFC and `cafe´` NFD collapse on
+HFS+). Both are treated as one phenomenon — "two source names that
+fold to the same target name."
+
+**Policy.**
+
+  - **Auto-rename with numeric suffix.** First match by deterministic
+    source order (sort by source path), subsequent matches get
+    ` (2)`, ` (3)`, … Same suffix rule as the filename-sanitization
+    section.
+  - **Warn per renamed entry**, listing source → target name.
+  - **Detected in preflight only** (batch / implicit-batch). No
+    mid-stream surprises.
+  - **Re-uses the existing `--allow-rename` gate.** Explicit-dst-path
+    case/normalization collisions still need `--allow-rename` to
+    proceed (consistent with the illegal-char rule). No separate
+    flag.
+  - **HFSX is case-sensitive**; the policy doesn't fire there. The FS
+    variant is detected from the volume header before applying.
+
+### Documentation outputs
+
+Multi-format docs, generated from one source of truth wherever
+possible. The clap argument definitions are the canonical grammar;
+`clap_mangen` and a small markdown-rendering helper produce the rest.
+
+| Output | Format | Audience | Generation |
+|---|---|---|---|
+| **`--help` (built-in)** | terminal text | every user, every platform | clap |
+| **Manpage** (`rb-cli.1`) | groff, viewed via `man rb-cli` | Unix users (Linux, macOS) | `clap_mangen` at build time; installed via package recipes (.deb, Homebrew formula, etc.) |
+| **README.md** | GitHub-flavored Markdown | first-time visitors browsing the repo | hand-written intro + tables of contents; links to the deeper docs below |
+| **Windows HTML help** | rendered Markdown shipped as `docs/cli/rb-cli.html` in the installer (and on the website) | Windows users — there is no native manpage equivalent | rendered from the same Markdown reference via `pandoc` or `comrak` |
+| **Shell completions** | bash / zsh / fish / PowerShell scripts | power users on every platform | `clap_complete` at build time; shipped in installer packages |
+| **`docs/cli-reference.md`** | Markdown — full verb-by-verb reference | online reading on GitHub / website | generated from clap definition (custom small renderer) |
+| **`docs/cli-examples.md`** | Markdown — recipe / cookbook style | scripting users hunting for a working snippet | hand-written; tested via integration tests so examples don't bit-rot |
+| **`docs/cli-cookbook.md`** | Markdown — common use cases organized by goal ("Back up a vintage SD card", "Build an HFS floppy from a host folder", "Repair a corrupted catalog") | new users, blog-post-style | hand-written |
+
+**What goes in which doc:**
+
+  - **Manpage** = the formal reference. Synopsis, every flag, exit
+    codes, environment variables, files, see-also. Section 1 (user
+    commands). Concise — terse Unix style. Companion manpages for
+    sub-grammars if needed (`rb-cli-batch.5` for the batch-script
+    JSON schema, `rb-cli-rbcli.conf.5` for the config file when it
+    lands).
+  - **README** = elevator pitch + install instructions + a *few*
+    common one-liners + links to the deeper docs. Stays short.
+  - **Windows HTML help** = the manpage content + the
+    examples/cookbook, rendered to a single browsable HTML page.
+    Optionally `.chm` if there's user demand, but plain HTML covers
+    99% of cases and is easier to ship.
+  - **`cli-reference.md`** = the complete verb list with every flag
+    and its semantics. The "I know there's a flag for this; what is
+    it called?" doc.
+  - **`cli-examples.md`** = standalone, runnable snippets. Each
+    example is self-contained: setup, command, expected output.
+    Integration tests in `tests/cli_examples_test.rs` parse the
+    Markdown, run each fenced bash block against a fixture image,
+    and assert success. Stale examples fail CI.
+  - **`cli-cookbook.md`** = problem-oriented. "I want to X" → walks
+    through `inspect` + `backup` + `fsck` for a real-world flow.
+    Longer prose; not auto-tested.
+
+**Runtime helpers.** Beyond the documents:
+
+  - `rb-cli help` — lists every verb with one-line summary.
+  - `rb-cli help <verb>` — clap-generated long help (same as
+    `rb-cli <verb> --help`).
+  - `rb-cli examples` — prints `cli-examples.md` content paged via
+    `$PAGER` (or `less` / `more` fallback). Useful offline or on
+    minimal Windows boxes.
+  - `rb-cli examples <verb>` — filters to just that verb's recipes.
+
+**Single source of truth.** The clap definitions are canonical. The
+manpage, HTML help, and `cli-reference.md` are *all* regenerated from
+them in CI; a script in `xtask/` (or `scripts/`) does the work and
+the build fails if the checked-in versions drift. Hand-written docs
+(README, examples, cookbook) live alongside but are reviewed
+manually — they're not regenerable from clap.
+
+**Phasing.**
+
+  - **Phase A** ships `--help`, the manpage, and a stub README.
+  - **Phase B-C** add `cli-reference.md` and `cli-examples.md` as the
+    verb set fills out.
+  - **Phase C-D** add the Windows HTML help and the cookbook.
+  - Shell completions can ship in Phase A — they're nearly free from
+    `clap_complete`.
+
+### Shell-completion install flow
+
+Two paths: a runtime auto-installer (preferred for most users) and a
+manual install for power users / packagers.
+
+**Runtime auto-installer:**
+
+```
+rb-cli install-completions               # detect shell, install to default location
+rb-cli install-completions --shell zsh   # force a shell
+rb-cli install-completions --prefix PATH # override install root
+rb-cli install-completions --print       # emit script to stdout, don't write
+rb-cli install-completions --uninstall   # remove what we installed
+```
+
+  - Detects shell from `$SHELL` (Unix) or `$PSModulePath` presence
+    (Windows / PowerShell).
+  - Writes the static `clap_complete`-generated script to the
+    canonical user-scoped path so no `sudo` is needed:
+    - **bash**: `~/.local/share/bash-completion/completions/rb-cli`
+      (XDG) or `$BASH_COMPLETION_USER_DIR/completions/rb-cli` if set.
+    - **zsh**: `~/.zsh/completions/_rb-cli`, prepending to `fpath` via
+      a one-line addition to `~/.zshrc` (idempotent — checks first).
+    - **fish**: `~/.config/fish/completions/rb-cli.fish`.
+    - **PowerShell**: appends `. $PROFILE.d/rb-cli-completions.ps1`
+      to `$PROFILE` (creates a sourcing stub once, then writes the
+      completion script to the stub's path so re-runs only update one
+      file).
+  - Prints a one-line "completions installed to PATH; restart your
+    shell to activate" message on success.
+  - On every release the user re-runs `rb-cli install-completions`
+    to refresh — the auto-installer overwrites idempotently.
+
+**Manual install** (for packagers, sysadmins, locked-down systems):
+shipped as plain text alongside the binary:
+
+```
+rb-cli completions bash > /usr/local/etc/bash_completion.d/rb-cli
+rb-cli completions zsh  > /usr/local/share/zsh/site-functions/_rb-cli
+rb-cli completions fish > ~/.config/fish/completions/rb-cli.fish
+rb-cli completions powershell | Out-File $PROFILE -Append
+```
+
+`rb-cli completions <shell>` is the lower-level command;
+`install-completions` is a convenience wrapper around it plus the
+detection + write logic.
+
+**Auto-update for macOS .app / AppImage / Homebrew users.** These
+distribution formats place the binary at a stable path (.app inside
+`/Applications`, AppImage at user-chosen path, Homebrew at
+`$(brew --prefix)/bin/rb-cli`). The completions reference the
+installed binary by its absolute path internally for the few flags
+that need dynamic lookup, so they don't need updating between minor
+versions. For major-version upgrades that add new verbs, the
+auto-installer flag in package post-install scripts re-runs it:
+
+  - **Homebrew**: formula's `post_install` block calls
+    `rb-cli install-completions --quiet` so brew upgrades refresh
+    completions automatically.
+  - **AppImage**: the bundled `apprun` wrapper checks completion
+    freshness on each launch and re-runs the installer if the binary
+    version > installed-completion version (cheap version-stamp
+    comparison; runs in <50 ms).
+  - **macOS .app**: a launch-time check inside the binary stamps a
+    version file in `~/Library/Application Support/rb-cli/`; if the
+    stamp is behind the binary version, prompt-once on first CLI
+    invocation: *"Completions are out of date. Update now? [Y/n]"*.
+  - **.deb / .rpm**: package post-install hook calls the installer
+    system-wide (to `/usr/share/bash-completion/completions/` etc.).
+    No per-user step needed.
+
+The user-facing instruction in README / docs is one line: *"Run
+`rb-cli install-completions` once after install. Most package
+managers do this for you."*
+
+### PowerPC Mac (OS X Tiger / Leopard) — deferred entirely
+
+PPC support is fully out of scope for this CLI plan. The
+hand-translated C port at `ppc-tiger/` and the external
+[rust-ppc-tiger](https://github.com/Scottcjn/rust-ppc-tiger)
+toolchain effort continue as a separate, parallel project with its
+own planning doc to be written later. The notes below are background
+only; they do not constrain anything in Phases A–H.
+
+**Why a direct cross-compile doesn't work today:**
+
+  - **No upstream Rust target for PPC Darwin.** `powerpc-apple-darwin`
+    was dropped from rustc long ago. The `rust-ppc-tiger` project is a
+    custom Rust-to-PowerPC compiler (writes assembly via a hand-rolled
+    backend), not a stock rustc target. Latest milestone: 45 crates
+    compiling on a real G4 — impressive, but a fraction of our
+    dependency graph.
+  - **Our dependency surface is huge for that compiler to chew
+    through:** `clap` (proc-macro-heavy), `serde` + `serde_json`,
+    `zstd` (C lib), `chd` (C lib via FFI), `crc32fast`, `sha2`,
+    `nix`, `windows` (Windows-only — N/A), `chrono`, `anyhow`,
+    `thiserror`, `tempfile`, `rustyline` (for `terminal`), `tracing` /
+    `tracing-subscriber`, etc. Each crate that fails to compile is a
+    blocker for the verbs that need it.
+  - **Endianness audit needed.** PPC is big-endian. The code is
+    *mostly* correct (uses `u16::from_le_bytes` etc. for FAT/NTFS/exFAT/MBR/GPT,
+    and `from_be_bytes` for HFS/Amiga), but raw `transmute` /
+    `bytemuck::cast` paths exist and need a careful sweep.
+  - **C library deps (`zstd`, `chd`) need to build on GCC 4.0.1 / 4.2.1**
+    (Tiger / Leopard system compilers). zstd has reportedly compiled
+    on older PPC GCC with patching; `libchdman-rs` definitely
+    requires modern toolchain features.
+  - **AltiVec / SIMD intrinsics in some crates** (`crc32fast`, `sha2`)
+    have scalar fallbacks but the compiler needs to actually pick them
+    on PPC. Verifying takes work.
+  - **Modern Rust language features** (async, GATs, edition 2021/2024)
+    are required by transitive deps — `rust-ppc-tiger` handles edition
+    2021 syntax but coverage of async / generics edge cases is still
+    growing.
+
+**What the existing ppc-tiger port does instead.** Hand-translated C
+reimplementation of the *core* backup engine. As of this writing, it
+supports: MBR/APM/Superfloppy partition tables, FAT12/16/32 compaction,
+gzip compression, CRC32/SHA-1 checksums, basic backup / restore /
+inspect / list-devices / rip — five verbs total. None of the extended
+features we're designing here (HFS catalog editing, batch JSON,
+expand-volume, fsck/repair, structured output, optical CHD rip, etc.)
+are in scope for the C port without significant additional work.
+
+**Practical plan for PPC support:**
+
+  1. **Keep flag names compatible.** Where the C port and the Rust CLI
+     overlap (`backup`, `restore`, `inspect`, optical), use the *same*
+     verb names and flag spellings. Users who learn one know the
+     other; muscle memory transfers. The C port is the constrained
+     subset; the Rust CLI is the superset.
+  2. **Document the subset.** The PPC port's `README.md` already lists
+     its verb table. Mirror that into the main docs as a *"PPC Tiger
+     compatibility matrix"* — which extended-CLI verbs work, which
+     don't, and which are reduced-feature.
+  3. **Track the rust-ppc-tiger effort.** When it grows enough crate
+     coverage to compile our actual dependency graph, revisit a real
+     Rust cross-build. Watch the [Scottcjn/rust-ppc-tiger](https://github.com/Scottcjn/rust-ppc-tiger)
+     release notes; check in quarterly.
+  4. **Manual PPC builds, manually distributed.** You already build on
+     your own G4. Until rust-ppc-tiger handles the dep graph, manual
+     builds of the C port + a wiki page documenting them is the
+     correct cadence. Wire a CI matrix entry only when an
+     auto-build is feasible.
+  5. **Reuse format compatibility.** Backups produced by the Rust CLI
+     should be readable by the C port (and vice versa) for the subset
+     of features both implement. `metadata.json` format already
+     matches per the PPC README. Anything new we add to the metadata
+     schema gets an "optional" flag so old readers ignore it
+     gracefully — schema versioning we already specified covers this.
+
+**Not in CLI-todo phasing.** PPC effort lives in its own future
+planning doc; the main CLI continues full-speed without PPC
+constraints. The C port stays its own thing, updated separately when
+core engine logic changes.
+
+### Deferred
+
+  - **Partition-scoped device restore.** Writing to a single partition
+    on a live disk (e.g. `/dev/disk3s2`) without touching the rest of
+    the device. Useful for refreshing one partition from a backup on a
+    multi-partition target. Defer until after the disk-level `restore`
+    / `write` lands — needs careful semantics around mount checks
+    (refuse if THAT partition is mounted, allow if siblings are) and
+    safety summary scoping.
