@@ -8,10 +8,14 @@
  *   - inspect         Display backup metadata
  *
  * Features:
- *   - Partition table support: MBR (with EBR chain), APM, Superfloppy
- *   - Compression: raw or gzip (via zlib, ships with Tiger)
- *   - Checksums: CRC32 (via zlib) and SHA-1 (via CommonCrypto)
+ *   - Partition tables: MBR (with EBR chain), APM, GPT, SGI volume header,
+ *     superfloppy (no table; FS sits at offset 0)
+ *   - Filesystem probing/detection: FAT12/16/32, exFAT, HFS, HFS+, HFSX,
+ *     ext2/3/4, ProDOS, AFFS, SGI EFS, Linux swap
+ *   - Image wrappers (auto-stripped): DC42 (DiskCopy 4.2), 2MG (2IMG)
  *   - FAT compaction: only backs up allocated clusters (FAT12/16/32)
+ *   - Output formats: raw, gzip (via zlib, ships with Tiger), VHD
+ *   - Checksums: CRC32 (via zlib) and SHA-256 (via CommonCrypto)
  *
  * Compiled: gcc -std=c99 -O2 -c rust_cli_real.c
  * Link with: -lz (for gzip + CRC32)
@@ -7453,8 +7457,14 @@ int main(int argc, char **argv) {
         return 0;
     } else if (strcmp(cmd, "--version") == 0 || strcmp(cmd, "-V") == 0) {
         printf("rusty-backup 0.3.0-ppc\n");
-        printf("Platform: Mac OS X Tiger PowerPC\n");
-        printf("Features: MBR, APM, EBR chain, gzip, CRC32, SHA-256, FAT compaction\n");
+        printf("Platform:    Mac OS X Tiger PowerPC\n");
+        printf("Part tables: MBR (+EBR chain), APM, GPT, SGI volume header\n");
+        printf("Filesystems: FAT12/16/32, exFAT, HFS, HFS+/HFSX,\n");
+        printf("             ext2/3/4, ProDOS, AFFS, SGI EFS, Linux swap\n");
+        printf("Compaction:  FAT12/16/32 (skip free clusters)\n");
+        printf("Wrappers:    DC42, 2MG (auto-detected)\n");
+        printf("Output:      raw, gzip, VHD\n");
+        printf("Checksums:   CRC32, SHA-256\n");
         return 0;
     } else {
         fprintf(stderr, "Unknown subcommand: %s\n", cmd);
