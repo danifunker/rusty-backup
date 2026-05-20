@@ -776,6 +776,15 @@ static int detect_partition_table(int fd, PartTable *pt) {
         return 0;
     }
 
+    /* Check superfloppy: exFAT VBR ("EXFAT   " magic at offset 3). Must
+     * precede the FAT check (exFAT's BPB region is zeroed, so is_fat_vbr
+     * rejects it, but keep the order explicit). */
+    if (memcmp(&sector[3], "EXFAT   ", 8) == 0) {
+        pt->type = PT_NONE;
+        strcpy(pt->fs_hint, "exFAT");
+        return 0;
+    }
+
     /* Check superfloppy: FAT VBR at sector 0 */
     if (is_fat_vbr(sector)) {
         pt->type = PT_NONE;
@@ -810,6 +819,14 @@ static int detect_partition_table(int fd, PartTable *pt) {
         pt->type = PT_NONE;
         uint16_t hsig = read_be16(&sector[1024]);
         strcpy(pt->fs_hint, hsig == 0x4244 ? "HFS" : "HFS+");
+        return 0;
+    }
+
+    /* Check superfloppy: ext2/3/4 superblock magic 0xEF53 at offset
+     * 0x38 of the superblock, 1024 bytes into the image. */
+    if (nr >= 2048 && read_le16(&sector[1024 + 0x38]) == 0xEF53) {
+        pt->type = PT_NONE;
+        strcpy(pt->fs_hint, "ext");
         return 0;
     }
 
@@ -3367,7 +3384,9 @@ typedef enum {
     FS_HFS_PLUS,
     FS_ISO9660,
     FS_PRODOS,
-    FS_AFFS
+    FS_AFFS,
+    FS_EXT2,
+    FS_EXFAT
 } BrowseFsType;
 
 /* Forward declarations for the per-FS browse functions defined
@@ -3436,7 +3455,9 @@ static int resolve_image_ref(const char *spec, int *fd_out,
     uint8_t probe[2048];
     if (lseek(fd, off, SEEK_SET) >= 0
         && read(fd, probe, 2048) >= 2048) {
-        if (is_fat_vbr(probe)) {
+        if (memcmp(&probe[3], "EXFAT   ", 8) == 0) {
+            ft = FS_EXFAT;
+        } else if (is_fat_vbr(probe)) {
             ft = FS_FAT;
         } else if (is_hfs_sig(&probe[1024])) {
             uint16_t sig = read_be16(&probe[1024]);
@@ -3446,6 +3467,11 @@ static int resolve_image_ref(const char *spec, int *fd_out,
         if (ft == FS_UNKNOWN && probe[0] == 'D' && probe[1] == 'O'
             && probe[2] == 'S' && probe[3] <= 7) {
             ft = FS_AFFS;
+        }
+        /* ext2/3/4: superblock magic 0xEF53 at offset 0x38 of the
+         * superblock, which lives 1024 bytes into the partition. */
+        if (ft == FS_UNKNOWN && read_le16(&probe[1024 + 0x38]) == 0xEF53) {
+            ft = FS_EXT2;
         }
         /* ProDOS: read block 2 (offset 1024); entry 0's high nibble
          * == 0xF marks the volume directory header. Require the
@@ -5647,6 +5673,715 @@ static int fs_get_iso9660(int fd, off_t fs_off, const char *path,
 }
 
 /* ============================================================
+ * ext2 / ext3 / ext4 Reader (read-only browse: ls / get)
+ * ----------------------------------------------------------------
+ * Parses the superblock (magic 0xEF53 at fs_off+1024), block-group
+ * descriptors, inodes, and directory blocks. Supports the classic
+ * 12 direct + single/double/triple indirect block map (ext2/3) and
+ * ext4 extent trees (per-inode EXTENTS_FL / fs INCOMPAT_EXTENTS).
+ *
+ * All ext on-disk integers are little-endian; on PPC (big-endian)
+ * read_le16/32 byteswap for us. Hashed directories (htree) are walked
+ * linearly - the hash is only an index hint, the leaf blocks are still
+ * ordinary linear directory blocks.
+ *
+ * Limitations: symlinks are listed but not followed; ext4 inline-data
+ * (INLINE_DATA) directories/files are not decoded; logical sparse gaps
+ * inside an extent-mapped file are not reconstructed (vintage ext2
+ * images use the indirect map, which we sparse-fill correctly).
+ * ============================================================ */
+
+#define EXT_SUPERBLOCK_OFF    1024
+#define EXT_MAGIC             0xEF53
+#define EXT_ROOT_INO          2
+#define EXT4_EXTENTS_FL       0x00080000u
+#define EXT4_EXT_MAGIC        0xF30A
+#define EXT_INCOMPAT_EXTENTS  0x0040
+#define EXT_INCOMPAT_64BIT    0x0080
+#define EXT_S_IFMT            0xF000
+#define EXT_S_IFDIR           0x4000
+#define EXT_S_IFREG           0x8000
+
+typedef struct {
+    int       fd;
+    off_t     fs_off;
+    uint64_t  block_size;
+    uint32_t  inodes_per_group;
+    uint16_t  inode_size;
+    uint32_t  group_count;
+    uint32_t  first_data_block;
+    uint16_t  desc_size;
+    int       is_64bit;
+    int       has_extents;
+    uint8_t  *gdt;
+    uint32_t  gdt_len;
+} Ext2Vol;
+
+typedef struct {
+    uint32_t mode;
+    uint64_t size;
+    uint32_t flags;
+    uint8_t  block[60];
+} Ext2Inode;
+
+static int ext2_open(int fd, off_t fs_off, Ext2Vol *v) {
+    memset(v, 0, sizeof(*v));
+    uint8_t sb[1024];
+    if (lseek(fd, fs_off + EXT_SUPERBLOCK_OFF, SEEK_SET) < 0) return -1;
+    if (read(fd, sb, 1024) != 1024) return -1;
+    if (read_le16(&sb[0x38]) != EXT_MAGIC) return -1;
+
+    uint32_t log_block_size   = read_le32(&sb[0x18]);
+    uint32_t blocks_per_group = read_le32(&sb[0x20]);
+    uint32_t inodes_count     = read_le32(&sb[0x00]);
+    uint32_t feat_incompat    = read_le32(&sb[0x60]);
+    v->first_data_block       = read_le32(&sb[0x14]);
+    v->inodes_per_group       = read_le32(&sb[0x28]);
+    v->inode_size             = read_le16(&sb[0x58]);
+    if (v->inode_size < 128) v->inode_size = 128;   /* ext2 rev 0 */
+
+    v->block_size = (uint64_t)1024 << log_block_size;
+    if (v->block_size < 1024 || v->block_size > 65536) return -1;
+    if (blocks_per_group == 0 || v->inodes_per_group == 0) return -1;
+
+    v->has_extents = (feat_incompat & EXT_INCOMPAT_EXTENTS) != 0;
+    v->is_64bit    = (feat_incompat & EXT_INCOMPAT_64BIT) != 0;
+
+    uint64_t total_blocks = read_le32(&sb[0x04]);
+    if (v->is_64bit) total_blocks |= (uint64_t)read_le32(&sb[0x150]) << 32;
+    if (total_blocks <= v->first_data_block) return -1;
+
+    v->desc_size = 32;
+    if (v->is_64bit) {
+        uint16_t ds = read_le16(&sb[0xFE]);
+        v->desc_size = (ds >= 64) ? ds : 64;
+    }
+
+    v->group_count = (uint32_t)((total_blocks - v->first_data_block
+                                 + blocks_per_group - 1) / blocks_per_group);
+    if (v->group_count == 0 || inodes_count == 0) return -1;
+
+    uint64_t sb_block  = (v->block_size == 1024) ? 1 : 0;
+    uint64_t gdt_block = sb_block + 1;
+    v->gdt_len = v->group_count * v->desc_size;
+    v->gdt = (uint8_t *)malloc(v->gdt_len);
+    if (!v->gdt) return -1;
+    if (lseek(fd, fs_off + (off_t)(gdt_block * v->block_size), SEEK_SET) < 0
+        || read(fd, v->gdt, v->gdt_len) != (ssize_t)v->gdt_len) {
+        free(v->gdt); v->gdt = NULL; return -1;
+    }
+    v->fd = fd;
+    v->fs_off = fs_off;
+    return 0;
+}
+
+static void ext2_close(Ext2Vol *v) {
+    if (v->gdt) { free(v->gdt); v->gdt = NULL; }
+}
+
+static uint64_t ext2_inode_table(const Ext2Vol *v, uint32_t group) {
+    const uint8_t *d = &v->gdt[group * v->desc_size];
+    uint64_t it = read_le32(&d[0x08]);
+    if (v->is_64bit && v->desc_size >= 64)
+        it |= (uint64_t)read_le32(&d[0x28]) << 32;
+    return it;
+}
+
+static int ext2_read_block(const Ext2Vol *v, uint64_t block_num, uint8_t *buf) {
+    off_t off = v->fs_off + (off_t)(block_num * v->block_size);
+    if (lseek(v->fd, off, SEEK_SET) < 0) return -1;
+    if (read(v->fd, buf, v->block_size) != (ssize_t)v->block_size) return -1;
+    return 0;
+}
+
+static int ext2_read_inode(const Ext2Vol *v, uint32_t inode_num, Ext2Inode *out) {
+    if (inode_num == 0) return -1;
+    uint32_t group = (inode_num - 1) / v->inodes_per_group;
+    uint32_t index = (inode_num - 1) % v->inodes_per_group;
+    if (group >= v->group_count) return -1;
+    uint64_t it = ext2_inode_table(v, group);
+    off_t off = v->fs_off + (off_t)(it * v->block_size)
+              + (off_t)index * v->inode_size;
+    uint8_t buf[256];
+    uint16_t want = (v->inode_size < 256) ? v->inode_size : 256;
+    if (lseek(v->fd, off, SEEK_SET) < 0) return -1;
+    if (read(v->fd, buf, want) != (ssize_t)want) return -1;
+    out->mode  = read_le16(&buf[0x00]);
+    out->flags = read_le32(&buf[0x20]);
+    uint64_t size_lo = read_le32(&buf[0x04]);
+    uint64_t size_hi = read_le32(&buf[0x6C]);   /* size_high (regular files) */
+    int is_reg = (out->mode & EXT_S_IFMT) == EXT_S_IFREG;
+    out->size  = is_reg ? ((size_hi << 32) | size_lo) : size_lo;
+    memcpy(out->block, &buf[0x28], 60);
+    return 0;
+}
+
+/* Growable list of physical block numbers (0 = sparse hole). Capped at
+ * `needed` entries (= ceil(size/block_size)) so a sparse triple-indirect
+ * tree can't blow up memory. */
+typedef struct {
+    uint64_t *blocks;
+    uint32_t  count;
+    uint32_t  cap;
+    uint32_t  needed;
+    int       error;
+} Ext2BlockList;
+
+static void ext2_bl_push(Ext2BlockList *bl, uint64_t b) {
+    if (bl->error || bl->count >= bl->needed) return;
+    if (bl->count == bl->cap) {
+        uint32_t nc = bl->cap ? bl->cap * 2 : 64;
+        uint64_t *nb = (uint64_t *)realloc(bl->blocks, nc * sizeof(uint64_t));
+        if (!nb) { bl->error = 1; return; }
+        bl->blocks = nb; bl->cap = nc;
+    }
+    bl->blocks[bl->count++] = b;
+}
+
+static void ext2_walk_indirect(const Ext2Vol *v, uint64_t block_num,
+                               int level, Ext2BlockList *bl) {
+    if (bl->error || bl->count >= bl->needed) return;
+    uint32_t ppb = (uint32_t)(v->block_size / 4);
+    if (block_num == 0) {
+        uint64_t span = 1;
+        for (int i = 0; i < level; i++) span *= ppb;
+        for (uint64_t i = 0; i < span && bl->count < bl->needed; i++)
+            ext2_bl_push(bl, 0);
+        return;
+    }
+    uint8_t *buf = (uint8_t *)malloc(v->block_size);
+    if (!buf) { bl->error = 1; return; }
+    if (ext2_read_block(v, block_num, buf) != 0) { free(buf); bl->error = 1; return; }
+    for (uint32_t i = 0; i < ppb && !bl->error && bl->count < bl->needed; i++) {
+        uint64_t entry = read_le32(&buf[i * 4]);
+        if (level == 1) ext2_bl_push(bl, entry);
+        else ext2_walk_indirect(v, entry, level - 1, bl);
+    }
+    free(buf);
+}
+
+static void ext2_walk_extents(const Ext2Vol *v, const uint8_t *node,
+                              Ext2BlockList *bl) {
+    if (bl->error) return;
+    if (read_le16(&node[0]) != EXT4_EXT_MAGIC) { bl->error = 1; return; }
+    uint16_t entries = read_le16(&node[2]);
+    uint16_t depth   = read_le16(&node[6]);
+    if (depth == 0) {
+        for (uint16_t i = 0; i < entries && !bl->error; i++) {
+            const uint8_t *e = &node[12 + i * 12];
+            uint16_t len = read_le16(&e[4]);
+            uint64_t start = read_le32(&e[8]) | ((uint64_t)read_le16(&e[6]) << 32);
+            if (len > 32768) len -= 32768;   /* uninitialized extent */
+            for (uint16_t j = 0; j < len && bl->count < bl->needed; j++)
+                ext2_bl_push(bl, start + j);
+        }
+    } else {
+        for (uint16_t i = 0; i < entries && !bl->error; i++) {
+            const uint8_t *e = &node[12 + i * 12];
+            uint64_t child = read_le32(&e[4]) | ((uint64_t)read_le16(&e[8]) << 32);
+            uint8_t *cb = (uint8_t *)malloc(v->block_size);
+            if (!cb) { bl->error = 1; return; }
+            if (ext2_read_block(v, child, cb) != 0) { free(cb); bl->error = 1; return; }
+            ext2_walk_extents(v, cb, bl);
+            free(cb);
+        }
+    }
+}
+
+static int ext2_block_list(const Ext2Vol *v, const Ext2Inode *in,
+                           Ext2BlockList *bl) {
+    memset(bl, 0, sizeof(*bl));
+    uint64_t needed64 = (in->size + v->block_size - 1) / v->block_size;
+    bl->needed = (needed64 > 0xFFFFFFFFULL) ? 0xFFFFFFFFu : (uint32_t)needed64;
+    if (bl->needed == 0) return 0;
+    if ((in->flags & EXT4_EXTENTS_FL)
+        || (v->has_extents && read_le16(&in->block[0]) == EXT4_EXT_MAGIC)) {
+        ext2_walk_extents(v, in->block, bl);
+    } else {
+        for (int i = 0; i < 12 && bl->count < bl->needed; i++)
+            ext2_bl_push(bl, read_le32(&in->block[i * 4]));
+        ext2_walk_indirect(v, read_le32(&in->block[48]), 1, bl);
+        ext2_walk_indirect(v, read_le32(&in->block[52]), 2, bl);
+        ext2_walk_indirect(v, read_le32(&in->block[56]), 3, bl);
+    }
+    if (bl->error) { free(bl->blocks); bl->blocks = NULL; return -1; }
+    return 0;
+}
+
+typedef int (*Ext2DirCb)(uint32_t inode, const char *name, uint8_t ftype,
+                         void *user);
+
+static int ext2_walk_dir(const Ext2Vol *v, const Ext2Inode *dir,
+                         Ext2DirCb cb, void *user) {
+    Ext2BlockList bl;
+    if (ext2_block_list(v, dir, &bl) != 0) return -1;
+    uint8_t *buf = (uint8_t *)malloc(v->block_size);
+    if (!buf) { free(bl.blocks); return -1; }
+    int stop = 0;
+    for (uint32_t bi = 0; bi < bl.count && !stop; bi++) {
+        uint64_t bn = bl.blocks[bi];
+        if (bn == 0) continue;            /* sparse hole in a directory */
+        if (ext2_read_block(v, bn, buf) != 0) continue;
+        uint32_t off = 0;
+        while (off + 8 <= v->block_size) {
+            uint32_t ino     = read_le32(&buf[off]);
+            uint16_t rec_len = read_le16(&buf[off + 4]);
+            uint8_t  name_len = buf[off + 6];
+            uint8_t  ftype    = buf[off + 7];
+            if (rec_len == 0 || off + rec_len > v->block_size) break;
+            if (ino != 0 && name_len > 0
+                && off + 8 + name_len <= v->block_size) {
+                char name[256];
+                memcpy(name, &buf[off + 8], name_len);
+                name[name_len] = '\0';
+                if (strcmp(name, ".") != 0 && strcmp(name, "..") != 0) {
+                    if (cb(ino, name, ftype, user)) { stop = 1; break; }
+                }
+            }
+            off += rec_len;
+        }
+    }
+    free(buf);
+    free(bl.blocks);
+    return 0;
+}
+
+typedef struct { const char *target; uint32_t found; } Ext2LookCtx;
+static int ext2_look_cb(uint32_t ino, const char *name, uint8_t ftype,
+                        void *user) {
+    Ext2LookCtx *c = (Ext2LookCtx *)user;
+    (void)ftype;
+    if (strcmp(name, c->target) == 0) { c->found = ino; return 1; }
+    return 0;
+}
+
+static int ext2_resolve_path(const Ext2Vol *v, const char *path,
+                             uint32_t *out_ino, Ext2Inode *out_inode) {
+    uint32_t cur = EXT_ROOT_INO;
+    Ext2Inode in;
+    if (ext2_read_inode(v, cur, &in) != 0) return -1;
+    char tmp[MAX_PATH_LEN];
+    snprintf(tmp, sizeof(tmp), "%s", (path && path[0]) ? path : "/");
+    char *p = tmp;
+    while (*p == '/') p++;
+    while (*p) {
+        char *slash = strchr(p, '/');
+        if (slash) *slash = '\0';
+        if (*p) {
+            if ((in.mode & EXT_S_IFMT) != EXT_S_IFDIR) return -1;
+            Ext2LookCtx c; c.target = p; c.found = 0;
+            ext2_walk_dir(v, &in, ext2_look_cb, &c);
+            if (c.found == 0) return -1;
+            cur = c.found;
+            if (ext2_read_inode(v, cur, &in) != 0) return -1;
+        }
+        if (!slash) break;
+        p = slash + 1;
+        while (*p == '/') p++;
+    }
+    *out_ino = cur;
+    *out_inode = in;
+    return 0;
+}
+
+typedef struct { const Ext2Vol *v; int printed; } Ext2LsCtx;
+static int ext2_ls_cb(uint32_t ino, const char *name, uint8_t ftype,
+                      void *user) {
+    Ext2LsCtx *c = (Ext2LsCtx *)user;
+    Ext2Inode in;
+    int is_dir;
+    uint64_t size = 0;
+    if (ext2_read_inode(c->v, ino, &in) == 0) {
+        is_dir = (in.mode & EXT_S_IFMT) == EXT_S_IFDIR;
+        size = in.size;
+    } else {
+        is_dir = (ftype == 2);   /* fall back to dir-entry file_type */
+    }
+    char sz[32];
+    format_bytes(size, sz, sizeof(sz));
+    printf("%s %10s  %s%s\n", is_dir ? "d" : "-", sz, name, is_dir ? "/" : "");
+    c->printed++;
+    return 0;
+}
+
+static int fs_ls_ext2(int fd, off_t fs_off, const char *path) {
+    Ext2Vol v;
+    if (ext2_open(fd, fs_off, &v) != 0) {
+        fprintf(stderr, "Error: cannot open ext filesystem\n");
+        return 1;
+    }
+    uint32_t ino;
+    Ext2Inode in;
+    if (ext2_resolve_path(&v, path, &ino, &in) != 0) {
+        fprintf(stderr, "Error: ext path not found: %s\n", path);
+        ext2_close(&v); return 1;
+    }
+    if ((in.mode & EXT_S_IFMT) != EXT_S_IFDIR) {
+        fprintf(stderr, "Error: %s is not a directory\n", path);
+        ext2_close(&v); return 1;
+    }
+    Ext2LsCtx c; c.v = &v; c.printed = 0;
+    ext2_walk_dir(&v, &in, ext2_ls_cb, &c);
+    if (c.printed == 0) printf("  (empty)\n");
+    ext2_close(&v);
+    return 0;
+}
+
+static int fs_get_ext2(int fd, off_t fs_off, const char *path,
+                       const char *host_out) {
+    Ext2Vol v;
+    if (ext2_open(fd, fs_off, &v) != 0) {
+        fprintf(stderr, "Error: cannot open ext filesystem\n");
+        return 1;
+    }
+    uint32_t ino;
+    Ext2Inode in;
+    if (ext2_resolve_path(&v, path, &ino, &in) != 0) {
+        fprintf(stderr, "Error: ext path not found: %s\n", path);
+        ext2_close(&v); return 1;
+    }
+    if ((in.mode & EXT_S_IFMT) == EXT_S_IFDIR) {
+        fprintf(stderr, "Error: %s is a directory\n", path);
+        ext2_close(&v); return 1;
+    }
+    Ext2BlockList bl;
+    if (ext2_block_list(&v, &in, &bl) != 0) {
+        fprintf(stderr, "Error: cannot map ext file blocks\n");
+        ext2_close(&v); return 1;
+    }
+    FILE *out = fopen(host_out, "wb");
+    if (!out) {
+        fprintf(stderr, "Error: cannot create %s: %s\n",
+                host_out, strerror(errno));
+        free(bl.blocks); ext2_close(&v); return 1;
+    }
+    uint8_t *buf  = (uint8_t *)malloc(v.block_size);
+    uint8_t *zero = (uint8_t *)calloc(1, v.block_size);
+    if (!buf || !zero) {
+        free(buf); free(zero); free(bl.blocks);
+        fclose(out); ext2_close(&v); return 1;
+    }
+    uint64_t remaining = in.size;
+    for (uint32_t bi = 0; bi < bl.count && remaining > 0; bi++) {
+        uint64_t bn = bl.blocks[bi];
+        size_t chunk = (remaining < v.block_size) ? (size_t)remaining
+                                                  : (size_t)v.block_size;
+        if (bn == 0) {
+            fwrite(zero, 1, chunk, out);
+        } else {
+            if (ext2_read_block(&v, bn, buf) != 0) break;
+            fwrite(buf, 1, chunk, out);
+        }
+        remaining -= chunk;
+    }
+    free(buf); free(zero); free(bl.blocks);
+    fclose(out);
+    ext2_close(&v);
+    fprintf(stderr, "Extracted %s (%llu bytes) -> %s\n",
+            path, (unsigned long long)in.size, host_out);
+    return 0;
+}
+
+/* ============================================================
+ * exFAT Reader (read-only browse: ls / get)
+ * ----------------------------------------------------------------
+ * Parses the exFAT VBR (magic "EXFAT   " at offset 3), follows the
+ * 32-bit FAT for cluster chains, and walks directory entry sets
+ * (0x85 File + 0xC0 Stream Extension + 0xC1 File Name). Honors the
+ * NoFatChain stream flag (contiguous extent) for both directories'
+ * children and file data.
+ *
+ * All exFAT on-disk integers are little-endian (read_le16/32/64
+ * byteswap on PPC). Filenames are UTF-16LE; we render them ASCII
+ * best-effort ('?' for non-ASCII), matching the ISO 9660 / Joliet
+ * reader's convention. The upcase table is not consulted; path
+ * matching uses strcasecmp (ASCII case-fold), which covers the
+ * common case.
+ * ============================================================ */
+
+#define EXFAT_ATTR_DIRECTORY  0x10
+#define EXFAT_ENTRY_FILE      0x85
+#define EXFAT_ENTRY_STREAM    0xC0
+#define EXFAT_ENTRY_FILENAME  0xC1
+
+typedef struct {
+    int       fd;
+    off_t     fs_off;
+    uint64_t  bytes_per_sector;
+    uint64_t  cluster_size;
+    uint32_t  fat_offset_sectors;
+    uint32_t  cluster_heap_offset_sectors;
+    uint32_t  cluster_count;
+    uint32_t  root_cluster;
+} ExfatVol;
+
+static int exfat_open(int fd, off_t fs_off, ExfatVol *v) {
+    memset(v, 0, sizeof(*v));
+    uint8_t vbr[512];
+    if (lseek(fd, fs_off, SEEK_SET) < 0) return -1;
+    if (read(fd, vbr, 512) != 512) return -1;
+    if (memcmp(&vbr[3], "EXFAT   ", 8) != 0) return -1;
+    uint8_t bps_shift = vbr[0x6C];
+    uint8_t spc_shift = vbr[0x6D];
+    if (bps_shift < 9 || bps_shift > 12) return -1;
+    if (spc_shift > 25) return -1;
+    v->fd = fd;
+    v->fs_off = fs_off;
+    v->bytes_per_sector = (uint64_t)1 << bps_shift;
+    v->cluster_size = v->bytes_per_sector << spc_shift;
+    v->fat_offset_sectors          = read_le32(&vbr[0x50]);
+    v->cluster_heap_offset_sectors = read_le32(&vbr[0x58]);
+    v->cluster_count               = read_le32(&vbr[0x5C]);
+    v->root_cluster                = read_le32(&vbr[0x60]);
+    if (v->root_cluster < 2 || v->cluster_size == 0) return -1;
+    return 0;
+}
+
+static off_t exfat_cluster_off(const ExfatVol *v, uint32_t c) {
+    return v->fs_off
+        + (off_t)v->cluster_heap_offset_sectors * v->bytes_per_sector
+        + (off_t)(c - 2) * v->cluster_size;
+}
+
+static int exfat_next_cluster(const ExfatVol *v, uint32_t c, uint32_t *next) {
+    if (c < 2 || c >= v->cluster_count + 2) return -1;
+    off_t off = v->fs_off + (off_t)v->fat_offset_sectors * v->bytes_per_sector
+              + (off_t)c * 4;
+    uint8_t b[4];
+    if (lseek(v->fd, off, SEEK_SET) < 0) return -1;
+    if (read(v->fd, b, 4) != 4) return -1;
+    uint32_t n = read_le32(b);
+    if (n < 2 || n >= 0xFFFFFFF8u) return -1;
+    *next = n;
+    return 0;
+}
+
+/* Read an entire directory (FAT-chained) into a malloc'd buffer. */
+static uint8_t *exfat_read_dir(const ExfatVol *v, uint32_t first_cluster,
+                               uint32_t *out_len) {
+    uint8_t *buf = NULL;
+    uint32_t len = 0;
+    uint32_t c = first_cluster;
+    uint32_t guard = 0;
+    while (c >= 2 && guard <= v->cluster_count) {
+        uint8_t *nb = (uint8_t *)realloc(buf, len + v->cluster_size);
+        if (!nb) { free(buf); return NULL; }
+        buf = nb;
+        if (lseek(v->fd, exfat_cluster_off(v, c), SEEK_SET) < 0
+            || read(v->fd, buf + len, v->cluster_size)
+               != (ssize_t)v->cluster_size) {
+            free(buf); return NULL;
+        }
+        len += v->cluster_size;
+        guard++;
+        uint32_t next;
+        if (exfat_next_cluster(v, c, &next) != 0) break;
+        c = next;
+    }
+    *out_len = len;
+    return buf;
+}
+
+typedef int (*ExfatDirCb)(const char *name, int is_dir, uint32_t first_cluster,
+                          uint64_t data_length, int no_fat_chain, void *user);
+
+static void exfat_walk_dir(const ExfatVol *v, uint32_t dir_cluster,
+                           ExfatDirCb cb, void *user) {
+    uint32_t len = 0;
+    uint8_t *d = exfat_read_dir(v, dir_cluster, &len);
+    if (!d) return;
+    uint32_t pos = 0;
+    while (pos + 32 <= len) {
+        uint8_t et = d[pos];
+        if (et == 0x00) break;                 /* end of directory */
+        if (et != EXFAT_ENTRY_FILE) { pos += 32; continue; }
+
+        uint8_t  secondary = d[pos + 1];
+        uint16_t attrs     = read_le16(&d[pos + 4]);
+        uint32_t stream_pos = pos + 32;
+        if (stream_pos + 32 > len || d[stream_pos] != EXFAT_ENTRY_STREAM) {
+            pos += 32; continue;
+        }
+        int      no_fat_chain = (d[stream_pos + 1] & 0x02) != 0;
+        uint8_t  name_len     = d[stream_pos + 3];
+        uint32_t first_cluster = read_le32(&d[stream_pos + 20]);
+        uint64_t data_length   = read_le64(&d[stream_pos + 24]);
+
+        char name[256];
+        int oi = 0;
+        for (int i = 0; i < (int)secondary - 1 && oi < name_len && oi < 255; i++) {
+            uint32_t fp = pos + 64 + (uint32_t)i * 32;
+            if (fp + 32 > len || d[fp] != EXFAT_ENTRY_FILENAME) break;
+            for (int j = 0; j < 15 && oi < name_len && oi < 255; j++) {
+                uint16_t u = read_le16(&d[fp + 2 + j * 2]);
+                name[oi++] = (u < 0x80) ? (char)u : '?';
+            }
+        }
+        name[oi] = '\0';
+
+        pos += 32 * (1 + (uint32_t)secondary);
+
+        if (name[0] == '\0' || strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
+            continue;
+        int is_dir = (attrs & EXFAT_ATTR_DIRECTORY) != 0;
+        if (cb(name, is_dir, first_cluster, data_length, no_fat_chain, user))
+            break;
+    }
+    free(d);
+}
+
+typedef struct {
+    const char *target;
+    int      found;
+    int      is_dir;
+    uint32_t first_cluster;
+    uint64_t data_length;
+    int      no_fat_chain;
+} ExfatLook;
+
+static int exfat_look_cb(const char *name, int is_dir, uint32_t fc,
+                         uint64_t dl, int nfc, void *user) {
+    ExfatLook *l = (ExfatLook *)user;
+    if (strcasecmp(name, l->target) == 0) {
+        l->found = 1; l->is_dir = is_dir; l->first_cluster = fc;
+        l->data_length = dl; l->no_fat_chain = nfc;
+        return 1;
+    }
+    return 0;
+}
+
+static int exfat_resolve(const ExfatVol *v, const char *path, int *is_dir,
+                         uint32_t *first_cluster, uint64_t *data_length,
+                         int *no_fat_chain) {
+    uint32_t cur = v->root_cluster;
+    int      cur_is_dir = 1;
+    uint64_t cur_len = 0;
+    int      cur_nfc = 0;
+    char tmp[MAX_PATH_LEN];
+    snprintf(tmp, sizeof(tmp), "%s", (path && path[0]) ? path : "/");
+    char *p = tmp;
+    while (*p == '/') p++;
+    while (*p) {
+        char *slash = strchr(p, '/');
+        if (slash) *slash = '\0';
+        if (*p) {
+            if (!cur_is_dir) return -1;
+            ExfatLook l; memset(&l, 0, sizeof(l)); l.target = p;
+            exfat_walk_dir(v, cur, exfat_look_cb, &l);
+            if (!l.found) return -1;
+            cur = l.first_cluster; cur_is_dir = l.is_dir;
+            cur_len = l.data_length; cur_nfc = l.no_fat_chain;
+        }
+        if (!slash) break;
+        p = slash + 1;
+        while (*p == '/') p++;
+    }
+    *is_dir = cur_is_dir;
+    *first_cluster = cur;
+    *data_length = cur_len;
+    *no_fat_chain = cur_nfc;
+    return 0;
+}
+
+typedef struct { int printed; } ExfatLsCtx;
+static int exfat_ls_cb(const char *name, int is_dir, uint32_t fc, uint64_t dl,
+                       int nfc, void *user) {
+    ExfatLsCtx *c = (ExfatLsCtx *)user;
+    (void)fc; (void)nfc;
+    char sz[32];
+    format_bytes(is_dir ? 0 : dl, sz, sizeof(sz));
+    printf("%s %10s  %s%s\n", is_dir ? "d" : "-", sz, name, is_dir ? "/" : "");
+    c->printed++;
+    return 0;
+}
+
+static int fs_ls_exfat(int fd, off_t fs_off, const char *path) {
+    ExfatVol v;
+    if (exfat_open(fd, fs_off, &v) != 0) {
+        fprintf(stderr, "Error: cannot open exFAT filesystem\n");
+        return 1;
+    }
+    int is_dir, nfc;
+    uint32_t fc;
+    uint64_t dl;
+    if (exfat_resolve(&v, path, &is_dir, &fc, &dl, &nfc) != 0) {
+        fprintf(stderr, "Error: exFAT path not found: %s\n", path);
+        return 1;
+    }
+    if (!is_dir) {
+        fprintf(stderr, "Error: %s is not a directory\n", path);
+        return 1;
+    }
+    ExfatLsCtx c; c.printed = 0;
+    exfat_walk_dir(&v, fc, exfat_ls_cb, &c);
+    if (c.printed == 0) printf("  (empty)\n");
+    return 0;
+}
+
+static int fs_get_exfat(int fd, off_t fs_off, const char *path,
+                        const char *host_out) {
+    ExfatVol v;
+    if (exfat_open(fd, fs_off, &v) != 0) {
+        fprintf(stderr, "Error: cannot open exFAT filesystem\n");
+        return 1;
+    }
+    int is_dir, nfc;
+    uint32_t fc;
+    uint64_t dl;
+    if (exfat_resolve(&v, path, &is_dir, &fc, &dl, &nfc) != 0) {
+        fprintf(stderr, "Error: exFAT path not found: %s\n", path);
+        return 1;
+    }
+    if (is_dir) {
+        fprintf(stderr, "Error: %s is a directory\n", path);
+        return 1;
+    }
+    FILE *out = fopen(host_out, "wb");
+    if (!out) {
+        fprintf(stderr, "Error: cannot create %s: %s\n",
+                host_out, strerror(errno));
+        return 1;
+    }
+    uint8_t *buf = (uint8_t *)malloc(v.cluster_size);
+    if (!buf) { fclose(out); return 1; }
+    uint64_t remaining = dl;
+    if (nfc) {
+        /* Contiguous extent — read straight through. */
+        if (lseek(fd, exfat_cluster_off(&v, fc), SEEK_SET) >= 0) {
+            while (remaining > 0) {
+                size_t chunk = (remaining < v.cluster_size)
+                             ? (size_t)remaining : (size_t)v.cluster_size;
+                ssize_t nr = read(fd, buf, chunk);
+                if (nr <= 0) break;
+                fwrite(buf, 1, nr, out);
+                remaining -= nr;
+            }
+        }
+    } else {
+        uint32_t c = fc;
+        uint32_t guard = 0;
+        while (c >= 2 && remaining > 0 && guard <= v.cluster_count) {
+            if (lseek(fd, exfat_cluster_off(&v, c), SEEK_SET) < 0) break;
+            size_t chunk = (remaining < v.cluster_size)
+                         ? (size_t)remaining : (size_t)v.cluster_size;
+            ssize_t nr = read(fd, buf, chunk);
+            if (nr <= 0) break;
+            fwrite(buf, 1, nr, out);
+            remaining -= nr;
+            guard++;
+            uint32_t next;
+            if (exfat_next_cluster(&v, c, &next) != 0) break;
+            c = next;
+        }
+    }
+    free(buf);
+    fclose(out);
+    fprintf(stderr, "Extracted %s (%llu bytes) -> %s\n",
+            path, (unsigned long long)dl, host_out);
+    return 0;
+}
+
+/* ============================================================
  * cmd_ls / cmd_get
  * ============================================================ */
 
@@ -5685,6 +6420,8 @@ static int cmd_ls(int argc, char **argv) {
         case FS_FAT:     rc = fs_ls_fat(fd, fs_off, path); break;
         case FS_AFFS:    rc = fs_ls_affs(fd, fs_off, fs_size, path); break;
         case FS_PRODOS:  rc = fs_ls_prodos(fd, fs_off, path); break;
+        case FS_EXT2:    rc = fs_ls_ext2(fd, fs_off, path); break;
+        case FS_EXFAT:   rc = fs_ls_exfat(fd, fs_off, path); break;
         default:
             fprintf(stderr,
                 "Error: ls is not yet implemented for this filesystem.\n");
@@ -5732,6 +6469,10 @@ static int cmd_get(int argc, char **argv) {
             rc = fs_get_affs(fd, fs_off, fs_size, path, host_out); break;
         case FS_PRODOS:
             rc = fs_get_prodos(fd, fs_off, path, host_out); break;
+        case FS_EXT2:
+            rc = fs_get_ext2(fd, fs_off, path, host_out); break;
+        case FS_EXFAT:
+            rc = fs_get_exfat(fd, fs_off, path, host_out); break;
         default:
             fprintf(stderr,
                 "Error: get is not yet implemented for this filesystem.\n");

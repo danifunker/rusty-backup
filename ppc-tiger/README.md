@@ -14,7 +14,7 @@ All core rusty-backup functionality, running natively on Tiger:
 - **Checksums**: CRC32 (`--checksum crc32`) and SHA-256 (`--checksum sha256`) — both match rb-cli's value set, so backups cross-verify in either direction. SHA-1 is intentionally not exposed.
 - **FAT compaction**: Automatic for FAT12/16/32 — only backs up allocated clusters
 - **Metadata**: Compatible `metadata.json` format
-- **Filesystem browse** (`ls` / `get`): read-only browse + per-file extraction for FAT12/16/32 (with LFN), classic HFS, HFS+/HFSX, ISO 9660 (incl. Joliet), AFFS (Amiga FFS/OFS), ProDOS (Apple II). Type/creator codes shown per entry for HFS / HFS+.
+- **Filesystem browse** (`ls` / `get`): read-only browse + per-file extraction for FAT12/16/32 (with LFN), classic HFS, HFS+/HFSX, ISO 9660 (incl. Joliet), AFFS (Amiga FFS/OFS), ProDOS (Apple II), ext2/3/4 (indirect block maps + ext4 extent trees), exFAT (FAT chains + NoFatChain extents). Type/creator codes shown per entry for HFS / HFS+.
 - **Image wrappers**: DC42 (DiskCopy 4.2) and 2MG (2IMG) wrappers are detected transparently — no need to `dd`-strip the header before browsing.
 - **fsck (FAT)**: Read-only consistency check — flags cross-linked / lost / bad-ref clusters and cluster-chain cycles.
 - **write**: Stream a raw image onto a block device or file with a `--yes` device-write guard.
