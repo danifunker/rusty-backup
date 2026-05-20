@@ -4,24 +4,35 @@
 # the readers were only smoke-tested on little-endian hardware, so this
 # run is what actually exercises the read_le* byteswap paths.
 #
-# Prereqs on the Tiger box:
-#   1. This whole ppc-tiger/ source dir (so build.sh can compile).
-#   2. The two fixture images, copied over from the dev machine:
-#         ext2.img    (1 MiB)   md5 a9def8f42cb7916ed282339edb3b8084
-#         exfat.img   (64 MiB)  md5 3b93211a0495e31bf2b8fc9829edd8ad
-#      Verify with:  md5 ext2.img exfat.img
+# Self-contained: the fixture images ship gzip-compressed in
+# ppc-tiger/fixtures/ (a few KB each since they are mostly zeros) and
+# are decompressed to a temp dir automatically. Just build, then run:
 #
-# Usage (run from inside the ppc-tiger/ dir):
-#   ./test_fs_readers.sh [EXT2_IMG] [EXFAT_IMG]
-# Defaults: ./ext2.img and ./exfat.img
+#   ./test_fs_readers.sh
+#
+# To test against your own raw images instead, pass them explicitly:
+#   ./test_fs_readers.sh /path/ext2.img /path/exfat.img
+#
+# Set SKIP_BUILD=1 to reuse an existing ./rusty-backup-ppc.
 
 set -u
 
-EXT2_IMG="${1:-./ext2.img}"
-EXFAT_IMG="${2:-./exfat.img}"
 BIN="./rusty-backup-ppc"
+FIXTURES="./fixtures"
 TMP="${TMPDIR:-/tmp}/rbfs.$$"
 mkdir -p "$TMP"
+
+# Resolve a fixture image: use the explicit arg if given, else gunzip the
+# committed .gz into $TMP. Echoes the usable path (empty if unavailable).
+resolve_fixture() {  # <explicit-arg> <name>
+    if [ -n "$1" ]; then echo "$1"; return; fi
+    if [ -f "$FIXTURES/$2.gz" ]; then
+        gunzip -c "$FIXTURES/$2.gz" > "$TMP/$2" 2>/dev/null && echo "$TMP/$2"
+    fi
+}
+
+EXT2_IMG=`resolve_fixture "${1:-}" ext2.img`
+EXFAT_IMG=`resolve_fixture "${2:-}" exfat.img`
 
 PASS=0
 FAIL=0
