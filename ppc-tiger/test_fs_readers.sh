@@ -11,7 +11,7 @@
 #   ./test_fs_readers.sh
 #
 # To test against your own raw images instead, pass them explicitly:
-#   ./test_fs_readers.sh /path/ext2.img /path/exfat.img
+#   ./test_fs_readers.sh /path/ext2.img /path/exfat.img /path/efs.img /path/sgi.img
 #
 # Set SKIP_BUILD=1 to reuse an existing ./rusty-backup-ppc.
 
@@ -33,6 +33,8 @@ resolve_fixture() {  # <explicit-arg> <name>
 
 EXT2_IMG=`resolve_fixture "${1:-}" ext2.img`
 EXFAT_IMG=`resolve_fixture "${2:-}" exfat.img`
+EFS_IMG=`resolve_fixture "${3:-}" efs.img`
+SGI_IMG=`resolve_fixture "${4:-}" sgi.img`
 
 PASS=0
 FAIL=0
@@ -121,6 +123,50 @@ else
     check_text "$TMP/x_hello" "Hello, exFAT world!" "exFAT: get hello.txt content"
     check_text "$TMP/x_inner" "nested exfat file"   "exFAT: get nested inner.txt content"
     check_fill "$TMP/x_big" 200000 B "exFAT: get big.bin (200000 bytes, all 'B' = cluster chain)"
+fi
+echo ""
+
+# ---------------------------------------------------------------
+echo "=== EFS / bare superfloppy ($EFS_IMG) ==="
+if [ ! -f "$EFS_IMG" ]; then
+    echo "  SKIP: $EFS_IMG not found"
+else
+    "$BIN" ls "$EFS_IMG" /        > "$TMP/f_root.txt" 2>&1
+    "$BIN" ls "$EFS_IMG" /subdir  > "$TMP/f_sub.txt"  2>&1
+    echo "  --- ls / ---"; sed 's/^/    /' "$TMP/f_root.txt"
+
+    check_contains "$TMP/f_root.txt" "hello.txt" "EFS: root lists hello.txt"
+    check_contains "$TMP/f_root.txt" "big.bin"   "EFS: root lists big.bin"
+    check_contains "$TMP/f_root.txt" "subdir/"   "EFS: root lists subdir/"
+    check_contains "$TMP/f_sub.txt"  "inner.txt" "EFS: subdir lists inner.txt"
+
+    "$BIN" get "$EFS_IMG" /hello.txt        "$TMP/f_hello" >/dev/null 2>&1
+    "$BIN" get "$EFS_IMG" /subdir/inner.txt "$TMP/f_inner" >/dev/null 2>&1
+    "$BIN" get "$EFS_IMG" /big.bin          "$TMP/f_big"   >/dev/null 2>&1
+
+    check_text "$TMP/f_hello" "Hello, EFS world!" "EFS: get hello.txt content"
+    check_text "$TMP/f_inner" "nested efs file"   "EFS: get nested inner.txt content"
+    check_fill "$TMP/f_big" 307200 E "EFS: get big.bin (307200 bytes, all 'E' = multi-extent)"
+fi
+echo ""
+
+# ---------------------------------------------------------------
+echo "=== SGI volume header ($SGI_IMG) ==="
+if [ ! -f "$SGI_IMG" ]; then
+    echo "  SKIP: $SGI_IMG not found"
+else
+    "$BIN" show partmap "$SGI_IMG" > "$TMP/s_pm.txt" 2>&1
+    echo "  --- show partmap ---"; sed 's/^/    /' "$TMP/s_pm.txt"
+    check_contains "$TMP/s_pm.txt" "SGI" "SGI: partition table identified as SGI"
+    check_contains "$TMP/s_pm.txt" "EFS" "SGI: EFS partition listed"
+
+    # EFS partition is entry @1 inside the volume header.
+    "$BIN" ls "$SGI_IMG@1" /        > "$TMP/s_root.txt" 2>&1
+    check_contains "$TMP/s_root.txt" "hello.txt" "SGI: ls @1 lists hello.txt"
+    check_contains "$TMP/s_root.txt" "subdir/"   "SGI: ls @1 lists subdir/"
+
+    "$BIN" get "$SGI_IMG@1" /subdir/inner.txt "$TMP/s_inner" >/dev/null 2>&1
+    check_text "$TMP/s_inner" "nested efs file" "SGI: get @1 nested file content"
 fi
 echo ""
 

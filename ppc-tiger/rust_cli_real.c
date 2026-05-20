@@ -114,6 +114,21 @@ typedef struct {
     ApmEntry entries[MAX_PARTITIONS];
 } ApmTable;
 
+/* ===== SGI Volume Header (IRIX disks) ===== */
+
+#define SGI_VOLHDR_MAGIC 0x0BE5A941u
+
+typedef struct {
+    uint32_t first;   /* first sector (512-byte) */
+    uint32_t blocks;  /* sector count */
+    uint32_t type;    /* SGI partition type code (0=VOLHDR .. 7=EFS .. 10=XFS) */
+} SgiEntry;
+
+typedef struct {
+    int      entry_count;
+    SgiEntry entries[16];   /* SGI on-disk array is exactly 16 */
+} SgiTable;
+
 /* ===== GPT ===== */
 
 #define GPT_SIGNATURE 0x5452415020494645ULL /* "EFI PART" LE */
@@ -146,7 +161,8 @@ typedef enum {
     PT_NONE = 0,   /* superfloppy */
     PT_MBR,
     PT_GPT,
-    PT_APM
+    PT_APM,
+    PT_SGI
 } PartTableType;
 
 typedef struct {
@@ -155,6 +171,7 @@ typedef struct {
         MbrTable mbr;
         ApmTable apm;
         GptTable gpt;
+        SgiTable sgi;
     } data;
     char     fs_hint[16];       /* for superfloppy */
     uint64_t disk_size;
@@ -742,6 +759,26 @@ static int detect_partition_table(int fd, PartTable *pt) {
     int nr = read(fd, sector, 2048);
     if (nr < 512) return -1;
 
+    /* Check SGI Volume Header: big-endian magic 0x0BE5A941 at sector 0
+     * offset 0. The 16-entry partition array lives at offset 0x138, each
+     * entry = blocks(be32) + first(be32) + type(be32). */
+    if (read_be32(sector) == SGI_VOLHDR_MAGIC) {
+        pt->type = PT_SGI;
+        pt->data.sgi.entry_count = 0;
+        for (int i = 0; i < 16; i++) {
+            const uint8_t *e = &sector[0x138 + i * 12];
+            uint32_t blocks = read_be32(&e[0]);
+            uint32_t first  = read_be32(&e[4]);
+            uint32_t type   = read_be32(&e[8]);
+            if (blocks == 0 && first == 0 && type == 0) continue; /* empty */
+            SgiEntry *se = &pt->data.sgi.entries[pt->data.sgi.entry_count++];
+            se->blocks = blocks;
+            se->first  = first;
+            se->type   = type;
+        }
+        return 0;
+    }
+
     /* Check APM: DDR signature 0x4552 at bytes 0-1 */
     uint16_t ddr_sig = read_be16(sector);
     if (ddr_sig == APM_DDR_SIG) {
@@ -830,6 +867,18 @@ static int detect_partition_table(int fd, PartTable *pt) {
         return 0;
     }
 
+    /* Check superfloppy: bare SGI EFS partition (superblock at byte 512,
+     * BE magic at offset 28). Whole SGI disks are caught earlier by the
+     * volume-header check; this handles a lone extracted EFS partition. */
+    if (nr >= 1024) {
+        uint32_t em = read_be32(&sector[512 + 28]);
+        if (em == 0x00072959u || em == 0x0007295Au) {
+            pt->type = PT_NONE;
+            strcpy(pt->fs_hint, "EFS");
+            return 0;
+        }
+    }
+
     /* Check MBR signature */
     uint16_t mbr_sig = read_le16(&sector[510]);
     if (mbr_sig != 0xAA55) return -1;  /* no recognized partition table */
@@ -871,6 +920,26 @@ static int detect_partition_table(int fd, PartTable *pt) {
 }
 
 /* Build flat partition list from parsed table */
+static const char *sgi_type_name(uint32_t t) {
+    switch (t) {
+        case 0:  return "VOLHDR";
+        case 1:  return "TRKREPL";
+        case 2:  return "SECREPL";
+        case 3:  return "RAW";
+        case 4:  return "BSD";
+        case 5:  return "SYSV";
+        case 6:  return "VOLUME";
+        case 7:  return "EFS";
+        case 8:  return "LVOL";
+        case 9:  return "RLVOL";
+        case 10: return "XFS";
+        case 11: return "XFSLOG";
+        case 12: return "XLV";
+        case 13: return "XVM";
+        default: return "Unknown";
+    }
+}
+
 static int get_partition_list(const PartTable *pt, PartInfo *parts) {
     int count = 0;
 
@@ -945,6 +1014,22 @@ static int get_partition_list(const PartTable *pt, PartInfo *parts) {
             p->start_lba = (uint64_t)ae->start_block * bsz / SECTOR_SIZE;
             p->total_sectors = (uint64_t)ae->block_count * bsz / SECTOR_SIZE;
             p->bootable = (ae->status & 0x08) != 0;
+            count++;
+        }
+    } else if (pt->type == PT_SGI) {
+        for (int i = 0; i < pt->data.sgi.entry_count && count < MAX_PARTITIONS; i++) {
+            const SgiEntry *se = &pt->data.sgi.entries[i];
+            /* Skip disk-wide wrappers: VOLHDR (0) covers the header region,
+             * VOLUME (6) spans the whole disk. Neither is a browsable FS. */
+            if (se->type == 0 || se->type == 6) continue;
+            if (se->blocks == 0) continue;
+            PartInfo *p = &parts[count];
+            memset(p, 0, sizeof(*p));
+            p->index = count;
+            p->type_byte = 0; /* SGI types don't map to MBR bytes */
+            strncpy(p->type_name, sgi_type_name(se->type), sizeof(p->type_name) - 1);
+            p->start_lba = se->first;
+            p->total_sectors = se->blocks;
             count++;
         }
     }
@@ -2032,6 +2117,7 @@ static void write_metadata_json(const char *backup_path, const char *source,
     if (pt->type == PT_MBR) pt_name = "MBR";
     else if (pt->type == PT_APM) pt_name = "APM";
     else if (pt->type == PT_GPT) pt_name = "GPT";
+    else if (pt->type == PT_SGI) pt_name = "SGI";
 
     fprintf(f, "{\n");
     fprintf(f, "  \"version\": 1,\n");
@@ -2301,6 +2387,7 @@ static int cmd_backup(int argc, char **argv) {
     if (pt.type == PT_MBR) pt_name = "MBR";
     else if (pt.type == PT_APM) pt_name = "APM";
     else if (pt.type == PT_GPT) pt_name = "GPT";
+    else if (pt.type == PT_SGI) pt_name = "SGI";
     fprintf(stderr, "Partition table: %s\n", pt_name);
 
     /* Get partition list */
@@ -3161,6 +3248,7 @@ static int cmd_show_partmap(int argc, char **argv) {
     if (pt.type == PT_MBR) pt_name = "MBR";
     else if (pt.type == PT_APM) pt_name = "APM";
     else if (pt.type == PT_GPT) pt_name = "GPT";
+    else if (pt.type == PT_SGI) pt_name = "SGI";
 
     printf("Image: %s\n", img);
     printf("Partition table: %s\n", pt_name);
@@ -3386,7 +3474,8 @@ typedef enum {
     FS_PRODOS,
     FS_AFFS,
     FS_EXT2,
-    FS_EXFAT
+    FS_EXFAT,
+    FS_EFS
 } BrowseFsType;
 
 /* Forward declarations for the per-FS browse functions defined
@@ -3472,6 +3561,13 @@ static int resolve_image_ref(const char *spec, int *fd_out,
          * superblock, which lives 1024 bytes into the partition. */
         if (ft == FS_UNKNOWN && read_le16(&probe[1024 + 0x38]) == 0xEF53) {
             ft = FS_EXT2;
+        }
+        /* SGI EFS: superblock at byte 512, BE magic at offset 28. */
+        if (ft == FS_UNKNOWN) {
+            uint32_t em = read_be32(&probe[512 + 28]);
+            if (em == 0x00072959u || em == 0x0007295Au) {
+                ft = FS_EFS;
+            }
         }
         /* ProDOS: read block 2 (offset 1024); entry 0's high nibble
          * == 0xF marks the volume directory header. Require the
@@ -6382,6 +6478,305 @@ static int fs_get_exfat(int fd, off_t fs_off, const char *path,
 }
 
 /* ============================================================
+ * SGI EFS Reader (read-only browse: ls / get)
+ * ----------------------------------------------------------------
+ * The Extent File System from IRIX. Superblock at byte 512 of the
+ * partition (BE magic 0x00072959 / 0x0007295A at offset 28). Inodes
+ * are 128 bytes, 4 per 512-byte block, located via the cylinder-group
+ * geometry (firstcg / cgfsize / cgisize). File and directory data
+ * live in 8-byte extent records (direct: 12 inline in the inode;
+ * indirect: inode extents point to blocks of further extent records).
+ *
+ * EFS is big-endian on disk - and so is the PPC host - so read_be*
+ * are the natural fit. Directory blocks carry a 0xBEEF magic and a
+ * slot table of (offset>>1) bytes pointing at (inode:be32, namelen:u8,
+ * name[]) dirents.
+ *
+ * Limitations: symlink targets are not followed (listed as 'l'); the
+ * bitmap/fsck side is not implemented (browse only).
+ * ============================================================ */
+
+#define EFS_BLOCKSIZE     512
+#define EFS_ROOT_INODE    2
+#define EFS_MAGIC_OLD     0x00072959u
+#define EFS_MAGIC_NEW     0x0007295Au
+#define EFS_DIRBLK_MAGIC  0xBEEF
+#define EFS_DIRECTEXTENTS 12
+
+typedef struct {
+    int      fd;
+    off_t    fs_off;
+    uint32_t firstcg;   /* block of first cylinder group */
+    uint32_t cgfsize;   /* blocks per cylinder group */
+    uint16_t cgisize;   /* inode blocks per cylinder group */
+    uint16_t ncg;       /* number of cylinder groups */
+} EfsVol;
+
+typedef struct {
+    uint32_t bn;      /* start block on disk (24-bit) */
+    uint32_t offset;  /* logical file offset in blocks (24-bit) */
+    uint8_t  length;  /* number of 512-byte blocks */
+    uint8_t  magic;   /* must be 0 for a valid extent */
+} EfsExtent;
+
+typedef struct {
+    uint16_t  mode;
+    uint32_t  size;
+    uint16_t  numextents;
+    EfsExtent ext[EFS_DIRECTEXTENTS];
+} EfsInode;
+
+static int efs_open(int fd, off_t fs_off, EfsVol *v) {
+    memset(v, 0, sizeof(*v));
+    uint8_t sb[EFS_BLOCKSIZE];
+    if (lseek(fd, fs_off + EFS_BLOCKSIZE, SEEK_SET) < 0) return -1;
+    if (read(fd, sb, EFS_BLOCKSIZE) != EFS_BLOCKSIZE) return -1;
+    uint32_t magic = read_be32(&sb[28]);
+    if (magic != EFS_MAGIC_OLD && magic != EFS_MAGIC_NEW) return -1;
+    v->fd = fd;
+    v->fs_off = fs_off;
+    v->firstcg = read_be32(&sb[4]);
+    v->cgfsize = read_be32(&sb[8]);
+    v->cgisize = read_be16(&sb[12]);
+    v->ncg     = read_be16(&sb[18]);
+    if (v->cgisize == 0 || v->cgfsize == 0) return -1;
+    return 0;
+}
+
+static int efs_read_inode(const EfsVol *v, uint32_t inum, EfsInode *out) {
+    if (inum == 0) return -1;
+    uint32_t inodes_per_cg = (uint32_t)v->cgisize * 4;  /* 4 inodes / block */
+    if (inodes_per_cg == 0) return -1;
+    uint32_t cg = inum / inodes_per_cg;
+    uint32_t off_in_cg = inum % inodes_per_cg;
+    uint32_t inblock = off_in_cg / 4;
+    uint32_t block = v->firstcg + cg * v->cgfsize + inblock;
+    uint32_t byte_in_block = (inum % 4) * 128;
+    off_t off = v->fs_off + (off_t)block * EFS_BLOCKSIZE + byte_in_block;
+    uint8_t buf[128];
+    if (lseek(v->fd, off, SEEK_SET) < 0) return -1;
+    if (read(v->fd, buf, 128) != 128) return -1;
+    out->mode       = read_be16(&buf[0]);
+    out->size       = read_be32(&buf[8]);
+    out->numextents = read_be16(&buf[28]);
+    for (int i = 0; i < EFS_DIRECTEXTENTS; i++) {
+        const uint8_t *e = &buf[32 + i * 8];
+        uint32_t w0 = read_be32(&e[0]);
+        uint32_t w1 = read_be32(&e[4]);
+        out->ext[i].magic  = (w0 >> 24) & 0xFF;
+        out->ext[i].bn     = w0 & 0x00FFFFFF;
+        out->ext[i].length = (w1 >> 24) & 0xFF;
+        out->ext[i].offset = w1 & 0x00FFFFFF;
+    }
+    return 0;
+}
+
+static int efs_extent_cmp(const void *a, const void *b) {
+    const EfsExtent *x = (const EfsExtent *)a;
+    const EfsExtent *y = (const EfsExtent *)b;
+    if (x->offset < y->offset) return -1;
+    if (x->offset > y->offset) return 1;
+    return 0;
+}
+
+/* Resolve an inode's data extents (direct or indirect) into a malloc'd,
+ * offset-sorted array. Caller frees. *out_count = 0 / NULL on empty. */
+static EfsExtent *efs_resolve_extents(const EfsVol *v, const EfsInode *in,
+                                      uint32_t *out_count) {
+    *out_count = 0;
+    uint32_t total = in->numextents;
+    if (total == 0) return NULL;
+    EfsExtent *arr = (EfsExtent *)malloc(total * sizeof(EfsExtent));
+    if (!arr) return NULL;
+    if (total <= EFS_DIRECTEXTENTS) {
+        for (uint32_t i = 0; i < total; i++) arr[i] = in->ext[i];
+    } else {
+        uint32_t direxts = in->ext[0].offset;
+        if (direxts == 0 || direxts > EFS_DIRECTEXTENTS) { free(arr); return NULL; }
+        uint32_t got = 0;
+        uint8_t blk[EFS_BLOCKSIZE];
+        for (uint32_t ds = 0; ds < direxts && got < total; ds++) {
+            EfsExtent ind = in->ext[ds];
+            for (uint32_t b = 0; b < ind.length && got < total; b++) {
+                uint32_t bn = ind.bn + b;
+                if (lseek(v->fd, v->fs_off + (off_t)bn * EFS_BLOCKSIZE, SEEK_SET) < 0
+                    || read(v->fd, blk, EFS_BLOCKSIZE) != EFS_BLOCKSIZE) {
+                    free(arr); return NULL;
+                }
+                for (int s = 0; s < EFS_BLOCKSIZE / 8 && got < total; s++) {
+                    const uint8_t *e = &blk[s * 8];
+                    uint32_t w0 = read_be32(&e[0]);
+                    uint32_t w1 = read_be32(&e[4]);
+                    arr[got].magic  = (w0 >> 24) & 0xFF;
+                    arr[got].bn     = w0 & 0x00FFFFFF;
+                    arr[got].length = (w1 >> 24) & 0xFF;
+                    arr[got].offset = w1 & 0x00FFFFFF;
+                    got++;
+                }
+            }
+        }
+        if (got != total) { free(arr); return NULL; }
+    }
+    qsort(arr, total, sizeof(EfsExtent), efs_extent_cmp);
+    *out_count = total;
+    return arr;
+}
+
+typedef int (*EfsDirCb)(uint32_t inum, const char *name, void *user);
+
+static void efs_walk_dir(const EfsVol *v, const EfsInode *dir,
+                         EfsDirCb cb, void *user) {
+    uint32_t nexts = 0;
+    EfsExtent *exts = efs_resolve_extents(v, dir, &nexts);
+    if (!exts) return;
+    uint8_t blk[EFS_BLOCKSIZE];
+    int stop = 0;
+    for (uint32_t i = 0; i < nexts && !stop; i++) {
+        for (uint32_t b = 0; b < exts[i].length && !stop; b++) {
+            uint32_t bn = exts[i].bn + b;
+            if (lseek(v->fd, v->fs_off + (off_t)bn * EFS_BLOCKSIZE, SEEK_SET) < 0) continue;
+            if (read(v->fd, blk, EFS_BLOCKSIZE) != EFS_BLOCKSIZE) continue;
+            if (read_be16(&blk[0]) != EFS_DIRBLK_MAGIC) continue;
+            int slots = blk[3];
+            for (int s = 0; s < slots && !stop; s++) {
+                uint8_t raw = blk[4 + s];
+                if (raw == 0) continue;
+                uint32_t off = (uint32_t)raw << 1;
+                if (off + 5 > EFS_BLOCKSIZE) continue;
+                uint32_t inum = read_be32(&blk[off]);
+                uint8_t namelen = blk[off + 4];
+                if (namelen == 0 || off + 5 + namelen > EFS_BLOCKSIZE) continue;
+                char name[256];
+                memcpy(name, &blk[off + 5], namelen);
+                name[namelen] = '\0';
+                if (inum == 0 || strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
+                    continue;
+                if (cb(inum, name, user)) stop = 1;
+            }
+        }
+    }
+    free(exts);
+}
+
+typedef struct { const char *target; uint32_t found; } EfsLook;
+static int efs_look_cb(uint32_t inum, const char *name, void *user) {
+    EfsLook *l = (EfsLook *)user;
+    if (strcmp(name, l->target) == 0) { l->found = inum; return 1; }
+    return 0;
+}
+
+static int efs_resolve(const EfsVol *v, const char *path, EfsInode *out) {
+    EfsInode in;
+    if (efs_read_inode(v, EFS_ROOT_INODE, &in) != 0) return -1;
+    char tmp[MAX_PATH_LEN];
+    snprintf(tmp, sizeof(tmp), "%s", (path && path[0]) ? path : "/");
+    char *p = tmp;
+    while (*p == '/') p++;
+    while (*p) {
+        char *slash = strchr(p, '/');
+        if (slash) *slash = '\0';
+        if (*p) {
+            if ((in.mode & 0xF000) != 0x4000) return -1;
+            EfsLook l; l.target = p; l.found = 0;
+            efs_walk_dir(v, &in, efs_look_cb, &l);
+            if (l.found == 0) return -1;
+            if (efs_read_inode(v, l.found, &in) != 0) return -1;
+        }
+        if (!slash) break;
+        p = slash + 1;
+        while (*p == '/') p++;
+    }
+    *out = in;
+    return 0;
+}
+
+typedef struct { const EfsVol *v; int printed; } EfsLsCtx;
+static int efs_ls_cb(uint32_t inum, const char *name, void *user) {
+    EfsLsCtx *c = (EfsLsCtx *)user;
+    EfsInode ci;
+    char t = '-';
+    uint64_t size = 0;
+    if (efs_read_inode(c->v, inum, &ci) == 0) {
+        uint16_t fmt = ci.mode & 0xF000;
+        if (fmt == 0x4000) t = 'd';
+        else if (fmt == 0xA000) t = 'l';
+        size = (t == 'd') ? 0 : ci.size;
+    }
+    char sz[32];
+    format_bytes(size, sz, sizeof(sz));
+    printf("%c %10s  %s%s\n", t, sz, name, t == 'd' ? "/" : "");
+    c->printed++;
+    return 0;
+}
+
+static int fs_ls_efs(int fd, off_t fs_off, const char *path) {
+    EfsVol v;
+    if (efs_open(fd, fs_off, &v) != 0) {
+        fprintf(stderr, "Error: cannot open EFS filesystem\n");
+        return 1;
+    }
+    EfsInode in;
+    if (efs_resolve(&v, path, &in) != 0) {
+        fprintf(stderr, "Error: EFS path not found: %s\n", path);
+        return 1;
+    }
+    if ((in.mode & 0xF000) != 0x4000) {
+        fprintf(stderr, "Error: %s is not a directory\n", path);
+        return 1;
+    }
+    EfsLsCtx c; c.v = &v; c.printed = 0;
+    efs_walk_dir(&v, &in, efs_ls_cb, &c);
+    if (c.printed == 0) printf("  (empty)\n");
+    return 0;
+}
+
+static int fs_get_efs(int fd, off_t fs_off, const char *path,
+                      const char *host_out) {
+    EfsVol v;
+    if (efs_open(fd, fs_off, &v) != 0) {
+        fprintf(stderr, "Error: cannot open EFS filesystem\n");
+        return 1;
+    }
+    EfsInode in;
+    if (efs_resolve(&v, path, &in) != 0) {
+        fprintf(stderr, "Error: EFS path not found: %s\n", path);
+        return 1;
+    }
+    if ((in.mode & 0xF000) == 0x4000) {
+        fprintf(stderr, "Error: %s is a directory\n", path);
+        return 1;
+    }
+    uint32_t nexts = 0;
+    EfsExtent *exts = efs_resolve_extents(&v, &in, &nexts);
+    FILE *out = fopen(host_out, "wb");
+    if (!out) {
+        fprintf(stderr, "Error: cannot create %s: %s\n",
+                host_out, strerror(errno));
+        free(exts); return 1;
+    }
+    uint8_t blk[EFS_BLOCKSIZE];
+    uint64_t remaining = in.size;
+    for (uint32_t i = 0; i < nexts && remaining > 0; i++) {
+        for (uint32_t b = 0; b < exts[i].length && remaining > 0; b++) {
+            uint32_t bn = exts[i].bn + b;
+            if (lseek(fd, fs_off + (off_t)bn * EFS_BLOCKSIZE, SEEK_SET) < 0
+                || read(fd, blk, EFS_BLOCKSIZE) != EFS_BLOCKSIZE) {
+                remaining = 0; break;
+            }
+            size_t chunk = (remaining < EFS_BLOCKSIZE) ? (size_t)remaining
+                                                       : EFS_BLOCKSIZE;
+            fwrite(blk, 1, chunk, out);
+            remaining -= chunk;
+        }
+    }
+    free(exts);
+    fclose(out);
+    fprintf(stderr, "Extracted %s (%llu bytes) -> %s\n",
+            path, (unsigned long long)in.size, host_out);
+    return 0;
+}
+
+/* ============================================================
  * cmd_ls / cmd_get
  * ============================================================ */
 
@@ -6422,6 +6817,7 @@ static int cmd_ls(int argc, char **argv) {
         case FS_PRODOS:  rc = fs_ls_prodos(fd, fs_off, path); break;
         case FS_EXT2:    rc = fs_ls_ext2(fd, fs_off, path); break;
         case FS_EXFAT:   rc = fs_ls_exfat(fd, fs_off, path); break;
+        case FS_EFS:     rc = fs_ls_efs(fd, fs_off, path); break;
         default:
             fprintf(stderr,
                 "Error: ls is not yet implemented for this filesystem.\n");
@@ -6473,6 +6869,8 @@ static int cmd_get(int argc, char **argv) {
             rc = fs_get_ext2(fd, fs_off, path, host_out); break;
         case FS_EXFAT:
             rc = fs_get_exfat(fd, fs_off, path, host_out); break;
+        case FS_EFS:
+            rc = fs_get_efs(fd, fs_off, path, host_out); break;
         default:
             fprintf(stderr,
                 "Error: get is not yet implemented for this filesystem.\n");

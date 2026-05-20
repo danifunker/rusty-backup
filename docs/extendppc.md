@@ -126,7 +126,7 @@ order makes several of these easier than they look.
 | **HFS edit + fsck repair** | High | The recent project memory shows how much hardening this needed (B-tree splits, map nodes, file-thread quirks, ROM-bootability invariants). Re-tracking that in C is real work. |
 | **HFS+ edit** | High | Same. |
 | **PFS3 / SFS edit** (Amiga) | High | Amiga FS rb-cli phases were multi-week projects. Read-only is Tier 2; edit is Tier 4. |
-| **EFS read** (SGI) | Medium-high | SGI EFS is small but obscure; bitmap convention is set-bit-=-free (also AFFS-like). |
+| **EFS read** (SGI) | **DONE** | Shipped read-only `ls` / `get` in `rust_cli_real.c` (`fs_ls_efs` / `fs_get_efs`): superblock (BE magic 0x00072959/0x0007295A at byte 540), 128-byte inodes located via cylinder-group geometry, 8-byte extent records (direct + indirect), and 0xBEEF directory blocks. Also added SGI Volume Header partition-table parsing (`PT_SGI`, magic 0x0BE5A941) so EFS partitions enumerate via `image@N`; bare EFS partitions detected as superfloppies too. Big-endian throughout (matches the PPC host). Browse only — no bitmap/fsck. |
 | **`expand` (HFS block-size change)** | High | Cloning to a fresh volume, CNID remapping, APM rebuilding. Whole `hfs_clone.rs` depends on HFS write being there. |
 | **`defrag` clone for HFS+ / PFS3** | High | Same. |
 | **`resize` / `shrink` for HFS / HFS+ / NTFS / ext / exFAT / EFS** | High | Each fs has its own in-place resize; needs the corresponding write side. |
