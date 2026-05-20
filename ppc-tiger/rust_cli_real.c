@@ -777,6 +777,13 @@ static int detect_partition_table(int fd, PartTable *pt) {
         return 0;
     }
 
+    /* Check superfloppy: ProDOS volume directory header at block 2. */
+    if (nr >= 2048 && ((sector[1024 + 4] >> 4) & 0x0F) == 0xF) {
+        pt->type = PT_NONE;
+        strcpy(pt->fs_hint, "ProDOS");
+        return 0;
+    }
+
     /* Check HFS/HFS+ at offset 1024 */
     if (nr >= 2048 && is_hfs_sig(&sector[1024])) {
         pt->type = PT_NONE;
@@ -3414,6 +3421,17 @@ static int resolve_image_ref(const char *spec, int *fd_out,
             && probe[2] == 'S' && probe[3] <= 7) {
             ft = FS_AFFS;
         }
+        /* ProDOS: read block 2 (offset 1024); entry 0's high nibble
+         * == 0xF marks the volume directory header. */
+        if (ft == FS_UNKNOWN) {
+            uint8_t vol[512];
+            if (lseek(fd, off + 2 * 512, SEEK_SET) >= 0
+                && read(fd, vol, 512) == 512) {
+                if (((vol[4] >> 4) & 0x0F) == 0xF) {
+                    ft = FS_PRODOS;
+                }
+            }
+        }
         /* ISO 9660: "CD001" magic at sector 16, offset 1 of the
          * Primary Volume Descriptor. Read sector 16 from fs base. */
         if (ft == FS_UNKNOWN) {
@@ -4205,6 +4223,304 @@ static int fs_get_hfs(int fd, off_t fs_off, const char *path,
     fclose(out);
     free(data);
     fprintf(stderr, "Extracted %s (%u bytes) -> %s\n", path, got, host_out);
+    return 0;
+}
+
+/* ============================================================
+ * ProDOS Reader (ls / get)
+ * ----------------------------------------------------------------
+ * Read-only browse of Apple II ProDOS volumes.
+ *
+ * Layout: 512-byte blocks. Volume directory starts at block 2;
+ * each dir block has a 4-byte prev/next header, then up to 13
+ * entries of 0x27 (39) bytes each.
+ *
+ * Storage types (high nibble of entry byte 0):
+ *   0x1 seedling (1-block file)
+ *   0x2 sapling  (file w/ 1 index block, up to 256 blocks)
+ *   0x3 tree     (master index block + 128 index blocks)
+ *   0xD subdir entry
+ *   0xE subdir header
+ *   0xF volume dir header
+ *
+ * No ProDOS GS extensions, no sparse file support.
+ * ============================================================ */
+
+#define PRODOS_BSIZE 512
+#define PRODOS_ENTRY_SIZE 0x27   /* 39 */
+#define PRODOS_VOL_DIR_BLOCK 2
+
+typedef struct {
+    int fd;
+    off_t fs_off;
+} ProdosVol;
+
+/* Read a 512-byte ProDOS block. */
+static int prodos_read_block(ProdosVol *v, uint16_t blk, uint8_t buf[PRODOS_BSIZE]) {
+    if (lseek(v->fd, v->fs_off + (off_t)blk * PRODOS_BSIZE, SEEK_SET) < 0) return -1;
+    if (read(v->fd, buf, PRODOS_BSIZE) != PRODOS_BSIZE) return -1;
+    return 0;
+}
+
+/* Detect ProDOS: read block 2, check first entry's storage_type == 0xF. */
+static int prodos_open(int fd, off_t fs_off, ProdosVol *v) {
+    v->fd = fd; v->fs_off = fs_off;
+    uint8_t blk[PRODOS_BSIZE];
+    if (prodos_read_block(v, PRODOS_VOL_DIR_BLOCK, blk) != 0) return -1;
+    /* Entry 0 starts at offset 4 (after the prev/next header). */
+    uint8_t b0 = blk[4];
+    int stype = (b0 >> 4) & 0x0F;
+    if (stype != 0xF) return -1;
+    return 0;
+}
+
+/* Decode a 15-char ProDOS file name (length-prefixed in the high nibble
+ * pattern, low nibble of byte 0). */
+static void prodos_decode_name(const uint8_t *entry, char *out, size_t outsz) {
+    int n = entry[0] & 0x0F;
+    if (n > 15) n = 15;
+    if ((size_t)n + 1 > outsz) n = (int)outsz - 1;
+    memcpy(out, &entry[1], n);
+    out[n] = '\0';
+}
+
+typedef struct {
+    char     name[16];
+    int      storage_type;   /* high nibble of byte 0 */
+    uint8_t  file_type;
+    uint16_t key_pointer;
+    uint32_t eof;            /* 3-byte LE */
+    uint16_t blocks_used;
+    int      is_dir;
+} ProdosEnt;
+
+static int prodos_parse_entry(const uint8_t *e, ProdosEnt *out) {
+    int stype = (e[0] >> 4) & 0x0F;
+    if (stype == 0 || stype == 0xE || stype == 0xF) return -1; /* deleted or header */
+    memset(out, 0, sizeof(*out));
+    prodos_decode_name(e, out->name, sizeof(out->name));
+    out->storage_type = stype;
+    out->file_type    = e[16];
+    out->key_pointer  = read_le16(&e[0x11]);
+    out->blocks_used  = read_le16(&e[0x13]);
+    out->eof = e[0x15] | (e[0x16] << 8) | ((uint32_t)e[0x17] << 16);
+    out->is_dir = (stype == 0xD);
+    return 0;
+}
+
+/* Walk a directory's entries; cb returns 1 to stop. */
+typedef int (*ProdosLsCb)(const ProdosEnt *e, void *user);
+
+static int prodos_walk_dir(ProdosVol *v, uint16_t start_block,
+                            ProdosLsCb cb, void *user) {
+    uint16_t cur = start_block;
+    int max_blocks = 1024;
+    while (cur && max_blocks-- > 0) {
+        uint8_t blk[PRODOS_BSIZE];
+        if (prodos_read_block(v, cur, blk) != 0) return -1;
+        uint16_t next_blk = read_le16(&blk[2]);
+        for (int i = 0; i < 13; i++) {
+            const uint8_t *e = &blk[4 + i * PRODOS_ENTRY_SIZE];
+            int stype = (e[0] >> 4) & 0x0F;
+            if (stype == 0 || stype == 0xE || stype == 0xF) continue;
+            ProdosEnt ent;
+            if (prodos_parse_entry(e, &ent) != 0) continue;
+            if (cb(&ent, user)) return 0;
+        }
+        cur = next_blk;
+    }
+    return 0;
+}
+
+/* Resolve a path to a ProDOS entry. */
+static int prodos_resolve_path(ProdosVol *v, const char *path,
+                                ProdosEnt *out, int *is_root_dir,
+                                uint16_t *root_block_out) {
+    *is_root_dir = 1;
+    *root_block_out = PRODOS_VOL_DIR_BLOCK;
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s", path && path[0] ? path : "/");
+    char *p = tmp;
+    while (*p == '/') p++;
+    if (!*p) return 0;
+
+    uint16_t cur_block = PRODOS_VOL_DIR_BLOCK;
+    while (*p) {
+        char *slash = strchr(p, '/');
+        if (slash) *slash = '\0';
+        if (*p) {
+            /* Linear-scan this directory for `p`. */
+            uint16_t scan_blk = cur_block;
+            int found = 0;
+            ProdosEnt match;
+            int max_blocks = 1024;
+            while (scan_blk && max_blocks-- > 0) {
+                uint8_t blk[PRODOS_BSIZE];
+                if (prodos_read_block(v, scan_blk, blk) != 0) return -1;
+                uint16_t next_blk = read_le16(&blk[2]);
+                for (int i = 0; i < 13 && !found; i++) {
+                    const uint8_t *e = &blk[4 + i * PRODOS_ENTRY_SIZE];
+                    int st = (e[0] >> 4) & 0x0F;
+                    if (st == 0 || st == 0xE || st == 0xF) continue;
+                    ProdosEnt ent;
+                    if (prodos_parse_entry(e, &ent) != 0) continue;
+                    if (strcasecmp(ent.name, p) == 0) {
+                        match = ent;
+                        found = 1;
+                    }
+                }
+                if (found) break;
+                scan_blk = next_blk;
+            }
+            if (!found) return -1;
+            *out = match;
+            *is_root_dir = 0;
+            if (match.is_dir) {
+                cur_block = match.key_pointer;
+            } else {
+                if (slash) return -1;
+            }
+        }
+        if (!slash) break;
+        p = slash + 1;
+        while (*p == '/') p++;
+    }
+    return 0;
+}
+
+typedef struct { int printed; } ProdosLsCtx;
+static int prodos_ls_cb(const ProdosEnt *e, void *user) {
+    ProdosLsCtx *ctx = (ProdosLsCtx *)user;
+    char sz[32];
+    format_bytes(e->eof, sz, sizeof(sz));
+    printf("%s %10s  %-16s  type=0x%02x\n",
+           e->is_dir ? "d" : "-",
+           e->is_dir ? "-" : sz,
+           e->name, e->file_type);
+    ctx->printed++;
+    return 0;
+}
+
+static int fs_ls_prodos(int fd, off_t fs_off, const char *path) {
+    ProdosVol v;
+    if (prodos_open(fd, fs_off, &v) != 0) {
+        fprintf(stderr, "Error: not a ProDOS volume\n");
+        return 1;
+    }
+    ProdosEnt e;
+    int is_root_dir;
+    uint16_t root_block;
+    if (prodos_resolve_path(&v, path, &e, &is_root_dir, &root_block) != 0) {
+        fprintf(stderr, "Error: ProDOS path not found: %s\n", path);
+        return 1;
+    }
+    uint16_t list_block = is_root_dir ? root_block : (e.is_dir ? e.key_pointer : 0);
+    if (!list_block) {
+        fprintf(stderr, "Error: %s is not a directory\n", path);
+        return 1;
+    }
+    ProdosLsCtx ctx = {0};
+    prodos_walk_dir(&v, list_block, prodos_ls_cb, &ctx);
+    if (ctx.printed == 0) printf("  (empty)\n");
+    return 0;
+}
+
+/* Read up to `eof` bytes from a ProDOS file. Seedlings have key_pointer
+ * = data block; sapling files have key = index block (256 pointers);
+ * tree files have key = master index (128 ptrs to index blocks). */
+static int fs_get_prodos(int fd, off_t fs_off, const char *path,
+                          const char *host_out) {
+    ProdosVol v;
+    if (prodos_open(fd, fs_off, &v) != 0) {
+        fprintf(stderr, "Error: not a ProDOS volume\n");
+        return 1;
+    }
+    ProdosEnt e;
+    int is_root_dir;
+    uint16_t root_block;
+    if (prodos_resolve_path(&v, path, &e, &is_root_dir, &root_block) != 0
+        || is_root_dir) {
+        fprintf(stderr, "Error: ProDOS path not found: %s\n", path);
+        return 1;
+    }
+    if (e.is_dir) {
+        fprintf(stderr, "Error: %s is a directory\n", path);
+        return 1;
+    }
+
+    FILE *out = fopen(host_out, "wb");
+    if (!out) { fprintf(stderr, "Error: cannot create %s\n", host_out); return 1; }
+
+    uint32_t remaining = e.eof;
+    if (e.storage_type == 0x1) {
+        /* Seedling: key_pointer IS the data block. */
+        uint8_t blk[PRODOS_BSIZE];
+        if (prodos_read_block(&v, e.key_pointer, blk) == 0) {
+            uint32_t to_write = remaining > PRODOS_BSIZE ? PRODOS_BSIZE : remaining;
+            fwrite(blk, 1, to_write, out);
+        }
+    } else if (e.storage_type == 0x2) {
+        /* Sapling: key_pointer = index block. 256 LE u16 pointers. */
+        uint8_t idx[PRODOS_BSIZE];
+        if (prodos_read_block(&v, e.key_pointer, idx) == 0) {
+            /* ProDOS uses a quirky split-byte layout: low bytes in
+             * idx[0..256], high bytes in idx[256..512]. */
+            for (int i = 0; i < 256 && remaining > 0; i++) {
+                uint16_t b = idx[i] | ((uint16_t)idx[256 + i] << 8);
+                if (b == 0) {
+                    /* Sparse hole — write zeros. */
+                    uint8_t zeros[PRODOS_BSIZE] = {0};
+                    uint32_t to_write = remaining > PRODOS_BSIZE ? PRODOS_BSIZE : remaining;
+                    fwrite(zeros, 1, to_write, out);
+                    remaining -= to_write;
+                } else {
+                    uint8_t data[PRODOS_BSIZE];
+                    if (prodos_read_block(&v, b, data) != 0) break;
+                    uint32_t to_write = remaining > PRODOS_BSIZE ? PRODOS_BSIZE : remaining;
+                    fwrite(data, 1, to_write, out);
+                    remaining -= to_write;
+                }
+            }
+        }
+    } else if (e.storage_type == 0x3) {
+        /* Tree: master index block holds 128 ptrs to index blocks. */
+        uint8_t master[PRODOS_BSIZE];
+        if (prodos_read_block(&v, e.key_pointer, master) == 0) {
+            for (int m = 0; m < 128 && remaining > 0; m++) {
+                uint16_t idx_blk = master[m] | ((uint16_t)master[128 + m] << 8);
+                if (idx_blk == 0) {
+                    uint8_t zeros[PRODOS_BSIZE] = {0};
+                    for (int z = 0; z < 256 && remaining > 0; z++) {
+                        uint32_t to_write = remaining > PRODOS_BSIZE ? PRODOS_BSIZE : remaining;
+                        fwrite(zeros, 1, to_write, out);
+                        remaining -= to_write;
+                    }
+                    continue;
+                }
+                uint8_t idx[PRODOS_BSIZE];
+                if (prodos_read_block(&v, idx_blk, idx) != 0) break;
+                for (int i = 0; i < 256 && remaining > 0; i++) {
+                    uint16_t b = idx[i] | ((uint16_t)idx[256 + i] << 8);
+                    uint32_t to_write = remaining > PRODOS_BSIZE ? PRODOS_BSIZE : remaining;
+                    if (b == 0) {
+                        uint8_t zeros[PRODOS_BSIZE] = {0};
+                        fwrite(zeros, 1, to_write, out);
+                    } else {
+                        uint8_t data[PRODOS_BSIZE];
+                        if (prodos_read_block(&v, b, data) != 0) break;
+                        fwrite(data, 1, to_write, out);
+                    }
+                    remaining -= to_write;
+                }
+            }
+        }
+    } else {
+        fprintf(stderr, "Error: unsupported ProDOS storage type 0x%x\n",
+                e.storage_type);
+        fclose(out); return 1;
+    }
+    fclose(out);
+    fprintf(stderr, "Extracted %s (%u bytes) -> %s\n", path, e.eof, host_out);
     return 0;
 }
 
@@ -5146,6 +5462,7 @@ static int cmd_ls(int argc, char **argv) {
         case FS_HFS_PLUS:rc = fs_ls_hfsplus(fd, fs_off, path); break;
         case FS_FAT:     rc = fs_ls_fat(fd, fs_off, path); break;
         case FS_AFFS:    rc = fs_ls_affs(fd, fs_off, fs_size, path); break;
+        case FS_PRODOS:  rc = fs_ls_prodos(fd, fs_off, path); break;
         default:
             fprintf(stderr,
                 "Error: ls is not yet implemented for this filesystem.\n");
@@ -5191,6 +5508,8 @@ static int cmd_get(int argc, char **argv) {
             rc = fs_get_fat(fd, fs_off, path, host_out); break;
         case FS_AFFS:
             rc = fs_get_affs(fd, fs_off, fs_size, path, host_out); break;
+        case FS_PRODOS:
+            rc = fs_get_prodos(fd, fs_off, path, host_out); break;
         default:
             fprintf(stderr,
                 "Error: get is not yet implemented for this filesystem.\n");
