@@ -59,7 +59,7 @@ serde_json = "1"
 byteorder = "1"
 log = "0.4"
 env_logger = "0.11"
-libchdman-rs = { git = "https://github.com/danifunker/libchdman-rs" }
+libchdman-rs = { version = "0.287.0-l7", features = ["prebuilt"] }
 zstd = "0.13"
 zeekstd = "0.6"
 sha2 = "0.11"
@@ -75,7 +75,7 @@ unicode-normalization = "0.1"
 flate2 = "1"
 bzip2 = "0.6"
 base64 = "0.22"
-opticaldiscs = { git = "https://github.com/danifunker/opticaldiscs-rs", features = ["drives"] }
+opticaldiscs = { version = "0.4.2", features = ["drives"] }
 cd-da-reader = { git = "https://github.com/danifunker/rust-cd-da-reader", branch = "add-data-support-0-4-1" }
 serde_yml = "0.0.12"
 csv = "1"
