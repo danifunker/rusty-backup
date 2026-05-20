@@ -791,8 +791,15 @@ static int detect_partition_table(int fd, PartTable *pt) {
         return 0;
     }
 
-    /* Check superfloppy: ProDOS volume directory header at block 2. */
-    if (nr >= 2048 && ((sector[1024 + 4] >> 4) & 0x0F) == 0xF) {
+    /* Check superfloppy: ProDOS volume directory header at block 2.
+     * Validate via the first dir block's "prev_block" pointer (bytes
+     * 0-1 of block 2) being zero AND entry 0's storage type == 0xF.
+     * The prev_block check rules out random non-zero data — FAT32's
+     * first FAT entry happens to live at the same offset and would
+     * otherwise false-match. */
+    if (nr >= 2048
+        && sector[1024] == 0 && sector[1025] == 0
+        && ((sector[1024 + 4] >> 4) & 0x0F) == 0xF) {
         pt->type = PT_NONE;
         strcpy(pt->fs_hint, "ProDOS");
         return 0;
@@ -3441,14 +3448,16 @@ static int resolve_image_ref(const char *spec, int *fd_out,
             ft = FS_AFFS;
         }
         /* ProDOS: read block 2 (offset 1024); entry 0's high nibble
-         * == 0xF marks the volume directory header. */
+         * == 0xF marks the volume directory header. Require the
+         * dir block's prev_block (vol[0..2]) to be zero so we don't
+         * false-match on FAT32 cluster data. */
         if (ft == FS_UNKNOWN) {
             uint8_t vol[512];
             if (lseek(fd, off + 2 * 512, SEEK_SET) >= 0
-                && read(fd, vol, 512) == 512) {
-                if (((vol[4] >> 4) & 0x0F) == 0xF) {
-                    ft = FS_PRODOS;
-                }
+                && read(fd, vol, 512) == 512
+                && vol[0] == 0 && vol[1] == 0
+                && ((vol[4] >> 4) & 0x0F) == 0xF) {
+                ft = FS_PRODOS;
             }
         }
         /* ISO 9660: "CD001" magic at sector 16, offset 1 of the
@@ -4243,6 +4252,160 @@ static int fs_get_hfs(int fd, off_t fs_off, const char *path,
     free(data);
     fprintf(stderr, "Extracted %s (%u bytes) -> %s\n", path, got, host_out);
     return 0;
+}
+
+/* ============================================================
+ * FAT fsck (read-only check)
+ * ----------------------------------------------------------------
+ * Walks the FAT volume from the root directory and flags:
+ *
+ *   - cross-linked clusters  (two files reference the same cluster)
+ *   - lost clusters          (allocated in FAT, unreachable from root)
+ *   - bad cluster references (chain pointer < 2 or >= total_clusters)
+ *   - cluster-chain cycles   (loop detection via visited bitmap)
+ *
+ * No repair on PPC — diagnostic only. Exit code 0 = clean, 1 = issues.
+ * ============================================================ */
+
+typedef struct {
+    int cross_linked;
+    int lost_clusters;
+    int bad_refs;
+    int cycles;
+    int dirs_visited;
+    int files_visited;
+} FatFsckStats;
+
+static void fat_fsck_walk_chain(FatVol *v, uint32_t start_cluster,
+                                 uint8_t *seen, FatFsckStats *st) {
+    uint32_t cur = start_cluster;
+    int hops = 0;
+    while (cur >= 2 && !fat_is_eoc(cur, v->fat_type)) {
+        if (cur >= v->total_clusters + 2) {
+            st->bad_refs++;
+            return;
+        }
+        if (seen[cur]) {
+            /* Already seen — could be a cross-link OR a cycle within
+             * the same file. We can't distinguish without per-file
+             * tracking, so flag conservatively. */
+            st->cross_linked++;
+            return;
+        }
+        seen[cur] = 1;
+        cur = fat_read_entry(v->fat_data, cur, v->fat_type);
+        if (++hops > (int)v->total_clusters + 2) {
+            st->cycles++;
+            return;
+        }
+    }
+}
+
+static void fat_fsck_recurse(FatVol *v, uint32_t start_cluster,
+                              uint8_t *seen, FatFsckStats *st);
+
+static int fat_fsck_entry_cb(const FatDirEnt *de, void *user) {
+    void **uptr = (void **)user;
+    FatVol *v = (FatVol *)uptr[0];
+    uint8_t *seen = (uint8_t *)uptr[1];
+    FatFsckStats *st = (FatFsckStats *)uptr[2];
+    if (strcmp(de->name, ".") == 0 || strcmp(de->name, "..") == 0) return 0;
+    if (de->is_dir) {
+        st->dirs_visited++;
+        fat_fsck_recurse(v, de->start_cluster, seen, st);
+    } else {
+        st->files_visited++;
+        if (de->start_cluster >= 2) {
+            fat_fsck_walk_chain(v, de->start_cluster, seen, st);
+        }
+    }
+    return 0;
+}
+
+static void fat_fsck_recurse(FatVol *v, uint32_t start_cluster,
+                              uint8_t *seen, FatFsckStats *st) {
+    uint32_t dsz = 0;
+    uint8_t *dir = fat_read_dir(v, start_cluster, &dsz);
+    if (!dir) return;
+    /* Mark directory clusters as seen too. */
+    if (start_cluster >= 2) {
+        fat_fsck_walk_chain(v, start_cluster, seen, st);
+    }
+    void *user[3] = { v, seen, st };
+    fat_walk_dir(v, dir, dsz, fat_fsck_entry_cb, user);
+    free(dir);
+}
+
+static int cmd_fsck(int argc, char **argv) {
+    if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
+        fprintf(stderr,
+            "USAGE: rusty-backup fsck <IMAGE[@N]>\n\n"
+            "  Read-only FAT12/16/32 consistency check. Reports\n"
+            "  cross-linked / lost / bad-reference clusters and\n"
+            "  cluster-chain cycles. No repair on PPC.\n"
+        );
+        return 0;
+    }
+    const char *spec = nth_positional(argc, argv, 0);
+    if (!spec) {
+        fprintf(stderr, "Error: IMAGE[@N] is required\n");
+        return 1;
+    }
+    int fd;
+    off_t fs_off;
+    uint64_t fs_size;
+    BrowseFsType ft;
+    char label[64];
+    if (resolve_image_ref(spec, &fd, &fs_off, &fs_size, &ft,
+                          label, sizeof(label)) != 0) {
+        return 1;
+    }
+    if (ft != FS_FAT) {
+        fprintf(stderr, "Error: fsck supports only FAT12/16/32 on PPC.\n");
+        close(fd);
+        return 1;
+    }
+    FatVol v;
+    if (fat_open_browse(fd, fs_off, &v) != 0) {
+        fprintf(stderr, "Error: cannot open FAT volume\n");
+        close(fd);
+        return 1;
+    }
+
+    fprintf(stderr, "FAT%s, %u total clusters, %u bytes per cluster\n",
+            v.fat_type == FAT_12 ? "12" : v.fat_type == FAT_16 ? "16" : "32",
+            v.total_clusters, v.cluster_size);
+
+    uint8_t *seen = (uint8_t *)calloc(v.total_clusters + 2, 1);
+    if (!seen) {
+        fat_close_browse(&v); close(fd); return 1;
+    }
+    FatFsckStats st = {0};
+    fat_fsck_recurse(&v, (v.fat_type == FAT_32) ? v.root_cluster : 0,
+                      seen, &st);
+
+    /* Walk the FAT for lost clusters. */
+    for (uint32_t c = 2; c < v.total_clusters + 2; c++) {
+        uint32_t entry = fat_read_entry(v.fat_data, c, v.fat_type);
+        if (fat_is_allocated(entry, v.fat_type) && !seen[c]) {
+            st.lost_clusters++;
+        }
+    }
+
+    fprintf(stderr, "\nVisited %d dirs, %d files\n",
+            st.dirs_visited, st.files_visited);
+    fprintf(stderr, "  cross-linked clusters: %d\n", st.cross_linked);
+    fprintf(stderr, "  lost clusters:         %d\n", st.lost_clusters);
+    fprintf(stderr, "  bad cluster refs:      %d\n", st.bad_refs);
+    fprintf(stderr, "  cluster-chain cycles:  %d\n", st.cycles);
+
+    free(seen);
+    fat_close_browse(&v);
+    close(fd);
+    int rc = (st.cross_linked || st.lost_clusters || st.bad_refs || st.cycles) ? 1 : 0;
+    fprintf(stderr, "\n%s\n", rc == 0 ? "OK: filesystem appears clean" :
+                              "Issues found.");
+    return rc;
 }
 
 /* ============================================================
@@ -5605,6 +5768,7 @@ static void print_usage(const char *prog) {
         "  write <IMAGE> <TARGET>          Stream a raw image to a device or file\n"
         "  ls <IMAGE[@N]> [PATH]           List a directory inside a filesystem\n"
         "  get <IMAGE[@N]> <PATH> <OUT>    Extract one file to a host path\n"
+        "  fsck <IMAGE[@N]>                FAT consistency check (read-only)\n"
         "  show devices                    Enumerate available disk devices\n"
         "  show partmap <IMAGE>            Print partition table (MBR/GPT/APM)\n"
         "  show fs-info <IMAGE[@N]>        Print FAT/HFS volume metadata\n"
@@ -5667,6 +5831,8 @@ int main(int argc, char **argv) {
         return cmd_ls(sub_argc, sub_argv);
     } else if (strcmp(cmd, "get") == 0) {
         return cmd_get(sub_argc, sub_argv);
+    } else if (strcmp(cmd, "fsck") == 0) {
+        return cmd_fsck(sub_argc, sub_argv);
     } else if (strcmp(cmd, "show") == 0) {
         /* rb-cli surface: devices / partmap / fs-info implemented;
          * chd-info is not (no CHD support on the PPC build today). */
