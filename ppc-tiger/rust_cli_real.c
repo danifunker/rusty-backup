@@ -205,6 +205,8 @@ typedef struct {
     char     filesystem[32];
     uint64_t total_space;
     uint64_t avail_space;
+    /* partition-table-derived info (used when not mounted) */
+    char     part_type[96];     /* e.g. "Apple_HFS (MacOS TigerLNX)" */
 } DeviceInfo;
 
 /* ============================================================
@@ -394,6 +396,11 @@ static uint64_t get_device_size_ioctl(const char *path) {
     return 0;
 }
 
+/* Forward decl: defined after detect_partition_table(). Walks the disk's
+ * partition table and fills `part_type` / `size_bytes` on partition
+ * DeviceInfos that we couldn't get info for via ioctl/statfs. */
+static void enrich_devices_with_parttable(DeviceInfo *devices, int dev_count);
+
 static int cmd_list_devices(void) {
     printf("Scanning for disk devices...\n\n");
 
@@ -457,6 +464,12 @@ static int cmd_list_devices(void) {
                 devices[j] = tmp;
             }
 
+    /* Fill in partition type names + sizes from the on-disk partition
+     * table (APM / MBR / GPT) for entries that ioctl/statfs couldn't
+     * report — e.g. Apple_UNIX_SVR2 partitions and the partition map
+     * itself, which show up as 0 B from userland without root. */
+    enrich_devices_with_parttable(devices, dev_count);
+
     /* For whole disks with 0 size, try to infer from mounted partitions */
     for (int i = 0; i < dev_count; i++) {
         if (!devices[i].is_whole || devices[i].size_bytes > 0) continue;
@@ -509,6 +522,8 @@ static int cmd_list_devices(void) {
                 format_bytes(devices[j].avail_space, avsz, sizeof(avsz));
                 printf("  %s (%s, %s free)", devices[j].mount_point,
                        devices[j].filesystem, avsz);
+            } else if (devices[j].part_type[0]) {
+                printf("  %s", devices[j].part_type);
             }
             printf("\n");
         }
@@ -1035,6 +1050,88 @@ static int get_partition_list(const PartTable *pt, PartInfo *parts) {
     }
 
     return count;
+}
+
+/* Walk the partition table on each whole disk and fill in `part_type` /
+ * `size_bytes` on any disk0sN entries that ioctl/statfs couldn't report.
+ * The macOS /dev/diskNsM nodes are 1-based and match the raw on-disk
+ * slot, INCLUDING the partition map and driver entries for APM — so we
+ * walk the raw entries here rather than reusing get_partition_list()
+ * (which filters out map/driver/free). */
+static void enrich_devices_with_parttable(DeviceInfo *devices, int dev_count) {
+    for (int i = 0; i < dev_count; i++) {
+        if (!devices[i].is_whole) continue;
+
+        int fd = open(devices[i].path, O_RDONLY);
+        if (fd < 0) {
+            char rpath[160];
+            snprintf(rpath, sizeof(rpath), "/dev/r%s", devices[i].name);
+            fd = open(rpath, O_RDONLY);
+            if (fd < 0) continue;
+        }
+
+        PartTable pt;
+        if (detect_partition_table(fd, &pt) < 0) { close(fd); continue; }
+        close(fd);
+
+        int prefix_len = strlen(devices[i].name);
+        for (int j = 0; j < dev_count; j++) {
+            if (devices[j].is_whole) continue;
+            if (strncmp(devices[j].name, devices[i].name, prefix_len) != 0) continue;
+            if (devices[j].name[prefix_len] != 's') continue;
+            int slot = atoi(&devices[j].name[prefix_len + 1]);
+            if (slot < 1) continue;
+
+            char tname[96] = "";
+            uint64_t psize = 0;
+
+            if (pt.type == PT_APM) {
+                uint16_t bsz = pt.data.apm.block_size ? pt.data.apm.block_size : 512;
+                if (slot <= pt.data.apm.entry_count) {
+                    const ApmEntry *ae = &pt.data.apm.entries[slot - 1];
+                    if (ae->name[0])
+                        snprintf(tname, sizeof(tname), "%s (%s)", ae->type, ae->name);
+                    else
+                        snprintf(tname, sizeof(tname), "%s", ae->type);
+                    psize = (uint64_t)ae->block_count * bsz;
+                }
+            } else if (pt.type == PT_MBR) {
+                if (slot <= 4) {
+                    const MbrEntry *e = &pt.data.mbr.entries[slot - 1];
+                    if (e->type != 0 && e->total_sectors > 0) {
+                        snprintf(tname, sizeof(tname), "%s", partition_type_name(e->type));
+                        psize = (uint64_t)e->total_sectors * 512;
+                    }
+                } else if (slot - 5 < pt.data.mbr.logical_count) {
+                    const MbrEntry *e = &pt.data.mbr.logical[slot - 5];
+                    snprintf(tname, sizeof(tname), "%s", partition_type_name(e->type));
+                    psize = (uint64_t)e->total_sectors * 512;
+                }
+            } else if (pt.type == PT_GPT) {
+                if (slot <= (int)pt.data.gpt.entry_count) {
+                    const GptEntry *e = &pt.data.gpt.entries[slot - 1];
+                    const char *gname = gpt_type_name_from_guid(e->type_guid);
+                    if (e->name[0])
+                        snprintf(tname, sizeof(tname), "%s (%s)", gname, e->name);
+                    else
+                        snprintf(tname, sizeof(tname), "%s", gname);
+                    psize = (e->last_lba >= e->first_lba)
+                          ? (e->last_lba - e->first_lba + 1) * 512ULL : 0;
+                }
+            } else if (pt.type == PT_SGI) {
+                if (slot <= pt.data.sgi.entry_count) {
+                    const SgiEntry *se = &pt.data.sgi.entries[slot - 1];
+                    snprintf(tname, sizeof(tname), "%s", sgi_type_name(se->type));
+                    psize = (uint64_t)se->blocks * 512;
+                }
+            }
+
+            if (psize > 0 && devices[j].size_bytes == 0)
+                devices[j].size_bytes = psize;
+            if (tname[0] && !devices[j].part_type[0])
+                strncpy(devices[j].part_type, tname, sizeof(devices[j].part_type) - 1);
+        }
+    }
 }
 
 /* ============================================================
@@ -3374,6 +3471,126 @@ static void show_hfs_fs_info(int fd, off_t offset) {
     }
 }
 
+/* Print ext2/3/4 superblock metadata. Superblock lives at byte 1024 of
+ * the filesystem. Magic 0xEF53 at offset 0x38. */
+static void show_ext_fs_info(int fd, off_t offset) {
+    uint8_t sb[1024];
+    if (lseek(fd, offset + 1024, SEEK_SET) < 0) return;
+    if (read(fd, sb, 1024) != 1024) return;
+    if (read_le16(&sb[0x38]) != 0xEF53) {
+        printf("  (ext superblock magic missing at +1024)\n");
+        return;
+    }
+    uint32_t inodes_count = read_le32(&sb[0x00]);
+    uint32_t blocks_lo    = read_le32(&sb[0x04]);
+    uint32_t log_bs       = read_le32(&sb[0x18]);
+    uint32_t block_size   = 1024u << log_bs;
+    uint16_t state        = read_le16(&sb[0x3A]);
+    uint32_t rev          = read_le32(&sb[0x4C]);
+    uint32_t feat_compat  = read_le32(&sb[0x5C]);
+    uint32_t feat_incompat= read_le32(&sb[0x60]);
+    /* ext4 64-bit feature stores high 32 bits of block count at 0x150 */
+    uint64_t total_blocks = blocks_lo;
+    if (read_le32(&sb[0x60]) & 0x80) {   /* INCOMPAT_64BIT */
+        total_blocks |= ((uint64_t)read_le32(&sb[0x150])) << 32;
+    }
+    uint64_t total_bytes = total_blocks * (uint64_t)block_size;
+
+    char label[17];
+    memcpy(label, &sb[0x78], 16); label[16] = '\0';
+
+    char uuid[37];
+    const uint8_t *u = &sb[0x68];
+    snprintf(uuid, sizeof(uuid),
+        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        u[0],u[1],u[2],u[3], u[4],u[5], u[6],u[7],
+        u[8],u[9], u[10],u[11],u[12],u[13],u[14],u[15]);
+
+    /* Family: HAS_JOURNAL(0x4) in feat_compat -> ext3+; EXTENTS(0x40) in
+     * feat_incompat -> ext4 (extents are ext4's defining incompat). */
+    const char *family = "ext2";
+    if (feat_compat & 0x4) family = "ext3";
+    if (feat_incompat & 0x40) family = "ext4";
+
+    char sz[32];
+    format_bytes(total_bytes, sz, sizeof(sz));
+
+    printf("  Filesystem:        %s\n", family);
+    printf("  Volume label:      %s\n", label[0] ? label : "(none)");
+    printf("  UUID:              %s\n", uuid);
+    printf("  Block size:        %u\n", block_size);
+    printf("  Total blocks:      %llu\n", (unsigned long long)total_blocks);
+    printf("  Inode count:       %u\n", inodes_count);
+    printf("  Revision:          %u\n", rev);
+    printf("  Volume size:       %s\n", sz);
+    printf("  State:             0x%04x%s\n", state,
+           (state & 0x1) ? " (clean)" : " (not clean)");
+}
+
+/* Detect Linux swap. The magic "SWAPSPACE2" (or legacy "SWAP-SPACE")
+ * sits in the last 10 bytes of the first kernel page. Page size depends
+ * on the kernel that initialized the swap (4K, 8K, 16K, 64K on PPC). */
+static int probe_linux_swap(int fd, off_t offset, char *out_kind, int out_sz,
+                            uint32_t *out_page_size) {
+    static const int page_sizes[] = { 4096, 8192, 16384, 32768, 65536 };
+    uint8_t page[65536];
+    for (size_t i = 0; i < sizeof(page_sizes)/sizeof(*page_sizes); i++) {
+        int psz = page_sizes[i];
+        if (lseek(fd, offset, SEEK_SET) < 0) return 0;
+        if (read(fd, page, psz) != psz) continue;
+        const uint8_t *m = &page[psz - 10];
+        if (memcmp(m, "SWAPSPACE2", 10) == 0) {
+            snprintf(out_kind, out_sz, "Linux swap v1");
+            if (out_page_size) *out_page_size = (uint32_t)psz;
+            return 1;
+        }
+        if (memcmp(m, "SWAP-SPACE", 10) == 0) {
+            snprintf(out_kind, out_sz, "Linux swap (legacy)");
+            if (out_page_size) *out_page_size = (uint32_t)psz;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void show_swap_fs_info(int fd, off_t offset) {
+    char kind[32]; uint32_t psz = 0;
+    if (!probe_linux_swap(fd, offset, kind, sizeof(kind), &psz)) {
+        printf("  (no Linux swap magic found)\n");
+        return;
+    }
+    /* swap v1 header at the start of the page: version(0..4),
+     * last_page(4..8), nr_badpages(8..12), uuid(12..28), label(28..44). */
+    uint8_t hdr[64];
+    if (lseek(fd, offset + 1024, SEEK_SET) >= 0 && read(fd, hdr, 64) == 64) {
+        uint32_t version   = read_le32(&hdr[0]);
+        uint32_t last_page = read_le32(&hdr[4]);
+        char label[17]; memcpy(label, &hdr[28], 16); label[16] = '\0';
+        const uint8_t *u = &hdr[12];
+        char uuid[37];
+        snprintf(uuid, sizeof(uuid),
+            "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+            u[0],u[1],u[2],u[3], u[4],u[5], u[6],u[7],
+            u[8],u[9], u[10],u[11],u[12],u[13],u[14],u[15]);
+        uint64_t bytes = (uint64_t)(last_page + 1) * psz;
+        char sz[32]; format_bytes(bytes, sz, sizeof(sz));
+        printf("  Filesystem:        %s\n", kind);
+        printf("  Volume label:      %s\n", label[0] ? label : "(none)");
+        printf("  UUID:              %s\n", uuid);
+        printf("  Page size:         %u\n", psz);
+        printf("  Version:           %u\n", version);
+        printf("  Swap size:         %s (%u pages)\n", sz, last_page + 1);
+    } else {
+        printf("  Filesystem:        %s\n", kind);
+        printf("  Page size:         %u\n", psz);
+    }
+}
+
+static int is_ext_sb(const uint8_t *sb1024_plus) {
+    /* sb1024_plus points to the superblock itself (byte 1024 of FS) */
+    return read_le16(&sb1024_plus[0x38]) == 0xEF53;
+}
+
 static int cmd_show_fs_info(int argc, char **argv) {
     const char *spec = nth_positional(argc, argv, 0);
     if (!spec) {
@@ -3432,7 +3649,9 @@ static int cmd_show_fs_info(int argc, char **argv) {
                (unsigned long long)p->start_lba);
     }
 
-    /* Sniff for FAT first (its VBR has a strict signature), then HFS. */
+    /* Sniff for FAT first (strict VBR signature), then HFS/HFS+, then
+     * ext (magic at +0x438), then Linux swap (magic in last 10 bytes of
+     * the first page). */
     uint8_t probe[2048];
     if (lseek(fd, fs_offset, SEEK_SET) >= 0
         && read(fd, probe, 2048) >= 1024) {
@@ -3440,9 +3659,16 @@ static int cmd_show_fs_info(int argc, char **argv) {
             show_fat_fs_info(fd, fs_offset);
         } else if (is_hfs_sig(&probe[1024])) {
             show_hfs_fs_info(fd, fs_offset);
+        } else if (is_ext_sb(&probe[1024])) {
+            show_ext_fs_info(fd, fs_offset);
         } else {
-            printf("  (unrecognized filesystem; partition type hint: %s)\n",
-                   fs_hint);
+            char swap_kind[32];
+            if (probe_linux_swap(fd, fs_offset, swap_kind, sizeof(swap_kind), NULL)) {
+                show_swap_fs_info(fd, fs_offset);
+            } else {
+                printf("  (unrecognized filesystem; partition type hint: %s)\n",
+                       fs_hint);
+            }
         }
     }
 
