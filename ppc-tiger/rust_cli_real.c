@@ -531,6 +531,28 @@ static int cmd_list_devices(void) {
     }
 
     if (dev_count == 0) printf("No disk devices found.\n");
+
+    /* If we're not root AND any partition came back with no size and no
+     * mount info, the user is seeing a partial listing — nudge them to
+     * re-run with sudo so ioctl/raw-disk reads can succeed. */
+    if (geteuid() != 0) {
+        int incomplete = 0;
+        for (int i = 0; i < dev_count; i++) {
+            if (devices[i].is_whole) continue;
+            if (devices[i].mount_point[0]) continue;
+            if (devices[i].size_bytes == 0 && !devices[i].part_type[0]) {
+                incomplete = 1;
+                break;
+            }
+        }
+        if (incomplete) {
+            printf("Note: some partitions could not be probed without root.\n");
+            printf("      Re-run with sudo for full partition sizes + types:\n");
+            printf("        sudo %s show devices\n",
+                   /* argv[0] isn't in scope here; rely on the canonical name */
+                   "./rusty-backup-ppc");
+        }
+    }
     return 0;
 }
 
