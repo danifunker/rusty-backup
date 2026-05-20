@@ -3310,6 +3310,458 @@ static int cmd_show_fs_info(int argc, char **argv) {
 }
 
 /* ============================================================
+ * Browse Infrastructure (ls / get)
+ * ----------------------------------------------------------------
+ * Read-only filesystem browse layer. Each supported filesystem
+ * (HFS, ISO 9660, ProDOS, AFFS, FAT) implements two functions:
+ *
+ *   fs_ls_<X>(fd, fs_base_offset, path)
+ *      Print a directory listing to stdout.
+ *   fs_get_<X>(fd, fs_base_offset, path, host_out)
+ *      Extract one file to a host path.
+ *
+ * `cmd_ls` and `cmd_get` resolve `IMAGE[@N]`, sniff the filesystem
+ * at the partition's start offset, and dispatch.
+ * ============================================================ */
+
+typedef enum {
+    FS_UNKNOWN = 0,
+    FS_FAT,
+    FS_HFS,
+    FS_HFS_PLUS,
+    FS_ISO9660,
+    FS_PRODOS,
+    FS_AFFS
+} BrowseFsType;
+
+/* Resolve `IMAGE[@N]` to a (fd, fs_offset, fs_size, fs_type) tuple.
+ * If `@N` is omitted, treat the image as a superfloppy (offset 0).
+ * Returns 0 on success and the four out params populated. */
+static int resolve_image_ref(const char *spec, int *fd_out,
+                              off_t *fs_offset_out, uint64_t *fs_size_out,
+                              BrowseFsType *fs_type_out,
+                              char *fs_label_out, size_t fs_label_sz) {
+    char img_path[MAX_PATH_LEN];
+    int part_n = parse_img_at(spec, img_path, sizeof(img_path));
+    if (part_n < 0) {
+        fprintf(stderr, "Error: invalid @N selector in '%s'\n", spec);
+        return -1;
+    }
+
+    int fd = open(img_path, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "Error: cannot open %s: %s\n",
+                img_path, strerror(errno));
+        return -1;
+    }
+
+    PartTable pt;
+    if (detect_partition_table(fd, &pt) != 0) {
+        fprintf(stderr, "Error: cannot identify %s\n", img_path);
+        close(fd);
+        return -1;
+    }
+
+    off_t off = 0;
+    uint64_t fs_size = 0;
+    if (part_n == 0) {
+        if (pt.type != PT_NONE) {
+            fprintf(stderr, "Error: %s has a partition table; specify @N\n",
+                    img_path);
+            close(fd);
+            return -1;
+        }
+        struct stat st;
+        if (fstat(fd, &st) == 0) fs_size = st.st_size;
+    } else {
+        PartInfo parts[MAX_PARTITIONS];
+        int n = get_partition_list(&pt, parts);
+        if (part_n > n) {
+            fprintf(stderr, "Error: partition %d of %d on %s\n",
+                    part_n, n, img_path);
+            close(fd);
+            return -1;
+        }
+        off = (off_t)parts[part_n - 1].start_lba * SECTOR_SIZE;
+        fs_size = parts[part_n - 1].total_sectors * SECTOR_SIZE;
+    }
+
+    /* Sniff fs at fs_offset. */
+    BrowseFsType ft = FS_UNKNOWN;
+    if (fs_label_out && fs_label_sz > 0) fs_label_out[0] = '\0';
+    uint8_t probe[2048];
+    if (lseek(fd, off, SEEK_SET) >= 0
+        && read(fd, probe, 2048) >= 2048) {
+        if (is_fat_vbr(probe)) {
+            ft = FS_FAT;
+        } else if (is_hfs_sig(&probe[1024])) {
+            uint16_t sig = read_be16(&probe[1024]);
+            ft = (sig == 0x4244) ? FS_HFS : FS_HFS_PLUS;
+        }
+        /* ISO 9660: "CD001" magic at sector 16, offset 1 of the
+         * Primary Volume Descriptor. Read sector 16 from fs base. */
+        if (ft == FS_UNKNOWN) {
+            uint8_t pvd[2048];
+            if (lseek(fd, off + 16ULL * 2048, SEEK_SET) >= 0
+                && read(fd, pvd, 2048) == 2048
+                && memcmp(&pvd[1], "CD001", 5) == 0) {
+                ft = FS_ISO9660;
+                if (fs_label_out && fs_label_sz > 0) {
+                    /* Volume identifier at offset 40, 32 bytes, A-chars,
+                     * space-padded. */
+                    int copy = (fs_label_sz < 33) ? (int)fs_label_sz - 1 : 32;
+                    memcpy(fs_label_out, &pvd[40], copy);
+                    fs_label_out[copy] = '\0';
+                    /* Trim trailing spaces. */
+                    for (int i = copy - 1; i >= 0; i--) {
+                        if (fs_label_out[i] == ' ') fs_label_out[i] = '\0';
+                        else break;
+                    }
+                }
+            }
+        }
+    }
+    if (ft == FS_UNKNOWN) {
+        fprintf(stderr, "Error: no recognized filesystem at %s%s%d\n",
+                img_path, part_n ? "@" : " (superfloppy)",
+                part_n);
+        close(fd);
+        return -1;
+    }
+
+    *fd_out = fd;
+    *fs_offset_out = off;
+    *fs_size_out = fs_size;
+    *fs_type_out = ft;
+    return 0;
+}
+
+/* ============================================================
+ * ISO 9660 Reader
+ * ----------------------------------------------------------------
+ * Implements directory listing + file extraction for plain ISO 9660
+ * Level 1 / Level 2 / Joliet (UCS-2 BE). Path Tables are ignored;
+ * we walk the root directory record (in the PVD at byte 156) and
+ * recurse via directory-record extents.
+ *
+ * Limitations: Rock Ridge is not interpreted (files keep their ISO
+ * `;1` version suffix unless they're Joliet); multi-extent files
+ * (CONTINUATION flag) are not chained; interleaved files are not
+ * de-interleaved.
+ * ============================================================ */
+
+#define ISO_SECTOR 2048
+
+typedef struct {
+    uint32_t extent_lba;
+    uint32_t data_length;
+    uint8_t  flags;       /* bit 1 = directory */
+    char     name[256];   /* UTF-8 best-effort */
+} IsoDirRec;
+
+/* Parse one ISO 9660 directory record from `buf` of total length
+ * `buf_len`. Returns the record's length (in bytes) so the caller can
+ * advance; 0 means "no more records in this sector" (padded). */
+static int iso_parse_dirrec(const uint8_t *buf, int buf_len,
+                            int joliet, IsoDirRec *out) {
+    if (buf_len < 33) return 0;
+    int rec_len = buf[0];
+    if (rec_len == 0) return 0;
+    if (rec_len > buf_len) return 0;
+
+    out->extent_lba   = read_le32(&buf[2]);
+    out->data_length  = read_le32(&buf[10]);
+    out->flags        = buf[25];
+    int name_len      = buf[32];
+    if (name_len <= 0 || 33 + name_len > rec_len) return rec_len;
+
+    if (joliet) {
+        /* UCS-2 BE — decode to ASCII best-effort. */
+        int oi = 0;
+        for (int i = 0; i + 1 < name_len && oi < 255; i += 2) {
+            uint16_t u = read_be16(&buf[33 + i]);
+            out->name[oi++] = (u < 0x80) ? (char)u : '?';
+        }
+        out->name[oi] = '\0';
+    } else {
+        int copy = name_len < 255 ? name_len : 255;
+        memcpy(out->name, &buf[33], copy);
+        out->name[copy] = '\0';
+        /* Strip trailing ";1" version. */
+        char *semi = strrchr(out->name, ';');
+        if (semi) *semi = '\0';
+        /* Strip trailing dot for extensionless files. */
+        int ln = (int)strlen(out->name);
+        if (ln > 0 && out->name[ln - 1] == '.') out->name[ln - 1] = '\0';
+    }
+    return rec_len;
+}
+
+/* Find the file/directory `name` (case-insensitive) inside the
+ * directory whose extent starts at `dir_lba` and has byte length
+ * `dir_len`. Returns 0 on hit (out populated), -1 on miss. */
+static int iso_lookup_in_dir(int fd, off_t fs_off, uint32_t dir_lba,
+                              uint32_t dir_len, int joliet,
+                              const char *name, IsoDirRec *out) {
+    uint32_t total = dir_len;
+    uint32_t lba = dir_lba;
+    while (total > 0) {
+        uint8_t sec[ISO_SECTOR];
+        if (lseek(fd, fs_off + (off_t)lba * ISO_SECTOR, SEEK_SET) < 0) return -1;
+        if (read(fd, sec, ISO_SECTOR) != ISO_SECTOR) return -1;
+        int off = 0;
+        while (off < ISO_SECTOR) {
+            IsoDirRec rec;
+            int rl = iso_parse_dirrec(&sec[off], ISO_SECTOR - off, joliet, &rec);
+            if (rl == 0) break;
+            /* Skip "." and ".." (name_len 1 with bytes 0/1). */
+            uint8_t name_first = sec[off + 33];
+            if (sec[off] >= 34 && (name_first == 0 || name_first == 1)) {
+                off += rl;
+                continue;
+            }
+            if (strcasecmp(rec.name, name) == 0) {
+                *out = rec;
+                return 0;
+            }
+            off += rl;
+        }
+        lba++;
+        total = (total > ISO_SECTOR) ? total - ISO_SECTOR : 0;
+    }
+    return -1;
+}
+
+/* Resolve a `/a/b/c` path to a directory record. `path` may name a
+ * file or a directory; the result's `flags` bit 1 distinguishes. */
+static int iso_resolve_path(int fd, off_t fs_off, const char *path,
+                             IsoDirRec *out, int *joliet_out) {
+    /* Read PVD (sector 16) for the root directory record (offset 156,
+     * 34 bytes) and look for a Joliet SVD (escape sequence in
+     * descriptor type 2). */
+    uint8_t pvd[ISO_SECTOR];
+    if (lseek(fd, fs_off + 16ULL * ISO_SECTOR, SEEK_SET) < 0) return -1;
+    if (read(fd, pvd, ISO_SECTOR) != ISO_SECTOR) return -1;
+    if (memcmp(&pvd[1], "CD001", 5) != 0) return -1;
+
+    int joliet = 0;
+    uint8_t root_rec[34];
+    memcpy(root_rec, &pvd[156], 34);
+
+    /* Scan descriptors looking for a Joliet SVD (type 2, esc seq
+     * starts with 0x25 0x2F and ends with 0x40/43/45). If found,
+     * prefer its root record. */
+    for (uint32_t sec_n = 17; sec_n < 64; sec_n++) {
+        uint8_t d[ISO_SECTOR];
+        if (lseek(fd, fs_off + (off_t)sec_n * ISO_SECTOR, SEEK_SET) < 0) break;
+        if (read(fd, d, ISO_SECTOR) != ISO_SECTOR) break;
+        if (memcmp(&d[1], "CD001", 5) != 0) break;
+        if (d[0] == 0xFF) break;   /* terminator */
+        if (d[0] == 2) {
+            /* Supplementary Volume Descriptor. Joliet uses UCS-2 BE
+             * with escape sequence at offset 88, 32 bytes. */
+            const uint8_t *esc = &d[88];
+            if (esc[0] == 0x25 && esc[1] == 0x2F
+                && (esc[2] == 0x40 || esc[2] == 0x43 || esc[2] == 0x45)) {
+                memcpy(root_rec, &d[156], 34);
+                joliet = 1;
+                break;
+            }
+        }
+    }
+    *joliet_out = joliet;
+
+    uint32_t cur_lba = read_le32(&root_rec[2]);
+    uint32_t cur_len = read_le32(&root_rec[10]);
+    out->extent_lba = cur_lba;
+    out->data_length = cur_len;
+    out->flags = root_rec[25];
+    out->name[0] = '\0';
+
+    /* Walk path components. */
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s", path && path[0] ? path : "/");
+    char *p = tmp;
+    while (*p == '/') p++;
+    while (*p) {
+        char *slash = strchr(p, '/');
+        if (slash) *slash = '\0';
+        if (*p) {
+            IsoDirRec next;
+            if (iso_lookup_in_dir(fd, fs_off, out->extent_lba,
+                                  out->data_length, joliet, p, &next) != 0) {
+                return -1;
+            }
+            *out = next;
+        }
+        if (!slash) break;
+        p = slash + 1;
+        while (*p == '/') p++;
+    }
+    return 0;
+}
+
+/* Public: list ISO 9660 directory at `path`. */
+static int fs_ls_iso9660(int fd, off_t fs_off, const char *path) {
+    IsoDirRec d;
+    int joliet;
+    if (iso_resolve_path(fd, fs_off, path, &d, &joliet) != 0) {
+        fprintf(stderr, "Error: ISO 9660 path not found: %s\n", path);
+        return 1;
+    }
+    if (!(d.flags & 0x02)) {
+        fprintf(stderr, "Error: %s is not a directory\n", path);
+        return 1;
+    }
+    uint32_t total = d.data_length;
+    uint32_t lba = d.extent_lba;
+    while (total > 0) {
+        uint8_t sec[ISO_SECTOR];
+        if (lseek(fd, fs_off + (off_t)lba * ISO_SECTOR, SEEK_SET) < 0) return 1;
+        if (read(fd, sec, ISO_SECTOR) != ISO_SECTOR) return 1;
+        int off = 0;
+        while (off < ISO_SECTOR) {
+            IsoDirRec rec;
+            int rl = iso_parse_dirrec(&sec[off], ISO_SECTOR - off, joliet, &rec);
+            if (rl == 0) break;
+            uint8_t name_first = sec[off + 33];
+            if (sec[off] >= 34 && (name_first == 0 || name_first == 1)) {
+                off += rl;
+                continue;
+            }
+            char sz[32];
+            format_bytes(rec.data_length, sz, sizeof(sz));
+            printf("%s %10s  %s%s\n",
+                   (rec.flags & 0x02) ? "d" : "-", sz, rec.name,
+                   (rec.flags & 0x02) ? "/" : "");
+            off += rl;
+        }
+        lba++;
+        total = (total > ISO_SECTOR) ? total - ISO_SECTOR : 0;
+    }
+    return 0;
+}
+
+/* Public: extract one ISO 9660 file to `host_out`. */
+static int fs_get_iso9660(int fd, off_t fs_off, const char *path,
+                           const char *host_out) {
+    IsoDirRec f;
+    int joliet;
+    if (iso_resolve_path(fd, fs_off, path, &f, &joliet) != 0) {
+        fprintf(stderr, "Error: ISO 9660 path not found: %s\n", path);
+        return 1;
+    }
+    if (f.flags & 0x02) {
+        fprintf(stderr, "Error: %s is a directory\n", path);
+        return 1;
+    }
+    FILE *out = fopen(host_out, "wb");
+    if (!out) {
+        fprintf(stderr, "Error: cannot create %s: %s\n",
+                host_out, strerror(errno));
+        return 1;
+    }
+    if (lseek(fd, fs_off + (off_t)f.extent_lba * ISO_SECTOR, SEEK_SET) < 0) {
+        fclose(out); return 1;
+    }
+    uint8_t *buf = (uint8_t *)malloc(CHUNK_SIZE);
+    if (!buf) { fclose(out); return 1; }
+    uint32_t remaining = f.data_length;
+    while (remaining > 0) {
+        size_t to_read = remaining > CHUNK_SIZE ? CHUNK_SIZE : remaining;
+        ssize_t nr = read(fd, buf, to_read);
+        if (nr <= 0) break;
+        if (fwrite(buf, 1, nr, out) != (size_t)nr) break;
+        remaining -= nr;
+    }
+    free(buf);
+    fclose(out);
+    fprintf(stderr, "Extracted %s (%u bytes) -> %s\n",
+            path, f.data_length, host_out);
+    return 0;
+}
+
+/* ============================================================
+ * cmd_ls / cmd_get
+ * ============================================================ */
+
+static int cmd_ls(int argc, char **argv) {
+    if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
+        fprintf(stderr,
+            "USAGE: rusty-backup ls <IMAGE[@N]> [PATH]\n\n"
+            "  Lists a directory inside the partition's filesystem.\n"
+            "  Currently supported (read-only): ISO 9660.\n"
+            "  HFS, HFS+, FAT, ProDOS, AFFS are wired in subsequent slices.\n"
+        );
+        return 0;
+    }
+    const char *spec = nth_positional(argc, argv, 0);
+    const char *path = nth_positional(argc, argv, 1);
+    if (!path) path = "/";
+    if (!spec) {
+        fprintf(stderr, "Error: IMAGE[@N] is required\n");
+        return 1;
+    }
+
+    int fd;
+    off_t fs_off;
+    uint64_t fs_size;
+    BrowseFsType ft;
+    char label[64];
+    if (resolve_image_ref(spec, &fd, &fs_off, &fs_size, &ft,
+                          label, sizeof(label)) != 0) {
+        return 1;
+    }
+    int rc = 1;
+    switch (ft) {
+        case FS_ISO9660: rc = fs_ls_iso9660(fd, fs_off, path); break;
+        default:
+            fprintf(stderr,
+                "Error: ls is not yet implemented for this filesystem.\n");
+            break;
+    }
+    close(fd);
+    return rc;
+}
+
+static int cmd_get(int argc, char **argv) {
+    if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
+        fprintf(stderr,
+            "USAGE: rusty-backup get <IMAGE[@N]> <PATH> <HOST_OUT>\n\n"
+            "  Extracts one file from the partition's filesystem to a\n"
+            "  host file. Currently supported (read-only): ISO 9660.\n"
+        );
+        return 0;
+    }
+    const char *spec = nth_positional(argc, argv, 0);
+    const char *path = nth_positional(argc, argv, 1);
+    const char *host_out = nth_positional(argc, argv, 2);
+    if (!spec || !path || !host_out) {
+        fprintf(stderr, "Error: IMAGE[@N], PATH, and HOST_OUT are required\n");
+        return 1;
+    }
+    int fd;
+    off_t fs_off;
+    uint64_t fs_size;
+    BrowseFsType ft;
+    if (resolve_image_ref(spec, &fd, &fs_off, &fs_size, &ft,
+                          NULL, 0) != 0) {
+        return 1;
+    }
+    int rc = 1;
+    switch (ft) {
+        case FS_ISO9660:
+            rc = fs_get_iso9660(fd, fs_off, path, host_out); break;
+        default:
+            fprintf(stderr,
+                "Error: get is not yet implemented for this filesystem.\n");
+            break;
+    }
+    close(fd);
+    return rc;
+}
+
+/* ============================================================
  * Print Usage
  * ============================================================ */
 
@@ -3334,6 +3786,8 @@ static void print_usage(const char *prog) {
         "  restore <BACKUP_DIR> <TARGET>   Restore a backup\n"
         "  inspect <BACKUP_DIR>            Show metadata for an existing backup\n"
         "  write <IMAGE> <TARGET>          Stream a raw image to a device or file\n"
+        "  ls <IMAGE[@N]> [PATH]           List a directory inside a filesystem\n"
+        "  get <IMAGE[@N]> <PATH> <OUT>    Extract one file to a host path\n"
         "  show devices                    Enumerate available disk devices\n"
         "  show partmap <IMAGE>            Print partition table (MBR/GPT/APM)\n"
         "  show fs-info <IMAGE[@N]>        Print FAT/HFS volume metadata\n"
@@ -3392,6 +3846,10 @@ int main(int argc, char **argv) {
         return cmd_inspect(sub_argc, sub_argv);
     } else if (strcmp(cmd, "write") == 0) {
         return cmd_write(sub_argc, sub_argv);
+    } else if (strcmp(cmd, "ls") == 0) {
+        return cmd_ls(sub_argc, sub_argv);
+    } else if (strcmp(cmd, "get") == 0) {
+        return cmd_get(sub_argc, sub_argv);
     } else if (strcmp(cmd, "show") == 0) {
         /* rb-cli surface: devices / partmap / fs-info implemented;
          * chd-info is not (no CHD support on the PPC build today). */
