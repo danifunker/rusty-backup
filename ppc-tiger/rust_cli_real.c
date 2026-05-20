@@ -158,7 +158,14 @@ typedef struct {
     } data;
     char     fs_hint[16];       /* for superfloppy */
     uint64_t disk_size;
+    /* For DC42 / 2MG / etc wrappers: byte offset of the raw image
+     * data within the host file. 0 for plain raw images. Consumers
+     * must add this to every absolute byte offset when reading. */
+    uint64_t image_data_offset;
 } PartTable;
+
+/* Forward decl: detect_image_wrapper lives below the wrapper section. */
+static uint64_t detect_image_wrapper(int fd);
 
 typedef struct {
     int      index;
@@ -724,7 +731,14 @@ static int detect_partition_table(int fd, PartTable *pt) {
     uint8_t sector[2048];  /* need 4 sectors for HFS check */
     memset(pt, 0, sizeof(*pt));
 
-    if (lseek(fd, 0, SEEK_SET) < 0) return -1;
+    /* Sniff for a DC42 / 2MG wrapper. If present, strip the wrapper
+     * by reading the raw image data from `image_data_offset`. Since
+     * wrappers only show up on superfloppy-style images, we know the
+     * inside is either FAT/HFS/HFS+/ProDOS/AFFS (no partition table). */
+    uint64_t img_off = detect_image_wrapper(fd);
+    pt->image_data_offset = img_off;
+
+    if (lseek(fd, (off_t)img_off, SEEK_SET) < 0) return -1;
     int nr = read(fd, sector, 2048);
     if (nr < 512) return -1;
 
@@ -3380,7 +3394,7 @@ static int resolve_image_ref(const char *spec, int *fd_out,
         return -1;
     }
 
-    off_t off = 0;
+    off_t off = (off_t)pt.image_data_offset;
     uint64_t fs_size = 0;
     if (part_n == 0) {
         if (pt.type != PT_NONE) {
@@ -3390,7 +3404,11 @@ static int resolve_image_ref(const char *spec, int *fd_out,
             return -1;
         }
         struct stat st;
-        if (fstat(fd, &st) == 0) fs_size = st.st_size;
+        if (fstat(fd, &st) == 0) {
+            fs_size = (uint64_t)st.st_size > pt.image_data_offset
+                    ? (uint64_t)st.st_size - pt.image_data_offset
+                    : 0;
+        }
     } else {
         PartInfo parts[MAX_PARTITIONS];
         int n = get_partition_list(&pt, parts);
@@ -3400,7 +3418,8 @@ static int resolve_image_ref(const char *spec, int *fd_out,
             close(fd);
             return -1;
         }
-        off = (off_t)parts[part_n - 1].start_lba * SECTOR_SIZE;
+        off = (off_t)pt.image_data_offset
+            + (off_t)parts[part_n - 1].start_lba * SECTOR_SIZE;
         fs_size = parts[part_n - 1].total_sectors * SECTOR_SIZE;
     }
 
@@ -4223,6 +4242,46 @@ static int fs_get_hfs(int fd, off_t fs_off, const char *path,
     fclose(out);
     free(data);
     fprintf(stderr, "Extracted %s (%u bytes) -> %s\n", path, got, host_out);
+    return 0;
+}
+
+/* ============================================================
+ * DC42 / 2MG Image-Format Wrappers
+ * ----------------------------------------------------------------
+ * Both formats wrap a raw disk image with a small header. The
+ * `image_data_offset` returned here is added to every subsequent
+ * raw-byte access (partition tables, filesystem reads).
+ *
+ *   DC42 (DiskCopy 4.2): 84-byte header with byte[82..84]=0x0100
+ *   magic. Name length byte at offset 0 (1..63).
+ *
+ *   2MG (2IMG): "2IMG" magic at offset 0, data offset at LE u32[0x18].
+ * ============================================================ */
+
+/* Detect a DC42 or 2MG wrapper at the start of `fd`. Returns the
+ * byte offset of the raw image data on success, 0 on plain (raw)
+ * input. */
+static uint64_t detect_image_wrapper(int fd) {
+    uint8_t hdr[128];
+    if (lseek(fd, 0, SEEK_SET) < 0) return 0;
+    int n = read(fd, hdr, 128);
+    if (n < 64) return 0;
+
+    /* 2IMG: magic at offset 0, data offset at [0x18..0x1C] LE. */
+    if (memcmp(hdr, "2IMG", 4) == 0) {
+        uint16_t hsz = read_le16(&hdr[8]);
+        if (hsz < 64) return 0;
+        uint32_t off = read_le32(&hdr[0x18]);
+        return off ? (uint64_t)off : 64;
+    }
+    /* DC42: name byte 0 is 1..63, magic 0x0100 at bytes [82..84]. */
+    if (n >= 84) {
+        uint16_t magic = (hdr[82] << 8) | hdr[83];
+        if (magic == 0x0100 && hdr[0] >= 1 && hdr[0] <= 63) {
+            uint32_t data_size = read_be32(&hdr[64]);
+            if (data_size > 0) return 84;
+        }
+    }
     return 0;
 }
 
