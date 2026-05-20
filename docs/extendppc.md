@@ -26,6 +26,31 @@ top of what's there".
 | CRC32 checksums | done (zlib) |
 | `backup` / `restore` / `inspect` / `show devices` / `optical rip` | done (CLI-alignment PR) |
 
+### Tier 1 — shipped 2026-05-19
+
+| Feature | Commit |
+|---|---|
+| `--checksum sha256` (CommonCrypto) | `0a8100a` |
+| `--split-size <MIB>` | `d0540fb` |
+| `--sparse` (raw zero-skip) | `2fd3314` |
+| `--format vhd` (Fixed footer) | `31d0c3c` |
+| GPT read + CRC32 + `gpt.json` sidecar | `1f919ee` |
+| `show partmap` + `show fs-info` | `6fe952f` |
+
+### Tier 2 — shipped 2026-05-20
+
+| Feature | Commit |
+|---|---|
+| `write IMG TARGET` raw streamer | `0af7573` |
+| `ls` / `get` + ISO 9660 reader | `f3fe107` |
+| Classic HFS reader | `2ef985d` |
+| FAT12/16/32 reader | `b2d3fc7` |
+| HFS+ / HFSX reader | `0c44180` |
+| AFFS (Amiga FFS/OFS) reader | `d7c5970` |
+| ProDOS reader | `b170fd2` |
+| DC42 + 2MG image wrappers (transparent) | `f97e2f1` |
+| FAT `fsck` (read-only) | `34a21ec` |
+
 ---
 
 ## Tier 1 — free or near-free (≤ ~200 LOC, no external deps)
@@ -50,18 +75,29 @@ and documented, or are pure byte arithmetic.
 Small filesystems and well-spec'd formats. PowerPC's native BE byte
 order makes several of these easier than they look.
 
-| Feature | Effort | Notes |
-|---|---|---|
-| **ISO 9660 read** (`optical browse` / `optical extract` for data discs) | Medium-low | Pure spec; ~500 LOC for PVD + path table + directory records. Rock Ridge / Joliet extensions are optional. |
-| **ProDOS read** (Apple II) | Medium-low | Small filesystem, well-documented, BE-friendly. ~600 LOC in Rust would compress in C. |
-| **AFFS read** (Amiga) | Medium-low | BE on-disk; PowerPC native. The hard part (Disk Validator fsck, edit) can be skipped — read-only is straightforward. |
-| **HFS read** (classic Mac) | Medium | This is the showcase one: BE-native (same as PowerPC), well-documented (IM:F), and the *reading* side avoids the B-tree split / map-node complexity that bloats the Rust write side. Estimate ~1500 LOC C for read + browse + extract. The Rust write side took weeks; the read side is much smaller. |
-| **DC42 / 2MG / WOZ-read** image formats | Medium-low each | All portable byte-bashing. WOZ is the most complex; DC42 + 2MG are ~200 LOC each. |
-| **`write IMG /dev/rdiskN`** | Trivial (~50 LOC) | Just `open + read + write`. The PPC `rip` command already does almost exactly this. |
-| **`new --fs fat`** (blank FAT volume) | Medium-low | The Rust `create_blank_fat` is ~300 LOC; FAT formatter math is well-trodden. |
-| **`fsck` (FAT only)** | Medium | Cluster-chain walk, lost-cluster detection. Reuses existing compaction's FAT reader. |
-| **`partmap` edit (MBR / APM)** | Medium | Add / resize / delete entries, recompute CHS for MBR. Partition *data* moves are out of scope here — rb-cli doesn't move data either. |
-| **`batch` JSON runner** | Medium | The verb dispatcher already exists; `batch` just reads JSON and replays. Needs a small JSON parser (or hand-coded for the small grammar). |
+✅ shipped 2026-05-20:
+
+| Feature | Status |
+|---|---|
+| **ISO 9660 read** (`ls` / `get`) | done; Joliet detection works, no Rock Ridge |
+| **HFS read** (classic Mac) | done; verified against 40 MiB Quadra image |
+| **HFS+ / HFSX read** | done; verified against HFS+J test image |
+| **FAT12/16/32 read** (`ls` / `get` with LFN) | done; full cluster-chain follow |
+| **AFFS read** (Amiga) | done; FFS + OFS, extension-block chain |
+| **ProDOS read** (Apple II) | done; seedling/sapling/tree storage types |
+| **DC42 / 2MG image wrappers** | done; transparent — adds image_data_offset to PartTable |
+| **`write IMG /dev/rdiskN`** | done; `--yes` guard on device targets |
+| **`fsck` (FAT)** | done; read-only diagnostic for cross-links / lost / cycles |
+
+⏭️ deferred (not shipped, future work):
+
+| Feature | Why deferred |
+|---|---|
+| **`new --fs fat`** (blank FAT volume) | Limited value without a `put` verb to populate it; the user can still mount blank images via macOS Finder. |
+| **`partmap` edit (MBR / APM)** | Significant write code (~600 LOC); higher value once restore-with-resize lands. |
+| **`batch` JSON runner** | Depends on the read-only verbs being polished + a `put` verb; revisit after Tier 3. |
+| **WOZ read** | Niche Apple II format; defer until a clear use case shows up. |
+| **RDB partition table** | Needed to browse AFFS partitions inside Amiga hard-disk images. ~300 LOC. Deferred — most Amiga vintage images are floppies, which work via raw `.adf`. |
 
 ---
 
