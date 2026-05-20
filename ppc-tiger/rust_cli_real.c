@@ -5792,11 +5792,14 @@ static int fs_get_iso9660(int fd, off_t fs_off, const char *path,
 #define EXT_ROOT_INO          2
 #define EXT4_EXTENTS_FL       0x00080000u
 #define EXT4_EXT_MAGIC        0xF30A
-#define EXT_INCOMPAT_EXTENTS  0x0040
-#define EXT_INCOMPAT_64BIT    0x0080
-#define EXT_S_IFMT            0xF000
-#define EXT_S_IFDIR           0x4000
-#define EXT_S_IFREG           0x8000
+#define EXT_INCOMPAT_EXTENTS    0x0040
+#define EXT_INCOMPAT_64BIT      0x0080
+#define EXT_INCOMPAT_INLINE_DATA 0x8000
+#define EXT4_INLINE_DATA_FL     0x10000000u
+#define EXT_S_IFMT              0xF000
+#define EXT_S_IFDIR             0x4000
+#define EXT_S_IFREG             0x8000
+#define EXT_S_IFLNK             0xA000
 
 typedef struct {
     int       fd;
@@ -5809,6 +5812,7 @@ typedef struct {
     uint16_t  desc_size;
     int       is_64bit;
     int       has_extents;
+    int       has_inline_data;
     uint8_t  *gdt;
     uint32_t  gdt_len;
 } Ext2Vol;
@@ -5840,8 +5844,9 @@ static int ext2_open(int fd, off_t fs_off, Ext2Vol *v) {
     if (v->block_size < 1024 || v->block_size > 65536) return -1;
     if (blocks_per_group == 0 || v->inodes_per_group == 0) return -1;
 
-    v->has_extents = (feat_incompat & EXT_INCOMPAT_EXTENTS) != 0;
-    v->is_64bit    = (feat_incompat & EXT_INCOMPAT_64BIT) != 0;
+    v->has_extents     = (feat_incompat & EXT_INCOMPAT_EXTENTS) != 0;
+    v->is_64bit        = (feat_incompat & EXT_INCOMPAT_64BIT) != 0;
+    v->has_inline_data = (feat_incompat & EXT_INCOMPAT_INLINE_DATA) != 0;
 
     uint64_t total_blocks = read_le32(&sb[0x04]);
     if (v->is_64bit) total_blocks |= (uint64_t)read_le32(&sb[0x150]) << 32;
@@ -6085,17 +6090,21 @@ static int ext2_ls_cb(uint32_t ino, const char *name, uint8_t ftype,
                       void *user) {
     Ext2LsCtx *c = (Ext2LsCtx *)user;
     Ext2Inode in;
-    int is_dir;
+    char t = '-';
     uint64_t size = 0;
     if (ext2_read_inode(c->v, ino, &in) == 0) {
-        is_dir = (in.mode & EXT_S_IFMT) == EXT_S_IFDIR;
-        size = in.size;
-    } else {
-        is_dir = (ftype == 2);   /* fall back to dir-entry file_type */
+        uint16_t fmt = in.mode & EXT_S_IFMT;
+        if (fmt == EXT_S_IFDIR) t = 'd';
+        else if (fmt == EXT_S_IFLNK) t = 'l';
+        size = (t == 'd') ? 0 : in.size;
+    } else if (ftype == 2) {
+        t = 'd';                  /* fall back to dir-entry file_type */
+    } else if (ftype == 7) {
+        t = 'l';                  /* FT_SYMLINK */
     }
     char sz[32];
     format_bytes(size, sz, sizeof(sz));
-    printf("%s %10s  %s%s\n", is_dir ? "d" : "-", sz, name, is_dir ? "/" : "");
+    printf("%c %10s  %s%s\n", t, sz, name, t == 'd' ? "/" : "");
     c->printed++;
     return 0;
 }
@@ -6123,6 +6132,38 @@ static int fs_ls_ext2(int fd, off_t fs_off, const char *path) {
     return 0;
 }
 
+/* Read a symlink's target string into `buf` (NUL-terminated). ext stores
+ * "fast" symlinks (size < 60, no extents) directly in i_block; longer
+ * "slow" symlinks live in regular data blocks. Returns the number of
+ * payload bytes written (excluding the terminator). */
+static size_t ext_read_symlink_target(const Ext2Vol *v, const Ext2Inode *in,
+                                      char *buf, size_t bufsz) {
+    if (bufsz == 0) return 0;
+    size_t n = (size_t)in->size;
+    if (n >= bufsz) n = bufsz - 1;
+    if (in->size < 60 && (in->flags & EXT4_EXTENTS_FL) == 0) {
+        memcpy(buf, in->block, n);
+        buf[n] = '\0';
+        return n;
+    }
+    Ext2BlockList bl;
+    if (ext2_block_list(v, in, &bl) != 0 || bl.count == 0 || bl.blocks[0] == 0) {
+        free(bl.blocks);
+        buf[0] = '\0';
+        return 0;
+    }
+    uint8_t *blk = (uint8_t *)malloc(v->block_size);
+    if (!blk) { free(bl.blocks); buf[0] = '\0'; return 0; }
+    if (ext2_read_block(v, bl.blocks[0], blk) != 0) {
+        free(blk); free(bl.blocks); buf[0] = '\0'; return 0;
+    }
+    if (n > v->block_size) n = (size_t)v->block_size;
+    memcpy(buf, blk, n);
+    buf[n] = '\0';
+    free(blk); free(bl.blocks);
+    return n;
+}
+
 static int fs_get_ext2(int fd, off_t fs_off, const char *path,
                        const char *host_out) {
     Ext2Vol v;
@@ -6139,6 +6180,38 @@ static int fs_get_ext2(int fd, off_t fs_off, const char *path,
     if ((in.mode & EXT_S_IFMT) == EXT_S_IFDIR) {
         fprintf(stderr, "Error: %s is a directory\n", path);
         ext2_close(&v); return 1;
+    }
+    /* Symlink: refuse with a target hint instead of writing the link
+     * text (which would otherwise show up as the "file" contents). */
+    if ((in.mode & EXT_S_IFMT) == EXT_S_IFLNK) {
+        char target[4096];
+        size_t tlen = ext_read_symlink_target(&v, &in, target, sizeof(target));
+        if (tlen > 0)
+            fprintf(stderr, "Error: %s is a symlink to '%s'; "
+                            "pass the target path\n", path, target);
+        else
+            fprintf(stderr, "Error: %s is a symlink; "
+                            "pass the target path\n", path);
+        ext2_close(&v); return 1;
+    }
+    /* ext4 INLINE_DATA: tiny file contents (<= 60 bytes) live in the
+     * inode's 60-byte i_block area instead of in a data block. Larger
+     * inline files spill into a system.data xattr, which we don't
+     * parse — cap support at the 60-byte tier. */
+    if (v.has_inline_data && (in.flags & EXT4_INLINE_DATA_FL) != 0) {
+        FILE *out = fopen(host_out, "wb");
+        if (!out) {
+            fprintf(stderr, "Error: cannot create %s: %s\n",
+                    host_out, strerror(errno));
+            ext2_close(&v); return 1;
+        }
+        size_t n = (in.size > 60) ? 60 : (size_t)in.size;
+        fwrite(in.block, 1, n, out);
+        fclose(out);
+        ext2_close(&v);
+        fprintf(stderr, "Extracted %s (%llu bytes, inline) -> %s\n",
+                path, (unsigned long long)n, host_out);
+        return 0;
     }
     Ext2BlockList bl;
     if (ext2_block_list(&v, &in, &bl) != 0) {
@@ -6744,6 +6817,37 @@ static int fs_get_efs(int fd, off_t fs_off, const char *path,
     }
     if ((in.mode & 0xF000) == 0x4000) {
         fprintf(stderr, "Error: %s is a directory\n", path);
+        return 1;
+    }
+    /* Symlink: refuse with a target hint instead of writing the link
+     * text. EFS stores the target as the file's content (first block
+     * of the first extent). */
+    if ((in.mode & 0xF000) == 0xA000) {
+        char target[4096];
+        size_t tlen = 0;
+        uint32_t nx = 0;
+        EfsExtent *ex = efs_resolve_extents(&v, &in, &nx);
+        if (ex && nx > 0) {
+            uint8_t blk[EFS_BLOCKSIZE];
+            uint32_t bn = ex[0].bn;
+            if (lseek(fd, fs_off + (off_t)bn * EFS_BLOCKSIZE, SEEK_SET) >= 0
+                && read(fd, blk, EFS_BLOCKSIZE) == EFS_BLOCKSIZE) {
+                tlen = in.size;
+                if (tlen > sizeof(target) - 1) tlen = sizeof(target) - 1;
+                if (tlen > EFS_BLOCKSIZE) tlen = EFS_BLOCKSIZE;
+                memcpy(target, blk, tlen);
+                /* Trim trailing NULs (EFS pads the block). */
+                while (tlen > 0 && target[tlen - 1] == '\0') tlen--;
+                target[tlen] = '\0';
+            }
+        }
+        free(ex);
+        if (tlen > 0)
+            fprintf(stderr, "Error: %s is a symlink to '%s'; "
+                            "pass the target path\n", path, target);
+        else
+            fprintf(stderr, "Error: %s is a symlink; "
+                            "pass the target path\n", path);
         return 1;
     }
     uint32_t nexts = 0;

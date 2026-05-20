@@ -102,7 +102,7 @@ above is in place. Per-tier they're listed roughly highest-value first.
 | Feature | Effort | Notes |
 |---|---|---|
 | **NTFS read** (`ls` / `get`) | ~3000 LOC C | The big missing one for "browse any common PC disk." MFT records, runlists, B+ tree indices, UTF-16LE names. Pure reads, no vendored code; extends the existing browse pattern. The Rust impl is ~800 LOC but the on-disk surface (security descriptors, attributes, sparse files) sprawls. |
-| **ext3 / ext4 fuller read** | Mostly already done | Our ext2 reader already handles ext4 extent trees and ext3 is read-compatible with ext2 (the journal is ignorable for read). The remaining work is htree-as-index for very large hashed directories (the current linear leaf walk is *correct*, just O(N) on directories with thousands of entries). Likely YAGNI for vintage images. |
+| **ext3 / ext4 fuller read** | Mostly done | ext4 extent trees + ext3 (journal-ignore) already shipped with the ext2 reader. Added 2026-05-20: `INLINE_DATA` (ext4 tiny-file inline content) and symlink-refuse hint in `get` (also applied to EFS for consistency). What's left is htree-as-index for very large hashed directories — current linear leaf walk is correct, just O(N) on directories with thousands of entries. Likely YAGNI for vintage images. |
 
 ### Tier C — vendor third-party code (weeks of build-plumbing work)
 

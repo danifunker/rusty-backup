@@ -86,18 +86,31 @@ else
     "$BIN" ls "$EXT2_IMG" /subdir   > "$TMP/e_sub.txt"  2>&1
     echo "  --- ls / ---"; sed 's/^/    /' "$TMP/e_root.txt"
 
-    check_contains "$TMP/e_root.txt" "hello.txt" "ext2: root lists hello.txt"
-    check_contains "$TMP/e_root.txt" "big.bin"   "ext2: root lists big.bin"
-    check_contains "$TMP/e_root.txt" "subdir/"   "ext2: root lists subdir/"
-    check_contains "$TMP/e_sub.txt"  "inner.txt" "ext2: subdir lists inner.txt"
+    check_contains "$TMP/e_root.txt" "hello.txt"        "ext2: root lists hello.txt"
+    check_contains "$TMP/e_root.txt" "big.bin"          "ext2: root lists big.bin"
+    check_contains "$TMP/e_root.txt" "subdir/"          "ext2: root lists subdir/"
+    check_contains "$TMP/e_root.txt" "inline_tiny.txt"  "ext2: root lists inline_tiny.txt"
+    check_contains "$TMP/e_root.txt" "l.*symlink_fast"  "ext2: symlink_fast tagged 'l' in ls"
+    check_contains "$TMP/e_sub.txt"  "inner.txt"        "ext2: subdir lists inner.txt"
 
     "$BIN" get "$EXT2_IMG" /hello.txt        "$TMP/e_hello"  >/dev/null 2>&1
     "$BIN" get "$EXT2_IMG" /subdir/inner.txt "$TMP/e_inner"  >/dev/null 2>&1
     "$BIN" get "$EXT2_IMG" /big.bin          "$TMP/e_big"    >/dev/null 2>&1
+    "$BIN" get "$EXT2_IMG" /inline_tiny.txt  "$TMP/e_inline" >/dev/null 2>&1
+    # symlink_fast: get must REFUSE with the target hint on stderr.
+    "$BIN" get "$EXT2_IMG" /symlink_fast     "$TMP/e_sym"    >"$TMP/e_sym_out" 2>"$TMP/e_sym_err"
+    sym_rc=$?
 
-    check_text "$TMP/e_hello" "Hello, ext2 world!"   "ext2: get hello.txt content"
-    check_text "$TMP/e_inner" "nested file contents" "ext2: get nested inner.txt content"
+    check_text "$TMP/e_hello"  "Hello, ext2 world!"   "ext2: get hello.txt content"
+    check_text "$TMP/e_inner"  "nested file contents" "ext2: get nested inner.txt content"
     check_fill "$TMP/e_big" 5000 A "ext2: get big.bin (5000 bytes, all 'A' = indirect map)"
+    check_text "$TMP/e_inline" "INLINE FILE!"         "ext2: get inline_tiny.txt content (INLINE_DATA)"
+    if [ "$sym_rc" != "0" ]; then ok "ext2: get on symlink exits non-zero"
+    else bad "ext2: get on symlink exits non-zero (got rc=$sym_rc)"; fi
+    check_contains "$TMP/e_sym_err" "is a symlink to 'target_path'" \
+        "ext2: get on symlink prints target hint"
+    if [ ! -s "$TMP/e_sym" ]; then ok "ext2: get on symlink does not write output file"
+    else bad "ext2: get on symlink wrote $(wc -c < "$TMP/e_sym") bytes to output"; fi
 fi
 echo ""
 

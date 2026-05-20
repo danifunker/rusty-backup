@@ -90,7 +90,16 @@ All big-endian (free on PPC).
 
 ---
 
-## 2. ext3 / ext4 leftovers
+## 2. ext3 / ext4 leftovers — **SHIPPED 2026-05-20**
+
+The two real items below shipped together. Symlink-refuse was also
+applied to the EFS reader for consistency. Test coverage extended to 32
+checks (was 26): inline extract byte-exact, symlink tagged `l` in ls,
+`get` on symlink exits non-zero with a target-hint stderr line and
+writes no output file.
+
+---
+
 
 The shipped ext2 reader handles ext4 extent trees, 64-bit GDT fields,
 classic indirect maps, hashed directories (correctly via linear leaf
