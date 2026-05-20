@@ -769,6 +769,14 @@ static int detect_partition_table(int fd, PartTable *pt) {
         return 0;
     }
 
+    /* Check superfloppy: AFFS "DOS\X" boot magic. */
+    if (sector[0] == 'D' && sector[1] == 'O' && sector[2] == 'S'
+        && sector[3] <= 7) {
+        pt->type = PT_NONE;
+        snprintf(pt->fs_hint, sizeof(pt->fs_hint), "AFFS DOS\\%d", sector[3]);
+        return 0;
+    }
+
     /* Check HFS/HFS+ at offset 1024 */
     if (nr >= 2048 && is_hfs_sig(&sector[1024])) {
         pt->type = PT_NONE;
@@ -3334,6 +3342,9 @@ typedef enum {
     FS_AFFS
 } BrowseFsType;
 
+/* Forward declarations for the per-FS browse functions defined
+ * after resolve_image_ref. */
+
 /* Resolve `IMAGE[@N]` to a (fd, fs_offset, fs_size, fs_type) tuple.
  * If `@N` is omitted, treat the image as a superfloppy (offset 0).
  * Returns 0 on success and the four out params populated. */
@@ -3397,6 +3408,11 @@ static int resolve_image_ref(const char *spec, int *fd_out,
         } else if (is_hfs_sig(&probe[1024])) {
             uint16_t sig = read_be16(&probe[1024]);
             ft = (sig == 0x4244) ? FS_HFS : FS_HFS_PLUS;
+        }
+        /* AFFS: "DOS\X" boot-block magic at offset 0, with X in 0..7. */
+        if (ft == FS_UNKNOWN && probe[0] == 'D' && probe[1] == 'O'
+            && probe[2] == 'S' && probe[3] <= 7) {
+            ft = FS_AFFS;
         }
         /* ISO 9660: "CD001" magic at sector 16, offset 1 of the
          * Primary Volume Descriptor. Read sector 16 from fs base. */
@@ -4193,6 +4209,311 @@ static int fs_get_hfs(int fd, off_t fs_off, const char *path,
 }
 
 /* ============================================================
+ * AFFS (Amiga FFS / OFS) Reader (ls / get)
+ * ----------------------------------------------------------------
+ * Read-only browse of Amiga AFFS volumes (DosType DOS\0..DOS\7).
+ * Layout: 512-byte blocks, root at (2+total-1)/2, each dir block
+ * has hashTable[72] at offset 0x18. Entry headers carry name at
+ * 0x1B0 (BSTR), sec_type at block_end-4, next_same_hash at 0x1F0.
+ *
+ * FFS variants (DOS\1/3/5/7): file data blocks are 512 bytes of
+ * raw payload. OFS variants (DOS\0/2/4/6) prepend a 24-byte header
+ * to each data block (we honor it via the OFS branch below).
+ *
+ * No checksum verification — keeps the code small. Intl hash is
+ * accepted for DOS\2/3 but we don't apply ISO-8859-1 case folding
+ * (ASCII case folding only).
+ * ============================================================ */
+
+#define AFFS_BSIZE 512
+#define AFFS_HT_SIZE 72
+#define AFFS_T_HEADER 2
+#define AFFS_T_DATA   8
+#define AFFS_ST_ROOT  1
+#define AFFS_ST_DIR   2
+#define AFFS_ST_FILE  (-3)
+#define AFFS_MAX_DATA_BLOCKS 72
+
+typedef struct {
+    int       variant;        /* 0..7 from DOS\X */
+    int       ffs;            /* 1 = FFS (raw data blocks), 0 = OFS */
+    int       intl;           /* 1 if Intl variant (we still ASCII-fold) */
+    uint32_t  root_block;
+    uint64_t  total_blocks;
+    int       fd;
+    off_t     fs_off;
+} AffsVol;
+
+static int affs_open(int fd, off_t fs_off, uint64_t fs_size, AffsVol *v) {
+    uint8_t boot[12];
+    if (lseek(fd, fs_off, SEEK_SET) < 0) return -1;
+    if (read(fd, boot, 12) != 12) return -1;
+    if (boot[0] != 'D' || boot[1] != 'O' || boot[2] != 'S') return -1;
+    int variant = boot[3];
+    if (variant < 0 || variant > 7) return -1;
+    memset(v, 0, sizeof(*v));
+    v->fd = fd;
+    v->fs_off = fs_off;
+    v->variant = variant;
+    v->ffs   = (variant & 1) ? 1 : 0;
+    v->intl  = (variant >= 2);
+    v->total_blocks = fs_size / AFFS_BSIZE;
+    v->root_block = (uint32_t)((2 + v->total_blocks - 1) / 2);
+    return 0;
+}
+
+static int affs_read_block(AffsVol *v, uint32_t blk, uint8_t buf[AFFS_BSIZE]) {
+    if (lseek(v->fd, v->fs_off + (off_t)blk * AFFS_BSIZE, SEEK_SET) < 0) return -1;
+    if (read(v->fd, buf, AFFS_BSIZE) != AFFS_BSIZE) return -1;
+    return 0;
+}
+
+/* AFFS BSTR: byte 0 = length, bytes 1..len = chars. */
+static void affs_read_bstr(const uint8_t *p, char *out, size_t outsz,
+                            size_t max_len) {
+    int n = p[0];
+    if ((size_t)n > max_len) n = max_len;
+    if ((size_t)n + 1 > outsz) n = (int)outsz - 1;
+    memcpy(out, &p[1], n);
+    out[n] = '\0';
+}
+
+/* AFFS dir-entry hash: (name_len & 0x7FF) * 13^i + upper(chars), mod 72. */
+static uint32_t affs_name_hash(const char *name) {
+    int n = (int)strlen(name);
+    uint32_t hash = (uint32_t)n & 0x7FF;
+    for (int i = 0; i < n; i++) {
+        uint8_t c = (uint8_t)name[i];
+        if (c >= 'a' && c <= 'z') c -= 32;
+        hash = (hash * 13U + c) & 0x7FF;
+    }
+    return hash % AFFS_HT_SIZE;
+}
+
+typedef struct {
+    uint32_t block_num;
+    int32_t  sec_type;
+    uint32_t byte_size;
+    char     name[32];
+    uint32_t next_same_hash;
+    uint32_t parent;
+    uint32_t first_data;
+    uint32_t high_seq;
+    uint32_t extension;
+    uint32_t data_blocks[AFFS_MAX_DATA_BLOCKS];
+    int      data_count;
+    uint32_t hash_table[AFFS_HT_SIZE];
+} AffsEntry;
+
+static int affs_parse_entry(const uint8_t buf[AFFS_BSIZE], uint32_t blk,
+                             AffsEntry *out) {
+    memset(out, 0, sizeof(*out));
+    out->block_num = blk;
+    int32_t type = (int32_t)read_be32(&buf[0]);
+    /* Header blocks use T_HEADER (2); file-extension blocks (continuation
+     * of a file's data_block list) use T_LIST (16). Both layouts share
+     * the data_blocks[]/extension/high_seq fields, so accept either. */
+    if (type != AFFS_T_HEADER && type != 16) return -1;
+    out->sec_type = (int32_t)read_be32(&buf[AFFS_BSIZE - 4]);
+    out->high_seq = read_be32(&buf[8]);
+    out->first_data = read_be32(&buf[0x10]);
+    out->byte_size  = read_be32(&buf[0x144]);
+    affs_read_bstr(&buf[0x1B0], out->name, sizeof(out->name), 30);
+    out->next_same_hash = read_be32(&buf[0x1F0]);
+    out->parent     = read_be32(&buf[0x1F4]);
+    out->extension  = read_be32(&buf[0x1F8]);
+
+    if (out->sec_type == AFFS_ST_FILE) {
+        /* Inline data-block pointer array, stored REVERSED:
+         * dataBlocks[71] is the first data block of the file. */
+        int count = (int)out->high_seq;
+        if (count > AFFS_MAX_DATA_BLOCKS) count = AFFS_MAX_DATA_BLOCKS;
+        for (int i = 0; i < count; i++) {
+            int slot = AFFS_MAX_DATA_BLOCKS - 1 - i;
+            out->data_blocks[i] = read_be32(&buf[0x18 + slot * 4]);
+        }
+        out->data_count = count;
+    } else if (out->sec_type == AFFS_ST_ROOT || out->sec_type == AFFS_ST_DIR) {
+        for (int i = 0; i < AFFS_HT_SIZE; i++) {
+            out->hash_table[i] = read_be32(&buf[0x18 + i * 4]);
+        }
+    }
+    return 0;
+}
+
+/* Walk a hash table from a parent dir block; for each chain emit
+ * AffsEntry to the callback. */
+typedef int (*AffsLsCb)(const AffsEntry *e, void *user);
+
+static int affs_walk_dir(AffsVol *v, const AffsEntry *parent,
+                          AffsLsCb cb, void *user) {
+    for (int i = 0; i < AFFS_HT_SIZE; i++) {
+        uint32_t cur = parent->hash_table[i];
+        int safety = 4096;
+        while (cur && safety-- > 0) {
+            uint8_t blk[AFFS_BSIZE];
+            if (affs_read_block(v, cur, blk) != 0) break;
+            AffsEntry e;
+            if (affs_parse_entry(blk, cur, &e) != 0) break;
+            if (cb(&e, user)) return 0;
+            cur = e.next_same_hash;
+        }
+    }
+    return 0;
+}
+
+/* Look up a name inside a parent dir via the hash table chain. */
+static int affs_lookup(AffsVol *v, const AffsEntry *parent,
+                        const char *name, AffsEntry *out) {
+    uint32_t h = affs_name_hash(name);
+    uint32_t cur = parent->hash_table[h];
+    int safety = 4096;
+    while (cur && safety-- > 0) {
+        uint8_t blk[AFFS_BSIZE];
+        if (affs_read_block(v, cur, blk) != 0) return -1;
+        AffsEntry e;
+        if (affs_parse_entry(blk, cur, &e) != 0) return -1;
+        if (strcasecmp(e.name, name) == 0) {
+            *out = e;
+            return 0;
+        }
+        cur = e.next_same_hash;
+    }
+    return -1;
+}
+
+static int affs_read_root(AffsVol *v, AffsEntry *out) {
+    uint8_t blk[AFFS_BSIZE];
+    if (affs_read_block(v, v->root_block, blk) != 0) return -1;
+    /* Root block has type=T_HEADER but sec_type=ST_ROOT at end. */
+    return affs_parse_entry(blk, v->root_block, out);
+}
+
+static int affs_resolve_path(AffsVol *v, const char *path, AffsEntry *out) {
+    if (affs_read_root(v, out) != 0) return -1;
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s", path && path[0] ? path : "/");
+    char *p = tmp;
+    while (*p == '/') p++;
+    while (*p) {
+        char *slash = strchr(p, '/');
+        if (slash) *slash = '\0';
+        if (*p) {
+            AffsEntry next;
+            if (affs_lookup(v, out, p, &next) != 0) return -1;
+            /* Trailing path component allowed on dirs and files. */
+            *out = next;
+            if (out->sec_type == AFFS_ST_FILE && slash) return -1;
+            /* If we recurse into a dir we need its full hash table. */
+            if (out->sec_type == AFFS_ST_DIR && slash) {
+                /* parse_entry already loaded hash_table */
+            }
+        }
+        if (!slash) break;
+        p = slash + 1;
+        while (*p == '/') p++;
+    }
+    return 0;
+}
+
+typedef struct { int printed; } AffsLsCtx;
+static int affs_ls_cb(const AffsEntry *e, void *user) {
+    AffsLsCtx *ctx = (AffsLsCtx *)user;
+    int is_dir = (e->sec_type == AFFS_ST_DIR);
+    char sz[32];
+    format_bytes(e->byte_size, sz, sizeof(sz));
+    printf("%s %10s  %s%s\n",
+           is_dir ? "d" : "-",
+           is_dir ? "-" : sz,
+           e->name, is_dir ? "/" : "");
+    ctx->printed++;
+    return 0;
+}
+
+static int fs_ls_affs(int fd, off_t fs_off, uint64_t fs_size, const char *path) {
+    AffsVol v;
+    if (affs_open(fd, fs_off, fs_size, &v) != 0) {
+        fprintf(stderr, "Error: not an AFFS volume\n");
+        return 1;
+    }
+    AffsEntry e;
+    if (affs_resolve_path(&v, path, &e) != 0) {
+        fprintf(stderr, "Error: AFFS path not found: %s\n", path);
+        return 1;
+    }
+    if (e.sec_type != AFFS_ST_ROOT && e.sec_type != AFFS_ST_DIR) {
+        fprintf(stderr, "Error: %s is not a directory\n", path);
+        return 1;
+    }
+    AffsLsCtx ctx = {0};
+    affs_walk_dir(&v, &e, affs_ls_cb, &ctx);
+    if (ctx.printed == 0) printf("  (empty)\n");
+    return 0;
+}
+
+/* Read a file's data via inline + extension blocks. */
+static int fs_get_affs(int fd, off_t fs_off, uint64_t fs_size,
+                        const char *path, const char *host_out) {
+    AffsVol v;
+    if (affs_open(fd, fs_off, fs_size, &v) != 0) {
+        fprintf(stderr, "Error: not an AFFS volume\n");
+        return 1;
+    }
+    AffsEntry e;
+    if (affs_resolve_path(&v, path, &e) != 0) {
+        fprintf(stderr, "Error: AFFS path not found: %s\n", path);
+        return 1;
+    }
+    if (e.sec_type != AFFS_ST_FILE) {
+        fprintf(stderr, "Error: %s is not a file\n", path);
+        return 1;
+    }
+    FILE *out = fopen(host_out, "wb");
+    if (!out) {
+        fprintf(stderr, "Error: cannot create %s: %s\n",
+                host_out, strerror(errno));
+        return 1;
+    }
+    uint64_t remaining = e.byte_size;
+    /* Collect data block pointers from header + extension blocks. */
+    AffsEntry cur = e;
+    while (remaining > 0) {
+        for (int i = 0; i < cur.data_count && remaining > 0; i++) {
+            uint8_t blk[AFFS_BSIZE];
+            if (affs_read_block(&v, cur.data_blocks[i], blk) != 0) {
+                fclose(out); return 1;
+            }
+            const uint8_t *data;
+            size_t data_len;
+            if (v.ffs) {
+                data = blk;
+                data_len = AFFS_BSIZE;
+            } else {
+                /* OFS data block: header(24 bytes) + 488 data bytes.
+                 * Actual length stored at offset 12 (u32 BE). */
+                data = &blk[24];
+                data_len = read_be32(&blk[12]);
+                if (data_len > AFFS_BSIZE - 24) data_len = AFFS_BSIZE - 24;
+            }
+            if (data_len > remaining) data_len = remaining;
+            fwrite(data, 1, data_len, out);
+            remaining -= data_len;
+        }
+        if (remaining == 0 || cur.extension == 0) break;
+        /* Follow extension chain — extension blocks have the same
+         * format as file headers but only the data_blocks[] array
+         * is meaningful (and another extension pointer). */
+        uint8_t ebuf[AFFS_BSIZE];
+        if (affs_read_block(&v, cur.extension, ebuf) != 0) break;
+        if (affs_parse_entry(ebuf, cur.extension, &cur) != 0) break;
+    }
+    fclose(out);
+    fprintf(stderr, "Extracted %s (%u bytes) -> %s\n",
+            path, e.byte_size, host_out);
+    return 0;
+}
+
+/* ============================================================
  * HFS+ Reader (ls / get)
  * ----------------------------------------------------------------
  * Reads HFS+ (sig 0x482B) and HFSX (sig 0x4858) volume headers
@@ -4824,6 +5145,7 @@ static int cmd_ls(int argc, char **argv) {
         case FS_HFS:     rc = fs_ls_hfs(fd, fs_off, path); break;
         case FS_HFS_PLUS:rc = fs_ls_hfsplus(fd, fs_off, path); break;
         case FS_FAT:     rc = fs_ls_fat(fd, fs_off, path); break;
+        case FS_AFFS:    rc = fs_ls_affs(fd, fs_off, fs_size, path); break;
         default:
             fprintf(stderr,
                 "Error: ls is not yet implemented for this filesystem.\n");
@@ -4867,6 +5189,8 @@ static int cmd_get(int argc, char **argv) {
             rc = fs_get_hfsplus(fd, fs_off, path, host_out); break;
         case FS_FAT:
             rc = fs_get_fat(fd, fs_off, path, host_out); break;
+        case FS_AFFS:
+            rc = fs_get_affs(fd, fs_off, fs_size, path, host_out); break;
         default:
             fprintf(stderr,
                 "Error: get is not yet implemented for this filesystem.\n");
