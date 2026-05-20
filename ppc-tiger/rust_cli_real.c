@@ -3437,6 +3437,379 @@ static int resolve_image_ref(const char *spec, int *fd_out,
 }
 
 /* ============================================================
+ * FAT12/16/32 Reader (ls / get)
+ * ----------------------------------------------------------------
+ * Independent of CompactFat: walks dir entries directly, handles
+ * cluster chains via in-memory FAT table. Long File Name (LFN)
+ * entries are decoded UCS-2 LE -> ASCII; if no LFN precedes a SFN,
+ * the 8.3 name is rendered with the dot inserted.
+ * ============================================================ */
+
+typedef struct {
+    FatType  fat_type;
+    uint32_t bps;
+    uint32_t spc;
+    uint32_t reserved;
+    uint32_t fats;
+    uint32_t root_ents;       /* FAT12/16 */
+    uint32_t fatsz;
+    uint32_t root_cluster;    /* FAT32 */
+    uint32_t total_sectors;
+    uint32_t total_clusters;
+    uint32_t data_start_sec;  /* sector of cluster 2 */
+    uint32_t cluster_size;
+    uint8_t *fat_data;
+    uint32_t fat_size;
+    int fd;
+    off_t fs_off;
+} FatVol;
+
+static int fat_open_browse(int fd, off_t fs_off, FatVol *v) {
+    uint8_t vbr[512];
+    if (lseek(fd, fs_off, SEEK_SET) < 0) return -1;
+    if (read(fd, vbr, 512) != 512) return -1;
+    if (!is_fat_vbr(vbr)) return -1;
+
+    memset(v, 0, sizeof(*v));
+    v->fd = fd;
+    v->fs_off = fs_off;
+    v->bps        = read_le16(&vbr[11]);
+    v->spc        = vbr[13];
+    v->reserved   = read_le16(&vbr[14]);
+    v->fats       = vbr[16];
+    v->root_ents  = read_le16(&vbr[17]);
+    uint16_t tot16 = read_le16(&vbr[19]);
+    uint16_t fsz16 = read_le16(&vbr[22]);
+    uint32_t tot32 = read_le32(&vbr[32]);
+    uint32_t fsz32 = read_le32(&vbr[36]);
+    v->total_sectors = tot16 ? tot16 : tot32;
+    v->fatsz         = fsz16 ? fsz16 : fsz32;
+    if (fsz16 == 0) v->root_cluster = read_le32(&vbr[44]);
+    v->cluster_size = v->bps * v->spc;
+
+    uint32_t root_sectors = ((v->root_ents * 32) + v->bps - 1) / v->bps;
+    uint32_t data_first = v->reserved + v->fats * v->fatsz + root_sectors;
+    uint32_t data_sectors = v->total_sectors - data_first;
+    v->total_clusters = data_sectors / v->spc;
+    v->data_start_sec = data_first;
+
+    if (v->total_clusters < 4085) v->fat_type = FAT_12;
+    else if (v->total_clusters < 65525) v->fat_type = FAT_16;
+    else v->fat_type = FAT_32;
+
+    v->fat_size = v->fatsz * v->bps;
+    v->fat_data = (uint8_t *)malloc(v->fat_size);
+    if (!v->fat_data) return -1;
+    if (lseek(fd, fs_off + (off_t)v->reserved * v->bps, SEEK_SET) < 0) {
+        free(v->fat_data); v->fat_data = NULL; return -1;
+    }
+    if (read(fd, v->fat_data, v->fat_size) != (ssize_t)v->fat_size) {
+        free(v->fat_data); v->fat_data = NULL; return -1;
+    }
+    return 0;
+}
+
+static void fat_close_browse(FatVol *v) {
+    free(v->fat_data); v->fat_data = NULL;
+}
+
+/* Walk a cluster chain from `start` and read all bytes into a fresh
+ * buffer of length `logical_size`. For FAT32 root, pass start =
+ * root_cluster and logical_size = 0 (we'll discover end-of-chain). */
+static uint8_t *fat_read_chain(FatVol *v, uint32_t start, uint32_t logical_size,
+                                uint32_t *out_actual) {
+    /* Estimate capacity: clusters until EOC. */
+    size_t cap = logical_size ? logical_size : v->cluster_size;
+    uint8_t *buf = (uint8_t *)malloc(cap + v->cluster_size);
+    if (!buf) return NULL;
+    uint32_t got = 0;
+    uint32_t cur = start;
+    int max_clusters = 1 << 22; /* sanity bound */
+    while (cur >= 2 && !fat_is_eoc(cur, v->fat_type) && max_clusters-- > 0) {
+        off_t cl_off = v->fs_off + (off_t)v->data_start_sec * v->bps
+                     + (off_t)(cur - 2) * v->cluster_size;
+        if (lseek(v->fd, cl_off, SEEK_SET) < 0) break;
+        if (got + v->cluster_size > cap) {
+            cap = (got + v->cluster_size) * 2;
+            uint8_t *nb = (uint8_t *)realloc(buf, cap);
+            if (!nb) { free(buf); return NULL; }
+            buf = nb;
+        }
+        if (read(v->fd, buf + got, v->cluster_size) != (ssize_t)v->cluster_size)
+            break;
+        got += v->cluster_size;
+        cur = fat_read_entry(v->fat_data, cur, v->fat_type);
+    }
+    if (logical_size && got > logical_size) got = logical_size;
+    *out_actual = got;
+    return buf;
+}
+
+/* Read FAT12/16 root directory (fixed location, fixed size) into a
+ * heap buffer. */
+static uint8_t *fat_read_root_dir(FatVol *v, uint32_t *out_size) {
+    uint32_t root_sectors = ((v->root_ents * 32) + v->bps - 1) / v->bps;
+    uint32_t root_first = v->reserved + v->fats * v->fatsz;
+    uint32_t sz = root_sectors * v->bps;
+    uint8_t *buf = (uint8_t *)malloc(sz);
+    if (!buf) return NULL;
+    if (lseek(v->fd, v->fs_off + (off_t)root_first * v->bps, SEEK_SET) < 0
+        || read(v->fd, buf, sz) != (ssize_t)sz) {
+        free(buf); return NULL;
+    }
+    *out_size = sz;
+    return buf;
+}
+
+/* Read directory data for a directory whose start cluster is
+ * `start_cluster` (or root for FAT12/16 if start_cluster == 0). */
+static uint8_t *fat_read_dir(FatVol *v, uint32_t start_cluster,
+                              uint32_t *out_size) {
+    if (start_cluster == 0 && v->fat_type != FAT_32) {
+        return fat_read_root_dir(v, out_size);
+    }
+    if (start_cluster == 0) start_cluster = v->root_cluster;
+    return fat_read_chain(v, start_cluster, 0, out_size);
+}
+
+/* Decode an LFN chain entry's name bytes into an ASCII buffer (best-
+ * effort: non-ASCII -> '?'). Each LFN entry has 13 UCS-2 code units
+ * at offsets 1-10, 14-25, 28-31. */
+static int fat_lfn_chars(const uint8_t *e, char *out, int out_off) {
+    static const int positions[13] = {
+        1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30
+    };
+    for (int i = 0; i < 13; i++) {
+        uint16_t u = read_le16(&e[positions[i]]);
+        if (u == 0 || u == 0xFFFF) break;
+        out[out_off++] = (u < 0x80) ? (char)u : '?';
+    }
+    return out_off;
+}
+
+/* Render an 8.3 SFN like "AUTOEXEC.BAT" -> "autoexec.bat". */
+static void fat_sfn_render(const uint8_t *e, char *out, size_t outsz) {
+    char tmp[13];
+    int oi = 0;
+    for (int i = 0; i < 8; i++) {
+        if (e[i] == ' ') break;
+        tmp[oi++] = e[i];
+    }
+    if (e[8] != ' ') {
+        tmp[oi++] = '.';
+        for (int i = 8; i < 11; i++) {
+            if (e[i] == ' ') break;
+            tmp[oi++] = e[i];
+        }
+    }
+    tmp[oi] = '\0';
+    /* Lowercase the SFN (vintage convention). */
+    for (int i = 0; tmp[i]; i++) {
+        if (tmp[i] >= 'A' && tmp[i] <= 'Z') tmp[i] += 32;
+    }
+    snprintf(out, outsz, "%s", tmp);
+}
+
+typedef struct {
+    char name[260];   /* decoded full name */
+    int  is_dir;
+    int  is_volume;
+    uint32_t size;
+    uint32_t start_cluster;
+} FatDirEnt;
+
+/* Iterate directory entries. `cb` returns 1 to stop. */
+typedef int (*FatDirCb)(const FatDirEnt *de, void *user);
+
+static void fat_walk_dir(FatVol *v, const uint8_t *dir, uint32_t dir_size,
+                          FatDirCb cb, void *user) {
+    char lfn_buf[260];
+    int lfn_off = 0;
+    int lfn_seen = 0;
+
+    for (uint32_t off = 0; off + 32 <= dir_size; off += 32) {
+        const uint8_t *e = &dir[off];
+        if (e[0] == 0x00) break;
+        if (e[0] == 0xE5) { lfn_off = 0; lfn_seen = 0; continue; }
+        if (e[11] == ATTR_LONG_NAME) {
+            /* LFN — accumulate. Sequence numbers run high-to-low, so
+             * we shift collected bytes right. Simpler approach: just
+             * track each LFN's contribution in a temporary slot and
+             * concatenate in correct order. For browse use, accept
+             * the FILO ordering as long as we read the high-sequence
+             * entry first; in practice on-disk LFN runs come highest-
+             * first because they're written that way. We reassemble
+             * by stashing each LFN's 13 chars in a temp slot ordered
+             * by sequence num, then concatenating in ascending order. */
+            int seq = e[0] & 0x1F;
+            if (seq >= 1 && seq <= 20) {
+                char piece[14];
+                int n = fat_lfn_chars(e, piece, 0);
+                piece[n] = '\0';
+                /* Place at (seq-1)*13 in lfn_buf, blank-pad later. */
+                int pos = (seq - 1) * 13;
+                if (pos + n < (int)sizeof(lfn_buf)) {
+                    memcpy(&lfn_buf[pos], piece, n);
+                    if (pos + n > lfn_off) lfn_off = pos + n;
+                    lfn_seen = 1;
+                }
+            }
+            continue;
+        }
+        /* SFN entry. */
+        FatDirEnt de;
+        memset(&de, 0, sizeof(de));
+        if (lfn_seen && lfn_off > 0) {
+            int copy = lfn_off < 259 ? lfn_off : 259;
+            memcpy(de.name, lfn_buf, copy);
+            de.name[copy] = '\0';
+        } else {
+            fat_sfn_render(e, de.name, sizeof(de.name));
+        }
+        lfn_off = 0; lfn_seen = 0;
+        uint8_t attr = e[11];
+        de.is_dir    = (attr & ATTR_DIRECTORY) ? 1 : 0;
+        de.is_volume = (attr & ATTR_VOLUME_ID) ? 1 : 0;
+        if (de.is_volume) continue;  /* skip volume label entry */
+        de.size = read_le32(&e[28]);
+        uint32_t lo = read_le16(&e[26]);
+        uint32_t hi = read_le16(&e[20]);
+        de.start_cluster = (hi << 16) | lo;
+        if (cb(&de, user)) return;
+    }
+}
+
+typedef struct { int printed; } FatLsCtx;
+static int fat_ls_cb(const FatDirEnt *de, void *user) {
+    FatLsCtx *ctx = (FatLsCtx *)user;
+    if (strcmp(de->name, ".") == 0 || strcmp(de->name, "..") == 0) return 0;
+    char sz[32];
+    format_bytes(de->size, sz, sizeof(sz));
+    printf("%s %10s  %s%s\n",
+           de->is_dir ? "d" : "-",
+           de->is_dir ? "-" : sz,
+           de->name, de->is_dir ? "/" : "");
+    ctx->printed++;
+    return 0;
+}
+
+typedef struct {
+    const char *target_name;
+    int found;
+    FatDirEnt match;
+} FatLookupCtx;
+static int fat_lookup_cb(const FatDirEnt *de, void *user) {
+    FatLookupCtx *ctx = (FatLookupCtx *)user;
+    if (strcasecmp(de->name, ctx->target_name) == 0) {
+        ctx->found = 1;
+        ctx->match = *de;
+        return 1;
+    }
+    return 0;
+}
+
+/* Resolve a path inside the FAT volume to (start_cluster, size,
+ * is_dir). Returns 0 on success. */
+static int fat_resolve_path(FatVol *v, const char *path,
+                             uint32_t *out_cluster, uint32_t *out_size,
+                             int *out_is_dir) {
+    uint32_t cur_cluster = 0;  /* 0 = root for FAT12/16; root_cluster for FAT32 used inside fat_read_dir */
+    int is_dir = 1;
+    uint32_t cur_size = 0;
+
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s", path && path[0] ? path : "/");
+    char *p = tmp;
+    while (*p == '/') p++;
+    while (*p) {
+        char *slash = strchr(p, '/');
+        if (slash) *slash = '\0';
+        if (*p) {
+            uint32_t dsz = 0;
+            uint8_t *dir = fat_read_dir(v, cur_cluster, &dsz);
+            if (!dir) return -1;
+            FatLookupCtx ctx;
+            memset(&ctx, 0, sizeof(ctx));
+            ctx.target_name = p;
+            fat_walk_dir(v, dir, dsz, fat_lookup_cb, &ctx);
+            free(dir);
+            if (!ctx.found) return -1;
+            cur_cluster = ctx.match.start_cluster;
+            cur_size = ctx.match.size;
+            is_dir = ctx.match.is_dir;
+            if (!is_dir && slash) return -1;
+        }
+        if (!slash) break;
+        p = slash + 1;
+        while (*p == '/') p++;
+    }
+    *out_cluster = cur_cluster;
+    *out_size = cur_size;
+    *out_is_dir = is_dir;
+    return 0;
+}
+
+static int fs_ls_fat(int fd, off_t fs_off, const char *path) {
+    FatVol v;
+    if (fat_open_browse(fd, fs_off, &v) != 0) {
+        fprintf(stderr, "Error: cannot open FAT volume\n");
+        return 1;
+    }
+    uint32_t cluster, sz;
+    int is_dir;
+    if (fat_resolve_path(&v, path, &cluster, &sz, &is_dir) != 0) {
+        fprintf(stderr, "Error: FAT path not found: %s\n", path);
+        fat_close_browse(&v); return 1;
+    }
+    if (!is_dir) {
+        fprintf(stderr, "Error: %s is not a directory\n", path);
+        fat_close_browse(&v); return 1;
+    }
+    uint32_t dsz = 0;
+    uint8_t *dir = fat_read_dir(&v, cluster, &dsz);
+    if (!dir) { fat_close_browse(&v); return 1; }
+    FatLsCtx ctx = {0};
+    fat_walk_dir(&v, dir, dsz, fat_ls_cb, &ctx);
+    if (ctx.printed == 0) printf("  (empty)\n");
+    free(dir);
+    fat_close_browse(&v);
+    return 0;
+}
+
+static int fs_get_fat(int fd, off_t fs_off, const char *path,
+                      const char *host_out) {
+    FatVol v;
+    if (fat_open_browse(fd, fs_off, &v) != 0) {
+        fprintf(stderr, "Error: cannot open FAT volume\n");
+        return 1;
+    }
+    uint32_t cluster, sz;
+    int is_dir;
+    if (fat_resolve_path(&v, path, &cluster, &sz, &is_dir) != 0) {
+        fprintf(stderr, "Error: FAT path not found: %s\n", path);
+        fat_close_browse(&v); return 1;
+    }
+    if (is_dir) {
+        fprintf(stderr, "Error: %s is a directory\n", path);
+        fat_close_browse(&v); return 1;
+    }
+    uint32_t got = 0;
+    uint8_t *data = fat_read_chain(&v, cluster, sz, &got);
+    fat_close_browse(&v);
+    if (!data) {
+        fprintf(stderr, "Error: cannot read file chain\n");
+        return 1;
+    }
+    FILE *out = fopen(host_out, "wb");
+    if (!out) { free(data); return 1; }
+    fwrite(data, 1, got, out);
+    fclose(out);
+    free(data);
+    fprintf(stderr, "Extracted %s (%u bytes) -> %s\n", path, got, host_out);
+    return 0;
+}
+
+/* ============================================================
  * HFS (Classic Mac) Reader
  * ----------------------------------------------------------------
  * Read-only browse of classic HFS volumes (signature 0x4244 "BD").
@@ -4097,6 +4470,7 @@ static int cmd_ls(int argc, char **argv) {
     switch (ft) {
         case FS_ISO9660: rc = fs_ls_iso9660(fd, fs_off, path); break;
         case FS_HFS:     rc = fs_ls_hfs(fd, fs_off, path); break;
+        case FS_FAT:     rc = fs_ls_fat(fd, fs_off, path); break;
         default:
             fprintf(stderr,
                 "Error: ls is not yet implemented for this filesystem.\n");
@@ -4136,6 +4510,8 @@ static int cmd_get(int argc, char **argv) {
             rc = fs_get_iso9660(fd, fs_off, path, host_out); break;
         case FS_HFS:
             rc = fs_get_hfs(fd, fs_off, path, host_out); break;
+        case FS_FAT:
+            rc = fs_get_fat(fd, fs_off, path, host_out); break;
         default:
             fprintf(stderr,
                 "Error: get is not yet implemented for this filesystem.\n");
