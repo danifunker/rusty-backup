@@ -207,6 +207,7 @@ typedef struct {
     uint64_t avail_space;
     /* partition-table-derived info (used when not mounted) */
     char     part_type[96];     /* e.g. "Apple_HFS (MacOS TigerLNX)" */
+    char     fs_kind[16];       /* detected FS family: "ext4", "swap", "HFS+"... */
 } DeviceInfo;
 
 /* ============================================================
@@ -400,6 +401,11 @@ static uint64_t get_device_size_ioctl(const char *path) {
  * partition table and fills `part_type` / `size_bytes` on partition
  * DeviceInfos that we couldn't get info for via ioctl/statfs. */
 static void enrich_devices_with_parttable(DeviceInfo *devices, int dev_count);
+/* Forward decls for FS-magic helpers defined deeper in the file (alongside
+ * cmd_show_fs_info). probe_fs_kind() is co-located with enrich_*. */
+static int  is_ext_sb(const uint8_t *sb1024_plus);
+static int  probe_linux_swap(int fd, off_t offset, char *out_kind, int out_sz,
+                             uint32_t *out_page_size);
 
 static int cmd_list_devices(void) {
     printf("Scanning for disk devices...\n\n");
@@ -525,6 +531,7 @@ static int cmd_list_devices(void) {
             } else if (devices[j].part_type[0]) {
                 printf("  %s", devices[j].part_type);
             }
+            if (devices[j].fs_kind[0]) printf("  [%s]", devices[j].fs_kind);
             printf("\n");
         }
         printf("\n");
@@ -1074,12 +1081,58 @@ static int get_partition_list(const PartTable *pt, PartInfo *parts) {
     return count;
 }
 
+/* Sniff the filesystem at a byte offset inside an already-open fd. Reads
+ * a 4 KiB probe (enough for FAT VBR / HFS magic at +1024 / ext sb at
+ * +1024). Writes a short family string into `out` (e.g. "ext4", "HFS+",
+ * "FAT", "swap") and returns 1 on match, 0 otherwise. Returns 0 quietly
+ * on read errors so we degrade gracefully if a partition is unreadable. */
+static int probe_fs_kind(int fd, off_t offset, char *out, int out_sz) {
+    out[0] = '\0';
+    uint8_t buf[4096];
+    if (lseek(fd, offset, SEEK_SET) < 0) return 0;
+    int nr = read(fd, buf, sizeof(buf));
+    if (nr < 1024) return 0;
+
+    if (is_fat_vbr(buf)) {
+        /* exFAT shows "EXFAT   " at +3; otherwise it's FAT12/16/32 */
+        if (nr >= 11 && memcmp(&buf[3], "EXFAT   ", 8) == 0)
+            snprintf(out, out_sz, "exFAT");
+        else
+            snprintf(out, out_sz, "FAT");
+        return 1;
+    }
+    if (nr >= 2048 && is_hfs_sig(&buf[1024])) {
+        uint16_t sig = read_be16(&buf[1024]);
+        snprintf(out, out_sz,
+                 sig == 0x4244 ? "HFS"
+                 : sig == 0x4858 ? "HFSX" : "HFS+");
+        return 1;
+    }
+    if (nr >= 2048 && is_ext_sb(&buf[1024])) {
+        uint32_t feat_compat   = read_le32(&buf[1024 + 0x5C]);
+        uint32_t feat_incompat = read_le32(&buf[1024 + 0x60]);
+        const char *family = "ext2";
+        if (feat_compat   & 0x4)  family = "ext3";
+        if (feat_incompat & 0x40) family = "ext4";  /* EXTENTS */
+        snprintf(out, out_sz, "%s", family);
+        return 1;
+    }
+    /* Linux swap: probe_linux_swap reads its own pages from fd, so just
+     * call it (it'll re-seek). Cheap on a small partition. */
+    char swap_kind[32];
+    if (probe_linux_swap(fd, offset, swap_kind, sizeof(swap_kind), NULL)) {
+        snprintf(out, out_sz, "swap");
+        return 1;
+    }
+    return 0;
+}
+
 /* Walk the partition table on each whole disk and fill in `part_type` /
- * `size_bytes` on any disk0sN entries that ioctl/statfs couldn't report.
- * The macOS /dev/diskNsM nodes are 1-based and match the raw on-disk
- * slot, INCLUDING the partition map and driver entries for APM — so we
- * walk the raw entries here rather than reusing get_partition_list()
- * (which filters out map/driver/free). */
+ * `size_bytes` / `fs_kind` on any disk0sN entries that ioctl/statfs
+ * couldn't report. The macOS /dev/diskNsM nodes are 1-based and match
+ * the raw on-disk slot, INCLUDING the partition map and driver entries
+ * for APM — so we walk the raw entries here rather than reusing
+ * get_partition_list() (which filters out map/driver/free). */
 static void enrich_devices_with_parttable(DeviceInfo *devices, int dev_count) {
     for (int i = 0; i < dev_count; i++) {
         if (!devices[i].is_whole) continue;
@@ -1094,7 +1147,7 @@ static void enrich_devices_with_parttable(DeviceInfo *devices, int dev_count) {
 
         PartTable pt;
         if (detect_partition_table(fd, &pt) < 0) { close(fd); continue; }
-        close(fd);
+        /* Keep fd open for FS sniffing into partitions below. */
 
         int prefix_len = strlen(devices[i].name);
         for (int j = 0; j < dev_count; j++) {
@@ -1106,6 +1159,8 @@ static void enrich_devices_with_parttable(DeviceInfo *devices, int dev_count) {
 
             char tname[96] = "";
             uint64_t psize = 0;
+            uint64_t pstart = 0;
+            int have_start = 0;
 
             if (pt.type == PT_APM) {
                 uint16_t bsz = pt.data.apm.block_size ? pt.data.apm.block_size : 512;
@@ -1115,19 +1170,25 @@ static void enrich_devices_with_parttable(DeviceInfo *devices, int dev_count) {
                         snprintf(tname, sizeof(tname), "%s (%s)", ae->type, ae->name);
                     else
                         snprintf(tname, sizeof(tname), "%s", ae->type);
-                    psize = (uint64_t)ae->block_count * bsz;
+                    psize  = (uint64_t)ae->block_count * bsz;
+                    pstart = (uint64_t)ae->start_block * bsz;
+                    have_start = 1;
                 }
             } else if (pt.type == PT_MBR) {
                 if (slot <= 4) {
                     const MbrEntry *e = &pt.data.mbr.entries[slot - 1];
                     if (e->type != 0 && e->total_sectors > 0) {
                         snprintf(tname, sizeof(tname), "%s", partition_type_name(e->type));
-                        psize = (uint64_t)e->total_sectors * 512;
+                        psize  = (uint64_t)e->total_sectors * 512;
+                        pstart = (uint64_t)e->start_lba * 512;
+                        have_start = 1;
                     }
                 } else if (slot - 5 < pt.data.mbr.logical_count) {
                     const MbrEntry *e = &pt.data.mbr.logical[slot - 5];
                     snprintf(tname, sizeof(tname), "%s", partition_type_name(e->type));
-                    psize = (uint64_t)e->total_sectors * 512;
+                    psize  = (uint64_t)e->total_sectors * 512;
+                    pstart = (uint64_t)e->start_lba * 512;
+                    have_start = 1;
                 }
             } else if (pt.type == PT_GPT) {
                 if (slot <= (int)pt.data.gpt.entry_count) {
@@ -1139,12 +1200,36 @@ static void enrich_devices_with_parttable(DeviceInfo *devices, int dev_count) {
                         snprintf(tname, sizeof(tname), "%s", gname);
                     psize = (e->last_lba >= e->first_lba)
                           ? (e->last_lba - e->first_lba + 1) * 512ULL : 0;
+                    pstart = e->first_lba * 512ULL;
+                    have_start = 1;
                 }
             } else if (pt.type == PT_SGI) {
                 if (slot <= pt.data.sgi.entry_count) {
                     const SgiEntry *se = &pt.data.sgi.entries[slot - 1];
                     snprintf(tname, sizeof(tname), "%s", sgi_type_name(se->type));
-                    psize = (uint64_t)se->blocks * 512;
+                    psize  = (uint64_t)se->blocks * 512;
+                    pstart = (uint64_t)se->first * 512;
+                    have_start = 1;
+                }
+            }
+
+            /* Sniff the filesystem inside the partition. Cheap (one 4
+             * KiB read) and only runs once per partition slot. Skip if
+             * we don't know where the partition starts, or it's the APM
+             * map itself / driver / free entries. */
+            if (have_start && psize > 0 && !devices[j].fs_kind[0]) {
+                int skip = 0;
+                if (pt.type == PT_APM) {
+                    const ApmEntry *ae = &pt.data.apm.entries[slot - 1];
+                    if (strcmp(ae->type, "Apple_partition_map") == 0) skip = 1;
+                    if (strncmp(ae->type, "Apple_Driver", 12) == 0)   skip = 1;
+                    if (strcmp(ae->type, "Apple_Free") == 0)          skip = 1;
+                    if (strcmp(ae->type, "Apple_Patches") == 0)       skip = 1;
+                }
+                if (!skip) {
+                    char kind[16];
+                    if (probe_fs_kind(fd, (off_t)pstart, kind, sizeof(kind)))
+                        strncpy(devices[j].fs_kind, kind, sizeof(devices[j].fs_kind) - 1);
                 }
             }
 
@@ -1153,6 +1238,7 @@ static void enrich_devices_with_parttable(DeviceInfo *devices, int dev_count) {
             if (tname[0] && !devices[j].part_type[0])
                 strncpy(devices[j].part_type, tname, sizeof(devices[j].part_type) - 1);
         }
+        close(fd);
     }
 }
 
