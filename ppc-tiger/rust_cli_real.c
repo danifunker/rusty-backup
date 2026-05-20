@@ -2977,6 +2977,93 @@ static int cmd_rip(int argc, char **argv) {
 /* Parse an `IMG[@N]` reference: returns the 1-based partition index
  * (0 = "whole disk", -1 = parse error). The image path is written
  * into `path_out` with the `@N` suffix stripped. */
+/* ============================================================
+ * write — stream an image onto a block device
+ * ----------------------------------------------------------------
+ * Equivalent of rb-cli's `write IMG /dev/diskN`. No partition-table
+ * smarts, no resize, no decompression — just raw bytes. Used to flash
+ * a previously-restored disk image (or any random raw file) onto
+ * removable media without going through the full restore pipeline.
+ * ============================================================ */
+static int cmd_write(int argc, char **argv) {
+    if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
+        fprintf(stderr,
+            "USAGE: rusty-backup write <IMAGE> <TARGET> [--yes]\n\n"
+            "ARGUMENTS:\n"
+            "  <IMAGE>    Source image file (raw bytes; no headers stripped)\n"
+            "  <TARGET>   Target device or file (rdiskN recommended for speed)\n\n"
+            "OPTIONS:\n"
+            "  --yes      Confirm destructive write to a block device\n"
+        );
+        return 0;
+    }
+
+    const char *src = nth_positional(argc, argv, 0);
+    const char *dst = nth_positional(argc, argv, 1);
+    int yes = has_flag(argc, argv, "--yes");
+
+    if (!src || !dst) {
+        fprintf(stderr, "Error: IMAGE and TARGET are required\n");
+        return 1;
+    }
+
+    int src_fd = open(src, O_RDONLY);
+    if (src_fd < 0) {
+        fprintf(stderr, "Error: cannot open %s: %s\n", src, strerror(errno));
+        return 1;
+    }
+    uint64_t src_size = 0;
+    struct stat st;
+    if (fstat(src_fd, &st) == 0 && S_ISREG(st.st_mode)) {
+        src_size = st.st_size;
+    }
+
+    /* Heuristic: paths under /dev/ are block devices and require --yes
+     * to confirm. Everything else is treated as a regular file target. */
+    int target_is_device = (strncmp(dst, "/dev/", 5) == 0);
+    if (target_is_device && !yes) {
+        fprintf(stderr,
+            "Refusing to write to block device %s without --yes.\n"
+            "  This will OVERWRITE every byte on the device.\n", dst);
+        close(src_fd);
+        return 1;
+    }
+
+    int tgt_fd = open(dst, O_WRONLY | O_CREAT, 0644);
+    if (tgt_fd < 0) {
+        fprintf(stderr, "Error: cannot open %s for writing: %s\n",
+                dst, strerror(errno));
+        close(src_fd);
+        return 1;
+    }
+
+    char sz[32];
+    fprintf(stderr, "Writing %s%s to %s...\n", src,
+            src_size ? "" : " (size unknown)", dst);
+
+    uint8_t *buf = (uint8_t *)malloc(CHUNK_SIZE);
+    if (!buf) { close(src_fd); close(tgt_fd); return 1; }
+
+    uint64_t written = 0;
+    ssize_t nr;
+    while ((nr = read(src_fd, buf, CHUNK_SIZE)) > 0) {
+        if (write(tgt_fd, buf, nr) != nr) {
+            fprintf(stderr, "\nError: short write: %s\n", strerror(errno));
+            break;
+        }
+        written += nr;
+        if (src_size > 0)
+            draw_progress((double)written / src_size * 100.0, "Writing");
+    }
+    free(buf);
+    close(src_fd);
+    close(tgt_fd);
+
+    format_bytes(written, sz, sizeof(sz));
+    fprintf(stderr, "\nWrite completed: %s (%s)\n", dst, sz);
+    return 0;
+}
+
 static int parse_img_at(const char *spec, char *path_out, size_t path_sz) {
     const char *at = strrchr(spec, '@');
     if (!at) {
@@ -3246,6 +3333,7 @@ static void print_usage(const char *prog) {
         "  backup <SOURCE> <DEST>          Back up a device or image\n"
         "  restore <BACKUP_DIR> <TARGET>   Restore a backup\n"
         "  inspect <BACKUP_DIR>            Show metadata for an existing backup\n"
+        "  write <IMAGE> <TARGET>          Stream a raw image to a device or file\n"
         "  show devices                    Enumerate available disk devices\n"
         "  show partmap <IMAGE>            Print partition table (MBR/GPT/APM)\n"
         "  show fs-info <IMAGE[@N]>        Print FAT/HFS volume metadata\n"
@@ -3302,6 +3390,8 @@ int main(int argc, char **argv) {
         return cmd_restore(sub_argc, sub_argv);
     } else if (strcmp(cmd, "inspect") == 0) {
         return cmd_inspect(sub_argc, sub_argv);
+    } else if (strcmp(cmd, "write") == 0) {
+        return cmd_write(sub_argc, sub_argv);
     } else if (strcmp(cmd, "show") == 0) {
         /* rb-cli surface: devices / partmap / fs-info implemented;
          * chd-info is not (no CHD support on the PPC build today). */
