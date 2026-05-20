@@ -14,6 +14,10 @@ All core rusty-backup functionality, running natively on Tiger:
 - **Checksums**: CRC32 (`--checksum crc32`) and SHA-256 (`--checksum sha256`) — both match rb-cli's value set, so backups cross-verify in either direction. SHA-1 is intentionally not exposed.
 - **FAT compaction**: Automatic for FAT12/16/32 — only backs up allocated clusters
 - **Metadata**: Compatible `metadata.json` format
+- **Filesystem browse** (`ls` / `get`): read-only browse + per-file extraction for FAT12/16/32 (with LFN), classic HFS, HFS+/HFSX, ISO 9660 (incl. Joliet), AFFS (Amiga FFS/OFS), ProDOS (Apple II). Type/creator codes shown per entry for HFS / HFS+.
+- **Image wrappers**: DC42 (DiskCopy 4.2) and 2MG (2IMG) wrappers are detected transparently — no need to `dd`-strip the header before browsing.
+- **fsck (FAT)**: Read-only consistency check — flags cross-linked / lost / bad-ref clusters and cluster-chain cycles.
+- **write**: Stream a raw image onto a block device or file with a `--yes` device-write guard.
 - **Carbon GUI**: Native Aqua frontend with progress bars and file pickers
 
 ## Requirements
@@ -80,6 +84,21 @@ sudo ./rusty-backup-ppc optical rip \
 # Read-only inspection of a raw image (no backup needed)
 ./rusty-backup-ppc show partmap   /Volumes/Images/my-disk.img
 ./rusty-backup-ppc show fs-info   /Volumes/Images/my-disk.img@1
+
+# Browse a filesystem inside any supported image
+./rusty-backup-ppc ls /Volumes/Images/my-floppy.adf            # superfloppy AFFS
+./rusty-backup-ppc ls /Volumes/Images/install-cd.iso /BOOT     # ISO 9660 subdir
+./rusty-backup-ppc ls /Volumes/Images/MacLC.hda@1 /Examples    # APM-wrapped HFS
+./rusty-backup-ppc ls /Volumes/Images/iigs.2mg /SYSTEM         # 2MG-wrapped ProDOS
+
+# Extract one file to the host filesystem
+./rusty-backup-ppc get /Volumes/Images/MacLC.hda@1 "/Desktop DB" /tmp/desktop_db.bin
+
+# Read-only FAT consistency check
+./rusty-backup-ppc fsck /Volumes/Images/dos-disk.img@1
+
+# Flash a raw image onto a block device
+sudo ./rusty-backup-ppc write /Volumes/Images/restored.img /dev/rdisk5 --yes
 ```
 
 ### Checksum support
