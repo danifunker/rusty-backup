@@ -1,0 +1,120 @@
+#!/bin/sh
+# test_fs_readers.sh - Validate the ext2/3/4 + exFAT read-only browse
+# (ls / get) on PowerPC/Tiger. This is the big-endian acceptance test:
+# the readers were only smoke-tested on little-endian hardware, so this
+# run is what actually exercises the read_le* byteswap paths.
+#
+# Prereqs on the Tiger box:
+#   1. This whole ppc-tiger/ source dir (so build.sh can compile).
+#   2. The two fixture images, copied over from the dev machine:
+#         ext2.img    (1 MiB)   md5 a9def8f42cb7916ed282339edb3b8084
+#         exfat.img   (64 MiB)  md5 3b93211a0495e31bf2b8fc9829edd8ad
+#      Verify with:  md5 ext2.img exfat.img
+#
+# Usage (run from inside the ppc-tiger/ dir):
+#   ./test_fs_readers.sh [EXT2_IMG] [EXFAT_IMG]
+# Defaults: ./ext2.img and ./exfat.img
+
+set -u
+
+EXT2_IMG="${1:-./ext2.img}"
+EXFAT_IMG="${2:-./exfat.img}"
+BIN="./rusty-backup-ppc"
+TMP="${TMPDIR:-/tmp}/rbfs.$$"
+mkdir -p "$TMP"
+
+PASS=0
+FAIL=0
+
+ok()   { echo "  PASS: $1"; PASS=`expr $PASS + 1`; }
+bad()  { echo "  FAIL: $1"; FAIL=`expr $FAIL + 1`; }
+
+# check_contains <file> <substring> <label>
+check_contains() {
+    if grep "$2" "$1" >/dev/null 2>&1; then ok "$3"; else
+        bad "$3 (did not find '$2' in:)"; sed 's/^/      /' "$1"; fi
+}
+
+# check_text <extracted-file> <expected-string> <label>
+check_text() {
+    got=`cat "$1" 2>/dev/null`
+    if [ "$got" = "$2" ]; then ok "$3"; else
+        bad "$3 (got '$got', expected '$2')"; fi
+}
+
+# check_fill <extracted-file> <expected-size> <fill-char> <label>
+# Verifies the file is exactly <size> bytes and contains ONLY <fill-char>.
+check_fill() {
+    sz=`wc -c < "$1" 2>/dev/null | tr -d ' '`
+    leftover=`tr -d "$3" < "$1" 2>/dev/null | wc -c | tr -d ' '`
+    if [ "$sz" = "$2" ] && [ "$leftover" = "0" ]; then ok "$4"; else
+        bad "$4 (size=$sz expected=$2, non-'$3' bytes=$leftover)"; fi
+}
+
+echo "=== Build ==="
+# Always rebuild from source so a stale binary can't silently mask new
+# code (an old binary lacks ext2/exFAT detection and fails confusingly).
+# Set SKIP_BUILD=1 to reuse the existing $BIN instead.
+if [ "${SKIP_BUILD:-0}" = "1" ]; then
+    echo "  SKIP_BUILD=1 set, reusing $BIN"
+else
+    ./build.sh || { echo "BUILD FAILED"; exit 2; }
+fi
+[ -x "$BIN" ] || { echo "ERROR: $BIN not found - build it first"; exit 2; }
+"$BIN" --version
+echo ""
+
+# ---------------------------------------------------------------
+echo "=== ext2 ($EXT2_IMG) ==="
+if [ ! -f "$EXT2_IMG" ]; then
+    echo "  SKIP: $EXT2_IMG not found"
+else
+    "$BIN" ls "$EXT2_IMG" /         > "$TMP/e_root.txt" 2>&1
+    "$BIN" ls "$EXT2_IMG" /subdir   > "$TMP/e_sub.txt"  2>&1
+    echo "  --- ls / ---"; sed 's/^/    /' "$TMP/e_root.txt"
+
+    check_contains "$TMP/e_root.txt" "hello.txt" "ext2: root lists hello.txt"
+    check_contains "$TMP/e_root.txt" "big.bin"   "ext2: root lists big.bin"
+    check_contains "$TMP/e_root.txt" "subdir/"   "ext2: root lists subdir/"
+    check_contains "$TMP/e_sub.txt"  "inner.txt" "ext2: subdir lists inner.txt"
+
+    "$BIN" get "$EXT2_IMG" /hello.txt        "$TMP/e_hello"  >/dev/null 2>&1
+    "$BIN" get "$EXT2_IMG" /subdir/inner.txt "$TMP/e_inner"  >/dev/null 2>&1
+    "$BIN" get "$EXT2_IMG" /big.bin          "$TMP/e_big"    >/dev/null 2>&1
+
+    check_text "$TMP/e_hello" "Hello, ext2 world!"   "ext2: get hello.txt content"
+    check_text "$TMP/e_inner" "nested file contents" "ext2: get nested inner.txt content"
+    check_fill "$TMP/e_big" 5000 A "ext2: get big.bin (5000 bytes, all 'A' = indirect map)"
+fi
+echo ""
+
+# ---------------------------------------------------------------
+echo "=== exFAT ($EXFAT_IMG) ==="
+if [ ! -f "$EXFAT_IMG" ]; then
+    echo "  SKIP: $EXFAT_IMG not found"
+else
+    "$BIN" ls "$EXFAT_IMG" /        > "$TMP/x_root.txt" 2>&1
+    "$BIN" ls "$EXFAT_IMG" /subdir  > "$TMP/x_sub.txt"  2>&1
+    echo "  --- ls / (macOS ._ and .fseventsd entries are expected noise) ---"
+    sed 's/^/    /' "$TMP/x_root.txt"
+
+    check_contains "$TMP/x_root.txt" "hello.txt" "exFAT: root lists hello.txt"
+    check_contains "$TMP/x_root.txt" "big.bin"   "exFAT: root lists big.bin"
+    check_contains "$TMP/x_root.txt" "subdir/"   "exFAT: root lists subdir/"
+    check_contains "$TMP/x_sub.txt"  "inner.txt" "exFAT: subdir lists inner.txt"
+
+    "$BIN" get "$EXFAT_IMG" /hello.txt        "$TMP/x_hello" >/dev/null 2>&1
+    "$BIN" get "$EXFAT_IMG" /subdir/inner.txt "$TMP/x_inner" >/dev/null 2>&1
+    "$BIN" get "$EXFAT_IMG" /big.bin          "$TMP/x_big"   >/dev/null 2>&1
+
+    check_text "$TMP/x_hello" "Hello, exFAT world!" "exFAT: get hello.txt content"
+    check_text "$TMP/x_inner" "nested exfat file"   "exFAT: get nested inner.txt content"
+    check_fill "$TMP/x_big" 200000 B "exFAT: get big.bin (200000 bytes, all 'B' = cluster chain)"
+fi
+echo ""
+
+# ---------------------------------------------------------------
+echo "=== Summary ==="
+echo "  PASS=$PASS  FAIL=$FAIL"
+rm -rf "$TMP"
+[ "$FAIL" = "0" ]
