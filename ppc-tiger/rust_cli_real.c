@@ -3981,6 +3981,8 @@ static int hfs_ls_cb(uint32_t parent_id, const uint8_t *name_bytes,
                      void *user) {
     HfsLsCtx *ctx = (HfsLsCtx *)user;
     if (parent_id != ctx->parent_id) return 0;
+    /* Skip thread records (3 = dir thread, 4 = file thread). */
+    if (rec_type == 0x03 || rec_type == 0x04) return 0;
     char name[64];
     hfs_decode_macroman(name_bytes, name_len, name, sizeof(name));
 
@@ -4181,6 +4183,356 @@ static int fs_get_hfs(int fd, off_t fs_off, const char *path,
         fprintf(stderr, "Error: cannot read fork\n");
         return 1;
     }
+    FILE *out = fopen(host_out, "wb");
+    if (!out) { free(data); return 1; }
+    fwrite(data, 1, got, out);
+    fclose(out);
+    free(data);
+    fprintf(stderr, "Extracted %s (%u bytes) -> %s\n", path, got, host_out);
+    return 0;
+}
+
+/* ============================================================
+ * HFS+ Reader (ls / get)
+ * ----------------------------------------------------------------
+ * Reads HFS+ (sig 0x482B) and HFSX (sig 0x4858) volume headers
+ * at fs+1024, loads the catalog file via its 8 inline extents, and
+ * walks the leaf-chain. Catalog records use UTF-16BE names; we
+ * decode ASCII subset and substitute '?' for non-ASCII.
+ *
+ * Limitations vs the desktop HFS+ impl: no extents-overflow
+ * traversal, no hardlink resolution, no Unicode normalization
+ * for case-insensitive comparison (we strcasecmp the ASCII
+ * subset, which works for the common Anglo-named volumes).
+ * ============================================================ */
+
+#define HFSPLUS_SIG    0x482B
+#define HFSX_SIG       0x4858
+
+typedef struct {
+    uint32_t start_block;
+    uint32_t block_count;
+} HfsPlusExt;
+
+typedef struct {
+    uint64_t logical_size;
+    uint32_t total_blocks;
+    HfsPlusExt extents[8];
+} HfsPlusFork;
+
+typedef struct {
+    uint16_t signature;
+    uint32_t block_size;
+    uint32_t total_blocks;
+    uint32_t file_count;
+    uint32_t folder_count;
+    HfsPlusFork catalog_file;
+} HfsPlusVH;
+
+static void hfsplus_parse_fork(const uint8_t *p, HfsPlusFork *out) {
+    out->logical_size = ((uint64_t)read_be32(&p[0]) << 32) | read_be32(&p[4]);
+    out->total_blocks = read_be32(&p[12]);
+    for (int i = 0; i < 8; i++) {
+        out->extents[i].start_block = read_be32(&p[16 + i * 8]);
+        out->extents[i].block_count = read_be32(&p[20 + i * 8]);
+    }
+}
+
+static int hfsplus_parse_vh(const uint8_t *sec, HfsPlusVH *out) {
+    uint16_t sig = read_be16(&sec[0]);
+    if (sig != HFSPLUS_SIG && sig != HFSX_SIG) return -1;
+    memset(out, 0, sizeof(*out));
+    out->signature    = sig;
+    out->block_size   = read_be32(&sec[40]);
+    out->total_blocks = read_be32(&sec[44]);
+    out->file_count   = read_be32(&sec[32]);
+    out->folder_count = read_be32(&sec[36]);
+    hfsplus_parse_fork(&sec[272], &out->catalog_file);
+    return 0;
+}
+
+/* Read a fork (file body) using up to 8 inline extents. Truncates on
+ * extents-overflow. */
+static uint8_t *hfsplus_read_fork(int fd, off_t fs_off, const HfsPlusVH *vh,
+                                   const HfsPlusFork *fork, uint32_t *out_actual) {
+    uint64_t logical = fork->logical_size;
+    if (logical > (uint64_t)0x40000000) {
+        /* 1 GiB browse cap — guard against malformed/huge catalogs. */
+        logical = 0x40000000;
+    }
+    uint8_t *buf = (uint8_t *)malloc((size_t)logical + 1);
+    if (!buf) return NULL;
+    uint32_t got = 0;
+    for (int i = 0; i < 8 && (uint64_t)got < logical; i++) {
+        if (fork->extents[i].block_count == 0) continue;
+        uint64_t ext_bytes = (uint64_t)fork->extents[i].block_count
+                            * vh->block_size;
+        uint32_t to_read = (uint32_t)(logical - got);
+        if (to_read > ext_bytes) to_read = (uint32_t)ext_bytes;
+        off_t off = fs_off + (off_t)fork->extents[i].start_block
+                                * vh->block_size;
+        if (lseek(fd, off, SEEK_SET) < 0) break;
+        ssize_t nr = read(fd, buf + got, to_read);
+        if (nr <= 0) break;
+        got += (uint32_t)nr;
+    }
+    if ((uint64_t)got < logical) {
+        fprintf(stderr, "[WARN] HFS+ fork truncated: got %u of %llu bytes "
+                "(extents-overflow not implemented)\n",
+                got, (unsigned long long)logical);
+    }
+    *out_actual = got;
+    return buf;
+}
+
+/* Decode HFS+ UTF-16BE name to ASCII best-effort. */
+static void hfsplus_decode_name(const uint8_t *src, int name_units,
+                                 char *out, size_t outsz) {
+    int oi = 0;
+    for (int i = 0; i < name_units && oi + 1 < (int)outsz; i++) {
+        uint16_t u = read_be16(&src[i * 2]);
+        out[oi++] = (u < 0x80) ? (char)u : '?';
+    }
+    out[oi] = '\0';
+}
+
+typedef int (*HfsPlusLeafCb)(uint32_t parent_id, const uint8_t *name_utf16be,
+                              int name_units, int16_t rec_type,
+                              const uint8_t *rec_data, int rec_data_len,
+                              void *user);
+
+static void hfsplus_walk_leaves(const uint8_t *cat, uint32_t cat_size,
+                                 HfsPlusLeafCb cb, void *user) {
+    if (cat_size < 256) return;
+    uint16_t node_size = read_be16(&cat[32]);
+    if (node_size < 256) return;
+    uint32_t first_leaf = read_be32(&cat[24]);
+    uint32_t node_idx = first_leaf;
+    while (node_idx != 0) {
+        uint64_t off = (uint64_t)node_idx * node_size;
+        if (off + node_size > cat_size) break;
+        const uint8_t *node = &cat[off];
+        uint32_t next_node = read_be32(&node[0]);
+        int8_t kind = (int8_t)node[8];
+        uint16_t num_records = read_be16(&node[10]);
+        if (kind != -1) {
+            node_idx = next_node;
+            continue;
+        }
+
+        for (uint32_t i = 0; i < num_records; i++) {
+            int offset_pos = node_size - 2 * (i + 1);
+            if (offset_pos + 2 > (int)node_size) break;
+            int rec_offset = read_be16(&node[offset_pos]);
+            if (rec_offset + 6 > (int)node_size) continue;
+
+            int key_len = read_be16(&node[rec_offset]);
+            if (key_len < 6 || rec_offset + 2 + key_len > (int)node_size) continue;
+            const uint8_t *key = &node[rec_offset + 2];
+            uint32_t key_parent = read_be32(&key[0]);
+            int name_units = read_be16(&key[4]);
+
+            int rec_data_off = rec_offset + 2 + key_len;
+            if (rec_data_off & 1) rec_data_off++;
+            if (rec_data_off + 2 > (int)node_size) continue;
+            int16_t rec_type = (int16_t)read_be16(&node[rec_data_off]);
+
+            int rec_data_len = (int)node_size - rec_data_off;
+            int stop = cb(key_parent, &key[6], name_units, rec_type,
+                          &node[rec_data_off], rec_data_len, user);
+            if (stop) return;
+        }
+        node_idx = next_node;
+    }
+}
+
+typedef struct { uint32_t parent_id; int printed; } HfsPlusLsCtx;
+static int hfsplus_ls_cb(uint32_t parent_id, const uint8_t *name_utf16be,
+                          int name_units, int16_t rec_type,
+                          const uint8_t *rec_data, int rec_data_len,
+                          void *user) {
+    HfsPlusLsCtx *ctx = (HfsPlusLsCtx *)user;
+    if (parent_id != ctx->parent_id) return 0;
+    /* Skip thread records (type 3 = folder thread, 4 = file thread)
+     * — they're internal CNID lookup metadata, not directory entries. */
+    if (rec_type == 3 || rec_type == 4) return 0;
+    char name[260];
+    hfsplus_decode_name(name_utf16be, name_units, name, sizeof(name));
+    /* Empty-named records (e.g. fragmented thread leftovers) shouldn't
+     * surface in a listing. */
+    if (name[0] == '\0') return 0;
+
+    if (rec_type == 1) {
+        printf("d %10s  %s/\n", "-", name);
+        ctx->printed++;
+    } else if (rec_type == 2) {
+        if (rec_data_len < 96) return 0;
+        /* Data fork at offset 88 — logical_size at +0 (u64 BE). */
+        uint64_t dsize = ((uint64_t)read_be32(&rec_data[88]) << 32)
+                      |  read_be32(&rec_data[92]);
+        char sz[32];
+        format_bytes(dsize, sz, sizeof(sz));
+        /* FileInfo at offset 48: type/creator. */
+        char fourcc[16];
+        snprintf(fourcc, sizeof(fourcc), "%c%c%c%c/%c%c%c%c",
+                 rec_data[48] ? rec_data[48] : ' ',
+                 rec_data[49] ? rec_data[49] : ' ',
+                 rec_data[50] ? rec_data[50] : ' ',
+                 rec_data[51] ? rec_data[51] : ' ',
+                 rec_data[52] ? rec_data[52] : ' ',
+                 rec_data[53] ? rec_data[53] : ' ',
+                 rec_data[54] ? rec_data[54] : ' ',
+                 rec_data[55] ? rec_data[55] : ' ');
+        printf("- %10s  %-30s [%s]\n", sz, name, fourcc);
+        ctx->printed++;
+    }
+    return 0;
+}
+
+typedef struct {
+    uint32_t target_parent;
+    const char *target_name;
+    int found;
+    int is_dir;
+    uint32_t folder_id;
+    uint64_t data_size;
+    HfsPlusFork data_fork;
+} HfsPlusLookupCtx;
+static int hfsplus_lookup_cb(uint32_t parent_id, const uint8_t *name_utf16be,
+                              int name_units, int16_t rec_type,
+                              const uint8_t *rec_data, int rec_data_len,
+                              void *user) {
+    HfsPlusLookupCtx *ctx = (HfsPlusLookupCtx *)user;
+    if (parent_id != ctx->target_parent) return 0;
+    char name[260];
+    hfsplus_decode_name(name_utf16be, name_units, name, sizeof(name));
+    if (strcasecmp(name, ctx->target_name) != 0) return 0;
+
+    if (rec_type == 1) {
+        if (rec_data_len < 12) return 0;
+        ctx->folder_id = read_be32(&rec_data[8]);
+        ctx->is_dir = 1;
+        ctx->found = 1;
+        return 1;
+    } else if (rec_type == 2) {
+        if (rec_data_len < 168) return 0;
+        hfsplus_parse_fork(&rec_data[88], &ctx->data_fork);
+        ctx->data_size = ctx->data_fork.logical_size;
+        ctx->is_dir = 0;
+        ctx->found = 1;
+        return 1;
+    }
+    return 0;
+}
+
+static int hfsplus_resolve_path(const uint8_t *cat, uint32_t cat_size,
+                                 const char *path, uint32_t *out_cnid,
+                                 int *out_is_dir, uint64_t *out_size,
+                                 HfsPlusFork *out_fork) {
+    uint32_t cur = 2; /* root */
+    *out_is_dir = 1;
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s", path && path[0] ? path : "/");
+    char *p = tmp;
+    while (*p == '/') p++;
+    while (*p) {
+        char *slash = strchr(p, '/');
+        if (slash) *slash = '\0';
+        if (*p) {
+            HfsPlusLookupCtx ctx;
+            memset(&ctx, 0, sizeof(ctx));
+            ctx.target_parent = cur;
+            ctx.target_name = p;
+            hfsplus_walk_leaves(cat, cat_size, hfsplus_lookup_cb, &ctx);
+            if (!ctx.found) return -1;
+            if (ctx.is_dir) {
+                cur = ctx.folder_id;
+                *out_is_dir = 1;
+            } else {
+                *out_is_dir = 0;
+                *out_size = ctx.data_size;
+                if (out_fork) *out_fork = ctx.data_fork;
+                if (slash) return -1;
+                cur = 0;
+            }
+        }
+        if (!slash) break;
+        p = slash + 1;
+        while (*p == '/') p++;
+    }
+    *out_cnid = cur;
+    return 0;
+}
+
+static int hfsplus_open_catalog(int fd, off_t fs_off, HfsPlusVH *vh,
+                                 uint8_t **cat_out, uint32_t *cat_size_out) {
+    uint8_t vh_sec[512];
+    if (lseek(fd, fs_off + HFS_MDB_OFFSET, SEEK_SET) < 0) return -1;
+    if (read(fd, vh_sec, 512) != 512) return -1;
+    if (hfsplus_parse_vh(vh_sec, vh) != 0) return -1;
+    uint32_t actual;
+    uint8_t *cat = hfsplus_read_fork(fd, fs_off, vh, &vh->catalog_file, &actual);
+    if (!cat) return -1;
+    *cat_out = cat;
+    *cat_size_out = actual;
+    return 0;
+}
+
+static int fs_ls_hfsplus(int fd, off_t fs_off, const char *path) {
+    HfsPlusVH vh;
+    uint8_t *cat = NULL;
+    uint32_t cat_size = 0;
+    if (hfsplus_open_catalog(fd, fs_off, &vh, &cat, &cat_size) != 0) {
+        fprintf(stderr, "Error: cannot open HFS+ catalog\n");
+        return 1;
+    }
+    uint32_t cnid;
+    int is_dir;
+    uint64_t fsize;
+    HfsPlusFork fk;
+    if (hfsplus_resolve_path(cat, cat_size, path, &cnid, &is_dir,
+                              &fsize, &fk) != 0) {
+        fprintf(stderr, "Error: HFS+ path not found: %s\n", path);
+        free(cat); return 1;
+    }
+    if (!is_dir) {
+        fprintf(stderr, "Error: %s is not a directory\n", path);
+        free(cat); return 1;
+    }
+    HfsPlusLsCtx ctx; memset(&ctx, 0, sizeof(ctx));
+    ctx.parent_id = cnid;
+    hfsplus_walk_leaves(cat, cat_size, hfsplus_ls_cb, &ctx);
+    if (ctx.printed == 0) printf("  (empty)\n");
+    free(cat);
+    return 0;
+}
+
+static int fs_get_hfsplus(int fd, off_t fs_off, const char *path,
+                          const char *host_out) {
+    HfsPlusVH vh;
+    uint8_t *cat = NULL;
+    uint32_t cat_size = 0;
+    if (hfsplus_open_catalog(fd, fs_off, &vh, &cat, &cat_size) != 0) {
+        fprintf(stderr, "Error: cannot open HFS+ catalog\n");
+        return 1;
+    }
+    uint32_t cnid;
+    int is_dir;
+    uint64_t fsize;
+    HfsPlusFork fk;
+    if (hfsplus_resolve_path(cat, cat_size, path, &cnid, &is_dir,
+                              &fsize, &fk) != 0) {
+        fprintf(stderr, "Error: HFS+ path not found: %s\n", path);
+        free(cat); return 1;
+    }
+    if (is_dir) {
+        fprintf(stderr, "Error: %s is a directory\n", path);
+        free(cat); return 1;
+    }
+    uint32_t got = 0;
+    uint8_t *data = hfsplus_read_fork(fd, fs_off, &vh, &fk, &got);
+    free(cat);
+    if (!data) return 1;
     FILE *out = fopen(host_out, "wb");
     if (!out) { free(data); return 1; }
     fwrite(data, 1, got, out);
@@ -4470,6 +4822,7 @@ static int cmd_ls(int argc, char **argv) {
     switch (ft) {
         case FS_ISO9660: rc = fs_ls_iso9660(fd, fs_off, path); break;
         case FS_HFS:     rc = fs_ls_hfs(fd, fs_off, path); break;
+        case FS_HFS_PLUS:rc = fs_ls_hfsplus(fd, fs_off, path); break;
         case FS_FAT:     rc = fs_ls_fat(fd, fs_off, path); break;
         default:
             fprintf(stderr,
@@ -4510,6 +4863,8 @@ static int cmd_get(int argc, char **argv) {
             rc = fs_get_iso9660(fd, fs_off, path, host_out); break;
         case FS_HFS:
             rc = fs_get_hfs(fd, fs_off, path, host_out); break;
+        case FS_HFS_PLUS:
+            rc = fs_get_hfsplus(fd, fs_off, path, host_out); break;
         case FS_FAT:
             rc = fs_get_fat(fd, fs_off, path, host_out); break;
         default:
