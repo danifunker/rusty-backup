@@ -230,8 +230,14 @@ jobs:
             codesign --force --deep --sign - "${BUNDLE_NAME}"
           fi
 
-          # Create DMG
-          hdiutil create -volname "${APP_NAME}" -srcfolder "${BUNDLE_NAME}" -ov -format UDZO "Rusty-Backup-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg"
+          # Create DMG (stage the app alongside an /Applications symlink so
+          # users can drag-install)
+          DMG_STAGING="dmg-staging"
+          rm -rf "${DMG_STAGING}"
+          mkdir -p "${DMG_STAGING}"
+          cp -R "${BUNDLE_NAME}" "${DMG_STAGING}/"
+          ln -s /Applications "${DMG_STAGING}/Applications"
+          hdiutil create -volname "${APP_NAME}" -srcfolder "${DMG_STAGING}" -ov -format UDZO "Rusty-Backup-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg"
 
           # Sign the DMG as well if certificate is available
           if [ -n "$MACOS_CERTIFICATE" ] && [ -n "$MACOS_TEAM_ID" ]; then
