@@ -266,6 +266,22 @@ pub(crate) fn cmd_new(
     name: &str,
     block_size: Option<u32>,
 ) -> Result<()> {
+    cmd_new_sized(image, size_arg, name, block_size, None, None)
+}
+
+/// Variant of [`cmd_new`] that exposes B-tree sizing overrides. When
+/// `catalog_bytes` / `extents_bytes` are `None`, falls back to
+/// [`crate::fs::hfs::default_btree_sizes`] (~0.5 % of volume, clump-
+/// aligned, 24-block floor) so steady-state file activity doesn't
+/// trigger B-tree extensions.
+pub(crate) fn cmd_new_sized(
+    image: PathBuf,
+    size_arg: &str,
+    name: &str,
+    block_size: Option<u32>,
+    catalog_bytes: Option<u32>,
+    extents_bytes: Option<u32>,
+) -> Result<()> {
     let size = parse_size(size_arg)?;
     if size < 1024 {
         bail!("size {size} is too small for an HFS volume");
@@ -280,7 +296,11 @@ pub(crate) fn cmd_new(
         None => pick_block_size(size),
     };
 
-    let bytes = create_blank_hfs_sized(size, block_size, name, 0, 0)
+    let (default_cat, default_ext) = crate::fs::hfs::default_btree_sizes(size, block_size);
+    let catalog_bytes = catalog_bytes.unwrap_or(default_cat);
+    let extents_bytes = extents_bytes.unwrap_or(default_ext);
+
+    let bytes = create_blank_hfs_sized(size, block_size, name, extents_bytes, catalog_bytes)
         .map_err(|e| anyhow!("failed to format HFS volume: {e}"))?;
 
     let mut file = OpenOptions::new()

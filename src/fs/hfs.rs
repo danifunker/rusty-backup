@@ -1468,6 +1468,107 @@ impl<R: Read + Seek> HfsFilesystem<R> {
             self.mdb.finder_info[i] = BigEndian::read_u32(&finder_info[i * 4..(i + 1) * 4]);
         }
     }
+
+    /// Rename the volume. Updates the MDB `drVN`, the root directory's
+    /// catalog key (which carries the volume name — Mac OS looks up the
+    /// root by `(parent=1, drVN)` at mount time), and the root thread
+    /// record's `thdCName`. Caller must `sync_metadata` to flush. New
+    /// name must be 1..=27 Mac Roman bytes.
+    pub fn set_volume_name(&mut self, new_name: &str) -> Result<(), FilesystemError> {
+        let new_name_raw = utf8_to_mac_roman(new_name)?;
+        if new_name_raw.is_empty() {
+            return Err(FilesystemError::InvalidData(
+                "HFS volume name must not be empty (Mac OS rejects unnamed volumes with -127)"
+                    .into(),
+            ));
+        }
+        if new_name_raw.len() > 27 {
+            return Err(FilesystemError::InvalidData(format!(
+                "HFS volume name '{new_name}' exceeds 27 Mac Roman bytes"
+            )));
+        }
+
+        let snap = self.snapshot();
+        let result = (|| -> Result<(), FilesystemError> {
+            let old_name_raw = self.mdb.volume_name_raw.clone();
+            if new_name_raw == old_name_raw {
+                return Ok(());
+            }
+
+            // Locate the root dir record by its current key (parent=1, drVN).
+            let (node_idx, rec_idx, key_abs) = self
+                .find_catalog_record_by_name(1, &old_name_raw)
+                .ok_or_else(|| {
+                FilesystemError::NotFound("root directory record not found in catalog".into())
+            })?;
+
+            // Extract the existing data portion of the record so we can
+            // re-emit it under a new key.
+            let node_size = BigEndian::read_u16(&self.catalog_data[32..34]) as usize;
+            let node_off = node_idx as usize * node_size;
+            let node = &self.catalog_data[node_off..node_off + node_size];
+            let (rec_start, rec_end) = hfs_common::btree_record_range(node, node_size, rec_idx);
+            // key_abs == node_off + rec_start
+            debug_assert_eq!(key_abs, node_off + rec_start);
+            let key_len = node[rec_start] as usize;
+            let mut data_rel = 1 + key_len;
+            if !data_rel.is_multiple_of(2) {
+                data_rel += 1;
+            }
+            let data_bytes = node[rec_start + data_rel..rec_end].to_vec();
+
+            // Build the new record: new key + (pad to even) + data + (pad).
+            let new_key = Self::build_catalog_key(1, &new_name_raw);
+            let mut new_record = new_key;
+            if !new_record.len().is_multiple_of(2) {
+                new_record.push(0);
+            }
+            new_record.extend_from_slice(&data_bytes);
+            if !new_record.len().is_multiple_of(2) {
+                new_record.push(0);
+            }
+
+            self.remove_catalog_record(node_idx, rec_idx);
+            self.insert_catalog_record(&new_record)?;
+
+            // Rewrite the root thread record's `thdCName` (Str31 at +14).
+            // Key stays (parent=2, name="") so the record's footprint is
+            // unchanged — safe to rewrite in place.
+            if let Some((_n, _r, t_key_abs)) = self.find_catalog_record_by_cnid(2) {
+                let t_key_len = self.catalog_data[t_key_abs] as usize;
+                let mut t_data_off = t_key_abs + 1 + t_key_len;
+                if !t_data_off.is_multiple_of(2) {
+                    t_data_off += 1;
+                }
+                if t_data_off + 15 + 27 <= self.catalog_data.len() {
+                    self.catalog_data[t_data_off + 14] = new_name_raw.len() as u8;
+                    for i in 0..27 {
+                        self.catalog_data[t_data_off + 15 + i] = 0;
+                    }
+                    self.catalog_data[t_data_off + 15..t_data_off + 15 + new_name_raw.len()]
+                        .copy_from_slice(&new_name_raw);
+                }
+            }
+
+            // Update the MDB. `drVN` lives at offset 36 (length byte) +
+            // 37..64 (up to 27 name bytes). `serialize_to_sector` reads
+            // these from `raw_sector` verbatim, so the change propagates
+            // on the next `sync_metadata`.
+            self.mdb.volume_name = mac_roman_to_utf8(&new_name_raw);
+            self.mdb.volume_name_raw = new_name_raw.clone();
+            self.mdb.raw_sector[36] = new_name_raw.len() as u8;
+            for i in 0..27 {
+                self.mdb.raw_sector[37 + i] = 0;
+            }
+            self.mdb.raw_sector[37..37 + new_name_raw.len()].copy_from_slice(&new_name_raw);
+
+            Ok(())
+        })();
+        if result.is_err() {
+            self.restore_snapshot(snap);
+        }
+        result
+    }
 }
 
 /// Write helpers — require Read + Write + Seek.
@@ -1569,6 +1670,13 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
             bitmap_set_bit_be(bitmap, start + i);
         }
         self.mdb.free_blocks -= count as u16;
+        // Advance drAllocPtr (MDB offset 16) past the run so subsequent
+        // allocation searches start where the last one ended. hformat
+        // maintains this; without it the field stays at 0 and the
+        // allocator hint never moves, which diffs against reference
+        // hformat-built volumes.
+        let next = (start + count) % self.mdb.total_blocks.max(1) as u32;
+        BigEndian::write_u16(&mut self.mdb.raw_sector[16..18], next as u16);
         Ok(start)
     }
 
@@ -2149,6 +2257,31 @@ pub fn create_blank_hfs(
     create_blank_hfs_sized(target_size_bytes, block_size, volume_name, 0, 0)
 }
 
+/// Default B-tree sizes that loosely follow `hformat` (hfsutils).
+/// The classic clump-size convention is `4 × block_size`; hformat scales
+/// the Catalog file with volume size so steady-state file activity
+/// rarely triggers an extension (each extension fragments the metadata).
+/// Returns `(catalog_bytes, extents_bytes)` — both clump-aligned, with a
+/// 24-block floor. Catalog ≈ 0.5 % of the volume; Extents ≈ half that.
+///
+/// Inputs are taken in bytes (`target_volume_bytes`) so callers don't
+/// need to repeat the `first_alloc_block` math; `block_size` must be a
+/// non-zero multiple of 512 (the create_blank_hfs precondition).
+pub fn default_btree_sizes(target_volume_bytes: u64, block_size: u32) -> (u32, u32) {
+    if block_size == 0 {
+        return (0, 0);
+    }
+    let clump = 4u64 * block_size as u64;
+    let floor = 24u64 * block_size as u64;
+    let raw = target_volume_bytes / 200; // 0.5 %
+    let catalog = raw.max(floor).div_ceil(clump) * clump;
+    let extents = (raw / 2).max(floor).div_ceil(clump) * clump;
+    (
+        catalog.min(u32::MAX as u64) as u32,
+        extents.min(u32::MAX as u64) as u32,
+    )
+}
+
 /// Variant of [`create_blank_hfs`] that lets the caller request minimum
 /// extents-overflow and catalog B-tree sizes (in bytes). Each is rounded up
 /// to a whole allocation block; values smaller than the 4-block default are
@@ -2315,6 +2448,10 @@ fn build_blank_mdb(
     BigEndian::write_u16(&mut mdb[0..2], HFS_SIGNATURE);
     BigEndian::write_u32(&mut mdb[2..6], now); // drCrDate
     BigEndian::write_u32(&mut mdb[6..10], now); // drLsMod
+                                                // drAtrb: kHFSVolumeUnmountedMask (0x0100). Without this bit, classic
+                                                // Mac OS treats the volume as needing repair on first mount and runs
+                                                // Disk First Aid — manifests as a slow startup on a real Mac.
+    BigEndian::write_u16(&mut mdb[10..12], 0x0100);
     BigEndian::write_u16(&mut mdb[14..16], 3); // drVBMSt = bitmap sector
     BigEndian::write_u16(&mut mdb[18..20], total_blocks); // drNmAlBlks
     BigEndian::write_u32(&mut mdb[20..24], block_size); // drAlBlkSiz
@@ -2983,6 +3120,29 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
             self.restore_snapshot(snap);
         }
         result
+    }
+
+    fn set_volume_name(&mut self, new_name: &str) -> Result<(), FilesystemError> {
+        HfsFilesystem::set_volume_name(self, new_name)
+    }
+
+    fn set_finder_info(
+        &mut self,
+        entry: &FileEntry,
+        finfo: [u8; 16],
+        fxinfo: [u8; 16],
+    ) -> Result<(), FilesystemError> {
+        HfsFilesystem::set_finder_info(self, entry, finfo, fxinfo)
+    }
+
+    fn set_dates(
+        &mut self,
+        entry: &FileEntry,
+        create: u32,
+        modify: u32,
+        backup: u32,
+    ) -> Result<(), FilesystemError> {
+        HfsFilesystem::set_dates(self, entry, create, modify, backup)
     }
 }
 
@@ -4460,6 +4620,23 @@ mod tests {
             let img = create_blank_hfs(*total_size, *block_size, "Fresh")
                 .unwrap_or_else(|e| panic!("{label}: create_blank_hfs failed: {e}"));
 
+            // Primary MDB at sector 2 (byte offset 1024). drAtrb at MDB+10
+            // must include kHFSVolumeUnmountedMask (0x0100) so Mac OS does
+            // not flag the volume for repair on first mount.
+            let atrb = BigEndian::read_u16(&img[1024 + 10..1024 + 12]);
+            assert_eq!(
+                atrb & 0x0100,
+                0x0100,
+                "{label}: drAtrb missing kHFSVolumeUnmountedMask (got 0x{atrb:04x})"
+            );
+            // Alt MDB at next-to-last sector mirrors the primary.
+            let alt_off = img.len() - 1024;
+            let alt_atrb = BigEndian::read_u16(&img[alt_off + 10..alt_off + 12]);
+            assert_eq!(
+                alt_atrb, atrb,
+                "{label}: alt MDB drAtrb (0x{alt_atrb:04x}) does not mirror primary (0x{atrb:04x})"
+            );
+
             // The image MUST be exactly the requested size (rounded down by
             // whole allocation blocks, plus MDB sectors). We don't enforce
             // exact equality — the builder consumes remaining bytes for the
@@ -4979,6 +5156,144 @@ mod tests {
         assert_eq!(fs2.mdb.finder_info[0], 100);
         assert_eq!(fs2.mdb.finder_info[3], 200);
         assert_eq!(fs2.mdb.finder_info[5], 300);
+    }
+
+    #[test]
+    fn test_default_btree_sizes_scale_and_floor() {
+        // Small volume: both sizes hit the 24-block floor.
+        let (cat, ext) = default_btree_sizes(1 * 1024 * 1024, 512);
+        let floor = 24 * 512;
+        assert_eq!(cat, floor, "small-volume catalog should hit floor");
+        assert_eq!(ext, floor, "small-volume extents should hit floor");
+
+        // 20 MB @ 512 (the hformat reference volume): catalog should be a
+        // healthy fraction of the volume (well above the 2 KB old default),
+        // extents ~half. Both clump-aligned (4 * block_size = 2048).
+        let (cat, ext) = default_btree_sizes(20 * 1024 * 1024, 512);
+        assert!(cat >= 100 * 1024, "20MB catalog too small: {cat}");
+        assert_eq!(cat % 2048, 0, "catalog not clump-aligned");
+        assert_eq!(ext % 2048, 0, "extents not clump-aligned");
+        assert!(ext <= cat, "extents should not exceed catalog");
+        assert!(ext * 2 >= cat - 2048, "extents should be ~half catalog");
+
+        // Larger volume scales further up.
+        let (cat_big, _) = default_btree_sizes(200 * 1024 * 1024, 4096);
+        assert!(cat_big > cat, "larger volume should get a larger catalog");
+
+        // A volume formatted with the default sizing must be buildable +
+        // fsck-clean (the catalog can't exceed available blocks).
+        let (c, e) = default_btree_sizes(20 * 1024 * 1024, 4096);
+        let img = create_blank_hfs_sized(20 * 1024 * 1024, 4096, "Ref20", e, c).unwrap();
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let result = fs.fsck().unwrap();
+        assert!(
+            result.errors.is_empty(),
+            "fsck errors on default-sized volume: {:?}",
+            result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_hfs_set_volume_name_roundtrip() {
+        // Build a blank volume, rename, re-open, verify drVN + catalog
+        // key + root thread record all carry the new name and fsck is clean.
+        let img = create_blank_hfs(8 * 1024 * 1024, 4096, "OldName").unwrap();
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+
+        fs.set_volume_name("NewName").unwrap();
+        assert_eq!(fs.mdb.volume_name, "NewName");
+        fs.sync_metadata().unwrap();
+
+        let bytes = fs.reader.get_ref().clone();
+        let mut fs2 = HfsFilesystem::open(Cursor::new(bytes.clone()), 0).unwrap();
+        assert_eq!(fs2.mdb.volume_name, "NewName");
+
+        // Root dir record key must now be (parent=1, "NewName") — otherwise
+        // Mac OS rejects the volume with -127 at mount.
+        let new_raw = b"NewName".to_vec();
+        assert!(
+            fs2.find_catalog_record_by_name(1, &new_raw).is_some(),
+            "root dir record not re-keyed to new name"
+        );
+        assert!(
+            fs2.find_catalog_record_by_name(1, b"OldName").is_none(),
+            "old root dir key still present"
+        );
+
+        // Root thread record (parent=2, name="") must carry new thdCName.
+        let (_n, _r, key_abs) = fs2.find_catalog_record_by_cnid(2).unwrap();
+        let key_len = fs2.catalog_data[key_abs] as usize;
+        let mut data_off = key_abs + 1 + key_len;
+        if !data_off.is_multiple_of(2) {
+            data_off += 1;
+        }
+        let thd_len = fs2.catalog_data[data_off + 14] as usize;
+        assert_eq!(thd_len, new_raw.len(), "thdCName length not updated");
+        assert_eq!(
+            &fs2.catalog_data[data_off + 15..data_off + 15 + thd_len],
+            new_raw.as_slice(),
+            "thdCName bytes not updated"
+        );
+
+        // MDB drVN at raw_sector +36 should mirror.
+        let mdb_off = 1024 + 36;
+        assert_eq!(bytes[mdb_off] as usize, new_raw.len());
+        assert_eq!(
+            &bytes[mdb_off + 1..mdb_off + 1 + new_raw.len()],
+            new_raw.as_slice()
+        );
+
+        let result = fs2.fsck().unwrap();
+        assert!(
+            result.errors.is_empty(),
+            "fsck errors after rename: {:?}",
+            result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_drallocptr_advances_with_allocations() {
+        // Fresh volume: drAllocPtr should be 0. After a put it should
+        // advance past the allocated run so subsequent allocations start
+        // where the last one ended — matches hformat behavior.
+        let img = create_blank_hfs(4 * 1024 * 1024, 512, "AllocPtr").unwrap();
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        assert_eq!(
+            BigEndian::read_u16(&fs.mdb.raw_sector[16..18]),
+            0,
+            "fresh volume drAllocPtr should be 0"
+        );
+
+        let root = fs.root().unwrap();
+        let payload = vec![0xABu8; 8 * 1024]; // forces 16 blocks @ 512
+        let mut src = payload.as_slice();
+        fs.create_file(
+            &root,
+            "ptr",
+            &mut src,
+            payload.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        let after = BigEndian::read_u16(&fs.mdb.raw_sector[16..18]);
+        assert!(after > 0, "drAllocPtr should advance after allocation");
+    }
+
+    #[test]
+    fn test_hfs_set_volume_name_rejects_invalid() {
+        let img = create_blank_hfs(1 * 1024 * 1024, 512, "X").unwrap();
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        assert!(
+            fs.set_volume_name("").is_err(),
+            "empty name must be rejected"
+        );
+        let too_long = "A".repeat(28);
+        assert!(
+            fs.set_volume_name(&too_long).is_err(),
+            ">27 byte name must be rejected"
+        );
+        // Original name must still be intact after rollback.
+        assert_eq!(fs.mdb.volume_name, "X");
     }
 
     #[test]

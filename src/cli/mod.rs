@@ -87,6 +87,18 @@ pub enum Command {
     /// host file.
     Setrsrc(verbs::setrsrc::SetRsrcArgs),
 
+    /// Rename the volume at IMG[@N] (HFS only today).
+    Setvolname(verbs::setvolname::SetVolNameArgs),
+
+    /// Reformat a partition in place, leaving the partition table intact
+    /// (HFS only today).
+    Reformat(verbs::reformat::ReformatArgs),
+
+    /// Put a MacBinary I / II archive: both forks + full Finder info in
+    /// one shot (HFS today).
+    #[command(name = "put-macbinary")]
+    PutMacBinary(verbs::put_macbinary::PutMacBinaryArgs),
+
     /// Resize the filesystem at IMG@N to a new size (FAT/NTFS/exFAT/HFS+/
     /// ext/btrfs/SFS/PFS3/AFFS/EFS — whichever magic matches).
     Resize(verbs::resize::ResizeArgs),
@@ -194,6 +206,9 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Bless(args) => verbs::bless::run(args),
         Command::Chmeta(args) => verbs::chmeta::run(args),
         Command::Setrsrc(args) => verbs::setrsrc::run(args),
+        Command::Setvolname(args) => verbs::setvolname::run(args),
+        Command::Reformat(args) => verbs::reformat::run(args),
+        Command::PutMacBinary(args) => verbs::put_macbinary::run(args),
         Command::Resize(args) => verbs::resize::run(args),
         Command::Expand(args) => verbs::expand::run(args),
         Command::Grow(args) => verbs::grow::run(args),

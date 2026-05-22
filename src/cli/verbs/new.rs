@@ -48,6 +48,19 @@ pub struct NewArgs {
     #[arg(long = "block-size")]
     pub block_size: Option<u32>,
 
+    /// HFS Catalog B-tree initial size in bytes (rounded up to a whole
+    /// allocation block). When unset, scales with volume size like
+    /// hformat (~0.5%, clump-aligned, 24-block floor). Ignored for other
+    /// filesystems.
+    #[arg(long = "catalog-size")]
+    pub catalog_size: Option<String>,
+
+    /// HFS Extents-overflow B-tree initial size in bytes (rounded up to a
+    /// whole allocation block). When unset, ~half the catalog size.
+    /// Ignored for other filesystems.
+    #[arg(long = "extents-size")]
+    pub extents_size: Option<String>,
+
     /// AFFS variant byte (0=OFS, 1=FFS, 2=OFS+intl, 3=FFS+intl,
     /// 4=OFS+dircache, 5=FFS+dircache). Defaults to 1 (FFS).
     #[arg(long = "affs-variant", default_value = "1")]
@@ -57,7 +70,26 @@ pub struct NewArgs {
 pub fn run(args: NewArgs) -> Result<()> {
     match args.fs {
         FsKind::Hfs => {
-            crate::cli::api::hfs::cmd_new(args.image, &args.size, &args.name, args.block_size)
+            let catalog_bytes = args
+                .catalog_size
+                .as_deref()
+                .map(|s| parse_size(s).context("parsing --catalog-size"))
+                .transpose()?
+                .map(|v| v.min(u32::MAX as u64) as u32);
+            let extents_bytes = args
+                .extents_size
+                .as_deref()
+                .map(|s| parse_size(s).context("parsing --extents-size"))
+                .transpose()?
+                .map(|v| v.min(u32::MAX as u64) as u32);
+            crate::cli::api::hfs::cmd_new_sized(
+                args.image,
+                &args.size,
+                &args.name,
+                args.block_size,
+                catalog_bytes,
+                extents_bytes,
+            )
         }
         FsKind::Fat => format_and_write(&args.image, &args.size, &args.name, |size, name| {
             crate::fs::fat::create_blank_fat(size, Some(name))

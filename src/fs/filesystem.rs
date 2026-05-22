@@ -379,6 +379,45 @@ pub trait EditableFilesystem: Filesystem {
         ))
     }
 
+    /// Rename the volume. Override on filesystems where the volume name is
+    /// stored in metadata that the implementation can rewrite in place
+    /// (HFS today; others return `Unsupported`).
+    fn set_volume_name(&mut self, _new_name: &str) -> Result<(), FilesystemError> {
+        Err(FilesystemError::Unsupported(
+            "set_volume_name not supported for this filesystem".into(),
+        ))
+    }
+
+    /// Overwrite the full 16-byte FInfo and 16-byte FXInfo Finder metadata
+    /// on a file's catalog record. HFS today; others `Unsupported`. Used
+    /// by the MacBinary put path to apply Finder flags / location / folder
+    /// in one shot.
+    fn set_finder_info(
+        &mut self,
+        _entry: &FileEntry,
+        _finfo: [u8; 16],
+        _fxinfo: [u8; 16],
+    ) -> Result<(), FilesystemError> {
+        Err(FilesystemError::Unsupported(
+            "set_finder_info not supported for this filesystem".into(),
+        ))
+    }
+
+    /// Overwrite the create/modify/backup dates on a file's catalog
+    /// record. Dates are Mac epoch (seconds since 1904-01-01 00:00 UTC).
+    /// HFS today; others `Unsupported`.
+    fn set_dates(
+        &mut self,
+        _entry: &FileEntry,
+        _create: u32,
+        _modify: u32,
+        _backup: u32,
+    ) -> Result<(), FilesystemError> {
+        Err(FilesystemError::Unsupported(
+            "set_dates not supported for this filesystem".into(),
+        ))
+    }
+
     /// Create a symbolic link in `parent` pointing at `target` (a path
     /// string interpreted by the filesystem's own resolver semantics).
     /// Returns the new symlink's entry. Default returns `Unsupported` —
