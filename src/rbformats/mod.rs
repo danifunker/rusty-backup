@@ -7,6 +7,7 @@ pub mod dmg;
 pub mod export;
 pub mod interleave;
 pub mod raw;
+pub mod sparse;
 pub mod twomg;
 pub mod vhd;
 pub mod woz;

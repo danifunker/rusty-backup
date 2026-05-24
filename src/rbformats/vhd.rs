@@ -33,6 +33,17 @@ pub const VHD_COOKIE: &[u8; 8] = b"conectix";
 /// - Unique ID: random 16 bytes
 /// - Checksum: one's complement of the sum of all footer bytes (excluding checksum field)
 pub fn build_vhd_footer(data_size: u64) -> [u8; 512] {
+    // Fixed disk: disk type 2, no dynamic header (data offset = 0xFFFF…).
+    build_vhd_footer_with_type(data_size, VHD_TYPE_FIXED, 0xFFFF_FFFF_FFFF_FFFF)
+}
+
+/// Build a 512-byte VHD footer, parameterized by disk type and data offset.
+///
+/// Fixed disks call this with `disk_type = VHD_TYPE_FIXED` and
+/// `data_offset = 0xFFFFFFFFFFFFFFFF` (the [`build_vhd_footer`] default, kept
+/// byte-identical for backward compatibility). Dynamic disks pass
+/// `VHD_TYPE_DYNAMIC` and the byte offset of the dynamic disk header (512).
+pub fn build_vhd_footer_with_type(data_size: u64, disk_type: u32, data_offset: u64) -> [u8; 512] {
     let mut footer = [0u8; 512];
 
     // Cookie (offset 0, 8 bytes)
@@ -44,8 +55,9 @@ pub fn build_vhd_footer(data_size: u64) -> [u8; 512] {
     // File Format Version (offset 12, 4 bytes) — 1.0
     footer[12..16].copy_from_slice(&0x0001_0000u32.to_be_bytes());
 
-    // Data Offset (offset 16, 8 bytes) — 0xFFFFFFFFFFFFFFFF for fixed disks
-    footer[16..24].copy_from_slice(&0xFFFF_FFFF_FFFF_FFFFu64.to_be_bytes());
+    // Data Offset (offset 16, 8 bytes) — 0xFFFFFFFFFFFFFFFF for fixed disks;
+    // points at the dynamic disk header for dynamic/differencing disks.
+    footer[16..24].copy_from_slice(&data_offset.to_be_bytes());
 
     // Timestamp (offset 24, 4 bytes) — seconds since 2000-01-01 00:00:00 UTC
     // VHD epoch: 2000-01-01 00:00:00 UTC = Unix timestamp 946684800
@@ -83,8 +95,8 @@ pub fn build_vhd_footer(data_size: u64) -> [u8; 512] {
     footer[58] = heads as u8;
     footer[59] = sectors_per_track as u8;
 
-    // Disk Type (offset 60, 4 bytes) — 2 = Fixed
-    footer[60..64].copy_from_slice(&2u32.to_be_bytes());
+    // Disk Type (offset 60, 4 bytes) — 2 = Fixed, 3 = Dynamic, 4 = Differencing
+    footer[60..64].copy_from_slice(&disk_type.to_be_bytes());
 
     // Checksum (offset 64, 4 bytes) — computed after UUID
     // UUID (offset 68, 16 bytes) — random
@@ -94,19 +106,23 @@ pub fn build_vhd_footer(data_size: u64) -> [u8; 512] {
     // Saved State (offset 84, 1 byte) — 0
     // Reserved (offset 85..512) — already zero
 
-    // Compute checksum: one's complement of the sum of all bytes,
-    // treating the checksum field (bytes 64..68) as zero.
-    let mut sum: u32 = 0;
-    for (i, &b) in footer.iter().enumerate() {
-        if (64..68).contains(&i) {
-            continue; // skip checksum field
-        }
-        sum = sum.wrapping_add(b as u32);
-    }
-    let checksum = !sum;
+    // Checksum: one's complement of the sum of all bytes with the checksum
+    // field left zero (it still is here, so sum over the whole footer).
+    let checksum = vhd_checksum(&footer);
     footer[64..68].copy_from_slice(&checksum.to_be_bytes());
 
     footer
+}
+
+/// VHD structure checksum: one's complement of the byte-wise sum of `bytes`.
+///
+/// Shared by the footer and the dynamic disk header. The caller must zero the
+/// 4-byte checksum field before calling so it does not contribute to the sum.
+pub(crate) fn vhd_checksum(bytes: &[u8]) -> u32 {
+    let sum = bytes
+        .iter()
+        .fold(0u32, |acc, &b| acc.wrapping_add(b as u32));
+    !sum
 }
 
 /// Compute VHD CHS geometry from total disk size (in bytes) per the VHD spec.
@@ -338,6 +354,150 @@ impl<R: Read + Seek> Seek for DynamicVhdReader<R> {
         self.pos = new_pos as u64;
         Ok(self.pos)
     }
+}
+
+/// Default dynamic-VHD block size: 2 MiB (the value `qemu-img`, Hyper-V, and
+/// Disk2vhd all emit).
+pub const VHD_DEFAULT_BLOCK_SIZE: u32 = 0x0020_0000;
+
+/// Build the 1024-byte VHD Dynamic Disk Header (`cxsparse`).
+///
+/// All fields big-endian. The dynamic header sits at byte offset 512 (right
+/// after the leading footer copy); the BAT it points at via `table_offset`
+/// follows at 1536.
+pub(crate) fn build_vhd_dynamic_header(
+    table_offset: u64,
+    max_table_entries: u32,
+    block_size: u32,
+) -> [u8; 1024] {
+    let mut h = [0u8; 1024];
+    // Cookie (0, 8)
+    h[0..8].copy_from_slice(VHD_DYNAMIC_COOKIE);
+    // Data offset (8, 8) — none for non-differencing disks.
+    h[8..16].copy_from_slice(&0xFFFF_FFFF_FFFF_FFFFu64.to_be_bytes());
+    // Table (BAT) offset (16, 8)
+    h[16..24].copy_from_slice(&table_offset.to_be_bytes());
+    // Header version (24, 4) — 1.0
+    h[24..28].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+    // Max table entries (28, 4)
+    h[28..32].copy_from_slice(&max_table_entries.to_be_bytes());
+    // Block size (32, 4)
+    h[32..36].copy_from_slice(&block_size.to_be_bytes());
+    // Checksum (36, 4) — over the whole header with this field zeroed (it is).
+    // Parent UUID / timestamp / name / locators (40..1024) — all zero.
+    let checksum = vhd_checksum(&h);
+    h[36..40].copy_from_slice(&checksum.to_be_bytes());
+    h
+}
+
+/// Stream a `disk_size`-byte source into a *dynamic* (sparse) VHD on `out`.
+///
+/// Blocks whose source bytes are entirely zero are left unallocated (their BAT
+/// entry stays `0xFFFFFFFF`, read back as zeros); non-zero blocks are appended
+/// with an all-ones sector bitmap. Layout written:
+///
+/// ```text
+/// +0      footer copy (512)
+/// +512    dynamic disk header (1024)
+/// +1536   BAT: max_entries * u32 BE, zero-padded to 512
+/// ...     appended blocks (each = sector bitmap + block_size data)
+/// EOF-512 footer
+/// ```
+///
+/// `block_size` of 0 selects [`VHD_DEFAULT_BLOCK_SIZE`]; otherwise it must be a
+/// non-zero multiple of 512. The BAT is held in RAM (a 2 TiB disk at 2 MiB
+/// blocks is 4 MiB of table) and back-patched after the data is streamed.
+pub fn export_whole_disk_vhd_dynamic(
+    reader: &mut impl Read,
+    out: &mut (impl Write + Seek),
+    disk_size: u64,
+    block_size: u32,
+    progress_cb: &mut dyn FnMut(u64),
+    cancel_check: &dyn Fn() -> bool,
+) -> Result<()> {
+    use super::sparse::{is_zero_unit, SparseAllocator};
+
+    let block_size = if block_size == 0 {
+        VHD_DEFAULT_BLOCK_SIZE
+    } else {
+        block_size
+    };
+    if !(block_size as u64).is_multiple_of(512) {
+        bail!("dynamic VHD block size {block_size} is not a multiple of 512");
+    }
+    let bs = block_size as u64;
+
+    let max_entries = disk_size.div_ceil(bs);
+    let bat_bytes = max_entries * 4;
+    let bat_padded = bat_bytes.div_ceil(512) * 512;
+
+    let header_offset: u64 = 512;
+    let table_offset: u64 = 512 + 1024;
+    let data_start = table_offset + bat_padded;
+
+    let sectors_per_block = bs / 512;
+    let bitmap_size = sectors_per_block.div_ceil(8).div_ceil(512) * 512;
+    let unit_size = bitmap_size + bs;
+
+    // Header region: footer copy, dynamic header, zero-filled BAT placeholder.
+    out.seek(SeekFrom::Start(0))?;
+    let footer = build_vhd_footer_with_type(disk_size, VHD_TYPE_DYNAMIC, header_offset);
+    out.write_all(&footer)
+        .context("failed to write dynamic VHD footer copy")?;
+    let header = build_vhd_dynamic_header(table_offset, max_entries as u32, block_size);
+    out.write_all(&header)
+        .context("failed to write dynamic disk header")?;
+    super::write_zeros(out, bat_padded).context("failed to write BAT placeholder")?;
+
+    // Stream blocks, allocating only the non-zero ones.
+    let mut allocator = SparseAllocator::new(data_start, unit_size);
+    let mut bat = vec![BAT_UNUSED; max_entries as usize];
+    let bitmap = vec![0xFFu8; bitmap_size as usize];
+    let mut block_buf = vec![0u8; bs as usize];
+
+    for (i, slot) in bat.iter_mut().enumerate() {
+        if cancel_check() {
+            bail!("dynamic VHD export cancelled");
+        }
+        let block_off = i as u64 * bs;
+        let this_block = (disk_size - block_off).min(bs) as usize;
+        reader
+            .read_exact(&mut block_buf[..this_block])
+            .context("failed to read source block")?;
+        // Zero any tail past the source's last partial block so the padding
+        // (and the zero-skip test) are deterministic.
+        for b in block_buf[this_block..].iter_mut() {
+            *b = 0;
+        }
+
+        if !is_zero_unit(&block_buf[..this_block]) {
+            let off = allocator.alloc();
+            *slot = (off / 512) as u32;
+            out.write_all(&bitmap)
+                .context("failed to write block bitmap")?;
+            out.write_all(&block_buf)
+                .context("failed to write block data")?;
+        }
+        progress_cb(block_off + this_block as u64);
+    }
+
+    // Trailing footer after the last allocated block (or right after the BAT
+    // placeholder if every block was sparse).
+    out.seek(SeekFrom::Start(allocator.next_offset()))?;
+    out.write_all(&footer)
+        .context("failed to write trailing dynamic VHD footer")?;
+
+    // Back-patch the BAT.
+    out.seek(SeekFrom::Start(table_offset))?;
+    let mut bat_bytes_buf = Vec::with_capacity(bat.len() * 4);
+    for entry in &bat {
+        bat_bytes_buf.extend_from_slice(&entry.to_be_bytes());
+    }
+    out.write_all(&bat_bytes_buf)
+        .context("failed to write BAT")?;
+    out.flush().context("failed to flush dynamic VHD")?;
+
+    Ok(())
 }
 
 /// Write VHD (Fixed): stream raw data to a single file, then append a
@@ -1463,5 +1623,201 @@ mod tests {
         // Zero size
         let (c, h, s) = vhd_chs_geometry(0);
         assert_eq!((c, h, s), (0, 0, 0));
+    }
+
+    // --- Session 1.2 tests: dynamic VHD writer ---
+
+    #[test]
+    fn test_build_vhd_footer_fixed_unchanged() {
+        // The refactored build_vhd_footer must produce structurally identical
+        // results to build_vhd_footer_with_type(…, FIXED, 0xFF…). UUID and
+        // timestamp differ between calls, so compare everything except those.
+        let f1 = build_vhd_footer(1024 * 1024);
+        let f2 = build_vhd_footer_with_type(1024 * 1024, VHD_TYPE_FIXED, u64::MAX);
+        // Cookie, features, version, data_offset, creator, host, sizes, geom, disk_type.
+        assert_eq!(&f1[0..24], &f2[0..24], "header fields");
+        assert_eq!(&f1[28..64], &f2[28..64], "creator through disk_type");
+        // Disk type must be 2 (Fixed).
+        assert_eq!(
+            u32::from_be_bytes(f1[60..64].try_into().unwrap()),
+            VHD_TYPE_FIXED
+        );
+        assert_eq!(
+            u32::from_be_bytes(f2[60..64].try_into().unwrap()),
+            VHD_TYPE_FIXED
+        );
+        // Data offset must be 0xFFFF… (no dynamic header).
+        assert_eq!(u64::from_be_bytes(f1[16..24].try_into().unwrap()), u64::MAX);
+    }
+
+    #[test]
+    fn test_vhd_checksum_helper() {
+        let data = [0u8; 512];
+        assert_eq!(vhd_checksum(&data), !0u32);
+        let data2 = [1u8; 4];
+        assert_eq!(vhd_checksum(&data2), !4u32);
+    }
+
+    #[test]
+    fn test_dynamic_vhd_writer_all_zeros() {
+        // A 64 KiB all-zero disk should produce a near-empty dynamic VHD:
+        // footer copy(512) + header(1024) + BAT(512) + trailing footer(512)
+        // = 2560 bytes, zero data blocks.
+        let disk_size: u64 = 65536;
+        let block_size = 65536u32;
+        let source = vec![0u8; disk_size as usize];
+        let mut out = Cursor::new(Vec::new());
+
+        export_whole_disk_vhd_dynamic(
+            &mut Cursor::new(&source),
+            &mut out,
+            disk_size,
+            block_size,
+            &mut |_| {},
+            &|| false,
+        )
+        .unwrap();
+
+        let written = out.into_inner();
+        // Just: footer copy + header + BAT (1 entry=4 bytes, padded to 512) + footer
+        let expected = 512 + 1024 + 512 + 512;
+        assert_eq!(
+            written.len(),
+            expected,
+            "all-zero disk should produce a minimal dynamic VHD, got {} bytes",
+            written.len()
+        );
+
+        // Round-trip: reader should see all zeros.
+        let mut reader = DynamicVhdReader::open(Cursor::new(written)).unwrap();
+        assert_eq!(reader.len(), disk_size);
+        let mut got = vec![0xFFu8; disk_size as usize];
+        std::io::copy(&mut reader, &mut Cursor::new(&mut got[..])).unwrap();
+        assert!(got.iter().all(|&b| b == 0), "round-trip should read zeros");
+    }
+
+    #[test]
+    fn test_dynamic_vhd_writer_roundtrip() {
+        // 8-block disk at 64 KiB block size (512 KiB total). Blocks 0 and 4
+        // have data; the rest are zero. The dynamic file should be much
+        // smaller than the flat equivalent because 6 of 8 blocks are skipped.
+        let bs = 65536usize;
+        let n = 8;
+        let disk_size = (bs * n) as u64;
+        let mut source = vec![0u8; disk_size as usize];
+        // Fill block 0 with 0xAB.
+        for b in source[..bs].iter_mut() {
+            *b = 0xAB;
+        }
+        // Fill block 4 with a pattern.
+        for (i, b) in source[bs * 4..bs * 5].iter_mut().enumerate() {
+            *b = (i % 256) as u8;
+        }
+
+        let mut out = Cursor::new(Vec::new());
+        export_whole_disk_vhd_dynamic(
+            &mut Cursor::new(&source),
+            &mut out,
+            disk_size,
+            bs as u32,
+            &mut |_| {},
+            &|| false,
+        )
+        .unwrap();
+
+        let written = out.into_inner();
+
+        // The file should be smaller than a fixed VHD of the same size because
+        // 6 of 8 blocks are skipped.
+        let fixed_size = disk_size as usize + 512; // raw + footer
+        assert!(
+            written.len() < fixed_size,
+            "dynamic VHD ({}) should be smaller than fixed ({})",
+            written.len(),
+            fixed_size
+        );
+
+        // Round-trip through the reader.
+        let mut reader = DynamicVhdReader::open(Cursor::new(written)).unwrap();
+        assert_eq!(reader.len(), disk_size);
+        let mut got = Vec::new();
+        std::io::copy(&mut reader, &mut got).unwrap();
+        assert_eq!(got.len(), disk_size as usize);
+        assert_eq!(got, source, "round-trip mismatch");
+    }
+
+    #[test]
+    fn test_dynamic_vhd_writer_default_block_size() {
+        // Using block_size=0 should select the 2 MiB default and still round-trip.
+        let disk_size: u64 = 4 * 1024 * 1024; // 4 MiB = 2 blocks at 2 MiB
+        let mut source = vec![0u8; disk_size as usize];
+        // Put some data in the second block.
+        source[2 * 1024 * 1024] = 0x42;
+
+        let mut out = Cursor::new(Vec::new());
+        export_whole_disk_vhd_dynamic(
+            &mut Cursor::new(&source),
+            &mut out,
+            disk_size,
+            0, // default
+            &mut |_| {},
+            &|| false,
+        )
+        .unwrap();
+
+        let written = out.into_inner();
+        let mut reader = DynamicVhdReader::open(Cursor::new(written)).unwrap();
+        assert_eq!(reader.len(), disk_size);
+        let mut got = Vec::new();
+        std::io::copy(&mut reader, &mut got).unwrap();
+        assert_eq!(got, source);
+    }
+
+    #[test]
+    fn test_dynamic_vhd_writer_detection_roundtrip() {
+        // Write to a file, let detect_image_format recognize it, then read back.
+        let bs = 1024usize;
+        let disk_size = (bs * 2) as u64;
+        let mut source = vec![0u8; disk_size as usize];
+        for b in source[..bs].iter_mut() {
+            *b = 0x77;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.vhd");
+        {
+            let mut out = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
+            export_whole_disk_vhd_dynamic(
+                &mut Cursor::new(&source),
+                &mut out,
+                disk_size,
+                bs as u32,
+                &mut |_| {},
+                &|| false,
+            )
+            .unwrap();
+        }
+
+        let file = File::open(&path).unwrap();
+        let fmt = crate::rbformats::detect_image_format_with_path(file, Some(&path)).unwrap();
+        match &fmt {
+            crate::rbformats::ImageFormat::VhdDynamic { logical_size, .. } => {
+                assert_eq!(*logical_size, disk_size);
+            }
+            _ => panic!("expected VhdDynamic, got something else"),
+        }
+
+        let file2 = File::open(&path).unwrap();
+        let (mut reader, size) = crate::rbformats::wrap_image_reader(file2, fmt).unwrap();
+        assert_eq!(size, disk_size);
+        let mut got = Vec::new();
+        std::io::copy(&mut reader, &mut got).unwrap();
+        assert_eq!(got, source);
     }
 }

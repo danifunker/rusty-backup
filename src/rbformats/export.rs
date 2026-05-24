@@ -22,6 +22,8 @@ use crate::partition::PartitionSizeOverride;
 pub enum ExportFormat {
     /// Fixed VHD (Virtual Hard Disk) — raw data + 512-byte footer.
     Vhd,
+    /// Dynamic (sparse) VHD — BAT + per-block bitmaps; all-zero blocks omitted.
+    VhdDynamic,
     /// Raw disk image — no header/footer.
     Raw,
     /// 2MG (Apple II) — 64-byte header + raw data.
@@ -45,7 +47,7 @@ impl ExportFormat {
     /// File extension for this format.
     pub fn extension(&self) -> &'static str {
         match self {
-            Self::Vhd => "vhd",
+            Self::Vhd | Self::VhdDynamic => "vhd",
             Self::Raw => "img",
             Self::TwoMg => "2mg",
             Self::Woz => "woz",
@@ -59,6 +61,7 @@ impl ExportFormat {
     pub fn description(&self) -> &'static str {
         match self {
             Self::Vhd => "Fixed VHD",
+            Self::VhdDynamic => "Dynamic VHD",
             Self::Raw => "Raw Image",
             Self::TwoMg => "2MG (Apple II)",
             Self::Woz => "WOZ (Apple II)",
@@ -78,7 +81,7 @@ impl ExportFormat {
     /// File dialog filter label and extensions.
     pub fn dialog_filter(&self) -> (&'static str, &'static [&'static str]) {
         match self {
-            Self::Vhd => ("VHD Files", &["vhd", "hda"]),
+            Self::Vhd | Self::VhdDynamic => ("VHD Files", &["vhd", "hda"]),
             Self::Raw => ("Raw Images", &["img", "raw", "bin", "dd"]),
             Self::TwoMg => ("2MG Files", &["2mg"]),
             Self::Woz => ("WOZ Files", &["woz"]),
@@ -233,6 +236,19 @@ pub fn export_whole_disk(
     // all the complex reconstruction with EBR chain rebuilding etc.
     if format == ExportFormat::Vhd {
         return super::vhd::export_whole_disk_vhd(
+            source_path,
+            backup_metadata,
+            mbr_bytes,
+            partition_sizes,
+            dest_path,
+            progress_cb,
+            cancel_check,
+            log_cb,
+        );
+    }
+
+    if format == ExportFormat::VhdDynamic {
+        return export_whole_disk_vhd_dynamic(
             source_path,
             backup_metadata,
             mbr_bytes,
@@ -761,6 +777,87 @@ fn convert_from_vhd_temp(
         data_size,
     ));
 
+    Ok(())
+}
+
+/// Export a whole disk as a dynamic (sparse) VHD.
+///
+/// For backup folders the disk is first reconstructed into a tempfile (the
+/// dynamic writer needs a readable source to scan for zero blocks); for raw
+/// images/devices the source is unwrapped via `wrap_image_reader` and streamed
+/// straight through. All-zero blocks are omitted from the output.
+#[allow(clippy::too_many_arguments)]
+fn export_whole_disk_vhd_dynamic(
+    source_path: &Path,
+    backup_metadata: Option<&BackupMetadata>,
+    mbr_bytes: Option<&[u8; 512]>,
+    partition_sizes: &[PartitionSizeOverride],
+    dest_path: &Path,
+    mut progress_cb: impl FnMut(u64),
+    cancel_check: impl Fn() -> bool,
+    mut log_cb: impl FnMut(&str),
+) -> Result<()> {
+    let mut out = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dest_path)
+        .with_context(|| format!("failed to create {}", dest_path.display()))?;
+
+    let disk_size = if let Some(meta) = backup_metadata {
+        // Reconstruct the flat disk into a tempfile, then convert to dynamic VHD.
+        let mut tmp =
+            tempfile::tempfile().context("create tempfile for dynamic VHD reconstruction")?;
+        let written = reconstruct_disk_from_backup(
+            source_path,
+            meta,
+            mbr_bytes,
+            partition_sizes,
+            meta.source_size_bytes,
+            &mut tmp,
+            false,
+            false,
+            None,
+            None,
+            &mut progress_cb,
+            &cancel_check,
+            &mut log_cb,
+        )?;
+        tmp.flush()?;
+        tmp.seek(SeekFrom::Start(0))?;
+        super::vhd::export_whole_disk_vhd_dynamic(
+            &mut tmp,
+            &mut out,
+            written,
+            0,
+            &mut progress_cb,
+            &cancel_check,
+        )?;
+        written
+    } else {
+        // Raw image/device: unwrap any container, then stream.
+        let file = File::open(source_path)
+            .with_context(|| format!("failed to open {}", source_path.display()))?;
+        let file2 = File::open(source_path)?;
+        let fmt = super::detect_image_format_with_path(file, Some(source_path))?;
+        let (mut reader, source_data_size) = super::wrap_image_reader(file2, fmt)?;
+        super::vhd::export_whole_disk_vhd_dynamic(
+            &mut reader,
+            &mut out,
+            source_data_size,
+            0,
+            &mut progress_cb,
+            &cancel_check,
+        )?;
+        source_data_size
+    };
+
+    log_cb(&format!(
+        "Dynamic VHD export complete: {} ({} logical bytes)",
+        dest_path.display(),
+        disk_size,
+    ));
     Ok(())
 }
 
