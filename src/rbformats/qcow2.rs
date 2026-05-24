@@ -105,6 +105,17 @@ pub struct Qcow2Reader<R: Read + Seek> {
     l2_cache: Option<(u64, Vec<u64>)>,
     /// Current logical (guest-side) byte position.
     pos: u64,
+    /// Host byte offset of the L1 table — needed by the in-place editor to
+    /// patch one L1 entry when it grows a new L2 table.
+    l1_table_offset: u64,
+    /// Refcount table (one u64 entry per refcount block, parsed from disk).
+    /// Session 2.3 mutates **existing** refcount block entries in place; growth
+    /// of the table itself is session 2.4 territory.
+    refcount_table: Vec<u64>,
+    /// Current end-of-file in bytes — where the next allocate-on-write cluster
+    /// lands. Initialised to the file length at open time; advanced by
+    /// `cluster_size` per allocation.
+    host_end: u64,
 }
 
 impl<R: Read + Seek> Qcow2Reader<R> {
@@ -208,6 +219,29 @@ impl<R: Read + Seek> Qcow2Reader<R> {
             .map(|c| u64::from_be_bytes(c.try_into().unwrap()))
             .collect();
 
+        // Refcount table — parsed even for read-only opens so the editor doesn't
+        // need a separate re-parse later. Cheap: one cluster of u64 entries for
+        // typical images.
+        let refcount_table_offset = u64::from_be_bytes(head[48..56].try_into().unwrap());
+        let refcount_table_clusters = u32::from_be_bytes(head[56..60].try_into().unwrap()) as u64;
+        let refcount_table = if refcount_table_offset == 0 || refcount_table_clusters == 0 {
+            // Strict open would refuse this — the spec mandates a refcount
+            // table on v3. Be permissive on read (returns an empty Vec, so the
+            // editor refuses to allocate) so we still inspect odd inputs.
+            Vec::new()
+        } else {
+            let rt_bytes = refcount_table_clusters * cluster_size;
+            if refcount_table_offset + rt_bytes > total_len {
+                bail!("QCOW2 refcount table extends past end of file");
+            }
+            inner.seek(SeekFrom::Start(refcount_table_offset))?;
+            let mut buf = vec![0u8; rt_bytes as usize];
+            inner.read_exact(&mut buf)?;
+            buf.chunks_exact(8)
+                .map(|c| u64::from_be_bytes(c.try_into().unwrap()))
+                .collect()
+        };
+
         Ok(Self {
             inner,
             header: Qcow2Header {
@@ -218,6 +252,9 @@ impl<R: Read + Seek> Qcow2Reader<R> {
             l1,
             l2_cache: None,
             pos: 0,
+            l1_table_offset,
+            refcount_table,
+            host_end: total_len,
         })
     }
 
@@ -329,6 +366,172 @@ impl<R: Read + Seek> Seek for Qcow2Reader<R> {
         }
         self.pos = new_pos as u64;
         Ok(self.pos)
+    }
+}
+
+/// Allocate-on-write `Write` for in-place editing of QCOW2 images.
+///
+/// Writes that land in an already-allocated data cluster update in place.
+/// Writes into an unallocated cluster (or a `QCOW_OFLAG_ZERO` cluster on v3)
+/// first append a fresh host cluster at the current EOF, patch the owning L2
+/// entry, bump the refcount, and — if no L2 table covered that L1 slot yet —
+/// also append a fresh L2 cluster and patch the L1 entry.
+///
+/// **Session 2.3 scope:** refcount **block** updates are in-place, so the
+/// covering refcount block must already exist. If the refcount table slot for
+/// the new cluster is empty (i.e. refcount-table growth would be needed),
+/// `write` errors with `WriteZero` — that growth path is session 2.4.
+///
+/// Like the reader, one inner `write` never crosses a cluster boundary; the
+/// caller (or `write_all`) loops to cover larger writes.
+impl<R: Read + Write + Seek> Write for Qcow2Reader<R> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.pos >= self.header.size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "write past end of QCOW2 image",
+            ));
+        }
+        let cluster_size = self.header.cluster_size;
+        let intra = self.pos % cluster_size;
+        let remaining_in_cluster = cluster_size - intra;
+        let remaining_in_disk = self.header.size - self.pos;
+        let to_write = (buf.len() as u64)
+            .min(remaining_in_cluster)
+            .min(remaining_in_disk) as usize;
+
+        let cluster_index = self.pos / cluster_size;
+        let entries_per_l2 = cluster_size / 8;
+        let l1_idx = (cluster_index / entries_per_l2) as usize;
+        let l2_idx = (cluster_index % entries_per_l2) as usize;
+
+        // Step 1: ensure an L2 table exists for this L1 slot. Empty slot →
+        // allocate a fresh zero-filled cluster, patch L1 on disk + in RAM.
+        let l1_entry = self.l1.get(l1_idx).copied().unwrap_or(0);
+        let mut l2_host = l1_entry & QCOW2_OFFSET_MASK;
+        if l2_host == 0 {
+            let new_l2 = self.allocate_cluster(true)?;
+            self.l1[l1_idx] = new_l2 | QCOW2_FLAG_COPIED;
+            self.write_l1_entry(l1_idx)?;
+            l2_host = new_l2;
+        }
+
+        // Step 2: locate the L2 entry for this guest cluster. Read straight from
+        // disk to avoid juggling the read-side L2 cache through this write path
+        // (we invalidate it on any change below).
+        let l2_entry = self.read_l2_entry_raw(l2_host, l2_idx)?;
+        let mut data_host = l2_entry & QCOW2_OFFSET_MASK;
+        let zero_flag = self.header.version == 3 && (l2_entry & QCOW2_FLAG_ZERO) != 0;
+        let needs_alloc = data_host == 0 || zero_flag;
+        // Compressed clusters: refuse — we never produce them, and overwriting
+        // one in place would corrupt the compression. Caller has to re-encode.
+        if l2_entry & QCOW2_FLAG_COMPRESSED != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "cannot edit a compressed QCOW2 cluster in place",
+            ));
+        }
+        if needs_alloc {
+            let new_data = self.allocate_cluster(true)?;
+            let new_entry = new_data | QCOW2_FLAG_COPIED;
+            self.write_l2_entry_raw(l2_host, l2_idx, new_entry)?;
+            // The freshly-allocated host cluster is zero-filled, so partial
+            // writes preserve "unwritten part of this guest cluster reads as 0".
+            data_host = new_data;
+            // Invalidate L2 cache wholesale if it covered this L2 table — keeps
+            // subsequent reads honest without juggling per-entry dirty flags.
+            if let Some((cached, _)) = &self.l2_cache {
+                if *cached == l2_host {
+                    self.l2_cache = None;
+                }
+            }
+        }
+
+        self.inner.seek(SeekFrom::Start(data_host + intra))?;
+        self.inner.write_all(&buf[..to_write])?;
+        self.pos += to_write as u64;
+        Ok(to_write)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<R: Read + Write + Seek> Qcow2Reader<R> {
+    /// Append a fresh host cluster at the current EOF, optionally zero-filling
+    /// it, and bump its refcount. Returns the host byte offset.
+    ///
+    /// `zero_fill = true` is the right answer for L2 tables and for data
+    /// clusters that may only be partially written below — the zero region is
+    /// what guarantees "untouched bytes of this guest cluster read as 0".
+    fn allocate_cluster(&mut self, zero_fill: bool) -> std::io::Result<u64> {
+        let off = self.host_end;
+        let cluster_size = self.header.cluster_size;
+        if zero_fill {
+            self.inner.seek(SeekFrom::Start(off))?;
+            let zeros = vec![0u8; cluster_size as usize];
+            self.inner.write_all(&zeros)?;
+        }
+        self.host_end += cluster_size;
+        self.bump_refcount(off / cluster_size)?;
+        Ok(off)
+    }
+
+    /// Set refcount[cluster_idx] = 1. Session 2.3 limitation: the covering
+    /// refcount block must already exist (no refcount-table growth yet).
+    fn bump_refcount(&mut self, cluster_idx: u64) -> std::io::Result<()> {
+        let cluster_size = self.header.cluster_size;
+        let refcounts_per_block = cluster_size / 2;
+        let table_idx = (cluster_idx / refcounts_per_block) as usize;
+        let entry_idx = cluster_idx % refcounts_per_block;
+        let rb_off = self.refcount_table.get(table_idx).copied().unwrap_or(0);
+        if rb_off == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                format!(
+                    "QCOW2 edit needs a refcount block at table slot {table_idx} \
+                     (cluster {cluster_idx}); refcount-table growth lands in \
+                     session 2.4"
+                ),
+            ));
+        }
+        self.inner.seek(SeekFrom::Start(rb_off + entry_idx * 2))?;
+        self.inner.write_all(&1u16.to_be_bytes())?;
+        Ok(())
+    }
+
+    /// Patch one L1 entry in place on disk (BE u64 at `l1_table_offset + 8*idx`).
+    fn write_l1_entry(&mut self, l1_idx: usize) -> std::io::Result<()> {
+        let off = self.l1_table_offset + (l1_idx as u64) * 8;
+        self.inner.seek(SeekFrom::Start(off))?;
+        self.inner.write_all(&self.l1[l1_idx].to_be_bytes())?;
+        Ok(())
+    }
+
+    /// Read one L2 entry straight from disk (no cache).
+    fn read_l2_entry_raw(&mut self, l2_host: u64, l2_idx: usize) -> std::io::Result<u64> {
+        let off = l2_host + (l2_idx as u64) * 8;
+        self.inner.seek(SeekFrom::Start(off))?;
+        let mut buf = [0u8; 8];
+        self.inner.read_exact(&mut buf)?;
+        Ok(u64::from_be_bytes(buf))
+    }
+
+    /// Patch one L2 entry in place (BE u64 at `l2_host + 8*idx`).
+    fn write_l2_entry_raw(
+        &mut self,
+        l2_host: u64,
+        l2_idx: usize,
+        entry: u64,
+    ) -> std::io::Result<()> {
+        let off = l2_host + (l2_idx as u64) * 8;
+        self.inner.seek(SeekFrom::Start(off))?;
+        self.inner.write_all(&entry.to_be_bytes())?;
+        Ok(())
     }
 }
 
@@ -993,6 +1196,147 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("cancelled"));
+    }
+
+    // -- In-place edit tests (Session 2.3) --------------------------------
+
+    /// Build a writer-produced QCOW2 image into a `Vec<u8>`, returning the
+    /// reader (positioned at offset 0). Tests for the editor reuse this so the
+    /// "fresh image" they edit is one we know is `qemu-img check`-clean.
+    fn fresh_qcow2(disk_size: u64, cluster_bits: u32, fill: &[u8]) -> Cursor<Vec<u8>> {
+        let mut src = vec![0u8; disk_size as usize];
+        src[..fill.len()].copy_from_slice(fill);
+        let mut out = Cursor::new(Vec::new());
+        export_qcow2(
+            &mut Cursor::new(&src),
+            &mut out,
+            disk_size,
+            cluster_bits,
+            &mut |_| {},
+            &|| false,
+        )
+        .unwrap();
+        out.set_position(0);
+        out
+    }
+
+    #[test]
+    fn editor_in_place_update_of_allocated_cluster() {
+        // Build a fresh image with cluster 0 non-zero, then overwrite the
+        // first 16 bytes of guest cluster 0 in place. The host cluster stays
+        // the same — no allocation, no L1/L2 mutation.
+        let cs = 512u64;
+        let backing = fresh_qcow2(2 * cs, 9, &[0x11u8; 16]);
+        let mut e = Qcow2Reader::open(backing).unwrap();
+        let host_end_before = e.host_end;
+        e.seek(SeekFrom::Start(0)).unwrap();
+        e.write_all(&[0xAB; 16]).unwrap();
+        // No new host cluster should have been allocated.
+        assert_eq!(e.host_end, host_end_before);
+        // Re-read via the same instance.
+        e.seek(SeekFrom::Start(0)).unwrap();
+        let mut read_back = [0u8; 16];
+        e.read_exact(&mut read_back).unwrap();
+        assert_eq!(read_back, [0xAB; 16]);
+        // And via a fresh reader over the same bytes — invalidation works.
+        let bytes = e.inner.into_inner();
+        let mut r2 = Qcow2Reader::open(Cursor::new(bytes)).unwrap();
+        let mut buf = [0u8; 16];
+        r2.read_exact(&mut buf).unwrap();
+        assert_eq!(buf, [0xAB; 16]);
+    }
+
+    #[test]
+    fn editor_allocates_data_cluster_for_sparse_write() {
+        // Fresh image with cluster 0 allocated, cluster 1 sparse. Writing into
+        // cluster 1 must allocate a new host cluster and patch the L2 entry,
+        // without touching the L1 table (L2 already exists for L1[0]).
+        let cs = 512u64;
+        let backing = fresh_qcow2(2 * cs, 9, &[0xCDu8; 16]);
+        let mut e = Qcow2Reader::open(backing).unwrap();
+        let host_end_before = e.host_end;
+        e.seek(SeekFrom::Start(cs)).unwrap();
+        let payload = [0xEFu8; 32];
+        e.write_all(&payload).unwrap();
+        assert_eq!(
+            e.host_end,
+            host_end_before + cs,
+            "exactly one cluster allocated for the new data block"
+        );
+        // Round-trip via a fresh reader.
+        let bytes = e.inner.into_inner();
+        let mut r2 = Qcow2Reader::open(Cursor::new(bytes)).unwrap();
+        r2.seek(SeekFrom::Start(cs)).unwrap();
+        let mut out = vec![0u8; cs as usize];
+        r2.read_exact(&mut out).unwrap();
+        assert_eq!(&out[..32], &payload);
+        // Tail of the cluster stays zero — partial writes don't leak garbage.
+        assert!(out[32..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn editor_grows_l2_for_new_l1_slot() {
+        // Cluster size 512 → entries_per_l2 = 64 → guest cluster 64 falls into
+        // L1 slot 1. We need a disk big enough to have at least 2 L1 slots
+        // worth of capacity (cluster_size * entries_per_l2 * 2 = 64 KiB).
+        let cs = 512u64;
+        let disk = 64 * 1024u64;
+        // Pre-fill only the very first cluster so L1[0] gets an L2 table but
+        // L1[1] stays empty (l2_host = 0).
+        let backing = fresh_qcow2(disk, 9, &[0xAA; 16]);
+        let mut e = Qcow2Reader::open(backing).unwrap();
+        assert_eq!(e.l1[1], 0, "test setup needs L1[1] to start empty");
+        let host_end_before = e.host_end;
+        // Write into guest cluster 64 — L1 slot 1's first L2 entry.
+        let target = 64 * cs;
+        e.seek(SeekFrom::Start(target)).unwrap();
+        let payload = [0xC3u8; 24];
+        e.write_all(&payload).unwrap();
+        // Expect TWO clusters allocated: a fresh L2 table and a fresh data
+        // cluster.
+        assert_eq!(e.host_end, host_end_before + 2 * cs);
+        assert_ne!(e.l1[1], 0, "L1[1] must now point at a new L2");
+        assert!(
+            e.l1[1] & QCOW2_FLAG_COPIED != 0,
+            "newly-allocated L1 entry should set COPIED"
+        );
+        // Reopen and verify the write is visible + the partial cluster's tail
+        // stayed zero.
+        let bytes = e.inner.into_inner();
+        let mut r2 = Qcow2Reader::open(Cursor::new(bytes)).unwrap();
+        r2.seek(SeekFrom::Start(target)).unwrap();
+        let mut out = vec![0u8; cs as usize];
+        r2.read_exact(&mut out).unwrap();
+        assert_eq!(&out[..24], &payload);
+        assert!(out[24..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn editor_output_passes_qemu_img_check() {
+        // Edit a fresh image, then run qemu-img check on the result. Gated:
+        // skipped when qemu-img isn't installed. Covers the realistic flow:
+        // open → grow L2 + allocate data → close → external validator says OK.
+        let disk = 64 * 1024u64;
+        let backing = fresh_qcow2(disk, 9, &[0x55; 16]);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), backing.get_ref()).unwrap();
+        {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(tmp.path())
+                .unwrap();
+            let mut e = Qcow2Reader::open(f).unwrap();
+            // Write into a guest cluster that needs a fresh L2 (slot 1).
+            e.seek(SeekFrom::Start(64 * 512)).unwrap();
+            e.write_all(&[0xDE; 256]).unwrap();
+            e.flush().unwrap();
+        }
+        match crate::rbformats::qemu_img_test::qemu_img_check(tmp.path()) {
+            Ok(true) => {}
+            Ok(false) => eprintln!("skipping qemu-img check — `qemu-img` not on PATH"),
+            Err(e) => panic!("qemu-img check failed on edited image: {e}"),
+        }
     }
 
     /// `qemu-img check` smoke test against a writer-produced image. Skipped
