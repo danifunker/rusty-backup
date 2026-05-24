@@ -77,11 +77,57 @@ fn new_hfs_put_get_mkdir_rm_round_trip() {
     run(&["get", img_s, "/hello.txt", back.to_str().unwrap()]);
     assert_eq!(std::fs::read(&host).unwrap(), std::fs::read(&back).unwrap());
 
-    // mkdir + put into the new dir.
+    // `locate` prints the file's absolute byte offset in the image.
+    // Re-read at that offset and confirm it matches the source bytes —
+    // this is the build-script use case (patch absolute offsets into a
+    // boot block / supervisor payload without grepping for markers).
+    let loc = run(&["locate", img_s, "/hello.txt"]);
+    let loc_json: serde_json::Value =
+        serde_json::from_slice(&loc.stdout).expect("locate emits JSON");
+    let result = &loc_json["result"];
+    assert_eq!(result["path"], "/hello.txt");
+    assert_eq!(result["fragmented"], false);
+    assert_eq!(result["partition_offset"], 0);
+    let offset = result["offset"].as_u64().expect("offset is u64");
+    let length = result["length"].as_u64().expect("length is u64");
+    assert_eq!(length, std::fs::read(&host).unwrap().len() as u64);
+    let img_bytes = std::fs::read(&img).unwrap();
+    let slice = &img_bytes[offset as usize..(offset + length) as usize];
+    assert_eq!(
+        slice,
+        std::fs::read(&host).unwrap().as_slice(),
+        "bytes at locate offset must match source file"
+    );
+
+    // mkdir + put into the new dir. Use --print-offset here so we
+    // exercise the put-then-emit shape build scripts will use; the
+    // JSON it prints must agree with what a separate `locate` call
+    // would return.
     run(&["mkdir", img_s, "/Apps"]);
     let host2 = dir.path().join("foo.bin");
     std::fs::write(&host2, b"\x01\x02\x03").unwrap();
-    run(&["put", img_s, host2.to_str().unwrap(), "/Apps/foo.bin"]);
+    let put_out = run(&[
+        "put",
+        img_s,
+        host2.to_str().unwrap(),
+        "/Apps/foo.bin",
+        "--print-offset",
+    ]);
+    let put_json: serde_json::Value =
+        serde_json::from_slice(&put_out.stdout).expect("--print-offset emits JSON");
+    let loc2 = run(&["locate", img_s, "/Apps/foo.bin"]);
+    let loc2_json: serde_json::Value = serde_json::from_slice(&loc2.stdout).unwrap();
+    assert_eq!(
+        put_json["result"], loc2_json["result"],
+        "put --print-offset must match a follow-up locate"
+    );
+    let off2 = put_json["result"]["offset"].as_u64().unwrap();
+    let img_bytes2 = std::fs::read(&img).unwrap();
+    assert_eq!(
+        &img_bytes2[off2 as usize..off2 as usize + 3],
+        b"\x01\x02\x03",
+        "bytes at --print-offset location must match source"
+    );
 
     // ls shows both top-level entries.
     let ls = run(&["ls", img_s, "/"]);
@@ -407,6 +453,101 @@ fn batch_applies_mkdir_put_rm_in_one_pass() {
     let ls_text = String::from_utf8(ls.stdout).unwrap();
     assert!(!ls_text.contains("a.bin"), "a.bin should be rm'd");
     assert!(ls_text.contains("b.bin"), "b.bin should remain");
+}
+
+#[test]
+fn locate_returns_absolute_offset_inside_apm_wrapped_image() {
+    // The load-bearing test for `locate`: an APM-wrapped disk where
+    // the HFS partition starts well past byte 0. The printed offset
+    // must include the partition base — that's the whole point of the
+    // verb (the build-script consumer shouldn't have to know APM
+    // layout).
+    use rusty_backup::fs::hfs::create_blank_hfs;
+    use rusty_backup::fs::hfs_clone::emit_apm_disk_with_hfs;
+    use rusty_backup::partition::apm::build_minimal_apm;
+    use std::io::Cursor;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let img = dir.path().join("apm.hda");
+
+    // Build a 256 KiB synthetic source APM with one driver + one HFS
+    // partition starting at block 64 (= 0x8000 bytes). This mirrors
+    // the in-crate `emit_apm_disk_round_trip` fixture, kept here so
+    // the integration test is self-contained.
+    let total_blocks: u32 = 4096; // 2 MiB total
+    let driver_start: u32 = 32;
+    let driver_blocks: u32 = 8;
+    let hfs_start: u32 = 64;
+    let mut apm = build_minimal_apm(
+        &[
+            ("Apple_Driver43".to_string(), driver_start, driver_blocks),
+            ("Apple_HFS".to_string(), hfs_start, total_blocks - hfs_start),
+        ],
+        512,
+        total_blocks,
+    );
+    apm.entries[2].name = "MacOS".to_string();
+    let blocks = apm.build_apm_blocks(Some(total_blocks));
+    let mut source = vec![0u8; total_blocks as usize * 512];
+    source[..blocks.len()].copy_from_slice(&blocks);
+
+    // Format a blank HFS volume sized to fill from hfs_start to end.
+    let hfs_bytes = (total_blocks - hfs_start) as u64 * 512;
+    let hfs_image = create_blank_hfs(hfs_bytes, 4096, "ApmLoc").unwrap();
+
+    // emit_apm_disk_with_hfs writes the final disk.
+    let mut out: Vec<u8> = Vec::new();
+    let mut src_cursor = Cursor::new(source.clone());
+    let mut out_cursor = Cursor::new(&mut out);
+    emit_apm_disk_with_hfs(
+        &mut src_cursor,
+        source.len() as u64,
+        &hfs_image,
+        &mut out_cursor,
+    )
+    .expect("emit APM disk");
+    std::fs::write(&img, &out).unwrap();
+
+    let img_s = img.to_str().unwrap();
+
+    // Put a payload through the verb, then locate it. Use the @N
+    // selector because the auto-pick still has Apple_partition_map +
+    // Apple_Driver43 alongside Apple_HFS — `resolve_partition_*`
+    // filters those out for `pick_default_partition` but we pin to
+    // partition 3 explicitly to match how scripts would target HFS.
+    // The CLI's APM enumeration only surfaces FS-bearing partitions
+    // (the self-referencing map entry and Apple_Driver43 are filtered
+    // out), so the lone Apple_HFS shows up at index 1.
+    let img_at = format!("{img_s}@1");
+    let host = dir.path().join("payload.bin");
+    let payload = b"abcdefghij-from-apm-payload";
+    std::fs::write(&host, payload).unwrap();
+    run(&["put", &img_at, host.to_str().unwrap(), "/Payload"]);
+
+    let loc = run(&["locate", &img_at, "/Payload"]);
+    let v: serde_json::Value = serde_json::from_slice(&loc.stdout).unwrap();
+    let r = &v["result"];
+    let offset = r["offset"].as_u64().expect("offset");
+    let length = r["length"].as_u64().expect("length");
+    let part_offset = r["partition_offset"].as_u64().expect("partition_offset");
+
+    assert_eq!(length, payload.len() as u64);
+    assert_eq!(
+        part_offset,
+        hfs_start as u64 * 512,
+        "partition_offset must equal the APM-declared HFS start"
+    );
+    assert!(
+        offset >= part_offset,
+        "offset ({offset}) must be inside the HFS partition (starts at {part_offset})"
+    );
+
+    let disk = std::fs::read(&img).unwrap();
+    assert_eq!(
+        &disk[offset as usize..(offset + length) as usize],
+        payload,
+        "bytes at locate offset inside APM disk must match source payload"
+    );
 }
 
 #[test]

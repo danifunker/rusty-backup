@@ -19,6 +19,7 @@ pub mod fsck;
 pub mod get;
 pub mod grow;
 pub mod inspect;
+pub mod locate;
 pub mod ls;
 pub mod mkdir;
 pub mod new;

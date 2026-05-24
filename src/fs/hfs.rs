@@ -198,6 +198,17 @@ pub struct HfsExtDescriptor {
     pub block_count: u16,
 }
 
+/// Result of [`HfsFilesystem::locate_file_by_cnid`]. `offset_in_image` is
+/// absolute within the underlying image file, so scripts patching
+/// disk-byte offsets into boot blocks or supervisor payloads can use it
+/// directly without re-adding any partition base.
+#[derive(Debug, Clone, Copy)]
+pub struct HfsFileLocation {
+    pub offset_in_image: u64,
+    pub length: u64,
+    pub fragmented: bool,
+}
+
 /// Lightweight, public snapshot of an HFS volume's headline numbers.
 /// Returned by [`HfsFilesystem::volume_summary`] so GUI code outside the
 /// library crate can populate display fields without touching pub(crate)
@@ -1045,6 +1056,36 @@ impl<R: Read + Seek> HfsFilesystem<R> {
     #[allow(dead_code)]
     pub(crate) fn partition_offset(&self) -> u64 {
         self.partition_offset
+    }
+
+    /// Locate a file's data fork on disk by its catalog CNID. Returns the
+    /// byte offset of the first extent **within the containing image file**
+    /// (i.e. `partition_offset + first_alloc_block*512 + start_block*block_size`),
+    /// the data-fork length, and a flag set when the fork is split across
+    /// more than one extent — in which case callers that need every byte
+    /// must walk all extents themselves; the offset returned points at the
+    /// first one only.
+    ///
+    /// Resource forks are ignored. Returns `None` if the CNID is not a
+    /// file in the catalog, or the file has zero data-fork extents
+    /// allocated (e.g. an empty file).
+    pub fn locate_file_by_cnid(&self, cnid: u32) -> Option<HfsFileLocation> {
+        let (data_size, data_extents, _rsrc_size, _rsrc_extents) = self.find_file_by_id(cnid)?;
+        let first = data_extents.first().copied()?;
+        if first.block_count == 0 {
+            return None;
+        }
+        let fragmented = data_extents.iter().skip(1).any(|e| e.block_count != 0);
+        // alloc_block_offset returns the byte offset of `block` *within the
+        // partition*; we add partition_offset so the caller (and any script
+        // grepping the image file) gets an absolute file-byte offset.
+        let offset_in_image =
+            self.partition_offset + self.alloc_block_offset(first.start_block as u32);
+        Some(HfsFileLocation {
+            offset_in_image,
+            length: data_size as u64,
+            fragmented,
+        })
     }
 
     /// Read the 1024-byte boot block region (sectors 0..1 of the partition).

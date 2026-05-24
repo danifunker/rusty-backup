@@ -61,6 +61,16 @@ pub struct PutArgs {
     /// Overwrite an existing entry at the destination path.
     #[arg(long)]
     pub force: bool,
+
+    /// After writing the file, also print the same JSON envelope
+    /// `locate` would have produced — absolute byte offset, length,
+    /// fragmented flag. One-shot for build scripts that need to patch
+    /// disk offsets immediately after placing a payload. HFS-only,
+    /// matches the locate verb's scope; ignored (with a warning) for
+    /// the `--zero` and `--boot` shapes since there's no host file to
+    /// describe.
+    #[arg(long = "print-offset")]
+    pub print_offset: bool,
 }
 
 pub fn run(args: PutArgs) -> Result<()> {
@@ -157,5 +167,14 @@ pub fn run(args: PutArgs) -> Result<()> {
 
     fs.sync_metadata()
         .map_err(|e| anyhow!("sync_metadata: {e}"))?;
+
+    if args.print_offset {
+        // Drop the editable handle before re-opening read-only via the
+        // locate path — we want the post-sync on-disk state.
+        drop(fs);
+        let payload = super::locate::locate_payload(&args.image, &dst)?;
+        super::locate::emit_locate(crate::cli::output::OutputFormat::Json, &payload)?;
+    }
+
     Ok(())
 }
