@@ -24,6 +24,10 @@ pub enum ExportFormat {
     Vhd,
     /// Dynamic (sparse) VHD — BAT + per-block bitmaps; all-zero blocks omitted.
     VhdDynamic,
+    /// QCOW2 v3 — uncompressed, no snapshots/backing file. Whole-disk only
+    /// (the sparse layout wraps a whole disk geometry); GUI/CLI wiring lands
+    /// in session 2.4.
+    Qcow2,
     /// Raw disk image — no header/footer.
     Raw,
     /// 2MG (Apple II) — 64-byte header + raw data.
@@ -48,6 +52,7 @@ impl ExportFormat {
     pub fn extension(&self) -> &'static str {
         match self {
             Self::Vhd | Self::VhdDynamic => "vhd",
+            Self::Qcow2 => "qcow2",
             Self::Raw => "img",
             Self::TwoMg => "2mg",
             Self::Woz => "woz",
@@ -62,6 +67,7 @@ impl ExportFormat {
         match self {
             Self::Vhd => "Fixed VHD",
             Self::VhdDynamic => "Dynamic VHD",
+            Self::Qcow2 => "QCOW2",
             Self::Raw => "Raw Image",
             Self::TwoMg => "2MG (Apple II)",
             Self::Woz => "WOZ (Apple II)",
@@ -82,6 +88,7 @@ impl ExportFormat {
     pub fn dialog_filter(&self) -> (&'static str, &'static [&'static str]) {
         match self {
             Self::Vhd | Self::VhdDynamic => ("VHD Files", &["vhd", "hda"]),
+            Self::Qcow2 => ("QCOW2 Files", &["qcow2", "qcow"]),
             Self::Raw => ("Raw Images", &["img", "raw", "bin", "dd"]),
             Self::TwoMg => ("2MG Files", &["2mg"]),
             Self::Woz => ("WOZ Files", &["woz"]),
@@ -249,6 +256,19 @@ pub fn export_whole_disk(
 
     if format == ExportFormat::VhdDynamic {
         return export_whole_disk_vhd_dynamic(
+            source_path,
+            backup_metadata,
+            mbr_bytes,
+            partition_sizes,
+            dest_path,
+            progress_cb,
+            cancel_check,
+            log_cb,
+        );
+    }
+
+    if format == ExportFormat::Qcow2 {
+        return export_whole_disk_qcow2(
             source_path,
             backup_metadata,
             mbr_bytes,
@@ -855,6 +875,85 @@ fn export_whole_disk_vhd_dynamic(
 
     log_cb(&format!(
         "Dynamic VHD export complete: {} ({} logical bytes)",
+        dest_path.display(),
+        disk_size,
+    ));
+    Ok(())
+}
+
+/// Export a whole disk as a QCOW2 v3 image.
+///
+/// Mirrors `export_whole_disk_vhd_dynamic`: backup folders are reconstructed
+/// into a tempfile first (the QCOW2 writer scans clusters for zeros and needs
+/// a `Read` source), raw images/devices stream through `wrap_image_reader`.
+/// All-zero clusters are omitted from the output, so a fresh / mostly-empty
+/// vintage disk shrinks dramatically.
+#[allow(clippy::too_many_arguments)]
+fn export_whole_disk_qcow2(
+    source_path: &Path,
+    backup_metadata: Option<&BackupMetadata>,
+    mbr_bytes: Option<&[u8; 512]>,
+    partition_sizes: &[PartitionSizeOverride],
+    dest_path: &Path,
+    mut progress_cb: impl FnMut(u64),
+    cancel_check: impl Fn() -> bool,
+    mut log_cb: impl FnMut(&str),
+) -> Result<()> {
+    let mut out = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dest_path)
+        .with_context(|| format!("failed to create {}", dest_path.display()))?;
+
+    let disk_size = if let Some(meta) = backup_metadata {
+        let mut tmp = tempfile::tempfile().context("create tempfile for QCOW2 reconstruction")?;
+        let written = reconstruct_disk_from_backup(
+            source_path,
+            meta,
+            mbr_bytes,
+            partition_sizes,
+            meta.source_size_bytes,
+            &mut tmp,
+            false,
+            false,
+            None,
+            None,
+            &mut progress_cb,
+            &cancel_check,
+            &mut log_cb,
+        )?;
+        tmp.flush()?;
+        tmp.seek(SeekFrom::Start(0))?;
+        super::qcow2::export_qcow2(
+            &mut tmp,
+            &mut out,
+            written,
+            0,
+            &mut progress_cb,
+            &cancel_check,
+        )?;
+        written
+    } else {
+        let file = File::open(source_path)
+            .with_context(|| format!("failed to open {}", source_path.display()))?;
+        let file2 = File::open(source_path)?;
+        let fmt = super::detect_image_format_with_path(file, Some(source_path))?;
+        let (mut reader, source_data_size) = super::wrap_image_reader(file2, fmt)?;
+        super::qcow2::export_qcow2(
+            &mut reader,
+            &mut out,
+            source_data_size,
+            0,
+            &mut progress_cb,
+            &cancel_check,
+        )?;
+        source_data_size
+    };
+
+    log_cb(&format!(
+        "QCOW2 export complete: {} ({} logical bytes)",
         dest_path.display(),
         disk_size,
     ));

@@ -7,6 +7,8 @@ pub mod dmg;
 pub mod export;
 pub mod interleave;
 pub mod qcow2;
+#[cfg(test)]
+pub(crate) mod qemu_img_test;
 pub mod raw;
 pub mod sparse;
 pub mod twomg;

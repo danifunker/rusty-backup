@@ -41,9 +41,9 @@
 //! bit 62 compressed (rejected), bit 0 (v3 only) QCOW_OFLAG_ZERO, low bits =
 //! host cluster offset; `0` means unallocated → zeros.
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 /// QCOW2 magic at file offset 0 (`"QFI\xFB"`).
 pub const QCOW2_MAGIC: &[u8; 4] = b"QFI\xfb";
@@ -56,6 +56,14 @@ const QCOW2_OFFSET_MASK: u64 = 0x00FF_FFFF_FFFF_FE00;
 const QCOW2_FLAG_COPIED: u64 = 1u64 << 63;
 /// L2 entry bit 62 — cluster is compressed. Rejected in v1 scope.
 const QCOW2_FLAG_COMPRESSED: u64 = 1u64 << 62;
+/// Default `cluster_bits` for the writer: 16 → 64 KiB clusters (the qemu-img
+/// default since v1.0, and what every retro VM image in the wild uses).
+pub const QCOW2_DEFAULT_CLUSTER_BITS: u32 = 16;
+/// Header length the writer stamps in v3 images (104 = spec minimum; we emit no
+/// header extensions). We still allocate 112 bytes on disk so the 8-byte
+/// `compression_type` + padding field is aligned to a 16-byte boundary,
+/// matching what `qemu-img` produces.
+const QCOW2_V3_HEADER_LEN: u32 = 104;
 /// L2 entry bit 0 (v3 only) on a *standard* entry — "read as zeros". The same
 /// bit position is reserved on v2, where unallocated zero clusters come from
 /// `entry == 0` instead.
@@ -322,6 +330,247 @@ impl<R: Read + Seek> Seek for Qcow2Reader<R> {
         self.pos = new_pos as u64;
         Ok(self.pos)
     }
+}
+
+/// Stream a `disk_size`-byte source into a QCOW2 v3 image on `out`.
+///
+/// Allocates a host cluster only for non-zero source clusters (zero clusters
+/// stay unmapped → read back as zeros). L2 tables and refcount blocks are
+/// allocated lazily / pre-sized respectively; the writer emits a fully valid
+/// uncompressed v3 image with `refcount_order = 4` that `qemu-img check`
+/// accepts.
+///
+/// `cluster_bits == 0` selects [`QCOW2_DEFAULT_CLUSTER_BITS`] (16 → 64 KiB).
+/// Otherwise it must fall in `9..=21` (512 B .. 2 MiB).
+///
+/// Layout written (host byte offsets, all multi-byte fields big-endian):
+///
+/// ```text
+/// +0                            v3 header (112 B), zero-padded to one cluster
+/// +cluster_size                 L1 table  (l1_size * u64, padded to cluster_size)
+/// +<after L1>                   Refcount table (1 cluster; u64 offsets pointing
+///                               at each refcount block)
+/// +<after refcount table>       Refcount blocks (pre-reserved at file build time
+///                               so layout decisions are independent of source
+///                               content; sized to cover every host cluster)
+/// +<after refcount blocks>      L2 tables and data clusters, allocated as the
+///                               source is streamed through. Each L2 table or
+///                               data cluster is one cluster.
+/// ```
+///
+/// `progress_cb` is fed cumulative source bytes consumed (matches the dynamic
+/// VHD writer's contract); `cancel_check` is polled per source cluster.
+pub fn export_qcow2(
+    reader: &mut impl Read,
+    out: &mut (impl Write + Seek),
+    disk_size: u64,
+    cluster_bits: u32,
+    progress_cb: &mut dyn FnMut(u64),
+    cancel_check: &dyn Fn() -> bool,
+) -> Result<()> {
+    use super::sparse::{is_zero_unit, SparseAllocator};
+    use std::collections::BTreeMap;
+
+    let cluster_bits = if cluster_bits == 0 {
+        QCOW2_DEFAULT_CLUSTER_BITS
+    } else {
+        cluster_bits
+    };
+    if !(9..=21).contains(&cluster_bits) {
+        bail!("QCOW2 cluster_bits {cluster_bits} out of supported range 9..=21");
+    }
+    let cluster_size = 1u64 << cluster_bits;
+    let entries_per_l2 = cluster_size / 8;
+    let num_guest_clusters = disk_size.div_ceil(cluster_size);
+    // l1_size always >= 1 so qemu-img check sees a non-empty L1 even for the
+    // 0-byte degenerate case.
+    let l1_size = disk_size.div_ceil(cluster_size * entries_per_l2).max(1);
+
+    // Layout: prefix regions sized up-front (header, L1, refcount-table) live
+    // at fixed offsets so we never seek-and-grow during streaming. The
+    // refcount **blocks** are allocated *after* streaming so we emit exactly
+    // the count we need — pre-reserving worst-case blocks (as the dynamic
+    // VHD writer can with its BAT) makes `qemu-img check` flag the extras as
+    // "leaked clusters" because they're allocated but unreferenced.
+    let l1_offset = cluster_size;
+    let l1_bytes_padded = (l1_size * 8).div_ceil(cluster_size) * cluster_size;
+    let refcount_table_offset = l1_offset + l1_bytes_padded;
+    // refcount_order = 4 → 2 bytes per entry → cluster_size/2 entries per block.
+    let refcounts_per_block = cluster_size / 2;
+    let data_start = refcount_table_offset + cluster_size;
+
+    // Zero-fill the reserved prefix so unused L1 slots / refcount-table entries
+    // read as 0 (= "no allocation") rather than uninitialised tempfile garbage.
+    let zero_cluster = vec![0u8; cluster_size as usize];
+    out.seek(SeekFrom::Start(0))?;
+    let mut written = 0u64;
+    while written < data_start {
+        out.write_all(&zero_cluster)
+            .context("failed to zero-fill QCOW2 reserved region")?;
+        written += cluster_size;
+    }
+
+    let mut alloc = SparseAllocator::new(data_start, cluster_size);
+    let mut l1: Vec<u64> = vec![0; l1_size as usize];
+    // L2 tables held in RAM: l1_idx -> (host offset, l2 entries).
+    let mut l2_tables: BTreeMap<u32, (u64, Vec<u64>)> = BTreeMap::new();
+
+    let mut buf = vec![0u8; cluster_size as usize];
+    for guest_idx in 0..num_guest_clusters {
+        if cancel_check() {
+            bail!("QCOW2 export cancelled");
+        }
+        let guest_off = guest_idx * cluster_size;
+        let to_read = (disk_size - guest_off).min(cluster_size) as usize;
+        reader
+            .read_exact(&mut buf[..to_read])
+            .context("failed to read source cluster")?;
+        for b in buf[to_read..].iter_mut() {
+            *b = 0;
+        }
+
+        if !is_zero_unit(&buf[..to_read]) {
+            let l1_idx = (guest_idx / entries_per_l2) as u32;
+            let l2_idx = (guest_idx % entries_per_l2) as usize;
+            if !l2_tables.contains_key(&l1_idx) {
+                // Allocate a fresh L2 table cluster, zero it on disk so unset
+                // slots read as 0, and point L1 at it.
+                let l2_off = alloc.alloc();
+                out.seek(SeekFrom::Start(l2_off))?;
+                out.write_all(&zero_cluster)
+                    .context("failed to zero-fill new L2 cluster")?;
+                l1[l1_idx as usize] = l2_off | QCOW2_FLAG_COPIED;
+                l2_tables.insert(l1_idx, (l2_off, vec![0u64; entries_per_l2 as usize]));
+            }
+            let data_off = alloc.alloc();
+            out.seek(SeekFrom::Start(data_off))?;
+            out.write_all(&buf)
+                .context("failed to write data cluster")?;
+            let (_, l2_entries) = l2_tables.get_mut(&l1_idx).unwrap();
+            l2_entries[l2_idx] = data_off | QCOW2_FLAG_COPIED;
+        }
+        progress_cb(guest_off + to_read as u64);
+    }
+
+    // Compute exactly how many refcount blocks we need. Self-referential: each
+    // block we add is a host cluster that needs its own refcount entry, so we
+    // iterate until the count is stable. Converges in O(log) because every
+    // added block can address `refcounts_per_block` additional clusters.
+    let post_stream_end = alloc.next_offset();
+    let mut needed_refcount_blocks: u64 = 1;
+    loop {
+        let total_with_blocks =
+            (post_stream_end + needed_refcount_blocks * cluster_size) / cluster_size;
+        let recomputed = total_with_blocks.div_ceil(refcounts_per_block).max(1);
+        if recomputed <= needed_refcount_blocks {
+            break;
+        }
+        needed_refcount_blocks = recomputed;
+    }
+    // Alloc + zero-fill each refcount block at the current end of the file.
+    let mut refcount_block_offsets: Vec<u64> = Vec::with_capacity(needed_refcount_blocks as usize);
+    for _ in 0..needed_refcount_blocks {
+        let off = alloc.alloc();
+        out.seek(SeekFrom::Start(off))?;
+        out.write_all(&zero_cluster)
+            .context("failed to zero-fill refcount block")?;
+        refcount_block_offsets.push(off);
+    }
+    let final_end = alloc.next_offset();
+    let total_host_clusters = final_end / cluster_size;
+
+    // Backfill L2 tables in place.
+    for (l2_off, l2_entries) in l2_tables.values() {
+        let mut bytes = Vec::with_capacity(l2_entries.len() * 8);
+        for e in l2_entries {
+            bytes.extend_from_slice(&e.to_be_bytes());
+        }
+        out.seek(SeekFrom::Start(*l2_off))?;
+        out.write_all(&bytes).context("failed to write L2 table")?;
+    }
+
+    // Backfill L1 table.
+    out.seek(SeekFrom::Start(l1_offset))?;
+    let mut l1_bytes_buf = Vec::with_capacity(l1.len() * 8);
+    for e in &l1 {
+        l1_bytes_buf.extend_from_slice(&e.to_be_bytes());
+    }
+    out.write_all(&l1_bytes_buf)
+        .context("failed to write L1 table")?;
+
+    // Refcount blocks: every host cluster 0..total_host_clusters has refcount=1.
+    // Unused tail entries inside the last block stay zero (unallocated).
+    for (block_idx, block_off) in refcount_block_offsets.iter().enumerate() {
+        let block_idx = block_idx as u64;
+        let mut block = vec![0u8; cluster_size as usize];
+        let first_cluster = block_idx * refcounts_per_block;
+        let last_cluster = ((block_idx + 1) * refcounts_per_block).min(total_host_clusters);
+        for cluster in first_cluster..last_cluster {
+            let entry_off = ((cluster - first_cluster) * 2) as usize;
+            block[entry_off..entry_off + 2].copy_from_slice(&1u16.to_be_bytes());
+        }
+        out.seek(SeekFrom::Start(*block_off))?;
+        out.write_all(&block)
+            .context("failed to write refcount block")?;
+    }
+
+    // Refcount table: one u64 BE per refcount block.
+    out.seek(SeekFrom::Start(refcount_table_offset))?;
+    let mut rt = Vec::with_capacity(refcount_block_offsets.len() * 8);
+    for off in &refcount_block_offsets {
+        rt.extend_from_slice(&off.to_be_bytes());
+    }
+    out.write_all(&rt)
+        .context("failed to write refcount table")?;
+
+    // Header at the very end so it isn't there until everything else is valid.
+    out.seek(SeekFrom::Start(0))?;
+    let header = build_qcow2_v3_header(
+        cluster_bits,
+        disk_size,
+        l1_size as u32,
+        l1_offset,
+        refcount_table_offset,
+        1,
+    );
+    out.write_all(&header)
+        .context("failed to write QCOW2 header")?;
+
+    out.flush()?;
+    Ok(())
+}
+
+/// Build the 112-byte v3 header (104-byte declared length + 8 bytes of
+/// compression_type + zero padding to 16-byte alignment, matching `qemu-img`).
+/// Feature words and `refcount_order` follow `compat=1.1` defaults; refcount
+/// table size is `refcount_table_clusters * cluster_size` bytes.
+fn build_qcow2_v3_header(
+    cluster_bits: u32,
+    size: u64,
+    l1_size: u32,
+    l1_offset: u64,
+    refcount_table_offset: u64,
+    refcount_table_clusters: u32,
+) -> Vec<u8> {
+    let mut h = vec![0u8; 112];
+    h[0..4].copy_from_slice(QCOW2_MAGIC);
+    h[4..8].copy_from_slice(&3u32.to_be_bytes());
+    // backing_file_offset (8..16) + backing_file_size (16..20) = 0
+    h[20..24].copy_from_slice(&cluster_bits.to_be_bytes());
+    h[24..32].copy_from_slice(&size.to_be_bytes());
+    // crypt_method (32..36) = 0
+    h[36..40].copy_from_slice(&l1_size.to_be_bytes());
+    h[40..48].copy_from_slice(&l1_offset.to_be_bytes());
+    h[48..56].copy_from_slice(&refcount_table_offset.to_be_bytes());
+    h[56..60].copy_from_slice(&refcount_table_clusters.to_be_bytes());
+    // nb_snapshots (60..64), snapshots_offset (64..72) = 0
+    // incompatible/compatible/autoclear (72..96) = 0
+    h[96..100].copy_from_slice(&4u32.to_be_bytes()); // refcount_order
+    h[100..104].copy_from_slice(&QCOW2_V3_HEADER_LEN.to_be_bytes());
+    // 104: compression_type = 0 (zlib, the only spec-defined value when the
+    // compression-type incompatible bit is clear, which it is for us).
+    // 105..112: zero padding to the next 16-byte boundary.
+    h
 }
 
 #[cfg(test)]
@@ -604,5 +853,180 @@ mod tests {
         let mut buf = [0u8; 16];
         let err = r.read(&mut buf).unwrap_err();
         assert!(err.to_string().contains("compressed"));
+    }
+
+    // -- Writer tests ------------------------------------------------------
+
+    /// Build a deterministic pseudo-random source of `len` bytes that's neither
+    /// all-zero (so the writer actually allocates clusters) nor degenerate
+    /// (so a wrong off-by-one in the address math shows up).
+    fn make_pattern(len: usize) -> Vec<u8> {
+        let mut v = vec![0u8; len];
+        for (i, b) in v.iter_mut().enumerate() {
+            *b = (i.wrapping_mul(31337) ^ (i >> 3)) as u8;
+        }
+        v
+    }
+
+    /// Read the QCOW2 image at `cur` back through `Qcow2Reader` and compare
+    /// against `expected`. Helper used by every round-trip writer test.
+    fn assert_qcow2_round_trips(cur: Cursor<Vec<u8>>, expected: &[u8]) {
+        let mut r = Qcow2Reader::open(cur).unwrap();
+        assert_eq!(r.len(), expected.len() as u64);
+        let mut out = vec![0u8; expected.len()];
+        r.read_exact(&mut out).unwrap();
+        assert_eq!(out, expected, "QCOW2 round-trip mismatch");
+    }
+
+    #[test]
+    fn writer_round_trips_dense_disk() {
+        // 4 KiB disk, 512 B clusters: 8 guest clusters, all non-zero so every
+        // one gets allocated. Exercises L1[0] → L2 → 8 data clusters.
+        let disk_size = 4096u64;
+        let src = make_pattern(disk_size as usize);
+        let mut out = Cursor::new(Vec::new());
+        export_qcow2(
+            &mut Cursor::new(&src),
+            &mut out,
+            disk_size,
+            9,
+            &mut |_| {},
+            &|| false,
+        )
+        .unwrap();
+        assert_qcow2_round_trips(out, &src);
+    }
+
+    #[test]
+    fn writer_round_trips_sparse_disk() {
+        // 4 KiB disk with two non-zero clusters surrounded by zeros. The zero
+        // clusters must read back as zero without ever being allocated.
+        let cs = 512usize;
+        let disk = 8 * cs;
+        let mut src = vec![0u8; disk];
+        let pat0 = make_pattern(cs);
+        let pat3 = vec![0xC3u8; cs];
+        src[0..cs].copy_from_slice(&pat0);
+        src[3 * cs..4 * cs].copy_from_slice(&pat3);
+        let mut out = Cursor::new(Vec::new());
+        export_qcow2(
+            &mut Cursor::new(&src),
+            &mut out,
+            disk as u64,
+            9,
+            &mut |_| {},
+            &|| false,
+        )
+        .unwrap();
+        // Output should be significantly smaller than the disk — only two data
+        // clusters allocated plus metadata.
+        assert!(
+            (out.get_ref().len() as u64) < disk as u64,
+            "sparse output not smaller than disk: {} vs {}",
+            out.get_ref().len(),
+            disk,
+        );
+        assert_qcow2_round_trips(out, &src);
+    }
+
+    #[test]
+    fn writer_all_zero_input_emits_no_data_clusters() {
+        // 64 KiB all-zero source. Output must be just the metadata prefix
+        // (header + L1 + refcount table + refcount block — no L2, no data).
+        let cs = 512usize;
+        let disk = 128 * cs; // 64 KiB
+        let src = vec![0u8; disk];
+        let mut out = Cursor::new(Vec::new());
+        export_qcow2(
+            &mut Cursor::new(&src),
+            &mut out,
+            disk as u64,
+            9,
+            &mut |_| {},
+            &|| false,
+        )
+        .unwrap();
+        // Exact upper bound: header + L1(1) + RT(1) + max_refcount_blocks(>=1).
+        // With cluster=512, max_clusters_no_refcount ≈ 132, one block (256
+        // entries) is enough → 4 clusters total = 2048 bytes.
+        assert_eq!(out.get_ref().len() as u64, 4 * cs as u64);
+        assert_qcow2_round_trips(out, &src);
+    }
+
+    #[test]
+    fn writer_default_cluster_bits() {
+        // Passing cluster_bits == 0 selects the 64 KiB default. Use a small
+        // disk so the test runs quickly; just verify round-trip + that the
+        // emitted image's cluster_bits reports as 16.
+        let disk_size = 64 * 1024u64;
+        let src = make_pattern(disk_size as usize);
+        let mut out = Cursor::new(Vec::new());
+        export_qcow2(
+            &mut Cursor::new(&src),
+            &mut out,
+            disk_size,
+            0,
+            &mut |_| {},
+            &|| false,
+        )
+        .unwrap();
+        // Inspect cluster_bits directly from the emitted header.
+        assert_eq!(
+            u32::from_be_bytes(out.get_ref()[20..24].try_into().unwrap()),
+            QCOW2_DEFAULT_CLUSTER_BITS
+        );
+        assert_qcow2_round_trips(out, &src);
+    }
+
+    #[test]
+    fn writer_cancel_aborts() {
+        let disk_size = 4096u64;
+        let src = make_pattern(disk_size as usize);
+        let mut out = Cursor::new(Vec::new());
+        let err = export_qcow2(
+            &mut Cursor::new(&src),
+            &mut out,
+            disk_size,
+            9,
+            &mut |_| {},
+            &|| true,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("cancelled"));
+    }
+
+    /// `qemu-img check` smoke test against a writer-produced image. Skipped
+    /// (printed) when `qemu-img` isn't on PATH. Session 4.2 (VMDK sparse) will
+    /// reuse [`crate::rbformats::qemu_img_test::qemu_img_check`].
+    #[test]
+    fn writer_round_trips_through_qemu_img_check() {
+        let disk_size = 64 * 1024u64;
+        let src = make_pattern(disk_size as usize);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(tmp.path())
+                .unwrap();
+            export_qcow2(
+                &mut Cursor::new(&src),
+                &mut f,
+                disk_size,
+                0,
+                &mut |_| {},
+                &|| false,
+            )
+            .unwrap();
+        }
+        match crate::rbformats::qemu_img_test::qemu_img_check(tmp.path()) {
+            Ok(true) => {} // passed
+            Ok(false) => eprintln!("skipping qemu-img check — `qemu-img` not on PATH"),
+            Err(e) => panic!("qemu-img check failed on writer output: {e}"),
+        }
+        // Independent round-trip via our own reader.
+        let f = std::fs::File::open(tmp.path()).unwrap();
+        assert_qcow2_round_trips(Cursor::new(std::fs::read(tmp.path()).unwrap()), &src);
+        drop(f);
     }
 }
