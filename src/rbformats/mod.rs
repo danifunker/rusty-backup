@@ -6,6 +6,7 @@ pub mod dc42;
 pub mod dmg;
 pub mod export;
 pub mod interleave;
+pub mod qcow2;
 pub mod raw;
 pub mod sparse;
 pub mod twomg;
@@ -1018,6 +1019,13 @@ pub enum ImageFormat {
     DiskCopy42(dc42::Dc42Header),
     /// WOZ 1.0/2.0 — nibble/bitstream floppy image, decoded to logical sectors.
     Woz(woz::WozReader),
+    /// QCOW2 (v2 or v3, uncompressed) — opened on-demand by path via
+    /// [`qcow2::Qcow2Reader`]; `logical_size` is the virtual disk size.
+    Qcow2 {
+        path: PathBuf,
+        logical_size: u64,
+        version: u32,
+    },
     /// MAME CHD — opened on-demand by path; logical_size is the uncompressed length.
     Chd { path: PathBuf, logical_size: u64 },
     /// MAME CD CHD — single-track MODE1, browsed via the cooked 2048-byte adapter.
@@ -1066,6 +1074,13 @@ impl ImageFormat {
                     reader.disk_type_name(),
                     reader.len()
                 )
+            }
+            ImageFormat::Qcow2 {
+                logical_size,
+                version,
+                ..
+            } => {
+                format!("QCOW2 v{} (disk: {} bytes)", version, logical_size)
             }
             ImageFormat::Chd { logical_size, .. } => {
                 format!("MAME CHD ({} bytes decoded)", logical_size)
@@ -1140,6 +1155,31 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
                 Ok(reader) => return Ok(ImageFormat::Woz(reader)),
                 Err(_) => {
                     // WOZ magic matched but decoding failed — fall through
+                }
+            }
+        }
+    }
+
+    // 1b. QCOW2 magic at offset 0 (`QFI\xFB`). Strong fixed signature, placed
+    //     ahead of the heuristic/size-based checks. The reader does all the
+    //     feature gating (rejects qcow1, snapshots, encryption, etc.) so we
+    //     only have to confirm the magic + harvest the virtual size here.
+    if file_size >= 32 {
+        file.seek(SeekFrom::Start(0))?;
+        let mut head = [0u8; 32];
+        if file.read_exact(&mut head).is_ok() && &head[0..4] == qcow2::QCOW2_MAGIC {
+            if let Some(p) = path {
+                // Re-open through the reader so a malformed header rejects
+                // here, not later during browse.
+                if let Ok(reader) = qcow2::Qcow2Reader::open(File::open(p)?) {
+                    let logical_size = reader.len();
+                    let version = reader.version();
+                    drop(reader);
+                    return Ok(ImageFormat::Qcow2 {
+                        path: p.to_path_buf(),
+                        logical_size,
+                        version,
+                    });
                 }
             }
         }
@@ -1318,6 +1358,17 @@ pub fn wrap_image_reader(file: File, format: ImageFormat) -> Result<(BoxReadSeek
             // Re-open by path so the reader owns its own File handle.
             drop(file);
             let reader = vhd::DynamicVhdReader::open(File::open(&path)?)?;
+            Ok((Box::new(reader), logical_size))
+        }
+        ImageFormat::Qcow2 {
+            path,
+            logical_size,
+            version: _,
+        } => {
+            // Re-open by path so the reader owns its own File handle (mirrors
+            // VhdDynamic / Chd).
+            drop(file);
+            let reader = qcow2::Qcow2Reader::open(File::open(&path)?)?;
             Ok((Box::new(reader), logical_size))
         }
         ImageFormat::Chd { path, logical_size } => {

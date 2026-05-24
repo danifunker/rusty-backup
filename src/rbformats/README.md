@@ -7,6 +7,7 @@ Compress/decompress handlers for backup output formats, plus disk reconstruction
 - **`mod.rs`** — Orchestration functions (`compress_partition`, `decompress_to_writer`, `reconstruct_disk_from_backup`) and shared utilities (`SplitWriter`, `write_zeros`, `is_all_zeros`, `output_path`, `file_name`, `CHUNK_SIZE`).
 - **`vhd.rs`** — VHD format: Fixed (`build_vhd_footer`, `export_whole_disk_vhd`, `export_partition_vhd`) and Dynamic/sparse (`DynamicVhdReader`, `export_whole_disk_vhd_dynamic`). Shared: `vhd_chs_geometry`, `vhd_checksum`, `VHD_COOKIE`.
 - **`sparse.rs`** — Shared sparse-allocation bookkeeping (`SparseAllocator`, `is_zero_unit`) reused by dynamic VHD (and later QCOW2, VMDK sparse).
+- **`qcow2.rs`** — QCOW2 v2/v3 reader (`Qcow2Reader`); uncompressed clusters only. Writer + in-place edit ship in later sessions of Phase 2.
 - **`chd.rs`** — CHD (MAME) format via the in-process `libchdman-rs` crate: `compress_chd`, `compress_chd_dvd`, `ChdReader`, `CdCookedReader`.
 - **`zstd.rs`** — Zstd streaming compression: `compress_zstd`.
 - **`raw.rs`** — Raw streaming with optional file splitting and sparse zero-skipping: `stream_with_split`.
@@ -18,6 +19,7 @@ Compress/decompress handlers for backup output formats, plus disk reconstruction
 | Raw    | `.raw`    | None        | Yes       | Supports sparse zero-skipping |
 | VHD (Fixed)   | `.vhd` | None  | No        | Raw data + 512-byte footer |
 | VHD (Dynamic) | `.vhd` | None  | No        | Sparse: BAT + per-block bitmap; all-zero blocks omitted |
+| QCOW2 (read)  | `.qcow2` | None | No       | Read-only so far: v2 + v3 uncompressed, no snapshots / backing / encryption |
 | Zstd   | `.zst`    | Zstd level 3 | Yes (post-hoc) | Good compression ratio |
 | CHD    | `.chd`    | MAME CHD    | Yes (post-hoc) | Native via `libchdman-rs` (no external tool) |
 
