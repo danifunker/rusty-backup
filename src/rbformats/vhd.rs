@@ -177,6 +177,169 @@ fn random_uuid() -> [u8; 16] {
     bytes
 }
 
+/// Cookie identifying the VHD Dynamic Disk Header (`"cxsparse"`).
+pub const VHD_DYNAMIC_COOKIE: &[u8; 8] = b"cxsparse";
+
+/// VHD disk-type values (footer offset 60, big-endian).
+pub const VHD_TYPE_FIXED: u32 = 2;
+pub const VHD_TYPE_DYNAMIC: u32 = 3;
+pub const VHD_TYPE_DIFFERENCING: u32 = 4;
+
+/// Sentinel BAT entry marking an unallocated block (reads as zeros).
+const BAT_UNUSED: u32 = 0xFFFF_FFFF;
+
+/// Reader over a *dynamic* (sparse) VHD that presents the logical disk as a
+/// flat, seekable byte stream. Unallocated blocks read as zeros.
+///
+/// Layout (all multi-byte fields big-endian):
+/// - footer copy (512 B) at offset 0, canonical footer (512 B) at EOF-512
+/// - Dynamic Disk Header (1024 B) at the footer's `data_offset`
+/// - BAT: `max_table_entries` × u32 (each = sector offset of a block's bitmap,
+///   or `0xFFFFFFFF` if unallocated)
+/// - each block = a sector bitmap (padded to 512 B) followed by `block_size`
+///   data bytes
+pub struct DynamicVhdReader<R: Read + Seek> {
+    inner: R,
+    /// Logical disk size in bytes (footer "current size", offset 48).
+    disk_size: u64,
+    /// Bytes of data per block (dynamic header offset 32).
+    block_size: u64,
+    /// Size of the per-block sector bitmap, padded to a 512-byte boundary.
+    bitmap_size: u64,
+    /// Block Allocation Table: one entry per block, sector offset or `BAT_UNUSED`.
+    bat: Vec<u32>,
+    /// Current logical read position.
+    pos: u64,
+}
+
+impl<R: Read + Seek> DynamicVhdReader<R> {
+    /// Parse a dynamic VHD from `inner`. Fails if the footer is missing, the
+    /// disk type is not dynamic (3), or the dynamic header is malformed.
+    /// Differencing disks (type 4) are explicitly rejected.
+    pub fn open(mut inner: R) -> Result<Self> {
+        let total_len = inner.seek(SeekFrom::End(0))?;
+        if total_len < 512 + 1024 {
+            bail!("file too small to be a dynamic VHD");
+        }
+
+        // Canonical footer at EOF-512.
+        inner.seek(SeekFrom::End(-512))?;
+        let mut footer = [0u8; 512];
+        inner.read_exact(&mut footer)?;
+        if &footer[0..8] != VHD_COOKIE {
+            bail!("missing VHD footer cookie");
+        }
+        let disk_type = u32::from_be_bytes(footer[60..64].try_into().unwrap());
+        match disk_type {
+            VHD_TYPE_DYNAMIC => {}
+            VHD_TYPE_DIFFERENCING => bail!("differencing VHDs are not supported"),
+            other => bail!("not a dynamic VHD (disk type {other})"),
+        }
+        let disk_size = u64::from_be_bytes(footer[48..56].try_into().unwrap());
+        let header_offset = u64::from_be_bytes(footer[16..24].try_into().unwrap());
+        if header_offset == u64::MAX || header_offset + 1024 > total_len {
+            bail!("invalid dynamic header offset");
+        }
+
+        // Dynamic Disk Header.
+        inner.seek(SeekFrom::Start(header_offset))?;
+        let mut header = [0u8; 1024];
+        inner.read_exact(&mut header)?;
+        if &header[0..8] != VHD_DYNAMIC_COOKIE {
+            bail!("missing dynamic header cookie");
+        }
+        let table_offset = u64::from_be_bytes(header[16..24].try_into().unwrap());
+        let max_table_entries = u32::from_be_bytes(header[28..32].try_into().unwrap()) as usize;
+        let block_size = u32::from_be_bytes(header[32..36].try_into().unwrap()) as u64;
+        if block_size == 0 || !block_size.is_multiple_of(512) {
+            bail!("invalid dynamic VHD block size {block_size}");
+        }
+        if table_offset + (max_table_entries as u64) * 4 > total_len {
+            bail!("BAT extends past end of file");
+        }
+
+        // BAT: one big-endian u32 per block.
+        inner.seek(SeekFrom::Start(table_offset))?;
+        let mut bat_bytes = vec![0u8; max_table_entries * 4];
+        inner.read_exact(&mut bat_bytes)?;
+        let bat: Vec<u32> = bat_bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_be_bytes(c.try_into().unwrap()))
+            .collect();
+
+        // Sector bitmap precedes each block, padded up to a 512-byte boundary.
+        let sectors_per_block = block_size / 512;
+        let bitmap_size = sectors_per_block.div_ceil(8).div_ceil(512) * 512;
+
+        Ok(Self {
+            inner,
+            disk_size,
+            block_size,
+            bitmap_size,
+            bat,
+            pos: 0,
+        })
+    }
+
+    /// Logical disk size in bytes.
+    pub fn len(&self) -> u64 {
+        self.disk_size
+    }
+
+    /// True if the logical disk is empty.
+    pub fn is_empty(&self) -> bool {
+        self.disk_size == 0
+    }
+}
+
+impl<R: Read + Seek> Read for DynamicVhdReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.disk_size || buf.is_empty() {
+            return Ok(0);
+        }
+        let block_index = (self.pos / self.block_size) as usize;
+        let intra = self.pos % self.block_size;
+        // Never cross a block boundary (or the end of the disk) in one read.
+        let remaining_in_block = self.block_size - intra;
+        let remaining_in_disk = self.disk_size - self.pos;
+        let to_read = (buf.len() as u64)
+            .min(remaining_in_block)
+            .min(remaining_in_disk) as usize;
+
+        let entry = self.bat.get(block_index).copied().unwrap_or(BAT_UNUSED);
+        if entry == BAT_UNUSED {
+            // Unallocated → zeros.
+            for b in buf[..to_read].iter_mut() {
+                *b = 0;
+            }
+        } else {
+            let host = entry as u64 * 512 + self.bitmap_size + intra;
+            self.inner.seek(SeekFrom::Start(host))?;
+            self.inner.read_exact(&mut buf[..to_read])?;
+        }
+        self.pos += to_read as u64;
+        Ok(to_read)
+    }
+}
+
+impl<R: Read + Seek> Seek for DynamicVhdReader<R> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let new_pos = match pos {
+            SeekFrom::Start(n) => n as i64,
+            SeekFrom::End(n) => self.disk_size as i64 + n,
+            SeekFrom::Current(n) => self.pos as i64 + n,
+        };
+        if new_pos < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "seek before start of dynamic VHD",
+            ));
+        }
+        self.pos = new_pos as u64;
+        Ok(self.pos)
+    }
+}
+
 /// Write VHD (Fixed): stream raw data to a single file, then append a
 /// 512-byte footer. `output_hasher`, when provided, is updated with
 /// every byte that lands in the file (raw bytes + footer) so the
@@ -1137,6 +1300,154 @@ mod tests {
             sum = sum.wrapping_add(b as u32);
         }
         assert_eq!(stored, !sum);
+    }
+
+    /// Build a minimal in-memory dynamic VHD. `blocks[i] == Some(data)` is an
+    /// allocated block (data must be `block_size` bytes); `None` is unallocated.
+    fn make_dynamic_vhd(block_size: usize, blocks: &[Option<Vec<u8>>]) -> Vec<u8> {
+        let n = blocks.len();
+        let disk_size = (block_size * n) as u64;
+        let sectors_per_block = block_size / 512;
+        let bitmap_size = sectors_per_block.div_ceil(8).div_ceil(512) * 512;
+
+        let header_offset: u64 = 512;
+        let bat_offset: u64 = 1536;
+        let data_start = (bat_offset + (n as u64) * 4).div_ceil(512) * 512;
+
+        let mut footer = build_vhd_footer(disk_size);
+        footer[16..24].copy_from_slice(&header_offset.to_be_bytes());
+        footer[60..64].copy_from_slice(&VHD_TYPE_DYNAMIC.to_be_bytes());
+
+        let mut header = [0u8; 1024];
+        header[0..8].copy_from_slice(VHD_DYNAMIC_COOKIE);
+        header[8..16].copy_from_slice(&u64::MAX.to_be_bytes());
+        header[16..24].copy_from_slice(&bat_offset.to_be_bytes());
+        header[24..28].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+        header[28..32].copy_from_slice(&(n as u32).to_be_bytes());
+        header[32..36].copy_from_slice(&(block_size as u32).to_be_bytes());
+
+        let mut bat = vec![BAT_UNUSED; n];
+        let mut blocks_region: Vec<u8> = Vec::new();
+        let mut next_sector = data_start / 512;
+        for (i, b) in blocks.iter().enumerate() {
+            if let Some(data) = b {
+                assert_eq!(data.len(), block_size);
+                bat[i] = next_sector as u32;
+                blocks_region.extend(std::iter::repeat_n(0xFFu8, bitmap_size));
+                blocks_region.extend_from_slice(data);
+                next_sector += ((bitmap_size + block_size) as u64) / 512;
+            }
+        }
+
+        let mut out = vec![0u8; data_start as usize];
+        out[0..512].copy_from_slice(&footer);
+        out[512..1536].copy_from_slice(&header);
+        for (i, e) in bat.iter().enumerate() {
+            let off = bat_offset as usize + i * 4;
+            out[off..off + 4].copy_from_slice(&e.to_be_bytes());
+        }
+        out.extend_from_slice(&blocks_region);
+        out.extend_from_slice(&footer);
+        out
+    }
+
+    #[test]
+    fn test_dynamic_vhd_reader_mixed_blocks() {
+        // Block 0 allocated (0xAB filled), block 1 unallocated (reads zeros).
+        let bs = 512usize;
+        let block0 = vec![0xABu8; bs];
+        let image = make_dynamic_vhd(bs, &[Some(block0.clone()), None]);
+
+        let mut reader = DynamicVhdReader::open(std::io::Cursor::new(image)).unwrap();
+        assert_eq!(reader.len(), (bs * 2) as u64);
+
+        // Whole-disk read, looping because reads stop at block boundaries.
+        let mut got = Vec::new();
+        std::io::copy(&mut reader, &mut got).unwrap();
+        assert_eq!(got.len(), bs * 2);
+        assert_eq!(&got[..bs], &block0[..]);
+        assert!(
+            got[bs..].iter().all(|&b| b == 0),
+            "unallocated block != zeros"
+        );
+    }
+
+    #[test]
+    fn test_dynamic_vhd_reader_seek_to_boundary() {
+        let bs = 512usize;
+        let block1 = vec![0x5Au8; bs];
+        // Block 0 unallocated, block 1 allocated.
+        let image = make_dynamic_vhd(bs, &[None, Some(block1.clone())]);
+        let mut reader = DynamicVhdReader::open(std::io::Cursor::new(image)).unwrap();
+
+        // Seek to the start of block 1 and read it back.
+        reader.seek(SeekFrom::Start(bs as u64)).unwrap();
+        let mut buf = vec![0u8; bs];
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(buf, block1);
+
+        // Seek back to block 0 (unallocated) — should read zeros.
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        let mut buf0 = vec![0u8; bs];
+        reader.read_exact(&mut buf0).unwrap();
+        assert!(buf0.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_dynamic_vhd_detection_roundtrip() {
+        // End-to-end: write a dynamic VHD to disk, let detect_image_format
+        // recognize it, then wrap_image_reader and read it back.
+        let bs = 512usize;
+        let block0 = vec![0xCDu8; bs];
+        let image = make_dynamic_vhd(bs, &[Some(block0.clone()), None]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dyn.vhd");
+        std::fs::write(&path, &image).unwrap();
+
+        let file = File::open(&path).unwrap();
+        let fmt = crate::rbformats::detect_image_format_with_path(file, Some(&path)).unwrap();
+        match &fmt {
+            crate::rbformats::ImageFormat::VhdDynamic { logical_size, .. } => {
+                assert_eq!(*logical_size, (bs * 2) as u64);
+            }
+            _ => panic!("expected VhdDynamic"),
+        }
+
+        let file2 = File::open(&path).unwrap();
+        let (mut reader, size) = crate::rbformats::wrap_image_reader(file2, fmt).unwrap();
+        assert_eq!(size, (bs * 2) as u64);
+        let mut got = Vec::new();
+        std::io::copy(&mut reader, &mut got).unwrap();
+        assert_eq!(&got[..bs], &block0[..]);
+        assert!(got[bs..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_dynamic_vhd_reader_rejects_fixed() {
+        // A fixed VHD is just data + footer; open() must reject it.
+        let footer = build_vhd_footer(1024); // disk type 2
+        let mut image = vec![0u8; 1024];
+        image.extend_from_slice(&footer);
+        let err = match DynamicVhdReader::open(std::io::Cursor::new(image)) {
+            Ok(_) => panic!("fixed VHD should be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("not a dynamic VHD"));
+    }
+
+    #[test]
+    fn test_dynamic_vhd_reader_rejects_differencing() {
+        let bs = 512usize;
+        let mut image = make_dynamic_vhd(bs, &[Some(vec![1u8; bs])]);
+        // Patch both footer copies' disk type to 4 (differencing).
+        let len = image.len();
+        image[60..64].copy_from_slice(&VHD_TYPE_DIFFERENCING.to_be_bytes());
+        image[len - 512 + 60..len - 512 + 64].copy_from_slice(&VHD_TYPE_DIFFERENCING.to_be_bytes());
+        let err = match DynamicVhdReader::open(std::io::Cursor::new(image)) {
+            Ok(_) => panic!("differencing VHD should be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("differencing"));
     }
 
     #[test]

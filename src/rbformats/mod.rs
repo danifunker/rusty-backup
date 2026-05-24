@@ -1004,6 +1004,9 @@ pub enum ImageFormat {
     Raw,
     /// VHD Fixed — strip the 512-byte footer; `data_size` is the raw data length.
     Vhd { data_size: u64 },
+    /// VHD Dynamic (sparse) — opened on-demand by path via `DynamicVhdReader`;
+    /// `logical_size` is the virtual disk size.
+    VhdDynamic { path: PathBuf, logical_size: u64 },
     /// 2MG (Apple II) — skip header, use data_offset/data_length.
     TwoMg(twomg::TwoMgHeader),
     /// UDIF DMG — virtual decompressed reader.
@@ -1028,6 +1031,9 @@ impl ImageFormat {
             ImageFormat::Raw => "Raw disk image".to_string(),
             ImageFormat::Vhd { data_size } => {
                 format!("Fixed VHD (data: {} bytes)", data_size)
+            }
+            ImageFormat::VhdDynamic { logical_size, .. } => {
+                format!("Dynamic VHD (disk: {} bytes)", logical_size)
             }
             ImageFormat::TwoMg(hdr) => {
                 format!("2MG ({}, {} bytes)", hdr.format_name(), hdr.data_length)
@@ -1150,11 +1156,25 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
         }
     }
 
-    // 3. Check last 512 bytes for VHD "conectix" cookie
+    // 3. Check last 512 bytes for VHD "conectix" cookie. The footer's disk-type
+    //    field (offset 60) distinguishes fixed (2) from dynamic/sparse (3).
     if file_size >= 512 {
         file.seek(SeekFrom::End(-512))?;
-        let mut cookie = [0u8; 8];
-        if file.read_exact(&mut cookie).is_ok() && &cookie == vhd::VHD_COOKIE {
+        let mut footer = [0u8; 512];
+        if file.read_exact(&mut footer).is_ok() && &footer[0..8] == vhd::VHD_COOKIE {
+            let disk_type = u32::from_be_bytes(footer[60..64].try_into().unwrap());
+            if disk_type == vhd::VHD_TYPE_DYNAMIC {
+                // Logical size = footer "current size" (offset 48). The reader
+                // is opened by path in wrap_image_reader.
+                let logical_size = u64::from_be_bytes(footer[48..56].try_into().unwrap());
+                if let Some(p) = path {
+                    return Ok(ImageFormat::VhdDynamic {
+                        path: p.to_path_buf(),
+                        logical_size,
+                    });
+                }
+            }
+            // Fixed (or any non-dynamic) VHD: strip the 512-byte footer.
             return Ok(ImageFormat::Vhd {
                 data_size: file_size - 512,
             });
@@ -1292,6 +1312,12 @@ pub fn wrap_image_reader(file: File, format: ImageFormat) -> Result<(BoxReadSeek
             drop(file);
             let size = reader.len();
             Ok((Box::new(reader), size))
+        }
+        ImageFormat::VhdDynamic { path, logical_size } => {
+            // Re-open by path so the reader owns its own File handle.
+            drop(file);
+            let reader = vhd::DynamicVhdReader::open(File::open(&path)?)?;
+            Ok((Box::new(reader), logical_size))
         }
         ImageFormat::Chd { path, logical_size } => {
             // CHD is opened directly via libchdman_rs; the raw File is unused.
