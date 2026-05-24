@@ -456,6 +456,80 @@ fn batch_applies_mkdir_put_rm_in_one_pass() {
 }
 
 #[test]
+fn put_boot_apm_writes_at_partition_offset_not_image_zero() {
+    // Regression: `put --boot` against an APM-wrapped image must write
+    // the 1024-byte boot region at the *partition's* LBA 0 (e.g. byte
+    // 0xC000 for a typical Apple_HFS placement), not the image's byte
+    // 0 — that would overwrite the APM Driver Descriptor Record and
+    // brick the disk for a Mac ROM.
+    use rusty_backup::fs::hfs::create_blank_hfs;
+    use rusty_backup::fs::hfs_clone::emit_apm_disk_with_hfs;
+    use rusty_backup::partition::apm::build_minimal_apm;
+    use std::io::Cursor;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let img = dir.path().join("apm.hda");
+
+    let total_blocks: u32 = 4096;
+    let driver_start: u32 = 32;
+    let driver_blocks: u32 = 8;
+    let hfs_start: u32 = 96; // 0xC000 — the canonical APM layout
+    let mut apm = build_minimal_apm(
+        &[
+            ("Apple_Driver43".to_string(), driver_start, driver_blocks),
+            ("Apple_HFS".to_string(), hfs_start, total_blocks - hfs_start),
+        ],
+        512,
+        total_blocks,
+    );
+    apm.entries[2].name = "MacOS".to_string();
+    let blocks = apm.build_apm_blocks(Some(total_blocks));
+    let mut source = vec![0u8; total_blocks as usize * 512];
+    source[..blocks.len()].copy_from_slice(&blocks);
+
+    let hfs_bytes = (total_blocks - hfs_start) as u64 * 512;
+    let hfs_image = create_blank_hfs(hfs_bytes, 4096, "BootApm").unwrap();
+    let source_len = source.len() as u64;
+    let mut out: Vec<u8> = Vec::new();
+    let mut src_cursor = Cursor::new(source);
+    let mut out_cursor = Cursor::new(&mut out);
+    emit_apm_disk_with_hfs(&mut src_cursor, source_len, &hfs_image, &mut out_cursor)
+        .expect("emit APM disk");
+    std::fs::write(&img, &out).unwrap();
+
+    // Snapshot byte 0 of the image (the DDR's "ER" signature) so we can
+    // confirm `--boot` left it alone.
+    let pre = std::fs::read(&img).unwrap();
+    let ddr_sig_before = [pre[0], pre[1]];
+    assert_eq!(
+        &ddr_sig_before, b"ER",
+        "expected APM DDR signature pre-write"
+    );
+
+    let bb = dir.path().join("bb.bin");
+    let bb_data: Vec<u8> = (0..600u32).map(|i| (i % 256) as u8).collect();
+    std::fs::write(&bb, &bb_data).unwrap();
+
+    let img_at = format!("{}@1", img.to_str().unwrap());
+    run(&["put", &img_at, "--boot", bb.to_str().unwrap()]);
+
+    let post = std::fs::read(&img).unwrap();
+    // DDR untouched.
+    assert_eq!(
+        &post[..2],
+        b"ER",
+        "image byte 0 must still be APM DDR signature; --boot smashed the wrong offset"
+    );
+    // Bytes landed at the partition's LBA 0.
+    let part_off = hfs_start as usize * 512;
+    assert_eq!(
+        &post[part_off..part_off + bb_data.len()],
+        &bb_data[..],
+        "boot bytes must land at partition_offset, not image byte 0"
+    );
+}
+
+#[test]
 fn locate_returns_absolute_offset_inside_apm_wrapped_image() {
     // The load-bearing test for `locate`: an APM-wrapped disk where
     // the HFS partition starts well past byte 0. The printed offset
