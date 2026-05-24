@@ -30,6 +30,7 @@ it in the binary yet?"
 - **Resume support for partial backups/restores** — explicitly deferred in the doc; the partial-metadata side already lands with backup's metadata.json `"status": "partial"` field.
 - **Device-write safety** — shipped in `src/cli/device_safety.rs`. System-disk refusal (`--write-to-system-disk` opts back in), mounted-target refusal, mount-point vs device-path disambiguation. Used by `restore --device` and `write`.
 - **Globbing for `get`** — Phase B shipped globs for `ls` and `rm`; `get` waits for the recursive-extract design in Phase D.
+- **`fsck` JSON output** — `src/cli/verbs/fsck.rs:133 print_report` writes human-readable lines via `out_stdout`/`log_stderr`; every other read-only verb (`inspect`, `show *`, `locate`) accepts `--format json|yaml` and emits the standard `schema_version`/`status`/`result` envelope. Add a `--format` flag here too and serialize `FsckResult` (which already has the shared `FsckIssue` / `FsckStats` types from `src/fs/fsck.rs`) into the same envelope. Scripts today work around it by redirecting stdout and branching on `$?`; flagged by a downstream build-script consumer 2026-05-24.
 
 The detailed plan below remains the spec; check this table before starting work on a verb to see if it's already implemented.
 
