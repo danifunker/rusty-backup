@@ -491,7 +491,6 @@ mod tests {
 
     use super::super::filesystem::Filesystem;
     use super::super::hfsplus::{create_blank_hfsplus, HfsPlusFilesystem};
-    use super::*;
 
     /// VH file_count lives at offset 1024 + 32 (big-endian u32). Mirror to
     /// the alternate VH at end-of-volume too so re-open uses the poked

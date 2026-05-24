@@ -2017,7 +2017,7 @@ fn test_sfs_staged_edits_round_trip() {
 #[test]
 fn test_synthetic_rdb_ffs_pipeline() {
     use byteorder::{BigEndian, ByteOrder};
-    use rusty_backup::fs::{self, filesystem::Filesystem};
+    use rusty_backup::fs;
     use rusty_backup::partition::PartitionTable;
 
     const BSIZE: usize = 512;
