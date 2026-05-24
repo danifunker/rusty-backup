@@ -224,7 +224,17 @@ pub struct DynamicVhdReader<R: Read + Seek> {
     bitmap_size: u64,
     /// Block Allocation Table: one entry per block, sector offset or `BAT_UNUSED`.
     bat: Vec<u32>,
-    /// Current logical read position.
+    /// Host byte offset of the BAT — needed to patch individual entries during
+    /// allocate-on-write without re-emitting the whole table.
+    table_offset: u64,
+    /// Host byte offset where the trailing footer currently starts. New blocks
+    /// get appended here (overwriting the footer); the footer is then
+    /// re-emitted at the new end-of-file.
+    host_end: u64,
+    /// Cached trailing-footer bytes so allocate-on-write re-appends the exact
+    /// original footer (preserving UUID, timestamp, creator, etc.).
+    footer: [u8; 512],
+    /// Current logical read/write position.
     pos: u64,
 }
 
@@ -293,6 +303,9 @@ impl<R: Read + Seek> DynamicVhdReader<R> {
             block_size,
             bitmap_size,
             bat,
+            table_offset,
+            host_end: total_len - 512,
+            footer,
             pos: 0,
         })
     }
@@ -353,6 +366,85 @@ impl<R: Read + Seek> Seek for DynamicVhdReader<R> {
         }
         self.pos = new_pos as u64;
         Ok(self.pos)
+    }
+}
+
+/// Allocate-on-write `Write` for in-place editing of dynamic VHDs.
+///
+/// Writes that land in an already-allocated block update in place. Writes
+/// that land in an unallocated block first append a fresh block to the file
+/// (overwriting the trailing footer, growing the file, patching the BAT,
+/// then re-emitting the cached footer at the new end-of-file). The bitmap
+/// of any newly-allocated block is set all-ones — we always mark every
+/// sector as written even when the caller only touches part of the block,
+/// which is the conservative interpretation Microsoft's spec endorses
+/// ("If the bitmap is unused, all data is valid").
+///
+/// Like [`Read`], one call never crosses a block boundary; the caller (or
+/// `write_all`) loops to cover larger writes.
+impl<R: Read + Write + Seek> Write for DynamicVhdReader<R> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.pos >= self.disk_size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "write past end of dynamic VHD",
+            ));
+        }
+        let block_index = (self.pos / self.block_size) as usize;
+        let intra = self.pos % self.block_size;
+        let remaining_in_block = self.block_size - intra;
+        let remaining_in_disk = self.disk_size - self.pos;
+        let to_write = (buf.len() as u64)
+            .min(remaining_in_block)
+            .min(remaining_in_disk) as usize;
+
+        if self.bat[block_index] == BAT_UNUSED {
+            self.allocate_block(block_index)?;
+        }
+
+        let entry = self.bat[block_index];
+        let host = entry as u64 * 512 + self.bitmap_size + intra;
+        self.inner.seek(SeekFrom::Start(host))?;
+        self.inner.write_all(&buf[..to_write])?;
+        self.pos += to_write as u64;
+        Ok(to_write)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<R: Read + Write + Seek> DynamicVhdReader<R> {
+    /// Allocate a fresh block for `block_index`: append (bitmap + zero-data)
+    /// at the current `host_end`, patch the BAT entry on disk + in memory,
+    /// re-emit the trailing footer at the new EOF.
+    fn allocate_block(&mut self, block_index: usize) -> std::io::Result<()> {
+        let new_host = self.host_end;
+        // Overwrite the old footer with the new block's bitmap.
+        self.inner.seek(SeekFrom::Start(new_host))?;
+        let bitmap = vec![0xFFu8; self.bitmap_size as usize];
+        self.inner.write_all(&bitmap)?;
+        // Then a fully-zero block; subsequent partial writes update the parts
+        // that the caller actually wants to change.
+        let zeros = vec![0u8; self.block_size as usize];
+        self.inner.write_all(&zeros)?;
+
+        // Patch the BAT (on disk and in memory).
+        let new_entry = (new_host / 512) as u32;
+        self.bat[block_index] = new_entry;
+        self.inner
+            .seek(SeekFrom::Start(self.table_offset + block_index as u64 * 4))?;
+        self.inner.write_all(&new_entry.to_be_bytes())?;
+
+        // Re-emit the footer at the new end-of-file.
+        self.host_end += self.bitmap_size + self.block_size;
+        self.inner.seek(SeekFrom::Start(self.host_end))?;
+        self.inner.write_all(&self.footer)?;
+        Ok(())
     }
 }
 
@@ -1771,6 +1863,238 @@ mod tests {
         let mut got = Vec::new();
         std::io::copy(&mut reader, &mut got).unwrap();
         assert_eq!(got, source);
+    }
+
+    // --- Session 1.3 tests: in-place edit (allocate-on-write) ---
+
+    /// Write into a previously-sparse block, then reopen with a fresh reader
+    /// and verify both the new data is readable and the rest of the disk
+    /// (including blocks that were already allocated) is intact.
+    #[test]
+    fn test_dynamic_vhd_write_allocates_sparse_block() {
+        // 4-block disk (512 B blocks). Start with block 0 allocated (0xAA) and
+        // blocks 1..4 sparse.
+        let bs = 512usize;
+        let disk_size = (bs * 4) as u64;
+        let mut source = vec![0u8; disk_size as usize];
+        for b in source[..bs].iter_mut() {
+            *b = 0xAA;
+        }
+
+        // Build it via the dynamic writer so the layout is canonical.
+        let mut backing = Cursor::new(Vec::new());
+        export_whole_disk_vhd_dynamic(
+            &mut Cursor::new(&source),
+            &mut backing,
+            disk_size,
+            bs as u32,
+            &mut |_| {},
+            &|| false,
+        )
+        .unwrap();
+        let before_len = backing.get_ref().len();
+
+        // Open read-write, mutate block 2 (currently sparse).
+        backing.seek(SeekFrom::Start(0)).unwrap();
+        let mut rw = DynamicVhdReader::open(backing).unwrap();
+        rw.seek(SeekFrom::Start((bs * 2) as u64)).unwrap();
+        let payload = vec![0x5Au8; bs];
+        rw.write_all(&payload).unwrap();
+        rw.flush().unwrap();
+        // Recover the underlying Cursor so we can reopen via a fresh reader.
+        let backing = {
+            let mut inner = rw.inner;
+            inner.seek(SeekFrom::Start(0)).unwrap();
+            inner
+        };
+
+        // File grew by exactly one block (bitmap + data).
+        let bitmap_size = 512u64;
+        let after_len = backing.get_ref().len();
+        assert_eq!(
+            after_len as u64,
+            before_len as u64 + bitmap_size + bs as u64
+        );
+
+        // Reopen with a fresh reader and verify everything.
+        let mut reader = DynamicVhdReader::open(backing).unwrap();
+        assert_eq!(reader.len(), disk_size);
+        let mut got = vec![0u8; disk_size as usize];
+        reader.read_exact(&mut got).unwrap();
+
+        // Block 0 still 0xAA.
+        assert!(got[..bs].iter().all(|&b| b == 0xAA), "block 0 corrupted");
+        // Block 1 still zero (sparse).
+        assert!(
+            got[bs..bs * 2].iter().all(|&b| b == 0),
+            "block 1 should still be sparse"
+        );
+        // Block 2 holds the new payload.
+        assert_eq!(&got[bs * 2..bs * 3], &payload[..], "new write missing");
+        // Block 3 still zero (sparse).
+        assert!(
+            got[bs * 3..].iter().all(|&b| b == 0),
+            "block 3 should still be sparse"
+        );
+    }
+
+    /// Partial write inside an unallocated block: only the touched bytes get
+    /// the new value, the rest of the now-allocated block reads as zero.
+    #[test]
+    fn test_dynamic_vhd_partial_write_zero_fills_rest_of_block() {
+        let bs = 1024usize;
+        let disk_size = (bs * 2) as u64;
+        let source = vec![0u8; disk_size as usize];
+
+        let mut backing = Cursor::new(Vec::new());
+        export_whole_disk_vhd_dynamic(
+            &mut Cursor::new(&source),
+            &mut backing,
+            disk_size,
+            bs as u32,
+            &mut |_| {},
+            &|| false,
+        )
+        .unwrap();
+
+        backing.seek(SeekFrom::Start(0)).unwrap();
+        let mut rw = DynamicVhdReader::open(backing).unwrap();
+        // Write 4 bytes in the middle of block 1 (previously sparse).
+        rw.seek(SeekFrom::Start(bs as u64 + 100)).unwrap();
+        rw.write_all(&[0x11, 0x22, 0x33, 0x44]).unwrap();
+
+        let mut backing = rw.inner;
+        backing.seek(SeekFrom::Start(0)).unwrap();
+        let mut reader = DynamicVhdReader::open(backing).unwrap();
+        let mut got = vec![0u8; disk_size as usize];
+        reader.read_exact(&mut got).unwrap();
+
+        // Block 0 untouched (zero).
+        assert!(got[..bs].iter().all(|&b| b == 0));
+        // First 100 bytes of block 1 still zero.
+        assert!(got[bs..bs + 100].iter().all(|&b| b == 0));
+        // The 4 payload bytes.
+        assert_eq!(&got[bs + 100..bs + 104], &[0x11, 0x22, 0x33, 0x44]);
+        // The rest of block 1 still zero.
+        assert!(got[bs + 104..].iter().all(|&b| b == 0));
+    }
+
+    /// Writing into an already-allocated block updates in place (file size
+    /// does not change) and reads back the new bytes.
+    #[test]
+    fn test_dynamic_vhd_write_in_place_for_allocated_block() {
+        let bs = 512usize;
+        let disk_size = (bs * 2) as u64;
+        let mut source = vec![0u8; disk_size as usize];
+        for b in source[..bs].iter_mut() {
+            *b = 0xAA;
+        }
+
+        let mut backing = Cursor::new(Vec::new());
+        export_whole_disk_vhd_dynamic(
+            &mut Cursor::new(&source),
+            &mut backing,
+            disk_size,
+            bs as u32,
+            &mut |_| {},
+            &|| false,
+        )
+        .unwrap();
+        let before_len = backing.get_ref().len();
+
+        backing.seek(SeekFrom::Start(0)).unwrap();
+        let mut rw = DynamicVhdReader::open(backing).unwrap();
+        rw.seek(SeekFrom::Start(0)).unwrap();
+        rw.write_all(&[0xBBu8; 16]).unwrap();
+        let mut backing = rw.inner;
+        let after_len = backing.get_ref().len();
+        assert_eq!(after_len, before_len, "in-place write should not grow file");
+
+        backing.seek(SeekFrom::Start(0)).unwrap();
+        let mut reader = DynamicVhdReader::open(backing).unwrap();
+        let mut got = vec![0u8; disk_size as usize];
+        reader.read_exact(&mut got).unwrap();
+        assert!(got[..16].iter().all(|&b| b == 0xBB));
+        assert!(got[16..bs].iter().all(|&b| b == 0xAA));
+    }
+
+    /// FS-level integration: format a blank FAT volume into a dynamic VHD,
+    /// open it read-write through the FAT layer, create a file, sync, then
+    /// reopen via DynamicVhdReader and read the file back through the FAT
+    /// layer on the immutable view.
+    #[test]
+    fn test_dynamic_vhd_fat_edit_roundtrip() {
+        use crate::fs::fat::{create_blank_fat, FatFilesystem};
+        use crate::fs::filesystem::{EditableFilesystem, Filesystem};
+        use crate::fs::CreateFileOptions;
+
+        // Format a 4 MiB FAT12 volume so it has cluster space to work with.
+        let blank = create_blank_fat(4 * 1024 * 1024, Some("DYNVHD")).expect("format FAT");
+        let disk_size = blank.len() as u64;
+
+        // Wrap it in a dynamic VHD on disk.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fat.vhd");
+        {
+            let mut out = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
+            export_whole_disk_vhd_dynamic(
+                &mut Cursor::new(&blank),
+                &mut out,
+                disk_size,
+                65536,
+                &mut |_| {},
+                &|| false,
+            )
+            .unwrap();
+        }
+
+        // Open read-write through the dynamic-VHD reader, hand it to the FAT
+        // filesystem layer, create a file, sync metadata.
+        let payload = b"hello from a sparse-allocated FAT cluster";
+        {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            let mut vhd = DynamicVhdReader::open(file).unwrap();
+            // FAT inside the VHD: partition_offset = 0 (no MBR/GPT around it).
+            let mut fs = FatFilesystem::open(&mut vhd, 0).expect("open FAT inside dyn VHD");
+            let root = fs.root().expect("root");
+            let mut src = Cursor::new(payload.to_vec());
+            fs.create_file(
+                &root,
+                "edit.txt",
+                &mut src,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create_file");
+            fs.sync_metadata().expect("sync_metadata");
+        }
+
+        // Reopen via a fresh DynamicVhdReader and confirm the file is there.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut vhd = DynamicVhdReader::open(file).unwrap();
+        let mut fs = FatFilesystem::open(&mut vhd, 0).expect("reopen FAT inside dyn VHD");
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list");
+        let file_entry = entries
+            .iter()
+            .find(|e| e.name == "edit.txt")
+            .expect("edit.txt should exist after sync");
+        let got = fs.read_file(file_entry, payload.len()).expect("read_file");
+        assert_eq!(got, payload, "file contents survived the round-trip");
     }
 
     #[test]
