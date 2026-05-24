@@ -1447,11 +1447,15 @@ impl InspectTab {
         }
 
         let is_chd_format = self.export_format == ExportFormat::Chd;
-        if is_chd_format {
-            // Per-partition CHD would emit headless partition slices that no
-            // emulator consumes — force whole-disk.
+        let is_dynamic_vhd = self.export_format == ExportFormat::VhdDynamic;
+        // Force whole-disk for formats that don't make sense per-partition:
+        // CHD (headless slice no emulator consumes) and dynamic VHD (one
+        // partition isn't mostly-zero, so the sparse layout buys nothing
+        // and there's no whole-disk geometry to wrap).
+        if is_chd_format || is_dynamic_vhd {
             self.export_whole_disk = true;
         }
+        let whole_disk_only = is_chd_format || is_dynamic_vhd;
 
         egui::Window::new("Export Disk Image")
             .collapsible(false)
@@ -1481,13 +1485,13 @@ impl InspectTab {
                     "Whole Disk (single file)",
                 );
                 let per_part_resp = ui.add_enabled(
-                    !is_chd_format,
+                    !whole_disk_only,
                     egui::RadioButton::new(
-                        !self.export_whole_disk && !is_chd_format,
+                        !self.export_whole_disk && !whole_disk_only,
                         "Per Partition (one file per partition)",
                     ),
                 );
-                if per_part_resp.clicked() && !is_chd_format {
+                if per_part_resp.clicked() && !whole_disk_only {
                     self.export_whole_disk = false;
                 }
                 if is_chd_format {
@@ -1497,6 +1501,13 @@ impl InspectTab {
                          which no emulator can consume. Use whole-disk export \
                          instead.",
                     );
+                } else if is_dynamic_vhd {
+                    per_part_resp.on_hover_text(
+                        "Per-partition export is not supported for dynamic VHD — \
+                         the sparse layout wraps a whole disk and buys nothing on \
+                         a single mostly-used partition. Use fixed VHD for \
+                         per-partition export.",
+                    );
                 }
 
                 ui.add_space(4.0);
@@ -1505,6 +1516,15 @@ impl InspectTab {
                 ui.label(egui::RichText::new("Format:").strong());
                 ui.horizontal_wrapped(|ui| {
                     ui.radio_value(&mut self.export_format, ExportFormat::Vhd, "VHD");
+                    ui.radio_value(
+                        &mut self.export_format,
+                        ExportFormat::VhdDynamic,
+                        "VHD (Dynamic)",
+                    )
+                    .on_hover_text(
+                        "Sparse VHD — all-zero blocks are omitted. Same .vhd extension; \
+                         readable by Hyper-V, qemu-img, Disk Management.",
+                    );
                     ui.radio_value(&mut self.export_format, ExportFormat::Raw, "Raw (.img)");
                     ui.radio_value(&mut self.export_format, ExportFormat::TwoMg, "2MG (.2mg)");
                     ui.radio_value(&mut self.export_format, ExportFormat::Woz, "WOZ (.woz)")

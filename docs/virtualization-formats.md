@@ -176,10 +176,10 @@ at the end (and mirrored at the front).
 
 | # | Session | Scope & deliverable |
 |---|---|---|
-| 1.1 | **Reader** | `DynamicVhdReader` (`Read + Seek`) parsing dynamic header + BAT + per-block bitmaps; unallocated blocks read as zeros. Detect dynamic-vs-fixed via footer `disk type` field (3 = dynamic, 2 = fixed). Wire detection into the file-open path so inspect/browse/convert-from work. Round-trip unit test against a hand-built dynamic VHD. |
-| 1.2 | **Writer (convert-to)** | Stream a disk image → dynamic VHD: emit header/footer, build BAT, allocate a block only when its data is non-zero, write the bitmap + block. New `ExportFormat::VhdDynamic`. **Extract `sparse_alloc` helper** (block-append + zero-skip) for downstream reuse. Tests asserting all-zero input produces a near-empty file and that fixed-VHD output is byte-identical to before (no regression). |
-| 1.3 | **In-place edit** | `Read + Write + Seek` with allocate-on-write: writing into an unallocated block appends a new block, sets its BAT entry + bitmap; writing into an allocated block updates in place. Host it through `open_editable_filesystem`. Tests: open → mutate a file via the FS layer → reopen with the reader → verify. |
-| 1.4 | **Integration** | GUI export dropdown entry + file-picker filter (`vhd` already present; distinguish on read). CLI `convert` support. Update `src/rbformats/README.md` format table and this doc. Manual `cargo run` smoke test. |
+| 1.1 ✅ | **Reader** | `DynamicVhdReader` (`Read + Seek`) parsing dynamic header + BAT + per-block bitmaps; unallocated blocks read as zeros. Detect dynamic-vs-fixed via footer `disk type` field (3 = dynamic, 2 = fixed). Wire detection into the file-open path so inspect/browse/convert-from work. Round-trip unit test against a hand-built dynamic VHD. Commit `d1f94bf`. |
+| 1.2 ✅ | **Writer (convert-to)** | Stream a disk image → dynamic VHD: emit header/footer, build BAT, allocate a block only when its data is non-zero, write the bitmap + block. New `ExportFormat::VhdDynamic`. **Extract `sparse_alloc` helper** (block-append + zero-skip) for downstream reuse. Tests asserting all-zero input produces a near-empty file and that fixed-VHD output is byte-identical to before (no regression). Commit `f236325`. |
+| 1.3 ✅ | **In-place edit** | `Read + Write + Seek` with allocate-on-write: writing into an unallocated block appends a new block, sets its BAT entry + bitmap; writing into an allocated block updates in place. Host it through `open_editable_filesystem`. Tests: open → mutate a file via the FS layer → reopen with the reader → verify. Commit `8691bad`. |
+| 1.4 ✅ | **Integration** | GUI export radio entry ("VHD (Dynamic)") on Inspect tab + Bulk Convert dialog; CLI `--format vhd-dynamic` on `rb-cli convert`. Per-partition export auto-forced to whole-disk (sparse layout wraps a whole disk). File-picker filter shares `vhd`/`hda` with fixed VHD; detection on read distinguishes via the footer's disk_type field. `src/rbformats/README.md` format table and this doc updated. |
 
 ### On-disk layout
 
@@ -299,11 +299,19 @@ bits when we allocate a block.
 
 ## Phase 2 — QCOW2 (priority)
 
-Reference: QEMU `docs/interop/qcow2.txt` (public spec). v1 scope: **version 3,
-uncompressed, no snapshots, no backing file, no encryption, no external data
-file**. Reject/clearly-error anything outside that on open and on import.
-Test fixture: a real UTM-exported classic-Mac QCOW2 (APM + HFS) plus a
-`qemu-img`-generated PC image.
+Reference: QEMU `docs/interop/qcow2.txt` (public spec). v1 scope: **header
+versions 2 and 3** (qcow2 `compat=0.10` and `compat=1.1`), uncompressed, no
+snapshots, no backing file, no encryption, no external data file, no extended
+L2 entries (subclusters). Reject/clearly-error anything outside that on open
+and on import. **Reject qcow1** (`.qcow`, magic `QFI\xFB` with version==1) —
+different on-disk format (no refcounts, single-level table) and effectively
+extinct in the wild. **The writer emits v3 only** (no reason to downgrade).
+Reader accepts v2 so we can ingest 2009–2013-era VM images
+(default QEMU output until 1.7, Dec 2013) — exactly the retro convert-from
+case Phases 1–5 exist for.
+Test fixtures: a real UTM-exported classic-Mac QCOW2 (APM + HFS, v3) plus a
+`qemu-img`-generated PC image. **Add a v2 fixture**
+(`qemu-img create -f qcow2 -o compat=0.10 …`) for session 2.1.
 
 Layout: header → L1 table → L2 tables → data clusters (default 64 KB);
 allocation tracked by a refcount table → refcount blocks.
@@ -321,23 +329,54 @@ All fields **big-endian**. The file is an array of fixed-size **clusters**
 (`cluster_size = 1 << cluster_bits`, default 65536). Everything — header, L1,
 L2 tables, refcount structures, data — is cluster-aligned.
 
-**Header (v3, ≥104 bytes), key fields:**
+**Header (v2 = 72 B, v3 ≥ 104 B + 8 B padding = 112 B written), all big-endian.
+Offsets verified against `qemu.org/docs/master/interop/qcow2.html`:**
 
 | Offset | Size | Field | Notes |
 |---|---|---|---|
 | 0 | 4 | magic | `QFI\xFB` (`0x514649FB`) — Seam A detection |
-| 4 | 4 | version | 2 or 3; **require 3** for v1 |
+| 4 | 4 | version | **accept 2 or 3**; reject 1 (qcow1) and anything ≥ 4 |
 | 8 | 8 | backing_file_offset | **must be 0** (reject backing files) |
-| 16 | 8 | backing_file_size | — |
-| 24 | 4 | cluster_bits | typically 16 |
-| 28 | 8 | size | virtual disk size in bytes |
-| 36 | 4 | crypt_method | **must be 0** (reject encryption) |
-| 40 | 4 | l1_size | number of L1 entries |
-| 48 | 8 | l1_table_offset | cluster-aligned |
-| 56 | 8 | refcount_table_offset | — |
-| 64 | 4 | refcount_table_clusters | — |
-| 68 | 4 | nb_snapshots | **must be 0** (reject snapshots) |
-| 80 | 8 | incompatible_features | reject if any unknown bit set; bit 0 = dirty, bit 1 = corrupt, bit 3 = external data file → **reject 3** |
+| 16 | 4 | backing_file_size | — (paired with the offset above) |
+| 20 | 4 | cluster_bits | typically 16 |
+| 24 | 8 | size | virtual disk size in bytes |
+| 32 | 4 | crypt_method | **must be 0** (reject encryption) |
+| 36 | 4 | l1_size | number of L1 entries |
+| 40 | 8 | l1_table_offset | cluster-aligned |
+| 48 | 8 | refcount_table_offset | — |
+| 56 | 4 | refcount_table_clusters | — |
+| 60 | 4 | nb_snapshots | **must be 0** (reject snapshots) |
+| 64 | 8 | snapshots_offset | v2 header ends after this field at byte 72 |
+| 72 | 8 | incompatible_features | **v3 only**. Reject if any **unknown** bit set; defined bits: 0 = dirty, 1 = corrupt, 2 = external data file (**reject**), 3 = compression type (**reject** — implies non-zlib), 4 = extended L2 entries (**reject** — subclusters). |
+| 80 | 8 | compatible_features | **v3 only**. Bit 0 = lazy refcounts; safe to ignore on read, clear on writeable open. |
+| 88 | 8 | autoclear_features | **v3 only**. Mask off bits we don't understand when opening for write. |
+| 96 | 4 | refcount_order | **v3 only**. Refcount bit width = `1 << refcount_order`. v1 supports only `4` (16-bit refcounts, the QEMU default); reject other values. v2 has no field — assume 4. |
+| 100 | 4 | header_length | **v3 only**. Length of the header in bytes (≥ 104). Bounds-check before reading header extensions, which start at `header_length`. |
+| 104 | 1 | compression_type | **v3 only** (since QEMU 5.1). 0 = zlib (default); reject any non-zero value (we reject the compression-type incompatible bit anyway). |
+| 105 | 7 | header_end_padding | zero |
+
+**v2 vs v3 deltas the reader must handle:**
+
+- **Header length:** v2 is exactly 72 B and has none of the feature words; treat
+  the missing fields as zero. `refcount_order` is implicitly 4 on v2.
+- **Header extensions:** v3 may carry a TLV chain after byte `header_length`
+  (backing-file format hint, feature-name table, bitmaps, etc.). v1 scope
+  reads them only to detect "unknown required extension" and reject; we don't
+  consume any extension data.
+- **QCOW_OFLAG_ZERO** (L2 entry bit 0 on a *standard* entry → read as zeros):
+  **v3 only**. On v2 the bit is reserved/unused; an unallocated L2 entry (= 0)
+  is still "read as zeros" via the normal sparse path, so v2 just lacks the
+  explicit zero-cluster optimization.
+- **Extended L2 entries (subclusters):** v3 only and gated by an incompatible
+  feature bit. Reject when set — v1 scope is standard L2 only.
+
+Writer always emits v3 with `header_length = 104` (the spec minimum), one byte
+of `compression_type = 0` plus 7 zero padding bytes to a 16-byte boundary at
+offset 112 before any header-extension TLVs (we emit none), `refcount_order = 4`,
+all feature words zero. (`header_length = 112` is also valid and what `qemu-img`
+typically writes, since it includes the compression_type byte + padding inside
+the declared length; either is acceptable per spec — pick whichever matches the
+fixture we round-trip in test.)
 
 **Address translation** (read path): for a guest byte offset,
 `cluster = off / cluster_size`; `l2_entries = cluster_size / 8`;
@@ -357,18 +396,22 @@ write refcount 1, which keeps this simple.
 
 ### Session 2.1 — `Qcow2Reader` (Read + Seek)
 
-- Parse header; **reject out-of-scope** (version≠3, backing file, encryption,
-  snapshots>0, external-data-file/unknown incompatible bits) with a precise
-  `FilesystemError`/`anyhow` message. Cache L1 in RAM (`l1_size`×8 ≤ tens of
+- Parse header; **accept version 2 or 3**, **reject out-of-scope** (version∉{2,3},
+  backing file, encryption, snapshots>0, external-data-file / extended-L2 /
+  unknown incompatible bits, `refcount_order ≠ 4`) with a precise
+  `FilesystemError`/`anyhow` message. On v2 the feature words and
+  `refcount_order` are absent — treat as zero / implicit 4. Cache L1 in RAM (`l1_size`×8 ≤ tens of
   KiB). Lazily read + cache L2 tables (single-entry LRU like `ChdReader`'s
   hunk cache is enough).
 - `read`/`seek`: address translation above; unallocated/ZERO clusters emit
   zeros; never cross a cluster boundary per inner read.
 - **Seam A:** `ImageFormat::Qcow2 { path, logical_size }`; detect by magic at
   offset 0 (put it high in the ladder); `wrap_image_reader` opens by path.
-- Tests: hand-built minimal QCOW2 (`Cursor`); a `qemu-img convert`-produced
-  fixture if available (gated). **Assert a UTM classic-Mac qcow2 inspects as
-  APM + HFS.**
+- Tests: hand-built minimal QCOW2 (`Cursor`) for **both v2 and v3** headers;
+  `qemu-img convert`-produced fixtures if available (gated) — at least one
+  `compat=0.10` (v2) and one `compat=1.1` (v3). **Assert a UTM classic-Mac
+  qcow2 (v3) inspects as APM + HFS, and a v2 PC image inspects with the
+  expected partition table.**
 
 ### Session 2.2 — writer (convert-to)
 

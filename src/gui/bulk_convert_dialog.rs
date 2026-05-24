@@ -156,6 +156,11 @@ impl BulkConvertDialog {
                 ui.label(egui::RichText::new("Output format:").strong());
                 ui.horizontal_wrapped(|ui| {
                     ui.radio_value(&mut self.format, ExportFormat::Vhd, "VHD");
+                    ui.radio_value(&mut self.format, ExportFormat::VhdDynamic, "VHD (Dynamic)")
+                        .on_hover_text(
+                            "Sparse VHD — all-zero blocks are omitted. Same .vhd extension; \
+                             readable by Hyper-V, qemu-img, Disk Management.",
+                        );
                     ui.radio_value(&mut self.format, ExportFormat::Raw, "Raw (.img)");
                     ui.radio_value(&mut self.format, ExportFormat::TwoMg, "2MG (.2mg)");
                     ui.radio_value(&mut self.format, ExportFormat::Woz, "WOZ (.woz)")

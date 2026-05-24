@@ -35,6 +35,8 @@ pub enum ConvertFormat {
     Bincue,
     /// Fixed VHD.
     Vhd,
+    /// Dynamic (sparse) VHD — all-zero blocks omitted; same .vhd extension.
+    VhdDynamic,
     /// Raw disk image (no header).
     Raw,
     /// 2MG (Apple II).
@@ -53,6 +55,7 @@ impl From<ConvertFormat> for ExportFormat {
             ConvertFormat::ChdCd => ExportFormat::ChdCd,
             ConvertFormat::Bincue => ExportFormat::BinCue,
             ConvertFormat::Vhd => ExportFormat::Vhd,
+            ConvertFormat::VhdDynamic => ExportFormat::VhdDynamic,
             ConvertFormat::Raw => ExportFormat::Raw,
             ConvertFormat::Twomg => ExportFormat::TwoMg,
             ConvertFormat::Woz => ExportFormat::Woz,
