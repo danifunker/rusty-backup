@@ -14,6 +14,7 @@ pub mod sparse;
 pub mod twomg;
 pub mod vhd;
 pub mod vmdk;
+pub mod vmdk_sparse;
 pub mod woz;
 pub mod woz_write;
 pub mod zstd;
@@ -1033,6 +1034,11 @@ pub enum ImageFormat {
     /// referencing one or more `FLAT`/`ZERO` extents. Opened on-demand by path
     /// via [`vmdk::VmdkFlatReader`]; `logical_size` is the virtual disk size.
     VmdkFlat { path: PathBuf, logical_size: u64 },
+    /// VMDK sparse (`monolithicSparse`) — binary `KDMV` header + grain
+    /// directory + grain tables. Opened on-demand by path via
+    /// [`vmdk_sparse::VmdkSparseReader`]; `logical_size` is the virtual disk
+    /// size (= `capacity_sectors * 512`).
+    VmdkSparse { path: PathBuf, logical_size: u64 },
     /// MAME CHD — opened on-demand by path; logical_size is the uncompressed length.
     Chd { path: PathBuf, logical_size: u64 },
     /// MAME CD CHD — single-track MODE1, browsed via the cooked 2048-byte adapter.
@@ -1091,6 +1097,9 @@ impl ImageFormat {
             }
             ImageFormat::VmdkFlat { logical_size, .. } => {
                 format!("VMDK flat (disk: {} bytes)", logical_size)
+            }
+            ImageFormat::VmdkSparse { logical_size, .. } => {
+                format!("VMDK sparse (disk: {} bytes)", logical_size)
             }
             ImageFormat::Chd { logical_size, .. } => {
                 format!("MAME CHD ({} bytes decoded)", logical_size)
@@ -1195,10 +1204,30 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
         }
     }
 
+    // 1c'. VMDK sparse magic at offset 0 (`KDMV`). Strong fixed signature;
+    //      placed before the flat-descriptor sniff because sparse `.vmdk`
+    //      files share the same extension but lead with binary magic the
+    //      flat reader rejects.
+    if file_size >= 512 {
+        file.seek(SeekFrom::Start(0))?;
+        let mut head = [0u8; 4];
+        if file.read_exact(&mut head).is_ok() && &head == vmdk_sparse::VMDK_SPARSE_MAGIC {
+            if let Some(p) = path {
+                if let Ok(reader) = vmdk_sparse::VmdkSparseReader::open(File::open(p)?) {
+                    let logical_size = reader.len();
+                    drop(reader);
+                    return Ok(ImageFormat::VmdkSparse {
+                        path: p.to_path_buf(),
+                        logical_size,
+                    });
+                }
+            }
+        }
+    }
+
     // 1c. VMDK flat descriptor at offset 0 (ASCII `# Disk DescriptorFile`).
     //     Strong fixed signature; placed alongside the other magic-at-0
-    //     checks. Sparse VMDKs lead with `KDMV` (Phase 4) — the reader
-    //     rejects them, so we don't pre-filter here.
+    //     checks. Sparse VMDKs lead with `KDMV` (handled above).
     if file_size >= vmdk::VMDK_DESCRIPTOR_MAGIC.len() as u64 {
         file.seek(SeekFrom::Start(0))?;
         let mut head = vec![0u8; vmdk::VMDK_DESCRIPTOR_MAGIC.len()];
@@ -1405,6 +1434,11 @@ pub fn wrap_image_reader(file: File, format: ImageFormat) -> Result<(BoxReadSeek
         ImageFormat::VmdkFlat { path, logical_size } => {
             drop(file);
             let reader = vmdk::VmdkFlatReader::open(&path)?;
+            Ok((Box::new(reader), logical_size))
+        }
+        ImageFormat::VmdkSparse { path, logical_size } => {
+            drop(file);
+            let reader = vmdk_sparse::VmdkSparseReader::open(File::open(&path)?)?;
             Ok((Box::new(reader), logical_size))
         }
         ImageFormat::Chd { path, logical_size } => {
