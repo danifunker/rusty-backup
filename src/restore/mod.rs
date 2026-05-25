@@ -2258,6 +2258,7 @@ fn run_clonezilla_restore(
 }
 
 /// Write a Clonezilla disk image: MBR/GPT, hidden data, EBR, and partition data.
+#[allow(clippy::too_many_arguments)] // Clonezilla restore takes image + overrides + sizes + callbacks
 fn write_clonezilla_disk(
     cz_image: &ClonezillaImage,
     overrides: &[PartitionSizeOverride],

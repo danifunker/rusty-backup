@@ -50,7 +50,9 @@ pub(super) fn check_alternate_mdb(
         return;
     }
 
-    // Cross-check critical fields
+    // Cross-check critical fields. The triple is (label, accessor, expected);
+    // hoisting to a named struct would be more code than it's worth here.
+    #[allow(clippy::type_complexity)]
     let checks: &[(&str, fn(&[u8; 512]) -> u32, u32)] = &[
         (
             "block size",

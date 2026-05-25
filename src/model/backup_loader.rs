@@ -22,6 +22,7 @@ use crate::partition::{self, detect_alignment, PartitionAlignment, PartitionInfo
 
 /// What `load_backup` produced — either a native rusty-backup folder or a
 /// detected Clonezilla image.
+#[allow(clippy::large_enum_variant)] // load happens once per open; outcomes are short-lived
 pub enum LoadOutcome {
     Backup(BackupLoadOutcome),
     Clonezilla(ClonezillaLoadOutcome),

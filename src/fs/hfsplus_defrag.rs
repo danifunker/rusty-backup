@@ -435,15 +435,18 @@ thread_local! {
     /// stderr only as before. Avoids threading a `log_cb` through 8+
     /// signatures while still piping the per-50k-records ticks into the
     /// GUI log queue.
-    static PROGRESS_SINK: std::cell::RefCell<Option<Box<dyn FnMut(&str)>>> =
+    static PROGRESS_SINK: std::cell::RefCell<Option<ProgressSink>> =
         const { std::cell::RefCell::new(None) };
 }
+
+/// Thread-local progress callback used by [`set_progress_sink`].
+pub type ProgressSink = Box<dyn FnMut(&str)>;
 
 /// Install or clear a progress sink for the current thread. Pass `Some(cb)`
 /// to receive log lines (one per 50k catalog inserts during build, plus
 /// phase boundaries); pass `None` to suppress GUI logging and rely on
 /// stderr only. Safe to call from anywhere; the previous value is dropped.
-pub fn set_progress_sink(cb: Option<Box<dyn FnMut(&str)>>) {
+pub fn set_progress_sink(cb: Option<ProgressSink>) {
     PROGRESS_SINK.with(|cell| {
         *cell.borrow_mut() = cb;
     });

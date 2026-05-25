@@ -190,11 +190,12 @@ fn gcd(a: u64, b: u64) -> u64 {
 mod tests {
     use super::*;
 
+    /// (type, start_lba, sectors, start_head, start_sec, start_cyl,
+    /// end_head, end_sec, end_cyl) — test-only MBR entry tuple.
+    type MbrChsEntry = (u8, u32, u32, u8, u8, u16, u8, u8, u16);
+
     /// Build MBR bytes with specific partition start LBAs and CHS values.
-    fn make_mbr_with_chs(
-        entries: &[(u8, u32, u32, u8, u8, u16, u8, u8, u16)],
-        // (type, start_lba, sectors, start_head, start_sec, start_cyl, end_head, end_sec, end_cyl)
-    ) -> [u8; 512] {
+    fn make_mbr_with_chs(entries: &[MbrChsEntry]) -> [u8; 512] {
         let mut data = [0u8; 512];
         data[440..444].copy_from_slice(&0x12345678u32.to_le_bytes());
 

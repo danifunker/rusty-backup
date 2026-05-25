@@ -404,6 +404,7 @@ const CATALOG_FILE_THREAD: i16 = 4;
 
 /// A parsed HFS+ catalog entry.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)] // catalog entries are short-lived per-record buffers; boxing adds heap churn
 enum CatalogEntry {
     Folder {
         folder_id: u32,

@@ -1,3 +1,7 @@
+// Image-format converters legitimately take many parameters
+// (reader, output path, sizes, callbacks, format options).
+#![allow(clippy::too_many_arguments)]
+
 pub mod chd;
 pub mod chd_edit;
 pub mod chd_options;

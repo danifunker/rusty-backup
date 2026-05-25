@@ -1,3 +1,7 @@
+// SFS ops take many parameters by nature (partition_offset, block_size,
+// bitmap chain state, log/cancel callbacks).
+#![allow(clippy::too_many_arguments)]
+
 //! Smart File System (SFS) reader.
 //!
 //! Phase 7 scope: **read-only browse + backup**. Both DosType variants

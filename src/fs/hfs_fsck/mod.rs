@@ -704,6 +704,7 @@ mod tests {
     /// Build a minimal catalog B-tree containing a root dir (CNID 2) with
     /// its thread, plus one file record with configurable fields.
     /// Returns (catalog_data, file_cnid).
+    #[allow(clippy::too_many_arguments)] // test helper composes a fixture record with many tunable fields
     fn make_btree_with_file(
         file_cnid: u32,
         data_logical: u32,

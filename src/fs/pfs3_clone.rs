@@ -231,6 +231,7 @@ where
 /// the recursion stack rather than an explicit queue for simplicity;
 /// PFS3 directory trees are wide rather than deep, so stack depth
 /// stays bounded.
+#[allow(clippy::too_many_arguments)] // recursive clone threads source/target/state/callbacks
 fn walk<RS, RT>(
     source: &mut Pfs3Filesystem<RS>,
     target: &mut Pfs3Filesystem<RT>,

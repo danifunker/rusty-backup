@@ -1,3 +1,7 @@
+// PFS3 ops take many parameters by nature (partition_offset, block_size,
+// rovingPointer, bitmap state, log/cancel/progress callbacks).
+#![allow(clippy::too_many_arguments)]
+
 //! Professional File System 3 (PFS3) reader.
 //!
 //! Supports the three DosType identifiers that share the PFS3 on-disk

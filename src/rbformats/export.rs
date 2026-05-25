@@ -1,3 +1,7 @@
+// Export streamers thread reader, partition table, sizes, chunk size, log
+// callback, cancel check, and format-specific options — all required.
+#![allow(clippy::too_many_arguments)]
+
 //! Unified disk image export layer.
 //!
 //! Provides [`ExportFormat`] (VHD, Raw, 2MG) and format-agnostic export

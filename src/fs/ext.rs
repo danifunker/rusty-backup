@@ -1,6 +1,9 @@
-// `+ 0x00 / 1 *` patterns left in for tabular byte-layout readability
-// (matches the row of `+ 0x04`, `+ 0x08`, ... that follows).
-#![allow(clippy::identity_op, clippy::erasing_op)]
+// Lint allowances scoped to this file:
+//  - identity_op/erasing_op: `+ 0x00`, `1 *` etc. kept for tabular byte-layout
+//    readability (matches the `+ 0x04`, `+ 0x08`, ... row that follows).
+//  - too_many_arguments: ext2/3/4 ops legitimately need partition_offset,
+//    block_size, sb fields, log/progress callbacks, cancel checks, etc.
+#![allow(clippy::identity_op, clippy::erasing_op, clippy::too_many_arguments)]
 
 //! ext2/3/4 filesystem browsing and compaction.
 //!

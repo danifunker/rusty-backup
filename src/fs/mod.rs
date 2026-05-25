@@ -819,6 +819,7 @@ pub fn is_expensive_minimum(partition_type: u8, partition_type_string: Option<&s
 ///
 /// `progress` receives short phase strings ("Opening filesystem...",
 /// "Computing last data byte...") so a worker thread can update its status.
+#[allow(clippy::too_many_arguments)] // unified dispatcher takes reader, fs identification, sizing modes, callbacks
 pub fn partition_minimum_size<R: Read + Seek + Send + 'static>(
     reader: R,
     partition_offset: u64,
@@ -1430,6 +1431,7 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
 /// Try to create a compacted reader by APM partition type string.
 /// Returns `Ok(None)` when the type is unsupported, `Ok(Some(...))` on success,
 /// and `Err(msg)` when the type is recognised but the reader constructor fails.
+#[allow(clippy::type_complexity)] // returns Result<Option<(reader, info)>, msg> — the nested optionality is load-bearing
 fn compact_partition_reader_by_string<R: Read + Seek + Send + 'static>(
     mut reader: R,
     partition_offset: u64,

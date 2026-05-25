@@ -1125,6 +1125,7 @@ where
 ///
 /// `parent_chain` is the chain of (node_idx, parent_of_node_idx) from root to the
 /// index node. We need this to find the grandparent when the index node itself splits.
+#[allow(clippy::too_many_arguments)] // B-tree index insert threads tree state + cmp + parent_chain
 pub fn btree_insert_into_index<F>(
     catalog_data: &mut [u8],
     node_size: usize,
@@ -1385,6 +1386,7 @@ pub fn btree_grow_root(
 ///
 /// Also returns the parent chain for use in insertion: Vec<(node_idx, parent_idx)>.
 #[allow(dead_code)]
+#[allow(clippy::type_complexity)] // returns (find_result, parent_chain) tuples — flattening would obscure intent
 pub fn btree_find_record<K, C>(
     catalog_data: &[u8],
     header: &BTreeHeader,

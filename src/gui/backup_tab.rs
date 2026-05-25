@@ -1058,6 +1058,7 @@ impl BackupTab {
     /// manually to override the default — e.g. to squeeze the backup onto
     /// a slightly-smaller destination disk when the auto threshold didn't
     /// fire.
+    #[allow(clippy::too_many_arguments)] // post-walk bookkeeping needs all the per-partition results
     fn record_min_size_result(
         &mut self,
         idx: usize,

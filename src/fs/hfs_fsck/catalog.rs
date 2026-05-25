@@ -145,6 +145,7 @@ pub(super) fn check_directory_structure(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // catalog walk needs MDB, btree data, extents, bitmap, error sinks
 pub(super) fn check_catalog_consistency(
     mdb: &HfsMasterDirectoryBlock,
     catalog_data: &[u8],

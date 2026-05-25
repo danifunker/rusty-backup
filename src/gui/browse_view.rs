@@ -1,3 +1,7 @@
+// Browse-view filesystem-open helpers thread filesystem type, partition
+// info, reader, ctx, logging, etc. — multi-arg by design.
+#![allow(clippy::too_many_arguments)]
+
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Write};

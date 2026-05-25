@@ -1,3 +1,7 @@
+// CHD compressors take input/output paths, hunk size, profile,
+// chdman options, log/progress/cancel callbacks — all required.
+#![allow(clippy::too_many_arguments)]
+
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;

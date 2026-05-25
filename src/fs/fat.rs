@@ -1,3 +1,8 @@
+// FAT12/16/32 ops take many parameters by nature (partition_offset,
+// bytes_per_sector, sectors_per_cluster, FAT count, BPB fields, log
+// callbacks, cancel checks).
+#![allow(clippy::too_many_arguments)]
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 

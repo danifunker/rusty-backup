@@ -4326,6 +4326,7 @@ impl InspectTab {
     /// background thread to build the seekable cache.  When the background
     /// build completes, `poll_cache_status` will upgrade the browser
     /// automatically.
+    #[allow(clippy::too_many_arguments)] // open-by-zstd threads partition info, paths, ctx
     fn open_browse_zstd(
         &mut self,
         part_index: usize,
