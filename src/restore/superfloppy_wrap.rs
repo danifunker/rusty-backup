@@ -373,7 +373,7 @@ fn synth_disk_signature(params: &WrapParams) -> u32 {
         .wrapping_mul(0x6C62_272E_07BB_0142);
     h ^= params.target_size_bytes.wrapping_mul(0x517C_C1B7_2722_0A95);
     for b in params.source_fs_hint.as_bytes() {
-        h = h.wrapping_mul(0x1000_0000_1B3).wrapping_add(*b as u64);
+        h = h.wrapping_mul(0x0100_0000_01B3).wrapping_add(*b as u64);
     }
     (h as u32) | 1
 }

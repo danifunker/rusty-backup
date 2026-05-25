@@ -995,7 +995,7 @@ mod tests {
         let sectors = [[0u8; 256]; 16];
         let (track, bit_count) = generate_track_525(DEFAULT_VOLUME_525, 0, &sectors);
         assert_eq!(bit_count, 50_464);
-        assert_eq!(track.len(), (50_464 + 7) / 8);
+        assert_eq!(track.len(), 50_464_usize.div_ceil(8));
     }
 
     fn make_pattern_sectors_35(count: usize, salt: u8) -> Vec<Option<[u8; 512]>> {

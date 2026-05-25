@@ -1051,8 +1051,8 @@ impl BackupTab {
 
     /// Common post-min-size-walk bookkeeping shared between the auto-load
     /// path (`load_partitions`) and the worker-poll path. Stores in-place
-    /// + defrag floors, fragmentation %, and auto-checks the Compact Space
-    /// toggle when compacting would save at least
+    /// plus defrag floors, fragmentation %, and auto-checks the Compact
+    /// Space toggle when compacting would save at least
     /// [`Self::COMPACT_AUTOCHECK_SAVINGS_PCT`] of the in-place trim size on
     /// a clone-capable filesystem. The user can still toggle the box
     /// manually to override the default — e.g. to squeeze the backup onto

@@ -840,7 +840,7 @@ impl BrowseView {
 
         // Two-panel layout: tree | content
         let available = ui.available_size();
-        let tree_width = (available.x * 0.4).max(200.0).min(400.0);
+        let tree_width = (available.x * 0.4).clamp(200.0, 400.0);
         let panel_height = available.y;
 
         ui.horizontal(|ui| {

@@ -243,7 +243,7 @@ mod tests {
         let path = b"/Volumes/MyDisk/Apps/MyApp.app";
         tags.extend_from_slice(&(path.len() as u16).to_be_bytes());
         tags.extend_from_slice(path);
-        if path.len() % 2 != 0 {
+        if !path.len().is_multiple_of(2) {
             tags.push(0);
         }
         tags.extend_from_slice(&0xFFFFu16.to_be_bytes());

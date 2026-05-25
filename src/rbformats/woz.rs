@@ -355,6 +355,7 @@ fn find_data_prologue(stream: &mut BitStream) -> bool {
 /// The disk stores 342 nibbles:
 /// - First 86 nibbles: auxiliary buffer (low 2 bits of bytes 0-255, packed 3 per nibble)
 /// - Next 256 nibbles: primary buffer (high 6 bits of bytes 0-255)
+///
 /// Then 1 checksum nibble.
 ///
 /// Each nibble is XOR'd with the previous to form a running checksum.
@@ -499,8 +500,8 @@ fn sectors_for_track(track: usize) -> usize {
 /// Total sectors on one side of an 80-track 3.5" disk.
 const TOTAL_SECTORS_35: usize = 800; // 12*16 + 11*16 + 10*16 + 9*16 + 8*16
 
-/// 3.5" GCR decode table — same as 5.25" (6-and-2 encoding).
-/// The nibble encoding is identical; what differs is the sector format.
+// 3.5" GCR decode table — same as 5.25" (6-and-2 encoding).
+// The nibble encoding is identical; what differs is the sector format.
 
 /// Find a 3.5" address field.
 /// 3.5" address fields use prologue D5 AA 96, same as 5.25" but with different

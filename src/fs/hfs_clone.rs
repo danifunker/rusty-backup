@@ -1075,7 +1075,7 @@ mod tests {
         backing
     }
 
-    fn find_child<'a, R: Read + Seek + Send>(
+    fn find_child<R: Read + Seek + Send>(
         fs: &mut HfsFilesystem<R>,
         parent: &FileEntry,
         name: &str,

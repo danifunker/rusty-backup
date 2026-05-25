@@ -1238,11 +1238,8 @@ impl<R: Read + Write + Seek> FatFilesystem<R> {
 
                     // Append to the chain
                     let mut last = start_cluster;
-                    loop {
-                        match self.next_cluster(last)? {
-                            Some(next) => last = next,
-                            None => break,
-                        }
+                    while let Some(next) = self.next_cluster(last)? {
+                        last = next;
                     }
                     self.write_fat_entry_disk(last, new_cluster)?;
 
@@ -3015,11 +3012,7 @@ pub fn set_fat_clean_flags(
             .saturating_sub(num_fats * spf16 as u32)
             .saturating_sub(root_dir_sectors);
         let sectors_per_cluster = bpb[13] as u32;
-        let cluster_count = if sectors_per_cluster > 0 {
-            data_sectors / sectors_per_cluster
-        } else {
-            0
-        };
+        let cluster_count = data_sectors.checked_div(sectors_per_cluster).unwrap_or(0);
         if cluster_count < 4085 {
             12
         } else {
@@ -3887,6 +3880,8 @@ mod tests {
         // Date: day=29, month=1, year=2026-1980=46
         let date = 29 | (1 << 5) | (46 << 9);
         // Time: second=0, minute=30, hour=14
+        // (intentional `0 |` keeps the bit-packed columns aligned)
+        #[allow(clippy::identity_op, clippy::erasing_op)]
         let time = 0 | (30 << 5) | (14 << 11);
         assert_eq!(format_fat_datetime(date, time), "2026-01-29 14:30:00");
     }
@@ -3907,8 +3902,7 @@ mod tests {
         let root_entry_count: u16 = 16;
         let total_sectors: u16 = 128;
         // FAT16 with 120 data clusters (needs sectors_per_fat to cover them)
-        let root_dir_sectors = ((root_entry_count as u64 * 32) + (bytes_per_sector as u64 - 1))
-            / bytes_per_sector as u64;
+        let root_dir_sectors = (root_entry_count as u64 * 32).div_ceil(bytes_per_sector as u64);
         let _data_start = reserved_sectors as u64 + root_dir_sectors;
         // We need FAT to cover at least total_sectors entries × 2 bytes
         let sectors_per_fat: u16 = 1;

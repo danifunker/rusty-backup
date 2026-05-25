@@ -3755,6 +3755,7 @@ pub fn validate_hfs_integrity(
 }
 
 #[cfg(test)]
+#[allow(clippy::identity_op)] // `1 * 1024 * 1024` reads as "1 MB" in size tables
 mod tests {
     use super::*;
     use std::io::Cursor;

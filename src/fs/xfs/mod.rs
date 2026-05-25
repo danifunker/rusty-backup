@@ -1535,23 +1535,20 @@ mod tests {
         let mut fs = XfsFilesystem::open(Cursor::new(img), 0).expect("open xfs");
         assert_eq!(fs.dir_format, DirFormat::Dir1);
         let root = fs.root().expect("root");
-        match fs.list_directory(&root) {
-            // Either we successfully (mis-)parse some entries — those will
-            // have invalid inumbers and child_entry() will surface fallback
-            // placeholders — or we hit a Parse error. Either is acceptable
-            // proof that the dir1 path executed. What must NOT happen is
-            // dir2 succeeding silently against dir1 bytes.
-            Ok(entries) => {
-                // The (mis-)parse will yield entries whose names are not the
-                // expected fixture names — verify we didn't accidentally
-                // produce the dir2 result set.
-                let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-                assert!(
-                    !names.contains(&"hello.txt"),
-                    "dir1 dispatch unexpectedly produced dir2 names: {names:?}"
-                );
-            }
-            Err(_) => {}
+        // Either we successfully (mis-)parse some entries — those will
+        // have invalid inumbers and child_entry() will surface fallback
+        // placeholders — or we hit a Parse error. Either is acceptable
+        // proof that the dir1 path executed. What must NOT happen is
+        // dir2 succeeding silently against dir1 bytes.
+        if let Ok(entries) = fs.list_directory(&root) {
+            // The (mis-)parse will yield entries whose names are not the
+            // expected fixture names — verify we didn't accidentally
+            // produce the dir2 result set.
+            let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+            assert!(
+                !names.contains(&"hello.txt"),
+                "dir1 dispatch unexpectedly produced dir2 names: {names:?}"
+            );
         }
     }
 }

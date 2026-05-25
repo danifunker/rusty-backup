@@ -4331,8 +4331,8 @@ impl InspectTab {
         part_index: usize,
         ptype: u8,
         partition_type_string: Option<String>,
-        data_path: &PathBuf,
-        folder: &PathBuf,
+        data_path: &Path,
+        folder: &Path,
         cache_name: &str,
         ctx: &mut TabContext,
     ) {
@@ -4363,8 +4363,11 @@ impl InspectTab {
             "Opening partition {} via streaming reader (seekable cache building in background)...",
             part_index,
         ));
-        self.browse_view
-            .open_streaming(data_path.clone(), ptype, partition_type_string.clone());
+        self.browse_view.open_streaming(
+            data_path.to_path_buf(),
+            ptype,
+            partition_type_string.clone(),
+        );
 
         // 4. Start background thread to build seekable cache
         let cache_path = folder.join(format!("_{cache_name}.seekable.zst"));
@@ -4386,7 +4389,7 @@ impl InspectTab {
         self.cache_status = Some(Arc::clone(&status));
         self.cache_rate.reset();
 
-        let data_path = data_path.clone();
+        let data_path = data_path.to_path_buf();
         std::thread::spawn(move || {
             let _wake =
                 rusty_backup::os::wakelock::acquire("Rusty Backup: build zstd seekable cache");

@@ -2362,7 +2362,7 @@ mod tests {
         // later slices will derive the effective location when 0.
         if sb.bmblock != 0 {
             assert!(
-                (sb.bmblock as u32) < sb.fs_size,
+                sb.bmblock < sb.fs_size,
                 "bmblock {} not inside volume of {} blocks",
                 sb.bmblock,
                 sb.fs_size

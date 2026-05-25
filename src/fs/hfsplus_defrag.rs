@@ -71,6 +71,7 @@ fn catalog_record_cost(name_utf16_len: usize, body_bytes: usize) -> usize {
 ///   - file record + file thread per file (incl. inodes)
 ///   - hardlink-stub record + thread per file hardlink and dir hardlink
 ///   - header + map placeholder + ~5% index overhead
+///
 /// The caller multiplies by [`CATALOG_PACKING_OVERHEAD_NUM`] /
 /// [`CATALOG_PACKING_OVERHEAP_DEN`] to absorb split-induced fragmentation.
 fn estimate_catalog_bytes(snapshot: &SourceCatalogSnapshot) -> u64 {
@@ -2039,11 +2040,11 @@ mod tests {
         assert!(names.contains(&"b.txt"), "b.txt missing: {names:?}");
     }
 
-    /// Build a source with one file inode + 3 hardlink stub rows. Plan
-    /// + build target metadata, stitch into a target image, open as
-    /// HfsPlusFilesystem, walk the catalog. All 3 stubs and the inode
-    /// row must be present; the inode's bsdInfo.special (link count)
-    /// must equal 3.
+    /// Build a source with one file inode plus 3 hardlink stub rows.
+    /// Plan and build target metadata, stitch into a target image,
+    /// open as `HfsPlusFilesystem`, walk the catalog. All 3 stubs and
+    /// the inode row must be present; the inode's `bsdInfo.special`
+    /// (link count) must equal 3.
     #[test]
     fn build_metadata_emits_file_hardlinks_with_link_count() {
         const PAYLOAD: &[u8] = b"shared\n";
@@ -2576,14 +2577,15 @@ mod tests {
     /// Step 22e — full end-to-end engine fixture. Build a synthetic HFS+
     /// source that exercises the clone-relevant features the blank
     /// builder can seed: a nested directory tree, a file with both data
-    /// + resource forks, and a file hardlink pair. Stream into a
+    /// and resource forks, and a file hardlink pair. Stream into a
     /// `Vec<u8>`, reopen as `HfsPlusFilesystem`, walk the catalog, and
-    /// verify byte-equal data forks + resource fork, preserved hardlink
-    /// topology (both link rows resolve to identical bytes), and `fsck`
-    /// clean on the target. Xattr emit is exercised separately by
-    /// `build_metadata_emits_inline_xattr` — `create_blank_hfsplus`
-    /// doesn't seed an attributes B-tree, so live `set_xattr` against
-    /// the blank source is a separate plumbing step.
+    /// verify byte-equal data forks and resource fork, preserved
+    /// hardlink topology (both link rows resolve to identical bytes),
+    /// and `fsck` clean on the target. Xattr emit is exercised
+    /// separately by `build_metadata_emits_inline_xattr` —
+    /// `create_blank_hfsplus` doesn't seed an attributes B-tree, so
+    /// live `set_xattr` against the blank source is a separate plumbing
+    /// step.
     #[test]
     fn stream_emit_round_trips_full_fixture() {
         use super::super::filesystem::ResourceForkSource;

@@ -2384,7 +2384,9 @@ fn test_rdb_multi_partition_shrink_auto_packs() {
         p
     };
     // P0 PART at block 1, points to P1 PART at block 2.
-    disk[1 * BSIZE..2 * BSIZE].copy_from_slice(&mk_part(2, b"DH0", p0_low, p0_high, 0x444F5301));
+    #[allow(clippy::identity_op)] // `1 * BSIZE` mirrors the block-1 prose comment
+    let p0_off = 1 * BSIZE;
+    disk[p0_off..2 * BSIZE].copy_from_slice(&mk_part(2, b"DH0", p0_low, p0_high, 0x444F5301));
     disk[2 * BSIZE..3 * BSIZE]
         .copy_from_slice(&mk_part(0xFFFFFFFF, b"DH1", p1_low, p1_high, 0x444F5301));
 

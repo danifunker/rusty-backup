@@ -58,7 +58,7 @@ impl ChdOptionsControl {
     /// always valid by construction; only Custom can be misaligned.
     pub fn is_valid(&self, profile: ChdProfile) -> bool {
         let opts = self.effective(profile);
-        opts.hunk_size % unit_size_for(profile) == 0
+        opts.hunk_size.is_multiple_of(unit_size_for(profile))
     }
 }
 
@@ -158,7 +158,7 @@ pub fn show(
                     }
                 });
             ui.label(format!("(unit {unit} bytes)"));
-            if opts.hunk_size % unit != 0 {
+            if !opts.hunk_size.is_multiple_of(unit) {
                 ui.colored_label(
                     egui::Color32::from_rgb(220, 80, 80),
                     format!("hunk must be a multiple of {unit}"),

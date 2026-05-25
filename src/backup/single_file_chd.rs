@@ -2405,7 +2405,7 @@ mod tests {
 
         // FAT (1 sector at offset 512). FAT12 entries 0+1 are reserved
         // (0xFF8 + 0xFFF), entry 2 = EOF (0xFFF), entries 3..N = 0 (free).
-        let fat = 1 * BYTES_PER_SECTOR;
+        let fat = BYTES_PER_SECTOR;
         // FAT12 packing: entries 0,1 share 3 bytes.
         img[fat] = 0xF8;
         img[fat + 1] = 0xFF;
@@ -2561,7 +2561,7 @@ mod tests {
         // the zero-tail assertion above is meaningful.
         let src_free = &data[512 + 4 * 512..512 + (PART_SECTORS as usize) * 512];
         assert!(
-            src_free.iter().any(|b| *b == 0xAB),
+            src_free.contains(&0xAB),
             "test setup failed — source free region must contain garbage",
         );
     }
