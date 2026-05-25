@@ -440,7 +440,7 @@ impl CatalogWalk {
                 }
                 let cnid = BigEndian::read_u32(&body[8..12]);
                 let valence = BigEndian::read_u32(&body[4..8]);
-                if !self.seen_cnids.insert(cnid, ()).is_none() {
+                if self.seen_cnids.insert(cnid, ()).is_some() {
                     self.duplicate_cnids.insert(cnid);
                 }
                 self.record_key_seen(key_parent_cnid, name_bytes, &name, cnid);
@@ -461,7 +461,7 @@ impl CatalogWalk {
                     return;
                 }
                 let cnid = BigEndian::read_u32(&body[8..12]);
-                if !self.seen_cnids.insert(cnid, ()).is_none() {
+                if self.seen_cnids.insert(cnid, ()).is_some() {
                     self.duplicate_cnids.insert(cnid);
                 }
                 self.record_key_seen(key_parent_cnid, name_bytes, &name, cnid);

@@ -319,9 +319,9 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
             }
 
             match entry_type {
-                ENTRY_TYPE_ALLOCATION_BITMAP => {
+                ENTRY_TYPE_ALLOCATION_BITMAP
                     // Bitmap entry: start cluster at offset 20 (u32), data length at offset 24 (u64)
-                    if pos + 32 <= root_data.len() {
+                    if pos + 32 <= root_data.len() => {
                         self.bitmap_start_cluster = u32::from_le_bytes([
                             root_data[pos + 20],
                             root_data[pos + 21],
@@ -339,7 +339,6 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
                             root_data[pos + 31],
                         ]);
                     }
-                }
                 ENTRY_TYPE_VOLUME_LABEL => {
                     // Volume label entry: character count at offset 1, name at offset 2 (UTF-16LE)
                     let char_count = root_data[pos + 1] as usize;

@@ -731,7 +731,7 @@ pub fn build_target_metadata(
                 queue.push_back(d.cnid);
 
                 insert_count += 2;
-                if insert_count % tick == 0 {
+                if insert_count.is_multiple_of(tick) {
                     log_progress(insert_count, "dirs", &mut last_tick);
                 }
             }
@@ -780,7 +780,7 @@ pub fn build_target_metadata(
         *child_count.entry(target_parent).or_default() += 1;
 
         insert_count += 2;
-        if insert_count % tick == 0 {
+        if insert_count.is_multiple_of(tick) {
             log_progress(insert_count, "files", &mut last_tick);
         }
     }
@@ -1314,7 +1314,7 @@ fn zero_fill<W: Write>(writer: &mut W, n: u64) -> std::io::Result<()> {
     if n == 0 {
         return Ok(());
     }
-    const BUF: [u8; 65536] = [0u8; 65536];
+    static BUF: [u8; 65536] = [0u8; 65536];
     let mut left = n;
     while left > 0 {
         let chunk = left.min(BUF.len() as u64) as usize;
@@ -1338,7 +1338,7 @@ fn missing_cnid(kind: &str, cnid: u32) -> FilesystemError {
 /// node + one empty leaf node. The remaining nodes are free.
 fn init_btree_buffer(total_bytes: usize, max_key_len: u16, key_compare_type: u8) -> Vec<u8> {
     assert!(
-        total_bytes % NODE_SIZE == 0,
+        total_bytes.is_multiple_of(NODE_SIZE),
         "btree size must be node-aligned"
     );
     let total_nodes = (total_bytes / NODE_SIZE) as u32;

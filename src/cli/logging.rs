@@ -88,7 +88,7 @@ pub enum ColorMode {
 /// directly — this lets [`install`] fall back to the config file's
 /// `[defaults]` section when the user didn't pass the flag. CLI > config
 /// > built-in default.
-#[derive(Debug, Clone, clap::Args)]
+#[derive(Debug, Clone, clap::Args, Default)]
 pub struct GlobalFlags {
     /// Diagnostic verbosity for stderr logs.
     /// Falls back to `[defaults] log-level` from the config; built-in default `warn`.
@@ -119,19 +119,6 @@ pub struct GlobalFlags {
     /// See `rb-cli config path` for what that location is.
     #[arg(long, global = true)]
     pub config: Option<std::path::PathBuf>,
-}
-
-impl Default for GlobalFlags {
-    fn default() -> Self {
-        Self {
-            log_level: None,
-            quiet: false,
-            progress: None,
-            color: None,
-            log_file: None,
-            config: None,
-        }
-    }
 }
 
 /// Effective runtime configuration after parsing flags and inspecting

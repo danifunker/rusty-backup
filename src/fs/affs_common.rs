@@ -128,7 +128,7 @@ pub fn name_hash(name: &[u8], intl: bool) -> u32 {
 }
 
 fn ascii_upper(b: u8) -> u8 {
-    if (b'a'..=b'z').contains(&b) {
+    if b.is_ascii_lowercase() {
         b - 0x20
     } else {
         b
@@ -136,7 +136,7 @@ fn ascii_upper(b: u8) -> u8 {
 }
 
 fn intl_upper(b: u8) -> u8 {
-    if (b'a'..=b'z').contains(&b) {
+    if b.is_ascii_lowercase() {
         return b - 0x20;
     }
     // ISO-8859-1 letters 0xE0..=0xFE except multiplication sign 0xF7.

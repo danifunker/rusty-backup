@@ -77,7 +77,7 @@ impl VmdkSparseHeader {
             bail!("VMDK sparse: bad magic (not `KDMV`)");
         }
         let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        if !matches!(version, 1 | 2 | 3) {
+        if !matches!(version, 1..=3) {
             bail!("VMDK sparse: unsupported header version {version}");
         }
         let flags = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
@@ -688,9 +688,7 @@ pub fn export_vmdk_sparse(
     let gt_pad_bytes = (gt_sectors_per_gt * VMDK_SECTOR) as usize;
     let mut gt_buf = vec![0u8; gt_pad_bytes];
     for (i, gt) in gts.iter().enumerate() {
-        for b in &mut gt_buf {
-            *b = 0;
-        }
+        gt_buf.fill(0);
         for (j, entry) in gt.iter().enumerate() {
             let off = j * 4;
             gt_buf[off..off + 4].copy_from_slice(&entry.to_le_bytes());

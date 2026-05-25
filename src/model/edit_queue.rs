@@ -346,10 +346,10 @@ impl EditQueue {
             match edit {
                 StagedEdit::AddFile { size, .. } => delta.added += size,
                 StagedEdit::DeleteEntry { entry, .. }
-                | StagedEdit::DeleteRecursive { entry, .. } => {
-                    if !entry.is_directory() {
-                        delta.freed += entry.size;
-                    }
+                | StagedEdit::DeleteRecursive { entry, .. }
+                    if !entry.is_directory() =>
+                {
+                    delta.freed += entry.size;
                 }
                 _ => {}
             }

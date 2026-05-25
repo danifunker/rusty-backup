@@ -623,7 +623,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         }
         // Final tail of holes past the last extent up to di_size (if any).
         if (out.len() as u64) < want64 {
-            out.resize(want as usize, 0);
+            out.resize(want, 0);
         }
         Ok(out)
     }

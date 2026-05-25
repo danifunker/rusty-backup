@@ -740,7 +740,7 @@ pub fn export_qcow2(
         if !is_zero_unit(&buf[..to_read]) {
             let l1_idx = (guest_idx / entries_per_l2) as u32;
             let l2_idx = (guest_idx % entries_per_l2) as usize;
-            if !l2_tables.contains_key(&l1_idx) {
+            if let std::collections::btree_map::Entry::Vacant(e) = l2_tables.entry(l1_idx) {
                 // Allocate a fresh L2 table cluster, zero it on disk so unset
                 // slots read as 0, and point L1 at it.
                 let l2_off = alloc.alloc();
@@ -748,7 +748,7 @@ pub fn export_qcow2(
                 out.write_all(&zero_cluster)
                     .context("failed to zero-fill new L2 cluster")?;
                 l1[l1_idx as usize] = l2_off | QCOW2_FLAG_COPIED;
-                l2_tables.insert(l1_idx, (l2_off, vec![0u64; entries_per_l2 as usize]));
+                e.insert((l2_off, vec![0u64; entries_per_l2 as usize]));
             }
             let data_off = alloc.alloc();
             out.seek(SeekFrom::Start(data_off))?;

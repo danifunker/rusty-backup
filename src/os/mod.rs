@@ -91,7 +91,7 @@ impl<R: Read + Seek> Read for SectorAlignedReader<R> {
         // bounce buffer that would otherwise turn a single large read_exact
         // (e.g. HFS+ catalog at ~200 MB) into hundreds of thousands of
         // per-sector syscalls on `/dev/rdisk*`.
-        if self.pos % SECTOR_SIZE as u64 == 0 && out.len() >= SECTOR_SIZE {
+        if self.pos.is_multiple_of(SECTOR_SIZE as u64) && out.len() >= SECTOR_SIZE {
             let aligned_len = out.len() - (out.len() % SECTOR_SIZE);
             self.inner.seek(SeekFrom::Start(self.pos))?;
             let n = self.inner.read(&mut out[..aligned_len])?;

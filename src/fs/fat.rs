@@ -3623,8 +3623,7 @@ pub fn create_blank_fat(size_bytes: u64, label: Option<&str>) -> Result<Vec<u8>>
         FatType::Fat32 => (32, 1, 6),
     };
     let num_fats: u8 = 2;
-    let root_dir_sectors =
-        ((root_entry_count as u32 * 32) + (BYTES_PER_SECTOR - 1)) / BYTES_PER_SECTOR;
+    let root_dir_sectors = (root_entry_count as u32 * 32).div_ceil(BYTES_PER_SECTOR);
 
     // Iterate sectors_per_fat until it covers the cluster count it itself enables.
     // FAT32's root directory occupies one cluster inside the data region (not
@@ -3641,7 +3640,7 @@ pub fn create_blank_fat(size_bytes: u64, label: Option<&str>) -> Result<Vec<u8>>
         let data_sectors = total_sectors - data_start;
         let total_clusters = data_sectors / sectors_per_cluster;
         let fat_bytes_needed = match fat_type {
-            FatType::Fat12 => (((total_clusters + 2) as u64 * 3 + 1) / 2) as u32,
+            FatType::Fat12 => ((total_clusters + 2) as u64 * 3).div_ceil(2) as u32,
             FatType::Fat16 => (total_clusters + 2) * 2,
             FatType::Fat32 => (total_clusters + 2) * 4,
         };

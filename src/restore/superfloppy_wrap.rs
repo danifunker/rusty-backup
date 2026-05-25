@@ -110,7 +110,7 @@ where
             source_size
         );
     }
-    if params.partition_size_bytes % SECTOR_SIZE != 0 {
+    if !params.partition_size_bytes.is_multiple_of(SECTOR_SIZE) {
         bail!(
             "partition size {} bytes is not a multiple of the sector size",
             params.partition_size_bytes

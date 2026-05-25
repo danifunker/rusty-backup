@@ -687,7 +687,7 @@ impl<R: Read + Seek> AffsFilesystem<R> {
         }
         // AmigaDOS doesn't define a directory order; sort alphabetically for
         // a predictable browse experience.
-        out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        out.sort_by_key(|a| a.name.to_lowercase());
         Ok(out)
     }
 
@@ -819,7 +819,7 @@ impl<R: Read + Seek> AffsFilesystem<R> {
     /// Used by the fsck rebuild to ensure bitmap blocks remain marked
     /// allocated even though they're never reached via directory walks.
     pub fn bitmap_page_owns_block(&self, block: u32) -> bool {
-        self.bitmap_pages.iter().any(|&b| b == block)
+        self.bitmap_pages.contains(&block)
     }
 
     /// Public accessor — same semantics as the private `block_is_allocated`.
@@ -1100,7 +1100,7 @@ impl<R: Read + Seek + Send> Filesystem for AffsFilesystem<R> {
                 "AFFS name cannot be empty".into(),
             ));
         }
-        if name.as_bytes().len() > MAX_NAME_LEN {
+        if name.len() > MAX_NAME_LEN {
             return Err(FilesystemError::InvalidData(format!(
                 "AFFS name '{name}' exceeds {MAX_NAME_LEN} bytes (Long Names not yet supported for write)"
             )));
@@ -1500,7 +1500,7 @@ fn names_equal(a: &str, b: &str, intl: bool) -> bool {
 }
 
 fn fold(b: u8, intl: bool) -> u8 {
-    if (b'a'..=b'z').contains(&b) {
+    if b.is_ascii_lowercase() {
         return b - 0x20;
     }
     if intl && (0xE0..=0xFE).contains(&b) && b != 0xF7 {
@@ -1851,7 +1851,7 @@ pub fn resize_affs_in_place(
     let mut new_bm = vec![0xFFu8; new_bitmap_bytes];
     // Trim padding bits past `new_bits` so they don't leak into the
     // written bitmap pages.
-    if new_bits % 8 != 0 {
+    if !new_bits.is_multiple_of(8) {
         let mask = (1u8 << (new_bits % 8)) - 1;
         if let Some(last) = new_bm.last_mut() {
             *last &= mask;
@@ -1911,7 +1911,7 @@ pub fn resize_affs_in_place(
                 // Set bit if `clear_bit` did NOT clear it (i.e. block is free).
                 let byte = (global_bit / 8) as usize;
                 let off = (global_bit % 8) as u8;
-                let is_free = new_bm.get(byte).map_or(false, |b| (b >> off) & 1 == 1);
+                let is_free = new_bm.get(byte).is_some_and(|b| (b >> off) & 1 == 1);
                 if is_free {
                     word |= 1u32 << bit_in_word;
                 }
@@ -2043,7 +2043,7 @@ fn affs_bm_pages_needed(total: u32) -> usize {
     if bits == 0 {
         return 1;
     }
-    ((bits + AFFS_BITS_PER_BM_PAGE as u64 - 1) / AFFS_BITS_PER_BM_PAGE as u64) as usize
+    bits.div_ceil(AFFS_BITS_PER_BM_PAGE as u64) as usize
 }
 
 /// Build a freshly-formatted AFFS (Amiga Fast File System) volume in memory.
@@ -2070,7 +2070,7 @@ pub fn create_blank_affs(
             "AFFS volume must be at least 32 KiB, got {size_bytes}"
         ));
     }
-    if size_bytes % BSIZE_U64 != 0 {
+    if !size_bytes.is_multiple_of(BSIZE_U64) {
         return Err(anyhow::anyhow!(
             "AFFS volume size must be a multiple of 512, got {size_bytes}"
         ));

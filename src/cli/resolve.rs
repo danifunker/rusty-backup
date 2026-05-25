@@ -138,8 +138,7 @@ fn pick_default_partition(partitions: &[PartitionInfo]) -> Result<PartitionInfo>
         _ => {
             let summary: Vec<String> = candidates
                 .iter()
-                .enumerate()
-                .map(|(_, p)| {
+                .map(|p| {
                     format!(
                         "  {}  {}  ({})",
                         p.index, p.type_name, p.partition_type_byte

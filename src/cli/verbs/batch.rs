@@ -602,7 +602,7 @@ fn fat_type_byte_for(size_bytes: u64) -> u8 {
 /// to the partition start LBA so DOS-era tools see consistent geometry.
 fn wrap_in_single_partition_mbr(fs_bytes: &[u8], type_byte: u8) -> Result<Vec<u8>> {
     const ALIGN_SECTORS: u32 = 2048; // 1 MiB at 512-byte sectors
-    let fs_sectors = (fs_bytes.len() + 511) / 512;
+    let fs_sectors = fs_bytes.len().div_ceil(512);
     if fs_sectors as u64 > u32::MAX as u64 - ALIGN_SECTORS as u64 {
         bail!("filesystem too large for an MBR wrapper");
     }
@@ -655,7 +655,7 @@ fn apply_disk_block(path: &std::path::Path, disk: &DiskBlock) -> Result<()> {
             .with_context(|| format!("parsing disk.partitions[].size {:?}", p.size))?;
         let name = p.name.as_deref().unwrap_or("rusty-backup");
         let fs_bytes = build_blank_fs(&p.fs, size, name, p.block_size, p.affs_variant)?;
-        let fs_sectors_u64 = (fs_bytes.len() as u64 + 511) / 512;
+        let fs_sectors_u64 = (fs_bytes.len() as u64).div_ceil(512);
         if fs_sectors_u64 > u32::MAX as u64 {
             bail!("partition too large for 32-bit LBA");
         }
@@ -677,7 +677,7 @@ fn apply_disk_block(path: &std::path::Path, disk: &DiskBlock) -> Result<()> {
             .checked_add(fs_sectors)
             .ok_or_else(|| anyhow!("partition layout overflowed u32 LBA"))?;
         // 1-MiB alignment between partitions.
-        cursor_lba = (cursor_lba + ALIGN_SECTORS - 1) / ALIGN_SECTORS * ALIGN_SECTORS;
+        cursor_lba = cursor_lba.div_ceil(ALIGN_SECTORS) * ALIGN_SECTORS;
     }
 
     let total_sectors = cursor_lba;

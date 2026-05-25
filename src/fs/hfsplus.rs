@@ -2710,7 +2710,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
             }
         }
 
-        entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        entries.sort_by_key(|a| a.name.to_lowercase());
         Ok(entries)
     }
 
@@ -4910,7 +4910,7 @@ fn build_blank_hfsplus_front(
     let btree_blocks: u32 = btree_node_count * blocks_per_node;
 
     let bitmap_bytes = total_blocks.div_ceil(8) as u64;
-    let bitmap_blocks = ((bitmap_bytes + bs - 1) / bs) as u32;
+    let bitmap_blocks = bitmap_bytes.div_ceil(bs) as u32;
 
     let bitmap_start: u32 = 1;
     let extents_start: u32 = bitmap_start + bitmap_blocks;

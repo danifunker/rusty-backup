@@ -147,7 +147,7 @@ pub fn run(args: PutMacBinaryArgs) -> Result<()> {
         );
     }
     let data_fork = bytes[off..data_end].to_vec();
-    off = off + pad128(hdr.data_length as usize);
+    off += pad128(hdr.data_length as usize);
     let rsrc_end = off + hdr.rsrc_length as usize;
     if rsrc_end > bytes.len() {
         bail!(

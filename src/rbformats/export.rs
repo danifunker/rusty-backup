@@ -1182,8 +1182,8 @@ pub fn export_whole_disk_chd(
             // Reuse the detector but reset the reader afterwards.
             let mut probe_file = File::open(source_path)
                 .with_context(|| format!("reopen {} for RDB probe", source_path.display()))?;
-            let detected = super::detect_raw_rdb(&mut probe_file).is_some();
-            detected
+
+            super::detect_raw_rdb(&mut probe_file).is_some()
         };
 
     // compress_chd writes "<base>.chd" — strip the trailing extension from

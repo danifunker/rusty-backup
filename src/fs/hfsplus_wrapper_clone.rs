@@ -379,7 +379,7 @@ where
     // (4 KiB). Validate it explicitly so a corrupt source surfaces here
     // instead of mid-stream.
     let inner_bs = inner_fs.block_size();
-    if plan.new_inner_size % inner_bs as u64 != 0 {
+    if !plan.new_inner_size.is_multiple_of(inner_bs as u64) {
         return Err(WrappedCloneError::InnerOuterBlockMismatch(inner_bs));
     }
 

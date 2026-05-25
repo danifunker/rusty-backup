@@ -1627,7 +1627,7 @@ fn stage_partitions_to_zst(
                     }
                     progress_cb(base_for_progress.saturating_add(n_read).min(total_target))
                 },
-                || cancel_check(),
+                cancel_check,
                 |msg| log_cb(msg),
             );
 
@@ -1760,7 +1760,7 @@ fn stage_partitions_to_zst(
                 false,
                 None,
                 |n_read| progress_cb(base_for_progress.saturating_add(n_read).min(total_target)),
-                || cancel_check(),
+                cancel_check,
                 |msg| log_cb(msg),
             )
             .with_context(|| format!("failed to zstd-stage resized partition-{}", plan.index))?;
@@ -1788,7 +1788,7 @@ fn stage_partitions_to_zst(
                 false,
                 None,
                 |n_read| progress_cb(base_for_progress.saturating_add(n_read).min(total_target)),
-                || cancel_check(),
+                cancel_check,
                 |msg| log_cb(msg),
             )
             .with_context(|| format!("failed to zstd-stage partition-{}", plan.index))?;
