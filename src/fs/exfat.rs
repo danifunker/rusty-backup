@@ -990,8 +990,8 @@ impl<R: Read + Write + Seek> ExfatFilesystem<R> {
 
         while pos + 32 <= dir_data.len() {
             let t = dir_data[pos];
-            if t == 0x00 || (t & 0x80 == 0 && t != 0x00) {
-                // Free or deleted entry
+            if t & 0x80 == 0 {
+                // Free (0x00) or deleted (high bit clear) entry
                 if run_start.is_none() {
                     run_start = Some(pos);
                     run_count = 1;
@@ -1072,11 +1072,8 @@ impl<R: Read + Write + Seek> ExfatFilesystem<R> {
 
             // Append to chain: walk to last cluster
             let mut last = parent_cluster;
-            loop {
-                match self.next_cluster(last)? {
-                    Some(next) => last = next,
-                    None => break,
-                }
+            while let Some(next) = self.next_cluster(last)? {
+                last = next;
             }
             // Link last -> new_cluster
             self.write_fat_entry(last, new_cluster)?;
@@ -2268,7 +2265,7 @@ mod tests {
         // FirstCluster = 2
         image[root_offset + 20..root_offset + 24].copy_from_slice(&2u32.to_le_bytes());
         // DataLength = ceil(cluster_count/8)
-        let bitmap_size = ((cluster_count + 7) / 8) as u64;
+        let bitmap_size = cluster_count.div_ceil(8) as u64;
         image[root_offset + 24..root_offset + 32].copy_from_slice(&bitmap_size.to_le_bytes());
 
         // Volume Label entry (0x83) at offset 32

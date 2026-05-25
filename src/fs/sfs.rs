@@ -995,7 +995,7 @@ impl<R: Read + Seek> CompactSfsReader<R> {
         let blocksize = fs.root.blocksize;
         let bitmap = read_bitmap(&mut fs).unwrap_or_default();
 
-        let total_blocks = (partition_size / blocksize as u64);
+        let total_blocks = partition_size / blocksize as u64;
         let bitmap_bits = (bitmap.len() * 8) as u64;
         let mut free_blocks: u64 = 0;
         for byte in &bitmap {

@@ -1599,7 +1599,7 @@ impl<R: Read + Seek> Pfs3Filesystem<R> {
         let hint_remainder_in_mi = hint_local % bits_per_mi.max(1);
         let hint_i = (hint_remainder_in_mi / sectors_per_bmb.max(1)) as usize;
         let hint_remainder_in_bm = hint_remainder_in_mi % sectors_per_bmb.max(1);
-        let hint_w = (hint_remainder_in_bm / 32);
+        let hint_w = hint_remainder_in_bm / 32;
         let hint_bit = hint_remainder_in_bm % 32;
         // Linear scan to find a run of `count` consecutive free bits.
         let mut run_start: Option<u32> = None;
