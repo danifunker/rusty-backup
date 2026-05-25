@@ -74,6 +74,7 @@ dirs = "6"
 unicode-normalization = "0.1"
 flate2 = "1"
 bzip2 = "0.6"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 base64 = "0.22"
 opticaldiscs = { version = "0.4.2", features = ["drives"] }
 cd-da-reader = { git = "https://github.com/danifunker/rust-cd-da-reader", branch = "add-data-support-0-4-1" }
@@ -161,4 +162,3 @@ openssl = "*"
 # Arch package metadata
 [package.metadata.aur]
 depends = ["gtk3", "openssl"]
-

@@ -63,19 +63,24 @@ fn file_dialog() -> rfd::FileDialog {
     dialog
 }
 
-/// If `path` points at an `.adz` / `.hdz` (gzip-wrapped Amiga image),
-/// decompress it to a temporary `.adf` / `.hdf` next to the system temp
-/// directory and return that path instead. Otherwise return the original
-/// path verbatim.
+/// Materialize compressed-container disk images to a temporary raw file.
 ///
-/// The decompressed file is named `<stem>.adf` (for `.adz`) or
-/// `<stem>.hdf` (for `.hdz`) inside a fresh `tempfile::tempdir` so the
-/// caller can keep the `_guard` alive for the duration of the operation
-/// — once the guard drops, the tempdir is removed. Callers that need the
-/// file to outlive the dialog should hold the `TempDir` (returned as the
-/// second tuple element) until the work is done.
+/// Handles:
+/// - `.adz` → gzip-decompressed `.adf` (Amiga floppy)
+/// - `.hdz` → gzip-decompressed `.hdf` (Amiga hard-disk)
+/// - `.imz` → ZIP-extracted `.ima` (WinImage floppy)
 ///
-/// Returns `Err` if the magic gzip bytes are missing or `flate2` fails.
+/// Anything else passes through unchanged.
+///
+/// The decompressed file lives inside a fresh `tempfile::tempdir`; callers
+/// must hold the returned `TempDir` (second tuple element) for the duration
+/// they need the materialized file. When the guard drops, the tempdir is
+/// removed.
+///
+/// Returns `Err` if the magic bytes are missing or decompression fails.
+///
+/// Name is historical — first added for Amiga `.adz`/`.hdz`; broadened to
+/// also cover WinImage `.imz` (and, planned, GHO / Partimage / TD0/IMD).
 pub fn materialize_amiga_image_path(
     path: &std::path::Path,
 ) -> std::io::Result<(std::path::PathBuf, Option<tempfile::TempDir>)> {
@@ -83,6 +88,15 @@ pub fn materialize_amiga_image_path(
         .extension()
         .and_then(|e| e.to_str())
         .map(|s| s.to_ascii_lowercase());
+
+    // IMZ → ZIP-wrapped floppy image. Delegate to the dedicated reader so
+    // password-protected archives produce the standard error message.
+    if ext.as_deref() == Some("imz") {
+        let mat = rusty_backup::rbformats::imz::materialize_imz_to_temp(path)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        return Ok((mat.temp_path, Some(mat.guard)));
+    }
+
     let target_ext = match ext.as_deref() {
         Some("adz") => "adf",
         Some("hdz") => "hdf",
@@ -157,6 +171,27 @@ mod materialize_tests {
         std::fs::write(&adz, b"not gzip data").unwrap();
         let err = materialize_amiga_image_path(&adz).unwrap_err();
         assert!(err.to_string().contains("gzip magic"));
+    }
+
+    #[test]
+    fn materialize_decompresses_imz() {
+        // Build a minimal IMZ (ZIP wrapping a single .ima entry) and confirm
+        // materialize_amiga_image_path unwraps it via the new IMZ branch.
+        let payload: &[u8] = b"WinImage floppy bytes";
+        let tmp = tempfile::tempdir().unwrap();
+        let imz_path = tmp.path().join("floppy.imz");
+        let f = std::fs::File::create(&imz_path).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        zw.start_file("floppy.ima", opts).unwrap();
+        zw.write_all(payload).unwrap();
+        zw.finish().unwrap();
+
+        let (out, guard) = materialize_amiga_image_path(&imz_path).unwrap();
+        assert!(guard.is_some(), "imz needs a tempdir guard");
+        assert_eq!(out.extension().and_then(|s| s.to_str()), Some("ima"));
+        assert_eq!(std::fs::read(&out).unwrap(), payload);
     }
 }
 

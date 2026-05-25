@@ -630,7 +630,7 @@ and can land anywhere; it's placed after the decode-to-temp group here.
 
 | # | Session | Format | Scope & deliverable | Reference / risk |
 |---|---|---|---|---|
-| 5.1 | **WinImage IMZ** | `.imz` reader | **Establishes Seam A′.** Decode-to-temp: IMZ is a zlib/gzip-wrapped raw image; unwrap then treat as raw. Build the shared materialize-to-tempfile + `TempDir`-guard + worker-decode plumbing here. Tests. | Mostly documented. **Low.** |
+| 5.1 ✅ | **WinImage IMZ** | `.imz` reader | **Establishes Seam A′.** `src/rbformats/imz.rs::materialize_imz_to_temp` unwraps a `.imz` ZIP into a fresh `tempfile::TempDir`, picks the first floppy-image entry (`.ima`/`.img`/`.dsk`/`.flp`/`.vfd`), and returns the temp path + guard. Password-protected entries (legacy ZipCrypto, detected via `ZipFile::encrypted()`) are rejected with a precise error. Wired through `gui::materialize_amiga_image_path` alongside `.adz`/`.hdz` so all three formats share one file-pick → materialize → detect-as-Raw path; GUI file-picker filters in Backup/Inspect/Restore tabs accept `imz`. Tests: 6 unit + 2 real-fixture-gated, including byte-for-byte round-trip of `w98_boot_nopassword.imz` vs `w98_boot.ima` and clean rejection of `w99_boot_withpassword.imz`. Worker-thread + progress-cb plumbing **deferred** — IMZ floppies decode in <1 ms; later legacy sessions (5.2 / 5.6) add it as needed since their payloads are MB–GB scale. |
 | 5.2 | **Partimage** | `.000` reader | Decode-to-temp (reuses 5.1 plumbing): header + bitmap of used blocks + gzip/bzip2 stream. Tests. | partimage source / format doc. **Med.** |
 | 5.3 | **Teledisk / ImageDisk** | `.TD0` + `.IMD` reader | Decode-to-temp floppy readers (reuse 5.1 plumbing). IMD is straightforward (Dunfield spec). TD0 advanced variant uses LZHUF — port a known decoder. Tests with sample floppies. | Dunfield IMD spec; TD0 RE notes. **Med.** Floppy-focused — broadens existing dc42/woz/2mg story. |
 | 5.4 | **E01 / EWF** | EnCase EWF reader | Independent — native `Read + Seek` over the chunked EWF segments (offset table per segment, zlib chunks, CRC per chunk). Multi-segment (`.E01`, `.E02`, …) handling. Tests. | libewf / libyal docs; Forensic7z confirms it's clean. **Low–Med.** |
@@ -708,10 +708,63 @@ order. EWF1 layout: a file header then a chain of typed **sections**
 
 Port the format model from the MIT-licensed clean-room parser
 [`nyarime/gho`](https://github.com/nyarime/gho) (do **not** consult any leaked
-Symantec source — see the provenance rule above). Confirmed structure:
+Symantec source — see the provenance rule above).
 
-- **File header (512 B):** magic `FE EF`, then a compression-type identifier and
-  image ID.
+**Two layers to keep straight:** there is the *container* header (the first
+~512 bytes of every `.gho`/`.ghs` file — same across Ghost 7.5 and 11.5 in
+our fixture corpus) and the *inner record stream* (what `nyarime/gho`
+documents). The container header was decoded from our own fixtures
+(`~/new-fixtures/gho/`) in conversation 2026-05-25; both 7.5 and 11.5 use the
+identical 12-byte container layout, so the version split lives **inside the
+record stream**, not in the wrapper.
+
+**Container header (verified across 12 fixtures, Ghost 7.5 + 11.5):**
+
+| Offset | Size | Field | Notes |
+|---|---|---|---|
+| 0x00 | 2 | magic | `FE EF` |
+| 0x02 | 1 | container version | `01` for every fixture we have (both 7.5 and 11.5) |
+| 0x03 | 1 | compression | `00` = none, `02` = fast, `03` = high |
+| 0x04 | 4 | serial / CRC | varies per backup; not yet decoded — confirm in 5.5 spike |
+| 0x08 | 2 | flags | constant `01 01` in our corpus; semantics unknown |
+| 0x0A | 1 | **image type** | `00` = file-aware (used-data only), `01` = SECTOR (raw sector-by-sector) |
+| 0x0B | 1 | password flag | `00` = none, `01` = password set |
+| 0x0C | 16 | password verifier | only present (non-zero) when password flag = `01` |
+
+Confirmation table (excerpt from the 2026-05-25 hex-dump pass):
+
+| Fixture | comp | type | pwd |
+|---|---|---|---|
+| `7.5/FULLDISK/FULLDISK.GHO` | 00 | 00 | 00 |
+| `7.5/PART/PART.GHO` | 00 | 00 | 00 |
+| `7.5/SECTOR/SECTOR.GHO` | 00 | **01** | 00 |
+| `7.5/FD-FAST/FAST.GHO` | 02 | 00 | 00 |
+| `7.5/FD-HIGH/FD-HIGH.GHO` | 03 | 00 | 00 |
+| `11.5/GH11/fulldisk.GHS` | 00 | 00 | 00 |
+| `11.5/GH11-hicompression/High.GHO` | 03 | 00 | 00 |
+| `11.5/GH11-password/GH11PW.GHO` | 00 | 00 | 01 |
+| legacy `HPVectra95C.gho` (Ghost ~7.x) | 02 | 00 | 00 |
+
+A Pascal-style description string can appear at offset `0xFF` (length byte +
+ASCII, e.g. `"PartitionBackup no compression"`). Present in some 7.5 fixtures,
+absent in the 11.5 ones — treat as optional metadata, parse if length byte is
+non-zero and offset+length stays within the first sector.
+
+**Image-type variants the reader must handle distinctly:**
+
+- **`0x00` file-aware ("truncated full backup"):** Ghost walks the filesystem
+  and stores only used clusters. This is the mode `nyarime/gho`'s record-stream
+  parser targets. **Start here for 5.5 / 5.6** — it's the common case and the
+  reference parser maps directly.
+- **`0x01` SECTOR:** sector-by-sector raw image with the container header in
+  front. Simpler in principle — no FS walk, no per-partition record stream — but
+  uses a different inner layout (raw + split-marker scheme). No compressed-SECTOR
+  fixture is currently in the corpus (the user is sourcing one). Defer the
+  SECTOR decoder until a fixture is in hand; spike work in 5.5 should at least
+  *detect* and *cleanly reject* SECTOR mode pending its own sub-session.
+
+**Inner record stream (from `nyarime/gho`, applies to file-aware mode):**
+
 - **Records (10-byte header):** `[u32 type][u32 magic 0x012F18D8][u16 body_len]`.
   Types: Track0 `0x0006` (MBR + boot sectors), Partition `0x0603` (descriptor),
   Continuation `0x0703` (additional data spans), End `0x0023`.
@@ -720,6 +773,8 @@ Symantec source — see the provenance rule above). Confirmed structure:
 - **Compression modes:** Z0 none; **Z1 Fast-LZ** (custom LZ77, 4096-entry hash,
   16-bit control words marking literals vs. matches, min 3-byte match, hash
   `h = ((-24993 * (b2 ^ (16*(b1 ^ (16*b0))))) >> 4) & 0xFFF`); Z3–Z9 zlib.
+  Cross-check against our container's compression byte (offset 0x03) — they
+  must agree.
 - **Spanning:** `.ghs` continuation files (one logical image split across
   multiple files due to CD/DVD/media size limits). The reference parser marks
   span-file **reading** as supported (writing is incomplete — we don't need
@@ -728,16 +783,50 @@ Symantec source — see the provenance rule above). Confirmed structure:
   `disk.ghs` / `.001` / `.002` …) or the caller supplies each segment, and
   whether a single job ever images *multiple physical disks* (a rarer layering
   = repeated Track0 + partition record sets) vs. the common single-disk split.
-- **encryption:** CRC-16 cipher (tolerate/skip, or reject encrypted images
-  cleanly).
-- Versions: Ghost 11.x–12.x (what the reference covers). Document the supported
-  set; reject unknown header variants with a clear message.
+  In our 7.5 SECTOR fixture the split files are `SECTOR.GHO` + `SECTO001.GHS`
+  + `SECTO002.GHS` + `SECTO003.GHS` (~2 GiB chunks); 11.5 uses smaller
+  ~100 MiB chunks with a `disk-001.GHS` / `disk-002.GHS` … naming pattern, and
+  `disk.GHO` is the primary.
+- **encryption:** CRC-16 cipher on the body when container password flag (offset
+  0x0B) is set. Tolerate/skip on first pass, or reject password-protected
+  images cleanly with a precise error. The 16-byte verifier at 0x0C is the
+  password hash — do not attempt to brute-force; just refuse with "password
+  required, not supported" until we wire UI prompting.
+- Versions: Ghost 11.x–12.x (what the reference covers) plus 7.5 confirmed
+  identical at the container level. Document the supported set; reject unknown
+  header variants with a clear message.
 
-**5.5 (spike):** Rust skeleton + header/record parsing against a sample `.gho`,
-plus the Fast-LZ decoder as a standalone tested unit. **5.6 (reader):** wire
-decode-to-temp (Track0 → MBR at LBA 0, partitions at their offsets, gaps
-zero-filled), `.ghs` span handling, zlib path; tests against the sample;
-Seam A′ + `ImageFormat::Gho { … }`.
+**5.5 (spike) deliverables (updated 2026-05-25):**
+1. Container-header parser (the 12-byte + optional password-verifier layout
+   above), tested against every fixture in `~/new-fixtures/gho/`.
+2. Image-type dispatch: file-aware vs SECTOR; SECTOR returns a clear
+   "not yet supported" error.
+3. Rust skeleton + record-header parsing against `11.5/GH11/fulldisk.GHS`
+   (uncompressed file-aware) — confirms `nyarime/gho`'s record model holds in
+   our corpus and that the inner stream begins at the expected offset past the
+   container header.
+4. Diff inner records of `7.5/PART/PART.GHO` vs `11.5/GH11/fulldisk.GHS` to
+   confirm the record stream is identical between Ghost 7.5 and 11.5 (or note
+   the deltas).
+5. Fast-LZ decoder as a standalone tested unit (oracle: round-trip a known
+   buffer via a reference Fast-LZ in Go/Python, or — simpler — against a real
+   `02`-compressed `.gho` once we can locate a block in it).
+6. Password-protected fixtures (`GH11PW.GHO`, `hipwd.GHO`) must open far enough
+   to read the container header and produce the "password required" error
+   without panicking.
+
+**5.6 (reader) deliverables:**
+- Wire decode-to-temp (Track0 → MBR at LBA 0, partitions at their offsets, gaps
+  zero-filled) for file-aware mode.
+- `.ghs` span handling (auto-follow when given the primary file).
+- zlib path for compression byte `0x03`.
+- Tests against the 5.5 fixtures plus the new compressed-SECTOR sample once
+  the user provides it.
+- Seam A′ + `ImageFormat::Gho { … }`.
+
+**SECTOR-mode reader:** scheduled as a follow-up sub-session (call it 5.6b) once
+a compressed-SECTOR fixture is in hand. Not a blocker for shipping
+file-aware-mode convert-from.
 
 ### 5.7 — Legacy integration
 

@@ -341,7 +341,7 @@ impl InspectTab {
                     }
                     ui.separator();
                     if ui
-                        .selectable_label(self.image_file_path.is_some(), "Open VHD/Disk Image...")
+                        .selectable_label(self.image_file_path.is_some(), "Open File...")
                         .clicked()
                     {
                         if let Some(path) = super::file_dialog()
@@ -350,7 +350,7 @@ impl InspectTab {
                                 &[
                                     "vhd", "img", "raw", "bin", "iso", "dd", "hda", "hdv", "2mg",
                                     "dmg", "po", "do", "dsk", "dc42", "woz", "chd", "adf", "hdf",
-                                    "adz", "hdz",
+                                    "adz", "hdz", "imz", "vmdk", "qcow2", "qcow",
                                 ],
                             )
                             .add_filter("All Files", &["*"])
@@ -2300,7 +2300,7 @@ impl InspectTab {
         // Single-file-CHD backups put the entire disk image inside
         // `disk.chd`. The existing per-partition inspect/browse path
         // doesn't know how to slice byte ranges out of the container, so
-        // redirect the user to "Open VHD/Disk Image" on the CHD itself —
+        // redirect the user to "Open File" on the CHD itself —
         // that path already handles CHD via ChdReader and gives full
         // browse + CHD-info access.
         if matches!(

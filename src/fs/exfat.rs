@@ -237,16 +237,12 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
             self.reader.seek(SeekFrom::Start(offset))?;
             let remaining = max_bytes - written;
             let to_read = self.cluster_size.min(remaining) as usize;
-            match self.reader.read(&mut buf[..to_read]) {
-                Ok(n) if n > 0 => {
-                    writer.write_all(&buf[..n])?;
-                    written += n as u64;
-                    if n < to_read {
-                        break;
-                    }
-                }
-                _ => break,
-            }
+            // read_exact: clusters are always fully present on disk. Wrapped
+            // readers (VMDK sparse, qcow2) legitimately return short reads at
+            // grain boundaries — that's not EOF.
+            self.reader.read_exact(&mut buf[..to_read])?;
+            writer.write_all(&buf[..to_read])?;
+            written += to_read as u64;
             count += 1;
             match self.next_cluster(cluster)? {
                 Some(next) => cluster = next,
@@ -279,15 +275,11 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
             let to_read = self.cluster_size.min(remaining) as usize;
             let mut buf = vec![0u8; to_read];
 
-            match self.reader.read(&mut buf) {
-                Ok(n) if n > 0 => {
-                    data.extend_from_slice(&buf[..n]);
-                    if n < to_read {
-                        break;
-                    }
-                }
-                _ => break,
-            }
+            // read_exact: clusters are always fully present on disk. Wrapped
+            // readers (VMDK sparse, qcow2) legitimately return short reads at
+            // grain boundaries — that's not EOF.
+            self.reader.read_exact(&mut buf)?;
+            data.extend_from_slice(&buf);
 
             count += 1;
             match self.next_cluster(cluster)? {
@@ -2263,8 +2255,8 @@ mod tests {
         // Cluster 4 (root dir): end of chain
         image[fat_start + 16..fat_start + 20].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
 
-        // -- Allocation bitmap (cluster 2) --
-        let bitmap_offset = cluster_heap_offset as usize * 512 + 0 * cluster_size as usize;
+        // -- Allocation bitmap (cluster 2, index 0 in the cluster heap) --
+        let bitmap_offset = cluster_heap_offset as usize * 512;
         // Clusters 2,3,4 are used (bitmap indices 0,1,2)
         image[bitmap_offset] = 0x07; // bits 0,1,2 set
 

@@ -235,8 +235,7 @@ impl<R: Read + Seek> FatFilesystem<R> {
                 let fat_size = ((total_entries as usize) * 3).div_ceil(2);
                 self.reader.seek(SeekFrom::Start(fat_offset))?;
                 let mut fat_data = vec![0u8; fat_size];
-                let actually_read = self.reader.read(&mut fat_data)?;
-                fat_data.truncate(actually_read);
+                self.reader.read_exact(&mut fat_data)?;
 
                 for cluster in (2..total_entries).rev() {
                     let byte_off = (cluster as usize * 3) / 2;
@@ -260,8 +259,7 @@ impl<R: Read + Seek> FatFilesystem<R> {
                 let fat_size = total_entries as usize * 2;
                 self.reader.seek(SeekFrom::Start(fat_offset))?;
                 let mut fat_data = vec![0u8; fat_size];
-                let actually_read = self.reader.read(&mut fat_data)?;
-                fat_data.truncate(actually_read);
+                self.reader.read_exact(&mut fat_data)?;
 
                 for cluster in (2..total_entries).rev() {
                     let off = cluster as usize * 2;
@@ -382,19 +380,14 @@ impl<R: Read + Seek> FatFilesystem<R> {
             }
             let offset = self.cluster_offset(cluster);
             self.reader.seek(SeekFrom::Start(offset))?;
-            match self.reader.read(&mut buf) {
-                Ok(n) if n > 0 => {
-                    let remaining = max_bytes - written;
-                    let to_write = (n as u64).min(remaining) as usize;
-                    writer.write_all(&buf[..to_write])?;
-                    written += to_write as u64;
-                    if n < cluster_size {
-                        break;
-                    }
-                }
-                Ok(_) => break,
-                Err(e) => return Err(e.into()),
-            }
+            // read_exact: clusters are always fully present on disk. Don't use
+            // .read() — wrapped readers (VMDK sparse, qcow2) legitimately return
+            // short reads at grain boundaries, which is not EOF.
+            self.reader.read_exact(&mut buf)?;
+            let remaining = max_bytes - written;
+            let to_write = (cluster_size as u64).min(remaining) as usize;
+            writer.write_all(&buf[..to_write])?;
+            written += to_write as u64;
             count += 1;
             match self.next_cluster(cluster)? {
                 Some(next) => cluster = next,
@@ -419,19 +412,11 @@ impl<R: Read + Seek> FatFilesystem<R> {
             self.reader.seek(SeekFrom::Start(offset))?;
             let mut buf = vec![0u8; cluster_size];
 
-            // Use read() instead of read_exact() to handle partial reads at EOF
-            match self.reader.read(&mut buf) {
-                Ok(n) if n > 0 => {
-                    data.extend_from_slice(&buf[..n]);
-                    // If we got a short read, we're probably at EOF
-                    if n < cluster_size {
-                        break;
-                    }
-                }
-                Ok(0) => break, // EOF
-                Ok(_) => break, // Shouldn't happen, but handle partial reads
-                Err(e) => return Err(e.into()),
-            }
+            // read_exact: clusters are always fully present on disk. Don't use
+            // .read() — wrapped readers (VMDK sparse, qcow2) legitimately return
+            // short reads at grain boundaries, which is not EOF.
+            self.reader.read_exact(&mut buf)?;
+            data.extend_from_slice(&buf);
             count += 1;
 
             match self.next_cluster(cluster)? {

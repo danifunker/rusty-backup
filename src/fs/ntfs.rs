@@ -3382,10 +3382,12 @@ mod tests {
         let entries = fs.list_directory(&root).unwrap();
         assert!(!entries.iter().any(|e| e.name == "temp.txt"));
 
-        // Free space should be restored (approximately)
+        // Free space should be restored (approximately) after delete.
         let final_free = fs.free_space().unwrap();
-        assert!(final_free >= initial_free - self::count_set_bits(&[]) * 0); // just check >= initial roughly
-        let _ = final_free; // avoid unused warning
+        assert!(
+            final_free >= initial_free,
+            "free space did not recover after delete"
+        );
     }
 
     #[test]
