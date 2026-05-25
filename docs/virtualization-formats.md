@@ -634,7 +634,8 @@ and can land anywhere; it's placed after the decode-to-temp group here.
 | 5.2 | **Partimage** | `.000` reader | Decode-to-temp (reuses 5.1 plumbing): header + bitmap of used blocks + gzip/bzip2 stream. Tests. | partimage source / format doc. **Med.** |
 | 5.3 | **Teledisk / ImageDisk** | `.TD0` + `.IMD` reader | Decode-to-temp floppy readers (reuse 5.1 plumbing). IMD is straightforward (Dunfield spec). TD0 advanced variant uses LZHUF — port a known decoder. Tests with sample floppies. | Dunfield IMD spec; TD0 RE notes. **Med.** Floppy-focused — broadens existing dc42/woz/2mg story. |
 | 5.4 | **E01 / EWF** | EnCase EWF reader | Independent — native `Read + Seek` over the chunked EWF segments (offset table per segment, zlib chunks, CRC per chunk). Multi-segment (`.E01`, `.E02`, …) handling. Tests. | libewf / libyal docs; Forensic7z confirms it's clean. **Low–Med.** |
-| 5.5 | **GHO spike** | Norton Ghost | Port the format model from the MIT-licensed `nyarime/gho` Go parser: 512B header (`FE EF`), 10B records (magic `0x012F18D8`; Track0 `0x0006`, Partition `0x0603`, Continuation `0x0703`, End `0x0023`), block control byte (`0x01` = stored), Fast-LZ + zlib. Produce a Rust skeleton + parsing of header/records against a sample `.gho`. | `github.com/nyarime/gho` (MIT). Ghost 11.x–12.x. **Med** (have a reference). |
+| 5.5a ✅ | **GHO container spike** | Norton Ghost | `src/rbformats/gho.rs`: container-header parser (12-byte prefix + optional 16-byte password verifier + optional Pascal description at 0xFF), `GhoCompression` / `GhoImageType` enums, `materialize_gho_to_temp` stub that dispatches by header and produces precise per-case errors (password-protected, SECTOR mode, unknown compression byte, unknown container version). 13 tests, including a corpus-walk that parses 11 real fixtures from `~/new-fixtures/gho/` and asserts the (compression, image_type, password) tuple matches the documented table. **Deferred:** inner record stream (5.5b), Fast-LZ decoder (5.5b), full decode-to-temp + `.GHS` span chain (5.6), SECTOR-mode decoding (5.6b). |
+| 5.5b | **GHO inner stream** | Norton Ghost | Record-header parser (10-byte: `[u32 type][u32 magic 0x012F18D8][u16 body_len]`, types Track0/Partition/Continuation/End), 32 KiB block control byte (`0x01` = stored, other = compressed), **Fast-LZ decoder** as a standalone tested unit, zlib decoder via existing `flate2`. Diff Ghost 7.5 (`PART.GHO`) vs 11.5 (`fulldisk.GHS`) inner records to confirm the stream is identical (or note deltas). No decode-to-temp yet. | `github.com/nyarime/gho` (MIT). **Med.** |
 | 5.6 | **GHO reader** | Norton Ghost | Decode-to-temp (reuses 5.1 plumbing): Fast-LZ decompressor + zlib path + multi-file `.ghs` span handling; emit raw disk; CRC-16 cipher tolerated/skipped. Tests against the 5.5 sample. Document supported versions; reject unknown cleanly. | as above. |
 | 5.7 | **Legacy integration** | all of Phase 5 | Unified convert-from entry: file-open dispatch detects each legacy format by magic; CLI `convert --from <legacy>` → modern target; GUI import recognizes the extensions and routes through reconstruct/modern-writer. Docs + README format table. | — |
 
@@ -743,6 +744,7 @@ Confirmation table (excerpt from the 2026-05-25 hex-dump pass):
 | `11.5/GH11/fulldisk.GHS` | 00 | 00 | 00 |
 | `11.5/GH11-hicompression/High.GHO` | 03 | 00 | 00 |
 | `11.5/GH11-password/GH11PW.GHO` | 00 | 00 | 01 |
+| `11.5/Gh11-sect compression high/secthigh.GHO` | 03 | **01** | 00 |
 | legacy `HPVectra95C.gho` (Ghost ~7.x) | 02 | 00 | 00 |
 
 A Pascal-style description string can appear at offset `0xFF` (length byte +
@@ -758,10 +760,12 @@ non-zero and offset+length stays within the first sector.
   reference parser maps directly.
 - **`0x01` SECTOR:** sector-by-sector raw image with the container header in
   front. Simpler in principle — no FS walk, no per-partition record stream — but
-  uses a different inner layout (raw + split-marker scheme). No compressed-SECTOR
-  fixture is currently in the corpus (the user is sourcing one). Defer the
-  SECTOR decoder until a fixture is in hand; spike work in 5.5 should at least
-  *detect* and *cleanly reject* SECTOR mode pending its own sub-session.
+  uses a different inner layout (raw + split-marker scheme). Both an uncompressed
+  fixture (`7.5/SECTOR/SECTOR.GHO`, ~6.4 GB) and a compressed one
+  (`11.5/Gh11-sect compression high/secthigh.GHO`, comp=03, ~641 MB) are in the
+  corpus as of 2026-05-25. Defer SECTOR decoder to **5.6b**; spike work in
+  5.5 should *detect* and *cleanly reject* SECTOR mode pending its own
+  sub-session.
 
 **Inner record stream (from `nyarime/gho`, applies to file-aware mode):**
 

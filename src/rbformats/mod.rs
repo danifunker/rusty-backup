@@ -5,6 +5,7 @@ pub mod compress;
 pub mod dc42;
 pub mod dmg;
 pub mod export;
+pub mod gho;
 pub mod imz;
 pub mod interleave;
 pub mod qcow2;
