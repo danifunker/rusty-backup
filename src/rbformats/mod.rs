@@ -13,6 +13,7 @@ pub mod raw;
 pub mod sparse;
 pub mod twomg;
 pub mod vhd;
+pub mod vmdk;
 pub mod woz;
 pub mod woz_write;
 pub mod zstd;
@@ -1028,6 +1029,10 @@ pub enum ImageFormat {
         logical_size: u64,
         version: u32,
     },
+    /// VMDK flat (`monolithicFlat` / `twoGbMaxExtentFlat`) — ASCII descriptor
+    /// referencing one or more `FLAT`/`ZERO` extents. Opened on-demand by path
+    /// via [`vmdk::VmdkFlatReader`]; `logical_size` is the virtual disk size.
+    VmdkFlat { path: PathBuf, logical_size: u64 },
     /// MAME CHD — opened on-demand by path; logical_size is the uncompressed length.
     Chd { path: PathBuf, logical_size: u64 },
     /// MAME CD CHD — single-track MODE1, browsed via the cooked 2048-byte adapter.
@@ -1083,6 +1088,9 @@ impl ImageFormat {
                 ..
             } => {
                 format!("QCOW2 v{} (disk: {} bytes)", version, logical_size)
+            }
+            ImageFormat::VmdkFlat { logical_size, .. } => {
+                format!("VMDK flat (disk: {} bytes)", logical_size)
             }
             ImageFormat::Chd { logical_size, .. } => {
                 format!("MAME CHD ({} bytes decoded)", logical_size)
@@ -1181,6 +1189,27 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
                         path: p.to_path_buf(),
                         logical_size,
                         version,
+                    });
+                }
+            }
+        }
+    }
+
+    // 1c. VMDK flat descriptor at offset 0 (ASCII `# Disk DescriptorFile`).
+    //     Strong fixed signature; placed alongside the other magic-at-0
+    //     checks. Sparse VMDKs lead with `KDMV` (Phase 4) — the reader
+    //     rejects them, so we don't pre-filter here.
+    if file_size >= vmdk::VMDK_DESCRIPTOR_MAGIC.len() as u64 {
+        file.seek(SeekFrom::Start(0))?;
+        let mut head = vec![0u8; vmdk::VMDK_DESCRIPTOR_MAGIC.len()];
+        if file.read_exact(&mut head).is_ok() && head == vmdk::VMDK_DESCRIPTOR_MAGIC {
+            if let Some(p) = path {
+                if let Ok(reader) = vmdk::VmdkFlatReader::open(p) {
+                    let logical_size = reader.len();
+                    drop(reader);
+                    return Ok(ImageFormat::VmdkFlat {
+                        path: p.to_path_buf(),
+                        logical_size,
                     });
                 }
             }
@@ -1371,6 +1400,11 @@ pub fn wrap_image_reader(file: File, format: ImageFormat) -> Result<(BoxReadSeek
             // VhdDynamic / Chd).
             drop(file);
             let reader = qcow2::Qcow2Reader::open(File::open(&path)?)?;
+            Ok((Box::new(reader), logical_size))
+        }
+        ImageFormat::VmdkFlat { path, logical_size } => {
+            drop(file);
+            let reader = vmdk::VmdkFlatReader::open(&path)?;
             Ok((Box::new(reader), logical_size))
         }
         ImageFormat::Chd { path, logical_size } => {

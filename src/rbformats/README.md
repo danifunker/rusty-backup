@@ -8,6 +8,7 @@ Compress/decompress handlers for backup output formats, plus disk reconstruction
 - **`vhd.rs`** — VHD format: Fixed (`build_vhd_footer`, `export_whole_disk_vhd`, `export_partition_vhd`) and Dynamic/sparse (`DynamicVhdReader`, `export_whole_disk_vhd_dynamic`). Shared: `vhd_chs_geometry`, `vhd_checksum`, `VHD_COOKIE`.
 - **`sparse.rs`** — Shared sparse-allocation bookkeeping (`SparseAllocator`, `is_zero_unit`) reused by dynamic VHD (and later QCOW2, VMDK sparse).
 - **`qcow2.rs`** — QCOW2: `Qcow2Reader` (v2/v3, read + in-place allocate-on-write edit) and `export_qcow2` (writes v3 with `refcount_order = 4`, single-file, uncompressed clusters). Self-referential refcount-block sizing keeps `qemu-img check` clean; the editor grows L2 tables + refcount blocks on demand and reuses free host clusters before extending the file.
+- **`vmdk.rs`** — VMDK flat: `VmdkFlatReader` (parses the ASCII descriptor, concatenates `FLAT`/`ZERO` extents from `monolithicFlat` and `twoGbMaxExtentFlat` layouts) and `export_vmdk_flat` (writes a single-extent `monolithicFlat`: `<base>.vmdk` descriptor + `<base>-flat.vmdk` raw extent). Sparse VMDKs (`KDMV` magic) are detected and rejected with a precise message — sparse support lands in Phase 4.
 - **`chd.rs`** — CHD (MAME) format via the in-process `libchdman-rs` crate: `compress_chd`, `compress_chd_dvd`, `ChdReader`, `CdCookedReader`.
 - **`zstd.rs`** — Zstd streaming compression: `compress_zstd`.
 - **`raw.rs`** — Raw streaming with optional file splitting and sparse zero-skipping: `stream_with_split`.
@@ -20,6 +21,7 @@ Compress/decompress handlers for backup output formats, plus disk reconstruction
 | VHD (Fixed)   | `.vhd` | None  | No        | Raw data + 512-byte footer |
 | VHD (Dynamic) | `.vhd` | None  | No        | Sparse: BAT + per-block bitmap; all-zero blocks omitted |
 | QCOW2         | `.qcow2` | None | No       | Read (v2 + v3) + write (v3 uncompressed). Sparse: zero clusters omitted. `qemu-img check` clean. |
+| VMDK (Flat)   | `.vmdk` | None | No       | Read (`monolithicFlat` / `twoGbMaxExtentFlat`, FLAT + ZERO extents). Write: `monolithicFlat` — descriptor + sibling `-flat.vmdk` raw extent. |
 | Zstd   | `.zst`    | Zstd level 3 | Yes (post-hoc) | Good compression ratio |
 | CHD    | `.chd`    | MAME CHD    | Yes (post-hoc) | Native via `libchdman-rs` (no external tool) |
 
