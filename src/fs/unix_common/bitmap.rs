@@ -229,9 +229,9 @@ pub fn bitmap_find_clear_bit(data: &[u8], bit_count: u64) -> Option<u64> {
     let full_bytes = (bit_count / 8) as usize;
     let remaining_bits = (bit_count % 8) as u32;
 
-    for i in 0..full_bytes {
-        if data[i] != 0xFF {
-            let bit = data[i].trailing_ones();
+    for (i, &byte) in data[..full_bytes].iter().enumerate() {
+        if byte != 0xFF {
+            let bit = byte.trailing_ones();
             return Some(i as u64 * 8 + bit as u64);
         }
     }

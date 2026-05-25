@@ -296,10 +296,8 @@ pub fn plan_defrag_layout(
     }
     all_source_cnids.sort_unstable();
     all_source_cnids.dedup();
-    let mut next_cnid = FIRST_USER_CNID;
-    for cnid in all_source_cnids {
+    for (next_cnid, cnid) in (FIRST_USER_CNID..).zip(all_source_cnids) {
         cnid_map.insert(cnid, next_cnid);
-        next_cnid += 1;
     }
 
     // Pack user file forks contiguously starting at user_data_start.
@@ -985,12 +983,12 @@ pub fn build_target_metadata(
 
     let mut new_finder_info = [0u32; 8];
     let known: std::collections::HashSet<u32> = plan.cnid_map.keys().copied().collect();
-    for i in 0..8 {
+    for (i, slot) in new_finder_info.iter_mut().enumerate() {
         if i == 6 || i == 7 {
             continue;
         }
         let src_val = snapshot.volume.finder_info[i];
-        new_finder_info[i] = if known.contains(&src_val) {
+        *slot = if known.contains(&src_val) {
             *plan.cnid_map.get(&src_val).unwrap()
         } else {
             src_val

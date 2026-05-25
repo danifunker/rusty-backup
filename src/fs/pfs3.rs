@@ -2667,9 +2667,7 @@ fn append_link_extrafield_to_direntry<R: Read + Write + Seek>(
     }
     // Zero the freshly-vacated tail region (the old start of the
     // next direntry, now duplicated at the shifted position).
-    for i in next_off..next_off + tail_bytes {
-        db[i] = 0;
-    }
+    db[next_off..next_off + tail_bytes].fill(0);
     // Pack: walking back from the flags word, write link_hi then
     // link_lo (matching the back-walker convention in parse_direntry).
     let flags_pos = next_off + tail_bytes - 2;

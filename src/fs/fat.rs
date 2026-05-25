@@ -2185,9 +2185,8 @@ impl<R: Read + Seek> CompactFatReader<R> {
         }
 
         // Remap entries for allocated clusters
-        for new_idx in 0..new_to_old.len() {
+        for (new_idx, &old_cluster) in new_to_old.iter().enumerate() {
             let new_cluster = (new_idx as u32) + 2;
-            let old_cluster = new_to_old[new_idx];
             let old_entry = read_fat_entry(&fat_data, old_cluster, fat_type);
 
             let new_entry = if is_end_of_chain(old_entry, fat_type) {
@@ -3827,8 +3826,7 @@ fn write_fat_boot_sector(
 fn fat_label_bytes(label: Option<&str>) -> [u8; 11] {
     let mut out = [b' '; 11];
     let s = label.unwrap_or("NO NAME");
-    let mut written = 0;
-    for ch in s.chars() {
+    for (written, ch) in s.chars().enumerate() {
         if written >= 11 {
             break;
         }
@@ -3847,7 +3845,6 @@ fn fat_label_bytes(label: Option<&str>) -> [u8; 11] {
             b'_'
         };
         out[written] = b;
-        written += 1;
     }
     out
 }

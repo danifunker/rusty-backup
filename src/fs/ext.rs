@@ -2052,6 +2052,11 @@ pub struct RelocationPlan {
 /// minimum number of block groups, and — if data extends beyond that
 /// boundary — pairs out-of-bounds allocated blocks with free data blocks
 /// within the boundary.
+// Block-group walks: `group` is both an index into `gd_infos` /
+// `allocated_by_group` AND a numeric block-group number used for
+// arithmetic (group_start, group_count comparisons). Refactoring to
+// `enumerate()` saves little and risks off-by-one in tested fs code.
+#[allow(clippy::needless_range_loop)]
 pub fn build_relocation_map<R: Read + Seek>(
     reader: &mut R,
     partition_offset: u64,
@@ -2329,6 +2334,7 @@ pub struct PatchedInodeTables {
 /// and rewrites any block pointers that appear in `relocations`. Also reads
 /// and patches indirect blocks and extent index blocks whose contents
 /// reference relocated blocks.
+#[allow(clippy::needless_range_loop)] // see build_relocation_map for rationale
 pub fn scan_and_patch_inodes<R: Read + Seek>(
     reader: &mut R,
     partition_offset: u64,
@@ -2870,6 +2876,9 @@ pub struct ShrinkMetadata {
 /// Reads the original metadata, applies the relocation plan (clearing bits for
 /// blocks moved out, setting bits for blocks moved in), truncates the GDT to
 /// `min_groups`, and updates the superblock totals.
+// Block-group rebuild loops use `group` as both an index and a numeric
+// block-group number; see `build_relocation_map` for the same rationale.
+#[allow(clippy::needless_range_loop)]
 pub fn rebuild_metadata_for_shrink<R: Read + Seek>(
     reader: &mut R,
     partition_offset: u64,
@@ -3190,6 +3199,7 @@ pub fn resize_ext_in_place(
 /// Validate ext2/3/4 filesystem integrity.
 ///
 /// Performs basic consistency checks and returns a list of warnings.
+#[allow(clippy::needless_range_loop)] // see build_relocation_map for rationale
 pub fn validate_ext_integrity(
     file: &mut (impl Read + Seek),
     partition_offset: u64,
@@ -3617,6 +3627,7 @@ impl<R: Read + Seek + Send> CompactExtReader<R> {
     }
 
     /// Build a layout-preserving compacted image (original behavior).
+    #[allow(clippy::needless_range_loop)] // see build_relocation_map for rationale
     fn new_layout_preserving(
         mut reader: R,
         partition_offset: u64,

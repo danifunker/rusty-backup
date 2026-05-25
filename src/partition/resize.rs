@@ -662,8 +662,8 @@ mod tests {
         // Test with data larger than CHUNK_SIZE
         let size = CHUNK_SIZE * 3;
         let mut data = vec![0u8; size + CHUNK_SIZE];
-        for i in 0..size {
-            data[i] = (i % 256) as u8;
+        for (i, slot) in data[..size].iter_mut().enumerate() {
+            *slot = (i % 256) as u8;
         }
         let original = data[..size].to_vec();
 

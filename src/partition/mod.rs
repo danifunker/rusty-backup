@@ -713,8 +713,8 @@ mod tests {
         data[511] = 0xAA;
         // Simulate non-zero bootstrap code in the partition table area (bytes 446-509)
         // This is common in real floppy VBRs and should NOT prevent superfloppy detection
-        for i in 446..510 {
-            data[i] = 0xCD + (i as u8 % 17); // arbitrary non-zero boot code
+        for (i, slot) in data[446..510].iter_mut().enumerate() {
+            *slot = 0xCD + ((446 + i) as u8 % 17); // arbitrary non-zero boot code
         }
 
         let mut cursor = Cursor::new(data);
@@ -738,8 +738,8 @@ mod tests {
         data[2] = 0x90;
         data[3..11].copy_from_slice(b"NTFS    ");
         // Realistic bootstrap bytes in the would-be partition table area.
-        for i in 446..510 {
-            data[i] = 0x4E + (i as u8 % 13);
+        for (i, slot) in data[446..510].iter_mut().enumerate() {
+            *slot = 0x4E + ((446 + i) as u8 % 13);
         }
         data[510] = 0x55;
         data[511] = 0xAA;
@@ -760,8 +760,8 @@ mod tests {
         data[1] = 0x76;
         data[2] = 0x90;
         data[3..11].copy_from_slice(b"EXFAT   ");
-        for i in 446..510 {
-            data[i] = 0x4E + (i as u8 % 13);
+        for (i, slot) in data[446..510].iter_mut().enumerate() {
+            *slot = 0x4E + ((446 + i) as u8 % 13);
         }
         data[510] = 0x55;
         data[511] = 0xAA;
