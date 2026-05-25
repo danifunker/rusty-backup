@@ -1450,14 +1450,16 @@ impl InspectTab {
         let is_dynamic_vhd = self.export_format == ExportFormat::VhdDynamic;
         let is_qcow2 = self.export_format == ExportFormat::Qcow2;
         let is_vmdk_flat = self.export_format == ExportFormat::VmdkFlat;
+        let is_vmdk_sparse = self.export_format == ExportFormat::VmdkSparse;
         // Force whole-disk for formats that don't make sense per-partition:
         // CHD (headless slice no emulator consumes), dynamic VHD, QCOW2, and
-        // VMDK flat (each wraps a whole-disk geometry the emulator expects to
-        // find an MBR/GPT/APM at sector 0 of).
-        if is_chd_format || is_dynamic_vhd || is_qcow2 || is_vmdk_flat {
+        // both VMDK variants (each wraps a whole-disk geometry the emulator
+        // expects to find an MBR/GPT/APM at sector 0 of).
+        if is_chd_format || is_dynamic_vhd || is_qcow2 || is_vmdk_flat || is_vmdk_sparse {
             self.export_whole_disk = true;
         }
-        let whole_disk_only = is_chd_format || is_dynamic_vhd || is_qcow2 || is_vmdk_flat;
+        let whole_disk_only =
+            is_chd_format || is_dynamic_vhd || is_qcow2 || is_vmdk_flat || is_vmdk_sparse;
 
         egui::Window::new("Export Disk Image")
             .collapsible(false)
@@ -1523,6 +1525,13 @@ impl InspectTab {
                          VMware/qemu-img/VirtualBox expect to find a partition \
                          table at sector 0 of.",
                     );
+                } else if is_vmdk_sparse {
+                    per_part_resp.on_hover_text(
+                        "Per-partition export is not supported for VMDK sparse — \
+                         the grain directory wraps a whole-disk geometry that \
+                         VMware/qemu-img/VirtualBox expect to find a partition \
+                         table at sector 0 of.",
+                    );
                 }
 
                 ui.add_space(4.0);
@@ -1551,6 +1560,15 @@ impl InspectTab {
                              <name>-flat.vmdk raw extent. Opens in VMware Workstation/\
                              Fusion, VirtualBox, qemu-img.",
                         );
+                    ui.radio_value(
+                        &mut self.export_format,
+                        ExportFormat::VmdkSparse,
+                        "VMDK (Sparse)",
+                    )
+                    .on_hover_text(
+                        "monolithicSparse VMDK — single self-contained .vmdk; \
+                         zero grains omitted. Opens in VMware, VirtualBox, qemu-img.",
+                    );
                     ui.radio_value(&mut self.export_format, ExportFormat::Raw, "Raw (.img)");
                     ui.radio_value(&mut self.export_format, ExportFormat::TwoMg, "2MG (.2mg)");
                     ui.radio_value(&mut self.export_format, ExportFormat::Woz, "WOZ (.woz)")

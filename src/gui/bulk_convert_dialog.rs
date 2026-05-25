@@ -171,6 +171,11 @@ impl BulkConvertDialog {
                             "monolithicFlat VMDK — descriptor + <name>-flat.vmdk pair. \
                              Opens in VMware, VirtualBox, qemu-img.",
                         );
+                    ui.radio_value(&mut self.format, ExportFormat::VmdkSparse, "VMDK (Sparse)")
+                        .on_hover_text(
+                            "monolithicSparse VMDK — single self-contained .vmdk; \
+                             zero grains omitted. Opens in VMware, VirtualBox, qemu-img.",
+                        );
                     ui.radio_value(&mut self.format, ExportFormat::Raw, "Raw (.img)");
                     ui.radio_value(&mut self.format, ExportFormat::TwoMg, "2MG (.2mg)");
                     ui.radio_value(&mut self.format, ExportFormat::Woz, "WOZ (.woz)")

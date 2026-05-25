@@ -1,7 +1,8 @@
-//! VMDK sparse reader (`monolithicSparse` / hosted `SparseExtent` extents).
+//! VMDK sparse reader + writer + in-place editor (`monolithicSparse` /
+//! hosted `SparseExtent` extents).
 //!
-//! Phase 4 / Session 4.1 of `docs/virtualization-formats.md`. Writer + edit
-//! land in 4.2 / 4.3.
+//! Phase 4 of `docs/virtualization-formats.md`: 4.1 reader, 4.2 writer,
+//! 4.3 allocate-on-write edit.
 //!
 //! ## Scope
 //!
@@ -165,6 +166,10 @@ pub struct VmdkSparseReader<R: Read + Seek> {
     /// `(gt_index, parsed_entries)` for the most recently loaded GT.
     gt_cache: Option<(usize, Vec<u32>)>,
     pos: u64,
+    /// Next free host byte for grain allocation (= EOF rounded up to a
+    /// grain boundary). Allocate-on-write bumps this by `grain_size_bytes`
+    /// per new grain.
+    host_end: u64,
 }
 
 impl<R: Read + Seek> VmdkSparseReader<R> {
@@ -204,12 +209,19 @@ impl<R: Read + Seek> VmdkSparseReader<R> {
             .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
             .collect();
 
+        let file_end = inner.seek(SeekFrom::End(0))?;
+        let grain_size_bytes = header.grain_size_sectors * VMDK_SECTOR;
+        // Round host_end up to a grain boundary so future grain allocations
+        // stay grain-aligned (matches the writer).
+        let host_end = file_end.div_ceil(grain_size_bytes) * grain_size_bytes;
+
         Ok(Self {
             inner,
             header,
             gd,
             gt_cache: None,
             pos: 0,
+            host_end,
         })
     }
 
@@ -297,6 +309,103 @@ impl<R: Read + Seek> Read for VmdkSparseReader<R> {
         }
         self.pos += to_read as u64;
         Ok(to_read)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// In-place edit (allocate-on-write)
+// ---------------------------------------------------------------------------
+
+impl<R: Read + Write + Seek> VmdkSparseReader<R> {
+    /// Allocate a fresh grain at `host_end`: write a zero-filled grain into
+    /// the new host region, set `GT[gt_index][gte_index]` to its host sector
+    /// (both in RAM and on disk), bump `host_end`.
+    ///
+    /// Returns the host byte offset of the new grain. `gt_index` must point
+    /// at an existing GT — our writer pre-allocates every GT (one per GD
+    /// entry) so the "grow a GT when its GD slot is empty" branch the QCOW2
+    /// editor needs doesn't arise here.
+    fn allocate_grain(&mut self, gt_index: usize, gte_index: usize) -> std::io::Result<u64> {
+        let grain_size_bytes = self.header.grain_size_sectors * VMDK_SECTOR;
+        let new_host = self.host_end;
+        // Zero-fill the grain so partial writes that come next don't expose
+        // stale bytes from beyond EOF.
+        self.inner.seek(SeekFrom::Start(new_host))?;
+        let zeros = vec![0u8; grain_size_bytes as usize];
+        self.inner.write_all(&zeros)?;
+
+        let new_grain_sector: u32 = (new_host / VMDK_SECTOR).try_into().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "VMDK sparse: grain offset overflows u32 sector field",
+            )
+        })?;
+
+        // Update GT entry on disk: GT host byte = gd[gt_index] * 512 + gte_index * 4.
+        let gt_host_sector = self.gd[gt_index] as u64;
+        let entry_byte = gt_host_sector * VMDK_SECTOR + (gte_index as u64) * 4;
+        self.inner.seek(SeekFrom::Start(entry_byte))?;
+        self.inner.write_all(&new_grain_sector.to_le_bytes())?;
+
+        // Update cached GT if it's the one we just touched.
+        if let Some((cached_idx, gt)) = &mut self.gt_cache {
+            if *cached_idx == gt_index {
+                gt[gte_index] = new_grain_sector;
+            }
+        }
+
+        self.host_end += grain_size_bytes;
+        Ok(new_host)
+    }
+}
+
+impl<R: Read + Write + Seek> Write for VmdkSparseReader<R> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.pos >= self.header.capacity_bytes() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "write past end of VMDK sparse image",
+            ));
+        }
+        let grain_size_bytes = self.header.grain_size_sectors * VMDK_SECTOR;
+        let grain_index = self.pos / grain_size_bytes;
+        let intra = self.pos % grain_size_bytes;
+        let remaining_in_grain = grain_size_bytes - intra;
+        let remaining_in_disk = self.header.capacity_bytes() - self.pos;
+        let to_write = (buf.len() as u64)
+            .min(remaining_in_grain)
+            .min(remaining_in_disk) as usize;
+
+        let entries_per_gt = self.header.num_gtes_per_gt as u64;
+        let gt_index = (grain_index / entries_per_gt) as usize;
+        let gte_index = (grain_index % entries_per_gt) as usize;
+
+        // Look up current host sector.
+        let grain_sector = match self
+            .load_gt(gt_index)
+            .map_err(|e| std::io::Error::other(format!("VMDK sparse: load GT for write: {e}")))?
+        {
+            Some(gt) => gt.get(gte_index).copied().unwrap_or(0),
+            None => 0,
+        };
+
+        let host_byte = if grain_sector == 0 {
+            self.allocate_grain(gt_index, gte_index)?
+        } else {
+            (grain_sector as u64) * VMDK_SECTOR
+        };
+
+        self.inner.seek(SeekFrom::Start(host_byte + intra))?;
+        self.inner.write_all(&buf[..to_write])?;
+        self.pos += to_write as u64;
+        Ok(to_write)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -772,6 +881,69 @@ mod tests {
         let mut got = vec![0u8; disk_size as usize];
         r.read_exact(&mut got).unwrap();
         assert!(got.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn allocate_on_write_round_trip() {
+        // Write a fully-zero source, then mutate two grains through the
+        // editor and verify the reader sees the new bytes (allocate-on-write)
+        // and qemu-img still considers it clean.
+        let grain = VMDK_SPARSE_DEFAULT_GRAIN_BYTES;
+        let disk_size = grain * 4;
+        let src = vec![0u8; disk_size as usize];
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut out = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(tmp.path())
+                .unwrap();
+            export_vmdk_sparse(
+                &mut Cursor::new(&src),
+                &mut out,
+                disk_size,
+                0,
+                &mut |_| {},
+                &|| false,
+            )
+            .unwrap();
+        }
+
+        // Mutate grain 1 and grain 3 via the editor.
+        let payload_a: Vec<u8> = (0..grain as u32).map(|i| (i & 0xFF) as u8).collect();
+        let payload_b: Vec<u8> = (0..grain as u32).map(|i| ((i + 7) & 0xFF) as u8).collect();
+        {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(tmp.path())
+                .unwrap();
+            let mut rw = VmdkSparseReader::open(f).unwrap();
+            rw.seek(SeekFrom::Start(grain)).unwrap();
+            rw.write_all(&payload_a).unwrap();
+            rw.seek(SeekFrom::Start(grain * 3)).unwrap();
+            rw.write_all(&payload_b).unwrap();
+            rw.flush().unwrap();
+        }
+
+        // Reopen via reader and verify.
+        let f = std::fs::File::open(tmp.path()).unwrap();
+        let mut r = VmdkSparseReader::open(f).unwrap();
+        let mut got = vec![0u8; disk_size as usize];
+        r.read_exact(&mut got).unwrap();
+        assert!(got[..grain as usize].iter().all(|&b| b == 0));
+        assert_eq!(&got[grain as usize..(grain * 2) as usize], &payload_a[..]);
+        assert!(got[(grain * 2) as usize..(grain * 3) as usize]
+            .iter()
+            .all(|&b| b == 0));
+        assert_eq!(&got[(grain * 3) as usize..], &payload_b[..]);
+
+        // qemu-img check should still be happy.
+        match crate::rbformats::qemu_img_test::qemu_img_check(tmp.path()) {
+            Ok(true) => {}
+            Ok(false) => eprintln!("skipping qemu-img check — `qemu-img` not on PATH"),
+            Err(e) => panic!("qemu-img check failed after allocate-on-write edit: {e}"),
+        }
     }
 
     /// Gated `qemu-img check` on a freshly written sparse VMDK. Skips silently

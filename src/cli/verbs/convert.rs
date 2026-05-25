@@ -41,6 +41,8 @@ pub enum ConvertFormat {
     Qcow2,
     /// VMDK flat (`monolithicFlat`) — descriptor + sibling `-flat.vmdk` raw extent.
     VmdkFlat,
+    /// VMDK sparse (`monolithicSparse`) — single self-contained .vmdk; zero grains omitted.
+    VmdkSparse,
     /// Raw disk image (no header).
     Raw,
     /// 2MG (Apple II).
@@ -62,6 +64,7 @@ impl From<ConvertFormat> for ExportFormat {
             ConvertFormat::VhdDynamic => ExportFormat::VhdDynamic,
             ConvertFormat::Qcow2 => ExportFormat::Qcow2,
             ConvertFormat::VmdkFlat => ExportFormat::VmdkFlat,
+            ConvertFormat::VmdkSparse => ExportFormat::VmdkSparse,
             ConvertFormat::Raw => ExportFormat::Raw,
             ConvertFormat::Twomg => ExportFormat::TwoMg,
             ConvertFormat::Woz => ExportFormat::Woz,
