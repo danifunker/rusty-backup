@@ -166,6 +166,11 @@ impl BulkConvertDialog {
                             "QCOW2 v3 — sparse, uncompressed. The format UTM uses for \
                              classic-Mac PPC guests; opens in QEMU, qemu-img, virt-manager.",
                         );
+                    ui.radio_value(&mut self.format, ExportFormat::VmdkFlat, "VMDK (Flat)")
+                        .on_hover_text(
+                            "monolithicFlat VMDK — descriptor + <name>-flat.vmdk pair. \
+                             Opens in VMware, VirtualBox, qemu-img.",
+                        );
                     ui.radio_value(&mut self.format, ExportFormat::Raw, "Raw (.img)");
                     ui.radio_value(&mut self.format, ExportFormat::TwoMg, "2MG (.2mg)");
                     ui.radio_value(&mut self.format, ExportFormat::Woz, "WOZ (.woz)")

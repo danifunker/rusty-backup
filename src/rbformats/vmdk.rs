@@ -450,6 +450,51 @@ pub fn build_monolithic_flat_descriptor(disk_size_bytes: u64, flat_filename: &st
     )
 }
 
+/// Resolve the single FLAT extent of a `monolithicFlat` VMDK descriptor and
+/// open the backing flat file with read+write access.
+///
+/// In-place edit for VMDK flat is trivial: the extent's bytes ARE the disk
+/// image, so the editor just needs an `R + W + S` handle on `<base>-flat.vmdk`
+/// (or whatever extent file the descriptor names). The descriptor itself
+/// records only sector counts and geometry — nothing in it has to be rewritten
+/// when bytes change inside the extent.
+///
+/// Errors when the descriptor names more than one FLAT extent (split layouts
+/// would need the caller to pick *which* extent to edit), references a ZERO
+/// extent (no backing file), or is a sparse `KDMV` image (Phase 4).
+pub fn open_flat_extent_for_edit(descriptor_path: &Path) -> Result<File> {
+    let (text, _embedded_data_start, dir) = read_descriptor(descriptor_path)?;
+    let descriptor = Descriptor::parse(&text, &dir)?;
+    let flat_extents: Vec<&ExtentSpec> = descriptor
+        .extents
+        .iter()
+        .filter(|e| e.kind == ExtentKind::Flat)
+        .collect();
+    match flat_extents.len() {
+        0 => bail!(
+            "VMDK descriptor {} has no FLAT extent to edit",
+            descriptor_path.display()
+        ),
+        1 => {
+            let path = flat_extents[0]
+                .path
+                .as_ref()
+                .expect("FLAT extent carries a path");
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .with_context(|| format!("failed to open VMDK extent {} R+W", path.display()))
+        }
+        n => bail!(
+            "VMDK descriptor {} has {} FLAT extents — in-place edit only supports \
+             single-extent (monolithicFlat) layouts; convert to monolithicFlat first",
+            descriptor_path.display(),
+            n
+        ),
+    }
+}
+
 /// Export a whole-disk source as a `monolithicFlat` VMDK at `dest_path` (the
 /// `.vmdk` descriptor). The raw extent is written as `<stem>-flat.vmdk` next to
 /// the descriptor.
@@ -644,6 +689,46 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("sparse"), "{err}");
+    }
+
+    #[test]
+    fn open_flat_extent_for_edit_round_trip() {
+        // Write a flat VMDK, open the extent R+W via the helper, mutate a
+        // sector, reopen via VmdkFlatReader, and confirm the mutation lands.
+        let tmp = tempfile::tempdir().unwrap();
+        let dst = tmp.path().join("edit.vmdk");
+
+        let src = vec![0u8; 4 * 512];
+        let mut cursor = std::io::Cursor::new(&src);
+        export_vmdk_flat(&mut cursor, &dst, src.len() as u64, &mut |_| {}, &|| false).unwrap();
+
+        {
+            let mut handle = open_flat_extent_for_edit(&dst).unwrap();
+            handle.seek(SeekFrom::Start(1024)).unwrap();
+            handle.write_all(&[0xAB; 16]).unwrap();
+            handle.flush().unwrap();
+        }
+
+        let mut reader = VmdkFlatReader::open(&dst).unwrap();
+        reader.seek(SeekFrom::Start(1024)).unwrap();
+        let mut got = [0u8; 16];
+        reader.read_exact(&mut got).unwrap();
+        assert_eq!(got, [0xAB; 16]);
+    }
+
+    #[test]
+    fn open_flat_extent_for_edit_rejects_multi_extent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.bin");
+        let b = tmp.path().join("b.bin");
+        write_bytes(&a, &[0u8; 512]);
+        write_bytes(&b, &[0u8; 512]);
+        let desc = "# Disk DescriptorFile\nversion=1\ncreateType=\"twoGbMaxExtentFlat\"\n\
+                    RW 1 FLAT \"a.bin\" 0\nRW 1 FLAT \"b.bin\" 0\n";
+        let dp = tmp.path().join("d.vmdk");
+        std::fs::write(&dp, desc).unwrap();
+        let err = open_flat_extent_for_edit(&dp).unwrap_err();
+        assert!(err.to_string().contains("monolithicFlat"), "{err}");
     }
 
     #[test]

@@ -1449,15 +1449,15 @@ impl InspectTab {
         let is_chd_format = self.export_format == ExportFormat::Chd;
         let is_dynamic_vhd = self.export_format == ExportFormat::VhdDynamic;
         let is_qcow2 = self.export_format == ExportFormat::Qcow2;
+        let is_vmdk_flat = self.export_format == ExportFormat::VmdkFlat;
         // Force whole-disk for formats that don't make sense per-partition:
-        // CHD (headless slice no emulator consumes), dynamic VHD, and QCOW2
-        // (sparse layouts that wrap whole-disk geometry — a single partition
-        // isn't mostly-zero so sparsity buys nothing and there's no
-        // MBR/GPT/APM for the emulator to read).
-        if is_chd_format || is_dynamic_vhd || is_qcow2 {
+        // CHD (headless slice no emulator consumes), dynamic VHD, QCOW2, and
+        // VMDK flat (each wraps a whole-disk geometry the emulator expects to
+        // find an MBR/GPT/APM at sector 0 of).
+        if is_chd_format || is_dynamic_vhd || is_qcow2 || is_vmdk_flat {
             self.export_whole_disk = true;
         }
-        let whole_disk_only = is_chd_format || is_dynamic_vhd || is_qcow2;
+        let whole_disk_only = is_chd_format || is_dynamic_vhd || is_qcow2 || is_vmdk_flat;
 
         egui::Window::new("Export Disk Image")
             .collapsible(false)
@@ -1516,6 +1516,13 @@ impl InspectTab {
                          the sparse layout wraps a whole-disk geometry that \
                          QEMU/UTM expect to find an MBR/GPT/APM at sector 0.",
                     );
+                } else if is_vmdk_flat {
+                    per_part_resp.on_hover_text(
+                        "Per-partition export is not supported for VMDK flat — \
+                         the descriptor wraps a whole-disk geometry that \
+                         VMware/qemu-img/VirtualBox expect to find a partition \
+                         table at sector 0 of.",
+                    );
                 }
 
                 ui.add_space(4.0);
@@ -1537,6 +1544,12 @@ impl InspectTab {
                         .on_hover_text(
                             "QCOW2 v3 — sparse, uncompressed. The container UTM uses \
                              for classic-Mac PPC guests; opens in QEMU, virt-manager.",
+                        );
+                    ui.radio_value(&mut self.export_format, ExportFormat::VmdkFlat, "VMDK (Flat)")
+                        .on_hover_text(
+                            "monolithicFlat VMDK — emits <name>.vmdk descriptor + \
+                             <name>-flat.vmdk raw extent. Opens in VMware Workstation/\
+                             Fusion, VirtualBox, qemu-img.",
                         );
                     ui.radio_value(&mut self.export_format, ExportFormat::Raw, "Raw (.img)");
                     ui.radio_value(&mut self.export_format, ExportFormat::TwoMg, "2MG (.2mg)");

@@ -456,7 +456,7 @@ small ASCII file (`# Disk DescriptorFile`, `createType`, an extent line like
 | # | Session | Scope & deliverable |
 |---|---|---|
 | 3.1 ✅ | **Reader + writer** | `VmdkFlatReader` parses the ASCII descriptor (standalone or embedded), resolves `FLAT`/`ZERO` extents, exposes them as a flat `Read + Seek` stream. `export_vmdk_flat` writes a single-extent `monolithicFlat` (descriptor + `<base>-flat.vmdk`). `ImageFormat::VmdkFlat` + Seam A detection on `# Disk DescriptorFile`. `ExportFormat::VmdkFlat` wired into `export_whole_disk` (backup-folder + raw-source paths). Sparse `KDMV` images detected and rejected pending Phase 4. Tests: round-trip split flat, multi-extent concatenation (FLAT + ZERO + FLAT), descriptor parsing edge cases (quoted/spaced filenames, SPARSE rejection, ZERO extents). |
-| 3.2 | **Edit + integration** | In-place edit (trivial — data is flat, no allocation). GUI/CLI wiring, file-picker filter, docs. |
+| 3.2 ✅ | **Edit + integration** | `vmdk::open_flat_extent_for_edit(descriptor)` resolves the single FLAT extent and returns it `R+W` (rejects multi-extent / ZERO / sparse — convert to monolithicFlat first). GUI radio "VMDK (Flat)" on Inspect + Bulk Convert dialogs; per-partition force-disabled (whole-disk only) for the same reason as dynamic VHD / QCOW2. CLI `rb-cli convert --format vmdk-flat`. Round-trip edit test: descriptor + flat extent → mutate via the helper → reopen via `VmdkFlatReader` → verify mutation visible. |
 
 ### Descriptor format
 
