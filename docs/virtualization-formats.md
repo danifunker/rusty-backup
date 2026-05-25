@@ -321,7 +321,7 @@ allocation tracked by a refcount table → refcount blocks.
 | 2.1 ✅ | **Reader** | `Qcow2Reader` (`Read + Seek`): parse header, walk L1 → L2 → cluster offset; unallocated/zero clusters read as zeros. Detect & reject out-of-scope feature bits with a precise error. Wire into file-open. Tests against fixtures; assert a UTM classic-Mac image inspects as APM + HFS. |
 | 2.2 ✅ | **Writer (convert-to)** | Disk → QCOW2 v3: build L1/L2 + refcount table/blocks, allocate clusters on non-zero data (reuse `sparse_alloc`). New `ExportFormat::Qcow2`. Tests: round-trip via `Qcow2Reader`; verify `qemu-img check` passes if `qemu-img` is available (gated, skipped otherwise). |
 | 2.3 ✅ | **In-place edit (a)** | `Read + Write + Seek`: cluster allocation, refcount increment, L2-table growth (allocate a new L2 when an L1 slot is empty). Host through `open_editable_filesystem`. Tests for the L2-growth path. |
-| 2.4 | **In-place edit (b) + integration** | Refcount-**table** growth edge cases (refcount block full), free-cluster reuse, host-cluster bookkeeping. GUI/CLI wiring. **Acceptance: round-trip a UTM classic-Mac APM+HFS disk** (import → edit a file → export → reopen in UTM/`qemu-img check`). Docs. |
+| 2.4 ✅ | **In-place edit (b) + integration** | Refcount-**table** growth edge cases (refcount block full), free-cluster reuse, host-cluster bookkeeping. GUI/CLI wiring. **Acceptance: round-trip a UTM classic-Mac APM+HFS disk** (import → edit a file → export → reopen in UTM/`qemu-img check`). Docs. |
 
 ### On-disk layout
 

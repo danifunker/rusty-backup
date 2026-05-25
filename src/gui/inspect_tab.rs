@@ -1448,14 +1448,16 @@ impl InspectTab {
 
         let is_chd_format = self.export_format == ExportFormat::Chd;
         let is_dynamic_vhd = self.export_format == ExportFormat::VhdDynamic;
+        let is_qcow2 = self.export_format == ExportFormat::Qcow2;
         // Force whole-disk for formats that don't make sense per-partition:
-        // CHD (headless slice no emulator consumes) and dynamic VHD (one
-        // partition isn't mostly-zero, so the sparse layout buys nothing
-        // and there's no whole-disk geometry to wrap).
-        if is_chd_format || is_dynamic_vhd {
+        // CHD (headless slice no emulator consumes), dynamic VHD, and QCOW2
+        // (sparse layouts that wrap whole-disk geometry — a single partition
+        // isn't mostly-zero so sparsity buys nothing and there's no
+        // MBR/GPT/APM for the emulator to read).
+        if is_chd_format || is_dynamic_vhd || is_qcow2 {
             self.export_whole_disk = true;
         }
-        let whole_disk_only = is_chd_format || is_dynamic_vhd;
+        let whole_disk_only = is_chd_format || is_dynamic_vhd || is_qcow2;
 
         egui::Window::new("Export Disk Image")
             .collapsible(false)
@@ -1508,6 +1510,12 @@ impl InspectTab {
                          a single mostly-used partition. Use fixed VHD for \
                          per-partition export.",
                     );
+                } else if is_qcow2 {
+                    per_part_resp.on_hover_text(
+                        "Per-partition export is not supported for QCOW2 — \
+                         the sparse layout wraps a whole-disk geometry that \
+                         QEMU/UTM expect to find an MBR/GPT/APM at sector 0.",
+                    );
                 }
 
                 ui.add_space(4.0);
@@ -1525,6 +1533,11 @@ impl InspectTab {
                         "Sparse VHD — all-zero blocks are omitted. Same .vhd extension; \
                          readable by Hyper-V, qemu-img, Disk Management.",
                     );
+                    ui.radio_value(&mut self.export_format, ExportFormat::Qcow2, "QCOW2")
+                        .on_hover_text(
+                            "QCOW2 v3 — sparse, uncompressed. The container UTM uses \
+                             for classic-Mac PPC guests; opens in QEMU, virt-manager.",
+                        );
                     ui.radio_value(&mut self.export_format, ExportFormat::Raw, "Raw (.img)");
                     ui.radio_value(&mut self.export_format, ExportFormat::TwoMg, "2MG (.2mg)");
                     ui.radio_value(&mut self.export_format, ExportFormat::Woz, "WOZ (.woz)")

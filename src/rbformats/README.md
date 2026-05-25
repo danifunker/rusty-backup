@@ -7,7 +7,7 @@ Compress/decompress handlers for backup output formats, plus disk reconstruction
 - **`mod.rs`** — Orchestration functions (`compress_partition`, `decompress_to_writer`, `reconstruct_disk_from_backup`) and shared utilities (`SplitWriter`, `write_zeros`, `is_all_zeros`, `output_path`, `file_name`, `CHUNK_SIZE`).
 - **`vhd.rs`** — VHD format: Fixed (`build_vhd_footer`, `export_whole_disk_vhd`, `export_partition_vhd`) and Dynamic/sparse (`DynamicVhdReader`, `export_whole_disk_vhd_dynamic`). Shared: `vhd_chs_geometry`, `vhd_checksum`, `VHD_COOKIE`.
 - **`sparse.rs`** — Shared sparse-allocation bookkeeping (`SparseAllocator`, `is_zero_unit`) reused by dynamic VHD (and later QCOW2, VMDK sparse).
-- **`qcow2.rs`** — QCOW2: `Qcow2Reader` (v2/v3) and `export_qcow2` (writes v3 with `refcount_order = 4`, single-file, uncompressed clusters). Self-referential refcount-block sizing keeps `qemu-img check` clean. In-place edit ships in sessions 2.3/2.4.
+- **`qcow2.rs`** — QCOW2: `Qcow2Reader` (v2/v3, read + in-place allocate-on-write edit) and `export_qcow2` (writes v3 with `refcount_order = 4`, single-file, uncompressed clusters). Self-referential refcount-block sizing keeps `qemu-img check` clean; the editor grows L2 tables + refcount blocks on demand and reuses free host clusters before extending the file.
 - **`chd.rs`** — CHD (MAME) format via the in-process `libchdman-rs` crate: `compress_chd`, `compress_chd_dvd`, `ChdReader`, `CdCookedReader`.
 - **`zstd.rs`** — Zstd streaming compression: `compress_zstd`.
 - **`raw.rs`** — Raw streaming with optional file splitting and sparse zero-skipping: `stream_with_split`.

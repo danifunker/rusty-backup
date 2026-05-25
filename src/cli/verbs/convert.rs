@@ -37,6 +37,8 @@ pub enum ConvertFormat {
     Vhd,
     /// Dynamic (sparse) VHD — all-zero blocks omitted; same .vhd extension.
     VhdDynamic,
+    /// QCOW2 v3 (uncompressed). Sparse: zero clusters omitted.
+    Qcow2,
     /// Raw disk image (no header).
     Raw,
     /// 2MG (Apple II).
@@ -56,6 +58,7 @@ impl From<ConvertFormat> for ExportFormat {
             ConvertFormat::Bincue => ExportFormat::BinCue,
             ConvertFormat::Vhd => ExportFormat::Vhd,
             ConvertFormat::VhdDynamic => ExportFormat::VhdDynamic,
+            ConvertFormat::Qcow2 => ExportFormat::Qcow2,
             ConvertFormat::Raw => ExportFormat::Raw,
             ConvertFormat::Twomg => ExportFormat::TwoMg,
             ConvertFormat::Woz => ExportFormat::Woz,

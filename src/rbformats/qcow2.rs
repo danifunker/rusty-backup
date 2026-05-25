@@ -109,12 +109,28 @@ pub struct Qcow2Reader<R: Read + Seek> {
     /// patch one L1 entry when it grows a new L2 table.
     l1_table_offset: u64,
     /// Refcount table (one u64 entry per refcount block, parsed from disk).
-    /// Session 2.3 mutates **existing** refcount block entries in place; growth
-    /// of the table itself is session 2.4 territory.
+    /// Session 2.4 grows this on demand by appending fresh refcount blocks at
+    /// EOF and patching the on-disk table entry.
     refcount_table: Vec<u64>,
+    /// Host byte offset of the refcount table — needed to patch one entry on
+    /// disk when [`Self::set_refcount_one`] allocates a new refcount block.
+    refcount_table_offset: u64,
+    /// Number of u64 slots the refcount table itself can hold
+    /// (`refcount_table_clusters * cluster_size / 8`). Growing the *table* (as
+    /// opposed to its blocks) would require relocating the entire structure
+    /// and is refused with a clear error — `qemu-img check`-clean images at
+    /// realistic sizes never need it (one cluster of table addresses
+    /// `cluster_size/8` blocks ≈ 16 TiB at 64 KiB clusters).
+    refcount_table_capacity: usize,
+    /// Free host clusters available for reuse before falling back to
+    /// `host_end` append. Lazily populated on the first allocation: scan the
+    /// refcount blocks once and remember every cluster slot whose refcount is
+    /// zero but whose host offset is below `host_end`. Subsequent edits drain
+    /// this Vec first.
+    free_clusters: Option<Vec<u64>>,
     /// Current end-of-file in bytes — where the next allocate-on-write cluster
-    /// lands. Initialised to the file length at open time; advanced by
-    /// `cluster_size` per allocation.
+    /// lands when `free_clusters` is empty. Initialised to the file length at
+    /// open time; advanced by `cluster_size` per host-end alloc.
     host_end: u64,
 }
 
@@ -224,23 +240,28 @@ impl<R: Read + Seek> Qcow2Reader<R> {
         // typical images.
         let refcount_table_offset = u64::from_be_bytes(head[48..56].try_into().unwrap());
         let refcount_table_clusters = u32::from_be_bytes(head[56..60].try_into().unwrap()) as u64;
-        let refcount_table = if refcount_table_offset == 0 || refcount_table_clusters == 0 {
-            // Strict open would refuse this — the spec mandates a refcount
-            // table on v3. Be permissive on read (returns an empty Vec, so the
-            // editor refuses to allocate) so we still inspect odd inputs.
-            Vec::new()
-        } else {
-            let rt_bytes = refcount_table_clusters * cluster_size;
-            if refcount_table_offset + rt_bytes > total_len {
-                bail!("QCOW2 refcount table extends past end of file");
-            }
-            inner.seek(SeekFrom::Start(refcount_table_offset))?;
-            let mut buf = vec![0u8; rt_bytes as usize];
-            inner.read_exact(&mut buf)?;
-            buf.chunks_exact(8)
-                .map(|c| u64::from_be_bytes(c.try_into().unwrap()))
-                .collect()
-        };
+        let (refcount_table, refcount_table_capacity) =
+            if refcount_table_offset == 0 || refcount_table_clusters == 0 {
+                // Strict open would refuse this — the spec mandates a refcount
+                // table on v3. Be permissive on read (returns an empty Vec, so
+                // the editor refuses to allocate) so we still inspect odd
+                // inputs.
+                (Vec::new(), 0usize)
+            } else {
+                let rt_bytes = refcount_table_clusters * cluster_size;
+                if refcount_table_offset + rt_bytes > total_len {
+                    bail!("QCOW2 refcount table extends past end of file");
+                }
+                inner.seek(SeekFrom::Start(refcount_table_offset))?;
+                let mut buf = vec![0u8; rt_bytes as usize];
+                inner.read_exact(&mut buf)?;
+                let entries: Vec<u64> = buf
+                    .chunks_exact(8)
+                    .map(|c| u64::from_be_bytes(c.try_into().unwrap()))
+                    .collect();
+                let cap = entries.len();
+                (entries, cap)
+            };
 
         Ok(Self {
             inner,
@@ -254,6 +275,9 @@ impl<R: Read + Seek> Qcow2Reader<R> {
             pos: 0,
             l1_table_offset,
             refcount_table,
+            refcount_table_offset,
+            refcount_table_capacity,
+            free_clusters: None,
             host_end: total_len,
         })
     }
@@ -462,45 +486,126 @@ impl<R: Read + Write + Seek> Write for Qcow2Reader<R> {
 }
 
 impl<R: Read + Write + Seek> Qcow2Reader<R> {
-    /// Append a fresh host cluster at the current EOF, optionally zero-filling
-    /// it, and bump its refcount. Returns the host byte offset.
+    /// Acquire a fresh host cluster, optionally zero-filling it, and bump its
+    /// refcount. Tries to reuse a free cluster (refcount==0 below `host_end`)
+    /// first so opening → editing → closing repeatedly doesn't bloat the file;
+    /// falls back to appending a cluster at the current EOF.
     ///
     /// `zero_fill = true` is the right answer for L2 tables and for data
     /// clusters that may only be partially written below — the zero region is
     /// what guarantees "untouched bytes of this guest cluster read as 0".
     fn allocate_cluster(&mut self, zero_fill: bool) -> std::io::Result<u64> {
-        let off = self.host_end;
+        self.ensure_free_cluster_index()?;
         let cluster_size = self.header.cluster_size;
+        let off = if let Some(reused) = self.free_clusters.as_mut().and_then(|v| v.pop()) {
+            reused
+        } else {
+            let new_off = self.host_end;
+            self.host_end += cluster_size;
+            new_off
+        };
         if zero_fill {
             self.inner.seek(SeekFrom::Start(off))?;
             let zeros = vec![0u8; cluster_size as usize];
             self.inner.write_all(&zeros)?;
         }
-        self.host_end += cluster_size;
-        self.bump_refcount(off / cluster_size)?;
+        self.set_refcount_one(off / cluster_size)?;
         Ok(off)
     }
 
-    /// Set refcount[cluster_idx] = 1. Session 2.3 limitation: the covering
-    /// refcount block must already exist (no refcount-table growth yet).
-    fn bump_refcount(&mut self, cluster_idx: u64) -> std::io::Result<()> {
+    /// Set refcount[cluster_idx] = 1, growing the refcount **block** at the
+    /// covering table slot on demand. The new block is itself a host cluster
+    /// that needs `refcount=1` — handled via a one-deep recursion since the
+    /// table slot is populated by the time we call back in. Refuses to grow
+    /// the refcount **table** itself (capacity = `refcount_table_capacity`),
+    /// which would mean relocating the entire structure; at typical 64 KiB
+    /// clusters one table cluster already addresses ~16 TiB of host data.
+    fn set_refcount_one(&mut self, cluster_idx: u64) -> std::io::Result<()> {
         let cluster_size = self.header.cluster_size;
         let refcounts_per_block = cluster_size / 2;
         let table_idx = (cluster_idx / refcounts_per_block) as usize;
         let entry_idx = cluster_idx % refcounts_per_block;
-        let rb_off = self.refcount_table.get(table_idx).copied().unwrap_or(0);
-        if rb_off == 0 {
+
+        if table_idx >= self.refcount_table_capacity {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WriteZero,
                 format!(
-                    "QCOW2 edit needs a refcount block at table slot {table_idx} \
-                     (cluster {cluster_idx}); refcount-table growth lands in \
-                     session 2.4"
+                    "QCOW2 edit would need to grow the refcount *table* (slot \
+                     {table_idx} of {}); not supported",
+                    self.refcount_table_capacity
                 ),
             ));
         }
+
+        if self.refcount_table[table_idx] == 0 {
+            // Refcount-block growth: append a fresh zero-filled cluster, patch
+            // the on-disk refcount table, then recurse to set the new block's
+            // own refcount=1 (its table slot is now populated, so the recursion
+            // terminates after one more call).
+            let new_block_off = self.host_end;
+            self.host_end += cluster_size;
+            self.inner.seek(SeekFrom::Start(new_block_off))?;
+            let zeros = vec![0u8; cluster_size as usize];
+            self.inner.write_all(&zeros)?;
+            self.refcount_table[table_idx] = new_block_off;
+            let rt_entry_off = self.refcount_table_offset + (table_idx as u64) * 8;
+            self.inner.seek(SeekFrom::Start(rt_entry_off))?;
+            self.inner.write_all(&new_block_off.to_be_bytes())?;
+            self.set_refcount_one(new_block_off / cluster_size)?;
+        }
+
+        let rb_off = self.refcount_table[table_idx];
         self.inner.seek(SeekFrom::Start(rb_off + entry_idx * 2))?;
         self.inner.write_all(&1u16.to_be_bytes())?;
+        Ok(())
+    }
+
+    /// Lazily build the free-cluster index on the first edit. Scans every
+    /// populated refcount block once and records host clusters whose refcount
+    /// is zero AND whose offset is below `host_end` (i.e. inside the physical
+    /// file — never going above EOF, since clusters past EOF don't exist
+    /// yet). Subsequent allocations drain this Vec via `pop()` before
+    /// extending the file.
+    ///
+    /// Cost: one pass over the existing refcount blocks (at 64 KiB clusters /
+    /// 16-bit refcounts, that's 2 bytes per host cluster — a few MiB even on
+    /// multi-TB images, comfortably one-shot).
+    fn ensure_free_cluster_index(&mut self) -> std::io::Result<()> {
+        if self.free_clusters.is_some() {
+            return Ok(());
+        }
+        let cluster_size = self.header.cluster_size;
+        let refcounts_per_block = cluster_size / 2;
+        let total_clusters_in_file = self.host_end / cluster_size;
+        let mut free: Vec<u64> = Vec::new();
+        let rt_snapshot: Vec<u64> = self.refcount_table.clone();
+        for (table_idx, &rb_off) in rt_snapshot.iter().enumerate() {
+            if rb_off == 0 {
+                continue;
+            }
+            let block_start_cluster = (table_idx as u64) * refcounts_per_block;
+            if block_start_cluster >= total_clusters_in_file {
+                break;
+            }
+            let block_end_cluster =
+                ((table_idx as u64 + 1) * refcounts_per_block).min(total_clusters_in_file);
+            let entries_in_use = (block_end_cluster - block_start_cluster) as usize;
+            let mut buf = vec![0u8; entries_in_use * 2];
+            self.inner.seek(SeekFrom::Start(rb_off))?;
+            self.inner.read_exact(&mut buf)?;
+            for (i, chunk) in buf.chunks_exact(2).enumerate() {
+                let refcount = u16::from_be_bytes(chunk.try_into().unwrap());
+                if refcount == 0 {
+                    let cluster_idx = block_start_cluster + i as u64;
+                    free.push(cluster_idx * cluster_size);
+                }
+            }
+        }
+        // Reverse so `pop()` hands out the lowest free offset first — locality,
+        // and matches the order qemu-img's leak detector would have us
+        // reclaim.
+        free.reverse();
+        self.free_clusters = Some(free);
         Ok(())
     }
 
@@ -1309,6 +1414,267 @@ mod tests {
         r2.read_exact(&mut out).unwrap();
         assert_eq!(&out[..24], &payload);
         assert!(out[24..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn editor_grows_refcount_block_when_appending_past_first_block() {
+        // 512 B clusters → refcounts_per_block = 256 → one refcount block
+        // covers 256 host clusters = 128 KiB host data. Build a small fresh
+        // image (a few KB), then write enough new data clusters to overflow
+        // the first refcount block. The editor must allocate a fresh refcount
+        // block, patch refcount_table[1], and the result must pass qemu-img
+        // check.
+        let cs = 512u64;
+        // Disk must be big enough to demand the writes that overflow.
+        // refcounts_per_block = 256; image starts with ~4 clusters allocated
+        // (header, L1, rt, rb0). Writing into ~270 distinct guest clusters
+        // pushes us past the first refcount block's 256-cluster reach.
+        let disk = 512 * cs; // 256 KiB virtual disk → 512 guest clusters
+        let backing = fresh_qcow2(disk, 9, &[0xAA; 16]);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), backing.get_ref()).unwrap();
+        {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(tmp.path())
+                .unwrap();
+            let mut e = Qcow2Reader::open(f).unwrap();
+            // Refcount table must have at least 2 slots so we can grow into the
+            // second one. With this image size the writer emits exactly one
+            // refcount-table cluster (capacity = 64 slots @ 512 B cluster_size
+            // = cluster_size / 8) — plenty of headroom.
+            assert!(
+                e.refcount_table_capacity >= 2,
+                "test premise needs >=2 refcount table slots, got {}",
+                e.refcount_table_capacity
+            );
+            // Write into ~300 guest clusters, each in its own cluster, to
+            // force enough data-cluster allocations to push the host file past
+            // cluster index 256.
+            for guest_idx in 0..300u64 {
+                e.seek(SeekFrom::Start(guest_idx * cs)).unwrap();
+                let pattern = [(guest_idx as u8).wrapping_add(1); 8];
+                e.write_all(&pattern).unwrap();
+            }
+            // After all those writes refcount_table[1] must be populated.
+            assert!(
+                e.refcount_table.get(1).copied().unwrap_or(0) != 0,
+                "refcount block growth never happened (rt[1] still 0)"
+            );
+            e.flush().unwrap();
+        }
+        match crate::rbformats::qemu_img_test::qemu_img_check(tmp.path()) {
+            Ok(true) => {}
+            Ok(false) => eprintln!("skipping qemu-img check — `qemu-img` not on PATH"),
+            Err(e) => panic!("qemu-img check failed after refcount-block growth: {e}"),
+        }
+        // Read-back check via fresh open: every pattern survives.
+        let f = std::fs::File::open(tmp.path()).unwrap();
+        let mut r = Qcow2Reader::open(f).unwrap();
+        for guest_idx in 0..300u64 {
+            r.seek(SeekFrom::Start(guest_idx * cs)).unwrap();
+            let mut buf = [0u8; 8];
+            r.read_exact(&mut buf).unwrap();
+            let expect = [(guest_idx as u8).wrapping_add(1); 8];
+            assert_eq!(
+                buf, expect,
+                "round-trip mismatch at guest cluster {guest_idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn editor_reuses_free_clusters_before_appending() {
+        // Build an image where the first guest cluster is allocated and the
+        // second is sparse. Manually clear the data cluster's refcount entry
+        // to simulate a free host cluster, then drive an edit that needs a
+        // new data cluster. The editor must reuse the freed slot rather than
+        // extend host_end.
+        let cs = 512u64;
+        let disk = 2 * cs;
+        let mut backing = fresh_qcow2(disk, 9, &[0xCD; 16]).into_inner();
+
+        // Locate the data cluster the writer allocated: walk header → L1 →
+        // L2[0]. Header at byte 0, L1 at cluster_size (refcount_table at the
+        // cluster after L1 region, etc.).
+        let l1_off = cs;
+        let l1_entry = u64::from_be_bytes(
+            backing[l1_off as usize..l1_off as usize + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let l2_host = l1_entry & QCOW2_OFFSET_MASK;
+        let l2_entry = u64::from_be_bytes(
+            backing[l2_host as usize..l2_host as usize + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let data_host = l2_entry & QCOW2_OFFSET_MASK;
+        // Free that cluster: zero its refcount entry + zero L2[0] so the
+        // reader sees the slot as unallocated.
+        let refcounts_per_block = cs / 2;
+        let cluster_idx = data_host / cs;
+        let table_idx = cluster_idx / refcounts_per_block;
+        let entry_idx = cluster_idx % refcounts_per_block;
+        // refcount_table_offset = l1_offset + l1_bytes_padded; the writer uses
+        // 1 cluster for l1 region in this size, so rt is at 2*cs.
+        let rt_off = 2 * cs;
+        let rb_off = u64::from_be_bytes(
+            backing[(rt_off + table_idx * 8) as usize..(rt_off + table_idx * 8) as usize + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let rc_entry_off = (rb_off + entry_idx * 2) as usize;
+        backing[rc_entry_off..rc_entry_off + 2].copy_from_slice(&0u16.to_be_bytes());
+        backing[l2_host as usize..l2_host as usize + 8].copy_from_slice(&0u64.to_be_bytes());
+
+        // Now open editable and write into the second guest cluster. The
+        // allocator should hand back `data_host` (the freed slot) rather than
+        // extending the file.
+        let mut e = Qcow2Reader::open(Cursor::new(backing)).unwrap();
+        let host_end_before = e.host_end;
+        e.seek(SeekFrom::Start(cs)).unwrap();
+        let payload = [0xEE; 16];
+        e.write_all(&payload).unwrap();
+        assert_eq!(
+            e.host_end, host_end_before,
+            "free-cluster reuse must not extend host_end"
+        );
+
+        // Round-trip via fresh reader.
+        let bytes = e.inner.into_inner();
+        let mut r = Qcow2Reader::open(Cursor::new(bytes)).unwrap();
+        r.seek(SeekFrom::Start(cs)).unwrap();
+        let mut buf = [0u8; 16];
+        r.read_exact(&mut buf).unwrap();
+        assert_eq!(buf, payload);
+    }
+
+    /// **Phase 2 acceptance test** (docs/virtualization-formats.md, session 2.4).
+    ///
+    /// Round-trip a UTM-shape APM + classic-HFS disk through every QCOW2
+    /// surface: build the source in memory → `export_qcow2` → reopen as a
+    /// `Qcow2Reader<File>` → host an `EditableFilesystem` over the inner HFS
+    /// partition → create a file via the HFS editor → close → `qemu-img
+    /// check` → reopen read-only → confirm the new file is visible with the
+    /// expected payload. This exercises the writer, the in-place editor
+    /// (allocate-on-write into clusters the writer left unmapped), and the
+    /// `Send + 'static` host requirement of `open_editable_filesystem` all in
+    /// one path.
+    #[test]
+    fn acceptance_apm_hfs_round_trip_through_qcow2_edit() {
+        use crate::fs::filesystem::CreateFileOptions;
+        use crate::fs::hfs::create_blank_hfs;
+        use crate::fs::hfs_clone::emit_apm_disk_with_hfs;
+        use crate::partition::apm::build_minimal_apm;
+
+        // 1. Build a small APM disk with one Apple_HFS partition. 4096
+        //    sectors × 512 B = 2 MiB. Apple_HFS at sector 96 (= 0xC000).
+        let total_blocks: u32 = 4096;
+        let hfs_start: u32 = 96;
+        let mut apm = build_minimal_apm(
+            &[
+                ("Apple_Driver43".into(), 32, 8),
+                ("Apple_HFS".into(), hfs_start, total_blocks - hfs_start),
+            ],
+            512,
+            total_blocks,
+        );
+        apm.entries[2].name = "MacOS".into();
+        let apm_blocks = apm.build_apm_blocks(Some(total_blocks));
+        let mut source = vec![0u8; total_blocks as usize * 512];
+        source[..apm_blocks.len()].copy_from_slice(&apm_blocks);
+        let hfs = create_blank_hfs((total_blocks - hfs_start) as u64 * 512, 4096, "Acceptance")
+            .expect("create_blank_hfs");
+        let mut raw_disk: Vec<u8> = Vec::new();
+        let src_len = source.len() as u64;
+        emit_apm_disk_with_hfs(
+            &mut Cursor::new(source),
+            src_len,
+            &hfs,
+            &mut Cursor::new(&mut raw_disk),
+        )
+        .expect("emit_apm_disk_with_hfs");
+        let disk_size = raw_disk.len() as u64;
+        let hfs_partition_offset = (hfs_start as u64) * 512;
+
+        // 2. Export the raw disk to a QCOW2 tempfile via the writer.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(tmp.path())
+                .unwrap();
+            export_qcow2(
+                &mut Cursor::new(&raw_disk),
+                &mut f,
+                disk_size,
+                0, // default 64 KiB clusters
+                &mut |_| {},
+                &|| false,
+            )
+            .expect("export_qcow2");
+        }
+
+        // 3. Open the QCOW2 read-write as a `Qcow2Reader<File>` and host the
+        //    Apple_HFS partition through `open_editable_filesystem`. This is
+        //    the same shape the GUI / CLI would use once browse-view edit
+        //    learns container readers — Session 2.4 ships the engine path;
+        //    the browse-view integration is an incremental follow-up.
+        let payload = b"hello from qcow2 in-place edit acceptance test\n";
+        let file_name = "GREETING.TXT";
+        {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(tmp.path())
+                .unwrap();
+            let reader = Qcow2Reader::open(f).expect("Qcow2Reader::open r+w");
+            let mut efs = crate::fs::open_editable_filesystem(
+                reader,
+                hfs_partition_offset,
+                0, // partition_type byte ignored for APM (type_string drives)
+                Some("Apple_HFS"),
+            )
+            .expect("open_editable_filesystem over Qcow2Reader");
+            let root = efs.root().expect("root");
+            let opts = CreateFileOptions::default();
+            let mut data_reader = std::io::Cursor::new(payload);
+            efs.create_file(
+                &root,
+                file_name,
+                &mut data_reader,
+                payload.len() as u64,
+                &opts,
+            )
+            .expect("create_file");
+            efs.sync_metadata().expect("sync_metadata");
+        }
+
+        // 4. External validator: qemu-img check must be happy with the edited
+        //    image (refcounts consistent, no truncation). Gated like all the
+        //    other qemu-img tests — skip cleanly when qemu-img isn't present.
+        match crate::rbformats::qemu_img_test::qemu_img_check(tmp.path()) {
+            Ok(true) => {}
+            Ok(false) => eprintln!("skipping qemu-img check — `qemu-img` not on PATH"),
+            Err(e) => panic!("qemu-img check failed on edited APM+HFS image: {e}"),
+        }
+
+        // 5. Reopen the QCOW2 read-only, walk the HFS catalog, find the file.
+        let f = std::fs::File::open(tmp.path()).unwrap();
+        let reader = Qcow2Reader::open(f).unwrap();
+        let mut fs = crate::fs::open_filesystem(reader, hfs_partition_offset, 0, Some("Apple_HFS"))
+            .expect("open_filesystem after edit");
+        let root = fs.root().unwrap();
+        let entries = fs.list_directory(&root).unwrap();
+        let entry = entries
+            .iter()
+            .find(|e| e.name == file_name)
+            .unwrap_or_else(|| panic!("file {file_name} not visible after round-trip"));
+        let buf = fs.read_file(entry, payload.len() * 2).unwrap();
+        assert_eq!(buf, payload, "payload mismatch after QCOW2 edit + reopen");
     }
 
     #[test]

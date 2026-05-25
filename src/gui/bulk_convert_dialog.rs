@@ -161,6 +161,11 @@ impl BulkConvertDialog {
                             "Sparse VHD — all-zero blocks are omitted. Same .vhd extension; \
                              readable by Hyper-V, qemu-img, Disk Management.",
                         );
+                    ui.radio_value(&mut self.format, ExportFormat::Qcow2, "QCOW2")
+                        .on_hover_text(
+                            "QCOW2 v3 — sparse, uncompressed. The format UTM uses for \
+                             classic-Mac PPC guests; opens in QEMU, qemu-img, virt-manager.",
+                        );
                     ui.radio_value(&mut self.format, ExportFormat::Raw, "Raw (.img)");
                     ui.radio_value(&mut self.format, ExportFormat::TwoMg, "2MG (.2mg)");
                     ui.radio_value(&mut self.format, ExportFormat::Woz, "WOZ (.woz)")
