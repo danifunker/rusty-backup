@@ -353,9 +353,8 @@ pub fn infer_fat_type_byte(name: &str) -> u8 {
         0x01
     } else if lower.contains("fat") {
         0x0C
-    } else if lower.contains("ntfs") {
-        0x07
-    } else if lower.contains("exfat") {
+    } else if lower.contains("ntfs") || lower.contains("exfat") {
+        // Both NTFS and exFAT share MBR type 0x07.
         0x07
     } else if lower.contains("linux") || lower.contains("ext") {
         0x83

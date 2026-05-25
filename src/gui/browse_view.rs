@@ -3858,6 +3858,11 @@ fn extract_entry(
                     }
 
                     if has_rsrc || has_finfo {
+                        // Per-mode `has_rsrc` gates are explicit on purpose:
+                        // the Native + SeparateRsrc paths only emit when a
+                        // resource fork is present, while AppleDouble always
+                        // emits (it carries Finder Info too).
+                        #[allow(clippy::collapsible_match)]
                         match resource_fork_mode {
                             ResourceForkMode::Native => {
                                 if has_rsrc {

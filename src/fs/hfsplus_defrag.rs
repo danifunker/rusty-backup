@@ -1620,7 +1620,7 @@ fn serialize_fork(fork: &ForkData, out: &mut [u8]) {
 /// surface a controlled error mirroring Step 13's inline-only
 /// limitation; landing fork-style xattr writes is a separate feature.
 fn emit_xattrs_for_cnid(
-    attr_buf: &mut Vec<u8>,
+    attr_buf: &mut [u8],
     target_cnid: u32,
     xattrs: &[XattrRecord],
     label: &str,

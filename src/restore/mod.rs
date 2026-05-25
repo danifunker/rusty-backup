@@ -3568,7 +3568,7 @@ mod tests {
         mbr[off + 12..off + 16].copy_from_slice(&PART_SECTORS.to_le_bytes());
         mbr[510] = 0x55;
         mbr[511] = 0xAA;
-        std::fs::write(backup_folder.join("mbr.bin"), &mbr).unwrap();
+        std::fs::write(backup_folder.join("mbr.bin"), mbr).unwrap();
         std::fs::write(backup_folder.join("partition-0.raw"), &clone_buf).unwrap();
 
         // Compute the SHA256 over the partition file so verify::compute_checksum

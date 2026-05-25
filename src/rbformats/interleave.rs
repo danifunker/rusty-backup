@@ -123,6 +123,12 @@ impl DosOrderReader {
     pub fn len(&self) -> u64 {
         self.data.len() as u64
     }
+
+    /// `true` if the decoded data is empty. Always `false` for a valid
+    /// 140 KB Apple II floppy, but mandated by clippy alongside `len()`.
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
 }
 
 impl Read for DosOrderReader {

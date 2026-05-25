@@ -326,10 +326,10 @@ impl<R: Read + Seek> FatFilesystem<R> {
                 } else {
                     val & 0x0FFF
                 };
-                if next >= 0x0FF8 {
-                    Ok(None) // end of chain
-                } else if next == 0 || next >= 0x0FF0 {
-                    Ok(None) // bad/reserved
+                // FAT12: end-of-chain (>=0x0FF8), bad/reserved (0 or >=0x0FF0),
+                // otherwise it's a valid forward cluster.
+                if next == 0 || next >= 0x0FF0 {
+                    Ok(None)
                 } else {
                     Ok(Some(next as u32))
                 }
@@ -339,9 +339,9 @@ impl<R: Read + Seek> FatFilesystem<R> {
                 self.reader
                     .seek(SeekFrom::Start(fat_offset + entry_offset))?;
                 let next = self.reader.read_u16::<LittleEndian>()?;
-                if next >= 0xFFF8 {
-                    Ok(None)
-                } else if next == 0 || next >= 0xFFF0 {
+                // FAT16: end-of-chain (>=0xFFF8) and bad/reserved (0 or
+                // >=0xFFF0) both terminate the chain.
+                if next == 0 || next >= 0xFFF0 {
                     Ok(None)
                 } else {
                     Ok(Some(next as u32))
@@ -352,9 +352,9 @@ impl<R: Read + Seek> FatFilesystem<R> {
                 self.reader
                     .seek(SeekFrom::Start(fat_offset + entry_offset))?;
                 let next = self.reader.read_u32::<LittleEndian>()? & 0x0FFF_FFFF;
-                if next >= 0x0FFF_FFF8 {
-                    Ok(None)
-                } else if !(2..0x0FFF_FFF0).contains(&next) {
+                // FAT32: terminate on end-of-chain (>=0x0FFF_FFF8) or
+                // bad/reserved (outside 2..0x0FFF_FFF0).
+                if !(2..0x0FFF_FFF0).contains(&next) {
                     Ok(None)
                 } else {
                     Ok(Some(next))

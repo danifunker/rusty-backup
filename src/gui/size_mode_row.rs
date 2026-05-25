@@ -88,6 +88,10 @@ pub fn size_mode_row(
         if minimum_size < original_size {
             ui.radio_value(choice, SizeMode::Minimum, "Minimum");
         } else {
+            // The `if ui...clicked()` block is intentionally nested under
+            // `Available { fs_name }` so we can use `fs_name` in the hover
+            // text. Clippy's collapse suggestion drops the fs_name binding.
+            #[allow(clippy::collapsible_match)]
             match &opts.deferred {
                 Some(DeferredMin::Pending { phase }) => {
                     ui.add(egui::Spinner::new()).on_hover_text(*phase);

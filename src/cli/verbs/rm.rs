@@ -65,7 +65,7 @@ pub fn run(args: RmArgs) -> Result<()> {
         }
         let mut matches = collect_matches(&mut *fs, &includes, &excludes)?;
         // Deepest-first: more slashes = deeper.
-        matches.sort_by(|a, b| b.2.matches('/').count().cmp(&a.2.matches('/').count()));
+        matches.sort_by_key(|m| std::cmp::Reverse(m.2.matches('/').count()));
         if matches.is_empty() {
             bail!("no matches for {:?}", args.path);
         }

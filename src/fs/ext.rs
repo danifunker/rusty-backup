@@ -4683,7 +4683,7 @@ mod tests {
 
         // The block pointer should be within group 0 (< 64)
         assert!(
-            new_block < 64 && new_block >= 5,
+            (5..64).contains(&new_block),
             "inode 12's block should be relocated to group 0, got {new_block}"
         );
 

@@ -2554,7 +2554,6 @@ mod tests {
             "log: {log:?}"
         );
         // Reopen and verify.
-        let mut cur = cur;
         let fs = AffsFilesystem::open(&mut cur, 0).expect("reopen after grow");
         assert_eq!(fs.total_blocks(), 3520);
         assert_eq!(fs.root_block_num(), 1760);

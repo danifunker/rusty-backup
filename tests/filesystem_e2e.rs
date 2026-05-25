@@ -2244,8 +2244,7 @@ fn test_rdb_sfs_export_shrink_round_trip() {
     )];
 
     // Run the export reconstruct.
-    let mut out_disk: Vec<u8> = Vec::new();
-    out_disk.resize(source_size_bytes as usize, 0);
+    let out_disk: Vec<u8> = vec![0; source_size_bytes as usize];
     let mut dest = Cursor::new(out_disk);
     let mut src2 = Cursor::new(disk.clone());
     let mut log_lines: Vec<String> = Vec::new();

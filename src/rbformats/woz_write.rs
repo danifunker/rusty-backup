@@ -1004,11 +1004,11 @@ mod tests {
         (0..count)
             .map(|s| {
                 let mut data = [0u8; 512];
-                for b in 0..512 {
-                    data[b] = (salt
+                for (b, slot) in data.iter_mut().enumerate() {
+                    *slot = salt
                         .wrapping_add(s as u8)
                         .wrapping_mul(31)
-                        .wrapping_add(b as u8)) as u8;
+                        .wrapping_add(b as u8);
                 }
                 Some(data)
             })

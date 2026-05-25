@@ -827,6 +827,12 @@ impl WozReader {
         self.data.len() as u64
     }
 
+    /// `true` if no data was decoded (always `false` for a valid WOZ
+    /// image; mandated by clippy alongside `len()`).
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
     /// Human-readable disk type description.
     pub fn disk_type_name(&self) -> &'static str {
         match self.disk_type {
