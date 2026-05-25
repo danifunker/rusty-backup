@@ -527,7 +527,7 @@ scheme, so 4.x reuses the patterns proven in Phase 2.
 | # | Session | Scope & deliverable |
 |---|---|---|
 | 4.1 ✅ | **Reader** | `VmdkSparseReader` (`Read + Seek`): parses `KDMV` `SparseExtentHeader`, loads GD into RAM, lazy GT load with single-entry LRU, walks GD → GT → grain for reads, unallocated grains return zeros. Compressed / marker (`streamOptimized`) variants rejected at open. RGD ignored on read (primary GD is authoritative). `ImageFormat::VmdkSparse` + Seam-A detection on `KDMV` magic (placed before flat-descriptor sniff). Tests: hand-built sparse extents covering grain-boundary reads, unallocated zero-fill, seek-then-read, and compressed-flag rejection. |
-| 4.2 | **Writer (convert-to)** | Disk → monolithicSparse: build GD/GT, allocate grains on non-zero data (reuse `sparse_alloc`), write embedded descriptor. `ExportFormat::VmdkSparse`. Tests. |
+| 4.2 ✅ | **Writer (convert-to)** | `export_vmdk_sparse` streams a whole-disk source into a single `monolithicSparse` file: header @ sector 0, embedded descriptor (10 KiB), GD, GTs, grain data; allocates grains on non-zero data via `SparseAllocator`, leaves zero-grain GT entries == 0. `overHead` aligned up to grain boundary. Writer emits v3 header (`version=3`, no RGD, no markers). `ExportFormat::VmdkSparse` + `export_whole_disk_vmdk_sparse` dispatcher (backup-folder + raw-source paths). Round-trip + all-zero-input tests; `qemu-img check` gated test passes on installed `qemu-img 11.0.0`. |
 | 4.3 | **Edit + integration** | Allocate-on-write (append grain, update GT/GD; keep RGD in sync). GUI/CLI wiring, docs. |
 
 ### On-disk layout

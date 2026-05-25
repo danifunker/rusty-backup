@@ -21,9 +21,11 @@
 //! `GD[gt]` (u32 sector offset) → that GT's host sector; `GT[gt][gte]` (u32
 //! sector offset) → the grain's host sector, or `0` for an unallocated grain.
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use anyhow::{bail, Context, Result};
+
+use super::sparse::{is_zero_unit, SparseAllocator};
 
 const VMDK_SECTOR: u64 = 512;
 
@@ -396,6 +398,237 @@ pub fn build_test_image(
     image
 }
 
+// ---------------------------------------------------------------------------
+// Writer — monolithicSparse
+// ---------------------------------------------------------------------------
+
+/// Default grain size in bytes when the caller passes `0` to
+/// [`export_vmdk_sparse`]. Matches VMware's monolithicSparse default
+/// (128 sectors = 64 KiB).
+pub const VMDK_SPARSE_DEFAULT_GRAIN_BYTES: u64 = 64 * 1024;
+/// Default `numGTEsPerGT` — entries per grain table.
+pub const VMDK_SPARSE_DEFAULT_GTES_PER_GT: u32 = 512;
+/// Default embedded-descriptor reservation, in sectors (10 KiB). VMware's
+/// own writers use 20 sectors for monolithicSparse.
+pub const VMDK_SPARSE_DESCRIPTOR_SECTORS: u64 = 20;
+
+/// Stream a whole-disk source into a `monolithicSparse` VMDK at `out`.
+///
+/// Allocates a 64 KiB grain (configurable via `grain_size_bytes`, `0` =
+/// default) on host only for non-zero source grains; runs of zeros stay
+/// unmapped and read back as zeros via [`VmdkSparseReader`]. Mirrors
+/// `export_qcow2` / `export_whole_disk_vhd_dynamic`: backfill the
+/// header/descriptor/GD/GT region at the end, after the data stream is
+/// known.
+///
+/// `disk_size_bytes` must be a non-zero multiple of 512 and equal to the
+/// total bytes available from `reader`.
+pub fn export_vmdk_sparse(
+    reader: &mut impl Read,
+    out: &mut (impl Write + Seek),
+    disk_size_bytes: u64,
+    grain_size_bytes: u64,
+    progress_cb: &mut dyn FnMut(u64),
+    cancel_check: &dyn Fn() -> bool,
+) -> Result<()> {
+    if disk_size_bytes == 0 {
+        bail!("VMDK sparse export: source disk size is zero");
+    }
+    if !disk_size_bytes.is_multiple_of(VMDK_SECTOR) {
+        bail!(
+            "VMDK sparse export: source size {disk_size_bytes} is not a multiple of \
+             {VMDK_SECTOR} bytes"
+        );
+    }
+
+    let grain_size_bytes = if grain_size_bytes == 0 {
+        VMDK_SPARSE_DEFAULT_GRAIN_BYTES
+    } else {
+        grain_size_bytes
+    };
+    if !grain_size_bytes.is_multiple_of(VMDK_SECTOR) || !grain_size_bytes.is_power_of_two() {
+        bail!(
+            "VMDK sparse export: grain size {grain_size_bytes} must be a power-of-two \
+             multiple of 512"
+        );
+    }
+    let grain_size_sectors = grain_size_bytes / VMDK_SECTOR;
+    let num_gtes_per_gt: u32 = VMDK_SPARSE_DEFAULT_GTES_PER_GT;
+    let capacity_sectors = disk_size_bytes / VMDK_SECTOR;
+    let grains_per_gt = grain_size_sectors * num_gtes_per_gt as u64;
+    let num_gts = capacity_sectors.div_ceil(grains_per_gt) as usize;
+
+    // Layout:
+    //   sector 0           — SparseExtentHeader
+    //   sector 1..21       — embedded descriptor (20 sectors / 10 KiB)
+    //   sector 21..        — GD (one u32 per GT)
+    //   ... + GD len       — GTs (each numGTEsPerGT × 4 bytes, padded to a sector)
+    //   overhead_sectors   — start of grain data (rounded up to grain boundary)
+    let gd_bytes = (num_gts * 4) as u64;
+    let gd_sectors = gd_bytes.div_ceil(VMDK_SECTOR);
+    let gt_bytes_per_gt = (num_gtes_per_gt as u64) * 4;
+    let gt_sectors_per_gt = gt_bytes_per_gt.div_ceil(VMDK_SECTOR);
+    let gt_total_sectors = gt_sectors_per_gt * num_gts as u64;
+
+    let descriptor_offset_sectors: u64 = 1;
+    let descriptor_size_sectors: u64 = VMDK_SPARSE_DESCRIPTOR_SECTORS;
+    let gd_first_sector: u64 = descriptor_offset_sectors + descriptor_size_sectors;
+    let gt_first_sector: u64 = gd_first_sector + gd_sectors;
+    let raw_overhead_sectors: u64 = gt_first_sector + gt_total_sectors;
+    // VMware aligns overHead up to grain_size_sectors so grain data is grain-
+    // aligned on host — keeps `qemu-img check` and read paths simple.
+    let overhead_sectors: u64 =
+        raw_overhead_sectors.div_ceil(grain_size_sectors) * grain_size_sectors;
+
+    // Pre-fill GD with sequential GT host sectors; pre-allocate GT buffers (all
+    // zero = no grains yet). GT[gt][gte] = host sector of the grain (or 0).
+    let mut gd: Vec<u32> = Vec::with_capacity(num_gts);
+    for i in 0..num_gts {
+        let gt_host_sector = gt_first_sector + (i as u64) * gt_sectors_per_gt;
+        gd.push(gt_host_sector as u32);
+    }
+    let mut gts: Vec<Vec<u32>> = vec![vec![0u32; num_gtes_per_gt as usize]; num_gts];
+
+    // Zero-fill the reserved header/descriptor/GD/GT region in the output so
+    // the file has a flat backing store before we start writing grain data
+    // past it (Cursor<Vec<u8>> targets need explicit zero-fill; File would
+    // grow on first write but we keep behaviour identical).
+    let reserved_bytes: u64 = overhead_sectors * VMDK_SECTOR;
+    out.seek(SeekFrom::Start(0))?;
+    super::write_zeros(out, reserved_bytes)?;
+
+    // Stream the source one grain at a time. Allocate at EOF for non-zero
+    // grains; leave GT[..]==0 for zero grains.
+    let mut allocator = SparseAllocator::new(reserved_bytes, grain_size_bytes);
+    let mut buf = vec![0u8; grain_size_bytes as usize];
+    let mut read_done: u64 = 0;
+    let mut grain_idx: u64 = 0;
+    while read_done < disk_size_bytes {
+        if cancel_check() {
+            bail!("VMDK sparse export cancelled");
+        }
+        let want = (disk_size_bytes - read_done).min(buf.len() as u64) as usize;
+        // Zero-pad the tail of the final grain if the source isn't a clean
+        // grain multiple.
+        for b in &mut buf[want..] {
+            *b = 0;
+        }
+        reader
+            .read_exact(&mut buf[..want])
+            .context("VMDK sparse export: read source grain")?;
+        read_done += want as u64;
+        let gt_index = (grain_idx / num_gtes_per_gt as u64) as usize;
+        let gte_index = (grain_idx % num_gtes_per_gt as u64) as usize;
+        if !is_zero_unit(&buf[..]) {
+            let host_byte = allocator.alloc();
+            assert!(
+                host_byte.is_multiple_of(VMDK_SECTOR),
+                "grain offset {host_byte} not sector-aligned"
+            );
+            out.seek(SeekFrom::Start(host_byte))?;
+            out.write_all(&buf)?;
+            gts[gt_index][gte_index] = (host_byte / VMDK_SECTOR) as u32;
+        }
+        grain_idx += 1;
+        progress_cb(read_done);
+    }
+
+    // Backfill: header (sector 0), descriptor (sector 1+), GD, GTs.
+    let mut hdr = [0u8; HEADER_LEN];
+    hdr[0..4].copy_from_slice(VMDK_SPARSE_MAGIC);
+    hdr[4..8].copy_from_slice(&3u32.to_le_bytes()); // version 3 — current
+    hdr[8..12].copy_from_slice(&0u32.to_le_bytes()); // flags: no RGD, no markers
+    hdr[12..20].copy_from_slice(&capacity_sectors.to_le_bytes());
+    hdr[20..28].copy_from_slice(&grain_size_sectors.to_le_bytes());
+    hdr[28..36].copy_from_slice(&descriptor_offset_sectors.to_le_bytes());
+    hdr[36..44].copy_from_slice(&descriptor_size_sectors.to_le_bytes());
+    hdr[44..48].copy_from_slice(&num_gtes_per_gt.to_le_bytes());
+    hdr[48..56].copy_from_slice(&0u64.to_le_bytes()); // no RGD
+    hdr[56..64].copy_from_slice(&gd_first_sector.to_le_bytes());
+    hdr[64..72].copy_from_slice(&overhead_sectors.to_le_bytes());
+    hdr[72] = 0; // uncleanShutdown
+    hdr[73] = b'\n';
+    hdr[74] = b' ';
+    hdr[75] = b'\r';
+    hdr[76] = b'\n';
+    hdr[77..79].copy_from_slice(&0u16.to_le_bytes());
+    out.seek(SeekFrom::Start(0))?;
+    out.write_all(&hdr)?;
+
+    // Embedded descriptor — see build_monolithic_sparse_descriptor below.
+    // The reader ignores it (the binary header is authoritative); it's there
+    // so qemu-img / VMware tooling have something to display for `info`.
+    let descriptor = build_monolithic_sparse_descriptor(disk_size_bytes);
+    let mut desc_buf = vec![0u8; (descriptor_size_sectors * VMDK_SECTOR) as usize];
+    let dbytes = descriptor.as_bytes();
+    let copy_len = dbytes.len().min(desc_buf.len() - 1);
+    desc_buf[..copy_len].copy_from_slice(&dbytes[..copy_len]);
+    out.seek(SeekFrom::Start(descriptor_offset_sectors * VMDK_SECTOR))?;
+    out.write_all(&desc_buf)?;
+
+    // GD.
+    let mut gd_bytes_buf = vec![0u8; (gd_sectors * VMDK_SECTOR) as usize];
+    for (i, entry) in gd.iter().enumerate() {
+        let off = i * 4;
+        gd_bytes_buf[off..off + 4].copy_from_slice(&entry.to_le_bytes());
+    }
+    out.seek(SeekFrom::Start(gd_first_sector * VMDK_SECTOR))?;
+    out.write_all(&gd_bytes_buf)?;
+
+    // GTs.
+    let gt_pad_bytes = (gt_sectors_per_gt * VMDK_SECTOR) as usize;
+    let mut gt_buf = vec![0u8; gt_pad_bytes];
+    for (i, gt) in gts.iter().enumerate() {
+        for b in &mut gt_buf {
+            *b = 0;
+        }
+        for (j, entry) in gt.iter().enumerate() {
+            let off = j * 4;
+            gt_buf[off..off + 4].copy_from_slice(&entry.to_le_bytes());
+        }
+        let host_sector = gt_first_sector + (i as u64) * gt_sectors_per_gt;
+        out.seek(SeekFrom::Start(host_sector * VMDK_SECTOR))?;
+        out.write_all(&gt_buf)?;
+    }
+
+    out.flush()?;
+    Ok(())
+}
+
+/// Build a minimal `monolithicSparse` embedded descriptor.
+///
+/// The descriptor is largely cosmetic — `VmdkSparseReader` and qemu-img both
+/// take the binary `SparseExtentHeader` as authoritative — but VMware's own
+/// tools display the `ddb.*` fields verbatim and `qemu-img info` expects a
+/// well-formed extent line. We keep it sector-padded by the caller.
+pub fn build_monolithic_sparse_descriptor(disk_size_bytes: u64) -> String {
+    let sectors = disk_size_bytes / VMDK_SECTOR;
+    let (cyl, heads, secs) = super::vhd::vhd_chs_geometry(disk_size_bytes);
+    // Deterministic but disk-derived CID, same shape as the flat writer.
+    let mut cid: u32 = 0x9E37_79B9;
+    for b in disk_size_bytes.to_le_bytes() {
+        cid = cid.wrapping_mul(0x0100_0193) ^ b as u32;
+    }
+    format!(
+        "# Disk DescriptorFile\n\
+         version=1\n\
+         CID={cid:08x}\n\
+         parentCID=ffffffff\n\
+         createType=\"monolithicSparse\"\n\
+         \n\
+         # Extent description\n\
+         RW {sectors} SPARSE \"image.vmdk\"\n\
+         \n\
+         # The Disk Data Base\n\
+         #DDB\n\
+         ddb.virtualHWVersion = \"4\"\n\
+         ddb.geometry.cylinders = \"{cyl}\"\n\
+         ddb.geometry.heads = \"{heads}\"\n\
+         ddb.geometry.sectors = \"{secs}\"\n\
+         ddb.adapterType = \"ide\"\n",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,6 +698,117 @@ mod tests {
         let mut buf = vec![0u8; 50];
         r.read_exact(&mut buf).unwrap();
         assert_eq!(buf, grain[100..150]);
+    }
+
+    #[test]
+    fn export_round_trips_through_reader() {
+        // 256 KiB source: alternating 64 KiB grains of pattern and zero, plus
+        // a partial trailing grain. Reader must reproduce every byte we put
+        // in, zero-fill the unallocated grain, and tolerate non-aligned tail.
+        let grain = VMDK_SPARSE_DEFAULT_GRAIN_BYTES;
+        let disk_size = grain * 4;
+        let mut src = vec![0u8; disk_size as usize];
+        for (i, b) in src[0..grain as usize].iter_mut().enumerate() {
+            *b = ((i ^ (i >> 3)) & 0xFF) as u8;
+        }
+        for (i, b) in src[(grain * 2) as usize..(grain * 3) as usize]
+            .iter_mut()
+            .enumerate()
+        {
+            *b = ((i.wrapping_mul(31337)) & 0xFF) as u8;
+        }
+        let mut out: Vec<u8> = Vec::new();
+        export_vmdk_sparse(
+            &mut Cursor::new(&src),
+            &mut Cursor::new(&mut out),
+            disk_size,
+            0,
+            &mut |_| {},
+            &|| false,
+        )
+        .unwrap();
+
+        // Reader must round-trip every byte.
+        let mut r = VmdkSparseReader::open(Cursor::new(&out)).unwrap();
+        assert_eq!(r.len(), disk_size);
+        let mut got = vec![0u8; disk_size as usize];
+        r.read_exact(&mut got).unwrap();
+        assert_eq!(got, src);
+
+        // Sparse layout actually omitted the zero grains — file should be
+        // much smaller than logical size (2 allocated grains + header/GD/GTs,
+        // not 4 grains).
+        assert!(
+            (out.len() as u64) < disk_size,
+            "sparse output ({}) should be smaller than logical disk ({})",
+            out.len(),
+            disk_size
+        );
+    }
+
+    #[test]
+    fn export_all_zero_input_skips_all_grains() {
+        let grain = VMDK_SPARSE_DEFAULT_GRAIN_BYTES;
+        let disk_size = grain * 8;
+        let src = vec![0u8; disk_size as usize];
+        let mut out: Vec<u8> = Vec::new();
+        export_vmdk_sparse(
+            &mut Cursor::new(&src),
+            &mut Cursor::new(&mut out),
+            disk_size,
+            0,
+            &mut |_| {},
+            &|| false,
+        )
+        .unwrap();
+        // Output is just the overhead (header + descriptor + GD + GTs, rounded
+        // up to a grain boundary) — *less than one grain* of body.
+        assert!(
+            (out.len() as u64) <= grain,
+            "all-zero export should fit in <=1 grain of overhead, got {} bytes",
+            out.len()
+        );
+        let mut r = VmdkSparseReader::open(Cursor::new(&out)).unwrap();
+        let mut got = vec![0u8; disk_size as usize];
+        r.read_exact(&mut got).unwrap();
+        assert!(got.iter().all(|&b| b == 0));
+    }
+
+    /// Gated `qemu-img check` on a freshly written sparse VMDK. Skips silently
+    /// when `qemu-img` isn't on PATH (CI without QEMU still passes).
+    #[test]
+    fn qemu_img_check_round_trip() {
+        let grain = VMDK_SPARSE_DEFAULT_GRAIN_BYTES;
+        let disk_size = grain * 4;
+        let mut src = vec![0u8; disk_size as usize];
+        for (i, b) in src[grain as usize..(grain * 2) as usize]
+            .iter_mut()
+            .enumerate()
+        {
+            *b = (i & 0xFF) as u8;
+        }
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut out = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(tmp.path())
+                .unwrap();
+            export_vmdk_sparse(
+                &mut Cursor::new(&src),
+                &mut out,
+                disk_size,
+                0,
+                &mut |_| {},
+                &|| false,
+            )
+            .unwrap();
+        }
+        match crate::rbformats::qemu_img_test::qemu_img_check(tmp.path()) {
+            Ok(true) => {}
+            Ok(false) => eprintln!("skipping qemu-img check — `qemu-img` not on PATH"),
+            Err(e) => panic!("qemu-img check failed on monolithicSparse VMDK: {e}"),
+        }
     }
 
     #[test]

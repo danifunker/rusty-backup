@@ -31,6 +31,10 @@ pub enum ExportFormat {
     /// VMDK flat (`monolithicFlat`) — emits a `<base>.vmdk` descriptor + a
     /// sibling `<base>-flat.vmdk` raw extent. Whole-disk only.
     VmdkFlat,
+    /// VMDK sparse (`monolithicSparse`) — single self-contained `.vmdk` with
+    /// embedded header + grain directory + grain tables; zero grains omitted.
+    /// Whole-disk only.
+    VmdkSparse,
     /// Raw disk image — no header/footer.
     Raw,
     /// 2MG (Apple II) — 64-byte header + raw data.
@@ -56,7 +60,7 @@ impl ExportFormat {
         match self {
             Self::Vhd | Self::VhdDynamic => "vhd",
             Self::Qcow2 => "qcow2",
-            Self::VmdkFlat => "vmdk",
+            Self::VmdkFlat | Self::VmdkSparse => "vmdk",
             Self::Raw => "img",
             Self::TwoMg => "2mg",
             Self::Woz => "woz",
@@ -73,6 +77,7 @@ impl ExportFormat {
             Self::VhdDynamic => "Dynamic VHD",
             Self::Qcow2 => "QCOW2",
             Self::VmdkFlat => "VMDK (Flat)",
+            Self::VmdkSparse => "VMDK (Sparse)",
             Self::Raw => "Raw Image",
             Self::TwoMg => "2MG (Apple II)",
             Self::Woz => "WOZ (Apple II)",
@@ -94,7 +99,7 @@ impl ExportFormat {
         match self {
             Self::Vhd | Self::VhdDynamic => ("VHD Files", &["vhd", "hda"]),
             Self::Qcow2 => ("QCOW2 Files", &["qcow2", "qcow"]),
-            Self::VmdkFlat => ("VMDK Files", &["vmdk"]),
+            Self::VmdkFlat | Self::VmdkSparse => ("VMDK Files", &["vmdk"]),
             Self::Raw => ("Raw Images", &["img", "raw", "bin", "dd"]),
             Self::TwoMg => ("2MG Files", &["2mg"]),
             Self::Woz => ("WOZ Files", &["woz"]),
@@ -288,6 +293,19 @@ pub fn export_whole_disk(
 
     if format == ExportFormat::VmdkFlat {
         return export_whole_disk_vmdk_flat(
+            source_path,
+            backup_metadata,
+            mbr_bytes,
+            partition_sizes,
+            dest_path,
+            progress_cb,
+            cancel_check,
+            log_cb,
+        );
+    }
+
+    if format == ExportFormat::VmdkSparse {
+        return export_whole_disk_vmdk_sparse(
             source_path,
             backup_metadata,
             mbr_bytes,
@@ -1040,6 +1058,83 @@ fn export_whole_disk_vmdk_flat(
 
     log_cb(&format!(
         "VMDK flat export complete: {} ({} logical bytes)",
+        dest_path.display(),
+        disk_size,
+    ));
+    Ok(())
+}
+
+/// Export a whole disk as a `monolithicSparse` VMDK (single self-contained
+/// `.vmdk` with embedded header + GD + GTs). Backup folders are reconstructed
+/// into a tempfile first (the writer needs to seek backward to backfill the
+/// GD/GT region); raw images/devices stream through `wrap_image_reader`.
+#[allow(clippy::too_many_arguments)]
+fn export_whole_disk_vmdk_sparse(
+    source_path: &Path,
+    backup_metadata: Option<&BackupMetadata>,
+    mbr_bytes: Option<&[u8; 512]>,
+    partition_sizes: &[PartitionSizeOverride],
+    dest_path: &Path,
+    mut progress_cb: impl FnMut(u64),
+    cancel_check: impl Fn() -> bool,
+    mut log_cb: impl FnMut(&str),
+) -> Result<()> {
+    let mut out = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dest_path)
+        .with_context(|| format!("failed to create {}", dest_path.display()))?;
+
+    let disk_size = if let Some(meta) = backup_metadata {
+        let mut tmp =
+            tempfile::tempfile().context("create tempfile for VMDK sparse reconstruction")?;
+        let written = reconstruct_disk_from_backup(
+            source_path,
+            meta,
+            mbr_bytes,
+            partition_sizes,
+            meta.source_size_bytes,
+            &mut tmp,
+            false,
+            false,
+            None,
+            None,
+            &mut progress_cb,
+            &cancel_check,
+            &mut log_cb,
+        )?;
+        tmp.flush()?;
+        tmp.seek(SeekFrom::Start(0))?;
+        super::vmdk_sparse::export_vmdk_sparse(
+            &mut tmp,
+            &mut out,
+            written,
+            0,
+            &mut progress_cb,
+            &cancel_check,
+        )?;
+        written
+    } else {
+        let file = File::open(source_path)
+            .with_context(|| format!("failed to open {}", source_path.display()))?;
+        let file2 = File::open(source_path)?;
+        let fmt = super::detect_image_format_with_path(file, Some(source_path))?;
+        let (mut reader, source_data_size) = super::wrap_image_reader(file2, fmt)?;
+        super::vmdk_sparse::export_vmdk_sparse(
+            &mut reader,
+            &mut out,
+            source_data_size,
+            0,
+            &mut progress_cb,
+            &cancel_check,
+        )?;
+        source_data_size
+    };
+
+    log_cb(&format!(
+        "VMDK sparse export complete: {} ({} logical bytes)",
         dest_path.display(),
         disk_size,
     ));
