@@ -11,7 +11,7 @@
 //! follow-up.
 
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
@@ -126,6 +126,103 @@ pub fn materialize_imz_to_temp(path: &Path) -> Result<ImzMaterialized> {
         guard,
         entry_name,
     })
+}
+
+// ---------------------------------------------------------------------------
+// ImzReader — streaming Read+Seek over an IMZ (eager-decompress into memory)
+// ---------------------------------------------------------------------------
+//
+// Floppy images are tiny (1.44 / 2.88 MB), so the entire entry is
+// decompressed into a Vec<u8> at open time. The win versus
+// `materialize_imz_to_temp` is the absent tempfile/TempDir lifecycle:
+// callers no longer have to keep a TempDir guard alive, and there's no
+// filesystem write/sync. Matches the shape of `GhoReader` / `ChdReader`
+// so `model::source_reader::open_read` can route uniformly.
+
+/// `Read + Seek` over the decoded floppy image inside an IMZ.
+///
+/// Memory-backed (`Cursor<Vec<u8>>`); the entire entry is decompressed
+/// at [`ImzReader::open`] time. Floppy images don't exceed a few MB,
+/// so this is cheaper than writing to a tempfile.
+pub struct ImzReader {
+    cursor: Cursor<Vec<u8>>,
+    entry_name: String,
+    logical_size: u64,
+}
+
+impl ImzReader {
+    /// Open an IMZ and eagerly decompress its single floppy-image entry
+    /// into memory. Errors mirror [`materialize_imz_to_temp`] (empty
+    /// archive, no extractable entry, password-protected).
+    pub fn open(path: &Path) -> Result<Self> {
+        let file = File::open(path).with_context(|| format!("opening IMZ {}", path.display()))?;
+        let mut archive = zip::ZipArchive::new(file)
+            .with_context(|| format!("parsing IMZ {} as ZIP", path.display()))?;
+
+        if archive.is_empty() {
+            return Err(anyhow!("IMZ {} contains no entries", path.display()));
+        }
+
+        let mut chosen: Option<usize> = None;
+        let mut fallback: Option<usize> = None;
+        for i in 0..archive.len() {
+            let entry = archive.by_index(i)?;
+            if entry.is_dir() {
+                continue;
+            }
+            if is_image_entry(entry.name()) {
+                chosen = Some(i);
+                break;
+            }
+            if fallback.is_none() {
+                fallback = Some(i);
+            }
+        }
+        let idx = chosen
+            .or(fallback)
+            .ok_or_else(|| anyhow!("IMZ {} has no extractable file entry", path.display()))?;
+
+        let mut entry = archive.by_index(idx)?;
+        if entry.encrypted() {
+            return Err(anyhow!(
+                "IMZ {} is password-protected (entry \"{}\"); password-protected IMZ \
+                 archives are not yet supported",
+                path.display(),
+                entry.name()
+            ));
+        }
+        let entry_name = entry.name().to_string();
+        let logical_size = entry.size();
+        let mut buf = Vec::with_capacity(logical_size as usize);
+        io::copy(&mut entry, &mut buf)
+            .with_context(|| format!("decompressing IMZ entry \"{}\"", entry_name))?;
+
+        Ok(Self {
+            cursor: Cursor::new(buf),
+            entry_name,
+            logical_size,
+        })
+    }
+
+    pub fn logical_size(&self) -> u64 {
+        self.logical_size
+    }
+
+    pub fn entry_name(&self) -> &str {
+        &self.entry_name
+    }
+}
+
+impl Read for ImzReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.cursor.read(buf)
+    }
+}
+
+impl Seek for ImzReader {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.cursor.seek(pos)
+    }
 }
 
 #[cfg(test)]
@@ -250,6 +347,53 @@ mod tests {
         let zw = zip::ZipWriter::new(f);
         zw.finish().unwrap();
         let err = materialize_imz_to_temp(&path).unwrap_err();
+        assert!(format!("{err}").contains("no entries"));
+    }
+
+    #[test]
+    fn imz_reader_round_trips_payload() {
+        let payload: Vec<u8> = (0..4096).map(|i| (i * 37) as u8).collect();
+        let imz = build_imz("disk.ima", &payload);
+        let mut r = ImzReader::open(&imz).unwrap();
+        assert_eq!(r.logical_size(), payload.len() as u64);
+        assert_eq!(r.entry_name(), "disk.ima");
+
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, payload);
+
+        // Random-access seek.
+        r.seek(SeekFrom::Start(2048)).unwrap();
+        let mut sample = vec![0u8; 256];
+        r.read_exact(&mut sample).unwrap();
+        assert_eq!(sample, payload[2048..2048 + 256]);
+    }
+
+    #[test]
+    fn imz_reader_matches_materialize_to_temp_byte_for_byte() {
+        let payload: Vec<u8> = (0..8192).map(|i| (i ^ 0xA5) as u8).collect();
+        let imz = build_imz("disk.IMG", &payload);
+        let via_reader = {
+            let mut r = ImzReader::open(&imz).unwrap();
+            let mut buf = Vec::new();
+            r.read_to_end(&mut buf).unwrap();
+            buf
+        };
+        let via_temp = {
+            let mat = materialize_imz_to_temp(&imz).unwrap();
+            std::fs::read(&mat.temp_path).unwrap()
+        };
+        assert_eq!(via_reader, via_temp);
+    }
+
+    #[test]
+    fn imz_reader_rejects_empty_archive() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let path = dir.join("empty.imz");
+        let f = File::create(&path).unwrap();
+        let zw = zip::ZipWriter::new(f);
+        zw.finish().unwrap();
+        let err = ImzReader::open(&path).err().expect("must error");
         assert!(format!("{err}").contains("no entries"));
     }
 

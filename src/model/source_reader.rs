@@ -19,6 +19,7 @@ use anyhow::{Context, Result};
 
 use crate::rbformats::chd::ChdReader;
 use crate::rbformats::gho::{GhoReader, GHO_MAGIC};
+use crate::rbformats::imz::{ImzReader, IMZ_MAGIC};
 use crate::rbformats::ReadSeek;
 
 /// Cheap magic sniff: returns true when `path` starts with `MComprHD`.
@@ -28,6 +29,27 @@ pub fn is_chd_path(path: &Path) -> bool {
     };
     let mut magic = [0u8; 8];
     matches!(f.read(&mut magic), Ok(n) if n == 8) && &magic == b"MComprHD"
+}
+
+/// Cheap sniff: returns true when `path` looks like a WinImage IMZ
+/// archive. IMZ is just a ZIP, so the bare magic (`PK\x03\x04`) would
+/// false-positive on arbitrary ZIPs — we additionally require the
+/// extension to be `.imz` (case-insensitive). Both conditions must hold
+/// before [`open_read`] swaps in an [`ImzReader`].
+pub fn is_imz_path(path: &Path) -> bool {
+    let ext_ok = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.eq_ignore_ascii_case("imz"))
+        .unwrap_or(false);
+    if !ext_ok {
+        return false;
+    }
+    let Ok(mut f) = File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 4];
+    matches!(f.read(&mut magic), Ok(n) if n == 4) && &magic == IMZ_MAGIC
 }
 
 /// Cheap magic sniff: returns true when `path` starts with the Norton
@@ -63,6 +85,9 @@ pub fn open_read(path: &Path) -> Result<Box<dyn ReadSeek>> {
     } else if is_gho_path(path) {
         let gho = GhoReader::open(path).with_context(|| format!("open GHO {}", path.display()))?;
         Ok(Box::new(gho))
+    } else if is_imz_path(path) {
+        let imz = ImzReader::open(path).with_context(|| format!("open IMZ {}", path.display()))?;
+        Ok(Box::new(imz))
     } else {
         let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
         Ok(Box::new(BufReader::new(f)))
@@ -73,6 +98,50 @@ pub fn open_read(path: &Path) -> Result<Box<dyn ReadSeek>> {
 mod tests {
     use super::*;
     use std::io::{Read, Seek, SeekFrom, Write};
+
+    #[test]
+    fn is_imz_path_requires_both_extension_and_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        // Right magic, wrong extension.
+        let zip_only = dir.path().join("regular.zip");
+        std::fs::write(&zip_only, b"PK\x03\x04rest").unwrap();
+        assert!(!is_imz_path(&zip_only), "ZIP without .imz extension");
+
+        // Right extension, wrong magic.
+        let wrong_magic = dir.path().join("fake.imz");
+        std::fs::write(&wrong_magic, b"NOPE").unwrap();
+        assert!(!is_imz_path(&wrong_magic), "imz extension without PK magic");
+
+        // Both.
+        let real = dir.path().join("real.imz");
+        std::fs::write(&real, b"PK\x03\x04rest").unwrap();
+        assert!(is_imz_path(&real));
+    }
+
+    #[test]
+    fn open_read_routes_imz_through_imz_reader() {
+        use std::io::Write as _;
+        use zip::write::SimpleFileOptions;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.imz");
+        let payload: Vec<u8> = (0..2048).map(|i| (i ^ 0x33) as u8).collect();
+        {
+            let f = File::create(&path).unwrap();
+            let mut zw = zip::ZipWriter::new(f);
+            zw.start_file(
+                "disk.ima",
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated),
+            )
+            .unwrap();
+            zw.write_all(&payload).unwrap();
+            zw.finish().unwrap();
+        }
+        let mut r = open_read(&path).unwrap();
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, payload);
+    }
 
     #[test]
     fn is_gho_path_rejects_non_gho() {
