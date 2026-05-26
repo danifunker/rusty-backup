@@ -887,6 +887,353 @@ fn decode_sector_block_stream<R: Read + Seek, W: Write>(
     Ok(total)
 }
 
+// ---------------------------------------------------------------------------
+// GhoReader — streaming Read+Seek over a SECTOR-mode GHO (or span set)
+// ---------------------------------------------------------------------------
+//
+// Eliminates the temp-file decode for browse / inspect / metadata reads.
+// Modelled after ChdReader: open once (cheap index pass, no
+// decompression), then random-access reads of the logical disk image
+// pull-decompress one block at a time, cached.
+//
+// Only SECTOR mode is supported here. File-aware mode keeps the legacy
+// decode-to-temp path (it has no LBA-addressable block layout). For
+// uncompressed SECTOR backups the reader is a thin wrapper over
+// SpanReader; for Fast / High compression the open scan walks the
+// `[u16 stored_len][block_body]` chunks recording each block's file
+// offset and stored_len, decompresses only the final block to learn its
+// exact size, and assumes the standard 32 KiB decompressed length for
+// every other block (Ghost's writer emits fixed-size blocks
+// throughout). A debug assertion fires inside `decode_block_into` if a
+// non-final block ever decompresses to a different size.
+
+const GHO_BLOCK_DECOMPRESSED_SIZE: usize = FAST_LZ_BLOCK_SIZE; // 32 KiB
+
+#[derive(Debug, Clone)]
+struct GhoBlockEntry {
+    /// Byte offset of the `[u16 stored_len]` prefix in the SpanReader.
+    file_offset: u64,
+    /// Total length on disk (includes the 2-byte stored_len prefix).
+    stored_len: u16,
+    /// Where this block's first decompressed byte sits in the logical image.
+    output_offset: u64,
+    /// Decompressed length. 32 KiB for all blocks except possibly the last.
+    decompressed_len: u32,
+}
+
+/// Streaming `Read + Seek` over a Norton Ghost SECTOR-mode image. Opens
+/// in milliseconds (header parse + index walk, no decompression) and
+/// decompresses one block on each read miss, caching the last block.
+///
+/// Multi-file span sets are handled transparently via [`SpanReader`];
+/// callers pass the primary `.gho` path and span discovery happens
+/// inside [`GhoReader::open`].
+///
+/// **Scope: SECTOR mode only.** File-aware (`image_type=0x00`) and
+/// password-protected GHOs return an error from `open`.
+pub struct GhoReader {
+    inner: SpanReader,
+    logical_size: u64,
+    position: u64,
+    mode: GhoReaderMode,
+}
+
+enum GhoReaderMode {
+    Uncompressed {
+        data_start: u64,
+    },
+    Blocked {
+        compression: GhoCompression,
+        blocks: Vec<GhoBlockEntry>,
+        cache_block_index: Option<usize>,
+        cache_buf: Vec<u8>,
+    },
+}
+
+impl GhoReader {
+    /// Open a SECTOR-mode GHO (single file or span set) for streaming
+    /// reads. Errors on file-aware mode, password-protected, or unknown
+    /// compression byte — these route to the legacy decode-to-temp path
+    /// instead.
+    pub fn open(path: &Path) -> Result<Self> {
+        let span_set = discover_gho_span_set(path)
+            .with_context(|| format!("discovering span set for {}", path.display()))?;
+
+        let mut primary = File::open(&span_set[0])
+            .with_context(|| format!("opening {}", span_set[0].display()))?;
+        let header = GhoContainerHeader::parse(&mut primary)
+            .with_context(|| format!("parsing GHO header from {}", span_set[0].display()))?;
+        drop(primary);
+
+        if header.container_version != 0x01 {
+            bail!(
+                "GHO {} container version {:#04x} not supported by GhoReader",
+                path.display(),
+                header.container_version
+            );
+        }
+        if header.password_protected {
+            bail!(
+                "GHO {} is password-protected; GhoReader cannot decrypt (see docs/gho_password.md)",
+                path.display()
+            );
+        }
+        if !matches!(header.image_type, GhoImageType::Sector) {
+            bail!(
+                "GHO {} is not SECTOR mode (image_type {:?}); GhoReader supports SECTOR only",
+                path.display(),
+                header.image_type
+            );
+        }
+
+        let mut inner = SpanReader::open(&span_set)
+            .with_context(|| format!("opening span set for {}", path.display()))?;
+        let file_size = inner.total_len();
+        let data_start = find_sector_data_start(&mut inner, file_size)?;
+
+        match header.compression {
+            GhoCompression::None => {
+                let logical_size = file_size.saturating_sub(data_start);
+                Ok(Self {
+                    inner,
+                    logical_size,
+                    position: 0,
+                    mode: GhoReaderMode::Uncompressed { data_start },
+                })
+            }
+            GhoCompression::Fast | GhoCompression::High => {
+                let mut blocks = index_sector_blocks(&mut inner, data_start, file_size)?;
+                // Fix the last block's decompressed_len — middle blocks are
+                // always 32 KiB but the final block can be smaller when the
+                // source partition size isn't a 32 KiB multiple.
+                if let Some(last) = blocks.last_mut() {
+                    let mut tmp = vec![0u8; GHO_BLOCK_DECOMPRESSED_SIZE + 1024];
+                    let n = decode_block_into(&mut inner, last, header.compression, &mut tmp)
+                        .with_context(|| format!("sizing final block of {}", path.display()))?;
+                    last.decompressed_len = n as u32;
+                }
+                let logical_size = blocks
+                    .last()
+                    .map(|b| b.output_offset + b.decompressed_len as u64)
+                    .unwrap_or(0);
+                Ok(Self {
+                    inner,
+                    logical_size,
+                    position: 0,
+                    mode: GhoReaderMode::Blocked {
+                        compression: header.compression,
+                        blocks,
+                        cache_block_index: None,
+                        cache_buf: Vec::with_capacity(GHO_BLOCK_DECOMPRESSED_SIZE + 1024),
+                    },
+                })
+            }
+            GhoCompression::Other(b) => bail!(
+                "GHO {} has unknown compression byte {:#04x}",
+                path.display(),
+                b
+            ),
+        }
+    }
+
+    /// Logical (decompressed) byte length of the disk image.
+    pub fn logical_size(&self) -> u64 {
+        self.logical_size
+    }
+
+    /// Number of indexed compressed blocks. For uncompressed images this
+    /// is 0 (the reader streams raw bytes). Exposed for diagnostics and
+    /// tests.
+    pub fn block_count(&self) -> usize {
+        match &self.mode {
+            GhoReaderMode::Uncompressed { .. } => 0,
+            GhoReaderMode::Blocked { blocks, .. } => blocks.len(),
+        }
+    }
+
+    fn ensure_block_cached(&mut self, idx: usize) -> std::io::Result<()> {
+        let GhoReaderMode::Blocked {
+            compression,
+            blocks,
+            cache_block_index,
+            cache_buf,
+        } = &mut self.mode
+        else {
+            return Ok(());
+        };
+        if *cache_block_index == Some(idx) {
+            return Ok(());
+        }
+        let block = &blocks[idx];
+        cache_buf.clear();
+        cache_buf.resize(GHO_BLOCK_DECOMPRESSED_SIZE + 1024, 0);
+        let n = decode_block_into(&mut self.inner, block, *compression, cache_buf)
+            .map_err(|e| std::io::Error::other(format!("GHO block {}: {:#}", idx, e)))?;
+        debug_assert_eq!(
+            n as u32, block.decompressed_len,
+            "block {} decompressed to {} bytes, index says {}",
+            idx, n, block.decompressed_len
+        );
+        cache_buf.truncate(n);
+        *cache_block_index = Some(idx);
+        Ok(())
+    }
+}
+
+unsafe impl Send for GhoReader {}
+
+impl Read for GhoReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() || self.position >= self.logical_size {
+            return Ok(0);
+        }
+        match &self.mode {
+            GhoReaderMode::Uncompressed { data_start } => {
+                let phys = data_start + self.position;
+                let remaining = self.logical_size - self.position;
+                let to_read = (buf.len() as u64).min(remaining) as usize;
+                self.inner.seek(SeekFrom::Start(phys))?;
+                let n = self.inner.read(&mut buf[..to_read])?;
+                self.position += n as u64;
+                Ok(n)
+            }
+            GhoReaderMode::Blocked { blocks, .. } => {
+                // Binary search for the block containing `self.position`.
+                let idx = match blocks.binary_search_by(|b| b.output_offset.cmp(&self.position)) {
+                    Ok(i) => i,
+                    Err(0) => 0,
+                    Err(i) => i - 1,
+                };
+                self.ensure_block_cached(idx)?;
+                let GhoReaderMode::Blocked {
+                    blocks, cache_buf, ..
+                } = &self.mode
+                else {
+                    unreachable!()
+                };
+                let block = &blocks[idx];
+                let off_in_block = (self.position - block.output_offset) as usize;
+                let avail = cache_buf.len().saturating_sub(off_in_block);
+                let n = avail.min(buf.len());
+                buf[..n].copy_from_slice(&cache_buf[off_in_block..off_in_block + n]);
+                self.position += n as u64;
+                Ok(n)
+            }
+        }
+    }
+}
+
+impl Seek for GhoReader {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let new_pos: i128 = match pos {
+            SeekFrom::Start(o) => o as i128,
+            SeekFrom::Current(o) => self.position as i128 + o as i128,
+            SeekFrom::End(o) => self.logical_size as i128 + o as i128,
+        };
+        if new_pos < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "GhoReader seek before start",
+            ));
+        }
+        self.position = (new_pos as u64).min(self.logical_size);
+        Ok(self.position)
+    }
+}
+
+impl DataLen for GhoReader {
+    fn total_len(&self) -> u64 {
+        self.logical_size
+    }
+}
+
+/// Walk the compressed block stream once without decompressing any
+/// block except the last. Records each block's file offset, stored_len,
+/// and computed logical output offset; decompresses only the final
+/// block to learn its exact length so `logical_size` is correct down
+/// to the byte.
+fn index_sector_blocks<R: Read + Seek>(
+    reader: &mut R,
+    data_start: u64,
+    data_end: u64,
+) -> Result<Vec<GhoBlockEntry>> {
+    let mut blocks = Vec::new();
+    let mut off = data_start;
+    let mut output_offset: u64 = 0;
+    let record_magic = GHO_RECORD_MAGIC.to_le_bytes();
+    while off + 2 <= data_end {
+        reader.seek(SeekFrom::Start(off))?;
+        let mut peek = [0u8; GHO_RECORD_HEADER_LEN];
+        let peek_n = read_fully_or_eof(reader, &mut peek)?;
+        if peek_n >= 8 && peek[4..8] == record_magic {
+            break;
+        }
+        let stored_len = u16::from_le_bytes([peek[0], peek[1]]) as u64;
+        if stored_len < 4 {
+            break;
+        }
+        if off + stored_len > data_end {
+            // Truncated final chunk; stop cleanly.
+            break;
+        }
+        blocks.push(GhoBlockEntry {
+            file_offset: off,
+            stored_len: stored_len as u16,
+            output_offset,
+            decompressed_len: GHO_BLOCK_DECOMPRESSED_SIZE as u32,
+        });
+        output_offset += GHO_BLOCK_DECOMPRESSED_SIZE as u64;
+        off += stored_len;
+    }
+    Ok(blocks)
+}
+
+/// Decompress one indexed block into `dst`. `dst` must be at least
+/// `GHO_BLOCK_DECOMPRESSED_SIZE + 1024` bytes; the actual decompressed
+/// length is returned.
+fn decode_block_into<R: Read + Seek>(
+    reader: &mut R,
+    block: &GhoBlockEntry,
+    compression: GhoCompression,
+    dst: &mut [u8],
+) -> Result<usize> {
+    let comp_len = (block.stored_len as usize).saturating_sub(2);
+    let mut buf = vec![0u8; comp_len];
+    reader.seek(SeekFrom::Start(block.file_offset + 2))?;
+    reader
+        .read_exact(&mut buf)
+        .with_context(|| format!("reading block body at {:#x}", block.file_offset + 2))?;
+    match compression {
+        GhoCompression::Fast => fast_lz_decompress(&buf, comp_len, dst)
+            .with_context(|| format!("Fast-LZ decode at {:#x}", block.file_offset)),
+        GhoCompression::High => {
+            use flate2::read::ZlibDecoder;
+            let mut dec = ZlibDecoder::new(&buf[..]);
+            let mut n = 0;
+            loop {
+                if n >= dst.len() {
+                    bail!(
+                        "GHO SECTOR zlib block at {:#x} decoded > {} bytes",
+                        block.file_offset,
+                        dst.len()
+                    );
+                }
+                match dec.read(&mut dst[n..]) {
+                    Ok(0) => return Ok(n),
+                    Ok(k) => n += k,
+                    Err(e) => {
+                        return Err(anyhow::Error::from(e)
+                            .context(format!("zlib decode at {:#x}", block.file_offset)));
+                    }
+                }
+            }
+        }
+        GhoCompression::None | GhoCompression::Other(_) => {
+            bail!("decode_block_into called with non-block compression")
+        }
+    }
+}
+
 /// Result of materializing a GHO container to a temp file. Same shape as
 /// [`crate::rbformats::imz::ImzMaterialized`] so the GUI's
 /// `materialize_amiga_image_path` can treat both formats identically.
@@ -2590,5 +2937,127 @@ mod tests {
             mat.temp_path.display(),
             mat.logical_size
         );
+    }
+
+    // ---------- GhoReader (streaming Read+Seek) ----------
+
+    #[test]
+    fn gho_reader_uncompressed_sector_matches_decode_to_temp() {
+        let mut s0 = [0u8; 512];
+        s0[0..3].copy_from_slice(b"\xeb\x58\x90");
+        s0[510] = 0x55;
+        s0[511] = 0xAA;
+        let mut s1 = [0u8; 512];
+        s1[..16].copy_from_slice(b"second sector...");
+        let buf = build_sector_mode_uncompressed(&[s0, s1]);
+        let path = write_to_temp(&buf);
+
+        // Reader path
+        let mut reader = GhoReader::open(&path).unwrap();
+        assert_eq!(reader.logical_size(), 1024);
+        let mut via_reader = Vec::new();
+        reader.read_to_end(&mut via_reader).unwrap();
+
+        // Temp-file path
+        let mat = materialize_gho_to_temp(&path).unwrap();
+        let via_temp = std::fs::read(&mat.temp_path).unwrap();
+
+        assert_eq!(via_reader, via_temp);
+
+        // Random-access seek
+        let mut buf2 = [0u8; 16];
+        reader.seek(SeekFrom::Start(512)).unwrap();
+        reader.read_exact(&mut buf2).unwrap();
+        assert_eq!(&buf2, b"second sector...");
+    }
+
+    #[test]
+    fn gho_reader_rejects_file_aware() {
+        let buf = build_header(0x00, 0x00, 0x00, None);
+        let path = write_to_temp(&buf);
+        let err = GhoReader::open(&path).err().expect("must error");
+        assert!(format!("{err:#}").to_lowercase().contains("sector"));
+    }
+
+    #[test]
+    fn gho_reader_rejects_password_protected() {
+        let buf = build_header(0x03, 0x01, 0x01, None);
+        let path = write_to_temp(&buf);
+        let err = GhoReader::open(&path).err().expect("must error");
+        assert!(format!("{err:#}").to_lowercase().contains("password"));
+    }
+
+    /// Open the zlib-compressed SECTOR fixture via GhoReader and confirm
+    /// the streamed contents match `materialize_gho_to_temp` byte-for-byte.
+    /// This is the load-bearing assertion: if the streaming reader and
+    /// batch decoder disagree on a single byte, browse / inspect against
+    /// the streaming reader would see corrupted data.
+    #[test]
+    #[ignore = "fixture-gated; decompresses hundreds of MB. Opt in with --ignored"]
+    fn gho_reader_matches_decode_to_temp_on_real_secthigh() {
+        let home = match std::env::var("HOME") {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        let path = std::path::PathBuf::from(home).join(
+            "new-fixtures/gho/ManualGhostBackups/11.5/Gh11-sect compression high/secthigh.GHO",
+        );
+        if !path.exists() {
+            return;
+        }
+        let mat = materialize_gho_to_temp(&path).unwrap();
+        let via_temp = std::fs::read(&mat.temp_path).unwrap();
+
+        let mut reader = GhoReader::open(&path).unwrap();
+        assert_eq!(reader.logical_size(), via_temp.len() as u64);
+        let mut via_reader = Vec::with_capacity(via_temp.len());
+        reader.read_to_end(&mut via_reader).unwrap();
+        assert_eq!(via_reader.len(), via_temp.len(), "streamed size mismatch");
+        assert_eq!(
+            via_reader, via_temp,
+            "streamed bytes mismatch decode-to-temp"
+        );
+        eprintln!(
+            "  GhoReader streamed {} bytes across {} blocks",
+            via_reader.len(),
+            reader.block_count()
+        );
+    }
+
+    /// Random-access seek inside a real compressed SECTOR fixture: jump
+    /// to a non-zero offset, read 4 KiB, and compare against the same
+    /// slice of the temp-decoded image.
+    #[test]
+    #[ignore = "fixture-gated; opens hundreds of MB. Opt in with --ignored"]
+    fn gho_reader_random_access_matches_temp() {
+        let home = match std::env::var("HOME") {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        let path = std::path::PathBuf::from(home).join(
+            "new-fixtures/gho/ManualGhostBackups/11.5/Gh11-sect compression high/secthigh.GHO",
+        );
+        if !path.exists() {
+            return;
+        }
+        let mat = materialize_gho_to_temp(&path).unwrap();
+        let via_temp = std::fs::read(&mat.temp_path).unwrap();
+        let mut reader = GhoReader::open(&path).unwrap();
+
+        // Pick a few offsets that cross block boundaries.
+        for &offset in &[0u64, 100_000, 1_000_000, 10_000_000] {
+            if offset + 4096 > via_temp.len() as u64 {
+                continue;
+            }
+            reader.seek(SeekFrom::Start(offset)).unwrap();
+            let mut buf = vec![0u8; 4096];
+            reader.read_exact(&mut buf).unwrap();
+            assert_eq!(
+                &buf[..],
+                &via_temp[offset as usize..offset as usize + 4096],
+                "mismatch at offset {}",
+                offset
+            );
+        }
     }
 }
