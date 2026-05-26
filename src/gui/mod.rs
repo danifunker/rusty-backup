@@ -69,6 +69,7 @@ fn file_dialog() -> rfd::FileDialog {
 /// - `.adz` → gzip-decompressed `.adf` (Amiga floppy)
 /// - `.hdz` → gzip-decompressed `.hdf` (Amiga hard-disk)
 /// - `.imz` → ZIP-extracted `.ima` (WinImage floppy)
+/// - `.gho` / `.ghs` → decoded raw disk image (Norton Ghost SECTOR mode)
 ///
 /// Anything else passes through unchanged.
 ///
@@ -94,6 +95,15 @@ pub fn materialize_amiga_image_path(
     if ext.as_deref() == Some("imz") {
         let mat = rusty_backup::rbformats::imz::materialize_imz_to_temp(path)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        return Ok((mat.temp_path, Some(mat.guard)));
+    }
+
+    // GHO/GHS → Norton Ghost container. SECTOR-mode (raw) backups decode
+    // to a raw disk image; file-aware backups and password-protected
+    // files surface a precise error from the reader.
+    if matches!(ext.as_deref(), Some("gho") | Some("ghs")) {
+        let mat = rusty_backup::rbformats::gho::materialize_gho_to_temp(path)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:#}")))?;
         return Ok((mat.temp_path, Some(mat.guard)));
     }
 
