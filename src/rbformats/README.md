@@ -14,7 +14,7 @@ Compress/decompress handlers for backup output formats, plus disk reconstruction
 - **`zstd.rs`** — Zstd streaming compression: `compress_zstd`.
 - **`raw.rs`** — Raw streaming with optional file splitting and sparse zero-skipping: `stream_with_split`.
 - **`imz.rs`** — WinImage IMZ (`.imz`) read-only convert-from. `materialize_imz_to_temp` unwraps the ZIP-wrapped floppy image (`.ima` / `.img`) into a fresh `tempfile::TempDir` and returns the temp path + guard. Password-protected entries (legacy ZipCrypto) are detected via `ZipFile::encrypted()` and rejected with a precise error. Wired through `gui::materialize_amiga_image_path` so the GUI file-pick flow handles `.imz` uniformly with `.adz`/`.hdz`; downstream detection treats the materialized file as Raw.
-- **`gho.rs`** — Norton Ghost (`.gho` / `.ghs`) read-only convert-from. `materialize_gho_to_temp` decodes **SECTOR-mode** (raw sector-by-sector) backups to a raw disk image in a tempdir (None / zlib / Fast-LZ compression), wired through `gui::materialize_amiga_image_path` alongside `.imz`/`.adz`/`.hdz`. The container header, record-stream parser, and Fast-LZ decoder are all clean-room ports from the MIT-licensed `nyarime/gho`. **File-aware** ("truncated full backup") mode and `.GHS` span chains are not yet supported — they surface precise errors. Password-protected backups are rejected.
+- **`gho.rs`** — Norton Ghost (`.gho` / `.ghs`) read-only convert-from. `materialize_gho_to_temp` decodes **SECTOR-mode** (raw sector-by-sector) backups — including multi-file span sets — to a raw disk image in a tempdir (None / zlib / Fast-LZ compression), wired through `gui::materialize_amiga_image_path` alongside `.imz`/`.adz`/`.hdz`. `discover_gho_span_set` + `SpanReader` handle three corpus naming patterns: stem-prefix `.GHS` siblings (with 8.3 truncation), hyphenated stem-prefix, and `.GHO.NNN` numeric suffix; the user can pick the primary OR any span sibling and the whole chain decodes as one continuous stream. The container header, record-stream parser, and Fast-LZ decoder are clean-room ports from the MIT-licensed `nyarime/gho`. **File-aware** ("truncated full backup") mode is not yet supported — it surfaces a precise error. Password-protected backups are rejected.
 
 ## Available Formats
 
@@ -27,7 +27,7 @@ Compress/decompress handlers for backup output formats, plus disk reconstruction
 | VMDK (Flat)   | `.vmdk` | None | No       | Read (`monolithicFlat` / `twoGbMaxExtentFlat`, FLAT + ZERO extents). Write: `monolithicFlat` — descriptor + sibling `-flat.vmdk` raw extent. |
 | VMDK (Sparse) | `.vmdk` | None | No       | Read + write + in-place edit (`monolithicSparse`, `KDMV` magic). Two-level grain map; zero grains omitted on write, allocate-on-write for edits. |
 | WinImage IMZ  | `.imz` | ZIP/Deflate | No  | Read-only convert-from (decode-to-temp). Password-protected archives rejected with a clear error. |
-| Norton Ghost  | `.gho` / `.ghs` | None / zlib / Fast-LZ | (span: pending) | Read-only convert-from (decode-to-temp). SECTOR-mode only; file-aware + spans + password not yet supported. |
+| Norton Ghost  | `.gho` / `.ghs` | None / zlib / Fast-LZ | Yes (auto-discover) | Read-only convert-from (decode-to-temp). SECTOR-mode (raw) only; file-aware reconstruction + password not yet supported. Multi-file span sets auto-discovered + concatenated. |
 | Zstd   | `.zst`    | Zstd level 3 | Yes (post-hoc) | Good compression ratio |
 | CHD    | `.chd`    | MAME CHD    | Yes (post-hoc) | Native via `libchdman-rs` (no external tool) |
 

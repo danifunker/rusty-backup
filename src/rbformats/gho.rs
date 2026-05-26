@@ -1,4 +1,4 @@
-//! Norton Ghost `.GHO`/`.GHS` reader (sessions 5.5a + 5.5b + 5.5c + 5.6).
+//! Norton Ghost `.GHO`/`.GHS` reader (sessions 5.5a + 5.5b + 5.5c + 5.6 + 5.6-span).
 //!
 //! Layered scope:
 //! - **5.5a:** outer container header — 12-byte wrapper, optional 16-byte
@@ -11,13 +11,13 @@
 //! - **5.5c:** standalone Fast-LZ block decoder (`fast_lz_decompress` +
 //!   `fast_lz_hash`) ported from the MIT-licensed clean-room reference
 //!   `nyarime/gho`.
-//! - **5.6 (this commit):** **SECTOR-mode decode-to-temp**
-//!   (`materialize_gho_to_temp`). SECTOR-mode (raw sector-by-sector)
-//!   backups — uncompressed, zlib (`High`), or Fast-LZ (`Fast`) — decode
-//!   to a raw disk image. Data starts at the sector after the last
-//!   `FE EF` sub-header; compressed streams are `[u16 stored_len][block]`
-//!   chunks (stored_len includes itself) terminated by a record header.
-//!   Wired into the GUI via `materialize_amiga_image_path`.
+//! - **5.6:** **SECTOR-mode decode-to-temp** (`materialize_gho_to_temp`).
+//!   SECTOR-mode (raw sector-by-sector) backups — uncompressed, zlib
+//!   (`High`), or Fast-LZ (`Fast`) — decode to a raw disk image. Data
+//!   starts at the sector after the last `FE EF` sub-header; compressed
+//!   streams are `[u16 stored_len][block]` chunks (stored_len includes
+//!   itself) terminated by a record header. Wired into the GUI via
+//!   `materialize_amiga_image_path`.
 //!
 //!   **File-aware mode is deferred.** Despite the plan ordering SECTOR
 //!   after file-aware, the fixture corpus showed SECTOR mode is the path
@@ -27,7 +27,17 @@
 //!   with 0x0002 cluster-data records and needs a full filesystem
 //!   rebuilder. The walker (`parse_gho_image`) + `decode_data_blocks_to`
 //!   are kept as scaffolding for that future slice.
-//! - **next:** file-aware filesystem reconstruction; `.GHS` span chain.
+//! - **5.6-span (this commit):** **multi-file span sets.**
+//!   `discover_gho_span_set(picked)` walks the picked file's directory
+//!   and returns the ordered set (primary + numbered spans), handling
+//!   three corpus naming patterns: stem-prefix `.GHS` siblings (incl.
+//!   8.3 truncation like `SECTOR.GHO` + `SECTO00N.GHS`), hyphenated
+//!   stem-prefix, and `.GHO.NNN` numeric suffix. `SpanReader: Read +
+//!   Seek` virtualises the chain — primary verbatim, container-header
+//!   skipped on every continuation — so SECTOR-mode decode reads one
+//!   continuous stream. The user can pick the primary OR any span
+//!   sibling and the whole set decodes.
+//! - **next:** file-aware filesystem reconstruction; password decrypt.
 //!
 //! Layout reverse-engineered from our own fixture corpus (12+ files
 //! spanning Ghost 7.5 and 11.5, with every combination of compression /
@@ -280,9 +290,25 @@ fn read_description<R: Read + Seek>(reader: &mut R) -> Result<Option<String>> {
 /// partition at its MBR-declared LBA) is the next slice — until then we
 /// return a precise error pointing at the deferred session.
 pub fn materialize_gho_to_temp(path: &Path) -> Result<GhoMaterialized> {
-    let mut file = File::open(path).with_context(|| format!("opening GHO {}", path.display()))?;
-    let header = GhoContainerHeader::parse(&mut file)
-        .with_context(|| format!("parsing GHO container header from {}", path.display()))?;
+    let span_set = discover_gho_span_set(path)
+        .with_context(|| format!("discovering span set for {}", path.display()))?;
+    if span_set.len() > 1 {
+        log::info!(
+            "GHO span set: {} files discovered for {}",
+            span_set.len(),
+            path.display()
+        );
+        for (i, p) in span_set.iter().enumerate() {
+            log::debug!("  span[{i}] -> {}", p.display());
+        }
+    }
+
+    let primary = &span_set[0];
+    let mut primary_file =
+        File::open(primary).with_context(|| format!("opening GHO {}", primary.display()))?;
+    let header = GhoContainerHeader::parse(&mut primary_file)
+        .with_context(|| format!("parsing GHO container header from {}", primary.display()))?;
+    drop(primary_file);
 
     if header.container_version != 0x01 {
         return Err(anyhow!(
@@ -310,7 +336,11 @@ pub fn materialize_gho_to_temp(path: &Path) -> Result<GhoMaterialized> {
     }
 
     match header.image_type {
-        GhoImageType::Sector => decode_sector_mode_to_temp(&mut file, path, &header),
+        GhoImageType::Sector => {
+            let mut reader = SpanReader::open(&span_set)
+                .with_context(|| format!("opening span set for {}", path.display()))?;
+            decode_sector_mode_to_temp(&mut reader, path, &header)
+        }
         GhoImageType::FileAware => {
             // File-aware mode interleaves boot-sector + FAT-entry + dir/file
             // metadata records with `0x0002` cluster-data records. Producing
@@ -335,23 +365,338 @@ pub fn materialize_gho_to_temp(path: &Path) -> Result<GhoMaterialized> {
     }
 }
 
-/// SECTOR-mode decoder. Data starts at the first non-zero 512-aligned
-/// offset past the container header (sector 6 on Ghost 7.5, sector 11
-/// on Ghost 11.5 in the corpus); from there it is either:
-///   - `compression == None` → raw sectors, copied verbatim to `out`
-///   - `compression == Fast`/`High` → stream of `[u16 stored_len][block_data]`
-///     chunks where `stored_len` includes itself; each chunk decompresses
-///     to one 32 KiB raw block.
-fn decode_sector_mode_to_temp(
-    file: &mut File,
+// SECTOR-mode decoder overview. Data starts at the sector after the last
+// FE EF sub-header (sector 6 on Ghost 7.5, sector 11 on Ghost 11.5 in
+// the corpus); from there it is either:
+//   - compression == None → raw sectors, copied verbatim to `out`
+//   - compression == Fast/High → stream of `[u16 stored_len][block_data]`
+//     chunks where `stored_len` includes itself; each chunk decompresses
+//     to one 32 KiB raw block.
+// The decoder fn itself lives further down (`decode_sector_mode_to_temp`);
+// the span-set discovery + multi-file reader machinery sits between.
+// ---------------------------------------------------------------------------
+// Span-set discovery + virtual multi-file reader
+// ---------------------------------------------------------------------------
+//
+// Norton Ghost splits large backups across multiple files (CD/DVD media-size
+// caps). We see three naming conventions in the corpus:
+//
+//   1. Stem-prefix `.GHS` siblings — primary `.GHO` + one or more `.GHS`
+//      files in the same directory whose stems share a prefix with the
+//      primary's stem. Examples: `SECTOR.GHO` + `SECTO00N.GHS` (8.3
+//      filename truncation), `gh11-spl.GHO` + `gh11-00N.GHS`,
+//      `gh11pwd.GHO` + `gh11p00N.GHS`, `hipwd.GHO` + `hipwd00N.GHS`.
+//   2. Truncated `.GHS` siblings — `XP_SP2FU.GHO` + `XP_SP00N.GHS`. Same
+//      family as #1 but the 8.3 truncation drops more characters.
+//   3. Numeric `.GHO.NNN` suffix — every file in the set is named
+//      `name.GHO.NNN` (e.g. `Win7_86xAMB.GHO.001` ... `.066`). No `.GHO`
+//      or `.GHS` extension on its own; the lowest-numbered file is the
+//      primary.
+//
+// Discovery rule (`discover_gho_span_set`): infer the picked file's
+// "logical stem" + numeric suffix, walk the same directory for siblings
+// that match the same logical stem + a 3-digit numeric suffix, return
+// `[primary, span_001, span_002, …]` in order. If nothing else matches,
+// return just `[picked]` (single-file case).
+
+/// Discover all files in the same Norton Ghost span set as `picked`.
+///
+/// Returns the set in stream order: primary first, then numbered spans
+/// in ascending order. The picked file is always included in the result;
+/// if no siblings are found the result is `[picked]`.
+///
+/// The picked file does NOT need to be the primary — passing any one
+/// file (primary OR any span) yields the same set.
+pub fn discover_gho_span_set(picked: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let dir = picked.parent().unwrap_or_else(|| Path::new("."));
+    let name = picked
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow!("picked path has no filename: {}", picked.display()))?;
+
+    // Pattern 3: `<stem>.GHO.NNN` — numeric extension on .GHO. Detect via
+    // case-insensitive `.GHO.<digits>` suffix.
+    if let Some((logical_stem, _)) = split_gho_dot_numeric(name) {
+        return gather_dot_numeric_siblings(dir, &logical_stem);
+    }
+
+    // Patterns 1 + 2: primary .GHO + .GHS siblings (or .GHS alone).
+    // Strategy: take the picked file's stem, strip a trailing 3-digit
+    // numeric suffix if present, then find every sibling whose stem
+    // (compared case-insensitively, ignoring its own trailing 3-digit
+    // suffix) starts with the same prefix AND whose extension is .GHO
+    // or .GHS. Sort by extension (.GHO before .GHS) then by numeric tail.
+    let stem = Path::new(name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let ext = Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext != "gho" && ext != "ghs" {
+        // Unknown extension — caller should have validated already.
+        return Ok(vec![picked.to_path_buf()]);
+    }
+    let logical_prefix = strip_trailing_numeric(stem).to_ascii_lowercase();
+    if logical_prefix.is_empty() {
+        return Ok(vec![picked.to_path_buf()]);
+    }
+    gather_ghs_siblings(dir, &logical_prefix, picked)
+}
+
+/// Splits `name.GHO.NNN` → `(name, NNN)`. Case-insensitive on `.GHO`.
+fn split_gho_dot_numeric(name: &str) -> Option<(String, u32)> {
+    let lower = name.to_ascii_lowercase();
+    let dot = lower.rfind('.')?;
+    let tail = &lower[dot + 1..];
+    if tail.is_empty() || !tail.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let n: u32 = tail.parse().ok()?;
+    let stem_and_gho = &lower[..dot];
+    if !stem_and_gho.ends_with(".gho") {
+        return None;
+    }
+    let logical = &name[..dot - 4]; // strip `.GHO.NNN` from original (case-preserving)
+    Some((logical.to_string(), n))
+}
+
+fn gather_dot_numeric_siblings(dir: &Path, logical_stem: &str) -> Result<Vec<std::path::PathBuf>> {
+    let mut matches: Vec<(u32, std::path::PathBuf)> = Vec::new();
+    for entry in
+        std::fs::read_dir(dir).with_context(|| format!("reading directory {}", dir.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let n = entry.file_name();
+        let s = match n.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        if let Some((stem, num)) = split_gho_dot_numeric(s) {
+            if stem.eq_ignore_ascii_case(logical_stem) {
+                matches.push((num, entry.path()));
+            }
+        }
+    }
+    matches.sort_by_key(|(n, _)| *n);
+    if matches.is_empty() {
+        bail!("no .GHO.NNN siblings found in {}", dir.display());
+    }
+    Ok(matches.into_iter().map(|(_, p)| p).collect())
+}
+
+/// Strip a trailing run of ASCII digits from `s` (max ~3 chars typical).
+fn strip_trailing_numeric(s: &str) -> &str {
+    let end = s
+        .rfind(|c: char| !c.is_ascii_digit())
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    &s[..end]
+}
+
+fn gather_ghs_siblings(
+    dir: &Path,
+    logical_prefix: &str,
+    picked: &Path,
+) -> Result<Vec<std::path::PathBuf>> {
+    // logical_prefix is the picked file's stem with any trailing digits
+    // stripped, lowercased. Examples: "SECTOR" → "sector",
+    // "SECTO" → "secto", "gh11-spl" → "gh11-spl", "gh11pwd" → "gh11pwd",
+    // "gh11p" → "gh11p" (truncated 8.3 form), "XP_SP2FU" → "XP_SP2FU".
+    // Some sets truncate the primary's stem when generating span names
+    // (gh11pwd.GHO → gh11p001.GHS); to catch that, also try a shortened
+    // 5-character prefix.
+    let mut prefixes = vec![logical_prefix.to_string()];
+    if logical_prefix.len() > 5 {
+        prefixes.push(logical_prefix[..5].to_string());
+    }
+
+    let mut primary: Option<std::path::PathBuf> = None;
+    let mut spans: Vec<(String, std::path::PathBuf)> = Vec::new();
+
+    for entry in
+        std::fs::read_dir(dir).with_context(|| format!("reading directory {}", dir.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name_os = entry.file_name();
+        let name = match name_os.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        let p = Path::new(name);
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ext != "gho" && ext != "ghs" {
+            continue;
+        }
+        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let stem_prefix = strip_trailing_numeric(stem).to_ascii_lowercase();
+        let matches_any = prefixes
+            .iter()
+            .any(|p| stem_prefix == *p || (!p.is_empty() && stem_prefix.starts_with(p)));
+        if !matches_any {
+            continue;
+        }
+        if ext == "gho" {
+            // Prefer the picked file as primary if it is the .GHO; otherwise
+            // first .GHO wins. (Either way, a .GHO acts as primary; spans
+            // are .GHS.)
+            if primary.is_none() || entry.path() == picked {
+                primary = Some(entry.path());
+            }
+        } else {
+            // .GHS span. Key by name for deterministic sort.
+            spans.push((name.to_ascii_lowercase(), entry.path()));
+        }
+    }
+    spans.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut out = Vec::new();
+    if let Some(p) = primary {
+        out.push(p);
+    } else {
+        // No .GHO in the dir — the picked file is the primary (could be a
+        // lone .GHS such as `fulldisk.GHS`).
+        out.push(picked.to_path_buf());
+    }
+    for (_, p) in spans {
+        // Don't double-include the picked file.
+        if out.first().map(|x| x.as_path()) != Some(p.as_path()) {
+            out.push(p);
+        }
+    }
+    Ok(out)
+}
+
+/// Trait giving the total length of a `Read + Seek` source. `File` reads
+/// it from `metadata`; `SpanReader` reads it from its precomputed map.
+/// Used so `decode_sector_mode_to_temp` can drive both without an extra
+/// per-file `metadata()` round-trip.
+pub trait DataLen {
+    fn total_len(&self) -> u64;
+}
+
+impl DataLen for File {
+    fn total_len(&self) -> u64 {
+        self.metadata().map(|m| m.len()).unwrap_or(0)
+    }
+}
+
+/// Virtual `Read + Seek` over an ordered list of Ghost span files. The
+/// first file is exposed verbatim; every file after that has its first
+/// 512 bytes (the container header) skipped, so the SECTOR-mode decoder
+/// sees one continuous data stream.
+pub struct SpanReader {
+    files: Vec<File>,
+    /// Cumulative virtual offsets — `offsets[i]` is the byte position of
+    /// `files[i]`'s exposed bytes in the virtual stream. `offsets[N]`
+    /// equals the total virtual length.
+    offsets: Vec<u64>,
+    pos: u64,
+    total: u64,
+}
+
+impl SpanReader {
+    pub fn open(paths: &[std::path::PathBuf]) -> Result<Self> {
+        let mut files = Vec::with_capacity(paths.len());
+        let mut offsets = Vec::with_capacity(paths.len() + 1);
+        let mut cum: u64 = 0;
+        for (i, p) in paths.iter().enumerate() {
+            let f = File::open(p).with_context(|| format!("opening span file {}", p.display()))?;
+            let raw = f.metadata()?.len();
+            let exposed = if i == 0 {
+                raw
+            } else {
+                raw.saturating_sub(GHO_SECTOR_SIZE)
+            };
+            offsets.push(cum);
+            cum = cum.saturating_add(exposed);
+            files.push(f);
+        }
+        offsets.push(cum);
+        Ok(Self {
+            files,
+            offsets,
+            pos: 0,
+            total: cum,
+        })
+    }
+}
+
+impl DataLen for SpanReader {
+    fn total_len(&self) -> u64 {
+        self.total
+    }
+}
+
+impl Read for SpanReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.total || buf.is_empty() {
+            return Ok(0);
+        }
+        // Find the file containing self.pos.
+        let mut idx = 0;
+        for i in 0..self.files.len() {
+            if self.pos < self.offsets[i + 1] {
+                idx = i;
+                break;
+            }
+            idx = i + 1;
+        }
+        if idx >= self.files.len() {
+            return Ok(0);
+        }
+        let virt_in_file = self.pos - self.offsets[idx];
+        let physical_in_file = if idx == 0 {
+            virt_in_file
+        } else {
+            GHO_SECTOR_SIZE + virt_in_file
+        };
+        let remaining_in_file = self.offsets[idx + 1] - self.pos;
+        let to_read = (buf.len() as u64).min(remaining_in_file) as usize;
+        self.files[idx].seek(SeekFrom::Start(physical_in_file))?;
+        let n = self.files[idx].read(&mut buf[..to_read])?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for SpanReader {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let new_pos: i128 = match pos {
+            SeekFrom::Start(o) => o as i128,
+            SeekFrom::Current(d) => self.pos as i128 + d as i128,
+            SeekFrom::End(d) => self.total as i128 + d as i128,
+        };
+        if new_pos < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "seek before start",
+            ));
+        }
+        self.pos = new_pos as u64;
+        Ok(self.pos)
+    }
+}
+
+fn decode_sector_mode_to_temp<R: Read + Seek + DataLen>(
+    reader: &mut R,
     path: &Path,
     header: &GhoContainerHeader,
 ) -> Result<GhoMaterialized> {
-    let file_size = file
-        .metadata()
-        .with_context(|| format!("statting GHO {}", path.display()))?
-        .len();
-    let data_start = find_sector_data_start(file, file_size)?;
+    let file_size = reader.total_len();
+    let data_start = find_sector_data_start(reader, file_size)?;
 
     let guard = tempfile::tempdir().context("creating tempdir for GHO materialization")?;
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("gho");
@@ -361,12 +706,12 @@ fn decode_sector_mode_to_temp(
 
     let bytes_written = match header.compression {
         GhoCompression::None => {
-            file.seek(SeekFrom::Start(data_start))?;
-            std::io::copy(file, &mut out)
+            reader.seek(SeekFrom::Start(data_start))?;
+            std::io::copy(reader, &mut out)
                 .with_context(|| format!("copying raw sectors from {}", path.display()))?
         }
         GhoCompression::Fast | GhoCompression::High => {
-            decode_sector_block_stream(file, data_start, file_size, header.compression, &mut out)
+            decode_sector_block_stream(reader, data_start, file_size, header.compression, &mut out)
                 .with_context(|| {
                     format!(
                         "decompressing SECTOR-mode block stream from {}",
@@ -2047,6 +2392,177 @@ mod tests {
     /// and confirm the first decoded sector is a valid FAT32 BPB. Exercises
     /// the zlib block-stream path end-to-end. `#[ignore]`-gated to keep
     /// the default test loop fast.
+    // ---------- 5.6-span — span-set discovery + multi-file decode ----------
+
+    #[test]
+    fn split_gho_dot_numeric_parses_win7_style_names() {
+        assert_eq!(
+            split_gho_dot_numeric("Win7_86xAMB.GHO.001"),
+            Some(("Win7_86xAMB".to_string(), 1))
+        );
+        assert_eq!(
+            split_gho_dot_numeric("Win7_86xAMB.GHO.066"),
+            Some(("Win7_86xAMB".to_string(), 66))
+        );
+        // Case-insensitive on `.GHO`.
+        assert_eq!(
+            split_gho_dot_numeric("name.gho.042"),
+            Some(("name".to_string(), 42))
+        );
+        // Doesn't trigger on plain `.gho`.
+        assert_eq!(split_gho_dot_numeric("disk.gho"), None);
+        // Doesn't trigger on `.ghs` extension.
+        assert_eq!(split_gho_dot_numeric("disk.ghs"), None);
+    }
+
+    #[test]
+    fn strip_trailing_numeric_handles_corpus_stems() {
+        assert_eq!(strip_trailing_numeric("SECTO001"), "SECTO");
+        assert_eq!(strip_trailing_numeric("gh11-001"), "gh11-");
+        assert_eq!(strip_trailing_numeric("gh11pwd"), "gh11pwd");
+        assert_eq!(strip_trailing_numeric("hipwd005"), "hipwd");
+        assert_eq!(strip_trailing_numeric("SECTOR"), "SECTOR");
+    }
+
+    /// Synthetic directory with `disk.GHO` + `disk001.GHS` + `disk002.GHS`.
+    /// Picking ANY one of the three should return the same ordered set.
+    #[test]
+    fn discover_span_set_finds_ghs_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("disk.GHO");
+        let s1 = dir.path().join("disk001.GHS");
+        let s2 = dir.path().join("disk002.GHS");
+        std::fs::write(&primary, b"primary").unwrap();
+        std::fs::write(&s1, b"span1").unwrap();
+        std::fs::write(&s2, b"span2").unwrap();
+        for pick in [&primary, &s1, &s2] {
+            let set = discover_gho_span_set(pick).unwrap();
+            assert_eq!(
+                set.len(),
+                3,
+                "picking {} should yield 3 files",
+                pick.display()
+            );
+            assert_eq!(set[0], primary, "primary must be first");
+            assert_eq!(set[1], s1);
+            assert_eq!(set[2], s2);
+        }
+    }
+
+    /// Numeric-suffix layout: `name.GHO.001`, `.002`, `.003`. Picking any
+    /// one yields the set sorted by numeric tail.
+    #[test]
+    fn discover_span_set_finds_dot_numeric_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = dir.path().join("name.GHO.001");
+        let p2 = dir.path().join("name.GHO.002");
+        let p3 = dir.path().join("name.GHO.003");
+        std::fs::write(&p1, b"a").unwrap();
+        std::fs::write(&p2, b"b").unwrap();
+        std::fs::write(&p3, b"c").unwrap();
+        for pick in [&p1, &p2, &p3] {
+            let set = discover_gho_span_set(pick).unwrap();
+            assert_eq!(set, vec![p1.clone(), p2.clone(), p3.clone()]);
+        }
+    }
+
+    /// Single-file case: no siblings → set is just the picked file.
+    #[test]
+    fn discover_span_set_singleton_when_no_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("lonely.GHO");
+        std::fs::write(&f, b"alone").unwrap();
+        let set = discover_gho_span_set(&f).unwrap();
+        assert_eq!(set, vec![f]);
+    }
+
+    #[test]
+    fn span_reader_concatenates_and_skips_container_headers() {
+        // Build 3 synthetic span files:
+        //   primary: 512-byte header (FE EF ...) + 100 bytes "A..."
+        //   span 1:  512-byte header (FE EF ...) + 50 bytes "B..."
+        //   span 2:  512-byte header (FE EF ...) + 25 bytes "C..."
+        // SpanReader should expose: full primary (612 bytes) +
+        // span1 minus its 512-byte header (50 bytes) +
+        // span2 minus its 512-byte header (25 bytes) = 687 bytes total.
+        let dir = tempfile::tempdir().unwrap();
+        let make = |name: &str, fill: u8, body_len: usize| -> std::path::PathBuf {
+            let path = dir.path().join(name);
+            let mut data = vec![0u8; 512];
+            data[0] = 0xFE;
+            data[1] = 0xEF;
+            data.extend_from_slice(&vec![fill; body_len]);
+            std::fs::write(&path, &data).unwrap();
+            path
+        };
+        let p0 = make("set.GHO", b'A', 100);
+        let p1 = make("set001.GHS", b'B', 50);
+        let p2 = make("set002.GHS", b'C', 25);
+
+        let mut r = SpanReader::open(&[p0, p1, p2]).unwrap();
+        assert_eq!(r.total_len(), 612 + 50 + 25);
+
+        let mut all = Vec::new();
+        r.read_to_end(&mut all).unwrap();
+        assert_eq!(all.len() as u64, r.total_len());
+
+        // Primary's header byte at offset 0 should be FE.
+        assert_eq!(all[0], 0xFE);
+        // Last byte of primary (offset 611) is 'A'.
+        assert_eq!(all[611], b'A');
+        // Bytes 612..662 are 'B' (50 from span 1, header skipped).
+        assert!(all[612..662].iter().all(|&b| b == b'B'), "span 1 body");
+        // Bytes 662..687 are 'C' (25 from span 2, header skipped).
+        assert!(all[662..687].iter().all(|&b| b == b'C'), "span 2 body");
+
+        // Seek round-trip.
+        r.seek(SeekFrom::Start(612)).unwrap();
+        let mut probe = [0u8; 1];
+        r.read_exact(&mut probe).unwrap();
+        assert_eq!(probe[0], b'B', "seek-then-read should land in span 1");
+    }
+
+    /// Fixture-gated: decode a real multi-file SECTOR set. Picks the
+    /// 7.5 corpus `SECTOR.GHO` set (1 primary + 3 .GHS spans, ~6 GiB
+    /// raw) but only reads the first 512 bytes of the decoded output
+    /// — we just need to confirm the multi-file reader doesn't break
+    /// the SECTOR data-start probe and the boot sector decodes.
+    /// `#[ignore]` because it touches ~6 GiB of input.
+    #[test]
+    #[ignore = "fixture-gated; reads multi-GiB SECTOR span set. Opt in with --ignored"]
+    fn materialize_real_sector_span_set_decodes_boot_sector() {
+        let home = match std::env::var("HOME") {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        let path = std::path::PathBuf::from(home)
+            .join("new-fixtures/gho/ManualGhostBackups/7.5/SECTOR/SECTOR.GHO");
+        if !path.exists() {
+            eprintln!("skipping: {} not present", path.display());
+            return;
+        }
+        // Pre-flight: confirm span discovery sees all 4 files.
+        let set = discover_gho_span_set(&path).unwrap();
+        assert!(
+            set.len() >= 2,
+            "span discovery should find the .GHS siblings: {set:?}"
+        );
+        eprintln!("  span set: {} files", set.len());
+
+        let mat = materialize_gho_to_temp(&path)
+            .unwrap_or_else(|e| panic!("decode of {} failed: {:#}", path.display(), e));
+        assert!(mat.logical_size >= 1024);
+        let mut f = File::open(&mat.temp_path).unwrap();
+        let mut boot = [0u8; 512];
+        f.read_exact(&mut boot).unwrap();
+        assert_eq!(&boot[510..512], &[0x55, 0xAA]);
+        eprintln!(
+            "  decoded SECTOR set -> {} ({} bytes)",
+            mat.temp_path.display(),
+            mat.logical_size
+        );
+    }
+
     #[test]
     #[ignore = "fixture-gated; decompresses hundreds of MB. Opt in with --ignored"]
     fn materialize_real_secthigh_gho_decodes_to_fat_disk() {
