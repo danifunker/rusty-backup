@@ -748,7 +748,7 @@ impl RestoreTab {
                             &[
                                 "img", "raw", "bin", "vhd", "2mg", "iso", "dd", "po", "do", "dsk",
                                 "dc42", "woz", "adf", "hdf", "adz", "hdz", "imz", "vmdk", "qcow2",
-                                "qcow",
+                                "qcow", "gho", "ghs", "GHO", "GHS",
                             ],
                         )
                         .add_filter("All Files", &["*"])
@@ -1679,7 +1679,7 @@ impl RestoreTab {
                             &[
                                 "img", "raw", "bin", "vhd", "2mg", "iso", "dd", "po", "do", "dsk",
                                 "dc42", "woz", "adf", "hdf", "adz", "hdz", "imz", "vmdk", "qcow2",
-                                "qcow",
+                                "qcow", "gho", "ghs", "GHO", "GHS",
                             ],
                         )
                         .add_filter("All Files", &["*"])

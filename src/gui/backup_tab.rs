@@ -252,6 +252,7 @@ impl BackupTab {
                                         "img", "raw", "bin", "iso", "dd", "vhd", "hda", "hdv",
                                         "2mg", "dmg", "po", "do", "dsk", "dc42", "woz", "chd",
                                         "adf", "hdf", "adz", "hdz", "imz", "vmdk", "qcow2", "qcow",
+                                        "gho", "ghs", "GHO", "GHS",
                                     ],
                                 )
                                 .add_filter("All Files", &["*"])
