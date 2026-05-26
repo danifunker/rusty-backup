@@ -1722,9 +1722,198 @@ pub fn fast_lz_decompress(data: &[u8], comp_len: usize, dst: &mut [u8]) -> Resul
 /// container's compression byte). Body_len is the on-disk block size.
 pub const GHO_REC_DATA_BLOCK: u16 = 0x0002;
 
-/// Boot-sector record (body = 512 bytes). Marks the start of a partition
-/// in our fixture corpus.
+/// Boot-sector record on Ghost 7.5 (body = 512 bytes). Marks the start
+/// of a partition.
 pub const GHO_REC_BOOT_SECTOR: u16 = 0x0017;
+
+/// Boot-sector record on Ghost 11.5 (body = 512 bytes). Same body shape
+/// as [`GHO_REC_BOOT_SECTOR`]; the high bits seem to encode "header
+/// section" framing — records in this section carry marker `0xC01E`.
+pub const GHO_REC_BOOT_SECTOR_V2: u16 = 0x0717;
+
+/// Root-directory entry record on Ghost 7.5 (body = 56 bytes). Each
+/// record holds one 32-byte FAT directory entry (LFN segment, 8.3
+/// entry, dot/dotdot, or empty slot) followed by a 24-byte trailer
+/// (4-byte hash + 20 zero bytes). The root dir's entries are stored
+/// as a contiguous run of these.
+pub const GHO_REC_DIR_ENTRY_ROOT: u16 = 0x0004;
+
+/// Root-directory entry record on Ghost 11.5 (body = 56 bytes). Same
+/// 56-byte payload as [`GHO_REC_DIR_ENTRY_ROOT`]; appears once at the
+/// start of the inner stream on 11.5 fixtures (instead of the
+/// multi-entry run we see on 7.5).
+pub const GHO_REC_DIR_ENTRY_ROOT_V2: u16 = 0x0704;
+
+/// Subdirectory entry record (body = 56 bytes). Same on-disk layout as
+/// [`GHO_REC_DIR_ENTRY_ROOT`]. Used for every directory below the root
+/// on both Ghost 7.5 and 11.5.
+pub const GHO_REC_DIR_ENTRY_SUB: u16 = 0x0104;
+
+/// File-content record (body = variable length). Carries either the
+/// entire content of a small file (≤ 32 KiB) or the trailing fragment
+/// of a larger file (`file_size mod 32768` bytes after N `0x0002`
+/// blocks).
+pub const GHO_REC_FILE_TAIL: u16 = 0x0102;
+
+/// Per-file checksum record (body = 20 bytes). Layout
+/// `[u32 cksum][u32 cksum_dup][12 zero bytes]` — the same 32-bit
+/// value stored twice for integrity.
+pub const GHO_REC_FILE_CHECKSUM: u16 = 0x0103;
+
+/// Returns true if `type_code` is a boot-sector marker.
+///
+/// Both Ghost 7.5 (`0x0017`) and 11.5 (`0x0717`) use a 512-byte body
+/// that's a verbatim copy of the partition's first sector.
+pub fn is_boot_sector_record(type_code: u16) -> bool {
+    type_code == GHO_REC_BOOT_SECTOR || type_code == GHO_REC_BOOT_SECTOR_V2
+}
+
+/// Returns true if `type_code` carries one 32-byte FAT directory entry
+/// (root or subdirectory variant, 7.5 or 11.5). All variants share the
+/// same 56-byte body layout — see [`parse_fat_dir_entry_body`].
+pub fn is_dir_entry_record(type_code: u16) -> bool {
+    matches!(
+        type_code,
+        GHO_REC_DIR_ENTRY_ROOT | GHO_REC_DIR_ENTRY_ROOT_V2 | GHO_REC_DIR_ENTRY_SUB
+    )
+}
+
+/// Returns true if `type_code` carries cluster / file content bytes
+/// (full 32 KiB block for `0x0002`, variable-length tail for `0x0102`).
+pub fn is_data_block_record(type_code: u16) -> bool {
+    type_code == GHO_REC_DATA_BLOCK || type_code == GHO_REC_FILE_TAIL
+}
+
+/// Returns true if `type_code` is the per-file checksum record.
+pub fn is_checksum_record(type_code: u16) -> bool {
+    type_code == GHO_REC_FILE_CHECKSUM
+}
+
+/// One parsed directory-entry record (`0x0004` / `0x0104` / `0x0704`).
+///
+/// The first 32 bytes are the verbatim FAT directory entry (LFN
+/// segment, 8.3 entry, dot/dotdot, or empty slot). Whether it's an
+/// LFN slot or an 8.3 entry is determined by the attribute byte at
+/// offset 11 (`0x0F == LFN slot`). The 24-byte trailer carries a
+/// per-entry 32-bit hash followed by 20 reserved bytes (all zero in
+/// every fixture observed).
+#[derive(Debug, Clone, Copy)]
+pub struct GhoDirEntryRecord {
+    /// The 32-byte FAT directory entry, ready to be written verbatim
+    /// into a rebuilt directory cluster.
+    pub fat_entry: [u8; 32],
+    /// 32-bit per-entry hash (purpose not yet reverse-engineered;
+    /// possibly CRC-32 of the entry). Preserved for diagnostics +
+    /// future integrity checks.
+    pub entry_hash: u32,
+}
+
+impl GhoDirEntryRecord {
+    /// FAT attribute byte at offset 11.
+    pub fn attr_byte(&self) -> u8 {
+        self.fat_entry[11]
+    }
+
+    /// True when the entry is a long-filename slot (`attr == 0x0F`).
+    pub fn is_lfn_slot(&self) -> bool {
+        self.attr_byte() == 0x0F
+    }
+
+    /// True when the entry is a directory (`attr & 0x10`). Not valid
+    /// for LFN slots.
+    pub fn is_directory(&self) -> bool {
+        !self.is_lfn_slot() && (self.attr_byte() & 0x10) != 0
+    }
+
+    /// True when the entry is a volume label (`attr & 0x08`). Not
+    /// valid for LFN slots.
+    pub fn is_volume_label(&self) -> bool {
+        !self.is_lfn_slot() && (self.attr_byte() & 0x08) != 0
+    }
+
+    /// True when the entry is empty (first byte 0x00) — FAT directory
+    /// "end of entries" sentinel.
+    pub fn is_empty_slot(&self) -> bool {
+        self.fat_entry[0] == 0x00
+    }
+
+    /// True when the entry is deleted (first byte 0xE5).
+    pub fn is_deleted(&self) -> bool {
+        self.fat_entry[0] == 0xE5
+    }
+
+    /// 8.3 entry's 32-bit starting cluster (high 16 + low 16 = full
+    /// 32-bit cluster for FAT32; high is 0 for FAT12/16). Returns 0
+    /// for LFN / empty / deleted slots.
+    pub fn first_cluster(&self) -> u32 {
+        if self.is_lfn_slot() || self.is_empty_slot() || self.is_deleted() {
+            return 0;
+        }
+        let lo = u16::from_le_bytes([self.fat_entry[26], self.fat_entry[27]]) as u32;
+        let hi = u16::from_le_bytes([self.fat_entry[20], self.fat_entry[21]]) as u32;
+        (hi << 16) | lo
+    }
+
+    /// 8.3 entry's 32-bit file size in bytes. Returns 0 for LFN /
+    /// empty / deleted slots and for directories.
+    pub fn file_size(&self) -> u32 {
+        if self.is_lfn_slot() || self.is_empty_slot() || self.is_deleted() || self.is_directory() {
+            return 0;
+        }
+        u32::from_le_bytes([
+            self.fat_entry[28],
+            self.fat_entry[29],
+            self.fat_entry[30],
+            self.fat_entry[31],
+        ])
+    }
+}
+
+/// Parse a `0x0004` / `0x0104` / `0x0704` directory-entry record body.
+///
+/// `body.len()` must be at least 36 (32 FAT bytes + 4 hash bytes); the
+/// remaining bytes are silently ignored (every fixture has the 24-byte
+/// trailer with hash at offset 32, but the reserved tail isn't
+/// required by the parser).
+pub fn parse_fat_dir_entry_body(body: &[u8]) -> Result<GhoDirEntryRecord> {
+    if body.len() < 36 {
+        bail!(
+            "GHO dir-entry record body must be >= 36 bytes, got {}",
+            body.len()
+        );
+    }
+    let mut fat_entry = [0u8; 32];
+    fat_entry.copy_from_slice(&body[..32]);
+    let entry_hash = u32::from_le_bytes([body[32], body[33], body[34], body[35]]);
+    Ok(GhoDirEntryRecord {
+        fat_entry,
+        entry_hash,
+    })
+}
+
+/// Parse a `0x0103` per-file checksum record body.
+///
+/// The body is `[u32 cksum][u32 cksum_dup][12 zero bytes]`. We surface
+/// the checksum once and assert internally that the duplicate matches
+/// (mismatch → corruption or misidentified record).
+pub fn parse_checksum_record_body(body: &[u8]) -> Result<u32> {
+    if body.len() < 8 {
+        bail!(
+            "GHO checksum record body must be >= 8 bytes, got {}",
+            body.len()
+        );
+    }
+    let a = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+    let b = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+    if a != b {
+        bail!(
+            "GHO checksum record has mismatched duplicate: {:#x} vs {:#x}",
+            a,
+            b
+        );
+    }
+    Ok(a)
+}
 
 /// Sector size used by the container header.
 pub const GHO_SECTOR_SIZE: u64 = 512;
@@ -2936,6 +3125,193 @@ mod tests {
             "  decoded secthigh.GHO -> {} ({} bytes)",
             mat.temp_path.display(),
             mat.logical_size
+        );
+    }
+
+    // ---------- file-aware record body parsers ----------
+
+    #[test]
+    fn record_type_predicates_classify_known_codes() {
+        // Boot sector
+        assert!(is_boot_sector_record(0x0017));
+        assert!(is_boot_sector_record(0x0717));
+        assert!(!is_boot_sector_record(0x0004));
+
+        // Dir entries
+        assert!(is_dir_entry_record(0x0004));
+        assert!(is_dir_entry_record(0x0104));
+        assert!(is_dir_entry_record(0x0704));
+        assert!(!is_dir_entry_record(0x0017));
+        assert!(!is_dir_entry_record(0x0102));
+
+        // Data blocks
+        assert!(is_data_block_record(0x0002));
+        assert!(is_data_block_record(0x0102));
+        assert!(!is_data_block_record(0x0103));
+        assert!(!is_data_block_record(0x0104));
+
+        // Checksum
+        assert!(is_checksum_record(0x0103));
+        assert!(!is_checksum_record(0x0102));
+    }
+
+    #[test]
+    fn parse_fat_dir_entry_body_decodes_lfn_slot() {
+        // Sequence-1 LFN holding 'A','c','c' UTF-16LE. attr=0x0F at offset 11.
+        let mut body = [0u8; 56];
+        body[0] = 0x41; // sequence + LFN flag
+        body[1] = b'A';
+        body[2] = 0;
+        body[3] = b'c';
+        body[4] = 0;
+        body[5] = b'c';
+        body[6] = 0;
+        body[11] = 0x0F; // LFN attr
+        body[32..36].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+
+        let parsed = parse_fat_dir_entry_body(&body).unwrap();
+        assert!(parsed.is_lfn_slot());
+        assert!(!parsed.is_directory());
+        assert_eq!(parsed.first_cluster(), 0);
+        assert_eq!(parsed.file_size(), 0);
+        assert_eq!(parsed.entry_hash, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn parse_fat_dir_entry_body_decodes_8_3_directory() {
+        // "MYDOCU~1" with attr=0x10 (dir), first_cluster=3 (FAT32 split:
+        // lo at 26-27, hi at 20-21), file_size=0.
+        let mut body = [0u8; 56];
+        body[..11].copy_from_slice(b"MYDOCU~1   ");
+        body[11] = 0x10; // directory
+        body[26..28].copy_from_slice(&3u16.to_le_bytes()); // cluster lo
+        body[20..22].copy_from_slice(&0u16.to_le_bytes()); // cluster hi
+        body[32..36].copy_from_slice(&0xCAFEu32.to_le_bytes());
+
+        let parsed = parse_fat_dir_entry_body(&body).unwrap();
+        assert!(!parsed.is_lfn_slot());
+        assert!(parsed.is_directory());
+        assert!(!parsed.is_volume_label());
+        assert_eq!(parsed.first_cluster(), 3);
+        assert_eq!(parsed.file_size(), 0); // directory size always 0
+        assert_eq!(parsed.entry_hash, 0xCAFE);
+    }
+
+    #[test]
+    fn parse_fat_dir_entry_body_decodes_regular_file() {
+        // "MSPAINT EXE" with size 0x54000 (344064), cluster 0x040000 (256K).
+        let mut body = [0u8; 56];
+        body[..11].copy_from_slice(b"MSPAINT EXE");
+        body[11] = 0x20; // archive
+        body[26..28].copy_from_slice(&0x0000u16.to_le_bytes()); // cluster lo
+        body[20..22].copy_from_slice(&0x0004u16.to_le_bytes()); // cluster hi
+        body[28..32].copy_from_slice(&0x00054000u32.to_le_bytes()); // size
+
+        let parsed = parse_fat_dir_entry_body(&body).unwrap();
+        assert!(!parsed.is_lfn_slot());
+        assert!(!parsed.is_directory());
+        assert_eq!(parsed.first_cluster(), 0x0004_0000);
+        assert_eq!(parsed.file_size(), 344_064);
+    }
+
+    #[test]
+    fn parse_fat_dir_entry_body_recognises_empty_and_deleted_slots() {
+        let body_empty = [0u8; 56];
+        let parsed = parse_fat_dir_entry_body(&body_empty).unwrap();
+        assert!(parsed.is_empty_slot());
+        assert!(!parsed.is_deleted());
+
+        let mut body_del = [0u8; 56];
+        body_del[0] = 0xE5;
+        let parsed = parse_fat_dir_entry_body(&body_del).unwrap();
+        assert!(parsed.is_deleted());
+        assert!(!parsed.is_empty_slot());
+    }
+
+    #[test]
+    fn parse_fat_dir_entry_body_rejects_too_short() {
+        let err = parse_fat_dir_entry_body(&[0u8; 35]).unwrap_err();
+        assert!(format!("{err}").contains(">= 36"));
+    }
+
+    #[test]
+    fn parse_checksum_record_body_extracts_duplicated_value() {
+        let mut body = [0u8; 20];
+        body[..4].copy_from_slice(&0x12345678u32.to_le_bytes());
+        body[4..8].copy_from_slice(&0x12345678u32.to_le_bytes());
+        let v = parse_checksum_record_body(&body).unwrap();
+        assert_eq!(v, 0x12345678);
+    }
+
+    #[test]
+    fn parse_checksum_record_body_errors_on_mismatch() {
+        let mut body = [0u8; 20];
+        body[..4].copy_from_slice(&0xAAAAu32.to_le_bytes());
+        body[4..8].copy_from_slice(&0xBBBBu32.to_le_bytes());
+        let err = parse_checksum_record_body(&body).unwrap_err();
+        assert!(format!("{err}").contains("mismatched"));
+    }
+
+    /// Walk the inner stream of `7.5/PART/PART.GHO` and apply the
+    /// typed parsers to the first ~12 records. Confirms that:
+    ///   - record #0 is a boot sector
+    ///   - records #1..8 (root dir entries) parse cleanly as
+    ///     `0x0004` dir entries with believable names + clusters
+    ///   - the second 8.3 entry (record #2) names "MYDOCU~1" with
+    ///     cluster 3 and attribute 0x10 (directory)
+    #[test]
+    #[ignore = "fixture-gated; needs PART.GHO. Opt in with --ignored"]
+    fn typed_parsing_against_real_part_gho() {
+        let home = match std::env::var("HOME") {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        let path = std::path::PathBuf::from(home)
+            .join("new-fixtures/gho/ManualGhostBackups/7.5/PART/PART.GHO");
+        if !path.exists() {
+            return;
+        }
+        let mut f = File::open(&path).unwrap();
+        let header = GhoContainerHeader::parse(&mut f).unwrap();
+        let header_end = if header.password_protected {
+            (GHO_HEADER_PREFIX_LEN + GHO_PASSWORD_VERIFIER_LEN) as u64
+        } else {
+            GHO_HEADER_PREFIX_LEN as u64
+        };
+        let inner_start = find_inner_stream_start(&mut f, header_end).unwrap();
+        let mut pos = inner_start;
+        let mut types = Vec::new();
+        let mut mydocu_seen = false;
+        for _ in 0..12 {
+            f.seek(SeekFrom::Start(pos)).unwrap();
+            let mut hdr = [0u8; GHO_RECORD_HEADER_LEN];
+            f.read_exact(&mut hdr).unwrap();
+            let type_code = u16::from_le_bytes([hdr[0], hdr[1]]);
+            let body_len = u16::from_le_bytes([hdr[8], hdr[9]]) as usize;
+            let body_off = pos + GHO_RECORD_HEADER_LEN as u64;
+            types.push(type_code);
+
+            if is_dir_entry_record(type_code) && body_len >= 36 {
+                let mut body = vec![0u8; body_len];
+                f.seek(SeekFrom::Start(body_off)).unwrap();
+                f.read_exact(&mut body).unwrap();
+                let entry = parse_fat_dir_entry_body(&body).unwrap();
+                if &entry.fat_entry[..8] == b"MYDOCU~1" {
+                    mydocu_seen = true;
+                    assert!(entry.is_directory(), "MYDOCU~1 must be a directory");
+                    assert_eq!(entry.first_cluster(), 3, "MYDOCU~1 cluster");
+                }
+            }
+            pos = body_off + body_len as u64;
+        }
+        assert!(
+            is_boot_sector_record(types[0]),
+            "first record must be boot sector"
+        );
+        assert!(
+            mydocu_seen,
+            "expected MYDOCU~1 entry within first 12 records, saw types: {:?}",
+            types
         );
     }
 
