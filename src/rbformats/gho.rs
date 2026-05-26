@@ -1891,6 +1891,237 @@ pub fn parse_fat_dir_entry_body(body: &[u8]) -> Result<GhoDirEntryRecord> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// File-aware directory tree walker (Slice B)
+// ---------------------------------------------------------------------------
+//
+// Algorithm (derived from PART.GHO + cross-checked against records
+// 60-200 of the same fixture — see docs/gho_file_aware.md for the
+// trace):
+//
+//   1. Track `current_dir_cluster` (initialised from the boot sector's
+//      BPB_RootClus on FAT32, or sentinel 0 for FAT12/16).
+//   2. When a "." dir entry is seen, set `current_dir_cluster` to that
+//      entry's `first_cluster`. The writer always emits "." right after
+//      descending into a directory.
+//   3. When a ".." dir entry is seen, it tells us the PARENT cluster of
+//      the directory we just descended into. We back-fill
+//      `parent_cluster` on the most-recently-emitted DIR entry.
+//   4. For a regular file (8.3, attr != dir):
+//      `parent_cluster` = `current_dir_cluster`. Subsequent `0x0002` /
+//      `0x0102` content records attach to it; `0x0103` finalises it.
+//   5. LFN slots (attr 0x0F) buffer up before each 8.3 record; they
+//      decorate the next 8.3 entry as its `long_name`.
+//   6. Empty slots (first byte 0x00) and deleted slots (0xE5) are
+//      source-FAT padding artifacts — ignored.
+//
+// **Known limitation.** The walker uses `current_dir_cluster` (last "."
+// cluster) as the parent for FILE entries. If Ghost's writer ascends
+// through multiple levels between a "." entry and the next 8.3, that
+// implicit ascent is invisible — files in the intervening levels
+// would be attributed to the deeper dir. Subdir entries are NOT
+// affected (they get their true parent via their own ".." entry).
+
+/// One entry (file or directory) recovered from a file-aware GHO.
+#[derive(Debug, Clone)]
+pub struct GhoFileAwareEntry {
+    pub source_cluster: u32,
+    pub parent_cluster: u32,
+    pub short_name: String,
+    pub long_name: Option<String>,
+    pub attr: u8,
+    pub file_size: u32,
+    /// Byte offsets within the GHO of this file's `0x0002` / `0x0102`
+    /// content record bodies, in stream order. Empty for directories.
+    pub content_record_offsets: Vec<u64>,
+    /// `0x0103` checksum value (`None` for dirs or unfinalised files).
+    pub checksum: Option<u32>,
+}
+
+impl GhoFileAwareEntry {
+    pub fn is_directory(&self) -> bool {
+        self.attr & 0x10 != 0 && self.attr != 0x0F
+    }
+
+    pub fn display_name(&self) -> &str {
+        self.long_name.as_deref().unwrap_or(&self.short_name)
+    }
+}
+
+/// Flat tree of file-aware entries; parent/child links are implicit
+/// in [`GhoFileAwareEntry::parent_cluster`].
+#[derive(Debug, Clone, Default)]
+pub struct GhoFileAwareTree {
+    pub root_cluster: u32,
+    pub entries: Vec<GhoFileAwareEntry>,
+}
+
+impl GhoFileAwareTree {
+    pub fn children_of(&self, dir_cluster: u32) -> impl Iterator<Item = &GhoFileAwareEntry> {
+        self.entries
+            .iter()
+            .filter(move |e| e.parent_cluster == dir_cluster)
+    }
+    pub fn file_count(&self) -> usize {
+        self.entries.iter().filter(|e| !e.is_directory()).count()
+    }
+    pub fn dir_count(&self) -> usize {
+        self.entries.iter().filter(|e| e.is_directory()).count()
+    }
+}
+
+fn format_8_3_name(raw: &[u8]) -> String {
+    let name = String::from_utf8_lossy(&raw[..8]).trim_end().to_string();
+    let ext = String::from_utf8_lossy(&raw[8..11]).trim_end().to_string();
+    if ext.is_empty() {
+        name
+    } else {
+        format!("{}.{}", name, ext)
+    }
+}
+
+fn decode_lfn_fragment(fat_entry: &[u8; 32]) -> String {
+    let mut chars: Vec<u16> = Vec::with_capacity(13);
+    for &(s, e) in &[(1usize, 11usize), (14, 26), (28, 32)] {
+        for chunk in fat_entry[s..e].chunks(2) {
+            if chunk.len() != 2 {
+                continue;
+            }
+            let c = u16::from_le_bytes([chunk[0], chunk[1]]);
+            if c == 0 || c == 0xFFFF {
+                return char::decode_utf16(chars).filter_map(|r| r.ok()).collect();
+            }
+            chars.push(c);
+        }
+    }
+    char::decode_utf16(chars).filter_map(|r| r.ok()).collect()
+}
+
+/// Walk an already-parsed [`GhoImage`] and produce the file-aware tree.
+///
+/// `reader` must back the same bytes [`parse_gho_image`] saw; we
+/// re-seek internally. The walker does NOT decompress block bodies —
+/// `content_record_offsets` lets callers pull decompressed bytes on
+/// demand using the container's compression mode.
+pub fn walk_file_aware_tree<R: Read + Seek>(
+    reader: &mut R,
+    image: &GhoImage,
+) -> Result<GhoFileAwareTree> {
+    let mut root_cluster: u32 = 0;
+    if let Some(bs) = image
+        .records
+        .iter()
+        .find(|r| is_boot_sector_record(r.type_code))
+    {
+        if bs.body_len as usize >= 48 {
+            reader.seek(SeekFrom::Start(bs.body_start()))?;
+            let mut bpb = [0u8; 512];
+            let n = read_fully_or_eof(reader, &mut bpb)?;
+            // FAT32-only field BPB_RootClus at offset 44; confirm via
+            // "FAT32" signature at offsets 82..87.
+            if n >= 87 && &bpb[82..87] == b"FAT32" {
+                root_cluster = u32::from_le_bytes([bpb[44], bpb[45], bpb[46], bpb[47]]);
+            }
+        }
+    }
+
+    let mut tree = GhoFileAwareTree {
+        root_cluster,
+        entries: Vec::new(),
+    };
+    let mut current_dir = root_cluster;
+    let mut lfn_buf: Vec<String> = Vec::new();
+    let mut pending_dir: Option<usize> = None;
+    let mut pending_file: Option<usize> = None;
+
+    for rec in &image.records {
+        if is_dir_entry_record(rec.type_code) && rec.body_len as usize >= 36 {
+            reader.seek(SeekFrom::Start(rec.body_start()))?;
+            let mut body = vec![0u8; rec.body_len as usize];
+            reader.read_exact(&mut body)?;
+            let entry = parse_fat_dir_entry_body(&body)?;
+
+            if entry.is_empty_slot() || entry.is_deleted() {
+                lfn_buf.clear();
+                continue;
+            }
+            if entry.is_lfn_slot() {
+                let frag = decode_lfn_fragment(&entry.fat_entry);
+                if entry.fat_entry[0] & 0x40 != 0 {
+                    lfn_buf.clear();
+                }
+                lfn_buf.insert(0, frag);
+                continue;
+            }
+
+            let short = format_8_3_name(&entry.fat_entry[..11]);
+            if short == "." {
+                current_dir = entry.first_cluster();
+                lfn_buf.clear();
+                continue;
+            }
+            if short == ".." {
+                if let Some(idx) = pending_dir.take() {
+                    // FAT convention: ".." inside a direct child of
+                    // root carries cluster=0 (not the real root
+                    // cluster). Normalise here so parent_cluster
+                    // points at the tree's `root_cluster`.
+                    let parent = entry.first_cluster();
+                    tree.entries[idx].parent_cluster = if parent == 0 {
+                        tree.root_cluster
+                    } else {
+                        parent
+                    };
+                }
+                lfn_buf.clear();
+                continue;
+            }
+
+            let long_name = if !lfn_buf.is_empty() {
+                Some(lfn_buf.join(""))
+            } else {
+                None
+            };
+            lfn_buf.clear();
+
+            let is_dir = entry.is_directory();
+            tree.entries.push(GhoFileAwareEntry {
+                source_cluster: entry.first_cluster(),
+                parent_cluster: if is_dir { 0 } else { current_dir },
+                short_name: short,
+                long_name,
+                attr: entry.attr_byte(),
+                file_size: entry.file_size(),
+                content_record_offsets: Vec::new(),
+                checksum: None,
+            });
+            let idx = tree.entries.len() - 1;
+            if is_dir {
+                pending_dir = Some(idx);
+                pending_file = None;
+            } else {
+                pending_file = Some(idx);
+                pending_dir = None;
+            }
+        } else if is_data_block_record(rec.type_code) {
+            if let Some(idx) = pending_file {
+                tree.entries[idx]
+                    .content_record_offsets
+                    .push(rec.body_start());
+            }
+        } else if is_checksum_record(rec.type_code) && rec.body_len as usize >= 8 {
+            if let Some(idx) = pending_file.take() {
+                reader.seek(SeekFrom::Start(rec.body_start()))?;
+                let mut body = vec![0u8; rec.body_len as usize];
+                reader.read_exact(&mut body)?;
+                tree.entries[idx].checksum = parse_checksum_record_body(&body).ok();
+            }
+        }
+    }
+
+    Ok(tree)
+}
+
 /// Parse a `0x0103` per-file checksum record body.
 ///
 /// The body is `[u32 cksum][u32 cksum_dup][12 zero bytes]`. We surface
@@ -3313,6 +3544,153 @@ mod tests {
             "expected MYDOCU~1 entry within first 12 records, saw types: {:?}",
             types
         );
+    }
+
+    // ---------- file-aware directory walker ----------
+
+    /// Validates the walker against PART.GHO. Asserts:
+    ///   - root_cluster matches the FAT32 BPB_RootClus (typically 2)
+    ///   - 8.3 "MYDOCU~1" has long_name "My Documents", parent=root
+    ///   - "MYPICT~1" has parent = MYDOCU~1's cluster
+    ///   - "PROGRA~1" parent = root (verifies that dir parents come
+    ///     from .. entries, not from current_dir tracking)
+    ///   - file_count + dir_count are non-zero
+    ///   - WORDPAD.EXE has the right file_size + at least one content
+    ///     record offset
+    #[test]
+    #[ignore = "fixture-gated; walks PART.GHO. Opt in with --ignored"]
+    fn walk_file_aware_tree_against_real_part_gho() {
+        let home = match std::env::var("HOME") {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        let path = std::path::PathBuf::from(home)
+            .join("new-fixtures/gho/ManualGhostBackups/7.5/PART/PART.GHO");
+        if !path.exists() {
+            return;
+        }
+        let mut f = File::open(&path).unwrap();
+        let header = GhoContainerHeader::parse(&mut f).unwrap();
+        let file_size = f.metadata().unwrap().len();
+        let image = parse_gho_image(&mut f, file_size, &header).unwrap();
+        let tree = walk_file_aware_tree(&mut f, &image).unwrap();
+
+        eprintln!(
+            "  root_cluster={} entries={} files={} dirs={}",
+            tree.root_cluster,
+            tree.entries.len(),
+            tree.file_count(),
+            tree.dir_count()
+        );
+        assert!(tree.root_cluster >= 2, "FAT32 root cluster should be >= 2");
+        assert!(tree.file_count() > 0);
+        assert!(tree.dir_count() > 0);
+
+        let mydocu = tree
+            .entries
+            .iter()
+            .find(|e| e.short_name == "MYDOCU~1")
+            .expect("MYDOCU~1 must be present");
+        assert!(mydocu.is_directory());
+        assert_eq!(
+            mydocu.parent_cluster, tree.root_cluster,
+            "MYDOCU~1 should be a root child"
+        );
+        assert_eq!(mydocu.long_name.as_deref(), Some("My Documents"));
+        let mydocu_cluster = mydocu.source_cluster;
+
+        let mypict = tree
+            .entries
+            .iter()
+            .find(|e| e.short_name == "MYPICT~1")
+            .expect("MYPICT~1 must be present");
+        assert_eq!(
+            mypict.parent_cluster, mydocu_cluster,
+            "MYPICT~1 should live inside MYDOCU~1"
+        );
+
+        let progra1 = tree
+            .entries
+            .iter()
+            .find(|e| e.short_name == "PROGRA~1")
+            .expect("PROGRA~1 must be present");
+        assert_eq!(
+            progra1.parent_cluster, tree.root_cluster,
+            "PROGRA~1 parent should be ROOT (proves .. lookup works, \
+             not current_dir-at-time-of-emit)"
+        );
+
+        if let Some(wordpad) = tree.entries.iter().find(|e| e.short_name == "WORDPAD.EXE") {
+            assert!(!wordpad.is_directory());
+            assert_eq!(wordpad.file_size, 204_800);
+            assert!(!wordpad.content_record_offsets.is_empty());
+            assert!(wordpad.checksum.is_some());
+        }
+    }
+
+    /// Unit-level: build a synthetic file-aware GHO with boot sector +
+    /// one dir + one file, walk it, and confirm the tree shape.
+    #[test]
+    fn walk_file_aware_tree_assembles_synthetic_stream() {
+        use std::io::Cursor;
+
+        // Build a minimal byte stream: container header + boot sector
+        // + dir entries + file content + checksum + EOF.
+        let mut buf = Vec::new();
+        // container prefix at sector 0
+        let mut prefix = vec![0u8; 512];
+        prefix[0] = 0xFE;
+        prefix[1] = 0xEF;
+        prefix[2] = 0x01; // version
+        prefix[3] = 0x00; // compression=None
+        prefix[10] = 0x00; // image_type=FileAware
+        buf.extend_from_slice(&prefix);
+
+        // Helper to write a record header.
+        let write_record = |buf: &mut Vec<u8>, type_code: u16, body: &[u8]| {
+            buf.extend_from_slice(&type_code.to_le_bytes());
+            buf.extend_from_slice(&0u16.to_le_bytes()); // marker
+            buf.extend_from_slice(&GHO_RECORD_MAGIC.to_le_bytes());
+            buf.extend_from_slice(&(body.len() as u16).to_le_bytes());
+            buf.extend_from_slice(body);
+        };
+        // Build a 512-byte FAT32 boot sector: just enough for the
+        // walker to extract root_cluster.
+        let mut boot = [0u8; 512];
+        boot[44..48].copy_from_slice(&2u32.to_le_bytes());
+        boot[82..87].copy_from_slice(b"FAT32");
+        write_record(&mut buf, GHO_REC_BOOT_SECTOR, &boot);
+
+        // 8.3 entry for "HELLO.TXT" in root, cluster=5, size=11.
+        let mut e = [0u8; 56];
+        e[..11].copy_from_slice(b"HELLO   TXT");
+        e[11] = 0x20; // archive
+        e[26..28].copy_from_slice(&5u16.to_le_bytes()); // cluster lo
+        e[28..32].copy_from_slice(&11u32.to_le_bytes()); // size
+        write_record(&mut buf, GHO_REC_DIR_ENTRY_ROOT, &e);
+
+        // File content for HELLO.TXT (11 bytes).
+        write_record(&mut buf, GHO_REC_FILE_TAIL, b"hello world");
+
+        // Checksum.
+        let mut c = [0u8; 20];
+        c[..4].copy_from_slice(&0x12345678u32.to_le_bytes());
+        c[4..8].copy_from_slice(&0x12345678u32.to_le_bytes());
+        write_record(&mut buf, GHO_REC_FILE_CHECKSUM, &c);
+
+        let mut cur = Cursor::new(buf.clone());
+        let header = GhoContainerHeader::parse(&mut cur).unwrap();
+        let image = parse_gho_image(&mut cur, buf.len() as u64, &header).unwrap();
+        let tree = walk_file_aware_tree(&mut cur, &image).unwrap();
+        assert_eq!(tree.root_cluster, 2);
+        assert_eq!(tree.entries.len(), 1);
+        let hello = &tree.entries[0];
+        assert_eq!(hello.short_name, "HELLO.TXT");
+        assert!(!hello.is_directory());
+        assert_eq!(hello.parent_cluster, 2);
+        assert_eq!(hello.file_size, 11);
+        assert_eq!(hello.content_record_offsets.len(), 1);
+        assert_eq!(hello.checksum, Some(0x12345678));
     }
 
     // ---------- GhoReader (streaming Read+Seek) ----------
