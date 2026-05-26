@@ -321,7 +321,8 @@ pub fn materialize_gho_to_temp(path: &Path) -> Result<GhoMaterialized> {
     if header.password_protected {
         return Err(anyhow!(
             "GHO {} is password-protected; password-protected Ghost backups are not yet \
-             supported",
+             supported (cipher is reset per data block and does not match the CRC-16 model in \
+             the Go reference -- see docs/gho_password.md)",
             path.display()
         ));
     }
