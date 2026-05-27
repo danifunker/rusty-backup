@@ -1067,8 +1067,19 @@ impl GhoReader {
             let mut fa_parts = Vec::with_capacity(slices.len());
             let mut max_end: u64 = 0;
             for slice in &slices {
+                let sub_records = image.records[slice.record_range.clone()].to_vec();
+                let sub_bodies: std::collections::HashMap<u64, Vec<u8>> = sub_records
+                    .iter()
+                    .filter_map(|r| {
+                        image
+                            .cached_bodies
+                            .get(&r.offset)
+                            .map(|b| (r.offset, b.clone()))
+                    })
+                    .collect();
                 let sub_image = GhoImage {
-                    records: image.records[slice.record_range.clone()].to_vec(),
+                    records: sub_records,
+                    cached_bodies: sub_bodies,
                     partition_count: 1,
                 };
                 let tree = walk_file_aware_tree(&mut inner, &sub_image).with_context(|| {
@@ -2649,16 +2660,32 @@ fn decode_lfn_fragment(fat_entry: &[u8; 32]) -> String {
     char::decode_utf16(chars).filter_map(|r| r.ok()).collect()
 }
 
+/// Read a record's body, using the cache if available, otherwise
+/// falling back to seeking in the file.
+fn read_record_body<R: Read + Seek>(
+    reader: &mut R,
+    rec: &GhoInnerRecord,
+    cache: &std::collections::HashMap<u64, Vec<u8>>,
+) -> Result<Vec<u8>> {
+    if let Some(body) = cache.get(&rec.offset) {
+        return Ok(body.clone());
+    }
+    reader.seek(SeekFrom::Start(rec.body_start()))?;
+    let mut body = vec![0u8; rec.body_len as usize];
+    reader.read_exact(&mut body)?;
+    Ok(body)
+}
+
 /// Walk an already-parsed [`GhoImage`] and produce the file-aware tree.
 ///
-/// `reader` must back the same bytes [`parse_gho_image`] saw; we
-/// re-seek internally. The walker does NOT decompress block bodies —
-/// `content_record_offsets` lets callers pull decompressed bytes on
-/// demand using the container's compression mode.
+/// Uses `image.cached_bodies` to avoid re-seeking for dir entry and
+/// checksum record bodies when available. Falls back to `reader` for
+/// any record not in the cache.
 pub fn walk_file_aware_tree<R: Read + Seek>(
     reader: &mut R,
     image: &GhoImage,
 ) -> Result<GhoFileAwareTree> {
+    let cache = &image.cached_bodies;
     let mut root_cluster: u32 = 0;
     if let Some(bs) = image
         .records
@@ -2666,12 +2693,8 @@ pub fn walk_file_aware_tree<R: Read + Seek>(
         .find(|r| is_boot_sector_record(r.type_code))
     {
         if bs.body_len as usize >= 48 {
-            reader.seek(SeekFrom::Start(bs.body_start()))?;
-            let mut bpb = [0u8; 512];
-            let n = read_fully_or_eof(reader, &mut bpb)?;
-            // FAT32-only field BPB_RootClus at offset 44; confirm via
-            // "FAT32" signature at offsets 82..87.
-            if n >= 87 && &bpb[82..87] == b"FAT32" {
+            let bpb = read_record_body(reader, bs, cache)?;
+            if bpb.len() >= 87 && &bpb[82..87] == b"FAT32" {
                 root_cluster = u32::from_le_bytes([bpb[44], bpb[45], bpb[46], bpb[47]]);
             }
         }
@@ -2688,9 +2711,7 @@ pub fn walk_file_aware_tree<R: Read + Seek>(
 
     for rec in &image.records {
         if is_dir_entry_record(rec.type_code) && rec.body_len as usize >= 36 {
-            reader.seek(SeekFrom::Start(rec.body_start()))?;
-            let mut body = vec![0u8; rec.body_len as usize];
-            reader.read_exact(&mut body)?;
+            let body = read_record_body(reader, rec, cache)?;
             let entry = parse_fat_dir_entry_body(&body)?;
 
             if entry.is_empty_slot() || entry.is_deleted() {
@@ -2714,10 +2735,6 @@ pub fn walk_file_aware_tree<R: Read + Seek>(
             }
             if short == ".." {
                 if let Some(idx) = pending_dir.take() {
-                    // FAT convention: ".." inside a direct child of
-                    // root carries cluster=0 (not the real root
-                    // cluster). Normalise here so parent_cluster
-                    // points at the tree's `root_cluster`.
                     let parent = entry.first_cluster();
                     tree.entries[idx].parent_cluster = if parent == 0 {
                         tree.root_cluster
@@ -2763,9 +2780,7 @@ pub fn walk_file_aware_tree<R: Read + Seek>(
             }
         } else if is_checksum_record(rec.type_code) && rec.body_len as usize >= 8 {
             if let Some(idx) = pending_file.take() {
-                reader.seek(SeekFrom::Start(rec.body_start()))?;
-                let mut body = vec![0u8; rec.body_len as usize];
-                reader.read_exact(&mut body)?;
+                let body = read_record_body(reader, rec, cache)?;
                 tree.entries[idx].checksum = parse_checksum_record_body(&body).ok();
             }
         }
@@ -2943,9 +2958,8 @@ fn source_partition_size_from_boot<R: Read + Seek>(
     if (bs.body_len as usize) < 36 {
         return Ok(None);
     }
-    reader.seek(SeekFrom::Start(bs.body_start()))?;
-    let mut bpb = [0u8; 512];
-    let n = read_fully_or_eof(reader, &mut bpb)?;
+    let bpb = read_record_body(reader, bs, &image.cached_bodies)?;
+    let n = bpb.len();
     if n < 36 {
         return Ok(None);
     }
@@ -3460,6 +3474,11 @@ impl GhoInnerRecord {
 #[derive(Debug, Clone)]
 pub struct GhoImage {
     pub records: Vec<GhoInnerRecord>,
+    /// Pre-read record bodies, keyed by record offset. Populated
+    /// during `parse_gho_image` for dir entries, boot sectors, and
+    /// checksums so that `walk_file_aware_tree` and `split_partitions`
+    /// can avoid re-seeking into the file.
+    pub cached_bodies: std::collections::HashMap<u64, Vec<u8>>,
     /// Count of `0x0017` boot-sector records — proxy for partition count.
     pub partition_count: usize,
 }
@@ -3496,12 +3515,14 @@ pub fn parse_gho_image<R: Read + Seek>(
         Err(_) => {
             return Ok(GhoImage {
                 records: Vec::new(),
+                cached_bodies: std::collections::HashMap::new(),
                 partition_count: 0,
             })
         }
     };
 
     let mut records = Vec::new();
+    let mut cached_bodies = std::collections::HashMap::new();
     let mut partition_count = 0;
     while offset + GHO_RECORD_HEADER_LEN as u64 <= file_size {
         reader.seek(SeekFrom::Start(offset))?;
@@ -3528,11 +3549,27 @@ pub fn parse_gho_image<R: Read + Seek>(
         if is_boot_sector_record(inner.type_code) && inner.body_len == 512 {
             partition_count += 1;
         }
+
+        // Eagerly read small record bodies that walk_file_aware_tree
+        // and split_partitions will need later. The reader is already
+        // positioned at body_start (right after the 10-byte header),
+        // so this is free sequential I/O — no extra seeks.
+        let should_cache = is_boot_sector_record(inner.type_code)
+            || is_dir_entry_record(inner.type_code)
+            || is_checksum_record(inner.type_code);
+        if should_cache && inner.body_len > 0 {
+            let mut body = vec![0u8; inner.body_len as usize];
+            if reader.read_exact(&mut body).is_ok() {
+                cached_bodies.insert(inner.offset, body);
+            }
+        }
+
         records.push(inner);
         offset = inner.body_end();
     }
     Ok(GhoImage {
         records,
+        cached_bodies,
         partition_count,
     })
 }
@@ -3559,16 +3596,14 @@ pub struct GhoPartitionSlice {
 fn parse_vbr_geometry<R: Read + Seek>(
     reader: &mut R,
     rec: &GhoInnerRecord,
+    cache: &std::collections::HashMap<u64, Vec<u8>>,
 ) -> Result<(u64, u64, String)> {
     if (rec.body_len as usize) < 64 {
         bail!("boot-sector body too short: {} bytes", rec.body_len);
     }
-    reader.seek(SeekFrom::Start(rec.body_start()))?;
-    let mut bpb = [0u8; 512];
-    let n = read_fully_or_eof(reader, &mut bpb)?;
-    if n < 64 {
-        bail!("short read on boot-sector body");
-    }
+    let bpb_vec = read_record_body(reader, rec, cache)?;
+    let bpb = &bpb_vec;
+    let n = bpb.len();
     let byts_per_sec = u16::from_le_bytes([bpb[11], bpb[12]]) as u64;
     if byts_per_sec == 0 || byts_per_sec > 4096 {
         bail!("invalid bytes_per_sector: {}", byts_per_sec);
@@ -3652,7 +3687,7 @@ pub fn split_partitions<R: Read + Seek>(
 
     for (pi, &boot_idx) in boot_indices.iter().enumerate() {
         let rec = &records[boot_idx];
-        let (hidden, size, fs_type) = match parse_vbr_geometry(reader, rec) {
+        let (hidden, size, fs_type) = match parse_vbr_geometry(reader, rec, &image.cached_bodies) {
             Ok(g) => g,
             Err(_) => continue,
         };
