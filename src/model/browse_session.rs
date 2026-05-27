@@ -157,6 +157,35 @@ impl BrowseSession {
             );
         }
 
+        // GHO/GHS — 2-byte magic FE EF. GhoReader handles both
+        // SECTOR-mode (streaming block cache) and file-aware (in-RAM
+        // virtual FAT image).
+        if magic[0] == 0xFE && magic[1] == 0xEF {
+            let gho_reader = crate::rbformats::gho::GhoReader::open(path)
+                .map_err(|e| FilesystemError::Parse(format!("failed to open GHO: {e:#}")))?;
+            return fs::open_filesystem(
+                gho_reader,
+                self.partition_offset,
+                self.partition_type,
+                self.partition_type_string.as_deref(),
+            );
+        }
+
+        // IMZ — 4-byte magic "PK\x03\x04" (ZIP local file header).
+        if &magic[..4] == b"PK\x03\x04" {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if ext.eq_ignore_ascii_case("imz") {
+                let imz_reader = crate::rbformats::imz::ImzReader::open(path)
+                    .map_err(|e| FilesystemError::Parse(format!("failed to open IMZ: {e:#}")))?;
+                return fs::open_filesystem(
+                    imz_reader,
+                    self.partition_offset,
+                    self.partition_type,
+                    self.partition_type_string.as_deref(),
+                );
+            }
+        }
+
         // Seekable zstd cache files — keep extension-based detection since
         // there is no reliable content-level signal distinguishing them from
         // other zstd files.
