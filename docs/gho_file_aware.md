@@ -36,13 +36,17 @@ sitting alongside the SECTOR-mode `GhoReader` for the file-aware case.
 | type   | body_len  | meaning                                                     |
 |--------|-----------|-------------------------------------------------------------|
 | `0x0002` | 32768   | full 32 KiB cluster of file content                         |
-| `0x0017` | 512     | boot sector (Ghost 7.5)                                     |
-| `0x0717` | 512     | boot sector (Ghost 11.5)                                    |
+| `0x0017` | 512     | boot sector (Ghost 7.5 partition-only / 11.5 full-disk)     |
+| `0x0717` | 512     | boot sector (Ghost 11.5 partition-only)                     |
+| `0xae17` | 512     | boot sector (Ghost 7.5 full-disk, disk-level header copy)   |
+| `0x0117` | 512     | boot sector (Ghost 7.5 full-disk, partition copy)           |
 | `0x0004` | 56      | dir entry — Ghost 7.5 "header section"                      |
 | `0x0704` | 56      | dir entry — Ghost 11.5 "header section" (appears once)      |
+| `0xae04` | 56      | dir entry — Ghost 7.5 full-disk header section              |
 | `0x0104` | 56      | dir entry — all later entries on both 7.5 and 11.5          |
 | `0x0102` | variable| file content (whole small file OR tail fragment)            |
 | `0x0103` | 20      | per-file checksum: `[u32 cksum][u32 cksum_dup][12 zeros]`   |
+| `0x0118` | 16384   | unknown, Ghost 7.5 full-disk (1 occurrence per fixture)     |
 
 Markers observed: `0x0000` (default), `0x95FD` (~10% of records on
 Ghost 11.5 — purpose TBD), `0xC01E` (first 3 records on 11.5
@@ -229,6 +233,35 @@ SECTOR-mode path reports bytes through `CountingRead`.
   reverse-engineering work tracked in `docs/gho_password.md`. All our
   encrypted fixtures are file-aware mode, so neither problem unblocks
   the other.
+
+## Full-disk variant (added 2026-05-26)
+
+Reverse-engineering update: the file-aware **full-disk** mode used by
+Ghost 7.5 for `FULLDISK.GHO`, `HPVectra95C.gho`, `fromdanilaptop.GHO`,
+and `XP_SP2FU.GHO` turns out to be structurally **the same single-
+partition stream** as PART.GHO, just with the disk-level header section
+records tagged using a different high-byte:
+
+- `0xae17` for the boot sector (instead of `0x0017`)
+- `0xae04` for the header dir entries (instead of `0x0004`)
+- followed by a second boot sector at `0x0117` (probably the partition
+  copy — same 512-byte body as `0xae17`)
+- followed by a single `0x0118` record (16384 bytes, unknown purpose —
+  could be a packed bitmap, FSInfo snapshot, or extended MBR)
+
+After accepting the new codes in `is_boot_sector_record` /
+`is_dir_entry_record`, the walker reads FULLDISK.GHO cleanly and
+recovers the exact same tree as PART.GHO (22,219 entries, 20,761 files,
+1,458 dirs — confirmed by the fixture-gated test
+`walk_file_aware_tree_against_real_fulldisk_gho_matches_part_gho`).
+
+This holds because both backups are of the same source disk and that
+disk has a single partition. A multi-partition full-disk fixture is
+still hypothetical — we haven't found one in the corpus.
+
+The 11.5 full-disk file (`GH11/fulldisk.GHS`) needs no special handling
+at all: it uses plain `0x0017` boot sectors and the existing walker
+handles it as-is.
 
 ## Corpus context (added 2026-05-26)
 

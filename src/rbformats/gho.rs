@@ -1791,6 +1791,19 @@ pub const GHO_REC_BOOT_SECTOR: u16 = 0x0017;
 /// section" framing — records in this section carry marker `0xC01E`.
 pub const GHO_REC_BOOT_SECTOR_V2: u16 = 0x0717;
 
+/// Boot-sector record on Ghost 7.5 **full-disk** mode (body = 512
+/// bytes). Same body shape as [`GHO_REC_BOOT_SECTOR`]; the `0xae` high
+/// byte tags the disk-level header section. Observed as the very first
+/// record in `FULLDISK.GHO`, `HPVectra95C.gho`,
+/// `fromdanilaptop.GHO`, and `XP_SP2FU.GHO`.
+pub const GHO_REC_BOOT_SECTOR_FULLDISK: u16 = 0xae17;
+
+/// Subsequent boot-sector record observed in `FULLDISK.GHO` after the
+/// disk-level header section ends. Bytes are still a verbatim 512-byte
+/// FAT BPB. Likely the partition boot sector (vs `0xae17` which carries
+/// the same content as a disk-level header).
+pub const GHO_REC_BOOT_SECTOR_PARTITION: u16 = 0x0117;
+
 /// Root-directory entry record on Ghost 7.5 (body = 56 bytes). Each
 /// record holds one 32-byte FAT directory entry (LFN segment, 8.3
 /// entry, dot/dotdot, or empty slot) followed by a 24-byte trailer
@@ -1809,6 +1822,13 @@ pub const GHO_REC_DIR_ENTRY_ROOT_V2: u16 = 0x0704;
 /// on both Ghost 7.5 and 11.5.
 pub const GHO_REC_DIR_ENTRY_SUB: u16 = 0x0104;
 
+/// Directory-entry record in Ghost 7.5 **full-disk** mode, disk-level
+/// header section (body = 56 bytes). Same body shape as
+/// [`GHO_REC_DIR_ENTRY_ROOT`]; `0xae` high byte tags the header
+/// section. Observed at the start of `FULLDISK.GHO` directly after the
+/// `0xae17` boot sector.
+pub const GHO_REC_DIR_ENTRY_FULLDISK: u16 = 0xae04;
+
 /// File-content record (body = variable length). Carries either the
 /// entire content of a small file (≤ 32 KiB) or the trailing fragment
 /// of a larger file (`file_size mod 32768` bytes after N `0x0002`
@@ -1825,7 +1845,13 @@ pub const GHO_REC_FILE_CHECKSUM: u16 = 0x0103;
 /// Both Ghost 7.5 (`0x0017`) and 11.5 (`0x0717`) use a 512-byte body
 /// that's a verbatim copy of the partition's first sector.
 pub fn is_boot_sector_record(type_code: u16) -> bool {
-    type_code == GHO_REC_BOOT_SECTOR || type_code == GHO_REC_BOOT_SECTOR_V2
+    matches!(
+        type_code,
+        GHO_REC_BOOT_SECTOR
+            | GHO_REC_BOOT_SECTOR_V2
+            | GHO_REC_BOOT_SECTOR_FULLDISK
+            | GHO_REC_BOOT_SECTOR_PARTITION
+    )
 }
 
 /// Returns true if `type_code` carries one 32-byte FAT directory entry
@@ -1834,7 +1860,10 @@ pub fn is_boot_sector_record(type_code: u16) -> bool {
 pub fn is_dir_entry_record(type_code: u16) -> bool {
     matches!(
         type_code,
-        GHO_REC_DIR_ENTRY_ROOT | GHO_REC_DIR_ENTRY_ROOT_V2 | GHO_REC_DIR_ENTRY_SUB
+        GHO_REC_DIR_ENTRY_ROOT
+            | GHO_REC_DIR_ENTRY_ROOT_V2
+            | GHO_REC_DIR_ENTRY_SUB
+            | GHO_REC_DIR_ENTRY_FULLDISK
     )
 }
 
@@ -2674,7 +2703,7 @@ pub fn parse_gho_image<R: Read + Seek>(
             type_code: rec.type_code,
             body_len: rec.body_len,
         };
-        if inner.type_code == GHO_REC_BOOT_SECTOR && inner.body_len == 512 {
+        if is_boot_sector_record(inner.type_code) && inner.body_len == 512 {
             partition_count += 1;
         }
         records.push(inner);
@@ -3808,12 +3837,15 @@ mod tests {
         // Boot sector
         assert!(is_boot_sector_record(0x0017));
         assert!(is_boot_sector_record(0x0717));
+        assert!(is_boot_sector_record(0xae17)); // 7.5 full-disk header copy
+        assert!(is_boot_sector_record(0x0117)); // 7.5 full-disk partition copy
         assert!(!is_boot_sector_record(0x0004));
 
         // Dir entries
         assert!(is_dir_entry_record(0x0004));
         assert!(is_dir_entry_record(0x0104));
         assert!(is_dir_entry_record(0x0704));
+        assert!(is_dir_entry_record(0xae04)); // 7.5 full-disk header section
         assert!(!is_dir_entry_record(0x0017));
         assert!(!is_dir_entry_record(0x0102));
 
@@ -4068,6 +4100,50 @@ mod tests {
             assert!(!wordpad.content_record_offsets.is_empty());
             assert!(wordpad.checksum.is_some());
         }
+    }
+
+    /// 7.5 full-disk fixture: `FULLDISK.GHO` is the same source disk as
+    /// `PART.GHO` (per docs/gho_file_aware.md "Corpus context"), backed
+    /// up in full-disk mode instead of partition-only. The inner
+    /// stream's record taxonomy uses `0xae04` / `0xae17` for the
+    /// disk-level header section; the walker treats them as ordinary
+    /// dir-entry / boot-sector records. After predicate fixes (this
+    /// commit), the resulting tree should match PART.GHO's tree
+    /// shape: 22,219 entries, 20,761 files, 1,458 dirs.
+    #[test]
+    #[ignore = "fixture-gated; walks 7.5 FULLDISK.GHO. Opt in with --ignored"]
+    fn walk_file_aware_tree_against_real_fulldisk_gho_matches_part_gho() {
+        let home = match std::env::var("HOME") {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        let path = std::path::PathBuf::from(home)
+            .join("new-fixtures/gho/ManualGhostBackups/7.5/FULLDISK/FULLDISK.GHO");
+        if !path.exists() {
+            return;
+        }
+        let mut f = File::open(&path).unwrap();
+        let header = GhoContainerHeader::parse(&mut f).unwrap();
+        let file_size = f.metadata().unwrap().len();
+        let image = parse_gho_image(&mut f, file_size, &header).unwrap();
+        let tree = walk_file_aware_tree(&mut f, &image).unwrap();
+        eprintln!(
+            "  FULLDISK partition_count={} root_cluster={} entries={} files={} dirs={}",
+            image.partition_count,
+            tree.root_cluster,
+            tree.entries.len(),
+            tree.file_count(),
+            tree.dir_count()
+        );
+        // partition_count = 2 because FULLDISK carries both the
+        // disk-level 0xae17 header copy AND the partition's 0x0117
+        // boot sector. Both are 512-byte FAT BPB sectors with
+        // identical content.
+        assert_eq!(image.partition_count, 2);
+        assert_eq!(tree.root_cluster, 2);
+        assert_eq!(tree.entries.len(), 22_219);
+        assert_eq!(tree.file_count(), 20_761);
+        assert_eq!(tree.dir_count(), 1_458);
     }
 
     /// Unit-level: build a synthetic file-aware GHO with boot sector +
