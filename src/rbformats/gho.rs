@@ -2611,7 +2611,7 @@ pub struct VirtualFatImage {
     pub data_start_sector: u32,
     pub total_size: u64,
     pub cluster_size: u64,
-    pub sparse: std::collections::BTreeMap<u64, Vec<u8>>,
+    pub sparse: std::collections::HashMap<u64, Vec<u8>>,
     pub cluster_to_file: std::collections::HashMap<u32, (u32, u32)>,
     pub files: Vec<FileContentRef>,
 }
@@ -2626,7 +2626,7 @@ pub struct FileContentRef {
 /// sector-granular (one `Vec<u8>` per touched sector). Reads of
 /// unwritten sectors return zero.
 struct SparseSink {
-    sectors: std::collections::BTreeMap<u64, Vec<u8>>,
+    sectors: std::collections::HashMap<u64, Vec<u8>>,
     sector_size: u64,
     total_size: u64,
     pos: u64,
@@ -2635,7 +2635,7 @@ struct SparseSink {
 impl SparseSink {
     fn new(total_size: u64, sector_size: u64) -> Self {
         Self {
-            sectors: std::collections::BTreeMap::new(),
+            sectors: std::collections::HashMap::new(),
             sector_size,
             total_size,
             pos: 0,
@@ -2809,6 +2809,8 @@ fn build_virtual_fat_image(
                 let mut empty = std::io::empty();
                 let opts = CreateFileOptions {
                     skip_data_write: true,
+                    skip_name_checks: true,
+                    skip_fsinfo_update: true,
                     ..Default::default()
                 };
                 let f = match fs.create_file(&parent_entry, &name, &mut empty, file_size, &opts) {

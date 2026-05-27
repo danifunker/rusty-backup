@@ -1580,16 +1580,24 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
     ) -> Result<FileEntry, FilesystemError> {
         validate_fat_name(name)?;
 
-        // Read parent directory to check for duplicates and collect SFNs
-        let dir_data = if parent.path == "/" && self.fat_type != FatType::Fat32 {
-            self.read_root_directory()?
+        let (existing_sfns, dir_data_for_sfn);
+        if options.skip_name_checks {
+            existing_sfns = std::collections::HashSet::new();
+            dir_data_for_sfn = None;
         } else {
-            self.read_cluster_chain(parent.location as u32)?
-        };
-
-        if self.name_exists_in_dir(&dir_data, name) {
-            return Err(FilesystemError::AlreadyExists(name.to_string()));
+            let dir_data = if parent.path == "/" && self.fat_type != FatType::Fat32 {
+                self.read_root_directory()?
+            } else {
+                self.read_cluster_chain(parent.location as u32)?
+            };
+            if self.name_exists_in_dir(&dir_data, name) {
+                return Err(FilesystemError::AlreadyExists(name.to_string()));
+            }
+            let sfns = self.collect_existing_sfns(&dir_data);
+            existing_sfns = sfns;
+            dir_data_for_sfn = Some(dir_data);
         }
+        let _ = dir_data_for_sfn;
 
         // Allocate clusters for file data
         let cluster_size = self.cluster_size() as usize;
@@ -1635,13 +1643,14 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
         }
 
         // Generate SFN and build directory entries
-        let existing_sfns = self.collect_existing_sfns(&dir_data);
         let sfn = Self::generate_short_name(name, &existing_sfns);
         let entry_bytes =
             Self::build_dir_entries(name, &sfn, ATTR_ARCHIVE, first_cluster, data_len as u32);
 
         self.add_to_directory(parent, &entry_bytes)?;
-        self.update_fsinfo()?;
+        if !options.skip_fsinfo_update {
+            self.update_fsinfo()?;
+        }
 
         let path = if parent.path == "/" {
             format!("/{name}")

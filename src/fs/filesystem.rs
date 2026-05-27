@@ -227,6 +227,15 @@ pub struct CreateFileOptions {
     /// file-aware virtual-FAT builder to avoid writing 1 GB+ of zeros
     /// that are immediately evicted.
     pub skip_data_write: bool,
+    /// When true, skip the duplicate-name check and SFN collision scan
+    /// before creating the file.  The caller guarantees uniqueness
+    /// (e.g. entries come from a pre-deduplicated tree on a fresh FS).
+    /// Eliminates the O(n) parent-directory read per file.
+    pub skip_name_checks: bool,
+    /// When true, skip the per-operation FSInfo update (FAT32).
+    /// Caller must call `sync_metadata` when done to write a correct
+    /// FSInfo sector.  Eliminates two full FAT-table reads per file.
+    pub skip_fsinfo_update: bool,
 }
 
 /// Options for creating a directory on an editable filesystem.
