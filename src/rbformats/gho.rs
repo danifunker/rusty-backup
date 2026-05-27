@@ -1113,6 +1113,14 @@ impl GhoReader {
 
             if !has_record_stream {
                 // No FAT record stream — try NTFS file-aware path.
+                if !matches!(header.compression, GhoCompression::None) {
+                    bail!(
+                        "GHO {} appears to be an NTFS file-aware backup with {:?} compression; \
+                         compressed NTFS file-aware GHOs are not yet supported",
+                        path.display(),
+                        header.compression
+                    );
+                }
                 log::info!("No FAT record stream found, trying NTFS file-aware path...");
                 match try_open_ntfs_file_aware(&mut inner, file_size) {
                     Ok((mode, volume_size)) => {
@@ -4426,7 +4434,9 @@ fn index_ntfs_file_aware<R: Read + Seek>(
     // by cluster count (Ghost doesn't emit them in the same order).
     let mut pending_lcns: Vec<(u64, u64)> = Vec::new();
 
-    let _ = data_run_queue; // Reserved for future fallback strategies.
+    // Runs that couldn't be matched to an inline MFT record's data runs.
+    // Resolved via $Bitmap after the main scan.
+    let mut unmapped_runs: Vec<(u64, u64)> = Vec::new(); // (cluster_count, file_offset)
 
     // Scan the entire file for run headers using the 16-byte needle.
     let needle = &NTFS_RUN_HEADER_ENTRY1;
@@ -4492,26 +4502,15 @@ fn index_ntfs_file_aware<R: Read + Seek>(
                                         lcn
                                     });
 
-                            // Skip runs we can't map. These are typically
-                            // system metadata clusters between the MFT and
-                            // the first inline MFT record.
-                            let Some(lcn) = lcn else {
-                                prev_data_end = data_end;
-                                if data_end > search_pos + chunk.len() as u64 {
-                                    search_pos = data_end;
-                                    scan_pos = chunk.len();
-                                    break;
-                                } else {
-                                    scan_pos = (data_end - search_pos) as usize;
-                                    continue;
-                                }
-                            };
-
-                            runs.push(NtfsGhoClusterRun {
-                                lcn_start: lcn,
-                                cluster_count: cc,
-                                file_offset: data_start,
-                            });
+                            if let Some(lcn) = lcn {
+                                runs.push(NtfsGhoClusterRun {
+                                    lcn_start: lcn,
+                                    cluster_count: cc,
+                                    file_offset: data_start,
+                                });
+                            } else {
+                                unmapped_runs.push((cc, data_start));
+                            }
                             total_stored_clusters += cc;
                             prev_data_end = data_end;
 
@@ -4537,6 +4536,53 @@ fn index_ntfs_file_aware<R: Read + Seek>(
         } else if search_pos + chunk.len() as u64 >= file_size {
             break;
         }
+    }
+
+    // --- Phase 3: resolve unmapped runs via $Bitmap ---
+    if !unmapped_runs.is_empty() {
+        log::info!(
+            "{} unmapped runs ({} clusters), resolving via MFT data-run queue",
+            unmapped_runs.len(),
+            unmapped_runs.iter().map(|(cc, _)| cc).sum::<u64>()
+        );
+
+        // Build a set of already-mapped LCN ranges for fast lookup.
+        let mut mapped_lcns: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for run in &runs {
+            for c in 0..run.cluster_count {
+                mapped_lcns.insert(run.lcn_start + c);
+            }
+        }
+
+        // Collect unmapped data runs from the MFT queue (those not
+        // consumed by inline matching). Match by cluster count.
+        let mut remaining_queue: Vec<(u64, u64)> = data_run_queue
+            .iter()
+            .filter(|&&(lcn, len)| {
+                // Exclude runs already mapped.
+                !(0..len).any(|c| mapped_lcns.contains(&(lcn + c)))
+            })
+            .copied()
+            .collect();
+
+        let mut resolved = 0u64;
+        for &(cc, file_offset) in &unmapped_runs {
+            if let Some(idx) = remaining_queue.iter().rposition(|&(_, len)| len == cc) {
+                let (lcn, _) = remaining_queue.remove(idx);
+                runs.push(NtfsGhoClusterRun {
+                    lcn_start: lcn,
+                    cluster_count: cc,
+                    file_offset,
+                });
+                resolved += 1;
+            }
+        }
+
+        log::info!(
+            "Resolved {} of {} unmapped runs via MFT queue fallback",
+            resolved,
+            unmapped_runs.len()
+        );
     }
 
     // Sort by LCN for binary search during reads.
