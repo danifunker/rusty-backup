@@ -1,348 +1,180 @@
 # GHO file-aware reconstruction
 
-Status (2026-05-26):
+Status (2026-05-27):
 - **Slice A** — typed body parsers + record-type predicates: **done**
-  (commit `e8847d0`, validated against PART.GHO).
-- **Slice B** — directory tree walker: **done** (commit `28d9ab1`,
-  validated against PART.GHO: 22,219 entries / 20,761 files / 1,458
-  dirs walked cleanly, structural invariants checked on MYDOCU~1,
-  MYPICT~1, PROGRA~1, WORDPAD.EXE).
-- **Slice C** — FAT image emitter: **done**. `emit_file_aware_fat_image`
-  (Vec) and `emit_file_aware_fat_image_to_sink` (streaming to any
-  `Read+Write+Seek`) in `src/rbformats/gho.rs`. PART.GHO round-trip:
-  1,458 dirs + 20,688 files emitted, 73 skipped (entries whose LFN +
-  8.3 both failed FAT name validation), 8.59 GB image reopens cleanly
-  as a FAT filesystem.
-- **Slice D** — GUI wiring: **done**. `materialize_gho_to_temp` now
-  routes file-aware GHOs through `decode_file_aware_to_temp`, which
-  walks + emits to a tempfile, returning the same `GhoMaterialized`
-  shape the SECTOR-mode path uses. All four tabs (backup, inspect,
-  restore picker, restore disk picker) pick this up automatically via
-  `materialize_amiga_image_path`.
+  (commit `e8847d0`).
+- **Slice B** — directory tree walker: **done** (commit `28d9ab1`).
+- **Slice C** — FAT image emitter: **done** (commit `ae77e3e`).
+- **Slice D** — unified streaming `GhoReader`: **done** (commit `922a035`).
+- **Full-disk variant** — `0xae17`/`0xae04`/`0x0117` accepted: **done**
+  (commit `94c7987`).
+- **GUI wiring** — inspect tab + browse view stream natively: **done**
+  (commits `fe358eb`, `df4078c`).
 
-Goal: turn a file-aware GHO into a mountable raw FAT partition image,
-sitting alongside the SECTOR-mode `GhoReader` for the file-aware case.
+All file-aware GHO fixtures in the corpus now open in the GUI without
+tempfiles. SECTOR-mode (raw block) GHOs already worked since the
+CHD-style `GhoReader` refactor (`e308dd2`).
+
+Goal: turn a file-aware GHO into a browsable FAT partition, sitting
+alongside the SECTOR-mode `GhoReader` for the file-aware case. **Done.**
+
+## Architecture
+
+`GhoReader::open(path)` is the single entry point for all GHO
+containers. Internally it dispatches on `image_type`:
+
+- `Sector` + `compression = None` → `GhoReaderMode::Uncompressed`
+- `Sector` + `compression in {Fast, High}` → `GhoReaderMode::Blocked`
+  (block-indexed, single-block decode cache)
+- `FileAware` → `GhoReaderMode::FileAware` (in-RAM virtual FAT image)
+
+All three modes implement `Read + Seek + DataLen`. Spanning
+(multi-file `.GHS` / `.GHO.NNN`) is handled by `SpanReader` under
+the hood for all modes.
+
+### File-aware virtual FAT image
+
+Instead of writing an 8 GB tempfile, `GhoReader` builds a
+`VirtualFatImage` in RAM:
+
+1. Parse + walk the file-aware tree (~2-5 s for 22k-entry fixtures).
+2. Compute FAT layout via `compute_fat_blank_layout` (extracted from
+   `create_blank_fat`).
+3. Write metadata (BPB, FAT tables, FSInfo, dir clusters) into a
+   `SparseSink` — sector-granular sparse `Read+Write+Seek` store.
+4. Call `FatFilesystem::create_file` with `ZeroReader` to allocate
+   cluster chains without materialising content bytes.
+5. Record each file's `(cluster_chain, content_record_offsets)` and
+   evict file-cluster sectors from the sparse store.
+6. At read time: metadata sectors come from the sparse map; data
+   clusters decompress the appropriate `0x0002`/`0x0102` records from
+   the GHO on demand via `GhoFileContentReader`.
+
+Peak RAM for an 8 GB FAT32 reconstruction: ~tens of MB (reserved +
+2x FAT + dir clusters + per-file metadata index).
+
+### GUI integration
+
+- **Inspect tab** (`src/gui/inspect_tab.rs`): `run_inspect` detects
+  GHO/IMZ via `is_gho_path`/`is_imz_path` and opens them through
+  `source_reader::open_read` (no tempfile). Regular images and
+  devices keep the existing `File::try_clone` path.
+- **Browse view** (`src/model/browse_session.rs`): `BrowseSession::open`
+  sniffs `FE EF` magic and routes through `GhoReader::open`.
+- **File picker** (`src/gui/mod.rs`): `prepare_disk_image_path` only
+  tempfile-decompresses `.adz`/`.hdz` (gzip). GHO/IMZ/CHD pass
+  through unchanged.
+- `open_disk_image_for_reading(path)` — thin wrapper over
+  `source_reader::open_read`, ready for callers that want
+  `Box<dyn ReadSeek>` directly.
 
 ## Exploration tools
 
-- `examples/gho_dump_records.rs` — hex-dump first N records of a GHO.
-- `examples/gho_record_histogram.rs` — type/marker histogram, used to
-  characterise unfamiliar fixtures.
-- `examples/gho_dump_tree.rs` — decodes each dir entry inline with
-  name/attr/cluster/size; used to reverse-engineer the directory walker.
+- `examples/gho_dump_records.rs` — hex-dump first N records.
+- `examples/gho_record_histogram.rs` — type/marker histogram.
+- `examples/gho_dump_tree.rs` — dir entries inline with
+  name/attr/cluster/size.
+- `examples/gho_scan_partitions.rs` — scan a fixture tree for
+  image_type + partition_count + span count.
 
 ## Record types
 
-| type   | body_len  | meaning                                                     |
-|--------|-----------|-------------------------------------------------------------|
-| `0x0002` | 32768   | full 32 KiB cluster of file content                         |
-| `0x0017` | 512     | boot sector (Ghost 7.5 partition-only / 11.5 full-disk)     |
-| `0x0717` | 512     | boot sector (Ghost 11.5 partition-only)                     |
-| `0xae17` | 512     | boot sector (Ghost 7.5 full-disk, disk-level header copy)   |
-| `0x0117` | 512     | boot sector (Ghost 7.5 full-disk, partition copy)           |
-| `0x0004` | 56      | dir entry — Ghost 7.5 "header section"                      |
-| `0x0704` | 56      | dir entry — Ghost 11.5 "header section" (appears once)      |
-| `0xae04` | 56      | dir entry — Ghost 7.5 full-disk header section              |
-| `0x0104` | 56      | dir entry — all later entries on both 7.5 and 11.5          |
-| `0x0102` | variable| file content (whole small file OR tail fragment)            |
-| `0x0103` | 20      | per-file checksum: `[u32 cksum][u32 cksum_dup][12 zeros]`   |
-| `0x0118` | 16384   | unknown, Ghost 7.5 full-disk (1 occurrence per fixture)     |
+| type     | body_len | meaning                                                  |
+|----------|----------|----------------------------------------------------------|
+| `0x0002` | 32768    | full 32 KiB cluster of file content                      |
+| `0x0017` | 512      | boot sector (Ghost 7.5 partition-only / 11.5 full-disk)  |
+| `0x0717` | 512      | boot sector (Ghost 11.5 partition-only)                  |
+| `0xae17` | 512      | boot sector (Ghost 7.5 full-disk, disk-level header)     |
+| `0x0117` | 512      | boot sector (Ghost 7.5 full-disk, partition copy)        |
+| `0x0004` | 56       | dir entry — Ghost 7.5 "header section"                   |
+| `0x0704` | 56       | dir entry — Ghost 11.5 "header section" (appears once)   |
+| `0xae04` | 56       | dir entry — Ghost 7.5 full-disk header section           |
+| `0x0104` | 56       | dir entry — all later entries on both 7.5 and 11.5       |
+| `0x0102` | variable | file content (whole small file OR tail fragment)         |
+| `0x0103` | 20       | per-file checksum: `[u32 cksum][u32 cksum_dup][12 zeros]`|
+| `0x0118` | 16384    | unknown, Ghost 7.5 full-disk (1 occurrence per fixture)  |
 
-Markers observed: `0x0000` (default), `0x95FD` (~10% of records on
-Ghost 11.5 — purpose TBD), `0xC01E` (first 3 records on 11.5
-file-aware fixtures — header-section flag).
+Markers: `0x0000` (default), `0x95FD` (~10% on 11.5), `0xC01E`
+(first 3 records on 11.5 header section).
 
-The `0x07xx`-series codes are NOT filesystem-specific. They're the
-Ghost 11.5 stream-version equivalents of the `0x00xx` codes used by
-Ghost 7.5 for the same body shapes. XP_SP2FU.GHO (which the filename
-suggests is NTFS) is actually a FAT32 partition — "MSWIN4.1" + "FAT32"
-signature in the boot sector. We have no real NTFS fixtures in the
-corpus; all four file-aware fixtures are FAT12/16/32.
-
-### `0x0017` / `0x0717` boot sector
-Verbatim copy of the FAT VBR. Bytes 0..511 of the backed-up partition.
-For FAT32, BPB_RootClus is at offset 44 (4 bytes LE). Confirm FAT32 by
-the `"FAT32"` signature at offsets 82..87.
-
-### `0x0004` / `0x0104` / `0x0704` directory entry
-First 32 bytes = verbatim FAT directory entry (LFN segment, 8.3 entry,
-dot/dotdot, or empty slot). Bytes 32..36 = `u32 entry_hash`. Bytes
-36..56 = 20 reserved zero bytes.
-
-The `0x0004` → `0x0104` transition is a writer-side stream-state flag
-unrelated to filesystem semantics. The walker treats all three type
-codes identically.
-
-### `0x0002` / `0x0102` file content
-Files are emitted as N × `0x0002` (32 KiB each, full clusters) +
-optional `0x0102` tail (file_size mod 32768). Verified against
-MSPAINT.EXE (344 064 bytes = 10 × 32 768 + 16 384, exact match).
-
-Uncompressed fixtures: body bytes are the raw content.
-Compressed fixtures: body is `[4-byte prefix][zlib stream]` (per the
-older 5.5c finding documented in `src/rbformats/gho.rs`
-`zlib_decode_block`).
-
-### `0x0103` per-file checksum
-Duplicated `u32` followed by 12 zero bytes. Algorithm is not yet
-reverse-engineered. Probably CRC-32 or Adler-32 over the file content
-— compute both for a known file (e.g. `desktop.ini` 125 bytes from
-PART.GHO record #12) and compare to the value stored at record #13
-(`0x1d78fce5`). Useful for integrity checks; not blocking
-reconstruction.
+The `0x07xx` codes are Ghost 11.5 equivalents of `0x00xx`. The
+`0xae` high-byte tags the disk-level header section on 7.5 full-disk
+mode.
 
 ## Directory walker algorithm
 
-Reverse-engineered from PART.GHO records 0-200 and implemented in
-`walk_file_aware_tree(reader, image) -> GhoFileAwareTree`. Validated
-against the full 22,219-entry tree.
+Implemented in `walk_file_aware_tree(reader, image) -> GhoFileAwareTree`.
+Depth-first pre-order descent matching Ghost's writer:
 
-The writer does depth-first **pre-order** descent: emit a dir's entries
-inline, recurse into each subdir IMMEDIATELY after seeing its 8.3
-entry, return when the subdir's entries are exhausted, continue the
-parent dir.
+1. `current_dir_cluster` initialised from boot sector's BPB_RootClus.
+2. `.` entry sets `current_dir_cluster`.
+3. `..` entry back-fills parent on the most-recent pending DIR entry.
+4. FILE entries use `current_dir_cluster` as parent.
+5. LFN slots buffer before each 8.3 and attach as `long_name`.
+6. Empty/deleted slots ignored.
 
-The walker mirrors this with a simpler reader-side model that doesn't
-need an explicit pop stack:
+**Known limitation**: implicit-pop ambiguity for FILE parent
+attribution. Not blocking; the tree is internally consistent.
 
-1. **`current_dir_cluster`** is initialised from the boot sector's
-   `BPB_RootClus` (FAT32) or `0` (FAT12/16 fixed root area).
-2. **`.` entry** sets `current_dir_cluster` to the entry's
-   first_cluster. The writer always emits `.` right after descending
-   into a directory.
-3. **`..` entry** reveals the PARENT cluster of the directory we just
-   descended into. We back-fill `parent_cluster` on the most-recent
-   pending DIR entry.
-4. **FILE 8.3 entry** uses `current_dir_cluster` as its parent.
-5. **DIR 8.3 entry** is pending; `parent_cluster` filled when the
-   dir's own `..` entry shows up.
-6. **LFN slots** (`attr == 0x0F`) buffer up before each 8.3 record
-   and attach as `long_name` to the next 8.3.
-7. **Empty / deleted slots** (first byte `0x00` or `0xE5`) are FAT
-   source padding artifacts — ignored.
+## Full-disk variant
 
-### Key correctness check
+Ghost 7.5's full-disk file-aware mode (`FULLDISK.GHO`,
+`HPVectra95C.gho`, `fromdanilaptop.GHO`, `XP_SP2FU.GHO`) is
+structurally identical to single-partition file-aware — just uses
+`0xae` high-byte for the header section. After accepting the new
+codes, the walker + emitter handle these transparently.
 
-`PROGRA~1` (Program Files) appears in the stream while
-`current_dir_cluster` still points at MyPics (cluster 8) — i.e. between
-MyPics' content end and the next descent. If we naively used
-`current_dir` as the dir's parent, Program Files would be wrongly
-placed inside MyPics. But its OWN `..` entry (record #18) says
-`cluster=0`, which we normalise to `root_cluster` per FAT convention
-(direct children of root carry `..` cluster=0, not the actual root
-cluster). So Program Files correctly lands at root.
+Ghost 11.5's full-disk (`GH11/fulldisk.GHS`) uses ordinary `0x0017`
+and works without changes.
 
-This is the load-bearing test for the algorithm; the fixture-gated
-test in `src/rbformats/gho.rs` (`walk_file_aware_tree_against_real_part_gho`)
-asserts it explicitly.
+### Corpus scan results (2026-05-27)
 
-### Known limitation
+All `ManualGhostBackups/` fixtures are the same source disk with
+different Ghost versions/modes. Scan via `gho_scan_partitions`:
 
-For FILE entries we use `current_dir_cluster` as the parent. If
-Ghost's writer ascends through multiple levels between a `.` entry
-and the next 8.3 FILE entry (the "implicit pop" scenario), files in
-the intervening levels would be attributed to the deepest level
-visited. Directory entries are NOT affected — they get their true
-parent via their own `..` entry.
+| fixture                  | type      | #p | spans | comp | notes          |
+|--------------------------|-----------|----|-------|------|----------------|
+| HPVectra95C.gho          | FileAware | 1  | 1     | Fast | Win95 disk     |
+| 7.5/FULLDISK.GHO         | FileAware | 2  | 1     | None | 7.5 full-disk  |
+| 7.5/PART.GHO             | FileAware | 1  | 1     | None | 7.5 partition  |
+| 7.5/PART-HI.GHO          | FileAware | 1  | 1     | High | 7.5 part+high  |
+| 7.5/FAST.GHO             | FileAware | 1  | 1     | Fast | 7.5 part+fast  |
+| 7.5/FD-HIGH.GHO          | FileAware | 1  | 1     | High | 7.5 FD+high    |
+| 7.5/SECTOR.GHO           | Sector    | 0  | 4     | None | 7.5 raw+spans  |
+| 11.5/gh11part.GHO        | FileAware | 1  | 1     | None | 11.5 part, PWD |
+| 11.5/partcom.GHO         | FileAware | 1  | 1     | High | 11.5 part, PWD |
+| 11.5/High.GHO            | FileAware | 1  | 1     | High | 11.5 part      |
+| 11.5/gh11-spl.GHO        | FileAware | 1  | 12    | None | 11.5 spans     |
+| 11.5/secthigh.GHO        | Sector    | 0  | 1     | High | 11.5 raw       |
+| 11.5/fulldisk.GHS        | FileAware | 2  | 1     | None | 11.5 full-disk |
+| 11.5/GH11PW.GHO          | FileAware | 1  | 1     | None | 11.5 part, PWD |
+| 11.5/hipwd.GHO           | FileAware | 1  | 6     | High | 11.5 spans,PWD |
+| 11.5/gh11pwd.GHO         | FileAware | 1  | 12    | None | 11.5 spans,PWD |
+| Unknown/fromdanilaptop   | FileAware | ?  | 6     | High | unknown origin |
+| Split/Win7_86xAMB.GHO    | FileAware | 0  | 1*    | High | 0 recs parsed* |
+| XP_SP2FU.GHO             | FileAware | 2  | 2     | High | XP disk        |
 
-The scope of this concern is bounded by the corpus we have:
-- PART.GHO's WORDPAD.EXE / MSPAINT.EXE / etc. all appear in
-  HyperTerminal's `current_dir` window. They may genuinely belong to
-  HyperTerminal (custom install) or they may be in Accessories one
-  level up. We don't have an independent ground-truth dump of PART.GHO
-  to disambiguate.
-- A future validation step (Ghost Explorer external extract, or mount
-  the reconstructed image and compare) would resolve this. Not
-  blocking slice C: the walker output is internally consistent and the
-  reconstructed image will be byte-equivalent up to file placement.
+`*` Win7_86xAMB.GHO uses `.GHO.NNN` numeric spans not discovered by
+the single-file scan; may need the full span set to parse.
 
-## Slice C — FAT image emitter (shipped)
+## What's NOT in scope
 
-Given `GhoFileAwareTree` + `content_record_offsets` per file, the
-emitter constructs a fresh FAT partition image:
+- **NTFS file-aware**: no fixtures exist. Would need a separate
+  reconstructor if one turns up.
+- **Password-protected GHOs**: blocked on cipher RE
+  (`docs/gho_password.md`).
+- **Multi-partition full-disk**: no fixture with >1 partition exists
+  in the corpus. The walker handles the first partition; if a real
+  multi-partition fixture appears, per-partition record-run splitting
+  would need to be added.
 
-1. **Use the source boot sector verbatim** at LBA 0. Reuses
-   sectors_per_cluster, reserved_sectors, num_FATs, sectors_per_FAT,
-   media descriptor, etc.
-2. **Format a blank FAT image** matching the source BPB params and
-   open it as `EditableFilesystem` from `src/fs/fat.rs`. This reuses
-   the existing FAT writer (cluster allocator, dir entry encoder,
-   LFN encoder, FSInfo updater).
-3. **Walk the tree** in topological order (root → subdirs depth-first
-   or BFS — either works since `EditableFilesystem::create_directory`
-   takes the parent path). For each entry:
-   - DIR: `create_directory(parent_path, name, opts)`
-   - FILE: `create_file(parent_path, name, content_reader, opts)` —
-     stream the content from `content_record_offsets` via a custom
-     `Read` wrapper that decompresses each `0x0002` / `0x0102` body
-     on demand (None / Fast / High per container compression).
-4. **Sync metadata** once at the end; the resulting image is a
-   ready-to-mount raw FAT partition.
+## Open questions
 
-The output is **byte-equivalent up to cluster allocation order**: we
-choose fresh cluster numbers (sequential as we create), so the source
-disk's FAT chain is not preserved. File content + names + tree
-structure ARE preserved.
-
-Open work items for slice C:
-- Decide the output API: does the emitter take a `Write+Seek` sink, or
-  produce a tempfile path, or directly stream to a `Vec<u8>`?
-  (Sectors-aligned `Write+Seek` is most flexible.)
-- Validate by mounting the reconstructed image and comparing the
-  directory tree to what we computed in slice B.
-- Compute `0x0103` checksums on emit (once the algorithm is known) so
-  round-trip GHO-out → GHO-in is possible.
-
-## Slice D — unified `GhoReader` (shipped)
-
-The reconstructor is exposed through the single `GhoReader::open(path)`
-entry point — the same shape SECTOR-mode already uses. `GhoReader`
-internally dispatches on `image_type`:
-
-- `Sector` + `compression = None` → `GhoReaderMode::Uncompressed`
-  (passes-through the raw block stream).
-- `Sector` + `compression in {Fast, High}` → `GhoReaderMode::Blocked`
-  (block-indexed, decompresses one 32 KiB block on demand with a
-  single-block cache).
-- `FileAware` → `GhoReaderMode::FileAware` (in-RAM virtual FAT
-  image; metadata sectors stored sparsely, data clusters resolved on
-  demand by decompressing the appropriate `0x0002`/`0x0102` records).
-
-Peak RAM for an 8 GB FAT32 file-aware reconstruction is bounded by:
-
-- reserved sectors + 2 × FAT (≈ 16 MB for 8 GB)
-- allocated directory clusters (a few KB per directory)
-- per-file content-record index (≈ 16 bytes per data cluster)
-
-= **tens of MB**, vs. 8 GB for the old "decode to tempfile" path.
-
-The reader implements `Read + Seek + DataLen`; `source_reader::open_read`
-automatically picks it up for file-aware GHOs (previously errored out).
-The legacy `materialize_gho_to_temp` is still available as a back-compat
-shim — its file-aware branch now runs `GhoReader::open` + `std::io::copy`
-into a tempfile, so callers that need a real path still get one. Once
-the GUI tabs are refactored to take `Box<dyn Read + Seek>` instead of
-`PathBuf`, the tempfile shim disappears entirely.
-
-Supporting infrastructure:
-
-- `src/fs/fat.rs::compute_fat_blank_layout` + `write_blank_fat_metadata_to_sink`
-  — extracted from `create_blank_fat` so we can format a FAT volume's
-  metadata into a sparse sink without allocating the full image as a Vec.
-- `SparseSink` (in `gho.rs`) — sector-granular sparse `Read+Write+Seek`
-  backing store; unwritten sectors read as zero.
-- `ZeroReader` — fixed-size zero stream fed to `FatFilesystem::create_file`
-  so cluster allocation runs without us having to materialise real
-  content bytes.
-- `VirtualFatImage` — the result of the build: sparse metadata map +
-  per-cluster file lookup table + content-record metadata.
-
-Progress reporting still isn't wired through — the virtual image is
-built synchronously on `GhoReader::open`. Worth adding once it surfaces
-in the GUI.
-
-## What's NOT in scope here
-
-- **No FAT entries are stored in the record stream.** Ghost's
-  file-aware mode discards the source's FAT entirely; the rebuilder
-  constructs a fresh FAT from observed (file, cluster_count) pairs.
-- **No partition table info.** File-aware GHOs are
-  `image_type=0x00` (single partition). Multi-partition full-disk
-  backups (e.g. FULLDISK.GHO) presumably interleave one record stream
-  per partition with a top-level "begin partition" marker — not yet
-  observed in our trace. SECTOR-mode multi-partition is handled
-  separately via the existing block-stream path.
-- **No NTFS.** All four file-aware fixtures we have are FAT. If a real
-  NTFS fixture turns up (recognisable by `"NTFS    "` OEM signature in
-  the boot sector + record types we haven't seen yet), it's a separate
-  reconstructor with a different downstream emitter.
-- **Password-protected file-aware GHOs.** Blocked on the cipher
-  reverse-engineering work tracked in `docs/gho_password.md`. All our
-  encrypted fixtures are file-aware mode, so neither problem unblocks
-  the other.
-
-## Full-disk variant (added 2026-05-26)
-
-Reverse-engineering update: the file-aware **full-disk** mode used by
-Ghost 7.5 for `FULLDISK.GHO`, `HPVectra95C.gho`, `fromdanilaptop.GHO`,
-and `XP_SP2FU.GHO` turns out to be structurally **the same single-
-partition stream** as PART.GHO, just with the disk-level header section
-records tagged using a different high-byte:
-
-- `0xae17` for the boot sector (instead of `0x0017`)
-- `0xae04` for the header dir entries (instead of `0x0004`)
-- followed by a second boot sector at `0x0117` (probably the partition
-  copy — same 512-byte body as `0xae17`)
-- followed by a single `0x0118` record (16384 bytes, unknown purpose —
-  could be a packed bitmap, FSInfo snapshot, or extended MBR)
-
-After accepting the new codes in `is_boot_sector_record` /
-`is_dir_entry_record`, the walker reads FULLDISK.GHO cleanly and
-recovers the exact same tree as PART.GHO (22,219 entries, 20,761 files,
-1,458 dirs — confirmed by the fixture-gated test
-`walk_file_aware_tree_against_real_fulldisk_gho_matches_part_gho`).
-
-This holds because both backups are of the same source disk and that
-disk has a single partition. A multi-partition full-disk fixture is
-still hypothetical — we haven't found one in the corpus.
-
-The 11.5 full-disk file (`GH11/fulldisk.GHS`) needs no special handling
-at all: it uses plain `0x0017` boot sectors and the existing walker
-handles it as-is.
-
-## Corpus context (added 2026-05-26)
-
-Everything under `~/new-fixtures/gho/ManualGhostBackups/` is **the same
-source disk**, backed up repeatedly with different Ghost versions
-(7.5 vs 11.5) and different operation modes (file-aware partition,
-SECTOR, full-disk, with/without password, fast/high compression). This
-makes the corpus a clean differential-comparison set.
-
-The most useful pairing for the next slice is:
-
-- `ManualGhostBackups/11.5/gh11-partitiononly/gh11part.GHO` — **single
-  partition, file-aware, Ghost 11.5.** Already handled by the
-  reconstructor (slice C).
-- `ManualGhostBackups/11.5/GH11/fulldisk.GHS` — **full disk, file-aware,
-  Ghost 11.5.** Same disk, same Ghost version, just full-disk mode.
-  Currently `partition_count = 0` because the inner stream presumably
-  starts with disk-level records (MBR / partition-map / per-partition
-  headers) before any `0x0017` boot sector.
-
-Because the two backups are the same source data, a byte-level diff of
-the inner record streams should expose the disk-level wrapper records
-exactly. Expected workflow:
-
-1. Run `gho_record_histogram` on both, diff the type-code distributions
-   — disk-level record types should appear only in `fulldisk.GHS`.
-2. Dump the first ~50 records of `fulldisk.GHS` with `gho_dump_records`
-   and look for an MBR-shaped (512-byte) record + a per-partition
-   marker that bookends each partition's record subsequence.
-3. Extend `parse_gho_image` to recognise the wrapper records and split
-   the inner stream into per-partition record runs.
-4. Extend `walk_file_aware_tree` / `emit_file_aware_fat_image_to_sink`
-   to iterate runs and emit one FAT image per partition (plus an MBR
-   sidecar). The GUI's reconstructed image would then need to be a
-   full disk (MBR + N partitions), not a single FAT volume.
-
-Other 0-partition fixtures (`HPVectra95C.gho`, `7.5/FULLDISK.GHO`,
-`fromdanilaptop.GHO`, `Win7_86xAMB.GHO`, `XP_SP2FU.GHO`) are
-independent disks and useful as cross-version sanity checks once the
-disk-level layout is decoded.
-
-## Open questions (still)
-
-1. **The implicit-pop ambiguity for FILE parent attribution.** Could
-   be resolved with an independent extract of PART.GHO (Ghost
-   Explorer, or compare against a mount of the reconstructed image).
+1. **Implicit-pop ambiguity for FILE parent attribution.** Resolvable
+   with Ghost Explorer extract or mounting the reconstructed image.
 2. **`0x0103` checksum algorithm.** CRC-32 vs Adler-32 vs custom.
-   Brute-force compute both over `desktop.ini` (125 bytes, checksum
-   `0x1d78fce5`) and compare.
-3. **`0x95FD` and `0xC01E` marker semantics.** `0xC01E` flags the
-   first 3 records on Ghost 11.5 (header section). `0x95FD` appears
-   on ~10% of records throughout. Not blocking, but unexplained.
-4. **Multi-partition full-disk reconstruction.** FULLDISK.GHO likely
-   has multiple boot-sector records (one per partition). The walker
-   currently handles only the first partition; adding multi-partition
-   support is a separate effort, not blocking slice C for the
-   common single-partition case.
+   Not blocking reconstruction.
+3. **`0x95FD` and `0xC01E` marker semantics.** Not blocking.
+4. **`0x0118` record (16 KiB, 1 per 7.5 full-disk).** Unknown purpose.
+5. **Win7_86xAMB.GHO**: 0 records parsed — likely needs its full
+   `.GHO.NNN` span set to parse.
