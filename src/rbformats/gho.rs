@@ -4233,13 +4233,9 @@ struct NtfsGhoIndex {
     vbr: [u8; 512],
 }
 
-/// Scan a compressed NTFS file-aware GHO to build the block map.
-///
-/// Compressed NTFS file-aware GHOs use zlib (High) compression. The data
-/// region is a sequence of zlib blocks (CMF=`0x78`, FLG=`0x01`) separated
-/// by 2-byte gaps. Each block decompresses to 10–32768 bytes. The gap
-/// bytes can be any value — including `78 01` — so when a candidate zlib
-/// header fails to decompress we skip 2 more bytes and retry.
+/// Scan-only block map builder (superseded by `scan_and_index_ntfs_compressed`
+/// for the zlib path, but kept for potential Fast-LZ support).
+#[allow(dead_code)]
 fn scan_ntfs_compressed_blocks<R: Read + Seek>(
     reader: &mut R,
     data_start: u64,
@@ -4251,7 +4247,10 @@ fn scan_ntfs_compressed_blocks<R: Read + Seek>(
     let mut blocks = Vec::with_capacity(100_000);
     let mut decomp_offset: u64 = 0;
     let end = file_size;
-    let mut decomp_buf = vec![0u8; FAST_LZ_BLOCK_SIZE + 1024];
+    // We only need total_in / total_out per block — not the data itself.
+    // A small discard buffer keeps the decompressor moving without
+    // materialising 32 KiB per block.
+    let mut discard = vec![0u8; 8192];
 
     // Find the first `78 01` (zlib header) after the VBR region.
     let mut off = data_start;
@@ -4314,30 +4313,28 @@ fn scan_ntfs_compressed_blocks<R: Read + Seek>(
 
         let mut decompress = flate2::Decompress::new(true);
         let mut total_in = 0usize;
-        let mut total_out = 0usize;
         let mut ok = true;
 
         loop {
             let before_in = decompress.total_in() as usize;
-            let before_out = decompress.total_out() as usize;
+            // Always decompress into the start of discard so there's
+            // always room — we don't need the output, just the counts.
+            let out_before = decompress.total_out();
             match decompress.decompress(
                 &input[total_in..],
-                &mut decomp_buf[total_out..],
+                &mut discard[..],
                 flate2::FlushDecompress::None,
             ) {
                 Ok(flate2::Status::Ok) => {
                     total_in = decompress.total_in() as usize;
-                    total_out = decompress.total_out() as usize;
-                    if total_out >= decomp_buf.len()
-                        || (decompress.total_in() as usize == before_in
-                            && decompress.total_out() as usize == before_out)
+                    if decompress.total_in() as usize == before_in
+                        && decompress.total_out() == out_before
                     {
                         break;
                     }
                 }
                 Ok(flate2::Status::StreamEnd) => {
                     total_in = decompress.total_in() as usize;
-                    total_out = decompress.total_out() as usize;
                     break;
                 }
                 Ok(flate2::Status::BufError) | Err(_) => {
@@ -4346,6 +4343,7 @@ fn scan_ntfs_compressed_blocks<R: Read + Seek>(
                 }
             }
         }
+        let total_out = decompress.total_out() as usize;
 
         if ok && total_out > 0 {
             blocks.push(NtfsCompressedBlock {
@@ -4382,9 +4380,506 @@ fn scan_ntfs_compressed_blocks<R: Read + Seek>(
     })
 }
 
-/// A `Read + Seek` adapter over a compressed NTFS block stream. Used during
-/// indexing so that `index_ntfs_file_aware` can work on the decompressed
-/// view without materializing the whole stream to disk.
+/// Single-pass scan + index for compressed NTFS file-aware GHOs.
+///
+/// Decompresses every block, accumulates a rolling decompressed stream,
+/// and simultaneously:
+///   1. Builds the compressed block map (`NtfsCompressedState`)
+///   2. Detects run headers (NTFS_RUN_HEADER_ENTRY1 needle)
+///   3. Parses the MFT from run 0 to build the data-run queue
+///   4. Parses inline MFT records in gaps between runs
+///   5. Matches cluster runs to LCNs (same rposition logic as the
+///      uncompressed `index_ntfs_file_aware`)
+///
+/// Returns the block map (for on-demand reads) and the cluster run index.
+fn scan_and_index_ntfs_compressed<R: Read + Seek>(
+    reader: &mut R,
+    data_start: u64,
+    file_size: u64,
+    compression: GhoCompression,
+    vbr: &crate::fs::ntfs::NtfsVbr,
+    vbr_raw: &[u8; 512],
+) -> Result<(NtfsCompressedState, NtfsGhoIndex)> {
+    use crate::fs::ntfs::{apply_fixup, parse_mft_attributes};
+
+    let _ = compression;
+    let cluster_size = vbr.bytes_per_sector * vbr.sectors_per_cluster;
+    let volume_size = vbr.total_sectors * vbr.bytes_per_sector;
+    let mft_record_size = vbr.mft_record_size as usize;
+
+    // ---- Pass 1: decompress all blocks into a decompressed stream,
+    //      building the block map and accumulating the decompressed
+    //      bytes for analysis. We process the stream in stages:
+    //        (a) find first run header → extract MFT cluster count
+    //        (b) accumulate MFT data, parse all MFT records
+    //        (c) for every subsequent run header, match LCN
+    //      All inline MFT records in gaps are parsed as they appear. ----
+
+    let end = file_size;
+    let io_chunk: usize = 4 * 1024 * 1024;
+    let max_decomp_block: usize = FAST_LZ_BLOCK_SIZE + 1024;
+    let mut decomp_buf = vec![0u8; max_decomp_block];
+
+    // Block map
+    let mut blocks = Vec::with_capacity(100_000);
+    let mut decomp_offset: u64 = 0;
+
+    // Accumulated decompressed stream for analysis.
+    // `stream_base` tracks how many bytes have been drained from the
+    // front, so `stream_base + i` gives the absolute decompressed offset
+    // of `stream[i]`.
+    let mut stream = Vec::with_capacity(8 * 1024 * 1024);
+    let mut stream_base: u64 = 0;
+
+    // Index state
+    let mut runs: Vec<NtfsGhoClusterRun> = Vec::new();
+    let mut total_stored_clusters: u64 = 0;
+    let mut pending_lcns: Vec<(u64, u64)> = Vec::new();
+    let mut unmapped_runs: Vec<(u64, u64)> = Vec::new();
+    let mut data_run_queue: Vec<(u64, u64)> = Vec::new();
+
+    // State machine phases.
+    // All offsets stored here and in `prev_data_end` are ABSOLUTE
+    // decompressed-stream offsets (not indices into `stream`).
+    #[derive(PartialEq)]
+    enum Phase {
+        FindFirstRun,
+        ReadMft {
+            mft_clusters: u64,
+            mft_data_start: u64,
+        },
+        ScanRuns,
+    }
+    let mut phase = Phase::FindFirstRun;
+
+    // Absolute offset of where the last run's cluster data ends in the
+    // decompressed stream.
+    let mut prev_data_end: u64 = 0;
+
+    // Find first zlib header
+    let mut off = data_start;
+    {
+        let scan_len = ((end - off) as usize).min(8192);
+        let mut scan_buf = vec![0u8; scan_len];
+        reader.seek(SeekFrom::Start(off))?;
+        let n = read_fully_or_eof(reader, &mut scan_buf)?;
+        let mut found = false;
+        for i in 0..n.saturating_sub(1) {
+            if scan_buf[i] == 0x78 && scan_buf[i + 1] == 0x01 {
+                off += i as u64;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            bail!("no zlib header found in NTFS compressed data region");
+        }
+    }
+
+    // Read large I/O chunks to minimise syscalls.
+    let mut chunk_buf = vec![0u8; io_chunk + 64 * 1024];
+    let mut chunk_start = off;
+    reader.seek(SeekFrom::Start(chunk_start))?;
+    let mut chunk_len = read_fully_or_eof(reader, &mut chunk_buf)?;
+    let mut local = 0usize;
+
+    let mut consecutive_fails = 0u32;
+    while chunk_start + local as u64 + 4 < end {
+        // Refill
+        if local + 64 * 1024 > chunk_len && chunk_start + (chunk_len as u64) < end {
+            let remaining = chunk_len - local;
+            chunk_buf.copy_within(local..chunk_len, 0);
+            chunk_start += local as u64;
+            local = 0;
+            reader.seek(SeekFrom::Start(chunk_start + remaining as u64))?;
+            let extra = read_fully_or_eof(reader, &mut chunk_buf[remaining..])?;
+            chunk_len = remaining + extra;
+        }
+        if local + 4 > chunk_len {
+            break;
+        }
+        if chunk_buf[local] != 0x78 || chunk_buf[local + 1] != 0x01 {
+            local += 1;
+            consecutive_fails += 1;
+            if consecutive_fails > 256 {
+                break;
+            }
+            continue;
+        }
+
+        let avail = chunk_len - local;
+        let input = &chunk_buf[local..local + avail];
+
+        let mut decompress = flate2::Decompress::new(true);
+        let mut total_in = 0usize;
+        let mut ok = true;
+        loop {
+            let out_before = decompress.total_out() as usize;
+            let in_before = decompress.total_in() as usize;
+            let out_off = (decompress.total_out() as usize) % decomp_buf.len();
+            match decompress.decompress(
+                &input[total_in..],
+                &mut decomp_buf[out_off..],
+                flate2::FlushDecompress::None,
+            ) {
+                Ok(flate2::Status::Ok) => {
+                    total_in = decompress.total_in() as usize;
+                    if decompress.total_in() as usize == in_before
+                        && decompress.total_out() as usize == out_before
+                    {
+                        break;
+                    }
+                }
+                Ok(flate2::Status::StreamEnd) => {
+                    total_in = decompress.total_in() as usize;
+                    break;
+                }
+                Ok(flate2::Status::BufError) | Err(_) => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        let total_out = decompress.total_out() as usize;
+
+        if !ok || total_out == 0 {
+            local += 2;
+            consecutive_fails += 1;
+            if consecutive_fails > 256 {
+                break;
+            }
+            continue;
+        }
+
+        blocks.push(NtfsCompressedBlock {
+            file_offset: chunk_start + local as u64,
+            comp_size: total_in as u32,
+            decomp_offset,
+            decomp_size: total_out as u32,
+        });
+
+        // Re-decompress into a properly-sized buffer for the stream.
+        // (The loop above used a rotating offset which garbles multi-pass
+        // blocks. For blocks ≤ decomp_buf.len() the first pass wrote
+        // everything starting at 0, so it's fine. For larger blocks —
+        // which shouldn't exist — fall back to a fresh decompress.)
+        if total_out <= decomp_buf.len() {
+            stream.extend_from_slice(&decomp_buf[..total_out]);
+        } else {
+            let mut big = vec![0u8; total_out];
+            let mut d2 = flate2::Decompress::new(true);
+            let _ = d2.decompress(
+                &input[..total_in],
+                &mut big,
+                flate2::FlushDecompress::Finish,
+            );
+            stream.extend_from_slice(&big[..d2.total_out() as usize]);
+        }
+
+        decomp_offset += total_out as u64;
+        local += total_in + 2;
+        consecutive_fails = 0;
+
+        // ---- Process the accumulated decompressed stream ----
+        // `stream_abs_len` = total decompressed bytes seen so far.
+        let stream_abs_len = stream_base + stream.len() as u64;
+
+        // Helper: convert absolute offset → index into `stream`.
+        // Returns None if the offset is before stream_base (already drained).
+        let to_local = |abs: u64| -> Option<usize> {
+            if abs >= stream_base {
+                Some((abs - stream_base) as usize)
+            } else {
+                None
+            }
+        };
+
+        match phase {
+            Phase::FindFirstRun => {
+                let needle = &NTFS_RUN_HEADER_ENTRY1;
+                if let Some(pos) = stream
+                    .windows(NTFS_RUN_HEADER_SIZE)
+                    .position(|w| w[..16] == *needle)
+                {
+                    if let Some(cc) = parse_ntfs_run_header(&stream[pos..]) {
+                        let mds = stream_base + pos as u64 + NTFS_RUN_HEADER_SIZE as u64;
+                        let mft_size = cc * cluster_size;
+                        log::info!(
+                            "Reading MFT: {} clusters ({:.1} MB) from decompressed offset {:#x}",
+                            cc,
+                            mft_size as f64 / (1024.0 * 1024.0),
+                            mds
+                        );
+                        phase = Phase::ReadMft {
+                            mft_clusters: cc,
+                            mft_data_start: mds,
+                        };
+                        runs.push(NtfsGhoClusterRun {
+                            lcn_start: vbr.mft_cluster,
+                            cluster_count: cc,
+                            file_offset: mds,
+                        });
+                        total_stored_clusters += cc;
+                    }
+                }
+            }
+            Phase::ReadMft {
+                mft_clusters,
+                mft_data_start: mds,
+            } => {
+                let mft_size = mft_clusters * cluster_size;
+                let mft_end = mds + mft_size;
+                if stream_abs_len >= mft_end {
+                    let num_records = mft_size / mft_record_size as u64;
+                    let mds_local = to_local(mds).unwrap_or(0);
+                    for rec_idx in 0..num_records {
+                        let rec_off = mds_local + rec_idx as usize * mft_record_size;
+                        if rec_off + mft_record_size > stream.len() {
+                            break;
+                        }
+                        let rec = &stream[rec_off..rec_off + mft_record_size];
+                        if &rec[0..4] != b"FILE" {
+                            continue;
+                        }
+                        let rec_num = u32::from_le_bytes([rec[44], rec[45], rec[46], rec[47]]);
+                        if rec_num == 0 || rec_num == 8 {
+                            continue;
+                        }
+                        let mut rec_buf = rec.to_vec();
+                        let _ = apply_fixup(&mut rec_buf, vbr.bytes_per_sector);
+                        let attrs = parse_mft_attributes(&rec_buf, vbr.mft_record_size);
+                        for attr in &attrs {
+                            if !attr.resident && !attr.data_runs.is_empty() {
+                                for dr in &attr.data_runs {
+                                    if dr.cluster_offset >= 0 && dr.length > 0 {
+                                        data_run_queue.push((dr.cluster_offset as u64, dr.length));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    log::info!(
+                        "MFT parsed: {} data-run entries from {} MFT records",
+                        data_run_queue.len(),
+                        num_records
+                    );
+                    prev_data_end = mft_end;
+                    phase = Phase::ScanRuns;
+                }
+            }
+            Phase::ScanRuns => {
+                let needle = &NTFS_RUN_HEADER_ENTRY1;
+                loop {
+                    // prev_data_end may point past the stream buffer
+                    // (into cluster data we haven't accumulated yet).
+                    let search_local = match to_local(prev_data_end) {
+                        Some(l) if l <= stream.len() => l,
+                        _ => break,
+                    };
+                    if search_local + NTFS_RUN_HEADER_SIZE > stream.len() {
+                        break;
+                    }
+                    let haystack = &stream[search_local..];
+                    let Some(idx) = haystack.windows(16).position(|w| w == needle) else {
+                        break;
+                    };
+                    let hdr_local = search_local + idx;
+                    let hdr_abs = stream_base + hdr_local as u64;
+                    if hdr_local + NTFS_RUN_HEADER_SIZE > stream.len() {
+                        break;
+                    }
+                    let Some(cc) = parse_ntfs_run_header(&stream[hdr_local..]) else {
+                        prev_data_end = hdr_abs + 16;
+                        continue;
+                    };
+                    if cc == 0 {
+                        prev_data_end = hdr_abs + NTFS_RUN_HEADER_SIZE as u64;
+                        continue;
+                    }
+
+                    let run_data_start = hdr_abs + NTFS_RUN_HEADER_SIZE as u64;
+                    let run_data_end = run_data_start + cc * cluster_size;
+
+                    // Parse inline MFT records in the gap.
+                    if let Some(gap_local_start) = to_local(prev_data_end) {
+                        if hdr_local > gap_local_start {
+                            let gap = &stream[gap_local_start..hdr_local];
+                            parse_inline_mft_from_buf(gap, vbr, &mut pending_lcns);
+                        }
+                    }
+
+                    // Match LCN by cluster count (rposition).
+                    let lcn = pending_lcns
+                        .iter()
+                        .rposition(|&(_, len)| len == cc)
+                        .map(|i| {
+                            let (lcn, _) = pending_lcns.remove(i);
+                            lcn
+                        });
+
+                    if let Some(lcn) = lcn {
+                        runs.push(NtfsGhoClusterRun {
+                            lcn_start: lcn,
+                            cluster_count: cc,
+                            file_offset: run_data_start,
+                        });
+                    } else {
+                        let lcn2 =
+                            data_run_queue
+                                .iter()
+                                .rposition(|&(_, len)| len == cc)
+                                .map(|i| {
+                                    let (lcn, _) = data_run_queue.remove(i);
+                                    lcn
+                                });
+                        if let Some(lcn) = lcn2 {
+                            runs.push(NtfsGhoClusterRun {
+                                lcn_start: lcn,
+                                cluster_count: cc,
+                                file_offset: run_data_start,
+                            });
+                        } else {
+                            unmapped_runs.push((cc, run_data_start));
+                        }
+                    }
+                    total_stored_clusters += cc;
+                    prev_data_end = run_data_end;
+
+                    if run_data_end > stream_abs_len {
+                        break;
+                    }
+                }
+                // Drain processed data to keep memory bounded.
+                // prev_data_end may point past the stream (into future
+                // cluster data), so clamp to what we actually have.
+                if let Some(drain_local) = to_local(prev_data_end) {
+                    let drain_local = drain_local.min(stream.len());
+                    if drain_local > 4 * 1024 * 1024 {
+                        let keep = stream.len() - drain_local;
+                        stream.copy_within(drain_local.., 0);
+                        stream.truncate(keep);
+                        stream_base += drain_local as u64;
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Phase 3: resolve unmapped runs ---
+    if !unmapped_runs.is_empty() {
+        log::info!(
+            "{} unmapped runs ({} clusters), resolving via MFT data-run queue",
+            unmapped_runs.len(),
+            unmapped_runs.iter().map(|(cc, _)| cc).sum::<u64>()
+        );
+        let mut mapped_lcns: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for run in &runs {
+            for c in 0..run.cluster_count {
+                mapped_lcns.insert(run.lcn_start + c);
+            }
+        }
+        let mut remaining_queue: Vec<(u64, u64)> = data_run_queue
+            .iter()
+            .filter(|&&(lcn, len)| !(0..len).any(|c| mapped_lcns.contains(&(lcn + c))))
+            .copied()
+            .collect();
+        let mut resolved = 0u64;
+        for &(cc, file_offset) in &unmapped_runs {
+            if let Some(idx) = remaining_queue.iter().rposition(|&(_, len)| len == cc) {
+                let (lcn, _) = remaining_queue.remove(idx);
+                runs.push(NtfsGhoClusterRun {
+                    lcn_start: lcn,
+                    cluster_count: cc,
+                    file_offset,
+                });
+                resolved += 1;
+            }
+        }
+        log::info!(
+            "Resolved {} of {} unmapped runs via MFT queue fallback",
+            resolved,
+            unmapped_runs.len()
+        );
+    }
+
+    runs.sort_by_key(|r| r.lcn_start);
+
+    log::info!(
+        "NTFS compressed index: {} blocks, {} runs, {} stored clusters ({:.1} MB), volume {:.1} GB",
+        blocks.len(),
+        runs.len(),
+        total_stored_clusters,
+        total_stored_clusters as f64 * cluster_size as f64 / (1024.0 * 1024.0),
+        volume_size as f64 / (1024.0 * 1024.0 * 1024.0)
+    );
+
+    let comp_state = NtfsCompressedState {
+        blocks,
+        compression,
+        total_decompressed: decomp_offset,
+        cache_block: None,
+        cache_buf: Vec::new(),
+    };
+    let index = NtfsGhoIndex {
+        runs,
+        volume_size,
+        cluster_size,
+        vbr: *vbr_raw,
+    };
+    Ok((comp_state, index))
+}
+
+/// Parse inline MFT records from a buffer (gap between cluster runs).
+/// Same logic as `parse_inline_mft_records` but works on an in-memory
+/// slice instead of a reader.
+fn parse_inline_mft_from_buf(
+    buf: &[u8],
+    vbr: &crate::fs::ntfs::NtfsVbr,
+    out: &mut Vec<(u64, u64)>,
+) {
+    use crate::fs::ntfs::{apply_fixup, parse_mft_attributes};
+    let rec_size = vbr.mft_record_size as usize;
+    if buf.len() < rec_size + 4 {
+        return;
+    }
+    let mut pos = 0;
+    while pos + rec_size <= buf.len() {
+        if let Some(idx) = buf[pos..].windows(4).position(|w| w == b"FILE") {
+            let rec_off = pos + idx;
+            if rec_off + rec_size > buf.len() {
+                break;
+            }
+            let rec_num = u32::from_le_bytes([
+                buf[rec_off + 44],
+                buf[rec_off + 45],
+                buf[rec_off + 46],
+                buf[rec_off + 47],
+            ]);
+            if rec_num == 8 {
+                pos = rec_off + rec_size;
+                continue;
+            }
+            let mut rec = buf[rec_off..rec_off + rec_size].to_vec();
+            let _ = apply_fixup(&mut rec, vbr.bytes_per_sector);
+            let attrs = parse_mft_attributes(&rec, vbr.mft_record_size);
+            for attr in &attrs {
+                if !attr.resident && !attr.data_runs.is_empty() {
+                    for dr in &attr.data_runs {
+                        if dr.cluster_offset >= 0 && dr.length > 0 {
+                            out.push((dr.cluster_offset as u64, dr.length));
+                        }
+                    }
+                }
+            }
+            pos = rec_off + rec_size;
+        } else {
+            break;
+        }
+    }
+}
+
+/// A `Read + Seek` adapter over a compressed NTFS block stream. Used
+/// for on-demand reads after the index has been built.
 struct NtfsDecompressingReader<'a, R> {
     inner: &'a mut R,
     state: &'a mut NtfsCompressedState,
@@ -4924,33 +5419,24 @@ fn try_open_ntfs_file_aware(
         ));
     }
 
-    // Compressed NTFS file-aware: build a block map, then index through
-    // a decompressing reader so the existing algorithm sees the same
-    // decompressed stream layout as an uncompressed file.
-    log::info!("Scanning compressed NTFS file-aware block stream...");
+    // Compressed NTFS file-aware: single-pass scan that decompresses
+    // blocks, searches for run headers, and builds the cluster run index
+    // all at once — avoids a separate 11+ GB sequential read through
+    // the decompressing reader.
+    log::info!("Scanning + indexing compressed NTFS file-aware...");
     let data_start = vbr_off + 512;
-    let mut comp_state = scan_ntfs_compressed_blocks(inner, data_start, file_size, compression)
-        .context("scanning compressed NTFS blocks")?;
-
-    let decompressed_size = comp_state.total_decompressed;
-    {
-        let mut decomp_reader = NtfsDecompressingReader {
-            inner,
-            state: &mut comp_state,
-            position: 0,
-        };
-        let index = index_ntfs_file_aware(&mut decomp_reader, decompressed_size, &vbr, &vbr_raw)
-            .context("building NTFS cluster run index (compressed)")?;
-        let volume_size = index.volume_size;
-        Ok((
-            GhoReaderMode::NtfsFileAware {
-                index,
-                last_run_hint: 0,
-                compressed: Some(comp_state),
-            },
-            volume_size,
-        ))
-    }
+    let (comp_state, index) =
+        scan_and_index_ntfs_compressed(inner, data_start, file_size, compression, &vbr, &vbr_raw)
+            .context("scan + index compressed NTFS file-aware")?;
+    let volume_size = index.volume_size;
+    Ok((
+        GhoReaderMode::NtfsFileAware {
+            index,
+            last_run_hint: 0,
+            compressed: Some(comp_state),
+        },
+        volume_size,
+    ))
 }
 
 /// Read bytes from an NTFS file-aware GHO at `position` in the logical
