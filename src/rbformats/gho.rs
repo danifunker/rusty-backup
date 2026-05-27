@@ -1040,6 +1040,10 @@ enum GhoReaderMode {
         mbr: [u8; 512],
         ebrs: std::collections::HashMap<u64, [u8; 512]>,
     },
+    NtfsFileAware {
+        index: NtfsGhoIndex,
+        last_run_hint: usize,
+    },
 }
 
 impl GhoReader {
@@ -1096,6 +1100,40 @@ impl GhoReader {
 
         // ---- File-aware dispatch ----
         if matches!(header.image_type, GhoImageType::FileAware) {
+            // Try to find the FAT record stream. NTFS file-aware backups
+            // don't use it — they have GHPR metadata + packed cluster runs
+            // instead. We detect this by checking whether the record stream
+            // magic appears in the header region.
+            let header_end = if header.password_protected {
+                GHO_HEADER_PREFIX_LEN as u64 + GHO_PASSWORD_VERIFIER_LEN as u64
+            } else {
+                GHO_HEADER_PREFIX_LEN as u64
+            };
+            let has_record_stream = find_inner_stream_start(&mut inner, header_end).is_ok();
+
+            if !has_record_stream {
+                // No FAT record stream — try NTFS file-aware path.
+                log::info!("No FAT record stream found, trying NTFS file-aware path...");
+                match try_open_ntfs_file_aware(&mut inner, file_size) {
+                    Ok((mode, volume_size)) => {
+                        return Ok(Self {
+                            inner,
+                            logical_size: volume_size,
+                            position: 0,
+                            mode,
+                        });
+                    }
+                    Err(e) => {
+                        bail!(
+                            "GHO {} is file-aware but has no FAT record stream and \
+                             NTFS detection also failed: {:#}",
+                            path.display(),
+                            e
+                        );
+                    }
+                }
+            }
+
             log::info!("Scanning Ghost record stream...");
             let image = parse_gho_image(&mut inner, file_size, &header)
                 .with_context(|| format!("parsing inner record stream for {}", path.display()))?;
@@ -1471,6 +1509,7 @@ impl GhoReader {
                 .iter()
                 .map(|p| p.image.cluster_to_file.len())
                 .sum(),
+            GhoReaderMode::NtfsFileAware { index, .. } => index.runs.len(),
         }
     }
 
@@ -1599,6 +1638,27 @@ impl Read for GhoReader {
                 let want = (buf.len() as u64).min(remaining) as usize;
                 let position = self.position;
                 let n = self.read_file_aware_into(position, &mut buf[..want])?;
+                self.position += n as u64;
+                Ok(n)
+            }
+            GhoReaderMode::NtfsFileAware { .. } => {
+                let remaining = self.logical_size - self.position;
+                let want = (buf.len() as u64).min(remaining) as usize;
+                let position = self.position;
+                let GhoReaderMode::NtfsFileAware {
+                    index,
+                    last_run_hint,
+                } = &mut self.mode
+                else {
+                    unreachable!()
+                };
+                let n = read_ntfs_file_aware_into(
+                    &mut self.inner,
+                    index,
+                    last_run_hint,
+                    position,
+                    &mut buf[..want],
+                )?;
                 self.position += n as u64;
                 Ok(n)
             }
@@ -4102,6 +4162,487 @@ fn zlib_decode_block(block: &[u8], dst: &mut [u8]) -> Result<usize> {
             Err(e) => return Err(anyhow::Error::from(e)),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// NTFS file-aware GHO support
+// ---------------------------------------------------------------------------
+//
+// NTFS file-aware Ghost backups use a completely different internal format
+// from FAT file-aware ones. Instead of the 0x012F18D8 record stream, they
+// store:
+//   1. GHPR metadata blocks containing the NTFS VBR
+//   2. Packed cluster runs — each preceded by a 42-byte header containing
+//      the cluster count, with MFT FILE records inline between runs
+//      providing the LCN mapping
+//   3. A single 0x0023 End record at the very end
+//
+// Detection: if `find_inner_stream_start` fails for a FileAware GHO, we
+// scan for the NTFS VBR signature in the header region. If found, we take
+// the NTFS path.
+
+/// 16-byte constant prefix appearing at the start of every NTFS file-aware
+/// cluster run header. Observed across all 5777 runs in the corpus fixture.
+const NTFS_RUN_HEADER_ENTRY1: [u8; 16] = [
+    0x0E, 0x20, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0F,
+];
+
+/// Total size of the 3-entry cluster run header before raw cluster data.
+const NTFS_RUN_HEADER_SIZE: usize = 42;
+
+/// One cluster run in the NTFS file-aware index: maps a contiguous range
+/// of LCNs to a file offset in the GHO.
+#[derive(Debug, Clone)]
+struct NtfsGhoClusterRun {
+    lcn_start: u64,
+    cluster_count: u64,
+    file_offset: u64,
+}
+
+/// Index built during the open scan. Sorted by `lcn_start` for binary
+/// search during reads.
+struct NtfsGhoIndex {
+    runs: Vec<NtfsGhoClusterRun>,
+    volume_size: u64,
+    cluster_size: u64,
+    #[allow(dead_code)]
+    vbr: [u8; 512],
+}
+
+/// Locate the NTFS VBR embedded in the GHPR metadata region. Scans from
+/// `start` to `end` for the 3-byte jump + `NTFS    ` OEM ID + valid
+/// `0x55 0xAA` boot signature.
+fn find_ntfs_vbr_in_header<R: Read + Seek>(
+    reader: &mut R,
+    start: u64,
+    end: u64,
+) -> Result<(u64, [u8; 512])> {
+    let mut buf = [0u8; 512];
+    let mut off = start;
+    while off + 512 <= end {
+        reader.seek(SeekFrom::Start(off))?;
+        if reader.read_exact(&mut buf).is_err() {
+            break;
+        }
+        if &buf[3..11] == b"NTFS    " && buf[510] == 0x55 && buf[511] == 0xAA {
+            return Ok((off, buf));
+        }
+        off += 1;
+    }
+    bail!("NTFS VBR not found in GHPR metadata region");
+}
+
+/// Parse the 42-byte run header at the current reader position. Returns
+/// the cluster count, or `None` if the header doesn't match the expected
+/// pattern.
+fn parse_ntfs_run_header(data: &[u8]) -> Option<u64> {
+    if data.len() < NTFS_RUN_HEADER_SIZE {
+        return None;
+    }
+    if data[0..16] != NTFS_RUN_HEADER_ENTRY1 {
+        return None;
+    }
+    if data[32] != 0x0F || data[41] != 0x0E {
+        return None;
+    }
+    let cluster_count = u64::from_le_bytes([
+        data[33], data[34], data[35], data[36], data[37], data[38], data[39], data[40],
+    ]);
+    Some(cluster_count)
+}
+
+/// Parse inline MFT FILE records in the gap between cluster runs.
+/// Appends `(lcn, cluster_count)` entries to `out` for each non-resident
+/// `$DATA` attribute found.
+fn parse_inline_mft_records<R: Read + Seek>(
+    reader: &mut R,
+    start: u64,
+    end: u64,
+    vbr: &crate::fs::ntfs::NtfsVbr,
+    out: &mut Vec<(u64, u64)>,
+) {
+    use crate::fs::ntfs::{apply_fixup, parse_mft_attributes, ATTR_DATA};
+    let rec_size = vbr.mft_record_size as usize;
+    let gap_size = (end - start) as usize;
+    if gap_size < rec_size + 4 {
+        return;
+    }
+    let mut buf = vec![0u8; gap_size];
+    if reader.seek(SeekFrom::Start(start)).is_err() {
+        return;
+    }
+    let n = match read_fully_or_eof(reader, &mut buf) {
+        Ok(n) => n,
+        Err(_) => return,
+    };
+    buf.truncate(n);
+
+    let mut pos = 0;
+    while pos + rec_size <= buf.len() {
+        if let Some(idx) = buf[pos..].windows(4).position(|w| w == b"FILE") {
+            let rec_off = pos + idx;
+            if rec_off + rec_size > buf.len() {
+                break;
+            }
+            let mut rec = buf[rec_off..rec_off + rec_size].to_vec();
+            let _ = apply_fixup(&mut rec, vbr.bytes_per_sector);
+            let attrs = parse_mft_attributes(&rec, vbr.mft_record_size);
+            for attr in &attrs {
+                if attr.attr_type == ATTR_DATA && !attr.data_runs.is_empty() {
+                    for dr in &attr.data_runs {
+                        if dr.cluster_offset >= 0 && dr.length > 0 {
+                            out.push((dr.cluster_offset as u64, dr.length));
+                        }
+                    }
+                }
+            }
+            pos = rec_off + rec_size;
+        } else {
+            break;
+        }
+    }
+}
+
+/// Build the NTFS cluster run index by walking the packed data stream.
+///
+/// Strategy: the first run is always the MFT. We read it, parse every
+/// MFT record to collect all non-resident `$DATA` attribute data runs,
+/// and build a queue of `(LCN, cluster_count)` entries sorted by MFT
+/// record number. Each subsequent cluster run in the file consumes the
+/// next entry from this queue (matched by cluster count).
+fn index_ntfs_file_aware<R: Read + Seek>(
+    reader: &mut R,
+    file_size: u64,
+    vbr: &crate::fs::ntfs::NtfsVbr,
+    vbr_raw: &[u8; 512],
+) -> Result<NtfsGhoIndex> {
+    use crate::fs::ntfs::{apply_fixup, parse_mft_attributes, ATTR_DATA};
+
+    let cluster_size = vbr.bytes_per_sector * vbr.sectors_per_cluster;
+    let volume_size = vbr.total_sectors * vbr.bytes_per_sector;
+    let mft_record_size = vbr.mft_record_size as usize;
+
+    // Scan for the first run header.
+    let scan_start = 0x1000u64;
+    let scan_end = file_size.min(scan_start + 256 * 1024);
+    let mut header_buf = [0u8; NTFS_RUN_HEADER_SIZE];
+    let mut first_run_offset: Option<u64> = None;
+
+    let mut off = scan_start;
+    while off + NTFS_RUN_HEADER_SIZE as u64 <= scan_end {
+        reader.seek(SeekFrom::Start(off))?;
+        if reader.read_exact(&mut header_buf).is_err() {
+            break;
+        }
+        if parse_ntfs_run_header(&header_buf).is_some() {
+            first_run_offset = Some(off);
+            break;
+        }
+        off += 1;
+    }
+    let first_run = first_run_offset
+        .ok_or_else(|| anyhow!("NTFS file-aware: no cluster run header found in scan region"))?;
+
+    // --- Phase 1: read the MFT (run 0) ---
+    reader.seek(SeekFrom::Start(first_run))?;
+    reader.read_exact(&mut header_buf)?;
+    let mft_clusters = parse_ntfs_run_header(&header_buf)
+        .ok_or_else(|| anyhow!("first run header is not valid"))?;
+    let mft_data_start = first_run + NTFS_RUN_HEADER_SIZE as u64;
+    let mft_size = mft_clusters * cluster_size;
+
+    log::info!(
+        "Reading MFT: {} clusters ({:.1} MB) from offset {:#x}",
+        mft_clusters,
+        mft_size as f64 / (1024.0 * 1024.0),
+        mft_data_start
+    );
+
+    // Parse all MFT records to build the data-run queue.
+    // Each entry: (mft_record_number, lcn, cluster_count)
+    let mut data_run_queue: Vec<(u64, u64)> = Vec::new();
+    let num_records = mft_size / mft_record_size as u64;
+    let mut rec_buf = vec![0u8; mft_record_size];
+
+    for rec_idx in 0..num_records {
+        let rec_off = mft_data_start + rec_idx * mft_record_size as u64;
+        reader.seek(SeekFrom::Start(rec_off))?;
+        if reader.read_exact(&mut rec_buf).is_err() {
+            break;
+        }
+        if &rec_buf[0..4] != b"FILE" {
+            continue;
+        }
+        // Skip $MFT itself (record 0) — it's already run 0.
+        let rec_num = u32::from_le_bytes([rec_buf[44], rec_buf[45], rec_buf[46], rec_buf[47]]);
+        if rec_num == 0 {
+            continue;
+        }
+        // Skip $BadClus (record 8) — it has a sparse data run covering
+        // the entire volume but no actual data is stored.
+        if rec_num == 8 {
+            continue;
+        }
+        let _ = apply_fixup(&mut rec_buf, vbr.bytes_per_sector);
+        let attrs = parse_mft_attributes(&rec_buf, vbr.mft_record_size);
+        for attr in &attrs {
+            if attr.attr_type == ATTR_DATA && !attr.data_runs.is_empty() {
+                for dr in &attr.data_runs {
+                    if dr.cluster_offset > 0 && dr.length > 0 {
+                        data_run_queue.push((dr.cluster_offset as u64, dr.length));
+                    }
+                }
+            }
+        }
+    }
+
+    log::info!(
+        "MFT parsed: {} data-run entries from {} MFT records",
+        data_run_queue.len(),
+        num_records
+    );
+
+    // --- Phase 2: walk all cluster runs using the run-header needle ---
+    let mut runs: Vec<NtfsGhoClusterRun> = Vec::new();
+    let mut total_stored_clusters: u64 = 0;
+
+    // Add the MFT as run 0.
+    runs.push(NtfsGhoClusterRun {
+        lcn_start: vbr.mft_cluster,
+        cluster_count: mft_clusters,
+        file_offset: mft_data_start,
+    });
+    total_stored_clusters += mft_clusters;
+
+    // Pending data runs from the most recently parsed inline MFT records.
+    // These map 1:1 to the following cluster runs.
+    let mut pending_lcns: Vec<(u64, u64)> = Vec::new();
+    let mut pending_idx: usize = 0;
+
+    // Fallback: data runs from the MFT itself, consumed in order when no
+    // inline MFT record provides the LCN.
+    let mut mft_queue: std::collections::VecDeque<(u64, u64)> =
+        data_run_queue.into_iter().collect();
+
+    // Scan the entire file for run headers using the 16-byte needle.
+    let needle = &NTFS_RUN_HEADER_ENTRY1;
+    let chunk_size: usize = 4 * 1024 * 1024;
+    let mut search_pos = mft_data_start + mft_size;
+    let mut prev_data_end = search_pos;
+
+    while search_pos < file_size {
+        let read_len = ((file_size - search_pos) as usize).min(chunk_size + 64);
+        let mut chunk = vec![0u8; read_len];
+        reader.seek(SeekFrom::Start(search_pos))?;
+        let n = read_fully_or_eof(reader, &mut chunk)?;
+        chunk.truncate(n);
+
+        let mut scan_pos = 0;
+        while scan_pos + NTFS_RUN_HEADER_SIZE <= chunk.len() {
+            if let Some(idx) = chunk[scan_pos..].windows(16).position(|w| w == needle) {
+                let abs_off = search_pos + (scan_pos + idx) as u64;
+                let local_off = scan_pos + idx;
+                if local_off + NTFS_RUN_HEADER_SIZE <= chunk.len() {
+                    if let Some(cc) = parse_ntfs_run_header(&chunk[local_off..]) {
+                        if cc > 0 {
+                            let data_start = abs_off + NTFS_RUN_HEADER_SIZE as u64;
+                            let data_end = data_start + cc * cluster_size;
+                            if data_end > file_size + cluster_size {
+                                scan_pos = chunk.len();
+                                break;
+                            }
+
+                            // Parse inline MFT records in the gap since the
+                            // last run. Each gap may contain multiple FILE
+                            // records whose data runs describe subsequent runs.
+                            let gap_start = prev_data_end;
+                            let gap_end = abs_off;
+                            if gap_end > gap_start && (gap_end - gap_start) < 1024 * 1024 {
+                                // New gap = new inline records. Reset pending.
+                                pending_lcns.clear();
+                                pending_idx = 0;
+                                parse_inline_mft_records(
+                                    reader,
+                                    gap_start,
+                                    gap_end,
+                                    vbr,
+                                    &mut pending_lcns,
+                                );
+                            }
+
+                            // Determine LCN from inline MFT records.
+                            let lcn = if pending_idx < pending_lcns.len() {
+                                let (lcn, _) = pending_lcns[pending_idx];
+                                pending_idx += 1;
+                                Some(lcn)
+                            } else {
+                                None
+                            };
+
+                            // Skip runs we can't map. These are typically
+                            // system metadata clusters between the MFT and
+                            // the first inline MFT record.
+                            let Some(lcn) = lcn else {
+                                prev_data_end = data_end;
+                                if data_end > search_pos + chunk.len() as u64 {
+                                    search_pos = data_end;
+                                    scan_pos = chunk.len();
+                                    break;
+                                } else {
+                                    scan_pos = (data_end - search_pos) as usize;
+                                    continue;
+                                }
+                            };
+
+                            runs.push(NtfsGhoClusterRun {
+                                lcn_start: lcn,
+                                cluster_count: cc,
+                                file_offset: data_start,
+                            });
+                            total_stored_clusters += cc;
+                            prev_data_end = data_end;
+
+                            if data_end > search_pos + chunk.len() as u64 {
+                                search_pos = data_end;
+                                scan_pos = chunk.len();
+                                break;
+                            } else {
+                                scan_pos = (data_end - search_pos) as usize;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                scan_pos += idx + 16;
+            } else {
+                break;
+            }
+        }
+
+        if scan_pos < chunk.len() {
+            search_pos += chunk.len().saturating_sub(15) as u64;
+        } else if search_pos + chunk.len() as u64 >= file_size {
+            break;
+        }
+    }
+
+    // Sort by LCN for binary search during reads.
+    runs.sort_by_key(|r| r.lcn_start);
+
+    log::info!(
+        "NTFS file-aware index: {} runs, {} stored clusters ({:.1} MB), volume {:.1} GB",
+        runs.len(),
+        total_stored_clusters,
+        total_stored_clusters as f64 * cluster_size as f64 / (1024.0 * 1024.0),
+        volume_size as f64 / (1024.0 * 1024.0 * 1024.0)
+    );
+
+    Ok(NtfsGhoIndex {
+        runs,
+        volume_size,
+        cluster_size,
+        vbr: *vbr_raw,
+    })
+}
+
+/// Try to open an NTFS file-aware GHO. Returns the reader mode and
+/// volume size on success.
+fn try_open_ntfs_file_aware(
+    inner: &mut SpanReader,
+    file_size: u64,
+) -> Result<(GhoReaderMode, u64)> {
+    use crate::fs::ntfs::parse_vbr;
+
+    // Find the NTFS VBR in the GHPR metadata region.
+    let (vbr_off, vbr_raw) = find_ntfs_vbr_in_header(inner, 0x200, file_size.min(0x4000))
+        .context("locating NTFS VBR in GHPR metadata")?;
+    log::info!("NTFS VBR found at file offset {:#x}", vbr_off);
+
+    let vbr = parse_vbr(&vbr_raw).map_err(|e| anyhow!("parsing NTFS VBR: {e}"))?;
+    log::info!(
+        "NTFS volume: {} bytes/sector, {} sectors/cluster, {} total sectors, MFT at LCN {}",
+        vbr.bytes_per_sector,
+        vbr.sectors_per_cluster,
+        vbr.total_sectors,
+        vbr.mft_cluster
+    );
+
+    let index = index_ntfs_file_aware(inner, file_size, &vbr, &vbr_raw)
+        .context("building NTFS cluster run index")?;
+    let volume_size = index.volume_size;
+
+    Ok((
+        GhoReaderMode::NtfsFileAware {
+            index,
+            last_run_hint: 0,
+        },
+        volume_size,
+    ))
+}
+
+/// Read bytes from an NTFS file-aware GHO at `position` in the logical
+/// volume. Uses binary search over the sorted cluster run index.
+fn read_ntfs_file_aware_into(
+    inner: &mut SpanReader,
+    index: &NtfsGhoIndex,
+    last_run_hint: &mut usize,
+    position: u64,
+    out: &mut [u8],
+) -> std::io::Result<usize> {
+    if out.is_empty() {
+        return Ok(0);
+    }
+
+    let cluster_size = index.cluster_size;
+    let lcn = position / cluster_size;
+    let offset_in_cluster = (position % cluster_size) as usize;
+    let avail_in_cluster = cluster_size as usize - offset_in_cluster;
+    let to_read = out.len().min(avail_in_cluster);
+
+    // Check hint first (fast path for sequential reads).
+    let runs = &index.runs;
+    let found_idx = if *last_run_hint < runs.len() {
+        let hint = &runs[*last_run_hint];
+        if lcn >= hint.lcn_start && lcn < hint.lcn_start + hint.cluster_count {
+            Some(*last_run_hint)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let found_idx = found_idx.or_else(|| {
+        runs.binary_search_by(|r| {
+            if lcn < r.lcn_start {
+                std::cmp::Ordering::Greater
+            } else if lcn >= r.lcn_start + r.cluster_count {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .ok()
+    });
+
+    let Some(idx) = found_idx else {
+        // Unallocated cluster — return zeros.
+        for b in &mut out[..to_read] {
+            *b = 0;
+        }
+        return Ok(to_read);
+    };
+
+    *last_run_hint = idx;
+    let run = &runs[idx];
+    let cluster_in_run = lcn - run.lcn_start;
+    let file_offset = run.file_offset + cluster_in_run * cluster_size + offset_in_cluster as u64;
+
+    inner
+        .seek(SeekFrom::Start(file_offset))
+        .map_err(std::io::Error::other)?;
+    let n = inner.read(&mut out[..to_read])?;
+    Ok(n)
 }
 
 #[cfg(test)]

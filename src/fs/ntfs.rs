@@ -16,7 +16,7 @@ const MFT_RECORD_BITMAP: u64 = 6;
 // Attribute type codes
 const ATTR_VOLUME_NAME: u32 = 0x60;
 const ATTR_VOLUME_INFORMATION: u32 = 0x70;
-const ATTR_DATA: u32 = 0x80;
+pub(crate) const ATTR_DATA: u32 = 0x80;
 const ATTR_INDEX_ROOT: u32 = 0x90;
 const ATTR_INDEX_ALLOCATION: u32 = 0xA0;
 const ATTR_BITMAP: u32 = 0xB0;
@@ -38,16 +38,16 @@ const INDEX_ENTRY_END: u32 = 0x02;
 const FILE_ATTR_DIRECTORY: u32 = 0x1000_0000;
 
 /// NTFS Volume Boot Record fields.
-struct NtfsVbr {
-    bytes_per_sector: u64,
-    sectors_per_cluster: u64,
-    total_sectors: u64,
-    mft_cluster: u64,
-    mft_mirror_cluster: u64,
-    mft_record_size: u32,
+pub(crate) struct NtfsVbr {
+    pub(crate) bytes_per_sector: u64,
+    pub(crate) sectors_per_cluster: u64,
+    pub(crate) total_sectors: u64,
+    pub(crate) mft_cluster: u64,
+    pub(crate) mft_mirror_cluster: u64,
+    pub(crate) mft_record_size: u32,
 }
 
-fn parse_vbr(vbr: &[u8; 512]) -> Result<NtfsVbr, FilesystemError> {
+pub(crate) fn parse_vbr(vbr: &[u8; 512]) -> Result<NtfsVbr, FilesystemError> {
     // Check OEM ID: "NTFS    " at offset 3
     if &vbr[3..11] != b"NTFS    " {
         return Err(FilesystemError::Parse(
@@ -101,34 +101,34 @@ fn parse_vbr(vbr: &[u8; 512]) -> Result<NtfsVbr, FilesystemError> {
 
 /// A parsed attribute from an MFT record.
 #[derive(Debug, Clone)]
-struct MftAttribute {
-    attr_type: u32,
-    resident: bool,
+pub(crate) struct MftAttribute {
+    pub(crate) attr_type: u32,
+    pub(crate) resident: bool,
     /// For resident attributes, the raw value data.
-    value: Vec<u8>,
+    pub(crate) value: Vec<u8>,
     /// For non-resident attributes, the data runs.
-    data_runs: Vec<DataRun>,
+    pub(crate) data_runs: Vec<DataRun>,
     /// For non-resident: real size of attribute data.
-    real_size: u64,
+    pub(crate) real_size: u64,
     /// For non-resident: allocated size.
     #[allow(dead_code)]
-    allocated_size: u64,
+    pub(crate) allocated_size: u64,
     /// For non-resident: starting VCN.
     #[allow(dead_code)]
-    starting_vcn: u64,
+    pub(crate) starting_vcn: u64,
 }
 
 /// A single data run (cluster offset, length in clusters).
 #[derive(Debug, Clone)]
-struct DataRun {
+pub(crate) struct DataRun {
     /// Absolute cluster offset (cumulative from previous runs).
-    cluster_offset: i64,
+    pub(crate) cluster_offset: i64,
     /// Number of clusters in this run.
-    length: u64,
+    pub(crate) length: u64,
 }
 
 /// Decode data runs from an MFT attribute's non-resident data.
-fn decode_data_runs(data: &[u8]) -> Vec<DataRun> {
+pub(crate) fn decode_data_runs(data: &[u8]) -> Vec<DataRun> {
     let mut runs = Vec::new();
     let mut pos = 0;
     let mut prev_offset: i64 = 0;
@@ -188,7 +188,7 @@ fn decode_data_runs(data: &[u8]) -> Vec<DataRun> {
 }
 
 /// Parse attributes from an MFT record (already fixup-applied).
-fn parse_mft_attributes(record: &[u8], record_size: u32) -> Vec<MftAttribute> {
+pub(crate) fn parse_mft_attributes(record: &[u8], record_size: u32) -> Vec<MftAttribute> {
     let mut attrs = Vec::new();
 
     if record.len() < 24 {
@@ -331,7 +331,7 @@ fn parse_mft_attributes(record: &[u8], record_size: u32) -> Vec<MftAttribute> {
 }
 
 /// Apply fixup array to an MFT record buffer.
-fn apply_fixup(record: &mut [u8], bytes_per_sector: u64) -> Result<(), FilesystemError> {
+pub(crate) fn apply_fixup(record: &mut [u8], bytes_per_sector: u64) -> Result<(), FilesystemError> {
     if record.len() < 48 {
         return Err(FilesystemError::Parse(
             "MFT record too small for fixup".into(),
