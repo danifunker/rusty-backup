@@ -157,10 +157,38 @@ different Ghost versions/modes. Scan via `gho_scan_partitions`:
 `*` Win7_86xAMB.GHO uses `.GHO.NNN` numeric spans not discovered by
 the single-file scan; may need the full span set to parse.
 
+## NTFS file-aware (new, 2026-05-27)
+
+NTFS file-aware backups use a completely different internal format:
+no `0x012F18D8` record stream; instead GHPR metadata blocks containing
+the VBR, then packed cluster runs with 42-byte headers and inline MFT
+FILE records between runs.
+
+**42-byte run header** (constant across all runs):
+```
+Entry 1 (16 bytes): 0E 20 80 00 ... 0F  (constant)
+Entry 2 (16 bytes): 0E 02 00 00 ... 0F  (constant)
+Entry 3 (10 bytes): 0F <u64_le cluster_count> 0E
+```
+
+**LCN mapping strategy** (3 phases):
+1. Run 0 = $MFT, LCN from VBR
+2. Parse MFT to get all non-resident data runs; parse inline FILE
+   records between runs and match to following cluster runs by
+   cluster count (rposition / last-match for ambiguous sizes)
+3. Unmapped runs resolved via MFT queue fallback (filter already-mapped)
+
+Result: 100% coverage on the corpus fixture (5613 runs, 443K clusters,
+10 GiB NTFS volume in 1.7 GiB backup). Directory browsing works.
+
+**Limitations:**
+- Uncompressed only (compressed NTFS file-aware bails with clear error)
+- Only one fixture tested (dirty-journal Windows XP partition)
+
 ## What's NOT in scope
 
-- **NTFS file-aware**: no fixtures exist. Would need a separate
-  reconstructor if one turns up.
+- **Compressed NTFS file-aware**: no fixtures exist; likely uses the
+  same `[u16 stored_len][block]` framing but needs verification.
 - **Password-protected GHOs**: blocked on cipher RE
   (`docs/gho_password.md`).
 - **Multi-partition full-disk**: no fixture with >1 partition exists
