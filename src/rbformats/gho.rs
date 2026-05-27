@@ -1043,6 +1043,7 @@ enum GhoReaderMode {
     NtfsFileAware {
         index: NtfsGhoIndex,
         last_run_hint: usize,
+        compressed: Option<NtfsCompressedState>,
     },
 }
 
@@ -1113,16 +1114,8 @@ impl GhoReader {
 
             if !has_record_stream {
                 // No FAT record stream — try NTFS file-aware path.
-                if !matches!(header.compression, GhoCompression::None) {
-                    bail!(
-                        "GHO {} appears to be an NTFS file-aware backup with {:?} compression; \
-                         compressed NTFS file-aware GHOs are not yet supported",
-                        path.display(),
-                        header.compression
-                    );
-                }
                 log::info!("No FAT record stream found, trying NTFS file-aware path...");
-                match try_open_ntfs_file_aware(&mut inner, file_size) {
+                match try_open_ntfs_file_aware(&mut inner, file_size, header.compression) {
                     Ok((mode, volume_size)) => {
                         return Ok(Self {
                             inner,
@@ -1656,6 +1649,7 @@ impl Read for GhoReader {
                 let GhoReaderMode::NtfsFileAware {
                     index,
                     last_run_hint,
+                    compressed,
                 } = &mut self.mode
                 else {
                     unreachable!()
@@ -1664,6 +1658,7 @@ impl Read for GhoReader {
                     &mut self.inner,
                     index,
                     last_run_hint,
+                    compressed,
                     position,
                     &mut buf[..want],
                 )?;
@@ -4189,6 +4184,27 @@ fn zlib_decode_block(block: &[u8], dst: &mut [u8]) -> Result<usize> {
 // scan for the NTFS VBR signature in the header region. If found, we take
 // the NTFS path.
 
+/// One compressed zlib block in the NTFS file-aware compressed stream.
+#[derive(Debug, Clone)]
+struct NtfsCompressedBlock {
+    file_offset: u64,
+    comp_size: u32,
+    decomp_offset: u64,
+    decomp_size: u32,
+}
+
+/// State for on-demand decompression of compressed NTFS file-aware GHOs.
+/// The decompressed stream is structurally identical to the uncompressed
+/// format (same run headers, MFT records, cluster data) — each zlib block
+/// decompresses to 10–32768 bytes. Blocks are separated by 2-byte gaps.
+struct NtfsCompressedState {
+    blocks: Vec<NtfsCompressedBlock>,
+    compression: GhoCompression,
+    total_decompressed: u64,
+    cache_block: Option<usize>,
+    cache_buf: Vec<u8>,
+}
+
 /// 16-byte constant prefix appearing at the start of every NTFS file-aware
 /// cluster run header. Observed across all 5777 runs in the corpus fixture.
 const NTFS_RUN_HEADER_ENTRY1: [u8; 16] = [
@@ -4215,6 +4231,271 @@ struct NtfsGhoIndex {
     cluster_size: u64,
     #[allow(dead_code)]
     vbr: [u8; 512],
+}
+
+/// Scan a compressed NTFS file-aware GHO to build the block map.
+///
+/// Compressed NTFS file-aware GHOs use zlib (High) compression. The data
+/// region is a sequence of zlib blocks (CMF=`0x78`, FLG=`0x01`) separated
+/// by 2-byte gaps. Each block decompresses to 10–32768 bytes. The gap
+/// bytes can be any value — including `78 01` — so when a candidate zlib
+/// header fails to decompress we skip 2 more bytes and retry.
+fn scan_ntfs_compressed_blocks<R: Read + Seek>(
+    reader: &mut R,
+    data_start: u64,
+    file_size: u64,
+    compression: GhoCompression,
+) -> Result<NtfsCompressedState> {
+    let _ = compression; // currently only zlib is wired up
+
+    let mut blocks = Vec::with_capacity(100_000);
+    let mut decomp_offset: u64 = 0;
+    let end = file_size;
+    let mut decomp_buf = vec![0u8; FAST_LZ_BLOCK_SIZE + 1024];
+
+    // Find the first `78 01` (zlib header) after the VBR region.
+    let mut off = data_start;
+    {
+        let scan_len = ((end - off) as usize).min(8192);
+        let mut scan_buf = vec![0u8; scan_len];
+        reader.seek(SeekFrom::Start(off))?;
+        let n = read_fully_or_eof(reader, &mut scan_buf)?;
+        let mut found = false;
+        for i in 0..n.saturating_sub(1) {
+            if scan_buf[i] == 0x78 && scan_buf[i + 1] == 0x01 {
+                off += i as u64;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            bail!("no zlib header found in NTFS compressed data region");
+        }
+    }
+
+    // Read in large chunks to minimise seeks. Each chunk may contain many
+    // small zlib blocks (10–32 KiB decompressed). We process blocks
+    // in-place within the chunk, only seeking when the chunk is exhausted.
+    let io_chunk: usize = 4 * 1024 * 1024;
+    let mut chunk_buf = vec![0u8; io_chunk + 64 * 1024];
+    let mut chunk_start = off;
+    reader.seek(SeekFrom::Start(chunk_start))?;
+    let mut chunk_len = read_fully_or_eof(reader, &mut chunk_buf)?;
+    let mut local = 0usize; // position within chunk_buf
+
+    let mut consecutive_fails = 0u32;
+    while chunk_start + local as u64 + 4 < end {
+        // Refill the chunk when we're near the end.
+        if local + 64 * 1024 > chunk_len && chunk_start + (chunk_len as u64) < end {
+            let remaining = chunk_len - local;
+            chunk_buf.copy_within(local..chunk_len, 0);
+            chunk_start += local as u64;
+            local = 0;
+            reader.seek(SeekFrom::Start(chunk_start + remaining as u64))?;
+            let extra = read_fully_or_eof(reader, &mut chunk_buf[remaining..])?;
+            chunk_len = remaining + extra;
+        }
+
+        if local + 4 > chunk_len {
+            break;
+        }
+
+        if chunk_buf[local] != 0x78 || chunk_buf[local + 1] != 0x01 {
+            local += 1;
+            consecutive_fails += 1;
+            if consecutive_fails > 256 {
+                break;
+            }
+            continue;
+        }
+
+        let avail = chunk_len - local;
+        let input = &chunk_buf[local..local + avail];
+
+        let mut decompress = flate2::Decompress::new(true);
+        let mut total_in = 0usize;
+        let mut total_out = 0usize;
+        let mut ok = true;
+
+        loop {
+            let before_in = decompress.total_in() as usize;
+            let before_out = decompress.total_out() as usize;
+            match decompress.decompress(
+                &input[total_in..],
+                &mut decomp_buf[total_out..],
+                flate2::FlushDecompress::None,
+            ) {
+                Ok(flate2::Status::Ok) => {
+                    total_in = decompress.total_in() as usize;
+                    total_out = decompress.total_out() as usize;
+                    if total_out >= decomp_buf.len()
+                        || (decompress.total_in() as usize == before_in
+                            && decompress.total_out() as usize == before_out)
+                    {
+                        break;
+                    }
+                }
+                Ok(flate2::Status::StreamEnd) => {
+                    total_in = decompress.total_in() as usize;
+                    total_out = decompress.total_out() as usize;
+                    break;
+                }
+                Ok(flate2::Status::BufError) | Err(_) => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+
+        if ok && total_out > 0 {
+            blocks.push(NtfsCompressedBlock {
+                file_offset: chunk_start + local as u64,
+                comp_size: total_in as u32,
+                decomp_offset,
+                decomp_size: total_out as u32,
+            });
+            decomp_offset += total_out as u64;
+            local += total_in + 2;
+            consecutive_fails = 0;
+            continue;
+        }
+
+        local += 2;
+        consecutive_fails += 1;
+        if consecutive_fails > 256 {
+            break;
+        }
+    }
+
+    log::info!(
+        "NTFS compressed block scan: {} blocks, {:.1} MB decompressed",
+        blocks.len(),
+        decomp_offset as f64 / (1024.0 * 1024.0),
+    );
+
+    Ok(NtfsCompressedState {
+        blocks,
+        compression,
+        total_decompressed: decomp_offset,
+        cache_block: None,
+        cache_buf: Vec::new(),
+    })
+}
+
+/// A `Read + Seek` adapter over a compressed NTFS block stream. Used during
+/// indexing so that `index_ntfs_file_aware` can work on the decompressed
+/// view without materializing the whole stream to disk.
+struct NtfsDecompressingReader<'a, R> {
+    inner: &'a mut R,
+    state: &'a mut NtfsCompressedState,
+    position: u64,
+}
+
+impl<'a, R: Read + Seek> NtfsDecompressingReader<'a, R> {
+    fn ensure_block_cached(&mut self, idx: usize) -> std::io::Result<()> {
+        if self.state.cache_block == Some(idx) {
+            return Ok(());
+        }
+        let block = &self.state.blocks[idx];
+        let comp_size = block.comp_size as usize;
+        let mut comp_buf = vec![0u8; comp_size];
+        self.inner
+            .seek(SeekFrom::Start(block.file_offset))
+            .map_err(std::io::Error::other)?;
+        self.inner
+            .read_exact(&mut comp_buf)
+            .map_err(std::io::Error::other)?;
+
+        self.state.cache_buf.clear();
+        self.state
+            .cache_buf
+            .resize(block.decomp_size as usize + 512, 0);
+
+        let n = match self.state.compression {
+            GhoCompression::High => {
+                use flate2::read::ZlibDecoder;
+                let mut dec = ZlibDecoder::new(&comp_buf[..]);
+                let mut total = 0;
+                loop {
+                    match dec.read(&mut self.state.cache_buf[total..]) {
+                        Ok(0) => break,
+                        Ok(k) => total += k,
+                        Err(e) => return Err(e),
+                    }
+                }
+                total
+            }
+            GhoCompression::Fast => {
+                fast_lz_decompress(&comp_buf, comp_size, &mut self.state.cache_buf)
+                    .map_err(|e| std::io::Error::other(format!("{e:#}")))?
+            }
+            _ => {
+                return Err(std::io::Error::other("unsupported compression"));
+            }
+        };
+        self.state.cache_buf.truncate(n);
+        self.state.cache_block = Some(idx);
+        Ok(())
+    }
+
+    fn find_block(&self, pos: u64) -> Option<usize> {
+        self.state
+            .blocks
+            .binary_search_by(|b| {
+                if pos < b.decomp_offset {
+                    std::cmp::Ordering::Greater
+                } else if pos >= b.decomp_offset + b.decomp_size as u64 {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .ok()
+    }
+}
+
+impl<R: Read + Seek> Read for NtfsDecompressingReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() || self.position >= self.state.total_decompressed {
+            return Ok(0);
+        }
+        let Some(idx) = self.find_block(self.position) else {
+            return Ok(0);
+        };
+        self.ensure_block_cached(idx)?;
+        let block = &self.state.blocks[idx];
+        let off_in_block = (self.position - block.decomp_offset) as usize;
+        let avail = self.state.cache_buf.len().saturating_sub(off_in_block);
+        let n = avail.min(buf.len());
+        buf[..n].copy_from_slice(&self.state.cache_buf[off_in_block..off_in_block + n]);
+        self.position += n as u64;
+        Ok(n)
+    }
+}
+
+impl<R: Read + Seek> Seek for NtfsDecompressingReader<'_, R> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let new_pos = match pos {
+            SeekFrom::Start(p) => p,
+            SeekFrom::Current(delta) => {
+                if delta >= 0 {
+                    self.position.saturating_add(delta as u64)
+                } else {
+                    self.position.saturating_sub((-delta) as u64)
+                }
+            }
+            SeekFrom::End(delta) => {
+                let total = self.state.total_decompressed;
+                if delta >= 0 {
+                    total.saturating_add(delta as u64)
+                } else {
+                    total.saturating_sub((-delta) as u64)
+                }
+            }
+        };
+        self.position = new_pos;
+        Ok(new_pos)
+    }
 }
 
 /// Locate the NTFS VBR embedded in the GHPR metadata region. Scans from
@@ -4338,8 +4619,10 @@ fn index_ntfs_file_aware<R: Read + Seek>(
     let volume_size = vbr.total_sectors * vbr.bytes_per_sector;
     let mft_record_size = vbr.mft_record_size as usize;
 
-    // Scan for the first run header.
-    let scan_start = 0x1000u64;
+    // Scan for the first run header. For raw files the GHPR metadata
+    // occupies the first ~8 KiB, so we skip it; for the decompressed
+    // view of a compressed file the stream starts right at the data.
+    let scan_start = 0u64;
     let scan_end = file_size.min(scan_start + 256 * 1024);
     let mut header_buf = [0u8; NTFS_RUN_HEADER_SIZE];
     let mut first_run_offset: Option<u64> = None;
@@ -4609,6 +4892,7 @@ fn index_ntfs_file_aware<R: Read + Seek>(
 fn try_open_ntfs_file_aware(
     inner: &mut SpanReader,
     file_size: u64,
+    compression: GhoCompression,
 ) -> Result<(GhoReaderMode, u64)> {
     use crate::fs::ntfs::parse_vbr;
 
@@ -4626,17 +4910,47 @@ fn try_open_ntfs_file_aware(
         vbr.mft_cluster
     );
 
-    let index = index_ntfs_file_aware(inner, file_size, &vbr, &vbr_raw)
-        .context("building NTFS cluster run index")?;
-    let volume_size = index.volume_size;
+    if matches!(compression, GhoCompression::None) {
+        let index = index_ntfs_file_aware(inner, file_size, &vbr, &vbr_raw)
+            .context("building NTFS cluster run index")?;
+        let volume_size = index.volume_size;
+        return Ok((
+            GhoReaderMode::NtfsFileAware {
+                index,
+                last_run_hint: 0,
+                compressed: None,
+            },
+            volume_size,
+        ));
+    }
 
-    Ok((
-        GhoReaderMode::NtfsFileAware {
-            index,
-            last_run_hint: 0,
-        },
-        volume_size,
-    ))
+    // Compressed NTFS file-aware: build a block map, then index through
+    // a decompressing reader so the existing algorithm sees the same
+    // decompressed stream layout as an uncompressed file.
+    log::info!("Scanning compressed NTFS file-aware block stream...");
+    let data_start = vbr_off + 512;
+    let mut comp_state = scan_ntfs_compressed_blocks(inner, data_start, file_size, compression)
+        .context("scanning compressed NTFS blocks")?;
+
+    let decompressed_size = comp_state.total_decompressed;
+    {
+        let mut decomp_reader = NtfsDecompressingReader {
+            inner,
+            state: &mut comp_state,
+            position: 0,
+        };
+        let index = index_ntfs_file_aware(&mut decomp_reader, decompressed_size, &vbr, &vbr_raw)
+            .context("building NTFS cluster run index (compressed)")?;
+        let volume_size = index.volume_size;
+        Ok((
+            GhoReaderMode::NtfsFileAware {
+                index,
+                last_run_hint: 0,
+                compressed: Some(comp_state),
+            },
+            volume_size,
+        ))
+    }
 }
 
 /// Read bytes from an NTFS file-aware GHO at `position` in the logical
@@ -4645,6 +4959,7 @@ fn read_ntfs_file_aware_into(
     inner: &mut SpanReader,
     index: &NtfsGhoIndex,
     last_run_hint: &mut usize,
+    compressed: &mut Option<NtfsCompressedState>,
     position: u64,
     out: &mut [u8],
 ) -> std::io::Result<usize> {
@@ -4696,6 +5011,15 @@ fn read_ntfs_file_aware_into(
     let run = &runs[idx];
     let cluster_in_run = lcn - run.lcn_start;
     let file_offset = run.file_offset + cluster_in_run * cluster_size + offset_in_cluster as u64;
+
+    if let Some(cs) = compressed {
+        let mut reader = NtfsDecompressingReader {
+            inner,
+            state: cs,
+            position: file_offset,
+        };
+        return reader.read(&mut out[..to_read]);
+    }
 
     inner
         .seek(SeekFrom::Start(file_offset))

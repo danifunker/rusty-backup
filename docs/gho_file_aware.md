@@ -182,13 +182,9 @@ Result: 100% coverage on the corpus fixture (5613 runs, 443K clusters,
 10 GiB NTFS volume in 1.7 GiB backup). Directory browsing works.
 
 **Limitations:**
-- Uncompressed only (compressed NTFS file-aware bails with clear error)
-- Only one fixture tested (dirty-journal Windows XP partition)
+- Two fixtures tested (one uncompressed, one zlib-compressed)
 
 ## What's NOT in scope
-
-- **Compressed NTFS file-aware**: no fixtures exist; likely uses the
-  same `[u16 stored_len][block]` framing but needs verification.
 - **Password-protected GHOs**: blocked on cipher RE
   (`docs/gho_password.md`).
 - **Multi-partition full-disk**: no fixture with >1 partition exists
