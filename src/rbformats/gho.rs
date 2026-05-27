@@ -246,23 +246,22 @@ impl GhoContainerHeader {
 
 fn read_description<R: Read + Seek>(reader: &mut R) -> Result<Option<String>> {
     reader.seek(SeekFrom::Start(GHO_DESCRIPTION_OFFSET))?;
-    let mut len_byte = [0u8; 1];
-    if reader.read_exact(&mut len_byte).is_err() {
-        // File too small to carry a description — that's fine.
-        return Ok(None);
+    // The description is a NUL-terminated ASCII string starting at
+    // offset 0xFF, bounded by the end of the first sector. (Ghost's
+    // UI caps descriptions well before the sector boundary.)
+    let max_len = 512u64.saturating_sub(GHO_DESCRIPTION_OFFSET) as usize;
+    let mut buf = vec![0u8; max_len];
+    let n = match read_fully_or_eof(reader, &mut buf) {
+        Ok(n) => n,
+        Err(_) => return Ok(None),
+    };
+    buf.truncate(n);
+    // Trim at NUL terminator.
+    if let Some(nul) = buf.iter().position(|&b| b == 0) {
+        buf.truncate(nul);
     }
-    let len = len_byte[0];
-    if len == 0 || len > GHO_DESCRIPTION_MAX {
-        return Ok(None);
-    }
-    let max_remaining = 512u64.saturating_sub(GHO_DESCRIPTION_OFFSET + 1) as usize;
-    let take = (len as usize).min(max_remaining);
-    let mut buf = vec![0u8; take];
-    if reader.read_exact(&mut buf).is_err() {
-        return Ok(None);
-    }
-    // Strip NUL padding + trailing whitespace.
-    while buf.last().map(|b| *b == 0 || *b == b' ').unwrap_or(false) {
+    // Strip trailing whitespace.
+    while buf.last().map(|&b| b == b' ').unwrap_or(false) {
         buf.pop();
     }
     if buf.is_empty() {
@@ -270,10 +269,68 @@ fn read_description<R: Read + Seek>(reader: &mut R) -> Result<Option<String>> {
     }
     match std::str::from_utf8(&buf) {
         Ok(s) => Ok(Some(s.to_string())),
-        // Description is ASCII in practice; tolerate stray high bytes by
-        // lossy-decoding rather than failing the whole header.
         Err(_) => Ok(Some(String::from_utf8_lossy(&buf).into_owned())),
     }
+}
+
+/// Format a human-readable summary of a GHO container's metadata.
+/// Similar to `format_chd_info` for CHD files.
+pub fn format_gho_info(path: &Path) -> Result<String> {
+    let span_set = discover_gho_span_set(path)?;
+    let mut f = File::open(&span_set[0])?;
+    let header = GhoContainerHeader::parse(&mut f)?;
+
+    let mut lines = Vec::new();
+    lines.push(format!("Norton Ghost Image"));
+    lines.push(format!(""));
+
+    if let Some(desc) = &header.description {
+        lines.push(format!("Description:  {}", desc));
+    }
+
+    let comp_str = match header.compression {
+        GhoCompression::None => "None",
+        GhoCompression::Fast => "Fast (LZ)",
+        GhoCompression::High => "High (zlib)",
+        GhoCompression::Other(b) => {
+            lines.push(format!("Compression:  Unknown (0x{:02x})", b));
+            ""
+        }
+    };
+    if !comp_str.is_empty() {
+        lines.push(format!("Compression:  {}", comp_str));
+    }
+
+    let type_str = match header.image_type {
+        GhoImageType::FileAware => "File-aware (truncated)",
+        GhoImageType::Sector => "Sector-by-sector",
+        GhoImageType::Other(b) => {
+            lines.push(format!("Image type:   Unknown (0x{:02x})", b));
+            ""
+        }
+    };
+    if !type_str.is_empty() {
+        lines.push(format!("Image type:   {}", type_str));
+    }
+
+    if header.password_protected {
+        lines.push(format!("Password:     Yes (encrypted)"));
+    }
+
+    if span_set.len() > 1 {
+        lines.push(format!("Span files:   {} files", span_set.len()));
+    }
+
+    let total_bytes: u64 = span_set
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+        .sum();
+    lines.push(format!(
+        "Archive size: {:.1} MB",
+        total_bytes as f64 / (1024.0 * 1024.0)
+    ));
+
+    Ok(lines.join("\n"))
 }
 
 /// Materialize a Norton Ghost backup into a raw disk image temp file.
@@ -1000,6 +1057,26 @@ impl GhoReader {
             .with_context(|| format!("parsing GHO header from {}", span_set[0].display()))?;
         drop(primary);
 
+        if let Some(desc) = &header.description {
+            log::info!("Ghost description: {}", desc);
+        }
+        let comp_label = match header.compression {
+            GhoCompression::None => "none",
+            GhoCompression::Fast => "Fast (LZ)",
+            GhoCompression::High => "High (zlib)",
+            GhoCompression::Other(_) => "unknown",
+        };
+        let type_label = match header.image_type {
+            GhoImageType::FileAware => "file-aware",
+            GhoImageType::Sector => "sector-by-sector",
+            GhoImageType::Other(_) => "unknown",
+        };
+        log::info!(
+            "Ghost image: {} compression, {} mode",
+            comp_label,
+            type_label
+        );
+
         if header.container_version != 0x01 {
             bail!(
                 "GHO {} container version {:#04x} not supported by GhoReader",
@@ -1019,8 +1096,14 @@ impl GhoReader {
 
         // ---- File-aware dispatch ----
         if matches!(header.image_type, GhoImageType::FileAware) {
+            log::info!("Scanning Ghost record stream...");
             let image = parse_gho_image(&mut inner, file_size, &header)
                 .with_context(|| format!("parsing inner record stream for {}", path.display()))?;
+            log::info!(
+                "Found {} records ({} cached bodies)",
+                image.records.len(),
+                image.cached_bodies.len()
+            );
 
             let mut slices = split_partitions(&mut inner, &image)
                 .with_context(|| format!("splitting partitions for {}", path.display()))?;
@@ -1029,6 +1112,11 @@ impl GhoReader {
                 // Single-partition: use the original path (whole tree).
                 let tree = walk_file_aware_tree(&mut inner, &image)
                     .with_context(|| format!("walking file-aware tree for {}", path.display()))?;
+                log::info!(
+                    "Reconstructing FAT partition from {} files, {} directories...",
+                    tree.file_count(),
+                    tree.dir_count()
+                );
                 let virtual_image =
                     build_virtual_fat_image(&mut inner, &image, &tree, header.compression)
                         .with_context(|| {
@@ -1064,9 +1152,13 @@ impl GhoReader {
                 std::collections::HashMap::new()
             };
 
+            log::info!(
+                "Reconstructing {} partitions from sparsely populated Ghost image...",
+                slices.len()
+            );
             let mut fa_parts = Vec::with_capacity(slices.len());
             let mut max_end: u64 = 0;
-            for slice in &slices {
+            for (pi, slice) in slices.iter().enumerate() {
                 let sub_records = image.records[slice.record_range.clone()].to_vec();
                 let sub_bodies: std::collections::HashMap<u64, Vec<u8>> = sub_records
                     .iter()
@@ -1088,6 +1180,14 @@ impl GhoReader {
                         slice.hidden_sectors
                     )
                 })?;
+                log::info!(
+                    "  Partition {} of {}: {} ({} files, {} dirs)",
+                    pi + 1,
+                    slices.len(),
+                    slice.fs_type,
+                    tree.file_count(),
+                    tree.dir_count()
+                );
                 let virtual_image =
                     build_virtual_fat_image(&mut inner, &sub_image, &tree, header.compression)
                         .with_context(|| {
@@ -4034,10 +4134,10 @@ mod tests {
         }
         if let Some(desc) = description {
             let bytes = desc.as_bytes();
-            assert!(bytes.len() <= 0xFF);
-            buf[0xFF] = bytes.len() as u8;
-            let end = 0x100 + bytes.len();
-            buf[0x100..end].copy_from_slice(bytes);
+            let max = 512 - 0xFF - 1; // leave room for NUL
+            assert!(bytes.len() <= max);
+            buf[0xFF..0xFF + bytes.len()].copy_from_slice(bytes);
+            // NUL terminator (buf is already zeroed).
         }
         buf
     }
@@ -4073,7 +4173,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_pascal_description() {
+    fn parses_nul_terminated_description() {
         let buf = build_header(0x00, 0x00, 0x00, Some("PartitionBackup no compression"));
         let header = GhoContainerHeader::parse(&mut Cursor::new(buf)).unwrap();
         assert_eq!(

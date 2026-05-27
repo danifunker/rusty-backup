@@ -2464,6 +2464,19 @@ impl InspectTab {
                         _ => "Streaming image",
                     };
                     push_log(format!("Detected format: {}", label));
+
+                    // Surface GHO metadata (description, compression, etc.)
+                    if matches!(ext.as_deref(), Some("gho") | Some("ghs")) {
+                        if let Ok(info) = rusty_backup::rbformats::gho::format_gho_info(&path) {
+                            for line in info.lines() {
+                                if !line.is_empty() {
+                                    push_log(line.to_string());
+                                }
+                            }
+                        }
+                        set_step("Reconstructing partitions from Ghost image...");
+                    }
+
                     if let Ok(mut s) = status.lock() {
                         s.format_label = Some(label.to_string());
                     }
