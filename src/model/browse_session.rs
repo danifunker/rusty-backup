@@ -54,6 +54,10 @@ pub struct BrowseSession {
     /// `source_path` — the GUI's CHD edit-mode flow installs it for the
     /// duration of editing and clears it on apply/discard.
     pub chd_edit_session: Option<Arc<Mutex<ChdEditSession>>>,
+    /// Password for encrypted containers (currently IMZ only). When set,
+    /// `open()` passes it to the decryption API. The GUI sets this after
+    /// prompting the user.
+    pub password: Option<String>,
 }
 
 /// True when the session is opening an HFS+ (or HFSX, or APM Apple_HFS that
@@ -175,7 +179,8 @@ impl BrowseSession {
         if &magic[..4] == b"PK\x03\x04" {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             if ext.eq_ignore_ascii_case("imz") {
-                let imz_reader = crate::rbformats::imz::ImzReader::open(path)
+                let pw = self.password.as_deref().map(|s| s.as_bytes());
+                let imz_reader = crate::rbformats::imz::ImzReader::open_with_password(path, pw)
                     .map_err(|e| FilesystemError::Parse(format!("failed to open IMZ: {e:#}")))?;
                 return fs::open_filesystem(
                     imz_reader,
@@ -275,8 +280,11 @@ impl BrowseSession {
             let mut fs = match session.open() {
                 Ok(fs) => fs,
                 Err(e) => {
+                    let msg = format!("{e}");
+                    let is_pw = msg.to_lowercase().contains("password-protected");
                     if let Ok(mut g) = status_thread.lock() {
                         g.error = Some(format!("Cannot open filesystem: {e}"));
+                        g.needs_password = is_pw;
                         g.finished = true;
                     }
                     return;
@@ -375,6 +383,9 @@ pub struct BrowseOpenStatus {
     pub root: Option<FileEntry>,
     pub root_entries: Option<Vec<FileEntry>>,
     pub error: Option<String>,
+    /// Set when the open fails because the container is password-protected.
+    /// The GUI checks this to show a password prompt instead of a plain error.
+    pub needs_password: bool,
     /// The opened filesystem itself, handed back to the UI thread so it can
     /// cache it. `None` if the open failed.
     pub fs: Option<Box<dyn Filesystem>>,
@@ -391,6 +402,7 @@ impl BrowseOpenStatus {
             root: None,
             root_entries: None,
             error: None,
+            needs_password: false,
             fs: None,
         }
     }

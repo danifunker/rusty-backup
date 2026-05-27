@@ -14,7 +14,7 @@ use std::fs::File;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 /// IMZ magic = ZIP local file header signature.
 pub const IMZ_MAGIC: &[u8; 4] = b"PK\x03\x04";
@@ -55,56 +55,97 @@ fn is_image_entry(name: &str) -> bool {
         || lower.ends_with(".vfd")
 }
 
-/// Open `path` as an IMZ archive and extract its floppy image to a fresh
-/// tempdir. The returned [`ImzMaterialized::guard`] must be kept alive for
-/// the lifetime of the materialized file.
-pub fn materialize_imz_to_temp(path: &Path) -> Result<ImzMaterialized> {
+/// Returns `true` if the archive's chosen entry is encrypted.
+pub fn imz_needs_password(path: &Path) -> Result<bool> {
     let file = File::open(path).with_context(|| format!("opening IMZ {}", path.display()))?;
     let mut archive = zip::ZipArchive::new(file)
         .with_context(|| format!("parsing IMZ {} as ZIP", path.display()))?;
+    let idx = pick_entry_index(&mut archive)?;
+    let entry = archive.by_index_raw(idx)?;
+    Ok(entry.encrypted())
+}
 
+fn pick_entry_index<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Result<usize> {
     if archive.is_empty() {
-        return Err(anyhow!("IMZ {} contains no entries", path.display()));
+        bail!("IMZ contains no entries");
     }
-
-    // Pick the first entry whose name looks like a floppy image; fall back
-    // to the first non-directory entry. WinImage always emits exactly one
-    // entry whose name matches the host filename, so either rule picks it.
     let mut chosen: Option<usize> = None;
     let mut fallback: Option<usize> = None;
     for i in 0..archive.len() {
-        let entry = archive.by_index(i)?;
-        if entry.is_dir() {
-            continue;
-        }
-        if is_image_entry(entry.name()) {
-            chosen = Some(i);
-            break;
-        }
-        if fallback.is_none() {
-            fallback = Some(i);
+        if let Ok(entry) = archive.by_index_raw(i) {
+            if entry.is_dir() {
+                continue;
+            }
+            if is_image_entry(entry.name()) {
+                chosen = Some(i);
+                break;
+            }
+            if fallback.is_none() {
+                fallback = Some(i);
+            }
         }
     }
-    let idx = chosen
+    chosen
         .or(fallback)
-        .ok_or_else(|| anyhow!("IMZ {} has no extractable file entry", path.display()))?;
+        .ok_or_else(|| anyhow!("IMZ has no extractable file entry"))
+}
 
-    let mut entry = archive.by_index(idx)?;
-    if entry.encrypted() {
-        return Err(anyhow!(
-            "IMZ {} is password-protected (entry \"{}\"); password-protected IMZ \
-             archives are not yet supported",
-            path.display(),
-            entry.name()
-        ));
+/// Open the chosen entry from the archive, optionally decrypting with
+/// `password`. Returns the decompressed entry + its metadata.
+fn open_entry<'a>(
+    archive: &'a mut zip::ZipArchive<File>,
+    idx: usize,
+    password: Option<&[u8]>,
+    path: &Path,
+) -> Result<(zip::read::ZipFile<'a>, String, u64)> {
+    if let Some(pw) = password {
+        let entry = archive
+            .by_index_decrypt(idx, pw)
+            .map_err(|e| anyhow!("IMZ {} decrypt failed: {e}", path.display()))?;
+        let name = entry.name().to_string();
+        let size = entry.size();
+        Ok((entry, name, size))
+    } else {
+        // Check encryption via raw access first (by_index errors on
+        // encrypted entries in zip 2.x before we can inspect the flag).
+        {
+            let raw = archive.by_index_raw(idx)?;
+            if raw.encrypted() {
+                let entry_name = raw.name().to_string();
+                bail!(
+                    "IMZ {} is password-protected (entry \"{entry_name}\")",
+                    path.display(),
+                );
+            }
+        }
+        let entry = archive.by_index(idx)?;
+        let name = entry.name().to_string();
+        let size = entry.size();
+        Ok((entry, name, size))
     }
-    let entry_name = entry.name().to_string();
-    let logical_size = entry.size();
+}
+
+/// Open `path` as an IMZ archive and extract its floppy image to a fresh
+/// tempdir. Pass `password` to decrypt password-protected archives.
+/// The returned [`ImzMaterialized::guard`] must be kept alive for
+/// the lifetime of the materialized file.
+pub fn materialize_imz_to_temp(path: &Path) -> Result<ImzMaterialized> {
+    materialize_imz_to_temp_with_password(path, None)
+}
+
+pub fn materialize_imz_to_temp_with_password(
+    path: &Path,
+    password: Option<&[u8]>,
+) -> Result<ImzMaterialized> {
+    let file = File::open(path).with_context(|| format!("opening IMZ {}", path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("parsing IMZ {} as ZIP", path.display()))?;
+    let idx = pick_entry_index(&mut archive)?;
+
+    let (mut entry, entry_name, logical_size) = open_entry(&mut archive, idx, password, path)?;
 
     let guard = tempfile::tempdir().with_context(|| "creating tempdir for IMZ materialization")?;
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("imz");
-    // Always write with a `.ima` extension so downstream detection treats
-    // the materialized file as a raw floppy image.
     let out_path = guard.path().join(format!("{}.ima", stem));
     let mut out =
         File::create(&out_path).with_context(|| format!("creating {}", out_path.display()))?;
@@ -153,46 +194,19 @@ pub struct ImzReader {
 impl ImzReader {
     /// Open an IMZ and eagerly decompress its single floppy-image entry
     /// into memory. Errors mirror [`materialize_imz_to_temp`] (empty
-    /// archive, no extractable entry, password-protected).
+    /// archive, no extractable entry, password-protected without
+    /// supplying a password).
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_password(path, None)
+    }
+
+    pub fn open_with_password(path: &Path, password: Option<&[u8]>) -> Result<Self> {
         let file = File::open(path).with_context(|| format!("opening IMZ {}", path.display()))?;
         let mut archive = zip::ZipArchive::new(file)
             .with_context(|| format!("parsing IMZ {} as ZIP", path.display()))?;
+        let idx = pick_entry_index(&mut archive)?;
 
-        if archive.is_empty() {
-            return Err(anyhow!("IMZ {} contains no entries", path.display()));
-        }
-
-        let mut chosen: Option<usize> = None;
-        let mut fallback: Option<usize> = None;
-        for i in 0..archive.len() {
-            let entry = archive.by_index(i)?;
-            if entry.is_dir() {
-                continue;
-            }
-            if is_image_entry(entry.name()) {
-                chosen = Some(i);
-                break;
-            }
-            if fallback.is_none() {
-                fallback = Some(i);
-            }
-        }
-        let idx = chosen
-            .or(fallback)
-            .ok_or_else(|| anyhow!("IMZ {} has no extractable file entry", path.display()))?;
-
-        let mut entry = archive.by_index(idx)?;
-        if entry.encrypted() {
-            return Err(anyhow!(
-                "IMZ {} is password-protected (entry \"{}\"); password-protected IMZ \
-                 archives are not yet supported",
-                path.display(),
-                entry.name()
-            ));
-        }
-        let entry_name = entry.name().to_string();
-        let logical_size = entry.size();
+        let (mut entry, entry_name, logical_size) = open_entry(&mut archive, idx, password, path)?;
         let mut buf = Vec::with_capacity(logical_size as usize);
         io::copy(&mut entry, &mut buf)
             .with_context(|| format!("decompressing IMZ entry \"{}\"", entry_name))?;
@@ -304,6 +318,42 @@ mod tests {
             msg.to_lowercase().contains("password"),
             "error should mention password, got: {msg}"
         );
+    }
+
+    /// WinImage's ZipCrypto encryption is not yet decryptable by the
+    /// `zip` crate — `by_index_decrypt` rejects the correct password
+    /// ("password"). WinImage uses proprietary extra-field headers
+    /// (0x4957 "WI", 0x4953 "SI") that may affect key derivation.
+    /// This test confirms the API plumbing works once the crate-level
+    /// issue is resolved.
+    #[test]
+    #[ignore = "WinImage ZipCrypto not yet decryptable by zip crate"]
+    fn decrypts_password_protected_real_winimage_fixture() {
+        let home = match std::env::var("HOME") {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        let fixture = PathBuf::from(&home).join("new-fixtures/imz/w99_boot_withpassword.imz");
+        let reference = PathBuf::from(&home).join("new-fixtures/imz/w98_boot.ima");
+        if !fixture.exists() || !reference.exists() {
+            eprintln!("skipping: fixture or reference missing");
+            return;
+        }
+        assert!(
+            imz_needs_password(&fixture).unwrap(),
+            "fixture should be encrypted"
+        );
+
+        let mat = materialize_imz_to_temp_with_password(&fixture, Some(b"password"))
+            .expect("decrypt with correct password");
+        let got = std::fs::read(&mat.temp_path).unwrap();
+        let want = std::fs::read(&reference).unwrap();
+        assert_eq!(got.len(), want.len(), "decoded size mismatch");
+        assert_eq!(got, want, "decoded IMZ bytes differ from reference IMA");
+
+        let reader =
+            ImzReader::open_with_password(&fixture, Some(b"password")).expect("ImzReader decrypt");
+        assert_eq!(reader.logical_size(), want.len() as u64);
     }
 
     /// Gated on the real WinImage no-password fixture being present.
