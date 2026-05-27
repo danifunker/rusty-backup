@@ -2712,28 +2712,6 @@ impl Seek for SparseSink {
     }
 }
 
-/// `Read` that yields `remaining` zero bytes then EOF. Used to feed
-/// `FatFilesystem::create_file` so it allocates clusters without us
-/// having to materialise real content bytes (those are served lazily
-/// from the GHO stream at read time instead).
-struct ZeroReader {
-    remaining: u64,
-}
-
-impl Read for ZeroReader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.remaining == 0 || buf.is_empty() {
-            return Ok(0);
-        }
-        let n = (buf.len() as u64).min(self.remaining) as usize;
-        for b in &mut buf[..n] {
-            *b = 0;
-        }
-        self.remaining -= n as u64;
-        Ok(n)
-    }
-}
-
 /// Build the in-memory virtual FAT image used by
 /// `GhoReaderMode::FileAware`.
 fn build_virtual_fat_image(
@@ -2828,16 +2806,12 @@ fn build_virtual_fat_image(
                     continue;
                 }
                 let file_size = entry.file_size as u64;
-                let mut zero = ZeroReader {
-                    remaining: file_size,
+                let mut empty = std::io::empty();
+                let opts = CreateFileOptions {
+                    skip_data_write: true,
+                    ..Default::default()
                 };
-                let f = match fs.create_file(
-                    &parent_entry,
-                    &name,
-                    &mut zero,
-                    file_size,
-                    &CreateFileOptions::default(),
-                ) {
+                let f = match fs.create_file(&parent_entry, &name, &mut empty, file_size, &opts) {
                     Ok(f) => f,
                     Err(_) => continue,
                 };
@@ -2863,19 +2837,6 @@ fn build_virtual_fat_image(
 
     fs.sync_metadata().map_err(|e| anyhow::anyhow!("{e}"))?;
     drop(fs);
-
-    // Evict file-cluster sectors from sparse storage — they were
-    // zero-filled by the ZeroReader and are served from the GHO at
-    // read time.
-    let data_start_sector = layout.data_start_byte() / bps;
-    let sectors_per_cluster = layout.sectors_per_cluster as u64;
-    for &cluster_id in cluster_to_file.keys() {
-        let cluster_offset = (cluster_id as u64) - 2;
-        let first_sector = data_start_sector + cluster_offset * sectors_per_cluster;
-        for s in first_sector..first_sector + sectors_per_cluster {
-            sink.sectors.remove(&s);
-        }
-    }
 
     Ok(VirtualFatImage {
         bytes_per_sector: layout.bytes_per_sector,

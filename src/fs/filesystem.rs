@@ -221,6 +221,12 @@ pub struct CreateFileOptions {
     /// filesystems. Default `None` leaves the date zero (which display
     /// tools render as the epoch).
     pub amiga_dates: Option<(i32, i32, i32)>,
+    /// When true, allocate clusters and create the directory entry but
+    /// skip writing file content.  The allocated clusters are left
+    /// uninitialized (zero on fresh images).  Used by the GHO
+    /// file-aware virtual-FAT builder to avoid writing 1 GB+ of zeros
+    /// that are immediately evicted.
+    pub skip_data_write: bool,
 }
 
 /// Options for creating a directory on an editable filesystem.

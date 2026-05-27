@@ -49,6 +49,10 @@ pub struct FatFilesystem<R> {
     /// Cluster count used (lazily computed).
     #[allow(dead_code)]
     used_clusters: Option<u64>,
+    /// Hint for the next free cluster scan start.  Avoids O(n^2)
+    /// allocation on fresh volumes where clusters are filled
+    /// sequentially.
+    next_free_hint: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -189,6 +193,7 @@ impl<R: Read + Seek> FatFilesystem<R> {
             label,
             total_clusters,
             used_clusters: None,
+            next_free_hint: 2,
         })
     }
 
@@ -853,6 +858,38 @@ impl<R: Read + Write + Seek> FatFilesystem<R> {
         Ok(fat_data)
     }
 
+    fn read_fat_entry_single(&mut self, cluster: u32) -> Result<u32, FilesystemError> {
+        let fat_offset = self.sector_offset(self.reserved_sectors);
+        match self.fat_type {
+            FatType::Fat32 => {
+                let off = fat_offset + cluster as u64 * 4;
+                self.reader.seek(SeekFrom::Start(off))?;
+                let mut buf = [0u8; 4];
+                self.reader.read_exact(&mut buf)?;
+                Ok(u32::from_le_bytes(buf) & 0x0FFF_FFFF)
+            }
+            FatType::Fat16 => {
+                let off = fat_offset + cluster as u64 * 2;
+                self.reader.seek(SeekFrom::Start(off))?;
+                let mut buf = [0u8; 2];
+                self.reader.read_exact(&mut buf)?;
+                Ok(u16::from_le_bytes(buf) as u32)
+            }
+            FatType::Fat12 => {
+                let byte_off = fat_offset + (cluster as u64 * 3) / 2;
+                self.reader.seek(SeekFrom::Start(byte_off))?;
+                let mut buf = [0u8; 2];
+                self.reader.read_exact(&mut buf)?;
+                let val = u16::from_le_bytes(buf);
+                Ok(if cluster & 1 == 1 {
+                    (val >> 4) as u32
+                } else {
+                    (val & 0x0FFF) as u32
+                })
+            }
+        }
+    }
+
     /// Write a FAT entry for a given cluster on disk (updates all FAT copies).
     fn write_fat_entry_disk(&mut self, cluster: u32, value: u32) -> Result<(), FilesystemError> {
         let fat_start = self.sector_offset(self.reserved_sectors);
@@ -893,15 +930,24 @@ impl<R: Read + Write + Seek> FatFilesystem<R> {
 
     /// Find `count` free clusters by scanning the FAT. Returns cluster numbers.
     fn find_free_clusters(&mut self, count: u32) -> Result<Vec<u32>, FilesystemError> {
-        let fat_data = self.read_fat_table()?;
         let total_entries = self.total_clusters as u32 + 2;
         let mut free = Vec::with_capacity(count as usize);
 
-        for cluster in 2..total_entries {
-            let entry = read_fat_entry(&fat_data, cluster, self.fat_type);
-            if entry == 0 {
+        let start = self.next_free_hint.max(2);
+        for cluster in start..total_entries {
+            if self.read_fat_entry_single(cluster)? == 0 {
                 free.push(cluster);
                 if free.len() == count as usize {
+                    self.next_free_hint = cluster + 1;
+                    return Ok(free);
+                }
+            }
+        }
+        for cluster in 2..start {
+            if self.read_fat_entry_single(cluster)? == 0 {
+                free.push(cluster);
+                if free.len() == count as usize {
+                    self.next_free_hint = cluster + 1;
                     return Ok(free);
                 }
             }
@@ -1530,7 +1576,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
         name: &str,
         data: &mut dyn std::io::Read,
         data_len: u64,
-        _options: &CreateFileOptions,
+        options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
         validate_fat_name(name)?;
 
@@ -1559,8 +1605,9 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
             0
         };
 
-        // Write file data to clusters
-        if clusters_needed > 0 {
+        // Write file data to clusters (skipped when skip_data_write is
+        // set — caller only needs the FAT chain, not the content).
+        if clusters_needed > 0 && !options.skip_data_write {
             let mut cluster = first_cluster;
             let mut remaining = data_len as usize;
             let mut buf = vec![0u8; cluster_size];
