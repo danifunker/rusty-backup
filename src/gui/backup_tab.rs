@@ -259,7 +259,7 @@ impl BackupTab {
                                 .pick_file()
                             {
                                 self.selected_device_idx = None;
-                                match super::materialize_amiga_image_path(&path) {
+                                match super::prepare_disk_image_path(&path) {
                                     Ok((materialized, guard)) => {
                                         self.image_file_path = Some(materialized);
                                         self.amiga_tempdir = guard;

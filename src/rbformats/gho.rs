@@ -17,7 +17,7 @@
 //!   starts at the sector after the last `FE EF` sub-header; compressed
 //!   streams are `[u16 stored_len][block]` chunks (stored_len includes
 //!   itself) terminated by a record header. Wired into the GUI via
-//!   `materialize_amiga_image_path`.
+//!   `prepare_disk_image_path`.
 //!
 //!   **File-aware mode is deferred.** Despite the plan ordering SECTOR
 //!   after file-aware, the fixture corpus showed SECTOR mode is the path
@@ -1428,7 +1428,7 @@ fn decode_block_into<R: Read + Seek>(
 
 /// Result of materializing a GHO container to a temp file. Same shape as
 /// [`crate::rbformats::imz::ImzMaterialized`] so the GUI's
-/// `materialize_amiga_image_path` can treat both formats identically.
+/// `prepare_disk_image_path` can treat both formats identically.
 #[derive(Debug)]
 pub struct GhoMaterialized {
     /// Path to the raw decoded partition image inside the tempdir.

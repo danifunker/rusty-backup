@@ -362,7 +362,7 @@ impl InspectTab {
                             // Transparently decompress .adz / .hdz so the
                             // rest of the pipeline (PartitionTable::detect,
                             // backup, browse) sees a raw image.
-                            match super::materialize_amiga_image_path(&path) {
+                            match super::prepare_disk_image_path(&path) {
                                 Ok((materialized, guard)) => {
                                     self.image_file_path = Some(materialized);
                                     self.amiga_tempdir = guard;

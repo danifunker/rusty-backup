@@ -63,26 +63,31 @@ fn file_dialog() -> rfd::FileDialog {
     dialog
 }
 
-/// Materialize compressed-container disk images to a temporary raw file.
+/// Prepare a disk image path for file-based access by downstream
+/// GUI worker code (which currently opens images via
+/// `File::open` + `try_clone`). Returns a path to a raw, seekable
+/// image — possibly the original (no work needed) or a tempfile
+/// containing the decompressed / reconstructed image.
 ///
-/// Handles:
-/// - `.adz` → gzip-decompressed `.adf` (Amiga floppy)
-/// - `.hdz` → gzip-decompressed `.hdf` (Amiga hard-disk)
-/// - `.imz` → ZIP-extracted `.ima` (WinImage floppy)
-/// - `.gho` / `.ghs` → decoded raw disk image (Norton Ghost SECTOR mode)
+/// Currently handles:
+///
+/// - `.adz` / `.hdz` — gzip-decompressed to a tempfile. **Genuinely
+///   needed**: gzip isn't seekable.
+/// - `.imz` — ZIP-extracted to a tempfile. **Transitional**: an
+///   [`ImzReader`] streams these. Once GUI workers take
+///   `Box<dyn ReadSeek>` instead of `File`, this branch is removed in
+///   favour of [`open_disk_image_for_reading`].
+/// - `.gho` / `.ghs` — Norton Ghost. **Transitional**: streamed by
+///   `GhoReader` + `std::io::copy` into a tempfile so the rest of the
+///   pipeline (which expects a `File`) can still open it. Once
+///   workers take a streaming reader, this branch is removed too.
 ///
 /// Anything else passes through unchanged.
 ///
-/// The decompressed file lives inside a fresh `tempfile::tempdir`; callers
-/// must hold the returned `TempDir` (second tuple element) for the duration
-/// they need the materialized file. When the guard drops, the tempdir is
-/// removed.
-///
-/// Returns `Err` if the magic bytes are missing or decompression fails.
-///
-/// Name is historical — first added for Amiga `.adz`/`.hdz`; broadened to
-/// also cover WinImage `.imz` (and, planned, GHO / Partimage / TD0/IMD).
-pub fn materialize_amiga_image_path(
+/// The output file lives inside a fresh `tempfile::tempdir`; callers
+/// must hold the returned `TempDir` (second tuple element) for the
+/// duration they need the materialized file.
+pub fn prepare_disk_image_path(
     path: &std::path::Path,
 ) -> std::io::Result<(std::path::PathBuf, Option<tempfile::TempDir>)> {
     let ext = path
@@ -98,9 +103,9 @@ pub fn materialize_amiga_image_path(
         return Ok((mat.temp_path, Some(mat.guard)));
     }
 
-    // GHO/GHS → Norton Ghost container. SECTOR-mode (raw) backups decode
-    // to a raw disk image; file-aware backups and password-protected
-    // files surface a precise error from the reader.
+    // GHO/GHS → Norton Ghost container. Streamed via GhoReader into a
+    // tempfile. (Eventually the worker code will take a streaming
+    // reader directly and this branch goes away.)
     if matches!(ext.as_deref(), Some("gho") | Some("ghs")) {
         let mat = rusty_backup::rbformats::gho::materialize_gho_to_temp(path)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:#}")))?;
@@ -142,6 +147,30 @@ pub fn materialize_amiga_image_path(
     Ok((out_path, Some(tmp)))
 }
 
+/// Open a disk image file for streaming reads, dispatching on container
+/// type:
+///
+/// - `.chd` → `ChdReader` (decompresses hunks on demand)
+/// - `.gho` / `.ghs` → `GhoReader` (streams SECTOR mode, builds an
+///   in-RAM virtual FAT image for file-aware mode)
+/// - `.imz` → `ImzReader` (streams ZIP-wrapped floppy image)
+/// - anything else → buffered `File`
+///
+/// No tempfile is created for any of the streaming containers; only
+/// gzip-wrapped Amiga images need [`prepare_disk_image_path`]
+/// first (since gzip isn't seekable).
+///
+/// This is the GUI's entry point for opening image FILES (not raw
+/// devices — those still need [`rusty_backup::os::open_source_for_reading`]
+/// for elevation / volume locking).
+#[allow(dead_code)] // First caller lands in the GUI worker refactor.
+pub fn open_disk_image_for_reading(
+    path: &std::path::Path,
+) -> std::io::Result<Box<dyn rusty_backup::rbformats::ReadSeek>> {
+    rusty_backup::model::source_reader::open_read(path)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e:#}")))
+}
+
 #[cfg(test)]
 mod materialize_tests {
     use super::*;
@@ -152,7 +181,7 @@ mod materialize_tests {
         let tmp = tempfile::tempdir().unwrap();
         let raw = tmp.path().join("disk.adf");
         std::fs::write(&raw, b"raw bytes").unwrap();
-        let (out, guard) = materialize_amiga_image_path(&raw).unwrap();
+        let (out, guard) = prepare_disk_image_path(&raw).unwrap();
         assert_eq!(out, raw);
         assert!(guard.is_none());
     }
@@ -167,7 +196,7 @@ mod materialize_tests {
         let mut enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
         enc.write_all(payload).unwrap();
         enc.finish().unwrap();
-        let (out, guard) = materialize_amiga_image_path(&adz_path).unwrap();
+        let (out, guard) = prepare_disk_image_path(&adz_path).unwrap();
         assert!(guard.is_some(), "decompressed path needs a tempdir guard");
         assert_eq!(out.extension().and_then(|s| s.to_str()), Some("adf"));
         let actual = std::fs::read(&out).unwrap();
@@ -179,14 +208,16 @@ mod materialize_tests {
         let tmp = tempfile::tempdir().unwrap();
         let adz = tmp.path().join("bogus.adz");
         std::fs::write(&adz, b"not gzip data").unwrap();
-        let err = materialize_amiga_image_path(&adz).unwrap_err();
+        let err = prepare_disk_image_path(&adz).unwrap_err();
         assert!(err.to_string().contains("gzip magic"));
     }
 
     #[test]
     fn materialize_decompresses_imz() {
-        // Build a minimal IMZ (ZIP wrapping a single .ima entry) and confirm
-        // materialize_amiga_image_path unwraps it via the new IMZ branch.
+        // Transitional: IMZ still materializes to a tempfile because
+        // GUI workers expect a File path. Once they take a
+        // Box<dyn ReadSeek> via open_disk_image_for_reading, both this
+        // branch and this test go away.
         let payload: &[u8] = b"WinImage floppy bytes";
         let tmp = tempfile::tempdir().unwrap();
         let imz_path = tmp.path().join("floppy.imz");
@@ -198,7 +229,7 @@ mod materialize_tests {
         zw.write_all(payload).unwrap();
         zw.finish().unwrap();
 
-        let (out, guard) = materialize_amiga_image_path(&imz_path).unwrap();
+        let (out, guard) = prepare_disk_image_path(&imz_path).unwrap();
         assert!(guard.is_some(), "imz needs a tempdir guard");
         assert_eq!(out.extension().and_then(|s| s.to_str()), Some("ima"));
         assert_eq!(std::fs::read(&out).unwrap(), payload);
