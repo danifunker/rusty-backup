@@ -34,8 +34,8 @@ pub struct InspectArgs {
 
 pub fn run(args: InspectArgs) -> Result<()> {
     require_non_flat(args.format, "inspect")?;
-    let mut file = crate::cli::io::open_image_ro(&args.image)?;
-    let pt = PartitionTable::detect(&mut file)?;
+    let mut reader = crate::model::source_reader::open_read(&args.image)?;
+    let pt = PartitionTable::detect(&mut reader)?;
     let partitions = pt.partitions();
     let chd_report = if args
         .image

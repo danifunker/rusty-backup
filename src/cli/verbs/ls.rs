@@ -11,7 +11,7 @@ use clap::Args;
 use crate::cli::glob::{collect_matches, compile_patterns};
 use crate::cli::img_at::ImageRef;
 use crate::cli::logging::{log_stderr, out_stdout};
-use crate::cli::resolve::resolve_partition_ro;
+use crate::cli::resolve::resolve_partition_streaming;
 use crate::fs::filesystem::Filesystem;
 
 #[derive(Debug, Args)]
@@ -41,11 +41,15 @@ pub struct LsArgs {
 }
 
 pub fn run(args: LsArgs) -> Result<()> {
-    let (file, ctx) = resolve_partition_ro(&args.image.path, args.image.partition)?;
+    let (reader, ctx) = resolve_partition_streaming(&args.image.path, args.image.partition)?;
     log_stderr(&ctx.label);
-    let mut fs =
-        crate::fs::open_filesystem(file, ctx.offset, ctx.type_byte, ctx.type_string.as_deref())
-            .map_err(|e| anyhow!("opening filesystem: {e}"))?;
+    let mut fs = crate::fs::open_filesystem(
+        reader,
+        ctx.offset,
+        ctx.type_byte,
+        ctx.type_string.as_deref(),
+    )
+    .map_err(|e| anyhow!("opening filesystem: {e}"))?;
 
     // Default case rule: insensitive on classic case-insensitive
     // filesystems, sensitive elsewhere. Phase B is conservative and

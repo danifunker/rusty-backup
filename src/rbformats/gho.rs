@@ -1344,6 +1344,9 @@ impl DataLen for GhoReader {
 /// and computed logical output offset; decompresses only the final
 /// block to learn its exact length so `logical_size` is correct down
 /// to the byte.
+///
+/// Reads in 256 KiB chunks to avoid per-block seek+read syscalls —
+/// highly-compressible data can produce millions of tiny blocks.
 fn index_sector_blocks<R: Read + Seek>(
     reader: &mut R,
     data_start: u64,
@@ -1353,11 +1356,27 @@ fn index_sector_blocks<R: Read + Seek>(
     let mut off = data_start;
     let mut output_offset: u64 = 0;
     let record_magic = GHO_RECORD_MAGIC.to_le_bytes();
+
+    const CHUNK: usize = 256 * 1024;
+    let mut buf = vec![0u8; CHUNK];
+    reader.seek(SeekFrom::Start(data_start))?;
+    let mut buf_file_off: u64 = data_start;
+    let mut buf_valid: usize = read_fully_or_eof(reader, &mut buf)?;
+
     while off + 2 <= data_end {
-        reader.seek(SeekFrom::Start(off))?;
-        let mut peek = [0u8; GHO_RECORD_HEADER_LEN];
-        let peek_n = read_fully_or_eof(reader, &mut peek)?;
-        if peek_n >= 8 && peek[4..8] == record_magic {
+        let pos = (off - buf_file_off) as usize;
+        if pos + GHO_RECORD_HEADER_LEN > buf_valid {
+            reader.seek(SeekFrom::Start(off))?;
+            buf_file_off = off;
+            buf_valid = read_fully_or_eof(reader, &mut buf)?;
+            if buf_valid < GHO_RECORD_HEADER_LEN {
+                break;
+            }
+            continue;
+        }
+
+        let peek = &buf[pos..pos + GHO_RECORD_HEADER_LEN];
+        if peek[4..8] == record_magic {
             break;
         }
         let stored_len = u16::from_le_bytes([peek[0], peek[1]]) as u64;
@@ -1365,7 +1384,6 @@ fn index_sector_blocks<R: Read + Seek>(
             break;
         }
         if off + stored_len > data_end {
-            // Truncated final chunk; stop cleanly.
             break;
         }
         blocks.push(GhoBlockEntry {
@@ -3189,21 +3207,13 @@ pub fn decode_data_blocks_to<R: Read + Seek, W: Write>(
 
 fn zlib_decode_block(block: &[u8], dst: &mut [u8]) -> Result<usize> {
     use flate2::read::ZlibDecoder;
-    // Like Fast-LZ, a leading byte of `1` signals "stored verbatim past
-    // the 4-byte prefix"; otherwise the body is a raw deflate stream
-    // (still with the 4-byte prefix per the corpus).
+    // Unlike Fast-LZ (which has a 4-byte prefix), zlib/High data blocks
+    // contain raw zlib directly — no prefix to skip.  Confirmed on both
+    // Ghost 7.5 and 11.5 corpora (all 0x0002 bodies start with 0x78).
     if block.is_empty() {
         return Ok(0);
     }
-    let payload = if block.len() >= 4 { &block[4..] } else { block };
-    if block[0] == 1 {
-        if payload.len() > dst.len() {
-            bail!("zlib uncompressed-escape exceeds decode buffer");
-        }
-        dst[..payload.len()].copy_from_slice(payload);
-        return Ok(payload.len());
-    }
-    let mut dec = ZlibDecoder::new(payload);
+    let mut dec = ZlibDecoder::new(block);
     let mut n = 0;
     loop {
         if n >= dst.len() {
