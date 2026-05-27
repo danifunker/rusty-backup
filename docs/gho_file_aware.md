@@ -230,6 +230,46 @@ SECTOR-mode path reports bytes through `CountingRead`.
   encrypted fixtures are file-aware mode, so neither problem unblocks
   the other.
 
+## Corpus context (added 2026-05-26)
+
+Everything under `~/new-fixtures/gho/ManualGhostBackups/` is **the same
+source disk**, backed up repeatedly with different Ghost versions
+(7.5 vs 11.5) and different operation modes (file-aware partition,
+SECTOR, full-disk, with/without password, fast/high compression). This
+makes the corpus a clean differential-comparison set.
+
+The most useful pairing for the next slice is:
+
+- `ManualGhostBackups/11.5/gh11-partitiononly/gh11part.GHO` — **single
+  partition, file-aware, Ghost 11.5.** Already handled by the
+  reconstructor (slice C).
+- `ManualGhostBackups/11.5/GH11/fulldisk.GHS` — **full disk, file-aware,
+  Ghost 11.5.** Same disk, same Ghost version, just full-disk mode.
+  Currently `partition_count = 0` because the inner stream presumably
+  starts with disk-level records (MBR / partition-map / per-partition
+  headers) before any `0x0017` boot sector.
+
+Because the two backups are the same source data, a byte-level diff of
+the inner record streams should expose the disk-level wrapper records
+exactly. Expected workflow:
+
+1. Run `gho_record_histogram` on both, diff the type-code distributions
+   — disk-level record types should appear only in `fulldisk.GHS`.
+2. Dump the first ~50 records of `fulldisk.GHS` with `gho_dump_records`
+   and look for an MBR-shaped (512-byte) record + a per-partition
+   marker that bookends each partition's record subsequence.
+3. Extend `parse_gho_image` to recognise the wrapper records and split
+   the inner stream into per-partition record runs.
+4. Extend `walk_file_aware_tree` / `emit_file_aware_fat_image_to_sink`
+   to iterate runs and emit one FAT image per partition (plus an MBR
+   sidecar). The GUI's reconstructed image would then need to be a
+   full disk (MBR + N partitions), not a single FAT volume.
+
+Other 0-partition fixtures (`HPVectra95C.gho`, `7.5/FULLDISK.GHO`,
+`fromdanilaptop.GHO`, `Win7_86xAMB.GHO`, `XP_SP2FU.GHO`) are
+independent disks and useful as cross-version sanity checks once the
+disk-level layout is decoded.
+
 ## Open questions (still)
 
 1. **The implicit-pop ambiguity for FILE parent attribution.** Could
