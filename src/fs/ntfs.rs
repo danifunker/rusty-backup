@@ -745,7 +745,6 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
         entries: &mut Vec<FileEntry>,
     ) -> Result<(), FilesystemError> {
         let data = self.read_attribute_data(attr, None)?;
-
         // Index allocation is a sequence of INDX records
         let record_size = 4096; // Standard NTFS index record size
         let mut pos = 0;
@@ -761,7 +760,10 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
 
             // Apply fixup to a copy
             let mut record_copy = record.to_vec();
-            let _ = apply_fixup(&mut record_copy, self.bytes_per_sector);
+            if apply_fixup(&mut record_copy, self.bytes_per_sector).is_err() {
+                pos += record_size;
+                continue;
+            }
 
             // Index node header is at offset 0x18 in INDX record
             let node_offset = 0x18;

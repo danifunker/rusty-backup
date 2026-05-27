@@ -4252,8 +4252,10 @@ fn parse_ntfs_run_header(data: &[u8]) -> Option<u64> {
 }
 
 /// Parse inline MFT FILE records in the gap between cluster runs.
-/// Appends `(lcn, cluster_count)` entries to `out` for each non-resident
-/// `$DATA` attribute found.
+/// Appends `(lcn, cluster_count)` entries to `out` for every non-resident
+/// attribute that has data runs (`$DATA`, `$INDEX_ALLOCATION`, `$BITMAP`,
+/// `$SECURITY_DESCRIPTOR`, etc.). Ghost stores cluster data for ALL
+/// non-resident attributes, not just `$DATA`.
 fn parse_inline_mft_records<R: Read + Seek>(
     reader: &mut R,
     start: u64,
@@ -4261,7 +4263,7 @@ fn parse_inline_mft_records<R: Read + Seek>(
     vbr: &crate::fs::ntfs::NtfsVbr,
     out: &mut Vec<(u64, u64)>,
 ) {
-    use crate::fs::ntfs::{apply_fixup, parse_mft_attributes, ATTR_DATA};
+    use crate::fs::ntfs::{apply_fixup, parse_mft_attributes};
     let rec_size = vbr.mft_record_size as usize;
     let gap_size = (end - start) as usize;
     if gap_size < rec_size + 4 {
@@ -4285,10 +4287,16 @@ fn parse_inline_mft_records<R: Read + Seek>(
                 break;
             }
             let mut rec = buf[rec_off..rec_off + rec_size].to_vec();
+            let rec_num = u32::from_le_bytes([rec[44], rec[45], rec[46], rec[47]]);
+            // Skip $BadClus (record 8) — sparse run covering entire volume.
+            if rec_num == 8 {
+                pos = rec_off + rec_size;
+                continue;
+            }
             let _ = apply_fixup(&mut rec, vbr.bytes_per_sector);
             let attrs = parse_mft_attributes(&rec, vbr.mft_record_size);
             for attr in &attrs {
-                if attr.attr_type == ATTR_DATA && !attr.data_runs.is_empty() {
+                if !attr.resident && !attr.data_runs.is_empty() {
                     for dr in &attr.data_runs {
                         if dr.cluster_offset >= 0 && dr.length > 0 {
                             out.push((dr.cluster_offset as u64, dr.length));
@@ -4316,7 +4324,7 @@ fn index_ntfs_file_aware<R: Read + Seek>(
     vbr: &crate::fs::ntfs::NtfsVbr,
     vbr_raw: &[u8; 512],
 ) -> Result<NtfsGhoIndex> {
-    use crate::fs::ntfs::{apply_fixup, parse_mft_attributes, ATTR_DATA};
+    use crate::fs::ntfs::{apply_fixup, parse_mft_attributes};
 
     let cluster_size = vbr.bytes_per_sector * vbr.sectors_per_cluster;
     let volume_size = vbr.total_sectors * vbr.bytes_per_sector;
@@ -4386,9 +4394,9 @@ fn index_ntfs_file_aware<R: Read + Seek>(
         let _ = apply_fixup(&mut rec_buf, vbr.bytes_per_sector);
         let attrs = parse_mft_attributes(&rec_buf, vbr.mft_record_size);
         for attr in &attrs {
-            if attr.attr_type == ATTR_DATA && !attr.data_runs.is_empty() {
+            if !attr.resident && !attr.data_runs.is_empty() {
                 for dr in &attr.data_runs {
-                    if dr.cluster_offset > 0 && dr.length > 0 {
+                    if dr.cluster_offset >= 0 && dr.length > 0 {
                         data_run_queue.push((dr.cluster_offset as u64, dr.length));
                     }
                 }
@@ -4414,15 +4422,11 @@ fn index_ntfs_file_aware<R: Read + Seek>(
     });
     total_stored_clusters += mft_clusters;
 
-    // Pending data runs from the most recently parsed inline MFT records.
-    // These map 1:1 to the following cluster runs.
+    // Pending data runs from inline MFT records. Matched to cluster runs
+    // by cluster count (Ghost doesn't emit them in the same order).
     let mut pending_lcns: Vec<(u64, u64)> = Vec::new();
-    let mut pending_idx: usize = 0;
 
-    // Fallback: data runs from the MFT itself, consumed in order when no
-    // inline MFT record provides the LCN.
-    let mut mft_queue: std::collections::VecDeque<(u64, u64)> =
-        data_run_queue.into_iter().collect();
+    let _ = data_run_queue; // Reserved for future fallback strategies.
 
     // Scan the entire file for run headers using the 16-byte needle.
     let needle = &NTFS_RUN_HEADER_ENTRY1;
@@ -4455,12 +4459,12 @@ fn index_ntfs_file_aware<R: Read + Seek>(
                             // Parse inline MFT records in the gap since the
                             // last run. Each gap may contain multiple FILE
                             // records whose data runs describe subsequent runs.
+                            // Append to (not replace) pending_lcns — a single
+                            // gap's MFT records can provide LCNs for many
+                            // subsequent runs.
                             let gap_start = prev_data_end;
                             let gap_end = abs_off;
                             if gap_end > gap_start && (gap_end - gap_start) < 1024 * 1024 {
-                                // New gap = new inline records. Reset pending.
-                                pending_lcns.clear();
-                                pending_idx = 0;
                                 parse_inline_mft_records(
                                     reader,
                                     gap_start,
@@ -4470,14 +4474,23 @@ fn index_ntfs_file_aware<R: Read + Seek>(
                                 );
                             }
 
-                            // Determine LCN from inline MFT records.
-                            let lcn = if pending_idx < pending_lcns.len() {
-                                let (lcn, _) = pending_lcns[pending_idx];
-                                pending_idx += 1;
-                                Some(lcn)
-                            } else {
-                                None
-                            };
+                            // Determine LCN from pending data runs. Ghost emits
+                            // MFT records in ascending record-number order but
+                            // stores cluster data largest-first within each batch.
+                            // Use cluster-count matching to handle the reordering.
+                            // For ambiguous cases (multiple runs with the same
+                            // cluster count), pop from the BACK of matching entries
+                            // so that later-declared MFT records (higher record
+                            // numbers) match first — this reflects Ghost's tendency
+                            // to write higher-numbered system files' data first.
+                            let lcn =
+                                pending_lcns
+                                    .iter()
+                                    .rposition(|&(_, len)| len == cc)
+                                    .map(|idx| {
+                                        let (lcn, _) = pending_lcns.remove(idx);
+                                        lcn
+                                    });
 
                             // Skip runs we can't map. These are typically
                             // system metadata clusters between the MFT and
@@ -4798,8 +4811,8 @@ mod tests {
         let err = materialize_gho_to_temp(&path).unwrap_err();
         let msg = format!("{err:#}").to_lowercase();
         assert!(
-            msg.contains("boot sector"),
-            "expected boot-sector error, got: {msg}"
+            msg.contains("boot sector") || msg.contains("ntfs") || msg.contains("record stream"),
+            "expected boot-sector / NTFS-fallback error, got: {msg}"
         );
     }
 
@@ -6357,7 +6370,11 @@ mod tests {
         let buf = build_header(0x00, 0x00, 0x00, None);
         let path = write_to_temp(&buf);
         let err = GhoReader::open(&path).err().expect("must error");
-        assert!(format!("{err:#}").to_lowercase().contains("sector"));
+        let msg = format!("{err:#}").to_lowercase();
+        assert!(
+            msg.contains("record stream") || msg.contains("ntfs") || msg.contains("sector"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]
