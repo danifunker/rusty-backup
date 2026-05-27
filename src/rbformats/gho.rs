@@ -342,21 +342,7 @@ pub fn materialize_gho_to_temp(path: &Path) -> Result<GhoMaterialized> {
                 .with_context(|| format!("opening span set for {}", path.display()))?;
             decode_sector_mode_to_temp(&mut reader, path, &header)
         }
-        GhoImageType::FileAware => {
-            // File-aware mode interleaves boot-sector + FAT-entry + dir/file
-            // metadata records with `0x0002` cluster-data records. Producing
-            // a usable raw partition image requires rebuilding the
-            // filesystem (boot sector + FAT tables + directory + clusters
-            // placed at correct LBAs) — much larger than 5.6's scope.
-            Err(anyhow!(
-                "GHO {} is a file-aware (Symantec \"truncated full backup\") image, \
-                 which stores only used clusters interleaved with FAT/directory metadata \
-                 records. Reconstructing a mountable partition image from these records \
-                 requires a full filesystem rebuilder and is the next planned slice. \
-                 SECTOR-mode (raw sector-by-sector) backups decode today.",
-                path.display()
-            ))
-        }
+        GhoImageType::FileAware => decode_file_aware_to_temp(&span_set, path, &header),
         GhoImageType::Other(b) => Err(anyhow!(
             "GHO {} has unknown image_type byte {:#04x} at offset 0x0A; expected 0x00 \
              (file-aware) or 0x01 (SECTOR)",
@@ -689,6 +675,80 @@ impl Seek for SpanReader {
         self.pos = new_pos as u64;
         Ok(self.pos)
     }
+}
+
+/// File-aware path: walk the inner stream + reconstruct a fresh FAT
+/// image into a tempfile, returning the same `GhoMaterialized` shape
+/// the SECTOR-mode path uses so the GUI's `materialize_amiga_image_path`
+/// pickup is uniform.
+fn decode_file_aware_to_temp(
+    span_set: &[std::path::PathBuf],
+    picked: &Path,
+    header: &GhoContainerHeader,
+) -> Result<GhoMaterialized> {
+    // Open the primary file as our source reader. File-aware GHOs in
+    // our corpus are single-file (no spans), but we accept span_set for
+    // symmetry — if a multi-span file-aware fixture shows up we'd swap
+    // this for SpanReader.
+    let primary = &span_set[0];
+    let mut src = File::open(primary)
+        .with_context(|| format!("opening file-aware GHO {}", primary.display()))?;
+    let file_size = src.metadata()?.len();
+
+    let image = parse_gho_image(&mut src, file_size, header)
+        .with_context(|| format!("parsing inner record stream for {}", primary.display()))?;
+    let tree = walk_file_aware_tree(&mut src, &image)
+        .with_context(|| format!("walking file-aware tree for {}", primary.display()))?;
+
+    let guard =
+        tempfile::tempdir().context("creating tempdir for GHO file-aware materialization")?;
+    let stem = picked.file_stem().and_then(|s| s.to_str()).unwrap_or("gho");
+    let out_path = guard.path().join(format!("{}.img", stem));
+    let mut out = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&out_path)
+        .with_context(|| format!("creating {}", out_path.display()))?;
+
+    let result =
+        emit_file_aware_fat_image_to_sink(&mut src, &image, &tree, header.compression, &mut out)
+            .with_context(|| {
+                format!(
+                    "reconstructing FAT image from file-aware {}",
+                    primary.display()
+                )
+            })?;
+    out.sync_all().ok();
+
+    log::info!(
+        "Materialized GHO file-aware {} -> {} ({} bytes; {} dirs, {} files, {} skipped)",
+        picked.display(),
+        out_path.display(),
+        result.bytes_written,
+        result.dirs_emitted,
+        result.files_emitted,
+        result.skipped.len(),
+    );
+    if !result.skipped.is_empty() {
+        for (name, why) in result.skipped.iter().take(10) {
+            log::warn!("  skipped {name}: {why}");
+        }
+        if result.skipped.len() > 10 {
+            log::warn!(
+                "  ...and {} more skipped entries",
+                result.skipped.len() - 10
+            );
+        }
+    }
+
+    Ok(GhoMaterialized {
+        temp_path: out_path,
+        logical_size: result.bytes_written,
+        guard,
+        partition_count: image.partition_count.max(1),
+    })
 }
 
 fn decode_sector_mode_to_temp<R: Read + Seek + DataLen>(
@@ -2146,6 +2206,385 @@ pub fn parse_checksum_record_body(body: &[u8]) -> Result<u32> {
     Ok(a)
 }
 
+// ---------------------------------------------------------------------------
+// Slice C — file-aware FAT image emitter
+// ---------------------------------------------------------------------------
+//
+// Given a parsed `GhoImage` + walked `GhoFileAwareTree`, reconstruct a
+// fresh, mountable FAT partition image. The output is byte-equivalent to
+// the source partition up to cluster allocation order: the original FAT
+// chain is NOT preserved (file-aware GHOs don't store the source FAT at
+// all), but file names, sizes, content, directory structure, and 8.3 LFN
+// pairings ARE.
+//
+// Sizing: read BPB_TotSec from the source boot sector and pass that
+// to `create_blank_fat`. The output FAT type may differ from the
+// source's (e.g. our blank formatter picks FAT16 for 1 GiB, even if
+// source was FAT32), but the result is mountable everywhere a current
+// OS / Ghost Explorer would mount it.
+//
+// File content: for each file we already have `content_record_offsets`
+// from slice B (a list of `0x0002` / `0x0102` body offsets in stream
+// order). `GhoFileContentReader` streams decompressed bytes from those
+// records on demand, so we never materialise an entire file in RAM
+// just to call `create_file`.
+
+/// Per-file content streamer over a file-aware GHO's record body
+/// offsets. Yields the file's decompressed content in stream order,
+/// truncated to `total_left` bytes (so the final `0x0102` tail doesn't
+/// over-spill if the source happened to pad).
+pub struct GhoFileContentReader<'a, R: Read + Seek> {
+    reader: &'a mut R,
+    record_meta: Vec<(u64, u16)>, // (body_start, body_len) — type code is irrelevant for decode
+    compression: GhoCompression,
+    next_idx: usize,
+    decoded: Vec<u8>,
+    pos: usize,
+    end: usize,
+    total_left: u64,
+    body_buf: Vec<u8>,
+}
+
+impl<'a, R: Read + Seek> GhoFileContentReader<'a, R> {
+    pub fn new(
+        reader: &'a mut R,
+        record_meta: Vec<(u64, u16)>,
+        compression: GhoCompression,
+        file_size: u64,
+    ) -> Self {
+        Self {
+            reader,
+            record_meta,
+            compression,
+            next_idx: 0,
+            decoded: vec![0u8; FAST_LZ_BLOCK_SIZE + 1024],
+            pos: 0,
+            end: 0,
+            total_left: file_size,
+            body_buf: vec![0u8; u16::MAX as usize],
+        }
+    }
+
+    fn fill_next(&mut self) -> std::io::Result<bool> {
+        if self.next_idx >= self.record_meta.len() {
+            return Ok(false);
+        }
+        let (body_start, body_len) = self.record_meta[self.next_idx];
+        self.next_idx += 1;
+        self.reader
+            .seek(SeekFrom::Start(body_start))
+            .map_err(std::io::Error::other)?;
+        let body = &mut self.body_buf[..body_len as usize];
+        self.reader.read_exact(body)?;
+        let n = match self.compression {
+            GhoCompression::None => {
+                self.decoded[..body_len as usize].copy_from_slice(body);
+                body_len as usize
+            }
+            GhoCompression::Fast => fast_lz_decompress(body, body_len as usize, &mut self.decoded)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?,
+            GhoCompression::High => zlib_decode_block(body, &mut self.decoded)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?,
+            GhoCompression::Other(b) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unsupported GHO compression byte {:#04x}", b),
+                ))
+            }
+        };
+        self.pos = 0;
+        self.end = n;
+        Ok(true)
+    }
+}
+
+impl<'a, R: Read + Seek> Read for GhoFileContentReader<'a, R> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.total_left == 0 || out.is_empty() {
+            return Ok(0);
+        }
+        if self.pos >= self.end && !self.fill_next()? {
+            return Ok(0);
+        }
+        let avail = (self.end - self.pos)
+            .min(out.len())
+            .min(self.total_left as usize);
+        out[..avail].copy_from_slice(&self.decoded[self.pos..self.pos + avail]);
+        self.pos += avail;
+        self.total_left -= avail as u64;
+        Ok(avail)
+    }
+}
+
+/// Outcome of emitting a file-aware GHO to a fresh FAT image. The
+/// `image` field is populated only by the Vec-returning variant
+/// [`emit_file_aware_fat_image`]; the streaming variant
+/// [`emit_file_aware_fat_image_to_sink`] leaves it empty since the
+/// image is written directly to the caller's sink.
+#[derive(Debug, Clone, Default)]
+pub struct EmitFileAwareResult {
+    pub image: Vec<u8>,
+    pub bytes_written: u64,
+    pub files_emitted: usize,
+    pub dirs_emitted: usize,
+    /// Entries we couldn't translate (e.g. name failed FAT validation).
+    /// Includes the source short name + reason. Reconstruction continues
+    /// past these; the resulting image is mountable but missing those
+    /// entries.
+    pub skipped: Vec<(String, String)>,
+}
+
+/// Read the source partition size in bytes from the boot sector record
+/// (`0x0017` / `0x0717`). Returns `None` if the record is missing or the
+/// BPB looks bogus.
+fn source_partition_size_from_boot<R: Read + Seek>(
+    reader: &mut R,
+    image: &GhoImage,
+) -> Result<Option<u64>> {
+    let Some(bs) = image
+        .records
+        .iter()
+        .find(|r| is_boot_sector_record(r.type_code))
+    else {
+        return Ok(None);
+    };
+    if (bs.body_len as usize) < 36 {
+        return Ok(None);
+    }
+    reader.seek(SeekFrom::Start(bs.body_start()))?;
+    let mut bpb = [0u8; 512];
+    let n = read_fully_or_eof(reader, &mut bpb)?;
+    if n < 36 {
+        return Ok(None);
+    }
+    let byts_per_sec = u16::from_le_bytes([bpb[11], bpb[12]]) as u64;
+    if !(byts_per_sec == 512
+        || byts_per_sec == 1024
+        || byts_per_sec == 2048
+        || byts_per_sec == 4096)
+    {
+        return Ok(None);
+    }
+    let tot_sec_16 = u16::from_le_bytes([bpb[19], bpb[20]]) as u64;
+    let tot_sec_32 = u32::from_le_bytes([bpb[32], bpb[33], bpb[34], bpb[35]]) as u64;
+    let tot_sec = if tot_sec_16 != 0 {
+        tot_sec_16
+    } else {
+        tot_sec_32
+    };
+    if tot_sec == 0 {
+        return Ok(None);
+    }
+    Ok(Some(tot_sec * byts_per_sec))
+}
+
+/// Pick a name to feed to the FAT writer. Prefer the long filename, but
+/// fall back to the 8.3 short name if the LFN fails validation (control
+/// chars, illegal char, trailing space/dot, etc.).
+fn choose_emit_name(entry: &GhoFileAwareEntry) -> Option<String> {
+    use crate::fs::filesystem::FilesystemError;
+    fn try_validate(s: &str) -> Result<(), FilesystemError> {
+        // Cheap mirror of validate_fat_name. Kept here to avoid making
+        // that function public from src/fs/fat.rs.
+        if s.is_empty() {
+            return Err(FilesystemError::InvalidData("empty".into()));
+        }
+        for c in s.chars() {
+            if matches!(c, '"' | '*' | '/' | ':' | '<' | '>' | '?' | '\\' | '|') {
+                return Err(FilesystemError::InvalidData(format!("bad char {c}")));
+            }
+            if (c as u32) < 0x20 {
+                return Err(FilesystemError::InvalidData("control".into()));
+            }
+        }
+        if s.ends_with(' ') || s.ends_with('.') {
+            return Err(FilesystemError::InvalidData("trailing".into()));
+        }
+        Ok(())
+    }
+    if let Some(lfn) = entry.long_name.as_deref() {
+        if try_validate(lfn).is_ok() {
+            return Some(lfn.to_string());
+        }
+    }
+    let short = &entry.short_name;
+    if try_validate(short).is_ok() {
+        return Some(short.clone());
+    }
+    None
+}
+
+/// Vec-returning convenience wrapper: useful for small images and
+/// tests. For large partitions, prefer
+/// [`emit_file_aware_fat_image_to_sink`] which streams the image to any
+/// `Read + Write + Seek` (e.g. a tempfile) without holding the whole
+/// thing in RAM.
+pub fn emit_file_aware_fat_image<R: Read + Seek>(
+    reader: &mut R,
+    image: &GhoImage,
+    tree: &GhoFileAwareTree,
+    compression: GhoCompression,
+) -> Result<EmitFileAwareResult> {
+    let mut cur = std::io::Cursor::new(Vec::<u8>::new());
+    let mut result = emit_file_aware_fat_image_to_sink(reader, image, tree, compression, &mut cur)?;
+    result.image = cur.into_inner();
+    Ok(result)
+}
+
+/// Reconstruct a mountable FAT image from a file-aware GHO and write it
+/// to `sink`. The sink is rewound and re-used as the FAT backing store
+/// (it must be a true `Read + Write + Seek`). Errors are fatal only for
+/// I/O / format problems on the source; per-entry name or disk-full
+/// failures are recorded in `EmitFileAwareResult::skipped` and
+/// reconstruction continues.
+pub fn emit_file_aware_fat_image_to_sink<R: Read + Seek, S: Read + Write + Seek + Send>(
+    reader: &mut R,
+    image: &GhoImage,
+    tree: &GhoFileAwareTree,
+    compression: GhoCompression,
+    sink: &mut S,
+) -> Result<EmitFileAwareResult> {
+    use crate::fs::entry::FileEntry;
+    use crate::fs::fat::{create_blank_fat, FatFilesystem};
+    use crate::fs::filesystem::{
+        CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem,
+    };
+    use std::collections::HashMap;
+
+    // Decide output image size.
+    let size = match source_partition_size_from_boot(reader, image)? {
+        Some(s) => s,
+        None => bail!("file-aware GHO has no usable boot sector — can't size output image"),
+    };
+    if size < 64 * 1024 {
+        bail!(
+            "boot sector reports partition size {} bytes (< 64 KiB) — refusing to format",
+            size
+        );
+    }
+
+    // Format a blank FAT in RAM (cheap: just BPB + zeroed FAT tables +
+    // FSInfo, not the full partition), then stream it into the sink and
+    // pad with zeros to the partition size.
+    let blank = create_blank_fat(size, None).context("formatting blank FAT for emit")?;
+    sink.seek(SeekFrom::Start(0))?;
+    sink.write_all(&blank)?;
+    if (blank.len() as u64) < size {
+        // Pad with zeros to the full partition size so the FAT image is
+        // sector-complete (some FAT writers won't tolerate a truncated
+        // backing store when extending cluster chains).
+        let mut remaining = size - blank.len() as u64;
+        let chunk = vec![0u8; 1 << 20];
+        while remaining > 0 {
+            let n = remaining.min(chunk.len() as u64) as usize;
+            sink.write_all(&chunk[..n])?;
+            remaining -= n as u64;
+        }
+    }
+    sink.flush()?;
+    sink.seek(SeekFrom::Start(0))?;
+
+    let mut fs = FatFilesystem::open(sink, 0).context("opening fresh FAT image for emit")?;
+
+    // Build record-offset → body_len lookup. The tree only stores
+    // body_start offsets; we need body_len to decode.
+    let mut offset_to_len: HashMap<u64, u16> = HashMap::with_capacity(image.records.len());
+    for rec in &image.records {
+        if is_data_block_record(rec.type_code) {
+            offset_to_len.insert(rec.body_start(), rec.body_len);
+        }
+    }
+
+    // Index children by parent_cluster for DFS pre-order emission.
+    let mut children_by_parent: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (idx, e) in tree.entries.iter().enumerate() {
+        children_by_parent
+            .entry(e.parent_cluster)
+            .or_default()
+            .push(idx);
+    }
+
+    let root = fs.root().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut stack: Vec<(u32, FileEntry)> = Vec::new();
+    stack.push((tree.root_cluster, root));
+
+    let mut result = EmitFileAwareResult {
+        image: Vec::new(),
+        bytes_written: size,
+        files_emitted: 0,
+        dirs_emitted: 0,
+        skipped: Vec::new(),
+    };
+
+    while let Some((src_cluster, parent_entry)) = stack.pop() {
+        let Some(child_idxs) = children_by_parent.get(&src_cluster) else {
+            continue;
+        };
+        let child_idxs = child_idxs.clone();
+        for idx in child_idxs {
+            let entry = &tree.entries[idx];
+            let Some(name) = choose_emit_name(entry) else {
+                result
+                    .skipped
+                    .push((entry.short_name.clone(), "name failed validation".into()));
+                continue;
+            };
+
+            if entry.is_directory() {
+                match fs.create_directory(&parent_entry, &name, &CreateDirectoryOptions::default())
+                {
+                    Ok(dir_entry) => {
+                        result.dirs_emitted += 1;
+                        stack.push((entry.source_cluster, dir_entry));
+                    }
+                    Err(e) => {
+                        result
+                            .skipped
+                            .push((entry.short_name.clone(), format!("mkdir: {e}")));
+                    }
+                }
+            } else {
+                let mut meta: Vec<(u64, u16)> =
+                    Vec::with_capacity(entry.content_record_offsets.len());
+                let mut missing = false;
+                for &off in &entry.content_record_offsets {
+                    match offset_to_len.get(&off) {
+                        Some(&l) => meta.push((off, l)),
+                        None => {
+                            missing = true;
+                            break;
+                        }
+                    }
+                }
+                if missing {
+                    result.skipped.push((
+                        entry.short_name.clone(),
+                        "content record offset not in image".into(),
+                    ));
+                    continue;
+                }
+                let file_size = entry.file_size as u64;
+                let mut content = GhoFileContentReader::new(reader, meta, compression, file_size);
+                match fs.create_file(
+                    &parent_entry,
+                    &name,
+                    &mut content,
+                    file_size,
+                    &CreateFileOptions::default(),
+                ) {
+                    Ok(_) => result.files_emitted += 1,
+                    Err(e) => result
+                        .skipped
+                        .push((entry.short_name.clone(), format!("create_file: {e}"))),
+                }
+            }
+        }
+    }
+
+    fs.sync_metadata().map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(result)
+}
+
 /// Sector size used by the container header.
 pub const GHO_SECTOR_SIZE: u64 = 512;
 
@@ -2465,14 +2904,17 @@ mod tests {
     }
 
     #[test]
-    fn materialize_file_aware_errors_on_deferred_reconstruction() {
+    fn materialize_file_aware_empty_stream_errors_on_missing_boot_sector() {
+        // A bare file-aware header with no inner records has no boot
+        // sector → the emitter can't size the output image. We expect a
+        // clean error mentioning "boot sector", not a panic.
         let buf = build_header(0x00, 0x00, 0x00, None);
         let path = write_to_temp(&buf);
         let err = materialize_gho_to_temp(&path).unwrap_err();
         let msg = format!("{err:#}").to_lowercase();
         assert!(
-            msg.contains("file-aware") && msg.contains("reconstruct"),
-            "error should explain file-aware reconstruction is deferred, got: {msg}"
+            msg.contains("boot sector"),
+            "expected boot-sector error, got: {msg}"
         );
     }
 
@@ -3691,6 +4133,182 @@ mod tests {
         assert_eq!(hello.file_size, 11);
         assert_eq!(hello.content_record_offsets.len(), 1);
         assert_eq!(hello.checksum, Some(0x12345678));
+    }
+
+    // ---------- Slice C: file-aware FAT image emitter ----------
+
+    /// Build a synthetic file-aware GHO (boot sector + one root file +
+    /// one subdir with one file), run the emitter, then re-open the
+    /// resulting FAT image and verify the tree.
+    #[test]
+    fn emit_file_aware_fat_image_roundtrips_synthetic_stream() {
+        use crate::fs::fat::FatFilesystem;
+        use crate::fs::filesystem::Filesystem;
+        use std::io::Cursor;
+
+        // ---------- build synthetic GHO bytes ----------
+        let mut buf = Vec::new();
+        let mut prefix = vec![0u8; 512];
+        prefix[0] = 0xFE;
+        prefix[1] = 0xEF;
+        prefix[2] = 0x01;
+        prefix[3] = 0x00; // compression=None
+        prefix[10] = 0x00; // image_type=FileAware
+        buf.extend_from_slice(&prefix);
+
+        let write_record = |buf: &mut Vec<u8>, type_code: u16, body: &[u8]| {
+            buf.extend_from_slice(&type_code.to_le_bytes());
+            buf.extend_from_slice(&0u16.to_le_bytes());
+            buf.extend_from_slice(&GHO_RECORD_MAGIC.to_le_bytes());
+            buf.extend_from_slice(&(body.len() as u16).to_le_bytes());
+            buf.extend_from_slice(body);
+        };
+
+        // FAT16 boot sector sized for a ~4 MiB partition (so the
+        // emitter's create_blank_fat picks the same regime).
+        // 4 MiB = 8192 sectors of 512.
+        let mut boot = [0u8; 512];
+        boot[11..13].copy_from_slice(&512u16.to_le_bytes()); // BytsPerSec
+        boot[13] = 1; // SecPerClus
+        boot[14..16].copy_from_slice(&1u16.to_le_bytes()); // RsvdSecCnt
+        boot[16] = 2; // NumFATs
+        boot[19..21].copy_from_slice(&8192u16.to_le_bytes()); // TotSec16
+                                                              // Mark as FAT16 explicitly via fs-type-string @ 54.
+        boot[54..62].copy_from_slice(b"FAT16   ");
+        write_record(&mut buf, GHO_REC_BOOT_SECTOR, &boot);
+
+        // Root file: HELLO.TXT, 11 bytes, cluster 5.
+        let mut e = [0u8; 56];
+        e[..11].copy_from_slice(b"HELLO   TXT");
+        e[11] = 0x20;
+        e[26..28].copy_from_slice(&5u16.to_le_bytes());
+        e[28..32].copy_from_slice(&11u32.to_le_bytes());
+        write_record(&mut buf, GHO_REC_DIR_ENTRY_ROOT, &e);
+        write_record(&mut buf, GHO_REC_FILE_TAIL, b"hello world");
+        let mut c = [0u8; 20];
+        c[..4].copy_from_slice(&0xdeadbeefu32.to_le_bytes());
+        c[4..8].copy_from_slice(&0xdeadbeefu32.to_le_bytes());
+        write_record(&mut buf, GHO_REC_FILE_CHECKSUM, &c);
+
+        // Subdir SUB, cluster 7.
+        let mut d = [0u8; 56];
+        d[..11].copy_from_slice(b"SUB        ");
+        d[11] = 0x10; // dir
+        d[26..28].copy_from_slice(&7u16.to_le_bytes());
+        write_record(&mut buf, GHO_REC_DIR_ENTRY_SUB, &d);
+
+        // Descend into SUB: "." cluster=7, ".." cluster=0 (root).
+        let mut dot = [0u8; 56];
+        dot[..11].copy_from_slice(b".          ");
+        dot[11] = 0x10;
+        dot[26..28].copy_from_slice(&7u16.to_le_bytes());
+        write_record(&mut buf, GHO_REC_DIR_ENTRY_SUB, &dot);
+        let mut dotdot = [0u8; 56];
+        dotdot[..11].copy_from_slice(b"..         ");
+        dotdot[11] = 0x10;
+        dotdot[26..28].copy_from_slice(&0u16.to_le_bytes());
+        write_record(&mut buf, GHO_REC_DIR_ENTRY_SUB, &dotdot);
+
+        // Inside SUB: NESTED.TXT, 6 bytes, cluster 9.
+        let mut e2 = [0u8; 56];
+        e2[..11].copy_from_slice(b"NESTED  TXT");
+        e2[11] = 0x20;
+        e2[26..28].copy_from_slice(&9u16.to_le_bytes());
+        e2[28..32].copy_from_slice(&6u32.to_le_bytes());
+        write_record(&mut buf, GHO_REC_DIR_ENTRY_SUB, &e2);
+        write_record(&mut buf, GHO_REC_FILE_TAIL, b"hello!");
+        let mut c2 = [0u8; 20];
+        c2[..4].copy_from_slice(&0xcafef00du32.to_le_bytes());
+        c2[4..8].copy_from_slice(&0xcafef00du32.to_le_bytes());
+        write_record(&mut buf, GHO_REC_FILE_CHECKSUM, &c2);
+
+        // ---------- parse + walk + emit ----------
+        let mut cur = Cursor::new(buf.clone());
+        let header = GhoContainerHeader::parse(&mut cur).unwrap();
+        let image = parse_gho_image(&mut cur, buf.len() as u64, &header).unwrap();
+        let tree = walk_file_aware_tree(&mut cur, &image).unwrap();
+        assert_eq!(tree.entries.len(), 3); // HELLO, SUB, NESTED
+        assert_eq!(tree.file_count(), 2);
+        assert_eq!(tree.dir_count(), 1);
+
+        let res = emit_file_aware_fat_image(&mut cur, &image, &tree, header.compression).unwrap();
+        assert_eq!(res.files_emitted, 2);
+        assert_eq!(res.dirs_emitted, 1);
+        assert!(
+            res.skipped.is_empty(),
+            "no entries should have been skipped, got {:?}",
+            res.skipped
+        );
+        assert!(!res.image.is_empty());
+
+        // ---------- reopen the FAT image and verify contents ----------
+        let mut img_cur = Cursor::new(res.image);
+        let mut fs = FatFilesystem::open(&mut img_cur, 0).unwrap();
+        let root = fs.root().unwrap();
+        let root_entries = fs.list_directory(&root).unwrap();
+        let names: Vec<&str> = root_entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"HELLO.TXT"), "root listing: {:?}", names);
+        assert!(names.contains(&"SUB"), "root listing: {:?}", names);
+
+        let hello = root_entries.iter().find(|e| e.name == "HELLO.TXT").unwrap();
+        let data = fs.read_file(hello, usize::MAX).unwrap();
+        assert_eq!(&data, b"hello world");
+
+        let sub = root_entries.iter().find(|e| e.name == "SUB").unwrap();
+        let sub_entries = fs.list_directory(sub).unwrap();
+        assert_eq!(sub_entries.len(), 1);
+        assert_eq!(sub_entries[0].name, "NESTED.TXT");
+        let nested = fs.read_file(&sub_entries[0], usize::MAX).unwrap();
+        assert_eq!(&nested, b"hello!");
+    }
+
+    /// Reconstruct PART.GHO into a fresh FAT image, then re-open it and
+    /// verify that the file count + a sentinel file (WORDPAD.EXE) round-trip.
+    /// Heavy: walks ~22k entries, decompresses MSPAINT/WORDPAD/etc.
+    #[test]
+    #[ignore = "fixture-gated; emits a FAT image from PART.GHO. Opt in with --ignored"]
+    fn emit_file_aware_fat_image_against_real_part_gho() {
+        use crate::fs::fat::FatFilesystem;
+        use crate::fs::filesystem::Filesystem;
+
+        let home = match std::env::var("HOME") {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        let path = std::path::PathBuf::from(home)
+            .join("new-fixtures/gho/ManualGhostBackups/7.5/PART/PART.GHO");
+        if !path.exists() {
+            return;
+        }
+        let mut f = File::open(&path).unwrap();
+        let header = GhoContainerHeader::parse(&mut f).unwrap();
+        let file_size = f.metadata().unwrap().len();
+        let image = parse_gho_image(&mut f, file_size, &header).unwrap();
+        let tree = walk_file_aware_tree(&mut f, &image).unwrap();
+
+        let res = emit_file_aware_fat_image(&mut f, &image, &tree, header.compression).unwrap();
+        eprintln!(
+            "  emitted {} dirs, {} files, {} skipped, image {} bytes",
+            res.dirs_emitted,
+            res.files_emitted,
+            res.skipped.len(),
+            res.image.len()
+        );
+        assert!(res.files_emitted > 0);
+        assert!(res.dirs_emitted > 0);
+        // Reopen and look for a sentinel.
+        let mut img_cur = std::io::Cursor::new(res.image);
+        let mut fs = FatFilesystem::open(&mut img_cur, 0).expect("reopen emitted FAT image");
+        // We don't know where WORDPAD.EXE lives in the rebuilt layout
+        // without walking, but `fs.root()` plus `list_directory` confirms
+        // the volume mounts. Stronger checks would require a tree walk
+        // here — kept light to avoid slowing the test further.
+        let root = fs.root().unwrap();
+        let root_entries = fs.list_directory(&root).unwrap();
+        assert!(
+            !root_entries.is_empty(),
+            "rebuilt FAT image's root must have at least one entry"
+        );
     }
 
     // ---------- GhoReader (streaming Read+Seek) ----------

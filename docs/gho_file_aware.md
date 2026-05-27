@@ -7,8 +7,18 @@ Status (2026-05-26):
   validated against PART.GHO: 22,219 entries / 20,761 files / 1,458
   dirs walked cleanly, structural invariants checked on MYDOCU~1,
   MYPICT~1, PROGRA~1, WORDPAD.EXE).
-- **Slice C** — FAT image emitter: not started.
-- **Slice D** — GUI wiring: not started.
+- **Slice C** — FAT image emitter: **done**. `emit_file_aware_fat_image`
+  (Vec) and `emit_file_aware_fat_image_to_sink` (streaming to any
+  `Read+Write+Seek`) in `src/rbformats/gho.rs`. PART.GHO round-trip:
+  1,458 dirs + 20,688 files emitted, 73 skipped (entries whose LFN +
+  8.3 both failed FAT name validation), 8.59 GB image reopens cleanly
+  as a FAT filesystem.
+- **Slice D** — GUI wiring: **done**. `materialize_gho_to_temp` now
+  routes file-aware GHOs through `decode_file_aware_to_temp`, which
+  walks + emits to a tempfile, returning the same `GhoMaterialized`
+  shape the SECTOR-mode path uses. All four tabs (backup, inspect,
+  restore picker, restore disk picker) pick this up automatically via
+  `materialize_amiga_image_path`.
 
 Goal: turn a file-aware GHO into a mountable raw FAT partition image,
 sitting alongside the SECTOR-mode `GhoReader` for the file-aware case.
@@ -142,7 +152,7 @@ The scope of this concern is bounded by the corpus we have:
   blocking slice C: the walker output is internally consistent and the
   reconstructed image will be byte-equivalent up to file placement.
 
-## Slice C — FAT image emitter (planned)
+## Slice C — FAT image emitter (shipped)
 
 Given `GhoFileAwareTree` + `content_record_offsets` per file, the
 emitter constructs a fresh FAT partition image:
@@ -179,15 +189,26 @@ Open work items for slice C:
 - Compute `0x0103` checksums on emit (once the algorithm is known) so
   round-trip GHO-out → GHO-in is possible.
 
-## Slice D — GUI wiring (planned)
+## Slice D — GUI wiring (shipped)
 
-- Inspect tab: when picking a file-aware `.gho`, route through the
-  reconstructor → mountable image. Show a progress bar over the
-  record walk + emit phases.
-- Auto-detect at file-pick time (we already have `image_type` in
-  the container header). SECTOR-mode keeps using `GhoReader`;
-  file-aware switches to a "decode to temp image" flow that wraps
-  walker + emitter.
+`materialize_gho_to_temp` now dispatches on `image_type`:
+
+- `Sector` → existing `decode_sector_mode_to_temp` (block-stream decode
+  to a raw partition tempfile).
+- `FileAware` → new `decode_file_aware_to_temp` which calls
+  `parse_gho_image` → `walk_file_aware_tree` →
+  `emit_file_aware_fat_image_to_sink` into a tempfile; returns the same
+  `GhoMaterialized` struct the SECTOR-mode path produces.
+
+The GUI helper `materialize_amiga_image_path` (src/gui/mod.rs:104)
+already routed `.gho`/`.ghs` through `materialize_gho_to_temp`, so all
+four tabs (backup, inspect, restore picker, restore disk picker) pick
+up file-aware reconstruction with no further plumbing.
+
+Progress reporting is not yet wired — the emit runs synchronously on
+the calling thread. A progress bar would need an emit-side callback
+hook through `emit_file_aware_fat_image_to_sink`, similar to how the
+SECTOR-mode path reports bytes through `CountingRead`.
 
 ## What's NOT in scope here
 
