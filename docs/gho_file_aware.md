@@ -193,26 +193,53 @@ Open work items for slice C:
 - Compute `0x0103` checksums on emit (once the algorithm is known) so
   round-trip GHO-out → GHO-in is possible.
 
-## Slice D — GUI wiring (shipped)
+## Slice D — unified `GhoReader` (shipped)
 
-`materialize_gho_to_temp` now dispatches on `image_type`:
+The reconstructor is exposed through the single `GhoReader::open(path)`
+entry point — the same shape SECTOR-mode already uses. `GhoReader`
+internally dispatches on `image_type`:
 
-- `Sector` → existing `decode_sector_mode_to_temp` (block-stream decode
-  to a raw partition tempfile).
-- `FileAware` → new `decode_file_aware_to_temp` which calls
-  `parse_gho_image` → `walk_file_aware_tree` →
-  `emit_file_aware_fat_image_to_sink` into a tempfile; returns the same
-  `GhoMaterialized` struct the SECTOR-mode path produces.
+- `Sector` + `compression = None` → `GhoReaderMode::Uncompressed`
+  (passes-through the raw block stream).
+- `Sector` + `compression in {Fast, High}` → `GhoReaderMode::Blocked`
+  (block-indexed, decompresses one 32 KiB block on demand with a
+  single-block cache).
+- `FileAware` → `GhoReaderMode::FileAware` (in-RAM virtual FAT
+  image; metadata sectors stored sparsely, data clusters resolved on
+  demand by decompressing the appropriate `0x0002`/`0x0102` records).
 
-The GUI helper `materialize_amiga_image_path` (src/gui/mod.rs:104)
-already routed `.gho`/`.ghs` through `materialize_gho_to_temp`, so all
-four tabs (backup, inspect, restore picker, restore disk picker) pick
-up file-aware reconstruction with no further plumbing.
+Peak RAM for an 8 GB FAT32 file-aware reconstruction is bounded by:
 
-Progress reporting is not yet wired — the emit runs synchronously on
-the calling thread. A progress bar would need an emit-side callback
-hook through `emit_file_aware_fat_image_to_sink`, similar to how the
-SECTOR-mode path reports bytes through `CountingRead`.
+- reserved sectors + 2 × FAT (≈ 16 MB for 8 GB)
+- allocated directory clusters (a few KB per directory)
+- per-file content-record index (≈ 16 bytes per data cluster)
+
+= **tens of MB**, vs. 8 GB for the old "decode to tempfile" path.
+
+The reader implements `Read + Seek + DataLen`; `source_reader::open_read`
+automatically picks it up for file-aware GHOs (previously errored out).
+The legacy `materialize_gho_to_temp` is still available as a back-compat
+shim — its file-aware branch now runs `GhoReader::open` + `std::io::copy`
+into a tempfile, so callers that need a real path still get one. Once
+the GUI tabs are refactored to take `Box<dyn Read + Seek>` instead of
+`PathBuf`, the tempfile shim disappears entirely.
+
+Supporting infrastructure:
+
+- `src/fs/fat.rs::compute_fat_blank_layout` + `write_blank_fat_metadata_to_sink`
+  — extracted from `create_blank_fat` so we can format a FAT volume's
+  metadata into a sparse sink without allocating the full image as a Vec.
+- `SparseSink` (in `gho.rs`) — sector-granular sparse `Read+Write+Seek`
+  backing store; unwritten sectors read as zero.
+- `ZeroReader` — fixed-size zero stream fed to `FatFilesystem::create_file`
+  so cluster allocation runs without us having to materialise real
+  content bytes.
+- `VirtualFatImage` — the result of the build: sparse metadata map +
+  per-cluster file lookup table + content-record metadata.
+
+Progress reporting still isn't wired through — the virtual image is
+built synchronously on `GhoReader::open`. Worth adding once it surfaces
+in the GUI.
 
 ## What's NOT in scope here
 

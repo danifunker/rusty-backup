@@ -342,7 +342,38 @@ pub fn materialize_gho_to_temp(path: &Path) -> Result<GhoMaterialized> {
                 .with_context(|| format!("opening span set for {}", path.display()))?;
             decode_sector_mode_to_temp(&mut reader, path, &header)
         }
-        GhoImageType::FileAware => decode_file_aware_to_temp(&span_set, path, &header),
+        GhoImageType::FileAware => {
+            // Stream through the unified GhoReader (which builds a
+            // virtual FAT image in RAM, no 8 GB tempfile) and copy
+            // its bytes into the materialize tempfile. The tempfile
+            // is now thin: it gets only what the caller actually
+            // reads, since std::io::copy drives the streaming reader.
+            let mut reader = GhoReader::open(path)
+                .with_context(|| format!("opening file-aware GHO {}", path.display()))?;
+            let logical = reader.logical_size();
+            let guard = tempfile::tempdir()
+                .context("creating tempdir for GHO file-aware materialization")?;
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("gho");
+            let out_path = guard.path().join(format!("{}.img", stem));
+            let mut out = File::create(&out_path)
+                .with_context(|| format!("creating {}", out_path.display()))?;
+            let bytes_written = std::io::copy(&mut reader, &mut out).with_context(|| {
+                format!("materializing file-aware {} via GhoReader", path.display())
+            })?;
+            out.sync_all().ok();
+            log::info!(
+                "Materialized GHO file-aware {} -> {} ({} bytes via streaming GhoReader)",
+                path.display(),
+                out_path.display(),
+                bytes_written
+            );
+            Ok(GhoMaterialized {
+                temp_path: out_path,
+                logical_size: logical,
+                guard,
+                partition_count: 1,
+            })
+        }
         GhoImageType::Other(b) => Err(anyhow!(
             "GHO {} has unknown image_type byte {:#04x} at offset 0x0A; expected 0x00 \
              (file-aware) or 0x01 (SECTOR)",
@@ -677,80 +708,6 @@ impl Seek for SpanReader {
     }
 }
 
-/// File-aware path: walk the inner stream + reconstruct a fresh FAT
-/// image into a tempfile, returning the same `GhoMaterialized` shape
-/// the SECTOR-mode path uses so the GUI's `materialize_amiga_image_path`
-/// pickup is uniform.
-fn decode_file_aware_to_temp(
-    span_set: &[std::path::PathBuf],
-    picked: &Path,
-    header: &GhoContainerHeader,
-) -> Result<GhoMaterialized> {
-    // Open the primary file as our source reader. File-aware GHOs in
-    // our corpus are single-file (no spans), but we accept span_set for
-    // symmetry — if a multi-span file-aware fixture shows up we'd swap
-    // this for SpanReader.
-    let primary = &span_set[0];
-    let mut src = File::open(primary)
-        .with_context(|| format!("opening file-aware GHO {}", primary.display()))?;
-    let file_size = src.metadata()?.len();
-
-    let image = parse_gho_image(&mut src, file_size, header)
-        .with_context(|| format!("parsing inner record stream for {}", primary.display()))?;
-    let tree = walk_file_aware_tree(&mut src, &image)
-        .with_context(|| format!("walking file-aware tree for {}", primary.display()))?;
-
-    let guard =
-        tempfile::tempdir().context("creating tempdir for GHO file-aware materialization")?;
-    let stem = picked.file_stem().and_then(|s| s.to_str()).unwrap_or("gho");
-    let out_path = guard.path().join(format!("{}.img", stem));
-    let mut out = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&out_path)
-        .with_context(|| format!("creating {}", out_path.display()))?;
-
-    let result =
-        emit_file_aware_fat_image_to_sink(&mut src, &image, &tree, header.compression, &mut out)
-            .with_context(|| {
-                format!(
-                    "reconstructing FAT image from file-aware {}",
-                    primary.display()
-                )
-            })?;
-    out.sync_all().ok();
-
-    log::info!(
-        "Materialized GHO file-aware {} -> {} ({} bytes; {} dirs, {} files, {} skipped)",
-        picked.display(),
-        out_path.display(),
-        result.bytes_written,
-        result.dirs_emitted,
-        result.files_emitted,
-        result.skipped.len(),
-    );
-    if !result.skipped.is_empty() {
-        for (name, why) in result.skipped.iter().take(10) {
-            log::warn!("  skipped {name}: {why}");
-        }
-        if result.skipped.len() > 10 {
-            log::warn!(
-                "  ...and {} more skipped entries",
-                result.skipped.len() - 10
-            );
-        }
-    }
-
-    Ok(GhoMaterialized {
-        temp_path: out_path,
-        logical_size: result.bytes_written,
-        guard,
-        partition_count: image.partition_count.max(1),
-    })
-}
-
 fn decode_sector_mode_to_temp<R: Read + Seek + DataLen>(
     reader: &mut R,
     path: &Path,
@@ -989,8 +946,10 @@ struct GhoBlockEntry {
 /// callers pass the primary `.gho` path and span discovery happens
 /// inside [`GhoReader::open`].
 ///
-/// **Scope: SECTOR mode only.** File-aware (`image_type=0x00`) and
-/// password-protected GHOs return an error from `open`.
+/// Handles both SECTOR-mode (streaming the raw block stream) and
+/// file-aware (in-memory virtual FAT image whose data clusters are
+/// resolved on demand by decompressing `0x0002`/`0x0102` records).
+/// Password-protected GHOs still return an error from `open`.
 pub struct GhoReader {
     inner: SpanReader,
     logical_size: u64,
@@ -1007,6 +966,14 @@ enum GhoReaderMode {
         blocks: Vec<GhoBlockEntry>,
         cache_block_index: Option<usize>,
         cache_buf: Vec<u8>,
+    },
+    FileAware {
+        image: VirtualFatImage,
+        compression: GhoCompression,
+        /// Single decoded cluster cache: `(cluster_id, decoded_bytes)`.
+        /// Many reads stay within one cluster so this avoids redundant
+        /// decompression of the same content record.
+        cluster_cache: Option<(u32, Vec<u8>)>,
     },
 }
 
@@ -1038,17 +1005,42 @@ impl GhoReader {
                 path.display()
             );
         }
+        let mut inner = SpanReader::open(&span_set)
+            .with_context(|| format!("opening span set for {}", path.display()))?;
+        let file_size = inner.total_len();
+
+        // ---- File-aware dispatch ----
+        if matches!(header.image_type, GhoImageType::FileAware) {
+            let image = parse_gho_image(&mut inner, file_size, &header)
+                .with_context(|| format!("parsing inner record stream for {}", path.display()))?;
+            let tree = walk_file_aware_tree(&mut inner, &image)
+                .with_context(|| format!("walking file-aware tree for {}", path.display()))?;
+            let virtual_image =
+                build_virtual_fat_image(&mut inner, &image, &tree, header.compression)
+                    .with_context(|| {
+                        format!("building virtual FAT image for {}", path.display())
+                    })?;
+            let logical_size = virtual_image.total_size;
+            return Ok(Self {
+                inner,
+                logical_size,
+                position: 0,
+                mode: GhoReaderMode::FileAware {
+                    image: virtual_image,
+                    compression: header.compression,
+                    cluster_cache: None,
+                },
+            });
+        }
+
         if !matches!(header.image_type, GhoImageType::Sector) {
             bail!(
-                "GHO {} is not SECTOR mode (image_type {:?}); GhoReader supports SECTOR only",
+                "GHO {} image_type {:?} not yet handled by GhoReader",
                 path.display(),
                 header.image_type
             );
         }
 
-        let mut inner = SpanReader::open(&span_set)
-            .with_context(|| format!("opening span set for {}", path.display()))?;
-        let file_size = inner.total_len();
         let data_start = find_sector_data_start(&mut inner, file_size)?;
 
         match header.compression {
@@ -1108,6 +1100,7 @@ impl GhoReader {
         match &self.mode {
             GhoReaderMode::Uncompressed { .. } => 0,
             GhoReaderMode::Blocked { blocks, .. } => blocks.len(),
+            GhoReaderMode::FileAware { image, .. } => image.cluster_to_file.len(),
         }
     }
 
@@ -1179,8 +1172,147 @@ impl Read for GhoReader {
                 self.position += n as u64;
                 Ok(n)
             }
+            GhoReaderMode::FileAware { .. } => {
+                let remaining = self.logical_size - self.position;
+                let want = (buf.len() as u64).min(remaining) as usize;
+                let position = self.position;
+                let n = self.read_file_aware_into(position, &mut buf[..want])?;
+                self.position += n as u64;
+                Ok(n)
+            }
         }
     }
+}
+
+impl GhoReader {
+    /// Serve bytes for FileAware mode at `position` into `out`. Bounded
+    /// to at most one sector per call (caller's outer loop drives more).
+    fn read_file_aware_into(&mut self, position: u64, out: &mut [u8]) -> std::io::Result<usize> {
+        let GhoReaderMode::FileAware {
+            image,
+            compression,
+            cluster_cache,
+        } = &mut self.mode
+        else {
+            unreachable!()
+        };
+
+        // Sector-granular dispatch. Most reads cross sector boundaries
+        // only by a few bytes, so this is fine.
+        let bps = image.bytes_per_sector as u64;
+        let sector_lba = position / bps;
+        let off_in_sector = (position % bps) as usize;
+        let avail_in_sector = (bps as usize) - off_in_sector;
+        let to_read = out.len().min(avail_in_sector);
+        if to_read == 0 {
+            return Ok(0);
+        }
+
+        // 1) Sparse metadata hit?
+        if let Some(stored) = image.sparse.get(&sector_lba) {
+            out[..to_read].copy_from_slice(&stored[off_in_sector..off_in_sector + to_read]);
+            return Ok(to_read);
+        }
+
+        // 2) Is this sector inside a file-owned cluster?
+        let data_start_sector = image.data_start_sector as u64;
+        if sector_lba >= data_start_sector {
+            let sectors_per_cluster = image.sectors_per_cluster as u64;
+            let cluster_offset_sector = sector_lba - data_start_sector;
+            let cluster_index_in_data = cluster_offset_sector / sectors_per_cluster;
+            // FAT clusters are numbered starting at 2.
+            let cluster_id = (cluster_index_in_data + 2) as u32;
+            if let Some(&(file_id, cluster_index_in_file)) = image.cluster_to_file.get(&cluster_id)
+            {
+                // Cluster bytes from the file's content records.
+                let cluster_bytes = ensure_cluster_decoded(
+                    &mut self.inner,
+                    image,
+                    *compression,
+                    file_id,
+                    cluster_index_in_file,
+                    cluster_id,
+                    cluster_cache,
+                )?;
+                let sector_in_cluster = (cluster_offset_sector % sectors_per_cluster) as usize;
+                let byte_in_cluster = sector_in_cluster * bps as usize + off_in_sector;
+                let end = (byte_in_cluster + to_read).min(cluster_bytes.len());
+                if end > byte_in_cluster {
+                    let span = end - byte_in_cluster;
+                    out[..span].copy_from_slice(&cluster_bytes[byte_in_cluster..end]);
+                    // Trailing bytes past file_size are zero (sector slack).
+                    for b in &mut out[span..to_read] {
+                        *b = 0;
+                    }
+                } else {
+                    for b in &mut out[..to_read] {
+                        *b = 0;
+                    }
+                }
+                return Ok(to_read);
+            }
+        }
+
+        // 3) Default: zero.
+        for b in &mut out[..to_read] {
+            *b = 0;
+        }
+        Ok(to_read)
+    }
+}
+
+/// Decode the requested cluster's bytes for a file-aware FAT cluster.
+/// Caches the most recently decoded cluster to avoid re-decoding when
+/// consecutive sectors target the same cluster.
+fn ensure_cluster_decoded(
+    inner: &mut SpanReader,
+    image: &VirtualFatImage,
+    compression: GhoCompression,
+    file_id: u32,
+    cluster_index_in_file: u32,
+    cluster_id: u32,
+    cache: &mut Option<(u32, Vec<u8>)>,
+) -> std::io::Result<Vec<u8>> {
+    if let Some((cached_id, cached_bytes)) = cache {
+        if *cached_id == cluster_id {
+            return Ok(cached_bytes.clone());
+        }
+    }
+
+    let file = &image.files[file_id as usize];
+    let cluster_size = image.cluster_size as usize;
+    let byte_in_file = cluster_index_in_file as u64 * image.cluster_size;
+
+    let mut content =
+        GhoFileContentReader::new(inner, file.records.clone(), compression, file.file_size);
+
+    // Skip to the start of this cluster's bytes within the file.
+    let mut skip = byte_in_file;
+    let mut sink = [0u8; 8192];
+    while skip > 0 {
+        let want = (skip as usize).min(sink.len());
+        let n = content.read(&mut sink[..want])?;
+        if n == 0 {
+            break;
+        }
+        skip -= n as u64;
+    }
+
+    // Read up to cluster_size bytes from this cluster.
+    let mut out = vec![0u8; cluster_size];
+    let mut filled = 0usize;
+    while filled < cluster_size {
+        let n = content.read(&mut out[filled..])?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    out.truncate(filled.max(cluster_size).min(cluster_size));
+    out.resize(cluster_size, 0);
+
+    *cache = Some((cluster_id, out.clone()));
+    Ok(out)
 }
 
 impl Seek for GhoReader {
@@ -2441,6 +2573,302 @@ fn choose_emit_name(entry: &GhoFileAwareEntry) -> Option<String> {
         return Some(short.clone());
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Streaming file-aware reader support (unifies with GhoReader::FileAware)
+// ---------------------------------------------------------------------------
+
+/// In-RAM representation of a reconstructed FAT image. Metadata
+/// (BPB, FAT tables, directory clusters, FSInfo) is stored sector-
+/// granularly in `sparse`; data-region clusters are resolved on demand
+/// by looking up `cluster_to_file` and decompressing the appropriate
+/// `0x0002` / `0x0102` records.
+///
+/// Peak memory for an 8 GB FAT32 reconstruction: ≈ tens of MB
+/// (reserved + 2 × FAT + dir clusters + per-file metadata).
+pub struct VirtualFatImage {
+    pub bytes_per_sector: u32,
+    pub sectors_per_cluster: u32,
+    pub data_start_sector: u32,
+    pub total_size: u64,
+    pub cluster_size: u64,
+    pub sparse: std::collections::BTreeMap<u64, Vec<u8>>,
+    pub cluster_to_file: std::collections::HashMap<u32, (u32, u32)>,
+    pub files: Vec<FileContentRef>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileContentRef {
+    pub records: Vec<(u64, u16)>,
+    pub file_size: u64,
+}
+
+/// Sparse `Read + Write + Seek` over a virtual byte range. Storage is
+/// sector-granular (one `Vec<u8>` per touched sector). Reads of
+/// unwritten sectors return zero.
+struct SparseSink {
+    sectors: std::collections::BTreeMap<u64, Vec<u8>>,
+    sector_size: u64,
+    total_size: u64,
+    pos: u64,
+}
+
+impl SparseSink {
+    fn new(total_size: u64, sector_size: u64) -> Self {
+        Self {
+            sectors: std::collections::BTreeMap::new(),
+            sector_size,
+            total_size,
+            pos: 0,
+        }
+    }
+}
+
+impl Read for SparseSink {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() || self.pos >= self.total_size {
+            return Ok(0);
+        }
+        let sector_lba = self.pos / self.sector_size;
+        let off_in_sector = (self.pos % self.sector_size) as usize;
+        let avail = (self.sector_size as usize) - off_in_sector;
+        let remaining = (self.total_size - self.pos) as usize;
+        let n = buf.len().min(avail).min(remaining);
+        match self.sectors.get(&sector_lba) {
+            Some(stored) => {
+                buf[..n].copy_from_slice(&stored[off_in_sector..off_in_sector + n]);
+            }
+            None => {
+                for b in &mut buf[..n] {
+                    *b = 0;
+                }
+            }
+        }
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Write for SparseSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let sector_lba = self.pos / self.sector_size;
+        let off_in_sector = (self.pos % self.sector_size) as usize;
+        let avail = (self.sector_size as usize) - off_in_sector;
+        let n = buf.len().min(avail);
+        let sector_size = self.sector_size as usize;
+        let sector = self
+            .sectors
+            .entry(sector_lba)
+            .or_insert_with(|| vec![0u8; sector_size]);
+        sector[off_in_sector..off_in_sector + n].copy_from_slice(&buf[..n]);
+        self.pos += n as u64;
+        if self.pos > self.total_size {
+            self.total_size = self.pos;
+        }
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Seek for SparseSink {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let new_pos: i128 = match pos {
+            SeekFrom::Start(o) => o as i128,
+            SeekFrom::Current(o) => self.pos as i128 + o as i128,
+            SeekFrom::End(o) => self.total_size as i128 + o as i128,
+        };
+        if new_pos < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "SparseSink seek before start",
+            ));
+        }
+        self.pos = new_pos as u64;
+        Ok(self.pos)
+    }
+}
+
+/// `Read` that yields `remaining` zero bytes then EOF. Used to feed
+/// `FatFilesystem::create_file` so it allocates clusters without us
+/// having to materialise real content bytes (those are served lazily
+/// from the GHO stream at read time instead).
+struct ZeroReader {
+    remaining: u64,
+}
+
+impl Read for ZeroReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 || buf.is_empty() {
+            return Ok(0);
+        }
+        let n = (buf.len() as u64).min(self.remaining) as usize;
+        for b in &mut buf[..n] {
+            *b = 0;
+        }
+        self.remaining -= n as u64;
+        Ok(n)
+    }
+}
+
+/// Build the in-memory virtual FAT image used by
+/// `GhoReaderMode::FileAware`.
+fn build_virtual_fat_image(
+    inner: &mut SpanReader,
+    image: &GhoImage,
+    tree: &GhoFileAwareTree,
+    compression: GhoCompression,
+) -> Result<VirtualFatImage> {
+    use crate::fs::entry::FileEntry;
+    use crate::fs::fat::{
+        compute_fat_blank_layout, write_blank_fat_metadata_to_sink, FatFilesystem,
+    };
+    use crate::fs::filesystem::{
+        CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem,
+    };
+    use std::collections::HashMap;
+
+    let _ = compression;
+
+    let size = match source_partition_size_from_boot(inner, image)? {
+        Some(s) => s,
+        None => bail!("file-aware GHO has no usable boot sector — can't size virtual image"),
+    };
+    if size < 64 * 1024 {
+        bail!(
+            "boot sector reports partition size {} bytes (< 64 KiB) — refusing to virtualise",
+            size
+        );
+    }
+    let layout = compute_fat_blank_layout(size)
+        .with_context(|| format!("computing FAT layout for size {}", size))?;
+
+    let bps = layout.bytes_per_sector as u64;
+    let mut sink = SparseSink::new(size, bps);
+    write_blank_fat_metadata_to_sink(&mut sink, &layout, None)
+        .context("writing blank FAT metadata into sparse sink")?;
+
+    let mut fs = FatFilesystem::open(&mut sink, 0).context("opening sparse FAT image for emit")?;
+
+    let mut offset_to_len: HashMap<u64, u16> = HashMap::with_capacity(image.records.len());
+    for rec in &image.records {
+        if is_data_block_record(rec.type_code) {
+            offset_to_len.insert(rec.body_start(), rec.body_len);
+        }
+    }
+
+    let mut children_by_parent: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (idx, e) in tree.entries.iter().enumerate() {
+        children_by_parent
+            .entry(e.parent_cluster)
+            .or_default()
+            .push(idx);
+    }
+
+    let root = fs.root().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut stack: Vec<(u32, FileEntry)> = vec![(tree.root_cluster, root)];
+
+    let mut files: Vec<FileContentRef> = Vec::new();
+    let mut cluster_to_file: HashMap<u32, (u32, u32)> = HashMap::new();
+
+    while let Some((src_cluster, parent_entry)) = stack.pop() {
+        let Some(child_idxs) = children_by_parent.get(&src_cluster) else {
+            continue;
+        };
+        let child_idxs = child_idxs.clone();
+        for idx in child_idxs {
+            let entry = &tree.entries[idx];
+            let Some(name) = choose_emit_name(entry) else {
+                continue;
+            };
+
+            if entry.is_directory() {
+                if let Ok(dir_entry) =
+                    fs.create_directory(&parent_entry, &name, &CreateDirectoryOptions::default())
+                {
+                    stack.push((entry.source_cluster, dir_entry));
+                }
+            } else {
+                let mut meta: Vec<(u64, u16)> =
+                    Vec::with_capacity(entry.content_record_offsets.len());
+                let mut missing = false;
+                for &off in &entry.content_record_offsets {
+                    match offset_to_len.get(&off) {
+                        Some(&l) => meta.push((off, l)),
+                        None => {
+                            missing = true;
+                            break;
+                        }
+                    }
+                }
+                if missing {
+                    continue;
+                }
+                let file_size = entry.file_size as u64;
+                let mut zero = ZeroReader {
+                    remaining: file_size,
+                };
+                let f = match fs.create_file(
+                    &parent_entry,
+                    &name,
+                    &mut zero,
+                    file_size,
+                    &CreateFileOptions::default(),
+                ) {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                };
+                let file_id = files.len() as u32;
+                files.push(FileContentRef {
+                    records: meta,
+                    file_size,
+                });
+
+                let mut cluster_idx: u32 = 0;
+                let mut c = f.location as u32;
+                while (2..0x0FFF_FFF8).contains(&c) {
+                    cluster_to_file.insert(c, (file_id, cluster_idx));
+                    cluster_idx += 1;
+                    match fs.next_cluster(c) {
+                        Ok(Some(next)) => c = next,
+                        _ => break,
+                    }
+                }
+            }
+        }
+    }
+
+    fs.sync_metadata().map_err(|e| anyhow::anyhow!("{e}"))?;
+    drop(fs);
+
+    // Evict file-cluster sectors from sparse storage — they were
+    // zero-filled by the ZeroReader and are served from the GHO at
+    // read time.
+    let data_start_sector = layout.data_start_byte() / bps;
+    let sectors_per_cluster = layout.sectors_per_cluster as u64;
+    for &cluster_id in cluster_to_file.keys() {
+        let cluster_offset = (cluster_id as u64) - 2;
+        let first_sector = data_start_sector + cluster_offset * sectors_per_cluster;
+        for s in first_sector..first_sector + sectors_per_cluster {
+            sink.sectors.remove(&s);
+        }
+    }
+
+    Ok(VirtualFatImage {
+        bytes_per_sector: layout.bytes_per_sector,
+        sectors_per_cluster: layout.sectors_per_cluster,
+        data_start_sector: (layout.data_start_byte() / bps) as u32,
+        total_size: size,
+        cluster_size: layout.cluster_size(),
+        sparse: sink.sectors,
+        cluster_to_file,
+        files,
+    })
 }
 
 /// Vec-returning convenience wrapper: useful for small images and
@@ -4385,6 +4813,83 @@ mod tests {
             !root_entries.is_empty(),
             "rebuilt FAT image's root must have at least one entry"
         );
+    }
+
+    /// Open a synthetic file-aware GHO via the unified `GhoReader`,
+    /// pipe its bytes into a Vec, and re-open as a FAT image. The
+    /// reader must serve the same bytes as `emit_file_aware_fat_image`
+    /// (the in-RAM Vec path) up to volume-label byte differences.
+    #[test]
+    fn gho_reader_file_aware_streams_same_tree_as_emit() {
+        use crate::fs::fat::FatFilesystem;
+        use crate::fs::filesystem::Filesystem;
+        use std::io::Cursor;
+
+        // Same synthetic stream the emit test builds.
+        let mut buf = Vec::new();
+        let mut prefix = vec![0u8; 512];
+        prefix[0] = 0xFE;
+        prefix[1] = 0xEF;
+        prefix[2] = 0x01;
+        prefix[3] = 0x00;
+        prefix[10] = 0x00;
+        buf.extend_from_slice(&prefix);
+        let write_record = |buf: &mut Vec<u8>, type_code: u16, body: &[u8]| {
+            buf.extend_from_slice(&type_code.to_le_bytes());
+            buf.extend_from_slice(&0u16.to_le_bytes());
+            buf.extend_from_slice(&GHO_RECORD_MAGIC.to_le_bytes());
+            buf.extend_from_slice(&(body.len() as u16).to_le_bytes());
+            buf.extend_from_slice(body);
+        };
+        let mut boot = [0u8; 512];
+        boot[11..13].copy_from_slice(&512u16.to_le_bytes());
+        boot[13] = 1;
+        boot[14..16].copy_from_slice(&1u16.to_le_bytes());
+        boot[16] = 2;
+        boot[19..21].copy_from_slice(&8192u16.to_le_bytes()); // 4 MiB
+        boot[54..62].copy_from_slice(b"FAT16   ");
+        write_record(&mut buf, GHO_REC_BOOT_SECTOR, &boot);
+        let mut e = [0u8; 56];
+        e[..11].copy_from_slice(b"HELLO   TXT");
+        e[11] = 0x20;
+        e[26..28].copy_from_slice(&5u16.to_le_bytes());
+        e[28..32].copy_from_slice(&11u32.to_le_bytes());
+        write_record(&mut buf, GHO_REC_DIR_ENTRY_ROOT, &e);
+        write_record(&mut buf, GHO_REC_FILE_TAIL, b"hello world");
+        let mut c = [0u8; 20];
+        c[..4].copy_from_slice(&0xdeadbeefu32.to_le_bytes());
+        c[4..8].copy_from_slice(&0xdeadbeefu32.to_le_bytes());
+        write_record(&mut buf, GHO_REC_FILE_CHECKSUM, &c);
+
+        // Write to a tempfile so GhoReader::open can pull it in.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("syn.gho");
+        std::fs::write(&path, &buf).unwrap();
+
+        let mut reader = GhoReader::open(&path).expect("GhoReader::open file-aware");
+        let logical = reader.logical_size();
+        assert!(
+            logical >= 4 * 1024 * 1024,
+            "logical size at least source partition"
+        );
+        let mut streamed = Vec::with_capacity(logical as usize);
+        reader.read_to_end(&mut streamed).unwrap();
+        assert_eq!(streamed.len() as u64, logical);
+        // First sector should look like a FAT boot sector.
+        assert_eq!(streamed[0], 0xEB);
+        assert_eq!(&streamed[510..512], &[0x55, 0xAA]);
+
+        // Reopen the streamed bytes as a real FAT image.
+        let mut img_cur = Cursor::new(streamed);
+        let mut fs = FatFilesystem::open(&mut img_cur, 0).unwrap();
+        let root = fs.root().unwrap();
+        let entries = fs.list_directory(&root).unwrap();
+        let hello = entries
+            .iter()
+            .find(|e| e.name == "HELLO.TXT")
+            .expect("HELLO.TXT must round-trip through the streaming reader");
+        let data = fs.read_file(hello, usize::MAX).unwrap();
+        assert_eq!(&data, b"hello world");
     }
 
     // ---------- GhoReader (streaming Read+Seek) ----------
