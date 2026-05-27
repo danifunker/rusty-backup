@@ -2402,83 +2402,125 @@ impl InspectTab {
                 }
             };
 
-            // Open the device/file with full elevation: unmounts volumes and
-            // claims exclusive DA access for the duration of the inspect.
-            let elevated = match rusty_backup::os::open_source_for_reading(&path) {
-                Ok(e) => e,
-                Err(e) => {
-                    finish_err(format!("Cannot open {}: {e}", path.display()));
-                    return;
-                }
-            };
-            // Decompose into file + guard (keeps DiskClaim alive until we
-            // explicitly drop it by storing/releasing from the main thread).
-            let (device_file, guard) = elevated.into_parts();
-
-            set_step("Reading partition table...");
-
-            // Clone for the BufReader; keep `device_file` for additional clones.
-            let mut reader = match device_file.try_clone() {
-                Ok(f) => BufReader::new(f),
-                Err(e) => {
-                    finish_err(format!("Cannot clone file handle: {e}"));
-                    return;
-                }
-            };
-
-            // Detect image format (VHD, 2MG, DMG, or raw)
             let is_device = path.to_string_lossy().starts_with("/dev/")
                 || path.to_string_lossy().starts_with("\\\\.\\");
 
-            let detect_result = if !is_device {
-                // For image files, use unified format detection
-                match device_file.try_clone() {
-                    Ok(clone) => match rusty_backup::rbformats::detect_image_format_with_path(
-                        clone,
-                        Some(&path),
-                    ) {
-                        Ok(format) => {
-                            let desc = format.description();
-                            push_log(format!("Detected format: {}", desc));
-                            if let Ok(mut s) = status.lock() {
-                                s.format_label = Some(desc.clone());
-                            }
-                            match rusty_backup::rbformats::wrap_image_reader(
-                                device_file.try_clone().unwrap_or_else(|_| {
-                                    std::fs::File::open(&path).expect("reopen failed")
-                                }),
-                                format,
-                            ) {
-                                Ok((mut wrapped_reader, _data_size)) => {
-                                    PartitionTable::detect(&mut wrapped_reader)
-                                }
-                                Err(e) => {
-                                    push_log(format!("Format wrap failed, trying raw: {e}"));
-                                    let _ = reader.seek(SeekFrom::Start(0));
-                                    PartitionTable::detect(&mut reader)
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            push_log(format!("Format detection failed, trying raw: {e}"));
-                            PartitionTable::detect(&mut reader)
-                        }
-                    },
-                    Err(_) => PartitionTable::detect(&mut reader),
+            // Streaming containers (GHO, IMZ) are opened via
+            // source_reader::open_read — no tempfile, no elevation needed.
+            let uses_streaming_reader = !is_device
+                && (rusty_backup::model::source_reader::is_gho_path(&path)
+                    || rusty_backup::model::source_reader::is_imz_path(&path));
+
+            // Open the device/file with full elevation: unmounts volumes and
+            // claims exclusive DA access for the duration of the inspect.
+            // Streaming-reader containers skip this (they open via open_read).
+            let (device_file, guard) = if !uses_streaming_reader {
+                let elevated = match rusty_backup::os::open_source_for_reading(&path) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        finish_err(format!("Cannot open {}: {e}", path.display()));
+                        return;
+                    }
+                };
+                let (f, g) = elevated.into_parts();
+                (Some(f), Some(g))
+            } else {
+                (None, None)
+            };
+
+            set_step("Reading partition table...");
+
+            // Build the initial reader: streaming reader for GHO/IMZ,
+            // cloned File for everything else.
+            let mut reader: Box<dyn rusty_backup::rbformats::ReadSeek> = if uses_streaming_reader {
+                match rusty_backup::model::source_reader::open_read(&path) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        finish_err(format!("Cannot open {}: {e:#}", path.display()));
+                        return;
+                    }
                 }
             } else {
-                // Device path — always treat as raw
-                PartitionTable::detect(&mut reader)
+                match device_file.as_ref().unwrap().try_clone() {
+                    Ok(f) => Box::new(BufReader::new(f)),
+                    Err(e) => {
+                        finish_err(format!("Cannot clone file handle: {e}"));
+                        return;
+                    }
+                }
             };
+
+            let detect_result =
+                if uses_streaming_reader {
+                    // Streaming containers (GHO, IMZ) already provide a decoded
+                    // raw disk image; skip VHD/2MG/DMG format detection.
+                    let ext = path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|s| s.to_ascii_lowercase());
+                    let label = match ext.as_deref() {
+                        Some("gho") | Some("ghs") => "Norton Ghost (GHO)",
+                        Some("imz") => "WinImage (IMZ)",
+                        _ => "Streaming image",
+                    };
+                    push_log(format!("Detected format: {}", label));
+                    if let Ok(mut s) = status.lock() {
+                        s.format_label = Some(label.to_string());
+                    }
+                    PartitionTable::detect(&mut reader)
+                } else if !is_device {
+                    // For image files, use unified format detection
+                    match device_file.as_ref().unwrap().try_clone() {
+                        Ok(clone) => match rusty_backup::rbformats::detect_image_format_with_path(
+                            clone,
+                            Some(&path),
+                        ) {
+                            Ok(format) => {
+                                let desc = format.description();
+                                push_log(format!("Detected format: {}", desc));
+                                if let Ok(mut s) = status.lock() {
+                                    s.format_label = Some(desc.clone());
+                                }
+                                match rusty_backup::rbformats::wrap_image_reader(
+                                    device_file.as_ref().unwrap().try_clone().unwrap_or_else(
+                                        |_| std::fs::File::open(&path).expect("reopen failed"),
+                                    ),
+                                    format,
+                                ) {
+                                    Ok((mut wrapped_reader, _data_size)) => {
+                                        PartitionTable::detect(&mut wrapped_reader)
+                                    }
+                                    Err(e) => {
+                                        push_log(format!("Format wrap failed, trying raw: {e}"));
+                                        let _ = reader.seek(SeekFrom::Start(0));
+                                        PartitionTable::detect(&mut reader)
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                push_log(format!("Format detection failed, trying raw: {e}"));
+                                PartitionTable::detect(&mut reader)
+                            }
+                        },
+                        Err(_) => PartitionTable::detect(&mut reader),
+                    }
+                } else {
+                    // Device path — always treat as raw
+                    PartitionTable::detect(&mut reader)
+                };
 
             match detect_result {
                 Ok(mut table) => {
                     // Fix up superfloppy size: seek(End(0)) returns 0 for macOS devices
                     if let PartitionTable::None { size_bytes, .. } = &mut table {
                         if *size_bytes == 0 {
-                            if let Ok(f) = device_file.try_clone() {
-                                if let Ok(real_size) = rusty_backup::os::get_file_size(&f, &path) {
-                                    *size_bytes = real_size;
+                            if let Some(ref df) = device_file {
+                                if let Ok(f) = df.try_clone() {
+                                    if let Ok(real_size) =
+                                        rusty_backup::os::get_file_size(&f, &path)
+                                    {
+                                        *size_bytes = real_size;
+                                    }
                                 }
                             }
                         }
@@ -2496,14 +2538,10 @@ impl InspectTab {
                     let is_chd = rusty_backup::model::source_reader::is_chd_path(&path);
                     let make_probe_reader =
                         || -> Option<Box<dyn rusty_backup::rbformats::ReadSeek>> {
-                            if is_chd {
-                                rusty_backup::rbformats::chd::ChdReader::open(&path)
-                                    .ok()
-                                    .map(|r| {
-                                        Box::new(r) as Box<dyn rusty_backup::rbformats::ReadSeek>
-                                    })
+                            if uses_streaming_reader || is_chd {
+                                rusty_backup::model::source_reader::open_read(&path).ok()
                             } else {
-                                device_file.try_clone().ok().map(|f| {
+                                device_file.as_ref()?.try_clone().ok().map(|f| {
                                     Box::new(BufReader::new(f))
                                         as Box<dyn rusty_backup::rbformats::ReadSeek>
                                 })
@@ -2833,13 +2871,12 @@ impl InspectTab {
                         if part.partition_type_byte == 0xEE {
                             continue;
                         }
-                        let result = if is_chd {
-                            let Ok(reader) = rusty_backup::rbformats::chd::ChdReader::open(&path)
-                            else {
+                        let result = if uses_streaming_reader || is_chd {
+                            let Ok(r) = rusty_backup::model::source_reader::open_read(&path) else {
                                 continue;
                             };
                             rusty_backup::fs::partition_minimum_size(
-                                reader,
+                                r,
                                 part.start_lba * 512,
                                 part.partition_type_byte,
                                 part.partition_type_string.as_deref(),
@@ -2849,7 +2886,7 @@ impl InspectTab {
                                 &|_| {},
                             )
                         } else {
-                            let Ok(f) = device_file.try_clone() else {
+                            let Ok(f) = device_file.as_ref().unwrap().try_clone() else {
                                 continue;
                             };
                             if is_device {
@@ -2923,8 +2960,12 @@ impl InspectTab {
                         // so BrowseView can reuse it without re-opening/re-prompting.
                         #[cfg(target_os = "macos")]
                         {
-                            s.device_file = Some(device_file);
-                            s.device_guard = Some(guard);
+                            if let Some(df) = device_file {
+                                s.device_file = Some(df);
+                            }
+                            if let Some(g) = guard {
+                                s.device_guard = Some(g);
+                            }
                         }
                         s.finished = true;
                     }

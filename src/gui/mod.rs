@@ -63,26 +63,15 @@ fn file_dialog() -> rfd::FileDialog {
     dialog
 }
 
-/// Prepare a disk image path for file-based access by downstream
-/// GUI worker code (which currently opens images via
-/// `File::open` + `try_clone`). Returns a path to a raw, seekable
-/// image — possibly the original (no work needed) or a tempfile
-/// containing the decompressed / reconstructed image.
+/// Prepare a disk image path for file-based access by downstream GUI
+/// worker code. Returns a path to a raw, seekable image — possibly the
+/// original (no work needed) or a tempfile.
 ///
-/// Currently handles:
-///
-/// - `.adz` / `.hdz` — gzip-decompressed to a tempfile. **Genuinely
-///   needed**: gzip isn't seekable.
-/// - `.imz` — ZIP-extracted to a tempfile. **Transitional**: an
-///   [`ImzReader`] streams these. Once GUI workers take
-///   `Box<dyn ReadSeek>` instead of `File`, this branch is removed in
-///   favour of [`open_disk_image_for_reading`].
-/// - `.gho` / `.ghs` — Norton Ghost. **Transitional**: streamed by
-///   `GhoReader` + `std::io::copy` into a tempfile so the rest of the
-///   pipeline (which expects a `File`) can still open it. Once
-///   workers take a streaming reader, this branch is removed too.
-///
-/// Anything else passes through unchanged.
+/// Only handles `.adz` / `.hdz` (gzip-decompressed to a tempfile —
+/// gzip isn't seekable). Everything else — including `.gho`/`.ghs`,
+/// `.imz`, `.chd` — passes through unchanged, since the inspect worker
+/// opens those via [`open_disk_image_for_reading`] (streaming
+/// `Read + Seek` readers, no tempfile).
 ///
 /// The output file lives inside a fresh `tempfile::tempdir`; callers
 /// must hold the returned `TempDir` (second tuple element) for the
@@ -95,22 +84,9 @@ pub fn prepare_disk_image_path(
         .and_then(|e| e.to_str())
         .map(|s| s.to_ascii_lowercase());
 
-    // IMZ → ZIP-wrapped floppy image. Delegate to the dedicated reader so
-    // password-protected archives produce the standard error message.
-    if ext.as_deref() == Some("imz") {
-        let mat = rusty_backup::rbformats::imz::materialize_imz_to_temp(path)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-        return Ok((mat.temp_path, Some(mat.guard)));
-    }
-
-    // GHO/GHS → Norton Ghost container. Streamed via GhoReader into a
-    // tempfile. (Eventually the worker code will take a streaming
-    // reader directly and this branch goes away.)
-    if matches!(ext.as_deref(), Some("gho") | Some("ghs")) {
-        let mat = rusty_backup::rbformats::gho::materialize_gho_to_temp(path)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:#}")))?;
-        return Ok((mat.temp_path, Some(mat.guard)));
-    }
+    // GHO/GHS and IMZ have streaming Read+Seek readers (GhoReader,
+    // ImzReader) — the inspect worker opens them via open_read, so
+    // the path passes through unchanged. No tempfile needed.
 
     let target_ext = match ext.as_deref() {
         Some("adz") => "adf",
@@ -168,7 +144,7 @@ pub fn open_disk_image_for_reading(
     path: &std::path::Path,
 ) -> std::io::Result<Box<dyn rusty_backup::rbformats::ReadSeek>> {
     rusty_backup::model::source_reader::open_read(path)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e:#}")))
+        .map_err(|e| std::io::Error::other(format!("{e:#}")))
 }
 
 #[cfg(test)]
@@ -213,26 +189,26 @@ mod materialize_tests {
     }
 
     #[test]
-    fn materialize_decompresses_imz() {
-        // Transitional: IMZ still materializes to a tempfile because
-        // GUI workers expect a File path. Once they take a
-        // Box<dyn ReadSeek> via open_disk_image_for_reading, both this
-        // branch and this test go away.
-        let payload: &[u8] = b"WinImage floppy bytes";
+    fn imz_passes_through_unchanged() {
+        // IMZ has a streaming reader (ImzReader); prepare_disk_image_path
+        // passes it through unchanged — the worker opens it via
+        // open_disk_image_for_reading.
         let tmp = tempfile::tempdir().unwrap();
         let imz_path = tmp.path().join("floppy.imz");
-        let f = std::fs::File::create(&imz_path).unwrap();
-        let mut zw = zip::ZipWriter::new(f);
-        let opts = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
-        zw.start_file("floppy.ima", opts).unwrap();
-        zw.write_all(payload).unwrap();
-        zw.finish().unwrap();
-
+        std::fs::write(&imz_path, b"PK\x03\x04anything").unwrap();
         let (out, guard) = prepare_disk_image_path(&imz_path).unwrap();
-        assert!(guard.is_some(), "imz needs a tempdir guard");
-        assert_eq!(out.extension().and_then(|s| s.to_str()), Some("ima"));
-        assert_eq!(std::fs::read(&out).unwrap(), payload);
+        assert_eq!(out, imz_path);
+        assert!(guard.is_none());
+    }
+
+    #[test]
+    fn gho_passes_through_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gho_path = tmp.path().join("test.gho");
+        std::fs::write(&gho_path, &[0xFE, 0xEF, 0x01, 0x00]).unwrap();
+        let (out, guard) = prepare_disk_image_path(&gho_path).unwrap();
+        assert_eq!(out, gho_path);
+        assert!(guard.is_none());
     }
 }
 
