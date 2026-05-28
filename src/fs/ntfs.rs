@@ -38,6 +38,7 @@ const INDEX_ENTRY_END: u32 = 0x02;
 const FILE_ATTR_DIRECTORY: u32 = 0x1000_0000;
 
 /// NTFS Volume Boot Record fields.
+#[derive(Clone)]
 pub(crate) struct NtfsVbr {
     pub(crate) bytes_per_sector: u64,
     pub(crate) sectors_per_cluster: u64,
