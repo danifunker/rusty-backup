@@ -2885,19 +2885,34 @@ impl InspectTab {
                             continue;
                         }
                         let result = if uses_streaming_reader || is_chd {
-                            let Ok(r) = rusty_backup::model::source_reader::open_read(&path) else {
-                                continue;
-                            };
-                            rusty_backup::fs::partition_minimum_size(
-                                r,
-                                part.start_lba * 512,
-                                part.partition_type_byte,
-                                part.partition_type_string.as_deref(),
-                                part.size_bytes,
-                                false,
-                                None,
-                                &|_| {},
-                            )
+                            // GHO containers with compressed NTFS
+                            // require decompressing the entire file to
+                            // compute minimum sizes — defer to avoid
+                            // blocking the inspect tab for minutes.
+                            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                            if ext.eq_ignore_ascii_case("gho") || ext.eq_ignore_ascii_case("ghs") {
+                                rusty_backup::fs::MinimumResult::Deferred {
+                                    fs_name: rusty_backup::fs::fs_name_for(
+                                        part.partition_type_byte,
+                                        part.partition_type_string.as_deref(),
+                                    ),
+                                }
+                            } else {
+                                let Ok(r) = rusty_backup::model::source_reader::open_read(&path)
+                                else {
+                                    continue;
+                                };
+                                rusty_backup::fs::partition_minimum_size(
+                                    r,
+                                    part.start_lba * 512,
+                                    part.partition_type_byte,
+                                    part.partition_type_string.as_deref(),
+                                    part.size_bytes,
+                                    false,
+                                    None,
+                                    &|_| {},
+                                )
+                            }
                         } else {
                             let Ok(f) = device_file.as_ref().unwrap().try_clone() else {
                                 continue;

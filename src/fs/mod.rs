@@ -665,7 +665,7 @@ pub enum MinimumResult {
 }
 
 /// Human-readable name of the filesystem associated with a partition type.
-fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &'static str {
+pub fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &'static str {
     if let Some(s) = partition_type_string {
         if is_amiga_dos_type(s) {
             return "AmigaDOS";
