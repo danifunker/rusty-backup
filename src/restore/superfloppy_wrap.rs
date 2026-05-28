@@ -200,16 +200,24 @@ fn write_table<W: Read + Write + Seek>(
                 .try_into()
                 .context("MBR partition sector count exceeds 32-bit limit; use GPT")?;
             let disk_sig = synth_disk_signature(params);
-            let mbr = build_minimal_mbr(
+            let mut mbr = build_minimal_mbr(
                 disk_sig,
                 &[(*type_byte, start_lba_u32, sectors_u32, *bootable)],
                 255,
                 63,
             );
+            // A bootable partition needs MBR boot code to chainload it;
+            // build_minimal_mbr only writes the partition table.
+            if *bootable {
+                crate::partition::mbr::install_mbr_boot_code(&mut mbr);
+            }
             target.write_all(&mbr).context("writing synthetic MBR")?;
             log_cb(&format!(
-                "Wrote synthetic MBR (type 0x{:02X}, start LBA {}, {} sectors)",
-                type_byte, first_lba, sectors_u32,
+                "Wrote synthetic MBR (type 0x{:02X}, start LBA {}, {} sectors{})",
+                type_byte,
+                first_lba,
+                sectors_u32,
+                if *bootable { ", bootable" } else { "" },
             ));
         }
         WrapTable::Gpt {

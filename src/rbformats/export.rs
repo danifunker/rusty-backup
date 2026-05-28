@@ -243,6 +243,38 @@ fn read_source_to_memory(
 ///
 /// For backup folders: reconstructs the disk from MBR + partition data files.
 /// For raw images/devices: reconstructs with partition size overrides.
+/// Identify the filesystem from a volume boot record, returning a hint string
+/// suitable for `superfloppy_wrap::mbr_type_byte_for_fs`. `None` when the VBR
+/// doesn't match a known FAT/NTFS/exFAT signature (so the caller skips wrapping
+/// rather than guessing a partition type).
+fn fs_hint_from_vbr(vbr: &[u8; 512]) -> Option<&'static str> {
+    if &vbr[3..7] == b"NTFS" {
+        Some("NTFS")
+    } else if &vbr[3..8] == b"EXFAT" {
+        Some("exFAT")
+    } else if &vbr[0x52..0x57] == b"FAT32" {
+        Some("FAT32")
+    } else if &vbr[0x36..0x3B] == b"FAT16" {
+        Some("FAT16")
+    } else if &vbr[0x36..0x3B] == b"FAT12" {
+        Some("FAT12")
+    } else {
+        None
+    }
+}
+
+/// NTFS volume length in sectors (`total_sectors` at VBR offset 0x28). Returns
+/// 0 for non-NTFS VBRs (callers fall back to the decoded byte count).
+fn ntfs_total_sectors_from_vbr(vbr: &[u8; 512]) -> u64 {
+    if &vbr[3..7] == b"NTFS" {
+        u64::from_le_bytes([
+            vbr[0x28], vbr[0x29], vbr[0x2A], vbr[0x2B], vbr[0x2C], vbr[0x2D], vbr[0x2E], vbr[0x2F],
+        ])
+    } else {
+        0
+    }
+}
+
 pub fn export_whole_disk(
     format: ExportFormat,
     source_path: &Path,
@@ -478,6 +510,67 @@ pub fn export_whole_disk(
                 super::wrap_image_reader(file2, fmt)?
             }
         };
+
+        // GHO whole-disk backups present a bare NTFS/exFAT/FAT volume
+        // (superfloppy) even though the original disk had a partition table.
+        // The volume's VBR records its original on-disk LBA in `hidden_sectors`;
+        // if non-zero, reassemble the disk — MBR (with boot code) + active
+        // partition at that LBA + the volume — so the Raw export is a bootable
+        // disk image rather than a partitionless volume.
+        if format == ExportFormat::Raw && crate::model::source_reader::is_gho_path(source_path) {
+            let mut vbr = [0u8; 512];
+            reader.seek(SeekFrom::Start(0))?;
+            let vbr_ok = reader.read_exact(&mut vbr).is_ok();
+            reader.seek(SeekFrom::Start(0))?;
+            let hidden = if vbr_ok && vbr[510] == 0x55 && vbr[511] == 0xAA {
+                u32::from_le_bytes([vbr[0x1C], vbr[0x1D], vbr[0x1E], vbr[0x1F]]) as u64
+            } else {
+                0
+            };
+            if let (true, Some(fs_hint)) = (hidden > 0, fs_hint_from_vbr(&vbr)) {
+                use crate::restore::superfloppy_wrap::{
+                    self, WrapAlignment, WrapParams, WrapTable,
+                };
+                let type_byte = superfloppy_wrap::mbr_type_byte_for_fs(fs_hint);
+                // Partition must cover the decoded bytes and the volume's own
+                // declared size (NTFS total_sectors), whichever is larger.
+                let data_sectors = source_data_size.div_ceil(512);
+                let part_sectors = data_sectors.max(ntfs_total_sectors_from_vbr(&vbr));
+                let partition_size_bytes = part_sectors * 512;
+                let target_size_bytes = hidden * 512 + partition_size_bytes;
+                let params = WrapParams {
+                    table: WrapTable::Mbr {
+                        type_byte,
+                        bootable: true,
+                        alignment: WrapAlignment::Custom(hidden),
+                    },
+                    partition_size_bytes,
+                    target_size_bytes,
+                    source_fs_hint: fs_hint.to_string(),
+                };
+                let mut dest = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(dest_path)
+                    .with_context(|| format!("failed to create {}", dest_path.display()))?;
+                log_cb(&format!(
+                    "Reassembling bootable disk: {} partition at LBA {}, {} byte disk",
+                    fs_hint, hidden, target_size_bytes,
+                ));
+                superfloppy_wrap::wrap_and_write(
+                    &mut reader,
+                    source_data_size,
+                    &mut dest,
+                    &params,
+                    &mut progress_cb,
+                    &cancel_check,
+                    &mut log_cb,
+                )?;
+                return Ok(());
+            }
+        }
 
         // If the source has an APM partition table and the caller supplied
         // size overrides, reconstruct the disk with patched APM entries and
