@@ -4293,6 +4293,38 @@ struct NtfsGhoIndex {
     cluster_size: u64,
     #[allow(dead_code)]
     vbr: [u8; 512],
+    /// Synthesized `$Bitmap`. Ghost omits `$Bitmap` content from file-aware
+    /// backups (it's derivable from the MFT allocation and Ghost's restorer
+    /// regenerates it), so the whole-disk stream must serve a synthesized one
+    /// or a strict NTFS driver sees an all-free/corrupt volume and won't mount.
+    /// `bitmap_runs` are `$Bitmap`'s own `$DATA` LCN runs (where to serve it);
+    /// `synth_bitmap` is one bit per cluster, LSB-first, set = allocated.
+    bitmap_runs: Vec<(u64, u64)>,
+    synth_bitmap: Vec<u8>,
+}
+
+/// Build a synthesized NTFS `$Bitmap` from the MFT-declared allocation.
+///
+/// `allocation` is every `(lcn, cluster_count)` the MFT marks in use (the
+/// `data_run_queue` plus the `$MFT` run itself). Returns the bitmap bytes sized
+/// to cover the whole volume (`ceil(total_clusters / 8)`), one bit per cluster,
+/// LSB-first, set = allocated. Bits for clusters past the volume end (padding in
+/// the final byte) are set to 1 per NTFS convention.
+fn build_synth_ntfs_bitmap(allocation: &[(u64, u64)], total_clusters: u64) -> Vec<u8> {
+    let nbytes = (total_clusters as usize).div_ceil(8);
+    let mut bm = vec![0u8; nbytes];
+    for &(lcn, len) in allocation {
+        let end = lcn.saturating_add(len).min(total_clusters);
+        for c in lcn..end {
+            bm[(c / 8) as usize] |= 1 << (c % 8);
+        }
+    }
+    // Clusters past the volume end occupy the slack bits of the final byte;
+    // NTFS marks them allocated so nothing tries to use them.
+    for c in total_clusters..(nbytes as u64 * 8) {
+        bm[(c / 8) as usize] |= 1 << (c % 8);
+    }
+    bm
 }
 /// Parse inline MFT records from a buffer (gap between cluster runs).
 /// Same logic as `parse_inline_mft_records` but works on an in-memory
@@ -4657,6 +4689,8 @@ fn index_ntfs_file_aware<R: Read + Seek>(
     // Parse all MFT records to build the data-run queue.
     // Each entry: (mft_record_number, lcn, cluster_count)
     let mut data_run_queue: Vec<(u64, u64)> = Vec::new();
+    // $Bitmap (record 6) $DATA runs — where the synthesized bitmap is served.
+    let mut bitmap_runs: Vec<(u64, u64)> = Vec::new();
     let num_records = mft_size / mft_record_size as u64;
     let mut rec_buf = vec![0u8; mft_record_size];
 
@@ -4691,6 +4725,9 @@ fn index_ntfs_file_aware<R: Read + Seek>(
                 }
                 if dr.cluster_offset >= 0 && dr.length > 0 {
                     data_run_queue.push((dr.cluster_offset as u64, dr.length));
+                    if rec_num == 6 && attr.attr_type == 0x80 {
+                        bitmap_runs.push((dr.cluster_offset as u64, dr.length));
+                    }
                 }
             }
         }
@@ -4880,11 +4917,30 @@ fn index_ntfs_file_aware<R: Read + Seek>(
         volume_size as f64 / (1024.0 * 1024.0 * 1024.0)
     );
 
+    // Synthesize $Bitmap from the complete run set (every allocated cluster
+    // with stored content) plus $Bitmap's own clusters. The uncompressed
+    // builder discovers all runs here, so the bitmap is complete now.
+    let total_clusters = volume_size / cluster_size;
+    let mut allocation: Vec<(u64, u64)> = runs
+        .iter()
+        .map(|r| (r.lcn_start, r.cluster_count))
+        .collect();
+    allocation.extend_from_slice(&bitmap_runs);
+    let synth_bitmap = build_synth_ntfs_bitmap(&allocation, total_clusters);
+    log::info!(
+        "Synthesized $Bitmap: {} bytes over {} run(s) for {} clusters",
+        synth_bitmap.len(),
+        bitmap_runs.len(),
+        total_clusters,
+    );
+
     Ok(NtfsGhoIndex {
         runs,
         volume_size,
         cluster_size,
         vbr: *vbr_raw,
+        bitmap_runs,
+        synth_bitmap,
     })
 }
 
@@ -4947,6 +5003,7 @@ fn open_ntfs_compressed_mft_only(
     let mut mft_data_start: Option<u64> = None;
     let mut mft_clusters: u64 = 0;
     let mut data_run_queue: Vec<(u64, u64)> = Vec::new();
+    let mut bitmap_runs: Vec<(u64, u64)> = Vec::new();
     let mut runs: Vec<NtfsGhoClusterRun> = Vec::new();
     let mut mft_parsed = false;
 
@@ -5121,6 +5178,9 @@ fn open_ntfs_compressed_mft_only(
                             }
                             if dr.cluster_offset >= 0 && dr.length > 0 {
                                 data_run_queue.push((dr.cluster_offset as u64, dr.length));
+                                if rec_num == 6 && attr.attr_type == 0x80 {
+                                    bitmap_runs.push((dr.cluster_offset as u64, dr.length));
+                                }
                             }
                         }
                     }
@@ -5162,6 +5222,11 @@ fn open_ntfs_compressed_mft_only(
         resume_file_offset,
     );
 
+    // $Bitmap is synthesized lazily on first read (see read_ntfs_file_aware_into):
+    // the complete run set isn't known until the lazy scan finishes, and most
+    // files' MFT records are stored inline in the stream, not in data_run_queue.
+    // Leaving synth_bitmap empty signals "not built yet".
+
     let comp_state = NtfsCompressedState {
         blocks,
         compression,
@@ -5188,6 +5253,8 @@ fn open_ntfs_compressed_mft_only(
         volume_size,
         cluster_size,
         vbr: *vbr_raw,
+        bitmap_runs,
+        synth_bitmap: Vec::new(), // built lazily on first $Bitmap read
     };
     Ok((comp_state, index))
 }
@@ -5689,6 +5756,52 @@ fn read_ntfs_file_aware_into(
             out[..copy_len].copy_from_slice(&index.vbr[pos..pos + copy_len]);
         }
         return Ok(n);
+    }
+
+    // Serve the synthesized $Bitmap. Ghost omits $Bitmap content from the
+    // backup, so its LCNs have no mapped run and would otherwise read as zeros
+    // (an all-free bitmap → strict NTFS drivers reject the volume). Serve the
+    // bitmap we build from the complete run set instead.
+    if index
+        .bitmap_runs
+        .iter()
+        .any(|&(l, c)| lcn >= l && lcn < l + c)
+    {
+        // Build it on first access. For the compressed path the run set isn't
+        // complete until the lazy scan finishes, so force it to EOF first.
+        if index.synth_bitmap.is_empty() {
+            if let Some(cs) = compressed.as_mut() {
+                if cs.lazy_scan.is_some() {
+                    extend_ntfs_compressed_index(inner, index, cs, u64::MAX);
+                }
+            }
+            let total_clusters = index.volume_size / index.cluster_size;
+            let mut allocation: Vec<(u64, u64)> = index
+                .runs
+                .iter()
+                .map(|r| (r.lcn_start, r.cluster_count))
+                .collect();
+            allocation.extend_from_slice(&index.bitmap_runs);
+            index.synth_bitmap = build_synth_ntfs_bitmap(&allocation, total_clusters);
+            log::info!(
+                "Synthesized $Bitmap on demand: {} bytes from {} runs for {} clusters",
+                index.synth_bitmap.len(),
+                index.runs.len(),
+                total_clusters,
+            );
+        }
+        let mut base = 0u64; // cluster offset within the $Bitmap file
+        for &(blcn, bcnt) in &index.bitmap_runs {
+            if lcn >= blcn && lcn < blcn + bcnt {
+                let file_off =
+                    ((base + (lcn - blcn)) * cluster_size + offset_in_cluster as u64) as usize;
+                for (i, b) in out[..to_read].iter_mut().enumerate() {
+                    *b = index.synth_bitmap.get(file_off + i).copied().unwrap_or(0);
+                }
+                return Ok(to_read);
+            }
+            base += bcnt;
+        }
     }
 
     let find_run = |runs: &[NtfsGhoClusterRun], hint: usize| -> Option<usize> {
