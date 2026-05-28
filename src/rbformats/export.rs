@@ -305,28 +305,25 @@ fn open_source_reader(source_path: &Path) -> Result<(super::BoxReadSeek, u64)> {
     }
 }
 
-/// Reassemble a bootable disk around a full-disk GHO superfloppy volume.
+/// Compute the [`WrapParams`](crate::restore::superfloppy_wrap::WrapParams)
+/// needed to reassemble a bootable disk around a full-disk GHO superfloppy.
 ///
 /// A whole-disk Ghost backup decodes to a *bare* filesystem volume: sector 0 is
 /// the filesystem VBR, not a partition table. The volume's original on-disk
 /// position is the only trace of the partitioning that's left, recorded in the
 /// VBR `hidden_sectors` field (offset 0x1C). When that's non-zero and the VBR is
-/// a recognised FAT/NTFS/exFAT, synthesize an MBR (with boot code) and place the
-/// volume as the active first partition at its original LBA, writing the
-/// reassembled disk to a tempfile. Returns a rewound reader over that disk plus
-/// its byte length.
+/// a recognised FAT/NTFS/exFAT, build params for a synthetic MBR (with boot
+/// code) that places the volume as the active first partition at its original
+/// LBA.
 ///
 /// Returns `Ok(None)` when no reassembly applies — no boot signature,
-/// `hidden_sectors == 0` (e.g. a floppy-sized GHO), or an unrecognised VBR. The
-/// caller then uses the bare volume as-is.
+/// `hidden_sectors == 0` (e.g. a floppy-sized GHO), or an unrecognised VBR.
 ///
-/// `reader` is read from offset 0 and fully consumed on the `Some` path.
-pub(crate) fn reassemble_gho_bootable_disk(
+/// Leaves `reader` rewound to offset 0.
+pub(crate) fn gho_wrap_params(
     reader: &mut (impl Read + Seek),
     source_data_size: u64,
-    progress_cb: &mut dyn FnMut(u64),
-    cancel_check: &dyn Fn() -> bool,
-) -> Result<Option<(File, u64)>> {
+) -> Result<Option<crate::restore::superfloppy_wrap::WrapParams>> {
     use crate::restore::superfloppy_wrap::{self, WrapAlignment, WrapParams, WrapTable};
 
     let mut vbr = [0u8; 512];
@@ -350,7 +347,7 @@ pub(crate) fn reassemble_gho_bootable_disk(
     let part_sectors = data_sectors.max(ntfs_total_sectors_from_vbr(&vbr));
     let partition_size_bytes = part_sectors * 512;
     let target_size_bytes = hidden * 512 + partition_size_bytes;
-    let params = WrapParams {
+    Ok(Some(WrapParams {
         table: WrapTable::Mbr {
             type_byte,
             bootable: true,
@@ -359,12 +356,35 @@ pub(crate) fn reassemble_gho_bootable_disk(
         partition_size_bytes,
         target_size_bytes,
         source_fs_hint: fs_hint.to_string(),
+    }))
+}
+
+/// Reassemble a bootable disk around a full-disk GHO superfloppy volume into a
+/// tempfile, returning a rewound reader over that disk plus its byte length.
+///
+/// Used by exporters that transform the data on the way out (dynamic VHD,
+/// QCOW2, sparse VMDK) and therefore need the reassembled disk materialized as a
+/// readable source. The Raw path does **not** use this — it wraps straight into
+/// the destination file (see `export_whole_disk`), avoiding a second full-size
+/// copy on space-constrained volumes.
+///
+/// Returns `Ok(None)` when no reassembly applies (see [`gho_wrap_params`]).
+/// `reader` is read from offset 0 and fully consumed on the `Some` path.
+pub(crate) fn reassemble_gho_bootable_disk(
+    reader: &mut (impl Read + Seek),
+    source_data_size: u64,
+    progress_cb: &mut dyn FnMut(u64),
+    cancel_check: &dyn Fn() -> bool,
+) -> Result<Option<(File, u64)>> {
+    let params = match gho_wrap_params(reader, source_data_size)? {
+        Some(p) => p,
+        None => return Ok(None),
     };
+    let target_size_bytes = params.target_size_bytes;
 
     log::info!(
-        "Reassembling bootable disk from GHO: {} partition at LBA {}, {} byte disk",
-        fs_hint,
-        hidden,
+        "Reassembling bootable disk from GHO: {} partition, {} byte disk",
+        params.source_fs_hint,
         target_size_bytes,
     );
 
@@ -374,7 +394,7 @@ pub(crate) fn reassemble_gho_bootable_disk(
     // `wrap_and_write` takes sized callback generics; re-wrap the dyn refs.
     let mut prog = |b: u64| progress_cb(b);
     let cancel = || cancel_check();
-    superfloppy_wrap::wrap_and_write(
+    crate::restore::superfloppy_wrap::wrap_and_write(
         reader,
         source_data_size,
         &mut tmp,
@@ -614,14 +634,52 @@ pub fn export_whole_disk(
             total_written,
         ));
     } else {
+        // Raw + full-disk GHO: reassemble the bootable disk (MBR + boot code +
+        // partition at the original LBA) straight into the destination. The Raw
+        // output IS the reassembled raw image, so wrap directly — going through
+        // `open_export_source` here would materialize the whole disk in a
+        // tempfile and then copy it to the destination, needing ~2x the space
+        // and failing on near-full volumes.
+        if format == ExportFormat::Raw && crate::model::source_reader::is_gho_path(source_path) {
+            let (mut reader, source_data_size) = open_source_reader(source_path)?;
+            if let Some(params) = gho_wrap_params(&mut reader, source_data_size)? {
+                let mut dest = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(dest_path)
+                    .with_context(|| format!("failed to create {}", dest_path.display()))?;
+                log_cb(&format!(
+                    "Reassembling bootable disk: {} partition, {} byte disk",
+                    params.source_fs_hint, params.target_size_bytes,
+                ));
+                crate::restore::superfloppy_wrap::wrap_and_write(
+                    &mut reader,
+                    source_data_size,
+                    &mut dest,
+                    &params,
+                    &mut progress_cb,
+                    &cancel_check,
+                    &mut log_cb,
+                )?;
+                log_cb(&format!(
+                    "Raw export complete: {} ({} byte bootable disk)",
+                    dest_path.display(),
+                    params.target_size_bytes,
+                ));
+                return Ok(());
+            }
+            // Not a superfloppy needing reassembly (e.g. a floppy-sized GHO with
+            // hidden_sectors == 0): fall through to the generic streaming path.
+        }
+
         // Raw image/device path.
         //
         // Unwrap any container (VHD, 2MG, DMG, DiskCopy 4.2, DOS-order .dsk, WOZ)
         // so Raw/2MG exports always emit flat sector data — not the source's
-        // header/footer bytes. Full-disk GHO sources are reassembled into a
-        // bootable disk (MBR + boot code + partition at the original LBA) by
-        // `open_export_source` so the Raw image is bootable, not a partitionless
-        // volume.
+        // header/footer bytes. (Full-disk GHO Raw exports are handled directly
+        // above; other GHO shapes pass through bare.)
         let (mut reader, source_data_size) =
             open_export_source(source_path, &mut progress_cb, &cancel_check)?;
 
@@ -1553,6 +1611,45 @@ mod tests {
             u32::from_le_bytes(buf[off + 0x1C..off + 0x20].try_into().unwrap()),
             63,
             "hidden_sectors patched so the volume still mounts"
+        );
+    }
+
+    /// When the NTFS VBR's `total_sectors` exceeds the bytes the GHO actually
+    /// decoded, the partition (and disk) must be sized to the *declared* volume
+    /// and the shortfall zero-padded — never truncated. This is the
+    /// danilaptopghost.img failure: a too-small image whose partition table
+    /// over-promised, so nothing would mount.
+    #[test]
+    fn reassemble_gho_pads_tail_when_ntfs_claims_more_than_decoded() {
+        // Volume declares 200 sectors but the GHO only decoded 120 sectors.
+        let declared_sectors = 200u64;
+        let decoded_bytes = 120 * 512u64;
+        let src = ntfs_superfloppy(63, declared_sectors, decoded_bytes);
+        let mut reader = std::io::Cursor::new(src);
+
+        let (mut disk, disk_size) =
+            reassemble_gho_bootable_disk(&mut reader, decoded_bytes, &mut |_| {}, &|| false)
+                .unwrap()
+                .expect("should reassemble");
+
+        // Disk = 63-sector prefix + the *declared* 200-sector partition.
+        assert_eq!(disk_size, (63 + declared_sectors) * 512);
+
+        let mut buf = vec![0u8; disk_size as usize];
+        disk.seek(SeekFrom::Start(0)).unwrap();
+        disk.read_exact(&mut buf).unwrap();
+
+        // MBR partition sector count reflects the declared volume size.
+        assert_eq!(
+            u32::from_le_bytes(buf[446 + 12..446 + 16].try_into().unwrap()) as u64,
+            declared_sectors,
+        );
+        // The bytes past the decoded data, out to the declared end, are zeros
+        // (the tail that was missing from the truncated export).
+        let tail_start = (63 + 120) * 512;
+        assert!(
+            buf[tail_start as usize..].iter().all(|&b| b == 0),
+            "partition tail must be zero-padded, not truncated"
         );
     }
 
