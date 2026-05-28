@@ -5467,14 +5467,23 @@ fn read_ntfs_file_aware_into(
     let avail_in_cluster = cluster_size as usize - offset_in_cluster;
     let to_read = out.len().min(avail_in_cluster);
 
-    // Synthesize VBR at LCN 0 from the GHPR-embedded copy. The $Boot
-    // cluster is stored somewhere in the compressed stream but we already
-    // have the VBR from the GHPR metadata — serve it directly for reads
-    // to sector 0 so the NTFS filesystem can open without a full scan.
-    if position < 512 {
-        let vbr_off = position as usize;
-        let n = to_read.min(512 - vbr_off);
-        out[..n].copy_from_slice(&index.vbr[vbr_off..vbr_off + n]);
+    // Synthesize the $Boot region from the GHPR-embedded VBR. The first
+    // 512 bytes are the VBR; the rest is boot code. We synthesize enough
+    // to cover partition-table detection probes (RDB scans 16 sectors =
+    // 8 KiB) so they don't trigger the expensive lazy scan. $Boot on
+    // NTFS typically spans 8 clusters but we only need the VBR bytes.
+    const SYNTH_BOOT_BYTES: u64 = 16 * 512; // 16 sectors = RDB scan range
+    if position < SYNTH_BOOT_BYTES {
+        let pos = position as usize;
+        let n = to_read.min(SYNTH_BOOT_BYTES as usize - pos);
+        for b in &mut out[..n] {
+            *b = 0;
+        }
+        if pos < 512 {
+            let vbr_end = (pos + n).min(512);
+            let copy_len = vbr_end - pos;
+            out[..copy_len].copy_from_slice(&index.vbr[pos..pos + copy_len]);
+        }
         return Ok(n);
     }
 
@@ -5501,9 +5510,19 @@ fn read_ntfs_file_aware_into(
 
     if found_idx.is_none() {
         if let Some(cs) = compressed.as_mut() {
-            if cs.lazy_scan.is_some() {
-                extend_ntfs_compressed_index(inner, index, cs, lcn);
-                found_idx = find_run(&index.runs, *last_run_hint);
+            if let Some(scan) = &cs.lazy_scan {
+                // Only trigger the expensive forward scan if this LCN is
+                // actually in the MFT data-run queue (= allocated cluster).
+                // Partition detection probes random sectors and should get
+                // zeros, not trigger a full decompression pass.
+                let is_known_lcn = scan
+                    .data_run_queue
+                    .iter()
+                    .any(|&(l, c)| lcn >= l && lcn < l + c);
+                if is_known_lcn {
+                    extend_ntfs_compressed_index(inner, index, cs, lcn);
+                    found_idx = find_run(&index.runs, *last_run_hint);
+                }
             }
         }
     }
