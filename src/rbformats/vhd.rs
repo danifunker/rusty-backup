@@ -824,6 +824,53 @@ pub fn export_whole_disk_vhd(
         return Ok(());
     }
 
+    // GHO span sets / IMZ archives: decode the full logical volume through
+    // source_reader (which spans every segment) and stream straight to VHD.
+    // A plain File::open here would read only the first span segment and
+    // truncate the export. Partition-size overrides aren't applied to these
+    // sources, consistent with the other format exporters.
+    if crate::model::source_reader::is_gho_path(source_path)
+        || crate::model::source_reader::is_imz_path(source_path)
+    {
+        let mut reader = crate::model::source_reader::open_read(source_path)?;
+        let source_data_size = reader.seek(SeekFrom::End(0))?;
+        reader.seek(SeekFrom::Start(0))?;
+
+        let mut writer = BufWriter::new(
+            File::create(dest_path)
+                .with_context(|| format!("failed to create {}", dest_path.display()))?,
+        );
+        let mut buf = vec![0u8; CHUNK_SIZE];
+        let mut limited = (&mut reader).take(source_data_size);
+        loop {
+            if cancel_check() {
+                bail!("export cancelled");
+            }
+            let n = limited
+                .read(&mut buf)
+                .context("failed to read GHO/IMZ source")?;
+            if n == 0 {
+                break;
+            }
+            writer
+                .write_all(&buf[..n])
+                .context("failed to write VHD data")?;
+            total_written += n as u64;
+            progress_cb(total_written);
+        }
+        let footer = build_vhd_footer(total_written);
+        writer
+            .write_all(&footer)
+            .context("failed to write VHD footer")?;
+        writer.flush()?;
+        log_cb(&format!(
+            "VHD export complete: {} ({} data bytes + 512 byte footer)",
+            dest_path.display(),
+            total_written,
+        ));
+        return Ok(());
+    }
+
     // Raw image/device path. If the source has an APM partition table and
     // there are size overrides, reconstruct with patched APM + per-partition
     // resize; then append the VHD footer. Otherwise fall back to the MBR /

@@ -275,6 +275,36 @@ fn ntfs_total_sectors_from_vbr(vbr: &[u8; 512]) -> u64 {
     }
 }
 
+/// Open a whole-disk source for export, returning a reader over the full
+/// logical volume plus its byte length.
+///
+/// GHO span sets and IMZ archives aren't recognized by
+/// `detect_image_format`/`wrap_image_reader` — opening `source_path` as a
+/// plain `File` would read only the first span segment's raw (still-compressed)
+/// bytes, silently truncating a spanned export. Route those through
+/// `source_reader::open_read`, which spans the segment set and presents the
+/// decoded volume. Everything else (raw images, devices, VHD/2MG/DMG/DC42/CHD
+/// containers) goes through `wrap_image_reader` as before.
+///
+/// Every format exporter (Raw, VHD dynamic, QCOW2, VMDK flat/sparse, CHD) must
+/// obtain its source through this helper so spanning works uniformly.
+fn open_source_reader(source_path: &Path) -> Result<(super::BoxReadSeek, u64)> {
+    if crate::model::source_reader::is_gho_path(source_path)
+        || crate::model::source_reader::is_imz_path(source_path)
+    {
+        let mut r = crate::model::source_reader::open_read(source_path)?;
+        let size = r.seek(SeekFrom::End(0))?;
+        r.seek(SeekFrom::Start(0))?;
+        Ok((r, size))
+    } else {
+        let file = File::open(source_path)
+            .with_context(|| format!("failed to open {}", source_path.display()))?;
+        let file2 = File::open(source_path)?;
+        let fmt = super::detect_image_format_with_path(file, Some(source_path))?;
+        super::wrap_image_reader(file2, fmt)
+    }
+}
+
 pub fn export_whole_disk(
     format: ExportFormat,
     source_path: &Path,
@@ -408,14 +438,8 @@ pub fn export_whole_disk(
             buf
         } else {
             // Unwrap any container (WOZ, 2MG, DMG, VHD, DiskCopy 4.2, DOS-order
-            // .do/.dsk) so we feed the encoder flat sector data.
-            let file = File::open(source_path)
-                .with_context(|| format!("failed to open {}", source_path.display()))?;
-            let (mut reader, data_size) = {
-                let file2 = File::open(source_path)?;
-                let fmt = super::detect_image_format_with_path(file, Some(source_path))?;
-                super::wrap_image_reader(file2, fmt)?
-            };
+            // .do/.dsk, GHO/IMZ) so we feed the encoder flat sector data.
+            let (mut reader, data_size) = open_source_reader(source_path)?;
             let mut buf = vec![0u8; data_size as usize];
             reader
                 .read_exact(&mut buf)
@@ -488,28 +512,7 @@ pub fn export_whole_disk(
         //
         // Unwrap any container (VHD, 2MG, DMG, DiskCopy 4.2, DOS-order .dsk, WOZ)
         // so Raw/2MG exports always emit flat sector data — not the source's header/footer bytes.
-        let (mut reader, source_data_size): (super::BoxReadSeek, u64) = {
-            // GHO span sets and IMZ archives aren't recognized by
-            // detect_image_format/wrap_image_reader — opening source_path as a
-            // plain File would read only the first span segment's raw
-            // (still-compressed) bytes. Decode them through their reader, which
-            // spans the segment set and presents the full logical volume.
-            // (CHD is handled by detect_image_format_with_path below.)
-            if crate::model::source_reader::is_gho_path(source_path)
-                || crate::model::source_reader::is_imz_path(source_path)
-            {
-                let mut r = crate::model::source_reader::open_read(source_path)?;
-                let size = r.seek(SeekFrom::End(0))?;
-                r.seek(SeekFrom::Start(0))?;
-                (r, size)
-            } else {
-                let file = File::open(source_path)
-                    .with_context(|| format!("failed to open {}", source_path.display()))?;
-                let file2 = File::open(source_path)?;
-                let fmt = super::detect_image_format_with_path(file, Some(source_path))?;
-                super::wrap_image_reader(file2, fmt)?
-            }
-        };
+        let (mut reader, source_data_size) = open_source_reader(source_path)?;
 
         // GHO whole-disk backups present a bare NTFS/exFAT/FAT volume
         // (superfloppy) even though the original disk had a partition table.
@@ -1006,11 +1009,7 @@ fn export_whole_disk_vhd_dynamic(
         written
     } else {
         // Raw image/device: unwrap any container, then stream.
-        let file = File::open(source_path)
-            .with_context(|| format!("failed to open {}", source_path.display()))?;
-        let file2 = File::open(source_path)?;
-        let fmt = super::detect_image_format_with_path(file, Some(source_path))?;
-        let (mut reader, source_data_size) = super::wrap_image_reader(file2, fmt)?;
+        let (mut reader, source_data_size) = open_source_reader(source_path)?;
         super::vhd::export_whole_disk_vhd_dynamic(
             &mut reader,
             &mut out,
@@ -1085,11 +1084,7 @@ fn export_whole_disk_qcow2(
         )?;
         written
     } else {
-        let file = File::open(source_path)
-            .with_context(|| format!("failed to open {}", source_path.display()))?;
-        let file2 = File::open(source_path)?;
-        let fmt = super::detect_image_format_with_path(file, Some(source_path))?;
-        let (mut reader, source_data_size) = super::wrap_image_reader(file2, fmt)?;
+        let (mut reader, source_data_size) = open_source_reader(source_path)?;
         super::qcow2::export_qcow2(
             &mut reader,
             &mut out,
@@ -1153,11 +1148,7 @@ fn export_whole_disk_vmdk_flat(
         )?;
         written
     } else {
-        let file = File::open(source_path)
-            .with_context(|| format!("failed to open {}", source_path.display()))?;
-        let file2 = File::open(source_path)?;
-        let fmt = super::detect_image_format_with_path(file, Some(source_path))?;
-        let (mut reader, source_data_size) = super::wrap_image_reader(file2, fmt)?;
+        let (mut reader, source_data_size) = open_source_reader(source_path)?;
         super::vmdk::export_vmdk_flat(
             &mut reader,
             dest_path,
@@ -1229,11 +1220,7 @@ fn export_whole_disk_vmdk_sparse(
         )?;
         written
     } else {
-        let file = File::open(source_path)
-            .with_context(|| format!("failed to open {}", source_path.display()))?;
-        let file2 = File::open(source_path)?;
-        let fmt = super::detect_image_format_with_path(file, Some(source_path))?;
-        let (mut reader, source_data_size) = super::wrap_image_reader(file2, fmt)?;
+        let (mut reader, source_data_size) = open_source_reader(source_path)?;
         super::vmdk_sparse::export_vmdk_sparse(
             &mut reader,
             &mut out,
@@ -1278,11 +1265,7 @@ pub fn export_whole_disk_chd(
         bail!("CHD export from backup folders is not implemented; export to VHD/Raw first");
     }
 
-    let file = File::open(source_path)
-        .with_context(|| format!("failed to open {}", source_path.display()))?;
-    let file2 = File::open(source_path)?;
-    let fmt = super::detect_image_format_with_path(file, Some(source_path))?;
-    let (mut reader, source_data_size) = super::wrap_image_reader(file2, fmt)?;
+    let (mut reader, source_data_size) = open_source_reader(source_path)?;
 
     // RDB-with-resize: route through reconstruct_raw_rdb_disk first
     // (which also picks up the PFS3 defragmenting clone for shrinks),
