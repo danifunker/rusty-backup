@@ -456,12 +456,27 @@ pub fn export_whole_disk(
         //
         // Unwrap any container (VHD, 2MG, DMG, DiskCopy 4.2, DOS-order .dsk, WOZ)
         // so Raw/2MG exports always emit flat sector data — not the source's header/footer bytes.
-        let (mut reader, source_data_size) = {
-            let file = File::open(source_path)
-                .with_context(|| format!("failed to open {}", source_path.display()))?;
-            let file2 = File::open(source_path)?;
-            let fmt = super::detect_image_format_with_path(file, Some(source_path))?;
-            super::wrap_image_reader(file2, fmt)?
+        let (mut reader, source_data_size): (super::BoxReadSeek, u64) = {
+            // GHO span sets and IMZ archives aren't recognized by
+            // detect_image_format/wrap_image_reader — opening source_path as a
+            // plain File would read only the first span segment's raw
+            // (still-compressed) bytes. Decode them through their reader, which
+            // spans the segment set and presents the full logical volume.
+            // (CHD is handled by detect_image_format_with_path below.)
+            if crate::model::source_reader::is_gho_path(source_path)
+                || crate::model::source_reader::is_imz_path(source_path)
+            {
+                let mut r = crate::model::source_reader::open_read(source_path)?;
+                let size = r.seek(SeekFrom::End(0))?;
+                r.seek(SeekFrom::Start(0))?;
+                (r, size)
+            } else {
+                let file = File::open(source_path)
+                    .with_context(|| format!("failed to open {}", source_path.display()))?;
+                let file2 = File::open(source_path)?;
+                let fmt = super::detect_image_format_with_path(file, Some(source_path))?;
+                super::wrap_image_reader(file2, fmt)?
+            }
         };
 
         // If the source has an APM partition table and the caller supplied
