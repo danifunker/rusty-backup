@@ -4236,16 +4236,45 @@ struct NtfsLazyScanState {
     /// Remaining decompressed bytes of cluster data to skip before
     /// the next gap/run-header region.
     skip_data_bytes: u64,
+    /// Decompressed offset up to which we have already searched for run
+    /// headers and found none. Avoids re-scanning the same bytes on every
+    /// subsequent block (which would be O(N^2)). Always >= `prev_data_end`.
+    search_resume: u64,
 }
 
-/// 16-byte constant prefix appearing at the start of every NTFS file-aware
-/// cluster run header. Observed across all 5777 runs in the corpus fixture.
+/// 16-byte constant prefix appearing at the start of an NTFS file-aware
+/// MFT header (the first run only). Subsequent runs use [`NTFS_RUN_ENTRY_B`]
+/// directly without this entry A prefix.
 const NTFS_RUN_HEADER_ENTRY1: [u8; 16] = [
     0x0E, 0x20, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0F,
 ];
 
-/// Total size of the 3-entry cluster run header before raw cluster data.
+/// Run-header entry B layout (16 bytes):
+///   byte 0:      0x0E (entry marker)
+///   bytes 1-6:   0x02 0x00 0x00 0x00 0x00 0x00 (fixed)
+///   bytes 7-14:  u64-LE run sequence number (0 = $MFT, 1+ subsequent)
+///   byte 15:     0x0F (terminator)
+/// Only the fixed bytes (0-6, 15) are matched; the seq field is read out
+/// separately by `parse_ntfs_run_b_header`.
+fn match_run_entry_b(window: &[u8]) -> bool {
+    if window.len() < 16 {
+        return false;
+    }
+    window[0] == 0x0E
+        && window[1] == 0x02
+        && window[2] == 0x00
+        && window[3] == 0x00
+        && window[4] == 0x00
+        && window[5] == 0x00
+        && window[6] == 0x00
+        && window[15] == 0x0F
+}
+
+/// Size of the 3-entry MFT header (entry A + entry B + entry C).
 const NTFS_RUN_HEADER_SIZE: usize = 42;
+
+/// Size of a non-MFT run header (entry B + entry C only).
+const NTFS_RUN_B_HEADER_SIZE: usize = 26;
 
 /// One cluster run in the NTFS file-aware index: maps a contiguous range
 /// of LCNs to a file offset in the GHO.
@@ -4452,9 +4481,8 @@ fn find_ntfs_vbr_in_header<R: Read + Seek>(
     bail!("NTFS VBR not found in GHPR metadata region");
 }
 
-/// Parse the 42-byte run header at the current reader position. Returns
-/// the cluster count, or `None` if the header doesn't match the expected
-/// pattern.
+/// Parse the 42-byte MFT run header. Returns the cluster count, or `None`
+/// if the header doesn't match the MFT pattern (entry A + entry B + entry C).
 fn parse_ntfs_run_header(data: &[u8]) -> Option<u64> {
     if data.len() < NTFS_RUN_HEADER_SIZE {
         return None;
@@ -4469,6 +4497,44 @@ fn parse_ntfs_run_header(data: &[u8]) -> Option<u64> {
         data[33], data[34], data[35], data[36], data[37], data[38], data[39], data[40],
     ]);
     Some(cluster_count)
+}
+
+/// Map an absolute decompressed offset to a position within the rolling
+/// `scan.stream` buffer (whose first byte is at `stream_base`). Returns
+/// `None` if the offset is before the buffer or past its end. Free function
+/// (not a closure) so it doesn't borrow `scan` across mutations.
+fn stream_local_offset(abs: u64, stream_base: u64, stream_len: usize) -> Option<usize> {
+    if abs >= stream_base {
+        let l = (abs - stream_base) as usize;
+        if l <= stream_len {
+            return Some(l);
+        }
+    }
+    None
+}
+
+/// Parse the 26-byte run header used for every non-MFT data run
+/// (entry B + entry C). Returns `(sequence_number, cluster_count)`, or
+/// `None` if the header doesn't match. The sequence number (entry B bytes
+/// 7-14, u64-LE) is the run's index in MFT data-run order: 0 = $MFT, 1 =
+/// first non-MFT run, etc. — used to match the run to its LCN exactly.
+fn parse_ntfs_run_b_header(data: &[u8]) -> Option<(u64, u64)> {
+    if data.len() < NTFS_RUN_B_HEADER_SIZE {
+        return None;
+    }
+    if !match_run_entry_b(&data[0..16]) {
+        return None;
+    }
+    if data[16] != 0x0F || data[25] != 0x0E {
+        return None;
+    }
+    let seq = u64::from_le_bytes([
+        data[7], data[8], data[9], data[10], data[11], data[12], data[13], data[14],
+    ]);
+    let cluster_count = u64::from_le_bytes([
+        data[17], data[18], data[19], data[20], data[21], data[22], data[23], data[24],
+    ]);
+    Some((seq, cluster_count))
 }
 
 /// Parse inline MFT FILE records in the gap between cluster runs.
@@ -4977,6 +5043,12 @@ fn open_ntfs_compressed_mft_only(
                 .windows(NTFS_RUN_HEADER_SIZE)
                 .position(|w| w[..16] == *needle)
             {
+                let hex: String = stream[pos..(pos + NTFS_RUN_HEADER_SIZE).min(stream.len())]
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                log::info!("MFT header at stream pos {:#x}: {}", pos, hex);
                 if let Some(cc) = parse_ntfs_run_header(&stream[pos..]) {
                     let mds = pos as u64 + NTFS_RUN_HEADER_SIZE as u64;
                     mft_clusters = cc;
@@ -5083,6 +5155,7 @@ fn open_ntfs_compressed_mft_only(
             stream: leftover_stream,
             stream_base: mft_end,
             skip_data_bytes: 0,
+            search_resume: mft_end,
         }),
     };
     let index = NtfsGhoIndex {
@@ -5111,7 +5184,7 @@ fn extend_ntfs_compressed_index(
     let io_chunk: usize = 4 * 1024 * 1024;
     let max_decomp_block: usize = FAST_LZ_BLOCK_SIZE + 1024;
     let mut decomp_buf = vec![0u8; max_decomp_block];
-    let mut discard = vec![0u8; 8192];
+    let mut discard = vec![0u8; 256 * 1024];
     let end = scan.file_size;
 
     let mut chunk_buf = vec![0u8; io_chunk + 64 * 1024];
@@ -5126,9 +5199,42 @@ fn extend_ntfs_compressed_index(
     let mut local = 0usize;
     let mut found_target = false;
     let mut consecutive_fails = 0u32;
-    let needle = &NTFS_RUN_HEADER_ENTRY1;
+    let mut decompress = flate2::Decompress::new(true);
+    let scan_start_offset = chunk_start;
+    let scan_start_time = std::time::Instant::now();
+    let mut last_progress_log = scan_start_time;
+    log::info!(
+        "Lazy scan starting: target_lcn={}, from offset {:#x}/{:#x} ({:.1}% of file)",
+        target_lcn,
+        scan_start_offset,
+        end,
+        (scan_start_offset as f64 / end as f64) * 100.0
+    );
 
-    while chunk_start + local as u64 + 4 < end && !found_target {
+    // Note: we intentionally scan to EOF rather than stopping at the target
+    // LCN. Stopping early would leave the target run's cluster-data blocks
+    // un-decompressed (and thus absent from comp.blocks), so the read that
+    // triggered the scan would get zero bytes back. A full pass records every
+    // block once; the index + block table then persist for all later reads.
+    while chunk_start + local as u64 + 4 < end {
+        // Periodic progress report
+        if last_progress_log.elapsed().as_secs() >= 2 {
+            let cur = chunk_start + local as u64;
+            let scanned = cur.saturating_sub(scan_start_offset);
+            let elapsed = scan_start_time.elapsed().as_secs_f64();
+            let mb_per_s = (scanned as f64 / 1_048_576.0) / elapsed.max(0.001);
+            log::info!(
+                "Lazy scan progress: at {:#x}/{:#x} ({:.1}%), {} runs, {} blocks, {:.1} MB/s",
+                cur,
+                end,
+                (cur as f64 / end as f64) * 100.0,
+                index.runs.len(),
+                comp.blocks.len(),
+                mb_per_s
+            );
+            last_progress_log = std::time::Instant::now();
+        }
+
         // Refill
         if local + 64 * 1024 > chunk_len && chunk_start + (chunk_len as u64) < end {
             let remaining = chunk_len - local;
@@ -5164,7 +5270,7 @@ fn extend_ntfs_compressed_index(
 
         // If skipping cluster data, use discard buffer.
         if scan.skip_data_bytes > 0 {
-            let mut decompress = flate2::Decompress::new(true);
+            decompress.reset(true);
             let mut total_in = 0usize;
             let mut ok = true;
             loop {
@@ -5210,14 +5316,28 @@ fn extend_ntfs_compressed_index(
             });
             scan.decomp_offset += total_out as u64;
             comp.total_decompressed = scan.decomp_offset;
-            scan.skip_data_bytes = scan.skip_data_bytes.saturating_sub(total_out as u64);
+            // If this block straddles the end of the run's cluster data, keep
+            // the metadata tail (decompressed into `discard`) so the gap's
+            // inline MFT records aren't lost. stream_base was set to
+            // run_data_end when the skip was triggered, so the tail's bytes
+            // begin exactly at the (now empty) stream's base.
+            if (total_out as u64) > scan.skip_data_bytes {
+                let tail_start = scan.skip_data_bytes as usize;
+                if tail_start < total_out && total_out <= discard.len() {
+                    scan.stream
+                        .extend_from_slice(&discard[tail_start..total_out]);
+                }
+                scan.skip_data_bytes = 0;
+            } else {
+                scan.skip_data_bytes -= total_out as u64;
+            }
             local += total_in + 2;
             consecutive_fails = 0;
             continue;
         }
 
         // Metadata block — decompress fully.
-        let mut decompress = flate2::Decompress::new(true);
+        decompress.reset(true);
         let mut total_in = 0usize;
         let mut ok = true;
         loop {
@@ -5274,72 +5394,90 @@ fn extend_ntfs_compressed_index(
 
         // Search for run headers in accumulated stream.
         let stream_abs_len = scan.stream_base + scan.stream.len() as u64;
-        let to_local = |abs: u64| -> Option<usize> {
-            if abs >= scan.stream_base {
-                let l = (abs - scan.stream_base) as usize;
-                if l <= scan.stream.len() {
-                    Some(l)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
 
+        // Tracks whether the inner search loop reached EOH (end of haystack)
+        // without finding a match. Only then is it safe to advance
+        // `search_resume` past the current stream — otherwise we risk
+        // skipping a needle that was found but couldn't be parsed because
+        // entry C extended past the current stream.
+        let mut full_scan_completed = false;
         loop {
-            let Some(search_local) = to_local(scan.prev_data_end) else {
+            let search_start = scan.prev_data_end.max(scan.search_resume);
+            let Some(search_local) =
+                stream_local_offset(search_start, scan.stream_base, scan.stream.len())
+            else {
                 break;
             };
-            if search_local + NTFS_RUN_HEADER_SIZE > scan.stream.len() {
+            if search_local + NTFS_RUN_B_HEADER_SIZE > scan.stream.len() {
+                // Not enough bytes from search_start onward to even contain
+                // a complete header — wait for the next block.
                 break;
             }
+            // Subsequent (non-MFT) runs use the 26-byte entry B + entry C
+            // header. Byte 7 of entry B is a run sequence number, so we
+            // match with a wildcard there.
             let haystack = &scan.stream[search_local..];
-            let Some(idx) = haystack.windows(16).position(|w| w == needle) else {
+            let mut idx_opt: Option<usize> = None;
+            for i in 0..haystack.len().saturating_sub(16) + 1 {
+                if match_run_entry_b(&haystack[i..i + 16]) {
+                    idx_opt = Some(i);
+                    break;
+                }
+            }
+            let Some(idx) = idx_opt else {
+                // Scanned the entire haystack — no needle. Safe to advance
+                // search_resume past this stream extent.
+                full_scan_completed = true;
                 break;
             };
             let hdr_local = search_local + idx;
             let hdr_abs = scan.stream_base + hdr_local as u64;
-            if hdr_local + NTFS_RUN_HEADER_SIZE > scan.stream.len() {
+            if hdr_local + NTFS_RUN_B_HEADER_SIZE > scan.stream.len() {
+                // Found a needle but entry C extends past current stream.
+                // Resume right here next pass so we re-find and parse it.
+                if scan.search_resume < hdr_abs {
+                    scan.search_resume = hdr_abs;
+                }
                 break;
             }
-            let Some(cc) = parse_ntfs_run_header(&scan.stream[hdr_local..]) else {
+            let Some((_seq, cc)) = parse_ntfs_run_b_header(&scan.stream[hdr_local..]) else {
                 scan.prev_data_end = hdr_abs + 16;
                 continue;
             };
             if cc == 0 {
-                scan.prev_data_end = hdr_abs + NTFS_RUN_HEADER_SIZE as u64;
+                scan.prev_data_end = hdr_abs + NTFS_RUN_B_HEADER_SIZE as u64;
                 continue;
             }
 
-            let run_data_start = hdr_abs + NTFS_RUN_HEADER_SIZE as u64;
+            let run_data_start = hdr_abs + NTFS_RUN_B_HEADER_SIZE as u64;
             let run_data_end = run_data_start + cc * scan.cluster_size;
 
-            // Parse inline MFT records in the gap.
-            if let Some(gap_local_start) = to_local(scan.prev_data_end) {
+            // Parse inline MFT records in the gap since the last run. Each
+            // gap holds the FILE records whose data runs describe the runs
+            // that follow, so this populates pending_lcns just-in-time.
+            if let Some(gap_local_start) =
+                stream_local_offset(scan.prev_data_end, scan.stream_base, scan.stream.len())
+            {
                 if hdr_local > gap_local_start {
-                    let gap = &scan.stream[gap_local_start..hdr_local];
-                    parse_inline_mft_from_buf(gap, &scan.vbr, &mut scan.pending_lcns);
+                    let gap = scan.stream[gap_local_start..hdr_local].to_vec();
+                    parse_inline_mft_from_buf(&gap, &scan.vbr, &mut scan.pending_lcns);
                 }
             }
 
-            // Match LCN by cluster count.
+            // Match LCN by cluster count: prefer a just-parsed inline MFT
+            // record (pending_lcns), fall back to the global MFT data-run
+            // queue. Ghost stores runs largest-first within a batch, so pop
+            // from the back of matching entries.
             let lcn = scan
                 .pending_lcns
                 .iter()
                 .rposition(|&(_, len)| len == cc)
-                .map(|i| {
-                    let (lcn, _) = scan.pending_lcns.remove(i);
-                    lcn
-                })
+                .map(|i| scan.pending_lcns.remove(i).0)
                 .or_else(|| {
                     scan.data_run_queue
                         .iter()
                         .rposition(|&(_, len)| len == cc)
-                        .map(|i| {
-                            let (lcn, _) = scan.data_run_queue.remove(i);
-                            lcn
-                        })
+                        .map(|i| scan.data_run_queue.remove(i).0)
                 });
 
             if let Some(lcn) = lcn {
@@ -5356,12 +5494,33 @@ fn extend_ntfs_compressed_index(
             scan.prev_data_end = run_data_end;
             if run_data_end > stream_abs_len {
                 scan.skip_data_bytes = run_data_end - stream_abs_len;
+                // The remaining run data isn't in the stream yet; the skip
+                // path will decompress+discard it. Reset the rolling buffer
+                // so it stays contiguous: after the skip completes, new
+                // metadata bytes begin at run_data_end.
+                scan.stream.clear();
+                scan.stream_base = run_data_end;
+                scan.search_resume = run_data_end;
                 break;
             }
         }
 
+        // Only advance search_resume if the inner loop scanned the entire
+        // haystack without finding a needle. If it broke for "insufficient
+        // bytes for entry C", search_resume was already pinned to that
+        // needle position so we re-find it next pass.
+        if full_scan_completed {
+            let stream_end_abs = scan.stream_base + scan.stream.len() as u64;
+            let new_resume = stream_end_abs.saturating_sub(15);
+            if new_resume > scan.search_resume {
+                scan.search_resume = new_resume;
+            }
+        }
+
         // Drain processed stream data.
-        if let Some(drain_local) = to_local(scan.prev_data_end) {
+        if let Some(drain_local) =
+            stream_local_offset(scan.prev_data_end, scan.stream_base, scan.stream.len())
+        {
             let drain_local = drain_local.min(scan.stream.len());
             if drain_local > 4 * 1024 * 1024 {
                 let keep = scan.stream.len() - drain_local;

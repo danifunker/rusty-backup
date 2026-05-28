@@ -72,7 +72,7 @@ reqwest = { version = "0.13", features = ["blocking", "json"] }
 webbrowser = "1.0"
 dirs = "6"
 unicode-normalization = "0.1"
-flate2 = "1"
+flate2 = { version = "1", default-features = false, features = ["zlib-ng"] }
 bzip2 = "0.6"
 zip = { version = "2", default-features = false, features = ["deflate", "aes-crypto"] }
 base64 = "0.22"

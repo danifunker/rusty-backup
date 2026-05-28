@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
 use anyhow::{bail, Result};
@@ -387,6 +388,7 @@ pub struct NtfsFilesystem<R> {
     ntfs_version: (u8, u8),
     fs_type_string: String,
     used_bytes: u64,
+    mft_cache: HashMap<u64, Vec<u8>>,
 }
 
 impl<R: Read + Seek> NtfsFilesystem<R> {
@@ -414,6 +416,7 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
             ntfs_version: (0, 0),
             fs_type_string: String::new(),
             used_bytes: 0,
+            mft_cache: HashMap::new(),
         };
 
         // Read NTFS version from $Volume (MFT record #3)
@@ -428,9 +431,6 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
         // Read volume label from $Volume
         fs.label = fs.read_volume_label();
 
-        // Read used size from $Bitmap
-        fs.used_bytes = fs.calculate_used_bytes().unwrap_or(0);
-
         Ok(fs)
     }
 
@@ -439,8 +439,14 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
         self.partition_offset + cluster * self.cluster_size
     }
 
-    /// Read an MFT record by record number.
+    const MFT_CACHE_MAX: usize = 4096;
+
+    /// Read an MFT record by record number, returning a cached copy when available.
     fn read_mft_record(&mut self, record_number: u64) -> Result<Vec<u8>, FilesystemError> {
+        if let Some(cached) = self.mft_cache.get(&record_number) {
+            return Ok(cached.clone());
+        }
+
         let mft_offset = self.cluster_offset(self.mft_cluster);
         let record_offset = mft_offset + record_number * self.mft_record_size as u64;
 
@@ -457,6 +463,11 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
         }
 
         apply_fixup(&mut record, self.bytes_per_sector)?;
+
+        if self.mft_cache.len() >= Self::MFT_CACHE_MAX {
+            self.mft_cache.clear();
+        }
+        self.mft_cache.insert(record_number, record.clone());
 
         Ok(record)
     }
@@ -615,6 +626,13 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
         Ok(data)
     }
 
+    /// Populate `used_bytes` from $Bitmap if not already computed.
+    pub fn ensure_used_bytes(&mut self) {
+        if self.used_bytes == 0 {
+            self.used_bytes = self.calculate_used_bytes().unwrap_or(0);
+        }
+    }
+
     /// Calculate used bytes by reading the $Bitmap (MFT record #6).
     fn calculate_used_bytes(&mut self) -> Result<u64, FilesystemError> {
         let record = self.read_mft_record(MFT_RECORD_BITMAP)?;
@@ -737,63 +755,96 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
         )
     }
 
-    /// Parse index entries from $INDEX_ALLOCATION (non-resident B+ tree nodes).
+    /// Resolve a VCN (virtual cluster number) within an attribute's data runs
+    /// to an absolute byte offset on disk. Returns `None` for sparse runs.
+    fn resolve_vcn_to_offset(&self, runs: &[DataRun], vcn: u64) -> Option<u64> {
+        let mut run_vcn: u64 = 0;
+        for run in runs {
+            let run_end = run_vcn + run.length;
+            if vcn >= run_vcn && vcn < run_end {
+                if run.cluster_offset == 0 {
+                    return None;
+                }
+                let offset_in_run = vcn - run_vcn;
+                return Some(self.cluster_offset((run.cluster_offset as u64) + offset_in_run));
+            }
+            run_vcn = run_end;
+        }
+        None
+    }
+
+    /// Parse index entries from $INDEX_ALLOCATION by reading one INDX record at
+    /// a time via VCN lookup, skipping records the bitmap marks as unused.
     fn parse_index_allocation_entries(
         &mut self,
         attr: &MftAttribute,
-        _bitmap: &[u8],
+        bitmap: &[u8],
         parent_path: &str,
         entries: &mut Vec<FileEntry>,
     ) -> Result<(), FilesystemError> {
-        let data = self.read_attribute_data(attr, None)?;
-        // Index allocation is a sequence of INDX records
-        let record_size = 4096; // Standard NTFS index record size
-        let mut pos = 0;
+        let record_size: u64 = 4096;
+        let clusters_per_record = (record_size + self.cluster_size - 1) / self.cluster_size;
+        let total_records = if attr.real_size > 0 {
+            attr.real_size / record_size
+        } else {
+            attr.allocated_size / record_size
+        };
 
-        while pos + record_size <= data.len() {
-            let record = &data[pos..pos + record_size];
+        let runs = attr.data_runs.clone();
 
-            // Check for INDX magic
-            if &record[0..4] != b"INDX" {
-                pos += record_size;
+        for i in 0..total_records {
+            if !bitmap.is_empty() {
+                let byte_idx = i as usize / 8;
+                let bit_idx = i as usize % 8;
+                if byte_idx < bitmap.len() && bitmap[byte_idx] & (1 << bit_idx) == 0 {
+                    continue;
+                }
+            }
+
+            let vcn = i * clusters_per_record;
+            let disk_offset = match self.resolve_vcn_to_offset(&runs, vcn) {
+                Some(off) => off,
+                None => continue,
+            };
+
+            self.reader.seek(SeekFrom::Start(disk_offset))?;
+            let mut record_buf = vec![0u8; record_size as usize];
+            if self.reader.read_exact(&mut record_buf).is_err() {
                 continue;
             }
 
-            // Apply fixup to a copy
-            let mut record_copy = record.to_vec();
-            if apply_fixup(&mut record_copy, self.bytes_per_sector).is_err() {
-                pos += record_size;
+            if &record_buf[0..4] != b"INDX" {
                 continue;
             }
 
-            // Index node header is at offset 0x18 in INDX record
+            if apply_fixup(&mut record_buf, self.bytes_per_sector).is_err() {
+                continue;
+            }
+
             let node_offset = 0x18;
-            if node_offset + 16 > record_copy.len() {
-                pos += record_size;
+            if node_offset + 16 > record_buf.len() {
                 continue;
             }
 
             let entries_offset = u32::from_le_bytes([
-                record_copy[node_offset],
-                record_copy[node_offset + 1],
-                record_copy[node_offset + 2],
-                record_copy[node_offset + 3],
+                record_buf[node_offset],
+                record_buf[node_offset + 1],
+                record_buf[node_offset + 2],
+                record_buf[node_offset + 3],
             ]) as usize;
 
             let entries_size = u32::from_le_bytes([
-                record_copy[node_offset + 4],
-                record_copy[node_offset + 5],
-                record_copy[node_offset + 6],
-                record_copy[node_offset + 7],
+                record_buf[node_offset + 4],
+                record_buf[node_offset + 5],
+                record_buf[node_offset + 6],
+                record_buf[node_offset + 7],
             ]) as usize;
 
             let start = node_offset + entries_offset;
-            let end = (node_offset + entries_size).min(record_copy.len());
+            let end = (node_offset + entries_size).min(record_buf.len());
             if start < end {
-                let _ = self.parse_index_entry_list(&record_copy[start..end], parent_path, entries);
+                let _ = self.parse_index_entry_list(&record_buf[start..end], parent_path, entries);
             }
-
-            pos += record_size;
         }
 
         Ok(())
@@ -1449,6 +1500,7 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
         let record_offset = mft_offset + record_number * self.mft_record_size as u64;
         self.reader.seek(SeekFrom::Start(record_offset))?;
         self.reader.write_all(record)?;
+        self.mft_cache.remove(&record_number);
         Ok(())
     }
 
