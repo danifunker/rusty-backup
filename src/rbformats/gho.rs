@@ -4968,8 +4968,13 @@ fn open_ntfs_compressed_mft_only(
         if chunk_buf[local] != 0x78 || chunk_buf[local + 1] != 0x01 {
             local += 1;
             consecutive_fails += 1;
-            if consecutive_fails > 256 {
-                break;
+            if consecutive_fails > 1_000_000 {
+                // Ghost interleaves structural records between zlib blocks; a
+                // long non-zlib gap must not abort the scan (doing so abandons
+                // the rest of the stream and silently drops data). Reset and
+                // keep scanning forward to resync at the next block. The high
+                // cap only guards against u32 overflow.
+                consecutive_fails = 0;
             }
             continue;
         }
@@ -5011,8 +5016,13 @@ fn open_ntfs_compressed_mft_only(
         if !ok || total_out == 0 {
             local += 2;
             consecutive_fails += 1;
-            if consecutive_fails > 256 {
-                break;
+            if consecutive_fails > 1_000_000 {
+                // Ghost interleaves structural records between zlib blocks; a
+                // long non-zlib gap must not abort the scan (doing so abandons
+                // the rest of the stream and silently drops data). Reset and
+                // keep scanning forward to resync at the next block. The high
+                // cap only guards against u32 overflow.
+                consecutive_fails = 0;
             }
             continue;
         }
@@ -5274,8 +5284,13 @@ fn extend_ntfs_compressed_index(
         if chunk_buf[local] != 0x78 || chunk_buf[local + 1] != 0x01 {
             local += 1;
             consecutive_fails += 1;
-            if consecutive_fails > 256 {
-                break;
+            if consecutive_fails > 1_000_000 {
+                // Ghost interleaves structural records between zlib blocks; a
+                // long non-zlib gap must not abort the scan (doing so abandons
+                // the rest of the stream and silently drops data). Reset and
+                // keep scanning forward to resync at the next block. The high
+                // cap only guards against u32 overflow.
+                consecutive_fails = 0;
             }
             continue;
         }
@@ -5318,8 +5333,8 @@ fn extend_ntfs_compressed_index(
             if !ok || total_out == 0 {
                 local += 2;
                 consecutive_fails += 1;
-                if consecutive_fails > 256 {
-                    break;
+                if consecutive_fails > 1_000_000 {
+                    consecutive_fails = 0;
                 }
                 continue;
             }
@@ -5386,8 +5401,13 @@ fn extend_ntfs_compressed_index(
         if !ok || total_out == 0 {
             local += 2;
             consecutive_fails += 1;
-            if consecutive_fails > 256 {
-                break;
+            if consecutive_fails > 1_000_000 {
+                // Ghost interleaves structural records between zlib blocks; a
+                // long non-zlib gap must not abort the scan (doing so abandons
+                // the rest of the stream and silently drops data). Reset and
+                // keep scanning forward to resync at the next block. The high
+                // cap only guards against u32 overflow.
+                consecutive_fails = 0;
             }
             continue;
         }
@@ -5548,17 +5568,27 @@ fn extend_ntfs_compressed_index(
 
     // Save resume position.
     scan.file_offset = chunk_start + local as u64;
+    let final_file_offset = scan.file_offset;
+    let reached_eof = final_file_offset + 4 >= end;
 
     // Re-sort runs after adding new ones.
     index.runs.sort_by_key(|r| r.lcn_start);
 
+    let total_decompressed = comp.total_decompressed;
+    let run_count = index.runs.len();
+    let block_count = comp.blocks.len();
     // If we reached EOF, mark scan as complete.
-    if scan.file_offset + 4 >= end {
+    if reached_eof {
         comp.lazy_scan = None;
         log::info!(
-            "Lazy scan complete: {} runs, {} blocks",
-            index.runs.len(),
-            comp.blocks.len()
+            "Lazy scan complete (EOF): {run_count} runs, {block_count} blocks, \
+             file_offset={final_file_offset} end={end} total_decompressed={total_decompressed}",
+        );
+    } else {
+        log::warn!(
+            "Lazy scan STOPPED EARLY at file_offset={final_file_offset} of end={end} \
+             ({run_count} runs, {block_count} blocks, total_decompressed={total_decompressed}) \
+             — remaining compressed data was not decoded",
         );
     }
 
@@ -5714,6 +5744,26 @@ fn read_ntfs_file_aware_into(
     let file_offset = run.file_offset + cluster_in_run * cluster_size + offset_in_cluster as u64;
 
     if let Some(cs) = compressed {
+        // A mapped run whose decompressed data wasn't recorded (file_offset at
+        // or past the end of the decompressed stream) would make the reader
+        // return 0, which sequential consumers (e.g. whole-disk export) treat
+        // as EOF and stop early. Zero-fill the cluster instead so reads keep
+        // advancing, and log it so the mismapping can be investigated.
+        if file_offset >= cs.total_decompressed {
+            log::warn!(
+                "GHO NTFS: run for lcn {lcn} maps to decompressed offset {file_offset} \
+                 >= total_decompressed {} (run lcn_start={} cluster_count={} file_offset={}); \
+                 zero-filling cluster",
+                cs.total_decompressed,
+                run.lcn_start,
+                run.cluster_count,
+                run.file_offset,
+            );
+            for b in &mut out[..to_read] {
+                *b = 0;
+            }
+            return Ok(to_read);
+        }
         let mut reader = NtfsDecompressingReader {
             inner,
             state: cs,
