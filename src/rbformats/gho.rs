@@ -4669,11 +4669,7 @@ fn index_ntfs_file_aware<R: Read + Seek>(
         if &rec_buf[0..4] != b"FILE" {
             continue;
         }
-        // Skip $MFT itself (record 0) — it's already run 0.
         let rec_num = u32::from_le_bytes([rec_buf[44], rec_buf[45], rec_buf[46], rec_buf[47]]);
-        if rec_num == 0 {
-            continue;
-        }
         // Skip $BadClus (record 8) — it has a sparse data run covering
         // the entire volume but no actual data is stored.
         if rec_num == 8 {
@@ -4682,11 +4678,19 @@ fn index_ntfs_file_aware<R: Read + Seek>(
         let _ = apply_fixup(&mut rec_buf, vbr.bytes_per_sector);
         let attrs = parse_mft_attributes(&rec_buf, vbr.mft_record_size);
         for attr in &attrs {
-            if !attr.resident && !attr.data_runs.is_empty() {
-                for dr in &attr.data_runs {
-                    if dr.cluster_offset >= 0 && dr.length > 0 {
-                        data_run_queue.push((dr.cluster_offset as u64, dr.length));
-                    }
+            if attr.resident || attr.data_runs.is_empty() {
+                continue;
+            }
+            // Record 0 is $MFT itself; fragment 0 is already registered as
+            // run 0, but its later $DATA fragments must be queued so they
+            // get mapped — otherwise high-numbered MFT records read as zeros.
+            let skip_first = rec_num == 0 && attr.attr_type == 0x80;
+            for (i, dr) in attr.data_runs.iter().enumerate() {
+                if skip_first && i == 0 {
+                    continue;
+                }
+                if dr.cluster_offset >= 0 && dr.length > 0 {
+                    data_run_queue.push((dr.cluster_offset as u64, dr.length));
                 }
             }
         }
@@ -5084,18 +5088,29 @@ fn open_ntfs_compressed_mft_only(
                         continue;
                     }
                     let rec_num = u32::from_le_bytes([rec[44], rec[45], rec[46], rec[47]]);
-                    if rec_num == 0 || rec_num == 8 {
+                    if rec_num == 8 {
                         continue;
                     }
                     let mut rec_buf = rec.to_vec();
                     let _ = apply_fixup(&mut rec_buf, vbr.bytes_per_sector);
                     let attrs = parse_mft_attributes(&rec_buf, vbr.mft_record_size);
                     for attr in &attrs {
-                        if !attr.resident && !attr.data_runs.is_empty() {
-                            for dr in &attr.data_runs {
-                                if dr.cluster_offset >= 0 && dr.length > 0 {
-                                    data_run_queue.push((dr.cluster_offset as u64, dr.length));
-                                }
+                        if attr.resident || attr.data_runs.is_empty() {
+                            continue;
+                        }
+                        // Record 0 is $MFT itself. Its $DATA runs describe
+                        // every MFT fragment; fragment 0 is already registered
+                        // as the MFT run above, so skip it here, but queue the
+                        // later fragments so the lazy scan maps them. Without
+                        // this, high-numbered MFT records (which live in those
+                        // fragments) read back as zeros -> "invalid magic".
+                        let skip_first = rec_num == 0 && attr.attr_type == 0x80;
+                        for (i, dr) in attr.data_runs.iter().enumerate() {
+                            if skip_first && i == 0 {
+                                continue;
+                            }
+                            if dr.cluster_offset >= 0 && dr.length > 0 {
+                                data_run_queue.push((dr.cluster_offset as u64, dr.length));
                             }
                         }
                     }

@@ -389,6 +389,11 @@ pub struct NtfsFilesystem<R> {
     fs_type_string: String,
     used_bytes: u64,
     mft_cache: HashMap<u64, Vec<u8>>,
+    /// Data runs of the $MFT's own $DATA attribute. Empty until loaded in
+    /// `open()`; when populated, record reads/writes resolve through these
+    /// runs so a fragmented MFT is read correctly instead of assuming the
+    /// whole table is one contiguous run starting at `mft_cluster`.
+    mft_data_runs: Vec<DataRun>,
 }
 
 impl<R: Read + Seek> NtfsFilesystem<R> {
@@ -417,7 +422,14 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
             fs_type_string: String::new(),
             used_bytes: 0,
             mft_cache: HashMap::new(),
+            mft_data_runs: Vec::new(),
         };
+
+        // Load the $MFT's own data runs (record 0) so reads of high record
+        // numbers follow the table across fragments. Record 0 always lives in
+        // the first fragment at `mft_cluster`, so this initial read uses the
+        // contiguous fallback (mft_data_runs is still empty here).
+        fs.mft_data_runs = fs.read_mft_self_data_runs().unwrap_or_default();
 
         // Read NTFS version from $Volume (MFT record #3)
         fs.ntfs_version = fs.read_ntfs_version().unwrap_or((0, 0));
@@ -447,12 +459,18 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
             return Ok(cached.clone());
         }
 
-        let mft_offset = self.cluster_offset(self.mft_cluster);
-        let record_offset = mft_offset + record_number * self.mft_record_size as u64;
-
-        self.reader.seek(SeekFrom::Start(record_offset))?;
         let mut record = vec![0u8; self.mft_record_size as usize];
-        self.reader.read_exact(&mut record)?;
+        let logical = record_number * self.mft_record_size as u64;
+        if self.mft_data_runs.is_empty() {
+            // Fallback: assume the MFT is one contiguous run. Used while
+            // bootstrapping (reading record 0 before runs are loaded) and for
+            // volumes whose $MFT $DATA runs we couldn't parse.
+            let record_offset = self.cluster_offset(self.mft_cluster) + logical;
+            self.reader.seek(SeekFrom::Start(record_offset))?;
+            self.reader.read_exact(&mut record)?;
+        } else {
+            self.read_mft_bytes(logical, &mut record)?;
+        }
 
         // Verify FILE magic
         if &record[0..4] != b"FILE" {
@@ -470,6 +488,44 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
         self.mft_cache.insert(record_number, record.clone());
 
         Ok(record)
+    }
+
+    /// Parse the $MFT's own non-resident $DATA runs from record 0 so that
+    /// record reads/writes can follow a fragmented MFT across the disk.
+    fn read_mft_self_data_runs(&mut self) -> Result<Vec<DataRun>, FilesystemError> {
+        let record = self.read_mft_record(0)?;
+        let attrs = parse_mft_attributes(&record, self.mft_record_size);
+        for attr in &attrs {
+            if attr.attr_type == ATTR_DATA && !attr.resident && !attr.data_runs.is_empty() {
+                return Ok(attr.data_runs.clone());
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    /// Read `buf.len()` bytes starting at logical byte offset `start` within
+    /// the $MFT data stream, resolving each cluster through the MFT's data
+    /// runs. Handles records that straddle a run boundary by reading one
+    /// run-contiguous chunk at a time.
+    fn read_mft_bytes(&mut self, start: u64, buf: &mut [u8]) -> Result<(), FilesystemError> {
+        let runs = self.mft_data_runs.clone();
+        let cluster_size = self.cluster_size;
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            let logical = start + filled as u64;
+            let vcn = logical / cluster_size;
+            let intra = (logical % cluster_size) as usize;
+            let disk_off = self.resolve_vcn_to_offset(&runs, vcn).ok_or_else(|| {
+                FilesystemError::Parse(format!(
+                    "MFT logical offset {logical} (vcn {vcn}) not mapped by $MFT data runs"
+                ))
+            })?;
+            let chunk = (cluster_size as usize - intra).min(buf.len() - filled);
+            self.reader.seek(SeekFrom::Start(disk_off + intra as u64))?;
+            self.reader.read_exact(&mut buf[filled..filled + chunk])?;
+            filled += chunk;
+        }
+        Ok(())
     }
 
     /// Read the NTFS version from the $Volume MFT entry (record #3).
@@ -1496,11 +1552,38 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
         record: &mut [u8],
     ) -> Result<(), FilesystemError> {
         prepare_fixup(record, self.bytes_per_sector);
-        let mft_offset = self.cluster_offset(self.mft_cluster);
-        let record_offset = mft_offset + record_number * self.mft_record_size as u64;
-        self.reader.seek(SeekFrom::Start(record_offset))?;
-        self.reader.write_all(record)?;
+        let logical = record_number * self.mft_record_size as u64;
+        if self.mft_data_runs.is_empty() {
+            let record_offset = self.cluster_offset(self.mft_cluster) + logical;
+            self.reader.seek(SeekFrom::Start(record_offset))?;
+            self.reader.write_all(record)?;
+        } else {
+            self.write_mft_bytes(logical, record)?;
+        }
         self.mft_cache.remove(&record_number);
+        Ok(())
+    }
+
+    /// Write `buf` to the $MFT data stream starting at logical byte offset
+    /// `start`, following the MFT's data runs across fragments.
+    fn write_mft_bytes(&mut self, start: u64, buf: &[u8]) -> Result<(), FilesystemError> {
+        let runs = self.mft_data_runs.clone();
+        let cluster_size = self.cluster_size;
+        let mut written = 0usize;
+        while written < buf.len() {
+            let logical = start + written as u64;
+            let vcn = logical / cluster_size;
+            let intra = (logical % cluster_size) as usize;
+            let disk_off = self.resolve_vcn_to_offset(&runs, vcn).ok_or_else(|| {
+                FilesystemError::Parse(format!(
+                    "MFT logical offset {logical} (vcn {vcn}) not mapped by $MFT data runs"
+                ))
+            })?;
+            let chunk = (cluster_size as usize - intra).min(buf.len() - written);
+            self.reader.seek(SeekFrom::Start(disk_off + intra as u64))?;
+            self.reader.write_all(&buf[written..written + chunk])?;
+            written += chunk;
+        }
         Ok(())
     }
 
