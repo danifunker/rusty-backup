@@ -305,6 +305,112 @@ fn open_source_reader(source_path: &Path) -> Result<(super::BoxReadSeek, u64)> {
     }
 }
 
+/// Reassemble a bootable disk around a full-disk GHO superfloppy volume.
+///
+/// A whole-disk Ghost backup decodes to a *bare* filesystem volume: sector 0 is
+/// the filesystem VBR, not a partition table. The volume's original on-disk
+/// position is the only trace of the partitioning that's left, recorded in the
+/// VBR `hidden_sectors` field (offset 0x1C). When that's non-zero and the VBR is
+/// a recognised FAT/NTFS/exFAT, synthesize an MBR (with boot code) and place the
+/// volume as the active first partition at its original LBA, writing the
+/// reassembled disk to a tempfile. Returns a rewound reader over that disk plus
+/// its byte length.
+///
+/// Returns `Ok(None)` when no reassembly applies — no boot signature,
+/// `hidden_sectors == 0` (e.g. a floppy-sized GHO), or an unrecognised VBR. The
+/// caller then uses the bare volume as-is.
+///
+/// `reader` is read from offset 0 and fully consumed on the `Some` path.
+pub(crate) fn reassemble_gho_bootable_disk(
+    reader: &mut (impl Read + Seek),
+    source_data_size: u64,
+    progress_cb: &mut dyn FnMut(u64),
+    cancel_check: &dyn Fn() -> bool,
+) -> Result<Option<(File, u64)>> {
+    use crate::restore::superfloppy_wrap::{self, WrapAlignment, WrapParams, WrapTable};
+
+    let mut vbr = [0u8; 512];
+    reader.seek(SeekFrom::Start(0))?;
+    let vbr_ok = reader.read_exact(&mut vbr).is_ok();
+    reader.seek(SeekFrom::Start(0))?;
+    let hidden = if vbr_ok && vbr[510] == 0x55 && vbr[511] == 0xAA {
+        u32::from_le_bytes([vbr[0x1C], vbr[0x1D], vbr[0x1E], vbr[0x1F]]) as u64
+    } else {
+        0
+    };
+    let fs_hint = match (hidden > 0, fs_hint_from_vbr(&vbr)) {
+        (true, Some(h)) => h,
+        _ => return Ok(None),
+    };
+
+    let type_byte = superfloppy_wrap::mbr_type_byte_for_fs(fs_hint);
+    // Partition must cover the decoded bytes and the volume's own declared
+    // size (NTFS total_sectors), whichever is larger.
+    let data_sectors = source_data_size.div_ceil(512);
+    let part_sectors = data_sectors.max(ntfs_total_sectors_from_vbr(&vbr));
+    let partition_size_bytes = part_sectors * 512;
+    let target_size_bytes = hidden * 512 + partition_size_bytes;
+    let params = WrapParams {
+        table: WrapTable::Mbr {
+            type_byte,
+            bootable: true,
+            alignment: WrapAlignment::Custom(hidden),
+        },
+        partition_size_bytes,
+        target_size_bytes,
+        source_fs_hint: fs_hint.to_string(),
+    };
+
+    log::info!(
+        "Reassembling bootable disk from GHO: {} partition at LBA {}, {} byte disk",
+        fs_hint,
+        hidden,
+        target_size_bytes,
+    );
+
+    let mut tmp =
+        tempfile::tempfile().context("create tempfile for GHO bootable-disk reassembly")?;
+    let mut log = |m: &str| log::info!("{m}");
+    // `wrap_and_write` takes sized callback generics; re-wrap the dyn refs.
+    let mut prog = |b: u64| progress_cb(b);
+    let cancel = || cancel_check();
+    superfloppy_wrap::wrap_and_write(
+        reader,
+        source_data_size,
+        &mut tmp,
+        &params,
+        &mut prog,
+        &cancel,
+        &mut log,
+    )?;
+    tmp.seek(SeekFrom::Start(0))?;
+    Ok(Some((tmp, target_size_bytes)))
+}
+
+/// Open a whole-disk export source, reassembling a bootable disk first when the
+/// source is a full-disk GHO superfloppy (see [`reassemble_gho_bootable_disk`]).
+///
+/// Every whole-disk format exporter (Raw, VMDK flat/sparse, dynamic VHD, QCOW2,
+/// CHD) routes through this so the emitted image carries a partition table +
+/// boot code rather than a partitionless volume. Sources that don't need
+/// reassembly (everything that isn't a full-disk GHO) pass straight through
+/// [`open_source_reader`] unchanged.
+fn open_export_source(
+    source_path: &Path,
+    progress_cb: &mut dyn FnMut(u64),
+    cancel_check: &dyn Fn() -> bool,
+) -> Result<(super::BoxReadSeek, u64)> {
+    let (mut reader, size) = open_source_reader(source_path)?;
+    if crate::model::source_reader::is_gho_path(source_path) {
+        if let Some((file, disk_size)) =
+            reassemble_gho_bootable_disk(&mut reader, size, progress_cb, cancel_check)?
+        {
+            return Ok((Box::new(file), disk_size));
+        }
+    }
+    Ok((reader, size))
+}
+
 pub fn export_whole_disk(
     format: ExportFormat,
     source_path: &Path,
@@ -511,69 +617,13 @@ pub fn export_whole_disk(
         // Raw image/device path.
         //
         // Unwrap any container (VHD, 2MG, DMG, DiskCopy 4.2, DOS-order .dsk, WOZ)
-        // so Raw/2MG exports always emit flat sector data — not the source's header/footer bytes.
-        let (mut reader, source_data_size) = open_source_reader(source_path)?;
-
-        // GHO whole-disk backups present a bare NTFS/exFAT/FAT volume
-        // (superfloppy) even though the original disk had a partition table.
-        // The volume's VBR records its original on-disk LBA in `hidden_sectors`;
-        // if non-zero, reassemble the disk — MBR (with boot code) + active
-        // partition at that LBA + the volume — so the Raw export is a bootable
-        // disk image rather than a partitionless volume.
-        if format == ExportFormat::Raw && crate::model::source_reader::is_gho_path(source_path) {
-            let mut vbr = [0u8; 512];
-            reader.seek(SeekFrom::Start(0))?;
-            let vbr_ok = reader.read_exact(&mut vbr).is_ok();
-            reader.seek(SeekFrom::Start(0))?;
-            let hidden = if vbr_ok && vbr[510] == 0x55 && vbr[511] == 0xAA {
-                u32::from_le_bytes([vbr[0x1C], vbr[0x1D], vbr[0x1E], vbr[0x1F]]) as u64
-            } else {
-                0
-            };
-            if let (true, Some(fs_hint)) = (hidden > 0, fs_hint_from_vbr(&vbr)) {
-                use crate::restore::superfloppy_wrap::{
-                    self, WrapAlignment, WrapParams, WrapTable,
-                };
-                let type_byte = superfloppy_wrap::mbr_type_byte_for_fs(fs_hint);
-                // Partition must cover the decoded bytes and the volume's own
-                // declared size (NTFS total_sectors), whichever is larger.
-                let data_sectors = source_data_size.div_ceil(512);
-                let part_sectors = data_sectors.max(ntfs_total_sectors_from_vbr(&vbr));
-                let partition_size_bytes = part_sectors * 512;
-                let target_size_bytes = hidden * 512 + partition_size_bytes;
-                let params = WrapParams {
-                    table: WrapTable::Mbr {
-                        type_byte,
-                        bootable: true,
-                        alignment: WrapAlignment::Custom(hidden),
-                    },
-                    partition_size_bytes,
-                    target_size_bytes,
-                    source_fs_hint: fs_hint.to_string(),
-                };
-                let mut dest = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(dest_path)
-                    .with_context(|| format!("failed to create {}", dest_path.display()))?;
-                log_cb(&format!(
-                    "Reassembling bootable disk: {} partition at LBA {}, {} byte disk",
-                    fs_hint, hidden, target_size_bytes,
-                ));
-                superfloppy_wrap::wrap_and_write(
-                    &mut reader,
-                    source_data_size,
-                    &mut dest,
-                    &params,
-                    &mut progress_cb,
-                    &cancel_check,
-                    &mut log_cb,
-                )?;
-                return Ok(());
-            }
-        }
+        // so Raw/2MG exports always emit flat sector data — not the source's
+        // header/footer bytes. Full-disk GHO sources are reassembled into a
+        // bootable disk (MBR + boot code + partition at the original LBA) by
+        // `open_export_source` so the Raw image is bootable, not a partitionless
+        // volume.
+        let (mut reader, source_data_size) =
+            open_export_source(source_path, &mut progress_cb, &cancel_check)?;
 
         // If the source has an APM partition table and the caller supplied
         // size overrides, reconstruct the disk with patched APM entries and
@@ -1009,7 +1059,8 @@ fn export_whole_disk_vhd_dynamic(
         written
     } else {
         // Raw image/device: unwrap any container, then stream.
-        let (mut reader, source_data_size) = open_source_reader(source_path)?;
+        let (mut reader, source_data_size) =
+            open_export_source(source_path, &mut progress_cb, &cancel_check)?;
         super::vhd::export_whole_disk_vhd_dynamic(
             &mut reader,
             &mut out,
@@ -1084,7 +1135,8 @@ fn export_whole_disk_qcow2(
         )?;
         written
     } else {
-        let (mut reader, source_data_size) = open_source_reader(source_path)?;
+        let (mut reader, source_data_size) =
+            open_export_source(source_path, &mut progress_cb, &cancel_check)?;
         super::qcow2::export_qcow2(
             &mut reader,
             &mut out,
@@ -1148,7 +1200,8 @@ fn export_whole_disk_vmdk_flat(
         )?;
         written
     } else {
-        let (mut reader, source_data_size) = open_source_reader(source_path)?;
+        let (mut reader, source_data_size) =
+            open_export_source(source_path, &mut progress_cb, &cancel_check)?;
         super::vmdk::export_vmdk_flat(
             &mut reader,
             dest_path,
@@ -1220,7 +1273,8 @@ fn export_whole_disk_vmdk_sparse(
         )?;
         written
     } else {
-        let (mut reader, source_data_size) = open_source_reader(source_path)?;
+        let (mut reader, source_data_size) =
+            open_export_source(source_path, &mut progress_cb, &cancel_check)?;
         super::vmdk_sparse::export_vmdk_sparse(
             &mut reader,
             &mut out,
@@ -1265,7 +1319,8 @@ pub fn export_whole_disk_chd(
         bail!("CHD export from backup folders is not implemented; export to VHD/Raw first");
     }
 
-    let (mut reader, source_data_size) = open_source_reader(source_path)?;
+    let (mut reader, source_data_size) =
+        open_export_source(source_path, &mut progress_cb, &cancel_check)?;
 
     // RDB-with-resize: route through reconstruct_raw_rdb_disk first
     // (which also picks up the PFS3 defragmenting clone for shrinks),
@@ -1440,6 +1495,78 @@ pub fn export_whole_disk_bincue(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal NTFS superfloppy: VBR at sector 0 with `hidden_sectors` and
+    /// `total_sectors`, the rest zero. Mirrors what a full-disk GHO decodes to.
+    fn ntfs_superfloppy(hidden_sectors: u32, total_sectors: u64, fs_bytes: u64) -> Vec<u8> {
+        let mut v = vec![0u8; fs_bytes as usize];
+        v[0] = 0xEB;
+        v[1] = 0x52;
+        v[2] = 0x90;
+        v[3..11].copy_from_slice(b"NTFS    ");
+        v[11..13].copy_from_slice(&512u16.to_le_bytes());
+        v[0x1C..0x20].copy_from_slice(&hidden_sectors.to_le_bytes());
+        v[0x28..0x30].copy_from_slice(&total_sectors.to_le_bytes());
+        v[510] = 0x55;
+        v[511] = 0xAA;
+        v
+    }
+
+    /// Regression guard for the GHO->VMDK/VHD/etc. "no files in the image" bug:
+    /// a full-disk GHO decodes to a bare NTFS superfloppy, and every whole-disk
+    /// exporter must reassemble a real MBR-partitioned disk around it (not stream
+    /// the partitionless volume). Exercises the shared helper directly.
+    #[test]
+    fn reassemble_gho_wraps_superfloppy_with_mbr() {
+        let fs_bytes = 4 * 1024 * 1024u64;
+        let total_sectors = fs_bytes / 512;
+        let src = ntfs_superfloppy(63, total_sectors, fs_bytes);
+        let mut reader = std::io::Cursor::new(src);
+
+        let (mut disk, disk_size) =
+            reassemble_gho_bootable_disk(&mut reader, fs_bytes, &mut |_| {}, &|| false)
+                .expect("reassembly should not error")
+                .expect("hidden_sectors > 0 + NTFS VBR should trigger reassembly");
+
+        // Disk = MBR + 63-sector gap + the volume.
+        assert_eq!(disk_size, 63 * 512 + fs_bytes);
+
+        let mut buf = vec![0u8; disk_size as usize];
+        disk.seek(SeekFrom::Start(0)).unwrap();
+        disk.read_exact(&mut buf).unwrap();
+
+        // MBR boot signature + a bootable NTFS (0x07) partition at LBA 63.
+        assert_eq!(&buf[510..512], &[0x55, 0xAA], "MBR signature present");
+        let entry = &buf[446..462];
+        assert_eq!(entry[0], 0x80, "partition marked bootable");
+        assert_eq!(entry[4], 0x07, "NTFS partition type");
+        assert_eq!(
+            u32::from_le_bytes(entry[8..12].try_into().unwrap()),
+            63,
+            "partition starts at the original LBA"
+        );
+
+        // The volume's VBR sits at LBA 63 with hidden_sectors patched to match.
+        let off = 63 * 512;
+        assert_eq!(&buf[off + 3..off + 11], b"NTFS    ", "VBR copied to LBA 63");
+        assert_eq!(
+            u32::from_le_bytes(buf[off + 0x1C..off + 0x20].try_into().unwrap()),
+            63,
+            "hidden_sectors patched so the volume still mounts"
+        );
+    }
+
+    /// A floppy-sized GHO (no partition table, hidden_sectors == 0) must NOT be
+    /// wrapped — the exporter uses the bare volume as-is.
+    #[test]
+    fn reassemble_gho_passes_through_when_no_hidden_sectors() {
+        let fs_bytes = 1024 * 1024u64;
+        let src = ntfs_superfloppy(0, fs_bytes / 512, fs_bytes);
+        let mut reader = std::io::Cursor::new(src);
+        let result =
+            reassemble_gho_bootable_disk(&mut reader, fs_bytes, &mut |_| {}, &|| false).unwrap();
+        assert!(result.is_none(), "no reassembly without hidden_sectors");
+    }
 
     #[test]
     fn test_export_format_extension() {

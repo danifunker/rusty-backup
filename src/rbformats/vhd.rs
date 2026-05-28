@@ -833,15 +833,38 @@ pub fn export_whole_disk_vhd(
         || crate::model::source_reader::is_imz_path(source_path)
     {
         let mut reader = crate::model::source_reader::open_read(source_path)?;
-        let source_data_size = reader.seek(SeekFrom::End(0))?;
+        let mut source_data_size = reader.seek(SeekFrom::End(0))?;
         reader.seek(SeekFrom::Start(0))?;
+
+        // Full-disk GHO backups decode to a bare superfloppy volume (sector 0 is
+        // the FS VBR, not a partition table). Reassemble a bootable disk — MBR +
+        // boot code + the volume placed as the active partition at its original
+        // LBA — so the VHD carries a partition table rather than a partitionless
+        // volume. Non-GHO (IMZ) or floppy-sized GHO sources pass through bare.
+        let reassembled = if crate::model::source_reader::is_gho_path(source_path) {
+            super::export::reassemble_gho_bootable_disk(
+                &mut reader,
+                source_data_size,
+                &mut progress_cb,
+                &cancel_check,
+            )?
+        } else {
+            None
+        };
+        let mut source: Box<dyn Read> = match reassembled {
+            Some((file, disk_size)) => {
+                source_data_size = disk_size;
+                Box::new(file)
+            }
+            None => Box::new(reader),
+        };
 
         let mut writer = BufWriter::new(
             File::create(dest_path)
                 .with_context(|| format!("failed to create {}", dest_path.display()))?,
         );
         let mut buf = vec![0u8; CHUNK_SIZE];
-        let mut limited = (&mut reader).take(source_data_size);
+        let mut limited = (&mut source).take(source_data_size);
         loop {
             if cancel_check() {
                 bail!("export cancelled");
