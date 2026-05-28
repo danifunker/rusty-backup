@@ -988,6 +988,9 @@ impl BackupTab {
             Some(p) if rusty_backup::model::source_reader::is_chd_path(p) => {
                 rusty_backup::model::min_size_runner::MinSizeSource::Chd(p.to_path_buf())
             }
+            Some(p) if rusty_backup::model::source_reader::is_gho_path(p) => {
+                rusty_backup::model::min_size_runner::MinSizeSource::Gho(p.to_path_buf())
+            }
             _ => {
                 let Some(file_arc) = self.source_file.clone() else {
                     ctx.log.error(format!(

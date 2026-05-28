@@ -14,6 +14,7 @@ use std::thread;
 use crate::fs::{self, MinimumResult};
 use crate::os::SectorAlignedReader;
 use crate::rbformats::chd::ChdReader;
+use crate::rbformats::gho::GhoReader;
 
 /// Shared state between the GUI poll loop and the worker thread.
 pub struct MinSizeStatus {
@@ -66,6 +67,9 @@ pub enum MinSizeSource {
     },
     /// Path to a CHD container — the worker opens its own `ChdReader`.
     Chd(PathBuf),
+    /// Path to a GHO/GHS container (or any file of its span set) — the worker
+    /// opens its own `GhoReader` over the logical (decompressed) volume.
+    Gho(PathBuf),
 }
 
 /// Inputs to `spawn`.
@@ -159,6 +163,25 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
                 Err(e) => {
                     if let Ok(mut s) = status_thread.lock() {
                         s.error = Some(format!("open CHD failed: {e}"));
+                        s.finished = true;
+                    }
+                    return;
+                }
+            },
+            MinSizeSource::Gho(path) => match GhoReader::open(&path) {
+                Ok(reader) => fs::partition_minimum_size(
+                    reader,
+                    req.partition_offset,
+                    req.partition_type,
+                    req.partition_type_string.as_deref(),
+                    req.partition_size,
+                    true,
+                    None,
+                    &progress,
+                ),
+                Err(e) => {
+                    if let Ok(mut s) = status_thread.lock() {
+                        s.error = Some(format!("open GHO failed: {e:#}"));
                         s.finished = true;
                     }
                     return;

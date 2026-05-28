@@ -3843,6 +3843,14 @@ impl InspectTab {
         // raw .chd file at partition_offset would read compressed bytes.
         let source = if let Some(chd_path) = self.chd_image_path.clone() {
             rusty_backup::model::min_size_runner::MinSizeSource::Chd(chd_path)
+        } else if let Some(gho_path) = self
+            .image_file_path
+            .as_ref()
+            .filter(|p| rusty_backup::model::source_reader::is_gho_path(p))
+        {
+            // GHO/GHS images decompress through GhoReader; reading the raw
+            // file at partition_offset would hit compressed bytes.
+            rusty_backup::model::min_size_runner::MinSizeSource::Gho(gho_path.clone())
         } else if let Some(file_arc) = self.open_device_file.clone() {
             rusty_backup::model::min_size_runner::MinSizeSource::File {
                 file: file_arc,
