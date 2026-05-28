@@ -14,6 +14,7 @@ mod resize_popup;
 mod restore_tab;
 mod settings_dialog;
 mod size_mode_row;
+pub mod ui_logger;
 
 use backup_tab::BackupTab;
 use bulk_convert_dialog::{BulkConvertDialog, DialogAction as BulkConvertAction};
@@ -359,6 +360,16 @@ impl eframe::App for RustyBackupApp {
             || self.bulk_convert_status.is_some()
         {
             ctx.request_repaint();
+        }
+
+        // Drain `log` crate records (incl. worker-thread log::info! from the
+        // GHO reader) into the panel so they're visible in the UI.
+        for (level, msg) in ui_logger::drain() {
+            match level {
+                log::Level::Error => self.log_panel.error(msg),
+                log::Level::Warn => self.log_panel.warn(msg),
+                _ => self.log_panel.info(msg),
+            }
         }
 
         // Drain bulk-convert worker logs into the panel and clear when done.

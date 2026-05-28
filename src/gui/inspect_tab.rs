@@ -3370,6 +3370,14 @@ impl InspectTab {
                             // Min Size column (in-place trim point).
                             if let Some(sz) = in_place_min {
                                 ui.label(partition::format_size(sz));
+                            } else if let Some(&computed) =
+                                self.partition_min_sizes.get(&part.index)
+                            {
+                                // Computed, but equals the full partition size
+                                // (in_place_min filters those out). Show it so
+                                // the user sees the result rather than a blank;
+                                // it means the volume can't shrink in place.
+                                ui.label(partition::format_size(computed));
                             } else if let Some(pending) =
                                 self.pending_min_size_calcs.get(&part.index)
                             {

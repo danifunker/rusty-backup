@@ -4,9 +4,10 @@
 mod gui;
 
 fn main() -> eframe::Result {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format_timestamp_millis()
-        .init();
+    // Install a logger that mirrors records to stderr AND buffers them for the
+    // GUI log panel (so worker-thread log::info! lines, e.g. from the GHO
+    // reader, surface in the UI). Replaces the plain env_logger stderr sink.
+    gui::ui_logger::init();
     // Load icon from bytes with transparency preserved
     let icon_bytes = include_bytes!("../assets/icons/icon-256.png");
     let icon_image = image::load_from_memory_with_format(icon_bytes, image::ImageFormat::Png)
@@ -112,7 +113,10 @@ fn main() -> eframe::Result {
         eframe::run_native(
             "Rusty Backup",
             make_options(renderer),
-            Box::new(|_cc| Ok(Box::new(gui::RustyBackupApp::default()))),
+            Box::new(|cc| {
+                gui::ui_logger::set_repaint_ctx(cc.egui_ctx.clone());
+                Ok(Box::new(gui::RustyBackupApp::default()))
+            }),
         )
     };
 
