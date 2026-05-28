@@ -499,8 +499,9 @@ pub fn open_flat_extent_for_edit(descriptor_path: &Path) -> Result<File> {
 /// `.vmdk` descriptor). The raw extent is written as `<stem>-flat.vmdk` next to
 /// the descriptor.
 ///
-/// `disk_size` must equal the total bytes available from `reader` and must be
-/// a non-zero multiple of 512 (VMDK requires sector-aligned extents).
+/// `disk_size` must equal the total bytes available from `reader` and be
+/// non-zero. If it isn't a multiple of 512, the extent is zero-padded up to
+/// the next sector boundary (VMDK requires sector-aligned extents).
 pub fn export_vmdk_flat(
     reader: &mut impl Read,
     descriptor_path: &Path,
@@ -511,9 +512,10 @@ pub fn export_vmdk_flat(
     if disk_size == 0 {
         bail!("VMDK flat export: source disk size is zero");
     }
-    if !disk_size.is_multiple_of(VMDK_SECTOR) {
-        bail!("VMDK flat export: source size {disk_size} is not a multiple of {VMDK_SECTOR} bytes");
-    }
+    // VMDK extents must be sector-aligned. Sources whose size isn't a
+    // multiple of 512 (e.g. some Ghost/raw images) get zero-padded up to the
+    // next sector boundary; the descriptor reports the padded size.
+    let aligned_size = disk_size.div_ceil(VMDK_SECTOR) * VMDK_SECTOR;
 
     let stem = descriptor_path
         .file_stem()
@@ -551,10 +553,17 @@ pub fn export_vmdk_flat(
         written += want as u64;
         progress_cb(written);
     }
+
+    // Zero-pad the tail so the extent is a whole number of 512-byte sectors.
+    if aligned_size > disk_size {
+        let pad = (aligned_size - disk_size) as usize;
+        flat.write_all(&vec![0u8; pad])
+            .context("failed to write VMDK flat extent padding")?;
+    }
     flat.flush()?;
 
     // Emit descriptor next to it.
-    let descriptor = build_monolithic_flat_descriptor(disk_size, &flat_filename);
+    let descriptor = build_monolithic_flat_descriptor(aligned_size, &flat_filename);
     std::fs::write(descriptor_path, descriptor.as_bytes())
         .with_context(|| format!("failed to write {}", descriptor_path.display()))?;
 
@@ -644,6 +653,39 @@ mod tests {
         let mut tail = vec![0u8; 1024];
         reader.read_exact(&mut tail).unwrap();
         assert_eq!(tail, src[1024..2048]);
+    }
+
+    #[test]
+    fn flat_export_zero_pads_unaligned_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dst = tmp.path().join("out.vmdk");
+
+        // 2 sectors + 186 trailing bytes (mirrors the real 2147462842 case:
+        // 186 bytes past a sector boundary).
+        let src: Vec<u8> = (0..2 * 512 + 186u32)
+            .map(|i| (i ^ (i >> 3)) as u8)
+            .collect();
+        let aligned = 3 * 512u64;
+
+        let mut cursor = std::io::Cursor::new(&src);
+        export_vmdk_flat(&mut cursor, &dst, src.len() as u64, &mut |_| {}, &|| false).unwrap();
+
+        let flat = tmp.path().join("out-flat.vmdk");
+        assert_eq!(
+            std::fs::metadata(&flat).unwrap().len(),
+            aligned,
+            "extent padded up to next sector"
+        );
+
+        let mut reader = VmdkFlatReader::open(&dst).unwrap();
+        assert_eq!(reader.len(), aligned, "descriptor reports padded size");
+        let mut got = vec![0u8; aligned as usize];
+        reader.read_exact(&mut got).unwrap();
+        assert_eq!(&got[..src.len()], &src[..], "real bytes preserved");
+        assert!(
+            got[src.len()..].iter().all(|&b| b == 0),
+            "tail is zero-padded"
+        );
     }
 
     #[test]
