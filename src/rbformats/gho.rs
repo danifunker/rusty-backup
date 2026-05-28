@@ -5995,6 +5995,68 @@ mod tests {
         ),
     ];
 
+    /// Small real Norton Ghost containers checked into tests/fixtures/
+    /// (zstd-compressed). Unlike the large ~/new-fixtures corpus, these run
+    /// on every clone and in CI, so they are the minimum header-parse
+    /// regression guard. Between them they cover both compression variants
+    /// that exist at a checkable-in size (none + high) and both Ghost header
+    /// generations (7.5 + 11.x). Tuple: (file, compression, image_type, pwd).
+    const REPO_GHO_FIXTURES: &[(&str, u8, u8, u8)] = &[
+        // 75MULTIU.GHO: Ghost 7.5, compression=none, fulldisk, no password.
+        ("test_gho_75_none.gho.zst", 0x00, 0x00, 0x00),
+        // 11comp.GHO: Ghost 11.x, compression=high, fulldisk, no password.
+        ("test_gho_11_high.gho.zst", 0x03, 0x00, 0x00),
+    ];
+
+    fn load_zst_fixture(name: &str) -> Vec<u8> {
+        let path = format!("tests/fixtures/{name}");
+        let compressed =
+            std::fs::read(&path).unwrap_or_else(|e| panic!("reading repo fixture {path}: {e}"));
+        let mut decoder = zstd::stream::read::Decoder::new(Cursor::new(compressed))
+            .unwrap_or_else(|e| panic!("zstd decoder for {path}: {e}"));
+        let mut out = Vec::new();
+        decoder
+            .read_to_end(&mut out)
+            .unwrap_or_else(|e| panic!("decompressing repo fixture {path}: {e}"));
+        out
+    }
+
+    /// Header-parse regression guard against the checked-in fixtures. Always
+    /// runs (no ~/new-fixtures dependency).
+    #[test]
+    fn parses_checked_in_gho_fixtures() {
+        for (name, comp, image_type, pwd) in REPO_GHO_FIXTURES {
+            let bytes = load_zst_fixture(name);
+            let header = GhoContainerHeader::parse(&mut Cursor::new(bytes))
+                .unwrap_or_else(|e| panic!("parsing {name}: {e:#}"));
+            assert_eq!(header.container_version, 0x01, "{name}: container_version");
+            assert_eq!(header.flags, [0x01, 0x01], "{name}: flags");
+            assert_eq!(
+                header.compression.as_byte(),
+                *comp,
+                "{name}: compression (got {:#04x}, want {:#04x})",
+                header.compression.as_byte(),
+                comp
+            );
+            assert_eq!(
+                header.image_type.as_byte(),
+                *image_type,
+                "{name}: image_type (got {:#04x}, want {:#04x})",
+                header.image_type.as_byte(),
+                image_type
+            );
+            assert_eq!(
+                header.password_protected,
+                *pwd == 0x01,
+                "{name}: password_protected"
+            );
+        }
+    }
+
+    /// Bonus coverage: walk the large ~/new-fixtures corpus when present and
+    /// validate any expected fixtures that exist. Never fails on a missing
+    /// file or low count — the checked-in fixtures in
+    /// `parses_checked_in_gho_fixtures` are the actual regression guard.
     #[test]
     fn parses_every_fixture_in_corpus() {
         let home = match std::env::var("HOME") {
@@ -6055,17 +6117,12 @@ mod tests {
         }
         if !missing.is_empty() {
             eprintln!(
-                "fixture corpus walk: {} fixtures parsed OK, {} missing: {:?}",
+                "fixture corpus walk: {} fixtures parsed OK, {} missing (bonus-only, not required): {:?}",
                 checked,
                 missing.len(),
                 missing
             );
         }
-        assert!(
-            checked >= 6,
-            "fewer than 6 fixtures present ({} found) — corpus may be out of date",
-            checked
-        );
     }
 
     // ---------- record-stream parser (5.5b) ----------
