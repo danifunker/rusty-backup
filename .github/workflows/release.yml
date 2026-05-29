@@ -64,11 +64,16 @@ jobs:
           path: target
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
+      # Tests run upfront on the runner (i686 32-bit tests execute fine on the
+      # x64 Windows runner). Failure fails the job and blocks the release.
+      - name: Test
+        run: cargo test --release --target ${{ matrix.target }}
+
       - name: Build
         env:
           RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
         run: cargo build --release --target ${{ matrix.target }}
-      
+
       - name: Package
         shell: bash
         run: |
@@ -100,7 +105,9 @@ jobs:
   build-macos:
     name: Build macOS
     needs: generate-version
-    runs-on: macos-latest
+    # arm64 builds+tests on Apple-silicon; x64 builds+tests natively on a real
+    # Intel runner (no Rosetta), so `cargo test` runs on each arch's hardware.
+    runs-on: ${{ matrix.runs-on }}
     env:
       HAS_SIGNING_CERT: ${{ secrets.MACOS_CERTIFICATE != '' }}
     strategy:
@@ -108,8 +115,10 @@ jobs:
         include:
           - target: aarch64-apple-darwin
             arch: arm64
+            runs-on: macos-latest
           - target: x86_64-apple-darwin
             arch: x64
+            runs-on: macos-26-intel
     steps:
       - uses: actions/checkout@v5
 
@@ -135,6 +144,12 @@ jobs:
         with:
           path: target
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+      # Tests run upfront on this leg's native hardware. Failure fails the job,
+      # which blocks the release (the release job needs every build job).
+      # --release shares compilation with the Build step below.
+      - name: Test
+        run: cargo test --release --target ${{ matrix.target }}
 
       - name: Build
         env:
@@ -398,6 +413,11 @@ jobs:
           path: target
           key: ${{ runner.os }}-${{ matrix.target }}-anylinux-cargo-build-${{ hashFiles('**/Cargo.lock') }}
 
+      # Tests run upfront in the Arch build container (native target). Failure
+      # fails the job and blocks the release.
+      - name: Test
+        run: cargo test --release --target ${{ matrix.target }}
+
       - name: Build
         env:
           RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
@@ -565,6 +585,11 @@ jobs:
         with:
           path: target
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+      # Tests run upfront on this leg's native runner (x64 + arm64). Failure
+      # fails the job and blocks the release.
+      - name: Test
+        run: cargo test --release --target ${{ matrix.target }}
 
       - name: Build
         env:
