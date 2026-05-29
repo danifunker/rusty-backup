@@ -16,25 +16,12 @@ use crate::fs::hfs_clone::{clone_hfs_volume, emit_apm_disk_with_hfs, CloneReport
 use crate::model::source_reader::open_read;
 use crate::model::status::ExpandStatus;
 
-/// Allocation block sizes the user can pick. Each maps to a 2 GB-class
-/// ceiling defined by HFS's 65535-block u16.
-pub const BLOCK_SIZE_CHOICES: &[u32] = &[4096, 8192, 16384, 32768, 65536];
-
-/// Maximum HFS volume size for a given allocation block size.
-pub fn max_volume_for_block_size(bs: u32) -> u64 {
-    65535u64 * bs as u64
-}
-
-/// Suggest the smallest block size whose ceiling can hold `target_bytes`.
-/// Falls back to the largest available size if nothing fits.
-pub fn suggest_block_size(target_bytes: u64) -> u32 {
-    for &bs in BLOCK_SIZE_CHOICES {
-        if max_volume_for_block_size(bs) >= target_bytes {
-            return bs;
-        }
-    }
-    *BLOCK_SIZE_CHOICES.last().unwrap()
-}
+// The allocation-block-size choices and ceiling helpers are classic-HFS
+// domain knowledge shared with HFV creation; they live canonically in
+// `crate::fs::hfv` and are re-exported here so existing GUI/CLI imports
+// (`model::hfs_expand_runner::{BLOCK_SIZE_CHOICES, suggest_block_size, ...}`)
+// keep resolving.
+pub use crate::fs::hfv::{max_volume_for_block_size, suggest_block_size, BLOCK_SIZE_CHOICES};
 
 /// Source-volume summary used to validate inputs and shape the clone.
 #[derive(Debug, Clone)]

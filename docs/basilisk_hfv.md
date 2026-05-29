@@ -133,29 +133,30 @@ APM `Apple_HFS`, which skipped superfloppy (type-byte-0) HFS rows.
   *not* widened here — it's deferred to Phase 6, which also adds the flat-HFV
   output mode + 2047 MB clamp the expand path needs.
 
-### Phase 3 — HFV constraints + flat-HFS emit (engine, no UI)
-The single source of truth for the limits, plus the "write a flat HFS volume to
-a file" primitive that every write feature reuses.
-- [ ] 3.1 New `src/fs/hfv.rs` (engine layer). Define:
-  - `const HFV_MAX_BYTES: u64 = 2047 * 1024 * 1024;`
-  - `fn validate_hfv_target(size_bytes, fs_kind) -> Result<(), HfvError>` —
-    rejects HFS+/HFSX and any `size > HFV_MAX_BYTES`; returns a clear,
-    ASCII-only message ("HFV volumes must be classic HFS and at most 2047 MB").
-  - `fn suggested_block_size(size_bytes) -> u32` — smallest standard block size
-    keeping `drNmAlBlks ≤ 65,535` (delegates to / mirrors `create_blank_hfs`'s
-    existing iteration).
-- [ ] 3.2 `fn write_blank_hfv(path/writer, size_bytes, block_size, name)` —
-  thin wrapper over `create_blank_hfs` that writes the flat volume with **no**
-  APM wrapper. (An HFV is literally `create_blank_hfs`'s output; this is mostly
-  a named, validated entry point.)
-- [ ] 3.3 `fn write_hfv_from_source(source_hfs, target_writer, target_size,
-  block_size, name)` — `create_blank_hfs` then `clone_hfs_volume(source,
-  target)`, no `emit_apm_disk_with_hfs`. Boot blocks copy via the existing
-  `read_boot_blocks`/`set_boot_blocks`, so a bootable source stays bootable
-  without DDR/APM.
-- [ ] 3.4 Unit tests: `validate_hfv_target` accept/reject matrix;
-  `write_blank_hfv` produces a file that re-detects as superfloppy HFS, passes
-  fsck, and has `drNmAlBlks ≤ 65,535`; clone round-trip preserves files.
+### Phase 3 — HFV constraints + flat-HFS emit (engine, no UI)  ✅ DONE
+New `src/fs/hfv.rs` is the single source of truth for the limits + the flat-HFS
+build/clone primitives every write feature reuses.
+- [x] 3.1 `src/fs/hfv.rs`:
+  - `HFV_MAX_BYTES = 2047 * 1024 * 1024`.
+  - `HfvVolumeKind { Hfs, HfsPlus }` + `from_fs_type()`.
+  - `validate_hfv_target(size, kind) -> Result<(), FilesystemError>` — rejects
+    HFS+/HFSX and `size > HFV_MAX_BYTES`, ASCII-only messages.
+  - `suggest_block_size(size)` / `max_volume_for_block_size` / `BLOCK_SIZE_CHOICES`
+    moved here as the canonical home (smallest block size keeping
+    `drNmAlBlks ≤ 65,535`); `model::hfs_expand_runner` now re-exports them, so
+    existing GUI/CLI imports keep resolving and there's no duplication.
+- [x] 3.2 `build_blank_hfv(size, block_size, name) -> Vec<u8>` — validated thin
+  wrapper over `create_blank_hfs_sized` (no APM wrapper). An HFV *is*
+  `create_blank_hfs`'s output.
+- [x] 3.3 `clone_into_hfv(source_hfs, target_size, block_size, name) ->
+  (Vec<u8>, CloneReport)` — builds a blank target sized to the source's
+  catalog/extents B-trees, opens it in memory, replays via `clone_hfs_volume`
+  (copies boot blocks → bootable source stays bootable), **skips**
+  `emit_apm_disk_with_hfs`. Refuses non-HFS sources.
+- [x] 3.4 6 unit tests in `fs::hfv`: validate accept/reject matrix (incl. exact
+  cap boundary), `suggest_block_size` range (2047 MB → 32 KiB), `build_blank_hfv`
+  re-detects as superfloppy HFS + fscks clean, oversize/HFS+ refusal, and a
+  `clone_into_hfv` file round-trip.
 
 ### Phase 4 — Create a blank HFV (model + GUI + CLI)
 - [ ] 4.1 Model runner `src/model/*` (or extend an existing one) wrapping
