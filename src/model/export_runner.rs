@@ -569,8 +569,17 @@ fn run_per_partition_hfv(
         );
 
         // Open the source HFS volume, capture its name + block size, then clone
-        // it into a fresh flat HFV of the configured size.
-        let reader = BufReader::new(File::open(source_image)?);
+        // it into a fresh flat HFV of the configured size. Route through the
+        // container-aware reader so a VHD/QCOW2/VMDK/CHD source is unwrapped to
+        // its decoded disk bytes — a naked File::open would read the container
+        // header where the HFS MDB is expected (e.g. a dynamic VHD's sparse
+        // header at offset 0), failing with "bad MDB signature".
+        let format = crate::rbformats::detect_image_format_with_path(
+            File::open(source_image)?,
+            Some(source_image),
+        )?;
+        let (reader, _len) =
+            crate::rbformats::wrap_image_reader(File::open(source_image)?, format)?;
         let mut source_fs = crate::fs::hfs::HfsFilesystem::open(reader, offset)
             .map_err(|e| anyhow::anyhow!("open source HFS at partition-{}: {e}", part.index))?;
         let name = source_fs.volume_summary().volume_name;

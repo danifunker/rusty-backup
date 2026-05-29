@@ -1009,8 +1009,36 @@ pub fn export_whole_disk_vhd(
             file_size
         };
 
-        if partition_sizes.is_empty() {
-            // No size overrides — stream the whole source
+        // A partition-less (superfloppy / HFV) source has no MBR to patch. The
+        // APM and RDB tables are reconstructed by the dedicated paths above, so
+        // by this point a non-empty `partition_sizes` only carries a real MBR
+        // disk *or* the single whole-disk "partition" the inspect tab
+        // synthesizes for a bare filesystem volume. Peek the boot signature to
+        // tell them apart: patching MBR partition entries over sector 0 of a
+        // bare-filesystem volume (e.g. a flat HFS `.hfv`) overwrites the
+        // volume's boot blocks and corrupts it. When there's no MBR, stream the
+        // source verbatim — the same thing Raw/QCOW2/VMDK do for this case.
+        // (Filesystem resize is a separate dedicated operation, not this path.)
+        let has_mbr = if source_data_size >= 512 {
+            let mut sig = [0u8; 512];
+            reader
+                .read_exact(&mut sig)
+                .context("failed to read source sector 0")?;
+            reader.seek(SeekFrom::Start(0))?;
+            sig[510] == 0x55 && sig[511] == 0xAA
+        } else {
+            false
+        };
+        if !partition_sizes.is_empty() && !has_mbr {
+            log_cb(
+                "Source has no MBR partition table (bare filesystem volume); \
+                 streaming verbatim without patching a partition table",
+            );
+        }
+
+        if partition_sizes.is_empty() || !has_mbr {
+            // No size overrides, or a partition-less source — stream the whole
+            // source unchanged.
             let mut buf = vec![0u8; CHUNK_SIZE];
             let mut limited = (&mut reader).take(source_data_size);
             loop {
