@@ -1382,6 +1382,84 @@ fn test_hfv_flat_hfs_detect_open_fsck_edit() {
     assert_eq!(&read_back, payload);
 }
 
+/// Model-layer expand → flat HFV: drive the real `start_hfs_expand` worker
+/// with `ExpandOutput::FlatHfv` against a small source HFS volume and verify
+/// the output is a valid, partition-less HFV holding the source's file.
+/// Complements the unit coverage of `fs::hfv::clone_into_hfv` by exercising
+/// the runner's branch + file write.
+#[test]
+fn test_expand_runner_writes_flat_hfv() {
+    use rusty_backup::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+    use rusty_backup::fs::hfs::{create_blank_hfs, HfsFilesystem};
+    use rusty_backup::model::hfs_expand_runner::{
+        start_hfs_expand, summarize_source, ExpandOutput,
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let src_path = tmp.path().join("source.hfv");
+    let out_path = tmp.path().join("bigger.hfv");
+
+    // Source: an 8 MiB HFV with one file.
+    let mut img = create_blank_hfs(8 * 1024 * 1024, 4096, "ExpandSrc").unwrap();
+    {
+        let mut efs = HfsFilesystem::open(Cursor::new(&mut img), 0).unwrap();
+        let root = efs.root().unwrap();
+        let payload = b"expand me to a flat HFV";
+        let mut data = Cursor::new(payload.as_slice());
+        efs.create_file(
+            &root,
+            "note.txt",
+            &mut data,
+            payload.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        efs.sync_metadata().unwrap();
+    }
+    std::fs::write(&src_path, &img).unwrap();
+
+    let source = summarize_source(&src_path, 0, img.len() as u64).unwrap();
+    let status = start_hfs_expand(
+        source,
+        16 * 1024 * 1024,
+        4096,
+        out_path.clone(),
+        ExpandOutput::FlatHfv,
+    );
+
+    // Bounded poll for completion (worker is fast on an 8 MiB volume).
+    let mut finished = false;
+    let mut err = None;
+    for _ in 0..200 {
+        {
+            let g = status.lock().unwrap();
+            if g.finished {
+                finished = true;
+                err = g.error.clone();
+                // Flat-HFV output produces no APM emit report.
+                assert!(
+                    g.emit_report.is_none(),
+                    "HFV output should have no EmitReport"
+                );
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(finished, "expand worker did not finish in time");
+    assert!(err.is_none(), "expand failed: {err:?}");
+
+    // The output is a valid flat HFV with the source's file.
+    let f = std::fs::File::open(&out_path).unwrap();
+    let mut out = HfsFilesystem::open(f, 0).unwrap();
+    assert_eq!(out.fs_type(), "HFS");
+    assert_eq!(out.volume_summary().volume_name, "ExpandSrc");
+    let root = out.root().unwrap();
+    let kids = out.list_directory(&root).unwrap();
+    assert!(kids.iter().any(|e| e.name == "note.txt"));
+    assert!(out.fsck().unwrap().errors.is_empty());
+}
+
 #[test]
 fn test_prodos_list_and_recurse() {
     use rusty_backup::fs::filesystem::Filesystem;

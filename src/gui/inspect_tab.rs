@@ -4681,7 +4681,10 @@ fn is_classic_hfs(ptype: u8, type_string: Option<&str>, type_name: &str) -> bool
         .map(|s| s.eq_ignore_ascii_case("Apple_HFS"))
         .unwrap_or(false);
     let mbr_hfs = ptype == 0xAF;
-    if !(apm_hfs || mbr_hfs) {
+    // A partition-less HFS superfloppy (a BasiliskII .hfv) is classic HFS too;
+    // the expand dialog can re-floor it or convert it (incl. to a flat HFV).
+    let superfloppy = is_superfloppy_hfs(ptype, type_name);
+    if !(apm_hfs || mbr_hfs || superfloppy) {
         return false;
     }
     !(type_name.contains("HFS+") || type_name.contains("HFSX"))

@@ -62,12 +62,26 @@ pub fn summarize_source(
     })
 }
 
+/// Shape of the file the expand worker writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpandOutput {
+    /// Wrap the cloned volume in a brand-new APM disk image (e.g. `.hda`),
+    /// preserving the source's Apple drivers — bootable on a real/emulated Mac
+    /// via the SCSI Manager.
+    ApmDisk,
+    /// Write the cloned volume as a flat **HFV** (`.hfv`) — the bare HFS volume
+    /// with no partition table, as BasiliskII / SheepShaver expect. Capped at
+    /// [`crate::fs::hfv::HFV_MAX_BYTES`] (2047 MB).
+    FlatHfv,
+}
+
 /// Spawn the expand worker. Returns the shared status handle.
 pub fn start_hfs_expand(
     source: ExpandSource,
     target_size_bytes: u64,
     target_block_size: u32,
     output_path: PathBuf,
+    output: ExpandOutput,
 ) -> Arc<Mutex<ExpandStatus>> {
     let status = Arc::new(Mutex::new(ExpandStatus {
         finished: false,
@@ -85,6 +99,7 @@ pub fn start_hfs_expand(
             target_size_bytes,
             target_block_size,
             output_path,
+            output,
             &status_thread,
         );
         let mut s = status_thread.lock().expect("expand status lock");
@@ -92,7 +107,7 @@ pub fn start_hfs_expand(
         match result {
             Ok((clone, emit)) => {
                 s.clone_report = Some(clone);
-                s.emit_report = Some(emit);
+                s.emit_report = emit;
                 s.current_step = "Done.".into();
             }
             Err(e) => {
@@ -104,14 +119,16 @@ pub fn start_hfs_expand(
     status
 }
 
-/// Worker body. Returns the clone+emit reports on success.
+/// Worker body. Returns the clone report and (for APM output) the emit report.
+/// Flat-HFV output has no APM emit, so the second element is `None`.
 fn run_expand(
     source: ExpandSource,
     target_size_bytes: u64,
     target_block_size: u32,
     output_path: PathBuf,
+    output: ExpandOutput,
     status: &Arc<Mutex<ExpandStatus>>,
-) -> anyhow::Result<(CloneReport, EmitReport)> {
+) -> anyhow::Result<(CloneReport, Option<EmitReport>)> {
     let push = |s: &str| {
         if let Ok(mut g) = status.lock() {
             g.log_messages.push(s.to_string());
@@ -122,6 +139,13 @@ fn run_expand(
             g.current_step = s.to_string();
         }
     };
+
+    // A flat HFV must respect the classic-HFS 2047 MB ceiling (APM output is
+    // bounded only by the 65535-block limit, which can be larger).
+    if output == ExpandOutput::FlatHfv {
+        crate::fs::hfv::validate_hfv_target(target_size_bytes, crate::fs::hfv::HfvVolumeKind::Hfs)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
 
     step("Building blank target volume…");
     let catalog_min = source
@@ -219,33 +243,49 @@ fn run_expand(
         }
     }
 
-    step("Writing new APM disk image…");
-    let output_file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&output_path)
-        .map_err(|e| anyhow::anyhow!("create output: {e}"))?;
-    let mut source_for_apm =
-        open_read(&source.source_path).map_err(|e| anyhow::anyhow!("reopen source: {e}"))?;
-    let emit_report = {
-        let mut writer = output_file;
-        emit_apm_disk_with_hfs(
-            &mut source_for_apm,
-            source_disk_size,
-            &target_buf,
-            &mut writer,
-        )
-        .map_err(|e| anyhow::anyhow!("emit APM: {e}"))?
-    };
-    push(&format!(
-        "Wrote {} MiB output: {} driver(s) preserved, HFS at block {} ({} blocks)",
-        emit_report.total_bytes / (1024 * 1024),
-        emit_report.drivers_copied,
-        emit_report.hfs_start_block,
-        emit_report.hfs_block_count
-    ));
-
-    Ok((clone_report, emit_report))
+    match output {
+        ExpandOutput::FlatHfv => {
+            // An HFV is the bare cloned volume: write target_buf verbatim, no
+            // APM/driver wrapper. The source's boot blocks were copied by the
+            // clone, so a bootable source stays bootable under BasiliskII.
+            step("Writing flat HFV image…");
+            std::fs::write(&output_path, &target_buf)
+                .map_err(|e| anyhow::anyhow!("write HFV: {e}"))?;
+            push(&format!(
+                "Wrote {} MiB flat HFV (classic HFS, no partition table)",
+                target_buf.len() / (1024 * 1024)
+            ));
+            Ok((clone_report, None))
+        }
+        ExpandOutput::ApmDisk => {
+            step("Writing new APM disk image…");
+            let output_file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&output_path)
+                .map_err(|e| anyhow::anyhow!("create output: {e}"))?;
+            let mut source_for_apm = open_read(&source.source_path)
+                .map_err(|e| anyhow::anyhow!("reopen source: {e}"))?;
+            let emit_report = {
+                let mut writer = output_file;
+                emit_apm_disk_with_hfs(
+                    &mut source_for_apm,
+                    source_disk_size,
+                    &target_buf,
+                    &mut writer,
+                )
+                .map_err(|e| anyhow::anyhow!("emit APM: {e}"))?
+            };
+            push(&format!(
+                "Wrote {} MiB output: {} driver(s) preserved, HFS at block {} ({} blocks)",
+                emit_report.total_bytes / (1024 * 1024),
+                emit_report.drivers_copied,
+                emit_report.hfs_start_block,
+                emit_report.hfs_block_count
+            ));
+            Ok((clone_report, Some(emit_report)))
+        }
+    }
 }

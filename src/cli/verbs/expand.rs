@@ -1,7 +1,9 @@
 //! `rb-cli expand IMG@N --size BYTES --block-size BS --output OUT` —
 //! HFS expand-block-size flow: clone a classic-HFS volume into a fresh
-//! blank volume of a chosen size and allocation block size, then wrap
-//! the result in a new APM disk image.
+//! blank volume of a chosen size and allocation block size, then either
+//! wrap the result in a new APM disk image (default) or, with `--to-hfv`,
+//! write it as a flat BasiliskII HFV (bare volume, no partition table,
+//! capped at 2047 MB).
 //!
 //! Thin CLI over [`crate::model::hfs_expand_runner`], the same worker
 //! the GUI's "Expand HFS Volume…" dialog uses. The source disk is
@@ -25,7 +27,7 @@ use crate::cli::parse::parse_size;
 use crate::cli::resolve::resolve_partition_ro;
 use crate::model::hfs_expand_runner::{
     max_volume_for_block_size, start_hfs_expand, suggest_block_size, summarize_source,
-    BLOCK_SIZE_CHOICES,
+    ExpandOutput, BLOCK_SIZE_CHOICES,
 };
 use crate::model::status::ExpandStatus;
 use crate::partition::format_size;
@@ -45,9 +47,15 @@ pub struct ExpandArgs {
     #[arg(long = "block-size")]
     pub block_size: Option<u32>,
 
-    /// Destination path for the new APM disk image. Created (or truncated).
+    /// Destination path for the new image. Created (or truncated).
     #[arg(long)]
     pub output: PathBuf,
+
+    /// Write a flat BasiliskII HFV (bare classic-HFS volume, no partition
+    /// table) instead of an APM disk image. Capped at 2047 MB. Use this to
+    /// produce a `.hfv` for BasiliskII / SheepShaver.
+    #[arg(long = "to-hfv")]
+    pub to_hfv: bool,
 }
 
 pub fn run(args: ExpandArgs) -> Result<()> {
@@ -91,6 +99,13 @@ pub fn run(args: ExpandArgs) -> Result<()> {
             block_size
         );
     }
+    if args.to_hfv && target_size > crate::fs::hfv::HFV_MAX_BYTES {
+        bail!(
+            "--size {} exceeds the BasiliskII HFV limit of {} (2047 MB); HFV volumes must be classic-HFS-mountable",
+            format_size(target_size),
+            format_size(crate::fs::hfv::HFV_MAX_BYTES)
+        );
+    }
     if target_size < source.used_bytes {
         bail!(
             "--size {} is smaller than the source's used bytes ({}); expand requires a target that holds the data",
@@ -99,14 +114,20 @@ pub fn run(args: ExpandArgs) -> Result<()> {
         );
     }
 
+    let output_mode = if args.to_hfv {
+        ExpandOutput::FlatHfv
+    } else {
+        ExpandOutput::ApmDisk
+    };
     log_stderr(format!(
-        "rb-cli expand: target {} at {} byte blocks -> {}",
+        "rb-cli expand: target {} at {} byte blocks -> {} ({})",
         format_size(target_size),
         block_size,
-        args.output.display()
+        args.output.display(),
+        if args.to_hfv { "flat HFV" } else { "APM disk" }
     ));
 
-    let status = start_hfs_expand(source, target_size, block_size, args.output);
+    let status = start_hfs_expand(source, target_size, block_size, args.output, output_mode);
     drain(status)
 }
 

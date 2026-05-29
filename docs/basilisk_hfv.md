@@ -173,37 +173,36 @@ build/clone primitives every write feature reuses.
   existing inspect-tab buttons. Revisit if a general File→New surface is added.
   A model runner will be added then (or for Phase 6, which does need one).
 
-### Phase 5 — Export to HFV
-Export an existing classic-HFS source (live image / backup / another HFS
-partition) to a flat `.hfv`, gated to HFS-only ≤ 2047 MB.
-- [ ] 5.1 Add `ExportFormat::Hfv` (src/rbformats/export.rs): extension `"hfv"`,
-  description "BasiliskII HFV", dialog filter `("BasiliskII HFV", &["hfv"])`.
-- [ ] 5.2 Export path delegates to `write_hfv_from_source` (Phase 3.3), **not**
-  the generic raw streamer — we re-lay-out into a freshly-sized HFS so the
-  result respects the block-size floor and ≤2047 MB cap.
-- [ ] 5.3 Gate the radio option: only offer HFV when the selected partition is
-  classic HFS and ≤ 2047 MB; otherwise disable with a tooltip explaining the
-  limit. Tie into `is_superfloppy_hfs` / `is_classic_hfs`.
-- [ ] 5.4 CLI: `rb-cli export --format hfv …` with the same gate.
-- [ ] 5.5 Tests: export an APM `Apple_HFS` partition and a superfloppy HFS to
-  HFV; both re-detect, fsck clean. Assert rejection of an HFS+ source and a
-  >2047 MB source.
+### Phases 5 & 6 — Export / Expand to a flat HFV  ✅ DONE (unified)
+"Export an HFS volume to HFV" and "resize/re-floor an HFV" are the **same**
+operation — clone a classic-HFS source into a freshly-sized flat HFS volume —
+which is exactly what the existing **Expand HFS Volume…** flow does before its
+APM-emit step. So rather than bolt `ExportFormat::Hfv` onto the whole-disk
+*streaming* export pipeline (a poor fit — HFV output is a volume re-layout, not
+a byte stream), both goals are delivered by adding a **flat-HFV output mode** to
+the expand path.
+- [x] 6.4 `model::hfs_expand_runner`: new `ExpandOutput { ApmDisk, FlatHfv }`
+  threaded through `start_hfs_expand` / `run_expand`. The clone + fsck-verify
+  chain is shared; `FlatHfv` writes `target_buf` verbatim (no
+  `emit_apm_disk_with_hfs`) and returns `emit_report = None`. Early
+  `validate_hfv_target` enforces the 2047 MB cap for HFV output.
+- [x] 6.1 `is_classic_hfs` (inspect_tab) widened via `is_superfloppy_hfs`, so an
+  HFV row now offers **Expand…** — that's the GUI "export/convert to HFV" and
+  "resize HFV" entry point.
+- [x] 6.2/6.3 `expand_hfs_dialog.rs`: **Output format** radio (APM disk / Flat
+  HFV), defaulting to HFV when the source is itself a `.hfv`. Size slider
+  clamps to 2047 MB and the Save-As dialog defaults to `.hfv` with an HFV
+  filter when HFV output is selected.
+- [x] 5.4 CLI: `rb-cli expand IMG@N --size … --to-hfv --output out.hfv` —
+  writes a flat HFV instead of an APM disk; rejects `--size > 2047 MB`.
+- [x] 5.x/6.5 Verified end-to-end: `expand THINKCDEV.hfv@1 --size 50M --to-hfv`
+  clones all 813 files into a 50 MB flat HFV that re-detects + fscks clean +
+  lists correctly; `--size 2048M` is refused. Model-layer test
+  `test_expand_runner_writes_flat_hfv` drives the real worker with
+  `ExpandOutput::FlatHfv` and asserts a valid HFV + no `EmitReport`.
 
-### Phase 6 — Expand / resize an HFV
-The existing "Expand HFS Volume…" flow currently emits an **APM-wrapped** disk
-(`emit_apm_disk_with_hfs`). Add a flat-HFV output mode and let HFVs use it.
-- [ ] 6.1 Extend `is_classic_hfs` (or the expand-dialog gate) so superfloppy
-  HFS rows offer "Expand…".
-- [ ] 6.2 In `src/gui/expand_hfs_dialog.rs`, add an output-shape choice:
-  **APM disk (.hda)** (existing) vs **flat HFV (.hfv)** (new, via Phase 3.3).
-  When the source is an HFV, default to flat HFV.
-- [ ] 6.3 Clamp the target-size slider to **≤ 2047 MB** when the flat-HFV output
-  is selected (the APM path keeps its current ceiling). Output filter includes
-  `"hfv"` (src/gui/expand_hfs_dialog.rs:224).
-- [ ] 6.4 Reuse the existing worker chain (`create_blank_hfs` → `clone_hfs_volume`
-  → fsck verify) but skip `emit_apm_disk_with_hfs` for the flat path.
-- [ ] 6.5 Tests: expand a 30 MB HFV to 100 MB flat HFV, verify file count and
-  fsck; assert the slider/validator rejects 2048 MB+.
+  Note: `ExportFormat::Hfv` in the inspect-tab Export dialog is intentionally
+  **not** added — see rationale above; the Expand button is the correct home.
 
 ### Phase 7 — Backup / restore round-trip
 - [ ] 7.1 Confirm backing up an HFV produces a sane per-partition backup
