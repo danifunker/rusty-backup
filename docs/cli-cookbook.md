@@ -108,6 +108,36 @@ source didn't have, the verb aborts before writing the APM. Check
 larger — that usually means the catalog needed more headroom than
 the auto-sizer allotted.
 
+### Producing a BasiliskII HFV instead of an APM disk
+
+BasiliskII / SheepShaver mount a **flat HFV** — a bare classic-HFS
+volume with no partition table — rather than an APM/SCSI disk. Add
+`--to-hfv` to the same `expand` verb to write one. HFV volumes are
+classic-HFS-only and capped at 2047 MB (the 2 GiB signed-32-bit
+boundary classic Mac OS won't cross), so `--size` must stay under that.
+
+```bash
+# Convert (and optionally resize) an Apple_HFS partition into a .hfv:
+rb-cli expand ~/MacBackups/quadra-system7-restored.hda@2 \
+    --size 500M --to-hfv \
+    --output ~/Basilisk/system7.hfv
+
+# Re-floor an existing .hfv to a bigger block size / size:
+rb-cli expand ~/Basilisk/old.hfv@1 --size 1G --to-hfv \
+    --output ~/Basilisk/old-1gb.hfv
+```
+
+To create a *blank* HFV from scratch, use `new --fs hfv`:
+
+```bash
+rb-cli new ~/Basilisk/scratch.hfv --fs hfv --size 100M --name "Mac HD"
+```
+
+A backup of an `.hfv` restores straight back to a byte-identical `.hfv`
+(`rb-cli backup disk.hfv bk/ && rb-cli restore bk/<stamp> out.hfv`) —
+the volume has no partition table, so restore writes the bare volume at
+sector 0.
+
 ## 3. Shrink an IRIX disk by re-encoding to CHD
 
 **Goal.** An SGI disk dump from a 9 GB U160 SCA drive is mostly empty

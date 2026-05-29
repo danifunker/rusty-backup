@@ -204,36 +204,39 @@ the expand path.
   Note: `ExportFormat::Hfv` in the inspect-tab Export dialog is intentionally
   **not** added — see rationale above; the Expand button is the correct home.
 
-### Phase 7 — Backup / restore round-trip
-- [ ] 7.1 Confirm backing up an HFV produces a sane per-partition backup
-  (superfloppy `partition_table_type == "None"`, HFS compaction is
-  layout-preserving). Record the original container as HFV in metadata if a hint
-  is needed for restore defaulting.
-- [ ] 7.2 Restore path: a `None`-table HFS backup should be restorable **as a
-  flat `.hfv`** (not forced through `superfloppy_wrap`, which adds an MBR/GPT —
-  that's the wrong shape for Basilisk). Verify `reconstruct_disk_from_backup` /
-  the superfloppy restore branch (src/restore/mod.rs:764, 1460, 1468) can emit
-  the bare volume, and offer ".hfv" as the restore output.
-- [ ] 7.3 Round-trip test: HFV → backup → restore → byte-equivalent (or
-  fsck-equivalent + same file tree) HFV.
+### Phase 7 — Backup / restore round-trip  ✅ DONE (works with no code changes)
+- [x] 7.1 Backing up an HFV produces a sane per-partition backup:
+  `partition_table_type == "None"`, `layout == "per-partition"`, HFS compaction
+  layout-preserving. Verified: `rb-cli backup THINKCDEV.hfv bk/`.
+- [x] 7.2 Restore of a `None`-table backup already emits the **bare volume at
+  sector 0** ("No table to write" branch, src/restore/mod.rs:1468) — that *is*
+  an HFV; it is **not** routed through `superfloppy_wrap` (which would add an
+  MBR/GPT — wrong for Basilisk). Restoring to an `out.hfv` path just works.
+- [x] 7.3 Round-trip verified **byte-identical**: `backup THINKCDEV.hfv` →
+  `restore … out.hfv` → `cmp` reports IDENTICAL (and fsck/listing match the
+  source: 813 files / 90 dirs).
+  - [ ] Optional nicety (not done): default the restore output filename to
+    `.hfv` when the backup is a `None`-table HFS. Round-trip works without it.
 
-### Phase 8 — CLI parity sweep
-- [ ] 8.1 Ensure `inspect`, `browse`, `backup`, `restore`, `export`, and any
-  resize verbs accept `.hfv` inputs/outputs. Cross-check naming against
-  docs/cli-todo.md.
-- [ ] 8.2 CLI examples/cookbook entries (docs/cli-examples.md,
-  docs/cli-cookbook.md).
+### Phase 8 — CLI parity sweep  ✅ DONE
+- [x] 8.1 Verified `.hfv` works across `inspect`, `ls`, `fsck`, `backup`,
+  `restore`, `expand` (`--to-hfv`), and `new --fs hfv`. The superfloppy path
+  makes the read verbs format-agnostic; the write verbs are explicit.
+- [x] 8.2 Added an HFV section to docs/cli-cookbook.md (expand `--to-hfv`,
+  `new --fs hfv`, backup/restore round-trip).
 
 ### Phase 9 — Docs + real-Mac validation
-- [ ] 9.1 Update CLAUDE.md (formats list) and src/rbformats/README.md /
-  src/fs/README.md as touched.
-- [ ] 9.2 Validate created/exported/expanded HFVs **boot or mount** in
-  BasiliskII (and/or MAME) — the only true test of the bootability/limit work.
-  Use the bootable samples (`Mac OS 8.1.HFV`, `Starterdisk.hfv`) as ground
-  truth; compare layouts the way `make_blank_apm_hfs` was A/B-tested against the
-  Apple HD SC reference.
-- [ ] 9.3 Confirm a 2047 MB created HFV mounts and a 2048 MB one is refused by
-  our validator (we never hand Basilisk a volume it would corrupt).
+- [x] 9.1 Updated CLAUDE.md with a "BasiliskII HFV Support" subsection; this
+  plan doc is the detailed reference. (No `rbformats/README.md` change needed —
+  HFV isn't an rbformats codec; it's an `fs/` re-layout.)
+- [x] 9.3 Validator coverage: `validate_hfv_target` unit tests assert exactly
+  2047 MB is accepted and +1 byte / 2048 MB is refused; CLI `expand --to-hfv`
+  and `new --fs hfv` both reject `--size 2048M` end-to-end.
+- [ ] 9.2 **Needs the user / an emulator**: boot or mount the
+  created/expanded HFVs in BasiliskII (and/or MAME) — the only true test of the
+  bootability work. Use the bootable samples (`Mac OS 8.1.HFV`,
+  `Starterdisk.hfv`) as ground truth. Our blank/cloned volumes fsck clean and
+  round-trip byte-identically, but in-emulator mount is unverified from here.
 
 ---
 
@@ -266,4 +269,19 @@ _Add a dated line per session as steps land._
 - 2026-05-29 — Plan created. Recon done: confirmed HFV = flat HFS @ offset 0
   (3 samples), mapped the existing superfloppy→HFS read path, identified the
   write-side gaps (extension wiring, fsck/expand/edit gating for type-byte-0
-  HFS, flat-HFS emit, 2047 MB/HFS-only validator). Nothing implemented yet.
+  HFS, flat-HFS emit, 2047 MB/HFS-only validator).
+- 2026-05-29 — Phases 1–8 implemented and committed (one commit per phase):
+  - P1 picker wiring + passthrough test; verified inspect/ls on samples.
+  - P2 `is_superfloppy_hfs` + Check gate; e2e detect/open/fsck/edit test.
+  - P3 `src/fs/hfv.rs` (HFV_MAX_BYTES, validate, build_blank_hfv,
+    clone_into_hfv; block-size helpers moved here, model re-exports). 6 tests.
+  - P4 `rb-cli new --fs hfv` (GUI create dialog deferred by design).
+  - P5+P6 unified: `ExpandOutput::FlatHfv` in the expand runner, `--to-hfv`
+    CLI flag, expand-dialog output radio + 2047 MB clamp, `is_classic_hfs`
+    widened for superfloppy HFS. Verified expand THINKCDEV→50M HFV (813 files,
+    fsck clean); runner test added.
+  - P7 backup/restore confirmed **byte-identical** round-trip, zero code
+    changes (superfloppy/None restore emits the bare volume).
+  - P8 CLI parity verified; cookbook + CLAUDE.md docs added.
+  - Remaining: P9.2 in-emulator boot/mount validation (needs BasiliskII/MAME);
+    optional restore-output `.hfv` default-filename nicety.
