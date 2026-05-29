@@ -5736,13 +5736,34 @@ fn read_ntfs_file_aware_into(
     let lcn = position / cluster_size;
     let offset_in_cluster = (position % cluster_size) as usize;
     let avail_in_cluster = cluster_size as usize - offset_in_cluster;
-    let to_read = out.len().min(avail_in_cluster);
+    let mut to_read = out.len().min(avail_in_cluster);
 
-    // Synthesize the $Boot region from the GHPR-embedded VBR. The first
-    // 512 bytes are the VBR; the rest is boot code. We synthesize enough
-    // to cover partition-table detection probes (RDB scans 16 sectors =
-    // 8 KiB) so they don't trigger the expensive lazy scan. $Boot on
-    // NTFS typically spans 8 clusters but we only need the VBR bytes.
+    // NTFS mirrors the VBR in the volume's final sector (the backup boot
+    // sector), which isn't part of any stored run. Clamp normal reads so they
+    // stop at its boundary; the read that then starts there serves the VBR copy
+    // below. Without the clamp a sequential read straddling the boundary would
+    // serve the whole (unmapped) tail as zeros, blanking the backup sector.
+    let sector_size = {
+        let s = u16::from_le_bytes([index.vbr[11], index.vbr[12]]) as u64;
+        if s == 0 {
+            512
+        } else {
+            s
+        }
+    };
+    let backup_start = index.volume_size.saturating_sub(sector_size);
+    if position < backup_start && position + to_read as u64 > backup_start {
+        to_read = (backup_start - position) as usize;
+    }
+
+    // $Boot region (first 16 sectors, LCN 0). Serve sector 0 from the
+    // authoritative GHPR-embedded VBR (this also keeps partition-detection
+    // probes cheap); zero the rest. Ghost stores $Boot's boot code, but its
+    // cluster-count run matching mismaps the LCN-0 run to other 2-cluster data
+    // (e.g. a directory $INDEX_ALLOCATION), so the stored boot code can't be
+    // reliably located — serving it would inject garbage. The volume mounts
+    // fine without sectors 1-15; booting would need a synthesized NTFS
+    // bootstrap (see notes — not yet implemented).
     const SYNTH_BOOT_BYTES: u64 = 16 * 512; // 16 sectors = RDB scan range
     if position < SYNTH_BOOT_BYTES {
         let pos = position as usize;
@@ -5754,6 +5775,17 @@ fn read_ntfs_file_aware_into(
             let vbr_end = (pos + n).min(512);
             let copy_len = vbr_end - pos;
             out[..copy_len].copy_from_slice(&index.vbr[pos..pos + copy_len]);
+        }
+        return Ok(n);
+    }
+
+    // Backup boot sector: serve the VBR copy for the volume's final sector
+    // (synthesized from the GHPR VBR; see the clamp above).
+    if position >= backup_start && position < index.volume_size {
+        let in_sector = (position - backup_start) as usize;
+        let n = to_read.min(sector_size as usize - in_sector);
+        for (i, b) in out[..n].iter_mut().enumerate() {
+            *b = index.vbr.get(in_sector + i).copied().unwrap_or(0);
         }
         return Ok(n);
     }
