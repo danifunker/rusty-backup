@@ -1721,6 +1721,23 @@ impl GhoReader {
         }
     }
 
+    /// Mapped NTFS cluster runs as `(lcn_start, cluster_count)`, sorted by LCN.
+    /// Only meaningful after `prepare_full_image` (so the run set is complete);
+    /// `None` for non-NTFS-file-aware GHOs. Used by diagnostics to report which
+    /// files have declared clusters not covered by any mapped run.
+    pub fn ntfs_mapped_ranges(&self) -> Option<Vec<(u64, u64)>> {
+        let GhoReaderMode::NtfsFileAware { index, .. } = &self.mode else {
+            return None;
+        };
+        let mut ranges: Vec<(u64, u64)> = index
+            .runs
+            .iter()
+            .map(|r| (r.lcn_start, r.cluster_count))
+            .collect();
+        ranges.sort_by_key(|r| r.0);
+        Some(ranges)
+    }
+
     /// Serve bytes for FileAware mode at `position` into `out`.
     fn read_file_aware_into(&mut self, position: u64, out: &mut [u8]) -> std::io::Result<usize> {
         let GhoReaderMode::FileAware {
