@@ -370,14 +370,14 @@ pub(crate) fn gho_wrap_params(
 /// Reassemble a bootable disk around a full-disk GHO superfloppy volume into a
 /// tempfile, returning a rewound reader over that disk plus its byte length.
 ///
-/// Used by exporters that transform the data on the way out (dynamic VHD,
-/// QCOW2, sparse VMDK) and therefore need the reassembled disk materialized as a
-/// readable source. The Raw path does **not** use this — it wraps straight into
-/// the destination file (see `export_whole_disk`), avoiding a second full-size
-/// copy on space-constrained volumes.
+/// Superseded in production by [`superfloppy_wrap::WrappedSuperfloppyReader`],
+/// which streams the same disk on the fly (no tempfile). Retained as a
+/// reference oracle: the `wrapped_reader_matches_wrap_and_write` test asserts
+/// the streaming reader reproduces this writer's output byte-for-byte.
 ///
 /// Returns `Ok(None)` when no reassembly applies (see [`gho_wrap_params`]).
 /// `reader` is read from offset 0 and fully consumed on the `Some` path.
+#[cfg(test)]
 pub(crate) fn reassemble_gho_bootable_disk(
     reader: &mut (impl Read + Seek),
     source_data_size: u64,
@@ -425,15 +425,23 @@ pub(crate) fn reassemble_gho_bootable_disk(
 /// [`open_source_reader`] unchanged.
 fn open_export_source(
     source_path: &Path,
-    progress_cb: &mut dyn FnMut(u64),
-    cancel_check: &dyn Fn() -> bool,
+    _progress_cb: &mut dyn FnMut(u64),
+    _cancel_check: &dyn Fn() -> bool,
 ) -> Result<(super::BoxReadSeek, u64)> {
     let (mut reader, size) = open_source_reader(source_path)?;
     if crate::model::source_reader::is_gho_path(source_path) {
-        if let Some((file, disk_size)) =
-            reassemble_gho_bootable_disk(&mut reader, size, progress_cb, cancel_check)?
-        {
-            return Ok((Box::new(file), disk_size));
+        // Full-disk GHO: present the bootable, MBR/GPT-wrapped disk as a
+        // streaming reader rather than materializing it to a tempfile first.
+        // The format writer reads through this on its single pass, so a
+        // transforming export (VMDK, QCOW2, dynamic VHD, CHD) no longer needs
+        // ~2x the disk space (one tempfile + the output). `gho_wrap_params`
+        // leaves `reader` rewound to 0.
+        if let Some(params) = gho_wrap_params(&mut reader, size)? {
+            let wrapped = crate::restore::superfloppy_wrap::WrappedSuperfloppyReader::new(
+                reader, size, &params,
+            )?;
+            let disk_size = wrapped.disk_size();
+            return Ok((Box::new(wrapped), disk_size));
         }
     }
     Ok((reader, size))

@@ -837,26 +837,26 @@ pub fn export_whole_disk_vhd(
         reader.seek(SeekFrom::Start(0))?;
 
         // Full-disk GHO backups decode to a bare superfloppy volume (sector 0 is
-        // the FS VBR, not a partition table). Reassemble a bootable disk — MBR +
-        // boot code + the volume placed as the active partition at its original
-        // LBA — so the VHD carries a partition table rather than a partitionless
-        // volume. Non-GHO (IMZ) or floppy-sized GHO sources pass through bare.
-        let reassembled = if crate::model::source_reader::is_gho_path(source_path) {
-            super::export::reassemble_gho_bootable_disk(
-                &mut reader,
-                source_data_size,
-                &mut progress_cb,
-                &cancel_check,
-            )?
-        } else {
-            None
-        };
-        let mut source: Box<dyn Read> = match reassembled {
-            Some((file, disk_size)) => {
-                source_data_size = disk_size;
-                Box::new(file)
+        // the FS VBR, not a partition table). Wrap a bootable disk — MBR + boot
+        // code + the volume placed as the active partition at its original LBA —
+        // so the VHD carries a partition table rather than a partitionless
+        // volume. Streamed on the fly (no intermediate tempfile). Non-GHO (IMZ)
+        // or floppy-sized GHO sources pass through bare.
+        let mut source: Box<dyn Read> = if crate::model::source_reader::is_gho_path(source_path) {
+            match super::export::gho_wrap_params(&mut reader, source_data_size)? {
+                Some(params) => {
+                    let wrapped = crate::restore::superfloppy_wrap::WrappedSuperfloppyReader::new(
+                        reader,
+                        source_data_size,
+                        &params,
+                    )?;
+                    source_data_size = wrapped.disk_size();
+                    Box::new(wrapped)
+                }
+                None => Box::new(reader),
             }
-            None => Box::new(reader),
+        } else {
+            Box::new(reader)
         };
 
         let mut writer = BufWriter::new(

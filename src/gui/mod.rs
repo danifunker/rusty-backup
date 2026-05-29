@@ -211,6 +211,21 @@ mod materialize_tests {
         assert_eq!(out, gho_path);
         assert!(guard.is_none());
     }
+
+    #[test]
+    fn hfv_passes_through_unchanged() {
+        // HFV is a flat raw HFS volume opened directly at offset 0 by the
+        // superfloppy path; prepare_disk_image_path must not materialize or
+        // rewrite it. Covers both .hfv and .HFV.
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["disk.hfv", "DISK.HFV"] {
+            let hfv_path = tmp.path().join(name);
+            std::fs::write(&hfv_path, b"\x00\x00\x00\x00").unwrap();
+            let (out, guard) = prepare_disk_image_path(&hfv_path).unwrap();
+            assert_eq!(out, hfv_path);
+            assert!(guard.is_none());
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

@@ -9,7 +9,7 @@
 //! The transform is one-way: there is no helper here to collapse a partitioned
 //! image back into a superfloppy.
 
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 
 use anyhow::{bail, Context, Result};
 
@@ -337,13 +337,14 @@ fn zero_fill_partition_tail<W: Write + Seek>(
     Ok(())
 }
 
-fn write_backup_gpt<W: Write + Seek>(
-    target: &mut W,
+/// Compute the backup GPT bytes and the disk offset they occupy, or `None` for
+/// MBR wraps. Shared by [`write_backup_gpt`] and [`build_wrap_overlay`] so the
+/// streaming reader and the writer can never disagree on the backup GPT.
+fn backup_gpt_region(
     params: &WrapParams,
     partition_sectors: u64,
     total_sectors: u64,
-    log_cb: &mut impl FnMut(&str),
-) -> Result<()> {
+) -> Option<(u64, Vec<u8>)> {
     let (type_guid, name, first_lba) = match &params.table {
         WrapTable::Gpt {
             type_guid,
@@ -354,7 +355,7 @@ fn write_backup_gpt<W: Write + Seek>(
             name.clone(),
             alignment.first_partition_lba().max(34),
         ),
-        _ => return Ok(()),
+        _ => return None,
     };
     let last_lba = first_lba + partition_sectors - 1;
     let gpt = build_minimal_gpt(
@@ -364,6 +365,20 @@ fn write_backup_gpt<W: Write + Seek>(
     let backup = gpt.build_backup_gpt(total_sectors);
     // Backup GPT occupies sectors total_sectors-33 .. total_sectors-1.
     let backup_offset = (total_sectors - 33) * SECTOR_SIZE;
+    Some((backup_offset, backup))
+}
+
+fn write_backup_gpt<W: Write + Seek>(
+    target: &mut W,
+    params: &WrapParams,
+    partition_sectors: u64,
+    total_sectors: u64,
+    log_cb: &mut impl FnMut(&str),
+) -> Result<()> {
+    let Some((backup_offset, backup)) = backup_gpt_region(params, partition_sectors, total_sectors)
+    else {
+        return Ok(());
+    };
     target
         .seek(SeekFrom::Start(backup_offset))
         .context("seeking to backup GPT")?;
@@ -384,6 +399,274 @@ fn synth_disk_signature(params: &WrapParams) -> u32 {
         h = h.wrapping_mul(0x0100_0000_01B3).wrapping_add(*b as u64);
     }
     (h as u32) | 1
+}
+
+// =============================================================================
+// Streaming wrap (no intermediate disk image)
+// =============================================================================
+
+/// Number of leading source bytes inspected when building the wrap overlay.
+/// 32 KiB covers the VBR plus every early on-volume backup structure a
+/// FAT32 / exFAT patch touches (FAT32 backup boot sector ~sector 6, exFAT
+/// backup VBR region sectors 12..24). NTFS's backup boot sector lives at the
+/// volume's *last* sector and is handled separately (it's a verbatim copy of
+/// the patched VBR, so it needs no extra source bytes).
+const WRAP_HEAD_PROBE: usize = 64 * 512;
+
+/// A streaming description of the wrapped disk: the small fixed (non-source)
+/// byte ranges, plus where the source volume sits. Layering these ranges over
+/// zeros, with the source volume placed at `partition_first_byte`, reproduces
+/// byte-for-byte what [`wrap_and_write`] writes — without materializing the
+/// whole disk. Verified by the `wrapped_reader_matches_wrap_and_write` test.
+pub struct WrapOverlay {
+    target_size: u64,
+    partition_first_byte: u64,
+    source_size: u64,
+    /// `(offset, bytes)` ranges that override the zero/source base layer.
+    /// Sorted by offset and non-overlapping. Cover the partition table (and
+    /// primary GPT), the patched VBR + early FS backups, any FS end-of-volume
+    /// backup sector, and the backup GPT.
+    fixed: Vec<(u64, Vec<u8>)>,
+}
+
+/// Render the partition-table region ([`wrap_and_write`]'s front matter: MBR,
+/// or protective MBR + primary GPT) into a byte buffer, reusing
+/// [`write_table`] so the streamed table is identical to the written one.
+fn render_table_region(
+    params: &WrapParams,
+    first_lba: u64,
+    partition_sectors: u64,
+    total_sectors: u64,
+) -> Result<Vec<u8>> {
+    let mut c = Cursor::new(Vec::<u8>::new());
+    write_table(
+        &mut c,
+        params,
+        first_lba,
+        partition_sectors,
+        total_sectors,
+        &mut |_| {},
+    )?;
+    Ok(c.into_inner())
+}
+
+/// Build the fixed-overlay ranges for the disk described by `params`, given the
+/// source volume's leading bytes. See [`WrapOverlay`].
+pub fn build_wrap_overlay(
+    source_head: &[u8],
+    source_size: u64,
+    params: &WrapParams,
+) -> Result<WrapOverlay> {
+    let first_lba = params.table.first_partition_lba();
+    let first_byte = first_lba
+        .checked_mul(SECTOR_SIZE)
+        .context("first partition LBA overflows")?;
+    if params.partition_size_bytes < source_size {
+        bail!(
+            "partition size {} bytes is smaller than source filesystem ({} bytes)",
+            params.partition_size_bytes,
+            source_size
+        );
+    }
+    if !params.partition_size_bytes.is_multiple_of(SECTOR_SIZE) {
+        bail!(
+            "partition size {} bytes is not a multiple of the sector size",
+            params.partition_size_bytes
+        );
+    }
+    let end_byte = first_byte
+        .checked_add(params.partition_size_bytes)
+        .context("partition end overflows")?;
+    if end_byte > params.target_size_bytes {
+        bail!(
+            "partition end ({} bytes) exceeds target size ({} bytes)",
+            end_byte,
+            params.target_size_bytes
+        );
+    }
+
+    let total_sectors = params.target_size_bytes / SECTOR_SIZE;
+    let partition_sectors = params.partition_size_bytes / SECTOR_SIZE;
+
+    let mut fixed: Vec<(u64, Vec<u8>)> = Vec::new();
+
+    // 1. Partition table (+ primary GPT) at the front.
+    fixed.push((
+        0,
+        render_table_region(params, first_lba, partition_sectors, total_sectors)?,
+    ));
+
+    // 2. Patched partition head: the VBR with `hidden_sectors` rewritten, plus
+    //    any early on-volume backup structures (FAT32 backup boot sector,
+    //    exFAT backup VBR region), produced by running the real
+    //    `patch_hidden_sectors_for` — the exact code `wrap_and_write` calls —
+    //    against a fixed-size window over the head. The fixed-size slice means
+    //    a patcher that tried to write past the window (e.g. an NTFS end-of-
+    //    volume backup) would error rather than silently grow the buffer; in
+    //    practice the FAT patcher patches NTFS's `hidden_sectors` first, so the
+    //    NTFS patcher then no-ops and never reaches for the volume tail.
+    let head_len = ((WRAP_HEAD_PROBE as u64).min(source_size) as usize / 512 * 512)
+        .max(512)
+        .min(source_head.len());
+    let mut head = source_head[..head_len].to_vec();
+    {
+        let mut log = |_: &str| {};
+        let mut cur = Cursor::new(&mut head[..]);
+        patch_hidden_sectors_for(&mut cur, 0, first_lba, &mut log)
+            .context("patching wrapped VBR hidden_sectors for overlay")?;
+    }
+    fixed.push((first_byte, head));
+
+    // 3. Backup GPT at the end of the disk (GPT wraps only).
+    if let Some(region) = backup_gpt_region(params, partition_sectors, total_sectors) {
+        fixed.push(region);
+    }
+
+    fixed.sort_by_key(|(off, _)| *off);
+    Ok(WrapOverlay {
+        target_size: params.target_size_bytes,
+        partition_first_byte: first_byte,
+        source_size,
+        fixed,
+    })
+}
+
+/// A `Read + Seek` view of a superfloppy wrapped with a synthetic partition
+/// table — streamed on the fly, with no intermediate full-disk image.
+///
+/// Reads yield the same bytes [`wrap_and_write`] would write: the partition
+/// table (+ primary GPT), a zero gap, the source volume at its original LBA
+/// (VBR `hidden_sectors` patched), zero tail padding, and a backup GPT for GPT
+/// wraps. The source is consumed strictly sequentially for the partition window
+/// (random reads re-seek the source), so it composes with any whole-disk export
+/// writer (VMDK flat/sparse, dynamic VHD, QCOW2, CHD) without staging the whole
+/// reassembled disk to a tempfile first.
+pub struct WrappedSuperfloppyReader<R> {
+    source: R,
+    overlay: WrapOverlay,
+    /// Current read position in the wrapped disk.
+    pos: u64,
+    /// Partition-relative offset the source is currently positioned at, so we
+    /// only re-seek the (possibly expensive) source on a discontinuity.
+    src_at: u64,
+}
+
+impl<R: Read + Seek> WrappedSuperfloppyReader<R> {
+    /// Build a streaming wrapped reader. `source` is the bare superfloppy
+    /// volume (e.g. a decoded GHO); `source_size` is its byte length; `params`
+    /// describes the table to synthesize (typically from [`gho_wrap_params`]).
+    pub fn new(mut source: R, source_size: u64, params: &WrapParams) -> Result<Self> {
+        source
+            .seek(SeekFrom::Start(0))
+            .context("rewind source for wrap-head probe")?;
+        let probe = (WRAP_HEAD_PROBE as u64).min(source_size) as usize;
+        let mut head = vec![0u8; probe];
+        let mut filled = 0;
+        while filled < probe {
+            let n = source
+                .read(&mut head[filled..])
+                .context("reading source head for wrap overlay")?;
+            if n == 0 {
+                break;
+            }
+            filled += n;
+        }
+        head.truncate(filled);
+        let overlay = build_wrap_overlay(&head, source_size, params)?;
+        source
+            .seek(SeekFrom::Start(0))
+            .context("rewind source after wrap-head probe")?;
+        Ok(Self {
+            source,
+            overlay,
+            pos: 0,
+            src_at: 0,
+        })
+    }
+
+    /// Total size of the wrapped disk in bytes.
+    pub fn disk_size(&self) -> u64 {
+        self.overlay.target_size
+    }
+}
+
+impl<R: Read + Seek> Read for WrappedSuperfloppyReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let target = self.overlay.target_size;
+        if self.pos >= target || buf.is_empty() {
+            return Ok(0);
+        }
+        let first_byte = self.overlay.partition_first_byte;
+        let win_end = first_byte + self.overlay.source_size;
+
+        let mut n = (buf.len() as u64).min(target - self.pos) as usize;
+        // Keep a single read within one region type (pre-window zeros, source
+        // window, post-window zeros) so the base fill below is uniform.
+        for &b in &[first_byte, win_end] {
+            if self.pos < b && self.pos + n as u64 > b {
+                n = (b - self.pos) as usize;
+            }
+        }
+
+        // Base layer.
+        if self.pos >= first_byte && self.pos < win_end {
+            let want_src = self.pos - first_byte;
+            if self.src_at != want_src {
+                self.source.seek(SeekFrom::Start(want_src))?;
+                self.src_at = want_src;
+            }
+            let mut filled = 0;
+            while filled < n {
+                let r = self.source.read(&mut buf[filled..n])?;
+                if r == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "wrapped source ended before its declared size",
+                    ));
+                }
+                filled += r;
+            }
+            self.src_at += n as u64;
+        } else {
+            buf[..n].fill(0);
+        }
+
+        // Overlay the fixed ranges (table, patched VBR, FS/GPT backups).
+        for (off, bytes) in &self.overlay.fixed {
+            let start = *off;
+            let end = start + bytes.len() as u64;
+            let lo = self.pos.max(start);
+            let hi = (self.pos + n as u64).min(end);
+            if lo < hi {
+                let dst = (lo - self.pos) as usize;
+                let src = (lo - start) as usize;
+                let len = (hi - lo) as usize;
+                buf[dst..dst + len].copy_from_slice(&bytes[src..src + len]);
+            }
+        }
+
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl<R: Read + Seek> Seek for WrappedSuperfloppyReader<R> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let target = self.overlay.target_size as i64;
+        let np = match pos {
+            SeekFrom::Start(o) => o as i64,
+            SeekFrom::End(o) => target + o,
+            SeekFrom::Current(o) => self.pos as i64 + o,
+        };
+        if np < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "seek to a negative position",
+            ));
+        }
+        self.pos = np as u64;
+        Ok(self.pos)
+    }
 }
 
 // =============================================================================
@@ -562,6 +845,94 @@ mod tests {
         )
         .expect("wrap_and_write");
         target
+    }
+
+    /// Stream the same wrap through `WrappedSuperfloppyReader` and return the
+    /// full disk bytes.
+    fn wrap_via_reader(source: Vec<u8>, params: &WrapParams) -> Vec<u8> {
+        let source_size = source.len() as u64;
+        let mut rdr = WrappedSuperfloppyReader::new(Cursor::new(source), source_size, params)
+            .expect("WrappedSuperfloppyReader::new");
+        let mut out = Vec::new();
+        rdr.read_to_end(&mut out).expect("read_to_end");
+        out
+    }
+
+    /// The streaming reader must reproduce `wrap_and_write`'s output byte-for-
+    /// byte — that equivalence is what lets the export paths drop the
+    /// intermediate full-disk tempfile. Covers MBR/NTFS (with the end-of-volume
+    /// backup boot sector), MBR/FAT32 (front backup boot sector), and GPT/NTFS
+    /// (protective MBR + primary + backup GPT).
+    #[test]
+    fn wrapped_reader_matches_wrap_and_write() {
+        // MBR + NTFS. total_sectors set so the backup boot sector overlay fires.
+        {
+            let fs_size = 4 * ONE_MIB;
+            let total = fs_size / 512;
+            let mut vbr = ntfs_vbr_sector(0);
+            vbr[0x28..0x30].copy_from_slice(&total.to_le_bytes());
+            let src = make_source(vbr, fs_size);
+            let params = WrapParams {
+                table: WrapTable::Mbr {
+                    type_byte: 0x07,
+                    bootable: true,
+                    alignment: WrapAlignment::DosTraditional,
+                },
+                partition_size_bytes: fs_size,
+                target_size_bytes: 63 * SECTOR_SIZE + fs_size,
+                source_fs_hint: "NTFS".into(),
+            };
+            assert_eq!(
+                wrap_via_reader(src.clone(), &params),
+                wrap_to_vec(src, &params),
+                "MBR/NTFS stream != write"
+            );
+        }
+        // MBR + FAT32 at 1 MiB alignment.
+        {
+            let fs_size = 4 * ONE_MIB;
+            let src = make_source(fat32_vbr_sector(0), fs_size);
+            let params = WrapParams {
+                table: WrapTable::Mbr {
+                    type_byte: 0x0C,
+                    bootable: false,
+                    alignment: WrapAlignment::Modern1MB,
+                },
+                partition_size_bytes: fs_size,
+                target_size_bytes: 2048 * SECTOR_SIZE + fs_size,
+                source_fs_hint: "FAT32".into(),
+            };
+            assert_eq!(
+                wrap_via_reader(src.clone(), &params),
+                wrap_to_vec(src, &params),
+                "MBR/FAT32 stream != write"
+            );
+        }
+        // GPT + NTFS: protective MBR + primary GPT at front, backup GPT at end.
+        {
+            let fs_size = 4 * ONE_MIB;
+            let total = fs_size / 512;
+            let mut vbr = ntfs_vbr_sector(0);
+            vbr[0x28..0x30].copy_from_slice(&total.to_le_bytes());
+            let src = make_source(vbr, fs_size);
+            let first_lba = 2048u64;
+            let params = WrapParams {
+                table: WrapTable::Gpt {
+                    type_guid: Guid::from_string("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7").unwrap(),
+                    name: "Data".into(),
+                    alignment: WrapAlignment::Custom(first_lba),
+                },
+                partition_size_bytes: fs_size,
+                // Room for the backup GPT (last 33 sectors) past the partition.
+                target_size_bytes: first_lba * SECTOR_SIZE + fs_size + 33 * SECTOR_SIZE,
+                source_fs_hint: "NTFS".into(),
+            };
+            assert_eq!(
+                wrap_via_reader(src.clone(), &params),
+                wrap_to_vec(src, &params),
+                "GPT/NTFS stream != write"
+            );
+        }
     }
 
     #[test]

@@ -54,7 +54,8 @@
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -1115,7 +1116,9 @@ impl GhoReader {
             if !has_record_stream {
                 // No FAT record stream — try NTFS file-aware path.
                 log::info!("No FAT record stream found, trying NTFS file-aware path...");
-                match try_open_ntfs_file_aware(&mut inner, file_size, header.compression) {
+                let cache_key = NtfsScanKey::from_span_set(&span_set);
+                match try_open_ntfs_file_aware(&mut inner, file_size, header.compression, cache_key)
+                {
                     Ok((mode, volume_size)) => {
                         return Ok(Self {
                             inner,
@@ -1717,6 +1720,14 @@ impl GhoReader {
                     "Could not locate $Boot in the GHO stream; exported disk will \
                      mount but not boot"
                 ),
+            }
+        }
+
+        // Refresh the cache with the now-complete $Bitmap + $Boot so a later
+        // export (or browse) of this archive reuses them too.
+        if let Some(cs) = compressed.as_ref() {
+            if let Some(key) = cs.cache_key.clone() {
+                ntfs_scan_cache_store(&key, index, cs);
             }
         }
     }
@@ -4274,6 +4285,11 @@ struct NtfsCompressedState {
     /// Lazy scanning state: where the next forward scan should resume
     /// in the compressed file. `None` = fully scanned.
     lazy_scan: Option<NtfsLazyScanState>,
+    /// Identity of the source archive for the process-wide scan cache. When
+    /// set, the completed run index + block table are stored under this key so
+    /// a later re-open of the same archive skips the rescan. `None` disables
+    /// caching (e.g. file metadata couldn't be read at open time).
+    cache_key: Option<NtfsScanKey>,
 }
 
 /// State preserved between incremental forward scans of a compressed
@@ -4313,6 +4329,150 @@ struct NtfsLazyScanState {
     /// match an already-used `(lcn, cc)` and land two files on the same
     /// clusters -> cross-links in chkdsk. Used to skip already-assigned LCNs.
     assigned_lcns: std::collections::HashSet<u64>,
+}
+
+// ---------------------------------------------------------------------------
+// NTFS file-aware lazy-scan cache
+//
+// Building the run index for a compressed NTFS file-aware GHO means scanning
+// the whole compressed stream forward (decompressing every block) to find each
+// file's cluster runs — `extend_ntfs_compressed_index`. The GUI opens a fresh
+// `GhoReader` for nearly every browse/extract operation (see the MEMORY.md note
+// about not caching state on the filesystem struct), so without a cache that
+// full scan is paid again on each extract. This process-wide cache stores the
+// completed scan keyed by the archive's file identity and reuses it across
+// reader instances.
+// ---------------------------------------------------------------------------
+
+/// Identity of a GHO span set for the lazy-scan cache: each span file's path,
+/// length, and modification time. A change to any span file (re-backup,
+/// truncation) yields a different key, so a stale scan is never reused.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct NtfsScanKey(Vec<(PathBuf, u64, u128)>);
+
+impl NtfsScanKey {
+    /// Build a key from the span set, or `None` if any file's metadata
+    /// (length / mtime) can't be read — in which case caching is skipped.
+    fn from_span_set(span_set: &[PathBuf]) -> Option<Self> {
+        let mut parts = Vec::with_capacity(span_set.len());
+        for p in span_set {
+            let meta = std::fs::metadata(p).ok()?;
+            let mtime = meta
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_nanos();
+            parts.push((p.clone(), meta.len(), mtime));
+        }
+        Some(NtfsScanKey(parts))
+    }
+}
+
+/// A completed NTFS file-aware lazy scan, cached in memory so re-opening the
+/// same archive reuses the run index + decompressed-block table instead of
+/// re-scanning the whole compressed stream.
+struct CachedNtfsScan {
+    runs: Vec<NtfsGhoClusterRun>,
+    blocks: Vec<NtfsCompressedBlock>,
+    compression: GhoCompression,
+    total_decompressed: u64,
+    volume_size: u64,
+    cluster_size: u64,
+    vbr: [u8; 512],
+    bitmap_runs: Vec<(u64, u64)>,
+    synth_bitmap: Vec<u8>,
+    boot_code: Vec<u8>,
+}
+
+/// Max archives kept in the scan cache. Each entry can hold a few MB of run /
+/// block tables, and users rarely juggle more than one or two GHOs at once;
+/// eviction is FIFO.
+const NTFS_SCAN_CACHE_CAP: usize = 4;
+
+#[derive(Default)]
+struct NtfsScanCacheInner {
+    map: std::collections::HashMap<NtfsScanKey, Arc<CachedNtfsScan>>,
+    /// FIFO insertion order for eviction.
+    order: std::collections::VecDeque<NtfsScanKey>,
+}
+
+fn ntfs_scan_cache() -> &'static Mutex<NtfsScanCacheInner> {
+    static CACHE: OnceLock<Mutex<NtfsScanCacheInner>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(NtfsScanCacheInner::default()))
+}
+
+fn ntfs_scan_cache_get(key: &NtfsScanKey) -> Option<Arc<CachedNtfsScan>> {
+    let cache = ntfs_scan_cache().lock().ok()?;
+    cache.map.get(key).cloned()
+}
+
+/// Snapshot the (now fully-scanned) index + compressed state and store it under
+/// `key`, replacing any prior entry. Cheap to call repeatedly: later calls just
+/// refresh the entry as `$Bitmap` / `$Boot` get filled in.
+fn ntfs_scan_cache_store(key: &NtfsScanKey, index: &NtfsGhoIndex, comp: &NtfsCompressedState) {
+    let snap = Arc::new(CachedNtfsScan {
+        runs: index.runs.clone(),
+        blocks: comp.blocks.clone(),
+        compression: comp.compression,
+        total_decompressed: comp.total_decompressed,
+        volume_size: index.volume_size,
+        cluster_size: index.cluster_size,
+        vbr: index.vbr,
+        bitmap_runs: index.bitmap_runs.clone(),
+        synth_bitmap: index.synth_bitmap.clone(),
+        boot_code: index.boot_code.clone(),
+    });
+    let Ok(mut cache) = ntfs_scan_cache().lock() else {
+        return;
+    };
+    if cache.map.insert(key.clone(), snap).is_none() {
+        // New key: record order and evict the oldest if over capacity.
+        cache.order.push_back(key.clone());
+        while cache.order.len() > NTFS_SCAN_CACHE_CAP {
+            if let Some(old) = cache.order.pop_front() {
+                cache.map.remove(&old);
+            }
+        }
+    }
+    log::info!(
+        "Cached NTFS lazy-scan result: {} runs, {} blocks ({} archive(s) cached)",
+        index.runs.len(),
+        comp.blocks.len(),
+        cache.map.len(),
+    );
+}
+
+/// Reconstruct a fully-scanned `NtfsFileAware` reader mode from a cached
+/// snapshot, skipping the MFT decompression and the forward scan entirely.
+fn ntfs_mode_from_cache(snap: &CachedNtfsScan, key: NtfsScanKey) -> (GhoReaderMode, u64) {
+    let index = NtfsGhoIndex {
+        runs: snap.runs.clone(),
+        volume_size: snap.volume_size,
+        cluster_size: snap.cluster_size,
+        vbr: snap.vbr,
+        bitmap_runs: snap.bitmap_runs.clone(),
+        synth_bitmap: snap.synth_bitmap.clone(),
+        boot_code: snap.boot_code.clone(),
+    };
+    let comp = NtfsCompressedState {
+        blocks: snap.blocks.clone(),
+        compression: snap.compression,
+        total_decompressed: snap.total_decompressed,
+        cache_block: None,
+        cache_buf: Vec::new(),
+        lazy_scan: None,
+        cache_key: Some(key),
+    };
+    let volume_size = index.volume_size;
+    (
+        GhoReaderMode::NtfsFileAware {
+            index,
+            last_run_hint: 0,
+            compressed: Some(comp),
+        },
+        volume_size,
+    )
 }
 
 /// 16-byte constant prefix appearing at the start of an NTFS file-aware
@@ -5338,6 +5498,7 @@ fn open_ntfs_compressed_mft_only(
             search_resume: mft_end,
             assigned_lcns: runs.iter().map(|r| r.lcn_start).collect(),
         }),
+        cache_key: None,
     };
     let index = NtfsGhoIndex {
         runs,
@@ -5753,6 +5914,11 @@ fn extend_ntfs_compressed_index(
             "Lazy scan complete (EOF): {run_count} runs, {block_count} blocks, \
              file_offset={final_file_offset} end={end} total_decompressed={total_decompressed}",
         );
+        // The index + block table are now complete; cache them so a later
+        // re-open of this archive skips the rescan entirely.
+        if let Some(key) = comp.cache_key.clone() {
+            ntfs_scan_cache_store(&key, index, comp);
+        }
     } else {
         log::warn!(
             "Lazy scan STOPPED EARLY at file_offset={final_file_offset} of end={end} \
@@ -5770,6 +5936,7 @@ fn try_open_ntfs_file_aware(
     inner: &mut SpanReader,
     file_size: u64,
     compression: GhoCompression,
+    cache_key: Option<NtfsScanKey>,
 ) -> Result<(GhoReaderMode, u64)> {
     use crate::fs::ntfs::parse_vbr;
 
@@ -5801,14 +5968,31 @@ fn try_open_ntfs_file_aware(
         ));
     }
 
+    // Compressed NTFS file-aware. A completed lazy scan for this exact archive
+    // may already be cached from a prior open (the GUI re-opens a fresh reader
+    // per browse/extract operation) — reuse it and skip both the MFT
+    // decompression and the whole-stream forward scan.
+    if let Some(key) = &cache_key {
+        if let Some(snap) = ntfs_scan_cache_get(key) {
+            log::info!(
+                "Reusing cached NTFS lazy-scan ({} runs, {} blocks) — skipping rescan",
+                snap.runs.len(),
+                snap.blocks.len()
+            );
+            return Ok(ntfs_mode_from_cache(&snap, key.clone()));
+        }
+    }
+
     // Compressed NTFS file-aware: MFT-only open. Decompress just the
     // first run (MFT) and parse it. The rest of the index is built
     // lazily on demand when reads hit unmapped LCNs.
     log::info!("Opening compressed NTFS file-aware (MFT-only, lazy index)...");
     let data_start = vbr_off + 512;
-    let (comp_state, index) =
+    let (mut comp_state, index) =
         open_ntfs_compressed_mft_only(inner, data_start, file_size, compression, &vbr, &vbr_raw)
             .context("MFT-only open of compressed NTFS file-aware")?;
+    // Remember the cache key so the completed scan gets stored for reuse.
+    comp_state.cache_key = cache_key;
     let volume_size = index.volume_size;
     Ok((
         GhoReaderMode::NtfsFileAware {
@@ -5986,6 +6170,13 @@ fn read_ntfs_file_aware_into(
                 index.runs.len(),
                 total_clusters,
             );
+            // The scan is now complete and the bitmap built; refresh the cache
+            // so subsequent opens also reuse the synthesized $Bitmap.
+            if let Some(cs) = compressed.as_ref() {
+                if let Some(key) = cs.cache_key.clone() {
+                    ntfs_scan_cache_store(&key, index, cs);
+                }
+            }
         }
         let mut base = 0u64; // cluster offset within the $Bitmap file
         for &(blcn, bcnt) in &index.bitmap_runs {
@@ -6093,6 +6284,105 @@ fn read_ntfs_file_aware_into(
 mod tests {
     use super::*;
     use std::io::{Cursor, Write};
+
+    /// Helper: a minimal `CachedNtfsScan` for cache round-trip tests.
+    fn dummy_scan(run_count: usize) -> CachedNtfsScan {
+        CachedNtfsScan {
+            runs: (0..run_count as u64)
+                .map(|i| NtfsGhoClusterRun {
+                    lcn_start: i * 10,
+                    cluster_count: 10,
+                    file_offset: i * 4096,
+                })
+                .collect(),
+            blocks: Vec::new(),
+            compression: GhoCompression::High,
+            total_decompressed: 1024,
+            volume_size: 1 << 20,
+            cluster_size: 4096,
+            vbr: [0u8; 512],
+            bitmap_runs: Vec::new(),
+            synth_bitmap: Vec::new(),
+            boot_code: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn ntfs_scan_key_tracks_len_and_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.gho");
+        std::fs::write(&a, b"hello").unwrap();
+
+        let k1 = NtfsScanKey::from_span_set(std::slice::from_ref(&a)).expect("key");
+        // Same file, unchanged -> identical key.
+        let k2 = NtfsScanKey::from_span_set(std::slice::from_ref(&a)).expect("key");
+        assert_eq!(k1, k2);
+
+        // Different length -> different key (so a re-backup is never reused).
+        std::fs::write(&a, b"hello world").unwrap();
+        let k3 = NtfsScanKey::from_span_set(std::slice::from_ref(&a)).expect("key");
+        assert_ne!(k1, k3);
+
+        // Missing file -> no key (caching disabled).
+        let missing = dir.path().join("nope.gho");
+        assert!(NtfsScanKey::from_span_set(std::slice::from_ref(&missing)).is_none());
+    }
+
+    #[test]
+    fn ntfs_scan_cache_round_trips_and_evicts() {
+        // Use unique synthetic keys so this test doesn't collide with others
+        // sharing the process-wide cache.
+        let key = |tag: &str| NtfsScanKey(vec![(PathBuf::from(tag), 1, 1)]);
+
+        let k = key("round-trip-unique-archive");
+        assert!(ntfs_scan_cache_get(&k).is_none());
+
+        let index = NtfsGhoIndex {
+            runs: dummy_scan(3).runs,
+            volume_size: 1 << 20,
+            cluster_size: 4096,
+            vbr: [0u8; 512],
+            bitmap_runs: Vec::new(),
+            synth_bitmap: Vec::new(),
+            boot_code: Vec::new(),
+        };
+        let comp = NtfsCompressedState {
+            blocks: Vec::new(),
+            compression: GhoCompression::High,
+            total_decompressed: 1024,
+            cache_block: None,
+            cache_buf: Vec::new(),
+            lazy_scan: None,
+            cache_key: Some(k.clone()),
+        };
+        ntfs_scan_cache_store(&k, &index, &comp);
+
+        let got = ntfs_scan_cache_get(&k).expect("cached");
+        assert_eq!(got.runs.len(), 3);
+        assert_eq!(got.volume_size, 1 << 20);
+
+        // Insert more than the cap of distinct keys; the first inserted one
+        // must be evicted (FIFO).
+        for i in 0..NTFS_SCAN_CACHE_CAP + 2 {
+            let kk = key(&format!("evict-unique-{i}"));
+            let c = NtfsCompressedState {
+                blocks: Vec::new(),
+                compression: GhoCompression::High,
+                total_decompressed: 0,
+                cache_block: None,
+                cache_buf: Vec::new(),
+                lazy_scan: None,
+                cache_key: Some(kk.clone()),
+            };
+            ntfs_scan_cache_store(&kk, &index, &c);
+        }
+        // The very first evict key is gone; the most recent survives.
+        assert!(ntfs_scan_cache_get(&key("evict-unique-0")).is_none());
+        assert!(
+            ntfs_scan_cache_get(&key(&format!("evict-unique-{}", NTFS_SCAN_CACHE_CAP + 1)))
+                .is_some()
+        );
+    }
 
     /// Build a synthetic GHO header for testing. Returns the prefix-sector
     /// (512 bytes) so callers can drop in description bytes at 0xFF if they

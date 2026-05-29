@@ -351,7 +351,7 @@ impl InspectTab {
                                     "vhd", "img", "raw", "bin", "iso", "dd", "hda", "hdv", "2mg",
                                     "dmg", "po", "do", "dsk", "dc42", "woz", "chd", "adf", "hdf",
                                     "adz", "hdz", "imz", "vmdk", "qcow2", "qcow", "gho", "ghs",
-                                    "GHO", "GHS",
+                                    "GHO", "GHS", "hfv", "HFV",
                                 ],
                             )
                             .add_filter("All Files", &["*"])
