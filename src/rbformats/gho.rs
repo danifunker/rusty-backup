@@ -1670,6 +1670,57 @@ impl Read for GhoReader {
 }
 
 impl GhoReader {
+    /// Prepare for a faithful whole-disk export. For NTFS file-aware GHOs this
+    /// forces the lazy run scan to completion, then builds the synthesized
+    /// `$Bitmap` and recovers `$Boot`'s boot code so the exported image is both
+    /// mountable and bootable. No-op for other GHO shapes.
+    ///
+    /// Export paths call this (via `open_source_reader`); inspect/browse don't,
+    /// so they keep fast lazy opens (and serve VBR + zeros for `$Boot`, which is
+    /// fine since they never need the boot code).
+    pub fn prepare_full_image(&mut self) {
+        let GhoReaderMode::NtfsFileAware {
+            index, compressed, ..
+        } = &mut self.mode
+        else {
+            return;
+        };
+
+        // Complete the run index so $Bitmap and $Boot recovery see every run.
+        if let Some(cs) = compressed.as_mut() {
+            if cs.lazy_scan.is_some() {
+                extend_ntfs_compressed_index(&mut self.inner, index, cs, u64::MAX);
+            }
+        }
+
+        // Build $Bitmap (Ghost omits it).
+        if index.synth_bitmap.is_empty() && !index.bitmap_runs.is_empty() {
+            let total_clusters = index.volume_size / index.cluster_size;
+            let mut allocation: Vec<(u64, u64)> = index
+                .runs
+                .iter()
+                .map(|r| (r.lcn_start, r.cluster_count))
+                .collect();
+            allocation.extend_from_slice(&index.bitmap_runs);
+            index.synth_bitmap = build_synth_ntfs_bitmap(&allocation, total_clusters);
+            log::info!("Prepared $Bitmap: {} bytes", index.synth_bitmap.len());
+        }
+
+        // Recover $Boot's boot code (mislabeled by Ghost; matched via the VBR).
+        if index.boot_code.is_empty() {
+            match recover_ntfs_boot_code(&mut self.inner, index, compressed) {
+                Some(bc) => {
+                    log::info!("Recovered $Boot boot code: {} bytes", bc.len());
+                    index.boot_code = bc;
+                }
+                None => log::warn!(
+                    "Could not locate $Boot in the GHO stream; exported disk will \
+                     mount but not boot"
+                ),
+            }
+        }
+    }
+
     /// Serve bytes for FileAware mode at `position` into `out`.
     fn read_file_aware_into(&mut self, position: u64, out: &mut [u8]) -> std::io::Result<usize> {
         let GhoReaderMode::FileAware {
@@ -4301,6 +4352,13 @@ struct NtfsGhoIndex {
     /// `synth_bitmap` is one bit per cluster, LSB-first, set = allocated.
     bitmap_runs: Vec<(u64, u64)>,
     synth_bitmap: Vec<u8>,
+    /// `$Boot`'s first 16 sectors (8 KiB), recovered from the stream by
+    /// content-matching the VBR (the read path otherwise synthesizes only the
+    /// VBR for the boot region and zeros sectors 1-15). Empty until
+    /// `prepare_full_image` runs (export only) or if no match is found; the read
+    /// path then falls back to VBR + zeros. Serving the real boot code (sectors
+    /// 1-15) is what makes the exported disk bootable.
+    boot_code: Vec<u8>,
 }
 
 /// Build a synthesized NTFS `$Bitmap` from the MFT-declared allocation.
@@ -4941,6 +4999,7 @@ fn index_ntfs_file_aware<R: Read + Seek>(
         vbr: *vbr_raw,
         bitmap_runs,
         synth_bitmap,
+        boot_code: Vec::new(),
     })
 }
 
@@ -5255,6 +5314,7 @@ fn open_ntfs_compressed_mft_only(
         vbr: *vbr_raw,
         bitmap_runs,
         synth_bitmap: Vec::new(), // built lazily on first $Bitmap read
+        boot_code: Vec::new(),    // recovered by prepare_full_image (export)
     };
     Ok((comp_state, index))
 }
@@ -5718,6 +5778,72 @@ fn try_open_ntfs_file_aware(
     ))
 }
 
+/// Recover `$Boot`'s first 16 sectors by content-matching the VBR.
+///
+/// The read path synthesizes the boot region (sector 0 = VBR, rest zeros) to
+/// keep partition-detection probes cheap, so the real NTFS boot code (sectors
+/// 1-15, the bootstrap that loads NTLDR) is otherwise dropped. Ghost does store
+/// `$Boot`, and `$Boot`'s sector 0 is byte-identical to the volume VBR, so the
+/// `$Boot` run is the one whose first 512 bytes equal the VBR. Matching by
+/// content (rather than trusting the cluster-count LCN mapping) is robust to any
+/// run-mapping ambiguity. Runs are checked in stream order (`$Boot` is stored
+/// early) and the search stops at the first match. Returns up to 8 KiB (16
+/// sectors) of boot code, or `None` if no match (caller falls back to zeros).
+///
+/// Requires a complete run index (call after the lazy scan finishes).
+fn recover_ntfs_boot_code(
+    inner: &mut SpanReader,
+    index: &NtfsGhoIndex,
+    compressed: &mut Option<NtfsCompressedState>,
+) -> Option<Vec<u8>> {
+    const BOOT_BYTES: usize = 16 * 512;
+    let mut order: Vec<&NtfsGhoClusterRun> = index.runs.iter().collect();
+    order.sort_by_key(|r| r.file_offset);
+
+    let mut head = [0u8; 512];
+    for run in order {
+        let read_head = |inner: &mut SpanReader,
+                         compressed: &mut Option<NtfsCompressedState>,
+                         head: &mut [u8; 512]|
+         -> bool {
+            if let Some(cs) = compressed.as_mut() {
+                let mut rdr = NtfsDecompressingReader {
+                    inner,
+                    state: cs,
+                    position: run.file_offset,
+                };
+                rdr.read_exact(head).is_ok()
+            } else {
+                inner.seek(SeekFrom::Start(run.file_offset)).is_ok()
+                    && inner.read_exact(head).is_ok()
+            }
+        };
+        if !read_head(inner, compressed, &mut head) {
+            continue;
+        }
+        if head == index.vbr {
+            let avail = (run.cluster_count * index.cluster_size) as usize;
+            let want = BOOT_BYTES.min(avail);
+            let mut buf = vec![0u8; want];
+            let ok = if let Some(cs) = compressed.as_mut() {
+                let mut rdr = NtfsDecompressingReader {
+                    inner,
+                    state: cs,
+                    position: run.file_offset,
+                };
+                rdr.read_exact(&mut buf).is_ok()
+            } else {
+                inner.seek(SeekFrom::Start(run.file_offset)).is_ok()
+                    && inner.read_exact(&mut buf).is_ok()
+            };
+            if ok {
+                return Some(buf);
+            }
+        }
+    }
+    None
+}
+
 /// Read bytes from an NTFS file-aware GHO at `position` in the logical
 /// volume. Uses binary search over the sorted cluster run index.
 fn read_ntfs_file_aware_into(
@@ -5756,25 +5882,22 @@ fn read_ntfs_file_aware_into(
         to_read = (backup_start - position) as usize;
     }
 
-    // $Boot region (first 16 sectors, LCN 0). Serve sector 0 from the
+    // $Boot region (first 16 sectors, LCN 0). Sector 0 is always the
     // authoritative GHPR-embedded VBR (this also keeps partition-detection
-    // probes cheap); zero the rest. Ghost stores $Boot's boot code, but its
-    // cluster-count run matching mismaps the LCN-0 run to other 2-cluster data
-    // (e.g. a directory $INDEX_ALLOCATION), so the stored boot code can't be
-    // reliably located — serving it would inject garbage. The volume mounts
-    // fine without sectors 1-15; booting would need a synthesized NTFS
-    // bootstrap (see notes — not yet implemented).
+    // probes cheap). Sectors 1-15 are the NTFS boot code: served from
+    // `index.boot_code` when an export prepared it (recover_ntfs_boot_code),
+    // else zeros — the volume still mounts, just won't self-boot.
     const SYNTH_BOOT_BYTES: u64 = 16 * 512; // 16 sectors = RDB scan range
     if position < SYNTH_BOOT_BYTES {
         let pos = position as usize;
         let n = to_read.min(SYNTH_BOOT_BYTES as usize - pos);
-        for b in &mut out[..n] {
-            *b = 0;
-        }
-        if pos < 512 {
-            let vbr_end = (pos + n).min(512);
-            let copy_len = vbr_end - pos;
-            out[..copy_len].copy_from_slice(&index.vbr[pos..pos + copy_len]);
+        for (i, b) in out[..n].iter_mut().enumerate() {
+            let fo = pos + i;
+            *b = if fo < 512 {
+                index.vbr[fo]
+            } else {
+                index.boot_code.get(fo).copied().unwrap_or(0)
+            };
         }
         return Ok(n);
     }

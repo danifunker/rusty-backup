@@ -289,9 +289,17 @@ fn ntfs_total_sectors_from_vbr(vbr: &[u8; 512]) -> u64 {
 /// Every format exporter (Raw, VHD dynamic, QCOW2, VMDK flat/sparse, CHD) must
 /// obtain its source through this helper so spanning works uniformly.
 fn open_source_reader(source_path: &Path) -> Result<(super::BoxReadSeek, u64)> {
-    if crate::model::source_reader::is_gho_path(source_path)
-        || crate::model::source_reader::is_imz_path(source_path)
-    {
+    if crate::model::source_reader::is_gho_path(source_path) {
+        // Open the GHO concretely so we can prepare a faithful whole-disk image
+        // (synthesize $Bitmap, recover $Boot's boot code) — these make the
+        // export mountable AND bootable. Only export goes through here; inspect
+        // uses source_reader::open_read and keeps its fast lazy open.
+        let mut gho = super::gho::GhoReader::open(source_path)?;
+        gho.prepare_full_image();
+        let size = gho.seek(SeekFrom::End(0))?;
+        gho.seek(SeekFrom::Start(0))?;
+        Ok((Box::new(gho), size))
+    } else if crate::model::source_reader::is_imz_path(source_path) {
         let mut r = crate::model::source_reader::open_read(source_path)?;
         let size = r.seek(SeekFrom::End(0))?;
         r.seek(SeekFrom::Start(0))?;
