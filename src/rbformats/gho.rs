@@ -4291,6 +4291,11 @@ struct NtfsLazyScanState {
     /// headers and found none. Avoids re-scanning the same bytes on every
     /// subsequent block (which would be O(N^2)). Always >= `prev_data_end`.
     search_resume: u64,
+    /// LCN starts already assigned to a run. Ghost re-declares some files'
+    /// runs both inline and in the MFT queue, so a stream run can otherwise
+    /// match an already-used `(lcn, cc)` and land two files on the same
+    /// clusters -> cross-links in chkdsk. Used to skip already-assigned LCNs.
+    assigned_lcns: std::collections::HashSet<u64>,
 }
 
 /// 16-byte constant prefix appearing at the start of an NTFS file-aware
@@ -4420,7 +4425,12 @@ fn parse_inline_mft_from_buf(
             for attr in &attrs {
                 if !attr.resident && !attr.data_runs.is_empty() {
                     for dr in &attr.data_runs {
-                        if dr.cluster_offset >= 0 && dr.length > 0 {
+                        // Skip sparse runs. decode_data_runs returns
+                        // cluster_offset == 0 for holes (offset_size == 0); they
+                        // have no stored content and no real LCN. Queuing them as
+                        // (lcn=0, cc) makes real stream runs match LCN 0 and pile
+                        // up on $Boot's clusters -> cross-links in chkdsk.
+                        if dr.cluster_offset > 0 && dr.length > 0 {
                             out.push((dr.cluster_offset as u64, dr.length));
                         }
                     }
@@ -4674,7 +4684,12 @@ fn parse_inline_mft_records<R: Read + Seek>(
             for attr in &attrs {
                 if !attr.resident && !attr.data_runs.is_empty() {
                     for dr in &attr.data_runs {
-                        if dr.cluster_offset >= 0 && dr.length > 0 {
+                        // Skip sparse runs. decode_data_runs returns
+                        // cluster_offset == 0 for holes (offset_size == 0); they
+                        // have no stored content and no real LCN. Queuing them as
+                        // (lcn=0, cc) makes real stream runs match LCN 0 and pile
+                        // up on $Boot's clusters -> cross-links in chkdsk.
+                        if dr.cluster_offset > 0 && dr.length > 0 {
                             out.push((dr.cluster_offset as u64, dr.length));
                         }
                     }
@@ -4781,7 +4796,9 @@ fn index_ntfs_file_aware<R: Read + Seek>(
                 if skip_first && i == 0 {
                     continue;
                 }
-                if dr.cluster_offset >= 0 && dr.length > 0 {
+                // Skip sparse runs (cluster_offset == 0 = hole); see the inline
+                // MFT parser for why queuing them as lcn=0 causes cross-links.
+                if dr.cluster_offset > 0 && dr.length > 0 {
                     data_run_queue.push((dr.cluster_offset as u64, dr.length));
                     if rec_num == 6 && attr.attr_type == 0x80 {
                         bitmap_runs.push((dr.cluster_offset as u64, dr.length));
@@ -4812,6 +4829,10 @@ fn index_ntfs_file_aware<R: Read + Seek>(
     // Pending data runs from inline MFT records. Matched to cluster runs
     // by cluster count (Ghost doesn't emit them in the same order).
     let mut pending_lcns: Vec<(u64, u64)> = Vec::new();
+
+    // LCN starts already assigned — prevents two stream runs landing on the
+    // same clusters when Ghost re-declares a run inline and in the MFT queue.
+    let mut assigned: std::collections::HashSet<u64> = runs.iter().map(|r| r.lcn_start).collect();
 
     // Runs that couldn't be matched to an inline MFT record's data runs.
     // Resolved via $Bitmap after the main scan.
@@ -4865,23 +4886,14 @@ fn index_ntfs_file_aware<R: Read + Seek>(
 
                             // Determine LCN from pending data runs. Ghost emits
                             // MFT records in ascending record-number order but
-                            // stores cluster data largest-first within each batch.
-                            // Use cluster-count matching to handle the reordering.
-                            // For ambiguous cases (multiple runs with the same
-                            // cluster count), pop from the BACK of matching entries
-                            // so that later-declared MFT records (higher record
-                            // numbers) match first — this reflects Ghost's tendency
-                            // to write higher-numbered system files' data first.
-                            let lcn =
-                                pending_lcns
-                                    .iter()
-                                    .rposition(|&(_, len)| len == cc)
-                                    .map(|idx| {
-                                        let (lcn, _) = pending_lcns.remove(idx);
-                                        lcn
-                                    });
+                            // stores cluster data largest-first within each batch,
+                            // so match by cluster count, popping from the BACK.
+                            // Skip already-assigned LCNs so a re-declared run
+                            // doesn't double-map onto another file's clusters.
+                            let lcn = pop_unassigned_lcn(&mut pending_lcns, cc, &assigned);
 
                             if let Some(lcn) = lcn {
+                                assigned.insert(lcn);
                                 runs.push(NtfsGhoClusterRun {
                                     lcn_start: lcn,
                                     cluster_count: cc,
@@ -4946,8 +4958,8 @@ fn index_ntfs_file_aware<R: Read + Seek>(
 
         let mut resolved = 0u64;
         for &(cc, file_offset) in &unmapped_runs {
-            if let Some(idx) = remaining_queue.iter().rposition(|&(_, len)| len == cc) {
-                let (lcn, _) = remaining_queue.remove(idx);
+            if let Some(lcn) = pop_unassigned_lcn(&mut remaining_queue, cc, &assigned) {
+                assigned.insert(lcn);
                 runs.push(NtfsGhoClusterRun {
                     lcn_start: lcn,
                     cluster_count: cc,
@@ -5235,7 +5247,9 @@ fn open_ntfs_compressed_mft_only(
                             if skip_first && i == 0 {
                                 continue;
                             }
-                            if dr.cluster_offset >= 0 && dr.length > 0 {
+                            // Skip sparse runs (cluster_offset == 0 = hole);
+                            // queuing them as lcn=0 causes $Boot cross-links.
+                            if dr.cluster_offset > 0 && dr.length > 0 {
                                 data_run_queue.push((dr.cluster_offset as u64, dr.length));
                                 if rec_num == 6 && attr.attr_type == 0x80 {
                                     bitmap_runs.push((dr.cluster_offset as u64, dr.length));
@@ -5305,6 +5319,7 @@ fn open_ntfs_compressed_mft_only(
             stream_base: mft_end,
             skip_data_bytes: 0,
             search_resume: mft_end,
+            assigned_lcns: runs.iter().map(|r| r.lcn_start).collect(),
         }),
     };
     let index = NtfsGhoIndex {
@@ -5317,6 +5332,22 @@ fn open_ntfs_compressed_mft_only(
         boot_code: Vec::new(),    // recovered by prepare_full_image (export)
     };
     Ok((comp_state, index))
+}
+
+/// Pop the last `(lcn, cc)` entry whose cluster count matches `cc` and whose
+/// LCN isn't already assigned to another run. Removing from the back honours
+/// Ghost's largest-first emission order; the assigned-LCN check prevents two
+/// stream runs from landing on the same clusters (Ghost re-declares some runs
+/// both inline and in the MFT queue). Returns the chosen LCN, or `None`.
+fn pop_unassigned_lcn(
+    list: &mut Vec<(u64, u64)>,
+    cc: u64,
+    assigned: &std::collections::HashSet<u64>,
+) -> Option<u64> {
+    let idx = list
+        .iter()
+        .rposition(|&(lcn, len)| len == cc && !assigned.contains(&lcn))?;
+    Some(list.remove(idx).0)
 }
 
 /// Extend the NTFS compressed run index by scanning forward in the
@@ -5629,20 +5660,14 @@ fn extend_ntfs_compressed_index(
             // Match LCN by cluster count: prefer a just-parsed inline MFT
             // record (pending_lcns), fall back to the global MFT data-run
             // queue. Ghost stores runs largest-first within a batch, so pop
-            // from the back of matching entries.
-            let lcn = scan
-                .pending_lcns
-                .iter()
-                .rposition(|&(_, len)| len == cc)
-                .map(|i| scan.pending_lcns.remove(i).0)
-                .or_else(|| {
-                    scan.data_run_queue
-                        .iter()
-                        .rposition(|&(_, len)| len == cc)
-                        .map(|i| scan.data_run_queue.remove(i).0)
-                });
+            // from the back of matching entries. Skip candidates whose LCN is
+            // already assigned — Ghost re-declares some files' runs both inline
+            // and in the queue, so a naive match double-assigns and cross-links.
+            let lcn = pop_unassigned_lcn(&mut scan.pending_lcns, cc, &scan.assigned_lcns)
+                .or_else(|| pop_unassigned_lcn(&mut scan.data_run_queue, cc, &scan.assigned_lcns));
 
             if let Some(lcn) = lcn {
+                scan.assigned_lcns.insert(lcn);
                 index.runs.push(NtfsGhoClusterRun {
                     lcn_start: lcn,
                     cluster_count: cc,
