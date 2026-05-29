@@ -4309,6 +4309,10 @@ struct NtfsLazyScanState {
     cluster_size: u64,
     /// Pending inline-MFT data runs not yet matched to run headers.
     pending_lcns: Vec<(u64, u64)>,
+    /// Index into `pending_lcns` where the most recently parsed gap's entries
+    /// begin. Stream runs are matched against this freshest group first (in
+    /// forward order); see `match_inline_run`.
+    pending_group_start: usize,
     /// Data-run queue from the MFT (Phase 1), consumed during matching.
     data_run_queue: Vec<(u64, u64)>,
     /// Absolute decompressed offset where the previous run's data ends.
@@ -5003,9 +5007,10 @@ fn index_ntfs_file_aware<R: Read + Seek>(
     });
     total_stored_clusters += mft_clusters;
 
-    // Pending data runs from inline MFT records. Matched to cluster runs
-    // by cluster count (Ghost doesn't emit them in the same order).
+    // Pending data runs from inline MFT records. Matched to cluster runs in
+    // MFT-walk order, freshest gap first (see match_inline_run).
     let mut pending_lcns: Vec<(u64, u64)> = Vec::new();
+    let mut pending_group_start: usize = 0;
 
     // LCN starts already assigned — prevents two stream runs landing on the
     // same clusters when Ghost re-declares a run inline and in the MFT queue.
@@ -5052,6 +5057,7 @@ fn index_ntfs_file_aware<R: Read + Seek>(
                             let gap_start = prev_data_end;
                             let gap_end = abs_off;
                             if gap_end > gap_start && (gap_end - gap_start) < 1024 * 1024 {
+                                let len_before = pending_lcns.len();
                                 parse_inline_mft_records(
                                     reader,
                                     gap_start,
@@ -5059,15 +5065,23 @@ fn index_ntfs_file_aware<R: Read + Seek>(
                                     vbr,
                                     &mut pending_lcns,
                                 );
+                                // A non-empty gap starts a fresh group: the runs
+                                // that follow consume these entries in MFT order.
+                                if pending_lcns.len() > len_before {
+                                    pending_group_start = len_before;
+                                }
                             }
 
-                            // Determine LCN from pending data runs. Ghost emits
-                            // MFT records in ascending record-number order but
-                            // stores cluster data largest-first within each batch,
-                            // so match by cluster count, popping from the BACK.
-                            // Skip already-assigned LCNs so a re-declared run
-                            // doesn't double-map onto another file's clusters.
-                            let lcn = pop_unassigned_lcn(&mut pending_lcns, cc, &assigned);
+                            // Determine LCN from pending data runs in MFT-walk
+                            // order (freshest gap first). Skip already-assigned
+                            // LCNs so a re-declared run doesn't double-map onto
+                            // another file's clusters.
+                            let lcn = match_inline_run(
+                                &mut pending_lcns,
+                                &mut pending_group_start,
+                                cc,
+                                &assigned,
+                            );
 
                             if let Some(lcn) = lcn {
                                 assigned.insert(lcn);
@@ -5490,6 +5504,7 @@ fn open_ntfs_compressed_mft_only(
             vbr: vbr.clone(),
             cluster_size,
             pending_lcns: Vec::new(),
+            pending_group_start: 0,
             data_run_queue,
             prev_data_end: mft_end,
             stream: leftover_stream,
@@ -5512,11 +5527,19 @@ fn open_ntfs_compressed_mft_only(
     Ok((comp_state, index))
 }
 
-/// Pop the last `(lcn, cc)` entry whose cluster count matches `cc` and whose
-/// LCN isn't already assigned to another run. Removing from the back honours
-/// Ghost's largest-first emission order; the assigned-LCN check prevents two
+/// Pop the FIRST `(lcn, cc)` entry whose cluster count matches `cc` and whose
+/// LCN isn't already assigned to another run. Ghost emits cluster runs in
+/// MFT-walk order — record order, then attribute order within a record, then
+/// fragment order within an attribute — and the MFT data-run queue is built in
+/// that same order, so the correct match for a stream run is the EARLIEST
+/// unassigned entry of the right size. The assigned-LCN check prevents two
 /// stream runs from landing on the same clusters (Ghost re-declares some runs
 /// both inline and in the MFT queue). Returns the chosen LCN, or `None`.
+///
+/// Used for the global MFT data-run queue (the Phase-3 fallback and the
+/// compressed lazy path's secondary lookup), where the whole list is one
+/// MFT-ordered group. For the inline `pending_lcns` list, which interleaves a
+/// freshly parsed gap's entries with stale orphans, use [`match_inline_run`].
 fn pop_unassigned_lcn(
     list: &mut Vec<(u64, u64)>,
     cc: u64,
@@ -5524,7 +5547,49 @@ fn pop_unassigned_lcn(
 ) -> Option<u64> {
     let idx = list
         .iter()
-        .rposition(|&(lcn, len)| len == cc && !assigned.contains(&lcn))?;
+        .position(|&(lcn, len)| len == cc && !assigned.contains(&lcn))?;
+    Some(list.remove(idx).0)
+}
+
+/// Match a stream run of size `cc` to an inline-MFT `(lcn, cc)` entry.
+///
+/// `pending_lcns` accumulates the data runs parsed from inline FILE records as
+/// gaps are scanned. Ghost writes each gap's records immediately before the
+/// cluster data they describe, and emits that data in MFT-walk order, so the
+/// correct entry for a stream run is the EARLIEST unassigned entry of size `cc`
+/// within the most recently parsed gap — the suffix `list[group_start..]`.
+/// Matching from the back instead (`rposition`) reverses every same-`cc` group:
+/// e.g. `$Secure`'s `$SDH`/`$SII` index-allocation blocks get swapped and a
+/// fragmented file's `$DATA` extents get reversed (verified against
+/// `smallNTFS.GHO`, where it produced chkdsk `$SDH`/`$SII`/`$I30` index errors).
+/// Matching from the front of the whole list instead grabs stale orphans: Ghost
+/// re-declares some already-emitted runs in a later gap, leaving entries that
+/// never get a stream run (e.g. a leftover `(1310297, 1)` ahead of the real
+/// `$SDH`/`$SII` pair). So: search the freshest group forward first, and only
+/// fall back to older orphaned entries (also forward) if it has no match.
+///
+/// On success removes the chosen entry, fixes up `*group_start`, and returns the
+/// LCN. The assigned-LCN check prevents double-mapping onto another file's
+/// clusters.
+fn match_inline_run(
+    list: &mut Vec<(u64, u64)>,
+    group_start: &mut usize,
+    cc: u64,
+    assigned: &std::collections::HashSet<u64>,
+) -> Option<u64> {
+    let gs = (*group_start).min(list.len());
+    let idx = list[gs..]
+        .iter()
+        .position(|&(lcn, len)| len == cc && !assigned.contains(&lcn))
+        .map(|i| gs + i)
+        .or_else(|| {
+            list[..gs]
+                .iter()
+                .position(|&(lcn, len)| len == cc && !assigned.contains(&lcn))
+        })?;
+    if idx < *group_start {
+        *group_start -= 1;
+    }
     Some(list.remove(idx).0)
 }
 
@@ -5831,18 +5896,27 @@ fn extend_ntfs_compressed_index(
             {
                 if hdr_local > gap_local_start {
                     let gap = scan.stream[gap_local_start..hdr_local].to_vec();
+                    let len_before = scan.pending_lcns.len();
                     parse_inline_mft_from_buf(&gap, &scan.vbr, &mut scan.pending_lcns);
+                    // A non-empty gap starts a fresh group (see match_inline_run).
+                    if scan.pending_lcns.len() > len_before {
+                        scan.pending_group_start = len_before;
+                    }
                 }
             }
 
-            // Match LCN by cluster count: prefer a just-parsed inline MFT
-            // record (pending_lcns), fall back to the global MFT data-run
-            // queue. Ghost stores runs largest-first within a batch, so pop
-            // from the back of matching entries. Skip candidates whose LCN is
-            // already assigned — Ghost re-declares some files' runs both inline
-            // and in the queue, so a naive match double-assigns and cross-links.
-            let lcn = pop_unassigned_lcn(&mut scan.pending_lcns, cc, &scan.assigned_lcns)
-                .or_else(|| pop_unassigned_lcn(&mut scan.data_run_queue, cc, &scan.assigned_lcns));
+            // Match LCN in MFT-walk order: prefer the freshest inline group
+            // (pending_lcns; see match_inline_run), then fall back to the global
+            // MFT data-run queue. Skip candidates whose LCN is already assigned —
+            // Ghost re-declares some files' runs both inline and in the queue, so
+            // a naive match double-assigns and cross-links.
+            let lcn = match_inline_run(
+                &mut scan.pending_lcns,
+                &mut scan.pending_group_start,
+                cc,
+                &scan.assigned_lcns,
+            )
+            .or_else(|| pop_unassigned_lcn(&mut scan.data_run_queue, cc, &scan.assigned_lcns));
 
             if let Some(lcn) = lcn {
                 scan.assigned_lcns.insert(lcn);
@@ -6305,6 +6379,58 @@ mod tests {
             synth_bitmap: Vec::new(),
             boot_code: Vec::new(),
         }
+    }
+
+    #[test]
+    fn match_inline_run_consumes_fresh_group_in_mft_order() {
+        use std::collections::HashSet;
+        // Reproduces the $Secure (file 9) scenario from smallNTFS.GHO: a stale
+        // orphaned (1310297,1) entry from an earlier gap sits ahead of the
+        // freshest gap's two same-size runs — $SDH (1310298) then $SII (1310299)
+        // in MFT attribute order. The two cc=1 stream runs that follow must be
+        // matched to 1310298 then 1310299, in that order. Matching from the back
+        // would swap them; matching from the front of the whole list would grab
+        // the stale 1310297.
+        let mut list = vec![(1310297u64, 1u64), (1310298, 1), (1310299, 1)];
+        let mut group_start = 1; // freshest gap appended entries 1..=2
+        let assigned: HashSet<u64> = HashSet::new();
+
+        let first = match_inline_run(&mut list, &mut group_start, 1, &assigned).unwrap();
+        assert_eq!(first, 1310298, "$SDH must take the lower (first) LCN");
+        let mut assigned = HashSet::new();
+        assigned.insert(first);
+        let second = match_inline_run(&mut list, &mut group_start, 1, &assigned).unwrap();
+        assert_eq!(second, 1310299, "$SII must take the higher (second) LCN");
+    }
+
+    #[test]
+    fn match_inline_run_falls_back_to_older_orphans() {
+        use std::collections::HashSet;
+        // Fresh group has no cc=3 match, so an older orphaned entry is used.
+        let mut list = vec![(100u64, 3u64), (200, 1), (201, 1)];
+        let mut group_start = 1;
+        let assigned: HashSet<u64> = HashSet::new();
+        let lcn = match_inline_run(&mut list, &mut group_start, 3, &assigned).unwrap();
+        assert_eq!(lcn, 100);
+        // Removing an entry before group_start shifts the boundary down.
+        assert_eq!(group_start, 0);
+    }
+
+    #[test]
+    fn match_inline_run_skips_assigned_and_preserves_fragment_order() {
+        use std::collections::HashSet;
+        // A fragmented file's $DATA: four same-size extents in MFT order. They
+        // must be handed out in that order, not reversed.
+        let mut list = vec![(50u64, 4u64), (10, 4), (90, 4), (30, 4)];
+        let mut group_start = 0;
+        let mut assigned: HashSet<u64> = HashSet::new();
+        let mut got = Vec::new();
+        for _ in 0..4 {
+            let lcn = match_inline_run(&mut list, &mut group_start, 4, &assigned).unwrap();
+            assigned.insert(lcn);
+            got.push(lcn);
+        }
+        assert_eq!(got, vec![50, 10, 90, 30]);
     }
 
     #[test]

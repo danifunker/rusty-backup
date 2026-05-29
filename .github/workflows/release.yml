@@ -354,6 +354,7 @@ jobs:
         run: |
           pacman -Syu --noconfirm \
             base-devel \
+            cmake \
             rust \
             gtk3 \
             openssl \
@@ -539,7 +540,7 @@ jobs:
         if: ${{ !contains(matrix.runs-on, 'self-hosted') }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libssl-dev pkg-config dpkg-dev liblzma-dev rpm libarchive-tools zstd
+          sudo apt-get install -y cmake libgtk-3-dev libssl-dev pkg-config dpkg-dev liblzma-dev rpm libarchive-tools zstd
 
       - name: Install cargo packaging tools
         run: |

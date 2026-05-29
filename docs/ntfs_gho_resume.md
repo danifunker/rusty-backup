@@ -106,16 +106,53 @@ Bytes 32-41: 0F <u64_le cluster_count> 0E                       (entry 3, variab
 - Scan entire file for the 16-byte run header needle in 4MB chunks
 - For each gap between runs, call `parse_inline_mft_records()` to extract
   data runs from FILE records in the gap — appended to `pending_lcns`
-- Match each cluster run to a pending LCN by cluster count using
-  **`rposition`** (last match, not first) — Ghost stores MFT records in
-  ascending order but writes cluster data largest-first within each batch
+- Match each cluster run to a pending LCN by cluster count in **MFT-walk
+  order** via `match_inline_run()` (see "Run ordering" below)
 - Runs without a matching pending LCN are collected in `unmapped_runs`
 
 ### Phase 3: MFT queue fallback for unmapped runs
 - Build a set of already-mapped LCNs
 - Filter `data_run_queue` to exclude already-mapped entries
-- Match unmapped runs by cluster count against the filtered queue (rposition)
-- In practice: only 1 run needed this fallback (the $MFT $BITMAP at LCN 786431)
+- Match unmapped runs by cluster count against the filtered queue
+  (`pop_unassigned_lcn`, earliest-first)
+- In practice: only 2 runs need this fallback (e.g. the $MFT $BITMAP)
+
+### Run ordering (the chkdsk-index-error fix, 2026-05-29)
+
+Ghost emits cluster runs in **MFT-walk order**: record order, then attribute
+order within a record, then fragment order within an attribute. The inline
+`(lcn, cc)` entries are queued in that same order, so the correct match for a
+stream run is the **earliest** unassigned entry of the right size within the
+**most recently parsed gap** (`pending_group_start..`), only falling back to
+older orphaned entries if that group has no match. See `match_inline_run()`.
+
+The original code matched from the back of the whole `pending_lcns` list
+(`rposition`, "largest-first"). That reversed every group of same-`cc` runs:
+`$Secure`'s `$SDH`/`$SII` index-allocation blocks were swapped, and fragmented
+files' `$DATA` extents were reversed. On a Windows XP volume this surfaced as
+chkdsk "Correcting error in index $SDH/$SII for file 9", "$O for file 25", and
+many "$I30 for file N" errors after a VHD export — the indexes pointed at
+swapped index buffers. Matching from the front of the whole list instead grabs
+stale orphans (Ghost re-declares some already-emitted runs in a later gap,
+e.g. a leftover `(1310297, 1)` ahead of the real `$SDH`/`$SII` pair), so the
+group-aware rule is needed.
+
+Verified with `examples/gho_ntfs_validate.rs` against `smallNTFS.GHO`:
+- `$SDH`/`$SII` land in MFT order (`$SDH` lcn < `$SII` lcn).
+- Per-attribute index-buffer self-VCN mismatches: uncompressed 14 -> 0,
+  compressed 292 -> 16.
+
+**Residual (compressed path only):** ~16 self-VCN mismatches remain on the
+compressed lazy-scan path, concentrated in a couple of large fragmented
+directories (e.g. MFT recs 315, 3274). Their inline MFT records are missed
+when a gap spans the lazy scan's stream-drain / `skip_data_bytes` boundary, so
+those runs fall back to the global `data_run_queue` and get cross-assigned.
+The uncompressed path (random-access gap parsing) has no such gap and is fully
+consistent. Fixing the compressed case needs the lazy scan to buffer inline
+records across the skip boundary. The remaining ~14 "in-use VCN reads as zero"
+index buffers are clusters Ghost never stored for this dirty/partially-copied
+source (6103 MFT data-runs vs 5613 stored runs) — not reconstructable, and
+chkdsk corrects the stale index bitmap itself.
 
 ### Result: 100% coverage (5613/5613 runs)
 
