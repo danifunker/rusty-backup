@@ -4667,7 +4667,12 @@ mod tests {
     /// A 2 GB - 1 byte volume at 32 KiB block size sits right under the
     /// u16 block-count ceiling (65535 blocks). Verify the builder accepts
     /// it and produces a fsck-clean image.
+    ///
+    /// Gated to 64-bit: create_blank_hfs materializes the whole ~2 GiB image
+    /// as a Vec, which a 32-bit address space can't allocate (this was the
+    /// "memory allocation of 2147461632 bytes failed" abort on the i686 CI leg).
     #[test]
+    #[cfg(target_pointer_width = "64")]
     fn test_create_blank_hfs_near_2gb() {
         let total = 2u64 * 1024 * 1024 * 1024 - 1;
         let img = create_blank_hfs(total, 32768, "Near2GB")
