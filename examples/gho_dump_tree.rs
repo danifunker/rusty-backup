@@ -47,8 +47,8 @@ fn main() {
     println!("# inner stream @ {:#x}", inner_start);
     println!();
     println!(
-        "{:>4} {:>6} {:>6} {:>6}  {}",
-        "#", "type", "marker", "body", "detail"
+        "{:>4} {:>6} {:>6} {:>6}  detail",
+        "#", "type", "marker", "body"
     );
 
     let mut pos = inner_start;

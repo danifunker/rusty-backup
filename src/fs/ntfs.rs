@@ -839,7 +839,7 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
         entries: &mut Vec<FileEntry>,
     ) -> Result<(), FilesystemError> {
         let record_size: u64 = 4096;
-        let clusters_per_record = (record_size + self.cluster_size - 1) / self.cluster_size;
+        let clusters_per_record = record_size.div_ceil(self.cluster_size);
         let total_records = if attr.real_size > 0 {
             attr.real_size / record_size
         } else {

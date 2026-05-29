@@ -282,8 +282,8 @@ pub fn format_gho_info(path: &Path) -> Result<String> {
     let header = GhoContainerHeader::parse(&mut f)?;
 
     let mut lines = Vec::new();
-    lines.push(format!("Norton Ghost Image"));
-    lines.push(format!(""));
+    lines.push("Norton Ghost Image".to_string());
+    lines.push(String::new());
 
     if let Some(desc) = &header.description {
         lines.push(format!("Description:  {}", desc));
@@ -315,7 +315,7 @@ pub fn format_gho_info(path: &Path) -> Result<String> {
     }
 
     if header.password_protected {
-        lines.push(format!("Password:     Yes (encrypted)"));
+        lines.push("Password:     Yes (encrypted)".to_string());
     }
 
     if span_set.len() > 1 {
@@ -1022,6 +1022,12 @@ struct FileAwarePartition {
     cluster_cache: Option<(u32, Vec<u8>)>,
 }
 
+// Exactly one GhoReaderMode exists per GhoReader, moved by value only once at
+// open time. The size spread between variants (the NtfsFileAware index dominates)
+// is therefore a single ~1 KB move, not a per-read cost — boxing the large
+// variant would instead add heap indirection on the read hot path, so we keep
+// the variants inline.
+#[allow(clippy::large_enum_variant)]
 enum GhoReaderMode {
     Uncompressed {
         data_start: u64,

@@ -40,12 +40,22 @@ fn main() {
 
     #[cfg(all(target_os = "windows", not(debug_assertions)))]
     {
-        // Embed manifest in release builds only for automatic elevation
-        // The embed-resource crate needs a .rc file, not a raw manifest
-        // Create the .rc file dynamically
+        // Embed the requireAdministrator manifest in release builds — but ONLY
+        // into the GUI binary (`rusty-backup`), NOT the CLI (`rb-cli`).
+        //
+        // The manifest declares `requireAdministrator`, which makes Windows fire
+        // a UAC prompt at *launch*, before any code runs, for every invocation.
+        // That is fine for the GUI (which always needs disk access), but the CLI
+        // mostly operates on plain image files and should not prompt for admin
+        // just to `inspect foo.img`. `compile_for` links the resource into the
+        // named binaries only; `rb-cli` is left with the default `asInvoker`
+        // execution level (no prompt at launch — it inherits admin when started
+        // from an already-elevated terminal, which is what physical-disk ops need).
+        //
+        // The embed-resource crate needs a .rc file, not a raw manifest.
         let manifest_path = std::path::PathBuf::from("rusty-backup.manifest");
         if manifest_path.exists() {
-            embed_resource::compile("rusty-backup.rc", embed_resource::NONE);
+            embed_resource::compile_for("rusty-backup.rc", &["rusty-backup"], embed_resource::NONE);
         }
     }
 }

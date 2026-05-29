@@ -1314,6 +1314,7 @@ fn test_prodos_superfloppy_detection() {
 ///      exactly as the inspect/CLI path does for a `.hfv`,
 ///   3. fsck clean,
 ///   4. round-trip an editable add-file via `open_editable_filesystem`.
+///
 /// This is the engine-level guarantee behind Phase 1/2 of docs/basilisk_hfv.md.
 #[test]
 fn test_hfv_flat_hfs_detect_open_fsck_edit() {

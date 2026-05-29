@@ -206,7 +206,7 @@ mod materialize_tests {
     fn gho_passes_through_unchanged() {
         let tmp = tempfile::tempdir().unwrap();
         let gho_path = tmp.path().join("test.gho");
-        std::fs::write(&gho_path, &[0xFE, 0xEF, 0x01, 0x00]).unwrap();
+        std::fs::write(&gho_path, [0xFE, 0xEF, 0x01, 0x00]).unwrap();
         let (out, guard) = prepare_disk_image_path(&gho_path).unwrap();
         assert_eq!(out, gho_path);
         assert!(guard.is_none());

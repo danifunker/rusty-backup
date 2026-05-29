@@ -1,5 +1,4 @@
 use rusty_backup::fs::filesystem::Filesystem;
-use std::io::{Read, Seek, SeekFrom};
 
 fn main() {
     env_logger::init();

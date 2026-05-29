@@ -35,7 +35,7 @@ fn main() -> std::io::Result<()> {
     writeln!(md, "```\n{}\n```\n", cmd.clone().render_usage()).unwrap();
 
     writeln!(md, "## Global options\n").unwrap();
-    render_args(&mut md, &cmd, &mut Vec::new());
+    render_args(&mut md, &cmd, &[]);
 
     writeln!(md, "## Verbs\n").unwrap();
     let mut sub_path = Vec::new();

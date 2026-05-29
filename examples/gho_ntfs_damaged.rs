@@ -92,7 +92,7 @@ fn main() {
     // Sorted (start, end) intervals for binary-search coverage tests.
     let cov: Vec<(u64, u64)> = ranges.iter().map(|&(l, c)| (l, l + c)).collect();
     let covered = |lcn: u64| -> bool {
-        match cov.binary_search_by(|&(s, e)| {
+        cov.binary_search_by(|&(s, e)| {
             if lcn < s {
                 std::cmp::Ordering::Greater
             } else if lcn >= e {
@@ -100,10 +100,8 @@ fn main() {
             } else {
                 std::cmp::Ordering::Equal
             }
-        }) {
-            Ok(_) => true,
-            Err(_) => false,
-        }
+        })
+        .is_ok()
     };
 
     // 2) VBR geometry.
@@ -194,7 +192,7 @@ fn main() {
     // cache) and isn't our bug.
     let mut partial: Vec<(u64, u64, u64)> = damaged.iter().copied().filter(|d| d.1 < d.2).collect();
     let full: Vec<(u64, u64, u64)> = damaged.iter().copied().filter(|d| d.1 == d.2).collect();
-    partial.sort_by(|a, b| b.1.cmp(&a.1));
+    partial.sort_by_key(|d| std::cmp::Reverse(d.1));
 
     let partial_missing: u64 = partial.iter().map(|d| d.1).sum();
     let full_missing: u64 = full.iter().map(|d| d.1).sum();

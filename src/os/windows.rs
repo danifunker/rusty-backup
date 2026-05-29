@@ -563,18 +563,23 @@ pub(crate) fn open_target_for_writing(path: &Path) -> Result<(File, VolumeLockSe
     let path_str = path.to_string_lossy();
     let drive_num = drive_number_from_path(&path_str).context("invalid physical drive path")?;
 
-    // In debug builds, check elevation before attempting to open
-    #[cfg(debug_assertions)]
-    {
-        if !is_elevated() {
-            log::warn!(
-                "Attempting to open {} for writing without admin privileges; requesting elevation...",
-                path.display()
-            );
-            request_elevation()?;
-            // If we get here, elevation was cancelled
-            bail!("Administrator privileges required to write to disk devices");
-        }
+    // Physical-disk writes need admin. The GUI is launched with a
+    // requireAdministrator manifest, so it is always elevated and never trips
+    // this check. The CLI (`rb-cli`) runs as `asInvoker` and may not be — fail
+    // with a clear message instead of a cryptic "Access is denied" (OS error 5).
+    if !is_elevated() {
+        log::warn!(
+            "Attempting to open {} for writing without admin privileges",
+            path.display()
+        );
+        // In debug builds, offer to relaunch elevated via UAC (preserves the
+        // historical developer workflow); in release, fail cleanly.
+        #[cfg(debug_assertions)]
+        request_elevation()?;
+        bail!(
+            "Administrator privileges required to write to disk devices. \
+             Re-run from an elevated terminal (right-click -> Run as administrator)."
+        );
     }
 
     // Lock and dismount all volumes on the target drive BEFORE opening.
@@ -622,17 +627,21 @@ pub fn open_source_for_reading(path: &Path) -> Result<crate::os::ElevatedSource>
         });
     }
 
-    // Physical drive - open with standard flags (no NO_BUFFERING to avoid alignment issues on reads)
-    #[cfg(debug_assertions)]
-    {
-        if !is_elevated() {
-            log::warn!(
-                "Attempting to open {} without admin privileges; requesting elevation...",
-                path.display()
-            );
-            request_elevation()?;
-            bail!("Administrator privileges required to read disk devices");
-        }
+    // Physical drive - open with standard flags (no NO_BUFFERING to avoid alignment issues on reads).
+    // Physical-disk reads need admin. The GUI is always elevated via its
+    // requireAdministrator manifest; the CLI runs as `asInvoker` and may not be
+    // — fail with a clear message instead of a cryptic "Access is denied".
+    if !is_elevated() {
+        log::warn!(
+            "Attempting to open {} without admin privileges",
+            path.display()
+        );
+        #[cfg(debug_assertions)]
+        request_elevation()?;
+        bail!(
+            "Administrator privileges required to read disk devices. \
+             Re-run from an elevated terminal (right-click -> Run as administrator)."
+        );
     }
 
     let wide = to_wide(&path_str);
