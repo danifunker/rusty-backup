@@ -11,7 +11,7 @@ use std::io::{Cursor, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::fs::hfs::{create_blank_hfs_sized, HfsFilesystem, HFS_MAX_BTREE_FILE_SIZE};
+use crate::fs::hfs::{create_blank_hfs_sized, HfsFilesystem};
 use crate::fs::hfs_clone::{clone_hfs_volume, emit_apm_disk_with_hfs, CloneReport, EmitReport};
 use crate::model::source_reader::open_read;
 use crate::model::status::ExpandStatus;
@@ -148,12 +148,15 @@ fn run_expand(
     }
 
     step("Building blank target volume…");
-    let catalog_min = source
-        .source_catalog_size
-        .saturating_mul(3)
-        .saturating_div(2)
-        .min(HFS_MAX_BTREE_FILE_SIZE);
-    let extents_min = source.source_extents_size.min(HFS_MAX_BTREE_FILE_SIZE);
+    // Floor the target B-trees at the blank-format default for `target_size`,
+    // not just 1.5x the source: a densely-packed source catalog can otherwise
+    // undersize the target and exhaust it mid-clone ("no free B-tree nodes").
+    let (catalog_min, extents_min) = crate::fs::hfs::clone_target_btree_sizes(
+        target_size_bytes,
+        target_block_size,
+        source.source_catalog_size,
+        source.source_extents_size,
+    );
     let mut target_buf = create_blank_hfs_sized(
         target_size_bytes,
         target_block_size,

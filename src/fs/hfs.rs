@@ -2323,6 +2323,38 @@ pub fn default_btree_sizes(target_volume_bytes: u64, block_size: u32) -> (u32, u
     )
 }
 
+/// Choose catalog + extents-overflow B-tree sizes (in bytes) for a freshly
+/// built HFS **clone target** of `target_size` at `block_size`, given the
+/// source volume's B-tree sizes.
+///
+/// Returns the *larger* of the source-derived estimate (1.5× the source
+/// catalog, 1× the source extents) and the volume-scaled blank-format default
+/// ([`default_btree_sizes`]), clamped to [`HFS_MAX_BTREE_FILE_SIZE`].
+///
+/// Using the blank default as a floor is the important part: a densely-packed
+/// source catalog reports a small byte size, but the target re-inserts every
+/// record through the byte-based leaf split, which can pack *less* densely and
+/// need more nodes than the source used. A catalog pre-sized to only 1.5× the
+/// source then runs out of nodes mid-clone ("no free B-tree nodes"), because
+/// the B-tree file can't grow. Flooring at the same size a blank volume of
+/// `target_size` would get (≈0.5 % of the volume) gives ample headroom while
+/// staying well under the 16 MiB ceiling for any classic-HFS-sized volume.
+pub fn clone_target_btree_sizes(
+    target_size: u64,
+    block_size: u32,
+    source_catalog: u32,
+    source_extents: u32,
+) -> (u32, u32) {
+    let (default_cat, default_ext) = default_btree_sizes(target_size, block_size);
+    let catalog = source_catalog
+        .saturating_mul(3)
+        .saturating_div(2)
+        .max(default_cat)
+        .min(HFS_MAX_BTREE_FILE_SIZE);
+    let extents = source_extents.max(default_ext).min(HFS_MAX_BTREE_FILE_SIZE);
+    (catalog, extents)
+}
+
 /// Variant of [`create_blank_hfs`] that lets the caller request minimum
 /// extents-overflow and catalog B-tree sizes (in bytes). Each is rounded up
 /// to a whole allocation block; values smaller than the 4-block default are
@@ -5233,6 +5265,40 @@ mod tests {
             "fsck errors on default-sized volume: {:?}",
             result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn test_clone_target_btree_sizes_floors_at_blank_default() {
+        // Regression: a densely-packed source catalog reports a small byte size
+        // (here 2 MiB), but 1.5x that (3 MiB) undersized a 2046 MiB expand/HFV
+        // target and exhausted it mid-clone ("no free B-tree nodes"). The clone
+        // target must floor at the blank-format default for its own size.
+        let target = 2046 * 1024 * 1024;
+        let (default_cat, _) = default_btree_sizes(target, 32768);
+        let (cat, _ext) = clone_target_btree_sizes(target, 32768, 2 * 1024 * 1024, 1024 * 1024);
+        assert_eq!(
+            cat, default_cat,
+            "large target must floor catalog at the blank default, not 1.5x source"
+        );
+        assert!(
+            cat > 2 * 1024 * 1024 * 3 / 2,
+            "floor must exceed 1.5x source"
+        );
+
+        // When 1.5x source exceeds the volume default (small target, big
+        // source catalog), the source-derived value wins.
+        let small_target = 40 * 1024 * 1024;
+        let (cat2, _) = clone_target_btree_sizes(small_target, 4096, 4 * 1024 * 1024, 256 * 1024);
+        assert_eq!(
+            cat2,
+            4 * 1024 * 1024 * 3 / 2,
+            "source-derived value should win"
+        );
+
+        // Never exceeds the HFS B-tree file ceiling.
+        let (cat3, ext3) = clone_target_btree_sizes(target, 32768, u32::MAX, u32::MAX);
+        assert!(cat3 <= HFS_MAX_BTREE_FILE_SIZE);
+        assert!(ext3 <= HFS_MAX_BTREE_FILE_SIZE);
     }
 
     #[test]

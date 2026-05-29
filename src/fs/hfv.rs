@@ -28,7 +28,7 @@
 use std::io::{Cursor, Read, Seek};
 
 use crate::fs::filesystem::{Filesystem, FilesystemError};
-use crate::fs::hfs::{create_blank_hfs_sized, HfsFilesystem, HFS_MAX_BTREE_FILE_SIZE};
+use crate::fs::hfs::{create_blank_hfs_sized, HfsFilesystem};
 use crate::fs::hfs_clone::{clone_hfs_volume, CloneReport};
 
 /// Maximum byte size of an HFV (classic-HFS) volume: **2047 MB**.
@@ -152,14 +152,15 @@ where
     validate_hfv_target(target_size, HfvVolumeKind::Hfs)?;
 
     let summary = source.volume_summary();
-    // Give the target catalog headroom (1.5x source) so the byte-based leaf
-    // split has slack; extents 1x. Both clamped to the HFS B-tree file ceiling.
-    let catalog_min = summary
-        .catalog_file_size
-        .saturating_mul(3)
-        .saturating_div(2)
-        .min(HFS_MAX_BTREE_FILE_SIZE);
-    let extents_min = summary.extents_file_size.min(HFS_MAX_BTREE_FILE_SIZE);
+    // Size the target B-trees with the blank-format default as a floor (not
+    // just 1.5x the source), so a densely-packed source catalog can't undersize
+    // the target and exhaust it mid-clone. See clone_target_btree_sizes.
+    let (catalog_min, extents_min) = crate::fs::hfs::clone_target_btree_sizes(
+        target_size,
+        block_size,
+        summary.catalog_file_size,
+        summary.extents_file_size,
+    );
 
     let mut target_buf = create_blank_hfs_sized(
         target_size,
