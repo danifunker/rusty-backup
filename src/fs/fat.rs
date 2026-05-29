@@ -4081,7 +4081,11 @@ mod tests {
         assert_eq!(fs.label.as_deref(), Some("CFCARD"));
     }
 
+    // FAT32 selection requires a volume > 2 GiB (see compute_fat_blank_layout),
+    // and create_blank_fat materializes the whole image as a Vec — a >2 GiB
+    // allocation that a 32-bit address space can't satisfy. Gate to 64-bit.
     #[test]
+    #[cfg(target_pointer_width = "64")]
     fn create_blank_fat_picks_fat32_for_large_volumes() {
         // 4 GiB → FAT32 territory.
         let img =
@@ -4095,7 +4099,10 @@ mod tests {
         assert!(entries.is_empty(), "fresh FAT32 root must be empty");
     }
 
+    // See note on create_blank_fat_picks_fat32_for_large_volumes: a >2 GiB
+    // in-RAM image can't be allocated on a 32-bit target. Gate to 64-bit.
     #[test]
+    #[cfg(target_pointer_width = "64")]
     fn create_blank_fat_fat32_supports_create_file() {
         let img = create_blank_fat(4u64 * 1024 * 1024 * 1024, Some("F32RW")).expect("format FAT32");
         let mut cur = std::io::Cursor::new(img);
