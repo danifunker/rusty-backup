@@ -14,6 +14,11 @@ use crate::cli::parse::parse_size;
 pub enum FsKind {
     /// Classic HFS (Mac OS Standard).
     Hfs,
+    /// BasiliskII HFV — a flat classic-HFS volume, no partition table.
+    /// Same on-disk bytes as `hfs`, but capped at 2047 MB and with the
+    /// allocation block size auto-floored so the result is mountable by
+    /// BasiliskII / SheepShaver and classic Mac OS.
+    Hfv,
     /// FAT12 (≤ 32 MiB) or FAT16 (≤ 2 GiB), auto-selected by size.
     Fat,
     /// IRIX EFS (single cylinder group).
@@ -90,6 +95,16 @@ pub fn run(args: NewArgs) -> Result<()> {
                 catalog_bytes,
                 extents_bytes,
             )
+        }
+        FsKind::Hfv => {
+            // A flat HFV is just a blank classic-HFS volume with the BasiliskII
+            // limits enforced: <= 2047 MB and a block size that keeps
+            // total_blocks <= 65535. build_blank_hfv validates the cap.
+            let explicit_bs = args.block_size;
+            format_and_write(&args.image, &args.size, &args.name, move |size, name| {
+                let bs = explicit_bs.unwrap_or_else(|| crate::fs::hfv::suggest_block_size(size));
+                Ok(crate::fs::hfv::build_blank_hfv(size, bs, name)?)
+            })
         }
         FsKind::Fat => format_and_write(&args.image, &args.size, &args.name, |size, name| {
             crate::fs::fat::create_blank_fat(size, Some(name))

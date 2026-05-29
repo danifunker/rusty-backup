@@ -158,15 +158,20 @@ build/clone primitives every write feature reuses.
   re-detects as superfloppy HFS + fscks clean, oversize/HFS+ refusal, and a
   `clone_into_hfv` file round-trip.
 
-### Phase 4 — Create a blank HFV (model + GUI + CLI)
-- [ ] 4.1 Model runner `src/model/*` (or extend an existing one) wrapping
-  `write_blank_hfv` with the progress/Status pattern (CONTRIBUTING
-  "Background work").
-- [ ] 4.2 GUI action: "New blank HFV…" (size slider clamped to
-  `[~800 KB .. 2047 MB]`, name field, block-size auto). Save dialog defaults to
-  `.hfv`. Reuse `expand_hfs_dialog.rs` widgets where sensible.
-- [ ] 4.3 CLI verb (see docs/cli-todo.md before naming) e.g.
-  `rb-cli create-hfv --size 100M --name "Mac HDD" out.hfv`.
+### Phase 4 — Create a blank HFV  ✅ DONE (CLI); GUI deferred by design
+- [x] 4.3 CLI: added `FsKind::Hfv` to the `new` verb —
+  `rb-cli new out.hfv --fs hfv --size 100M --name "Mac HD"`. Routes through
+  `fs::hfv::build_blank_hfv` (validates the 2047 MB cap) with the block size
+  auto-floored via `suggest_block_size` unless `--block-size` is given.
+  Verified end-to-end: a 100 MB `--fs hfv` image inspects as a single HFS
+  superfloppy and fscks clean; `--size 2048M` is refused with the cap message.
+- [-] 4.1/4.2 Standalone model runner + "New blank HFV…" GUI dialog **deferred
+  by design**: the GUI has no general "create blank image" surface for *any*
+  filesystem today, so a create dialog would be net-new UI scaffolding
+  orthogonal to HFV. GUI-side HFV creation is delivered instead through
+  **Export to HFV** (Phase 5) and **Expand to HFV** (Phase 6), which hang off
+  existing inspect-tab buttons. Revisit if a general File→New surface is added.
+  A model runner will be added then (or for Phase 6, which does need one).
 
 ### Phase 5 — Export to HFV
 Export an existing classic-HFS source (live image / backup / another HFS
