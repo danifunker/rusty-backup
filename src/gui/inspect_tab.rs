@@ -3438,7 +3438,8 @@ impl InspectTab {
                                     part.partition_type_string.clone(),
                                 ));
                             }
-                            if is_checkable_type(ptype, part.partition_type_string.as_deref())
+                            if (is_checkable_type(ptype, part.partition_type_string.as_deref())
+                                || is_superfloppy_hfs(part.partition_type_byte, &part.type_name))
                                 && ui.small_button("Check").clicked()
                             {
                                 check_request = Some((
@@ -4725,6 +4726,17 @@ fn is_browsable_superfloppy(ptype: u8, type_name: &str) -> bool {
         type_name,
         "FAT" | "HFS" | "HFS+" | "NTFS" | "exFAT" | "ProDOS" | "XFS" | "ext" | "btrfs" | "Unknown"
     )
+}
+
+/// Check if a partition row is a classic-HFS **superfloppy** (a flat,
+/// partition-less HFS volume at LBA 0, i.e. a BasiliskII `.hfv`). These rows
+/// carry `partition_type_byte == 0` with `type_name == "HFS"` because no
+/// partition table assigned them a type byte. The classic-HFS fsck, edit, and
+/// expand paths are all offset-driven and work at offset 0, but the gating
+/// helpers keyed to `0xAF` / APM `Apple_HFS` skip these rows — this helper lets
+/// callers OR them back in.
+fn is_superfloppy_hfs(ptype: u8, type_name: &str) -> bool {
+    ptype == 0 && type_name == "HFS"
 }
 
 /// Fallback check: detect FAT from the human-readable type name string.

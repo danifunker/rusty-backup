@@ -1307,6 +1307,81 @@ fn test_prodos_superfloppy_detection() {
     }
 }
 
+/// Full BasiliskII-HFV path on a *real* HFS volume: a flat, partition-less
+/// classic-HFS image (no MBR/GPT/APM, volume at byte 0) must
+///   1. detect as a `None` superfloppy with fs_hint "HFS",
+///   2. open through the auto-detect factory `open_filesystem(.., 0, 0, None)`
+///      exactly as the inspect/CLI path does for a `.hfv`,
+///   3. fsck clean,
+///   4. round-trip an editable add-file via `open_editable_filesystem`.
+/// This is the engine-level guarantee behind Phase 1/2 of docs/basilisk_hfv.md.
+#[test]
+fn test_hfv_flat_hfs_detect_open_fsck_edit() {
+    use rusty_backup::fs::filesystem::CreateFileOptions;
+    use rusty_backup::fs::hfs::create_blank_hfs;
+    use rusty_backup::fs::{open_editable_filesystem, open_filesystem};
+    use rusty_backup::partition::PartitionTable;
+
+    // A blank classic-HFS volume IS a valid HFV (boot blocks @0, MDB @1024).
+    let img = create_blank_hfs(8 * 1024 * 1024, 4096, "HfvTest").expect("create_blank_hfs");
+
+    // 1. Superfloppy detection.
+    let mut cur = Cursor::new(img.clone());
+    match PartitionTable::detect(&mut cur).unwrap() {
+        PartitionTable::None { fs_hint, .. } => assert_eq!(fs_hint, "HFS"),
+        other => panic!("expected HFS superfloppy, got {other:?}"),
+    }
+
+    // 2. Auto-detect factory open (the path GUI inspect + rb-cli take).
+    let cur = Cursor::new(img.clone());
+    let mut fs = open_filesystem(cur, 0, 0x00, None).expect("open_filesystem auto-detect");
+    assert_eq!(fs.fs_type(), "HFS");
+    assert_eq!(fs.volume_label(), Some("HfvTest"));
+
+    // 3. fsck clean.
+    let result = fs.fsck().expect("fsck supported").expect("fsck ran");
+    let errs: Vec<_> = result.errors.iter().map(|e| e.message.clone()).collect();
+    assert!(result.errors.is_empty(), "fsck errors: {errs:?}");
+
+    // 4. Editable add-file round-trip via the auto-detect editable factory.
+    let tmp = tempfile::tempdir().unwrap();
+    let img_path = tmp.path().join("blank.hfv");
+    std::fs::write(&img_path, &img).unwrap();
+    let payload: &[u8] = b"hello from an HFV";
+    {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&img_path)
+            .unwrap();
+        let mut efs = open_editable_filesystem(file, 0, 0x00, None)
+            .expect("open_editable_filesystem auto-detect");
+        let root = efs.root().unwrap();
+        let mut src = Cursor::new(payload);
+        efs.create_file(
+            &root,
+            "readme.txt",
+            &mut src,
+            payload.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        efs.sync_metadata().unwrap();
+    }
+
+    // Reopen and verify the file persisted and reads back byte-identical.
+    let f2 = std::fs::File::open(&img_path).unwrap();
+    let mut fs2 = open_filesystem(f2, 0, 0x00, None).expect("reopen");
+    let root = fs2.root().unwrap();
+    let kids = fs2.list_directory(&root).unwrap();
+    let entry = kids
+        .iter()
+        .find(|e| e.name == "readme.txt")
+        .expect("readme.txt present after edit");
+    let read_back = fs2.read_file(entry, 1024).unwrap();
+    assert_eq!(&read_back, payload);
+}
+
 #[test]
 fn test_prodos_list_and_recurse() {
     use rusty_backup::fs::filesystem::Filesystem;

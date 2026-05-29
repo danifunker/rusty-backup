@@ -95,37 +95,43 @@ files (small, high-value). Phases 3–6 are the write side. Phase 7 is
 backup/restore round-trip. Phase 8 is CLI parity. Phase 9 is docs + real-Mac
 validation.
 
-### Phase 1 — Read / inspect / browse existing HFVs  ✅ smallest valuable slice
-- [ ] 1.1 Add `"hfv"`, `"HFV"` to the **inspect** picker filter
+### Phase 1 — Read / inspect / browse existing HFVs  ✅ DONE (commit 7dd3b61)
+- [x] 1.1 Add `"hfv"`, `"HFV"` to the **inspect** picker filter
   (src/gui/inspect_tab.rs:349-356).
-- [ ] 1.2 Add the same to the **backup-source** picker
+- [x] 1.2 Add the same to the **backup-source** picker
   (src/gui/backup_tab.rs:250-256) and both **restore-source** pickers
   (src/gui/restore_tab.rs:746-754, 1677-1685).
-- [ ] 1.3 Confirm `prepare_disk_image_path` (src/gui/mod.rs:80) passes `.hfv`
-  through untouched (no decompression) — it already does; add a unit-test
-  assertion so a future edit can't regress it.
-- [ ] 1.4 Manual: open all three sample HFVs in Inspect; confirm one HFS row,
-  correct volume name, block size, used/free; open Browse and walk the tree.
-- [ ] 1.5 Verify `partition_minimum_size`/sizing display is sane for a
-  superfloppy HFS row (it routes through the same HFS code as APM HFS).
+- [x] 1.3 Confirm `prepare_disk_image_path` (src/gui/mod.rs:80) passes `.hfv`
+  through untouched (no decompression) — it does; added `hfv_passes_through_unchanged`
+  unit test (covers `.hfv` and `.HFV`).
+- [x] 1.4 Verified via `rb-cli inspect` + `rb-cli ls` against `THINKCDEV.hfv`
+  (non-bootable) and `Mac OS 8.1.HFV` (bootable): each detects as one HFS
+  superfloppy row at LBA 0 with correct size, and the root tree browses.
+- [x] 1.5 Sizing display routes through the same HFS code as APM HFS (the row
+  is a normal `PartitionInfo` with `partition_type_byte == 0`); inspect shows
+  correct size for both samples.
 
-### Phase 2 — fsck + edit for superfloppy HFS
-The classic-HFS fsck and editable paths exist but their **GUI gating** is keyed
-to type-byte `0xAF` / APM `Apple_HFS`. Extend it to recognize superfloppy
-(type-byte-0) HFS so HFVs get the same Check / Edit affordances.
-- [ ] 2.1 Extend `is_checkable_type` (src/gui/inspect_tab.rs:4754) to return
-  true for a superfloppy HFS row (`ptype == 0 && type_name == "HFS"`). Consider
-  a small `is_superfloppy_hfs(ptype, type_name)` helper reused by 2.x and 6.x.
-- [ ] 2.2 Confirm the per-partition **Check** button runs HFS fsck on an HFV
-  (the checker is offset-driven via `HfsFilesystem::open(reader, 0)`; no engine
-  change expected). Test against `THINKCDEV.hfv`.
-- [ ] 2.3 Confirm **Edit mode** opens for a superfloppy HFS: trace
-  `open_editable_filesystem(type_byte=0)` auto-detect and the browse-view edit
-  gating. Add a file, Apply Edits, reopen, verify it persists and the volume
-  still mounts (Phase 9 validation).
-- [ ] 2.4 Unit test: open a small synthetic flat-HFS image (built via
-  `create_blank_hfs`) with no partition table, assert detect → HFS, fsck clean,
-  add-file round-trips.
+### Phase 2 — fsck + edit for superfloppy HFS  ✅ DONE
+The classic-HFS fsck and editable paths are entirely offset-driven and already
+work at offset 0 (verified: `rb-cli fsck THINKCDEV.hfv@1` → "813 files / 90
+dirs checked"). The only gap was the **GUI gating** keyed to type-byte `0xAF` /
+APM `Apple_HFS`, which skipped superfloppy (type-byte-0) HFS rows.
+- [x] 2.1 Added `is_superfloppy_hfs(ptype, type_name)` helper
+  (src/gui/inspect_tab.rs) — `ptype == 0 && type_name == "HFS"`.
+- [x] 2.2 ORed it into the inspect-tab **Check** gate; `run_fsck` already opens
+  via `open_filesystem(.., 0, None)` auto-detect, so no engine change. CLI fsck
+  confirmed working on `THINKCDEV.hfv`.
+- [x] 2.3 **Edit mode** needs no gating change: the browse button uses
+  `is_browsable_superfloppy` (already lists HFS) and `session.open_editable()`
+  is a dynamic `open_editable_filesystem(.., 0, None)` probe — auto-detects HFS.
+- [x] 2.4 Integration test `test_hfv_flat_hfs_detect_open_fsck_edit`
+  (tests/filesystem_e2e.rs): builds a real blank HFS via `create_blank_hfs`,
+  asserts superfloppy detect → auto-detect factory open → fsck clean →
+  add-file round-trip persists & reads back byte-identical.
+
+  Note: the inspect-tab **Expand…** gate (`is_classic_hfs`) is intentionally
+  *not* widened here — it's deferred to Phase 6, which also adds the flat-HFV
+  output mode + 2047 MB clamp the expand path needs.
 
 ### Phase 3 — HFV constraints + flat-HFS emit (engine, no UI)
 The single source of truth for the limits, plus the "write a flat HFS volume to
