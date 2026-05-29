@@ -1460,6 +1460,90 @@ fn test_expand_runner_writes_flat_hfv() {
     assert!(out.fsck().unwrap().errors.is_empty());
 }
 
+/// Export dialog → HFV: drive `start_per_partition_hfv` (the worker behind the
+/// "HFV (BasiliskII)" Export option) against a flat-HFS source image and verify
+/// it writes a valid `partition-0.hfv` holding the source's file. Uses the real
+/// detect→partitions() path the GUI feeds it.
+#[test]
+fn test_export_runner_per_partition_hfv() {
+    use rusty_backup::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+    use rusty_backup::fs::hfs::{create_blank_hfs, HfsFilesystem};
+    use rusty_backup::model::export_runner::start_per_partition_hfv;
+    use rusty_backup::partition::PartitionTable;
+    use std::collections::HashMap;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("source.img");
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir(&out_dir).unwrap();
+
+    // Source: an 8 MiB flat HFS image (a superfloppy) with one file.
+    let mut img = create_blank_hfs(8 * 1024 * 1024, 4096, "ExportSrc").unwrap();
+    {
+        let mut efs = HfsFilesystem::open(Cursor::new(&mut img), 0).unwrap();
+        let root = efs.root().unwrap();
+        let payload = b"export me as HFV";
+        let mut data = Cursor::new(payload.as_slice());
+        efs.create_file(
+            &root,
+            "f.txt",
+            &mut data,
+            payload.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        efs.sync_metadata().unwrap();
+    }
+    std::fs::write(&src, &img).unwrap();
+
+    // Derive partitions exactly as the GUI does.
+    let mut cur = std::fs::File::open(&src).unwrap();
+    let partitions = PartitionTable::detect(&mut cur).unwrap().partitions();
+    assert_eq!(partitions.len(), 1);
+    assert_eq!(partitions[0].type_name, "HFS");
+
+    // Keep the same size (no resize); index 0 -> partition-0.hfv.
+    let mut size_map = HashMap::new();
+    size_map.insert(0usize, img.len() as u64);
+
+    let status = start_per_partition_hfv(
+        src.clone(),
+        partitions,
+        size_map,
+        out_dir.clone(),
+        img.len() as u64,
+    );
+
+    let mut finished = false;
+    let mut err = None;
+    for _ in 0..200 {
+        {
+            let g = status.lock().unwrap();
+            if g.finished {
+                finished = true;
+                err = g.error.clone();
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(finished, "HFV export worker did not finish in time");
+    assert!(err.is_none(), "HFV export failed: {err:?}");
+
+    let out = out_dir.join("partition-0.hfv");
+    assert!(out.exists(), "expected partition-0.hfv");
+    let mut fs = HfsFilesystem::open(std::fs::File::open(&out).unwrap(), 0).unwrap();
+    assert_eq!(fs.fs_type(), "HFS");
+    assert_eq!(fs.volume_summary().volume_name, "ExportSrc");
+    let root = fs.root().unwrap();
+    assert!(fs
+        .list_directory(&root)
+        .unwrap()
+        .iter()
+        .any(|e| e.name == "f.txt"));
+    assert!(fs.fsck().unwrap().errors.is_empty());
+}
+
 #[test]
 fn test_prodos_list_and_recurse() {
     use rusty_backup::fs::filesystem::Filesystem;

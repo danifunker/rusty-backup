@@ -56,6 +56,14 @@ pub enum ExportFormat {
     /// BIN/CUE pair extracted from a CD CHD. Single-bin by default; the
     /// bulk-convert worker can request multi-bin via a separate flag.
     BinCue,
+    /// BasiliskII HFV — a flat classic-HFS volume (no partition table), built
+    /// by *cloning* the source HFS partition into a freshly-sized volume rather
+    /// than streaming bytes. Unlike every other `ExportFormat`, this is NOT a
+    /// streaming codec: the GUI/CLI intercept it and route to the HFV clone
+    /// path (`fs::hfv::clone_into_hfv` via `export_runner::start_per_partition_hfv`),
+    /// so it never reaches `write_header`/`write_footer` or the whole-disk /
+    /// per-partition streaming functions. HFS-only, per-partition only, ≤2047 MB.
+    Hfv,
 }
 
 impl ExportFormat {
@@ -71,6 +79,7 @@ impl ExportFormat {
             Self::Dc42 => "dsk",
             Self::Chd | Self::ChdDvd | Self::ChdCd => "chd",
             Self::BinCue => "cue",
+            Self::Hfv => "hfv",
         }
     }
 
@@ -90,6 +99,7 @@ impl ExportFormat {
             Self::ChdDvd => "DVD CHD",
             Self::ChdCd => "CD CHD",
             Self::BinCue => "BIN/CUE",
+            Self::Hfv => "BasiliskII HFV",
         }
     }
 
@@ -110,6 +120,7 @@ impl ExportFormat {
             Self::Dc42 => ("DiskCopy 4.2", &["dsk", "image", "dc42", "img"]),
             Self::Chd | Self::ChdDvd | Self::ChdCd => ("MAME CHD", &["chd"]),
             Self::BinCue => ("BIN/CUE Sheet", &["cue"]),
+            Self::Hfv => ("BasiliskII HFV", &["hfv"]),
         }
     }
 

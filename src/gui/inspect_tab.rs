@@ -1461,6 +1461,13 @@ impl InspectTab {
         }
         let whole_disk_only =
             is_chd_format || is_dynamic_vhd || is_qcow2 || is_vmdk_flat || is_vmdk_sparse;
+        // HFV is the inverse: a flat HFV is a single classic-HFS volume, so it
+        // is per-partition only (one .hfv per HFS partition). Force it off
+        // whole-disk and disable the whole-disk radio.
+        let is_hfv = self.export_format == ExportFormat::Hfv;
+        if is_hfv {
+            self.export_whole_disk = false;
+        }
 
         egui::Window::new("Export Disk Image")
             .collapsible(false)
@@ -1484,11 +1491,19 @@ impl InspectTab {
                 ui.add_space(8.0);
 
                 // Export mode
-                ui.radio_value(
-                    &mut self.export_whole_disk,
-                    true,
-                    "Whole Disk (single file)",
+                let whole_disk_resp = ui.add_enabled(
+                    !is_hfv,
+                    egui::RadioButton::new(self.export_whole_disk, "Whole Disk (single file)"),
                 );
+                if whole_disk_resp.clicked() && !is_hfv {
+                    self.export_whole_disk = true;
+                }
+                if is_hfv {
+                    whole_disk_resp.on_hover_text(
+                        "HFV is a single classic-HFS volume with no partition table, so it is \
+                         exported per-partition (one .hfv per HFS partition).",
+                    );
+                }
                 let per_part_resp = ui.add_enabled(
                     !whole_disk_only,
                     egui::RadioButton::new(
@@ -1584,6 +1599,12 @@ impl InspectTab {
                     .on_hover_text(
                         "Mac / Apple IIgs DiskCopy 4.2 (floppy only: 400K / 720K / 800K / 1440K)",
                     );
+                    ui.radio_value(&mut self.export_format, ExportFormat::Hfv, "HFV (BasiliskII)")
+                        .on_hover_text(
+                            "Flat classic-HFS volume for BasiliskII / SheepShaver (no partition \
+                             table, classic-HFS-only, max 2047 MB). Exported per-partition: one \
+                             .hfv per HFS partition, cloned and re-floored to the chosen size.",
+                        );
 
                     let hd_resp = ui.add_enabled(
                         chd_hd_enabled,
@@ -1963,6 +1984,40 @@ impl InspectTab {
         let overrides =
             export_runner::build_size_overrides(&self.export_partition_configs, &self.partitions);
         let total_bytes: u64 = size_map.values().sum();
+
+        // HFV is not a streaming codec: clone each classic-HFS partition into a
+        // flat .hfv. Route here before the streaming whole-disk/per-partition
+        // paths. Needs a raw image / device source (not a backup folder or
+        // Clonezilla image — those go through restore-as-HFV instead).
+        if format == ExportFormat::Hfv {
+            let source_image = self.image_file_path.clone().or_else(|| {
+                self.selected_device_idx
+                    .and_then(|idx| ctx.devices.get(idx))
+                    .map(|d| d.path.clone())
+            });
+            let Some(source_image) = source_image else {
+                ctx.log
+                    .error("HFV export needs a raw image or device source.");
+                return;
+            };
+            let dest_folder = match super::file_dialog().pick_folder() {
+                Some(p) => p,
+                None => return,
+            };
+            ctx.log.info(format!(
+                "Exporting classic-HFS partition(s) as flat HFV file(s) to {}...",
+                dest_folder.display()
+            ));
+            self.export_status = Some(export_runner::start_per_partition_hfv(
+                source_image,
+                self.partitions.clone(),
+                size_map,
+                dest_folder,
+                total_bytes,
+            ));
+            self.export_rate.reset();
+            return;
+        }
 
         if self.export_whole_disk {
             let (filter_label, filter_exts) = format.dialog_filter();
@@ -3452,7 +3507,13 @@ impl InspectTab {
                                 part.partition_type_byte,
                                 part.partition_type_string.as_deref(),
                                 &part.type_name,
-                            ) && ui.small_button("Expand…").clicked()
+                            ) && ui
+                                .small_button("Expand/Export…")
+                                .on_hover_text(
+                                    "Re-floor this classic-HFS volume to a new size / block \
+                                     size (APM .hda) or export it as a flat BasiliskII HFV.",
+                                )
+                                .clicked()
                             {
                                 expand_request = Some((part.start_lba * 512, part.size_bytes));
                             }

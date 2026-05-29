@@ -201,8 +201,20 @@ the expand path.
   `test_expand_runner_writes_flat_hfv` drives the real worker with
   `ExpandOutput::FlatHfv` and asserts a valid HFV + no `EmitReport`.
 
-  Note: `ExportFormat::Hfv` in the inspect-tab Export dialog is intentionally
-  **not** added — see rationale above; the Expand button is the correct home.
+  Follow-up (added later, per user request): HFV is **also** surfaced in the
+  **Export Disk Image** dialog for discoverability.
+  - Inspect-tab Expand button relabelled **"Expand/Export…"** (it does both
+    re-floor and HFV export) with a hover explaining the two outputs.
+  - `ExportFormat::Hfv` added, but it is **not** a streaming codec: it's
+    intercepted in `start_export` and routed to a dedicated clone worker
+    `export_runner::start_per_partition_hfv` (reusing `fs::hfv::clone_into_hfv`),
+    so it never touches the streaming whole-disk/per-partition paths. Selecting
+    "HFV (BasiliskII)" auto-forces **per-partition** and disables the
+    whole-disk radio (HFV is a single bare HFS volume). One `partition-N.hfv`
+    per classic-HFS partition; non-HFS partitions are skipped with a log line;
+    each partition's chosen export size feeds the clone (≤2047 MB enforced).
+  - Test `test_export_runner_per_partition_hfv` drives the worker via the real
+    `detect→partitions()` path and verifies a valid `partition-0.hfv`.
 
 ### Phase 7 — Backup / restore round-trip  ✅ DONE (works with no code changes)
 - [x] 7.1 Backing up an HFV produces a sane per-partition backup:
