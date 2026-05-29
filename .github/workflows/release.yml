@@ -32,6 +32,9 @@ jobs:
     needs: generate-version
     runs-on: windows-latest
     strategy:
+      # Run both arches to completion — don't let a 32-bit failure cancel the
+      # x64 leg (we want to see both results when diagnosing arch-specific bugs).
+      fail-fast: false
       matrix:
         include:
           - target: i686-pc-windows-msvc

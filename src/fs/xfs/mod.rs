@@ -976,15 +976,38 @@ mod tests {
     use byteorder::{BigEndian, ByteOrder};
     use std::io::Cursor;
 
-    fn load_fixture() -> Vec<u8> {
+    /// Decompress `name` from tests/fixtures/sgi/ once and hand out a shared
+    /// `&'static [u8]`. The dir2 fixture inflates to 512 MiB; returning a shared
+    /// slice (rather than a fresh Vec per call) keeps the cargo-test thread pool
+    /// from holding N independent copies at once, which would exhaust a 32-bit
+    /// address space (the i686 Windows CI leg). Tests that need to mutate the
+    /// image take an owned `.to_vec()` copy.
+    fn load_sgi_fixture(name: &str) -> &'static [u8] {
+        use std::sync::{Mutex, OnceLock};
+        static CACHE: OnceLock<Mutex<std::collections::HashMap<String, &'static [u8]>>> =
+            OnceLock::new();
+        let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+        let mut map = cache.lock().unwrap();
+        if let Some(bytes) = map.get(name) {
+            return bytes;
+        }
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/sgi/xfs_v2_dir2_small.img.zst");
+            .join("tests/fixtures/sgi")
+            .join(name);
         let compressed = std::fs::read(&path).expect("fixture present");
         let mut decoder =
             zstd::stream::read::Decoder::new(Cursor::new(compressed)).expect("zstd decoder");
         let mut out = Vec::new();
         decoder.read_to_end(&mut out).expect("decompress");
-        out
+        // Leak the decompressed image so the slice lives for the whole test run;
+        // it's shared by every test that asks for this fixture.
+        let leaked: &'static [u8] = Vec::leak(out);
+        map.insert(name.to_string(), leaked);
+        leaked
+    }
+
+    fn load_fixture() -> &'static [u8] {
+        load_sgi_fixture("xfs_v2_dir2_small.img.zst")
     }
 
     #[test]
@@ -1473,15 +1496,8 @@ mod tests {
     /// Decompress the bundled modern-XFS fixture (300 MiB of mostly zeros,
     /// zstd → ~18 KiB on disk). Produced by a stock Linux `mkfs.xfs`
     /// (v5/CRC, dir3, blocksize=4096, inodesize=512, 4 AGs).
-    fn load_modern_fixture() -> Vec<u8> {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/sgi/xfs_v5_modern_small.img.zst");
-        let compressed = std::fs::read(&path).expect("modern fixture present");
-        let mut decoder =
-            zstd::stream::read::Decoder::new(Cursor::new(compressed)).expect("zstd decoder");
-        let mut out = Vec::new();
-        decoder.read_to_end(&mut out).expect("decompress");
-        out
+    fn load_modern_fixture() -> &'static [u8] {
+        load_sgi_fixture("xfs_v5_modern_small.img.zst")
     }
 
     #[test]
@@ -1530,7 +1546,7 @@ mod tests {
         // shortform on disk; under the dir1 parser the byte layout no longer
         // makes sense, so we expect a Parse error (not an Unsupported one) —
         // proof that we routed through `parse_shortform` in dir1.rs.
-        let mut img = load_fixture();
+        let mut img = load_fixture().to_vec();
         img[100..102].copy_from_slice(&0x94a4u16.to_be_bytes());
         let mut fs = XfsFilesystem::open(Cursor::new(img), 0).expect("open xfs");
         assert_eq!(fs.dir_format, DirFormat::Dir1);

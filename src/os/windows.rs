@@ -708,7 +708,10 @@ mod tests {
     fn test_string_from_buffer_offset() {
         let buf = b"header\0\0Samsung SSD\0extra";
         assert_eq!(string_from_buffer_offset(buf, 8), "Samsung SSD");
-        assert_eq!(string_from_buffer_offset(buf, 0), "header");
+        // Offset 0 means "field not present" in the STORAGE_DEVICE_DESCRIPTOR
+        // layout this parses, so it deliberately yields an empty string even
+        // though byte 0 happens to start "header".
+        assert_eq!(string_from_buffer_offset(buf, 0), "");
         assert_eq!(string_from_buffer_offset(buf, 100), "");
     }
 
