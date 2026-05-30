@@ -406,9 +406,55 @@ pub fn flatten_to_parent(
         let _ = fs::remove_file(&staging_chd);
     }
 
-    let mut reader = HdImageSequentialReader { session };
+    // Stage the merged parent+diff view into a flat scratch file BEFORE
+    // calling compress_chd. libchdman-rs's create_from_reader cannot be
+    // re-entered from its own reader callback — when the reader is backed by
+    // ChdEditSession (which itself calls libchdman's HdImage::read_sector to
+    // resolve each merged read), the nested libchdman calls produce a
+    // corrupted output CHD (all-zero hunks in practice). Feeding a plain
+    // File-backed reader to compress_chd decouples the two libchdman
+    // invocations entirely. Memory usage stays bounded by the I/O buffer
+    // size, not by logical_size, so this works for multi-GB images too.
+    let scratch_path = parent_dir.join({
+        let mut s = parent_path
+            .file_stem()
+            .map(|s| s.to_os_string())
+            .unwrap_or_default();
+        s.push(".flattening.scratch");
+        s
+    });
+    if scratch_path.exists() {
+        let _ = fs::remove_file(&scratch_path);
+    }
+    {
+        let mut reader = HdImageSequentialReader { session };
+        let mut scratch = std::io::BufWriter::with_capacity(
+            1024 * 1024,
+            fs::File::create(&scratch_path).with_context(|| {
+                format!(
+                    "failed to create flatten scratch file {}",
+                    scratch_path.display()
+                )
+            })?,
+        );
+        std::io::copy(&mut reader, &mut scratch)
+            .context("failed to stage merged view for flatten")?;
+        std::io::Write::flush(&mut scratch).context("failed to flush flatten scratch file")?;
+        // reader (and the wrapped session) drops here — close the read-side
+        // libchdman handle BEFORE compress_chd opens its write-side one.
+    }
+
+    let mut scratch_reader = std::io::BufReader::with_capacity(
+        1024 * 1024,
+        fs::File::open(&scratch_path).with_context(|| {
+            format!(
+                "failed to reopen flatten scratch file {}",
+                scratch_path.display()
+            )
+        })?,
+    );
     let result = compress_chd(
-        &mut reader,
+        &mut scratch_reader,
         &staging_base,
         logical_size,
         None,
@@ -417,9 +463,8 @@ pub fn flatten_to_parent(
         cancel_check,
         log_cb,
     );
-
-    // Drop the HdImage before touching the parent file on disk.
-    drop(reader);
+    drop(scratch_reader);
+    let _ = fs::remove_file(&scratch_path);
 
     match result {
         Ok(_files) => {
