@@ -6,9 +6,14 @@
 //! [`tempfile::TempDir`] guard for the lifetime of the open image so the
 //! decoded file lives long enough to be inspected/browsed.
 //!
-//! Password-protected archives (legacy PKZIP / ZipCrypto) are detected and
-//! rejected with a precise error — UI-driven password prompting is a
-//! follow-up.
+//! Password-protected archives are detected and rejected with a precise
+//! error. WinImage 6.0+ encrypts the (already-deflated) entry with its own
+//! scheme — MD5(password) -> 128-bit key, then Rijndael, preceded by a
+//! 135-byte header — which is NOT PKWARE ZipCrypto and NOT WinZip-AES, so
+//! the `zip` crate cannot decrypt it. A known-plaintext analysis ruled out
+//! every standard Rijndael mode/key-derivation; see `docs/imz_encryption.md`.
+//! Until the scheme is reverse-engineered from the WinImage binary, encrypted
+//! IMZ files are unsupported.
 
 use std::fs::File;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
@@ -99,9 +104,19 @@ fn open_entry<'a>(
     path: &Path,
 ) -> Result<(zip::read::ZipFile<'a, File>, String, u64)> {
     if let Some(pw) = password {
-        let entry = archive
-            .by_index_decrypt(idx, pw)
-            .map_err(|e| anyhow!("IMZ {} decrypt failed: {e}", path.display()))?;
+        // The `zip` crate only knows ZipCrypto and WinZip-AES. Real WinImage
+        // IMZ files use a proprietary MD5+Rijndael scheme that neither matches
+        // (see docs/imz_encryption.md), so this only succeeds on the rare
+        // standards-compliant IMZ. On failure, say so plainly rather than
+        // implying the password was wrong.
+        let entry = archive.by_index_decrypt(idx, pw).map_err(|e| {
+            anyhow!(
+                "IMZ {} could not be decrypted ({e}). WinImage's own \
+                 password encryption (MD5 + Rijndael) is not yet supported; \
+                 this is unrelated to whether the password is correct.",
+                path.display(),
+            )
+        })?;
         let name = entry.name().to_string();
         let size = entry.size();
         Ok((entry, name, size))
