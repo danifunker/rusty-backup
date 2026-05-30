@@ -97,7 +97,7 @@ fn open_entry<'a>(
     idx: usize,
     password: Option<&[u8]>,
     path: &Path,
-) -> Result<(zip::read::ZipFile<'a>, String, u64)> {
+) -> Result<(zip::read::ZipFile<'a, File>, String, u64)> {
     if let Some(pw) = password {
         let entry = archive
             .by_index_decrypt(idx, pw)
