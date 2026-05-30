@@ -2469,12 +2469,12 @@ impl InspectTab {
             // Open the device/file with full elevation: unmounts volumes and
             // claims exclusive DA access for the duration of the inspect.
             // Streaming-reader containers skip this (they open via open_read).
-            // `_guard` is held purely for RAII: it keeps the volume locks /
-            // DA claim alive for the duration of the inspect. The underscore
-            // prefix silences the unused-variable lint without changing drop
-            // timing (a `_`-prefixed binding still lives until end of scope,
-            // unlike `let _ = ...`).
-            let (device_file, _guard) = if !uses_streaming_reader {
+            // `guard` is held purely for RAII: it keeps the volume locks / DA
+            // claim alive for the duration of the inspect. On macOS the fd +
+            // claim are handed off to the main thread below; on every other
+            // platform `guard` is unused, so silence the lint there.
+            #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+            let (device_file, guard) = if !uses_streaming_reader {
                 let elevated = match rusty_backup::os::open_source_for_reading(&path) {
                     Ok(e) => e,
                     Err(e) => {
