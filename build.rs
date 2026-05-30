@@ -55,7 +55,11 @@ fn main() {
         // The embed-resource crate needs a .rc file, not a raw manifest.
         let manifest_path = std::path::PathBuf::from("rusty-backup.manifest");
         if manifest_path.exists() {
-            embed_resource::compile_for("rusty-backup.rc", &["rusty-backup"], embed_resource::NONE);
+            let _ = embed_resource::compile_for(
+                "rusty-backup.rc",
+                &["rusty-backup"],
+                embed_resource::NONE,
+            );
         }
     }
 }

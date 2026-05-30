@@ -6,8 +6,10 @@
 //! skip silently otherwise (so CI without QEMU still passes). This module is
 //! that one shared helper — kept here to avoid duplicating the PATH-probe
 //! logic in two writer test modules.
-
-#![cfg(test)]
+//!
+//! The `#[cfg(test)]` gate lives on the `pub mod qemu_img_test;` line in
+//! `rbformats/mod.rs`; a redundant inner `#![cfg(test)]` here trips clippy's
+//! `duplicated_attributes` lint under `-D warnings`.
 
 use std::path::Path;
 use std::process::Command;

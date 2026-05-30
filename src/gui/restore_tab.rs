@@ -687,19 +687,16 @@ impl RestoreTab {
                 {
                     self.confirm_popup_open = true;
                 }
-            } else {
-                if ui.button("Cancel").clicked() {
-                    if let Some(ref progress_arc) = self.restore_progress {
-                        if let Ok(mut p) = progress_arc.lock() {
-                            p.cancel_requested = true;
-                            p.operation =
-                                "Cancelling — waiting for current write to complete…".to_string();
-                        }
+            } else if ui.button("Cancel").clicked() {
+                if let Some(ref progress_arc) = self.restore_progress {
+                    if let Ok(mut p) = progress_arc.lock() {
+                        p.cancel_requested = true;
+                        p.operation =
+                            "Cancelling — waiting for current write to complete…".to_string();
                     }
-                    ctx.log.warn(
-                        "Cancellation requested — waiting for current disk write to complete...",
-                    );
                 }
+                ctx.log
+                    .warn("Cancellation requested — waiting for current disk write to complete...");
             }
         });
     }

@@ -2269,8 +2269,6 @@ fn write_clonezilla_disk(
     disk_target_size: u64,
     progress: &Arc<Mutex<RestoreProgress>>,
 ) -> Result<u64> {
-    use std::io;
-
     let mut total_written: u64 = 0;
     let target_size = progress.lock().map(|p| p.total_bytes).unwrap_or(0);
     let target_sectors = disk_target_size / 512;
@@ -2445,7 +2443,7 @@ fn write_clonezilla_disk(
                     } else {
                         match writer.seek(SeekFrom::Current(pad as i64)) {
                             Ok(_) => total_written += pad,
-                            Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+                            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
                                 crate::rbformats::write_zeros(writer, pad)?;
                                 total_written += pad;
                             }

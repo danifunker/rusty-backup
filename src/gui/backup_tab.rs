@@ -663,20 +663,18 @@ impl BackupTab {
                         ctx.log.info("Auto-backup canceled; minimum-size calculations will still complete in the background");
                     }
                 }
-            } else {
-                if ui.button("Cancel").clicked() {
-                    if let Some(ref progress_arc) = self.backup_progress {
-                        if let Ok(mut p) = progress_arc.lock() {
-                            p.cancel_requested = true;
-                        }
+            } else if ui.button("Cancel").clicked() {
+                if let Some(ref progress_arc) = self.backup_progress {
+                    if let Ok(mut p) = progress_arc.lock() {
+                        p.cancel_requested = true;
                     }
-                    if let Some(ref status) = self.vhd_export_status {
-                        if let Ok(mut s) = status.lock() {
-                            s.cancel_requested = true;
-                        }
-                    }
-                    ctx.log.warn("Cancellation requested...");
                 }
+                if let Some(ref status) = self.vhd_export_status {
+                    if let Ok(mut s) = status.lock() {
+                        s.cancel_requested = true;
+                    }
+                }
+                ctx.log.warn("Cancellation requested...");
             }
         });
 

@@ -311,7 +311,7 @@ fn query_disk_size(handle: HANDLE) -> Option<u64> {
 pub fn get_physical_drive_size(file: &File) -> Result<u64> {
     use std::os::windows::io::AsRawHandle;
 
-    let handle = HANDLE(file.as_raw_handle() as *mut std::ffi::c_void);
+    let handle = HANDLE(file.as_raw_handle());
     query_disk_size(handle)
         .context("failed to query disk size via IOCTL_DISK_GET_DRIVE_GEOMETRY_EX")
 }
@@ -381,7 +381,7 @@ fn enumerate_volumes() -> Vec<VolumeInfo> {
     let drive_roots: Vec<String> = buf[..len as usize]
         .split(|&c| c == 0)
         .filter(|s| !s.is_empty())
-        .map(|s| String::from_utf16_lossy(s))
+        .map(String::from_utf16_lossy)
         .collect();
 
     for root in &drive_roots {
@@ -603,7 +603,7 @@ pub(crate) fn open_target_for_writing(path: &Path) -> Result<(File, VolumeLockSe
     .with_context(|| format!("cannot open {} for writing", path.display()))?;
 
     // Convert HANDLE to File (takes ownership — do NOT also wrap in SafeHandle)
-    let file = unsafe { File::from_raw_handle(handle.0 as *mut c_void) };
+    let file = unsafe { File::from_raw_handle(handle.0) };
     Ok((file, volume_locks))
 }
 
@@ -658,11 +658,64 @@ pub fn open_source_for_reading(path: &Path) -> Result<crate::os::ElevatedSource>
     }
     .with_context(|| format!("cannot open {} for reading", path.display()))?;
 
-    let file = unsafe { File::from_raw_handle(handle.0 as *mut c_void) };
+    let file = unsafe { File::from_raw_handle(handle.0) };
     Ok(crate::os::ElevatedSource {
         file,
         temp_path: None,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Privileged disk access implementation (Windows)
+// ---------------------------------------------------------------------------
+
+use crate::privileged::{AccessStatus, DiskHandle, PrivilegedDiskAccess};
+
+/// Windows implementation of privileged disk access.
+///
+/// Uses direct file I/O. The app should be launched with UAC elevation
+/// (which it already requests via manifest).
+pub struct WindowsDiskAccess {
+    // TODO: Track open handles
+}
+
+impl WindowsDiskAccess {
+    pub fn new() -> Result<Self> {
+        Ok(Self {})
+    }
+}
+
+impl PrivilegedDiskAccess for WindowsDiskAccess {
+    fn check_status(&self) -> Result<AccessStatus> {
+        // Check if we're running as administrator
+        if is_elevated() {
+            Ok(AccessStatus::Ready)
+        } else {
+            // Windows already prompts for UAC at startup
+            // If we're here and not admin, something went wrong
+            anyhow::bail!("Application must be run as administrator")
+        }
+    }
+
+    fn open_disk_read(&mut self, _path: &Path) -> Result<DiskHandle> {
+        anyhow::bail!("Windows privileged disk access not yet implemented")
+    }
+
+    fn open_disk_write(&mut self, _path: &Path) -> Result<DiskHandle> {
+        anyhow::bail!("Windows privileged disk access not yet implemented")
+    }
+
+    fn read_sectors(&mut self, _handle: DiskHandle, _lba: u64, _count: u32) -> Result<Vec<u8>> {
+        anyhow::bail!("Windows privileged disk access not yet implemented")
+    }
+
+    fn write_sectors(&mut self, _handle: DiskHandle, _lba: u64, _data: &[u8]) -> Result<()> {
+        anyhow::bail!("Windows privileged disk access not yet implemented")
+    }
+
+    fn close_disk(&mut self, _handle: DiskHandle) -> Result<()> {
+        anyhow::bail!("Windows privileged disk access not yet implemented")
+    }
 }
 
 #[cfg(test)]
@@ -723,58 +776,5 @@ mod tests {
             !devices.is_empty(),
             "should find at least one physical drive"
         );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Privileged disk access implementation (Windows)
-// ---------------------------------------------------------------------------
-
-use crate::privileged::{AccessStatus, DiskHandle, PrivilegedDiskAccess};
-
-/// Windows implementation of privileged disk access.
-///
-/// Uses direct file I/O. The app should be launched with UAC elevation
-/// (which it already requests via manifest).
-pub struct WindowsDiskAccess {
-    // TODO: Track open handles
-}
-
-impl WindowsDiskAccess {
-    pub fn new() -> Result<Self> {
-        Ok(Self {})
-    }
-}
-
-impl PrivilegedDiskAccess for WindowsDiskAccess {
-    fn check_status(&self) -> Result<AccessStatus> {
-        // Check if we're running as administrator
-        if is_elevated() {
-            Ok(AccessStatus::Ready)
-        } else {
-            // Windows already prompts for UAC at startup
-            // If we're here and not admin, something went wrong
-            anyhow::bail!("Application must be run as administrator")
-        }
-    }
-
-    fn open_disk_read(&mut self, _path: &Path) -> Result<DiskHandle> {
-        anyhow::bail!("Windows privileged disk access not yet implemented")
-    }
-
-    fn open_disk_write(&mut self, _path: &Path) -> Result<DiskHandle> {
-        anyhow::bail!("Windows privileged disk access not yet implemented")
-    }
-
-    fn read_sectors(&mut self, _handle: DiskHandle, _lba: u64, _count: u32) -> Result<Vec<u8>> {
-        anyhow::bail!("Windows privileged disk access not yet implemented")
-    }
-
-    fn write_sectors(&mut self, _handle: DiskHandle, _lba: u64, _data: &[u8]) -> Result<()> {
-        anyhow::bail!("Windows privileged disk access not yet implemented")
-    }
-
-    fn close_disk(&mut self, _handle: DiskHandle) -> Result<()> {
-        anyhow::bail!("Windows privileged disk access not yet implemented")
     }
 }

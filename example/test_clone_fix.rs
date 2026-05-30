@@ -45,11 +45,12 @@ fn main() {
         s.catalog_file_size / 1024
     );
 
-    let catalog_min = (s.catalog_file_size as u32)
+    let catalog_min = s
+        .catalog_file_size
         .saturating_mul(3)
         .saturating_div(2)
         .min(HFS_MAX_BTREE_FILE_SIZE);
-    let extents_min = (s.extents_file_size as u32).min(HFS_MAX_BTREE_FILE_SIZE);
+    let extents_min = s.extents_file_size.min(HFS_MAX_BTREE_FILE_SIZE);
 
     println!(
         "Building blank target file: {} MiB, bs={}, catalog>={} KiB, extents>={} KiB",
