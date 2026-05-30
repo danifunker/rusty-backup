@@ -80,6 +80,7 @@ fn read_at(r: &mut GhoReader, off: u64, len: usize) -> std::io::Result<Vec<u8>> 
 }
 
 fn main() -> anyhow::Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let path = std::env::args().nth(1).expect("path to GHO");
     let mut r = GhoReader::open(std::path::Path::new(&path))?;
     r.prepare_full_image();

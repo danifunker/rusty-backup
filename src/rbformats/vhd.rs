@@ -832,7 +832,24 @@ pub fn export_whole_disk_vhd(
     if crate::model::source_reader::is_gho_path(source_path)
         || crate::model::source_reader::is_imz_path(source_path)
     {
-        let mut reader = crate::model::source_reader::open_read(source_path)?;
+        // GHO must go through a concrete GhoReader + prepare_full_image() so the
+        // exported whole-disk image is faithful: $MFTMirr synthesized, the typed
+        // run fixup applied (corrects mismapped $INDEX_ALLOCATION /
+        // $SECURITY_DESCRIPTOR clusters that otherwise make chkdsk report
+        // "the security descriptor in file 0x5 is invalid"), and $Boot recovered.
+        // `source_reader::open_read` does a fast LAZY open that SKIPS
+        // prepare_full_image — correct for inspect/browse, wrong for export
+        // (this is the same concrete path the raw exporter uses via
+        // export::open_source_reader). IMZ has no preparation step and uses the
+        // lazy reader as-is.
+        let mut reader: super::BoxReadSeek =
+            if crate::model::source_reader::is_gho_path(source_path) {
+                let mut gho = super::gho::GhoReader::open(source_path)?;
+                gho.prepare_full_image();
+                Box::new(gho)
+            } else {
+                crate::model::source_reader::open_read(source_path)?
+            };
         let mut source_data_size = reader.seek(SeekFrom::End(0))?;
         reader.seek(SeekFrom::Start(0))?;
 

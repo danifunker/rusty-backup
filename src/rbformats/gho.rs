@@ -1702,6 +1702,20 @@ impl GhoReader {
             }
         }
 
+        // Post-scan content-aware fix-up: rewire runs the streaming matcher
+        // misassigned among same-cc candidates by inspecting first-4-byte magic
+        // (INDX / FILE / RSTR|RCRD). Resolves the cross-links that otherwise
+        // cause chkdsk /f to orphan files. See fixup_ntfs_typed_misalignments.
+        // Disable with RUSTYBACKUP_GHO_NTFS_NO_FIXUP=1 for diagnostic comparison.
+        if std::env::var("RUSTYBACKUP_GHO_NTFS_NO_FIXUP")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            log::warn!("NTFS fixup disabled via RUSTYBACKUP_GHO_NTFS_NO_FIXUP");
+        } else if let Ok(vbr_parsed) = crate::fs::ntfs::parse_vbr(&index.vbr) {
+            fixup_ntfs_typed_misalignments(&mut self.inner, index, compressed, &vbr_parsed);
+        }
+
         // Build $Bitmap (Ghost omits it).
         if index.synth_bitmap.is_empty() && !index.bitmap_runs.is_empty() {
             let total_clusters = index.volume_size / index.cluster_size;
@@ -4526,6 +4540,16 @@ struct NtfsGhoClusterRun {
     lcn_start: u64,
     cluster_count: u64,
     file_offset: u64,
+    /// Run header bytes 7-14 carry a u64 sequence number: the fragment index
+    /// within an attribute (0 = first fragment of a new attribute; 1+ =
+    /// continuation). Single-fragment attributes are always seq=0. Captured
+    /// during the lazy scan and used by [`fixup_ntfs_typed_misalignments`] to
+    /// deterministically map stream runs to MFT attributes — when an
+    /// attribute has multiple fragments, the seq chain uniquely identifies
+    /// the attribute (the cc sequence is unique among multi-fragment attrs).
+    /// `u64::MAX` for entries that pre-date the seq capture (e.g. the
+    /// explicitly-registered MFT first run added at scan start).
+    seq: u64,
 }
 
 /// Index built during the open scan. Sorted by `lcn_start` for binary
@@ -4951,6 +4975,11 @@ fn index_ntfs_file_aware<R: Read + Seek>(
     let mut data_run_queue: Vec<(u64, u64)> = Vec::new();
     // $Bitmap (record 6) $DATA runs — where the synthesized bitmap is served.
     let mut bitmap_runs: Vec<(u64, u64)> = Vec::new();
+    // $MFTMirr (record 1) $DATA run — (lcn, cluster_count). Ghost omits the
+    // mirror's content from the stream (it's a verbatim copy of $MFT's first
+    // records, hence derivable), so we synthesize it by mapping these clusters
+    // back to the start of $MFT's data. See the run injection below.
+    let mut mftmirr_run: Option<(u64, u64)> = None;
     let num_records = mft_size / mft_record_size as u64;
     let mut rec_buf = vec![0u8; mft_record_size];
 
@@ -4986,6 +5015,13 @@ fn index_ntfs_file_aware<R: Read + Seek>(
                 // Skip sparse runs (cluster_offset == 0 = hole); see the inline
                 // MFT parser for why queuing them as lcn=0 causes cross-links.
                 if dr.cluster_offset > 0 && dr.length > 0 {
+                    // $MFTMirr's $DATA: remember it for synthesis, don't queue
+                    // it (no stream run will ever match — Ghost omits the
+                    // mirror content). Queuing would just leave it unmapped.
+                    if rec_num == 1 && attr.attr_type == 0x80 && mftmirr_run.is_none() {
+                        mftmirr_run = Some((dr.cluster_offset as u64, dr.length));
+                        continue;
+                    }
                     data_run_queue.push((dr.cluster_offset as u64, dr.length));
                     if rec_num == 6 && attr.attr_type == 0x80 {
                         bitmap_runs.push((dr.cluster_offset as u64, dr.length));
@@ -5005,13 +5041,38 @@ fn index_ntfs_file_aware<R: Read + Seek>(
     let mut runs: Vec<NtfsGhoClusterRun> = Vec::new();
     let mut total_stored_clusters: u64 = 0;
 
-    // Add the MFT as run 0.
+    // Add the MFT as run 0. seq=0 — it's the first fragment of $MFT's $DATA.
     runs.push(NtfsGhoClusterRun {
         lcn_start: vbr.mft_cluster,
         cluster_count: mft_clusters,
         file_offset: mft_data_start,
+        seq: 0,
     });
     total_stored_clusters += mft_clusters;
+
+    // Synthesize $MFTMirr. NTFS keeps $MFTMirr as a byte-verbatim copy of
+    // $MFT's first records (the mirror cluster equals the MFT's first cluster,
+    // confirmed against ground-truth disks), so map the mirror's clusters
+    // straight back to the start of $MFT's stream data. Ghost stores no mirror
+    // content of its own (file-aware backups omit derivable system streams the
+    // way they omit $Bitmap / $Boot), so without this the mirror reads as zeros
+    // and chkdsk reports "$MFTMirr ($DATA) is corrupt / cross-linked".
+    if let Some((mirr_lcn, mirr_cc)) = mftmirr_run {
+        let cc = mirr_cc.min(mft_clusters);
+        if cc > 0 {
+            runs.push(NtfsGhoClusterRun {
+                lcn_start: mirr_lcn,
+                cluster_count: cc,
+                file_offset: mft_data_start,
+                seq: 0,
+            });
+            log::info!(
+                "Synthesized $MFTMirr: {} cluster(s) at lcn {} mapped to $MFT data",
+                cc,
+                mirr_lcn
+            );
+        }
+    }
 
     // Pending data runs from inline MFT records. Matched to cluster runs in
     // MFT-walk order, freshest gap first (see match_inline_run).
@@ -5095,6 +5156,10 @@ fn index_ntfs_file_aware<R: Read + Seek>(
                                     lcn_start: lcn,
                                     cluster_count: cc,
                                     file_offset: data_start,
+                                    // TODO: parse seq from entry B inside the 3-entry header
+                                    // for the uncompressed path. Currently a sentinel — fixup
+                                    // will fall back to non-seq matching for these.
+                                    seq: u64::MAX,
                                 });
                             } else {
                                 unmapped_runs.push((cc, data_start));
@@ -5161,6 +5226,7 @@ fn index_ntfs_file_aware<R: Read + Seek>(
                     lcn_start: lcn,
                     cluster_count: cc,
                     file_offset,
+                    seq: u64::MAX,
                 });
                 resolved += 1;
             }
@@ -5272,6 +5338,7 @@ fn open_ntfs_compressed_mft_only(
     let mut mft_clusters: u64 = 0;
     let mut data_run_queue: Vec<(u64, u64)> = Vec::new();
     let mut bitmap_runs: Vec<(u64, u64)> = Vec::new();
+    let mut mftmirr_run: Option<(u64, u64)> = None;
     let mut runs: Vec<NtfsGhoClusterRun> = Vec::new();
     let mut mft_parsed = false;
 
@@ -5403,6 +5470,7 @@ fn open_ntfs_compressed_mft_only(
                         lcn_start: vbr.mft_cluster,
                         cluster_count: cc,
                         file_offset: mds,
+                        seq: 0,
                     });
                 }
             }
@@ -5447,12 +5515,40 @@ fn open_ntfs_compressed_mft_only(
                             // Skip sparse runs (cluster_offset == 0 = hole);
                             // queuing them as lcn=0 causes $Boot cross-links.
                             if dr.cluster_offset > 0 && dr.length > 0 {
+                                // $MFTMirr ($DATA, rec 1): synthesized from the
+                                // $MFT data, not from a stream run (Ghost omits
+                                // the mirror content). Capture, don't queue. See
+                                // the uncompressed path for the full rationale.
+                                if rec_num == 1 && attr.attr_type == 0x80 && mftmirr_run.is_none() {
+                                    mftmirr_run = Some((dr.cluster_offset as u64, dr.length));
+                                    continue;
+                                }
                                 data_run_queue.push((dr.cluster_offset as u64, dr.length));
                                 if rec_num == 6 && attr.attr_type == 0x80 {
                                     bitmap_runs.push((dr.cluster_offset as u64, dr.length));
                                 }
                             }
                         }
+                    }
+                }
+                // Synthesize $MFTMirr: map its clusters back to the start of
+                // $MFT's stream data (the mirror is a verbatim copy of $MFT's
+                // first records). Without this the mirror reads as zeros and
+                // chkdsk flags "$MFTMirr ($DATA) corrupt / cross-linked".
+                if let Some((mirr_lcn, mirr_cc)) = mftmirr_run {
+                    let cc = mirr_cc.min(mft_clusters);
+                    if cc > 0 {
+                        runs.push(NtfsGhoClusterRun {
+                            lcn_start: mirr_lcn,
+                            cluster_count: cc,
+                            file_offset: mds,
+                            seq: 0,
+                        });
+                        log::info!(
+                            "Synthesized $MFTMirr: {} cluster(s) at lcn {} mapped to $MFT data",
+                            cc,
+                            mirr_lcn
+                        );
                     }
                 }
                 log::info!(
@@ -5882,7 +5978,7 @@ fn extend_ntfs_compressed_index(
                 }
                 break;
             }
-            let Some((_seq, cc)) = parse_ntfs_run_b_header(&scan.stream[hdr_local..]) else {
+            let Some((seq, cc)) = parse_ntfs_run_b_header(&scan.stream[hdr_local..]) else {
                 scan.prev_data_end = hdr_abs + 16;
                 continue;
             };
@@ -5930,10 +6026,21 @@ fn extend_ntfs_compressed_index(
                     lcn_start: lcn,
                     cluster_count: cc,
                     file_offset: run_data_start,
+                    seq,
                 });
                 if target_lcn >= lcn && target_lcn < lcn + cc {
                     found_target = true;
                 }
+            } else {
+                // Even when no LCN matches, record the stream run so the
+                // fixup can reassign by seq later. lcn_start = u64::MAX is a
+                // sentinel meaning "no original lcn known".
+                index.runs.push(NtfsGhoClusterRun {
+                    lcn_start: u64::MAX,
+                    cluster_count: cc,
+                    file_offset: run_data_start,
+                    seq,
+                });
             }
 
             scan.prev_data_end = run_data_end;
@@ -6082,6 +6189,841 @@ fn try_open_ntfs_file_aware(
         },
         volume_size,
     ))
+}
+
+/// What first-4-byte magic the cluster content for an NTFS attribute is expected
+/// to start with. Used by [`fixup_ntfs_typed_misalignments`] to detect cluster
+/// runs the matcher placed at the wrong `lcn_start` when multiple MFT attributes
+/// share the same `cluster_count` (the dominant ambiguity is `cc=2`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ExpectedMagic {
+    /// `$INDEX_ALLOCATION` (attr type `0xa0`) blocks start with `INDX`.
+    Indx,
+    /// `$MFT` (rec 0) `$DATA` fragments are sequences of `FILE` records.
+    File,
+    /// `$LogFile` (rec 2) `$DATA` blocks start with `RSTR` (restart) or `RCRD`
+    /// (log record).
+    Logfile,
+    /// Pre-Windows-2000 per-file `$SECURITY_DESCRIPTOR` (attr type `0x50`) and
+    /// the entries in `$Secure $DATA "$SDS"`. The first byte is the SD revision
+    /// (always 1), byte 1 is sbz1 (always 0), byte 3's high bit is
+    /// `SE_SELF_RELATIVE` (almost always set for stored SDs). That's a 4-byte
+    /// fingerprint stronger than a magic number even though it's not literal.
+    SecurityDescriptor,
+}
+
+impl ExpectedMagic {
+    /// Predict the magic for a non-resident attribute, given the MFT record that
+    /// **owns** it (i.e. the base record number, chasing `$ATTRIBUTE_LIST` for
+    /// extension records). `None` for attributes whose content is opaque (user
+    /// `$DATA`, `$Secure $DATA $SDS`, etc.) — no useful prediction.
+    fn from_attr(owning_rec: u64, attr_type: u32) -> Option<Self> {
+        match attr_type {
+            0xa0 => Some(Self::Indx),
+            // $MFT (rec 0) and $MFTMirr (rec 1) both store FILE records.
+            0x80 if owning_rec == 0 || owning_rec == 1 => Some(Self::File),
+            0x80 if owning_rec == 2 => Some(Self::Logfile),
+            // Per-file embedded security descriptor (old-style NTFS).
+            0x50 => Some(Self::SecurityDescriptor),
+            _ => None,
+        }
+    }
+
+    /// Classify an observed magic against the predictable types.
+    fn from_observed(magic: &[u8; 4]) -> Option<Self> {
+        if magic == b"INDX" {
+            Some(Self::Indx)
+        } else if magic == b"FILE" {
+            Some(Self::File)
+        } else if magic == b"RSTR" || magic == b"RCRD" {
+            Some(Self::Logfile)
+        } else if magic[0] == 0x01 && magic[1] == 0x00 && (magic[3] & 0x80) != 0 {
+            // SD revision 1 + sbz1=0 + SE_SELF_RELATIVE control bit. Byte 2
+            // (control low) varies; byte 3 (control high) is 0x80 or
+            // 0x80|other-bits.
+            Some(Self::SecurityDescriptor)
+        } else {
+            None
+        }
+    }
+}
+
+/// Read up to `out.len()` bytes directly from `file_offset` — bypassing the
+/// `lcn → run` index lookup so an overlapping-runs ambiguity doesn't corrupt
+/// the result. Handles both uncompressed (read straight from the `SpanReader`)
+/// and zlib-compressed GHOs (route through `NtfsDecompressingReader`). Returns
+/// the number of bytes actually read; short reads (or 0) signal EOF / missing
+/// decompressed coverage for that offset.
+fn peek_run_bytes(
+    inner: &mut SpanReader,
+    compressed: Option<&mut NtfsCompressedState>,
+    file_offset: u64,
+    out: &mut [u8],
+) -> usize {
+    if let Some(cs) = compressed {
+        if file_offset >= cs.total_decompressed {
+            return 0;
+        }
+        let mut rdr = NtfsDecompressingReader {
+            inner,
+            state: cs,
+            position: file_offset,
+        };
+        let mut got = 0;
+        while got < out.len() {
+            match rdr.read(&mut out[got..]) {
+                Ok(0) => break,
+                Ok(n) => got += n,
+                Err(_) => break,
+            }
+        }
+        return got;
+    }
+    if inner.seek(SeekFrom::Start(file_offset)).is_err() {
+        return 0;
+    }
+    let mut got = 0;
+    while got < out.len() {
+        match inner.read(&mut out[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(_) => break,
+        }
+    }
+    got
+}
+
+/// Per-run expected content, derived from the MFT.
+#[derive(Debug, Clone, Copy)]
+struct TypedExpect {
+    /// Run length in clusters.
+    cc: u64,
+    /// Predicted content magic, or `None` for opaque attribute kinds.
+    magic: Option<ExpectedMagic>,
+    /// For `Indx`, the expected `self_vcn` of the FIRST INDX block in this run.
+    /// (Each subsequent INDX block self_vcn is `+= idx_record_size / cluster_size`,
+    /// which is `1` on all volumes we've seen since idx_record_size == cluster_size.)
+    expected_vcn: u64,
+}
+
+/// Post-scan content-aware index rebuild.
+///
+/// The streaming matcher in [`index_ntfs_file_aware`] / [`extend_ntfs_compressed_index`]
+/// disambiguates same-`cc` MFT entries by MFT-record order alone. When Ghost's
+/// stored stream order doesn't match MFT-record order — the dominant ambiguity
+/// is `cc=2` (the default initial `$INDEX_ALLOCATION` allocation) — runs land
+/// at the wrong `lcn_start` and the reader serves other files' bytes at those
+/// LCNs. chkdsk then sees garbage `INDX` blocks, flags directories as corrupt,
+/// and (with `/f`) orphans thousands of files.
+///
+/// **Strategy.** Instead of trying to patch the matcher's mistakes via swaps
+/// (which are hard to get right when same-`cc` entries are pervasive and the
+/// matcher's index has *overlapping* LCN ranges), this pass treats the MFT as
+/// ground truth and rebuilds `index.runs` from scratch:
+///
+/// 1. **MFT scan.** Walk every FILE record; for each non-resident attribute,
+///    record `(lcn, cc, magic, expected_vcn)`. Magic is INDX for
+///    `$INDEX_ALLOCATION`, FILE for `$MFT $DATA`, RSTR|RCRD for `$LogFile
+///    $DATA`, `None` for opaque attrs (user `$DATA`, `$Secure $DATA $SDS`,
+///    etc.). The base-record id (FILE header offset 0x20) resolves
+///    `$ATTRIBUTE_LIST` extension records back to the owning base — that's how
+///    `$Secure`'s `$SDH` index runs (which live in an extension record, not
+///    rec 9 itself) get the correct INDX expectation.
+/// 2. **Observe.** For every run in the existing `index.runs`, peek the first
+///    24 bytes directly from its `file_offset` (bypassing the binary_search-on-
+///    LCN lookup, which is what overlapping runs corrupt). Record kind + INDX
+///    `self_vcn`. The (file_offset, kind, self_vcn, cluster_count) tuple is
+///    what we have to *place*.
+/// 3. **Assign.** For each MFT entry of cc=K, find the observed run with cc=K
+///    whose content matches the entry's predicted magic + (for INDX) vcn. That
+///    run's `file_offset` becomes the new entry's `file_offset` at `lcn = entry.lcn`.
+///    For entries with no magic prediction (user data), match by cc alone in
+///    MFT order — same heuristic as the original matcher but applied at the
+///    end, after all magic-typed assignments have claimed their slots.
+/// 4. **Replace.** Drop the old `index.runs` entirely; substitute the rebuilt
+///    list. Re-sort by `lcn_start`. The new list has *no overlaps* because
+///    every entry came from a distinct MFT data-run declaration, and NTFS
+///    guarantees non-overlapping cluster claims within a well-formed volume.
+///
+/// The MFT run itself (rec 0 fragment 0 at `vbr.mft_cluster`) is preserved
+/// verbatim — it was set explicitly at scan start, never via the ambiguous cc
+/// queue, so it's already correct.
+///
+/// Conservative for opaque attrs: when MFT order disagrees with stream order,
+/// the user-`$DATA` portion may still be cross-linked. But every metadata
+/// stream (`$MFT`, `$LogFile`, every `$INDEX_ALLOCATION`) is placed by content,
+/// which is what chkdsk reads.
+fn fixup_ntfs_typed_misalignments(
+    inner: &mut SpanReader,
+    index: &mut NtfsGhoIndex,
+    compressed: &mut Option<NtfsCompressedState>,
+    vbr: &crate::fs::ntfs::NtfsVbr,
+) {
+    use crate::fs::ntfs::{apply_fixup, parse_mft_attributes};
+
+    let cluster_size = index.cluster_size;
+    let mft_record_size = vbr.mft_record_size as usize;
+
+    let Some(mft_run) = index
+        .runs
+        .iter()
+        .find(|r| r.lcn_start == vbr.mft_cluster)
+        .cloned()
+    else {
+        log::warn!("NTFS fixup: MFT run not found in index, skipping");
+        return;
+    };
+
+    // The MFT's first fragment is only part of the MFT — read $MFT (rec 0) to
+    // discover the total size via its $DATA $DATA attribute. Without this we'd
+    // miss every MFT record beyond the first fragment, which on this corpus is
+    // ~3 % of the table.
+    let mut rec0 = vec![0u8; mft_record_size];
+    {
+        let mft_pos = vbr.mft_cluster * cluster_size;
+        let mut total = 0;
+        let mut hint = 0usize;
+        while total < mft_record_size {
+            let n = match read_ntfs_file_aware_into(
+                inner,
+                index,
+                &mut hint,
+                compressed,
+                mft_pos + total as u64,
+                &mut rec0[total..],
+            ) {
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+    }
+    let _ = apply_fixup(&mut rec0, vbr.bytes_per_sector);
+    // $MFT's own $DATA runs, as (vcn_start, cluster_count, lcn_start) in order.
+    // Used to place FILE-magic MFT-fragment runs deterministically by content:
+    // an MFT fragment's first record carries its own record number, which fixes
+    // the fragment's VCN, and these runs map that VCN to its LCN.
+    let mut mft_data_runs: Vec<(u64, u64, u64)> = Vec::new();
+    let mft_total_bytes = {
+        let attrs = parse_mft_attributes(&rec0, vbr.mft_record_size);
+        let mut total = 0u64;
+        for a in &attrs {
+            if !a.resident && a.attr_type == 0x80 {
+                let mut vcn = a.starting_vcn;
+                for dr in &a.data_runs {
+                    if dr.cluster_offset > 0 && dr.length > 0 {
+                        mft_data_runs.push((vcn, dr.length, dr.cluster_offset as u64));
+                    }
+                    vcn += dr.length;
+                    total += dr.length * cluster_size;
+                }
+            }
+        }
+        if total == 0 {
+            mft_run.cluster_count * cluster_size
+        } else {
+            total
+        }
+    };
+    // Map an absolute $MFT VCN to its on-disk LCN via the $MFT $DATA runs.
+    let mft_vcn_to_lcn = |vcn: u64| -> Option<u64> {
+        for &(vstart, len, lcn) in &mft_data_runs {
+            if vcn >= vstart && vcn < vstart + len {
+                return Some(lcn + (vcn - vstart));
+            }
+        }
+        None
+    };
+    let num_records = mft_total_bytes / mft_record_size as u64;
+    log::info!(
+        "NTFS fixup: scanning {num_records} MFT records ({} bytes total MFT)",
+        mft_total_bytes
+    );
+
+    // Step 1: collect MFT entries — ALL non-resident attribute data runs.
+    // Each entry will become an `index.runs` slot in the rebuilt index.
+    //
+    // We build TWO views:
+    //   1. `mft_entries: Vec<(lcn, TypedExpect)>` — flat, sorted+deduped by
+    //      `(lcn, cc)`. Used by the content-based opaque fallback.
+    //   2. `mft_attrs: Vec<Vec<MftFragment>>` — grouped per non-resident
+    //      attribute *in MFT-walk order*, preserving emission order. Each
+    //      inner Vec is one attribute's fragments (one entry per data run).
+    //      This is what gets matched to `stream_attrs` by position.
+    struct MftFragment {
+        lcn: u64,
+        cc: u64,
+        magic: Option<ExpectedMagic>,
+        expected_vcn: u64,
+    }
+    let mut mft_entries: Vec<(u64, TypedExpect)> = Vec::new();
+    let mut mft_attrs: Vec<Vec<MftFragment>> = Vec::new();
+    // Deterministic INDX placement: map (owning_dir_rec, vcn) -> lcn for every
+    // $INDEX_ALLOCATION ($I30) fragment. An INDX block in the stream is
+    // self-identifying — its index entries carry the parent directory's MFT
+    // reference — so we can place each one at exactly the right LCN regardless
+    // of cluster-count collisions or stream emission order. Keyed only for the
+    // $I30 (directory) index, which is what chkdsk's index checks cover.
+    let mut indx_dest: std::collections::HashMap<(u64, u64), u64> =
+        std::collections::HashMap::new();
+    // $MFTMirr (rec 1) $DATA — pinned to map onto $MFT's data, never matched to
+    // a stream run (Ghost omits the mirror's content; it's a verbatim copy of
+    // $MFT's first records). Captured here, re-added at reassembly.
+    let mut pinned_mftmirr: Option<(u64, u64)> = None;
+
+    let mut rec_buf = vec![0u8; mft_record_size];
+    let mut hint = 0usize;
+    for rec_idx in 0..num_records {
+        let mft_pos = vbr.mft_cluster * cluster_size + rec_idx * mft_record_size as u64;
+        let mut total = 0;
+        while total < mft_record_size {
+            let n = match read_ntfs_file_aware_into(
+                inner,
+                index,
+                &mut hint,
+                compressed,
+                mft_pos + total as u64,
+                &mut rec_buf[total..],
+            ) {
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+        if total < mft_record_size || &rec_buf[0..4] != b"FILE" {
+            continue;
+        }
+        let flags = u16::from_le_bytes([rec_buf[22], rec_buf[23]]);
+        if flags & 0x01 == 0 {
+            continue;
+        }
+        let base_ref = u64::from_le_bytes([
+            rec_buf[0x20],
+            rec_buf[0x21],
+            rec_buf[0x22],
+            rec_buf[0x23],
+            rec_buf[0x24],
+            rec_buf[0x25],
+            rec_buf[0x26],
+            rec_buf[0x27],
+        ]);
+        let base_rec = base_ref & 0x0000_FFFF_FFFF_FFFF;
+        let self_rec =
+            u32::from_le_bytes([rec_buf[44], rec_buf[45], rec_buf[46], rec_buf[47]]) as u64;
+        let owning_rec = if base_rec != 0 { base_rec } else { self_rec };
+        // Skip rec 8 ($BadClus, sparse all-volume run) and rec 0 fragment 0
+        // (the MFT first run — added separately at the end).
+        if self_rec == 8 {
+            continue;
+        }
+        let _ = apply_fixup(&mut rec_buf, vbr.bytes_per_sector);
+        let attrs = parse_mft_attributes(&rec_buf, vbr.mft_record_size);
+        for attr in &attrs {
+            if attr.resident || attr.data_runs.is_empty() {
+                continue;
+            }
+            let magic = ExpectedMagic::from_attr(owning_rec, attr.attr_type);
+            // $MFTMirr (rec 1) $DATA: pin it, don't match it to a stream run.
+            // Its content is synthesized from $MFT's data (see below).
+            if self_rec == 1 && attr.attr_type == 0x80 {
+                if pinned_mftmirr.is_none() {
+                    if let Some(dr) = attr
+                        .data_runs
+                        .iter()
+                        .find(|dr| dr.cluster_offset > 0 && dr.length > 0)
+                    {
+                        pinned_mftmirr = Some((dr.cluster_offset as u64, dr.length));
+                    }
+                }
+                continue;
+            }
+            // Rec 0's $DATA fragment 0 is the MFT first run, set explicitly at
+            // scan time. Don't include it as an entry (we'll add it back below).
+            let skip_first = self_rec == 0 && attr.attr_type == 0x80;
+            let mut vcn = attr.starting_vcn;
+            let mut attr_frags: Vec<MftFragment> = Vec::new();
+            for (i, dr) in attr.data_runs.iter().enumerate() {
+                let len = dr.length;
+                if dr.cluster_offset > 0 && len > 0 && !(skip_first && i == 0) {
+                    let lcn = dr.cluster_offset as u64;
+                    mft_entries.push((
+                        lcn,
+                        TypedExpect {
+                            cc: len,
+                            magic,
+                            expected_vcn: vcn,
+                        },
+                    ));
+                    attr_frags.push(MftFragment {
+                        lcn,
+                        cc: len,
+                        magic,
+                        expected_vcn: vcn,
+                    });
+                    // Index every $INDEX_ALLOCATION (0xa0) fragment's destination
+                    // per VCN. $Secure (rec 9) owns $SII/$SDH which aren't
+                    // directory ($I30) indexes; their entries have no parent ref,
+                    // so the content lookup just won't match them — excluding
+                    // rec 9 keeps the map clean. Each VCN of the attribute maps to
+                    // its own LCN (a cc>1 fragment covers several consecutive VCNs).
+                    if attr.attr_type == 0xa0 && owning_rec != 9 {
+                        for off in 0..len {
+                            indx_dest.insert((owning_rec, vcn + off), lcn + off);
+                        }
+                    }
+                }
+                vcn += len;
+            }
+            if !attr_frags.is_empty() {
+                mft_attrs.push(attr_frags);
+            }
+        }
+    }
+
+    // Dedupe MFT entries by (lcn, cc, magic, expected_vcn). $ATTRIBUTE_LIST can
+    // cause the same attribute to surface from both the base record and an
+    // extension; we only want one entry per (lcn, cc) pair.
+    mft_entries.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(a.1.cc.cmp(&b.1.cc))
+            .then(a.1.expected_vcn.cmp(&b.1.expected_vcn))
+    });
+    mft_entries.dedup_by(|a, b| a.0 == b.0 && a.1.cc == b.1.cc);
+    log::info!(
+        "NTFS fixup: {} unique MFT entries (after dedup)",
+        mft_entries.len()
+    );
+
+    // Step 2: observe every existing run's actual content (peek at file_offset).
+    // Skip the MFT run itself — it's preserved separately.
+    #[derive(Debug, Clone, Copy)]
+    struct ObservedRun {
+        file_offset: u64,
+        cc: u64,
+        kind: Option<ExpectedMagic>,
+        self_vcn: Option<u64>,
+        /// Stream-side fragment index captured during the lazy scan. `u64::MAX`
+        /// for entries whose seq wasn't recorded (uncompressed path TODO).
+        seq: u64,
+    }
+    let mut observed_runs: Vec<ObservedRun> = Vec::with_capacity(index.runs.len());
+    let mut order: Vec<usize> = (0..index.runs.len()).collect();
+    order.sort_by_key(|&i| index.runs[i].file_offset);
+    for run_i in order {
+        let r = &index.runs[run_i];
+        if r.lcn_start == vbr.mft_cluster {
+            continue;
+        }
+        // Skip the synthesized $MFTMirr run: it shares the MFT's file_offset
+        // (it maps onto $MFT's data) and would otherwise be observed as a
+        // phantom FILE-magic run and mis-matched. It's re-added at reassembly.
+        if r.file_offset == mft_run.file_offset {
+            continue;
+        }
+        let mut buf = [0u8; 24];
+        let got = peek_run_bytes(inner, compressed.as_mut(), r.file_offset, &mut buf);
+        if got < 4 {
+            continue;
+        }
+        let kind = ExpectedMagic::from_observed(&[buf[0], buf[1], buf[2], buf[3]]);
+        let self_vcn = if kind == Some(ExpectedMagic::Indx) && got >= 0x18 {
+            Some(u64::from_le_bytes([
+                buf[0x10], buf[0x11], buf[0x12], buf[0x13], buf[0x14], buf[0x15], buf[0x16],
+                buf[0x17],
+            ]))
+        } else {
+            None
+        };
+        observed_runs.push(ObservedRun {
+            file_offset: r.file_offset,
+            cc: r.cluster_count,
+            kind,
+            self_vcn,
+            seq: r.seq,
+        });
+    }
+    // observed_runs is now in stream order (sorted by file_offset). Group it
+    // into stream-attributes by seq=0 boundaries: a new attribute starts every
+    // time seq drops back to 0. Each group is one MFT non-resident attribute's
+    // fragment list in emission order.
+    let mut stream_attrs: Vec<Vec<usize>> = Vec::new(); // groups of observed_runs indices
+    {
+        let mut current: Vec<usize> = Vec::new();
+        for (i, o) in observed_runs.iter().enumerate() {
+            if o.seq == 0 {
+                if !current.is_empty() {
+                    stream_attrs.push(std::mem::take(&mut current));
+                }
+                current.push(i);
+            } else if o.seq == u64::MAX {
+                // Uncompressed-path sentinel — flush as a standalone group so
+                // it still gets matched by fragment-shape (which is just [cc]).
+                if !current.is_empty() {
+                    stream_attrs.push(std::mem::take(&mut current));
+                }
+                stream_attrs.push(vec![i]);
+            } else {
+                current.push(i);
+            }
+        }
+        if !current.is_empty() {
+            stream_attrs.push(current);
+        }
+    }
+    log::info!(
+        "NTFS fixup: grouped {} observed runs into {} stream-attributes",
+        observed_runs.len(),
+        stream_attrs.len()
+    );
+    let mut indx_obs = 0;
+    let mut file_obs = 0;
+    let mut log_obs = 0;
+    let mut sd_obs = 0;
+    let mut other_obs = 0;
+    for o in &observed_runs {
+        match o.kind {
+            Some(ExpectedMagic::Indx) => indx_obs += 1,
+            Some(ExpectedMagic::File) => file_obs += 1,
+            Some(ExpectedMagic::Logfile) => log_obs += 1,
+            Some(ExpectedMagic::SecurityDescriptor) => sd_obs += 1,
+            None => other_obs += 1,
+        }
+    }
+    log::info!(
+        "NTFS fixup: {} runs observed (INDX={} FILE={} LOGFILE={} SD={} other={})",
+        observed_runs.len(),
+        indx_obs,
+        file_obs,
+        log_obs,
+        sd_obs,
+        other_obs
+    );
+
+    // Step 3: assign observed runs to MFT entries.
+    //
+    // Pass 0 (seq-based) — the deterministic path. `stream_attrs[k]` is the
+    // k-th attribute Ghost emitted; `mft_attrs[k]` is the k-th non-resident
+    // attribute we found walking the MFT. Their fragments line up
+    // one-to-one IF the emission order matches MFT-walk order AND the
+    // fragment counts agree. When a mismatch is detected (different fragment
+    // count or magic disagreement on the first fragment) we BAIL on seq
+    // matching for that attribute and let Pass 1 / Pass 2 handle its runs as
+    // before — that's the fallback for `$ATTRIBUTE_LIST`-reordered streams
+    // or any other emission-order surprise.
+    //
+    // Pass 1 — magic-typed entries (content-based fallback). For each MFT
+    // entry with a magic prediction (INDX/FILE/LOGFILE), find an unused
+    // observed run whose cc + kind + (for INDX) self_vcn match.
+    //
+    // Pass 2 — opaque entries (user $DATA, $Secure $DATA $SDS, etc.).
+    // Preserve the matcher's original `(lcn, cc) → file_offset` choice.
+    let mut used = vec![false; observed_runs.len()];
+    let mut assignments: Vec<(u64, u64, u64, u64)> = Vec::new(); // (lcn, cc, file_offset, seq)
+    let mut typed_matched = 0usize;
+    let mut typed_unmatched = 0usize;
+    let mut seq_matched = 0usize;
+    let mut seq_bailouts = 0usize;
+    // (lcn, cc) pairs already assigned, shared across all passes so none
+    // double-assign. Maintained incrementally from the first (INDX-content) pass
+    // onward.
+    let mut claimed: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+
+    // Pass -1 (INDX content): deterministic directory-index placement, run
+    // before everything else. Every $I30 INDX block names its parent directory
+    // in its first index entry's $FILE_NAME key; combined with the block's
+    // self-VCN that uniquely identifies the destination LCN (`indx_dest`),
+    // independent of cluster-count collisions and stream emission order — the
+    // failure mode that desynced positional seq-matching on large volumes and
+    // produced chkdsk "index entry ... is incorrect" / "incorrectly sorted"
+    // errors en masse. INDX blocks that can't be identified (empty nodes, or
+    // non-$I30 indexes whose keys aren't $FILE_NAME) fall through to the later
+    // passes unchanged.
+    let mut indx_content_matched = 0usize;
+    {
+        let mut blk = vec![0u8; 8192];
+        for i in 0..observed_runs.len() {
+            if used[i] || observed_runs[i].kind != Some(ExpectedMagic::Indx) {
+                continue;
+            }
+            let fo = observed_runs[i].file_offset;
+            let got = peek_run_bytes(inner, compressed.as_mut(), fo, &mut blk);
+            if got < 0x20 || &blk[0..4] != b"INDX" {
+                continue;
+            }
+            let self_vcn = u64::from_le_bytes(blk[0x10..0x18].try_into().unwrap());
+            // INDEX_NODE_HEADER sits at 0x18; its first-entry offset is relative
+            // to the header start (0x18).
+            let first_off = 0x18 + u32::from_le_bytes(blk[0x18..0x1C].try_into().unwrap()) as usize;
+            if first_off + 0x18 > got {
+                continue;
+            }
+            let entry_flags = u16::from_le_bytes([blk[first_off + 0x0C], blk[first_off + 0x0D]]);
+            let key_len =
+                u16::from_le_bytes([blk[first_off + 0x0A], blk[first_off + 0x0B]]) as usize;
+            // 0x02 = last/end entry. With no key it's an empty node — unidentifiable.
+            if entry_flags & 0x02 != 0 || key_len < 8 {
+                continue;
+            }
+            // The key is a $FILE_NAME; its first 8 bytes are the parent dir ref.
+            let pr_off = first_off + 0x10;
+            if pr_off + 8 > got {
+                continue;
+            }
+            let parent_ref = u64::from_le_bytes(blk[pr_off..pr_off + 8].try_into().unwrap())
+                & 0x0000_FFFF_FFFF_FFFF;
+            if let Some(&lcn) = indx_dest.get(&(parent_ref, self_vcn)) {
+                let cc = observed_runs[i].cc;
+                if !claimed.contains(&(lcn, cc)) {
+                    used[i] = true;
+                    assignments.push((lcn, cc, fo, observed_runs[i].seq));
+                    claimed.insert((lcn, cc));
+                    indx_content_matched += 1;
+                }
+            }
+        }
+    }
+    log::info!(
+        "NTFS fixup: Pass -1 (INDX content) — {indx_content_matched} directory-index blocks placed"
+    );
+
+    // Pass -1b (MFT-fragment content): place FILE-magic runs — the $MFT's own
+    // later $DATA fragments — deterministically. Each fragment is a sequence of
+    // FILE records, and every record stores its own record number at offset
+    // 0x2C. The first record's number fixes the fragment's $MFT VCN, which the
+    // $MFT $DATA runs map to an LCN. This avoids the cc-based ambiguity that
+    // otherwise swaps same-size MFT fragments and leaves a few records reading
+    // as zeros / foreign data ("Attribute record (80) is corrupt" in chkdsk).
+    let mut mft_frag_matched = 0usize;
+    {
+        let mut hdr = [0u8; 0x30];
+        for i in 0..observed_runs.len() {
+            if used[i] || observed_runs[i].kind != Some(ExpectedMagic::File) {
+                continue;
+            }
+            let fo = observed_runs[i].file_offset;
+            let got = peek_run_bytes(inner, compressed.as_mut(), fo, &mut hdr);
+            if got < 0x30 || &hdr[0..4] != b"FILE" {
+                continue;
+            }
+            // Record number this fragment starts at (offset 0x2C).
+            let first_rec = u32::from_le_bytes([hdr[0x2C], hdr[0x2D], hdr[0x2E], hdr[0x2F]]) as u64;
+            // VCN of that record within $MFT, then its LCN via the $MFT runs.
+            let vcn = first_rec * mft_record_size as u64 / cluster_size;
+            if let Some(lcn) = mft_vcn_to_lcn(vcn) {
+                let cc = observed_runs[i].cc;
+                if !claimed.contains(&(lcn, cc)) {
+                    used[i] = true;
+                    assignments.push((lcn, cc, fo, observed_runs[i].seq));
+                    claimed.insert((lcn, cc));
+                    mft_frag_matched += 1;
+                }
+            }
+        }
+    }
+    log::info!(
+        "NTFS fixup: Pass -1b (MFT-fragment content) — {mft_frag_matched} $MFT fragments placed"
+    );
+
+    // Pass 0: seq-based attribute alignment.
+    let n_pairs = stream_attrs.len().min(mft_attrs.len());
+    for k in 0..n_pairs {
+        let s_idxs = &stream_attrs[k];
+        let mft_frags = &mft_attrs[k];
+        // Skip groups whose runs or destinations the INDX-content pass already
+        // claimed — re-committing them here would double-assign.
+        if s_idxs.iter().any(|&si| used[si])
+            || mft_frags.iter().any(|f| claimed.contains(&(f.lcn, f.cc)))
+        {
+            continue;
+        }
+        // Bail if the shapes don't agree — different fragment counts or
+        // cc mismatch on a fragment means Ghost's emission order isn't what
+        // we assumed for this attribute.
+        if s_idxs.len() != mft_frags.len() {
+            seq_bailouts += 1;
+            continue;
+        }
+        let mut shape_ok = true;
+        for (j, &si) in s_idxs.iter().enumerate() {
+            if observed_runs[si].cc != mft_frags[j].cc {
+                shape_ok = false;
+                break;
+            }
+            // Magic disagreement on a fragment whose attribute predicts a
+            // specific magic is a strong "this isn't the right attribute"
+            // signal. Check fragment 0 (others may genuinely lack magic).
+            if j == 0 {
+                if let Some(want_m) = mft_frags[j].magic {
+                    if observed_runs[si].kind != Some(want_m) {
+                        shape_ok = false;
+                        break;
+                    }
+                    if want_m == ExpectedMagic::Indx
+                        && observed_runs[si].self_vcn != Some(mft_frags[j].expected_vcn)
+                    {
+                        shape_ok = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if !shape_ok {
+            seq_bailouts += 1;
+            continue;
+        }
+        // Shapes agree — commit each fragment.
+        for (j, &si) in s_idxs.iter().enumerate() {
+            used[si] = true;
+            assignments.push((
+                mft_frags[j].lcn,
+                mft_frags[j].cc,
+                observed_runs[si].file_offset,
+                observed_runs[si].seq,
+            ));
+            claimed.insert((mft_frags[j].lcn, mft_frags[j].cc));
+            seq_matched += 1;
+        }
+    }
+    log::info!(
+        "NTFS fixup: Pass 0 (seq) — {} fragments matched, {} attrs bailed out",
+        seq_matched,
+        seq_bailouts
+    );
+
+    // Pass 1: typed entries that Pass 0 didn't already claim.
+    for (lcn, t) in &mft_entries {
+        if claimed.contains(&(*lcn, t.cc)) {
+            continue;
+        }
+        let Some(want_magic) = t.magic else {
+            continue;
+        };
+        let mut found: Option<usize> = None;
+        for (i, o) in observed_runs.iter().enumerate() {
+            if used[i] {
+                continue;
+            }
+            if o.cc != t.cc {
+                continue;
+            }
+            if o.kind != Some(want_magic) {
+                continue;
+            }
+            if want_magic == ExpectedMagic::Indx && o.self_vcn != Some(t.expected_vcn) {
+                continue;
+            }
+            found = Some(i);
+            break;
+        }
+        if let Some(i) = found {
+            used[i] = true;
+            assignments.push((
+                *lcn,
+                t.cc,
+                observed_runs[i].file_offset,
+                observed_runs[i].seq,
+            ));
+            claimed.insert((*lcn, t.cc));
+            typed_matched += 1;
+        } else {
+            typed_unmatched += 1;
+        }
+    }
+
+    // Pass 2: opaque entries — preserve the matcher's original choice.
+    let mut original_assignments: std::collections::HashMap<(u64, u64), u64> =
+        std::collections::HashMap::with_capacity(index.runs.len());
+    for r in &index.runs {
+        original_assignments
+            .entry((r.lcn_start, r.cluster_count))
+            .or_insert(r.file_offset);
+    }
+    let mut opaque_matched = 0usize;
+    let mut opaque_unmatched = 0usize;
+    for (lcn, t) in &mft_entries {
+        if t.magic.is_some() {
+            continue;
+        }
+        if claimed.contains(&(*lcn, t.cc)) {
+            continue;
+        }
+        if let Some(&fo) = original_assignments.get(&(*lcn, t.cc)) {
+            assignments.push((*lcn, t.cc, fo, u64::MAX));
+            claimed.insert((*lcn, t.cc));
+            opaque_matched += 1;
+        } else {
+            opaque_unmatched += 1;
+        }
+    }
+
+    // Also preserve original placement for any TYPED entries that Pass 1
+    // couldn't match — better to keep the matcher's guess than to lose the run
+    // entirely (would read as zeros and chkdsk would think the file is empty).
+    for (lcn, t) in &mft_entries {
+        if t.magic.is_none() {
+            continue;
+        }
+        if claimed.contains(&(*lcn, t.cc)) {
+            continue;
+        }
+        if let Some(&fo) = original_assignments.get(&(*lcn, t.cc)) {
+            assignments.push((*lcn, t.cc, fo, u64::MAX));
+            claimed.insert((*lcn, t.cc));
+        }
+    }
+
+    log::info!(
+        "NTFS fixup: typed-matched={typed_matched} typed-unmatched={typed_unmatched} \
+         opaque-matched={opaque_matched} opaque-unmatched={opaque_unmatched} \
+         unused-observed={}",
+        used.iter().filter(|&&u| !u).count()
+    );
+
+    // Step 4: rebuild index.runs. Preserve the MFT run unchanged; replace
+    // everything else with the new assignments.
+    let mut new_runs: Vec<NtfsGhoClusterRun> = Vec::with_capacity(assignments.len() + 2);
+    let mft_file_offset = mft_run.file_offset;
+    let mft_run_clusters = mft_run.cluster_count;
+    new_runs.push(mft_run);
+    // Re-add the synthesized $MFTMirr: clusters mapped onto the start of $MFT's
+    // data so the mirror reads as a verbatim copy of $MFT's first records.
+    if let Some((mirr_lcn, mirr_cc)) = pinned_mftmirr {
+        let cc = mirr_cc.min(mft_run_clusters);
+        if cc > 0 {
+            new_runs.push(NtfsGhoClusterRun {
+                lcn_start: mirr_lcn,
+                cluster_count: cc,
+                file_offset: mft_file_offset,
+                seq: 0,
+            });
+            log::info!(
+                "NTFS fixup: re-added synthesized $MFTMirr ({} cluster(s) at lcn {})",
+                cc,
+                mirr_lcn
+            );
+        }
+    }
+    for (lcn, cc, file_offset, seq) in assignments {
+        new_runs.push(NtfsGhoClusterRun {
+            lcn_start: lcn,
+            cluster_count: cc,
+            file_offset,
+            seq,
+        });
+    }
+    new_runs.sort_by_key(|r| r.lcn_start);
+    log::info!(
+        "NTFS fixup: rebuilt index, {} runs (was {})",
+        new_runs.len(),
+        index.runs.len()
+    );
+    index.runs = new_runs;
 }
 
 /// Recover `$Boot`'s first 16 sectors by content-matching the VBR.
@@ -6373,6 +7315,7 @@ mod tests {
                     lcn_start: i * 10,
                     cluster_count: 10,
                     file_offset: i * 4096,
+                    seq: 0,
                 })
                 .collect(),
             blocks: Vec::new(),
