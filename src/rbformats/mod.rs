@@ -10,6 +10,7 @@ pub mod dc42;
 pub mod dmg;
 pub mod export;
 pub mod gho;
+pub mod gho_crypto;
 pub mod imz;
 pub mod interleave;
 pub mod qcow2;

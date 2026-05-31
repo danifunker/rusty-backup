@@ -165,7 +165,8 @@ impl BrowseSession {
         // SECTOR-mode (streaming block cache) and file-aware (in-RAM
         // virtual FAT image).
         if magic[0] == 0xFE && magic[1] == 0xEF {
-            let gho_reader = crate::rbformats::gho::GhoReader::open(path)
+            let pw = self.password.as_deref().map(|s| s.as_bytes());
+            let gho_reader = crate::rbformats::gho::GhoReader::open_with_password(path, pw)
                 .map_err(|e| FilesystemError::Parse(format!("failed to open GHO: {e:#}")))?;
             return fs::open_filesystem(
                 gho_reader,
@@ -281,7 +282,17 @@ impl BrowseSession {
                 Ok(fs) => fs,
                 Err(e) => {
                     let msg = format!("{e}");
-                    let is_pw = msg.to_lowercase().contains("password-protected");
+                    // Detect password-related open failures (missing or wrong
+                    // password) so the GUI re-shows the password prompt. Match
+                    // on specific phrases rather than the bare word "password"
+                    // to avoid false positives from image paths that happen to
+                    // contain it (e.g. a folder named "GH11-password").
+                    let lower = msg.to_lowercase();
+                    let is_pw = lower.contains("password-protected")
+                        || lower.contains("password is required")
+                        || lower.contains("password must be specified")
+                        || lower.contains("incorrect password")
+                        || lower.contains("wrong password");
                     if let Ok(mut g) = status_thread.lock() {
                         g.error = Some(format!("Cannot open filesystem: {e}"));
                         g.needs_password = is_pw;

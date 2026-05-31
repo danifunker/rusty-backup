@@ -1,104 +1,86 @@
-# GHO password decrypt — open problem
+# GHO password decryption — SOLVED
 
-Status: **unsolved**. Attempted in the GHO 5.6 slice (2026-05-26); cipher
-implementation reverted because real-fixture verification revealed the
-Go reference's cipher does not match Symantec's actual encryption.
+Status: **solved** (2026-05-31). Reverse-engineered from `ghostexp.exe` (Ghost
+Explorer 11.5) and verified bit-exact against real password-protected fixtures.
+Implemented in [`src/rbformats/gho_crypto.rs`](../src/rbformats/gho_crypto.rs);
+wired through `GhoReader::open_with_password`, `source_reader`, the CLI
+`--password` flag, and the GUI password prompt.
 
-## What we know (verified against real fixture pairs)
+## The scheme
 
-We have three encrypted fixtures, all created with password `"password"`,
-all image_type=`0x00` (file-aware mode), one Fast-LZ and two zlib-high:
+Ghost encrypts only the **bodies** of the inner record stream. The container
+header, the 10-byte record headers, and inter-record bytes stay in clear text —
+which is why an encrypted image's record skeleton is byte-identical to its
+unencrypted twin. Each body is enciphered **independently**, with the cipher
+state reset to the password seed at the start of every body.
 
-- `11.5/GH11-password/GH11PW.GHO` (single file, compression=None)
-- `11.5/gh11-pwd-split/gh11pwd.GHO` + 11 `.GHS` spans (compression=None)
-- `11.5/gh11-hicompression-with-password/hipwd.GHO` + 5 spans (compression=High)
+### 1. Password -> 16-bit seed (`sub_4dc860`)
 
-The hipwd set has an unencrypted twin (`11.5/GH11-hicompression/High.GHO`)
-with **identical record stream and identical body_lens** in the first
-three `0x0002` records. That gives us known plaintext / ciphertext pairs
-for reverse-engineering the cipher.
+```
+pw   = ascii_uppercase(password)[..11]    # case-insensitive, max 11 bytes
+crc  = 0
+for b in pw:
+    crc = ((crc << 8) ^ CRC32_FWD[((crc >> 24) ^ b) & 0xff]) & 0xffffffff
+seed = (crc ^ (crc >> 16)) & 0xffff
+```
 
-### Verified findings
+`CRC32_FWD` is the standard **forward** CRC-32 table (poly `0x04C11DB7`,
+MSB-first, init 0, no reflection, no final XOR). The password is uppercased and
+truncated to 11 bytes, so Ghost passwords are case-insensitive and only the
+first 11 characters matter. Example: `"password"` -> `"PASSWORD"` -> seed
+`0x9BE1`.
 
-1. **The record skeleton is plaintext.** `GhoRecordIter` walks an
-   encrypted file cleanly — record headers carry the right magic
-   (`0x012F18D8`), body_lens point past valid record boundaries. Only
-   the data **inside** each `0x0002` (cluster-data) body is encrypted.
-2. **The 16-byte password verifier at container offset 0x0C is
-   identical across all three "password" fixtures.** It is purely a
-   function of the password — usable as a fast wrong-password check
-   once the cipher is known, but its plaintext content has not been
-   reverse-engineered (decrypting it with the CRC-16/ARC model from
-   `nyarime/gho/crypto.go` produces gibberish).
-3. **The cipher is reset per data block, not per partition.** Encrypted
-   `0x0002` bodies all start with the same two ciphertext bytes
-   `0x99 0xa4`, which against the known plaintext `0x78 0x01` (zlib
-   header) gives the same first two keystream bytes `0xE1 0xA5`
-   regardless of block index in the file. This is the opposite of the
-   `nyarime/gho/reader.go` model, which keeps cipher state across all
-   blocks within a partition.
-4. **The cipher state advances by plaintext, not by ciphertext or by
-   stepping a counter.** Block 0 and block 1 share their first two
-   plaintext bytes (`0x78 0x01`) and produce identical keystream bytes
-   `0xE1 0xA5 0xDB`; they diverge at byte 3 because plaintext byte 2
-   differs (`0xed` vs `0x9d`). Matches the "Decrypt: state = update(state,
-   plain)" shape from the Go reference.
-5. **The exact cipher polynomial/init/byte-ordering is NOT
-   CRC-16/ARC.** Exhaustive brute force over 336 combinations
-   (polynomials `{0xA001, 0x8408, 0xC002, 0x8005, 0x1021, 0x9C0B,
-   0xC867}` × init `{0xFFFF, 0x0000, 0x8408, 0xA001, 0xFFFE, 0x1D0F}`
-   × LSB/MSB shift × low-byte/high-byte key × single/double password
-   processing) — **zero matches** for the target keystream
-   `0xE1 0xA5 ...` from password `"password"`. The cipher must use
-   something other than a standard CRC-16 table-driven update.
+### 2. Verifier / wrong-password check (`SetPassword @ 0x4d14d0`)
 
-### What we ruled out
+When `password_flag` (header offset `0x0B`) is `1`, a 16-byte verifier follows
+the prefix at offset `0x0C`. Decrypting it with the seed yields
+`b"BinaryResearch\0"` in its first 15 bytes for the correct password (byte 16 is
+framing). This is the fast wrong-password check (`gho_verify_seed`).
 
-- CRC-16/ARC LSB shift with init 0xFFFF (the `nyarime/gho/crypto.go`
-  model) — gives keystream starting `0x37 0x03 ...`, not `0xE1 0xA5
-  ...`.
-- All standard CRC-16 polynomial / init / byte-order combinations.
-- Per-partition cipher state (decrypting block 1 with continued state
-  from block 0 gives garbage; per-block reset gives a consistent
-  first-two-bytes pattern).
+### 3. Body cipher (`decrypt @ 0x4dc920`, `encrypt @ 0x4dc8d0`)
 
-## Why this matters
+A self-synchronising CRC-16-CCITT keystream cipher. The 256-entry 16-bit table
+is built at runtime (`sub_4dc7d0` -> `sub_4dc710`) as a CRC-16-CCITT
+(poly `0x1021`) **pre-seeded with `0x07A2`** and the index interleaved as it
+shifts — a non-standard table.
 
-The `nyarime` Go library's `CRC16Cipher` looks like clean-room
-reverse-engineering, but it was almost certainly written aspirationally
-to match the **writer** (which round-trips against itself) without ever
-being tested against real Symantec-encrypted output. Don't trust it.
+```
+state = seed                       # reset at the start of EACH body
+for each ciphertext byte c:
+    plain = c ^ (state & 0xff)
+    state = ((state & 0xff) << 8) ^ TABLE16[(state >> 8) ^ c]
+```
 
-The Ghost header cipher (`fixupPRNG` in `nyarime/gho/fixup.go`) is a
-completely separate algorithm — a 32-bit state advanced by
-`state += ROR(state, 7)`, used only on header bytes 2..n. Not the same
-as the data cipher.
+The feedback uses the ciphertext byte, so encrypt and decrypt share the same
+state update.
 
-## Recommended next steps for a future "password" slice
+## Why the earlier attempt failed
 
-1. **Reverse-engineer the verifier format first.** The 16-byte verifier
-   is deterministic given the password; figure out what plaintext it
-   encodes (likely a constant magic, or the password itself padded).
-   Once known, the verifier lets us test cipher candidates without
-   touching multi-MB block streams.
-2. **Find the real cipher.** Reasonable starting hypotheses now that
-   CRC-16/ARC is out:
-   - A custom CRC variant with non-standard table (probe by computing
-     forward differences in the keystream from short plaintexts).
-   - A multiplicative LCG seeded by the password (state =
-     state * mult + add).
-   - The CRC-32 polynomial truncated to 16 bits.
-   - Symantec's `ghofixup` PRNG (`state += ROR(state, 7)`) repurposed
-     for data blocks but with password-derived seed.
-3. **Disassemble the Symantec encryption routine.** `ghost.exe` from
-   Ghost 11.5 (available in archive.org collections) carries the
-   actual implementation. The `ghofixup.exe` PDB path quoted in
-   `nyarime/gho/fixup.go`
-   (`c:\depot\ghost\gsstrunk\ghost\utilityapps\ghofixup\`) suggests
-   the main Ghost binary has comparable symbol coverage.
-4. **End-to-end testing is blocked on file-aware reconstruction**
-   regardless. All three encrypted fixtures are file-aware mode, so
-   even with a correct cipher we cannot produce a mountable image
-   until the file-aware filesystem rebuilder lands. A SECTOR-mode
-   encrypted fixture would unblock end-to-end testing — created with
-   `ghost.exe -ia -pwd=password` (need a Ghost 11.5 environment).
+The 2026-05-26 attempt assumed CRC-16/**ARC** (poly `0xA001`) and brute-forced
+only 6 fixed init constants. The real cipher is CRC-16-**CCITT** (poly `0x1021`)
+with a **pre-seeded register (`0x07A2`)** producing a non-standard table, and the
+register is seeded from a **16-bit password-derived value** (`0x9BE1` for
+`password`) that fixed-init brute force never covered. The `nyarime/gho` Go
+reference `CRC16Cipher` is unrelated to Symantec's real output.
+
+## Validation
+
+- **All 52,696 data-block bodies** (1.13 GB) of `11.5/GH11-password/GH11PW.GHO`
+  decrypt bit-exact to the unencrypted twin `11.5/GH11/fulldisk.GHS`.
+- Every record-body type (`0x0002 0x0004 0x0017 0x0102 0x0103 0x0104 0x0117
+  0x0118`) decrypts correctly with per-body reset.
+- The verifier decrypts to `BinaryResearch\0` with seed `0x9BE1`.
+- High-compression (zlib, split) and raw-split fixtures decrypt bit-exact too.
+- Unit tests in `gho_crypto.rs` pin the table, seed, verifier, and round-trip.
+
+## Implementation notes
+
+- Decryption is transparent: `SpanReader` (the single reader every GHO decode
+  path uses) holds an optional body-range map + seed and decrypts body bytes on
+  read while passing headers through. The map is built from a header-only scan
+  (`collect_gho_body_ranges`) before decryption is switched on, so the complex
+  file-aware / NTFS random-access read paths need no changes.
+- **SECTOR-mode encrypted images are not yet supported** — all available
+  encrypted fixtures are file-aware (`image_type=0x00`), so the SECTOR-mode body
+  layout under encryption is untested. `open_with_password` errors clearly if the
+  record stream can't be mapped.

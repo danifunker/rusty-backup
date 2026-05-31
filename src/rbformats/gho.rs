@@ -59,6 +59,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{anyhow, bail, Context, Result};
 
+use super::gho_crypto::{gho_decrypt_body, gho_seed_from_password, gho_verify_seed};
+
 /// Length of the fixed container header (excluding the optional password
 /// verifier and description string).
 pub const GHO_HEADER_PREFIX_LEN: usize = 12;
@@ -673,6 +675,46 @@ impl DataLen for File {
 /// first file is exposed verbatim; every file after that has its first
 /// 512 bytes (the container header) skipped, so the SECTOR-mode decoder
 /// sees one continuous data stream.
+/// Transparent body-decryption layer for password-protected GHOs.
+///
+/// The inner record stream is `[header][body][header][body]...`; only the
+/// bodies are encrypted (each independently, with the cipher reset to `seed`).
+/// This holds the sorted body ranges so [`SpanReader`] can decrypt body bytes
+/// on the fly while passing record headers and container metadata through
+/// unchanged — making decryption invisible to every decode path.
+struct GhoBodyDecryptor {
+    seed: u16,
+    /// Record body ranges `(body_start, body_len)`, sorted by `body_start`.
+    bodies: Vec<(u64, u32)>,
+    /// Single-body decrypt cache (reads are largely sequential within a body).
+    cache_start: u64,
+    cache: Vec<u8>,
+    cache_valid: bool,
+}
+
+impl GhoBodyDecryptor {
+    /// Return the body range `(start, len)` containing `pos`, if any.
+    fn body_at(&self, pos: u64) -> Option<(u64, u32)> {
+        let idx = match self.bodies.binary_search_by(|&(s, _)| s.cmp(&pos)) {
+            Ok(i) => i,
+            Err(0) => return None,
+            Err(i) => i - 1,
+        };
+        let (s, l) = self.bodies[idx];
+        if pos >= s && pos < s + l as u64 {
+            Some((s, l))
+        } else {
+            None
+        }
+    }
+
+    /// Smallest body start strictly greater than `pos` (passthrough limit).
+    fn next_body_start(&self, pos: u64) -> Option<u64> {
+        let idx = self.bodies.partition_point(|&(s, _)| s <= pos);
+        self.bodies.get(idx).map(|&(s, _)| s)
+    }
+}
+
 pub struct SpanReader {
     files: Vec<File>,
     /// Cumulative virtual offsets — `offsets[i]` is the byte position of
@@ -681,6 +723,8 @@ pub struct SpanReader {
     offsets: Vec<u64>,
     pos: u64,
     total: u64,
+    /// `Some` for password-protected images — decrypts record bodies on read.
+    crypt: Option<GhoBodyDecryptor>,
 }
 
 impl SpanReader {
@@ -706,7 +750,108 @@ impl SpanReader {
             offsets,
             pos: 0,
             total: cum,
+            crypt: None,
         })
+    }
+
+    /// Enable transparent body decryption for a password-protected image.
+    ///
+    /// `bodies` is the full list of `(body_start, body_len)` record-body
+    /// ranges (sorted by `body_start`); `seed` is the password-derived cipher
+    /// seed. After this call, reads of body bytes return plaintext while record
+    /// headers and container bytes pass through unchanged.
+    pub fn enable_decryption(&mut self, seed: u16, mut bodies: Vec<(u64, u32)>) {
+        bodies.sort_unstable_by_key(|&(s, _)| s);
+        self.crypt = Some(GhoBodyDecryptor {
+            seed,
+            bodies,
+            cache_start: u64::MAX,
+            cache: Vec::new(),
+            cache_valid: false,
+        });
+    }
+
+    /// Map a virtual offset to `(file_index, physical_offset, remaining_in_file)`.
+    fn map(&self, virt: u64) -> Option<(usize, u64, u64)> {
+        if virt >= self.total {
+            return None;
+        }
+        let mut idx = 0;
+        for i in 0..self.files.len() {
+            if virt < self.offsets[i + 1] {
+                idx = i;
+                break;
+            }
+            idx = i + 1;
+        }
+        if idx >= self.files.len() {
+            return None;
+        }
+        let virt_in_file = virt - self.offsets[idx];
+        let physical = if idx == 0 {
+            virt_in_file
+        } else {
+            GHO_SECTOR_SIZE + virt_in_file
+        };
+        let remaining = self.offsets[idx + 1] - virt;
+        Some((idx, physical, remaining))
+    }
+
+    /// Read raw (undecrypted) bytes at the current `pos`, advancing it.
+    /// Limited to a single span file per call (callers loop / partial-read).
+    fn read_raw_advancing(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let (idx, physical, remaining) = match self.map(self.pos) {
+            Some(m) => m,
+            None => return Ok(0),
+        };
+        let to_read = (buf.len() as u64).min(remaining) as usize;
+        self.files[idx].seek(SeekFrom::Start(physical))?;
+        let n = self.files[idx].read(&mut buf[..to_read])?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+
+    /// Read exactly `out.len()` raw bytes starting at virtual `off`, without
+    /// touching `self.pos`. Crosses span boundaries as needed.
+    fn read_exact_raw_at(&mut self, off: u64, out: &mut [u8]) -> std::io::Result<()> {
+        let mut done = 0usize;
+        let mut cur = off;
+        while done < out.len() {
+            let (idx, physical, remaining) = self.map(cur).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "GHO body read past EOF")
+            })?;
+            let want = ((out.len() - done) as u64).min(remaining) as usize;
+            self.files[idx].seek(SeekFrom::Start(physical))?;
+            let n = self.files[idx].read(&mut out[done..done + want])?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "GHO body read hit EOF",
+                ));
+            }
+            done += n;
+            cur += n as u64;
+        }
+        Ok(())
+    }
+
+    /// Ensure the decrypted body starting at `bstart` (length `blen`) is in
+    /// the decryptor cache.
+    fn ensure_body_cached(&mut self, bstart: u64, blen: u32) -> std::io::Result<()> {
+        if let Some(c) = &self.crypt {
+            if c.cache_valid && c.cache_start == bstart {
+                return Ok(());
+            }
+        }
+        let mut tmp = vec![0u8; blen as usize];
+        self.read_exact_raw_at(bstart, &mut tmp)?;
+        let seed = self.crypt.as_ref().expect("crypt set").seed;
+        gho_decrypt_body(&mut tmp, seed);
+        let c = self.crypt.as_mut().expect("crypt set");
+        c.cache = tmp;
+        c.cache_start = bstart;
+        c.cache_valid = true;
+        Ok(())
     }
 }
 
@@ -721,30 +866,41 @@ impl Read for SpanReader {
         if self.pos >= self.total || buf.is_empty() {
             return Ok(0);
         }
-        // Find the file containing self.pos.
-        let mut idx = 0;
-        for i in 0..self.files.len() {
-            if self.pos < self.offsets[i + 1] {
-                idx = i;
-                break;
-            }
-            idx = i + 1;
+        if self.crypt.is_none() {
+            return self.read_raw_advancing(buf);
         }
-        if idx >= self.files.len() {
-            return Ok(0);
-        }
-        let virt_in_file = self.pos - self.offsets[idx];
-        let physical_in_file = if idx == 0 {
-            virt_in_file
-        } else {
-            GHO_SECTOR_SIZE + virt_in_file
+
+        let pos = self.pos;
+        let (body, next_start) = {
+            let c = self.crypt.as_ref().expect("crypt set");
+            (c.body_at(pos), c.next_body_start(pos))
         };
-        let remaining_in_file = self.offsets[idx + 1] - self.pos;
-        let to_read = (buf.len() as u64).min(remaining_in_file) as usize;
-        self.files[idx].seek(SeekFrom::Start(physical_in_file))?;
-        let n = self.files[idx].read(&mut buf[..to_read])?;
-        self.pos += n as u64;
-        Ok(n)
+
+        match body {
+            Some((bstart, blen)) => {
+                // Encrypted body byte: serve from the decrypted cache.
+                self.ensure_body_cached(bstart, blen)?;
+                let c = self.crypt.as_ref().expect("crypt set");
+                let within = (pos - bstart) as usize;
+                let avail = (blen as usize - within).min(buf.len());
+                buf[..avail].copy_from_slice(&c.cache[within..within + avail]);
+                self.pos += avail as u64;
+                Ok(avail)
+            }
+            None => {
+                // Plaintext byte (record header / container): pass through,
+                // but never read past the start of the next encrypted body.
+                let mut limit = buf.len() as u64;
+                if let Some(ns) = next_start {
+                    limit = limit.min(ns.saturating_sub(pos));
+                }
+                let limit = limit.min(self.total - pos) as usize;
+                if limit == 0 {
+                    return Ok(0);
+                }
+                self.read_raw_advancing(&mut buf[..limit])
+            }
+        }
     }
 }
 
@@ -1055,11 +1211,20 @@ enum GhoReaderMode {
 }
 
 impl GhoReader {
-    /// Open a SECTOR-mode GHO (single file or span set) for streaming
-    /// reads. Errors on file-aware mode, password-protected, or unknown
-    /// compression byte — these route to the legacy decode-to-temp path
-    /// instead.
+    /// Open a GHO (single file or span set) for streaming reads, without a
+    /// password. Equivalent to [`GhoReader::open_with_password`] with `None`.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_password(path, None)
+    }
+
+    /// Open a GHO (single file or span set) for streaming reads, optionally
+    /// supplying a password for encrypted images.
+    ///
+    /// For password-protected images the seed is derived from `password`,
+    /// validated against the container verifier, and transparent body
+    /// decryption is enabled on the underlying reader (see `gho_crypto`).
+    /// Returns an error if the password is missing or incorrect.
+    pub fn open_with_password(path: &Path, password: Option<&[u8]>) -> Result<Self> {
         let span_set = discover_gho_span_set(path)
             .with_context(|| format!("discovering span set for {}", path.display()))?;
 
@@ -1096,15 +1261,57 @@ impl GhoReader {
                 header.container_version
             );
         }
-        if header.password_protected {
-            bail!(
-                "GHO {} is password-protected; GhoReader cannot decrypt (see docs/gho_password.md)",
-                path.display()
-            );
-        }
+        // Derive + verify the password seed up front so a wrong/missing
+        // password fails before we touch the data stream.
+        let password_seed: Option<u16> = if header.password_protected {
+            let pw = password.ok_or_else(|| {
+                anyhow!(
+                    "GHO {} is password-protected; a password is required to open it",
+                    path.display()
+                )
+            })?;
+            let seed = gho_seed_from_password(pw);
+            match &header.password_verifier {
+                Some(v) if gho_verify_seed(v, seed) => Some(seed),
+                Some(_) => bail!(
+                    "GHO {}: incorrect password (verifier mismatch)",
+                    path.display()
+                ),
+                None => bail!(
+                    "GHO {} is flagged password-protected but carries no verifier",
+                    path.display()
+                ),
+            }
+        } else {
+            None
+        };
+
         let mut inner = SpanReader::open(&span_set)
             .with_context(|| format!("opening span set for {}", path.display()))?;
         let file_size = inner.total_len();
+
+        // Enable transparent record-body decryption before any decode path
+        // reads the stream. The record headers are plaintext, so we can walk
+        // them on the raw reader to map every body range, then switch the
+        // reader into decrypting mode.
+        if let Some(seed) = password_seed {
+            let header_end = (GHO_HEADER_PREFIX_LEN + GHO_PASSWORD_VERIFIER_LEN) as u64;
+            let bodies =
+                collect_gho_body_ranges(&mut inner, header_end, file_size).with_context(|| {
+                    format!(
+                        "mapping encrypted record bodies for {} (SECTOR-mode encrypted GHOs are \
+                         not yet supported)",
+                        path.display()
+                    )
+                })?;
+            let body_count = bodies.len();
+            inner.enable_decryption(seed, bodies);
+            log::info!(
+                "GHO {}: password accepted, decrypting {} record bodies",
+                path.display(),
+                body_count
+            );
+        }
 
         // ---- File-aware dispatch ----
         if matches!(header.image_type, GhoImageType::FileAware) {
@@ -2324,6 +2531,45 @@ pub fn find_inner_stream_start<R: Read + Seek>(reader: &mut R, header_end: u64) 
         "GHO inner-stream magic not found within {} bytes of container header",
         GHO_INNER_STREAM_SCAN_LIMIT
     ))
+}
+
+/// Walk the inner record stream (reading only the plaintext 10-byte headers)
+/// and collect every record's body range `(body_start, body_len)`.
+///
+/// Used to build the decryption map for password-protected images: each body
+/// is independently encrypted, so we need the exact byte ranges to decrypt.
+/// Records with a zero-length body are skipped (nothing to decrypt).
+fn collect_gho_body_ranges<R: Read + Seek>(
+    reader: &mut R,
+    header_end: u64,
+    file_size: u64,
+) -> Result<Vec<(u64, u32)>> {
+    // Mirror `parse_gho_image`'s walk so the body map covers exactly the
+    // records the real (decrypted) decode pass will read: bound by file size,
+    // resync on a magic mismatch, stop at a clean end.
+    let mut offset = find_inner_stream_start(&mut *reader, header_end)
+        .context("locating inner record stream for encrypted GHO")?;
+    let mut bodies = Vec::new();
+    while offset + GHO_RECORD_HEADER_LEN as u64 <= file_size {
+        reader.seek(SeekFrom::Start(offset))?;
+        let rec = match GhoRecordHeader::read_from(reader) {
+            Ok(Some(r)) => r,
+            Ok(None) => break,
+            Err(_) => match find_inner_stream_start(&mut *reader, offset) {
+                Ok(o) if o > offset && o < file_size => {
+                    offset = o;
+                    continue;
+                }
+                _ => break,
+            },
+        };
+        let body_start = offset + GHO_RECORD_HEADER_LEN as u64;
+        if rec.body_len > 0 {
+            bodies.push((body_start, rec.body_len as u32));
+        }
+        offset = body_start + rec.body_len as u64;
+    }
+    Ok(bodies)
 }
 
 /// Iterator that walks the records in a Ghost backup's inner stream.
@@ -8888,5 +9134,167 @@ mod tests {
         let path = write_to_temp(&buf);
         let err = GhoReader::open(&path).err().expect("must error");
         assert!(format!("{err:#}").to_lowercase().contains("password"));
+    }
+
+    #[test]
+    fn gho_reader_requires_password_when_protected() {
+        let buf = build_header(0x00, 0x00, 0x01, None);
+        let path = write_to_temp(&buf);
+        let err = GhoReader::open_with_password(&path, None)
+            .err()
+            .expect("must error");
+        let m = format!("{err:#}").to_lowercase();
+        assert!(m.contains("password is required"), "got: {m}");
+    }
+
+    #[test]
+    fn gho_reader_rejects_wrong_password() {
+        // build_header writes a 0xAB*16 verifier, which no real password
+        // decrypts to "BinaryResearch\0", so any password is "wrong".
+        let buf = build_header(0x00, 0x00, 0x01, None);
+        let path = write_to_temp(&buf);
+        let err = GhoReader::open_with_password(&path, Some(b"whatever"))
+            .err()
+            .expect("must error");
+        let m = format!("{err:#}").to_lowercase();
+        assert!(m.contains("incorrect password"), "got: {m}");
+    }
+
+    /// Definitive decryption check against real fixtures: every data-block
+    /// body of an encrypted GHO must decrypt (through the real `SpanReader`
+    /// path) bit-exact to the same body in its unencrypted twin. Ignored by
+    /// default — set `RB_GHO_PLAIN` + `RB_GHO_CIPHER` (and optionally
+    /// `RB_GHO_PASSWORD`, default "password") to run it.
+    #[test]
+    #[ignore = "needs external GHO twin fixtures via RB_GHO_PLAIN / RB_GHO_CIPHER"]
+    fn decrypts_real_fixture_data_blocks_bit_exact() {
+        let (plain, cipher) = match (
+            std::env::var("RB_GHO_PLAIN"),
+            std::env::var("RB_GHO_CIPHER"),
+        ) {
+            (Ok(p), Ok(c)) => (std::path::PathBuf::from(p), std::path::PathBuf::from(c)),
+            _ => {
+                eprintln!("skip: set RB_GHO_PLAIN and RB_GHO_CIPHER");
+                return;
+            }
+        };
+        let pw = std::env::var("RB_GHO_PASSWORD").unwrap_or_else(|_| "password".into());
+
+        // Cipher reader with decryption enabled (mirrors open_with_password).
+        let mut csr = SpanReader::open(std::slice::from_ref(&cipher)).unwrap();
+        let file_size = csr.total_len();
+        let seed = gho_seed_from_password(pw.as_bytes());
+        let header_end = (GHO_HEADER_PREFIX_LEN + GHO_PASSWORD_VERIFIER_LEN) as u64;
+        let bodies = collect_gho_body_ranges(&mut csr, header_end, file_size).unwrap();
+        csr.enable_decryption(seed, bodies);
+
+        // Two plain readers: one to walk records, one to read bodies.
+        let mut psr = SpanReader::open(std::slice::from_ref(&plain)).unwrap();
+        let mut walk = SpanReader::open(std::slice::from_ref(&plain)).unwrap();
+        let pstart = find_inner_stream_start(&mut walk, GHO_HEADER_PREFIX_LEN as u64).unwrap();
+        let mut iter = GhoRecordIter::new(&mut walk, pstart).unwrap();
+
+        let mut checked = 0u64;
+        loop {
+            let off = iter.current_offset();
+            match iter.next() {
+                Some(Ok(h)) => {
+                    if matches!(h.type_code, 0x0002 | 0x0102) && h.body_len > 0 {
+                        let bs = off + GHO_RECORD_HEADER_LEN as u64;
+                        let len = h.body_len as usize;
+                        let mut pb = vec![0u8; len];
+                        psr.seek(SeekFrom::Start(bs)).unwrap();
+                        psr.read_exact(&mut pb).unwrap();
+                        let mut cb = vec![0u8; len];
+                        csr.seek(SeekFrom::Start(bs)).unwrap();
+                        csr.read_exact(&mut cb).unwrap();
+                        checked += 1;
+                        assert_eq!(pb, cb, "data block at {bs} decrypted incorrectly");
+                    }
+                }
+                Some(Err(_)) | None => break,
+            }
+        }
+        eprintln!("checked {checked} data blocks, all bit-exact");
+        assert!(checked > 0, "no data blocks walked");
+    }
+
+    /// Exercise the `SpanReader` body-decryption layer directly: a synthetic
+    /// stream of `[container header][record header][encrypted body]...` must
+    /// read back with bodies decrypted and headers untouched, under both
+    /// sequential and random access.
+    #[test]
+    fn span_reader_decrypts_bodies_and_passes_headers_through() {
+        use crate::rbformats::gho_crypto::gho_encrypt_body;
+        use std::io::Read as _;
+
+        let seed = gho_seed_from_password(b"secret");
+        let plain1: Vec<u8> = b"The quick brown fox jumps over the lazy dog 0123456789".to_vec();
+        let plain2: Vec<u8> = (0..500u32)
+            .map(|i| (i.wrapping_mul(37) ^ 0xC3) as u8)
+            .collect();
+
+        let rec_hdr = |typ: u16, body_len: u16| -> [u8; 10] {
+            let mut h = [0u8; 10];
+            h[0..2].copy_from_slice(&typ.to_le_bytes());
+            h[4..8].copy_from_slice(&GHO_RECORD_MAGIC.to_le_bytes());
+            h[8..10].copy_from_slice(&body_len.to_le_bytes());
+            h
+        };
+
+        // On-disk stream: 28-byte container header, then two records.
+        let mut disk = vec![0u8; 28];
+        disk[0] = 0xFE;
+        disk[1] = 0xEF;
+
+        disk.extend_from_slice(&rec_hdr(0x0002, plain1.len() as u16));
+        let body1_off = disk.len() as u64;
+        let mut enc1 = plain1.clone();
+        gho_encrypt_body(&mut enc1, seed);
+        disk.extend_from_slice(&enc1);
+
+        disk.extend_from_slice(&rec_hdr(0x0002, plain2.len() as u16));
+        let body2_off = disk.len() as u64;
+        let mut enc2 = plain2.clone();
+        gho_encrypt_body(&mut enc2, seed);
+        disk.extend_from_slice(&enc2);
+
+        // Expected decrypted view: headers identical, bodies plaintext.
+        let mut expected = disk.clone();
+        expected[body1_off as usize..body1_off as usize + plain1.len()].copy_from_slice(&plain1);
+        expected[body2_off as usize..body2_off as usize + plain2.len()].copy_from_slice(&plain2);
+
+        let path = write_to_temp(&disk);
+        let mut sr = SpanReader::open(std::slice::from_ref(&path)).unwrap();
+        sr.enable_decryption(
+            seed,
+            vec![
+                (body1_off, plain1.len() as u32),
+                (body2_off, plain2.len() as u32),
+            ],
+        );
+
+        // Sequential read of the whole stream.
+        let mut got = Vec::new();
+        sr.read_to_end(&mut got).unwrap();
+        assert_eq!(got, expected, "sequential decrypt mismatch");
+
+        // Random access into the middle of body2 (cache fill).
+        sr.seek(SeekFrom::Start(body2_off + 123)).unwrap();
+        let mut b = [0u8; 32];
+        sr.read_exact(&mut b).unwrap();
+        assert_eq!(&b, &plain2[123..155]);
+
+        // Random access back into body1 (cache eviction + re-decrypt).
+        sr.seek(SeekFrom::Start(body1_off + 4)).unwrap();
+        let mut b1 = [0u8; 10];
+        sr.read_exact(&mut b1).unwrap();
+        assert_eq!(&b1, &plain1[4..14]);
+
+        // Header bytes pass through unchanged.
+        sr.seek(SeekFrom::Start(0)).unwrap();
+        let mut hdr = [0u8; 2];
+        sr.read_exact(&mut hdr).unwrap();
+        assert_eq!(&hdr, &[0xFE, 0xEF]);
     }
 }
