@@ -8377,8 +8377,13 @@ mod tests {
     const REPO_GHO_FIXTURES: &[(&str, u8, u8, u8)] = &[
         // 75MULTIU.GHO: Ghost 7.5, compression=none, fulldisk, no password.
         ("test_gho_75_none.gho.zst", 0x00, 0x00, 0x00),
-        // 11comp.GHO: Ghost 11.x, compression=high, fulldisk, no password.
+        // 11comp.GHO: Ghost 11.x, compression=high, multi-partition file-aware,
+        // no password. Plaintext twin of test_gho_11_high_pw.gho.zst below.
         ("test_gho_11_high.gho.zst", 0x03, 0x00, 0x00),
+        // 4.GHO: Ghost 11.5, high, multi-partition file-aware, PASSWORD-
+        // protected (password "password"). Encrypted twin of the fixture
+        // above — same record skeleton, bodies enciphered.
+        ("test_gho_11_high_pw.gho.zst", 0x03, 0x00, 0x01),
     ];
 
     fn load_zst_fixture(name: &str) -> Vec<u8> {
@@ -9371,6 +9376,68 @@ mod tests {
         }
         eprintln!("checked {checked} data blocks, all bit-exact");
         assert!(checked > 0, "no data blocks walked");
+    }
+
+    /// Checked-in version of the bit-exact decryption guard: the encrypted
+    /// multi-partition fixture `test_gho_11_high_pw.gho.zst` must decrypt (via
+    /// the real `SpanReader` body-decryption path, with the seed derived from
+    /// "password") to bodies bit-identical to its unencrypted twin
+    /// `test_gho_11_high.gho.zst`. Runs on every clone / in CI.
+    #[test]
+    fn checked_in_multipart_fixture_decrypts_bit_exact() {
+        let plain = write_to_temp(&load_zst_fixture("test_gho_11_high.gho.zst"));
+        let cipher = write_to_temp(&load_zst_fixture("test_gho_11_high_pw.gho.zst"));
+
+        // Verify the seed against the cipher fixture's header verifier first.
+        let header = GhoContainerHeader::parse(&mut File::open(&cipher).unwrap()).unwrap();
+        assert!(
+            header.password_protected,
+            "cipher fixture must be encrypted"
+        );
+        let seed = gho_seed_from_password(b"password");
+        assert!(
+            gho_verify_seed(header.password_verifier.as_ref().unwrap(), seed),
+            "password verifier mismatch"
+        );
+
+        // Cipher reader with decryption enabled (mirrors open_with_password).
+        let mut csr = SpanReader::open(std::slice::from_ref(&cipher)).unwrap();
+        let file_size = csr.total_len();
+        let header_end = (GHO_HEADER_PREFIX_LEN + GHO_PASSWORD_VERIFIER_LEN) as u64;
+        let bodies = collect_gho_body_ranges(&mut csr, header_end, file_size).unwrap();
+        csr.enable_decryption(seed, bodies);
+
+        // Walk the plaintext record stream; compare every data-block body.
+        let mut psr = SpanReader::open(std::slice::from_ref(&plain)).unwrap();
+        let mut walk = SpanReader::open(std::slice::from_ref(&plain)).unwrap();
+        let pstart = find_inner_stream_start(&mut walk, GHO_HEADER_PREFIX_LEN as u64).unwrap();
+        let mut iter = GhoRecordIter::new(&mut walk, pstart).unwrap();
+
+        let mut checked = 0u64;
+        loop {
+            let off = iter.current_offset();
+            match iter.next() {
+                Some(Ok(h)) => {
+                    if matches!(h.type_code, 0x0002 | 0x0102) && h.body_len > 0 {
+                        let bs = off + GHO_RECORD_HEADER_LEN as u64;
+                        let len = h.body_len as usize;
+                        let mut pb = vec![0u8; len];
+                        psr.seek(SeekFrom::Start(bs)).unwrap();
+                        psr.read_exact(&mut pb).unwrap();
+                        let mut cb = vec![0u8; len];
+                        csr.seek(SeekFrom::Start(bs)).unwrap();
+                        csr.read_exact(&mut cb).unwrap();
+                        checked += 1;
+                        assert_eq!(pb, cb, "data block at {bs} decrypted incorrectly");
+                    }
+                }
+                Some(Err(_)) | None => break,
+            }
+        }
+        assert!(
+            checked >= 10,
+            "expected multiple multi-partition data blocks, walked {checked}"
+        );
     }
 
     /// Exercise the `SpanReader` body-decryption layer directly: a synthetic
