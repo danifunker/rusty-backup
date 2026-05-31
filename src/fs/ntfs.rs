@@ -15,6 +15,7 @@ const MFT_RECORD_ROOT: u64 = 5;
 const MFT_RECORD_BITMAP: u64 = 6;
 
 // Attribute type codes
+const ATTR_ATTRIBUTE_LIST: u32 = 0x20;
 const ATTR_VOLUME_NAME: u32 = 0x60;
 const ATTR_VOLUME_INFORMATION: u32 = 0x70;
 pub(crate) const ATTR_DATA: u32 = 0x80;
@@ -568,6 +569,91 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
         None
     }
 
+    /// Collect the complete unnamed `$DATA` for a file whose base record uses an
+    /// `$ATTRIBUTE_LIST` to spill attributes into extension records (the case
+    /// for heavily-fragmented files like large registry hives, whose runlist no
+    /// longer fits in one MFT record).
+    ///
+    /// Returns `Ok(None)` when the base record has no `$ATTRIBUTE_LIST` — the
+    /// caller then uses the base record's own `$DATA` as before. Otherwise walks
+    /// the attribute list, gathers every unnamed `$DATA` fragment (matched by its
+    /// `(holding-record, starting-VCN)`), reads each holding record, and
+    /// concatenates the fragments' data runs in VCN order. The runs each carry
+    /// absolute LCNs, so concatenation reconstructs the whole file. `real_size`
+    /// comes from the `starting_vcn == 0` fragment (the only one that records it).
+    fn collect_attrlist_data(
+        &mut self,
+        record_number: u64,
+    ) -> Result<Option<(Vec<DataRun>, u64)>, FilesystemError> {
+        let base = self.read_mft_record(record_number)?;
+        let base_attrs = parse_mft_attributes(&base, self.mft_record_size);
+
+        let mut attrlist: Option<Vec<u8>> = None;
+        for a in &base_attrs {
+            if a.attr_type == ATTR_ATTRIBUTE_LIST {
+                attrlist = Some(if a.resident {
+                    a.value.clone()
+                } else {
+                    self.read_attribute_data(a, None)?
+                });
+                break;
+            }
+        }
+        let Some(al) = attrlist else {
+            return Ok(None);
+        };
+
+        // Walk attribute-list entries; collect unnamed $DATA fragments as
+        // (holding mft record, starting VCN). Entry layout: type(4) len(2)
+        // name_len(1) name_off(1) start_vcn(8) base_ref(8) attr_id(2) [name].
+        let mut frags: Vec<(u64, u64)> = Vec::new();
+        let mut p = 0usize;
+        while p + 0x1A <= al.len() {
+            let atype = u32::from_le_bytes([al[p], al[p + 1], al[p + 2], al[p + 3]]);
+            let elen = u16::from_le_bytes([al[p + 4], al[p + 5]]) as usize;
+            if elen < 0x1A || p + elen > al.len() {
+                break;
+            }
+            let name_len = al[p + 6];
+            if atype == ATTR_DATA && name_len == 0 {
+                let svcn = u64::from_le_bytes(al[p + 8..p + 16].try_into().unwrap());
+                let mref = u64::from_le_bytes(al[p + 0x10..p + 0x18].try_into().unwrap())
+                    & 0xFFFF_FFFF_FFFF;
+                frags.push((mref, svcn));
+            }
+            p += elen;
+        }
+        if frags.is_empty() {
+            return Ok(None);
+        }
+        frags.sort_by_key(|&(_, svcn)| svcn);
+        frags.dedup();
+
+        let mut runs: Vec<DataRun> = Vec::new();
+        let mut real_size = 0u64;
+        for (mref, svcn) in &frags {
+            let rec = if *mref == record_number {
+                base.clone()
+            } else {
+                self.read_mft_record(*mref)?
+            };
+            let attrs = parse_mft_attributes(&rec, self.mft_record_size);
+            for a in &attrs {
+                if a.attr_type == ATTR_DATA && !a.resident && a.starting_vcn == *svcn {
+                    if *svcn == 0 {
+                        real_size = a.real_size;
+                    }
+                    runs.extend(a.data_runs.iter().cloned());
+                    break;
+                }
+            }
+        }
+        if runs.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some((runs, real_size)))
+    }
+
     /// Read attribute data (handles both resident and non-resident).
     fn read_attribute_data(
         &mut self,
@@ -1079,6 +1165,14 @@ impl<R: Read + Seek + Send> Filesystem for NtfsFilesystem<R> {
         let record = self.read_mft_record(record_number)?;
         let attrs = parse_mft_attributes(&record, self.mft_record_size);
 
+        // A non-resident $DATA in the base record is complete only when there's
+        // no $ATTRIBUTE_LIST spilling the rest into extension records. Prefer the
+        // attribute-list collection when present so fragmented files (large
+        // registry hives, etc.) read in full.
+        if let Some((runs, real_size)) = self.collect_attrlist_data(record_number)? {
+            return self.read_data_runs(&runs, real_size, Some(max_bytes as u64));
+        }
+
         for attr in &attrs {
             if attr.attr_type == ATTR_DATA {
                 return self.read_attribute_data(attr, Some(max_bytes as u64));
@@ -1101,6 +1195,16 @@ impl<R: Read + Seek + Send> Filesystem for NtfsFilesystem<R> {
         }
         let record = self.read_mft_record(entry.location)?;
         let attrs = parse_mft_attributes(&record, self.mft_record_size);
+        // Follow $ATTRIBUTE_LIST first (see read_file) so fragmented files whose
+        // runlist spilled into extension records stream in full.
+        if let Some((runs, real_size)) = self.collect_attrlist_data(entry.location)? {
+            let cap = if entry.size > 0 {
+                entry.size
+            } else {
+                real_size
+            };
+            return self.write_data_runs_to(&runs, real_size, writer, cap);
+        }
         for attr in &attrs {
             if attr.attr_type == ATTR_DATA {
                 return self.write_attribute_data_to(attr, writer, entry.size);
