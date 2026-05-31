@@ -110,6 +110,10 @@ reference `CRC16Cipher` is unrelated to Symantec's real output.
   NTFS volume — sector 0 / MFT / backup boot sector all check out, and files
   (e.g. `WINDOWS/twunk_32.exe`) extract as valid PEs through `rb-cli`.
 - Compressed SECTOR images decode through the existing block path with no
-  decryption. (A separate, pre-existing decode bug mis-splits a single-volume
-  superfloppy compressed-SECTOR image into "2 partitions"; it is unrelated to
-  encryption and tracked separately.)
+  decryption. `index_sector_blocks` now drops a trailing `0x0703` continuation
+  (a stream terminator with no blocks after it) instead of treating it as a
+  partition boundary — previously that synthesized a bogus empty second
+  partition and mis-detected a single-volume superfloppy as MBR. Verified: the
+  compressed twin (`sectpw.GHO`) browses as the same NTFS volume as the
+  uncompressed set, and `WINDOWS/twunk_32.exe` extracts byte-identical
+  (SHA-256) from both.

@@ -2465,6 +2465,13 @@ fn index_sector_blocks<R: Read + Seek>(
         output_offset += GHO_BLOCK_DECOMPRESSED_SIZE as u64;
         off += stored_len;
     }
+    // A `0x0703` that closes the stream (no blocks follow it) is a terminator,
+    // not a partition boundary. Ghost emits one at the end of a single-volume
+    // sector image; treating it as a boundary would synthesize a bogus empty
+    // second partition (and mis-detect a superfloppy as MBR). Drop any boundary
+    // at or past the final block. Real multi-partition boundaries sit *between*
+    // blocks (boundary < blocks.len()) and are preserved.
+    partition_boundaries.retain(|&b| b < blocks.len());
     Ok(SectorBlockIndex {
         blocks,
         partition_boundaries,
@@ -9506,5 +9513,65 @@ mod tests {
         let mut hdr = [0u8; 2];
         sr.read_exact(&mut hdr).unwrap();
         assert_eq!(&hdr, &[0xFE, 0xEF]);
+    }
+
+    /// A `0x0703` continuation that *closes* the block stream is a terminator,
+    /// not a partition boundary. Ghost emits one at the end of a single-volume
+    /// sector image; counting it would synthesize a bogus empty 2nd partition
+    /// and mis-detect a superfloppy as MBR. A `0x0703` *between* blocks is a
+    /// real boundary and must survive.
+    #[test]
+    fn index_sector_blocks_drops_trailing_continuation() {
+        use std::io::Cursor;
+
+        // A compressed block as the indexer sees it: [u16 stored_len][body].
+        // (Indexing only reads the length prefix; bodies aren't decompressed.)
+        let block = |n: u16| -> Vec<u8> {
+            let mut b = n.to_le_bytes().to_vec();
+            b.resize(n as usize, 0);
+            b
+        };
+        // A 0x0703 continuation record: type|marker|magic|body_len + body.
+        let cont = || -> Vec<u8> {
+            let mut h = GHO_REC_CONTINUATION.to_le_bytes().to_vec();
+            h.extend_from_slice(&[0u8, 0u8]); // marker
+            h.extend_from_slice(&GHO_RECORD_MAGIC.to_le_bytes());
+            h.extend_from_slice(&20u16.to_le_bytes()); // body_len
+            h.resize(h.len() + 20, 0);
+            h
+        };
+
+        // Single volume: 3 blocks then a trailing continuation terminator.
+        let mut s = Vec::new();
+        for _ in 0..3 {
+            s.extend(block(100));
+        }
+        s.extend(cont());
+        let mut cur = Cursor::new(s.clone());
+        let idx = index_sector_blocks(&mut cur, 0, s.len() as u64).unwrap();
+        assert_eq!(idx.blocks.len(), 3);
+        assert!(
+            idx.partition_boundaries.is_empty(),
+            "trailing 0x0703 must not be counted as a partition boundary"
+        );
+
+        // Two volumes: blocks | continuation | blocks | trailing continuation.
+        let mut s2 = Vec::new();
+        for _ in 0..2 {
+            s2.extend(block(100));
+        }
+        s2.extend(cont());
+        for _ in 0..2 {
+            s2.extend(block(100));
+        }
+        s2.extend(cont());
+        let mut cur2 = Cursor::new(s2.clone());
+        let idx2 = index_sector_blocks(&mut cur2, 0, s2.len() as u64).unwrap();
+        assert_eq!(idx2.blocks.len(), 4);
+        assert_eq!(
+            idx2.partition_boundaries,
+            vec![2],
+            "mid-stream boundary kept; trailing terminator dropped"
+        );
     }
 }
