@@ -87,9 +87,9 @@ fn validate_cells_overlapping(
     true
 }
 
-fn find_zero_gap(hive: &[u8], used_end: usize) -> Option<(usize, usize)> {
-    // First all-zero 4 KiB cluster, and the contiguous run of them.
-    let mut o = 4096;
+// First all-zero 4 KiB cluster run at or after `from`, as (offset, length).
+fn find_zero_gap(hive: &[u8], from: usize, used_end: usize) -> Option<(usize, usize)> {
+    let mut o = from.max(4096);
     while o + 4096 <= used_end {
         if hive[o..o + 512].iter().all(|&x| x == 0) {
             let start = o;
@@ -122,18 +122,17 @@ fn main() -> anyhow::Result<()> {
     let mut sentinels = r.debug_sentinel_runs_full(1 << 20); // up to 1 MiB per run
     println!("sentinel runs available: {}", sentinels.len());
 
-    // Fix every zero gap: for each, find the (unused) sentinel whose bytes make
-    // the registry cell chain tile the patched hbin(s) exactly.
+    // Fix every zero gap. Use a cursor so unrecoverable gaps (left as clean
+    // zeros) don't re-trigger the scan. We always write a BEST-EFFORT hive at
+    // the end so it can be `reg load`-tested — even one with residual holes.
     let mut gaps_fixed = 0;
     let mut gaps_unrecovered = 0;
-    while let Some((gap_off, gap_len)) = find_zero_gap(&hive, used) {
+    let mut cursor = 4096usize;
+    while let Some((gap_off, gap_len)) = find_zero_gap(&hive, cursor, used) {
         println!(
             "gap at offset {gap_off} length {gap_len} ({} clusters)",
             gap_len / 4096
         );
-        // Try every 4 KiB-aligned window of every unconsumed sentinel — the
-        // gap's clusters may sit at a non-leading offset within a multi-cluster
-        // run. Accept the window that makes the cell chain tile.
         let mut chosen: Option<(usize, usize)> = None; // (sentinel idx, window offset)
         'outer: for (i, (_cc, _seq, data)) in sentinels.iter().enumerate() {
             if data.is_empty() {
@@ -154,35 +153,32 @@ fn main() -> anyhow::Result<()> {
         match chosen {
             Some((i, w)) => {
                 println!("  -> filled from sentinel #{i} window@{w} (cell chain tiles exactly)");
-                // Consume the used window so it isn't reused for another gap.
                 sentinels[i].2[w..w + gap_len].fill(0);
                 gaps_fixed += 1;
+                // re-scan from the start in case fill exposed nothing new
+                cursor = 4096;
             }
             None => {
-                println!("  -> NO sentinel fits this gap (data not captured); zero-filled stays");
+                println!("  -> NO sentinel fits this gap; leaving it zero-filled");
                 gaps_unrecovered += 1;
-                // Mark this gap non-zero with a sentinel byte so the loop advances.
-                hive[gap_off] = 0xFF;
+                cursor = gap_off + gap_len; // skip past it
             }
         }
     }
 
-    // Restore any 0xFF advance-markers we wrote into unrecovered gaps.
-    // (Only matters if we keep the file; we don't write it when unrecovered.)
     println!("\ngaps fixed: {gaps_fixed}  gaps unrecovered: {gaps_unrecovered}");
-    if gaps_unrecovered == 0 {
-        // Final whole-hive validation: every hbin tiles with valid cells.
-        let whole_ok = validate_cells_overlapping(&hive, 4096, used, used);
-        let (hcount, hok) = validate_hbins(&hive, used);
-        println!("final: whole-hive cells_tile={whole_ok} hbin_chain_ok={hok} hbins={hcount}");
-        if whole_ok && hok {
-            std::fs::write(&out, &hive)?;
-            println!("RECOVERED: fully repaired hive written -> {out}");
-        } else {
-            println!("WARNING: gaps filled but whole-hive validation failed; not writing.");
-        }
+    let whole_ok = validate_cells_overlapping(&hive, 4096, used, used);
+    let (hcount, hok) = validate_hbins(&hive, used);
+    println!("final: whole-hive cells_tile={whole_ok} hbin_chain_ok={hok} hbins={hcount}");
+    std::fs::write(&out, &hive)?;
+    if gaps_unrecovered == 0 && whole_ok && hok {
+        println!("RECOVERED (complete): {out}");
     } else {
-        println!("Some gaps could not be recovered from sentinels — not writing a partial hive.");
+        println!(
+            "WROTE BEST-EFFORT hive ({gaps_unrecovered} hole(s) still zero) -> {out}\n\
+             Try `reg load` on it; if Windows accepts it the residual holes are in\n\
+             non-critical/unreferenced cells."
+        );
     }
     Ok(())
 }

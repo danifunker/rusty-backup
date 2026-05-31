@@ -6527,6 +6527,8 @@ fn fixup_ntfs_typed_misalignments(
     // This is what lets sentinel recovery place a hive's interior clusters.
     let mut file_data_frags: std::collections::HashMap<u64, Vec<(u64, u64, u64)>> =
         std::collections::HashMap::new();
+    // base record -> file name, for the residual-hole report logged at the end.
+    let mut rec_names: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
     // $MFTMirr (rec 1) $DATA — pinned to map onto $MFT's data, never matched to
     // a stream run (Ghost omits the mirror's content; it's a verbatim copy of
     // $MFT's first records). Captured here, re-added at reassembly.
@@ -6582,6 +6584,28 @@ fn fixup_ntfs_typed_misalignments(
         }
         let _ = apply_fixup(&mut rec_buf, vbr.bytes_per_sector);
         let attrs = parse_mft_attributes(&rec_buf, vbr.mft_record_size);
+        // Capture the file name from a base record's resident $FILE_NAME (0x30)
+        // for the residual-hole report. Value layout: parent ref (8) ... name
+        // length (1) @0x40, name (UTF-16LE) @0x42.
+        if base_ref == 0 {
+            for a in &attrs {
+                if a.attr_type == 0x30 && a.resident && a.value.len() >= 0x42 {
+                    let nl = a.value[0x40] as usize;
+                    if 0x42 + nl * 2 <= a.value.len() {
+                        let name: String = (0..nl)
+                            .filter_map(|i| {
+                                char::from_u32(u16::from_le_bytes([
+                                    a.value[0x42 + i * 2],
+                                    a.value[0x42 + i * 2 + 1],
+                                ]) as u32)
+                            })
+                            .collect();
+                        rec_names.entry(self_rec).or_insert(name);
+                    }
+                    break;
+                }
+            }
+        }
         for attr in &attrs {
             if attr.resident || attr.data_runs.is_empty() {
                 continue;
@@ -7190,6 +7214,70 @@ fn fixup_ntfs_typed_misalignments(
         index.runs.len()
     );
     index.runs = new_runs;
+
+    // Residual-hole report. After recovery, any file $DATA cluster the final
+    // run set still doesn't cover reads back as zeros in the exported image —
+    // genuinely-uncaptured data (Ghost-skipped transient files like
+    // hiberfil/pagefile, or runs whose headers the scan never found). These
+    // are harmless to mount but represent incomplete file content, so list the
+    // worst offenders in the log as a record of what couldn't be restored.
+    {
+        let mut covered: Vec<(u64, u64)> = index
+            .runs
+            .iter()
+            .filter(|r| r.lcn_start != u64::MAX)
+            .map(|r| (r.lcn_start, r.cluster_count))
+            .collect();
+        covered.sort_by_key(|r| r.0);
+        let is_covered = |lcn: u64| -> bool {
+            covered
+                .binary_search_by(|&(s, l)| {
+                    if lcn < s {
+                        std::cmp::Ordering::Greater
+                    } else if lcn >= s + l {
+                        std::cmp::Ordering::Less
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
+                .is_ok()
+        };
+        let mut holes: Vec<(u64, u64)> = Vec::new(); // (owning_rec, uncovered clusters)
+        let mut total_hole = 0u64;
+        for (rec, runs) in &file_runlist {
+            let mut miss = 0u64;
+            for &(lcn, cc) in runs {
+                for c in 0..cc {
+                    if !is_covered(lcn + c) {
+                        miss += 1;
+                    }
+                }
+            }
+            if miss > 0 {
+                holes.push((*rec, miss));
+                total_hole += miss;
+            }
+        }
+        if !holes.is_empty() {
+            holes.sort_by(|a, b| b.1.cmp(&a.1));
+            log::warn!(
+                "NTFS: {} file(s) have zero-filled $DATA holes (no captured data); \
+                 {} clusters total. These files are incomplete in the exported image:",
+                holes.len(),
+                total_hole
+            );
+            for (rec, miss) in holes.iter().take(40) {
+                let name = rec_names
+                    .get(rec)
+                    .map(|s| s.as_str())
+                    .unwrap_or("<name in extension record>");
+                log::warn!("  rec#{rec} ({miss} clusters zero-filled): {name}");
+            }
+            if holes.len() > 40 {
+                log::warn!("  ... and {} more file(s)", holes.len() - 40);
+            }
+        }
+    }
 }
 
 /// Recover `$Boot`'s first 16 sectors by content-matching the VBR.
