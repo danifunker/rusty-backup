@@ -175,3 +175,91 @@ A recurring sub-task: several formats are **container formats** (`.d88`, EDSK,
 sectors with per-track geometry. Build a shared "decode container -> flat LBA
 sectors" layer feeding the superfloppy path, reused across cores — budget that
 as one **M** infrastructure piece rather than re-solving it per filesystem.
+
+---
+
+## Prior art: TotalImage and existing Rust crates
+
+Survey done 2026-05-31 to answer "can we reuse existing code instead of
+writing every outstanding filesystem from scratch?"
+
+### TotalImage (`../TotalImage`)
+
+- **What it is:** an MIT-licensed disk-image editor written in **C# / .NET 10 /
+  WinForms**. MIT is compatible with our AGPL-3.0 (port with attribution), but
+  it is a **different language** — nothing links or imports; every reused line
+  must be **manually ported to Rust**.
+- **Filesystem overlap:** it implements FAT12/16/32, exFAT, NTFS, ISO9660, UDF,
+  and IMGFS (Windows CE). We already have everything except UDF and IMGFS,
+  neither of which is in MiSTer scope. **It contains none of the outstanding
+  MiSTer filesystems** (no CP/M, CBM DOS, ADFS, Human68k, QDOS, OS-9, etc.) —
+  it is a PC/DOS/Windows-centric tool.
+- **The one genuinely portable gem:** `FileSystems/FAT/FatFactory.cs` does
+  robust **BPB-less FAT detection** — infers geometry from image size + media
+  descriptor + dual-FAT validation (4 disambiguation rounds), tries the BPB at
+  alternate offsets (0x04 Zenith Z-100, 0x50 Apricot), and special-cases
+  Acorn-DOS-800K and Victor 9000. Paired with the geometry table in
+  `DiskGeometries/FloppyGeometry.cs`. Our `src/fs/fat.rs::open` currently
+  **requires a BPB at the standard offset with no fallback**, so this is a real
+  robustness gap-filler — but it only helps cores we **already support** (raw
+  Atari ST `.st`, MSX `.dsk`, odd PC floppies). It does nothing for the
+  outstanding non-FAT cores.
+- **IMZ note:** `Containers/ImzContainer.cs` confirms an *unencrypted* WinImage
+  IMZ is just a ZIP with a single entry + zip comment. It does **not** touch the
+  encrypted IMZ (MD5 + Rijndael) tracked in `imz_encryption.md`.
+- **Verdict:** not a "use most of their code" opportunity. Treat as a narrow
+  *reference*: port the BPB-less FAT detection + geometry table (with MIT
+  attribution) if/when we harden raw-floppy FAT handling. Everything else
+  either overlaps what we have or is out of scope.
+
+### Pure-Rust crates (the bigger lever)
+
+All three are MIT / MIT-OR-Apache, so they can be **vendored as dependencies**
+or ported with attribution under our AGPL.
+
+| Crate | License | Covers | MiSTer cores unlocked | Maturity |
+|---|---|---|---|---|
+| **a2kit** (`dfgordon/a2kit`) | MIT | CP/M 1/2/3, Apple DOS 3.3, ProDOS, Pascal FS, FAT; containers 2MG/DSK/DO/PO/IMD/IMG/NIB/TD0/WOZ | Apple-II DOS 3.3 (our gap) + **CP/M family: Amstrad, AmstradPCW, TatungEinstein, SVI328, Altair8800, MultiComp, ZX +3DOS** | Active, v4.4.2 |
+| **cbm** (`simmons/cbm`) | MIT/Apache | D64/D71/D81 read/write/format/rename | **C64, C128, C16, VIC20** (not PET D80/D82) | Complete but dormant |
+| **fluxfox** (`dbalsom/fluxfox`) | MIT | Container/track layer: TD0, IMD, HFE, 86F, IPF, SCP, raw IMG/DSK/ADF/ST + Amiga/Mac/Atari ST/Apple GCR | The shared **container-decode infra layer** feeding the superfloppy path | Active, ~150 stars |
+
+**Caveats to verify before depending on them:**
+
+- **a2kit CP/M** may be Apple-CP/M-centric — confirm it ingests arbitrary
+  per-machine **disk parameter blocks** (Amstrad/PCW/Einstein geometries)
+  before counting it for the CP/M cores.
+- **fluxfox `.d88`** support is ambiguous (crate docs omit it; a secondary
+  source claimed it) — matters for PC88 / X68000 floppies.
+
+### Per-filesystem crate availability matrix
+
+| Outstanding filesystem | Cores | Rust crate? | Best path |
+|---|---|---|---|
+| CP/M | Amstrad, PCW, Einstein, SVI328, Altair, MultiComp, ZX+3 | **a2kit** (verify DPBs) | Vendor/port a2kit |
+| CBM DOS | C64, C128, C16, VIC20 | **cbm** | Vendor cbm |
+| CBM DOS (D80/D82) | PET2001 | No | Extend cbm or ground-up |
+| Apple DOS 3.3 | Apple-II | **a2kit** | Vendor/port a2kit |
+| Container decode (TD0/IMD/ADF/ST/MSA) | many | **fluxfox** | Vendor fluxfox |
+| Container `.d88` | PC88, X68000 | fluxfox (uncertain) | Verify, else custom |
+| Atari DOS (`.atr`) | Atari800 | No (`atrfs` is Go/Python) | Ground-up; reference atrfs spec |
+| Human68k | X68000 | No (`dis68k`/`fathuman` are C/Go) | FAT-derived; our FAT + custom dir layer |
+| ADFS / FileCore | Archie, BBC/Electron ADFS | No | Ground-up; ref OpenAcornExplorer, Linux adfs |
+| QDOS | QL | No | Ground-up |
+| OS-9 RBF / RS-DOS / DragonDOS | CoCo2, CoCo3 | No | Ground-up |
+| TRS-80 (TRSDOS/LDOS) | TRS-80 | No | Ground-up |
+| Sedoric / Oric DOS | Oric | No | Ground-up |
+| N88-BASIC | PC88 | No | Ground-up |
+| Sharp MZ FD | SharpMZ | No | Ground-up |
+| EOS | ColecoAdam | No | Ground-up (read-only) |
+| TI-99 FS | TI-99_4A | No | Ground-up |
+| ANDOS/CSIDOS, MicroDOS, Specialist-MX | BK0011M, Vector-06C, Specialist | No | Ground-up (niche) |
+
+### Revised takeaway
+
+The crates change the build-vs-reuse math for the **highest-payoff** targets:
+**a2kit** can cover the entire CP/M family plus our Apple DOS 3.3 gap, **cbm**
+covers four Commodore cores outright, and **fluxfox** supplies the
+container-decode infrastructure piece budgeted above. The long tail (ADFS,
+Human68k, QDOS, OS-9, TRS-80, and the niche/Soviet filesystems) still has no
+Rust prior art and remains ground-up work. TotalImage is a minor reference for
+hardening FAT floppy detection, not a reuse source for the outstanding cores.
