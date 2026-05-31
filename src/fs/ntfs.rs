@@ -1036,8 +1036,13 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
                 ]) & 0x0000_FFFF_FFFF_FFFF;
 
                 if let Some(entry) = self.parse_file_name_entry(content, parent_path, mft_ref) {
-                    // Skip system metafiles (MFT records 0-23)
-                    if mft_ref >= 24 || (11..24).contains(&mft_ref) {
+                    // NTFS reserves MFT records 0-23 for system metafiles
+                    // ($MFT, $Bitmap, $Boot, $Extend, $ObjId, ...). These are
+                    // filesystem metadata, not user files (Windows hides them),
+                    // and the reserved $Extend children have no unnamed $DATA
+                    // attribute, so reading them as files fails. User files
+                    // always start at record 24, so only push those.
+                    if mft_ref >= 24 {
                         entries.push(entry);
                     }
                 }

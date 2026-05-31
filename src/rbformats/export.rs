@@ -361,7 +361,10 @@ pub(crate) fn gho_wrap_params(
 
     let type_byte = superfloppy_wrap::mbr_type_byte_for_fs(fs_hint);
     // Partition must cover the decoded bytes and the volume's own declared
-    // size (NTFS total_sectors), whichever is larger.
+    // size (NTFS total_sectors), whichever is larger. For NTFS the decoded
+    // stream already runs to total_sectors + 1 sectors (the GHO reader appends
+    // the backup boot sector past the addressable volume; see ntfs_served_size),
+    // so data_sectors is the larger term and the partition gets room for it.
     let data_sectors = source_data_size.div_ceil(512);
     let part_sectors = data_sectors.max(ntfs_total_sectors_from_vbr(&vbr));
     let partition_size_bytes = part_sectors * 512;

@@ -4538,14 +4538,14 @@ fn ntfs_mode_from_cache(snap: &CachedNtfsScan, key: NtfsScanKey) -> (GhoReaderMo
         lazy_scan: None,
         cache_key: Some(key),
     };
-    let volume_size = index.volume_size;
+    let served_size = ntfs_served_size(&index);
     (
         GhoReaderMode::NtfsFileAware {
             index,
             last_run_hint: 0,
             compressed: Some(comp),
         },
-        volume_size,
+        served_size,
     )
 }
 
@@ -6194,14 +6194,14 @@ fn try_open_ntfs_file_aware(
     if matches!(compression, GhoCompression::None) {
         let index = index_ntfs_file_aware(inner, file_size, &vbr, &vbr_raw)
             .context("building NTFS cluster run index")?;
-        let volume_size = index.volume_size;
+        let served_size = ntfs_served_size(&index);
         return Ok((
             GhoReaderMode::NtfsFileAware {
                 index,
                 last_run_hint: 0,
                 compressed: None,
             },
-            volume_size,
+            served_size,
         ));
     }
 
@@ -6230,14 +6230,14 @@ fn try_open_ntfs_file_aware(
             .context("MFT-only open of compressed NTFS file-aware")?;
     // Remember the cache key so the completed scan gets stored for reuse.
     comp_state.cache_key = cache_key;
-    let volume_size = index.volume_size;
+    let served_size = ntfs_served_size(&index);
     Ok((
         GhoReaderMode::NtfsFileAware {
             index,
             last_run_hint: 0,
             compressed: Some(comp_state),
         },
-        volume_size,
+        served_size,
     ))
 }
 
@@ -7346,6 +7346,31 @@ fn recover_ntfs_boot_code(
     None
 }
 
+/// Bytes per sector from a parsed NTFS VBR (offset 0x0B), defaulting to 512
+/// when the field is zero/garbage.
+fn ntfs_vbr_sector_size(vbr: &[u8; 512]) -> u64 {
+    let s = u16::from_le_bytes([vbr[11], vbr[12]]) as u64;
+    if s == 0 {
+        512
+    } else {
+        s
+    }
+}
+
+/// Total served length of the reconstructed NTFS volume in bytes.
+///
+/// `index.volume_size` is the NTFS-addressable volume (`total_sectors * bps`),
+/// which deliberately EXCLUDES the final sector. NTFS places a copy of the VBR
+/// (the backup boot sector) in that excluded final sector, so the real volume —
+/// and therefore the partition we export it into — is one sector longer. The
+/// read path serves that trailing sector from the VBR (see the backup-boot-sector
+/// branch in `read_ntfs_file_aware_into`); without the `+1` the exported volume
+/// is a sector short and the backup boot sector lands at the wrong offset, which
+/// chkdsk and the Windows boot path both flag.
+fn ntfs_served_size(index: &NtfsGhoIndex) -> u64 {
+    index.volume_size + ntfs_vbr_sector_size(&index.vbr)
+}
+
 /// Read bytes from an NTFS file-aware GHO at `position` in the logical
 /// volume. Uses binary search over the sorted cluster run index.
 fn read_ntfs_file_aware_into(
@@ -7366,20 +7391,14 @@ fn read_ntfs_file_aware_into(
     let avail_in_cluster = cluster_size as usize - offset_in_cluster;
     let mut to_read = out.len().min(avail_in_cluster);
 
-    // NTFS mirrors the VBR in the volume's final sector (the backup boot
-    // sector), which isn't part of any stored run. Clamp normal reads so they
-    // stop at its boundary; the read that then starts there serves the VBR copy
-    // below. Without the clamp a sequential read straddling the boundary would
-    // serve the whole (unmapped) tail as zeros, blanking the backup sector.
-    let sector_size = {
-        let s = u16::from_le_bytes([index.vbr[11], index.vbr[12]]) as u64;
-        if s == 0 {
-            512
-        } else {
-            s
-        }
-    };
-    let backup_start = index.volume_size.saturating_sub(sector_size);
+    // NTFS mirrors the VBR in the backup boot sector, the ONE sector that sits
+    // immediately past the addressable volume (`total_sectors` excludes it; see
+    // `ntfs_served_size`). It isn't part of any stored run. Clamp normal reads so
+    // they stop at that boundary; the read that then starts there serves the VBR
+    // copy below. Without the clamp a sequential read straddling the boundary
+    // would serve the whole (unmapped) tail as zeros, blanking the backup sector.
+    let sector_size = ntfs_vbr_sector_size(&index.vbr);
+    let backup_start = index.volume_size;
     if position < backup_start && position + to_read as u64 > backup_start {
         to_read = (backup_start - position) as usize;
     }
@@ -7404,9 +7423,11 @@ fn read_ntfs_file_aware_into(
         return Ok(n);
     }
 
-    // Backup boot sector: serve the VBR copy for the volume's final sector
-    // (synthesized from the GHPR VBR; see the clamp above).
-    if position >= backup_start && position < index.volume_size {
+    // Backup boot sector: serve the VBR copy for the trailing sector at
+    // `volume_size` (synthesized from the GHPR VBR; see the clamp above). The
+    // served volume runs to `volume_size + sector_size` (`ntfs_served_size`), so
+    // this is the genuine last sector of the partition — where NTFS expects it.
+    if position >= backup_start && position < index.volume_size + sector_size {
         let in_sector = (position - backup_start) as usize;
         let n = to_read.min(sector_size as usize - in_sector);
         for (i, b) in out[..n].iter_mut().enumerate() {
@@ -7582,6 +7603,76 @@ mod tests {
             synth_bitmap: Vec::new(),
             boot_code: Vec::new(),
         }
+    }
+
+    #[test]
+    fn ntfs_backup_boot_sector_lives_in_the_trailing_sector() {
+        // A reconstructed NTFS volume must run to total_sectors + 1 sectors, with
+        // the VBR copy (backup boot sector) in that final trailing sector — where
+        // NTFS, chkdsk, and the Windows boot path all look for it. total_sectors
+        // (VBR 0x28) deliberately EXCLUDES that sector, so the served volume is
+        // one sector longer than index.volume_size.
+        let bps: u64 = 512;
+        let total_sectors: u64 = 100;
+        let cluster_size: u64 = 4096;
+
+        let mut vbr = [0u8; 512];
+        vbr[3..11].copy_from_slice(b"NTFS    ");
+        vbr[0x0B..0x0D].copy_from_slice(&(bps as u16).to_le_bytes());
+        vbr[0x28..0x30].copy_from_slice(&total_sectors.to_le_bytes());
+        vbr[0xAB] = 0xAB; // a recognizable boot-code byte past the BPB
+        vbr[510] = 0x55;
+        vbr[511] = 0xAA;
+
+        let mut index = NtfsGhoIndex {
+            runs: Vec::new(), // no mapped runs -> normal reads return zeros
+            volume_size: total_sectors * bps,
+            cluster_size,
+            vbr,
+            bitmap_runs: Vec::new(),
+            synth_bitmap: Vec::new(),
+            boot_code: Vec::new(),
+        };
+
+        // The served length includes the trailing backup-boot sector.
+        assert_eq!(ntfs_served_size(&index), total_sectors * bps + bps);
+
+        // runs is empty, so `inner` is never actually read below; SpanReader still
+        // needs a backing file to exist.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("dummy.bin");
+        std::fs::write(&p, [0u8; 4096]).unwrap();
+        let mut inner = SpanReader::open(std::slice::from_ref(&p)).unwrap();
+        let mut hint = 0usize;
+        let mut comp: Option<NtfsCompressedState> = None;
+
+        let mut read_at = |inner: &mut SpanReader, index: &mut NtfsGhoIndex, pos: u64| -> Vec<u8> {
+            let mut out = [0u8; 512];
+            let n = read_ntfs_file_aware_into(inner, index, &mut hint, &mut comp, pos, &mut out)
+                .unwrap();
+            out[..n].to_vec()
+        };
+
+        // The backup boot sector at `volume_size` mirrors the VBR exactly.
+        let backup = read_at(&mut inner, &mut index, total_sectors * bps);
+        assert_eq!(backup.len(), bps as usize);
+        assert_eq!(
+            &backup[..],
+            &vbr[..],
+            "trailing sector must be the VBR copy"
+        );
+
+        // The OLD (buggy) location, one sector earlier, must now be ordinary
+        // volume data (zeros here) — NOT a stray, misplaced VBR copy.
+        let old_loc = read_at(&mut inner, &mut index, (total_sectors - 1) * bps);
+        assert!(
+            old_loc.iter().all(|&b| b == 0),
+            "the sector before the end must not carry a misplaced backup VBR"
+        );
+
+        // Sector 0 remains the primary VBR.
+        let sector0 = read_at(&mut inner, &mut index, 0);
+        assert_eq!(&sector0[..16], &vbr[..16], "sector 0 must be the VBR");
     }
 
     #[test]

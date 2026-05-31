@@ -1550,6 +1550,7 @@ impl BrowseView {
             total_bytes: 0,
             current_file: String::new(),
             files_extracted: 0,
+            files_skipped: 0,
             total_files: 0,
             finished: false,
             error: None,
@@ -3693,6 +3694,12 @@ impl BrowseView {
                 if p.finished {
                     Some(if let Some(ref err) = p.error {
                         format!("Extraction failed: {err}")
+                    } else if p.files_skipped > 0 {
+                        format!(
+                            "Extraction complete: {} files extracted, {} skipped \
+                             (see log for details).",
+                            p.files_extracted, p.files_skipped
+                        )
                     } else {
                         format!(
                             "Extraction complete: {} files extracted.",
@@ -3778,6 +3785,12 @@ fn count_entry(
         }
         EntryType::Special => Ok((0, 0)),
     }
+}
+
+/// True when the error is the sentinel raised on user cancellation. Such an
+/// error must abort the whole extraction rather than being skipped per-file.
+fn is_cancellation(e: &(dyn std::error::Error + Send + Sync)) -> bool {
+    e.to_string() == "Extraction cancelled"
 }
 
 /// Recursively extract an entry to the destination path.
@@ -3948,7 +3961,7 @@ fn extract_entry(
 
             let children = fs.list_directory(entry)?;
             for child in &children {
-                extract_entry(
+                match extract_entry(
                     fs,
                     child,
                     &dir_path,
@@ -3957,7 +3970,21 @@ fn extract_entry(
                     is_prodos,
                     prodos_export_mode,
                     progress,
-                )?;
+                ) {
+                    Ok(()) => {}
+                    // Cancellation must stop the whole run; propagate it.
+                    Err(e) if is_cancellation(&*e) => return Err(e),
+                    // Any other per-entry failure (e.g. an NTFS metafile with
+                    // no $DATA attribute, an unreadable file, or a host I/O
+                    // error) is logged and counted as skipped so extraction
+                    // continues with the remaining entries.
+                    Err(e) => {
+                        log::warn!("Skipped {}: {e}", child.path);
+                        if let Ok(mut p) = progress.lock() {
+                            p.files_skipped += 1;
+                        }
+                    }
+                }
             }
         }
         EntryType::Symlink => {
