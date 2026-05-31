@@ -483,6 +483,18 @@ pub fn enumerate_devices() -> Vec<DiskDevice> {
     #[cfg(debug_assertions)]
     {
         if !is_elevated() {
+            // Escape hatch: when iterating on file-only flows in a debug build,
+            // the developer can `set RB_NO_AUTO_ELEVATE=1` (or export it from
+            // the env) to opt out of the UAC relaunch. Device enumeration just
+            // returns empty; everything that doesn't touch a physical disk
+            // keeps working.
+            if std::env::var_os("RB_NO_AUTO_ELEVATE").is_some() {
+                log::warn!(
+                    "RB_NO_AUTO_ELEVATE is set; skipping UAC relaunch. \
+                     Physical-disk enumeration returns empty."
+                );
+                return Vec::new();
+            }
             log::warn!("Not running with administrator privileges; requesting elevation...");
             if let Err(e) = request_elevation() {
                 log::error!("Failed to request elevation: {}", e);
@@ -574,8 +586,13 @@ pub(crate) fn open_target_for_writing(path: &Path) -> Result<(File, VolumeLockSe
         );
         // In debug builds, offer to relaunch elevated via UAC (preserves the
         // historical developer workflow); in release, fail cleanly.
+        // `RB_NO_AUTO_ELEVATE=1` opts out of the relaunch and fails fast,
+        // matching release behaviour — useful when iterating on file-only
+        // flows in a debug build.
         #[cfg(debug_assertions)]
-        request_elevation()?;
+        if std::env::var_os("RB_NO_AUTO_ELEVATE").is_none() {
+            request_elevation()?;
+        }
         bail!(
             "Administrator privileges required to write to disk devices. \
              Re-run from an elevated terminal (right-click -> Run as administrator)."
