@@ -350,6 +350,18 @@ pub fn format_gho_info(path: &Path) -> Result<String> {
 /// partition at its MBR-declared LBA) is the next slice — until then we
 /// return a precise error pointing at the deferred session.
 pub fn materialize_gho_to_temp(path: &Path) -> Result<GhoMaterialized> {
+    materialize_gho_to_temp_with_password(path, None)
+}
+
+/// Like [`materialize_gho_to_temp`] but accepts an optional password for
+/// encrypted images. Password-protected GHOs are decoded through the streaming
+/// [`GhoReader`], which derives + verifies the seed and applies the correct
+/// decryption framing (per record body for file-aware, 32 KiB chunks for
+/// uncompressed SECTOR), then the decoded disk is copied to a tempfile.
+pub fn materialize_gho_to_temp_with_password(
+    path: &Path,
+    password: Option<&[u8]>,
+) -> Result<GhoMaterialized> {
     let span_set = discover_gho_span_set(path)
         .with_context(|| format!("discovering span set for {}", path.display()))?;
     if span_set.len() > 1 {
@@ -379,12 +391,39 @@ pub fn materialize_gho_to_temp(path: &Path) -> Result<GhoMaterialized> {
     }
 
     if header.password_protected {
-        return Err(anyhow!(
-            "GHO {} is password-protected; password-protected Ghost backups are not yet \
-             supported (cipher is reset per data block and does not match the CRC-16 model in \
-             the Go reference -- see docs/gho_password.md)",
-            path.display()
-        ));
+        // Route encrypted images through the streaming GhoReader, which
+        // derives + verifies the password seed and applies the right
+        // decryption framing for both file-aware and SECTOR layouts, then
+        // copy the decoded disk into a tempfile. (A missing/incorrect
+        // password surfaces as a precise error from `open_with_password`.)
+        let mut reader = GhoReader::open_with_password(path, password)
+            .with_context(|| format!("opening password-protected GHO {}", path.display()))?;
+        let logical = reader.logical_size();
+        let partition_count = match &reader.mode {
+            GhoReaderMode::FileAware { partitions, .. } => partitions.len(),
+            _ => 1,
+        };
+        let guard =
+            tempfile::tempdir().context("creating tempdir for encrypted GHO materialization")?;
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("gho");
+        let out_path = guard.path().join(format!("{}.img", stem));
+        let mut out =
+            File::create(&out_path).with_context(|| format!("creating {}", out_path.display()))?;
+        let bytes_written = std::io::copy(&mut reader, &mut out)
+            .with_context(|| format!("materializing encrypted {} via GhoReader", path.display()))?;
+        out.sync_all().ok();
+        log::info!(
+            "Materialized encrypted GHO {} -> {} ({} bytes via GhoReader)",
+            path.display(),
+            out_path.display(),
+            bytes_written
+        );
+        return Ok(GhoMaterialized {
+            temp_path: out_path,
+            logical_size: logical,
+            guard,
+            partition_count,
+        });
     }
 
     if let GhoCompression::Other(b) = header.compression {
@@ -675,43 +714,87 @@ impl DataLen for File {
 /// first file is exposed verbatim; every file after that has its first
 /// 512 bytes (the container header) skipped, so the SECTOR-mode decoder
 /// sees one continuous data stream.
-/// Transparent body-decryption layer for password-protected GHOs.
+/// Layout of the encrypted region(s) inside a password-protected GHO.
 ///
-/// The inner record stream is `[header][body][header][body]...`; only the
-/// bodies are encrypted (each independently, with the cipher reset to `seed`).
-/// This holds the sorted body ranges so [`SpanReader`] can decrypt body bytes
-/// on the fly while passing record headers and container metadata through
-/// unchanged — making decryption invisible to every decode path.
+/// Ghost encrypts independent units, each with the cipher reset to the
+/// password seed. Two shapes occur in the wild:
+enum GhoEncLayout {
+    /// File-aware mode: the inner record stream is `[header][body]...` and
+    /// only the **bodies** are encrypted (headers + container bytes are
+    /// plaintext). Holds the record body ranges `(body_start, body_len)`,
+    /// sorted by `body_start`.
+    Bodies(Vec<(u64, u32)>),
+    /// Uncompressed SECTOR mode: the contiguous disk image at `[data_start,
+    /// end)` is encrypted in fixed `chunk`-byte pieces, each reset to the
+    /// seed. (Compressed SECTOR images are stored *unencrypted* by Ghost
+    /// 11.5, so they never use this path.)
+    Chunked {
+        data_start: u64,
+        chunk: u64,
+        end: u64,
+    },
+}
+
+/// Transparent decryption layer for password-protected GHOs.
+///
+/// Holds the encrypted-region layout so [`SpanReader`] can decrypt the
+/// relevant bytes on the fly while passing plaintext bytes (record headers,
+/// container metadata, the pre-data sub-headers) through unchanged — making
+/// decryption invisible to every decode path.
 struct GhoBodyDecryptor {
     seed: u16,
-    /// Record body ranges `(body_start, body_len)`, sorted by `body_start`.
-    bodies: Vec<(u64, u32)>,
-    /// Single-body decrypt cache (reads are largely sequential within a body).
+    layout: GhoEncLayout,
+    /// Single-unit decrypt cache (reads are largely sequential within a unit).
     cache_start: u64,
     cache: Vec<u8>,
     cache_valid: bool,
 }
 
 impl GhoBodyDecryptor {
-    /// Return the body range `(start, len)` containing `pos`, if any.
+    /// Return the encrypted unit `(start, len)` containing `pos`, if any.
     fn body_at(&self, pos: u64) -> Option<(u64, u32)> {
-        let idx = match self.bodies.binary_search_by(|&(s, _)| s.cmp(&pos)) {
-            Ok(i) => i,
-            Err(0) => return None,
-            Err(i) => i - 1,
-        };
-        let (s, l) = self.bodies[idx];
-        if pos >= s && pos < s + l as u64 {
-            Some((s, l))
-        } else {
-            None
+        match &self.layout {
+            GhoEncLayout::Bodies(bodies) => {
+                let idx = match bodies.binary_search_by(|&(s, _)| s.cmp(&pos)) {
+                    Ok(i) => i,
+                    Err(0) => return None,
+                    Err(i) => i - 1,
+                };
+                let (s, l) = bodies[idx];
+                if pos >= s && pos < s + l as u64 {
+                    Some((s, l))
+                } else {
+                    None
+                }
+            }
+            GhoEncLayout::Chunked {
+                data_start,
+                chunk,
+                end,
+            } => {
+                if pos < *data_start || pos >= *end {
+                    return None;
+                }
+                let idx = (pos - data_start) / chunk;
+                let bstart = data_start + idx * chunk;
+                let blen = (*end - bstart).min(*chunk) as u32;
+                Some((bstart, blen))
+            }
         }
     }
 
-    /// Smallest body start strictly greater than `pos` (passthrough limit).
+    /// Smallest encrypted-unit start strictly greater than `pos`, used to
+    /// bound passthrough reads so they never spill into an encrypted unit.
     fn next_body_start(&self, pos: u64) -> Option<u64> {
-        let idx = self.bodies.partition_point(|&(s, _)| s <= pos);
-        self.bodies.get(idx).map(|&(s, _)| s)
+        match &self.layout {
+            GhoEncLayout::Bodies(bodies) => {
+                let idx = bodies.partition_point(|&(s, _)| s <= pos);
+                bodies.get(idx).map(|&(s, _)| s)
+            }
+            // Chunked: the only plaintext region is before `data_start`; once
+            // inside `[data_start, end)` every byte is covered by `body_at`.
+            GhoEncLayout::Chunked { data_start, .. } => (pos < *data_start).then_some(*data_start),
+        }
     }
 }
 
@@ -764,7 +847,27 @@ impl SpanReader {
         bodies.sort_unstable_by_key(|&(s, _)| s);
         self.crypt = Some(GhoBodyDecryptor {
             seed,
-            bodies,
+            layout: GhoEncLayout::Bodies(bodies),
+            cache_start: u64::MAX,
+            cache: Vec::new(),
+            cache_valid: false,
+        });
+    }
+
+    /// Enable transparent decryption for an uncompressed SECTOR-mode image.
+    ///
+    /// The contiguous disk image at `[data_start, end)` is decrypted in
+    /// `chunk`-byte pieces (each reset to `seed`); bytes before `data_start`
+    /// (container + sub-headers) pass through unchanged. Random access works
+    /// because each chunk is independently keyed.
+    pub fn enable_chunked_decryption(&mut self, seed: u16, data_start: u64, chunk: u64, end: u64) {
+        self.crypt = Some(GhoBodyDecryptor {
+            seed,
+            layout: GhoEncLayout::Chunked {
+                data_start,
+                chunk,
+                end,
+            },
             cache_start: u64::MAX,
             cache: Vec::new(),
             cache_valid: false,
@@ -1290,27 +1393,64 @@ impl GhoReader {
             .with_context(|| format!("opening span set for {}", path.display()))?;
         let file_size = inner.total_len();
 
-        // Enable transparent record-body decryption before any decode path
-        // reads the stream. The record headers are plaintext, so we can walk
-        // them on the raw reader to map every body range, then switch the
-        // reader into decrypting mode.
+        // Enable transparent decryption before any decode path reads the
+        // stream. The encryption shape depends on the image mode:
+        //   * file-aware       -> per record body (headers stay plaintext)
+        //   * SECTOR + None     -> contiguous image in 32 KiB chunks
+        //   * SECTOR + compress -> NOT encrypted (Ghost 11.5 stores the block
+        //                          stream plaintext even with a password set)
+        //
+        // For SECTOR mode we must locate `data_start` on the *plaintext* sub-
+        // headers before switching the reader into decrypting mode, so the
+        // FEEF scan can't trip over decrypted disk bytes. The value is cached
+        // and reused by the SECTOR dispatch below.
+        let mut sector_data_start: Option<u64> = None;
         if let Some(seed) = password_seed {
-            let header_end = (GHO_HEADER_PREFIX_LEN + GHO_PASSWORD_VERIFIER_LEN) as u64;
-            let bodies =
-                collect_gho_body_ranges(&mut inner, header_end, file_size).with_context(|| {
-                    format!(
-                        "mapping encrypted record bodies for {} (SECTOR-mode encrypted GHOs are \
-                         not yet supported)",
-                        path.display()
-                    )
-                })?;
-            let body_count = bodies.len();
-            inner.enable_decryption(seed, bodies);
-            log::info!(
-                "GHO {}: password accepted, decrypting {} record bodies",
-                path.display(),
-                body_count
-            );
+            match header.image_type {
+                GhoImageType::FileAware => {
+                    let header_end = (GHO_HEADER_PREFIX_LEN + GHO_PASSWORD_VERIFIER_LEN) as u64;
+                    let bodies = collect_gho_body_ranges(&mut inner, header_end, file_size)
+                        .with_context(|| {
+                            format!("mapping encrypted record bodies for {}", path.display())
+                        })?;
+                    let body_count = bodies.len();
+                    inner.enable_decryption(seed, bodies);
+                    log::info!(
+                        "GHO {}: password accepted, decrypting {} record bodies",
+                        path.display(),
+                        body_count
+                    );
+                }
+                GhoImageType::Sector => {
+                    let ds = find_sector_data_start(&mut inner, file_size)?;
+                    sector_data_start = Some(ds);
+                    match header.compression {
+                        GhoCompression::None => {
+                            inner.enable_chunked_decryption(
+                                seed,
+                                ds,
+                                FAST_LZ_BLOCK_SIZE as u64,
+                                file_size,
+                            );
+                            log::info!(
+                                "GHO {}: password accepted, decrypting SECTOR data in {}-byte \
+                                 chunks from {:#x}",
+                                path.display(),
+                                FAST_LZ_BLOCK_SIZE,
+                                ds
+                            );
+                        }
+                        _ => {
+                            log::info!(
+                                "GHO {}: compressed SECTOR image — Ghost 11.5 stores the block \
+                                 stream unencrypted; password verified, no decryption applied",
+                                path.display()
+                            );
+                        }
+                    }
+                }
+                GhoImageType::Other(_) => {}
+            }
         }
 
         // ---- File-aware dispatch ----
@@ -1490,7 +1630,14 @@ impl GhoReader {
             );
         }
 
-        let data_start = find_sector_data_start(&mut inner, file_size)?;
+        // Reuse the `data_start` computed (on plaintext) when decryption was
+        // enabled; otherwise scan for it now. Re-scanning after chunked
+        // decryption is enabled would read decrypted disk bytes and could
+        // mistake a stray `FE EF` for a sub-header.
+        let data_start = match sector_data_start {
+            Some(ds) => ds,
+            None => find_sector_data_start(&mut inner, file_size)?,
+        };
 
         match header.compression {
             GhoCompression::None => {
@@ -9292,6 +9439,69 @@ mod tests {
         assert_eq!(&b1, &plain1[4..14]);
 
         // Header bytes pass through unchanged.
+        sr.seek(SeekFrom::Start(0)).unwrap();
+        let mut hdr = [0u8; 2];
+        sr.read_exact(&mut hdr).unwrap();
+        assert_eq!(&hdr, &[0xFE, 0xEF]);
+    }
+
+    /// Uncompressed SECTOR-mode framing: a contiguous image encrypted in fixed
+    /// chunks (each reset to the seed), with a plaintext sub-header region
+    /// before `data_start`. Mirrors what Ghost writes for `-ia` + password.
+    #[test]
+    fn span_reader_chunked_sector_decryption() {
+        use crate::rbformats::gho_crypto::gho_encrypt_body;
+        use std::io::Read as _;
+
+        let seed = gho_seed_from_password(b"hunter2");
+        let data_start = 0x600u64; // plaintext container + sub-header region
+        let chunk = 64u64;
+
+        // A plaintext "disk image" spanning several chunks (200 = 3*64 + 8, so
+        // the final chunk is short — exercises the partial-tail path).
+        let image: Vec<u8> = (0..200u32)
+            .map(|i| (i.wrapping_mul(91) ^ 0x5A) as u8)
+            .collect();
+
+        // On disk: data_start plaintext bytes, then each `chunk`-sized slice of
+        // the image encrypted independently (cipher reset per chunk).
+        let mut disk = vec![0u8; data_start as usize];
+        disk[0] = 0xFE;
+        disk[1] = 0xEF;
+        for off in (0..image.len()).step_by(chunk as usize) {
+            let end = (off + chunk as usize).min(image.len());
+            let mut seg = image[off..end].to_vec();
+            gho_encrypt_body(&mut seg, seed);
+            disk.extend_from_slice(&seg);
+        }
+        let end = disk.len() as u64;
+
+        let path = write_to_temp(&disk);
+        let mut sr = SpanReader::open(std::slice::from_ref(&path)).unwrap();
+        sr.enable_chunked_decryption(seed, data_start, chunk, end);
+
+        // Sequential read: plaintext sub-header passthrough + decrypted image.
+        let mut got = Vec::new();
+        sr.read_to_end(&mut got).unwrap();
+        let mut expected = vec![0u8; data_start as usize];
+        expected[0] = 0xFE;
+        expected[1] = 0xEF;
+        expected.extend_from_slice(&image);
+        assert_eq!(got, expected, "sequential chunked decrypt mismatch");
+
+        // Random access straddling a chunk boundary (image[60..70)).
+        sr.seek(SeekFrom::Start(data_start + 60)).unwrap();
+        let mut b = [0u8; 10];
+        sr.read_exact(&mut b).unwrap();
+        assert_eq!(&b, &image[60..70], "cross-chunk random read");
+
+        // Into the short final chunk (image[195..200)).
+        sr.seek(SeekFrom::Start(data_start + 195)).unwrap();
+        let mut tail = [0u8; 5];
+        sr.read_exact(&mut tail).unwrap();
+        assert_eq!(&tail, &image[195..200], "final short chunk");
+
+        // Sub-header bytes before data_start pass through unchanged.
         sr.seek(SeekFrom::Start(0)).unwrap();
         let mut hdr = [0u8; 2];
         sr.read_exact(&mut hdr).unwrap();

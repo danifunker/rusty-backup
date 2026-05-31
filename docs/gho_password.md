@@ -54,6 +54,25 @@ for each ciphertext byte c:
 The feedback uses the ciphertext byte, so encrypt and decrypt share the same
 state update.
 
+### 4. What gets encrypted, by image mode
+
+The cipher, seed, and verifier above are identical across every mode. Only the
+*framing* — which byte ranges get an independent per-unit reset — changes:
+
+| Image mode (`image_type`) | Compression | Encrypted? | Unit reset per |
+| --- | --- | --- | --- |
+| File-aware (`0x00`) | any | **yes** | each record body |
+| SECTOR (`0x01`) | None | **yes** | each 32 KiB chunk of the contiguous disk image, from `data_start` |
+| SECTOR (`0x01`) | Fast / High | **no** | — Ghost 11.5 writes the verifier but stores the block stream as **plaintext** zlib/LZ |
+
+For uncompressed SECTOR images the encrypted region is the contiguous logical
+disk (across all span files) starting at `data_start` (the byte after the last
+`FE EF` sub-header), sliced into `FAST_LZ_BLOCK_SIZE` (32768-byte) chunks, each
+reset to the seed. Random access works because every chunk is independently
+keyed. Compressed SECTOR images need no decryption at all — the password is
+still verified against the header verifier (matching Ghost Explorer's prompt),
+but the data is read as-is.
+
 ## Why the earlier attempt failed
 
 The 2026-05-26 attempt assumed CRC-16/**ARC** (poly `0xA001`) and brute-forced
@@ -76,11 +95,21 @@ reference `CRC16Cipher` is unrelated to Symantec's real output.
 ## Implementation notes
 
 - Decryption is transparent: `SpanReader` (the single reader every GHO decode
-  path uses) holds an optional body-range map + seed and decrypts body bytes on
-  read while passing headers through. The map is built from a header-only scan
-  (`collect_gho_body_ranges`) before decryption is switched on, so the complex
-  file-aware / NTFS random-access read paths need no changes.
-- **SECTOR-mode encrypted images are not yet supported** — all available
-  encrypted fixtures are file-aware (`image_type=0x00`), so the SECTOR-mode body
-  layout under encryption is untested. `open_with_password` errors clearly if the
-  record stream can't be mapped.
+  path uses) holds an optional `GhoEncLayout` + seed and decrypts the relevant
+  bytes on read while passing plaintext through. Two layouts:
+  - `Bodies` — file-aware: a body-range map built from a header-only scan
+    (`collect_gho_body_ranges`) before decryption is switched on, so the complex
+    file-aware / NTFS random-access read paths need no changes.
+  - `Chunked` — uncompressed SECTOR: `{data_start, chunk, end}`; any read in
+    `[data_start, end)` decrypts the enclosing 32 KiB chunk. `data_start` is
+    located on the plaintext sub-headers *before* decryption is enabled (so the
+    `FE EF` scan can't trip over decrypted disk bytes) and reused by the SECTOR
+    dispatch.
+- **SECTOR-mode validation**: the uncompressed spanned fixture
+  (`sectpwun.GHO` + `sectp001/002.GHS`, password `password`) decrypts to a valid
+  NTFS volume — sector 0 / MFT / backup boot sector all check out, and files
+  (e.g. `WINDOWS/twunk_32.exe`) extract as valid PEs through `rb-cli`.
+- Compressed SECTOR images decode through the existing block path with no
+  decryption. (A separate, pre-existing decode bug mis-splits a single-volume
+  superfloppy compressed-SECTOR image into "2 partitions"; it is unrelated to
+  encryption and tracked separately.)
