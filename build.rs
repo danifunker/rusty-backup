@@ -57,7 +57,7 @@ fn main() {
         if manifest_path.exists() {
             let _ = embed_resource::compile_for(
                 "rusty-backup.rc",
-                &["rusty-backup"],
+                ["rusty-backup"],
                 embed_resource::NONE,
             );
         }

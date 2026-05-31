@@ -1769,6 +1769,56 @@ impl GhoReader {
         Some(ranges)
     }
 
+    /// Diagnostic / recovery: every "sentinel" run (lcn_start == u64::MAX —
+    /// recorded by the lazy scan but never assigned a real LCN), returning
+    /// `(cluster_count, seq, full_decoded_bytes)`. The bytes ARE the dropped
+    /// data — captured in the stream, just unplaced — so callers can splice
+    /// them back into a file with a hole at the right offset. `max_bytes` caps
+    /// the per-run read (pass a cluster-size multiple).
+    pub fn debug_sentinel_runs_full(&mut self, max_bytes: usize) -> Vec<(u64, u64, Vec<u8>)> {
+        let GhoReaderMode::NtfsFileAware {
+            index, compressed, ..
+        } = &mut self.mode
+        else {
+            return Vec::new();
+        };
+        let sentinels: Vec<(u64, u64, u64)> = index
+            .runs
+            .iter()
+            .filter(|r| r.lcn_start == u64::MAX)
+            .map(|r| (r.cluster_count, r.seq, r.file_offset))
+            .collect();
+        let mut out = Vec::with_capacity(sentinels.len());
+        for (cc, seq, fo) in sentinels {
+            let want = ((cc * index.cluster_size) as usize).min(max_bytes);
+            let mut buf = vec![0u8; want];
+            let mut got = 0usize;
+            if let Some(cs) = compressed.as_mut() {
+                let mut rdr = NtfsDecompressingReader {
+                    inner: &mut self.inner,
+                    state: cs,
+                    position: fo,
+                };
+                while got < want {
+                    match rdr.read(&mut buf[got..]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => got += n,
+                    }
+                }
+            } else if self.inner.seek(SeekFrom::Start(fo)).is_ok() {
+                while got < want {
+                    match self.inner.read(&mut buf[got..]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => got += n,
+                    }
+                }
+            }
+            buf.truncate(got);
+            out.push((cc, seq, buf));
+        }
+        out
+    }
+
     /// Serve bytes for FileAware mode at `position` into `out`.
     fn read_file_aware_into(&mut self, position: u64, out: &mut [u8]) -> std::io::Result<usize> {
         let GhoReaderMode::FileAware {
@@ -6469,6 +6519,14 @@ fn fixup_ntfs_typed_misalignments(
     // $I30 (directory) index, which is what chkdsk's index checks cover.
     let mut indx_dest: std::collections::HashMap<(u64, u64), u64> =
         std::collections::HashMap::new();
+    // Per-FILE $DATA runlist, merged across $ATTRIBUTE_LIST extension records:
+    // owning_rec -> Vec<(vcn, lcn, cc)>. A fragmented file's $DATA runs are
+    // described across several MFT records, but in the stream they're emitted as
+    // one seq-numbered run sequence. Sorting these by vcn reconstructs the
+    // file's fragment order, so a sentinel run's seq indexes straight into it.
+    // This is what lets sentinel recovery place a hive's interior clusters.
+    let mut file_data_frags: std::collections::HashMap<u64, Vec<(u64, u64, u64)>> =
+        std::collections::HashMap::new();
     // $MFTMirr (rec 1) $DATA — pinned to map onto $MFT's data, never matched to
     // a stream run (Ghost omits the mirror's content; it's a verbatim copy of
     // $MFT's first records). Captured here, re-added at reassembly.
@@ -6576,6 +6634,14 @@ fn fixup_ntfs_typed_misalignments(
                         for off in 0..len {
                             indx_dest.insert((owning_rec, vcn + off), lcn + off);
                         }
+                    }
+                    // Accumulate $DATA fragments per owning file (skip $MFT,
+                    // rec 0, served separately) for sentinel recovery.
+                    if attr.attr_type == 0x80 && owning_rec != 0 {
+                        file_data_frags
+                            .entry(owning_rec)
+                            .or_default()
+                            .push((vcn, lcn, len));
                     }
                 }
                 vcn += len;
@@ -6978,6 +7044,80 @@ fn fixup_ntfs_typed_misalignments(
         }
     }
 
+    // Sentinel recovery. The lazy scan records runs it can't assign an LCN with
+    // lcn_start == u64::MAX (it found the run header + decoded the data, but had
+    // no candidate (lcn,cc) at scan time — typical for a fragment of a file
+    // whose runlist is described in an $ATTRIBUTE_LIST extension record). Their
+    // data IS present; only the LCN is missing. Recover each via its
+    // stream-attribute neighbours: within a seq-delimited stream attribute, an
+    // already-placed (matched) run identifies the owning MFT attribute, and the
+    // sentinel is just another fragment of it — its LCN is mft_attrs[k][seq].
+    // This is what restores a registry hive's interior $DATA clusters that the
+    // scan dropped, without the cc-collision risk of blind matching.
+    let orig_lcn_by_fo: std::collections::HashMap<u64, u64> = index
+        .runs
+        .iter()
+        .map(|r| (r.file_offset, r.lcn_start))
+        .collect();
+    // Finalize per-file runlists: sort each file's $DATA fragments by VCN (=
+    // stream emission order) and index every fragment lcn back to its file +
+    // position. Position is the fragment's index in the sorted runlist, which
+    // equals its `seq` offset from any sibling fragment in the same stream run.
+    let mut file_runlist: std::collections::HashMap<u64, Vec<(u64, u64)>> =
+        std::collections::HashMap::with_capacity(file_data_frags.len()); // rec -> [(lcn, cc)]
+    let mut lcn_to_file_pos: std::collections::HashMap<u64, (u64, usize)> =
+        std::collections::HashMap::new(); // lcn -> (owning_rec, index)
+    for (rec, mut frags) in file_data_frags.into_iter() {
+        frags.sort_by_key(|&(vcn, _, _)| vcn);
+        let runs: Vec<(u64, u64)> = frags.iter().map(|&(_, l, c)| (l, c)).collect();
+        for (i, &(l, _)) in runs.iter().enumerate() {
+            lcn_to_file_pos.entry(l).or_insert((rec, i));
+        }
+        file_runlist.insert(rec, runs);
+    }
+    // Walk observed runs in stream (file_offset) emission order. Ghost emits a
+    // file's $DATA fragments consecutively, in VCN order, so a matched run
+    // identifies the current file + its position in that file's runlist, and the
+    // run immediately following is the next fragment. A sentinel sandwiched
+    // between a file's matched runs is therefore that file's next runlist entry —
+    // recovered with no dependence on the (irregular) seq field. The cc check +
+    // anchor reset on any mismatch keep a wrong guess from landing.
+    let mut sentinel_recovered = 0usize;
+    let mut cur: Option<(u64, usize)> = None; // (owning_rec, next runlist index)
+    for (i, o) in observed_runs.iter().enumerate() {
+        let olcn = orig_lcn_by_fo
+            .get(&o.file_offset)
+            .copied()
+            .unwrap_or(u64::MAX);
+        if olcn != u64::MAX {
+            // Matched run: (re)anchor to the file + fragment AFTER this one.
+            cur = lcn_to_file_pos.get(&olcn).map(|&(rec, idx)| (rec, idx + 1));
+            continue;
+        }
+        // Sentinel: place it at the current file's next expected fragment.
+        if used[i] {
+            continue;
+        }
+        let Some((rec, next_idx)) = cur else { continue };
+        let placed = file_runlist
+            .get(&rec)
+            .and_then(|runs| runs.get(next_idx).copied())
+            .filter(|&(lcn, cc)| cc == o.cc && !claimed.contains(&(lcn, cc)));
+        match placed {
+            Some((lcn, cc)) => {
+                assignments.push((lcn, cc, o.file_offset, o.seq));
+                claimed.insert((lcn, cc));
+                used[i] = true;
+                sentinel_recovered += 1;
+                cur = Some((rec, next_idx + 1));
+            }
+            None => cur = None, // shape disagreed — stop trusting this anchor
+        }
+    }
+    log::info!(
+        "NTFS fixup: sentinel recovery placed {sentinel_recovered} previously-unmapped runs"
+    );
+
     // Safety net: preserve every observed run the passes above couldn't match
     // to an MFT entry, at its ORIGINAL lazy-scan LCN. The rebuild must never
     // DROP a run the lazy scan found — dropping reads it back as zeros. This
@@ -6987,11 +7127,6 @@ fn fixup_ntfs_typed_misalignments(
     // run. Large registry hives hit exactly this — losing their first $DATA
     // cluster (the `regf` base block) made the hive unloadable. Keep the lazy
     // placement unless its LCN was already reassigned to a corrected run.
-    let orig_lcn_by_fo: std::collections::HashMap<u64, u64> = index
-        .runs
-        .iter()
-        .map(|r| (r.file_offset, r.lcn_start))
-        .collect();
     let mut preserved_unmatched = 0usize;
     for (i, o) in observed_runs.iter().enumerate() {
         if used[i] {
