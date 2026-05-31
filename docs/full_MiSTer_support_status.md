@@ -1,0 +1,177 @@
+# MiSTer Computer Cores — Rusty Backup Filesystem Support Status
+
+This document cross-references every **computer** core listed on the MiSTer
+wiki (<https://mister-devel.github.io/MkDocs_MiSTer/cores/computer/>) against
+the filesystems Rusty Backup currently implements, and estimates the work to
+support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
+
+## What Rusty Backup supports today
+
+- **Filesystems:** FAT12/16/32, exFAT, NTFS, HFS, HFS+/HFSX, ext2/3/4, btrfs,
+  ProDOS, Amiga OFS/FFS (AFFS) / PFS3 / SFS, IRIX EFS, ISO9660 (optical browse).
+- **Partition tables:** MBR, GPT, APM, Amiga RDB.
+- **Raw / superfloppy** (partitionless) images are handled.
+
+Legend for the **Support** column:
+
+- **Yes** — filesystem + media path already work end to end.
+- **Partial** — one media path or one filesystem is covered, others are not.
+- **No** — outstanding; needs new filesystem (and sometimes container/partition) work.
+- **N/A** — tape / cartridge / ROM-only core; no disk filesystem to support.
+
+---
+
+## Unified support table (all 64 cores)
+
+| Core | System | Media | Filesystem(s) | Rusty Backup support |
+|---|---|---|---|---|
+| ao486 | 486DX33 PC | Floppy, HDD, CD | FAT12 / FAT16/32 (MBR) / ISO9660 | **Yes** |
+| PCXT | IBM PC/XT | Floppy, HDD | FAT12 / FAT12-16 (MBR) | **Yes** |
+| MSX | MSX/MSX2/TurboR | Floppy, HDD | FAT12 / FAT16 (Nextor VHD) | **Yes** |
+| MSX1 | Microsoft MSX1 | Floppy, HDD | FAT12 / FAT12-16 | **Yes** |
+| ZXNext | ZX Spectrum Next | SD/HDD (VHD) | FAT32/16/12 | **Yes** |
+| TSConf | ZX-Evolution | SD/HDD (VHD) | FAT32 (non-MBR) | **Yes** |
+| Minimig-AGA | Commodore Amiga | Floppy, HDD, CD | OFS/FFS, PFS3, SFS (RDB) / ISO9660 | **Yes** |
+| MacPlus | Macintosh Plus | Floppy, HDD | HFS / MFS (400K floppy) | **Partial** — HFS yes; MFS 400K floppy no |
+| AtariST | Atari ST/STe | Floppy, HDD | GEMDOS = FAT12 / FAT16 | **Partial** — FAT yes; needs Atari AHDI partition table for HDD |
+| Apple-II | Apple IIe | Floppy, HDD | DOS 3.3 / ProDOS | **Partial** — ProDOS yes; DOS 3.3 no |
+| ZX-Spectrum | Sinclair ZX Spectrum | Floppy, SD/HDD | TR-DOS, G+DOS, +3DOS (CP/M-like), esxDOS FAT | **Partial** — FAT (DivMMC/esxDOS) yes; native FS no |
+| X68000 | Sharp X68000 | Floppy, SASI HDD | Human68k (FAT-derived dialect) | **No** |
+| Archie | Acorn Archimedes | Floppy, HDD | ADFS / FileCore | **No** |
+| QL | Sinclair QL | Microdrive, HDD | QDOS (QXL.WIN) | **No** |
+| Amstrad | Amstrad CPC 6128 | Floppy | AMSDOS, CP/M 2.2/Plus | **No** |
+| AmstradPCW | Amstrad PCW | Floppy | CP/M Plus | **No** |
+| TatungEinstein | Tatung Einstein | Floppy | Xtal/DOS (CP/M-compatible) | **No** |
+| SVI328 | Spectravideo SV-328 | Floppy | CP/M (MSX-DOS/FAT12 possible) | **No** |
+| Altair8800 | MITS Altair 8800 | Floppy, IDE/CF | CP/M | **No** |
+| MultiComp | Grant Searle MultiComp | Floppy | CP/M | **No** |
+| C64 | Commodore 64/128 | Floppy | CBM DOS (flat track/sector) | **No** |
+| C128 | Commodore 128 | Floppy | CBM DOS | **No** |
+| C16 | Commodore C16/Plus4 | Floppy | CBM DOS | **No** |
+| VIC20 | Commodore VIC-20 | Floppy | CBM DOS | **No** |
+| PET2001 | Commodore PET | Floppy (IEEE-488) | CBM DOS (D80/D82) | **No** |
+| BBCMicro | BBC Micro B/Master | Floppy | Acorn DFS / ADFS | **No** |
+| AcornElectron | Acorn Electron | Floppy | DFS / ADFS | **No** |
+| AcornAtom | Acorn Atom | Tape, Floppy | Atom DOS | **No** |
+| CoCo2 | Tandy CoCo 2 / Dragon | Floppy | RS-DOS / DragonDOS, OS-9 (RBF) | **No** |
+| CoCo3 | Tandy CoCo 3 | Floppy/virtual | RS-DOS, OS-9 / NitrOS-9 (RBF) | **No** |
+| TRS-80 | Tandy TRS-80 | Floppy (JV1) | TRSDOS / LDOS / NEWDOS | **No** |
+| Atari800 | Atari 8-bit | Floppy, ltd HDD | Atari DOS (DOS 2.x) | **No** |
+| TI-99_4A | TI-99/4A | Floppy | TI floppy FS (VIB/FDIR) | **No** |
+| Oric | Tangerine Oric | Floppy | Sedoric / Oric DOS | **No** |
+| SharpMZ | Sharp MZ | Floppy, Tape | Sharp MZ FD format | **No** |
+| PC88 | NEC PC-8801 mkII SR | Floppy | N88-BASIC Disk BASIC | **No** |
+| SAM-Coupe | SAM Coupe | Floppy | SAM DOS / MasterDOS | **No** |
+| ColecoAdam | Coleco Adam | Floppy, DDP tape | EOS (read-only in core) | **No** |
+| BK0011M | Elektronika BK | Floppy, HDD (VHD) | ANDOS / CSIDOS | **No** |
+| Vector-06C | Vector-06C | Floppy | MicroDOS | **No** |
+| Specialist | Specialist | Floppy | Specialist-MX FS | **No** |
+| ZX81 | Sinclair ZX80/ZX81 | Tape | — | **N/A** |
+| Apple-I | Apple I | ROM/program | — | **N/A** |
+| Aquarius | Mattel Aquarius | Cart, Tape | — | **N/A** |
+| Apogee | Apogee BK-01 | Tape/ROM | — | **N/A** |
+| AliceMC10 | Matra Alice | Tape | — | **N/A** |
+| Casio_PV-2000 | Casio PV-2000 | Cartridge | — | **N/A** |
+| Chip8 | CHIP-8 | Program/ROM | — | **N/A** |
+| EDSAC | EDSAC | Paper tape | — | **N/A** |
+| EG2000 | EACA Colour Genie | Tape, Cart | — | **N/A** |
+| Galaksija | Galaksija | Tape | — | **N/A** |
+| Homelab | Compukit Homelab | Tape | — | **N/A** |
+| Interact | Interact | Tape | — | **N/A** |
+| Jupiter | Jupiter Ace | Tape, Cart | — | **N/A** |
+| Laser310 | Vtech Laser 310 | Tape | — | **N/A** |
+| Lynx48 | Camputers Lynx | Tape | — | **N/A** |
+| OndraSPO186 | Tesla Ondra SPO-186 | Tape | — | **N/A** |
+| Orao | PEL Varazdin Orao | Tape | — | **N/A** |
+| PDP1 | DEC PDP-1 | Paper tape | — | **N/A** |
+| PMD85 | Tesla PMD 85 | ROM, Tape | — | **N/A** |
+| RX-78 | Bandai RX-78 | Cartridge | — | **N/A** |
+| SordM5 | Sord M5 | Cart, Tape | — | **N/A** |
+| TomyTutor | Tomy Tutor | Cart, Tape | — | **N/A** |
+| UK101 | Compukit UK101 | Tape/program | — | **N/A** |
+
+**Tally:** 7 fully supported, 4 partial, 30 outstanding (No), 23 N/A (tape/cart/ROM-only).
+
+---
+
+## Outstanding work, grouped by filesystem
+
+Estimates assume one developer fluent in the codebase, and cover
+**detect + browse/inspect + backup compaction**. Edit / fsck / resize is an
+additional increment, only worthwhile on HDD-capable cores. Effort:
+**S** ~= days, **M** ~= 1-3 weeks, **L** ~= 3-6 weeks.
+
+Rusty Backup's differentiators (resize, compaction, CHD/VHD/zstd compression)
+only matter for **hard-disk-capable** cores. Most outstanding cores are
+floppy-only with tiny fixed-geometry disks (140 KB-800 KB) where there is
+nothing to resize or compact — the work there is browse / inspect / verify /
+convert only.
+
+### Highest value — hard-disk-capable (resize/compaction pays off)
+
+| Filesystem | Cores unlocked | Effort | Notes / extra support needed |
+|---|---|---|---|
+| **CP/M (parameterized)** | Amstrad, AmstradPCW, TatungEinstein, SVI328, Altair8800, MultiComp (+ ZX +3DOS) | M-L | One implementation with a per-machine diskdef/DPB registry (like cpmtools) covers ~6 cores. Biggest core-count payoff. Needs **EDSK container decoder**. |
+| **Human68k** | X68000 | M | FAT-derived — can reuse FAT scaffolding, but needs 18.3 names, Shift-JIS, case-sensitivity, X68k partition scheme. Needs **.d88/.dim container decoder**. |
+| **ADFS / FileCore** | Archie (+ BBC/Electron ADFS) | M-L | Acorn-proprietary 256-byte-block FS with free-space map. Strip Arculator <=0.99 512-byte header. |
+| **QDOS** | QL | M | QXL.WIN hard-disk container; resize valuable. Microdrive .mdv is fixed-size. |
+
+### Medium value — mostly floppy-only (browse/inspect/convert, no resize)
+
+| Filesystem | Cores unlocked | Effort | Notes / extra support needed |
+|---|---|---|---|
+| **CBM DOS** | C64, C128, C16, VIC20, PET2001 | M | Flat single-directory track/sector. Raw .d64/.d71/.d81/.d80/.d82 easy; needs **GCR decoder for .g64/.g71** (+S-M). No resize concept. |
+| **Acorn DFS** | BBCMicro, AcornElectron | S | Trivial flat catalogue in track 0. (ADFS shares FileCore work above.) |
+| **RS-DOS/DragonDOS + OS-9 RBF** | CoCo2, CoCo3 | M each | RS-DOS granule table (a "FAT" in name only). OS-9 RBF is a separate Unix-like FS. Needs **.jvc/.vdk handling**. |
+| **Atari DOS** | Atari800 | S-M | DOS 2.x family on .atr. |
+| **TI-99 FS** | TI-99_4A | M | VIB + FDIR sector scheme on .dsk. |
+| **TRS-80 DOS** | TRS-80 | M | TRSDOS/LDOS/NEWDOS variants on JV1 sector dumps. |
+| **Sedoric / Oric DOS** | Oric | S-M | Needs **EDSK container**. |
+| **N88-BASIC** | PC88 | M | Needs **.d88 container** (shared with X68000). |
+| **Sharp MZ FD** | SharpMZ | S-M | Per-machine floppy format. |
+| **EOS** | ColecoAdam | S-M | Block-based, read-only in the core -> read/browse only. |
+| **Atom DOS** | AcornAtom | S-M | Niche; mostly a tape machine. |
+| **SAM DOS / MasterDOS** | SAM-Coupe | S-M | MGT 800K layout (shares family with Spectrum G+DOS). |
+
+### Low value — niche Soviet / hobby cores
+
+| Filesystem | Cores | Effort | Notes |
+|---|---|---|---|
+| **ANDOS / CSIDOS** | BK0011M (has .vhd HDD) | M | Only outstanding Soviet core with HDD. |
+| **MicroDOS** | Vector-06C | M | Needs **.fdd/.edd container**. |
+| **Specialist-MX FS** | Specialist | M | Needs **.odi container**. |
+
+### Near-complete touch-ups (small wins)
+
+| Item | Core(s) | Effort | Notes |
+|---|---|---|---|
+| **Atari AHDI partition table** | AtariST | S | Atari's MBR-like scheme; makes ST hard-disk images first-class (FAT already supported). |
+| **Apple DOS 3.3** | Apple-II | S-M | Complements existing ProDOS; covers sector-order .dsk/.do. |
+| **MFS** | MacPlus | S | Macintosh File System for 400 KB floppies; low priority. |
+
+---
+
+## CD-ROM summary
+
+CD-ROM support is effectively **done**. Only **ao486** (ISO9660) and **Amiga
+CD32** (data CDFS = ISO9660; audio not implemented in the core) use CD media.
+No other computer core uses CD-ROM, so no new optical work is required.
+
+---
+
+## Recommended sequencing (best coverage per unit effort)
+
+1. **CP/M (parameterized + EDSK decoder)** — unlocks ~6 cores including two
+   HDD-relevant ones. Biggest payoff.
+2. **CBM DOS (+ GCR)** — unlocks 5 Commodore cores.
+3. **Near-complete touch-ups** — AtariST AHDI partition table, Apple DOS 3.3.
+4. **Human68k, ADFS/FileCore, QDOS** — the three outstanding HDD filesystems
+   where resize/compaction actually pays off.
+5. Everything else is floppy-only long-tail: implement on demand;
+   browse/inspect-only is usually enough.
+
+A recurring sub-task: several formats are **container formats** (`.d88`, EDSK,
+`.g64/.g71`, `.msa`, `.dim`, `.vdk/.jvc`, `.fdd/.edd`, `.odi`, `.nib`) that wrap
+sectors with per-track geometry. Build a shared "decode container -> flat LBA
+sectors" layer feeding the superfloppy path, reused across cores — budget that
+as one **M** infrastructure piece rather than re-solving it per filesystem.
