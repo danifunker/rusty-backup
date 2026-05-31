@@ -79,6 +79,14 @@ pub fn is_gho_path(path: &Path) -> bool {
 /// `GhoReader::open` to error out; the caller can then fall back to the
 /// legacy `materialize_gho_to_temp` path which decodes to a tempfile.
 pub fn open_read(path: &Path) -> Result<Box<dyn ReadSeek>> {
+    open_read_with_password(path, None)
+}
+
+/// Variant of [`open_read`] that accepts an optional password for
+/// container formats that support encryption (currently just IMZ — CHD
+/// and GHO have their own encryption schemes that aren't wired here).
+/// Pass `None` to behave like [`open_read`].
+pub fn open_read_with_password(path: &Path, password: Option<&[u8]>) -> Result<Box<dyn ReadSeek>> {
     if is_chd_path(path) {
         let chd = ChdReader::open(path).with_context(|| format!("open CHD {}", path.display()))?;
         Ok(Box::new(chd))
@@ -86,7 +94,8 @@ pub fn open_read(path: &Path) -> Result<Box<dyn ReadSeek>> {
         let gho = GhoReader::open(path).with_context(|| format!("open GHO {}", path.display()))?;
         Ok(Box::new(gho))
     } else if is_imz_path(path) {
-        let imz = ImzReader::open(path).with_context(|| format!("open IMZ {}", path.display()))?;
+        let imz = ImzReader::open_with_password(path, password)
+            .with_context(|| format!("open IMZ {}", path.display()))?;
         Ok(Box::new(imz))
     } else {
         let f = File::open(path).with_context(|| format!("open {}", path.display()))?;

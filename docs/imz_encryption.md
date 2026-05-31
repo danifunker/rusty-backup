@@ -1,7 +1,11 @@
 # WinImage IMZ encryption — reverse-engineering notes
 
-Status: **format characterized, cipher NOT yet broken.** Standard Rijndael
-constructions keyed by MD5(password) do not match a known-plaintext oracle.
+Status: **SOLVED** (2026-05-30, on Windows via Frida instrumentation). Spec is
+in the [SOLVED] section at the bottom — everything above is historical
+narrative left in place so the prior dead ends stay legible. Reference
+implementation: `/tmp/decrypt_imz.py` (on the Windows RE box) or
+`scripts/decrypt_imz.py` if that gets committed. Rust port lives in
+`src/rbformats/imz.rs`.
 
 ## Samples (developer-local, not in repo)
 `/Users/dani/new-fixtures/imz/`
@@ -231,3 +235,134 @@ possible but multi-step and error-prone.
 - CRITICAL gotcha fixed: unicorn register consts are **`UC_X86_REG_*`** not
   `UC_REG_*`; the wrong name silently NameErrors *inside hook callbacks*, which
   looked like crypto faults in earlier sessions.
+
+## [SOLVED] WinImage IMZ password encryption spec (2026-05-30)
+
+Recovered on a Windows machine with `winima61\winimage.exe` running under
+Frida (`frida-tools` 17.x), driving the password dialog with `pywinauto` and
+hooking the AES primitives at fixed VAs (ImageBase 0x400000, ASLR off because
+the PE has `DllCharacteristics = 0`). The key insight the static-only attempts
+missed: WinImage has **two** Rijndael implementations linked in. The reference
+S-box impl at 0x43d915 / 0x43dac6 is only used for the **password verifier**
+(one block call). All bulk decryption goes through a separate **T-table impl
+at 0x43ded2** whose forward tables sit at `0x4504a0..0x4510a0` (4 × 1 KiB) —
+addresses the prior static pass overlooked. Stalker on that function fired
+~15 k times in the 3 s after password OK; Interceptor I/O capture on the
+first ~30 calls plus a sampled tail (n = 5000, 10000, …, 30000) was enough to
+identify the mode and chunk layout.
+
+### Container
+Standard ZIP. Single entry, deflate (method 8), GP-flag bit 0 set. WinImage's
+proprietary `SI` extra field (`0x4953`, payload `804d495210800000`) marks the
+entry as encrypted by WinImage's scheme — **NOT** PKWARE ZipCrypto, **NOT**
+WinZip-AES. Both encrypted and plain entries also carry a `WI` extra
+(`0x4957`, `0100000000801600`). The encrypted entry body (= ZIP CSZ bytes) is
+laid out as below.
+
+### Body layout
+```
+offset   size           field
+  0      8 bytes        per-file header (random/mystery; ignored on decrypt)
+  8      u32 LE         chunk_size_0 (in bytes, always a multiple of 16; full chunks = 32768)
+ 12      chunk_size_0   chunk 0 ciphertext
+ ...     u32 LE         chunk_size_1
+ ...     chunk_size_1   chunk 1 ciphertext
+ ...     (one u32 + one ct slice per chunk; all internal chunks have size 32768)
+ ...     u32 LE         chunk_size_last  (PADDED size of the last chunk's ct, mult. of 16)
+ ...     chunk_size_last  last chunk ciphertext
+ end-4   u32 LE         real_pt_len_last (un-padded plaintext byte count of the last chunk)
+```
+
+Total body length = 8 + Σ (4 + chunk_size_i) + 4. Every chunk_size is already
+16-byte aligned (the last chunk's ct is the plaintext rounded up; the 11
+trailing padding bytes we observed are leftover heap noise, not zeros).
+
+### Key derivation
+```
+K = MD5( password.encode("utf-16-le") )         # 16-byte AES-128 key
+```
+Password is encoded as UTF-16LE **without** a trailing nul (8-char "password"
+hashes 16 bytes). Confirmed by hooking 0x43c460 (MD5 compress) and reading the
+input buffer: `70 00 61 00 73 00 73 00 77 00 6f 00 72 00 64 00` followed by
+standard MD5 padding. For password `password`, K = `b081dbe85e1ec3ffc3d4e7d0227400cd`.
+
+### Cipher
+**AES-128 in CBC mode, IV = 16 zero bytes**, applied **independently to each
+chunk** (IV reset to zero at every chunk boundary — there is no chaining
+between chunks). Internally WinImage uses Daemen/Rijmen reference Rijndael
+with variable block size, but for IMZ it's always 128-bit block / 128-bit key
+/ 10 rounds. Inspecting the cipher context at [edi+4] showed mode = 1
+(WinImage's enum: 0=ECB, 1=CBC, 2=CFB-1); the IV at [edi+0xc..0x1b] was all
+zeros and is *not* written back between calls.
+
+### Decryption
+```python
+def decrypt_imz_entry_body(body: bytes, password: str) -> bytes:
+    K = hashlib.md5(password.encode("utf-16-le")).digest()
+    iv = b"\x00" * 16
+    last_pt_len = struct.unpack("<I", body[-4:])[0]
+    out, pos, end = [], 8, len(body) - 4
+    while pos + 4 <= end:
+        ct_len = struct.unpack("<I", body[pos:pos+4])[0]
+        pos += 4
+        ct = body[pos:pos + ct_len]
+        pos += ct_len
+        pt = AES.new(K, AES.MODE_CBC, iv=iv).decrypt(ct)
+        out.append(pt[:last_pt_len] if pos >= end else pt)
+    return b"".join(out)   # this is the raw deflate stream
+```
+Then `zlib.decompress(deflate, -15)` gives the floppy image.
+
+### Worked example (validates against the known-plaintext oracle)
+- File: `w99_boot_withpassword.imz`, password `password`.
+- ZIP CSZ = 893,084. USZ = 1,474,560.
+- K = `b081dbe85e1ec3ffc3d4e7d0227400cd`.
+- body[0..7] mystery = `04 57 a6 a8 e2 b0 cd bd` (per-file, no decryption role).
+- body[8..11] = `00 80 00 00` = 32768 = first chunk size.
+- 27 full chunks × 32768 + 1 partial chunk × 8224 (= round_up(8213, 16)).
+- body[893080..893083] = `15 20 00 00` = 8213 = real plaintext length of last chunk.
+- AES-CBC-decrypt each chunk with IV=0, trim last to 8213, concatenate
+  → 892,949 bytes of deflate.
+- `zlib.decompress(..., -15)` → 1,474,560 bytes, CRC32 `0xd4c4bba0`. ✓
+
+### Notes for an encrypter (future work)
+- The 8-byte mystery header is per-file. Unknown derivation; not E_K(0),
+  D_K(0), E_K(K), or MD5(K) (all four tested and miss). Could be a random
+  nonce, a truncated version stamp, or a salted verifier — irrelevant for
+  decrypt, but if we want WinImage to *open* our output we'll need to
+  reproduce whatever it expects there (or empirically check that it ignores
+  it on read).
+- Last-chunk padding: WinImage's encrypter leaves 11 bytes of leftover heap
+  bytes after the real plaintext. A round-tripping encrypter can just zero
+  them — the unpadded length comes from the trailing u32.
+- The reference Rijndael code at 0x43d915 / makeKey at 0x43cd9e are linked
+  in but only the verifier path uses them; bulk encryption presumably uses
+  the T-table impl at 0x43ded2 (forward) plus its inverse twin near
+  0x43dac6+. We never observed the encrypt path in this RE session.
+
+### Tooling used (artifacts on the Windows box, `C:\temp\imz_re\`)
+- `hook.js` / `hook2.js` — Frida hooks for MD5, makeKey, encrypt, decrypt,
+  cryptfeed, and the T-table AES at 0x43ded2.
+- `hook_stalker.js` — Frida Stalker call-summary harness; this is what
+  revealed 0x43ded2 as the bulk-crypto hot function.
+- `full_drive.py` / `drive_stalker.py` / `drive2.py` — `pywinauto`-based
+  drivers that spawn winimage.exe with the IMZ as argv, dismiss the
+  unregistered-nag dialog (BM_CLICK to IDOK), fill the password Edit
+  (WM_SETTEXT), click OK, and (for `full_drive.py`) post WM_COMMAND 124
+  (Image > Extract) to force a full bulk decryption.
+- `analyze.py` / `decrypt_imz.py` — offline cipher-mode tester and the final
+  validated decrypter against the known-plaintext oracle.
+
+### Black-box reconciliation
+The original analysis ruled out "AES-CBC with K=MD5(password)" because
+892,949 bytes is not a multiple of 16. That conclusion was right *in
+isolation* but missed the framing: the entry body is **not** 892,949 bytes
+of ciphertext — it's 12 bytes prefix + 28 chunks of (u32 size + ct) + 4
+bytes trailer, where every ct slice **is** 16-aligned. The "135-byte
+header" earlier docs talked about isn't a discrete header at all: it's the
+8-byte mystery + the first 4-byte chunk-size u32 + 123 bytes of chunk 0's
+ciphertext (= 7 full 16-byte AES blocks + 11 bytes into the 8th block). And
+the "stream-like length preservation" was likewise an artifact of summing
+all the chunk ciphertexts and ignoring the size-table overhead: total
+ct bytes = 27·32768 + 8224 = 892,960, off from the 892,949 deflate length
+by exactly the 11 padding bytes in the last chunk.

@@ -44,6 +44,10 @@ path = "example/generate_cli_reference.rs"
 name = "generate_cli_html_help"
 path = "example/generate_cli_html_help.rs"
 
+[[example]]
+name = "decrypt_real_imz"
+path = "example/decrypt_real_imz.rs"
+
 [features]
 default = []
 
@@ -63,6 +67,9 @@ libchdman-rs = { version = "0.288.1", features = ["prebuilt"] }
 zstd = "0.13"
 zeekstd = "0.6"
 sha2 = "0.11"
+md-5 = "0.10"
+aes = "0.8"
+cbc = "0.1"
 crc32c = "0.6"
 crc32fast = "1"
 chrono = "0.4"

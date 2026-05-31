@@ -30,11 +30,16 @@ pub struct InspectArgs {
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text, global = false)]
     pub format: OutputFormat,
+
+    /// Password for encrypted containers (currently: WinImage IMZ).
+    #[arg(long)]
+    pub password: Option<String>,
 }
 
 pub fn run(args: InspectArgs) -> Result<()> {
     require_non_flat(args.format, "inspect")?;
-    let mut reader = crate::model::source_reader::open_read(&args.image)?;
+    let pw_bytes = args.password.as_deref().map(|s| s.as_bytes());
+    let mut reader = crate::model::source_reader::open_read_with_password(&args.image, pw_bytes)?;
     let pt = PartitionTable::detect(&mut reader)?;
     let partitions = pt.partitions();
     let ext = args

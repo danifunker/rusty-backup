@@ -76,11 +76,22 @@ pub fn resolve_partition_streaming(
     path: &std::path::Path,
     selector: Option<u32>,
 ) -> Result<(BoxReadSeek, PartitionContext)> {
+    resolve_partition_streaming_with_password(path, selector, None)
+}
+
+/// Variant of [`resolve_partition_streaming`] that accepts an optional
+/// password for encrypted IMZ files. Pass `None` to behave like
+/// [`resolve_partition_streaming`].
+pub fn resolve_partition_streaming_with_password(
+    path: &std::path::Path,
+    selector: Option<u32>,
+    password: Option<&[u8]>,
+) -> Result<(BoxReadSeek, PartitionContext)> {
     let is_streaming = source_reader::is_gho_path(path)
         || source_reader::is_imz_path(path)
         || source_reader::is_chd_path(path);
     if is_streaming {
-        let mut reader = source_reader::open_read(path)?;
+        let mut reader = source_reader::open_read_with_password(path, password)?;
         let ctx = resolve(&mut reader, selector)?;
         Ok((reader, ctx))
     } else {

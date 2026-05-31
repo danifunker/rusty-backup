@@ -6,20 +6,22 @@
 //! [`tempfile::TempDir`] guard for the lifetime of the open image so the
 //! decoded file lives long enough to be inspected/browsed.
 //!
-//! Password-protected archives are detected and rejected with a precise
-//! error. WinImage 6.0+ encrypts the (already-deflated) entry with its own
-//! scheme — MD5(password) -> 128-bit key, then Rijndael, preceded by a
-//! 135-byte header — which is NOT PKWARE ZipCrypto and NOT WinZip-AES, so
-//! the `zip` crate cannot decrypt it. A known-plaintext analysis ruled out
-//! every standard Rijndael mode/key-derivation; see `docs/imz_encryption.md`.
-//! Until the scheme is reverse-engineered from the WinImage binary, encrypted
-//! IMZ files are unsupported.
+//! Password-protected archives are handled with WinImage's own scheme
+//! (AES-128-CBC, key = MD5(password.utf-16-le), 32 KiB chunks with IV=0
+//! reset per chunk, plus an 8-byte plaintext header and a 4-byte size
+//! sidetable). The format was reverse-engineered from the WinImage 6.1
+//! binary; see `docs/imz_encryption.md` for the full spec and the RE
+//! narrative. Files that present as encrypted but don't follow that
+//! framing (or where the password is wrong) surface as an explicit error.
 
 use std::fs::File;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use aes::Aes128;
 use anyhow::{anyhow, bail, Context, Result};
+use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+use md5::{Digest, Md5};
 
 /// IMZ magic = ZIP local file header signature.
 pub const IMZ_MAGIC: &[u8; 4] = b"PK\x03\x04";
@@ -95,6 +97,115 @@ fn pick_entry_index<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Result<
         .ok_or_else(|| anyhow!("IMZ has no extractable file entry"))
 }
 
+/// AES-128 key derivation per the WinImage IMZ spec:
+/// `K = MD5(password.encode("utf-16-le"))`.
+/// Password bytes are encoded as UTF-16LE *without* a trailing nul.
+fn derive_winimage_key(password: &[u8]) -> [u8; 16] {
+    // Treat the input as UTF-8; on decode failure (rare for "password"-style
+    // ASCII inputs) fall back to interpreting each byte as a code point so we
+    // still hash *something* deterministic rather than silently truncating.
+    let s = std::str::from_utf8(password)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|_| password.iter().map(|&b| b as char).collect());
+    let mut utf16le = Vec::with_capacity(s.encode_utf16().count() * 2);
+    for u in s.encode_utf16() {
+        utf16le.push((u & 0xff) as u8);
+        utf16le.push((u >> 8) as u8);
+    }
+    let digest = Md5::digest(&utf16le);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest);
+    out
+}
+
+/// Decrypt a WinImage password-protected entry body. Returns the raw
+/// deflate stream embedded inside (which the caller should inflate with
+/// `flate2::read::DeflateDecoder` to recover the floppy image).
+///
+/// Body layout (from `docs/imz_encryption.md`):
+/// ```text
+/// +0      8 bytes   per-file header (random; ignored on decrypt)
+/// +8      u32 LE    chunk_size_0 in bytes (multiple of 16; typically 32768)
+/// +12     chunk_size_0 bytes  chunk 0 ciphertext
+/// ...     u32 LE + ct slice per chunk
+/// end-4   u32 LE    real un-padded plaintext byte count of the last chunk
+/// ```
+/// Each chunk is AES-128-CBC with IV = 16 zeros (reset per chunk).
+fn decrypt_winimage_body(body: &[u8], password: &[u8]) -> Result<Vec<u8>> {
+    type Aes128CbcDec = cbc::Decryptor<Aes128>;
+    const PREFIX: usize = 8;
+    const TRAILER: usize = 4;
+
+    if body.len() < PREFIX + 4 + 16 + TRAILER {
+        bail!(
+            "WinImage-encrypted IMZ body too short ({} bytes) to hold any chunks",
+            body.len()
+        );
+    }
+
+    let key = derive_winimage_key(password);
+    let iv = [0u8; 16];
+    let real_last_pt_len =
+        u32::from_le_bytes(body[body.len() - TRAILER..].try_into().unwrap()) as usize;
+
+    let end = body.len() - TRAILER;
+    let mut out: Vec<u8> = Vec::with_capacity(body.len());
+    let mut pos = PREFIX;
+    while pos + 4 <= end {
+        let ct_len = u32::from_le_bytes(body[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        if ct_len == 0 || !ct_len.is_multiple_of(16) {
+            bail!(
+                "WinImage IMZ: chunk ciphertext length {} at body[{}] is not a positive multiple of 16",
+                ct_len,
+                pos - 4
+            );
+        }
+        if pos + ct_len > end {
+            bail!(
+                "WinImage IMZ: chunk at body[{}] of length {} overruns body (end={})",
+                pos,
+                ct_len,
+                end
+            );
+        }
+        let mut buf = body[pos..pos + ct_len].to_vec();
+        pos += ct_len;
+        let mut cipher = Aes128CbcDec::new(&key.into(), &iv.into());
+        // decrypt_padded_mut requires PKCS#7-compatible padding which we
+        // don't have here; decrypt the blocks in-place via the raw block API.
+        let blocks: &mut [aes::cipher::generic_array::GenericArray<u8, _>] = unsafe {
+            std::slice::from_raw_parts_mut(
+                buf.as_mut_ptr()
+                    as *mut aes::cipher::generic_array::GenericArray<u8, aes::cipher::consts::U16>,
+                ct_len / 16,
+            )
+        };
+        cipher.decrypt_blocks_mut(blocks);
+        if pos >= end {
+            // Last chunk: trim padding to the real plaintext length.
+            if real_last_pt_len > buf.len() {
+                bail!(
+                    "WinImage IMZ: declared last-chunk pt length {} exceeds decrypted size {}",
+                    real_last_pt_len,
+                    buf.len()
+                );
+            }
+            buf.truncate(real_last_pt_len);
+            out.extend_from_slice(&buf);
+        } else {
+            out.extend_from_slice(&buf);
+        }
+    }
+    if pos != end {
+        bail!(
+            "WinImage IMZ: {} bytes left in body before trailer (parser misaligned)",
+            end - pos
+        );
+    }
+    Ok(out)
+}
+
 /// Open the chosen entry from the archive, optionally decrypting with
 /// `password`. Returns the decompressed entry + its metadata.
 fn open_entry<'a>(
@@ -102,24 +213,35 @@ fn open_entry<'a>(
     idx: usize,
     password: Option<&[u8]>,
     path: &Path,
-) -> Result<(zip::read::ZipFile<'a, File>, String, u64)> {
+) -> Result<(Box<dyn Read + 'a>, String, u64)> {
     if let Some(pw) = password {
-        // The `zip` crate only knows ZipCrypto and WinZip-AES. Real WinImage
-        // IMZ files use a proprietary MD5+Rijndael scheme that neither matches
-        // (see docs/imz_encryption.md), so this only succeeds on the rare
-        // standards-compliant IMZ. On failure, say so plainly rather than
-        // implying the password was wrong.
+        // Capture the entry's raw (still-encrypted) body up front. Almost all
+        // password-protected IMZ files in the wild use WinImage's proprietary
+        // scheme (see docs/imz_encryption.md); the `zip` crate's built-in
+        // ZipCrypto / WinZip-AES paths are kept as a fallback in case
+        // someone ever produces a standards-compliant encrypted IMZ.
+        let (csz, name, size) = {
+            let raw = archive.by_index_raw(idx)?;
+            (raw.compressed_size(), raw.name().to_string(), raw.size())
+        };
+        let mut raw_body = Vec::with_capacity(csz as usize);
+        archive.by_index_raw(idx)?.read_to_end(&mut raw_body)?;
+
+        if let Ok(deflate_bytes) = decrypt_winimage_body(&raw_body, pw) {
+            let dec = flate2::read::DeflateDecoder::new(Cursor::new(deflate_bytes));
+            return Ok((Box::new(dec) as Box<dyn Read + 'a>, name, size));
+        }
+        // Fall back to standards-compliant ZipCrypto / WinZip-AES.
         let entry = archive.by_index_decrypt(idx, pw).map_err(|e| {
             anyhow!(
-                "IMZ {} could not be decrypted ({e}). WinImage's own \
-                 password encryption (MD5 + Rijndael) is not yet supported; \
-                 this is unrelated to whether the password is correct.",
+                "IMZ {} could not be decrypted ({e}). \
+                 Wrong password, or an encryption scheme this build does not yet support.",
                 path.display(),
             )
         })?;
         let name = entry.name().to_string();
         let size = entry.size();
-        Ok((entry, name, size))
+        Ok((Box::new(entry) as Box<dyn Read + 'a>, name, size))
     } else {
         // Check encryption via raw access first (by_index errors on
         // encrypted entries in zip 2.x before we can inspect the flag).
@@ -128,7 +250,9 @@ fn open_entry<'a>(
             if raw.encrypted() {
                 let entry_name = raw.name().to_string();
                 bail!(
-                    "IMZ {} is password-protected (entry \"{entry_name}\")",
+                    "IMZ {} is password-protected (entry \"{entry_name}\"); \
+                     password must be specified (use the GUI password prompt, \
+                     or pass --password on the CLI)",
                     path.display(),
                 );
             }
@@ -136,7 +260,7 @@ fn open_entry<'a>(
         let entry = archive.by_index(idx)?;
         let name = entry.name().to_string();
         let size = entry.size();
-        Ok((entry, name, size))
+        Ok((Box::new(entry) as Box<dyn Read + 'a>, name, size))
     }
 }
 
@@ -364,6 +488,68 @@ mod tests {
         zw.finish().unwrap();
         let err = ImzReader::open(&path).err().expect("must error");
         assert!(format!("{err}").contains("no entries"));
+    }
+
+    #[test]
+    fn winimage_key_derivation_matches_known_vector() {
+        // From the reverse-engineering trace: MD5 of UTF-16LE "password"
+        // (16 bytes, no trailing nul) = b081dbe85e1ec3ffc3d4e7d0227400cd.
+        let k = derive_winimage_key(b"password");
+        let expected = [
+            0xb0u8, 0x81, 0xdb, 0xe8, 0x5e, 0x1e, 0xc3, 0xff, 0xc3, 0xd4, 0xe7, 0xd0, 0x22, 0x74,
+            0x00, 0xcd,
+        ];
+        assert_eq!(k, expected, "WinImage AES key derivation broke");
+    }
+
+    #[test]
+    fn winimage_decrypt_roundtrips_a_synthetic_body() {
+        // Build a small WinImage-format body around a known plaintext, then
+        // feed it through decrypt_winimage_body and confirm we get the
+        // plaintext back. Uses the same key derivation as the real format.
+        use aes::cipher::{generic_array::GenericArray, BlockEncryptMut, KeyIvInit};
+        type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
+
+        let key = derive_winimage_key(b"password");
+        let iv = [0u8; 16];
+
+        // Two chunks: chunk 0 is full (32768 bytes); chunk 1 is partial (100 bytes).
+        let pt0: Vec<u8> = (0..32768).map(|i| (i * 31 + 7) as u8).collect();
+        let pt1_real: Vec<u8> = (0..100).map(|i| (i * 13 + 91) as u8).collect();
+        // Pad chunk 1 to multiple of 16.
+        let pt1_padded_len = 112usize;
+        let mut pt1_padded = pt1_real.clone();
+        pt1_padded.resize(pt1_padded_len, 0xAA);
+
+        let encrypt_chunk = |pt: &[u8]| -> Vec<u8> {
+            let mut buf = pt.to_vec();
+            let mut cipher = Aes128CbcEnc::new(&key.into(), &iv.into());
+            let blocks: &mut [GenericArray<u8, _>] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    buf.as_mut_ptr() as *mut GenericArray<u8, aes::cipher::consts::U16>,
+                    pt.len() / 16,
+                )
+            };
+            cipher.encrypt_blocks_mut(blocks);
+            buf
+        };
+        let ct0 = encrypt_chunk(&pt0);
+        let ct1 = encrypt_chunk(&pt1_padded);
+
+        // Assemble body: 8-byte mystery + u32 size + ct0 + u32 size + ct1 + u32 trailer.
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 8]);
+        body.extend_from_slice(&(ct0.len() as u32).to_le_bytes());
+        body.extend_from_slice(&ct0);
+        body.extend_from_slice(&(ct1.len() as u32).to_le_bytes());
+        body.extend_from_slice(&ct1);
+        body.extend_from_slice(&(pt1_real.len() as u32).to_le_bytes());
+
+        let got = decrypt_winimage_body(&body, b"password").unwrap();
+        let mut want = Vec::new();
+        want.extend_from_slice(&pt0);
+        want.extend_from_slice(&pt1_real);
+        assert_eq!(got, want);
     }
 
     #[test]
