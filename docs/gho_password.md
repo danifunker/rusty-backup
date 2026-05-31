@@ -25,10 +25,17 @@ seed = (crc ^ (crc >> 16)) & 0xffff
 ```
 
 `CRC32_FWD` is the standard **forward** CRC-32 table (poly `0x04C11DB7`,
-MSB-first, init 0, no reflection, no final XOR). The password is uppercased and
-truncated to 11 bytes, so Ghost passwords are case-insensitive and only the
-first 11 characters matter. Example: `"password"` -> `"PASSWORD"` -> seed
-`0x9BE1`.
+MSB-first, init 0, no reflection, no final XOR). The reader (`ghostexp.exe`)
+uppercases the password and `strncpy`s it to 11 bytes, so Ghost passwords are
+case-insensitive and only the first 11 characters matter. Example:
+`"password"` -> `"PASSWORD"` -> seed `0x9BE1`; `"Sw0rdFish"` /
+`"sw0rdfish"` / `"SW0RDFISH"` all -> seed `0x0E4B` (verified against a real
+fixture).
+
+Note: Ghost's *writer* (`ghost.exe -PWD=`) caps the password at **10**
+characters ("Usage Error 19000"), one below the reader's 11-byte truncation —
+so for every password Ghost can actually create, the 11th byte never matters
+and the two limits agree. We truncate at 11 to match the reader exactly.
 
 ### 2. Verifier / wrong-password check (`SetPassword @ 0x4d14d0`)
 
@@ -90,7 +97,19 @@ reference `CRC16Cipher` is unrelated to Symantec's real output.
   0x0118`) decrypts correctly with per-body reset.
 - The verifier decrypts to `BinaryResearch\0` with seed `0x9BE1`.
 - High-compression (zlib, split) and raw-split fixtures decrypt bit-exact too.
-- Unit tests in `gho_crypto.rs` pin the table, seed, verifier, and round-trip.
+- **Non-`password` KDF**: a fixture made with `Sw0rdFish` (seed `0x0E4B`) opens
+  end-to-end, and its verifier decrypts to `BinaryResearch\0`. `Sw0rdFish` /
+  `sw0rdfish` / `SW0RDFISH` all produce the same seed (case-insensitivity
+  confirmed on real output, not just the disassembly).
+- **Multi-partition** (MBR: FAT32 boot + extended + FAT16/FAT32 logicals):
+  - file-aware encrypted decrypts bit-exact to its unencrypted twin
+    (`MultiPartitions/11comp.GHO`); all four partitions browse via `rb-cli`.
+  - SECTOR + High (compressed, so unencrypted) decodes all four partitions and
+    browses each, including the logicals through the EBR chain.
+- **Fast-LZ** file-aware encrypted decrypts + decodes (password verified, body
+  cipher then Fast-LZ).
+- Unit tests in `gho_crypto.rs` pin the table, seed, verifier, and round-trip;
+  `gho.rs` tests cover body + chunked decryption and the SECTOR boundary fix.
 
 ## Implementation notes
 
