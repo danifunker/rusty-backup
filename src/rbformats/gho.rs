@@ -6978,10 +6978,41 @@ fn fixup_ntfs_typed_misalignments(
         }
     }
 
+    // Safety net: preserve every observed run the passes above couldn't match
+    // to an MFT entry, at its ORIGINAL lazy-scan LCN. The rebuild must never
+    // DROP a run the lazy scan found — dropping reads it back as zeros. This
+    // happens when a file's $DATA-describing attribute lives in an extension
+    // record we couldn't read (a zeroed MFT cluster), so the MFT walk never
+    // collected that file's runs and nothing here matches its observed stream
+    // run. Large registry hives hit exactly this — losing their first $DATA
+    // cluster (the `regf` base block) made the hive unloadable. Keep the lazy
+    // placement unless its LCN was already reassigned to a corrected run.
+    let orig_lcn_by_fo: std::collections::HashMap<u64, u64> = index
+        .runs
+        .iter()
+        .map(|r| (r.file_offset, r.lcn_start))
+        .collect();
+    let mut preserved_unmatched = 0usize;
+    for (i, o) in observed_runs.iter().enumerate() {
+        if used[i] {
+            continue;
+        }
+        let Some(&orig_lcn) = orig_lcn_by_fo.get(&o.file_offset) else {
+            continue;
+        };
+        if claimed.contains(&(orig_lcn, o.cc)) {
+            continue;
+        }
+        assignments.push((orig_lcn, o.cc, o.file_offset, o.seq));
+        claimed.insert((orig_lcn, o.cc));
+        used[i] = true;
+        preserved_unmatched += 1;
+    }
+
     log::info!(
         "NTFS fixup: typed-matched={typed_matched} typed-unmatched={typed_unmatched} \
          opaque-matched={opaque_matched} opaque-unmatched={opaque_unmatched} \
-         unused-observed={}",
+         preserved-unmatched={preserved_unmatched} unused-observed={}",
         used.iter().filter(|&&u| !u).count()
     );
 
