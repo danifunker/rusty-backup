@@ -20,6 +20,7 @@ pub mod ag;
 pub mod bmap;
 pub mod dir1;
 pub mod dir2;
+pub mod fsck;
 pub mod inode;
 pub mod sb;
 pub mod symlink;
@@ -828,6 +829,10 @@ impl<R: Read + Seek + Send> Filesystem for XfsFilesystem<R> {
     fn last_data_byte(&mut self) -> Result<u64, FilesystemError> {
         Ok(self.total_size())
     }
+
+    fn fsck(&mut self) -> Option<Result<crate::fs::fsck::FsckResult, FilesystemError>> {
+        Some(self.run_fsck())
+    }
 }
 
 /// Look up an extent record covering file fsblock `fb`. Returns
@@ -1030,6 +1035,46 @@ mod tests {
         assert_eq!(fs.fs_type(), "XFS v2");
         assert_eq!(fs.volume_label(), Some("RUSTYTEST"));
         assert_eq!(fs.total_size(), 131_072u64 * 4096);
+    }
+
+    #[test]
+    fn fsck_clean_v4_fixture_reports_no_errors() {
+        let img = load_fixture();
+        let mut fs = XfsFilesystem::open(Cursor::new(img), 0).expect("open xfs");
+        let res = fs.run_fsck().expect("fsck runs");
+        assert!(
+            res.errors.is_empty(),
+            "clean fixture should have no errors, got: {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+        assert!(!res.repairable);
+        // Stats should report the two allocation groups.
+        let ags = res
+            .stats
+            .extra
+            .iter()
+            .find(|(k, _)| k == "Allocation groups")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(ags, Some("2"));
+    }
+
+    #[test]
+    fn fsck_detects_corrupted_ag_superblock_replica() {
+        // Corrupt AG 1's superblock replica: flip its dblocks field so it
+        // disagrees with the primary. AG 1 starts at agblocks*blocksize =
+        // 65536 * 4096. The replica's dblocks is at offset 8..16.
+        let mut img = load_fixture().to_vec();
+        let ag1 = 65_536usize * 4096;
+        img[ag1 + 8..ag1 + 16].copy_from_slice(&0xDEADu64.to_be_bytes());
+        let mut fs = XfsFilesystem::open(Cursor::new(img), 0).expect("open xfs");
+        let res = fs.run_fsck().expect("fsck runs");
+        assert!(
+            res.errors.iter().any(|e| e.code == "ReplicaSbMismatch"),
+            "expected ReplicaSbMismatch, got: {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+        // A replica mismatch is repairable (R4 rewrites it from primary).
+        assert!(res.repairable);
     }
 
     #[test]
