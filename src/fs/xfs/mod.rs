@@ -1133,6 +1133,23 @@ mod tests {
     }
 
     #[test]
+    fn fsck_detects_agf_freeblks_mismatch() {
+        // Corrupt AG 0's AGF freeblks summary so it disagrees with the
+        // free-space btree walk. AGF is sector 1 (byte 512); freeblks is at
+        // AGF offset 52..56 (see ag.rs). Expect AgfFreeblksMismatch.
+        let mut img = load_fixture().to_vec();
+        let agf_freeblks = 512 + 52;
+        img[agf_freeblks..agf_freeblks + 4].copy_from_slice(&0u32.to_be_bytes());
+        let mut fs = XfsFilesystem::open(Cursor::new(img), 0).expect("open xfs");
+        let res = fs.run_fsck().expect("fsck runs");
+        assert!(
+            res.errors.iter().any(|e| e.code == "AgfFreeblksMismatch"),
+            "expected AgfFreeblksMismatch, got: {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn repair_r4_rewrites_corrupted_secondary_superblock() {
         // R4 round-trip: corrupt AG 1's secondary superblock geometry
         // (agblocks @ 84..88 and dblocks @ 8..16), run repair(), then confirm

@@ -26,8 +26,8 @@ use byteorder::{BigEndian, ByteOrder};
 use super::ag::{XfsAgf, XfsAgi};
 use super::sb::XfsSuperblock;
 use super::types::{
-    NULLAGBLOCK, XFS_BTREE_SBLOCK_CRC_LEN, XFS_BTREE_SBLOCK_LEN, XFS_IBT_CRC_MAGIC, XFS_IBT_MAGIC,
-    XFS_INODES_PER_CHUNK,
+    NULLAGBLOCK, XFS_ABTB_CRC_MAGIC, XFS_ABTB_MAGIC, XFS_BTREE_SBLOCK_CRC_LEN,
+    XFS_BTREE_SBLOCK_LEN, XFS_IBT_CRC_MAGIC, XFS_IBT_MAGIC, XFS_INODES_PER_CHUNK,
 };
 use super::{read_at_aligned, XfsFilesystem};
 use crate::fs::filesystem::{Filesystem, FilesystemError};
@@ -106,6 +106,10 @@ struct AgHeaders {
     /// AG-relative root block of the inode-allocation btree, if the AGI
     /// parsed. `None` means we can't enumerate this AG's inodes.
     agi_root: Option<u32>,
+    /// AG-relative root block of the free-space-by-block (bnobt) btree and
+    /// the AGF's cached free-block count, if the AGF parsed.
+    agf_bno_root: Option<u32>,
+    agf_freeblks: Option<u32>,
 }
 
 impl<R: Read + Seek + Send> XfsFilesystem<R> {
@@ -168,6 +172,8 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
                 out.push(AgHeaders {
                     expected_len,
                     agi_root: None,
+                    agf_bno_root: None,
+                    agf_freeblks: None,
                 });
                 continue;
             }
@@ -183,13 +189,18 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
 
             // --- AGF (sector 1) ---
             let agf_off = sectsize as usize;
-            match XfsAgf::parse(&buf[agf_off..agf_off + sectsize as usize]) {
-                Ok(agf) => {
-                    check_agf(&agf, agno, expected_len, b);
-                    total_free_blocks += agf.freeblks as u64;
-                }
-                Err(e) => b.err("AgfBadMagic", format!("AG {agno} AGF: {e}")),
-            }
+            let (agf_bno_root, agf_freeblks) =
+                match XfsAgf::parse(&buf[agf_off..agf_off + sectsize as usize]) {
+                    Ok(agf) => {
+                        check_agf(&agf, agno, expected_len, b);
+                        total_free_blocks += agf.freeblks as u64;
+                        (Some(agf.bno_root), Some(agf.freeblks))
+                    }
+                    Err(e) => {
+                        b.err("AgfBadMagic", format!("AG {agno} AGF: {e}"));
+                        (None, None)
+                    }
+                };
 
             // --- AGI (sector 2) ---
             let agi_off = 2 * sectsize as usize;
@@ -209,6 +220,8 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
             out.push(AgHeaders {
                 expected_len,
                 agi_root,
+                agf_bno_root,
+                agf_freeblks,
             });
         }
 
@@ -296,6 +309,31 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
                     let ino = (agno << (sb.agblklog + sb.inopblog)) | agino;
                     allocated.insert(ino);
                     self.scan_inode_blocks(sb, ino, &mut map, b);
+                }
+            }
+
+            // Free-space btree (bnobt): sum the free extents and cross-check
+            // against the AGF's cached freeblks. Catches summary corruption
+            // and validates the btree is internally walkable.
+            if let (Some(bno_root), Some(agf_freeblks)) = (ag.agf_bno_root, ag.agf_freeblks) {
+                match self.sum_freesp_btree(sb, agno, bno_root, ag.expected_len, &mut map, b) {
+                    Ok(free_blocks) => {
+                        if free_blocks != agf_freeblks as u64 {
+                            b.err(
+                                "AgfFreeblksMismatch",
+                                format!(
+                                    "AG {agno}: free-space btree sums to {free_blocks} blocks, \
+                                     but AGF freeblks = {agf_freeblks}"
+                                ),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        b.err(
+                            "FreespBtreeWalkFailed",
+                            format!("AG {agno} free-space btree: {e}"),
+                        );
+                    }
                 }
             }
         }
@@ -564,6 +602,88 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
             }
         }
         Ok(recs)
+    }
+
+    /// Walk the free-space-by-block (bnobt) btree, sum the free extents'
+    /// block counts, and mark every btree block as fs metadata in `map`.
+    /// Free *data* blocks are intentionally left `S_UNKNOWN` (they're free).
+    ///
+    /// alloc-btree record/key are 8 bytes (startblock u32 + blockcount u32);
+    /// pointers are 4 bytes, laid out as keys[maxrecs] then ptrs[maxrecs].
+    fn sum_freesp_btree(
+        &mut self,
+        sb: &XfsSuperblock,
+        agno: u64,
+        root_agbno: u32,
+        expected_len: u64,
+        map: &mut OwnerMap,
+        b: &mut Builder,
+    ) -> Result<u64, FilesystemError> {
+        let bs = sb.blocksize as usize;
+        let hdr = if sb.is_v5() {
+            XFS_BTREE_SBLOCK_CRC_LEN
+        } else {
+            XFS_BTREE_SBLOCK_LEN
+        };
+        // Internal nodes: key(8) + ptr(4); leaves: rec(8).
+        let max_intern = (bs - hdr) / 12;
+        let max_leaf = (bs - hdr) / 8;
+        let agblocks = sb.agblocks as u64;
+
+        let mut free_blocks: u64 = 0;
+        let mut block = vec![0u8; bs];
+        let mut stack = vec![root_agbno];
+        let mut visited: HashSet<u32> = HashSet::new();
+
+        while let Some(agbno) = stack.pop() {
+            if agbno == NULLAGBLOCK || agbno as u64 >= expected_len {
+                continue;
+            }
+            if !visited.insert(agbno) {
+                b.err(
+                    "FreespBtreeCycle",
+                    format!("AG {agno} free-space btree: block {agbno} visited twice"),
+                );
+                continue;
+            }
+            let fsblock = (agno << sb.agblklog) | agbno as u64;
+            self.read_fsblock(fsblock, &mut block)?;
+            map.mark(agno * agblocks + agbno as u64, S_INUSE_FS);
+
+            let magic = BigEndian::read_u32(&block[0..4]);
+            if magic != XFS_ABTB_MAGIC && magic != XFS_ABTB_CRC_MAGIC {
+                return Err(FilesystemError::Parse(format!(
+                    "bad free-space btree magic 0x{magic:08X} at AG {agno} block {agbno}"
+                )));
+            }
+            let level = BigEndian::read_u16(&block[4..6]);
+            let numrecs = BigEndian::read_u16(&block[6..8]) as usize;
+
+            if level == 0 {
+                if numrecs > max_leaf {
+                    return Err(FilesystemError::Parse(format!(
+                        "AG {agno} free-space btree leaf numrecs {numrecs} > max {max_leaf}"
+                    )));
+                }
+                for i in 0..numrecs {
+                    let off = hdr + i * 8;
+                    let blockcount = BigEndian::read_u32(&block[off + 4..off + 8]);
+                    free_blocks += blockcount as u64;
+                }
+            } else {
+                if numrecs > max_intern {
+                    return Err(FilesystemError::Parse(format!(
+                        "AG {agno} free-space btree node numrecs {numrecs} > max {max_intern}"
+                    )));
+                }
+                let ptr_base = hdr + max_intern * 8;
+                for i in 0..numrecs {
+                    let off = ptr_base + i * 4;
+                    stack.push(BigEndian::read_u32(&block[off..off + 4]));
+                }
+            }
+        }
+        Ok(free_blocks)
     }
 }
 
