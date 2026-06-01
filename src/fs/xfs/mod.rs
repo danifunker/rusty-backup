@@ -1150,6 +1150,54 @@ mod tests {
     }
 
     #[test]
+    fn repair_r4b_rewrites_agf_agi_summaries() {
+        // R4b round-trip: corrupt AG 0's AGF freeblks (byte 512+52) and AGI
+        // count/freecount (byte 1024+16, 1024+28), run repair(), confirm the
+        // verifier reports clean. Validates the summary-rewrite path.
+        use crate::fs::filesystem::EditableFilesystem;
+        let mut img = load_fixture().to_vec();
+        img[512 + 52..512 + 56].copy_from_slice(&0u32.to_be_bytes()); // AGF freeblks
+        img[1024 + 16..1024 + 20].copy_from_slice(&111u32.to_be_bytes()); // AGI count
+        img[1024 + 28..1024 + 32].copy_from_slice(&111u32.to_be_bytes()); // AGI freecount
+
+        // Pre-repair: verifier flags the freeblks mismatch.
+        {
+            let mut fs = XfsFilesystem::open(Cursor::new(img.clone()), 0).expect("open");
+            let res = fs.run_fsck().expect("fsck");
+            assert!(res.errors.iter().any(|e| e.code == "AgfFreeblksMismatch"));
+        }
+
+        let mut cursor = Cursor::new(img);
+        let report = {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable");
+            fs.repair().expect("repair runs")
+        };
+        assert_eq!(report.fixes_failed.len(), 0, "{:?}", report.fixes_failed);
+        assert!(
+            report
+                .fixes_applied
+                .iter()
+                .any(|f| f.contains("AGF freeblks")),
+            "expected AGF freeblks fix, got: {:?}",
+            report.fixes_applied
+        );
+        assert!(
+            report.fixes_applied.iter().any(|f| f.contains("AGI count")),
+            "expected AGI count fix, got: {:?}",
+            report.fixes_applied
+        );
+
+        let repaired = cursor.into_inner();
+        let mut fs = XfsFilesystem::open(Cursor::new(repaired), 0).expect("reopen");
+        let res = fs.run_fsck().expect("fsck after repair");
+        assert!(
+            res.errors.is_empty(),
+            "expected clean after repair, got: {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn repair_r4_rewrites_corrupted_secondary_superblock() {
         // R4 round-trip: corrupt AG 1's secondary superblock geometry
         // (agblocks @ 84..88 and dblocks @ 8..16), run repair(), then confirm

@@ -21,7 +21,9 @@
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
-use super::ag::XfsAgf;
+use byteorder::{BigEndian, ByteOrder};
+
+use super::ag::{XfsAgf, XfsAgi};
 use super::sb::XfsSuperblock;
 use super::{read_at_aligned, XfsFilesystem};
 use crate::fs::entry::FileEntry;
@@ -121,6 +123,102 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         Ok(report)
     }
 
+    /// R4b: recompute the AGF/AGI summary counters from the btrees and rewrite
+    /// them if the cached values are wrong.
+    ///
+    /// `agf_freeblks` is recomputed by summing the free-space btree; `agi_count`
+    /// and `agi_freecount` from the inode btree. These are cached summaries —
+    /// the btrees themselves are authoritative — so a straight overwrite is
+    /// safe and self-verifiable (re-run the verifier; xfs_repair -n agrees).
+    /// Field offsets within the AGF/AGI sectors per the on-disk layout:
+    /// AGF freeblks @ 52..56; AGI count @ 16..20, freecount @ 28..32.
+    pub(crate) fn run_repair_summaries(&mut self) -> Result<RepairReport, FilesystemError> {
+        let mut report = RepairReport {
+            fixes_applied: Vec::new(),
+            fixes_failed: Vec::new(),
+            unrepairable_count: 0,
+        };
+        let sb = self.superblock().clone();
+        let sectsize = sb.sectsize as u64;
+        let agblocks = sb.agblocks as u64;
+        let blocksize = sb.blocksize as u64;
+
+        for agno in 0..sb.agcount as u64 {
+            let expected_len = if agno == sb.agcount as u64 - 1 {
+                sb.dblocks - agno * agblocks
+            } else {
+                agblocks
+            };
+            let ag_byte = self.partition_offset + agno * agblocks * blocksize;
+            let agf_byte = ag_byte + sectsize;
+            let agi_byte = ag_byte + 2 * sectsize;
+
+            // --- AGF freeblks ---
+            let mut agf = vec![0u8; sectsize as usize];
+            if read_at_aligned(&mut self.reader, agf_byte, sectsize, &mut agf).is_ok() {
+                if let Ok(parsed) = XfsAgf::parse(&agf) {
+                    match self.freesp_block_total(&sb, agno, parsed.bno_root, expected_len) {
+                        Ok(correct) if correct != parsed.freeblks as u64 => {
+                            BigEndian::write_u32(&mut agf[52..56], correct as u32);
+                            self.write_sector(agf_byte, &agf, &mut report, agno, "AGF freeblks");
+                        }
+                        Ok(_) => {}
+                        Err(e) => report
+                            .fixes_failed
+                            .push(format!("AG {agno}: AGF freeblks recompute failed: {e}")),
+                    }
+                }
+            }
+
+            // --- AGI count / freecount ---
+            let mut agi = vec![0u8; sectsize as usize];
+            if read_at_aligned(&mut self.reader, agi_byte, sectsize, &mut agi).is_ok() {
+                if let Ok(parsed) = XfsAgi::parse(&agi) {
+                    match self.inode_count_freecount(&sb, agno, parsed.root, expected_len) {
+                        Ok((count, freecount))
+                            if count != parsed.count || freecount != parsed.freecount =>
+                        {
+                            BigEndian::write_u32(&mut agi[16..20], count);
+                            BigEndian::write_u32(&mut agi[28..32], freecount);
+                            self.write_sector(agi_byte, &agi, &mut report, agno, "AGI count");
+                        }
+                        Ok(_) => {}
+                        Err(e) => report
+                            .fixes_failed
+                            .push(format!("AG {agno}: AGI count recompute failed: {e}")),
+                    }
+                }
+            }
+        }
+        self.reader.flush()?;
+        Ok(report)
+    }
+
+    /// Write a full sector at `byte_off`, recording success/failure.
+    fn write_sector(
+        &mut self,
+        byte_off: u64,
+        data: &[u8],
+        report: &mut RepairReport,
+        agno: u64,
+        what: &str,
+    ) {
+        if self.reader.seek(SeekFrom::Start(byte_off)).is_err() {
+            report
+                .fixes_failed
+                .push(format!("AG {agno}: seek for {what} failed"));
+            return;
+        }
+        match self.reader.write_all(data) {
+            Ok(()) => report
+                .fixes_applied
+                .push(format!("AG {agno}: rewrote {what} from btree")),
+            Err(e) => report
+                .fixes_failed
+                .push(format!("AG {agno}: {what} write failed: {e}")),
+        }
+    }
+
     /// Sum free blocks across all AGFs → free bytes. Used by `free_space`.
     fn free_bytes(&mut self) -> Result<u64, FilesystemError> {
         let sb = self.superblock().clone();
@@ -177,7 +275,14 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for XfsFilesystem<R> {
     }
 
     fn repair(&mut self) -> Result<RepairReport, FilesystemError> {
-        self.run_repair()
+        // R4: secondary-superblock geometry, then R4b: AGF/AGI summary
+        // counters. Both are conservative (no structural btree writes).
+        let mut report = self.run_repair()?;
+        let summaries = self.run_repair_summaries()?;
+        report.fixes_applied.extend(summaries.fixes_applied);
+        report.fixes_failed.extend(summaries.fixes_failed);
+        report.unrepairable_count += summaries.unrepairable_count;
+        Ok(report)
     }
 
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {

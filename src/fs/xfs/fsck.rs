@@ -36,12 +36,17 @@ use crate::fs::fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry};
 /// FsckIssue codes the XFS repair path knows how to fix.
 ///
 /// `ReplicaSbMismatch` — a per-AG superblock copy can be rewritten verbatim
-/// from the authoritative primary (R4). `OrphanInode` — an
-/// allocated-but-unreachable inode can be reconnected into `lost+found/`
-/// (R7). Structural damage (bad AG headers, cross-links, dangling entries)
-/// is surfaced for diagnosis until the rebuild phases land.
+/// from the authoritative primary (R4). `AgfFreeblksMismatch` — the AGF's
+/// cached free-block summary can be recomputed from the bnobt and rewritten
+/// (R4b). `OrphanInode` — an allocated-but-unreachable inode can be
+/// reconnected into `lost+found/` (R7). Structural damage (bad AG headers,
+/// cross-links, dangling entries) is surfaced for diagnosis until the rebuild
+/// phases land.
 fn is_repairable_code(code: &str) -> bool {
-    matches!(code, "ReplicaSbMismatch" | "OrphanInode")
+    matches!(
+        code,
+        "ReplicaSbMismatch" | "AgfFreeblksMismatch" | "OrphanInode"
+    )
 }
 
 /// Accumulates findings; keeps the per-check code focused.
@@ -284,14 +289,13 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
             map.mark(agno * agblocks, S_INUSE_FS);
 
             let Some(root) = ag.agi_root else { continue };
-            let recs =
-                match self.collect_inobt_records(sb, agno, root, ag.expected_len, &mut map, b) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        b.err("InobtWalkFailed", format!("AG {agno} inode btree: {e}"));
-                        continue;
-                    }
-                };
+            let recs = match self.collect_inobt_records(sb, agno, root, ag.expected_len, &mut map) {
+                Ok(r) => r,
+                Err(e) => {
+                    b.err("InobtWalkFailed", format!("AG {agno} inode btree: {e}"));
+                    continue;
+                }
+            };
 
             for rec in recs {
                 // Claim the inode-chunk blocks themselves.
@@ -316,7 +320,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
             // against the AGF's cached freeblks. Catches summary corruption
             // and validates the btree is internally walkable.
             if let (Some(bno_root), Some(agf_freeblks)) = (ag.agf_bno_root, ag.agf_freeblks) {
-                match self.sum_freesp_btree(sb, agno, bno_root, ag.expected_len, &mut map, b) {
+                match self.sum_freesp_btree(sb, agno, bno_root, ag.expected_len, &mut map) {
                     Ok(free_blocks) => {
                         if free_blocks != agf_freeblks as u64 {
                             b.err(
@@ -525,6 +529,88 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         }
     }
 
+    /// Generic descent of a short-form (AG-relative) btree from `root_agbno`.
+    /// Calls `on_record` with each leaf record's `rec_size`-byte slice and
+    /// `on_block` with each visited btree block's AG-linear block number (for
+    /// ownership marking). `leaf_magics` are the accepted block magics (v4 +
+    /// v5 variant); `key_size` is the internal-node key width (pointers are
+    /// always 4 bytes, laid out as keys[maxrecs] then ptrs[maxrecs]). Returns
+    /// Err on magic / numrecs / cycle corruption.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_sblock_btree(
+        &mut self,
+        sb: &XfsSuperblock,
+        agno: u64,
+        root_agbno: u32,
+        expected_len: u64,
+        leaf_magics: [u32; 2],
+        rec_size: usize,
+        key_size: usize,
+        mut on_record: impl FnMut(&[u8]),
+        mut on_block: impl FnMut(u64),
+    ) -> Result<(), FilesystemError> {
+        let bs = sb.blocksize as usize;
+        let hdr = if sb.is_v5() {
+            XFS_BTREE_SBLOCK_CRC_LEN
+        } else {
+            XFS_BTREE_SBLOCK_LEN
+        };
+        let max_intern = (bs - hdr) / (key_size + 4);
+        let max_leaf = (bs - hdr) / rec_size;
+        let agblocks = sb.agblocks as u64;
+
+        let mut block = vec![0u8; bs];
+        let mut stack = vec![root_agbno];
+        let mut visited: HashSet<u32> = HashSet::new();
+
+        while let Some(agbno) = stack.pop() {
+            if agbno == NULLAGBLOCK || agbno as u64 >= expected_len {
+                continue;
+            }
+            if !visited.insert(agbno) {
+                return Err(FilesystemError::Parse(format!(
+                    "AG {agno} btree: block {agbno} visited twice (cycle)"
+                )));
+            }
+            let fsblock = (agno << sb.agblklog) | agbno as u64;
+            self.read_fsblock(fsblock, &mut block)?;
+            on_block(agno * agblocks + agbno as u64);
+
+            let magic = BigEndian::read_u32(&block[0..4]);
+            if !leaf_magics.contains(&magic) {
+                return Err(FilesystemError::Parse(format!(
+                    "bad btree magic 0x{magic:08X} at AG {agno} block {agbno}"
+                )));
+            }
+            let level = BigEndian::read_u16(&block[4..6]);
+            let numrecs = BigEndian::read_u16(&block[6..8]) as usize;
+
+            if level == 0 {
+                if numrecs > max_leaf {
+                    return Err(FilesystemError::Parse(format!(
+                        "AG {agno} btree leaf numrecs {numrecs} > max {max_leaf}"
+                    )));
+                }
+                for i in 0..numrecs {
+                    let off = hdr + i * rec_size;
+                    on_record(&block[off..off + rec_size]);
+                }
+            } else {
+                if numrecs > max_intern {
+                    return Err(FilesystemError::Parse(format!(
+                        "AG {agno} btree node numrecs {numrecs} > max {max_intern}"
+                    )));
+                }
+                let ptr_base = hdr + max_intern * key_size;
+                for i in 0..numrecs {
+                    let off = ptr_base + i * 4;
+                    stack.push(BigEndian::read_u32(&block[off..off + 4]));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Walk an AG's inode-allocation btree, collecting every leaf record and
     /// marking the btree's own blocks as filesystem metadata in `map`.
     fn collect_inobt_records(
@@ -534,82 +620,32 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         root_agbno: u32,
         expected_len: u64,
         map: &mut OwnerMap,
-        b: &mut Builder,
     ) -> Result<Vec<InobtRec>, FilesystemError> {
-        let bs = sb.blocksize as usize;
-        let hdr = if sb.is_v5() {
-            XFS_BTREE_SBLOCK_CRC_LEN
-        } else {
-            XFS_BTREE_SBLOCK_LEN
-        };
-        // Internal nodes: key(4) + ptr(4); leaves: rec(16).
-        let max_intern = (bs - hdr) / 8;
-        let max_leaf = (bs - hdr) / 16;
-        let agblocks = sb.agblocks as u64;
-
         let mut recs = Vec::new();
-        let mut block = vec![0u8; bs];
-        let mut stack = vec![root_agbno];
-        let mut visited: HashSet<u32> = HashSet::new();
-
-        while let Some(agbno) = stack.pop() {
-            if agbno == NULLAGBLOCK || agbno as u64 >= expected_len {
-                continue;
-            }
-            if !visited.insert(agbno) {
-                b.err(
-                    "InobtCycle",
-                    format!("AG {agno} inode btree: block {agbno} visited twice"),
-                );
-                continue;
-            }
-            let fsblock = (agno << sb.agblklog) | agbno as u64;
-            self.read_fsblock(fsblock, &mut block)?;
-            map.mark(agno * agblocks + agbno as u64, S_INUSE_FS);
-
-            let magic = BigEndian::read_u32(&block[0..4]);
-            if magic != XFS_IBT_MAGIC && magic != XFS_IBT_CRC_MAGIC {
-                return Err(FilesystemError::Parse(format!(
-                    "bad inode btree magic 0x{magic:08X} at AG {agno} block {agbno}"
-                )));
-            }
-            let level = BigEndian::read_u16(&block[4..6]);
-            let numrecs = BigEndian::read_u16(&block[6..8]) as usize;
-
-            if level == 0 {
-                if numrecs > max_leaf {
-                    return Err(FilesystemError::Parse(format!(
-                        "AG {agno} inode btree leaf numrecs {numrecs} > max {max_leaf}"
-                    )));
-                }
-                for i in 0..numrecs {
-                    let off = hdr + i * 16;
-                    let start_agino = BigEndian::read_u32(&block[off..off + 4]);
-                    let free = BigEndian::read_u64(&block[off + 8..off + 16]);
-                    recs.push(InobtRec { start_agino, free });
-                }
-            } else {
-                if numrecs > max_intern {
-                    return Err(FilesystemError::Parse(format!(
-                        "AG {agno} inode btree node numrecs {numrecs} > max {max_intern}"
-                    )));
-                }
-                let ptr_base = hdr + max_intern * 4;
-                for i in 0..numrecs {
-                    let off = ptr_base + i * 4;
-                    stack.push(BigEndian::read_u32(&block[off..off + 4]));
-                }
-            }
-        }
+        self.walk_sblock_btree(
+            sb,
+            agno,
+            root_agbno,
+            expected_len,
+            [XFS_IBT_MAGIC, XFS_IBT_CRC_MAGIC],
+            16, // inobt leaf record width
+            4,  // inobt internal key width
+            |rec| {
+                recs.push(InobtRec {
+                    start_agino: BigEndian::read_u32(&rec[0..4]),
+                    free: BigEndian::read_u64(&rec[8..16]),
+                });
+            },
+            |linear| {
+                map.mark(linear, S_INUSE_FS);
+            },
+        )?;
         Ok(recs)
     }
 
     /// Walk the free-space-by-block (bnobt) btree, sum the free extents'
     /// block counts, and mark every btree block as fs metadata in `map`.
     /// Free *data* blocks are intentionally left `S_UNKNOWN` (they're free).
-    ///
-    /// alloc-btree record/key are 8 bytes (startblock u32 + blockcount u32);
-    /// pointers are 4 bytes, laid out as keys[maxrecs] then ptrs[maxrecs].
     fn sum_freesp_btree(
         &mut self,
         sb: &XfsSuperblock,
@@ -617,73 +653,79 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         root_agbno: u32,
         expected_len: u64,
         map: &mut OwnerMap,
-        b: &mut Builder,
     ) -> Result<u64, FilesystemError> {
-        let bs = sb.blocksize as usize;
-        let hdr = if sb.is_v5() {
-            XFS_BTREE_SBLOCK_CRC_LEN
-        } else {
-            XFS_BTREE_SBLOCK_LEN
-        };
-        // Internal nodes: key(8) + ptr(4); leaves: rec(8).
-        let max_intern = (bs - hdr) / 12;
-        let max_leaf = (bs - hdr) / 8;
-        let agblocks = sb.agblocks as u64;
-
         let mut free_blocks: u64 = 0;
-        let mut block = vec![0u8; bs];
-        let mut stack = vec![root_agbno];
-        let mut visited: HashSet<u32> = HashSet::new();
-
-        while let Some(agbno) = stack.pop() {
-            if agbno == NULLAGBLOCK || agbno as u64 >= expected_len {
-                continue;
-            }
-            if !visited.insert(agbno) {
-                b.err(
-                    "FreespBtreeCycle",
-                    format!("AG {agno} free-space btree: block {agbno} visited twice"),
-                );
-                continue;
-            }
-            let fsblock = (agno << sb.agblklog) | agbno as u64;
-            self.read_fsblock(fsblock, &mut block)?;
-            map.mark(agno * agblocks + agbno as u64, S_INUSE_FS);
-
-            let magic = BigEndian::read_u32(&block[0..4]);
-            if magic != XFS_ABTB_MAGIC && magic != XFS_ABTB_CRC_MAGIC {
-                return Err(FilesystemError::Parse(format!(
-                    "bad free-space btree magic 0x{magic:08X} at AG {agno} block {agbno}"
-                )));
-            }
-            let level = BigEndian::read_u16(&block[4..6]);
-            let numrecs = BigEndian::read_u16(&block[6..8]) as usize;
-
-            if level == 0 {
-                if numrecs > max_leaf {
-                    return Err(FilesystemError::Parse(format!(
-                        "AG {agno} free-space btree leaf numrecs {numrecs} > max {max_leaf}"
-                    )));
-                }
-                for i in 0..numrecs {
-                    let off = hdr + i * 8;
-                    let blockcount = BigEndian::read_u32(&block[off + 4..off + 8]);
-                    free_blocks += blockcount as u64;
-                }
-            } else {
-                if numrecs > max_intern {
-                    return Err(FilesystemError::Parse(format!(
-                        "AG {agno} free-space btree node numrecs {numrecs} > max {max_intern}"
-                    )));
-                }
-                let ptr_base = hdr + max_intern * 8;
-                for i in 0..numrecs {
-                    let off = ptr_base + i * 4;
-                    stack.push(BigEndian::read_u32(&block[off..off + 4]));
-                }
-            }
-        }
+        self.walk_sblock_btree(
+            sb,
+            agno,
+            root_agbno,
+            expected_len,
+            [XFS_ABTB_MAGIC, XFS_ABTB_CRC_MAGIC],
+            8, // alloc leaf record width (startblock + blockcount)
+            8, // alloc internal key width
+            |rec| {
+                free_blocks += BigEndian::read_u32(&rec[4..8]) as u64;
+            },
+            |linear| {
+                map.mark(linear, S_INUSE_FS);
+            },
+        )?;
         Ok(free_blocks)
+    }
+
+    /// Repair helper: total free blocks in the bnobt (no ownership map / no
+    /// findings). Used by R4b to recompute the AGF freeblks summary.
+    pub(crate) fn freesp_block_total(
+        &mut self,
+        sb: &XfsSuperblock,
+        agno: u64,
+        root_agbno: u32,
+        expected_len: u64,
+    ) -> Result<u64, FilesystemError> {
+        let mut free_blocks: u64 = 0;
+        self.walk_sblock_btree(
+            sb,
+            agno,
+            root_agbno,
+            expected_len,
+            [XFS_ABTB_MAGIC, XFS_ABTB_CRC_MAGIC],
+            8,
+            8,
+            |rec| {
+                free_blocks += BigEndian::read_u32(&rec[4..8]) as u64;
+            },
+            |_| {},
+        )?;
+        Ok(free_blocks)
+    }
+
+    /// Repair helper: (count, freecount) of inodes in the inobt. `count` is
+    /// allocated-chunk inodes (records * 64); `freecount` sums the free
+    /// bitmaps. Used by R4b to recompute the AGI summary.
+    pub(crate) fn inode_count_freecount(
+        &mut self,
+        sb: &XfsSuperblock,
+        agno: u64,
+        root_agbno: u32,
+        expected_len: u64,
+    ) -> Result<(u32, u32), FilesystemError> {
+        let mut count: u64 = 0;
+        let mut freecount: u64 = 0;
+        self.walk_sblock_btree(
+            sb,
+            agno,
+            root_agbno,
+            expected_len,
+            [XFS_IBT_MAGIC, XFS_IBT_CRC_MAGIC],
+            16,
+            4,
+            |rec| {
+                count += XFS_INODES_PER_CHUNK as u64;
+                freecount += BigEndian::read_u64(&rec[8..16]).count_ones() as u64;
+            },
+            |_| {},
+        )?;
+        Ok((count as u32, freecount as u32))
     }
 }
 
