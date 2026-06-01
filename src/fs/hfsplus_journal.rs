@@ -412,6 +412,131 @@ impl JournalState {
     }
 }
 
+/// A named byte range of one volume metadata structure, used to classify which
+/// subsystem a journaled block targets. Offsets are relative to the partition.
+#[derive(Debug, Clone)]
+pub struct MetadataRegion {
+    pub name: &'static str,
+    pub start: u64,
+    pub end: u64,
+}
+
+/// Classify a target byte offset against a set of metadata regions, returning
+/// the region name or `"fork data"` when it falls outside all of them.
+pub fn classify_target(regions: &[MetadataRegion], target: u64) -> &'static str {
+    for r in regions {
+        if target >= r.start && target < r.end {
+            return r.name;
+        }
+    }
+    "fork data"
+}
+
+/// One journaled block, trimmed for display: where it lands, its size, and a
+/// short hex preview of its leading bytes.
+#[derive(Debug, Clone)]
+pub struct JournalBlockDetail {
+    /// Target byte offset relative to the partition (`bnum * jhdr_size`).
+    pub target: u64,
+    pub bsize: u32,
+    /// First up-to-64 payload bytes, for a hex preview in the viewer.
+    pub preview: Vec<u8>,
+}
+
+/// One transaction, fully decoded for the history viewer (block previews only,
+/// not full payloads, to bound memory on large journals).
+#[derive(Debug, Clone)]
+pub struct JournalTxnDetail {
+    pub sequence_num: u32,
+    pub flags: u32,
+    pub bytes_used: u32,
+    pub total_bytes: u64,
+    pub blocks: Vec<JournalBlockDetail>,
+}
+
+/// Everything the GUI journal viewer needs: the JIB + header, the decoded
+/// transactions (newest-last, as walked), the metadata regions used to
+/// classify block targets, and any consistency findings.
+#[derive(Debug, Clone)]
+pub struct JournalDetail {
+    pub info: JournalInfoBlock,
+    pub header: JournalHeader,
+    pub transactions: Vec<JournalTxnDetail>,
+    pub regions: Vec<MetadataRegion>,
+    pub checksum_mismatch: Option<u32>,
+    pub sequence_jumps: Vec<(u32, u32)>,
+    pub partial: bool,
+}
+
+/// Largest preview kept per block.
+const PREVIEW_BYTES: usize = 64;
+
+/// Walk a journal into a [`JournalDetail`], capturing bounded per-block
+/// previews. `regions` is supplied by the caller (it needs the volume header's
+/// fork extents). Used by the GUI history viewer (Step 29).
+pub fn read_journal_detail<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    jib: JournalInfoBlock,
+    header: JournalHeader,
+    regions: Vec<MetadataRegion>,
+) -> JournalDetail {
+    let mut transactions = Vec::new();
+    let mut checksum_mismatch = None;
+    let mut sequence_jumps = Vec::new();
+    let mut partial = false;
+    {
+        let mut walker = JournalWalker::new(reader, partition_offset, &jib, &header);
+        let mut prev_seq: Option<u32> = None;
+        while let Some(item) = walker.next() {
+            match item {
+                Ok(view) => {
+                    if let Some(prev) = prev_seq {
+                        if view.sequence_num != prev && view.sequence_num != prev.wrapping_add(1) {
+                            sequence_jumps.push((prev, view.sequence_num));
+                        }
+                    }
+                    prev_seq = Some(view.sequence_num);
+                    let blocks = view
+                        .blocks
+                        .iter()
+                        .map(|(target, data)| JournalBlockDetail {
+                            target: *target,
+                            bsize: data.len() as u32,
+                            preview: data[..data.len().min(PREVIEW_BYTES)].to_vec(),
+                        })
+                        .collect();
+                    transactions.push(JournalTxnDetail {
+                        sequence_num: view.sequence_num,
+                        flags: view.flags,
+                        bytes_used: view.bytes_used,
+                        total_bytes: view.total_payload,
+                        blocks,
+                    });
+                }
+                Err(JournalError::CorruptTransaction { sequence_num }) => {
+                    checksum_mismatch = Some(sequence_num);
+                    partial = true;
+                    break;
+                }
+                Err(_) => {
+                    partial = true;
+                    break;
+                }
+            }
+        }
+    }
+    JournalDetail {
+        info: jib,
+        header,
+        transactions,
+        regions,
+        checksum_mismatch,
+        sequence_jumps,
+        partial,
+    }
+}
+
 /// Walks the live transactions of a journal (`start -> end`, wrapping at
 /// `size`). Each `next` decodes one transaction. The walker reads straight
 /// from the disk so it works on any `Read + Seek` source.

@@ -598,18 +598,19 @@ mod tests {
         assert!(!result.is_clean());
     }
 
-    /// Graft an in-FS journal onto a blank volume with one good transaction
-    /// and one whose block-list-header checksum has been corrupted, then run
-    /// fsck and confirm phase 4 surfaces exactly one `JournalChecksumMismatch`.
-    #[test]
-    fn fsck_journal_phase_flags_corrupt_transaction() {
+    /// Graft an in-FS journal onto a blank volume, writing each element of
+    /// `txns` as one dirty transaction. Returns the image and the
+    /// journal-relative start offset of every transaction (so a caller can
+    /// corrupt one). The journal lives in the volume tail, past anything the
+    /// blank layout uses, so the bitmap will not account for it (harmless for
+    /// these journal-focused tests).
+    fn graft_journal(size: u64, bs: u32, txns: &[Vec<(u64, Vec<u8>)>]) -> (Vec<u8>, Vec<u64>) {
         use super::super::hfsplus_journal::{
             JournalEndian, JournalHeader, JournalInfoBlock, TransactionBuilder,
             JOURNAL_HEADER_MAGIC, KJI_JOURNAL_IN_FS_MASK,
         };
 
-        let bs = 4096u32;
-        let mut img = create_blank_hfsplus(32 * 1024 * 1024, bs, "Jrnl", false);
+        let mut img = create_blank_hfsplus(size, bs, "Jrnl", false);
 
         // Set the journaled bit in the primary + alternate volume headers.
         for vh in [1024usize, img.len() - 1024] {
@@ -618,10 +619,6 @@ mod tests {
             BigEndian::write_u32(&mut img[vh + 4..vh + 8], attrs);
         }
 
-        // Place the JIB + journal in the volume tail (well past anything the
-        // blank layout uses). The bitmap will not account for these blocks, so
-        // fsck phase 3 reports a (harmless, for this test) error; we assert on
-        // the journal warning specifically.
         let jib_offset = (img.len() as u64 - 256 * 1024) & !(bs as u64 - 1);
         let jib_block = (jib_offset / bs as u64) as u32;
         for vh in [1024usize, img.len() - 1024] {
@@ -630,7 +627,6 @@ mod tests {
 
         let journal_offset = jib_offset + bs as u64;
         let journal_size = 64 * 1024u64;
-        // JIB: flags (in-FS), journal offset, journal size — all big-endian.
         BigEndian::write_u32(&mut img[jib_offset as usize..], KJI_JOURNAL_IN_FS_MASK);
         BigEndian::write_u64(&mut img[jib_offset as usize + 36..], journal_offset);
         BigEndian::write_u64(&mut img[jib_offset as usize + 44..], journal_size);
@@ -655,21 +651,37 @@ mod tests {
             size: journal_size,
         };
         let mut jh = header.clone();
-        let second_start;
+        let mut starts = Vec::new();
         {
             let mut cur = Cursor::new(&mut img);
-            let mut b1 = TransactionBuilder::new(512);
-            b1.record_block(0, &vec![0xAB; 512]);
-            b1.write_to_journal(&mut cur, &jib, &mut jh, 0).unwrap();
-
-            second_start = jh.end;
-            let mut b2 = TransactionBuilder::new(512);
-            b2.record_block(512, &vec![0xCD; 512]);
-            b2.write_to_journal(&mut cur, &jib, &mut jh, 0).unwrap();
+            for blocks in txns {
+                starts.push(jh.end);
+                let mut b = TransactionBuilder::new(512);
+                for (off, data) in blocks {
+                    b.record_block(*off, data);
+                }
+                b.write_to_journal(&mut cur, &jib, &mut jh, 0).unwrap();
+            }
         }
+        // Convert journal-relative starts to absolute byte offsets.
+        let abs_starts = starts.iter().map(|s| journal_offset + s).collect();
+        (img, abs_starts)
+    }
+
+    /// One good transaction and one whose block-list-header checksum has been
+    /// corrupted: fsck phase 4 surfaces exactly one `JournalChecksumMismatch`.
+    #[test]
+    fn fsck_journal_phase_flags_corrupt_transaction() {
+        let (mut img, starts) = graft_journal(
+            32 * 1024 * 1024,
+            4096,
+            &[
+                vec![(0u64, vec![0xAB; 512])],
+                vec![(512u64, vec![0xCD; 512])],
+            ],
+        );
         // Corrupt the second transaction's checksum-covered region.
-        let second_blhdr = (jib.offset + second_start) as usize;
-        img[second_blhdr + 4] ^= 0xFF;
+        img[starts[1] as usize + 4] ^= 0xFF;
 
         let cursor = Cursor::new(img);
         let mut fs = HfsPlusFilesystem::open(cursor, 0).expect("open");
@@ -694,5 +706,46 @@ mod tests {
             .find(|(k, _)| k == "journal_transactions_pending")
             .map(|(_, v)| v.clone());
         assert_eq!(pending.as_deref(), Some("1"));
+    }
+
+    /// The GUI viewer's data source: `journal_detail` decodes every
+    /// transaction, classifies block targets against the volume's metadata
+    /// regions, and keeps a bounded preview.
+    #[test]
+    fn journal_detail_decodes_and_classifies() {
+        // First transaction writes the volume header sector (offset 1024); the
+        // second writes a high "fork data" sector well past any metadata.
+        let (img, _starts) = graft_journal(
+            32 * 1024 * 1024,
+            4096,
+            &[
+                vec![(1024u64, vec![0x11; 512])],
+                vec![(8 * 1024 * 1024u64, vec![0x22; 512])],
+            ],
+        );
+        let cursor = Cursor::new(img);
+        let mut fs = HfsPlusFilesystem::open(cursor, 0).expect("open");
+        let detail = fs
+            .journal_detail()
+            .expect("journal_detail ok")
+            .expect("journaled");
+        assert_eq!(detail.transactions.len(), 2);
+        assert!(detail.checksum_mismatch.is_none());
+
+        // Block at 1024 lands in the volume header region.
+        let regions = &detail.regions;
+        assert_eq!(
+            super::super::hfsplus_journal::classify_target(regions, 1024),
+            "volume header"
+        );
+        // A high sector classifies as fork data (outside all metadata regions).
+        assert_eq!(
+            super::super::hfsplus_journal::classify_target(regions, 8 * 1024 * 1024),
+            "fork data"
+        );
+        // Preview is populated and capped.
+        let first = &detail.transactions[0].blocks[0];
+        assert_eq!(first.target, 1024);
+        assert!(!first.preview.is_empty() && first.preview.len() <= 64);
     }
 }

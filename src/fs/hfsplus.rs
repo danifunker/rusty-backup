@@ -709,15 +709,22 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
     /// corrupt or short transaction, mirroring how macOS replay behaves.
     ///
     /// See `docs/hfsplus_enhancements.md` Phase 9, Step 24.
-    pub fn read_journal(
+    /// Locate and parse the JIB + journal header. `Ok(None)` when the volume
+    /// is not journaled. Shared by `read_journal` and `journal_detail`.
+    fn locate_journal(
         &mut self,
-    ) -> Result<Option<super::hfsplus_journal::JournalState>, FilesystemError> {
-        use super::hfsplus_journal::{JournalHeader, JournalInfoBlock, JournalWalker};
+    ) -> Result<
+        Option<(
+            super::hfsplus_journal::JournalInfoBlock,
+            super::hfsplus_journal::JournalHeader,
+        )>,
+        FilesystemError,
+    > {
+        use super::hfsplus_journal::{JournalHeader, JournalInfoBlock};
 
         if !self.is_journaled() {
             return Ok(None);
         }
-
         let to_fs = |e: super::hfsplus_journal::JournalError| {
             FilesystemError::InvalidData(format!("journal: {e}"))
         };
@@ -736,6 +743,71 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         let mut jh_buf = vec![0u8; 512];
         self.reader.read_exact(&mut jh_buf)?;
         let header = JournalHeader::parse(&jh_buf).map_err(to_fs)?;
+        Ok(Some((jib, header)))
+    }
+
+    /// Byte ranges (relative to the partition) of the volume's metadata
+    /// structures, for classifying which subsystem a journaled block targets.
+    fn metadata_regions(&self) -> Vec<super::hfsplus_journal::MetadataRegion> {
+        use super::hfsplus_journal::MetadataRegion;
+        let bs = self.vh.block_size as u64;
+        let mut regions = vec![MetadataRegion {
+            name: "volume header",
+            start: 1024,
+            end: 1536,
+        }];
+        let fork = |name: &'static str, fork: &ForkData| -> Option<MetadataRegion> {
+            let first = fork.extents.iter().find(|e| !e.is_empty())?;
+            let start = first.start_block as u64 * bs;
+            let bytes = fork.total_blocks as u64 * bs;
+            Some(MetadataRegion {
+                name,
+                start,
+                end: start + bytes,
+            })
+        };
+        for (name, f) in [
+            ("allocation bitmap", &self.vh.allocation_file),
+            ("extents btree", &self.vh.extents_file),
+            ("catalog btree", &self.vh.catalog_file),
+            ("attributes btree", &self.vh.attributes_file),
+            ("startup file", &self.vh.startup_file),
+        ] {
+            if let Some(r) = fork(name, f) {
+                regions.push(r);
+            }
+        }
+        regions
+    }
+
+    /// Decode the journal into per-transaction, per-block detail for the GUI
+    /// history viewer (Step 29). Block previews are capped; classification is
+    /// against [`metadata_regions`]. `Ok(None)` when not journaled.
+    pub fn journal_detail(
+        &mut self,
+    ) -> Result<Option<super::hfsplus_journal::JournalDetail>, FilesystemError> {
+        let Some((jib, header)) = self.locate_journal()? else {
+            return Ok(None);
+        };
+        let regions = self.metadata_regions();
+        let detail = super::hfsplus_journal::read_journal_detail(
+            &mut self.reader,
+            self.partition_offset,
+            jib,
+            header,
+            regions,
+        );
+        Ok(Some(detail))
+    }
+
+    pub fn read_journal(
+        &mut self,
+    ) -> Result<Option<super::hfsplus_journal::JournalState>, FilesystemError> {
+        use super::hfsplus_journal::JournalWalker;
+
+        let Some((jib, header)) = self.locate_journal()? else {
+            return Ok(None);
+        };
 
         let mut transactions = Vec::new();
         let mut partial = false;
@@ -2983,6 +3055,20 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
 
     fn fsck(&mut self) -> Option<Result<super::fsck::FsckResult, FilesystemError>> {
         Some(super::hfsplus_fsck::check(self))
+    }
+
+    fn read_journal(
+        &mut self,
+    ) -> Result<Option<super::hfsplus_journal::JournalState>, FilesystemError> {
+        // Delegate to the inherent method (which takes priority for concrete
+        // calls); this override is what `dyn Filesystem` callers reach.
+        HfsPlusFilesystem::read_journal(self)
+    }
+
+    fn journal_detail(
+        &mut self,
+    ) -> Result<Option<super::hfsplus_journal::JournalDetail>, FilesystemError> {
+        HfsPlusFilesystem::journal_detail(self)
     }
 }
 
