@@ -12,6 +12,7 @@
 #   scripts/xfs-oracle.sh repair <img>    # run `xfs_repair -n` (the oracle)
 #   scripts/xfs-oracle.sh db <img> <cmds> # run arbitrary xfs_db commands
 #   scripts/xfs-oracle.sh check <img>     # run OUR verifier (cargo example)
+#   scripts/xfs-oracle.sh repair <img>    # run OUR conservative repair in place
 #   scripts/xfs-oracle.sh verify <img>    # run both and report agreement
 set -euo pipefail
 
@@ -44,6 +45,9 @@ EOF
     ;;
   check)
     cargo run -q --manifest-path "$ROOT/Cargo.toml" --example xfs_check -- "$2"
+    ;;
+  repair)
+    cargo run -q --manifest-path "$ROOT/Cargo.toml" --example xfs_check -- --repair "$2"
     ;;
   verify)
     img=$2; base=$(basename "$img")

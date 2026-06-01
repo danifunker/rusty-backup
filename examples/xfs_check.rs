@@ -4,23 +4,61 @@
 //! image with the `rusty-xfs-oracle` Docker image (xfsprogs 4.9.0), then run
 //! this to confirm our checker agrees with `xfs_repair -n`.
 //!
-//!   cargo run --example xfs_check -- <image-path> [partition-offset-bytes]
+//!   cargo run --example xfs_check -- [--repair] <image-path> [partition-offset-bytes]
 //!
-//! Exit code is 0 when the verifier reports no errors, 1 otherwise.
+//! With `--repair`, opens the image read-write and runs the conservative
+//! repair before checking. Exit code is 0 when the verifier reports no
+//! errors, 1 otherwise.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::process::ExitCode;
 
-use rusty_backup::fs::filesystem::Filesystem;
+use rusty_backup::fs::filesystem::{EditableFilesystem, Filesystem};
 use rusty_backup::fs::xfs::XfsFilesystem;
 
 fn main() -> ExitCode {
-    let mut args = std::env::args().skip(1);
-    let Some(path) = args.next() else {
-        eprintln!("usage: xfs_check <image-path> [partition-offset-bytes]");
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let do_repair = args.first().map(|s| s == "--repair").unwrap_or(false);
+    if do_repair {
+        args.remove(0);
+    }
+    let Some(path) = args.first().cloned() else {
+        eprintln!("usage: xfs_check [--repair] <image-path> [partition-offset-bytes]");
         return ExitCode::FAILURE;
     };
-    let offset: u64 = args.next().map(|s| s.parse().unwrap_or(0)).unwrap_or(0);
+    let offset: u64 = args.get(1).map(|s| s.parse().unwrap_or(0)).unwrap_or(0);
+
+    if do_repair {
+        let file = match OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("cannot open {path} read-write: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        match XfsFilesystem::open(file, offset) {
+            Ok(mut fs) => match fs.repair() {
+                Ok(report) => {
+                    println!("=== repair ===");
+                    for f in &report.fixes_applied {
+                        println!("  fixed: {f}");
+                    }
+                    for f in &report.fixes_failed {
+                        println!("  FAILED: {f}");
+                    }
+                    println!("  unrepairable: {}", report.unrepairable_count);
+                }
+                Err(e) => {
+                    eprintln!("repair failed: {e}");
+                    return ExitCode::FAILURE;
+                }
+            },
+            Err(e) => {
+                eprintln!("not an XFS volume at offset {offset}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
 
     let file = match File::open(&path) {
         Ok(f) => f,
