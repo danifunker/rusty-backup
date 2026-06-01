@@ -251,7 +251,10 @@ polished install experience is **~5–6 d**.
 - [x] Phase 5 — ARP DisplayVersion refresh (`os::win_install`)
 - [x] Phase 6 — portable detection (`os::win_install::is_installed`); elevation
       is inherent (GUI runs elevated); writability-probe fallback not needed
-- [ ] Phase 7 — CI (deferred)
+- [x] Phase 7 — CI: `build-windows` compiles `installer/rusty-backup.iss` via
+      Inno Setup (choco) per arch and uploads `Setup.exe`; the release job's
+      `*.exe` filter attaches it. Pending first green CI run to verify the
+      Windows-only code compiles.
 - [ ] Phase 8 — testing on Windows VM (deferred — requires Windows)
 - [ ] Phase 9 — docs & migration (deferred)
 
