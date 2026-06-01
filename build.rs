@@ -38,28 +38,17 @@ fn main() {
         }
     }
 
-    #[cfg(all(target_os = "windows", not(debug_assertions)))]
-    {
-        // Embed the requireAdministrator manifest in release builds — but ONLY
-        // into the GUI binary (`rusty-backup`), NOT the CLI (`rb-cli`).
-        //
-        // The manifest declares `requireAdministrator`, which makes Windows fire
-        // a UAC prompt at *launch*, before any code runs, for every invocation.
-        // That is fine for the GUI (which always needs disk access), but the CLI
-        // mostly operates on plain image files and should not prompt for admin
-        // just to `inspect foo.img`. `compile_for` links the resource into the
-        // named binaries only; `rb-cli` is left with the default `asInvoker`
-        // execution level (no prompt at launch — it inherits admin when started
-        // from an already-elevated terminal, which is what physical-disk ops need).
-        //
-        // The embed-resource crate needs a .rc file, not a raw manifest.
-        let manifest_path = std::path::PathBuf::from("rusty-backup.manifest");
-        if manifest_path.exists() {
-            let _ = embed_resource::compile_for(
-                "rusty-backup.rc",
-                ["rusty-backup"],
-                embed_resource::NONE,
-            );
-        }
-    }
+    // NOTE: The GUI no longer embeds a `requireAdministrator` manifest. It used
+    // to (release-only, GUI binary only), which forced a UAC prompt at *launch*
+    // for every run and — more importantly — made the per-user installer's
+    // post-install `[Run]` step fail with "CreateProcess failed; code 740, the
+    // requested operation requires elevation" (an un-elevated installer cannot
+    // CreateProcess an always-elevated exe).
+    //
+    // Both `rusty-backup` and `rb-cli` now ship as `asInvoker`: no UAC at
+    // launch. Administrator rights are requested *on demand* — the GUI's
+    // top-bar "Show Physical Devices" button calls `os::windows::request_
+    // elevation()` (whole-process UAC relaunch) only when the user actually
+    // wants raw physical-disk access. File-only flows never elevate. See
+    // docs/windows_self_update.md (elevation phase).
 }

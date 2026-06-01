@@ -479,31 +479,20 @@ fn enumerate_volumes() -> Vec<VolumeInfo> {
 ///
 /// In debug builds, if not elevated, automatically requests elevation via UAC.
 pub fn enumerate_devices() -> Vec<DiskDevice> {
-    // In debug builds, check elevation and request if needed
-    #[cfg(debug_assertions)]
-    {
-        if !is_elevated() {
-            // Escape hatch: when iterating on file-only flows in a debug build,
-            // the developer can `set RB_NO_AUTO_ELEVATE=1` (or export it from
-            // the env) to opt out of the UAC relaunch. Device enumeration just
-            // returns empty; everything that doesn't touch a physical disk
-            // keeps working.
-            if std::env::var_os("RB_NO_AUTO_ELEVATE").is_some() {
-                log::warn!(
-                    "RB_NO_AUTO_ELEVATE is set; skipping UAC relaunch. \
-                     Physical-disk enumeration returns empty."
-                );
-                return Vec::new();
-            }
-            log::warn!("Not running with administrator privileges; requesting elevation...");
-            if let Err(e) = request_elevation() {
-                log::error!("Failed to request elevation: {}", e);
-                // Return empty list if elevation failed
-                return Vec::new();
-            }
-            // If we get here, elevation was cancelled or failed
-            return Vec::new();
-        }
+    // Physical-disk enumeration needs admin. The GUI now launches `asInvoker`
+    // (no requireAdministrator manifest), so it is NOT elevated by default.
+    // Elevation is an explicit, up-front user action: the top-bar "Show Physical
+    // Devices" button calls `request_elevation()` (whole-process UAC relaunch),
+    // and the elevated instance auto-enumerates on startup. We therefore never
+    // relaunch from here — doing so could fire a UAC prompt (or worse, a
+    // process exit) at an arbitrary time. When not elevated we simply report no
+    // devices; file-only flows keep working.
+    if !is_elevated() {
+        log::info!(
+            "Not elevated; physical-disk enumeration returns empty. \
+             Use \"Show Physical Devices\" to elevate."
+        );
+        return Vec::new();
     }
 
     let volumes = enumerate_volumes();
@@ -575,27 +564,18 @@ pub(crate) fn open_target_for_writing(path: &Path) -> Result<(File, VolumeLockSe
     let path_str = path.to_string_lossy();
     let drive_num = drive_number_from_path(&path_str).context("invalid physical drive path")?;
 
-    // Physical-disk writes need admin. The GUI is launched with a
-    // requireAdministrator manifest, so it is always elevated and never trips
-    // this check. The CLI (`rb-cli`) runs as `asInvoker` and may not be — fail
-    // with a clear message instead of a cryptic "Access is denied" (OS error 5).
+    // Physical-disk writes need admin. Both the GUI and CLI now run `asInvoker`.
+    // In the GUI, the user reaches this path only after clicking "Show Physical
+    // Devices" (which relaunches the whole process elevated), so we are already
+    // elevated here. We do NOT relaunch from this function: `request_elevation()`
+    // exits the process, which must never happen mid-write on a worker thread.
+    // If somehow not elevated, fail with a clear message instead of a cryptic
+    // "Access is denied" (OS error 5).
     if !is_elevated() {
-        log::warn!(
-            "Attempting to open {} for writing without admin privileges",
-            path.display()
-        );
-        // In debug builds, offer to relaunch elevated via UAC (preserves the
-        // historical developer workflow); in release, fail cleanly.
-        // `RB_NO_AUTO_ELEVATE=1` opts out of the relaunch and fails fast,
-        // matching release behaviour — useful when iterating on file-only
-        // flows in a debug build.
-        #[cfg(debug_assertions)]
-        if std::env::var_os("RB_NO_AUTO_ELEVATE").is_none() {
-            request_elevation()?;
-        }
         bail!(
             "Administrator privileges required to write to disk devices. \
-             Re-run from an elevated terminal (right-click -> Run as administrator)."
+             Use \"Show Physical Devices\" in the GUI, or re-run rb-cli from an \
+             elevated terminal (right-click -> Run as administrator)."
         );
     }
 
@@ -645,19 +625,15 @@ pub fn open_source_for_reading(path: &Path) -> Result<crate::os::ElevatedSource>
     }
 
     // Physical drive - open with standard flags (no NO_BUFFERING to avoid alignment issues on reads).
-    // Physical-disk reads need admin. The GUI is always elevated via its
-    // requireAdministrator manifest; the CLI runs as `asInvoker` and may not be
-    // — fail with a clear message instead of a cryptic "Access is denied".
+    // Physical-disk reads need admin. Both GUI and CLI run `asInvoker`; the GUI
+    // reaches this only after the up-front "Show Physical Devices" elevation, so
+    // we are already elevated. We never relaunch here (it would exit the process
+    // mid-read). If not elevated, fail clearly.
     if !is_elevated() {
-        log::warn!(
-            "Attempting to open {} without admin privileges",
-            path.display()
-        );
-        #[cfg(debug_assertions)]
-        request_elevation()?;
         bail!(
             "Administrator privileges required to read disk devices. \
-             Re-run from an elevated terminal (right-click -> Run as administrator)."
+             Use \"Show Physical Devices\" in the GUI, or re-run rb-cli from an \
+             elevated terminal (right-click -> Run as administrator)."
         );
     }
 
@@ -704,13 +680,13 @@ impl WindowsDiskAccess {
 
 impl PrivilegedDiskAccess for WindowsDiskAccess {
     fn check_status(&self) -> Result<AccessStatus> {
-        // Check if we're running as administrator
+        // The GUI launches `asInvoker`; elevation is on-demand via the top-bar
+        // "Show Physical Devices" button. Report NeedsElevation when not admin
+        // so callers can surface that path instead of treating it as an error.
         if is_elevated() {
             Ok(AccessStatus::Ready)
         } else {
-            // Windows already prompts for UAC at startup
-            // If we're here and not admin, something went wrong
-            anyhow::bail!("Application must be run as administrator")
+            Ok(AccessStatus::NeedsElevation)
         }
     }
 
