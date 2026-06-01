@@ -1114,6 +1114,26 @@ mod tests {
     }
 
     #[test]
+    fn fsck_detects_unaccounted_blocks() {
+        // Shrink AG 0's bnobt first free record's blockcount so the freed
+        // blocks vanish from the free list while staying unclaimed -> leaked.
+        // (This also trips AgfFreeblksMismatch; we only assert the leak.)
+        let mut img = load_fixture().to_vec();
+        let bno_root = u32::from_be_bytes(img[512 + 16..512 + 20].try_into().unwrap()) as usize;
+        let rec0 = bno_root * 4096 + 16;
+        let orig = u32::from_be_bytes(img[rec0 + 4..rec0 + 8].try_into().unwrap());
+        assert!(orig > 10, "fixture first free extent should be sizable");
+        img[rec0 + 4..rec0 + 8].copy_from_slice(&(orig - 10).to_be_bytes());
+        let mut fs = XfsFilesystem::open(Cursor::new(img), 0).expect("open xfs");
+        let res = fs.run_fsck().expect("fsck runs");
+        assert!(
+            res.errors.iter().any(|e| e.code == "UnaccountedBlocks"),
+            "expected UnaccountedBlocks, got: {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn fsck_detects_free_block_also_claimed_by_inode() {
         // Patch AG 0's bnobt so a free extent overlaps the root inode chunk
         // (agbno 8..12, marked S_INO). Read bno_root from the AGF (byte

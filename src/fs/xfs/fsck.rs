@@ -26,8 +26,9 @@ use byteorder::{BigEndian, ByteOrder};
 use super::ag::{XfsAgf, XfsAgi};
 use super::sb::XfsSuperblock;
 use super::types::{
-    NULLAGBLOCK, XFS_ABTB_CRC_MAGIC, XFS_ABTB_MAGIC, XFS_BTREE_SBLOCK_CRC_LEN,
-    XFS_BTREE_SBLOCK_LEN, XFS_IBT_CRC_MAGIC, XFS_IBT_MAGIC, XFS_INODES_PER_CHUNK,
+    NULLAGBLOCK, XFS_ABTB_CRC_MAGIC, XFS_ABTB_MAGIC, XFS_ABTC_CRC_MAGIC, XFS_ABTC_MAGIC,
+    XFS_BTREE_SBLOCK_CRC_LEN, XFS_BTREE_SBLOCK_LEN, XFS_IBT_CRC_MAGIC, XFS_IBT_MAGIC,
+    XFS_INODES_PER_CHUNK,
 };
 use super::{read_at_aligned, XfsFilesystem};
 use crate::fs::filesystem::{Filesystem, FilesystemError};
@@ -115,6 +116,11 @@ struct AgHeaders {
     /// the AGF's cached free-block count, if the AGF parsed.
     agf_bno_root: Option<u32>,
     agf_freeblks: Option<u32>,
+    /// Free-space-by-count (cntbt) root, and the AGFL window
+    /// `(flfirst, fllast, flcount)` — both needed to account for every
+    /// metadata block in the ownership scan.
+    agf_cnt_root: Option<u32>,
+    agf_fl: Option<(u32, u32, u32)>,
 }
 
 impl<R: Read + Seek + Send> XfsFilesystem<R> {
@@ -179,6 +185,8 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
                     agi_root: None,
                     agf_bno_root: None,
                     agf_freeblks: None,
+                    agf_cnt_root: None,
+                    agf_fl: None,
                 });
                 continue;
             }
@@ -194,18 +202,28 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
 
             // --- AGF (sector 1) ---
             let agf_off = sectsize as usize;
-            let (agf_bno_root, agf_freeblks) =
-                match XfsAgf::parse(&buf[agf_off..agf_off + sectsize as usize]) {
-                    Ok(agf) => {
-                        check_agf(&agf, agno, expected_len, b);
-                        total_free_blocks += agf.freeblks as u64;
-                        (Some(agf.bno_root), Some(agf.freeblks))
-                    }
-                    Err(e) => {
-                        b.err("AgfBadMagic", format!("AG {agno} AGF: {e}"));
-                        (None, None)
-                    }
-                };
+            #[allow(clippy::type_complexity)]
+            let (agf_bno_root, agf_freeblks, agf_cnt_root, agf_fl): (
+                Option<u32>,
+                Option<u32>,
+                Option<u32>,
+                Option<(u32, u32, u32)>,
+            ) = match XfsAgf::parse(&buf[agf_off..agf_off + sectsize as usize]) {
+                Ok(agf) => {
+                    check_agf(&agf, agno, expected_len, b);
+                    total_free_blocks += agf.freeblks as u64;
+                    (
+                        Some(agf.bno_root),
+                        Some(agf.freeblks),
+                        Some(agf.cnt_root),
+                        Some((agf.flfirst, agf.fllast, agf.flcount)),
+                    )
+                }
+                Err(e) => {
+                    b.err("AgfBadMagic", format!("AG {agno} AGF: {e}"));
+                    (None, None, None, None)
+                }
+            };
 
             // --- AGI (sector 2) ---
             let agi_off = 2 * sectsize as usize;
@@ -227,6 +245,8 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
                 agi_root,
                 agf_bno_root,
                 agf_freeblks,
+                agf_cnt_root,
+                agf_fl,
             });
         }
 
@@ -287,10 +307,37 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         // own blocks in AG j, so the map is only complete post-loop).
         let mut all_free: Vec<(u64, u64)> = Vec::new();
 
+        // Internal log: a contiguous run of metadata blocks (sb_logstart is an
+        // fsblock; 0 means an external log). Account for it up front.
+        if sb.logstart != 0 {
+            let log_agno = sb.logstart >> sb.agblklog;
+            let log_agbno = sb.logstart & ((1u64 << sb.agblklog) - 1);
+            let log_linear = log_agno * agblocks + log_agbno;
+            for i in 0..sb.logblocks as u64 {
+                map.mark(log_linear + i, S_INUSE_FS);
+            }
+        }
+
         for (agno, ag) in ags.iter().enumerate() {
             let agno = agno as u64;
             // AG header block 0 holds sb/AGF/AGI/AGFL.
             map.mark(agno * agblocks, S_INUSE_FS);
+
+            // Free-space-by-count (cntbt) btree blocks are metadata too; walk
+            // it only to mark its blocks (records mirror the bnobt).
+            if let Some(cnt_root) = ag.agf_cnt_root {
+                if let Err(e) =
+                    self.mark_cntbt_blocks(sb, agno, cnt_root, ag.expected_len, &mut map)
+                {
+                    b.err("CntBtreeWalkFailed", format!("AG {agno} cnt btree: {e}"));
+                }
+            }
+
+            // AGFL: pre-reserved free-list blocks (allocated metadata, not in
+            // the free-space btrees).
+            if let Some((flfirst, _fllast, flcount)) = ag.agf_fl {
+                self.mark_agfl_blocks(sb, agno, flfirst, flcount, &mut map, b);
+            }
 
             let Some(root) = ag.agi_root else { continue };
             let recs = match self.collect_inobt_records(sb, agno, root, ag.expected_len, &mut map) {
@@ -367,12 +414,103 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
             }
         }
 
+        // Mark every free-listed block, then any block still UNKNOWN is
+        // neither allocated metadata/inode-data nor free — a leak. On a
+        // healthy volume the map is exhaustive, so this is 0.
+        //
+        // Only meaningful on v4: v5 adds metadata structures we don't model
+        // here (finobt, rmapbt, refcountbt), so their blocks would look
+        // "leaked". The completeness check is v4-only; v5 is read-only-best-
+        // effort for us anyway.
+        for &(start, len) in &all_free {
+            for blk in start..start + len {
+                map.mark_free(blk);
+            }
+        }
+        if !sb.is_v5() {
+            let unaccounted = map.count_unknown();
+            if unaccounted > 0 {
+                b.err(
+                    "UnaccountedBlocks",
+                    format!(
+                        "{unaccounted} block(s) are neither allocated nor in the free-space btree \
+                         (lost/leaked space)"
+                    ),
+                );
+            }
+        }
+
         let mult = map.count_mult();
         b.stat("Blocks scanned", format!("{} claimed", map.count_claimed()));
         if mult > 0 {
             b.stat("Cross-linked blocks", format!("{mult}"));
         }
         allocated
+    }
+
+    /// Walk the free-space-by-count (cntbt) btree only to mark its blocks as
+    /// metadata; the records duplicate the bnobt so we ignore them.
+    fn mark_cntbt_blocks(
+        &mut self,
+        sb: &XfsSuperblock,
+        agno: u64,
+        root_agbno: u32,
+        expected_len: u64,
+        map: &mut OwnerMap,
+    ) -> Result<(), FilesystemError> {
+        self.walk_sblock_btree(
+            sb,
+            agno,
+            root_agbno,
+            expected_len,
+            [XFS_ABTC_MAGIC, XFS_ABTC_CRC_MAGIC],
+            8,
+            8,
+            |_| {},
+            |linear| {
+                map.mark(linear, S_INUSE_FS);
+            },
+        )
+    }
+
+    /// Mark the AGFL's pre-reserved free-list blocks. The AGFL (sector 3 of
+    /// the AG) is a circular array of AG-relative block numbers; `flfirst`
+    /// and `fllast` are inclusive indices and `flcount` is the live count.
+    /// v5 prefixes a 36-byte header; v4 starts the array at offset 0.
+    fn mark_agfl_blocks(
+        &mut self,
+        sb: &XfsSuperblock,
+        agno: u64,
+        flfirst: u32,
+        flcount: u32,
+        map: &mut OwnerMap,
+        b: &mut Builder,
+    ) {
+        if flcount == 0 {
+            return;
+        }
+        let agblocks = sb.agblocks as u64;
+        let sectsize = sb.sectsize as u64;
+        let blocksize = sb.blocksize as u64;
+        let agfl_byte = self.partition_offset + agno * agblocks * blocksize + 3 * sectsize;
+        let mut sec = vec![0u8; sectsize as usize];
+        if read_at_aligned(&mut self.reader, agfl_byte, sectsize, &mut sec).is_err() {
+            b.warn("AgflReadFailed", format!("AG {agno}: could not read AGFL"));
+            return;
+        }
+        let arr_off = if sb.is_v5() { 36 } else { 0 };
+        let nslots = ((sectsize as usize - arr_off) / 4) as u32;
+        if nslots == 0 {
+            return;
+        }
+        for i in 0..flcount {
+            let idx = (flfirst + i) % nslots;
+            let off = arr_off + (idx as usize) * 4;
+            let agbno = BigEndian::read_u32(&sec[off..off + 4]);
+            if (agbno as u64) < agblocks {
+                map.mark(agno * agblocks + agbno as u64, S_INUSE_FS);
+            }
+        }
     }
 
     /// Phase 3: directory connectivity / orphan detection (R7 input).
@@ -765,13 +903,13 @@ struct InobtRec {
     free: u64,
 }
 
-// Block-ownership states (subset of xfs_repair's XR_E_*; the rebuild phases
-// add the FREE/FREE1 states once the free-space btree walk lands).
+// Block-ownership states (subset of xfs_repair's XR_E_*).
 const S_UNKNOWN: u8 = 0;
 const S_INUSE: u8 = 1; // file/dir data
-const S_INUSE_FS: u8 = 2; // AG headers / btree blocks
+const S_INUSE_FS: u8 = 2; // AG headers / btree blocks / AGFL / log
 const S_INO: u8 = 3; // inode chunk blocks
 const S_MULT: u8 = 4; // multiply claimed (cross-link)
+const S_FREE: u8 = 5; // in the free-space btree
 
 /// Per-volume block-state map, indexed by partition-linear block number
 /// (`agno * agblocks + agbno`). The R1 ownership map from the plan.
@@ -798,6 +936,18 @@ impl OwnerMap {
             *slot = S_MULT;
             true
         }
+    }
+    /// Mark `linear` free, but only if currently unclaimed — never clobber a
+    /// claim (those conflicts are reported separately as FreeBlockClaimed).
+    fn mark_free(&mut self, linear: u64) {
+        if let Some(slot) = self.states.get_mut(linear as usize) {
+            if *slot == S_UNKNOWN {
+                *slot = S_FREE;
+            }
+        }
+    }
+    fn count_unknown(&self) -> usize {
+        self.states.iter().filter(|&&s| s == S_UNKNOWN).count()
     }
     fn count_claimed(&self) -> usize {
         self.states.iter().filter(|&&s| s != S_UNKNOWN).count()

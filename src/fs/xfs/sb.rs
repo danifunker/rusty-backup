@@ -28,6 +28,11 @@ pub struct XfsSuperblock {
     pub dblocks: u64,
     pub rblocks: u64,
     pub rextents: u64,
+    /// Internal-log location: first fsblock (`sb_logstart`, 0 = external log)
+    /// and length in blocks (`sb_logblocks`). The log's blocks are allocated
+    /// metadata that the ownership scan must account for.
+    pub logstart: u64,
+    pub logblocks: u32,
     pub rootino: u64,
     /// Realtime bitmap / summary inodes (`sb_rbmino` / `sb_rsumino`). Always
     /// allocated by mkfs even on non-realtime volumes; referenced only from
@@ -129,6 +134,8 @@ impl XfsSuperblock {
             dblocks: BigEndian::read_u64(&buf[8..16]),
             rblocks: BigEndian::read_u64(&buf[16..24]),
             rextents,
+            logstart: BigEndian::read_u64(&buf[48..56]),
+            logblocks: BigEndian::read_u32(&buf[96..100]),
             rootino: BigEndian::read_u64(&buf[56..64]),
             rbmino: BigEndian::read_u64(&buf[64..72]),
             rsumino: BigEndian::read_u64(&buf[72..80]),
