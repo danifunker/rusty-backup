@@ -68,8 +68,10 @@ Name: "associate"; Description: "&Associate disk image files with Rusty Backup";
 
 [Files]
 Source: "{#SourceDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
-; rb-cli goes in bin\ so only the CLI lands on PATH (not the GUI exe).
-Source: "{#SourceDir}\{#MyCliExeName}"; DestDir: "{app}\bin"; Flags: ignoreversion skipifsourcedoesntexist
+; rb-cli goes in bin\ so only the CLI lands on PATH (not the GUI exe). Required
+; (no skipifsourcedoesntexist): the "Add rb-cli to PATH" task depends on it, so
+; a missing CLI should fail the installer build loudly, not ship a broken PATH.
+Source: "{#SourceDir}\{#MyCliExeName}"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "{#AssetsDir}\icon.ico"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Icons]
