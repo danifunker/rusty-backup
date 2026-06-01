@@ -2,11 +2,15 @@
 //!
 //! The fixtures are flat journaled HFS+ "superfloppies" made on macOS with
 //!   hdiutil create -size 4m -fs "Journaled HFS+" -volname JTest -layout NONE
-//! and checked in zstd-compressed. The `_clean` image is exactly as macOS left
-//! it (empty journal). The `_dirty` image additionally has three safe,
-//! self-referential transactions injected via the `craft_dirty_journal`
-//! example (each records a metadata block's current bytes, so replay rewrites
-//! identical data).
+//! then mounted and populated with:
+//!   hello.txt          — "Hello, hfsplus-journaled!"
+//!   subdir/            — directory
+//!   subdir/nested.txt  — "nested file"
+//! (plus macOS's own hidden .fseventsd), and checked in zstd-compressed. The
+//! `_clean` image is exactly as macOS left it (empty journal). The `_dirty`
+//! image additionally has three safe, self-referential transactions injected
+//! via the `craft_dirty_journal` example (each records a metadata block's
+//! current bytes, so replay rewrites identical data).
 //!
 //! These guard the parser/replayer against drift relative to genuine Apple
 //! on-disk structures (byte order, JIB layout, journal-header checksum) — which
@@ -17,6 +21,7 @@
 use byteorder::{BigEndian, ByteOrder};
 use std::io::{Cursor, Read};
 
+use rusty_backup::fs::filesystem::Filesystem;
 use rusty_backup::fs::hfsplus::HfsPlusFilesystem;
 use rusty_backup::fs::hfsplus_journal::{
     classify_target, replay_journal, JournalEndian, JournalHeader, JournalInfoBlock,
@@ -47,6 +52,53 @@ fn locate(img: &[u8]) -> (JournalInfoBlock, JournalHeader) {
     let jh_off = jib.offset as usize;
     let jh = JournalHeader::parse(&img[jh_off..jh_off + 512]).expect("parse journal header");
     (jib, jh)
+}
+
+#[test]
+fn real_clean_journal_volume_has_files() {
+    let img = load_fixture("test_hfsplus_journaled_clean.img.zst");
+    let mut fs = HfsPlusFilesystem::open(Cursor::new(img), 0).expect("open HFS+");
+
+    let root = fs.root().expect("root entry");
+    let names: Vec<String> = fs
+        .list_directory(&root)
+        .expect("list root")
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "hello.txt"),
+        "root names: {names:?}"
+    );
+    assert!(names.iter().any(|n| n == "subdir"), "root names: {names:?}");
+
+    // Read hello.txt and confirm its contents survive the round-trip.
+    let hello = fs
+        .list_directory(&root)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.name == "hello.txt")
+        .expect("hello.txt entry");
+    let buf = fs.read_file(&hello, 1024).expect("read hello.txt");
+    assert_eq!(buf, b"Hello, hfsplus-journaled!");
+
+    // And the nested file under subdir/.
+    let subdir = fs
+        .list_directory(&root)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.name == "subdir")
+        .expect("subdir entry");
+    let nested: Vec<String> = fs
+        .list_directory(&subdir)
+        .expect("list subdir")
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert!(
+        nested.iter().any(|n| n == "nested.txt"),
+        "subdir: {nested:?}"
+    );
 }
 
 #[test]
