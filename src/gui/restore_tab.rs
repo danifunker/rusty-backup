@@ -367,6 +367,13 @@ impl RestoreTab {
                                 );
                                 ui.selectable_value(&mut self.selected_device_idx, Some(i), label);
                             }
+                            if ctx.devices.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(super::no_devices_hint())
+                                        .italics()
+                                        .weak(),
+                                );
+                            }
                         });
                 });
 
@@ -860,6 +867,13 @@ impl RestoreTab {
                                 self.sp_target_partition_idx = None;
                                 self.sp_scan_error = None;
                             }
+                        }
+                        if ctx.devices.is_empty() {
+                            ui.label(
+                                egui::RichText::new(super::no_devices_hint())
+                                    .italics()
+                                    .weak(),
+                            );
                         }
                     });
 
@@ -1783,6 +1797,13 @@ impl RestoreTab {
                                     if device.is_system { " [SYSTEM]" } else { "" },
                                 );
                                 ui.selectable_value(&mut self.nd_target_device_idx, Some(i), label);
+                            }
+                            if ctx.devices.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(super::no_devices_hint())
+                                        .italics()
+                                        .weak(),
+                                );
                             }
                         });
                 });

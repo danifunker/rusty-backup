@@ -53,6 +53,25 @@ fn bytes_human(n: u64) -> String {
     }
 }
 
+/// Hint shown in a device dropdown when no physical devices are listed. On
+/// Windows the empty list usually means the process isn't elevated yet, so we
+/// point the user at the top-bar gate; when already elevated (or on other
+/// platforms) it just reports that none were detected.
+fn no_devices_hint() -> &'static str {
+    #[cfg(windows)]
+    {
+        if rusty_backup::os::windows::is_elevated() {
+            "No physical devices detected."
+        } else {
+            "Click \"Show Physical Devices\" (top bar) to access disks."
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        "No physical devices detected."
+    }
+}
+
 fn file_dialog() -> rfd::FileDialog {
     let dialog = rfd::FileDialog::new();
     #[cfg(target_os = "linux")]
@@ -255,6 +274,10 @@ pub struct RustyBackupApp {
     settings_dialog: SettingsDialog,
     #[cfg(target_os = "linux")]
     elevation_dialog: ElevationDialog,
+    /// Stylized shield texture for the "Show Physical Devices" elevation button.
+    /// Loaded lazily on first use (the egui context isn't available at
+    /// construction time).
+    shield_texture: Option<egui::TextureHandle>,
     /// Shared backup folder path between restore and inspect tabs
     loaded_backup_folder: Option<PathBuf>,
     /// Bulk Convert dialog state (None = closed).
@@ -340,6 +363,7 @@ impl Default for RustyBackupApp {
             settings_dialog: SettingsDialog::default(),
             #[cfg(target_os = "linux")]
             elevation_dialog,
+            shield_texture: None,
             loaded_backup_folder: None,
             bulk_convert_dialog: None,
             bulk_convert_status: None,
@@ -347,7 +371,55 @@ impl Default for RustyBackupApp {
     }
 }
 
+/// Whether the physical-device elevation gate applies, and its current state.
+/// `NeedsElevation`/`Elevated` are only constructed on Windows; on other
+/// platforms `elevation_gate()` always returns `NotApplicable`.
+#[derive(Clone, Copy, PartialEq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+enum ElevationGate {
+    /// Not a gated platform (Linux/macOS handle elevation their own way) — the
+    /// normal "Refresh Devices" control applies.
+    NotApplicable,
+    /// Windows, not elevated — show the shielded "Show Physical Devices" button.
+    NeedsElevation,
+    /// Windows, already elevated — devices are available, show "Refresh Devices".
+    Elevated,
+}
+
 impl RustyBackupApp {
+    /// Current Windows elevation-gate state. The button + device-list behavior
+    /// key off this; non-Windows is always `NotApplicable`.
+    fn elevation_gate(&self) -> ElevationGate {
+        #[cfg(windows)]
+        {
+            if rusty_backup::os::windows::is_elevated() {
+                ElevationGate::Elevated
+            } else {
+                ElevationGate::NeedsElevation
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            ElevationGate::NotApplicable
+        }
+    }
+
+    /// Lazily load (once) and return the stylized shield texture for the
+    /// elevation button.
+    fn shield_texture(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
+        if let Some(tex) = &self.shield_texture {
+            return tex.clone();
+        }
+        let rgba = image::load_from_memory(include_bytes!("../../assets/icons/shield.png"))
+            .expect("embedded shield.png is valid")
+            .to_rgba8();
+        let size = [rgba.width() as usize, rgba.height() as usize];
+        let color_image = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+        let tex = ctx.load_texture("shield", color_image, egui::TextureOptions::LINEAR);
+        self.shield_texture = Some(tex.clone());
+        tex
+    }
+
     /// Drain bulk-convert worker log messages into the GUI log panel and
     /// clear the status handle when the worker finishes.
     fn poll_bulk_convert(&mut self) {
@@ -522,11 +594,55 @@ impl eframe::App for RustyBackupApp {
                         }
                     }
 
-                    if ui.button("Refresh Devices").clicked() {
-                        self.devices = device::enumerate_devices();
-                        self.log_panel
-                            .info(format!("Refreshed: {} device(s) found", self.devices.len()));
-                        ui.ctx().request_repaint();
+                    // Windows: physical-device access needs admin, and the GUI
+                    // launches un-elevated (asInvoker). When not elevated, the
+                    // single global gate is this shielded "Show Physical
+                    // Devices" button, which relaunches the whole process via
+                    // UAC; the elevated instance auto-enumerates on startup.
+                    // Once elevated, it becomes the normal "Refresh Devices".
+                    match self.elevation_gate() {
+                        ElevationGate::NeedsElevation => {
+                            let tint = ui.visuals().widgets.active.fg_stroke.color;
+                            let shield = self.shield_texture(ui.ctx());
+                            let icon = egui::Image::from_texture(
+                                egui::load::SizedTexture::from_handle(&shield),
+                            )
+                            .tint(tint)
+                            .max_height(14.0);
+                            let resp = ui
+                                .add(egui::Button::image_and_text(
+                                    icon,
+                                    egui::RichText::new("Show Physical Devices")
+                                        .color(egui::Color32::YELLOW),
+                                ))
+                                .on_hover_text(
+                                    "Restart with administrator privileges to access \
+                                     physical disk devices (will prompt for elevation).",
+                                );
+                            if resp.clicked() {
+                                #[cfg(windows)]
+                                {
+                                    self.log_panel
+                                        .info("Requesting administrator privileges...");
+                                    if let Err(e) = rusty_backup::os::windows::request_elevation() {
+                                        self.log_panel.error(format!(
+                                            "Elevation request failed or was cancelled: {e}"
+                                        ));
+                                    }
+                                }
+                            }
+                            ui.separator();
+                        }
+                        ElevationGate::NotApplicable | ElevationGate::Elevated => {
+                            if ui.button("Refresh Devices").clicked() {
+                                self.devices = device::enumerate_devices();
+                                self.log_panel.info(format!(
+                                    "Refreshed: {} device(s) found",
+                                    self.devices.len()
+                                ));
+                                ui.ctx().request_repaint();
+                            }
+                        }
                     }
                     ui.separator();
 

@@ -240,6 +240,13 @@ impl BackupTab {
                                 self.update_backup_name(ctx);
                             }
                         }
+                        if ctx.devices.is_empty() {
+                            ui.label(
+                                egui::RichText::new(super::no_devices_hint())
+                                    .italics()
+                                    .weak(),
+                            );
+                        }
                         ui.separator();
                         if ui
                             .selectable_label(self.image_file_path.is_some(), "Open Image File...")
