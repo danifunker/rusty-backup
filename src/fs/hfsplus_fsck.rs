@@ -748,4 +748,36 @@ mod tests {
         assert_eq!(first.target, 1024);
         assert!(!first.preview.is_empty() && first.preview.len() <= 64);
     }
+
+    /// Step 27 (partial): a cleanly-unmounted journaled volume (empty journal)
+    /// is editable; its journal stays empty and valid.
+    #[test]
+    fn prepare_for_edit_allows_clean_journaled_volume() {
+        // No transactions -> the journal header is left clean (start == end).
+        let (img, _) = graft_journal(32 * 1024 * 1024, 4096, &[]);
+        let cursor = Cursor::new(img);
+        let mut fs = HfsPlusFilesystem::open(cursor, 0).expect("open");
+        assert!(fs.is_journaled());
+        fs.prepare_for_edit()
+            .expect("clean journaled volume should be editable");
+    }
+
+    /// A dirty journaled volume is still refused (editing stale metadata would
+    /// drop the journaled changes).
+    #[test]
+    fn prepare_for_edit_refuses_dirty_journaled_volume() {
+        let (img, _) = graft_journal(32 * 1024 * 1024, 4096, &[vec![(1024u64, vec![0x11; 512])]]);
+        let cursor = Cursor::new(img);
+        let mut fs = HfsPlusFilesystem::open(cursor, 0).expect("open");
+        let err = fs
+            .prepare_for_edit()
+            .expect_err("dirty journal must refuse");
+        assert!(
+            matches!(
+                err,
+                super::super::filesystem::FilesystemError::Unsupported(_)
+            ),
+            "expected Unsupported, got {err:?}"
+        );
+    }
 }

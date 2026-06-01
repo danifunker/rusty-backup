@@ -1060,15 +1060,39 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
     /// not by read-only opens, so the cost is paid only when we're about
     /// to mutate.
     ///
-    /// Returns `Err(Unsupported)` for journaled volumes (Step 4 of
-    /// `docs/hfsplus_enhancements.md`); xattr-bearing volumes succeed but
-    /// later `delete_entry` calls against any of the cached CNIDs are
-    /// refused at the source until Phase 5 lands.
+    /// Journaled volumes are accepted only when the journal is *clean* (empty,
+    /// `start == end`) — the cleanly-unmounted case. A clean journal has no
+    /// pending state, so editing the catalog in place and leaving the journal
+    /// empty keeps the volume valid for macOS (it replays nothing on mount).
+    /// A *dirty* journal carries metadata the catalog hasn't absorbed yet;
+    /// editing on top of that stale catalog would lose the journaled changes,
+    /// so we still refuse it here. In-place transactional writes that journal
+    /// our own mutations and recover dirty volumes are the remaining half of
+    /// Step 27 (`docs/hfsplus_enhancements.md`) and are not yet wired in.
+    ///
+    /// xattr-bearing volumes succeed but later `delete_entry` calls against any
+    /// of the cached CNIDs are refused at the source until Phase 5 lands.
     pub fn prepare_for_edit(&mut self) -> Result<(), FilesystemError> {
         if self.vh.attributes & HFSPLUS_VOLUME_JOURNALED_BIT != 0 {
-            return Err(FilesystemError::Unsupported(
-                "journaled HFS+ volume — clear the journal in macOS or open read-only".into(),
-            ));
+            match self.locate_journal() {
+                Ok(Some((_jib, header))) if !header.is_empty() => {
+                    return Err(FilesystemError::Unsupported(
+                        "dirty journaled HFS+ volume — mount and cleanly unmount it in macOS \
+                         to flush the journal, then retry (or open read-only)"
+                            .into(),
+                    ));
+                }
+                Ok(_) => {
+                    // Clean journal (or, defensively, none) — safe to edit in
+                    // place; the journal stays empty and valid.
+                }
+                Err(e) => {
+                    return Err(FilesystemError::Unsupported(format!(
+                        "journaled HFS+ volume with an unreadable journal ({e}) — \
+                         open read-only"
+                    )));
+                }
+            }
         }
 
         // No attributes file → nothing to scan, leave the set as `None`
@@ -6203,10 +6227,12 @@ mod tests {
     }
 
     #[test]
-    fn test_prepare_for_edit_refuses_journaled_volume() {
-        // Build a clean image, then flip `vh.attributes` to set the
-        // journaled bit before opening. `prepare_for_edit` must refuse;
-        // a plain `open` continues to succeed (read-only is fine).
+    fn test_prepare_for_edit_refuses_journaled_volume_without_valid_journal() {
+        // Set the journaled bit but provide no valid journal (journalInfoBlock
+        // points at zeroed boot blocks). Since we can't verify the journal is
+        // clean, `prepare_for_edit` refuses; a plain read-only `open` still
+        // succeeds. (Clean journaled volumes — verified empty — are accepted;
+        // see hfsplus_fsck::tests::prepare_for_edit_allows_clean_journaled_volume.)
         let mut img = make_editable_hfsplus_image();
         let attr_off = 1024 + 4; // VH offset 4 = attributes (u32 BE)
         let mut attrs = BigEndian::read_u32(&img[attr_off..attr_off + 4]);
@@ -6217,10 +6243,10 @@ mod tests {
         let mut fs = HfsPlusFilesystem::open(cursor, 0).expect("read-only open should succeed");
         let err = fs
             .prepare_for_edit()
-            .expect_err("journaled volume must refuse edit prep");
+            .expect_err("journaled volume with no valid journal must refuse edit prep");
         match err {
-            FilesystemError::Unsupported(msg) => assert!(msg.contains("journaled")),
-            other => panic!("expected Unsupported(journaled...), got {other:?}"),
+            FilesystemError::Unsupported(msg) => assert!(msg.contains("journal")),
+            other => panic!("expected Unsupported(journal...), got {other:?}"),
         }
     }
 
