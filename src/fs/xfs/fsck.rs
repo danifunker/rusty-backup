@@ -16,10 +16,17 @@
 //! `repair/sb.c`) under `~/efs-xfs-refs/xfsprogs/`. v4 on-disk layout per
 //! "XFS Algorithms & Data Structures" 3rd ed.
 
+use std::collections::HashSet;
 use std::io::{Read, Seek};
+
+use byteorder::{BigEndian, ByteOrder};
 
 use super::ag::{XfsAgf, XfsAgi};
 use super::sb::XfsSuperblock;
+use super::types::{
+    NULLAGBLOCK, XFS_BTREE_SBLOCK_CRC_LEN, XFS_BTREE_SBLOCK_LEN, XFS_IBT_CRC_MAGIC, XFS_IBT_MAGIC,
+    XFS_INODES_PER_CHUNK,
+};
 use super::{read_at_aligned, XfsFilesystem};
 use crate::fs::filesystem::FilesystemError;
 use crate::fs::fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry};
@@ -89,6 +96,14 @@ impl Builder {
     }
 }
 
+/// Per-AG header summary captured in Phase 1 and reused by Phase 2.
+struct AgHeaders {
+    expected_len: u64,
+    /// AG-relative root block of the inode-allocation btree, if the AGI
+    /// parsed. `None` means we can't enumerate this AG's inodes.
+    agi_root: Option<u32>,
+}
+
 impl<R: Read + Seek + Send> XfsFilesystem<R> {
     /// Run the XFS verifier and return a shared `FsckResult`.
     pub(crate) fn run_fsck(&mut self) -> Result<FsckResult, FilesystemError> {
@@ -96,7 +111,8 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         let sb = self.superblock().clone();
 
         check_superblock_geometry(&sb, &mut b);
-        self.check_ag_headers(&sb, &mut b);
+        let ag_headers = self.check_ag_headers(&sb, &mut b);
+        self.check_allocations(&sb, &ag_headers, &mut b);
 
         Ok(b.finish())
     }
@@ -107,7 +123,8 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
     /// 0), then the AGF (sector 1), AGI (sector 2) and AGFL (sector 3),
     /// where "sector" is `sb_sectsize`. We read the first four sectors of
     /// each AG in one aligned read and validate them against the primary.
-    fn check_ag_headers(&mut self, sb: &XfsSuperblock, b: &mut Builder) {
+    /// Returns per-AG info Phase 2 needs (inobt roots, AG lengths).
+    fn check_ag_headers(&mut self, sb: &XfsSuperblock, b: &mut Builder) -> Vec<AgHeaders> {
         let agcount = sb.agcount as u64;
         let agblocks = sb.agblocks as u64;
         let blocksize = sb.blocksize as u64;
@@ -116,6 +133,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         let mut total_free_blocks: u64 = 0;
         let mut total_inodes: u64 = 0;
         let mut total_free_inodes: u64 = 0;
+        let mut out = Vec::with_capacity(agcount as usize);
 
         // Header span: 4 sectors (sb / AGF / AGI / AGFL). sectsize is a
         // power of two >= 512, so 4*sectsize is 512-aligned as required by
@@ -124,6 +142,13 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         let mut buf = vec![0u8; span as usize];
 
         for agno in 0..agcount {
+            // Expected block count for this AG: the last AG is short.
+            let expected_len = if agno == agcount - 1 {
+                sb.dblocks - agno * agblocks
+            } else {
+                agblocks
+            };
+
             let ag_start = agno * agblocks * blocksize;
             if let Err(e) = read_at_aligned(
                 &mut self.reader,
@@ -135,15 +160,12 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
                     "AgHeaderReadFailed",
                     format!("AG {agno}: could not read headers: {e}"),
                 );
+                out.push(AgHeaders {
+                    expected_len,
+                    agi_root: None,
+                });
                 continue;
             }
-
-            // Expected block count for this AG: the last AG is short.
-            let expected_len = if agno == agcount - 1 {
-                sb.dblocks - agno * agblocks
-            } else {
-                agblocks
-            };
 
             // --- AG superblock replica (sector 0) ---
             match XfsSuperblock::parse(&buf[0..sectsize as usize]) {
@@ -166,14 +188,23 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
 
             // --- AGI (sector 2) ---
             let agi_off = 2 * sectsize as usize;
-            match XfsAgi::parse(&buf[agi_off..agi_off + sectsize as usize]) {
+            let agi_root = match XfsAgi::parse(&buf[agi_off..agi_off + sectsize as usize]) {
                 Ok(agi) => {
                     check_agi(&agi, agno, expected_len, b);
                     total_inodes += agi.count as u64;
                     total_free_inodes += agi.freecount as u64;
+                    Some(agi.root)
                 }
-                Err(e) => b.err("AgiBadMagic", format!("AG {agno} AGI: {e}")),
-            }
+                Err(e) => {
+                    b.err("AgiBadMagic", format!("AG {agno} AGI: {e}"));
+                    None
+                }
+            };
+
+            out.push(AgHeaders {
+                expected_len,
+                agi_root,
+            });
         }
 
         b.stat(
@@ -190,6 +221,293 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
             "Allocated inodes",
             format!("{total_inodes} ({total_free_inodes} free)"),
         );
+        out
+    }
+
+    /// Phase 2: block-ownership map (the in-memory rmap substitute, R1 in
+    /// `docs/xfs_edit_and_repair.md`). Enumerate every allocated inode via
+    /// each AG's inode btree, claim its blocks in a per-volume state map,
+    /// and report any block claimed twice (`DoubleAllocation`) or any extent
+    /// outside the volume (`ExtentPastVolume`).
+    fn check_allocations(&mut self, sb: &XfsSuperblock, ags: &[AgHeaders], b: &mut Builder) {
+        // Bound the in-memory map. Vintage IRIX disks are a few GB (≤ ~1M
+        // 4 KiB blocks); refuse only absurd geometries to avoid OOM.
+        const MAX_MAP_BLOCKS: u64 = 256 * 1024 * 1024; // 256M blocks (256 MiB map)
+        if sb.dblocks > MAX_MAP_BLOCKS {
+            b.warn(
+                "OwnershipMapSkipped",
+                format!(
+                    "volume has {} blocks (> {MAX_MAP_BLOCKS}); skipping block-ownership scan",
+                    sb.dblocks
+                ),
+            );
+            return;
+        }
+
+        let agblocks = sb.agblocks as u64;
+        let mut map = OwnerMap::new(sb.dblocks);
+        // blocks spanned by one 64-inode chunk.
+        let blocks_per_chunk =
+            ((XFS_INODES_PER_CHUNK as u64) * sb.inodesize as u64).div_ceil(sb.blocksize as u64);
+
+        for (agno, ag) in ags.iter().enumerate() {
+            let agno = agno as u64;
+            // AG header block 0 holds sb/AGF/AGI/AGFL.
+            map.mark(agno * agblocks, S_INUSE_FS);
+
+            let Some(root) = ag.agi_root else { continue };
+            let recs =
+                match self.collect_inobt_records(sb, agno, root, ag.expected_len, &mut map, b) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        b.err("InobtWalkFailed", format!("AG {agno} inode btree: {e}"));
+                        continue;
+                    }
+                };
+
+            for rec in recs {
+                // Claim the inode-chunk blocks themselves.
+                let chunk_agbno = (rec.start_agino as u64) >> sb.inopblog;
+                for blk in 0..blocks_per_chunk {
+                    map.mark(agno * agblocks + chunk_agbno + blk, S_INO);
+                }
+                // Visit each allocated inode in the chunk.
+                for slot in 0..XFS_INODES_PER_CHUNK {
+                    let is_free = (rec.free >> slot) & 1 == 1;
+                    if is_free {
+                        continue;
+                    }
+                    let agino = rec.start_agino as u64 + slot as u64;
+                    let ino = (agno << (sb.agblklog + sb.inopblog)) | agino;
+                    self.scan_inode_blocks(sb, ino, &mut map, b);
+                }
+            }
+        }
+
+        let mult = map.count_mult();
+        b.stat("Blocks scanned", format!("{} claimed", map.count_claimed()));
+        if mult > 0 {
+            b.stat("Cross-linked blocks", format!("{mult}"));
+        }
+    }
+
+    /// Read one allocated inode, count it, and claim its data-fork blocks in
+    /// the ownership map. Read or decode failures are reported, not fatal.
+    fn scan_inode_blocks(
+        &mut self,
+        sb: &XfsSuperblock,
+        ino: u64,
+        map: &mut OwnerMap,
+        b: &mut Builder,
+    ) {
+        let (core, inode_buf) = match self.read_inode_buf(ino) {
+            Ok(v) => v,
+            Err(e) => {
+                b.err("InodeReadFailed", format!("inode {ino}: {e}"));
+                return;
+            }
+        };
+        if core.mode == 0 {
+            // inobt said allocated but the inode is zeroed — inconsistency.
+            b.err(
+                "AllocatedInodeZeroed",
+                format!("inode {ino} marked allocated in inobt but has mode 0"),
+            );
+            return;
+        }
+        if core.is_dir() {
+            b.dirs_checked += 1;
+        } else {
+            b.files_checked += 1;
+        }
+
+        // Only extent / btree formats own separate disk blocks. Local
+        // (inline dirs, short symlinks, devices) own none.
+        use super::types::DiFormat;
+        if !matches!(core.format, DiFormat::Extents | DiFormat::Btree) {
+            return;
+        }
+        let extents = match self.decode_data_extents(&core, &inode_buf) {
+            Ok(e) => e,
+            Err(e) => {
+                b.err("ExtentDecodeFailed", format!("inode {ino}: {e}"));
+                return;
+            }
+        };
+        for ext in &extents {
+            self.claim_extent(sb, ino, ext.startblock, ext.blockcount, map, b);
+        }
+    }
+
+    /// Claim `[startblock, startblock+count)` (XFS fsblocks) for `ino`,
+    /// flagging out-of-bounds extents and cross-links.
+    fn claim_extent(
+        &self,
+        sb: &XfsSuperblock,
+        ino: u64,
+        startblock: u64,
+        count: u64,
+        map: &mut OwnerMap,
+        b: &mut Builder,
+    ) {
+        let agblocks = sb.agblocks as u64;
+        let agmask = (1u64 << sb.agblklog) - 1;
+        let mut collided = false;
+        for i in 0..count {
+            let fsb = startblock + i;
+            let agno = fsb >> sb.agblklog;
+            let agbno = fsb & agmask;
+            if agno >= sb.agcount as u64 || agbno >= agblocks {
+                b.err(
+                    "ExtentPastVolume",
+                    format!(
+                        "inode {ino}: extent block {fsb} (AG {agno}, agbno {agbno}) is outside the volume"
+                    ),
+                );
+                return;
+            }
+            let linear = agno * agblocks + agbno;
+            if map.mark(linear, S_INUSE) {
+                collided = true;
+            }
+        }
+        if collided {
+            b.err(
+                "DoubleAllocation",
+                format!(
+                    "inode {ino}: extent [{startblock}..{}) overlaps blocks already claimed elsewhere",
+                    startblock + count
+                ),
+            );
+        }
+    }
+
+    /// Walk an AG's inode-allocation btree, collecting every leaf record and
+    /// marking the btree's own blocks as filesystem metadata in `map`.
+    fn collect_inobt_records(
+        &mut self,
+        sb: &XfsSuperblock,
+        agno: u64,
+        root_agbno: u32,
+        expected_len: u64,
+        map: &mut OwnerMap,
+        b: &mut Builder,
+    ) -> Result<Vec<InobtRec>, FilesystemError> {
+        let bs = sb.blocksize as usize;
+        let hdr = if sb.is_v5() {
+            XFS_BTREE_SBLOCK_CRC_LEN
+        } else {
+            XFS_BTREE_SBLOCK_LEN
+        };
+        // Internal nodes: key(4) + ptr(4); leaves: rec(16).
+        let max_intern = (bs - hdr) / 8;
+        let max_leaf = (bs - hdr) / 16;
+        let agblocks = sb.agblocks as u64;
+
+        let mut recs = Vec::new();
+        let mut block = vec![0u8; bs];
+        let mut stack = vec![root_agbno];
+        let mut visited: HashSet<u32> = HashSet::new();
+
+        while let Some(agbno) = stack.pop() {
+            if agbno == NULLAGBLOCK || agbno as u64 >= expected_len {
+                continue;
+            }
+            if !visited.insert(agbno) {
+                b.err(
+                    "InobtCycle",
+                    format!("AG {agno} inode btree: block {agbno} visited twice"),
+                );
+                continue;
+            }
+            let fsblock = (agno << sb.agblklog) | agbno as u64;
+            self.read_fsblock(fsblock, &mut block)?;
+            map.mark(agno * agblocks + agbno as u64, S_INUSE_FS);
+
+            let magic = BigEndian::read_u32(&block[0..4]);
+            if magic != XFS_IBT_MAGIC && magic != XFS_IBT_CRC_MAGIC {
+                return Err(FilesystemError::Parse(format!(
+                    "bad inode btree magic 0x{magic:08X} at AG {agno} block {agbno}"
+                )));
+            }
+            let level = BigEndian::read_u16(&block[4..6]);
+            let numrecs = BigEndian::read_u16(&block[6..8]) as usize;
+
+            if level == 0 {
+                if numrecs > max_leaf {
+                    return Err(FilesystemError::Parse(format!(
+                        "AG {agno} inode btree leaf numrecs {numrecs} > max {max_leaf}"
+                    )));
+                }
+                for i in 0..numrecs {
+                    let off = hdr + i * 16;
+                    let start_agino = BigEndian::read_u32(&block[off..off + 4]);
+                    let free = BigEndian::read_u64(&block[off + 8..off + 16]);
+                    recs.push(InobtRec { start_agino, free });
+                }
+            } else {
+                if numrecs > max_intern {
+                    return Err(FilesystemError::Parse(format!(
+                        "AG {agno} inode btree node numrecs {numrecs} > max {max_intern}"
+                    )));
+                }
+                let ptr_base = hdr + max_intern * 4;
+                for i in 0..numrecs {
+                    let off = ptr_base + i * 4;
+                    stack.push(BigEndian::read_u32(&block[off..off + 4]));
+                }
+            }
+        }
+        Ok(recs)
+    }
+}
+
+/// One inode-allocation btree leaf record: the chunk's first AG-relative
+/// inode number and its 64-bit free bitmap (set bit = free).
+struct InobtRec {
+    start_agino: u32,
+    free: u64,
+}
+
+// Block-ownership states (subset of xfs_repair's XR_E_*; the rebuild phases
+// add the FREE/FREE1 states once the free-space btree walk lands).
+const S_UNKNOWN: u8 = 0;
+const S_INUSE: u8 = 1; // file/dir data
+const S_INUSE_FS: u8 = 2; // AG headers / btree blocks
+const S_INO: u8 = 3; // inode chunk blocks
+const S_MULT: u8 = 4; // multiply claimed (cross-link)
+
+/// Per-volume block-state map, indexed by partition-linear block number
+/// (`agno * agblocks + agbno`). The R1 ownership map from the plan.
+struct OwnerMap {
+    states: Vec<u8>,
+}
+
+impl OwnerMap {
+    fn new(dblocks: u64) -> Self {
+        Self {
+            states: vec![S_UNKNOWN; dblocks as usize],
+        }
+    }
+    /// Claim `linear` for `state`. Returns true if the block was already
+    /// claimed (transition to `S_MULT`).
+    fn mark(&mut self, linear: u64, state: u8) -> bool {
+        let Some(slot) = self.states.get_mut(linear as usize) else {
+            return false;
+        };
+        if *slot == S_UNKNOWN {
+            *slot = state;
+            false
+        } else {
+            *slot = S_MULT;
+            true
+        }
+    }
+    fn count_claimed(&self) -> usize {
+        self.states.iter().filter(|&&s| s != S_UNKNOWN).count()
+    }
+    fn count_mult(&self) -> usize {
+        self.states.iter().filter(|&&s| s == S_MULT).count()
     }
 }
 

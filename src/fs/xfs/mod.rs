@@ -1059,6 +1059,38 @@ mod tests {
     }
 
     #[test]
+    fn fsck_phase2_enumerates_inodes_and_claims_blocks() {
+        // Proves the Phase 2 inode-btree walk + block-ownership map ran end
+        // to end on real mkfs output: the fixture has hello.txt + readme.txt
+        // + a symlink in root and a nested file under subdir/, so we expect
+        // at least 2 files and 2 directories scanned and some claimed blocks.
+        let img = load_fixture();
+        let mut fs = XfsFilesystem::open(Cursor::new(img), 0).expect("open xfs");
+        let res = fs.run_fsck().expect("fsck runs");
+        assert!(
+            res.errors.is_empty(),
+            "{:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+        assert!(
+            res.stats.files_checked >= 2,
+            "expected >=2 files, got {}",
+            res.stats.files_checked
+        );
+        assert!(
+            res.stats.directories_checked >= 2,
+            "expected >=2 dirs (root + subdir), got {}",
+            res.stats.directories_checked
+        );
+        let scanned = res
+            .stats
+            .extra
+            .iter()
+            .any(|(k, v)| k == "Blocks scanned" && v != "0 claimed");
+        assert!(scanned, "expected non-zero claimed blocks");
+    }
+
+    #[test]
     fn fsck_detects_corrupted_ag_superblock_replica() {
         // Corrupt AG 1's superblock replica: flip its dblocks field so it
         // disagrees with the primary. AG 1 starts at agblocks*blocksize =
