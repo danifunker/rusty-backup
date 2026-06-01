@@ -388,7 +388,8 @@ pub struct TransactionSummary {
     pub target_range: Option<(u64, u64)>,
 }
 
-/// Read-only state of a parsed journal — enough for the history viewer.
+/// Read-only state of a parsed journal — enough for the history viewer and the
+/// fsck journal phase.
 #[derive(Debug, Clone)]
 pub struct JournalState {
     pub info: JournalInfoBlock,
@@ -396,6 +397,19 @@ pub struct JournalState {
     pub transactions: Vec<TransactionSummary>,
     /// True when the walk stopped early on a corrupt/short transaction.
     pub partial: bool,
+    /// Sequence number of the transaction whose block-list-header checksum
+    /// failed (the walk stops there, like macOS replay), if any.
+    pub checksum_mismatch: Option<u32>,
+    /// `(from, to)` for each point where the sequence number did not advance
+    /// by one. macOS stops replay at the first such jump.
+    pub sequence_jumps: Vec<(u32, u32)>,
+}
+
+impl JournalState {
+    /// Total bytes of block payloads across all pending transactions.
+    pub fn pending_bytes(&self) -> u64 {
+        self.transactions.iter().map(|t| t.total_bytes).sum()
+    }
 }
 
 /// Walks the live transactions of a journal (`start -> end`, wrapping at

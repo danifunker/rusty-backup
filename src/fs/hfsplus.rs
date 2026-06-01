@@ -739,12 +739,33 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
 
         let mut transactions = Vec::new();
         let mut partial = false;
+        let mut checksum_mismatch = None;
+        let mut sequence_jumps = Vec::new();
         {
             let mut walker =
                 JournalWalker::new(&mut self.reader, self.partition_offset, &jib, &header);
+            let mut prev_seq: Option<u32> = None;
             while let Some(item) = walker.next() {
                 match item {
-                    Ok(view) => transactions.push(view.summary()),
+                    Ok(view) => {
+                        let seq = view.sequence_num;
+                        if let Some(prev) = prev_seq {
+                            // macOS expects each transaction's sequence to be
+                            // prev or prev+1; anything else is a jump.
+                            if seq != prev && seq != prev.wrapping_add(1) {
+                                sequence_jumps.push((prev, seq));
+                            }
+                        }
+                        prev_seq = Some(seq);
+                        transactions.push(view.summary());
+                    }
+                    Err(super::hfsplus_journal::JournalError::CorruptTransaction {
+                        sequence_num,
+                    }) => {
+                        checksum_mismatch = Some(sequence_num);
+                        partial = true;
+                        break;
+                    }
                     Err(_) => {
                         partial = true;
                         break;
@@ -758,6 +779,8 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
             header,
             transactions,
             partial,
+            checksum_mismatch,
+            sequence_jumps,
         }))
     }
 
