@@ -679,9 +679,14 @@ fn check_superblock_geometry(sb: &XfsSuperblock, b: &mut Builder) {
 }
 
 /// Compare one AG's superblock replica against the authoritative primary.
-/// Only the geometry fields matter — they must match exactly or the AG is
-/// uninterpretable. A mismatch is repairable: R4 rewrites the copy from the
-/// primary.
+/// Only the **geometry** fields are replicated and must match exactly, or the
+/// AG is uninterpretable. Inode-pointer fields (`rootino`, `rbmino`,
+/// `rsumino`, quota inodes) are deliberately **not** compared: XFS only
+/// stores them in the primary and leaves the secondaries' copies as
+/// NULLFSINO (verified against `xfs_db`: `sb 2` shows `rootino = null` on a
+/// clean mkfs'd v4 volume). Comparing them produced a false-positive
+/// `ReplicaSbMismatch` that `xfs_repair -n` did not report. A geometry
+/// mismatch is repairable: R4 rewrites the copy from the primary.
 fn check_sb_replica(primary: &XfsSuperblock, rep: &XfsSuperblock, agno: u64, b: &mut Builder) {
     let mut report = |field: &str, p: String, r: String| {
         b.err(
@@ -722,13 +727,6 @@ fn check_sb_replica(primary: &XfsSuperblock, rep: &XfsSuperblock, agno: u64, b: 
             "inodesize",
             primary.inodesize.to_string(),
             rep.inodesize.to_string(),
-        );
-    }
-    if rep.rootino != primary.rootino {
-        report(
-            "rootino",
-            primary.rootino.to_string(),
-            rep.rootino.to_string(),
         );
     }
 }

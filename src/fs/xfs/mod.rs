@@ -1094,6 +1094,25 @@ mod tests {
     }
 
     #[test]
+    fn fsck_tolerates_null_rootino_in_secondary_superblock() {
+        // Real mkfs.xfs leaves rootino/rbmino/rsumino as NULLFSINO in the
+        // secondary superblocks (verified via `xfs_db -c 'sb 2'`). The
+        // verifier must NOT flag that as a ReplicaSbMismatch — only geometry
+        // fields are replicated. Set AG 1's secondary rootino to NULLFSINO
+        // (offset 56..64) and confirm no mismatch is reported.
+        let mut img = load_fixture().to_vec();
+        let ag1 = 65_536usize * 4096;
+        img[ag1 + 56..ag1 + 64].copy_from_slice(&u64::MAX.to_be_bytes());
+        let mut fs = XfsFilesystem::open(Cursor::new(img), 0).expect("open xfs");
+        let res = fs.run_fsck().expect("fsck runs");
+        assert!(
+            !res.errors.iter().any(|e| e.code == "ReplicaSbMismatch"),
+            "null rootino in a secondary must not be a mismatch, got: {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn fsck_detects_corrupted_ag_superblock_replica() {
         // Corrupt AG 1's superblock replica: flip its dblocks field so it
         // disagrees with the primary. AG 1 starts at agblocks*blocksize =
