@@ -1,6 +1,9 @@
 # Windows Install + Self-Update (self_update / self_replace + Inno Setup)
 
-Status: **PLAN** — not yet started. Supersedes the earlier Velopack plan
+Status: **IN PROGRESS.** Self-update + installer (Phases 1-7) implemented and
+green on CI; Windows-VM runtime testing (Phase 8) + docs (Phase 9) remain. The
+on-demand **elevation rework** (Phases A-H below) is implemented (A-G) and
+pending its own CI/VM verification (H). Supersedes the earlier Velopack plan
 (removed): Velopack required SemVer and a per-arch packaging toolchain; this
 approach needs neither.
 
@@ -44,15 +47,15 @@ ships an Inno Setup installer. `cargo-dist`/`axoupdater` is the heavier
 
 ### Install location — user-selectable, default per-user
 Inno's "Select Destination Location" page defaults to
-`%LocalAppData%\RustyBackup` (per-user, no elevation → `self_replace` can
-overwrite freely) but lets the user pick another folder. Caveat for protected
-dirs (`Program Files`): an unprivileged `self_replace` can't write there — but
-**our GUI exe already runs elevated** (`requireAdministrator` manifest,
-build.rs:41), so a self-update launched from the running app inherits the admin
-token and still succeeds. We therefore allow any folder but **recommend
-`%LocalAppData%`** and document the trade-off. If a future build drops the
-admin manifest, gate self-update on a writability probe and fall back to
-"download the installer."
+`%LocalAppData%\Programs\Rusty Backup` (per-user, no elevation → `self_replace`
+can overwrite freely) but lets the user pick another folder. Caveat for
+protected dirs (`Program Files`): the GUI now runs **`asInvoker`** (the
+`requireAdministrator` manifest was removed — see the elevation rework below),
+so an un-elevated `self_replace` **cannot** write to `Program Files`. We default
+to and **recommend `%LocalAppData%`**; a self-update into a protected dir will
+fail the in-place swap. Follow-up (not yet done): gate self-update on a
+writability probe and fall back to "download the installer" when the install
+dir isn't user-writable.
 
 ### Start Menu + Add/Remove Programs — yes, via Inno
 Inno auto-creates the Start-Menu group/shortcut (optional desktop icon), the
@@ -273,3 +276,62 @@ polished install experience is **~5–6 d**.
   `release` job artifact filter).
 - The `AppId` GUID is duplicated in `installer/rusty-backup.iss` and
   `os::win_install::UNINSTALL_SUBKEY` — keep them in sync.
+
+---
+
+## Elevation rework (on-demand admin) — fixes installer error 740
+
+The GUI shipped a `requireAdministrator` manifest (always-elevated). That broke
+the per-user installer: an un-elevated `Setup.exe` cannot `CreateProcess` an
+always-elevated exe at post-install, giving **"CreateProcess failed; code 740,
+the requested operation requires elevation."** It also forced a UAC prompt on
+every launch. This rework moves the GUI to `asInvoker` with a single, explicit,
+global elevation gate. Continues the trajectory of commits `e50f4fb` (gate
+admin to physical-disk ops, manifest → GUI binary only) and `e3b0173`.
+
+### Model
+- GUI launches **`asInvoker`** (no manifest). File-only flows (inspect/backup/
+  restore against image files, self-update, association registration) never
+  elevate, never prompt.
+- **One global gate**: a top-bar **"Show Physical Devices"** button (stylized
+  shield) is the *only* elevation trigger. Click → `os::windows::
+  request_elevation()` relaunches the whole process via UAC. The elevated
+  instance auto-enumerates devices on startup (the existing startup
+  `enumerate_devices()` returns devices when elevated), so all tabs' device
+  lists populate at once. Once elevated the button becomes "Refresh Devices".
+- Elevation is **whole-process** (Windows can't elevate one call); a global
+  top-bar gate honestly reflects that. Low-level read/write paths never
+  relaunch (that would `process::exit` mid-operation) — they only `bail!`
+  clearly if somehow not elevated.
+
+### Phases
+- [x] **A** — drop `requireAdministrator` manifest (`build.rs`); remove orphaned
+      `.manifest`/`.rc` + `embed-resource` build-dep. GUI now `asInvoker`.
+- [x] **B** — `os/windows.rs`: `enumerate_devices()` returns empty (no relaunch)
+      when not elevated; read/write paths drop auto-relaunch, keep clear
+      `bail!`; `check_status()` → `NeedsElevation` instead of erroring.
+- [x] **C** — global state: startup `enumerate_devices()` already auto-populates
+      when elevated, so post-relaunch is seamless (no new state needed).
+- [x] **D** — top-bar `ElevationGate` button (`gui/mod.rs`): shielded "Show
+      Physical Devices" → `request_elevation()`; else "Refresh Devices".
+- [x] **E** — `assets/icons/shield.png`: tintable B/W quartered-shield
+      silhouette; lazy `shield_texture` loader (egui API verified on host).
+- [x] **F** — `no_devices_hint()` + in-dropdown hints in backup/restore tabs
+      when the device list is empty.
+- [x] **G** — `RB_NO_AUTO_ELEVATE` removed: it only gated the auto-relaunch that
+      no longer exists, so it's obsolete (no escape hatch needed when the GUI
+      starts un-elevated by default).
+- [ ] **H** — CI compile (Windows-only code) + Windows-VM runtime test: Setup.exe
+      completes without 740; button prompts UAC once; devices appear across
+      tabs; device backup/restore works; self-update relaunch keeps elevation.
+
+### Notes / caveats
+- Optical tab uses its own drive list (`opticaldiscs::drives`), not
+  `ctx.devices`; its rip path still hits the same `open_source_for_reading`
+  elevation `bail!`. Adding the shield hint there is follow-up, not done here.
+- Removing the manifest changes **release** behavior: a non-elevated GUI that
+  reaches a write path fails fast with a clear message instead of being admin.
+  Intended.
+- Relaunch discards GUI state (tab/selection). The button lives in the top bar
+  and is the first thing a device user clicks, so the loss is trivial — but it
+  is a real relaunch, not in-place.
