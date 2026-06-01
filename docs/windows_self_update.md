@@ -241,12 +241,32 @@ polished install experience is **~5–6 d**.
   `self_update` + TLS (reqwest, already a dep) work there.
 
 ## Progress tracker
-- [ ] Phase 1 — in-app self-update core
-- [ ] Phase 2 — GUI update UX
-- [ ] Phase 3 — central extension registry + association registrar
-- [ ] Phase 4 — Inno Setup installer (PATH task + associations opt-in)
-- [ ] Phase 5 — ARP DisplayVersion refresh
-- [ ] Phase 6 — location/elevation/portable reconciliation
-- [ ] Phase 7 — CI
-- [ ] Phase 8 — testing
-- [ ] Phase 9 — docs & migration
+- [x] Phase 1 — in-app self-update core (`update.rs`: download/extract +
+      self_replace swap; `model::update_runner`)
+- [x] Phase 2 — GUI update UX (`gui::mod::show_update_actions`)
+- [x] Phase 3 — central extension registry + association registrar
+      (`model::file_types`, `os::file_assoc`, config fields, main.rs hooks,
+      Settings toggle)
+- [x] Phase 4 — Inno Setup installer (`installer/rusty-backup.iss`)
+- [x] Phase 5 — ARP DisplayVersion refresh (`os::win_install`)
+- [x] Phase 6 — portable detection (`os::win_install::is_installed`); elevation
+      is inherent (GUI runs elevated); writability-probe fallback not needed
+- [ ] Phase 7 — CI (deferred)
+- [ ] Phase 8 — testing on Windows VM (deferred — requires Windows)
+- [ ] Phase 9 — docs & migration (deferred)
+
+## Implementation notes (for the deferred Phases 7-9)
+- Host is Homebrew Rust (no rustup / no Windows std), so all `#[cfg(windows)]`
+  paths (`self_replace`, `os::file_assoc`, `os::win_install`, the Windows
+  branches of `gui::mod`/`settings_dialog`/`main`) were written but **not
+  compiled here** — they need CI / a Windows VM to verify. Cross-platform parts
+  (download/extract, `model::file_types` + tests, picker repoints, config) do
+  compile and pass on host.
+- New deps (Windows-only): `self-replace`, `winreg`.
+- Phase 7 CI must: add `rb-cli.exe` into the Windows ZIP under `bin\` so the
+  self-updater's sidecar refresh + the installer's PATH layout line up; install
+  Inno (`iscc`) and compile `installer/rusty-backup.iss` per arch passing
+  `/DMyAppVersion=<version>`; attach `Setup.exe` to the release (extend the
+  `release` job artifact filter).
+- The `AppId` GUID is duplicated in `installer/rusty-backup.iss` and
+  `os::win_install::UNINSTALL_SUBKEY` — keep them in sync.

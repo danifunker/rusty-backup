@@ -48,7 +48,12 @@ fn main() -> eframe::Result {
     // Windows installer/uninstaller association hooks (and launch-time refresh).
     // Must run before GUI init; the hook flags exit without opening a window.
     #[cfg(windows)]
-    handle_windows_assoc_cli();
+    {
+        handle_windows_assoc_cli();
+        // Keep the installer's Add/Remove Programs DisplayVersion accurate after
+        // a self-update replaced the exe in place (no-op for portable copies).
+        let _ = rusty_backup::os::win_install::refresh_arp_display_version(env!("APP_VERSION"));
+    }
 
     // Install a logger that mirrors records to stderr AND buffers them for the
     // GUI log panel (so worker-thread log::info! lines, e.g. from the GHO
