@@ -18,4 +18,5 @@ pub mod physical_write_runner;
 pub mod size_mode;
 pub mod source_reader;
 pub mod status;
+pub mod update_runner;
 pub mod volume_label_runner;

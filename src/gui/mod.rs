@@ -248,6 +248,10 @@ pub struct RustyBackupApp {
     devices: Vec<DiskDevice>,
     update_info: Arc<Mutex<Option<UpdateInfo>>>,
     update_dismissed: bool,
+    /// In-app self-update worker status (Windows only). `None` until the user
+    /// clicks "Download & Install Update".
+    #[cfg(windows)]
+    update_run: Option<Arc<Mutex<rusty_backup::model::update_runner::UpdateRunStatus>>>,
     settings_dialog: SettingsDialog,
     #[cfg(target_os = "linux")]
     elevation_dialog: ElevationDialog,
@@ -331,6 +335,8 @@ impl Default for RustyBackupApp {
             devices,
             update_info,
             update_dismissed: false,
+            #[cfg(windows)]
+            update_run: None,
             settings_dialog: SettingsDialog::default(),
             #[cfg(target_os = "linux")]
             elevation_dialog,
@@ -362,6 +368,82 @@ impl RustyBackupApp {
         if status.finished {
             drop(status);
             self.bulk_convert_status = None;
+        }
+    }
+
+    /// Render the update-banner action buttons. On Windows with a matched
+    /// release asset this offers in-app "Download & Install Update" (download
+    /// progress -> "Restart now"); otherwise (other platforms, unmatched arch,
+    /// or a missing asset) it opens the releases page in a browser.
+    fn show_update_actions(&mut self, ui: &mut egui::Ui, info: &UpdateInfo) {
+        #[cfg(windows)]
+        {
+            use rusty_backup::model::update_runner::{self, UpdateRunState};
+
+            if info.asset_url.is_some() {
+                let run_state = self.update_run.as_ref().map(|s| {
+                    s.lock()
+                        .map(|g| g.state.clone())
+                        .unwrap_or(UpdateRunState::Idle)
+                });
+
+                match run_state {
+                    None => {
+                        if ui.button("Download & Install Update").clicked() {
+                            let status =
+                                Arc::new(Mutex::new(update_runner::UpdateRunStatus::default()));
+                            update_runner::spawn(info.clone(), Arc::clone(&status));
+                            self.update_run = Some(status);
+                            self.log_panel.info("Downloading update...");
+                        }
+                        if ui.button("View Release").clicked() {
+                            let _ = webbrowser::open(&info.releases_url);
+                        }
+                    }
+                    Some(UpdateRunState::Idle) | Some(UpdateRunState::Downloading { .. }) => {
+                        let frac = self
+                            .update_run
+                            .as_ref()
+                            .and_then(|s| s.lock().ok().and_then(|g| g.progress_fraction()));
+                        ui.add(egui::Spinner::new());
+                        if let Some(f) = frac {
+                            ui.add(
+                                egui::ProgressBar::new(f)
+                                    .desired_width(140.0)
+                                    .show_percentage(),
+                            );
+                        } else {
+                            ui.label("Downloading update...");
+                        }
+                        ui.ctx().request_repaint();
+                    }
+                    Some(UpdateRunState::Ready) => {
+                        ui.label(
+                            egui::RichText::new("Update installed.").color(egui::Color32::GREEN),
+                        );
+                        if ui.button("Restart now").clicked() {
+                            rusty_backup::update::restart_app();
+                        }
+                    }
+                    Some(UpdateRunState::Failed(e)) => {
+                        ui.label(
+                            egui::RichText::new(format!("Update failed: {e}"))
+                                .color(egui::Color32::LIGHT_RED),
+                        );
+                        if ui.button("Retry").clicked() {
+                            self.update_run = None;
+                        }
+                        if ui.button("View Release").clicked() {
+                            let _ = webbrowser::open(&info.releases_url);
+                        }
+                    }
+                }
+                return;
+            }
+        }
+
+        if ui.button("View Release").clicked() {
+            let _ = webbrowser::open(&info.releases_url);
         }
     }
 }
@@ -540,37 +622,38 @@ impl eframe::App for RustyBackupApp {
             }
         }
 
-        // Update notification banner (if update available and not dismissed)
-        if !self.update_dismissed {
-            if let Ok(Some(ref info)) = self.update_info.lock().map(|guard| guard.clone()) {
-                if info.is_outdated {
-                    egui::Panel::top("update_banner").show_inside(ctx, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new("Update")
-                                    .color(egui::Color32::YELLOW)
-                                    .strong(),
-                            );
-                            ui.label(format!(
-                                "available: v{} -> v{}",
-                                info.current_version, info.latest_version
-                            ));
-                            if ui.button("View Release").clicked() {
-                                let _ = webbrowser::open(&info.releases_url);
+        // Update notification banner (if update available and not dismissed).
+        // Clone the info into an owned local first so the mutex guard is dropped
+        // before the closure (which needs unique access to `self`).
+        let banner_info: Option<UpdateInfo> = if self.update_dismissed {
+            None
+        } else {
+            self.update_info.lock().ok().and_then(|g| g.clone())
+        };
+        if let Some(info) = banner_info {
+            if info.is_outdated {
+                egui::Panel::top("update_banner").show_inside(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Update")
+                                .color(egui::Color32::YELLOW)
+                                .strong(),
+                        );
+                        ui.label(format!(
+                            "available: v{} -> v{}",
+                            info.current_version, info.latest_version
+                        ));
+                        self.show_update_actions(ui, &info);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Dismiss update notification").clicked() {
+                                self.update_dismissed = true;
                             }
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui.button("Dismiss update notification").clicked() {
-                                        self.update_dismissed = true;
-                                    }
-                                },
-                            );
                         });
                     });
-                }
+                });
             }
         }
+        // (end update banner)
 
         // Elevation dialog (Linux)
         #[cfg(target_os = "linux")]
