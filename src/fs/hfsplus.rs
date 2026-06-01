@@ -698,6 +698,69 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         self.vh.attributes
     }
 
+    /// True when the volume header's journaled bit is set.
+    pub fn is_journaled(&self) -> bool {
+        self.vh.attributes & HFSPLUS_VOLUME_JOURNALED_BIT != 0
+    }
+
+    /// Locate, parse, and summarize the journal without applying any state.
+    /// Returns `Ok(None)` when the volume is not journaled. The summaries walk
+    /// `start -> end`; the walk stops early (and `partial` is set) on the first
+    /// corrupt or short transaction, mirroring how macOS replay behaves.
+    ///
+    /// See `docs/hfsplus_enhancements.md` Phase 9, Step 24.
+    pub fn read_journal(
+        &mut self,
+    ) -> Result<Option<super::hfsplus_journal::JournalState>, FilesystemError> {
+        use super::hfsplus_journal::{JournalHeader, JournalInfoBlock, JournalWalker};
+
+        if !self.is_journaled() {
+            return Ok(None);
+        }
+
+        let to_fs = |e: super::hfsplus_journal::JournalError| {
+            FilesystemError::InvalidData(format!("journal: {e}"))
+        };
+
+        // JIB lives at allocation block `journal_info_block`.
+        let jib_byte =
+            self.partition_offset + self.vh.journal_info_block as u64 * self.vh.block_size as u64;
+        self.reader.seek(SeekFrom::Start(jib_byte))?;
+        let mut jib_buf = vec![0u8; 512];
+        self.reader.read_exact(&mut jib_buf)?;
+        let jib = JournalInfoBlock::parse(&jib_buf).map_err(to_fs)?;
+
+        // The journal header's fixed fields live in the first 512 bytes.
+        self.reader
+            .seek(SeekFrom::Start(self.partition_offset + jib.offset))?;
+        let mut jh_buf = vec![0u8; 512];
+        self.reader.read_exact(&mut jh_buf)?;
+        let header = JournalHeader::parse(&jh_buf).map_err(to_fs)?;
+
+        let mut transactions = Vec::new();
+        let mut partial = false;
+        {
+            let mut walker =
+                JournalWalker::new(&mut self.reader, self.partition_offset, &jib, &header);
+            while let Some(item) = walker.next() {
+                match item {
+                    Ok(view) => transactions.push(view.summary()),
+                    Err(_) => {
+                        partial = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(Some(super::hfsplus_journal::JournalState {
+            info: jib,
+            header,
+            transactions,
+            partial,
+        }))
+    }
+
     pub(crate) fn vh_create_date(&self) -> u32 {
         self.vh.create_date
     }
