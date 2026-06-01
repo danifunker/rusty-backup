@@ -107,6 +107,9 @@ objc2-foundation = { version = "0.3", features = ["NSBundle", "NSString"] }
 # Note: Removed xpc-sys and objc2-service-management - using Unix sockets instead of XPC
 
 [target.'cfg(target_os = "windows")'.dependencies]
+# In-app self-update: replaces the running .exe in place, handling the
+# Windows locked-running-image problem. See docs/windows_self_update.md.
+self-replace = "1"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Ioctl",

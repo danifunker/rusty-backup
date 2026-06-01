@@ -1,0 +1,252 @@
+# Windows Install + Self-Update (self_update / self_replace + Inno Setup)
+
+Status: **PLAN** — not yet started. Supersedes the earlier Velopack plan
+(removed): Velopack required SemVer and a per-arch packaging toolchain; this
+approach needs neither.
+
+## Goal
+
+Give Windows the same "installed into an updatable area, self-updates in place"
+experience macOS (DMG → `/Applications`) and Linux (AppImage + zsync) already
+have — **without SemVer, without a bespoke updater binary, and without a
+heavyweight framework.**
+
+Today Windows ships a **portable ZIP** the user extracts anywhere; the in-app
+"update" banner only opens the GitHub releases page in a browser
+(`src/gui/mod.rs:558`). `src/update.rs` already does the "is a newer release
+available?" half via a plain string compare of the GitHub `releases/latest`
+tag (update.rs:161) — **no SemVer**. We reuse that and add the download +
+in-place replace half.
+
+## Approach
+
+Two off-the-shelf crates do the hard parts; Inno Setup handles first install.
+
+- **`self_replace`** — replaces the **currently running executable**, correctly
+  handling the Windows locked-running-exe problem (moves the running image
+  aside, drops the new one in). Battle-tested; this is the exact problem that
+  motivated the abandoned "separate `rb-updater` app" idea — the ecosystem
+  already packaged that trick, so we don't build it.
+- **`self_update`** — lists GitHub Releases, picks the asset for this OS/arch,
+  downloads, extracts, and replaces the binary via `self_replace`. Version
+  comparison is configurable, so we drive it off the existing date-tag check
+  instead of SemVer.
+- **Inno Setup** — a free, CLI-compilable installer that gives a GUI install
+  wizard, user-selectable install dir, Start-Menu shortcut, Add/Remove Programs
+  (ARP) entry, and an uninstaller — all for free.
+
+Precedent in the Rust ecosystem: rustup self-updates via the same
+`self_replace` mechanism and installs to a user-writable dir; WezTerm (Rust GUI)
+ships an Inno Setup installer. `cargo-dist`/`axoupdater` is the heavier
+"framework" alternative we are intentionally not taking.
+
+## Design decisions / answers to the open questions
+
+### Install location — user-selectable, default per-user
+Inno's "Select Destination Location" page defaults to
+`%LocalAppData%\RustyBackup` (per-user, no elevation → `self_replace` can
+overwrite freely) but lets the user pick another folder. Caveat for protected
+dirs (`Program Files`): an unprivileged `self_replace` can't write there — but
+**our GUI exe already runs elevated** (`requireAdministrator` manifest,
+build.rs:41), so a self-update launched from the running app inherits the admin
+token and still succeeds. We therefore allow any folder but **recommend
+`%LocalAppData%`** and document the trade-off. If a future build drops the
+admin manifest, gate self-update on a writability probe and fall back to
+"download the installer."
+
+### Start Menu + Add/Remove Programs — yes, via Inno
+Inno auto-creates the Start-Menu group/shortcut (optional desktop icon), the
+uninstaller, and the ARP entry under `HKCU\…\Uninstall\{AppId}` (per-user
+install).
+
+### rb-cli on PATH — installer task, default yes
+An Inno `[Tasks]` checkbox ("Add rb-cli to PATH", checked by default) adds a
+`bin\` subdir to the **per-user PATH** (`HKCU\Environment`) with
+`ChangesEnvironment=yes` so the change broadcasts without a reboot. Install
+`rb-cli.exe` into `bin\` (not the root) so only the CLI lands on PATH, not the
+GUI exe. Uninstaller removes the PATH entry.
+
+### File associations — owned by the app, not the installer
+The supported-extension list **grows between installer releases** (the app
+self-updates in place), so a static Inno association list goes stale the moment
+a new format lands. Therefore the **app** owns registration:
+
+- **Single source of truth.** Centralize the extension list into one module
+  (e.g. `src/model/file_types.rs`) that both the `add_filter` file pickers and
+  the association registrar consume. Today the list is duplicated and already
+  drifted (inspect_tab.rs:351 lists ~30 exts incl. `hfv`/`gho`/`woz`;
+  restore_tab.rs:395 only `img`/`raw`/`bin`) — this refactor is a standalone win.
+- **App registers per-user, idempotently.** Writes `HKCU\Software\Classes\
+  RustyBackup.DiskImage` ProgId (icon + open command) and
+  `HKCU\Software\Classes\.<ext>` → ProgId (+ `OpenWithProgids`) for every
+  extension in the central list. Re-runs on launch **when the build version
+  changed**, so a self-update that adds `.newext` registers it automatically —
+  no reinstall.
+- **One code path, three callers.** A hidden `--register-file-associations` /
+  `--unregister-file-associations` flag drives it. The Inno installer offers an
+  opt-in `[Tasks]` checkbox ("Associate disk image files with Rusty Backup") and,
+  when checked, runs the app once with that flag; an in-app **Settings toggle**
+  calls the same routine; the uninstaller calls the unregister flag.
+- **Windows default-handler caveat.** Registering makes RB a *handler* (appears
+  in "Open with", eligible as default). Windows 8+ does **not** let an app
+  silently seize the default — the user confirms via the Windows prompt /
+  Settings. "Associate" therefore means "register as handler," not "force
+  default." Document this so expectations are right.
+
+### Cross-platform associations — one list, three plumbings
+File associations are **not Windows-only**, but the mechanism differs and only
+Windows registers at runtime. The Phase-3 `src/model/file_types.rs` list is the
+single source of truth; each platform's metadata is **generated from it**, never
+hand-duplicated (mirror the existing `generate_manpage` /
+`generate_cli_reference` example binaries):
+
+- **Windows** — runtime `HKCU\Software\Classes` registrar (above). New
+  extensions register live on next launch after a self-update; no reinstall.
+- **macOS** — declarative `CFBundleDocumentTypes` (+ UTI declarations) in the
+  app bundle's `Info.plist`, generated into the CI plist step (release.yml
+  ~212-234). Launch Services auto-registers on install; the **app does not
+  register at runtime**. New extensions take effect when a new build is
+  installed (i.e. on the next DMG update).
+- **Linux** — declarative `.desktop` `MimeType=` + a shared-mime-info XML
+  (glob → MIME). The `.deb`/`.rpm` packages install these reliably; the
+  AppImage embeds a `.desktop` (release.yml AppImage job) but associations only
+  apply **if the user integrates the AppImage**. New extensions take effect on
+  package/AppImage update.
+
+Implication: on macOS/Linux a newly added extension only associates after the
+user updates to a build whose bundle/package declares it — there is no live
+re-register like Windows, because those platforms key off static bundle
+metadata. Since updates replace the whole bundle/package, this is handled on
+update; it just isn't instantaneous. Mac/Linux association generation is
+tracked as follow-up work to Phase 3, separate from this doc's Windows focus.
+
+### Keeping ARP accurate across in-app updates
+`self_replace` swaps the exe **in place** within the install dir, bypassing the
+installer — so Inno's ARP `DisplayVersion` would go **stale**. The uninstaller
+still works (the install dir / `UninstallString` path is unchanged). Fix: after
+a successful self-update the app **rewrites `HKCU\…\Uninstall\{AppId}\
+DisplayVersion`** (and DisplayName) to the new version — HKCU, no admin needed.
+This is the standard pattern for "installer creates ARP, app keeps it current."
+
+### Multi-binary update
+We ship `rusty-backup.exe` (GUI) + `rb-cli.exe`. `self_replace` targets the
+running GUI exe; `rb-cli.exe` is **not running**, so the update flow overwrites
+it with a plain file copy from the downloaded archive. The download asset is the
+existing Windows ZIP (already built in CI), so no new artifact is required for
+updates.
+
+### Portable ZIP coexistence
+Keep shipping the portable ZIP. A portable (non-installed) copy should **not**
+write ARP/registry entries — detect "installed vs portable" (e.g. presence of an
+install marker or running from `%LocalAppData%\RustyBackup`) and skip
+registry-touching steps when portable. Portable copies can still self-update in
+place (the dir is user-writable).
+
+## What we deliberately are NOT doing
+- No SemVer (reuse the date-tag string compare).
+- No bespoke updater process (`self_replace` is the updater).
+- No delta updates (irrelevant at this app's size — full ZIP re-download is
+  fine).
+- No per-machine MSI / Program Files default (fights self-update + needs admin).
+
+## Phased plan & effort estimates
+
+Effort in developer-days. Core in-app update (P1–P2) is ~2–2.5 d; the full
+polished install experience is **~5–6 d**.
+
+### Phase 1 — In-app self-update core — ~1–1.5 days
+- Add `self_update` + `self_replace` to `Cargo.toml` (GUI binary; `#[cfg(windows)]`).
+- Reuse `update::check_for_updates` to decide "newer?" (date-tag compare).
+- On confirm: download the Windows ZIP asset for this arch, `self_replace` the
+  GUI exe, plain-copy `rb-cli.exe`, then relaunch + exit.
+- Non-Windows keeps the existing browser-banner path untouched.
+
+### Phase 2 — GUI update UX — ~1 day
+- Replace the Windows "View Release" button (`gui/mod.rs:558`) with
+  **"Download & Install Update"** → check → download (progress) → apply →
+  prompt restart. Run on a worker thread (existing `Arc<Mutex<…>>` status
+  pattern); never block the UI thread.
+- Show download progress in the banner.
+
+### Phase 3 — Central extension registry + file-association registrar — ~1 day
+- Add `src/model/file_types.rs`: the canonical supported-extension list +
+  ProgId definition. Repoint the scattered `add_filter` calls (inspect_tab,
+  restore_tab, backup_tab, optical_tab, expand_hfs_dialog) at it to kill the
+  drift.
+- Add `--register-file-associations` / `--unregister-file-associations` flags
+  that write/remove the `HKCU\Software\Classes` ProgId + per-`.ext` keys from
+  that list. Run registration automatically on launch when the build version
+  changed (store a "registered-for-version" marker). Add an in-app Settings
+  toggle that calls the same routine. Windows-only.
+
+### Phase 4 — Inno Setup installer — ~1–1.5 days
+- Author `installer/rusty-backup.iss`: per-user mode (`PrivilegesRequired=
+  lowest`), default `%LocalAppData%\RustyBackup`, user-selectable dir,
+  Start-Menu shortcut (+ optional desktop icon), auto uninstaller + ARP entry,
+  stable `{AppId}` GUID. Bundles `rusty-backup.exe` (root) + `rb-cli.exe`
+  (`bin\` subdir) + icon.
+- `[Tasks]`: "Add rb-cli to PATH" (default checked → add `bin\` to HKCU PATH,
+  `ChangesEnvironment=yes`); "Associate disk image files with Rusty Backup"
+  (opt-in → run app once with `--register-file-associations`).
+- Uninstaller removes the PATH entry and runs `--unregister-file-associations`.
+
+### Phase 5 — Keep ARP DisplayVersion current — ~0.5 day
+- After a successful self-update, write the new version to
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\{AppId}\
+  DisplayVersion` (+ DisplayName). Skip when running portable.
+
+### Phase 6 — Location / elevation / portable reconciliation — ~0.5 day
+- Confirm self-update works from `%LocalAppData%` (unprivileged) and from a
+  protected dir (via the app's existing elevation).
+- Detect portable vs installed; skip registry writes (associations, ARP) when
+  portable.
+- Optional: writability probe + "download installer" fallback for the
+  no-admin/protected-dir case.
+
+### Phase 7 — CI — ~0.5 day
+- In `build-windows`: bundle `rb-cli.exe` (in `bin\`) alongside the GUI in the
+  ZIP (if not already), install Inno (`iscc`), compile `rusty-backup.iss` per
+  arch, upload `Setup.exe`. Extend the `release` job's artifact filter
+  (`release.yml:686`) to include `*.exe` installers. Keep the ZIP.
+
+### Phase 8 — Testing — ~1 day
+- Clean Windows VM: run `Setup.exe`, verify install dir choice, "Add rb-cli to
+  PATH" (open a new shell → `rb-cli --version`), associations checkbox,
+  Start-Menu shortcut, ARP entry, launch.
+- Publish a higher version; verify in-app "Download & Install Update" replaces
+  the exe, relaunches, refreshes ARP `DisplayVersion`, and re-registers
+  associations for any newly added extension.
+- Verify uninstaller removes the app, PATH entry, and associations after
+  several self-updates.
+- Verify a portable ZIP copy self-updates but writes no registry entries.
+
+### Phase 9 — Docs & migration — ~0.5 day
+- README/release notes: "Windows: `Setup.exe` (installs + auto-updates) or the
+  portable ZIP." Note existing ZIP users run Setup once to get Start-Menu/ARP.
+- Update `docs/WINDOWS-WRITE.md` / config docs if update settings change.
+
+## Resolved decisions (2026-06-01)
+- **Scope of first pass:** Phases 1-6 (in-app update + file_types + Inno
+  installer + ARP + portable/elevation). CI (7), testing (8), docs (9) deferred.
+- **Branch:** `new-file-formats` (commit directly, per-slice).
+- **Installer association default:** **default-on (checked)**. "Add rb-cli to
+  PATH" also default-checked.
+- **Update apply mode:** **prompt** — "Download & Install Update" button →
+  download w/ progress → prompt restart. Never silent.
+
+## Open questions (deferred)
+- Single ZIP asset for both arch updates, or per-arch? (`self_update` selects by
+  asset name — keep the existing per-arch ZIP naming.)
+- Oldest supported Windows for the i686 build — confirm `self_replace` /
+  `self_update` + TLS (reqwest, already a dep) work there.
+
+## Progress tracker
+- [ ] Phase 1 — in-app self-update core
+- [ ] Phase 2 — GUI update UX
+- [ ] Phase 3 — central extension registry + association registrar
+- [ ] Phase 4 — Inno Setup installer (PATH task + associations opt-in)
+- [ ] Phase 5 — ARP DisplayVersion refresh
+- [ ] Phase 6 — location/elevation/portable reconciliation
+- [ ] Phase 7 — CI
+- [ ] Phase 8 — testing
+- [ ] Phase 9 — docs & migration

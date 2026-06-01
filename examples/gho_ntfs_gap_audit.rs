@@ -260,7 +260,7 @@ fn main() -> anyhow::Result<()> {
     println!("affected files (records): {}", gap_clusters_by_rec.len());
     println!("\nAll affected files by gap size:");
     let mut v: Vec<(u64, u64)> = gap_clusters_by_rec.iter().map(|(k, c)| (*k, *c)).collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v.sort_by_key(|b| std::cmp::Reverse(b.1));
     for (rec, n) in v.iter().take(200) {
         let name = rec_name.get(rec).map(|s| s.as_str()).unwrap_or("?");
         println!("  rec#{rec} (0x{rec:X})  {n:>6} clusters  {name}");

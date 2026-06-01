@@ -7659,7 +7659,7 @@ fn fixup_ntfs_typed_misalignments(
             }
         }
         if !holes.is_empty() {
-            holes.sort_by(|a, b| b.1.cmp(&a.1));
+            holes.sort_by_key(|b| std::cmp::Reverse(b.1));
             log::warn!(
                 "NTFS: {} file(s) have zero-filled $DATA holes (no captured data); \
                  {} clusters total. These files are incomplete in the exported image:",
