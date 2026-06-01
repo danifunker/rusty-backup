@@ -556,12 +556,12 @@ The phase splits into three concerns: read-only parse + replay (steps 24–25), 
 
 ### Step 24 — Journal on-disk parse
 
-- [ ] **Goal:** Library-only ability to locate, parse, and walk the journal without applying any state. No behavior change in edit mode or backup.
+- [x] **Goal:** Library-only ability to locate, parse, and walk the journal without applying any state. No behavior change in edit mode or backup.
 
 **Files:** `src/fs/hfsplus_journal.rs` (new), `src/fs/hfsplus.rs` (accessor wiring), `src/fs/mod.rs` (module wire-up)
 
 **Changes:**
-- Parse `JournalInfoBlock` from the disk block at `vh.journal_info_block` (512 B; fields: `flags`, `device_signature[8]`, `offset`, `size`, `ext_jnl_uuid[36]`, `machine_serial_num[48]`, padding). Bits we care about in `flags`: `kJIJournalInFSMask (0x1)` (in-volume journal — common case), `kJIJournalNeedInitMask (0x2)`, `kJIJournalOnOtherDeviceMask (0x4)` (treat as "unsupported, refuse").
+- Parse `JournalInfoBlock` from the disk block at `vh.journal_info_block` (512 B; fields: `flags`, `device_signature[8]`, `offset`, `size`, `ext_jnl_uuid[36]`, `machine_serial_num[48]`, padding). Bits we care about in `flags` (per `core/hfs_format.h`): `kJIJournalInFSMask (0x1)` (in-volume journal — common case), `kJIJournalOnOtherDeviceMask (0x2)` (treat as "unsupported, refuse"), `kJIJournalNeedInitMask (0x4)`. (An earlier draft transposed the latter two.)
 - Parse `journal_header` at `journal_info.offset` (variable size, normally 4096 B; fields: `magic`, `endian`, `start`, `end`, `size`, `blhdr_size`, `checksum`, `jhdr_size`, `sequence_num`). Magic `0x4a4e4c78` (`'JNLx'`) native vs. byte-swapped `'xLNJ'` distinguishes endianness; honor it across every field for the rest of the parse.
 - `JournalWalker::new(reader, jib, jh)` and `walker.next() -> Option<Result<TransactionView<'_>>>` walks `start → end` (with wraparound at `size`) returning `block_list_header { max_blocks, num_blocks, bytes_used, checksum, flags, sequence_num }` plus a slice of `block_info { bnum, bsize, next }` and an iterator of `(target_lba, &[u8])` block payloads. Verify each transaction's Adler-style checksum; surface mismatch as `JournalError::CorruptTransaction { sequence_num }`.
 - `pub(crate) fn read_journal(&mut self) -> Result<Option<JournalState>>` on `HfsPlusFilesystem` returns `None` when the journaled bit is clear, `Some(JournalState { info, header, transactions: Vec<TransactionSummary> })` otherwise. `TransactionSummary` carries sequence number, block count, total bytes, and the target LBA range — enough for the history viewer.
@@ -573,7 +573,7 @@ The phase splits into three concerns: read-only parse + replay (steps 24–25), 
 
 ### Step 25 — Journal replay + dirty-volume recovery
 
-- [ ] **Goal:** A dirty journaled volume can be opened by first replaying the journal in place. After replay the on-disk catalog matches what macOS would see post-mount, and `start == end` so subsequent writes start from a known good state.
+- [x] **Goal:** A dirty journaled volume can be opened by first replaying the journal in place. After replay the on-disk catalog matches what macOS would see post-mount, and `start == end` so subsequent writes start from a known good state.
 
 **Files:** `src/fs/hfsplus_journal.rs`, `src/fs/hfsplus.rs`, `src/fs/mod.rs`
 
@@ -594,7 +594,7 @@ The phase splits into three concerns: read-only parse + replay (steps 24–25), 
 
 ### Step 26 — Transaction recorder
 
-- [ ] **Goal:** A `TransactionBuilder` that buffers dirty 512-byte blocks during a high-level mutation (`create_file`, `delete_entry`, etc.) and emits one journal transaction at sync time.
+- [x] **Goal:** A `TransactionBuilder` that buffers dirty 512-byte blocks during a high-level mutation (`create_file`, `delete_entry`, etc.) and emits one journal transaction at sync time.
 
 **Files:** `src/fs/hfsplus_journal.rs`, `src/fs/hfsplus.rs`
 
@@ -617,7 +617,16 @@ The phase splits into three concerns: read-only parse + replay (steps 24–25), 
 
 ### Step 27 — Wire mutations through the recorder; relax Step 4
 
-- [ ] **Goal:** Every `EditableFilesystem` mutation path on `HfsPlusFilesystem` records its dirty blocks into a transaction. The Step 4 journaled-volume refusal becomes a soft warning (or disappears entirely) when `replay_dirty_journal=true` and the recorder is active.
+- [~] **Goal:** Every `EditableFilesystem` mutation path on `HfsPlusFilesystem` records its dirty blocks into a transaction. The Step 4 journaled-volume refusal becomes a soft warning (or disappears entirely) when `replay_dirty_journal=true` and the recorder is active.
+
+  **Partial (landed):** the Step 4 relaxation. `prepare_for_edit` now accepts a
+  journaled volume when its journal is *clean* (empty, `start == end`) and still
+  refuses dirty ones. Editing writes directly to disk and leaves the empty
+  journal valid for macOS. **Remaining (deferred):** routing every
+  `do_sync_metadata` block write through `pending_tx.record_*` (a deep refactor
+  of every HFS+ write site) and `replay_dirty_journal`-on-open. The recorder
+  (`TransactionBuilder`) and `replay_journal` machinery these need already
+  shipped in steps 25/26, so the remaining work is the plumbing below.
 
 **Files:** `src/fs/hfsplus.rs` (every site that currently writes to `disk` via `do_sync_metadata` and friends)
 
@@ -638,7 +647,7 @@ The phase splits into three concerns: read-only parse + replay (steps 24–25), 
 
 ### Step 28 — fsck.hfsplus journal phase
 
-- [ ] **Goal:** Existing `hfsplus_fsck` (Step 11) gains a journal-consistency phase so the GUI Check button reports journal corruption instead of silently passing it over.
+- [x] **Goal:** Existing `hfsplus_fsck` (Step 11) gains a journal-consistency phase so the GUI Check button reports journal corruption instead of silently passing it over.
 
 **Files:** `src/fs/hfsplus_fsck.rs`, `src/fs/fsck.rs` (only if a new `FsckIssue` code is needed)
 
@@ -650,7 +659,7 @@ The phase splits into three concerns: read-only parse + replay (steps 24–25), 
 
 ### Step 29 — Journal history viewer (GUI)
 
-- [ ] **Goal:** A read-only "Journal" view in `BrowseView` shows the parsed transaction log so the user can see what edit-mode (or macOS) wrote, in order, with enough detail to troubleshoot.
+- [x] **Goal:** A read-only "Journal" view in `BrowseView` shows the parsed transaction log so the user can see what edit-mode (or macOS) wrote, in order, with enough detail to troubleshoot.
 
 **Files:** `src/gui/browse_view.rs`, new `src/gui/journal_view.rs`, `src/gui/inspect_tab.rs`
 
@@ -711,12 +720,12 @@ The phase splits into three concerns: read-only parse + replay (steps 24–25), 
 | 22f-ii | backup restore | required | required | yes (e2e backup+restore) | yes (full flow) |
 | 22g | gui | required | required | n/a | yes (toggle) |
 | 23 | polish | required | required | n/a | yes (reference disks) |
-| 24 | journal | required | required | yes (parse + endian) | no |
-| 25 | journal | required | required | yes (replay + idempotent + corrupt) | no |
-| 26 | journal | required | required | yes (recorder + wraparound) | no |
-| 27 | journal | required | required | yes (e2e edit on journaled vol) | yes (edit-mode toast) |
-| 28 | journal | required | required | yes (fsck journal phase) | yes (Check button) |
-| 29 | journal | required | required | n/a | yes (history view) |
+| 24 | journal | DONE | DONE | DONE (parse + endian) | no |
+| 25 | journal | DONE | DONE | DONE (replay + idempotent + corrupt) | no |
+| 26 | journal | DONE | DONE | DONE (recorder + wraparound) | no |
+| 27 | journal | DONE (partial) | DONE | DONE (clean accept / dirty refuse) | pending (recorder deferred) |
+| 28 | journal | DONE | DONE | DONE (fsck journal phase) | pending (Check button) |
+| 29 | journal | DONE | DONE | n/a | pending (history view) |
 
 ---
 
