@@ -21,6 +21,7 @@ pub mod bmap;
 pub mod btree_build;
 pub mod dir1;
 pub mod dir2;
+pub mod freespace_rebuild;
 pub mod fsck;
 pub mod inode;
 pub mod repair;
@@ -111,7 +112,10 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
     /// Read a full on-disk inode buffer (sized to `sb.inodesize`). Returns
     /// the parsed core and the raw bytes so callers can also slice into the
     /// fork without a second seek.
-    fn read_inode_buf(&mut self, ino: u64) -> Result<(XfsDinodeCore, Vec<u8>), FilesystemError> {
+    pub(crate) fn read_inode_buf(
+        &mut self,
+        ino: u64,
+    ) -> Result<(XfsDinodeCore, Vec<u8>), FilesystemError> {
         let part_off = inode_byte_offset(
             ino,
             self.sb.agblocks,
@@ -184,7 +188,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
     /// Decode the full extent list from either an inline-extents inode
     /// (`di_format == Extents`) or a bmap-btree inode (`di_format == Btree`).
     /// Returned records are sorted by file offset.
-    fn decode_data_extents(
+    pub(crate) fn decode_data_extents(
         &mut self,
         core: &XfsDinodeCore,
         inode_buf: &[u8],
@@ -300,7 +304,11 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
     }
 
     /// Read the bytes of one filesystem block at `fsblock` into `out`.
-    fn read_fsblock(&mut self, fsblock: u64, out: &mut [u8]) -> Result<(), FilesystemError> {
+    pub(crate) fn read_fsblock(
+        &mut self,
+        fsblock: u64,
+        out: &mut [u8],
+    ) -> Result<(), FilesystemError> {
         let bs = self.sb.blocksize as u64;
         let part_byte = fsblock_to_partition_byte(
             fsblock,

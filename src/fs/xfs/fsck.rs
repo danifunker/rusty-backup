@@ -700,7 +700,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
     /// always 4 bytes, laid out as keys[maxrecs] then ptrs[maxrecs]). Returns
     /// Err on magic / numrecs / cycle corruption.
     #[allow(clippy::too_many_arguments)]
-    fn walk_sblock_btree(
+    pub(crate) fn walk_sblock_btree(
         &mut self,
         sb: &XfsSuperblock,
         agno: u64,

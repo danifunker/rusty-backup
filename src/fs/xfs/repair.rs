@@ -275,13 +275,22 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for XfsFilesystem<R> {
     }
 
     fn repair(&mut self) -> Result<RepairReport, FilesystemError> {
-        // R4: secondary-superblock geometry, then R4b: AGF/AGI summary
-        // counters. Both are conservative (no structural btree writes).
+        // Order matters: R4 (secondary-superblock geometry) → R4b (AGF/AGI
+        // summary counters) → R2 (free-space btree rebuild, the first
+        // structural write). R2 must run *last* because its final step resyncs
+        // `sb_fdblocks` by summing every AGF's freeblks — so every AGF must
+        // already hold its corrected value (R4b) before that sum is taken.
+        // R2 itself is gated hard on a trustworthy ownership map and is a
+        // no-op on a clean volume.
         let mut report = self.run_repair()?;
         let summaries = self.run_repair_summaries()?;
         report.fixes_applied.extend(summaries.fixes_applied);
         report.fixes_failed.extend(summaries.fixes_failed);
         report.unrepairable_count += summaries.unrepairable_count;
+        let freespace = self.run_freespace_rebuild()?;
+        report.fixes_applied.extend(freespace.fixes_applied);
+        report.fixes_failed.extend(freespace.fixes_failed);
+        report.unrepairable_count += freespace.unrepairable_count;
         Ok(report)
     }
 
