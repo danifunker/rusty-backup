@@ -1,11 +1,49 @@
 # Virtualization & Legacy Image Format Support — Implementation Plan
 
-Status: **proposed** (2026-05-23). Owner: Dani. Reviewer-gated before work starts.
+Status: **CLOSED** (2026-06-01; opened 2026-05-23). Owner: Dani. The shipped
+work merges to main with this branch; the unfinished items are deferred (see
+the closeout below).
 
 This plan adds support for modern virtual-machine disk-image containers
 (VHD dynamic, QCOW2, VMDK) and read-only import of vintage/legacy backup
 imaging formats (GHO, EnCase E01, Partimage, WinImage IMZ, Teledisk/
 ImageDisk floppy). VHDX is deferred; PQI is out of scope (§ Phase 5).
+
+## Closeout (2026-06-01)
+
+**Shipped:**
+
+- **Phases 1–4 complete** — VHD dynamic, QCOW2, VMDK flat, VMDK sparse: each
+  with convert-from (reader), convert-to (`ExportFormat`), and in-place edit,
+  wired into GUI + CLI.
+- **Phase 5 (legacy import) — IMZ and Norton Ghost shipped, and well past the
+  original scope:** WinImage IMZ (incl. password decryption); GHO container +
+  record-stream + Fast-LZ + zlib, SECTOR-mode, `.GHS`/`.NNN` span chains,
+  password decryption, **and full file-aware reconstruction for both FAT and
+  NTFS** (5.6-fa, originally scoped FAT-only and marked "deferred"). GHO/IMZ
+  were also refactored from decode-to-temp onto CHD-style streaming
+  `Read + Seek` readers (no tempfile).
+
+**Deferred indefinitely** (no work started; revisit only on concrete demand):
+
+- **5.2 Partimage** — parked. Reference + a phased plan live in
+  `docs/additional_nix_filesystems.md` (Partimage decodes used-blocks of a
+  Unix FS, so it composes with the ReiserFS/XFS readers tracked there).
+- **5.3 Teledisk / ImageDisk (TD0 / IMD)** — **superseded:** these floppy
+  containers are owned by the MiSTer plan,
+  `docs/mister_filesystem_implementation_plan.md` §3.2 (port the decoders from
+  `fluxfox`, MIT). Do not implement standalone here — it would duplicate that
+  decoder.
+- **5.4 EnCase E01 / EWF** — deferred indefinitely. No other plan covers it; it
+  has no floppy/retro-core relevance, so it stays an orphaned follow-up until a
+  real need appears.
+- **5.8 corrupt/truncated recovery** (always a stretch goal) — deferred
+  indefinitely.
+- **Phase 6 VHDX** — deferred indefinitely (unchanged from the original plan).
+- **PQI** — out of scope (unchanged).
+
+The per-session ✅ markers below are the historical record. The status column
+of the unfinished rows is annotated **DEFERRED** with the pointer above.
 
 Each numbered session below is sized to fit **one Claude Code session** and
 ends in **one commit**. Context is cleared between sessions. Sessions within a
@@ -631,16 +669,16 @@ and can land anywhere; it's placed after the decode-to-temp group here.
 | # | Session | Format | Scope & deliverable | Reference / risk |
 |---|---|---|---|---|
 | 5.1 ✅ | **WinImage IMZ** | `.imz` reader | **Establishes Seam A′.** `src/rbformats/imz.rs::materialize_imz_to_temp` unwraps a `.imz` ZIP into a fresh `tempfile::TempDir`, picks the first floppy-image entry (`.ima`/`.img`/`.dsk`/`.flp`/`.vfd`), and returns the temp path + guard. Password-protected entries (legacy ZipCrypto, detected via `ZipFile::encrypted()`) are rejected with a precise error. Wired through `gui::materialize_amiga_image_path` alongside `.adz`/`.hdz` so all three formats share one file-pick → materialize → detect-as-Raw path; GUI file-picker filters in Backup/Inspect/Restore tabs accept `imz`. Tests: 6 unit + 2 real-fixture-gated, including byte-for-byte round-trip of `w98_boot_nopassword.imz` vs `w98_boot.ima` and clean rejection of `w99_boot_withpassword.imz`. Worker-thread + progress-cb plumbing **deferred** — IMZ floppies decode in <1 ms; later legacy sessions (5.2 / 5.6) add it as needed since their payloads are MB–GB scale. |
-| 5.2 | **Partimage** | `.000` reader | Decode-to-temp (reuses 5.1 plumbing): header + bitmap of used blocks + gzip/bzip2 stream. Tests. | partimage source / format doc. **Med.** |
-| 5.3 | **Teledisk / ImageDisk** | `.TD0` + `.IMD` reader | Decode-to-temp floppy readers (reuse 5.1 plumbing). IMD is straightforward (Dunfield spec). TD0 advanced variant uses LZHUF — port a known decoder. Tests with sample floppies. | Dunfield IMD spec; TD0 RE notes. **Med.** Floppy-focused — broadens existing dc42/woz/2mg story. |
-| 5.4 | **E01 / EWF** | EnCase EWF reader | Independent — native `Read + Seek` over the chunked EWF segments (offset table per segment, zlib chunks, CRC per chunk). Multi-segment (`.E01`, `.E02`, …) handling. Tests. | libewf / libyal docs; Forensic7z confirms it's clean. **Low–Med.** |
+| 5.2 **DEFERRED** | **Partimage** | `.000` reader | **Parked → see `docs/additional_nix_filesystems.md`.** Decode-to-temp (reuses 5.1 plumbing): header + bitmap of used blocks + gzip/bzip2 stream. | partimage source / format doc. **Med.** |
+| 5.3 **DEFERRED** | **Teledisk / ImageDisk** | `.TD0` + `.IMD` reader | **Superseded → `docs/mister_filesystem_implementation_plan.md` §3.2** owns TD0/IMD (port from `fluxfox`, MIT). Do not implement standalone here. | Dunfield IMD spec; TD0 RE notes. **Med.** |
+| 5.4 **DEFERRED** | **E01 / EWF** | EnCase EWF reader | **Deferred indefinitely — no other plan covers it.** Native `Read + Seek` over chunked EWF segments (per-segment offset table, zlib chunks, CRC per chunk); multi-segment (`.E01`, `.E02`, …). | libewf / libyal docs; Forensic7z confirms it's clean. **Low–Med.** |
 | 5.5a ✅ | **GHO container spike** | Norton Ghost | `src/rbformats/gho.rs`: container-header parser (12-byte prefix + optional 16-byte password verifier + optional Pascal description at 0xFF), `GhoCompression` / `GhoImageType` enums, `materialize_gho_to_temp` stub that dispatches by header and produces precise per-case errors (password-protected, SECTOR mode, unknown compression byte, unknown container version). 13 tests, including a corpus-walk that parses 11 real fixtures from `~/new-fixtures/gho/` and asserts the (compression, image_type, password) tuple matches the documented table. **Deferred:** inner record stream (5.5b), Fast-LZ decoder (5.5b), full decode-to-temp + `.GHS` span chain (5.6), SECTOR-mode decoding (5.6b). |
 | 5.5b ✅ | **GHO record-stream parser** | Norton Ghost | `GhoRecordHeader` (corrected layout: `u16 type | u16 marker | u32 magic | u16 body_len`, 10 bytes total — the plan's "u32 type" was the type + marker fields run together), `find_inner_stream_start` (scan-forward, absorbs the 7.5 vs 11.5 padding diff: 7.5 starts at sector 6, 11.5 at sector 11), `GhoRecordIter` walker. **Key 5.5b finding:** record stream is structurally identical between Ghost 7.5 and 11.5 — same type + body_len sequence record-for-record over the first 128 records (0 type mismatches, 0 body-len mismatches). Marker differs: 7.5 is always `0x0000`; 11.5 is mostly `0x0000` with ~10% `0x95FD`. 9 new tests including the 7.5-vs-11.5 fixture diff. **Fast-LZ decoder split out to 5.5c** for slice size. |
 | 5.5c ✅ | **GHO Fast-LZ decoder** | Norton Ghost | `fast_lz_decompress(data, comp_len, dst)` + `fast_lz_hash` ported from MIT `nyarime/gho/fastlz.go` (4096-entry hash, 16-bit control words, min 3-byte match, sentinel literal `"123456789012345678"`). `data[0] == 1` path forwards a verbatim uncompressed block; otherwise the LZ77 token stream drives literal + match-copy expansion with the documented hash. Covered by 6 synthetic tests (hash spot-check, uncompressed round-trip, literal-only LZ77 token stream, truncation / zero-length / too-short rejections) plus an `#[ignore]`d fixture-gated brute-force scan kept as a hook for 5.6 — that test cannot locate true block boundaries from byte-level scanning since they live in the record framing, so a non-match there is expected, not a decoder regression. No decode-to-temp yet (5.6 wires it). | `github.com/nyarime/gho` (MIT). **Med.** |
 | 5.6 ✅ | **GHO SECTOR-mode reader** | Norton Ghost | `materialize_gho_to_temp` decodes **SECTOR-mode** (raw sector-by-sector) backups to a raw disk image in a tempdir, wired into the GUI via `materialize_amiga_image_path` (`.gho`/`.ghs` join `.adz`/`.hdz`/`.imz`). Three compression paths: None (verbatim sector copy), High (zlib block stream), Fast (Fast-LZ block stream). Data starts at the sector after the last `FE EF` sub-header (`find_sector_data_start`); compressed chunks are `[u16 stored_len][block]` where stored_len includes itself, terminated by a record header (peek for record magic at +4). Verified end-to-end against the real `secthigh.GHO` (641 MB zlib → 8.5 GB FAT32 disk, valid boot sig) and `SECTOR.GHO` (uncompressed). **File-aware mode deferred** — the fixture corpus revealed file-aware backups interleave boot-sector (0x0017) / FAT-entry (0x0004) / dir (0x0102-4) metadata with 0x0002 cluster-data records and need a full filesystem rebuilder, not a stream concat; the plan's "file-aware first" assumption (from the Go reference's record model, which does NOT match our corpus's actual record taxonomy) was wrong. The walker (`parse_gho_image`) + `decode_data_blocks_to` are kept as scaffolding. `.GHS` span chain still pending. 4 synthetic tests + 2 `#[ignore]`d real-fixture tests. | as above. |
-| 5.6-fa | **GHO file-aware rebuild** | Norton Ghost | Reconstruct a mountable FAT partition from the file-aware record stream (boot sector + FAT entries + directory + cluster-data 0x0002 records placed at filesystem offsets). Larger than a stream decode — needs a partial FS writer. | `nyarime/gho` for the record model; our own corpus for the actual taxonomy. **High.** |
+| 5.6-fa ✅ | **GHO file-aware rebuild** | Norton Ghost | **Shipped — and beyond the original FAT-only scope.** Reconstructs a mountable volume from the file-aware record stream: typed body parsers, directory-tree walker, FAT image emitter (`922a035` unified into an in-RAM virtual FAT, no tempfile), Ghost 7.5 full-disk records, **plus a full NTFS file-aware subsystem** (LCN mapping, compressed/zlib NTFS, fragmented `$MFT`, `$Bitmap`/`$Boot`/`$MFTMirr` synthesis for bootable export). See `docs/gho_file_aware.md`. | `nyarime/gho` for the record model; our own corpus for the actual taxonomy. **High.** |
 | 5.6-span ✅ | **GHO `.GHS` span chain** | Norton Ghost | `discover_gho_span_set(picked)` walks the picked file's directory and returns the ordered span set (primary + numbered spans), handling all three corpus naming patterns: stem-prefix `.GHS` siblings (incl. 8.3 truncation like `SECTOR.GHO` + `SECTO00N.GHS`), hyphenated stem-prefix (`gh11-spl.GHO` + `gh11-00N.GHS`), and `.GHO.NNN` numeric suffix (`Win7_86xAMB.GHO.001` ... `.066`). `SpanReader: Read + Seek` virtualises the chain — exposes the primary verbatim, skips the 512-byte container header on every continuation file, so the SECTOR-mode decoder reads one continuous data stream without realising it crosses files. Wired through `materialize_gho_to_temp`: the user can pick the primary OR any span sibling and the whole set decodes. Verified against the real 7.5 `SECTOR.GHO` 4-file set (primary + 3 `.GHS` → 8.5 GiB FAT32 disk with valid boot signature). 6 synthetic tests (naming-pattern parsing, sibling discovery for both patterns, singleton fallback, multi-file reader concatenation + seek) + 1 `#[ignore]`d real-fixture test. Span discovery confirmed against all 6 multi-file corpus sets (4–66 files) via a one-off probe. | `nyarime/gho/span.go` for the .GHS skip-header convention. **Med.** |
-| 5.7 | **Legacy integration** | all of Phase 5 | Unified convert-from entry: file-open dispatch detects each legacy format by magic; CLI `convert --from <legacy>` → modern target; GUI import recognizes the extensions and routes through reconstruct/modern-writer. Docs + README format table. | — |
+| 5.7 ◑ | **Legacy integration** | all of Phase 5 | **Done for the formats that shipped (GHO/IMZ): magic detection, GUI file-picker filters, CLI convert, streaming readers. The remainder is moot — the only unintegrated formats are the DEFERRED 5.2/5.3/5.4 above, so there is nothing left to wire until one of those is built.** | — |
 
 > **PQI (PowerQuest DriveImage) is out of scope.** Dropped 2026-05-23: no
 > public spec, no open/clean-room reference (Aaru #400 unimplemented), and
@@ -845,6 +883,10 @@ just "materialize → existing export path".
 
 ### 5.8 (STRETCH, optional) — Partial recovery of corrupt / truncated archives
 
+> **DEFERRED INDEFINITELY (2026-06-01).** Always a stretch goal; not started.
+> The design below is preserved as the spec for whenever a damaged-archive
+> recovery need actually arises.
+
 Not required for normal convert-from; this is a separate **resilience layer**
 for "I have a damaged multi-file Ghost backup and want to salvage what I can."
 The `nyarime/gho` reference is happy-path only (aborts on the first invalid
@@ -880,7 +922,10 @@ post-MVP follow-up, not part of the Phase 5 baseline.
 
 ---
 
-## Phase 6 — VHDX (deferred / optional)
+## Phase 6 — VHDX (deferred indefinitely)
+
+> **DEFERRED INDEFINITELY (2026-06-01).** Never scheduled; modern Hyper-V only,
+> zero retro demand, highest cost of any format here. Spec preserved below.
 
 Only if a concrete Hyper-V need appears. Region table + metadata region + BAT +
 **log/journal replay-on-open and write-on-edit** for crash consistency, plus
@@ -889,20 +934,17 @@ edit-with-log / integration). Not scheduled.
 
 ---
 
-## Session inventory (sequencing at a glance)
+## Session inventory (final status)
 
-20 baseline sessions (each one commit) + 1 optional stretch session (5.8).
-Phases are independent after Phase 1 ships the `sparse_alloc` helper (Phases 2
-and 4 depend on it; Phase 3 and Phase 5 do not).
-
-| Phase | Sessions | Depends on |
+| Phase | Sessions | Status |
 |---|---|---|
-| 1 — VHD dynamic (warmup) | 1.1 reader, 1.2 writer + `sparse_alloc`, 1.3 edit, 1.4 integration | — |
-| 2 — QCOW2 (priority) | 2.1 reader, 2.2 writer, 2.3 edit(a), 2.4 edit(b)+integration | 1.2 (`sparse_alloc`) |
-| 3 — VMDK flat | 3.1 reader+writer, 3.2 edit+integration | — |
-| 4 — VMDK sparse | 4.1 reader, 4.2 writer, 4.3 edit+integration | 1.2, patterns from 2 |
-| 5 — legacy convert-from | 5.1 IMZ (builds Seam A′), 5.2 Partimage, 5.3 TD0/IMD, 5.4 E01, 5.5 GHO spike, 5.6 GHO reader, 5.7 integration; **5.8 STRETCH** corrupt/partial recovery | 5.2/5.3/5.6 reuse 5.1's Seam A′; 5.8 depends on 5.6 |
-| 6 — VHDX (deferred) | not scheduled | — |
+| 1 — VHD dynamic (warmup) | 1.1 reader, 1.2 writer + `sparse_alloc`, 1.3 edit, 1.4 integration | ✅ complete |
+| 2 — QCOW2 (priority) | 2.1 reader, 2.2 writer, 2.3 edit(a), 2.4 edit(b)+integration | ✅ complete |
+| 3 — VMDK flat | 3.1 reader+writer, 3.2 edit+integration | ✅ complete |
+| 4 — VMDK sparse | 4.1 reader, 4.2 writer, 4.3 edit+integration | ✅ complete |
+| 5 — legacy convert-from | 5.1 IMZ ✅, 5.5/5.6 GHO (container/records/Fast-LZ/SECTOR/span/file-aware FAT+NTFS/password) ✅ | ✅ for IMZ + GHO |
+| 5 — deferred | 5.2 Partimage → `additional_nix_filesystems.md`; 5.3 TD0/IMD → MiSTer plan §3.2; 5.4 E01; 5.8 recovery | **DEFERRED** |
+| 6 — VHDX | reader / writer / edit / integration | **DEFERRED INDEFINITELY** |
 
 Recommended execution order: **1 → 2 → 3 → 4 → 5**. Within Phase 5, do **5.1
 (IMZ) first** to build the Seam A′ decode-to-temp plumbing that 5.2/5.3/5.6
