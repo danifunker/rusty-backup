@@ -29,6 +29,15 @@ pub struct XfsSuperblock {
     pub rblocks: u64,
     pub rextents: u64,
     pub rootino: u64,
+    /// Realtime bitmap / summary inodes (`sb_rbmino` / `sb_rsumino`). Always
+    /// allocated by mkfs even on non-realtime volumes; referenced only from
+    /// the superblock, so the connectivity check must treat them as roots.
+    pub rbmino: u64,
+    pub rsumino: u64,
+    /// Quota inodes (`sb_uquotino` / `sb_gquotino`). 0 or NULLFSINO when
+    /// quotas are disabled; otherwise superblock-referenced roots.
+    pub uquotino: u64,
+    pub gquotino: u64,
     pub agblocks: u32,
     pub agcount: u32,
     pub versionnum: u16,
@@ -121,6 +130,10 @@ impl XfsSuperblock {
             rblocks: BigEndian::read_u64(&buf[16..24]),
             rextents,
             rootino: BigEndian::read_u64(&buf[56..64]),
+            rbmino: BigEndian::read_u64(&buf[64..72]),
+            rsumino: BigEndian::read_u64(&buf[72..80]),
+            uquotino: BigEndian::read_u64(&buf[104..112]),
+            gquotino: BigEndian::read_u64(&buf[112..120]),
             agblocks: BigEndian::read_u32(&buf[84..88]),
             agcount: BigEndian::read_u32(&buf[88..92]),
             versionnum,
@@ -139,6 +152,25 @@ impl XfsSuperblock {
             features_ro_compat,
             features_incompat,
         })
+    }
+
+    /// Superblock-referenced "internal" inodes: the root plus realtime
+    /// bitmap/summary and (if quotas are on) quota inodes. These are
+    /// allocated but not reachable through the directory tree, so the
+    /// connectivity check seeds them as reachable roots. Filters out unset
+    /// slots (0 or NULLFSINO = all-ones).
+    pub fn internal_inodes(&self) -> Vec<u64> {
+        const NULLFSINO: u64 = u64::MAX;
+        [
+            self.rootino,
+            self.rbmino,
+            self.rsumino,
+            self.uquotino,
+            self.gquotino,
+        ]
+        .into_iter()
+        .filter(|&ino| ino != 0 && ino != NULLFSINO)
+        .collect()
     }
 
     /// True iff this is a v5 (CRC-enabled, dir3) filesystem.

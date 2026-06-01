@@ -6,11 +6,13 @@
 //! filesystem-agnostic, mirroring `efs_fsck` / `hfs_fsck`.
 //!
 //! Phasing (see the doc):
-//!   * **Phase 1 (this commit)** — superblock geometry, per-AG superblock
-//!     replica consistency, and AGF/AGI parse + bounds checks. Pure
+//!   * **Phase 1** — superblock geometry, per-AG superblock replica
+//!     consistency, and AGF/AGI parse + bounds checks. Pure
 //!     fixed-location-metadata reads; no inode or btree walk.
-//!   * Phase 2 — allocation + inode btree walk and block-ownership map.
-//!   * Phase 3 — directory connectivity / orphan detection.
+//!   * **Phase 2** — inode-btree walk + block-ownership map (R1): claim
+//!     every allocated inode's blocks, flag cross-links / out-of-bounds.
+//!   * **Phase 3** — directory connectivity: BFS from root, flag orphaned
+//!     (allocated-but-unreachable) inodes and dangling directory entries.
 //!
 //! Porting reference: `xfs_repair` @ v3.1.11 (`repair/agheader.c`,
 //! `repair/sb.c`) under `~/efs-xfs-refs/xfsprogs/`. v4 on-disk layout per
@@ -28,16 +30,18 @@ use super::types::{
     XFS_INODES_PER_CHUNK,
 };
 use super::{read_at_aligned, XfsFilesystem};
-use crate::fs::filesystem::FilesystemError;
+use crate::fs::filesystem::{Filesystem, FilesystemError};
 use crate::fs::fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry};
 
-/// FsckIssue codes the XFS repair path knows how to fix. Phase 1 only
-/// emits `ReplicaSbMismatch` as repairable (a per-AG superblock copy can be
-/// rewritten verbatim from the authoritative primary, R4). Structural
-/// damage to AG headers is surfaced for diagnosis until the rebuild phases
-/// land. Later phases extend this set.
+/// FsckIssue codes the XFS repair path knows how to fix.
+///
+/// `ReplicaSbMismatch` — a per-AG superblock copy can be rewritten verbatim
+/// from the authoritative primary (R4). `OrphanInode` — an
+/// allocated-but-unreachable inode can be reconnected into `lost+found/`
+/// (R7). Structural damage (bad AG headers, cross-links, dangling entries)
+/// is surfaced for diagnosis until the rebuild phases land.
 fn is_repairable_code(code: &str) -> bool {
-    matches!(code, "ReplicaSbMismatch")
+    matches!(code, "ReplicaSbMismatch" | "OrphanInode")
 }
 
 /// Accumulates findings; keeps the per-check code focused.
@@ -112,7 +116,8 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
 
         check_superblock_geometry(&sb, &mut b);
         let ag_headers = self.check_ag_headers(&sb, &mut b);
-        self.check_allocations(&sb, &ag_headers, &mut b);
+        let allocated = self.check_allocations(&sb, &ag_headers, &mut b);
+        self.check_connectivity(&sb, &allocated, &mut b);
 
         Ok(b.finish())
     }
@@ -229,7 +234,17 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
     /// each AG's inode btree, claim its blocks in a per-volume state map,
     /// and report any block claimed twice (`DoubleAllocation`) or any extent
     /// outside the volume (`ExtentPastVolume`).
-    fn check_allocations(&mut self, sb: &XfsSuperblock, ags: &[AgHeaders], b: &mut Builder) {
+    ///
+    /// Returns the set of allocated inode numbers (used by Phase 3 for
+    /// connectivity / orphan detection).
+    fn check_allocations(
+        &mut self,
+        sb: &XfsSuperblock,
+        ags: &[AgHeaders],
+        b: &mut Builder,
+    ) -> HashSet<u64> {
+        let mut allocated: HashSet<u64> = HashSet::new();
+
         // Bound the in-memory map. Vintage IRIX disks are a few GB (≤ ~1M
         // 4 KiB blocks); refuse only absurd geometries to avoid OOM.
         const MAX_MAP_BLOCKS: u64 = 256 * 1024 * 1024; // 256M blocks (256 MiB map)
@@ -241,7 +256,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
                     sb.dblocks
                 ),
             );
-            return;
+            return allocated;
         }
 
         let agblocks = sb.agblocks as u64;
@@ -279,6 +294,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
                     }
                     let agino = rec.start_agino as u64 + slot as u64;
                     let ino = (agno << (sb.agblklog + sb.inopblog)) | agino;
+                    allocated.insert(ino);
                     self.scan_inode_blocks(sb, ino, &mut map, b);
                 }
             }
@@ -289,6 +305,95 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         if mult > 0 {
             b.stat("Cross-linked blocks", format!("{mult}"));
         }
+        allocated
+    }
+
+    /// Phase 3: directory connectivity / orphan detection (R7 input).
+    ///
+    /// BFS from the root inode through the directory tree, collecting every
+    /// reachable inode. Any allocated inode not reached is an orphan
+    /// (repairable: R7 will reconnect it into lost+found). Directory entries
+    /// pointing at inodes the inobt didn't mark allocated are dangling.
+    fn check_connectivity(
+        &mut self,
+        sb: &XfsSuperblock,
+        allocated: &HashSet<u64>,
+        b: &mut Builder,
+    ) {
+        if allocated.is_empty() {
+            // Phase 2 was skipped or found nothing; orphan analysis needs the
+            // allocated set, so there's nothing to compare against.
+            return;
+        }
+
+        let root = match self.root() {
+            Ok(r) => r,
+            Err(e) => {
+                b.err("RootUnreadable", format!("cannot read root directory: {e}"));
+                return;
+            }
+        };
+
+        let mut reachable: HashSet<u64> = HashSet::new();
+        // Seed the superblock-referenced internal inodes (root + realtime
+        // bitmap/summary + quota inodes). They're allocated but reached only
+        // via the superblock, not the directory tree.
+        for ino in sb.internal_inodes() {
+            reachable.insert(ino);
+        }
+        let mut queue = vec![root];
+        let mut visited_dirs: HashSet<u64> = HashSet::new();
+
+        while let Some(dir) = queue.pop() {
+            if !visited_dirs.insert(dir.location) {
+                continue; // already expanded (guards against dir cycles)
+            }
+            let children = match self.list_directory(&dir) {
+                Ok(c) => c,
+                Err(e) => {
+                    b.err(
+                        "DirReadFailed",
+                        format!("inode {}: directory unreadable: {e}", dir.location),
+                    );
+                    continue;
+                }
+            };
+            for child in children {
+                if !allocated.contains(&child.location) {
+                    b.err(
+                        "DanglingEntry",
+                        format!(
+                            "directory inode {} entry '{}' points at inode {} which is not allocated",
+                            dir.location, child.name, child.location
+                        ),
+                    );
+                    continue;
+                }
+                reachable.insert(child.location);
+                if child.is_directory() {
+                    queue.push(child);
+                }
+            }
+        }
+
+        // Orphans: allocated but unreachable from root.
+        let mut orphans: Vec<u64> = allocated.difference(&reachable).copied().collect();
+        orphans.sort_unstable();
+        for ino in orphans {
+            let is_dir = self.read_inode(ino).map(|c| c.is_dir()).unwrap_or(false);
+            b.err(
+                "OrphanInode",
+                format!("inode {ino} is allocated but unreachable from the root directory"),
+            );
+            b.orphaned.push(OrphanedEntry {
+                id: ino,
+                name: format!("inode_{ino}"),
+                is_directory: is_dir,
+                missing_parent_id: 0, // unknown — XFS orphans have lost their parent link
+            });
+        }
+
+        b.stat("Reachable inodes", format!("{}", reachable.len()));
     }
 
     /// Read one allocated inode, count it, and claim its data-fork blocks in

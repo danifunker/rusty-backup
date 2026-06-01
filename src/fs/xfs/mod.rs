@@ -1048,6 +1048,9 @@ mod tests {
             res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
         );
         assert!(!res.repairable);
+        // Phase 3 ran and found no orphans on a healthy volume.
+        assert!(res.orphaned_entries.is_empty());
+        assert!(res.stats.extra.iter().any(|(k, _)| k == "Reachable inodes"));
         // Stats should report the two allocation groups.
         let ags = res
             .stats
