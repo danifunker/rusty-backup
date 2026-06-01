@@ -742,11 +742,7 @@ impl RestoreTab {
                     if let Some(path) = super::file_dialog()
                         .add_filter(
                             "Disk Images",
-                            &[
-                                "img", "raw", "bin", "vhd", "2mg", "iso", "dd", "po", "do", "dsk",
-                                "dc42", "woz", "adf", "hdf", "adz", "hdz", "imz", "vmdk", "qcow2",
-                                "qcow", "gho", "ghs", "GHO", "GHS", "hfv", "HFV",
-                            ],
+                            rusty_backup::model::file_types::DISK_IMAGE_EXTS,
                         )
                         .add_filter("All Files", &["*"])
                         .pick_file()
@@ -1673,11 +1669,7 @@ impl RestoreTab {
                     if let Some(path) = super::file_dialog()
                         .add_filter(
                             "Disk Images",
-                            &[
-                                "img", "raw", "bin", "vhd", "2mg", "iso", "dd", "po", "do", "dsk",
-                                "dc42", "woz", "adf", "hdf", "adz", "hdz", "imz", "vmdk", "qcow2",
-                                "qcow", "gho", "ghs", "GHO", "GHS", "hfv", "HFV",
-                            ],
+                            rusty_backup::model::file_types::DISK_IMAGE_EXTS,
                         )
                         .add_filter("All Files", &["*"])
                         .pick_file()

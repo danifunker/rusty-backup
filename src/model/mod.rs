@@ -10,6 +10,7 @@ pub mod bulk_convert_runner;
 pub mod chd_expand_runner;
 pub mod edit_queue;
 pub mod export_runner;
+pub mod file_types;
 pub mod fsck_runner;
 pub mod hfs_expand_runner;
 pub mod min_size_runner;

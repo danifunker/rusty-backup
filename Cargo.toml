@@ -110,6 +110,8 @@ objc2-foundation = { version = "0.3", features = ["NSBundle", "NSString"] }
 # In-app self-update: replaces the running .exe in place, handling the
 # Windows locked-running-image problem. See docs/windows_self_update.md.
 self-replace = "1"
+# Per-user file-association registration (HKCU\Software\Classes).
+winreg = "0.55"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Ioctl",

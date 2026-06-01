@@ -3,7 +3,53 @@
 
 mod gui;
 
+/// Windows: handle the installer/uninstaller association hooks
+/// (`--register-file-associations` / `--unregister-file-associations`) and the
+/// launch-time re-registration that picks up newly supported extensions after
+/// a self-update. The hook flags register/unregister (HKCU, unprivileged) and
+/// exit without opening the GUI; a normal launch only refreshes if the enabled
+/// associations were registered for an older build.
+#[cfg(windows)]
+fn handle_windows_assoc_cli() {
+    use rusty_backup::update::UpdateConfig;
+
+    let args: Vec<String> = std::env::args().collect();
+    let register = args.iter().any(|a| a == "--register-file-associations");
+    let unregister = args.iter().any(|a| a == "--unregister-file-associations");
+
+    if !register && !unregister {
+        // Normal launch: refresh associations if enabled but stale.
+        let mut cfg = UpdateConfig::load();
+        if cfg.file_associations_enabled
+            && cfg.assoc_registered_version.as_deref() != Some(env!("APP_VERSION"))
+        {
+            let _ = rusty_backup::os::file_assoc::register_file_associations();
+            cfg.assoc_registered_version = Some(env!("APP_VERSION").to_string());
+            let _ = cfg.save();
+        }
+        return;
+    }
+
+    let mut cfg = UpdateConfig::load();
+    if register {
+        let _ = rusty_backup::os::file_assoc::register_file_associations();
+        cfg.file_associations_enabled = true;
+        cfg.assoc_registered_version = Some(env!("APP_VERSION").to_string());
+    } else {
+        let _ = rusty_backup::os::file_assoc::unregister_file_associations();
+        cfg.file_associations_enabled = false;
+        cfg.assoc_registered_version = None;
+    }
+    let _ = cfg.save();
+    std::process::exit(0);
+}
+
 fn main() -> eframe::Result {
+    // Windows installer/uninstaller association hooks (and launch-time refresh).
+    // Must run before GUI init; the hook flags exit without opening a window.
+    #[cfg(windows)]
+    handle_windows_assoc_cli();
+
     // Install a logger that mirrors records to stderr AND buffers them for the
     // GUI log panel (so worker-thread log::info! lines, e.g. from the GHO
     // reader, surface in the UI). Replaces the plain env_logger stderr sink.

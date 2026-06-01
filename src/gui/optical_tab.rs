@@ -209,7 +209,7 @@ impl OpticalTab {
                             if let Some(path) = super::file_dialog()
                                 .add_filter(
                                     "Disc Images",
-                                    &["iso", "bin", "cue", "chd", "toast", "img"],
+                                    rusty_backup::model::file_types::OPTICAL_EXTS,
                                 )
                                 .add_filter("All Files", &["*"])
                                 .pick_file()

@@ -248,12 +248,7 @@ impl BackupTab {
                             if let Some(path) = super::file_dialog()
                                 .add_filter(
                                     "Disk Images",
-                                    &[
-                                        "img", "raw", "bin", "iso", "dd", "vhd", "hda", "hdv",
-                                        "2mg", "dmg", "po", "do", "dsk", "dc42", "woz", "chd",
-                                        "adf", "hdf", "adz", "hdz", "imz", "vmdk", "qcow2", "qcow",
-                                        "gho", "ghs", "GHO", "GHS", "hfv", "HFV",
-                                    ],
+                                    rusty_backup::model::file_types::DISK_IMAGE_EXTS,
                                 )
                                 .add_filter("All Files", &["*"])
                                 .pick_file()

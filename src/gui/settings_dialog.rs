@@ -7,6 +7,9 @@ pub struct SettingsDialog {
     update_check_enabled: bool,
     update_repo_url: String,
     status_message: Option<String>,
+    /// Windows only: register Rusty Backup as a handler for disk-image files.
+    #[cfg(windows)]
+    file_associations_enabled: bool,
 }
 
 impl SettingsDialog {
@@ -57,6 +60,23 @@ impl SettingsDialog {
                     ui.label("(e.g., https://github.com/owner/repo)");
                     ui.add_space(10.0);
 
+                    #[cfg(windows)]
+                    {
+                        ui.separator();
+                        ui.add_space(10.0);
+                        ui.heading("File Associations");
+                        ui.add_space(10.0);
+                        ui.checkbox(
+                            &mut self.file_associations_enabled,
+                            "Associate disk image files with Rusty Backup",
+                        );
+                        ui.label(
+                            "Adds Rusty Backup to the Windows \"Open with\" list for disk \
+                             image files (.img, .vhd, .chd, .adf, ...).",
+                        );
+                        ui.add_space(10.0);
+                    }
+
                     if let Some(ref msg) = self.status_message {
                         ui.colored_label(
                             if msg.starts_with("Error") {
@@ -87,6 +107,10 @@ impl SettingsDialog {
         let config = UpdateConfig::load();
         self.update_check_enabled = config.update_check.enabled;
         self.update_repo_url = config.update_check.repository_url;
+        #[cfg(windows)]
+        {
+            self.file_associations_enabled = config.file_associations_enabled;
+        }
         self.status_message = None;
         self.open = true;
     }
@@ -96,6 +120,21 @@ impl SettingsDialog {
 
         config.update_check.enabled = self.update_check_enabled;
         config.update_check.repository_url = self.update_repo_url.trim().to_string();
+
+        // Windows: apply the file-association toggle (register/unregister under
+        // HKCU) before persisting the new state.
+        #[cfg(windows)]
+        {
+            let was_enabled = config.file_associations_enabled;
+            config.file_associations_enabled = self.file_associations_enabled;
+            if self.file_associations_enabled {
+                let _ = rusty_backup::os::file_assoc::register_file_associations();
+                config.assoc_registered_version = Some(env!("APP_VERSION").to_string());
+            } else if was_enabled {
+                let _ = rusty_backup::os::file_assoc::unregister_file_associations();
+                config.assoc_registered_version = None;
+            }
+        }
 
         match config.save() {
             Ok(_) => {

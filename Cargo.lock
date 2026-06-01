@@ -4595,6 +4595,7 @@ dependencies = [
  "unicode-normalization",
  "webbrowser",
  "windows",
+ "winreg",
  "winres",
  "zeekstd",
  "zip",

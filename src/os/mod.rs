@@ -7,6 +7,9 @@ pub mod linux;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
+#[cfg(target_os = "windows")]
+pub mod file_assoc;
+
 pub mod wakelock;
 
 use std::fs::{self, File};

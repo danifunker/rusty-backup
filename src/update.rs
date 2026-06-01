@@ -14,6 +14,17 @@ pub struct UpdateConfig {
     /// Last-used CHD hunk size in bytes. `None` = use the profile default.
     #[serde(default)]
     pub last_chd_hunk_size: Option<u32>,
+    /// Windows only: whether disk-image file associations are registered for
+    /// this user. Set by the installer (`--register-file-associations`) or the
+    /// Settings toggle; drives the launch-time re-registration that picks up
+    /// newly supported extensions after a self-update.
+    #[serde(default)]
+    pub file_associations_enabled: bool,
+    /// `APP_VERSION` the associations were last registered for. When this no
+    /// longer matches the running build, associations are refreshed on launch
+    /// so a self-update that adds an extension registers it without a reinstall.
+    #[serde(default)]
+    pub assoc_registered_version: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -77,6 +88,8 @@ impl Default for UpdateConfig {
             },
             last_chd_codecs: None,
             last_chd_hunk_size: None,
+            file_associations_enabled: false,
+            assoc_registered_version: None,
         }
     }
 }
