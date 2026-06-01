@@ -150,7 +150,7 @@ pub fn encode_dc42(name: &str, data: &[u8]) -> Result<Vec<u8>, &'static str> {
     };
 
     let name_bytes = name.as_bytes();
-    let name_len = name_bytes.len().min(63).max(1);
+    let name_len = name_bytes.len().clamp(1, 63);
     let effective_name: &[u8] = if name_bytes.is_empty() {
         b"Untitled"
     } else {

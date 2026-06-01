@@ -404,6 +404,7 @@ const CATALOG_FILE_THREAD: i16 = 4;
 
 /// A parsed HFS+ catalog entry.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)] // catalog entries are short-lived per-record buffers; boxing adds heap churn
 enum CatalogEntry {
     Folder {
         folder_id: u32,
@@ -2710,7 +2711,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
             }
         }
 
-        entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        entries.sort_by_key(|a| a.name.to_lowercase());
         Ok(entries)
     }
 
@@ -4411,8 +4412,8 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
     /// Decrement `linkCount` on the inode named `iNode<inode_num>` under the
     /// volume's `HFS+ Private Data` dir. When the count drops to zero, free
     /// the inode's forks, drop its xattrs, and remove the inode catalog row
-    /// + thread + map entry. Bumps `vh.file_count` and the private dir's
-    /// valence accordingly.
+    /// plus thread plus map entry. Bumps `vh.file_count` and the private
+    /// dir's valence accordingly.
     fn delete_hardlink_inode_ref(&mut self, inode_num: u32) -> Result<(), FilesystemError> {
         let private_cnid = self.find_private_dir_cnid()?.ok_or_else(|| {
             FilesystemError::InvalidData(
@@ -4910,7 +4911,7 @@ fn build_blank_hfsplus_front(
     let btree_blocks: u32 = btree_node_count * blocks_per_node;
 
     let bitmap_bytes = total_blocks.div_ceil(8) as u64;
-    let bitmap_blocks = ((bitmap_bytes + bs - 1) / bs) as u32;
+    let bitmap_blocks = bitmap_bytes.div_ceil(bs) as u32;
 
     let bitmap_start: u32 = 1;
     let extents_start: u32 = bitmap_start + bitmap_blocks;
@@ -5297,6 +5298,7 @@ pub fn validate_hfsplus_integrity(
 }
 
 #[cfg(test)]
+#[allow(clippy::identity_op)] // `1usize * block_size` keeps offset rows aligned
 mod tests {
     use super::*;
 
@@ -5474,7 +5476,7 @@ mod tests {
         let bitmap_block = 1u32;
         let catalog_start_block = 2u32;
         let catalog_blocks = 4u32;
-        let alloc_blocks = 1 + 1 + catalog_blocks as u32; // VH + bitmap + catalog = 6 blocks
+        let alloc_blocks = 1 + 1 + catalog_blocks; // VH + bitmap + catalog = 6 blocks
         let bitmap_data = &mut img[bitmap_block as usize * block_size as usize
             ..(bitmap_block + 1) as usize * block_size as usize];
         // Set bits 0-5 (MSB-first): byte 0 = 0b11111100

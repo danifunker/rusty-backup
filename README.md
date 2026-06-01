@@ -18,7 +18,11 @@ Rusty Backup ships as a single self-contained binary per platform.
 1. Grab the latest build for your OS from the
    [GitHub Releases page](https://github.com/danifunker/rusty-backup/releases).
 2. Drop the binary where you want it:
-   - **Windows** — extract the ZIP and run `rusty-backup.exe`.
+   - **Windows** — run the installer (`.exe`) to register file
+     associations and "Add/Remove Programs" support, or extract the
+     portable ZIP and run `rusty-backup.exe` directly. The app can
+     download and install its own updates in place from within the
+     **About / Update** UI.
    - **macOS** — open the DMG and drag `Rusty Backup.app` into `/Applications`.
    - **Linux** — `chmod +x rusty-backup-*.AppImage` and launch it.
 3. Raw physical disks require elevated privileges (admin on Windows, root on
@@ -89,8 +93,9 @@ The app has four tabs:
     trailing free space exists, pre-filled per partition-table type.
   - **Expand Image…** to grow a raw, VHD, or CHD image with trailing
     zero-padding so you have room for new partitions.
-  - **Export Disk Image…** to write VHD, Raw, 2MG, WOZ, DC42, or CHD
-    (whole-disk or per-partition) — see `docs/vhd-export.md`.
+  - **Export Disk Image…** to write VHD (fixed or dynamic), QCOW2,
+    VMDK, Raw, 2MG, WOZ, DC42, HFV, or CHD (whole-disk or
+    per-partition) — see `docs/vhd-export.md`.
   - **Check** (`fsck`) on classic HFS, HFS+, AmigaDOS (Disk Validator),
     and SGI EFS, with **Repair** that uses replica blocks + lost+found
     where supported.
@@ -174,8 +179,14 @@ readable.
 |----------------|-----------------|----------------|-----------------|-------|
 | Raw            | `.img`, `.raw`, `.hda` | Yes     | Yes             | Sparse zero-skipping; optional splitting |
 | Fixed VHD      | `.vhd`          | Yes            | Yes             | 512-byte footer; also used for VHD export |
+| Dynamic VHD    | `.vhd`          | Yes            | Yes             | Sparse, allocate-on-write |
+| QCOW2 (QEMU)   | `.qcow2`        | Yes            | Yes (create / edit) | v2 + v3 |
+| VMDK (VMware)  | `.vmdk`         | Yes            | Yes (create / edit) | Flat and monolithic-sparse |
 | Zstd stream    | `.zst`          | Yes            | Yes             | Good general compression, splittable |
 | CHD (MAME)     | `.chd`          | Yes            | Yes             | Native (MAME's CHD core is bundled — no external `chdman` needed) |
+| Norton Ghost   | `.gho`, `.ghs`  | Yes            | No              | File-aware FAT/NTFS browse, sector + spanned sets, Ghost 7.5, password-protected images decrypted automatically |
+| WinImage       | `.imz`          | Yes            | No              | Including password-protected archives |
+| BasiliskII HFV | `.hfv`          | Yes            | Yes             | Flat classic-HFS volume (≤ 2047 MB) for 68k Mac emulators |
 | Apple 2MG      | `.2mg`          | Yes            | No              | Apple II / IIgs disk images |
 | Disk Copy 4.2  | `.dc42`, `.image` | Yes          | No              | Classic Mac floppy images |
 | Apple DMG      | `.dmg`          | Yes (raw/UDRW) | No              | Uncompressed DMGs only |

@@ -794,8 +794,8 @@ mod tests {
 
             // Boot blocks (sectors 0..1, 1024 bytes): write a recognisable
             // pattern so capture() can round-trip them.
-            for i in 0..1024 {
-                img[i] = (i as u8).wrapping_mul(7).wrapping_add(3);
+            for (i, slot) in img[..1024].iter_mut().enumerate() {
+                *slot = (i as u8).wrapping_mul(7).wrapping_add(3);
             }
 
             // Bitmap sector 3, mark blocks 0-3 allocated (catalog)
@@ -914,8 +914,8 @@ mod tests {
         // Boot blocks round-trip: reproduce the pattern the generator wrote
         // into sectors 0..1.
         let mut expected = [0u8; 1024];
-        for i in 0..1024 {
-            expected[i] = (i as u8).wrapping_mul(7).wrapping_add(3);
+        for (i, slot) in expected.iter_mut().enumerate() {
+            *slot = (i as u8).wrapping_mul(7).wrapping_add(3);
         }
         assert_eq!(snap.boot_blocks, expected);
     }
@@ -1075,7 +1075,7 @@ mod tests {
         backing
     }
 
-    fn find_child<'a, R: Read + Seek + Send>(
+    fn find_child<R: Read + Seek + Send>(
         fs: &mut HfsFilesystem<R>,
         parent: &FileEntry,
         name: &str,

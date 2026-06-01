@@ -156,6 +156,26 @@ impl BulkConvertDialog {
                 ui.label(egui::RichText::new("Output format:").strong());
                 ui.horizontal_wrapped(|ui| {
                     ui.radio_value(&mut self.format, ExportFormat::Vhd, "VHD");
+                    ui.radio_value(&mut self.format, ExportFormat::VhdDynamic, "VHD (Dynamic)")
+                        .on_hover_text(
+                            "Sparse VHD — all-zero blocks are omitted. Same .vhd extension; \
+                             readable by Hyper-V, qemu-img, Disk Management.",
+                        );
+                    ui.radio_value(&mut self.format, ExportFormat::Qcow2, "QCOW2")
+                        .on_hover_text(
+                            "QCOW2 v3 — sparse, uncompressed. The format UTM uses for \
+                             classic-Mac PPC guests; opens in QEMU, qemu-img, virt-manager.",
+                        );
+                    ui.radio_value(&mut self.format, ExportFormat::VmdkFlat, "VMDK (Flat)")
+                        .on_hover_text(
+                            "monolithicFlat VMDK — descriptor + <name>-flat.vmdk pair. \
+                             Opens in VMware, VirtualBox, qemu-img.",
+                        );
+                    ui.radio_value(&mut self.format, ExportFormat::VmdkSparse, "VMDK (Sparse)")
+                        .on_hover_text(
+                            "monolithicSparse VMDK — single self-contained .vmdk; \
+                             zero grains omitted. Opens in VMware, VirtualBox, qemu-img.",
+                        );
                     ui.radio_value(&mut self.format, ExportFormat::Raw, "Raw (.img)");
                     ui.radio_value(&mut self.format, ExportFormat::TwoMg, "2MG (.2mg)");
                     ui.radio_value(&mut self.format, ExportFormat::Woz, "WOZ (.woz)")

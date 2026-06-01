@@ -108,8 +108,7 @@ impl DosOrderReader {
 
         let mut data = vec![0u8; FLOPPY_140K as usize];
         for track in 0..NUM_TRACKS {
-            for prodos_sec in 0..SECTORS_PER_TRACK {
-                let dos_sec = prodos_to_dos[prodos_sec];
+            for (prodos_sec, &dos_sec) in prodos_to_dos.iter().enumerate() {
                 let src_offset = (track * SECTORS_PER_TRACK + dos_sec) * SECTOR_SIZE;
                 let dst_offset = (track * SECTORS_PER_TRACK + prodos_sec) * SECTOR_SIZE;
                 data[dst_offset..dst_offset + SECTOR_SIZE]
@@ -123,6 +122,12 @@ impl DosOrderReader {
     /// Total size in bytes.
     pub fn len(&self) -> u64 {
         self.data.len() as u64
+    }
+
+    /// `true` if the decoded data is empty. Always `false` for a valid
+    /// 140 KB Apple II floppy, but mandated by clippy alongside `len()`.
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
     }
 }
 
@@ -237,8 +242,7 @@ mod tests {
             prodos_to_dos[p] = d;
         }
 
-        for prodos_sec in 0..SECTORS_PER_TRACK {
-            let dos_sec = prodos_to_dos[prodos_sec];
+        for (prodos_sec, &dos_sec) in prodos_to_dos.iter().enumerate() {
             let offset = prodos_sec * SECTOR_SIZE;
             let expected_tag = (dos_sec & 0xFF) as u8;
             assert_eq!(

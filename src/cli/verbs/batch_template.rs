@@ -176,6 +176,7 @@ fn matches(includes: &[Pattern], excludes: &[Pattern], rel: &str) -> bool {
     includes.iter().any(|p| p.is_match(rel))
 }
 
+#[allow(clippy::too_many_arguments)] // recursive directory walker threads filters + sinks
 fn walk(
     root: &Path,
     cur: &Path,

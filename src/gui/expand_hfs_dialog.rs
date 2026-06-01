@@ -11,11 +11,15 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use rusty_backup::fs::hfv::HFV_MAX_BYTES;
 use rusty_backup::model::hfs_expand_runner::{
-    max_volume_for_block_size, start_hfs_expand, suggest_block_size, ExpandSource,
+    max_volume_for_block_size, start_hfs_expand, suggest_block_size, ExpandOutput, ExpandSource,
     BLOCK_SIZE_CHOICES,
 };
 use rusty_backup::model::status::ExpandStatus;
+
+/// HFV's 2047 MB ceiling expressed in whole MiB, for slider clamping.
+const HFV_MAX_MIB: u32 = (HFV_MAX_BYTES / (1024 * 1024)) as u32;
 
 use super::progress::LogPanel;
 
@@ -28,6 +32,9 @@ pub struct ExpandHfsDialog {
     target_size_mib: u32,
     /// Target allocation block size (one of `BLOCK_SIZE_CHOICES`).
     target_block_size: u32,
+    /// When true, write a flat BasiliskII HFV (no partition table, max
+    /// 2047 MB) instead of an APM disk image.
+    output_hfv: bool,
     /// User-picked output file path.
     output_path: Option<PathBuf>,
     /// Background work status; `Some` while running and after completion.
@@ -44,11 +51,19 @@ impl ExpandHfsDialog {
         let suggested_mib =
             (suggested_bytes.div_ceil(1024 * 1024)).clamp(1, u32::MAX as u64) as u32;
         let suggested_bs = suggest_block_size(suggested_bytes);
+        // If the source itself is a .hfv, default to flat-HFV output.
+        let output_hfv = source
+            .source_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("hfv"))
+            .unwrap_or(false);
         Self {
             open: true,
             source,
             target_size_mib: suggested_mib,
             target_block_size: suggested_bs,
+            output_hfv,
             output_path: None,
             status: None,
             completed: false,
@@ -111,6 +126,22 @@ impl ExpandHfsDialog {
 
                 ui.add_enabled_ui(!busy && !self.completed, |ui| {
                     ui.horizontal(|ui| {
+                        ui.label("Output format:");
+                        ui.radio_value(&mut self.output_hfv, false, "APM disk (.hda)");
+                        ui.radio_value(&mut self.output_hfv, true, "Flat HFV (.hfv)");
+                    });
+                    if self.output_hfv {
+                        ui.label(
+                            egui::RichText::new(
+                                "HFV: bare classic-HFS volume for BasiliskII / SheepShaver; \
+                                 capped at 2047 MB.",
+                            )
+                            .small()
+                            .italics(),
+                        );
+                    }
+
+                    ui.horizontal(|ui| {
                         ui.label("Allocation block size:");
                         egui::ComboBox::new("expand_hfs_bs", "")
                             .selected_text(format!(
@@ -133,8 +164,12 @@ impl ExpandHfsDialog {
                             });
                     });
 
-                    let max_mib_for_bs =
+                    let mut max_mib_for_bs =
                         (max_volume_for_block_size(self.target_block_size) / (1024 * 1024)) as u32;
+                    // A flat HFV must stay under the classic-HFS 2047 MB ceiling.
+                    if self.output_hfv {
+                        max_mib_for_bs = max_mib_for_bs.min(HFV_MAX_MIB);
+                    }
                     let min_mib = (self.source.used_bytes.div_ceil(1024 * 1024)).max(1) as u32;
                     if self.target_size_mib > max_mib_for_bs {
                         self.target_size_mib = max_mib_for_bs;
@@ -215,15 +250,17 @@ impl ExpandHfsDialog {
         self.open = window_open;
 
         if pick_output_clicked {
-            let default_name = format!(
-                "{}-expanded.hda",
-                sanitize_filename(&self.source.volume_name)
-            );
-            if let Some(path) = super::file_dialog()
-                .set_file_name(&default_name)
-                .add_filter("Disk image", &["hda", "img", "dsk"])
-                .save_file()
-            {
+            let stem = sanitize_filename(&self.source.volume_name);
+            let dialog = if self.output_hfv {
+                super::file_dialog()
+                    .set_file_name(format!("{stem}-expanded.hfv"))
+                    .add_filter("BasiliskII HFV", &["hfv"])
+            } else {
+                super::file_dialog()
+                    .set_file_name(format!("{stem}-expanded.hda"))
+                    .add_filter("Disk image", &["hda", "img", "dsk"])
+            };
+            if let Some(path) = dialog.save_file() {
                 self.output_path = Some(path);
             }
         }
@@ -251,14 +288,30 @@ impl ExpandHfsDialog {
         let source = self.source.clone();
         let target_size = self.target_size_mib as u64 * 1024 * 1024;
         let target_bs = self.target_block_size;
+        let output_mode = if self.output_hfv {
+            ExpandOutput::FlatHfv
+        } else {
+            ExpandOutput::ApmDisk
+        };
         log.info(format!(
-            "Expanding HFS volume '{}' to {} MiB at {} KiB blocks -> {}",
+            "Expanding HFS volume '{}' to {} MiB at {} KiB blocks -> {} ({})",
             source.volume_name,
             self.target_size_mib,
             target_bs / 1024,
-            output.display()
+            output.display(),
+            if self.output_hfv {
+                "flat HFV"
+            } else {
+                "APM disk"
+            }
         ));
-        self.status = Some(start_hfs_expand(source, target_size, target_bs, output));
+        self.status = Some(start_hfs_expand(
+            source,
+            target_size,
+            target_bs,
+            output,
+            output_mode,
+        ));
     }
 }
 

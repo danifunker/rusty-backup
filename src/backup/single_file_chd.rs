@@ -587,6 +587,9 @@ fn copy_capped(
 /// Type alias for a stream segment: `(offset_in_disk, length, reader)`.
 type Segment = (u64, u64, Box<dyn Read + Send>);
 
+/// Shared log sink for defrag progress passed across thread boundaries.
+type DefragLogSink = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Build a `Read` covering one partition's full source extent.
 fn build_partition_reader(
     source_file: &File,
@@ -1264,7 +1267,7 @@ pub fn run_via_staging(
     log_cb: &mut dyn FnMut(&str),
     checksum_phase_cb: &mut dyn FnMut(u64, u64),
     phase_cb: &mut dyn FnMut(&str),
-    defrag_log_sink: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
+    defrag_log_sink: Option<DefragLogSink>,
 ) -> Result<SingleFileChdResult> {
     if !is_supported(inputs.partition_table) {
         anyhow::bail!(
@@ -1379,6 +1382,7 @@ fn synthesize_noop_plans(partitions: &[PartitionInfo]) -> Vec<PartitionResizePla
 /// `plan.new_size_bytes` bytes (truncated or zero-padded as needed)
 /// so [`assemble_from_staging`] can wire them up as fixed-length
 /// segments.
+#[allow(clippy::too_many_arguments)] // staging needs reader, partitions, sizes, callbacks
 fn stage_partitions_to_zst(
     inputs: &SingleFileChdInputs<'_>,
     plans: &[PartitionResizePlan],
@@ -1387,7 +1391,7 @@ fn stage_partitions_to_zst(
     cancel_check: &dyn Fn() -> bool,
     log_cb: &mut dyn FnMut(&str),
     phase_cb: &mut dyn FnMut(&str),
-    defrag_log_sink: Option<&std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
+    defrag_log_sink: Option<&DefragLogSink>,
 ) -> Result<()> {
     let total_target: u64 = plans.iter().map(|p| p.new_size_bytes).sum();
     let mut bytes_done: u64 = 0;
@@ -1486,8 +1490,7 @@ fn stage_partitions_to_zst(
             // backup thread has — without it the catalog-walk ticks
             // only reach stderr and the GUI log goes silent for
             // minutes during build_target_metadata.
-            let producer_sink: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>> =
-                defrag_log_sink.cloned();
+            let producer_sink: Option<DefragLogSink> = defrag_log_sink.cloned();
             let producer =
                 std::thread::spawn(move || -> Result<fs::hfsplus_defrag::DefragReport> {
                     // Defensive: clear the thread-local on the way out
@@ -1627,7 +1630,7 @@ fn stage_partitions_to_zst(
                     }
                     progress_cb(base_for_progress.saturating_add(n_read).min(total_target))
                 },
-                || cancel_check(),
+                cancel_check,
                 |msg| log_cb(msg),
             );
 
@@ -1760,7 +1763,7 @@ fn stage_partitions_to_zst(
                 false,
                 None,
                 |n_read| progress_cb(base_for_progress.saturating_add(n_read).min(total_target)),
-                || cancel_check(),
+                cancel_check,
                 |msg| log_cb(msg),
             )
             .with_context(|| format!("failed to zstd-stage resized partition-{}", plan.index))?;
@@ -1788,7 +1791,7 @@ fn stage_partitions_to_zst(
                 false,
                 None,
                 |n_read| progress_cb(base_for_progress.saturating_add(n_read).min(total_target)),
-                || cancel_check(),
+                cancel_check,
                 |msg| log_cb(msg),
             )
             .with_context(|| format!("failed to zstd-stage partition-{}", plan.index))?;
@@ -2405,7 +2408,7 @@ mod tests {
 
         // FAT (1 sector at offset 512). FAT12 entries 0+1 are reserved
         // (0xFF8 + 0xFFF), entry 2 = EOF (0xFFF), entries 3..N = 0 (free).
-        let fat = 1 * BYTES_PER_SECTOR;
+        let fat = BYTES_PER_SECTOR;
         // FAT12 packing: entries 0,1 share 3 bytes.
         img[fat] = 0xF8;
         img[fat + 1] = 0xFF;
@@ -2561,7 +2564,7 @@ mod tests {
         // the zero-tail assertion above is meaningful.
         let src_free = &data[512 + 4 * 512..512 + (PART_SECTORS as usize) * 512];
         assert!(
-            src_free.iter().any(|b| *b == 0xAB),
+            src_free.contains(&0xAB),
             "test setup failed — source free region must contain garbage",
         );
     }

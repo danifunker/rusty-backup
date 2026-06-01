@@ -737,6 +737,9 @@ fn make_prodos_datetime_now() -> (u16, u16) {
         let month: u16 = 1;
         let day: u16 = 15;
         let date = (year << 9) | (month << 5) | day;
+        // `| 0` here mirrors the bit-packing pattern; minutes are always 0
+        // for this synthesized timestamp.
+        #[allow(clippy::identity_op)]
         let time = (12u16 << 8) | 0;
         (date, time)
     }
@@ -1820,6 +1823,7 @@ mod tests {
         assert_eq!(parse_prodos_datetime(0, 0), None);
 
         // month 0 → None
+        #[allow(clippy::erasing_op, clippy::identity_op)]
         let bad_date = (year << 9) | (0u16 << 5) | day;
         assert_eq!(parse_prodos_datetime(bad_date, time), None);
     }

@@ -287,6 +287,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::identity_op)] // `1 * ONE_MIB` reads as "1 MiB"
     fn test_run_worker_direct_copy() {
         let src_file = write_source(1 * ONE_MIB);
         let target_file = NamedTempFile::new().unwrap();

@@ -413,6 +413,77 @@ pub fn build_ebr_chain(
     result
 }
 
+/// Standard generic MBR bootstrap (84 bytes), occupying the boot-code area
+/// (offsets 0..84) of sector 0. It does what every DOS/Windows MBR does:
+/// relocate itself from 0000:7C00 to 0000:0600, scan the partition table for
+/// the active (0x80) entry, load that partition's first sector (the VBR) to
+/// 0000:7C00 via INT 13h LBA extensions (AH=42h), and chainload it with
+/// DS:SI -> the active partition entry. On no active partition or a read
+/// error it falls through to INT 18h / halt.
+///
+/// It is OS-independent (the OS-specific boot code lives in the partition's
+/// VBR), so it's a faithful substitute for a disk's original MBR boot code.
+/// Assembled with `llvm-mc` from this source and verified by disassembly:
+///
+/// ```text
+///     .code16
+/// _start:
+///     cli
+///     xor    %ax, %ax
+///     mov    %ax, %ss
+///     mov    $0x7c00, %sp
+///     mov    %ax, %ds
+///     mov    %ax, %es
+///     sti
+///     cld
+///     mov    $0x7c00, %si
+///     mov    $0x0600, %di
+///     mov    $0x100, %cx          # 256 words = 512 bytes
+///     rep movsw
+///     ljmp   $0x0000, $0x061e     # -> reloc (0x600 + 0x1e)
+/// reloc:
+///     mov    $0x07be, %si         # relocated partition table (0x600+0x1be)
+///     mov    $4, %cx
+/// find_active:
+///     cmpb   $0x80, (%si)
+///     je     found
+///     add    $0x10, %si
+///     loop   find_active
+///     int    $0x18                # no active partition
+/// halt:
+///     hlt
+///     jmp    halt
+/// found:
+///     mov    %si, %bp             # bp -> active entry
+///     pushl  $0                   # DAP[12]: LBA high = 0
+///     pushl  8(%bp)               # DAP[8]:  LBA low (entry start LBA)
+///     pushw  $0x0000              # DAP[6]:  dest segment
+///     pushw  $0x7c00              # DAP[4]:  dest offset
+///     pushw  $1                   # DAP[2]:  sector count
+///     pushw  $0x0010              # DAP[0]:  size = 16
+///     mov    %sp, %si             # ds:si -> DAP
+///     mov    $0x42, %ah
+///     int    $0x13                # dl = boot drive (from BIOS)
+///     jc     halt
+///     mov    %bp, %si             # ds:si -> partition entry
+///     ljmp   $0x0000, $0x7c00     # chainload VBR
+/// ```
+pub const MBR_BOOT_CODE: [u8; 84] = [
+    0xfa, 0x31, 0xc0, 0x8e, 0xd0, 0xbc, 0x00, 0x7c, 0x8e, 0xd8, 0x8e, 0xc0, 0xfb, 0xfc, 0xbe, 0x00,
+    0x7c, 0xbf, 0x00, 0x06, 0xb9, 0x00, 0x01, 0xf3, 0xa5, 0xea, 0x1e, 0x06, 0x00, 0x00, 0xbe, 0xbe,
+    0x07, 0xb9, 0x04, 0x00, 0x80, 0x3c, 0x80, 0x74, 0x0a, 0x83, 0xc6, 0x10, 0xe2, 0xf6, 0xcd, 0x18,
+    0xf4, 0xeb, 0xfd, 0x89, 0xf5, 0x66, 0x6a, 0x00, 0x66, 0xff, 0x76, 0x08, 0x6a, 0x00, 0x68, 0x00,
+    0x7c, 0x6a, 0x01, 0x6a, 0x10, 0x89, 0xe6, 0xb4, 0x42, 0xcd, 0x13, 0x72, 0xe3, 0x89, 0xee, 0xea,
+    0x00, 0x7c, 0x00, 0x00,
+];
+
+/// Overlay [`MBR_BOOT_CODE`] into the boot-code area of a 512-byte sector,
+/// leaving the disk signature (440..444) and partition table (446..510)
+/// intact. Use after [`build_minimal_mbr`] to make the disk BIOS-bootable.
+pub fn install_mbr_boot_code(sector: &mut [u8; 512]) {
+    sector[..MBR_BOOT_CODE.len()].copy_from_slice(&MBR_BOOT_CODE);
+}
+
 /// Build a minimal MBR from scratch with the given partition entries.
 ///
 /// Each entry is `(type_byte, start_lba, total_sectors, bootable)`.
@@ -876,5 +947,31 @@ mod tests {
         assert_eq!(non_empty[1].start_lba, 1050624);
         assert_eq!(non_empty[1].total_sectors, 2097152);
         assert!(!non_empty[1].bootable);
+    }
+
+    #[test]
+    fn test_install_mbr_boot_code_preserves_table_and_signature() {
+        // Boot code lives in 0..440 and must not touch the disk signature
+        // (440..444), partition table (446..510), or boot signature (510..512).
+        assert!(MBR_BOOT_CODE.len() < 440);
+
+        let mut mbr = build_minimal_mbr(0xCAFEBABE, &[(0x07, 63, 36869111, true)], 255, 63);
+        let table_before = mbr[440..512].to_vec();
+
+        install_mbr_boot_code(&mut mbr);
+
+        assert_eq!(&mbr[..MBR_BOOT_CODE.len()], &MBR_BOOT_CODE);
+        assert_eq!(&mbr[440..512], &table_before[..], "table/signature changed");
+
+        // Still parses with the same partition entry.
+        let parsed = Mbr::parse(&mbr).unwrap();
+        let p = parsed.entries.iter().find(|e| !e.is_empty()).unwrap();
+        assert_eq!(p.partition_type, 0x07);
+        assert_eq!(p.start_lba, 63);
+        assert!(p.bootable);
+
+        // Sanity: the bootstrap ends with the chainload far-jump to 0000:7C00
+        // (ljmp $0,$0x7c00 = EA 00 7C 00 00).
+        assert_eq!(&MBR_BOOT_CODE[79..84], &[0xEA, 0x00, 0x7C, 0x00, 0x00]);
     }
 }

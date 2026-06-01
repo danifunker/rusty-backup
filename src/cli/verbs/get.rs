@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use crate::cli::img_at::ImageRef;
 use crate::cli::logging::log_stderr;
-use crate::cli::resolve::resolve_partition_ro;
+use crate::cli::resolve::resolve_partition_streaming_with_password;
 
 #[derive(Debug, Args)]
 pub struct GetArgs {
@@ -24,14 +24,27 @@ pub struct GetArgs {
 
     /// Destination path on the host.
     pub dst: PathBuf,
+
+    /// Password for encrypted containers (currently: WinImage IMZ).
+    #[arg(long)]
+    pub password: Option<String>,
 }
 
 pub fn run(args: GetArgs) -> Result<()> {
-    let (file, ctx) = resolve_partition_ro(&args.image.path, args.image.partition)?;
+    let pw_bytes = args.password.as_deref().map(|s| s.as_bytes());
+    let (reader, ctx) = resolve_partition_streaming_with_password(
+        &args.image.path,
+        args.image.partition,
+        pw_bytes,
+    )?;
     log_stderr(&ctx.label);
-    let mut fs =
-        crate::fs::open_filesystem(file, ctx.offset, ctx.type_byte, ctx.type_string.as_deref())
-            .map_err(|e| anyhow!("opening filesystem: {e}"))?;
+    let mut fs = crate::fs::open_filesystem(
+        reader,
+        ctx.offset,
+        ctx.type_byte,
+        ctx.type_string.as_deref(),
+    )
+    .map_err(|e| anyhow!("opening filesystem: {e}"))?;
     let entry = super::ls::resolve_path(&mut *fs, &args.src)?;
     if entry.is_directory() {
         bail!(

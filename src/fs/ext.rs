@@ -1,3 +1,10 @@
+// Lint allowances scoped to this file:
+//  - identity_op/erasing_op: `+ 0x00`, `1 *` etc. kept for tabular byte-layout
+//    readability (matches the `+ 0x04`, `+ 0x08`, ... row that follows).
+//  - too_many_arguments: ext2/3/4 ops legitimately need partition_offset,
+//    block_size, sb fields, log/progress callbacks, cancel checks, etc.
+#![allow(clippy::identity_op, clippy::erasing_op, clippy::too_many_arguments)]
+
 //! ext2/3/4 filesystem browsing and compaction.
 //!
 //! Implements the `Filesystem` trait for ext2, ext3, and ext4 partitions,
@@ -2048,6 +2055,11 @@ pub struct RelocationPlan {
 /// minimum number of block groups, and — if data extends beyond that
 /// boundary — pairs out-of-bounds allocated blocks with free data blocks
 /// within the boundary.
+// Block-group walks: `group` is both an index into `gd_infos` /
+// `allocated_by_group` AND a numeric block-group number used for
+// arithmetic (group_start, group_count comparisons). Refactoring to
+// `enumerate()` saves little and risks off-by-one in tested fs code.
+#[allow(clippy::needless_range_loop)]
 pub fn build_relocation_map<R: Read + Seek>(
     reader: &mut R,
     partition_offset: u64,
@@ -2325,6 +2337,7 @@ pub struct PatchedInodeTables {
 /// and rewrites any block pointers that appear in `relocations`. Also reads
 /// and patches indirect blocks and extent index blocks whose contents
 /// reference relocated blocks.
+#[allow(clippy::needless_range_loop)] // see build_relocation_map for rationale
 pub fn scan_and_patch_inodes<R: Read + Seek>(
     reader: &mut R,
     partition_offset: u64,
@@ -2866,6 +2879,9 @@ pub struct ShrinkMetadata {
 /// Reads the original metadata, applies the relocation plan (clearing bits for
 /// blocks moved out, setting bits for blocks moved in), truncates the GDT to
 /// `min_groups`, and updates the superblock totals.
+// Block-group rebuild loops use `group` as both an index and a numeric
+// block-group number; see `build_relocation_map` for the same rationale.
+#[allow(clippy::needless_range_loop)]
 pub fn rebuild_metadata_for_shrink<R: Read + Seek>(
     reader: &mut R,
     partition_offset: u64,
@@ -3038,11 +3054,9 @@ pub fn rebuild_metadata_for_shrink<R: Read + Seek>(
         old_reserved_lo
     };
     let old_total = total_blocks;
-    let new_reserved = if old_total > 0 {
-        old_reserved * new_total / old_total
-    } else {
-        0
-    };
+    let new_reserved = (old_reserved * new_total)
+        .checked_div(old_total)
+        .unwrap_or(0);
     sb[0x08..0x0C].copy_from_slice(&(new_reserved as u32).to_le_bytes());
     if is_64bit {
         sb[0x154..0x158].copy_from_slice(&((new_reserved >> 32) as u32).to_le_bytes());
@@ -3144,11 +3158,9 @@ pub fn resize_ext_in_place(
         // Shrinking: reduce free and reserved proportionally
         let removed = old_blocks - new_blocks;
         new_free = old_free.saturating_sub(removed);
-        new_reserved = if old_blocks > 0 {
-            old_reserved * new_blocks / old_blocks
-        } else {
-            0
-        };
+        new_reserved = (old_reserved * new_blocks)
+            .checked_div(old_blocks)
+            .unwrap_or(0);
         log_cb(&format!(
             "ext resize: shrinking from {old_blocks} to {new_blocks} blocks (-{removed})"
         ));
@@ -3190,6 +3202,7 @@ pub fn resize_ext_in_place(
 /// Validate ext2/3/4 filesystem integrity.
 ///
 /// Performs basic consistency checks and returns a list of warnings.
+#[allow(clippy::needless_range_loop)] // see build_relocation_map for rationale
 pub fn validate_ext_integrity(
     file: &mut (impl Read + Seek),
     partition_offset: u64,
@@ -3617,6 +3630,7 @@ impl<R: Read + Seek + Send> CompactExtReader<R> {
     }
 
     /// Build a layout-preserving compacted image (original behavior).
+    #[allow(clippy::needless_range_loop)] // see build_relocation_map for rationale
     fn new_layout_preserving(
         mut reader: R,
         partition_offset: u64,
@@ -3937,7 +3951,7 @@ mod tests {
         let name_bytes = name.as_bytes();
         let name_len = name_bytes.len();
         // rec_len: aligned to 4 bytes
-        let rec_len = ((8 + name_len + 3) / 4) * 4;
+        let rec_len = (8 + name_len).next_multiple_of(4);
 
         image[offset..offset + 4].copy_from_slice(&inode.to_le_bytes());
         image[offset + 4..offset + 6].copy_from_slice(&(rec_len as u16).to_le_bytes());
@@ -4104,11 +4118,11 @@ mod tests {
         let mut data = vec![0u8; 256];
         // Entry 1: inode=5, name="test.txt", type=regular
         write_dir_entry_buf(&mut data, 0, 5, "test.txt", FT_REG_FILE);
-        let e1_len = ((8 + 8 + 3) / 4) * 4; // 16
-                                            // Entry 2: inode=6, name="dir", type=directory
+        let e1_len = (8 + 8usize).next_multiple_of(4); // 16
+                                                       // Entry 2: inode=6, name="dir", type=directory
         write_dir_entry_buf(&mut data, e1_len, 6, "dir", FT_DIR);
-        let e2_len = ((8 + 3 + 3) / 4) * 4; // 12
-                                            // Make last entry fill the rest
+        let e2_len = (8 + 3usize).next_multiple_of(4); // 12
+                                                       // Make last entry fill the rest
         let remaining = 256 - e1_len - e2_len;
         data[e1_len + e2_len + 4..e1_len + e2_len + 6]
             .copy_from_slice(&(remaining as u16).to_le_bytes());
@@ -4129,7 +4143,7 @@ mod tests {
     fn write_dir_entry_buf(buf: &mut [u8], offset: usize, inode: u32, name: &str, ft: u8) {
         let name_bytes = name.as_bytes();
         let name_len = name_bytes.len();
-        let rec_len = ((8 + name_len + 3) / 4) * 4;
+        let rec_len = (8 + name_len).next_multiple_of(4);
 
         buf[offset..offset + 4].copy_from_slice(&inode.to_le_bytes());
         buf[offset + 4..offset + 6].copy_from_slice(&(rec_len as u16).to_le_bytes());
@@ -4669,7 +4683,7 @@ mod tests {
 
         // The block pointer should be within group 0 (< 64)
         assert!(
-            new_block < 64 && new_block >= 5,
+            (5..64).contains(&new_block),
             "inode 12's block should be relocated to group 0, got {new_block}"
         );
 
@@ -4889,7 +4903,7 @@ mod tests {
         //                   4-19(inode table = 256*256/4096 = 16 blocks), 20(root dir) = 21 blocks
         let inode_table_blocks = (inodes_per_group as usize * inode_size as usize) / block_size;
         let metadata_blocks = 4 + inode_table_blocks + 1; // +1 for root dir block
-        let free_blocks = total_blocks as u32 - metadata_blocks as u32;
+        let free_blocks = total_blocks - metadata_blocks as u32;
 
         let mut image = vec![0u8; total_blocks as usize * block_size];
 

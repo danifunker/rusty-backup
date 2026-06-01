@@ -542,7 +542,7 @@ impl SourceCatalogSnapshot {
         // Stash the raw fork records on each file snapshot so the clone
         // pipeline can stream forks block-by-block instead of buffering
         // them. Then load xattrs (small, bounded by node size).
-        for (file, (data_fork, rsrc_fork)) in files.iter_mut().zip(pending_forks.into_iter()) {
+        for (file, (data_fork, rsrc_fork)) in files.iter_mut().zip(pending_forks) {
             file.data_fork_size = BigEndian::read_u64(&data_fork[0..8]);
             file.rsrc_fork_size = BigEndian::read_u64(&rsrc_fork[0..8]);
             file.data_fork_raw = data_fork;
@@ -1138,12 +1138,12 @@ where
     // it. Same convention as `clone_hfs_volume`.
     let known_source_cnids: HashSet<u32> = cnid_map.keys().copied().collect();
     let mut new_finder_info = [0u32; 8];
-    for i in 0..8 {
+    for (i, slot) in new_finder_info.iter_mut().enumerate() {
         if i == 6 || i == 7 {
             continue;
         }
         let src_val = snapshot.volume.finder_info[i];
-        new_finder_info[i] = if known_source_cnids.contains(&src_val) {
+        *slot = if known_source_cnids.contains(&src_val) {
             *cnid_map.get(&src_val).unwrap()
         } else {
             src_val

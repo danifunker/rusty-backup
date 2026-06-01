@@ -44,6 +44,10 @@ path = "example/generate_cli_reference.rs"
 name = "generate_cli_html_help"
 path = "example/generate_cli_html_help.rs"
 
+[[example]]
+name = "decrypt_real_imz"
+path = "example/decrypt_real_imz.rs"
+
 [features]
 default = []
 
@@ -59,10 +63,13 @@ serde_json = "1"
 byteorder = "1"
 log = "0.4"
 env_logger = "0.11"
-libchdman-rs = { version = "0.287.0-l7", features = ["prebuilt"] }
+libchdman-rs = { version = "0.288.1", features = ["prebuilt"] }
 zstd = "0.13"
 zeekstd = "0.6"
 sha2 = "0.11"
+md-5 = "0.10"
+aes = "0.8"
+cbc = "0.1"
 crc32c = "0.6"
 crc32fast = "1"
 chrono = "0.4"
@@ -72,15 +79,16 @@ reqwest = { version = "0.13", features = ["blocking", "json"] }
 webbrowser = "1.0"
 dirs = "6"
 unicode-normalization = "0.1"
-flate2 = "1"
+flate2 = { version = "1", default-features = false, features = ["zlib-ng"] }
 bzip2 = "0.6"
+zip = { version = "8", default-features = false, features = ["deflate", "aes-crypto"] }
 base64 = "0.22"
 opticaldiscs = { version = "0.4.2", features = ["drives"] }
 cd-da-reader = { git = "https://github.com/danifunker/rust-cd-da-reader", branch = "add-data-support-0-4-1" }
-serde_yml = "0.0.12"
+serde_yml = "0.0.13"
 csv = "1"
 clap_complete = "4"
-clap_mangen = "0.2"
+clap_mangen = "0.3"
 globset = "0.4"
 rustyline = { version = "18.0.0", features = ["with-file-history"] }
 shell-words = "1.1.1"
@@ -99,6 +107,11 @@ objc2-foundation = { version = "0.3", features = ["NSBundle", "NSString"] }
 # Note: Removed xpc-sys and objc2-service-management - using Unix sockets instead of XPC
 
 [target.'cfg(target_os = "windows")'.dependencies]
+# In-app self-update: replaces the running .exe in place, handling the
+# Windows locked-running-image problem. See docs/windows_self_update.md.
+self-replace = "1"
+# Per-user file-association registration (HKCU\Software\Classes).
+winreg = "0.55"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Ioctl",
@@ -112,7 +125,6 @@ windows = { version = "0.62", features = [
 ] }
 
 [build-dependencies]
-embed-resource = "3"
 winres = "0.1"
 
 [dev-dependencies]
@@ -161,4 +173,3 @@ openssl = "*"
 # Arch package metadata
 [package.metadata.aur]
 depends = ["gtk3", "openssl"]
-

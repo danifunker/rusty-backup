@@ -32,6 +32,9 @@ jobs:
     needs: generate-version
     runs-on: windows-latest
     strategy:
+      # Run both arches to completion — don't let a 32-bit failure cancel the
+      # x64 leg (we want to see both results when diagnosing arch-specific bugs).
+      fail-fast: false
       matrix:
         include:
           - target: i686-pc-windows-msvc
@@ -64,11 +67,16 @@ jobs:
           path: target
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
+      # Tests run upfront on the runner (i686 32-bit tests execute fine on the
+      # x64 Windows runner). Failure fails the job and blocks the release.
+      - name: Test
+        run: cargo test --release --target ${{ matrix.target }}
+
       - name: Build
         env:
           RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
         run: cargo build --release --target ${{ matrix.target }}
-      
+
       - name: Package
         shell: bash
         run: |
@@ -97,10 +105,35 @@ jobs:
           name: Rusty-Backup-CLI-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
           path: Rusty-Backup-CLI-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.exe
 
+      # Per-user Inno Setup installer (Setup.exe). Installs to %LocalAppData%
+      # so the in-app self-updater can replace the running exe without admin.
+      # Source dir has both rusty-backup.exe and rb-cli.exe from the Build step.
+      # See installer/rusty-backup.iss + docs/windows_self_update.md.
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found at $iscc" }
+          $version = "${{ needs.generate-version.outputs.version }}"
+          $src = "$env:GITHUB_WORKSPACE\target\${{ matrix.target }}\release"
+          $assets = "$env:GITHUB_WORKSPACE\assets\icons"
+          $base = "Rusty-Backup-Setup-windows-${{ matrix.arch }}-$version"
+          & $iscc "/DMyAppVersion=$version" "/DSourceDir=$src" "/DAssetsDir=$assets" "/F$base" installer\rusty-backup.iss
+          if ($LASTEXITCODE -ne 0) { throw "iscc failed with exit code $LASTEXITCODE" }
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: Rusty-Backup-Setup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: installer\Output\Rusty-Backup-Setup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.exe
+
   build-macos:
     name: Build macOS
     needs: generate-version
-    runs-on: macos-latest
+    # arm64 builds+tests on Apple-silicon; x64 builds+tests natively on a real
+    # Intel runner (no Rosetta), so `cargo test` runs on each arch's hardware.
+    runs-on: ${{ matrix.runs-on }}
     env:
       HAS_SIGNING_CERT: ${{ secrets.MACOS_CERTIFICATE != '' }}
     strategy:
@@ -108,8 +141,10 @@ jobs:
         include:
           - target: aarch64-apple-darwin
             arch: arm64
+            runs-on: macos-latest
           - target: x86_64-apple-darwin
             arch: x64
+            runs-on: macos-26-intel
     steps:
       - uses: actions/checkout@v5
 
@@ -135,6 +170,12 @@ jobs:
         with:
           path: target
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+      # Tests run upfront on this leg's native hardware. Failure fails the job,
+      # which blocks the release (the release job needs every build job).
+      # --release shares compilation with the Build step below.
+      - name: Test
+        run: cargo test --release --target ${{ matrix.target }}
 
       - name: Build
         env:
@@ -354,6 +395,7 @@ jobs:
         run: |
           pacman -Syu --noconfirm \
             base-devel \
+            cmake \
             rust \
             gtk3 \
             openssl \
@@ -396,6 +438,11 @@ jobs:
         with:
           path: target
           key: ${{ runner.os }}-${{ matrix.target }}-anylinux-cargo-build-${{ hashFiles('**/Cargo.lock') }}
+
+      # Tests run upfront in the Arch build container (native target). Failure
+      # fails the job and blocks the release.
+      - name: Test
+        run: cargo test --release --target ${{ matrix.target }}
 
       - name: Build
         env:
@@ -539,7 +586,7 @@ jobs:
         if: ${{ !contains(matrix.runs-on, 'self-hosted') }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libssl-dev pkg-config dpkg-dev liblzma-dev rpm libarchive-tools zstd
+          sudo apt-get install -y cmake libgtk-3-dev libssl-dev pkg-config dpkg-dev liblzma-dev rpm libarchive-tools zstd
 
       - name: Install cargo packaging tools
         run: |
@@ -564,6 +611,11 @@ jobs:
         with:
           path: target
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+      # Tests run upfront on this leg's native runner (x64 + arm64). Failure
+      # fails the job and blocks the release.
+      - name: Test
+        run: cargo test --release --target ${{ matrix.target }}
 
       - name: Build
         env:

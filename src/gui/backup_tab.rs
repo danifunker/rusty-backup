@@ -240,6 +240,13 @@ impl BackupTab {
                                 self.update_backup_name(ctx);
                             }
                         }
+                        if ctx.devices.is_empty() {
+                            ui.label(
+                                egui::RichText::new(super::no_devices_hint())
+                                    .italics()
+                                    .weak(),
+                            );
+                        }
                         ui.separator();
                         if ui
                             .selectable_label(self.image_file_path.is_some(), "Open Image File...")
@@ -248,17 +255,13 @@ impl BackupTab {
                             if let Some(path) = super::file_dialog()
                                 .add_filter(
                                     "Disk Images",
-                                    &[
-                                        "img", "raw", "bin", "iso", "dd", "vhd", "hda", "hdv",
-                                        "2mg", "dmg", "po", "do", "dsk", "dc42", "woz", "chd",
-                                        "adf", "hdf", "adz", "hdz",
-                                    ],
+                                    rusty_backup::model::file_types::DISK_IMAGE_EXTS,
                                 )
                                 .add_filter("All Files", &["*"])
                                 .pick_file()
                             {
                                 self.selected_device_idx = None;
-                                match super::materialize_amiga_image_path(&path) {
+                                match super::prepare_disk_image_path(&path) {
                                     Ok((materialized, guard)) => {
                                         self.image_file_path = Some(materialized);
                                         self.amiga_tempdir = guard;
@@ -662,20 +665,18 @@ impl BackupTab {
                         ctx.log.info("Auto-backup canceled; minimum-size calculations will still complete in the background");
                     }
                 }
-            } else {
-                if ui.button("Cancel").clicked() {
-                    if let Some(ref progress_arc) = self.backup_progress {
-                        if let Ok(mut p) = progress_arc.lock() {
-                            p.cancel_requested = true;
-                        }
+            } else if ui.button("Cancel").clicked() {
+                if let Some(ref progress_arc) = self.backup_progress {
+                    if let Ok(mut p) = progress_arc.lock() {
+                        p.cancel_requested = true;
                     }
-                    if let Some(ref status) = self.vhd_export_status {
-                        if let Ok(mut s) = status.lock() {
-                            s.cancel_requested = true;
-                        }
-                    }
-                    ctx.log.warn("Cancellation requested...");
                 }
+                if let Some(ref status) = self.vhd_export_status {
+                    if let Ok(mut s) = status.lock() {
+                        s.cancel_requested = true;
+                    }
+                }
+                ctx.log.warn("Cancellation requested...");
             }
         });
 
@@ -987,6 +988,9 @@ impl BackupTab {
             Some(p) if rusty_backup::model::source_reader::is_chd_path(p) => {
                 rusty_backup::model::min_size_runner::MinSizeSource::Chd(p.to_path_buf())
             }
+            Some(p) if rusty_backup::model::source_reader::is_gho_path(p) => {
+                rusty_backup::model::min_size_runner::MinSizeSource::Gho(p.to_path_buf())
+            }
             _ => {
                 let Some(file_arc) = self.source_file.clone() else {
                     ctx.log.error(format!(
@@ -1051,13 +1055,14 @@ impl BackupTab {
 
     /// Common post-min-size-walk bookkeeping shared between the auto-load
     /// path (`load_partitions`) and the worker-poll path. Stores in-place
-    /// + defrag floors, fragmentation %, and auto-checks the Compact Space
-    /// toggle when compacting would save at least
+    /// plus defrag floors, fragmentation %, and auto-checks the Compact
+    /// Space toggle when compacting would save at least
     /// [`Self::COMPACT_AUTOCHECK_SAVINGS_PCT`] of the in-place trim size on
     /// a clone-capable filesystem. The user can still toggle the box
     /// manually to override the default — e.g. to squeeze the backup onto
     /// a slightly-smaller destination disk when the auto threshold didn't
     /// fire.
+    #[allow(clippy::too_many_arguments)] // post-walk bookkeeping needs all the per-partition results
     fn record_min_size_result(
         &mut self,
         idx: usize,

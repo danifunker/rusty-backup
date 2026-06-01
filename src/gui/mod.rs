@@ -14,6 +14,7 @@ mod resize_popup;
 mod restore_tab;
 mod settings_dialog;
 mod size_mode_row;
+pub mod ui_logger;
 
 use backup_tab::BackupTab;
 use bulk_convert_dialog::{BulkConvertDialog, DialogAction as BulkConvertAction};
@@ -52,6 +53,40 @@ fn bytes_human(n: u64) -> String {
     }
 }
 
+/// Hint shown in a device dropdown when no physical devices are listed. On
+/// Windows the empty list usually means the process isn't elevated yet, so we
+/// point the user at the top-bar gate; when already elevated (or on other
+/// platforms) it just reports that none were detected.
+fn no_devices_hint() -> &'static str {
+    #[cfg(windows)]
+    {
+        if rusty_backup::os::windows::is_elevated() {
+            "No physical devices detected."
+        } else {
+            "Click \"Show Physical Devices\" (top bar) to access disks."
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        "No physical devices detected."
+    }
+}
+
+/// Whether physical-device access is available right now. On Windows this means
+/// the process is elevated (raw disk + SCSI optical access need admin); on other
+/// platforms it is always true. Used to gray out physical-source controls until
+/// the user elevates via the top-bar "Show Physical Devices" button.
+fn physical_devices_available() -> bool {
+    #[cfg(windows)]
+    {
+        rusty_backup::os::windows::is_elevated()
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
 fn file_dialog() -> rfd::FileDialog {
     let dialog = rfd::FileDialog::new();
     #[cfg(target_os = "linux")]
@@ -63,26 +98,31 @@ fn file_dialog() -> rfd::FileDialog {
     dialog
 }
 
-/// If `path` points at an `.adz` / `.hdz` (gzip-wrapped Amiga image),
-/// decompress it to a temporary `.adf` / `.hdf` next to the system temp
-/// directory and return that path instead. Otherwise return the original
-/// path verbatim.
+/// Prepare a disk image path for file-based access by downstream GUI
+/// worker code. Returns a path to a raw, seekable image — possibly the
+/// original (no work needed) or a tempfile.
 ///
-/// The decompressed file is named `<stem>.adf` (for `.adz`) or
-/// `<stem>.hdf` (for `.hdz`) inside a fresh `tempfile::tempdir` so the
-/// caller can keep the `_guard` alive for the duration of the operation
-/// — once the guard drops, the tempdir is removed. Callers that need the
-/// file to outlive the dialog should hold the `TempDir` (returned as the
-/// second tuple element) until the work is done.
+/// Only handles `.adz` / `.hdz` (gzip-decompressed to a tempfile —
+/// gzip isn't seekable). Everything else — including `.gho`/`.ghs`,
+/// `.imz`, `.chd` — passes through unchanged, since the inspect worker
+/// opens those via [`open_disk_image_for_reading`] (streaming
+/// `Read + Seek` readers, no tempfile).
 ///
-/// Returns `Err` if the magic gzip bytes are missing or `flate2` fails.
-pub fn materialize_amiga_image_path(
+/// The output file lives inside a fresh `tempfile::tempdir`; callers
+/// must hold the returned `TempDir` (second tuple element) for the
+/// duration they need the materialized file.
+pub fn prepare_disk_image_path(
     path: &std::path::Path,
 ) -> std::io::Result<(std::path::PathBuf, Option<tempfile::TempDir>)> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .map(|s| s.to_ascii_lowercase());
+
+    // GHO/GHS and IMZ have streaming Read+Seek readers (GhoReader,
+    // ImzReader) — the inspect worker opens them via open_read, so
+    // the path passes through unchanged. No tempfile needed.
+
     let target_ext = match ext.as_deref() {
         Some("adz") => "adf",
         Some("hdz") => "hdf",
@@ -118,6 +158,30 @@ pub fn materialize_amiga_image_path(
     Ok((out_path, Some(tmp)))
 }
 
+/// Open a disk image file for streaming reads, dispatching on container
+/// type:
+///
+/// - `.chd` → `ChdReader` (decompresses hunks on demand)
+/// - `.gho` / `.ghs` → `GhoReader` (streams SECTOR mode, builds an
+///   in-RAM virtual FAT image for file-aware mode)
+/// - `.imz` → `ImzReader` (streams ZIP-wrapped floppy image)
+/// - anything else → buffered `File`
+///
+/// No tempfile is created for any of the streaming containers; only
+/// gzip-wrapped Amiga images need [`prepare_disk_image_path`]
+/// first (since gzip isn't seekable).
+///
+/// This is the GUI's entry point for opening image FILES (not raw
+/// devices — those still need [`rusty_backup::os::open_source_for_reading`]
+/// for elevation / volume locking).
+#[allow(dead_code)] // First caller lands in the GUI worker refactor.
+pub fn open_disk_image_for_reading(
+    path: &std::path::Path,
+) -> std::io::Result<Box<dyn rusty_backup::rbformats::ReadSeek>> {
+    rusty_backup::model::source_reader::open_read(path)
+        .map_err(|e| std::io::Error::other(format!("{e:#}")))
+}
+
 #[cfg(test)]
 mod materialize_tests {
     use super::*;
@@ -128,7 +192,7 @@ mod materialize_tests {
         let tmp = tempfile::tempdir().unwrap();
         let raw = tmp.path().join("disk.adf");
         std::fs::write(&raw, b"raw bytes").unwrap();
-        let (out, guard) = materialize_amiga_image_path(&raw).unwrap();
+        let (out, guard) = prepare_disk_image_path(&raw).unwrap();
         assert_eq!(out, raw);
         assert!(guard.is_none());
     }
@@ -143,7 +207,7 @@ mod materialize_tests {
         let mut enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
         enc.write_all(payload).unwrap();
         enc.finish().unwrap();
-        let (out, guard) = materialize_amiga_image_path(&adz_path).unwrap();
+        let (out, guard) = prepare_disk_image_path(&adz_path).unwrap();
         assert!(guard.is_some(), "decompressed path needs a tempdir guard");
         assert_eq!(out.extension().and_then(|s| s.to_str()), Some("adf"));
         let actual = std::fs::read(&out).unwrap();
@@ -155,8 +219,46 @@ mod materialize_tests {
         let tmp = tempfile::tempdir().unwrap();
         let adz = tmp.path().join("bogus.adz");
         std::fs::write(&adz, b"not gzip data").unwrap();
-        let err = materialize_amiga_image_path(&adz).unwrap_err();
+        let err = prepare_disk_image_path(&adz).unwrap_err();
         assert!(err.to_string().contains("gzip magic"));
+    }
+
+    #[test]
+    fn imz_passes_through_unchanged() {
+        // IMZ has a streaming reader (ImzReader); prepare_disk_image_path
+        // passes it through unchanged — the worker opens it via
+        // open_disk_image_for_reading.
+        let tmp = tempfile::tempdir().unwrap();
+        let imz_path = tmp.path().join("floppy.imz");
+        std::fs::write(&imz_path, b"PK\x03\x04anything").unwrap();
+        let (out, guard) = prepare_disk_image_path(&imz_path).unwrap();
+        assert_eq!(out, imz_path);
+        assert!(guard.is_none());
+    }
+
+    #[test]
+    fn gho_passes_through_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gho_path = tmp.path().join("test.gho");
+        std::fs::write(&gho_path, [0xFE, 0xEF, 0x01, 0x00]).unwrap();
+        let (out, guard) = prepare_disk_image_path(&gho_path).unwrap();
+        assert_eq!(out, gho_path);
+        assert!(guard.is_none());
+    }
+
+    #[test]
+    fn hfv_passes_through_unchanged() {
+        // HFV is a flat raw HFS volume opened directly at offset 0 by the
+        // superfloppy path; prepare_disk_image_path must not materialize or
+        // rewrite it. Covers both .hfv and .HFV.
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["disk.hfv", "DISK.HFV"] {
+            let hfv_path = tmp.path().join(name);
+            std::fs::write(&hfv_path, b"\x00\x00\x00\x00").unwrap();
+            let (out, guard) = prepare_disk_image_path(&hfv_path).unwrap();
+            assert_eq!(out, hfv_path);
+            assert!(guard.is_none());
+        }
     }
 }
 
@@ -180,9 +282,17 @@ pub struct RustyBackupApp {
     devices: Vec<DiskDevice>,
     update_info: Arc<Mutex<Option<UpdateInfo>>>,
     update_dismissed: bool,
+    /// In-app self-update worker status (Windows only). `None` until the user
+    /// clicks "Download & Install Update".
+    #[cfg(windows)]
+    update_run: Option<Arc<Mutex<rusty_backup::model::update_runner::UpdateRunStatus>>>,
     settings_dialog: SettingsDialog,
     #[cfg(target_os = "linux")]
     elevation_dialog: ElevationDialog,
+    /// Stylized shield texture for the "Show Physical Devices" elevation button.
+    /// Loaded lazily on first use (the egui context isn't available at
+    /// construction time).
+    shield_texture: Option<egui::TextureHandle>,
     /// Shared backup folder path between restore and inspect tabs
     loaded_backup_folder: Option<PathBuf>,
     /// Bulk Convert dialog state (None = closed).
@@ -263,9 +373,12 @@ impl Default for RustyBackupApp {
             devices,
             update_info,
             update_dismissed: false,
+            #[cfg(windows)]
+            update_run: None,
             settings_dialog: SettingsDialog::default(),
             #[cfg(target_os = "linux")]
             elevation_dialog,
+            shield_texture: None,
             loaded_backup_folder: None,
             bulk_convert_dialog: None,
             bulk_convert_status: None,
@@ -273,7 +386,55 @@ impl Default for RustyBackupApp {
     }
 }
 
+/// Whether the physical-device elevation gate applies, and its current state.
+/// `NeedsElevation`/`Elevated` are only constructed on Windows; on other
+/// platforms `elevation_gate()` always returns `NotApplicable`.
+#[derive(Clone, Copy, PartialEq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+enum ElevationGate {
+    /// Not a gated platform (Linux/macOS handle elevation their own way) — the
+    /// normal "Refresh Devices" control applies.
+    NotApplicable,
+    /// Windows, not elevated — show the shielded "Show Physical Devices" button.
+    NeedsElevation,
+    /// Windows, already elevated — devices are available, show "Refresh Devices".
+    Elevated,
+}
+
 impl RustyBackupApp {
+    /// Current Windows elevation-gate state. The button + device-list behavior
+    /// key off this; non-Windows is always `NotApplicable`.
+    fn elevation_gate(&self) -> ElevationGate {
+        #[cfg(windows)]
+        {
+            if rusty_backup::os::windows::is_elevated() {
+                ElevationGate::Elevated
+            } else {
+                ElevationGate::NeedsElevation
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            ElevationGate::NotApplicable
+        }
+    }
+
+    /// Lazily load (once) and return the stylized shield texture for the
+    /// elevation button.
+    fn shield_texture(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
+        if let Some(tex) = &self.shield_texture {
+            return tex.clone();
+        }
+        let rgba = image::load_from_memory(include_bytes!("../../assets/icons/shield.png"))
+            .expect("embedded shield.png is valid")
+            .to_rgba8();
+        let size = [rgba.width() as usize, rgba.height() as usize];
+        let color_image = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+        let tex = ctx.load_texture("shield", color_image, egui::TextureOptions::LINEAR);
+        self.shield_texture = Some(tex.clone());
+        tex
+    }
+
     /// Drain bulk-convert worker log messages into the GUI log panel and
     /// clear the status handle when the worker finishes.
     fn poll_bulk_convert(&mut self) {
@@ -296,6 +457,82 @@ impl RustyBackupApp {
             self.bulk_convert_status = None;
         }
     }
+
+    /// Render the update-banner action buttons. On Windows with a matched
+    /// release asset this offers in-app "Download & Install Update" (download
+    /// progress -> "Restart now"); otherwise (other platforms, unmatched arch,
+    /// or a missing asset) it opens the releases page in a browser.
+    fn show_update_actions(&mut self, ui: &mut egui::Ui, info: &UpdateInfo) {
+        #[cfg(windows)]
+        {
+            use rusty_backup::model::update_runner::{self, UpdateRunState};
+
+            if info.asset_url.is_some() {
+                let run_state = self.update_run.as_ref().map(|s| {
+                    s.lock()
+                        .map(|g| g.state.clone())
+                        .unwrap_or(UpdateRunState::Idle)
+                });
+
+                match run_state {
+                    None => {
+                        if ui.button("Download & Install Update").clicked() {
+                            let status =
+                                Arc::new(Mutex::new(update_runner::UpdateRunStatus::default()));
+                            update_runner::spawn(info.clone(), Arc::clone(&status));
+                            self.update_run = Some(status);
+                            self.log_panel.info("Downloading update...");
+                        }
+                        if ui.button("View Release").clicked() {
+                            let _ = webbrowser::open(&info.releases_url);
+                        }
+                    }
+                    Some(UpdateRunState::Idle) | Some(UpdateRunState::Downloading { .. }) => {
+                        let frac = self
+                            .update_run
+                            .as_ref()
+                            .and_then(|s| s.lock().ok().and_then(|g| g.progress_fraction()));
+                        ui.add(egui::Spinner::new());
+                        if let Some(f) = frac {
+                            ui.add(
+                                egui::ProgressBar::new(f)
+                                    .desired_width(140.0)
+                                    .show_percentage(),
+                            );
+                        } else {
+                            ui.label("Downloading update...");
+                        }
+                        ui.ctx().request_repaint();
+                    }
+                    Some(UpdateRunState::Ready) => {
+                        ui.label(
+                            egui::RichText::new("Update installed.").color(egui::Color32::GREEN),
+                        );
+                        if ui.button("Restart now").clicked() {
+                            rusty_backup::update::restart_app();
+                        }
+                    }
+                    Some(UpdateRunState::Failed(e)) => {
+                        ui.label(
+                            egui::RichText::new(format!("Update failed: {e}"))
+                                .color(egui::Color32::LIGHT_RED),
+                        );
+                        if ui.button("Retry").clicked() {
+                            self.update_run = None;
+                        }
+                        if ui.button("View Release").clicked() {
+                            let _ = webbrowser::open(&info.releases_url);
+                        }
+                    }
+                }
+                return;
+            }
+        }
+
+        if ui.button("View Release").clicked() {
+            let _ = webbrowser::open(&info.releases_url);
+        }
+    }
 }
 
 impl eframe::App for RustyBackupApp {
@@ -307,6 +544,16 @@ impl eframe::App for RustyBackupApp {
             || self.bulk_convert_status.is_some()
         {
             ctx.request_repaint();
+        }
+
+        // Drain `log` crate records (incl. worker-thread log::info! from the
+        // GHO reader) into the panel so they're visible in the UI.
+        for (level, msg) in ui_logger::drain() {
+            match level {
+                log::Level::Error => self.log_panel.error(msg),
+                log::Level::Warn => self.log_panel.warn(msg),
+                _ => self.log_panel.info(msg),
+            }
         }
 
         // Drain bulk-convert worker logs into the panel and clear when done.
@@ -362,11 +609,55 @@ impl eframe::App for RustyBackupApp {
                         }
                     }
 
-                    if ui.button("Refresh Devices").clicked() {
-                        self.devices = device::enumerate_devices();
-                        self.log_panel
-                            .info(format!("Refreshed: {} device(s) found", self.devices.len()));
-                        ui.ctx().request_repaint();
+                    // Windows: physical-device access needs admin, and the GUI
+                    // launches un-elevated (asInvoker). When not elevated, the
+                    // single global gate is this shielded "Show Physical
+                    // Devices" button, which relaunches the whole process via
+                    // UAC; the elevated instance auto-enumerates on startup.
+                    // Once elevated, it becomes the normal "Refresh Devices".
+                    match self.elevation_gate() {
+                        ElevationGate::NeedsElevation => {
+                            let tint = ui.visuals().widgets.active.fg_stroke.color;
+                            let shield = self.shield_texture(ui.ctx());
+                            let icon = egui::Image::from_texture(
+                                egui::load::SizedTexture::from_handle(&shield),
+                            )
+                            .tint(tint)
+                            .max_height(14.0);
+                            let resp = ui
+                                .add(egui::Button::image_and_text(
+                                    icon,
+                                    egui::RichText::new("Show Physical Devices")
+                                        .color(egui::Color32::YELLOW),
+                                ))
+                                .on_hover_text(
+                                    "Restart with administrator privileges to access \
+                                     physical disk devices (will prompt for elevation).",
+                                );
+                            if resp.clicked() {
+                                #[cfg(windows)]
+                                {
+                                    self.log_panel
+                                        .info("Requesting administrator privileges...");
+                                    if let Err(e) = rusty_backup::os::windows::request_elevation() {
+                                        self.log_panel.error(format!(
+                                            "Elevation request failed or was cancelled: {e}"
+                                        ));
+                                    }
+                                }
+                            }
+                            ui.separator();
+                        }
+                        ElevationGate::NotApplicable | ElevationGate::Elevated => {
+                            if ui.button("Refresh Devices").clicked() {
+                                self.devices = device::enumerate_devices();
+                                self.log_panel.info(format!(
+                                    "Refreshed: {} device(s) found",
+                                    self.devices.len()
+                                ));
+                                ui.ctx().request_repaint();
+                            }
+                        }
                     }
                     ui.separator();
 
@@ -462,37 +753,38 @@ impl eframe::App for RustyBackupApp {
             }
         }
 
-        // Update notification banner (if update available and not dismissed)
-        if !self.update_dismissed {
-            if let Ok(Some(ref info)) = self.update_info.lock().map(|guard| guard.clone()) {
-                if info.is_outdated {
-                    egui::Panel::top("update_banner").show_inside(ctx, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new("Update")
-                                    .color(egui::Color32::YELLOW)
-                                    .strong(),
-                            );
-                            ui.label(format!(
-                                "available: v{} -> v{}",
-                                info.current_version, info.latest_version
-                            ));
-                            if ui.button("View Release").clicked() {
-                                let _ = webbrowser::open(&info.releases_url);
+        // Update notification banner (if update available and not dismissed).
+        // Clone the info into an owned local first so the mutex guard is dropped
+        // before the closure (which needs unique access to `self`).
+        let banner_info: Option<UpdateInfo> = if self.update_dismissed {
+            None
+        } else {
+            self.update_info.lock().ok().and_then(|g| g.clone())
+        };
+        if let Some(info) = banner_info {
+            if info.is_outdated {
+                egui::Panel::top("update_banner").show_inside(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Update")
+                                .color(egui::Color32::YELLOW)
+                                .strong(),
+                        );
+                        ui.label(format!(
+                            "available: v{} -> v{}",
+                            info.current_version, info.latest_version
+                        ));
+                        self.show_update_actions(ui, &info);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Dismiss update notification").clicked() {
+                                self.update_dismissed = true;
                             }
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui.button("Dismiss update notification").clicked() {
-                                        self.update_dismissed = true;
-                                    }
-                                },
-                            );
                         });
                     });
-                }
+                });
             }
         }
+        // (end update banner)
 
         // Elevation dialog (Linux)
         #[cfg(target_os = "linux")]

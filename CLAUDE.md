@@ -113,6 +113,12 @@ Amiga images (`.adf`, `.hdf`, `.adz`, `.hdz`, and CHD-wrapped HDFs) and the thre
 
 See `docs/amiga_support.md` for the full phased implementation plan + reference C-source pointers (`~/repos/amigasources/{ADFlib,amitools,pfs3aio,smartfilesystem}`).
 
+### BasiliskII HFV Support
+
+`.hfv` / `.HFV` files are flat, partition-less raw images of a single **classic HFS** volume (boot blocks at sector 0, MDB at byte 1024, no MBR/GPT/APM) used by the BasiliskII / SheepShaver 68k Mac emulators. They flow through the existing **superfloppy** path: `partition::detect_superfloppy` finds the MDB at offset 1024 → `PartitionTable::None { fs_hint: "HFS" }` → `open_filesystem(.., 0, 0, None)` auto-detects HFS at offset 0. So read / inspect / browse / fsck / edit / backup / restore all work with no HFV-specific code — only the file-picker extensions and a few superfloppy-HFS gating helpers (`is_superfloppy_hfs`) needed touching.
+
+The **write** side lives in `src/fs/hfv.rs`, the single source of truth for the HFV limits: **classic HFS only** (never HFS+) and **≤ 2047 MB** (the 2 GiB signed-32-bit boundary classic Mac OS won't cross). `build_blank_hfv` / `clone_into_hfv` produce a flat HFS image with **no** APM wrapper (an HFV is the bare volume). Creation is `rb-cli new --fs hfv`; conversion/resize to HFV is `rb-cli expand --to-hfv` (and the GUI "Expand HFS Volume…" dialog's "Flat HFV" output mode), which reuse the HFS clone path and skip `emit_apm_disk_with_hfs`. See `docs/basilisk_hfv.md` for the full plan + progress tracker.
+
 ### Platform-Specific Concerns
 
 Device paths differ by platform: `/dev/sdX` (Linux), `/dev/diskX` (macOS), `\\.\PhysicalDriveX` (Windows). Raw disk access requires elevated privileges. The `nix` crate handles Unix-specific operations; `windows` crate handles Windows.

@@ -71,6 +71,7 @@ fn catalog_record_cost(name_utf16_len: usize, body_bytes: usize) -> usize {
 ///   - file record + file thread per file (incl. inodes)
 ///   - hardlink-stub record + thread per file hardlink and dir hardlink
 ///   - header + map placeholder + ~5% index overhead
+///
 /// The caller multiplies by [`CATALOG_PACKING_OVERHEAD_NUM`] /
 /// [`CATALOG_PACKING_OVERHEAP_DEN`] to absorb split-induced fragmentation.
 fn estimate_catalog_bytes(snapshot: &SourceCatalogSnapshot) -> u64 {
@@ -295,10 +296,8 @@ pub fn plan_defrag_layout(
     }
     all_source_cnids.sort_unstable();
     all_source_cnids.dedup();
-    let mut next_cnid = FIRST_USER_CNID;
-    for cnid in all_source_cnids {
+    for (next_cnid, cnid) in (FIRST_USER_CNID..).zip(all_source_cnids) {
         cnid_map.insert(cnid, next_cnid);
-        next_cnid += 1;
     }
 
     // Pack user file forks contiguously starting at user_data_start.
@@ -436,15 +435,18 @@ thread_local! {
     /// stderr only as before. Avoids threading a `log_cb` through 8+
     /// signatures while still piping the per-50k-records ticks into the
     /// GUI log queue.
-    static PROGRESS_SINK: std::cell::RefCell<Option<Box<dyn FnMut(&str)>>> =
+    static PROGRESS_SINK: std::cell::RefCell<Option<ProgressSink>> =
         const { std::cell::RefCell::new(None) };
 }
+
+/// Thread-local progress callback used by [`set_progress_sink`].
+pub type ProgressSink = Box<dyn FnMut(&str)>;
 
 /// Install or clear a progress sink for the current thread. Pass `Some(cb)`
 /// to receive log lines (one per 50k catalog inserts during build, plus
 /// phase boundaries); pass `None` to suppress GUI logging and rely on
 /// stderr only. Safe to call from anywhere; the previous value is dropped.
-pub fn set_progress_sink(cb: Option<Box<dyn FnMut(&str)>>) {
+pub fn set_progress_sink(cb: Option<ProgressSink>) {
     PROGRESS_SINK.with(|cell| {
         *cell.borrow_mut() = cb;
     });
@@ -731,7 +733,7 @@ pub fn build_target_metadata(
                 queue.push_back(d.cnid);
 
                 insert_count += 2;
-                if insert_count % tick == 0 {
+                if insert_count.is_multiple_of(tick) {
                     log_progress(insert_count, "dirs", &mut last_tick);
                 }
             }
@@ -780,7 +782,7 @@ pub fn build_target_metadata(
         *child_count.entry(target_parent).or_default() += 1;
 
         insert_count += 2;
-        if insert_count % tick == 0 {
+        if insert_count.is_multiple_of(tick) {
             log_progress(insert_count, "files", &mut last_tick);
         }
     }
@@ -984,12 +986,12 @@ pub fn build_target_metadata(
 
     let mut new_finder_info = [0u32; 8];
     let known: std::collections::HashSet<u32> = plan.cnid_map.keys().copied().collect();
-    for i in 0..8 {
+    for (i, slot) in new_finder_info.iter_mut().enumerate() {
         if i == 6 || i == 7 {
             continue;
         }
         let src_val = snapshot.volume.finder_info[i];
-        new_finder_info[i] = if known.contains(&src_val) {
+        *slot = if known.contains(&src_val) {
             *plan.cnid_map.get(&src_val).unwrap()
         } else {
             src_val
@@ -1314,7 +1316,7 @@ fn zero_fill<W: Write>(writer: &mut W, n: u64) -> std::io::Result<()> {
     if n == 0 {
         return Ok(());
     }
-    const BUF: [u8; 65536] = [0u8; 65536];
+    static BUF: [u8; 65536] = [0u8; 65536];
     let mut left = n;
     while left > 0 {
         let chunk = left.min(BUF.len() as u64) as usize;
@@ -1338,7 +1340,7 @@ fn missing_cnid(kind: &str, cnid: u32) -> FilesystemError {
 /// node + one empty leaf node. The remaining nodes are free.
 fn init_btree_buffer(total_bytes: usize, max_key_len: u16, key_compare_type: u8) -> Vec<u8> {
     assert!(
-        total_bytes % NODE_SIZE == 0,
+        total_bytes.is_multiple_of(NODE_SIZE),
         "btree size must be node-aligned"
     );
     let total_nodes = (total_bytes / NODE_SIZE) as u32;
@@ -1618,7 +1620,7 @@ fn serialize_fork(fork: &ForkData, out: &mut [u8]) {
 /// surface a controlled error mirroring Step 13's inline-only
 /// limitation; landing fork-style xattr writes is a separate feature.
 fn emit_xattrs_for_cnid(
-    attr_buf: &mut Vec<u8>,
+    attr_buf: &mut [u8],
     target_cnid: u32,
     xattrs: &[XattrRecord],
     label: &str,
@@ -2039,11 +2041,11 @@ mod tests {
         assert!(names.contains(&"b.txt"), "b.txt missing: {names:?}");
     }
 
-    /// Build a source with one file inode + 3 hardlink stub rows. Plan
-    /// + build target metadata, stitch into a target image, open as
-    /// HfsPlusFilesystem, walk the catalog. All 3 stubs and the inode
-    /// row must be present; the inode's bsdInfo.special (link count)
-    /// must equal 3.
+    /// Build a source with one file inode plus 3 hardlink stub rows.
+    /// Plan and build target metadata, stitch into a target image,
+    /// open as `HfsPlusFilesystem`, walk the catalog. All 3 stubs and
+    /// the inode row must be present; the inode's `bsdInfo.special`
+    /// (link count) must equal 3.
     #[test]
     fn build_metadata_emits_file_hardlinks_with_link_count() {
         const PAYLOAD: &[u8] = b"shared\n";
@@ -2576,14 +2578,15 @@ mod tests {
     /// Step 22e — full end-to-end engine fixture. Build a synthetic HFS+
     /// source that exercises the clone-relevant features the blank
     /// builder can seed: a nested directory tree, a file with both data
-    /// + resource forks, and a file hardlink pair. Stream into a
+    /// and resource forks, and a file hardlink pair. Stream into a
     /// `Vec<u8>`, reopen as `HfsPlusFilesystem`, walk the catalog, and
-    /// verify byte-equal data forks + resource fork, preserved hardlink
-    /// topology (both link rows resolve to identical bytes), and `fsck`
-    /// clean on the target. Xattr emit is exercised separately by
-    /// `build_metadata_emits_inline_xattr` — `create_blank_hfsplus`
-    /// doesn't seed an attributes B-tree, so live `set_xattr` against
-    /// the blank source is a separate plumbing step.
+    /// verify byte-equal data forks and resource fork, preserved
+    /// hardlink topology (both link rows resolve to identical bytes),
+    /// and `fsck` clean on the target. Xattr emit is exercised
+    /// separately by `build_metadata_emits_inline_xattr` —
+    /// `create_blank_hfsplus` doesn't seed an attributes B-tree, so
+    /// live `set_xattr` against the blank source is a separate plumbing
+    /// step.
     #[test]
     fn stream_emit_round_trips_full_fixture() {
         use super::super::filesystem::ResourceForkSource;

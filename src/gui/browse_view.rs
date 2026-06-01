@@ -1,3 +1,7 @@
+// Browse-view filesystem-open helpers thread filesystem type, partition
+// info, reader, ctx, logging, etc. — multi-arg by design.
+#![allow(clippy::too_many_arguments)]
+
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -158,6 +162,11 @@ pub struct BrowseView {
     /// the UI for the seconds a 500k-file HFS+ open can take.
     pending_open: Option<Arc<Mutex<BrowseOpenStatus>>>,
 
+    /// Whether the container requires a password (detected on open failure).
+    needs_password: bool,
+    /// User's password input text for the password prompt.
+    password_input: String,
+
     /// One open `Filesystem` instance reused across read-only operations
     /// (directory listings, file previews, fsck, tree dumps). Re-opening for
     /// every operation forces a re-read of the entire catalog — fine for
@@ -307,6 +316,8 @@ impl Default for BrowseView {
             chd_flatten_progress: None,
             single_file_chd_backup_folder: None,
             pending_open: None,
+            needs_password: false,
+            password_input: String::new(),
             cached_fs: None,
             pending_tree: None,
         }
@@ -511,6 +522,8 @@ impl BrowseView {
         // Detach any in-flight open worker. The thread keeps running but its
         // result will be dropped when the Arc dies on completion.
         self.pending_open = None;
+        self.needs_password = false;
+        self.password_input.clear();
         self.cached_fs = None;
         // Clean up archive temp file if present
         if let Some(temp) = self.archive_temp_path.take() {
@@ -586,6 +599,31 @@ impl BrowseView {
 
         // Poll extraction progress
         self.poll_extraction(ui);
+
+        // Password prompt for encrypted containers (e.g. IMZ with ZipCrypto).
+        if self.needs_password {
+            ui.vertical_centered(|ui| {
+                ui.add_space(20.0);
+                ui.label("This image is password-protected.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label("Password:");
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.password_input)
+                            .password(true)
+                            .desired_width(200.0),
+                    );
+                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if ui.button("Unlock").clicked() || enter {
+                        self.session.password = Some(self.password_input.clone());
+                        self.needs_password = false;
+                        self.error = None;
+                        self.pending_open = Some(self.session.spawn_open());
+                    }
+                });
+            });
+            return;
+        }
 
         // Handle drag-and-drop from host OS
         self.handle_dropped_files(ui);
@@ -840,7 +878,7 @@ impl BrowseView {
 
         // Two-panel layout: tree | content
         let available = ui.available_size();
-        let tree_width = (available.x * 0.4).max(200.0).min(400.0);
+        let tree_width = (available.x * 0.4).clamp(200.0, 400.0);
         let panel_height = available.y;
 
         ui.horizontal(|ui| {
@@ -1512,6 +1550,7 @@ impl BrowseView {
             total_bytes: 0,
             current_file: String::new(),
             files_extracted: 0,
+            files_skipped: 0,
             total_files: 0,
             finished: false,
             error: None,
@@ -3604,7 +3643,10 @@ impl BrowseView {
                         }
                         self.root = Some(root);
                     }
-                    if let Some(err) = g.error.take() {
+                    if g.needs_password {
+                        self.needs_password = true;
+                        self.error = None;
+                    } else if let Some(err) = g.error.take() {
                         self.error = Some(err);
                     }
                     // Hand the live filesystem into the read cache so we
@@ -3652,6 +3694,12 @@ impl BrowseView {
                 if p.finished {
                     Some(if let Some(ref err) = p.error {
                         format!("Extraction failed: {err}")
+                    } else if p.files_skipped > 0 {
+                        format!(
+                            "Extraction complete: {} files extracted, {} skipped \
+                             (see log for details).",
+                            p.files_extracted, p.files_skipped
+                        )
                     } else {
                         format!(
                             "Extraction complete: {} files extracted.",
@@ -3737,6 +3785,12 @@ fn count_entry(
         }
         EntryType::Special => Ok((0, 0)),
     }
+}
+
+/// True when the error is the sentinel raised on user cancellation. Such an
+/// error must abort the whole extraction rather than being skipped per-file.
+fn is_cancellation(e: &(dyn std::error::Error + Send + Sync)) -> bool {
+    e.to_string() == "Extraction cancelled"
 }
 
 /// Recursively extract an entry to the destination path.
@@ -3854,6 +3908,11 @@ fn extract_entry(
                     }
 
                     if has_rsrc || has_finfo {
+                        // Per-mode `has_rsrc` gates are explicit on purpose:
+                        // the Native + SeparateRsrc paths only emit when a
+                        // resource fork is present, while AppleDouble always
+                        // emits (it carries Finder Info too).
+                        #[allow(clippy::collapsible_match)]
                         match resource_fork_mode {
                             ResourceForkMode::Native => {
                                 if has_rsrc {
@@ -3902,7 +3961,7 @@ fn extract_entry(
 
             let children = fs.list_directory(entry)?;
             for child in &children {
-                extract_entry(
+                match extract_entry(
                     fs,
                     child,
                     &dir_path,
@@ -3911,7 +3970,21 @@ fn extract_entry(
                     is_prodos,
                     prodos_export_mode,
                     progress,
-                )?;
+                ) {
+                    Ok(()) => {}
+                    // Cancellation must stop the whole run; propagate it.
+                    Err(e) if is_cancellation(&*e) => return Err(e),
+                    // Any other per-entry failure (e.g. an NTFS metafile with
+                    // no $DATA attribute, an unreadable file, or a host I/O
+                    // error) is logged and counted as skipped so extraction
+                    // continues with the remaining entries.
+                    Err(e) => {
+                        log::warn!("Skipped {}: {e}", child.path);
+                        if let Ok(mut p) = progress.lock() {
+                            p.files_skipped += 1;
+                        }
+                    }
+                }
             }
         }
         EntryType::Symlink => {

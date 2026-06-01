@@ -13,7 +13,9 @@ use std::fs::File;
 use std::io::{Read, Seek};
 
 use crate::cli::io::{open_image_ro, open_image_rw};
+use crate::model::source_reader;
 use crate::partition::{PartitionInfo, PartitionTable};
+use crate::rbformats::BoxReadSeek;
 
 /// Resolved partition context — what to pass to
 /// [`crate::fs::open_filesystem`] / [`crate::fs::open_editable_filesystem`].
@@ -65,6 +67,38 @@ pub fn resolve_partition_rw(
     let mut file = open_image_rw(path)?;
     let ctx = resolve(&mut file, selector)?;
     Ok((file, ctx))
+}
+
+/// Like [`resolve_partition_ro`] but returns a boxed `Read + Seek`,
+/// transparently routing GHO / IMZ / CHD containers through their
+/// streaming readers so the caller sees a raw disk image.
+pub fn resolve_partition_streaming(
+    path: &std::path::Path,
+    selector: Option<u32>,
+) -> Result<(BoxReadSeek, PartitionContext)> {
+    resolve_partition_streaming_with_password(path, selector, None)
+}
+
+/// Variant of [`resolve_partition_streaming`] that accepts an optional
+/// password for encrypted IMZ files. Pass `None` to behave like
+/// [`resolve_partition_streaming`].
+pub fn resolve_partition_streaming_with_password(
+    path: &std::path::Path,
+    selector: Option<u32>,
+    password: Option<&[u8]>,
+) -> Result<(BoxReadSeek, PartitionContext)> {
+    let is_streaming = source_reader::is_gho_path(path)
+        || source_reader::is_imz_path(path)
+        || source_reader::is_chd_path(path);
+    if is_streaming {
+        let mut reader = source_reader::open_read_with_password(path, password)?;
+        let ctx = resolve(&mut reader, selector)?;
+        Ok((reader, ctx))
+    } else {
+        let mut file = open_image_ro(path)?;
+        let ctx = resolve(&mut file, selector)?;
+        Ok((Box::new(std::io::BufReader::new(file)), ctx))
+    }
 }
 
 fn resolve<R: Read + Seek>(reader: &mut R, selector: Option<u32>) -> Result<PartitionContext> {
@@ -138,8 +172,7 @@ fn pick_default_partition(partitions: &[PartitionInfo]) -> Result<PartitionInfo>
         _ => {
             let summary: Vec<String> = candidates
                 .iter()
-                .enumerate()
-                .map(|(_, p)| {
+                .map(|p| {
                     format!(
                         "  {}  {}  ({})",
                         p.index, p.type_name, p.partition_type_byte

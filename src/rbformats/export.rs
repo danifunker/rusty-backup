@@ -1,3 +1,7 @@
+// Export streamers thread reader, partition table, sizes, chunk size, log
+// callback, cancel check, and format-specific options — all required.
+#![allow(clippy::too_many_arguments)]
+
 //! Unified disk image export layer.
 //!
 //! Provides [`ExportFormat`] (VHD, Raw, 2MG) and format-agnostic export
@@ -22,6 +26,19 @@ use crate::partition::PartitionSizeOverride;
 pub enum ExportFormat {
     /// Fixed VHD (Virtual Hard Disk) — raw data + 512-byte footer.
     Vhd,
+    /// Dynamic (sparse) VHD — BAT + per-block bitmaps; all-zero blocks omitted.
+    VhdDynamic,
+    /// QCOW2 v3 — uncompressed, no snapshots/backing file. Whole-disk only
+    /// (the sparse layout wraps a whole disk geometry); GUI/CLI wiring lands
+    /// in session 2.4.
+    Qcow2,
+    /// VMDK flat (`monolithicFlat`) — emits a `<base>.vmdk` descriptor + a
+    /// sibling `<base>-flat.vmdk` raw extent. Whole-disk only.
+    VmdkFlat,
+    /// VMDK sparse (`monolithicSparse`) — single self-contained `.vmdk` with
+    /// embedded header + grain directory + grain tables; zero grains omitted.
+    /// Whole-disk only.
+    VmdkSparse,
     /// Raw disk image — no header/footer.
     Raw,
     /// 2MG (Apple II) — 64-byte header + raw data.
@@ -39,19 +56,30 @@ pub enum ExportFormat {
     /// BIN/CUE pair extracted from a CD CHD. Single-bin by default; the
     /// bulk-convert worker can request multi-bin via a separate flag.
     BinCue,
+    /// BasiliskII HFV — a flat classic-HFS volume (no partition table), built
+    /// by *cloning* the source HFS partition into a freshly-sized volume rather
+    /// than streaming bytes. Unlike every other `ExportFormat`, this is NOT a
+    /// streaming codec: the GUI/CLI intercept it and route to the HFV clone
+    /// path (`fs::hfv::clone_into_hfv` via `export_runner::start_per_partition_hfv`),
+    /// so it never reaches `write_header`/`write_footer` or the whole-disk /
+    /// per-partition streaming functions. HFS-only, per-partition only, ≤2047 MB.
+    Hfv,
 }
 
 impl ExportFormat {
     /// File extension for this format.
     pub fn extension(&self) -> &'static str {
         match self {
-            Self::Vhd => "vhd",
+            Self::Vhd | Self::VhdDynamic => "vhd",
+            Self::Qcow2 => "qcow2",
+            Self::VmdkFlat | Self::VmdkSparse => "vmdk",
             Self::Raw => "img",
             Self::TwoMg => "2mg",
             Self::Woz => "woz",
             Self::Dc42 => "dsk",
             Self::Chd | Self::ChdDvd | Self::ChdCd => "chd",
             Self::BinCue => "cue",
+            Self::Hfv => "hfv",
         }
     }
 
@@ -59,6 +87,10 @@ impl ExportFormat {
     pub fn description(&self) -> &'static str {
         match self {
             Self::Vhd => "Fixed VHD",
+            Self::VhdDynamic => "Dynamic VHD",
+            Self::Qcow2 => "QCOW2",
+            Self::VmdkFlat => "VMDK (Flat)",
+            Self::VmdkSparse => "VMDK (Sparse)",
             Self::Raw => "Raw Image",
             Self::TwoMg => "2MG (Apple II)",
             Self::Woz => "WOZ (Apple II)",
@@ -67,6 +99,7 @@ impl ExportFormat {
             Self::ChdDvd => "DVD CHD",
             Self::ChdCd => "CD CHD",
             Self::BinCue => "BIN/CUE",
+            Self::Hfv => "BasiliskII HFV",
         }
     }
 
@@ -78,13 +111,16 @@ impl ExportFormat {
     /// File dialog filter label and extensions.
     pub fn dialog_filter(&self) -> (&'static str, &'static [&'static str]) {
         match self {
-            Self::Vhd => ("VHD Files", &["vhd", "hda"]),
+            Self::Vhd | Self::VhdDynamic => ("VHD Files", &["vhd", "hda"]),
+            Self::Qcow2 => ("QCOW2 Files", &["qcow2", "qcow"]),
+            Self::VmdkFlat | Self::VmdkSparse => ("VMDK Files", &["vmdk"]),
             Self::Raw => ("Raw Images", &["img", "raw", "bin", "dd"]),
             Self::TwoMg => ("2MG Files", &["2mg"]),
             Self::Woz => ("WOZ Files", &["woz"]),
             Self::Dc42 => ("DiskCopy 4.2", &["dsk", "image", "dc42", "img"]),
             Self::Chd | Self::ChdDvd | Self::ChdCd => ("MAME CHD", &["chd"]),
             Self::BinCue => ("BIN/CUE Sheet", &["cue"]),
+            Self::Hfv => ("BasiliskII HFV", &["hfv"]),
         }
     }
 
@@ -218,6 +254,213 @@ fn read_source_to_memory(
 ///
 /// For backup folders: reconstructs the disk from MBR + partition data files.
 /// For raw images/devices: reconstructs with partition size overrides.
+/// Identify the filesystem from a volume boot record, returning a hint string
+/// suitable for `superfloppy_wrap::mbr_type_byte_for_fs`. `None` when the VBR
+/// doesn't match a known FAT/NTFS/exFAT signature (so the caller skips wrapping
+/// rather than guessing a partition type).
+fn fs_hint_from_vbr(vbr: &[u8; 512]) -> Option<&'static str> {
+    if &vbr[3..7] == b"NTFS" {
+        Some("NTFS")
+    } else if &vbr[3..8] == b"EXFAT" {
+        Some("exFAT")
+    } else if &vbr[0x52..0x57] == b"FAT32" {
+        Some("FAT32")
+    } else if &vbr[0x36..0x3B] == b"FAT16" {
+        Some("FAT16")
+    } else if &vbr[0x36..0x3B] == b"FAT12" {
+        Some("FAT12")
+    } else {
+        None
+    }
+}
+
+/// NTFS volume length in sectors (`total_sectors` at VBR offset 0x28). Returns
+/// 0 for non-NTFS VBRs (callers fall back to the decoded byte count).
+fn ntfs_total_sectors_from_vbr(vbr: &[u8; 512]) -> u64 {
+    if &vbr[3..7] == b"NTFS" {
+        u64::from_le_bytes([
+            vbr[0x28], vbr[0x29], vbr[0x2A], vbr[0x2B], vbr[0x2C], vbr[0x2D], vbr[0x2E], vbr[0x2F],
+        ])
+    } else {
+        0
+    }
+}
+
+/// Open a whole-disk source for export, returning a reader over the full
+/// logical volume plus its byte length.
+///
+/// GHO span sets and IMZ archives aren't recognized by
+/// `detect_image_format`/`wrap_image_reader` — opening `source_path` as a
+/// plain `File` would read only the first span segment's raw (still-compressed)
+/// bytes, silently truncating a spanned export. Route those through
+/// `source_reader::open_read`, which spans the segment set and presents the
+/// decoded volume. Everything else (raw images, devices, VHD/2MG/DMG/DC42/CHD
+/// containers) goes through `wrap_image_reader` as before.
+///
+/// Every format exporter (Raw, VHD dynamic, QCOW2, VMDK flat/sparse, CHD) must
+/// obtain its source through this helper so spanning works uniformly.
+fn open_source_reader(source_path: &Path) -> Result<(super::BoxReadSeek, u64)> {
+    if crate::model::source_reader::is_gho_path(source_path) {
+        // Open the GHO concretely so we can prepare a faithful whole-disk image
+        // (synthesize $Bitmap, recover $Boot's boot code) — these make the
+        // export mountable AND bootable. Only export goes through here; inspect
+        // uses source_reader::open_read and keeps its fast lazy open.
+        let mut gho = super::gho::GhoReader::open(source_path)?;
+        gho.prepare_full_image();
+        let size = gho.seek(SeekFrom::End(0))?;
+        gho.seek(SeekFrom::Start(0))?;
+        Ok((Box::new(gho), size))
+    } else if crate::model::source_reader::is_imz_path(source_path) {
+        let mut r = crate::model::source_reader::open_read(source_path)?;
+        let size = r.seek(SeekFrom::End(0))?;
+        r.seek(SeekFrom::Start(0))?;
+        Ok((r, size))
+    } else {
+        let file = File::open(source_path)
+            .with_context(|| format!("failed to open {}", source_path.display()))?;
+        let file2 = File::open(source_path)?;
+        let fmt = super::detect_image_format_with_path(file, Some(source_path))?;
+        super::wrap_image_reader(file2, fmt)
+    }
+}
+
+/// Compute the [`WrapParams`](crate::restore::superfloppy_wrap::WrapParams)
+/// needed to reassemble a bootable disk around a full-disk GHO superfloppy.
+///
+/// A whole-disk Ghost backup decodes to a *bare* filesystem volume: sector 0 is
+/// the filesystem VBR, not a partition table. The volume's original on-disk
+/// position is the only trace of the partitioning that's left, recorded in the
+/// VBR `hidden_sectors` field (offset 0x1C). When that's non-zero and the VBR is
+/// a recognised FAT/NTFS/exFAT, build params for a synthetic MBR (with boot
+/// code) that places the volume as the active first partition at its original
+/// LBA.
+///
+/// Returns `Ok(None)` when no reassembly applies — no boot signature,
+/// `hidden_sectors == 0` (e.g. a floppy-sized GHO), or an unrecognised VBR.
+///
+/// Leaves `reader` rewound to offset 0.
+pub(crate) fn gho_wrap_params(
+    reader: &mut (impl Read + Seek),
+    source_data_size: u64,
+) -> Result<Option<crate::restore::superfloppy_wrap::WrapParams>> {
+    use crate::restore::superfloppy_wrap::{self, WrapAlignment, WrapParams, WrapTable};
+
+    let mut vbr = [0u8; 512];
+    reader.seek(SeekFrom::Start(0))?;
+    let vbr_ok = reader.read_exact(&mut vbr).is_ok();
+    reader.seek(SeekFrom::Start(0))?;
+    let hidden = if vbr_ok && vbr[510] == 0x55 && vbr[511] == 0xAA {
+        u32::from_le_bytes([vbr[0x1C], vbr[0x1D], vbr[0x1E], vbr[0x1F]]) as u64
+    } else {
+        0
+    };
+    let fs_hint = match (hidden > 0, fs_hint_from_vbr(&vbr)) {
+        (true, Some(h)) => h,
+        _ => return Ok(None),
+    };
+
+    let type_byte = superfloppy_wrap::mbr_type_byte_for_fs(fs_hint);
+    // Partition must cover the decoded bytes and the volume's own declared
+    // size (NTFS total_sectors), whichever is larger. For NTFS the decoded
+    // stream already runs to total_sectors + 1 sectors (the GHO reader appends
+    // the backup boot sector past the addressable volume; see ntfs_served_size),
+    // so data_sectors is the larger term and the partition gets room for it.
+    let data_sectors = source_data_size.div_ceil(512);
+    let part_sectors = data_sectors.max(ntfs_total_sectors_from_vbr(&vbr));
+    let partition_size_bytes = part_sectors * 512;
+    let target_size_bytes = hidden * 512 + partition_size_bytes;
+    Ok(Some(WrapParams {
+        table: WrapTable::Mbr {
+            type_byte,
+            bootable: true,
+            alignment: WrapAlignment::Custom(hidden),
+        },
+        partition_size_bytes,
+        target_size_bytes,
+        source_fs_hint: fs_hint.to_string(),
+    }))
+}
+
+/// Reassemble a bootable disk around a full-disk GHO superfloppy volume into a
+/// tempfile, returning a rewound reader over that disk plus its byte length.
+///
+/// Superseded in production by [`superfloppy_wrap::WrappedSuperfloppyReader`],
+/// which streams the same disk on the fly (no tempfile). Retained as a
+/// reference oracle: the `wrapped_reader_matches_wrap_and_write` test asserts
+/// the streaming reader reproduces this writer's output byte-for-byte.
+///
+/// Returns `Ok(None)` when no reassembly applies (see [`gho_wrap_params`]).
+/// `reader` is read from offset 0 and fully consumed on the `Some` path.
+#[cfg(test)]
+pub(crate) fn reassemble_gho_bootable_disk(
+    reader: &mut (impl Read + Seek),
+    source_data_size: u64,
+    progress_cb: &mut dyn FnMut(u64),
+    cancel_check: &dyn Fn() -> bool,
+) -> Result<Option<(File, u64)>> {
+    let params = match gho_wrap_params(reader, source_data_size)? {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    let target_size_bytes = params.target_size_bytes;
+
+    log::info!(
+        "Reassembling bootable disk from GHO: {} partition, {} byte disk",
+        params.source_fs_hint,
+        target_size_bytes,
+    );
+
+    let mut tmp =
+        tempfile::tempfile().context("create tempfile for GHO bootable-disk reassembly")?;
+    let mut log = |m: &str| log::info!("{m}");
+    // `wrap_and_write` takes sized callback generics; re-wrap the dyn refs.
+    let mut prog = |b: u64| progress_cb(b);
+    let cancel = || cancel_check();
+    crate::restore::superfloppy_wrap::wrap_and_write(
+        reader,
+        source_data_size,
+        &mut tmp,
+        &params,
+        &mut prog,
+        &cancel,
+        &mut log,
+    )?;
+    tmp.seek(SeekFrom::Start(0))?;
+    Ok(Some((tmp, target_size_bytes)))
+}
+
+/// Open a whole-disk export source, reassembling a bootable disk first when the
+/// source is a full-disk GHO superfloppy (see [`reassemble_gho_bootable_disk`]).
+///
+/// Every whole-disk format exporter (Raw, VMDK flat/sparse, dynamic VHD, QCOW2,
+/// CHD) routes through this so the emitted image carries a partition table +
+/// boot code rather than a partitionless volume. Sources that don't need
+/// reassembly (everything that isn't a full-disk GHO) pass straight through
+/// [`open_source_reader`] unchanged.
+fn open_export_source(
+    source_path: &Path,
+    _progress_cb: &mut dyn FnMut(u64),
+    _cancel_check: &dyn Fn() -> bool,
+) -> Result<(super::BoxReadSeek, u64)> {
+    let (mut reader, size) = open_source_reader(source_path)?;
+    if crate::model::source_reader::is_gho_path(source_path) {
+        // Full-disk GHO: present the bootable, MBR/GPT-wrapped disk as a
+        // streaming reader rather than materializing it to a tempfile first.
+        // The format writer reads through this on its single pass, so a
+        // transforming export (VMDK, QCOW2, dynamic VHD, CHD) no longer needs
+        // ~2x the disk space (one tempfile + the output). `gho_wrap_params`
+        // leaves `reader` rewound to 0.
+        if let Some(params) = gho_wrap_params(&mut reader, size)? {
+            let wrapped = crate::restore::superfloppy_wrap::WrappedSuperfloppyReader::new(
+                reader, size, &params,
+            )?;
+            let disk_size = wrapped.disk_size();
+            return Ok((Box::new(wrapped), disk_size));
+        }
+    }
+    Ok((reader, size))
+}
+
 pub fn export_whole_disk(
     format: ExportFormat,
     source_path: &Path,
@@ -233,6 +476,58 @@ pub fn export_whole_disk(
     // all the complex reconstruction with EBR chain rebuilding etc.
     if format == ExportFormat::Vhd {
         return super::vhd::export_whole_disk_vhd(
+            source_path,
+            backup_metadata,
+            mbr_bytes,
+            partition_sizes,
+            dest_path,
+            progress_cb,
+            cancel_check,
+            log_cb,
+        );
+    }
+
+    if format == ExportFormat::VhdDynamic {
+        return export_whole_disk_vhd_dynamic(
+            source_path,
+            backup_metadata,
+            mbr_bytes,
+            partition_sizes,
+            dest_path,
+            progress_cb,
+            cancel_check,
+            log_cb,
+        );
+    }
+
+    if format == ExportFormat::Qcow2 {
+        return export_whole_disk_qcow2(
+            source_path,
+            backup_metadata,
+            mbr_bytes,
+            partition_sizes,
+            dest_path,
+            progress_cb,
+            cancel_check,
+            log_cb,
+        );
+    }
+
+    if format == ExportFormat::VmdkFlat {
+        return export_whole_disk_vmdk_flat(
+            source_path,
+            backup_metadata,
+            mbr_bytes,
+            partition_sizes,
+            dest_path,
+            progress_cb,
+            cancel_check,
+            log_cb,
+        );
+    }
+
+    if format == ExportFormat::VmdkSparse {
+        return export_whole_disk_vmdk_sparse(
             source_path,
             backup_metadata,
             mbr_bytes,
@@ -299,14 +594,8 @@ pub fn export_whole_disk(
             buf
         } else {
             // Unwrap any container (WOZ, 2MG, DMG, VHD, DiskCopy 4.2, DOS-order
-            // .do/.dsk) so we feed the encoder flat sector data.
-            let file = File::open(source_path)
-                .with_context(|| format!("failed to open {}", source_path.display()))?;
-            let (mut reader, data_size) = {
-                let file2 = File::open(source_path)?;
-                let fmt = super::detect_image_format_with_path(file, Some(source_path))?;
-                super::wrap_image_reader(file2, fmt)?
-            };
+            // .do/.dsk, GHO/IMZ) so we feed the encoder flat sector data.
+            let (mut reader, data_size) = open_source_reader(source_path)?;
             let mut buf = vec![0u8; data_size as usize];
             reader
                 .read_exact(&mut buf)
@@ -375,17 +664,54 @@ pub fn export_whole_disk(
             total_written,
         ));
     } else {
+        // Raw + full-disk GHO: reassemble the bootable disk (MBR + boot code +
+        // partition at the original LBA) straight into the destination. The Raw
+        // output IS the reassembled raw image, so wrap directly — going through
+        // `open_export_source` here would materialize the whole disk in a
+        // tempfile and then copy it to the destination, needing ~2x the space
+        // and failing on near-full volumes.
+        if format == ExportFormat::Raw && crate::model::source_reader::is_gho_path(source_path) {
+            let (mut reader, source_data_size) = open_source_reader(source_path)?;
+            if let Some(params) = gho_wrap_params(&mut reader, source_data_size)? {
+                let mut dest = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(dest_path)
+                    .with_context(|| format!("failed to create {}", dest_path.display()))?;
+                log_cb(&format!(
+                    "Reassembling bootable disk: {} partition, {} byte disk",
+                    params.source_fs_hint, params.target_size_bytes,
+                ));
+                crate::restore::superfloppy_wrap::wrap_and_write(
+                    &mut reader,
+                    source_data_size,
+                    &mut dest,
+                    &params,
+                    &mut progress_cb,
+                    &cancel_check,
+                    &mut log_cb,
+                )?;
+                log_cb(&format!(
+                    "Raw export complete: {} ({} byte bootable disk)",
+                    dest_path.display(),
+                    params.target_size_bytes,
+                ));
+                return Ok(());
+            }
+            // Not a superfloppy needing reassembly (e.g. a floppy-sized GHO with
+            // hidden_sectors == 0): fall through to the generic streaming path.
+        }
+
         // Raw image/device path.
         //
         // Unwrap any container (VHD, 2MG, DMG, DiskCopy 4.2, DOS-order .dsk, WOZ)
-        // so Raw/2MG exports always emit flat sector data — not the source's header/footer bytes.
-        let (mut reader, source_data_size) = {
-            let file = File::open(source_path)
-                .with_context(|| format!("failed to open {}", source_path.display()))?;
-            let file2 = File::open(source_path)?;
-            let fmt = super::detect_image_format_with_path(file, Some(source_path))?;
-            super::wrap_image_reader(file2, fmt)?
-        };
+        // so Raw/2MG exports always emit flat sector data — not the source's
+        // header/footer bytes. (Full-disk GHO Raw exports are handled directly
+        // above; other GHO shapes pass through bare.)
+        let (mut reader, source_data_size) =
+            open_export_source(source_path, &mut progress_cb, &cancel_check)?;
 
         // If the source has an APM partition table and the caller supplied
         // size overrides, reconstruct the disk with patched APM entries and
@@ -764,6 +1090,298 @@ fn convert_from_vhd_temp(
     Ok(())
 }
 
+/// Export a whole disk as a dynamic (sparse) VHD.
+///
+/// For backup folders the disk is first reconstructed into a tempfile (the
+/// dynamic writer needs a readable source to scan for zero blocks); for raw
+/// images/devices the source is unwrapped via `wrap_image_reader` and streamed
+/// straight through. All-zero blocks are omitted from the output.
+#[allow(clippy::too_many_arguments)]
+fn export_whole_disk_vhd_dynamic(
+    source_path: &Path,
+    backup_metadata: Option<&BackupMetadata>,
+    mbr_bytes: Option<&[u8; 512]>,
+    partition_sizes: &[PartitionSizeOverride],
+    dest_path: &Path,
+    mut progress_cb: impl FnMut(u64),
+    cancel_check: impl Fn() -> bool,
+    mut log_cb: impl FnMut(&str),
+) -> Result<()> {
+    let mut out = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dest_path)
+        .with_context(|| format!("failed to create {}", dest_path.display()))?;
+
+    let disk_size = if let Some(meta) = backup_metadata {
+        // Reconstruct the flat disk into a tempfile, then convert to dynamic VHD.
+        let mut tmp =
+            tempfile::tempfile().context("create tempfile for dynamic VHD reconstruction")?;
+        let written = reconstruct_disk_from_backup(
+            source_path,
+            meta,
+            mbr_bytes,
+            partition_sizes,
+            meta.source_size_bytes,
+            &mut tmp,
+            false,
+            false,
+            None,
+            None,
+            &mut progress_cb,
+            &cancel_check,
+            &mut log_cb,
+        )?;
+        tmp.flush()?;
+        tmp.seek(SeekFrom::Start(0))?;
+        super::vhd::export_whole_disk_vhd_dynamic(
+            &mut tmp,
+            &mut out,
+            written,
+            0,
+            &mut progress_cb,
+            &cancel_check,
+        )?;
+        written
+    } else {
+        // Raw image/device: unwrap any container, then stream.
+        let (mut reader, source_data_size) =
+            open_export_source(source_path, &mut progress_cb, &cancel_check)?;
+        super::vhd::export_whole_disk_vhd_dynamic(
+            &mut reader,
+            &mut out,
+            source_data_size,
+            0,
+            &mut progress_cb,
+            &cancel_check,
+        )?;
+        source_data_size
+    };
+
+    log_cb(&format!(
+        "Dynamic VHD export complete: {} ({} logical bytes)",
+        dest_path.display(),
+        disk_size,
+    ));
+    Ok(())
+}
+
+/// Export a whole disk as a QCOW2 v3 image.
+///
+/// Mirrors `export_whole_disk_vhd_dynamic`: backup folders are reconstructed
+/// into a tempfile first (the QCOW2 writer scans clusters for zeros and needs
+/// a `Read` source), raw images/devices stream through `wrap_image_reader`.
+/// All-zero clusters are omitted from the output, so a fresh / mostly-empty
+/// vintage disk shrinks dramatically.
+#[allow(clippy::too_many_arguments)]
+fn export_whole_disk_qcow2(
+    source_path: &Path,
+    backup_metadata: Option<&BackupMetadata>,
+    mbr_bytes: Option<&[u8; 512]>,
+    partition_sizes: &[PartitionSizeOverride],
+    dest_path: &Path,
+    mut progress_cb: impl FnMut(u64),
+    cancel_check: impl Fn() -> bool,
+    mut log_cb: impl FnMut(&str),
+) -> Result<()> {
+    let mut out = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dest_path)
+        .with_context(|| format!("failed to create {}", dest_path.display()))?;
+
+    let disk_size = if let Some(meta) = backup_metadata {
+        let mut tmp = tempfile::tempfile().context("create tempfile for QCOW2 reconstruction")?;
+        let written = reconstruct_disk_from_backup(
+            source_path,
+            meta,
+            mbr_bytes,
+            partition_sizes,
+            meta.source_size_bytes,
+            &mut tmp,
+            false,
+            false,
+            None,
+            None,
+            &mut progress_cb,
+            &cancel_check,
+            &mut log_cb,
+        )?;
+        tmp.flush()?;
+        tmp.seek(SeekFrom::Start(0))?;
+        super::qcow2::export_qcow2(
+            &mut tmp,
+            &mut out,
+            written,
+            0,
+            &mut progress_cb,
+            &cancel_check,
+        )?;
+        written
+    } else {
+        let (mut reader, source_data_size) =
+            open_export_source(source_path, &mut progress_cb, &cancel_check)?;
+        super::qcow2::export_qcow2(
+            &mut reader,
+            &mut out,
+            source_data_size,
+            0,
+            &mut progress_cb,
+            &cancel_check,
+        )?;
+        source_data_size
+    };
+
+    log_cb(&format!(
+        "QCOW2 export complete: {} ({} logical bytes)",
+        dest_path.display(),
+        disk_size,
+    ));
+    Ok(())
+}
+
+/// Export a whole disk as a `monolithicFlat` VMDK (descriptor + sibling raw
+/// `<base>-flat.vmdk`). Backup folders are reconstructed into a tempfile first
+/// (the writer just streams bytes, but reconstruction needs a `Read+Write+Seek`
+/// sink); raw images/devices stream through `wrap_image_reader`.
+#[allow(clippy::too_many_arguments)]
+fn export_whole_disk_vmdk_flat(
+    source_path: &Path,
+    backup_metadata: Option<&BackupMetadata>,
+    mbr_bytes: Option<&[u8; 512]>,
+    partition_sizes: &[PartitionSizeOverride],
+    dest_path: &Path,
+    mut progress_cb: impl FnMut(u64),
+    cancel_check: impl Fn() -> bool,
+    mut log_cb: impl FnMut(&str),
+) -> Result<()> {
+    let disk_size = if let Some(meta) = backup_metadata {
+        let mut tmp =
+            tempfile::tempfile().context("create tempfile for VMDK flat reconstruction")?;
+        let written = reconstruct_disk_from_backup(
+            source_path,
+            meta,
+            mbr_bytes,
+            partition_sizes,
+            meta.source_size_bytes,
+            &mut tmp,
+            false,
+            false,
+            None,
+            None,
+            &mut progress_cb,
+            &cancel_check,
+            &mut log_cb,
+        )?;
+        tmp.flush()?;
+        tmp.seek(SeekFrom::Start(0))?;
+        super::vmdk::export_vmdk_flat(
+            &mut tmp,
+            dest_path,
+            written,
+            &mut progress_cb,
+            &cancel_check,
+        )?;
+        written
+    } else {
+        let (mut reader, source_data_size) =
+            open_export_source(source_path, &mut progress_cb, &cancel_check)?;
+        super::vmdk::export_vmdk_flat(
+            &mut reader,
+            dest_path,
+            source_data_size,
+            &mut progress_cb,
+            &cancel_check,
+        )?;
+        source_data_size
+    };
+
+    log_cb(&format!(
+        "VMDK flat export complete: {} ({} logical bytes)",
+        dest_path.display(),
+        disk_size,
+    ));
+    Ok(())
+}
+
+/// Export a whole disk as a `monolithicSparse` VMDK (single self-contained
+/// `.vmdk` with embedded header + GD + GTs). Backup folders are reconstructed
+/// into a tempfile first (the writer needs to seek backward to backfill the
+/// GD/GT region); raw images/devices stream through `wrap_image_reader`.
+#[allow(clippy::too_many_arguments)]
+fn export_whole_disk_vmdk_sparse(
+    source_path: &Path,
+    backup_metadata: Option<&BackupMetadata>,
+    mbr_bytes: Option<&[u8; 512]>,
+    partition_sizes: &[PartitionSizeOverride],
+    dest_path: &Path,
+    mut progress_cb: impl FnMut(u64),
+    cancel_check: impl Fn() -> bool,
+    mut log_cb: impl FnMut(&str),
+) -> Result<()> {
+    let mut out = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dest_path)
+        .with_context(|| format!("failed to create {}", dest_path.display()))?;
+
+    let disk_size = if let Some(meta) = backup_metadata {
+        let mut tmp =
+            tempfile::tempfile().context("create tempfile for VMDK sparse reconstruction")?;
+        let written = reconstruct_disk_from_backup(
+            source_path,
+            meta,
+            mbr_bytes,
+            partition_sizes,
+            meta.source_size_bytes,
+            &mut tmp,
+            false,
+            false,
+            None,
+            None,
+            &mut progress_cb,
+            &cancel_check,
+            &mut log_cb,
+        )?;
+        tmp.flush()?;
+        tmp.seek(SeekFrom::Start(0))?;
+        super::vmdk_sparse::export_vmdk_sparse(
+            &mut tmp,
+            &mut out,
+            written,
+            0,
+            &mut progress_cb,
+            &cancel_check,
+        )?;
+        written
+    } else {
+        let (mut reader, source_data_size) =
+            open_export_source(source_path, &mut progress_cb, &cancel_check)?;
+        super::vmdk_sparse::export_vmdk_sparse(
+            &mut reader,
+            &mut out,
+            source_data_size,
+            0,
+            &mut progress_cb,
+            &cancel_check,
+        )?;
+        source_data_size
+    };
+
+    log_cb(&format!(
+        "VMDK sparse export complete: {} ({} logical bytes)",
+        dest_path.display(),
+        disk_size,
+    ));
+    Ok(())
+}
+
 /// Export a whole disk as a MAME CHD (HD or DVD profile) via libchdman-rs.
 ///
 /// Takes any source `wrap_image_reader` understands (raw image, VHD, 2MG, DMG,
@@ -789,11 +1407,8 @@ pub fn export_whole_disk_chd(
         bail!("CHD export from backup folders is not implemented; export to VHD/Raw first");
     }
 
-    let file = File::open(source_path)
-        .with_context(|| format!("failed to open {}", source_path.display()))?;
-    let file2 = File::open(source_path)?;
-    let fmt = super::detect_image_format_with_path(file, Some(source_path))?;
-    let (mut reader, source_data_size) = super::wrap_image_reader(file2, fmt)?;
+    let (mut reader, source_data_size) =
+        open_export_source(source_path, &mut progress_cb, &cancel_check)?;
 
     // RDB-with-resize: route through reconstruct_raw_rdb_disk first
     // (which also picks up the PFS3 defragmenting clone for shrinks),
@@ -805,8 +1420,8 @@ pub fn export_whole_disk_chd(
             // Reuse the detector but reset the reader afterwards.
             let mut probe_file = File::open(source_path)
                 .with_context(|| format!("reopen {} for RDB probe", source_path.display()))?;
-            let detected = super::detect_raw_rdb(&mut probe_file).is_some();
-            detected
+
+            super::detect_raw_rdb(&mut probe_file).is_some()
         };
 
     // compress_chd writes "<base>.chd" — strip the trailing extension from
@@ -968,6 +1583,117 @@ pub fn export_whole_disk_bincue(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal NTFS superfloppy: VBR at sector 0 with `hidden_sectors` and
+    /// `total_sectors`, the rest zero. Mirrors what a full-disk GHO decodes to.
+    fn ntfs_superfloppy(hidden_sectors: u32, total_sectors: u64, fs_bytes: u64) -> Vec<u8> {
+        let mut v = vec![0u8; fs_bytes as usize];
+        v[0] = 0xEB;
+        v[1] = 0x52;
+        v[2] = 0x90;
+        v[3..11].copy_from_slice(b"NTFS    ");
+        v[11..13].copy_from_slice(&512u16.to_le_bytes());
+        v[0x1C..0x20].copy_from_slice(&hidden_sectors.to_le_bytes());
+        v[0x28..0x30].copy_from_slice(&total_sectors.to_le_bytes());
+        v[510] = 0x55;
+        v[511] = 0xAA;
+        v
+    }
+
+    /// Regression guard for the GHO->VMDK/VHD/etc. "no files in the image" bug:
+    /// a full-disk GHO decodes to a bare NTFS superfloppy, and every whole-disk
+    /// exporter must reassemble a real MBR-partitioned disk around it (not stream
+    /// the partitionless volume). Exercises the shared helper directly.
+    #[test]
+    fn reassemble_gho_wraps_superfloppy_with_mbr() {
+        let fs_bytes = 4 * 1024 * 1024u64;
+        let total_sectors = fs_bytes / 512;
+        let src = ntfs_superfloppy(63, total_sectors, fs_bytes);
+        let mut reader = std::io::Cursor::new(src);
+
+        let (mut disk, disk_size) =
+            reassemble_gho_bootable_disk(&mut reader, fs_bytes, &mut |_| {}, &|| false)
+                .expect("reassembly should not error")
+                .expect("hidden_sectors > 0 + NTFS VBR should trigger reassembly");
+
+        // Disk = MBR + 63-sector gap + the volume.
+        assert_eq!(disk_size, 63 * 512 + fs_bytes);
+
+        let mut buf = vec![0u8; disk_size as usize];
+        disk.seek(SeekFrom::Start(0)).unwrap();
+        disk.read_exact(&mut buf).unwrap();
+
+        // MBR boot signature + a bootable NTFS (0x07) partition at LBA 63.
+        assert_eq!(&buf[510..512], &[0x55, 0xAA], "MBR signature present");
+        let entry = &buf[446..462];
+        assert_eq!(entry[0], 0x80, "partition marked bootable");
+        assert_eq!(entry[4], 0x07, "NTFS partition type");
+        assert_eq!(
+            u32::from_le_bytes(entry[8..12].try_into().unwrap()),
+            63,
+            "partition starts at the original LBA"
+        );
+
+        // The volume's VBR sits at LBA 63 with hidden_sectors patched to match.
+        let off = 63 * 512;
+        assert_eq!(&buf[off + 3..off + 11], b"NTFS    ", "VBR copied to LBA 63");
+        assert_eq!(
+            u32::from_le_bytes(buf[off + 0x1C..off + 0x20].try_into().unwrap()),
+            63,
+            "hidden_sectors patched so the volume still mounts"
+        );
+    }
+
+    /// When the NTFS VBR's `total_sectors` exceeds the bytes the GHO actually
+    /// decoded, the partition (and disk) must be sized to the *declared* volume
+    /// and the shortfall zero-padded — never truncated. This is the
+    /// danilaptopghost.img failure: a too-small image whose partition table
+    /// over-promised, so nothing would mount.
+    #[test]
+    fn reassemble_gho_pads_tail_when_ntfs_claims_more_than_decoded() {
+        // Volume declares 200 sectors but the GHO only decoded 120 sectors.
+        let declared_sectors = 200u64;
+        let decoded_bytes = 120 * 512u64;
+        let src = ntfs_superfloppy(63, declared_sectors, decoded_bytes);
+        let mut reader = std::io::Cursor::new(src);
+
+        let (mut disk, disk_size) =
+            reassemble_gho_bootable_disk(&mut reader, decoded_bytes, &mut |_| {}, &|| false)
+                .unwrap()
+                .expect("should reassemble");
+
+        // Disk = 63-sector prefix + the *declared* 200-sector partition.
+        assert_eq!(disk_size, (63 + declared_sectors) * 512);
+
+        let mut buf = vec![0u8; disk_size as usize];
+        disk.seek(SeekFrom::Start(0)).unwrap();
+        disk.read_exact(&mut buf).unwrap();
+
+        // MBR partition sector count reflects the declared volume size.
+        assert_eq!(
+            u32::from_le_bytes(buf[446 + 12..446 + 16].try_into().unwrap()) as u64,
+            declared_sectors,
+        );
+        // The bytes past the decoded data, out to the declared end, are zeros
+        // (the tail that was missing from the truncated export).
+        let tail_start = (63 + 120) * 512;
+        assert!(
+            buf[tail_start as usize..].iter().all(|&b| b == 0),
+            "partition tail must be zero-padded, not truncated"
+        );
+    }
+
+    /// A floppy-sized GHO (no partition table, hidden_sectors == 0) must NOT be
+    /// wrapped — the exporter uses the bare volume as-is.
+    #[test]
+    fn reassemble_gho_passes_through_when_no_hidden_sectors() {
+        let fs_bytes = 1024 * 1024u64;
+        let src = ntfs_superfloppy(0, fs_bytes / 512, fs_bytes);
+        let mut reader = std::io::Cursor::new(src);
+        let result =
+            reassemble_gho_bootable_disk(&mut reader, fs_bytes, &mut |_| {}, &|| false).unwrap();
+        assert!(result.is_none(), "no reassembly without hidden_sectors");
+    }
 
     #[test]
     fn test_export_format_extension() {

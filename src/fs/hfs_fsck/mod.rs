@@ -704,6 +704,7 @@ mod tests {
     /// Build a minimal catalog B-tree containing a root dir (CNID 2) with
     /// its thread, plus one file record with configurable fields.
     /// Returns (catalog_data, file_cnid).
+    #[allow(clippy::too_many_arguments)] // test helper composes a fixture record with many tunable fields
     fn make_btree_with_file(
         file_cnid: u32,
         data_logical: u32,
@@ -1720,7 +1721,7 @@ mod tests {
         data[r0 + 6] = name_0.len() as u8;
         data[r0 + 7..r0 + 7 + name_0.len()].copy_from_slice(name_0);
         let mut key_total_0 = 1 + key_len_0;
-        if key_total_0 % 2 != 0 {
+        if !key_total_0.is_multiple_of(2) {
             key_total_0 += 1; // even alignment
         }
         let data_off_0 = r0 + key_total_0;
@@ -1737,7 +1738,7 @@ mod tests {
         data[r1 + 6] = name_1.len() as u8;
         data[r1 + 7..r1 + 7 + name_1.len()].copy_from_slice(name_1);
         let mut key_total_1 = 1 + key_len_1;
-        if key_total_1 % 2 != 0 {
+        if !key_total_1.is_multiple_of(2) {
             key_total_1 += 1;
         }
         let data_off_1 = r1 + key_total_1;

@@ -30,33 +30,44 @@ pub struct InspectArgs {
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text, global = false)]
     pub format: OutputFormat,
+
+    /// Password for encrypted containers (currently: WinImage IMZ).
+    #[arg(long)]
+    pub password: Option<String>,
 }
 
 pub fn run(args: InspectArgs) -> Result<()> {
     require_non_flat(args.format, "inspect")?;
-    let mut file = crate::cli::io::open_image_ro(&args.image)?;
-    let pt = PartitionTable::detect(&mut file)?;
+    let pw_bytes = args.password.as_deref().map(|s| s.as_bytes());
+    let mut reader = crate::model::source_reader::open_read_with_password(&args.image, pw_bytes)?;
+    let pt = PartitionTable::detect(&mut reader)?;
     let partitions = pt.partitions();
-    let chd_report = if args
+    let ext = args
         .image
         .extension()
         .and_then(|s| s.to_str())
-        .map(|s| s.eq_ignore_ascii_case("chd"))
-        .unwrap_or(false)
-    {
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let chd_report = if ext == "chd" {
         Some(crate::rbformats::chd::format_chd_info(&args.image)?)
     } else {
         None
     };
+    let gho_report = if ext == "gho" || ext == "ghs" {
+        crate::rbformats::gho::format_gho_info(&args.image).ok()
+    } else {
+        None
+    };
 
+    let extra_report = chd_report.or(gho_report);
     match args.format {
-        OutputFormat::Text => emit_text(&args.image, &pt, &partitions, chd_report.as_deref()),
+        OutputFormat::Text => emit_text(&args.image, &pt, &partitions, extra_report.as_deref()),
         OutputFormat::Json | OutputFormat::Yaml => emit_structured(
             args.format,
             &args.image,
             &pt,
             &partitions,
-            chd_report.as_deref(),
+            extra_report.as_deref(),
         ),
         _ => unreachable!(),
     }
@@ -72,7 +83,6 @@ fn emit_text(
     out_stdout(format!("Partition table: {}", pt.type_name()));
     if let Some(report) = chd_report {
         out_stdout("");
-        out_stdout("CHD info:");
         for line in report.lines() {
             out_stdout(format!("  {line}"));
         }

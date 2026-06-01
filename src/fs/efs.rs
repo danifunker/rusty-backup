@@ -2362,7 +2362,7 @@ mod tests {
         // later slices will derive the effective location when 0.
         if sb.bmblock != 0 {
             assert!(
-                (sb.bmblock as u32) < sb.fs_size,
+                sb.bmblock < sb.fs_size,
                 "bmblock {} not inside volume of {} blocks",
                 sb.bmblock,
                 sb.fs_size
@@ -3377,7 +3377,7 @@ mod tests {
 
         // Re-read primary by opening again from the now-mutated buffer.
         let bytes = fs.reader.into_inner();
-        let mut fs2 = EfsFilesystem::open(Cursor::new(bytes.clone()), 0).expect("reopen");
+        let fs2 = EfsFilesystem::open(Cursor::new(bytes.clone()), 0).expect("reopen");
         assert_eq!(fs2.sb.tfree, 0xDEAD_BEEF);
 
         // Replica must also carry the new tfree.

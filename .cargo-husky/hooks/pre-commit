@@ -1,3 +1,40 @@
 #!/bin/sh
+#
+# Rusty Backup pre-commit hook (managed via cargo-husky `user-hooks`).
+# Edit THIS file, not .git/hooks/pre-commit — cargo-husky regenerates the
+# installed copy from here on the next `cargo build` / `cargo test`.
+#
+# Runs the general Rust cleanup tasks before each commit:
+#   1. cargo fmt    — auto-format and re-stage (always; cheap)
+#   2. cargo check  — type-check the whole workspace
+#   3. cargo clippy — lint with warnings denied
+#
+# Steps 2 & 3 only run when the commit touches Rust sources or Cargo
+# manifests, so docs-only commits stay fast. Any failure aborts the commit.
+
+set -e
+
+# --- 1. Format and re-stage ------------------------------------------------
+echo "pre-commit: cargo fmt --all"
 cargo fmt --all
 git add -u
+
+# --- Skip heavy checks for non-Rust commits --------------------------------
+# Look at what's actually staged (after the fmt re-stage above).
+staged_rust=$(git diff --cached --name-only --diff-filter=ACMR \
+  | grep -E '\.rs$|(^|/)Cargo\.(toml|lock)$' || true)
+
+if [ -z "$staged_rust" ]; then
+  echo "pre-commit: no Rust/Cargo changes staged; skipping check & clippy"
+  exit 0
+fi
+
+# --- 2. Type-check ---------------------------------------------------------
+echo "pre-commit: cargo check --all-targets"
+cargo check --all-targets
+
+# --- 3. Lint (warnings denied) ---------------------------------------------
+echo "pre-commit: cargo clippy --all-targets -- -D warnings"
+cargo clippy --all-targets -- -D warnings
+
+echo "pre-commit: all checks passed"

@@ -198,6 +198,17 @@ pub struct HfsExtDescriptor {
     pub block_count: u16,
 }
 
+/// Result of [`HfsFilesystem::locate_file_by_cnid`]. `offset_in_image` is
+/// absolute within the underlying image file, so scripts patching
+/// disk-byte offsets into boot blocks or supervisor payloads can use it
+/// directly without re-adding any partition base.
+#[derive(Debug, Clone, Copy)]
+pub struct HfsFileLocation {
+    pub offset_in_image: u64,
+    pub length: u64,
+    pub fragmented: bool,
+}
+
 /// Lightweight, public snapshot of an HFS volume's headline numbers.
 /// Returned by [`HfsFilesystem::volume_summary`] so GUI code outside the
 /// library crate can populate display fields without touching pub(crate)
@@ -1045,6 +1056,36 @@ impl<R: Read + Seek> HfsFilesystem<R> {
     #[allow(dead_code)]
     pub(crate) fn partition_offset(&self) -> u64 {
         self.partition_offset
+    }
+
+    /// Locate a file's data fork on disk by its catalog CNID. Returns the
+    /// byte offset of the first extent **within the containing image file**
+    /// (i.e. `partition_offset + first_alloc_block*512 + start_block*block_size`),
+    /// the data-fork length, and a flag set when the fork is split across
+    /// more than one extent — in which case callers that need every byte
+    /// must walk all extents themselves; the offset returned points at the
+    /// first one only.
+    ///
+    /// Resource forks are ignored. Returns `None` if the CNID is not a
+    /// file in the catalog, or the file has zero data-fork extents
+    /// allocated (e.g. an empty file).
+    pub fn locate_file_by_cnid(&self, cnid: u32) -> Option<HfsFileLocation> {
+        let (data_size, data_extents, _rsrc_size, _rsrc_extents) = self.find_file_by_id(cnid)?;
+        let first = data_extents.first().copied()?;
+        if first.block_count == 0 {
+            return None;
+        }
+        let fragmented = data_extents.iter().skip(1).any(|e| e.block_count != 0);
+        // alloc_block_offset returns the byte offset of `block` *within the
+        // partition*; we add partition_offset so the caller (and any script
+        // grepping the image file) gets an absolute file-byte offset.
+        let offset_in_image =
+            self.partition_offset + self.alloc_block_offset(first.start_block as u32);
+        Some(HfsFileLocation {
+            offset_in_image,
+            length: data_size as u64,
+            fragmented,
+        })
     }
 
     /// Read the 1024-byte boot block region (sectors 0..1 of the partition).
@@ -2282,6 +2323,38 @@ pub fn default_btree_sizes(target_volume_bytes: u64, block_size: u32) -> (u32, u
     )
 }
 
+/// Choose catalog + extents-overflow B-tree sizes (in bytes) for a freshly
+/// built HFS **clone target** of `target_size` at `block_size`, given the
+/// source volume's B-tree sizes.
+///
+/// Returns the *larger* of the source-derived estimate (1.5× the source
+/// catalog, 1× the source extents) and the volume-scaled blank-format default
+/// ([`default_btree_sizes`]), clamped to [`HFS_MAX_BTREE_FILE_SIZE`].
+///
+/// Using the blank default as a floor is the important part: a densely-packed
+/// source catalog reports a small byte size, but the target re-inserts every
+/// record through the byte-based leaf split, which can pack *less* densely and
+/// need more nodes than the source used. A catalog pre-sized to only 1.5× the
+/// source then runs out of nodes mid-clone ("no free B-tree nodes"), because
+/// the B-tree file can't grow. Flooring at the same size a blank volume of
+/// `target_size` would get (≈0.5 % of the volume) gives ample headroom while
+/// staying well under the 16 MiB ceiling for any classic-HFS-sized volume.
+pub fn clone_target_btree_sizes(
+    target_size: u64,
+    block_size: u32,
+    source_catalog: u32,
+    source_extents: u32,
+) -> (u32, u32) {
+    let (default_cat, default_ext) = default_btree_sizes(target_size, block_size);
+    let catalog = source_catalog
+        .saturating_mul(3)
+        .saturating_div(2)
+        .max(default_cat)
+        .min(HFS_MAX_BTREE_FILE_SIZE);
+    let extents = source_extents.max(default_ext).min(HFS_MAX_BTREE_FILE_SIZE);
+    (catalog, extents)
+}
+
 /// Variant of [`create_blank_hfs`] that lets the caller request minimum
 /// extents-overflow and catalog B-tree sizes (in bytes). Each is rounded up
 /// to a whole allocation block; values smaller than the 4-block default are
@@ -2558,7 +2631,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
             }
         }
 
-        entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        entries.sort_by_key(|a| a.name.to_lowercase());
         Ok(entries)
     }
 
@@ -3714,6 +3787,7 @@ pub fn validate_hfs_integrity(
 }
 
 #[cfg(test)]
+#[allow(clippy::identity_op)] // `1 * 1024 * 1024` reads as "1 MB" in size tables
 mod tests {
     use super::*;
     use std::io::Cursor;
@@ -4281,118 +4355,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // manual test — requires real HFS image
-    fn test_fsck_real_hfs_image() {
-        let path = std::path::Path::new(&std::env::var("HOME").unwrap())
-            .join("Documents/HD20_512 20MB Mac II Data-FullyWorking.hda");
-        if !path.exists() {
-            eprintln!("Skipping: {:?} not found", path);
-            return;
-        }
-        let file = std::fs::File::open(&path).unwrap();
-        // APM disk: partition 3 (Apple_HFS) starts at sector 0x60 = 96
-        let partition_offset = 96 * 512;
-        let mut fs = HfsFilesystem::open(file, partition_offset).unwrap();
-        let result = fs.fsck().unwrap();
-
-        eprintln!("=== ERRORS ({}) ===", result.errors.len());
-        for e in &result.errors {
-            eprintln!("  [{}] {}", e.code, e.message);
-        }
-        eprintln!("=== WARNINGS ({}) ===", result.warnings.len());
-        for w in &result.warnings {
-            eprintln!("  [{}] {}", w.code, w.message);
-        }
-        eprintln!(
-            "=== STATS: {} files, {} dirs ===",
-            result.stats.files_checked, result.stats.directories_checked
-        );
-        assert!(
-            result.is_clean(),
-            "known-good image should be clean ({} errors, {} warnings)",
-            result.errors.len(),
-            result.warnings.len()
-        );
-    }
-
-    #[test]
-    #[ignore] // manual test — requires real HFS image
-    fn test_fsck_pm6100_compare() {
-        let paths = [
-            (
-                "/Volumes/Software/VintageSystemBackups/HD40_imagedPowerMac6100.hda",
-                "ORIGINAL",
-            ),
-            (
-                "/Volumes/Software/VintageSystemBackups/DiskWarriorFixed/HD50_pm6100 hdd.hda",
-                "DISKWARRIOR FIXED",
-            ),
-        ];
-
-        for (path, label) in &paths {
-            let p = std::path::Path::new(path);
-            if !p.exists() {
-                eprintln!("Skipping {}: not found", path);
-                continue;
-            }
-            eprintln!("\n========== {} ==========", label);
-            eprintln!("File: {}", path);
-
-            let file = std::fs::File::open(p).unwrap();
-            let mut reader = std::io::BufReader::new(file);
-
-            // Find Apple_HFS partition in APM
-            let mut hfs_offset = 0u64;
-            for i in 1..64u64 {
-                use std::io::{Read, Seek};
-                reader.seek(SeekFrom::Start(i * 512)).unwrap();
-                let mut buf = [0u8; 512];
-                if reader.read_exact(&mut buf).is_err() {
-                    break;
-                }
-                if buf[0] != 0x50 || buf[1] != 0x4D {
-                    break;
-                }
-                let start = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
-                let count = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
-                let tstr: String = buf[48..80]
-                    .iter()
-                    .take_while(|&&b| b != 0)
-                    .map(|&b| b as char)
-                    .collect();
-                eprintln!(
-                    "  Part {}: {:32} start={:>8} blocks={:>8}",
-                    i, tstr, start, count
-                );
-                if tstr == "Apple_HFS" && hfs_offset == 0 {
-                    hfs_offset = start as u64 * 512;
-                }
-            }
-            eprintln!("  -> HFS partition at offset {}", hfs_offset);
-
-            let file2 = std::fs::File::open(p).unwrap();
-            let mut fs = HfsFilesystem::open(file2, hfs_offset).unwrap();
-            let result = fs.fsck().unwrap();
-
-            eprintln!("=== ERRORS ({}) ===", result.errors.len());
-            for e in &result.errors {
-                eprintln!("  [{}] {}", e.code, e.message);
-            }
-            eprintln!("=== WARNINGS ({}) ===", result.warnings.len());
-            for w in &result.warnings {
-                eprintln!("  [{}] {}", w.code, w.message);
-            }
-            eprintln!(
-                "=== STATS: {} files, {} dirs ===",
-                result.stats.files_checked, result.stats.directories_checked
-            );
-            for (k, v) in &result.stats.extra {
-                eprintln!("  {} = {}", k, v);
-            }
-        }
-    }
-
-    #[test]
     fn test_fsck_clean_fresh_image() {
         let img = make_editable_hfs_image();
         let cursor = Cursor::new(img);
@@ -4705,7 +4667,12 @@ mod tests {
     /// A 2 GB - 1 byte volume at 32 KiB block size sits right under the
     /// u16 block-count ceiling (65535 blocks). Verify the builder accepts
     /// it and produces a fsck-clean image.
+    ///
+    /// Gated to 64-bit: create_blank_hfs materializes the whole ~2 GiB image
+    /// as a Vec, which a 32-bit address space can't allocate (this was the
+    /// "memory allocation of 2147461632 bytes failed" abort on the i686 CI leg).
     #[test]
+    #[cfg(target_pointer_width = "64")]
     fn test_create_blank_hfs_near_2gb() {
         let total = 2u64 * 1024 * 1024 * 1024 - 1;
         let img = create_blank_hfs(total, 32768, "Near2GB")
@@ -5191,6 +5158,40 @@ mod tests {
             "fsck errors on default-sized volume: {:?}",
             result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn test_clone_target_btree_sizes_floors_at_blank_default() {
+        // Regression: a densely-packed source catalog reports a small byte size
+        // (here 2 MiB), but 1.5x that (3 MiB) undersized a 2046 MiB expand/HFV
+        // target and exhausted it mid-clone ("no free B-tree nodes"). The clone
+        // target must floor at the blank-format default for its own size.
+        let target = 2046 * 1024 * 1024;
+        let (default_cat, _) = default_btree_sizes(target, 32768);
+        let (cat, _ext) = clone_target_btree_sizes(target, 32768, 2 * 1024 * 1024, 1024 * 1024);
+        assert_eq!(
+            cat, default_cat,
+            "large target must floor catalog at the blank default, not 1.5x source"
+        );
+        assert!(
+            cat > 2 * 1024 * 1024 * 3 / 2,
+            "floor must exceed 1.5x source"
+        );
+
+        // When 1.5x source exceeds the volume default (small target, big
+        // source catalog), the source-derived value wins.
+        let small_target = 40 * 1024 * 1024;
+        let (cat2, _) = clone_target_btree_sizes(small_target, 4096, 4 * 1024 * 1024, 256 * 1024);
+        assert_eq!(
+            cat2,
+            4 * 1024 * 1024 * 3 / 2,
+            "source-derived value should win"
+        );
+
+        // Never exceeds the HFS B-tree file ceiling.
+        let (cat3, ext3) = clone_target_btree_sizes(target, 32768, u32::MAX, u32::MAX);
+        assert!(cat3 <= HFS_MAX_BTREE_FILE_SIZE);
+        assert!(ext3 <= HFS_MAX_BTREE_FILE_SIZE);
     }
 
     #[test]

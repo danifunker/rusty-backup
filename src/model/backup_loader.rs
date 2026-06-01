@@ -22,6 +22,7 @@ use crate::partition::{self, detect_alignment, PartitionAlignment, PartitionInfo
 
 /// What `load_backup` produced — either a native rusty-backup folder or a
 /// detected Clonezilla image.
+#[allow(clippy::large_enum_variant)] // load happens once per open; outcomes are short-lived
 pub enum LoadOutcome {
     Backup(BackupLoadOutcome),
     Clonezilla(ClonezillaLoadOutcome),
@@ -352,9 +353,8 @@ pub fn infer_fat_type_byte(name: &str) -> u8 {
         0x01
     } else if lower.contains("fat") {
         0x0C
-    } else if lower.contains("ntfs") {
-        0x07
-    } else if lower.contains("exfat") {
+    } else if lower.contains("ntfs") || lower.contains("exfat") {
+        // Both NTFS and exFAT share MBR type 0x07.
         0x07
     } else if lower.contains("linux") || lower.contains("ext") {
         0x83

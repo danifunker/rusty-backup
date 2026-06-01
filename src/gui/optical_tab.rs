@@ -148,11 +148,23 @@ impl OpticalTab {
         ui.add_enabled_ui(controls_enabled, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Source:");
-                ui.radio_value(
-                    &mut self.source_mode,
-                    SourceMode::PhysicalDrive,
-                    "Physical drive",
-                );
+                // Physical-drive ripping opens the drive with write access for
+                // SCSI pass-through, which needs administrator rights on Windows.
+                // Keep the option visible (so users know it exists) but gray it
+                // out until they elevate via the top-bar "Show Physical Devices"
+                // button. Image-file convert stays available unelevated.
+                let phys_enabled = super::physical_devices_available();
+                ui.add_enabled_ui(phys_enabled, |ui| {
+                    ui.radio_value(
+                        &mut self.source_mode,
+                        SourceMode::PhysicalDrive,
+                        "Physical drive",
+                    )
+                    .on_disabled_hover_text(
+                        "Click \"Show Physical Devices\" (top bar) to enable — \
+                         ripping a physical disc requires administrator rights.",
+                    );
+                });
                 ui.radio_value(&mut self.source_mode, SourceMode::ImageFile, "Image file");
             });
 
@@ -209,7 +221,7 @@ impl OpticalTab {
                             if let Some(path) = super::file_dialog()
                                 .add_filter(
                                     "Disc Images",
-                                    &["iso", "bin", "cue", "chd", "toast", "img"],
+                                    rusty_backup::model::file_types::OPTICAL_EXTS,
                                 )
                                 .add_filter("All Files", &["*"])
                                 .pick_file()

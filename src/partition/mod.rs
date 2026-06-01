@@ -637,11 +637,12 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    /// (type, start_lba, sectors, start_head, start_sec, start_cyl,
+    /// end_head, end_sec, end_cyl) — test-only MBR entry tuple.
+    type MbrChsEntry = (u8, u32, u32, u8, u8, u16, u8, u8, u16);
+
     /// Build MBR bytes with specific partition start LBAs and CHS values.
-    fn make_mbr_with_chs(
-        entries: &[(u8, u32, u32, u8, u8, u16, u8, u8, u16)],
-        // (type, start_lba, sectors, start_head, start_sec, start_cyl, end_head, end_sec, end_cyl)
-    ) -> [u8; 512] {
+    fn make_mbr_with_chs(entries: &[MbrChsEntry]) -> [u8; 512] {
         let mut data = [0u8; 512];
         data[440..444].copy_from_slice(&0x12345678u32.to_le_bytes());
 
@@ -713,8 +714,8 @@ mod tests {
         data[511] = 0xAA;
         // Simulate non-zero bootstrap code in the partition table area (bytes 446-509)
         // This is common in real floppy VBRs and should NOT prevent superfloppy detection
-        for i in 446..510 {
-            data[i] = 0xCD + (i as u8 % 17); // arbitrary non-zero boot code
+        for (i, slot) in data[446..510].iter_mut().enumerate() {
+            *slot = 0xCD + ((446 + i) as u8 % 17); // arbitrary non-zero boot code
         }
 
         let mut cursor = Cursor::new(data);
@@ -738,8 +739,8 @@ mod tests {
         data[2] = 0x90;
         data[3..11].copy_from_slice(b"NTFS    ");
         // Realistic bootstrap bytes in the would-be partition table area.
-        for i in 446..510 {
-            data[i] = 0x4E + (i as u8 % 13);
+        for (i, slot) in data[446..510].iter_mut().enumerate() {
+            *slot = 0x4E + ((446 + i) as u8 % 13);
         }
         data[510] = 0x55;
         data[511] = 0xAA;
@@ -760,8 +761,8 @@ mod tests {
         data[1] = 0x76;
         data[2] = 0x90;
         data[3..11].copy_from_slice(b"EXFAT   ");
-        for i in 446..510 {
-            data[i] = 0x4E + (i as u8 % 13);
+        for (i, slot) in data[446..510].iter_mut().enumerate() {
+            *slot = 0x4E + ((446 + i) as u8 % 13);
         }
         data[510] = 0x55;
         data[511] = 0xAA;

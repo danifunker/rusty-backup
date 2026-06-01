@@ -44,23 +44,13 @@ pub fn bitmap_clear_bit_be(data: &mut [u8], index: u32) {
 /// Find the first set (1) bit in a big-endian bitmap within `max_bits`.
 /// ProDOS uses bit=1 for FREE blocks, so this finds the first free block.
 pub fn bitmap_find_set_bit_be(data: &[u8], max_bits: u32) -> Option<u32> {
-    for bit in 0..max_bits {
-        if bitmap_test_bit_be(data, bit) {
-            return Some(bit);
-        }
-    }
-    None
+    (0..max_bits).find(|&bit| bitmap_test_bit_be(data, bit))
 }
 
 #[allow(dead_code)]
 /// Find the first clear (0) bit in a big-endian bitmap within `max_bits`.
 pub fn bitmap_find_clear_bit_be(data: &[u8], max_bits: u32) -> Option<u32> {
-    for bit in 0..max_bits {
-        if !bitmap_test_bit_be(data, bit) {
-            return Some(bit);
-        }
-    }
-    None
+    (0..max_bits).find(|&bit| !bitmap_test_bit_be(data, bit))
 }
 
 /// Collect every contiguous run of clear bits in a big-endian bitmap as
@@ -1135,6 +1125,7 @@ where
 ///
 /// `parent_chain` is the chain of (node_idx, parent_of_node_idx) from root to the
 /// index node. We need this to find the grandparent when the index node itself splits.
+#[allow(clippy::too_many_arguments)] // B-tree index insert threads tree state + cmp + parent_chain
 pub fn btree_insert_into_index<F>(
     catalog_data: &mut [u8],
     node_size: usize,
@@ -1395,6 +1386,7 @@ pub fn btree_grow_root(
 ///
 /// Also returns the parent chain for use in insertion: Vec<(node_idx, parent_idx)>.
 #[allow(dead_code)]
+#[allow(clippy::type_complexity)] // returns (find_result, parent_chain) tuples — flattening would obscure intent
 pub fn btree_find_record<K, C>(
     catalog_data: &[u8],
     header: &BTreeHeader,
@@ -1567,7 +1559,7 @@ where
 /// matches the algorithm `HfsPlusFilesystem::insert_catalog_record`
 /// has been using.
 pub fn btree_insert_full<F>(
-    data: &mut Vec<u8>,
+    data: &mut [u8],
     key_record: &[u8],
     cmp: &F,
 ) -> Result<(), super::filesystem::FilesystemError>

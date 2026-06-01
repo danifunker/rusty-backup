@@ -7,6 +7,12 @@ pub mod linux;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
+#[cfg(target_os = "windows")]
+pub mod file_assoc;
+
+#[cfg(target_os = "windows")]
+pub mod win_install;
+
 pub mod wakelock;
 
 use std::fs::{self, File};
@@ -91,7 +97,7 @@ impl<R: Read + Seek> Read for SectorAlignedReader<R> {
         // bounce buffer that would otherwise turn a single large read_exact
         // (e.g. HFS+ catalog at ~200 MB) into hundreds of thousands of
         // per-sector syscalls on `/dev/rdisk*`.
-        if self.pos % SECTOR_SIZE as u64 == 0 && out.len() >= SECTOR_SIZE {
+        if self.pos.is_multiple_of(SECTOR_SIZE as u64) && out.len() >= SECTOR_SIZE {
             let aligned_len = out.len() - (out.len() % SECTOR_SIZE);
             self.inner.seek(SeekFrom::Start(self.pos))?;
             let n = self.inner.read(&mut out[..aligned_len])?;
@@ -176,7 +182,7 @@ mod aligned_buffer {
             assert!(capacity > 0, "capacity must be non-zero");
             assert!(alignment.is_power_of_two(), "alignment must be power of 2");
             assert!(
-                capacity % alignment == 0,
+                capacity.is_multiple_of(alignment),
                 "capacity must be multiple of alignment"
             );
 
@@ -387,9 +393,13 @@ pub struct SectorAlignedWriter {
 
 #[cfg(target_os = "windows")]
 impl SectorAlignedWriter {
-    pub fn new(file: File) -> Self {
-        // For devices, metadata() typically fails so position defaults to 0.
-        let position = file.metadata().map(|m| m.len()).unwrap_or(0);
+    pub fn new(mut file: File) -> Self {
+        // `set_len()` grows a fresh image but leaves the cursor at 0; a device
+        // handle also starts at 0. Use the current cursor position, NOT the
+        // file length — metadata().len() returns the pre-sized length, which
+        // made the first write land at EOF (Windows-only restore corruption).
+        // Fall back to 0 if the handle can't report its position.
+        let position = file.stream_position().unwrap_or(0);
 
         Self {
             inner: file,
@@ -432,7 +442,7 @@ impl SectorAlignedWriter {
 
         // Ensure we're at a sector-aligned position
         // Use our tracked position instead of stream_position() which fails with FILE_FLAG_NO_BUFFERING
-        if self.position % SECTOR_SIZE as u64 != 0 {
+        if !self.position.is_multiple_of(SECTOR_SIZE as u64) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("file position {} is not sector-aligned", self.position),
@@ -864,5 +874,54 @@ pub fn request_elevation() -> Result<()> {
     #[cfg(not(target_os = "windows"))]
     {
         anyhow::bail!("elevation request not implemented on this platform")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::OpenOptions;
+    // Read/Seek/SeekFrom/Write come in via the parent module's
+    // `use std::io::{self, Read, Seek, SeekFrom, Write}` at the top of the file.
+
+    /// Regression: `SectorAlignedWriter::new` must start writing at the current
+    /// cursor (offset 0 for a fresh handle), NOT at `metadata().len()`. The
+    /// re-resize restore path pre-sizes the target with `set_len()` and then
+    /// expects the first write — the patched MBR — to land at sector 0. The
+    /// prior Windows constructor seeded `position` from the file length, so
+    /// the MBR was written at EOF and sector 0 stayed zero-filled, producing
+    /// a restored image with a zeroed partition table.
+    #[test]
+    fn sector_aligned_writer_starts_at_cursor_not_eof() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("preallocated.img");
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .expect("create");
+        // Pre-size to 1 MiB the same way the re-resize restore path does.
+        file.set_len(1 << 20).expect("set_len");
+
+        let mut writer = SectorAlignedWriter::new(file);
+
+        // Write one full sector of 0xAB starting at offset 0.
+        let payload = vec![0xABu8; SECTOR_SIZE];
+        writer.write_all(&payload).expect("write");
+        writer.flush().expect("flush");
+        drop(writer);
+
+        let mut check = OpenOptions::new().read(true).open(&path).expect("reopen");
+        check.seek(SeekFrom::Start(0)).expect("seek");
+        let mut first = vec![0u8; SECTOR_SIZE];
+        check.read_exact(&mut first).expect("read sector 0");
+        assert!(
+            first.iter().all(|&b| b == 0xAB),
+            "first sector should contain the payload, not zeros (was {:?}..)",
+            &first[..16]
+        );
     }
 }

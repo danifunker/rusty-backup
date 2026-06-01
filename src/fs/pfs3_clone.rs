@@ -231,6 +231,7 @@ where
 /// the recursion stack rather than an explicit queue for simplicity;
 /// PFS3 directory trees are wide rather than deep, so stack depth
 /// stays bounded.
+#[allow(clippy::too_many_arguments)] // recursive clone threads source/target/state/callbacks
 fn walk<RS, RT>(
     source: &mut Pfs3Filesystem<RS>,
     target: &mut Pfs3Filesystem<RT>,
@@ -349,7 +350,7 @@ where
     R: Read + Seek + Send,
     W: Write,
 {
-    if target_size % HW_SECTOR != 0 {
+    if !target_size.is_multiple_of(HW_SECTOR) {
         return Err(FilesystemError::InvalidData(format!(
             "stream_defragmented_pfs3: target_size {target_size} is not a multiple of {HW_SECTOR}"
         )));
@@ -368,10 +369,9 @@ where
     // I/O ring instead of the whole target image. The tempfile is
     // unlinked when dropped — drained into `dst` first.
     let mut tmp = tempfile::tempfile().map_err(|e| {
-        FilesystemError::Io(io::Error::new(
-            io::ErrorKind::Other,
-            format!("create tempfile for PFS3 clone: {e}"),
-        ))
+        FilesystemError::Io(io::Error::other(format!(
+            "create tempfile for PFS3 clone: {e}"
+        )))
     })?;
     tmp.write_all(&blank)?;
     drop(blank); // free the 9 GB blank-buffer for big partitions

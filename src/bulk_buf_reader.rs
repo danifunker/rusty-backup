@@ -232,8 +232,8 @@ mod tests {
         let mut r = BulkBufReader::new(make_source(8192), 1024, 4096).unwrap();
         let mut buf = [0u8; 16];
         r.read_exact(&mut buf).unwrap();
-        for i in 0..16 {
-            assert_eq!(buf[i], (i & 0xff) as u8);
+        for (i, &b) in buf.iter().enumerate() {
+            assert_eq!(b, (i & 0xff) as u8);
         }
     }
 
@@ -245,8 +245,8 @@ mod tests {
         r.seek(SeekFrom::Start(100)).unwrap();
         let mut b2 = [0u8; 8];
         r.read_exact(&mut b2).unwrap();
-        for i in 0..8 {
-            assert_eq!(b2[i], ((100 + i) & 0xff) as u8);
+        for (i, &b) in b2.iter().enumerate() {
+            assert_eq!(b, ((100 + i) & 0xff) as u8);
         }
     }
 
@@ -258,8 +258,8 @@ mod tests {
         r.seek(SeekFrom::Start(40_000)).unwrap();
         let mut b2 = [0u8; 16];
         r.read_exact(&mut b2).unwrap();
-        for i in 0..16 {
-            assert_eq!(b2[i], ((40_000 + i) & 0xff) as u8);
+        for (i, &b) in b2.iter().enumerate() {
+            assert_eq!(b, ((40_000 + i) & 0xff) as u8);
         }
     }
 

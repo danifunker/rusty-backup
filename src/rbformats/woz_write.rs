@@ -762,8 +762,7 @@ pub fn sectors_to_woz_525(sectors: &[u8]) -> anyhow::Result<Vec<u8>> {
         // Reorder ProDOS-ordered sectors into physical order for track generation.
         let mut phys = [[0u8; 256]; 16];
         let track_base = t as usize * 16 * 256;
-        for p in 0..16 {
-            let phys_idx = PRODOS_TO_PHYS_525[p];
+        for (p, &phys_idx) in PRODOS_TO_PHYS_525.iter().enumerate() {
             let src = track_base + p * 256;
             phys[phys_idx].copy_from_slice(&sectors[src..src + 256]);
         }
@@ -851,6 +850,9 @@ pub fn write_woz(path: &std::path::Path, sectors: &[u8]) -> anyhow::Result<()> {
 // ─────────────────────────────── tests ─────────────────────────────────────
 
 #[cfg(test)]
+// Test helpers fill 16-sector × 256-byte test tracks; the loop index
+// is also the (sector, byte) coordinate used for pattern generation.
+#[allow(clippy::needless_range_loop)]
 mod tests {
     use super::*;
 
@@ -995,18 +997,18 @@ mod tests {
         let sectors = [[0u8; 256]; 16];
         let (track, bit_count) = generate_track_525(DEFAULT_VOLUME_525, 0, &sectors);
         assert_eq!(bit_count, 50_464);
-        assert_eq!(track.len(), (50_464 + 7) / 8);
+        assert_eq!(track.len(), 50_464_usize.div_ceil(8));
     }
 
     fn make_pattern_sectors_35(count: usize, salt: u8) -> Vec<Option<[u8; 512]>> {
         (0..count)
             .map(|s| {
                 let mut data = [0u8; 512];
-                for b in 0..512 {
-                    data[b] = (salt
+                for (b, slot) in data.iter_mut().enumerate() {
+                    *slot = salt
                         .wrapping_add(s as u8)
                         .wrapping_mul(31)
-                        .wrapping_add(b as u8)) as u8;
+                        .wrapping_add(b as u8);
                 }
                 Some(data)
             })

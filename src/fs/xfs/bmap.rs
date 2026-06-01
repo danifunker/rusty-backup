@@ -140,6 +140,7 @@ mod tests {
         // agblklog=16 → AG mask = 0xFFFF. fsblock = (1<<16)|5 → ag=1, agbno=5.
         // byte = (1*65536 + 5) * 4096.
         let fsb = (1u64 << 16) | 5;
+        #[allow(clippy::identity_op)] // `1 * 65536` mirrors ag=1 in the comment above
         let expect = (1u64 * 65536 + 5) * 4096;
         assert_eq!(fsblock_to_partition_byte(fsb, 65536, 16, 4096), expect);
     }

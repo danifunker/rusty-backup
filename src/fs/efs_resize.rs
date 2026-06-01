@@ -269,9 +269,9 @@ pub fn grow_efs<R: Read + Write + Seek>(
 /// Find a free contiguous run inside the current volume large enough
 /// to hold the new bitmap, copy the existing bitmap forward into the
 /// staged buffer (which gets resized), mark the old bitmap blocks as
-/// free, mark the new bitmap blocks as in-use, and update sb.bmblock
-/// + sb.bmsize. Returns the updated superblock; the caller installs
-/// it via `fs.set_sb` once the rest of the grow finishes.
+/// free, mark the new bitmap blocks as in-use, and update `sb.bmblock`
+/// plus `sb.bmsize`. Returns the updated superblock; the caller
+/// installs it via `fs.set_sb` once the rest of the grow finishes.
 ///
 /// The write to the new location happens at sync_metadata time —
 /// `do_sync_metadata` calls `write_bitmap` which uses the current

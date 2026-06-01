@@ -1,3 +1,7 @@
+// PFS3 ops take many parameters by nature (partition_offset, block_size,
+// rovingPointer, bitmap state, log/cancel/progress callbacks).
+#![allow(clippy::too_many_arguments)]
+
 //! Professional File System 3 (PFS3) reader.
 //!
 //! Supports the three DosType identifiers that share the PFS3 on-disk
@@ -1089,7 +1093,7 @@ fn read_user_bitmap<R: Read + Seek>(
         return Ok(Vec::new());
     }
     let data_sectors = total_sectors - bitmap_start;
-    let total_bytes = ((data_sectors as usize) + 7) / 8;
+    let total_bytes = (data_sectors as usize).div_ceil(8);
     let mut out = vec![0u8; total_bytes];
 
     let longs_per_bmb = (fs.reserved_blksize / 4).saturating_sub(3) as usize;
@@ -1099,7 +1103,7 @@ fn read_user_bitmap<R: Read + Seek>(
     // flat bitmap. Each word covers 32 sectors.
     let sectors_per_bmb: u64 = longs_per_bmb as u64 * 32;
 
-    let mi_pointers: Vec<u32> = fs.root.bitmapindex.iter().copied().collect();
+    let mi_pointers: Vec<u32> = fs.root.bitmapindex.to_vec();
     for (mi_seq, &mi_blk) in mi_pointers.iter().enumerate() {
         if mi_blk == 0 {
             continue;
@@ -1291,7 +1295,7 @@ impl<R: Read + Seek> Pfs3Filesystem<R> {
         // up to 32 reserved blocks); for numreserved > 32 we'd need to
         // scan a second word, which is fine since the format allows it.
         let bm_off = 512 + 12;
-        for word_idx in 0..((numreserved + 31) / 32) {
+        for word_idx in 0..numreserved.div_ceil(32) {
             let o = bm_off + word_idx as usize * 4;
             if o + 4 > cluster.len() {
                 break;
@@ -1335,7 +1339,7 @@ impl<R: Read + Seek> Pfs3Filesystem<R> {
     fn free_reserved_block(&mut self, sec: u32) -> Result<(), FilesystemError> {
         if sec < self.root.first_reserved
             || sec > self.root.last_reserved
-            || (sec - self.root.first_reserved) % self.rscluster != 0
+            || !(sec - self.root.first_reserved).is_multiple_of(self.rscluster)
         {
             return Err(parse_err(format!(
                 "free_reserved_block: sec {} not aligned to a reserved cluster",
@@ -1490,8 +1494,8 @@ impl<R: Read + Seek> Pfs3Filesystem<R> {
             Some(_) => {
                 // Slot exists but is zero — allocate a new IB and
                 // record it.
-                let new_ib_sec = self.alloc_new_indexblock(indexblock_seqnr)?;
-                new_ib_sec
+
+                self.alloc_new_indexblock(indexblock_seqnr)?
             }
             None => {
                 return Err(FilesystemError::DiskFull(format!(
@@ -1587,7 +1591,7 @@ impl<R: Read + Seek> Pfs3Filesystem<R> {
         // Search across BM blocks via the rootblock.bitmapindex[] list.
         // Each MI block holds `indexperblock` BM pointers; we follow the
         // small layout convention.
-        let mi_pointers: Vec<u32> = self.root.bitmapindex.iter().copied().collect();
+        let mi_pointers: Vec<u32> = self.root.bitmapindex.to_vec();
         // Start the search at the rolling hint to avoid an O(N) walk
         // over already-allocated regions on every call. The hint
         // monotonically advances as runs are consumed and is lowered by
@@ -1599,7 +1603,7 @@ impl<R: Read + Seek> Pfs3Filesystem<R> {
         let hint_remainder_in_mi = hint_local % bits_per_mi.max(1);
         let hint_i = (hint_remainder_in_mi / sectors_per_bmb.max(1)) as usize;
         let hint_remainder_in_bm = hint_remainder_in_mi % sectors_per_bmb.max(1);
-        let hint_w = (hint_remainder_in_bm / 32) as u32;
+        let hint_w = hint_remainder_in_bm / 32;
         let hint_bit = hint_remainder_in_bm % 32;
         // Linear scan to find a run of `count` consecutive free bits.
         let mut run_start: Option<u32> = None;
@@ -2054,7 +2058,7 @@ impl<R: Read + Write + Seek + Send> Pfs3Filesystem<R> {
         let (first_sec, sectors) = if data_len == 0 {
             (0u32, 0u32)
         } else {
-            let sectors = ((data_len + HW_SECTOR - 1) / HW_SECTOR) as u32;
+            let sectors = data_len.div_ceil(HW_SECTOR) as u32;
             let first = self.alloc_data_blocks(sectors)?;
             (first, sectors)
         };
@@ -2667,9 +2671,7 @@ fn append_link_extrafield_to_direntry<R: Read + Write + Seek>(
     }
     // Zero the freshly-vacated tail region (the old start of the
     // next direntry, now duplicated at the shifted position).
-    for i in next_off..next_off + tail_bytes {
-        db[i] = 0;
-    }
+    db[next_off..next_off + tail_bytes].fill(0);
     // Pack: walking back from the flags word, write link_hi then
     // link_lo (matching the back-walker convention in parse_direntry).
     let flags_pos = next_off + tail_bytes - 2;
@@ -2911,8 +2913,7 @@ pub fn create_blank_pfs3(total_sectors: u32, name: &str) -> Result<Vec<u8>, File
     //                `alloc_new_indexblock` when an AB chain crosses
     //                an IB boundary).
     //   headroom: 16 blocks of allocator slack.
-    let approx_no_bmb =
-        ((total_sectors as u64) + sectors_per_bmb as u64 - 1) / sectors_per_bmb as u64;
+    let approx_no_bmb = (total_sectors as u64).div_ceil(sectors_per_bmb as u64);
     let est_anodes = (total_sectors as u64).div_ceil(8); // sectors / 8 = ~1 per 4 KB
     let approx_no_ab = est_anodes.div_ceil(anodesperblock as u64);
     let approx_no_ib_extra = approx_no_ab
@@ -2936,7 +2937,7 @@ pub fn create_blank_pfs3(total_sectors: u32, name: &str) -> Result<Vec<u8>, File
 
     let bitmap_start_sector = last_reserved + 1;
     let data_sectors = total_sectors - bitmap_start_sector;
-    let no_bmb = (data_sectors + sectors_per_bmb - 1) / sectors_per_bmb;
+    let no_bmb = data_sectors.div_ceil(sectors_per_bmb);
     if no_bmb > indexperblock {
         return Err(parse_err(format!(
             "PFS3 formatter: disk too large for single MI block ({} BM > {} index slots); \
@@ -3010,7 +3011,7 @@ pub fn create_blank_pfs3(total_sectors: u32, name: &str) -> Result<Vec<u8>, File
                                         // bitmap[] starts at +12: bit i (MSB-first within each u32) = reserved
                                         // block i is FREE when 1, ALLOCATED when 0 (AmigaDOS convention).
                                         // We mark blocks 0..used_rb allocated and the rest free.
-    let words = ((numreserved + 31) / 32) as usize;
+    let words = numreserved.div_ceil(32) as usize;
     for w in 0..words {
         let mut word: u32 = 0;
         for bit in 0..32u32 {
@@ -3171,7 +3172,7 @@ pub fn resize_pfs3_in_place(
     };
 
     let reserved_blksize = root.reserved_blksize as u32;
-    if reserved_blksize == 0 || reserved_blksize % 512 != 0 {
+    if reserved_blksize == 0 || !reserved_blksize.is_multiple_of(512) {
         log(&format!(
             "PFS3 resize: invalid reserved_blksize {}, skipping",
             reserved_blksize
@@ -3477,7 +3478,7 @@ fn pfs3_highest_alloc_and_free_count(
                     let is_free = (word >> (31 - i)) & 1 == 1;
                     if !is_free {
                         // Allocated.
-                        if highest.map_or(true, |h| sec as u32 > h) {
+                        if highest.is_none_or(|h| sec as u32 > h) {
                             highest = Some(sec as u32);
                         }
                     } else if sec >= new_total as u64 && sec < old_total as u64 {

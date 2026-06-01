@@ -57,6 +57,11 @@ pub enum Command {
     /// List a directory inside a filesystem.
     Ls(verbs::ls::LsArgs),
 
+    /// Print the absolute byte offset and length of a file inside an
+    /// image (HFS only today). Output is JSON so build scripts that
+    /// patch disk offsets into boot blocks can parse it with `jq`.
+    Locate(verbs::locate::LocateArgs),
+
     /// Copy a host file (or zero-fill / write boot blocks) into a filesystem.
     Put(verbs::put::PutArgs),
 
@@ -197,6 +202,7 @@ pub fn dispatch(command: Command) -> Result<()> {
     match command {
         Command::New(args) => verbs::new::run(args),
         Command::Ls(args) => verbs::ls::run(args),
+        Command::Locate(args) => verbs::locate::run(args),
         Command::Put(args) => verbs::put::run(args),
         Command::Get(args) => verbs::get::run(args),
         Command::Rm(args) => verbs::rm::run(args),

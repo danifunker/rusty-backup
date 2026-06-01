@@ -1,3 +1,8 @@
+// FAT12/16/32 ops take many parameters by nature (partition_offset,
+// bytes_per_sector, sectors_per_cluster, FAT count, BPB fields, log
+// callbacks, cancel checks).
+#![allow(clippy::too_many_arguments)]
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
@@ -44,10 +49,14 @@ pub struct FatFilesystem<R> {
     /// Cluster count used (lazily computed).
     #[allow(dead_code)]
     used_clusters: Option<u64>,
+    /// Hint for the next free cluster scan start.  Avoids O(n^2)
+    /// allocation on fresh volumes where clusters are filled
+    /// sequentially.
+    next_free_hint: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum FatType {
+pub enum FatType {
     Fat12,
     Fat16,
     Fat32,
@@ -184,6 +193,7 @@ impl<R: Read + Seek> FatFilesystem<R> {
             label,
             total_clusters,
             used_clusters: None,
+            next_free_hint: 2,
         })
     }
 
@@ -235,8 +245,7 @@ impl<R: Read + Seek> FatFilesystem<R> {
                 let fat_size = ((total_entries as usize) * 3).div_ceil(2);
                 self.reader.seek(SeekFrom::Start(fat_offset))?;
                 let mut fat_data = vec![0u8; fat_size];
-                let actually_read = self.reader.read(&mut fat_data)?;
-                fat_data.truncate(actually_read);
+                self.reader.read_exact(&mut fat_data)?;
 
                 for cluster in (2..total_entries).rev() {
                     let byte_off = (cluster as usize * 3) / 2;
@@ -260,8 +269,7 @@ impl<R: Read + Seek> FatFilesystem<R> {
                 let fat_size = total_entries as usize * 2;
                 self.reader.seek(SeekFrom::Start(fat_offset))?;
                 let mut fat_data = vec![0u8; fat_size];
-                let actually_read = self.reader.read(&mut fat_data)?;
-                fat_data.truncate(actually_read);
+                self.reader.read_exact(&mut fat_data)?;
 
                 for cluster in (2..total_entries).rev() {
                     let off = cluster as usize * 2;
@@ -310,7 +318,7 @@ impl<R: Read + Seek> FatFilesystem<R> {
     }
 
     /// Read the next cluster number from the FAT.
-    fn next_cluster(&mut self, cluster: u32) -> Result<Option<u32>, FilesystemError> {
+    pub fn next_cluster(&mut self, cluster: u32) -> Result<Option<u32>, FilesystemError> {
         let fat_offset = self.sector_offset(self.reserved_sectors);
         match self.fat_type {
             FatType::Fat12 => {
@@ -323,10 +331,10 @@ impl<R: Read + Seek> FatFilesystem<R> {
                 } else {
                     val & 0x0FFF
                 };
-                if next >= 0x0FF8 {
-                    Ok(None) // end of chain
-                } else if next == 0 || next >= 0x0FF0 {
-                    Ok(None) // bad/reserved
+                // FAT12: end-of-chain (>=0x0FF8), bad/reserved (0 or >=0x0FF0),
+                // otherwise it's a valid forward cluster.
+                if next == 0 || next >= 0x0FF0 {
+                    Ok(None)
                 } else {
                     Ok(Some(next as u32))
                 }
@@ -336,9 +344,9 @@ impl<R: Read + Seek> FatFilesystem<R> {
                 self.reader
                     .seek(SeekFrom::Start(fat_offset + entry_offset))?;
                 let next = self.reader.read_u16::<LittleEndian>()?;
-                if next >= 0xFFF8 {
-                    Ok(None)
-                } else if next == 0 || next >= 0xFFF0 {
+                // FAT16: end-of-chain (>=0xFFF8) and bad/reserved (0 or
+                // >=0xFFF0) both terminate the chain.
+                if next == 0 || next >= 0xFFF0 {
                     Ok(None)
                 } else {
                     Ok(Some(next as u32))
@@ -349,9 +357,9 @@ impl<R: Read + Seek> FatFilesystem<R> {
                 self.reader
                     .seek(SeekFrom::Start(fat_offset + entry_offset))?;
                 let next = self.reader.read_u32::<LittleEndian>()? & 0x0FFF_FFFF;
-                if next >= 0x0FFF_FFF8 {
-                    Ok(None)
-                } else if !(2..0x0FFF_FFF0).contains(&next) {
+                // FAT32: terminate on end-of-chain (>=0x0FFF_FFF8) or
+                // bad/reserved (outside 2..0x0FFF_FFF0).
+                if !(2..0x0FFF_FFF0).contains(&next) {
                     Ok(None)
                 } else {
                     Ok(Some(next))
@@ -382,19 +390,14 @@ impl<R: Read + Seek> FatFilesystem<R> {
             }
             let offset = self.cluster_offset(cluster);
             self.reader.seek(SeekFrom::Start(offset))?;
-            match self.reader.read(&mut buf) {
-                Ok(n) if n > 0 => {
-                    let remaining = max_bytes - written;
-                    let to_write = (n as u64).min(remaining) as usize;
-                    writer.write_all(&buf[..to_write])?;
-                    written += to_write as u64;
-                    if n < cluster_size {
-                        break;
-                    }
-                }
-                Ok(_) => break,
-                Err(e) => return Err(e.into()),
-            }
+            // read_exact: clusters are always fully present on disk. Don't use
+            // .read() — wrapped readers (VMDK sparse, qcow2) legitimately return
+            // short reads at grain boundaries, which is not EOF.
+            self.reader.read_exact(&mut buf)?;
+            let remaining = max_bytes - written;
+            let to_write = (cluster_size as u64).min(remaining) as usize;
+            writer.write_all(&buf[..to_write])?;
+            written += to_write as u64;
             count += 1;
             match self.next_cluster(cluster)? {
                 Some(next) => cluster = next,
@@ -419,19 +422,11 @@ impl<R: Read + Seek> FatFilesystem<R> {
             self.reader.seek(SeekFrom::Start(offset))?;
             let mut buf = vec![0u8; cluster_size];
 
-            // Use read() instead of read_exact() to handle partial reads at EOF
-            match self.reader.read(&mut buf) {
-                Ok(n) if n > 0 => {
-                    data.extend_from_slice(&buf[..n]);
-                    // If we got a short read, we're probably at EOF
-                    if n < cluster_size {
-                        break;
-                    }
-                }
-                Ok(0) => break, // EOF
-                Ok(_) => break, // Shouldn't happen, but handle partial reads
-                Err(e) => return Err(e.into()),
-            }
+            // read_exact: clusters are always fully present on disk. Don't use
+            // .read() — wrapped readers (VMDK sparse, qcow2) legitimately return
+            // short reads at grain boundaries, which is not EOF.
+            self.reader.read_exact(&mut buf)?;
+            data.extend_from_slice(&buf);
             count += 1;
 
             match self.next_cluster(cluster)? {
@@ -863,6 +858,38 @@ impl<R: Read + Write + Seek> FatFilesystem<R> {
         Ok(fat_data)
     }
 
+    fn read_fat_entry_single(&mut self, cluster: u32) -> Result<u32, FilesystemError> {
+        let fat_offset = self.sector_offset(self.reserved_sectors);
+        match self.fat_type {
+            FatType::Fat32 => {
+                let off = fat_offset + cluster as u64 * 4;
+                self.reader.seek(SeekFrom::Start(off))?;
+                let mut buf = [0u8; 4];
+                self.reader.read_exact(&mut buf)?;
+                Ok(u32::from_le_bytes(buf) & 0x0FFF_FFFF)
+            }
+            FatType::Fat16 => {
+                let off = fat_offset + cluster as u64 * 2;
+                self.reader.seek(SeekFrom::Start(off))?;
+                let mut buf = [0u8; 2];
+                self.reader.read_exact(&mut buf)?;
+                Ok(u16::from_le_bytes(buf) as u32)
+            }
+            FatType::Fat12 => {
+                let byte_off = fat_offset + (cluster as u64 * 3) / 2;
+                self.reader.seek(SeekFrom::Start(byte_off))?;
+                let mut buf = [0u8; 2];
+                self.reader.read_exact(&mut buf)?;
+                let val = u16::from_le_bytes(buf);
+                Ok(if cluster & 1 == 1 {
+                    (val >> 4) as u32
+                } else {
+                    (val & 0x0FFF) as u32
+                })
+            }
+        }
+    }
+
     /// Write a FAT entry for a given cluster on disk (updates all FAT copies).
     fn write_fat_entry_disk(&mut self, cluster: u32, value: u32) -> Result<(), FilesystemError> {
         let fat_start = self.sector_offset(self.reserved_sectors);
@@ -903,15 +930,24 @@ impl<R: Read + Write + Seek> FatFilesystem<R> {
 
     /// Find `count` free clusters by scanning the FAT. Returns cluster numbers.
     fn find_free_clusters(&mut self, count: u32) -> Result<Vec<u32>, FilesystemError> {
-        let fat_data = self.read_fat_table()?;
         let total_entries = self.total_clusters as u32 + 2;
         let mut free = Vec::with_capacity(count as usize);
 
-        for cluster in 2..total_entries {
-            let entry = read_fat_entry(&fat_data, cluster, self.fat_type);
-            if entry == 0 {
+        let start = self.next_free_hint.max(2);
+        for cluster in start..total_entries {
+            if self.read_fat_entry_single(cluster)? == 0 {
                 free.push(cluster);
                 if free.len() == count as usize {
+                    self.next_free_hint = cluster + 1;
+                    return Ok(free);
+                }
+            }
+        }
+        for cluster in 2..start {
+            if self.read_fat_entry_single(cluster)? == 0 {
+                free.push(cluster);
+                if free.len() == count as usize {
+                    self.next_free_hint = cluster + 1;
                     return Ok(free);
                 }
             }
@@ -1253,11 +1289,8 @@ impl<R: Read + Write + Seek> FatFilesystem<R> {
 
                     // Append to the chain
                     let mut last = start_cluster;
-                    loop {
-                        match self.next_cluster(last)? {
-                            Some(next) => last = next,
-                            None => break,
-                        }
+                    while let Some(next) = self.next_cluster(last)? {
+                        last = next;
                     }
                     self.write_fat_entry_disk(last, new_cluster)?;
 
@@ -1543,20 +1576,28 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
         name: &str,
         data: &mut dyn std::io::Read,
         data_len: u64,
-        _options: &CreateFileOptions,
+        options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
         validate_fat_name(name)?;
 
-        // Read parent directory to check for duplicates and collect SFNs
-        let dir_data = if parent.path == "/" && self.fat_type != FatType::Fat32 {
-            self.read_root_directory()?
+        let (existing_sfns, dir_data_for_sfn);
+        if options.skip_name_checks {
+            existing_sfns = std::collections::HashSet::new();
+            dir_data_for_sfn = None;
         } else {
-            self.read_cluster_chain(parent.location as u32)?
-        };
-
-        if self.name_exists_in_dir(&dir_data, name) {
-            return Err(FilesystemError::AlreadyExists(name.to_string()));
+            let dir_data = if parent.path == "/" && self.fat_type != FatType::Fat32 {
+                self.read_root_directory()?
+            } else {
+                self.read_cluster_chain(parent.location as u32)?
+            };
+            if self.name_exists_in_dir(&dir_data, name) {
+                return Err(FilesystemError::AlreadyExists(name.to_string()));
+            }
+            let sfns = self.collect_existing_sfns(&dir_data);
+            existing_sfns = sfns;
+            dir_data_for_sfn = Some(dir_data);
         }
+        let _ = dir_data_for_sfn;
 
         // Allocate clusters for file data
         let cluster_size = self.cluster_size() as usize;
@@ -1572,8 +1613,9 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
             0
         };
 
-        // Write file data to clusters
-        if clusters_needed > 0 {
+        // Write file data to clusters (skipped when skip_data_write is
+        // set — caller only needs the FAT chain, not the content).
+        if clusters_needed > 0 && !options.skip_data_write {
             let mut cluster = first_cluster;
             let mut remaining = data_len as usize;
             let mut buf = vec![0u8; cluster_size];
@@ -1601,13 +1643,14 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
         }
 
         // Generate SFN and build directory entries
-        let existing_sfns = self.collect_existing_sfns(&dir_data);
         let sfn = Self::generate_short_name(name, &existing_sfns);
         let entry_bytes =
             Self::build_dir_entries(name, &sfn, ATTR_ARCHIVE, first_cluster, data_len as u32);
 
         self.add_to_directory(parent, &entry_bytes)?;
-        self.update_fsinfo()?;
+        if !options.skip_fsinfo_update {
+            self.update_fsinfo()?;
+        }
 
         let path = if parent.path == "/" {
             format!("/{name}")
@@ -2203,9 +2246,8 @@ impl<R: Read + Seek> CompactFatReader<R> {
         }
 
         // Remap entries for allocated clusters
-        for new_idx in 0..new_to_old.len() {
+        for (new_idx, &old_cluster) in new_to_old.iter().enumerate() {
             let new_cluster = (new_idx as u32) + 2;
-            let old_cluster = new_to_old[new_idx];
             let old_entry = read_fat_entry(&fat_data, old_cluster, fat_type);
 
             let new_entry = if is_end_of_chain(old_entry, fat_type) {
@@ -3030,11 +3072,7 @@ pub fn set_fat_clean_flags(
             .saturating_sub(num_fats * spf16 as u32)
             .saturating_sub(root_dir_sectors);
         let sectors_per_cluster = bpb[13] as u32;
-        let cluster_count = if sectors_per_cluster > 0 {
-            data_sectors / sectors_per_cluster
-        } else {
-            0
-        };
+        let cluster_count = data_sectors.checked_div(sectors_per_cluster).unwrap_or(0);
         if cluster_count < 4085 {
             12
         } else {
@@ -3584,7 +3622,46 @@ fn compute_free_clusters(
 ///
 /// `size_bytes` must be at least 64 KiB (FAT12/16) or 33 MiB (FAT32).
 /// It is rounded down to a 512-byte sector boundary.
-pub fn create_blank_fat(size_bytes: u64, label: Option<&str>) -> Result<Vec<u8>> {
+/// Pre-computed geometry for a blank FAT image of a given size. Lets
+/// callers (e.g. the file-aware GHO reader) format only the metadata
+/// region into a sparse sink without allocating the full image.
+#[derive(Debug, Clone, Copy)]
+pub struct FatBlankLayout {
+    pub fat_type: FatType,
+    pub bytes_per_sector: u32,
+    pub sectors_per_cluster: u32,
+    pub reserved_sectors: u16,
+    pub num_fats: u8,
+    pub root_entry_count: u16,
+    pub root_dir_sectors: u32,
+    pub sectors_per_fat: u32,
+    pub fsinfo_sector: u16,
+    pub backup_boot_sector: u16,
+    pub total_sectors: u32,
+}
+
+impl FatBlankLayout {
+    /// Byte offset where the data region (cluster 2 onwards) begins.
+    pub fn data_start_byte(&self) -> u64 {
+        let sector = self.reserved_sectors as u32
+            + (self.num_fats as u32 * self.sectors_per_fat)
+            + self.root_dir_sectors;
+        sector as u64 * self.bytes_per_sector as u64
+    }
+
+    /// Total image size in bytes.
+    pub fn image_size(&self) -> u64 {
+        self.total_sectors as u64 * self.bytes_per_sector as u64
+    }
+
+    /// Cluster size in bytes.
+    pub fn cluster_size(&self) -> u64 {
+        self.bytes_per_sector as u64 * self.sectors_per_cluster as u64
+    }
+}
+
+/// Compute the layout that [`create_blank_fat`] would use for `size_bytes`.
+pub fn compute_fat_blank_layout(size_bytes: u64) -> Result<FatBlankLayout> {
     if size_bytes < 64 * 1024 {
         return Err(anyhow::anyhow!(
             "FAT volume must be at least 64 KiB, got {size_bytes}"
@@ -3600,30 +3677,21 @@ pub fn create_blank_fat(size_bytes: u64, label: Option<&str>) -> Result<Vec<u8>>
     }
     let total_sectors = total_sectors_u64 as u32;
 
-    // Choose FAT type + sectors-per-cluster + root-entry count.
-    // FAT32 uses root_entry_count = 0 (root is a regular cluster chain).
     let (fat_type, sectors_per_cluster, root_entry_count) = if size_bytes <= 32 * 1024 * 1024 {
         let spc: u32 = match size_bytes {
-            0..=2_097_152 => 1,          // ≤ 2 MiB
-            2_097_153..=8_388_608 => 2,  // ≤ 8 MiB
-            8_388_609..=16_777_216 => 4, // ≤ 16 MiB
-            _ => 8,                      // ≤ 32 MiB
+            0..=2_097_152 => 1,
+            2_097_153..=8_388_608 => 2,
+            8_388_609..=16_777_216 => 4,
+            _ => 8,
         };
         (FatType::Fat12, spc, 224u16)
     } else if size_bytes <= 2u64 * 1024 * 1024 * 1024 {
-        // FAT16: keep total_clusters under 65525.
         let mut spc: u32 = 1;
         while (total_sectors / spc) > 65500 && spc < 64 {
             spc *= 2;
         }
         (FatType::Fat16, spc, 512u16)
     } else {
-        // FAT32: cluster count must be >= 65525 (so FS-type heuristics
-        // pick FAT32). Microsoft's recommended SPC table:
-        //   ≤ 8 GiB    → 8 sectors / cluster (4 KiB)
-        //   ≤ 16 GiB   → 16
-        //   ≤ 32 GiB   → 32
-        //   > 32 GiB   → 64
         let spc: u32 = match size_bytes {
             0..=8_589_934_592 => 8,
             8_589_934_593..=17_179_869_184 => 16,
@@ -3638,12 +3706,8 @@ pub fn create_blank_fat(size_bytes: u64, label: Option<&str>) -> Result<Vec<u8>>
         FatType::Fat32 => (32, 1, 6),
     };
     let num_fats: u8 = 2;
-    let root_dir_sectors =
-        ((root_entry_count as u32 * 32) + (BYTES_PER_SECTOR - 1)) / BYTES_PER_SECTOR;
+    let root_dir_sectors = (root_entry_count as u32 * 32).div_ceil(BYTES_PER_SECTOR);
 
-    // Iterate sectors_per_fat until it covers the cluster count it itself enables.
-    // FAT32's root directory occupies one cluster inside the data region (not
-    // a fixed root-dir-sector area).
     let mut sectors_per_fat: u32 = 1;
     loop {
         let data_start =
@@ -3656,7 +3720,7 @@ pub fn create_blank_fat(size_bytes: u64, label: Option<&str>) -> Result<Vec<u8>>
         let data_sectors = total_sectors - data_start;
         let total_clusters = data_sectors / sectors_per_cluster;
         let fat_bytes_needed = match fat_type {
-            FatType::Fat12 => (((total_clusters + 2) as u64 * 3 + 1) / 2) as u32,
+            FatType::Fat12 => ((total_clusters + 2) as u64 * 3).div_ceil(2) as u32,
             FatType::Fat16 => (total_clusters + 2) * 2,
             FatType::Fat32 => (total_clusters + 2) * 4,
         };
@@ -3667,101 +3731,133 @@ pub fn create_blank_fat(size_bytes: u64, label: Option<&str>) -> Result<Vec<u8>>
         sectors_per_fat = needed_spf;
     }
 
-    let image_size = total_sectors as usize * BYTES_PER_SECTOR as usize;
-    let mut img = vec![0u8; image_size];
-
-    let label_bytes = fat_label_bytes(label);
-
-    // ---- Boot sector ----
-    write_fat_boot_sector(
-        &mut img[..512],
+    Ok(FatBlankLayout {
         fat_type,
-        BYTES_PER_SECTOR,
+        bytes_per_sector: BYTES_PER_SECTOR,
         sectors_per_cluster,
         reserved_sectors,
         num_fats,
         root_entry_count,
-        total_sectors,
+        root_dir_sectors,
         sectors_per_fat,
         fsinfo_sector,
         backup_boot_sector,
+        total_sectors,
+    })
+}
+
+/// Write a blank FAT image's metadata (BPB, FATs, FSInfo, backup boot,
+/// volume-label entry) into `sink`. The data region is **not** touched
+/// — sink positions ≥ `layout.data_start_byte()` are left untouched, so
+/// callers using a sparse sink pay metadata-only cost regardless of the
+/// virtual image size. The sink must support seeking to arbitrary
+/// positions.
+pub fn write_blank_fat_metadata_to_sink<W: std::io::Write + std::io::Seek>(
+    sink: &mut W,
+    layout: &FatBlankLayout,
+    label: Option<&str>,
+) -> Result<()> {
+    use std::io::SeekFrom;
+    let bps = layout.bytes_per_sector as usize;
+    let label_bytes = fat_label_bytes(label);
+
+    // ---- Boot sector ----
+    let mut boot = vec![0u8; bps];
+    write_fat_boot_sector(
+        &mut boot,
+        layout.fat_type,
+        layout.bytes_per_sector,
+        layout.sectors_per_cluster,
+        layout.reserved_sectors,
+        layout.num_fats,
+        layout.root_entry_count,
+        layout.total_sectors,
+        layout.sectors_per_fat,
+        layout.fsinfo_sector,
+        layout.backup_boot_sector,
         &label_bytes,
     );
+    sink.seek(SeekFrom::Start(0))?;
+    sink.write_all(&boot)?;
 
-    // ---- FAT32 only: FSInfo sector + backup boot sector ----
-    if fat_type == FatType::Fat32 {
-        let fsinfo_off = fsinfo_sector as usize * BYTES_PER_SECTOR as usize;
-        let fsinfo = &mut img[fsinfo_off..fsinfo_off + 512];
-        fsinfo[0..4].copy_from_slice(&0x4161_5252u32.to_le_bytes()); // "RRaA"
-        fsinfo[484..488].copy_from_slice(&0x6141_7272u32.to_le_bytes()); // "rrAa"
-                                                                         // free cluster count: unknown sentinel
+    // ---- FSInfo + backup boot (FAT32 only) ----
+    let mut fsinfo_buf: Option<Vec<u8>> = None;
+    if layout.fat_type == FatType::Fat32 {
+        let mut fsinfo = vec![0u8; bps];
+        fsinfo[0..4].copy_from_slice(&0x4161_5252u32.to_le_bytes());
+        fsinfo[484..488].copy_from_slice(&0x6141_7272u32.to_le_bytes());
         fsinfo[488..492].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-        // next-free hint: cluster 3 (we'll have used cluster 2 for the root dir)
         fsinfo[492..496].copy_from_slice(&3u32.to_le_bytes());
         fsinfo[508..512].copy_from_slice(&0xAA55_0000u32.to_le_bytes());
+        sink.seek(SeekFrom::Start(layout.fsinfo_sector as u64 * bps as u64))?;
+        sink.write_all(&fsinfo)?;
 
-        let backup_off = backup_boot_sector as usize * BYTES_PER_SECTOR as usize;
-        img.copy_within(0..512, backup_off);
-        // FSInfo is mirrored at backup_boot_sector + 1.
-        let backup_fsinfo_off = backup_off + 512;
-        img.copy_within(fsinfo_off..fsinfo_off + 512, backup_fsinfo_off);
+        let backup_off = layout.backup_boot_sector as u64 * bps as u64;
+        sink.seek(SeekFrom::Start(backup_off))?;
+        sink.write_all(&boot)?;
+        sink.seek(SeekFrom::Start(backup_off + bps as u64))?;
+        sink.write_all(&fsinfo)?;
+        fsinfo_buf = Some(fsinfo);
     }
+    let _ = fsinfo_buf;
 
-    // ---- FAT 0 (and FAT 1 via copy) ----
-    let fat0_off = reserved_sectors as usize * BYTES_PER_SECTOR as usize;
-    let fat_bytes_total = sectors_per_fat as usize * BYTES_PER_SECTOR as usize;
-    match fat_type {
+    // ---- FAT 0 (full sector with first few entries set) + FAT 1 ----
+    let mut fat_first = vec![0u8; bps];
+    match layout.fat_type {
         FatType::Fat12 => {
-            // FAT12: entry 0 = 0xFF8 (media), entry 1 = 0xFFF (EOC). Packed.
-            img[fat0_off] = 0xF8;
-            img[fat0_off + 1] = 0xFF;
-            img[fat0_off + 2] = 0xFF;
+            fat_first[0] = 0xF8;
+            fat_first[1] = 0xFF;
+            fat_first[2] = 0xFF;
         }
         FatType::Fat16 => {
-            img[fat0_off..fat0_off + 2].copy_from_slice(&0xFFF8u16.to_le_bytes());
-            img[fat0_off + 2..fat0_off + 4].copy_from_slice(&0xFFFFu16.to_le_bytes());
+            fat_first[0..2].copy_from_slice(&0xFFF8u16.to_le_bytes());
+            fat_first[2..4].copy_from_slice(&0xFFFFu16.to_le_bytes());
         }
         FatType::Fat32 => {
-            // Entry 0: 0x0FFFFFF8 (media in low byte, top nibble reserved).
-            img[fat0_off..fat0_off + 4].copy_from_slice(&0x0FFF_FFF8u32.to_le_bytes());
-            // Entry 1: 0x0FFFFFFF (EOC). Top nibble must stay zero.
-            img[fat0_off + 4..fat0_off + 8].copy_from_slice(&0x0FFF_FFFFu32.to_le_bytes());
-            // Entry 2: EOC (root directory cluster is allocated and chain-ends here).
-            img[fat0_off + 8..fat0_off + 12].copy_from_slice(&0x0FFF_FFFFu32.to_le_bytes());
+            fat_first[0..4].copy_from_slice(&0x0FFF_FFF8u32.to_le_bytes());
+            fat_first[4..8].copy_from_slice(&0x0FFF_FFFFu32.to_le_bytes());
+            fat_first[8..12].copy_from_slice(&0x0FFF_FFFFu32.to_le_bytes());
         }
     }
-    let fat1_off = fat0_off + fat_bytes_total;
-    let initial_len = match fat_type {
-        FatType::Fat12 => 3,
-        FatType::Fat16 => 4,
-        FatType::Fat32 => 12,
-    };
-    img.copy_within(fat0_off..fat0_off + initial_len, fat1_off);
+    let fat0_byte = layout.reserved_sectors as u64 * bps as u64;
+    let fat_size_bytes = layout.sectors_per_fat as u64 * bps as u64;
+    sink.seek(SeekFrom::Start(fat0_byte))?;
+    sink.write_all(&fat_first)?;
+    let fat1_byte = fat0_byte + fat_size_bytes;
+    sink.seek(SeekFrom::Start(fat1_byte))?;
+    sink.write_all(&fat_first)?;
 
-    // ---- Root directory ----
-    match fat_type {
-        FatType::Fat12 | FatType::Fat16 => {
-            let root_dir_off = fat1_off + fat_bytes_total;
-            if label.is_some() {
-                let entry = &mut img[root_dir_off..root_dir_off + 32];
+    // ---- Volume label entry (if any) in the root directory ----
+    if label.is_some() {
+        match layout.fat_type {
+            FatType::Fat12 | FatType::Fat16 => {
+                let root_dir_off = fat1_byte + fat_size_bytes;
+                sink.seek(SeekFrom::Start(root_dir_off))?;
+                let mut entry = vec![0u8; 32];
                 entry[0..11].copy_from_slice(&label_bytes);
                 entry[11] = ATTR_VOLUME_ID;
+                sink.write_all(&entry)?;
             }
-        }
-        FatType::Fat32 => {
-            // Root cluster = #2, sits at start of the data region (after both FATs).
-            let data_start_sector =
-                reserved_sectors as u32 + (num_fats as u32 * sectors_per_fat) + root_dir_sectors;
-            let root_cluster_off = data_start_sector as usize * BYTES_PER_SECTOR as usize;
-            if label.is_some() {
-                let entry = &mut img[root_cluster_off..root_cluster_off + 32];
+            FatType::Fat32 => {
+                let root_cluster_byte = layout.data_start_byte();
+                sink.seek(SeekFrom::Start(root_cluster_byte))?;
+                let mut entry = vec![0u8; 32];
                 entry[0..11].copy_from_slice(&label_bytes);
                 entry[11] = ATTR_VOLUME_ID;
+                sink.write_all(&entry)?;
             }
-            // Rest of root cluster stays zeroed (entries marked unused).
         }
     }
 
+    Ok(())
+}
+
+pub fn create_blank_fat(size_bytes: u64, label: Option<&str>) -> Result<Vec<u8>> {
+    let layout = compute_fat_blank_layout(size_bytes)?;
+    let image_size = layout.image_size() as usize;
+    let mut img = vec![0u8; image_size];
+    let mut cur = std::io::Cursor::new(&mut img);
+    write_blank_fat_metadata_to_sink(&mut cur, &layout, label)?;
     Ok(img)
 }
 
@@ -3850,8 +3946,7 @@ fn write_fat_boot_sector(
 fn fat_label_bytes(label: Option<&str>) -> [u8; 11] {
     let mut out = [b' '; 11];
     let s = label.unwrap_or("NO NAME");
-    let mut written = 0;
-    for ch in s.chars() {
+    for (written, ch) in s.chars().enumerate() {
         if written >= 11 {
             break;
         }
@@ -3870,7 +3965,6 @@ fn fat_label_bytes(label: Option<&str>) -> [u8; 11] {
             b'_'
         };
         out[written] = b;
-        written += 1;
     }
     out
 }
@@ -3903,6 +3997,8 @@ mod tests {
         // Date: day=29, month=1, year=2026-1980=46
         let date = 29 | (1 << 5) | (46 << 9);
         // Time: second=0, minute=30, hour=14
+        // (intentional `0 |` keeps the bit-packed columns aligned)
+        #[allow(clippy::identity_op, clippy::erasing_op)]
         let time = 0 | (30 << 5) | (14 << 11);
         assert_eq!(format_fat_datetime(date, time), "2026-01-29 14:30:00");
     }
@@ -3923,8 +4019,7 @@ mod tests {
         let root_entry_count: u16 = 16;
         let total_sectors: u16 = 128;
         // FAT16 with 120 data clusters (needs sectors_per_fat to cover them)
-        let root_dir_sectors = ((root_entry_count as u64 * 32) + (bytes_per_sector as u64 - 1))
-            / bytes_per_sector as u64;
+        let root_dir_sectors = (root_entry_count as u64 * 32).div_ceil(bytes_per_sector as u64);
         let _data_start = reserved_sectors as u64 + root_dir_sectors;
         // We need FAT to cover at least total_sectors entries × 2 bytes
         let sectors_per_fat: u16 = 1;
@@ -3986,7 +4081,11 @@ mod tests {
         assert_eq!(fs.label.as_deref(), Some("CFCARD"));
     }
 
+    // FAT32 selection requires a volume > 2 GiB (see compute_fat_blank_layout),
+    // and create_blank_fat materializes the whole image as a Vec — a >2 GiB
+    // allocation that a 32-bit address space can't satisfy. Gate to 64-bit.
     #[test]
+    #[cfg(target_pointer_width = "64")]
     fn create_blank_fat_picks_fat32_for_large_volumes() {
         // 4 GiB → FAT32 territory.
         let img =
@@ -4000,7 +4099,10 @@ mod tests {
         assert!(entries.is_empty(), "fresh FAT32 root must be empty");
     }
 
+    // See note on create_blank_fat_picks_fat32_for_large_volumes: a >2 GiB
+    // in-RAM image can't be allocated on a 32-bit target. Gate to 64-bit.
     #[test]
+    #[cfg(target_pointer_width = "64")]
     fn create_blank_fat_fat32_supports_create_file() {
         let img = create_blank_fat(4u64 * 1024 * 1024 * 1024, Some("F32RW")).expect("format FAT32");
         let mut cur = std::io::Cursor::new(img);

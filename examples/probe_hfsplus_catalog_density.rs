@@ -155,8 +155,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let payload_limit = node_size.saturating_sub(16);
     println!();
     println!(
-        "{:>8} {:>8} {:>10} {:>10}  {}",
-        "node_idx", "records", "used_b", "longest_r", "note"
+        "{:>8} {:>8} {:>10} {:>10}  note",
+        "node_idx", "records", "used_b", "longest_r"
     );
     let mut tight_leaves = 0usize;
     while leaf_idx != 0 && visited < 200_000 {

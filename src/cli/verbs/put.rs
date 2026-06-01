@@ -61,14 +61,28 @@ pub struct PutArgs {
     /// Overwrite an existing entry at the destination path.
     #[arg(long)]
     pub force: bool,
+
+    /// After writing the file, also print the same JSON envelope
+    /// `locate` would have produced — absolute byte offset, length,
+    /// fragmented flag. One-shot for build scripts that need to patch
+    /// disk offsets immediately after placing a payload. HFS-only,
+    /// matches the locate verb's scope; ignored (with a warning) for
+    /// the `--zero` and `--boot` shapes since there's no host file to
+    /// describe.
+    #[arg(long = "print-offset")]
+    pub print_offset: bool,
 }
 
 pub fn run(args: PutArgs) -> Result<()> {
     if let Some(bb_file) = args.boot {
-        // Boot-block write is a raw byte-0 sector smash — keep the
-        // existing HFS-only path. Phase D may generalize this to FAT
-        // BPB / NTFS boot loader as needed.
-        return crate::cli::api::hfs::cmd_put_boot(args.image.path, bb_file);
+        // Boot-block write: 1024 bytes at the *partition's* first
+        // sector, not the image's. For raw superfloppies that's byte 0;
+        // for APM-wrapped disks (`IMG@N`) it's the Apple_HFS
+        // partition's start_lba * 512 (typically 0xC000), and
+        // overwriting byte 0 would smash the APM Driver Descriptor
+        // Record. We resolve the partition through the same dispatch
+        // every other verb uses so `--boot` honors `@N`.
+        return put_boot(&args.image.path, args.image.partition, &bb_file);
     }
 
     let dst = match (args.dst, args.dst_flag) {
@@ -157,5 +171,59 @@ pub fn run(args: PutArgs) -> Result<()> {
 
     fs.sync_metadata()
         .map_err(|e| anyhow!("sync_metadata: {e}"))?;
+
+    if args.print_offset {
+        // Drop the editable handle before re-opening read-only via the
+        // locate path — we want the post-sync on-disk state.
+        drop(fs);
+        let payload = super::locate::locate_payload(&args.image, &dst)?;
+        super::locate::emit_locate(crate::cli::output::OutputFormat::Json, &payload)?;
+    }
+
+    Ok(())
+}
+
+/// Write a boot block (up to 1024 bytes, zero-padded if shorter) at the
+/// selected partition's first sector. HFS-only today, but the partition
+/// resolution is generic so future FAT/NTFS boot-loader writes can drop
+/// in by relaxing the type-byte check.
+fn put_boot(
+    image: &std::path::Path,
+    partition: Option<u32>,
+    bb_file: &std::path::Path,
+) -> Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let bb = std::fs::read(bb_file).map_err(|e| anyhow!("reading {}: {e}", bb_file.display()))?;
+    if bb.len() > 1024 {
+        bail!(
+            "boot block source is {} bytes; HFS boot region is 1024 bytes max",
+            bb.len()
+        );
+    }
+
+    let (mut file, ctx) = resolve_partition_rw(image, partition)?;
+    log_stderr(&ctx.label);
+
+    // Same type check `locate` uses — keeps `--boot` from silently
+    // smashing the first 1024 bytes of, say, a FAT partition.
+    let is_hfs = matches!(ctx.type_byte, 0xaf)
+        || ctx
+            .type_string
+            .as_deref()
+            .map(|s| s == "Apple_HFS")
+            .unwrap_or(false)
+        || ctx.type_byte == 0x00; // raw superfloppy — accept; new HFS images land here
+    if !is_hfs {
+        bail!(
+            "--boot is HFS-only today; got type 0x{:02x} {}",
+            ctx.type_byte,
+            ctx.type_string.as_deref().unwrap_or("(unknown)")
+        );
+    }
+
+    file.seek(SeekFrom::Start(ctx.offset))?;
+    file.write_all(&bb)?;
+    file.flush()?;
     Ok(())
 }

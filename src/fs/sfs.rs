@@ -1,3 +1,7 @@
+// SFS ops take many parameters by nature (partition_offset, block_size,
+// bitmap chain state, log/cancel callbacks).
+#![allow(clippy::too_many_arguments)]
+
 //! Smart File System (SFS) reader.
 //!
 //! Phase 7 scope: **read-only browse + backup**. Both DosType variants
@@ -78,7 +82,7 @@ fn validate_block_with(
     expected_blk: u32,
     check_checksum: bool,
 ) -> Result<(), FilesystemError> {
-    if buf.len() < 12 || buf.len() % 4 != 0 {
+    if buf.len() < 12 || !buf.len().is_multiple_of(4) {
         return Err(parse_err("SFS block buffer size invalid"));
     }
     let id = rd_u32(buf, 0);
@@ -313,7 +317,7 @@ impl<R: Read + Seek> SfsFilesystem<R> {
         }
         // We trust the probe to give us blocksize; re-read at proper size.
         let blocksize = rd_u32(&probe, 52) as u64;
-        if !(512..=65536).contains(&blocksize) || blocksize % 512 != 0 {
+        if !(512..=65536).contains(&blocksize) || !blocksize.is_multiple_of(512) {
             return Err(parse_err(format!(
                 "SFS rootblock blocksize {} out of range",
                 blocksize
@@ -440,7 +444,7 @@ impl<R: Read + Seek> SfsFilesystem<R> {
     ///   log2(blocksize) - 5` (4 for 512-byte blocks). The low bit is a
     ///   "container is full" flag we can simply mask off by shifting.
     fn lookup_object_block(&mut self, objectnode: u32) -> Result<u32, FilesystemError> {
-        let shifts_block = (self.root.blocksize as u32).trailing_zeros();
+        let shifts_block = self.root.blocksize.trailing_zeros();
         let shifts_block32 = shifts_block.saturating_sub(5);
         let mut blk = self.root.objectnoderoot;
         let mut guard = 0;
@@ -912,7 +916,7 @@ impl<'a> Write for WriteAdapter<'a> {
 fn read_bitmap<R: Read + Seek>(fs: &mut SfsFilesystem<R>) -> Result<Vec<u8>, FilesystemError> {
     let bs = fs.block_size() as u64;
     let total = fs.root.totalblocks;
-    let total_bytes = ((total as usize) + 7) / 8;
+    let total_bytes = (total as usize).div_ceil(8);
     let mut out = vec![0u8; total_bytes];
 
     // Bitmap blocks: the first lives at root.bitmapbase; subsequent ones
@@ -995,7 +999,7 @@ impl<R: Read + Seek> CompactSfsReader<R> {
         let blocksize = fs.root.blocksize;
         let bitmap = read_bitmap(&mut fs).unwrap_or_default();
 
-        let total_blocks = (partition_size / blocksize as u64) as u64;
+        let total_blocks = partition_size / blocksize as u64;
         let bitmap_bits = (bitmap.len() * 8) as u64;
         let mut free_blocks: u64 = 0;
         for byte in &bitmap {
@@ -1175,7 +1179,7 @@ impl<R: Read + Seek> SfsFilesystem<R> {
         let words_per_block = ((bs as usize) - 12) / 4;
         let bits_per_block = words_per_block * 32;
         let total = self.root.totalblocks as usize;
-        let needed_blocks = (total + bits_per_block - 1) / bits_per_block;
+        let needed_blocks = total.div_ceil(bits_per_block);
 
         // Pass 1: build a flat allocation bitmap from disk so we can scan
         // for a contiguous run without juggling cross-block boundaries.
@@ -1714,7 +1718,7 @@ impl<R: Read + Write + Seek + Send> SfsFilesystem<R> {
         let (first_data, blocks) = if data_len == 0 {
             (0u32, 0u32)
         } else {
-            let n = ((data_len + bs - 1) / bs) as u32;
+            let n = data_len.div_ceil(bs) as u32;
             let first = self.alloc_data_blocks(n)?;
             (first, n)
         };
@@ -1845,7 +1849,7 @@ impl<R: Read + Write + Seek + Send> SfsFilesystem<R> {
             let bs = self.root.blocksize as u64;
             let size = obj.size_or_firstdirblock as u64;
             if obj.data_or_hashtable != 0 && size > 0 {
-                let blocks = ((size + bs - 1) / bs) as u32;
+                let blocks = size.div_ceil(bs) as u32;
                 self.free_data_blocks(obj.data_or_hashtable, blocks)?;
                 let _ = self.extent_btree_remove(obj.data_or_hashtable);
             }
@@ -2195,7 +2199,7 @@ pub fn create_blank_sfs(total_blocks: u32, name: &str) -> Result<Vec<u8>, Filesy
         )));
     }
     let blocks_inbitmap = (blocksize - 12) * 8;
-    let blocks_bitmap = (total_blocks + blocks_inbitmap - 1) / blocks_inbitmap;
+    let blocks_bitmap = total_blocks.div_ceil(blocks_inbitmap);
     let blocks_admin = SFS_BLOCKS_ADMIN;
     let reserved_start = SFS_BLOCKS_RESERVED_START;
     let reserved_end = SFS_BLOCKS_RESERVED_END;
@@ -2209,9 +2213,9 @@ pub fn create_blank_sfs(total_blocks: u32, name: &str) -> Result<Vec<u8>, Filesy
     let block_bitmapbase = block_adminspace + blocks_admin;
 
     if block_bitmapbase + blocks_bitmap + reserved_end > total_blocks {
-        return Err(parse_err(format!(
-            "SFS formatter: layout doesn't fit (admin+bitmap+reserved > total)"
-        )));
+        return Err(parse_err(
+            "SFS formatter: layout doesn't fit (admin+bitmap+reserved > total)".to_string(),
+        ));
     }
 
     let total_size = total_blocks as usize * blocksize as usize;
@@ -2444,7 +2448,7 @@ pub fn resize_sfs_in_place(
         return Ok(());
     }
     let blocksize = rd_u32(&probe, 52) as u64;
-    if !(512..=65536).contains(&blocksize) || blocksize % 512 != 0 {
+    if !(512..=65536).contains(&blocksize) || !blocksize.is_multiple_of(512) {
         log(&format!(
             "SFS resize: rootblock blocksize {} out of range, skipping",
             blocksize
@@ -2561,7 +2565,7 @@ fn read_bitmap_raw(
 ) -> anyhow::Result<Vec<u8>> {
     let bs = root.blocksize as u64;
     let total = root.totalblocks as usize;
-    let total_bytes = (total + 7) / 8;
+    let total_bytes = total.div_ceil(8);
     let mut out = vec![0u8; total_bytes];
     let words_per_block = ((bs as usize) - 12) / 4;
     let bits_per_block = words_per_block * 32;

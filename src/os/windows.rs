@@ -311,7 +311,7 @@ fn query_disk_size(handle: HANDLE) -> Option<u64> {
 pub fn get_physical_drive_size(file: &File) -> Result<u64> {
     use std::os::windows::io::AsRawHandle;
 
-    let handle = HANDLE(file.as_raw_handle() as *mut std::ffi::c_void);
+    let handle = HANDLE(file.as_raw_handle());
     query_disk_size(handle)
         .context("failed to query disk size via IOCTL_DISK_GET_DRIVE_GEOMETRY_EX")
 }
@@ -381,7 +381,7 @@ fn enumerate_volumes() -> Vec<VolumeInfo> {
     let drive_roots: Vec<String> = buf[..len as usize]
         .split(|&c| c == 0)
         .filter(|s| !s.is_empty())
-        .map(|s| String::from_utf16_lossy(s))
+        .map(String::from_utf16_lossy)
         .collect();
 
     for root in &drive_roots {
@@ -479,19 +479,20 @@ fn enumerate_volumes() -> Vec<VolumeInfo> {
 ///
 /// In debug builds, if not elevated, automatically requests elevation via UAC.
 pub fn enumerate_devices() -> Vec<DiskDevice> {
-    // In debug builds, check elevation and request if needed
-    #[cfg(debug_assertions)]
-    {
-        if !is_elevated() {
-            log::warn!("Not running with administrator privileges; requesting elevation...");
-            if let Err(e) = request_elevation() {
-                log::error!("Failed to request elevation: {}", e);
-                // Return empty list if elevation failed
-                return Vec::new();
-            }
-            // If we get here, elevation was cancelled or failed
-            return Vec::new();
-        }
+    // Physical-disk enumeration needs admin. The GUI now launches `asInvoker`
+    // (no requireAdministrator manifest), so it is NOT elevated by default.
+    // Elevation is an explicit, up-front user action: the top-bar "Show Physical
+    // Devices" button calls `request_elevation()` (whole-process UAC relaunch),
+    // and the elevated instance auto-enumerates on startup. We therefore never
+    // relaunch from here — doing so could fire a UAC prompt (or worse, a
+    // process exit) at an arbitrary time. When not elevated we simply report no
+    // devices; file-only flows keep working.
+    if !is_elevated() {
+        log::info!(
+            "Not elevated; physical-disk enumeration returns empty. \
+             Use \"Show Physical Devices\" to elevate."
+        );
+        return Vec::new();
     }
 
     let volumes = enumerate_volumes();
@@ -563,18 +564,19 @@ pub(crate) fn open_target_for_writing(path: &Path) -> Result<(File, VolumeLockSe
     let path_str = path.to_string_lossy();
     let drive_num = drive_number_from_path(&path_str).context("invalid physical drive path")?;
 
-    // In debug builds, check elevation before attempting to open
-    #[cfg(debug_assertions)]
-    {
-        if !is_elevated() {
-            log::warn!(
-                "Attempting to open {} for writing without admin privileges; requesting elevation...",
-                path.display()
-            );
-            request_elevation()?;
-            // If we get here, elevation was cancelled
-            bail!("Administrator privileges required to write to disk devices");
-        }
+    // Physical-disk writes need admin. Both the GUI and CLI now run `asInvoker`.
+    // In the GUI, the user reaches this path only after clicking "Show Physical
+    // Devices" (which relaunches the whole process elevated), so we are already
+    // elevated here. We do NOT relaunch from this function: `request_elevation()`
+    // exits the process, which must never happen mid-write on a worker thread.
+    // If somehow not elevated, fail with a clear message instead of a cryptic
+    // "Access is denied" (OS error 5).
+    if !is_elevated() {
+        bail!(
+            "Administrator privileges required to write to disk devices. \
+             Use \"Show Physical Devices\" in the GUI, or re-run rb-cli from an \
+             elevated terminal (right-click -> Run as administrator)."
+        );
     }
 
     // Lock and dismount all volumes on the target drive BEFORE opening.
@@ -598,7 +600,7 @@ pub(crate) fn open_target_for_writing(path: &Path) -> Result<(File, VolumeLockSe
     .with_context(|| format!("cannot open {} for writing", path.display()))?;
 
     // Convert HANDLE to File (takes ownership — do NOT also wrap in SafeHandle)
-    let file = unsafe { File::from_raw_handle(handle.0 as *mut c_void) };
+    let file = unsafe { File::from_raw_handle(handle.0) };
     Ok((file, volume_locks))
 }
 
@@ -622,17 +624,17 @@ pub fn open_source_for_reading(path: &Path) -> Result<crate::os::ElevatedSource>
         });
     }
 
-    // Physical drive - open with standard flags (no NO_BUFFERING to avoid alignment issues on reads)
-    #[cfg(debug_assertions)]
-    {
-        if !is_elevated() {
-            log::warn!(
-                "Attempting to open {} without admin privileges; requesting elevation...",
-                path.display()
-            );
-            request_elevation()?;
-            bail!("Administrator privileges required to read disk devices");
-        }
+    // Physical drive - open with standard flags (no NO_BUFFERING to avoid alignment issues on reads).
+    // Physical-disk reads need admin. Both GUI and CLI run `asInvoker`; the GUI
+    // reaches this only after the up-front "Show Physical Devices" elevation, so
+    // we are already elevated. We never relaunch here (it would exit the process
+    // mid-read). If not elevated, fail clearly.
+    if !is_elevated() {
+        bail!(
+            "Administrator privileges required to read disk devices. \
+             Use \"Show Physical Devices\" in the GUI, or re-run rb-cli from an \
+             elevated terminal (right-click -> Run as administrator)."
+        );
     }
 
     let wide = to_wide(&path_str);
@@ -649,11 +651,64 @@ pub fn open_source_for_reading(path: &Path) -> Result<crate::os::ElevatedSource>
     }
     .with_context(|| format!("cannot open {} for reading", path.display()))?;
 
-    let file = unsafe { File::from_raw_handle(handle.0 as *mut c_void) };
+    let file = unsafe { File::from_raw_handle(handle.0) };
     Ok(crate::os::ElevatedSource {
         file,
         temp_path: None,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Privileged disk access implementation (Windows)
+// ---------------------------------------------------------------------------
+
+use crate::privileged::{AccessStatus, DiskHandle, PrivilegedDiskAccess};
+
+/// Windows implementation of privileged disk access.
+///
+/// Uses direct file I/O. The app should be launched with UAC elevation
+/// (which it already requests via manifest).
+pub struct WindowsDiskAccess {
+    // TODO: Track open handles
+}
+
+impl WindowsDiskAccess {
+    pub fn new() -> Result<Self> {
+        Ok(Self {})
+    }
+}
+
+impl PrivilegedDiskAccess for WindowsDiskAccess {
+    fn check_status(&self) -> Result<AccessStatus> {
+        // The GUI launches `asInvoker`; elevation is on-demand via the top-bar
+        // "Show Physical Devices" button. Report NeedsElevation when not admin
+        // so callers can surface that path instead of treating it as an error.
+        if is_elevated() {
+            Ok(AccessStatus::Ready)
+        } else {
+            Ok(AccessStatus::NeedsElevation)
+        }
+    }
+
+    fn open_disk_read(&mut self, _path: &Path) -> Result<DiskHandle> {
+        anyhow::bail!("Windows privileged disk access not yet implemented")
+    }
+
+    fn open_disk_write(&mut self, _path: &Path) -> Result<DiskHandle> {
+        anyhow::bail!("Windows privileged disk access not yet implemented")
+    }
+
+    fn read_sectors(&mut self, _handle: DiskHandle, _lba: u64, _count: u32) -> Result<Vec<u8>> {
+        anyhow::bail!("Windows privileged disk access not yet implemented")
+    }
+
+    fn write_sectors(&mut self, _handle: DiskHandle, _lba: u64, _data: &[u8]) -> Result<()> {
+        anyhow::bail!("Windows privileged disk access not yet implemented")
+    }
+
+    fn close_disk(&mut self, _handle: DiskHandle) -> Result<()> {
+        anyhow::bail!("Windows privileged disk access not yet implemented")
+    }
 }
 
 #[cfg(test)]
@@ -699,7 +754,10 @@ mod tests {
     fn test_string_from_buffer_offset() {
         let buf = b"header\0\0Samsung SSD\0extra";
         assert_eq!(string_from_buffer_offset(buf, 8), "Samsung SSD");
-        assert_eq!(string_from_buffer_offset(buf, 0), "header");
+        // Offset 0 means "field not present" in the STORAGE_DEVICE_DESCRIPTOR
+        // layout this parses, so it deliberately yields an empty string even
+        // though byte 0 happens to start "header".
+        assert_eq!(string_from_buffer_offset(buf, 0), "");
         assert_eq!(string_from_buffer_offset(buf, 100), "");
     }
 
@@ -711,58 +769,5 @@ mod tests {
             !devices.is_empty(),
             "should find at least one physical drive"
         );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Privileged disk access implementation (Windows)
-// ---------------------------------------------------------------------------
-
-use crate::privileged::{AccessStatus, DiskHandle, PrivilegedDiskAccess};
-
-/// Windows implementation of privileged disk access.
-///
-/// Uses direct file I/O. The app should be launched with UAC elevation
-/// (which it already requests via manifest).
-pub struct WindowsDiskAccess {
-    // TODO: Track open handles
-}
-
-impl WindowsDiskAccess {
-    pub fn new() -> Result<Self> {
-        Ok(Self {})
-    }
-}
-
-impl PrivilegedDiskAccess for WindowsDiskAccess {
-    fn check_status(&self) -> Result<AccessStatus> {
-        // Check if we're running as administrator
-        if is_elevated() {
-            Ok(AccessStatus::Ready)
-        } else {
-            // Windows already prompts for UAC at startup
-            // If we're here and not admin, something went wrong
-            anyhow::bail!("Application must be run as administrator")
-        }
-    }
-
-    fn open_disk_read(&mut self, _path: &Path) -> Result<DiskHandle> {
-        anyhow::bail!("Windows privileged disk access not yet implemented")
-    }
-
-    fn open_disk_write(&mut self, _path: &Path) -> Result<DiskHandle> {
-        anyhow::bail!("Windows privileged disk access not yet implemented")
-    }
-
-    fn read_sectors(&mut self, _handle: DiskHandle, _lba: u64, _count: u32) -> Result<Vec<u8>> {
-        anyhow::bail!("Windows privileged disk access not yet implemented")
-    }
-
-    fn write_sectors(&mut self, _handle: DiskHandle, _lba: u64, _data: &[u8]) -> Result<()> {
-        anyhow::bail!("Windows privileged disk access not yet implemented")
-    }
-
-    fn close_disk(&mut self, _handle: DiskHandle) -> Result<()> {
-        anyhow::bail!("Windows privileged disk access not yet implemented")
     }
 }

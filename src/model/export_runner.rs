@@ -458,6 +458,158 @@ pub fn start_per_partition(inputs: PerPartitionInputs) -> Arc<Mutex<ExportStatus
     status
 }
 
+/// True if a partition row is a classic-HFS volume eligible for HFV export:
+/// an MBR 0xAF, an APM `Apple_HFS`, or a partition-less HFS superfloppy — but
+/// never an HFS+/HFSX (a tagged `Apple_HFS (HFS+)` row, or `0xAF` carrying an
+/// HFS+ volume). Mirrors the inspect-tab `is_classic_hfs` gate.
+fn is_hfv_eligible(part: &PartitionInfo) -> bool {
+    let apm_hfs = part
+        .partition_type_string
+        .as_deref()
+        .map(|s| s.eq_ignore_ascii_case("Apple_HFS"))
+        .unwrap_or(false);
+    let mbr_hfs = part.partition_type_byte == 0xAF;
+    let superfloppy = part.partition_type_byte == 0 && part.type_name == "HFS";
+    if !(apm_hfs || mbr_hfs || superfloppy) {
+        return false;
+    }
+    !(part.type_name.contains("HFS+") || part.type_name.contains("HFSX"))
+}
+
+/// Spawn a per-partition **HFV** export from a raw image / device. Every
+/// classic-HFS partition is *cloned* (not streamed) into a flat BasiliskII
+/// `.hfv` of its configured export size via [`crate::fs::hfv::clone_into_hfv`];
+/// non-HFS partitions are skipped with a log line. This is the HFV branch of
+/// the Export dialog — see [`ExportFormat::Hfv`] for why it bypasses the
+/// streaming export path.
+pub fn start_per_partition_hfv(
+    source_image: PathBuf,
+    partitions: Vec<PartitionInfo>,
+    size_map: HashMap<usize, u64>,
+    dest_folder: PathBuf,
+    total_bytes: u64,
+) -> Arc<Mutex<ExportStatus>> {
+    let status = new_status(total_bytes);
+    let status_thread = Arc::clone(&status);
+
+    std::thread::spawn(move || {
+        let _wake = crate::os::wakelock::acquire("Rusty Backup: HFV export");
+        let result = run_per_partition_hfv(
+            &source_image,
+            &partitions,
+            &size_map,
+            &dest_folder,
+            &status_thread,
+        );
+        if let Ok(mut s) = status_thread.lock() {
+            s.finished = true;
+            if let Err(e) = result {
+                s.error = Some(format!("{e:#}"));
+            }
+        }
+    });
+
+    status
+}
+
+fn run_per_partition_hfv(
+    source_image: &std::path::Path,
+    partitions: &[PartitionInfo],
+    size_map: &HashMap<usize, u64>,
+    dest_folder: &std::path::Path,
+    status: &Arc<Mutex<ExportStatus>>,
+) -> anyhow::Result<()> {
+    let log = |s: &Arc<Mutex<ExportStatus>>, msg: String| {
+        if let Ok(mut g) = s.lock() {
+            g.log_messages.push(msg);
+        }
+    };
+
+    let eligible: Vec<&PartitionInfo> = partitions.iter().filter(|p| is_hfv_eligible(p)).collect();
+    if eligible.is_empty() {
+        anyhow::bail!(
+            "no classic-HFS partition found to export as HFV (HFV is classic-HFS-only; \
+             HFS+/HFSX and other filesystems can't be written as a flat HFV)"
+        );
+    }
+
+    let mut overall_written: u64 = 0;
+    for part in partitions {
+        if status.lock().map(|s| s.cancel_requested).unwrap_or(false) {
+            anyhow::bail!("export cancelled");
+        }
+        if !is_hfv_eligible(part) {
+            if !part.is_extended_container {
+                log(
+                    status,
+                    format!(
+                        "Skipping partition-{} ({}): not classic HFS, can't be a flat HFV",
+                        part.index, part.type_name
+                    ),
+                );
+            }
+            continue;
+        }
+
+        let target_size = size_map
+            .get(&part.index)
+            .copied()
+            .unwrap_or(part.size_bytes);
+        let offset = part.start_lba * 512;
+        let dest_path = dest_folder.join(format!("partition-{}.hfv", part.index));
+
+        log(
+            status,
+            format!(
+                "Exporting partition-{} to flat HFV {} ({})",
+                part.index,
+                dest_path.display(),
+                partition::format_size(target_size),
+            ),
+        );
+
+        // Open the source HFS volume, capture its name + block size, then clone
+        // it into a fresh flat HFV of the configured size. Route through the
+        // container-aware reader so a VHD/QCOW2/VMDK/CHD source is unwrapped to
+        // its decoded disk bytes — a naked File::open would read the container
+        // header where the HFS MDB is expected (e.g. a dynamic VHD's sparse
+        // header at offset 0), failing with "bad MDB signature".
+        let format = crate::rbformats::detect_image_format_with_path(
+            File::open(source_image)?,
+            Some(source_image),
+        )?;
+        let (reader, _len) =
+            crate::rbformats::wrap_image_reader(File::open(source_image)?, format)?;
+        let mut source_fs = crate::fs::hfs::HfsFilesystem::open(reader, offset)
+            .map_err(|e| anyhow::anyhow!("open source HFS at partition-{}: {e}", part.index))?;
+        let name = source_fs.volume_summary().volume_name;
+        let block_size = crate::fs::hfv::suggest_block_size(target_size);
+
+        let (bytes, report) =
+            crate::fs::hfv::clone_into_hfv(&mut source_fs, target_size, block_size, &name)
+                .map_err(|e| anyhow::anyhow!("partition-{} -> HFV: {e}", part.index))?;
+        std::fs::write(&dest_path, &bytes)
+            .map_err(|e| anyhow::anyhow!("writing {}: {e}", dest_path.display()))?;
+
+        log(
+            status,
+            format!(
+                "  partition-{}: cloned {} file(s) / {} dir(s) into a {} MiB HFV",
+                part.index,
+                report.files_copied,
+                report.dirs_copied,
+                bytes.len() / (1024 * 1024),
+            ),
+        );
+
+        overall_written += target_size;
+        if let Ok(mut s) = status.lock() {
+            s.current_bytes = overall_written;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_per_partition(
     format: ExportFormat,

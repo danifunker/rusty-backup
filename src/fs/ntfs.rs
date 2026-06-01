@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
 use anyhow::{bail, Result};
@@ -14,9 +15,10 @@ const MFT_RECORD_ROOT: u64 = 5;
 const MFT_RECORD_BITMAP: u64 = 6;
 
 // Attribute type codes
+const ATTR_ATTRIBUTE_LIST: u32 = 0x20;
 const ATTR_VOLUME_NAME: u32 = 0x60;
 const ATTR_VOLUME_INFORMATION: u32 = 0x70;
-const ATTR_DATA: u32 = 0x80;
+pub(crate) const ATTR_DATA: u32 = 0x80;
 const ATTR_INDEX_ROOT: u32 = 0x90;
 const ATTR_INDEX_ALLOCATION: u32 = 0xA0;
 const ATTR_BITMAP: u32 = 0xB0;
@@ -38,16 +40,17 @@ const INDEX_ENTRY_END: u32 = 0x02;
 const FILE_ATTR_DIRECTORY: u32 = 0x1000_0000;
 
 /// NTFS Volume Boot Record fields.
-struct NtfsVbr {
-    bytes_per_sector: u64,
-    sectors_per_cluster: u64,
-    total_sectors: u64,
-    mft_cluster: u64,
-    mft_mirror_cluster: u64,
-    mft_record_size: u32,
+#[derive(Clone)]
+pub(crate) struct NtfsVbr {
+    pub(crate) bytes_per_sector: u64,
+    pub(crate) sectors_per_cluster: u64,
+    pub(crate) total_sectors: u64,
+    pub(crate) mft_cluster: u64,
+    pub(crate) mft_mirror_cluster: u64,
+    pub(crate) mft_record_size: u32,
 }
 
-fn parse_vbr(vbr: &[u8; 512]) -> Result<NtfsVbr, FilesystemError> {
+pub(crate) fn parse_vbr(vbr: &[u8; 512]) -> Result<NtfsVbr, FilesystemError> {
     // Check OEM ID: "NTFS    " at offset 3
     if &vbr[3..11] != b"NTFS    " {
         return Err(FilesystemError::Parse(
@@ -101,34 +104,34 @@ fn parse_vbr(vbr: &[u8; 512]) -> Result<NtfsVbr, FilesystemError> {
 
 /// A parsed attribute from an MFT record.
 #[derive(Debug, Clone)]
-struct MftAttribute {
-    attr_type: u32,
-    resident: bool,
+pub(crate) struct MftAttribute {
+    pub(crate) attr_type: u32,
+    pub(crate) resident: bool,
     /// For resident attributes, the raw value data.
-    value: Vec<u8>,
+    pub(crate) value: Vec<u8>,
     /// For non-resident attributes, the data runs.
-    data_runs: Vec<DataRun>,
+    pub(crate) data_runs: Vec<DataRun>,
     /// For non-resident: real size of attribute data.
-    real_size: u64,
+    pub(crate) real_size: u64,
     /// For non-resident: allocated size.
     #[allow(dead_code)]
-    allocated_size: u64,
+    pub(crate) allocated_size: u64,
     /// For non-resident: starting VCN.
     #[allow(dead_code)]
-    starting_vcn: u64,
+    pub(crate) starting_vcn: u64,
 }
 
 /// A single data run (cluster offset, length in clusters).
 #[derive(Debug, Clone)]
-struct DataRun {
+pub(crate) struct DataRun {
     /// Absolute cluster offset (cumulative from previous runs).
-    cluster_offset: i64,
+    pub(crate) cluster_offset: i64,
     /// Number of clusters in this run.
-    length: u64,
+    pub(crate) length: u64,
 }
 
 /// Decode data runs from an MFT attribute's non-resident data.
-fn decode_data_runs(data: &[u8]) -> Vec<DataRun> {
+pub(crate) fn decode_data_runs(data: &[u8]) -> Vec<DataRun> {
     let mut runs = Vec::new();
     let mut pos = 0;
     let mut prev_offset: i64 = 0;
@@ -188,7 +191,7 @@ fn decode_data_runs(data: &[u8]) -> Vec<DataRun> {
 }
 
 /// Parse attributes from an MFT record (already fixup-applied).
-fn parse_mft_attributes(record: &[u8], record_size: u32) -> Vec<MftAttribute> {
+pub(crate) fn parse_mft_attributes(record: &[u8], record_size: u32) -> Vec<MftAttribute> {
     let mut attrs = Vec::new();
 
     if record.len() < 24 {
@@ -331,7 +334,7 @@ fn parse_mft_attributes(record: &[u8], record_size: u32) -> Vec<MftAttribute> {
 }
 
 /// Apply fixup array to an MFT record buffer.
-fn apply_fixup(record: &mut [u8], bytes_per_sector: u64) -> Result<(), FilesystemError> {
+pub(crate) fn apply_fixup(record: &mut [u8], bytes_per_sector: u64) -> Result<(), FilesystemError> {
     if record.len() < 48 {
         return Err(FilesystemError::Parse(
             "MFT record too small for fixup".into(),
@@ -386,6 +389,12 @@ pub struct NtfsFilesystem<R> {
     ntfs_version: (u8, u8),
     fs_type_string: String,
     used_bytes: u64,
+    mft_cache: HashMap<u64, Vec<u8>>,
+    /// Data runs of the $MFT's own $DATA attribute. Empty until loaded in
+    /// `open()`; when populated, record reads/writes resolve through these
+    /// runs so a fragmented MFT is read correctly instead of assuming the
+    /// whole table is one contiguous run starting at `mft_cluster`.
+    mft_data_runs: Vec<DataRun>,
 }
 
 impl<R: Read + Seek> NtfsFilesystem<R> {
@@ -413,7 +422,15 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
             ntfs_version: (0, 0),
             fs_type_string: String::new(),
             used_bytes: 0,
+            mft_cache: HashMap::new(),
+            mft_data_runs: Vec::new(),
         };
+
+        // Load the $MFT's own data runs (record 0) so reads of high record
+        // numbers follow the table across fragments. Record 0 always lives in
+        // the first fragment at `mft_cluster`, so this initial read uses the
+        // contiguous fallback (mft_data_runs is still empty here).
+        fs.mft_data_runs = fs.read_mft_self_data_runs().unwrap_or_default();
 
         // Read NTFS version from $Volume (MFT record #3)
         fs.ntfs_version = fs.read_ntfs_version().unwrap_or((0, 0));
@@ -427,9 +444,6 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
         // Read volume label from $Volume
         fs.label = fs.read_volume_label();
 
-        // Read used size from $Bitmap
-        fs.used_bytes = fs.calculate_used_bytes().unwrap_or(0);
-
         Ok(fs)
     }
 
@@ -438,14 +452,26 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
         self.partition_offset + cluster * self.cluster_size
     }
 
-    /// Read an MFT record by record number.
-    fn read_mft_record(&mut self, record_number: u64) -> Result<Vec<u8>, FilesystemError> {
-        let mft_offset = self.cluster_offset(self.mft_cluster);
-        let record_offset = mft_offset + record_number * self.mft_record_size as u64;
+    const MFT_CACHE_MAX: usize = 4096;
 
-        self.reader.seek(SeekFrom::Start(record_offset))?;
+    /// Read an MFT record by record number, returning a cached copy when available.
+    fn read_mft_record(&mut self, record_number: u64) -> Result<Vec<u8>, FilesystemError> {
+        if let Some(cached) = self.mft_cache.get(&record_number) {
+            return Ok(cached.clone());
+        }
+
         let mut record = vec![0u8; self.mft_record_size as usize];
-        self.reader.read_exact(&mut record)?;
+        let logical = record_number * self.mft_record_size as u64;
+        if self.mft_data_runs.is_empty() {
+            // Fallback: assume the MFT is one contiguous run. Used while
+            // bootstrapping (reading record 0 before runs are loaded) and for
+            // volumes whose $MFT $DATA runs we couldn't parse.
+            let record_offset = self.cluster_offset(self.mft_cluster) + logical;
+            self.reader.seek(SeekFrom::Start(record_offset))?;
+            self.reader.read_exact(&mut record)?;
+        } else {
+            self.read_mft_bytes(logical, &mut record)?;
+        }
 
         // Verify FILE magic
         if &record[0..4] != b"FILE" {
@@ -457,7 +483,50 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
 
         apply_fixup(&mut record, self.bytes_per_sector)?;
 
+        if self.mft_cache.len() >= Self::MFT_CACHE_MAX {
+            self.mft_cache.clear();
+        }
+        self.mft_cache.insert(record_number, record.clone());
+
         Ok(record)
+    }
+
+    /// Parse the $MFT's own non-resident $DATA runs from record 0 so that
+    /// record reads/writes can follow a fragmented MFT across the disk.
+    fn read_mft_self_data_runs(&mut self) -> Result<Vec<DataRun>, FilesystemError> {
+        let record = self.read_mft_record(0)?;
+        let attrs = parse_mft_attributes(&record, self.mft_record_size);
+        for attr in &attrs {
+            if attr.attr_type == ATTR_DATA && !attr.resident && !attr.data_runs.is_empty() {
+                return Ok(attr.data_runs.clone());
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    /// Read `buf.len()` bytes starting at logical byte offset `start` within
+    /// the $MFT data stream, resolving each cluster through the MFT's data
+    /// runs. Handles records that straddle a run boundary by reading one
+    /// run-contiguous chunk at a time.
+    fn read_mft_bytes(&mut self, start: u64, buf: &mut [u8]) -> Result<(), FilesystemError> {
+        let runs = self.mft_data_runs.clone();
+        let cluster_size = self.cluster_size;
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            let logical = start + filled as u64;
+            let vcn = logical / cluster_size;
+            let intra = (logical % cluster_size) as usize;
+            let disk_off = self.resolve_vcn_to_offset(&runs, vcn).ok_or_else(|| {
+                FilesystemError::Parse(format!(
+                    "MFT logical offset {logical} (vcn {vcn}) not mapped by $MFT data runs"
+                ))
+            })?;
+            let chunk = (cluster_size as usize - intra).min(buf.len() - filled);
+            self.reader.seek(SeekFrom::Start(disk_off + intra as u64))?;
+            self.reader.read_exact(&mut buf[filled..filled + chunk])?;
+            filled += chunk;
+        }
+        Ok(())
     }
 
     /// Read the NTFS version from the $Volume MFT entry (record #3).
@@ -498,6 +567,91 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
         }
 
         None
+    }
+
+    /// Collect the complete unnamed `$DATA` for a file whose base record uses an
+    /// `$ATTRIBUTE_LIST` to spill attributes into extension records (the case
+    /// for heavily-fragmented files like large registry hives, whose runlist no
+    /// longer fits in one MFT record).
+    ///
+    /// Returns `Ok(None)` when the base record has no `$ATTRIBUTE_LIST` — the
+    /// caller then uses the base record's own `$DATA` as before. Otherwise walks
+    /// the attribute list, gathers every unnamed `$DATA` fragment (matched by its
+    /// `(holding-record, starting-VCN)`), reads each holding record, and
+    /// concatenates the fragments' data runs in VCN order. The runs each carry
+    /// absolute LCNs, so concatenation reconstructs the whole file. `real_size`
+    /// comes from the `starting_vcn == 0` fragment (the only one that records it).
+    fn collect_attrlist_data(
+        &mut self,
+        record_number: u64,
+    ) -> Result<Option<(Vec<DataRun>, u64)>, FilesystemError> {
+        let base = self.read_mft_record(record_number)?;
+        let base_attrs = parse_mft_attributes(&base, self.mft_record_size);
+
+        let mut attrlist: Option<Vec<u8>> = None;
+        for a in &base_attrs {
+            if a.attr_type == ATTR_ATTRIBUTE_LIST {
+                attrlist = Some(if a.resident {
+                    a.value.clone()
+                } else {
+                    self.read_attribute_data(a, None)?
+                });
+                break;
+            }
+        }
+        let Some(al) = attrlist else {
+            return Ok(None);
+        };
+
+        // Walk attribute-list entries; collect unnamed $DATA fragments as
+        // (holding mft record, starting VCN). Entry layout: type(4) len(2)
+        // name_len(1) name_off(1) start_vcn(8) base_ref(8) attr_id(2) [name].
+        let mut frags: Vec<(u64, u64)> = Vec::new();
+        let mut p = 0usize;
+        while p + 0x1A <= al.len() {
+            let atype = u32::from_le_bytes([al[p], al[p + 1], al[p + 2], al[p + 3]]);
+            let elen = u16::from_le_bytes([al[p + 4], al[p + 5]]) as usize;
+            if elen < 0x1A || p + elen > al.len() {
+                break;
+            }
+            let name_len = al[p + 6];
+            if atype == ATTR_DATA && name_len == 0 {
+                let svcn = u64::from_le_bytes(al[p + 8..p + 16].try_into().unwrap());
+                let mref = u64::from_le_bytes(al[p + 0x10..p + 0x18].try_into().unwrap())
+                    & 0xFFFF_FFFF_FFFF;
+                frags.push((mref, svcn));
+            }
+            p += elen;
+        }
+        if frags.is_empty() {
+            return Ok(None);
+        }
+        frags.sort_by_key(|&(_, svcn)| svcn);
+        frags.dedup();
+
+        let mut runs: Vec<DataRun> = Vec::new();
+        let mut real_size = 0u64;
+        for (mref, svcn) in &frags {
+            let rec = if *mref == record_number {
+                base.clone()
+            } else {
+                self.read_mft_record(*mref)?
+            };
+            let attrs = parse_mft_attributes(&rec, self.mft_record_size);
+            for a in &attrs {
+                if a.attr_type == ATTR_DATA && !a.resident && a.starting_vcn == *svcn {
+                    if *svcn == 0 {
+                        real_size = a.real_size;
+                    }
+                    runs.extend(a.data_runs.iter().cloned());
+                    break;
+                }
+            }
+        }
+        if runs.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some((runs, real_size)))
     }
 
     /// Read attribute data (handles both resident and non-resident).
@@ -612,6 +766,13 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
 
         data.truncate(limit as usize);
         Ok(data)
+    }
+
+    /// Populate `used_bytes` from $Bitmap if not already computed.
+    pub fn ensure_used_bytes(&mut self) {
+        if self.used_bytes == 0 {
+            self.used_bytes = self.calculate_used_bytes().unwrap_or(0);
+        }
     }
 
     /// Calculate used bytes by reading the $Bitmap (MFT record #6).
@@ -736,61 +897,96 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
         )
     }
 
-    /// Parse index entries from $INDEX_ALLOCATION (non-resident B+ tree nodes).
+    /// Resolve a VCN (virtual cluster number) within an attribute's data runs
+    /// to an absolute byte offset on disk. Returns `None` for sparse runs.
+    fn resolve_vcn_to_offset(&self, runs: &[DataRun], vcn: u64) -> Option<u64> {
+        let mut run_vcn: u64 = 0;
+        for run in runs {
+            let run_end = run_vcn + run.length;
+            if vcn >= run_vcn && vcn < run_end {
+                if run.cluster_offset == 0 {
+                    return None;
+                }
+                let offset_in_run = vcn - run_vcn;
+                return Some(self.cluster_offset((run.cluster_offset as u64) + offset_in_run));
+            }
+            run_vcn = run_end;
+        }
+        None
+    }
+
+    /// Parse index entries from $INDEX_ALLOCATION by reading one INDX record at
+    /// a time via VCN lookup, skipping records the bitmap marks as unused.
     fn parse_index_allocation_entries(
         &mut self,
         attr: &MftAttribute,
-        _bitmap: &[u8],
+        bitmap: &[u8],
         parent_path: &str,
         entries: &mut Vec<FileEntry>,
     ) -> Result<(), FilesystemError> {
-        let data = self.read_attribute_data(attr, None)?;
+        let record_size: u64 = 4096;
+        let clusters_per_record = record_size.div_ceil(self.cluster_size);
+        let total_records = if attr.real_size > 0 {
+            attr.real_size / record_size
+        } else {
+            attr.allocated_size / record_size
+        };
 
-        // Index allocation is a sequence of INDX records
-        let record_size = 4096; // Standard NTFS index record size
-        let mut pos = 0;
+        let runs = attr.data_runs.clone();
 
-        while pos + record_size <= data.len() {
-            let record = &data[pos..pos + record_size];
+        for i in 0..total_records {
+            if !bitmap.is_empty() {
+                let byte_idx = i as usize / 8;
+                let bit_idx = i as usize % 8;
+                if byte_idx < bitmap.len() && bitmap[byte_idx] & (1 << bit_idx) == 0 {
+                    continue;
+                }
+            }
 
-            // Check for INDX magic
-            if &record[0..4] != b"INDX" {
-                pos += record_size;
+            let vcn = i * clusters_per_record;
+            let disk_offset = match self.resolve_vcn_to_offset(&runs, vcn) {
+                Some(off) => off,
+                None => continue,
+            };
+
+            self.reader.seek(SeekFrom::Start(disk_offset))?;
+            let mut record_buf = vec![0u8; record_size as usize];
+            if self.reader.read_exact(&mut record_buf).is_err() {
                 continue;
             }
 
-            // Apply fixup to a copy
-            let mut record_copy = record.to_vec();
-            let _ = apply_fixup(&mut record_copy, self.bytes_per_sector);
+            if &record_buf[0..4] != b"INDX" {
+                continue;
+            }
 
-            // Index node header is at offset 0x18 in INDX record
+            if apply_fixup(&mut record_buf, self.bytes_per_sector).is_err() {
+                continue;
+            }
+
             let node_offset = 0x18;
-            if node_offset + 16 > record_copy.len() {
-                pos += record_size;
+            if node_offset + 16 > record_buf.len() {
                 continue;
             }
 
             let entries_offset = u32::from_le_bytes([
-                record_copy[node_offset],
-                record_copy[node_offset + 1],
-                record_copy[node_offset + 2],
-                record_copy[node_offset + 3],
+                record_buf[node_offset],
+                record_buf[node_offset + 1],
+                record_buf[node_offset + 2],
+                record_buf[node_offset + 3],
             ]) as usize;
 
             let entries_size = u32::from_le_bytes([
-                record_copy[node_offset + 4],
-                record_copy[node_offset + 5],
-                record_copy[node_offset + 6],
-                record_copy[node_offset + 7],
+                record_buf[node_offset + 4],
+                record_buf[node_offset + 5],
+                record_buf[node_offset + 6],
+                record_buf[node_offset + 7],
             ]) as usize;
 
             let start = node_offset + entries_offset;
-            let end = (node_offset + entries_size).min(record_copy.len());
+            let end = (node_offset + entries_size).min(record_buf.len());
             if start < end {
-                let _ = self.parse_index_entry_list(&record_copy[start..end], parent_path, entries);
+                let _ = self.parse_index_entry_list(&record_buf[start..end], parent_path, entries);
             }
-
-            pos += record_size;
         }
 
         Ok(())
@@ -840,8 +1036,13 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
                 ]) & 0x0000_FFFF_FFFF_FFFF;
 
                 if let Some(entry) = self.parse_file_name_entry(content, parent_path, mft_ref) {
-                    // Skip system metafiles (MFT records 0-23)
-                    if mft_ref >= 24 || (11..24).contains(&mft_ref) {
+                    // NTFS reserves MFT records 0-23 for system metafiles
+                    // ($MFT, $Bitmap, $Boot, $Extend, $ObjId, ...). These are
+                    // filesystem metadata, not user files (Windows hides them),
+                    // and the reserved $Extend children have no unnamed $DATA
+                    // attribute, so reading them as files fails. User files
+                    // always start at record 24, so only push those.
+                    if mft_ref >= 24 {
                         entries.push(entry);
                     }
                 }
@@ -969,6 +1170,14 @@ impl<R: Read + Seek + Send> Filesystem for NtfsFilesystem<R> {
         let record = self.read_mft_record(record_number)?;
         let attrs = parse_mft_attributes(&record, self.mft_record_size);
 
+        // A non-resident $DATA in the base record is complete only when there's
+        // no $ATTRIBUTE_LIST spilling the rest into extension records. Prefer the
+        // attribute-list collection when present so fragmented files (large
+        // registry hives, etc.) read in full.
+        if let Some((runs, real_size)) = self.collect_attrlist_data(record_number)? {
+            return self.read_data_runs(&runs, real_size, Some(max_bytes as u64));
+        }
+
         for attr in &attrs {
             if attr.attr_type == ATTR_DATA {
                 return self.read_attribute_data(attr, Some(max_bytes as u64));
@@ -991,6 +1200,16 @@ impl<R: Read + Seek + Send> Filesystem for NtfsFilesystem<R> {
         }
         let record = self.read_mft_record(entry.location)?;
         let attrs = parse_mft_attributes(&record, self.mft_record_size);
+        // Follow $ATTRIBUTE_LIST first (see read_file) so fragmented files whose
+        // runlist spilled into extension records stream in full.
+        if let Some((runs, real_size)) = self.collect_attrlist_data(entry.location)? {
+            let cap = if entry.size > 0 {
+                entry.size
+            } else {
+                real_size
+            };
+            return self.write_data_runs_to(&runs, real_size, writer, cap);
+        }
         for attr in &attrs {
             if attr.attr_type == ATTR_DATA {
                 return self.write_attribute_data_to(attr, writer, entry.size);
@@ -1442,10 +1661,38 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
         record: &mut [u8],
     ) -> Result<(), FilesystemError> {
         prepare_fixup(record, self.bytes_per_sector);
-        let mft_offset = self.cluster_offset(self.mft_cluster);
-        let record_offset = mft_offset + record_number * self.mft_record_size as u64;
-        self.reader.seek(SeekFrom::Start(record_offset))?;
-        self.reader.write_all(record)?;
+        let logical = record_number * self.mft_record_size as u64;
+        if self.mft_data_runs.is_empty() {
+            let record_offset = self.cluster_offset(self.mft_cluster) + logical;
+            self.reader.seek(SeekFrom::Start(record_offset))?;
+            self.reader.write_all(record)?;
+        } else {
+            self.write_mft_bytes(logical, record)?;
+        }
+        self.mft_cache.remove(&record_number);
+        Ok(())
+    }
+
+    /// Write `buf` to the $MFT data stream starting at logical byte offset
+    /// `start`, following the MFT's data runs across fragments.
+    fn write_mft_bytes(&mut self, start: u64, buf: &[u8]) -> Result<(), FilesystemError> {
+        let runs = self.mft_data_runs.clone();
+        let cluster_size = self.cluster_size;
+        let mut written = 0usize;
+        while written < buf.len() {
+            let logical = start + written as u64;
+            let vcn = logical / cluster_size;
+            let intra = (logical % cluster_size) as usize;
+            let disk_off = self.resolve_vcn_to_offset(&runs, vcn).ok_or_else(|| {
+                FilesystemError::Parse(format!(
+                    "MFT logical offset {logical} (vcn {vcn}) not mapped by $MFT data runs"
+                ))
+            })?;
+            let chunk = (cluster_size as usize - intra).min(buf.len() - written);
+            self.reader.seek(SeekFrom::Start(disk_off + intra as u64))?;
+            self.reader.write_all(&buf[written..written + chunk])?;
+            written += chunk;
+        }
         Ok(())
     }
 
@@ -3382,10 +3629,12 @@ mod tests {
         let entries = fs.list_directory(&root).unwrap();
         assert!(!entries.iter().any(|e| e.name == "temp.txt"));
 
-        // Free space should be restored (approximately)
+        // Free space should be restored (approximately) after delete.
         let final_free = fs.free_space().unwrap();
-        assert!(final_free >= initial_free - self::count_set_bits(&[]) * 0); // just check >= initial roughly
-        let _ = final_free; // avoid unused warning
+        assert!(
+            final_free >= initial_free,
+            "free space did not recover after delete"
+        );
     }
 
     #[test]

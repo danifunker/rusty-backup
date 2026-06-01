@@ -87,6 +87,10 @@ pub struct ExtractionProgress {
     pub total_bytes: u64,
     pub current_file: String,
     pub files_extracted: u32,
+    /// Count of entries skipped because they could not be read/written
+    /// (e.g. NTFS system metafiles with no $DATA attribute). A skipped
+    /// file does not abort the whole extraction.
+    pub files_skipped: u32,
     pub total_files: u32,
     pub finished: bool,
     pub error: Option<String>,

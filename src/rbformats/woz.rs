@@ -355,6 +355,7 @@ fn find_data_prologue(stream: &mut BitStream) -> bool {
 /// The disk stores 342 nibbles:
 /// - First 86 nibbles: auxiliary buffer (low 2 bits of bytes 0-255, packed 3 per nibble)
 /// - Next 256 nibbles: primary buffer (high 6 bits of bytes 0-255)
+///
 /// Then 1 checksum nibble.
 ///
 /// Each nibble is XOR'd with the previous to form a running checksum.
@@ -499,8 +500,8 @@ fn sectors_for_track(track: usize) -> usize {
 /// Total sectors on one side of an 80-track 3.5" disk.
 const TOTAL_SECTORS_35: usize = 800; // 12*16 + 11*16 + 10*16 + 9*16 + 8*16
 
-/// 3.5" GCR decode table — same as 5.25" (6-and-2 encoding).
-/// The nibble encoding is identical; what differs is the sector format.
+// 3.5" GCR decode table — same as 5.25" (6-and-2 encoding).
+// The nibble encoding is identical; what differs is the sector format.
 
 /// Find a 3.5" address field.
 /// 3.5" address fields use prologue D5 AA 96, same as 5.25" but with different
@@ -826,6 +827,12 @@ impl WozReader {
         self.data.len() as u64
     }
 
+    /// `true` if no data was decoded (always `false` for a valid WOZ
+    /// image; mandated by clippy alongside `len()`).
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
     /// Human-readable disk type description.
     pub fn disk_type_name(&self) -> &'static str {
         match self.disk_type {
@@ -948,70 +955,5 @@ mod tests {
             disk_type: DISK_TYPE_525,
         };
         assert_eq!(reader.len(), 1000);
-    }
-}
-
-/// Tests that require real disk images from ~/Downloads (skipped if absent).
-#[cfg(test)]
-mod integration_tests {
-    use super::*;
-
-    #[test]
-    fn test_35_woz_decodes_filesystem() {
-        let path = std::path::Path::new(env!("HOME")).join("Downloads/4th & Inches IIgs.woz");
-        if !path.exists() {
-            return;
-        }
-
-        let reader = WozReader::open(&path).expect("failed to open WOZ file");
-        assert_eq!(
-            reader.len(),
-            819200,
-            "expected 800K double-sided 3.5\" image"
-        );
-
-        let data = &reader.data;
-        let non_zero = data.iter().filter(|&&b| b != 0).count();
-        assert!(non_zero > 1000, "decoded data is mostly zeros");
-
-        // ProDOS volume directory key block is at block 2 (offset 1024)
-        assert!(
-            crate::rbformats::interleave::has_prodos_volume_header(&data[1024..]),
-            "expected ProDOS volume header at offset 1024"
-        );
-
-        // Verify all files are readable (catches block ordering bugs)
-        let woz = WozReader::open(&path).unwrap();
-        let mut fs = crate::fs::open_filesystem(woz, 0, 0, None).unwrap();
-        let root_entry = fs.root().unwrap();
-        let root = fs.list_directory(&root_entry).unwrap();
-        assert!(!root.is_empty(), "root directory should not be empty");
-
-        fn collect_files(
-            fs: &mut dyn crate::fs::filesystem::Filesystem,
-            dir: &[crate::fs::entry::FileEntry],
-            all: &mut Vec<crate::fs::entry::FileEntry>,
-        ) {
-            for e in dir {
-                all.push(e.clone());
-                if e.entry_type == crate::fs::entry::EntryType::Directory {
-                    if let Ok(children) = fs.list_directory(e) {
-                        collect_files(fs, &children, all);
-                    }
-                }
-            }
-        }
-        let mut all_entries = Vec::new();
-        collect_files(&mut *fs, &root, &mut all_entries);
-
-        let mut failures = Vec::new();
-        for e in &all_entries {
-            if e.entry_type == crate::fs::entry::EntryType::File && e.size > 0 {
-                if let Err(err) = fs.read_file(e, e.size as usize) {
-                    failures.push(format!("{}: {}", e.name, err));
-                }
-            }
-        }
-        assert!(failures.is_empty(), "Failed to read files: {:?}", failures);
     }
 }

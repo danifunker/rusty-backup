@@ -2258,6 +2258,7 @@ fn run_clonezilla_restore(
 }
 
 /// Write a Clonezilla disk image: MBR/GPT, hidden data, EBR, and partition data.
+#[allow(clippy::too_many_arguments)] // Clonezilla restore takes image + overrides + sizes + callbacks
 fn write_clonezilla_disk(
     cz_image: &ClonezillaImage,
     overrides: &[PartitionSizeOverride],
@@ -2268,8 +2269,6 @@ fn write_clonezilla_disk(
     disk_target_size: u64,
     progress: &Arc<Mutex<RestoreProgress>>,
 ) -> Result<u64> {
-    use std::io;
-
     let mut total_written: u64 = 0;
     let target_size = progress.lock().map(|p| p.total_bytes).unwrap_or(0);
     let target_sectors = disk_target_size / 512;
@@ -2444,7 +2443,7 @@ fn write_clonezilla_disk(
                     } else {
                         match writer.seek(SeekFrom::Current(pad as i64)) {
                             Ok(_) => total_written += pad,
-                            Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+                            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
                                 crate::rbformats::write_zeros(writer, pad)?;
                                 total_written += pad;
                             }
@@ -3567,7 +3566,7 @@ mod tests {
         mbr[off + 12..off + 16].copy_from_slice(&PART_SECTORS.to_le_bytes());
         mbr[510] = 0x55;
         mbr[511] = 0xAA;
-        std::fs::write(backup_folder.join("mbr.bin"), &mbr).unwrap();
+        std::fs::write(backup_folder.join("mbr.bin"), mbr).unwrap();
         std::fs::write(backup_folder.join("partition-0.raw"), &clone_buf).unwrap();
 
         // Compute the SHA256 over the partition file so verify::compute_checksum

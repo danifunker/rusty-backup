@@ -1,0 +1,138 @@
+# GHO password decryption — SOLVED
+
+Status: **solved** (2026-05-31). Reverse-engineered from `ghostexp.exe` (Ghost
+Explorer 11.5) and verified bit-exact against real password-protected fixtures.
+Implemented in [`src/rbformats/gho_crypto.rs`](../src/rbformats/gho_crypto.rs);
+wired through `GhoReader::open_with_password`, `source_reader`, the CLI
+`--password` flag, and the GUI password prompt.
+
+## The scheme
+
+Ghost encrypts only the **bodies** of the inner record stream. The container
+header, the 10-byte record headers, and inter-record bytes stay in clear text —
+which is why an encrypted image's record skeleton is byte-identical to its
+unencrypted twin. Each body is enciphered **independently**, with the cipher
+state reset to the password seed at the start of every body.
+
+### 1. Password -> 16-bit seed (`sub_4dc860`)
+
+```
+pw   = ascii_uppercase(password)[..11]    # case-insensitive, max 11 bytes
+crc  = 0
+for b in pw:
+    crc = ((crc << 8) ^ CRC32_FWD[((crc >> 24) ^ b) & 0xff]) & 0xffffffff
+seed = (crc ^ (crc >> 16)) & 0xffff
+```
+
+`CRC32_FWD` is the standard **forward** CRC-32 table (poly `0x04C11DB7`,
+MSB-first, init 0, no reflection, no final XOR). The reader (`ghostexp.exe`)
+uppercases the password and `strncpy`s it to 11 bytes, so Ghost passwords are
+case-insensitive and only the first 11 characters matter. Example:
+`"password"` -> `"PASSWORD"` -> seed `0x9BE1`; `"Sw0rdFish"` /
+`"sw0rdfish"` / `"SW0RDFISH"` all -> seed `0x0E4B` (verified against a real
+fixture).
+
+Note: Ghost's *writer* (`ghost.exe -PWD=`) caps the password at **10**
+characters ("Usage Error 19000"), one below the reader's 11-byte truncation —
+so for every password Ghost can actually create, the 11th byte never matters
+and the two limits agree. We truncate at 11 to match the reader exactly.
+
+### 2. Verifier / wrong-password check (`SetPassword @ 0x4d14d0`)
+
+When `password_flag` (header offset `0x0B`) is `1`, a 16-byte verifier follows
+the prefix at offset `0x0C`. Decrypting it with the seed yields
+`b"BinaryResearch\0"` in its first 15 bytes for the correct password (byte 16 is
+framing). This is the fast wrong-password check (`gho_verify_seed`).
+
+### 3. Body cipher (`decrypt @ 0x4dc920`, `encrypt @ 0x4dc8d0`)
+
+A self-synchronising CRC-16-CCITT keystream cipher. The 256-entry 16-bit table
+is built at runtime (`sub_4dc7d0` -> `sub_4dc710`) as a CRC-16-CCITT
+(poly `0x1021`) **pre-seeded with `0x07A2`** and the index interleaved as it
+shifts — a non-standard table.
+
+```
+state = seed                       # reset at the start of EACH body
+for each ciphertext byte c:
+    plain = c ^ (state & 0xff)
+    state = ((state & 0xff) << 8) ^ TABLE16[(state >> 8) ^ c]
+```
+
+The feedback uses the ciphertext byte, so encrypt and decrypt share the same
+state update.
+
+### 4. What gets encrypted, by image mode
+
+The cipher, seed, and verifier above are identical across every mode. Only the
+*framing* — which byte ranges get an independent per-unit reset — changes:
+
+| Image mode (`image_type`) | Compression | Encrypted? | Unit reset per |
+| --- | --- | --- | --- |
+| File-aware (`0x00`) | any | **yes** | each record body |
+| SECTOR (`0x01`) | None | **yes** | each 32 KiB chunk of the contiguous disk image, from `data_start` |
+| SECTOR (`0x01`) | Fast / High | **no** | — Ghost 11.5 writes the verifier but stores the block stream as **plaintext** zlib/LZ |
+
+For uncompressed SECTOR images the encrypted region is the contiguous logical
+disk (across all span files) starting at `data_start` (the byte after the last
+`FE EF` sub-header), sliced into `FAST_LZ_BLOCK_SIZE` (32768-byte) chunks, each
+reset to the seed. Random access works because every chunk is independently
+keyed. Compressed SECTOR images need no decryption at all — the password is
+still verified against the header verifier (matching Ghost Explorer's prompt),
+but the data is read as-is.
+
+## Why the earlier attempt failed
+
+The 2026-05-26 attempt assumed CRC-16/**ARC** (poly `0xA001`) and brute-forced
+only 6 fixed init constants. The real cipher is CRC-16-**CCITT** (poly `0x1021`)
+with a **pre-seeded register (`0x07A2`)** producing a non-standard table, and the
+register is seeded from a **16-bit password-derived value** (`0x9BE1` for
+`password`) that fixed-init brute force never covered. The `nyarime/gho` Go
+reference `CRC16Cipher` is unrelated to Symantec's real output.
+
+## Validation
+
+- **All 52,696 data-block bodies** (1.13 GB) of `11.5/GH11-password/GH11PW.GHO`
+  decrypt bit-exact to the unencrypted twin `11.5/GH11/fulldisk.GHS`.
+- Every record-body type (`0x0002 0x0004 0x0017 0x0102 0x0103 0x0104 0x0117
+  0x0118`) decrypts correctly with per-body reset.
+- The verifier decrypts to `BinaryResearch\0` with seed `0x9BE1`.
+- High-compression (zlib, split) and raw-split fixtures decrypt bit-exact too.
+- **Non-`password` KDF**: a fixture made with `Sw0rdFish` (seed `0x0E4B`) opens
+  end-to-end, and its verifier decrypts to `BinaryResearch\0`. `Sw0rdFish` /
+  `sw0rdfish` / `SW0RDFISH` all produce the same seed (case-insensitivity
+  confirmed on real output, not just the disassembly).
+- **Multi-partition** (MBR: FAT32 boot + extended + FAT16/FAT32 logicals):
+  - file-aware encrypted decrypts bit-exact to its unencrypted twin
+    (`MultiPartitions/11comp.GHO`); all four partitions browse via `rb-cli`.
+  - SECTOR + High (compressed, so unencrypted) decodes all four partitions and
+    browses each, including the logicals through the EBR chain.
+- **Fast-LZ** file-aware encrypted decrypts + decodes (password verified, body
+  cipher then Fast-LZ).
+- Unit tests in `gho_crypto.rs` pin the table, seed, verifier, and round-trip;
+  `gho.rs` tests cover body + chunked decryption and the SECTOR boundary fix.
+
+## Implementation notes
+
+- Decryption is transparent: `SpanReader` (the single reader every GHO decode
+  path uses) holds an optional `GhoEncLayout` + seed and decrypts the relevant
+  bytes on read while passing plaintext through. Two layouts:
+  - `Bodies` — file-aware: a body-range map built from a header-only scan
+    (`collect_gho_body_ranges`) before decryption is switched on, so the complex
+    file-aware / NTFS random-access read paths need no changes.
+  - `Chunked` — uncompressed SECTOR: `{data_start, chunk, end}`; any read in
+    `[data_start, end)` decrypts the enclosing 32 KiB chunk. `data_start` is
+    located on the plaintext sub-headers *before* decryption is enabled (so the
+    `FE EF` scan can't trip over decrypted disk bytes) and reused by the SECTOR
+    dispatch.
+- **SECTOR-mode validation**: the uncompressed spanned fixture
+  (`sectpwun.GHO` + `sectp001/002.GHS`, password `password`) decrypts to a valid
+  NTFS volume — sector 0 / MFT / backup boot sector all check out, and files
+  (e.g. `WINDOWS/twunk_32.exe`) extract as valid PEs through `rb-cli`.
+- Compressed SECTOR images decode through the existing block path with no
+  decryption. `index_sector_blocks` now drops a trailing `0x0703` continuation
+  (a stream terminator with no blocks after it) instead of treating it as a
+  partition boundary — previously that synthesized a bogus empty second
+  partition and mis-detected a single-volume superfloppy as MBR. Verified: the
+  compressed twin (`sectpw.GHO`) browses as the same NTFS volume as the
+  uncompressed set, and `WINDOWS/twunk_32.exe` extracts byte-identical
+  (SHA-256) from both.

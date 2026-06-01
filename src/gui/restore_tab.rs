@@ -367,6 +367,13 @@ impl RestoreTab {
                                 );
                                 ui.selectable_value(&mut self.selected_device_idx, Some(i), label);
                             }
+                            if ctx.devices.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(super::no_devices_hint())
+                                        .italics()
+                                        .weak(),
+                                );
+                            }
                         });
                 });
 
@@ -687,19 +694,16 @@ impl RestoreTab {
                 {
                     self.confirm_popup_open = true;
                 }
-            } else {
-                if ui.button("Cancel").clicked() {
-                    if let Some(ref progress_arc) = self.restore_progress {
-                        if let Ok(mut p) = progress_arc.lock() {
-                            p.cancel_requested = true;
-                            p.operation =
-                                "Cancelling — waiting for current write to complete…".to_string();
-                        }
+            } else if ui.button("Cancel").clicked() {
+                if let Some(ref progress_arc) = self.restore_progress {
+                    if let Ok(mut p) = progress_arc.lock() {
+                        p.cancel_requested = true;
+                        p.operation =
+                            "Cancelling — waiting for current write to complete…".to_string();
                     }
-                    ctx.log.warn(
-                        "Cancellation requested — waiting for current disk write to complete...",
-                    );
                 }
+                ctx.log
+                    .warn("Cancellation requested — waiting for current disk write to complete...");
             }
         });
     }
@@ -745,15 +749,12 @@ impl RestoreTab {
                     if let Some(path) = super::file_dialog()
                         .add_filter(
                             "Disk Images",
-                            &[
-                                "img", "raw", "bin", "vhd", "2mg", "iso", "dd", "po", "do", "dsk",
-                                "dc42", "woz", "adf", "hdf", "adz", "hdz",
-                            ],
+                            rusty_backup::model::file_types::DISK_IMAGE_EXTS,
                         )
                         .add_filter("All Files", &["*"])
                         .pick_file()
                     {
-                        match super::materialize_amiga_image_path(&path) {
+                        match super::prepare_disk_image_path(&path) {
                             Ok((materialized, guard)) => {
                                 self.sp_image_file = Some(materialized);
                                 self.sp_amiga_tempdir = guard;
@@ -866,6 +867,13 @@ impl RestoreTab {
                                 self.sp_target_partition_idx = None;
                                 self.sp_scan_error = None;
                             }
+                        }
+                        if ctx.devices.is_empty() {
+                            ui.label(
+                                egui::RichText::new(super::no_devices_hint())
+                                    .italics()
+                                    .weak(),
+                            );
                         }
                     });
 
@@ -1675,15 +1683,12 @@ impl RestoreTab {
                     if let Some(path) = super::file_dialog()
                         .add_filter(
                             "Disk Images",
-                            &[
-                                "img", "raw", "bin", "vhd", "2mg", "iso", "dd", "po", "do", "dsk",
-                                "dc42", "woz", "adf", "hdf", "adz", "hdz",
-                            ],
+                            rusty_backup::model::file_types::DISK_IMAGE_EXTS,
                         )
                         .add_filter("All Files", &["*"])
                         .pick_file()
                     {
-                        match super::materialize_amiga_image_path(&path) {
+                        match super::prepare_disk_image_path(&path) {
                             Ok((materialized, guard)) => {
                                 self.sp_image_file = Some(materialized);
                                 self.sp_amiga_tempdir = guard;
@@ -1792,6 +1797,13 @@ impl RestoreTab {
                                     if device.is_system { " [SYSTEM]" } else { "" },
                                 );
                                 ui.selectable_value(&mut self.nd_target_device_idx, Some(i), label);
+                            }
+                            if ctx.devices.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(super::no_devices_hint())
+                                        .italics()
+                                        .weak(),
+                                );
                             }
                         });
                 });

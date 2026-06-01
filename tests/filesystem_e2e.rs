@@ -1307,6 +1307,244 @@ fn test_prodos_superfloppy_detection() {
     }
 }
 
+/// Full BasiliskII-HFV path on a *real* HFS volume: a flat, partition-less
+/// classic-HFS image (no MBR/GPT/APM, volume at byte 0) must
+///   1. detect as a `None` superfloppy with fs_hint "HFS",
+///   2. open through the auto-detect factory `open_filesystem(.., 0, 0, None)`
+///      exactly as the inspect/CLI path does for a `.hfv`,
+///   3. fsck clean,
+///   4. round-trip an editable add-file via `open_editable_filesystem`.
+///
+/// This is the engine-level guarantee behind Phase 1/2 of docs/basilisk_hfv.md.
+#[test]
+fn test_hfv_flat_hfs_detect_open_fsck_edit() {
+    use rusty_backup::fs::filesystem::CreateFileOptions;
+    use rusty_backup::fs::hfs::create_blank_hfs;
+    use rusty_backup::fs::{open_editable_filesystem, open_filesystem};
+    use rusty_backup::partition::PartitionTable;
+
+    // A blank classic-HFS volume IS a valid HFV (boot blocks @0, MDB @1024).
+    let img = create_blank_hfs(8 * 1024 * 1024, 4096, "HfvTest").expect("create_blank_hfs");
+
+    // 1. Superfloppy detection.
+    let mut cur = Cursor::new(img.clone());
+    match PartitionTable::detect(&mut cur).unwrap() {
+        PartitionTable::None { fs_hint, .. } => assert_eq!(fs_hint, "HFS"),
+        other => panic!("expected HFS superfloppy, got {other:?}"),
+    }
+
+    // 2. Auto-detect factory open (the path GUI inspect + rb-cli take).
+    let cur = Cursor::new(img.clone());
+    let mut fs = open_filesystem(cur, 0, 0x00, None).expect("open_filesystem auto-detect");
+    assert_eq!(fs.fs_type(), "HFS");
+    assert_eq!(fs.volume_label(), Some("HfvTest"));
+
+    // 3. fsck clean.
+    let result = fs.fsck().expect("fsck supported").expect("fsck ran");
+    let errs: Vec<_> = result.errors.iter().map(|e| e.message.clone()).collect();
+    assert!(result.errors.is_empty(), "fsck errors: {errs:?}");
+
+    // 4. Editable add-file round-trip via the auto-detect editable factory.
+    let tmp = tempfile::tempdir().unwrap();
+    let img_path = tmp.path().join("blank.hfv");
+    std::fs::write(&img_path, &img).unwrap();
+    let payload: &[u8] = b"hello from an HFV";
+    {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&img_path)
+            .unwrap();
+        let mut efs = open_editable_filesystem(file, 0, 0x00, None)
+            .expect("open_editable_filesystem auto-detect");
+        let root = efs.root().unwrap();
+        let mut src = Cursor::new(payload);
+        efs.create_file(
+            &root,
+            "readme.txt",
+            &mut src,
+            payload.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        efs.sync_metadata().unwrap();
+    }
+
+    // Reopen and verify the file persisted and reads back byte-identical.
+    let f2 = std::fs::File::open(&img_path).unwrap();
+    let mut fs2 = open_filesystem(f2, 0, 0x00, None).expect("reopen");
+    let root = fs2.root().unwrap();
+    let kids = fs2.list_directory(&root).unwrap();
+    let entry = kids
+        .iter()
+        .find(|e| e.name == "readme.txt")
+        .expect("readme.txt present after edit");
+    let read_back = fs2.read_file(entry, 1024).unwrap();
+    assert_eq!(&read_back, payload);
+}
+
+/// Model-layer expand → flat HFV: drive the real `start_hfs_expand` worker
+/// with `ExpandOutput::FlatHfv` against a small source HFS volume and verify
+/// the output is a valid, partition-less HFV holding the source's file.
+/// Complements the unit coverage of `fs::hfv::clone_into_hfv` by exercising
+/// the runner's branch + file write.
+#[test]
+fn test_expand_runner_writes_flat_hfv() {
+    use rusty_backup::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+    use rusty_backup::fs::hfs::{create_blank_hfs, HfsFilesystem};
+    use rusty_backup::model::hfs_expand_runner::{
+        start_hfs_expand, summarize_source, ExpandOutput,
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let src_path = tmp.path().join("source.hfv");
+    let out_path = tmp.path().join("bigger.hfv");
+
+    // Source: an 8 MiB HFV with one file.
+    let mut img = create_blank_hfs(8 * 1024 * 1024, 4096, "ExpandSrc").unwrap();
+    {
+        let mut efs = HfsFilesystem::open(Cursor::new(&mut img), 0).unwrap();
+        let root = efs.root().unwrap();
+        let payload = b"expand me to a flat HFV";
+        let mut data = Cursor::new(payload.as_slice());
+        efs.create_file(
+            &root,
+            "note.txt",
+            &mut data,
+            payload.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        efs.sync_metadata().unwrap();
+    }
+    std::fs::write(&src_path, &img).unwrap();
+
+    let source = summarize_source(&src_path, 0, img.len() as u64).unwrap();
+    let status = start_hfs_expand(
+        source,
+        16 * 1024 * 1024,
+        4096,
+        out_path.clone(),
+        ExpandOutput::FlatHfv,
+    );
+
+    // Bounded poll for completion (worker is fast on an 8 MiB volume).
+    let mut finished = false;
+    let mut err = None;
+    for _ in 0..200 {
+        {
+            let g = status.lock().unwrap();
+            if g.finished {
+                finished = true;
+                err = g.error.clone();
+                // Flat-HFV output produces no APM emit report.
+                assert!(
+                    g.emit_report.is_none(),
+                    "HFV output should have no EmitReport"
+                );
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(finished, "expand worker did not finish in time");
+    assert!(err.is_none(), "expand failed: {err:?}");
+
+    // The output is a valid flat HFV with the source's file.
+    let f = std::fs::File::open(&out_path).unwrap();
+    let mut out = HfsFilesystem::open(f, 0).unwrap();
+    assert_eq!(out.fs_type(), "HFS");
+    assert_eq!(out.volume_summary().volume_name, "ExpandSrc");
+    let root = out.root().unwrap();
+    let kids = out.list_directory(&root).unwrap();
+    assert!(kids.iter().any(|e| e.name == "note.txt"));
+    assert!(out.fsck().unwrap().errors.is_empty());
+}
+
+/// Export dialog → HFV: drive `start_per_partition_hfv` (the worker behind the
+/// "HFV (BasiliskII)" Export option) against a flat-HFS source image and verify
+/// it writes a valid `partition-0.hfv` holding the source's file. Uses the real
+/// detect→partitions() path the GUI feeds it.
+#[test]
+fn test_export_runner_per_partition_hfv() {
+    use rusty_backup::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+    use rusty_backup::fs::hfs::{create_blank_hfs, HfsFilesystem};
+    use rusty_backup::model::export_runner::start_per_partition_hfv;
+    use rusty_backup::partition::PartitionTable;
+    use std::collections::HashMap;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("source.img");
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir(&out_dir).unwrap();
+
+    // Source: an 8 MiB flat HFS image (a superfloppy) with one file.
+    let mut img = create_blank_hfs(8 * 1024 * 1024, 4096, "ExportSrc").unwrap();
+    {
+        let mut efs = HfsFilesystem::open(Cursor::new(&mut img), 0).unwrap();
+        let root = efs.root().unwrap();
+        let payload = b"export me as HFV";
+        let mut data = Cursor::new(payload.as_slice());
+        efs.create_file(
+            &root,
+            "f.txt",
+            &mut data,
+            payload.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        efs.sync_metadata().unwrap();
+    }
+    std::fs::write(&src, &img).unwrap();
+
+    // Derive partitions exactly as the GUI does.
+    let mut cur = std::fs::File::open(&src).unwrap();
+    let partitions = PartitionTable::detect(&mut cur).unwrap().partitions();
+    assert_eq!(partitions.len(), 1);
+    assert_eq!(partitions[0].type_name, "HFS");
+
+    // Keep the same size (no resize); index 0 -> partition-0.hfv.
+    let mut size_map = HashMap::new();
+    size_map.insert(0usize, img.len() as u64);
+
+    let status = start_per_partition_hfv(
+        src.clone(),
+        partitions,
+        size_map,
+        out_dir.clone(),
+        img.len() as u64,
+    );
+
+    let mut finished = false;
+    let mut err = None;
+    for _ in 0..200 {
+        {
+            let g = status.lock().unwrap();
+            if g.finished {
+                finished = true;
+                err = g.error.clone();
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(finished, "HFV export worker did not finish in time");
+    assert!(err.is_none(), "HFV export failed: {err:?}");
+
+    let out = out_dir.join("partition-0.hfv");
+    assert!(out.exists(), "expected partition-0.hfv");
+    let mut fs = HfsFilesystem::open(std::fs::File::open(&out).unwrap(), 0).unwrap();
+    assert_eq!(fs.fs_type(), "HFS");
+    assert_eq!(fs.volume_summary().volume_name, "ExportSrc");
+    let root = fs.root().unwrap();
+    assert!(fs
+        .list_directory(&root)
+        .unwrap()
+        .iter()
+        .any(|e| e.name == "f.txt"));
+    assert!(fs.fsck().unwrap().errors.is_empty());
+}
+
 #[test]
 fn test_prodos_list_and_recurse() {
     use rusty_backup::fs::filesystem::Filesystem;
@@ -2017,7 +2255,7 @@ fn test_sfs_staged_edits_round_trip() {
 #[test]
 fn test_synthetic_rdb_ffs_pipeline() {
     use byteorder::{BigEndian, ByteOrder};
-    use rusty_backup::fs::{self, filesystem::Filesystem};
+    use rusty_backup::fs;
     use rusty_backup::partition::PartitionTable;
 
     const BSIZE: usize = 512;
@@ -2244,8 +2482,7 @@ fn test_rdb_sfs_export_shrink_round_trip() {
     )];
 
     // Run the export reconstruct.
-    let mut out_disk: Vec<u8> = Vec::new();
-    out_disk.resize(source_size_bytes as usize, 0);
+    let out_disk: Vec<u8> = vec![0; source_size_bytes as usize];
     let mut dest = Cursor::new(out_disk);
     let mut src2 = Cursor::new(disk.clone());
     let mut log_lines: Vec<String> = Vec::new();
@@ -2384,7 +2621,9 @@ fn test_rdb_multi_partition_shrink_auto_packs() {
         p
     };
     // P0 PART at block 1, points to P1 PART at block 2.
-    disk[1 * BSIZE..2 * BSIZE].copy_from_slice(&mk_part(2, b"DH0", p0_low, p0_high, 0x444F5301));
+    #[allow(clippy::identity_op)] // `1 * BSIZE` mirrors the block-1 prose comment
+    let p0_off = 1 * BSIZE;
+    disk[p0_off..2 * BSIZE].copy_from_slice(&mk_part(2, b"DH0", p0_low, p0_high, 0x444F5301));
     disk[2 * BSIZE..3 * BSIZE]
         .copy_from_slice(&mk_part(0xFFFFFFFF, b"DH1", p1_low, p1_high, 0x444F5301));
 
@@ -2546,4 +2785,150 @@ fn test_resize_filesystem_for_affs_shrink_round_trip() {
     assert_eq!(fs.total_blocks(), 800);
     assert_eq!(fs.root_block_num(), 400);
     assert_eq!(fs.volume_label(), Some("DispRT"));
+}
+
+// ============================================================================
+// Regression: whole-disk Fixed VHD export of a partition-less (HFV) source
+//
+// A flat classic-HFS `.hfv` has no MBR/GPT/APM — the inspect tab synthesizes a
+// single whole-disk "partition" for it, which produces one PartitionSizeOverride.
+// The Fixed-VHD reconstruct path used to take that as license to patch an MBR
+// onto sector 0, overwriting the HFS boot blocks and corrupting the volume
+// (reported symptom: re-inspecting the exported .vhd failed with
+// "invalid boot signature: expected 0xAA55, got 0xDADA", and exporting it back
+// to HFV failed with "bad MDB signature: 0x0000"). The export must instead pass
+// a partition-less source through verbatim.
+// ============================================================================
+
+#[test]
+fn test_whole_disk_vhd_export_preserves_partitionless_hfv() {
+    use rusty_backup::fs::hfv::{build_blank_hfv, suggest_block_size};
+    use rusty_backup::partition::{PartitionSizeOverride, PartitionTable};
+    use rusty_backup::rbformats::vhd::export_whole_disk_vhd;
+    use std::io::Seek;
+
+    // A small blank flat HFV: bare classic HFS, no partition table. The blank
+    // builder rounds the on-disk size, so take the produced length as truth.
+    let requested: u64 = 8 * 1024 * 1024;
+    let bs = suggest_block_size(requested);
+    let hfv = build_blank_hfv(requested, bs, "HfvVhdRT").expect("build_blank_hfv");
+    let size = hfv.len() as u64;
+
+    // Sanity: the source really is partition-less HFS.
+    let mut src_cur = Cursor::new(hfv.clone());
+    assert!(matches!(
+        PartitionTable::detect(&mut src_cur),
+        Ok(PartitionTable::None { .. }) | Err(_)
+    ));
+    src_cur.rewind().unwrap();
+    rusty_backup::fs::hfs::HfsFilesystem::open(&mut src_cur, 0)
+        .expect("source opens as classic HFS");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src_path = dir.path().join("Main.hfv");
+    let dst_path = dir.path().join("disk.vhd");
+    std::fs::write(&src_path, &hfv).expect("write source hfv");
+
+    // The single whole-disk override the inspect tab synthesizes for a bare
+    // filesystem volume (start_lba 0, export == original).
+    let overrides = vec![PartitionSizeOverride::size_only(0, 0, size, size)];
+
+    let mut log: Vec<String> = Vec::new();
+    export_whole_disk_vhd(
+        &src_path,
+        None,
+        None,
+        &overrides,
+        &dst_path,
+        |_| {},
+        || false,
+        |s| log.push(s.to_string()),
+    )
+    .expect("export_whole_disk_vhd");
+
+    // It must NOT have patched a partition table onto the bare volume.
+    assert!(
+        !log.iter().any(|l| l.contains("Patched MBR")),
+        "must not patch an MBR onto a partition-less source; got {log:?}"
+    );
+
+    // Output = source bytes verbatim + 512-byte VHD footer.
+    let out = std::fs::read(&dst_path).expect("read output vhd");
+    assert_eq!(out.len() as u64, size + 512, "fixed VHD = data + footer");
+    assert_eq!(
+        &out[..size as usize],
+        &hfv[..],
+        "HFS data must be unchanged"
+    );
+    assert_eq!(
+        &out[size as usize..size as usize + 8],
+        b"conectix",
+        "VHD footer cookie present"
+    );
+
+    // The exported VHD's HFS volume must still parse (MDB intact, boot blocks
+    // not clobbered) — what the original report could not do.
+    let mut out_cur = Cursor::new(out[..size as usize].to_vec());
+    rusty_backup::fs::hfs::HfsFilesystem::open(&mut out_cur, 0)
+        .expect("exported VHD still holds a valid HFS volume");
+}
+
+// ============================================================================
+// Regression: exporting back to flat HFV from a *dynamic* VHD source.
+//
+// The per-partition HFV export opened its source with a naked File::open and
+// read the HFS MDB at the partition offset. For a dynamic (sparse) VHD the
+// disk bytes aren't contiguous at offset 0 — that region holds the VHD's
+// footer-copy + sparse header — so the MDB read returned header bytes and the
+// open failed with "bad MDB signature". The export must unwrap the container
+// via detect_image_format/wrap_image_reader first.
+// ============================================================================
+
+#[test]
+fn test_hfv_source_open_unwraps_dynamic_vhd() {
+    use rusty_backup::fs::hfv::{build_blank_hfv, suggest_block_size};
+    use rusty_backup::rbformats::vhd::export_whole_disk_vhd_dynamic;
+    use rusty_backup::rbformats::{detect_image_format_with_path, wrap_image_reader};
+    use std::io::Seek;
+
+    // Blank flat HFV, then wrap it in a dynamic VHD on disk.
+    let requested: u64 = 8 * 1024 * 1024;
+    let bs = suggest_block_size(requested);
+    let hfv = build_blank_hfv(requested, bs, "HfvDynRT").expect("build_blank_hfv");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let vhd_path = dir.path().join("disk_dynamic.vhd");
+    {
+        let mut out = std::fs::File::create(&vhd_path).expect("create vhd");
+        let mut src = Cursor::new(hfv.clone());
+        export_whole_disk_vhd_dynamic(
+            &mut src,
+            &mut out,
+            hfv.len() as u64,
+            0, // default block size
+            &mut |_| {},
+            &|| false,
+        )
+        .expect("write dynamic vhd");
+    }
+
+    // A naked File::open at offset 0 reads the sparse header, NOT the HFS MDB —
+    // this is the pre-fix failure mode.
+    let raw = std::io::BufReader::new(std::fs::File::open(&vhd_path).unwrap());
+    assert!(
+        rusty_backup::fs::hfs::HfsFilesystem::open(raw, 0).is_err(),
+        "naked open of a dynamic VHD must NOT find a valid HFS MDB"
+    );
+
+    // The container-aware open (what the fixed export uses) unwraps the VHD and
+    // exposes the decoded disk, so the HFS volume parses.
+    let format =
+        detect_image_format_with_path(std::fs::File::open(&vhd_path).unwrap(), Some(&vhd_path))
+            .expect("detect dynamic vhd");
+    let (mut reader, _len) =
+        wrap_image_reader(std::fs::File::open(&vhd_path).unwrap(), format).expect("wrap reader");
+    reader.rewind().unwrap();
+    let fs = rusty_backup::fs::hfs::HfsFilesystem::open(reader, 0)
+        .expect("container-aware open finds the HFS volume");
+    assert_eq!(fs.volume_summary().volume_name, "HfvDynRT");
 }

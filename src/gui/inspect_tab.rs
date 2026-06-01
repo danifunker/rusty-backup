@@ -341,17 +341,13 @@ impl InspectTab {
                     }
                     ui.separator();
                     if ui
-                        .selectable_label(self.image_file_path.is_some(), "Open VHD/Disk Image...")
+                        .selectable_label(self.image_file_path.is_some(), "Open File...")
                         .clicked()
                     {
                         if let Some(path) = super::file_dialog()
                             .add_filter(
                                 "Disk Images",
-                                &[
-                                    "vhd", "img", "raw", "bin", "iso", "dd", "hda", "hdv", "2mg",
-                                    "dmg", "po", "do", "dsk", "dc42", "woz", "chd", "adf", "hdf",
-                                    "adz", "hdz",
-                                ],
+                                rusty_backup::model::file_types::DISK_IMAGE_EXTS,
                             )
                             .add_filter("All Files", &["*"])
                             .pick_file()
@@ -361,7 +357,7 @@ impl InspectTab {
                             // Transparently decompress .adz / .hdz so the
                             // rest of the pipeline (PartitionTable::detect,
                             // backup, browse) sees a raw image.
-                            match super::materialize_amiga_image_path(&path) {
+                            match super::prepare_disk_image_path(&path) {
                                 Ok((materialized, guard)) => {
                                     self.image_file_path = Some(materialized);
                                     self.amiga_tempdir = guard;
@@ -1447,10 +1443,25 @@ impl InspectTab {
         }
 
         let is_chd_format = self.export_format == ExportFormat::Chd;
-        if is_chd_format {
-            // Per-partition CHD would emit headless partition slices that no
-            // emulator consumes — force whole-disk.
+        let is_dynamic_vhd = self.export_format == ExportFormat::VhdDynamic;
+        let is_qcow2 = self.export_format == ExportFormat::Qcow2;
+        let is_vmdk_flat = self.export_format == ExportFormat::VmdkFlat;
+        let is_vmdk_sparse = self.export_format == ExportFormat::VmdkSparse;
+        // Force whole-disk for formats that don't make sense per-partition:
+        // CHD (headless slice no emulator consumes), dynamic VHD, QCOW2, and
+        // both VMDK variants (each wraps a whole-disk geometry the emulator
+        // expects to find an MBR/GPT/APM at sector 0 of).
+        if is_chd_format || is_dynamic_vhd || is_qcow2 || is_vmdk_flat || is_vmdk_sparse {
             self.export_whole_disk = true;
+        }
+        let whole_disk_only =
+            is_chd_format || is_dynamic_vhd || is_qcow2 || is_vmdk_flat || is_vmdk_sparse;
+        // HFV is the inverse: a flat HFV is a single classic-HFS volume, so it
+        // is per-partition only (one .hfv per HFS partition). Force it off
+        // whole-disk and disable the whole-disk radio.
+        let is_hfv = self.export_format == ExportFormat::Hfv;
+        if is_hfv {
+            self.export_whole_disk = false;
         }
 
         egui::Window::new("Export Disk Image")
@@ -1475,19 +1486,27 @@ impl InspectTab {
                 ui.add_space(8.0);
 
                 // Export mode
-                ui.radio_value(
-                    &mut self.export_whole_disk,
-                    true,
-                    "Whole Disk (single file)",
+                let whole_disk_resp = ui.add_enabled(
+                    !is_hfv,
+                    egui::RadioButton::new(self.export_whole_disk, "Whole Disk (single file)"),
                 );
+                if whole_disk_resp.clicked() && !is_hfv {
+                    self.export_whole_disk = true;
+                }
+                if is_hfv {
+                    whole_disk_resp.on_hover_text(
+                        "HFV is a single classic-HFS volume with no partition table, so it is \
+                         exported per-partition (one .hfv per HFS partition).",
+                    );
+                }
                 let per_part_resp = ui.add_enabled(
-                    !is_chd_format,
+                    !whole_disk_only,
                     egui::RadioButton::new(
-                        !self.export_whole_disk && !is_chd_format,
+                        !self.export_whole_disk && !whole_disk_only,
                         "Per Partition (one file per partition)",
                     ),
                 );
-                if per_part_resp.clicked() && !is_chd_format {
+                if per_part_resp.clicked() && !whole_disk_only {
                     self.export_whole_disk = false;
                 }
                 if is_chd_format {
@@ -1497,6 +1516,33 @@ impl InspectTab {
                          which no emulator can consume. Use whole-disk export \
                          instead.",
                     );
+                } else if is_dynamic_vhd {
+                    per_part_resp.on_hover_text(
+                        "Per-partition export is not supported for dynamic VHD — \
+                         the sparse layout wraps a whole disk and buys nothing on \
+                         a single mostly-used partition. Use fixed VHD for \
+                         per-partition export.",
+                    );
+                } else if is_qcow2 {
+                    per_part_resp.on_hover_text(
+                        "Per-partition export is not supported for QCOW2 — \
+                         the sparse layout wraps a whole-disk geometry that \
+                         QEMU/UTM expect to find an MBR/GPT/APM at sector 0.",
+                    );
+                } else if is_vmdk_flat {
+                    per_part_resp.on_hover_text(
+                        "Per-partition export is not supported for VMDK flat — \
+                         the descriptor wraps a whole-disk geometry that \
+                         VMware/qemu-img/VirtualBox expect to find a partition \
+                         table at sector 0 of.",
+                    );
+                } else if is_vmdk_sparse {
+                    per_part_resp.on_hover_text(
+                        "Per-partition export is not supported for VMDK sparse — \
+                         the grain directory wraps a whole-disk geometry that \
+                         VMware/qemu-img/VirtualBox expect to find a partition \
+                         table at sector 0 of.",
+                    );
                 }
 
                 ui.add_space(4.0);
@@ -1505,6 +1551,35 @@ impl InspectTab {
                 ui.label(egui::RichText::new("Format:").strong());
                 ui.horizontal_wrapped(|ui| {
                     ui.radio_value(&mut self.export_format, ExportFormat::Vhd, "VHD");
+                    ui.radio_value(
+                        &mut self.export_format,
+                        ExportFormat::VhdDynamic,
+                        "VHD (Dynamic)",
+                    )
+                    .on_hover_text(
+                        "Sparse VHD — all-zero blocks are omitted. Same .vhd extension; \
+                         readable by Hyper-V, qemu-img, Disk Management.",
+                    );
+                    ui.radio_value(&mut self.export_format, ExportFormat::Qcow2, "QCOW2")
+                        .on_hover_text(
+                            "QCOW2 v3 — sparse, uncompressed. The container UTM uses \
+                             for classic-Mac PPC guests; opens in QEMU, virt-manager.",
+                        );
+                    ui.radio_value(&mut self.export_format, ExportFormat::VmdkFlat, "VMDK (Flat)")
+                        .on_hover_text(
+                            "monolithicFlat VMDK — emits <name>.vmdk descriptor + \
+                             <name>-flat.vmdk raw extent. Opens in VMware Workstation/\
+                             Fusion, VirtualBox, qemu-img.",
+                        );
+                    ui.radio_value(
+                        &mut self.export_format,
+                        ExportFormat::VmdkSparse,
+                        "VMDK (Sparse)",
+                    )
+                    .on_hover_text(
+                        "monolithicSparse VMDK — single self-contained .vmdk; \
+                         zero grains omitted. Opens in VMware, VirtualBox, qemu-img.",
+                    );
                     ui.radio_value(&mut self.export_format, ExportFormat::Raw, "Raw (.img)");
                     ui.radio_value(&mut self.export_format, ExportFormat::TwoMg, "2MG (.2mg)");
                     ui.radio_value(&mut self.export_format, ExportFormat::Woz, "WOZ (.woz)")
@@ -1519,6 +1594,12 @@ impl InspectTab {
                     .on_hover_text(
                         "Mac / Apple IIgs DiskCopy 4.2 (floppy only: 400K / 720K / 800K / 1440K)",
                     );
+                    ui.radio_value(&mut self.export_format, ExportFormat::Hfv, "HFV (BasiliskII)")
+                        .on_hover_text(
+                            "Flat classic-HFS volume for BasiliskII / SheepShaver (no partition \
+                             table, classic-HFS-only, max 2047 MB). Exported per-partition: one \
+                             .hfv per HFS partition, cloned and re-floored to the chosen size.",
+                        );
 
                     let hd_resp = ui.add_enabled(
                         chd_hd_enabled,
@@ -1899,6 +1980,40 @@ impl InspectTab {
             export_runner::build_size_overrides(&self.export_partition_configs, &self.partitions);
         let total_bytes: u64 = size_map.values().sum();
 
+        // HFV is not a streaming codec: clone each classic-HFS partition into a
+        // flat .hfv. Route here before the streaming whole-disk/per-partition
+        // paths. Needs a raw image / device source (not a backup folder or
+        // Clonezilla image — those go through restore-as-HFV instead).
+        if format == ExportFormat::Hfv {
+            let source_image = self.image_file_path.clone().or_else(|| {
+                self.selected_device_idx
+                    .and_then(|idx| ctx.devices.get(idx))
+                    .map(|d| d.path.clone())
+            });
+            let Some(source_image) = source_image else {
+                ctx.log
+                    .error("HFV export needs a raw image or device source.");
+                return;
+            };
+            let dest_folder = match super::file_dialog().pick_folder() {
+                Some(p) => p,
+                None => return,
+            };
+            ctx.log.info(format!(
+                "Exporting classic-HFS partition(s) as flat HFV file(s) to {}...",
+                dest_folder.display()
+            ));
+            self.export_status = Some(export_runner::start_per_partition_hfv(
+                source_image,
+                self.partitions.clone(),
+                size_map,
+                dest_folder,
+                total_bytes,
+            ));
+            self.export_rate.reset();
+            return;
+        }
+
         if self.export_whole_disk {
             let (filter_label, filter_exts) = format.dialog_filter();
             let dialog = super::file_dialog()
@@ -2236,7 +2351,7 @@ impl InspectTab {
         // Single-file-CHD backups put the entire disk image inside
         // `disk.chd`. The existing per-partition inspect/browse path
         // doesn't know how to slice byte ranges out of the container, so
-        // redirect the user to "Open VHD/Disk Image" on the CHD itself —
+        // redirect the user to "Open File" on the CHD itself —
         // that path already handles CHD via ChdReader and gives full
         // browse + CHD-info access.
         if matches!(
@@ -2337,83 +2452,143 @@ impl InspectTab {
                 }
             };
 
-            // Open the device/file with full elevation: unmounts volumes and
-            // claims exclusive DA access for the duration of the inspect.
-            let elevated = match rusty_backup::os::open_source_for_reading(&path) {
-                Ok(e) => e,
-                Err(e) => {
-                    finish_err(format!("Cannot open {}: {e}", path.display()));
-                    return;
-                }
-            };
-            // Decompose into file + guard (keeps DiskClaim alive until we
-            // explicitly drop it by storing/releasing from the main thread).
-            let (device_file, guard) = elevated.into_parts();
-
-            set_step("Reading partition table...");
-
-            // Clone for the BufReader; keep `device_file` for additional clones.
-            let mut reader = match device_file.try_clone() {
-                Ok(f) => BufReader::new(f),
-                Err(e) => {
-                    finish_err(format!("Cannot clone file handle: {e}"));
-                    return;
-                }
-            };
-
-            // Detect image format (VHD, 2MG, DMG, or raw)
             let is_device = path.to_string_lossy().starts_with("/dev/")
                 || path.to_string_lossy().starts_with("\\\\.\\");
 
-            let detect_result = if !is_device {
-                // For image files, use unified format detection
-                match device_file.try_clone() {
-                    Ok(clone) => match rusty_backup::rbformats::detect_image_format_with_path(
-                        clone,
-                        Some(&path),
-                    ) {
-                        Ok(format) => {
-                            let desc = format.description();
-                            push_log(format!("Detected format: {}", desc));
-                            if let Ok(mut s) = status.lock() {
-                                s.format_label = Some(desc.clone());
-                            }
-                            match rusty_backup::rbformats::wrap_image_reader(
-                                device_file.try_clone().unwrap_or_else(|_| {
-                                    std::fs::File::open(&path).expect("reopen failed")
-                                }),
-                                format,
-                            ) {
-                                Ok((mut wrapped_reader, _data_size)) => {
-                                    PartitionTable::detect(&mut wrapped_reader)
-                                }
-                                Err(e) => {
-                                    push_log(format!("Format wrap failed, trying raw: {e}"));
-                                    let _ = reader.seek(SeekFrom::Start(0));
-                                    PartitionTable::detect(&mut reader)
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            push_log(format!("Format detection failed, trying raw: {e}"));
-                            PartitionTable::detect(&mut reader)
-                        }
-                    },
-                    Err(_) => PartitionTable::detect(&mut reader),
+            // Streaming containers (GHO, IMZ) are opened via
+            // source_reader::open_read — no tempfile, no elevation needed.
+            let uses_streaming_reader = !is_device
+                && (rusty_backup::model::source_reader::is_gho_path(&path)
+                    || rusty_backup::model::source_reader::is_imz_path(&path));
+
+            // Open the device/file with full elevation: unmounts volumes and
+            // claims exclusive DA access for the duration of the inspect.
+            // Streaming-reader containers skip this (they open via open_read).
+            // `guard` is held purely for RAII: it keeps the volume locks / DA
+            // claim alive for the duration of the inspect. On macOS the fd +
+            // claim are handed off to the main thread below; on every other
+            // platform `guard` is unused, so silence the lint there.
+            #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+            let (device_file, guard) = if !uses_streaming_reader {
+                let elevated = match rusty_backup::os::open_source_for_reading(&path) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        finish_err(format!("Cannot open {}: {e}", path.display()));
+                        return;
+                    }
+                };
+                let (f, g) = elevated.into_parts();
+                (Some(f), Some(g))
+            } else {
+                (None, None)
+            };
+
+            set_step("Reading partition table...");
+
+            // Build the initial reader: streaming reader for GHO/IMZ,
+            // cloned File for everything else.
+            let mut reader: Box<dyn rusty_backup::rbformats::ReadSeek> = if uses_streaming_reader {
+                match rusty_backup::model::source_reader::open_read(&path) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        finish_err(format!("Cannot open {}: {e:#}", path.display()));
+                        return;
+                    }
                 }
             } else {
-                // Device path — always treat as raw
-                PartitionTable::detect(&mut reader)
+                match device_file.as_ref().unwrap().try_clone() {
+                    Ok(f) => Box::new(BufReader::new(f)),
+                    Err(e) => {
+                        finish_err(format!("Cannot clone file handle: {e}"));
+                        return;
+                    }
+                }
             };
+
+            let detect_result =
+                if uses_streaming_reader {
+                    // Streaming containers (GHO, IMZ) already provide a decoded
+                    // raw disk image; skip VHD/2MG/DMG format detection.
+                    let ext = path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|s| s.to_ascii_lowercase());
+                    let label = match ext.as_deref() {
+                        Some("gho") | Some("ghs") => "Norton Ghost (GHO)",
+                        Some("imz") => "WinImage (IMZ)",
+                        _ => "Streaming image",
+                    };
+                    push_log(format!("Detected format: {}", label));
+
+                    // Surface GHO metadata (description, compression, etc.)
+                    if matches!(ext.as_deref(), Some("gho") | Some("ghs")) {
+                        if let Ok(info) = rusty_backup::rbformats::gho::format_gho_info(&path) {
+                            for line in info.lines() {
+                                if !line.is_empty() {
+                                    push_log(line.to_string());
+                                }
+                            }
+                        }
+                        set_step("Reconstructing partitions from Ghost image...");
+                    }
+
+                    if let Ok(mut s) = status.lock() {
+                        s.format_label = Some(label.to_string());
+                    }
+                    PartitionTable::detect(&mut reader)
+                } else if !is_device {
+                    // For image files, use unified format detection
+                    match device_file.as_ref().unwrap().try_clone() {
+                        Ok(clone) => match rusty_backup::rbformats::detect_image_format_with_path(
+                            clone,
+                            Some(&path),
+                        ) {
+                            Ok(format) => {
+                                let desc = format.description();
+                                push_log(format!("Detected format: {}", desc));
+                                if let Ok(mut s) = status.lock() {
+                                    s.format_label = Some(desc.clone());
+                                }
+                                match rusty_backup::rbformats::wrap_image_reader(
+                                    device_file.as_ref().unwrap().try_clone().unwrap_or_else(
+                                        |_| std::fs::File::open(&path).expect("reopen failed"),
+                                    ),
+                                    format,
+                                ) {
+                                    Ok((mut wrapped_reader, _data_size)) => {
+                                        PartitionTable::detect(&mut wrapped_reader)
+                                    }
+                                    Err(e) => {
+                                        push_log(format!("Format wrap failed, trying raw: {e}"));
+                                        let _ = reader.seek(SeekFrom::Start(0));
+                                        PartitionTable::detect(&mut reader)
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                push_log(format!("Format detection failed, trying raw: {e}"));
+                                PartitionTable::detect(&mut reader)
+                            }
+                        },
+                        Err(_) => PartitionTable::detect(&mut reader),
+                    }
+                } else {
+                    // Device path — always treat as raw
+                    PartitionTable::detect(&mut reader)
+                };
 
             match detect_result {
                 Ok(mut table) => {
                     // Fix up superfloppy size: seek(End(0)) returns 0 for macOS devices
                     if let PartitionTable::None { size_bytes, .. } = &mut table {
                         if *size_bytes == 0 {
-                            if let Ok(f) = device_file.try_clone() {
-                                if let Ok(real_size) = rusty_backup::os::get_file_size(&f, &path) {
-                                    *size_bytes = real_size;
+                            if let Some(ref df) = device_file {
+                                if let Ok(f) = df.try_clone() {
+                                    if let Ok(real_size) =
+                                        rusty_backup::os::get_file_size(&f, &path)
+                                    {
+                                        *size_bytes = real_size;
+                                    }
                                 }
                             }
                         }
@@ -2431,14 +2606,10 @@ impl InspectTab {
                     let is_chd = rusty_backup::model::source_reader::is_chd_path(&path);
                     let make_probe_reader =
                         || -> Option<Box<dyn rusty_backup::rbformats::ReadSeek>> {
-                            if is_chd {
-                                rusty_backup::rbformats::chd::ChdReader::open(&path)
-                                    .ok()
-                                    .map(|r| {
-                                        Box::new(r) as Box<dyn rusty_backup::rbformats::ReadSeek>
-                                    })
+                            if uses_streaming_reader || is_chd {
+                                rusty_backup::model::source_reader::open_read(&path).ok()
                             } else {
-                                device_file.try_clone().ok().map(|f| {
+                                device_file.as_ref()?.try_clone().ok().map(|f| {
                                     Box::new(BufReader::new(f))
                                         as Box<dyn rusty_backup::rbformats::ReadSeek>
                                 })
@@ -2768,23 +2939,37 @@ impl InspectTab {
                         if part.partition_type_byte == 0xEE {
                             continue;
                         }
-                        let result = if is_chd {
-                            let Ok(reader) = rusty_backup::rbformats::chd::ChdReader::open(&path)
-                            else {
-                                continue;
-                            };
-                            rusty_backup::fs::partition_minimum_size(
-                                reader,
-                                part.start_lba * 512,
-                                part.partition_type_byte,
-                                part.partition_type_string.as_deref(),
-                                part.size_bytes,
-                                false,
-                                None,
-                                &|_| {},
-                            )
+                        let result = if uses_streaming_reader || is_chd {
+                            // GHO containers with compressed NTFS
+                            // require decompressing the entire file to
+                            // compute minimum sizes — defer to avoid
+                            // blocking the inspect tab for minutes.
+                            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                            if ext.eq_ignore_ascii_case("gho") || ext.eq_ignore_ascii_case("ghs") {
+                                rusty_backup::fs::MinimumResult::Deferred {
+                                    fs_name: rusty_backup::fs::fs_name_for(
+                                        part.partition_type_byte,
+                                        part.partition_type_string.as_deref(),
+                                    ),
+                                }
+                            } else {
+                                let Ok(r) = rusty_backup::model::source_reader::open_read(&path)
+                                else {
+                                    continue;
+                                };
+                                rusty_backup::fs::partition_minimum_size(
+                                    r,
+                                    part.start_lba * 512,
+                                    part.partition_type_byte,
+                                    part.partition_type_string.as_deref(),
+                                    part.size_bytes,
+                                    false,
+                                    None,
+                                    &|_| {},
+                                )
+                            }
                         } else {
-                            let Ok(f) = device_file.try_clone() else {
+                            let Ok(f) = device_file.as_ref().unwrap().try_clone() else {
                                 continue;
                             };
                             if is_device {
@@ -2858,8 +3043,12 @@ impl InspectTab {
                         // so BrowseView can reuse it without re-opening/re-prompting.
                         #[cfg(target_os = "macos")]
                         {
-                            s.device_file = Some(device_file);
-                            s.device_guard = Some(guard);
+                            if let Some(df) = device_file {
+                                s.device_file = Some(df);
+                            }
+                            if let Some(g) = guard {
+                                s.device_guard = Some(g);
+                            }
                         }
                         s.finished = true;
                     }
@@ -3236,6 +3425,14 @@ impl InspectTab {
                             // Min Size column (in-place trim point).
                             if let Some(sz) = in_place_min {
                                 ui.label(partition::format_size(sz));
+                            } else if let Some(&computed) =
+                                self.partition_min_sizes.get(&part.index)
+                            {
+                                // Computed, but equals the full partition size
+                                // (in_place_min filters those out). Show it so
+                                // the user sees the result rather than a blank;
+                                // it means the volume can't shrink in place.
+                                ui.label(partition::format_size(computed));
                             } else if let Some(pending) =
                                 self.pending_min_size_calcs.get(&part.index)
                             {
@@ -3296,7 +3493,8 @@ impl InspectTab {
                                     part.partition_type_string.clone(),
                                 ));
                             }
-                            if is_checkable_type(ptype, part.partition_type_string.as_deref())
+                            if (is_checkable_type(ptype, part.partition_type_string.as_deref())
+                                || is_superfloppy_hfs(part.partition_type_byte, &part.type_name))
                                 && ui.small_button("Check").clicked()
                             {
                                 check_request = Some((
@@ -3309,7 +3507,13 @@ impl InspectTab {
                                 part.partition_type_byte,
                                 part.partition_type_string.as_deref(),
                                 &part.type_name,
-                            ) && ui.small_button("Expand…").clicked()
+                            ) && ui
+                                .small_button("Expand/Export…")
+                                .on_hover_text(
+                                    "Re-floor this classic-HFS volume to a new size / block \
+                                     size (APM .hda) or export it as a flat BasiliskII HFV.",
+                                )
+                                .clicked()
                             {
                                 expand_request = Some((part.start_lba * 512, part.size_bytes));
                             }
@@ -3709,6 +3913,14 @@ impl InspectTab {
         // raw .chd file at partition_offset would read compressed bytes.
         let source = if let Some(chd_path) = self.chd_image_path.clone() {
             rusty_backup::model::min_size_runner::MinSizeSource::Chd(chd_path)
+        } else if let Some(gho_path) = self
+            .image_file_path
+            .as_ref()
+            .filter(|p| rusty_backup::model::source_reader::is_gho_path(p))
+        {
+            // GHO/GHS images decompress through GhoReader; reading the raw
+            // file at partition_offset would hit compressed bytes.
+            rusty_backup::model::min_size_runner::MinSizeSource::Gho(gho_path.clone())
         } else if let Some(file_arc) = self.open_device_file.clone() {
             rusty_backup::model::min_size_runner::MinSizeSource::File {
                 file: file_arc,
@@ -4262,13 +4474,14 @@ impl InspectTab {
     /// background thread to build the seekable cache.  When the background
     /// build completes, `poll_cache_status` will upgrade the browser
     /// automatically.
+    #[allow(clippy::too_many_arguments)] // open-by-zstd threads partition info, paths, ctx
     fn open_browse_zstd(
         &mut self,
         part_index: usize,
         ptype: u8,
         partition_type_string: Option<String>,
-        data_path: &PathBuf,
-        folder: &PathBuf,
+        data_path: &Path,
+        folder: &Path,
         cache_name: &str,
         ctx: &mut TabContext,
     ) {
@@ -4299,8 +4512,11 @@ impl InspectTab {
             "Opening partition {} via streaming reader (seekable cache building in background)...",
             part_index,
         ));
-        self.browse_view
-            .open_streaming(data_path.clone(), ptype, partition_type_string.clone());
+        self.browse_view.open_streaming(
+            data_path.to_path_buf(),
+            ptype,
+            partition_type_string.clone(),
+        );
 
         // 4. Start background thread to build seekable cache
         let cache_path = folder.join(format!("_{cache_name}.seekable.zst"));
@@ -4322,7 +4538,7 @@ impl InspectTab {
         self.cache_status = Some(Arc::clone(&status));
         self.cache_rate.reset();
 
-        let data_path = data_path.clone();
+        let data_path = data_path.to_path_buf();
         std::thread::spawn(move || {
             let _wake =
                 rusty_backup::os::wakelock::acquire("Rusty Backup: build zstd seekable cache");
@@ -4526,7 +4742,10 @@ fn is_classic_hfs(ptype: u8, type_string: Option<&str>, type_name: &str) -> bool
         .map(|s| s.eq_ignore_ascii_case("Apple_HFS"))
         .unwrap_or(false);
     let mbr_hfs = ptype == 0xAF;
-    if !(apm_hfs || mbr_hfs) {
+    // A partition-less HFS superfloppy (a BasiliskII .hfv) is classic HFS too;
+    // the expand dialog can re-floor it or convert it (incl. to a flat HFV).
+    let superfloppy = is_superfloppy_hfs(ptype, type_name);
+    if !(apm_hfs || mbr_hfs || superfloppy) {
         return false;
     }
     !(type_name.contains("HFS+") || type_name.contains("HFSX"))
@@ -4571,6 +4790,17 @@ fn is_browsable_superfloppy(ptype: u8, type_name: &str) -> bool {
         type_name,
         "FAT" | "HFS" | "HFS+" | "NTFS" | "exFAT" | "ProDOS" | "XFS" | "ext" | "btrfs" | "Unknown"
     )
+}
+
+/// Check if a partition row is a classic-HFS **superfloppy** (a flat,
+/// partition-less HFS volume at LBA 0, i.e. a BasiliskII `.hfv`). These rows
+/// carry `partition_type_byte == 0` with `type_name == "HFS"` because no
+/// partition table assigned them a type byte. The classic-HFS fsck, edit, and
+/// expand paths are all offset-driven and work at offset 0, but the gating
+/// helpers keyed to `0xAF` / APM `Apple_HFS` skip these rows — this helper lets
+/// callers OR them back in.
+fn is_superfloppy_hfs(ptype: u8, type_name: &str) -> bool {
+    ptype == 0 && type_name == "HFS"
 }
 
 /// Fallback check: detect FAT from the human-readable type name string.

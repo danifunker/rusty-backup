@@ -112,6 +112,7 @@ pub fn unix_mode_string(mode: u32) -> String {
 ///
 /// The caller is responsible for filling `symlink_target` afterwards for symlinks
 /// (since reading the link target requires filesystem I/O).
+#[allow(clippy::too_many_arguments)] // FileEntry fields all need to come in from the caller
 pub fn unix_entry_from_inode(
     name: &str,
     path: &str,

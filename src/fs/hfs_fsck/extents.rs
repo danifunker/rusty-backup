@@ -604,10 +604,7 @@ fn check_extents_key_ordering(
 /// Applies the same structural fixes as the catalog B-tree repair:
 /// header/root node kinds, map nodes, key ordering, leaf chain, index rebuild,
 /// node bitmap.
-pub(super) fn repair_extents_btree_structure(
-    extents_data: &mut Vec<u8>,
-    report: &mut RepairReport,
-) {
+pub(super) fn repair_extents_btree_structure(extents_data: &mut [u8], report: &mut RepairReport) {
     if extents_data.len() < 512 {
         return;
     }

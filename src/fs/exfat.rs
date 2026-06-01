@@ -237,16 +237,12 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
             self.reader.seek(SeekFrom::Start(offset))?;
             let remaining = max_bytes - written;
             let to_read = self.cluster_size.min(remaining) as usize;
-            match self.reader.read(&mut buf[..to_read]) {
-                Ok(n) if n > 0 => {
-                    writer.write_all(&buf[..n])?;
-                    written += n as u64;
-                    if n < to_read {
-                        break;
-                    }
-                }
-                _ => break,
-            }
+            // read_exact: clusters are always fully present on disk. Wrapped
+            // readers (VMDK sparse, qcow2) legitimately return short reads at
+            // grain boundaries — that's not EOF.
+            self.reader.read_exact(&mut buf[..to_read])?;
+            writer.write_all(&buf[..to_read])?;
+            written += to_read as u64;
             count += 1;
             match self.next_cluster(cluster)? {
                 Some(next) => cluster = next,
@@ -279,15 +275,11 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
             let to_read = self.cluster_size.min(remaining) as usize;
             let mut buf = vec![0u8; to_read];
 
-            match self.reader.read(&mut buf) {
-                Ok(n) if n > 0 => {
-                    data.extend_from_slice(&buf[..n]);
-                    if n < to_read {
-                        break;
-                    }
-                }
-                _ => break,
-            }
+            // read_exact: clusters are always fully present on disk. Wrapped
+            // readers (VMDK sparse, qcow2) legitimately return short reads at
+            // grain boundaries — that's not EOF.
+            self.reader.read_exact(&mut buf)?;
+            data.extend_from_slice(&buf);
 
             count += 1;
             match self.next_cluster(cluster)? {
@@ -327,9 +319,9 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
             }
 
             match entry_type {
-                ENTRY_TYPE_ALLOCATION_BITMAP => {
+                ENTRY_TYPE_ALLOCATION_BITMAP
                     // Bitmap entry: start cluster at offset 20 (u32), data length at offset 24 (u64)
-                    if pos + 32 <= root_data.len() {
+                    if pos + 32 <= root_data.len() => {
                         self.bitmap_start_cluster = u32::from_le_bytes([
                             root_data[pos + 20],
                             root_data[pos + 21],
@@ -347,7 +339,6 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
                             root_data[pos + 31],
                         ]);
                     }
-                }
                 ENTRY_TYPE_VOLUME_LABEL => {
                     // Volume label entry: character count at offset 1, name at offset 2 (UTF-16LE)
                     let char_count = root_data[pos + 1] as usize;
@@ -999,8 +990,8 @@ impl<R: Read + Write + Seek> ExfatFilesystem<R> {
 
         while pos + 32 <= dir_data.len() {
             let t = dir_data[pos];
-            if t == 0x00 || (t & 0x80 == 0 && t != 0x00) {
-                // Free or deleted entry
+            if t & 0x80 == 0 {
+                // Free (0x00) or deleted (high bit clear) entry
                 if run_start.is_none() {
                     run_start = Some(pos);
                     run_count = 1;
@@ -1081,11 +1072,8 @@ impl<R: Read + Write + Seek> ExfatFilesystem<R> {
 
             // Append to chain: walk to last cluster
             let mut last = parent_cluster;
-            loop {
-                match self.next_cluster(last)? {
-                    Some(next) => last = next,
-                    None => break,
-                }
+            while let Some(next) = self.next_cluster(last)? {
+                last = next;
             }
             // Link last -> new_cluster
             self.write_fat_entry(last, new_cluster)?;
@@ -2263,8 +2251,8 @@ mod tests {
         // Cluster 4 (root dir): end of chain
         image[fat_start + 16..fat_start + 20].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
 
-        // -- Allocation bitmap (cluster 2) --
-        let bitmap_offset = cluster_heap_offset as usize * 512 + 0 * cluster_size as usize;
+        // -- Allocation bitmap (cluster 2, index 0 in the cluster heap) --
+        let bitmap_offset = cluster_heap_offset as usize * 512;
         // Clusters 2,3,4 are used (bitmap indices 0,1,2)
         image[bitmap_offset] = 0x07; // bits 0,1,2 set
 
@@ -2277,7 +2265,7 @@ mod tests {
         // FirstCluster = 2
         image[root_offset + 20..root_offset + 24].copy_from_slice(&2u32.to_le_bytes());
         // DataLength = ceil(cluster_count/8)
-        let bitmap_size = ((cluster_count + 7) / 8) as u64;
+        let bitmap_size = cluster_count.div_ceil(8) as u64;
         image[root_offset + 24..root_offset + 32].copy_from_slice(&bitmap_size.to_le_bytes());
 
         // Volume Label entry (0x83) at offset 32

@@ -247,24 +247,21 @@ impl PartitionEditor {
                             _ => {}
                         }
                     }
-                    PartitionTable::Gpt { .. } | PartitionTable::Apm(_) => {
+                    PartitionTable::Gpt { .. } | PartitionTable::Apm(_)
                         if entry.type_text.trim()
-                            != orig.partition_type_string.as_deref().unwrap_or("")
-                        {
-                            self.edits.push(PartitionTableEdit::ChangeType {
-                                index: entry.index,
-                                new_type_byte: 0,
-                                new_type_string: Some(entry.type_text.trim().to_string()),
-                            });
-                        }
+                            != orig.partition_type_string.as_deref().unwrap_or("") =>
+                    {
+                        self.edits.push(PartitionTableEdit::ChangeType {
+                            index: entry.index,
+                            new_type_byte: 0,
+                            new_type_string: Some(entry.type_text.trim().to_string()),
+                        });
                     }
-                    PartitionTable::Rdb(_) => {
-                        if entry.bootable != orig.bootable {
-                            self.edits.push(PartitionTableEdit::SetBootable {
-                                index: entry.index,
-                                bootable: entry.bootable,
-                            });
-                        }
+                    PartitionTable::Rdb(_) if entry.bootable != orig.bootable => {
+                        self.edits.push(PartitionTableEdit::SetBootable {
+                            index: entry.index,
+                            bootable: entry.bootable,
+                        });
                     }
                     _ => {}
                 }

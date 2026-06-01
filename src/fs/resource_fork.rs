@@ -319,9 +319,9 @@ pub fn parse_appledouble(data: &[u8]) -> Option<ImportedResourceFork> {
                 // Resource fork
                 rsrc_data = Some(data[offset..offset + length].to_vec());
             }
-            9 => {
+            9
                 // Finder info — type at +0, creator at +4
-                if length >= 8 {
+                if length >= 8 => {
                     let mut tc = [0u8; 4];
                     let mut cc = [0u8; 4];
                     tc.copy_from_slice(&data[offset..offset + 4]);
@@ -333,7 +333,6 @@ pub fn parse_appledouble(data: &[u8]) -> Option<ImportedResourceFork> {
                         creator_code = Some(cc);
                     }
                 }
-            }
             _ => {}
         }
     }
