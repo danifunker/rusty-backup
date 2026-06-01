@@ -53,6 +53,8 @@ enum HfsPlusFsckCode {
     ParentValenceMismatch,
     BitmapAllocCountMismatch,
     BitmapTooShort,
+    JournalChecksumMismatch,
+    JournalSequenceJump,
 }
 
 impl HfsPlusFsckCode {
@@ -71,6 +73,8 @@ impl HfsPlusFsckCode {
             HfsPlusFsckCode::ParentValenceMismatch => "ParentValenceMismatch",
             HfsPlusFsckCode::BitmapAllocCountMismatch => "BitmapAllocCountMismatch",
             HfsPlusFsckCode::BitmapTooShort => "BitmapTooShort",
+            HfsPlusFsckCode::JournalChecksumMismatch => "JournalChecksumMismatch",
+            HfsPlusFsckCode::JournalSequenceJump => "JournalSequenceJump",
         }
     }
 }
@@ -89,7 +93,7 @@ pub(super) fn check<R: Read + Seek>(
     fs: &mut HfsPlusFilesystem<R>,
 ) -> Result<FsckResult, FilesystemError> {
     let mut errors: Vec<FsckIssue> = Vec::new();
-    let warnings: Vec<FsckIssue> = Vec::new();
+    let mut warnings: Vec<FsckIssue> = Vec::new();
     let mut orphaned: Vec<OrphanedEntry> = Vec::new();
 
     // ---- Phase 1: Volume header sanity --------------------------------
@@ -326,6 +330,46 @@ pub(super) fn check<R: Read + Seek>(
         }
     }
 
+    // ---- Phase 4: Journal consistency ---------------------------------
+    // Non-fatal: journal issues surface as warnings and stats but never flip
+    // the volume's own `clean` state. A journaled volume that is cleanly
+    // unmounted has an empty journal (start == end) and produces no issues.
+    let mut journal_pending_txns: u64 = 0;
+    let mut journal_pending_bytes: u64 = 0;
+    if fs.is_journaled() {
+        match fs.read_journal() {
+            Ok(Some(state)) => {
+                journal_pending_txns = state.transactions.len() as u64;
+                journal_pending_bytes = state.pending_bytes();
+                if let Some(seq) = state.checksum_mismatch {
+                    warnings.push(issue(
+                        HfsPlusFsckCode::JournalChecksumMismatch,
+                        format!(
+                            "journal transaction sequence {seq} has a bad block-list-header \
+                             checksum; macOS will stop replay here"
+                        ),
+                    ));
+                }
+                for (from, to) in &state.sequence_jumps {
+                    warnings.push(issue(
+                        HfsPlusFsckCode::JournalSequenceJump,
+                        format!(
+                            "journal sequence jumped from {from} to {to} (expected {})",
+                            from.wrapping_add(1)
+                        ),
+                    ));
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warnings.push(issue(
+                    HfsPlusFsckCode::JournalChecksumMismatch,
+                    format!("could not read journal: {e}"),
+                ));
+            }
+        }
+    }
+
     let stats = FsckStats {
         files_checked: total_file_count,
         directories_checked: total_folder_count,
@@ -333,6 +377,14 @@ pub(super) fn check<R: Read + Seek>(
             ("threads".to_string(), walk.threads.len().to_string()),
             ("total_blocks".to_string(), total_blocks.to_string()),
             ("free_blocks".to_string(), free_blocks.to_string()),
+            (
+                "journal_transactions_pending".to_string(),
+                journal_pending_txns.to_string(),
+            ),
+            (
+                "journal_bytes_pending".to_string(),
+                journal_pending_bytes.to_string(),
+            ),
         ],
     };
 
@@ -544,5 +596,188 @@ mod tests {
             "expected FileCountMismatch, got {codes:?}"
         );
         assert!(!result.is_clean());
+    }
+
+    /// Graft an in-FS journal onto a blank volume, writing each element of
+    /// `txns` as one dirty transaction. Returns the image and the
+    /// journal-relative start offset of every transaction (so a caller can
+    /// corrupt one). The journal lives in the volume tail, past anything the
+    /// blank layout uses, so the bitmap will not account for it (harmless for
+    /// these journal-focused tests).
+    fn graft_journal(size: u64, bs: u32, txns: &[Vec<(u64, Vec<u8>)>]) -> (Vec<u8>, Vec<u64>) {
+        use super::super::hfsplus_journal::{
+            JournalEndian, JournalHeader, JournalInfoBlock, TransactionBuilder,
+            JOURNAL_HEADER_MAGIC, KJI_JOURNAL_IN_FS_MASK,
+        };
+
+        let mut img = create_blank_hfsplus(size, bs, "Jrnl", false);
+
+        // Set the journaled bit in the primary + alternate volume headers.
+        for vh in [1024usize, img.len() - 1024] {
+            let mut attrs = BigEndian::read_u32(&img[vh + 4..vh + 8]);
+            attrs |= super::super::hfsplus::HFSPLUS_VOLUME_JOURNALED_BIT;
+            BigEndian::write_u32(&mut img[vh + 4..vh + 8], attrs);
+        }
+
+        let jib_offset = (img.len() as u64 - 256 * 1024) & !(bs as u64 - 1);
+        let jib_block = (jib_offset / bs as u64) as u32;
+        for vh in [1024usize, img.len() - 1024] {
+            BigEndian::write_u32(&mut img[vh + 12..vh + 16], jib_block);
+        }
+
+        let journal_offset = jib_offset + bs as u64;
+        let journal_size = 64 * 1024u64;
+        BigEndian::write_u32(&mut img[jib_offset as usize..], KJI_JOURNAL_IN_FS_MASK);
+        BigEndian::write_u64(&mut img[jib_offset as usize + 36..], journal_offset);
+        BigEndian::write_u64(&mut img[jib_offset as usize + 44..], journal_size);
+
+        let header = JournalHeader {
+            endian: JournalEndian::Big,
+            magic: JOURNAL_HEADER_MAGIC,
+            start: 512,
+            end: 512,
+            size: journal_size,
+            blhdr_size: 512,
+            checksum: 0,
+            jhdr_size: 512,
+            sequence_num: 0,
+        };
+        let hb = header.serialize(None);
+        img[journal_offset as usize..journal_offset as usize + hb.len()].copy_from_slice(&hb);
+
+        let jib = JournalInfoBlock {
+            flags: KJI_JOURNAL_IN_FS_MASK,
+            offset: journal_offset,
+            size: journal_size,
+        };
+        let mut jh = header.clone();
+        let mut starts = Vec::new();
+        {
+            let mut cur = Cursor::new(&mut img);
+            for blocks in txns {
+                starts.push(jh.end);
+                let mut b = TransactionBuilder::new(512);
+                for (off, data) in blocks {
+                    b.record_block(*off, data);
+                }
+                b.write_to_journal(&mut cur, &jib, &mut jh, 0).unwrap();
+            }
+        }
+        // Convert journal-relative starts to absolute byte offsets.
+        let abs_starts = starts.iter().map(|s| journal_offset + s).collect();
+        (img, abs_starts)
+    }
+
+    /// One good transaction and one whose block-list-header checksum has been
+    /// corrupted: fsck phase 4 surfaces exactly one `JournalChecksumMismatch`.
+    #[test]
+    fn fsck_journal_phase_flags_corrupt_transaction() {
+        let (mut img, starts) = graft_journal(
+            32 * 1024 * 1024,
+            4096,
+            &[
+                vec![(0u64, vec![0xAB; 512])],
+                vec![(512u64, vec![0xCD; 512])],
+            ],
+        );
+        // Corrupt the second transaction's checksum-covered region.
+        img[starts[1] as usize + 4] ^= 0xFF;
+
+        let cursor = Cursor::new(img);
+        let mut fs = HfsPlusFilesystem::open(cursor, 0).expect("open");
+        let result = fs.fsck().expect("fsck supported").expect("fsck ran");
+
+        let mismatches = result
+            .warnings
+            .iter()
+            .filter(|w| w.code == "JournalChecksumMismatch")
+            .count();
+        assert_eq!(
+            mismatches,
+            1,
+            "expected exactly one JournalChecksumMismatch warning, warnings: {:?}",
+            result.warnings.iter().map(|w| &w.code).collect::<Vec<_>>()
+        );
+        // The good transaction was walked before the corrupt one stopped it.
+        let pending = result
+            .stats
+            .extra
+            .iter()
+            .find(|(k, _)| k == "journal_transactions_pending")
+            .map(|(_, v)| v.clone());
+        assert_eq!(pending.as_deref(), Some("1"));
+    }
+
+    /// The GUI viewer's data source: `journal_detail` decodes every
+    /// transaction, classifies block targets against the volume's metadata
+    /// regions, and keeps a bounded preview.
+    #[test]
+    fn journal_detail_decodes_and_classifies() {
+        // First transaction writes the volume header sector (offset 1024); the
+        // second writes a high "fork data" sector well past any metadata.
+        let (img, _starts) = graft_journal(
+            32 * 1024 * 1024,
+            4096,
+            &[
+                vec![(1024u64, vec![0x11; 512])],
+                vec![(8 * 1024 * 1024u64, vec![0x22; 512])],
+            ],
+        );
+        let cursor = Cursor::new(img);
+        let mut fs = HfsPlusFilesystem::open(cursor, 0).expect("open");
+        let detail = fs
+            .journal_detail()
+            .expect("journal_detail ok")
+            .expect("journaled");
+        assert_eq!(detail.transactions.len(), 2);
+        assert!(detail.checksum_mismatch.is_none());
+
+        // Block at 1024 lands in the volume header region.
+        let regions = &detail.regions;
+        assert_eq!(
+            super::super::hfsplus_journal::classify_target(regions, 1024),
+            "volume header"
+        );
+        // A high sector classifies as fork data (outside all metadata regions).
+        assert_eq!(
+            super::super::hfsplus_journal::classify_target(regions, 8 * 1024 * 1024),
+            "fork data"
+        );
+        // Preview is populated and capped.
+        let first = &detail.transactions[0].blocks[0];
+        assert_eq!(first.target, 1024);
+        assert!(!first.preview.is_empty() && first.preview.len() <= 64);
+    }
+
+    /// Step 27 (partial): a cleanly-unmounted journaled volume (empty journal)
+    /// is editable; its journal stays empty and valid.
+    #[test]
+    fn prepare_for_edit_allows_clean_journaled_volume() {
+        // No transactions -> the journal header is left clean (start == end).
+        let (img, _) = graft_journal(32 * 1024 * 1024, 4096, &[]);
+        let cursor = Cursor::new(img);
+        let mut fs = HfsPlusFilesystem::open(cursor, 0).expect("open");
+        assert!(fs.is_journaled());
+        fs.prepare_for_edit()
+            .expect("clean journaled volume should be editable");
+    }
+
+    /// A dirty journaled volume is still refused (editing stale metadata would
+    /// drop the journaled changes).
+    #[test]
+    fn prepare_for_edit_refuses_dirty_journaled_volume() {
+        let (img, _) = graft_journal(32 * 1024 * 1024, 4096, &[vec![(1024u64, vec![0x11; 512])]]);
+        let cursor = Cursor::new(img);
+        let mut fs = HfsPlusFilesystem::open(cursor, 0).expect("open");
+        let err = fs
+            .prepare_for_edit()
+            .expect_err("dirty journal must refuse");
+        assert!(
+            matches!(
+                err,
+                super::super::filesystem::FilesystemError::Unsupported(_)
+            ),
+            "expected Unsupported, got {err:?}"
+        );
     }
 }

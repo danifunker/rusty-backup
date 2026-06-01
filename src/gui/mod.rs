@@ -6,6 +6,7 @@ mod context;
 mod elevation_dialog;
 mod expand_hfs_dialog;
 mod inspect_tab;
+mod journal_view;
 mod optical_tab;
 mod partition_bar;
 mod physical_disk_export;

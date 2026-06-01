@@ -19,6 +19,7 @@ pub mod hfsplus;
 pub mod hfsplus_clone;
 pub mod hfsplus_defrag;
 pub mod hfsplus_fsck;
+pub mod hfsplus_journal;
 pub mod hfsplus_wrapper_clone;
 pub mod hfv;
 pub mod layout_preserving;

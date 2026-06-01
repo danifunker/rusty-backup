@@ -698,6 +698,164 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         self.vh.attributes
     }
 
+    /// True when the volume header's journaled bit is set.
+    pub fn is_journaled(&self) -> bool {
+        self.vh.attributes & HFSPLUS_VOLUME_JOURNALED_BIT != 0
+    }
+
+    /// Locate, parse, and summarize the journal without applying any state.
+    /// Returns `Ok(None)` when the volume is not journaled. The summaries walk
+    /// `start -> end`; the walk stops early (and `partial` is set) on the first
+    /// corrupt or short transaction, mirroring how macOS replay behaves.
+    ///
+    /// See `docs/hfsplus_enhancements.md` Phase 9, Step 24.
+    /// Locate and parse the JIB + journal header. `Ok(None)` when the volume
+    /// is not journaled. Shared by `read_journal` and `journal_detail`.
+    fn locate_journal(
+        &mut self,
+    ) -> Result<
+        Option<(
+            super::hfsplus_journal::JournalInfoBlock,
+            super::hfsplus_journal::JournalHeader,
+        )>,
+        FilesystemError,
+    > {
+        use super::hfsplus_journal::{JournalHeader, JournalInfoBlock};
+
+        if !self.is_journaled() {
+            return Ok(None);
+        }
+        let to_fs = |e: super::hfsplus_journal::JournalError| {
+            FilesystemError::InvalidData(format!("journal: {e}"))
+        };
+
+        // JIB lives at allocation block `journal_info_block`.
+        let jib_byte =
+            self.partition_offset + self.vh.journal_info_block as u64 * self.vh.block_size as u64;
+        self.reader.seek(SeekFrom::Start(jib_byte))?;
+        let mut jib_buf = vec![0u8; 512];
+        self.reader.read_exact(&mut jib_buf)?;
+        let jib = JournalInfoBlock::parse(&jib_buf).map_err(to_fs)?;
+
+        // The journal header's fixed fields live in the first 512 bytes.
+        self.reader
+            .seek(SeekFrom::Start(self.partition_offset + jib.offset))?;
+        let mut jh_buf = vec![0u8; 512];
+        self.reader.read_exact(&mut jh_buf)?;
+        let header = JournalHeader::parse(&jh_buf).map_err(to_fs)?;
+        Ok(Some((jib, header)))
+    }
+
+    /// Byte ranges (relative to the partition) of the volume's metadata
+    /// structures, for classifying which subsystem a journaled block targets.
+    fn metadata_regions(&self) -> Vec<super::hfsplus_journal::MetadataRegion> {
+        use super::hfsplus_journal::MetadataRegion;
+        let bs = self.vh.block_size as u64;
+        let mut regions = vec![MetadataRegion {
+            name: "volume header",
+            start: 1024,
+            end: 1536,
+        }];
+        let fork = |name: &'static str, fork: &ForkData| -> Option<MetadataRegion> {
+            let first = fork.extents.iter().find(|e| !e.is_empty())?;
+            let start = first.start_block as u64 * bs;
+            let bytes = fork.total_blocks as u64 * bs;
+            Some(MetadataRegion {
+                name,
+                start,
+                end: start + bytes,
+            })
+        };
+        for (name, f) in [
+            ("allocation bitmap", &self.vh.allocation_file),
+            ("extents btree", &self.vh.extents_file),
+            ("catalog btree", &self.vh.catalog_file),
+            ("attributes btree", &self.vh.attributes_file),
+            ("startup file", &self.vh.startup_file),
+        ] {
+            if let Some(r) = fork(name, f) {
+                regions.push(r);
+            }
+        }
+        regions
+    }
+
+    /// Decode the journal into per-transaction, per-block detail for the GUI
+    /// history viewer (Step 29). Block previews are capped; classification is
+    /// against [`metadata_regions`]. `Ok(None)` when not journaled.
+    pub fn journal_detail(
+        &mut self,
+    ) -> Result<Option<super::hfsplus_journal::JournalDetail>, FilesystemError> {
+        let Some((jib, header)) = self.locate_journal()? else {
+            return Ok(None);
+        };
+        let regions = self.metadata_regions();
+        let detail = super::hfsplus_journal::read_journal_detail(
+            &mut self.reader,
+            self.partition_offset,
+            jib,
+            header,
+            regions,
+        );
+        Ok(Some(detail))
+    }
+
+    pub fn read_journal(
+        &mut self,
+    ) -> Result<Option<super::hfsplus_journal::JournalState>, FilesystemError> {
+        use super::hfsplus_journal::JournalWalker;
+
+        let Some((jib, header)) = self.locate_journal()? else {
+            return Ok(None);
+        };
+
+        let mut transactions = Vec::new();
+        let mut partial = false;
+        let mut checksum_mismatch = None;
+        let mut sequence_jumps = Vec::new();
+        {
+            let mut walker =
+                JournalWalker::new(&mut self.reader, self.partition_offset, &jib, &header);
+            let mut prev_seq: Option<u32> = None;
+            while let Some(item) = walker.next() {
+                match item {
+                    Ok(view) => {
+                        let seq = view.sequence_num;
+                        if let Some(prev) = prev_seq {
+                            // macOS expects each transaction's sequence to be
+                            // prev or prev+1; anything else is a jump.
+                            if seq != prev && seq != prev.wrapping_add(1) {
+                                sequence_jumps.push((prev, seq));
+                            }
+                        }
+                        prev_seq = Some(seq);
+                        transactions.push(view.summary());
+                    }
+                    Err(super::hfsplus_journal::JournalError::CorruptTransaction {
+                        sequence_num,
+                    }) => {
+                        checksum_mismatch = Some(sequence_num);
+                        partial = true;
+                        break;
+                    }
+                    Err(_) => {
+                        partial = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(Some(super::hfsplus_journal::JournalState {
+            info: jib,
+            header,
+            transactions,
+            partial,
+            checksum_mismatch,
+            sequence_jumps,
+        }))
+    }
+
     pub(crate) fn vh_create_date(&self) -> u32 {
         self.vh.create_date
     }
@@ -902,15 +1060,39 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
     /// not by read-only opens, so the cost is paid only when we're about
     /// to mutate.
     ///
-    /// Returns `Err(Unsupported)` for journaled volumes (Step 4 of
-    /// `docs/hfsplus_enhancements.md`); xattr-bearing volumes succeed but
-    /// later `delete_entry` calls against any of the cached CNIDs are
-    /// refused at the source until Phase 5 lands.
+    /// Journaled volumes are accepted only when the journal is *clean* (empty,
+    /// `start == end`) — the cleanly-unmounted case. A clean journal has no
+    /// pending state, so editing the catalog in place and leaving the journal
+    /// empty keeps the volume valid for macOS (it replays nothing on mount).
+    /// A *dirty* journal carries metadata the catalog hasn't absorbed yet;
+    /// editing on top of that stale catalog would lose the journaled changes,
+    /// so we still refuse it here. In-place transactional writes that journal
+    /// our own mutations and recover dirty volumes are the remaining half of
+    /// Step 27 (`docs/hfsplus_enhancements.md`) and are not yet wired in.
+    ///
+    /// xattr-bearing volumes succeed but later `delete_entry` calls against any
+    /// of the cached CNIDs are refused at the source until Phase 5 lands.
     pub fn prepare_for_edit(&mut self) -> Result<(), FilesystemError> {
         if self.vh.attributes & HFSPLUS_VOLUME_JOURNALED_BIT != 0 {
-            return Err(FilesystemError::Unsupported(
-                "journaled HFS+ volume — clear the journal in macOS or open read-only".into(),
-            ));
+            match self.locate_journal() {
+                Ok(Some((_jib, header))) if !header.is_empty() => {
+                    return Err(FilesystemError::Unsupported(
+                        "dirty journaled HFS+ volume — mount and cleanly unmount it in macOS \
+                         to flush the journal, then retry (or open read-only)"
+                            .into(),
+                    ));
+                }
+                Ok(_) => {
+                    // Clean journal (or, defensively, none) — safe to edit in
+                    // place; the journal stays empty and valid.
+                }
+                Err(e) => {
+                    return Err(FilesystemError::Unsupported(format!(
+                        "journaled HFS+ volume with an unreadable journal ({e}) — \
+                         open read-only"
+                    )));
+                }
+            }
         }
 
         // No attributes file → nothing to scan, leave the set as `None`
@@ -2897,6 +3079,20 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
 
     fn fsck(&mut self) -> Option<Result<super::fsck::FsckResult, FilesystemError>> {
         Some(super::hfsplus_fsck::check(self))
+    }
+
+    fn read_journal(
+        &mut self,
+    ) -> Result<Option<super::hfsplus_journal::JournalState>, FilesystemError> {
+        // Delegate to the inherent method (which takes priority for concrete
+        // calls); this override is what `dyn Filesystem` callers reach.
+        HfsPlusFilesystem::read_journal(self)
+    }
+
+    fn journal_detail(
+        &mut self,
+    ) -> Result<Option<super::hfsplus_journal::JournalDetail>, FilesystemError> {
+        HfsPlusFilesystem::journal_detail(self)
     }
 }
 
@@ -6031,10 +6227,12 @@ mod tests {
     }
 
     #[test]
-    fn test_prepare_for_edit_refuses_journaled_volume() {
-        // Build a clean image, then flip `vh.attributes` to set the
-        // journaled bit before opening. `prepare_for_edit` must refuse;
-        // a plain `open` continues to succeed (read-only is fine).
+    fn test_prepare_for_edit_refuses_journaled_volume_without_valid_journal() {
+        // Set the journaled bit but provide no valid journal (journalInfoBlock
+        // points at zeroed boot blocks). Since we can't verify the journal is
+        // clean, `prepare_for_edit` refuses; a plain read-only `open` still
+        // succeeds. (Clean journaled volumes — verified empty — are accepted;
+        // see hfsplus_fsck::tests::prepare_for_edit_allows_clean_journaled_volume.)
         let mut img = make_editable_hfsplus_image();
         let attr_off = 1024 + 4; // VH offset 4 = attributes (u32 BE)
         let mut attrs = BigEndian::read_u32(&img[attr_off..attr_off + 4]);
@@ -6045,10 +6243,10 @@ mod tests {
         let mut fs = HfsPlusFilesystem::open(cursor, 0).expect("read-only open should succeed");
         let err = fs
             .prepare_for_edit()
-            .expect_err("journaled volume must refuse edit prep");
+            .expect_err("journaled volume with no valid journal must refuse edit prep");
         match err {
-            FilesystemError::Unsupported(msg) => assert!(msg.contains("journaled")),
-            other => panic!("expected Unsupported(journaled...), got {other:?}"),
+            FilesystemError::Unsupported(msg) => assert!(msg.contains("journal")),
+            other => panic!("expected Unsupported(journal...), got {other:?}"),
         }
     }
 

@@ -94,6 +94,8 @@ pub struct BrowseView {
     show_fsck_popup: bool,
     /// CHD info popup text. `Some` while the popup is open.
     chd_info_text: Option<String>,
+    /// HFS+ journal history viewer. `Some` while the window is open.
+    journal_view: Option<super::journal_view::JournalView>,
     /// Whether to show debug-level fsck messages.
     show_fsck_debug: bool,
     /// Whether to show the repair confirmation dialog.
@@ -297,6 +299,7 @@ impl Default for BrowseView {
             fsck_result: None,
             show_fsck_popup: false,
             chd_info_text: None,
+            journal_view: None,
             show_fsck_debug: false,
             show_repair_confirm: false,
             repair_report: None,
@@ -509,6 +512,7 @@ impl BrowseView {
         self.blessed_folder = None;
         self.fsck_result = None;
         self.show_fsck_popup = false;
+        self.journal_view = None;
         self.show_repair_confirm = false;
         self.repair_report = None;
         self.tree_text = None;
@@ -739,6 +743,32 @@ impl BrowseView {
                 }
             }
 
+            // Journal history viewer (HFS+/HFSX only). Opening reports whether
+            // the volume is actually journaled.
+            if (self.fs_type == "HFS+" || self.fs_type == "HFSX") && ui.button("Journal").clicked()
+            {
+                match self.take_or_open_fs() {
+                    Some(mut fs) => {
+                        match fs.journal_detail() {
+                            Ok(Some(detail)) => {
+                                self.journal_view =
+                                    Some(super::journal_view::JournalView::new(detail));
+                            }
+                            Ok(None) => {
+                                self.error = Some("This volume is not journaled.".into());
+                            }
+                            Err(e) => {
+                                self.error = Some(format!("Could not read journal: {e}"));
+                            }
+                        }
+                        self.return_fs(fs);
+                    }
+                    None => {
+                        self.error = Some("Failed to open filesystem".into());
+                    }
+                }
+            }
+
             if self.is_chd_source() {
                 if let Some(chd_path) = self.session.source_path.clone() {
                     if ui.button("CHD Info").clicked() {
@@ -914,6 +944,13 @@ impl BrowseView {
         self.render_chd_info_popup(ui);
         self.render_tree_popup(ui);
         self.render_tree_large_dialog(ui);
+
+        // Journal history viewer window
+        if let Some(view) = &mut self.journal_view {
+            if !view.show(ui.ctx()) {
+                self.journal_view = None;
+            }
+        }
     }
 
     fn render_tree_entry(&mut self, ui: &mut egui::Ui, entry: &FileEntry) {

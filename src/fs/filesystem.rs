@@ -113,6 +113,24 @@ pub trait Filesystem: Send {
         None
     }
 
+    /// Parse and summarize the volume's journal, if it has one. Returns
+    /// `Ok(None)` when the filesystem has no journal or is not journaled.
+    /// Only HFS+/HFSX override this. See `docs/hfsplus_enhancements.md`
+    /// Phase 9, Step 29.
+    fn read_journal(
+        &mut self,
+    ) -> Result<Option<super::hfsplus_journal::JournalState>, FilesystemError> {
+        Ok(None)
+    }
+
+    /// Decode the journal into per-transaction detail for the GUI history
+    /// viewer. `Ok(None)` when not journaled / not applicable.
+    fn journal_detail(
+        &mut self,
+    ) -> Result<Option<super::hfsplus_journal::JournalDetail>, FilesystemError> {
+        Ok(None)
+    }
+
     /// Validate that `name` is legal for a new file or directory on this
     /// filesystem. Returns `Err(InvalidData)` with a human-readable reason
     /// when the name violates length, character, or encoding rules.
