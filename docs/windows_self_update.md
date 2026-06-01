@@ -326,9 +326,13 @@ admin to physical-disk ops, manifest → GUI binary only) and `e3b0173`.
       tabs; device backup/restore works; self-update relaunch keeps elevation.
 
 ### Notes / caveats
-- Optical tab uses its own drive list (`opticaldiscs::drives`), not
-  `ctx.devices`; its rip path still hits the same `open_source_for_reading`
-  elevation `bail!`. Adding the shield hint there is follow-up, not done here.
+- Optical tab: physical-disc ripping opens the drive with `GENERIC_READ |
+  GENERIC_WRITE` for `IOCTL_SCSI_PASS_THROUGH_DIRECT` (via `cd-da-reader`), which
+  needs admin on Windows — it does NOT go through `open_source_for_reading`. The
+  "Physical drive" source radio is now grayed out (kept visible, with a
+  disabled-hover hint) until the user elevates via the top-bar button;
+  image-file convert stays available unelevated. Gating helper:
+  `gui::physical_devices_available()`.
 - Removing the manifest changes **release** behavior: a non-elevated GUI that
   reaches a write path fails fast with a clear message instead of being admin.
   Intended.

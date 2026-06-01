@@ -72,6 +72,21 @@ fn no_devices_hint() -> &'static str {
     }
 }
 
+/// Whether physical-device access is available right now. On Windows this means
+/// the process is elevated (raw disk + SCSI optical access need admin); on other
+/// platforms it is always true. Used to gray out physical-source controls until
+/// the user elevates via the top-bar "Show Physical Devices" button.
+fn physical_devices_available() -> bool {
+    #[cfg(windows)]
+    {
+        rusty_backup::os::windows::is_elevated()
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
 fn file_dialog() -> rfd::FileDialog {
     let dialog = rfd::FileDialog::new();
     #[cfg(target_os = "linux")]
