@@ -282,6 +282,10 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         // blocks spanned by one 64-inode chunk.
         let blocks_per_chunk =
             ((XFS_INODES_PER_CHUNK as u64) * sb.inodesize as u64).div_ceil(sb.blocksize as u64);
+        // Free extents from every AG's bnobt, cross-checked against the
+        // ownership map after all inodes are scanned (an inode in AG i can
+        // own blocks in AG j, so the map is only complete post-loop).
+        let mut all_free: Vec<(u64, u64)> = Vec::new();
 
         for (agno, ag) in ags.iter().enumerate() {
             let agno = agno as u64;
@@ -316,12 +320,13 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
                 }
             }
 
-            // Free-space btree (bnobt): sum the free extents and cross-check
-            // against the AGF's cached freeblks. Catches summary corruption
-            // and validates the btree is internally walkable.
+            // Free-space btree (bnobt): collect the free extents, cross-check
+            // their sum against the AGF's cached freeblks (catches summary
+            // corruption), and stash them for the post-loop conflict scan.
             if let (Some(bno_root), Some(agf_freeblks)) = (ag.agf_bno_root, ag.agf_freeblks) {
-                match self.sum_freesp_btree(sb, agno, bno_root, ag.expected_len, &mut map) {
-                    Ok(free_blocks) => {
+                match self.collect_free_extents(sb, agno, bno_root, ag.expected_len, &mut map) {
+                    Ok(extents) => {
+                        let free_blocks: u64 = extents.iter().map(|&(_, len)| len).sum();
                         if free_blocks != agf_freeblks as u64 {
                             b.err(
                                 "AgfFreeblksMismatch",
@@ -331,6 +336,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
                                 ),
                             );
                         }
+                        all_free.extend(extents);
                     }
                     Err(e) => {
                         b.err(
@@ -339,6 +345,25 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
                         );
                     }
                 }
+            }
+        }
+
+        // Cross-check: a block the free-space btree calls free must not be
+        // claimed by an inode (or its chunk). This is the classic "block
+        // claimed by both inode and free space" corruption. One finding per
+        // offending extent keeps the report readable.
+        for &(start, len) in &all_free {
+            if let Some(bad) =
+                (start..start + len).find(|&blk| matches!(map.state(blk), S_INUSE | S_INO | S_MULT))
+            {
+                b.err(
+                    "FreeBlockClaimed",
+                    format!(
+                        "block {bad} is in the free-space btree but also claimed by an inode \
+                         (free extent [{start}..{}))",
+                        start + len
+                    ),
+                );
             }
         }
 
@@ -643,18 +668,20 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         Ok(recs)
     }
 
-    /// Walk the free-space-by-block (bnobt) btree, sum the free extents'
-    /// block counts, and mark every btree block as fs metadata in `map`.
-    /// Free *data* blocks are intentionally left `S_UNKNOWN` (they're free).
-    fn sum_freesp_btree(
+    /// Walk the free-space-by-block (bnobt) btree, returning each free extent
+    /// as `(linear_start, len)` (partition-linear block numbers), and mark
+    /// every btree block as fs metadata in `map`. Free *data* blocks are
+    /// intentionally left `S_UNKNOWN` (they're free).
+    fn collect_free_extents(
         &mut self,
         sb: &XfsSuperblock,
         agno: u64,
         root_agbno: u32,
         expected_len: u64,
         map: &mut OwnerMap,
-    ) -> Result<u64, FilesystemError> {
-        let mut free_blocks: u64 = 0;
+    ) -> Result<Vec<(u64, u64)>, FilesystemError> {
+        let agblocks = sb.agblocks as u64;
+        let mut extents: Vec<(u64, u64)> = Vec::new();
         self.walk_sblock_btree(
             sb,
             agno,
@@ -664,13 +691,15 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
             8, // alloc leaf record width (startblock + blockcount)
             8, // alloc internal key width
             |rec| {
-                free_blocks += BigEndian::read_u32(&rec[4..8]) as u64;
+                let start = BigEndian::read_u32(&rec[0..4]) as u64;
+                let len = BigEndian::read_u32(&rec[4..8]) as u64;
+                extents.push((agno * agblocks + start, len));
             },
             |linear| {
                 map.mark(linear, S_INUSE_FS);
             },
         )?;
-        Ok(free_blocks)
+        Ok(extents)
     }
 
     /// Repair helper: total free blocks in the bnobt (no ownership map / no
@@ -775,6 +804,12 @@ impl OwnerMap {
     }
     fn count_mult(&self) -> usize {
         self.states.iter().filter(|&&s| s == S_MULT).count()
+    }
+    fn state(&self, linear: u64) -> u8 {
+        self.states
+            .get(linear as usize)
+            .copied()
+            .unwrap_or(S_UNKNOWN)
     }
 }
 

@@ -1114,6 +1114,26 @@ mod tests {
     }
 
     #[test]
+    fn fsck_detects_free_block_also_claimed_by_inode() {
+        // Patch AG 0's bnobt so a free extent overlaps the root inode chunk
+        // (agbno 8..12, marked S_INO). Read bno_root from the AGF (byte
+        // 512+16), find the leaf's first record (block*4096 + 16 header), and
+        // rewrite it to (startblock=8, blockcount=4). Expect FreeBlockClaimed.
+        let mut img = load_fixture().to_vec();
+        let bno_root = u32::from_be_bytes(img[512 + 16..512 + 20].try_into().unwrap()) as usize;
+        let rec0 = bno_root * 4096 + 16; // v4 short-form btree header = 16 bytes
+        img[rec0..rec0 + 4].copy_from_slice(&8u32.to_be_bytes()); // startblock
+        img[rec0 + 4..rec0 + 8].copy_from_slice(&4u32.to_be_bytes()); // blockcount
+        let mut fs = XfsFilesystem::open(Cursor::new(img), 0).expect("open xfs");
+        let res = fs.run_fsck().expect("fsck runs");
+        assert!(
+            res.errors.iter().any(|e| e.code == "FreeBlockClaimed"),
+            "expected FreeBlockClaimed, got: {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn fsck_detects_corrupted_ag_superblock_replica() {
         // Corrupt AG 1's superblock replica: flip its dblocks field so it
         // disagrees with the primary. AG 1 starts at agblocks*blocksize =
