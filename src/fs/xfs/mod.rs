@@ -18,6 +18,7 @@
 
 pub mod ag;
 pub mod bmap;
+pub mod btree_build;
 pub mod dir1;
 pub mod dir2;
 pub mod fsck;
