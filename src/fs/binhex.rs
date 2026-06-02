@@ -114,8 +114,9 @@ fn rle90_encode(data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// RLE90 decompress (inverse of [`rle90_encode`]).
-fn rle90_decode(input: &[u8]) -> Vec<u8> {
+/// RLE90 decompress (inverse of [`rle90_encode`]). Shared with the StuffIt
+/// reader, which uses the same 0x90 run encoding for compression method 1.
+pub(crate) fn rle90_decode(input: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len() * 2);
     let mut i = 0;
     while i < input.len() {

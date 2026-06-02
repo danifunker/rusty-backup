@@ -124,15 +124,17 @@ image pipeline).
 
 ### Steps
 
-- [ ] Clone XADMaster reference; document codec pointers here (amigasources-style)
-- [ ] `macarchive`: archive-header + entry-header parser, folder tree reconstruction
-- [ ] Decompressors: method 0, 1 (RLE90 reuse), 13 (LZAH), 15 (Arsenic/BWT) — each unit-tested against known vectors
-- [ ] Decompressors: method 2 (LZW), 3 (Huffman) — as needed
-- [ ] Per-fork CRC verification on extract
-- [ ] Bridge entries → `FileEntry`; read-only browse view (GUI) + `list`/`extract` (CLI)
-- [ ] Tests against real `.sit` samples (collect a corpus first)
+- [x] Clone XADMaster reference (at `~/repos/XADMaster`)
+- [x] `src/macarchive/stuffit.rs`: archive-header + 112-byte entry-header parser, folder tree reconstruction, fork offsets, CRC-16/ARC header + fork verification
+- [x] Decompressors: method 0 (none), 1 (RLE90, reused from binhex), **13 (LZ+Huffman)** — both dynamic (in-stream tables via metacode) and static (selectors 1–5; tables auto-generated into `src/macarchive/stuffit13_tables.rs` from XAD source). Ported from `XADStuffIt13Handle.m` + `XADLZSSHandle.m` + `XADPrefixCode.m`.
+- [x] Per-fork CRC verification on extract (CRC-16/ARC)
+- [x] `.sea` dispatch: `find_sea_archive` scans for the embedded `SIT!`/`rLau` stream
+- [x] Tests against real `.sit` samples: **102 forks across 4 archives decompressed + CRC-verified** (decoded on the fly from `.sit.hqx`), exercising both method-13 sub-modes
+- [ ] Decompressors: method 3 (Huffman), 2 (LZW/Compress), 15 (Arsenic/BWT) — return a clear "unsupported codec" error today
+- [-] StuffIt 5 format (`SIT5` / "StuffIt (c)…") — newer container, out of scope (detected + skipped)
+- [ ] Bridge entries → `FileEntry`; read-only browse view (GUI) + `list`/`extract` (CLI) — next slice
 
-**Estimate: 1–2 weeks, dominated by codec porting + corpus testing.**
+**Status: classic `.sit` reading works end-to-end for the dominant codecs (0/1/13). Remaining codecs (3/2/15) and the GUI/CLI surface are follow-ups.**
 
 ---
 
