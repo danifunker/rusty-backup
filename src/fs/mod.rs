@@ -63,6 +63,7 @@ pub use ntfs::{
     patch_ntfs_hidden_sectors, resize_ntfs_in_place, validate_ntfs_integrity, CompactNtfsReader,
 };
 pub use prodos::{resize_prodos_in_place, validate_prodos_integrity, CompactProDosReader};
+pub use reiserfs::CompactReiserFsReader;
 
 /// Update the BPB/VBR hidden-sectors / partition-offset field for whichever
 /// filesystem is present at `partition_offset`. Each per-FS patcher checks
@@ -366,6 +367,11 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
                     let (reader, info) = CompactBtrfsReader::new(reader, partition_offset).ok()?;
                     Some((Box::new(reader), info))
                 }
+                "reiserfs" => {
+                    let (reader, info) =
+                        CompactReiserFsReader::new(reader, partition_offset).ok()?;
+                    Some((Box::new(reader), info))
+                }
                 "prodos" => {
                     let (reader, info) = CompactProDosReader::new(reader, partition_offset).ok()?;
                     Some((Box::new(reader), info))
@@ -393,8 +399,9 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
                 _ => None,
             }
         }
-        // Linux (ext2/3/4, btrfs). Also FAT for MSX HDDs that mis-stamp
-        // the type byte (Nextor / similar write 0x83 for FAT partitions).
+        // Linux (ext2/3/4, btrfs, reiserfs). Also FAT for MSX HDDs that
+        // mis-stamp the type byte (Nextor / similar write 0x83 for FAT
+        // partitions).
         0x83 => {
             let fs_type = detect_filesystem_type(&mut reader, partition_offset);
             match fs_type {
@@ -404,6 +411,11 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
                 }
                 "btrfs" => {
                     let (reader, info) = CompactBtrfsReader::new(reader, partition_offset).ok()?;
+                    Some((Box::new(reader), info))
+                }
+                "reiserfs" => {
+                    let (reader, info) =
+                        CompactReiserFsReader::new(reader, partition_offset).ok()?;
                     Some((Box::new(reader), info))
                 }
                 "fat" => {

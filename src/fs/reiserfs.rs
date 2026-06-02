@@ -49,6 +49,9 @@ use std::io::{Read, Seek, SeekFrom};
 
 use super::entry::FileEntry;
 use super::filesystem::{Filesystem, FilesystemError};
+use super::unix_common::bitmap::BitmapReader;
+use super::unix_common::compact::{CompactLayout, CompactSection, CompactStreamReader};
+use crate::fs::CompactResult;
 
 // ---- Constants ----
 
@@ -90,15 +93,12 @@ impl ReiserFsVersion {
 // ---- Filesystem ----
 
 pub struct ReiserFsFilesystem<R> {
-    #[allow(dead_code)] // R.2 will use this for bitmap reads.
     reader: R,
-    #[allow(dead_code)] // R.2 will use this for bitmap reads.
     partition_offset: u64,
     version: ReiserFsVersion,
     block_size: u64,
     total_blocks: u64,
     free_blocks: u64,
-    #[allow(dead_code)] // R.2 will use this to size the bitmap walk.
     bmap_nr: u32,
     label: Option<String>,
 }
@@ -199,6 +199,48 @@ impl<R: Read + Seek + Send> ReiserFsFilesystem<R> {
     pub fn version(&self) -> ReiserFsVersion {
         self.version
     }
+
+    /// Block where the superblock lives. Superblock byte offset is always
+    /// 65536, so `sb_block = 65536 / block_size`.
+    fn sb_block(&self) -> u64 {
+        REISERFS_SUPERBLOCK_OFFSET / self.block_size
+    }
+
+    /// Read the bitmap block whose index in the bitmap chain is `i`.
+    ///
+    /// ReiserFS places bitmap 0 immediately after the superblock (so its
+    /// physical block number is `sb_block + 1`); bitmap `i >= 1` lives at
+    /// block `i * (block_size * 8)` (the first block of the i-th
+    /// `blocks_per_bitmap` group). Each bitmap covers `block_size * 8`
+    /// consecutive volume blocks starting at block `i * blocks_per_bitmap`.
+    fn read_bitmap_block(&mut self, i: u32) -> Result<Vec<u8>, FilesystemError> {
+        let blocks_per_bitmap = self.block_size * 8;
+        let phys_block = if i == 0 {
+            self.sb_block() + 1
+        } else {
+            i as u64 * blocks_per_bitmap
+        };
+        self.reader.seek(SeekFrom::Start(
+            self.partition_offset + phys_block * self.block_size,
+        ))?;
+        let mut buf = vec![0u8; self.block_size as usize];
+        self.reader.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Number of valid bits in bitmap `i`.
+    ///
+    /// Every bitmap except the last covers exactly `block_size * 8` blocks
+    /// (a full bitmap). The last bitmap covers the trailing remainder.
+    fn bitmap_valid_bits(&self, i: u32) -> u64 {
+        let blocks_per_bitmap = self.block_size * 8;
+        let logical_start = i as u64 * blocks_per_bitmap;
+        if i == self.bmap_nr - 1 {
+            self.total_blocks.saturating_sub(logical_start)
+        } else {
+            blocks_per_bitmap
+        }
+    }
 }
 
 impl<R: Read + Seek + Send> Filesystem for ReiserFsFilesystem<R> {
@@ -238,6 +280,136 @@ impl<R: Read + Seek + Send> Filesystem for ReiserFsFilesystem<R> {
 
     fn used_size(&self) -> u64 {
         self.total_blocks.saturating_sub(self.free_blocks) * self.block_size
+    }
+
+    /// Walk the bitmap chain from the end and return the byte offset just
+    /// past the highest allocated block. ReiserFS uses **set bit =
+    /// allocated**, the standard Linux convention (verified against
+    /// `partimage-0.6.9/src/client/fs/fs_reiser.cpp`). Bitmap blocks
+    /// themselves are always marked allocated by the on-disk image, so a
+    /// non-zero answer is guaranteed for a valid volume.
+    fn last_data_byte(&mut self) -> Result<u64, FilesystemError> {
+        // Scan bitmaps from the last to the first to short-circuit on the
+        // first hit. `bmap_nr` is bounded at open-time (computed from
+        // block_count for the sentinel-zero case), so it's always sane here.
+        for i in (0..self.bmap_nr).rev() {
+            let bitmap = self.read_bitmap_block(i)?;
+            let valid_bits = self.bitmap_valid_bits(i);
+            let bm = BitmapReader::new(&bitmap, valid_bits);
+            if let Some(highest) = bm.highest_set_bit() {
+                let absolute = i as u64 * (self.block_size * 8) + highest;
+                return Ok((absolute + 1) * self.block_size);
+            }
+        }
+        // No allocated blocks anywhere — degenerate but possible on a
+        // freshly-mkfs'd-then-emptied volume. Return total_size to match
+        // the trait default behavior.
+        Ok(self.total_blocks * self.block_size)
+    }
+}
+
+// ---- Compact reader ----
+
+/// A streaming `Read` that produces a compacted ReiserFS partition image.
+///
+/// **Layout-preserving** — allocated blocks are read from their original
+/// positions, unallocated blocks are emitted as zeros. Block addresses
+/// inside the volume's S+tree therefore remain valid against the stream,
+/// which is what the layout-preserving backup pipeline needs.
+///
+/// The compaction win comes from the trailing zero-fill: free space in
+/// the middle of the volume compresses near-perfectly under zstd / CHD,
+/// and `last_data_byte()`-driven trimming drops the tail after the last
+/// allocated block entirely.
+pub struct CompactReiserFsReader<R: Read + Seek> {
+    inner: CompactStreamReader<R>,
+}
+
+impl<R: Read + Seek + Send> CompactReiserFsReader<R> {
+    /// Create a new compacted ReiserFS reader.
+    ///
+    /// Parses the superblock, walks every bitmap block, and builds a
+    /// section list with one entry per allocated/free run.
+    pub fn new(
+        mut reader: R,
+        partition_offset: u64,
+    ) -> Result<(Self, CompactResult), FilesystemError> {
+        // Re-open the volume via the regular parser so we share validation
+        // (magic, block size, label, bmap_nr fallback) with the read path.
+        let mut fs = ReiserFsFilesystem::open(reader, partition_offset)?;
+        let block_size = fs.block_size;
+        let total_blocks = fs.total_blocks;
+        let blocks_per_bitmap = block_size * 8;
+
+        let mut sections: Vec<CompactSection> = Vec::new();
+        let mut total_allocated: u64 = 0;
+        let mut next_logical_block: u64 = 0;
+
+        for i in 0..fs.bmap_nr {
+            let bitmap = fs.read_bitmap_block(i)?;
+            let valid_bits = fs.bitmap_valid_bits(i);
+            if valid_bits == 0 {
+                continue;
+            }
+            let bm = BitmapReader::new(&bitmap, valid_bits);
+            let group_start = i as u64 * blocks_per_bitmap;
+
+            // Coalesce consecutive same-state runs into single sections.
+            let mut bit: u64 = 0;
+            while bit < valid_bits {
+                let is_set = bm.is_bit_set(bit);
+                let mut run_end = bit + 1;
+                while run_end < valid_bits && bm.is_bit_set(run_end) == is_set {
+                    run_end += 1;
+                }
+                let run_len = run_end - bit;
+
+                if is_set {
+                    let old_blocks: Vec<u64> = (bit..run_end).map(|b| group_start + b).collect();
+                    total_allocated += run_len;
+                    sections.push(CompactSection::MappedBlocks { old_blocks });
+                } else {
+                    sections.push(CompactSection::Zeros(run_len * block_size));
+                }
+                bit = run_end;
+            }
+
+            next_logical_block = group_start + valid_bits;
+        }
+
+        // Trailing gap if total_blocks > sum of bitmap coverage (the on-disk
+        // sentinel-zero bmap_nr branch should already round up to cover the
+        // full volume, but emit an explicit zero region defensively).
+        if next_logical_block < total_blocks {
+            sections.push(CompactSection::Zeros(
+                (total_blocks - next_logical_block) * block_size,
+            ));
+        }
+
+        reader = fs.reader;
+        let original_size = total_blocks * block_size;
+        let layout = CompactLayout {
+            sections,
+            block_size: block_size as usize,
+            source_data_start: 0,
+            source_partition_offset: partition_offset,
+        };
+        let inner = CompactStreamReader::new(reader, layout);
+        Ok((
+            Self { inner },
+            CompactResult {
+                original_size,
+                compacted_size: original_size,
+                data_size: total_allocated * block_size,
+                clusters_used: total_allocated as u32,
+            },
+        ))
+    }
+}
+
+impl<R: Read + Seek> Read for CompactReiserFsReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
     }
 }
 
@@ -395,6 +567,189 @@ mod tests {
             crate::fs::probe_0x83_fs_type(&mut cursor, 0),
             Some("ReiserFS")
         );
+    }
+
+    /// Set bit `bit` (LSB-first within each byte) in `data`. Tests construct
+    /// real bitmap layouts with this so the bitmap-walk path is exercised.
+    fn set_bit(data: &mut [u8], bit: u64) {
+        let byte = (bit / 8) as usize;
+        let off = (bit % 8) as u32;
+        data[byte] |= 1u8 << off;
+    }
+
+    /// Build a synthetic ReiserFS volume + write a populated bitmap.
+    /// Returns the raw image plus `(block_size, total_blocks)` for assertions.
+    ///
+    /// Reserved blocks (boot area, superblock, and every bitmap block) are
+    /// always marked allocated — that matches what a real `mkfs.reiserfs`
+    /// produces. `extra_allocated` lists additional user-data blocks the
+    /// caller wants set for a specific test.
+    fn synth_volume_with_bitmap(
+        magic: &[u8],
+        block_count: u32,
+        block_size_field: u16,
+        s_version: u16,
+        extra_allocated: &[u64],
+    ) -> (Vec<u8>, u64, u64) {
+        let mut buf = synth_volume(magic, block_count, 0, block_size_field, None, s_version);
+        let block_size = block_size_field as u64;
+        let sb_block = REISERFS_SUPERBLOCK_OFFSET / block_size;
+        let blocks_per_bitmap = block_size * 8;
+        let bmap_nr = (block_count as u64).div_ceil(blocks_per_bitmap) as u32;
+
+        // Collect everything that needs to be set, then write all bits.
+        let mut allocated: Vec<u64> = Vec::new();
+        // Reserved area: blocks 0..=sb_block. The actual boot area is usually
+        // sparse but real ReiserFS marks the leading run allocated.
+        for b in 0..=sb_block {
+            allocated.push(b);
+        }
+        // Bitmap blocks themselves.
+        for i in 0..bmap_nr {
+            let phys = if i == 0 {
+                sb_block + 1
+            } else {
+                i as u64 * blocks_per_bitmap
+            };
+            if phys < block_count as u64 {
+                allocated.push(phys);
+            }
+        }
+        allocated.extend_from_slice(extra_allocated);
+
+        for absolute_block in allocated {
+            if absolute_block >= block_count as u64 {
+                continue;
+            }
+            let bitmap_idx = (absolute_block / blocks_per_bitmap) as u32;
+            assert!(bitmap_idx < bmap_nr, "test sets out-of-range block");
+            let bit_in_bitmap = absolute_block % blocks_per_bitmap;
+            let bitmap_phys_block = if bitmap_idx == 0 {
+                sb_block + 1
+            } else {
+                bitmap_idx as u64 * blocks_per_bitmap
+            };
+            let bitmap_byte_off = (bitmap_phys_block * block_size) as usize;
+            // The synth_volume helper pads to 4 MiB minimum but extra bitmap
+            // blocks past block_count may sit past EOF — extend buf if needed.
+            let bitmap_block_end = bitmap_byte_off + block_size as usize;
+            if buf.len() < bitmap_block_end {
+                buf.resize(bitmap_block_end, 0);
+            }
+            set_bit(
+                &mut buf[bitmap_byte_off..bitmap_byte_off + block_size as usize],
+                bit_in_bitmap,
+            );
+        }
+
+        (buf, block_size, block_count as u64)
+    }
+
+    #[test]
+    fn last_data_byte_returns_highest_allocated_block_plus_one() {
+        // 64-block 4096-byte volume; reserved blocks fill 0..=17, extras
+        // add 20, 30, 50. Highest is 50, last_data_byte = 51 * 4096.
+        let (buf, bs, _) = synth_volume_with_bitmap(MAGIC_V3_6, 64, 4096, 2, &[20, 30, 50]);
+        let mut fs = ReiserFsFilesystem::open(Cursor::new(buf), 0).expect("open");
+        assert_eq!(fs.last_data_byte().unwrap(), 51 * bs);
+    }
+
+    #[test]
+    fn last_data_byte_with_only_reserved_blocks() {
+        // Fresh-from-mkfs case: only reserved metadata (boot + superblock +
+        // bitmap) is allocated. For block_size = 4096, sb_block = 16 and
+        // the first bitmap at block 17 is the highest set bit, so
+        // last_data_byte = (17 + 1) * 4096.
+        let (buf, bs, _) = synth_volume_with_bitmap(MAGIC_V3_6, 64, 4096, 2, &[]);
+        let mut fs = ReiserFsFilesystem::open(Cursor::new(buf), 0).expect("open");
+        assert_eq!(fs.last_data_byte().unwrap(), 18 * bs);
+    }
+
+    #[test]
+    fn last_data_byte_falls_back_to_total_when_bitmap_empty() {
+        // Construct a volume whose bitmap is genuinely all-zero (no reserved
+        // blocks marked). The fallback path returns total_size verbatim.
+        let buf = synth_volume(MAGIC_V3_6, 64, 0, 4096, None, 2);
+        let mut fs = ReiserFsFilesystem::open(Cursor::new(buf), 0).expect("open");
+        assert_eq!(fs.last_data_byte().unwrap(), 64 * 4096);
+    }
+
+    #[test]
+    fn last_data_byte_spans_multiple_bitmap_blocks() {
+        // block_size = 1024 → blocks_per_bitmap = 8192, so a 24576-block
+        // volume has 3 bitmaps (at physical blocks 65, 8192, 16384). With
+        // an extra allocation at block 20000 (inside bitmap 2's range) the
+        // highest set bit lives in bitmap 2 and last_data_byte is
+        // (20000 + 1) * 1024.
+        let (buf, bs, _) =
+            synth_volume_with_bitmap(MAGIC_V3_6, 24576, 1024, 2, &[100, 9000, 20000]);
+        let mut fs = ReiserFsFilesystem::open(Cursor::new(buf), 0).expect("open");
+        assert_eq!(fs.last_data_byte().unwrap(), 20001 * bs);
+    }
+
+    #[test]
+    fn compact_reader_emits_layout_preserving_stream() {
+        // 64-block 4096-byte volume with extras 20, 30, 50 allocated past the
+        // 18-block reserved area. Compact stream is 64 * 4096 bytes; each
+        // allocated user block's bytes sit at their original byte offset.
+        let (mut buf, bs, total) = synth_volume_with_bitmap(MAGIC_V3_6, 64, 4096, 2, &[20, 30, 50]);
+        for (block, fill) in [(20u64, 0xAAu8), (30, 0xBB), (50, 0xCC)] {
+            let off = (block * bs) as usize;
+            buf[off..off + bs as usize].fill(fill);
+        }
+
+        let (mut compact, info) =
+            CompactReiserFsReader::new(Cursor::new(buf), 0).expect("build compact");
+        assert_eq!(info.original_size, total * bs);
+        assert_eq!(info.compacted_size, total * bs); // layout-preserving
+                                                     // Reserved (boot 0..=16, superblock at 16 dedups, first bitmap at 17)
+                                                     // = 18 blocks, plus 3 extras = 21 allocated total.
+        assert_eq!(info.clusters_used, 21);
+
+        let mut out = Vec::new();
+        compact.read_to_end(&mut out).expect("read");
+        assert_eq!(out.len(), (total * bs) as usize);
+
+        for (block, fill) in [(20u64, 0xAAu8), (30, 0xBB), (50, 0xCC)] {
+            let off = (block * bs) as usize;
+            assert!(
+                out[off..off + bs as usize].iter().all(|&b| b == fill),
+                "block {block} did not contain its fill byte 0x{fill:02X}"
+            );
+        }
+        // Spot-check a free block (25, between extras and well past reserved)
+        // stays zeroed in the compact stream.
+        let free_off = (25 * bs) as usize;
+        assert!(out[free_off..free_off + bs as usize]
+            .iter()
+            .all(|&b| b == 0));
+    }
+
+    #[test]
+    fn compact_reader_round_trips_through_parser() {
+        // Compact stream of a populated volume should re-detect as the same
+        // ReiserFS volume and report the same sizes / label.
+        let (buf, _bs, _total) =
+            synth_volume_with_bitmap(MAGIC_V3_6, 128, 4096, 2, &[5, 10, 18, 100]);
+        let original_len = buf.len();
+        // Inject a label to confirm the V2 extension survives the round-trip.
+        let sb_off = REISERFS_SUPERBLOCK_OFFSET as usize;
+        let mut buf = buf;
+        buf[sb_off + 100..sb_off + 100 + 9].copy_from_slice(b"roundtrip");
+
+        let (mut compact, _) =
+            CompactReiserFsReader::new(Cursor::new(buf), 0).expect("build compact");
+        let mut out = Vec::new();
+        compact.read_to_end(&mut out).expect("read");
+        // The compact stream covers the volume's declared block range; the
+        // original `synth_volume` buffer may have been larger (4 MiB pad).
+        // Padding tail beyond the volume is dropped by the reader.
+        assert!(out.len() <= original_len);
+
+        let fs = ReiserFsFilesystem::open(Cursor::new(out), 0).expect("re-open compact");
+        assert_eq!(fs.version(), ReiserFsVersion::V3_6);
+        assert_eq!(fs.volume_label(), Some("roundtrip"));
+        assert_eq!(fs.total_size(), 128 * 4096);
     }
 
     #[test]
