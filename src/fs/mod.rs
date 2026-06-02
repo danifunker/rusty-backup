@@ -61,6 +61,7 @@ pub use hfs::{
     hfs_max_growable_size, resize_hfs_in_place, validate_hfs_integrity, CompactHfsReader,
 };
 pub use hfsplus::{resize_hfsplus_in_place, validate_hfsplus_integrity, CompactHfsPlusReader};
+pub use jfs::CompactJfsReader;
 pub use ntfs::{
     patch_ntfs_hidden_sectors, resize_ntfs_in_place, validate_ntfs_integrity, CompactNtfsReader,
 };
@@ -421,6 +422,10 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
                     let (reader, info) = CompactUfsReader::new(reader, partition_offset).ok()?;
                     Some((Box::new(reader), info))
                 }
+                "jfs" => {
+                    let (reader, info) = CompactJfsReader::new(reader, partition_offset).ok()?;
+                    Some((Box::new(reader), info))
+                }
                 "prodos" => {
                     let (reader, info) = CompactProDosReader::new(reader, partition_offset).ok()?;
                     Some((Box::new(reader), info))
@@ -469,6 +474,10 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
                 }
                 "ufs" => {
                     let (reader, info) = CompactUfsReader::new(reader, partition_offset).ok()?;
+                    Some((Box::new(reader), info))
+                }
+                "jfs" => {
+                    let (reader, info) = CompactJfsReader::new(reader, partition_offset).ok()?;
                     Some((Box::new(reader), info))
                 }
                 "fat" => {
