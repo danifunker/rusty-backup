@@ -22,6 +22,7 @@ pub mod btree_build;
 pub mod dir1;
 pub mod dir2;
 pub mod dir_repair;
+pub mod edit;
 pub mod freespace_rebuild;
 pub mod fsck;
 pub mod inobt_repair;
@@ -1345,6 +1346,60 @@ mod tests {
         assert!(
             res.errors.is_empty(),
             "expected clean after repair, got: {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn create_directory_in_shortform_root() {
+        // Allocate an inode + insert a short-form entry: create /made_dir under
+        // the root, then confirm it lists, is an empty directory, the root link
+        // count bumped, and the verifier stays clean.
+        use crate::fs::filesystem::{CreateDirectoryOptions, EditableFilesystem};
+        let img = load_fixture().to_vec();
+        let mut cursor = Cursor::new(img);
+        let new_ino = {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable");
+            let root = fs.root().expect("root");
+            let root_nlink = fs.read_inode(root.location).expect("root inode").nlink;
+            let entry = fs
+                .create_directory(&root, "made_dir", &CreateDirectoryOptions::default())
+                .expect("create_directory");
+            fs.sync_metadata().expect("sync");
+            // Root gained a subdirectory -> nlink + 1.
+            let after = fs.read_inode(root.location).expect("root inode").nlink;
+            assert_eq!(after, root_nlink + 1, "root nlink not bumped");
+            entry.location
+        };
+
+        let repaired = cursor.into_inner();
+        let mut fs = XfsFilesystem::open(Cursor::new(repaired), 0).expect("reopen");
+        let root = fs.root().expect("root");
+        let names: Vec<String> = fs
+            .list_directory(&root)
+            .expect("list")
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(
+            names.contains(&"made_dir".to_string()),
+            "not listed: {names:?}"
+        );
+        let core = fs.read_inode(new_ino).expect("new dir inode");
+        assert!(core.is_dir(), "new inode is not a directory");
+        assert_eq!(core.nlink, 2, "empty dir should have nlink 2");
+        // The new directory is empty and listable.
+        let made = fs
+            .list_directory(&root)
+            .expect("list")
+            .into_iter()
+            .find(|e| e.name == "made_dir")
+            .expect("entry");
+        assert!(fs.list_directory(&made).expect("list new dir").is_empty());
+        let res = fs.run_fsck().expect("fsck");
+        assert!(
+            res.errors.is_empty(),
+            "expected clean, got {:?}",
             res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
         );
     }

@@ -258,13 +258,18 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for XfsFilesystem<R> {
 
     fn create_directory(
         &mut self,
-        _parent: &FileEntry,
-        _name: &str,
-        _options: &CreateDirectoryOptions,
+        parent: &FileEntry,
+        name: &str,
+        options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
-        Err(FilesystemError::Unsupported(
-            "XFS directory creation is not implemented yet (repair-only editable surface)".into(),
-        ))
+        // v4 short-form directories only (block/leaf/node parents and new-chunk
+        // inode allocation are not implemented yet). Force the directory format
+        // bit onto whatever permission bits the caller passed.
+        let mode = ((options.mode.unwrap_or(0o755) & 0o7777) | 0o040000) as u16;
+        let uid = options.uid.unwrap_or(0);
+        let gid = options.gid.unwrap_or(0);
+        let ino = self.do_create_directory(parent.location, name, mode, uid, gid)?;
+        self.child_entry(&parent.path, name.to_string(), ino)
     }
 
     fn delete_entry(
