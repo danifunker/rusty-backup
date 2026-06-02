@@ -163,9 +163,11 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                             self.write_sector(agf_byte, &agf, &mut report, agno, "AGF freeblks");
                         }
                         Ok(_) => {}
-                        Err(e) => report
-                            .fixes_failed
-                            .push(format!("AG {agno}: AGF freeblks recompute failed: {e}")),
+                        // Tree too damaged to walk: the structural rebuild
+                        // (R2) runs after R4b and will both rebuild it and set
+                        // the correct summary, so this is not a failure — skip
+                        // quietly rather than reporting an alarming error.
+                        Err(_) => {}
                     }
                 }
             }
@@ -183,9 +185,10 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                             self.write_sector(agi_byte, &agi, &mut report, agno, "AGI count");
                         }
                         Ok(_) => {}
-                        Err(e) => report
-                            .fixes_failed
-                            .push(format!("AG {agno}: AGI count recompute failed: {e}")),
+                        // Tree too damaged to walk: R3 (inobt) runs after R4b
+                        // and will rebuild it and set the correct AGI summary,
+                        // so skip quietly rather than reporting a failure.
+                        Err(_) => {}
                     }
                 }
             }

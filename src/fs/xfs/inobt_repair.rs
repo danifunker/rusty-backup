@@ -18,10 +18,13 @@
 //! so this is decoupled from the free-space btrees (R2) — an inode being free
 //! or not does not change which blocks the chunk occupies.
 //!
-//! This slice requires a **walkable** inobt (we descend it to find the leaf
-//! blocks). A trashed inobt *structure* — bad magic/pointers — needs full
-//! inode-chunk rediscovery by scanning and is deliberately out of scope here;
-//! we report and skip such an AG, writing nothing.
+//! When the inobt is **walkable** we descend it and correct each leaf's masks
+//! in place. When its *structure* is trashed (bad root magic/pointers) we fall
+//! back to rediscovering the inode chunks by **scanning** the AG and writing a
+//! fresh leaf into the existing root block — but only for a single-level tree
+//! (`agi_level == 1`), where the whole inobt is that one block, so no block
+//! allocation or free-space change is needed. A multi-level trashed inobt would
+//! need block allocation (and R2 coupling) and is still reported + skipped.
 //!
 //! v4 only: v5 inobt blocks carry a CRC we don't recompute, so rewriting a
 //! leaf there would invalidate it. Porting reference: `xfs_repair` @ v3.1.11
@@ -103,53 +106,94 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                 }
             };
 
-            let leaves = match self.collect_inobt_leaf_blocks(&sb, agno, agi.root) {
-                Ok(l) => l,
-                Err(e) => {
-                    // Unwalkable structure: defer to a future rebuild, no write.
-                    report.fixes_failed.push(format!(
-                        "AG {agno}: inobt not walkable ({e}); structure rebuild not implemented, skipped"
-                    ));
-                    continue;
-                }
+            let expected_len = if agno == sb.agcount as u64 - 1 {
+                sb.dblocks - agno * agblocks
+            } else {
+                agblocks
             };
 
             let mut ag_count: u64 = 0;
             let mut ag_freecount: u64 = 0;
-            let mut leaves_fixed = 0u32;
+            let mut changed = false;
             let mut ag_failed = false;
 
-            for leaf_agbno in leaves {
-                match self.repair_inobt_leaf(&sb, agno, leaf_agbno, &internal) {
-                    Ok(LeafResult {
-                        count,
-                        freecount,
-                        rewritten,
-                    }) => {
-                        ag_count += count;
-                        ag_freecount += freecount;
-                        if rewritten {
-                            leaves_fixed += 1;
+            match self.collect_inobt_leaf_blocks(&sb, agno, agi.root) {
+                Ok(leaves) => {
+                    // Walkable: recompute each existing leaf's masks in place.
+                    let mut leaves_fixed = 0u32;
+                    for leaf_agbno in leaves {
+                        match self.repair_inobt_leaf(&sb, agno, leaf_agbno, &internal) {
+                            Ok(LeafResult {
+                                count,
+                                freecount,
+                                rewritten,
+                            }) => {
+                                ag_count += count;
+                                ag_freecount += freecount;
+                                if rewritten {
+                                    leaves_fixed += 1;
+                                }
+                            }
+                            Err(e) => {
+                                report.fixes_failed.push(format!(
+                                    "AG {agno}: inobt leaf {leaf_agbno} repair failed: {e}"
+                                ));
+                                ag_failed = true;
+                                break;
+                            }
                         }
                     }
-                    Err(e) => {
+                    if !ag_failed && leaves_fixed > 0 {
+                        changed = true;
+                        report.fixes_applied.push(format!(
+                            "AG {agno}: recomputed {leaves_fixed} inobt leaf free-mask(s) from inodes"
+                        ));
+                    }
+                }
+                Err(e) => {
+                    // Trashed structure. A single-level tree is exactly one leaf
+                    // at the (intact-AGI) root block, so we can rediscover the
+                    // inode chunks by scanning and rewrite that one block in
+                    // place — no block allocation, no free-space change.
+                    // Multi-level rebuild needs allocation and is deferred.
+                    if agi.level == 1 {
+                        match self.rebuild_single_inobt_leaf(
+                            &sb,
+                            agno,
+                            agi.root,
+                            expected_len,
+                            &internal,
+                        ) {
+                            Ok((count, freecount)) => {
+                                ag_count = count;
+                                ag_freecount = freecount;
+                                changed = true;
+                                report.fixes_applied.push(format!(
+                                    "AG {agno}: rebuilt trashed inobt root leaf from {} discovered inode chunk(s)",
+                                    count / XFS_INODES_PER_CHUNK as u64
+                                ));
+                            }
+                            Err(re) => {
+                                report.fixes_failed.push(format!(
+                                    "AG {agno}: inobt rebuild failed ({re}); original error: {e}"
+                                ));
+                                ag_failed = true;
+                            }
+                        }
+                    } else {
                         report.fixes_failed.push(format!(
-                            "AG {agno}: inobt leaf {leaf_agbno} repair failed: {e}"
+                            "AG {agno}: inobt unwalkable ({e}) and multi-level (level {}); structure rebuild not implemented, skipped",
+                            agi.level
                         ));
                         ag_failed = true;
-                        break;
                     }
                 }
             }
             if ag_failed {
                 continue;
             }
-
-            if leaves_fixed > 0 {
+            if changed {
                 any_change = true;
-                report.fixes_applied.push(format!(
-                    "AG {agno}: recomputed {leaves_fixed} inobt leaf free-mask(s) from inodes"
-                ));
             }
 
             // Fix the AGI summary counters from the recomputed totals.
@@ -332,6 +376,103 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             freecount,
             rewritten: changed,
         })
+    }
+
+    /// Rebuild a trashed single-level inobt: rediscover every inode chunk in
+    /// the AG by scanning, then write a fresh leaf block (level 0, sibling
+    /// pointers null) into the existing root block. Returns
+    /// `(count, freecount)` for the AGI fix. The AGI is trusted (parsed
+    /// already), so `root_agbno` is the right place for the leaf; only its
+    /// *content* was lost.
+    fn rebuild_single_inobt_leaf(
+        &mut self,
+        sb: &XfsSuperblock,
+        agno: u64,
+        root_agbno: u32,
+        expected_len: u64,
+        internal: &HashSet<u64>,
+    ) -> Result<(u64, u64), FilesystemError> {
+        let bs = sb.blocksize as usize;
+        let max_leaf = (bs - INOBT_HDR_LEN) / INOBT_REC_SIZE;
+        let chunks = self.scan_ag_inode_chunks(sb, agno, expected_len, internal)?;
+        if chunks.len() > max_leaf {
+            return Err(FilesystemError::Unsupported(format!(
+                "AG {agno}: {} inode chunks exceed one leaf ({max_leaf}); needs multi-level rebuild",
+                chunks.len()
+            )));
+        }
+
+        let mut block = vec![0u8; bs];
+        BigEndian::write_u32(&mut block[0..4], XFS_IBT_MAGIC);
+        BigEndian::write_u16(&mut block[4..6], 0); // level 0 (leaf)
+        BigEndian::write_u16(&mut block[6..8], chunks.len() as u16);
+        BigEndian::write_u32(&mut block[8..12], NULLAGBLOCK); // leftsib
+        BigEndian::write_u32(&mut block[12..16], NULLAGBLOCK); // rightsib
+
+        let mut freecount: u64 = 0;
+        for (i, &(start_agino, free_mask)) in chunks.iter().enumerate() {
+            let off = INOBT_HDR_LEN + i * INOBT_REC_SIZE;
+            let fc = free_mask.count_ones();
+            freecount += fc as u64;
+            BigEndian::write_u32(&mut block[off..off + 4], start_agino);
+            BigEndian::write_u32(&mut block[off + REC_FREECOUNT_OFF..off + 8], fc);
+            BigEndian::write_u64(&mut block[off + REC_FREE_OFF..off + 16], free_mask);
+        }
+
+        let fsblock = (agno << sb.agblklog) | root_agbno as u64;
+        let part_byte = fsblock_to_partition_byte(fsblock, sb.agblocks, sb.agblklog, sb.blocksize);
+        self.reader
+            .seek(SeekFrom::Start(self.partition_offset + part_byte))?;
+        self.reader.write_all(&block)?;
+
+        Ok((chunks.len() as u64 * XFS_INODES_PER_CHUNK as u64, freecount))
+    }
+
+    /// Discover every inode chunk in an AG by scanning at chunk-block stride.
+    /// 64-inode chunks are aligned to `blocks_per_chunk` (start inode is a
+    /// multiple of 64, so its block is a multiple of `64 >> inopblog`), so we
+    /// probe each candidate's first inode for the dinode magic + a sane version
+    /// before accepting it. Returns `(start_agino, free_mask)` sorted by
+    /// start_agino — the leaf-record set for a rebuilt inobt.
+    fn scan_ag_inode_chunks(
+        &mut self,
+        sb: &XfsSuperblock,
+        agno: u64,
+        expected_len: u64,
+        internal: &HashSet<u64>,
+    ) -> Result<Vec<(u32, u64)>, FilesystemError> {
+        let inodesize = sb.inodesize as usize;
+        let blocks_per_chunk =
+            ((XFS_INODES_PER_CHUNK as u64) * inodesize as u64).div_ceil(sb.blocksize as u64);
+        let bs = sb.blocksize as u64;
+        let mut first_block = vec![0u8; bs as usize];
+        let mut chunks: Vec<(u32, u64)> = Vec::new();
+
+        let mut chunk_agbno = 0u64;
+        while chunk_agbno + blocks_per_chunk <= expected_len {
+            let fsblock = (agno << sb.agblklog) | chunk_agbno;
+            let part_byte =
+                fsblock_to_partition_byte(fsblock, sb.agblocks, sb.agblklog, sb.blocksize);
+            if read_at_aligned(
+                &mut self.reader,
+                self.partition_offset + part_byte,
+                bs,
+                &mut first_block,
+            )
+            .is_ok()
+            {
+                let magic = BigEndian::read_u16(&first_block[0..2]);
+                let version = first_block[4];
+                if magic == super::types::XFS_DINODE_MAGIC && (version == 1 || version == 2) {
+                    let start_agino = (chunk_agbno << sb.inopblog) as u32;
+                    let mask = self.compute_chunk_free_mask(sb, agno, start_agino, internal)?;
+                    chunks.push((start_agino, mask));
+                }
+            }
+            chunk_agbno += blocks_per_chunk;
+        }
+        chunks.sort_by_key(|&(start, _)| start);
+        Ok(chunks)
     }
 
     /// Build a chunk's 64-bit free mask (set bit = free) by reading every
