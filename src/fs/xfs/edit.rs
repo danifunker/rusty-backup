@@ -30,7 +30,7 @@ use super::btree_build::FreeExtent;
 use super::dir2::XFS_DIR2_DATA_HDR_LEN;
 use super::freespace_rebuild::{carve_from_largest, coalesce};
 use super::inode::fork_offset;
-use super::types::{XFS_ABTB_MAGIC, XFS_ABTC_MAGIC};
+use super::types::{XFS_ABTB_MAGIC, XFS_ABTC_MAGIC, XFS_INODES_PER_CHUNK};
 use super::{read_at_aligned, XfsFilesystem};
 use crate::fs::filesystem::FilesystemError;
 
@@ -646,5 +646,240 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         self.sf_insert_entry(&sb, parent_ino, name, ino, false)?;
         self.reader.flush()?;
         Ok(ino)
+    }
+
+    // ----- delete_entry ------------------------------------------------------
+
+    /// Remove `name` from short-form directory `parent_ino`, rebuilding the
+    /// inline fork without it (count--, di_size), and decrementing the parent
+    /// link count when the removed child was a subdirectory. Errors `NotFound`
+    /// if the name isn't present.
+    fn sf_remove_entry(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        parent_ino: u64,
+        name: &str,
+        child_was_dir: bool,
+    ) -> Result<(), FilesystemError> {
+        let has_ftype = sb.has_ftype();
+        let (core, mut buf) = self.read_inode_buf(parent_ino)?;
+        if !core.is_dir() || core.format != super::types::DiFormat::Local {
+            return Err(FilesystemError::Unsupported(
+                "parent is not a short-form directory".into(),
+            ));
+        }
+        let fs = fork_offset(false);
+        let fork_len = core.size as usize;
+        let fork_end = fs + fork_len;
+
+        // Walk the entries capturing raw spans + names; collect survivors.
+        let count = buf[fs] as usize;
+        let i8count = buf[fs + 1];
+        let ino_width = if i8count > 0 { 8 } else { 4 };
+        let mut survivors: Vec<(usize, usize)> = Vec::with_capacity(count); // (start,end) in buf
+        let mut removed = false;
+        let mut pos = fs + 2 + ino_width;
+        for _ in 0..count {
+            let start = pos;
+            if start + 3 > fork_end {
+                return Err(FilesystemError::Parse("short-form entry truncated".into()));
+            }
+            let namelen = buf[start] as usize;
+            let name_off = start + 3;
+            let next = name_off + namelen + usize::from(has_ftype) + ino_width;
+            if next > fork_end {
+                return Err(FilesystemError::Parse("short-form entry overflow".into()));
+            }
+            let ename = String::from_utf8_lossy(&buf[name_off..name_off + namelen]);
+            if !removed && ename == name {
+                removed = true; // drop this one
+            } else {
+                survivors.push((start, next));
+            }
+            pos = next;
+        }
+        if !removed {
+            return Err(FilesystemError::NotFound(name.into()));
+        }
+
+        // Rebuild: header (count', i8count, parent) + surviving spans verbatim.
+        let header = buf[fs..fs + 2 + ino_width].to_vec();
+        let mut new_fork = Vec::with_capacity(fork_len);
+        new_fork.extend_from_slice(&header);
+        for (s, e) in &survivors {
+            new_fork.extend_from_slice(&buf[*s..*e]);
+        }
+        new_fork[0] = survivors.len() as u8; // count
+
+        buf[fs..fs + new_fork.len()].copy_from_slice(&new_fork);
+        for b in buf.iter_mut().take(fork_end).skip(fs + new_fork.len()) {
+            *b = 0;
+        }
+        BigEndian::write_u64(&mut buf[56..64], new_fork.len() as u64);
+        if child_was_dir {
+            let version = buf[4];
+            if version == 1 {
+                let n = BigEndian::read_u16(&buf[6..8]).saturating_sub(1);
+                BigEndian::write_u16(&mut buf[6..8], n);
+            } else {
+                let n = BigEndian::read_u32(&buf[16..20]).saturating_sub(1);
+                BigEndian::write_u32(&mut buf[16..20], n);
+            }
+        }
+        self.write_inode_region(sb, parent_ino, &buf)
+    }
+
+    /// Free a previously-allocated inode: mark its inobt slot free (set the
+    /// `ir_free` bit, ++ record freecount + AGI freecount + `sb_ifree`) and zero
+    /// its on-disk `di_mode` so it reads as a free inode.
+    fn free_inode(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        ino: u64,
+    ) -> Result<(), FilesystemError> {
+        let sectsize = sb.sectsize as u64;
+        let agblocks = sb.agblocks as u64;
+        let blocksize = sb.blocksize as u64;
+        let bs = sb.blocksize as usize;
+        let ino_shift = sb.agblklog + sb.inopblog;
+        let agno = ino >> ino_shift;
+        let agino = (ino & ((1u64 << ino_shift) - 1)) as u32;
+
+        let agi_byte = self.partition_offset + agno * agblocks * blocksize + 2 * sectsize;
+        let mut agi_sec = vec![0u8; sectsize as usize];
+        read_at_aligned(&mut self.reader, agi_byte, sectsize, &mut agi_sec)?;
+        let agi = XfsAgi::parse(&agi_sec)?;
+        let leaves = self.collect_inobt_leaf_blocks(sb, agno, agi.root)?;
+        for leaf_agbno in leaves {
+            let fsblock = (agno << sb.agblklog) | leaf_agbno as u64;
+            let mut block = vec![0u8; bs];
+            self.read_fsblock(fsblock, &mut block)?;
+            let numrecs = BigEndian::read_u16(&block[6..8]) as usize;
+            let max_leaf = (bs - INOBT_HDR_LEN) / INOBT_REC_SIZE;
+            if numrecs > max_leaf {
+                continue;
+            }
+            for r in 0..numrecs {
+                let off = INOBT_HDR_LEN + r * INOBT_REC_SIZE;
+                let start_agino = BigEndian::read_u32(&block[off..off + 4]);
+                if agino < start_agino || agino >= start_agino + XFS_INODES_PER_CHUNK as u32 {
+                    continue;
+                }
+                let slot = (agino - start_agino) as u64;
+                let freecount = BigEndian::read_u32(&block[off + 4..off + 8]);
+                let free = BigEndian::read_u64(&block[off + 8..off + 16]);
+                if (free >> slot) & 1 == 1 {
+                    return Err(FilesystemError::InvalidData(format!(
+                        "inode {ino} already free in inobt"
+                    )));
+                }
+                BigEndian::write_u32(&mut block[off + 4..off + 8], freecount + 1);
+                BigEndian::write_u64(&mut block[off + 8..off + 16], free | (1u64 << slot));
+                self.write_fsblock(sb, fsblock, &block)?;
+
+                BigEndian::write_u32(
+                    &mut agi_sec[AGI_FREECOUNT_OFF..AGI_FREECOUNT_OFF + 4],
+                    agi.freecount + 1,
+                );
+                self.write_at(agi_byte, &agi_sec)?;
+                self.bump_sb_ifree(sb, 1)?;
+
+                // Zero the dinode's mode so it reads as free.
+                let (_c, mut ibuf) = self.read_inode_buf(ino)?;
+                BigEndian::write_u16(&mut ibuf[2..4], 0);
+                self.write_inode_region(sb, ino, &ibuf)?;
+                return Ok(());
+            }
+        }
+        Err(FilesystemError::NotFound(format!(
+            "inode {ino} not found in any inobt chunk"
+        )))
+    }
+
+    /// Return `extents` (as `(fsblock, count)`) to the free-space btrees by
+    /// rebuilding each touched AG's bno/cnt over its current free set plus the
+    /// freed blocks, then resyncing `sb_fdblocks`. The inverse of
+    /// [`alloc_blocks`].
+    fn free_blocks(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        extents: &[(u64, u32)],
+    ) -> Result<(), FilesystemError> {
+        let agblocks = sb.agblocks as u64;
+        let agmask = (1u64 << sb.agblklog) - 1;
+        // Group the freed runs by AG (AG-relative).
+        let mut by_ag: std::collections::BTreeMap<u64, Vec<FreeExtent>> =
+            std::collections::BTreeMap::new();
+        for &(fsblock, count) in extents {
+            if count == 0 {
+                continue;
+            }
+            let agno = fsblock >> sb.agblklog;
+            let agbno = (fsblock & agmask) as u32;
+            by_ag.entry(agno).or_default().push(FreeExtent {
+                startblock: agbno,
+                blockcount: count,
+            });
+        }
+        for (agno, freed) in by_ag {
+            let expected_len = if agno == sb.agcount as u64 - 1 {
+                sb.dblocks - agno * agblocks
+            } else {
+                agblocks
+            };
+            let mut all = self.current_full_free(sb, agno, expected_len)?;
+            all.extend(freed);
+            let derived = coalesce(all);
+            self.rebuild_ag_freespace(sb, agno, expected_len, &derived)?;
+        }
+        self.resync_sb_fdblocks(sb)?;
+        Ok(())
+    }
+
+    /// Internal entry point for `delete_entry`: remove `name` (-> `child_ino`)
+    /// from short-form directory `parent_ino`, free the child's data blocks, and
+    /// free the child inode. Refuses a non-empty / non-short-form directory and
+    /// a bmap-btree-format child (multi-extent free not implemented).
+    pub(crate) fn do_delete_entry(
+        &mut self,
+        parent_ino: u64,
+        name: &str,
+        child_ino: u64,
+    ) -> Result<(), FilesystemError> {
+        let sb = self.superblock().clone();
+        let (cc, cbuf) = self.read_inode_buf(child_ino)?;
+        let child_is_dir = cc.is_dir();
+        if child_is_dir {
+            if cc.format != super::types::DiFormat::Local {
+                return Err(FilesystemError::Unsupported(
+                    "cannot delete a non-short-form directory yet".into(),
+                ));
+            }
+            let fork = self.data_fork(&cc, &cbuf);
+            if fork.first().copied().unwrap_or(0) != 0 {
+                return Err(FilesystemError::InvalidData("directory not empty".into()));
+            }
+        }
+        let extents: Vec<(u64, u32)> = match cc.format {
+            super::types::DiFormat::Extents => self
+                .decode_data_extents(&cc, &cbuf)?
+                .iter()
+                .map(|e| (e.startblock, e.blockcount as u32))
+                .collect(),
+            super::types::DiFormat::Btree => {
+                return Err(FilesystemError::Unsupported(
+                    "cannot delete a bmap-btree-format inode yet".into(),
+                ));
+            }
+            _ => Vec::new(), // local / device: owns no blocks
+        };
+
+        self.sf_remove_entry(&sb, parent_ino, name, child_is_dir)?;
+        if !extents.is_empty() {
+            self.free_blocks(&sb, &extents)?;
+        }
+        self.free_inode(&sb, child_ino)?;
+        self.reader.flush()?;
+        Ok(())
     }
 }

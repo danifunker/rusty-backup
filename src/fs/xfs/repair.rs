@@ -277,12 +277,12 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for XfsFilesystem<R> {
 
     fn delete_entry(
         &mut self,
-        _parent: &FileEntry,
-        _entry: &FileEntry,
+        parent: &FileEntry,
+        entry: &FileEntry,
     ) -> Result<(), FilesystemError> {
-        Err(FilesystemError::Unsupported(
-            "XFS deletion is not implemented yet (repair-only editable surface)".into(),
-        ))
+        // v4 short-form parents; empty short-form directories or single/no-extent
+        // files (bmap-btree children are refused).
+        self.do_delete_entry(parent.location, &entry.name, entry.location)
     }
 
     fn repair(&mut self) -> Result<RepairReport, FilesystemError> {

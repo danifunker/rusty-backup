@@ -1351,6 +1351,81 @@ mod tests {
     }
 
     #[test]
+    fn delete_entry_frees_inode_and_blocks() {
+        // Create a file + an empty dir, then delete both; the volume returns to
+        // a clean state with the entries gone and free space recovered.
+        use crate::fs::filesystem::{
+            CreateDirectoryOptions, CreateFileOptions, EditableFilesystem,
+        };
+        use std::io::Cursor as IoCursor;
+        let payload: Vec<u8> = (0..6000u32).map(|i| (i % 251) as u8).collect();
+
+        let img = load_fixture().to_vec();
+        let mut cursor = Cursor::new(img);
+        let free_before;
+        {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable");
+            free_before = fs.free_space().expect("free");
+            let root = fs.root().expect("root");
+            let mut data = IoCursor::new(payload.clone());
+            fs.create_file(
+                &root,
+                "tmp.bin",
+                &mut data,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create_file");
+            fs.create_directory(&root, "tmpdir", &CreateDirectoryOptions::default())
+                .expect("mkdir");
+            fs.sync_metadata().expect("sync");
+        }
+        // Reopen and delete both.
+        {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("reopen editable");
+            let root = fs.root().expect("root");
+            let entries = fs.list_directory(&root).expect("list");
+            for nm in ["tmp.bin", "tmpdir"] {
+                let e = entries.iter().find(|e| e.name == nm).expect("entry");
+                fs.delete_entry(&root, e).expect("delete");
+            }
+            fs.sync_metadata().expect("sync");
+        }
+
+        let repaired = cursor.into_inner();
+        let mut fs = XfsFilesystem::open(Cursor::new(repaired), 0).expect("reopen");
+        let root = fs.root().expect("root");
+        let names: Vec<String> = fs
+            .list_directory(&root)
+            .expect("list")
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(
+            !names.contains(&"tmp.bin".to_string()),
+            "file not removed: {names:?}"
+        );
+        assert!(
+            !names.contains(&"tmpdir".to_string()),
+            "dir not removed: {names:?}"
+        );
+        // The original fixture entries survive.
+        assert!(
+            names.contains(&"hello.txt".to_string()),
+            "sibling lost: {names:?}"
+        );
+        // Free space is fully reclaimed (delete is the inverse of create).
+        let free_after = fs.free_space().expect("free");
+        assert_eq!(free_after, free_before, "free space not fully reclaimed");
+        let res = fs.run_fsck().expect("fsck");
+        assert!(
+            res.errors.is_empty(),
+            "expected clean, got {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn create_file_in_shortform_root_roundtrips_data() {
         // Allocate an inode + data blocks + insert: create /payload.bin with a
         // known pattern, then read it back byte-for-byte and confirm the volume
