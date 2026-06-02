@@ -248,6 +248,137 @@ impl<R: Read + Seek + Send> ReiserFsFilesystem<R> {
             blocks_per_bitmap
         }
     }
+
+    // The three methods below are wired into `Filesystem::list_directory`
+    // and `read_file` in R.3c/d. Until then they only have test callers,
+    // so silence the dead-code warning until then.
+    #[allow(dead_code)]
+    /// Read an arbitrary tree (or data) block by its absolute block number.
+    /// Refuses to read past the volume's declared block count so a corrupt
+    /// child pointer can't drag the cursor into adjacent partitions.
+    pub(crate) fn read_tree_block(&mut self, block_num: u32) -> Result<Vec<u8>, FilesystemError> {
+        if block_num == 0 {
+            return Err(FilesystemError::Parse(
+                "reiserfs: block 0 is the boot area, not a tree block".into(),
+            ));
+        }
+        if (block_num as u64) >= self.total_blocks {
+            return Err(FilesystemError::Parse(format!(
+                "reiserfs: block number {block_num} exceeds total_blocks {}",
+                self.total_blocks
+            )));
+        }
+        let off = self.partition_offset + (block_num as u64) * self.block_size;
+        self.reader.seek(SeekFrom::Start(off))?;
+        let mut buf = vec![0u8; self.block_size as usize];
+        self.reader.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    #[allow(dead_code)]
+    /// Walk the S+tree from the root and return every leaf block number in
+    /// left-to-right (key-sorted) order.
+    ///
+    /// The naïve "visit every leaf" strategy is intentional for a first
+    /// pass. Real volumes can have many leaves, but each `list_directory`
+    /// or `read_file` call only ever consults a tiny subset; a follow-up
+    /// can replace this with a key-bounded descent once a workload makes
+    /// the difference measurable. The on-disk fixture
+    /// (`tests/fixtures/test_reiserfs_v3_6.img.zst`) is a single-leaf
+    /// tree, so this gets exercised end-to-end without B-tree depth.
+    pub(crate) fn collect_leaf_block_numbers(&mut self) -> Result<Vec<u32>, FilesystemError> {
+        // Refuse the degenerate "root_block = 0" case: real volumes always
+        // have the tree past the journal / bitmap reservation.
+        if self.root_block == 0 {
+            return Err(FilesystemError::Parse(
+                "reiserfs: root_block is 0 (uninitialized superblock?)".into(),
+            ));
+        }
+        let mut leaves: Vec<u32> = Vec::new();
+        // DFS via an explicit stack; children pushed in reverse so the
+        // returned leaf order matches the on-disk key order.
+        let mut stack: Vec<u32> = vec![self.root_block];
+        // Bound the worst-case traversal so a corrupt tree can't run away.
+        // 1M tree nodes covers any realistic volume (a 1 TB FS with 4 KiB
+        // blocks tops out at ~262M data blocks but the tree's internal +
+        // leaf count is a tiny fraction of that).
+        const MAX_VISITED: u32 = 1 << 20;
+        let mut visited: u32 = 0;
+        while let Some(block_num) = stack.pop() {
+            visited = visited.saturating_add(1);
+            if visited > MAX_VISITED {
+                return Err(FilesystemError::Parse(
+                    "reiserfs: tree walk exceeded 1M nodes (likely corrupt)".into(),
+                ));
+            }
+            let block = self.read_tree_block(block_num)?;
+            let head = BlockHead::parse(&block)?;
+            if head.is_leaf() {
+                leaves.push(block_num);
+                continue;
+            }
+            // Internal node. Refuse impossibly tall trees up-front.
+            if head.level > MAX_TREE_LEVEL {
+                return Err(FilesystemError::Parse(format!(
+                    "reiserfs: tree level {} exceeds MAX_TREE_LEVEL {}",
+                    head.level, MAX_TREE_LEVEL
+                )));
+            }
+            let (_keys, children) = parse_internal_keys_and_children(&block)?;
+            // Reverse so popping gives left-to-right traversal.
+            for child in children.iter().rev() {
+                // `read_tree_block` validates the range, but a child
+                // pointer of 0 specifically means "no subtree" in a
+                // partially-written internal node — refuse here rather
+                // than chase the boot block.
+                if child.block_number == 0 {
+                    return Err(FilesystemError::Parse(
+                        "reiserfs: internal node child pointer is 0".into(),
+                    ));
+                }
+                stack.push(child.block_number);
+            }
+        }
+        Ok(leaves)
+    }
+
+    #[allow(dead_code)]
+    /// Collect every item in the tree whose key matches
+    /// `(dir_id, objectid)`. Each match is returned as
+    /// `(item_head, item_body_bytes)` where the bytes are a fresh copy
+    /// of the in-leaf body (so the caller can hand them to a decoder
+    /// without juggling block buffers).
+    ///
+    /// Items are returned in tree (key-sorted) order, which is also the
+    /// natural order for stitching together SD + IND + DRCT pieces of a
+    /// single file or DIR_ENTRY items of a single directory.
+    pub(crate) fn collect_items_for_object(
+        &mut self,
+        dir_id: u32,
+        objectid: u32,
+    ) -> Result<Vec<(ItemHead, Vec<u8>)>, FilesystemError> {
+        let leaf_numbers = self.collect_leaf_block_numbers()?;
+        let mut out: Vec<(ItemHead, Vec<u8>)> = Vec::new();
+        for leaf_num in leaf_numbers {
+            let block = self.read_tree_block(leaf_num)?;
+            let items = parse_leaf_item_heads(&block)?;
+            for ih in items {
+                if ih.key.dir_id() != dir_id || ih.key.objectid() != objectid {
+                    continue;
+                }
+                let loc = ih.item_location as usize;
+                let end = loc.saturating_add(ih.item_len as usize);
+                if end > block.len() {
+                    return Err(FilesystemError::Parse(format!(
+                        "reiserfs: item bytes {loc}..{end} exceed block size {}",
+                        block.len()
+                    )));
+                }
+                out.push((ih, block[loc..end].to_vec()));
+            }
+        }
+        Ok(out)
+    }
 }
 
 impl<R: Read + Seek + Send> Filesystem for ReiserFsFilesystem<R> {
@@ -447,7 +578,19 @@ pub const ITEM_HEAD_SIZE: usize = 24;
 pub const DISK_CHILD_SIZE: usize = 8;
 
 /// Level value that identifies a leaf node.
-pub const LEAF_LEVEL: u16 = 0;
+///
+/// ReiserFS reserves level 0 for "free / unused" blocks; the smallest level
+/// a real tree node carries is 1 (leaves). Internal nodes have level >= 2.
+/// `s_tree_height` in the superblock counts up to the root's level.
+///
+/// Verified against the kernel header (`DISK_LEAF_NODE_LEVEL = 1`) and
+/// `debugreiserfs -d` on a freshly-formatted single-leaf v3.6 volume.
+pub const LEAF_LEVEL: u16 = 1;
+
+/// Highest tree level we'll honour during a descent. Matches
+/// `MAX_HEIGHT = 7` from the reiserfs kernel; anything taller is a sign
+/// of a corrupt internal node we should refuse rather than chase.
+pub const MAX_TREE_LEVEL: u16 = 7;
 
 /// Header at offset 0 of every tree node.
 ///
@@ -580,6 +723,12 @@ impl Key {
 /// On-disk key format. Recorded per leaf item via [`ItemHead::version`].
 /// Internal node keys inherit the volume's "natural" version from the
 /// superblock (V2 for 3.6, V1 for 3.5).
+///
+/// Important: directory items keep V1 keys (`version == 0`) even on a
+/// v3.6 volume — only StatData / Indirect / Direct items get V2 keys
+/// (`version == 1`) when the volume is v3.6. This is enforced by
+/// `mkfs.reiserfs --format 3.6` and confirmed by `debugreiserfs` on our
+/// fixture (DIR items show `format old`, SD/IND/DRCT show `format new`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyFormat {
     V1,
@@ -587,15 +736,20 @@ pub enum KeyFormat {
 }
 
 impl KeyFormat {
-    /// Translate an [`ItemHead::version`] byte (0 = V1, 2 = V2) into the
-    /// matching key format. Other values are rejected so callers don't
-    /// silently mis-parse a newer item format.
+    /// Translate an [`ItemHead::version`] byte into the matching key
+    /// format. Kernel convention (`reiserfs_fs.h`):
+    ///   * `ITEM_VERSION_1 = 0`  → V1 keys (3.5 layout: u32 offset + u32 type)
+    ///   * `ITEM_VERSION_2 = 1`  → V2 keys (3.6 layout: packed u64 with
+    ///     60-bit offset + 4-bit type)
+    ///
+    /// Any other value indicates a newer item format we don't yet handle;
+    /// we surface a clear error rather than silently mis-parse.
     pub fn from_version(version: u16) -> Result<Self, FilesystemError> {
         match version {
             0 => Ok(KeyFormat::V1),
-            2 => Ok(KeyFormat::V2),
+            1 => Ok(KeyFormat::V2),
             other => Err(FilesystemError::Parse(format!(
-                "reiserfs: unknown item version {other} (expected 0 or 2)"
+                "reiserfs: unknown item version {other} (expected 0 or 1)"
             ))),
         }
     }
@@ -1190,8 +1344,9 @@ mod tests {
 
     #[test]
     fn key_format_from_version_byte() {
+        // Kernel convention: ITEM_VERSION_1 = 0, ITEM_VERSION_2 = 1.
         assert_eq!(KeyFormat::from_version(0).unwrap(), KeyFormat::V1);
-        assert_eq!(KeyFormat::from_version(2).unwrap(), KeyFormat::V2);
+        assert_eq!(KeyFormat::from_version(1).unwrap(), KeyFormat::V2);
         match KeyFormat::from_version(99) {
             Err(FilesystemError::Parse(msg)) => assert!(msg.contains("99")),
             other => panic!("expected Parse(99), got {other:?}"),
@@ -1201,8 +1356,8 @@ mod tests {
     #[test]
     fn parses_block_head_leaf_and_internal() {
         let mut block = [0u8; 4096];
-        // Leaf: level 0, nr_item 3, free_space 1234.
-        block[0..2].copy_from_slice(&0u16.to_le_bytes());
+        // Leaf: level 1, nr_item 3, free_space 1234.
+        block[0..2].copy_from_slice(&1u16.to_le_bytes());
         block[2..4].copy_from_slice(&3u16.to_le_bytes());
         block[4..6].copy_from_slice(&1234u16.to_le_bytes());
         let head = BlockHead::parse(&block).expect("parse leaf");
@@ -1217,6 +1372,16 @@ mod tests {
         assert!(!head.is_leaf());
         assert_eq!(head.level, 2);
         assert_eq!(head.nr_item, 5);
+    }
+
+    #[test]
+    fn block_at_level_zero_is_not_a_leaf() {
+        // Level 0 is reserved for free blocks; treating one as a leaf would
+        // make a corrupt internal-node child pointer silently dump zero data.
+        let mut block = [0u8; 4096];
+        block[0..2].copy_from_slice(&0u16.to_le_bytes());
+        let head = BlockHead::parse(&block).expect("parse free");
+        assert!(!head.is_leaf());
     }
 
     #[test]
@@ -1248,7 +1413,7 @@ mod tests {
         ih_bytes[16..18].copy_from_slice(&0u16.to_le_bytes()); // free_space
         ih_bytes[18..20].copy_from_slice(&44u16.to_le_bytes()); // item_len
         ih_bytes[20..22].copy_from_slice(&3500u16.to_le_bytes()); // item_location
-        ih_bytes[22..24].copy_from_slice(&2u16.to_le_bytes()); // version = V2
+        ih_bytes[22..24].copy_from_slice(&1u16.to_le_bytes()); // version = V2 (kernel ITEM_VERSION_2 = 1)
 
         let ih = ItemHead::parse(&ih_bytes).expect("parse item head");
         assert_eq!(ih.item_len, 44);
@@ -1261,8 +1426,8 @@ mod tests {
     fn parse_leaf_returns_all_item_heads() {
         // Build a 4096-byte leaf with 3 item heads (24 bytes each).
         let mut block = vec![0u8; 4096];
-        // BlockHead: level 0, nr_item 3.
-        block[0..2].copy_from_slice(&0u16.to_le_bytes());
+        // BlockHead: level 1 (leaf), nr_item 3.
+        block[0..2].copy_from_slice(&1u16.to_le_bytes());
         block[2..4].copy_from_slice(&3u16.to_le_bytes());
 
         // Three V2 stat-data item heads at increasing positions.
@@ -1274,7 +1439,7 @@ mod tests {
             block[off + 18..off + 20].copy_from_slice(&44u16.to_le_bytes());
             let loc = 4096u16 - ((i + 1) as u16) * 44;
             block[off + 20..off + 22].copy_from_slice(&loc.to_le_bytes());
-            block[off + 22..off + 24].copy_from_slice(&2u16.to_le_bytes());
+            block[off + 22..off + 24].copy_from_slice(&1u16.to_le_bytes()); // V2 = ITEM_VERSION_2 = 1
         }
 
         let heads = parse_leaf_item_heads(&block).expect("parse");
@@ -1289,8 +1454,8 @@ mod tests {
     #[test]
     fn parse_leaf_rejects_internal_node() {
         let mut block = vec![0u8; 4096];
-        // level = 1 (not a leaf)
-        block[0..2].copy_from_slice(&1u16.to_le_bytes());
+        // level = 2 (internal, not a leaf)
+        block[0..2].copy_from_slice(&2u16.to_le_bytes());
         block[2..4].copy_from_slice(&3u16.to_le_bytes());
         match parse_leaf_item_heads(&block) {
             Err(FilesystemError::Parse(msg)) => assert!(msg.contains("expected leaf")),
@@ -1302,7 +1467,7 @@ mod tests {
     fn parse_internal_returns_keys_and_n_plus_one_children() {
         // 4-KiB internal node with 2 keys (so 3 children).
         let mut block = vec![0u8; 4096];
-        block[0..2].copy_from_slice(&1u16.to_le_bytes()); // level 1
+        block[0..2].copy_from_slice(&2u16.to_le_bytes()); // level 2 (internal)
         block[2..4].copy_from_slice(&2u16.to_le_bytes()); // nr_item 2
 
         let keys_off = BLOCK_HEAD_SIZE;
@@ -1330,11 +1495,327 @@ mod tests {
     #[test]
     fn parse_internal_rejects_leaf_node() {
         let mut block = vec![0u8; 4096];
-        block[0..2].copy_from_slice(&0u16.to_le_bytes()); // level 0 (leaf)
+        block[0..2].copy_from_slice(&1u16.to_le_bytes()); // level 1 (leaf)
         block[2..4].copy_from_slice(&1u16.to_le_bytes());
         match parse_internal_keys_and_children(&block) {
             Err(FilesystemError::Parse(msg)) => assert!(msg.contains("expected internal")),
             other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    // ---- R.3b: tree walker (collect_leaf_block_numbers /
+    //                         collect_items_for_object) ----
+
+    /// Build a synth volume large enough to host the volume + a handful of
+    /// extra blocks for tree nodes. Writes `block_count` to the superblock
+    /// and points `s_root_block` (offset 8) at `root_block`. The volume
+    /// buffer is sized to `total_blocks * block_size` so block reads up to
+    /// `total_blocks - 1` succeed.
+    fn synth_volume_with_root(block_count: u32, block_size_field: u16, root_block: u32) -> Vec<u8> {
+        let mut buf = synth_volume(MAGIC_V3_6, block_count, 0, block_size_field, None, 2);
+        let bs = block_size_field as u64;
+        let needed = (block_count as u64) * bs;
+        if (buf.len() as u64) < needed {
+            buf.resize(needed as usize, 0);
+        }
+        let sb = REISERFS_SUPERBLOCK_OFFSET as usize;
+        buf[sb + 8..sb + 12].copy_from_slice(&root_block.to_le_bytes());
+        buf
+    }
+
+    /// Write a single 24-byte item head + its body into a leaf block.
+    /// `body_loc` is the byte offset of the item body inside the block.
+    fn place_item(block: &mut [u8], idx: usize, head: &ItemHead, body: &[u8]) {
+        let off = BLOCK_HEAD_SIZE + idx * ITEM_HEAD_SIZE;
+        block[off..off + 16].copy_from_slice(&head.key.raw);
+        block[off + 16..off + 18].copy_from_slice(&head.free_space_or_entry_count.to_le_bytes());
+        block[off + 18..off + 20].copy_from_slice(&head.item_len.to_le_bytes());
+        block[off + 20..off + 22].copy_from_slice(&head.item_location.to_le_bytes());
+        block[off + 22..off + 24].copy_from_slice(&head.version.to_le_bytes());
+        let loc = head.item_location as usize;
+        block[loc..loc + body.len()].copy_from_slice(body);
+    }
+
+    fn write_leaf_at(
+        buf: &mut [u8],
+        block_num: u32,
+        block_size: u64,
+        items: Vec<(ItemHead, Vec<u8>)>,
+    ) {
+        let block_off = (block_num as u64 * block_size) as usize;
+        let block = &mut buf[block_off..block_off + block_size as usize];
+        block[0..2].copy_from_slice(&LEAF_LEVEL.to_le_bytes());
+        block[2..4].copy_from_slice(&(items.len() as u16).to_le_bytes());
+        for (i, (head, body)) in items.iter().enumerate() {
+            place_item(block, i, head, body);
+        }
+    }
+
+    fn write_internal_at(
+        buf: &mut [u8],
+        block_num: u32,
+        block_size: u64,
+        level: u16,
+        keys: &[[u8; 16]],
+        child_blocks: &[u32],
+    ) {
+        assert_eq!(keys.len() + 1, child_blocks.len(), "B+tree N+1 invariant");
+        let block_off = (block_num as u64 * block_size) as usize;
+        let block = &mut buf[block_off..block_off + block_size as usize];
+        block[0..2].copy_from_slice(&level.to_le_bytes());
+        block[2..4].copy_from_slice(&(keys.len() as u16).to_le_bytes());
+        let mut off = BLOCK_HEAD_SIZE;
+        for k in keys {
+            block[off..off + 16].copy_from_slice(k);
+            off += 16;
+        }
+        for cb in child_blocks {
+            block[off..off + 4].copy_from_slice(&cb.to_le_bytes());
+            block[off + 4..off + 6].copy_from_slice(&(block_size as u16).to_le_bytes());
+            off += 8;
+        }
+    }
+
+    fn ih(
+        dir_id: u32,
+        objectid: u32,
+        off: u64,
+        kind_v2: u8,
+        item_len: u16,
+        item_loc: u16,
+    ) -> ItemHead {
+        ItemHead {
+            key: Key {
+                raw: build_v2_key(dir_id, objectid, off, kind_v2),
+            },
+            free_space_or_entry_count: 0,
+            item_len,
+            item_location: item_loc,
+            // V2 keys live in items with version = ITEM_VERSION_2 = 1
+            // (kernel constant). Some 2026 ReiserFS docs incorrectly
+            // say 2 — the on-disk byte is 1.
+            version: 1,
+        }
+    }
+
+    #[test]
+    fn walks_single_leaf_tree() {
+        // root_block points directly at a leaf — the same shape as our
+        // real-image fixture (small volume, no internal nodes).
+        const BS: u16 = 4096;
+        let mut buf = synth_volume_with_root(64, BS, 25);
+        // Put a leaf at block 25 with 2 items.
+        let bs = BS as u64;
+        let items = vec![
+            (ih(1, 2, 0, 0, 44, 4000), vec![0xAB; 44]),
+            (ih(2, 3, 0, 0, 44, 3950), vec![0xCD; 44]),
+        ];
+        write_leaf_at(&mut buf, 25, bs, items);
+
+        let mut fs = ReiserFsFilesystem::open(Cursor::new(buf), 0).expect("open");
+        let leaves = fs.collect_leaf_block_numbers().expect("walk");
+        assert_eq!(leaves, vec![25]);
+
+        let matches = fs.collect_items_for_object(1, 2).expect("collect");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].0.key.dir_id(), 1);
+        assert_eq!(matches[0].0.key.objectid(), 2);
+        assert_eq!(matches[0].1, vec![0xAB; 44]);
+
+        let no_match = fs.collect_items_for_object(99, 99).expect("collect-empty");
+        assert!(no_match.is_empty());
+    }
+
+    #[test]
+    fn walks_root_with_two_leaf_children() {
+        // root (internal, level 2) → leaf[block=30], leaf[block=40].
+        const BS: u16 = 4096;
+        let mut buf = synth_volume_with_root(64, BS, 20);
+        let bs = BS as u64;
+
+        // Two leaves, each with one item.
+        write_leaf_at(
+            &mut buf,
+            30,
+            bs,
+            vec![(ih(1, 2, 0, 0, 44, 4000), vec![0xAA; 44])],
+        );
+        write_leaf_at(
+            &mut buf,
+            40,
+            bs,
+            vec![(ih(2, 5, 0, 0, 44, 4000), vec![0xBB; 44])],
+        );
+
+        // Internal root with one key separating the two children.
+        let keys = [build_v2_key(2, 5, 0, 0)];
+        write_internal_at(&mut buf, 20, bs, 2, &keys, &[30, 40]);
+
+        let mut fs = ReiserFsFilesystem::open(Cursor::new(buf), 0).expect("open");
+        let leaves = fs.collect_leaf_block_numbers().expect("walk");
+        // Left-to-right traversal order.
+        assert_eq!(leaves, vec![30, 40]);
+
+        let matches = fs.collect_items_for_object(2, 5).expect("collect");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].1, vec![0xBB; 44]);
+    }
+
+    #[test]
+    fn refuses_zero_child_pointer() {
+        const BS: u16 = 4096;
+        let mut buf = synth_volume_with_root(64, BS, 20);
+        let bs = BS as u64;
+        let keys = [build_v2_key(2, 5, 0, 0)];
+        // Both children are 0 → corrupt; collect_leaf_block_numbers must
+        // refuse rather than chase the boot block.
+        write_internal_at(&mut buf, 20, bs, 2, &keys, &[0, 0]);
+        let mut fs = ReiserFsFilesystem::open(Cursor::new(buf), 0).expect("open");
+        match fs.collect_leaf_block_numbers() {
+            Err(FilesystemError::Parse(msg)) => assert!(msg.contains("child pointer is 0")),
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    // ---- R.3b: real-image checks against tests/fixtures/test_reiserfs_v3_6.img.zst ----
+
+    /// Decompress a zstd fixture into a byte vector. Matches the
+    /// `load_fixture` pattern used elsewhere (`ntfs.rs`, `xfs/mod.rs`).
+    fn load_fixture(name: &str) -> Vec<u8> {
+        let path = format!("tests/fixtures/{name}");
+        let compressed =
+            std::fs::read(&path).unwrap_or_else(|e| panic!("Failed to read fixture {path}: {e}"));
+        let mut decoder = zstd::stream::read::Decoder::new(Cursor::new(compressed))
+            .unwrap_or_else(|e| panic!("Failed to create zstd decoder for {path}: {e}"));
+        let mut output = Vec::new();
+        std::io::Read::read_to_end(&mut decoder, &mut output)
+            .unwrap_or_else(|e| panic!("Failed to decompress {path}: {e}"));
+        output
+    }
+
+    #[test]
+    fn fixture_v3_6_opens_and_reports_metadata() {
+        let img = load_fixture("test_reiserfs_v3_6.img.zst");
+        let fs = ReiserFsFilesystem::open(Cursor::new(img), 0).expect("open fixture");
+        assert_eq!(fs.fs_type(), "ReiserFS 3.6");
+        assert_eq!(fs.volume_label(), Some("reiser36_test"));
+        assert_eq!(fs.total_size(), 64 * 1024 * 1024);
+        // debugreiserfs -d on this fixture reports `Free blocks: 8166`
+        // (16384 - 8218 used). `used_size()` reports the same.
+        assert_eq!(fs.used_size(), 8218 * 4096);
+    }
+
+    #[test]
+    fn fixture_v3_6_walks_to_single_leaf() {
+        // The fresh-mkfs + 5-file fixture lives entirely inside one leaf;
+        // root_block IS that leaf. Confirms the leaf-detection path
+        // (LEAF_LEVEL = 1) before R.3c starts decoding items.
+        let img = load_fixture("test_reiserfs_v3_6.img.zst");
+        let mut fs = ReiserFsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let leaves = fs.collect_leaf_block_numbers().expect("walk");
+        assert_eq!(leaves.len(), 1, "expected single-leaf tree");
+        assert_eq!(leaves[0], 8211, "root_block per debugreiserfs");
+    }
+
+    #[test]
+    fn fixture_v3_6_collects_root_dir_items() {
+        // debugreiserfs dump shows the root directory has two items:
+        //   key (1, 2, 0x0) StatData
+        //   key (1, 2, 0x1) DirEntry — the chain of 8 directory entries.
+        // collect_items_for_object(1, 2) should surface both, in tree order.
+        let img = load_fixture("test_reiserfs_v3_6.img.zst");
+        let mut fs = ReiserFsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let items = fs
+            .collect_items_for_object(1, 2)
+            .expect("collect root items");
+        assert_eq!(items.len(), 2, "expected SD + DIR_ENTRY for root");
+
+        // SD comes first (offset 0).
+        let (sd_head, sd_body) = &items[0];
+        assert_eq!(sd_head.key.dir_id(), 1);
+        assert_eq!(sd_head.key.objectid(), 2);
+        // The SD body is 44 bytes (stat-data v2). Just spot-check size;
+        // R.3c will parse the body.
+        assert_eq!(sd_head.item_len as usize, 44);
+        assert_eq!(sd_body.len(), 44);
+
+        // DIR_ENTRY follows. It uses V1 keys (format old) on a v3.6
+        // volume — recorded via ItemHead::version = 0.
+        let (dir_head, dir_body) = &items[1];
+        assert_eq!(dir_head.version, 0, "DIR items use V1 keys");
+        assert_eq!(dir_head.free_space_or_entry_count, 8, "8 entries in root");
+        assert_eq!(dir_head.item_len as usize, 216);
+        assert_eq!(dir_body.len(), 216);
+    }
+
+    #[test]
+    fn fixture_v3_6_collects_hello_txt_items() {
+        // debugreiserfs: hello.txt lives at (dir_id=2, objectid=4), with
+        //   SD len 44 + DRCT len 16 ("Hello, ReiserFS!" zero-padded).
+        let img = load_fixture("test_reiserfs_v3_6.img.zst");
+        let mut fs = ReiserFsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let items = fs.collect_items_for_object(2, 4).expect("collect hello");
+        assert_eq!(items.len(), 2);
+        let (sd, _) = &items[0];
+        assert_eq!(sd.item_len as usize, 44);
+        // V2 = ITEM_VERSION_2 = 1 on disk (per kernel `reiserfs_fs.h`).
+        assert_eq!(sd.version, 1, "SD uses V2 keys");
+        assert_eq!(sd.key_format().unwrap(), KeyFormat::V2);
+        let (drct, drct_body) = &items[1];
+        assert_eq!(drct.item_len as usize, 16);
+        assert_eq!(drct.version, 1);
+        assert_eq!(drct.key_format().unwrap(), KeyFormat::V2);
+        // The DRCT body is the 16-byte file contents (16 chars + 0-pad).
+        assert!(
+            drct_body.starts_with(b"Hello, ReiserFS!"),
+            "DRCT body should start with the file contents, got {:?}",
+            &drct_body[..drct_body.len().min(20)]
+        );
+    }
+
+    #[test]
+    fn fixture_v3_6_collects_large_bin_indirect_item() {
+        // large.bin is 24 KiB at (2, 9): SD + IND (one indirect item
+        // pointing at 6 unformatted data blocks per the debugreiserfs
+        // dump: `[ 8212(6) ]` means 6 consecutive blocks starting at
+        // 8212). 24 KiB / 4 KiB = 6 ✓.
+        let img = load_fixture("test_reiserfs_v3_6.img.zst");
+        let mut fs = ReiserFsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let items = fs
+            .collect_items_for_object(2, 9)
+            .expect("collect large.bin");
+        assert_eq!(items.len(), 2);
+        let (ind, ind_body) = &items[1];
+        // IND item: 6 u32 block pointers = 24 bytes.
+        assert_eq!(ind.item_len as usize, 24);
+        assert_eq!(ind_body.len(), 24);
+        // First pointer should be 8212 per the debugreiserfs dump.
+        let first_ptr = u32::from_le_bytes([ind_body[0], ind_body[1], ind_body[2], ind_body[3]]);
+        assert_eq!(first_ptr, 8212);
+    }
+
+    #[test]
+    fn refuses_out_of_range_child_pointer() {
+        const BS: u16 = 4096;
+        // 64-block volume, child points at block 999 → past EOF.
+        let mut buf = synth_volume_with_root(64, BS, 20);
+        let bs = BS as u64;
+        let keys = [build_v2_key(2, 5, 0, 0)];
+        write_internal_at(&mut buf, 20, bs, 2, &keys, &[30, 999]);
+        // Leaf at 30 is valid so the walker descends past root first.
+        write_leaf_at(
+            &mut buf,
+            30,
+            bs,
+            vec![(ih(1, 2, 0, 0, 44, 4000), vec![0xAA; 44])],
+        );
+        let mut fs = ReiserFsFilesystem::open(Cursor::new(buf), 0).expect("open");
+        match fs.collect_leaf_block_numbers() {
+            Err(FilesystemError::Parse(msg)) => assert!(
+                msg.contains("exceeds total_blocks"),
+                "unexpected error msg: {msg}"
+            ),
+            other => panic!("expected Parse(out-of-range), got {other:?}"),
         }
     }
 }
