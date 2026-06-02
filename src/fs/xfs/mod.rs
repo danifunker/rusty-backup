@@ -25,6 +25,7 @@ pub mod freespace_rebuild;
 pub mod fsck;
 pub mod inobt_repair;
 pub mod inode;
+pub mod inode_repair;
 pub mod repair;
 pub mod sb;
 pub mod symlink;

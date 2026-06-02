@@ -268,7 +268,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     /// Descend the inobt from `root`, returning the AG-relative block numbers
     /// of its leaf (level 0) blocks. Errors on bad magic, an over-long node, or
     /// a cycle — the "unwalkable structure" signal the caller skips on.
-    fn collect_inobt_leaf_blocks(
+    pub(crate) fn collect_inobt_leaf_blocks(
         &mut self,
         sb: &XfsSuperblock,
         agno: u64,

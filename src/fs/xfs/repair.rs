@@ -279,13 +279,14 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for XfsFilesystem<R> {
 
     fn repair(&mut self) -> Result<RepairReport, FilesystemError> {
         // Order matters: R4 (secondary-superblock geometry) → R4b (AGF/AGI
-        // summary counters) → R3 (inobt free-mask/freecount repair) → R2
-        // (free-space btree rebuild). R3 runs after R4b so its corrected AGI
-        // counters aren't re-clobbered, and before R2 so R2's ownership map
-        // walks the now-correct inobt (only allocated inodes own data blocks).
-        // R2 runs *last* because its final step resyncs `sb_fdblocks` by
-        // summing every AGF's freeblks. Each phase is gated hard and is a
-        // no-op on a clean volume.
+        // summary counters) → R3 (inobt free-mask/freecount repair) → R5
+        // (inode-core counters) → R2 (free-space btree rebuild). R3 runs after
+        // R4b so its corrected AGI counters aren't re-clobbered, and before R5
+        // so R5 walks the now-correct inobt. R5 only rewrites cached inode
+        // counters (di_nblocks/di_nextents), touching no block ownership, so it
+        // is independent of R2. R2 runs *last* because its final step resyncs
+        // `sb_fdblocks` by summing every AGF's freeblks. Each phase is gated
+        // hard and is a no-op on a clean volume.
         let mut report = self.run_repair()?;
         let summaries = self.run_repair_summaries()?;
         report.fixes_applied.extend(summaries.fixes_applied);
@@ -295,6 +296,10 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for XfsFilesystem<R> {
         report.fixes_applied.extend(inobt.fixes_applied);
         report.fixes_failed.extend(inobt.fixes_failed);
         report.unrepairable_count += inobt.unrepairable_count;
+        let inode_core = self.run_inode_core_repair()?;
+        report.fixes_applied.extend(inode_core.fixes_applied);
+        report.fixes_failed.extend(inode_core.fixes_failed);
+        report.unrepairable_count += inode_core.unrepairable_count;
         let freespace = self.run_freespace_rebuild()?;
         report.fixes_applied.extend(freespace.fixes_applied);
         report.fixes_failed.extend(freespace.fixes_failed);
