@@ -449,16 +449,22 @@ Gaps to reconcile back into the plan when it gets picked up:
 
 ## 6. CLI / GUI
 
-### 6.1 `rb-cli fsck --format json|yaml`
+### 6.1 `rb-cli fsck --format json|yaml` — **Shipped**
 
-Last unstructured query verb. Every other read-only verb (`inspect`,
-`show *`, `locate`) accepts `--format json|yaml` and emits the standard
-`schema_version`/`status`/`result` envelope. `fsck` writes
-human-readable lines via `out_stdout` / `log_stderr` today
-(`src/cli/verbs/fsck.rs:133`); serialize the existing `FsckResult`
-(which already uses the shared `FsckIssue` / `FsckStats` types from
-`src/fs/fsck.rs`) into the same envelope. Scripts currently work around
-it by redirecting stdout and branching on `$?`.
+`FsckResult` / `FsckIssue` / `FsckStats` / `OrphanedEntry` /
+`RepairReport` all gained `#[derive(Serialize)]`. The `fsck` verb
+accepts the same `--format text|json|yaml` flag as every other
+read-only verb (`csv`/`tsv` rejected — the report is nested). The
+JSON/YAML payload wraps the `FsckResult` plus a top-level
+`clean: bool` so scripts can branch without re-deriving it; in
+`--repair` mode the envelope additionally carries a `repair`
+sub-object with the applied/failed/unrepairable counts. Unsupported
+filesystems emit a structured error envelope with
+`status.error: true`, `status.code: GENERIC_FAILURE`, and
+`result: null`. The process exit code stays non-zero on issues even
+in structured mode, so shell `$?` branching keeps working. 5 new
+unit tests cover the OK / clean / error / unsupported envelopes plus
+the CSV/TSV rejection.
 
 ### 6.2 `rb-cli get` globbing
 

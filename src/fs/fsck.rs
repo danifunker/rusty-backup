@@ -3,8 +3,15 @@
 //! These types are filesystem-agnostic. Each filesystem's fsck module
 //! (e.g. `hfs_fsck`) produces results using these shared types so the
 //! GUI and trait layer don't need filesystem-specific knowledge.
+//!
+//! All types carry `serde::Serialize` derives so `rb-cli fsck --format
+//! json|yaml` (and any future structured GUI / API export) can emit the
+//! result envelope without per-call shim types.
+
+use serde::Serialize;
 
 /// Result of a filesystem integrity check.
+#[derive(Debug, Serialize)]
 pub struct FsckResult {
     /// Errors that indicate data corruption or inconsistency.
     pub errors: Vec<FsckIssue>,
@@ -27,6 +34,7 @@ impl FsckResult {
 }
 
 /// A single issue found during the check.
+#[derive(Debug, Serialize)]
 pub struct FsckIssue {
     /// Short identifier for the issue type (e.g. "BadSignature", "MissingParent").
     pub code: String,
@@ -40,6 +48,7 @@ pub struct FsckIssue {
 }
 
 /// Aggregate statistics from a filesystem check.
+#[derive(Debug, Serialize)]
 pub struct FsckStats {
     pub files_checked: u32,
     pub directories_checked: u32,
@@ -48,6 +57,7 @@ pub struct FsckStats {
 }
 
 /// A file or directory whose parent directory is missing.
+#[derive(Debug, Serialize)]
 pub struct OrphanedEntry {
     /// Filesystem ID of the orphaned entry (e.g. CNID for HFS, inode for ext).
     pub id: u64,
@@ -60,7 +70,7 @@ pub struct OrphanedEntry {
 }
 
 /// Report from a repair operation.
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct RepairReport {
     /// Descriptions of successfully applied fixes.
     pub fixes_applied: Vec<String>,
