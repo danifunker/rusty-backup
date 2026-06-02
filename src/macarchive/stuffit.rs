@@ -294,6 +294,9 @@ pub fn decompress_fork(archive: &[u8], fork: &ForkInfo) -> Result<Vec<u8>> {
     let out = match fork.method & 0x0f {
         0 => comp.to_vec(),
         1 => binhex::rle90_decode(comp),
+        2 => super::stuffit_lzw::decompress(comp, want, 0x8e)?,
+        3 => super::stuffit_huffman::decompress(comp, want)?,
+        5 => super::stuffit_lzah::decompress(comp, want)?,
         13 => super::stuffit_lzh::decompress(comp, want)?,
         15 => super::stuffit_arsenic::decompress(comp, want)?,
         m => bail!(

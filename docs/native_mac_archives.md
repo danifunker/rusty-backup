@@ -130,7 +130,8 @@ image pipeline).
 - [x] Per-fork CRC verification on extract (CRC-16/ARC)
 - [x] `.sea` dispatch: `find_sea_archive` scans for the embedded `SIT!`/`rLau` stream
 - [x] Tests against real `.sit` samples: **102 forks across 4 archives decompressed + CRC-verified** (decoded on the fly from `.sit.hqx`), exercising both method-13 sub-modes
-- [ ] Decompressors: method 3 (Huffman), 2 (LZW/Compress), 15 (Arsenic/BWT) — return a clear "unsupported codec" error today
+- [x] Decompressors: method **2 (LZW/Compress)** — `stuffit_lzw.rs`, validated against 7 real method-2 forks (incl. a DiskCopy image) with CRC; method **15 (Arsenic)** — done (see §6a); method **3 (Huffman)** — `stuffit_huffman.rs` (explicit-tree, BE); method **5 (LZAH)** — `stuffit_lzah.rs` (adaptive FGK Huffman + LHA preset window). 3 and 5 are faithful XAD ports with no local sample to validate against, but fail closed via the per-fork CRC.
+- [-] Methods 6 (Fixed Huffman), 8 (MW), 14 (Installer) — vanishingly rare; XADMaster itself flags them as "interesting"/partial. Return a clear "unsupported codec" error.
 - [-] StuffIt 5 format (`SIT5` / "StuffIt (c)…") — newer container, out of scope (detected + skipped)
 - [x] CLI: `sit list ARCHIVE` + `sit extract ARCHIVE DEST --format binhex|macbinary|appledouble|raw`. Transparently decodes BinHex-wrapped `.sit.hqx` and `.sea`; rebuilds the directory tree; preserves forks + type/creator/flags. Verified end-to-end on real archives (49-file MacWeb tree extracted; decompressed HTML + GIF content confirmed valid).
 - [x] GUI: **Archives tab** (`src/gui/archives_tab.rs`) — pick a `.sit`/`.sea`/`.sit.hqx`, see the entry tree (name, type/creator, size, codec), and "Extract All…" to a folder in a chosen container (BinHex / MacBinary / AppleDouble / raw) with a progress bar. Routes classic SIT!, StuffIt 5, and `.sea` automatically.

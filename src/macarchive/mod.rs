@@ -10,9 +10,13 @@
 //!
 //! See `docs/native_mac_archives.md` for the format references and roadmap.
 
+pub mod bitreader_be;
 pub mod extract;
 pub mod stuffit;
 pub mod stuffit13_tables;
 pub mod stuffit5;
 pub mod stuffit_arsenic;
+pub mod stuffit_huffman;
+pub mod stuffit_lzah;
 pub mod stuffit_lzh;
+pub mod stuffit_lzw;
