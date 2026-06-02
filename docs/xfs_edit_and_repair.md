@@ -1,17 +1,26 @@
 # XFS — Editable Filesystem + Full fsck Repair (v4 / IRIX)
 
 > **Implementation status (2026-06-01).** Verifier (Phases 1–3 + block-ownership
-> map) and the repair phases **R4** (secondary-superblock geometry), **R4b**
+> map) and repair phases **R4** (secondary-superblock geometry), **R4b**
 > (AGF/AGI summary counters), **R2** (free-space btree rebuild,
-> `src/fs/xfs/freespace_rebuild.rs` + `btree_build.rs`), and **R3** (inobt
-> free-mask/freecount repair + single-level structure rebuild,
-> `src/fs/xfs/inobt_repair.rs`) are **shipped and oracle-validated** — including
-> against a real V1-inode IRIX disk (`xfsprogs` 3.1.9 oracle). `repair()` runs
-> them in order R4 → R4b → R3 → R2. Not yet done: R3 multi-level structure
-> rebuild, **R5** (inode core), **R6** (directory), **R7** (orphan reconnection
-> — note the verifier already flags `OrphanInode` as repairable, which won't be
-> true until R7 lands), and the §3/§4 edit write-primitives. See the auto-memory
-> `xfs_fsck_repair.md` for the running status and the Docker oracle recipe.
+> `freespace_rebuild.rs` + `btree_build.rs`), **R3** (inobt free-mask/freecount
+> repair + single-AND-multi-level structure rebuild, `inobt_repair.rs`), **R5**
+> (inode core: di_nblocks/di_nextents recompute, `inode_repair.rs`), **R6**
+> (drop dangling **short-form** directory entries + fix di_size/nlink,
+> `dir_repair.rs`), and **R7's link-count half** (recompute every reachable
+> inode's nlink, `dir_repair.rs`) are **shipped and oracle-validated** —
+> including a real V1-inode IRIX disk (`xfsprogs` 3.1.9 oracle). `repair()` runs
+> them R4 → R4b → R3 → R5 → R2 → R6 → R7(nlink). The shared bottom-up
+> `build_sblock_btree` is record-agnostic (alloc 8/8, inobt 16/4) and
+> balance-fills every non-root block to ≥ maxrecs/2.
+>
+> **Still not done:** R6 for **block/leaf/node** (multi-block) directories, and
+> **R7 orphan reconnection** (linking unreachable inodes into `lost+found`) —
+> both need inode-allocation + directory-insertion write primitives (shortform
+> add → block-form conversion, `..` rewrite), a subsystem shared with the §3/§4
+> edit path. Until R7 reconnection lands the verifier's `OrphanInode`
+> "repairable" flag is aspirational. See the auto-memory `xfs_fsck_repair.md`
+> for running status and the Docker oracle recipe.
 
 Extend the existing read-only XFS support (`src/fs/xfs/`) all the way to:
 
