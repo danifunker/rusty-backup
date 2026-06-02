@@ -320,10 +320,15 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for XfsFilesystem<R> {
         report.fixes_applied.extend(dirs.fixes_applied);
         report.fixes_failed.extend(dirs.fixes_failed);
         report.unrepairable_count += dirs.unrepairable_count;
-        // R7 (link-count half) runs after R6 so it counts the post-cleanup
-        // directory graph. Orphan reconnection (the other half of R7) is not
-        // implemented yet — it needs inode-allocation + directory-insertion
-        // primitives — so OrphanInode stays reported-but-unreconnected.
+        // R7 reconnection: link allocated-but-unreachable inodes into
+        // /lost+found (using the edit primitives). Runs after R6 (so the graph
+        // is free of dangling entries) and before the nlink pass below.
+        let reconnect = self.run_orphan_reconnect()?;
+        report.fixes_applied.extend(reconnect.fixes_applied);
+        report.fixes_failed.extend(reconnect.fixes_failed);
+        report.unrepairable_count += reconnect.unrepairable_count;
+        // R7 (link-count half) runs last so it counts the now-connected
+        // directory graph (reconnected orphans included).
         let nlinks = self.run_nlink_repair()?;
         report.fixes_applied.extend(nlinks.fixes_applied);
         report.fixes_failed.extend(nlinks.fixes_failed);

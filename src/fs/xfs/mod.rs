@@ -1351,6 +1351,102 @@ mod tests {
     }
 
     #[test]
+    fn repair_r7_reconnects_orphan_into_lost_found() {
+        // Create a file, then orphan it by dropping the root's last short-form
+        // entry (decrement count + di_size in the inode bytes) while leaving the
+        // inode allocated. repair() should reconnect it into /lost+found and the
+        // verifier should be clean.
+        use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem};
+        use std::io::Cursor as IoCursor;
+
+        let img = load_fixture().to_vec();
+        let mut cursor = Cursor::new(img);
+        // Snapshot the pre-create root sf size + entry count, then add a file.
+        let (root_byte, root_size0, orphan_ino) = {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable");
+            let sb = fs.superblock().clone();
+            let byte = inode_byte_offset(
+                128,
+                sb.agblocks,
+                sb.agblklog,
+                sb.inopblog,
+                sb.blocksize,
+                sb.inodesize,
+            ) as usize;
+            let size0 = fs.read_inode(128).expect("root").size;
+            let root = fs.root().expect("root");
+            let mut data = IoCursor::new(vec![7u8; 2000]);
+            let e = fs
+                .create_file(
+                    &root,
+                    "orphanme",
+                    &mut data,
+                    2000,
+                    &CreateFileOptions::default(),
+                )
+                .expect("create");
+            fs.sync_metadata().expect("sync");
+            (byte, size0, e.location)
+        };
+        let count0 = 4u8; // fixture root: hello.txt, readme.txt, subdir, link
+
+        // Orphan it: drop the just-added last entry by restoring the original
+        // count byte (fork offset 100) and di_size (core offset 56).
+        let mut img = cursor.into_inner();
+        img[root_byte + 100] = count0;
+        img[root_byte + 56..root_byte + 64].copy_from_slice(&root_size0.to_be_bytes());
+
+        // Pre-repair: the verifier flags the orphan.
+        {
+            let mut fs = XfsFilesystem::open(Cursor::new(img.clone()), 0).expect("open");
+            let res = fs.run_fsck().expect("fsck");
+            assert!(
+                res.errors.iter().any(|e| e.code == "OrphanInode"),
+                "expected OrphanInode, got {:?}",
+                res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+            );
+        }
+
+        let mut cursor = Cursor::new(img);
+        let report = {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable");
+            fs.repair().expect("repair")
+        };
+        assert!(
+            report
+                .fixes_applied
+                .iter()
+                .any(|f| f.contains("lost+found")),
+            "expected a reconnect fix, got {:?}",
+            report.fixes_applied
+        );
+
+        let repaired = cursor.into_inner();
+        let mut fs = XfsFilesystem::open(Cursor::new(repaired), 0).expect("reopen");
+        let root = fs.root().expect("root");
+        let lf = fs
+            .list_directory(&root)
+            .expect("list")
+            .into_iter()
+            .find(|e| e.name == "lost+found")
+            .expect("lost+found created");
+        assert!(lf.is_directory());
+        let reconnected: Vec<u64> = fs
+            .list_directory(&lf)
+            .expect("list lf")
+            .into_iter()
+            .map(|e| e.location)
+            .collect();
+        assert!(reconnected.contains(&orphan_ino), "orphan not reconnected");
+        let res = fs.run_fsck().expect("fsck after");
+        assert!(
+            res.errors.is_empty(),
+            "expected clean, got {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn shortform_to_block_dir_conversion() {
         // Add enough files to overflow the inline root directory, forcing a
         // short-form -> single-block conversion (exercises the dir2 block
