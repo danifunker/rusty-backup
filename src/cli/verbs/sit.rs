@@ -17,6 +17,7 @@ use crate::cli::logging::log_stderr;
 use crate::fs::binhex;
 use crate::fs::resource_fork::{self, sanitize_filename};
 use crate::macarchive::stuffit::{self, StuffItArchive};
+use crate::macarchive::stuffit5;
 
 #[derive(Debug, Subcommand)]
 pub enum SitCommand {
@@ -87,7 +88,8 @@ pub fn run(cmd: SitCommand) -> Result<()> {
     }
 }
 
-/// Load an archive, transparently BinHex-decoding a `.sit.hqx` wrapper.
+/// Load an archive, transparently BinHex-decoding a `.sit.hqx` wrapper and
+/// routing classic StuffIt (`SIT!`), StuffIt 5, and `.sea` to the right parser.
 fn load_archive(path: &Path) -> Result<(Vec<u8>, StuffItArchive)> {
     let raw = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     // If it's a BinHex document, the StuffIt stream is its data fork.
@@ -95,13 +97,16 @@ fn load_archive(path: &Path) -> Result<(Vec<u8>, StuffItArchive)> {
         Ok(bh) => bh.data_fork,
         Err(_) => raw,
     };
-    if stuffit::find_sea_archive(&bytes).is_none() {
+    let archive = if stuffit5::is_stuffit5(&bytes) {
+        stuffit5::parse(&bytes)?
+    } else if stuffit::find_sea_archive(&bytes).is_some() {
+        stuffit::parse(&bytes)?
+    } else {
         bail!(
-            "{}: not a classic StuffIt archive (newer StuffIt 5 / .sitx is not supported)",
+            "{}: not a recognized StuffIt archive (classic SIT! / StuffIt 5; .sitx is not supported)",
             path.display()
         );
-    }
-    let archive = stuffit::parse(&bytes)?;
+    };
     Ok((bytes, archive))
 }
 

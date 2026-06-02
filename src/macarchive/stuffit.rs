@@ -295,6 +295,7 @@ pub fn decompress_fork(archive: &[u8], fork: &ForkInfo) -> Result<Vec<u8>> {
         0 => comp.to_vec(),
         1 => binhex::rle90_decode(comp),
         13 => super::stuffit_lzh::decompress(comp, want)?,
+        15 => super::stuffit_arsenic::decompress(comp, want)?,
         m => bail!(
             "StuffIt: compression method {m} ({}) not yet supported",
             method_name(fork.method)

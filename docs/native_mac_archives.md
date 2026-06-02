@@ -187,14 +187,15 @@ duplication.
 
 ---
 
+## 6a. StuffIt 5 (`.sit` v5) — read   [done]
+
+- [x] `src/macarchive/stuffit5.rs`: container parser (`XADStuffIt5Parser` port) producing the shared `StuffItEntry`/`ForkInfo`, so forks flow through `decompress_fork`. Handles directory tree (`diroffs` map), phantom marker entries, second-block file type/creator/finder flags, resource forks. Encrypted archives rejected.
+- [x] `src/macarchive/stuffit_arsenic.rs`: **method 15 (Arsenic)** — MSB-first arithmetic decoder + adaptive models + inverse MTF + inverse BWT + de-randomization + 4-byte RLE, with trailing CRC-32 verification. Ported from `XADStuffItArsenicHandle.m` + `BWT.c`.
+- [x] CLI `sit list`/`extract` route SIT5 automatically (alongside classic `SIT!`).
+- [x] **Validated end-to-end against the real Apple Mac OS 7.1 800K set**: all 10 disk images decompress with CRC-32 verification and are **byte-for-byte identical to `unar`'s output**; extracted `.img` files are valid HFS volumes `rb-cli` reads.
+
 ## 7. Deferred / out of scope
 
-- `[ ]` **StuffIt 5 (`.sit` v5, magic "StuffIt (c)…")** — the format used by a
-  lot of real-world archives, including Apple's own `Apple_Mac_OS_7.1_800k.sit`
-  disk set. **Not** the same as classic `SIT!` — it needs `XADStuffIt5Parser` +
-  its codecs (a separate parser). Currently detected and rejected with a clear
-  message; `unar` handles it externally in the meantime. This is the highest-
-  value remaining read target given how common v5 is.
 - `[-]` **StuffIt X (`.sitx`)** — different container + arithmetic/Brimstone/BWT
   codecs; biggest lift, least common for floppy preservation. Revisit only on
   demand; XADMaster is the reference if/when we do.
@@ -208,3 +209,4 @@ duplication.
 
 - 2026-06-02: Plan drafted. Scope set: BinHex r/w, SIT r/w, SEA read, SITX deferred; GUI+CLI together. Confirmed MacBinary/AppleDouble/DiskCopy-4.2/fork-extraction already exist and are the foundation.
 - 2026-06-02: Shipped BinHex r/w (engine+CLI+GUI export), classic StuffIt read (methods 0/1/13, container+`.sea`), StuffIt write (stored/RLE90), CLI `sit list/extract/create`, and `.sit.hqx` export. Externally validated with `lsar`/`unar`. Discovered StuffIt 5 is common in the wild (Apple's MacOS 7.1 800k set) → promoted to top read follow-up.
+- 2026-06-02: Shipped native **StuffIt 5** read + **Arsenic (method 15)** codec. The Apple Mac OS 7.1 800K `.sit.hqx` extracts entirely natively — all 10 disk images byte-identical to `unar`. Remaining codecs: 2 (LZW), 3 (Huffman), 5 (LZAH); plus StuffIt 13 static selectors are done. GUI archive browse still pending.

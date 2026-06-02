@@ -12,4 +12,6 @@
 
 pub mod stuffit;
 pub mod stuffit13_tables;
+pub mod stuffit5;
+pub mod stuffit_arsenic;
 pub mod stuffit_lzh;
