@@ -36,5 +36,6 @@ pub mod setrsrc;
 pub mod setvolname;
 pub mod show;
 pub mod shrink;
+pub mod sit;
 pub mod terminal;
 pub mod write;

@@ -175,6 +175,13 @@ pub enum Command {
         cmd: verbs::partmap::PartmapCommand,
     },
 
+    /// Read classic StuffIt archives (list / extract; accepts .sit, .sea,
+    /// and BinHex-wrapped .sit.hqx).
+    Sit {
+        #[command(subcommand)]
+        cmd: verbs::sit::SitCommand,
+    },
+
     /// Open an interactive rb-cli shell (rustyline-based REPL).
     Terminal,
 
@@ -241,6 +248,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Show { cmd } => verbs::show::run(cmd),
         Command::Optical { cmd } => verbs::optical::run(cmd),
         Command::Partmap { cmd } => verbs::partmap::run(cmd),
+        Command::Sit { cmd } => verbs::sit::run(cmd),
         Command::Terminal => verbs::terminal::run(),
         Command::Completions(args) => verbs::completions::run_emit(args),
         Command::InstallCompletions(args) => verbs::completions::run_install(args),

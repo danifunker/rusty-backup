@@ -132,9 +132,11 @@ image pipeline).
 - [x] Tests against real `.sit` samples: **102 forks across 4 archives decompressed + CRC-verified** (decoded on the fly from `.sit.hqx`), exercising both method-13 sub-modes
 - [ ] Decompressors: method 3 (Huffman), 2 (LZW/Compress), 15 (Arsenic/BWT) — return a clear "unsupported codec" error today
 - [-] StuffIt 5 format (`SIT5` / "StuffIt (c)…") — newer container, out of scope (detected + skipped)
-- [ ] Bridge entries → `FileEntry`; read-only browse view (GUI) + `list`/`extract` (CLI) — next slice
+- [x] CLI: `sit list ARCHIVE` + `sit extract ARCHIVE DEST --format binhex|macbinary|appledouble|raw`. Transparently decodes BinHex-wrapped `.sit.hqx` and `.sea`; rebuilds the directory tree; preserves forks + type/creator/flags. Verified end-to-end on real archives (49-file MacWeb tree extracted; decompressed HTML + GIF content confirmed valid).
+- [ ] GUI: read-only archive browse view (model on `optical/browse_view.rs`) + "extract selection to HQX" — next slice
+- [ ] Bridge entries → `FileEntry` for the GUI browse view
 
-**Status: classic `.sit` reading works end-to-end for the dominant codecs (0/1/13). Remaining codecs (3/2/15) and the GUI/CLI surface are follow-ups.**
+**Status: classic `.sit`/`.sea` reading + extraction works end-to-end (CLI) for the dominant codecs (0/1/13). Remaining: codecs 3/2/15, and the GUI browse surface.**
 
 ---
 
