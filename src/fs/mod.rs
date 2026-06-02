@@ -31,6 +31,7 @@ pub mod pfs3;
 pub mod pfs3_clone;
 pub mod prodos;
 pub mod prodos_types;
+pub mod reiserfs;
 pub mod resource_fork;
 pub mod sfs;
 pub mod tree;
@@ -221,16 +222,29 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
         return "affs";
     }
 
-    // Sector 128 (offset 65536 = 0x10000): btrfs superblock.
-    // btrfs magic "_BHRfS_M" is at offset 0x40 (64) within the superblock,
-    // i.e. byte 64 of a sector-aligned read from offset 65536.
+    // Sector 128 (offset 65536 = 0x10000): btrfs superblock AND ReiserFS
+    // superblock share this offset. btrfs magic "_BHRfS_M" sits at offset
+    // 0x40 within the superblock; ReiserFS magic sits at offset 52
+    // (0x34) of the same superblock. One sector-aligned 512-byte read
+    // disambiguates both.
     if reader
         .seek(SeekFrom::Start(partition_offset + 0x10000))
         .is_ok()
     {
-        let mut btrfs_buf = [0u8; 512];
-        if reader.read_exact(&mut btrfs_buf).is_ok() && &btrfs_buf[0x40..0x48] == b"_BHRfS_M" {
-            return "btrfs";
+        let mut sb64k = [0u8; 512];
+        if reader.read_exact(&mut sb64k).is_ok() {
+            if &sb64k[0x40..0x48] == b"_BHRfS_M" {
+                return "btrfs";
+            }
+            // ReiserFS magics live at offset 52. v3.5 = "ReIsErFs",
+            // v3.6 = "ReIsEr2Fs", reiser4 = "ReIsEr4" (rejected at open).
+            let rmagic = &sb64k[52..62];
+            if rmagic.starts_with(b"ReIsErFs")
+                || rmagic.starts_with(b"ReIsEr2Fs")
+                || rmagic.starts_with(b"ReIsEr4")
+            {
+                return "reiserfs";
+            }
         }
     }
 
@@ -244,8 +258,8 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
 /// type-name column use this to replace the generic "Linux" label with the
 /// actual filesystem family.
 ///
-/// Returns one of: `"FAT"`, `"ext"`, `"btrfs"`, `"XFS"`, or `None` when the
-/// content isn't a filesystem this function recognizes.
+/// Returns one of: `"FAT"`, `"ext"`, `"btrfs"`, `"XFS"`, `"ReiserFS"`, or
+/// `None` when the content isn't a filesystem this function recognizes.
 pub fn probe_0x83_fs_type<R: Read + Seek>(
     reader: &mut R,
     partition_offset: u64,
@@ -255,6 +269,7 @@ pub fn probe_0x83_fs_type<R: Read + Seek>(
         "ext" => Some("ext"),
         "btrfs" => Some("btrfs"),
         "xfs" => Some("XFS"),
+        "reiserfs" => Some("ReiserFS"),
         _ => None,
     }
 }
@@ -682,14 +697,14 @@ pub fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &
         return match s {
             "Apple_HFS" => "HFS",
             "Apple_HFSX" => "HFSX",
-            "Apple_UNIX_SVR2" => "ext/btrfs",
-            "Linux" => "ext/btrfs",
+            "Apple_UNIX_SVR2" => "ext/btrfs/xfs/reiserfs",
+            "Linux" => "ext/btrfs/xfs/reiserfs",
             _ => "unknown",
         };
     }
     match partition_type {
         0xAF => "HFS/HFS+",
-        0x83 => "ext/btrfs/xfs",
+        0x83 => "ext/btrfs/xfs/reiserfs",
         0xA8 => "ProDOS",
         0x07 => "NTFS/exFAT",
         0x01 | 0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C => "FAT",
@@ -1020,6 +1035,10 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "reiserfs" => Ok(Box::new(reiserfs::ReiserFsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "efs" => Ok(Box::new(efs::EfsFilesystem::open(
                     reader,
                     partition_offset,
@@ -1080,6 +1099,10 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     partition_offset,
                 )?)),
                 "xfs" => Ok(Box::new(xfs::XfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "reiserfs" => Ok(Box::new(reiserfs::ReiserFsFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),
