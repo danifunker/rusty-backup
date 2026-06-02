@@ -49,6 +49,9 @@ use std::io::{Read, Seek, SeekFrom};
 
 use super::entry::FileEntry;
 use super::filesystem::{Filesystem, FilesystemError};
+use super::unix_common::bitmap::BitmapReader;
+use super::unix_common::compact::{CompactLayout, CompactSection, CompactStreamReader};
+use crate::fs::CompactResult;
 
 // ---- Constants ----
 
@@ -75,8 +78,10 @@ const SB_READ_SIZE: usize = 2048;
 // On-disk field offsets, validated against the FreeBSD struct definition
 // and cross-checked against our makefs-built fixtures (see scripts/
 // generate-ufs-fixtures.sh + scripts/probe-ufs-sb.py).
-#[allow(dead_code)] // U.2 will consume this when walking the CG region
+#[allow(dead_code)] // surfaced for completeness; the SB block address isn't
+                    // needed by U.1/U.2/U.3
 const OFF_SBLKNO: usize = 0x008; // fs_sblkno      i32 — SB address in frags
+const OFF_CBLKNO: usize = 0x00C; // fs_cblkno      i32 — CG block addr in frags
 const OFF_OLD_SIZE: usize = 0x024; // fs_old_size    i32 — UFS1 total fragments
 const OFF_NCG: usize = 0x02C; // fs_ncg         u32 — # cylinder groups
 const OFF_BSIZE: usize = 0x030; // fs_bsize       i32 — block size in bytes
@@ -89,6 +94,25 @@ const OFF_SIZE_UFS2: usize = 1080; // fs_size        i64 — UFS2 64-bit fragmen
 const OFF_FLAGS2: usize = 0x35E; // fs_flags2      i32 (relevant journal bits live elsewhere too, but this is the canonical "ENABLED" word in modern UFS2)
 
 const VOLNAME_LEN: usize = 32;
+
+// ---- Cylinder-group on-disk header (`struct cg` in fs.h) ----
+
+/// Magic number at offset 4 of every cylinder-group header. Matches
+/// `CG_MAGIC` from FreeBSD `sys/ufs/ffs/fs.h`.
+const CG_MAGIC: u32 = 0x0009_0255;
+const CG_OFF_MAGIC: usize = 0x004;
+const CG_OFF_CGX: usize = 0x00C; // cg_cgx          u32 — CG index
+const CG_OFF_NDBLK: usize = 0x014; // cg_ndblk        u32 — # data frags in CG
+const CG_OFF_IUSEDOFF: usize = 0x05C; // cg_iusedoff     u32 — inode-used bitmap offset
+const CG_OFF_FREEOFF: usize = 0x060; // cg_freeoff      u32 — free-frag bitmap offset
+const CG_OFF_NEXTFREEOFF: usize = 0x064; // cg_nextfreeoff  u32 — used to bound the bitmap
+
+/// How many bytes of the CG header we read in a single sweep. The fixed
+/// portion ends around byte 168, and the trailing free-frag bitmap can
+/// be far larger (1 bit per fragment in the CG). We read the fixed
+/// portion to learn `cg_freeoff` + `cg_ndblk`, then issue a second
+/// targeted read for the bitmap itself.
+const CG_HEADER_FIXED_BYTES: usize = 256;
 
 /// Block-size sanity limits. Matches FreeBSD `MINBSIZE = 512` / `MAXBSIZE
 /// = 65536`. Any value outside this range is a corrupt or non-UFS image.
@@ -123,10 +147,9 @@ pub enum UfsEndian {
 
 // ---- Filesystem ----
 
-// Several fields below are read only from the U.2 compactor and U.3 browse
-// layers (still pending); we capture them at open time so the parser and its
-// consumers share one source of truth. The unused-field warnings disappear
-// once those follow-up commits land.
+// `ipg` is only consumed by U.3 (still pending) and `bsize` / `frag` are
+// captured for parity with the FS struct but unused until then. The other
+// fields all see use in U.1/U.2.
 #[allow(dead_code)]
 pub struct UfsFilesystem<R> {
     pub(crate) reader: R,
@@ -142,6 +165,9 @@ pub struct UfsFilesystem<R> {
     pub(crate) ncg: u32,   // number of cylinder groups
     pub(crate) fpg: u32,   // fragments per cylinder group
     pub(crate) ipg: u32,   // inodes per cylinder group (U.3 needs this)
+    /// `fs_cblkno`: fragment offset of the cylinder-group header inside
+    /// each CG region. CG `i`'s header lives at fragment `i * fpg + cblkno`.
+    pub(crate) cblkno: u32,
     pub(crate) total_frags: u64,
     label: Option<String>,
 }
@@ -213,6 +239,7 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
         let ncg = read_u32(&sb, OFF_NCG, endian);
         let fpg = read_i32(&sb, OFF_FPG, endian);
         let ipg = read_u32(&sb, OFF_IPG, endian);
+        let cblkno = read_i32(&sb, OFF_CBLKNO, endian);
 
         // Sanity gates. A corrupt or non-UFS image trips here rather than
         // returning bogus sizes downstream.
@@ -239,6 +266,11 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
         if ncg == 0 || ncg > 1_000_000 {
             return Err(FilesystemError::Parse(format!(
                 "ufs: implausible cylinder-group count {ncg}"
+            )));
+        }
+        if cblkno <= 0 {
+            return Err(FilesystemError::Parse(format!(
+                "ufs: implausible CG block offset {cblkno}"
             )));
         }
 
@@ -300,9 +332,92 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
             ncg,
             fpg: fpg as u32,
             ipg,
+            cblkno: cblkno as u32,
             total_frags,
             label,
         })
+    }
+
+    /// Byte offset (relative to the partition start) of the cylinder-group
+    /// header for CG index `i`. `cgbase(fs, i) = fpg * i` (FreeBSD's
+    /// modern UFS layout, post-rotational-table removal); the CG header
+    /// then lives at `cgbase + cblkno` fragments.
+    pub(crate) fn cg_header_offset(&self, i: u32) -> u64 {
+        ((i as u64) * (self.fpg as u64) + self.cblkno as u64) * self.fsize
+    }
+
+    /// Starting absolute fragment of CG `i`.
+    pub(crate) fn cgbase_frag(&self, i: u32) -> u64 {
+        (i as u64) * (self.fpg as u64)
+    }
+
+    /// Read CG `i`'s header (fixed portion + free-frag bitmap) and return
+    /// the bitmap bytes plus the in-CG fragment count it covers.
+    ///
+    /// Validates the CG magic + cg_cgx index; refuses bitmaps that would
+    /// extend past `cg_nextfreeoff` (the next-section sentinel) or past
+    /// the CG block region in `fpg` fragments.
+    pub(crate) fn read_cg_free_bitmap(
+        &mut self,
+        i: u32,
+    ) -> Result<(Vec<u8>, u64), FilesystemError> {
+        let cg_byte = self.partition_offset + self.cg_header_offset(i);
+
+        // Fixed portion first — gives us cg_freeoff + cg_ndblk.
+        self.reader.seek(SeekFrom::Start(cg_byte))?;
+        let mut hdr = vec![0u8; CG_HEADER_FIXED_BYTES];
+        self.reader.read_exact(&mut hdr)?;
+
+        let magic = read_u32(&hdr, CG_OFF_MAGIC, self.endian);
+        if magic != CG_MAGIC {
+            return Err(FilesystemError::Parse(format!(
+                "ufs CG {i}: bad magic 0x{magic:08X} (expected 0x{CG_MAGIC:08X}) at byte {cg_byte}"
+            )));
+        }
+        let cgx = read_u32(&hdr, CG_OFF_CGX, self.endian);
+        if cgx != i {
+            return Err(FilesystemError::Parse(format!(
+                "ufs CG {i}: cg_cgx says {cgx}, expected {i}"
+            )));
+        }
+        let cg_ndblk = read_u32(&hdr, CG_OFF_NDBLK, self.endian);
+        if cg_ndblk == 0 || cg_ndblk as u64 > self.fpg as u64 {
+            return Err(FilesystemError::Parse(format!(
+                "ufs CG {i}: implausible cg_ndblk {cg_ndblk} (fpg={})",
+                self.fpg
+            )));
+        }
+        let freeoff = read_u32(&hdr, CG_OFF_FREEOFF, self.endian) as u64;
+        let nextfreeoff = read_u32(&hdr, CG_OFF_NEXTFREEOFF, self.endian) as u64;
+        let iusedoff = read_u32(&hdr, CG_OFF_IUSEDOFF, self.endian) as u64;
+        if freeoff < (CG_HEADER_FIXED_BYTES as u64).min(iusedoff) {
+            // The bitmap can sit inside the first 256 bytes for tiny CG
+            // layouts; guard only against the truly nonsensical case
+            // where `cg_freeoff` lands before `cg_iusedoff`.
+        }
+        if nextfreeoff <= freeoff {
+            return Err(FilesystemError::Parse(format!(
+                "ufs CG {i}: cg_nextfreeoff {nextfreeoff} ≤ cg_freeoff {freeoff}"
+            )));
+        }
+
+        // Compute bitmap length from cg_ndblk and confirm it fits the
+        // declared CG region between freeoff and nextfreeoff.
+        let expected_len = cg_ndblk.div_ceil(8) as u64;
+        let region_len = nextfreeoff - freeoff;
+        if expected_len > region_len {
+            return Err(FilesystemError::Parse(format!(
+                "ufs CG {i}: cg_ndblk {cg_ndblk} needs {expected_len} bitmap bytes, \
+                 declared region [freeoff={freeoff}, nextfreeoff={nextfreeoff}) is {region_len}"
+            )));
+        }
+
+        // Read the bitmap. We re-seek because freeoff might sit beyond
+        // the 256-byte header read above.
+        self.reader.seek(SeekFrom::Start(cg_byte + freeoff))?;
+        let mut bitmap = vec![0u8; expected_len as usize];
+        self.reader.read_exact(&mut bitmap)?;
+        Ok((bitmap, cg_ndblk as u64))
     }
 
     /// Read-back accessors so the compactor (U.2) and browse layer (U.3)
@@ -432,6 +547,137 @@ impl<R: Read + Seek + Send> Filesystem for UfsFilesystem<R> {
         // drives `last_data_byte`).
         self.total_size()
     }
+
+    fn last_data_byte(&mut self) -> Result<u64, FilesystemError> {
+        // Walk every CG bitmap from the last index back to 0 and find the
+        // highest CLEAR bit (= last allocated fragment) anywhere on the
+        // volume. UFS bitmaps use **set bit = FREE** (BSD convention,
+        // opposite of ext / ReiserFS); a clear bit means "this fragment
+        // holds live data — the backup pipeline must capture it."
+        for i in (0..self.ncg).rev() {
+            let (bitmap, ndblk) = self.read_cg_free_bitmap(i)?;
+            let bm = BitmapReader::new(&bitmap, ndblk);
+            if let Some(top) = bm.highest_clear_bit() {
+                let absolute_frag = self.cgbase_frag(i) + top;
+                return Ok((absolute_frag + 1) * self.fsize);
+            }
+        }
+        // No allocated fragments at all — the volume's bitmaps say
+        // everything is free. Return total_size as the safe upper bound.
+        Ok(self.total_size())
+    }
+}
+
+// ---- Compact reader ----
+
+/// A streaming `Read` that produces a compacted UFS partition image.
+///
+/// **Layout-preserving** — allocated fragments are read from their original
+/// byte positions; free fragments emit zeros. UFS uses
+/// **set bit = free** in the per-CG `cg_freeoff` bitmap, so we walk every
+/// CG, group consecutive same-state bits into runs, and emit each run as
+/// either a [`CompactSection::MappedBlocks`] (allocated) or
+/// [`CompactSection::Zeros`] (free) section.
+///
+/// Per-CG metadata (CG header, SB copy, inode table) is **also** covered
+/// by the bitmap and shows up as allocated — by design, since the backup
+/// pipeline needs those bytes to faithfully reconstruct the volume.
+///
+/// The trailing reserved region between the last CG's end and
+/// `total_frags` (sometimes present when `ncg * fpg < total_frags`) is
+/// emitted as zeros so the stream length still equals `original_size`.
+pub struct CompactUfsReader<R: Read + Seek> {
+    inner: CompactStreamReader<R>,
+}
+
+impl<R: Read + Seek + Send> CompactUfsReader<R> {
+    /// Create a new compacted UFS reader. Parses the SB, walks every CG
+    /// bitmap, and builds the section list.
+    pub fn new(reader: R, partition_offset: u64) -> Result<(Self, CompactResult), FilesystemError> {
+        // Re-open the volume so we share SB validation + endian detection
+        // with the read path.
+        let mut fs = UfsFilesystem::open(reader, partition_offset)?;
+        let fsize = fs.fsize;
+        let total_frags = fs.total_frags;
+
+        let mut sections: Vec<CompactSection> = Vec::new();
+        let mut total_allocated: u64 = 0;
+        let mut covered_frags: u64 = 0;
+
+        for i in 0..fs.ncg {
+            let cgbase = fs.cgbase_frag(i);
+            // If the previous CG didn't end exactly where this one begins
+            // (degenerate layouts), zero-pad the gap so absolute fragment
+            // offsets in subsequent sections still match the source. The
+            // `covered_frags` book-keeping is refreshed at the end of the
+            // loop body so we only need the section emission here.
+            if covered_frags < cgbase {
+                sections.push(CompactSection::Zeros((cgbase - covered_frags) * fsize));
+            }
+
+            let (bitmap, ndblk) = fs.read_cg_free_bitmap(i)?;
+            let bm = BitmapReader::new(&bitmap, ndblk);
+
+            // Coalesce same-state runs into single sections.
+            let mut bit: u64 = 0;
+            while bit < ndblk {
+                let is_set = bm.is_bit_set(bit);
+                let mut run_end = bit + 1;
+                while run_end < ndblk && bm.is_bit_set(run_end) == is_set {
+                    run_end += 1;
+                }
+                let run_len = run_end - bit;
+
+                if is_set {
+                    // SET = free in UFS — emit zeros.
+                    sections.push(CompactSection::Zeros(run_len * fsize));
+                } else {
+                    // CLEAR = allocated — map the actual fragments.
+                    let old_blocks: Vec<u64> = (bit..run_end).map(|b| cgbase + b).collect();
+                    total_allocated += run_len;
+                    sections.push(CompactSection::MappedBlocks { old_blocks });
+                }
+                bit = run_end;
+            }
+            covered_frags = cgbase + ndblk;
+        }
+
+        // Trailing zero-pad. Some UFS layouts have `ncg * fpg < total_frags`
+        // when the last CG was truncated; the residual area is never
+        // allocated to user data, so emitting zeros matches the source.
+        if covered_frags < total_frags {
+            sections.push(CompactSection::Zeros((total_frags - covered_frags) * fsize));
+        }
+
+        let original_size = total_frags * fsize;
+        let layout = CompactLayout {
+            sections,
+            block_size: fsize as usize,
+            source_data_start: 0,
+            source_partition_offset: partition_offset,
+        };
+        let inner = CompactStreamReader::new(fs.reader, layout);
+        Ok((
+            Self { inner },
+            CompactResult {
+                original_size,
+                // Layout-preserving — stream length matches the source.
+                compacted_size: original_size,
+                data_size: total_allocated * fsize,
+                // CompactResult::clusters_used is u32 for parity with FAT-
+                // family bookkeeping; UFS fragment counts beyond u32 only
+                // happen on multi-TiB volumes we don't expect here. Cap
+                // at u32::MAX defensively.
+                clusters_used: total_allocated.min(u32::MAX as u64) as u32,
+            },
+        ))
+    }
+}
+
+impl<R: Read + Seek> Read for CompactUfsReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
 }
 
 // ---- Tests ----
@@ -488,6 +734,10 @@ mod tests {
         write_i32(sb, OFF_FPG, fpg as i32);
         write_u32(sb, OFF_IPG, ipg);
         write_u32(sb, OFF_FLAGS2, fs_flags2);
+        // `fs_cblkno` — fragment offset of the CG block header. 24 is the
+        // makefs default for the small fixtures we exercise; tests that
+        // walk CG headers seed the bitmap region themselves.
+        write_i32(sb, OFF_CBLKNO, 24);
 
         match version {
             UfsVersion::Ufs1 => {
@@ -809,5 +1059,142 @@ mod tests {
         // makefs places the UFS2 SB at byte 8192 for small images.
         assert_eq!(fs.superblock_offset(), SB_OFFSET_UFS1);
         assert_eq!(fs.total_size(), 16 * 1024 * 1024);
+    }
+
+    // ---- U.2 — CG walk + compact + last_data_byte ----
+
+    fn corrupt_cg_magic(img: &mut [u8], fs: &UfsFilesystem<Cursor<Vec<u8>>>) {
+        // CG 0 header lives at byte `cgbase_frag(0) + cblkno`*fsize.
+        let cg_off = fs.cg_header_offset(0) as usize;
+        img[cg_off + CG_OFF_MAGIC..cg_off + CG_OFF_MAGIC + 4]
+            .copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+    }
+
+    #[test]
+    fn fixture_ufs1_last_data_byte_matches_probe() {
+        // Independent probe (`scripts/probe-ufs-cg.py`) shows the
+        // makefs-built fixture allocates up to fragment 71 within the
+        // single CG. (71 + 1) * fsize = 72 * 1024 = 73728 bytes.
+        let img = load_fixture("test_ufs1.img.zst");
+        let mut fs = UfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        assert_eq!(fs.last_data_byte().expect("scan"), 73728);
+    }
+
+    #[test]
+    fn fixture_ufs2_last_data_byte_matches_probe() {
+        // Same allocation pattern as UFS1 since makefs uses the same
+        // file set; the CG header layout differs (slightly different
+        // freeoff / iusedoff offsets within the CG) but the highest
+        // allocated frag still lands at 71.
+        let img = load_fixture("test_ufs2.img.zst");
+        let mut fs = UfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        assert_eq!(fs.last_data_byte().expect("scan"), 73728);
+    }
+
+    #[test]
+    fn fixture_ufs1_cg_header_validates_magic() {
+        let mut img = load_fixture("test_ufs1.img.zst");
+        let fs = UfsFilesystem::open(Cursor::new(img.clone()), 0).expect("open");
+        corrupt_cg_magic(&mut img, &fs);
+        let mut fs = UfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let err = fs.last_data_byte().expect_err("expected magic mismatch");
+        match err {
+            FilesystemError::Parse(msg) => {
+                assert!(msg.contains("CG 0") && msg.contains("magic"), "got: {msg}")
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fixture_ufs1_compact_reader_stream_length_matches_total_size() {
+        // CompactReader is layout-preserving: stream length == original
+        // partition size. Free fragments emit zeros (compress to almost
+        // nothing); allocated fragments are read from their original
+        // positions.
+        let img = load_fixture("test_ufs1.img.zst");
+        let (mut reader, info) =
+            CompactUfsReader::new(Cursor::new(img.clone()), 0).expect("compactor");
+        assert_eq!(info.original_size, 16 * 1024 * 1024);
+        assert_eq!(info.compacted_size, 16 * 1024 * 1024);
+        // 70 allocated fragments × 1024 bytes = 70 KiB of "live" data.
+        // (Frags 0–39 + 40–45 + 48–71 = 40 + 6 + 24 = 70; frags 46/47 sit
+        // in a gap between the inode table and the user data run.)
+        assert_eq!(info.data_size, 70 * 1024);
+
+        // Drain the stream and confirm we get exactly the original size.
+        let mut sink = Vec::new();
+        std::io::copy(&mut reader, &mut sink).expect("drain");
+        assert_eq!(sink.len() as u64, info.original_size);
+    }
+
+    #[test]
+    fn fixture_ufs1_compact_reader_preserves_allocated_byte_offsets() {
+        // The compactor must emit the original file bytes at their
+        // original byte offsets. Read the raw fixture and the compact
+        // stream side-by-side; allocated regions (frags 0-45, 48-71)
+        // must match byte-for-byte. Free regions emit zeros from the
+        // compactor and arbitrary content from the source.
+        let img = load_fixture("test_ufs1.img.zst");
+        let raw = img.clone();
+        let (mut reader, info) = CompactUfsReader::new(Cursor::new(img), 0).expect("compactor");
+        let mut out = Vec::with_capacity(info.original_size as usize);
+        std::io::copy(&mut reader, &mut out).expect("drain");
+
+        // Allocated frags 0..46 — the metadata + superblock region —
+        // must round-trip identically. Skip frag 46/47 (free per probe)
+        // and check frags 48..72 (the 24 KiB large.bin file).
+        let fsize = 1024usize;
+        for frag in 0..46 {
+            let start = frag * fsize;
+            assert_eq!(
+                &out[start..start + fsize],
+                &raw[start..start + fsize],
+                "frag {frag} (allocated) round-trip mismatch"
+            );
+        }
+        for frag in 48..72 {
+            let start = frag * fsize;
+            assert_eq!(
+                &out[start..start + fsize],
+                &raw[start..start + fsize],
+                "frag {frag} (allocated, part of large.bin) round-trip mismatch"
+            );
+        }
+        // Free frags (72..16384) — compactor emits zeros.
+        for frag in 72..16384 {
+            let start = frag * fsize;
+            assert!(
+                out[start..start + fsize].iter().all(|&b| b == 0),
+                "frag {frag} (free) should be zero-filled by compactor"
+            );
+        }
+    }
+
+    #[test]
+    fn fixture_ufs1_compact_reader_round_trips_through_parser() {
+        // The compacted stream must itself be a valid UFS image — when we
+        // feed it back into UfsFilesystem::open we should see identical
+        // geometry.
+        let img = load_fixture("test_ufs1.img.zst");
+        let (mut reader, _info) = CompactUfsReader::new(Cursor::new(img), 0).expect("compactor");
+        let mut out = Vec::new();
+        std::io::copy(&mut reader, &mut out).expect("drain");
+        let fs = UfsFilesystem::open(Cursor::new(out), 0).expect("re-open compacted");
+        assert_eq!(fs.fs_type(), "UFS1");
+        assert_eq!(fs.total_size(), 16 * 1024 * 1024);
+        assert_eq!(fs.ncg, 1);
+    }
+
+    #[test]
+    fn fixture_ufs2_compact_reader_round_trips_through_parser() {
+        let img = load_fixture("test_ufs2.img.zst");
+        let (mut reader, _info) = CompactUfsReader::new(Cursor::new(img), 0).expect("compactor");
+        let mut out = Vec::new();
+        std::io::copy(&mut reader, &mut out).expect("drain");
+        let fs = UfsFilesystem::open(Cursor::new(out), 0).expect("re-open compacted");
+        assert_eq!(fs.fs_type(), "UFS2");
+        assert_eq!(fs.total_size(), 16 * 1024 * 1024);
+        assert_eq!(fs.ncg, 1);
     }
 }

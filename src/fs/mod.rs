@@ -65,6 +65,7 @@ pub use ntfs::{
 };
 pub use prodos::{resize_prodos_in_place, validate_prodos_integrity, CompactProDosReader};
 pub use reiserfs::CompactReiserFsReader;
+pub use ufs::CompactUfsReader;
 
 /// Update the BPB/VBR hidden-sectors / partition-offset field for whichever
 /// filesystem is present at `partition_offset`. Each per-FS patcher checks
@@ -400,6 +401,10 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
                         CompactReiserFsReader::new(reader, partition_offset).ok()?;
                     Some((Box::new(reader), info))
                 }
+                "ufs" => {
+                    let (reader, info) = CompactUfsReader::new(reader, partition_offset).ok()?;
+                    Some((Box::new(reader), info))
+                }
                 "prodos" => {
                     let (reader, info) = CompactProDosReader::new(reader, partition_offset).ok()?;
                     Some((Box::new(reader), info))
@@ -444,6 +449,10 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
                 "reiserfs" => {
                     let (reader, info) =
                         CompactReiserFsReader::new(reader, partition_offset).ok()?;
+                    Some((Box::new(reader), info))
+                }
+                "ufs" => {
+                    let (reader, info) = CompactUfsReader::new(reader, partition_offset).ok()?;
                     Some((Box::new(reader), info))
                 }
                 "fat" => {
