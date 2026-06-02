@@ -24,6 +24,23 @@ pub enum SitCommand {
     List(ListArgs),
     /// Extract a StuffIt archive to a directory on the host.
     Extract(ExtractArgs),
+    /// Create a StuffIt archive from host files (.hqx / .bin / plain).
+    Create(CreateArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CreateArgs {
+    /// Output `.sit` archive path.
+    pub output: PathBuf,
+
+    /// Input files. Each may be a BinHex `.hqx`, a MacBinary `.bin`, or a
+    /// plain file (with an optional `._name` / `.rsrc` sidecar).
+    #[arg(required = true)]
+    pub inputs: Vec<PathBuf>,
+
+    /// Compress forks with RLE90 (method 1) instead of storing uncompressed.
+    #[arg(long)]
+    pub rle: bool,
 }
 
 #[derive(Debug, Args)]
@@ -65,6 +82,7 @@ pub fn run(cmd: SitCommand) -> Result<()> {
     match cmd {
         SitCommand::List(args) => run_list(args),
         SitCommand::Extract(args) => run_extract(args),
+        SitCommand::Create(args) => run_create(args),
     }
 }
 
@@ -237,6 +255,107 @@ fn write_entry(
         }
     }
     Ok(())
+}
+
+fn run_create(args: CreateArgs) -> Result<()> {
+    let method = if args.rle {
+        stuffit::WriteMethod::Rle
+    } else {
+        stuffit::WriteMethod::Store
+    };
+
+    let mut files = Vec::new();
+    for input in &args.inputs {
+        // Skip AppleDouble / .rsrc sidecars — they're consumed with their
+        // primary file.
+        if resource_fork::is_resource_fork_sidecar(input) {
+            continue;
+        }
+        files.push(host_file_to_input(input)?);
+    }
+    if files.is_empty() {
+        bail!("no input files to archive");
+    }
+
+    let bytes = stuffit::build_archive(&files, method)?;
+    std::fs::write(&args.output, &bytes)
+        .with_context(|| format!("writing {}", args.output.display()))?;
+
+    log_stderr(format!(
+        "sit create: {} file(s) -> {} ({} bytes)",
+        files.len(),
+        args.output.display(),
+        bytes.len()
+    ));
+    Ok(())
+}
+
+/// Build a [`stuffit::StuffItInput`] from a host file, recognizing BinHex and
+/// MacBinary containers and plain files (with optional fork sidecars).
+fn host_file_to_input(path: &Path) -> Result<stuffit::StuffItInput> {
+    let raw = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+
+    // BinHex: full fidelity (name + both forks + Finder info).
+    if let Ok(bh) = binhex::parse_binhex(&raw) {
+        return Ok(stuffit::StuffItInput {
+            name: bh.name,
+            type_code: bh.type_code,
+            creator_code: bh.creator_code,
+            finder_flags: bh.flags,
+            create_date: 0,
+            mod_date: 0,
+            data_fork: bh.data_fork,
+            resource_fork: bh.resource_fork,
+        });
+    }
+
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("untitled")
+        .to_string();
+    let full_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("untitled")
+        .to_string();
+
+    // MacBinary container.
+    if let Some(mb) = resource_fork::parse_macbinary(&raw) {
+        return Ok(stuffit::StuffItInput {
+            name: stem,
+            type_code: mb.type_code.unwrap_or(*b"????"),
+            creator_code: mb.creator_code.unwrap_or(*b"????"),
+            finder_flags: 0,
+            create_date: 0,
+            mod_date: 0,
+            data_fork: mb.data_fork.unwrap_or_default(),
+            resource_fork: mb.data,
+        });
+    }
+
+    // Plain file, picking up an AppleDouble / .rsrc sidecar if present.
+    let detected = resource_fork::detect_resource_fork(path);
+    let (rsrc, type_code, creator_code) = detected
+        .map(|d| {
+            (
+                d.data,
+                d.type_code.unwrap_or(*b"????"),
+                d.creator_code.unwrap_or(*b"????"),
+            )
+        })
+        .unwrap_or_else(|| (Vec::new(), *b"????", *b"????"));
+
+    Ok(stuffit::StuffItInput {
+        name: full_name,
+        type_code,
+        creator_code,
+        finder_flags: 0,
+        create_date: 0,
+        mod_date: 0,
+        data_fork: raw,
+        resource_fork: rsrc,
+    })
 }
 
 /// Append `.ext` to a path (keeping any existing extension).

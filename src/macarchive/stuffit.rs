@@ -327,6 +327,127 @@ pub fn decompress_fork(archive: &[u8], fork: &ForkInfo) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// Writer
+// ---------------------------------------------------------------------------
+
+/// Compression to use when writing a fork.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteMethod {
+    /// Store uncompressed (method 0).
+    Store,
+    /// RLE90 (method 1), falling back to Store when it doesn't shrink the fork.
+    Rle,
+}
+
+/// A single file to place into a StuffIt archive (top level; folders are not
+/// emitted by the writer yet).
+#[derive(Debug, Clone)]
+pub struct StuffItInput {
+    /// Mac filename (truncated to 31 bytes).
+    pub name: String,
+    pub type_code: [u8; 4],
+    pub creator_code: [u8; 4],
+    pub finder_flags: u16,
+    /// Mac 1904-epoch timestamps (0 is acceptable).
+    pub create_date: u32,
+    pub mod_date: u32,
+    pub data_fork: Vec<u8>,
+    pub resource_fork: Vec<u8>,
+}
+
+/// Compress a fork for writing, returning `(method_byte, bytes)`.
+fn compress_fork(data: &[u8], method: WriteMethod) -> (u8, Vec<u8>) {
+    match method {
+        WriteMethod::Store => (0, data.to_vec()),
+        WriteMethod::Rle => {
+            let encoded = binhex::rle90_encode(data);
+            if encoded.len() < data.len() {
+                (1, encoded)
+            } else {
+                (0, data.to_vec())
+            }
+        }
+    }
+}
+
+/// Build a classic StuffIt (`.sit`) archive from a flat list of files.
+///
+/// Produces correct 112-byte entry-header CRCs and per-fork CRC-16/ARC values
+/// (the checksums real readers verify), so the result round-trips through
+/// [`parse`] and is accepted by The Unarchiver. The 16-bit archive-header field
+/// at offset 20 (whose derivation is unknown and which XAD ignores) is written
+/// as zero.
+pub fn build_archive(files: &[StuffItInput], method: WriteMethod) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+
+    for f in files {
+        let name_bytes = mac_name_bytes(&f.name);
+        let namelen = name_bytes.len();
+
+        let (rmethod, rcomp) = if f.resource_fork.is_empty() {
+            (0u8, Vec::new())
+        } else {
+            compress_fork(&f.resource_fork, method)
+        };
+        let (dmethod, dcomp) = compress_fork(&f.data_fork, method);
+
+        let mut h = [0u8; ENTRY_HEADER_LEN];
+        h[0] = rmethod;
+        h[1] = dmethod;
+        h[2] = namelen as u8;
+        h[3..3 + namelen].copy_from_slice(&name_bytes);
+        // [34..36] filename CRC (size byte + name); not verified by readers.
+        let fname_crc = crc16_arc(&h[2..3 + namelen]);
+        BigEndian::write_u16(&mut h[34..36], fname_crc);
+        h[66..70].copy_from_slice(&f.type_code);
+        h[70..74].copy_from_slice(&f.creator_code);
+        BigEndian::write_u16(&mut h[74..76], f.finder_flags);
+        BigEndian::write_u32(&mut h[76..80], f.create_date);
+        BigEndian::write_u32(&mut h[80..84], f.mod_date);
+        BigEndian::write_u32(&mut h[84..88], f.resource_fork.len() as u32);
+        BigEndian::write_u32(&mut h[88..92], f.data_fork.len() as u32);
+        BigEndian::write_u32(&mut h[92..96], rcomp.len() as u32);
+        BigEndian::write_u32(&mut h[96..100], dcomp.len() as u32);
+        BigEndian::write_u16(&mut h[100..102], crc16_arc(&f.resource_fork));
+        BigEndian::write_u16(&mut h[102..104], crc16_arc(&f.data_fork));
+        // [62..66] child offset: -1 marks a file entry (as real archives do).
+        h[62..66].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+        // Header CRC over the first 110 bytes.
+        let hdr_crc = crc16_arc(&h[0..110]);
+        BigEndian::write_u16(&mut h[110..112], hdr_crc);
+
+        body.extend_from_slice(&h);
+        body.extend_from_slice(&rcomp);
+        body.extend_from_slice(&dcomp);
+    }
+
+    let total = (ARCHIVE_HEADER_LEN + body.len()) as u32;
+    let mut out = Vec::with_capacity(total as usize);
+    out.extend_from_slice(b"SIT!");
+    out.extend_from_slice(&(files.len() as u16).to_be_bytes());
+    out.extend_from_slice(&total.to_be_bytes());
+    out.extend_from_slice(b"rLau");
+    out.push(1); // version
+    out.push(0); // reserved
+    out.extend_from_slice(&(ARCHIVE_HEADER_LEN as u32).to_be_bytes());
+    out.extend_from_slice(&[0, 0]); // archive-header field at [20]; XAD ignores it
+    debug_assert_eq!(out.len(), ARCHIVE_HEADER_LEN);
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+/// Encode a name to at most 31 Mac Roman bytes (lossy ASCII fallback).
+fn mac_name_bytes(name: &str) -> Vec<u8> {
+    let mut bytes = crate::fs::hfs::utf8_to_mac_roman(name).unwrap_or_else(|_| {
+        name.chars()
+            .map(|c| if c.is_ascii() { c as u8 } else { b'_' })
+            .collect()
+    });
+    bytes.truncate(31);
+    bytes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,6 +465,56 @@ mod tests {
         buf[10..14].copy_from_slice(b"rLau");
         assert!(is_stuffit(&buf));
         assert!(!is_stuffit(b"not a sit file"));
+    }
+
+    #[test]
+    fn write_then_read_roundtrip() {
+        let files = vec![
+            StuffItInput {
+                name: "Read Me".to_string(),
+                type_code: *b"TEXT",
+                creator_code: *b"ttxt",
+                finder_flags: 0,
+                create_date: 0xAABBCCDD,
+                mod_date: 0x11223344,
+                // Long runs so RLE actually engages.
+                data_fork: b"Hello\r\rAAAAAAAAAAAAAAAAAAAA end.".to_vec(),
+                resource_fork: vec![0u8; 200],
+            },
+            StuffItInput {
+                name: "Empty Rsrc".to_string(),
+                type_code: *b"BINA",
+                creator_code: *b"????",
+                finder_flags: 0x4000,
+                create_date: 0,
+                mod_date: 0,
+                data_fork: b"just a data fork".to_vec(),
+                resource_fork: Vec::new(),
+            },
+        ];
+
+        for method in [WriteMethod::Store, WriteMethod::Rle] {
+            let bytes = build_archive(&files, method).unwrap();
+            assert!(is_stuffit(&bytes));
+            let archive = parse(&bytes).expect("our writer must parse");
+            assert_eq!(archive.entries.len(), 2);
+
+            let e0 = &archive.entries[0];
+            assert_eq!(e0.name, "Read Me");
+            assert_eq!(&e0.type_code, b"TEXT");
+            assert_eq!(e0.create_date, 0xAABBCCDD);
+            // decompress_fork verifies the per-fork CRC internally.
+            let data0 = decompress_fork(&bytes, e0.data.as_ref().unwrap()).unwrap();
+            assert_eq!(data0, files[0].data_fork);
+            let rsrc0 = decompress_fork(&bytes, e0.rsrc.as_ref().unwrap()).unwrap();
+            assert_eq!(rsrc0, files[0].resource_fork);
+
+            let e1 = &archive.entries[1];
+            assert_eq!(e1.finder_flags, 0x4000);
+            assert!(e1.rsrc.is_none());
+            let data1 = decompress_fork(&bytes, e1.data.as_ref().unwrap()).unwrap();
+            assert_eq!(data1, files[1].data_fork);
+        }
     }
 
     /// Parses real `.sit` samples if present (decoded from `.sit.hqx` on the

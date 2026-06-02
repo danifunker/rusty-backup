@@ -82,8 +82,9 @@ fn binhex_crc16(data: &[u8]) -> u16 {
 }
 
 /// RLE90 compress: a run of `b` repeated `n` (3..=255) times becomes
-/// `b 0x90 n`; a literal `0x90` becomes `0x90 0x00`.
-fn rle90_encode(data: &[u8]) -> Vec<u8> {
+/// `b 0x90 n`; a literal `0x90` becomes `0x90 0x00`. Shared with the StuffIt
+/// writer (compression method 1).
+pub(crate) fn rle90_encode(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
     let mut i = 0;
     while i < data.len() {

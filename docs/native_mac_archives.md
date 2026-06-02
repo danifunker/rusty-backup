@@ -142,19 +142,19 @@ image pipeline).
 
 ## 4. StuffIt classic (`.sit`) — write   [Phase 3]
 
-User wants SIT emission too. Pragmatic path — **valid archives first, good
-compression later**:
+- [x] Container writer (`stuffit::build_archive`): archive header + 112-byte entry headers + correct **entry-header CRC** and **per-fork CRC-16/ARC** (the checksums real readers verify)
+- [x] Method **0 (stored)** and **1 (RLE90)** writers (`WriteMethod`; RLE falls back to store when it doesn't shrink)
+- [x] CLI `sit create OUT.sit INPUT… [--rle]` — inputs may be `.hqx` (full fidelity), `.bin` MacBinary, or plain files (+ `._`/`.rsrc` sidecars)
+- [x] Round-trip tests: unit test (write → parse → fork CRCs verify) + full CLI workflow (`.hqx` → `sit create` → `sit extract` yields byte-identical data forks)
+- [-] External validation against `lsar`/`unar` — not available locally; deferred
+- [ ] Folder (nested directory) emission — writer is flat-file only today
+- [-] method 13 compressor — out of scope (stored/RLE90 is sufficient for preservation)
 
-- [ ] Container writer: archive header + entry headers + folder markers + CRCs
-- [ ] Method **0 (stored)** and **1 (RLE90)** writers — trivial, produce archives StuffIt Expander / unar accept
-- [ ] CLI `put-sit` / `make-sit` (multi-file in) + GUI "Export selection to StuffIt…"
-- [ ] Round-trip test: write SIT → read back with our Phase 2 reader → forks/Finder info intact
-- [ ] Validate against The Unarchiver (`lsar`/`unar`) externally
-- [ ] *(optional)* method 13 (LZAH) compressor for real space savings — defer unless needed
-
-> Note: writing a *good* StuffIt compressor (method 13/15) is substantial and low
-> value for preservation. Stored/RLE90 is correct and sufficient; treat real
-> compression as a stretch goal.
+> **Caveat (documented in code):** the 16-bit field at archive-header offset 20
+> is of unknown derivation — XAD/The Unarchiver ignore it, and we write 0. The
+> per-entry and per-fork CRCs (which unar *does* verify) are correct, so our
+> archives round-trip through our own reader and should be accepted by unar.
+> StuffIt Expander's stricter behavior on that header field is unverified.
 
 ---
 
