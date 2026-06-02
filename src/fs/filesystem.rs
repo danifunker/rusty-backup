@@ -376,6 +376,26 @@ pub trait EditableFilesystem: Filesystem {
         ))
     }
 
+    /// Set the ProDOS access byte on an existing file or directory.
+    ///
+    /// The access byte (offset 30 of a directory entry) is a bitmask:
+    /// `0x80` = enable destroy, `0x40` = enable rename, `0x20` = backup
+    /// required (set when the file changes; cleared by backup software),
+    /// `0x02` = enable write, `0x01` = enable read. Conventional values:
+    /// `0xC3` = unlocked (read/write/destroy/rename), `0x21` = locked
+    /// (read + backup-required).
+    ///
+    /// Default returns `Unsupported` — override on ProDOS.
+    fn set_prodos_access(
+        &mut self,
+        _entry: &FileEntry,
+        _access: u8,
+    ) -> Result<(), FilesystemError> {
+        Err(FilesystemError::Unsupported(
+            "set_prodos_access not supported for this filesystem".into(),
+        ))
+    }
+
     /// Write resource fork data. Override on HFS/HFS+; other filesystems
     /// return `Unsupported` rather than silently dropping the fork.
     fn write_resource_fork(

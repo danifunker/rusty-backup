@@ -2124,6 +2124,37 @@ impl BrowseView {
                 }
             }
 
+            // ProDOS Lock / Unlock buttons (ProDOS only, file or folder
+            // selected). The access byte conventions are:
+            //   $C3 = unlocked: read + write + destroy + rename + backup
+            //   $21 = locked:   read + backup-required
+            // We stage canonical values; advanced callers can drive
+            // `EditableFilesystem::set_prodos_access` directly via the CLI
+            // when they need bit-level control.
+            if self.is_prodos_type() {
+                let can_lock = has_selection;
+                if ui
+                    .add_enabled(can_lock, egui::Button::new("Lock"))
+                    .on_hover_text("Set the ProDOS access byte to $21 (read + backup only).")
+                    .clicked()
+                {
+                    if let Some(ref sel) = self.selected_entry.clone() {
+                        self.staged_edits.replace_set_prodos_access(sel, 0x21);
+                        self.edit_result = Some(format!("Staged lock '{}'", sel.name));
+                    }
+                }
+                if ui
+                    .add_enabled(can_lock, egui::Button::new("Unlock"))
+                    .on_hover_text("Set the ProDOS access byte to $C3 (read/write/destroy/rename).")
+                    .clicked()
+                {
+                    if let Some(ref sel) = self.selected_entry.clone() {
+                        self.staged_edits.replace_set_prodos_access(sel, 0xC3);
+                        self.edit_result = Some(format!("Staged unlock '{}'", sel.name));
+                    }
+                }
+            }
+
             ui.add_space(8.0);
             ui.separator();
             ui.add_space(8.0);

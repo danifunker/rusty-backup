@@ -1035,6 +1035,30 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ProDosFilesystem<R> {
         Ok(())
     }
 
+    fn set_prodos_access(&mut self, entry: &FileEntry, access: u8) -> Result<(), FilesystemError> {
+        // ProDOS allows access bits on both files and subdirectories
+        // (the access byte exists in every directory entry layout). The
+        // volume-directory header itself doesn't carry a settable access
+        // byte the same way, so the root entry isn't valid here.
+        if entry.path == "/" {
+            return Err(FilesystemError::Unsupported(
+                "set_prodos_access cannot be applied to the volume root".into(),
+            ));
+        }
+        let (block_num, slot) = self.locate_dir_entry_by_path(&entry.path)?;
+
+        let block = self.read_block(block_num)?;
+        let eo = 4 + slot * 39;
+        let mut entry_bytes = [0u8; 39];
+        entry_bytes.copy_from_slice(&block[eo..eo + 39]);
+        // Access byte at offset 30 within the entry. See `~/repos/CiderPress2`
+        // / ProDOS technical reference; helper constants in `prodos_types`
+        // also expose the bit-flag layout for the GUI label.
+        entry_bytes[30] = access;
+        self.write_dir_entry(block_num, slot, &entry_bytes)?;
+        Ok(())
+    }
+
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
         self.do_sync_metadata()
     }
@@ -2233,5 +2257,99 @@ mod tests {
         assert!(validate_prodos_name("MY FILE").is_err());
         // Invalid: special chars
         assert!(validate_prodos_name("FILE/NAME").is_err());
+    }
+
+    /// Read the access byte for `path` directly from its on-disk directory
+    /// entry, bypassing the FS cache so we can verify the write actually
+    /// landed.
+    fn read_access_byte(fs: &mut ProDosFilesystem<Cursor<Vec<u8>>>, path: &str) -> u8 {
+        let (block_num, slot) = fs.locate_dir_entry_by_path(path).unwrap();
+        let block = fs.read_block(block_num).unwrap();
+        block[4 + slot * 39 + 30]
+    }
+
+    #[test]
+    fn test_set_prodos_access_locks_file() {
+        let mut fs = make_editable_fs();
+        let root = fs.root().unwrap();
+        let entry = fs
+            .create_file(
+                &root,
+                "DOC",
+                &mut &b"hi"[..],
+                2,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+
+        // Fresh-from-create access byte is the unlocked-canonical $C3.
+        assert_eq!(read_access_byte(&mut fs, &entry.path), 0xC3);
+
+        fs.set_prodos_access(&entry, 0x21).unwrap();
+        fs.sync_metadata().unwrap();
+        assert_eq!(read_access_byte(&mut fs, &entry.path), 0x21);
+
+        // Re-toggle back to unlocked.
+        fs.set_prodos_access(&entry, 0xC3).unwrap();
+        fs.sync_metadata().unwrap();
+        assert_eq!(read_access_byte(&mut fs, &entry.path), 0xC3);
+    }
+
+    #[test]
+    fn test_set_prodos_access_works_on_directory() {
+        // Access bytes exist on subdirectory entries too; the trait
+        // accepts both so a future "lock this folder" UX can ride the
+        // same code path.
+        let mut fs = make_editable_fs();
+        let root = fs.root().unwrap();
+        let dir = fs
+            .create_directory(&root, "SUB", &CreateDirectoryOptions::default())
+            .unwrap();
+
+        fs.set_prodos_access(&dir, 0x21).unwrap();
+        fs.sync_metadata().unwrap();
+        assert_eq!(read_access_byte(&mut fs, &dir.path), 0x21);
+    }
+
+    #[test]
+    fn test_set_prodos_access_refuses_volume_root() {
+        let mut fs = make_editable_fs();
+        let root = fs.root().unwrap();
+        // The volume directory header doesn't have a writable access byte
+        // the same way, so the setter refuses with Unsupported.
+        match fs.set_prodos_access(&root, 0x21) {
+            Err(FilesystemError::Unsupported(msg)) => assert!(msg.contains("volume root")),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_set_prodos_access_preserves_other_fields() {
+        let mut fs = make_editable_fs();
+        let root = fs.root().unwrap();
+        let opts = CreateFileOptions {
+            type_code: Some("$06".into()),
+            aux_type: Some(0x2000),
+            ..Default::default()
+        };
+        let entry = fs
+            .create_file(&root, "BIN", &mut &b"x"[..], 1, &opts)
+            .unwrap();
+
+        // Confirm type + aux are set before we touch access.
+        let (block_num, slot) = fs.locate_dir_entry_by_path(&entry.path).unwrap();
+        let block = fs.read_block(block_num).unwrap();
+        let eo = 4 + slot * 39;
+        assert_eq!(block[eo + 16], 0x06); // file_type byte
+        assert_eq!(u16::from_le_bytes([block[eo + 31], block[eo + 32]]), 0x2000);
+
+        fs.set_prodos_access(&entry, 0x21).unwrap();
+        fs.sync_metadata().unwrap();
+
+        let block = fs.read_block(block_num).unwrap();
+        assert_eq!(block[eo + 30], 0x21); // access updated
+        assert_eq!(block[eo + 16], 0x06); // file_type unchanged
+        assert_eq!(u16::from_le_bytes([block[eo + 31], block[eo + 32]]), 0x2000);
+        // aux_type unchanged
     }
 }

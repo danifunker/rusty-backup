@@ -299,27 +299,28 @@ layout-preserving compactor.
 
 ## 3. Filesystem engine — small to medium
 
-### 3.1 ProDOS access-bit setter
+### 3.1 ProDOS access-bit setter — **Shipped**
 
-ProDOS directory entries carry an *access byte* at offset 30 (read /
-write / destroy / rename / backup-needed flags; `$C3` unlocked, `$21`
-locked). The codebase reads and writes this byte
-(`src/fs/prodos.rs:602, 637, 664`) but the `EditableFilesystem` trait
-offers no way to change it after creation.
+`EditableFilesystem::set_prodos_access(entry, access)` added to the
+trait (default returns `Unsupported`) and overridden on
+`ProDosFilesystem`. The access byte at offset 30 of each directory
+entry is patched in place; other fields (file_type at 16, aux_type at
+31-32, key_pointer, blocks_used, etc.) round-trip unchanged. The
+volume root has no settable access byte and is refused with a clear
+`Unsupported`.
 
-Add a ProDOS-specific method (mirrors `set_prodos_type`):
-```rust
-fn set_prodos_access(&mut self, entry: &FileEntry, access: u8)
-    -> Result<(), FilesystemError>
-```
-or a higher-level `set_locked(entry, bool)` if a single toggle covers
-the GUI case. **GUI hookup**: new `StagedEdit::SetProdosAccess` variant
-in `src/gui/browse_view.rs` (parallel to `SetProdosType`); button gated
-on `fs_type == "ProDOS"`. ~150-200 LOC total.
+`StagedEdit::SetProdosAccess { entry, access }` added to the staged-
+edit pipeline with the usual replace-prior + pending-query helpers
+(`EditQueue::replace_set_prodos_access`,
+`EditQueue::pending_prodos_access_for`). Browse-view edit toolbar gets
+a **Lock** ($21 = read + backup) and **Unlock** ($C3 = read + write +
+destroy + rename + backup) button pair, gated on a ProDOS partition
+being open and an entry being selected. Advanced bit-level access
+overrides ship via the trait method for CLI use.
 
-`set_permissions(mode: u32)` is Unix-shaped and only ext implements it;
-ProDOS access bits are an 8-bit format with different semantics, so they
-can't piggy-back on `set_permissions`.
+Tests: 4 new unit tests in `src/fs/prodos.rs` cover the file lock/
+unlock cycle, the directory case, the volume-root refusal, and the
+preservation of file_type / aux_type when the access byte changes.
 
 ### 3.2 NTFS file-aware GHO — compressed path
 
