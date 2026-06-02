@@ -485,44 +485,188 @@ apply as one operation — same code path as `rb-cli batch`. The
 trailing-slash rule and conflict-handling flags (`--force` /
 `--skip-existing`) carry over unchanged.
 
-### 6.3 Native Mac archives — remaining GUI / parity items
+### 6.3 Native Mac archives — GUI workflow polish
 
 Reader / writer for BinHex 4.0 (.hqx), StuffIt classic (SIT! and SIT5),
 and .sea are in tree (Phase 1-2-3 of the original plan plus SEA
 detection via `find_sea_archive`). CLI verbs `put-binhex`, `get-binhex`,
 `sit list`, `sit extract`, `sit create`, `sit create OUT.sit.hqx`
-shipped. Archives tab in the GUI ships.
+shipped. `src/macarchive/stuffit.rs` exposes a tree-shaped writer
+(`StuffItInputNode { File | Folder }` + `build_archive_tree`) that
+emits START_FOLDER / END_FOLDER markers; the flat `build_archive` API
+delegates to it. ASCII-only audit on every user-visible string in
+`src/macarchive/`, `src/gui/archives_tab.rs`, and the SIT / MacBinary
+CLI verbs is clean (verified 2026-06-02; non-ASCII only in dev-facing
+doc comments).
 
-Still open:
-- **GUI `.hqx` import**: currently export-only. Need an "Import .hqx"
-  flow in edit mode that decodes → `create_file` on the open
-  filesystem.
-- **Auto-unwrap hook**: when a decoded `.hqx` payload sniffs as a
-  DiskCopy 4.2 (via `dc42::detect_dc42`) or raw HFS, route it into the
-  image pipeline instead of the loose-file path.
-- **SIT writer folder emission** — **Shipped.**
-  `src/macarchive/stuffit.rs` exposes a new `StuffItInputNode { File |
-  Folder }` tree-shaped input and a `build_archive_tree(tree, method)`
-  entry point that emits START_FOLDER (0x20) / END_FOLDER (0x21)
-  marker entries around children. The flat `build_archive(files,
-  method)` API stays valid and now delegates to the tree path
-  (one `File` node per input). 5 new tests cover the empty-folder
-  marker, a two-file folder with fork round-trip, deeply nested
-  folders preserving full path components, mixed root-and-folder
-  trees confirming `currdir` pops back after END_FOLDER, and the
-  flat-API backwards-compat case.
-- **File-picker extensions** for `.hqx` / `.sit` / `.sea` — add to the
-  inspect-tab / restore-tab / backup-tab pickers (single source of
-  truth in `src/model/file_types.rs`).
-- **GUI archive browse**: open `.hqx` / `.sit` / `.sea` as a read-only
-  archive view, with the auto-unwrap hook routing disk-image payloads
-  to the image pipeline.
-- **ASCII-only audit** — **Clean** (verified 2026-06-02). Every
-  user-visible string in `src/macarchive/`, `src/gui/archives_tab.rs`,
-  `src/cli/verbs/sit.rs`, and `src/cli/verbs/put_macbinary.rs` is
-  plain ASCII. Non-ASCII characters appear only in developer-facing
-  doc comments (`//!` / `///`) — `→`, `…`, `─`, em-dashes — which
-  per CLAUDE.md are allowed.
+#### Why these workflows matter
+
+Classic Mac files carry a **resource fork** + 4-byte **type code** +
+4-byte **creator code** that vanish the moment the file touches a
+non-HFS filesystem. BinHex 4.0 (`.hqx`) encodes the whole
+data+resource+Finder-info bundle into printable 7-bit ASCII, so it's
+the only format that round-trips a classic Mac file through email,
+modern web uploads, Windows/Linux disks, macOS HFS+, or anywhere else
+the resource fork would otherwise be silently dropped. StuffIt
+(`.sit`) bundles many files but only preserves forks intact if the
+archive itself lives on HFS or rides inside `.hqx`. Hence the
+recurring `.sit.hqx` combo for emailing a collection: SIT bundles,
+HQX makes the bundle transport-safe.
+
+The four GUI workflows below cover both directions across the
+disk-image boundary, plus a standalone "just open an archive"
+mode. Each modal includes a short explanatory paragraph so users
+who don't already know the SIT/HQX history can choose correctly.
+
+#### Workflow A — Importing a `.hqx` / `.sit` / `.sea` into a disk image
+
+Trigger: user clicks **Add File…** (or drags onto the browse pane) in
+the edit-mode browse view of an HFS / HFS+ partition, and the picked
+file matches one of the archive extensions.
+
+Modal: "This is a `<format>` archive. What would you like to add to
+the disk image?"
+
+  * **Extract and add the archive contents.** *Decode the archive on
+    the host, then create each file/folder inside the open directory
+    of the disk image. Use this when you're trying to land the
+    enclosed files on the target Mac (e.g. you downloaded
+    `MacApp.sit.hqx` and want to install MacApp).*
+  * **Add the archive file as-is.** *The `.hqx` / `.sit` lands as a
+    single flat file on the disk image. Use this when you want to
+    move the archive through the disk image as cargo (e.g. shipping
+    a `.sit.hqx` to an emulator user who will unstuff it themselves
+    with StuffIt Expander on the target Mac).*
+  * **Cancel.**
+
+For `.sit.hqx` (double-wrapped), surface a third option: **Decode HQX
+only (the `.sit` lands on the disk image).** Useful when the target
+Mac has StuffIt Expander but no BinHex tool.
+
+Auto-unwrap hook (same modal flow): when the decoded HQX payload
+sniffs as a DiskCopy 4.2 (`dc42::detect_dc42`) or raw HFS volume, the
+"Extract and add" choice routes to the disk-image pipeline instead of
+loose-file creation, with a fourth option "Mount this image" surfaced
+when a disk-image-aware modal already handles selection of target
+partition / source view.
+
+Code placement: file-type membership in `src/model/file_types.rs`
+(single source of truth for picker filters across inspect / restore /
+backup tabs); decode path reuses the CLI `put-binhex` /
+`sit extract` core functions; modal lives in the browse-tab edit
+toolbar alongside the existing Add File flow.
+
+#### Workflow B — Exporting selected file(s) from a disk image as a SIT / HQX archive
+
+Trigger: user selects one or more entries in the browse view of an
+HFS / HFS+ partition (or an Amiga / classic-Unix partition where
+resource forks aren't relevant but multi-file bundling still is) and
+opens the **Save As…** dropdown.
+
+New dropdown entries (alongside the existing "Raw bytes" /
+"MacBinary" / "AppleDouble" options):
+
+  * **Save as BinHex 4.0 (`.hqx`).** Enabled only for single-file
+    selections. Tooltip: *Encodes both forks + Finder info (type +
+    creator codes) in printable ASCII. The only format that
+    preserves a classic Mac file's resource fork through email,
+    web uploads, modern Windows / Linux / macOS filesystems, or
+    anything else that isn't HFS — every other "flat" export
+    silently drops the resource fork.*
+  * **Save as StuffIt classic (`.sit`).** Enabled for any selection
+    including folders. Tooltip: *Multi-file compressed archive in
+    StuffIt 1.x–3.x format. Works on System 6+. Preserves forks
+    intact only if the resulting `.sit` then sits on HFS or rides
+    inside a `.hqx` — see the `.sit.hqx` option below for
+    transport-safe distribution.*
+  * **Save as StuffIt-over-BinHex (`.sit.hqx`).** Enabled for any
+    selection. Tooltip: *Use this when emailing or web-uploading a
+    bundle of Mac files: SIT bundles them, HQX wraps the bundle in
+    transport-safe ASCII. The classic "I emailed you a Mac app"
+    format.*
+
+Implementation reuses `build_archive_tree(StuffItInputNode::Folder,
+…)` for SIT, the existing `binhex::encode` for HQX, and chains them
+for the combined variant. Each selected entry becomes a
+`StuffItInputNode::File` carrying data fork + resource fork +
+`FinderInfo`; selected folders walk recursively into nested
+`StuffItInputNode::Folder` nodes.
+
+#### Workflow C — Extracting an already-archived file *out of* a disk image
+
+Trigger: user selects a `.hqx` / `.sit` / `.sea` / `.sit.hqx` file
+**inside** the disk image (browse view) and clicks **Save As…**.
+
+Modal: "This file inside the disk image is a `<format>` archive. How
+would you like to extract it?"
+
+  * **Save the archive as-is (`<format>` file).** *The raw bytes from
+    the disk image land on the host. Useful when the host is just a
+    way station — you want to email the `.sit.hqx` along to someone
+    else without disturbing the encoding.*
+  * **Decode and extract the contents to a folder.** *Decompress the
+    archive on the host. The enclosed files lose their resource
+    forks the moment they touch a non-HFS host filesystem; pick a
+    fork-preserving container (BinHex / MacBinary / AppleDouble) in
+    the follow-up dialog if you need them preserved.*
+  * **Cancel.**
+
+The decoded-extract path reuses the standalone Archives tab's
+extract pipeline (which already offers the BinHex / MacBinary /
+AppleDouble / raw container choice in a follow-up dialog), so
+selecting "Decode and extract" effectively pipes the archive bytes
+into the same code path as Workflow D's extract action — but rooted
+at a host directory chosen here instead of the Archives tab's
+dropdown target.
+
+#### Workflow D — Browsing / extracting a `.hqx` / `.sit` / `.sea` standalone
+
+Trigger: user opens the **Archives** tab (already in tree, 316 lines
+of egui surface in `src/gui/archives_tab.rs`) and picks a file via
+the file-type picker.
+
+Today: `.sit`, `.sea`, and `.sit.hqx` browse + extract work. Still
+open:
+
+  * **Accept loose `.hqx`** in the file picker. A `.hqx` whose
+    payload is not a SIT archive still has one file's worth of
+    content (data fork + resource fork + Finder info). The browse
+    view shows the single decoded entry; extract emits the
+    container of the user's choice.
+  * **Show the auto-unwrap hint** when the decoded `.hqx` payload
+    sniffs as DiskCopy 4.2 or raw HFS: surface a "Mount this image
+    in a new Inspect tab" affordance alongside the regular extract
+    options. This is the standalone version of Workflow A's
+    auto-unwrap; same `dc42::detect_dc42` probe.
+  * **Mixed selection extract**: today the tab extracts everything
+    in the archive. Add per-entry checkboxes so users can pull just
+    one file out without unpacking the whole bundle. Same fork-
+    preserving container choice applies per entry.
+  * **File-picker extensions** for `.hqx` / `.sit` / `.sea` /
+    `.sit.hqx` in the inspect-tab / restore-tab / backup-tab
+    pickers — single source of truth in
+    `src/model/file_types.rs`. Today only the Archives tab knows
+    about these extensions, so a user trying to inspect a
+    `.sit.hqx` from those other tabs has to type the path manually.
+
+#### Design checkpoint expected before any code work
+
+The modal text above is illustrative. Before implementation, the user
+will want to see:
+
+  * Final wording for each modal (especially the educational
+    paragraphs — they shouldn't lecture, just inform).
+  * Auto-detect vs. always-prompt policy: does Workflow A pop the
+    modal whenever the picked file's extension matches, or only
+    when the magic also sniffs? (Recommended: always pop on
+    extension match, since the user explicitly picked the file —
+    surprise auto-extraction is worse than one extra click.)
+  * Whether Workflow B's per-format tooltips live inline in the
+    dropdown (cleaner) or as a "?" affordance opening the same
+    educational paragraph (denser dropdown).
+  * Settings affordance to remember "always extract" / "always
+    add as-is" per format for power users, so the modal doesn't
+    nag on every import.
 
 ---
 
