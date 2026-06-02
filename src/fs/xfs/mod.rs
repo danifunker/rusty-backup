@@ -21,6 +21,7 @@ pub mod bmap;
 pub mod btree_build;
 pub mod dir1;
 pub mod dir2;
+pub mod dir_repair;
 pub mod freespace_rebuild;
 pub mod fsck;
 pub mod inobt_repair;
@@ -1340,6 +1341,82 @@ mod tests {
         let mut fs = XfsFilesystem::open(Cursor::new(repaired), 0).expect("reopen");
         let core = fs.read_inode(131).expect("reread inode 131");
         assert_eq!(core.nblocks, true_nblocks, "di_nblocks not restored");
+        let res = fs.run_fsck().expect("fsck after repair");
+        assert!(
+            res.errors.is_empty(),
+            "expected clean after repair, got: {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn repair_r6_drops_dangling_shortform_entry() {
+        // R6 round-trip: free hello.txt (inode 131) by zeroing its mode, then
+        // repair(). R3 frees it in the inobt, R2 reclaims its blocks, and R6
+        // drops the now-dangling 'hello.txt' entry from the short-form root.
+        // Afterwards the verifier is clean and the entry is gone.
+        use crate::fs::filesystem::EditableFilesystem;
+        let mut img = load_fixture().to_vec();
+        let ino_byte = {
+            let fs = XfsFilesystem::open(Cursor::new(img.clone()), 0).expect("open");
+            let sb = fs.superblock().clone();
+            inode_byte_offset(
+                131,
+                sb.agblocks,
+                sb.agblklog,
+                sb.inopblog,
+                sb.blocksize,
+                sb.inodesize,
+            ) as usize
+        };
+        // Zero di_mode (u16 at core offset 2) -> inode reads as free.
+        img[ino_byte + 2..ino_byte + 4].copy_from_slice(&0u16.to_be_bytes());
+
+        // Pre-repair: zeroing only the mode (not the inobt) makes the verifier
+        // flag the inode as allocated-but-zeroed; R3 then frees it in the inobt
+        // and R6 drops the entry that pointed at it.
+        {
+            let mut fs = XfsFilesystem::open(Cursor::new(img.clone()), 0).expect("open");
+            let res = fs.run_fsck().expect("fsck");
+            assert!(
+                res.errors.iter().any(|e| e.code == "AllocatedInodeZeroed"),
+                "expected AllocatedInodeZeroed, got {:?}",
+                res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+            );
+        }
+
+        let mut cursor = Cursor::new(img);
+        let report = {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable");
+            fs.repair().expect("repair runs")
+        };
+        assert_eq!(report.fixes_failed.len(), 0, "{:?}", report.fixes_failed);
+        assert!(
+            report
+                .fixes_applied
+                .iter()
+                .any(|f| f.contains("dangling shortform")),
+            "expected a dangling-entry fix, got: {:?}",
+            report.fixes_applied
+        );
+
+        let repaired = cursor.into_inner();
+        let mut fs = XfsFilesystem::open(Cursor::new(repaired), 0).expect("reopen");
+        let root = fs.root().expect("root");
+        let names: Vec<String> = fs
+            .list_directory(&root)
+            .expect("list")
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(
+            !names.contains(&"hello.txt".to_string()),
+            "entry not dropped: {names:?}"
+        );
+        assert!(
+            names.contains(&"readme.txt".to_string()),
+            "sibling lost: {names:?}"
+        );
         let res = fs.run_fsck().expect("fsck after repair");
         assert!(
             res.errors.is_empty(),

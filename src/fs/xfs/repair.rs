@@ -304,6 +304,14 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for XfsFilesystem<R> {
         report.fixes_applied.extend(freespace.fixes_applied);
         report.fixes_failed.extend(freespace.fixes_failed);
         report.unrepairable_count += freespace.unrepairable_count;
+        // R6 (directory connectivity) runs last: it only rewrites short-form
+        // directory inodes (inline data — no block-ownership change), and needs
+        // R3's corrected allocated-inode state to tell dangling entries from
+        // live ones.
+        let dirs = self.run_dir_repair()?;
+        report.fixes_applied.extend(dirs.fixes_applied);
+        report.fixes_failed.extend(dirs.fixes_failed);
+        report.unrepairable_count += dirs.unrepairable_count;
         Ok(report)
     }
 

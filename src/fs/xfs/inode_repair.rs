@@ -258,7 +258,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     /// Read-modify-write one inode's `inodesize` bytes back to disk. Mirrors
     /// `read_inode_buf`'s offset math; reads the containing sector span, patches
     /// the inode region, and writes the span (inodes are smaller than a sector).
-    fn write_inode_region(
+    pub(crate) fn write_inode_region(
         &mut self,
         sb: &super::sb::XfsSuperblock,
         ino: u64,
