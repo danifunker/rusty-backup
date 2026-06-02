@@ -1215,7 +1215,7 @@ mod tests {
 
         // Pre-repair: verifier flags the freeblks mismatch.
         {
-            let mut fs = XfsFilesystem::open(Cursor::new(img.clone()), 0).expect("open");
+            let mut fs = XfsFilesystem::open(Cursor::new(img.as_slice()), 0).expect("open");
             let res = fs.run_fsck().expect("fsck");
             assert!(res.errors.iter().any(|e| e.code == "AgfFreeblksMismatch"));
         }
@@ -1264,7 +1264,7 @@ mod tests {
 
         // Pre-repair: verifier flags the mismatch.
         {
-            let mut fs = XfsFilesystem::open(Cursor::new(img.clone()), 0).expect("open");
+            let mut fs = XfsFilesystem::open(Cursor::new(img.as_slice()), 0).expect("open");
             let res = fs.run_fsck().expect("fsck");
             assert!(res.errors.iter().any(|e| e.code == "ReplicaSbMismatch"));
         }
@@ -1304,7 +1304,7 @@ mod tests {
 
         // Locate inode 131 and snapshot its true nblocks before corrupting.
         let (ino_byte, true_nblocks) = {
-            let mut fs = XfsFilesystem::open(Cursor::new(img.clone()), 0).expect("open");
+            let mut fs = XfsFilesystem::open(Cursor::new(img.as_slice()), 0).expect("open");
             let sb = fs.superblock().clone();
             let byte = inode_byte_offset(
                 131,
@@ -1398,7 +1398,7 @@ mod tests {
 
         // Pre-repair: the verifier flags the orphan.
         {
-            let mut fs = XfsFilesystem::open(Cursor::new(img.clone()), 0).expect("open");
+            let mut fs = XfsFilesystem::open(Cursor::new(img.as_slice()), 0).expect("open");
             let res = fs.run_fsck().expect("fsck");
             assert!(
                 res.errors.iter().any(|e| e.code == "OrphanInode"),
@@ -1695,7 +1695,7 @@ mod tests {
         use crate::fs::filesystem::EditableFilesystem;
         let mut img = load_fixture().to_vec();
         let (ino_byte, true_nlink) = {
-            let mut fs = XfsFilesystem::open(Cursor::new(img.clone()), 0).expect("open");
+            let mut fs = XfsFilesystem::open(Cursor::new(img.as_slice()), 0).expect("open");
             let sb = fs.superblock().clone();
             let byte = inode_byte_offset(
                 128,
@@ -1746,7 +1746,7 @@ mod tests {
         use crate::fs::filesystem::EditableFilesystem;
         let mut img = load_fixture().to_vec();
         let ino_byte = {
-            let fs = XfsFilesystem::open(Cursor::new(img.clone()), 0).expect("open");
+            let fs = XfsFilesystem::open(Cursor::new(img.as_slice()), 0).expect("open");
             let sb = fs.superblock().clone();
             inode_byte_offset(
                 131,
@@ -1764,7 +1764,7 @@ mod tests {
         // flag the inode as allocated-but-zeroed; R3 then frees it in the inobt
         // and R6 drops the entry that pointed at it.
         {
-            let mut fs = XfsFilesystem::open(Cursor::new(img.clone()), 0).expect("open");
+            let mut fs = XfsFilesystem::open(Cursor::new(img.as_slice()), 0).expect("open");
             let res = fs.run_fsck().expect("fsck");
             assert!(
                 res.errors.iter().any(|e| e.code == "AllocatedInodeZeroed"),
