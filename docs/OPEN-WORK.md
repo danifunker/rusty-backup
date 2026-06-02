@@ -28,7 +28,8 @@ Magic dispatch order (`probe_0x83_fs_type` in `src/fs/mod.rs`) should remain
 **content-magic first, partition-type-byte second**; all four (ext, btrfs,
 xfs, reiserfs/ufs/jfs) share MBR type `0x83` on Linux.
 
-### 1.1 ReiserFS
+### 1.1 ReiserFS — **Read-track shipped 2026-06-02.** Tier A (R.1–R.2) +
+Tier B (R.3a–R.3d) all landed; inspect / browse / read all work on v3.6.
 
 - **Scope**: v3.5 (`ReIsErFs` magic) + v3.6 (`ReIsEr2Fs` magic). Reject
   reiser4 with a clear error — wholly different on-disk format, extinct,
@@ -50,7 +51,7 @@ xfs, reiserfs/ufs/jfs) share MBR type `0x83` on Linux.
 | R.3a | B | **Shipped.** On-disk S+tree node parsers in `src/fs/reiserfs.rs`: `BlockHead` (level + nr_item + free_space + right_delim_key, 24 bytes); `Key` (16-byte raw + `KeyFormat`-aware `dir_id` / `objectid` / `offset` / `item_type` accessors handling both v1 sentinel-u32 and v2 packed-u64 layouts); `ItemHead` (24-byte leaf header with `version` → `key_format`); `DiskChild` (8-byte internal-node child pointer). `parse_leaf_item_heads` / `parse_internal_keys_and_children` walk a whole block and assert the B-tree N+1 invariant. Superblock `root_block` is now parsed and stored. 13 new tests cover both key formats, both item-type decode tables, BlockHead leaf/internal, ItemHead, DiskChild, leaf-of-3 + internal-with-2-keys round trips, and the leaf/internal mismatch rejections. |
 | R.3b | B | **In progress.** Tree walker (descend root → find leaves). Fixture `tests/fixtures/test_reiserfs_v3_6.img.zst` shipped 2026-06-02 via `scripts/generate-reiserfs-fixtures.sh` (libguestfs appliance, kernel modules from `linux-modules-extra-$(uname -r)`). |
 | ~~R.3c~~ | B | **Shipped.** `Filesystem::list_directory` decodes DIR_ENTRY items: 16-byte `reiserfs_de_head` headers sorted by hash, names packed in reverse at item tail, NUL-padded to 8-byte slots. `.`, `..`, and `.reiserfs_priv` are filtered. Per-entry SD lookup populates mode/uid/gid/mtime + size; symlink targets fetched from the Direct item and truncated to SD-recorded size. `FileEntry::location` packs `(dir_id << 32) \| objectid` so subdir entries round-trip through subsequent `list_directory` calls. Tests: 9 synth (StatData new/old + reject-wrong-size, DIR_ENTRY empty/single/multi + overlap/past-body refusals, pack/unpack round-trip) and 5 fixture-driven (root entry, hidden-filter, file metadata, symlink target, recursive subdir descent). |
-| R.3d | B | `read_file` (StatData + Indirect/Direct + tail packing). |
+| ~~R.3d~~ | B | **Shipped.** `Filesystem::read_file` walks the file's items in key-order: SD fixes the logical size, IND items expand to `block_size` chunks per u32 pointer (sparse pointers = 0 emit zeros), DRCT items append raw bytes. Final truncation to SD.size drops the NUL-padding inside the tail-packed DRCT's 8-byte slot. `max_bytes` is honoured eagerly so over-cap reads short-circuit without loading entire IND chains. Tests: 5 fixture-driven (`hello.txt` DRCT, `tiny.txt` tail-packed-with-padding, `large.bin` 6-pointer IND with byte-formula spot-checks at 0/1/100/4095/4096/12345/24575, `subdir/nested.txt` recursive read, `max_bytes` cap). |
 
 ### 1.2 UFS
 

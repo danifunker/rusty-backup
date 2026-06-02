@@ -699,12 +699,87 @@ impl<R: Read + Seek + Send> Filesystem for ReiserFsFilesystem<R> {
 
     fn read_file(
         &mut self,
-        _entry: &FileEntry,
-        _max_bytes: usize,
+        entry: &FileEntry,
+        max_bytes: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
-        Err(FilesystemError::Unsupported(
-            "ReiserFS read_file not yet implemented (see OPEN-WORK.md §1.1 R.3d)".into(),
-        ))
+        let (dir_id, objectid) = unpack_loc(entry.location);
+        let items = self.collect_items_for_object(dir_id, objectid)?;
+
+        // StatData carries the logical file size we truncate to. Items
+        // come back in tree (key.offset) order, so SD (offset 0) is
+        // always first, followed by IND / DRCT in increasing-offset
+        // order. Concatenating their bodies gives the file in order.
+        let mut sd_size: Option<u64> = None;
+        let mut data: Vec<u8> = Vec::new();
+
+        for (ih, body) in items {
+            if data.len() >= max_bytes {
+                break;
+            }
+            let fmt = ih.key_format()?;
+            match ih.key.item_type(fmt) {
+                ItemType::StatData => {
+                    let sd = StatData::parse(&body)?;
+                    sd_size = Some(sd.size);
+                    let capacity = (sd.size as usize).min(max_bytes);
+                    data.reserve(capacity.saturating_sub(data.capacity()));
+                }
+                ItemType::Indirect => {
+                    // Body is a u32[] of block pointers; each pointer
+                    // names an unformatted data block holding one
+                    // block_size slice of the file.
+                    if !body.len().is_multiple_of(4) {
+                        return Err(FilesystemError::Parse(format!(
+                            "reiserfs: IND item body length {} is not a multiple of 4",
+                            body.len()
+                        )));
+                    }
+                    for chunk in body.chunks_exact(4) {
+                        if data.len() >= max_bytes {
+                            break;
+                        }
+                        let block_num =
+                            u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                        let remaining = max_bytes - data.len();
+                        let take = (self.block_size as usize).min(remaining);
+                        if block_num == 0 {
+                            // Sparse block — emit `take` zeros.
+                            data.extend(std::iter::repeat_n(0u8, take));
+                        } else {
+                            let block = self.read_tree_block(block_num)?;
+                            data.extend_from_slice(&block[..take]);
+                        }
+                    }
+                }
+                ItemType::Direct => {
+                    // The body holds raw bytes — for tail-packed files
+                    // this is the last (< block_size) chunk; for fully
+                    // small files it's the whole file (possibly NUL-
+                    // padded out to the slot size, trimmed below).
+                    let take = body.len().min(max_bytes - data.len());
+                    data.extend_from_slice(&body[..take]);
+                }
+                ItemType::DirEntry | ItemType::Unknown(_) => {
+                    // Not a file item. Skip silently; a directory
+                    // surfaced as `read_file` will simply return an
+                    // empty body.
+                }
+            }
+        }
+
+        let size = sd_size.ok_or_else(|| {
+            FilesystemError::Parse(format!(
+                "reiserfs: read_file({dir_id}, {objectid}) found no StatData item"
+            ))
+        })?;
+        // Truncate to the file's logical size (drops the NUL padding
+        // that tail-packed Direct items carry inside their 8-byte
+        // slots) and respect the caller's max_bytes ceiling.
+        let target = (size as usize).min(max_bytes);
+        if data.len() > target {
+            data.truncate(target);
+        }
+        Ok(data)
     }
 
     fn volume_label(&self) -> Option<&str> {
@@ -2343,6 +2418,86 @@ mod tests {
         assert_eq!(nested.name, "nested.txt");
         assert_eq!(nested.path, "/subdir/nested.txt");
         assert_eq!(nested.size, 11); // "nested file"
+    }
+
+    // ---- R.3d: read_file ----
+
+    #[test]
+    fn fixture_v3_6_read_hello_txt() {
+        let img = load_fixture("test_reiserfs_v3_6.img.zst");
+        let mut fs = ReiserFsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list");
+        let hello = entries.iter().find(|e| e.name == "hello.txt").unwrap();
+        let data = fs.read_file(hello, 4096).expect("read hello.txt");
+        assert_eq!(data, b"Hello, ReiserFS!");
+    }
+
+    #[test]
+    fn fixture_v3_6_read_tiny_txt_tail_packed() {
+        // tiny.txt is 10 bytes ("tiny bytes") stored fully in a DRCT
+        // item whose body is 16 bytes (NUL-padded to 8-byte slot).
+        // read_file must truncate to SD.size = 10 so the trailing NULs
+        // are dropped.
+        let img = load_fixture("test_reiserfs_v3_6.img.zst");
+        let mut fs = ReiserFsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list");
+        let tiny = entries.iter().find(|e| e.name == "tiny.txt").unwrap();
+        let data = fs.read_file(tiny, 1024).expect("read tiny.txt");
+        assert_eq!(data, b"tiny bytes");
+        assert_eq!(data.len(), 10);
+    }
+
+    #[test]
+    fn fixture_v3_6_read_large_bin_indirect() {
+        // large.bin is 24576 bytes (= 6 * 4096) generated by the python
+        // formula `(i * 37 + 11) & 0xFF`. Read it back and check the
+        // size + a few sentinel bytes.
+        let img = load_fixture("test_reiserfs_v3_6.img.zst");
+        let mut fs = ReiserFsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list");
+        let large = entries.iter().find(|e| e.name == "large.bin").unwrap();
+        let data = fs.read_file(large, 64 * 1024).expect("read large.bin");
+        assert_eq!(data.len(), 24576);
+        // Byte i = (i * 37 + 11) & 0xFF
+        for i in [0usize, 1, 100, 4095, 4096, 12345, 24575] {
+            let want = ((i * 37 + 11) & 0xFF) as u8;
+            assert_eq!(data[i], want, "mismatch at i={i}");
+        }
+    }
+
+    #[test]
+    fn fixture_v3_6_read_nested_txt_under_subdir() {
+        // /subdir/nested.txt is 11 bytes via DRCT, exercising the
+        // location-pack round-trip + read on a non-root child.
+        let img = load_fixture("test_reiserfs_v3_6.img.zst");
+        let mut fs = ReiserFsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list");
+        let subdir = entries.iter().find(|e| e.name == "subdir").unwrap();
+        let sub_entries = fs.list_directory(subdir).expect("list subdir");
+        let nested = sub_entries.iter().find(|e| e.name == "nested.txt").unwrap();
+        let data = fs.read_file(nested, 1024).expect("read nested.txt");
+        assert_eq!(data, b"nested file");
+    }
+
+    #[test]
+    fn fixture_v3_6_read_with_max_bytes_caps_output() {
+        // max_bytes < SD.size should clip the output. Use large.bin and
+        // cap at 100; data must equal the first 100 bytes of the file.
+        let img = load_fixture("test_reiserfs_v3_6.img.zst");
+        let mut fs = ReiserFsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list");
+        let large = entries.iter().find(|e| e.name == "large.bin").unwrap();
+        let clipped = fs.read_file(large, 100).expect("read clipped");
+        assert_eq!(clipped.len(), 100);
+        for (i, &byte) in clipped.iter().enumerate() {
+            let want = ((i * 37 + 11) & 0xFF) as u8;
+            assert_eq!(byte, want, "clipped mismatch at i={i}");
+        }
     }
 
     #[test]
