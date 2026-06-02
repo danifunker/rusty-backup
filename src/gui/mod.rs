@@ -1,3 +1,4 @@
+mod archives_tab;
 mod backup_tab;
 mod browse_view;
 mod bulk_convert_dialog;
@@ -17,6 +18,7 @@ mod settings_dialog;
 mod size_mode_row;
 pub mod ui_logger;
 
+use archives_tab::ArchivesTab;
 use backup_tab::BackupTab;
 use bulk_convert_dialog::{BulkConvertDialog, DialogAction as BulkConvertAction};
 use inspect_tab::InspectTab;
@@ -269,6 +271,7 @@ enum Tab {
     Restore,
     Inspect,
     Optical,
+    Archives,
 }
 
 /// Main application state.
@@ -278,6 +281,7 @@ pub struct RustyBackupApp {
     restore_tab: RestoreTab,
     inspect_tab: InspectTab,
     optical_tab: OpticalTab,
+    archives_tab: ArchivesTab,
     log_panel: LogPanel,
     progress: ProgressState,
     devices: Vec<DiskDevice>,
@@ -369,6 +373,7 @@ impl Default for RustyBackupApp {
             restore_tab: RestoreTab::default(),
             inspect_tab: InspectTab::default(),
             optical_tab,
+            archives_tab: ArchivesTab::default(),
             log_panel: log,
             progress: ProgressState::default(),
             devices,
@@ -569,6 +574,7 @@ impl eframe::App for RustyBackupApp {
                 ui.selectable_value(&mut self.active_tab, Tab::Restore, "Restore");
                 ui.selectable_value(&mut self.active_tab, Tab::Inspect, "Inspect");
                 ui.selectable_value(&mut self.active_tab, Tab::Optical, "Optical");
+                ui.selectable_value(&mut self.active_tab, Tab::Archives, "Archives");
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Version display
@@ -871,6 +877,9 @@ impl eframe::App for RustyBackupApp {
             Tab::Optical => {
                 self.optical_tab
                     .show(ui, &mut self.log_panel, &mut self.progress);
+            }
+            Tab::Archives => {
+                self.archives_tab.show(ui, &mut self.log_panel);
             }
         });
 

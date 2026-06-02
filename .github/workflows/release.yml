@@ -69,7 +69,23 @@ jobs:
 
       # Tests run upfront on the runner (i686 32-bit tests execute fine on the
       # x64 Windows runner). Failure fails the job and blocks the release.
+      #
+      # The 32-bit (i686) target has a ~2 GiB user address space. Some tests
+      # materialize large in-memory images (e.g. the 512 MiB XFS fixture, which
+      # is leaked once as a shared static, plus a writable per-test copy), so
+      # running the test binary multi-threaded stacks several 512 MiB+ buffers
+      # concurrently and aborts with "memory allocation of 536870912 bytes
+      # failed". Serialize the i686 test binary so only one heavy test's
+      # working set is live at a time; x64 has the address space to run in
+      # parallel.
+      - name: Test (i686, single-threaded)
+        if: matrix.arch == 'x86'
+        env:
+          RUST_TEST_THREADS: 1
+        run: cargo test --release --target ${{ matrix.target }}
+
       - name: Test
+        if: matrix.arch != 'x86'
         run: cargo test --release --target ${{ matrix.target }}
 
       - name: Build

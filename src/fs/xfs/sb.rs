@@ -28,7 +28,21 @@ pub struct XfsSuperblock {
     pub dblocks: u64,
     pub rblocks: u64,
     pub rextents: u64,
+    /// Internal-log location: first fsblock (`sb_logstart`, 0 = external log)
+    /// and length in blocks (`sb_logblocks`). The log's blocks are allocated
+    /// metadata that the ownership scan must account for.
+    pub logstart: u64,
+    pub logblocks: u32,
     pub rootino: u64,
+    /// Realtime bitmap / summary inodes (`sb_rbmino` / `sb_rsumino`). Always
+    /// allocated by mkfs even on non-realtime volumes; referenced only from
+    /// the superblock, so the connectivity check must treat them as roots.
+    pub rbmino: u64,
+    pub rsumino: u64,
+    /// Quota inodes (`sb_uquotino` / `sb_gquotino`). 0 or NULLFSINO when
+    /// quotas are disabled; otherwise superblock-referenced roots.
+    pub uquotino: u64,
+    pub gquotino: u64,
     pub agblocks: u32,
     pub agcount: u32,
     pub versionnum: u16,
@@ -42,6 +56,10 @@ pub struct XfsSuperblock {
     pub inopblog: u8,
     pub agblklog: u8,
     pub dirblklog: u8,
+    /// Inode-chunk start alignment in fsblocks (`sb_inoalignmt`). Inode chunks
+    /// begin on multiples of this; 0 means unaligned. Used by the repair
+    /// chunk-scanner to stride at the right granularity.
+    pub inoalignmt: u32,
     pub features2: u32,
     pub features_compat: u32,
     pub features_ro_compat: u32,
@@ -120,7 +138,13 @@ impl XfsSuperblock {
             dblocks: BigEndian::read_u64(&buf[8..16]),
             rblocks: BigEndian::read_u64(&buf[16..24]),
             rextents,
+            logstart: BigEndian::read_u64(&buf[48..56]),
+            logblocks: BigEndian::read_u32(&buf[96..100]),
             rootino: BigEndian::read_u64(&buf[56..64]),
+            rbmino: BigEndian::read_u64(&buf[64..72]),
+            rsumino: BigEndian::read_u64(&buf[72..80]),
+            uquotino: BigEndian::read_u64(&buf[160..168]),
+            gquotino: BigEndian::read_u64(&buf[168..176]),
             agblocks: BigEndian::read_u32(&buf[84..88]),
             agcount: BigEndian::read_u32(&buf[88..92]),
             versionnum,
@@ -134,11 +158,31 @@ impl XfsSuperblock {
             inopblog: buf[123],
             agblklog: buf[124],
             dirblklog: buf[192],
+            inoalignmt: BigEndian::read_u32(&buf[180..184]),
             features2,
             features_compat,
             features_ro_compat,
             features_incompat,
         })
+    }
+
+    /// Superblock-referenced "internal" inodes: the root plus realtime
+    /// bitmap/summary and (if quotas are on) quota inodes. These are
+    /// allocated but not reachable through the directory tree, so the
+    /// connectivity check seeds them as reachable roots. Filters out unset
+    /// slots (0 or NULLFSINO = all-ones).
+    pub fn internal_inodes(&self) -> Vec<u64> {
+        const NULLFSINO: u64 = u64::MAX;
+        [
+            self.rootino,
+            self.rbmino,
+            self.rsumino,
+            self.uquotino,
+            self.gquotino,
+        ]
+        .into_iter()
+        .filter(|&ino| ino != 0 && ino != NULLFSINO)
+        .collect()
     }
 
     /// True iff this is a v5 (CRC-enabled, dir3) filesystem.

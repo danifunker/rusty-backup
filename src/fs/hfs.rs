@@ -3878,6 +3878,11 @@ mod tests {
         assert!(utf8_to_mac_roman(text).is_err());
     }
 
+    // Allocates a ~512 MB in-memory image, which can't fit in the constrained
+    // address space of 32-bit targets (the parallel test runner aborts the
+    // process on the failed allocation). The overflow logic under test is
+    // pointer-width-independent, so restricting to 64-bit hosts loses nothing.
+    #[cfg(target_pointer_width = "64")]
     #[test]
     fn test_resize_hfs_rejects_u16_overflow() {
         // Build a minimal 500 MB HFS-like image with 8192-byte blocks. The u16

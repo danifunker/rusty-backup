@@ -9,6 +9,7 @@
 pub mod backup;
 pub mod batch;
 pub mod batch_template;
+pub mod binhex;
 pub mod bless;
 pub mod chmeta;
 pub mod completions;
@@ -35,5 +36,6 @@ pub mod setrsrc;
 pub mod setvolname;
 pub mod show;
 pub mod shrink;
+pub mod sit;
 pub mod terminal;
 pub mod write;

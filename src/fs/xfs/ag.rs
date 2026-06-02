@@ -13,6 +13,12 @@ pub struct XfsAgf {
     pub length: u32,
     pub bno_root: u32,
     pub cnt_root: u32,
+    /// AGFL circular-buffer indices + count (`agf_flfirst`/`fllast`/`flcount`).
+    /// The AGFL holds pre-reserved free-list blocks that are allocated
+    /// metadata, not part of the free-space btrees.
+    pub flfirst: u32,
+    pub fllast: u32,
+    pub flcount: u32,
     pub freeblks: u32,
 }
 
@@ -35,6 +41,9 @@ impl XfsAgf {
             length: BigEndian::read_u32(&buf[12..16]),
             bno_root: BigEndian::read_u32(&buf[16..20]),
             cnt_root: BigEndian::read_u32(&buf[20..24]),
+            flfirst: BigEndian::read_u32(&buf[40..44]),
+            fllast: BigEndian::read_u32(&buf[44..48]),
+            flcount: BigEndian::read_u32(&buf[48..52]),
             freeblks: BigEndian::read_u32(&buf[52..56]),
         })
     }

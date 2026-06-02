@@ -15,6 +15,8 @@ pub enum ResourceForkMode {
     AppleDouble,
     /// MacBinary III: single .bin file containing both forks
     MacBinary,
+    /// BinHex 4.0: single .hqx text file containing both forks + Finder info
+    BinHex,
     /// Separate .rsrc sidecar files
     SeparateRsrc,
     /// Skip resource forks entirely
@@ -27,15 +29,17 @@ impl ResourceForkMode {
             ResourceForkMode::Native => "Native resource fork",
             ResourceForkMode::AppleDouble => "AppleDouble (._file)",
             ResourceForkMode::MacBinary => "MacBinary III (.bin)",
+            ResourceForkMode::BinHex => "BinHex 4.0 (.hqx)",
             ResourceForkMode::SeparateRsrc => "Separate (.rsrc)",
             ResourceForkMode::DataForkOnly => "Data fork only",
         }
     }
 
-    pub const ALL: [ResourceForkMode; 5] = [
+    pub const ALL: [ResourceForkMode; 6] = [
         ResourceForkMode::Native,
         ResourceForkMode::AppleDouble,
         ResourceForkMode::MacBinary,
+        ResourceForkMode::BinHex,
         ResourceForkMode::SeparateRsrc,
         ResourceForkMode::DataForkOnly,
     ];

@@ -16,6 +16,29 @@ pub const XFS_AGI_MAGIC: u32 = 0x5841_4749;
 /// Inode magic ("IN"), big-endian.
 pub const XFS_DINODE_MAGIC: u16 = 0x494E;
 
+/// Inode-allocation btree magic ("IABT", v4) and its v5/CRC variant ("IAB3").
+pub const XFS_IBT_MAGIC: u32 = 0x4941_4254;
+pub const XFS_IBT_CRC_MAGIC: u32 = 0x4941_4233;
+
+/// Free-space btree magics: by-block ("ABTB"/"AB3B") and by-count
+/// ("ABTC"/"AB3C"). Used by the allocation-walk phase.
+pub const XFS_ABTB_MAGIC: u32 = 0x4142_5442;
+pub const XFS_ABTB_CRC_MAGIC: u32 = 0x4142_3342;
+pub const XFS_ABTC_MAGIC: u32 = 0x4142_5443;
+pub const XFS_ABTC_CRC_MAGIC: u32 = 0x4142_3343;
+
+/// Short-form (AG-relative) btree block header length. v4 is
+/// magic(4)+level(2)+numrecs(2)+leftsib(4)+rightsib(4) = 16; v5/CRC adds
+/// blkno(8)+lsn(8)+uuid(16)+owner(4)+crc(4) = +40 → 56.
+pub const XFS_BTREE_SBLOCK_LEN: usize = 16;
+pub const XFS_BTREE_SBLOCK_CRC_LEN: usize = 56;
+
+/// Sentinel AG-relative block pointer ("no sibling / no child").
+pub const NULLAGBLOCK: u32 = 0xFFFF_FFFF;
+
+/// Inodes per inobt record / chunk (the `ir_free` bitmask is 64 bits).
+pub const XFS_INODES_PER_CHUNK: usize = 64;
+
 /// Low nibble of `sb_versionnum` carries the format version.
 pub const XFS_SB_VERSION_NUMBITS: u16 = 0x000F;
 pub const XFS_SB_VERSION_4: u16 = 4;

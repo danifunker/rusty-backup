@@ -18,9 +18,17 @@
 
 pub mod ag;
 pub mod bmap;
+pub mod btree_build;
 pub mod dir1;
 pub mod dir2;
+pub mod dir_repair;
+pub mod edit;
+pub mod freespace_rebuild;
+pub mod fsck;
+pub mod inobt_repair;
 pub mod inode;
+pub mod inode_repair;
+pub mod repair;
 pub mod sb;
 pub mod symlink;
 pub mod types;
@@ -108,7 +116,10 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
     /// Read a full on-disk inode buffer (sized to `sb.inodesize`). Returns
     /// the parsed core and the raw bytes so callers can also slice into the
     /// fork without a second seek.
-    fn read_inode_buf(&mut self, ino: u64) -> Result<(XfsDinodeCore, Vec<u8>), FilesystemError> {
+    pub(crate) fn read_inode_buf(
+        &mut self,
+        ino: u64,
+    ) -> Result<(XfsDinodeCore, Vec<u8>), FilesystemError> {
         let part_off = inode_byte_offset(
             ino,
             self.sb.agblocks,
@@ -181,7 +192,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
     /// Decode the full extent list from either an inline-extents inode
     /// (`di_format == Extents`) or a bmap-btree inode (`di_format == Btree`).
     /// Returned records are sorted by file offset.
-    fn decode_data_extents(
+    pub(crate) fn decode_data_extents(
         &mut self,
         core: &XfsDinodeCore,
         inode_buf: &[u8],
@@ -297,7 +308,11 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
     }
 
     /// Read the bytes of one filesystem block at `fsblock` into `out`.
-    fn read_fsblock(&mut self, fsblock: u64, out: &mut [u8]) -> Result<(), FilesystemError> {
+    pub(crate) fn read_fsblock(
+        &mut self,
+        fsblock: u64,
+        out: &mut [u8],
+    ) -> Result<(), FilesystemError> {
         let bs = self.sb.blocksize as u64;
         let part_byte = fsblock_to_partition_byte(
             fsblock,
@@ -828,6 +843,10 @@ impl<R: Read + Seek + Send> Filesystem for XfsFilesystem<R> {
     fn last_data_byte(&mut self) -> Result<u64, FilesystemError> {
         Ok(self.total_size())
     }
+
+    fn fsck(&mut self) -> Option<Result<crate::fs::fsck::FsckResult, FilesystemError>> {
+        Some(self.run_fsck())
+    }
 }
 
 /// Look up an extent record covering file fsblock `fb`. Returns
@@ -1030,6 +1049,768 @@ mod tests {
         assert_eq!(fs.fs_type(), "XFS v2");
         assert_eq!(fs.volume_label(), Some("RUSTYTEST"));
         assert_eq!(fs.total_size(), 131_072u64 * 4096);
+    }
+
+    #[test]
+    fn fsck_clean_v4_fixture_reports_no_errors() {
+        let img = load_fixture();
+        let mut fs = XfsFilesystem::open(Cursor::new(img), 0).expect("open xfs");
+        let res = fs.run_fsck().expect("fsck runs");
+        assert!(
+            res.errors.is_empty(),
+            "clean fixture should have no errors, got: {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+        assert!(!res.repairable);
+        // Phase 3 ran and found no orphans on a healthy volume.
+        assert!(res.orphaned_entries.is_empty());
+        assert!(res.stats.extra.iter().any(|(k, _)| k == "Reachable inodes"));
+        // Stats should report the two allocation groups.
+        let ags = res
+            .stats
+            .extra
+            .iter()
+            .find(|(k, _)| k == "Allocation groups")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(ags, Some("2"));
+    }
+
+    #[test]
+    fn fsck_phase2_enumerates_inodes_and_claims_blocks() {
+        // Proves the Phase 2 inode-btree walk + block-ownership map ran end
+        // to end on real mkfs output: the fixture has hello.txt + readme.txt
+        // + a symlink in root and a nested file under subdir/, so we expect
+        // at least 2 files and 2 directories scanned and some claimed blocks.
+        let img = load_fixture();
+        let mut fs = XfsFilesystem::open(Cursor::new(img), 0).expect("open xfs");
+        let res = fs.run_fsck().expect("fsck runs");
+        assert!(
+            res.errors.is_empty(),
+            "{:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+        assert!(
+            res.stats.files_checked >= 2,
+            "expected >=2 files, got {}",
+            res.stats.files_checked
+        );
+        assert!(
+            res.stats.directories_checked >= 2,
+            "expected >=2 dirs (root + subdir), got {}",
+            res.stats.directories_checked
+        );
+        let scanned = res
+            .stats
+            .extra
+            .iter()
+            .any(|(k, v)| k == "Blocks scanned" && v != "0 claimed");
+        assert!(scanned, "expected non-zero claimed blocks");
+    }
+
+    #[test]
+    fn fsck_tolerates_null_rootino_in_secondary_superblock() {
+        // Real mkfs.xfs leaves rootino/rbmino/rsumino as NULLFSINO in the
+        // secondary superblocks (verified via `xfs_db -c 'sb 2'`). The
+        // verifier must NOT flag that as a ReplicaSbMismatch — only geometry
+        // fields are replicated. Set AG 1's secondary rootino to NULLFSINO
+        // (offset 56..64) and confirm no mismatch is reported.
+        let mut img = load_fixture().to_vec();
+        let ag1 = 65_536usize * 4096;
+        img[ag1 + 56..ag1 + 64].copy_from_slice(&u64::MAX.to_be_bytes());
+        let mut fs = XfsFilesystem::open(Cursor::new(img), 0).expect("open xfs");
+        let res = fs.run_fsck().expect("fsck runs");
+        assert!(
+            !res.errors.iter().any(|e| e.code == "ReplicaSbMismatch"),
+            "null rootino in a secondary must not be a mismatch, got: {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn fsck_detects_unaccounted_blocks() {
+        // Shrink AG 0's bnobt first free record's blockcount so the freed
+        // blocks vanish from the free list while staying unclaimed -> leaked.
+        // (This also trips AgfFreeblksMismatch; we only assert the leak.)
+        let mut img = load_fixture().to_vec();
+        let bno_root = u32::from_be_bytes(img[512 + 16..512 + 20].try_into().unwrap()) as usize;
+        let rec0 = bno_root * 4096 + 16;
+        let orig = u32::from_be_bytes(img[rec0 + 4..rec0 + 8].try_into().unwrap());
+        assert!(orig > 10, "fixture first free extent should be sizable");
+        img[rec0 + 4..rec0 + 8].copy_from_slice(&(orig - 10).to_be_bytes());
+        let mut fs = XfsFilesystem::open(Cursor::new(img), 0).expect("open xfs");
+        let res = fs.run_fsck().expect("fsck runs");
+        assert!(
+            res.errors.iter().any(|e| e.code == "UnaccountedBlocks"),
+            "expected UnaccountedBlocks, got: {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn fsck_detects_free_block_also_claimed_by_inode() {
+        // Patch AG 0's bnobt so a free extent overlaps the root inode chunk
+        // (agbno 8..12, marked S_INO). Read bno_root from the AGF (byte
+        // 512+16), find the leaf's first record (block*4096 + 16 header), and
+        // rewrite it to (startblock=8, blockcount=4). Expect FreeBlockClaimed.
+        let mut img = load_fixture().to_vec();
+        let bno_root = u32::from_be_bytes(img[512 + 16..512 + 20].try_into().unwrap()) as usize;
+        let rec0 = bno_root * 4096 + 16; // v4 short-form btree header = 16 bytes
+        img[rec0..rec0 + 4].copy_from_slice(&8u32.to_be_bytes()); // startblock
+        img[rec0 + 4..rec0 + 8].copy_from_slice(&4u32.to_be_bytes()); // blockcount
+        let mut fs = XfsFilesystem::open(Cursor::new(img), 0).expect("open xfs");
+        let res = fs.run_fsck().expect("fsck runs");
+        assert!(
+            res.errors.iter().any(|e| e.code == "FreeBlockClaimed"),
+            "expected FreeBlockClaimed, got: {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn fsck_detects_corrupted_ag_superblock_replica() {
+        // Corrupt AG 1's superblock replica: flip its dblocks field so it
+        // disagrees with the primary. AG 1 starts at agblocks*blocksize =
+        // 65536 * 4096. The replica's dblocks is at offset 8..16.
+        let mut img = load_fixture().to_vec();
+        let ag1 = 65_536usize * 4096;
+        img[ag1 + 8..ag1 + 16].copy_from_slice(&0xDEADu64.to_be_bytes());
+        let mut fs = XfsFilesystem::open(Cursor::new(img), 0).expect("open xfs");
+        let res = fs.run_fsck().expect("fsck runs");
+        assert!(
+            res.errors.iter().any(|e| e.code == "ReplicaSbMismatch"),
+            "expected ReplicaSbMismatch, got: {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+        // A replica mismatch is repairable (R4 rewrites it from primary).
+        assert!(res.repairable);
+    }
+
+    #[test]
+    fn fsck_detects_agf_freeblks_mismatch() {
+        // Corrupt AG 0's AGF freeblks summary so it disagrees with the
+        // free-space btree walk. AGF is sector 1 (byte 512); freeblks is at
+        // AGF offset 52..56 (see ag.rs). Expect AgfFreeblksMismatch.
+        let mut img = load_fixture().to_vec();
+        let agf_freeblks = 512 + 52;
+        img[agf_freeblks..agf_freeblks + 4].copy_from_slice(&0u32.to_be_bytes());
+        let mut fs = XfsFilesystem::open(Cursor::new(img), 0).expect("open xfs");
+        let res = fs.run_fsck().expect("fsck runs");
+        assert!(
+            res.errors.iter().any(|e| e.code == "AgfFreeblksMismatch"),
+            "expected AgfFreeblksMismatch, got: {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn repair_r4b_rewrites_agf_agi_summaries() {
+        // R4b round-trip: corrupt AG 0's AGF freeblks (byte 512+52) and AGI
+        // count/freecount (byte 1024+16, 1024+28), run repair(), confirm the
+        // verifier reports clean. Validates the summary-rewrite path.
+        use crate::fs::filesystem::EditableFilesystem;
+        let mut img = load_fixture().to_vec();
+        img[512 + 52..512 + 56].copy_from_slice(&0u32.to_be_bytes()); // AGF freeblks
+        img[1024 + 16..1024 + 20].copy_from_slice(&111u32.to_be_bytes()); // AGI count
+        img[1024 + 28..1024 + 32].copy_from_slice(&111u32.to_be_bytes()); // AGI freecount
+
+        // Pre-repair: verifier flags the freeblks mismatch.
+        {
+            let mut fs = XfsFilesystem::open(Cursor::new(img.as_slice()), 0).expect("open");
+            let res = fs.run_fsck().expect("fsck");
+            assert!(res.errors.iter().any(|e| e.code == "AgfFreeblksMismatch"));
+        }
+
+        let mut cursor = Cursor::new(img);
+        let report = {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable");
+            fs.repair().expect("repair runs")
+        };
+        assert_eq!(report.fixes_failed.len(), 0, "{:?}", report.fixes_failed);
+        assert!(
+            report
+                .fixes_applied
+                .iter()
+                .any(|f| f.contains("AGF freeblks")),
+            "expected AGF freeblks fix, got: {:?}",
+            report.fixes_applied
+        );
+        assert!(
+            report.fixes_applied.iter().any(|f| f.contains("AGI count")),
+            "expected AGI count fix, got: {:?}",
+            report.fixes_applied
+        );
+
+        let repaired = cursor.into_inner();
+        let mut fs = XfsFilesystem::open(Cursor::new(repaired), 0).expect("reopen");
+        let res = fs.run_fsck().expect("fsck after repair");
+        assert!(
+            res.errors.is_empty(),
+            "expected clean after repair, got: {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn repair_r4_rewrites_corrupted_secondary_superblock() {
+        // R4 round-trip: corrupt AG 1's secondary superblock geometry
+        // (agblocks @ 84..88 and dblocks @ 8..16), run repair(), then confirm
+        // the verifier reports clean. Proves the replica-rewrite end to end
+        // without any btree writes.
+        use crate::fs::filesystem::EditableFilesystem;
+        let mut img = load_fixture().to_vec();
+        let ag1 = 65_536usize * 4096;
+        img[ag1 + 8..ag1 + 16].copy_from_slice(&0xDEADu64.to_be_bytes());
+        img[ag1 + 84..ag1 + 88].copy_from_slice(&0x1234u32.to_be_bytes());
+
+        // Pre-repair: verifier flags the mismatch.
+        {
+            let mut fs = XfsFilesystem::open(Cursor::new(img.as_slice()), 0).expect("open");
+            let res = fs.run_fsck().expect("fsck");
+            assert!(res.errors.iter().any(|e| e.code == "ReplicaSbMismatch"));
+        }
+
+        // Repair in place (Cursor<Vec<u8>> is Read + Write + Seek).
+        let mut cursor = Cursor::new(img);
+        let report = {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable");
+            fs.repair().expect("repair runs")
+        };
+        assert_eq!(report.fixes_failed.len(), 0, "{:?}", report.fixes_failed);
+        assert!(
+            report.fixes_applied.iter().any(|f| f.contains("AG 1")),
+            "expected an AG 1 fix, got: {:?}",
+            report.fixes_applied
+        );
+
+        // Post-repair: verifier is clean.
+        let repaired = cursor.into_inner();
+        let mut fs = XfsFilesystem::open(Cursor::new(repaired), 0).expect("reopen");
+        let res = fs.run_fsck().expect("fsck after repair");
+        assert!(
+            res.errors.is_empty(),
+            "expected clean after repair, got: {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn repair_r5_recomputes_inode_nblocks() {
+        // R5 round-trip: hello.txt (inode 131) is an inline-extents regular
+        // file. Corrupt its di_nblocks (core offset 64) to a bogus value, run
+        // repair(), and confirm R5 recomputes it back to the true block count
+        // (the extent-list sum) — and that the verifier stays clean.
+        use crate::fs::filesystem::EditableFilesystem;
+        let mut img = load_fixture().to_vec();
+
+        // Locate inode 131 and snapshot its true nblocks before corrupting.
+        let (ino_byte, true_nblocks) = {
+            let mut fs = XfsFilesystem::open(Cursor::new(img.as_slice()), 0).expect("open");
+            let sb = fs.superblock().clone();
+            let byte = inode_byte_offset(
+                131,
+                sb.agblocks,
+                sb.agblklog,
+                sb.inopblog,
+                sb.blocksize,
+                sb.inodesize,
+            ) as usize;
+            let core = fs.read_inode(131).expect("read inode 131");
+            assert!(core.is_regular(), "inode 131 should be a regular file");
+            assert!(core.nblocks > 0, "expected a real block count");
+            (byte, core.nblocks)
+        };
+
+        // Corrupt di_nblocks (u64 at core offset 64).
+        img[ino_byte + 64..ino_byte + 72].copy_from_slice(&9999u64.to_be_bytes());
+
+        let mut cursor = Cursor::new(img);
+        let report = {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable");
+            fs.repair().expect("repair runs")
+        };
+        assert_eq!(report.fixes_failed.len(), 0, "{:?}", report.fixes_failed);
+        assert!(
+            report
+                .fixes_applied
+                .iter()
+                .any(|f| f.contains("di_nblocks")),
+            "expected an inode-core fix, got: {:?}",
+            report.fixes_applied
+        );
+
+        let repaired = cursor.into_inner();
+        let mut fs = XfsFilesystem::open(Cursor::new(repaired), 0).expect("reopen");
+        let core = fs.read_inode(131).expect("reread inode 131");
+        assert_eq!(core.nblocks, true_nblocks, "di_nblocks not restored");
+        let res = fs.run_fsck().expect("fsck after repair");
+        assert!(
+            res.errors.is_empty(),
+            "expected clean after repair, got: {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn repair_r7_reconnects_orphan_into_lost_found() {
+        // Create a file, then orphan it by dropping the root's last short-form
+        // entry (decrement count + di_size in the inode bytes) while leaving the
+        // inode allocated. repair() should reconnect it into /lost+found and the
+        // verifier should be clean.
+        use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem};
+        use std::io::Cursor as IoCursor;
+
+        let img = load_fixture().to_vec();
+        let mut cursor = Cursor::new(img);
+        // Snapshot the pre-create root sf size + entry count, then add a file.
+        let (root_byte, root_size0, orphan_ino) = {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable");
+            let sb = fs.superblock().clone();
+            let byte = inode_byte_offset(
+                128,
+                sb.agblocks,
+                sb.agblklog,
+                sb.inopblog,
+                sb.blocksize,
+                sb.inodesize,
+            ) as usize;
+            let size0 = fs.read_inode(128).expect("root").size;
+            let root = fs.root().expect("root");
+            let mut data = IoCursor::new(vec![7u8; 2000]);
+            let e = fs
+                .create_file(
+                    &root,
+                    "orphanme",
+                    &mut data,
+                    2000,
+                    &CreateFileOptions::default(),
+                )
+                .expect("create");
+            fs.sync_metadata().expect("sync");
+            (byte, size0, e.location)
+        };
+        let count0 = 4u8; // fixture root: hello.txt, readme.txt, subdir, link
+
+        // Orphan it: drop the just-added last entry by restoring the original
+        // count byte (fork offset 100) and di_size (core offset 56).
+        let mut img = cursor.into_inner();
+        img[root_byte + 100] = count0;
+        img[root_byte + 56..root_byte + 64].copy_from_slice(&root_size0.to_be_bytes());
+
+        // Pre-repair: the verifier flags the orphan.
+        {
+            let mut fs = XfsFilesystem::open(Cursor::new(img.as_slice()), 0).expect("open");
+            let res = fs.run_fsck().expect("fsck");
+            assert!(
+                res.errors.iter().any(|e| e.code == "OrphanInode"),
+                "expected OrphanInode, got {:?}",
+                res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+            );
+        }
+
+        let mut cursor = Cursor::new(img);
+        let report = {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable");
+            fs.repair().expect("repair")
+        };
+        assert!(
+            report
+                .fixes_applied
+                .iter()
+                .any(|f| f.contains("lost+found")),
+            "expected a reconnect fix, got {:?}",
+            report.fixes_applied
+        );
+
+        let repaired = cursor.into_inner();
+        let mut fs = XfsFilesystem::open(Cursor::new(repaired), 0).expect("reopen");
+        let root = fs.root().expect("root");
+        let lf = fs
+            .list_directory(&root)
+            .expect("list")
+            .into_iter()
+            .find(|e| e.name == "lost+found")
+            .expect("lost+found created");
+        assert!(lf.is_directory());
+        let reconnected: Vec<u64> = fs
+            .list_directory(&lf)
+            .expect("list lf")
+            .into_iter()
+            .map(|e| e.location)
+            .collect();
+        assert!(reconnected.contains(&orphan_ino), "orphan not reconnected");
+        let res = fs.run_fsck().expect("fsck after");
+        assert!(
+            res.errors.is_empty(),
+            "expected clean, got {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn shortform_to_block_dir_conversion() {
+        // Add enough files to overflow the inline root directory, forcing a
+        // short-form -> single-block conversion (exercises the dir2 block
+        // builder + hash leaf index on the ftype-enabled fixture). All entries
+        // must list, the originals survive, a sample reads back, and the volume
+        // stays clean.
+        use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem};
+        use std::io::Cursor as IoCursor;
+        let sample: Vec<u8> = (0..1234u32).map(|i| (i % 251) as u8).collect();
+
+        let img = load_fixture().to_vec();
+        let mut cursor = Cursor::new(img);
+        {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable");
+            let root = fs.root().expect("root");
+            for i in 0..20 {
+                let mut data = IoCursor::new(sample.clone());
+                fs.create_file(
+                    &root,
+                    &format!("added_{i:02}.dat"),
+                    &mut data,
+                    sample.len() as u64,
+                    &CreateFileOptions::default(),
+                )
+                .unwrap_or_else(|e| panic!("create_file {i}: {e}"));
+            }
+            fs.sync_metadata().expect("sync");
+        }
+
+        let repaired = cursor.into_inner();
+        let mut fs = XfsFilesystem::open(Cursor::new(repaired), 0).expect("reopen");
+        let root = fs.root().expect("root");
+        // Root must now be a block (extents) directory, not short-form.
+        assert_ne!(
+            fs.read_inode(root.location).expect("root core").format,
+            DiFormat::Local,
+            "root should have converted out of short-form"
+        );
+        let entries = fs.list_directory(&root).expect("list");
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        for i in 0..20 {
+            let want = format!("added_{i:02}.dat");
+            assert!(
+                names.contains(&want.as_str()),
+                "missing {want} in {names:?}"
+            );
+        }
+        // Originals survive.
+        assert!(names.contains(&"hello.txt"), "original lost: {names:?}");
+        // A sample reads back intact.
+        let e = entries.iter().find(|e| e.name == "added_07.dat").unwrap();
+        let got = fs.read_file(e, sample.len() + 4096).expect("read");
+        assert_eq!(&got[..sample.len()], &sample[..], "data mismatch");
+        let res = fs.run_fsck().expect("fsck");
+        assert!(
+            res.errors.is_empty(),
+            "expected clean, got {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn delete_entry_frees_inode_and_blocks() {
+        // Create a file + an empty dir, then delete both; the volume returns to
+        // a clean state with the entries gone and free space recovered.
+        use crate::fs::filesystem::{
+            CreateDirectoryOptions, CreateFileOptions, EditableFilesystem,
+        };
+        use std::io::Cursor as IoCursor;
+        let payload: Vec<u8> = (0..6000u32).map(|i| (i % 251) as u8).collect();
+
+        let img = load_fixture().to_vec();
+        let mut cursor = Cursor::new(img);
+        let free_before;
+        {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable");
+            free_before = fs.free_space().expect("free");
+            let root = fs.root().expect("root");
+            let mut data = IoCursor::new(payload.clone());
+            fs.create_file(
+                &root,
+                "tmp.bin",
+                &mut data,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create_file");
+            fs.create_directory(&root, "tmpdir", &CreateDirectoryOptions::default())
+                .expect("mkdir");
+            fs.sync_metadata().expect("sync");
+        }
+        // Reopen and delete both.
+        {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("reopen editable");
+            let root = fs.root().expect("root");
+            let entries = fs.list_directory(&root).expect("list");
+            for nm in ["tmp.bin", "tmpdir"] {
+                let e = entries.iter().find(|e| e.name == nm).expect("entry");
+                fs.delete_entry(&root, e).expect("delete");
+            }
+            fs.sync_metadata().expect("sync");
+        }
+
+        let repaired = cursor.into_inner();
+        let mut fs = XfsFilesystem::open(Cursor::new(repaired), 0).expect("reopen");
+        let root = fs.root().expect("root");
+        let names: Vec<String> = fs
+            .list_directory(&root)
+            .expect("list")
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(
+            !names.contains(&"tmp.bin".to_string()),
+            "file not removed: {names:?}"
+        );
+        assert!(
+            !names.contains(&"tmpdir".to_string()),
+            "dir not removed: {names:?}"
+        );
+        // The original fixture entries survive.
+        assert!(
+            names.contains(&"hello.txt".to_string()),
+            "sibling lost: {names:?}"
+        );
+        // Free space is fully reclaimed (delete is the inverse of create).
+        let free_after = fs.free_space().expect("free");
+        assert_eq!(free_after, free_before, "free space not fully reclaimed");
+        let res = fs.run_fsck().expect("fsck");
+        assert!(
+            res.errors.is_empty(),
+            "expected clean, got {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn create_file_in_shortform_root_roundtrips_data() {
+        // Allocate an inode + data blocks + insert: create /payload.bin with a
+        // known pattern, then read it back byte-for-byte and confirm the volume
+        // stays clean.
+        use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem};
+        use std::io::Cursor as IoCursor;
+        let payload: Vec<u8> = (0..9000u32).map(|i| (i % 251) as u8).collect();
+
+        let img = load_fixture().to_vec();
+        let mut cursor = Cursor::new(img);
+        {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable");
+            let root = fs.root().expect("root");
+            let mut data = IoCursor::new(payload.clone());
+            fs.create_file(
+                &root,
+                "payload.bin",
+                &mut data,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create_file");
+            fs.sync_metadata().expect("sync");
+        }
+
+        let repaired = cursor.into_inner();
+        let mut fs = XfsFilesystem::open(Cursor::new(repaired), 0).expect("reopen");
+        let root = fs.root().expect("root");
+        let entry = fs
+            .list_directory(&root)
+            .expect("list")
+            .into_iter()
+            .find(|e| e.name == "payload.bin")
+            .expect("file listed");
+        assert!(!entry.is_directory());
+        assert_eq!(entry.size, payload.len() as u64, "size mismatch");
+        let read_back = fs
+            .read_file(&entry, payload.len() + 4096)
+            .expect("read_file");
+        assert_eq!(&read_back[..payload.len()], &payload[..], "data mismatch");
+        let res = fs.run_fsck().expect("fsck");
+        assert!(
+            res.errors.is_empty(),
+            "expected clean, got {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn create_directory_in_shortform_root() {
+        // Allocate an inode + insert a short-form entry: create /made_dir under
+        // the root, then confirm it lists, is an empty directory, the root link
+        // count bumped, and the verifier stays clean.
+        use crate::fs::filesystem::{CreateDirectoryOptions, EditableFilesystem};
+        let img = load_fixture().to_vec();
+        let mut cursor = Cursor::new(img);
+        let new_ino = {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable");
+            let root = fs.root().expect("root");
+            let root_nlink = fs.read_inode(root.location).expect("root inode").nlink;
+            let entry = fs
+                .create_directory(&root, "made_dir", &CreateDirectoryOptions::default())
+                .expect("create_directory");
+            fs.sync_metadata().expect("sync");
+            // Root gained a subdirectory -> nlink + 1.
+            let after = fs.read_inode(root.location).expect("root inode").nlink;
+            assert_eq!(after, root_nlink + 1, "root nlink not bumped");
+            entry.location
+        };
+
+        let repaired = cursor.into_inner();
+        let mut fs = XfsFilesystem::open(Cursor::new(repaired), 0).expect("reopen");
+        let root = fs.root().expect("root");
+        let names: Vec<String> = fs
+            .list_directory(&root)
+            .expect("list")
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(
+            names.contains(&"made_dir".to_string()),
+            "not listed: {names:?}"
+        );
+        let core = fs.read_inode(new_ino).expect("new dir inode");
+        assert!(core.is_dir(), "new inode is not a directory");
+        assert_eq!(core.nlink, 2, "empty dir should have nlink 2");
+        // The new directory is empty and listable.
+        let made = fs
+            .list_directory(&root)
+            .expect("list")
+            .into_iter()
+            .find(|e| e.name == "made_dir")
+            .expect("entry");
+        assert!(fs.list_directory(&made).expect("list new dir").is_empty());
+        let res = fs.run_fsck().expect("fsck");
+        assert!(
+            res.errors.is_empty(),
+            "expected clean, got {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn repair_r7_recomputes_inode_nlink() {
+        // R7 link-count half: corrupt the root directory's nlink (v2 inodes ->
+        // di_nlink at core offset 16), repair(), and confirm R7 recomputes it
+        // from the directory graph (root has one subdir -> nlink 3) and the
+        // verifier stays clean.
+        use crate::fs::filesystem::EditableFilesystem;
+        let mut img = load_fixture().to_vec();
+        let (ino_byte, true_nlink) = {
+            let mut fs = XfsFilesystem::open(Cursor::new(img.as_slice()), 0).expect("open");
+            let sb = fs.superblock().clone();
+            let byte = inode_byte_offset(
+                128,
+                sb.agblocks,
+                sb.agblklog,
+                sb.inopblog,
+                sb.blocksize,
+                sb.inodesize,
+            ) as usize;
+            let core = fs.read_inode(128).expect("root inode");
+            (byte, core.nlink)
+        };
+        // Corrupt di_nlink (u32 at core offset 16).
+        img[ino_byte + 16..ino_byte + 20].copy_from_slice(&99u32.to_be_bytes());
+
+        let mut cursor = Cursor::new(img);
+        let report = {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable");
+            fs.repair().expect("repair runs")
+        };
+        assert_eq!(report.fixes_failed.len(), 0, "{:?}", report.fixes_failed);
+        assert!(
+            report
+                .fixes_applied
+                .iter()
+                .any(|f| f.contains("link counts")),
+            "expected an nlink fix, got: {:?}",
+            report.fixes_applied
+        );
+
+        let repaired = cursor.into_inner();
+        let mut fs = XfsFilesystem::open(Cursor::new(repaired), 0).expect("reopen");
+        assert_eq!(fs.read_inode(128).expect("reread").nlink, true_nlink);
+        let res = fs.run_fsck().expect("fsck after repair");
+        assert!(
+            res.errors.is_empty(),
+            "expected clean, got {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn repair_r6_drops_dangling_shortform_entry() {
+        // R6 round-trip: free hello.txt (inode 131) by zeroing its mode, then
+        // repair(). R3 frees it in the inobt, R2 reclaims its blocks, and R6
+        // drops the now-dangling 'hello.txt' entry from the short-form root.
+        // Afterwards the verifier is clean and the entry is gone.
+        use crate::fs::filesystem::EditableFilesystem;
+        let mut img = load_fixture().to_vec();
+        let ino_byte = {
+            let fs = XfsFilesystem::open(Cursor::new(img.as_slice()), 0).expect("open");
+            let sb = fs.superblock().clone();
+            inode_byte_offset(
+                131,
+                sb.agblocks,
+                sb.agblklog,
+                sb.inopblog,
+                sb.blocksize,
+                sb.inodesize,
+            ) as usize
+        };
+        // Zero di_mode (u16 at core offset 2) -> inode reads as free.
+        img[ino_byte + 2..ino_byte + 4].copy_from_slice(&0u16.to_be_bytes());
+
+        // Pre-repair: zeroing only the mode (not the inobt) makes the verifier
+        // flag the inode as allocated-but-zeroed; R3 then frees it in the inobt
+        // and R6 drops the entry that pointed at it.
+        {
+            let mut fs = XfsFilesystem::open(Cursor::new(img.as_slice()), 0).expect("open");
+            let res = fs.run_fsck().expect("fsck");
+            assert!(
+                res.errors.iter().any(|e| e.code == "AllocatedInodeZeroed"),
+                "expected AllocatedInodeZeroed, got {:?}",
+                res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+            );
+        }
+
+        let mut cursor = Cursor::new(img);
+        let report = {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable");
+            fs.repair().expect("repair runs")
+        };
+        assert_eq!(report.fixes_failed.len(), 0, "{:?}", report.fixes_failed);
+        assert!(
+            report
+                .fixes_applied
+                .iter()
+                .any(|f| f.contains("dangling shortform")),
+            "expected a dangling-entry fix, got: {:?}",
+            report.fixes_applied
+        );
+
+        let repaired = cursor.into_inner();
+        let mut fs = XfsFilesystem::open(Cursor::new(repaired), 0).expect("reopen");
+        let root = fs.root().expect("root");
+        let names: Vec<String> = fs
+            .list_directory(&root)
+            .expect("list")
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(
+            !names.contains(&"hello.txt".to_string()),
+            "entry not dropped: {names:?}"
+        );
+        assert!(
+            names.contains(&"readme.txt".to_string()),
+            "sibling lost: {names:?}"
+        );
+        let res = fs.run_fsck().expect("fsck after repair");
+        assert!(
+            res.errors.is_empty(),
+            "expected clean after repair, got: {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
     }
 
     #[test]

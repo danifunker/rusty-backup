@@ -104,6 +104,16 @@ pub enum Command {
     #[command(name = "put-macbinary")]
     PutMacBinary(verbs::put_macbinary::PutMacBinaryArgs),
 
+    /// Decode a BinHex 4.0 (.hqx) file and write it (both forks + Finder
+    /// info) into a filesystem.
+    #[command(name = "put-binhex")]
+    PutBinHex(verbs::binhex::PutBinHexArgs),
+
+    /// Extract a file and encode it as BinHex 4.0 (.hqx), preserving both
+    /// forks and the type/creator codes.
+    #[command(name = "get-binhex")]
+    GetBinHex(verbs::binhex::GetBinHexArgs),
+
     /// Resize the filesystem at IMG@N to a new size (FAT/NTFS/exFAT/HFS+/
     /// ext/btrfs/SFS/PFS3/AFFS/EFS — whichever magic matches).
     Resize(verbs::resize::ResizeArgs),
@@ -165,6 +175,13 @@ pub enum Command {
         cmd: verbs::partmap::PartmapCommand,
     },
 
+    /// Read classic StuffIt archives (list / extract; accepts .sit, .sea,
+    /// and BinHex-wrapped .sit.hqx).
+    Sit {
+        #[command(subcommand)]
+        cmd: verbs::sit::SitCommand,
+    },
+
     /// Open an interactive rb-cli shell (rustyline-based REPL).
     Terminal,
 
@@ -215,6 +232,8 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Setvolname(args) => verbs::setvolname::run(args),
         Command::Reformat(args) => verbs::reformat::run(args),
         Command::PutMacBinary(args) => verbs::put_macbinary::run(args),
+        Command::PutBinHex(args) => verbs::binhex::run_put(args),
+        Command::GetBinHex(args) => verbs::binhex::run_get(args),
         Command::Resize(args) => verbs::resize::run(args),
         Command::Expand(args) => verbs::expand::run(args),
         Command::Grow(args) => verbs::grow::run(args),
@@ -229,6 +248,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Show { cmd } => verbs::show::run(cmd),
         Command::Optical { cmd } => verbs::optical::run(cmd),
         Command::Partmap { cmd } => verbs::partmap::run(cmd),
+        Command::Sit { cmd } => verbs::sit::run(cmd),
         Command::Terminal => verbs::terminal::run(),
         Command::Completions(args) => verbs::completions::run_emit(args),
         Command::InstallCompletions(args) => verbs::completions::run_install(args),

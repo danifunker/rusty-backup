@@ -1,6 +1,7 @@
 pub mod affs;
 pub mod affs_common;
 pub mod affs_fsck;
+pub mod binhex;
 pub mod btrfs;
 pub mod efs;
 pub mod efs_fsck;
@@ -1170,6 +1171,10 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                         reader,
                         partition_offset,
                     )?)),
+                    "xfs" => Ok(Box::new(xfs::XfsFilesystem::open(
+                        reader,
+                        partition_offset,
+                    )?)),
                     _ => Err(FilesystemError::Unsupported(format!(
                         "editing not yet supported for APM Unix filesystem type '{fs_type}'"
                     ))),
@@ -1248,6 +1253,10 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "xfs" => Ok(Box::new(xfs::XfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 _ => Err(FilesystemError::Unsupported(format!(
                     "editing not yet supported for filesystem type '{fs_type}'"
                 ))),
@@ -1298,6 +1307,10 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "xfs" => Ok(Box::new(xfs::XfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 _ => Err(FilesystemError::Unsupported(format!(
                     "editing not yet supported for type 0x83 filesystem '{fs_type}'"
                 ))),
@@ -1310,6 +1323,11 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
         )?)),
         // SGI EFS — synthetic type byte emitted by PartitionTable::Sgi.
         0xA1 => Ok(Box::new(efs::EfsFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
+        // SGI XFS — synthetic type byte emitted by PartitionTable::Sgi.
+        0xA0 => Ok(Box::new(xfs::XfsFilesystem::open(
             reader,
             partition_offset,
         )?)),
@@ -1371,6 +1389,10 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
                     partition_offset,
                 )?)),
                 "btrfs" => Ok(Box::new(btrfs::BtrfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "xfs" => Ok(Box::new(xfs::XfsFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),
