@@ -46,8 +46,10 @@ Add a new entry here every time you park an item with "need fixture".
       byte 65536 — our parser handles both).
   - Contents (matching ReiserFS / ext fixtures):
     `/hello.txt`, `/subdir/nested.txt`, `/link.txt` symlink, `/tiny.txt`
-    (10 bytes), `/large.bin` (24 KiB deterministic to exercise UFS3 indirect
-    pointers under U.3).
+    (10 bytes), `/large.bin` (24 KiB deterministic; exercises the
+    direct[0..3] block walk under U.3 — fits within the 12-direct
+    ceiling at bsize=8192, so single-indirect coverage rides on a
+    synthetic-image test in `synthetic_single_indirect_walk`).
   - Producer notes: Ubuntu 24.04 has no `mkfs.ufs`/`newfs`, but the `makefs`
     package in universe (NetBSD's tool) builds an FFS image directly from a
     host directory tree. Install via `sudo apt-get install -y makefs`; the
