@@ -80,37 +80,80 @@ breakdown.
 
 Start by checking `git log --oneline -20` to see what landed in the
 previous session, then pick the next item from the "Still open"
-list (in priority order: §2.3 HFS+ journal Step 27 if you want the
-biggest piece, §6.2 `rb-cli get` globbing for medium scope, or §6.3
-GUI .hqx import for a design checkpoint first). Park items the user
-hasn't given a fixture for and move on.
+list. Recommended order:
+
+  1. **§1.2 UFS** (Tier A: U.1 + U.2) — fixture generation is now
+     unblocked (`linux-modules-extra-$(uname -r)` is installed in
+     WSL so libguestfs can mount UFS2 in its appliance). Reuses the
+     EFS scaffolding (`src/fs/efs.rs` + `src/fs/unix_common/`) which
+     already implements the cylinder-group + classic-Unix-inode
+     shape. Should be a smaller lift per phase than ReiserFS was.
+  2. **§1.3 JFS** (Tier A: J.1 + J.2) — same fixture story; JFS2
+     has a basic B+tree walker even at Tier A because BMAP itself
+     is a B+tree of allocation control pages.
+  3. **§2.3 HFS+ journal Step 27** if you want the biggest piece
+     (~500 LOC across every HFS+ write site).
+  4. **§6.2 `rb-cli get` globbing** for medium scope.
+  5. **§6.3 GUI `.hqx` import** for a design checkpoint first.
+
+To regenerate or extend a fixture, model your script on
+`scripts/generate-reiserfs-fixtures.sh`. The WSL environment is
+already configured (libguestfs + linux-image-virtual + modules-extra
++ dpkg-statoverride on the vmlinuz).
+
+Park items the user hasn't given a fixture for and move on.
 ```
 
 ---
 
-## Recently shipped (last session, 2026-06-02)
+## Recently shipped (last session, 2026-06-02 evening)
 
-9 commits on `mister-parity` ahead of `5082f17`:
+4 commits on `mister-parity` ahead of `9759a97`:
 
 | Commit | Item | Tests added |
 |---|---|---|
-| `151908e` | gui: ElevationGate dead-code cleanup (prep for clippy `-D warnings`) | — |
-| `b149898` | **ReiserFS R.1** detect + superblock + sizing (v3.5 / v3.6 / reject reiser4) | 9 |
-| `4079385` | **ReiserFS R.2** bitmap walk + `last_data_byte` + `CompactReiserFsReader` | 6 |
-| `36c4440` | **ReiserFS R.3a** on-disk S+tree node parsers (BlockHead / Key / ItemHead / DiskChild) | 13 |
-| `de3f1e3` | `docs/need_fixtures.md` introduced; R.3b/c/d, UFS, JFS parked as "need fixture" | — |
-| `3af6ca4` | **ProDOS §3.1** `set_prodos_access` + GUI Lock/Unlock buttons | 4 |
-| `2ae1072` | **CLI §6.1** `fsck --format text|json|yaml` envelope output | 5 |
-| `5b6441d` | **SIT §6.3** writer emits nested folders (`StuffItInputNode` tree API) | 5 |
-| `ea73d90` | **CLAUDE.md cleanup** ASCII tree connectors + `->` symlink arrows | — |
+| `7e58ffc` | **ReiserFS fixture** — `test_reiserfs_v3_6.img.zst` (3.7 KB compressed, 64 MiB raw) + `scripts/generate-reiserfs-fixtures.sh`. v3.5 fixture parked: modern kernel won't mount it. | — |
+| `e2b53b1` | **ReiserFS R.3b** S+tree walker (`collect_leaf_block_numbers`, `collect_items_for_object`). Fixed two R.3a bugs the real image exposed: `LEAF_LEVEL` was 0 (should be 1; kernel `DISK_LEAF_NODE_LEVEL = 1`); `KeyFormat::from_version` mapped `2 → V2` (should be `1 → V2`; kernel `ITEM_VERSION_2 = 1`). | 10 |
+| `9f53b83` | **ReiserFS R.3c** `list_directory` — DIR_ENTRY decoder (16-byte `reiserfs_de_head` + name slots), StatData parser (new 44 B / old 32 B), `pack_loc/unpack_loc`, `.reiserfs_priv` filter, recursive subdir descent. | 14 |
+| `2be0e0b` | **ReiserFS R.3d** `read_file` — SD + IND (sparse-zero handling) + DRCT (tail-padding truncation), `max_bytes` honoured eagerly. Closes the entire §1.1 read track. | 5 |
 
-42 new unit tests, full lib suite green except the pre-existing
-Windows-only `os::windows::tests::test_enumerate_devices_nonempty`
-which requires a real physical disk.
+29 new ReiserFS unit tests (57 total in the module). Full lib suite
+green except the pre-existing Windows-only
+`os::windows::tests::test_enumerate_devices_nonempty` which requires
+a real physical disk.
+
+### WSL fixture-generation environment is now set up
+
+`scripts/generate-reiserfs-fixtures.sh` documents the host-side
+setup as comments at the top, but the one-time work is already done
+on the user's WSL Ubuntu 24.04:
+
+  * `reiserfsprogs`, `libguestfs-tools`, `linux-image-virtual`,
+    `linux-modules-extra-$(uname -r)` are all installed
+  * `dpkg-statoverride` makes `/boot/vmlinuz-*` readable to the
+    user (libguestfs needs it; persists across kernel upgrades)
+
+So UFS / JFS fixture generation works the same way: format with the
+host's `mkfs.*`, populate via libguestfs's QEMU appliance kernel.
+Just write a `scripts/generate-{ufs,jfs}-fixtures.sh` modeled on
+the reiserfs one.
 
 ---
 
 ## Still open — pick one
+
+### Filesystem read-track (fixture work unblocked)
+- **§1.2 UFS** (Recommended next) — Tier A: U.1 superblock (UFS1 at
+  byte 8192 magic `0x011954`, UFS2 at byte 65536 magic `0x19540119`),
+  U.2 cylinder-group walk → compact + `last_data_byte`. Tier B: U.3
+  inode + dir + file browse. Reuses `src/fs/efs.rs` +
+  `src/fs/unix_common/` patterns (cylinder-group + classic-Unix-inode
+  shape). Refuse softupdate-journaled + SU+J dirty volumes with a
+  clear message rather than risk corrupting recovery state.
+- **§1.3 JFS** (Tier A: J.1 + J.2) — JFS2 only; reject AIX JFS1 with
+  a clear error. Aggregate Superblock at byte 32768. BMAP is itself
+  a B+tree of allocation control pages so even Tier A needs a basic
+  B+tree walker.
 
 ### Large
 - **§2.3 HFS+ journal Step 27** — route every `do_sync_metadata`
@@ -143,15 +186,12 @@ All these are in `docs/need_fixtures.md` with target filenames and
 producer instructions. Drop the fixture, remove the "Parked" tag in
 OPEN-WORK, resume.
 
-- **ReiserFS R.3b/c/d** — S+tree walker, `list_directory`, `read_file`
-  with tail packing. Needs `tests/fixtures/test_reiserfs_v3_5.img.zst`
-  + `test_reiserfs_v3_6.img.zst`. Grab `reiserfsprogs` while it's still
-  packaged — the Linux kernel is on the removal track.
-- **UFS U.1/U.2/U.3** — UFS1 (FreeBSD ≤4, Solaris, NetBSD, OpenBSD) +
-  UFS2 (FreeBSD 5+). Needs `tests/fixtures/test_ufs1.img.zst` +
-  `test_ufs2.img.zst`.
-- **JFS J.1/J.2/J.3** — IBM JFS2. Needs
-  `tests/fixtures/test_jfs2.img.zst`.
+- **ReiserFS v3.5 real-image validation** — parked because modern
+  Linux kernels (6.x) refuse to mount v3.5 volumes (`EUCLEAN
+  "Structure needs cleaning"`; `-o conv` no longer auto-upgrades).
+  R.1/R.2/R.3a synth tests cover v3.5 superblock + V1 keys
+  end-to-end. Would need an older kernel (~5.x) to mount-and-
+  populate; not worth chasing now that the read path is shipped.
 - **§3.2 NTFS file-aware GHO compressed path** — needs a real
   Norton-Ghost-produced compressed file-aware NTFS backup.
 - **§3.3 HFS raw partition extend** — needs an APM-less raw HFS
