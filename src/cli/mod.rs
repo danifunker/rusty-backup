@@ -65,7 +65,8 @@ pub enum Command {
     /// Copy a host file (or zero-fill / write boot blocks) into a filesystem.
     Put(verbs::put::PutArgs),
 
-    /// Extract a file from a filesystem to the host.
+    /// Extract a file, directory tree, or glob match from a filesystem
+    /// to the host.
     Get(verbs::get::GetArgs),
 
     /// Delete a file or directory from a filesystem.

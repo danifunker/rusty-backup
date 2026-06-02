@@ -82,13 +82,12 @@ Start by checking `git log --oneline -20` to see what landed in the
 previous session, then pick the next item from the "Still open"
 list. Recommended order:
 
-  1. **§6.2 `rb-cli get` globbing** — medium scope; extend the
-     existing `src/cli/glob.rs` infrastructure that already powers
-     `ls` / `rm` / `put` to cover recursive extract.
-  2. **§2.3 HFS+ journal Step 27** if you want the biggest piece
-     (~500 LOC across every HFS+ write site).
-  3. **§6.3 GUI `.hqx` import** — needs a design checkpoint first.
-  4. **§1.3 JFS J.2 + J.3** — parked; pick up if you want the
+  1. **§2.3 HFS+ journal Step 27** — the biggest open piece
+     (~500 LOC across every HFS+ write site). Recorder + replay
+     infra is already in `src/fs/hfsplus_journal.rs`; this is the
+     consumer wiring.
+  2. **§6.3 GUI `.hqx` import** — needs a design checkpoint first.
+  3. **§1.3 JFS J.2 + J.3** — parked; pick up if you want the
      BMAP walker for free-block trimming.
 
 To regenerate or extend a fixture, model your script on
@@ -107,6 +106,7 @@ Most recent commits on `mister-parity` (newest first):
 
 | Commit | Item | Tests added |
 |---|---|---|
+| _(this session)_ | **`rb-cli get` globbing + recursive extract** — `get` accepts the same glob / `--exclude` / `--ignore-case` syntax as `ls` and `rm`, plus `-r` / `--recursive` for directory dumps and `--force` / `--skip-existing` for conflict handling. DST gains layout-under-prefix semantics: single file = literal target; literal dir + `-r` = `DST/<basename>/...` (cp convention); glob = relative-to-glob-root under `DST`. Symlinks ride out as plain-text fallback files (cross-platform safe). | 12 unit + 6 e2e |
 | _(this session)_ | **JFS J.1** — Aggregate Superblock parser + detect for JFS2 (`"JFS1"` magic at byte 32768; accepts on-disk `s_version` 1 or 2; refuses dirty aggregates). Decodes the inline-log + fsck-workspace `pxd_t`s and reports `last_data_byte = max(aggregate_end, logpxd_end, fsckpxd_end)` so backups capture the inline log when it lives past the aggregate end (true on the makefs-equivalent layout). Fixture `test_jfs.img.zst` (16 MiB, 4.4 KiB zstd) via `scripts/generate-jfs-fixtures.sh` + libguestfs. Wired through `detect_filesystem_type`, `probe_0x83_fs_type` ("JFS2"), and `open_filesystem` 0x83 + superfloppy. J.2 (BMAP B+tree compactor) + J.3 (browse) parked — multi-session work, not currently scheduled. | 21 |
 | `93c3054` | **UFS U.3** — dinode reader + DIRENT2 `list_directory` + direct/indirect `read_file` for both UFS1 (128 B dinode, 32-bit pointers) and UFS2 (256 B dinode, 64-bit pointers). Adds `UfsInode`, `inode_byte_offset`, `read_inode`, `resolve_logical_block` (12 direct → single → double → triple indirect, sparse-block-aware), `read_inode_data`, `read_symlink_target` (inline payload up to `fs_maxsymlinklen`, otherwise data block), `build_file_entry`. Now reads + browses end-to-end through the existing dispatch. | 19 |
 | `e2a5121` | **UFS U.2** — CG header parser + walker (validates cg_magic 0x00090255), `Filesystem::last_data_byte` override (bitmap polarity is **set = FREE**, BSD convention), `CompactUfsReader` (layout-preserving, coalesces same-state runs). Adds `BitmapReader::highest_clear_bit` to `unix_common::bitmap`. Re-exported as `crate::fs::CompactUfsReader`. | 13 |
@@ -160,13 +160,6 @@ the ReiserFS one (`jfsutils` is the Ubuntu package; the host's
   across every HFS+ write site (~500+ LOC + journal-replay-on-open
   plumbing). The recorder + replay infra (`src/fs/hfsplus_journal.rs`)
   is already in place from steps 25/26; this is the consumer wiring.
-
-### Medium
-- **§6.2 `rb-cli get` globbing** — extend the `get` verb with glob
-  expansion + recursive extract. Plan calls for an "implicit batch"
-  shape: multi-match `get` builds an in-memory batch, runs one
-  preflight pass, applies as one operation. The glob infrastructure
-  in `src/cli/glob.rs` already powers `ls` / `rm` / `put`.
 
 ### Design-checkpoint
 - **§6.3 GUI `.hqx` import + auto-unwrap hook** — pair work. Import

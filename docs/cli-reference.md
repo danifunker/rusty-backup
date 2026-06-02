@@ -418,7 +418,8 @@ Usage: expand [OPTIONS] --size <SIZE> --output <OUTPUT> <IMAGE>
 
 - `--size` — Target volume size in bytes. Accepts suffixes (`K`, `M`, `G`)
 - `--block-size` — Allocation block size in bytes. One of: 4096, 8192, 16384, 32768, 65536. If omitted, picks the smallest block size whose 65535-block ceiling can hold `--size`
-- `--output` — Destination path for the new APM disk image. Created (or truncated)
+- `--output` — Destination path for the new image. Created (or truncated)
+- `--to-hfv` — Write a flat BasiliskII HFV (bare classic-HFS volume, no partition table) instead of an APM disk image. Capped at 2047 MB. Use this to produce a `.hfv` for BasiliskII / SheepShaver
 
 ### `fsck`
 
@@ -437,20 +438,49 @@ Usage: fsck [OPTIONS] <IMAGE>
 - `--checkonly` — Scan only. Never prompt, never repair. Exits non-zero on issues
 - `--repair` — Auto-repair detected issues without prompting
 - `--prompt-timeout` — Seconds to wait for an interactive repair confirmation before resolving to "No" (default 30; or `[fsck] prompt-timeout` from the config file when set). `0` waits indefinitely (TTY only)
+- `--format` — Output format. `text` (default) emits the human-readable report; `json` / `yaml` emit a status-wrapped envelope mirroring the other read-only verbs. `csv` / `tsv` are rejected — the report is nested
 
 ### `get`
 
-Extract a file from a filesystem to the host
+Extract a file, directory tree, or glob match from a filesystem to the host
 
 ```
-Usage: get <IMAGE> <SRC> <DST>
+Usage: get [OPTIONS] <IMAGE> <SRC> <DST>
 ```
 
 **Arguments**
 
 - `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
+- `<SRC>` — Source path or glob inside the filesystem. Patterns containing `*`, `?`, `[`, or `{` walk the volume and extract every match
+- `<DST>` — Destination path on the host. Single-match: the literal target file. Multi-match or directory source: a directory under which matched entries are laid out (created if it doesn't exist)
+
+**Options**
+
+- `-r` / `--recursive` — Recursively extract directories (literal dir source or glob match against a directory). Without this flag, matched directories are skipped with a warning
+- `--exclude` — Exclude paths matching this glob. Repeatable. Exclude always wins over `--include` / the positional source
+- `--ignore-case` — Match case-insensitively regardless of the target's native rule
+- `--case-sensitive` — Match case-sensitively regardless of the target's native rule
+- `--force` — Overwrite existing host files. Mutually exclusive with `--skip-existing`
+- `--skip-existing` — Skip silently when a host file already exists. Mutually exclusive with `--force`. Without either flag, an existing destination is a hard error
+- `--password` — Password for encrypted containers (currently: WinImage IMZ)
+
+### `get-binhex`
+
+Extract a file and encode it as BinHex 4.0 (.hqx), preserving both forks and the type/creator codes
+
+```
+Usage: get-binhex [OPTIONS] <IMAGE> <SRC> <DST>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N`)
 - `<SRC>` — Source path inside the filesystem
-- `<DST>` — Destination path on the host
+- `<DST>` — Destination `.hqx` path on the host
+
+**Options**
+
+- `--password` — Password for encrypted containers (currently: WinImage IMZ)
 
 ### `grow`
 
@@ -483,6 +513,7 @@ Usage: inspect [OPTIONS] <IMAGE>
 **Options**
 
 - `--format` — Output format
+- `--password` — Password for encrypted containers (currently: WinImage IMZ)
 
 ### `install-completions`
 
@@ -498,6 +529,23 @@ Usage: install-completions [OPTIONS]
 - `--prefix` — Override the install prefix (rarely needed). When set, the file is written under `PREFIX/<canonical-subdir>`
 - `--print` — Print the script to stdout instead of writing to disk
 - `--uninstall` — Remove the installed completion file. No-op if it doesn't exist
+
+### `locate`
+
+Print the absolute byte offset and length of a file inside an image (HFS only today). Output is JSON so build scripts that patch disk offsets into boot blocks can parse it with `jq`
+
+```
+Usage: locate [OPTIONS] <IMAGE> <PATH>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
+- `<PATH>` — Path inside the filesystem (Mac path conventions; `/` is the separator — `:` is rejected for the same reason as the other verbs)
+
+**Options**
+
+- `--format` — Output format. `json` is the default because the load-bearing consumer is a build script
 
 ### `ls`
 
@@ -517,6 +565,7 @@ Usage: ls [OPTIONS] <IMAGE> [PATH]
 - `--exclude` — Exclude paths matching this glob. Repeatable. Exclude always wins over `--include` / a positional path
 - `--ignore-case` — Treat case-insensitively, regardless of the target's native rule
 - `--case-sensitive` — Treat case-sensitively, regardless of the target's native rule
+- `--password` — Password for encrypted containers (currently: WinImage IMZ)
 
 ### `mkdir`
 
@@ -549,6 +598,8 @@ Usage: new [OPTIONS] --fs <FS> <IMAGE>
 - `--size` — Volume size, accepting plain bytes or `K`/`KiB`/`M`/`MiB`/`G`/`GiB` suffixes (e.g. `800K`, `5M`). Defaults to 800K (an 800 KiB floppy)
 - `--name` — Volume label/name. Defaults to `rusty-backup`. HFS: up to 27 Mac Roman bytes. FAT: up to 11 chars (uppercased; non-ASCII → `_`). EFS: 6-byte fname/fpack. AFFS: up to 30 bytes
 - `--block-size` — HFS allocation block size in bytes. Must be a non-zero multiple of 512. When unset, the smallest size that keeps `total_blocks <= 65535` is chosen automatically. Ignored for other filesystems
+- `--catalog-size` — HFS Catalog B-tree initial size in bytes (rounded up to a whole allocation block). When unset, scales with volume size like hformat (~0.5%, clump-aligned, 24-block floor). Ignored for other filesystems
+- `--extents-size` — HFS Extents-overflow B-tree initial size in bytes (rounded up to a whole allocation block). When unset, ~half the catalog size. Ignored for other filesystems
 - `--affs-variant` — AFFS variant byte (0=OFS, 1=FFS, 2=OFS+intl, 3=FFS+intl, 4=OFS+dircache, 5=FFS+dircache). Defaults to 1 (FFS)
 
 ### `optical`
@@ -769,6 +820,65 @@ Usage: put [OPTIONS] <IMAGE> [HOST_FILE] [DST]
 - `--type` — 4-character type code (HFS / HFS+ / ProDOS). Defaults to `BINA`, or `[put] type` from the config file when set
 - `--creator` — 4-character creator code (HFS / HFS+ only). Defaults to `????`, or `[put] creator` from the config file when set
 - `--force` — Overwrite an existing entry at the destination path
+- `--print-offset` — After writing the file, also print the same JSON envelope `locate` would have produced — absolute byte offset, length, fragmented flag. One-shot for build scripts that need to patch disk offsets immediately after placing a payload. HFS-only, matches the locate verb's scope; ignored (with a warning) for the `--zero` and `--boot` shapes since there's no host file to describe
+
+### `put-binhex`
+
+Decode a BinHex 4.0 (.hqx) file and write it (both forks + Finder info) into a filesystem
+
+```
+Usage: put-binhex [OPTIONS] <IMAGE> <HOST_FILE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N`)
+- `<HOST_FILE>` — BinHex 4.0 (`.hqx`) file on the host
+
+**Options**
+
+- `--dst-dir` — Destination directory inside the filesystem (`/` for root). The filename comes from the BinHex header. Defaults to `/`
+- `--rename` — Override the filename from the BinHex header
+- `--force` — Overwrite an existing entry at the destination path
+
+### `put-macbinary`
+
+Put a MacBinary I / II archive: both forks + full Finder info in one shot (HFS today)
+
+```
+Usage: put-macbinary [OPTIONS] <IMAGE> <HOST_FILE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N`)
+- `<HOST_FILE>` — MacBinary I / II archive on the host
+
+**Options**
+
+- `--dst-dir` — Destination directory inside the filesystem (`/` for root). The filename comes from the MacBinary header. Defaults to `/`
+- `--rename` — Override the filename from the MacBinary header
+- `--force` — Overwrite an existing entry at the destination path
+
+### `reformat`
+
+Reformat a partition in place, leaving the partition table intact (HFS only today)
+
+```
+Usage: reformat [OPTIONS] --fs <FS> <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N`)
+
+**Options**
+
+- `--fs` — Filesystem to format the partition with. Only `hfs` is supported today
+- `--name` — New volume name. HFS: up to 27 Mac Roman bytes
+- `--block-size` — HFS allocation block size in bytes (non-zero multiple of 512). Defaults to the smallest size that keeps total_blocks <= 65535
+- `--catalog-size` — HFS Catalog B-tree initial size in bytes. Defaults to hformat-style scaling (~0.5% of the partition)
+- `--extents-size` — HFS Extents-overflow B-tree initial size in bytes. Defaults to ~half the catalog size
 
 ### `resize`
 
@@ -845,6 +955,19 @@ Usage: setrsrc --from-file <FROM_FILE> <IMAGE> <PATH>
 **Options**
 
 - `--from-file` — Host file whose contents become the new resource fork
+
+### `setvolname`
+
+Rename the volume at IMG[@N] (HFS only today)
+
+```
+Usage: setvolname <IMAGE> <NAME>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N`)
+- `<NAME>` — New volume name. HFS: 1..=27 Mac Roman bytes
 
 ### `show`
 
@@ -927,6 +1050,60 @@ Usage: shrink <INPUT> <OUTPUT>
 
 - `<INPUT>` — Source image (raw `.img` or `.chd`). Must contain an SGI volume header at sector 0
 - `<OUTPUT>` — Destination CHD path. Must end in `.chd`, must not already exist, and must not resolve to the same file as `input`
+
+### `sit`
+
+Read classic StuffIt archives (list / extract; accepts .sit, .sea, and BinHex-wrapped .sit.hqx)
+
+```
+Usage: sit <COMMAND>
+```
+
+### `sit create`
+
+Create a StuffIt archive from host files (.hqx / .bin / plain)
+
+```
+Usage: create [OPTIONS] <OUTPUT> <INPUTS>...
+```
+
+**Arguments**
+
+- `<OUTPUT>` — Output path. A `.sit` extension writes a raw archive; a `.hqx` extension BinHex-wraps it (the classic `.sit.hqx` format)
+- `<INPUTS>` — Input files. Each may be a BinHex `.hqx`, a MacBinary `.bin`, or a plain file (with an optional `._name` / `.rsrc` sidecar)
+
+**Options**
+
+- `--rle` — Compress forks with RLE90 (method 1) instead of storing uncompressed
+
+### `sit extract`
+
+Extract a StuffIt archive to a directory on the host
+
+```
+Usage: extract [OPTIONS] <ARCHIVE> <DEST>
+```
+
+**Arguments**
+
+- `<ARCHIVE>` — StuffIt archive (`.sit`, `.sea`, or `.sit.hqx`)
+- `<DEST>` — Destination directory on the host (created if missing)
+
+**Options**
+
+- `--format` — Container format for the extracted files
+
+### `sit list`
+
+List the entries in a StuffIt archive
+
+```
+Usage: list <ARCHIVE>
+```
+
+**Arguments**
+
+- `<ARCHIVE>` — StuffIt archive (`.sit`, `.sea`, or `.sit.hqx`)
 
 ### `terminal`
 

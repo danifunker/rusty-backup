@@ -481,17 +481,46 @@ in structured mode, so shell `$?` branching keeps working. 5 new
 unit tests cover the OK / clean / error / unsupported envelopes plus
 the CSV/TSV rejection.
 
-### 6.2 `rb-cli get` globbing
+### 6.2 `rb-cli get` globbing — **Shipped**
 
-Globs already work for `ls` / `rm` / `put` (bash-equivalent: `*` `?`
-`[abc]` `**` `{a,b}`, `--include` / `--exclude` with exclude-wins).
-`get` was deferred to the recursive-extract design.
+`get` now accepts the same glob / `--exclude` / `--ignore-case` /
+`--case-sensitive` syntax as `ls` and `rm`. Plus three new flags:
 
-Shape: when the source argument expands to multiple files (shell glob
-or `--glob` flag), build an implicit batch in memory, run preflight,
-apply as one operation — same code path as `rb-cli batch`. The
-trailing-slash rule and conflict-handling flags (`--force` /
-`--skip-existing`) carry over unchanged.
+  * `-r` / `--recursive` — descend into directories. A literal
+    directory source without `-r` is a clear error pointing at the
+    flag; matched directory entries in a glob with no `-r` are
+    skipped with a one-line warning.
+  * `--force` — overwrite existing host files.
+  * `--skip-existing` — skip with a one-line note. Mutually exclusive
+    with `--force`. Default is a hard error on conflict.
+
+Destination semantics:
+
+  * Single literal file → DST is the literal target path. If DST
+    exists as a directory **or** the user wrote a trailing
+    separator, the file lands under `DST/<basename>`.
+  * Literal directory + `-r` → DST is the parent under which
+    `DST/<source-basename>/...` mirrors the source tree (cp/rsync
+    convention).
+  * Glob → DST is a directory; matches lay out relative to the
+    longest non-glob prefix of the pattern (so `/foo/*.txt` matched
+    by `/foo/a.txt` and `/foo/sub/a.txt` under
+    `**/*.txt` land at `DST/a.txt` and `DST/sub/a.txt`
+    respectively).
+
+Symlinks ride out as plain text files containing the target path —
+lossy but cross-platform safe (Windows symlinks need developer mode
+or admin). Special files (devices / fifos / sockets) are skipped
+with a one-line note. The original `get-binhex` / `get-applesingle`
+paths still handle Mac resource forks for the cases where they
+matter.
+
+Tests: 12 unit (`src/cli/verbs/get.rs`) for the path / glob-root /
+conflict-mode primitives + 6 end-to-end (`tests/cli_flat.rs`) for
+single-file extract, glob extract, recursive directory dump, literal
+directory refusal without `-r`, `--force` overwrite, `--skip-existing`
+preservation, and `--exclude` filtering against an HFS scratch
+image.
 
 ### 6.3 Native Mac archives — GUI workflow polish
 
