@@ -1555,6 +1555,10 @@ impl BrowseView {
 
         if has_rsrc && self.resource_fork_mode == ResourceForkMode::MacBinary {
             candidates.push(dest.join(format!("{safe_name}.bin")));
+        } else if entry.is_file() && self.resource_fork_mode == ResourceForkMode::BinHex {
+            // BinHex packs data + resource fork + Finder info into one .hqx,
+            // regardless of whether a resource fork is present.
+            candidates.push(dest.join(format!("{safe_name}.hqx")));
         } else {
             candidates.push(dest.join(&safe_name));
             if has_rsrc {
@@ -3913,6 +3917,45 @@ fn extract_entry(
 
                 if let Ok(mut p) = progress.lock() {
                     p.current_bytes += data.len() as u64 + rsrc_buf.len() as u64;
+                    p.files_extracted += 1;
+                }
+            } else if resource_fork_mode == ResourceForkMode::BinHex {
+                // BinHex: single .hqx text file with both forks + Finder info.
+                // Always applicable to a file, even with no resource fork.
+                let data = fs.read_file(entry, usize::MAX)?;
+                let mut rsrc_buf = Vec::new();
+                if has_rsrc {
+                    fs.write_resource_fork_to(entry, &mut rsrc_buf)?;
+                }
+
+                let type_code = entry
+                    .type_code
+                    .as_ref()
+                    .map(|s| fourcc_bytes(s))
+                    .unwrap_or([0; 4]);
+                let creator_code = entry
+                    .creator_code
+                    .as_ref()
+                    .map(|s| fourcc_bytes(s))
+                    .unwrap_or([0; 4]);
+
+                let bh = rusty_backup::fs::binhex::BinHexFile {
+                    // Preserve the original Mac name inside the archive.
+                    name: entry.name.clone(),
+                    type_code,
+                    creator_code,
+                    flags: 0,
+                    data_fork: data,
+                    resource_fork: rsrc_buf,
+                };
+                let text = rusty_backup::fs::binhex::build_binhex(&bh);
+                let out_path = dest.join(format!("{safe_name}.hqx"));
+                let mut f = BufWriter::new(File::create(&out_path)?);
+                f.write_all(text.as_bytes())?;
+                f.flush()?;
+
+                if let Ok(mut p) = progress.lock() {
+                    p.current_bytes += bh.data_fork.len() as u64 + bh.resource_fork.len() as u64;
                     p.files_extracted += 1;
                 }
             } else {

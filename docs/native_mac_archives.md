@@ -88,7 +88,8 @@ whose payload is a plain file flows into the fork-export path.
 - [x] RLE90 encode/decode + 6-bit codec + augmented CRC-16 as private helpers (unit-tested round-trip)
 - [x] CLI: `put-binhex IMG[@N] HOST [--dst-dir/--rename/--force]` and `get-binhex IMG[@N] SRC OUT.hqx` (mirror `put_macbinary.rs`); registered in `cli/mod.rs` + `cli/verbs/mod.rs`
 - [x] Tests: round-trip unit tests; validated against 5 real `.hqx` samples (all 3 CRCs verify); full CLI E2E (`.hqx` → HFS → `.hqx` → HFS, data forks byte-identical, type/creator/rsrc preserved)
-- [ ] GUI: "Export to BinHex (.hqx)…" + "Import .hqx" in browse view alongside existing fork-export options
+- [x] GUI export: `ResourceForkMode::BinHex` variant — "BinHex 4.0 (.hqx)" appears in the HFS/HFS+ resource-fork dropdown; extract writes a single `.hqx` per file (both forks + type/creator), with overwrite-detection candidate path
+- [ ] GUI import: "Import .hqx" into a disk in edit mode (decode → create_file)
 - [ ] Auto-unwrap hook: decoded payload sniffed via `dc42::detect_dc42` (and raw-HFS sniff) → route to image pipeline
 - [-] `ResourceForkMode::BinHex` variant — not needed; BinHex has its own `BinHexFile` type and dedicated verbs rather than riding the host-sidecar import path
 
