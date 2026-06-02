@@ -510,8 +510,12 @@ Still open:
 - **GUI archive browse**: open `.hqx` / `.sit` / `.sea` as a read-only
   archive view, with the auto-unwrap hook routing disk-image payloads
   to the image pipeline.
-- **ASCII-only audit**: confirm no Unicode glyphs leaked into the
-  native-mac-archives surface (CLAUDE.md rule).
+- **ASCII-only audit** — **Clean** (verified 2026-06-02). Every
+  user-visible string in `src/macarchive/`, `src/gui/archives_tab.rs`,
+  `src/cli/verbs/sit.rs`, and `src/cli/verbs/put_macbinary.rs` is
+  plain ASCII. Non-ASCII characters appear only in developer-facing
+  doc comments (`//!` / `///`) — `→`, `…`, `─`, em-dashes — which
+  per CLAUDE.md are allowed.
 
 ---
 

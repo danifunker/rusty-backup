@@ -279,7 +279,7 @@ impl OpticalDiscBrowseView {
 
                 let size_str = entry.size_string();
                 let label = match &entry.symlink_target {
-                    Some(target) => format!("{} → {}  ({})", entry.name, target, size_str),
+                    Some(target) => format!("{} -> {}  ({})", entry.name, target, size_str),
                     None => format!("{}  ({})", entry.name, size_str),
                 };
 
@@ -376,7 +376,7 @@ impl OpticalDiscBrowseView {
                         }
                     }
                     if let Some(ref target) = entry.symlink_target {
-                        ui.label(format!("→ {target}"));
+                        ui.label(format!("-> {target}"));
                     }
                     ui.label(format!("Path: {}", entry.path));
                 });
@@ -663,7 +663,10 @@ fn walk_optical_tree(
 
     for (i, child) in children.iter().enumerate() {
         let is_last = i == count - 1;
-        let connector = if is_last { "└── " } else { "├── " };
+        // ASCII tree connectors so the egui Monospace text-edit (and any
+        // other consumer that doesn't have full Unicode font coverage)
+        // renders correctly. CLAUDE.md "no Unicode glyphs in UI text" rule.
+        let connector = if is_last { "\\-- " } else { "|-- " };
 
         out.push_str(prefix);
         out.push_str(connector);
@@ -696,7 +699,10 @@ fn walk_optical_tree(
             let child_prefix = if is_last {
                 format!("{prefix}    ")
             } else {
-                format!("{prefix}│   ")
+                // ASCII vertical-bar continuation, paired with the ASCII
+                // `|--` / `\\--` connectors above. Keeps the tree readable
+                // in egui's default font (no Unicode box-drawing glyphs).
+                format!("{prefix}|   ")
             };
             walk_optical_tree(fs, child, &child_prefix, out, dir_count, file_count)?;
         } else {
