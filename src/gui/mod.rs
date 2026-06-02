@@ -396,14 +396,20 @@ impl Default for RustyBackupApp {
 /// `NeedsElevation`/`Elevated` are only constructed on Windows; on other
 /// platforms `elevation_gate()` always returns `NotApplicable`.
 #[derive(Clone, Copy, PartialEq)]
-#[cfg_attr(not(windows), allow(dead_code))]
 enum ElevationGate {
     /// Not a gated platform (Linux/macOS handle elevation their own way) — the
-    /// normal "Refresh Devices" control applies.
+    /// normal "Refresh Devices" control applies. Only constructed on
+    /// non-Windows builds; the cfg_attr below silences the resulting
+    /// "variant never constructed" warning on Windows.
+    #[cfg_attr(windows, allow(dead_code))]
     NotApplicable,
     /// Windows, not elevated — show the shielded "Show Physical Devices" button.
+    /// Constructed only inside `#[cfg(windows)]` paths.
+    #[cfg_attr(not(windows), allow(dead_code))]
     NeedsElevation,
     /// Windows, already elevated — devices are available, show "Refresh Devices".
+    /// Constructed only inside `#[cfg(windows)]` paths.
+    #[cfg_attr(not(windows), allow(dead_code))]
     Elevated,
 }
 
