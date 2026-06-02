@@ -52,12 +52,29 @@ use super::entry::FileEntry;
 use super::filesystem::{Filesystem, FilesystemError};
 use super::unix_common::bitmap::BitmapReader;
 use super::unix_common::compact::{CompactLayout, CompactSection, CompactStreamReader};
+use super::unix_common::inode::{format_unix_timestamp, unix_file_type, UnixFileType};
 use crate::fs::CompactResult;
 
 // ---- Constants ----
 
 /// ReiserFS superblock lives 64 KiB into the partition.
 const REISERFS_SUPERBLOCK_OFFSET: u64 = 65536;
+
+// ---- Reserved object-id sentinels (kernel `reiserfs_fs.h`) ----
+
+/// Sentinel "parent objectid" recorded against the root directory. Real
+/// objectids start at 2; this 1 is just a tag meaning "no real parent."
+pub const REISERFS_ROOT_PARENT_OBJECTID: u32 = 1;
+
+/// Objectid every freshly-created ReiserFS volume assigns to its root
+/// directory. (`mkfs.reiserfs` writes the root's StatData with key
+/// `(1, 2, 0, StatData)`.)
+pub const REISERFS_ROOT_OBJECTID: u32 = 2;
+
+/// Hidden directory name used by reiserfs to store extended attributes
+/// and ACLs. We filter it from `list_directory` the same way the kernel
+/// hides it from userland.
+const REISERFS_PRIV_NAME: &str = ".reiserfs_priv";
 
 /// Magic-string offset within the superblock.
 const MAGIC_OFFSET: usize = 52;
@@ -249,10 +266,6 @@ impl<R: Read + Seek + Send> ReiserFsFilesystem<R> {
         }
     }
 
-    // The three methods below are wired into `Filesystem::list_directory`
-    // and `read_file` in R.3c/d. Until then they only have test callers,
-    // so silence the dead-code warning until then.
-    #[allow(dead_code)]
     /// Read an arbitrary tree (or data) block by its absolute block number.
     /// Refuses to read past the volume's declared block count so a corrupt
     /// child pointer can't drag the cursor into adjacent partitions.
@@ -275,7 +288,6 @@ impl<R: Read + Seek + Send> ReiserFsFilesystem<R> {
         Ok(buf)
     }
 
-    #[allow(dead_code)]
     /// Walk the S+tree from the root and return every leaf block number in
     /// left-to-right (key-sorted) order.
     ///
@@ -342,7 +354,6 @@ impl<R: Read + Seek + Send> ReiserFsFilesystem<R> {
         Ok(leaves)
     }
 
-    #[allow(dead_code)]
     /// Collect every item in the tree whose key matches
     /// `(dir_id, objectid)`. Each match is returned as
     /// `(item_head, item_body_bytes)` where the bytes are a fresh copy
@@ -379,19 +390,311 @@ impl<R: Read + Seek + Send> ReiserFsFilesystem<R> {
         }
         Ok(out)
     }
+
+    /// Read an object's StatData. Errors if the object has no SD item
+    /// (corrupt) or the item's body doesn't decode.
+    fn read_statdata(&mut self, dir_id: u32, objectid: u32) -> Result<StatData, FilesystemError> {
+        let items = self.collect_items_for_object(dir_id, objectid)?;
+        for (ih, body) in items {
+            let fmt = ih.key_format()?;
+            if matches!(ih.key.item_type(fmt), ItemType::StatData) {
+                return StatData::parse(&body);
+            }
+        }
+        Err(FilesystemError::Parse(format!(
+            "reiserfs: object ({dir_id}, {objectid}) has no StatData item"
+        )))
+    }
+
+    /// Read a symlink's target text. Symlink bodies live in a Direct
+    /// item (always one block or smaller in practice). We truncate to
+    /// the StatData-recorded size to drop the slot's NUL padding.
+    fn read_symlink_target(
+        &mut self,
+        dir_id: u32,
+        objectid: u32,
+        sd_size: u64,
+    ) -> Result<String, FilesystemError> {
+        let items = self.collect_items_for_object(dir_id, objectid)?;
+        for (ih, body) in items {
+            let fmt = ih.key_format()?;
+            if matches!(ih.key.item_type(fmt), ItemType::Direct) {
+                let take = (sd_size as usize).min(body.len());
+                return Ok(String::from_utf8_lossy(&body[..take]).into_owned());
+            }
+        }
+        Err(FilesystemError::Parse(format!(
+            "reiserfs: symlink ({dir_id}, {objectid}) has no Direct item"
+        )))
+    }
+}
+
+// ---- Location packing for FileEntry ----
+//
+// `FileEntry::location` is a single u64, but ReiserFS needs both the
+// parent's objectid (the `dir_id` field of an item's key) and the
+// object's own objectid to look up its SD / DIR_ENTRY items. We pack
+// them as `(dir_id << 32) | objectid` since both are u32 on disk.
+
+#[inline]
+fn pack_loc(dir_id: u32, objectid: u32) -> u64 {
+    ((dir_id as u64) << 32) | (objectid as u64)
+}
+
+#[inline]
+fn unpack_loc(loc: u64) -> (u32, u32) {
+    ((loc >> 32) as u32, (loc & 0xFFFF_FFFF) as u32)
+}
+
+// ---- StatData (item type 0) ----
+
+/// Decoded fields of a ReiserFS StatData item.
+///
+/// On-disk versions:
+///   * v3.6 / "new" SD (44 bytes): the layout below.
+///   * v3.5 / "old" SD (32 bytes): different field shapes; not produced
+///     by `mkfs.reiserfs --format 3.6` and not exercised by our fixture.
+///     We accept either size; the old-SD path follows the v1 layout.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StatData {
+    pub mode: u32,
+    pub size: u64,
+    pub uid: u32,
+    pub gid: u32,
+    pub mtime: u32,
+}
+
+impl StatData {
+    /// Parse a StatData body. Dispatches on body length (44 = new, 32 = old).
+    fn parse(body: &[u8]) -> Result<Self, FilesystemError> {
+        match body.len() {
+            44 => Self::parse_new(body),
+            32 => Self::parse_old(body),
+            other => Err(FilesystemError::Parse(format!(
+                "reiserfs StatData: expected 32 or 44 bytes, got {other}"
+            ))),
+        }
+    }
+
+    /// v3.6 / "new" StatData. Field offsets per kernel `struct stat_data`
+    /// in `reiserfs_fs.h`.
+    fn parse_new(b: &[u8]) -> Result<Self, FilesystemError> {
+        let mode = u16::from_le_bytes([b[0], b[1]]) as u32;
+        // bytes 2..4 = sd_attrs (skipped)
+        // bytes 4..8  = sd_nlink (parsed but not surfaced)
+        let size = u64::from_le_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]);
+        let uid = u32::from_le_bytes([b[16], b[17], b[18], b[19]]);
+        let gid = u32::from_le_bytes([b[20], b[21], b[22], b[23]]);
+        // bytes 24..28 = sd_atime (skipped)
+        let mtime = u32::from_le_bytes([b[28], b[29], b[30], b[31]]);
+        Ok(Self {
+            mode,
+            size,
+            uid,
+            gid,
+            mtime,
+        })
+    }
+
+    /// v3.5 / "old" StatData. Field offsets per kernel
+    /// `struct stat_data_v1`.
+    fn parse_old(b: &[u8]) -> Result<Self, FilesystemError> {
+        let mode = u16::from_le_bytes([b[0], b[1]]) as u32;
+        // bytes 2..4  = sd_nlink (u16, not surfaced)
+        let uid = u16::from_le_bytes([b[4], b[5]]) as u32;
+        let gid = u16::from_le_bytes([b[6], b[7]]) as u32;
+        let size = u32::from_le_bytes([b[8], b[9], b[10], b[11]]) as u64;
+        // bytes 12..16 = sd_atime (skipped)
+        let mtime = u32::from_le_bytes([b[16], b[17], b[18], b[19]]);
+        Ok(Self {
+            mode,
+            size,
+            uid,
+            gid,
+            mtime,
+        })
+    }
+}
+
+// ---- Directory entry decoding (item type 3) ----
+
+/// On-disk DIR_ENTRY header (`struct reiserfs_de_head`). Sixteen bytes,
+/// always little-endian.
+const DEH_SIZE: usize = 16;
+
+/// One decoded directory entry (name + target object key).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DirEntry {
+    pub name: String,
+    /// Target object's `dir_id` (= the directory's objectid, since
+    /// the entry lives inside that directory).
+    pub deh_dir_id: u32,
+    /// Target object's own objectid.
+    pub deh_objectid: u32,
+}
+
+/// Decode every entry in a DIR_ENTRY item body.
+///
+/// `body` is the in-leaf bytes (`item_location..item_location+item_len`),
+/// `entry_count` is the `free_space_or_entry_count` field of the
+/// `ItemHead`.
+///
+/// On-disk layout: `entry_count` × 16-byte `reiserfs_de_head` (sorted by
+/// hash), then names packed at the trailing end of the item, in reverse
+/// order. The slot allocated to entry `i` runs from `deh[i].location`
+/// up to `deh[i-1].location` (or `item_len` when `i == 0`). Within the
+/// slot, the name extends from `deh.location` up to the first NUL byte
+/// (slots are NUL-padded out to the next 8-byte alignment).
+pub(crate) fn parse_dirent_item(
+    body: &[u8],
+    entry_count: u16,
+) -> Result<Vec<DirEntry>, FilesystemError> {
+    let n = entry_count as usize;
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let headers_end = n.checked_mul(DEH_SIZE).ok_or_else(|| {
+        FilesystemError::Parse(format!("reiserfs dirent: entry_count {n} overflows"))
+    })?;
+    if headers_end > body.len() {
+        return Err(FilesystemError::Parse(format!(
+            "reiserfs dirent: {n} headers need {headers_end} bytes, item is {}",
+            body.len()
+        )));
+    }
+    // First pass: parse all headers + validate ordering of name locations.
+    let mut headers: Vec<(u32, u32, u16)> = Vec::with_capacity(n); // (dir_id, objectid, location)
+    for i in 0..n {
+        let off = i * DEH_SIZE;
+        let h = &body[off..off + DEH_SIZE];
+        // h[0..4]: deh_offset (hash | gen num) — not needed for read.
+        let dir_id = u32::from_le_bytes([h[4], h[5], h[6], h[7]]);
+        let objectid = u32::from_le_bytes([h[8], h[9], h[10], h[11]]);
+        let location = u16::from_le_bytes([h[12], h[13]]);
+        // h[14..16]: deh_state — bit 2 = visible. Not enforced.
+        if (location as usize) < headers_end {
+            return Err(FilesystemError::Parse(format!(
+                "reiserfs dirent: name location {location} overlaps {n}-entry \
+                 header area (ends at {headers_end})"
+            )));
+        }
+        if (location as usize) > body.len() {
+            return Err(FilesystemError::Parse(format!(
+                "reiserfs dirent: name location {location} past item body ({})",
+                body.len()
+            )));
+        }
+        headers.push((dir_id, objectid, location));
+    }
+    // Decode names. Slot for entry i runs from headers[i].loc to
+    // (i==0 ? item_len : headers[i-1].loc).
+    let mut entries = Vec::with_capacity(n);
+    for (i, &(dir_id, objectid, loc)) in headers.iter().enumerate() {
+        let slot_end = if i == 0 {
+            body.len()
+        } else {
+            headers[i - 1].2 as usize
+        };
+        let slot_start = loc as usize;
+        if slot_end < slot_start {
+            return Err(FilesystemError::Parse(format!(
+                "reiserfs dirent: entry {i} slot is reversed ({slot_end} < {slot_start})"
+            )));
+        }
+        let slot = &body[slot_start..slot_end];
+        // Name ends at the first NUL byte; slot is NUL-padded.
+        let name_end = slot.iter().position(|&b| b == 0).unwrap_or(slot.len());
+        let name = String::from_utf8_lossy(&slot[..name_end]).into_owned();
+        entries.push(DirEntry {
+            name,
+            deh_dir_id: dir_id,
+            deh_objectid: objectid,
+        });
+    }
+    Ok(entries)
 }
 
 impl<R: Read + Seek + Send> Filesystem for ReiserFsFilesystem<R> {
     fn root(&mut self) -> Result<FileEntry, FilesystemError> {
-        Err(FilesystemError::Unsupported(
-            "ReiserFS browse not yet implemented (see OPEN-WORK.md §1.1 R.3)".into(),
-        ))
+        let mut entry = FileEntry::root();
+        entry.location = pack_loc(REISERFS_ROOT_PARENT_OBJECTID, REISERFS_ROOT_OBJECTID);
+        // The root dir's StatData carries permissions / uid / gid the
+        // browse view shows. Failing to read it here would block the
+        // browse tab entirely, so surface a Parse error.
+        let sd = self.read_statdata(REISERFS_ROOT_PARENT_OBJECTID, REISERFS_ROOT_OBJECTID)?;
+        entry.mode = Some(sd.mode);
+        entry.uid = Some(sd.uid);
+        entry.gid = Some(sd.gid);
+        Ok(entry)
     }
 
-    fn list_directory(&mut self, _entry: &FileEntry) -> Result<Vec<FileEntry>, FilesystemError> {
-        Err(FilesystemError::Unsupported(
-            "ReiserFS browse not yet implemented (see OPEN-WORK.md §1.1 R.3)".into(),
-        ))
+    fn list_directory(&mut self, entry: &FileEntry) -> Result<Vec<FileEntry>, FilesystemError> {
+        let (dir_id, objectid) = unpack_loc(entry.location);
+        let items = self.collect_items_for_object(dir_id, objectid)?;
+        let mut children: Vec<FileEntry> = Vec::new();
+        for (ih, body) in items {
+            let fmt = ih.key_format()?;
+            if !matches!(ih.key.item_type(fmt), ItemType::DirEntry) {
+                continue;
+            }
+            let parsed = parse_dirent_item(&body, ih.free_space_or_entry_count)?;
+            for ent in parsed {
+                if ent.name == "." || ent.name == ".." || ent.name == REISERFS_PRIV_NAME {
+                    continue;
+                }
+                let child_sd = self.read_statdata(ent.deh_dir_id, ent.deh_objectid)?;
+                let parent_path = if entry.path == "/" {
+                    String::new()
+                } else {
+                    entry.path.clone()
+                };
+                let child_path = format!("{}/{}", parent_path, ent.name);
+                let child_loc = pack_loc(ent.deh_dir_id, ent.deh_objectid);
+                let mut child = match unix_file_type(child_sd.mode) {
+                    UnixFileType::Directory => {
+                        FileEntry::new_directory(ent.name.clone(), child_path, child_loc)
+                    }
+                    UnixFileType::Symlink => {
+                        let target = self.read_symlink_target(
+                            ent.deh_dir_id,
+                            ent.deh_objectid,
+                            child_sd.size,
+                        )?;
+                        FileEntry::new_symlink(
+                            ent.name.clone(),
+                            child_path,
+                            child_sd.size,
+                            child_loc,
+                            target,
+                        )
+                    }
+                    UnixFileType::BlockDevice
+                    | UnixFileType::CharDevice
+                    | UnixFileType::Fifo
+                    | UnixFileType::Socket => FileEntry::new_special(
+                        ent.name.clone(),
+                        child_path,
+                        child_loc,
+                        match unix_file_type(child_sd.mode) {
+                            UnixFileType::BlockDevice => "block device".into(),
+                            UnixFileType::CharDevice => "char device".into(),
+                            UnixFileType::Fifo => "fifo".into(),
+                            UnixFileType::Socket => "socket".into(),
+                            _ => unreachable!(),
+                        },
+                    ),
+                    UnixFileType::Regular | UnixFileType::Unknown => {
+                        FileEntry::new_file(ent.name.clone(), child_path, child_sd.size, child_loc)
+                    }
+                };
+                child.mode = Some(child_sd.mode);
+                child.uid = Some(child_sd.uid);
+                child.gid = Some(child_sd.gid);
+                child.modified = Some(format_unix_timestamp(child_sd.mtime as i64));
+                children.push(child);
+            }
+        }
+        Ok(children)
     }
 
     fn read_file(
@@ -400,7 +703,7 @@ impl<R: Read + Seek + Send> Filesystem for ReiserFsFilesystem<R> {
         _max_bytes: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
         Err(FilesystemError::Unsupported(
-            "ReiserFS read not yet implemented (see OPEN-WORK.md §1.1 R.3)".into(),
+            "ReiserFS read_file not yet implemented (see OPEN-WORK.md §1.1 R.3d)".into(),
         ))
     }
 
@@ -1792,6 +2095,254 @@ mod tests {
         // First pointer should be 8212 per the debugreiserfs dump.
         let first_ptr = u32::from_le_bytes([ind_body[0], ind_body[1], ind_body[2], ind_body[3]]);
         assert_eq!(first_ptr, 8212);
+    }
+
+    // ---- R.3c: StatData, DIR_ENTRY parser, list_directory ----
+
+    fn build_new_statdata(mode: u32, size: u64, uid: u32, gid: u32, mtime: u32) -> [u8; 44] {
+        let mut b = [0u8; 44];
+        b[0..2].copy_from_slice(&(mode as u16).to_le_bytes());
+        // attrs(2..4) left zero
+        b[4..8].copy_from_slice(&1u32.to_le_bytes()); // nlink
+        b[8..16].copy_from_slice(&size.to_le_bytes());
+        b[16..20].copy_from_slice(&uid.to_le_bytes());
+        b[20..24].copy_from_slice(&gid.to_le_bytes());
+        b[28..32].copy_from_slice(&mtime.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn parses_new_statdata() {
+        let body = build_new_statdata(0o100644, 12345, 1000, 100, 1700000000);
+        let sd = StatData::parse(&body).expect("parse");
+        assert_eq!(sd.mode, 0o100644);
+        assert_eq!(sd.size, 12345);
+        assert_eq!(sd.uid, 1000);
+        assert_eq!(sd.gid, 100);
+        assert_eq!(sd.mtime, 1700000000);
+    }
+
+    #[test]
+    fn parses_old_statdata() {
+        let mut b = [0u8; 32];
+        b[0..2].copy_from_slice(&(0o100644u32 as u16).to_le_bytes()); // mode
+        b[2..4].copy_from_slice(&1u16.to_le_bytes()); // nlink
+        b[4..6].copy_from_slice(&500u16.to_le_bytes()); // uid
+        b[6..8].copy_from_slice(&100u16.to_le_bytes()); // gid
+        b[8..12].copy_from_slice(&999u32.to_le_bytes()); // size
+        b[16..20].copy_from_slice(&1700000000u32.to_le_bytes()); // mtime
+        let sd = StatData::parse(&b).expect("parse old");
+        assert_eq!(sd.mode, 0o100644);
+        assert_eq!(sd.size, 999);
+        assert_eq!(sd.uid, 500);
+        assert_eq!(sd.gid, 100);
+        assert_eq!(sd.mtime, 1700000000);
+    }
+
+    #[test]
+    fn rejects_wrong_size_statdata() {
+        match StatData::parse(&[0u8; 16]) {
+            Err(FilesystemError::Parse(msg)) => {
+                assert!(msg.contains("32 or 44"), "unexpected msg: {msg}")
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    /// Build a DIR_ENTRY item body containing `entries`. Names are packed
+    /// 8-aligned at the end (matching mkfs.reiserfs convention).
+    fn build_dirent_body(entries: &[(&str, u32, u32)]) -> (Vec<u8>, u16) {
+        let n = entries.len();
+        let headers_size = n * DEH_SIZE;
+        // Compute name slots (8-aligned).
+        let mut slot_sizes: Vec<usize> = entries
+            .iter()
+            .map(|(name, _, _)| name.len().div_ceil(8) * 8)
+            .collect();
+        // Ensure at least one byte slot (catch zero-length names).
+        for s in slot_sizes.iter_mut() {
+            if *s == 0 {
+                *s = 8;
+            }
+        }
+        let total: usize = headers_size + slot_sizes.iter().sum::<usize>();
+        let mut body = vec![0u8; total];
+
+        // Names live at the END of the body, with entry[0] having the
+        // HIGHEST location (closest to the end).
+        let mut name_offset = total;
+        let mut deh_locations = Vec::with_capacity(n);
+        for (i, (name, _, _)) in entries.iter().enumerate() {
+            name_offset -= slot_sizes[i];
+            deh_locations.push(name_offset);
+            body[name_offset..name_offset + name.len()].copy_from_slice(name.as_bytes());
+        }
+        // Now write the headers in array order.
+        for (i, (_name, dir_id, objectid)) in entries.iter().enumerate() {
+            let off = i * DEH_SIZE;
+            // deh_offset: just write i as the hash (not used by parser).
+            body[off..off + 4].copy_from_slice(&(i as u32).to_le_bytes());
+            body[off + 4..off + 8].copy_from_slice(&dir_id.to_le_bytes());
+            body[off + 8..off + 12].copy_from_slice(&objectid.to_le_bytes());
+            body[off + 12..off + 14].copy_from_slice(&(deh_locations[i] as u16).to_le_bytes());
+            // state bit 2 = visible
+            body[off + 14..off + 16].copy_from_slice(&4u16.to_le_bytes());
+        }
+        (body, n as u16)
+    }
+
+    #[test]
+    fn parse_dirent_empty() {
+        let entries = parse_dirent_item(&[], 0).expect("parse empty");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn parse_dirent_single() {
+        let (body, n) = build_dirent_body(&[("hello", 2, 4)]);
+        let entries = parse_dirent_item(&body, n).expect("parse");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "hello");
+        assert_eq!(entries[0].deh_dir_id, 2);
+        assert_eq!(entries[0].deh_objectid, 4);
+    }
+
+    #[test]
+    fn parse_dirent_multiple_with_padding() {
+        // Three entries — array order is the on-disk order (by hash).
+        // First entry has HIGHEST location (latest byte slot near end).
+        let (body, n) = build_dirent_body(&[(".", 1, 2), ("..", 0, 1), ("subdir", 2, 5)]);
+        let entries = parse_dirent_item(&body, n).expect("parse");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].name, ".");
+        assert_eq!(entries[1].name, "..");
+        assert_eq!(entries[2].name, "subdir");
+        assert_eq!(entries[2].deh_objectid, 5);
+    }
+
+    #[test]
+    fn parse_dirent_rejects_overlap_with_header_area() {
+        // entry_count=2 means headers occupy bytes 0..32. A name
+        // location of 16 would land inside the header area.
+        let mut body = vec![0u8; 64];
+        // header 0
+        body[12..14].copy_from_slice(&16u16.to_le_bytes());
+        // header 1
+        body[28..30].copy_from_slice(&48u16.to_le_bytes());
+        match parse_dirent_item(&body, 2) {
+            Err(FilesystemError::Parse(msg)) => {
+                assert!(msg.contains("overlaps"), "unexpected msg: {msg}")
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_dirent_rejects_location_past_body() {
+        let mut body = vec![0u8; 32]; // 1 entry header + 16 bytes name area
+        body[12..14].copy_from_slice(&999u16.to_le_bytes());
+        match parse_dirent_item(&body, 1) {
+            Err(FilesystemError::Parse(msg)) => {
+                assert!(msg.contains("past item body"), "unexpected msg: {msg}")
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pack_unpack_loc_roundtrip() {
+        for (d, o) in [(1, 2), (5, 999), (u32::MAX, 0), (0, u32::MAX)] {
+            assert_eq!(unpack_loc(pack_loc(d, o)), (d, o));
+        }
+    }
+
+    // ---- R.3c: real-image checks against the v3.6 fixture ----
+
+    #[test]
+    fn fixture_v3_6_root_returns_directory() {
+        let img = load_fixture("test_reiserfs_v3_6.img.zst");
+        let mut fs = ReiserFsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        assert!(root.is_directory());
+        assert_eq!(root.path, "/");
+        // (dir_id, objectid) for root = (1, 2).
+        assert_eq!(unpack_loc(root.location), (1, 2));
+        // Root SD: drwxr-xr-x per debugreiserfs.
+        assert!(root.mode.is_some(), "root has SD mode bits");
+        let mode = root.mode.unwrap() & 0o7777;
+        assert_eq!(mode, 0o755);
+    }
+
+    #[test]
+    fn fixture_v3_6_list_root_filters_hidden() {
+        let img = load_fixture("test_reiserfs_v3_6.img.zst");
+        let mut fs = ReiserFsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list root");
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        // `.`, `..`, `.reiserfs_priv` filtered. Remaining: 5 user entries.
+        assert_eq!(entries.len(), 5, "got entries: {names:?}");
+        for visible in &["hello.txt", "subdir", "link.txt", "tiny.txt", "large.bin"] {
+            assert!(names.contains(visible), "missing {visible} in {names:?}");
+        }
+        for hidden in &[".", "..", ".reiserfs_priv"] {
+            assert!(!names.contains(hidden), "{hidden} should be hidden");
+        }
+    }
+
+    #[test]
+    fn fixture_v3_6_file_entries_carry_metadata() {
+        let img = load_fixture("test_reiserfs_v3_6.img.zst");
+        let mut fs = ReiserFsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list root");
+
+        let hello = entries.iter().find(|e| e.name == "hello.txt").unwrap();
+        assert!(hello.is_file());
+        assert_eq!(hello.size, 16); // "Hello, ReiserFS!" = 16 bytes
+        assert_eq!(hello.mode.map(|m| m & 0o777), Some(0o644));
+        assert!(hello.uid.is_some());
+        assert!(hello.gid.is_some());
+        assert!(hello.modified.is_some());
+
+        let large = entries.iter().find(|e| e.name == "large.bin").unwrap();
+        assert!(large.is_file());
+        assert_eq!(large.size, 24576);
+
+        let tiny = entries.iter().find(|e| e.name == "tiny.txt").unwrap();
+        assert!(tiny.is_file());
+        assert_eq!(tiny.size, 10);
+    }
+
+    #[test]
+    fn fixture_v3_6_symlink_target() {
+        let img = load_fixture("test_reiserfs_v3_6.img.zst");
+        let mut fs = ReiserFsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list root");
+        let link = entries.iter().find(|e| e.name == "link.txt").unwrap();
+        assert!(link.is_symlink());
+        assert_eq!(link.size, 9); // "hello.txt"
+        assert_eq!(link.symlink_target.as_deref(), Some("hello.txt"));
+        assert_eq!(link.mode.map(|m| m & 0o7777), Some(0o777));
+    }
+
+    #[test]
+    fn fixture_v3_6_subdir_listing() {
+        let img = load_fixture("test_reiserfs_v3_6.img.zst");
+        let mut fs = ReiserFsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list root");
+        let subdir = entries.iter().find(|e| e.name == "subdir").unwrap();
+        assert!(subdir.is_directory());
+        assert_eq!(subdir.path, "/subdir");
+        // Recurse one level.
+        let sub_entries = fs.list_directory(subdir).expect("list subdir");
+        assert_eq!(sub_entries.len(), 1, "subdir has only nested.txt");
+        let nested = &sub_entries[0];
+        assert_eq!(nested.name, "nested.txt");
+        assert_eq!(nested.path, "/subdir/nested.txt");
+        assert_eq!(nested.size, 11); // "nested file"
     }
 
     #[test]
