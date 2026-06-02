@@ -1351,6 +1351,68 @@ mod tests {
     }
 
     #[test]
+    fn shortform_to_block_dir_conversion() {
+        // Add enough files to overflow the inline root directory, forcing a
+        // short-form -> single-block conversion (exercises the dir2 block
+        // builder + hash leaf index on the ftype-enabled fixture). All entries
+        // must list, the originals survive, a sample reads back, and the volume
+        // stays clean.
+        use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem};
+        use std::io::Cursor as IoCursor;
+        let sample: Vec<u8> = (0..1234u32).map(|i| (i % 251) as u8).collect();
+
+        let img = load_fixture().to_vec();
+        let mut cursor = Cursor::new(img);
+        {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable");
+            let root = fs.root().expect("root");
+            for i in 0..20 {
+                let mut data = IoCursor::new(sample.clone());
+                fs.create_file(
+                    &root,
+                    &format!("added_{i:02}.dat"),
+                    &mut data,
+                    sample.len() as u64,
+                    &CreateFileOptions::default(),
+                )
+                .unwrap_or_else(|e| panic!("create_file {i}: {e}"));
+            }
+            fs.sync_metadata().expect("sync");
+        }
+
+        let repaired = cursor.into_inner();
+        let mut fs = XfsFilesystem::open(Cursor::new(repaired), 0).expect("reopen");
+        let root = fs.root().expect("root");
+        // Root must now be a block (extents) directory, not short-form.
+        assert_ne!(
+            fs.read_inode(root.location).expect("root core").format,
+            DiFormat::Local,
+            "root should have converted out of short-form"
+        );
+        let entries = fs.list_directory(&root).expect("list");
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        for i in 0..20 {
+            let want = format!("added_{i:02}.dat");
+            assert!(
+                names.contains(&want.as_str()),
+                "missing {want} in {names:?}"
+            );
+        }
+        // Originals survive.
+        assert!(names.contains(&"hello.txt"), "original lost: {names:?}");
+        // A sample reads back intact.
+        let e = entries.iter().find(|e| e.name == "added_07.dat").unwrap();
+        let got = fs.read_file(e, sample.len() + 4096).expect("read");
+        assert_eq!(&got[..sample.len()], &sample[..], "data mismatch");
+        let res = fs.run_fsck().expect("fsck");
+        assert!(
+            res.errors.is_empty(),
+            "expected clean, got {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn delete_entry_frees_inode_and_blocks() {
         // Create a file + an empty dir, then delete both; the volume returns to
         // a clean state with the entries gone and free space recovered.

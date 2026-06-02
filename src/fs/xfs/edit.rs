@@ -4,21 +4,26 @@
 //! and writes straight through to the device (no in-memory staging), like the
 //! repair path.
 //!
-//! This first slice covers the two primitives a short-form `create_directory`
-//! needs — and no more:
+//! Primitives, smallest first:
 //!
-//!   1. **Inode-slot allocation** ([`alloc_inode_slot`]): claim a free inode
-//!      from an existing inode-btree chunk (flip its `ir_free` bit, decrement
-//!      the record freecount + AGI freecount + `sb_ifree`). Allocating a *new*
-//!      64-inode chunk when none has a free slot is deferred.
-//!   2. **Short-form directory entry insertion** ([`sf_insert_entry`]): append
-//!      an entry to an inline directory, computing the dir2 offset cookie the
-//!      way `libxfs` does, updating `di_size`/count and the parent's link
-//!      count. Conversion to block form when the inline fork overflows is
-//!      deferred (returns `DiskFull`).
+//!   * **Inode-slot allocation** ([`alloc_inode_slot`]) / freeing
+//!     ([`free_inode`]): claim/release an inode in an existing inode-btree
+//!     chunk (flip `ir_free`, adjust the record freecount + AGI freecount +
+//!     `sb_ifree`). New-chunk allocation when every chunk is full is deferred.
+//!   * **Block allocation** ([`alloc_blocks`]) / freeing ([`free_blocks`]):
+//!     carve/return contiguous blocks by rebuilding the AG free-space btrees
+//!     (reusing the R2 rebuild) + resyncing `sb_fdblocks`.
+//!   * **Directory insert** ([`dir_insert_entry`]) / remove ([`sf_remove_entry`]):
+//!     short-form inline add/remove, automatic short-form→single-block
+//!     conversion on overflow ([`build_block_dir`] writes the data entries,
+//!     `bestfree`, and the sorted hash leaf index), and rebuild-in-place inserts
+//!     for an already single-block directory. Leaf/node (multi-block)
+//!     directories are still `Unsupported`.
 //!
-//! Porting reference: `xfs_repair` @ v3.1.11 + `libxfs/xfs_dir2_sf.c`,
-//! `libxfs/xfs_ialloc.c`.
+//! On top of these: `create_directory`, `create_file` (single contiguous
+//! extent), and `delete_entry` (empty short-form dirs / single-or-no-extent
+//! files). Porting reference: `xfs_repair` @ v3.1.11 + `libxfs/xfs_dir2_sf.c`,
+//! `libxfs/xfs_dir2_block.c`, `libxfs/xfs_ialloc.c`.
 
 use std::io::{Read, Seek, Write};
 
@@ -36,6 +41,9 @@ use crate::fs::filesystem::FilesystemError;
 
 /// Largest single-extent file we write: the on-disk blockcount field is 21 bits.
 const MAX_SINGLE_EXTENT_BLOCKS: u64 = (1 << 21) - 1;
+
+/// A directory's child entries as `(name, inode, ftype)`, excluding `.`/`..`.
+type DirEntries = Vec<(String, u64, u8)>;
 
 /// dir2 filetype values (only the two we emit).
 const XFS_DIR3_FT_REG_FILE: u8 = 1;
@@ -381,56 +389,16 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     ) -> Result<u64, FilesystemError> {
         let sb = self.superblock().clone();
 
-        // Pre-flight: the parent must be a short-form dir with room for the
-        // entry, and the name must be unique — checked before allocating so a
-        // failure leaves the volume unchanged.
-        self.sf_check_insertable(&sb, parent_ino, name)?;
+        // Pre-flight (no writes): unique name + the parent can take the entry
+        // (short-form, or short-form converting to a single block, or an
+        // existing single-block dir) — so a failure leaves the volume unchanged.
+        self.dir_can_insert(&sb, parent_ino, name, true)?;
 
         let ino = self.alloc_inode_slot(&sb)?;
         self.init_empty_shortform_dir(&sb, ino, parent_ino, mode, uid, gid)?;
-        self.sf_insert_entry(&sb, parent_ino, name, ino, true)?;
+        self.dir_insert_entry(&sb, parent_ino, name, ino, true)?;
         self.reader.flush()?;
         Ok(ino)
-    }
-
-    /// Validate that `name` can be inserted into short-form directory
-    /// `parent_ino` (parent is a short-form dir, name unique, room in the inline
-    /// fork). Pure check — no writes.
-    fn sf_check_insertable(
-        &mut self,
-        sb: &super::sb::XfsSuperblock,
-        parent_ino: u64,
-        name: &str,
-    ) -> Result<(), FilesystemError> {
-        let has_ftype = sb.has_ftype();
-        let (core, buf) = self.read_inode_buf(parent_ino)?;
-        if !core.is_dir() || core.format != super::types::DiFormat::Local {
-            return Err(FilesystemError::Unsupported(
-                "parent is not a short-form directory".into(),
-            ));
-        }
-        let namelen = name.len();
-        if namelen == 0 || namelen > 255 {
-            return Err(FilesystemError::InvalidData("bad entry name length".into()));
-        }
-        let fs = fork_offset(false);
-        let fork_end = fs + core.size as usize;
-        let (_parent, entries) = super::dir2::parse_shortform(&buf[fs..fork_end], has_ftype)?;
-        if entries.iter().any(|e| e.name == name) {
-            return Err(FilesystemError::AlreadyExists(name.to_string()));
-        }
-        let entry_len = 1 + 2 + namelen + usize::from(has_ftype) + 4;
-        let avail_end = if core.forkoff > 0 {
-            fs + (core.forkoff as usize) * 8
-        } else {
-            buf.len()
-        };
-        if fork_end + entry_len > avail_end {
-            return Err(FilesystemError::DiskFull(
-                "short-form directory full (block-form conversion not implemented)".into(),
-            ));
-        }
-        Ok(())
     }
 
     // ----- block allocation + create_file -----------------------------------
@@ -620,7 +588,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         gid: u32,
     ) -> Result<u64, FilesystemError> {
         let sb = self.superblock().clone();
-        self.sf_check_insertable(&sb, parent_ino, name)?;
+        self.dir_can_insert(&sb, parent_ino, name, false)?;
 
         let bs = sb.blocksize as u64;
         let nblocks = data_len.div_ceil(bs);
@@ -643,7 +611,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             self.write_file_data(&sb, fsblock, count, data, data_len)?;
         }
         self.init_file_inode(&sb, ino, mode, uid, gid, data_len, extent)?;
-        self.sf_insert_entry(&sb, parent_ino, name, ino, false)?;
+        self.dir_insert_entry(&sb, parent_ino, name, ino, false)?;
         self.reader.flush()?;
         Ok(ino)
     }
@@ -882,4 +850,524 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         self.reader.flush()?;
         Ok(())
     }
+
+    // ----- format-aware directory insert (short-form OR single-block) --------
+
+    /// Check, without writing, that `name` can be inserted into directory
+    /// `parent_ino` (unique name; parent is short-form or single-block; the
+    /// result fits — converting short-form→block if the inline fork overflows).
+    /// Errors `AlreadyExists` / `DiskFull` / `Unsupported` accordingly.
+    pub(crate) fn dir_can_insert(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        parent_ino: u64,
+        name: &str,
+        new_is_dir: bool,
+    ) -> Result<(), FilesystemError> {
+        let has_ftype = sb.has_ftype();
+        let (core, buf) = self.read_inode_buf(parent_ino)?;
+        if !core.is_dir() {
+            return Err(FilesystemError::Unsupported(
+                "parent is not a directory".into(),
+            ));
+        }
+        let (dotdot, mut entries) = self.gather_dir_entries(sb, &core, &buf, parent_ino)?;
+        if entries.iter().any(|(n, _, _)| n == name) {
+            return Err(FilesystemError::AlreadyExists(name.into()));
+        }
+        match core.format {
+            super::types::DiFormat::Local => {
+                // Inline fit?
+                let fs = fork_offset(false);
+                let entry_len = 1 + 2 + name.len() + usize::from(has_ftype) + 4;
+                let avail_end = if core.forkoff > 0 {
+                    fs + (core.forkoff as usize) * 8
+                } else {
+                    buf.len()
+                };
+                if fs + core.size as usize + entry_len <= avail_end {
+                    return Ok(()); // fits inline
+                }
+                // Would overflow → must fit one block.
+                let ft = if new_is_dir {
+                    XFS_DIR3_FT_DIR
+                } else {
+                    XFS_DIR3_FT_REG_FILE
+                };
+                entries.push((name.to_string(), 0, ft));
+                build_block_dir(
+                    &entries,
+                    parent_ino,
+                    dotdot,
+                    sb.dirblksize() as usize,
+                    has_ftype,
+                )
+                .map(|_| ())
+            }
+            super::types::DiFormat::Extents => {
+                let ft = if new_is_dir {
+                    XFS_DIR3_FT_DIR
+                } else {
+                    XFS_DIR3_FT_REG_FILE
+                };
+                entries.push((name.to_string(), 0, ft));
+                build_block_dir(
+                    &entries,
+                    parent_ino,
+                    dotdot,
+                    sb.dirblksize() as usize,
+                    has_ftype,
+                )
+                .map(|_| ())
+            }
+            _ => Err(FilesystemError::Unsupported(
+                "parent directory format not editable (btree/leaf/node)".into(),
+            )),
+        }
+    }
+
+    /// Insert `(name -> child_ino)` into directory `parent_ino`, handling
+    /// short-form (inline, or converted to a single block on overflow) and
+    /// single-block directories. Bumps the parent link count for a subdirectory.
+    pub(crate) fn dir_insert_entry(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        parent_ino: u64,
+        name: &str,
+        child_ino: u64,
+        is_dir: bool,
+    ) -> Result<(), FilesystemError> {
+        let (core, _buf) = self.read_inode_buf(parent_ino)?;
+        match core.format {
+            super::types::DiFormat::Local => {
+                match self.sf_insert_entry(sb, parent_ino, name, child_ino, is_dir) {
+                    Err(FilesystemError::DiskFull(_)) => {
+                        self.convert_sf_dir_to_block(sb, parent_ino, name, child_ino, is_dir)
+                    }
+                    other => other,
+                }
+            }
+            super::types::DiFormat::Extents => {
+                self.block_insert_entry(sb, parent_ino, name, child_ino, is_dir)
+            }
+            _ => Err(FilesystemError::Unsupported(
+                "parent directory format not editable (btree/leaf/node)".into(),
+            )),
+        }
+    }
+
+    /// Convert an overflowing short-form directory to a single-block directory,
+    /// including the new `(name -> child_ino)` entry. Allocates one directory
+    /// block, writes it, and rewrites the inode to extents format.
+    fn convert_sf_dir_to_block(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        parent_ino: u64,
+        name: &str,
+        child_ino: u64,
+        is_dir: bool,
+    ) -> Result<(), FilesystemError> {
+        let has_ftype = sb.has_ftype();
+        let (core, buf) = self.read_inode_buf(parent_ino)?;
+        let (dotdot, mut entries) = self.gather_dir_entries(sb, &core, &buf, parent_ino)?;
+        let ft = if is_dir {
+            XFS_DIR3_FT_DIR
+        } else {
+            XFS_DIR3_FT_REG_FILE
+        };
+        entries.push((name.to_string(), child_ino, ft));
+
+        let dirblksize = sb.dirblksize() as usize;
+        let block = build_block_dir(&entries, parent_ino, dotdot, dirblksize, has_ftype)?;
+        let blocks_per_dir = (dirblksize as u64).div_ceil(sb.blocksize as u64) as u32;
+        let fsblock = self.alloc_blocks(sb, blocks_per_dir)?;
+        self.write_dir_block(sb, fsblock, &block)?;
+        self.set_dir_inode_single_extent(
+            sb,
+            parent_ino,
+            fsblock,
+            blocks_per_dir,
+            dirblksize,
+            is_dir,
+        )
+    }
+
+    /// Rebuild an already single-block directory with the new entry appended,
+    /// writing it back in place (no reallocation). Errors `DiskFull` if the
+    /// directory has outgrown one block (leaf/node format not implemented).
+    fn block_insert_entry(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        parent_ino: u64,
+        name: &str,
+        child_ino: u64,
+        is_dir: bool,
+    ) -> Result<(), FilesystemError> {
+        let has_ftype = sb.has_ftype();
+        let (core, buf) = self.read_inode_buf(parent_ino)?;
+        let extents = self.decode_data_extents(&core, &buf)?;
+        let first = extents
+            .first()
+            .ok_or_else(|| FilesystemError::Parse("block dir has no extent".into()))?;
+        if first.startoff != 0 {
+            return Err(FilesystemError::Unsupported(
+                "multi-block directory not editable".into(),
+            ));
+        }
+        let dirblksize = sb.dirblksize() as usize;
+        let blocks_per_dir = (dirblksize as u64).div_ceil(sb.blocksize as u64) as u32;
+        let fsblock = first.startblock;
+
+        let (dotdot, mut entries) =
+            self.read_block_dir_entries(sb, fsblock, dirblksize, has_ftype)?;
+        if entries.iter().any(|(n, _, _)| n == name) {
+            return Err(FilesystemError::AlreadyExists(name.into()));
+        }
+        let ft = if is_dir {
+            XFS_DIR3_FT_DIR
+        } else {
+            XFS_DIR3_FT_REG_FILE
+        };
+        entries.push((name.to_string(), child_ino, ft));
+        let block = build_block_dir(&entries, parent_ino, dotdot, dirblksize, has_ftype)?;
+        self.write_dir_block(sb, fsblock, &block)?;
+        let _ = blocks_per_dir;
+        if is_dir {
+            self.bump_dir_nlink(sb, parent_ino, 1)?;
+        }
+        Ok(())
+    }
+
+    /// Collect a directory's entries `(name, ino, ftype)` (excluding `.`/`..`)
+    /// plus the `..` inode, from a short-form or single-block directory.
+    fn gather_dir_entries(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        core: &super::inode::XfsDinodeCore,
+        buf: &[u8],
+        parent_ino: u64,
+    ) -> Result<(u64, DirEntries), FilesystemError> {
+        let has_ftype = sb.has_ftype();
+        match core.format {
+            super::types::DiFormat::Local => {
+                let fs = fork_offset(false);
+                let fork = &buf[fs..fs + core.size as usize];
+                Ok(sf_entries_with_ftype(fork, has_ftype)?)
+            }
+            super::types::DiFormat::Extents => {
+                let extents = self.decode_data_extents(core, buf)?;
+                let first = extents
+                    .first()
+                    .ok_or_else(|| FilesystemError::Parse("block dir has no extent".into()))?;
+                let dirblksize = sb.dirblksize() as usize;
+                self.read_block_dir_entries(sb, first.startblock, dirblksize, has_ftype)
+            }
+            _ => {
+                let _ = parent_ino;
+                Err(FilesystemError::Unsupported(
+                    "parent directory format not editable".into(),
+                ))
+            }
+        }
+    }
+
+    /// Read a single-block directory's entries `(name, ino, ftype)` (skipping
+    /// `.`/`..`) and the `..` inode.
+    fn read_block_dir_entries(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        fsblock: u64,
+        dirblksize: usize,
+        has_ftype: bool,
+    ) -> Result<(u64, DirEntries), FilesystemError> {
+        let mut block = vec![0u8; dirblksize];
+        let bs = sb.blocksize as u64;
+        for i in 0..(dirblksize as u64 / bs) {
+            let part =
+                fsblock_to_partition_byte(fsblock + i, sb.agblocks, sb.agblklog, sb.blocksize);
+            read_at_aligned(
+                &mut self.reader,
+                self.partition_offset + part,
+                bs,
+                &mut block[(i * bs) as usize..((i + 1) * bs) as usize],
+            )?;
+        }
+        block_entries_with_ftype(&block, has_ftype)
+    }
+
+    /// Write `block` bytes across the directory block's fsblock(s).
+    fn write_dir_block(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        fsblock: u64,
+        block: &[u8],
+    ) -> Result<(), FilesystemError> {
+        use std::io::SeekFrom;
+        let bs = sb.blocksize as usize;
+        for (i, chunk) in block.chunks(bs).enumerate() {
+            let part = fsblock_to_partition_byte(
+                fsblock + i as u64,
+                sb.agblocks,
+                sb.agblklog,
+                sb.blocksize,
+            );
+            self.reader
+                .seek(SeekFrom::Start(self.partition_offset + part))?;
+            self.reader.write_all(chunk)?;
+        }
+        Ok(())
+    }
+
+    /// Rewrite a directory inode to extents format with a single data extent
+    /// `(fsblock, blocks)` of size `dirblksize`. Bumps nlink when `add_subdir`.
+    fn set_dir_inode_single_extent(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        ino: u64,
+        fsblock: u64,
+        blocks: u32,
+        dirblksize: usize,
+        add_subdir: bool,
+    ) -> Result<(), FilesystemError> {
+        let (_core, mut buf) = self.read_inode_buf(ino)?;
+        buf[5] = 2; // di_format = extents
+        BigEndian::write_u64(&mut buf[56..64], dirblksize as u64); // di_size
+        BigEndian::write_u64(&mut buf[64..72], blocks as u64); // di_nblocks
+        BigEndian::write_u32(&mut buf[76..80], 1); // di_nextents
+        if add_subdir {
+            let version = buf[4];
+            if version == 1 {
+                let n = BigEndian::read_u16(&buf[6..8]).wrapping_add(1);
+                BigEndian::write_u16(&mut buf[6..8], n);
+            } else {
+                let n = BigEndian::read_u32(&buf[16..20]).wrapping_add(1);
+                BigEndian::write_u32(&mut buf[16..20], n);
+            }
+        }
+        let fs = fork_offset(false);
+        for b in buf.iter_mut().skip(fs) {
+            *b = 0;
+        }
+        let rec = encode_extent(false, 0, fsblock, blocks as u64);
+        buf[fs..fs + 16].copy_from_slice(&rec);
+        self.write_inode_region(sb, ino, &buf)
+    }
+
+    /// Bump a directory inode's link count by `delta` (version-correct field).
+    fn bump_dir_nlink(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        ino: u64,
+        delta: i32,
+    ) -> Result<(), FilesystemError> {
+        let (_core, mut buf) = self.read_inode_buf(ino)?;
+        let version = buf[4];
+        if version == 1 {
+            let n = (BigEndian::read_u16(&buf[6..8]) as i32 + delta).max(0) as u16;
+            BigEndian::write_u16(&mut buf[6..8], n);
+        } else {
+            let n = (BigEndian::read_u32(&buf[16..20]) as i32 + delta).max(0) as u32;
+            BigEndian::write_u32(&mut buf[16..20], n);
+        }
+        self.write_inode_region(sb, ino, &buf)
+    }
+}
+
+/// XFS directory name hash (`xfs_da_hashname`) — used to build the leaf hash
+/// index of a single-block directory.
+fn dir_hashname(name: &[u8]) -> u32 {
+    let mut hash: u32 = 0;
+    let mut chunks = name.chunks_exact(4);
+    for c in &mut chunks {
+        hash = ((c[0] as u32) << 21)
+            ^ ((c[1] as u32) << 14)
+            ^ ((c[2] as u32) << 7)
+            ^ (c[3] as u32)
+            ^ hash.rotate_left(7 * 4);
+    }
+    let rem = chunks.remainder();
+    match rem.len() {
+        3 => {
+            ((rem[0] as u32) << 14)
+                ^ ((rem[1] as u32) << 7)
+                ^ (rem[2] as u32)
+                ^ hash.rotate_left(7 * 3)
+        }
+        2 => ((rem[0] as u32) << 7) ^ (rem[1] as u32) ^ hash.rotate_left(7 * 2),
+        1 => (rem[0] as u32) ^ hash.rotate_left(7),
+        _ => hash,
+    }
+}
+
+/// Data-block size one directory entry occupies: `inumber(8) + namelen(1) +
+/// name + [ftype] + tag(2)`, rounded up to 8.
+fn dir2_data_entsize(namelen: usize, has_ftype: bool) -> usize {
+    let raw = 8 + 1 + namelen + usize::from(has_ftype) + 2;
+    raw.div_ceil(8) * 8
+}
+
+/// Build a v4 single-block (`XD2B`) directory holding `.`, `..`, and `entries`.
+/// `self_ino` is the directory's own inode (its `.`), `dotdot` its parent.
+/// Returns `DiskFull` if it doesn't fit one `dirblksize` block.
+fn build_block_dir(
+    entries: &[(String, u64, u8)],
+    self_ino: u64,
+    dotdot: u64,
+    dirblksize: usize,
+    has_ftype: bool,
+) -> Result<Vec<u8>, FilesystemError> {
+    // Full entry list with synthetic "." and "..".
+    let mut all: Vec<(&[u8], u64, u8)> = Vec::with_capacity(entries.len() + 2);
+    all.push((b".", self_ino, XFS_DIR3_FT_DIR));
+    all.push((b"..", dotdot, XFS_DIR3_FT_DIR));
+    for (n, ino, ft) in entries {
+        all.push((n.as_bytes(), *ino, *ft));
+    }
+
+    let leaf_count = all.len();
+    let leaf_section = leaf_count * 8 + 8; // leaf entries + tail
+    let data_size: usize = all
+        .iter()
+        .map(|(n, _, _)| dir2_data_entsize(n.len(), has_ftype))
+        .sum();
+    let data_start = XFS_DIR2_DATA_HDR_LEN;
+    let leaf_start = dirblksize
+        .checked_sub(leaf_section)
+        .ok_or_else(|| FilesystemError::DiskFull("dir block too small".into()))?;
+    if data_start + data_size > leaf_start {
+        return Err(FilesystemError::DiskFull(
+            "directory entries exceed one block (leaf/node format not implemented)".into(),
+        ));
+    }
+
+    let mut buf = vec![0u8; dirblksize];
+    BigEndian::write_u32(&mut buf[0..4], super::dir2::XFS_DIR2_BLOCK_MAGIC);
+
+    // Data entries from data_start; collect (hashval, address) for the leaf.
+    let mut leaf: Vec<(u32, u32)> = Vec::with_capacity(leaf_count);
+    let mut pos = data_start;
+    for (name, ino, ft) in &all {
+        let namelen = name.len();
+        let ent = dir2_data_entsize(namelen, has_ftype);
+        BigEndian::write_u64(&mut buf[pos..pos + 8], *ino);
+        buf[pos + 8] = namelen as u8;
+        buf[pos + 9..pos + 9 + namelen].copy_from_slice(name);
+        if has_ftype {
+            buf[pos + 9 + namelen] = *ft;
+        }
+        // Trailing tag = this entry's byte offset within the block.
+        BigEndian::write_u16(&mut buf[pos + ent - 2..pos + ent], pos as u16);
+        leaf.push((dir_hashname(name), (pos >> 3) as u32));
+        pos += ent;
+    }
+
+    // Free gap between the data area and the leaf section (a multiple of 8,
+    // since all the pieces are 8-aligned).
+    let gap_off = pos;
+    let gap_len = leaf_start - pos;
+    if gap_len >= 8 {
+        BigEndian::write_u16(&mut buf[gap_off..gap_off + 2], 0xFFFF); // free tag
+        BigEndian::write_u16(&mut buf[gap_off + 2..gap_off + 4], gap_len as u16);
+        // Unused record's trailing tag = its own offset.
+        BigEndian::write_u16(
+            &mut buf[gap_off + gap_len - 2..gap_off + gap_len],
+            gap_off as u16,
+        );
+        // bestfree[0] points at this gap.
+        BigEndian::write_u16(&mut buf[4..6], gap_off as u16);
+        BigEndian::write_u16(&mut buf[6..8], gap_len as u16);
+    }
+
+    // Leaf hash index, sorted ascending by hashval.
+    leaf.sort_by_key(|&(h, _)| h);
+    for (i, (h, a)) in leaf.iter().enumerate() {
+        let off = leaf_start + i * 8;
+        BigEndian::write_u32(&mut buf[off..off + 4], *h);
+        BigEndian::write_u32(&mut buf[off + 4..off + 8], *a);
+    }
+    // Tail: count, stale.
+    let tail = dirblksize - 8;
+    BigEndian::write_u32(&mut buf[tail..tail + 4], leaf_count as u32);
+    BigEndian::write_u32(&mut buf[tail + 4..tail + 8], 0);
+
+    Ok(buf)
+}
+
+/// Walk a short-form fork into `(parent_ino, [(name, ino, ftype)])`.
+fn sf_entries_with_ftype(
+    fork: &[u8],
+    has_ftype: bool,
+) -> Result<(u64, DirEntries), FilesystemError> {
+    if fork.len() < 6 {
+        return Err(FilesystemError::Parse("short-form fork too small".into()));
+    }
+    let count = fork[0] as usize;
+    let i8count = fork[1];
+    let ino_width = if i8count > 0 { 8 } else { 4 };
+    let read_ino = |b: &[u8]| -> u64 {
+        if ino_width == 8 {
+            BigEndian::read_u64(b)
+        } else {
+            BigEndian::read_u32(b) as u64
+        }
+    };
+    let parent = read_ino(&fork[2..2 + ino_width]);
+    let mut out = Vec::with_capacity(count);
+    let mut pos = 2 + ino_width;
+    for _ in 0..count {
+        let namelen = fork[pos] as usize;
+        let name_off = pos + 3;
+        let name_end = name_off + namelen;
+        let ft = if has_ftype { fork[name_end] } else { 0 };
+        let ino_off = name_end + usize::from(has_ftype);
+        let ino = read_ino(&fork[ino_off..ino_off + ino_width]);
+        out.push((
+            String::from_utf8_lossy(&fork[name_off..name_end]).to_string(),
+            ino,
+            ft,
+        ));
+        pos = ino_off + ino_width;
+    }
+    Ok((parent, out))
+}
+
+/// Walk a single-block directory into `(dotdot_ino, [(name, ino, ftype)])`,
+/// skipping `.`/`..`.
+fn block_entries_with_ftype(
+    block: &[u8],
+    has_ftype: bool,
+) -> Result<(u64, DirEntries), FilesystemError> {
+    let block_end = block.len();
+    let tail = block_end - 8;
+    let leaf_count = BigEndian::read_u32(&block[tail..tail + 4]) as usize;
+    let data_end = block_end - (leaf_count * 8 + 8);
+    let mut out = Vec::new();
+    let mut dotdot = 0u64;
+    let mut pos = XFS_DIR2_DATA_HDR_LEN;
+    while pos + 4 <= data_end {
+        let freetag = BigEndian::read_u16(&block[pos..pos + 2]);
+        if freetag == 0xFFFF {
+            let len = BigEndian::read_u16(&block[pos + 2..pos + 4]) as usize;
+            if len == 0 {
+                break;
+            }
+            pos += len;
+            continue;
+        }
+        let ino = BigEndian::read_u64(&block[pos..pos + 8]);
+        let namelen = block[pos + 8] as usize;
+        let name = &block[pos + 9..pos + 9 + namelen];
+        let ft = if has_ftype {
+            block[pos + 9 + namelen]
+        } else {
+            0
+        };
+        if name == b".." {
+            dotdot = ino;
+        } else if name != b"." {
+            out.push((String::from_utf8_lossy(name).to_string(), ino, ft));
+        }
+        pos += dir2_data_entsize(namelen, has_ftype);
+    }
+    Ok((dotdot, out))
 }
