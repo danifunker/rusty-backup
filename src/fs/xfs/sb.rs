@@ -56,6 +56,10 @@ pub struct XfsSuperblock {
     pub inopblog: u8,
     pub agblklog: u8,
     pub dirblklog: u8,
+    /// Inode-chunk start alignment in fsblocks (`sb_inoalignmt`). Inode chunks
+    /// begin on multiples of this; 0 means unaligned. Used by the repair
+    /// chunk-scanner to stride at the right granularity.
+    pub inoalignmt: u32,
     pub features2: u32,
     pub features_compat: u32,
     pub features_ro_compat: u32,
@@ -154,6 +158,7 @@ impl XfsSuperblock {
             inopblog: buf[123],
             agblklog: buf[124],
             dirblklog: buf[192],
+            inoalignmt: BigEndian::read_u32(&buf[180..184]),
             features2,
             features_compat,
             features_ro_compat,

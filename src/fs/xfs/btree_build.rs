@@ -113,29 +113,30 @@ pub fn build_sblock_btree(
     let mut next = 0usize; // index into `avail`
 
     // --- Level 0: leaves ---
-    // Each leaf carries up to max_leaf records and is chained left<->right.
-    let leaf_count = if nrecs == 0 {
-        1
-    } else {
-        nrecs.div_ceil(max_leaf)
-    };
-    let leaf_agbnos: Vec<u32> = (0..leaf_count).map(|_| take(avail, &mut next)).collect();
+    // Spread records *evenly* across the minimum number of leaves so that every
+    // leaf (the only exception being a lone leaf that is also the root) holds at
+    // least `maxrecs/2` records. XFS requires this B+tree minimum-fill invariant
+    // and `xfs_repair` flags any underfilled non-root block ("dubious ... block
+    // header"); a naive fill-then-remainder split leaves a starved last block.
+    let leaf_sizes = balanced_sizes(nrecs, max_leaf);
+    let leaf_agbnos: Vec<u32> = (0..leaf_sizes.len())
+        .map(|_| take(avail, &mut next))
+        .collect();
 
     // Each entry: (agbno, first_key) propagated to the parent level.
-    let mut child_level: Vec<(u32, Vec<u8>)> = Vec::with_capacity(leaf_count);
+    let mut child_level: Vec<(u32, Vec<u8>)> = Vec::with_capacity(leaf_sizes.len());
 
-    for i in 0..leaf_count {
+    let mut lo = 0usize;
+    for (i, &chunk_recs) in leaf_sizes.iter().enumerate() {
         let agbno = leaf_agbnos[i];
-        let lo = i * max_leaf;
-        let hi = ((i + 1) * max_leaf).min(nrecs);
+        let hi = lo + chunk_recs;
         let chunk = &records[lo * rec_size..hi * rec_size];
-        let chunk_recs = hi - lo;
         let left = if i == 0 {
             NULLAGBLOCK
         } else {
             leaf_agbnos[i - 1]
         };
-        let right = if i + 1 < leaf_count {
+        let right = if i + 1 < leaf_agbnos.len() {
             leaf_agbnos[i + 1]
         } else {
             NULLAGBLOCK
@@ -150,6 +151,7 @@ pub fn build_sblock_btree(
         }
         child_level.push((agbno, key));
         blocks.push(BuiltBlock { agbno, bytes: buf });
+        lo = hi;
     }
 
     let mut levels = 1u32;
@@ -157,7 +159,10 @@ pub fn build_sblock_btree(
     // --- Internal levels until a single root remains ---
     while child_level.len() > 1 {
         let mut parent_level: Vec<(u32, Vec<u8>)> = Vec::new();
-        for chunk in child_level.chunks(max_intern) {
+        let node_sizes = balanced_sizes(child_level.len(), max_intern);
+        let mut child_lo = 0usize;
+        for &node_recs in &node_sizes {
+            let chunk = &child_level[child_lo..child_lo + node_recs];
             let agbno = take(avail, &mut next);
             let mut buf = vec![0u8; blocksize];
             write_header(
@@ -181,6 +186,7 @@ pub fn build_sblock_btree(
             let key = chunk[0].1.clone();
             parent_level.push((agbno, key));
             blocks.push(BuiltBlock { agbno, bytes: buf });
+            child_lo += node_recs;
         }
         child_level = parent_level;
         levels += 1;
@@ -244,6 +250,23 @@ fn take(avail: &[u32], next: &mut usize) -> u32 {
     let v = avail[*next];
     *next += 1;
     v
+}
+
+/// Split `total` items into the fewest groups that each hold at most `max`,
+/// distributed as evenly as possible (sizes differ by at most one). With
+/// `parts = ceil(total/max)`, each group then holds between `floor(total/parts)`
+/// and `ceil(total/parts)` items, and `floor(total/parts) >= max/2` for any
+/// `parts >= 2` — exactly the B+tree minimum-fill invariant XFS requires of
+/// every non-root block. `total == 0` yields a single empty group (an empty
+/// root leaf).
+fn balanced_sizes(total: usize, max: usize) -> Vec<usize> {
+    if total == 0 {
+        return vec![0];
+    }
+    let parts = total.div_ceil(max);
+    let base = total / parts;
+    let rem = total % parts;
+    (0..parts).map(|i| base + usize::from(i < rem)).collect()
 }
 
 #[cfg(test)]
@@ -393,6 +416,29 @@ mod tests {
             leaf = right;
         }
         assert_eq!(out, records, "leaf records survive round-trip in order");
+    }
+
+    #[test]
+    fn balanced_sizes_respect_minimum_fill() {
+        // Every non-singleton group must be >= max/2 (the XFS minimum-fill
+        // invariant) and <= max, and the sizes must sum back to total.
+        for max in [3usize, 8, 31, 62, 510] {
+            for total in 0..=(max * 5 + 1) {
+                let sizes = balanced_sizes(total, max);
+                assert_eq!(sizes.iter().sum::<usize>(), total, "sum total={total}");
+                if total == 0 {
+                    assert_eq!(sizes, vec![0]);
+                    continue;
+                }
+                assert_eq!(sizes.len(), total.div_ceil(max), "part count total={total}");
+                for &s in &sizes {
+                    assert!(s <= max, "overfull: total={total} max={max} s={s}");
+                    if sizes.len() > 1 {
+                        assert!(s >= max / 2, "underfull: total={total} max={max} s={s}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

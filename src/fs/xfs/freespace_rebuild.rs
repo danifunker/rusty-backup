@@ -75,20 +75,21 @@ struct AgInfo {
 /// Whole-volume block-in-use map, indexed by partition-linear block number
 /// (`agno * agblocks + agbno`). `true` = owned by metadata / inode data and
 /// therefore *not* free. Old bnobt/cntbt blocks are deliberately left `false`
-/// so the rebuild reclaims them.
-struct InUseMap {
+/// so the rebuild reclaims them. Shared with R3's multi-level inobt rebuild,
+/// which builds an equivalent map (scan-based) to find blocks for the new tree.
+pub(crate) struct InUseMap {
     used: Vec<bool>,
 }
 
 impl InUseMap {
-    fn new(dblocks: u64) -> Self {
+    pub(crate) fn new(dblocks: u64) -> Self {
         Self {
             used: vec![false; dblocks as usize],
         }
     }
     /// Mark `linear` in use. Returns `true` if it was *already* in use — a
     /// cross-link / double allocation that makes the map untrustworthy.
-    fn mark(&mut self, linear: u64) -> bool {
+    pub(crate) fn mark(&mut self, linear: u64) -> bool {
         match self.used.get_mut(linear as usize) {
             Some(slot) => {
                 let was = *slot;
@@ -98,7 +99,7 @@ impl InUseMap {
             None => false,
         }
     }
-    fn is_used(&self, linear: u64) -> bool {
+    pub(crate) fn is_used(&self, linear: u64) -> bool {
         self.used.get(linear as usize).copied().unwrap_or(true)
     }
 }
@@ -325,7 +326,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     /// Mark one allocated inode's data-fork blocks in use. Returns a skip
     /// reason if the inode is btree-format (unmappable bmap blocks), if a
     /// block is cross-linked, or on any read/decode failure.
-    fn mark_inode_blocks(
+    pub(crate) fn mark_inode_blocks(
         &mut self,
         sb: &XfsSuperblock,
         ino: u64,
@@ -371,7 +372,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     /// Mark the AGFL's live entries in use. AGFL blocks are pre-reserved
     /// free-list blocks we keep where they are. A collision here means the
     /// AGFL points at owned space — untrustworthy, so we skip.
-    fn mark_agfl(
+    pub(crate) fn mark_agfl(
         &mut self,
         sb: &XfsSuperblock,
         agno: u64,
@@ -608,7 +609,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     }
 
     /// Write one filesystem block at `fsblock`.
-    fn write_fsblock(
+    pub(crate) fn write_fsblock(
         &mut self,
         sb: &XfsSuperblock,
         fsblock: u64,
@@ -656,7 +657,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
 
 /// Scan the in-use map for AG `agno` over `[0, expected_len)` and emit the
 /// runs of free blocks as AG-relative `(start, len)` extents.
-fn derive_free_extents(
+pub(crate) fn derive_free_extents(
     map: &InUseMap,
     agno: u64,
     agblocks: u64,
@@ -694,7 +695,10 @@ fn derive_free_extents(
 /// from the tail of a single extent keeps the extent *count* unchanged (the
 /// extent shrinks, or vanishes only if fully consumed — which `n < len`
 /// prevents), so the rebuilt tree's block math stays a one-shot calculation.
-fn carve_from_largest(extents: &[FreeExtent], n: u32) -> Option<(Vec<u32>, Vec<FreeExtent>)> {
+pub(crate) fn carve_from_largest(
+    extents: &[FreeExtent],
+    n: u32,
+) -> Option<(Vec<u32>, Vec<FreeExtent>)> {
     if n == 0 {
         return Some((Vec::new(), extents.to_vec()));
     }
