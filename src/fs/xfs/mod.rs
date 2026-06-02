@@ -1350,6 +1350,57 @@ mod tests {
     }
 
     #[test]
+    fn repair_r7_recomputes_inode_nlink() {
+        // R7 link-count half: corrupt the root directory's nlink (v2 inodes ->
+        // di_nlink at core offset 16), repair(), and confirm R7 recomputes it
+        // from the directory graph (root has one subdir -> nlink 3) and the
+        // verifier stays clean.
+        use crate::fs::filesystem::EditableFilesystem;
+        let mut img = load_fixture().to_vec();
+        let (ino_byte, true_nlink) = {
+            let mut fs = XfsFilesystem::open(Cursor::new(img.clone()), 0).expect("open");
+            let sb = fs.superblock().clone();
+            let byte = inode_byte_offset(
+                128,
+                sb.agblocks,
+                sb.agblklog,
+                sb.inopblog,
+                sb.blocksize,
+                sb.inodesize,
+            ) as usize;
+            let core = fs.read_inode(128).expect("root inode");
+            (byte, core.nlink)
+        };
+        // Corrupt di_nlink (u32 at core offset 16).
+        img[ino_byte + 16..ino_byte + 20].copy_from_slice(&99u32.to_be_bytes());
+
+        let mut cursor = Cursor::new(img);
+        let report = {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable");
+            fs.repair().expect("repair runs")
+        };
+        assert_eq!(report.fixes_failed.len(), 0, "{:?}", report.fixes_failed);
+        assert!(
+            report
+                .fixes_applied
+                .iter()
+                .any(|f| f.contains("link counts")),
+            "expected an nlink fix, got: {:?}",
+            report.fixes_applied
+        );
+
+        let repaired = cursor.into_inner();
+        let mut fs = XfsFilesystem::open(Cursor::new(repaired), 0).expect("reopen");
+        assert_eq!(fs.read_inode(128).expect("reread").nlink, true_nlink);
+        let res = fs.run_fsck().expect("fsck after repair");
+        assert!(
+            res.errors.is_empty(),
+            "expected clean, got {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn repair_r6_drops_dangling_shortform_entry() {
         // R6 round-trip: free hello.txt (inode 131) by zeroing its mode, then
         // repair(). R3 frees it in the inobt, R2 reclaims its blocks, and R6

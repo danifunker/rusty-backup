@@ -312,6 +312,14 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for XfsFilesystem<R> {
         report.fixes_applied.extend(dirs.fixes_applied);
         report.fixes_failed.extend(dirs.fixes_failed);
         report.unrepairable_count += dirs.unrepairable_count;
+        // R7 (link-count half) runs after R6 so it counts the post-cleanup
+        // directory graph. Orphan reconnection (the other half of R7) is not
+        // implemented yet — it needs inode-allocation + directory-insertion
+        // primitives — so OrphanInode stays reported-but-unreconnected.
+        let nlinks = self.run_nlink_repair()?;
+        report.fixes_applied.extend(nlinks.fixes_applied);
+        report.fixes_failed.extend(nlinks.fixes_failed);
+        report.unrepairable_count += nlinks.unrepairable_count;
         Ok(report)
     }
 

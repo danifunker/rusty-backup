@@ -33,7 +33,7 @@ use byteorder::{BigEndian, ByteOrder};
 use super::ag::XfsAgi;
 use super::types::{DiFormat, XFS_INODES_PER_CHUNK};
 use super::{read_at_aligned, XfsFilesystem};
-use crate::fs::filesystem::FilesystemError;
+use crate::fs::filesystem::{Filesystem, FilesystemError};
 use crate::fs::fsck::RepairReport;
 
 /// inobt leaf record layout (v4 short header): startino(4) freecount(4) free(8).
@@ -122,6 +122,118 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             self.reader.flush()?;
         }
         Ok(report)
+    }
+
+    /// R7 (link-count half): recompute every *reachable* inode's link count
+    /// from the directory graph and rewrite the ones that disagree
+    /// (`xfs_repair` phase 7). A file's count is the number of directory
+    /// entries pointing at it; a directory's is `2 + immediate subdirectories`.
+    ///
+    /// Runs after R6 so the graph is already free of dangling entries. Only
+    /// *reached* inodes are corrected — an orphan (allocated but unreachable)
+    /// keeps its on-disk nlink, because zeroing it would look like a free inode;
+    /// reconnecting orphans into `lost+found` is the deferred other half of R7
+    /// (needs inode-allocation + directory-insertion primitives). If any
+    /// directory in the walk is unreadable the file tallies would undercount,
+    /// so we abort and write nothing. v4 only (v5 inode CRC).
+    pub(crate) fn run_nlink_repair(&mut self) -> Result<RepairReport, FilesystemError> {
+        let mut report = RepairReport {
+            fixes_applied: Vec::new(),
+            fixes_failed: Vec::new(),
+            unrepairable_count: 0,
+        };
+        let sb = self.superblock().clone();
+        if sb.is_v5() {
+            return Ok(report);
+        }
+
+        let root = match self.root() {
+            Ok(r) => r,
+            Err(_) => return Ok(report), // verifier already flags an unreadable root
+        };
+
+        // BFS the directory tree, tallying counted link counts.
+        use std::collections::{HashMap, HashSet};
+        let mut file_links: HashMap<u64, u32> = HashMap::new();
+        let mut dir_nlink: HashMap<u64, u32> = HashMap::new();
+        let mut reached: HashSet<u64> = HashSet::new();
+        let mut visited: HashSet<u64> = HashSet::new();
+        let mut queue = vec![root.clone()];
+        reached.insert(root.location);
+        while let Some(dir) = queue.pop() {
+            if !visited.insert(dir.location) {
+                continue;
+            }
+            let children = match self.list_directory(&dir) {
+                Ok(c) => c,
+                // Incomplete graph -> file link tallies would undercount; abort
+                // without writing anything.
+                Err(_) => return Ok(report),
+            };
+            let mut nsub = 0u32;
+            for child in children {
+                reached.insert(child.location);
+                if child.is_directory() {
+                    nsub += 1;
+                    queue.push(child);
+                } else {
+                    *file_links.entry(child.location).or_default() += 1;
+                }
+            }
+            dir_nlink.insert(dir.location, 2 + nsub);
+        }
+
+        let mut fixed = 0u64;
+        for ino in reached {
+            let counted = match (dir_nlink.get(&ino), file_links.get(&ino)) {
+                (Some(&n), _) => n,
+                (None, Some(&n)) => n,
+                // Reached but tallied nowhere (only the root before its own
+                // visit, already inserted in dir_nlink) — shouldn't happen.
+                (None, None) => continue,
+            };
+            match self.fix_inode_nlink(&sb, ino, counted) {
+                Ok(true) => fixed += 1,
+                Ok(false) => {}
+                Err(e) => report.fixes_failed.push(format!("inode {ino}: {e}")),
+            }
+        }
+        if fixed > 0 {
+            self.reader.flush()?;
+            report
+                .fixes_applied
+                .push(format!("recomputed link counts on {fixed} inode(s)"));
+        }
+        Ok(report)
+    }
+
+    /// Read inode `ino`, and if its stored link count differs from `counted`,
+    /// rewrite the version-correct nlink field. Returns whether it changed.
+    fn fix_inode_nlink(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        ino: u64,
+        counted: u32,
+    ) -> Result<bool, FilesystemError> {
+        let (core, mut buf) = self.read_inode_buf(ino)?;
+        if core.mode == 0 {
+            return Ok(false);
+        }
+        let stored = if core.version == 1 {
+            BigEndian::read_u16(&buf[DI_ONLINK_OFF..DI_ONLINK_OFF + 2]) as u32
+        } else {
+            BigEndian::read_u32(&buf[DI_NLINK_OFF..DI_NLINK_OFF + 4])
+        };
+        if stored == counted {
+            return Ok(false);
+        }
+        if core.version == 1 {
+            BigEndian::write_u16(&mut buf[DI_ONLINK_OFF..DI_ONLINK_OFF + 2], counted as u16);
+        } else {
+            BigEndian::write_u32(&mut buf[DI_NLINK_OFF..DI_NLINK_OFF + 4], counted);
+        }
+        self.write_inode_region(sb, ino, &buf)?;
+        Ok(true)
     }
 
     /// Examine one inode; if it's an allocated short-form directory with entries
