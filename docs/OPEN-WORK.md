@@ -493,8 +493,17 @@ Still open:
 - **Auto-unwrap hook**: when a decoded `.hqx` payload sniffs as a
   DiskCopy 4.2 (via `dc42::detect_dc42`) or raw HFS, route it into the
   image pipeline instead of the loose-file path.
-- **SIT writer folder emission**: currently flat-file only. Add nested-
-  directory support so a tree of files round-trips through `sit create`.
+- **SIT writer folder emission** — **Shipped.**
+  `src/macarchive/stuffit.rs` exposes a new `StuffItInputNode { File |
+  Folder }` tree-shaped input and a `build_archive_tree(tree, method)`
+  entry point that emits START_FOLDER (0x20) / END_FOLDER (0x21)
+  marker entries around children. The flat `build_archive(files,
+  method)` API stays valid and now delegates to the tree path
+  (one `File` node per input). 5 new tests cover the empty-folder
+  marker, a two-file folder with fork round-trip, deeply nested
+  folders preserving full path components, mixed root-and-folder
+  trees confirming `currdir` pops back after END_FOLDER, and the
+  flat-API backwards-compat case.
 - **File-picker extensions** for `.hqx` / `.sit` / `.sea` — add to the
   inspect-tab / restore-tab / backup-tab pickers (single source of
   truth in `src/model/file_types.rs`).
