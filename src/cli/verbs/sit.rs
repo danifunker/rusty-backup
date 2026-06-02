@@ -30,7 +30,8 @@ pub enum SitCommand {
 
 #[derive(Debug, Args)]
 pub struct CreateArgs {
-    /// Output `.sit` archive path.
+    /// Output path. A `.sit` extension writes a raw archive; a `.hqx`
+    /// extension BinHex-wraps it (the classic `.sit.hqx` format).
     pub output: PathBuf,
 
     /// Input files. Each may be a BinHex `.hqx`, a MacBinary `.bin`, or a
@@ -277,17 +278,56 @@ fn run_create(args: CreateArgs) -> Result<()> {
         bail!("no input files to archive");
     }
 
-    let bytes = stuffit::build_archive(&files, method)?;
-    std::fs::write(&args.output, &bytes)
+    let sit_bytes = stuffit::build_archive(&files, method)?;
+
+    // If the output ends in `.hqx`, BinHex-wrap the archive (the classic
+    // `.sit.hqx` distribution format).
+    let wrap_hqx = args
+        .output
+        .extension()
+        .map(|e| e.eq_ignore_ascii_case("hqx"))
+        .unwrap_or(false);
+
+    let (out_bytes, kind) = if wrap_hqx {
+        let bh = binhex::BinHexFile {
+            name: inner_sit_name(&args.output),
+            type_code: *b"SITD",
+            creator_code: *b"SIT!",
+            flags: 0,
+            data_fork: sit_bytes,
+            resource_fork: Vec::new(),
+        };
+        (binhex::build_binhex(&bh).into_bytes(), "sit.hqx")
+    } else {
+        (sit_bytes, "sit")
+    };
+
+    std::fs::write(&args.output, &out_bytes)
         .with_context(|| format!("writing {}", args.output.display()))?;
 
     log_stderr(format!(
-        "sit create: {} file(s) -> {} ({} bytes)",
+        "sit create: {} file(s) -> {} ({} format, {} bytes)",
         files.len(),
         args.output.display(),
-        bytes.len()
+        kind,
+        out_bytes.len()
     ));
     Ok(())
+}
+
+/// Derive the inner StuffIt filename for a `.sit.hqx` wrapper from the output
+/// path, ensuring it ends in `.sit`.
+fn inner_sit_name(output: &Path) -> String {
+    // Strip the trailing `.hqx`, then ensure a `.sit` suffix.
+    let stem = output
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("archive");
+    if stem.to_ascii_lowercase().ends_with(".sit") {
+        stem.to_string()
+    } else {
+        format!("{stem}.sit")
+    }
 }
 
 /// Build a [`stuffit::StuffItInput`] from a host file, recognizing BinHex and

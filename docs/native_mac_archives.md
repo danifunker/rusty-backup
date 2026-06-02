@@ -146,7 +146,8 @@ image pipeline).
 - [x] Method **0 (stored)** and **1 (RLE90)** writers (`WriteMethod`; RLE falls back to store when it doesn't shrink)
 - [x] CLI `sit create OUT.sit INPUT… [--rle]` — inputs may be `.hqx` (full fidelity), `.bin` MacBinary, or plain files (+ `._`/`.rsrc` sidecars)
 - [x] Round-trip tests: unit test (write → parse → fork CRCs verify) + full CLI workflow (`.hqx` → `sit create` → `sit extract` yields byte-identical data forks)
-- [-] External validation against `lsar`/`unar` — not available locally; deferred
+- [x] External validation against `lsar`/`unar`: our `.sit` is recognized as "StuffIt" and extracts with correct content; our `.sit.hqx` is recognized as "StuffIt in BinHex" and extracts correctly. Writer is interoperable (the offset-20 header field is accepted).
+- [x] `.sit.hqx` export (sit-over-BinHex): `sit create OUT.sit.hqx …` wraps the archive in BinHex (name `*.sit`, type `SITD`, creator `SIT!`). The classic distribution format.
 - [ ] Folder (nested directory) emission — writer is flat-file only today
 - [-] method 13 compressor — out of scope (stored/RLE90 is sufficient for preservation)
 
@@ -188,6 +189,12 @@ duplication.
 
 ## 7. Deferred / out of scope
 
+- `[ ]` **StuffIt 5 (`.sit` v5, magic "StuffIt (c)…")** — the format used by a
+  lot of real-world archives, including Apple's own `Apple_Mac_OS_7.1_800k.sit`
+  disk set. **Not** the same as classic `SIT!` — it needs `XADStuffIt5Parser` +
+  its codecs (a separate parser). Currently detected and rejected with a clear
+  message; `unar` handles it externally in the meantime. This is the highest-
+  value remaining read target given how common v5 is.
 - `[-]` **StuffIt X (`.sitx`)** — different container + arithmetic/Brimstone/BWT
   codecs; biggest lift, least common for floppy preservation. Revisit only on
   demand; XADMaster is the reference if/when we do.
@@ -200,3 +207,4 @@ duplication.
 ## Progress log
 
 - 2026-06-02: Plan drafted. Scope set: BinHex r/w, SIT r/w, SEA read, SITX deferred; GUI+CLI together. Confirmed MacBinary/AppleDouble/DiskCopy-4.2/fork-extraction already exist and are the foundation.
+- 2026-06-02: Shipped BinHex r/w (engine+CLI+GUI export), classic StuffIt read (methods 0/1/13, container+`.sea`), StuffIt write (stored/RLE90), CLI `sit list/extract/create`, and `.sit.hqx` export. Externally validated with `lsar`/`unar`. Discovered StuffIt 5 is common in the wild (Apple's MacOS 7.1 800k set) → promoted to top read follow-up.
