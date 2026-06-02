@@ -31,7 +31,7 @@ use byteorder::{BigEndian, ByteOrder};
 
 use super::ag::{XfsAgf, XfsAgi};
 use super::bmap::{encode_extent, fsblock_to_partition_byte};
-use super::btree_build::FreeExtent;
+use super::btree_build::{blocks_needed, FreeExtent};
 use super::dir2::XFS_DIR2_DATA_HDR_LEN;
 use super::freespace_rebuild::{carve_from_largest, coalesce};
 use super::inode::fork_offset;
@@ -513,6 +513,9 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
 
     /// Initialize a freshly-allocated inode as a regular file. `extent` is the
     /// single data-fork extent `(fsblock, count)` (`None` for an empty file).
+    /// Initialize a freshly-allocated inode as a regular file. `extents` is the
+    /// data fork as `(startoff, fsblock, count)` records (already in file-offset
+    /// order); empty for a zero-length file.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn init_file_inode(
         &mut self,
@@ -522,7 +525,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         uid: u32,
         gid: u32,
         size: u64,
-        extent: Option<(u64, u32)>,
+        extents: &[(u64, u64, u32)],
     ) -> Result<(), FilesystemError> {
         let (_core, mut buf) = self.read_inode_buf(ino)?;
         let version = buf[4];
@@ -546,15 +549,12 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             *b = 0;
         }
         BigEndian::write_u64(&mut buf[56..64], size);
-        let (nblocks, nextents) = match extent {
-            Some((_, count)) => (count as u64, 1u32),
-            None => (0, 0),
-        };
+        let nblocks: u64 = extents.iter().map(|&(_, _, c)| c as u64).sum();
         BigEndian::write_u64(&mut buf[64..72], nblocks);
         for b in buf.iter_mut().take(76).skip(72) {
             *b = 0; // extsize
         }
-        BigEndian::write_u32(&mut buf[76..80], nextents);
+        BigEndian::write_u32(&mut buf[76..80], extents.len() as u32);
         for b in buf.iter_mut().take(92).skip(80) {
             *b = 0; // anextents, forkoff, aformat(set below), dm*, flags
         }
@@ -566,9 +566,16 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         for b in buf.iter_mut().take(isz).skip(fs) {
             *b = 0;
         }
-        if let Some((fsblock, count)) = extent {
-            let rec = encode_extent(false, 0, fsblock, count as u64);
-            buf[fs..fs + 16].copy_from_slice(&rec);
+        // Inline extent records must fit the literal area; the caller bounds the
+        // extent count, but guard anyway.
+        if fs + extents.len() * 16 > isz {
+            return Err(FilesystemError::Unsupported(
+                "too many extents for an inline data fork (bmap-btree not implemented)".into(),
+            ));
+        }
+        for (i, &(startoff, fsblock, count)) in extents.iter().enumerate() {
+            let rec = encode_extent(false, startoff, fsblock, count as u64);
+            buf[fs + i * 16..fs + i * 16 + 16].copy_from_slice(&rec);
         }
         self.write_inode_region(sb, ino, &buf)
     }
@@ -593,28 +600,132 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
 
         let bs = sb.blocksize as u64;
         let nblocks = data_len.div_ceil(bs);
+        // Each extent's blockcount is 21 bits; the data fork holds it inline as
+        // up to `max_inline` records before it would need a bmap btree.
         if nblocks > MAX_SINGLE_EXTENT_BLOCKS {
             return Err(FilesystemError::Unsupported(format!(
-                "file needs {nblocks} blocks; multi-extent files not implemented"
+                "file needs {nblocks} blocks; files larger than one 2^21-block extent are not supported"
             )));
         }
 
-        // Allocate data first (so a DiskFull leaves no half-built inode), then
-        // the inode, then write data + init + link.
-        let extent = if nblocks > 0 {
-            let fsblock = self.alloc_blocks(&sb, nblocks as u32)?;
-            Some((fsblock, nblocks as u32))
+        // Allocate data first (so a DiskFull leaves no half-built inode): one
+        // contiguous run when possible, else several (capped at the inline-fork
+        // extent limit). Then the inode, then write data + init + link.
+        let runs = if nblocks > 0 {
+            self.alloc_extents(&sb, nblocks as u32)?
         } else {
-            None
+            Vec::new()
         };
-        let ino = self.alloc_inode_slot(&sb)?;
-        if let Some((fsblock, count)) = extent {
-            self.write_file_data(&sb, fsblock, count, data, data_len)?;
+        // Assign sequential file offsets to the runs.
+        let mut extents: Vec<(u64, u64, u32)> = Vec::with_capacity(runs.len());
+        let mut off = 0u64;
+        for (fsblock, count) in runs {
+            extents.push((off, fsblock, count));
+            off += count as u64;
         }
-        self.init_file_inode(&sb, ino, mode, uid, gid, data_len, extent)?;
+
+        let ino = self.alloc_inode_slot(&sb)?;
+        self.write_file_data_extents(&sb, &extents, data, data_len)?;
+        self.init_file_inode(&sb, ino, mode, uid, gid, data_len, &extents)?;
         self.dir_insert_entry(&sb, parent_ino, name, ino, false)?;
         self.reader.flush()?;
         Ok(ino)
+    }
+
+    /// Allocate `n` blocks as up to `max_inline` contiguous runs. Tries a single
+    /// run first (the common case); otherwise carves several runs largest-first
+    /// from one allocation group's free extents and rebuilds that AG's
+    /// free-space btrees over the remainder. Errors `DiskFull` when no AG can
+    /// satisfy `n` within the inline-extent budget.
+    fn alloc_extents(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        n: u32,
+    ) -> Result<Vec<(u64, u32)>, FilesystemError> {
+        // Fast path: one contiguous run.
+        match self.alloc_blocks(sb, n) {
+            Ok(fsblock) => return Ok(vec![(fsblock, n)]),
+            Err(FilesystemError::DiskFull(_)) => {}
+            Err(e) => return Err(e),
+        }
+
+        let bs = sb.blocksize as usize;
+        let max_inline = (sb.inodesize as usize - fork_offset(false)) / 16;
+        let agblocks = sb.agblocks as u64;
+        for agno in 0..sb.agcount as u64 {
+            let expected_len = if agno == sb.agcount as u64 - 1 {
+                sb.dblocks - agno * agblocks
+            } else {
+                agblocks
+            };
+            let mut full = match self.current_full_free(sb, agno, expected_len) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let total: u64 = full.iter().map(|e| e.blockcount as u64).sum();
+            if total < n as u64 {
+                continue;
+            }
+            // Allocate largest-first to minimise the run count; take from the
+            // start of each extent, leaving its tail free.
+            full.sort_by_key(|e| std::cmp::Reverse(e.blockcount));
+            let mut runs: Vec<(u32, u32)> = Vec::new();
+            let mut post: Vec<FreeExtent> = Vec::new();
+            let mut remaining = n;
+            for ext in &full {
+                if remaining == 0 {
+                    post.push(*ext);
+                    continue;
+                }
+                let take = remaining.min(ext.blockcount);
+                runs.push((ext.startblock, take));
+                remaining -= take;
+                if take < ext.blockcount {
+                    post.push(FreeExtent {
+                        startblock: ext.startblock + take,
+                        blockcount: ext.blockcount - take,
+                    });
+                }
+            }
+            if remaining > 0 || runs.len() > max_inline {
+                continue; // (shouldn't underflow; too fragmented for inline)
+            }
+            // The rebuild carves its btree blocks from the largest remaining
+            // free extent, so make sure one is big enough.
+            let post_largest = post.iter().map(|e| e.blockcount).max().unwrap_or(0) as usize;
+            let need_bt = 2 * blocks_needed(post.len(), bs);
+            if post_largest <= need_bt {
+                continue;
+            }
+            self.rebuild_ag_freespace(sb, agno, expected_len, &post)?;
+            self.resync_sb_fdblocks(sb)?;
+            return Ok(runs
+                .into_iter()
+                .map(|(agbno, c)| ((agno << sb.agblklog) | agbno as u64, c))
+                .collect());
+        }
+        Err(FilesystemError::DiskFull(format!(
+            "could not allocate {n} blocks as <= {max_inline} contiguous runs"
+        )))
+    }
+
+    /// Write `data_len` bytes from `data` across the file's `extents`
+    /// (`(startoff, fsblock, count)`), zero-padding the final block of each run.
+    fn write_file_data_extents(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        extents: &[(u64, u64, u32)],
+        data: &mut dyn Read,
+        data_len: u64,
+    ) -> Result<(), FilesystemError> {
+        let bs = sb.blocksize as u64;
+        for &(startoff, fsblock, count) in extents {
+            let run_file_start = startoff * bs;
+            let run_bytes = count as u64 * bs;
+            let want = data_len.saturating_sub(run_file_start).min(run_bytes);
+            self.write_file_data(sb, fsblock, count, data, want)?;
+        }
+        Ok(())
     }
 
     // ----- delete_entry ------------------------------------------------------
