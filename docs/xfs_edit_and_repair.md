@@ -1,5 +1,18 @@
 # XFS — Editable Filesystem + Full fsck Repair (v4 / IRIX)
 
+> **Implementation status (2026-06-01).** Verifier (Phases 1–3 + block-ownership
+> map) and the repair phases **R4** (secondary-superblock geometry), **R4b**
+> (AGF/AGI summary counters), **R2** (free-space btree rebuild,
+> `src/fs/xfs/freespace_rebuild.rs` + `btree_build.rs`), and **R3** (inobt
+> free-mask/freecount repair + single-level structure rebuild,
+> `src/fs/xfs/inobt_repair.rs`) are **shipped and oracle-validated** — including
+> against a real V1-inode IRIX disk (`xfsprogs` 3.1.9 oracle). `repair()` runs
+> them in order R4 → R4b → R3 → R2. Not yet done: R3 multi-level structure
+> rebuild, **R5** (inode core), **R6** (directory), **R7** (orphan reconnection
+> — note the verifier already flags `OrphanInode` as repairable, which won't be
+> true until R7 lands), and the §3/§4 edit write-primitives. See the auto-memory
+> `xfs_fsck_repair.md` for the running status and the Docker oracle recipe.
+
 Extend the existing read-only XFS support (`src/fs/xfs/`) all the way to:
 
 1. **Full fsck repair** — not just the conservative field-fixes in
