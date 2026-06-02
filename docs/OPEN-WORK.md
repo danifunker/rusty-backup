@@ -48,9 +48,9 @@ xfs, reiserfs/ufs/jfs) share MBR type `0x83` on Linux.
 | ~~R.1~~ | A | **Shipped.** `src/fs/reiserfs.rs` parses the superblock at byte 65536 with magic dispatch (v3.5 / v3.6 / reject-reiser4), reads `s_block_count` / `s_free_blocks` / `s_blocksize` / `s_bmap_nr` / `s_label`, and is wired through `detect_filesystem_type`, `probe_0x83_fs_type` ("ReiserFS"), and both `open_filesystem` dispatch arms (type 0x83 + auto-detect). Inspect tab shows the right type + sizes. 9 unit tests cover both magics, the reiser4 reject path, block-size validation, label parsing, partition-offset threading, and `probe_0x83_fs_type` routing. Gated test against a real `mkfs.reiserfs` fixture still pending. |
 | ~~R.2~~ | A | **Shipped.** `src/fs/reiserfs.rs` adds `read_bitmap_block` + `bitmap_valid_bits` helpers (bitmap 0 at sb_block+1, bitmap i≥1 at i*blocks_per_bitmap), `Filesystem::last_data_byte` override (scans bitmaps from end via `highest_set_bit`), and a layout-preserving `CompactReiserFsReader` that coalesces same-state bitmap runs into `MappedBlocks` / `Zeros` sections. Bitmap polarity is **set = allocated** (standard Linux). Wired into `compact_partition_reader` for both auto-detect and 0x83 dispatch arms; re-exported as `crate::fs::CompactReiserFsReader`. 6 new tests: `last_data_byte` with extras / reserved-only / empty-bitmap / multi-bitmap-block, plus a layout-preserving stream check and a round-trip-through-parser test. Gated test against a real `mkfs.reiserfs` fixture still pending. |
 | R.3a | B | **Shipped.** On-disk S+tree node parsers in `src/fs/reiserfs.rs`: `BlockHead` (level + nr_item + free_space + right_delim_key, 24 bytes); `Key` (16-byte raw + `KeyFormat`-aware `dir_id` / `objectid` / `offset` / `item_type` accessors handling both v1 sentinel-u32 and v2 packed-u64 layouts); `ItemHead` (24-byte leaf header with `version` → `key_format`); `DiskChild` (8-byte internal-node child pointer). `parse_leaf_item_heads` / `parse_internal_keys_and_children` walk a whole block and assert the B-tree N+1 invariant. Superblock `root_block` is now parsed and stored. 13 new tests cover both key formats, both item-type decode tables, BlockHead leaf/internal, ItemHead, DiskChild, leaf-of-3 + internal-with-2-keys round trips, and the leaf/internal mismatch rejections. |
-| R.3b | B | Tree walker: `find_leaf_for_key(key)` descends from `root_block` by binary-searching internal nodes; `range_scan(min, max)` iterates items in sorted order. Reads tree nodes via the existing partition reader. |
-| R.3c | B | `list_directory`: starting from inode 2 (root dir), walk `DirEntry` items, parse the entry-array + name-area structure, return `FileEntry`s. |
-| R.3d | B | `read_file`: walk `StatData` for size, then `Indirect`/`Direct` items for file body, including **tail packing** — small files (<= a few KB) keep their tail in a `Direct` item co-located with the stat data. |
+| R.3b | B | **Parked — need fixture.** Tree walker against synth data would land but the correctness check needs a real `mkfs.reiserfs` image. See `docs/need_fixtures.md` (ReiserFS section). |
+| R.3c | B | **Parked — need fixture.** `list_directory` (DIR_ENTRY items). Same fixture as R.3b. |
+| R.3d | B | **Parked — need fixture.** `read_file` (StatData + Indirect/Direct + tail packing). Same fixture as R.3b. |
 
 ### 1.2 UFS
 
@@ -67,10 +67,10 @@ xfs, reiserfs/ufs/jfs) share MBR type `0x83` on Linux.
 
 | # | Tier | Deliverable |
 |---|---|---|
-| U.1 | A | Superblock parser handling UFS1 (`MAGIC=0x011954` at byte 8192) and UFS2 (`MAGIC=0x19540119` at byte 65536). `fs_name_for` returns "UFS1"/"UFS2". Port from `fs_ufs.cpp` + `fs.h`. Inspect tab shows the right type + total/used/free. Unit test against hand-built superblocks; gated test against a `newfs` fixture (FreeBSD VM or `mkfs.ufs` package on Linux). |
-| U.2 | A | Walk cylinder groups: each CG header carries pointers to its block bitmap. Sum free + record highest allocated block for `last_data_byte`. `is_expensive_minimum` = false. Implement `compact_partition_reader_by_string`. Round-trip compaction test. |
-| U.3 | B | Walk inode table per CG; parse `ufs1_dinode` / `ufs2_dinode` (mode, uid, gid, size, mtime, block pointers). Directory entries are `direct struct` (32-bit ino + 16-bit reclen + 8-bit type + 8-bit namlen + name). `unix_common::unix_entry_from_inode` handles the mapping. Indirect / double-indirect / triple-indirect block walks (familiar pattern from ext2 inode block addressing). Read-only. |
-| U.4 | B+ | **Optional follow-up** — fsck + edit (alloc/free + dir insert/remove + snapshot/rollback, mirrors EFS shape). Cylinder-group rotation makes contiguous allocation slightly different from EFS's single-CG case. Defer until U.1-U.3 prove demand. |
+| U.1 | A | **Parked — need fixture.** Superblock parser handling UFS1 (byte 8192, magic `0x011954`) and UFS2 (byte 65536, magic `0x19540119`). Synth unit tests would land; for end-to-end validation we need a `newfs` fixture. See `docs/need_fixtures.md`. |
+| U.2 | A | **Parked — need fixture.** Cylinder-group walk for compaction + `last_data_byte`. Same fixture as U.1. |
+| U.3 | B | **Parked — need fixture.** Inode + dir + file browse. Same fixture as U.1. |
+| U.4 | B+ | **Optional follow-up** — fsck + edit. Defer until U.1-U.3 prove demand. |
 
 ### 1.3 JFS
 
@@ -86,10 +86,10 @@ xfs, reiserfs/ufs/jfs) share MBR type `0x83` on Linux.
 
 | # | Tier | Deliverable |
 |---|---|---|
-| J.1 | A | Parse the Primary Aggregate Superblock at byte 32768 (`s_magic = "JFS1"`, `s_version = 2`; reject v1). Pull `s_size`, `s_bsize`, `s_l2bsize`. Wire dispatch (`0x83` precedence after ext/btrfs/xfs/reiserfs). Inspect tab shows JFS + total size. |
-| J.2 | A | Walk the BMAP tree to compute used/free block counts. Port the bitmap traversal from `fs_jfs.cpp`. Implement `compact_partition_reader_by_string` + `last_data_byte`. `is_expensive_minimum` = true on first pass (BMAP walk is heavier than a flat bitmap). |
-| J.3 | B | Walk the Fileset Allocation Map (FSAM) to find inode tables, then walk **dtrees** (directory B+trees) and **xtrees** (extent B+trees) per inode. Reference `jfsutils/libfs/`. Read-only. Multi-session. |
-| J.4 | B+ | **Parked** — fsck + edit. JFS edit means atomically rewriting three B+trees (BMAP, dtree, xtree) against the journal — comparable scope to a btrfs writer. Revisit only after J.3 ships and there's real demand. |
+| J.1 | A | **Parked — need fixture.** Parse Aggregate Superblock at byte 32768 (`s_magic = "JFS1"`, `s_version = 2`; reject v1). Synth tests would land; full validation needs `mkfs.jfs` fixture. See `docs/need_fixtures.md`. |
+| J.2 | A | **Parked — need fixture.** BMAP B+tree walk → compact + `last_data_byte`. Same fixture as J.1. |
+| J.3 | B | **Parked — need fixture.** dtree + xtree + inode browse. Same fixture as J.1. |
+| J.4 | B+ | **Parked — design dependency.** fsck + edit. Defer until J.3 ships and there's real demand. |
 
 ### Estimated total
 
