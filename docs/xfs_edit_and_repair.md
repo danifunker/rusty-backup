@@ -1,5 +1,99 @@
 # XFS — Editable Filesystem + Full fsck Repair (v4 / IRIX)
 
+Resume prompt:
+
+  Continue the XFS v4 edit+repair work on branch `xfs-efs-fsck` in /Users/dani/repos/rusty-backup.
+  First read the auto-memory `xfs_fsck_repair.md` (it has the full running status + Docker
+  oracle recipe) and `docs/xfs_edit_and_repair.md` (§3 write primitives, §4 EDIT phases,
+  §5 REPAIR R1–R8). Everything below builds on already-shipped, oracle-validated work.
+
+  STATUS (done): full v4 repair pipeline R2/R3(incl multi-level)/R4/R4b/R6/R7(reconnect+nlink),
+  plus editing — create_directory, create_file (multi-extent), delete_entry, and short-form⇄
+  single-block directory growth/shrink. All in src/fs/xfs/edit.rs (write primitives:
+  alloc_inode_slot/free_inode, alloc_blocks/alloc_extents/free_blocks, dir_insert_entry/
+  dir_remove_entry, build_block_dir, set_dir_inode_single_extent, init_file_inode, encode_extent).
+  Wired into GUI/CLI via open_editable_filesystem. Reader: src/fs/xfs/mod.rs (read_inode_buf,
+  decode_data_extents, walk_bmbt, read_fsblock), dir2.rs, bmap.rs, inobt_repair.rs,
+  freespace_rebuild.rs (rebuild_ag_freespace, current_full_free), btree_build.rs
+  (build_sblock_btree, balanced fill).
+
+  DISCIPLINE (non-negotiable):
+  - Oracle-grade EVERY write: it must come back clean under `xfs_repair -n`. Don't ship a write
+    path that isn't oracle-validated.
+  - Oracles (Docker): `rusty-xfs-oracle` = xfsprogs 4.9.0 (v4, v2 inodes); `rusty-xfs-oracle-v1`
+    = xfsprogs 3.1.9 (V1-inode IRIX disks). For v5 you'll need a 3rd image with recent xfsprogs
+    (e.g. ubuntu:22.04, xfsprogs 5.x) — mkfs.xfs defaults to v5 there.
+  - Tools: scripts/xfs-oracle.sh; examples/xfs_check.rs (`--repair`), xfs_mkdir.rs, xfs_mkfile.rs;
+    and the production path `rb-cli mkdir|put|rm|ls|get IMG[@N] PATH`. Real disk:
+    ~/Documents/scsi2.raw (SGI, V1 inodes, XFS at byte 2097152 / `@1`, partition slot 7). Extract
+    the bare partition for the oracle: `dd if=… of=part.img bs=512 skip=4096 count=2093056`.
+    Scratch images live in /tmp/xfsoracle.
+  - NEVER write to an original disk — always operate on a copy.
+  - v4-first; gate v5 explicitly until hole #4. Commit one coherent slice at a time with an
+    oracle-validation note in the message. Don't stop to check in between slices.
+
+  CLOSE THESE HOLES (suggested order — easiest/most-reusable first):
+
+  (A) new-chunk inode allocation — alloc_inode_slot currently returns DiskFull when every inobt
+      chunk is full. Add: allocate `blocks_per_chunk` contiguous blocks (alloc_blocks), respecting
+      sb_inoalignmt; initialize all 64 dinodes (magic 0x494e, version from a sibling, di_mode=0,
+      di_next_unlinked=NULLAGINO); add the chunk to the inobt (startino, freecount 64, free=all-ones).
+      Reuse the R3 multi-level REBUILD (build_sblock_btree) instead of incremental btree insert:
+      gather all chunks + the new one, rebuild the inobt, update AGI root/level/count/freecount and
+      sb_icount/sb_ifree. Ref libxfs/xfs_ialloc.c (xfs_ialloc_ag_alloc). Oracle: fill all free inode
+      slots, then create one more file/dir → clean.
+
+  (B) block→short-form dir re-compaction (cosmetic, small) — after block_remove_entry, if the
+      surviving entries fit the inode literal area, convert back to short-form: build the sf fork,
+      free the dir data block (free_blocks), set di_format=Local, di_size=sf_len, nblocks=0,
+      nextents=0. Ref xfs_dir2_block_to_sf. Oracle: grow a dir to block form, delete down to a few
+      entries → expect short-form again, clean.
+
+  (C) leaf/node (multi-block) directories — the big directory item. Today dir_insert_entry returns
+      DiskFull when a single-block dir overflows one block. Implement block→LEAF conversion: spread
+      entries across multiple XD2D data blocks (each with header+bestfree+tag entries), and a leaf
+      index block at file offset XFS_DIR2_LEAF_OFFSET (32 GiB / blocksize) holding the sorted
+      itself overflows (free-index + da-btree node blocks). Update the inode extent map accordingly.
+      The reader already parses leaf/node data blocks (walk_dir2_data_blocks); verify it fully lists
+      them and add write support. Ref libxfs/xfs_dir2_block.c, xfs_dir2_leaf.c, xfs_dir2_node.c.
+      Oracle: add 100s of entries to one directory → list all back, read a sample, clean.
+
+  (D) bmap-btree file forks — create_file caps at one 2^21-block extent and ~9 inline extents
+      (alloc_extents). When a file needs more extents or >2^21 blocks, convert the data fork to
+      btree format (di_format=3): allocate bmbt block(s), write extent records into the leaf chain,
+      put a bmbt root in the inode fork, and include the bmbt blocks in di_nblocks. Reader already
+      supports bmbt READ (walk_bmbt). Ref libxfs/xfs_bmap_btree.c. Bonus: once we can enumerate
+      bmbt blocks for ownership, relax the R2/R3 "abort on di_format==3" gate so repair handles
+      fragmented files. Oracle: write a file with >9 extents (heavily fragment free space first) →
+      clean, data byte-matches.
+
+  (E) v5/CRC editing — the largest item; currently every write path is v4-only (is_v5() →
+      Unsupported/skip) because v5 blocks carry crc32c + uuid + owner + blkno/lsn. Add a crc32c
+      (Castagnoli) routine, and at every write site set the CRC (computed over the block with the
+      crc field zeroed) + uuid (=sb_uuid) + owner + blkno on: v3 inode core (176-byte core, di_crc),
+      dir3 data/leaf/node blocks (64-byte hdr), short-form-block btrees (XFS_BTREE_SBLOCK_CRC_LEN=56),
+      bmbt crc blocks, AGF/AGI, and the superblock. Thread is_v5 through edit.rs/repair (header
+      lengths, fork_offset(true)=176) instead of hardcoding v4. Open up the v5 open-time rejection
+      for editing. Ref libxfs/xfs_cksum.h and the per-structure crc offsets. Validate with a v5
+      oracle (recent xfsprogs). Treat as a multi-slice effort; land v5 reads/writes structure-by-
+      structure, oracle-checking each.
+
+  ALSO STILL OPEN (I deferred these earlier; not in the 5 above — confirm whether you want them):
+  E6 dirty-log guard (refuse EDIT on an unclean log, like the HFS+ journal refusal),
+  R8 repair seal (whole-run snapshot/rollback + final re-verify), and R5 completeness (mode/di_size/
+  timestamp validation + truncate out-of-bounds/cross-linked forks — only di_nblocks/di_nextents
+  recompute shipped).
+
+  Reference sources are local at ~/efs-xfs-refs/xfsprogs (pinned v3.1.11, v4-only) and the modern
+  libxfs. Keep each slice oracle-validated before committing.
+
+  ---
+  Two notes before you clear:
+  - I scoped the prompt to the 5 holes you listed, but added the "also still open" line so the safety items (dirty-log guard, repair seal) and the partial R5
+  aren't lost — you can tell the next session to skip or include them.
+  - Realistic expectation: (A)/(B) are small-to-medium, (C)/(D) are each a meaningful subsystem, and (E) v5/CRC is the biggest by far (the plan even lists it as a
+  separate project) — it touches every write site. The new session will likely want to do them as several commits each rather than one pass.
+
 > **Implementation status (2026-06-01).** Verifier (Phases 1–3 + block-ownership
 > map) and repair phases **R4** (secondary-superblock geometry), **R4b**
 > (AGF/AGI summary counters), **R2** (free-space btree rebuild,
