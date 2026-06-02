@@ -1351,6 +1351,55 @@ mod tests {
     }
 
     #[test]
+    fn create_file_in_shortform_root_roundtrips_data() {
+        // Allocate an inode + data blocks + insert: create /payload.bin with a
+        // known pattern, then read it back byte-for-byte and confirm the volume
+        // stays clean.
+        use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem};
+        use std::io::Cursor as IoCursor;
+        let payload: Vec<u8> = (0..9000u32).map(|i| (i % 251) as u8).collect();
+
+        let img = load_fixture().to_vec();
+        let mut cursor = Cursor::new(img);
+        {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable");
+            let root = fs.root().expect("root");
+            let mut data = IoCursor::new(payload.clone());
+            fs.create_file(
+                &root,
+                "payload.bin",
+                &mut data,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create_file");
+            fs.sync_metadata().expect("sync");
+        }
+
+        let repaired = cursor.into_inner();
+        let mut fs = XfsFilesystem::open(Cursor::new(repaired), 0).expect("reopen");
+        let root = fs.root().expect("root");
+        let entry = fs
+            .list_directory(&root)
+            .expect("list")
+            .into_iter()
+            .find(|e| e.name == "payload.bin")
+            .expect("file listed");
+        assert!(!entry.is_directory());
+        assert_eq!(entry.size, payload.len() as u64, "size mismatch");
+        let read_back = fs
+            .read_file(&entry, payload.len() + 4096)
+            .expect("read_file");
+        assert_eq!(&read_back[..payload.len()], &payload[..], "data mismatch");
+        let res = fs.run_fsck().expect("fsck");
+        assert!(
+            res.errors.is_empty(),
+            "expected clean, got {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn create_directory_in_shortform_root() {
         // Allocate an inode + insert a short-form entry: create /made_dir under
         // the root, then confirm it lists, is an empty directory, the root link

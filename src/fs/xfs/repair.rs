@@ -245,15 +245,18 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
 impl<R: Read + Write + Seek + Send> EditableFilesystem for XfsFilesystem<R> {
     fn create_file(
         &mut self,
-        _parent: &FileEntry,
-        _name: &str,
-        _data: &mut dyn std::io::Read,
-        _data_len: u64,
-        _options: &CreateFileOptions,
+        parent: &FileEntry,
+        name: &str,
+        data: &mut dyn std::io::Read,
+        data_len: u64,
+        options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
-        Err(FilesystemError::Unsupported(
-            "XFS file creation is not implemented yet (repair-only editable surface)".into(),
-        ))
+        // v4 short-form parents, single-extent files only.
+        let mode = ((options.mode.unwrap_or(0o644) & 0o7777) | 0o100000) as u16;
+        let uid = options.uid.unwrap_or(0);
+        let gid = options.gid.unwrap_or(0);
+        let ino = self.do_create_file(parent.location, name, data, data_len, mode, uid, gid)?;
+        self.child_entry(&parent.path, name.to_string(), ino)
     }
 
     fn create_directory(

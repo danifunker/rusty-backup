@@ -155,7 +155,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                 continue;
             }
 
-            match self.rebuild_ag_freespace(&sb, agno, ag, &derived) {
+            match self.rebuild_ag_freespace(&sb, agno, ag.expected_len, &derived) {
                 Ok(freeblks) => {
                     any_changed = true;
                     report.fixes_applied.push(format!(
@@ -458,7 +458,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     /// Walk an AG-relative alloc btree (`XFS_ABTB_MAGIC` / `XFS_ABTC_MAGIC`),
     /// returning its leaf records as `(start, len)` extents and the AG-relative
     /// block numbers of every btree block visited. Pure read.
-    fn walk_alloc_tree(
+    pub(crate) fn walk_alloc_tree(
         &mut self,
         sb: &XfsSuperblock,
         agno: u64,
@@ -495,11 +495,11 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
 
     /// Rebuild one AG's bno + cnt btrees over `derived` free extents and
     /// rewrite the AGF. Returns the AG's new free-block total.
-    fn rebuild_ag_freespace(
+    pub(crate) fn rebuild_ag_freespace(
         &mut self,
         sb: &XfsSuperblock,
         agno: u64,
-        ag: &AgInfo,
+        expected_len: u64,
         derived: &[FreeExtent],
     ) -> Result<u64, FilesystemError> {
         let bs = sb.blocksize as usize;
@@ -552,7 +552,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         self.write_agf_fields(
             sb,
             agno,
-            ag.expected_len,
+            expected_len,
             bno.root_agbno,
             bno.levels,
             cnt.root_agbno,
@@ -629,7 +629,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     /// (`agf_freeblks`) *and* the AGFL's pre-reserved blocks (`agf_flcount`),
     /// which the bnobt deliberately excludes. Omitting the AGFL term leaves
     /// `xfs_repair -n` reporting `sb_fdblocks N, counted M` (off by Σ flcount).
-    fn resync_sb_fdblocks(&mut self, sb: &XfsSuperblock) -> Result<(), FilesystemError> {
+    pub(crate) fn resync_sb_fdblocks(&mut self, sb: &XfsSuperblock) -> Result<(), FilesystemError> {
         let sectsize = sb.sectsize as u64;
         let agblocks = sb.agblocks as u64;
         let blocksize = sb.blocksize as u64;
@@ -725,7 +725,7 @@ pub(crate) fn carve_from_largest(
 /// Sort by startblock and merge adjacent/touching extents into maximal runs.
 /// Input extents must be non-overlapping (they come from disjoint sources:
 /// free records plus the trees' own distinct blocks).
-fn coalesce(mut extents: Vec<FreeExtent>) -> Vec<FreeExtent> {
+pub(crate) fn coalesce(mut extents: Vec<FreeExtent>) -> Vec<FreeExtent> {
     extents.sort_by_key(|e| e.startblock);
     let mut out: Vec<FreeExtent> = Vec::with_capacity(extents.len());
     for e in extents {

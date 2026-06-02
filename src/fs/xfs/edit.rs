@@ -24,11 +24,18 @@ use std::io::{Read, Seek, Write};
 
 use byteorder::{BigEndian, ByteOrder};
 
-use super::ag::XfsAgi;
+use super::ag::{XfsAgf, XfsAgi};
+use super::bmap::{encode_extent, fsblock_to_partition_byte};
+use super::btree_build::FreeExtent;
 use super::dir2::XFS_DIR2_DATA_HDR_LEN;
+use super::freespace_rebuild::{carve_from_largest, coalesce};
 use super::inode::fork_offset;
+use super::types::{XFS_ABTB_MAGIC, XFS_ABTC_MAGIC};
 use super::{read_at_aligned, XfsFilesystem};
 use crate::fs::filesystem::FilesystemError;
+
+/// Largest single-extent file we write: the on-disk blockcount field is 21 bits.
+const MAX_SINGLE_EXTENT_BLOCKS: u64 = (1 << 21) - 1;
 
 /// dir2 filetype values (only the two we emit).
 const XFS_DIR3_FT_REG_FILE: u8 = 1;
@@ -424,5 +431,220 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             ));
         }
         Ok(())
+    }
+
+    // ----- block allocation + create_file -----------------------------------
+
+    /// Allocate `n` **contiguous** free blocks, returning their starting fsblock.
+    /// Carves the run off the tail of an AG's largest free extent and rebuilds
+    /// that AG's free-space btrees over the remainder (reusing the R2 rebuild),
+    /// then resyncs `sb_fdblocks`. Errors `DiskFull` when no AG has a single
+    /// free extent large enough (no multi-extent split yet). v4 only.
+    pub(crate) fn alloc_blocks(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        n: u32,
+    ) -> Result<u64, FilesystemError> {
+        if n == 0 {
+            return Err(FilesystemError::InvalidData("alloc_blocks(0)".into()));
+        }
+        let agblocks = sb.agblocks as u64;
+        for agno in 0..sb.agcount as u64 {
+            let expected_len = if agno == sb.agcount as u64 - 1 {
+                sb.dblocks - agno * agblocks
+            } else {
+                agblocks
+            };
+            let full_free = match self.current_full_free(sb, agno, expected_len) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            // Carve the data run off the largest extent's tail (contiguous,
+            // extent-count preserving). Leaves room for the btree rebuild's own
+            // carve from the remainder.
+            let Some((carved, free_after)) = carve_from_largest(&full_free, n) else {
+                continue;
+            };
+            // Rebuild bno/cnt over the remaining free set + rewrite the AGF.
+            // Fails if the remainder can't host the btrees — try the next AG.
+            if self
+                .rebuild_ag_freespace(sb, agno, expected_len, &free_after)
+                .is_err()
+            {
+                continue;
+            }
+            self.resync_sb_fdblocks(sb)?;
+            let start_agbno = carved[0] as u64;
+            return Ok((agno << sb.agblklog) | start_agbno);
+        }
+        Err(FilesystemError::DiskFull(
+            "no allocation group has a single free extent large enough".into(),
+        ))
+    }
+
+    /// The AG's complete free-block set (AG-relative extents): the bnobt's free
+    /// records plus the blocks both space btrees themselves occupy (which a
+    /// rebuild reclaims), coalesced — the same reconstruction R2 uses.
+    fn current_full_free(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        agno: u64,
+        expected_len: u64,
+    ) -> Result<Vec<FreeExtent>, FilesystemError> {
+        let sectsize = sb.sectsize as u64;
+        let agblocks = sb.agblocks as u64;
+        let blocksize = sb.blocksize as u64;
+        let agf_byte = self.partition_offset + agno * agblocks * blocksize + sectsize;
+        let mut agf_sec = vec![0u8; sectsize as usize];
+        read_at_aligned(&mut self.reader, agf_byte, sectsize, &mut agf_sec)?;
+        let agf = XfsAgf::parse(&agf_sec)?;
+        let (recs, bno_blocks) =
+            self.walk_alloc_tree(sb, agno, agf.bno_root, expected_len, XFS_ABTB_MAGIC)?;
+        let (_cnt_recs, cnt_blocks) =
+            self.walk_alloc_tree(sb, agno, agf.cnt_root, expected_len, XFS_ABTC_MAGIC)?;
+        let mut all = recs;
+        for agbno in bno_blocks.into_iter().chain(cnt_blocks) {
+            all.push(FreeExtent {
+                startblock: agbno,
+                blockcount: 1,
+            });
+        }
+        Ok(coalesce(all))
+    }
+
+    /// Write `data_len` bytes from `data` into `[fsblock, fsblock+count)`,
+    /// zero-padding the rest of the final block.
+    fn write_file_data(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        fsblock: u64,
+        count: u32,
+        data: &mut dyn Read,
+        data_len: u64,
+    ) -> Result<(), FilesystemError> {
+        use std::io::SeekFrom;
+        let bs = sb.blocksize as u64;
+        let span = count as u64 * bs;
+        let mut buf = vec![0u8; span as usize];
+        let want = data_len.min(span) as usize;
+        let mut filled = 0usize;
+        while filled < want {
+            let nr = data.read(&mut buf[filled..want])?;
+            if nr == 0 {
+                break;
+            }
+            filled += nr;
+        }
+        let part_byte = fsblock_to_partition_byte(fsblock, sb.agblocks, sb.agblklog, sb.blocksize);
+        self.reader
+            .seek(SeekFrom::Start(self.partition_offset + part_byte))?;
+        self.reader.write_all(&buf)?;
+        Ok(())
+    }
+
+    /// Initialize a freshly-allocated inode as a regular file. `extent` is the
+    /// single data-fork extent `(fsblock, count)` (`None` for an empty file).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn init_file_inode(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        ino: u64,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+        size: u64,
+        extent: Option<(u64, u32)>,
+    ) -> Result<(), FilesystemError> {
+        let (_core, mut buf) = self.read_inode_buf(ino)?;
+        let version = buf[4];
+        let gen = BigEndian::read_u32(&buf[92..96]).wrapping_add(1);
+        let isz = buf.len();
+
+        BigEndian::write_u16(&mut buf[0..2], super::types::XFS_DINODE_MAGIC);
+        BigEndian::write_u16(&mut buf[2..4], mode);
+        buf[4] = version;
+        buf[5] = 2; // di_format = extents
+        if version == 1 {
+            BigEndian::write_u16(&mut buf[6..8], 1);
+            BigEndian::write_u32(&mut buf[16..20], 0);
+        } else {
+            BigEndian::write_u16(&mut buf[6..8], 0);
+            BigEndian::write_u32(&mut buf[16..20], 1);
+        }
+        BigEndian::write_u32(&mut buf[8..12], uid);
+        BigEndian::write_u32(&mut buf[12..16], gid);
+        for b in buf.iter_mut().take(56).skip(20) {
+            *b = 0;
+        }
+        BigEndian::write_u64(&mut buf[56..64], size);
+        let (nblocks, nextents) = match extent {
+            Some((_, count)) => (count as u64, 1u32),
+            None => (0, 0),
+        };
+        BigEndian::write_u64(&mut buf[64..72], nblocks);
+        for b in buf.iter_mut().take(76).skip(72) {
+            *b = 0; // extsize
+        }
+        BigEndian::write_u32(&mut buf[76..80], nextents);
+        for b in buf.iter_mut().take(92).skip(80) {
+            *b = 0; // anextents, forkoff, aformat(set below), dm*, flags
+        }
+        buf[83] = 2; // di_aformat = extents (no attr fork)
+        BigEndian::write_u32(&mut buf[92..96], gen);
+        BigEndian::write_u32(&mut buf[96..100], NULLAGINO);
+
+        let fs = fork_offset(false);
+        for b in buf.iter_mut().take(isz).skip(fs) {
+            *b = 0;
+        }
+        if let Some((fsblock, count)) = extent {
+            let rec = encode_extent(false, 0, fsblock, count as u64);
+            buf[fs..fs + 16].copy_from_slice(&rec);
+        }
+        self.write_inode_region(sb, ino, &buf)
+    }
+
+    /// Internal entry point for `create_file`: pre-flight the parent insert,
+    /// allocate the data blocks (one contiguous extent) and write the data,
+    /// allocate + initialize the file inode, then insert it into the parent.
+    /// Returns the new file's inode number.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn do_create_file(
+        &mut self,
+        parent_ino: u64,
+        name: &str,
+        data: &mut dyn Read,
+        data_len: u64,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+    ) -> Result<u64, FilesystemError> {
+        let sb = self.superblock().clone();
+        self.sf_check_insertable(&sb, parent_ino, name)?;
+
+        let bs = sb.blocksize as u64;
+        let nblocks = data_len.div_ceil(bs);
+        if nblocks > MAX_SINGLE_EXTENT_BLOCKS {
+            return Err(FilesystemError::Unsupported(format!(
+                "file needs {nblocks} blocks; multi-extent files not implemented"
+            )));
+        }
+
+        // Allocate data first (so a DiskFull leaves no half-built inode), then
+        // the inode, then write data + init + link.
+        let extent = if nblocks > 0 {
+            let fsblock = self.alloc_blocks(&sb, nblocks as u32)?;
+            Some((fsblock, nblocks as u32))
+        } else {
+            None
+        };
+        let ino = self.alloc_inode_slot(&sb)?;
+        if let Some((fsblock, count)) = extent {
+            self.write_file_data(&sb, fsblock, count, data, data_len)?;
+        }
+        self.init_file_inode(&sb, ino, mode, uid, gid, data_len, extent)?;
+        self.sf_insert_entry(&sb, parent_ino, name, ino, false)?;
+        self.reader.flush()?;
+        Ok(ino)
     }
 }

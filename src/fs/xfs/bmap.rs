@@ -60,6 +60,19 @@ pub fn decode_extent(rec: &[u8; 16]) -> XfsBmbtIrec {
     }
 }
 
+/// Pack an extent record from logical fields, the inverse of [`decode_extent`]
+/// (mirrors `xfs_bmbt_disk_set_all`). Used by the write path to lay down a
+/// file's data-fork extent.
+pub fn encode_extent(unwritten: bool, startoff: u64, startblock: u64, blockcount: u64) -> [u8; 16] {
+    let mut buf = [0u8; 16];
+    let flag = u64::from(unwritten);
+    let l0 = (flag << 63) | (startoff << 9) | (startblock >> 43);
+    let l1 = (startblock << 21) | (blockcount & ((1u64 << 21) - 1));
+    BigEndian::write_u64(&mut buf[0..8], l0);
+    BigEndian::write_u64(&mut buf[8..16], l1);
+    buf
+}
+
 /// Translate an XFS filesystem block (the combined AG+block address used in
 /// extent records) into a byte offset relative to the start of the partition.
 ///
@@ -76,16 +89,9 @@ pub fn fsblock_to_partition_byte(fsblock: u64, agblocks: u32, agblklog: u8, bloc
 mod tests {
     use super::*;
 
-    /// Pack a record from logical fields the same way `xfs_bmbt_disk_set_all`
-    /// does. Used to build hand-constructed test cases.
+    /// Pack a record from logical fields (round-trip partner of decode).
     fn pack(unwritten: bool, startoff: u64, startblock: u64, blockcount: u64) -> [u8; 16] {
-        let mut buf = [0u8; 16];
-        let flag = if unwritten { 1u64 } else { 0u64 };
-        let l0 = (flag << 63) | (startoff << 9) | (startblock >> 43);
-        let l1 = (startblock << 21) | (blockcount & ((1u64 << 21) - 1));
-        BigEndian::write_u64(&mut buf[0..8], l0);
-        BigEndian::write_u64(&mut buf[8..16], l1);
-        buf
+        encode_extent(unwritten, startoff, startblock, blockcount)
     }
 
     #[test]
