@@ -15,26 +15,25 @@ Add a new entry here every time you park an item with "need fixture".
 
 ## ReiserFS
 
-- **§1.1 R.3b/c/d — S+tree walker, list_directory, read_file**
-  - Files:
-    - `tests/fixtures/test_reiserfs_v3_5.img.zst` — ≥ 32 MiB, v3.5 (`ReIsErFs` magic)
-    - `tests/fixtures/test_reiserfs_v3_6.img.zst` — ≥ 32 MiB, v3.6 (`ReIsEr2Fs` magic)
-  - Minimum contents (same layout on both, so tests can share code):
-    - `/hello.txt` containing exactly `Hello, ReiserFS!`
-    - `/subdir/nested.txt` containing exactly `nested file`
-    - `/link.txt` symlink → `hello.txt`
-    - One file with size > 16 KiB to force an indirect item (vs tail-packed direct)
-    - One file < 64 bytes to verify tail packing
-  - Producer: Linux box with `reiserfsprogs`:
-    ```
-    dd if=/dev/zero of=test_reiserfs_v3_6.img bs=1M count=64
-    mkfs.reiserfs -f -v 2 test_reiserfs_v3_6.img        # -v 2 = format 3.6
-    # ... loop-mount, populate, unmount ...
-    zstd test_reiserfs_v3_6.img -o test_reiserfs_v3_6.img.zst
-    ```
-    Replace `-v 2` with `-v 1` for the v3.5 image. Grab `reiserfsprogs`
-    **soon** — Linux kernel is on the removal track and distros will
-    start dropping the userspace next.
+- **§1.1 R.3b/c/d — S+tree walker, list_directory, read_file (v3.6 — shipped)**
+  - File: `tests/fixtures/test_reiserfs_v3_6.img.zst` — 64 MiB, v3.6
+    (`ReIsEr2Fs` magic), label `reiser36_test`. Carries `/hello.txt`,
+    `/subdir/nested.txt`, `/link.txt -> hello.txt`, `/tiny.txt` (10
+    bytes, exercises the tail-packing direct-item path), and
+    `/large.bin` (24 KiB deterministic, forces an indirect item with
+    6 block pointers). Producer: `scripts/generate-reiserfs-fixtures.sh`.
+
+- **§1.1 R.3 v3.5 fixture — parked (modern kernel won't mount)**
+  - Files: `tests/fixtures/test_reiserfs_v3_5.img.zst` (would need ≥ 32 MiB)
+  - Modern Linux kernels (6.x) refuse to mount a v3.5 ReiserFS volume
+    even when `reiserfsprogs` happily formats one — `mount` returns
+    `EUCLEAN "Structure needs cleaning"` and `mount -o conv` no longer
+    auto-upgrades. To produce a populated v3.5 fixture we'd need an
+    older kernel (~5.x). The R.1/R.2/R.3a synth tests in
+    `src/fs/reiserfs.rs` already cover the v3.5 superblock and V1 key
+    format (both `from_v1` sentinel u32s and V1 ItemHead version=0)
+    end-to-end. Grab `reiserfsprogs` while it's still in distros — the
+    Linux kernel is on the removal track and userspace is going next.
 
 ## UFS
 
