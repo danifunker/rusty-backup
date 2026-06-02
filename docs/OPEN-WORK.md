@@ -81,30 +81,36 @@ demand.
 | ~~U.3~~ | B | **Shipped.** `src/fs/ufs.rs` adds the `UfsInode` struct (version-agnostic in-memory dinode), `read_inode` (UFS1 128 B + UFS2 256 B layouts at `(cg * fpg + iblkno) * fsize + in_cg * dinode_size`), `resolve_logical_block` (direct[0..12] → single → double → triple indirect with sparse-pointer zero handling), `read_inode_data` (logical-block-by-logical-block walk with eager `max_bytes` clamp), `read_symlink_target` (inline payload when `di_size <= fs_maxsymlinklen`, otherwise data-block fallback), `build_file_entry` (mode-driven dispatch into File / Directory / Symlink / Special), and the `Filesystem::list_directory` + `Filesystem::read_file` implementations. `list_directory` decodes DIRENT2 records (8-byte fixed header + name + 4-byte-aligned pad), filters `.` / `..`, and validates `d_reclen` alignment + bounds + `d_namlen` slot fit. Wired through the existing dispatch — inspect → root → list → read works end-to-end on UFS1 and UFS2 fixtures. 19 new tests: inode_byte_offset against probe-derived absolute offsets, root-inode parse on both versions, dot/dotdot filtering, recursive subdir descent, inline symlink decode on both UFS1 (60 B cutoff) and UFS2 (120 B cutoff), 11 B file read (hello.txt), 10 B file read (tiny.txt), 24 KiB direct-block walk (large.bin = 3 blocks via direct[0..3]) with deterministic byte-formula spot checks, max_bytes early-exit clamp, regular/symlink/directory dispatch in read_file, two synthetic indirect-walk tests (single-indirect resolution to fragment 800 + sparse-block zero emission), and two inode-OOB rejection tests. |
 | U.4 | B+ | **Optional follow-up** — fsck + edit. Defer until there's real demand. |
 
-### 1.3 JFS
+### 1.3 JFS — **Tier A (J.1) shipped 2026-06-02.** Detect + size + inline-log-aware backup extent work; inspect tab shows the right type + sizes; backup captures the inline log + fsck workspace correctly.
 
-- **Scope**: JFS2 only (the only on-disk version Linux ever shipped; AIX's
-  original JFS1 is a different format-id — reject with a clear message).
-  Read + size first; edit out of scope until U.4 lands as the warm-up.
-- **References**: `partimage-0.6.9/src/client/fs/fs_jfs.cpp` (688 lines) for
-  Tier A; `jfsutils` (`jfs_debugfs`, `jfs_fsck`) for B+tree walkers; Linux
-  `fs/jfs/jfs_dinode.h`, `jfs_dtree.h`, `jfs_xtree.h`.
-- **Note**: even Tier A needs a basic B+tree walker because the Block
-  Allocation Map (BMAP) is itself a B+tree of allocation control pages, not
-  a flat bitmap.
+- **Scope**: JFS2 only (the only on-disk format Linux ever shipped; AIX
+  JFS1 is a different format with different magic and is rejected
+  implicitly by the `"JFS1"` ASCII-magic gate). Linux's `s_version` field
+  carries `1` (mkfs.jfs default); the kernel constant is `2`. The parser
+  accepts `1..=2` for forward compatibility.
+- **References**: `jfsutils/include/jfs_superblock.h` for the on-disk
+  struct; Linux `fs/jfs/{jfs_superblock,jfs_dinode,jfs_dtree,jfs_xtree,
+  jfs_dmap}.h` for AIT + xtree + BMAP walkers (J.2+).
+- **Note**: Tier A's "compact" piece needs a BMAP B+tree walker because
+  the Block Allocation Map is itself a B+tree of allocation control
+  pages (not a flat bitmap). J.1 ships without it — `last_data_byte`
+  returns `max(aggregate_end, logpxd_end, fsckpxd_end)` so backups
+  capture the inline log even on partitions where it lives past the
+  aggregate end; J.2 lights up free-block trimming on top.
 
 | # | Tier | Deliverable |
 |---|---|---|
-| J.1 | A | **Parked — need fixture.** Parse Aggregate Superblock at byte 32768 (`s_magic = "JFS1"`, `s_version = 2`; reject v1). Synth tests would land; full validation needs `mkfs.jfs` fixture. See `docs/need_fixtures.md`. |
-| J.2 | A | **Parked — need fixture.** BMAP B+tree walk → compact + `last_data_byte`. Same fixture as J.1. |
-| J.3 | B | **Parked — need fixture.** dtree + xtree + inode browse. Same fixture as J.1. |
-| J.4 | B+ | **Parked — design dependency.** fsck + edit. Defer until J.3 ships and there's real demand. |
+| ~~J.1~~ | A | **Shipped.** `src/fs/jfs.rs` parses the Aggregate Superblock at byte 32768 (`"JFS1"` ASCII magic + version `1..=2`), reads `s_size` (hardware-block count) / `s_bsize` (aggregate block size) / `s_pbsize` (hardware/LVM block size) / `s_agsize` / `s_state` / `s_label`, and decodes the inline-log + fsck-workspace `pxd_t`s (24-bit length + 40-bit address split across two LE words). Refuses dirty aggregates (`s_state != 0`) and asks the user to run `fsck.jfs -p`. `last_data_byte` returns `max(aggregate_end, logpxd_end, fsckpxd_end)` so backups capture the inline log even when it lives at the partition tail past the aggregate end (true on the makefs-equivalent layout `mkfs.jfs` produces — the log sits at agg block 3840 of a 3788-agg-block volume). Wired through `detect_filesystem_type` (4-byte ASCII probe at byte 32768), `probe_0x83_fs_type` ("JFS2"), and `open_filesystem`'s superfloppy + 0x83 dispatch arms. Fixture `tests/fixtures/test_jfs.img.zst` ships via `scripts/generate-jfs-fixtures.sh` (16 MiB, mkfs.jfs + libguestfs to populate the standard test tree). 21 tests: 14 synth (magic / version-1 / version-2 / future-version reject / dirty-aggregate reject / bad-bsize / l2bsize-mismatch / pbsize > bsize / zero-size / Pxd encode + decode round-trip / label / no-label / last_data_byte when log past aggregate vs inside / partition-offset threading) + 4 fixture-driven (geometry, logpxd / fsckpxd addresses, last_data_byte == 16 MiB > total_size). |
+| J.2 | A | **Parked — multi-session BMAP B+tree walker.** True free-block compaction (turning JFS allocation state into `CompactStreamReader` sections). Requires: (1) read AIT (Aggregate Inode Table) at the fixed `(SUPER1_OFF + SIZE_OF_SUPER + SIZE_OF_AIM)` byte offset; (2) look up inode 2 (BMAP control inode); (3) walk its inline xtree root → xtpage extension blocks → dmapctl L2/L1 pages → dmap leaf bitmaps. Each dmap covers 8 KiB of bitmap = 65536 aggregate blocks (256 MiB at bsize=4096). Kernel reference: `fs/jfs/jfs_dmap.c` is ~2000 lines. Without J.2 backups still work (J.1's `last_data_byte` is correct), they just don't trim free blocks inside the aggregate. Real demand for shrinking JFS backups is low on vintage hardware. |
+| J.3 | B | **Parked — depends on J.2's AIT + xtree walker.** Tier B browse: dtree (directory btree) decoding, xtree-driven file read, fileset-1 root inode lookup. AIT walker from J.2 is the prerequisite; ~1500 more lines on top. |
+| J.4 | B+ | **Parked — design dependency on J.3.** fsck + edit. Defer until J.3 ships and there's real demand. |
 
 ### Estimated total
 
-~~8 ReiserFS Tier A+B sessions~~ + ~~6 UFS Tier A+B sessions~~ done.
-~10-12 JFS Tier A+B left. Each Tier A slice is small (1-2 sessions);
-fixture generation per FS is a few minutes in a Linux VM.
+~~8 ReiserFS Tier A+B sessions~~ + ~~6 UFS Tier A+B sessions~~ +
+~~1 JFS J.1 session~~ done. ~10-12 JFS J.2 + J.3 (BMAP walker +
+browse) left if the user picks it back up; not currently scheduled
+because real demand for free-block trimming on JFS is low.
 
 ---
 

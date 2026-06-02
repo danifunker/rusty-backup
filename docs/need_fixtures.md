@@ -56,17 +56,30 @@ Add a new entry here every time you park an item with "need fixture".
     script then runs `makefs -t ffs -B le -s 16m -o version={1,2}`. No
     kernel UFS write support needed — userspace pass only.
 
-## JFS
+## JFS — **fixture shipped 2026-06-02**
 
-- **§1.3 J.1 / J.2 / J.3 — JFS2 detect, BMAP walk, browse**
-  - Files:
-    - `tests/fixtures/test_jfs2.img.zst` — ≥ 16 MiB, JFS2 (Aggregate Superblock at byte 32768, magic `JFS1` with `s_version=2`)
-  - Minimum contents: ReiserFS-shape (hello/subdir/link/large/small).
-  - Producer: Linux box with `jfsutils`:
-    ```
-    dd if=/dev/zero of=test_jfs2.img bs=1M count=32
-    mkfs.jfs -q test_jfs2.img
-    ```
+- **§1.3 J.1 — JFS2 detect, sizing, inline-log-aware backup extent (now in tree)**
+  - File (shipped via `scripts/generate-jfs-fixtures.sh`, 4.4 KiB zstd):
+    - `tests/fixtures/test_jfs.img.zst` — 16 MiB, JFS2 (Aggregate
+      Superblock at byte 32768, magic `JFS1`, on-disk `s_version=1`
+      as Linux mkfs.jfs writes; kernel constant is `2` and either
+      value mounts cleanly).
+  - Contents (matching ReiserFS / ext / UFS fixtures):
+    `/hello.txt`, `/subdir/nested.txt`, `/link.txt` symlink,
+    `/tiny.txt` (10 bytes), `/large.bin` (24 KiB deterministic;
+    consumed by J.3 once the AIT + xtree walker lands).
+  - Producer notes: Ubuntu has `jfsutils` (universe) which gives
+    `mkfs.jfs`; the kernel module isn't always loaded in WSL, so
+    `guestfish` mounts via the libguestfs appliance kernel +
+    `linux-modules-extra-$(uname -r)` (same pattern as the ReiserFS
+    fixture). 16 MiB is the JFS minimum — anything smaller and
+    mkfs.jfs refuses.
+- **§1.3 J.2 / J.3 — BMAP B+tree walker + Tier B browse** still
+  parked, but **not fixture-blocked** — the fixture above already
+  carries the file tree J.3 will need. Parked for scope (multi-
+  session walker, ~2000 lines of kernel reference for J.2 alone).
+  Pick up if real demand surfaces for trimming free blocks out of
+  JFS backups.
 
 ## NTFS file-aware GHO (compressed)
 

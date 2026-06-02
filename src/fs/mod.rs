@@ -23,6 +23,7 @@ pub mod hfsplus_fsck;
 pub mod hfsplus_journal;
 pub mod hfsplus_wrapper_clone;
 pub mod hfv;
+pub mod jfs;
 pub mod layout_preserving;
 pub mod mac_alias;
 pub mod ntfs;
@@ -276,6 +277,20 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
         }
     }
 
+    // JFS2 magic probe. The primary aggregate superblock lives at byte
+    // 32768 (`SUPER1_OFF`) and starts with the 4-byte ASCII magic
+    // "JFS1" (Linux JFS2; AIX JFS1 is a different on-disk format with
+    // different magic — rejected implicitly).
+    if reader
+        .seek(SeekFrom::Start(partition_offset + 0x8000))
+        .is_ok()
+    {
+        let mut jfs_magic = [0u8; 4];
+        if reader.read_exact(&mut jfs_magic).is_ok() && &jfs_magic == b"JFS1" {
+            return "jfs";
+        }
+    }
+
     "unknown"
 }
 
@@ -300,6 +315,7 @@ pub fn probe_0x83_fs_type<R: Read + Seek>(
         "xfs" => Some("XFS"),
         "reiserfs" => Some("ReiserFS"),
         "ufs" => Some("UFS"),
+        "jfs" => Some("JFS2"),
         _ => None,
     }
 }
@@ -746,14 +762,14 @@ pub fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &
         return match s {
             "Apple_HFS" => "HFS",
             "Apple_HFSX" => "HFSX",
-            "Apple_UNIX_SVR2" => "ext/btrfs/xfs/reiserfs/UFS",
-            "Linux" => "ext/btrfs/xfs/reiserfs/UFS",
+            "Apple_UNIX_SVR2" => "ext/btrfs/xfs/reiserfs/UFS/JFS",
+            "Linux" => "ext/btrfs/xfs/reiserfs/UFS/JFS",
             _ => "unknown",
         };
     }
     match partition_type {
         0xAF => "HFS/HFS+",
-        0x83 => "ext/btrfs/xfs/reiserfs/UFS",
+        0x83 => "ext/btrfs/xfs/reiserfs/UFS/JFS",
         0xA8 => "ProDOS",
         0x07 => "NTFS/exFAT",
         0x01 | 0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C => "FAT",
@@ -1092,6 +1108,10 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "jfs" => Ok(Box::new(jfs::JfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "efs" => Ok(Box::new(efs::EfsFilesystem::open(
                     reader,
                     partition_offset,
@@ -1160,6 +1180,10 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     partition_offset,
                 )?)),
                 "ufs" => Ok(Box::new(ufs::UfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "jfs" => Ok(Box::new(jfs::JfsFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),

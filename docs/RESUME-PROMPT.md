@@ -82,14 +82,14 @@ Start by checking `git log --oneline -20` to see what landed in the
 previous session, then pick the next item from the "Still open"
 list. Recommended order:
 
-  1. **§1.3 JFS** (Tier A: J.1 + J.2) — fixture needs `jfsutils`
-     installed in WSL (`sudo apt-get install -y jfsutils`); JFS2
-     has a basic B+tree walker even at Tier A because BMAP itself
-     is a B+tree of allocation control pages.
+  1. **§6.2 `rb-cli get` globbing** — medium scope; extend the
+     existing `src/cli/glob.rs` infrastructure that already powers
+     `ls` / `rm` / `put` to cover recursive extract.
   2. **§2.3 HFS+ journal Step 27** if you want the biggest piece
      (~500 LOC across every HFS+ write site).
-  3. **§6.2 `rb-cli get` globbing** for medium scope.
-  4. **§6.3 GUI `.hqx` import** for a design checkpoint first.
+  3. **§6.3 GUI `.hqx` import** — needs a design checkpoint first.
+  4. **§1.3 JFS J.2 + J.3** — parked; pick up if you want the
+     BMAP walker for free-block trimming.
 
 To regenerate or extend a fixture, model your script on
 `scripts/generate-{reiserfs,ufs}-fixtures.sh`. The WSL environment
@@ -107,7 +107,8 @@ Most recent commits on `mister-parity` (newest first):
 
 | Commit | Item | Tests added |
 |---|---|---|
-| _(this session)_ | **UFS U.3** — dinode reader + DIRENT2 `list_directory` + direct/indirect `read_file` for both UFS1 (128 B dinode, 32-bit pointers) and UFS2 (256 B dinode, 64-bit pointers). Adds `UfsInode`, `inode_byte_offset`, `read_inode`, `resolve_logical_block` (12 direct → single → double → triple indirect, sparse-block-aware), `read_inode_data`, `read_symlink_target` (inline payload up to `fs_maxsymlinklen`, otherwise data block), `build_file_entry`. Now reads + browses end-to-end through the existing dispatch. | 19 |
+| _(this session)_ | **JFS J.1** — Aggregate Superblock parser + detect for JFS2 (`"JFS1"` magic at byte 32768; accepts on-disk `s_version` 1 or 2; refuses dirty aggregates). Decodes the inline-log + fsck-workspace `pxd_t`s and reports `last_data_byte = max(aggregate_end, logpxd_end, fsckpxd_end)` so backups capture the inline log when it lives past the aggregate end (true on the makefs-equivalent layout). Fixture `test_jfs.img.zst` (16 MiB, 4.4 KiB zstd) via `scripts/generate-jfs-fixtures.sh` + libguestfs. Wired through `detect_filesystem_type`, `probe_0x83_fs_type` ("JFS2"), and `open_filesystem` 0x83 + superfloppy. J.2 (BMAP B+tree compactor) + J.3 (browse) parked — multi-session work, not currently scheduled. | 21 |
+| `93c3054` | **UFS U.3** — dinode reader + DIRENT2 `list_directory` + direct/indirect `read_file` for both UFS1 (128 B dinode, 32-bit pointers) and UFS2 (256 B dinode, 64-bit pointers). Adds `UfsInode`, `inode_byte_offset`, `read_inode`, `resolve_logical_block` (12 direct → single → double → triple indirect, sparse-block-aware), `read_inode_data`, `read_symlink_target` (inline payload up to `fs_maxsymlinklen`, otherwise data block), `build_file_entry`. Now reads + browses end-to-end through the existing dispatch. | 19 |
 | `e2a5121` | **UFS U.2** — CG header parser + walker (validates cg_magic 0x00090255), `Filesystem::last_data_byte` override (bitmap polarity is **set = FREE**, BSD convention), `CompactUfsReader` (layout-preserving, coalesces same-state runs). Adds `BitmapReader::highest_clear_bit` to `unix_common::bitmap`. Re-exported as `crate::fs::CompactUfsReader`. | 13 |
 | `375abe4` | **UFS U.1** — `src/fs/ufs.rs` superblock parser + detect (UFS1 0x00011954 / UFS2 0x19540119; both LE/BE; both SB offsets 8192 + 65536; SU+J dirty refusal); `scripts/generate-ufs-fixtures.sh` uses NetBSD `makefs` to produce `test_ufs{1,2}.img.zst` (16 MiB each, ~1.4 KB zstd). Wired through `detect_filesystem_type`, `probe_0x83_fs_type` ("UFS"), and `open_filesystem` 0x83 + superfloppy arms. | 17 |
 | `2be0e0b` | **ReiserFS R.3d** `read_file` — SD + IND (sparse-zero handling) + DRCT (tail-padding truncation), `max_bytes` honoured eagerly. Closes the entire §1.1 read track. | 5 |
@@ -144,14 +145,14 @@ the ReiserFS one (`jfsutils` is the Ubuntu package; the host's
 
 ## Still open — pick one
 
-### Filesystem read-track (fixture work unblocked)
-- **§1.3 JFS** (Recommended next, Tier A: J.1 + J.2) — JFS2 only;
-  reject AIX JFS1 with a clear error. Aggregate Superblock at byte
-  32768. BMAP is itself a B+tree of allocation control pages so
-  even Tier A needs a basic B+tree walker. Fixture generation needs
-  `jfsutils` from Ubuntu apt (not yet installed in user's WSL);
-  follow the libguestfs + modules-extra pattern from
-  `scripts/generate-reiserfs-fixtures.sh`.
+### Filesystem read-track (parked, not currently scheduled)
+- **§1.3 JFS J.2 + J.3** — BMAP B+tree compactor + Tier B browse.
+  Fixture (`test_jfs.img.zst`) ships in tree; the gating constraint
+  is scope, not data. J.2 alone needs an AIT walker + xtree decoder
+  + dmapctl multi-level traversal; kernel reference is ~2000 lines.
+  Without J.2, backups still work (J.1's `last_data_byte` is
+  correct), they just don't trim free blocks inside the aggregate.
+  Pick up if real demand surfaces.
 
 ### Large
 - **§2.3 HFS+ journal Step 27** — route every `do_sync_metadata`
