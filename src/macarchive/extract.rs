@@ -66,14 +66,24 @@ pub fn open_bytes(raw: Vec<u8>) -> Result<(Vec<u8>, StuffItArchive)> {
     };
     let archive = if stuffit5::is_stuffit5(&bytes) {
         stuffit5::parse(&bytes)?
+    } else if is_stuffitx(&bytes) {
+        bail!(
+            "StuffIt X (.sitx) recognized, but native extraction is not yet implemented \
+             (its catalog + data streams use the Brimstone / PPMd-variant-G codec). \
+             Use `unar` for now."
+        );
     } else if stuffit::find_sea_archive(&bytes).is_some() {
         stuffit::parse(&bytes)?
     } else {
-        bail!(
-            "not a recognized StuffIt archive (classic SIT! / StuffIt 5; .sitx is not supported)"
-        );
+        bail!("not a recognized StuffIt archive (classic SIT! / StuffIt 5)");
     };
     Ok((bytes, archive))
+}
+
+/// Detect the StuffIt X container ("StuffIt!" / "StuffIt?"). Distinct from
+/// StuffIt 5, whose 8th byte is a space ("StuffIt (c)1997…").
+pub fn is_stuffitx(data: &[u8]) -> bool {
+    data.len() >= 8 && &data[..7] == b"StuffIt" && (data[7] == b'!' || data[7] == b'?')
 }
 
 /// Extract every file in `archive` to `dest`, rebuilding the directory tree.

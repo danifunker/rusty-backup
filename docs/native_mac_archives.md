@@ -197,9 +197,24 @@ duplication.
 
 ## 7. Deferred / out of scope
 
-- `[-]` **StuffIt X (`.sitx`)** — different container + arithmetic/Brimstone/BWT
-  codecs; biggest lift, least common for floppy preservation. Revisit only on
-  demand; XADMaster is the reference if/when we do.
+- `[~]` **StuffIt X (`.sitx`)** — recognized (`extract::is_stuffitx`) and routed
+  with a clear "not yet implemented" message. Full investigation done; the
+  remaining work is precisely scoped:
+  - **Container** (`XADStuffItXParser.m`, ~770 lines): a bit-packed P2 var-int
+    stream of typed "elements" (file/fork/directory/catalog/data) forming an
+    object graph with **solid** (concatenated) streams + out-of-order forks.
+  - **Gate:** filenames live in a **catalog** element that is itself compressed,
+    so even *listing* needs a working codec.
+  - **Codec:** both local sample `.sitx` files (incl. Apple's set) use
+    **Brimstone = PPMd variant G** + a custom "Brimstone" pointer-pool
+    suballocator (`PPMd/{RangeCoder,Context,VariantG,SubAllocatorBrimstone}.c`,
+    ~1,320 lines). Other codecs (Cyanide/Darkhorse/Blend/Iron/Deflate) +
+    preprocessors (English dict, x86) are additional.
+  - **Validation hook:** each element carries an IEEE-CRC32, so a correct PPMd
+    decode of the catalog/data verifies itself.
+  - **Total:** ~2,500 lines of intricate Rust (incl. unsafe pointer-pool memory
+    emulation; PPMd is bit-exact-or-nothing). A standalone project; `unar`
+    covers `.sitx` in the meantime.
 - `[-]` **SIT method 13/15 *compressors*** — read-only for those; we write
   stored/RLE90.
 - `[-]` **Compact Pro / DiskDoubler / other SEA engines** — detect-and-decline.
