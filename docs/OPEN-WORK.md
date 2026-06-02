@@ -53,25 +53,31 @@ Tier B (R.3a–R.3d) all landed; inspect / browse / read all work on v3.6.
 | ~~R.3c~~ | B | **Shipped.** `Filesystem::list_directory` decodes DIR_ENTRY items: 16-byte `reiserfs_de_head` headers sorted by hash, names packed in reverse at item tail, NUL-padded to 8-byte slots. `.`, `..`, and `.reiserfs_priv` are filtered. Per-entry SD lookup populates mode/uid/gid/mtime + size; symlink targets fetched from the Direct item and truncated to SD-recorded size. `FileEntry::location` packs `(dir_id << 32) \| objectid` so subdir entries round-trip through subsequent `list_directory` calls. Tests: 9 synth (StatData new/old + reject-wrong-size, DIR_ENTRY empty/single/multi + overlap/past-body refusals, pack/unpack round-trip) and 5 fixture-driven (root entry, hidden-filter, file metadata, symlink target, recursive subdir descent). |
 | ~~R.3d~~ | B | **Shipped.** `Filesystem::read_file` walks the file's items in key-order: SD fixes the logical size, IND items expand to `block_size` chunks per u32 pointer (sparse pointers = 0 emit zeros), DRCT items append raw bytes. Final truncation to SD.size drops the NUL-padding inside the tail-packed DRCT's 8-byte slot. `max_bytes` is honoured eagerly so over-cap reads short-circuit without loading entire IND chains. Tests: 5 fixture-driven (`hello.txt` DRCT, `tiny.txt` tail-packed-with-padding, `large.bin` 6-pointer IND with byte-formula spot-checks at 0/1/100/4095/4096/12345/24575, `subdir/nested.txt` recursive read, `max_bytes` cap). |
 
-### 1.2 UFS
+### 1.2 UFS — **Tier A shipped 2026-06-02.** U.1 + U.2 landed; inspect /
+backup compactor work on UFS1 + UFS2 (both 8192- and 65536-byte SB
+locations, both LE and BE endians). Tier B (U.3 browse) is next.
 
 - **Scope**: UFS1 (4.2BSD/FFS — SunOS 4, Solaris 2, NetBSD, OpenBSD, FreeBSD
   ≤4) and UFS2 (FreeBSD 5+). Read + size on first pass; edit + fsck gated
-  on real demand. **Reject** softupdate-journaled and SU+J **dirty**
-  volumes with a clear message rather than risk corrupting recovery state.
+  on real demand. Softupdate-journaled (SU+J) **dirty** volumes are
+  refused at open with a clear message — the safe path is "let
+  `fsck_ffs -y` replay the journal first."
 - **References**: `partimage-0.6.9/src/client/fs/fs_ufs.cpp` for Tier A;
   FreeBSD `sys/ufs/ffs/fs.h` + `sys/ufs/ufs/dinode.h` for on-disk structs;
   `ufstools` (`ufstool`, `fsck_ffs`) as oracle.
 - **Internal precedent**: `src/fs/efs.rs` + `src/fs/unix_common/` — EFS is
   the same cylinder-group + inode-bitmap + classic-Unix-inode shape, and
   the unix_common scaffolding lifts to UFS with little change.
+- **Bitmap polarity**: confirmed **set = FREE** (BSD convention, opposite
+  of ReiserFS / ext). `BitmapReader::highest_clear_bit` (added under U.2)
+  is the matching primitive; JFS can reuse it.
 
 | # | Tier | Deliverable |
 |---|---|---|
-| U.1 | A | **Parked — need fixture.** Superblock parser handling UFS1 (byte 8192, magic `0x011954`) and UFS2 (byte 65536, magic `0x19540119`). Synth unit tests would land; for end-to-end validation we need a `newfs` fixture. See `docs/need_fixtures.md`. |
-| U.2 | A | **Parked — need fixture.** Cylinder-group walk for compaction + `last_data_byte`. Same fixture as U.1. |
-| U.3 | B | **Parked — need fixture.** Inode + dir + file browse. Same fixture as U.1. |
-| U.4 | B+ | **Optional follow-up** — fsck + edit. Defer until U.1-U.3 prove demand. |
+| ~~U.1~~ | A | **Shipped.** `src/fs/ufs.rs` parses the FreeBSD UFS superblock for both UFS1 (`0x00011954`) and UFS2 (`0x19540119`), probing the kernel `SBLOCKSEARCH` order — UFS2's modern byte 65536 first, then UFS1's byte 8192 — and accepting whichever magic matches in either endian. Geometry (bsize / fsize / frag / ncg / fpg / ipg / cblkno) is read with byte-order-aware accessors and gated on power-of-two block sizes, frag×fsize == bsize, and plausible ncg. UFS1 total comes from `fs_old_size`; UFS2 from the 64-bit `fs_size` at offset 1080. Refuses SU+J dirty volumes. Wired through `detect_filesystem_type`, `probe_0x83_fs_type` ("UFS"), and `open_filesystem`'s superfloppy + 0x83 dispatch arms. 15 synth unit tests + 2 fixture-driven tests cover both magics, both endians, both SB offsets, SB-ambiguous "prefer-UFS2" disambiguation, SU+J reject/accept, bsize/frag sanity, label parsing, partition-offset threading, UFS1 / UFS2 size formulas. |
+| ~~U.2~~ | A | **Shipped.** Cylinder-group walker: `cg_header_offset(i)` / `cgbase_frag(i)` math, `read_cg_free_bitmap(i)` (validates cg_magic `0x00090255` + cg_cgx; bounds the bitmap to `[freeoff, nextfreeoff)`), `Filesystem::last_data_byte` override (scans CGs from end, returns highest CLEAR-bit position translated to bytes), and `CompactUfsReader` (layout-preserving stream coalescing same-state bitmap runs into MappedBlocks / Zeros sections, with trailing zero-pad to `total_frags * fsize`). Re-exported as `crate::fs::CompactUfsReader` and wired through `compact_partition_reader` (both 0x83 + superfloppy arms). `BitmapReader::highest_clear_bit` added to `unix_common::bitmap` with 6 dedicated tests. 7 new fixture-driven tests verify last_data_byte (= 73728 on both UFS1/UFS2 fixtures, independently confirmed via `scripts/probe-ufs-cg.py`), CG-magic corruption rejection, stream length == original_size, byte-for-byte allocated-region preservation, zero-fill in free regions, and round-trip through the parser for both fixtures. |
+| U.3 | B | **Available.** Inode + dir + file browse. UFS1 dinode (128 B) + UFS2 dinode (256 B) lookup at well-known CG offsets; DIRENT2 records (variable-length name + type byte); inline 12 direct + 3 indirect block pointers (UFS1 32-bit) or 48-byte extents (UFS2 64-bit); symlink targets (inline up to 60/120 bytes, otherwise via direct pointer). Synth + fixture-driven tests mirroring ReiserFS R.3c/d shape. |
+| U.4 | B+ | **Optional follow-up** — fsck + edit. Defer until U.3 ships and there's real demand. |
 
 ### 1.3 JFS
 

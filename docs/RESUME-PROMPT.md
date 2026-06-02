@@ -82,13 +82,13 @@ Start by checking `git log --oneline -20` to see what landed in the
 previous session, then pick the next item from the "Still open"
 list. Recommended order:
 
-  1. **§1.2 UFS** (Tier A: U.1 + U.2) — fixture generation is now
-     unblocked (`linux-modules-extra-$(uname -r)` is installed in
-     WSL so libguestfs can mount UFS2 in its appliance). Reuses the
-     EFS scaffolding (`src/fs/efs.rs` + `src/fs/unix_common/`) which
-     already implements the cylinder-group + classic-Unix-inode
-     shape. Should be a smaller lift per phase than ReiserFS was.
-  2. **§1.3 JFS** (Tier A: J.1 + J.2) — same fixture story; JFS2
+  1. **§1.2 UFS U.3** (Tier B browse + read) — fixtures
+     `test_ufs{1,2}.img.zst` ship in tree; UFS1/UFS2 dinode + DIRENT2
+     + indirect-block resolution + inline-vs-deferred symlink
+     handling. Mirror ReiserFS R.3c/d shape; should be a similar
+     lift per phase.
+  2. **§1.3 JFS** (Tier A: J.1 + J.2) — fixture needs `jfsutils`
+     installed in WSL (`sudo apt-get install -y jfsutils`); JFS2
      has a basic B+tree walker even at Tier A because BMAP itself
      is a B+tree of allocation control pages.
   3. **§2.3 HFS+ journal Step 27** if you want the biggest piece
@@ -97,9 +97,9 @@ list. Recommended order:
   5. **§6.3 GUI `.hqx` import** for a design checkpoint first.
 
 To regenerate or extend a fixture, model your script on
-`scripts/generate-reiserfs-fixtures.sh`. The WSL environment is
-already configured (libguestfs + linux-image-virtual + modules-extra
-+ dpkg-statoverride on the vmlinuz).
+`scripts/generate-{reiserfs,ufs}-fixtures.sh`. The WSL environment
+is already configured (libguestfs + linux-image-virtual +
+modules-extra + dpkg-statoverride on the vmlinuz; `makefs` for FFS).
 
 Park items the user hasn't given a fixture for and move on.
 ```
@@ -108,7 +108,7 @@ Park items the user hasn't given a fixture for and move on.
 
 ## Recently shipped (last session, 2026-06-02 evening)
 
-4 commits on `mister-parity` ahead of `9759a97`:
+Most recent commits on `mister-parity`:
 
 | Commit | Item | Tests added |
 |---|---|---|
@@ -116,44 +116,55 @@ Park items the user hasn't given a fixture for and move on.
 | `e2b53b1` | **ReiserFS R.3b** S+tree walker (`collect_leaf_block_numbers`, `collect_items_for_object`). Fixed two R.3a bugs the real image exposed: `LEAF_LEVEL` was 0 (should be 1; kernel `DISK_LEAF_NODE_LEVEL = 1`); `KeyFormat::from_version` mapped `2 → V2` (should be `1 → V2`; kernel `ITEM_VERSION_2 = 1`). | 10 |
 | `9f53b83` | **ReiserFS R.3c** `list_directory` — DIR_ENTRY decoder (16-byte `reiserfs_de_head` + name slots), StatData parser (new 44 B / old 32 B), `pack_loc/unpack_loc`, `.reiserfs_priv` filter, recursive subdir descent. | 14 |
 | `2be0e0b` | **ReiserFS R.3d** `read_file` — SD + IND (sparse-zero handling) + DRCT (tail-padding truncation), `max_bytes` honoured eagerly. Closes the entire §1.1 read track. | 5 |
+| `375abe4` | **UFS U.1** — `src/fs/ufs.rs` superblock parser + detect (UFS1 0x00011954 / UFS2 0x19540119; both LE/BE; both SB offsets 8192 + 65536; SU+J dirty refusal); `scripts/generate-ufs-fixtures.sh` uses NetBSD `makefs` to produce `test_ufs{1,2}.img.zst` (16 MiB each, ~1.4 KB zstd). Wired through `detect_filesystem_type`, `probe_0x83_fs_type` ("UFS"), and `open_filesystem` 0x83 + superfloppy arms. | 17 |
+| `e2a5121` | **UFS U.2** — CG header parser + walker (validates cg_magic 0x00090255), `Filesystem::last_data_byte` override (bitmap polarity is **set = FREE**, BSD convention), `CompactUfsReader` (layout-preserving, coalesces same-state runs). Adds `BitmapReader::highest_clear_bit` to `unix_common::bitmap`. Re-exported as `crate::fs::CompactUfsReader`. | 13 |
 
-29 new ReiserFS unit tests (57 total in the module). Full lib suite
-green except the pre-existing Windows-only
-`os::windows::tests::test_enumerate_devices_nonempty` which requires
-a real physical disk.
+29 new ReiserFS unit tests + 24 new UFS unit tests + 6 new bitmap
+helper tests. Full lib suite green except the pre-existing
+Windows-only `os::windows::tests::test_enumerate_devices_nonempty`
+which requires a real physical disk.
 
-### WSL fixture-generation environment is now set up
+### WSL fixture-generation environment
 
-`scripts/generate-reiserfs-fixtures.sh` documents the host-side
-setup as comments at the top, but the one-time work is already done
-on the user's WSL Ubuntu 24.04:
+`scripts/generate-reiserfs-fixtures.sh` and
+`scripts/generate-ufs-fixtures.sh` document host-side setup as
+comments at the top. The one-time work is already done on the
+user's WSL Ubuntu 24.04:
 
   * `reiserfsprogs`, `libguestfs-tools`, `linux-image-virtual`,
-    `linux-modules-extra-$(uname -r)` are all installed
+    `linux-modules-extra-$(uname -r)` (for ReiserFS).
+  * `makefs` (NetBSD's FFS image builder, Ubuntu universe) — used
+    for both UFS1 and UFS2 fixtures since Ubuntu has no
+    `mkfs.ufs` / `newfs`.
   * `dpkg-statoverride` makes `/boot/vmlinuz-*` readable to the
-    user (libguestfs needs it; persists across kernel upgrades)
+    user (libguestfs needs it; persists across kernel upgrades).
 
-So UFS / JFS fixture generation works the same way: format with the
-host's `mkfs.*`, populate via libguestfs's QEMU appliance kernel.
-Just write a `scripts/generate-{ufs,jfs}-fixtures.sh` modeled on
-the reiserfs one.
+JFS fixture generation will reuse the libguestfs+modules-extra
+path; just write `scripts/generate-jfs-fixtures.sh` modeled on
+the ReiserFS one (`jfsutils` is the Ubuntu package; the host's
+`mkfs.jfs` formats userspace and the appliance kernel mounts).
 
 ---
 
 ## Still open — pick one
 
 ### Filesystem read-track (fixture work unblocked)
-- **§1.2 UFS** (Recommended next) — Tier A: U.1 superblock (UFS1 at
-  byte 8192 magic `0x011954`, UFS2 at byte 65536 magic `0x19540119`),
-  U.2 cylinder-group walk → compact + `last_data_byte`. Tier B: U.3
-  inode + dir + file browse. Reuses `src/fs/efs.rs` +
-  `src/fs/unix_common/` patterns (cylinder-group + classic-Unix-inode
-  shape). Refuse softupdate-journaled + SU+J dirty volumes with a
-  clear message rather than risk corrupting recovery state.
+- **§1.2 UFS U.3** (Recommended next) — Tier B browse + read on the
+  UFS fixtures that just landed under U.1/U.2. UFS1 dinode is 128 B
+  / UFS2 dinode is 256 B at well-known CG offsets (`fs_iblkno`
+  through `fs_iblkno + ipg*dinode_size/fsize`). DIRENT2 records are
+  variable-length (`d_ino`, `d_reclen`, `d_type`, name + NUL pad to
+  4-byte alignment). Files via inline 12 direct + 3 indirect block
+  pointers (UFS1 32-bit) or 48-byte extents (UFS2 64-bit). Symlink
+  targets inline up to 60 (UFS1) / 120 (UFS2) bytes, otherwise via
+  direct pointer. Mirror ReiserFS R.3c/d shape: collect + decode +
+  fixture-driven assertions for hello.txt / subdir / link / large /
+  tiny against the actual makefs-built bytes.
 - **§1.3 JFS** (Tier A: J.1 + J.2) — JFS2 only; reject AIX JFS1 with
   a clear error. Aggregate Superblock at byte 32768. BMAP is itself
   a B+tree of allocation control pages so even Tier A needs a basic
-  B+tree walker.
+  B+tree walker. Fixture generation needs `jfsutils` from Ubuntu
+  apt (not yet installed in user's WSL).
 
 ### Large
 - **§2.3 HFS+ journal Step 27** — route every `do_sync_metadata`

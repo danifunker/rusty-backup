@@ -35,16 +35,24 @@ Add a new entry here every time you park an item with "need fixture".
     end-to-end. Grab `reiserfsprogs` while it's still in distros — the
     Linux kernel is on the removal track and userspace is going next.
 
-## UFS
+## UFS — **fixtures shipped 2026-06-02**
 
-- **§1.2 U.1 / U.2 / U.3 — UFS1 + UFS2 detect, sizing, browse**
-  - Files:
-    - `tests/fixtures/test_ufs1.img.zst` — ≥ 16 MiB, UFS1 (superblock at byte 8192, magic `0x011954`)
-    - `tests/fixtures/test_ufs2.img.zst` — ≥ 16 MiB, UFS2 (superblock at byte 65536, magic `0x19540119`)
-  - Minimum contents: same shape as ReiserFS — `/hello.txt`, `/subdir/nested.txt`,
-    `/link.txt` symlink, one >16 KiB file (indirect block walk), one inline file.
-  - Producer: FreeBSD VM (`newfs -O 1 ...` for UFS1, `newfs -O 2 ...` for UFS2),
-    or Linux with the `ufstool` / `mkfs.ufs` package.
+- **§1.2 U.1 / U.2 / U.3 — UFS1 + UFS2 detect, sizing, browse (now in tree)**
+  - Files (shipped via `scripts/generate-ufs-fixtures.sh`, ~1.4 KB zstd each):
+    - `tests/fixtures/test_ufs1.img.zst` — 16 MiB, UFS1, makefs default layout
+      (SB at byte 8192, magic `0x011954`).
+    - `tests/fixtures/test_ufs2.img.zst` — 16 MiB, UFS2; NetBSD makefs places
+      the SB at byte 8192 even for `-O 2` (FreeBSD `newfs` would put it at
+      byte 65536 — our parser handles both).
+  - Contents (matching ReiserFS / ext fixtures):
+    `/hello.txt`, `/subdir/nested.txt`, `/link.txt` symlink, `/tiny.txt`
+    (10 bytes), `/large.bin` (24 KiB deterministic to exercise UFS3 indirect
+    pointers under U.3).
+  - Producer notes: Ubuntu 24.04 has no `mkfs.ufs`/`newfs`, but the `makefs`
+    package in universe (NetBSD's tool) builds an FFS image directly from a
+    host directory tree. Install via `sudo apt-get install -y makefs`; the
+    script then runs `makefs -t ffs -B le -s 16m -o version={1,2}`. No
+    kernel UFS write support needed — userspace pass only.
 
 ## JFS
 
