@@ -104,7 +104,7 @@ jobs:
           fi
       
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: Rusty-Backup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
           path: Rusty-Backup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip
@@ -118,7 +118,7 @@ jobs:
           7z a "../../../rb-cli-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip" rb-cli.exe
 
       - name: Upload CLI artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: rb-cli-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
           path: rb-cli-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip
@@ -141,7 +141,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "iscc failed with exit code $LASTEXITCODE" }
 
       - name: Upload installer artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: Rusty-Backup-Setup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
           path: installer\Output\Rusty-Backup-Setup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.exe
@@ -373,13 +373,13 @@ jobs:
           fi
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: Rusty-Backup-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
           path: Rusty-Backup-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg
 
       - name: Upload CLI artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: rb-cli-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
           path: rb-cli-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip
@@ -573,7 +573,7 @@ jobs:
           rm -f /usr/local/bin/pkexec
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-appimage
           path: |
@@ -681,19 +681,19 @@ jobs:
           tar -czf ../../Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.pkg.tar.zst *
 
       - name: Upload Debian package
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-deb
           path: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.deb
 
       - name: Upload RPM package
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-rpm
           path: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.rpm
 
       - name: Upload Arch package
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-arch
           path: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.pkg.tar.zst
@@ -704,7 +704,7 @@ jobs:
           tar -C "target/${{ matrix.target }}/release" -czf "$TGZ" rb-cli
 
       - name: Upload CLI artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: rb-cli-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
           path: rb-cli-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz
@@ -716,7 +716,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
       
@@ -777,7 +777,7 @@ jobs:
           cat DOWNLOADS.md
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ needs.generate-version.outputs.version }}
           name: Release ${{ needs.generate-version.outputs.version }}
