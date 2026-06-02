@@ -10,6 +10,7 @@
 //!
 //! See `docs/native_mac_archives.md` for the format references and roadmap.
 
+pub mod extract;
 pub mod stuffit;
 pub mod stuffit13_tables;
 pub mod stuffit5;

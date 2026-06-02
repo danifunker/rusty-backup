@@ -15,9 +15,9 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::logging::log_stderr;
 use crate::fs::binhex;
-use crate::fs::resource_fork::{self, sanitize_filename};
-use crate::macarchive::stuffit::{self, StuffItArchive};
-use crate::macarchive::stuffit5;
+use crate::fs::resource_fork;
+use crate::macarchive::extract;
+use crate::macarchive::stuffit;
 
 #[derive(Debug, Subcommand)]
 pub enum SitCommand {
@@ -80,6 +80,17 @@ pub enum ForkFormat {
     Raw,
 }
 
+impl ForkFormat {
+    fn to_core(self) -> extract::ForkFormat {
+        match self {
+            ForkFormat::BinHex => extract::ForkFormat::BinHex,
+            ForkFormat::MacBinary => extract::ForkFormat::MacBinary,
+            ForkFormat::AppleDouble => extract::ForkFormat::AppleDouble,
+            ForkFormat::Raw => extract::ForkFormat::Raw,
+        }
+    }
+}
+
 pub fn run(cmd: SitCommand) -> Result<()> {
     match cmd {
         SitCommand::List(args) => run_list(args),
@@ -88,30 +99,9 @@ pub fn run(cmd: SitCommand) -> Result<()> {
     }
 }
 
-/// Load an archive, transparently BinHex-decoding a `.sit.hqx` wrapper and
-/// routing classic StuffIt (`SIT!`), StuffIt 5, and `.sea` to the right parser.
-fn load_archive(path: &Path) -> Result<(Vec<u8>, StuffItArchive)> {
-    let raw = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    // If it's a BinHex document, the StuffIt stream is its data fork.
-    let bytes = match binhex::parse_binhex(&raw) {
-        Ok(bh) => bh.data_fork,
-        Err(_) => raw,
-    };
-    let archive = if stuffit5::is_stuffit5(&bytes) {
-        stuffit5::parse(&bytes)?
-    } else if stuffit::find_sea_archive(&bytes).is_some() {
-        stuffit::parse(&bytes)?
-    } else {
-        bail!(
-            "{}: not a recognized StuffIt archive (classic SIT! / StuffIt 5; .sitx is not supported)",
-            path.display()
-        );
-    };
-    Ok((bytes, archive))
-}
-
 fn run_list(args: ListArgs) -> Result<()> {
-    let (_, archive) = load_archive(&args.archive)?;
+    let (_, archive) =
+        extract::open(&args.archive).with_context(|| args.archive.display().to_string())?;
     for e in &archive.entries {
         if e.is_dir {
             println!("DIR   {}/", e.display_path());
@@ -144,122 +134,28 @@ fn run_list(args: ListArgs) -> Result<()> {
 }
 
 fn run_extract(args: ExtractArgs) -> Result<()> {
-    let (bytes, archive) = load_archive(&args.archive)?;
-    std::fs::create_dir_all(&args.dest)
-        .with_context(|| format!("creating {}", args.dest.display()))?;
+    let (bytes, archive) =
+        extract::open(&args.archive).with_context(|| args.archive.display().to_string())?;
 
-    let mut files = 0u32;
-    let mut skipped = 0u32;
-    for e in &archive.entries {
-        // Build the host-side relative path from sanitized components.
-        let mut rel = PathBuf::new();
-        for comp in &e.path {
-            rel.push(sanitize_filename(comp));
-        }
-        let target = args.dest.join(&rel);
-
-        if e.is_dir {
-            std::fs::create_dir_all(&target)?;
-            continue;
-        }
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let data = match e.data.as_ref() {
-            Some(f) if f.uncompressed_len > 0 => match stuffit::decompress_fork(&bytes, f) {
-                Ok(d) => d,
-                Err(err) => {
-                    log_stderr(format!("Skipped {}: {err}", e.display_path()));
-                    skipped += 1;
-                    continue;
-                }
-            },
-            _ => Vec::new(),
-        };
-        let rsrc = match e.rsrc.as_ref() {
-            Some(f) if f.uncompressed_len > 0 => match stuffit::decompress_fork(&bytes, f) {
-                Ok(d) => d,
-                Err(err) => {
-                    log_stderr(format!("Skipped {}: {err}", e.display_path()));
-                    skipped += 1;
-                    continue;
-                }
-            },
-            _ => Vec::new(),
-        };
-
-        write_entry(
-            &target,
-            &e.name,
-            e.type_code,
-            e.creator_code,
-            e.finder_flags,
-            &data,
-            &rsrc,
-            args.format,
-        )?;
-        files += 1;
-    }
+    let stats = extract::extract_all(
+        &bytes,
+        &archive,
+        &args.dest,
+        args.format.to_core(),
+        |_done, _total, _name| {},
+        log_stderr,
+    )?;
 
     log_stderr(format!(
-        "sit extract: {files} files extracted to {}{}",
+        "sit extract: {} files extracted to {}{}",
+        stats.files,
         args.dest.display(),
-        if skipped > 0 {
-            format!(" ({skipped} skipped)")
+        if stats.skipped > 0 {
+            format!(" ({} skipped)", stats.skipped)
         } else {
             String::new()
         }
     ));
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn write_entry(
-    target: &Path,
-    mac_name: &str,
-    type_code: [u8; 4],
-    creator_code: [u8; 4],
-    flags: u16,
-    data: &[u8],
-    rsrc: &[u8],
-    format: ForkFormat,
-) -> Result<()> {
-    match format {
-        ForkFormat::BinHex => {
-            let bh = binhex::BinHexFile {
-                name: mac_name.to_string(),
-                type_code,
-                creator_code,
-                flags,
-                data_fork: data.to_vec(),
-                resource_fork: rsrc.to_vec(),
-            };
-            let path = with_added_extension(target, "hqx");
-            std::fs::write(&path, binhex::build_binhex(&bh).as_bytes())?;
-        }
-        ForkFormat::MacBinary => {
-            let mb =
-                resource_fork::build_macbinary(mac_name, &type_code, &creator_code, data, rsrc);
-            let path = with_added_extension(target, "bin");
-            std::fs::write(&path, mb)?;
-        }
-        ForkFormat::AppleDouble => {
-            std::fs::write(target, data)?;
-            if !rsrc.is_empty() || type_code != [0; 4] || creator_code != [0; 4] {
-                let ad = resource_fork::build_appledouble(&type_code, &creator_code, rsrc);
-                let ad_path = sidecar_path(target, "._");
-                std::fs::write(ad_path, ad)?;
-            }
-        }
-        ForkFormat::Raw => {
-            std::fs::write(target, data)?;
-            if !rsrc.is_empty() {
-                let path = with_added_extension(target, "rsrc");
-                std::fs::write(path, rsrc)?;
-            }
-        }
-    }
     Ok(())
 }
 
@@ -401,18 +297,4 @@ fn host_file_to_input(path: &Path) -> Result<stuffit::StuffItInput> {
         data_fork: raw,
         resource_fork: rsrc,
     })
-}
-
-/// Append `.ext` to a path (keeping any existing extension).
-fn with_added_extension(path: &Path, ext: &str) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".");
-    name.push(ext);
-    path.with_file_name(name)
-}
-
-/// Build a `._name` AppleDouble sidecar path next to `target`.
-fn sidecar_path(target: &Path, prefix: &str) -> PathBuf {
-    let name = target.file_name().unwrap_or_default().to_string_lossy();
-    target.with_file_name(format!("{prefix}{name}"))
 }

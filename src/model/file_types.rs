@@ -26,6 +26,10 @@ pub const DISK_IMAGE_EXTS: &[&str] = &[
 /// Optical disc-image extensions (CD/DVD images), a distinct picker group.
 pub const OPTICAL_EXTS: &[&str] = &["iso", "bin", "cue", "chd", "toast", "img"];
 
+/// Macintosh archive / encoding extensions (StuffIt + BinHex), a picker group
+/// for the Archives tab. Includes uppercase variants for case-sensitive pickers.
+pub const MAC_ARCHIVE_EXTS: &[&str] = &["sit", "hqx", "sea", "SIT", "HQX", "SEA"];
+
 /// ProgId registered under `HKCU\Software\Classes` for disk-image associations.
 pub const DISK_IMAGE_PROGID: &str = "RustyBackup.DiskImage";
 
