@@ -843,7 +843,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             _ => Vec::new(), // local / device: owns no blocks
         };
 
-        self.sf_remove_entry(&sb, parent_ino, name, child_is_dir)?;
+        self.dir_remove_entry(&sb, parent_ino, name, child_is_dir)?;
         if !extents.is_empty() {
             self.free_blocks(&sb, &extents)?;
         }
@@ -1035,6 +1035,68 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         let _ = blocks_per_dir;
         if is_dir {
             self.bump_dir_nlink(sb, parent_ino, 1)?;
+        }
+        Ok(())
+    }
+
+    /// Remove `name` from directory `parent_ino`, dispatching by format:
+    /// short-form (inline rewrite) or single-block (rebuild in place). A
+    /// single-block directory is left in block form even if it shrinks small
+    /// (valid, just not re-compacted to short-form).
+    fn dir_remove_entry(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        parent_ino: u64,
+        name: &str,
+        child_was_dir: bool,
+    ) -> Result<(), FilesystemError> {
+        let (core, _buf) = self.read_inode_buf(parent_ino)?;
+        match core.format {
+            super::types::DiFormat::Local => {
+                self.sf_remove_entry(sb, parent_ino, name, child_was_dir)
+            }
+            super::types::DiFormat::Extents => {
+                self.block_remove_entry(sb, parent_ino, name, child_was_dir)
+            }
+            _ => Err(FilesystemError::Unsupported(
+                "parent directory format not editable (btree/leaf/node)".into(),
+            )),
+        }
+    }
+
+    /// Remove `name` from a single-block directory by rebuilding the block
+    /// without it and writing it back in place.
+    fn block_remove_entry(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        parent_ino: u64,
+        name: &str,
+        child_was_dir: bool,
+    ) -> Result<(), FilesystemError> {
+        let has_ftype = sb.has_ftype();
+        let (core, buf) = self.read_inode_buf(parent_ino)?;
+        let extents = self.decode_data_extents(&core, &buf)?;
+        let first = extents
+            .first()
+            .ok_or_else(|| FilesystemError::Parse("block dir has no extent".into()))?;
+        if first.startoff != 0 {
+            return Err(FilesystemError::Unsupported(
+                "multi-block directory not editable".into(),
+            ));
+        }
+        let dirblksize = sb.dirblksize() as usize;
+        let fsblock = first.startblock;
+        let (dotdot, mut entries) =
+            self.read_block_dir_entries(sb, fsblock, dirblksize, has_ftype)?;
+        let before = entries.len();
+        entries.retain(|(n, _, _)| n != name);
+        if entries.len() == before {
+            return Err(FilesystemError::NotFound(name.into()));
+        }
+        let block = build_block_dir(&entries, parent_ino, dotdot, dirblksize, has_ftype)?;
+        self.write_dir_block(sb, fsblock, &block)?;
+        if child_was_dir {
+            self.bump_dir_nlink(sb, parent_ino, -1)?;
         }
         Ok(())
     }
