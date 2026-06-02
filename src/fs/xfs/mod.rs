@@ -1292,6 +1292,63 @@ mod tests {
     }
 
     #[test]
+    fn repair_r5_recomputes_inode_nblocks() {
+        // R5 round-trip: hello.txt (inode 131) is an inline-extents regular
+        // file. Corrupt its di_nblocks (core offset 64) to a bogus value, run
+        // repair(), and confirm R5 recomputes it back to the true block count
+        // (the extent-list sum) — and that the verifier stays clean.
+        use crate::fs::filesystem::EditableFilesystem;
+        let mut img = load_fixture().to_vec();
+
+        // Locate inode 131 and snapshot its true nblocks before corrupting.
+        let (ino_byte, true_nblocks) = {
+            let mut fs = XfsFilesystem::open(Cursor::new(img.clone()), 0).expect("open");
+            let sb = fs.superblock().clone();
+            let byte = inode_byte_offset(
+                131,
+                sb.agblocks,
+                sb.agblklog,
+                sb.inopblog,
+                sb.blocksize,
+                sb.inodesize,
+            ) as usize;
+            let core = fs.read_inode(131).expect("read inode 131");
+            assert!(core.is_regular(), "inode 131 should be a regular file");
+            assert!(core.nblocks > 0, "expected a real block count");
+            (byte, core.nblocks)
+        };
+
+        // Corrupt di_nblocks (u64 at core offset 64).
+        img[ino_byte + 64..ino_byte + 72].copy_from_slice(&9999u64.to_be_bytes());
+
+        let mut cursor = Cursor::new(img);
+        let report = {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable");
+            fs.repair().expect("repair runs")
+        };
+        assert_eq!(report.fixes_failed.len(), 0, "{:?}", report.fixes_failed);
+        assert!(
+            report
+                .fixes_applied
+                .iter()
+                .any(|f| f.contains("di_nblocks")),
+            "expected an inode-core fix, got: {:?}",
+            report.fixes_applied
+        );
+
+        let repaired = cursor.into_inner();
+        let mut fs = XfsFilesystem::open(Cursor::new(repaired), 0).expect("reopen");
+        let core = fs.read_inode(131).expect("reread inode 131");
+        assert_eq!(core.nblocks, true_nblocks, "di_nblocks not restored");
+        let res = fs.run_fsck().expect("fsck after repair");
+        assert!(
+            res.errors.is_empty(),
+            "expected clean after repair, got: {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn root_inode_is_directory() {
         let img = load_fixture();
         let mut fs = XfsFilesystem::open(Cursor::new(img), 0).expect("open xfs");
