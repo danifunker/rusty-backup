@@ -726,12 +726,72 @@ jobs:
           find artifacts -type f \( -name "*.zip" -o -name "*.dmg" -o -name "*.AppImage" -o -name "*.AppImage.zsync" -o -name "*.deb" -o -name "*.rpm" -o -name "*.pkg.tar.zst" -o -name "*.exe" -o -name "*.tar.gz" \) -exec cp {} release-files/ \;
           ls -lh release-files/
       
+      # Build a download-picker table from the (fixed) build matrix. Links
+      # point at the assets this same job is about to upload. Emitted as the
+      # release body; GitHub's auto-generated commit notes are appended below
+      # it (generate_release_notes: true).
+      - name: Generate downloads table
+        env:
+          VER: ${{ needs.generate-version.outputs.version }}
+        run: |
+          TAG="v${VER}"
+          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          # Warn (don't fail) if an expected asset is missing — surfaces a
+          # matrix change without blocking the release.
+          for f in \
+            "Rusty-Backup-Setup-windows-x64-${VER}.exe" "Rusty-Backup-windows-x64-${VER}.zip" \
+            "Rusty-Backup-Setup-windows-x86-${VER}.exe" "Rusty-Backup-windows-x86-${VER}.zip" \
+            "Rusty-Backup-macos-arm64-${VER}.dmg" "Rusty-Backup-macos-x64-${VER}.dmg" \
+            "Rusty-Backup-linux-x64-${VER}.AppImage" "Rusty-Backup-linux-x64-${VER}.deb" \
+            "Rusty-Backup-linux-x64-${VER}.rpm" "Rusty-Backup-linux-x64-${VER}.pkg.tar.zst" \
+            "Rusty-Backup-linux-arm64-${VER}.AppImage" "Rusty-Backup-linux-arm64-${VER}.deb" \
+            "Rusty-Backup-linux-arm64-${VER}.rpm" "Rusty-Backup-linux-arm64-${VER}.pkg.tar.zst" \
+            "Rusty-Backup-CLI-windows-x64-${VER}.exe" "Rusty-Backup-CLI-windows-x86-${VER}.exe" \
+            "Rusty-Backup-CLI-macos-arm64-${VER}.zip" "Rusty-Backup-CLI-macos-x64-${VER}.zip" \
+            "Rusty-Backup-CLI-linux-x64-${VER}.tar.gz" "Rusty-Backup-CLI-linux-arm64-${VER}.tar.gz"; do
+            [ -f "release-files/${f}" ] || echo "::warning::expected release asset missing: ${f}"
+          done
+
+          cat > DOWNLOADS.md <<EOF
+          ## Downloads
+
+          **Most people want:** Windows -> **x64 installer** · Mac -> **Apple Silicon** or **Intel** \`.dmg\` · Linux -> **AppImage**.
+
+          | Platform | Architecture | Download |
+          |---|---|---|
+          | **Windows 11 / 10** | x64 (64-bit) | [Installer](${BASE}/Rusty-Backup-Setup-windows-x64-${VER}.exe) · [Portable zip](${BASE}/Rusty-Backup-windows-x64-${VER}.zip) |
+          | **Windows 10** | x86 (32-bit) | [Installer](${BASE}/Rusty-Backup-Setup-windows-x86-${VER}.exe) · [Portable zip](${BASE}/Rusty-Backup-windows-x86-${VER}.zip) |
+          | **macOS 10.13+** | Apple Silicon (arm64) | [.dmg](${BASE}/Rusty-Backup-macos-arm64-${VER}.dmg) |
+          | **macOS 10.13+** | Intel (x64) | [.dmg](${BASE}/Rusty-Backup-macos-x64-${VER}.dmg) |
+          | **Linux** | x64 | [AppImage](${BASE}/Rusty-Backup-linux-x64-${VER}.AppImage) · [deb](${BASE}/Rusty-Backup-linux-x64-${VER}.deb) · [rpm](${BASE}/Rusty-Backup-linux-x64-${VER}.rpm) · [pkg](${BASE}/Rusty-Backup-linux-x64-${VER}.pkg.tar.zst) |
+          | **Linux** | arm64 | [AppImage](${BASE}/Rusty-Backup-linux-arm64-${VER}.AppImage) · [deb](${BASE}/Rusty-Backup-linux-arm64-${VER}.deb) · [rpm](${BASE}/Rusty-Backup-linux-arm64-${VER}.rpm) · [pkg](${BASE}/Rusty-Backup-linux-arm64-${VER}.pkg.tar.zst) |
+
+          <sub>**Windows:** x86 = 32-bit (Windows 10, the last Windows to support 32-bit). · **macOS:** requires 10.13 High Sierra or later. · **Linux packages:** deb = Debian/Ubuntu, rpm = Fedora/RHEL/openSUSE, pkg = Arch/Manjaro — built against **glibc 2.39** (Ubuntu 24.04). · **AppImage** is self-contained and runs on most distributions regardless of glibc.</sub>
+
+          <details>
+          <summary><b>Command-line tool (rb-cli)</b> — for scripting/automation</summary>
+
+          | Platform | Architecture | Download |
+          |---|---|---|
+          | Windows | x64 / x86 | [x64](${BASE}/Rusty-Backup-CLI-windows-x64-${VER}.exe) · [x86](${BASE}/Rusty-Backup-CLI-windows-x86-${VER}.exe) |
+          | macOS | arm64 / x64 | [arm64](${BASE}/Rusty-Backup-CLI-macos-arm64-${VER}.zip) · [x64](${BASE}/Rusty-Backup-CLI-macos-x64-${VER}.zip) |
+          | Linux | x64 / arm64 | [x64](${BASE}/Rusty-Backup-CLI-linux-x64-${VER}.tar.gz) · [arm64](${BASE}/Rusty-Backup-CLI-linux-arm64-${VER}.tar.gz) |
+
+          Windows downloads are \`rb-cli.exe\` (renamed with version/arch); the macOS \`.zip\` and Linux \`.tar.gz\` each contain a single \`rb-cli\` binary.
+          </details>
+
+          ---
+          EOF
+          echo "----- generated DOWNLOADS.md -----"
+          cat DOWNLOADS.md
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ needs.generate-version.outputs.version }}
           name: Release ${{ needs.generate-version.outputs.version }}
           files: release-files/*
+          body_path: DOWNLOADS.md
           draft: false
           prerelease: false
           generate_release_notes: true
