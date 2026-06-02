@@ -9,6 +9,7 @@
 pub mod backup;
 pub mod batch;
 pub mod batch_template;
+pub mod binhex;
 pub mod bless;
 pub mod chmeta;
 pub mod completions;

@@ -83,14 +83,14 @@ whose payload is a plain file flows into the fork-export path.
 
 ### Steps
 
-- [ ] `src/fs/binhex.rs`: `parse_binhex(&[u8]) -> Option<ImportedResourceFork>` (mirror `parse_macbinary`)
-- [ ] `build_binhex(name, type, creator, flags, data_fork, rsrc_fork) -> String` (mirror `build_macbinary`)
-- [ ] RLE90 encode/decode + 6-bit codec + CRC-16 as private helpers (unit-tested round-trip)
-- [ ] Add `ResourceForkMode::BinHex` variant + label
-- [ ] CLI: `put-binhex IMG[@N] HOST [DST]` and `get-binhex SRC HOST` (mirror `put_macbinary.rs`); register in `cli/verbs/mod.rs`, document in `docs/cli-todo.md`
-- [ ] GUI: "Export to BinHex (.hqx)…" in browse view alongside existing fork-export options
+- [x] `src/fs/binhex.rs`: `parse_binhex(&[u8]) -> Result<BinHexFile>` (richer than `ImportedResourceFork` — carries name + flags too)
+- [x] `build_binhex(&BinHexFile) -> String`
+- [x] RLE90 encode/decode + 6-bit codec + augmented CRC-16 as private helpers (unit-tested round-trip)
+- [x] CLI: `put-binhex IMG[@N] HOST [--dst-dir/--rename/--force]` and `get-binhex IMG[@N] SRC OUT.hqx` (mirror `put_macbinary.rs`); registered in `cli/mod.rs` + `cli/verbs/mod.rs`
+- [x] Tests: round-trip unit tests; validated against 5 real `.hqx` samples (all 3 CRCs verify); full CLI E2E (`.hqx` → HFS → `.hqx` → HFS, data forks byte-identical, type/creator/rsrc preserved)
+- [ ] GUI: "Export to BinHex (.hqx)…" + "Import .hqx" in browse view alongside existing fork-export options
 - [ ] Auto-unwrap hook: decoded payload sniffed via `dc42::detect_dc42` (and raw-HFS sniff) → route to image pipeline
-- [ ] Tests: round-trip a known `.hqx`; cross-check against a real sample; verify forks + type/creator survive
+- [-] `ResourceForkMode::BinHex` variant — not needed; BinHex has its own `BinHexFile` type and dedicated verbs rather than riding the host-sidecar import path
 
 **Estimate: a few days. This alone satisfies the stated extract-and-preserve goal.**
 
