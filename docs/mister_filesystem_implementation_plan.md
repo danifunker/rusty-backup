@@ -593,9 +593,10 @@ Every slice/commit must satisfy:
 7. `Err(FilesystemError::Unsupported)` for unimplemented trait methods — never
    silent no-ops.
 8. **GUI / CLI parity:** every scriptable operation (inspect, browse-extract,
-   backup, restore, and resize where applicable) is exposed in `rb-cli` per
-   `docs/cli-todo.md`. Shared logic lives in the engine/model layer, called by
-   both.
+   backup, restore, and resize where applicable) is exposed in `rb-cli`. Check
+   `rb-cli --help` / `docs/cli-reference.md` for the canonical verb names
+   before adding new ones, and keep shared logic in the engine/model layer
+   so both surfaces call into it.
 9. Ported code (from `cbm`, `a2kit`, `fluxfox` — all MIT / MIT-OR-Apache)
    carries a source + license attribution header. No new crate is added (§2.4),
    so there is no NOTICE entry to make unless we later opt to keep `binrw`.

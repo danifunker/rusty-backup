@@ -18,11 +18,13 @@ Rusty Backup ships as a single self-contained binary per platform.
 1. Grab the latest build for your OS from the
    [GitHub Releases page](https://github.com/danifunker/rusty-backup/releases).
 2. Drop the binary where you want it:
-   - **Windows** — run the installer (`.exe`) to register file
-     associations and "Add/Remove Programs" support, or extract the
-     portable ZIP and run `rusty-backup.exe` directly. The app can
-     download and install its own updates in place from within the
-     **About / Update** UI.
+   - **Windows** — run `Setup.exe` for the installed experience
+     (Start-Menu shortcut, "Add/Remove Programs" entry, optional
+     file-association registration, `rb-cli` on `PATH`), or extract the
+     portable ZIP and run `rusty-backup.exe` directly. Either install
+     can self-update in place from within the **About / Update** UI;
+     existing portable-ZIP users can run `Setup.exe` once to gain the
+     Start-Menu / ARP integration without re-downloading later updates.
    - **macOS** — open the DMG and drag `Rusty Backup.app` into `/Applications`.
    - **Linux** — `chmod +x rusty-backup-*.AppImage` and launch it.
 3. Raw physical disks require elevated privileges (admin on Windows, root on
@@ -58,7 +60,8 @@ rb-cli completions zsh > _rb-cli    # emit-to-stdout for packagers
 
 Full verb-by-verb reference: [`docs/cli-reference.md`](docs/cli-reference.md)
 (regenerated from `cargo run --example generate_cli_reference`).
-Grammar plan: [`docs/cli-todo.md`](docs/cli-todo.md).
+Open CLI follow-ups (and everything else still to do) are tracked in
+[`docs/OPEN-WORK.md`](docs/OPEN-WORK.md).
 
 ## Usage
 
@@ -100,9 +103,9 @@ The app has four tabs:
     and SGI EFS, with **Repair** that uses replica blocks + lost+found
     where supported.
   - **Edit mode** on FAT, NTFS, exFAT, ext, HFS, HFS+, AFFS, PFS3, SFS,
-    ProDOS, and EFS: stage create-file / new-folder / drag-and-drop /
-    delete edits, then Apply atomically with snapshot rollback on
-    error.
+    ProDOS, EFS, and XFS (v4): stage create-file / new-folder /
+    drag-and-drop / delete edits, then Apply atomically with snapshot
+    rollback on error.
 - **Optical** — browse and extract files from CD/DVD images and physical
   optical drives. Supports ISO9660, Joliet, Rock Ridge, and HFS hybrid
   discs. Re-opens automatically when the underlying disc changes.
@@ -219,7 +222,7 @@ inspect-tab Edit Mode.
 | PFS3 / PDS3 / muFS | Yes | Yes | Yes (in-place + defragmenting clone) | —    | Amiga PFS3 family. Shrink refuses to truncate live data; clone path packs the volume for genuinely smaller targets. |
 | SFS (Smart File System) | Yes | Yes (single-leaf btree) | Yes (in-place trim/grow) | —    | Amiga `SFS\0` / `SFS\2`. |
 | SGI EFS        | Yes    | Yes  | Yes (in-place grow + conservative + aggressive shrink) | Yes (check + repair: replica copy, bitmap fixup, lost+found) | IRIX < 6.0. Aggressive shrink renumbers inodes into low CGs. |
-| SGI XFS (v4 / v5) | Yes (read-only) | No | No           | —    | IRIX 6.x and Linux. Disk-level expansion supported via the "Add free space" workflow + in-OS `xfs_growfs`. |
+| SGI XFS (v4 / v5) | Yes | Yes (v4 only; v5 editing pending) | Grow via "Add free space" + in-OS `xfs_growfs`; shrink via clone-into-fresh is planned (see [`docs/OPEN-WORK.md`](docs/OPEN-WORK.md) §2.2) | Yes (R1-R8 repair pipeline; v4 oracle-validated) | IRIX 6.x and Linux. `xfs_repair`-clean writes. |
 
 ### Partition tables
 
@@ -250,10 +253,14 @@ images, partition table sidecars) for restore — see `docs/clonezilla.md`.
   block size and a verified-bootable APM layout (DDR + APM map + driver
   partitions + alt MDB). Useful when an old 2 GB classic-HFS volume runs
   out of 16-bit block addresses.
-- **SGI EFS / XFS**: EFS is fully read/write/resize; XFS is read-only
-  (browsing + display only). XFS growth is handled at the disk-layout
-  level (Add free space → in-OS `xfs_growfs`), not by patching the
-  filesystem.
+- **SGI EFS / XFS**: EFS is fully read/write/resize. XFS gained a full
+  edit + repair surface (R1-R8 repair pipeline; oracle-validated against
+  `xfs_repair`) on the v4 format. Open XFS holes (multi-block leaf/node
+  directories, bmap-btree forks, v5/CRC write side) and the planned
+  shrink-via-clone path are tracked in
+  [`docs/OPEN-WORK.md`](docs/OPEN-WORK.md) §2.1 and §2.2. XFS grow is
+  still done at the disk-layout level ("Add free space" + in-OS
+  `xfs_growfs`).
 - **ProDOS → VHD** is not implemented yet; restore to raw / CHD / Zstd /
   physical disk works.
 - **Raw → raw** restore always works regardless of filesystem; only the

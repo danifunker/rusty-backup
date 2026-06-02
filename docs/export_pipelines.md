@@ -21,9 +21,9 @@ canonical procedure for "add a defragmenting writer for filesystem X"
 that are easy to miss (the CHD path was forgotten initially during that
 work and required a follow-up; it's now an explicit step in the recipe).
 
-Pair with:
-- `docs/amiga_resize.md` — Amiga in-place resize phases + the PFS3 clone path.
-- `docs/hfsplus_enhancements.md` — HFS+ defrag clone planner.
+Reference implementations in tree:
+- `src/fs/affs.rs`, `src/fs/pfs3.rs`, `src/fs/sfs.rs`, `src/fs/pfs3_clone.rs` — Amiga in-place resize + PFS3 defragmenting clone.
+- `src/fs/hfsplus_defrag.rs`, `src/fs/hfsplus_clone.rs` — HFS+ defrag clone planner + streamer.
 
 ---
 

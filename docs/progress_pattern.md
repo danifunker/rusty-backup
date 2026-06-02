@@ -1,8 +1,7 @@
 # Progress / Log Channel Pattern
 
 This document codifies how long-running operations report progress, log
-messages, errors, and cancellation back to the GUI. It addresses §10 item 3
-of [`codecleanup.md`](codecleanup.md).
+messages, errors, and cancellation back to the GUI.
 
 ## TL;DR
 

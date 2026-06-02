@@ -1,7 +1,7 @@
 # Windows installer (Inno Setup)
 
-`rusty-backup.iss` builds the per-user Windows installer. See
-`docs/windows_self_update.md` for the full plan.
+`rusty-backup.iss` builds the per-user Windows installer (shipped 2026-06-02
+alongside the in-app `self_replace`-based self-updater).
 
 ## Why per-user
 
@@ -41,8 +41,7 @@ iscc /DMyAppVersion=<version> /DSourceDir=<dir-with-exes> /DAssetsDir=<dir-with-
 
 Defaults (`SourceDir=..\target\release`, `AssetsDir=..\assets\icons`) let you
 run `iscc installer\rusty-backup.iss` after a local `cargo build --release`.
-CI compiles this per arch and attaches `Setup.exe` to the GitHub release —
-that wiring is Phase 7 (deferred).
+CI compiles this per arch and attaches `Setup.exe` to the GitHub release.
 
 ## AppId
 
