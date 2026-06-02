@@ -10,17 +10,27 @@
 > `dir_repair.rs`), and **R7's link-count half** (recompute every reachable
 > inode's nlink, `dir_repair.rs`) are **shipped and oracle-validated** —
 > including a real V1-inode IRIX disk (`xfsprogs` 3.1.9 oracle). `repair()` runs
-> them R4 → R4b → R3 → R5 → R2 → R6 → R7(nlink). The shared bottom-up
-> `build_sblock_btree` is record-agnostic (alloc 8/8, inobt 16/4) and
-> balance-fills every non-root block to ≥ maxrecs/2.
+> them R4 → R4b → R3 → R5 → R2 → R6 → **R7 reconnect** → R7(nlink). The shared
+> bottom-up `build_sblock_btree` is record-agnostic (alloc 8/8, inobt 16/4) and
+> balance-fills every non-root block to ≥ maxrecs/2. **R7 orphan reconnection**
+> (link unreachable inodes into `/lost+found`) is shipped and oracle-validated,
+> so `OrphanInode` is now genuinely repairable.
 >
-> **Still not done:** R6 for **block/leaf/node** (multi-block) directories, and
-> **R7 orphan reconnection** (linking unreachable inodes into `lost+found`) —
-> both need inode-allocation + directory-insertion write primitives (shortform
-> add → block-form conversion, `..` rewrite), a subsystem shared with the §3/§4
-> edit path. Until R7 reconnection lands the verifier's `OrphanInode`
-> "repairable" flag is aspirational. See the auto-memory `xfs_fsck_repair.md`
-> for running status and the Docker oracle recipe.
+> **EDIT (Track B) is also shipped** (`src/fs/xfs/edit.rs`), v4 only, and reaches
+> the GUI/CLI through `open_editable_filesystem` (rb-cli mkdir/put/rm all
+> oracle-clean on a real SGI/IRIX disk). Working: `create_directory`,
+> `create_file` (multi-extent, fragmented free space), `delete_entry`, and
+> automatic **short-form ⇄ single-block** directory growth/shrink (the dir2
+> block builder writes data entries + `bestfree` + the sorted `xfs_da_hashname`
+> leaf index). Primitives: inode-slot + block alloc/free, dir entry
+> insert/remove, extent encode.
+>
+> **Still not done** (all return clean errors, never corrupt): **leaf/node**
+> (multi-block, > ~one dir block) directories; **bmap-btree** file forks
+> (> ~9 inline extents / files larger than one 2^21-block extent); **new-chunk
+> inode allocation** when every inobt chunk is full; and **v5/CRC** editing.
+> See the auto-memory `xfs_fsck_repair.md` for running status and the Docker
+> oracle recipe (4.9.0 for v4, 3.1.9 for V1-inode IRIX disks).
 
 Extend the existing read-only XFS support (`src/fs/xfs/`) all the way to:
 
