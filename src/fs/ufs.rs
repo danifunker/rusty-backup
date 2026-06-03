@@ -1468,6 +1468,47 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
         let iusedoff = read_u32(&buf, 0, self.endian) as u64;
         Ok((cg_byte, iusedoff))
     }
+
+    /// Read `SB_READ_SIZE` bytes of the primary superblock. Used by the
+    /// repair pass to source the byte image we copy into each CG's
+    /// replica slot.
+    pub(crate) fn read_primary_sb_bytes(&mut self) -> Result<Vec<u8>, FilesystemError> {
+        self.reader
+            .seek(SeekFrom::Start(self.partition_offset + self.sb_offset))?;
+        let mut buf = vec![0u8; SB_READ_SIZE];
+        self.reader.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Write `SB_READ_SIZE` bytes into CG `cg`'s replica SB slot. Refuses
+    /// `cg == 0` (the primary occupies that slot — overwriting it via the
+    /// replica path would be a no-op in the best case and a corruption in
+    /// the worst). Refuses a `bytes` slice that isn't exactly
+    /// `SB_READ_SIZE` long.
+    pub(crate) fn write_replica_sb_bytes(
+        &mut self,
+        cg: u32,
+        bytes: &[u8],
+    ) -> Result<(), FilesystemError> {
+        if cg == 0 {
+            return Err(FilesystemError::InvalidData(
+                "ufs write_replica_sb_bytes: refusing to rewrite CG 0 replica slot".into(),
+            ));
+        }
+        if bytes.len() != SB_READ_SIZE {
+            return Err(FilesystemError::InvalidData(format!(
+                "ufs write_replica_sb_bytes: expected {SB_READ_SIZE} bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let off = self
+            .replica_sb_byte_offset(cg)
+            .ok_or_else(|| FilesystemError::Parse(format!("ufs: cg {cg} out of range")))?;
+        self.reader
+            .seek(SeekFrom::Start(self.partition_offset + off))?;
+        self.reader.write_all(bytes)?;
+        Ok(())
+    }
 }
 
 // ---- U.4 directory + file-data helpers + EditableFilesystem ----
@@ -2146,6 +2187,327 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Uf
         }
         Ok(total * self.fsize)
     }
+
+    fn repair(&mut self) -> Result<super::fsck::RepairReport, FilesystemError> {
+        repair_ufs(self)
+    }
+}
+
+/// UFS repair driver. Re-runs the verifier and fixes the three repairable
+/// findings:
+///   * `ReplicaSb*Mismatch`  → rewrite the affected CG's replica slot from
+///     the primary superblock byte image.
+///   * `BitmapMissingAllocation` → clear the stray "free" bit (UFS bitmap
+///     polarity is set=FREE, so clearing the bit marks it allocated to
+///     match the inode that claims it) and bump `cg_cs.nffree` down by one
+///     per cleared bit.
+///   * `OrphanInode` → adopt every unreachable inode into `/lost+found/`
+///     as `ino_<inum>` with collision-safe suffix retry.
+///
+/// Findings the verifier flags as unrepairable (geometry damage, double
+/// allocation, out-of-range pointers, indirect-read failures) are counted
+/// in `unrepairable_count` and left for a future pass.
+fn repair_ufs<R: Read + Write + Seek + Send>(
+    fs: &mut UfsFilesystem<R>,
+) -> Result<super::fsck::RepairReport, FilesystemError> {
+    use std::collections::{HashMap, HashSet};
+
+    let mut report = super::fsck::RepairReport {
+        fixes_applied: Vec::new(),
+        fixes_failed: Vec::new(),
+        unrepairable_count: 0,
+    };
+
+    let result = super::ufs_fsck::fsck_ufs(fs)?;
+    if result.errors.is_empty() {
+        return Ok(report);
+    }
+
+    // ----- Replica SB fixup -----
+    // Every `ReplicaSb*Mismatch` finding names its CG up front:
+    // "CG {cg} replica SB ...". Collect the unique CGs and rewrite each
+    // replica slot from the primary byte image in one pass — the primary
+    // is the source of truth (the fsck only compares the replicas against
+    // it; mismatches by definition mean the replica drifted, not the
+    // primary).
+    let replica_errs: Vec<&super::fsck::FsckIssue> = result
+        .errors
+        .iter()
+        .filter(|e| e.code.starts_with("ReplicaSb") && e.code.ends_with("Mismatch"))
+        .collect();
+    if !replica_errs.is_empty() {
+        let primary = fs.read_primary_sb_bytes()?;
+        let mut cgs: HashSet<u32> = HashSet::new();
+        for issue in &replica_errs {
+            match parse_replica_cg_from_msg(&issue.message) {
+                Some(cg) if cg > 0 => {
+                    cgs.insert(cg);
+                }
+                Some(_) => {
+                    // CG 0's "replica" overlaps the primary slot; the
+                    // verifier already skips it, so this is unreachable
+                    // in practice — guard anyway.
+                }
+                None => report.fixes_failed.push(format!(
+                    "Replica SB: could not parse CG from '{}'",
+                    issue.message
+                )),
+            }
+        }
+        let mut rewritten = 0u32;
+        for cg in cgs {
+            match fs.write_replica_sb_bytes(cg, &primary) {
+                Ok(()) => rewritten += 1,
+                Err(e) => report
+                    .fixes_failed
+                    .push(format!("Replica SB CG {cg}: rewrite failed: {e}")),
+            }
+        }
+        if rewritten > 0 {
+            report.fixes_applied.push(format!(
+                "Replica superblock: rewrote {rewritten} CG replica(s) from primary \
+                 ({} field-mismatch(es) corrected)",
+                replica_errs.len()
+            ));
+        }
+    }
+
+    // ----- Bitmap missing-allocation fixup -----
+    // Group fixes by CG so each CG's bitmap reads + writes happen once.
+    let mut bitmap_fixes_per_cg: HashMap<u32, Vec<u64>> = HashMap::new();
+    for issue in result
+        .errors
+        .iter()
+        .filter(|e| e.code == "BitmapMissingAllocation")
+    {
+        match parse_fragment_number_from_msg(&issue.message) {
+            Some(frag) => {
+                let cg = (frag / fs.fpg as u64) as u32;
+                let in_cg = frag % fs.fpg as u64;
+                bitmap_fixes_per_cg.entry(cg).or_default().push(in_cg);
+            }
+            None => report.fixes_failed.push(format!(
+                "BitmapMissingAllocation: could not parse fragment from '{}'",
+                issue.message
+            )),
+        }
+    }
+    let mut bitmap_fixes = 0u32;
+    for (cg, in_cgs) in bitmap_fixes_per_cg {
+        let (mut bm, ndblk) = match fs.read_cg_free_bitmap(cg) {
+            Ok(pair) => pair,
+            Err(e) => {
+                report
+                    .fixes_failed
+                    .push(format!("CG {cg} bitmap read failed: {e}"));
+                continue;
+            }
+        };
+        let mut cleared = 0u32;
+        for in_cg in in_cgs {
+            if in_cg >= ndblk {
+                report.fixes_failed.push(format!(
+                    "BitmapMissingAllocation: CG {cg} fragment in_cg {in_cg} past cg_ndblk {ndblk}"
+                ));
+                continue;
+            }
+            let by = (in_cg / 8) as usize;
+            let bb = (in_cg % 8) as u8;
+            // set bit = free; mark allocated by CLEARING the bit.
+            if bm[by] & (1 << bb) != 0 {
+                bm[by] &= !(1 << bb);
+                cleared += 1;
+            }
+        }
+        if cleared > 0 {
+            if let Err(e) = fs.write_cg_free_bitmap(cg, &bm) {
+                report
+                    .fixes_failed
+                    .push(format!("CG {cg} bitmap write failed: {e}"));
+                continue;
+            }
+            // Each cleared free bit means one fewer free fragment in this CG.
+            if let Err(e) = fs.update_cg_cs(cg, 0, 0, 0, -(cleared as i32)) {
+                report
+                    .fixes_failed
+                    .push(format!("CG {cg} cs nffree update failed: {e}"));
+                continue;
+            }
+            bitmap_fixes += cleared;
+        }
+    }
+    if bitmap_fixes > 0 {
+        report.fixes_applied.push(format!(
+            "Bitmap: cleared {bitmap_fixes} stray free bit(s) for inode-claimed fragments"
+        ));
+    }
+
+    // ----- Orphan adoption into lost+found -----
+    if !result.orphaned_entries.is_empty() {
+        match adopt_orphans_into_lost_found_ufs(fs, &result.orphaned_entries, &mut report) {
+            Ok(adopted) if adopted > 0 => report.fixes_applied.push(format!(
+                "Orphans: adopted {adopted} entry/entries into lost+found/"
+            )),
+            Ok(_) => {}
+            Err(e) => report
+                .fixes_failed
+                .push(format!("Orphan adoption setup failed: {e}")),
+        }
+    }
+
+    report.unrepairable_count = result.errors.iter().filter(|e| !e.repairable).count();
+    Ok(report)
+}
+
+/// Parse `"CG {N} ..."` out of a fsck replica-mismatch issue message.
+/// The verifier emits a stable format so this is a controlled-input
+/// parse.
+fn parse_replica_cg_from_msg(msg: &str) -> Option<u32> {
+    let tail = msg.strip_prefix("CG ")?;
+    let num_str = tail.split_whitespace().next()?;
+    num_str.parse().ok()
+}
+
+/// Parse `"fragment {N} ..."` out of a fsck BitmapMissingAllocation
+/// message. Mirrors `parse_replica_cg_from_msg` in shape.
+fn parse_fragment_number_from_msg(msg: &str) -> Option<u64> {
+    let tail = msg.strip_prefix("fragment ")?;
+    let num_str = tail.split_whitespace().next()?;
+    num_str.parse().ok()
+}
+
+/// Ensure `/lost+found` exists under the root inode and link each orphan
+/// into it as `ino_<inum>` (with `_<n>` suffix retry on collision).
+/// Returns the number of orphans successfully adopted; failures are
+/// pushed into `report.fixes_failed`.
+fn adopt_orphans_into_lost_found_ufs<R: Read + Write + Seek + Send>(
+    fs: &mut UfsFilesystem<R>,
+    orphans: &[super::fsck::OrphanedEntry],
+    report: &mut super::fsck::RepairReport,
+) -> Result<u32, FilesystemError> {
+    use super::entry::{EntryType, FileEntry};
+    use super::filesystem::{CreateDirectoryOptions, EditableFilesystem};
+
+    // Find or create lost+found under root.
+    let root_inode = fs.read_inode(ROOT_INODE)?;
+    let lf_inum = match fs.dir_find(&root_inode, b"lost+found")? {
+        Some((_off, _reclen)) => {
+            // dir_find returns the slot location; re-read the dirent to
+            // pull the actual child inum. Simpler: list children and find
+            // by name.
+            let root_entry = FileEntry {
+                name: "/".into(),
+                path: "/".into(),
+                entry_type: EntryType::Directory,
+                size: 0,
+                location: ROOT_INODE as u64,
+                modified: None,
+                type_code: None,
+                creator_code: None,
+                symlink_target: None,
+                special_type: None,
+                mode: Some(root_inode.mode),
+                uid: Some(root_inode.uid),
+                gid: Some(root_inode.gid),
+                resource_fork_size: None,
+                aux_type: None,
+                link_target_cnid: None,
+                amiga_protection: None,
+                amiga_comment: None,
+                amiga_date: None,
+            };
+            let children =
+                (fs as &mut dyn super::filesystem::Filesystem).list_directory(&root_entry)?;
+            let lf = children
+                .into_iter()
+                .find(|c| c.name == "lost+found")
+                .ok_or_else(|| {
+                    FilesystemError::Parse(
+                        "lost+found dirent found by dir_find but missing in list_directory".into(),
+                    )
+                })?;
+            lf.location as u32
+        }
+        None => {
+            let root_entry = FileEntry {
+                name: "/".into(),
+                path: "/".into(),
+                entry_type: EntryType::Directory,
+                size: 0,
+                location: ROOT_INODE as u64,
+                modified: None,
+                type_code: None,
+                creator_code: None,
+                symlink_target: None,
+                special_type: None,
+                mode: Some(root_inode.mode),
+                uid: Some(root_inode.uid),
+                gid: Some(root_inode.gid),
+                resource_fork_size: None,
+                aux_type: None,
+                link_target_cnid: None,
+                amiga_protection: None,
+                amiga_comment: None,
+                amiga_date: None,
+            };
+            let lf = fs.create_directory(
+                &root_entry,
+                "lost+found",
+                &CreateDirectoryOptions::default(),
+            )?;
+            lf.location as u32
+        }
+    };
+
+    let mut adopted: u32 = 0;
+    for orphan in orphans {
+        let inum = orphan.id as u32;
+        // Pull the orphan's mode so we stamp the correct d_type into the
+        // dirent — getting this wrong only matters for tools that trust
+        // d_type without re-reading the inode, but the kernel does, so
+        // mirror what `mode_to_dirent_type` produces during create.
+        let orphan_inode = match fs.read_inode(inum) {
+            Ok(i) => i,
+            Err(e) => {
+                report
+                    .fixes_failed
+                    .push(format!("Orphan inum {inum}: could not read inode: {e}"));
+                continue;
+            }
+        };
+        if orphan_inode.mode == 0 {
+            // Inode was freed between fsck and adoption — nothing to link.
+            continue;
+        }
+        let d_type = mode_to_dirent_type(orphan_inode.mode);
+
+        let mut lf_inode = fs.read_inode(lf_inum)?;
+        let mut name = format!("ino_{inum}");
+        let mut suffix = 1u32;
+        while fs.dir_find(&lf_inode, name.as_bytes())?.is_some() {
+            name = format!("ino_{inum}_{suffix}");
+            suffix += 1;
+            if suffix > 1000 {
+                report.fixes_failed.push(format!(
+                    "Orphan inum {inum}: could not generate unique lost+found name"
+                ));
+                break;
+            }
+        }
+        if suffix > 1000 {
+            continue;
+        }
+        match fs.dir_insert(&mut lf_inode, name.as_bytes(), inum, d_type) {
+            Ok(()) => {
+                fs.write_inode(lf_inum, &lf_inode)?;
+                adopted += 1;
+            }
+            Err(e) => report.fixes_failed.push(format!(
+                "Orphan inum {inum}: could not adopt into lost+found: {e}"
+            )),
+        }
+    }
+    Ok(adopted)
 }
 
 // ---- `fs_flags2` bits we care about ----
@@ -2545,6 +2907,7 @@ impl<R: Read + Seek> Read for CompactUfsReader<R> {
 mod tests {
     use super::*;
     use crate::fs::entry::EntryType;
+    use crate::fs::filesystem::{EditableFilesystem, Filesystem};
     use std::io::Cursor;
 
     // ---- Synthetic superblock construction ----
@@ -4119,6 +4482,255 @@ mod tests {
             result.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
         );
         assert!(result.repairable);
+    }
+
+    // ---- U.4 repair() ----
+
+    /// Repair clears the stray "free" bit that fsck flagged as
+    /// `BitmapMissingAllocation` and the volume re-fscks clean. Uses the
+    /// real UFS1 fixture so the post-repair fsck has the same hard
+    /// expectation (`is_clean()`) the original `fixture_ufs1_fsck_clean`
+    /// test does.
+    #[test]
+    fn repair_clears_bitmap_missing_allocation_and_refscks_clean() {
+        let mut img = load_fixture("test_ufs1.img.zst");
+
+        // Mirror `fsck_flags_bitmap_missing_allocation`: locate the root
+        // dir's first allocated data fragment, then SET its bitmap bit
+        // ("free" in UFS polarity) while the inode still claims it.
+        let (bitmap_byte, in_cg) = {
+            let mut fs = UfsFilesystem::open(Cursor::new(&img), 0).expect("open clean");
+            let root = fs.read_inode(ROOT_INODE).expect("read root inode");
+            let (data, _) = fs.walk_inode_blocks(&root).expect("walk root");
+            let frag = *data
+                .iter()
+                .find(|&&f| f != 0)
+                .expect("root has at least one data fragment");
+            let cg = frag / fs.fpg as u64;
+            assert_eq!(cg, 0, "test assumes root is in CG 0");
+            let in_cg = frag % fs.fpg as u64;
+            let cg_byte = fs.cg_header_offset(cg as u32);
+            let mut buf = [0u8; 4];
+            buf.copy_from_slice(
+                &img[cg_byte as usize + CG_OFF_FREEOFF..cg_byte as usize + CG_OFF_FREEOFF + 4],
+            );
+            let freeoff = u32::from_le_bytes(buf) as u64;
+            (cg_byte + freeoff + in_cg / 8, in_cg % 8)
+        };
+        img[bitmap_byte as usize] |= 1u8 << in_cg as u8;
+
+        // Sanity: fsck flags the corruption.
+        {
+            let mut fs = UfsFilesystem::open(Cursor::new(&img), 0).expect("re-open");
+            let pre = fs.fsck().expect("supports fsck").expect("runs");
+            assert!(
+                pre.errors
+                    .iter()
+                    .any(|e| e.code == "BitmapMissingAllocation"),
+                "expected BitmapMissingAllocation before repair"
+            );
+        }
+
+        // Repair on a writable cursor, then re-fsck.
+        let mut fs = UfsFilesystem::open(Cursor::new(img), 0).expect("re-open for repair");
+        let report = fs.repair().expect("repair runs");
+        assert!(
+            report.fixes_applied.iter().any(|s| s.contains("Bitmap:")),
+            "expected bitmap fix to be applied, got: {:?}",
+            report.fixes_applied
+        );
+        let post = fs.fsck().expect("supports fsck").expect("runs");
+        assert!(
+            post.is_clean(),
+            "fsck not clean after repair: {:?}",
+            post.errors
+                .iter()
+                .map(|e| (&e.code, &e.message))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Repair adopts an orphan inode into `/lost+found/` and the volume
+    /// re-fscks clean. The orphan is forged by allocating an inum,
+    /// writing a valid mode-0o100644 inode at it, and never linking it
+    /// from any directory — exactly what crash-recovered FS state looks
+    /// like.
+    #[test]
+    fn repair_adopts_orphan_inode_into_lost_found_and_refscks_clean() {
+        let img = load_fixture("test_ufs1.img.zst");
+        let mut fs = UfsFilesystem::open(Cursor::new(img), 0).expect("open");
+
+        // Forge an orphan: allocate inum + write a minimal valid inode.
+        let orphan_inum = fs.alloc_inode(0).expect("alloc inode");
+        let orphan = UfsInode {
+            inum: orphan_inum,
+            mode: 0o100644,
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            mtime: 0,
+            direct: [0; UFS_NDADDR],
+            indirect: [0; UFS_NIADDR],
+            inline_payload: Vec::new(),
+        };
+        fs.write_inode(orphan_inum, &orphan).expect("write inode");
+
+        // Sanity: fsck flags the orphan.
+        let pre = fs.fsck().expect("supports fsck").expect("runs");
+        assert!(
+            pre.errors.iter().any(|e| e.code == "OrphanInode"),
+            "expected OrphanInode before repair, got: {:?}",
+            pre.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+        assert!(
+            pre.orphaned_entries
+                .iter()
+                .any(|o| o.id == orphan_inum as u64),
+            "orphaned_entries did not include forged inum {orphan_inum}"
+        );
+
+        // Repair adopts and the volume goes clean.
+        let report = fs.repair().expect("repair runs");
+        assert!(
+            report.fixes_applied.iter().any(|s| s.contains("Orphans:")),
+            "expected orphan adoption, got: {:?}",
+            report.fixes_applied
+        );
+        let post = fs.fsck().expect("supports fsck").expect("runs");
+        assert!(
+            post.is_clean(),
+            "fsck not clean after orphan adoption: {:?}",
+            post.errors
+                .iter()
+                .map(|e| (&e.code, &e.message))
+                .collect::<Vec<_>>()
+        );
+
+        // The adopted name lives under `/lost+found/` and its inum matches.
+        let root_entry = fs.root().expect("root");
+        let kids = fs.list_directory(&root_entry).expect("ls /");
+        let lf = kids
+            .iter()
+            .find(|c| c.name == "lost+found")
+            .expect("/lost+found exists post-repair");
+        let lf_kids = fs.list_directory(lf).expect("ls /lost+found");
+        let adopted = lf_kids
+            .iter()
+            .find(|c| c.name == format!("ino_{orphan_inum}"))
+            .expect("adopted dirent named after orphan inum");
+        assert_eq!(adopted.location as u32, orphan_inum);
+    }
+
+    /// Repair rewrites a corrupted replica superblock from the primary
+    /// and the (synthetic 2-CG) volume re-fscks without
+    /// `ReplicaSb*Mismatch` codes. This synthetic image carries
+    /// geometry-related warnings that the hand-rolled CG headers don't
+    /// resolve (intentionally — it's a minimum-viable layout); we only
+    /// assert that every replica-mismatch error is gone after repair.
+    #[test]
+    fn repair_rewrites_replica_sb_from_primary() {
+        // Build a 2-CG synthetic UFS2 image — same shape as
+        // `fsck_flags_replica_sb_magic_mismatch`.
+        let bsize = 8192u32;
+        let fsize = 1024u32;
+        let fpg = 64u32;
+        let ipg = 64u32;
+        let ncg = 2u32;
+        let total_frags = (fpg as u64) * (ncg as u64);
+        let sblkno = 8i32;
+        let mut img = build_sb(
+            UfsVersion::Ufs2,
+            UfsEndian::Little,
+            SB_OFFSET_UFS1,
+            bsize,
+            fsize,
+            ncg,
+            fpg,
+            ipg,
+            total_frags,
+            b"",
+            1,
+            0,
+        );
+        img[SB_OFFSET_UFS1 as usize + OFF_SBLKNO..SB_OFFSET_UFS1 as usize + OFF_SBLKNO + 4]
+            .copy_from_slice(&sblkno.to_le_bytes());
+        let needed = (total_frags as usize) * (fsize as usize);
+        if img.len() < needed {
+            img.resize(needed, 0);
+        }
+        for cg in 0..ncg {
+            let cg_byte = (cg as u64 * fpg as u64 + 24) as usize * fsize as usize;
+            img[cg_byte + CG_OFF_MAGIC..cg_byte + CG_OFF_MAGIC + 4]
+                .copy_from_slice(&CG_MAGIC.to_le_bytes());
+            img[cg_byte + CG_OFF_CGX..cg_byte + CG_OFF_CGX + 4].copy_from_slice(&cg.to_le_bytes());
+            img[cg_byte + CG_OFF_NDBLK..cg_byte + CG_OFF_NDBLK + 4]
+                .copy_from_slice(&fpg.to_le_bytes());
+            let iusedoff = 256u32;
+            let freeoff = 264u32;
+            let nextfreeoff = freeoff + fpg.div_ceil(8);
+            img[cg_byte + CG_OFF_IUSEDOFF..cg_byte + CG_OFF_IUSEDOFF + 4]
+                .copy_from_slice(&iusedoff.to_le_bytes());
+            img[cg_byte + CG_OFF_FREEOFF..cg_byte + CG_OFF_FREEOFF + 4]
+                .copy_from_slice(&freeoff.to_le_bytes());
+            img[cg_byte + CG_OFF_NEXTFREEOFF..cg_byte + CG_OFF_NEXTFREEOFF + 4]
+                .copy_from_slice(&nextfreeoff.to_le_bytes());
+            for i in (freeoff as usize)..(nextfreeoff as usize) {
+                img[cg_byte + i] = 0xFF;
+            }
+        }
+        // CG 1's replica starts as a verbatim copy of the primary.
+        let cg1_sb_byte = (fpg as u64 + sblkno as u64) as usize * fsize as usize;
+        let primary_sb_bytes: Vec<u8> =
+            img[SB_OFFSET_UFS1 as usize..SB_OFFSET_UFS1 as usize + SB_READ_SIZE].to_vec();
+        if cg1_sb_byte + SB_READ_SIZE > img.len() {
+            img.resize(cg1_sb_byte + SB_READ_SIZE, 0);
+        }
+        img[cg1_sb_byte..cg1_sb_byte + SB_READ_SIZE].copy_from_slice(&primary_sb_bytes);
+
+        // Corrupt: clobber the replica's magic AND its bsize so we see
+        // multiple ReplicaSb*Mismatch findings and confirm repair rewrites
+        // the whole 2 KiB image, not just one field.
+        img[cg1_sb_byte + MAGIC_OFF..cg1_sb_byte + MAGIC_OFF + 4]
+            .copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        img[cg1_sb_byte + OFF_BSIZE..cg1_sb_byte + OFF_BSIZE + 4]
+            .copy_from_slice(&0u32.to_le_bytes());
+
+        // Pre-repair fsck should flag both.
+        {
+            let mut fs = UfsFilesystem::open(Cursor::new(&img), 0).expect("open pre-repair");
+            let pre = fs.fsck().expect("supports fsck").expect("runs");
+            assert!(
+                pre.errors
+                    .iter()
+                    .any(|e| e.code == "ReplicaSbMagicMismatch"),
+                "expected ReplicaSbMagicMismatch pre-repair"
+            );
+        }
+
+        // Repair.
+        let mut fs = UfsFilesystem::open(Cursor::new(img), 0).expect("open for repair");
+        let report = fs.repair().expect("repair runs");
+        assert!(
+            report
+                .fixes_applied
+                .iter()
+                .any(|s| s.contains("Replica superblock:")),
+            "expected replica fix entry, got: {:?}",
+            report.fixes_applied
+        );
+
+        // Post-repair: every ReplicaSb*Mismatch must be gone (other
+        // hand-rolled-image findings are tolerated).
+        let post = fs.fsck().expect("supports fsck").expect("runs");
+        assert!(
+            !post
+                .errors
+                .iter()
+                .any(|e| e.code.starts_with("ReplicaSb") && e.code.ends_with("Mismatch")),
+            "expected no ReplicaSb*Mismatch after repair, got: {:?}",
+            post.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
     }
 
     #[test]
