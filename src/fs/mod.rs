@@ -27,6 +27,7 @@ pub mod jfs;
 pub mod jfs_fsck;
 pub mod layout_preserving;
 pub mod mac_alias;
+pub mod mfs;
 pub mod ntfs;
 pub mod patch;
 pub mod pfs3;
