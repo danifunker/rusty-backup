@@ -1,6 +1,7 @@
 pub mod affs;
 pub mod affs_common;
 pub mod affs_fsck;
+pub mod apple_dos;
 pub mod binhex;
 pub mod btrfs;
 pub mod efs;
