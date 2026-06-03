@@ -45,15 +45,8 @@ byte 2097152 / `@1`, partition slot 7). Always operate on a copy.
 
 Open holes in v4 edit (suggested order — easiest/most reusable first):
 
-- **(A) new-chunk inode allocation** — **single-leaf path shipped
-  2026-06-02** (see §10). Follow-up still open: **multi-level inobt
-  growth.** When an AG outgrows its single-leaf inobt (≈16k inodes per AG
-  at 4 KiB blocksize + 16-byte records), `alloc_new_inode_chunk` currently
-  returns `Unsupported`. Reuse R3's `rebuild_multilevel_inobt` shape via
-  `build_sblock_btree`, but free the old tree blocks alongside allocating
-  the new ones (R3 relies on a follow-up R2 pass that hole (A) doesn't
-  have). Oracle: a deliberately-overgrown AG with the leaf full → create
-  one more file → `xfs_repair -n` clean.
+- **(A) new-chunk inode allocation** — **shipped 2026-06-02** (single-leaf
+  + multi-level grow; see §10).
 
 - **(B) block → short-form dir re-compaction** — cosmetic. After
   `block_remove_entry`, if surviving entries fit the inode literal area,
@@ -405,7 +398,7 @@ Out, not parked. Listed so the question doesn't get re-litigated.
 
 ---
 
-## 10. Recently closed (2026-06-02 sweep)
+## 10. Recently closed (2026-06-02 sweep + follow-ups)
 
 Audit trail. Each was either shipped, closed-by-design, or moved into
 the structure above before its source plan doc was deleted in the
@@ -539,23 +532,42 @@ docs-consolidation pass.
   longest non-glob prefix of the pattern. Symlinks ride out as plain
   text files containing the target (lossy but cross-platform safe);
   specials skip with a one-line note.
-- **XFS hole (A) — single-leaf inobt growth** — `alloc_inode_slot`
-  lifted into `try_claim_slot_from_existing_chunks`; the new
-  `alloc_new_inode_chunk` reads `di_version` from the root inode, carves
-  `blocks_per_chunk` contiguous fsblocks aligned to `sb_inoalignmt`
-  (or `blocks_per_chunk` when ALIGN is off) via the new
-  `alloc_blocks_aligned` + `carve_aligned_from_largest` primitives,
-  writes 64 free dinodes (magic + version + `di_mode = 0` +
-  `di_next_unlinked = NULLAGINO`), splices an all-free record (freecount
-  64, free `u64::MAX`) into the AG's single-leaf inobt, and bumps AGI
-  `count`/`freecount` + sb `sb_icount`/`sb_ifree` by 64. Slot search
-  re-runs and claims slot 0 of the new chunk via the existing -1
-  accounting. v1 single-leaf scope only — multi-level growth is the
-  remaining §2.1 (A) follow-up. Tests: 5 alignment-carve unit tests +
+- **XFS hole (A) — new-chunk inode allocation (single-leaf + multi-level
+  grow)** — `alloc_inode_slot` lifted into
+  `try_claim_slot_from_existing_chunks`; the new `alloc_new_inode_chunk`
+  reads `di_version` from the root inode, carves `blocks_per_chunk`
+  contiguous fsblocks aligned to `sb_inoalignmt` (or `blocks_per_chunk`
+  when ALIGN is off) via the new `alloc_blocks_aligned` +
+  `carve_aligned_from_largest` primitives, writes 64 free dinodes (magic
+  + version + `di_mode = 0` + `di_next_unlinked = NULLAGINO`), then
+  dispatches between two splice strategies. **Single-leaf splice**
+  (`splice_inobt_single_leaf_record`) — when the AGI root is a one-block
+  level-1 leaf with at least one open slot, sort + rewrite the leaf in
+  place; AGI root/level unchanged. **Multi-level grow**
+  (`grow_inobt_with_new_record`) — when the existing tree is multi-level
+  or its only leaf is full, gather every existing record from every
+  leaf, add the new all-free chunk, key-sort, allocate `blocks_needed_for`
+  contiguous AG-local blocks for a fresh tree AND reclaim the old tree
+  blocks in one freespace rebuild via the new `swap_inobt_blocks_in_ag`
+  helper (alloc + free fused; the old blocks coalesce into the AG's
+  current-full-free set, then `n` blocks carve from the largest extent,
+  and `rebuild_ag_freespace` writes one set of new bno/cnt trees),
+  re-build the inobt via R3's `build_sblock_btree`, write every new tree
+  block, then relocate AGI root + level. AGI `count`/`freecount` + sb
+  `sb_icount`/`sb_ifree` bump by 64 once after dispatch — both paths
+  share the same counter update. Slot search re-runs and claims slot 0
+  of the new chunk via the existing -1 accounting. v4 only (v5/CRC is
+  hole E). New helpers: `collect_inobt_all_blocks` in `inobt_repair.rs`
+  (shared `walk_inobt` traversal returns leaves + all blocks).
+  Tests: 5 alignment-carve unit tests +
   `alloc_new_inode_chunk_extends_inobt_and_keeps_volume_clean` end-to-end
   against the v4 fixture (counter deltas, sorted record + all-free
-  shape, every dinode initialized, our verifier stays clean). Oracle
-  helper: `examples/xfs_fill_chunks.rs`.
+  shape, every dinode initialized, our verifier stays clean) +
+  `alloc_new_inode_chunk_promotes_full_leaf_to_multi_level` (forges 254
+  phantom records to fill the root leaf, then verifies the new tree is
+  level >= 2, AGI root moved, all max_leaf+1 records survive in
+  per-leaf-sorted form, sb counters bumped). Oracle helper:
+  `examples/xfs_fill_chunks.rs`.
 - **Native Mac archives GUI polish (Workflows A / B / C / D / E)** —
   full sweep. Detection is now magic-driven via
   `macarchive::detect::detect_mac_archive` (six `MacArchiveKind`

@@ -2545,6 +2545,284 @@ mod tests {
     }
 
     #[test]
+    fn alloc_new_inode_chunk_promotes_full_leaf_to_multi_level() {
+        // §2.1 hole (A) follow-up: when the AG's only inobt leaf is full
+        // (numrecs == max_leaf), alloc_new_inode_chunk must switch from the
+        // single-leaf splice path to the multi-level grow path — rebuild the
+        // inobt as a 2-level tree on freshly carved blocks (reclaiming the old
+        // leaf in the same freespace rebuild via swap_inobt_blocks_in_ag),
+        // relocate AGI root + level, and bump AGI count/freecount + sb
+        // counters by +64.
+        //
+        // Forging the leaf to max_leaf records (existing real + phantom
+        // records with no backing dinodes) shortcuts the alternative — 254
+        // real allocations to legitimately fill the leaf — at the cost of
+        // leaving inobt vs actual-inodes inconsistent; a follow-up `run_fsck`
+        // is therefore omitted. The growth ALGORITHM is what's under test.
+        use crate::fs::filesystem::EditableFilesystem;
+        use crate::fs::xfs::ag::XfsAgi;
+        use crate::fs::xfs::types::XFS_INODES_PER_CHUNK;
+
+        let img = load_fixture().to_vec();
+        let mut cursor = Cursor::new(img);
+
+        let (sb_clone, agi_byte0, sectsize, blocksize, agi_before, root_agbno) = {
+            let fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable");
+            let sb = fs.superblock().clone();
+            let sectsize = sb.sectsize as u64;
+            let blocksize = sb.blocksize as u64;
+            let agi_byte0 = 2 * sectsize;
+            let mut agi_sec = vec![0u8; sectsize as usize];
+            read_at_aligned(
+                &mut Cursor::new(cursor.get_ref().as_slice()),
+                agi_byte0,
+                sectsize,
+                &mut agi_sec,
+            )
+            .expect("read AGI 0");
+            let agi = XfsAgi::parse(&agi_sec).expect("parse AGI 0");
+            let root = agi.root;
+            (sb, agi_byte0, sectsize, blocksize, agi, root)
+        };
+        assert_eq!(
+            agi_before.level, 1,
+            "fixture starts with a single-level inobt"
+        );
+
+        let bs = blocksize as usize;
+        let max_leaf = (bs - 16) / 16; // INOBT_HDR_LEN, INOBT_REC_SIZE
+
+        // Read the existing root leaf so we can preserve real records and
+        // their start_aginos.
+        let leaf_byte = root_agbno as u64 * blocksize;
+        let mut leaf = vec![0u8; bs];
+        read_at_aligned(
+            &mut Cursor::new(cursor.get_ref().as_slice()),
+            leaf_byte,
+            blocksize,
+            &mut leaf,
+        )
+        .expect("read leaf");
+        let existing_numrecs = BigEndian::read_u16(&leaf[6..8]) as usize;
+        assert!(
+            existing_numrecs < max_leaf,
+            "fixture leaf should not already be full"
+        );
+
+        let mut existing: Vec<(u32, u32, u64)> = Vec::with_capacity(existing_numrecs);
+        let mut max_existing_start: u32 = 0;
+        for r in 0..existing_numrecs {
+            let off = 16 + r * 16;
+            let s = BigEndian::read_u32(&leaf[off..off + 4]);
+            let fc = BigEndian::read_u32(&leaf[off + 4..off + 8]);
+            let free = BigEndian::read_u64(&leaf[off + 8..off + 16]);
+            existing.push((s, fc, free));
+            if s > max_existing_start {
+                max_existing_start = s;
+            }
+        }
+
+        // Phantom records: start_aginos strictly above the existing chunks
+        // and well below where `alloc_blocks_aligned`'s tail-anchored carve
+        // will land the new chunk. Phantoms claim inodes in the inobt
+        // accounting (forcing numrecs == max_leaf) but no backing blocks,
+        // so freespace is left untouched.
+        let phantom_count = max_leaf - existing_numrecs;
+        let phantom_stride: u32 = XFS_INODES_PER_CHUNK as u32; // 64
+        let phantom_base: u32 =
+            (max_existing_start + phantom_stride * 2).next_multiple_of(phantom_stride);
+        let mut all_records: Vec<(u32, u32, u64)> = Vec::with_capacity(max_leaf);
+        all_records.extend(existing.iter().copied());
+        for i in 0..phantom_count {
+            all_records.push((phantom_base + i as u32 * phantom_stride, 0, 0));
+        }
+        all_records.sort_by_key(|&(s, _, _)| s);
+        BigEndian::write_u16(&mut leaf[6..8], max_leaf as u16);
+        for (i, &(s, fc, free)) in all_records.iter().enumerate() {
+            let off = 16 + i * 16;
+            BigEndian::write_u32(&mut leaf[off..off + 4], s);
+            BigEndian::write_u32(&mut leaf[off + 4..off + 8], fc);
+            BigEndian::write_u64(&mut leaf[off + 8..off + 16], free);
+        }
+        {
+            let writer = cursor.get_mut();
+            let lo = leaf_byte as usize;
+            writer[lo..lo + bs].copy_from_slice(&leaf);
+        }
+
+        // Patch AGI count and sb_icount to match the forge: each phantom
+        // claims 64 inodes, all allocated (freecount unchanged).
+        let phantom_inodes = (phantom_count as u32) * XFS_INODES_PER_CHUNK as u32;
+        let new_count_pre = agi_before.count + phantom_inodes;
+        let mut agi_sec = vec![0u8; sectsize as usize];
+        read_at_aligned(
+            &mut Cursor::new(cursor.get_ref().as_slice()),
+            agi_byte0,
+            sectsize,
+            &mut agi_sec,
+        )
+        .expect("read AGI for patch");
+        BigEndian::write_u32(&mut agi_sec[16..20], new_count_pre);
+        {
+            let writer = cursor.get_mut();
+            let lo = agi_byte0 as usize;
+            writer[lo..lo + sectsize as usize].copy_from_slice(&agi_sec);
+        }
+        let mut primary = vec![0u8; sectsize as usize];
+        read_at_aligned(
+            &mut Cursor::new(cursor.get_ref().as_slice()),
+            0,
+            sectsize,
+            &mut primary,
+        )
+        .expect("read primary for patch");
+        let sb_icount_pre = BigEndian::read_u64(&primary[128..136]);
+        let sb_ifree_pre = BigEndian::read_u64(&primary[136..144]);
+        BigEndian::write_u64(
+            &mut primary[128..136],
+            sb_icount_pre + phantom_inodes as u64,
+        );
+        {
+            let writer = cursor.get_mut();
+            writer[0..sectsize as usize].copy_from_slice(&primary);
+        }
+
+        // Drive the new-chunk path. A full root leaf must route through the
+        // multi-level grow branch.
+        {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable");
+            fs.alloc_new_inode_chunk(&sb_clone)
+                .expect("alloc_new_inode_chunk in multi-level grow path");
+            fs.sync_metadata().expect("sync");
+        }
+
+        // AGI: level >= 2 (was 1), root moved, count/freecount += 64.
+        let mut agi_after_sec = vec![0u8; sectsize as usize];
+        read_at_aligned(
+            &mut Cursor::new(cursor.get_ref().as_slice()),
+            agi_byte0,
+            sectsize,
+            &mut agi_after_sec,
+        )
+        .expect("read AGI 0 after");
+        let agi_after = XfsAgi::parse(&agi_after_sec).expect("parse AGI 0 after");
+        assert!(
+            agi_after.level >= 2,
+            "AGI level should be >= 2 after multi-level grow; got {}",
+            agi_after.level
+        );
+        assert_ne!(
+            agi_after.root, root_agbno,
+            "AGI root should have moved off the old single-leaf block"
+        );
+        assert_eq!(
+            agi_after.count,
+            new_count_pre + XFS_INODES_PER_CHUNK as u32,
+            "AGI count should bump by 64 (one new all-free chunk)",
+        );
+        assert_eq!(
+            agi_after.freecount,
+            agi_before.freecount + XFS_INODES_PER_CHUNK as u32,
+            "AGI freecount should bump by 64 (one new all-free chunk)",
+        );
+
+        // sb_icount += 64, sb_ifree += 64.
+        let mut primary_after = vec![0u8; sectsize as usize];
+        read_at_aligned(
+            &mut Cursor::new(cursor.get_ref().as_slice()),
+            0,
+            sectsize,
+            &mut primary_after,
+        )
+        .expect("read primary after");
+        assert_eq!(
+            BigEndian::read_u64(&primary_after[128..136]),
+            sb_icount_pre + phantom_inodes as u64 + XFS_INODES_PER_CHUNK as u64,
+            "sb_icount should bump by 64",
+        );
+        assert_eq!(
+            BigEndian::read_u64(&primary_after[136..144]),
+            sb_ifree_pre + XFS_INODES_PER_CHUNK as u64,
+            "sb_ifree should bump by 64",
+        );
+
+        // Walk the new multi-level tree and gather all leaf records. There
+        // should be max_leaf + 1 records (existing real + phantoms + the new
+        // all-free chunk) and exactly one all-free record.
+        let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("reopen");
+        let leaves = fs
+            .collect_inobt_leaf_blocks(&sb_clone, 0, agi_after.root)
+            .expect("walk new inobt");
+        assert!(
+            leaves.len() >= 2,
+            "multi-level tree should have >= 2 leaves; got {}",
+            leaves.len()
+        );
+
+        let mut all_after: Vec<(u32, u32, u64)> = Vec::new();
+        for leaf_agbno in &leaves {
+            let leaf_fsblock = *leaf_agbno as u64; // AG 0
+            let mut buf = vec![0u8; bs];
+            fs.read_fsblock(leaf_fsblock, &mut buf).expect("read leaf");
+            let nr = BigEndian::read_u16(&buf[6..8]) as usize;
+            for r in 0..nr {
+                let off = 16 + r * 16;
+                let s = BigEndian::read_u32(&buf[off..off + 4]);
+                let fc = BigEndian::read_u32(&buf[off + 4..off + 8]);
+                let free = BigEndian::read_u64(&buf[off + 8..off + 16]);
+                all_after.push((s, fc, free));
+            }
+        }
+        assert_eq!(
+            all_after.len(),
+            max_leaf + 1,
+            "new tree should contain old records + new all-free chunk"
+        );
+        let all_free_records: Vec<&(u32, u32, u64)> = all_after
+            .iter()
+            .filter(|&&(_, fc, free)| fc == XFS_INODES_PER_CHUNK as u32 && free == u64::MAX)
+            .collect();
+        assert_eq!(
+            all_free_records.len(),
+            1,
+            "exactly one all-free chunk should be in the new tree"
+        );
+
+        // Each individual leaf must be internally sorted by start_agino; the
+        // DFS walker visits leaves in stack-pop (right-to-left) order, so we
+        // check each leaf independently rather than the gathered sequence.
+        for leaf_agbno in &leaves {
+            let leaf_fsblock = *leaf_agbno as u64;
+            let mut buf = vec![0u8; bs];
+            fs.read_fsblock(leaf_fsblock, &mut buf).expect("read leaf");
+            let nr = BigEndian::read_u16(&buf[6..8]) as usize;
+            let mut prev: i64 = -1;
+            for r in 0..nr {
+                let off = 16 + r * 16;
+                let s = BigEndian::read_u32(&buf[off..off + 4]);
+                assert!(
+                    (s as i64) > prev,
+                    "leaf {leaf_agbno}: records must be sorted by start_agino"
+                );
+                prev = s as i64;
+            }
+        }
+
+        // Globally, the multiset of records survives the rebuild. Sort and
+        // verify the global set is also strictly increasing (no duplicates).
+        let mut sorted = all_after.clone();
+        sorted.sort_by_key(|&(s, _, _)| s);
+        let mut prev: i64 = -1;
+        for &(s, _, _) in &sorted {
+            assert!(
+                (s as i64) > prev,
+                "globally: records must be unique start_aginos"
+            );
+            prev = s as i64;
+        }
+    }
+
+    #[test]
     fn dir1_dispatch_uses_dir1_shortform_parser() {
         // Patch the fixture's versionnum to clear the DIRV2 bit, then assert
         // the dir1 dispatch path is taken. The fixture's root inode is dir2

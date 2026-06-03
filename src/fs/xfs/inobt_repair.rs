@@ -309,10 +309,39 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         agno: u64,
         root: u32,
     ) -> Result<Vec<u32>, FilesystemError> {
+        let (leaves, _all) = self.walk_inobt(sb, agno, root)?;
+        Ok(leaves)
+    }
+
+    /// Descend the inobt from `root`, returning the AG-relative block numbers
+    /// of **every** block visited (leaves + internal nodes). Used by the inobt
+    /// growth path in `edit.rs` to free the old tree blocks when replacing it
+    /// with a freshly-built one. Errors on the same conditions as
+    /// [`collect_inobt_leaf_blocks`].
+    pub(crate) fn collect_inobt_all_blocks(
+        &mut self,
+        sb: &XfsSuperblock,
+        agno: u64,
+        root: u32,
+    ) -> Result<Vec<u32>, FilesystemError> {
+        let (_leaves, all) = self.walk_inobt(sb, agno, root)?;
+        Ok(all)
+    }
+
+    /// Shared inobt traversal: returns `(leaves, all_blocks)` where `leaves`
+    /// is the level-0 block subset and `all_blocks` is every block visited
+    /// (including the root and any intermediate nodes).
+    fn walk_inobt(
+        &mut self,
+        sb: &XfsSuperblock,
+        agno: u64,
+        root: u32,
+    ) -> Result<(Vec<u32>, Vec<u32>), FilesystemError> {
         let bs = sb.blocksize as usize;
         let max_intern = (bs - INOBT_HDR_LEN) / (4 + 4); // 4-byte key + 4-byte ptr
         let mut block = vec![0u8; bs];
         let mut leaves = Vec::new();
+        let mut all = Vec::new();
         let mut stack = vec![root];
         let mut visited: HashSet<u32> = HashSet::new();
 
@@ -325,6 +354,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                     "AG {agno} inobt block {agbno} visited twice (cycle)"
                 )));
             }
+            all.push(agbno);
             let fsblock = (agno << sb.agblklog) | agbno as u64;
             self.read_fsblock(fsblock, &mut block)?;
             let magic = BigEndian::read_u32(&block[0..4]);
@@ -350,7 +380,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                 }
             }
         }
-        Ok(leaves)
+        Ok((leaves, all))
     }
 
     /// Recompute every record's free mask/freecount in one inobt leaf block

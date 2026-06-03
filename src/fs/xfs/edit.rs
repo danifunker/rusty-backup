@@ -11,11 +11,14 @@
 //!     chunk (flip `ir_free`, adjust the record freecount + AGI freecount +
 //!     `sb_ifree`). When every existing chunk is full, `alloc_new_inode_chunk`
 //!     carves a fresh 64-inode chunk via [`alloc_blocks_aligned`], writes 64
-//!     free dinodes, splices a new record into the AG's single-leaf inobt, and
-//!     bumps the AGI + superblock inode counters; the slot search then runs
-//!     again and claims slot 0 of the new chunk. v1 only handles single-leaf
-//!     inobt growth — multi-level growth (when the existing root leaf is full)
-//!     stays `Unsupported` pending the multi-level rebuild follow-up.
+//!     free dinodes, then splices a new record into the AG's inobt and bumps
+//!     the AGI + superblock inode counters; the slot search then runs again
+//!     and claims slot 0 of the new chunk. Two splice strategies pick
+//!     themselves based on tree shape: single-leaf splice when the AGI root
+//!     is a single leaf with room, multi-level grow (via
+//!     [`build_sblock_btree`]) when the existing tree is multi-level or its
+//!     only leaf is full — the latter reclaims the old tree blocks in the
+//!     same freespace rebuild that allocates the new ones.
 //!   * **Block allocation** ([`alloc_blocks`]) / freeing ([`free_blocks`]):
 //!     carve/return contiguous blocks by rebuilding the AG free-space btrees
 //!     (reusing the R2 rebuild) + resyncing `sb_fdblocks`.
@@ -37,11 +40,13 @@ use byteorder::{BigEndian, ByteOrder};
 
 use super::ag::{XfsAgf, XfsAgi};
 use super::bmap::{encode_extent, fsblock_to_partition_byte};
-use super::btree_build::{blocks_needed, FreeExtent};
+use super::btree_build::{blocks_needed, blocks_needed_for, build_sblock_btree, FreeExtent};
 use super::dir2::XFS_DIR2_DATA_HDR_LEN;
 use super::freespace_rebuild::{carve_aligned_from_largest, carve_from_largest, coalesce};
 use super::inode::fork_offset;
-use super::types::{XFS_ABTB_MAGIC, XFS_ABTC_MAGIC, XFS_DINODE_MAGIC, XFS_INODES_PER_CHUNK};
+use super::types::{
+    XFS_ABTB_MAGIC, XFS_ABTC_MAGIC, XFS_DINODE_MAGIC, XFS_IBT_MAGIC, XFS_INODES_PER_CHUNK,
+};
 use super::{read_at_aligned, XfsFilesystem};
 use crate::fs::filesystem::{Filesystem, FilesystemError};
 use crate::fs::fsck::RepairReport;
@@ -62,9 +67,14 @@ const NULLAGINO: u32 = 0xFFFF_FFFF;
 /// inobt leaf record layout (v4): startino(4) freecount(4) free(8).
 const INOBT_REC_SIZE: usize = 16;
 const INOBT_HDR_LEN: usize = 16;
+/// inobt key is the leading 4-byte `startino` field; same width as a btree
+/// pointer.
+const INOBT_KEY_SIZE: usize = 4;
 
 /// AGI / superblock counter offsets.
 const AGI_COUNT_OFF: usize = 16;
+const AGI_ROOT_OFF: usize = 20;
+const AGI_LEVEL_OFF: usize = 24;
 const AGI_FREECOUNT_OFF: usize = 28;
 const SB_ICOUNT_OFF: usize = 128;
 const SB_IFREE_OFF: usize = 136;
@@ -185,16 +195,23 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     /// Extend an AG's inobt with a brand-new 64-inode chunk. Carves
     /// `blocks_per_chunk` aligned contiguous blocks via
     /// [`alloc_blocks_aligned`], writes 64 free dinodes there, then splices a
-    /// fresh inobt record (all 64 bits set ⇒ all free) into the AG's existing
-    /// root leaf. Updates AGI `count`/`freecount` and superblock
-    /// `sb_icount`/`sb_ifree` by `+64` each — the caller's slot claim later
-    /// rebalances `freecount`/`sb_ifree` by `-1`.
+    /// fresh inobt record (all 64 bits set ⇒ all free) into the AG's inobt.
+    /// Updates AGI `count`/`freecount` and superblock `sb_icount`/`sb_ifree`
+    /// by `+64` each — the caller's slot claim later rebalances `freecount`/
+    /// `sb_ifree` by `-1`.
     ///
-    /// **v1 scope** (matches `OPEN-WORK.md` §2.1 hole A first cut): single-leaf
-    /// inobt growth only. An AG whose inobt is already multi-level, or whose
-    /// root leaf is already full, is reported with a clear `Unsupported`
-    /// instead of being grown — the multi-level rebuild path that handles that
-    /// case (R3's [`build_sblock_btree`] reuse) is the natural follow-up.
+    /// Two record-splice strategies, picked by the existing tree's shape:
+    ///   * **Single-leaf splice** ([`splice_inobt_single_leaf_record`]) — when
+    ///     `agi.level == 1` and the root leaf has at least one open slot, the
+    ///     new record drops in alongside the existing ones with no allocation
+    ///     and no AGI root/level change.
+    ///   * **Multi-level grow** ([`grow_inobt_with_new_record`]) — when the
+    ///     existing tree is already multi-level OR its only leaf is full, gather
+    ///     every existing record + the new one, allocate fresh contiguous tree
+    ///     blocks (and reclaim the old tree blocks in the same freespace
+    ///     rebuild), then rebuild a balanced tree via [`build_sblock_btree`]
+    ///     and relocate the AGI root + level.
+    ///
     /// v4 only.
     pub(crate) fn alloc_new_inode_chunk(
         &mut self,
@@ -241,8 +258,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         // di_next_unlinked = NULLAGINO, mode 0 == free).
         self.init_free_inode_chunk(sb, chunk_fsblock, di_version, blocks_per_chunk as usize)?;
 
-        // Re-read the AGI of the chosen AG so we can splice the new record
-        // into the inobt's root leaf.
+        // Re-read the AGI of the chosen AG so we can pick a splice strategy.
         let sectsize = sb.sectsize as u64;
         let agblocks = sb.agblocks as u64;
         let agi_byte = self.partition_offset + agno * agblocks * bs + 2 * sectsize;
@@ -250,75 +266,35 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         read_at_aligned(&mut self.reader, agi_byte, sectsize, &mut agi_sec)?;
         let agi = XfsAgi::parse(&agi_sec)?;
 
-        // v1 single-leaf gate. The multi-level path (existing tree relocates
-        // to a fresh build via build_sblock_btree) is the documented follow-up.
-        if agi.level != 1 {
-            return Err(FilesystemError::Unsupported(format!(
-                "XFS new-chunk allocation: AG {agno} inobt has {} levels; \
-                 only single-leaf growth supported in v1",
-                agi.level
-            )));
-        }
-        let leaves = self.collect_inobt_leaf_blocks(sb, agno, agi.root)?;
-        if leaves.as_slice() != [agi.root] {
-            return Err(FilesystemError::Unsupported(format!(
-                "XFS new-chunk allocation: AG {agno} inobt structure does not match \
-                 single-root-leaf assumption (got leaves {leaves:?}, AGI root {})",
-                agi.root
-            )));
-        }
-        let leaf_fsblock = (agno << sb.agblklog) | agi.root as u64;
-        let mut leaf = vec![0u8; bs_usize];
-        self.read_fsblock(leaf_fsblock, &mut leaf)?;
-        let numrecs = BigEndian::read_u16(&leaf[6..8]) as usize;
-        if numrecs >= max_leaf {
-            return Err(FilesystemError::Unsupported(format!(
-                "XFS new-chunk allocation: AG {agno} inobt root leaf full \
-                 ({numrecs}/{max_leaf} records); multi-level growth not yet \
-                 implemented"
-            )));
-        }
-
-        // Read existing records, append the new one, sort by start_agino, and
-        // rewrite the leaf. The leaf header (level/sibling pointers) is left
-        // untouched; we only bump numrecs and the per-record body.
-        let mut records: Vec<(u32, u32, u64)> = Vec::with_capacity(numrecs + 1);
-        for r in 0..numrecs {
-            let off = INOBT_HDR_LEN + r * INOBT_REC_SIZE;
-            let s = BigEndian::read_u32(&leaf[off..off + 4]);
-            let fc = BigEndian::read_u32(&leaf[off + 4..off + 8]);
-            let free = BigEndian::read_u64(&leaf[off + 8..off + 16]);
-            // Defense: refuse a duplicate start_agino (would mean the new
-            // chunk's blocks collided with an existing chunk — alloc_blocks
-            // should have prevented this, but check anyway).
-            if s == start_agino {
-                return Err(FilesystemError::Parse(format!(
-                    "XFS new-chunk allocation: AG {agno} already has chunk at \
-                     start_agino {start_agino}"
-                )));
+        // Pick the splice strategy. Single-leaf splice when (a) the tree is
+        // single-level, (b) its only leaf is the AGI root, and (c) the leaf
+        // has at least one open slot. Anything else → multi-level grow.
+        let single_leaf_fits = if agi.level == 1 {
+            let leaves = self.collect_inobt_leaf_blocks(sb, agno, agi.root)?;
+            if leaves.as_slice() == [agi.root] {
+                let leaf_fsblock = (agno << sb.agblklog) | agi.root as u64;
+                let mut leaf = vec![0u8; bs_usize];
+                self.read_fsblock(leaf_fsblock, &mut leaf)?;
+                let numrecs = BigEndian::read_u16(&leaf[6..8]) as usize;
+                numrecs < max_leaf
+            } else {
+                false
             }
-            records.push((s, fc, free));
-        }
-        records.push((start_agino, XFS_INODES_PER_CHUNK as u32, u64::MAX));
-        records.sort_by_key(|&(s, _, _)| s);
+        } else {
+            false
+        };
 
-        BigEndian::write_u16(&mut leaf[6..8], (numrecs + 1) as u16);
-        for (i, &(s, fc, free)) in records.iter().enumerate() {
-            let off = INOBT_HDR_LEN + i * INOBT_REC_SIZE;
-            BigEndian::write_u32(&mut leaf[off..off + 4], s);
-            BigEndian::write_u32(&mut leaf[off + 4..off + 8], fc);
-            BigEndian::write_u64(&mut leaf[off + 8..off + 16], free);
+        if single_leaf_fits {
+            self.splice_inobt_single_leaf_record(sb, agno, agi.root, start_agino, max_leaf)?;
+        } else {
+            self.grow_inobt_with_new_record(sb, agno, agi.root, start_agino)?;
+            // grow_inobt_with_new_record rewrote AGI root + level; refresh.
+            read_at_aligned(&mut self.reader, agi_byte, sectsize, &mut agi_sec)?;
         }
-        // Zero the bytes that the dropped trailing record used to occupy, so a
-        // future numrecs bump doesn't read stale data.
-        let used = INOBT_HDR_LEN + records.len() * INOBT_REC_SIZE;
-        let stale_end = INOBT_HDR_LEN + (numrecs + 1).min(max_leaf) * INOBT_REC_SIZE;
-        for b in &mut leaf[used..stale_end.max(used)] {
-            *b = 0;
-        }
-        self.write_fsblock(sb, leaf_fsblock, &leaf)?;
 
-        // AGI count += 64, freecount += 64.
+        // AGI count += 64, freecount += 64. The single-leaf path leaves AGI
+        // root/level untouched; the multi-level grow already wrote new values
+        // but left count/freecount alone, so this final step is unconditional.
         let new_count = agi
             .count
             .checked_add(XFS_INODES_PER_CHUNK as u32)
@@ -336,6 +312,206 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
 
         // sb_icount += 64, sb_ifree += 64.
         self.bump_sb_inode_counters(sb, XFS_INODES_PER_CHUNK as i64, XFS_INODES_PER_CHUNK as i64)
+    }
+
+    /// Splice a fresh all-free chunk record `(start_agino, freecount=64,
+    /// free=u64::MAX)` into the existing single-leaf inobt at `root_agbno`.
+    /// Reads the leaf, appends the record, sorts by `start_agino`, and rewrites
+    /// the leaf in place. Bumps only the leaf's `numrecs`; the leaf header
+    /// (level, sibling pointers) is left untouched. Trailing-byte zero fill
+    /// keeps a future bump from reading stale data.
+    fn splice_inobt_single_leaf_record(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        agno: u64,
+        root_agbno: u32,
+        new_start_agino: u32,
+        max_leaf: usize,
+    ) -> Result<(), FilesystemError> {
+        let bs_usize = sb.blocksize as usize;
+        let leaf_fsblock = (agno << sb.agblklog) | root_agbno as u64;
+        let mut leaf = vec![0u8; bs_usize];
+        self.read_fsblock(leaf_fsblock, &mut leaf)?;
+        let numrecs = BigEndian::read_u16(&leaf[6..8]) as usize;
+
+        let mut records: Vec<(u32, u32, u64)> = Vec::with_capacity(numrecs + 1);
+        for r in 0..numrecs {
+            let off = INOBT_HDR_LEN + r * INOBT_REC_SIZE;
+            let s = BigEndian::read_u32(&leaf[off..off + 4]);
+            let fc = BigEndian::read_u32(&leaf[off + 4..off + 8]);
+            let free = BigEndian::read_u64(&leaf[off + 8..off + 16]);
+            if s == new_start_agino {
+                return Err(FilesystemError::Parse(format!(
+                    "XFS new-chunk allocation: AG {agno} already has chunk at \
+                     start_agino {new_start_agino}"
+                )));
+            }
+            records.push((s, fc, free));
+        }
+        records.push((new_start_agino, XFS_INODES_PER_CHUNK as u32, u64::MAX));
+        records.sort_by_key(|&(s, _, _)| s);
+
+        BigEndian::write_u16(&mut leaf[6..8], (numrecs + 1) as u16);
+        for (i, &(s, fc, free)) in records.iter().enumerate() {
+            let off = INOBT_HDR_LEN + i * INOBT_REC_SIZE;
+            BigEndian::write_u32(&mut leaf[off..off + 4], s);
+            BigEndian::write_u32(&mut leaf[off + 4..off + 8], fc);
+            BigEndian::write_u64(&mut leaf[off + 8..off + 16], free);
+        }
+        let used = INOBT_HDR_LEN + records.len() * INOBT_REC_SIZE;
+        let stale_end = INOBT_HDR_LEN + (numrecs + 1).min(max_leaf) * INOBT_REC_SIZE;
+        for b in &mut leaf[used..stale_end.max(used)] {
+            *b = 0;
+        }
+        self.write_fsblock(sb, leaf_fsblock, &leaf)?;
+        Ok(())
+    }
+
+    /// Multi-level inobt growth: the existing tree can't take one more record
+    /// without restructuring (root leaf full, or already multi-level). Gather
+    /// every existing record, add the new all-free chunk, allocate fresh
+    /// contiguous tree blocks (reclaiming the old tree blocks in the same
+    /// freespace rebuild via [`swap_inobt_blocks_in_ag`]), build a balanced
+    /// tree with [`build_sblock_btree`], write its blocks, and relocate the
+    /// AGI root + level. AGI count/freecount are not touched here — the caller
+    /// applies a single +64 delta after dispatch.
+    fn grow_inobt_with_new_record(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        agno: u64,
+        old_root: u32,
+        new_start_agino: u32,
+    ) -> Result<(), FilesystemError> {
+        let bs_usize = sb.blocksize as usize;
+        let sectsize = sb.sectsize as u64;
+        let agblocks = sb.agblocks as u64;
+        let bs = sb.blocksize as u64;
+
+        // (1) Gather every existing record from every leaf, refuse a duplicate
+        // start_agino, then add the new all-free record and key-sort.
+        let old_leaves = self.collect_inobt_leaf_blocks(sb, agno, old_root)?;
+        let mut records: Vec<(u32, u32, u64)> = Vec::new();
+        for &leaf_agbno in &old_leaves {
+            let leaf_fsblock = (agno << sb.agblklog) | leaf_agbno as u64;
+            let mut leaf = vec![0u8; bs_usize];
+            self.read_fsblock(leaf_fsblock, &mut leaf)?;
+            let nr = BigEndian::read_u16(&leaf[6..8]) as usize;
+            for r in 0..nr {
+                let off = INOBT_HDR_LEN + r * INOBT_REC_SIZE;
+                let s = BigEndian::read_u32(&leaf[off..off + 4]);
+                let fc = BigEndian::read_u32(&leaf[off + 4..off + 8]);
+                let free = BigEndian::read_u64(&leaf[off + 8..off + 16]);
+                if s == new_start_agino {
+                    return Err(FilesystemError::Parse(format!(
+                        "XFS new-chunk allocation: AG {agno} already has chunk at \
+                         start_agino {new_start_agino}"
+                    )));
+                }
+                records.push((s, fc, free));
+            }
+        }
+        records.push((new_start_agino, XFS_INODES_PER_CHUNK as u32, u64::MAX));
+        records.sort_by_key(|&(s, _, _)| s);
+
+        // (2) Pack the records into the flat byte buffer build_sblock_btree
+        // wants (each entry: startino(4) freecount(4) free(8)).
+        let mut packed = vec![0u8; records.len() * INOBT_REC_SIZE];
+        for (i, &(s, fc, free)) in records.iter().enumerate() {
+            let off = i * INOBT_REC_SIZE;
+            BigEndian::write_u32(&mut packed[off..off + 4], s);
+            BigEndian::write_u32(&mut packed[off + 4..off + 8], fc);
+            BigEndian::write_u64(&mut packed[off + 8..off + 16], free);
+        }
+
+        // (3) Enumerate every block the OLD tree occupies (leaves + internal
+        // nodes) so the freespace swap can reclaim them.
+        let old_blocks = self.collect_inobt_all_blocks(sb, agno, old_root)?;
+
+        // (4) Reserve `need` contiguous AG-local blocks for the new tree AND
+        // free the old tree blocks in one freespace rebuild — the only way to
+        // avoid stranding either side when the AG's freespace is tight.
+        let need = blocks_needed_for(records.len(), bs_usize, INOBT_REC_SIZE, INOBT_KEY_SIZE);
+        let new_tree_start_agbno =
+            self.swap_inobt_blocks_in_ag(sb, agno, &old_blocks, need as u32)?;
+
+        // (5) Build the new tree on the carved block run.
+        let carved_agbnos: Vec<u32> = (0..need as u32).map(|i| new_tree_start_agbno + i).collect();
+        let tree = build_sblock_btree(
+            &packed,
+            INOBT_REC_SIZE,
+            INOBT_KEY_SIZE,
+            XFS_IBT_MAGIC,
+            bs_usize,
+            agno as u32,
+            &carved_agbnos,
+        );
+
+        // (6) Write every new tree block. Until the AGI root/level update at
+        // step (7), the AGI still points at the old (now-freed) root — readers
+        // would see garbage if the freed blocks were reused. Within this method
+        // no concurrent access happens (we hold &mut self), and we don't
+        // return until AGI is updated, so the on-disk window is closed.
+        for blk in &tree.blocks {
+            let fsblock = (agno << sb.agblklog) | blk.agbno as u64;
+            self.write_fsblock(sb, fsblock, &blk.bytes)?;
+        }
+
+        // (7) Rewrite AGI root + level. Count/freecount are bumped by the
+        // caller after dispatch, so we leave them alone here.
+        let agi_byte = self.partition_offset + agno * agblocks * bs + 2 * sectsize;
+        let mut agi_sec = vec![0u8; sectsize as usize];
+        read_at_aligned(&mut self.reader, agi_byte, sectsize, &mut agi_sec)?;
+        BigEndian::write_u32(
+            &mut agi_sec[AGI_ROOT_OFF..AGI_ROOT_OFF + 4],
+            tree.root_agbno,
+        );
+        BigEndian::write_u32(&mut agi_sec[AGI_LEVEL_OFF..AGI_LEVEL_OFF + 4], tree.levels);
+        self.write_at(agi_byte, &agi_sec)?;
+        Ok(())
+    }
+
+    /// Reserve `n` contiguous AG-local blocks for the new inobt and return the
+    /// freed `old_blocks` to the free set, all in one freespace rebuild. Adds
+    /// the freed blocks to this AG's current full-free set, coalesces, carves
+    /// `n` blocks from the largest extent of the merged set, then rebuilds
+    /// bno/cnt + resyncs `sb_fdblocks`. Returns the AG-relative starting block
+    /// of the carved run.
+    ///
+    /// Both alloc and free are AG-scoped: the inobt belongs to one specific AG
+    /// (the AGI of that AG points at its root), so every new tree block has to
+    /// live in that AG, and every reclaimed old block does too. A pure
+    /// `alloc_blocks` would try other AGs on `DiskFull`; this stays put.
+    fn swap_inobt_blocks_in_ag(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        agno: u64,
+        old_blocks: &[u32],
+        n: u32,
+    ) -> Result<u32, FilesystemError> {
+        let agblocks = sb.agblocks as u64;
+        let expected_len = if agno == sb.agcount as u64 - 1 {
+            sb.dblocks - agno * agblocks
+        } else {
+            agblocks
+        };
+        let mut full_free = self.current_full_free(sb, agno, expected_len)?;
+        // Add the old tree blocks back to the free set as single-block extents;
+        // coalesce will merge them with neighbouring runs.
+        for &agbno in old_blocks {
+            full_free.push(FreeExtent {
+                startblock: agbno,
+                blockcount: 1,
+            });
+        }
+        let merged = coalesce(full_free);
+        let (carved, free_after) = carve_from_largest(&merged, n).ok_or_else(|| {
+            FilesystemError::DiskFull(format!(
+                "AG {agno}: no free extent large enough for {n}-block inobt growth"
+            ))
+        })?;
+        self.rebuild_ag_freespace(sb, agno, expected_len, &free_after)?;
+        self.resync_sb_fdblocks(sb)?;
+        Ok(carved[0])
     }
 
     /// Carve `n` contiguous blocks whose start agbno is a multiple of
