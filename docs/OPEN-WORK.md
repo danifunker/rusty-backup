@@ -319,24 +319,53 @@ see §10. Reopen when new CLI / GUI work surfaces.)
 Items that have a real shape but no schedule. Surface them here so they
 aren't lost.
 
-- **UFS Tier B+ (U.4) — fsck + edit.** Read shipped (see §10); on-disk
-  ground knowledge is already in tree via `src/fs/ufs.rs` + EFS precedent
-  (`src/fs/efs.rs` shares the cylinder-group + classic-Unix-inode shape).
-  Real-world demand has been zero so far; revisit if someone needs to
-  edit / repair a UFS image.
-- **JFS Tier B+ (J.4) — fsck + edit.** Read shipped (see §10), but every
-  edit path runs through xtree / dtree / dmapctl B+tree writes that
-  J.1–J.3 deliberately walked only at the inline-root level. Picking up
-  edit means the multi-page B+tree walkers + reverse-direction writers
-  for all three trees.
-- **JFS multi-page B+tree walkers (read-side).** `walk_bmap` refuses
-  aggregates ≥ 2²³ blocks (32 GiB at bsize=4096) — a multi-level `dmapctl`
-  walker is the unblocker. `read_fileset_iag` refuses multi-IAG filesets
-  (> 4096 inodes). `parse_inline_dtree` refuses non-inline dtrees
-  (`di_size > 4096`); `read_file_data` refuses xtrees with internal
-  nodes. All four are out of scope for vintage hardware (the actual
-  motivating workload) but would block any larger-than-vintage JFS
-  read.
+- **UFS U.4 — `repair()`.** Detection shipped 2026-06-03 (see §10):
+  `fsck_ufs` runs 5 passes and flags `ReplicaSb*Mismatch`,
+  `BitmapMissingAllocation`, and `OrphanInode` as repairable. The
+  `EditableFilesystem::repair()` driver that actually applies the
+  fixes (rewrite replica SB from primary; clear stray bitmap bits;
+  adopt orphan inodes into `/lost+found/`) is the remaining half —
+  the write primitives + edit surface needed to drive it shipped
+  in the same sweep, so the implementation is small (~200-300 LOC
+  mirroring `repair_efs`).
+- **JFS Tier B+ (J.4) — fsck + edit.** Read shipped (see §10), but
+  every edit path runs through xtree / dtree / dmapctl B+tree writes
+  that J.1–J.3 deliberately walked only at the inline-root level.
+  Picking up edit means the multi-page B+tree walkers + reverse-
+  direction writers for all three trees. (Read-side xtpage walker
+  landed 2026-06-03, see §10 — file + BMAP xtree-internal refusals
+  lifted; multi-IAG dispatch / dtree walker / dmapctl walker still
+  open below.)
+- **JFS multi-IAG dispatch.** `read_fileset_iag` now accepts internal-
+  node FILESYSTEM_I xtree (lifted 2026-06-03; see §10) but still
+  reads only page 1 (IAG 0) and gates on `di_size > 2 * PSIZE`. Full
+  multi-IAG support needs `read_fileset_inode` to route by `fino /
+  4096` to the right IAG and either lazy-load or cache them. ~200 LOC
+  follow-up.
+- **JFS multi-page dtree walker (read-side).** `parse_inline_dtree`
+  still refuses `di_size > DT_INLINE_CAP` (4096 bytes) and
+  internal-node dtrees. Unblocks any directory whose entries spill
+  past the 8-slot inline stbl into off-disk pages — uses the new
+  xtpage walker pattern but the leaf-page contents are dtree records
+  rather than data, so it's a separate slice (the xtpage walker
+  shipped 2026-06-03 doesn't help directly).
+- **JFS multi-level dmapctl walker (read-side).** `walk_bmap` still
+  refuses aggregates ≥ 2²³ blocks (32 GiB at bsize=4096) via the
+  `MAX_BMAP_DEPTH_1_BLOCKS` cap. The new xtree walker (2026-06-03,
+  see §10) covers BMAP's internal xtree but the dmapctl L0/L1/L2
+  hierarchy past one level is a separate structure. Out of scope for
+  vintage hardware; revisit if someone hits a multi-TiB JFS volume.
+- **XFS R2 (freespace rebuild) + R3 (inobt rebuild) on v5.** Both
+  helpers can now emit CRC-correct sblock-crc trees (E.4 wired
+  `build_alloc_btree` / `build_sblock_btree` for v5). What stops a
+  safe lift is that v5 layouts may carry `finobt` (free inode btree)
+  / `rmapbt` (reverse-map btree) / `refcountbt` (reflink refcount
+  btree) ro-compat metadata that our in-memory block-completeness map
+  and AGI-summary recompute don't model — rebuilding the bnobt / cntbt
+  / inobt without resyncing the finobt would leave those side-trees
+  with stale records. Revisit when a v5 image with one of these
+  features actually needs `--repair`; the existing read path is
+  already finobt-tolerant.
 - **XFS R2 (freespace rebuild) + R3 (inobt rebuild) on v5.** Both
   helpers can now emit CRC-correct sblock-crc trees (E.4 wired
   `build_alloc_btree` / `build_sblock_btree` for v5). What stops a
@@ -386,6 +415,58 @@ Audit trail. Each was either shipped, closed-by-design, or moved into
 the structure above before its source plan doc was deleted in the
 docs-consolidation pass.
 
+- **UFS U.4 — fsck + write + EditableFilesystem (§8)** — shipped
+  across three slices on 2026-06-03. **fsck** (`src/fs/ufs_fsck.rs`,
+  ~500 LOC) mirrors `efs_fsck.rs`: 5 ordered passes covering geometry
+  re-validation, per-CG header + replica SB cross-check (every CG > 0,
+  comparing magic/bsize/fsize/frag/ncg/fpg/ipg/sblkno/cblkno/iblkno/
+  total_frags), inode-table walk with full direct + single/double/
+  triple indirect descent (`walk_inode_blocks` helper returns both
+  data + indirect-block fragments so a thorough bitmap check
+  accounts for both), bitmap consistency (every inode-claimed
+  fragment's bit must be CLEAR — UFS bitmap is set=FREE, opposite of
+  every Linux FS), connectivity BFS from root inum 2. Repairable
+  codes: `ReplicaSb*Mismatch` (11 fields), `BitmapMissingAllocation`,
+  `OrphanInode`. **Write primitives**: `write_frag_run`,
+  `write_inode` (version-aware UFS1 128 B / UFS2 256 B encoding),
+  `read_cg_iused_bitmap` / `write_cg_iused_bitmap` /
+  `write_cg_free_bitmap` (named by effect — `alloc_*` / `free_*` —
+  so callers don't have to remember which bitmap uses which
+  polarity), `read_cg_cs` / `update_cg_cs` for the 4-field
+  cylinder-group summary, `alloc_inode` / `free_inode` /
+  `alloc_frag_run` / `free_frag_run`. **EditableFilesystem**:
+  `create_file` (direct extents only, ≤ 12 × bsize), `create_
+  directory` (single-block initial layout with `.` / `..` stamped
+  via DIRENT2 reclen + d_type, parent nlink bumped + CG ndir
+  counter incremented), `delete_entry` (empty-dir scan, unlink-
+  first-then-free crash-survivability, parent nlink + ndir
+  decremented on dir delete), `sync_metadata` (no-op — every
+  primitive flushes synchronously), `free_space` (per-CG nffree
+  sum × fsize). Tests: 62 UFS tests total — fixture round-trips
+  (create + list_directory + read_file + fsck-clean), edit failure
+  modes (delete non-empty dir, oversize file rejection), bitmap +
+  inode primitive smoke tests, replica-SB-magic-mismatch detection
+  on a hand-rolled 2-CG synthetic UFS2 image. `repair()` itself —
+  applying the repairable codes — is the only piece left of the §8
+  UFS line, parked there with a ~200-300 LOC scope estimate.
+- **JFS multi-level xtpage walker (§8)** — `parse_xtpage_buf` /
+  `read_xtpage_at` / `read_xtree_logical_page` / `walk_xtree_leaves`
+  primitives on `JfsFilesystem`. The header layout is identical for
+  inline xtroot (288 B) and external xtpage (4 KiB); the parser
+  validates `nextindex` against the buffer's actual capacity so
+  corruption surfaces as `Parse` rather than slice OOB. Descent is
+  iterative with a 16-level cycle guard and a 1M-node-visit budget.
+  Refusals lifted: `read_file_data` now walks every leaf XAD
+  (sorted by logical offset, sparse gaps zero-filled);
+  `walk_bmap` accepts BMAP control inode's internal xtree
+  (`read_bmap_logical_page` descends via `read_xtree_logical_page`);
+  `read_fileset_iag` accepts FILESYSTEM_I internal xtree (with a
+  separate multi-IAG gate on `di_size > 2 * PSIZE`). Tests: 4 new
+  on a synthetic 2-level xtree built on a `Cursor<Vec<u8>>` —
+  parse round-trip, DFS leaf walk, descent to correct physical
+  block via sentinel bytes, page-uncovered error. 53 JFS tests
+  pass total. Multi-IAG dispatch + dtree walker + dmapctl walker
+  remain parked in §8.
 - **HFS — extending a raw partition image (§3.1)** — `emit_apm_disk_with_hfs`
   in `src/fs/hfs_clone.rs` now takes `Apm::parse` as optional: a non-APM
   source (a raw single-partition HFS image like `partition-0.img`, no DDR at
