@@ -27,6 +27,12 @@
 #   /link.txt           -> symlink to hello.txt
 #   /large.bin          -> 24 KiB deterministic data (exercises xtree leaf)
 #   /tiny.txt           -> 10 bytes
+#   /bigdir/file_<NNN>  -> 200 numbered tiny files (exercises external
+#                          dtree: blows past the inline-dtroot's 8-slot
+#                          cap so JFS allocates an off-disk dtpage). The
+#                          read-side multi-page dtree walker (parked in
+#                          OPEN-WORK §8) verifies against this directory
+#                          once it lands.
 
 set -euo pipefail
 
@@ -59,7 +65,22 @@ mkdir /subdir
 write /subdir/nested.txt "nested file"
 ln-s hello.txt /link.txt
 write /tiny.txt "tiny bytes"
+mkdir /bigdir
 EOF
+
+    # Populate /bigdir with 200 tiny files. This blows past the inline
+    # dtroot's 8-slot cap (an inline dtree maxes out around ~8 short-name
+    # entries), forcing JFS to convert /bigdir to an external dtree with
+    # off-disk dtpages. The read-side multi-page dtree walker (parked in
+    # OPEN-WORK §8) regression-tests against this directory once it
+    # lands; today's parse_inline_dtree refuses with a clear error.
+    {
+        echo "run"
+        echo "mount /dev/sda /"
+        for i in $(seq -w 1 200); do
+            echo "write /bigdir/file_${i} \"line ${i}\""
+        done
+    } | guestfish --rw -a "$raw"
 
     # Write a 24 KiB "large" file separately (binary content -> heredoc
     # would mangle bytes). guestfish 'upload' takes a host path.

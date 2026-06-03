@@ -346,14 +346,20 @@ aren't lost.
   up to DTPAGEMAXSLOT=128. Internal entry layout is `idtentry { xd
   pxd 8B + next i8 + namlen u8 + name[11] u16 }` — same 32 B as
   ldtentry. The slice needs a fixture with a directory > 127 entries
-  to verify the recursive descent (we don't have one in tree); the
-  xtpage walker pattern from 2026-06-03 carries over, but leaf-page
-  contents are dtree records rather than XADs so it's a separate
-  parser. Park reason: shipping an unverified B+tree walker is
-  higher-risk than the value of speculative support; refused on
-  demand with a clear error today. J.4a fsck also emits an
-  `ExternalDtreeNotWalked` warning on encounter so the verifier's
-  silence on subtrees-not-walked is loud and audited.
+  to verify the recursive descent; the xtpage walker pattern from
+  2026-06-03 carries over, but leaf-page contents are dtree records
+  rather than XADs so it's a separate parser. **Fixture groundwork
+  landed 2026-06-03 late**: `scripts/generate-jfs-fixtures.sh` now
+  also creates `/bigdir` with 200 numbered tiny files — past the
+  inline-dtroot's ~8-slot cap, forcing JFS to convert the dir to an
+  external dtree with off-disk dtpages. Next person to regen the
+  fixture (Linux box with `jfsutils` + `libguestfs-tools`) gets the
+  external-dtree coverage automatically. Park reason: shipping an
+  unverified B+tree walker is higher-risk than the value of
+  speculative support; refused on demand with a clear error today.
+  J.4a fsck also emits an `ExternalDtreeNotWalked` warning on
+  encounter so the verifier's silence on subtrees-not-walked is loud
+  and audited.
 - **XFS R2 (freespace rebuild) + R3 (inobt rebuild) on v5.** Both
   helpers can now emit CRC-correct sblock-crc trees (E.4 wired
   `build_alloc_btree` / `build_sblock_btree` for v5). What stops a
