@@ -1,8 +1,19 @@
 //! XFS write primitives (§3 of `docs/xfs_edit_and_repair.md`) — the shared
 //! foundation for Track-B editing (`create_directory` here) and R7 orphan
-//! reconnection. Everything is **v4-only** (no inode/dir CRCs to recompute)
-//! and writes straight through to the device (no in-memory staging), like the
-//! repair path.
+//! reconnection. Writes straight through to the device (no in-memory
+//! staging), like the repair path.
+//!
+//! **Format coverage**: v4 (no CRC) is the original target. v5 (CRC) is
+//! being landed structure-by-structure under §2.1 hole (E):
+//!   - **E.2 (this commit)** wires v3 inode core stamping
+//!     ([`v5_crc::stamp_inode_v3`]) into [`write_inode_region`] and into the
+//!     fresh-chunk initializer ([`init_free_inode_chunk`]). Upstream callers
+//!     still gate on v5 — `alloc_inode_slot` and `alloc_new_inode_chunk`
+//!     because the inobt leaf splice / AGI / AGFL / superblock writes don't
+//!     yet stamp CRCs (E.4 / E.5).
+//!   - The dir3 / bmbt / sblock-CRC / AGF / AGI / SB stamp work lives in
+//!     later slices; until then the v5 gate at each alloc entry point keeps
+//!     the volume internally consistent (no write paths active).
 //!
 //! Primitives, smallest first:
 //!
@@ -571,6 +582,13 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     /// `di_version` (matching every other inode), `di_mode = 0` (the on-disk
     /// "free slot" marker), and `di_next_unlinked = NULLAGINO`. All other
     /// fields are zero — matching what `xfs_ialloc_inode_init` writes.
+    ///
+    /// **v5 (CRC) volumes**: each slot's v3 core also needs its CRC-header
+    /// tuple stamped (`di_uuid` / `di_ino` / `di_lsn` / `di_crc`) so the
+    /// inobt-walk readers and `xfs_repair` accept the chunk as a fresh
+    /// 64-slot extension. The kernel's `xfs_ialloc_inode_init` does the
+    /// equivalent stamp via `xfs_dinode_calc_crc` after writing the body;
+    /// we do it inline. v4 callers skip the stamp (no `di_crc` field).
     fn init_free_inode_chunk(
         &mut self,
         sb: &super::sb::XfsSuperblock,
@@ -582,6 +600,14 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         let bs = sb.blocksize as usize;
         let span = blocks_per_chunk * bs;
         let mut buf = vec![0u8; span];
+        // chunk_fsblock's starting agino = the first inode number in this chunk.
+        // Each slot's di_ino = start_agino + slot, embedded as a full inumber.
+        let agno = chunk_fsblock >> sb.agblklog;
+        let chunk_agbno = chunk_fsblock & ((1u64 << sb.agblklog) - 1);
+        let start_agino = chunk_agbno << sb.inopblog;
+        let ino_shift = sb.agblklog + sb.inopblog;
+        let start_ino = (agno << ino_shift) | start_agino;
+
         for slot in 0..XFS_INODES_PER_CHUNK {
             let base = slot * inodesize;
             BigEndian::write_u16(&mut buf[base..base + 2], XFS_DINODE_MAGIC);
@@ -591,6 +617,10 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                 &mut buf[base + DI_NEXT_UNLINKED_OFF..base + DI_NEXT_UNLINKED_OFF + 4],
                 NULLAGINO,
             );
+            if sb.is_v5() {
+                let slot_buf = &mut buf[base..base + inodesize];
+                super::v5_crc::stamp_inode_v3(slot_buf, start_ino + slot as u64, sb);
+            }
         }
         let part_byte =
             fsblock_to_partition_byte(chunk_fsblock, sb.agblocks, sb.agblklog, sb.blocksize);

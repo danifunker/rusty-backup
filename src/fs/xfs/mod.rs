@@ -2809,6 +2809,54 @@ mod tests {
         );
     }
 
+    /// §2.1 hole (E.2): round-trip the root inode through `write_inode_region`
+    /// on the v5 fixture. The caller mutates a non-CRC field (`di_atime`),
+    /// the writer stamps `di_crc` over the entire on-disk inode buffer, and
+    /// a re-read sees the mutation AND a CRC that re-verifies. If the v5
+    /// stamp didn't fire, `crc_valid` would catch it.
+    #[test]
+    fn write_inode_region_stamps_v3_crc_on_v5_round_trip() {
+        use crate::fs::xfs::v5_crc::{crc_valid, INODE_V3_DI_CRC_OFF, INODE_V3_DI_INO_OFF};
+
+        let img = load_modern_fixture().to_vec();
+        let mut cursor = Cursor::new(img);
+        let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open xfs v5");
+        let sb = fs.superblock().clone();
+        assert!(sb.is_v5());
+
+        // Read the root inode, mutate di_atime.tv_sec (offset 32..36, BE32),
+        // write through the editable surface, then re-read and verify both
+        // the field round-trip AND the CRC.
+        let (_core, mut ibuf) = fs.read_inode_buf(sb.rootino).expect("read root inode");
+        assert!(crc_valid(&ibuf, INODE_V3_DI_CRC_OFF), "pre-write CRC valid");
+        let pre_atime = BigEndian::read_u32(&ibuf[32..36]);
+        let new_atime = pre_atime.wrapping_add(1);
+        BigEndian::write_u32(&mut ibuf[32..36], new_atime);
+
+        // Sanity: di_ino on disk matches sb.rootino (the stamper writes it,
+        // so we'd notice if the offset constants drifted).
+        assert_eq!(
+            BigEndian::read_u64(&ibuf[INODE_V3_DI_INO_OFF..INODE_V3_DI_INO_OFF + 8]),
+            sb.rootino
+        );
+
+        fs.write_inode_region(&sb, sb.rootino, &ibuf)
+            .expect("write_inode_region");
+
+        // Re-read the inode buffer and check (1) the mutation landed,
+        // (2) the di_crc still verifies. This is the whole point of E.2.
+        let (_core2, ibuf2) = fs.read_inode_buf(sb.rootino).expect("re-read root inode");
+        assert_eq!(
+            BigEndian::read_u32(&ibuf2[32..36]),
+            new_atime,
+            "di_atime mutation round-tripped"
+        );
+        assert!(
+            crc_valid(&ibuf2, INODE_V3_DI_CRC_OFF),
+            "post-write di_crc invalid — v5 stamp didn't fire"
+        );
+    }
+
     #[test]
     fn alloc_new_inode_chunk_extends_inobt_and_keeps_volume_clean() {
         // §2.1 hole (A): when every existing inobt chunk is full,

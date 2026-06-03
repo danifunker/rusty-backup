@@ -275,6 +275,16 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     /// Read-modify-write one inode's `inodesize` bytes back to disk. Mirrors
     /// `read_inode_buf`'s offset math; reads the containing sector span, patches
     /// the inode region, and writes the span (inodes are smaller than a sector).
+    ///
+    /// **v5 (CRC) volumes**: every caller's edits live in `inode_buf`. Before
+    /// we commit the sector span, the v3 inode core's CRC tuple
+    /// (`di_uuid`/`di_ino`/`di_lsn`/`di_changecount`/`di_crc`) is stamped via
+    /// [`v5_crc::stamp_inode_v3`] over the (mutable) `isz`-sized window. That
+    /// keeps every callsite (`do_create_file`, `do_sync_metadata`, R5/R6) free
+    /// of v5 plumbing — they prepare the inode body the same way for v4 and
+    /// v5, and the stamp lands here, just before the write. Upstream callers
+    /// still gate on v5 (`alloc_inode_slot`, repair entry points); E.4 / E.5
+    /// will lift those gates.
     pub(crate) fn write_inode_region(
         &mut self,
         sb: &super::sb::XfsSuperblock,
@@ -302,6 +312,11 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         )?;
         let off_in = (part_off - sector_start) as usize;
         buf[off_in..off_in + isz as usize].copy_from_slice(&inode_buf[..isz as usize]);
+        if sb.is_v5() {
+            // Stamp the v3 inode core in place over the freshly-copied bytes,
+            // so the CRC covers exactly the body that lands on disk.
+            super::v5_crc::stamp_inode_v3(&mut buf[off_in..off_in + isz as usize], ino, sb);
+        }
         self.reader
             .seek(SeekFrom::Start(self.partition_offset + sector_start))?;
         self.reader.write_all(&buf)?;
