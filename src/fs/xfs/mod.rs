@@ -44,7 +44,7 @@ use bmap::{
     decode_extent, fsblock_to_partition_byte, XfsBmbtIrec, NULLFSBLOCK, XFS_BMAP_CRC_MAGIC,
     XFS_BMAP_MAGIC, XFS_BTREE_LBLOCK_CRC_LEN, XFS_BTREE_LBLOCK_LEN,
 };
-use inode::{fork_offset, inode_byte_offset, XfsDinodeCore};
+use inode::{inode_byte_offset, XfsDinodeCore};
 use sb::XfsSuperblock;
 use types::{DiFormat, DirFormat};
 
@@ -156,7 +156,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
     /// at `fork_start + (forkoff << 3)`; otherwise it consumes the rest of
     /// the literal area.
     fn data_fork<'a>(&self, core: &XfsDinodeCore, inode_buf: &'a [u8]) -> &'a [u8] {
-        let fork_start = fork_offset(self.sb.is_v5());
+        let fork_start = self.sb.fork_offset();
         let end = if core.forkoff > 0 {
             fork_start + (core.forkoff as usize) * 8
         } else {
@@ -2187,6 +2187,126 @@ mod tests {
             res.errors.is_empty(),
             "expected clean, got {:?}",
             res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// §2.1 hole (E.5d) follow-up + CL.1 bug fix: R6 on a v5 volume must
+    /// write the rebuilt short-form fork at byte 176 (v5 inode literal
+    /// area), not byte 100 (v4). Before CL.1, `repair_shortform_dir`
+    /// hardcoded `fork_offset(false)` so a v5 R6 rebuild would corrupt the
+    /// dir. After CL.1 it routes through `sb.fork_offset()`.
+    ///
+    /// To exercise the regression: orphan one of the v5 fixture's root
+    /// entries by zeroing its di_mode, run `repair()`, and assert (a) the
+    /// dangling entry is gone, (b) the v5 verifier stays clean — which it
+    /// can't if R6 wrote the new fork at the wrong offset.
+    #[test]
+    fn repair_r6_drops_dangling_shortform_entry_on_v5_fixture() {
+        use crate::fs::filesystem::EditableFilesystem;
+
+        let mut img = load_modern_fixture().to_vec();
+
+        // Find the inode number of "hostname" in the v5 root so we know
+        // which inode to orphan. The fixture's root is short-form so the
+        // entry list is parsable without any write paths.
+        let (ino_to_orphan, sb) = {
+            let mut fs = XfsFilesystem::open(Cursor::new(img.as_slice()), 0).expect("open v5");
+            assert!(fs.sb.is_v5());
+            let root = fs.root().expect("root");
+            let entries = fs.list_directory(&root).expect("list");
+            let host = entries
+                .iter()
+                .find(|e| e.name == "hostname")
+                .expect("hostname missing from v5 fixture root");
+            (host.location, fs.sb.clone())
+        };
+
+        // Zero di_mode at the inode's on-disk location to orphan it.
+        let ino_byte = inode_byte_offset(
+            ino_to_orphan,
+            sb.agblocks,
+            sb.agblklog,
+            sb.inopblog,
+            sb.blocksize,
+            sb.inodesize,
+        ) as usize;
+        img[ino_byte + 2..ino_byte + 4].copy_from_slice(&0u16.to_be_bytes());
+        // Stamp the inode's CRC over the mutated body so the v5 fsck verifier
+        // doesn't bail on a CRC mismatch before the rest of the repair runs.
+        let inodesize = sb.inodesize as usize;
+        let mut tmp = img[ino_byte..ino_byte + inodesize].to_vec();
+        crate::fs::xfs::v5_crc::stamp_inode_v3(&mut tmp, ino_to_orphan, &sb);
+        img[ino_byte..ino_byte + inodesize].copy_from_slice(&tmp);
+
+        // Drive R6 (via the full repair pass).
+        let mut cursor = Cursor::new(img);
+        let report = {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable v5");
+            fs.repair().expect("repair runs")
+        };
+        assert_eq!(
+            report.fixes_failed.len(),
+            0,
+            "v5 R6 should not fail: {:?}",
+            report.fixes_failed
+        );
+        assert!(
+            report
+                .fixes_applied
+                .iter()
+                .any(|f| f.contains("dangling shortform")),
+            "expected R6 to drop the dangling entry on v5; got: {:?}",
+            report.fixes_applied
+        );
+
+        // After R6, hostname is gone and the sibling entries survive. The
+        // *root inode's CRC* must re-verify — that's the regression check:
+        // the pre-CL.1 hardcode wrote the new short-form fork at byte 100
+        // (v4 fork offset), overwriting `di_crc` and the rest of the v3
+        // CRC tuple inside what should be inode-core territory. Verifier
+        // would then surface `InodeCrcMismatch` on the root.
+        //
+        // (We don't assert `errors.is_empty()` here because R3 is v4-only
+        // — see §8 — so the now-orphaned inobt slot still trips
+        // `AllocatedInodeZeroed`. That's expected, not the bug under test.)
+        let repaired = cursor.into_inner();
+        let mut fs = XfsFilesystem::open(Cursor::new(repaired), 0).expect("reopen v5");
+        let root = fs.root().expect("root");
+        let names: Vec<String> = fs
+            .list_directory(&root)
+            .expect("list")
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(
+            !names.contains(&"hostname".to_string()),
+            "v5 R6 didn't drop the entry: {names:?}"
+        );
+        assert!(
+            names.contains(&"data_1.bin".to_string()),
+            "v5 R6 dropped a sibling: {names:?}"
+        );
+
+        // Read the root inode raw and confirm its di_crc still validates.
+        let (_core, ibuf) = fs.read_inode_buf(sb.rootino).expect("read root inode");
+        assert!(
+            crate::fs::xfs::v5_crc::crc_valid(&ibuf, crate::fs::xfs::v5_crc::INODE_V3_DI_CRC_OFF),
+            "root inode di_crc invalid — R6 wrote at the wrong fork offset"
+        );
+
+        // Verifier surface beyond CRC: anything other than the expected
+        // `AllocatedInodeZeroed` would mean R6 actually corrupted
+        // structure (not just the per-orphan slot accounting).
+        let res = fs.run_fsck().expect("fsck after v5 R6");
+        let unexpected: Vec<&String> = res
+            .errors
+            .iter()
+            .map(|e| &e.code)
+            .filter(|c| *c != "AllocatedInodeZeroed")
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "v5 R6 left unexpected verifier complaints: {unexpected:?}"
         );
     }
 

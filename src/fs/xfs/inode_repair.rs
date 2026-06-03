@@ -44,9 +44,9 @@ use super::{read_at_aligned, XfsFilesystem, SECTOR};
 use crate::fs::filesystem::FilesystemError;
 use crate::fs::fsck::RepairReport;
 
-/// inobt leaf record layout (v4 short header): startino(4) freecount(4) free(8).
+/// inobt leaf record layout: startino(4) freecount(4) free(8). Same on v4
+/// and v5; the leading header size differs (see `XfsSuperblock::sblock_hdr_len`).
 const INOBT_REC_SIZE: usize = 16;
-const INOBT_HDR_LEN: usize = 16; // XFS_BTREE_SBLOCK_LEN
 
 /// di_nblocks (u64) and di_nextents (u32) offsets within an on-disk inode.
 const DI_NBLOCKS_OFF: usize = 64;
@@ -71,11 +71,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         let blocksize = sb.blocksize as u64;
         let bs = sb.blocksize as usize;
         let ino_shift = sb.agblklog + sb.inopblog;
-        let hdr_len = if sb.is_v5() {
-            super::types::XFS_BTREE_SBLOCK_CRC_LEN
-        } else {
-            INOBT_HDR_LEN
-        };
+        let hdr_len = sb.sblock_hdr_len();
 
         let mut any_change = false;
 

@@ -228,6 +228,46 @@ impl XfsSuperblock {
         }
     }
 
+    // ----- format-dependent layout dispatch --------------------------------
+    //
+    // The methods below hide the v4/v5 split for every site that just wants
+    // to know "where does the fork start" or "how big is the btree header".
+    // Each is the canonical reference; ad-hoc `if sb.is_v5()` checks at the
+    // call sites should call these instead.
+
+    /// Byte offset of the data fork inside an on-disk inode. v1/v2 inodes
+    /// have a 100-byte core (`offsetof(di_crc)`); v3 (v5/CRC) inodes grow
+    /// the core to 176 bytes (`offsetof(di_literal_area)`).
+    pub fn fork_offset(&self) -> usize {
+        if self.is_v5() {
+            176
+        } else {
+            100
+        }
+    }
+
+    /// Short-form (AG-relative) btree block header length — inobt / bnobt /
+    /// cntbt. v4 is 16 bytes (`xfs_btree_block_shdr` without CRC suffix);
+    /// v5 is 56 bytes (adds `bb_blkno`/`bb_lsn`/`bb_uuid`/`bb_owner`/`bb_crc`
+    /// at offsets 16..56).
+    pub fn sblock_hdr_len(&self) -> usize {
+        if self.is_v5() {
+            super::types::XFS_BTREE_SBLOCK_CRC_LEN
+        } else {
+            super::types::XFS_BTREE_SBLOCK_LEN
+        }
+    }
+
+    /// Long-form (full-fsblock) btree block header length — bmbt. v4 is
+    /// 24 bytes; v5 is 72 bytes.
+    pub fn lblock_hdr_len(&self) -> usize {
+        if self.is_v5() {
+            super::bmap::XFS_BTREE_LBLOCK_CRC_LEN
+        } else {
+            super::bmap::XFS_BTREE_LBLOCK_LEN
+        }
+    }
+
     /// True iff the DIRV2 bit is set (dir2 layout). v5 implies dir3 which is
     /// dir2-derived, so this also returns true on v5.
     pub fn is_dir2(&self) -> bool {

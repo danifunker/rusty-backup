@@ -27,8 +27,7 @@ use super::ag::{XfsAgf, XfsAgi};
 use super::sb::XfsSuperblock;
 use super::types::{
     NULLAGBLOCK, XFS_ABTB_CRC_MAGIC, XFS_ABTB_MAGIC, XFS_ABTC_CRC_MAGIC, XFS_ABTC_MAGIC,
-    XFS_BTREE_SBLOCK_CRC_LEN, XFS_BTREE_SBLOCK_LEN, XFS_IBT_CRC_MAGIC, XFS_IBT_MAGIC,
-    XFS_INODES_PER_CHUNK,
+    XFS_IBT_CRC_MAGIC, XFS_IBT_MAGIC, XFS_INODES_PER_CHUNK,
 };
 use super::{read_at_aligned, XfsFilesystem};
 use crate::fs::filesystem::{Filesystem, FilesystemError};
@@ -713,11 +712,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         mut on_block: impl FnMut(u64),
     ) -> Result<(), FilesystemError> {
         let bs = sb.blocksize as usize;
-        let hdr = if sb.is_v5() {
-            XFS_BTREE_SBLOCK_CRC_LEN
-        } else {
-            XFS_BTREE_SBLOCK_LEN
-        };
+        let hdr = sb.sblock_hdr_len();
         let max_intern = (bs - hdr) / (key_size + 4);
         let max_leaf = (bs - hdr) / rec_size;
         let agblocks = sb.agblocks as u64;

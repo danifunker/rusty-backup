@@ -41,10 +41,7 @@ use super::bmap::fsblock_to_partition_byte;
 use super::btree_build::{blocks_needed_for, build_sblock_btree};
 use super::freespace_rebuild::{carve_from_largest, derive_free_extents, InUseMap};
 use super::sb::XfsSuperblock;
-use super::types::{
-    NULLAGBLOCK, XFS_BTREE_SBLOCK_CRC_LEN, XFS_BTREE_SBLOCK_LEN, XFS_IBT_CRC_MAGIC, XFS_IBT_MAGIC,
-    XFS_INODES_PER_CHUNK,
-};
+use super::types::{NULLAGBLOCK, XFS_IBT_CRC_MAGIC, XFS_IBT_MAGIC, XFS_INODES_PER_CHUNK};
 use super::{read_at_aligned, XfsFilesystem};
 use crate::fs::filesystem::FilesystemError;
 use crate::fs::fsck::RepairReport;
@@ -339,11 +336,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         root: u32,
     ) -> Result<(Vec<u32>, Vec<u32>), FilesystemError> {
         let bs = sb.blocksize as usize;
-        let hdr = if sb.is_v5() {
-            XFS_BTREE_SBLOCK_CRC_LEN
-        } else {
-            XFS_BTREE_SBLOCK_LEN
-        };
+        let hdr = sb.sblock_hdr_len();
         let want_magic = if sb.is_v5() {
             XFS_IBT_CRC_MAGIC
         } else {

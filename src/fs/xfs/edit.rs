@@ -50,16 +50,13 @@ use std::io::{Read, Seek, Write};
 use byteorder::{BigEndian, ByteOrder};
 
 use super::ag::{XfsAgf, XfsAgi};
-use super::bmap::{
-    encode_extent, fsblock_to_partition_byte, NULLFSBLOCK, XFS_BMAP_MAGIC, XFS_BTREE_LBLOCK_LEN,
-};
+use super::bmap::{encode_extent, fsblock_to_partition_byte, NULLFSBLOCK, XFS_BMAP_MAGIC};
 use super::btree_build::{blocks_needed, blocks_needed_for, build_sblock_btree, FreeExtent};
 use super::dir2::XFS_DIR2_DATA_HDR_LEN;
 use super::freespace_rebuild::{carve_aligned_from_largest, carve_from_largest, coalesce};
-use super::inode::fork_offset;
 use super::types::{
-    XFS_ABTB_MAGIC, XFS_ABTC_MAGIC, XFS_BTREE_SBLOCK_CRC_LEN, XFS_BTREE_SBLOCK_LEN,
-    XFS_DINODE_MAGIC, XFS_IBT_CRC_MAGIC, XFS_IBT_MAGIC, XFS_INODES_PER_CHUNK,
+    XFS_ABTB_MAGIC, XFS_ABTC_MAGIC, XFS_DINODE_MAGIC, XFS_IBT_CRC_MAGIC, XFS_IBT_MAGIC,
+    XFS_INODES_PER_CHUNK,
 };
 use super::{read_at_aligned, XfsFilesystem};
 use crate::fs::filesystem::{Filesystem, FilesystemError};
@@ -87,16 +84,6 @@ const INOBT_REC_SIZE: usize = 16;
 /// inobt key is the leading 4-byte `startino` field; same width as a btree
 /// pointer.
 const INOBT_KEY_SIZE: usize = 4;
-
-/// Short-form btree header length per format. Inobt / bnobt / cntbt leaves
-/// pack records starting at this byte offset.
-fn sblock_hdr_len(is_v5: bool) -> usize {
-    if is_v5 {
-        XFS_BTREE_SBLOCK_CRC_LEN
-    } else {
-        XFS_BTREE_SBLOCK_LEN
-    }
-}
 
 /// Stamp the v5 sblock-crc header tuple (`bb_blkno` / `bb_lsn` / `bb_uuid` /
 /// `bb_owner` / `bb_crc`) on an inobt / bnobt / cntbt block buffer, given
@@ -188,7 +175,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                 Ok(l) => l,
                 Err(_) => continue,
             };
-            let hdr_len = sblock_hdr_len(sb.is_v5());
+            let hdr_len = sb.sblock_hdr_len();
             for leaf_agbno in leaves {
                 let fsblock = (agno << sb.agblklog) | leaf_agbno as u64;
                 let mut block = vec![0u8; bs];
@@ -278,7 +265,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         } else {
             blocks_per_chunk
         };
-        let max_leaf = (bs_usize - sblock_hdr_len(sb.is_v5())) / INOBT_REC_SIZE;
+        let max_leaf = (bs_usize - sb.sblock_hdr_len()) / INOBT_REC_SIZE;
 
         // di_version: every inode in a v4 volume shares the version byte the
         // root inode carries. Reading it once gives the right value for both
@@ -371,7 +358,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         max_leaf: usize,
     ) -> Result<(), FilesystemError> {
         let bs_usize = sb.blocksize as usize;
-        let hdr_len = sblock_hdr_len(sb.is_v5());
+        let hdr_len = sb.sblock_hdr_len();
         let leaf_fsblock = (agno << sb.agblklog) | root_agbno as u64;
         let mut leaf = vec![0u8; bs_usize];
         self.read_fsblock(leaf_fsblock, &mut leaf)?;
@@ -438,7 +425,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         // (1) Gather every existing record from every leaf, refuse a duplicate
         // start_agino, then add the new all-free record and key-sort.
         let old_leaves = self.collect_inobt_leaf_blocks(sb, agno, old_root)?;
-        let read_hdr_len = sblock_hdr_len(sb.is_v5());
+        let read_hdr_len = sb.sblock_hdr_len();
         let mut records: Vec<(u32, u32, u64)> = Vec::new();
         for &leaf_agbno in &old_leaves {
             let leaf_fsblock = (agno << sb.agblklog) | leaf_agbno as u64;
@@ -762,7 +749,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         BigEndian::write_u32(&mut buf[96..100], NULLAGINO); // di_next_unlinked
 
         // Inline fork: count=0, i8count=0, parent (4 bytes).
-        let fs = fork_offset(sb.is_v5());
+        let fs = sb.fork_offset();
         for b in buf.iter_mut().take(isz).skip(fs) {
             *b = 0;
         }
@@ -802,7 +789,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             return Err(FilesystemError::InvalidData("bad entry name length".into()));
         }
 
-        let fs = fork_offset(sb.is_v5());
+        let fs = sb.fork_offset();
         let fork_len = core.size as usize;
         let fork_end = fs + fork_len;
         if fork_end > buf.len() {
@@ -1199,7 +1186,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
 
         // Fork starts at byte 100 in v4 (`fork_offset(false)`) and at byte
         // 176 in v5 (`fork_offset(true)` — the v3 inode core is 176 bytes).
-        let fs = fork_offset(sb.is_v5());
+        let fs = sb.fork_offset();
         for b in buf.iter_mut().take(isz).skip(fs) {
             *b = 0;
         }
@@ -1263,7 +1250,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         // Pick between inline and btree data-fork format. v1 supports single-
         // leaf bmbt only: leaves beyond the leaf cap force a clear error so
         // the partial allocation is reclaimed before the operation aborts.
-        let max_inline = (sb.inodesize as usize - fork_offset(sb.is_v5())) / BMBT_REC_SIZE;
+        let max_inline = (sb.inodesize as usize - sb.fork_offset()) / BMBT_REC_SIZE;
         let leaf_max = bmbt_leaf_max(&sb);
         if extents.len() > leaf_max {
             // Roll back the data allocation.
@@ -1293,7 +1280,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         let ino = self.alloc_inode_slot(&sb)?;
         self.write_file_data_extents(&sb, &extents, data, data_len)?;
         if let Some(leaf_fsblock) = bmbt_leaf_fsblock {
-            let mut leaf_bytes = build_bmbt_leaf(&extents, sb.blocksize as usize, sb.is_v5());
+            let mut leaf_bytes = build_bmbt_leaf(&extents, &sb);
             if sb.is_v5() {
                 // v5 lblock-crc tuple — `bb_owner` is the file's own inode.
                 let blkno = super::v5_crc::fsblock_to_daddr(leaf_fsblock, &sb);
@@ -1442,7 +1429,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                 "parent is not a short-form directory".into(),
             ));
         }
-        let fs = fork_offset(sb.is_v5());
+        let fs = sb.fork_offset();
         let fork_len = core.size as usize;
         let fork_end = fs + fork_len;
 
@@ -1524,7 +1511,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         read_at_aligned(&mut self.reader, agi_byte, sectsize, &mut agi_sec)?;
         let agi = XfsAgi::parse(&agi_sec)?;
         let leaves = self.collect_inobt_leaf_blocks(sb, agno, agi.root)?;
-        let hdr_len = sblock_hdr_len(sb.is_v5());
+        let hdr_len = sb.sblock_hdr_len();
         for leaf_agbno in leaves {
             let fsblock = (agno << sb.agblklog) | leaf_agbno as u64;
             let mut block = vec![0u8; bs];
@@ -1688,7 +1675,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         match core.format {
             super::types::DiFormat::Local => {
                 // Inline fit?
-                let fs = fork_offset(sb.is_v5());
+                let fs = sb.fork_offset();
                 let entry_len = 1 + 2 + name.len() + usize::from(has_ftype) + 4;
                 let avail_end = if core.forkoff > 0 {
                     fs + (core.forkoff as usize) * 8
@@ -2100,7 +2087,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         BigEndian::write_u64(&mut buf[56..64], size); // di_size
         BigEndian::write_u64(&mut buf[64..72], nblocks); // di_nblocks
         BigEndian::write_u32(&mut buf[76..80], extents.len() as u32); // di_nextents
-        let fs = fork_offset(sb.is_v5());
+        let fs = sb.fork_offset();
         for b in buf.iter_mut().skip(fs) {
             *b = 0;
         }
@@ -2202,7 +2189,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
 
         // Available literal area: fork start (`fork_offset(false)`) up to
         // either the attr-fork base (when `forkoff > 0`) or the inode end.
-        let fs = fork_offset(sb.is_v5());
+        let fs = sb.fork_offset();
         let avail_end = if core.forkoff > 0 {
             fs + (core.forkoff as usize) * 8
         } else {
@@ -2326,7 +2313,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         let has_ftype = sb.has_ftype();
         match core.format {
             super::types::DiFormat::Local => {
-                let fs = fork_offset(sb.is_v5());
+                let fs = sb.fork_offset();
                 let fork = &buf[fs..fs + core.size as usize];
                 Ok(sf_entries_with_ftype(fork, has_ftype)?)
             }
@@ -2420,7 +2407,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                 BigEndian::write_u32(&mut buf[16..20], n);
             }
         }
-        let fs = fork_offset(sb.is_v5());
+        let fs = sb.fork_offset();
         for b in buf.iter_mut().skip(fs) {
             *b = 0;
         }
@@ -2617,7 +2604,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         let (core, mut buf) = self.read_inode_buf(ino)?;
         match core.format {
             super::types::DiFormat::Local => {
-                let fs = fork_offset(sb.is_v5());
+                let fs = sb.fork_offset();
                 if buf[fs + 1] > 0 {
                     BigEndian::write_u64(&mut buf[fs + 2..fs + 10], new_parent);
                 } else {
@@ -2708,7 +2695,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                 Err(_) => continue,
             };
             let mut block = vec![0u8; bs];
-            let hdr_len = sblock_hdr_len(sb.is_v5());
+            let hdr_len = sb.sblock_hdr_len();
             for leaf_agbno in leaves {
                 let fsblock = (agno << sb.agblklog) | leaf_agbno as u64;
                 if self.read_fsblock(fsblock, &mut block).is_err() {
@@ -2768,20 +2755,10 @@ fn dir2_data_entsize(namelen: usize, has_ftype: bool) -> usize {
     raw.div_ceil(8) * 8
 }
 
-/// Long-form (bmbt) btree header length per format. v5 carries the 48-byte
-/// CRC suffix (uuid/blkno/lsn/owner/crc + pad) after the v4 24-byte hdr.
-fn lblock_hdr_len(is_v5: bool) -> usize {
-    if is_v5 {
-        super::bmap::XFS_BTREE_LBLOCK_CRC_LEN
-    } else {
-        XFS_BTREE_LBLOCK_LEN
-    }
-}
-
 /// Maximum extent records in one bmap btree leaf block — what fits after
 /// the long-form `xfs_btree_block` header. v5 has 48 fewer payload bytes.
 fn bmbt_leaf_max(sb: &super::sb::XfsSuperblock) -> usize {
-    (sb.blocksize as usize - lblock_hdr_len(sb.is_v5())) / BMBT_REC_SIZE
+    (sb.blocksize as usize - sb.lblock_hdr_len()) / BMBT_REC_SIZE
 }
 
 /// Convert raw `(fsblock, count)` allocation runs into bmap extent records
@@ -2818,9 +2795,10 @@ fn runs_to_extent_records(runs: &[(u64, u32)]) -> Vec<(u64, u64, u32)> {
 /// The caller stamps the CRC tuple (`v5_crc::stamp_lblock_crc_header`)
 /// after this builder returns, once the leaf's destination fsblock is
 /// known.
-fn build_bmbt_leaf(extents: &[(u64, u64, u32)], bs: usize, is_v5: bool) -> Vec<u8> {
+fn build_bmbt_leaf(extents: &[(u64, u64, u32)], sb: &super::sb::XfsSuperblock) -> Vec<u8> {
+    let bs = sb.blocksize as usize;
     let mut buf = vec![0u8; bs];
-    let magic = if is_v5 {
+    let magic = if sb.is_v5() {
         super::bmap::XFS_BMAP_CRC_MAGIC
     } else {
         XFS_BMAP_MAGIC
@@ -2830,7 +2808,7 @@ fn build_bmbt_leaf(extents: &[(u64, u64, u32)], bs: usize, is_v5: bool) -> Vec<u
     BigEndian::write_u16(&mut buf[6..8], extents.len() as u16);
     BigEndian::write_u64(&mut buf[8..16], NULLFSBLOCK); // leftsib
     BigEndian::write_u64(&mut buf[16..24], NULLFSBLOCK); // rightsib
-    let hdr = lblock_hdr_len(is_v5);
+    let hdr = sb.lblock_hdr_len();
     for (i, &(off, fsblock, count)) in extents.iter().enumerate() {
         let rec = encode_extent(false, off, fsblock, count as u64);
         let pos = hdr + i * BMBT_REC_SIZE;
