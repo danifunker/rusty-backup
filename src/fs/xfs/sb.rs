@@ -19,6 +19,11 @@ const XFS_SB_FEAT_INCOMPAT_NREXT64: u32 = 1 << 5;
 const XFS_SB_FEAT_INCOMPAT_METADIR: u32 = 1 << 8;
 const XFS_SB_FEAT_INCOMPAT_ZONED: u32 = 1 << 9;
 
+/// `META_UUID` incompat bit. When set, metadata block CRC headers carry
+/// `sb_meta_uuid` instead of `sb_uuid` — every metadata-stamping site must
+/// route through [`XfsSuperblock::meta_uuid`].
+const XFS_SB_FEAT_INCOMPAT_META_UUID: u32 = 1 << 2;
+
 /// Parsed XFS superblock. Only the fields Step 5 needs to look up the root
 /// inode (and a few cosmetic fields for `fs_type` / `volume_label`).
 #[derive(Debug, Clone)]
@@ -64,6 +69,15 @@ pub struct XfsSuperblock {
     pub features_compat: u32,
     pub features_ro_compat: u32,
     pub features_incompat: u32,
+    /// `sb_uuid` (offset 32, 16 bytes). User-visible filesystem identity;
+    /// also stamped on every metadata block's CRC header when META_UUID is
+    /// not set (the common case).
+    pub sb_uuid: [u8; 16],
+    /// `sb_meta_uuid` (v5 only, offset 248, 16 bytes). Stamped on metadata
+    /// when the META_UUID incompat bit is set. Defaults to a copy of
+    /// `sb_uuid` on v4 / when META_UUID is off; [`meta_uuid`] picks the
+    /// right one.
+    pub sb_meta_uuid: [u8; 16],
 }
 
 impl XfsSuperblock {
@@ -132,6 +146,16 @@ impl XfsSuperblock {
             }
         }
 
+        let mut sb_uuid = [0u8; 16];
+        sb_uuid.copy_from_slice(&buf[32..48]);
+        // sb_meta_uuid only exists on v5 (offset 248, needs the buffer to be
+        // at least 264 bytes). On v4 we just mirror sb_uuid so callers can
+        // unconditionally `meta_uuid()` without v5 dispatch.
+        let mut sb_meta_uuid = sb_uuid;
+        if is_v5 && buf.len() >= 264 {
+            sb_meta_uuid.copy_from_slice(&buf[248..264]);
+        }
+
         Ok(XfsSuperblock {
             magicnum,
             blocksize,
@@ -163,6 +187,8 @@ impl XfsSuperblock {
             features_compat,
             features_ro_compat,
             features_incompat,
+            sb_uuid,
+            sb_meta_uuid,
         })
     }
 
@@ -188,6 +214,18 @@ impl XfsSuperblock {
     /// True iff this is a v5 (CRC-enabled, dir3) filesystem.
     pub fn is_v5(&self) -> bool {
         (self.versionnum & XFS_SB_VERSION_NUMBITS) == XFS_SB_VERSION_5
+    }
+
+    /// The UUID every metadata-block CRC header carries. v5 with the
+    /// META_UUID incompat bit set uses `sb_meta_uuid`; everything else uses
+    /// `sb_uuid`. v4 callers can still use this — `sb_meta_uuid` is mirrored
+    /// from `sb_uuid` at parse time.
+    pub fn meta_uuid(&self) -> &[u8; 16] {
+        if self.is_v5() && (self.features_incompat & XFS_SB_FEAT_INCOMPAT_META_UUID) != 0 {
+            &self.sb_meta_uuid
+        } else {
+            &self.sb_uuid
+        }
     }
 
     /// True iff the DIRV2 bit is set (dir2 layout). v5 implies dir3 which is

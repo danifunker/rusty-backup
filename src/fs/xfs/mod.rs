@@ -32,6 +32,7 @@ pub mod repair;
 pub mod sb;
 pub mod symlink;
 pub mod types;
+pub mod v5_crc;
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -2770,6 +2771,42 @@ mod tests {
         let n = fs.write_file_to(hostname, &mut streamed).expect("stream");
         assert_eq!(n, hostname.size);
         assert_eq!(streamed, direct);
+    }
+
+    /// Cross-check the E.1 CRC primitive against on-disk v5 metadata blocks:
+    /// the root inode (v3 core) and the AGF/AGI/SB CRC fields. If our
+    /// `stamp_crc` produced anything other than what mkfs.xfs put there, the
+    /// equality fails and every v5 write would write garbage.
+    #[test]
+    fn v5_crc_primitive_matches_on_disk_root_inode_and_ag_headers() {
+        use crate::fs::xfs::v5_crc::{
+            crc_valid, AGF_CRC_OFF, AGI_CRC_OFF, INODE_V3_DI_CRC_OFF, SB_CRC_OFF,
+        };
+
+        let img = load_modern_fixture();
+        let mut fs = XfsFilesystem::open(Cursor::new(img), 0).expect("open xfs v5");
+        let sb = fs.superblock().clone();
+        assert!(sb.is_v5());
+
+        // Superblock CRC over the first sector.
+        let sb_sec = img[..sb.sectsize as usize].to_vec();
+        assert!(crc_valid(&sb_sec, SB_CRC_OFF), "superblock CRC mismatch");
+
+        // AG 0 AGF (sector 1) + AGI (sector 2).
+        let sectsize = sb.sectsize as usize;
+        let agf = img[sectsize..2 * sectsize].to_vec();
+        assert!(crc_valid(&agf, AGF_CRC_OFF), "AGF CRC mismatch");
+        let agi = img[2 * sectsize..3 * sectsize].to_vec();
+        assert!(crc_valid(&agi, AGI_CRC_OFF), "AGI CRC mismatch");
+
+        // Root inode v3 core CRC — sized to inodesize, located via the
+        // existing inode reader.
+        let (_core, ibuf) = fs.read_inode_buf(sb.rootino).expect("read root inode");
+        assert_eq!(ibuf.len(), sb.inodesize as usize);
+        assert!(
+            crc_valid(&ibuf, INODE_V3_DI_CRC_OFF),
+            "root inode di_crc mismatch"
+        );
     }
 
     #[test]
