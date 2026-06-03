@@ -1,5 +1,6 @@
 pub mod alignment;
 pub mod apm;
+pub mod atari;
 pub mod editor;
 pub mod gpt;
 pub mod mbr;
@@ -11,6 +12,7 @@ use std::io::{Read, Seek, SeekFrom};
 
 use crate::error::RustyBackupError;
 use apm::Apm;
+use atari::{looks_like_ahdi_root, AhdiPartitionKind, AhdiTable, AHDI_NUM_SLOTS};
 use gpt::Gpt;
 use mbr::Mbr;
 use rdb::{Rdb, RDSK_SIGNATURE};
@@ -34,6 +36,10 @@ pub enum PartitionTable {
     /// plus a volume directory of standalone executables (`sash`, `ide`,
     /// `/unix`); see `src/partition/sgi.rs`.
     Sgi(SgiVolumeHeader),
+    /// Atari HD File System Driver — MBR-equivalent for Atari ST / TT / Falcon
+    /// hard-disk images. 4 primary slots + XGM extended chains, big-endian,
+    /// no boot signature; see `src/partition/atari.rs`.
+    Ahdi(AhdiTable),
     /// Superfloppy / floppy: no partition table, filesystem at sector 0.
     None {
         /// Total disk size in bytes (needed to synthesize partition info).
@@ -287,6 +293,35 @@ impl PartitionTable {
             reader.seek(SeekFrom::Start(0))?;
         }
 
+        // Check for AHDI (Atari ST/TT/Falcon hard disks). AHDI has no magic
+        // number; the probe runs only on sectors that lack the 0xAA55 MBR
+        // signature and have at least one validly-shaped partition entry
+        // whose geometry fits the disk size. This must come BEFORE the
+        // superfloppy probe because AHDI disks are HDD-shaped (start at
+        // sector > 0) — superfloppy would not match them anyway, but the
+        // ordering keeps the intent clear.
+        let disk_size_bytes = reader
+            .seek(SeekFrom::End(0))
+            .map_err(RustyBackupError::Io)?;
+        if looks_like_ahdi_root(&mbr_data, disk_size_bytes) {
+            reader
+                .seek(SeekFrom::Start(0))
+                .map_err(RustyBackupError::Io)?;
+            if let Ok(table) = AhdiTable::detect_and_walk(reader, disk_size_bytes) {
+                return Ok(PartitionTable::Ahdi(table));
+            }
+            // Fall through if walking failed (XGM cycle, etc.) — the
+            // superfloppy / MBR paths still get a chance below.
+            reader
+                .seek(SeekFrom::Start(0))
+                .map_err(RustyBackupError::Io)?;
+        } else {
+            // Restore reader position for the superfloppy probe.
+            reader
+                .seek(SeekFrom::Start(0))
+                .map_err(RustyBackupError::Io)?;
+        }
+
         // Check for superfloppy (no partition table) before MBR parsing
         if let Some(fs_hint) = detect_superfloppy(&mbr_data, reader) {
             // Get disk size via seek to end
@@ -512,6 +547,48 @@ impl PartitionTable {
                     drv_name: Some(p.drv_name.clone()),
                 })
                 .collect(),
+            PartitionTable::Ahdi(table) => {
+                let mut out: Vec<PartitionInfo> = Vec::new();
+                for (i, e) in table.primary.iter().enumerate() {
+                    if e.is_empty() || !e.exists() {
+                        continue;
+                    }
+                    // XGM is a container, not a filesystem — surface it so the
+                    // user sees the table shape but don't emit a separate row
+                    // when its logical children are about to follow.
+                    out.push(PartitionInfo {
+                        index: i,
+                        type_name: format!("AHDI {}", e.kind.display_name()),
+                        partition_type_byte: e.kind.synthetic_type_byte(),
+                        start_lba: e.start_sector as u64,
+                        size_bytes: e.size_bytes(),
+                        bootable: e.bootable(),
+                        is_logical: false,
+                        is_extended_container: matches!(e.kind, AhdiPartitionKind::Xgm),
+                        partition_type_string: None,
+                        hfs_block_size: None,
+                        rdb_part_block: None,
+                        drv_name: None,
+                    });
+                }
+                for (j, e) in table.logical.iter().enumerate() {
+                    out.push(PartitionInfo {
+                        index: AHDI_NUM_SLOTS + j,
+                        type_name: format!("AHDI {}", e.kind.display_name()),
+                        partition_type_byte: e.kind.synthetic_type_byte(),
+                        start_lba: e.start_sector as u64,
+                        size_bytes: e.size_bytes(),
+                        bootable: e.bootable(),
+                        is_logical: true,
+                        is_extended_container: false,
+                        partition_type_string: None,
+                        hfs_block_size: None,
+                        rdb_part_block: None,
+                        drv_name: None,
+                    });
+                }
+                out
+            }
             PartitionTable::None {
                 size_bytes,
                 fs_hint,
@@ -559,6 +636,7 @@ impl PartitionTable {
             PartitionTable::Apm(_) => "APM",
             PartitionTable::Rdb(_) => "RDB",
             PartitionTable::Sgi(_) => "SGI",
+            PartitionTable::Ahdi(_) => "AHDI",
             PartitionTable::None { .. } => "None",
         }
     }
@@ -572,6 +650,7 @@ impl PartitionTable {
             PartitionTable::Apm(_)
             | PartitionTable::Rdb(_)
             | PartitionTable::Sgi(_)
+            | PartitionTable::Ahdi(_)
             | PartitionTable::None { .. } => 0,
         }
     }
@@ -1051,6 +1130,83 @@ mod tests {
             xfs.partition_type_string.is_none(),
             "SGI partitions must route by type byte, not string"
         );
+    }
+
+    #[test]
+    fn test_detect_ahdi_two_partitions() {
+        use byteorder::{BigEndian, ByteOrder};
+        // Build a synthetic AHDI disk: 32 MiB, with GEM @ sector 2 (8 MiB)
+        // and BGM @ sector 16386 (8 MiB). No 0xAA55 trailing signature.
+        let disk_sectors: usize = 65_536;
+        let mut disk = vec![0u8; disk_sectors * 512];
+
+        // GEM at slot 0
+        let s0 = 0x1C6;
+        disk[s0] = 0x01;
+        disk[s0 + 1..s0 + 4].copy_from_slice(b"GEM");
+        BigEndian::write_u32(&mut disk[s0 + 4..s0 + 8], 2);
+        BigEndian::write_u32(&mut disk[s0 + 8..s0 + 12], 16_384);
+
+        // BGM at slot 1
+        let s1 = 0x1C6 + 12;
+        disk[s1] = 0x01;
+        disk[s1 + 1..s1 + 4].copy_from_slice(b"BGM");
+        BigEndian::write_u32(&mut disk[s1 + 4..s1 + 8], 16_386);
+        BigEndian::write_u32(&mut disk[s1 + 8..s1 + 12], 16_384);
+
+        // Disk size field
+        BigEndian::write_u32(&mut disk[0x1F6..0x1FA], disk_sectors as u32);
+
+        // Stamp the AHDI checksum so checksum_valid is true.
+        let mut sum: u32 = 0;
+        for chunk in disk[..512].chunks_exact(2) {
+            sum = sum.wrapping_add(u16::from_be_bytes([chunk[0], chunk[1]]) as u32);
+        }
+        let cksum = ((0x1234u32.wrapping_sub(sum)) & 0xFFFF) as u16;
+        BigEndian::write_u16(&mut disk[0x1FE..0x200], cksum);
+
+        let mut cursor = Cursor::new(disk);
+        let table = PartitionTable::detect(&mut cursor).expect("AHDI detected");
+        assert_eq!(table.type_name(), "AHDI");
+        let parts = table.partitions();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].type_name, "AHDI GEM");
+        assert_eq!(parts[0].start_lba, 2);
+        assert_eq!(parts[0].size_bytes, 16_384u64 * 512);
+        assert_eq!(parts[0].partition_type_byte, 0x01); // FAT12
+        assert_eq!(parts[1].type_name, "AHDI BGM");
+        assert_eq!(parts[1].partition_type_byte, 0x06); // FAT16
+        assert!(!parts[0].is_logical);
+        assert!(!parts[0].is_extended_container);
+    }
+
+    #[test]
+    fn test_detect_ahdi_does_not_fire_on_fat_superfloppy() {
+        // A FAT12 floppy must still resolve to PartitionTable::None — the
+        // AHDI probe should reject when the BPB is valid (`0xEB` JMP + valid
+        // BPB fields) and there is no clean AHDI partition entry shape at
+        // 0x1C6+.
+        let mut data = vec![0u8; 1_474_560];
+        data[0] = 0xEB;
+        data[1] = 0x3C;
+        data[2] = 0x90;
+        data[3..11].copy_from_slice(b"MSDOS5.0");
+        data[11] = 0x00; // 512 bps
+        data[12] = 0x02;
+        data[13] = 0x01;
+        data[14] = 0x01;
+        data[15] = 0x00;
+        data[16] = 0x02;
+        data[21] = 0xF0;
+        // Leave bytes 446..510 zero so the AHDI entries at 0x1C6 are all
+        // empty. AHDI would reject — no exists() entry.
+        data[510] = 0x55;
+        data[511] = 0xAA;
+
+        let mut cursor = Cursor::new(data);
+        let table = PartitionTable::detect(&mut cursor).unwrap();
+        assert_eq!(table.type_name(), "None");
+        assert_eq!(table.partitions()[0].type_name, "FAT");
     }
 
     #[test]

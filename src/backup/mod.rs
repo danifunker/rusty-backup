@@ -524,6 +524,18 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             );
             bail!("backing up SGI disks is not yet supported (browse only)");
         }
+        PartitionTable::Ahdi(table) => {
+            // Mirror the RDB / SGI sidecar shape: emit ahdi.json so a future
+            // restore knows the AHDI primary slots, XGM chain, and disk-size
+            // / bad-sector fields. Per-partition FAT data backup rides the
+            // standard layout-preserving path through the existing FAT
+            // pipeline.
+            let json = serde_json::to_string_pretty(table)
+                .context("failed to serialize AHDI table to JSON")?;
+            std::fs::write(backup_folder.join("ahdi.json"), json)
+                .context("failed to write ahdi.json")?;
+            log(&progress, LogLevel::Info, "Exported AHDI (ahdi.json)");
+        }
         PartitionTable::None { fs_hint, .. } => {
             log(
                 &progress,

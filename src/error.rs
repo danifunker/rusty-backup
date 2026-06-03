@@ -20,6 +20,9 @@ pub enum RustyBackupError {
     #[error("Invalid RDB: {0}")]
     InvalidRdb(String),
 
+    #[error("Invalid AHDI: {0}")]
+    InvalidAhdi(String),
+
     #[error("Device is currently mounted: {0}")]
     DeviceMounted(String),
 
