@@ -38,6 +38,7 @@
 //! * Linux `fs/jfs/jfs_superblock.h` — kernel mirror of the same struct.
 //! * `partimage-0.6.9/src/client/fs/fs_jfs.cpp` — Tier-A reference port.
 
+use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 
 use super::entry::FileEntry;
@@ -350,6 +351,12 @@ pub struct JfsFilesystem<R> {
     /// across multiple calls. We never clear it — the BMAP doesn't
     /// change under us in read-only mode.
     bmap_walk_cache: Option<BmapWalk>,
+    /// Per-IAG cache keyed by `iag_no = fino / (INOSPEREXT * EXTSPERIAG)`.
+    /// Populated on first access via `iag_for_fino` / `read_fileset_iag_at`
+    /// and never cleared (read-only mode — the FILESYSTEM_I inode's
+    /// xtree doesn't change under us). A directory list of N children
+    /// across K IAGs costs K logical-page reads instead of N.
+    iag_cache: HashMap<u32, FilesetIag>,
 }
 
 impl<R: Read + Seek + Send> JfsFilesystem<R> {
@@ -476,6 +483,7 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
             total_byte_extent,
             label,
             bmap_walk_cache: None,
+            iag_cache: HashMap::new(),
         })
     }
 
@@ -509,25 +517,40 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
 
     // ---- J.3: fileset + iag + dtree + per-user-inode read ----
 
-    /// Read fileset 1's IAG (Inode Allocation Group) page 0 from the
-    /// FILESYSTEM_I inode's data area. Returns the parsed inoext[]
-    /// PXD array — slot `extent_idx` describes the disk extent that
-    /// holds fileset inodes `extent_idx * INOSPEREXT .. +INOSPEREXT`.
-    pub(crate) fn read_fileset_iag(&mut self) -> Result<FilesetIag, FilesystemError> {
+    /// Read fileset 1's IAG number `iag_no` from FILESYSTEM_I. The
+    /// fileset inode's logical-page layout is
+    /// `page 0 = dinomap_disk header, page 1 = IAG 0, page 2 = IAG 1,
+    /// ...`, so IAG `n` lives at logical page `1 + n`. Refuses
+    /// `iag_no` past `(di_size / PSIZE) - 1` (the last allocated page,
+    /// minus the dinomap header). Multi-IAG filesets are now supported
+    /// — past `EXTSPERIAG * INOSPEREXT = 4096` inodes the dispatch
+    /// routes through here via [`Self::iag_for_fino`].
+    pub(crate) fn read_fileset_iag_at(
+        &mut self,
+        iag_no: u32,
+    ) -> Result<FilesetIag, FilesystemError> {
         let fs_ino = self.read_ait_inode(FILESYSTEM_I)?;
         let xtroot = self.parse_inline_xtree_root(&fs_ino.raw)?;
-        // Multi-IAG filesets (> 4096 inodes) are still parked — only IAG 0
-        // is read for now, and read_fileset_inode caps `fino` at
-        // INOSPEREXT * EXTSPERIAG = 4096. FILESYSTEM_I's logical layout
-        // is `page 0 = dinomap_disk header, page 1 = IAG 0, page 2 =
-        // IAG 1, ...`; we refuse here when `di_size` claims more than
-        // 2 pages (≤ 8 KiB ⇒ single IAG).
-        if fs_ino.size > 2 * PSIZE {
+        // FILESYSTEM_I's logical-page count cap: di_size / PSIZE. Page 0
+        // is the dinomap header, so the maximum legal `iag_no` is
+        // `(di_size / PSIZE).saturating_sub(1) - 1` — but be conservative
+        // and compute it via div_ceil so a partially-allocated last page
+        // is still walked.
+        let logical_pages = fs_ino.size.div_ceil(PSIZE);
+        if logical_pages < 2 {
+            return Err(FilesystemError::Parse(format!(
+                "jfs: FILESYSTEM_I di_size {} bytes is too small to hold any IAG \
+                 (need ≥ 2 logical pages)",
+                fs_ino.size
+            )));
+        }
+        let max_iag = (logical_pages - 1) as u32; // exclusive
+        if iag_no >= max_iag {
             return Err(FilesystemError::Unsupported(format!(
-                "JFS: FILESYSTEM_I di_size {} bytes implies multi-IAG fileset \
-                 (> {} inodes) — multi-IAG dispatch not yet implemented",
+                "jfs: requested IAG {iag_no} is past the fileset's last IAG \
+                 (di_size = {} bytes ⇒ max iag_no = {})",
                 fs_ino.size,
-                INOSPEREXT * EXTSPERIAG as u32
+                max_iag.saturating_sub(1)
             )));
         }
         if xtroot.xads.is_empty() {
@@ -535,15 +558,12 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
                 "jfs: FILESYSTEM_I inode has no xtree entries".into(),
             ));
         }
-        // FILESYSTEM_I data: page 0 = dinomap_disk header (we skip
-        // it), page 1 = first IAG. Descends internal xtpages when the
-        // xtroot is INTERNAL — the walker handles the depth.
-        let iag_page = self.read_inode_logical_page(&xtroot, 1)?;
+        let iag_page = self.read_inode_logical_page(&xtroot, 1 + iag_no as u64)?;
         let agstart = u64::from_le_bytes(iag_page[0..8].try_into().unwrap());
         let iagnum = u32::from_le_bytes(iag_page[8..12].try_into().unwrap());
-        if iagnum != 0 {
+        if iagnum != iag_no {
             return Err(FilesystemError::Parse(format!(
-                "jfs: first IAG has iagnum {iagnum} != 0"
+                "jfs: IAG {iag_no} page reports iagnum {iagnum} (expected {iag_no})"
             )));
         }
 
@@ -566,6 +586,42 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
         })
     }
 
+    /// IAG index for a global fileset inode number. Fileset inodes are
+    /// laid out densely across the IAGs, so `fino` `[0, 4095]` lives in
+    /// IAG 0, `[4096, 8191]` in IAG 1, and so on.
+    fn iag_no_for_fino(fino: u32) -> u32 {
+        fino / (INOSPEREXT * EXTSPERIAG as u32)
+    }
+
+    /// Fetch IAG `iag_no` from the cache, populating it on miss. Returns
+    /// a `Clone` of the cached entry to keep callers from holding a
+    /// `&mut self` borrow across subsequent reads (the cache lives on
+    /// `self`). The IAG payload is small (a few KiB) so cloning isn't
+    /// a hot-path concern.
+    pub(crate) fn iag_for_fino(&mut self, fino: u32) -> Result<FilesetIag, FilesystemError> {
+        let iag_no = Self::iag_no_for_fino(fino);
+        if let Some(hit) = self.iag_cache.get(&iag_no) {
+            return Ok(hit.clone());
+        }
+        let iag = self.read_fileset_iag_at(iag_no)?;
+        self.iag_cache.insert(iag_no, iag.clone());
+        Ok(iag)
+    }
+
+    /// Read fileset inode `fino` end-to-end: locate the right IAG via
+    /// the cache, then dispatch the per-extent lookup. This is the
+    /// preferred entry point for trait-layer code (`root` /
+    /// `list_directory` / `read_file`) — it removes the
+    /// "single-IAG only" cap that the older `read_fileset_inode(fino,
+    /// &iag)` form imposed when the caller eagerly loaded IAG 0.
+    pub(crate) fn read_fileset_inode_global(
+        &mut self,
+        fino: u32,
+    ) -> Result<JfsDinode, FilesystemError> {
+        let iag = self.iag_for_fino(fino)?;
+        self.read_fileset_inode(fino, &iag)
+    }
+
     /// Read logical page `logical_page` from an inode's data area via
     /// the xtree root. Descends through any internal xtpages. Used by
     /// both BMAP and FILESYSTEM_I walks.
@@ -578,36 +634,40 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
     }
 
     /// Read fileset inode `fino` (a user-fileset inode number) via the
-    /// IAG's inoext[] array. The dinode lives at byte
-    /// `inoext[fino/32].address * bsize + (fino % 32) * DISIZE`.
+    /// supplied IAG's `inoext[]` array. `fino` is the global fileset
+    /// inode number; the IAG passed must be the one covering it (i.e.
+    /// `iag.iagnum == Self::iag_no_for_fino(fino)`). The dinode lives
+    /// at byte `inoext[idx_in_iag].address * bsize + (fino % 32) *
+    /// DISIZE` where `idx_in_iag = (fino / 32) % EXTSPERIAG`.
     pub(crate) fn read_fileset_inode(
         &mut self,
         fino: u32,
         iag: &FilesetIag,
     ) -> Result<JfsDinode, FilesystemError> {
-        let extent_idx = (fino / INOSPEREXT) as usize;
-        let in_extent = (fino % INOSPEREXT) as u64;
-        if extent_idx >= EXTSPERIAG {
-            return Err(FilesystemError::Unsupported(format!(
-                "jfs: fileset inode {fino} would require IAG {} (only IAG 0 \
-                 supported in this first slice)",
-                fino / (INOSPEREXT * EXTSPERIAG as u32)
+        let expected_iag = Self::iag_no_for_fino(fino);
+        if iag.iagnum != expected_iag {
+            return Err(FilesystemError::Parse(format!(
+                "jfs: read_fileset_inode: inode {fino} belongs in IAG {expected_iag} \
+                 but caller supplied IAG {}",
+                iag.iagnum
             )));
         }
-        let pxd = iag.inoext[extent_idx];
+        let local_extent = ((fino / INOSPEREXT) as usize) % EXTSPERIAG;
+        let in_extent = (fino % INOSPEREXT) as u64;
+        let pxd = iag.inoext[local_extent];
         if pxd.length == 0 {
             return Err(FilesystemError::Parse(format!(
-                "jfs: fileset inode {fino}: inoext[{extent_idx}] is empty \
+                "jfs: fileset inode {fino}: inoext[{local_extent}] is empty \
                  (extent not allocated)"
             )));
         }
-        // Verify the pmap bit is set — bit (31 - extent_idx%32) of
-        // word extent_idx/32, MSB-first.
-        let pmap_word = iag.pmap[extent_idx / 32];
-        let pmap_bit_pos = 31 - (extent_idx % 32);
+        // Verify the pmap bit is set — bit (31 - local_extent%32) of
+        // word local_extent/32, MSB-first.
+        let pmap_word = iag.pmap[local_extent / 32];
+        let pmap_bit_pos = 31 - (local_extent % 32);
         if (pmap_word >> pmap_bit_pos) & 1 != 1 {
             return Err(FilesystemError::Parse(format!(
-                "jfs: fileset inode {fino}: pmap says extent {extent_idx} is free"
+                "jfs: fileset inode {fino}: pmap says extent {local_extent} is free"
             )));
         }
 
@@ -1451,8 +1511,7 @@ fn parse_label(bytes: &[u8]) -> Option<String> {
 
 impl<R: Read + Seek + Send> Filesystem for JfsFilesystem<R> {
     fn root(&mut self) -> Result<FileEntry, FilesystemError> {
-        let iag = self.read_fileset_iag()?;
-        let root_dinode = self.read_fileset_inode(FILESET_ROOT_INO, &iag)?;
+        let root_dinode = self.read_fileset_inode_global(FILESET_ROOT_INO)?;
         let mut entry = FileEntry::root();
         entry.location = FILESET_ROOT_INO as u64;
         entry.mode = Some(root_dinode.mode & 0xFFFF);
@@ -1468,8 +1527,7 @@ impl<R: Read + Seek + Send> Filesystem for JfsFilesystem<R> {
 
     fn list_directory(&mut self, entry: &FileEntry) -> Result<Vec<FileEntry>, FilesystemError> {
         let fino = entry.location as u32;
-        let iag = self.read_fileset_iag()?;
-        let dir_dinode = self.read_fileset_inode(fino, &iag)?;
+        let dir_dinode = self.read_fileset_inode_global(fino)?;
         if !dir_dinode.is_directory() {
             return Err(FilesystemError::Parse(format!(
                 "jfs: list_directory on inode {fino} which is not a directory \
@@ -1481,7 +1539,10 @@ impl<R: Read + Seek + Send> Filesystem for JfsFilesystem<R> {
         let mut out: Vec<FileEntry> = Vec::with_capacity(raw_entries.len());
         let parent_path = entry.path.as_str();
         for raw in raw_entries {
-            let child_dinode = self.read_fileset_inode(raw.inumber, &iag)?;
+            // `read_fileset_inode_global` re-resolves the IAG per inum so
+            // a directory whose children straddle IAGs (common past
+            // 4096 inodes) Just Works — the cache makes repeats free.
+            let child_dinode = self.read_fileset_inode_global(raw.inumber)?;
             let child_entry = self.build_user_entry(&raw.name, parent_path, &child_dinode)?;
             out.push(child_entry);
         }
@@ -1494,8 +1555,7 @@ impl<R: Read + Seek + Send> Filesystem for JfsFilesystem<R> {
         max_bytes: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
         let fino = entry.location as u32;
-        let iag = self.read_fileset_iag()?;
-        let dinode = self.read_fileset_inode(fino, &iag)?;
+        let dinode = self.read_fileset_inode_global(fino)?;
         match dinode.posix_type() {
             S_IFREG => self.read_file_data(&dinode, max_bytes),
             S_IFLNK => {
@@ -2378,7 +2438,7 @@ mod tests {
         // allocated), inoext[0] = (len=4, addr=28).
         let img = load_fixture("test_jfs.img.zst");
         let mut fs = JfsFilesystem::open(Cursor::new(img), 0).expect("open");
-        let iag = fs.read_fileset_iag().expect("read IAG");
+        let iag = fs.read_fileset_iag_at(0).expect("read IAG 0");
         assert_eq!(iag.iagnum, 0);
         assert_eq!(iag.inoext[0].length, 4);
         assert_eq!(iag.inoext[0].address, 28);
@@ -2392,7 +2452,7 @@ mod tests {
     fn fixture_reads_fileset_root_inode() {
         let img = load_fixture("test_jfs.img.zst");
         let mut fs = JfsFilesystem::open(Cursor::new(img), 0).expect("open");
-        let iag = fs.read_fileset_iag().expect("read IAG");
+        let iag = fs.read_fileset_iag_at(0).expect("read IAG 0");
         let root = fs
             .read_fileset_inode(FILESET_ROOT_INO, &iag)
             .expect("read root");
@@ -2402,6 +2462,82 @@ mod tests {
         assert_eq!(root.nlink, 3);
         assert_eq!(root.mode & 0xFFFF, 0o40755);
         assert!(root.is_directory());
+    }
+
+    /// `iag_no_for_fino` is the pure-math arithmetic the dispatch keys
+    /// off; this nails down the EXTSPERIAG * INOSPEREXT (= 4096) split
+    /// so the fileset_inode_global router routes correctly regardless of
+    /// what fixture we're running against.
+    #[test]
+    fn iag_no_for_fino_splits_every_4096_inodes() {
+        type Fs = JfsFilesystem<Cursor<Vec<u8>>>;
+        assert_eq!(Fs::iag_no_for_fino(0), 0);
+        assert_eq!(Fs::iag_no_for_fino(FILESET_ROOT_INO), 0);
+        assert_eq!(Fs::iag_no_for_fino(4095), 0);
+        assert_eq!(Fs::iag_no_for_fino(4096), 1);
+        assert_eq!(Fs::iag_no_for_fino(8191), 1);
+        assert_eq!(Fs::iag_no_for_fino(8192), 2);
+        assert_eq!(Fs::iag_no_for_fino(40_960), 10);
+    }
+
+    /// The IAG cache short-circuits a second `iag_for_fino` call for the
+    /// same IAG. We exercise this via the single-IAG fixture and assert
+    /// the cache map size grows by 1 after the first call and stays at 1
+    /// after the second.
+    #[test]
+    fn iag_cache_short_circuits_second_lookup_for_same_iag() {
+        let img = load_fixture("test_jfs.img.zst");
+        let mut fs = JfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        assert_eq!(fs.iag_cache.len(), 0);
+        let _ = fs.iag_for_fino(FILESET_ROOT_INO).expect("first lookup");
+        assert_eq!(fs.iag_cache.len(), 1);
+        let _ = fs.iag_for_fino(FILESET_ROOT_INO).expect("second lookup");
+        assert_eq!(fs.iag_cache.len(), 1, "no extra IAG should be cached");
+        // A different inode in the same IAG hits the same cache slot.
+        let _ = fs.iag_for_fino(7).expect("third lookup, same IAG");
+        assert_eq!(fs.iag_cache.len(), 1, "still only IAG 0 cached");
+    }
+
+    /// `read_fileset_inode_global` is the new dispatch entry point. The
+    /// existing fixture has 5 user entries plus the root; verifying that
+    /// the dispatch reads the root back identically to the
+    /// per-IAG-supplied form locks the routing math down.
+    #[test]
+    fn read_fileset_inode_global_matches_iag_supplied_form() {
+        let img = load_fixture("test_jfs.img.zst");
+        let mut fs = JfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let iag0 = fs.read_fileset_iag_at(0).expect("read IAG 0");
+        let via_iag = fs
+            .read_fileset_inode(FILESET_ROOT_INO, &iag0)
+            .expect("read root via iag");
+        let via_dispatch = fs
+            .read_fileset_inode_global(FILESET_ROOT_INO)
+            .expect("read root via dispatch");
+        assert_eq!(via_iag.di_number, via_dispatch.di_number);
+        assert_eq!(via_iag.size, via_dispatch.size);
+        assert_eq!(via_iag.nlink, via_dispatch.nlink);
+        assert_eq!(via_iag.mode, via_dispatch.mode);
+    }
+
+    /// `read_fileset_inode` now refuses an IAG/fino mismatch. This guards
+    /// against future refactors that accidentally pass IAG 0 for a fino
+    /// outside it — symptoms would otherwise be silent garbage rather
+    /// than a clear error.
+    #[test]
+    fn read_fileset_inode_rejects_iag_mismatch() {
+        let img = load_fixture("test_jfs.img.zst");
+        let mut fs = JfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let iag0 = fs.read_fileset_iag_at(0).expect("read IAG 0");
+        // 4096 is the first inum in IAG 1; supplying IAG 0 must fail.
+        let err = fs
+            .read_fileset_inode(4096, &iag0)
+            .expect_err("expected mismatch error");
+        match err {
+            FilesystemError::Parse(msg) => {
+                assert!(msg.contains("belongs in IAG 1"), "got: {msg}");
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2699,6 +2835,7 @@ mod tests {
             total_byte_extent: 0,
             label: None,
             bmap_walk_cache: None,
+            iag_cache: HashMap::new(),
         };
         let mut leaves: Vec<Xad> = Vec::new();
         fs.walk_xtree_leaves(&root, &mut |xad| leaves.push(*xad))
@@ -2739,6 +2876,7 @@ mod tests {
             total_byte_extent: 0,
             label: None,
             bmap_walk_cache: None,
+            iag_cache: HashMap::new(),
         };
         // Logical page 3 is covered by leaf_a's second XAD (logical 2,
         // length 2, addr 52). Within the extent, the page maps to
@@ -2777,6 +2915,7 @@ mod tests {
             total_byte_extent: 0,
             label: None,
             bmap_walk_cache: None,
+            iag_cache: HashMap::new(),
         };
         // Logical page 7 is past leaf_b's end (covers 4..7) — error.
         let err = fs
