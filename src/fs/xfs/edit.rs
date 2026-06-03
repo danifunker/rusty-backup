@@ -1620,9 +1620,11 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     }
 
     /// Remove `name` from directory `parent_ino`, dispatching by format:
-    /// short-form (inline rewrite) or single-block (rebuild in place). A
-    /// single-block directory is left in block form even if it shrinks small
-    /// (valid, just not re-compacted to short-form).
+    /// short-form (inline rewrite) or single-block (rebuild in place, then
+    /// attempt re-compaction back to short-form when the surviving entries
+    /// fit the inode literal area — §2.1 hole (B)). A single-block
+    /// directory whose entries still overflow the literal area stays in
+    /// block form.
     fn dir_remove_entry(
         &mut self,
         sb: &super::sb::XfsSuperblock,
@@ -1636,12 +1638,127 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                 self.sf_remove_entry(sb, parent_ino, name, child_was_dir)
             }
             super::types::DiFormat::Extents => {
-                self.block_remove_entry(sb, parent_ino, name, child_was_dir)
+                self.block_remove_entry(sb, parent_ino, name, child_was_dir)?;
+                self.try_recompact_block_dir_to_shortform(sb, parent_ino)
             }
             _ => Err(FilesystemError::Unsupported(
                 "parent directory format not editable (btree/leaf/node)".into(),
             )),
         }
+    }
+
+    /// After a block-form directory removal, try to re-compact it back to
+    /// short-form when the surviving entries fit the inode literal area
+    /// (§2.1 hole (B), the inverse of [`convert_sf_dir_to_block`]). Builds the
+    /// short-form fork bytes, frees the directory's data block(s) via
+    /// [`free_blocks`], and rewrites the inode (`di_format=Local`,
+    /// `di_size=sf_len`, `di_nblocks=0`, `di_nextents=0`). When recompaction
+    /// isn't possible — entries don't fit, an inode number needs 8 bytes
+    /// (`i8count`), or the directory has grown beyond a single block — the
+    /// volume is left untouched and the directory stays in block form.
+    /// Mirrors `xfs_dir2_block_to_sf`. v4 only.
+    fn try_recompact_block_dir_to_shortform(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        parent_ino: u64,
+    ) -> Result<(), FilesystemError> {
+        let has_ftype = sb.has_ftype();
+        let (core, buf) = self.read_inode_buf(parent_ino)?;
+        if !core.is_dir() || core.format != super::types::DiFormat::Extents {
+            return Ok(());
+        }
+        let extents = self.decode_data_extents(&core, &buf)?;
+        // Only a single-block directory (one extent at file-offset 0) is in
+        // scope; multi-block leaf/node dirs go through their own re-compaction
+        // path once hole (C) lands.
+        if extents.len() != 1 {
+            return Ok(());
+        }
+        let first = &extents[0];
+        if first.startoff != 0 {
+            return Ok(());
+        }
+        let dirblksize = sb.dirblksize() as usize;
+        let blocks_per_dir = (dirblksize as u64).div_ceil(sb.blocksize as u64) as u32;
+        let fsblock = first.startblock;
+        let (dotdot, entries) = self.read_block_dir_entries(sb, fsblock, dirblksize, has_ftype)?;
+
+        // 8-byte-inode short-form (`i8count > 0`) is not implemented; if any
+        // inode in scope needs 8 bytes, leave the directory in block form.
+        if parent_ino > u64::from(u32::MAX)
+            || dotdot > u64::from(u32::MAX)
+            || entries.iter().any(|(_, ino, _)| *ino > u64::from(u32::MAX))
+        {
+            return Ok(());
+        }
+
+        // Short-form size: header(count(1) + i8count(1) + parent(4)) + sum
+        // over entries of (namelen(1) + offset(2) + name + [ftype] + ino(4)).
+        let ino_width = 4usize;
+        let header = 2 + ino_width;
+        let entries_size: usize = entries
+            .iter()
+            .map(|(n, _, _)| 1 + 2 + n.len() + usize::from(has_ftype) + ino_width)
+            .sum();
+        let sf_size = header + entries_size;
+
+        // Available literal area: fork start (`fork_offset(false)`) up to
+        // either the attr-fork base (when `forkoff > 0`) or the inode end.
+        let fs = fork_offset(false);
+        let avail_end = if core.forkoff > 0 {
+            fs + (core.forkoff as usize) * 8
+        } else {
+            buf.len()
+        };
+        if fs + sf_size > avail_end {
+            return Ok(()); // doesn't fit; stay in block form
+        }
+
+        // Build the short-form fork bytes. Each entry's offset cookie is its
+        // byte position in the notional dir2 data block — starting after the
+        // synthetic "." and ".." and advancing by each entry's data-block
+        // size, matching how `sf_insert_entry` extends the fork.
+        let mut sf_fork = vec![0u8; sf_size];
+        sf_fork[0] = entries.len() as u8; // count
+        sf_fork[1] = 0; // i8count
+        BigEndian::write_u32(&mut sf_fork[2..6], dotdot as u32);
+
+        let mut data_off = XFS_DIR2_DATA_HDR_LEN
+            + dir2_data_entsize(1, has_ftype)  // "."
+            + dir2_data_entsize(2, has_ftype); // ".."
+        let mut pos = header;
+        for (name, ino, ft) in &entries {
+            let namelen = name.len();
+            sf_fork[pos] = namelen as u8;
+            BigEndian::write_u16(&mut sf_fork[pos + 1..pos + 3], data_off as u16);
+            pos += 3;
+            sf_fork[pos..pos + namelen].copy_from_slice(name.as_bytes());
+            pos += namelen;
+            if has_ftype {
+                sf_fork[pos] = *ft;
+                pos += 1;
+            }
+            BigEndian::write_u32(&mut sf_fork[pos..pos + 4], *ino as u32);
+            pos += 4;
+            data_off += dir2_data_entsize(namelen, has_ftype);
+        }
+        debug_assert_eq!(pos, sf_size);
+
+        // Return the block dir's data blocks to free space.
+        self.free_blocks(sb, &[(fsblock, blocks_per_dir)])?;
+
+        // Rewrite the inode as a short-form directory. Zero the literal area
+        // first so stale block-fork bytes can't leak through.
+        let (_core_now, mut ibuf) = self.read_inode_buf(parent_ino)?;
+        ibuf[5] = 1; // di_format = local
+        BigEndian::write_u64(&mut ibuf[56..64], sf_size as u64); // di_size
+        BigEndian::write_u64(&mut ibuf[64..72], 0); // di_nblocks
+        BigEndian::write_u32(&mut ibuf[76..80], 0); // di_nextents
+        for b in ibuf.iter_mut().take(avail_end).skip(fs) {
+            *b = 0;
+        }
+        ibuf[fs..fs + sf_size].copy_from_slice(&sf_fork);
+        self.write_inode_region(sb, parent_ino, &ibuf)
     }
 
     /// Remove `name` from a single-block directory by rebuilding the block

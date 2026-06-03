@@ -1584,6 +1584,118 @@ mod tests {
     }
 
     #[test]
+    fn block_dir_recompacts_to_shortform_on_shrink() {
+        // §2.1 hole (B): grow root to block form by adding 20 files, then
+        // delete them all. The block_remove_entry path is supposed to detect
+        // that the surviving (original) entries fit the inode literal area
+        // and re-compact back to short-form — di_format goes back to Local,
+        // di_nblocks/nextents back to 0, and the directory's data block is
+        // returned to free space. Originals survive, free space is fully
+        // reclaimed, the volume stays fsck-clean.
+        use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem};
+        use std::io::Cursor as IoCursor;
+
+        let img = load_fixture().to_vec();
+        let mut cursor = Cursor::new(img);
+
+        let (free_before, originals);
+        {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable");
+            free_before = fs.free_space().expect("free");
+            let root = fs.root().expect("root");
+            originals = fs
+                .list_directory(&root)
+                .expect("list")
+                .into_iter()
+                .map(|e| e.name)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                fs.read_inode(root.location).expect("root core").format,
+                DiFormat::Local,
+                "root starts short-form"
+            );
+            for i in 0..20 {
+                let mut data = IoCursor::new(Vec::<u8>::new());
+                fs.create_file(
+                    &root,
+                    &format!("added_{i:02}.dat"),
+                    &mut data,
+                    0,
+                    &CreateFileOptions::default(),
+                )
+                .unwrap_or_else(|e| panic!("create_file {i}: {e}"));
+            }
+            fs.sync_metadata().expect("sync");
+        }
+        // After 20 adds the root should have overflowed to block form.
+        {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("reopen editable");
+            let root = fs.root().expect("root");
+            assert_ne!(
+                fs.read_inode(root.location).expect("root core").format,
+                DiFormat::Local,
+                "root should be block form after 20 adds"
+            );
+
+            // Delete all 20 added files. The last delete should recompact.
+            let entries = fs.list_directory(&root).expect("list");
+            for i in 0..20 {
+                let want = format!("added_{i:02}.dat");
+                let e = entries
+                    .iter()
+                    .find(|e| e.name == want)
+                    .unwrap_or_else(|| panic!("missing {want}"));
+                fs.delete_entry(&root, e).expect("delete");
+            }
+            fs.sync_metadata().expect("sync");
+        }
+
+        // The root must be back in short-form, with originals intact, free
+        // space fully reclaimed, and the volume clean.
+        let repaired = cursor.into_inner();
+        let mut fs = XfsFilesystem::open(Cursor::new(repaired), 0).expect("reopen");
+        let root = fs.root().expect("root");
+        assert_eq!(
+            fs.read_inode(root.location).expect("root core").format,
+            DiFormat::Local,
+            "root should have re-compacted to short-form"
+        );
+        let core = fs.read_inode(root.location).expect("root core");
+        assert_eq!(core.nblocks, 0, "di_nblocks should be 0 after recompaction");
+        assert_eq!(
+            core.nextents, 0,
+            "di_nextents should be 0 after recompaction"
+        );
+
+        let entries = fs.list_directory(&root).expect("list");
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        for want in &originals {
+            assert!(
+                names.contains(&want.as_str()),
+                "original lost: {want} in {names:?}",
+            );
+        }
+        for i in 0..20 {
+            let unwanted = format!("added_{i:02}.dat");
+            assert!(
+                !names.contains(&unwanted.as_str()),
+                "added file not removed: {unwanted}"
+            );
+        }
+        let free_after = fs.free_space().expect("free");
+        assert_eq!(
+            free_after, free_before,
+            "free space not fully reclaimed after add+delete cycle"
+        );
+        let res = fs.run_fsck().expect("fsck");
+        assert!(
+            res.errors.is_empty(),
+            "expected clean after re-compaction, got: {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn create_file_in_shortform_root_roundtrips_data() {
         // Allocate an inode + data blocks + insert: create /payload.bin with a
         // known pattern, then read it back byte-for-byte and confirm the volume

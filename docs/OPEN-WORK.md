@@ -48,12 +48,8 @@ Open holes in v4 edit (suggested order — easiest/most reusable first):
 - **(A) new-chunk inode allocation** — **shipped 2026-06-02** (single-leaf
   + multi-level grow; see §10).
 
-- **(B) block → short-form dir re-compaction** — cosmetic. After
-  `block_remove_entry`, if surviving entries fit the inode literal area,
-  convert back to short-form: build the sf fork, free the dir data block
-  (`free_blocks`), set `di_format=Local`, `di_size=sf_len`, `nblocks=0`,
-  `nextents=0`. Ref `xfs_dir2_block_to_sf`. Oracle: grow a dir to block
-  form, delete down to a few entries → expect short-form again, clean.
+- **(B) block → short-form dir re-compaction** — **shipped 2026-06-02**
+  (see §10).
 
 - **(C) leaf/node (multi-block) directories** — the big directory item.
   Today `dir_insert_entry` returns `DiskFull` when a single-block dir
@@ -532,6 +528,25 @@ docs-consolidation pass.
   longest non-glob prefix of the pattern. Symlinks ride out as plain
   text files containing the target (lossy but cross-platform safe);
   specials skip with a one-line note.
+- **XFS hole (B) — block → short-form dir re-compaction** —
+  `dir_remove_entry` calls `try_recompact_block_dir_to_shortform` after
+  `block_remove_entry` rewrites the data block. The helper bails (no-op,
+  leaves dir in block form) when the dir is multi-extent / not at file
+  offset 0 / any inode > `u32::MAX` (8-byte short-form not implemented) /
+  the surviving entries don't fit the inode literal area. Otherwise: build
+  the short-form fork bytes (count + i8count=0 + parent + per-entry
+  `namelen(1) + offset(2) + name + [ftype] + ino(4)`, with offset cookies
+  matching the notional dir2 data-block positions starting after `.` /
+  `..`), `free_blocks` the directory's data block(s), and rewrite the
+  inode: `di_format=Local`, `di_size=sf_len`, `di_nblocks=0`,
+  `di_nextents=0`, literal area zeroed before the fork bytes are written
+  so stale block-fork bytes can't leak through. Mirrors
+  `xfs_dir2_block_to_sf`. v4 only. Test
+  `block_dir_recompacts_to_shortform_on_shrink` adds 20 files (forces
+  short-form → block conversion), deletes all 20 (last delete trips the
+  re-compaction), then verifies the root is back to `DiFormat::Local`
+  with `nblocks=0`/`nextents=0`, originals intact, free space fully
+  reclaimed, and the volume fsck-clean.
 - **XFS hole (A) — new-chunk inode allocation (single-leaf + multi-level
   grow)** — `alloc_inode_slot` lifted into
   `try_claim_slot_from_existing_chunks`; the new `alloc_new_inode_chunk`
