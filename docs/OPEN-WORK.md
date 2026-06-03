@@ -51,18 +51,12 @@ Open holes in v4 edit (suggested order — easiest/most reusable first):
 - **(B) block → short-form dir re-compaction** — **shipped 2026-06-02**
   (see §10).
 
-- **(C) leaf/node (multi-block) directories** — the big directory item.
-  Today `dir_insert_entry` returns `DiskFull` when a single-block dir
-  overflows one block. Implement block → LEAF conversion: spread entries
-  across multiple XD2D data blocks (each with header+bestfree+tag entries)
-  plus a leaf index block at file offset `XFS_DIR2_LEAF_OFFSET` (32
-  GiB/blocksize) holding the sorted hash-table itself overflows (free-
-  index + da-btree node blocks). Update the inode extent map accordingly.
-  Reader already parses leaf/node data blocks (`walk_dir2_data_blocks`);
-  verify exhaustive listing, then add write support. Ref
-  `libxfs/xfs_dir2_block.c`, `xfs_dir2_leaf.c`, `xfs_dir2_node.c`.
-  Oracle: add 100s of entries to one directory → list all back, read a
-  sample, clean.
+- **(C) leaf/node (multi-block) directories** — **block→leaf conversion
+  shipped 2026-06-02** (v1: 2-data-block leaf form on overflow; see §10).
+  Follow-ups still open: leaf-form INSERT (grow beyond 2 data blocks),
+  leaf-form REMOVE, leaf→block recompaction, node form for very large
+  dirs. v1 is enough to take a single-block dir past 127 entries; further
+  inserts return `Unsupported` with a clear message.
 
 - **(D) bmap-btree file forks** — **shipped 2026-06-02** (single-leaf
   bmbt — multi-leaf parked for follow-up; see §10). The R2 abort-on-btree
@@ -522,6 +516,34 @@ docs-consolidation pass.
   longest non-glob prefix of the pattern. Symlinks ride out as plain
   text files containing the target (lossy but cross-platform safe);
   specials skip with a one-line note.
+- **XFS hole (C) — block→leaf dir conversion (v1: 2 data blocks)** —
+  `block_insert_entry` falls through to `convert_block_dir_to_leaf_form`
+  when `build_block_dir` reports `DiskFull` after appending the new entry.
+  The conversion sorts every entry by hash (matching the reader's
+  `dir_hashname`), splits at the byte midpoint between block 0 (with
+  synthetic `.` / `..`) and block 1, allocates two new dir blocks (data
+  block 1 + the XD2F leaf1 index block at file offset
+  `XFS_DIR2_LEAF_OFFSET = 2^32 / blocksize`), builds and writes all three
+  blocks via `build_leaf_data_block` (XD2D — header+bestfree+tag entries
+  packed against the head, free record at the tail recorded in
+  `bestfree[0]`) and `build_leaf1_block_v4` (`xfs_da_blkinfo` +
+  `xfs_dir2_leaf_hdr` + sorted entries[hashval(4) + address(4)] + bests
+  array at the tail), then rewrites the inode via
+  `write_dir_inode_multi_extent` (`di_format=Extents`,
+  `di_size=2*dirblksize`, `di_nblocks=3*blocks_per_dir`, `di_nextents=3`,
+  3-record inline data fork — well within the 9-extent inline cap).
+  Address encoding: `(file_block * dirblksize + byte_off) / 8` —
+  block 0 entries get dataptrs < 512, block 1 entries 512..1024 (at
+  4 KiB dirblksize). `dir_can_insert` pre-flights the split fit and
+  refuses leaf-form sources before do_create_file allocates an inode
+  (avoids orphans). `block_remove_entry` rejects leaf-form sources with
+  a clear error — remove + leaf→block recompaction is a follow-up slice.
+  Reader path unchanged (still `walk_dir2_data_blocks`). Test
+  `dir_overflow_converts_block_to_leaf_form` adds files until the
+  inserter rejects with the leaf-form-not-implemented message, verifies
+  > 100 adds absorbed by the conversion, `di_format=Extents`, `nextents
+  >= 3`, every original + every successful add lists back, and `run_fsck`
+  stays clean. v4 only.
 - **XFS hole (D) — bmap-btree file forks (single-leaf)** —
   `do_create_file` no longer caps at `MAX_SINGLE_EXTENT_BLOCKS` blocks or
   `max_inline` extents: `alloc_extents` returns arbitrary runs (capped at

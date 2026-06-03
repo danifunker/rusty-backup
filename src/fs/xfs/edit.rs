@@ -1552,20 +1552,65 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                 .map(|_| ())
             }
             super::types::DiFormat::Extents => {
+                // Refuse insert into an already-leaf-form dir (multi-extent
+                // data fork). v1 of hole (C) ships block→leaf conversion only;
+                // leaf-form grow + lookup-by-hash isn't wired here yet. Catch
+                // it now, before do_create_file allocates an inode whose
+                // directory entry can't be inserted (would orphan it).
+                let extents = self.decode_data_extents(&core, &buf)?;
+                if extents.len() > 1 || extents.first().is_some_and(|e| e.startoff != 0) {
+                    return Err(FilesystemError::Unsupported(
+                        "insert into leaf/node-form directory not yet implemented".into(),
+                    ));
+                }
                 let ft = if new_is_dir {
                     XFS_DIR3_FT_DIR
                 } else {
                     XFS_DIR3_FT_REG_FILE
                 };
                 entries.push((name.to_string(), 0, ft));
-                build_block_dir(
-                    &entries,
-                    parent_ino,
-                    dotdot,
-                    sb.dirblksize() as usize,
-                    has_ftype,
-                )
-                .map(|_| ())
+                let dirblksize = sb.dirblksize() as usize;
+                match build_block_dir(&entries, parent_ino, dotdot, dirblksize, has_ftype) {
+                    Ok(_) => Ok(()),
+                    Err(FilesystemError::DiskFull(_)) => {
+                        // Single block would overflow — would convert to
+                        // leaf form. Pre-flight that the 2-data-block split
+                        // would actually fit (§2.1 hole (C)).
+                        let mut sorted = entries.clone();
+                        sorted.sort_by_key(|(n, _, _)| dir_hashname(n.as_bytes()));
+                        let dotdot_bytes =
+                            dir2_data_entsize(1, has_ftype) + dir2_data_entsize(2, has_ftype);
+                        let total: usize = sorted
+                            .iter()
+                            .map(|(n, _, _)| dir2_data_entsize(n.len(), has_ftype))
+                            .sum();
+                        let target = (total + dotdot_bytes).saturating_sub(dotdot_bytes) / 2;
+                        let mut block0_payload = 0usize;
+                        let mut split_at = 0;
+                        let mut any = false;
+                        for (i, (n, _, _)) in sorted.iter().enumerate() {
+                            let ent = dir2_data_entsize(n.len(), has_ftype);
+                            if any && block0_payload + ent > target {
+                                split_at = i;
+                                break;
+                            }
+                            block0_payload += ent;
+                            any = true;
+                            split_at = i + 1;
+                        }
+                        let block0_bytes = XFS_DIR2_DATA_HDR_LEN + dotdot_bytes + block0_payload;
+                        let block1_bytes = XFS_DIR2_DATA_HDR_LEN + (total - block0_payload);
+                        if block0_bytes > dirblksize || block1_bytes > dirblksize {
+                            return Err(FilesystemError::DiskFull(format!(
+                                "leaf-form conversion split block 0={block0_bytes} block 1={block1_bytes} \
+                                 doesn't fit dirblksize {dirblksize} (deeper leaf/node form not implemented)"
+                            )));
+                        }
+                        let _ = split_at;
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
             }
             _ => Err(FilesystemError::Unsupported(
                 "parent directory format not editable (btree/leaf/node)".into(),
@@ -1640,8 +1685,10 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     }
 
     /// Rebuild an already single-block directory with the new entry appended,
-    /// writing it back in place (no reallocation). Errors `DiskFull` if the
-    /// directory has outgrown one block (leaf/node format not implemented).
+    /// writing it back in place (no reallocation). When the entries no longer
+    /// fit one block, convert the directory to **leaf form** (§2.1 hole (C)):
+    /// two XD2D data blocks plus an XD2F leaf1 block at file offset
+    /// `XFS_DIR2_LEAF_OFFSET`.
     fn block_insert_entry(
         &mut self,
         sb: &super::sb::XfsSuperblock,
@@ -1656,9 +1703,19 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         let first = extents
             .first()
             .ok_or_else(|| FilesystemError::Parse("block dir has no extent".into()))?;
+        // Single-block dir: exactly one extent at file offset 0. Anything
+        // else (already leaf/node form) goes through the leaf-aware insert
+        // path, which is not yet implemented for further growth.
         if first.startoff != 0 {
             return Err(FilesystemError::Unsupported(
-                "multi-block directory not editable".into(),
+                "multi-block directory: insert into existing leaf/node form not yet supported"
+                    .into(),
+            ));
+        }
+        if extents.len() > 1 {
+            return Err(FilesystemError::Unsupported(
+                "leaf-form directory insert not yet implemented (only block→leaf conversion)"
+                    .into(),
             ));
         }
         let dirblksize = sb.dirblksize() as usize;
@@ -1676,13 +1733,175 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             XFS_DIR3_FT_REG_FILE
         };
         entries.push((name.to_string(), child_ino, ft));
-        let block = build_block_dir(&entries, parent_ino, dotdot, dirblksize, has_ftype)?;
-        self.write_dir_block(sb, fsblock, &block)?;
-        let _ = blocks_per_dir;
+
+        // Try the in-place block rebuild first. If that overflows, fall
+        // through to the leaf-form conversion path.
+        match build_block_dir(&entries, parent_ino, dotdot, dirblksize, has_ftype) {
+            Ok(block) => {
+                self.write_dir_block(sb, fsblock, &block)?;
+            }
+            Err(FilesystemError::DiskFull(_)) => {
+                self.convert_block_dir_to_leaf_form(
+                    sb,
+                    parent_ino,
+                    &entries,
+                    dotdot,
+                    fsblock,
+                    blocks_per_dir,
+                )?;
+            }
+            Err(e) => return Err(e),
+        }
         if is_dir {
             self.bump_dir_nlink(sb, parent_ino, 1)?;
         }
         Ok(())
+    }
+
+    /// Convert a single-block directory to leaf form: redistribute every entry
+    /// across two XD2D data blocks (entries sorted by hash, split at the byte
+    /// midpoint), allocate the second data block and the XD2F leaf1 index
+    /// block (at file offset `XFS_DIR2_LEAF_OFFSET` in fsblocks), build all
+    /// three blocks, write them, and rewrite the inode with a 3-extent inline
+    /// data fork. `existing_fsblock` is the dir's current single-block fsblock
+    /// (reused as the new block 0); the second data + leaf1 blocks are freshly
+    /// allocated. §2.1 hole (C) v1 — supports the block → 2-data-block leaf
+    /// shape only; further growth (3+ data blocks, node form) is parked.
+    fn convert_block_dir_to_leaf_form(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        parent_ino: u64,
+        all_entries: &[(String, u64, u8)],
+        dotdot: u64,
+        existing_fsblock: u64,
+        blocks_per_dir: u32,
+    ) -> Result<(), FilesystemError> {
+        let has_ftype = sb.has_ftype();
+        let dirblksize = sb.dirblksize() as usize;
+
+        // Sort by hash so the leaf index entries are naturally contiguous,
+        // then split the entries so block 0 (with `.` + `..`) and block 1
+        // each end up roughly half-full by data-bytes count.
+        let mut sorted = all_entries.to_vec();
+        sorted.sort_by_key(|(n, _, _)| dir_hashname(n.as_bytes()));
+
+        let dotdot_bytes = dir2_data_entsize(1, has_ftype) + dir2_data_entsize(2, has_ftype);
+        let total_entry_bytes: usize = sorted
+            .iter()
+            .map(|(n, _, _)| dir2_data_entsize(n.len(), has_ftype))
+            .sum();
+        // Targets: half the entry bytes per block, after subtracting `.`/`..`
+        // from block 0's budget.
+        let target_block0_payload =
+            (total_entry_bytes + dotdot_bytes).saturating_sub(dotdot_bytes) / 2;
+        let mut block0: Vec<(String, u64, u8)> = Vec::new();
+        let mut block0_payload = 0usize;
+        let mut split_at = 0;
+        for (i, (n, ino, ft)) in sorted.iter().enumerate() {
+            let ent = dir2_data_entsize(n.len(), has_ftype);
+            if !block0.is_empty() && block0_payload + ent > target_block0_payload {
+                split_at = i;
+                break;
+            }
+            block0.push((n.clone(), *ino, *ft));
+            block0_payload += ent;
+            split_at = i + 1;
+        }
+        let block1: Vec<(String, u64, u8)> = sorted[split_at..].to_vec();
+
+        // Build both data blocks. block 0 carries the synthetic `.`/`..`.
+        let mut data0 =
+            build_leaf_data_block(&block0, parent_ino, dotdot, 0, dirblksize, has_ftype, true)?;
+        let mut data1 = build_leaf_data_block(
+            &block1,
+            parent_ino,
+            dotdot,
+            blocks_per_dir as u64,
+            dirblksize,
+            has_ftype,
+            false,
+        )?;
+        data0.leaf_index.append(&mut data1.leaf_index);
+
+        // bestfree[0] for each data block is at bytes 6..8 (offset 4..6 holds
+        // the byte offset, 6..8 holds the length). Read that as the data
+        // block's "best free" length for the leaf1 bests array.
+        let bests = [
+            BigEndian::read_u16(&data0.bytes[6..8]),
+            BigEndian::read_u16(&data1.bytes[6..8]),
+        ];
+        let leaf1_bytes = build_leaf1_block_v4(data0.leaf_index, &bests, dirblksize)?;
+
+        // Allocate two new dir blocks: data block 1, then the leaf1 block.
+        // On a failure between the two allocs, roll back the first one.
+        let data1_fsblock = self.alloc_blocks(sb, blocks_per_dir)?;
+        let leaf1_fsblock = match self.alloc_blocks(sb, blocks_per_dir) {
+            Ok(fb) => fb,
+            Err(e) => {
+                self.free_blocks(sb, &[(data1_fsblock, blocks_per_dir)])?;
+                return Err(e);
+            }
+        };
+
+        // Lay down all three blocks. Block 0 (the existing single-block dir)
+        // is rewritten in place with the XD2D format (no inline leaf tail).
+        self.write_dir_block(sb, existing_fsblock, &data0.bytes)?;
+        self.write_dir_block(sb, data1_fsblock, &data1.bytes)?;
+        self.write_dir_block(sb, leaf1_fsblock, &leaf1_bytes)?;
+
+        // Update the inode: 3 inline extents, di_size = 2 * dirblksize (only
+        // the data blocks count toward dir size; the leaf1 block sits above
+        // XFS_DIR2_LEAF_OFFSET and isn't part of the file's logical size),
+        // di_nblocks = 3 * blocks_per_dir.
+        let leaf_off_fb = dir2_leaf_offset_fb(sb.blocksize);
+        let extents: [(u64, u64, u32); 3] = [
+            (0, existing_fsblock, blocks_per_dir),
+            (blocks_per_dir as u64, data1_fsblock, blocks_per_dir),
+            (leaf_off_fb, leaf1_fsblock, blocks_per_dir),
+        ];
+        self.write_dir_inode_multi_extent(
+            sb,
+            parent_ino,
+            &extents,
+            2 * dirblksize as u64,
+            3 * blocks_per_dir as u64,
+        )
+    }
+
+    /// Rewrite a directory inode whose data fork holds N inline extents (each
+    /// `(startoff, fsblock, blocks)`). Sets `di_format=Extents`, `di_size`,
+    /// `di_nblocks`, `di_nextents=N`; preserves the rest of the core. The
+    /// inline-fork fits the literal area when `N * 16 <= inodesize -
+    /// fork_offset` — bounded by the caller (e.g. the leaf-form conversion
+    /// only ever stores 3 extents, well within 9 inline slots).
+    fn write_dir_inode_multi_extent(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        ino: u64,
+        extents: &[(u64, u64, u32)],
+        size: u64,
+        nblocks: u64,
+    ) -> Result<(), FilesystemError> {
+        let (_core, mut buf) = self.read_inode_buf(ino)?;
+        buf[5] = 2; // di_format = extents
+        BigEndian::write_u64(&mut buf[56..64], size); // di_size
+        BigEndian::write_u64(&mut buf[64..72], nblocks); // di_nblocks
+        BigEndian::write_u32(&mut buf[76..80], extents.len() as u32); // di_nextents
+        let fs = fork_offset(false);
+        for b in buf.iter_mut().skip(fs) {
+            *b = 0;
+        }
+        let isz = buf.len();
+        if fs + extents.len() * 16 > isz {
+            return Err(FilesystemError::Unsupported(
+                "directory inline fork can't hold this many extents".into(),
+            ));
+        }
+        for (i, &(startoff, fsblock, count)) in extents.iter().enumerate() {
+            let rec = encode_extent(false, startoff, fsblock, count as u64);
+            buf[fs + i * 16..fs + (i + 1) * 16].copy_from_slice(&rec);
+        }
+        self.write_inode_region(sb, ino, &buf)
     }
 
     /// Remove `name` from directory `parent_ino`, dispatching by format:
@@ -1828,7 +2047,9 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     }
 
     /// Remove `name` from a single-block directory by rebuilding the block
-    /// without it and writing it back in place.
+    /// without it and writing it back in place. Leaf-form (multi-extent)
+    /// directories are rejected with a clear error — remove from leaf form is
+    /// a separate slice once §2.1 hole (C) ships growing-insert + recompaction.
     fn block_remove_entry(
         &mut self,
         sb: &super::sb::XfsSuperblock,
@@ -1845,6 +2066,11 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         if first.startoff != 0 {
             return Err(FilesystemError::Unsupported(
                 "multi-block directory not editable".into(),
+            ));
+        }
+        if extents.len() > 1 {
+            return Err(FilesystemError::Unsupported(
+                "remove from leaf-form directory not yet implemented".into(),
             ));
         }
         let dirblksize = sb.dirblksize() as usize;
@@ -2374,6 +2600,156 @@ fn write_bmbt_root_to_leaf(fork: &mut [u8], first_startoff: u64, leaf_fsblock: u
     BigEndian::write_u64(&mut fork[4..12], first_startoff);
     let ptrs_off = 4 + maxrecs * 8;
     BigEndian::write_u64(&mut fork[ptrs_off..ptrs_off + 8], leaf_fsblock);
+}
+
+/// XFS dir2 leaf1 block magic (`xfs_da_blkinfo.magic` for a single-leaf
+/// directory). Stored as a 16-bit big-endian value at byte 8 of the block.
+const XFS_DIR2_LEAF1_MAGIC: u16 = 0xD2F1;
+
+/// dir2 leaf address space starts at byte 32 GiB in the inode's file offset
+/// stream (`XFS_DIR2_LEAF_OFFSET`). Converted to fsblocks: `2^32 / blocksize`.
+fn dir2_leaf_offset_fb(blocksize: u32) -> u64 {
+    (1u64 << 32) / (blocksize as u64)
+}
+
+/// A built dir2 XD2D data block paired with its leaf-index contributions:
+/// the block's on-disk bytes, plus a `(hashval, address)` pair per entry the
+/// leaf1 block needs to record. Address encoding: `(file_block_in_dir *
+/// dirblksize + byte_off) / 8` — the standard dir2 dataptr.
+struct DataBlockWithIndex {
+    bytes: Vec<u8>,
+    leaf_index: Vec<(u32, u32)>,
+}
+
+/// Build a v4 XD2D directory data block from a sub-slice of entries that
+/// belong in this data block. The block's file-offset in dir2 address space
+/// is `file_block_in_dir` (0 for the first data block, 1 for the next, …).
+/// Each entry contributes a `(hashval, address)` pair to the returned leaf
+/// index; addresses are 8-byte dataptr offsets (`(file_block * dirblksize +
+/// byte_off) / 8`). `extra_dot_dotdot` adds the synthetic `.` and `..`
+/// entries (only for the first data block). The free space at the tail is
+/// recorded as an unused record + bestfree[0]; bestfree[1..3] stay zero.
+fn build_leaf_data_block(
+    entries: &[(String, u64, u8)],
+    self_ino: u64,
+    dotdot: u64,
+    file_block_in_dir: u64,
+    dirblksize: usize,
+    has_ftype: bool,
+    extra_dot_dotdot: bool,
+) -> Result<DataBlockWithIndex, FilesystemError> {
+    let mut all: Vec<(Vec<u8>, u64, u8)> = Vec::with_capacity(entries.len() + 2);
+    if extra_dot_dotdot {
+        all.push((b".".to_vec(), self_ino, XFS_DIR3_FT_DIR));
+        all.push((b"..".to_vec(), dotdot, XFS_DIR3_FT_DIR));
+    }
+    for (n, ino, ft) in entries {
+        all.push((n.as_bytes().to_vec(), *ino, *ft));
+    }
+
+    let data_size: usize = all
+        .iter()
+        .map(|(n, _, _)| dir2_data_entsize(n.len(), has_ftype))
+        .sum();
+    let data_start = XFS_DIR2_DATA_HDR_LEN;
+    if data_start + data_size > dirblksize {
+        return Err(FilesystemError::DiskFull(format!(
+            "leaf-form data block overflow: {} entries need {} bytes, block is {dirblksize}",
+            all.len(),
+            data_start + data_size
+        )));
+    }
+
+    let mut buf = vec![0u8; dirblksize];
+    BigEndian::write_u32(&mut buf[0..4], super::dir2::XFS_DIR2_DATA_MAGIC);
+
+    let dirblksize_units = (dirblksize / 8) as u32;
+    let block_base_units = file_block_in_dir as u32 * dirblksize_units;
+    let mut leaf: Vec<(u32, u32)> = Vec::with_capacity(all.len());
+    let mut pos = data_start;
+    for (name, ino, ft) in &all {
+        let namelen = name.len();
+        let ent = dir2_data_entsize(namelen, has_ftype);
+        BigEndian::write_u64(&mut buf[pos..pos + 8], *ino);
+        buf[pos + 8] = namelen as u8;
+        buf[pos + 9..pos + 9 + namelen].copy_from_slice(name);
+        if has_ftype {
+            buf[pos + 9 + namelen] = *ft;
+        }
+        BigEndian::write_u16(&mut buf[pos + ent - 2..pos + ent], pos as u16);
+        leaf.push((dir_hashname(name), block_base_units + (pos / 8) as u32));
+        pos += ent;
+    }
+
+    // Free region at the end (if any): freetag(0xFFFF) + length(2) + tag(2).
+    let gap_off = pos;
+    let gap_len = dirblksize - pos;
+    if gap_len >= 8 {
+        BigEndian::write_u16(&mut buf[gap_off..gap_off + 2], 0xFFFF);
+        BigEndian::write_u16(&mut buf[gap_off + 2..gap_off + 4], gap_len as u16);
+        BigEndian::write_u16(
+            &mut buf[gap_off + gap_len - 2..gap_off + gap_len],
+            gap_off as u16,
+        );
+        // bestfree[0] = (offset, length).
+        BigEndian::write_u16(&mut buf[4..6], gap_off as u16);
+        BigEndian::write_u16(&mut buf[6..8], gap_len as u16);
+        // bestfree[1..3] left zero.
+    }
+
+    Ok(DataBlockWithIndex {
+        bytes: buf,
+        leaf_index: leaf,
+    })
+}
+
+/// Build a v4 XD2F dir2 leaf1 block from the per-data-block leaf-index
+/// entries (already collected by `build_leaf_data_block` calls) and the
+/// `bests` array (one u16 per data block: the largest free-record length in
+/// that block). Layout:
+///
+/// ```text
+///   da_blkinfo:  forw(4) back(4) magic(2) pad(2)        =  12 bytes
+///   ldlh:        count(2) stale(2)                      =   4 bytes
+///   ents[count]: hashval(4) address(4) per slot         =   8 bytes each
+///   ... free space ...
+///   bests[bests_count]: u16 each, at the tail of the block
+/// ```
+///
+/// Entries are sorted by `hashval` ascending so name lookups can binary-search.
+fn build_leaf1_block_v4(
+    mut entries: Vec<(u32, u32)>,
+    bests: &[u16],
+    dirblksize: usize,
+) -> Result<Vec<u8>, FilesystemError> {
+    let bests_bytes = bests.len() * 2;
+    let header_bytes = 12 + 4; // da_blkinfo + ldlh
+    let used = header_bytes + entries.len() * 8 + bests_bytes;
+    if used > dirblksize {
+        return Err(FilesystemError::DiskFull(format!(
+            "leaf1 block overflow: needed {used} bytes, have {dirblksize}"
+        )));
+    }
+    entries.sort_by_key(|&(h, _)| h);
+
+    let mut buf = vec![0u8; dirblksize];
+    // da_blkinfo: forw=0, back=0, magic=XFS_DIR2_LEAF1_MAGIC, pad=0.
+    BigEndian::write_u16(&mut buf[8..10], XFS_DIR2_LEAF1_MAGIC);
+    // ldlh: count, stale.
+    BigEndian::write_u16(&mut buf[12..14], entries.len() as u16);
+    BigEndian::write_u16(&mut buf[14..16], 0);
+    // Entries packed from byte 16.
+    for (i, (h, a)) in entries.iter().enumerate() {
+        let off = 16 + i * 8;
+        BigEndian::write_u32(&mut buf[off..off + 4], *h);
+        BigEndian::write_u32(&mut buf[off + 4..off + 8], *a);
+    }
+    // Bests array at the very end of the block, in data-block index order.
+    let bests_off = dirblksize - bests_bytes;
+    for (i, &b) in bests.iter().enumerate() {
+        BigEndian::write_u16(&mut buf[bests_off + i * 2..bests_off + i * 2 + 2], b);
+    }
+    Ok(buf)
 }
 
 /// Build a v4 single-block (`XD2B`) directory holding `.`, `..`, and `entries`.

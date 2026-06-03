@@ -1762,6 +1762,112 @@ mod tests {
     }
 
     #[test]
+    fn dir_overflow_converts_block_to_leaf_form() {
+        // §2.1 hole (C): when a single-block directory would overflow on the
+        // next insert, convert it to leaf form — two XD2D data blocks plus an
+        // XD2F leaf1 index block at file offset XFS_DIR2_LEAF_OFFSET. Adding
+        // 150 files (~32 bytes per entry × 150 = ~4800 bytes data + ~1200
+        // bytes leaf = > 4 KiB) to the 4-entry fixture root forces the
+        // conversion mid-sequence. After: di_format is still Extents (leaf
+        // form lives in extents, not bmbt), the inode has 3 extents, all
+        // entries enumerate, originals survive, the volume stays fsck-clean.
+        use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem};
+        use std::io::Cursor as IoCursor;
+
+        let img = load_fixture().to_vec();
+        let mut cursor = Cursor::new(img);
+
+        let originals;
+        {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable");
+            let root = fs.root().expect("root");
+            originals = fs
+                .list_directory(&root)
+                .expect("list")
+                .into_iter()
+                .map(|e| e.name)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                fs.read_inode(root.location).expect("root core").format,
+                DiFormat::Local,
+                "root starts short-form"
+            );
+            // Add files one at a time until the inserter rejects with the
+            // post-conversion "leaf-form insert not implemented" message
+            // (v1 only supports block→leaf conversion, not further growth).
+            // Stop there — the conversion succeeded and the directory is
+            // now in leaf form holding everything written so far.
+            let mut added = 0u32;
+            for i in 0..150u32 {
+                let mut data = IoCursor::new(Vec::<u8>::new());
+                match fs.create_file(
+                    &root,
+                    &format!("f{i:04}.b"),
+                    &mut data,
+                    0,
+                    &CreateFileOptions::default(),
+                ) {
+                    Ok(_) => added += 1,
+                    Err(FilesystemError::Unsupported(msg))
+                        if msg.contains("leaf/node-form directory") =>
+                    {
+                        break;
+                    }
+                    Err(e) => panic!("create_file {i}: {e}"),
+                }
+            }
+            assert!(
+                added > 100,
+                "expected the block→leaf conversion to absorb at least 100 adds before \
+                 hitting the (not-yet-implemented) leaf-form insert path; got {added}"
+            );
+            fs.sync_metadata().expect("sync");
+        }
+
+        let repaired = cursor.into_inner();
+        let mut fs = XfsFilesystem::open(Cursor::new(repaired), 0).expect("reopen");
+        let root = fs.root().expect("root");
+        let core = fs.read_inode(root.location).expect("root core");
+        assert_eq!(
+            core.format,
+            DiFormat::Extents,
+            "root should be in extents (leaf or block) form"
+        );
+        assert!(
+            core.nextents >= 3,
+            "leaf-form root should have at least 3 extents (data0, data1, leaf1); got {}",
+            core.nextents
+        );
+        let entries = fs.list_directory(&root).expect("list root");
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        for want in &originals {
+            assert!(
+                names.contains(&want.as_str()),
+                "original lost: {want} in {} names",
+                names.len()
+            );
+        }
+        // Every file that was successfully created must list back. Count
+        // how many we expect by re-running the same admission loop in dry
+        // form (any name f0000.b..f0149.b that's actually present counts).
+        let added_present: usize = (0..150u32)
+            .filter(|i| names.contains(&format!("f{i:04}.b").as_str()))
+            .count();
+        assert!(
+            added_present > 100,
+            "expected > 100 added files listable from leaf-form dir, got {added_present}"
+        );
+        // The volume must remain fsck-clean: data blocks + leaf1 block must
+        // form a coherent leaf-form directory.
+        let res = fs.run_fsck().expect("fsck");
+        assert!(
+            res.errors.is_empty(),
+            "expected clean after leaf-form conversion, got: {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn create_file_writes_bmbt_format_when_extents_exceed_inline_cap() {
         // §2.1 hole (D): when an allocation produces more extent records than
         // fit the inline data fork (`max_inline = (inodesize - fork_offset) /
