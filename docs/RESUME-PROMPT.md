@@ -87,8 +87,8 @@ list. Recommended order:
      infra is already in `src/fs/hfsplus_journal.rs`; this is the
      consumer wiring.
   2. **§6.3 GUI `.hqx` import** — needs a design checkpoint first.
-  3. **§1.3 JFS J.2 + J.3** — parked; pick up if you want the
-     BMAP walker for free-block trimming.
+  3. **§2.1 XFS holes A-E** — five independent slices on the
+     v4-edit / v5-write track.
 
 To regenerate or extend a fixture, model your script on
 `scripts/generate-{reiserfs,ufs}-fixtures.sh`. The WSL environment
@@ -106,7 +106,9 @@ Most recent commits on `mister-parity` (newest first):
 
 | Commit | Item | Tests added |
 |---|---|---|
-| _(this session)_ | **`rb-cli get` globbing + recursive extract** — `get` accepts the same glob / `--exclude` / `--ignore-case` syntax as `ls` and `rm`, plus `-r` / `--recursive` for directory dumps and `--force` / `--skip-existing` for conflict handling. DST gains layout-under-prefix semantics: single file = literal target; literal dir + `-r` = `DST/<basename>/...` (cp convention); glob = relative-to-glob-root under `DST`. Symlinks ride out as plain-text fallback files (cross-platform safe). | 12 unit + 6 e2e |
+| _(this session)_ | **JFS J.3** — fileset bootstrap + dtree + browse + read_file. `read_fileset_iag` parses the IAG at page 1 of FILESYSTEM_I's data; `read_fileset_inode` locates user dinodes; `parse_inline_dtree` walks the 288-byte dtroot (slot[0] overlaps the header, leaf entries at slots 1..8, iterate stbl[0..nextindex]); long-name continuation chain follows the `next` field through dtslot continuation slots. `read_file_data` walks the inline xtree XADs with sparse-aware gap-fill. Symlink decode reads `di_fastsymlink` (inline ≤ 128 B) or falls back to xtree. | 12 |
+| _(this session)_ | **JFS J.2** — AIT bootstrap, dinode + xtree + BMAP walker, `CompactJfsReader`. Layout-preserving compaction emits one section per BMAP run + logpxd + fsckpxd verbatim. Lazy `BmapWalk` cache; `used_size` becomes accurate once warm; `last_data_byte` stays maxed against the inline log. Refuses aggregates ≥ 32 GiB (multi-level dmapctl walker is a follow-up). | 16 |
+| _(prev session)_ | **`rb-cli get` globbing + recursive extract** — `get` accepts the same glob / `--exclude` / `--ignore-case` syntax as `ls` and `rm`, plus `-r` / `--recursive` for directory dumps and `--force` / `--skip-existing` for conflict handling. DST gains layout-under-prefix semantics: single file = literal target; literal dir + `-r` = `DST/<basename>/...` (cp convention); glob = relative-to-glob-root under `DST`. Symlinks ride out as plain-text fallback files (cross-platform safe). | 12 unit + 6 e2e |
 | _(this session)_ | **JFS J.1** — Aggregate Superblock parser + detect for JFS2 (`"JFS1"` magic at byte 32768; accepts on-disk `s_version` 1 or 2; refuses dirty aggregates). Decodes the inline-log + fsck-workspace `pxd_t`s and reports `last_data_byte = max(aggregate_end, logpxd_end, fsckpxd_end)` so backups capture the inline log when it lives past the aggregate end (true on the makefs-equivalent layout). Fixture `test_jfs.img.zst` (16 MiB, 4.4 KiB zstd) via `scripts/generate-jfs-fixtures.sh` + libguestfs. Wired through `detect_filesystem_type`, `probe_0x83_fs_type` ("JFS2"), and `open_filesystem` 0x83 + superfloppy. J.2 (BMAP B+tree compactor) + J.3 (browse) parked — multi-session work, not currently scheduled. | 21 |
 | `93c3054` | **UFS U.3** — dinode reader + DIRENT2 `list_directory` + direct/indirect `read_file` for both UFS1 (128 B dinode, 32-bit pointers) and UFS2 (256 B dinode, 64-bit pointers). Adds `UfsInode`, `inode_byte_offset`, `read_inode`, `resolve_logical_block` (12 direct → single → double → triple indirect, sparse-block-aware), `read_inode_data`, `read_symlink_target` (inline payload up to `fs_maxsymlinklen`, otherwise data block), `build_file_entry`. Now reads + browses end-to-end through the existing dispatch. | 19 |
 | `e2a5121` | **UFS U.2** — CG header parser + walker (validates cg_magic 0x00090255), `Filesystem::last_data_byte` override (bitmap polarity is **set = FREE**, BSD convention), `CompactUfsReader` (layout-preserving, coalesces same-state runs). Adds `BitmapReader::highest_clear_bit` to `unix_common::bitmap`. Re-exported as `crate::fs::CompactUfsReader`. | 13 |
@@ -145,14 +147,10 @@ the ReiserFS one (`jfsutils` is the Ubuntu package; the host's
 
 ## Still open — pick one
 
-### Filesystem read-track (parked, not currently scheduled)
-- **§1.3 JFS J.2 + J.3** — BMAP B+tree compactor + Tier B browse.
-  Fixture (`test_jfs.img.zst`) ships in tree; the gating constraint
-  is scope, not data. J.2 alone needs an AIT walker + xtree decoder
-  + dmapctl multi-level traversal; kernel reference is ~2000 lines.
-  Without J.2, backups still work (J.1's `last_data_byte` is
-  correct), they just don't trim free blocks inside the aggregate.
-  Pick up if real demand surfaces.
+### Filesystem read-track
+- **§1 read-track now closed.** ReiserFS + UFS + JFS Tier A + Tier B
+  all shipped 2026-06-02. Only per-FS fsck + edit (Tier B+) remain
+  as parked optional work, pick up if real demand surfaces.
 
 ### Large
 - **§2.3 HFS+ journal Step 27** — route every `do_sync_metadata`

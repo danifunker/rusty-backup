@@ -131,8 +131,11 @@ const BMAP_I: u32 = 2; // block allocation map control inode
 const LOG_I: u32 = 3;
 #[allow(dead_code)]
 const BADBLOCK_I: u32 = 4;
-#[allow(dead_code)] // J.3 consumes FILESYSTEM_I for the user-fileset walk
 const FILESYSTEM_I: u32 = 16; // first fileset (user data)
+/// Fileset-internal root directory inode number. Reserved like UFS's
+/// inode 2: the first fileset inode (`fino=0`/`fino=1`) is reserved
+/// and the root dir always lives at `fino=2`.
+const FILESET_ROOT_INO: u32 = 2;
 /// Maximum aggregate inode number we read via the first AIT extent.
 /// FILESYSTEM_I = 16 is the highest one we care about; the kernel
 /// reserves slots up to 31.
@@ -156,32 +159,62 @@ const DI_OFF_MTIME: usize = 72; // timestruc_t (8 B; we read the seconds half)
 /// / `u._file._u2._special.{_fastsymlink, _rdev}`).
 const DI_OFF_TYPE_AREA: usize = 224;
 /// Start of `di_fastsymlink` / `di_rdev` within the dinode for the
-/// special variant. J.3 consumes this for inline-symlink decoding.
-#[allow(dead_code)]
+/// special variant. Consumed by J.3 for inline-symlink decoding.
 const DI_OFF_FASTSYMLINK: usize = 256;
 /// `di_fastsymlink` capacity in bytes.
-#[allow(dead_code)]
 const DI_FASTSYMLINK_LEN: usize = 128;
-/// Start of `di_inlineea` within the dinode (overflow for long fast
-/// symlinks; consumed by J.3).
+
+// ---- J.3: fileset + iag + dtree constants ----
+
+/// `INOSPEREXT` — dinodes per inode extent (32 × 512 B = 16 KiB =
+/// 4 aggregate blocks at bsize=4096).
+const INOSPEREXT: u32 = 32;
+/// `EXTSPERIAG` — inode-extent slots per IAG (each iag describes 128
+/// possible inode extents = 4096 fileset inodes).
+const EXTSPERIAG: usize = 128;
+/// Byte offset of `inoext[]` (pxd_t[EXTSPERIAG]) within a 4096-byte
+/// iag. Layout per `jfs_imap.h`:
+///   header (72) + pad (1976) + wmap (512) + pmap (512) + inoext (1024) = 4096
+const IAG_INOEXT_OFF: usize = 72 + 1976 + 512 + 512; // 3072
+/// Byte offset of `pmap[]` (u32[EXTSPERIAG]) within an iag.
+const IAG_PMAP_OFF: usize = 72 + 1976 + 512; // 2560
+
+/// `dtroot` lives at dinode offset 224 and is 288 bytes (9 × 32-byte
+/// slots, with slot[0] overlapping the header in the kernel's union
+/// type). Active leaf entries live at slot indices 1..=8; slot 0 is
+/// the header in disguise.
+const DTROOT_SIZE: usize = 288;
+const DT_SLOT_SIZE: usize = 32;
+/// Header field offsets within the 288-byte dtroot.
 #[allow(dead_code)]
-const DI_OFF_INLINEEA: usize = 384;
+const DTROOT_OFF_DASD: usize = 0; // 16 bytes (DASD quota descriptor — unused by browse)
+const DTROOT_OFF_FLAG: usize = 16; // u8
+const DTROOT_OFF_NEXTINDEX: usize = 17; // u8 — number of active entries
+#[allow(dead_code)]
+const DTROOT_OFF_FREECNT: usize = 18; // s8
+#[allow(dead_code)]
+const DTROOT_OFF_FREELIST: usize = 19; // s8
+#[allow(dead_code)]
+const DTROOT_OFF_IDOTDOT: usize = 20; // u32 — parent inode #
+const DTROOT_OFF_STBL: usize = 24; // s8[8] — sorted entry index table
+
+/// Maximum directory size we accept inline (i.e. inside the dinode's
+/// dtroot). When `di_size > DT_INLINE_CAP`, the dtree has spilled to
+/// off-disk leaf/internal pages — not supported in this J.3 first
+/// slice. Empirically the kernel keeps a directory inline while its
+/// total entry count fits in the 8 free slots (~7 short-name entries),
+/// so the cap below is generous.
+const DT_INLINE_CAP: u64 = 4096;
 
 // Mode bits. The low 16 bits hold POSIX mode (S_IFMT + perms); high bits
-// hold JFS attribute flags (IFJOURNAL, IDIRECTORY, etc.). Symlink /
-// special-device constants live here for completeness; J.3's dispatch
-// consumes them once it lands.
+// hold JFS attribute flags (IFJOURNAL, IDIRECTORY, etc.).
 const S_IFMT: u32 = 0o170000;
 const S_IFREG: u32 = 0o100000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFLNK: u32 = 0o120000;
-#[allow(dead_code)]
 const S_IFBLK: u32 = 0o060000;
-#[allow(dead_code)]
 const S_IFCHR: u32 = 0o020000;
-#[allow(dead_code)]
 const S_IFIFO: u32 = 0o010000;
-#[allow(dead_code)]
 const S_IFSOCK: u32 = 0o140000;
 
 // xtree (extent btree) constants.
@@ -469,6 +502,307 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
                     .into(),
             )
         })
+    }
+
+    // ---- J.3: fileset + iag + dtree + per-user-inode read ----
+
+    /// Read fileset 1's IAG (Inode Allocation Group) page 0 from the
+    /// FILESYSTEM_I inode's data area. Returns the parsed inoext[]
+    /// PXD array — slot `extent_idx` describes the disk extent that
+    /// holds fileset inodes `extent_idx * INOSPEREXT .. +INOSPEREXT`.
+    pub(crate) fn read_fileset_iag(&mut self) -> Result<FilesetIag, FilesystemError> {
+        let fs_ino = self.read_ait_inode(FILESYSTEM_I)?;
+        let xtroot = self.parse_inline_xtree_root(&fs_ino.raw)?;
+        if xtroot.flag & BT_TYPE_MASK & BT_INTERNAL_FLAG != 0 {
+            return Err(FilesystemError::Unsupported(
+                "JFS: FILESYSTEM_I xtree has internal nodes — multi-IAG layouts \
+                 (filesets with > 4096 inodes) not yet supported"
+                    .into(),
+            ));
+        }
+        if xtroot.xads.is_empty() {
+            return Err(FilesystemError::Parse(
+                "jfs: FILESYSTEM_I inode has no xtree entries".into(),
+            ));
+        }
+        // FILESYSTEM_I data: page 0 = dinomap_disk header (we skip
+        // it), page 1 = first IAG. The first XAD must cover both.
+        let iag_page = self.read_inode_logical_page(&xtroot, 1)?;
+        let agstart = u64::from_le_bytes(iag_page[0..8].try_into().unwrap());
+        let iagnum = u32::from_le_bytes(iag_page[8..12].try_into().unwrap());
+        if iagnum != 0 {
+            return Err(FilesystemError::Parse(format!(
+                "jfs: first IAG has iagnum {iagnum} != 0"
+            )));
+        }
+
+        let mut pmap = [0u32; EXTSPERIAG];
+        for (i, slot) in pmap.iter_mut().enumerate() {
+            let off = IAG_PMAP_OFF + i * 4;
+            *slot = u32::from_le_bytes(iag_page[off..off + 4].try_into().unwrap());
+        }
+
+        let mut inoext = Vec::with_capacity(EXTSPERIAG);
+        for i in 0..EXTSPERIAG {
+            let off = IAG_INOEXT_OFF + i * 8;
+            inoext.push(Pxd::parse(&iag_page[off..off + 8]));
+        }
+        Ok(FilesetIag {
+            agstart,
+            iagnum,
+            pmap,
+            inoext,
+        })
+    }
+
+    /// Read logical page `logical_page` from an inode's data area via
+    /// the inline xtree root. Used by both BMAP and FILESYSTEM_I walks.
+    /// Returns a 4 KiB page buffer.
+    fn read_inode_logical_page(
+        &mut self,
+        xtroot: &XtreeRoot,
+        logical_page: u64,
+    ) -> Result<Vec<u8>, FilesystemError> {
+        self.read_bmap_logical_page(xtroot, logical_page)
+    }
+
+    /// Read fileset inode `fino` (a user-fileset inode number) via the
+    /// IAG's inoext[] array. The dinode lives at byte
+    /// `inoext[fino/32].address * bsize + (fino % 32) * DISIZE`.
+    pub(crate) fn read_fileset_inode(
+        &mut self,
+        fino: u32,
+        iag: &FilesetIag,
+    ) -> Result<JfsDinode, FilesystemError> {
+        let extent_idx = (fino / INOSPEREXT) as usize;
+        let in_extent = (fino % INOSPEREXT) as u64;
+        if extent_idx >= EXTSPERIAG {
+            return Err(FilesystemError::Unsupported(format!(
+                "jfs: fileset inode {fino} would require IAG {} (only IAG 0 \
+                 supported in this first slice)",
+                fino / (INOSPEREXT * EXTSPERIAG as u32)
+            )));
+        }
+        let pxd = iag.inoext[extent_idx];
+        if pxd.length == 0 {
+            return Err(FilesystemError::Parse(format!(
+                "jfs: fileset inode {fino}: inoext[{extent_idx}] is empty \
+                 (extent not allocated)"
+            )));
+        }
+        // Verify the pmap bit is set — bit (31 - extent_idx%32) of
+        // word extent_idx/32, MSB-first.
+        let pmap_word = iag.pmap[extent_idx / 32];
+        let pmap_bit_pos = 31 - (extent_idx % 32);
+        if (pmap_word >> pmap_bit_pos) & 1 != 1 {
+            return Err(FilesystemError::Parse(format!(
+                "jfs: fileset inode {fino}: pmap says extent {extent_idx} is free"
+            )));
+        }
+
+        let byte = self.partition_offset + pxd.address * self.bsize + in_extent * DISIZE;
+        self.reader.seek(SeekFrom::Start(byte))?;
+        let mut buf = [0u8; DISIZE as usize];
+        self.reader.read_exact(&mut buf)?;
+        JfsDinode::parse(&buf, fino)
+    }
+
+    /// Walk an inline dtroot and return one decoded entry per active
+    /// stbl slot. Refuses non-inline dtrees (di_size > DT_INLINE_CAP)
+    /// with a clear error — multi-page dtree walkers are a J.3
+    /// follow-up.
+    pub(crate) fn parse_inline_dtree(
+        &self,
+        dir_inode: &JfsDinode,
+    ) -> Result<Vec<DtreeEntry>, FilesystemError> {
+        if dir_inode.size > DT_INLINE_CAP {
+            return Err(FilesystemError::Unsupported(format!(
+                "JFS: directory inode {} has size {} > {} (multi-page \
+                 dtree walker not yet implemented)",
+                dir_inode.di_number, dir_inode.size, DT_INLINE_CAP
+            )));
+        }
+        if dir_inode.raw.len() < DI_OFF_TYPE_AREA + DTROOT_SIZE {
+            return Err(FilesystemError::Parse(format!(
+                "jfs: directory inode {} buffer too small for dtroot",
+                dir_inode.di_number
+            )));
+        }
+        let dtroot = &dir_inode.raw[DI_OFF_TYPE_AREA..DI_OFF_TYPE_AREA + DTROOT_SIZE];
+        let flag = dtroot[DTROOT_OFF_FLAG];
+        if flag & BT_TYPE_MASK & BT_INTERNAL_FLAG != 0 {
+            return Err(FilesystemError::Unsupported(format!(
+                "JFS: directory inode {} dtree has internal nodes — multi-page \
+                 dtree walker not yet implemented",
+                dir_inode.di_number
+            )));
+        }
+        let nextindex = dtroot[DTROOT_OFF_NEXTINDEX] as usize;
+        if nextindex > 8 {
+            return Err(FilesystemError::Parse(format!(
+                "jfs: directory inode {} dtroot nextindex {nextindex} > 8",
+                dir_inode.di_number
+            )));
+        }
+        let stbl = &dtroot[DTROOT_OFF_STBL..DTROOT_OFF_STBL + 8];
+
+        let mut entries = Vec::with_capacity(nextindex);
+        for (i, raw_slot) in stbl.iter().enumerate().take(nextindex) {
+            let slot_idx = *raw_slot as i8 as i32;
+            if !(0..=8).contains(&slot_idx) {
+                return Err(FilesystemError::Parse(format!(
+                    "jfs: directory inode {} stbl[{i}] = {slot_idx} out of range",
+                    dir_inode.di_number
+                )));
+            }
+            let slot_off = slot_idx as usize * DT_SLOT_SIZE;
+            let slot = &dtroot[slot_off..slot_off + DT_SLOT_SIZE];
+            // ldtentry: inumber u32 + next s8 + namlen u8 + name[11] u16 + index u32
+            let inumber = u32::from_le_bytes(slot[0..4].try_into().unwrap());
+            let mut next = slot[4] as i8 as i32;
+            let namlen = slot[5] as usize;
+            // First 11 UCS-2 chars live in the entry slot.
+            let mut name_buf: Vec<u16> = Vec::with_capacity(namlen);
+            let take_first = namlen.min(11);
+            for c in 0..take_first {
+                let cp_off = 6 + c * 2;
+                let cp = u16::from_le_bytes(slot[cp_off..cp_off + 2].try_into().unwrap());
+                name_buf.push(cp);
+            }
+            // Walk the continuation chain for remaining chars.
+            let mut remaining = namlen.saturating_sub(11);
+            while remaining > 0 {
+                if !(0..=8).contains(&next) {
+                    return Err(FilesystemError::Parse(format!(
+                        "jfs: directory inode {} name-continuation next slot {next} \
+                         out of range (remaining={remaining})",
+                        dir_inode.di_number
+                    )));
+                }
+                let cont_off = next as usize * DT_SLOT_SIZE;
+                let cont_slot = &dtroot[cont_off..cont_off + DT_SLOT_SIZE];
+                // dtslot: next s8 + cnt s8 + name[15] u16
+                let cont_next = cont_slot[0] as i8 as i32;
+                let cont_cnt = cont_slot[1] as usize;
+                let take = cont_cnt.min(15).min(remaining);
+                for c in 0..take {
+                    let cp_off = 2 + c * 2;
+                    let cp = u16::from_le_bytes(cont_slot[cp_off..cp_off + 2].try_into().unwrap());
+                    name_buf.push(cp);
+                }
+                remaining = remaining.saturating_sub(take);
+                next = cont_next;
+            }
+            let name = String::from_utf16_lossy(&name_buf);
+            entries.push(DtreeEntry { inumber, name });
+        }
+        Ok(entries)
+    }
+
+    /// Read a user file's data fork. Walks the inline xtree root only
+    /// (no xtpage chase yet) — refuses files larger than ~64 KiB of
+    /// data spread across more than 16 XADs with a clear error.
+    pub(crate) fn read_file_data(
+        &mut self,
+        file_inode: &JfsDinode,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, FilesystemError> {
+        let xtroot = self.parse_inline_xtree_root(&file_inode.raw)?;
+        if xtroot.flag & BT_TYPE_MASK & BT_INTERNAL_FLAG != 0 {
+            return Err(FilesystemError::Unsupported(format!(
+                "JFS: file inode {} has internal-node xtree (multi-level xtpage \
+                 walker not yet implemented)",
+                file_inode.di_number
+            )));
+        }
+        let total = (file_inode.size as usize).min(max_bytes);
+        let mut out: Vec<u8> = Vec::with_capacity(total);
+        for xad in &xtroot.xads {
+            if out.len() >= total {
+                break;
+            }
+            let logical_start_byte = xad.logical_offset * self.bsize;
+            // If the XAD's logical start is past where we are, the
+            // gap is sparse — emit zeros up to it.
+            if logical_start_byte as usize > out.len() {
+                let gap = (logical_start_byte as usize - out.len()).min(total - out.len());
+                out.resize(out.len() + gap, 0);
+                if out.len() >= total {
+                    break;
+                }
+            }
+            let extent_bytes = xad.physical_length as usize * self.bsize as usize;
+            let take = extent_bytes.min(total - out.len());
+            let byte = self.partition_offset + xad.physical_address * self.bsize;
+            self.reader.seek(SeekFrom::Start(byte))?;
+            let start = out.len();
+            out.resize(start + take, 0);
+            self.reader.read_exact(&mut out[start..start + take])?;
+        }
+        // Pad with zeros to file_size if there's a sparse tail.
+        if out.len() < total {
+            out.resize(total, 0);
+        }
+        Ok(out)
+    }
+
+    /// Decode an inline symlink target from `di_fastsymlink`. For
+    /// non-inline symlinks the target lives in the xtree-managed
+    /// data fork — falls back to `read_file_data`.
+    fn read_symlink_target(&mut self, link_inode: &JfsDinode) -> Result<String, FilesystemError> {
+        let size = link_inode.size as usize;
+        if size == 0 {
+            return Ok(String::new());
+        }
+        if size <= DI_FASTSYMLINK_LEN {
+            // Inline. di_fastsymlink lives at +256 in the dinode.
+            let bytes = &link_inode.raw[DI_OFF_FASTSYMLINK..DI_OFF_FASTSYMLINK + size];
+            return Ok(String::from_utf8_lossy(bytes).into_owned());
+        }
+        let bytes = self.read_file_data(link_inode, size)?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Build a `FileEntry` from a fileset dinode and a name + parent.
+    fn build_user_entry(
+        &mut self,
+        name: &str,
+        parent_path: &str,
+        child_dinode: &JfsDinode,
+    ) -> Result<FileEntry, FilesystemError> {
+        let path = if parent_path == "/" {
+            format!("/{name}")
+        } else {
+            format!("{parent_path}/{name}")
+        };
+        let loc = child_dinode.di_number as u64;
+        let mode = child_dinode.mode;
+        let posix_type = mode & S_IFMT;
+        let mut entry = match posix_type {
+            S_IFDIR => FileEntry::new_directory(name.to_string(), path, loc),
+            S_IFLNK => {
+                let target = self.read_symlink_target(child_dinode)?;
+                FileEntry::new_symlink(name.to_string(), path, child_dinode.size, loc, target)
+            }
+            S_IFREG => FileEntry::new_file(name.to_string(), path, child_dinode.size, loc),
+            S_IFBLK => FileEntry::new_special(name.to_string(), path, loc, "block device".into()),
+            S_IFCHR => FileEntry::new_special(name.to_string(), path, loc, "char device".into()),
+            S_IFIFO => FileEntry::new_special(name.to_string(), path, loc, "fifo".into()),
+            S_IFSOCK => FileEntry::new_special(name.to_string(), path, loc, "socket".into()),
+            _ => FileEntry::new_file(name.to_string(), path, child_dinode.size, loc),
+        };
+        // Carry mode + uid + gid through to the browse view; only the
+        // low 16 bits are the POSIX mode that `unix_mode_string`
+        // understands.
+        entry.mode = Some(mode & 0xFFFF);
+        entry.uid = Some(child_dinode.uid);
+        entry.gid = Some(child_dinode.gid);
+        if child_dinode.mtime_seconds != 0 {
+            entry.modified = Some(super::unix_common::inode::format_unix_timestamp(
+                child_dinode.mtime_seconds as i64,
+            ));
+        }
+        Ok(entry)
     }
 
     /// Read-back accessors.
@@ -764,6 +1098,30 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
     }
 }
 
+// ---- J.3: fileset / dtree types ----
+
+/// Decoded fileset Inode Allocation Group (IAG). Page 1 of the
+/// FILESYSTEM_I inode's data fork.
+#[derive(Debug, Clone)]
+pub struct FilesetIag {
+    pub agstart: u64,
+    pub iagnum: u32,
+    /// pmap[i]: bit-vector for the 32 inode extents covered by this
+    /// word (MSB = extent 0). Set bit = extent allocated.
+    pub pmap: [u32; EXTSPERIAG],
+    /// `inoext[i]` describes the on-disk extent holding fileset
+    /// inodes `i * INOSPEREXT .. +INOSPEREXT`. `length = 0` means
+    /// "unused slot."
+    pub inoext: Vec<Pxd>,
+}
+
+/// One dtree leaf entry: a child inode + UTF-8 name.
+#[derive(Debug, Clone)]
+pub struct DtreeEntry {
+    pub inumber: u32,
+    pub name: String,
+}
+
 // ---- J.2 / J.3: dinode + xtree types ----
 
 /// Parsed JFS on-disk inode. Holds the 512-byte raw buffer plus the
@@ -978,26 +1336,67 @@ fn parse_label(bytes: &[u8]) -> Option<String> {
 
 impl<R: Read + Seek + Send> Filesystem for JfsFilesystem<R> {
     fn root(&mut self) -> Result<FileEntry, FilesystemError> {
-        // Tier B (J.3 — AIT + fileset 1 root inode + xtree dir walker)
-        // will replace this with a real inode lookup. For Tier A we
-        // surface a stub root so the inspect tab renders.
-        Ok(FileEntry::root())
+        let iag = self.read_fileset_iag()?;
+        let root_dinode = self.read_fileset_inode(FILESET_ROOT_INO, &iag)?;
+        let mut entry = FileEntry::root();
+        entry.location = FILESET_ROOT_INO as u64;
+        entry.mode = Some(root_dinode.mode & 0xFFFF);
+        entry.uid = Some(root_dinode.uid);
+        entry.gid = Some(root_dinode.gid);
+        if root_dinode.mtime_seconds != 0 {
+            entry.modified = Some(super::unix_common::inode::format_unix_timestamp(
+                root_dinode.mtime_seconds as i64,
+            ));
+        }
+        Ok(entry)
     }
 
-    fn list_directory(&mut self, _entry: &FileEntry) -> Result<Vec<FileEntry>, FilesystemError> {
-        Err(FilesystemError::Unsupported(
-            "JFS directory browse not yet implemented (Tier B / J.3 pending)".into(),
-        ))
+    fn list_directory(&mut self, entry: &FileEntry) -> Result<Vec<FileEntry>, FilesystemError> {
+        let fino = entry.location as u32;
+        let iag = self.read_fileset_iag()?;
+        let dir_dinode = self.read_fileset_inode(fino, &iag)?;
+        if !dir_dinode.is_directory() {
+            return Err(FilesystemError::Parse(format!(
+                "jfs: list_directory on inode {fino} which is not a directory \
+                 (mode = 0o{:o})",
+                dir_dinode.mode
+            )));
+        }
+        let raw_entries = self.parse_inline_dtree(&dir_dinode)?;
+        let mut out: Vec<FileEntry> = Vec::with_capacity(raw_entries.len());
+        let parent_path = entry.path.as_str();
+        for raw in raw_entries {
+            let child_dinode = self.read_fileset_inode(raw.inumber, &iag)?;
+            let child_entry = self.build_user_entry(&raw.name, parent_path, &child_dinode)?;
+            out.push(child_entry);
+        }
+        Ok(out)
     }
 
     fn read_file(
         &mut self,
-        _entry: &FileEntry,
-        _max_bytes: usize,
+        entry: &FileEntry,
+        max_bytes: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
-        Err(FilesystemError::Unsupported(
-            "JFS file read not yet implemented (Tier B / J.3 pending)".into(),
-        ))
+        let fino = entry.location as u32;
+        let iag = self.read_fileset_iag()?;
+        let dinode = self.read_fileset_inode(fino, &iag)?;
+        match dinode.posix_type() {
+            S_IFREG => self.read_file_data(&dinode, max_bytes),
+            S_IFLNK => {
+                let target = self.read_symlink_target(&dinode)?;
+                let bytes = target.into_bytes();
+                let take = bytes.len().min(max_bytes);
+                Ok(bytes[..take].to_vec())
+            }
+            S_IFDIR => Err(FilesystemError::Parse(format!(
+                "jfs: read_file on directory inode {fino}"
+            ))),
+            _ => Err(FilesystemError::Unsupported(format!(
+                "jfs: cannot read special file inode {fino} (mode 0o{:o})",
+                dinode.mode
+            ))),
+        }
     }
 
     fn volume_label(&self) -> Option<&str> {
@@ -1201,6 +1600,7 @@ impl<R: Read + Seek> Read for CompactJfsReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fs::entry::EntryType;
     use std::io::Cursor;
 
     // ---- Synthetic superblock construction ----
@@ -1846,5 +2246,205 @@ mod tests {
             FilesystemError::Parse(msg) => assert!(msg.contains("nextindex 1")),
             other => panic!("expected Parse, got {other:?}"),
         }
+    }
+
+    // ---- J.3 — fileset + iag + dtree + browse + read_file ----
+
+    fn find_entry<'a>(entries: &'a [FileEntry], name: &str) -> &'a FileEntry {
+        entries
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("missing entry {name:?} in listing"))
+    }
+
+    #[test]
+    fn fixture_reads_fileset_iag() {
+        // Per probe-jfs-fileset.py: pmap[0] = 0xFF000000 (extents 0..7
+        // allocated), inoext[0] = (len=4, addr=28).
+        let img = load_fixture("test_jfs.img.zst");
+        let mut fs = JfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let iag = fs.read_fileset_iag().expect("read IAG");
+        assert_eq!(iag.iagnum, 0);
+        assert_eq!(iag.inoext[0].length, 4);
+        assert_eq!(iag.inoext[0].address, 28);
+        assert_eq!(iag.inoext[1].length, 4);
+        assert_eq!(iag.inoext[1].address, 36);
+        // pmap[0] = 0xFF000000 → top 8 bits set → extents 0..7 allocated.
+        assert_eq!(iag.pmap[0], 0xFF00_0000);
+    }
+
+    #[test]
+    fn fixture_reads_fileset_root_inode() {
+        let img = load_fixture("test_jfs.img.zst");
+        let mut fs = JfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let iag = fs.read_fileset_iag().expect("read IAG");
+        let root = fs
+            .read_fileset_inode(FILESET_ROOT_INO, &iag)
+            .expect("read root");
+        assert_eq!(root.di_number, FILESET_ROOT_INO);
+        // From probe: di_size=40, di_nlink=3, mode=0o240755 (S_IFDIR + 0o755).
+        assert_eq!(root.size, 40);
+        assert_eq!(root.nlink, 3);
+        assert_eq!(root.mode & 0xFFFF, 0o40755);
+        assert!(root.is_directory());
+    }
+
+    #[test]
+    fn fixture_root_listing_returns_all_user_entries() {
+        let img = load_fixture("test_jfs.img.zst");
+        let mut fs = JfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list root");
+
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names.len(),
+            5,
+            "expected 5 entries (hello.txt, large.bin, link.txt, subdir, tiny.txt); got {names:?}"
+        );
+        for expected in ["hello.txt", "large.bin", "link.txt", "subdir", "tiny.txt"] {
+            assert!(
+                names.contains(&expected),
+                "missing {expected}; got {names:?}"
+            );
+        }
+
+        let hello = find_entry(&entries, "hello.txt");
+        assert_eq!(hello.entry_type, EntryType::File);
+        assert_eq!(hello.size, 11);
+        assert_eq!(hello.path, "/hello.txt");
+
+        let subdir = find_entry(&entries, "subdir");
+        assert_eq!(subdir.entry_type, EntryType::Directory);
+        assert_eq!(subdir.path, "/subdir");
+    }
+
+    #[test]
+    fn fixture_inline_symlink_target_decodes() {
+        let img = load_fixture("test_jfs.img.zst");
+        let mut fs = JfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list root");
+        let link = find_entry(&entries, "link.txt");
+        assert_eq!(link.entry_type, EntryType::Symlink);
+        // 9 bytes ≤ 128 → inline. Target = "hello.txt".
+        assert_eq!(link.symlink_target.as_deref(), Some("hello.txt"));
+        assert_eq!(link.size, 9);
+    }
+
+    #[test]
+    fn fixture_reads_small_file() {
+        let img = load_fixture("test_jfs.img.zst");
+        let mut fs = JfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list");
+        let hello = find_entry(&entries, "hello.txt");
+        let bytes = fs.read_file(hello, 1_000_000).expect("read");
+        assert_eq!(bytes, b"Hello, JFS!");
+    }
+
+    #[test]
+    fn fixture_reads_tiny_file() {
+        let img = load_fixture("test_jfs.img.zst");
+        let mut fs = JfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list");
+        let tiny = find_entry(&entries, "tiny.txt");
+        let bytes = fs.read_file(tiny, 1_000_000).expect("read");
+        assert_eq!(bytes, b"tiny bytes");
+    }
+
+    #[test]
+    fn fixture_reads_24kib_file_via_xtree() {
+        // large.bin = 24 KiB = 6 aggregate blocks (bsize=4096); should
+        // fit in 1-2 inline xtree XADs. Deterministic content per the
+        // generator: data[i] = (i*37 + 11) & 0xFF.
+        let img = load_fixture("test_jfs.img.zst");
+        let mut fs = JfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list");
+        let big = find_entry(&entries, "large.bin");
+        assert_eq!(big.size, 24 * 1024);
+        let bytes = fs.read_file(big, 24 * 1024).expect("read");
+        assert_eq!(bytes.len(), 24 * 1024);
+        for i in [0usize, 1, 100, 4095, 4096, 8191, 8192, 12345, 16384, 24575] {
+            assert_eq!(
+                bytes[i],
+                ((i * 37 + 11) & 0xFF) as u8,
+                "large.bin[{i}] mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn fixture_read_file_honours_max_bytes() {
+        let img = load_fixture("test_jfs.img.zst");
+        let mut fs = JfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list");
+        let big = find_entry(&entries, "large.bin");
+        let bytes = fs.read_file(big, 5000).expect("read clamped");
+        assert_eq!(bytes.len(), 5000);
+        // First 5 KB still matches the deterministic content.
+        for i in [0usize, 100, 4095, 4999] {
+            assert_eq!(bytes[i], ((i * 37 + 11) & 0xFF) as u8);
+        }
+    }
+
+    #[test]
+    fn fixture_descends_subdir() {
+        let img = load_fixture("test_jfs.img.zst");
+        let mut fs = JfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list root");
+        let subdir = find_entry(&entries, "subdir");
+        let nested = fs.list_directory(subdir).expect("list subdir");
+        assert_eq!(nested.len(), 1);
+        assert_eq!(nested[0].name, "nested.txt");
+        assert_eq!(nested[0].path, "/subdir/nested.txt");
+        assert_eq!(nested[0].size, 11);
+        let bytes = fs.read_file(&nested[0], 1_000_000).expect("read nested");
+        assert_eq!(bytes, b"nested file");
+    }
+
+    #[test]
+    fn fixture_read_file_on_directory_is_parse_error() {
+        let img = load_fixture("test_jfs.img.zst");
+        let mut fs = JfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        let err = fs.read_file(&root, 64).expect_err("expected parse error");
+        assert!(matches!(err, FilesystemError::Parse(_)));
+    }
+
+    #[test]
+    fn fixture_read_file_on_symlink_returns_target_bytes() {
+        let img = load_fixture("test_jfs.img.zst");
+        let mut fs = JfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list");
+        let link = find_entry(&entries, "link.txt");
+        let bytes = fs.read_file(link, 1_000_000).expect("read symlink");
+        assert_eq!(bytes, b"hello.txt");
+    }
+
+    #[test]
+    fn list_directory_filesystem_metadata_carries_uid_gid_mtime() {
+        let img = load_fixture("test_jfs.img.zst");
+        let mut fs = JfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list");
+        let hello = find_entry(&entries, "hello.txt");
+        // The fixture was created with default uid/gid = 0 (running as
+        // root inside guestfish). mtime is the build timestamp;
+        // assert it's *some* string rather than pinning a value.
+        assert_eq!(hello.uid, Some(0));
+        assert_eq!(hello.gid, Some(0));
+        assert!(hello.modified.is_some());
+        // Mode string should start with '-' (regular file).
+        let ms = hello.mode_string().unwrap();
+        assert!(
+            ms.starts_with('-'),
+            "expected mode_string to begin with '-', got {ms}"
+        );
     }
 }

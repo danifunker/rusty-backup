@@ -74,12 +74,10 @@ Add a new entry here every time you park an item with "need fixture".
     `linux-modules-extra-$(uname -r)` (same pattern as the ReiserFS
     fixture). 16 MiB is the JFS minimum — anything smaller and
     mkfs.jfs refuses.
-- **§1.3 J.2 / J.3 — BMAP B+tree walker + Tier B browse** still
-  parked, but **not fixture-blocked** — the fixture above already
-  carries the file tree J.3 will need. Parked for scope (multi-
-  session walker, ~2000 lines of kernel reference for J.2 alone).
-  Pick up if real demand surfaces for trimming free blocks out of
-  JFS backups.
+- **§1.3 J.2 / J.3 — shipped 2026-06-02.** The fixture above drove
+  both the BMAP-walker tests (47 allocated blocks / 3741 free,
+  layout-preserving compaction) and the Tier B browse tests
+  (5 user entries + recursive subdir + 24 KiB xtree read).
 
 ## NTFS file-aware GHO (compressed)
 
