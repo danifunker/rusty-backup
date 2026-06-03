@@ -3162,6 +3162,226 @@ mod tests {
         );
     }
 
+    /// §2.1 hole (E.5b): drive `alloc_new_inode_chunk` on the v5 modern
+    /// fixture. Mirrors the v4 single-leaf test (`alloc_new_inode_chunk_
+    /// extends_inobt_and_keeps_volume_clean`) but checks every v5
+    /// invariant — AGI/AGF/SB CRCs re-verify, the inobt leaf's sblock-crc
+    /// re-verifies, and every fresh dinode in the new chunk carries the
+    /// v3 core (di_version=3, di_ino, di_uuid, valid di_crc).
+    #[test]
+    fn alloc_new_inode_chunk_on_v5_stamps_every_block_and_stays_clean() {
+        use crate::fs::xfs::ag::{XfsAgf, XfsAgi};
+        use crate::fs::xfs::types::XFS_INODES_PER_CHUNK;
+        use crate::fs::xfs::v5_crc::{
+            crc_valid, AGF_CRC_OFF, AGI_CRC_OFF, INODE_V3_DI_CRC_OFF, INODE_V3_DI_INO_OFF,
+            INODE_V3_DI_UUID_OFF, SBLOCK_CRC_CRC_OFF, SB_CRC_OFF,
+        };
+
+        let img = load_modern_fixture().to_vec();
+        let mut cursor = Cursor::new(img);
+
+        let (sb, sectsize, blocksize, agi_byte0, agf_byte0, agbno_root, counts_before) = {
+            let fs = XfsFilesystem::open(&mut cursor, 0).expect("open v5");
+            let sb = fs.superblock().clone();
+            assert!(sb.is_v5(), "expected v5 fixture");
+            let sectsize = sb.sectsize as u64;
+            let blocksize = sb.blocksize as u64;
+            let agi_byte0 = 2 * sectsize;
+            let agf_byte0 = sectsize;
+            let mut agi_sec = vec![0u8; sectsize as usize];
+            read_at_aligned(
+                &mut Cursor::new(cursor.get_ref().as_slice()),
+                agi_byte0,
+                sectsize,
+                &mut agi_sec,
+            )
+            .expect("AGI 0 pre");
+            let agi = XfsAgi::parse(&agi_sec).unwrap();
+            let mut primary = vec![0u8; sectsize as usize];
+            read_at_aligned(
+                &mut Cursor::new(cursor.get_ref().as_slice()),
+                0,
+                sectsize,
+                &mut primary,
+            )
+            .expect("SB pre");
+            let sb_icount = BigEndian::read_u64(&primary[128..136]);
+            let sb_ifree = BigEndian::read_u64(&primary[136..144]);
+            (
+                sb,
+                sectsize,
+                blocksize,
+                agi_byte0,
+                agf_byte0,
+                agi.root,
+                (agi.count, agi.freecount, sb_icount, sb_ifree),
+            )
+        };
+        let (agi_count_before, agi_freecount_before, sb_icount_before, sb_ifree_before) =
+            counts_before;
+
+        // Drive the new-chunk allocation. With the v5 gate lifted this
+        // should now succeed against the modern fixture.
+        {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable v5");
+            fs.alloc_new_inode_chunk(&sb)
+                .expect("alloc_new_inode_chunk on v5");
+            use crate::fs::filesystem::EditableFilesystem;
+            fs.sync_metadata().expect("sync");
+        }
+
+        // AGI / AGF / SB still CRC-valid after every write site stamped on
+        // the way out (E.5a path).
+        let mut agi_after = vec![0u8; sectsize as usize];
+        read_at_aligned(
+            &mut Cursor::new(cursor.get_ref().as_slice()),
+            agi_byte0,
+            sectsize,
+            &mut agi_after,
+        )
+        .expect("AGI 0 post");
+        assert!(
+            crc_valid(&agi_after, AGI_CRC_OFF),
+            "AGI CRC invalid after chunk alloc"
+        );
+        let agi_parsed = XfsAgi::parse(&agi_after).unwrap();
+        assert_eq!(
+            agi_parsed.count,
+            agi_count_before + XFS_INODES_PER_CHUNK as u32
+        );
+        assert_eq!(
+            agi_parsed.freecount,
+            agi_freecount_before + XFS_INODES_PER_CHUNK as u32
+        );
+
+        let mut agf_after = vec![0u8; sectsize as usize];
+        read_at_aligned(
+            &mut Cursor::new(cursor.get_ref().as_slice()),
+            agf_byte0,
+            sectsize,
+            &mut agf_after,
+        )
+        .expect("AGF 0 post");
+        assert!(
+            crc_valid(&agf_after, AGF_CRC_OFF),
+            "AGF CRC invalid after chunk alloc"
+        );
+        let _ = XfsAgf::parse(&agf_after).expect("AGF parses after rebuild");
+
+        let mut sb_after = vec![0u8; sectsize as usize];
+        read_at_aligned(
+            &mut Cursor::new(cursor.get_ref().as_slice()),
+            0,
+            sectsize,
+            &mut sb_after,
+        )
+        .expect("SB post");
+        assert!(
+            crc_valid(&sb_after, SB_CRC_OFF),
+            "SB CRC invalid after chunk alloc"
+        );
+        assert_eq!(
+            BigEndian::read_u64(&sb_after[128..136]),
+            sb_icount_before + XFS_INODES_PER_CHUNK as u64
+        );
+        assert_eq!(
+            BigEndian::read_u64(&sb_after[136..144]),
+            sb_ifree_before + XFS_INODES_PER_CHUNK as u64
+        );
+
+        // The single-leaf inobt at the AGI root must still parse via the v5
+        // 56-byte hdr and have its sblock-crc re-verified.
+        let leaf_fsblock = agbno_root as u64; // AG 0 → fsblock == agbno
+        let leaf_byte = leaf_fsblock * blocksize;
+        let mut leaf_after = vec![0u8; blocksize as usize];
+        read_at_aligned(
+            &mut Cursor::new(cursor.get_ref().as_slice()),
+            leaf_byte,
+            blocksize,
+            &mut leaf_after,
+        )
+        .expect("inobt leaf post");
+        assert!(
+            crc_valid(&leaf_after, SBLOCK_CRC_CRC_OFF),
+            "inobt leaf sblock CRC invalid after splice"
+        );
+        // Find a record matching `(64, u64::MAX)` — our new chunk.
+        let hdr_len = 56; // v5 XFS_BTREE_SBLOCK_CRC_LEN
+        let numrecs = BigEndian::read_u16(&leaf_after[6..8]) as usize;
+        let mut found_new_record = false;
+        let mut new_start_agino = 0u32;
+        for r in 0..numrecs {
+            let off = hdr_len + r * 16; // INOBT_REC_SIZE
+            let fc = BigEndian::read_u32(&leaf_after[off + 4..off + 8]);
+            let free = BigEndian::read_u64(&leaf_after[off + 8..off + 16]);
+            if fc == XFS_INODES_PER_CHUNK as u32 && free == u64::MAX {
+                assert!(!found_new_record, "more than one all-free chunk record");
+                found_new_record = true;
+                new_start_agino = BigEndian::read_u32(&leaf_after[off..off + 4]);
+            }
+        }
+        assert!(
+            found_new_record,
+            "new all-free chunk record missing from inobt leaf"
+        );
+
+        // Every fresh dinode in the new chunk: di_magic + di_version=3 +
+        // di_ino = start_ino + slot + di_uuid = sb_meta_uuid + valid di_crc.
+        let inodesize = sb.inodesize as u64;
+        let blocks_per_chunk =
+            ((XFS_INODES_PER_CHUNK as u64) * inodesize).div_ceil(blocksize) as usize;
+        let chunk_agbno = (new_start_agino as u64) >> sb.inopblog;
+        let chunk_byte = chunk_agbno * blocksize;
+        let span = blocks_per_chunk * blocksize as usize;
+        let mut chunk_bytes = vec![0u8; span];
+        read_at_aligned(
+            &mut Cursor::new(cursor.get_ref().as_slice()),
+            chunk_byte,
+            span as u64,
+            &mut chunk_bytes,
+        )
+        .expect("new chunk bytes");
+
+        let ino_shift = sb.agblklog + sb.inopblog;
+        let start_ino = (0u64 << ino_shift) | new_start_agino as u64;
+        for slot in 0..XFS_INODES_PER_CHUNK {
+            let base = slot * inodesize as usize;
+            let slot_buf = &chunk_bytes[base..base + inodesize as usize];
+            assert_eq!(
+                BigEndian::read_u16(&slot_buf[0..2]),
+                super::types::XFS_DINODE_MAGIC,
+                "slot {slot} missing di_magic"
+            );
+            assert_eq!(slot_buf[4], 3, "slot {slot} di_version should be 3 on v5");
+            assert_eq!(
+                BigEndian::read_u64(&slot_buf[INODE_V3_DI_INO_OFF..INODE_V3_DI_INO_OFF + 8]),
+                start_ino + slot as u64,
+                "slot {slot} di_ino mismatch"
+            );
+            assert_eq!(
+                &slot_buf[INODE_V3_DI_UUID_OFF..INODE_V3_DI_UUID_OFF + 16],
+                sb.meta_uuid(),
+                "slot {slot} di_uuid != sb_meta_uuid"
+            );
+            assert!(
+                crc_valid(slot_buf, INODE_V3_DI_CRC_OFF),
+                "slot {slot} di_crc invalid"
+            );
+        }
+
+        // End-to-end: our own verifier stays clean over the extended v5
+        // volume. This catches structural issues across AGI / AGF / inobt /
+        // SB that the per-stamp checks above might miss.
+        let extended = cursor.into_inner();
+        let mut fs = XfsFilesystem::open(Cursor::new(extended), 0).expect("reopen v5");
+        let res = fs.run_fsck().expect("fsck after v5 new-chunk allocation");
+        assert!(
+            res.errors.is_empty(),
+            "expected clean v5 volume after new-chunk alloc, got: {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn alloc_new_inode_chunk_promotes_full_leaf_to_multi_level() {
         // §2.1 hole (A) follow-up: when the AG's only inobt leaf is full

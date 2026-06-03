@@ -41,7 +41,10 @@ use super::bmap::fsblock_to_partition_byte;
 use super::btree_build::{blocks_needed_for, build_sblock_btree};
 use super::freespace_rebuild::{carve_from_largest, derive_free_extents, InUseMap};
 use super::sb::XfsSuperblock;
-use super::types::{NULLAGBLOCK, XFS_IBT_MAGIC, XFS_INODES_PER_CHUNK};
+use super::types::{
+    NULLAGBLOCK, XFS_BTREE_SBLOCK_CRC_LEN, XFS_BTREE_SBLOCK_LEN, XFS_IBT_CRC_MAGIC, XFS_IBT_MAGIC,
+    XFS_INODES_PER_CHUNK,
+};
 use super::{read_at_aligned, XfsFilesystem};
 use crate::fs::filesystem::FilesystemError;
 use crate::fs::fsck::RepairReport;
@@ -336,7 +339,17 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         root: u32,
     ) -> Result<(Vec<u32>, Vec<u32>), FilesystemError> {
         let bs = sb.blocksize as usize;
-        let max_intern = (bs - INOBT_HDR_LEN) / (4 + 4); // 4-byte key + 4-byte ptr
+        let hdr = if sb.is_v5() {
+            XFS_BTREE_SBLOCK_CRC_LEN
+        } else {
+            XFS_BTREE_SBLOCK_LEN
+        };
+        let want_magic = if sb.is_v5() {
+            XFS_IBT_CRC_MAGIC
+        } else {
+            XFS_IBT_MAGIC
+        };
+        let max_intern = (bs - hdr) / (4 + 4); // 4-byte key + 4-byte ptr
         let mut block = vec![0u8; bs];
         let mut leaves = Vec::new();
         let mut all = Vec::new();
@@ -356,7 +369,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             let fsblock = (agno << sb.agblklog) | agbno as u64;
             self.read_fsblock(fsblock, &mut block)?;
             let magic = BigEndian::read_u32(&block[0..4]);
-            if magic != XFS_IBT_MAGIC {
+            if magic != want_magic {
                 return Err(FilesystemError::Parse(format!(
                     "bad inobt magic 0x{magic:08X} at AG {agno} block {agbno}"
                 )));
@@ -371,7 +384,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                         "AG {agno} inobt node numrecs {numrecs} > max {max_intern}"
                     )));
                 }
-                let ptr_base = INOBT_HDR_LEN + max_intern * 4;
+                let ptr_base = hdr + max_intern * 4;
                 for i in 0..numrecs {
                     let off = ptr_base + i * 4;
                     stack.push(BigEndian::read_u32(&block[off..off + 4]));
