@@ -362,18 +362,48 @@ aren't lost.
   and audited.
 - **XFS R2 (freespace rebuild) + R3 (inobt rebuild) on v5.** Both
   helpers can now emit CRC-correct sblock-crc trees (E.4 wired
-  `build_alloc_btree` / `build_sblock_btree` for v5). What stops a
-  safe lift is structural, not a TODO: v5 layouts may carry `finobt`
-  (free inode btree) / `rmapbt` (reverse-map btree) / `refcountbt`
-  (reflink refcount btree) ro-compat metadata that our in-memory
-  block-completeness map and AGI-summary recompute don't model.
-  Rebuilding the bnobt / cntbt / inobt without resyncing the finobt
-  would leave those side-trees with stale records — the rebuild
-  succeeds but `xfs_repair -n` post-repair re-flags. Lift requires
-  modeling each side-tree we encounter (read-side already finobt-
-  tolerant; rmapbt and refcountbt have no read-side path yet
-  either). Revisit when a v5 image actually carrying one of these
-  features needs `--repair` AND we have an oracle to verify against.
+  `build_alloc_btree` / `build_sblock_btree` for v5). What stops the
+  v5 lift is unwritten side-tree code, not fundamental:
+
+  The bundled `xfs_v5_modern_small.img.zst` fixture is sufficient
+  (modern mkfs.xfs defaults to `crc=1 finobt=1 reflink=1`), the
+  WSL oracle works (`xfs_repair -n` available in xfsprogs 5.x), and
+  `features_ro_compat` is already parsed in `sb.rs:129`. The actual
+  gaps are:
+
+  1. **finobt parser** — `agi_free_root` + `agi_free_level` are read
+     into `XfsSuperblock` but never walked. Adding a `walk_finobt`
+     (records are the same `xfs_inobt_rec` shape as inobt, so the
+     existing walker generalises with a magic-list parameter) +
+     `XFS_FIBT_CRC_MAGIC = 0x46494233` / `XFS_FIBT_MAGIC = 0x46494221`
+     unlocks block-completeness-map accounting for finobt blocks.
+     ~150 LOC.
+  2. **refcountbt parser** — `agf_refcount_root` + `agf_refcount_level`
+     not in tree. With reflink=1 (modern default) refcountbt is
+     allocated even if empty. ~200 LOC parser + walker that marks
+     refcountbt blocks. `XFS_REFC_CRC_MAGIC = 0x52334320`.
+  3. **rmapbt parser** — `agf_rmap_root` + `agf_rmap_level`. Only
+     present when rmap=1 (opt-in; modern default OFF). Same shape as
+     above. `XFS_RMAP_CRC_MAGIC = 0x524d4233`. ~200 LOC.
+  4. **R2 v5 gate lift** — `freespace_rebuild.rs:119-124` early-
+     returns on `sb.is_v5()`. With (1)-(3) accounted, lift the gate
+     and let the v4 rebuild logic run on v5. Plus the
+     `fsck.rs:421-423` "v5 is read-only-best-effort" comment goes.
+  5. **R3 finobt resync** — `agi_root` rebuild already shipped (E.4).
+     For v5 with finobt, R3 must also rebuild finobt against the new
+     inobt records so the two stay coherent. Needs a `build_finobt`
+     mirroring our `build_sblock_btree` ~300 LOC.
+  6. **Refusal when (2)/(3) trees are populated but parser absent** —
+     until the parsers land, refuse R2/R3 on rmapbt or non-empty
+     refcountbt with a clear "feature X enabled — not yet supported"
+     error rather than silent v5-gate dropthrough.
+
+  Park reason: the modern-default v5 image has finobt + (empty)
+  refcountbt, so (1) + (2) + (4) + (6) is a ~750 LOC slice to unlock
+  R2 on default modern v5 images. R3 inobt-rebuild requires (5) on
+  top. Substantial but not blocked on external dependencies. Track
+  here under "scoped, not started"; pick up alongside the next time
+  XFS work gets opened.
 
 ---
 
