@@ -20,14 +20,17 @@ here.
 (JFS2) all read end-to-end through the trait: inspect, layout-preserving
 backup compactor, browse, file read, symlinks, recursive directory
 descent. UFS U.4 (fsck + edit + repair) shipped 2026-06-03; see §10
-for the per-FS one-liners. JFS J.4a (fsck read-only verifier) and
-multi-IAG dispatch covering >4k inodes both shipped 2026-06-03 late;
-J.4b (edit-side write primitives) and the multi-page external-dtree
-walker remain parked in §8 behind real demand. The multi-level dmapctl
-walker (>32 GiB JFS aggregates) is in §9 explicitly excluded — vintage
-hardware doesn't address that scale. ReiserFS is intentionally
-read-only forever (filesystem leaving the kernel; investment caps at
-"read what exists").
+for the per-FS one-liners. JFS J.4a (fsck read-only verifier),
+multi-IAG dispatch covering >4k inodes, and the multi-page external
+dtree walker (>127-entry directories) all shipped 2026-06-03 late. The
+JFS fixture was regenerated in WSL Ubuntu-24.04 to include
+`/bigdir/file_001..200` for the dtree-walker regression. J.4b
+(edit-side write primitives) remains parked in §8 behind real demand
+— `repair()` that adopts OrphanInode findings depends on it. The
+multi-level dmapctl walker (>32 GiB JFS aggregates) is in §9
+explicitly excluded — vintage hardware doesn't address that scale.
+ReiserFS is intentionally read-only forever (filesystem leaving the
+kernel; investment caps at "read what exists").
 
 ---
 
@@ -347,80 +350,34 @@ both fixtures and oracles are accessible from this host.
   gating in CLI + GUI, structured-output via `rb-cli fsck --format
   json`); J.4b's value depends on the volume of OrphanInode findings
   in the wild, which is empirically rare.
-- **JFS multi-page dtree walker (read-side).** `parse_inline_dtree`
-  still refuses `di_size > DT_INLINE_CAP` (4096 bytes) and
-  internal-node dtrees. Unblocks any directory whose entries spill
-  past the 8-slot inline stbl into off-disk pages. Layout notes from
-  the parked-item exploration: external dtpages are 4 KiB with a
-  40-byte header at the page start: `next i64 / prev i64 / flag u8
-  / rsrvd[3] / nextindex i16 / freecnt i16 / freelist i16 / maxslot
-  u8 / stblindex u8 / rsrvd[2] / self pxd`, then dtslots (32 B each)
-  up to DTPAGEMAXSLOT=128. Internal entry layout is `idtentry { xd
-  pxd 8B + next i8 + namlen u8 + name[11] u16 }` — same 32 B as
-  ldtentry. The slice needs a fixture with a directory > 127 entries
-  to verify the recursive descent; the xtpage walker pattern from
-  2026-06-03 carries over, but leaf-page contents are dtree records
-  rather than XADs so it's a separate parser. **Fixture groundwork
-  landed 2026-06-03 late**: `scripts/generate-jfs-fixtures.sh` now
-  also creates `/bigdir` with 200 numbered tiny files — past the
-  inline-dtroot's ~8-slot cap, forcing JFS to convert the dir to an
-  external dtree with off-disk dtpages. Next person to regen the
-  fixture (Linux box with `jfsutils` + `libguestfs-tools`) gets the
-  external-dtree coverage automatically. Park reason: shipping an
-  unverified B+tree walker is higher-risk than the value of
-  speculative support; refused on demand with a clear error today.
-  J.4a fsck also emits an `ExternalDtreeNotWalked` warning on
-  encounter so the verifier's silence on subtrees-not-walked is loud
-  and audited.
-- **XFS R2 (freespace rebuild) + R3 (inobt rebuild) on v5.** Both
-  helpers can now emit CRC-correct sblock-crc trees (E.4 wired
-  `build_alloc_btree` / `build_sblock_btree` for v5). What stops the
-  v5 lift is unwritten side-tree code, not fundamental:
+- **XFS rmapbt rebuild + refcountbt rebuild** (R2 / R3 fully on v5
+  with all features). Slices 1–6 of the previous v5-unlock plan all
+  shipped 2026-06-03 late (see §10): finobt + rmapbt + refcountbt
+  parsers + walkers, R2 v5 gate lift, safe-feature gating, and R3
+  finobt resync. What's left to make R2 / R3 SAFE on volumes with
+  rmapbt enabled (modern xfsprogs 6.6.0 default, including the
+  bundled v5 fixture):
 
-  The bundled `tests/fixtures/sgi/xfs_v5_modern_small.img.zst` carries
-  `features_ro_compat = 0xf` per `xfs_db` probe — **all four**
-  ro-compat features on: FINOBT, RMAPBT, REFLINK, INOBTCNT (modern
-  xfsprogs 6.6.0 defaults rmapbt=1, no longer opt-in). The WSL
-  oracle works (`xfs_repair -n` from xfsprogs 6.6.0), and
-  `features_ro_compat` is already parsed in `sb.rs:129`. The actual
-  gaps to unlock R2 on the bundled fixture are:
+  1. **rmapbt rebuild on R2.** When R2 rewrites bnobt/cntbt and frees
+     the old tree blocks, every rmapbt record pointing at those old
+     blocks goes stale. R2 currently refuses on `has_rmapbt()` to
+     avoid the skew. Lift requires walking rmapbt to find affected
+     records, emitting new records pointing at the new tree blocks,
+     and updating AGF's rmap counters.
+  2. **rmapbt rebuild on R3.** Same problem for R3's inobt rewrites.
+     R3 currently refuses on `has_rmapbt()`.
+  3. **refcountbt rebuild on reflink-active volumes.** Modern mkfs
+     enables reflink by default even when no reflinks exist (empty
+     refcountbt). Once a reflink is actually created, R2's bnobt
+     rewrite needs to preserve refcount records over the affected
+     blocks.
 
-  1. **finobt parser** — `agi_free_root` + `agi_free_level` are read
-     into `XfsSuperblock` but never walked. Adding a `walk_finobt`
-     (records are the same `xfs_inobt_rec` shape as inobt, so the
-     existing walker generalises with a magic-list parameter) +
-     `XFS_FIBT_CRC_MAGIC = 0x46494233` / `XFS_FIBT_MAGIC = 0x46494221`
-     unlocks block-completeness-map accounting for finobt blocks.
-     ~150 LOC.
-  2. **refcountbt parser** — `agf_refcount_root` + `agf_refcount_level`
-     not in tree. With reflink=1 (modern default) refcountbt is
-     allocated even if empty. ~200 LOC parser + walker that marks
-     refcountbt blocks. `XFS_REFC_CRC_MAGIC = 0x52334320`.
-  3. **rmapbt parser** — `agf_rmap_root` + `agf_rmap_level`. Modern
-     mkfs.xfs default (rmapbt=1 in xfsprogs 6.6.0; the bundled
-     fixture has it on). Same shape as above.
-     `XFS_RMAP_CRC_MAGIC = 0x524d4233`. ~200 LOC.
-  4. **R2 v5 gate lift** — `freespace_rebuild.rs:119-124` early-
-     returns on `sb.is_v5()`. With (1)-(3) accounted, lift the gate
-     and let the v4 rebuild logic run on v5. Plus the
-     `fsck.rs:421-423` "v5 is read-only-best-effort" comment goes.
-  5. **R3 finobt resync** — `agi_root` rebuild already shipped (E.4).
-     For v5 with finobt, R3 must also rebuild finobt against the new
-     inobt records so the two stay coherent. Needs a `build_finobt`
-     mirroring our `build_sblock_btree` ~300 LOC.
-  6. **Refusal when (2)/(3) trees are populated but parser absent** —
-     until the parsers land, refuse R2/R3 on rmapbt or non-empty
-     refcountbt with a clear "feature X enabled — not yet supported"
-     error rather than silent v5-gate dropthrough.
-
-  Park reason: the bundled v5 fixture has all four ro-compat
-  features on, so the safe-on-bundled-fixture slice is
-  (1)+(2)+(3)+(4)+(6) ≈ ~950 LOC to unlock R2. R3 inobt-rebuild
-  needs (5) on top (~300 LOC more — finobt resync builder).
-  Substantial but not blocked on external dependencies; the WSL
-  oracle (xfsprogs 6.6.0) and the bundled fixture together cover
-  the verification surface. Track here under "scoped, not started";
-  pick up alongside the next XFS-work window.
+  Park reason: the bundled fixture has rmapbt=1, so R2 / R3 stay
+  silent-skipped on it. R3 finobt resync (slice 5) is reachable on
+  v5+FINOBT-only volumes (rare without rmapbt). The rmapbt rebuild
+  is genuinely a separate slice — ~500-800 LOC — and lands when a
+  user actually needs `--repair` on a modern v5 image with damaged
+  bnobt / inobt.
 
 ---
 
@@ -469,6 +426,75 @@ Audit trail. Each was either shipped, closed-by-design, or moved into
 the structure above before its source plan doc was deleted in the
 docs-consolidation pass.
 
+- **XFS R3 finobt resync (slice 5) (§8 parked → §10)** — `repair_inobt_
+  leaf` now uses `sb.sblock_hdr_len()` (was hardcoded 16-byte v4
+  header) and re-stamps sblock-CRC on v5, returns per-record
+  `InobtRecordChange` so the caller can propagate into finobt.
+  New `sync_finobt_for_changes` walks the AG's finobt with the
+  generalised `walk_short_btree_blocks`, finds each change's
+  start_agino key, rewrites the matching record's mask + freecount
+  in place, re-stamps the CRC. Pure-update transitions only;
+  0-boundary transitions refuse cleanly with `Unsupported` so the
+  caller surfaces a per-AG failure entry. R3 driver's
+  `has_finobt()` early skip comes down (rmapbt still gates).
+  Tests added (2): direct call of `sync_finobt_for_changes` on
+  the v5 fixture's AG 0 finobt verifying mask propagation + CRC
+  re-stamp + on-disk bytes; refusal-path test asserting the
+  zero-boundary `Unsupported` error.
+- **XFS v5 side-tree walks (slices 1+2+3+4+6) (§8 parked → §10)** —
+  Modern xfsprogs 6.6.0's bundled v5 fixture has
+  `features_ro_compat = 0xF` (FINOBT + RMAPBT + REFLINK +
+  INOBTCNT). All three side-trees now parsed and walked into the
+  block-completeness map. (1) finobt: `XFS_FIBT_MAGIC` +
+  `XFS_FIBT_CRC_MAGIC` constants, `XfsAgi` reads `agi_free_root` /
+  `agi_free_level` at offsets 328/332, `XfsSuperblock::has_finobt()`
+  /` finobt_magic()` helpers, `walk_short_btree_blocks` generalised
+  from `walk_inobt` so the same descent shape drives finobt walks
+  too. (2) refcountbt: parses `agf_refcount_root` / `_level` at
+  offsets 88/92. On-disk magic is `R3FC` (0x52334643), not `R3C `
+  (0x52334320) as older kernel headers list — verified via probe
+  of the bundled fixture. (3) rmapbt: parses `agf_rmap_root` /
+  `_level` at offsets 24/36 (= `agf_roots[2]` / `agf_levels[2]`).
+  (4) `check_allocations` in fsck.rs now walks each side-tree per
+  AG when its corresponding ro_compat bit is on; the
+  `if !sb.is_v5()` gate around `UnaccountedBlocks` comes down. (6)
+  R2 silently skips on `has_rmapbt() || has_reflink()` and R3
+  silently skips on `has_rmapbt()` — preserves the "no-op on clean
+  volume" promise without claiming to safely rebuild trees whose
+  side-tree records would go stale. Tests added (2):
+  `opens_modern_xfs_v5_fixture` extended to assert all three
+  feature bits AND that AG 0's three side-tree roots are populated
+  in `XfsAgf` / `XfsAgi`; `repair_r6_drops_dangling_shortform_
+  entry_on_v5_fixture` tolerates the now-active `UnaccountedBlocks`
+  finding (R6 zeroes an inode without freeing its blocks; the
+  completeness check correctly surfaces those blocks as leaked).
+- **JFS multi-page dtree walker (§8 parked → §10)** —
+  `parse_inline_dtree` (name kept for API compat; now handles
+  external dtrees too) descends BT_INTERNAL dtroots into off-disk
+  dtpages. CRITICAL finding: kernel jfs_dtree.h declares dtpage's
+  `nextindex`/`freecnt`/`freelist` as `__le16`, but on-disk truth
+  (confirmed via probe of `/bigdir` in the regenerated fixture) is
+  u8 — matching dtroot's layout. Walker uses on-disk layout: header
+  is 32 bytes (one slot), u8 fields at offsets 17–21, self_pxd at
+  24. Recursive descent with `DTREE_MAX_DEPTH = 16` +
+  `DTREE_MAX_PAGES_VISITED = 65536` cycle/budget guards. Shared
+  `parse_dtree_ldtentry` decoder + continuation-slot closure works
+  for both inline-dtroot (continuation in dtroot bytes) and
+  external-dtpage (continuation in same page) slot pools. Fixture
+  regenerated via WSL Ubuntu-24.04's
+  `scripts/generate-jfs-fixtures.sh` to add `/bigdir/file_001..200`
+  past the inline 8-slot cap, forcing JFS to convert /bigdir to an
+  external dtree (1 internal dtroot + 2 leaf dtpages chained via
+  sibling next pointers). Tests added (2 + 6 re-pinned): full walk
+  emits all 200 unique names; `read_file` round-trips file_001's
+  "line 001" content after walker enumerated it; bmap / pmap / root-
+  inode / used-size assertions re-pinned for new fixture geometry
+  (pmap[0]=0xFFFFFFFF, mapsize=3788 nfree=3514 alloc=274,
+  root.size=48 nlink=4); orphan-detection test moved to fino 34
+  (extent 1) since fino 8 is now a real bigdir/file_001 entry.
+  J.4a fsck `ExternalDtreeNotWalked` warning path remains as
+  defence-in-depth for future fixtures with even-deeper dtrees but
+  is dormant on the current fixture.
 - **JFS J.4a — fsck (read-only verifier) (§8 parked → §10)** — new
   `src/fs/jfs_fsck.rs` (~370 LOC) closes the read-side half of the §8
   J.4 entry. Mirrors `ufs_fsck.rs` / `efs_fsck.rs` in shape (Builder
