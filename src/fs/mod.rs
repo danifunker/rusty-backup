@@ -188,6 +188,9 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
                     return "hfs";
                 }
                 0x482B | 0x4858 => return "hfsplus",
+                // MFS — pre-HFS, used by Mac 128K/512K and Mac Plus on 400 KB
+                // single-sided floppies. Same byte-1024 MDB convention as HFS.
+                0xD2D7 => return "mfs",
                 _ => {}
             }
             // ext superblock magic at offset 0x38 (56) within this sector
@@ -1092,6 +1095,10 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     partition_offset,
                 )?)),
                 "hfsplus" => Ok(Box::new(hfsplus::HfsPlusFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "mfs" => Ok(Box::new(mfs::MfsFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),

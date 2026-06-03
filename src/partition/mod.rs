@@ -171,6 +171,9 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
             match sig {
                 0x4244 => return Some("HFS".to_string()),
                 0x482B | 0x4858 => return Some("HFS+".to_string()),
+                // MFS — pre-HFS, used by Mac 128K/512K and Mac Plus on 400 KB
+                // single-sided floppies. Same byte-1024 MDB convention as HFS.
+                0xD2D7 => return Some("MFS".to_string()),
                 _ => {}
             }
             // ext2/3/4 superblock magic 0xEF53 (LE u16) at byte 0x38 of the
