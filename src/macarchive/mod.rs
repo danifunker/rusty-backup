@@ -11,6 +11,7 @@
 //! See `docs/native_mac_archives.md` for the format references and roadmap.
 
 pub mod bitreader_be;
+pub mod detect;
 pub mod extract;
 pub mod stuffit;
 pub mod stuffit13_tables;
