@@ -1578,6 +1578,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                     dotdot,
                     sb.dirblksize() as usize,
                     has_ftype,
+                    sb.is_v5(),
                 )
                 .map(|_| ())
             }
@@ -1600,7 +1601,14 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                 };
                 entries.push((name.to_string(), 0, ft));
                 let dirblksize = sb.dirblksize() as usize;
-                match build_block_dir(&entries, parent_ino, dotdot, dirblksize, has_ftype) {
+                match build_block_dir(
+                    &entries,
+                    parent_ino,
+                    dotdot,
+                    dirblksize,
+                    has_ftype,
+                    sb.is_v5(),
+                ) {
                     Ok(_) => Ok(()),
                     Err(FilesystemError::DiskFull(_)) => {
                         // Single block would overflow — would convert to
@@ -1700,9 +1708,22 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         entries.push((name.to_string(), child_ino, ft));
 
         let dirblksize = sb.dirblksize() as usize;
-        let block = build_block_dir(&entries, parent_ino, dotdot, dirblksize, has_ftype)?;
+        let mut block = build_block_dir(
+            &entries,
+            parent_ino,
+            dotdot,
+            dirblksize,
+            has_ftype,
+            sb.is_v5(),
+        )?;
         let blocks_per_dir = (dirblksize as u64).div_ceil(sb.blocksize as u64) as u32;
         let fsblock = self.alloc_blocks(sb, blocks_per_dir)?;
+        if sb.is_v5() {
+            // Stamp xfs_dir3_blk_hdr (crc/blkno/lsn/uuid/owner) over the
+            // fresh `XDB3` block before it goes to disk.
+            let blkno = super::v5_crc::fsblock_to_daddr(fsblock, sb);
+            super::v5_crc::stamp_dir3_blk_hdr(&mut block, blkno, parent_ino, sb);
+        }
         self.write_dir_block(sb, fsblock, &block)?;
         self.set_dir_inode_single_extent(
             sb,
@@ -1766,8 +1787,19 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
 
         // Try the in-place block rebuild first. If that overflows, fall
         // through to the leaf-form conversion path.
-        match build_block_dir(&entries, parent_ino, dotdot, dirblksize, has_ftype) {
-            Ok(block) => {
+        match build_block_dir(
+            &entries,
+            parent_ino,
+            dotdot,
+            dirblksize,
+            has_ftype,
+            sb.is_v5(),
+        ) {
+            Ok(mut block) => {
+                if sb.is_v5() {
+                    let blkno = super::v5_crc::fsblock_to_daddr(fsblock, sb);
+                    super::v5_crc::stamp_dir3_blk_hdr(&mut block, blkno, parent_ino, sb);
+                }
                 self.write_dir_block(sb, fsblock, &block)?;
             }
             Err(FilesystemError::DiskFull(_)) => {
@@ -1840,8 +1872,10 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         let block1: Vec<(String, u64, u8)> = sorted[split_at..].to_vec();
 
         // Build both data blocks. block 0 carries the synthetic `.`/`..`.
-        let mut data0 =
-            build_leaf_data_block(&block0, parent_ino, dotdot, 0, dirblksize, has_ftype, true)?;
+        let is_v5 = sb.is_v5();
+        let mut data0 = build_leaf_data_block(
+            &block0, parent_ino, dotdot, 0, dirblksize, has_ftype, true, is_v5,
+        )?;
         let mut data1 = build_leaf_data_block(
             &block1,
             parent_ino,
@@ -1850,17 +1884,21 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             dirblksize,
             has_ftype,
             false,
+            is_v5,
         )?;
         data0.leaf_index.append(&mut data1.leaf_index);
 
-        // bestfree[0] for each data block is at bytes 6..8 (offset 4..6 holds
-        // the byte offset, 6..8 holds the length). Read that as the data
-        // block's "best free" length for the leaf1 bests array.
+        // bestfree[0] for each data block is at a known offset inside the
+        // dir2/dir3 data header — v4 packs the triple at byte 4, v5 packs it
+        // at byte 48 (after the 48-byte xfs_dir3_blk_hdr). Each triple is
+        // {offset(u16 BE), length(u16 BE)}; the leaf1 `bests` array wants
+        // the length only.
+        let bests_off = if is_v5 { 50 } else { 6 };
         let bests = [
-            BigEndian::read_u16(&data0.bytes[6..8]),
-            BigEndian::read_u16(&data1.bytes[6..8]),
+            BigEndian::read_u16(&data0.bytes[bests_off..bests_off + 2]),
+            BigEndian::read_u16(&data1.bytes[bests_off..bests_off + 2]),
         ];
-        let leaf1_bytes = build_leaf1_block_v4(data0.leaf_index, &bests, dirblksize)?;
+        let mut leaf1_bytes = build_leaf1_block(data0.leaf_index, &bests, dirblksize, is_v5)?;
 
         // Allocate two new dir blocks: data block 1, then the leaf1 block.
         // On a failure between the two allocs, roll back the first one.
@@ -1873,8 +1911,20 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             }
         };
 
+        // v5 CRC stamps for all three blocks now that we know their fsblocks.
+        // Data blocks carry an `xfs_dir3_blk_hdr`; the leaf1 block carries an
+        // `xfs_da3_blkinfo`. Owner is the parent directory's inode.
+        if is_v5 {
+            let blkno0 = super::v5_crc::fsblock_to_daddr(existing_fsblock, sb);
+            super::v5_crc::stamp_dir3_blk_hdr(&mut data0.bytes, blkno0, parent_ino, sb);
+            let blkno1 = super::v5_crc::fsblock_to_daddr(data1_fsblock, sb);
+            super::v5_crc::stamp_dir3_blk_hdr(&mut data1.bytes, blkno1, parent_ino, sb);
+            let blkno_l = super::v5_crc::fsblock_to_daddr(leaf1_fsblock, sb);
+            super::v5_crc::stamp_da3_blkinfo(&mut leaf1_bytes, blkno_l, parent_ino, sb);
+        }
+
         // Lay down all three blocks. Block 0 (the existing single-block dir)
-        // is rewritten in place with the XD2D format (no inline leaf tail).
+        // is rewritten in place with the XD2D/XDD3 format (no inline leaf tail).
         self.write_dir_block(sb, existing_fsblock, &data0.bytes)?;
         self.write_dir_block(sb, data1_fsblock, &data1.bytes)?;
         self.write_dir_block(sb, leaf1_fsblock, &leaf1_bytes)?;
@@ -2112,7 +2162,18 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         if entries.len() == before {
             return Err(FilesystemError::NotFound(name.into()));
         }
-        let block = build_block_dir(&entries, parent_ino, dotdot, dirblksize, has_ftype)?;
+        let mut block = build_block_dir(
+            &entries,
+            parent_ino,
+            dotdot,
+            dirblksize,
+            has_ftype,
+            sb.is_v5(),
+        )?;
+        if sb.is_v5() {
+            let blkno = super::v5_crc::fsblock_to_daddr(fsblock, sb);
+            super::v5_crc::stamp_dir3_blk_hdr(&mut block, blkno, parent_ino, sb);
+        }
         self.write_dir_block(sb, fsblock, &block)?;
         if child_was_dir {
             self.bump_dir_nlink(sb, parent_ino, -1)?;
@@ -2635,6 +2696,9 @@ fn write_bmbt_root_to_leaf(fork: &mut [u8], first_startoff: u64, leaf_fsblock: u
 /// XFS dir2 leaf1 block magic (`xfs_da_blkinfo.magic` for a single-leaf
 /// directory). Stored as a 16-bit big-endian value at byte 8 of the block.
 const XFS_DIR2_LEAF1_MAGIC: u16 = 0xD2F1;
+/// XFS dir3 leaf1 block magic (`xfs_da3_blkinfo.magic` for a v5 single-leaf
+/// directory). Same byte position as v4 (offset 8..10 of the block).
+const XFS_DIR3_LEAF1_MAGIC: u16 = 0x3DF1;
 
 /// dir2 leaf address space starts at byte 32 GiB in the inode's file offset
 /// stream (`XFS_DIR2_LEAF_OFFSET`). Converted to fsblocks: `2^32 / blocksize`.
@@ -2651,14 +2715,21 @@ struct DataBlockWithIndex {
     leaf_index: Vec<(u32, u32)>,
 }
 
-/// Build a v4 XD2D directory data block from a sub-slice of entries that
-/// belong in this data block. The block's file-offset in dir2 address space
-/// is `file_block_in_dir` (0 for the first data block, 1 for the next, …).
-/// Each entry contributes a `(hashval, address)` pair to the returned leaf
-/// index; addresses are 8-byte dataptr offsets (`(file_block * dirblksize +
-/// byte_off) / 8`). `extra_dot_dotdot` adds the synthetic `.` and `..`
-/// entries (only for the first data block). The free space at the tail is
-/// recorded as an unused record + bestfree[0]; bestfree[1..3] stay zero.
+/// Build an XD2D (v4) / XDD3 (v5) directory data block from a sub-slice of
+/// entries that belong in this data block. The block's file-offset in dir2
+/// address space is `file_block_in_dir` (0 for the first data block, 1 for
+/// the next, …). Each entry contributes a `(hashval, address)` pair to the
+/// returned leaf index; addresses are 8-byte dataptr offsets
+/// (`(file_block * dirblksize + byte_off) / 8`). `extra_dot_dotdot` adds the
+/// synthetic `.` and `..` entries (only for the first data block). The free
+/// space at the tail is recorded as an unused record + `bestfree[0]`;
+/// `bestfree[1..3]` stay zero.
+///
+/// **v5 (CRC)**: header is 64 bytes (`XFS_DIR3_DATA_HDR_LEN`), magic is
+/// `XFS_DIR3_DATA_MAGIC`, and `bestfree[0]` sits at offset 48..52. The CRC
+/// tuple is left zero — caller stamps it via
+/// [`v5_crc::stamp_dir3_blk_hdr`].
+#[allow(clippy::too_many_arguments)] // 8 args: v4 builder shape + is_v5 flag
 fn build_leaf_data_block(
     entries: &[(String, u64, u8)],
     self_ino: u64,
@@ -2667,6 +2738,7 @@ fn build_leaf_data_block(
     dirblksize: usize,
     has_ftype: bool,
     extra_dot_dotdot: bool,
+    is_v5: bool,
 ) -> Result<DataBlockWithIndex, FilesystemError> {
     let mut all: Vec<(Vec<u8>, u64, u8)> = Vec::with_capacity(entries.len() + 2);
     if extra_dot_dotdot {
@@ -2681,7 +2753,12 @@ fn build_leaf_data_block(
         .iter()
         .map(|(n, _, _)| dir2_data_entsize(n.len(), has_ftype))
         .sum();
-    let data_start = XFS_DIR2_DATA_HDR_LEN;
+    let data_start = if is_v5 {
+        super::dir2::XFS_DIR3_DATA_HDR_LEN
+    } else {
+        XFS_DIR2_DATA_HDR_LEN
+    };
+    let bestfree0_off = if is_v5 { 48 } else { 4 };
     if data_start + data_size > dirblksize {
         return Err(FilesystemError::DiskFull(format!(
             "leaf-form data block overflow: {} entries need {} bytes, block is {dirblksize}",
@@ -2691,7 +2768,12 @@ fn build_leaf_data_block(
     }
 
     let mut buf = vec![0u8; dirblksize];
-    BigEndian::write_u32(&mut buf[0..4], super::dir2::XFS_DIR2_DATA_MAGIC);
+    let magic = if is_v5 {
+        super::dir2::XFS_DIR3_DATA_MAGIC
+    } else {
+        super::dir2::XFS_DIR2_DATA_MAGIC
+    };
+    BigEndian::write_u32(&mut buf[0..4], magic);
 
     let dirblksize_units = (dirblksize / 8) as u32;
     let block_base_units = file_block_in_dir as u32 * dirblksize_units;
@@ -2722,8 +2804,11 @@ fn build_leaf_data_block(
             gap_off as u16,
         );
         // bestfree[0] = (offset, length).
-        BigEndian::write_u16(&mut buf[4..6], gap_off as u16);
-        BigEndian::write_u16(&mut buf[6..8], gap_len as u16);
+        BigEndian::write_u16(&mut buf[bestfree0_off..bestfree0_off + 2], gap_off as u16);
+        BigEndian::write_u16(
+            &mut buf[bestfree0_off + 2..bestfree0_off + 4],
+            gap_len as u16,
+        );
         // bestfree[1..3] left zero.
     }
 
@@ -2733,10 +2818,10 @@ fn build_leaf_data_block(
     })
 }
 
-/// Build a v4 XD2F dir2 leaf1 block from the per-data-block leaf-index
-/// entries (already collected by `build_leaf_data_block` calls) and the
-/// `bests` array (one u16 per data block: the largest free-record length in
-/// that block). Layout:
+/// Build a dir2 (v4 `XD2F`) / dir3 (v5 `XD3F`) leaf1 block from the
+/// per-data-block leaf-index entries (already collected by
+/// `build_leaf_data_block` calls) and the `bests` array (one u16 per data
+/// block: the largest free-record length in that block). v4 layout:
 ///
 /// ```text
 ///   da_blkinfo:  forw(4) back(4) magic(2) pad(2)        =  12 bytes
@@ -2746,14 +2831,23 @@ fn build_leaf_data_block(
 ///   bests[bests_count]: u16 each, at the tail of the block
 /// ```
 ///
+/// v5 layout swaps the 12-byte `xfs_da_blkinfo` for the 56-byte
+/// `xfs_da3_blkinfo` — same `magic` byte position (offset 8..10), but with
+/// crc(4)+blkno(8)+lsn(8)+uuid(16)+owner(8) appended before `ldlh`. The
+/// CRC tuple is left zero — caller stamps it via
+/// [`v5_crc::stamp_da3_blkinfo`].
+///
 /// Entries are sorted by `hashval` ascending so name lookups can binary-search.
-fn build_leaf1_block_v4(
+fn build_leaf1_block(
     mut entries: Vec<(u32, u32)>,
     bests: &[u16],
     dirblksize: usize,
+    is_v5: bool,
 ) -> Result<Vec<u8>, FilesystemError> {
     let bests_bytes = bests.len() * 2;
-    let header_bytes = 12 + 4; // da_blkinfo + ldlh
+    // Header = blkinfo + ldlh. v4: 12+4=16. v5: 56+4=60.
+    let blkinfo_bytes = if is_v5 { 56 } else { 12 };
+    let header_bytes = blkinfo_bytes + 4;
     let used = header_bytes + entries.len() * 8 + bests_bytes;
     if used > dirblksize {
         return Err(FilesystemError::DiskFull(format!(
@@ -2763,14 +2857,24 @@ fn build_leaf1_block_v4(
     entries.sort_by_key(|&(h, _)| h);
 
     let mut buf = vec![0u8; dirblksize];
-    // da_blkinfo: forw=0, back=0, magic=XFS_DIR2_LEAF1_MAGIC, pad=0.
-    BigEndian::write_u16(&mut buf[8..10], XFS_DIR2_LEAF1_MAGIC);
-    // ldlh: count, stale.
-    BigEndian::write_u16(&mut buf[12..14], entries.len() as u16);
-    BigEndian::write_u16(&mut buf[14..16], 0);
-    // Entries packed from byte 16.
+    // `magic` lives at offset 8..10 in both v4 (`xfs_da_blkinfo`) and v5
+    // (`xfs_da3_blkinfo`). Everything else in the blkinfo (forw/back/pad +
+    // v5 crc/blkno/lsn/uuid/owner) is left zero here; the v5 CRC stamp is a
+    // post-build pass.
+    let magic = if is_v5 {
+        XFS_DIR3_LEAF1_MAGIC
+    } else {
+        XFS_DIR2_LEAF1_MAGIC
+    };
+    BigEndian::write_u16(&mut buf[8..10], magic);
+    // ldlh: count, stale — sits immediately after the blkinfo.
+    let ldlh_off = blkinfo_bytes;
+    BigEndian::write_u16(&mut buf[ldlh_off..ldlh_off + 2], entries.len() as u16);
+    BigEndian::write_u16(&mut buf[ldlh_off + 2..ldlh_off + 4], 0);
+    // Entries packed from the end of the header.
+    let entries_off = header_bytes;
     for (i, (h, a)) in entries.iter().enumerate() {
-        let off = 16 + i * 8;
+        let off = entries_off + i * 8;
         BigEndian::write_u32(&mut buf[off..off + 4], *h);
         BigEndian::write_u32(&mut buf[off + 4..off + 8], *a);
     }
@@ -2782,15 +2886,23 @@ fn build_leaf1_block_v4(
     Ok(buf)
 }
 
-/// Build a v4 single-block (`XD2B`) directory holding `.`, `..`, and `entries`.
-/// `self_ino` is the directory's own inode (its `.`), `dotdot` its parent.
-/// Returns `DiskFull` if it doesn't fit one `dirblksize` block.
+/// Build a single-block (`XD2B` v4 / `XDB3` v5) directory holding `.`, `..`,
+/// and `entries`. `self_ino` is the directory's own inode (its `.`),
+/// `dotdot` its parent. Returns `DiskFull` if it doesn't fit one `dirblksize`
+/// block.
+///
+/// **v5 (CRC)**: header is 64 bytes (`XFS_DIR3_DATA_HDR_LEN`) instead of 16,
+/// magic is `XFS_DIR3_BLOCK_MAGIC`, and `bestfree[0]` sits at offset 48..52
+/// of the block (after the 48-byte `xfs_dir3_blk_hdr`). The CRC tuple
+/// (crc/blkno/lsn/uuid/owner) is left zero here — the caller stamps it via
+/// [`v5_crc::stamp_dir3_blk_hdr`] once the destination fsblock is known.
 fn build_block_dir(
     entries: &[(String, u64, u8)],
     self_ino: u64,
     dotdot: u64,
     dirblksize: usize,
     has_ftype: bool,
+    is_v5: bool,
 ) -> Result<Vec<u8>, FilesystemError> {
     // Full entry list with synthetic "." and "..".
     let mut all: Vec<(&[u8], u64, u8)> = Vec::with_capacity(entries.len() + 2);
@@ -2806,7 +2918,15 @@ fn build_block_dir(
         .iter()
         .map(|(n, _, _)| dir2_data_entsize(n.len(), has_ftype))
         .sum();
-    let data_start = XFS_DIR2_DATA_HDR_LEN;
+    let data_start = if is_v5 {
+        super::dir2::XFS_DIR3_DATA_HDR_LEN
+    } else {
+        XFS_DIR2_DATA_HDR_LEN
+    };
+    // bestfree[0].offset / .length live inside the data header. v4 packs the
+    // bestfree triple right after the magic at byte 4..16; v5 packs it after
+    // the 48-byte xfs_dir3_blk_hdr (bytes 48..60) with a 4-byte pad after.
+    let bestfree0_off = if is_v5 { 48 } else { 4 };
     let leaf_start = dirblksize
         .checked_sub(leaf_section)
         .ok_or_else(|| FilesystemError::DiskFull("dir block too small".into()))?;
@@ -2817,7 +2937,12 @@ fn build_block_dir(
     }
 
     let mut buf = vec![0u8; dirblksize];
-    BigEndian::write_u32(&mut buf[0..4], super::dir2::XFS_DIR2_BLOCK_MAGIC);
+    let magic = if is_v5 {
+        super::dir2::XFS_DIR3_BLOCK_MAGIC
+    } else {
+        super::dir2::XFS_DIR2_BLOCK_MAGIC
+    };
+    BigEndian::write_u32(&mut buf[0..4], magic);
 
     // Data entries from data_start; collect (hashval, address) for the leaf.
     let mut leaf: Vec<(u32, u32)> = Vec::with_capacity(leaf_count);
@@ -2850,8 +2975,11 @@ fn build_block_dir(
             gap_off as u16,
         );
         // bestfree[0] points at this gap.
-        BigEndian::write_u16(&mut buf[4..6], gap_off as u16);
-        BigEndian::write_u16(&mut buf[6..8], gap_len as u16);
+        BigEndian::write_u16(&mut buf[bestfree0_off..bestfree0_off + 2], gap_off as u16);
+        BigEndian::write_u16(
+            &mut buf[bestfree0_off + 2..bestfree0_off + 4],
+            gap_len as u16,
+        );
     }
 
     // Leaf hash index, sorted ascending by hashval.
@@ -2946,4 +3074,170 @@ fn block_entries_with_ftype(
         pos += dir2_data_entsize(namelen, has_ftype);
     }
     Ok((dotdot, out))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the dir-block builders. The integration round-trip on
+    //! the v5 fixture lives in `super::tests` (see
+    //! `dir3_block_builder_round_trips_through_dir2_reader` etc.).
+    use super::*;
+    use crate::fs::xfs::dir2;
+
+    /// Look up the `XfsSuperblock` constants we need to fabricate a
+    /// stamper-ready superblock without an actual on-disk image.
+    fn fake_v5_sb(meta_uuid_byte: u8) -> crate::fs::xfs::sb::XfsSuperblock {
+        crate::fs::xfs::sb::XfsSuperblock {
+            magicnum: 0x5846_5342,
+            blocksize: 4096,
+            dblocks: 0,
+            rblocks: 0,
+            rextents: 0,
+            logstart: 0,
+            logblocks: 0,
+            rootino: 0,
+            rbmino: 0,
+            rsumino: 0,
+            uquotino: 0,
+            gquotino: 0,
+            agblocks: 0,
+            agcount: 0,
+            versionnum: 0x0005,
+            sectsize: 512,
+            inodesize: 512,
+            inopblock: 8,
+            fname: [0; 12],
+            blocklog: 12,
+            sectlog: 9,
+            inodelog: 9,
+            inopblog: 3,
+            agblklog: 16,
+            dirblklog: 0,
+            inoalignmt: 0,
+            features2: 0,
+            features_compat: 0,
+            features_ro_compat: 0,
+            features_incompat: 0,
+            sb_uuid: [meta_uuid_byte; 16],
+            sb_meta_uuid: [meta_uuid_byte; 16],
+        }
+    }
+
+    /// §2.1 hole (E.3): `build_block_dir` with `is_v5=true` produces an XDB3
+    /// header, the v5 stamper validates, and the dir2 reader (which already
+    /// knows dir3) walks every entry back.
+    #[test]
+    fn build_block_dir_v5_round_trips_through_reader_after_stamp() {
+        let sb = fake_v5_sb(0x77);
+        let entries = vec![
+            ("alpha".to_string(), 0x1100u64, super::XFS_DIR3_FT_REG_FILE),
+            ("beta".to_string(), 0x1200u64, super::XFS_DIR3_FT_DIR),
+            ("gamma".to_string(), 0x1300u64, super::XFS_DIR3_FT_REG_FILE),
+        ];
+        let dirblksize = 4096;
+        let self_ino = 0xABCD;
+        let dotdot = 0xBEEF;
+        let has_ftype = true;
+        let mut buf =
+            build_block_dir(&entries, self_ino, dotdot, dirblksize, has_ftype, true).unwrap();
+
+        // Magic = XDB3 (v5 single-block dir).
+        assert_eq!(
+            BigEndian::read_u32(&buf[0..4]),
+            dir2::XFS_DIR3_BLOCK_MAGIC,
+            "expected XDB3 magic"
+        );
+
+        // Stamp the xfs_dir3_blk_hdr — owner = parent / self_ino, blkno = some
+        // synthetic daddr. After stamping, crc_valid must return true.
+        let blkno = 0xDEAD_BEEFu64;
+        crate::fs::xfs::v5_crc::stamp_dir3_blk_hdr(&mut buf, blkno, self_ino, &sb);
+        assert!(
+            crate::fs::xfs::v5_crc::crc_valid(&buf, crate::fs::xfs::v5_crc::DIR3_BLK_CRC_OFF),
+            "dir3 block CRC mismatch after build+stamp"
+        );
+
+        // Round-trip via the dir2 reader, which dispatches by magic and
+        // handles dir3's 64-byte header.
+        let parsed = dir2::parse_block(&buf, has_ftype).expect("reader walks XDB3 block");
+        let names: Vec<&str> = parsed.iter().map(|e| e.name.as_str()).collect();
+        for n in ["alpha", "beta", "gamma"] {
+            assert!(names.contains(&n), "missing entry {n} in {names:?}");
+        }
+    }
+
+    /// `build_leaf_data_block` v5 — XDD3 magic, bestfree[0] at offset 48,
+    /// stamper validates.
+    #[test]
+    fn build_leaf_data_block_v5_stamps_and_parses() {
+        let sb = fake_v5_sb(0x88);
+        let entries = vec![
+            ("alpha".to_string(), 0x2100u64, super::XFS_DIR3_FT_REG_FILE),
+            ("beta".to_string(), 0x2200u64, super::XFS_DIR3_FT_REG_FILE),
+        ];
+        let mut data = build_leaf_data_block(
+            &entries, 0x222, // self_ino (only used when extra_dot_dotdot is true)
+            0x111, // dotdot
+            1,     // file_block_in_dir
+            4096,  // dirblksize
+            true,  // has_ftype
+            false, // no `.`/`..` for non-first data block
+            true,  // v5
+        )
+        .unwrap();
+        let block = &mut data.bytes;
+        assert_eq!(BigEndian::read_u32(&block[0..4]), dir2::XFS_DIR3_DATA_MAGIC);
+
+        // bestfree[0] = (offset, length) at bytes 48..52 on v5.
+        let bf_off = BigEndian::read_u16(&block[48..50]);
+        let bf_len = BigEndian::read_u16(&block[50..52]);
+        assert!(bf_off >= 64, "bestfree[0].offset should sit past v5 header");
+        assert!(bf_len > 0, "bestfree[0].length should be the tail gap");
+
+        let blkno = 0xCAFE_BABEu64;
+        crate::fs::xfs::v5_crc::stamp_dir3_blk_hdr(block, blkno, 0x111, &sb);
+        assert!(
+            crate::fs::xfs::v5_crc::crc_valid(block, crate::fs::xfs::v5_crc::DIR3_BLK_CRC_OFF),
+            "XDD3 CRC mismatch after stamp"
+        );
+
+        // dir2 reader's parse_data_block already handles the XDD3 / 64-byte
+        // header — confirm both entries surface.
+        let parsed = dir2::parse_data_block(block, true).expect("walk XDD3 data block");
+        let names: Vec<&str> = parsed.iter().map(|e| e.name.as_str()).collect();
+        for n in ["alpha", "beta"] {
+            assert!(names.contains(&n), "missing entry {n} in {names:?}");
+        }
+    }
+
+    /// `build_leaf1_block` v5 — magic 0x3DF1 at offset 8..10 in the
+    /// `xfs_da3_blkinfo`, 56-byte header before the entries, stamper
+    /// validates.
+    #[test]
+    fn build_leaf1_block_v5_stamps_at_da3_offset() {
+        let sb = fake_v5_sb(0x99);
+        let entries = vec![(0x1111, 0x100), (0x2222, 0x200), (0x3333, 0x300)];
+        let bests = [256u16, 256u16];
+        let mut buf = build_leaf1_block(entries, &bests, 4096, true).unwrap();
+
+        // Magic at offset 8..10 = XFS_DIR3_LEAF1_MAGIC.
+        assert_eq!(
+            BigEndian::read_u16(&buf[8..10]),
+            XFS_DIR3_LEAF1_MAGIC,
+            "expected 0x3DF1 dir3 leaf1 magic"
+        );
+        // ldlh `count` lives at offset 56 (right after the 56-byte da3 hdr).
+        assert_eq!(
+            BigEndian::read_u16(&buf[56..58]),
+            3,
+            "leaf entry count should round-trip"
+        );
+
+        let blkno = 0xFEED_FACEu64;
+        crate::fs::xfs::v5_crc::stamp_da3_blkinfo(&mut buf, blkno, 0x222, &sb);
+        assert!(
+            crate::fs::xfs::v5_crc::crc_valid(&buf, crate::fs::xfs::v5_crc::DA3_CRC_OFF),
+            "da3_blkinfo CRC mismatch after stamp"
+        );
+    }
 }

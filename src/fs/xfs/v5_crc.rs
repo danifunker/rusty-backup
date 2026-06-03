@@ -111,6 +111,14 @@ pub const SB_LSN_OFF: usize = 240;
 /// sentinel that compares greater than every real lsn.
 pub const XFS_LSN_NULL: u64 = u64::MAX;
 
+/// Translate a filesystem block number to the **disk address** stamped into
+/// per-block `blkno` CRC-header fields — XFS always counts these in
+/// 512-byte basic blocks (`BBSIZE`), independent of `sb_sectsize`. Mirrors
+/// the kernel's `XFS_FSB_TO_BB(mp, fsbno) = fsbno << (blocklog - 9)`.
+pub fn fsblock_to_daddr(fsblock: u64, sb: &XfsSuperblock) -> u64 {
+    fsblock << (sb.blocklog - 9)
+}
+
 // ---------- CRC primitive ----------
 
 /// Compute the standard CRC-32C (Castagnoli, init=0xFFFFFFFF, xorout=
