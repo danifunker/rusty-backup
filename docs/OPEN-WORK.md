@@ -322,6 +322,18 @@ see §10. Reopen when new CLI / GUI work surfaces.)
 Items that have a real shape but no schedule. Surface them here so they
 aren't lost.
 
+**WSL toolchain — verified 2026-06-03 on `Ubuntu-24.04`:** to avoid
+re-litigating setup, the following is confirmed working end-to-end
+(appliance smoke-tested, not just `dpkg -l` presence checked):
+`mkfs.jfs` (jfsutils 1.1.15), `guestfish` (libguestfs 1.52.0),
+`linux-image-virtual` + `linux-modules-extra-6.8.0-124-generic`,
+`/boot/vmlinuz-*` 0644 via `dpkg-statoverride`, `zstd`, `mkfs.xfs` /
+`xfs_repair` / `xfs_db` (xfsprogs 6.6.0). The minimal-image appliance
+boots and round-trips reads/writes; `xfs_repair -n` runs clean on the
+bundled v5 fixture. **Implication for the entries below:** any park
+reason that names "tooling unavailable" or "no oracle" is wrong —
+both fixtures and oracles are accessible from this host.
+
 - **JFS J.4b — edit-side write primitives.** J.4a fsck (read-only
   verifier) shipped 2026-06-03 late (see §10). J.4b is the
   EditableFilesystem trait surface: dir-insert into external dtrees,
