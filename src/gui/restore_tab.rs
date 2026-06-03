@@ -751,6 +751,10 @@ impl RestoreTab {
                             "Disk Images",
                             rusty_backup::model::file_types::DISK_IMAGE_EXTS,
                         )
+                        .add_filter(
+                            "Mac archives",
+                            rusty_backup::model::file_types::MAC_ARCHIVE_EXTS,
+                        )
                         .add_filter("All Files", &["*"])
                         .pick_file()
                     {
@@ -1684,6 +1688,10 @@ impl RestoreTab {
                         .add_filter(
                             "Disk Images",
                             rusty_backup::model::file_types::DISK_IMAGE_EXTS,
+                        )
+                        .add_filter(
+                            "Mac archives",
+                            rusty_backup::model::file_types::MAC_ARCHIVE_EXTS,
                         )
                         .add_filter("All Files", &["*"])
                         .pick_file()

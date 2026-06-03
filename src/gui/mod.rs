@@ -889,6 +889,16 @@ impl eframe::App for RustyBackupApp {
             }
         });
 
+        // Workflow D.2 auto-unwrap: the Archives tab queues a payload
+        // when the user clicks "Mount in new Inspect tab". Drain here,
+        // hand it to the Inspect tab (which owns the tempdir guard so
+        // the file survives), and switch tabs.
+        if let Some(open) = self.archives_tab.take_pending_inspect_open() {
+            self.inspect_tab
+                .load_image_with_tempdir(open.path, Some(open.guard));
+            self.active_tab = Tab::Inspect;
+        }
+
         // Show settings dialog if open
         self.settings_dialog.show(ctx);
     }

@@ -268,6 +268,22 @@ impl InspectTab {
         }
     }
 
+    /// Programmatically open a disk-image path in this tab, optionally
+    /// owning a [`tempfile::TempDir`] that contains it. Used by the
+    /// Archives tab's "Mount in new Inspect tab" auto-unwrap hook
+    /// (Workflow D.2) to hand off a decoded payload extracted from a
+    /// `.hqx` / `.sit` / `.sea` to this tab without going through the
+    /// user-facing file-picker. The tempdir guard is kept alive on this
+    /// tab so the temp file outlives the Archives tab's frame; clearing
+    /// the tab or picking a new file drops it.
+    pub fn load_image_with_tempdir(&mut self, path: PathBuf, guard: Option<tempfile::TempDir>) {
+        self.selected_device_idx = None;
+        self.backup_folder_path = None;
+        self.image_file_path = Some(path);
+        self.amiga_tempdir = guard;
+        self.clear_results();
+    }
+
     pub fn clear_backup(&mut self) {
         self.backup_folder_path = None;
         self.backup_metadata = None;
@@ -348,6 +364,10 @@ impl InspectTab {
                             .add_filter(
                                 "Disk Images",
                                 rusty_backup::model::file_types::DISK_IMAGE_EXTS,
+                            )
+                            .add_filter(
+                                "Mac archives",
+                                rusty_backup::model::file_types::MAC_ARCHIVE_EXTS,
                             )
                             .add_filter("All Files", &["*"])
                             .pick_file()
