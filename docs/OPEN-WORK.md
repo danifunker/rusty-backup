@@ -24,13 +24,14 @@ for the per-FS one-liners. JFS J.4a (fsck read-only verifier),
 multi-IAG dispatch covering >4k inodes, and the multi-page external
 dtree walker (>127-entry directories) all shipped 2026-06-03 late. The
 JFS fixture was regenerated in WSL Ubuntu-24.04 to include
-`/bigdir/file_001..200` for the dtree-walker regression. J.4b
-(edit-side write primitives) remains parked in §8 behind real demand
-— `repair()` that adopts OrphanInode findings depends on it. The
-multi-level dmapctl walker (>32 GiB JFS aggregates) is in §9
-explicitly excluded — vintage hardware doesn't address that scale.
-ReiserFS is intentionally read-only forever (filesystem leaving the
-kernel; investment caps at "read what exists").
+`/bigdir/file_001..200` for the dtree-walker regression. **J.4b
+(edit-side write primitives) is in §9 explicitly excluded** —
+`repair()`-driven OrphanInode adoption is the only thing it would
+unlock, real-world JFS orphans are rare, and Linux `fsck.jfs` is the
+fallback when one surfaces. The multi-level dmapctl walker (>32 GiB
+JFS aggregates) is also in §9 — vintage hardware doesn't address that
+scale. ReiserFS is intentionally read-only forever (filesystem leaving
+the kernel; investment caps at "read what exists").
 
 ---
 
@@ -337,47 +338,8 @@ bundled v5 fixture. **Implication for the entries below:** any park
 reason that names "tooling unavailable" or "no oracle" is wrong —
 both fixtures and oracles are accessible from this host.
 
-- **JFS J.4b — edit-side write primitives.** J.4a fsck (read-only
-  verifier) shipped 2026-06-03 late (see §10). J.4b is the
-  EditableFilesystem trait surface: dir-insert into external dtrees,
-  inode alloc + free across IAGs, block alloc + free via BMAP pmap
-  flip + write, xtree leaf/internal split + collapse, dtree leaf/
-  internal split + collapse. The combined write surface drives a
-  `repair()` driver that can adopt the OrphanInode findings the
-  J.4a verifier already produces. Each sub-primitive (xtree-write /
-  dtree-write / dmap-write) is itself a non-trivial slice — multi-
-  month combined. Park reason: J.4a alone is useful (fsck-clean
-  gating in CLI + GUI, structured-output via `rb-cli fsck --format
-  json`); J.4b's value depends on the volume of OrphanInode findings
-  in the wild, which is empirically rare.
-- **XFS rmapbt rebuild + refcountbt rebuild** (R2 / R3 fully on v5
-  with all features). Slices 1–6 of the previous v5-unlock plan all
-  shipped 2026-06-03 late (see §10): finobt + rmapbt + refcountbt
-  parsers + walkers, R2 v5 gate lift, safe-feature gating, and R3
-  finobt resync. What's left to make R2 / R3 SAFE on volumes with
-  rmapbt enabled (modern xfsprogs 6.6.0 default, including the
-  bundled v5 fixture):
-
-  1. **rmapbt rebuild on R2.** When R2 rewrites bnobt/cntbt and frees
-     the old tree blocks, every rmapbt record pointing at those old
-     blocks goes stale. R2 currently refuses on `has_rmapbt()` to
-     avoid the skew. Lift requires walking rmapbt to find affected
-     records, emitting new records pointing at the new tree blocks,
-     and updating AGF's rmap counters.
-  2. **rmapbt rebuild on R3.** Same problem for R3's inobt rewrites.
-     R3 currently refuses on `has_rmapbt()`.
-  3. **refcountbt rebuild on reflink-active volumes.** Modern mkfs
-     enables reflink by default even when no reflinks exist (empty
-     refcountbt). Once a reflink is actually created, R2's bnobt
-     rewrite needs to preserve refcount records over the affected
-     blocks.
-
-  Park reason: the bundled fixture has rmapbt=1, so R2 / R3 stay
-  silent-skipped on it. R3 finobt resync (slice 5) is reachable on
-  v5+FINOBT-only volumes (rare without rmapbt). The rmapbt rebuild
-  is genuinely a separate slice — ~500-800 LOC — and lands when a
-  user actually needs `--repair` on a modern v5 image with damaged
-  bnobt / inobt.
+*(Currently empty — all previously-parked items either shipped to §10
+or moved to §9. New work that's "scoped but not started" goes here.)*
 
 ---
 
@@ -404,6 +366,32 @@ Out, not parked. Listed so the question doesn't get re-litigated.
   §2 for the per-crate rationale; all are reference ports, not crates.
 - **In-place btrfs balance / shrink** — replaced by §2.4
   scratch-recreate (gated on B.0 decision).
+- **JFS J.4b — edit-side write primitives** (multi-month surface:
+  xtree-write + dtree-write + dmap-write + IAG alloc/free). J.4a
+  fsck shipped, so the read-side audit + OrphanInode reporting are
+  in tree. The only thing J.4b would unlock is `repair()`-driven
+  adoption of OrphanInode findings into `/lost+found/`. Real-world
+  JFS orphans are rare (single-user vintage volumes don't accumulate
+  the dangling-inode patterns big-multi-user systems do), and on
+  the rare hit the user can route through Linux `fsck.jfs` to
+  resolve. Investment / payoff ratio doesn't justify the multi-
+  month surface. **Closed indefinitely** — reopen only if a real
+  user workflow surfaces meaningful orphan volumes that fsck.jfs
+  can't handle.
+- **XFS rmapbt rebuild / refcountbt rebuild** (R2 / R3 fully safe
+  on rmapbt-enabled v5 images). Slices 1–6 of the v5 unlock shipped
+  (see §10): finobt + rmapbt + refcountbt parsers/walkers, R2 v5
+  gate lift, R3 finobt resync. R2 / R3 silently skip on
+  `has_rmapbt() || has_reflink()` to avoid leaving side-tree records
+  stale. Making rmapbt-rebuild itself work is a separate ~500–800
+  LOC slice: walk rmapbt to find records over old tree blocks,
+  emit new records pointing at the new ones, update AGF rmap
+  counters. Same shape for refcountbt when reflinks are actually
+  in use. **Closed indefinitely** — the vintage / single-disk
+  retro-restore target rarely hits `--repair` on modern v5 images
+  with these features, and when it does the user can route through
+  `xfs_repair` in WSL. Reopen only if a real workflow needs in-app
+  v5+rmapbt repair coverage that the WSL fallback can't provide.
 - **JFS multi-level dmapctl walker** (read-side, BMAP at
   `MAX_BMAP_DEPTH_1_BLOCKS` = 32 GiB cap). Vintage hardware doesn't
   address a multi-TiB JFS aggregate; the rusty-backup target is
