@@ -104,7 +104,7 @@ jobs:
           fi
       
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: Rusty-Backup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
           path: Rusty-Backup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip
@@ -112,14 +112,16 @@ jobs:
       - name: Stage CLI binary
         shell: bash
         run: |
-          cp "target/${{ matrix.target }}/release/rb-cli.exe" \
-             "Rusty-Backup-CLI-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.exe"
+          # Zip the CLI so the download extracts to a plainly-named rb-cli.exe
+          # (consistent with the macOS .zip / Linux .tar.gz).
+          cd "target/${{ matrix.target }}/release"
+          7z a "../../../rb-cli-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip" rb-cli.exe
 
       - name: Upload CLI artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
-          name: Rusty-Backup-CLI-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
-          path: Rusty-Backup-CLI-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.exe
+          name: rb-cli-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: rb-cli-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip
 
       # Per-user Inno Setup installer (Setup.exe). Installs to %LocalAppData%
       # so the in-app self-updater can replace the running exe without admin.
@@ -139,7 +141,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "iscc failed with exit code $LASTEXITCODE" }
 
       - name: Upload installer artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: Rusty-Backup-Setup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
           path: installer\Output\Rusty-Backup-Setup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.exe
@@ -338,11 +340,12 @@ jobs:
 
       - name: Package CLI for notarization
         run: |
-          ZIP_NAME="Rusty-Backup-CLI-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip"
+          ZIP_NAME="rb-cli-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip"
           # ditto produces the zip layout notarytool / Gatekeeper expect for
           # loose binaries; plain `zip` works too but ditto is the canonical
-          # tool on macOS.
-          ditto -c -k --keepParent "target/${{ matrix.target }}/release/rb-cli" "$ZIP_NAME"
+          # tool on macOS. No --keepParent: the archive root is the bare
+          # rb-cli binary, so it extracts to ./rb-cli (not ./release/rb-cli).
+          ditto -c -k "target/${{ matrix.target }}/release/rb-cli" "$ZIP_NAME"
 
       - name: Notarize CLI
         if: ${{ env.HAS_SIGNING_CERT == 'true' }}
@@ -351,7 +354,7 @@ jobs:
           MACOS_NOTARIZE_PASSWORD: ${{ secrets.MACOS_NOTARIZE_PASSWORD }}
           MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
         run: |
-          ZIP_NAME="Rusty-Backup-CLI-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip"
+          ZIP_NAME="rb-cli-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip"
           echo "Submitting CLI zip for notarization..."
           xcrun notarytool submit "$ZIP_NAME" \
             --apple-id "$MACOS_NOTARIZE_APPLE_ID" \
@@ -370,16 +373,16 @@ jobs:
           fi
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: Rusty-Backup-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
           path: Rusty-Backup-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg
 
       - name: Upload CLI artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
-          name: Rusty-Backup-CLI-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
-          path: Rusty-Backup-CLI-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip
+          name: rb-cli-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: rb-cli-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip
 
   build-linux-appimage:
     name: Build Linux AppImage (Anylinux)
@@ -570,7 +573,7 @@ jobs:
           rm -f /usr/local/bin/pkexec
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-appimage
           path: |
@@ -678,33 +681,33 @@ jobs:
           tar -czf ../../Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.pkg.tar.zst *
 
       - name: Upload Debian package
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-deb
           path: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.deb
 
       - name: Upload RPM package
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-rpm
           path: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.rpm
 
       - name: Upload Arch package
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-arch
           path: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.pkg.tar.zst
 
       - name: Package CLI
         run: |
-          TGZ="Rusty-Backup-CLI-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz"
+          TGZ="rb-cli-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz"
           tar -C "target/${{ matrix.target }}/release" -czf "$TGZ" rb-cli
 
       - name: Upload CLI artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
-          name: Rusty-Backup-CLI-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
-          path: Rusty-Backup-CLI-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz
+          name: rb-cli-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: rb-cli-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz
 
   release:
     name: Create Release
@@ -713,7 +716,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
       
@@ -726,12 +729,60 @@ jobs:
           find artifacts -type f \( -name "*.zip" -o -name "*.dmg" -o -name "*.AppImage" -o -name "*.AppImage.zsync" -o -name "*.deb" -o -name "*.rpm" -o -name "*.pkg.tar.zst" -o -name "*.exe" -o -name "*.tar.gz" \) -exec cp {} release-files/ \;
           ls -lh release-files/
       
+      # Build a download-picker table from the (fixed) build matrix. Links
+      # point at the assets this same job is about to upload. Emitted as the
+      # release body; GitHub's auto-generated commit notes are appended below
+      # it (generate_release_notes: true).
+      - name: Generate downloads table
+        env:
+          VER: ${{ needs.generate-version.outputs.version }}
+        run: |
+          TAG="v${VER}"
+          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          # Warn (don't fail) if an expected asset is missing — surfaces a
+          # matrix change without blocking the release.
+          for f in \
+            "Rusty-Backup-Setup-windows-x64-${VER}.exe" "Rusty-Backup-windows-x64-${VER}.zip" \
+            "Rusty-Backup-Setup-windows-x86-${VER}.exe" "Rusty-Backup-windows-x86-${VER}.zip" \
+            "Rusty-Backup-macos-arm64-${VER}.dmg" "Rusty-Backup-macos-x64-${VER}.dmg" \
+            "Rusty-Backup-linux-x64-${VER}.AppImage" "Rusty-Backup-linux-x64-${VER}.deb" \
+            "Rusty-Backup-linux-x64-${VER}.rpm" "Rusty-Backup-linux-x64-${VER}.pkg.tar.zst" \
+            "Rusty-Backup-linux-arm64-${VER}.AppImage" "Rusty-Backup-linux-arm64-${VER}.deb" \
+            "Rusty-Backup-linux-arm64-${VER}.rpm" "Rusty-Backup-linux-arm64-${VER}.pkg.tar.zst" \
+            "rb-cli-windows-x64-${VER}.zip" "rb-cli-windows-x86-${VER}.zip" \
+            "rb-cli-macos-arm64-${VER}.zip" "rb-cli-macos-x64-${VER}.zip" \
+            "rb-cli-linux-x64-${VER}.tar.gz" "rb-cli-linux-arm64-${VER}.tar.gz"; do
+            [ -f "release-files/${f}" ] || echo "::warning::expected release asset missing: ${f}"
+          done
+
+          cat > DOWNLOADS.md <<EOF
+          ## Downloads
+
+          **Most people want:** Windows -> **x64 installer** · Mac -> **Apple Silicon** or **Intel** \`.dmg\` · Linux -> **AppImage**.
+
+          | Platform | Architecture | App | Command line (\`rb-cli\`) |
+          |---|---|---|---|
+          | **Windows 11 / 10** | x64 (64-bit) | [Installer](${BASE}/Rusty-Backup-Setup-windows-x64-${VER}.exe) · [Portable zip](${BASE}/Rusty-Backup-windows-x64-${VER}.zip) | [rb-cli](${BASE}/rb-cli-windows-x64-${VER}.zip) |
+          | **Windows 10** | x86 (32-bit) | [Installer](${BASE}/Rusty-Backup-Setup-windows-x86-${VER}.exe) · [Portable zip](${BASE}/Rusty-Backup-windows-x86-${VER}.zip) | [rb-cli](${BASE}/rb-cli-windows-x86-${VER}.zip) |
+          | **macOS 10.13+** | Apple Silicon (arm64) | [.dmg](${BASE}/Rusty-Backup-macos-arm64-${VER}.dmg) | [rb-cli](${BASE}/rb-cli-macos-arm64-${VER}.zip) |
+          | **macOS 10.13+** | Intel (x64) | [.dmg](${BASE}/Rusty-Backup-macos-x64-${VER}.dmg) | [rb-cli](${BASE}/rb-cli-macos-x64-${VER}.zip) |
+          | **Linux** (glibc >= 2.39) | x64 | [AppImage](${BASE}/Rusty-Backup-linux-x64-${VER}.AppImage) · [deb](${BASE}/Rusty-Backup-linux-x64-${VER}.deb) · [rpm](${BASE}/Rusty-Backup-linux-x64-${VER}.rpm) · [pkg](${BASE}/Rusty-Backup-linux-x64-${VER}.pkg.tar.zst) | [rb-cli](${BASE}/rb-cli-linux-x64-${VER}.tar.gz) |
+          | **Linux** (glibc >= 2.39) | arm64 | [AppImage](${BASE}/Rusty-Backup-linux-arm64-${VER}.AppImage) · [deb](${BASE}/Rusty-Backup-linux-arm64-${VER}.deb) · [rpm](${BASE}/Rusty-Backup-linux-arm64-${VER}.rpm) · [pkg](${BASE}/Rusty-Backup-linux-arm64-${VER}.pkg.tar.zst) | [rb-cli](${BASE}/rb-cli-linux-arm64-${VER}.tar.gz) |
+
+          <sub>**Windows:** x86 = 32-bit (Windows 10, the last Windows with 32-bit support). · **macOS:** requires 10.13 High Sierra or later. · **Linux:** deb = Debian/Ubuntu, rpm = Fedora/RHEL/openSUSE, pkg = Arch/Manjaro; the packages and \`rb-cli\` are built against **glibc 2.39** (Ubuntu 24.04), while the **AppImage** is self-contained and runs on most distributions regardless of glibc. · Every **rb-cli** download contains a single \`rb-cli\` executable (\`rb-cli.exe\` on Windows).</sub>
+
+          ---
+          EOF
+          echo "----- generated DOWNLOADS.md -----"
+          cat DOWNLOADS.md
+
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ needs.generate-version.outputs.version }}
           name: Release ${{ needs.generate-version.outputs.version }}
           files: release-files/*
+          body_path: DOWNLOADS.md
           draft: false
           prerelease: false
           generate_release_notes: true
